@@ -3711,6 +3711,7 @@ dependencies = [
  "encoding_rs",
  "futures",
  "log",
+ "png",
  "roxmltree",
  "ruffle_core",
  "ruffle_render_wgpu",
