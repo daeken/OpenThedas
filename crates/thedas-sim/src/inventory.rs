@@ -26,6 +26,7 @@ impl Sim {
         if let Some(f) = from.and_then(|f| self.world.get_mut(f)) {
             f.inventory.retain(|&i| i != item);
             f.equipment.retain(|_, i| *i != item);
+            f.other_set.retain(|_, i| *i != item);
         }
         if let Some(t) = self.world.get_mut(to) {
             if !t.inventory.contains(&item) {
@@ -43,6 +44,53 @@ impl Sim {
             self.world.queue_event(0, f, removed, None);
         }
         true
+    }
+
+    /// What a creature's equipped items add to a property: for each item stat that
+    /// `itemstatdefines.gda` links to the property (its fourth column), the item's value
+    /// from `itemstats.gda` (by base item type). Provisional: material and quality do not
+    /// scale it, and items' own property lists are not applied yet.
+    pub fn equipment_bonus(&self, id: ObjectId, property: i32) -> f32 {
+        const COL_PROPERTY: u32 = 0xd650_5aa1;
+        let Some(o) = self.world.get(id) else {
+            return 0.0;
+        };
+        if o.equipment.is_empty() || property <= 0 {
+            return 0.0;
+        }
+        let tables = self.world.tables();
+        let (Some(defs), Some(stats)) =
+            (tables.get(0, "itemstatdefines"), tables.get(0, "itemstats"))
+        else {
+            return 0.0;
+        };
+        let labels: Vec<String> = defs
+            .order
+            .iter()
+            .filter(|&&r| match defs.cell_by_hash(COL_PROPERTY, r) {
+                Some(thedas_formats::gda::Cell::Int(p)) => *p == property as i64,
+                _ => false,
+            })
+            .map(|&r| crate::engine::cell_string(defs.cell("Label", r)))
+            .filter(|l| !l.is_empty())
+            .collect();
+        if labels.is_empty() {
+            return 0.0;
+        }
+        let mut sum = 0.0;
+        for item in o.equipment.values() {
+            let Some(base) = self
+                .world
+                .get(*item)
+                .and_then(|i| i.fields.get("BaseItem").copied())
+            else {
+                continue;
+            };
+            for l in &labels {
+                sum += crate::engine::cell_float(stats.cell(crate::engine::clean(l), base as i64));
+            }
+        }
+        sum
     }
 
     /// `StoreFollowerInventory`: moves a creature's items (equipped ones too, remembering
@@ -140,6 +188,7 @@ impl Sim {
             o.inventory.push(item);
         }
         o.equipment.retain(|_, i| *i != item);
+        o.other_set.retain(|_, i| *i != item);
         o.equipment.insert(slot, item);
         Some(slot)
     }
@@ -232,6 +281,7 @@ impl Sim {
         if let Some(c) = self.world.get_mut(creature) {
             c.inventory.retain(|i| !items.contains(i));
             c.equipment.retain(|_, i| !items.contains(i));
+            c.other_set.retain(|_, i| !items.contains(i));
         }
         Some(bag)
     }

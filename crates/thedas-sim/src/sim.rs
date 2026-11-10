@@ -1535,14 +1535,21 @@ impl Sim {
     pub fn load_template_items(&mut self, id: ObjectId, t: &Gff3) {
         let Some(r) = t.structs.first() else { return };
         for (list, equip) in [("Equip_ItemList", true), ("ItemList", false)] {
-            let entries: Vec<(u32, String, Option<i32>)> = list_of(r, list)
+            let entries: Vec<(u32, String, Option<i32>, i32)> = list_of(r, list)
                 .iter()
                 .filter_map(|&si| t.structs.get(si as usize))
                 .filter_map(|s| {
-                    resref_field(s, "TemplateResRef").map(|x| (s.id, x, int(s, "Droppable")))
+                    resref_field(s, "TemplateResRef").map(|x| {
+                        (
+                            s.id,
+                            x,
+                            int(s, "Droppable"),
+                            int(s, "SetNumber").unwrap_or(0),
+                        )
+                    })
                 })
                 .collect();
-            for (slot, resref, droppable) in entries {
+            for (slot, resref, droppable, set) in entries {
                 let item = self.create_item(&resref);
                 if let (Some(d), Some(o)) = (droppable, self.world.get_mut(item)) {
                     o.fields.insert("Droppable".into(), d);
@@ -1550,7 +1557,14 @@ impl Sim {
                 if let Some(o) = self.world.get_mut(id) {
                     o.inventory.push(item);
                     if equip {
-                        o.equipment.insert(slot as i32, item);
+                        // Weapons of the second set (SetNumber 1) wait in the inactive set;
+                        // creatures start with set 0.
+                        let slot = slot as i32;
+                        if set == 1 && crate::world::WEAPON_SET_SLOTS.contains(&slot) {
+                            o.other_set.insert(slot, item);
+                        } else {
+                            o.equipment.insert(slot, item);
+                        }
                     }
                 }
             }
@@ -1575,6 +1589,7 @@ impl Sim {
                 .get_mut(id)
                 .map(|o| {
                     o.equipment.clear();
+                    o.other_set.clear();
                     std::mem::take(&mut o.inventory)
                 })
                 .unwrap_or_default();

@@ -133,6 +133,10 @@ pub struct Object {
     /// Equipped items by `INVENTORY_SLOT_*`. Equipped items stay in the inventory.
     #[serde(default)]
     pub equipment: BTreeMap<i32, ObjectId>,
+    /// The inactive weapon set's weapons (main hand, off hand, ammunition), swapped with
+    /// `equipment`'s by `SwitchWeaponSet`. The active set is field `ActiveWeaponSet`.
+    #[serde(default)]
+    pub other_set: BTreeMap<i32, ObjectId>,
     /// Integer fields of the template and instance (`Package`, `Race`, `Combatant`, ...),
     /// for engine functions that read them.
     pub fields: BTreeMap<String, i32>,
@@ -174,6 +178,7 @@ impl Object {
             money: 0,
             inventory: Vec::new(),
             equipment: BTreeMap::new(),
+            other_set: BTreeMap::new(),
             fields: BTreeMap::new(),
         }
     }
@@ -242,6 +247,9 @@ pub enum EngineData {
     Command(Command),
     Effect(Effect),
 }
+
+/// Inventory slots that belong to a weapon set (main hand, off hand, ranged ammunition).
+pub const WEAPON_SET_SLOTS: [i32; 3] = [0, 1, 2];
 
 /// The plot actions control: the set shown (0 hides it), whether it is enabled, and each
 /// action's state (0 invalid, 1 enabled, 2 used, 3 active) and count.
