@@ -21,7 +21,9 @@ use crate::d3d::{
     sampler_texture,
 };
 use crate::gpu::{DEPTH_FORMAT, GpuContext, TextureCache};
-use crate::scene::{AreaScene, SceneLight, SceneMaterial, SceneMesh};
+use crate::scene::{
+    AreaScene, DOMAIN_CHARACTERS, DOMAIN_LEVEL, SceneLight, SceneMaterial, SceneMesh,
+};
 
 /// How `CULL_CW` / `CULL_CCW` map onto wgpu. D3D9 culls by screen-space winding; whether our
 /// right-handed camera mirrors the original's is checked by comparing against captures
@@ -659,7 +661,17 @@ impl D3dPass {
                 textures: textures_group,
                 slot,
                 draw: di,
-                lights: pick_lights(&scene.lights, d.sphere),
+                // The level's own meshes come first; the placed objects and creatures
+                // after them are lit as characters.
+                lights: pick_lights(
+                    &scene.lights,
+                    d.sphere,
+                    if di < scene.static_draws {
+                        DOMAIN_LEVEL
+                    } else {
+                        DOMAIN_CHARACTERS
+                    },
+                ),
                 multipass,
             });
         }

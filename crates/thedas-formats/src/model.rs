@@ -27,7 +27,7 @@ pub mod field {
     pub const LIGHT_COLOR: u32 = 6007;
     pub const LIGHT_RADIUS: u32 = 6008;
     pub const AMBIENT_COLOR: u32 = 6010;
-    pub const LIGHT_KIND: u32 = 6296;
+    pub const LIGHT_AFFECT_DOMAIN: u32 = 6296;
     /// A skeleton node's bone index.
     pub const BONE_INDEX: u32 = 6254;
     /// A skinned mesh's palette: the bone index each of its vertices' blend indices names.
@@ -40,17 +40,27 @@ pub const KIND_MESH: FourCC = FourCC::new(b"mshh");
 pub const KIND_POINT_LIGHT: FourCC = FourCC::new(b"nplt");
 pub const KIND_AMBIENT_LIGHT: FourCC = FourCC::new(b"nalt");
 
-/// A light node, as found in a level's `<room>_ll` model.
+/// [`Light::Point`]'s affect domain bit for characters and objects.
+pub const DOMAIN_CHARACTERS: i64 = 1;
+/// [`Light::Point`]'s affect domain bit for level geometry.
+pub const DOMAIN_LEVEL: i64 = 2;
+
+/// A light node, as found in a level's `<room>_ll` and `<room>_lc` models.
 ///
 /// Provisional: `6007` is the colour and `6008` the radius of point lights (`nplt`), `6010`
-/// the colour of ambient lights (`nalt`); `6296` is kept raw (2 on every light in the
-/// candidate levels; plausibly whether the light is baked, dynamic or both).
+/// the colour of ambient lights (`nalt`), and `6296` what the light affects (xoreos names it
+/// `LightAffectDomain`). The rooms' level light models (`<room>_ll`) give 2 on every light
+/// (lamps, bounces, window light); their character light models (`<room>_lc`) give 1 on the
+/// `Char_sun`/`Char_bounce`/`Char_ambient` lights, which reach 600 units. Read as a mask: 1
+/// characters and objects, 2 level geometry.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Light {
     Point {
         color: [f32; 4],
         radius: f32,
-        kind: Option<i64>,
+        /// What the light affects (see [`Light`]): [`DOMAIN_CHARACTERS`], [`DOMAIN_LEVEL`],
+        /// or both; `None` when the node does not say.
+        affect_domain: Option<i64>,
     },
     Ambient {
         color: [f32; 4],
@@ -272,7 +282,7 @@ fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>
         Some(Light::Point {
             color: d.opt_vec4(id, field::LIGHT_COLOR, 1.0)?.unwrap_or([1.0; 4]),
             radius: d.opt_f32(id, field::LIGHT_RADIUS)?.unwrap_or(0.0),
-            kind: d.opt_i64(id, field::LIGHT_KIND)?,
+            affect_domain: d.opt_i64(id, field::LIGHT_AFFECT_DOMAIN)?,
         })
     } else if kind == KIND_AMBIENT_LIGHT {
         Some(Light::Ambient {
@@ -390,7 +400,7 @@ mod tests {
                 (field::NAME, s("Candle")),
                 (field::LIGHT_COLOR, Value::Color([0.5, 0.25, 0.0, 1.0])),
                 (field::LIGHT_RADIUS, Value::F32(12.0)),
-                (field::LIGHT_KIND, Value::I32(2)),
+                (field::LIGHT_AFFECT_DOMAIN, Value::I32(2)),
                 (field::CHILDREN, generic(&[t])),
             ],
         );
@@ -408,7 +418,7 @@ mod tests {
             &Light::Point {
                 color: [0.5, 0.25, 0.0, 1.0],
                 radius: 12.0,
-                kind: Some(2)
+                affect_domain: Some(2)
             }
         );
         assert_eq!(lights[0].chain[1].position, [1.0, 2.0, 3.0]);
