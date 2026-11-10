@@ -1211,6 +1211,68 @@ impl Server {
     }
 
     #[tool(
+        description = "The world map: whether it is open, the pin the party is at, and the primary map's pins with their status (2 = active, travel possible; 3 greyed out; 1 hidden pins are left out)."
+    )]
+    async fn world_map(&self) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_ref().ok_or("no sim")?;
+            let wm = &sim.world.world_map;
+            let pins: Vec<J> = sim
+                .world
+                .objects
+                .values()
+                .filter(|o| {
+                    o.kind == ObjectKind::MapPin
+                        && wm
+                            .primary
+                            .is_none_or(|m| o.locals.objects.get("WM_MAP") == Some(&m))
+                        && o.fields.get("WMStatus").is_some_and(|s| *s > 1)
+                })
+                .map(|o| {
+                    json!({
+                        "id": o.id,
+                        "tag": o.tag,
+                        "name": o.name_strref.and_then(|s| sim.string(s)),
+                        "status": o.fields.get("WMStatus"),
+                        "area": o.locals.strings.get("WM_AREA"),
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "open": wm.open,
+                "primary": wm.primary.and_then(|m| sim.world.get(m)).map(|m| m.tag.clone()),
+                "at": wm.player_pin.and_then(|p| sim.world.get(p)).map(|p| p.tag.clone()),
+                "pins": pins,
+            }))
+        })
+    }
+
+    #[tool(
+        description = "Travel on the world map to a pin (as clicking it does): the module's travel script runs (it may stop the party at a random encounter), then the party arrives. Returns the area the party ends up in."
+    )]
+    async fn travel(&self, Parameters(a): Parameters<ObjectArg>) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            let pin = resolve(sim, &a.object).ok_or("no such pin")?;
+            if !sim.begin_travel(pin) {
+                return Err("that pin cannot be travelled to (not an active pin?)".into());
+            }
+            for _ in 0..50 {
+                sim.tick(100);
+                if !sim.world.world_map.arriving && sim.world.world_map.travelling_to.is_none() {
+                    break;
+                }
+            }
+            sim.tick(0);
+            Ok(json!({
+                "area": sim.world.area.and_then(|x| sim.world.get(x)).map(|x| x.tag.clone()),
+                "time_ms": sim.world.time_ms,
+                "conversation": dialog_json(sim),
+            }))
+        })
+    }
+
+    #[tool(
         description = "Turn autopilot on or off. On, nobody is under direct control and the game's party AI fights for every party member, the hero included, with its tactics (a hero with none gets its class's first tactics preset). Use step to let fights play out."
     )]
     async fn autopilot(&self, Parameters(a): Parameters<AutopilotArgs>) -> String {

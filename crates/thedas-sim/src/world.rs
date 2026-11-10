@@ -27,6 +27,12 @@ pub enum ObjectKind {
     /// Stage (a cutscene/conversation staging point).
     Stage,
     Party,
+    /// A world map (`.map`, e.g. `wide_open_world`).
+    Map,
+    /// A location pin on a world map (`wml_wow_lothering`).
+    MapPin,
+    /// A projectile in flight (`FireProjectile`).
+    Projectile,
 }
 
 impl ObjectKind {
@@ -44,6 +50,10 @@ impl ObjectKind {
             ObjectKind::Sound => 16384,
             ObjectKind::Party => 32768,
             ObjectKind::Stage => 0,
+            ObjectKind::Map => 262144,
+            // Provisional: pins are taken to be the map patches.
+            ObjectKind::MapPin => 65536,
+            ObjectKind::Projectile => 256,
         }
     }
 }
@@ -298,6 +308,12 @@ pub struct World {
     /// controlling. For playing without a player.
     #[serde(default)]
     pub autopilot: bool,
+    /// Objects to remove at a time (projectiles when they land).
+    #[serde(default)]
+    pub destroy_at: Vec<(u64, ObjectId)>,
+    /// The world map (see `worldmap`).
+    #[serde(default)]
+    pub world_map: crate::worldmap::WorldMapState,
     /// Group pairs set hostile with `SetGroupHostility`.
     #[serde(default, with = "pairs")]
     pub hostility: BTreeMap<(i32, i32), bool>,
@@ -393,6 +409,8 @@ impl World {
             hostility: BTreeMap::new(),
             party_fighting: false,
             autopilot: false,
+            destroy_at: Vec::new(),
+            world_map: Default::default(),
             rng: Rng::new(seed),
             trace: Trace::default(),
             tables,
@@ -436,6 +454,9 @@ impl World {
     /// the game; another area of the same list may hold its own copy of a creature), then
     /// area-less objects (module, areas), then the rest. Provisional.
     pub fn find_tag(&self, tag: &str, n: usize) -> Option<ObjectId> {
+        if tag.is_empty() {
+            return None;
+        }
         let mut found: Vec<&Object> = self.by_tag(tag).collect();
         found.sort_by_key(|o| match o.area {
             x if x.is_some() && x == self.area => 0,
@@ -450,6 +471,23 @@ impl World {
         self.objects
             .values()
             .filter(move |o| o.tag.to_ascii_lowercase() == tag)
+    }
+
+    /// Removes an object `delay_ms` from now.
+    pub fn queue_destroy(&mut self, delay_ms: u64, id: ObjectId) {
+        self.destroy_at.push((self.time_ms + delay_ms, id));
+    }
+
+    /// Removes the objects whose time is up.
+    pub fn destroy_due(&mut self) {
+        let now = self.time_ms;
+        let (due, keep): (Vec<_>, Vec<_>) = self.destroy_at.drain(..).partition(|(t, _)| *t <= now);
+        self.destroy_at = keep;
+        for (_, id) in due {
+            if Some(id) != self.hero {
+                self.objects.remove(&id);
+            }
+        }
     }
 
     /// Queues an event `delay_ms` from now.

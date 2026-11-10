@@ -61,6 +61,15 @@ impl Sim {
         world.trace.entries.clear();
         self.world = world;
         self.talk = save.talk;
+        // Saves from before world maps were simulated have none.
+        if !self
+            .world
+            .objects
+            .values()
+            .any(|o| o.kind == crate::world::ObjectKind::Map)
+        {
+            self.load_world_maps();
+        }
         Ok(())
     }
 

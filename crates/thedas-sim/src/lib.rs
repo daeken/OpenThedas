@@ -24,6 +24,7 @@ pub mod session;
 pub mod sim;
 pub mod trace;
 pub mod world;
+pub mod worldmap;
 
 pub use sim::Sim;
 pub use world::World;
