@@ -152,7 +152,6 @@ const PRESENTATION: &[&str] = &[
     "PlaySoundObject",
     "SetLoadHint",
     "LinkAreaMiniMaps",
-    "SetQuickslot",
     "SendGameEventRunDatabase",
     "SetTrainingMode",
     "SetPlaceableHealth",
@@ -947,12 +946,10 @@ pub fn call(
                 return ok(Value::Float(gear));
             } else if vt == current {
                 cur
-            } else if bounds.is_some_and(|b| b.0 == 3) {
-                // A depletable's total is its maximum: the base and its modifiers, whatever
-                // is left of it now.
-                base + gear
             } else {
-                base.max(cur) + gear
+                // A depletable's total is its maximum: the base and its modifiers, whatever
+                // is left of it now (see `Sim::property_total`).
+                return ok(Value::Float(h.sim.property_total(obj(a, 0), int(a, 1))));
             };
             // Totals and attributes stay within `properties.gda`'s Min and Max (a depletable's
             // current value may still run down to 0). Provisional: inferred from the table.
@@ -2462,6 +2459,30 @@ pub fn call(
             void()
         }
         "GetItemValue" => ok(Value::Int(h.sim.item_value(obj(a, 0)))),
+        // A quickbar slot: an ability and the tag of the item it comes from; no ability
+        // empties it.
+        "SetQuickslot" => {
+            let (slot, ability, item) = (int(a, 1), int(a, 2), string(a, 3));
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                if ability > 0 {
+                    o.quickslots
+                        .insert(slot, crate::world::Quickslot { ability, item });
+                } else {
+                    o.quickslots.remove(&slot);
+                }
+            }
+            void()
+        }
+        "GetQuickslot" => {
+            let (who, slot) = (obj(a, 0), int(a, 1));
+            ok(Value::Int(
+                h.sim
+                    .quickbar(who)
+                    .into_iter()
+                    .find(|(s, _)| *s == slot)
+                    .map_or(0, |(_, q)| q.ability),
+            ))
+        }
         "GetStoreMoney" => ok(Value::Int(store_field(h, obj(a, 0), "StoreMoney", -1))),
         "SetStoreMoney" => set_store_field(h, obj(a, 0), "StoreMoney", int(a, 1)),
         "GetStoreMaxBuyPrice" => ok(Value::Int(store_field(h, obj(a, 0), "MaxBuyPrice", -1))),
@@ -3203,7 +3224,7 @@ pub fn inside(p: [f32; 3], poly: &[[f32; 3]]) -> bool {
 }
 
 /// The key `SetCooldown` and `GetRemainingCooldown` share: the ability and source item tag.
-fn cooldown_key(ability: i32, item: &str) -> String {
+pub(crate) fn cooldown_key(ability: i32, item: &str) -> String {
     format!("{ability}:{}", item.to_ascii_lowercase())
 }
 
@@ -3280,7 +3301,7 @@ fn placeable_default_action(sim: &Sim, id: ObjectId) -> Option<i32> {
 }
 
 /// A property's type (as `GetCreaturePropertyType`), Min and Max from `properties.gda`.
-fn property_bounds(sim: &Sim, property: i32) -> Option<(i32, f32, f32)> {
+pub(crate) fn property_bounds(sim: &Sim, property: i32) -> Option<(i32, f32, f32)> {
     let t = sim.world.tables.get(0, "properties")?;
     let num = |c: Option<&Cell>| match c {
         Some(Cell::Int(v)) => Some(*v as f32),

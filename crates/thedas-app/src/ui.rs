@@ -199,7 +199,14 @@ impl UiLayer {
     /// One interface frame while playing: binds the simulation's values, brings the screens
     /// up to it, runs the movies `dt_ms` and applies the messages nothing handled yet. The
     /// simulation is not locked while the movies run (their handler locks it).
-    pub fn play(&mut self, screens: &mut Screens, sim: &Arc<Mutex<Sim>>, dt_ms: f64) {
+    /// Returns the abilities the movies asked to use on a target the player is to pick (see
+    /// [`thedas_ui::input::aim`]).
+    pub fn play(
+        &mut self,
+        screens: &mut Screens,
+        sim: &Arc<Mutex<Sim>>,
+        dt_ms: f64,
+    ) -> Vec<thedas_ui::input::Aim> {
         let (want, line) = {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             let shown = self.shown.lock().map(|s| s.clone()).unwrap_or_default();
@@ -256,12 +263,26 @@ impl UiLayer {
                 log::info!("ui: {name} {args:?}");
             }
         }
+        let mut aims = Vec::new();
+        {
+            let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+            for (name, args) in &ignored {
+                if let Some(a) = thedas_ui::input::aim(&sim, name, args) {
+                    aims.push(a);
+                }
+            }
+        }
         for (name, _) in ignored {
-            // The stage closes a movie that asks for this itself.
-            if name != "GUI.HideFullScreenGUI" && self.ignored.insert(name.clone()) {
+            // The stage closes a movie that asks for this itself; an ability to aim is the
+            // app's to finish.
+            if name != "GUI.HideFullScreenGUI"
+                && name != thedas_ui::input::PERFORM_ABILITY
+                && self.ignored.insert(name.clone())
+            {
                 log::warn!("ui: the simulation does not handle {name} yet");
             }
         }
+        aims
     }
 
     /// A left click while playing reached the interface: a conversation line still playing is

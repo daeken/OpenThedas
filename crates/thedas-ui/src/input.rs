@@ -12,6 +12,58 @@ use crate::protocol::{GameMessage, MessageHandler};
 
 /// conversation.gfx's reply pick: the reply's index.
 pub const SELECT_RESPONSE: &str = "Conversation.SelectResponse";
+/// quickbar.gfx's slot use: the ability, the party member and the item it comes from.
+pub const PERFORM_ABILITY: &str = "GameModeController.PerformAbility";
+
+/// An ability waiting for its target (a quickbar ability that is not used on its user).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Aim {
+    pub caster: u32,
+    pub ability: i32,
+    /// The tag of the item it comes from, if any.
+    pub item: String,
+}
+
+/// `who` uses quickbar `slot` (its key was pressed): an ability used on its user goes at
+/// once; one that needs a target is returned to be aimed. Nothing in the slot, nothing.
+pub fn use_quickslot(sim: &mut Sim, who: u32, slot: i32) -> Option<Aim> {
+    let (_, q) = sim.quickbar(who).into_iter().find(|(s, _)| *s == slot)?;
+    if sim.ability_on_self(q.ability) {
+        sim.order_ability(who, q.ability, who, &q.item);
+        return None;
+    }
+    Some(Aim {
+        caster: who,
+        ability: q.ability,
+        item: q.item,
+    })
+}
+
+/// The ability a [`PERFORM_ABILITY`] message asks a party member to use.
+pub fn aim(sim: &Sim, name: &str, args: &[String]) -> Option<Aim> {
+    if name != PERFORM_ABILITY {
+        return None;
+    }
+    let int = |i: usize| {
+        args.get(i)
+            .and_then(|a| a.trim().parse::<f64>().ok())
+            .filter(|v| v.fract() == 0.0 && *v >= 0.0 && *v < u32::MAX as f64)
+            .map(|v| v as u32)
+    };
+    let (ability, caster) = (int(0)?, int(1)?);
+    if ability == 0 || !thedas_sim::engine::party_of(sim).contains(&caster) {
+        return None;
+    }
+    let item = int(2)
+        .and_then(|i| sim.world.get(i))
+        .map(|o| o.tag.clone())
+        .unwrap_or_default();
+    Some(Aim {
+        caster,
+        ability: ability as i32,
+        item,
+    })
+}
 
 /// Acts on a message a movie sent: a conversation reply is picked (continuing past the last
 /// line of one that ended closes it), anything else goes to the simulation's interface
@@ -28,6 +80,15 @@ pub fn apply(sim: &mut Sim, name: &str, args: &[String]) -> bool {
             sim.choose_reply(n);
         }
         sim.tick(0);
+        return true;
+    }
+    // An ability used on its user goes at once; one that needs a target waits for the
+    // player to pick it (the message is passed back).
+    if let Some(a) = aim(sim, name, args) {
+        if !sim.ability_on_self(a.ability) {
+            return false;
+        }
+        sim.order_ability(a.caster, a.ability, a.caster, &a.item);
         return true;
     }
     if sim.gui_message(name, args) {
@@ -127,6 +188,41 @@ mod tests {
             ],
         );
         assert_eq!(left, vec![("Nobody.Listens".to_string(), vec!["1".into()])]);
+    }
+
+    #[test]
+    fn quickbar_abilities_go_at_once_on_self_and_wait_for_a_target_otherwise() {
+        use thedas_formats::gda::Cell;
+        let mut s = sim();
+        s.world.tables().insert(
+            "ABI_base",
+            &["TargetType"],
+            vec![(700, vec![Cell::Int(1)]), (3024, vec![Cell::Int(4)])],
+        );
+        let hero = s
+            .world
+            .spawn(thedas_sim::world::ObjectKind::Creature, "hero");
+        s.world.hero = Some(hero);
+        let args = |a: i32| vec![a.to_string(), hero.to_string(), "0".to_string()];
+        // On its user: ordered now.
+        assert!(apply(&mut s, PERFORM_ABILITY, &args(700)));
+        let q = &s.world.get(hero).unwrap().commands;
+        assert_eq!((q[0].ints.clone(), q[0].target), (vec![700], Some(hero)));
+        // On a foe: passed back to be aimed.
+        assert!(!apply(&mut s, PERFORM_ABILITY, &args(3024)));
+        assert_eq!(
+            aim(&s, PERFORM_ABILITY, &args(3024)),
+            Some(Aim {
+                caster: hero,
+                ability: 3024,
+                item: String::new()
+            })
+        );
+        // Not a party member: nothing.
+        assert_eq!(
+            aim(&s, PERFORM_ABILITY, &["3024".into(), "999".into()]),
+            None
+        );
     }
 
     #[test]

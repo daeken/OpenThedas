@@ -117,6 +117,9 @@ pub struct Object {
     /// `PROPERTY_VALUE_MODIFIER` part of a total.
     #[serde(default)]
     pub modifiers: BTreeMap<i32, f32>,
+    /// Quickbar slots scripts filled (`SetQuickslot`): ability and the item it comes from.
+    #[serde(default)]
+    pub quickslots: BTreeMap<i32, Quickslot>,
     pub dead: bool,
     /// When the creature last died (simulation milliseconds); `None` while alive. For
     /// presentation (the death animation plays from it) and saves.
@@ -187,6 +190,7 @@ impl Object {
             dialog: None,
             properties: BTreeMap::new(),
             modifiers: BTreeMap::new(),
+            quickslots: BTreeMap::new(),
             dead: false,
             died_at: None,
             head_morph: None,
@@ -283,6 +287,13 @@ pub struct Effect {
     /// scripts), by index.
     #[serde(default)]
     pub engine_ints: Vec<(i32, i32)>,
+}
+
+/// A quickbar slot: an ability, and the tag of the item it comes from (a potion), if any.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Quickslot {
+    pub ability: i32,
+    pub item: String,
 }
 
 /// Engine structures held by handle (scripts copy handles; every `Set*` makes a new one).

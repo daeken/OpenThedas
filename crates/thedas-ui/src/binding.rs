@@ -182,9 +182,19 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         v.insert(format!("{prefix}.Dead"), num(o.dead as u8));
         // The simulation keeps (base, current); for depletable properties (health, mana)
         // the base is the maximum the bars show as Total.
+        // Health and mana bars show their maximum with what gear and effects add.
+        let depletable = [
+            thedas_sim::sim::constant(&sim.table, "PROPERTY_DEPLETABLE_HEALTH"),
+            thedas_sim::sim::constant(&sim.table, "PROPERTY_DEPLETABLE_MANA_STAMINA"),
+        ];
         for (p, (total, cur)) in &o.properties {
+            let total = if depletable.contains(p) && *p != 0 {
+                sim.depletable_max(id, *p)
+            } else {
+                *total
+            };
             v.insert(format!("{prefix}.Attributes.{p}.Current"), num(*cur));
-            v.insert(format!("{prefix}.Attributes.{p}.Total"), num(*total));
+            v.insert(format!("{prefix}.Attributes.{p}.Total"), num(total));
         }
     };
     for (i, id) in members.iter().enumerate() {
@@ -345,7 +355,113 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         .count();
     set("Area.CreatureCount".into(), num(creatures as f64));
     inventory(sim, controlled.or(hero), shown.item_filter, &mut v);
+    if let Some(who) = controlled.or(hero) {
+        quickbar(sim, who, &mut v);
+    }
     v
+}
+
+/// The quickbar of the party member the player controls (`GUI.SelectedChar.Stats.
+/// QuickSlots.N`, 0 when empty): each slot's ability as an ability icon reads it, whether it
+/// is on (`Status` 1, a sustained ability running), how much cooldown is left, and the item
+/// it comes from.
+fn quickbar(sim: &Sim, who: u32, v: &mut BTreeMap<String, UiValue>) {
+    let tables = sim.world.tables();
+    let abi = tables.get(0, "ABI_base");
+    let bar = sim.quickbar(who);
+    v.insert("GUI.SelectedChar.Stats.QuickbarLocked".into(), num(0));
+    // The quickbar shows its first row only. Provisional.
+    v.insert("Party.QuickbarExpandValue".into(), num(0));
+    // The keys shown on the first ten slots: the game's default bindings, 1 to 0.
+    for n in 1..=10 {
+        v.insert(
+            format!("InputMappings.Mappings.ActivateQuickslot{n}.PrimaryMappedKey"),
+            UiValue::String((n % 10).to_string()),
+        );
+    }
+    for slot in 0..thedas_sim::quickbar::QUICKSLOTS {
+        let k = format!("GUI.SelectedChar.Stats.QuickSlots.{slot}");
+        let Some((_, q)) = bar.iter().find(|(s, _)| *s == slot) else {
+            v.insert(k, num(0));
+            continue;
+        };
+        if let Some(abi) = &abi {
+            let ty = match abi.cell("AbilityType", q.ability as i64) {
+                Some(thedas_formats::gda::Cell::Int(t)) => *t,
+                _ => 0,
+            };
+            crate::chains::ability(
+                sim,
+                abi,
+                &k,
+                q.ability as i64,
+                ty,
+                crate::chains::DISPLAYSTATE_HAVE,
+                v,
+            );
+        } else {
+            v.insert(k.clone(), num(q.ability));
+        }
+        let item = sim
+            .party_backpack()
+            .into_iter()
+            .chain(
+                sim.world
+                    .get(who)
+                    .map(|o| o.inventory.clone())
+                    .unwrap_or_default(),
+            )
+            .find(|&i| {
+                !q.item.is_empty()
+                    && sim
+                        .world
+                        .get(i)
+                        .is_some_and(|o| o.tag.eq_ignore_ascii_case(&q.item))
+            });
+        v.insert(
+            format!("{k}.Status"),
+            num(sim.modal_active(who, q.ability) as u8),
+        );
+        v.insert(
+            format!("{k}.CooldownPercentage"),
+            num(sim.cooldown_left(who, q.ability, &q.item)),
+        );
+        v.insert(format!("{k}.PendingActivation"), num(0));
+        // The slot's picture (quickbar.gfx draws only this): the item's icon for an
+        // item's slot, else the ability's. Provisional: inferred from the movie.
+        let icon = match item {
+            Some(i) => sim.item_look(i).icon,
+            None => abi
+                .as_ref()
+                .and_then(|t| match t.cell("Icon", q.ability as i64) {
+                    Some(thedas_formats::gda::Cell::String(s)) => {
+                        Some(s.trim_end_matches('\0').trim().to_string())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default(),
+        };
+        v.insert(format!("{k}.ItemIcon"), UiValue::String(icon));
+        v.insert(format!("{k}.SourceItem.ID"), num(item.unwrap_or(0)));
+        v.insert(
+            format!("{k}.SourceItemTag"),
+            UiValue::String(q.item.clone()),
+        );
+        v.insert(
+            format!("{k}.RefTemplate"),
+            UiValue::String(
+                item.and_then(|i| sim.world.get(i))
+                    .map(|o| o.template.clone())
+                    .unwrap_or_default(),
+            ),
+        );
+        // How many of the item are left; no text for an ability's slot.
+        let stack = match item.and_then(|i| sim.world.get(i)) {
+            Some(o) => num(o.fields.get("StackSize").copied().unwrap_or(1)),
+            None => UiValue::String(String::new()),
+        };
+        v.insert(format!("{k}.SourceItem.StackSize"), stack);
+    }
 }
 
 /// An item as the inventory screens read it (`<prefix>.ID`, `.Name`, `.Icon`, ...).
@@ -549,6 +665,49 @@ mod tests {
             },
         );
         assert!(other.contains_key(&format!("{k}.0")));
+    }
+
+    #[test]
+    fn the_quickbar_shows_the_selected_members_abilities() {
+        use thedas_formats::gda::Cell;
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        sim.world.tables().insert(
+            "ABI_base",
+            &["AbilityType", "UseType", "TargetType", "Icon"],
+            vec![(
+                3024,
+                vec![
+                    Cell::Int(1),
+                    Cell::Int(4),
+                    Cell::Int(4),
+                    Cell::String("tlt_ico_overrun".into()),
+                ],
+            )],
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        sim.world.hero = Some(hero);
+        sim.world.get_mut(hero).unwrap().abilities.insert(3024);
+        let v = sim_values(&sim);
+        let k = "GUI.SelectedChar.Stats.QuickSlots";
+        assert_eq!(v[&format!("{k}.0")], UiValue::Number(3024.0));
+        assert_eq!(
+            v[&format!("{k}.0.ItemIcon")],
+            UiValue::String("tlt_ico_overrun".into())
+        );
+        assert_eq!(v[&format!("{k}.0.Status")], UiValue::Number(0.0));
+        assert_eq!(
+            v[&format!("{k}.0.CooldownPercentage")],
+            UiValue::Number(0.0)
+        );
+        assert_eq!(v[&format!("{k}.1")], UiValue::Number(0.0));
+        assert_eq!(
+            v["InputMappings.Mappings.ActivateQuickslot10.PrimaryMappedKey"],
+            UiValue::String("0".into())
+        );
     }
 
     #[test]
