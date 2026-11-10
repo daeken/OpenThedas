@@ -260,6 +260,15 @@ struct LevelUpArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct HeadMorphArgs {
+    /// A preset number 1-4 for the creature's race and gender (`hm_pcc_b01` ...), or a
+    /// morph resource name.
+    morph: String,
+    /// The creature (object id or tag); the hero when left out.
+    object: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct ChargenArgs {
     /// Event name without EVENT_TYPE_: CHARGEN_SELECT_GENDER, CHARGEN_SELECT_RACE,
     /// CHARGEN_SELECT_CLASS, CHARGEN_SELECT_BACKGROUND, CHARGEN_SELECT_NAME,
@@ -1180,6 +1189,27 @@ impl Server {
                 "area": sim.world.area.map(|x| summary(sim, x)),
                 "conversation": dialog_json(sim),
             }))
+        })
+    }
+
+    #[tool(
+        description = "Choose a face, as character creation's face screen does: a head preset 1-4 for the creature's race and gender, or a head morph resource. The creature keeps it (and saves it); the hero when no object is given."
+    )]
+    async fn set_head_morph(&self, Parameters(a): Parameters<HeadMorphArgs>) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            let who = match &a.object {
+                Some(o) => resolve(sim, o).ok_or("no such object")?,
+                None => sim.world.hero.ok_or("no hero")?,
+            };
+            let morph = match a.morph.trim().parse::<u32>() {
+                Ok(n) if (1..=thedas_sim::Sim::CHARGEN_HEAD_PRESETS).contains(&n) => sim
+                    .chargen_head_preset(who, n)
+                    .ok_or("no such preset for this creature's race and gender")?,
+                _ => a.morph.clone(),
+            };
+            sim.set_head_morph(who, Some(morph));
+            Ok(json!({ "object": who, "head_morph": sim.world.get(who).and_then(|o| o.head_morph.clone()) }))
         })
     }
 

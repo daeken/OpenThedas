@@ -14,8 +14,9 @@
 //!   from the body's attachment nodes.
 //! - Heads: a creature template's `Appearance Data` names a head morph (`HeadMorph`, a
 //!   `.mor`), which names the head, eyes, hair, beard and lashes and carries the face's
-//!   shape and colours. Part-based creatures without one (the hero, made in character
-//!   creation) get the race's base head (`hm_uhm_basa_0`, eyes and lashes; provisional).
+//!   shape and colours. A morph kept on the creature (the player's face from character
+//!   creation) comes first. Part-based creatures with neither get the race's base head
+//!   (`hm_uhm_basa_0`, eyes and lashes; provisional).
 
 use thedas_formats::gda::Cell;
 use thedas_script::vm::ObjectId;
@@ -116,9 +117,17 @@ fn has_model(sim: &Sim, model: &str) -> bool {
     sim.vfs.lookup(&format!("{model}.mmh")).is_some()
 }
 
-/// The head morph a creature's template names (`Appearance Data` / `HeadMorph`), if the
-/// resource exists.
+/// A creature's head morph, if the resource exists: the one it keeps (the player's face
+/// from character creation), else the one its template names (`Appearance Data` /
+/// `HeadMorph`).
 pub fn head_morph(sim: &Sim, o: &Object) -> Option<String> {
+    if let Some(m) = o
+        .head_morph
+        .as_ref()
+        .filter(|m| sim.vfs.lookup(&format!("{m}.mor")).is_some())
+    {
+        return Some(m.clone());
+    }
     use thedas_formats::gff3::{Gff3, Struct, Value};
     fn field<'a>(s: &'a Struct, label: &str) -> Option<&'a Value> {
         s.fields.iter().find(|f| f.label == label).map(|f| &f.value)

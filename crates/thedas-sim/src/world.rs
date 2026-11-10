@@ -117,6 +117,11 @@ pub struct Object {
     /// presentation (the death animation plays from it) and saves.
     #[serde(default)]
     pub died_at: Option<u64>,
+    /// A head morph kept on the creature itself (`.mor` resource, no extension), as
+    /// character creation leaves the player's face; others take theirs from their
+    /// template's `Appearance Data`. Saved.
+    #[serde(default)]
+    pub head_morph: Option<String>,
     pub immortal: bool,
     pub plot: bool,
     pub team: i32,
@@ -178,6 +183,7 @@ impl Object {
             properties: BTreeMap::new(),
             dead: false,
             died_at: None,
+            head_morph: None,
             immortal: false,
             plot: false,
             team: -1,
