@@ -650,7 +650,7 @@ impl Server {
                     "values": values,
                     "unanswered": unanswered,
                     "failed_loads": stage.failed_loads(),
-                    "log": stage.log.iter().rev().take(40).collect::<Vec<_>>(),
+                    "log": stage.log.iter().rev().take(200).rev().collect::<Vec<_>>(),
                 }))
             })
             .await;

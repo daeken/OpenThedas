@@ -1046,13 +1046,23 @@ pub fn call(
                 _ => Value::Object(e.objects.get(i).copied().unwrap_or(OBJECT_INVALID)),
             })
         }
-        "SetEffectInteger" | "SetEffectFloat" | "SetEffectObject" | "SetEffectCreator"
-        | "SetEffectAbilityID" => {
+        "SetEffectInteger"
+        | "SetEffectFloat"
+        | "SetEffectObject"
+        | "SetEffectCreator"
+        | "SetEffectAbilityID"
+        | "SetEffectEngineFloat" => {
             let mut e = match h.sim.world.handle(handle(a, 0)) {
                 Some(EngineData::Effect(e)) => e.clone(),
                 _ => Effect::default(),
             };
             let i = int(a, 1).max(0) as usize;
+            // Engine floats are kept apart from script floats (provisional layout).
+            let (name, i) = if name == "SetEffectEngineFloat" {
+                ("SetEffectFloat", i + 32)
+            } else {
+                (name, i)
+            };
             match name {
                 "SetEffectInteger" if i < 64 => {
                     if e.ints.len() <= i {
@@ -1265,6 +1275,67 @@ pub fn call(
                 handle: hd,
             })
         }
+        "GetObjectsInShape" => {
+            // Provisional: every shape is treated as a sphere of its largest dimension.
+            let (mask, excl_dead) = (int(a, 0), int(a, 6) != 0);
+            let radius = float(a, 3).max(float(a, 4)).max(float(a, 5));
+            let l = match h.sim.world.handle(handle(a, 2)) {
+                Some(EngineData::Location(l)) => Some(*l),
+                _ => None,
+            };
+            let list: Vec<ObjectId> = match l {
+                Some(l) => h
+                    .sim
+                    .world
+                    .objects
+                    .values()
+                    .filter(|o| o.area == Some(l.area) && o.active)
+                    .filter(|o| mask == 0 || o.kind.script_type() & mask != 0)
+                    .filter(|o| !excl_dead || !o.dead)
+                    .filter(|o| dist(o.position, l.position) <= radius)
+                    .map(|o| o.id)
+                    .collect(),
+                None => Vec::new(),
+            };
+            ok(objects(list))
+        }
+        "EffectAreaOfEffect" => {
+            // EffectAreaOfEffect is type 5 ("Area of Effect (AOE)") in effects.gda.
+            let e = Effect {
+                ty: 5,
+                creator: Some(caller),
+                ints: vec![int(a, 0), int(a, 2)],
+                strings: vec![string(a, 1)],
+                ..Default::default()
+            };
+            let hd = h.sim.world.store(EngineData::Effect(e));
+            ok(Value::Engine {
+                ty: ty.effect,
+                handle: Some(hd),
+            })
+        }
+        "SetTrapDetected" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields.insert("TrapDetected".into(), int(a, 1));
+            }
+            void()
+        }
+        "SetRoamRadius" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.locals.floats.insert("__roam_radius".into(), float(a, 1));
+            }
+            void()
+        }
+        "SetRoamLocation" => {
+            let l = match h.sim.world.handle(handle(a, 1)) {
+                Some(EngineData::Location(l)) => Some(*l),
+                _ => None,
+            };
+            if let (Some(l), Some(o)) = (l, h.sim.world.get_mut(obj(a, 0))) {
+                o.locals.locations.insert("__roam_location".into(), l);
+            }
+            void()
+        }
         "GetHealth" => {
             let health = constant(&h.sim.table, "PROPERTY_DEPLETABLE_HEALTH");
             ok(Value::Int(
@@ -1430,6 +1501,11 @@ pub fn call(
             }
             void()
         }
+        "GetFollowerApproval" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .and_then(|o| o.fields.get("Approval").copied())
+                .unwrap_or(0),
+        )),
         "AdjustFollowerApproval" => {
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
                 *o.fields.entry("Approval".into()).or_default() += int(a, 1);

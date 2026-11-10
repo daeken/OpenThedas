@@ -59,6 +59,35 @@ pub fn talk_table(vfs: &Vfs) -> crate::protocol::StringLookup {
     Arc::new(move |id| map.get(&id).cloned())
 }
 
+/// Serves the movies' loads: images they ask for by `.dds` name (`img://name.dds`, how
+/// Scaleform games hand textures to `loadMovie`) come from the GUI atlases or the resource
+/// stack, converted to PNG, which the player can decode; everything else is passed through.
+pub fn image_lookup(
+    lookup: ResourceLookup,
+    images: Arc<std::sync::Mutex<ImageSource>>,
+) -> ResourceLookup {
+    Arc::new(move |name: &str| {
+        if name.ends_with(".dds") || name.ends_with(".tga") {
+            let img = images.lock().ok()?.image(name)?;
+            return encode_png(&img);
+        }
+        lookup(name)
+    })
+}
+
+/// RGBA8 to PNG bytes.
+pub fn encode_png(img: &Rgba) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(std::io::Cursor::new(&mut out), img.width, img.height);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut w = enc.write_header().ok()?;
+        w.write_image_data(&img.pixels).ok()?;
+    }
+    Some(out)
+}
+
 /// `base = src + base * (1 - src.a)` for a premultiplied `src` of the same size.
 pub fn blend_premultiplied(base: &mut Rgba, src: &Rgba) {
     if (base.width, base.height) != (src.width, src.height) {
@@ -84,7 +113,7 @@ pub struct Stage {
     pub bridge: GameBridge,
     gpu: Gpu,
     lookup: ResourceLookup,
-    images: ImageSource,
+    images: Arc<std::sync::Mutex<ImageSource>>,
     size: (u32, u32),
 }
 
@@ -97,6 +126,7 @@ impl Stage {
             .filter(|n| n.starts_with("atl_") && n.ends_with("_dat.xml"));
         let images = ImageSource::new(lookup.clone(), atlases);
         log::info!("ui: {} atlas images indexed", images.len());
+        let images = Arc::new(std::sync::Mutex::new(images));
         Self {
             movies: Vec::new(),
             log: Vec::new(),
@@ -114,7 +144,13 @@ impl Stage {
 
     /// Loads a movie (`mainmenu.gfx`) on top of the others and starts it.
     pub fn open(&mut self, name: &str) -> Result<(), UiError> {
-        let (swf, rep) = crate::load_movie(name, &self.lookup, &mut self.images)?;
+        let (swf, rep) = {
+            let mut images = self
+                .images
+                .lock()
+                .map_err(|_| UiError::Render("image source poisoned".into()))?;
+            crate::load_movie(name, &self.lookup, &mut images)?
+        };
         log::info!(
             "ui: {name}: {} images inlined, {} missing, Scaleform tags dropped {:?}",
             rep.images_inlined.len(),
@@ -129,7 +165,7 @@ impl Stage {
             name,
             &swf,
             self.size,
-            self.lookup.clone(),
+            image_lookup(self.lookup.clone(), self.images.clone()),
             Some(self.bridge.responder()),
         )?;
         // Run until the injected frame-one action has registered its callback (class
@@ -259,6 +295,25 @@ mod tests {
             vec!["quickbar.gfx", "x.swf"]
         );
         assert_eq!(movie_names("hud").len(), 3);
+    }
+
+    #[test]
+    fn images_become_png_and_other_loads_pass_through() {
+        let lookup: ResourceLookup = Arc::new(|n: &str| (n == "lib.gfx").then(|| b"GFX".to_vec()));
+        let images = Arc::new(std::sync::Mutex::new(ImageSource::new(
+            lookup.clone(),
+            Vec::<String>::new(),
+        )));
+        let l = image_lookup(lookup, images);
+        assert_eq!(l("lib.gfx"), Some(b"GFX".to_vec()));
+        assert_eq!(l("missing.dds"), None);
+        let png = encode_png(&Rgba {
+            width: 1,
+            height: 1,
+            pixels: vec![1, 2, 3, 4],
+        })
+        .unwrap();
+        assert_eq!(&png[1..4], b"PNG");
     }
 
     #[test]
