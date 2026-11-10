@@ -916,6 +916,16 @@ impl Server {
         })
     }
 
+    #[tool(
+        description = "Coverage counters since the simulation was loaded: calls to unimplemented engine functions, to placeholder stubs and to presentation-only functions, and 2DA lookups that found no such table or column, each by count."
+    )]
+    async fn coverage(&self) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_ref().ok_or("no sim")?;
+            Ok(sim.world.trace.coverage())
+        })
+    }
+
     #[tool(description = "List objects, optionally filtered by tag substring and kind.")]
     async fn list_objects(&self, Parameters(a): Parameters<ListArgs>) -> String {
         self.with_sim(|st| {
@@ -1787,7 +1797,17 @@ impl rmcp::ServerHandler for Server {}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let service = Server::new().serve(rmcp::transport::stdio()).await?;
+    let server = Server::new();
+    let state = server.state.clone();
+    let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
+    // THEDAS_COVERAGE names a JSON file the session's coverage counters are added to on
+    // exit (unimplemented, stubbed and presentation-only engine calls, missing 2DA data).
+    if let Some(path) = std::env::var_os("THEDAS_COVERAGE") {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(sim) = &st.sim {
+            let _ = sim.world.trace.merge_coverage(std::path::Path::new(&path));
+        }
+    }
     Ok(())
 }

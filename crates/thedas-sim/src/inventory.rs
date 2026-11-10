@@ -12,6 +12,45 @@ use crate::sim::Sim;
 use crate::world::ObjectKind;
 
 impl Sim {
+    /// `ScaleEquippedItems`: gives a creature's equipped items the material their material
+    /// progression (`TS_Material`, table 199: a row per progression, columns `Material1` to
+    /// `Material15`) has at the target level, as the treasure scripts pick an item's
+    /// material: tier (level - 1) / 3 + 1 with the level between 1 and 45 and the tier
+    /// between 1 and 15. Unique items and items without a progression keep theirs; party
+    /// members are not scaled (script.ldf). Provisional: the treasure scripts' rule taken for
+    /// the engine's.
+    pub fn scale_equipped_items(&mut self, creature: ObjectId, level: i32) {
+        if crate::engine::party_of(self).contains(&creature) {
+            return;
+        }
+        let tier = ((level.clamp(1, 45) - 1) / 3 + 1).clamp(1, 15);
+        let items: Vec<ObjectId> = self
+            .world
+            .get(creature)
+            .map(|o| o.equipment.values().copied().collect())
+            .unwrap_or_default();
+        let tables = self.world.tables();
+        let Some(t) = tables.get(199, "") else {
+            return;
+        };
+        for item in items {
+            let Some(o) = self.world.get(item) else {
+                continue;
+            };
+            let progression = o.fields.get("MaterialProgress").copied().unwrap_or(0);
+            if progression <= 0 || o.fields.get("Unique").copied().unwrap_or(0) != 0 {
+                continue;
+            }
+            let material = match t.cell(&format!("Material{tier}"), progression as i64) {
+                Some(thedas_formats::gda::Cell::Int(m)) if *m > 0 => *m as i32,
+                _ => continue,
+            };
+            if let Some(o) = self.world.get_mut(item) {
+                o.fields.insert("Material".into(), material);
+            }
+        }
+    }
+
     /// Moves an item into `to`'s inventory (from wherever it is) and tells both owners.
     pub fn give_item(&mut self, item: ObjectId, to: ObjectId) -> bool {
         if self.world.get(item).is_none() || self.world.get(to).is_none() {
@@ -420,6 +459,54 @@ mod stat_tests {
 
     use crate::sim::Sim;
     use crate::world::ObjectKind;
+
+    #[test]
+    fn equipped_items_take_their_progressions_material_at_a_level() {
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let t = crate::m2da::Tables::empty();
+        t.insert(
+            "#199",
+            &["ID", "Label", "Material1", "Material2", "Material3"],
+            vec![(
+                46,
+                vec![
+                    Cell::Int(46),
+                    Cell::String("Armor, All Metal".into()),
+                    Cell::Int(1),
+                    Cell::Int(2),
+                    Cell::Int(8),
+                ],
+            )],
+        );
+        s.world.tables = Arc::new(t);
+        let foe = s.world.spawn(ObjectKind::Creature, "hurlock");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.hero = Some(hero);
+        let give = |s: &mut Sim, who, unique| {
+            let i = s.world.spawn(ObjectKind::Item, "boots");
+            s.world.get_mut(i).unwrap().fields.extend([
+                ("MaterialProgress".to_string(), 46),
+                ("Material".to_string(), 1),
+                ("Unique".to_string(), unique),
+            ]);
+            s.world.get_mut(who).unwrap().equipment.insert(unique, i);
+            i
+        };
+        let (plain, unique, heros) = (
+            give(&mut s, foe, 0),
+            give(&mut s, foe, 1),
+            give(&mut s, hero, 0),
+        );
+        let material = |s: &Sim, i| s.world.get(i).unwrap().fields["Material"];
+        // Level 7: tier (7 - 1) / 3 + 1 = 3.
+        s.scale_equipped_items(foe, 7);
+        assert_eq!(material(&s, plain), 8);
+        assert_eq!(material(&s, unique), 1, "unique items keep theirs");
+        s.scale_equipped_items(hero, 7);
+        assert_eq!(material(&s, heros), 1, "the party is not scaled");
+        s.scale_equipped_items(foe, 4);
+        assert_eq!(material(&s, plain), 2);
+    }
 
     #[test]
     fn item_stats_scale_by_material_and_add_to_linked_properties() {

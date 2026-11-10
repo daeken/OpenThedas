@@ -155,7 +155,6 @@ const PRESENTATION: &[&str] = &[
     "SetQuickslot",
     "SendGameEventRunDatabase",
     "SetTrainingMode",
-    "SetItemMaterialType",
     "SetPlaceableHealth",
     "SetMapPinState",
     "SetCameraTarget",
@@ -164,10 +163,23 @@ const PRESENTATION: &[&str] = &[
     "SetSoundSet",
     "PlayMusic",
     "SetMusicIntensity",
-    "ScaleEquippedItems",
     "SendToRunDatabase",
     "SetCreaturesGlobalMaxTimeBeforeDecay",
     "SetCreatureGoreLevel",
+];
+
+/// Engine functions answered with a fixed placeholder because the simulation lacks what
+/// they need (stealth, ambient dialog, effect flags, pools, tactics item tags, ...). Calls to
+/// them are counted (`Trace::stubbed`) so coverage work can follow what the game uses.
+pub const STUBS: &[&str] = &[
+    "GetPlotSummary",
+    "DialogIsAmbient",
+    "ClearAmbientDialogs",
+    "CreatePool",
+    "GetStealthEnabled",
+    "GetAutoPauseCombatStatus",
+    "RevealCurrentMap",
+    "LogStoryEvent",
 ];
 
 /// Converts `CommandMoveToObject` to `COMMAND_TYPE_MOVE_TO_OBJECT`.
@@ -193,7 +205,21 @@ pub fn call(
 ) -> Option<VmResult<Option<Value>>> {
     let name = f.name.as_str();
     if PRESENTATION.contains(&name) {
+        *h.sim
+            .world
+            .trace
+            .presentation
+            .entry(name.to_string())
+            .or_default() += 1;
         return void();
+    }
+    if STUBS.contains(&name) {
+        *h.sim
+            .world
+            .trace
+            .stubbed
+            .entry(name.to_string())
+            .or_default() += 1;
     }
     let ty = h.sim.types;
     let t = h.sim.world.time_ms;
@@ -808,6 +834,27 @@ pub fn call(
             let c = table
                 .as_ref()
                 .and_then(|t| t.cell(&string(a, 1), int(a, 2) as i64));
+            // A missing table or column (not a missing row, which scripts probe for) is
+            // counted for coverage.
+            let missing = match &table {
+                None => Some(format!("table {} {}", int(a, 0), string(a, 3))),
+                Some(t)
+                    if !t
+                        .columns
+                        .contains_key(&thedas_formats::gda::column_hash(&string(a, 1))) =>
+                {
+                    Some(format!(
+                        "table {} {} column {}",
+                        int(a, 0),
+                        string(a, 3),
+                        string(a, 1)
+                    ))
+                }
+                _ => None,
+            };
+            if let Some(m) = missing {
+                *h.sim.world.trace.m2da_missing.entry(m).or_default() += 1;
+            }
             ok(match name {
                 "GetM2DAInt" => Value::Int(cell_int(c)),
                 "GetM2DAFloat" => Value::Float(cell_float(c)),
@@ -1333,7 +1380,21 @@ pub fn call(
             }
             void()
         }
-        "GetEffectsFlags" => ok(Value::Int(0)),
+        // The flags (EFFECT_FLAG_DISABLE_MOVEMENT, _COMBAT, _TALENTS, ...) of the effects a
+        // creature holds: each effect type's `Flags` in effects.gda, combined.
+        "GetEffectsFlags" => {
+            let types: Vec<i32> = h
+                .object(obj(a, 0))
+                .map(|o| o.effects.iter().map(|e| e.ty).collect())
+                .unwrap_or_default();
+            let table = h.sim.world.tables.get(0, "effects");
+            let flags = types.iter().fold(0, |acc, &ty| {
+                acc | table
+                    .as_ref()
+                    .map_or(0, |t| cell_int(t.cell("Flags", ty as i64)))
+            });
+            ok(Value::Int(flags))
+        }
 
         // --- Commands ---------------------------------------------------------------------
         n if n.starts_with("Command") && f.ret == Type::Engine(ty.command) => {
@@ -1536,10 +1597,26 @@ pub fn call(
         }
         // Area effects and map notifications are not simulated yet.
         "Engine_ApplyEffectAtLocation" | "ShowAreaUnlockedNotification" => {
+            let effect = match h.sim.world.handle(handle(a, 1)) {
+                Some(EngineData::Effect(e)) => Some(e.ty),
+                _ => None,
+            };
+            // A visual effect at a location (EffectVisualEffect, type 4 in effects.gda) is
+            // presentation; anything else there (an area of effect, which the simulation
+            // does not hold yet) is a placeholder, counted for coverage.
+            if name == "Engine_ApplyEffectAtLocation" {
+                let tally = if effect == Some(4) {
+                    &mut h.sim.world.trace.presentation
+                } else {
+                    &mut h.sim.world.trace.stubbed
+                };
+                *tally.entry(name.to_string()).or_default() += 1;
+            }
+            let ty = effect.map_or(String::new(), |e| format!(" effect type {e}"));
             h.sim.world.trace.push(TraceEntry::Log {
                 t,
                 channel: -3,
-                text: format!("{name}{:?} (no effect in the simulation)", a),
+                text: format!("{name}{:?}{ty} (no effect in the simulation)", a),
             });
             void()
         }
@@ -2689,6 +2766,23 @@ pub fn call(
             }
             void()
         }
+        // An item's material (materialtypes.gda row), which scales its stats (see
+        // `Sim::item_stat`).
+        "GetItemMaterialType" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .and_then(|o| o.fields.get("Material").copied())
+                .unwrap_or(0),
+        )),
+        "SetItemMaterialType" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields.insert("Material".into(), int(a, 1));
+            }
+            void()
+        }
+        "ScaleEquippedItems" => {
+            h.sim.scale_equipped_items(obj(a, 0), int(a, 1));
+            void()
+        }
         "GetItemUnique" | "GetItemMaterialProgression" => {
             let field = if name == "GetItemUnique" {
                 "Unique"
@@ -2877,7 +2971,17 @@ pub fn call(
             void()
         }
         // Ability results only steer animations, which the simulation does not play.
-        "SetAbilityResult" => void(),
+        // Reports the target's resistance roll (made by the scripts themselves) and the node a
+        // projectile aims at: presentation for the simulation.
+        "SetAbilityResult" => {
+            *h.sim
+                .world
+                .trace
+                .presentation
+                .entry(name.to_string())
+                .or_default() += 1;
+            void()
+        }
         "GetShowSpecialMoveFloaties" => ok(Value::Int(0)),
         "GetEventLocation" => {
             let l = match h.sim.world.handle(handle(a, 0)) {
@@ -2923,6 +3027,8 @@ pub fn call(
                 handle: Some(hd),
             })
         }
+        // Tactics set by scripts (SetTacticEntry) and presets carry no item; only the
+        // player's tactics screen gives one, which the simulation does not have.
         "GetTacticCommandItemTag" => ok(Value::String(String::new())),
         "GetAutoPauseCombatStatus" => ok(Value::Int(0)),
         "EnableWeaponTrail" => void(),
@@ -3112,6 +3218,7 @@ mod tests {
         object[] GetPartyPoolList() = 23;\n\
         void SetPlaceableActionResult(object o, int a, int s, int v = FALSE) = 24;\n\
         int GetPlaceableState(object o) = 25;\n\
+        int GetEffectsFlags(object o) = 26;\n\
         int FOLLOWER_STATE_AVAILABLE = 2;\n\
         int PROPERTY_SIMPLE_EXPERIENCE = 19;\n\
         int PROPERTY_SIMPLE_LEVEL = 15;\n";
@@ -3125,6 +3232,51 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn effect_flags_combine_the_flags_of_the_effects_held() {
+        use thedas_formats::gda::Cell;
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let t = crate::m2da::Tables::empty();
+        t.insert(
+            "effects",
+            &["ID", "Label", "Flags"],
+            vec![
+                (
+                    1014,
+                    vec![
+                        Cell::Int(1014),
+                        Cell::String("KNOCKDOWN".into()),
+                        Cell::Int(7),
+                    ],
+                ),
+                (
+                    1007,
+                    vec![
+                        Cell::Int(1007),
+                        Cell::String("LOCK_INVENTORY".into()),
+                        Cell::Int(512),
+                    ],
+                ),
+                (
+                    1010,
+                    vec![Cell::Int(1010), Cell::String("HEAL".into()), Cell::Int(0)],
+                ),
+            ],
+        );
+        s.world.tables = Arc::new(t);
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let flags = |s: &mut Sim| run(s, c, "GetEffectsFlags", &[Value::Object(c)]);
+        assert_eq!(flags(&mut s), Some(Value::Int(0)));
+        for ty in [1014, 1007, 1010] {
+            s.world.get_mut(c).unwrap().effects.push(Effect {
+                ty,
+                ..Default::default()
+            });
+        }
+        assert_eq!(flags(&mut s), Some(Value::Int(7 | 512)));
     }
 
     #[test]
