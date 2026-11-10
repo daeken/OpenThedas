@@ -5,13 +5,16 @@
 //! capture, Esc to quit.
 //!
 //! Playing: `--save <file>` (a save from the MCP's save_state) or `--new-game` runs the
-//! simulation live at real time; Space pauses it.
+//! simulation live at real time; Space pauses it. The camera follows the party leader: hold
+//! the right mouse button to orbit, the wheel to zoom, Q/E to turn; F switches to the
+//! free-flying camera and back.
 //!
 //! Headless: `--capture out.png --camera x,y,z,yaw,pitch` renders one frame with no window.
 //!
 //! `--ui menu`, `--ui hud` or `--ui movie1,movie2` plays Scaleform movies over the scene;
 //! `--area none` shows them alone.
 
+mod follow;
 mod live;
 mod ui;
 
@@ -327,6 +330,8 @@ struct App {
     loaded: Loaded,
     /// The running game, when playing.
     live: Option<live::Live>,
+    /// The game camera, when following the party leader (playing; F toggles free-fly).
+    follow: Option<follow::Follow>,
     ui: Vec<String>,
     cursor: (f64, f64),
     camera: Camera,
@@ -407,6 +412,14 @@ impl App {
         let dt = (now - self.last).as_secs_f32().min(0.1);
         self.last = now;
         let k = |c| self.keys.contains(&c);
+        if let Some(f) = self.follow.as_mut() {
+            let turn = (k(KeyCode::KeyQ) as i32 - k(KeyCode::KeyE) as i32) as f32;
+            f.orbit(turn * 1.8 * dt, 0.0);
+            if let Some(feet) = self.live.as_ref().and_then(|l| l.leader_feet()) {
+                self.camera = f.camera(feet, dt, &self.camera);
+            }
+            return;
+        }
         let speed = if k(KeyCode::ShiftLeft) || k(KeyCode::ShiftRight) {
             15.0
         } else {
@@ -553,6 +566,12 @@ impl ApplicationHandler for App {
                             match code {
                                 KeyCode::Escape => event_loop.exit(),
                                 KeyCode::KeyP => println!("camera {}", self.camera.spec()),
+                                KeyCode::KeyF if self.live.is_some() => {
+                                    self.follow = match self.follow.take() {
+                                        Some(_) => None,
+                                        None => Some(follow::Follow::behind(self.camera.yaw)),
+                                    };
+                                }
                                 KeyCode::Space => {
                                     if let Some(live) = self.live.as_mut() {
                                         live.paused = !live.paused;
@@ -603,6 +622,15 @@ impl ApplicationHandler for App {
                     g.window.set_cursor_visible(!self.looking);
                 }
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let steps = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
+                };
+                if let Some(f) = self.follow.as_mut() {
+                    f.zoom(steps);
+                }
+            }
             WindowEvent::Focused(false) => {
                 self.keys.clear();
                 self.looking = false;
@@ -620,7 +648,10 @@ impl ApplicationHandler for App {
         if let DeviceEvent::MouseMotion { delta } = event {
             if self.looking {
                 let s = 0.003;
-                self.camera.look(-delta.0 as f32 * s, -delta.1 as f32 * s);
+                match self.follow.as_mut() {
+                    Some(f) => f.orbit(-delta.0 as f32 * s, -delta.1 as f32 * s),
+                    None => self.camera.look(-delta.0 as f32 * s, -delta.1 as f32 * s),
+                }
             }
         }
     }
@@ -682,9 +713,19 @@ fn main() -> Result<()> {
         .map(thedas_ui::stage::movie_names)
         .unwrap_or_default();
 
+    // Playing, the camera follows the party leader from behind.
+    let mut follow = match (&live, hero) {
+        (Some(_), Some((_, facing))) if args.camera.is_none() => Some(follow::Follow::behind(
+            thedas_sim::world::heading_of(facing).to_radians(),
+        )),
+        _ => None,
+    };
     if let Some(out) = &args.capture {
         if let Some(l) = live.as_mut() {
             l.sim.tick(args.run_ms);
+            if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
+                camera = f.camera(feet, 0.0, &camera);
+            }
         }
         return capture(
             &loaded,
@@ -701,6 +742,7 @@ fn main() -> Result<()> {
     let mut app = App {
         loaded,
         live,
+        follow,
         ui,
         cursor: (0.0, 0.0),
         camera,

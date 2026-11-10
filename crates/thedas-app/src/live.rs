@@ -31,6 +31,8 @@ pub struct LiveScene {
 pub struct Live {
     pub sim: Sim,
     pub paused: bool,
+    /// The party member the player controls; `None` for the hero.
+    pub leader: Option<thedas_script::vm::ObjectId>,
     install: PathBuf,
     shaders: String,
     pub scene: Option<LiveScene>,
@@ -72,6 +74,7 @@ impl Live {
         Ok(Self {
             sim,
             paused: false,
+            leader: None,
             install: install.to_path_buf(),
             shaders: shaders.to_string(),
             scene: None,
@@ -93,6 +96,18 @@ impl Live {
             self.owed_ms -= whole;
             self.sim.tick(whole as u64);
         }
+    }
+
+    /// The party leader the player controls (the hero until another is chosen).
+    pub fn leader(&self) -> Option<thedas_script::vm::ObjectId> {
+        self.leader.or(self.sim.world.hero)
+    }
+
+    /// Where the party leader stands, when it is in the current area.
+    pub fn leader_feet(&self) -> Option<glam::Vec3> {
+        let w = &self.sim.world;
+        let o = w.get(self.leader()?)?;
+        (o.area.is_some() && o.area == w.area).then(|| glam::Vec3::from_array(o.position))
     }
 
     /// The hero's position and facing, when it is in the current area.
