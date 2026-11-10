@@ -108,6 +108,10 @@ pub struct Object {
     /// with the equipment slot it was in (-1 for none).
     #[serde(default)]
     pub stored: BTreeMap<ObjectId, Vec<(ObjectId, i32)>>,
+    /// Whether the object was active when the party left its area (the area is not
+    /// loaded meanwhile); restored when the party comes back.
+    #[serde(default)]
+    pub parked: Option<bool>,
     pub effects: Vec<Effect>,
     /// Combat bookkeeping (perception, threat, the pending attack); see `combat`.
     #[serde(default)]
@@ -153,6 +157,7 @@ impl Object {
             followers: Vec::new(),
             escorts: Vec::new(),
             stored: BTreeMap::new(),
+            parked: None,
             effects: Vec::new(),
             combat: Default::default(),
             abilities: std::collections::BTreeSet::new(),
