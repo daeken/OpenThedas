@@ -61,6 +61,19 @@ pub struct CombatData {
     pub attack: Option<AttackResult>,
     /// `SetAttackDuration` for the attack in progress.
     pub attack_ms: Option<u64>,
+    /// Tactics slots (`SetTacticEntry`, or a preset).
+    #[serde(default)]
+    pub tactics: Vec<Tactic>,
+}
+
+/// One tactics slot: when `condition` holds for a target of `target` type, do `command`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Tactic {
+    pub enabled: bool,
+    pub target: i32,
+    pub condition: i32,
+    pub command: i32,
+    pub param: i32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -181,6 +194,42 @@ impl Sim {
         }
     }
 
+    /// Out-of-combat recovery: living creatures not in combat regain health and
+    /// mana/stamina at `PROPERTY_ATTRIBUTE_REGENERATION_HEALTH` points per second, up to their
+    /// maximum. Provisional: the rate, and no recovery during combat, are guesses.
+    pub fn regenerate(&mut self, ms: u64) {
+        if ms == 0 {
+            return;
+        }
+        let (health, mana, regen) = (
+            constant_of(self, "PROPERTY_DEPLETABLE_HEALTH"),
+            constant_of(self, "PROPERTY_DEPLETABLE_MANA_STAMINA"),
+            constant_of(self, "PROPERTY_ATTRIBUTE_REGENERATION_HEALTH"),
+        );
+        let fighting = self.world.game_mode == constant_of(self, "GM_COMBAT");
+        let party = crate::engine::party_of(self);
+        let secs = ms as f32 / 1000.0;
+        for o in self.world.objects.values_mut() {
+            if o.kind != ObjectKind::Creature || o.dead || o.combat.in_combat {
+                continue;
+            }
+            if fighting && party.contains(&o.id) {
+                continue;
+            }
+            let rate = o.properties.get(&regen).map_or(0.0, |p| p.0.max(p.1));
+            if rate <= 0.0 {
+                continue;
+            }
+            for p in [health, mana] {
+                if let Some(v) = o.properties.get_mut(&p) {
+                    if v.1 < v.0 {
+                        v.1 = (v.1 + rate * secs).min(v.0);
+                    }
+                }
+            }
+        }
+    }
+
     /// Queues `PERCEPTION_APPEAR` (or `DISAPPEAR`) for `who` about `seen`.
     pub fn perceive(&mut self, who: ObjectId, seen: ObjectId, appear: bool) {
         let name = if appear {
@@ -213,12 +262,14 @@ impl Sim {
         let mut ev = self.new_event("APPLY_EFFECT", creator);
         ev.objects = vec![target];
         let saved = self.current_effect.replace((effect.clone(), true));
+        let saved_target = self.current_effect_target.replace(target);
         let script = self.world.get(target).and_then(|o| o.script.clone());
         if let Some(script) = script {
             self.run_script(&script, target, Some(ev));
         }
         let (effect, valid) =
             std::mem::replace(&mut self.current_effect, saved).unwrap_or((effect, true));
+        self.current_effect_target = saved_target;
         // A lethal hit arrives as EFFECT_TYPE_DEATH (7 in effects.gda) rather than as damage
         // that empties the health bar: the engine does the killing.
         if valid && effect.ty == EFFECT_TYPE_RESURRECTION {
@@ -270,6 +321,77 @@ impl Sim {
         let mut ev = self.new_event("DEATH", Some(killer));
         ev.objects = vec![killer];
         self.world.queue_event(0, id, ev, None);
+    }
+
+    /// Fills a creature's tactics slots from a preset: the preset's row in
+    /// `tacticsuserpresets.gda` names an M2DA table (`TacticsTable`, e.g. 2001 for Tank) whose
+    /// rows are the slots in order (target type, condition, command, parameter). Provisional.
+    pub fn apply_tactic_preset(&mut self, id: ObjectId, preset: i32) -> bool {
+        let tables = self.world.tables.clone();
+        let Some(presets) = tables.get(0, "tacticsuserpresets") else {
+            return false;
+        };
+        let table_id = match presets.cell("TacticsTable", preset as i64) {
+            Some(thedas_formats::gda::Cell::Int(v)) => *v as i32,
+            _ => return false,
+        };
+        let Some(t) = tables.get(table_id, "") else {
+            return false;
+        };
+        let int = |row: i64, col: &str| match t.cell(col, row) {
+            Some(thedas_formats::gda::Cell::Int(v)) => *v as i32,
+            _ => 0,
+        };
+        // The parameter column's name is not known; it is the fifth column.
+        let param_hash = t.columns.iter().find(|(_, i)| **i == 4).map(|(h, _)| *h);
+        let slots: Vec<Tactic> = t
+            .order
+            .iter()
+            .map(|&row| Tactic {
+                enabled: true,
+                target: int(row, "TargetType"),
+                condition: int(row, "Condition"),
+                command: int(row, "Command"),
+                param: param_hash
+                    .and_then(|h| t.cell_by_hash(h, row))
+                    .map_or(0, |c| match c {
+                        thedas_formats::gda::Cell::Int(v) => *v as i32,
+                        _ => 0,
+                    }),
+            })
+            .collect();
+        match self.world.get_mut(id) {
+            Some(o) => {
+                o.combat.tactics = slots;
+                o.fields.insert("TacticPreset".into(), preset);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A creature's tactics, applying its first added preset if it has none yet (followers
+    /// get presets with `AddTacticPresetID` and no slots of their own). Provisional.
+    pub fn tactics_of(&mut self, id: ObjectId) -> Vec<Tactic> {
+        let (empty, first) = match self.world.get(id) {
+            Some(o) => (
+                o.combat.tactics.is_empty(),
+                o.fields
+                    .get("TacticPreset")
+                    .or_else(|| o.fields.get("TacticPreset.0"))
+                    .copied(),
+            ),
+            None => return Vec::new(),
+        };
+        if empty {
+            if let Some(p) = first {
+                self.apply_tactic_preset(id, p);
+            }
+        }
+        self.world
+            .get(id)
+            .map(|o| o.combat.tactics.clone())
+            .unwrap_or_default()
     }
 
     /// Orders a creature to attack another, as the player does by clicking an enemy.

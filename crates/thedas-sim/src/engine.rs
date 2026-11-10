@@ -131,7 +131,6 @@ const PRESENTATION: &[&str] = &[
     "SendGameEventRunDatabase",
     "SetTrainingMode",
     "SetItemMaterialType",
-    "SetCanLevelUp",
     "SetObjectInteractive",
     "SetPlaceableHealth",
     "SetMapPinState",
@@ -935,15 +934,15 @@ pub fn call(
                     .unwrap_or(OBJECT_INVALID),
             ))
         }
-        // Provisional: an unspecified slot (INVENTORY_SLOT_INVALID) means slot 0 (main hand);
-        // weapon sets are not modelled.
+        // An unspecified slot (INVENTORY_SLOT_INVALID) means the base type's first free
+        // slot (bitm_base EquippableSlots). Weapon sets are not modelled (provisional).
         "EquipItem" => {
             let (who, item, slot) = (obj(a, 0), obj(a, 1), int(a, 2));
-            let slot = if slot == constant(&h.sim.table, "INVENTORY_SLOT_INVALID") {
-                0
-            } else {
-                slot
-            };
+            if slot == constant(&h.sim.table, "INVENTORY_SLOT_INVALID") {
+                // The base type's first free slot.
+                let done = h.object(item).is_some() && h.sim.equip_default(who, item).is_some();
+                return ok(b(done));
+            }
             let ok_ = h.object(item).is_some();
             if let (true, Some(o)) = (ok_, h.sim.world.get_mut(who)) {
                 if !o.inventory.contains(&item) {
@@ -1012,9 +1011,7 @@ pub fn call(
                     o.tag = tag;
                 }
             }
-            if let Some(owner) = h.sim.world.get_mut(obj(a, 1)) {
-                owner.inventory.push(id);
-            }
+            h.sim.give_item(id, obj(a, 1));
             ok(Value::Object(id))
         }
 
@@ -1551,12 +1548,57 @@ pub fn call(
         // No ambient (bark) conversations are simulated.
         "DialogIsAmbient" => ok(Value::Int(0)),
         "ClearAmbientDialogs" => ok(Value::Int(0)),
-        "SetFollowPartyLeader" | "SetTacticPresetID" => {
-            let field = if name == "SetFollowPartyLeader" {
-                "FollowPartyLeader"
-            } else {
-                "TacticPreset"
+        "SetTacticPresetID" => {
+            h.sim.apply_tactic_preset(obj(a, 0), int(a, 1));
+            void()
+        }
+        "GetTacticPresetID" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .and_then(|o| o.fields.get("TacticPreset").copied())
+                .unwrap_or(0),
+        )),
+        "SetTacticEntry" => {
+            let (who, i) = (obj(a, 0), int(a, 1).clamp(0, 63) as usize);
+            let tactic = crate::combat::Tactic {
+                enabled: int(a, 2) != 0,
+                target: int(a, 3),
+                condition: int(a, 4),
+                command: int(a, 5),
+                param: int(a, 6),
             };
+            if let Some(o) = h.sim.world.get_mut(who) {
+                if o.combat.tactics.len() <= i {
+                    o.combat.tactics.resize(i + 1, Default::default());
+                }
+                o.combat.tactics[i] = tactic;
+            }
+            void()
+        }
+        "IsTacticEnabled"
+        | "GetTacticTargetType"
+        | "GetTacticCondition"
+        | "GetTacticCommand"
+        | "GetTacticCommandParam" => {
+            let (who, i) = (obj(a, 0), int(a, 1));
+            let num = h
+                .object(who)
+                .and_then(|o| o.fields.get("NumTactics").copied())
+                .unwrap_or(i32::MAX);
+            let tactics = h.sim.tactics_of(who);
+            let t = (i >= 0 && i < num)
+                .then(|| tactics.get(i as usize))
+                .flatten();
+            ok(Value::Int(match (name, t) {
+                (_, None) => 0,
+                ("IsTacticEnabled", Some(t)) => t.enabled as i32,
+                ("GetTacticTargetType", Some(t)) => t.target,
+                ("GetTacticCondition", Some(t)) => t.condition,
+                ("GetTacticCommand", Some(t)) => t.command,
+                (_, Some(t)) => t.param,
+            }))
+        }
+        "SetFollowPartyLeader" => {
+            let field = "FollowPartyLeader";
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
                 o.fields.insert(field.to_string(), int(a, 1));
             }
@@ -1602,7 +1644,6 @@ pub fn call(
         | "TakeScreenshot"
         | "RevealCurrentMap"
         | "SetWorldMapPrimary"
-        | "SetTacticEntry"
         | "SetCreatureGoreLevel" => {
             h.sim.world.trace.push(TraceEntry::Log {
                 t,
@@ -1771,7 +1812,12 @@ pub fn call(
         "IsAbilityAvailable" => ok(b(h
             .object(obj(a, 0))
             .is_some_and(|o| o.abilities.contains(&int(a, 1))))),
-        "LogStoryEvent" | "LoadItemsFromTemplate" => {
+        "LoadItemsFromTemplate" => {
+            h.sim
+                .load_items_from_template(obj(a, 0), &string(a, 1), int(a, 2) != 0);
+            void()
+        }
+        "LogStoryEvent" => {
             h.sim.world.trace.push(TraceEntry::Log {
                 t,
                 channel: -3,
@@ -1871,7 +1917,76 @@ pub fn call(
             ok(b(any))
         }
         // Loot bags and achievements have no simulation state.
-        "SpawnBodyBag" | "UnlockAchievementByID" | "IncrementAchievementCountByID" => {
+        "SpawnBodyBag" => {
+            h.sim.spawn_body_bag(obj(a, 0), int(a, 1) != 0);
+            void()
+        }
+        // No occlusion is simulated: two objects in the same area can see each other.
+        "CheckLineOfSightObject" => ok(b(match (h.object(obj(a, 0)), h.object(obj(a, 1))) {
+            (Some(x), Some(y)) => x.area == y.area,
+            _ => false,
+        })),
+        "CountItemsByTag" => {
+            let tag = string(a, 1);
+            let n = h
+                .object(obj(a, 0))
+                .map(|o| o.inventory.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|i| {
+                    h.object(*i)
+                        .is_some_and(|x| x.tag.eq_ignore_ascii_case(&tag))
+                })
+                .count();
+            ok(Value::Int(n as i32))
+        }
+        "SetCanLevelUp" | "SetAILevel" => {
+            let field = if name == "SetCanLevelUp" {
+                "CanLevelUp"
+            } else {
+                "AILevel"
+            };
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields.insert(field.to_string(), int(a, 1));
+            }
+            void()
+        }
+        "GetCanLevelUp" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .and_then(|o| o.fields.get("CanLevelUp").copied())
+                .unwrap_or(0),
+        )),
+        "IsEffectValid" => ok(b(matches!(
+            h.sim.world.handle(handle(a, 0)),
+            Some(EngineData::Effect(e)) if e.ty != 0
+        ))),
+        // EffectModifyProperty is EFFECT_TYPE_MODIFY_PROPERTY (1012 in effects.gda):
+        // integers are the property ids, floats their changes (provisional layout).
+        "EffectModifyProperty" => {
+            let e = Effect {
+                ty: 1012,
+                creator: Some(caller),
+                ints: vec![int(a, 0), int(a, 2), int(a, 4)],
+                floats: vec![float(a, 1), float(a, 3), float(a, 5)],
+                ..Default::default()
+            };
+            let hd = h.sim.world.store(EngineData::Effect(e));
+            ok(Value::Engine {
+                ty: ty.effect,
+                handle: Some(hd),
+            })
+        }
+        "SetDeathHint" => void(),
+        "IsItemDroppable" => ok(b(h
+            .object(obj(a, 0))
+            .is_some_and(|o| o.fields.get("Droppable").copied().unwrap_or(0) != 0))),
+        "SetItemDroppable" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields.insert("Droppable".into(), int(a, 1));
+            }
+            void()
+        }
+        "UnlockAchievementByID" | "IncrementAchievementCountByID" => {
             h.sim.world.trace.push(TraceEntry::Log {
                 t,
                 channel: -3,
@@ -2012,6 +2127,41 @@ pub fn call(
             };
             ok(Value::Float(v))
         }
+        "GetItemStackSize" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .and_then(|o| o.fields.get("StackSize").copied())
+                .unwrap_or(1)
+                .max(1),
+        )),
+        "SetItemStackSize" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields.insert("StackSize".into(), int(a, 1).max(1));
+            }
+            void()
+        }
+        // ApplyEffectModifyProperty: the effect's integers are property ids and its floats
+        // the changes (EffectModifyProperty's layout); applied to the current effect's owner.
+        "ApplyEffectModifyProperty" | "RemoveEffectModifyProperty" => {
+            let e = match h.sim.world.handle(handle(a, 0)) {
+                Some(EngineData::Effect(e)) => e.clone(),
+                _ => return void(),
+            };
+            let sign = if name == "ApplyEffectModifyProperty" {
+                1.0
+            } else {
+                -1.0
+            };
+            let target = h.sim.current_effect_target.unwrap_or(caller);
+            if let Some(o) = h.sim.world.get_mut(target) {
+                for (p, d) in e.ints.iter().zip(e.floats.iter()) {
+                    if *p != 0 {
+                        let v = o.properties.entry(*p).or_insert((0.0, 0.0));
+                        v.0 += sign * d;
+                    }
+                }
+            }
+            void()
+        }
         "GetItemUnique" | "GetItemMaterialProgression" => {
             let field = if name == "GetItemUnique" {
                 "Unique"
@@ -2026,7 +2176,6 @@ pub fn call(
         }
         "SetAimLoopDuration" => void(),
         // Tactics and area-of-effect abilities are not simulated yet.
-        "IsTacticEnabled" => ok(b(false)),
         "GetAbilitiesDueToAOEs" => ok(Value::Array {
             elem: Type::Int,
             items: Vec::new(),

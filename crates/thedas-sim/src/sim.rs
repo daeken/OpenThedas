@@ -79,6 +79,8 @@ pub struct Sim {
     pub(crate) nav_grids: HashMap<String, Option<Arc<thedas_formats::level::NavGrid>>>,
     /// The effect an `APPLY_EFFECT` handler is looking at, and whether it is still valid.
     pub(crate) current_effect: Option<(crate::world::Effect, bool)>,
+    /// Who the effect in `current_effect` is being applied to.
+    pub(crate) current_effect_target: Option<ObjectId>,
     pub(crate) talk: Option<crate::dialog::Conversation>,
     pub(crate) plots: crate::plot::Plots,
     strings: std::sync::OnceLock<std::collections::BTreeMap<u32, String>>,
@@ -138,6 +140,7 @@ impl Sim {
             script_budget: 5_000_000,
             chargen_policy: ChargenPolicy::default(),
             current_effect: None,
+            current_effect_target: None,
             install_root: None,
             area_layouts: HashMap::new(),
             nav_grids: HashMap::new(),
@@ -311,7 +314,8 @@ impl Sim {
 
     /// Advances time by `ms`, delivering every event that falls due and running commands.
     pub fn tick(&mut self, ms: u64) {
-        let until = self.world.time_ms + ms;
+        let start = self.world.time_ms;
+        let until = start + ms;
         self.update_perception();
         loop {
             // Engine work that waits for the current scripts: transitions, then cutscenes.
@@ -346,7 +350,9 @@ impl Sim {
                 _ => break,
             }
         }
+        let elapsed = until.saturating_sub(start);
         self.world.time_ms = until;
+        self.regenerate(elapsed);
     }
 
     /// Ends a cutscene the way the engine does when one finishes playing. Provisional, inferred
@@ -596,8 +602,9 @@ impl Sim {
     }
 
     /// Keeps the hero's followers with it: each living follower in the same area that
-    /// follows the leader (`SetFollowPartyLeader`, on unless turned off) and is not busy
-    /// with a command stands a metre behind, one more metre per follower. Provisional: real
+    /// follows the leader (`SetFollowPartyLeader`, on unless turned off) and is not fighting
+    /// or busy with anything but waiting or its own follow move stands a metre behind, one
+    /// more metre per follower. Provisional: real
     /// followers path after the leader.
     pub fn follow_leader(&mut self, leader: ObjectId) {
         let Some((pos, area, facing, followers)) = self.world.get(leader).map(|o| {
@@ -612,7 +619,10 @@ impl Sim {
             let ok = self.world.get(f).is_some_and(|o| {
                 !o.dead
                     && o.area == area
-                    && o.commands.is_empty()
+                    && !o.combat.in_combat
+                    && o.commands.first().is_none_or(|c| {
+                        matches!(c.name.as_str(), "CommandWait" | "CommandMoveToLocation")
+                    })
                     && o.fields.get("FollowPartyLeader").copied().unwrap_or(1) != 0
             });
             if ok {
@@ -1045,28 +1055,9 @@ impl Sim {
                 }
             }
         }
-        // A creature's equipment (Equip_ItemList: each struct's type id is the
-        // INVENTORY_SLOT_*, provisional) and carried items.
         if kind == ObjectKind::Creature {
             if let Some(t) = &tmpl {
-                if let Some(r) = t.structs.first() {
-                    for (list, equip) in [("Equip_ItemList", true), ("ItemList", false)] {
-                        let entries: Vec<(u32, String)> = list_of(r, list)
-                            .iter()
-                            .filter_map(|&si| t.structs.get(si as usize))
-                            .filter_map(|s| resref_field(s, "TemplateResRef").map(|x| (s.id, x)))
-                            .collect();
-                        for (slot, resref) in entries {
-                            let item = self.create_item(&resref);
-                            if let Some(o) = self.world.get_mut(id) {
-                                o.inventory.push(item);
-                                if equip {
-                                    o.equipment.insert(slot as i32, item);
-                                }
-                            }
-                        }
-                    }
-                }
+                self.load_template_items(id, t);
             }
         }
         self.created(id);
@@ -1129,6 +1120,62 @@ fn float(s: &Struct, label: &str) -> f32 {
 }
 
 impl Sim {
+    /// Gives a creature the equipment and carried items its template lists
+    /// (`Equip_ItemList`: each struct's type id is the `INVENTORY_SLOT_*`, provisional;
+    /// `ItemList`), keeping each entry's `Droppable` flag.
+    pub fn load_template_items(&mut self, id: ObjectId, t: &Gff3) {
+        let Some(r) = t.structs.first() else { return };
+        for (list, equip) in [("Equip_ItemList", true), ("ItemList", false)] {
+            let entries: Vec<(u32, String, Option<i32>)> = list_of(r, list)
+                .iter()
+                .filter_map(|&si| t.structs.get(si as usize))
+                .filter_map(|s| {
+                    resref_field(s, "TemplateResRef").map(|x| (s.id, x, int(s, "Droppable")))
+                })
+                .collect();
+            for (slot, resref, droppable) in entries {
+                let item = self.create_item(&resref);
+                if let (Some(d), Some(o)) = (droppable, self.world.get_mut(item)) {
+                    o.fields.insert("Droppable".into(), d);
+                }
+                if let Some(o) = self.world.get_mut(id) {
+                    o.inventory.push(item);
+                    if equip {
+                        o.equipment.insert(slot as i32, item);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `LoadItemsFromTemplate`: the template's equipment and items, replacing what the
+    /// creature has when asked (the replaced items are destroyed).
+    pub fn load_items_from_template(&mut self, id: ObjectId, template: &str, replace: bool) {
+        let name = template.trim_end_matches(".utc").to_ascii_lowercase();
+        let Ok(t) = self.read_gff3(&format!("{name}.utc")) else {
+            let at = self.world.time_ms;
+            self.world.trace.push(TraceEntry::Missing {
+                t: at,
+                what: format!("{name}.utc"),
+            });
+            return;
+        };
+        if replace {
+            let old = self
+                .world
+                .get_mut(id)
+                .map(|o| {
+                    o.equipment.clear();
+                    std::mem::take(&mut o.inventory)
+                })
+                .unwrap_or_default();
+            for i in old {
+                self.world.objects.remove(&i);
+            }
+        }
+        self.load_template_items(id, &t);
+    }
+
     /// Creates an item from its `.uti` template, with the template's integer fields
     /// (`BaseItem`, ...) for engine functions that read them. A missing template still
     /// makes the item, traced as missing.
