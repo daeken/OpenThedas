@@ -855,14 +855,18 @@ pub fn call(
                 .object(obj(a, 0))
                 .and_then(|o| o.properties.get(&int(a, 1)).copied())
                 .unwrap_or((0.0, 0.0));
+            // Equipped items add their stats to the properties itemstatdefines.gda links
+            // them to (armour to Armor, defence to Defense, ...): part of the total, not the
+            // base.
+            let gear = h.sim.equipment_bonus(obj(a, 0), int(a, 1));
             let v = if vt == base_type {
                 base
             } else if vt == modifier {
-                return ok(Value::Float(0.0));
+                return ok(Value::Float(gear));
             } else if vt == current {
                 cur
             } else {
-                base.max(cur)
+                base.max(cur) + gear
             };
             // Totals and attributes stay within `properties.gda`'s Min and Max (a depletable's
             // current value may still run down to 0). Provisional: inferred from the table.
@@ -1004,10 +1008,21 @@ pub fn call(
             .is_some_and(|o| o.abilities.contains(&int(a, 1))))),
         "IsModalAbilityActive" => ok(b(h.sim.modal_active(obj(a, 0), int(a, 1)))),
         "GetItemInEquipSlot" => {
-            let who = obj(a, 1);
+            let (slot, who) = (int(a, 0), obj(a, 1));
+            let set = a.get(2).map_or(-1, |_| int(a, 2));
             ok(Value::Object(
                 h.object(who)
-                    .and_then(|o| o.equipment.get(&int(a, 0)).copied())
+                    .and_then(|o| {
+                        let active = o.fields.get("ActiveWeaponSet").copied().unwrap_or(0);
+                        if (set == 0 || set == 1)
+                            && set != active
+                            && crate::world::WEAPON_SET_SLOTS.contains(&slot)
+                        {
+                            o.other_set.get(&slot).copied()
+                        } else {
+                            o.equipment.get(&slot).copied()
+                        }
+                    })
                     .unwrap_or(OBJECT_INVALID),
             ))
         }
@@ -1020,13 +1035,24 @@ pub fn call(
                 let done = h.object(item).is_some() && h.sim.equip_default(who, item).is_some();
                 return ok(b(done));
             }
+            let set = a.get(3).map_or(-1, |_| int(a, 3));
             let ok_ = h.object(item).is_some();
             if let (true, Some(o)) = (ok_, h.sim.world.get_mut(who)) {
                 if !o.inventory.contains(&item) {
                     o.inventory.push(item);
                 }
                 o.equipment.retain(|_, &mut i| i != item);
-                o.equipment.insert(slot, item);
+                o.other_set.retain(|_, &mut i| i != item);
+                let active = o.fields.get("ActiveWeaponSet").copied().unwrap_or(0);
+                // A weapon for the set not in hand goes to the inactive set.
+                if (set == 0 || set == 1)
+                    && set != active
+                    && crate::world::WEAPON_SET_SLOTS.contains(&slot)
+                {
+                    o.other_set.insert(slot, item);
+                } else {
+                    o.equipment.insert(slot, item);
+                }
             }
             ok(b(ok_))
         }
@@ -1034,9 +1060,10 @@ pub fn call(
             let item = obj(a, 1);
             let found = match h.sim.world.get_mut(obj(a, 0)) {
                 Some(o) => {
-                    let n = o.equipment.len();
+                    let n = o.equipment.len() + o.other_set.len();
                     o.equipment.retain(|_, &mut i| i != item);
-                    n != o.equipment.len()
+                    o.other_set.retain(|_, &mut i| i != item);
+                    n != o.equipment.len() + o.other_set.len()
                 }
                 None => false,
             };
@@ -1058,6 +1085,7 @@ pub fn call(
             if let Some(o) = h.sim.world.get_mut(who) {
                 o.inventory.retain(|i| !items.contains(i));
                 o.equipment.retain(|_, i| !items.contains(i));
+                o.other_set.retain(|_, i| !items.contains(i));
             }
             for i in items {
                 h.sim.world.objects.remove(&i);
@@ -1448,6 +1476,7 @@ pub fn call(
                 if let Some(o) = h.sim.world.get_mut(from) {
                     o.inventory.retain(|&i| i != item);
                     o.equipment.retain(|_, i| *i != item);
+                    o.other_set.retain(|_, i| *i != item);
                 }
                 if let Some(o) = h.sim.world.get_mut(to) {
                     o.inventory.push(item);
@@ -1879,8 +1908,8 @@ pub fn call(
             });
             void()
         }
-        // The active weapon set (0 or 1). Provisional: the simulation keeps one set of
-        // equipment, so switching records the set without swapping items.
+        // The active weapon set (0 or 1). Switching swaps the weapon slots with the inactive
+        // set's. Provisional: no equip events are sent for the swap.
         "GetActiveWeaponSet" => ok(Value::Int(
             h.object(obj(a, 0))
                 .and_then(|o| o.fields.get("ActiveWeaponSet").copied())
@@ -1893,6 +1922,17 @@ pub fn call(
                     s @ (0 | 1) => s,
                     _ => 1 - now,
                 };
+                if to != now {
+                    for slot in crate::world::WEAPON_SET_SLOTS {
+                        let held = o.equipment.remove(&slot);
+                        if let Some(i) = o.other_set.remove(&slot) {
+                            o.equipment.insert(slot, i);
+                        }
+                        if let Some(i) = held {
+                            o.other_set.insert(slot, i);
+                        }
+                    }
+                }
                 o.fields.insert("ActiveWeaponSet".into(), to);
             }
             void()
@@ -2754,6 +2794,7 @@ pub fn call(
                 for o in h.sim.world.objects.values_mut() {
                     o.inventory.retain(|&i| i != item);
                     o.equipment.retain(|_, i| *i != item);
+                    o.other_set.retain(|_, i| *i != item);
                 }
                 h.sim.world.objects.remove(&item);
             }
@@ -2944,7 +2985,10 @@ mod tests {
         void SwitchWeaponSet(object o, int n = -1) = 17;\n\
         int GetActiveWeaponSet(object o) = 18;\n\
         void SetPlotActionState(int a, int s) = 19;\n\
-        int GetPlotActionState(int a) = 20;\n";
+        int GetPlotActionState(int a) = 20;\n\
+        int EquipItem(object o, object i, int s = 255, int w = -1) = 21;\n\
+        object GetItemInEquipSlot(int s, object o, int w = -1) = 22;\n\
+        int INVENTORY_SLOT_INVALID = 255;\n";
 
     /// Calls engine function `name` as `caller`.
     fn run(s: &mut Sim, caller: ObjectId, name: &str, a: &[Value]) -> Option<Value> {
@@ -2955,6 +2999,56 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn weapon_sets_hold_their_own_weapons() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let c = s.world.spawn(ObjectKind::Creature, "militia");
+        let (dagger, bow, armour) = (
+            s.world.spawn(ObjectKind::Item, "dagger"),
+            s.world.spawn(ObjectKind::Item, "bow"),
+            s.world.spawn(ObjectKind::Item, "armour"),
+        );
+        let o = Value::Object;
+        run(
+            &mut s,
+            c,
+            "EquipItem",
+            &[o(c), o(armour), Value::Int(4), Value::Int(-1)],
+        );
+        run(
+            &mut s,
+            c,
+            "EquipItem",
+            &[o(c), o(dagger), Value::Int(0), Value::Int(0)],
+        );
+        run(
+            &mut s,
+            c,
+            "EquipItem",
+            &[o(c), o(bow), Value::Int(0), Value::Int(1)],
+        );
+        let main = |s: &mut Sim, set: i32| {
+            run(
+                s,
+                c,
+                "GetItemInEquipSlot",
+                &[Value::Int(0), o(c), Value::Int(set)],
+            )
+        };
+        // The bow went to the second set; the dagger is in hand.
+        assert_eq!(main(&mut s, -1), Some(o(dagger)));
+        assert_eq!(main(&mut s, 1), Some(o(bow)));
+        run(&mut s, c, "SwitchWeaponSet", &[o(c), Value::Int(1)]);
+        assert_eq!(main(&mut s, -1), Some(o(bow)));
+        assert_eq!(main(&mut s, 0), Some(o(dagger)));
+        assert_eq!(
+            s.world.get(c).unwrap().equipment.get(&4),
+            Some(&armour),
+            "armour stays"
+        );
     }
 
     #[test]

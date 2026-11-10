@@ -37,8 +37,14 @@ use thedas_script::vm::{OBJECT_INVALID, ObjectId};
 use crate::sim::Sim;
 use crate::world::{Effect, ObjectKind};
 
-/// How far creatures see each other, in metres. Provisional.
-pub const PERCEPTION_RANGE: f32 = 20.0;
+/// How far a creature notices others when its template gives no `PerceptionClass`, in
+/// metres. Provisional.
+pub const PERCEPTION_RANGE: f32 = 12.0;
+
+/// How far a creature keeps track of one it has noticed: script.ldf's `TriggerPerception`
+/// speaks of an outer "visual radius (about 60m)" beyond the normal perception ring.
+/// Provisional.
+pub const VISUAL_RANGE: f32 = 60.0;
 
 /// `EFFECT_TYPE_DEATH` in effects.gda.
 pub const EFFECT_TYPE_DEATH: i32 = 7;
@@ -137,12 +143,40 @@ impl Sim {
             .filter(|o| o.kind == ObjectKind::Creature && o.area == Some(area))
             .map(|o| (o.id, o.position))
             .collect();
+        let grid = self.nav_grid(area);
         for &(id, pos) in &creatures {
             let alive = self.alive(id);
+            // A creature notices others within its template's PerceptionClass (taken to be a
+            // radius in metres: 9 for most creatures, 12 for player characters, 15 for an
+            // ogre; provisional) when nothing blocks the line between them, and keeps track
+            // of those it has noticed out to the visual radius.
+            let ring = self
+                .world
+                .get(id)
+                .and_then(|o| o.fields.get("PerceptionClass").copied())
+                .filter(|&r| r > 0)
+                .map_or(PERCEPTION_RANGE, |r| r as f32);
+            let seen = self
+                .world
+                .get(id)
+                .map(|o| o.combat.perceived.clone())
+                .unwrap_or_default();
             let now: Vec<ObjectId> = if alive {
                 creatures
                     .iter()
-                    .filter(|&&(o, p)| o != id && self.alive(o) && dist(pos, p) <= PERCEPTION_RANGE)
+                    .filter(|&&(o, p)| {
+                        if o == id || !self.alive(o) {
+                            return false;
+                        }
+                        let d = dist(pos, p);
+                        if seen.contains(&o) {
+                            return d <= VISUAL_RANGE;
+                        }
+                        d <= ring
+                            && grid
+                                .as_ref()
+                                .is_none_or(|g| crate::nav::line_clear(g, pos, p))
+                    })
                     .map(|&(o, _)| o)
                     .collect()
             } else {
@@ -830,6 +864,45 @@ mod tests {
             },
         );
         assert!(!s.world.get(hero).unwrap().dead);
+    }
+
+    #[test]
+    fn perception_class_sets_the_ring_and_noticed_creatures_stay_seen() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let near_sighted = s.world.spawn(ObjectKind::Creature, "corpse");
+        s.world.hero = Some(hero);
+        for (id, x, ring) in [(hero, 0.0, 12), (near_sighted, 10.0, 9)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = [x, 0.0, 0.0];
+            o.fields.insert("PerceptionClass".into(), ring);
+        }
+        s.update_perception();
+        // 10 m apart: inside the hero's 12 m ring, outside the corpse's 9 m one.
+        assert_eq!(
+            s.world.get(hero).unwrap().combat.perceived,
+            vec![near_sighted]
+        );
+        assert!(
+            s.world
+                .get(near_sighted)
+                .unwrap()
+                .combat
+                .perceived
+                .is_empty()
+        );
+        // Once noticed, a creature is kept track of well beyond the ring.
+        s.world.get_mut(near_sighted).unwrap().position = [40.0, 0.0, 0.0];
+        s.update_perception();
+        assert_eq!(
+            s.world.get(hero).unwrap().combat.perceived,
+            vec![near_sighted]
+        );
+        s.world.get_mut(near_sighted).unwrap().position = [70.0, 0.0, 0.0];
+        s.update_perception();
+        assert!(s.world.get(hero).unwrap().combat.perceived.is_empty());
     }
 
     #[test]
