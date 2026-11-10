@@ -16,6 +16,7 @@ pub mod combat;
 pub mod dialog;
 pub mod engine;
 pub mod m2da;
+pub mod nav;
 pub mod plot;
 pub mod save;
 pub mod session;

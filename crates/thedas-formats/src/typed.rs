@@ -194,6 +194,34 @@ impl<'a> Doc<'a> {
         }
     }
 
+    /// A numeric list as floats, whatever its element type. Missing or null reads as empty.
+    pub fn numbers(&self, id: StructId, label: u32) -> TypedResult<Vec<f32>> {
+        Ok(match self.get(id, label) {
+            None | Some(Value::List(None)) => Vec::new(),
+            Some(Value::List(Some(l))) => match l {
+                List::U8(v) => v.iter().map(|&x| x as f32).collect(),
+                List::I8(v) => v.iter().map(|&x| x as f32).collect(),
+                List::U16(v) => v.iter().map(|&x| x as f32).collect(),
+                List::I16(v) => v.iter().map(|&x| x as f32).collect(),
+                List::U32(v) => v.iter().map(|&x| x as f32).collect(),
+                List::I32(v) => v.iter().map(|&x| x as f32).collect(),
+                List::F32(v) => v.clone(),
+                List::F64(v) => v.iter().map(|&x| x as f32).collect(),
+                _ => return Err(self.wrong(label, self.get(id, label).unwrap_or(&Value::Absent))),
+            },
+            Some(v) => return Err(self.wrong(label, v)),
+        })
+    }
+
+    /// A struct-valued field.
+    pub fn opt_struct(&self, id: StructId, label: u32) -> TypedResult<Option<StructId>> {
+        match self.get(id, label) {
+            None | Some(Value::Struct(None)) => Ok(None),
+            Some(Value::Struct(Some(c))) => Ok(Some(*c)),
+            Some(v) => Err(self.wrong(label, v)),
+        }
+    }
+
     /// A byte-list field (vertex and index blobs). Missing or null reads as empty.
     pub fn bytes(&self, id: StructId, label: u32) -> TypedResult<&'a [u8]> {
         match self.get(id, label) {
