@@ -1579,6 +1579,7 @@ impl Server {
                 from: None,
                 approach: None,
                 ring_wait: false,
+                path: Vec::new(),
             };
             if let Some(o) = sim.world.get_mut(hero) {
                 o.commands.clear();

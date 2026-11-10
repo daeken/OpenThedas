@@ -666,6 +666,7 @@ impl Sim {
             from: None,
             approach: None,
             ring_wait: false,
+            path: Vec::new(),
         };
         if let Some(o) = self.world.get_mut(attacker) {
             o.commands.clear();
@@ -703,6 +704,7 @@ impl Sim {
             from: None,
             approach: None,
             ring_wait: false,
+            path: Vec::new(),
         };
         if let Some(o) = self.world.get_mut(who).filter(|o| o.commands.is_empty()) {
             o.commands.push(cmd);

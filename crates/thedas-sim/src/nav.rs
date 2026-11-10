@@ -281,4 +281,62 @@ mod tests {
         g.heights[(2 * 5 + 2) as usize] = 16.0;
         assert!(route(&g, [0.5, 0.5, 0.0], [4.5, 0.5, 0.0]).is_none());
     }
+
+    #[test]
+    fn creatures_move_along_routes_round_walls() {
+        use crate::world::{Command, Location, ObjectKind};
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        s.area_layouts.insert(area, "walled".into());
+        s.nav_grids.insert("walled".into(), Some(Arc::new(grid())));
+        let c = s.world.spawn(ObjectKind::Creature, "walker");
+        {
+            let o = s.world.get_mut(c).unwrap();
+            o.area = Some(area);
+            o.position = [0.5, 0.5, 0.0];
+        }
+        let to = [4.5, 0.5, 0.0];
+        s.world.get_mut(c).unwrap().commands.push(Command {
+            ty: 0,
+            name: "CommandMoveToLocation".into(),
+            target: None,
+            location: Some(Location {
+                area,
+                position: to,
+                facing: 0.0,
+            }),
+            seconds: 0.0,
+            ints: Vec::new(),
+            strings: Vec::new(),
+            due: None,
+            from: None,
+            approach: None,
+            ring_wait: false,
+            path: Vec::new(),
+        });
+        // Four metres in a straight line, but the wall sends it up through the gap: the
+        // route is longer, and halfway along it the walker is in the top row, not inside
+        // the wall.
+        s.tick(1);
+        let path = s.world.get(c).unwrap().commands[0].path.clone();
+        assert!(path.len() > 2, "{path:?}");
+        let mut prev = [0.5, 0.5, 0.0];
+        let mut len = 0.0;
+        for p in &path {
+            len += crate::engine::dist(prev, *p);
+            prev = *p;
+        }
+        assert!(len > 4.5, "{len}");
+        let due = s.world.get(c).unwrap().commands[0].due.unwrap();
+        let half = (due - s.world.time_ms) / 2;
+        s.tick(half);
+        let p = s.world.get(c).unwrap().position;
+        assert!(p[1] >= 1.5, "halfway it is round the wall's end: {p:?}");
+        s.tick(10_000);
+        let o = s.world.get(c).unwrap();
+        assert!(o.commands.is_empty());
+        assert_eq!(o.position, to);
+    }
 }
