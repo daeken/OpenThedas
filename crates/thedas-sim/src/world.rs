@@ -104,6 +104,14 @@ pub struct Object {
     /// Non-party followers (`AddNonPartyFollower`): they follow but are not in the party.
     #[serde(default)]
     pub escorts: Vec<ObjectId>,
+    /// Inventories stored on this container (`StoreFollowerInventory`): by owner, each item
+    /// with the equipment slot it was in (-1 for none).
+    #[serde(default)]
+    pub stored: BTreeMap<ObjectId, Vec<(ObjectId, i32)>>,
+    /// Whether the object was active when the party left its area (the area is not
+    /// loaded meanwhile); restored when the party comes back.
+    #[serde(default)]
+    pub parked: Option<bool>,
     pub effects: Vec<Effect>,
     /// Combat bookkeeping (perception, threat, the pending attack); see `combat`.
     #[serde(default)]
@@ -148,6 +156,8 @@ impl Object {
             commands: Vec::new(),
             followers: Vec::new(),
             escorts: Vec::new(),
+            stored: BTreeMap::new(),
+            parked: None,
             effects: Vec::new(),
             combat: Default::default(),
             abilities: std::collections::BTreeSet::new(),
@@ -283,6 +293,11 @@ pub struct World {
     /// Whether the party was fighting at the last perception update.
     #[serde(default)]
     pub party_fighting: bool,
+    /// Nobody is under the player's direct control: the party AI (tactics) drives every
+    /// party member, the hero included, as it drives followers the player is not
+    /// controlling. For playing without a player.
+    #[serde(default)]
+    pub autopilot: bool,
     /// Group pairs set hostile with `SetGroupHostility`.
     #[serde(default, with = "pairs")]
     pub hostility: BTreeMap<(i32, i32), bool>,
@@ -377,6 +392,7 @@ impl World {
             in_triggers: BTreeMap::new(),
             hostility: BTreeMap::new(),
             party_fighting: false,
+            autopilot: false,
             rng: Rng::new(seed),
             trace: Trace::default(),
             tables,

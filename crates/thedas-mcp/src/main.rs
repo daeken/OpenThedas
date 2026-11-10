@@ -185,6 +185,12 @@ struct LoadArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct AutopilotArgs {
+    /// On: the party AI (tactics) fights for every party member, the hero included.
+    on: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct LevelUpArgs {
     /// Party member to level up (default: the hero).
     object: Option<String>,
@@ -1201,6 +1207,39 @@ impl Server {
                 "area": sim.world.area.map(|x| summary(sim, x)),
                 "conversation": dialog_json(sim),
             }))
+        })
+    }
+
+    #[tool(
+        description = "Turn autopilot on or off. On, nobody is under direct control and the game's party AI fights for every party member, the hero included, with its tactics (a hero with none gets its class's first tactics preset). Use step to let fights play out."
+    )]
+    async fn autopilot(&self, Parameters(a): Parameters<AutopilotArgs>) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            sim.world.autopilot = a.on;
+            let hero = sim.world.hero.ok_or("no hero")?;
+            let mut preset = None;
+            if a.on && sim.tactics_of(hero).is_empty() {
+                let class = sim
+                    .world
+                    .get(hero)
+                    .and_then(|o| o.properties.get(&27))
+                    .map_or(1, |v| v.0.max(v.1) as i64);
+                let tables = sim.world.tables();
+                if let Some(t) = tables.get(0, "tacticsuserpresets") {
+                    let col = t.columns.iter().find(|(_, i)| **i == 4).map(|(h, _)| *h);
+                    preset = t.order.iter().copied().find(|&r| {
+                        r > 0
+                            && col.is_some_and(|h| {
+                                matches!(t.cell_by_hash(h, r), Some(thedas_formats::gda::Cell::Int(c)) if *c == class)
+                            })
+                    });
+                }
+                if let Some(p) = preset {
+                    sim.apply_tactic_preset(hero, p as i32);
+                }
+            }
+            Ok(json!({ "autopilot": a.on, "hero_preset": preset, "hero_tactics": sim.tactics_of(hero).len() }))
         })
     }
 

@@ -45,6 +45,65 @@ impl Sim {
         true
     }
 
+    /// `StoreFollowerInventory`: moves a creature's items (equipped ones too, remembering
+    /// their slots) into a container. `equipped` false leaves equipped items where they are
+    /// (the party inventory). Provisional.
+    pub fn store_inventory(&mut self, owner: ObjectId, container: ObjectId, equipped: bool) {
+        if self.world.get(container).is_none() {
+            return;
+        }
+        let Some(o) = self.world.get_mut(owner) else {
+            return;
+        };
+        let slot_of = |o: &crate::world::Object, i: ObjectId| {
+            o.equipment
+                .iter()
+                .find(|(_, x)| **x == i)
+                .map_or(-1, |(s, _)| *s)
+        };
+        let items: Vec<(ObjectId, i32)> = o
+            .inventory
+            .iter()
+            .map(|&i| (i, slot_of(o, i)))
+            .filter(|(_, s)| equipped || *s < 0)
+            .collect();
+        o.inventory.retain(|i| !items.iter().any(|(x, _)| x == i));
+        o.equipment
+            .retain(|_, i| !items.iter().any(|(x, _)| x == i));
+        if let Some(c) = self.world.get_mut(container) {
+            c.inventory.extend(items.iter().map(|(i, _)| *i));
+            c.stored.entry(owner).or_default().extend(items);
+            c.active = true;
+        }
+    }
+
+    /// `RestoreFollowerInventory`: gives back what `store_inventory` put in the container
+    /// (whatever is still there), re-equipping it.
+    pub fn restore_inventory(&mut self, owner: ObjectId, container: ObjectId) {
+        if self.world.get(owner).is_none() {
+            return;
+        }
+        let Some(c) = self.world.get_mut(container) else {
+            return;
+        };
+        let items = c.stored.remove(&owner).unwrap_or_default();
+        let items: Vec<(ObjectId, i32)> = items
+            .into_iter()
+            .filter(|(i, _)| c.inventory.contains(i))
+            .collect();
+        c.inventory.retain(|i| !items.iter().any(|(x, _)| x == i));
+        if let Some(o) = self.world.get_mut(owner) {
+            for (i, slot) in items {
+                if !o.inventory.contains(&i) {
+                    o.inventory.push(i);
+                }
+                if slot >= 0 {
+                    o.equipment.insert(slot, i);
+                }
+            }
+        }
+    }
+
     /// The equipment slots an item fits (`EquippableSlots` bitmask of its base type in
     /// `bitm_base.gda`), lowest first.
     pub fn item_slots(&self, item: ObjectId) -> Vec<i32> {
@@ -175,6 +234,41 @@ impl Sim {
             c.equipment.retain(|_, i| !items.contains(i));
         }
         Some(bag)
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use std::sync::Arc;
+
+    use thedas_script::EngineTable;
+    use thedas_vfs::Vfs;
+
+    use super::*;
+
+    #[test]
+    fn stored_inventories_come_back_equipped() {
+        let mut s = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(EngineTable::parse(b"").unwrap()),
+            1,
+        );
+        let who = s.world.spawn(ObjectKind::Creature, "alistair");
+        let chest = s.world.spawn(ObjectKind::Placeable, "footlocker");
+        let sword = s.world.spawn(ObjectKind::Item, "sword");
+        let pelt = s.world.spawn(ObjectKind::Item, "pelt");
+        let o = s.world.get_mut(who).unwrap();
+        o.inventory = vec![sword, pelt];
+        o.equipment.insert(0, sword);
+        s.store_inventory(who, chest, true);
+        assert!(s.world.get(who).unwrap().inventory.is_empty());
+        assert!(s.world.get(who).unwrap().equipment.is_empty());
+        assert_eq!(s.world.get(chest).unwrap().inventory, vec![sword, pelt]);
+        s.restore_inventory(who, chest);
+        let o = s.world.get(who).unwrap();
+        assert_eq!(o.inventory, vec![sword, pelt]);
+        assert_eq!(o.equipment.get(&0), Some(&sword));
+        assert!(s.world.get(chest).unwrap().inventory.is_empty());
     }
 }
 

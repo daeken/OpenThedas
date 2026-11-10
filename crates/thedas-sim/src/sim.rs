@@ -406,6 +406,34 @@ impl Sim {
 
     /// Moves the party to another area (`DoAreaTransition`), loading it. Provisional: the
     /// area left behind stays in the world, inactive, and is not reused on return.
+    /// The party pool: recruited followers in or out of the active party (follower state
+    /// ACTIVE, AVAILABLE, SUSPENDED or LOCKEDACTIVE). They travel with the party, those out
+    /// of it staying inactive. Provisional.
+    pub fn party_pool(&self) -> Vec<ObjectId> {
+        let states: Vec<i32> = [
+            "FOLLOWER_STATE_ACTIVE",
+            "FOLLOWER_STATE_AVAILABLE",
+            "FOLLOWER_STATE_SUSPENDED",
+            "FOLLOWER_STATE_LOCKEDACTIVE",
+        ]
+        .iter()
+        .map(|c| constant(&self.table, c))
+        .filter(|&v| v != 0)
+        .collect();
+        self.world
+            .objects
+            .values()
+            .filter(|o| {
+                Some(o.id) != self.world.hero
+                    && o.kind == ObjectKind::Creature
+                    && o.fields
+                        .get("FollowerState")
+                        .is_some_and(|s| states.contains(s))
+            })
+            .map(|o| o.id)
+            .collect()
+    }
+
     pub fn area_transition(&mut self, area: &str, waypoint: &str) {
         let t = self.world.time_ms;
         self.world.trace.push(TraceEntry::Log {
@@ -425,10 +453,14 @@ impl Sim {
                     .map(|h| h.followers.clone())
                     .unwrap_or_default(),
             )
+            .chain(self.party_pool())
             .collect();
+        // The old area unloads: its objects go inactive, remembering whether they were
+        // active for when the party comes back.
         if let Some(old) = old {
             for o in self.world.objects.values_mut() {
                 if o.area == Some(old) && !party.contains(&o.id) || o.id == old {
+                    o.parked = Some(o.active);
                     o.active = false;
                 }
             }
@@ -454,7 +486,9 @@ impl Sim {
                 if let Some(old) = old {
                     for o in self.world.objects.values_mut() {
                         if o.area == Some(old) || o.id == old {
-                            o.active = true;
+                            if let Some(a) = o.parked.take() {
+                                o.active = a;
+                            }
                         }
                     }
                 }
@@ -928,6 +962,25 @@ impl Sim {
         resref: &str,
         waypoint: Option<&str>,
     ) -> Result<ObjectId, SimError> {
+        // An area the party has been to keeps its objects and their state.
+        let known = self
+            .world
+            .objects
+            .values()
+            .find(|o| o.kind == ObjectKind::Area && o.template.eq_ignore_ascii_case(resref))
+            .map(|o| o.id);
+        if let Some(area) = known {
+            for o in self.world.objects.values_mut() {
+                if o.area == Some(area) || o.id == area {
+                    if let Some(a) = o.parked.take() {
+                        o.active = a;
+                    }
+                }
+            }
+            self.world.area = Some(area);
+            self.arrive(area, waypoint, Vec::new());
+            return Ok(area);
+        }
         let are = self.read_gff3(&format!("{}.are", resref.to_ascii_lowercase()))?;
         let root = are
             .structs
@@ -970,6 +1023,13 @@ impl Sim {
             }
         }
 
+        self.arrive(area, waypoint, spawned);
+        Ok(area)
+    }
+
+    /// The party arrives in an area: the hero stands at the waypoint (or the first one),
+    /// new objects get `SPAWN`, the area its load events and the hero's `ENTER`.
+    fn arrive(&mut self, area: ObjectId, waypoint: Option<&str>, spawned: Vec<ObjectId>) {
         // Place the hero.
         if let Some(hero) = self.world.hero {
             let wp = self
@@ -1011,7 +1071,6 @@ impl Sim {
             self.world.in_triggers.remove(&hero);
             self.update_triggers(hero);
         }
-        Ok(area)
     }
 
     fn spawn_instance(
@@ -1549,6 +1608,39 @@ mod tests {
         assert!(s.chargen_event("CHARGEN_END", vec![0, 0], Vec::new()));
         assert_eq!(s.world.chargen, None);
         assert!(!s.chargen_event("CHARGEN_END", vec![0, 0], Vec::new()));
+    }
+
+    #[test]
+    fn areas_keep_their_state_between_visits() {
+        let mut s = sim();
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.hero = Some(hero);
+        let mut areas = Vec::new();
+        for name in ["a", "b"] {
+            let id = s.world.spawn(ObjectKind::Area, name);
+            s.world.get_mut(id).unwrap().template = name.into();
+            areas.push(id);
+        }
+        let (a, b) = (areas[0], areas[1]);
+        s.world.area = Some(a);
+        s.world.get_mut(hero).unwrap().area = Some(a);
+        let awake = s.world.spawn(ObjectKind::Creature, "awake");
+        let asleep = s.world.spawn(ObjectKind::Creature, "asleep");
+        for (id, on) in [(awake, true), (asleep, false)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(a);
+            o.active = on;
+        }
+        let count = s.world.objects.len();
+        s.area_transition("b", "");
+        assert_eq!(s.world.area, Some(b));
+        assert!(!s.world.get(awake).unwrap().active, "the left area unloads");
+        s.area_transition("a", "");
+        assert_eq!(s.world.area, Some(a));
+        assert_eq!(s.world.objects.len(), count, "nothing is spawned again");
+        assert!(s.world.get(awake).unwrap().active);
+        assert!(!s.world.get(asleep).unwrap().active);
+        assert_eq!(s.world.get(hero).unwrap().area, Some(a));
     }
 
     #[test]
