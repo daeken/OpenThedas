@@ -10,7 +10,9 @@
 
 pub mod atlas;
 pub mod avm1;
+pub mod binding;
 pub mod protocol;
+pub mod stage;
 
 pub use thedas_formats::gfx;
 pub mod navigator;

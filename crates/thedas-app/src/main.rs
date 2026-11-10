@@ -564,7 +564,11 @@ fn main() -> Result<()> {
         (None, None) => Camera::new(Vec3::ZERO, 0.0, 0.0),
     };
     camera.fov_y = args.fov.clamp(10.0, 150.0).to_radians();
-    let ui = args.ui.as_deref().map(ui::movie_names).unwrap_or_default();
+    let ui = args
+        .ui
+        .as_deref()
+        .map(thedas_ui::stage::movie_names)
+        .unwrap_or_default();
 
     if let Some(out) = &args.capture {
         return capture(&loaded, out, camera, size, &ui, args.ui_frames);
