@@ -2641,7 +2641,13 @@ pub fn call(
                     .unwrap_or(hero_default),
             ))
         }
-        "SetAimLoopDuration" => void(),
+        "SetAimLoopDuration" => {
+            let ms = (float(a, 1).max(0.0) * 1000.0) as u64;
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.combat.aim_ms = Some(ms);
+            }
+            void()
+        }
         // Tactics and area-of-effect abilities are not simulated yet.
         "GetAbilitiesDueToAOEs" => ok(Value::Array {
             elem: Type::Int,

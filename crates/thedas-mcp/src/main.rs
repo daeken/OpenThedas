@@ -909,6 +909,7 @@ impl Server {
                 "queued_events": sim.world.queue.len(),
                 "scripts_run": tr.scripts_run,
                 "script_errors": tr.script_errors,
+                "game_over": sim.world.game_over,
                 "unimplemented_top": un.iter().take(40).map(|(f, n)| json!({"function": f, "calls": n})).collect::<Vec<_>>(),
                 "conversation": dialog_json(sim),
             }))

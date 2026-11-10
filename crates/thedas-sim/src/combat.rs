@@ -73,6 +73,10 @@ pub struct CombatData {
     pub attack: Option<AttackResult>,
     /// `SetAttackDuration` for the attack in progress.
     pub attack_ms: Option<u64>,
+    /// `SetAimLoopDuration` for a ranged attack in progress: the time spent aiming before
+    /// the shot, on top of the attack's own duration. Provisional.
+    #[serde(default)]
+    pub aim_ms: Option<u64>,
     /// Tactics slots (`SetTacticEntry`, or a preset).
     #[serde(default)]
     pub tactics: Vec<Tactic>,
@@ -240,10 +244,23 @@ impl Sim {
                 })
         });
         // A fight that ended with fallen party members gets them up
-        // (EVENT_TYPE_DEATH_RES_PARTY to the module), whatever the game mode is.
+        // (EVENT_TYPE_DEATH_RES_PARTY to the module), whatever the game mode is, as long as
+        // someone was left standing. When the whole party falls the game is over: the engine
+        // shows the death screen itself (no script calls ShowDeathScreen).
         let was = std::mem::replace(&mut self.world.party_fighting, fighting);
+        let standing = party.iter().any(|&m| self.alive(m));
+        if !party.is_empty() && !standing && !self.world.game_over {
+            self.world.game_over = true;
+            let t = self.world.time_ms;
+            self.world.trace.push(crate::trace::TraceEntry::Log {
+                t,
+                channel: -1,
+                text: "the whole party has fallen: game over".into(),
+            });
+        }
         if was
             && !fighting
+            && standing
             && party
                 .iter()
                 .any(|&m| self.world.get(m).is_some_and(|o| o.dead))
@@ -657,6 +674,7 @@ impl Sim {
         if let Some(o) = self.world.get_mut(id) {
             o.combat.attack = None;
             o.combat.attack_ms = None;
+            o.combat.aim_ms = None;
         }
         let script = self.world.get(id).and_then(|o| o.script.clone());
         if let Some(script) = script {
