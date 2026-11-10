@@ -202,9 +202,13 @@ impl Sim {
     }
 
     /// Clicking a pin on the world map: `EVENT_TYPE_BEGIN_TRAVEL` to the module (strings:
-    /// the area left, the destination area and its arrival waypoint; integers: the map, the
-    /// destination pin's terrain and icon; object: the pin the party is at). Returns false if
-    /// the pin cannot be travelled to.
+    /// the area left, the destination area and its arrival waypoint; integers: 0, the
+    /// destination pin's terrain and the map's `worldmaps.gda` row; object: the pin the party
+    /// is at). Returns false if the pin cannot be travelled to.
+    ///
+    /// The integer order is read from sp_module_travel, which logs "World Map: " with integer
+    /// 2 and "Target Terrain: " with integer 1, and looks the map up in `worldmaps.gda` for
+    /// the trip counter table. Nothing found reads integer 0 (provisional).
     pub fn begin_travel(&mut self, pin: ObjectId) -> bool {
         let active = crate::sim::constant(&self.table, "WM_LOCATION_ACTIVE");
         let Some(p) = self.world.get(pin).filter(|o| o.kind == ObjectKind::MapPin) else {
@@ -217,9 +221,9 @@ impl Sim {
             return false;
         };
         let ints = vec![
-            p.fields.get("WMMap").copied().unwrap_or(0),
+            0,
             p.fields.get("WMTerrain").copied().unwrap_or(0),
-            p.fields.get("WMIcon").copied().unwrap_or(0),
+            p.fields.get("WMMap").copied().unwrap_or(0),
         ];
         let from = self
             .world
@@ -347,5 +351,33 @@ mod tests {
         assert_eq!((p.status, p.terrain, p.icon), (3, 5, 6));
         assert_eq!(p.position, [410.0, 372.0]);
         assert_eq!(p.name_strref, Some(9));
+    }
+
+    #[test]
+    fn travel_sends_the_terrain_and_map_where_the_travel_script_reads_them() {
+        use std::sync::Arc;
+        let mut s = Sim::new(
+            Arc::new(thedas_vfs::Vfs::new()),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        s.world.module = Some(module);
+        let pin = s.world.spawn(ObjectKind::MapPin, "wml_town");
+        {
+            let o = s.world.get_mut(pin).unwrap();
+            // WM_LOCATION_ACTIVE is 0 without script.ldf constants.
+            o.fields.insert("WMStatus".into(), 0);
+            o.fields.insert("WMMap".into(), 1);
+            o.fields.insert("WMTerrain".into(), 5);
+            o.fields.insert("WMIcon".into(), 6);
+            o.locals
+                .strings
+                .insert("WM_AREA".into(), "town_area".into());
+        }
+        assert!(s.begin_travel(pin));
+        let ev = &s.world.queue.values().next().unwrap().event;
+        assert_eq!(ev.ints, vec![0, 5, 1]);
+        assert_eq!(ev.strings[1], "town_area");
     }
 }
