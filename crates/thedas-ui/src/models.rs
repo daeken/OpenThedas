@@ -294,8 +294,8 @@ pub mod action {
 /// How long an attack plays when the script set no duration (milliseconds). Provisional.
 pub const DEFAULT_ATTACK_MS: u64 = 1500;
 
-/// What a creature's body is doing: dead (the death animation's last pose: when it died
-/// is not kept), attacking (the attack animation over the attack's duration), moving (a
+/// What a creature's body is doing: dead (the death animation from when it died, then its
+/// last pose), attacking (the attack animation over the attack's duration), moving (a
 /// run), or standing (pause, the combat stance when fighting). Looping animations start at
 /// a different point per creature so a crowd does not move in step. Provisional: the
 /// original picks among variants (`attk_v1`..`v6`, weapon styles) that are not modelled.
@@ -324,10 +324,13 @@ pub fn motion(sim: &Sim, o: &Object) -> Option<Motion> {
     };
     let fighting = o.combat.in_combat;
     if o.dead {
+        // From when it died, held on the last frame; a death of unknown time (a save from
+        // before deaths were timed) shows the last frame.
+        let time = o.died_at.map_or(f32::MAX, |t| secs(now.saturating_sub(t)));
         return Some(Motion {
             trees: trees(&[&ambient, &combat]),
             action: action::DIE.into(),
-            time: f32::MAX,
+            time,
             looping: false,
         });
     }
@@ -441,6 +444,44 @@ mod tests {
         assert_eq!(var(sword), Some(("lsw".into(), "ls01a".into())));
         assert_eq!(var(claw), None, "no variation table");
         assert_eq!(var(unknown), None, "no such variation");
+    }
+
+    #[test]
+    fn the_dead_play_their_death_from_when_they_died() {
+        use std::sync::Arc;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let st = |v: &str| Cell::String(format!("{v}\0"));
+        s.world.tables().insert(
+            "apr_base",
+            &["#500976ec", "#de80b418", "MovementTree", "CombatMoveTree"],
+            vec![(
+                15,
+                vec![
+                    st("humanoid.anb"),
+                    st("combat_humanoid.anb"),
+                    st("movement.anb"),
+                    st("combat_movement.anb"),
+                ],
+            )],
+        );
+        let id = s.world.spawn(ObjectKind::Creature, "bandit");
+        {
+            let o = s.world.get_mut(id).unwrap();
+            o.appearance = 15;
+            o.dead = true;
+            o.died_at = Some(1_000);
+        }
+        s.world.time_ms = 2_500;
+        let m = motion(&s, s.world.get(id).unwrap()).unwrap();
+        assert_eq!(m.action, action::DIE);
+        assert_eq!(m.trees, vec!["humanoid.anb", "combat_humanoid.anb"]);
+        assert!(!m.looping);
+        assert!((m.time - 1.5).abs() < 1e-6);
+        // A death of unknown time shows the end of the animation.
+        s.world.get_mut(id).unwrap().died_at = None;
+        assert_eq!(motion(&s, s.world.get(id).unwrap()).unwrap().time, f32::MAX);
     }
 
     #[test]
