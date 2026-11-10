@@ -527,6 +527,78 @@ impl Sim {
         self.update_triggers(id);
     }
 
+    /// Walks an object in a straight line to `to` at 5 m/s, half a metre per step, running
+    /// the world as it goes, so triggers on the way fire and the world reacts. Stops early
+    /// when a conversation starts, the area changes or the walker dies; returns whether it
+    /// arrived. Provisional: there is no pathfinding, so walls are walked through. A
+    /// destination in another area is a teleport.
+    pub fn walk(&mut self, id: ObjectId, to: [f32; 3], area: Option<ObjectId>) -> bool {
+        let Some((from, here)) = self.world.get(id).map(|o| (o.position, o.area)) else {
+            return false;
+        };
+        if area.is_some() && area != here {
+            self.move_object(id, to, area);
+            self.tick(0);
+            return true;
+        }
+        let d = crate::engine::dist(from, to);
+        if d > 0.01 {
+            if let Some(o) = self.world.get_mut(id) {
+                o.facing = (to[1] - from[1]).atan2(to[0] - from[0]).to_degrees();
+            }
+        }
+        let steps = (d / 0.5).ceil().max(1.0) as usize;
+        let talking = self.talk.as_ref().is_some_and(|c| !c.ended);
+        for i in 1..=steps {
+            let f = i as f32 / steps as f32;
+            let p = [
+                from[0] + (to[0] - from[0]) * f,
+                from[1] + (to[1] - from[1]) * f,
+                from[2] + (to[2] - from[2]) * f,
+            ];
+            self.move_object(id, p, None);
+            if Some(id) == self.world.hero {
+                self.follow_leader(id);
+            }
+            self.tick(100);
+            let o = self.world.get(id);
+            let stopped = o.is_none_or(|o| o.dead || o.area != here)
+                || (!talking && self.talk.as_ref().is_some_and(|c| !c.ended));
+            if stopped {
+                return i == steps;
+            }
+        }
+        true
+    }
+
+    /// Keeps the hero's followers with it: each living follower in the same area that
+    /// follows the leader (`SetFollowPartyLeader`, on unless turned off) and is not busy
+    /// with a command stands a metre behind, one more metre per follower. Provisional: real
+    /// followers path after the leader.
+    pub fn follow_leader(&mut self, leader: ObjectId) {
+        let Some((pos, area, facing, followers)) = self
+            .world
+            .get(leader)
+            .map(|o| (o.position, o.area, o.facing, o.followers.clone()))
+        else {
+            return;
+        };
+        let (s, c) = facing.to_radians().sin_cos();
+        for (i, f) in followers.into_iter().enumerate() {
+            let ok = self.world.get(f).is_some_and(|o| {
+                !o.dead
+                    && o.area == area
+                    && o.commands.is_empty()
+                    && o.fields.get("FollowPartyLeader").copied().unwrap_or(1) != 0
+            });
+            if ok {
+                let back = 1.0 + i as f32;
+                let p = [pos[0] - c * back, pos[1] - s * back, pos[2]];
+                self.move_object(f, p, None);
+            }
+        }
+    }
+
     /// Queues ENTER for triggers a creature is now in and EXIT for ones it left. Provisional:
     /// trigger outlines are tested in the XY plane, and the creature is the event's creator
     /// and object 0.
@@ -650,6 +722,20 @@ impl Sim {
             }
         }
         if let Some(l) = cmd.location {
+            // Cross the triggers between here and there on the way (straight line).
+            let from = self.world.get(id).map(|o| (o.position, o.area));
+            if let Some((from, Some(a))) = from.filter(|f| f.1 == Some(l.area)) {
+                let steps = (crate::engine::dist(from, l.position) / 0.5).ceil() as usize;
+                for i in 1..steps {
+                    let f = i as f32 / steps as f32;
+                    let p = [
+                        from[0] + (l.position[0] - from[0]) * f,
+                        from[1] + (l.position[1] - from[1]) * f,
+                        from[2] + (l.position[2] - from[2]) * f,
+                    ];
+                    self.move_object(id, p, Some(a));
+                }
+            }
             if let Some(obj) = self.world.get_mut(id) {
                 obj.position = l.position;
                 obj.area = Some(l.area);
@@ -931,6 +1017,30 @@ impl Sim {
                 }
             }
         }
+        // A creature's equipment (Equip_ItemList: each struct's type id is the
+        // INVENTORY_SLOT_*, provisional) and carried items.
+        if kind == ObjectKind::Creature {
+            if let Some(t) = &tmpl {
+                if let Some(r) = t.structs.first() {
+                    for (list, equip) in [("Equip_ItemList", true), ("ItemList", false)] {
+                        let entries: Vec<(u32, String)> = list_of(r, list)
+                            .iter()
+                            .filter_map(|&si| t.structs.get(si as usize))
+                            .filter_map(|s| resref_field(s, "TemplateResRef").map(|x| (s.id, x)))
+                            .collect();
+                        for (slot, resref) in entries {
+                            let item = self.create_item(&resref);
+                            if let Some(o) = self.world.get_mut(id) {
+                                o.inventory.push(item);
+                                if equip {
+                                    o.equipment.insert(slot as i32, item);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         self.created(id);
         id
     }
@@ -987,6 +1097,48 @@ fn float(s: &Struct, label: &str) -> f32 {
         Some(G3::Float(v)) => *v,
         Some(G3::Double(v)) => *v as f32,
         _ => 0.0,
+    }
+}
+
+impl Sim {
+    /// Creates an item from its `.uti` template, with the template's integer fields
+    /// (`BaseItem`, ...) for engine functions that read them. A missing template still
+    /// makes the item, traced as missing.
+    pub fn create_item(&mut self, resref: &str) -> ObjectId {
+        let resref = resref.trim_end_matches(".uti").to_ascii_lowercase();
+        let tmpl = self.read_gff3(&format!("{resref}.uti"));
+        let tag = tmpl
+            .as_ref()
+            .ok()
+            .and_then(|g| g.structs.first().and_then(|r| text(r, "Tag")))
+            .unwrap_or_else(|| resref.clone());
+        let id = self.world.spawn(ObjectKind::Item, &tag);
+        match tmpl {
+            Ok(g) => {
+                if let (Some(r), Some(o)) = (g.structs.first(), self.world.get_mut(id)) {
+                    o.template = resref;
+                    o.name_strref = strref(r, "LocalizedName");
+                    o.plot = int(r, "Plot").unwrap_or(0) != 0;
+                    for fl in &r.fields {
+                        if let Some(v) = int(r, &fl.label) {
+                            o.fields.insert(fl.label.clone(), v);
+                        }
+                    }
+                    read_vars(&g, r, &mut o.locals);
+                }
+            }
+            Err(e) => {
+                if let Some(o) = self.world.get_mut(id) {
+                    o.template = resref;
+                }
+                let t = self.world.time_ms;
+                self.world.trace.push(TraceEntry::Missing {
+                    t,
+                    what: e.to_string(),
+                });
+            }
+        }
+        id
     }
 }
 
@@ -1310,6 +1462,41 @@ mod tests {
         s.move_object(c, [20.0, 10.0, 0.0], None);
         assert_eq!(s.world.queue.len(), 1);
         assert!(!s.world.in_triggers.contains_key(&c));
+    }
+
+    #[test]
+    fn walking_crosses_triggers_on_the_way_and_followers_keep_up() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let dog = s.world.spawn(ObjectKind::Creature, "dog");
+        let tr = s.world.spawn(ObjectKind::Trigger, "t");
+        s.world.hero = Some(hero);
+        for id in [hero, dog, tr] {
+            s.world.get_mut(id).unwrap().area = Some(area);
+        }
+        s.world.get_mut(hero).unwrap().followers = vec![dog];
+        {
+            let t = s.world.get_mut(tr).unwrap();
+            t.position = [5.0, 0.0, 0.0];
+            t.geometry = vec![
+                [-0.5, -1.0, 0.0],
+                [0.5, -1.0, 0.0],
+                [0.5, 1.0, 0.0],
+                [-0.5, 1.0, 0.0],
+            ];
+        }
+        assert!(s.walk(hero, [10.0, 0.0, 0.0], None));
+        assert_eq!(s.world.get(hero).unwrap().position, [10.0, 0.0, 0.0]);
+        // 10 m at 5 m/s.
+        assert_eq!(s.world.time_ms, 2000);
+        // The trigger saw the hero pass (enter and exit both delivered by now).
+        assert!(!s.world.in_triggers.contains_key(&hero));
+        let dog_pos = s.world.get(dog).unwrap().position;
+        assert!(
+            (dog_pos[0] - 9.0).abs() < 1e-4,
+            "dog follows a metre behind: {dog_pos:?}"
+        );
     }
 
     #[test]
