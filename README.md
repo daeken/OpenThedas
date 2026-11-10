@@ -31,9 +31,10 @@ Materials outside the Static1 family fall back to a hand-written stand-in unless
 | `thedas-shader` | D3D9 shader bytecode and constant-table parsing; translation to validated naga IR |
 | `thedas-render` | wgpu renderer: loads an area's static geometry, draws each material with its translated original shaders (or a stand-in), captures |
 | `thedas-app` | The `thedas-app` binary: a window with a free-fly camera, or a headless capture |
+| `thedas-script` | NWScript: the `script.ldf` engine-function table, NCS bytecode parsing and disassembly, and the stack VM |
 | `thedas-cli` | The `thedas` tool: `ls`, `extract`, `dump`, `resolve`, `corpus` |
 
-Planned crates follow the architecture doc: `thedas-script`, `thedas-sim`, `thedas-ui`,
+Planned crates follow the architecture doc: `thedas-sim`, `thedas-ui`,
 `thedas-audio`, `thedas-video`.
 
 ## Walking through an area
@@ -67,6 +68,9 @@ GAME=~/path/to/Dragon\ Age\ Origins   # the folder holding packages/ and modules
 ./target/release/thedas dump "$GAME/packages/core/data/2da.erf:abi_base.gda"
 ./target/release/thedas resolve "$GAME" abi_base.gda
 ./target/release/thedas resolve "$GAME" lgt101d_room000.dds --level lgt101d
+./target/release/thedas script disasm "$GAME" setplayerimmortal
+./target/release/thedas script run "$GAME" setplayerimmortal       # engine calls stubbed, printed
+./target/release/thedas script stats "$GAME" --report actions.json  # engine functions by call count
 ./target/release/thedas corpus "$GAME" --report corpus-report.json
 ```
 

@@ -2,6 +2,7 @@
 
 mod corpus;
 mod dump;
+mod script;
 
 use std::path::{Path, PathBuf};
 
@@ -48,6 +49,11 @@ enum Command {
         #[arg(long)]
         level: Option<String>,
     },
+    /// Compiled scripts: disassemble, run, or rank engine functions by use.
+    Script {
+        #[command(subcommand)]
+        command: ScriptCommand,
+    },
     /// Open every archive in an install and parse every GFF4-family resource.
     Corpus {
         /// Install roots or individual archives.
@@ -61,6 +67,31 @@ enum Command {
         /// Example failures to print per category.
         #[arg(long, default_value_t = 5)]
         examples: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScriptCommand {
+    /// Print a script's instructions with engine function names.
+    Disasm {
+        install: PathBuf,
+        /// A script resource (`name` or `name.ncs`) or a file.
+        script: String,
+    },
+    /// Run a script against an engine that implements nothing, printing every engine call.
+    Run {
+        install: PathBuf,
+        script: String,
+        /// Object id for OBJECT_SELF.
+        #[arg(long, default_value_t = 0)]
+        caller: u32,
+    },
+    /// Rank engine functions by static call count across every script in the install.
+    Stats {
+        install: PathBuf,
+        /// Write a JSON report here (and Markdown beside it).
+        #[arg(long)]
+        report: Option<PathBuf>,
     },
 }
 
@@ -99,6 +130,15 @@ fn run() -> Result<()> {
             name,
             level,
         } => resolve(&install, &name, level.as_deref()),
+        Command::Script { command } => match command {
+            ScriptCommand::Disasm { install, script } => script::disasm(&install, &script),
+            ScriptCommand::Run {
+                install,
+                script,
+                caller,
+            } => script::run(&install, &script, caller),
+            ScriptCommand::Stats { install, report } => script::stats(&install, report.as_deref()),
+        },
         Command::Corpus {
             paths,
             report,

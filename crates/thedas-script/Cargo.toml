@@ -1,0 +1,11 @@
+[package]
+name = "thedas-script"
+description = "NWScript for Dragon Age: Origins: script.ldf engine table, NCS bytecode and VM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true

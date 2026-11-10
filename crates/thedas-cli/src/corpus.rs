@@ -16,6 +16,7 @@ use thedas_formats::gff4::{Gff4, is_gff4};
 use thedas_formats::{
     Area, Arl, Dds, Gda, MaterialDef, MaterialObject, MaterialState, Mmh, Msh, Rml, Tlk,
 };
+use thedas_script::{EngineTable, Ncs};
 use thedas_vfs::erf::sniff_version;
 use thedas_vfs::{DaoInstall, Erf, extension};
 
@@ -111,9 +112,28 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// The engine-function table for checking scripts, loaded once from the install being
+/// checked (if the paths include one).
+static ENGINE_TABLE: std::sync::OnceLock<Option<EngineTable>> = std::sync::OnceLock::new();
+
+/// Failure categories that are reported but do not fail the run: an archive with an unusual
+/// extension, and engine calls the shipped `script.ldf` does not declare. In the GOG 1.05
+/// install those are engine functions #859-#862 and a two-argument `CommandFly`, used by the
+/// DLC and Awakening scripts (their engine extended the table; no newer `script.ldf` ships),
+/// plus a few 2006 iteration-test scripts compiled against an older table.
+const NON_FATAL: &[&str] = &["unexpected-archive", "script/undeclared-action"];
+
 pub fn run(paths: &[PathBuf], report: Option<&Path>, jobs: usize, keep: usize) -> Result<bool> {
     let started = Instant::now();
     let (items, root) = gather(paths)?;
+    ENGINE_TABLE.get_or_init(|| {
+        let install = DaoInstall::open(root.as_ref()?).ok()?;
+        let vfs = install
+            .global_vfs(thedas_vfs::install::TextureQuality::High)
+            .ok()?;
+        let (data, _) = vfs.read("script.ldf").ok()?;
+        EngineTable::parse(&data).ok()
+    });
     let rel = |p: &Path| -> String {
         match &root {
             Some(r) => p.strip_prefix(r).unwrap_or(p).display().to_string(),
@@ -319,10 +339,64 @@ fn check_other(
         Dds::parse(data).map(|_| ()).map_err(|e| e.to_string())
     } else if ext == "fxo" {
         return check_shader(data, location, stats, keep);
+    } else if ext == "ncs" {
+        return check_script(data, location, stats, keep);
+    } else if ext == "ldf" {
+        EngineTable::parse(data)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     } else {
         return;
     };
     typed_result(stats, ext, location, result, keep);
+}
+
+/// Scripts: parse and disassemble, and check every engine call against the engine table
+/// (known id, argument count within the declared parameters).
+fn check_script(data: &[u8], location: String, stats: &mut Stats, keep: usize) {
+    let table = ENGINE_TABLE.get().and_then(|t| t.as_ref());
+    let result = Ncs::parse(data).map_err(|e| e.to_string()).inspect(|ncs| {
+        let _ = ncs.disassemble(table);
+    });
+    let es = stats.by_ext.entry("ncs".into()).or_default();
+    let ncs = match result {
+        Ok(n) => {
+            es.typed_ok += 1;
+            n
+        }
+        Err(e) => {
+            es.typed_failed += 1;
+            stats.fail("typed/ncs", location, e, keep);
+            return;
+        }
+    };
+    let Some(table) = table else { return };
+    for (id, argc) in ncs.actions() {
+        match table.function(id) {
+            None => {
+                stats.fail(
+                    "script/undeclared-action",
+                    location.clone(),
+                    format!("engine function #{id} is not in script.ldf"),
+                    keep,
+                );
+            }
+            Some(f) if (argc as usize) > f.params.len() || (argc as usize) < f.required() => {
+                stats.fail(
+                    "script/undeclared-action",
+                    location.clone(),
+                    format!(
+                        "{} called with {argc} arguments, declared with {}..={}",
+                        f.name,
+                        f.required(),
+                        f.params.len()
+                    ),
+                    keep,
+                );
+            }
+            Some(_) => {}
+        }
+    }
 }
 
 /// Shaders: parse the D3D9 bytecode, translate it to naga IR and validate it. Failures are
@@ -559,7 +633,7 @@ fn print_summary(stats: &Stats, secs: f64) -> bool {
     let ok = stats
         .failure_counts
         .keys()
-        .all(|k| k == "unexpected-archive");
+        .all(|k| NON_FATAL.contains(&k.as_str()));
     println!("\n{} in {secs:.0}s", if ok { "PASS" } else { "FAIL" });
     ok
 }
