@@ -428,9 +428,15 @@ pub fn call(
             found.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
             let ids: Vec<ObjectId> = found.into_iter().map(|(_, id)| id).collect();
             if name == "UT_GetNearestObjectByTag" {
-                ok(Value::Object(
-                    ids.first().copied().unwrap_or(OBJECT_INVALID),
-                ))
+                // Nothing here: the object anywhere (the party scripts find followers
+                // left in another area this way). Provisional.
+                let any = ids.first().copied().or_else(|| {
+                    h.sim
+                        .world
+                        .find_tag(&tag, 0)
+                        .filter(|&o| include_self != 0 || o != from)
+                });
+                ok(Value::Object(any.unwrap_or(OBJECT_INVALID)))
             } else {
                 ok(objects(
                     ids.into_iter().take(count.max(1) as usize).collect(),
@@ -1580,9 +1586,19 @@ pub fn call(
                     }
                 }
                 // Joining the active party puts a follower on the player's side
-                // (GROUP_PC), whatever group it had as an NPC. Provisional.
+                // (GROUP_PC), whatever group it had as an NPC, and at the leader's side if
+                // it was elsewhere. Provisional.
+                let at = h.object(hero).map(|o| (o.area, o.position));
                 if let (true, Some(g), Some(o)) = (active, hero_group, h.sim.world.get_mut(who)) {
                     o.group = g;
+                    if let Some((area, pos)) = at {
+                        if o.area != area {
+                            o.area = area;
+                            o.position = pos;
+                            o.parked = None;
+                            o.active = true;
+                        }
+                    }
                 }
             }
             void()
@@ -1875,9 +1891,6 @@ pub fn call(
                 .collect();
             ok(objects(v))
         }
-        // The action a click would take. Provisional: the game derives it from the
-        // placeable's state controller; here an area-transition destination makes it a
-        // transition, a conversation a dialog, and anything else a plain use.
         "SetPartyPickerGUIStatus" => {
             if let Some(m) = h.sim.world.module.and_then(|m| h.sim.world.get_mut(m)) {
                 m.fields.insert("PartyPickerGUIStatus".into(), int(a, 0));
@@ -2017,8 +2030,16 @@ pub fn call(
             }
             void()
         }
+        // The action a click takes: the placeable type's state controller
+        // (placeable_types.gda, e.g. StateCnt_Informational) gives each state's default
+        // action. Without one, an area-transition destination means a transition, a
+        // conversation a dialog, anything else a plain use (provisional fallback).
         "GetPlaceableAction" => {
-            let o = h.object(obj(a, 0));
+            let id = obj(a, 0);
+            if let Some(action) = placeable_default_action(h.sim, id) {
+                return ok(Value::Int(action));
+            }
+            let o = h.object(id);
             let dest = o.is_some_and(|o| {
                 o.locals
                     .strings
@@ -2034,6 +2055,15 @@ pub fn call(
             };
             ok(Value::Int(constant(&h.sim.table, name)))
         }
+        // The quest board screen: which board is open (jobboards.gda row) is kept for the
+        // interface; accepting a job is the screen's business.
+        "ShowChantersGUI" => {
+            if let Some(m) = h.sim.world.module.and_then(|m| h.sim.world.get_mut(m)) {
+                m.fields.insert("ChantersBoard".into(), int(a, 0));
+            }
+            void()
+        }
+        "HasConversation" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.dialog.is_some()))),
         "GetPlaceableState" => ok(Value::Int(
             h.object(obj(a, 0))
                 .and_then(|o| o.fields.get("State").copied())
@@ -2680,6 +2710,34 @@ fn cooldown_key(ability: i32, item: &str) -> String {
     format!("{ability}:{}", item.to_ascii_lowercase())
 }
 
+/// A placeable's default action in its current state, from its type's state controller:
+/// `placeable_types.gda` (the ninth column names the controller table) and the controller's
+/// action column (hash 0x52be3c5e) at the row of the placeable's state. Provisional.
+fn placeable_default_action(sim: &Sim, id: ObjectId) -> Option<i32> {
+    let o = sim.world.get(id)?;
+    let appearance = *o.fields.get("Appearance")? as i64;
+    let state = o.fields.get("State").copied().unwrap_or(0) as i64;
+    let tables = sim.world.tables();
+    let types = tables.get(93, "")?;
+    let col = types
+        .columns
+        .iter()
+        .find(|(_, i)| **i == 8)
+        .map(|(h, _)| *h)?;
+    let controller = match types.cell_by_hash(col, appearance)? {
+        Cell::String(s) => clean(s).to_ascii_lowercase(),
+        _ => return None,
+    };
+    if controller.is_empty() {
+        return None;
+    }
+    let t = tables.get(0, &controller)?;
+    match t.cell_by_hash(0x52be_3c5e, state)? {
+        Cell::Int(v) if *v > 0 => Some(*v as i32),
+        _ => None,
+    }
+}
+
 /// A property's type (as `GetCreaturePropertyType`), Min and Max from `properties.gda`.
 fn property_bounds(sim: &Sim, property: i32) -> Option<(i32, f32, f32)> {
     let t = sim.world.tables.get(0, "properties")?;
@@ -2812,8 +2870,17 @@ mod tests {
         let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
         let hero = s.world.spawn(ObjectKind::Creature, "hero");
         let ally = s.world.spawn(ObjectKind::Creature, "ally");
+        let (here, there) = (
+            s.world.spawn(ObjectKind::Area, "here"),
+            s.world.spawn(ObjectKind::Area, "there"),
+        );
         s.world.hero = Some(hero);
-        s.world.get_mut(ally).unwrap().group = 2;
+        s.world.get_mut(hero).unwrap().area = Some(here);
+        let a = s.world.get_mut(ally).unwrap();
+        a.group = 2;
+        a.area = Some(there);
+        a.active = false;
+        a.parked = Some(true);
         run(
             &mut s,
             hero,
@@ -2821,7 +2888,14 @@ mod tests {
             &[Value::Object(ally), Value::Int(1)],
         );
         assert_eq!(s.world.get(hero).unwrap().followers, vec![ally]);
-        assert_eq!(s.world.get(ally).unwrap().group, 0);
+        let a = s.world.get(ally).unwrap();
+        assert_eq!(a.group, 0);
+        assert_eq!(
+            a.area,
+            Some(here),
+            "hired from another area, it joins the leader"
+        );
+        assert!(a.active && a.parked.is_none());
         // The hero counts as an active party member without being given a state.
         let state = |s: &mut Sim, o| run(s, hero, "GetFollowerState", &[Value::Object(o)]);
         assert_eq!(state(&mut s, hero), Some(Value::Int(1)));
