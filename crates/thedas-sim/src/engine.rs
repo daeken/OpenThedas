@@ -1003,6 +1003,7 @@ pub fn call(
                 if int(a, 1) == health && vt != base_type && o.dead && o.properties[&health].1 > 0.0
                 {
                     o.dead = false;
+                    o.died_at = None;
                 }
             }
             if let Some(before) = health_before {
@@ -3910,6 +3911,7 @@ mod tests {
         let hero = s.world.spawn(ObjectKind::Creature, "hero");
         let o = s.world.get_mut(hero).unwrap();
         o.dead = true;
+        o.died_at = Some(10);
         o.properties.insert(7, (100.0, 0.0));
         let set = |s: &mut Sim, v: f32, t: i32| {
             let a = [
@@ -3928,6 +3930,7 @@ mod tests {
         set(&mut s, 25.0, 3);
         let o = s.world.get(hero).unwrap();
         assert!(!o.dead);
+        assert_eq!(o.died_at, None);
         assert_eq!(o.properties[&7], (120.0, 25.0));
     }
 
