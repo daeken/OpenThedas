@@ -10,9 +10,10 @@
 //! (5200). The "Primary Camera" actor's tracks include an `AJSC` entry naming the stage place
 //! whose default camera frames the line.
 //!
-//! A line staged without cinematics of its own (an empty cut) takes the camera of the
-//! place its speaker stands at, as the nearest line on the same stage with cinematics
-//! places them (actors move between places from line to line).
+//! Its actors' `AJSP` tracks put each at a stage place. A line staged without cinematics of
+//! its own (an empty cut) takes the camera of the place its speaker stands at, and the
+//! actors' places, from the nearest line on the same stage with cinematics that places the
+//! speaker (actors move between places from line to line).
 //!
 //! Provisional. Field names are xoreos's (read for the format only): 11000 places, 11001
 //! cameras, 11003 camera field of view, 11004 a place's default camera; 1 a name, 4 a
@@ -125,12 +126,15 @@ impl Stage {
 }
 
 /// The shot a conversation line takes: the stage (an area stage's tag), the stage file
-/// its cinematics were made with (without `.stg`) and the place whose camera frames it.
+/// its cinematics were made with (without `.stg`), the place whose camera frames it and
+/// the place each actor stands at (actor as the cutscene names it: `OWNER`, `PLAYER`,
+/// `HENCH:<tag>` or a creature's tag; place).
 #[derive(Clone, Debug, PartialEq)]
 pub struct LineShot {
     pub stage: String,
     pub stage_file: String,
     pub place: String,
+    pub actors: Vec<(String, String)>,
 }
 
 /// Each line of a conversation (in the order of its line list, 12002, which the dialog's
@@ -152,6 +156,7 @@ pub fn line_shots(g: &Gff4) -> TypedResult<Vec<Option<LineShot>>> {
                 stage: s.stage.clone(),
                 stage_file: file.clone(),
                 place: place.clone(),
+                actors: s.places.clone(),
             }));
             continue;
         }
@@ -171,6 +176,7 @@ pub fn line_shots(g: &Gff4) -> TypedResult<Vec<Option<LineShot>>> {
                 stage: s.stage.clone(),
                 stage_file: o.stage_file.clone()?,
                 place: place.clone(),
+                actors: o.places.clone(),
             })
         });
         out.push(found);
@@ -345,12 +351,14 @@ mod tests {
                     stage: "bhn_stage".into(),
                     stage_file: "bhn_stage_1".into(),
                     place: "node1_mother".into(),
+                    actors: vec![("PLAYER".into(), "node2_player".into())],
                 }),
                 None,
                 Some(LineShot {
                     stage: "bhn_stage".into(),
                     stage_file: "bhn_stage_1".into(),
                     place: "node2_player".into(),
+                    actors: vec![("PLAYER".into(), "node2_player".into())],
                 }),
                 None,
             ]

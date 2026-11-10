@@ -176,6 +176,17 @@ pub struct Conversation {
     pub chain: Vec<usize>,
 }
 
+/// An open conversation as presentation sees it: its dialog (resource name without
+/// `.dlg`), the node being shown (an index into the dialog's line list), its owner and the
+/// player character in it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OpenLine<'a> {
+    pub dialog: &'a str,
+    pub line: Option<usize>,
+    pub owner: ObjectId,
+    pub player: ObjectId,
+}
+
 /// What a conversation looks like to a player: the current line and the choices.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct DialogState {
@@ -411,11 +422,15 @@ impl Sim {
         self.dialog_state()
     }
 
-    /// The open conversation's dialog (resource name without `.dlg`), the node being shown
-    /// (an index into the dialog's line list) and its owner, for presentation.
-    pub fn conversation_line(&self) -> Option<(&str, Option<usize>, ObjectId)> {
+    /// The open conversation, for presentation.
+    pub fn conversation_line(&self) -> Option<OpenLine<'_>> {
         let c = self.talk.as_ref().filter(|c| !c.ended)?;
-        Some((c.dlg.name.as_str(), c.line, c.owner))
+        Some(OpenLine {
+            dialog: c.dlg.name.as_str(),
+            line: c.line,
+            owner: c.owner,
+            player: c.player,
+        })
     }
 
     pub fn dialog_state(&self) -> Option<DialogState> {
