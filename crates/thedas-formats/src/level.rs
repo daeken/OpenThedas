@@ -19,9 +19,11 @@ pub mod field {
     pub const ARL_NAME: u32 = 3012;
     pub const ARL_ROOMS: u32 = 3016;
     pub const ARL_PATHING: u32 = 3020;
-    pub const ARL_SUN_ON: u32 = 3148;
-    pub const ARL_SUN_COLOR: u32 = 3149;
+    pub const ARL_SUN_COLOR_CHAR: u32 = 3149;
     pub const ARL_SUN_DIRECTION: u32 = 3150;
+    pub const ARL_SUN_ENABLED: u32 = 3151;
+    pub const ARL_SUN_COLOR: u32 = 3152;
+    pub const ARL_SUN_COLOR_MULT: u32 = 3153;
     pub const PATHING_GRID: u32 = 3110;
     pub const GRID_COLUMNS: u32 = 3086;
     pub const GRID_ROWS: u32 = 3087;
@@ -91,15 +93,19 @@ pub struct Arl {
     pub sun: Option<Sun>,
 }
 
-/// A level's sun: the direction its light travels (normalized, world space) and its colour.
+/// A level's sun: the direction its light travels (normalized, world space), its colour on
+/// the level's surfaces and its colour on characters.
 ///
-/// Provisional, from the layouts' contents: field 3148 is 1 in exteriors and 0 in interiors,
-/// 3149 the colour and 3150 a unit vector pointing down, which the shaders' sun light
-/// (`g_vLightParams` 2 and 3) takes as the light's direction.
+/// Provisional. The fields are named as xoreos's GFF4 field list names them (read for the
+/// format only): 3150 sunlight direction (a unit vector pointing down), 3151 sunlight
+/// enabled (absent in the layouts seen, taken as on), 3152 sunlight colour, 3153 its
+/// multiplier (absent, taken as 1) and 3149 the sunlight colour for characters. Interiors
+/// give black colours: no sun.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sun {
     pub direction: [f32; 3],
     pub color: [f32; 3],
+    pub character_color: [f32; 3],
 }
 
 /// The layout's pathing grid: `columns x rows` square cells of `cell_size` metres from
@@ -214,22 +220,25 @@ impl Arl {
             },
             None => None,
         };
-        let sun = match d.opt_i64(root, field::ARL_SUN_ON)? {
-            Some(on) if on != 0 => {
-                let color = d.opt_vec3(root, field::ARL_SUN_COLOR)?;
-                let direction = d.opt_vec3(root, field::ARL_SUN_DIRECTION)?;
-                match (color, direction) {
-                    (Some(color), Some([x, y, z])) => {
-                        let len = (x * x + y * y + z * z).sqrt();
-                        (len.is_finite() && len > 1e-6 && color.iter().all(|c| c.is_finite())).then(
-                            || Sun {
-                                direction: [x / len, y / len, z / len],
-                                color,
-                            },
-                        )
-                    }
-                    _ => None,
-                }
+        let enabled = d
+            .opt_i64(root, field::ARL_SUN_ENABLED)?
+            .is_none_or(|v| v != 0);
+        let mult = d.opt_f32(root, field::ARL_SUN_COLOR_MULT)?.unwrap_or(1.0);
+        let color = d
+            .opt_vec3(root, field::ARL_SUN_COLOR)?
+            .map(|c| c.map(|v| v * mult));
+        let character_color = d.opt_vec3(root, field::ARL_SUN_COLOR_CHAR)?;
+        let sun = match (enabled, color, d.opt_vec3(root, field::ARL_SUN_DIRECTION)?) {
+            (true, Some(color), Some([x, y, z])) => {
+                let character_color = character_color.unwrap_or(color);
+                let len = (x * x + y * y + z * z).sqrt();
+                let lit = color.iter().chain(&character_color).any(|c| *c > 0.0);
+                let finite = color.iter().chain(&character_color).all(|c| c.is_finite());
+                (len.is_finite() && len > 1e-6 && lit && finite).then(|| Sun {
+                    direction: [x / len, y / len, z / len],
+                    color,
+                    character_color,
+                })
             }
             _ => None,
         };
@@ -409,24 +418,45 @@ mod tests {
 
     #[test]
     fn reads_an_exteriors_sun() {
-        let sun = |on: i32, dir: [f32; 3]| {
+        let sun = |fields: Vec<(u32, Value)>| {
             let mut b = Builder::new(b"ARL ");
-            let root = b.add(
-                b"AREA",
-                vec![
-                    (field::ARL_SUN_ON, Value::I32(on)),
-                    (field::ARL_SUN_COLOR, Value::Vec4([0.6, 0.5, 0.3, 1.0])),
-                    (field::ARL_SUN_DIRECTION, Value::Vec3(dir)),
-                ],
-            );
+            let root = b.add(b"AREA", fields);
             Arl::from_gff4(&b.finish(root)).unwrap().sun
         };
-        let s = sun(1, [0.0, 0.0, -2.0]).unwrap();
+        let dir = (field::ARL_SUN_DIRECTION, Value::Vec3([0.0, 0.0, -2.0]));
+        let level = (field::ARL_SUN_COLOR, Value::Vec4([0.6, 0.5, 0.3, 1.0]));
+        let chars = (field::ARL_SUN_COLOR_CHAR, Value::Vec4([0.4, 0.4, 0.4, 1.0]));
+        let s = sun(vec![dir.clone(), level.clone(), chars.clone()]).unwrap();
         assert_eq!(s.direction, [0.0, 0.0, -1.0]);
         assert_eq!(s.color, [0.6, 0.5, 0.3]);
-        // Interiors have it off; a direction of no length is no sun.
-        assert_eq!(sun(0, [0.0, 0.0, -1.0]), None);
-        assert_eq!(sun(1, [0.0; 3]), None);
+        assert_eq!(s.character_color, [0.4, 0.4, 0.4]);
+        // The multiplier scales the level's colour.
+        let s = sun(vec![
+            dir.clone(),
+            level.clone(),
+            (field::ARL_SUN_COLOR_MULT, Value::F32(2.0)),
+        ])
+        .unwrap();
+        assert_eq!(s.color, [1.2, 1.0, 0.6]);
+        assert_eq!(s.character_color, s.color);
+        // Disabled, black (an interior), or of no direction: no sun.
+        assert_eq!(
+            sun(vec![
+                dir.clone(),
+                level.clone(),
+                (field::ARL_SUN_ENABLED, Value::I32(0))
+            ]),
+            None
+        );
+        let black = (field::ARL_SUN_COLOR, Value::Vec4([0.0, 0.0, 0.0, 1.0]));
+        assert_eq!(sun(vec![dir.clone(), black]), None);
+        assert_eq!(
+            sun(vec![
+                (field::ARL_SUN_DIRECTION, Value::Vec3([0.0; 3])),
+                level
+            ]),
+            None
+        );
     }
 
     #[test]
