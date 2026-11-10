@@ -66,6 +66,10 @@ pub struct Live {
     cache: RenderCache,
     /// Simulation time not yet ticked (fractions of a millisecond).
     owed_ms: f64,
+    /// Whether frames get the level's frame buffer effects.
+    pub frame_effects: bool,
+    /// The graphics detail level scenes are loaded at.
+    pub detail: thedas_render::scene::Detail,
 }
 
 /// How to start the game.
@@ -113,6 +117,8 @@ impl Live {
             models: ModelCache::default(),
             cache: RenderCache::default(),
             owed_ms: 0.0,
+            frame_effects: true,
+            detail: Default::default(),
         })
     }
 
@@ -229,6 +235,22 @@ impl Live {
         true
     }
 
+    /// Records the level's frame buffer effects over a frame [`Live::render`] drew into
+    /// `target` (which needs `COPY_SRC` usage).
+    pub fn finish_frame(
+        &mut self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+        (width, height): (u32, u32),
+    ) {
+        if let Some(level) = self.level.as_mut() {
+            level
+                .renderer
+                .finish_frame(ctx, encoder, target, width, height);
+        }
+    }
+
     /// The frame as RGBA8 pixels, when there is a level to draw.
     pub fn capture(
         &mut self,
@@ -260,12 +282,13 @@ impl Live {
         let install = DaoInstall::open(&self.install)?;
         let mut vfs = install.global_vfs(TextureQuality::High)?;
         install.mount_level(&mut vfs, layout)?;
-        let scene = AreaScene::load(&vfs, layout)?;
+        let scene = AreaScene::load_with_props_at(&vfs, layout, &[], self.detail)?;
         // A new resource stack: nothing cached carries over.
         self.cache = RenderCache::default();
         let programs = crate::programs_cached(&vfs, &scene, &self.shaders, &mut self.cache)?;
-        let renderer =
+        let mut renderer =
             AreaRenderer::new_cached(ctx, &vfs, &scene, &programs, format, &mut self.cache);
+        renderer.frame_effects = self.frame_effects;
         log::info!(
             "{layout}: level of {} draws built in {:.2}s",
             scene.draws.len(),
@@ -295,7 +318,7 @@ impl Live {
             .map(|l| l.vfs.clone())
             .context("objects before their level")?;
         let props: Vec<Prop> = models.iter().map(prop).collect();
-        let scene = AreaScene::load_objects(&vfs, layout, &props)?;
+        let scene = AreaScene::load_objects_at(&vfs, layout, &props, self.detail)?;
         let programs = crate::programs_cached(&vfs, &scene, &self.shaders, &mut self.cache)?;
         let renderer =
             AreaRenderer::new_cached(ctx, &vfs, &scene, &programs, format, &mut self.cache);

@@ -130,6 +130,14 @@ struct Args {
     /// (`127.0.0.1:7878`), as `thedas-mcp`'s `attach` sends it.
     #[arg(long)]
     control: Option<String>,
+    /// The level's frame buffer effects (bloom), as the original's "Frame-buffer effects"
+    /// video option: `on` or `off`.
+    #[arg(long, default_value = "on", value_parser = ["on", "off"])]
+    frame_effects: String,
+    /// The original's "Graphics Detail" video option, which picks the materials' techniques
+    /// and the bloom's blur: `low`, `medium` or `high` (High draws as Medium).
+    #[arg(long, default_value = "medium", value_parser = ["low", "medium", "high"])]
+    detail: String,
 }
 
 /// Behind and above a hero at `pos` with the game's `facing`, looking the same way (as the
@@ -163,6 +171,8 @@ struct Loaded {
     vfs: Arc<Vfs>,
     scene: Option<AreaScene>,
     shaders: String,
+    /// Whether frames get the level's frame buffer effects (`--frame-effects`).
+    frame_effects: bool,
 }
 
 impl Loaded {
@@ -223,6 +233,7 @@ fn load(
     area: &str,
     shaders: &str,
     props: &[thedas_render::Prop],
+    detail: thedas_render::scene::Detail,
 ) -> Result<Loaded> {
     let install = DaoInstall::open(install)?;
     let mut vfs = install.global_vfs(TextureQuality::High)?;
@@ -231,6 +242,7 @@ fn load(
             vfs: Arc::new(vfs),
             scene: None,
             shaders: shaders.to_string(),
+            frame_effects: true,
         });
     }
     let level = match install.mount_level(&mut vfs, area) {
@@ -251,7 +263,7 @@ fn load(
         }
     };
     let started = Instant::now();
-    let scene = AreaScene::load_with_props(&vfs, &level, props)?;
+    let scene = AreaScene::load_with_props_at(&vfs, &level, props, detail)?;
     log::info!(
         "{level} ({}): {} rooms, {} draws ({} of {} props), {} lights, {} meshes, {} materials, {} warnings, loaded in {:.2}s",
         scene.name.as_deref().unwrap_or("?"),
@@ -269,6 +281,7 @@ fn load(
         vfs: Arc::new(vfs),
         scene: Some(scene),
         shaders: shaders.to_string(),
+        frame_effects: true,
     })
 }
 
@@ -351,6 +364,7 @@ fn capture(
                     &loaded.programs(scene)?,
                     thedas_render::gpu::CAPTURE_FORMAT,
                 );
+                renderer.frame_effects = loaded.frame_effects;
                 log_stats(&renderer);
                 renderer.capture(ctx, &camera, w, h)?
             }
@@ -621,13 +635,14 @@ impl App {
         surface.configure(&ctx.device, &config);
         let renderer = match &self.loaded.scene {
             Some(scene) => {
-                let r = AreaRenderer::new(
+                let mut r = AreaRenderer::new(
                     &ctx,
                     &self.loaded.vfs,
                     scene,
                     &self.loaded.programs(scene)?,
                     config.format,
                 );
+                r.frame_effects = self.loaded.frame_effects;
                 log_stats(&r);
                 println!("camera {}", self.camera.spec());
                 Some(r)
@@ -738,6 +753,16 @@ impl App {
             }
             (None, None) => false,
         };
+        // The level's frame buffer effects go over the world, under the interface; they copy
+        // the frame, which needs a surface that allows it.
+        if drawn && g.config.usage.contains(wgpu::TextureUsages::COPY_SRC) {
+            let texture = &frame.texture;
+            match (self.live.as_mut(), g.renderer.as_mut()) {
+                (Some(live), _) => live.finish_frame(&g.ctx, &mut encoder, texture, size),
+                (None, Some(r)) => r.finish_frame(&g.ctx, &mut encoder, texture, size.0, size.1),
+                (None, None) => {}
+            }
+        }
         match drawn {
             true => {}
             false => {
@@ -1527,7 +1552,13 @@ fn main() -> Result<()> {
     } else {
         args.area.as_str()
     };
-    let loaded = load(&install, area, &args.shaders, &[])?;
+    let detail = thedas_render::scene::Detail::parse(&args.detail).unwrap_or_default();
+    let mut loaded = load(&install, area, &args.shaders, &[], detail)?;
+    loaded.frame_effects = args.frame_effects == "on";
+    if let Some(l) = live.as_mut() {
+        l.frame_effects = loaded.frame_effects;
+        l.detail = detail;
+    }
     let hero = live.as_ref().and_then(|l| l.hero());
     let mut camera = match (&args.camera, &loaded.scene, hero) {
         (Some(spec), _, _) => Camera::parse(spec).context("camera must be x,y,z,yaw,pitch")?,

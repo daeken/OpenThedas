@@ -143,6 +143,38 @@ pub enum SceneLight {
     },
 }
 
+/// The original's "Graphics Detail" video option, which picks among the techniques a
+/// material's logic tests allow (`LogicTest Detail="LOW"` / `"MEDIUM"`): at Low, `Static`
+/// draws with `Static1_Fast.psh`, characters vertex-lit, terrain with `Terrain3`, trees with
+/// their `_Low` shaders and bloom with the five-tap blur. No material in the data tests for
+/// High, so High draws as Medium. Medium by default: the original's own default (chosen by
+/// its hardware detection) is not traced.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Detail {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl Detail {
+    /// The name the material logic tests use.
+    pub fn name(self) -> &'static str {
+        match self {
+            Detail::Low => "LOW",
+            Detail::Medium => "MEDIUM",
+            Detail::High => "HIGH",
+        }
+    }
+
+    /// `low`, `medium` or `high`, any case.
+    pub fn parse(s: &str) -> Option<Detail> {
+        [Detail::Low, Detail::Medium, Detail::High]
+            .into_iter()
+            .find(|d| d.name().eq_ignore_ascii_case(s))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AreaScene {
     pub level: String,
@@ -167,6 +199,10 @@ pub struct AreaScene {
     pub skeleton_models: Vec<String>,
     /// How many of `draws` are the level's own; the props' follow.
     pub static_draws: usize,
+    /// The level's frame buffer effects (see [`crate::post`]).
+    pub effects: Vec<thedas_formats::level::FrameEffect>,
+    /// The graphics detail level the materials' techniques were chosen for.
+    pub detail: Detail,
     /// The models the simulation placed, in the order given, with their draws.
     pub props: Vec<PropDraws>,
 }
@@ -495,7 +531,7 @@ impl<'a> Loader<'a> {
                     let render_class = sem.and_then(|s| s.render_class.clone());
                     let technique = definition
                         .as_ref()
-                        .and_then(|d| d.select(&semantic, 3, "HIGH"))
+                        .and_then(|d| d.select(&semantic, 3, self.scene.detail.name()))
                         .cloned();
                     Some(SceneMaterial {
                         mao: key.clone(),
@@ -895,14 +931,34 @@ impl AreaScene {
         level: &str,
         props: &[Prop],
     ) -> Result<AreaScene, SceneError> {
-        Self::load_parts(vfs, level, props, true)
+        Self::load_parts(vfs, level, props, true, Detail::default())
     }
 
     /// The objects alone in a level: `props` lit by the level's lights and probes, without
     /// the level's own meshes, for drawing over a scene of the level drawn once (see
     /// `AreaRenderer::render_over`): objects that come and go then rebuild only themselves.
     pub fn load_objects(vfs: &Vfs, level: &str, props: &[Prop]) -> Result<AreaScene, SceneError> {
-        Self::load_parts(vfs, level, props, false)
+        Self::load_parts(vfs, level, props, false, Detail::default())
+    }
+
+    /// [`AreaScene::load_with_props`] at a graphics detail level.
+    pub fn load_with_props_at(
+        vfs: &Vfs,
+        level: &str,
+        props: &[Prop],
+        detail: Detail,
+    ) -> Result<AreaScene, SceneError> {
+        Self::load_parts(vfs, level, props, true, detail)
+    }
+
+    /// [`AreaScene::load_objects`] at a graphics detail level.
+    pub fn load_objects_at(
+        vfs: &Vfs,
+        level: &str,
+        props: &[Prop],
+        detail: Detail,
+    ) -> Result<AreaScene, SceneError> {
+        Self::load_parts(vfs, level, props, false, detail)
     }
 
     fn load_parts(
@@ -910,11 +966,13 @@ impl AreaScene {
         level: &str,
         props: &[Prop],
         level_meshes: bool,
+        detail: Detail,
     ) -> Result<AreaScene, SceneError> {
         let mut l = Loader {
             vfs,
             scene: AreaScene {
                 level: level.to_string(),
+                detail,
                 ..Default::default()
             },
             mmh: HashMap::new(),
@@ -932,6 +990,7 @@ impl AreaScene {
             message: e.to_string(),
         })?;
         l.scene.name = arl.name.clone();
+        l.scene.effects = arl.effects.clone();
         // Characters (the objects' scene) take the sun's character colour.
         l.scene.sun = arl.sun.map(|s| {
             let color = if level_meshes {

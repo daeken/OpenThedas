@@ -19,6 +19,12 @@ pub mod field {
     pub const ARL_NAME: u32 = 3012;
     pub const ARL_ROOMS: u32 = 3016;
     pub const ARL_PATHING: u32 = 3020;
+    pub const ARL_FRAME_EFFECTS: u32 = 3026;
+    pub const FBE_NAME: u32 = 5520;
+    pub const FBE_EFFECT: u32 = 5521;
+    pub const FBE_PARAMETERS: u32 = 5522;
+    pub const FBEP_NAME: u32 = 5523;
+    pub const FBEP_VALUE: u32 = 5524;
     pub const ARL_SUN_COLOR_CHAR: u32 = 3149;
     pub const ARL_SUN_DIRECTION: u32 = 3150;
     pub const ARL_SUN_ENABLED: u32 = 3151;
@@ -91,6 +97,33 @@ pub struct Arl {
     pub grid: Option<NavGrid>,
     /// The level's sun, when it has one (exteriors).
     pub sun: Option<Sun>,
+    /// The frame buffer effects the level runs over each frame, in the order listed.
+    pub effects: Vec<FrameEffect>,
+}
+
+/// One of a level's frame buffer effects: the `.ffx.xml` effect it names (`da_bloom`,
+/// `da_hsvmatrix`, `da_fade`, `da_dof`) and the values it gives that effect's exposed
+/// parameters.
+///
+/// Provisional: the labels were identified from the data. 3026 lists `FBE ` structs; 5520
+/// and 5521 both hold the effect's id (equal on every level seen; 5521 is read when 5520 is
+/// missing); 5522 lists `FBEP` structs of a parameter name (5523) and a generic value
+/// (5524), a float on every level seen. Entries with no id and non-numeric values are
+/// skipped.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrameEffect {
+    pub name: String,
+    pub parameters: Vec<(String, f32)>,
+}
+
+impl FrameEffect {
+    /// The value the level gives parameter `name` (case-insensitive).
+    pub fn parameter(&self, name: &str) -> Option<f32> {
+        self.parameters
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| *v)
+    }
 }
 
 /// A level's sun: the direction its light travels (normalized, world space), its colour on
@@ -242,11 +275,32 @@ impl Arl {
             }
             _ => None,
         };
+        let mut effects = Vec::new();
+        for e in d.structs(root, field::ARL_FRAME_EFFECTS)? {
+            let name = match d.opt_str(e, field::FBE_NAME)? {
+                Some(n) if !n.is_empty() => n,
+                _ => match d.opt_str(e, field::FBE_EFFECT)? {
+                    Some(n) if !n.is_empty() => n,
+                    _ => continue,
+                },
+            };
+            let mut parameters = Vec::new();
+            for p in d.structs(e, field::FBE_PARAMETERS)? {
+                let Some(pname) = d.opt_str(p, field::FBEP_NAME)?.filter(|n| !n.is_empty()) else {
+                    continue;
+                };
+                if let Some(v) = d.get(p, field::FBEP_VALUE).and_then(|v| v.as_f64()) {
+                    parameters.push((pname, v as f32));
+                }
+            }
+            effects.push(FrameEffect { name, parameters });
+        }
         Ok(Arl {
             name: d.opt_str(root, field::ARL_NAME)?,
             rooms,
             grid,
             sun,
+            effects,
         })
     }
 
@@ -414,6 +468,7 @@ mod tests {
         assert_eq!(arl.rooms[1].name, "lvl_7");
         assert_eq!(arl.bounds(), Some(([-1.0, -2.0, -3.0], [5.0, 2.0, 3.0])));
         assert_eq!(arl.sun, None);
+        assert!(arl.effects.is_empty());
     }
 
     #[test]
@@ -531,5 +586,51 @@ mod tests {
         assert!(Rml::from_gff4(&b.finish(root)).is_err());
         // Garbage bytes.
         assert!(Arl::parse(b"not a gff").is_err());
+    }
+
+    #[test]
+    fn reads_frame_effects() {
+        let mut b = Builder::new(b"ARL ");
+        let param = |b: &mut Builder, name: &str, v: Value| {
+            b.add(
+                b"FBEP",
+                vec![
+                    (field::FBEP_NAME, s(name)),
+                    (
+                        field::FBEP_VALUE,
+                        Value::Generic(Box::new(crate::gff4::GenericSlot {
+                            type_code: 8,
+                            flags: 0,
+                            value: Some(v),
+                        })),
+                    ),
+                ],
+            )
+        };
+        let glow = param(&mut b, "GlowIntensity", Value::F32(0.25));
+        let blur = param(&mut b, "HBlurWidth", Value::F32(3.0));
+        let odd = param(&mut b, "Label", s("not a number"));
+        let bloom = b.add(
+            b"FBE ",
+            vec![
+                (field::FBE_NAME, s("da_bloom")),
+                (field::FBE_EFFECT, s("da_bloom")),
+                (field::FBE_PARAMETERS, structs(&[glow, blur, odd])),
+            ],
+        );
+        let hsv = b.add(b"FBE ", vec![(field::FBE_EFFECT, s("da_hsvmatrix"))]);
+        let empty = b.add(b"FBE ", vec![]);
+        let root = b.add(
+            b"AREA",
+            vec![(field::ARL_FRAME_EFFECTS, structs(&[bloom, hsv, empty]))],
+        );
+        let arl = Arl::from_gff4(&b.finish(root)).unwrap();
+        assert_eq!(arl.effects.len(), 2);
+        assert_eq!(arl.effects[0].name, "da_bloom");
+        assert_eq!(arl.effects[0].parameter("glowintensity"), Some(0.25));
+        assert_eq!(arl.effects[0].parameter("HBlurWidth"), Some(3.0));
+        assert_eq!(arl.effects[0].parameter("Label"), None);
+        assert_eq!(arl.effects[1].name, "da_hsvmatrix");
+        assert!(arl.effects[1].parameters.is_empty());
     }
 }
