@@ -13,6 +13,7 @@
 
 pub mod animate;
 pub mod camera;
+pub mod collide;
 pub mod d3d;
 mod d3d_gpu;
 pub mod gpu;

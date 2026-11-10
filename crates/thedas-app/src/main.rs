@@ -665,7 +665,9 @@ impl App {
             let turn = (k(KeyCode::KeyQ) as i32 - k(KeyCode::KeyE) as i32) as f32;
             f.orbit(turn * 1.8 * dt, 0.0);
             if let Some(feet) = self.live.as_ref().and_then(|l| l.leader_feet()) {
-                self.camera = f.camera(feet, dt, &self.camera);
+                let live = self.live.as_ref();
+                let hit = |a, b| live.and_then(|l| l.first_hit(a, b));
+                self.camera = f.camera_clear(feet, dt, &self.camera, &hit);
             }
             return;
         }
@@ -1509,7 +1511,7 @@ fn main() -> Result<()> {
                 played = Some((layer, s));
             }
             if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
-                camera = f.camera(feet, 0.0, &camera);
+                camera = f.camera_clear(feet, 0.0, &camera, &|a, b| l.first_hit(a, b));
             }
             for c in &args.click {
                 let (x, y) = c
@@ -1638,7 +1640,10 @@ fn main() -> Result<()> {
                             }
                             frames += 1;
                             if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
-                                camera = f.camera(feet, dt as f32 / 1000.0, &camera);
+                                camera =
+                                    f.camera_clear(feet, dt as f32 / 1000.0, &camera, &|a, b| {
+                                        l.first_hit(a, b)
+                                    });
                             }
                         }
                         if let Some((_, s)) = played.as_ref() {
@@ -1688,7 +1693,7 @@ fn main() -> Result<()> {
             }
             drop(sim);
             if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
-                camera = f.camera(feet, 0.0, &camera);
+                camera = f.camera_clear(feet, 0.0, &camera, &|a, b| l.first_hit(a, b));
             }
         }
         return capture(
