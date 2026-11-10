@@ -1,9 +1,11 @@
 //! Routing on the layout's pathing grid (`.arl`, see `thedas_formats::level::NavGrid`).
 //!
 //! Provisional, inferred from the data: a cell is walkable when bit 0 of its data byte is
-//! set, its height is the stored value in sixteenths of a metre, and a creature can step
-//! between neighbouring cells whose heights differ by at most [`MAX_STEP`]. Routes are
-//! 8-connected A* without cutting blocked corners.
+//! set and bit 3 is clear (cells are 1, 9 or 10: of the creatures placed in five areas, 283
+//! of 287 stand on 1s; 9s form the walls between rooms, with gaps where doors stand), its
+//! height is the stored value in sixteenths of a metre, and a creature can step between
+//! neighbouring cells whose heights differ by at most [`MAX_STEP`]. Routes are 8-connected
+//! A* without cutting blocked corners.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -20,7 +22,8 @@ pub const MAX_STEP: f32 = 0.6;
 const SEARCH_LIMIT: usize = 400_000;
 
 pub fn walkable(g: &NavGrid, c: (u32, u32)) -> bool {
-    g.value(c) & 1 != 0
+    let v = g.value(c);
+    v & 1 != 0 && v & 8 == 0
 }
 
 /// A cell's floor height in metres.
@@ -91,6 +94,16 @@ pub fn region(g: &NavGrid, from: [f32; 3]) -> Vec<bool> {
 /// The route from `from` to `to` as world points (cell centres at floor height, ending at
 /// `to`), or `None` when either end is off the grid or no route exists.
 pub fn route(g: &NavGrid, from: [f32; 3], to: [f32; 3]) -> Option<Vec<[f32; 3]>> {
+    route_avoiding(g, from, to, &std::collections::HashSet::new())
+}
+
+/// [`route`], treating the cells in `blocked` (row-major indices) as unwalkable too.
+pub fn route_avoiding(
+    g: &NavGrid,
+    from: [f32; 3],
+    to: [f32; 3],
+    blocked: &std::collections::HashSet<usize>,
+) -> Option<Vec<[f32; 3]>> {
     let start = nearest_walkable(g, from)?;
     let goal = nearest_walkable(g, to)?;
     let idx = |c: (u32, u32)| (c.1 * g.columns + c.0) as usize;
@@ -149,14 +162,15 @@ pub fn route(g: &NavGrid, from: [f32; 3], to: [f32; 3]) -> Option<Vec<[f32; 3]>>
                 continue;
             }
             let n = (x as u32, y as u32);
-            if !walkable(g, n) || (height(g, n) - hc).abs() > MAX_STEP {
+            let free = |c: (u32, u32)| walkable(g, c) && !blocked.contains(&idx(c));
+            if !free(n) || (height(g, n) - hc).abs() > MAX_STEP {
                 continue;
             }
             // No cutting corners past blocked cells.
             if dx != 0 && dy != 0 {
                 let a = ((c.0 as i32 + dx) as u32, c.1);
                 let b = (c.0, (c.1 as i32 + dy) as u32);
-                if !walkable(g, a) || !walkable(g, b) {
+                if !free(a) || !free(b) {
                     continue;
                 }
             }
@@ -176,7 +190,143 @@ pub fn route(g: &NavGrid, from: [f32; 3], to: [f32; 3]) -> Option<Vec<[f32; 3]>>
     None
 }
 
+/// `placeable_types.gda`: a placeable appearance's state controller (`StateCnt_Door`,
+/// `StateCnt_AreaTransition`, ...). The column's name is not known.
+const COL_STATE_CONTROLLER: u32 = 0x9a32_0a51;
+
+/// How far a closed door's doorway reaches from the door, in metres. Provisional: the gaps
+/// the pathing grid leaves in walls where doors stand are about 2.5 m wide.
+pub const DOORWAY_RADIUS: f32 = 1.25;
+
+/// A door and the grid cells of its doorway (row-major indices).
+pub type Doorway = (thedas_script::vm::ObjectId, Vec<usize>);
+
+/// How a mover gets somewhere (see `Sim::route_to`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Routed {
+    /// Along these waypoints, ending at the destination.
+    Path(Vec<[f32; 3]>),
+    /// Only through this closed door.
+    Door(thedas_script::vm::ObjectId),
+    /// No route known (no grid, an end off it, or no way at all): a straight line.
+    Straight,
+}
+
 impl Sim {
+    /// The closed doors of an area with the pathing-grid cells of their doorways: doors are
+    /// the placeables whose appearance's state controller (`placeable_types.gda`) is
+    /// `StateCnt_Door`; a door is closed in states 0 and 1 (`statecnt_door.gda`:
+    /// Closed_Unlocked, Closed_Locked), its state being field `State` (`SetPlaceableState`)
+    /// or else the template's `AnimContState`. The doorway is the walkable cells within
+    /// [`DOORWAY_RADIUS`] of the door.
+    pub fn closed_doors(
+        &mut self,
+        area: thedas_script::vm::ObjectId,
+    ) -> Vec<(thedas_script::vm::ObjectId, Vec<usize>)> {
+        let doors = match self.door_cells.get(&area) {
+            Some(d) => d.clone(),
+            None => {
+                let d = Arc::new(self.doorways(area));
+                self.door_cells.insert(area, d.clone());
+                d
+            }
+        };
+        doors
+            .iter()
+            .filter(|(id, _)| {
+                self.world.get(*id).is_some_and(|o| {
+                    let state = o
+                        .fields
+                        .get("State")
+                        .or_else(|| o.fields.get("AnimContState"))
+                        .copied()
+                        .unwrap_or(0);
+                    o.active && (state == 0 || state == 1)
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Every door of an area with its doorway's grid cells, open or not.
+    fn doorways(
+        &mut self,
+        area: thedas_script::vm::ObjectId,
+    ) -> Vec<(thedas_script::vm::ObjectId, Vec<usize>)> {
+        let Some(g) = self.nav_grid(area) else {
+            return Vec::new();
+        };
+        let tables = self.world.tables();
+        let types = tables.get(0, "placeable_types");
+        let is_door = |appearance: i32| {
+            types
+                .as_ref()
+                .and_then(
+                    |t| match t.cell_by_hash(COL_STATE_CONTROLLER, appearance as i64)? {
+                        thedas_formats::gda::Cell::String(s) => {
+                            Some(crate::engine::clean(s).eq_ignore_ascii_case("StateCnt_Door"))
+                        }
+                        _ => None,
+                    },
+                )
+                .unwrap_or(false)
+        };
+        let mut out = Vec::new();
+        for o in self.world.objects.values() {
+            if o.kind != crate::world::ObjectKind::Placeable
+                || o.area != Some(area)
+                || !is_door(o.appearance)
+            {
+                continue;
+            }
+            let r = (DOORWAY_RADIUS / g.cell_size).ceil() as i32;
+            let Some((cx, cy)) = g.cell(o.position) else {
+                continue;
+            };
+            let mut cells = Vec::new();
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    let (x, y) = (cx as i32 + dx, cy as i32 + dy);
+                    if x < 0 || y < 0 || x as u32 >= g.columns || y as u32 >= g.rows {
+                        continue;
+                    }
+                    let c = (x as u32, y as u32);
+                    let m = g.center(c);
+                    if walkable(&g, c)
+                        && crate::engine::dist(m, [o.position[0], o.position[1], m[2]])
+                            <= DOORWAY_RADIUS
+                    {
+                        cells.push((c.1 * g.columns + c.0) as usize);
+                    }
+                }
+            }
+            out.push((o.id, cells));
+        }
+        out
+    }
+
+    /// Whether the straight line between two points passes through a closed door's
+    /// doorway: within [`DOORWAY_RADIUS`] of one of `doors` (their positions), leaving out
+    /// the first and last 0.75 m (two creatures standing by a door see each other).
+    pub fn door_between(doors: &[[f32; 3]], a: [f32; 3], b: [f32; 3]) -> bool {
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len2 = dx * dx + dy * dy;
+        let len = len2.sqrt();
+        doors.iter().any(|p| {
+            let t = if len2 > 0.0 {
+                (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let along = t * len;
+            if along < 0.75 || len - along < 0.75 {
+                return false;
+            }
+            let (qx, qy) = (a[0] + dx * t, a[1] + dy * t);
+            ((p[0] - qx).powi(2) + (p[1] - qy).powi(2)).sqrt() <= DOORWAY_RADIUS
+        })
+    }
+
     /// The pathing grid of an area (by its object id), loaded once per layout.
     pub fn nav_grid(&mut self, area: thedas_script::vm::ObjectId) -> Option<Arc<NavGrid>> {
         let name = self.area_layout(area)?;
@@ -338,5 +488,80 @@ mod tests {
         let o = s.world.get(c).unwrap();
         assert!(o.commands.is_empty());
         assert_eq!(o.position, to);
+    }
+
+    #[test]
+    fn closed_doors_block_their_doorways_until_opened() {
+        use crate::world::ObjectKind;
+        use thedas_formats::gda::Cell;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let t = crate::m2da::Tables::empty();
+        t.insert(
+            "placeable_types",
+            &["ID", "Label", "#9a320a51"],
+            vec![
+                (
+                    93,
+                    vec![
+                        Cell::Int(93),
+                        Cell::String("Door".into()),
+                        Cell::String("StateCnt_Door".into()),
+                    ],
+                ),
+                (
+                    5,
+                    vec![
+                        Cell::Int(5),
+                        Cell::String("Chest".into()),
+                        Cell::String("StateCnt_Container".into()),
+                    ],
+                ),
+            ],
+        );
+        s.world.tables = Arc::new(t);
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        s.area_layouts.insert(area, "walled".into());
+        let g = Arc::new(grid());
+        s.nav_grids.insert("walled".into(), Some(g.clone()));
+        // A door in the wall's only gap (the top row), and a chest that does not block.
+        let door = s.world.spawn(ObjectKind::Placeable, "door");
+        let chest = s.world.spawn(ObjectKind::Placeable, "chest");
+        for (id, app, x) in [(door, 93, 2.5), (chest, 5, 0.5)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.appearance = app;
+            o.position = [x, 2.5, 0.0];
+        }
+        let walker = s.world.spawn(ObjectKind::Creature, "walker");
+        {
+            let o = s.world.get_mut(walker).unwrap();
+            o.area = Some(area);
+            o.position = [0.5, 0.5, 0.0];
+        }
+        let doors = s.closed_doors(area);
+        assert_eq!(doors.len(), 1);
+        assert_eq!(doors[0].0, door);
+        assert_eq!(s.route_to(walker, [4.5, 0.5, 0.0]), Routed::Door(door));
+        let at = [[2.5, 2.5, 0.0]];
+        assert!(Sim::door_between(&at, [0.5, 2.5, 0.0], [4.5, 2.5, 0.0]));
+        assert!(!Sim::door_between(&at, [0.5, 0.5, 0.0], [0.5, 2.5, 0.0]));
+        assert!(
+            !Sim::door_between(&at, [2.0, 2.5, 0.0], [3.0, 2.5, 0.0]),
+            "both by the door"
+        );
+        let _ = &g;
+        // Opened (SetPlaceableState to Open), the way is clear.
+        s.world
+            .get_mut(door)
+            .unwrap()
+            .fields
+            .insert("State".into(), 2);
+        assert!(s.closed_doors(area).is_empty());
+        assert!(matches!(
+            s.route_to(walker, [4.5, 0.5, 0.0]),
+            Routed::Path(_)
+        ));
     }
 }

@@ -1096,6 +1096,10 @@ impl Server {
             };
             let mut out = summary(sim, hero);
             out["arrived"] = json!(arrived);
+            if let Some(d) = sim.walk_blocked_by {
+                // A closed door is in the way: the player uses it (interact) to open it.
+                out["blocked_by"] = summary(sim, d);
+            }
             out["time_ms"] = json!(sim.world.time_ms);
             out["conversation"] = dialog_json(sim);
             Ok(out)

@@ -83,6 +83,9 @@ pub struct CombatData {
     /// When each cooldown ends (simulation milliseconds), by `ability:item tag`.
     #[serde(default)]
     pub cooldowns: std::collections::BTreeMap<String, u64>,
+    /// The last command that finished or failed (`GetPreviousCommand`).
+    #[serde(default)]
+    pub previous_command: Option<crate::world::Command>,
 }
 
 /// One tactics slot: when `condition` holds for a target of `target` type, do `command`.
@@ -147,13 +150,21 @@ impl Sim {
             .filter(|o| o.kind == ObjectKind::Creature && o.area == Some(area))
             .map(|o| (o.id, o.position))
             .collect();
+        // Closed doors block sight (their doorways, see `Sim::closed_doors`).
+        let doors: Vec<[f32; 3]> = self
+            .closed_doors(area)
+            .into_iter()
+            .filter_map(|(d, _)| self.world.get(d).map(|o| o.position))
+            .collect();
+        let blocked = |a: [f32; 3], b: [f32; 3]| Sim::door_between(&doors, a, b);
         for &(id, pos) in &creatures {
             let alive = self.alive(id);
             // A creature notices others within its template's PerceptionClass (taken to be a
             // radius in metres: 9 for most creatures, 12 for player characters, 15 for an
             // ogre; provisional) and keeps track of those it has noticed out to the visual
-            // radius. Line of sight is not checked: the pathing grid, the only geometry the
-            // simulation has, marks furniture and rubble that do not block sight.
+            // radius. Closed doors block sight; walls are not checked: the pathing grid, the
+            // only geometry the simulation has, marks furniture and rubble that do not block
+            // sight the same way.
             let ring = self
                 .world
                 .get(id)
@@ -173,10 +184,12 @@ impl Sim {
                             return false;
                         }
                         let d = dist(pos, p);
-                        if seen.contains(&o) {
-                            return d <= VISUAL_RANGE;
-                        }
-                        d <= ring
+                        let range = if seen.contains(&o) {
+                            VISUAL_RANGE
+                        } else {
+                            ring
+                        };
+                        d <= range && !blocked(pos, p)
                     })
                     .map(|&(o, _)| o)
                     .collect()

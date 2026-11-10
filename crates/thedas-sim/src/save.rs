@@ -61,6 +61,9 @@ impl Sim {
         world.trace.entries.clear();
         self.world = world;
         self.talk = save.talk;
+        // Caches keyed by object id belong to the world just replaced.
+        self.area_layouts.clear();
+        self.door_cells.clear();
         // Saves from before world maps were simulated have none.
         if !self
             .world
