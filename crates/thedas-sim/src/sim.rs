@@ -377,7 +377,75 @@ impl Sim {
             event_name: self.event_name(event.ty),
             script: script.clone(),
         });
+        let chargen_end = self.event_type("CHARGEN_END");
+        let chargen_done = chargen_end != 0
+            && event.ty == chargen_end
+            && event.ints.first().copied().unwrap_or(0) == 0;
+        let creature = event.objects.first().copied();
         self.run_script(&script, target, Some(event));
+        // Once the module has handled the end of character creation (race and gender are
+        // set by then), the new character keeps a face.
+        if chargen_done {
+            if let Some(c) = creature {
+                self.keep_chargen_face(c);
+            }
+        }
+    }
+
+    /// Character-creation head presets per race and gender: `<race><gender>_pcc_b01` to
+    /// `_b04` (`hm_pcc_b01.mor`; each with a `.mop` of slider settings).
+    pub const CHARGEN_HEAD_PRESETS: u32 = 4;
+
+    /// The head preset `index` (1-based) for a creature's race and gender: `apr_base.gda`'s
+    /// `ModelRace` letter and the `Gender` field (2 female, else male); `None` for creatures
+    /// that are not part-based humanoids or a preset that does not exist.
+    pub fn chargen_head_preset(&self, id: ObjectId, index: u32) -> Option<String> {
+        let o = self.world.get(id)?;
+        let t = self.world.tables().get(0, "apr_base")?;
+        let race = match t.cell("ModelRace", o.appearance as i64)? {
+            thedas_formats::gda::Cell::String(s) => {
+                s.trim_end_matches('\0').trim().to_ascii_lowercase()
+            }
+            _ => return None,
+        };
+        let r = race
+            .chars()
+            .next()
+            .filter(|c| matches!(c, 'h' | 'e' | 'd' | 'q'))?;
+        let g = if o.fields.get("Gender").copied() == Some(2) {
+            'f'
+        } else {
+            'm'
+        };
+        let name = format!("{r}{g}_pcc_b{index:02}");
+        self.vfs
+            .lookup(&format!("{name}.mor"))
+            .is_some()
+            .then_some(name)
+    }
+
+    /// Keeps a face on a creature that leaves character creation without one: the first
+    /// head preset of its race and gender (provisional: the face screen is not simulated,
+    /// and its default is taken to be the first preset).
+    pub fn keep_chargen_face(&mut self, id: ObjectId) {
+        if self.world.get(id).is_none_or(|o| o.head_morph.is_some()) {
+            return;
+        }
+        let preset = self.chargen_head_preset(id, 1);
+        if let Some(o) = self.world.get_mut(id) {
+            o.head_morph = preset;
+        }
+    }
+
+    /// Sets the head morph a creature keeps (the face screen's choice); `None` returns it to
+    /// its template's.
+    pub fn set_head_morph(&mut self, id: ObjectId, morph: Option<String>) {
+        if let Some(o) = self.world.get_mut(id) {
+            o.head_morph = morph
+                .map(|m| m.trim().to_ascii_lowercase())
+                .map(|m| m.strip_suffix(".mor").map(str::to_string).unwrap_or(m))
+                .filter(|m| !m.is_empty());
+        }
     }
 
     pub fn new_event(&self, name: &str, creator: Option<ObjectId>) -> Event {
@@ -2257,6 +2325,71 @@ mod tests {
         assert_eq!(s.world.plots.get(&("ABC".to_string(), 13)), Some(&true));
         let l = &s.world.get(m).unwrap().locals;
         assert!(!l.strings.contains_key("CUTSCENE_SET_PLOT"));
+    }
+
+    #[test]
+    fn character_creation_leaves_a_saved_face() {
+        let dir = std::env::temp_dir().join(format!("thedas-face-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let preset = dir.join("hf_pcc_b01.mor");
+        std::fs::write(&preset, b"MORP").unwrap();
+        let mut vfs = Vfs::new();
+        vfs.push_files(&[preset], "test");
+        let table = Arc::new(
+            EngineTable::parse(
+                b"#define ENGINE_STRUCTURE_0 event\nint EVENT_TYPE_CHARGEN_END = 59;\n",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(vfs), table, 1);
+        s.world.tables().insert(
+            "apr_base",
+            &["ModelType", "ModelRace"],
+            vec![(
+                15,
+                vec![
+                    thedas_formats::gda::Cell::String("P".into()),
+                    thedas_formats::gda::Cell::String("H\0".into()),
+                ],
+            )],
+        );
+        let m = with_module(&mut s);
+        s.world.get_mut(m).unwrap().script = Some("missing_module_script".into());
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        {
+            let o = s.world.get_mut(hero).unwrap();
+            o.appearance = 15;
+            o.fields.insert("Gender".into(), 2);
+        }
+        // Level-up's end leaves the face alone; creation's end keeps the first preset.
+        let mut end = s.new_event("CHARGEN_END", Some(hero));
+        end.objects = vec![hero];
+        end.ints = vec![1, 0];
+        s.deliver(m, end.clone(), None);
+        assert_eq!(s.world.get(hero).unwrap().head_morph, None);
+        end.ints = vec![0, 0];
+        s.deliver(m, end.clone(), None);
+        assert_eq!(
+            s.world.get(hero).unwrap().head_morph.as_deref(),
+            Some("hf_pcc_b01")
+        );
+        // A face chosen on the face screen stays, and is saved.
+        s.set_head_morph(hero, Some("HF_PCC_B03.mor".into()));
+        s.deliver(m, end, None);
+        assert_eq!(
+            s.world.get(hero).unwrap().head_morph.as_deref(),
+            Some("hf_pcc_b03")
+        );
+        let saved = s.save_json().unwrap();
+        let mut t = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        t.load_json(&saved).unwrap();
+        assert_eq!(
+            t.world.get(hero).unwrap().head_morph.as_deref(),
+            Some("hf_pcc_b03")
+        );
+        s.set_head_morph(hero, Some("  ".into()));
+        assert_eq!(s.world.get(hero).unwrap().head_morph, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

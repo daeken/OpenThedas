@@ -12,6 +12,7 @@ use thedas_formats::material::{MaterialDef, MaterialObject, Technique, TextureBi
 use thedas_formats::mesh::{DeclUsage, MeshChunk, Msh};
 use thedas_formats::morph::{Morph, MorphNode, slot as morph_slot};
 use thedas_formats::probe::IrradianceProbe;
+use thedas_formats::tint::Tint;
 use thedas_formats::{Arl, Mmh, Rml};
 
 use crate::skeleton::Skeleton;
@@ -178,6 +179,9 @@ pub struct Prop {
     pub morph: Option<String>,
     /// Leave out the morph's hair and beard (under a helmet).
     pub hide_hair: bool,
+    /// Equipment tints by model (of `models` or `attached`): (model, `.tnt` without
+    /// extension). They fill the model's materials' `mml_vTintMaskColours`.
+    pub tints: Vec<(String, String)>,
     /// Model to world.
     pub transform: Mat4,
 }
@@ -278,7 +282,12 @@ struct Placing<'a> {
     probe: Option<usize>,
     /// A head morph shaping and colouring the model's face meshes: (name, morph).
     morph: Option<(&'a str, &'a Morph)>,
+    /// An item tint for every material of the model: (name, tint).
+    tint: Option<(&'a str, &'a Tint)>,
 }
+
+/// The material parameter an item tint fills.
+pub const TINT_PARAMETER: &str = "mml_vTintMaskColours";
 
 struct Loader<'a> {
     vfs: &'a Vfs,
@@ -289,6 +298,7 @@ struct Loader<'a> {
     mat_defs: HashMap<String, Option<Arc<MaterialDef>>>,
     material_index: HashMap<String, Option<usize>>,
     morphs: HashMap<String, Option<Arc<Morph>>>,
+    tints: HashMap<String, Option<Arc<Tint>>>,
     skeleton_index: HashMap<String, usize>,
 }
 
@@ -504,6 +514,28 @@ impl<'a> Loader<'a> {
         index
     }
 
+    fn tint(&mut self, name: &str) -> Option<Arc<Tint>> {
+        let key = format!("{}.tnt", name.to_ascii_lowercase());
+        if let Some(t) = self.tints.get(&key) {
+            return t.clone();
+        }
+        let loaded = match self.read(&key) {
+            Ok(d) => match Tint::parse(&d) {
+                Ok(t) => Some(Arc::new(t)),
+                Err(e) => {
+                    self.warn(format!("{key}: {e}"));
+                    None
+                }
+            },
+            Err(e) => {
+                self.warn(e.to_string());
+                None
+            }
+        };
+        self.tints.insert(key, loaded.clone());
+        loaded
+    }
+
     fn morph(&mut self, name: &str) -> Option<Arc<Morph>> {
         let key = format!("{}.mor", name.to_ascii_lowercase());
         if let Some(m) = self.morphs.get(&key) {
@@ -673,6 +705,7 @@ impl<'a> Loader<'a> {
             room,
             probe,
             morph,
+            tint,
         } = at;
         let Some(model) = self.model(model_name) else {
             return;
@@ -729,6 +762,14 @@ impl<'a> Loader<'a> {
                         &node.vectors,
                     );
                 }
+            }
+            if let Some((name, t)) = tint {
+                material = self.overridden_material(
+                    material,
+                    name,
+                    &[],
+                    &[(TINT_PARAMETER.to_string(), t.colours.to_vec())],
+                );
             }
 
             let node = piece
@@ -846,6 +887,7 @@ impl AreaScene {
             mat_defs: HashMap::new(),
             material_index: HashMap::new(),
             morphs: HashMap::new(),
+            tints: HashMap::new(),
             skeleton_index: HashMap::new(),
         };
         let arl_name = format!("{level}.arl");
@@ -897,6 +939,7 @@ impl AreaScene {
                         room: &room.name,
                         probe: room_probe,
                         morph: None,
+                        tint: None,
                     },
                 );
             }
@@ -916,9 +959,27 @@ impl AreaScene {
                 room,
                 probe,
                 morph: None,
+                tint: None,
+            };
+            // Each tinted model's tint, read once per prop.
+            let tints: Vec<(String, String, Option<Arc<Tint>>)> = prop
+                .tints
+                .iter()
+                .map(|(m, t)| (m.clone(), t.clone(), l.tint(t)))
+                .collect();
+            let tint_of = |model: &str| {
+                tints.iter().find_map(|(m, name, t)| {
+                    m.eq_ignore_ascii_case(model)
+                        .then(|| t.as_deref().map(|t| (name.as_str(), t)))
+                        .flatten()
+                })
             };
             for model in &prop.models {
-                l.place(model, prop.transform, placing(&prop.label));
+                let at = Placing {
+                    tint: tint_of(model),
+                    ..placing(&prop.label)
+                };
+                l.place(model, prop.transform, at);
             }
             let mut attachments = Vec::new();
             for (model, node) in &prop.attached {
@@ -935,7 +996,11 @@ impl AreaScene {
                     .iter()
                     .fold(prop.transform, |m, t| m * transform_matrix(t));
                 let first = l.scene.draws.len();
-                l.place(model, at, placing(&prop.label));
+                let placing_at = Placing {
+                    tint: tint_of(model),
+                    ..placing(&prop.label)
+                };
+                l.place(model, at, placing_at);
                 let skeleton = l.skeleton(&body, &mmh);
                 if let Some(n) = l.scene.skeletons[skeleton].node(node) {
                     attachments.push(PropAttachment {
@@ -988,6 +1053,7 @@ mod tests {
             mat_defs: HashMap::new(),
             material_index: HashMap::new(),
             morphs: HashMap::new(),
+            tints: HashMap::new(),
             skeleton_index: HashMap::new(),
         };
         let vertex = |z: f32| Vertex {

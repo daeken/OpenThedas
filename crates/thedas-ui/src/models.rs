@@ -14,8 +14,9 @@
 //!   from the body's attachment nodes.
 //! - Heads: a creature template's `Appearance Data` names a head morph (`HeadMorph`, a
 //!   `.mor`), which names the head, eyes, hair, beard and lashes and carries the face's
-//!   shape and colours. Part-based creatures without one (the hero, made in character
-//!   creation) get the race's base head (`hm_uhm_basa_0`, eyes and lashes; provisional).
+//!   shape and colours. A morph kept on the creature (the player's face from character
+//!   creation) comes first. Part-based creatures with neither get the race's base head
+//!   (`hm_uhm_basa_0`, eyes and lashes; provisional).
 
 use thedas_formats::gda::Cell;
 use thedas_script::vm::ObjectId;
@@ -38,6 +39,8 @@ pub struct ObjectModel {
     /// The body (or the placeable): models sharing the object's placement.
     pub models: Vec<String>,
     pub attached: Vec<Attached>,
+    /// Equipment tints: (model, `.tnt` without extension).
+    pub tints: Vec<(String, String)>,
     /// The head morph resource (without `.mor`), if any.
     pub morph: Option<String>,
     /// A helmet hides the morph's hair and beard (provisional).
@@ -114,9 +117,17 @@ fn has_model(sim: &Sim, model: &str) -> bool {
     sim.vfs.lookup(&format!("{model}.mmh")).is_some()
 }
 
-/// The head morph a creature's template names (`Appearance Data` / `HeadMorph`), if the
-/// resource exists.
+/// A creature's head morph, if the resource exists: the one it keeps (the player's face
+/// from character creation), else the one its template names (`Appearance Data` /
+/// `HeadMorph`).
 pub fn head_morph(sim: &Sim, o: &Object) -> Option<String> {
+    if let Some(m) = o
+        .head_morph
+        .as_ref()
+        .filter(|m| sim.vfs.lookup(&format!("{m}.mor")).is_some())
+    {
+        return Some(m.clone());
+    }
     use thedas_formats::gff3::{Gff3, Struct, Value};
     fn field<'a>(s: &'a Struct, label: &str) -> Option<&'a Value> {
         s.fields.iter().find(|f| f.label == label).map(|f| &f.value)
@@ -155,6 +166,8 @@ fn base_head(sim: &Sim, prefix: &str) -> Vec<String> {
 pub struct Drawn {
     pub models: Vec<String>,
     pub attached: Vec<Attached>,
+    /// Equipment tints: (model, `.tnt` without extension).
+    pub tints: Vec<(String, String)>,
     pub morph: Option<String>,
     pub hide_hair: bool,
 }
@@ -182,6 +195,7 @@ pub fn object_models(sim: &Sim, o: &Object) -> Drawn {
             let kind = text(t.cell("ModelType", app)).unwrap_or_default();
             let morph = head_morph(sim, o);
             let mut hide_hair = false;
+            let mut prefix: Option<String> = None;
             let models = if kind.eq_ignore_ascii_case("P") {
                 let race = text(t.cell("ModelRace", app)).unwrap_or_default();
                 let gender = o.fields.get("Gender").copied().unwrap_or(1);
@@ -189,6 +203,7 @@ pub fn object_models(sim: &Sim, o: &Object) -> Drawn {
                     Some(p) => {
                         let (mut parts, helmet) = worn_parts(sim, o, &p);
                         hide_hair = helmet;
+                        prefix = Some(p.clone());
                         if morph.is_none() {
                             parts.extend(base_head(sim, &p));
                         }
@@ -207,6 +222,7 @@ pub fn object_models(sim: &Sim, o: &Object) -> Drawn {
             Drawn {
                 models,
                 attached: weapons(sim, o),
+                tints: equipment_tints(sim, o, prefix.as_deref()),
                 morph,
                 hide_hair,
             }
@@ -248,6 +264,45 @@ fn worn_parts(sim: &Sim, o: &Object, prefix: &str) -> (Vec<String>, bool) {
     let has_helmet = helmet.is_some();
     out.extend(helmet);
     (out, has_helmet)
+}
+
+/// The tint an item's material gives it (`Material` -> `materialtypes.gda` `TintFile`),
+/// without the `.tnt` extension.
+pub fn item_tint(sim: &Sim, item: &Object) -> Option<String> {
+    let material = *item.fields.get("Material")? as i64;
+    let t = sim.world.tables().get(0, "materialtypes")?;
+    let file = text(t.cell("TintFile", material))?.to_ascii_lowercase();
+    let stem = file.strip_suffix(".tnt").unwrap_or(&file).to_string();
+    (!stem.is_empty()).then_some(stem)
+}
+
+/// The tints of a creature's equipment by the model each item draws: worn parts under
+/// `prefix` (part-based creatures) and weapons.
+fn equipment_tints(sim: &Sim, o: &Object, prefix: Option<&str>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut add = |slot_name: &str, model: &dyn Fn(&str, &str) -> String| {
+        let Some(item) = equipped(sim, o, slot_name) else {
+            return;
+        };
+        let (Some((ty, v)), Some(tint)) = (item_variation(sim, item), item_tint(sim, item)) else {
+            return;
+        };
+        out.push((model(&ty, &v), tint));
+    };
+    if let Some(p) = prefix {
+        for slot_name in [
+            "INVENTORY_SLOT_CHEST",
+            "INVENTORY_SLOT_BOOTS",
+            "INVENTORY_SLOT_GLOVES",
+            "INVENTORY_SLOT_HEAD",
+        ] {
+            add(slot_name, &|ty, v| format!("{p}_{ty}_{v}{LOD0}"));
+        }
+    }
+    for slot_name in ["INVENTORY_SLOT_MAIN", "INVENTORY_SLOT_OFFHAND"] {
+        add(slot_name, &|ty, v| format!("w_{ty}_{v}{LOD0}"));
+    }
+    out
 }
 
 /// The creature's weapons in its hands.
@@ -440,6 +495,7 @@ pub fn area_models(sim: &Sim, area: ObjectId) -> Vec<ObjectModel> {
                 kind: o.kind,
                 models: d.models,
                 attached: d.attached,
+                tints: d.tints,
                 morph: d.morph,
                 hide_hair: d.hide_hair,
                 motion: motion(sim, o),
@@ -593,6 +649,47 @@ mod tests {
         assert_eq!(style(Some(great), None), Some("tw"));
         assert_eq!(style(Some(bow), None), Some("bow"));
         assert_eq!(style(None, None), None);
+    }
+
+    #[test]
+    fn items_take_their_materials_tint() {
+        use std::sync::Arc;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        s.world.tables().insert(
+            "materialtypes",
+            &["Label", "TintFile"],
+            vec![
+                (
+                    40,
+                    vec![
+                        Cell::String("Weapon, Iron".into()),
+                        Cell::String("T3_WPN_IRN.tnt\0".into()),
+                    ],
+                ),
+                (
+                    0,
+                    vec![Cell::String("INVALID".into()), Cell::String("".into())],
+                ),
+            ],
+        );
+        let mut item = |material: Option<i32>| {
+            let id = s.world.spawn(ObjectKind::Item, "item");
+            if let Some(m) = material {
+                s.world
+                    .get_mut(id)
+                    .unwrap()
+                    .fields
+                    .insert("Material".into(), m);
+            }
+            id
+        };
+        let (iron, none, unset) = (item(Some(40)), item(Some(0)), item(None));
+        let tint = |id| item_tint(&s, s.world.get(id).unwrap());
+        assert_eq!(tint(iron).as_deref(), Some("t3_wpn_irn"));
+        assert_eq!(tint(none), None);
+        assert_eq!(tint(unset), None);
     }
 
     #[test]
