@@ -238,7 +238,16 @@ impl Sim {
         let name = if dlg.is_empty() {
             match self.world.get(target).and_then(|o| o.dialog.clone()) {
                 Some(d) => d,
-                None => return false,
+                None => {
+                    let t = self.world.time_ms;
+                    self.world.trace.push(TraceEntry::Missing {
+                        t,
+                        what: format!(
+                            "conversation: {initiator} -> {target} names no dialog and the target has none"
+                        ),
+                    });
+                    return false;
+                }
             }
         } else {
             dlg.trim_end_matches(".dlg").to_string()
@@ -290,6 +299,11 @@ impl Sim {
         };
         let node = c.dlg.nodes[reply].clone();
         self.action(&node.action, c.owner);
+        // The action started another conversation (a plot script's UT_Talk): it replaces
+        // this one, as in the game.
+        if self.talk.is_some() {
+            return self.dialog_state();
+        }
         let next = node.children.iter().copied().find(|&n| {
             let cond = c.dlg.nodes[n].condition.clone();
             self.condition(&cond, c.owner)
@@ -302,7 +316,9 @@ impl Sim {
                 ..c
             },
         };
-        self.talk = Some(c);
+        if self.talk.is_none() {
+            self.talk = Some(c);
+        }
         self.dialog_state()
     }
 
