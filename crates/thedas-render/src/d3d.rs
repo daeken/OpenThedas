@@ -150,6 +150,16 @@ impl D3dSource {
     /// Prepares programs for every material in the scene whose selected technique's passes
     /// all (if `filter` is set) use one of the listed vertex/pixel shader pairs.
     pub fn new(vfs: &Vfs, scene: &AreaScene, filter: &ShaderFilter) -> Self {
+        Self::new_cached(vfs, scene, filter, &mut crate::RenderCache::default())
+    }
+
+    /// [`D3dSource::new`], reusing (and keeping) translations in `cache`.
+    pub fn new_cached(
+        vfs: &Vfs,
+        scene: &AreaScene,
+        filter: &ShaderFilter,
+        cache: &mut crate::RenderCache,
+    ) -> Self {
         let mut programs = HashMap::new();
         let mut failures = Vec::new();
         for m in &scene.materials {
@@ -172,6 +182,10 @@ impl D3dSource {
                 if programs.contains_key(&key) {
                     continue;
                 }
+                if let Some(built) = cache.programs.get(&key) {
+                    programs.insert(key, built.clone());
+                    continue;
+                }
                 let built = match build(vfs, vs, ps, st) {
                     Ok(p) => Some(Arc::new(p)),
                     Err(e) => {
@@ -180,6 +194,7 @@ impl D3dSource {
                         None
                     }
                 };
+                cache.programs.insert(key.clone(), built.clone());
                 programs.insert(key, built);
             }
         }
