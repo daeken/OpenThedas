@@ -1,6 +1,6 @@
 [package]
 name = "thedas-formats"
-description = "Parsers and writers for Dragon Age data formats (GFF4, GDA, TLK)"
+description = "Parsers and writers for Dragon Age data formats (GFF4, GFF3, GDA, TLK, models, meshes, materials, DDS)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,3 +10,4 @@ rust-version.workspace = true
 [dependencies]
 thiserror.workspace = true
 crc32fast.workspace = true
+roxmltree.workspace = true
