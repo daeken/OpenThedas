@@ -8,6 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use glam::Mat4;
 use thedas_render::{Animator, AreaRenderer, AreaScene, Clip, GpuContext, Prop};
+use thedas_script::vm::ObjectId;
 use thedas_sim::Sim;
 use thedas_ui::models::{ModelCache, ObjectModel};
 use thedas_vfs::install::TextureQuality;
@@ -23,6 +24,9 @@ type SceneKey = (String, Vec<(u32, Vec<String>)>);
 
 pub struct LiveScene {
     key: SceneKey,
+    /// Interactive placeables' bounds (centre offset from the object, radius), from their
+    /// draws when the scene was built.
+    bounds: std::collections::HashMap<ObjectId, (glam::Vec3, f32)>,
     pub vfs: Arc<Vfs>,
     pub scene: AreaScene,
     pub renderer: AreaRenderer,
@@ -31,8 +35,6 @@ pub struct LiveScene {
 pub struct Live {
     pub sim: Sim,
     pub paused: bool,
-    /// The party member the player controls; `None` for the hero.
-    pub leader: Option<thedas_script::vm::ObjectId>,
     install: PathBuf,
     shaders: String,
     pub scene: Option<LiveScene>,
@@ -71,10 +73,11 @@ impl Live {
                 std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
             sim.load_json(&bytes)?;
         }
+        // The player is in control (saves made by test drivers may have the autopilot on).
+        sim.world.autopilot = false;
         Ok(Self {
             sim,
             paused: false,
-            leader: None,
             install: install.to_path_buf(),
             shaders: shaders.to_string(),
             scene: None,
@@ -99,8 +102,8 @@ impl Live {
     }
 
     /// The party leader the player controls (the hero until another is chosen).
-    pub fn leader(&self) -> Option<thedas_script::vm::ObjectId> {
-        self.leader.or(self.sim.world.hero)
+    pub fn leader(&self) -> Option<ObjectId> {
+        self.sim.world.controlled()
     }
 
     /// Where the party leader stands, when it is in the current area.
@@ -174,12 +177,167 @@ impl Live {
         );
         // A new scene means new skeleton indices.
         self.animator = Animator::default();
+        let mut bounds = std::collections::HashMap::new();
+        for (m, p) in models.iter().zip(&scene.props) {
+            let spheres: Vec<(glam::Vec3, f32)> = p
+                .draws
+                .clone()
+                .filter_map(|d| scene.draws.get(d).map(|d| d.sphere))
+                .collect();
+            if spheres.is_empty() {
+                continue;
+            }
+            let centre = spheres.iter().map(|s| s.0).sum::<glam::Vec3>() / spheres.len() as f32;
+            let radius = spheres
+                .iter()
+                .map(|s| s.0.distance(centre) + s.1)
+                .fold(0.0, f32::max);
+            bounds.insert(m.id, (centre - glam::Vec3::from_array(m.position), radius));
+        }
         Ok(LiveScene {
             key,
+            bounds,
             vfs: Arc::new(vfs),
             scene,
             renderer,
         })
+    }
+}
+
+/// What a click lands on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pick {
+    Object(ObjectId),
+    Ground([f32; 3]),
+}
+
+/// Creatures are picked as upright cylinders this tall (metres). Provisional.
+pub const PICK_HEIGHT: f32 = 1.9;
+
+/// Where a ray first meets an upright cylinder (base `p`, radius `r`, height `h`).
+fn ray_cylinder(o: glam::Vec3, d: glam::Vec3, p: glam::Vec3, r: f32, h: f32) -> Option<f32> {
+    let (ox, oy) = (o.x - p.x, o.y - p.y);
+    let a = d.x * d.x + d.y * d.y;
+    if a < 1e-9 {
+        return None;
+    }
+    let b = 2.0 * (ox * d.x + oy * d.y);
+    let c = ox * ox + oy * oy - r * r;
+    let disc = b * b - 4.0 * a * c;
+    if disc < 0.0 {
+        return None;
+    }
+    let s = disc.sqrt();
+    [(-b - s) / (2.0 * a), (-b + s) / (2.0 * a)]
+        .into_iter()
+        .filter(|&t| t > 0.0)
+        .find(|&t| {
+            let z = o.z + d.z * t;
+            z >= p.z && z <= p.z + h
+        })
+}
+
+/// Where a ray first meets a sphere.
+fn ray_sphere(o: glam::Vec3, d: glam::Vec3, c: glam::Vec3, r: f32) -> Option<f32> {
+    let oc = o - c;
+    let b = oc.dot(d);
+    let disc = b * b - (oc.length_squared() - r * r);
+    if disc < 0.0 {
+        return None;
+    }
+    let s = disc.sqrt();
+    [-b - s, -b + s].into_iter().find(|&t| t > 0.0)
+}
+
+impl Live {
+    /// What a ray from the camera (`origin`, unit `dir`) lands on: the nearest creature
+    /// (not the party leader) or interactive placeable it passes through, else the ground.
+    pub fn pick(&mut self, origin: glam::Vec3, dir: glam::Vec3) -> Option<Pick> {
+        let area = self.sim.world.area?;
+        let leader = self.leader();
+        let mut best: Option<(f32, ObjectId)> = None;
+        for o in self.sim.world.objects.values() {
+            if o.area != Some(area) || !o.active || Some(o.id) == leader {
+                continue;
+            }
+            let p = glam::Vec3::from_array(o.position);
+            let t = match o.kind {
+                thedas_sim::world::ObjectKind::Creature => {
+                    let r = self.sim.body_radius(o.id).max(0.35);
+                    ray_cylinder(origin, dir, p, r, PICK_HEIGHT)
+                }
+                thedas_sim::world::ObjectKind::Placeable if o.interactive => self
+                    .scene
+                    .as_ref()
+                    .and_then(|s| s.bounds.get(&o.id))
+                    .and_then(|&(off, r)| ray_sphere(origin, dir, p + off, r)),
+                _ => None,
+            };
+            if let Some(t) = t {
+                if best.is_none_or(|(b, _)| t < b) {
+                    best = Some((t, o.id));
+                }
+            }
+        }
+        let ground = self
+            .sim
+            .ground_hit(area, origin.to_array(), dir.to_array(), 300.0);
+        match (best, ground) {
+            (Some((t, id)), Some(g)) if t <= origin.distance(glam::Vec3::from_array(g)) => {
+                Some(Pick::Object(id))
+            }
+            (Some((_, id)), None) => Some(Pick::Object(id)),
+            (_, Some(g)) => Some(Pick::Ground(g)),
+            (None, None) => None,
+        }
+    }
+
+    /// Orders the party leader as a click on `pick` does: lead with a party member, attack a
+    /// living hostile, talk to another creature that has a conversation, use an interactive
+    /// placeable, walk to a point on the ground. The order is an ordinary command queue; the simulation runs it.
+    pub fn click(&mut self, pick: Pick) -> Option<String> {
+        let leader = self.leader()?;
+        match pick {
+            Pick::Ground(p) => {
+                self.sim.order_move(leader, p);
+                Some(format!("move to {:.1} {:.1}", p[0], p[1]))
+            }
+            Pick::Object(id) => {
+                // A party member is chosen to lead.
+                let party = thedas_sim::engine::party_of(&self.sim);
+                if let Some(n) = party.iter().position(|&m| m == id) {
+                    return self.choose_leader(n).map(|t| format!("lead with {t}"));
+                }
+                let o = self.sim.world.get(id)?;
+                let (kind, dead, tag, talks) = (o.kind, o.dead, o.tag.clone(), o.dialog.is_some());
+                match kind {
+                    thedas_sim::world::ObjectKind::Creature
+                        if !dead && self.sim.hostile(leader, id) =>
+                    {
+                        self.sim.order_attack(leader, id);
+                        Some(format!("attack {tag}"))
+                    }
+                    thedas_sim::world::ObjectKind::Creature if !dead && talks => {
+                        self.sim.order_talk(leader, id);
+                        Some(format!("talk to {tag}"))
+                    }
+                    thedas_sim::world::ObjectKind::Placeable => {
+                        self.sim.order_use(leader, id);
+                        Some(format!("use {tag}"))
+                    }
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// Makes party member `n` (0 is the hero) the leader the player controls.
+    pub fn choose_leader(&mut self, n: usize) -> Option<String> {
+        let party = thedas_sim::engine::party_of(&self.sim);
+        let id = *party.get(n)?;
+        // The simulation learns who the player controls, so that member's AI stands down.
+        self.sim.set_controlled(Some(id));
+        self.sim.world.get(id).map(|o| o.tag.clone())
     }
 }
 

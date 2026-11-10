@@ -21,6 +21,7 @@ pub mod inventory;
 pub mod levelup;
 pub mod m2da;
 pub mod nav;
+pub mod orders;
 pub mod plot;
 pub mod save;
 pub mod session;

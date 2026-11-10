@@ -347,12 +347,13 @@ pub fn call(
 
         // --- Objects ----------------------------------------------------------------------
         "GetModule" => ok(Value::Object(h.sim.world.module.unwrap_or(OBJECT_INVALID))),
-        "GetHero" | "GetPartyLeader" | "GetMainControlled" => {
-            ok(Value::Object(h.sim.world.hero.unwrap_or(OBJECT_INVALID)))
-        }
+        "GetHero" => ok(Value::Object(h.sim.world.hero.unwrap_or(OBJECT_INVALID))),
+        "GetPartyLeader" | "GetMainControlled" => ok(Value::Object(
+            h.sim.world.controlled().unwrap_or(OBJECT_INVALID),
+        )),
         "IsHero" => ok(b(Some(obj(a, 0)) == h.sim.world.hero)),
         "IsControlled" => ok(b(
-            !h.sim.world.autopilot && Some(obj(a, 0)) == h.sim.world.hero
+            !h.sim.world.autopilot && Some(obj(a, 0)) == h.sim.world.controlled()
         )),
         "IsFollower" => {
             let o = obj(a, 0);
@@ -2931,9 +2932,9 @@ pub fn call(
             let n = h.object(obj(a, 0)).map_or(0, |o| o.equipment.len());
             ok(Value::Int(if n == 0 { 0 } else { 1 }))
         }
-        // Followers fight on their own; the hero is the player's.
+        // Followers fight on their own; the member the player controls is the player's.
         "IsPartyAIEnabled" => ok(b(
-            h.sim.world.autopilot || Some(obj(a, 0)) != h.sim.world.hero
+            h.sim.world.autopilot || Some(obj(a, 0)) != h.sim.world.controlled()
         )),
         // The creatures on a creature's melee ring: within reach of it (the two bodies and
         // the melee gap, see `Sim::reach_to`) and between the two angles, measured from its

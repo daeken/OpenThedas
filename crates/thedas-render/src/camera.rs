@@ -77,6 +77,17 @@ impl Camera {
         self.projection(aspect) * self.view()
     }
 
+    /// The ray through pixel (`x`, `y`) of a `width` x `height` view: origin and unit
+    /// direction in world space.
+    pub fn ray(&self, x: f32, y: f32, width: f32, height: f32) -> (Vec3, Vec3) {
+        let inv = self.view_proj(width / height.max(1.0)).inverse();
+        let ndc_x = 2.0 * x / width.max(1.0) - 1.0;
+        let ndc_y = 1.0 - 2.0 * y / height.max(1.0);
+        let near = inv.project_point3(Vec3::new(ndc_x, ndc_y, 0.0));
+        let far = inv.project_point3(Vec3::new(ndc_x, ndc_y, 1.0));
+        (near, (far - near).normalize_or_zero())
+    }
+
     /// Moves relative to the view: `forward` along the view direction, `right` sideways,
     /// `up` along world Z.
     pub fn fly(&mut self, forward: f32, right: f32, up: f32) {
@@ -94,6 +105,17 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_centre_ray_looks_along_the_view() {
+        let c = Camera::new(Vec3::new(1.0, 2.0, 3.0), 0.7, -0.3);
+        let (o, d) = c.ray(400.0, 300.0, 800.0, 600.0);
+        assert!((d - c.forward()).length() < 1e-4, "{d:?}");
+        assert!((o - c.position).length() < 0.2);
+        // The left edge leans left of the view.
+        let (_, l) = c.ray(0.0, 300.0, 800.0, 600.0);
+        assert!(l.cross(c.forward()).z < 0.0);
+    }
 
     #[test]
     fn parses_and_prints_specs() {

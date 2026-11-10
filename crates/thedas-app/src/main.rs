@@ -7,7 +7,8 @@
 //! Playing: `--save <file>` (a save from the MCP's save_state) or `--new-game` runs the
 //! simulation live at real time; Space pauses it. The camera follows the party leader: hold
 //! the right mouse button to orbit, the wheel to zoom, Q/E to turn; F switches to the
-//! free-flying camera and back.
+//! free-flying camera and back. A left click orders the leader: walk to the ground clicked,
+//! attack a hostile, talk to someone, use a door or container. 1-4 choose the leader.
 //!
 //! Headless: `--capture out.png --camera x,y,z,yaw,pitch` renders one frame with no window.
 //!
@@ -88,6 +89,10 @@ struct Args {
     /// Headless, playing: run the simulation this many milliseconds before capturing.
     #[arg(long, default_value_t = 0)]
     run_ms: u64,
+    /// Headless, playing: left-click at this pixel (`x,y`) of the view before running, as the
+    /// player would (repeatable).
+    #[arg(long)]
+    click: Vec<String>,
     /// Module for `--save` and `--objects`.
     #[arg(long, default_value = "single player")]
     module: String,
@@ -528,6 +533,19 @@ impl App {
         Ok(())
     }
 
+    /// A left click at window pixel (`x`, `y`) while playing: the party leader is ordered to
+    /// whatever it lands on.
+    fn click(&mut self, x: f64, y: f64) {
+        let (Some(live), Some(g)) = (self.live.as_mut(), self.gfx.as_ref()) else {
+            return;
+        };
+        let (w, h) = (g.config.width as f32, g.config.height as f32);
+        let (origin, dir) = self.camera.ray(x as f32, y as f32, w, h);
+        if let Some(order) = live.pick(origin, dir).and_then(|p| live.click(p)) {
+            log::info!("order: {order}");
+        }
+    }
+
     fn fail(&mut self, event_loop: &ActiveEventLoop, e: anyhow::Error) {
         self.error = Some(e);
         event_loop.exit();
@@ -566,6 +584,24 @@ impl ApplicationHandler for App {
                             match code {
                                 KeyCode::Escape => event_loop.exit(),
                                 KeyCode::KeyP => println!("camera {}", self.camera.spec()),
+                                KeyCode::Digit1
+                                | KeyCode::Digit2
+                                | KeyCode::Digit3
+                                | KeyCode::Digit4
+                                    if self.live.is_some() =>
+                                {
+                                    let n = match code {
+                                        KeyCode::Digit1 => 0,
+                                        KeyCode::Digit2 => 1,
+                                        KeyCode::Digit3 => 2,
+                                        _ => 3,
+                                    };
+                                    if let Some(tag) =
+                                        self.live.as_mut().and_then(|l| l.choose_leader(n))
+                                    {
+                                        log::info!("leading with {tag}");
+                                    }
+                                }
                                 KeyCode::KeyF if self.live.is_some() => {
                                     self.follow = match self.follow.take() {
                                         Some(_) => None,
@@ -610,6 +646,10 @@ impl ApplicationHandler for App {
                 let (x, y) = self.cursor;
                 if let Some(g) = self.gfx.as_mut() {
                     g.ui.mouse_button(x, y, state == ElementState::Pressed);
+                }
+                // Playing with no interface movie open, a click orders the party leader.
+                if state == ElementState::Pressed && self.ui.is_empty() {
+                    self.click(x, y);
                 }
             }
             WindowEvent::MouseInput {
@@ -722,7 +762,34 @@ fn main() -> Result<()> {
     };
     if let Some(out) = &args.capture {
         if let Some(l) = live.as_mut() {
+            if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
+                camera = f.camera(feet, 0.0, &camera);
+            }
+            for c in &args.click {
+                let (x, y) = c
+                    .split_once(',')
+                    .and_then(|(x, y)| {
+                        Some((x.trim().parse::<f32>().ok()?, y.trim().parse::<f32>().ok()?))
+                    })
+                    .context("--click takes x,y")?;
+                let (o, d) = camera.ray(x, y, size.0 as f32, size.1 as f32);
+                match l.pick(o, d).and_then(|p| l.click(p)) {
+                    Some(order) => println!("click {x},{y}: {order}"),
+                    None => println!("click {x},{y}: nothing"),
+                }
+            }
             l.sim.tick(args.run_ms);
+            if let Some(h) = l.leader().and_then(|h| l.sim.world.get(h)) {
+                log::info!(
+                    "leader at {:?}, doing {:?}, saying: {:?}",
+                    h.position,
+                    h.commands
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>(),
+                    l.sim.dialog_state().map(|d| d.line)
+                );
+            }
             if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
                 camera = f.camera(feet, 0.0, &camera);
             }

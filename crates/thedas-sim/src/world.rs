@@ -364,6 +364,10 @@ pub struct World {
     pub module: Option<ObjectId>,
     pub area: Option<ObjectId>,
     pub hero: Option<ObjectId>,
+    /// The party member the player controls, when not the hero (see
+    /// [`World::controlled`]). Saved.
+    #[serde(default)]
+    pub controlled: Option<ObjectId>,
     pub party: Option<ObjectId>,
     /// Plot flags by (plot resource, flag).
     #[serde(with = "pairs")]
@@ -503,6 +507,7 @@ impl World {
             module: None,
             area: None,
             hero: None,
+            controlled: None,
             party: None,
             plots: BTreeMap::new(),
             game_mode: 0,
@@ -528,6 +533,19 @@ impl World {
             trace: Trace::default(),
             tables,
         }
+    }
+
+    /// The party member the player controls (`GetMainControlled`): the one chosen, while it
+    /// is still in the party and alive enough to exist, else the hero.
+    pub fn controlled(&self) -> Option<ObjectId> {
+        let hero = self.hero;
+        let chosen = self.controlled.filter(|&c| {
+            Some(c) == hero
+                || hero
+                    .and_then(|h| self.get(h))
+                    .is_some_and(|h| h.followers.contains(&c))
+        });
+        chosen.or(hero)
     }
 
     pub fn spawn(&mut self, kind: ObjectKind, tag: &str) -> ObjectId {
