@@ -1,0 +1,24 @@
+//! The headless, deterministic simulation of a Dragon Age: Origins world.
+//!
+//! - [`world`]: objects, locals, engine values (events, locations, effects, commands), time and
+//!   the event queue.
+//! - [`sim`]: loading modules and areas, running scripts on the NWScript VM, delivering events
+//!   and ticking.
+//! - [`engine`]: engine functions scripts call, by name, in call-frequency order.
+//! - [`m2da`]: merged 2DA tables. [`plot`]: plot flags and plot scripts. [`dialog`]:
+//!   conversations.
+//! - [`trace`]: what happened, as JSON lines.
+//!
+//! Nothing here reads the wall clock, the frame rate or a GPU: time advances only through
+//! [`Sim::tick`], and randomness comes from a seeded generator.
+
+pub mod dialog;
+pub mod engine;
+pub mod m2da;
+pub mod plot;
+pub mod sim;
+pub mod trace;
+pub mod world;
+
+pub use sim::Sim;
+pub use world::World;

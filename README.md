@@ -32,9 +32,10 @@ Materials outside the Static1 family fall back to a hand-written stand-in unless
 | `thedas-render` | wgpu renderer: loads an area's static geometry, draws each material with its translated original shaders (or a stand-in), captures |
 | `thedas-app` | The `thedas-app` binary: a window with a free-fly camera, or a headless capture |
 | `thedas-script` | NWScript: the `script.ldf` engine-function table, NCS bytecode parsing and disassembly, and the stack VM |
+| `thedas-sim` | The headless, deterministic world: modules and areas loaded from their files, objects, events and the event queue, engine functions for the NWScript VM, plots and conversations |
 | `thedas-cli` | The `thedas` tool: `ls`, `extract`, `dump`, `resolve`, `corpus` |
 
-Planned crates follow the architecture doc: `thedas-sim`, `thedas-ui`,
+Planned crates follow the architecture doc: `thedas-ui`,
 `thedas-audio`, `thedas-video`.
 
 ## Walking through an area
@@ -71,6 +72,8 @@ GAME=~/path/to/Dragon\ Age\ Origins   # the folder holding packages/ and modules
 ./target/release/thedas script disasm "$GAME" setplayerimmortal
 ./target/release/thedas script run "$GAME" setplayerimmortal       # engine calls stubbed, printed
 ./target/release/thedas script stats "$GAME" --report actions.json  # engine functions by call count
+./target/release/thedas sim "$GAME" --area cir110ar_inn --ticks 200 --trace sim.jsonl
+./target/release/thedas sim "$GAME" --area cir110ar_inn --talk urn300cr_innkeeper --replies 1,0
 ./target/release/thedas corpus "$GAME" --report corpus-report.json
 ```
 

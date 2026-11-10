@@ -125,6 +125,18 @@ impl EngineTable {
         self.by_name.get(name).map(|&i| &self.functions[i])
     }
 
+    /// Adds or replaces a function.
+    pub fn insert(&mut self, f: Function) {
+        match self.by_id.get(&f.id) {
+            Some(&i) => self.functions[i] = f.clone(),
+            None => {
+                self.by_id.insert(f.id, self.functions.len());
+                self.functions.push(f.clone());
+            }
+        }
+        self.by_name.insert(f.name.clone(), self.by_id[&f.id]);
+    }
+
     pub fn constant(&self, name: &str) -> Option<&Constant> {
         self.constants.iter().find(|c| c.name == name)
     }

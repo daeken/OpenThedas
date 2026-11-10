@@ -5,6 +5,7 @@
 //! - [`vm`]: the stack machine. Engine functions go to a [`vm::Host`], which the simulation
 //!   implements; the VM itself is deterministic and headless.
 
+pub mod inferred;
 pub mod ldf;
 pub mod ncs;
 pub mod vm;
