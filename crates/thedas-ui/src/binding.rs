@@ -137,6 +137,19 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
         set("Conversation.ResponsesReady".into(), num(1));
         set("Conversation.HasVO".into(), num(0));
     }
+    // The open job board, as chanters.gfx reads it (see thedas_sim::chanters).
+    if let Some(b) = &sim.world.chanter_board {
+        let text =
+            |s: Option<u32>| UiValue::String(s.and_then(|s| sim.string(s)).unwrap_or_default());
+        set("Journal.ChanterBoard.Header".into(), text(b.header_strref));
+        for (i, j) in b.jobs.iter().enumerate() {
+            let k = format!("Journal.ChanterBoard.ChanterEntries.{i}");
+            set(format!("{k}.PlotName"), text(j.name_strref));
+            set(format!("{k}.JournalText"), text(j.text_strref));
+            set(format!("{k}.PlotResRef"), UiValue::String(j.plot.clone()));
+            set(format!("{k}.Accepted"), num(j.accepted as u8));
+        }
+    }
     let creatures = sim
         .world
         .objects
@@ -163,5 +176,33 @@ mod tests {
         assert_eq!(v.get("Party.MemberSelected.0"), Some(&UiValue::Number(0.0)));
         assert!(!v.contains_key("Party.Members.0.ID"));
         assert!(!v.contains_key("GUI.SelectedChar.ID"));
+    }
+
+    #[test]
+    fn the_open_board_lists_its_jobs() {
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        sim.world.chanter_board = Some(thedas_sim::chanters::ChanterBoard {
+            board: 3,
+            header_strref: None,
+            jobs: vec![thedas_sim::chanters::BoardJob {
+                plot: "lot100pt_bears".into(),
+                name_strref: None,
+                text_strref: None,
+                accepted_flag: 2,
+                accepted: true,
+            }],
+        });
+        let v = sim_values(&sim);
+        let k = "Journal.ChanterBoard.ChanterEntries.0";
+        assert_eq!(
+            v.get(&format!("{k}.PlotResRef")),
+            Some(&UiValue::String("lot100pt_bears".into()))
+        );
+        assert_eq!(v.get(&format!("{k}.Accepted")), Some(&UiValue::Number(1.0)));
+        assert!(!v.contains_key("Journal.ChanterBoard.ChanterEntries.1.PlotName"));
     }
 }

@@ -202,6 +202,14 @@ struct ChoosePartyArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct BoardArgs {
+    /// Take the job at this index (as the board's Accept button does).
+    accept: Option<usize>,
+    /// Close the board.
+    close: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct PopupArgs {
     /// Button to press (1 for the first, e.g. Yes/OK); omit to just read the popup.
     button: Option<i32>,
@@ -358,6 +366,25 @@ struct SlotArgs {
 
 fn kind_name(k: ObjectKind) -> String {
     format!("{k:?}").to_ascii_lowercase()
+}
+
+/// The open job board as the player sees it.
+fn board_json(sim: &Sim) -> J {
+    let Some(b) = &sim.world.chanter_board else {
+        return J::Null;
+    };
+    let text = |s: Option<u32>| s.and_then(|s| sim.string(s));
+    json!({
+        "board": b.board,
+        "header": text(b.header_strref),
+        "jobs": b.jobs.iter().enumerate().map(|(i, j)| json!({
+            "index": i,
+            "plot": j.plot,
+            "name": text(j.name_strref),
+            "text": text(j.text_strref),
+            "accepted": j.accepted,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 fn resolve(sim: &Sim, s: &str) -> Option<ObjectId> {
@@ -645,6 +672,9 @@ impl Server {
                     sim.choose_reply(n);
                     sim.tick(0);
                     out.push(json!({ "selected_response": n, "conversation": dialog_json(sim) }));
+                } else if sim.gui_message(name, args) {
+                    sim.tick(0);
+                    out.push(json!({ "message": name, "args": args, "board": board_json(sim) }));
                 }
             }
         }
@@ -1403,6 +1433,28 @@ impl Server {
             }
             sim.world.party_choice = (!ids.is_empty()).then_some(ids.clone());
             Ok(json!({ "party_choice": ids }))
+        })
+    }
+
+    #[tool(
+        description = "The open job board (Chantry board or guild box, ShowChantersGUI): its jobs with their text and whether each is taken. accept takes a job by index; close closes the board. Same messages the board's movie sends."
+    )]
+    async fn job_board(&self, Parameters(a): Parameters<BoardArgs>) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            if sim.world.chanter_board.is_none() {
+                return Ok(json!({ "board": null }));
+            }
+            let mut taken = None;
+            if let Some(i) = a.accept {
+                taken = Some(sim.gui_message(thedas_sim::chanters::MSG_ACCEPT, &[i.to_string()]));
+                sim.tick(0);
+            }
+            let board = board_json(sim);
+            if a.close == Some(true) {
+                sim.gui_message(thedas_sim::chanters::MSG_CLEAR, &[]);
+            }
+            Ok(json!({ "accepted": taken, "board": board, "closed": a.close == Some(true) }))
         })
     }
 

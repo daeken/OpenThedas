@@ -28,6 +28,8 @@ pub struct PlotInfo {
     /// Each flag's reward id (field 13003, a row of the rewards table; 0 for none), as
     /// `GetPlotFlagRewardId` answers it. Provisional: the field is inferred from the data.
     pub rewards: BTreeMap<i32, i32>,
+    /// Each flag's journal text (field 13004, a talk-table id).
+    pub journal: BTreeMap<i32, u32>,
 }
 
 #[derive(Default)]
@@ -65,6 +67,7 @@ pub fn plots_from_gff4(g: &Gff4, resref: &str) -> Vec<PlotInfo> {
         let Some(guid) = s(g, p, 13007) else { continue };
         let mut flags = BTreeMap::new();
         let mut rewards = BTreeMap::new();
+        let mut journal = BTreeMap::new();
         for f in structs(g, p, 13000) {
             if let (Some(id), Some(name)) =
                 (g.field(f, 13001).and_then(|v| v.as_i64()), s(g, f, 13002))
@@ -76,6 +79,11 @@ pub fn plots_from_gff4(g: &Gff4, resref: &str) -> Vec<PlotInfo> {
                     .filter(|&r| r != 0)
                 {
                     rewards.insert(id as i32, r as i32);
+                }
+                if let Some(Value::Tlk(t)) = g.field(f, 13004) {
+                    if t.id != u32::MAX {
+                        journal.insert(id as i32, t.id);
+                    }
                 }
             }
         }
@@ -90,6 +98,7 @@ pub fn plots_from_gff4(g: &Gff4, resref: &str) -> Vec<PlotInfo> {
             name_strref,
             flags,
             rewards,
+            journal,
         });
     }
     out
@@ -118,9 +127,12 @@ impl Plots {
     pub fn get(&mut self, vfs: &Vfs, key: &str) -> Option<Arc<PlotInfo>> {
         self.load(vfs);
         let k = key.trim().trim_end_matches('\0');
+        // Tables name plots without the file prefix (`lot100pt_bears` for
+        // `plt_lot100pt_bears.plo`).
         self.by_key
             .get(&k.to_ascii_uppercase())
             .or_else(|| self.by_key.get(&k.to_ascii_lowercase()))
+            .or_else(|| self.by_key.get(&format!("plt_{}", k.to_ascii_lowercase())))
             .cloned()
     }
 }
