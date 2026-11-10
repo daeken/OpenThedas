@@ -28,7 +28,8 @@ pub struct PlotInfo {
     /// Each flag's reward id (field 13003, a row of the rewards table; 0 for none), as
     /// `GetPlotFlagRewardId` answers it. Provisional: the field is inferred from the data.
     pub rewards: BTreeMap<i32, i32>,
-    /// Each flag's journal text (field 13004, a talk-table id).
+    /// Each flag's journal text (field 13004, a talk-table id). Provisional: the field is
+    /// inferred from the data.
     pub journal: BTreeMap<i32, u32>,
 }
 
