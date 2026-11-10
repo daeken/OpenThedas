@@ -228,29 +228,44 @@ impl Vfs {
             .unwrap_or_default()
     }
 
-    /// Reads the winning version of a resource.
-    pub fn read(&self, name: &str) -> Result<(Vec<u8>, Provenance)> {
-        let hits = self
-            .index
-            .get(&normalize_name(name))
-            .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        let &(layer, slot) = hits
-            .last()
-            .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        let data = match (&self.layers[layer].source, slot) {
+    fn read_slot(&self, layer: usize, slot: Slot) -> Result<Vec<u8>> {
+        match (&self.layers[layer].source, slot) {
             (LayerSource::Archive { erf, key }, Slot::Entry(i)) => {
-                erf.read(&erf.entries[i], key.as_ref())?
+                erf.read(&erf.entries[i], key.as_ref())
             }
             (LayerSource::Directory { .. } | LayerSource::Files, Slot::File(i)) => {
                 let path = &self.dir_files[layer][i].1;
                 std::fs::read(path).map_err(|e| Error::Io {
                     path: path.clone(),
                     source: e,
-                })?
+                })
             }
             _ => unreachable!("slot kind always matches layer kind"),
-        };
-        Ok((data, self.provenance(layer, slot)))
+        }
+    }
+
+    /// Reads the winning version of a resource.
+    ///
+    /// When the winner is an encrypted archive entry we have no key for (DLC archives that
+    /// shadow core files), the next layer down is tried instead, and the returned provenance
+    /// names the layer that actually supplied the data. With every DLC key available this
+    /// is the original's lookup; without keys it is the closest readable approximation.
+    pub fn read(&self, name: &str) -> Result<(Vec<u8>, Provenance)> {
+        let hits = self
+            .index
+            .get(&normalize_name(name))
+            .ok_or_else(|| Error::NotFound(name.to_string()))?;
+        let mut first_err = None;
+        for &(layer, slot) in hits.iter().rev() {
+            match self.read_slot(layer, slot) {
+                Ok(data) => return Ok((data, self.provenance(layer, slot))),
+                Err(e @ Error::Encrypted { .. }) => {
+                    first_err.get_or_insert(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(first_err.unwrap_or_else(|| Error::NotFound(name.to_string())))
     }
 
     /// All visible names, sorted.
@@ -361,5 +376,49 @@ mod tests {
         assert_eq!(vfs.len(), 1);
         vfs.truncate(10);
         assert_eq!(vfs.len(), 1);
+    }
+
+    /// An ERF V2.2 archive flagged as DA:O Blowfish-encrypted, holding one entry.
+    fn encrypted_erf(name: &str, data: &[u8]) -> Vec<u8> {
+        let utf16 = |s: &str, n: usize| {
+            let mut v: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            v.resize(n, 0);
+            v
+        };
+        let mut out = utf16("ERF V2.2", 16);
+        out.extend(1u32.to_le_bytes()); // count
+        out.extend(109u32.to_le_bytes()); // year
+        out.extend(1u32.to_le_bytes()); // day
+        out.extend(0xFFFF_FFFFu32.to_le_bytes());
+        out.extend((2u32 << 4).to_le_bytes()); // Blowfish (DA:O)
+        out.extend(0u32.to_le_bytes()); // module id
+        out.extend([0u8; 16]); // password digest
+        let offset = out.len() + 76;
+        out.extend(utf16(name, 64));
+        out.extend((offset as u32).to_le_bytes());
+        out.extend((data.len() as u32).to_le_bytes());
+        out.extend((data.len() as u32).to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    #[test]
+    fn falls_back_past_encrypted_entries() {
+        let base = std::env::temp_dir().join(format!("thedas-vfs-enc-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("tex.dds"), b"core").unwrap();
+        let dlc = base.join("dlc.erf");
+        std::fs::write(&dlc, encrypted_erf("tex.dds", &[0u8; 8])).unwrap();
+        std::fs::write(base.join("only.erf"), encrypted_erf("only.dds", &[0u8; 8])).unwrap();
+
+        let mut vfs = Vfs::new();
+        vfs.push_files(&[base.join("tex.dds")], "core");
+        vfs.push_archive(&dlc, "dlc").unwrap();
+        vfs.push_archive(base.join("only.erf"), "only").unwrap();
+        assert_eq!(vfs.lookup("tex.dds").unwrap().layer_label, "dlc");
+        let (data, prov) = vfs.read("tex.dds").unwrap();
+        assert_eq!(data, b"core");
+        assert_eq!(prov.layer_label, "core");
+        assert!(matches!(vfs.read("only.dds"), Err(Error::Encrypted { .. })));
     }
 }
