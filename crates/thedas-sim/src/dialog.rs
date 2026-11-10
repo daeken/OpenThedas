@@ -18,7 +18,7 @@ use thedas_script::vm::{OBJECT_INVALID, ObjectId, Value as V};
 use crate::sim::Sim;
 use crate::trace::TraceEntry;
 
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlotRef {
     pub plot: Option<String>,
     pub flag: i32,
@@ -33,7 +33,7 @@ impl PlotRef {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Node {
     pub reply: bool,
     pub strref: Option<u32>,
@@ -45,7 +45,7 @@ pub struct Node {
     pub children: Vec<usize>,
 }
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Dlg {
     pub name: String,
     pub starts: Vec<usize>,
@@ -144,7 +144,7 @@ impl Dlg {
 }
 
 /// A conversation in progress.
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Conversation {
     pub dlg: Dlg,
     pub owner: ObjectId,

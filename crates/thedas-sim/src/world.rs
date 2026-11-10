@@ -8,12 +8,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thedas_script::vm::{OBJECT_INVALID, ObjectId};
 
 use crate::trace::{Trace, TraceEntry};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ObjectKind {
     Module,
     Area,
@@ -49,7 +49,7 @@ impl ObjectKind {
 }
 
 /// Local variables (`VarTable` in templates and instances, `SetLocal*` from scripts).
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Locals {
     pub ints: BTreeMap<String, i32>,
     pub floats: BTreeMap<String, f32>,
@@ -59,7 +59,7 @@ pub struct Locals {
     pub locations: BTreeMap<String, Location>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Location {
     pub area: ObjectId,
     pub position: [f32; 3],
@@ -67,7 +67,7 @@ pub struct Location {
     pub facing: f32,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Object {
     pub id: ObjectId,
     pub kind: ObjectKind,
@@ -148,7 +148,7 @@ impl Object {
 }
 
 /// An event as scripts see it: a type plus parameter lists.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub ty: i32,
     pub creator: Option<ObjectId>,
@@ -163,7 +163,7 @@ pub struct Event {
 
 /// A queued command (`AddCommand`). Provisional: commands complete as soon as the executor
 /// reaches them, except `Wait`, which lasts its duration.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Command {
     /// `COMMAND_TYPE_*`.
     pub ty: i32,
@@ -175,7 +175,7 @@ pub struct Command {
     pub strings: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Effect {
     pub ty: i32,
     pub creator: Option<ObjectId>,
@@ -189,7 +189,7 @@ pub struct Effect {
 }
 
 /// Engine structures held by handle (scripts copy handles; every `Set*` makes a new one).
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum EngineData {
     Event(Event),
     Location(Location),
@@ -197,7 +197,7 @@ pub enum EngineData {
     Effect(Effect),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QueuedEvent {
     pub target: ObjectId,
     pub event: Event,
@@ -206,7 +206,7 @@ pub struct QueuedEvent {
 }
 
 /// A small, fast, deterministic generator (xorshift64*).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Rng(u64);
 
 impl Rng {
@@ -234,13 +234,17 @@ impl Rng {
     }
 }
 
-#[derive(Clone)]
+/// Everything a save holds. The trace and the tables are not saved: the trace starts afresh
+/// and the tables come from the resources of the simulation that loads the save.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct World {
     pub time_ms: u64,
     pub objects: BTreeMap<ObjectId, Object>,
     next_id: ObjectId,
+    #[serde(with = "sorted")]
     pub handles: HashMap<u64, EngineData>,
     next_handle: u64,
+    #[serde(with = "pairs")]
     pub queue: BTreeMap<(u64, u64), QueuedEvent>,
     next_seq: u64,
     pub module: Option<ObjectId>,
@@ -248,11 +252,65 @@ pub struct World {
     pub hero: Option<ObjectId>,
     pub party: Option<ObjectId>,
     /// Plot flags by (plot resource, flag).
+    #[serde(with = "pairs")]
     pub plots: BTreeMap<(String, i32), bool>,
     pub game_mode: i32,
     pub rng: Rng,
+    #[serde(skip)]
     pub trace: Trace,
+    #[serde(skip, default = "no_tables")]
     pub(crate) tables: Arc<crate::m2da::Tables>,
+}
+
+fn no_tables() -> Arc<crate::m2da::Tables> {
+    Arc::new(crate::m2da::Tables::empty())
+}
+
+/// Maps with tuple keys, as a list of pairs (JSON keys must be strings).
+mod pairs {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<K: Serialize, V: Serialize, S: Serializer>(
+        m: &BTreeMap<K, V>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        s.collect_seq(m.iter())
+    }
+
+    pub fn deserialize<'de, K, V, D>(d: D) -> Result<BTreeMap<K, V>, D::Error>
+    where
+        K: Deserialize<'de> + Ord,
+        V: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        Ok(Vec::<(K, V)>::deserialize(d)?.into_iter().collect())
+    }
+}
+
+/// Hash maps in key order, so saves are byte-for-byte deterministic.
+mod sorted {
+    use std::collections::{BTreeMap, HashMap};
+    use std::hash::Hash;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<K: Serialize + Ord, V: Serialize, S: Serializer>(
+        m: &HashMap<K, V>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        m.iter().collect::<BTreeMap<_, _>>().serialize(s)
+    }
+
+    pub fn deserialize<'de, K, V, D>(d: D) -> Result<HashMap<K, V>, D::Error>
+    where
+        K: Deserialize<'de> + Eq + Hash + Ord,
+        V: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        Ok(BTreeMap::<K, V>::deserialize(d)?.into_iter().collect())
+    }
 }
 
 impl World {
