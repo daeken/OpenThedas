@@ -421,6 +421,154 @@ struct App {
     control: Option<control::Control>,
     /// Clients' input still playing, first come first played.
     remote: VecDeque<Remote>,
+    /// Clients waiting for the next presented frame, and how much smaller they want it.
+    frame_requests: Vec<(std::sync::mpsc::Sender<J>, u32)>,
+}
+
+/// A presented frame being copied out: the buffer and its size and row pitch.
+struct FrameReadback {
+    buffer: wgpu::Buffer,
+    width: u32,
+    height: u32,
+    row: u32,
+}
+
+/// Copies the frame `texture` (as drawn so far by `encoder`) into a buffer to read.
+fn read_frame(
+    ctx: &GpuContext,
+    encoder: &mut wgpu::CommandEncoder,
+    texture: &wgpu::Texture,
+) -> FrameReadback {
+    let (width, height) = (texture.width(), texture.height());
+    let row = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+        * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("frame readback"),
+        size: row as u64 * height as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    FrameReadback {
+        buffer,
+        width,
+        height,
+        row,
+    }
+}
+
+/// The copied frame, as opaque RGBA.
+fn finish_read_frame(
+    ctx: &GpuContext,
+    r: FrameReadback,
+    format: wgpu::TextureFormat,
+) -> Result<thedas_ui::Rgba> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    r.buffer.slice(..).map_async(wgpu::MapMode::Read, move |m| {
+        let _ = tx.send(m);
+    });
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|e| anyhow::anyhow!("reading the frame back: {e}"))?;
+    rx.recv()?
+        .map_err(|e| anyhow::anyhow!("reading the frame back: {e}"))?;
+    let bgra = matches!(
+        format,
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+    );
+    let mapped = r
+        .buffer
+        .slice(..)
+        .get_mapped_range()
+        .map_err(|e| anyhow::anyhow!("reading the frame back: {e:?}"))?;
+    let mut pixels = Vec::with_capacity((r.width * r.height * 4) as usize);
+    for y in 0..r.height as usize {
+        let line = &mapped[y * r.row as usize..][..r.width as usize * 4];
+        for p in line.chunks_exact(4) {
+            let (red, blue) = if bgra { (p[2], p[0]) } else { (p[0], p[2]) };
+            pixels.extend_from_slice(&[red, p[1], blue, 255]);
+        }
+    }
+    Ok(thedas_ui::Rgba {
+        width: r.width,
+        height: r.height,
+        pixels,
+    })
+}
+
+/// A presented frame as a control reply: a PNG in base64, `scale` times smaller (blocks
+/// averaged), with the window's size.
+fn frame_reply(frame: &thedas_ui::Rgba, scale: u32) -> Result<J> {
+    let small = shrink(frame, scale);
+    let png = thedas_ui::stage::encode_png(&small).context("encoding the frame")?;
+    use base64::Engine as _;
+    Ok(json!({
+        "ok": true,
+        "width": frame.width,
+        "height": frame.height,
+        "scale": scale,
+        "presented": true,
+        "png": base64::engine::general_purpose::STANDARD.encode(png),
+    }))
+}
+
+/// `img` made `k` times smaller in each direction by averaging `k` x `k` blocks.
+fn shrink(img: &thedas_ui::Rgba, k: u32) -> thedas_ui::Rgba {
+    let k = k.max(1);
+    let (w, h) = ((img.width / k).max(1), (img.height / k).max(1));
+    if k == 1 {
+        return thedas_ui::Rgba {
+            width: img.width,
+            height: img.height,
+            pixels: img.pixels.clone(),
+        };
+    }
+    let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let mut sum = [0u32; 4];
+            let mut n = 0;
+            for dy in 0..k {
+                for dx in 0..k {
+                    let (sx, sy) = (x * k + dx, y * k + dy);
+                    if sx >= img.width || sy >= img.height {
+                        continue;
+                    }
+                    let i = ((sy * img.width + sx) * 4) as usize;
+                    for (c, s) in sum.iter_mut().enumerate() {
+                        *s += img.pixels.get(i + c).copied().unwrap_or(0) as u32;
+                    }
+                    n += 1;
+                }
+            }
+            pixels.extend(sum.map(|s| (s / n.max(1)) as u8));
+        }
+    }
+    thedas_ui::Rgba {
+        width: w,
+        height: h,
+        pixels,
+    }
 }
 
 /// Steps a client sent, playing.
@@ -466,6 +614,10 @@ impl App {
             config.format = *f;
         }
         config.present_mode = wgpu::PresentMode::AutoVsync;
+        // The control channel's screenshots read the presented frame back.
+        if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+            config.usage |= wgpu::TextureUsages::COPY_SRC;
+        }
         surface.configure(&ctx.device, &config);
         let renderer = match &self.loaded.scene {
             Some(scene) => {
@@ -564,6 +716,16 @@ impl App {
                 live.step(dt);
             }
             live.sync(&g.ctx, g.config.format)?;
+            // Portraits are drawn by the objects' renderers, whose constants this frame's
+            // draws use too: they are drawn (and submitted) before the frame is encoded, so
+            // the frame is not drawn from the portrait camera.
+            if self.screens.is_some() {
+                let party = thedas_sim::engine::party_of(&live.sim());
+                if g.ui.wants_portraits(party, dt) {
+                    let shots = live.portraits(&g.ctx, ui::PORTRAIT_SIZE);
+                    g.ui.set_portraits(shots);
+                }
+            }
         }
         let size = (g.config.width, g.config.height);
         let drawn = match (self.live.as_mut(), g.renderer.as_mut()) {
@@ -596,11 +758,6 @@ impl App {
             (Some(screens), Some(live)) => {
                 let level = live.level.as_ref();
                 g.ui.set_level(level.map(|l| l.layout.as_str()), level.map(|l| &l.vfs));
-                let party = thedas_sim::engine::party_of(&live.sim());
-                if g.ui.wants_portraits(party, dt) {
-                    let shots = live.portraits(&g.ctx, ui::PORTRAIT_SIZE);
-                    g.ui.set_portraits(shots);
-                }
                 for aim in g.ui.play(screens, &live.sim, dt.min(100.0)) {
                     log::info!("aiming ability {} (click a target)", aim.ability);
                     live.aiming = Some(aim);
@@ -620,7 +777,18 @@ impl App {
                 .draw(&g.ctx.device, &mut encoder, &view, size, &lines);
         }
         g.ui.composite(&mut encoder, &view, g.config.format);
+        let readback = (!self.frame_requests.is_empty())
+            .then(|| read_frame(&g.ctx, &mut encoder, &frame.texture));
         g.ctx.queue.submit([encoder.finish()]);
+        if let Some(readback) = readback {
+            let frame = finish_read_frame(&g.ctx, readback, g.config.format);
+            for (reply, scale) in self.frame_requests.drain(..) {
+                let _ = reply.send(match &frame {
+                    Ok(f) => frame_reply(f, scale).unwrap_or_else(control::failure),
+                    Err(e) => control::failure(e),
+                });
+            }
+        }
         g.window.pre_present_notify();
         g.ctx.queue.present(frame);
         Ok(())
@@ -895,7 +1063,20 @@ impl App {
             let cmd = r.body["cmd"].as_str().unwrap_or_default().to_string();
             let answer = match cmd.as_str() {
                 "status" => Some(self.status()),
-                "screenshot" => Some(self.screenshot().unwrap_or_else(control::failure)),
+                // The frame as presented, read back as the next one is drawn; a surface that
+                // cannot be read back is drawn again offscreen instead.
+                "screenshot" => match self
+                    .gfx
+                    .as_ref()
+                    .map(|g| g.config.usage.contains(wgpu::TextureUsages::COPY_SRC))
+                {
+                    Some(true) => {
+                        let scale = r.body["scale"].as_u64().unwrap_or(1).clamp(1, 16) as u32;
+                        self.frame_requests.push((r.reply.clone(), scale));
+                        None
+                    }
+                    _ => Some(self.screenshot().unwrap_or_else(control::failure)),
+                },
                 "state" => Some(match self.live.as_ref().map(|l| l.sim().save_json()) {
                     Some(Ok(bytes)) => json!({
                         "ok": true,
@@ -1553,6 +1734,7 @@ fn main() -> Result<()> {
         swallow_release: false,
         control,
         remote: VecDeque::new(),
+        frame_requests: Vec::new(),
     };
     event_loop.run_app(&mut app)?;
     match app.error {
@@ -1564,6 +1746,19 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shrinks_frames_by_averaging_blocks() {
+        let img = thedas_ui::Rgba {
+            width: 4,
+            height: 2,
+            pixels: [[0, 0, 0, 255], [200, 100, 0, 255]].repeat(4).concat(),
+        };
+        let small = shrink(&img, 2);
+        assert_eq!((small.width, small.height), (2, 1));
+        assert_eq!(&small.pixels[..4], &[100, 50, 0, 255]);
+        assert_eq!(shrink(&img, 1).pixels, img.pixels);
+    }
 
     #[test]
     fn parses_steps() {

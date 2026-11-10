@@ -8,8 +8,9 @@
 //! - `input` with `"steps"`: input played into the game in order, in `--steps` syntax
 //!   (`click X,Y; run MS; key i; ...`). The reply comes once every step has played, `run`
 //!   steps taking that long in the game's own frames.
-//! - `screenshot`: the frame as the player sees it (world, reticle and interface), a PNG in
-//!   base64 under `"png"`.
+//! - `screenshot`: the frame as the player sees it, read back from the window as it is
+//!   presented (`"presented": true`; drawn again offscreen where the window's surface cannot
+//!   be read), a PNG in base64 under `"png"`. `"scale": k` makes it `k` times smaller.
 //! - `state`: the simulation's save (the JSON `thedas-mcp`'s `save_state` writes) under
 //!   `"save"`, as a string.
 //!
