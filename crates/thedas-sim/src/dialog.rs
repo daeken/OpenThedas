@@ -185,6 +185,8 @@ pub struct OpenLine<'a> {
     pub line: Option<usize>,
     pub owner: ObjectId,
     pub player: ObjectId,
+    /// Whether the player has replies to choose among (not only an unspoken continue).
+    pub choosing: bool,
 }
 
 /// What a conversation looks like to a player: the current line and the choices.
@@ -430,6 +432,10 @@ impl Sim {
             line: c.line,
             owner: c.owner,
             player: c.player,
+            choosing: c
+                .replies
+                .iter()
+                .any(|&r| !self.node_text(&c.dlg.nodes[r]).trim().is_empty()),
         })
     }
 

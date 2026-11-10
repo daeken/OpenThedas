@@ -8,11 +8,14 @@
 //! creatures are drawn at their marks; the simulation keeps them where they were, and they
 //! are drawn there again when the conversation ends.
 //!
+//! Once a line with its own cinematics has run its length (the cut's, 5000) and the player
+//! has replies to choose, the view moves to the stage's `decision` camera.
+//!
 //! Provisional: the stage is the area stage with the line's tag nearest the conversation's
 //! owner (a tag can be placed more than once); the camera's field of view is taken as
 //! vertical; whether the original moves the creatures themselves (so that they stay on
 //! their marks afterwards) is not traced; the original's camera moves between and within
-//! lines, the decision camera while the player chooses and lines staged at the speaker's
+//! lines and lines staged at the speaker's
 //! current location (`StageAtCurrentLocation`) are not followed.
 
 use std::collections::HashMap;
@@ -30,17 +33,28 @@ use thedas_sim::world::{Object, ObjectKind};
 #[derive(Clone, Debug, PartialEq)]
 pub struct Staged {
     pub camera: Camera,
+    /// The stage's `decision` camera, which frames the player choosing a reply.
+    pub decision: Option<Camera>,
+    /// How long the line's cinematics run (milliseconds), when it has its own.
+    pub line_ms: Option<f64>,
     /// Each actor drawn at its mark: world position and facing (degrees, as objects').
     pub marks: HashMap<ObjectId, ([f32; 3], f32)>,
 }
+
+/// Which conversation line: the conversation (dialog name, owner) and the node shown.
+type LineKey = ((String, ObjectId), Option<usize>);
 
 /// Line shots and stages read so far, and the staging in use.
 #[derive(Default)]
 pub struct TalkCamera {
     shots: HashMap<String, Option<Arc<Vec<Option<LineShot>>>>>,
     stages: HashMap<String, Option<Arc<Stage>>>,
-    /// The conversation (dialog name, owner) and the staging its last staged line took.
-    held: Option<((String, ObjectId), Staged)>,
+    /// The line whose staging is held (the last staged line) and that staging.
+    held: Option<(LineKey, Staged)>,
+    /// The presentation clock (milliseconds; it runs while the world is stopped too).
+    clock_ms: f64,
+    /// The line shown and when it came up on the clock.
+    shown: Option<(LineKey, f64)>,
 }
 
 impl TalkCamera {
@@ -49,27 +63,57 @@ impl TalkCamera {
     pub fn staging(&mut self, sim: &Sim, base: &Camera) -> Option<&Staged> {
         let Some(open) = sim.conversation_line() else {
             self.held = None;
+            self.shown = None;
             return None;
         };
-        let key = (open.dialog.to_ascii_lowercase(), open.owner);
-        if self.held.as_ref().is_some_and(|(k, _)| *k != key) {
+        let conversation = (open.dialog.to_ascii_lowercase(), open.owner);
+        if self
+            .held
+            .as_ref()
+            .is_some_and(|((c, _), _)| *c != conversation)
+        {
             self.held = None;
         }
+        let line = (conversation, open.line);
+        if self.shown.as_ref().is_none_or(|(l, _)| *l != line) {
+            self.shown = Some((line.clone(), self.clock_ms));
+        }
         let shot = open.line.and_then(|l| {
-            let shots = self.shots(sim, &key.0)?;
+            let shots = self.shots(sim, &line.0.0)?;
             shots.get(l).cloned().flatten()
         });
         if let Some(shot) = shot
             && let Some(staged) = self.stage_line(sim, &shot, &open, base)
         {
-            self.held = Some((key, staged));
+            self.held = Some((line, staged));
         }
         self.held.as_ref().map(|(_, s)| s)
     }
 
-    /// [`TalkCamera::staging`]'s camera.
+    /// Advances the presentation clock.
+    pub fn advance(&mut self, dt_ms: f64) {
+        self.clock_ms += dt_ms.max(0.0);
+    }
+
+    /// The camera for the open conversation: the line's shot, or the stage's decision camera
+    /// once a line with its own cinematics has run its length and the player has replies
+    /// to choose. Provisional: the original's line length is its voice-over's; the cut's
+    /// length (5000) is taken instead, and lines without one keep their shot.
     pub fn camera(&mut self, sim: &Sim, base: &Camera) -> Option<Camera> {
-        self.staging(sim, base).map(|s| s.camera)
+        let choosing = sim.conversation_line().is_some_and(|o| o.choosing);
+        let now = self.clock_ms;
+        let shown = self.shown.clone();
+        let staged = self.staging(sim, base)?.clone();
+        let line_done = match (&self.held, shown) {
+            (Some((held, _)), Some((line, since))) if *held == line => {
+                staged.line_ms.is_some_and(|ms| now - since >= ms)
+            }
+            _ => false,
+        };
+        Some(match staged.decision {
+            Some(d) if choosing && line_done => d,
+            _ => staged.camera,
+        })
     }
 
     fn shots(&mut self, sim: &Sim, dlg: &str) -> Option<Arc<Vec<Option<LineShot>>>> {
@@ -134,6 +178,10 @@ impl TalkCamera {
         }
         Some(Staged {
             camera: place_camera(placed.position, placed.facing, cam, base),
+            decision: stage
+                .camera("decision")
+                .map(|d| place_camera(placed.position, placed.facing, d, base)),
+            line_ms: shot.seconds.map(|s| s as f64 * 1000.0),
             marks,
         })
     }

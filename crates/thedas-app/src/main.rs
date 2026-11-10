@@ -741,6 +741,7 @@ impl App {
             if !stopped {
                 live.step(dt);
             }
+            live.advance_presentation(dt);
             live.sync(&g.ctx, g.config.format)?;
             // Portraits are drawn by the objects' renderers, whose constants this frame's
             // draws use too: they are drawn (and submitted) before the frame is encoded, so
@@ -1708,6 +1709,7 @@ fn main() -> Result<()> {
                             if !played.as_ref().is_some_and(|(_, s)| s.world_stopped()) {
                                 l.step(dt);
                             }
+                            l.advance_presentation(dt);
                             // As the window does: the drawn scenes follow the world (objects
                             // that come and go are rebuilt).
                             l.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
