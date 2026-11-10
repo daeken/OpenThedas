@@ -28,6 +28,10 @@ pub mod field {
     pub const LIGHT_RADIUS: u32 = 6008;
     pub const AMBIENT_COLOR: u32 = 6010;
     pub const LIGHT_KIND: u32 = 6296;
+    /// A skeleton node's bone index.
+    pub const BONE_INDEX: u32 = 6254;
+    /// A skinned mesh's palette: the bone index each of its vertices' blend indices names.
+    pub const MESH_BONES: u32 = 6255;
 }
 
 pub const KIND_TRANSLATION: FourCC = FourCC::new(b"trsl");
@@ -53,6 +57,9 @@ pub enum Light {
     },
 }
 
+/// A palette entry naming no bone.
+pub const NO_BONE: u32 = u32::MAX;
+
 /// What a mesh node draws.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MeshRef {
@@ -62,6 +69,9 @@ pub struct MeshRef {
     pub material: String,
     /// Matched against [`crate::level::LightmapBinding::chunk`].
     pub lightmap_id: Option<String>,
+    /// For a skinned mesh, the bone index (a skeleton node's [`Node::bone`]) that each
+    /// value of its vertices' blend indices stands for; empty for rigid meshes.
+    pub bones: Vec<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -72,6 +82,8 @@ pub struct Node {
     pub transform: Transform,
     pub mesh: Option<MeshRef>,
     pub light: Option<Light>,
+    /// The node's bone index, for skeleton nodes.
+    pub bone: Option<u32>,
     pub children: Vec<Node>,
 }
 
@@ -236,6 +248,20 @@ fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>
                 lightmap_id: d
                     .opt_str(id, field::MESH_LIGHTMAP_ID)?
                     .filter(|s| !s.is_empty()),
+                bones: d
+                    .numbers(id, field::MESH_BONES)?
+                    .into_iter()
+                    .map(|b| {
+                        if b.is_finite() && b >= 0.0 && b <= u16::MAX as f32 {
+                            Ok(b as u32)
+                        } else if b.is_finite() && b < 0.0 {
+                            // No bone: never matches a skeleton node, so stays at rest.
+                            Ok(NO_BONE)
+                        } else {
+                            Err(TypedError::Invalid(format!("mmh: bone index {b}")))
+                        }
+                    })
+                    .collect::<TypedResult<_>>()?,
             }),
             None => None,
         }
@@ -263,6 +289,13 @@ fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>
         transform,
         mesh,
         light,
+        // Negative (-1) marks a node that is not a bone.
+        bone: match d.opt_i64(id, field::BONE_INDEX)? {
+            Some(b) if (0..=u16::MAX as i64).contains(&b) => Some(b as u32),
+            Some(b) if b < 0 => None,
+            Some(b) => return Err(TypedError::Invalid(format!("mmh: bone index {b}"))),
+            None => None,
+        },
         children,
     }))
 }
@@ -295,6 +328,10 @@ mod tests {
                 (field::MESH_MATERIAL, s("wall_master")),
                 (field::MESH_LIGHTMAP_ID, s("_7u")),
                 (field::MESH_CHUNK, s("MshMain_wall")),
+                (
+                    field::MESH_BONES,
+                    Value::List(Some(crate::gff4::List::U32(vec![5, 52, 0]))),
+                ),
                 (field::CHILDREN, generic(&[t2])),
             ],
         );
@@ -305,6 +342,7 @@ mod tests {
             b"node",
             vec![
                 (field::NAME, s("GOB")),
+                (field::BONE_INDEX, Value::I32(7)),
                 (field::CHILDREN, generic(&[t1, r1, bbox, mesh, group])),
             ],
         );
@@ -327,6 +365,8 @@ mod tests {
         assert_eq!(pieces.len(), 1);
         assert_eq!(pieces[0].mesh.material, "wall_master");
         assert_eq!(pieces[0].mesh.lightmap_id.as_deref(), Some("_7u"));
+        assert_eq!(pieces[0].mesh.bones, vec![5, 52, 0]);
+        assert_eq!(gob.bone, Some(7));
         assert_eq!(pieces[0].chain.len(), 2);
         assert_eq!(pieces[0].chain[1].position, [0.0, 0.0, 5.0]);
         assert!(mmh.lights().is_empty());

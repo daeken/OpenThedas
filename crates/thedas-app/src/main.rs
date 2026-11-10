@@ -84,6 +84,8 @@ struct Args {
 struct SimView {
     layout: String,
     props: Vec<thedas_render::Prop>,
+    /// Each prop's animation.
+    clips: Vec<Option<thedas_render::Clip>>,
     hero: Option<([f32; 3], f32)>,
 }
 
@@ -111,7 +113,19 @@ fn sim_view(
     }
     let area = sim.world.area.context("the simulation is in no area")?;
     let layout = sim.area_layout(area).context("the area has no layout")?;
-    let props = thedas_ui::models::area_models(&sim, area)
+    let models = thedas_ui::models::area_models(&sim, area);
+    let clips = models
+        .iter()
+        .map(|m| {
+            m.motion.as_ref().map(|c| thedas_render::Clip {
+                trees: c.trees.clone(),
+                action: c.action.clone(),
+                time: c.time,
+                looping: c.looping,
+            })
+        })
+        .collect();
+    let props = models
         .into_iter()
         .map(|m| thedas_render::Prop {
             label: format!("{} {}", m.id, m.tag),
@@ -131,6 +145,7 @@ fn sim_view(
     Ok(SimView {
         layout,
         props,
+        clips,
         hero,
     })
 }
@@ -166,6 +181,8 @@ struct Loaded {
     vfs: Arc<Vfs>,
     scene: Option<AreaScene>,
     shaders: String,
+    /// Each prop's placement and animation.
+    posed: Vec<(glam::Mat4, Option<thedas_render::Clip>)>,
 }
 
 impl Loaded {
@@ -204,6 +221,7 @@ fn load(
             vfs: Arc::new(vfs),
             scene: None,
             shaders: shaders.to_string(),
+            posed: Vec::new(),
         });
     }
     let level = match install.mount_level(&mut vfs, area) {
@@ -242,6 +260,7 @@ fn load(
         vfs: Arc::new(vfs),
         scene: Some(scene),
         shaders: shaders.to_string(),
+        posed: Vec::new(),
     })
 }
 
@@ -311,6 +330,14 @@ fn capture(
                 thedas_render::gpu::CAPTURE_FORMAT,
             );
             log_stats(&renderer);
+            thedas_render::Animator::default().pose_props(
+                &loaded.vfs,
+                scene,
+                &mut renderer,
+                &ctx,
+                &loaded.posed,
+                0.0,
+            );
             renderer.capture(&ctx, &camera, w, h)?
         }
         None => [0, 0, 0, 255].repeat(w as usize * h as usize),
@@ -350,6 +377,9 @@ struct Gfx {
 
 struct App {
     loaded: Loaded,
+    animator: thedas_render::Animator,
+    /// When the window opened: looping animations play from it.
+    started: Instant,
     ui: Vec<String>,
     cursor: (f64, f64),
     camera: Camera,
@@ -473,6 +503,17 @@ impl App {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
+        if let (Some(r), Some(scene)) = (g.renderer.as_mut(), self.loaded.scene.as_ref()) {
+            let elapsed = self.started.elapsed().as_secs_f32();
+            self.animator.pose_props(
+                &self.loaded.vfs,
+                scene,
+                r,
+                &g.ctx,
+                &self.loaded.posed,
+                elapsed,
+            );
+        }
         match &mut g.renderer {
             Some(r) => r.render(
                 &g.ctx,
@@ -662,7 +703,15 @@ fn main() -> Result<()> {
         Some(v) => (v.layout.as_str(), v.props.as_slice()),
         None => (args.area.as_str(), &[][..]),
     };
-    let loaded = load(&install, area, &args.shaders, props)?;
+    let mut loaded = load(&install, area, &args.shaders, props)?;
+    if let Some(v) = &view {
+        loaded.posed = v
+            .props
+            .iter()
+            .map(|p| p.transform)
+            .zip(v.clips.iter().cloned())
+            .collect();
+    }
     let hero = view.as_ref().and_then(|v| v.hero);
     let mut camera = match (&args.camera, &loaded.scene) {
         (Some(spec), _) => Camera::parse(spec).context("camera must be x,y,z,yaw,pitch")?,
@@ -687,6 +736,8 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::new()?;
     let mut app = App {
         loaded,
+        animator: thedas_render::Animator::default(),
+        started: Instant::now(),
         ui,
         cursor: (0.0, 0.0),
         camera,

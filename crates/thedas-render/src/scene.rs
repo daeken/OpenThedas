@@ -13,6 +13,8 @@ use thedas_formats::mesh::{DeclUsage, MeshChunk, Msh};
 use thedas_formats::morph::{Morph, MorphNode, slot as morph_slot};
 use thedas_formats::probe::IrradianceProbe;
 use thedas_formats::{Arl, Mmh, Rml};
+
+use crate::skeleton::Skeleton;
 use thedas_vfs::{Provenance, Vfs};
 
 #[derive(Debug, thiserror::Error)]
@@ -104,6 +106,19 @@ pub struct DrawItem {
     pub room: String,
     /// The irradiance probe lighting it ([`AreaScene::probes`]).
     pub probe: Option<usize>,
+    /// For a skinned mesh: how its vertices follow its model's skeleton.
+    pub skin: Option<DrawSkin>,
+}
+
+/// A skinned draw's bones.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DrawSkin {
+    /// The model's skeleton ([`AreaScene::skeletons`]).
+    pub skeleton: usize,
+    /// Per palette slot (the values of the mesh's blend indices), the skeleton node.
+    pub palette: Vec<Option<usize>>,
+    /// The mesh node's rest placement in the model.
+    pub mesh_node: Mat4,
 }
 
 /// A light placed in the level (from the room's `_ll` light model).
@@ -137,6 +152,10 @@ pub struct AreaScene {
     pub warnings: Vec<String>,
     /// The level's irradiance probes.
     pub probes: Vec<SceneProbe>,
+    /// The skeletons of the skinned models, one per model.
+    pub skeletons: Vec<Arc<Skeleton>>,
+    /// Each skeleton's model (without `.mmh`).
+    pub skeleton_models: Vec<String>,
     /// How many of `draws` are the level's own; the props' follow.
     pub static_draws: usize,
     /// The models the simulation placed, in the order given, with their draws.
@@ -189,9 +208,35 @@ pub struct PropDraws {
     /// Where the prop was placed when the scene loaded.
     pub transform: Mat4,
     pub draws: std::ops::Range<usize>,
+    /// Models hung from a node of the body: their draws follow that node.
+    pub attachments: Vec<PropAttachment>,
+}
+
+/// An attached model's draws and the body node they hang from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PropAttachment {
+    pub draws: std::ops::Range<usize>,
+    pub skeleton: usize,
+    pub node: usize,
 }
 
 impl AreaScene {
+    /// The skeletons a prop's draws and attachments use.
+    pub fn prop_skeletons(&self, prop: usize) -> Vec<usize> {
+        let Some(p) = self.props.get(prop) else {
+            return Vec::new();
+        };
+        let mut out: Vec<usize> = p
+            .draws
+            .clone()
+            .filter_map(|d| self.draws.get(d)?.skin.as_ref().map(|s| s.skeleton))
+            .chain(p.attachments.iter().map(|a| a.skeleton))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Every texture the scene references (material textures and lightmap atlases).
     pub fn textures(&self) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
@@ -244,6 +289,7 @@ struct Loader<'a> {
     mat_defs: HashMap<String, Option<Arc<MaterialDef>>>,
     material_index: HashMap<String, Option<usize>>,
     morphs: HashMap<String, Option<Arc<Morph>>>,
+    skeleton_index: HashMap<String, usize>,
 }
 
 impl<'a> Loader<'a> {
@@ -700,6 +746,20 @@ impl<'a> Loader<'a> {
                     })
             });
             let transform = placement * node;
+            let skin = (!piece.mesh.bones.is_empty()).then(|| {
+                let skeleton = self.skeleton(model_name, &model);
+                let s = &self.scene.skeletons[skeleton];
+                DrawSkin {
+                    skeleton,
+                    palette: piece
+                        .mesh
+                        .bones
+                        .iter()
+                        .map(|&b| s.node_of_bone(b))
+                        .collect(),
+                    mesh_node: node,
+                }
+            });
             let sphere = sphere.unwrap_or_else(|| {
                 let m = &self.scene.meshes[mesh];
                 let (lo, hi) = m.vertices.iter().fold(
@@ -721,8 +781,24 @@ impl<'a> Loader<'a> {
                 model: model_name.to_string(),
                 room: room.to_string(),
                 probe,
+                skin,
             });
         }
+    }
+
+    /// The skeleton of a model, built once.
+    fn skeleton(&mut self, model_name: &str, model: &Mmh) -> usize {
+        let key = model_name.to_ascii_lowercase();
+        if let Some(i) = self.skeleton_index.get(&key) {
+            return *i;
+        }
+        self.scene
+            .skeletons
+            .push(Arc::new(Skeleton::from_mmh(model)));
+        self.scene.skeleton_models.push(key.clone());
+        let i = self.scene.skeletons.len() - 1;
+        self.skeleton_index.insert(key, i);
+        i
     }
 }
 
@@ -770,6 +846,7 @@ impl AreaScene {
             mat_defs: HashMap::new(),
             material_index: HashMap::new(),
             morphs: HashMap::new(),
+            skeleton_index: HashMap::new(),
         };
         let arl_name = format!("{level}.arl");
         let arl = Arl::parse(&l.read(&arl_name)?).map_err(|e| SceneError::Parse {
@@ -843,19 +920,30 @@ impl AreaScene {
             for model in &prop.models {
                 l.place(model, prop.transform, placing(&prop.label));
             }
+            let mut attachments = Vec::new();
             for (model, node) in &prop.attached {
-                let chain = prop
-                    .models
-                    .iter()
-                    .find_map(|m| l.model(m).and_then(|mmh| mmh.node_chain(node)));
-                let Some(chain) = chain else {
+                let body = prop.models.iter().find_map(|m| {
+                    let mmh = l.model(m)?;
+                    let chain = mmh.node_chain(node)?;
+                    Some((m.clone(), mmh, chain))
+                });
+                let Some((body, mmh, chain)) = body else {
                     l.warn(format!("{}: no node {node} for {model}", prop.label));
                     continue;
                 };
                 let at = chain
                     .iter()
                     .fold(prop.transform, |m, t| m * transform_matrix(t));
+                let first = l.scene.draws.len();
                 l.place(model, at, placing(&prop.label));
+                let skeleton = l.skeleton(&body, &mmh);
+                if let Some(n) = l.scene.skeletons[skeleton].node(node) {
+                    attachments.push(PropAttachment {
+                        draws: first..l.scene.draws.len(),
+                        skeleton,
+                        node: n,
+                    });
+                }
             }
             if let Some(name) = &prop.morph {
                 if let Some(m) = l.morph(name) {
@@ -877,6 +965,7 @@ impl AreaScene {
                 label: prop.label.clone(),
                 transform: prop.transform,
                 draws: first..l.scene.draws.len(),
+                attachments,
             });
         }
         Ok(l.scene)
@@ -899,6 +988,7 @@ mod tests {
             mat_defs: HashMap::new(),
             material_index: HashMap::new(),
             morphs: HashMap::new(),
+            skeleton_index: HashMap::new(),
         };
         let vertex = |z: f32| Vertex {
             position: [0.0, 0.0, z],

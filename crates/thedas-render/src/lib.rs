@@ -11,13 +11,16 @@
 //!
 //! Presentation only: nothing here writes simulation state.
 
+pub mod animate;
 pub mod camera;
 pub mod d3d;
 mod d3d_gpu;
 pub mod gpu;
 pub mod material;
 pub mod scene;
+pub mod skeleton;
 
+pub use animate::{Animator, Clip};
 pub use camera::Camera;
 pub use gpu::{AreaRenderer, GpuContext};
 pub use material::{ProgramRegistry, ProgramSource};

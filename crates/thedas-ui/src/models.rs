@@ -42,6 +42,8 @@ pub struct ObjectModel {
     pub morph: Option<String>,
     /// A helmet hides the morph's hair and beard (provisional).
     pub hide_hair: bool,
+    /// What the creature's body is doing, for its skeleton.
+    pub motion: Option<Motion>,
     pub position: [f32; 3],
     /// The game's facing (degrees about Z; see `thedas_sim::world::heading_of`).
     pub facing: f32,
@@ -266,6 +268,108 @@ fn weapons(sim: &Sim, o: &Object) -> Vec<Attached> {
     .collect()
 }
 
+/// An animation to play: the action in the first of `trees` (`.anb`) that has it, at `time`
+/// seconds (wrapped when `looping`, else held at the end).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Motion {
+    pub trees: Vec<String>,
+    pub action: String,
+    pub time: f32,
+    pub looping: bool,
+}
+
+/// `apr_base.gda`'s animation trees: ambient and combat (column names not known), movement
+/// out of and in combat.
+pub const COL_AMBIENT_TREE: u32 = 0x5009_76ec;
+pub const COL_COMBAT_TREE: u32 = 0xde80_b418;
+
+/// Actions in the trees (from `humanoid.anb`, `combat_humanoid.anb`, `movement.anb`).
+pub mod action {
+    pub const PAUSE: &str = "pause";
+    pub const RUN: &str = "runf";
+    pub const ATTACK: &str = "attk_v1";
+    pub const DIE: &str = "die";
+}
+
+/// How long an attack plays when the script set no duration (milliseconds). Provisional.
+pub const DEFAULT_ATTACK_MS: u64 = 1500;
+
+/// What a creature's body is doing: dead (the death animation's last pose: when it died
+/// is not kept), attacking (the attack animation over the attack's duration), moving (a
+/// run), or standing (pause, the combat stance when fighting). Looping animations start at
+/// a different point per creature so a crowd does not move in step. Provisional: the
+/// original picks among variants (`attk_v1`..`v6`, weapon styles) that are not modelled.
+pub fn motion(sim: &Sim, o: &Object) -> Option<Motion> {
+    if o.kind != ObjectKind::Creature {
+        return None;
+    }
+    let t = sim.world.tables().get(0, "apr_base")?;
+    let app = o.appearance as i64;
+    let tree = |hash: u32| match t.cell_by_hash(hash, app) {
+        Some(Cell::String(s)) => {
+            let s = s.trim_end_matches('\0').trim().to_ascii_lowercase();
+            (!s.is_empty()).then_some(s)
+        }
+        _ => None,
+    };
+    let ambient = tree(COL_AMBIENT_TREE);
+    let combat = tree(COL_COMBAT_TREE);
+    let movement = text(t.cell("MovementTree", app)).map(|s| s.to_ascii_lowercase());
+    let combat_move = text(t.cell("CombatMoveTree", app)).map(|s| s.to_ascii_lowercase());
+    let now = sim.world.time_ms;
+    let secs = |ms: u64| ms as f32 / 1000.0;
+    let phase = (o.id % 97) as f32 * 0.37;
+    let trees = |list: &[&Option<String>]| -> Vec<String> {
+        list.iter().filter_map(|t| (*t).clone()).collect()
+    };
+    let fighting = o.combat.in_combat;
+    if o.dead {
+        return Some(Motion {
+            trees: trees(&[&ambient, &combat]),
+            action: action::DIE.into(),
+            time: f32::MAX,
+            looping: false,
+        });
+    }
+    if let Some(c) = o.commands.first() {
+        if c.from.is_some() {
+            let list = if fighting {
+                trees(&[&combat_move, &movement])
+            } else {
+                trees(&[&movement, &combat_move])
+            };
+            return Some(Motion {
+                trees: list,
+                action: action::RUN.into(),
+                time: secs(now) + phase,
+                looping: true,
+            });
+        }
+        if c.name == "CommandAttack" {
+            if let Some(due) = c.due {
+                let length = o.combat.attack_ms.unwrap_or(DEFAULT_ATTACK_MS);
+                let start = due.saturating_sub(length);
+                return Some(Motion {
+                    trees: trees(&[&combat, &ambient]),
+                    action: action::ATTACK.into(),
+                    time: secs(now.saturating_sub(start)),
+                    looping: false,
+                });
+            }
+        }
+    }
+    Some(Motion {
+        trees: if fighting {
+            trees(&[&combat, &ambient])
+        } else {
+            trees(&[&ambient, &combat])
+        },
+        action: action::PAUSE.into(),
+        time: secs(now) + phase,
+        looping: true,
+    })
+}
+
 /// Every active creature and placeable in `area` that has a model, in id order.
 pub fn area_models(sim: &Sim, area: ObjectId) -> Vec<ObjectModel> {
     sim.world
@@ -283,6 +387,7 @@ pub fn area_models(sim: &Sim, area: ObjectId) -> Vec<ObjectModel> {
                 attached: d.attached,
                 morph: d.morph,
                 hide_hair: d.hide_hair,
+                motion: motion(sim, o),
                 position: o.position,
                 facing: o.facing,
             })

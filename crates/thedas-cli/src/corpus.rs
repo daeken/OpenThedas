@@ -523,6 +523,9 @@ fn check_data(
         (_, "mmh") => Some(s(Mmh::from_gff4(&doc).map(|_| ()))),
         (_, "mor") => Some(s(thedas_formats::morph::Morph::from_gff4(&doc).map(|_| ()))),
         (_, "msh") => Some(s(Msh::from_gff4(&doc).map(|_| ()))),
+        (_, "ani") => Some(s(
+            thedas_formats::anim::Animation::from_gff(&doc).map(|_| ())
+        )),
         (_, "anb") => Some(s(thedas_formats::anim::AnimTree::from_gff(&doc).map(|_| ()))),
         (_, "gad") => Some(s(thedas_formats::anim::AnimInfo::from_gff(&doc).map(|_| ()))),
         (_, "evt") => Some(s(thedas_formats::anim::events_from_gff(&doc).map(|_| ()))),

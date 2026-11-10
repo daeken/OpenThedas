@@ -79,6 +79,8 @@ pub(crate) struct D3dPass {
     worlds: Vec<(glam::Mat4, Option<crate::scene::LightmapRef>, usize)>,
     /// Each scene draw's irradiance probe.
     probes: Vec<Option<usize>>,
+    /// Each scene draw's skinning palette rows (empty: every bone at rest).
+    bones: Vec<Vec<[f32; 4]>>,
     scene_probes: Vec<thedas_formats::probe::IrradianceProbe>,
     ambient: Vec3,
     pub programs: Vec<String>,
@@ -621,9 +623,17 @@ impl D3dPass {
                 .map(|d| (d.transform, d.lightmap.clone(), d.material))
                 .collect(),
             probes: scene.draws.iter().map(|d| d.probe).collect(),
+            bones: vec![Vec::new(); scene.draws.len()],
             scene_probes: scene.probes.iter().map(|p| p.probe.clone()).collect(),
             ambient,
             programs,
+        }
+    }
+
+    /// Sets scene draw `draw`'s skinning palette rows for the next frames.
+    pub fn set_bones(&mut self, draw: usize, rows: Vec<[f32; 4]>) {
+        if let Some(b) = self.bones.get_mut(draw) {
+            *b = rows;
         }
     }
 
@@ -665,7 +675,7 @@ impl D3dPass {
                 lightmap: lightmap.as_ref(),
                 lights: &d.lights,
                 ambient: self.ambient,
-                bones: &[],
+                bones: self.bones.get(d.draw).map_or(&[][..], |b| b.as_slice()),
                 irradiance: self
                     .probes
                     .get(d.draw)
