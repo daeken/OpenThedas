@@ -362,6 +362,7 @@ impl Sim {
         let elapsed = until.saturating_sub(start);
         self.world.time_ms = until;
         self.regenerate(elapsed);
+        self.expire_effects();
     }
 
     /// Ends a cutscene the way the engine does when one finishes playing. Provisional, inferred

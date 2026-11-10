@@ -964,7 +964,7 @@ pub fn call(
         "HasAbility" => ok(b(h
             .object(obj(a, 0))
             .is_some_and(|o| o.abilities.contains(&int(a, 1))))),
-        "IsModalAbilityActive" => ok(Value::Int(0)),
+        "IsModalAbilityActive" => ok(b(h.sim.modal_active(obj(a, 0), int(a, 1)))),
         "GetItemInEquipSlot" => {
             let who = obj(a, 1);
             ok(Value::Object(
@@ -1146,6 +1146,11 @@ pub fn call(
                 if a.len() > 5 && int(a, 5) != 0 {
                     e.ability = int(a, 5);
                 }
+                // A temporary effect lasts its duration (seconds).
+                let temporary = constant(&h.sim.table, "EFFECT_DURATION_TYPE_TEMPORARY");
+                if e.duration_type == temporary && float(a, 3) > 0.0 {
+                    e.expires = Some(t + (float(a, 3).min(1.0e6) * 1000.0) as u64);
+                }
                 h.sim.apply_effect(obj(a, 2), e);
             }
             void()
@@ -1203,19 +1208,24 @@ pub fn call(
         }
         "RemoveEffect" => {
             if let Some(EngineData::Effect(e)) = h.sim.world.handle(handle(a, 1)).cloned() {
-                if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                    if let Some(i) = o.effects.iter().position(|x| x == &e) {
-                        o.effects.remove(i);
-                    }
-                }
+                h.sim.remove_effect(obj(a, 0), &e);
             }
             void()
         }
         "RemoveEffectsByParameters" => {
-            let (et, ab) = (int(a, 1), int(a, 2));
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.effects
-                    .retain(|e| !((et == 0 || e.ty == et) && (ab == 0 || e.ability == ab)));
+            let (who, et, ab) = (obj(a, 0), int(a, 1), int(a, 2));
+            let gone: Vec<Effect> = h
+                .object(who)
+                .map(|o| {
+                    o.effects
+                        .iter()
+                        .filter(|e| (et == 0 || e.ty == et) && (ab == 0 || e.ability == ab))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            for e in gone {
+                h.sim.remove_effect(who, &e);
             }
             void()
         }
@@ -1853,6 +1863,26 @@ pub fn call(
                 .map(|o| o.id)
                 .collect();
             ok(objects(v))
+        }
+        // The action a click would take. Provisional: the game derives it from the
+        // placeable's state controller; here an area-transition destination makes it a
+        // transition, a conversation a dialog, and anything else a plain use.
+        "GetPlaceableAction" => {
+            let o = h.object(obj(a, 0));
+            let dest = o.is_some_and(|o| {
+                o.locals
+                    .strings
+                    .get("PLC_AT_DEST_AREA_TAG")
+                    .is_some_and(|d| !d.is_empty() && !d.eq_ignore_ascii_case("none"))
+            });
+            let name = if dest {
+                "PLACEABLE_ACTION_AREA_TRANSITION"
+            } else if o.is_some_and(|o| o.dialog.is_some()) {
+                "PLACEABLE_ACTION_DIALOG"
+            } else {
+                "PLACEABLE_ACTION_USE"
+            };
+            ok(Value::Int(constant(&h.sim.table, name)))
         }
         "GetPlaceableState" => ok(Value::Int(
             h.object(obj(a, 0))

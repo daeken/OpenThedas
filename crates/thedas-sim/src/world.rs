@@ -201,6 +201,9 @@ pub struct Effect {
     pub strings: Vec<String>,
     pub duration_type: i32,
     pub id: i32,
+    /// When a temporary effect runs out (simulation milliseconds).
+    #[serde(default)]
+    pub expires: Option<u64>,
 }
 
 /// Engine structures held by handle (scripts copy handles; every `Set*` makes a new one).
