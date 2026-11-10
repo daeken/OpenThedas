@@ -20,3 +20,8 @@ async-channel = "2"
 encoding_rs = "0.8"
 thedas-formats.workspace = true
 roxmltree.workspace = true
+thedas-sim.workspace = true
+thedas-vfs.workspace = true
+
+[dev-dependencies]
+thedas-script.workspace = true
