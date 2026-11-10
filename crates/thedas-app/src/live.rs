@@ -150,6 +150,11 @@ impl Live {
         self.level.as_ref()?.collider.first_hit(from, to)
     }
 
+    /// Advances what runs while the world may be stopped (the conversation camera's clock).
+    pub fn advance_presentation(&mut self, dt_ms: f64) {
+        self.talk_camera.advance(dt_ms);
+    }
+
     /// The open conversation's camera, when its lines are staged (see [`crate::talkcam`]);
     /// `base` gives the clip planes. `None` leaves the game camera as it is.
     pub fn conversation_camera(

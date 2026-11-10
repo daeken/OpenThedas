@@ -15,6 +15,9 @@
 //! actors' places, from the nearest line on the same stage with cinematics that places the
 //! speaker (actors move between places from line to line).
 //!
+//! A line's cut also gives how long its cinematics run (5000, seconds); a stage's `decision`
+//! camera frames the player choosing a reply.
+//!
 //! Provisional. Field names are xoreos's (read for the format only): 11000 places, 11001
 //! cameras, 11003 camera field of view, 11004 a place's default camera; 1 a name, 4 a
 //! position, 5 a rotation quaternion. In the conversations checked, the camera actor's own
@@ -38,6 +41,7 @@ pub mod field {
     pub const LINE_STAGE: u32 = 12100;
     pub const LINE_CUT: u32 = 12211;
     pub const CUT_STAGE_FILE: u32 = 5017;
+    pub const CUT_SECONDS: u32 = 5000;
     pub const CUT_ACTORS: u32 = 5200;
     pub const ACTOR_NAME: u32 = 2;
     pub const ACTOR_TRACKS: u32 = 5206;
@@ -112,16 +116,25 @@ impl Stage {
         Ok(Stage { places, cameras })
     }
 
-    /// The camera framing place `place` (its default camera), by name, ignoring case.
-    pub fn camera_for(&self, place: &str) -> Option<&StageCamera> {
-        let p = self
-            .places
-            .iter()
-            .find(|p| p.name.eq_ignore_ascii_case(place))?;
-        let cam = p.default_camera.as_deref()?;
+    /// The camera named `name`, ignoring case (`decision` frames the player choosing).
+    pub fn camera(&self, name: &str) -> Option<&StageCamera> {
         self.cameras
             .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(cam))
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The camera a line's `AJSC` track names: a place's default camera, or else the camera
+    /// of that name (lines put the player's choice under the `decision` camera this way).
+    /// Names ignore case.
+    pub fn camera_for(&self, name: &str) -> Option<&StageCamera> {
+        match self
+            .places
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(name))
+        {
+            Some(p) => self.camera(p.default_camera.as_deref()?),
+            None => self.camera(name),
+        }
     }
 }
 
@@ -135,6 +148,8 @@ pub struct LineShot {
     pub stage_file: String,
     pub place: String,
     pub actors: Vec<(String, String)>,
+    /// How long the line's cinematics run (seconds, 5000), when the line has its own.
+    pub seconds: Option<f32>,
 }
 
 /// Each line of a conversation (in the order of its line list, 12002, which the dialog's
@@ -157,6 +172,7 @@ pub fn line_shots(g: &Gff4) -> TypedResult<Vec<Option<LineShot>>> {
                 stage_file: file.clone(),
                 place: place.clone(),
                 actors: s.places.clone(),
+                seconds: s.seconds,
             }));
             continue;
         }
@@ -177,6 +193,7 @@ pub fn line_shots(g: &Gff4) -> TypedResult<Vec<Option<LineShot>>> {
                 stage_file: o.stage_file.clone()?,
                 place: place.clone(),
                 actors: o.places.clone(),
+                seconds: s.seconds,
             })
         });
         out.push(found);
@@ -193,6 +210,7 @@ struct Staging {
     camera: Option<String>,
     /// Each actor's place (actor name, place).
     places: Vec<(String, String)>,
+    seconds: Option<f32>,
 }
 
 fn staging(d: &Doc, line: StructId) -> TypedResult<Option<Staging>> {
@@ -208,10 +226,14 @@ fn staging(d: &Doc, line: StructId) -> TypedResult<Option<Staging>> {
         stage_file: None,
         camera: None,
         places: Vec::new(),
+        seconds: None,
     };
     let Some(cut) = d.opt_struct(line, field::LINE_CUT)? else {
         return Ok(Some(s));
     };
+    s.seconds = d
+        .opt_f32(cut, field::CUT_SECONDS)?
+        .filter(|t| t.is_finite() && *t > 0.0);
     s.stage_file = d
         .opt_str(cut, field::CUT_STAGE_FILE)?
         .filter(|f| !f.is_empty())
@@ -278,6 +300,8 @@ mod tests {
         assert_eq!(c.fov, 25.0);
         assert_eq!(st.cameras[1].fov, 45.0);
         assert!(st.camera_for("nobody").is_none());
+        // A name that is no place's is a camera's.
+        assert_eq!(st.camera_for("Group").unwrap().name, "group");
     }
 
     #[test]
@@ -304,6 +328,7 @@ mod tests {
             b"CUT ",
             vec![
                 (field::CUT_STAGE_FILE, s("BHN_Stage_1.stg")),
+                (field::CUT_SECONDS, Value::F32(2.5)),
                 (field::CUT_ACTORS, structs(&[player, camera])),
             ],
         );
@@ -352,6 +377,7 @@ mod tests {
                     stage_file: "bhn_stage_1".into(),
                     place: "node1_mother".into(),
                     actors: vec![("PLAYER".into(), "node2_player".into())],
+                    seconds: Some(2.5),
                 }),
                 None,
                 Some(LineShot {
@@ -359,6 +385,7 @@ mod tests {
                     stage_file: "bhn_stage_1".into(),
                     place: "node2_player".into(),
                     actors: vec![("PLAYER".into(), "node2_player".into())],
+                    seconds: None,
                 }),
                 None,
             ]
