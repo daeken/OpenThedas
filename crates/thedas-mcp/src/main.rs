@@ -3,6 +3,9 @@
 //! things, talk to people, pick dialog replies, poke plot flags and locals, call engine
 //! functions and scripts, and snapshot/restore the world. The `ui_*` tools play the game's
 //! Scaleform interface on a headless GPU, bound to the simulation, with screenshots.
+//! `attach` connects to a game running in a window (`thedas-app --control 127.0.0.1:7878`)
+//! and the `live_*` tools play it: input as the player's, screenshots of the window, and a
+//! copy of its simulation for the inspection tools.
 //!
 //! Register it with Claude Code:
 //!
@@ -10,6 +13,7 @@
 //! claude mcp add thedas -e THEDAS_INSTALL=/path/to/Dragon\ Age -- /path/to/thedas-mcp
 //! ```
 
+mod live;
 mod ui;
 
 use std::collections::BTreeMap;
@@ -68,6 +72,8 @@ fn message_handler(state: Arc<Mutex<State>>) -> thedas_ui::protocol::MessageHand
 struct Server {
     state: Arc<Mutex<State>>,
     ui: ui::UiThread,
+    /// The running game `attach` connected to.
+    live: Arc<Mutex<Option<live::Link>>>,
 }
 
 fn ui_json(v: &UiValue) -> J {
@@ -159,6 +165,29 @@ struct AbilityArgs {
     item: Option<String>,
     /// Target object id or tag (default: the hero).
     target: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct AttachArgs {
+    /// Where the game listens (`thedas-app --control ADDR`); default 127.0.0.1:7878.
+    address: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct LiveInputArgs {
+    /// Input played in order, `;`-separated, in window pixels (see live_screenshot's
+    /// scale): `click X,Y`, `rclick X,Y`, `dclick X,Y`, `hover X,Y`, `run MS` (the game runs
+    /// that long before the next step), `key i` (inventory), `key f1`-`key f4` (who leads),
+    /// `key 1`-`key 0` (quickbar slots), `key space` (pause), `talk TAG` (the leader goes to
+    /// talk to a creature), `reply N` (the conversation's reply N, from 0).
+    steps: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct LiveShotArgs {
+    /// Shrink the picture to at most this wide (default 1280) by a whole factor; the reply
+    /// says the factor, which window pixels are the picture's times.
+    max_width: Option<u32>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -503,6 +532,7 @@ impl Server {
         Self {
             state: Arc::new(Mutex::new(State::default())),
             ui: ui::UiThread::spawn(),
+            live: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1780,6 +1810,149 @@ impl Server {
         })
     }
 
+    /// Sends one request to the attached game, off the async runtime (an `input` may run
+    /// for a while).
+    async fn ask_live(&self, body: J) -> Result<J, String> {
+        let live = self.live.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut link = live.lock().unwrap_or_else(|p| p.into_inner());
+            let l = link
+                .as_mut()
+                .ok_or("not attached to a game; call attach first")?;
+            let r = l.ask(body);
+            if r.as_ref().is_err_and(|e| e.contains("hung up")) {
+                *link = None;
+            }
+            r
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    #[tool(
+        description = "Attach to a running game (thedas-app started with --control 127.0.0.1:7878, a window the player can watch): the live_* tools then play it. Returns where the game is."
+    )]
+    async fn attach(&self, Parameters(a): Parameters<AttachArgs>) -> String {
+        let addr = a.address.unwrap_or_else(|| live::DEFAULT_ADDR.to_string());
+        let link = {
+            let addr = addr.clone();
+            tokio::task::spawn_blocking(move || live::Link::connect(&addr)).await
+        };
+        match link {
+            Ok(Ok(l)) => {
+                *self.live.lock().unwrap_or_else(|p| p.into_inner()) = Some(l);
+                match self.ask_live(json!({"cmd": "status"})).await {
+                    Ok(v) => pretty(json!({ "attached": addr, "status": v })),
+                    Err(e) => err(e),
+                }
+            }
+            Ok(Err(e)) => err(e),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(description = "Let go of the attached game (it keeps running).")]
+    async fn detach(&self) -> String {
+        let was = self.live.lock().unwrap_or_else(|p| p.into_inner()).take();
+        pretty(json!({ "detached": was.map(|l| l.addr) }))
+    }
+
+    #[tool(
+        description = "Where the attached game is: time, area, the party leader and what it is doing, the party, the conversation and its replies, the screens up, the window size."
+    )]
+    async fn live_status(&self) -> String {
+        match self.ask_live(json!({"cmd": "status"})).await {
+            Ok(v) => pretty(v),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(
+        description = "Play input into the attached game as the player would, in order (clicks go to the interface or the world as in the window); returns once every step has played, with what each did and where the game is then."
+    )]
+    async fn live_input(&self, Parameters(a): Parameters<LiveInputArgs>) -> String {
+        match self
+            .ask_live(json!({"cmd": "input", "steps": a.steps}))
+            .await
+        {
+            Ok(v) => pretty(v),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(
+        description = "What the player sees in the attached game's window right now (world, aiming reticle and interface)."
+    )]
+    async fn live_screenshot(&self, Parameters(a): Parameters<LiveShotArgs>) -> CallToolResult {
+        let shot = match self.ask_live(json!({"cmd": "screenshot"})).await {
+            Ok(v) => v,
+            Err(e) => return CallToolResult::error(vec![ContentBlock::text(err(e))]),
+        };
+        let png = match base64::engine::general_purpose::STANDARD
+            .decode(shot["png"].as_str().unwrap_or_default())
+        {
+            Ok(p) => p,
+            Err(e) => return CallToolResult::error(vec![ContentBlock::text(err(e))]),
+        };
+        match live::shrink_png(&png, a.max_width.unwrap_or(1280)) {
+            Ok((small, w, h, k)) => CallToolResult::success(vec![
+                ContentBlock::text(format!(
+                    "{w}x{h} picture of a {}x{} window: window pixels are the picture's times {k}",
+                    shot["width"], shot["height"]
+                )),
+                ContentBlock::image(
+                    base64::engine::general_purpose::STANDARD.encode(small),
+                    "image/png",
+                ),
+            ]),
+            Err(e) => CallToolResult::error(vec![ContentBlock::text(err(e))]),
+        }
+    }
+
+    #[tool(
+        description = "Copy the attached game's simulation into this server (opening its module first if none is loaded), so status, list_objects, inspect_object, get_trace and the rest can look at it. The copy is separate: changing it does not change the game; play the game with live_input."
+    )]
+    async fn live_sync(&self) -> String {
+        let save = match self.ask_live(json!({"cmd": "state"})).await {
+            Ok(v) => v["save"].as_str().unwrap_or_default().to_string(),
+            Err(e) => return err(e),
+        };
+        let state = self.state.clone();
+        let r = tokio::task::spawn_blocking(move || -> Result<J, String> {
+            let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
+            if st.sim.is_none() {
+                let install = install_from_env()
+                    .ok_or("no install: set THEDAS_INSTALL (or call load first)")?;
+                let sim = open(&SessionOptions {
+                    install,
+                    module: "single player".into(),
+                    area: None,
+                    waypoint: None,
+                    seed: 1,
+                    keep_trace: true,
+                })
+                .map_err(|e| e.to_string())?;
+                st.sim = Some(sim);
+            }
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            sim.load_json(save.as_bytes()).map_err(|e| e.to_string())?;
+            let out = json!({
+                "synced_bytes": save.len(),
+                "time_ms": sim.world.time_ms,
+                "area": sim.world.area.map(|a| summary(sim, a)),
+                "hero": sim.world.hero.map(|h| summary(sim, h)),
+            });
+            st.trace_cursor = 0;
+            Ok(out)
+        })
+        .await;
+        match r {
+            Ok(Ok(v)) => pretty(v),
+            Ok(Err(e)) => err(e),
+            Err(e) => err(e),
+        }
+    }
+
     #[tool(
         description = "Save the simulation state to an in-memory slot, and to a JSON file if path is given."
     )]
@@ -1840,7 +2013,7 @@ impl Server {
 #[tool_handler(
     name = "thedas",
     version = "0.1.0",
-    instructions = "Drives the OpenThedas Dragon Age: Origins simulation. Start with load (e.g. area cir110ar_inn for the Spoiled Princess), then list_objects, interact to talk or use things, choose_reply to pick dialog options, step to advance time, and get_trace to see what scripts did. The game's own interface runs too: ui_open (menu, hud, startmenu2, or movie names), ui_screenshot to look, ui_click at screenshot pixels, ui_step, and ui_values for what it reads from the engine."
+    instructions = "Drives the OpenThedas Dragon Age: Origins simulation. Start with load (e.g. area cir110ar_inn for the Spoiled Princess), then list_objects, interact to talk or use things, choose_reply to pick dialog options, step to advance time, and get_trace to see what scripts did. The game's own interface runs too: ui_open (menu, hud, startmenu2, or movie names), ui_screenshot to look, ui_click at screenshot pixels, ui_step, and ui_values for what it reads from the engine. To play the game running in a window (thedas-app --control 127.0.0.1:7878), call attach, then live_screenshot to look, live_input to click, press keys and let time run, live_status for where things stand, and live_sync to copy its simulation here for list_objects and the other inspection tools."
 )]
 impl rmcp::ServerHandler for Server {}
 

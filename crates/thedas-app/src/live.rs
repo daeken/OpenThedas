@@ -56,8 +56,6 @@ pub struct Live {
     /// Each drawn object's id, placement and motion at the last sync (in the objects' scene
     /// order).
     posed: Vec<(ObjectId, Mat4, Option<Clip>)>,
-    /// The colour format the scenes are drawn in (captures come back in it).
-    format: Option<wgpu::TextureFormat>,
     models: ModelCache,
     /// Textures, meshes, pipelines and shader translations of the current level, kept while
     /// its objects are rebuilt.
@@ -106,7 +104,6 @@ impl Live {
             objects: None,
             animator: Animator::default(),
             aiming: None,
-            format: None,
             posed: Vec::new(),
             models: ModelCache::default(),
             cache: RenderCache::default(),
@@ -153,7 +150,6 @@ impl Live {
     /// changes, the objects when the set of objects (or what they wear) changes; then places
     /// and poses every object.
     pub fn sync(&mut self, ctx: &GpuContext, format: wgpu::TextureFormat) -> Result<()> {
-        self.format = Some(format);
         let shared = self.sim.clone();
         let mut sim = shared.lock().unwrap_or_else(|p| p.into_inner());
         let Some(layout) = sim.world.area.and_then(|a| sim.area_layout(a)) else {
@@ -636,17 +632,10 @@ impl Live {
             );
             camera.fov_y = 35f32.to_radians();
             camera.near = 0.05;
+            // Captures come back RGBA whatever the renderer draws in.
             let Ok(mut pixels) = objects.renderer.capture(ctx, &camera, size, size) else {
                 continue;
             };
-            if matches!(
-                self.format,
-                Some(wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb)
-            ) {
-                for p in pixels.chunks_exact_mut(4) {
-                    p.swap(0, 2);
-                }
-            }
             // The game lights portraits with a rig of their own (portraits.gda's light
             // columns); the scene's light is brightened instead. Provisional.
             for p in pixels.chunks_exact_mut(4) {
