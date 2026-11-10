@@ -27,22 +27,33 @@ pub struct Collider {
 impl Collider {
     /// The opaque surfaces of `scene` (see the module docs).
     pub fn from_scene(scene: &AreaScene) -> Self {
+        Self::from_draws(scene, 0..scene.draws.len(), true)
+    }
+
+    /// The surfaces of `scene`'s draws `draws` (one object's, to pick it by its shape), only
+    /// the opaque ones when `solid_only`.
+    pub fn from_draws(
+        scene: &AreaScene,
+        draws: impl IntoIterator<Item = usize>,
+        solid_only: bool,
+    ) -> Self {
         let mut triangles = Vec::new();
-        for d in &scene.draws {
+        for d in draws.into_iter().filter_map(|i| scene.draws.get(i)) {
             if d.skin.is_some() {
                 continue;
             }
-            let solid = scene.materials.get(d.material).is_none_or(|m| {
-                let kind = format!(
-                    "{} {}",
-                    m.semantic,
-                    m.render_class.as_deref().unwrap_or_default()
-                )
-                .to_ascii_lowercase();
-                !["punch", "alpha", "additive"]
-                    .iter()
-                    .any(|k| kind.contains(k))
-            });
+            let solid = !solid_only
+                || scene.materials.get(d.material).is_none_or(|m| {
+                    let kind = format!(
+                        "{} {}",
+                        m.semantic,
+                        m.render_class.as_deref().unwrap_or_default()
+                    )
+                    .to_ascii_lowercase();
+                    !["punch", "alpha", "additive"]
+                        .iter()
+                        .any(|k| kind.contains(k))
+                });
             let Some(mesh) = scene.meshes.get(d.mesh).filter(|_| solid) else {
                 continue;
             };
@@ -245,6 +256,77 @@ mod tests {
             w.first_hit(Vec3::splat(f32::NAN), Vec3::ZERO).is_none()
                 && Collider::default().first_hit(Vec3::ZERO, Vec3::X).is_none()
         );
+    }
+
+    #[test]
+    fn one_objects_draws_make_its_shape() {
+        use crate::scene::{DrawItem, SceneMesh, Vertex};
+        let vertex = |x: f32, y: f32, z: f32| Vertex {
+            position: [x, y, z],
+            normal: [1.0, 0.0, 0.0],
+            uv0: [0.0; 2],
+            uv1: [0.0; 2],
+        };
+        // A 2 m square in the plane x = 0.
+        let mesh = SceneMesh {
+            key: "quad".into(),
+            vertices: vec![
+                vertex(0.0, -1.0, 0.0),
+                vertex(0.0, 1.0, 0.0),
+                vertex(0.0, 1.0, 2.0),
+                vertex(0.0, -1.0, 2.0),
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            chunk: thedas_formats::mesh::MeshChunk {
+                name: "quad".into(),
+                vertex_size: 0,
+                vertex_count: 4,
+                index_count: 6,
+                primitive: 0,
+                index_format: thedas_formats::mesh::IndexFormat::U16,
+                base_vertex: 0,
+                vertex_offset: 0,
+                start_index: 0,
+                elements: vec![],
+                bounds: None,
+            },
+            raw_vertices: vec![],
+            positions: None,
+        };
+        let draw = |x: f32| DrawItem {
+            mesh: 0,
+            material: 0,
+            transform: Mat4::from_translation(Vec3::new(x, 0.0, 0.0)),
+            lightmap: None,
+            sphere: (Vec3::new(x, 0.0, 1.0), 1.5),
+            model: "quad".into(),
+            room: String::new(),
+            probe: None,
+            skin: None,
+        };
+        let scene = AreaScene {
+            meshes: vec![mesh],
+            draws: vec![draw(2.0), draw(6.0)],
+            ..Default::default()
+        };
+        // The second object alone: a ray along +X meets it at x = 6, not the first at 2.
+        let second = Collider::from_draws(&scene, [1], false);
+        let t = second
+            .first_hit(Vec3::new(0.0, 0.0, 1.0), Vec3::new(10.0, 0.0, 1.0))
+            .unwrap();
+        assert!((t - 0.6).abs() < 1e-4, "{t}");
+        // Past its edge it is not touched, though its bounds would be.
+        assert!(
+            second
+                .first_hit(Vec3::new(0.0, 1.4, 1.0), Vec3::new(10.0, 1.4, 1.0))
+                .is_none()
+        );
+        // Both: the first is in front.
+        let both = Collider::from_scene(&scene);
+        let t = both
+            .first_hit(Vec3::new(0.0, 0.0, 1.0), Vec3::new(10.0, 0.0, 1.0))
+            .unwrap();
+        assert!((t - 0.2).abs() < 1e-4);
     }
 
     #[test]
