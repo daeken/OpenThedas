@@ -411,6 +411,13 @@ impl Sim {
         self.dialog_state()
     }
 
+    /// The open conversation's dialog (resource name without `.dlg`), the node being shown
+    /// (an index into the dialog's line list) and its owner, for presentation.
+    pub fn conversation_line(&self) -> Option<(&str, Option<usize>, ObjectId)> {
+        let c = self.talk.as_ref().filter(|c| !c.ended)?;
+        Some((c.dlg.name.as_str(), c.line, c.owner))
+    }
+
     pub fn dialog_state(&self) -> Option<DialogState> {
         let c = self.talk.as_ref()?;
         let line = c.line.map(|l| &c.dlg.nodes[l]);

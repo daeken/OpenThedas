@@ -20,6 +20,7 @@
 //! - [`morph`]: head morphs (`.mor`): a character's face, hair and their materials.
 //! - [`tint`]: item material tints (`.tnt`), the colours of tint-masked equipment.
 //! - [`probe`]: irradiance probes (`.mtx`), the diffuse light characters and props receive.
+//! - [`stage`]: conversation stages (`.stg`) and the shot each conversation line takes.
 //! - [`anim`]: animation trees (`.anb`), animation lengths (`.gad`) and events (`.evt`).
 //!
 //! Interface:
@@ -39,6 +40,7 @@ pub mod mesh;
 pub mod model;
 pub mod morph;
 pub mod probe;
+pub mod stage;
 pub mod state;
 pub mod tint;
 pub mod tlk;
