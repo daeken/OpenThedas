@@ -20,7 +20,9 @@ pub const SAVE_FORMAT: u32 = 1;
 /// up to date:
 /// - 1: worn items' properties are effects on their wearers (before, gear's bonuses were
 ///   not applied; loading a revision 0 save applies them).
-pub const SAVE_REVISION: u32 = 1;
+/// - 2: creatures keep an appearance: saves from earlier runs have party members whose
+///   appearance was lost (0, so they drew nothing); loading gives them their template's.
+pub const SAVE_REVISION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 pub struct SaveGame {
@@ -67,6 +69,24 @@ impl Sim {
         }
     }
 
+    /// Gives creatures with no appearance their template's (saves from before revision 2).
+    fn restore_lost_appearances(&mut self) {
+        let lost: Vec<ObjectId> = self
+            .world
+            .objects
+            .values()
+            .filter(|o| o.kind == crate::world::ObjectKind::Creature && o.appearance <= 0)
+            .map(|o| o.id)
+            .collect();
+        for id in lost {
+            if let Some(app) = self.original_appearance(id) {
+                if let Some(o) = self.world.get_mut(id) {
+                    o.appearance = app;
+                }
+            }
+        }
+    }
+
     pub fn save_json(&self) -> Result<Vec<u8>, SimError> {
         serde_json::to_vec(&self.save_game())
             .map_err(|e| SimError::Parse("save".into(), e.to_string()))
@@ -101,6 +121,9 @@ impl Sim {
         self.door_cells.clear();
         if save_revision < 1 {
             self.apply_worn_properties();
+        }
+        if save_revision < 2 {
+            self.restore_lost_appearances();
         }
         // Saves from before world maps were simulated have none.
         if !self
@@ -137,6 +160,75 @@ mod tests {
         let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 7);
         s.module_info.name = "test".into();
         s
+    }
+
+    #[test]
+    fn lost_appearances_come_back_from_templates() {
+        use thedas_formats::gff3::{Field, Gff3, Struct, Value as G3};
+        let dir = std::env::temp_dir().join(format!("thedas-app-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let utc = dir.join("hm_follower.utc");
+        let gff = Gff3 {
+            file_type: *b"UTC ",
+            file_version: *b"V3.2",
+            structs: vec![Struct {
+                id: u32::MAX,
+                fields: vec![Field {
+                    label: "Appearance".into(),
+                    value: G3::Short(15),
+                }],
+            }],
+        };
+        std::fs::write(&utc, gff.write().unwrap()).unwrap();
+        let mut vfs = Vfs::new();
+        vfs.push_files(&[utc], "test");
+        let table = EngineTable::parse(
+            b"void SetAppearanceType(object oCreature, int nType, int bUpdate) = 1;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(vfs), Arc::new(table), 7);
+        s.module_info.name = "test".into();
+        s.world.trace.keep = true;
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        let follower = s.world.spawn(ObjectKind::Creature, "follower");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().followers.push(follower);
+        s.world.get_mut(follower).unwrap().template = "hm_follower".into();
+        // An older save with the follower's appearance lost: loading gives it back.
+        let mut old = s.save_game();
+        old.revision = 1;
+        s.load_game(old).unwrap();
+        assert_eq!(s.world.get(follower).unwrap().appearance, 15);
+        // A current save keeps what it says.
+        s.world.get_mut(follower).unwrap().appearance = 0;
+        s.load_game(s.save_game()).unwrap();
+        assert_eq!(s.world.get(follower).unwrap().appearance, 0);
+        // SetAppearanceType -1 is the creature's own; setting a party member's to 0 is traced.
+        let set = |s: &mut Sim, n: i32| {
+            let f = s
+                .table
+                .function_by_name("SetAppearanceType")
+                .cloned()
+                .unwrap();
+            let mut host = crate::sim::ScriptHost {
+                sim: s,
+                event: None,
+                script: "test".into(),
+            };
+            let args = [
+                thedas_script::vm::Value::Object(follower),
+                thedas_script::vm::Value::Int(n),
+                thedas_script::vm::Value::Int(0),
+            ];
+            crate::engine::call(&mut host, OBJECT_INVALID, &f, &args);
+        };
+        set(&mut s, -1);
+        assert_eq!(s.world.get(follower).unwrap().appearance, 15);
+        set(&mut s, 0);
+        assert!(s.world.trace.entries.iter().any(|e| matches!(
+            e,
+            crate::trace::TraceEntry::Log { text, .. } if text.contains("leaves it nothing to draw")
+        )));
     }
 
     #[test]

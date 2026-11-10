@@ -2100,9 +2100,33 @@ pub fn call(
             }
             void()
         }
+        // -1 restores the creature's own appearance (rules_core ends a shapeshift so).
+        // Provisional: its own is taken to be its template's. A party member losing its
+        // appearance is traced: it draws nothing.
         "SetAppearanceType" => {
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.appearance = int(a, 1);
+            let who = obj(a, 0);
+            let mut app = int(a, 1);
+            if app == -1 {
+                app = h
+                    .sim
+                    .original_appearance(who)
+                    .or_else(|| h.object(who).map(|o| o.appearance))
+                    .unwrap_or(0);
+            }
+            if app <= 0 && crate::engine::party_of(h.sim).contains(&who) {
+                let t = h.sim.world.time_ms;
+                let tag = h.object(who).map(|o| o.tag.clone()).unwrap_or_default();
+                h.sim.world.trace.push(crate::trace::TraceEntry::Log {
+                    t,
+                    channel: -1,
+                    text: format!(
+                        "SetAppearanceType({tag}, {}) leaves it nothing to draw",
+                        int(a, 1)
+                    ),
+                });
+            }
+            if let Some(o) = h.sim.world.get_mut(who) {
+                o.appearance = app;
             }
             void()
         }
