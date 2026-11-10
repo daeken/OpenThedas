@@ -348,6 +348,11 @@ mod sorted {
 }
 
 impl World {
+    /// The merged 2DA tables (`GetM2DA*`).
+    pub fn tables(&self) -> Arc<crate::m2da::Tables> {
+        self.tables.clone()
+    }
+
     pub fn new(tables: Arc<crate::m2da::Tables>, seed: u64) -> Self {
         World {
             time_ms: 0,

@@ -25,6 +25,9 @@ pub struct PlotInfo {
     pub script: Option<String>,
     pub name_strref: Option<u32>,
     pub flags: BTreeMap<i32, String>,
+    /// Each flag's reward id (field 13003, a row of the rewards table; 0 for none), as
+    /// `GetPlotFlagRewardId` answers it. Provisional: the field is inferred from the data.
+    pub rewards: BTreeMap<i32, i32>,
 }
 
 #[derive(Default)]
@@ -61,11 +64,19 @@ pub fn plots_from_gff4(g: &Gff4, resref: &str) -> Vec<PlotInfo> {
     for p in structs(g, g.root, 13016) {
         let Some(guid) = s(g, p, 13007) else { continue };
         let mut flags = BTreeMap::new();
+        let mut rewards = BTreeMap::new();
         for f in structs(g, p, 13000) {
             if let (Some(id), Some(name)) =
                 (g.field(f, 13001).and_then(|v| v.as_i64()), s(g, f, 13002))
             {
                 flags.insert(id as i32, name);
+                if let Some(r) = g
+                    .field(f, 13003)
+                    .and_then(|v| v.as_i64())
+                    .filter(|&r| r != 0)
+                {
+                    rewards.insert(id as i32, r as i32);
+                }
             }
         }
         let name_strref = match g.field(p, 13008) {
@@ -78,6 +89,7 @@ pub fn plots_from_gff4(g: &Gff4, resref: &str) -> Vec<PlotInfo> {
             script: s(g, p, 13009),
             name_strref,
             flags,
+            rewards,
         });
     }
     out
@@ -246,7 +258,7 @@ mod tests {
             templates: vec![
                 tmpl(b"PLTS", &[13016]),
                 tmpl(b"PLOT", &[13000, 13007, 13008, 13009]),
-                tmpl(b"FLAG", &[13001, 13002]),
+                tmpl(b"FLAG", &[13001, 13002, 13003]),
             ],
             structs: vec![
                 st(
@@ -267,11 +279,19 @@ mod tests {
                 ),
                 st(
                     2,
-                    vec![Value::U32(0), Value::String(Some("FIRST\0".into()))],
+                    vec![
+                        Value::U32(0),
+                        Value::String(Some("FIRST\0".into())),
+                        Value::U32(142),
+                    ],
                 ),
                 st(
                     2,
-                    vec![Value::U32(256), Value::String(Some("DEFINED\0".into()))],
+                    vec![
+                        Value::U32(256),
+                        Value::String(Some("DEFINED\0".into())),
+                        Value::U32(0),
+                    ],
                 ),
             ],
             root: StructId(0),
@@ -283,5 +303,7 @@ mod tests {
         assert_eq!(p[0].script.as_deref(), Some("plt_script"));
         assert_eq!(p[0].name_strref, Some(7));
         assert_eq!(p[0].flags.get(&256).map(String::as_str), Some("DEFINED"));
+        assert_eq!(p[0].rewards.get(&0), Some(&142));
+        assert_eq!(p[0].rewards.get(&256), None, "no reward is not a reward");
     }
 }

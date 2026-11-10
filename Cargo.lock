@@ -3653,6 +3653,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "thedas-formats",
  "thedas-render",
  "thedas-script",
  "thedas-sim",

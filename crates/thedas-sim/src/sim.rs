@@ -482,9 +482,25 @@ impl Sim {
         let mut ev = self.chargen_event_for("CHARGEN_START", creature);
         ev.ints = vec![mode, import];
         self.world.queue_event(0, module, ev, None);
-        if self.chargen_policy == ChargenPolicy::QuickStart {
+        // Level-up (mode 1) only starts when someone asked for it (`request_level_up`), so
+        // it is left for them to finish.
+        if self.chargen_policy == ChargenPolicy::QuickStart && mode == 0 {
             self.chargen_event("CHARGEN_END", vec![mode, 0], Vec::new());
         }
+    }
+
+    /// The level-up button: `EVENT_TYPE_PLAYERLEVELUP` to the module for a party member,
+    /// whose chargen script opens character generation in level-up mode (`StartCharGen`
+    /// mode 1); the choices then arrive as `CHARGEN_ASSIGN_ATTRIBUTES` (attribute,
+    /// amount) and `CHARGEN_ASSIGN_ABILITIES` (ability) events and `CHARGEN_END`.
+    /// Provisional, read from `sys_chargen`.
+    pub fn request_level_up(&mut self, creature: ObjectId) {
+        let Some(module) = self.world.module else {
+            return;
+        };
+        let mut ev = self.new_event("PLAYERLEVELUP", Some(creature));
+        ev.objects = vec![creature];
+        self.world.queue_event(0, module, ev, None);
     }
 
     /// Sends a character-generation event (`CHARGEN_SELECT_RACE`, `CHARGEN_END`, ...) for the
