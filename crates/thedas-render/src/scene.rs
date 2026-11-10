@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use glam::{Mat4, Quat, Vec3};
 use thedas_formats::level::{ArlRoom, LightmapBinding, Transform};
-use thedas_formats::material::{MaterialDef, MaterialObject, Technique};
+use thedas_formats::material::{MaterialDef, MaterialObject, Technique, TextureBinding};
 use thedas_formats::mesh::{DeclUsage, MeshChunk, Msh};
+use thedas_formats::morph::{Morph, MorphNode, slot as morph_slot};
 use thedas_formats::probe::IrradianceProbe;
 use thedas_formats::{Arl, Mmh, Rml};
 use thedas_vfs::{Provenance, Vfs};
@@ -48,6 +49,8 @@ pub struct SceneMesh {
     pub chunk: MeshChunk,
     /// The chunk's original vertex bytes, laid out as `chunk.elements` describes.
     pub raw_vertices: Vec<u8>,
+    /// Positions that replace the raw stream's (a head morph's face), one per vertex.
+    pub positions: Option<Vec<[f32; 4]>>,
 }
 
 /// A material object resolved down to its material definition.
@@ -151,6 +154,11 @@ pub struct Prop {
     /// Models hung from a node of the first of `models` that has it: (model, node), e.g. a
     /// sword from the right hand's `Prop01`.
     pub attached: Vec<(String, String)>,
+    /// A head morph (without `.mor`): its head, eyes, hair, beard and lashes are drawn with
+    /// the prop, shaped and coloured by it.
+    pub morph: Option<String>,
+    /// Leave out the morph's hair and beard (under a helmet).
+    pub hide_hair: bool,
     /// Model to world.
     pub transform: Mat4,
 }
@@ -223,6 +231,8 @@ struct Placing<'a> {
     /// The room, or the prop's label.
     room: &'a str,
     probe: Option<usize>,
+    /// A head morph shaping and colouring the model's face meshes: (name, morph).
+    morph: Option<(&'a str, &'a Morph)>,
 }
 
 struct Loader<'a> {
@@ -233,6 +243,7 @@ struct Loader<'a> {
     mesh_index: HashMap<String, Option<usize>>,
     mat_defs: HashMap<String, Option<Arc<MaterialDef>>>,
     material_index: HashMap<String, Option<usize>>,
+    morphs: HashMap<String, Option<Arc<Morph>>>,
 }
 
 impl<'a> Loader<'a> {
@@ -370,6 +381,7 @@ impl<'a> Loader<'a> {
             indices: indices.into_iter().map(|i| i + base).collect(),
             chunk: chunk.clone(),
             raw_vertices: raw,
+            positions: None,
         })
     }
 
@@ -446,6 +458,104 @@ impl<'a> Loader<'a> {
         index
     }
 
+    fn morph(&mut self, name: &str) -> Option<Arc<Morph>> {
+        let key = format!("{}.mor", name.to_ascii_lowercase());
+        if let Some(m) = self.morphs.get(&key) {
+            return m.clone();
+        }
+        let loaded = match self.read(&key) {
+            Ok(d) => match Morph::parse(&d) {
+                Ok(m) => Some(Arc::new(m)),
+                Err(e) => {
+                    self.warn(format!("{key}: {e}"));
+                    None
+                }
+            },
+            Err(e) => {
+                self.warn(e.to_string());
+                None
+            }
+        };
+        self.morphs.insert(key, loaded.clone());
+        loaded
+    }
+
+    /// A copy of mesh `base` with a head morph's vertex positions, shared by every draw of
+    /// that morph. The base mesh when the vertex counts disagree.
+    fn morphed_mesh(&mut self, base: usize, morph: &str, node: &MorphNode) -> usize {
+        let key = format!("{}#{morph}", self.scene.meshes[base].key);
+        if let Some(Some(i)) = self.mesh_index.get(&key) {
+            return *i;
+        }
+        let mut m = self.scene.meshes[base].clone();
+        if node.vertices.len() != m.vertices.len() {
+            self.warn(format!(
+                "{morph}.mor: {} has {} vertices, {} has {}",
+                node.name,
+                node.vertices.len(),
+                m.key,
+                m.vertices.len()
+            ));
+            return base;
+        }
+        for (v, p) in m.vertices.iter_mut().zip(&node.vertices) {
+            v.position = [p[0], p[1], p[2]];
+        }
+        m.positions = Some(node.vertices.clone());
+        m.key = key.clone();
+        self.scene.meshes.push(m);
+        let i = self.scene.meshes.len() - 1;
+        self.mesh_index.insert(key, Some(i));
+        i
+    }
+
+    /// A copy of material `base` with textures and vector parameters replaced (a head
+    /// morph's, an item tint's), shared by every draw with the same `source`.
+    fn overridden_material(
+        &mut self,
+        base: usize,
+        source: &str,
+        textures: &[(String, String)],
+        vectors: &[(String, Vec<[f32; 4]>)],
+    ) -> usize {
+        let key = format!("{}#{source}", self.scene.materials[base].mao).to_ascii_lowercase();
+        if let Some(Some(i)) = self.material_index.get(&key) {
+            return *i;
+        }
+        let mut m = self.scene.materials[base].clone();
+        let o = &mut m.object;
+        for (param, tex) in textures {
+            match o
+                .textures
+                .iter_mut()
+                .find(|t| t.parameter.eq_ignore_ascii_case(param))
+            {
+                Some(t) => t.res_name = tex.clone(),
+                None => o.textures.push(TextureBinding {
+                    parameter: param.clone(),
+                    res_name: tex.clone(),
+                    requires_id: false,
+                }),
+            }
+        }
+        for (name, values) in vectors {
+            if let [v] = values.as_slice() {
+                o.vectors.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+                o.vectors.push((name.clone(), *v));
+            } else {
+                o.vector_arrays
+                    .retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+                o.vector_arrays
+                    .push((name.clone(), values.iter().flatten().copied().collect()));
+            }
+        }
+        m.mao = key.clone();
+        self.scene.materials.push(m);
+        let i = self.scene.materials.len() - 1;
+        self.material_index.insert(key, Some(i));
+        i
+    }
+
     /// Reads every irradiance probe the mounted level carries (`<level>_probe_*.mtx`).
     fn load_probes(&mut self, level: &str) {
         let prefix = format!("{}_probe_", level.to_ascii_lowercase());
@@ -516,6 +626,7 @@ impl<'a> Loader<'a> {
             lightmaps,
             room,
             probe,
+            morph,
         } = at;
         let Some(model) = self.model(model_name) else {
             return;
@@ -548,12 +659,32 @@ impl<'a> Loader<'a> {
             return;
         };
         for piece in pieces {
-            let Some(mesh) = self.mesh(&msh_name, &piece.mesh.chunk) else {
+            let Some(mut mesh) = self.mesh(&msh_name, &piece.mesh.chunk) else {
                 continue;
             };
-            let Some(material) = self.material(&piece.mesh.material) else {
+            let Some(mut material) = self.material(&piece.mesh.material) else {
                 continue;
             };
+            let shaped = morph.and_then(|(name, m)| {
+                piece
+                    .node_name
+                    .and_then(|n| m.node(n))
+                    .map(|node| (name, node))
+            });
+            if let Some((name, node)) = shaped {
+                if !node.vertices.is_empty() {
+                    mesh = self.morphed_mesh(mesh, name, node);
+                }
+                if !node.textures.is_empty() || !node.vectors.is_empty() {
+                    material = self.overridden_material(
+                        material,
+                        &format!("{name}:{}", node.name),
+                        &node.textures,
+                        &node.vectors,
+                    );
+                }
+            }
+
             let node = piece
                 .chain
                 .iter()
@@ -638,6 +769,7 @@ impl AreaScene {
             mesh_index: HashMap::new(),
             mat_defs: HashMap::new(),
             material_index: HashMap::new(),
+            morphs: HashMap::new(),
         };
         let arl_name = format!("{level}.arl");
         let arl = Arl::parse(&l.read(&arl_name)?).map_err(|e| SceneError::Parse {
@@ -687,6 +819,7 @@ impl AreaScene {
                         lightmaps: &p.lightmaps,
                         room: &room.name,
                         probe: room_probe,
+                        morph: None,
                     },
                 );
             }
@@ -705,6 +838,7 @@ impl AreaScene {
                 lightmaps: &[],
                 room,
                 probe,
+                morph: None,
             };
             for model in &prop.models {
                 l.place(model, prop.transform, placing(&prop.label));
@@ -723,6 +857,22 @@ impl AreaScene {
                     .fold(prop.transform, |m, t| m * transform_matrix(t));
                 l.place(model, at, placing(&prop.label));
             }
+            if let Some(name) = &prop.morph {
+                if let Some(m) = l.morph(name) {
+                    for (slot, model) in m.models.iter().enumerate() {
+                        let Some(model) = model else { continue };
+                        if prop.hide_hair && matches!(slot, morph_slot::HAIR | morph_slot::BEARD) {
+                            continue;
+                        }
+                        let model = model.to_ascii_lowercase();
+                        let at = Placing {
+                            morph: Some((name.as_str(), &m)),
+                            ..placing(&prop.label)
+                        };
+                        l.place(&model, prop.transform, at);
+                    }
+                }
+            }
             l.scene.props.push(PropDraws {
                 label: prop.label.clone(),
                 transform: prop.transform,
@@ -736,6 +886,101 @@ impl AreaScene {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn head_morphs_reshape_meshes_and_override_materials() {
+        let vfs = Vfs::new();
+        let mut l = Loader {
+            vfs: &vfs,
+            scene: AreaScene::default(),
+            mmh: HashMap::new(),
+            msh: HashMap::new(),
+            mesh_index: HashMap::new(),
+            mat_defs: HashMap::new(),
+            material_index: HashMap::new(),
+            morphs: HashMap::new(),
+        };
+        let vertex = |z: f32| Vertex {
+            position: [0.0, 0.0, z],
+            normal: [0.0, 0.0, 1.0],
+            uv0: [0.0; 2],
+            uv1: [0.0; 2],
+        };
+        l.scene.meshes.push(SceneMesh {
+            key: "head.msh:facem1".into(),
+            vertices: vec![vertex(1.0), vertex(2.0)],
+            indices: vec![0, 1, 0],
+            chunk: thedas_formats::mesh::MeshChunk {
+                name: "FaceM1".into(),
+                vertex_size: 0,
+                vertex_count: 2,
+                index_count: 3,
+                primitive: 0,
+                index_format: thedas_formats::mesh::IndexFormat::U16,
+                base_vertex: 0,
+                vertex_offset: 0,
+                start_index: 0,
+                elements: vec![],
+                bounds: None,
+            },
+            raw_vertices: vec![],
+            positions: None,
+        });
+        let xml = br#"<MaterialObject Name="face"><Material Name="face.mat"/>
+            <Texture Name="mml_tDiffuse" ResName="base_d.dds"/></MaterialObject>"#;
+        l.scene.materials.push(SceneMaterial {
+            mao: "face.mao".into(),
+            object: MaterialObject::parse(xml).unwrap(),
+            definition: None,
+            semantic: "Default".into(),
+            render_class: None,
+            technique: None,
+        });
+        let node = MorphNode {
+            name: "FaceM1".into(),
+            vertices: vec![[0.0, 0.1, 1.5, 1.0], [0.0, 0.2, 1.7, 1.0]],
+            textures: vec![("mml_tDiffuse".into(), "uh_hed_masa_0d".into())],
+            vectors: vec![
+                ("g_vFacialHairColour".into(), vec![[0.5, 0.25, 0.0, 1.0]]),
+                ("mml_vTintMaskColours".into(), vec![[1.0; 4], [0.5; 4]]),
+            ],
+            ..Default::default()
+        };
+        let m = l.morphed_mesh(0, "hm_test", &node);
+        assert_eq!(m, 1);
+        assert_eq!(l.scene.meshes[1].vertices[1].position, [0.0, 0.2, 1.7]);
+        assert_eq!(
+            l.scene.meshes[1].positions.as_deref(),
+            Some(&node.vertices[..])
+        );
+        assert_eq!(l.morphed_mesh(0, "hm_test", &node), 1, "shared");
+        let short = MorphNode {
+            vertices: vec![[0.0; 4]],
+            ..node.clone()
+        };
+        assert_eq!(l.morphed_mesh(0, "hm_other", &short), 0, "counts differ");
+
+        let mat = l.overridden_material(0, "hm_test:FaceM1", &node.textures, &node.vectors);
+        let o = &l.scene.materials[mat].object;
+        assert_eq!(
+            o.texture("mml_tDiffuse").unwrap().res_name,
+            "uh_hed_masa_0d"
+        );
+        assert_eq!(
+            o.vectors,
+            vec![("g_vFacialHairColour".into(), [0.5, 0.25, 0.0, 1.0])]
+        );
+        assert_eq!(o.vector_arrays[0].1.len(), 8);
+        assert_eq!(
+            l.scene.materials[0]
+                .object
+                .texture("mml_tDiffuse")
+                .unwrap()
+                .res_name,
+            "base_d.dds",
+            "the original is untouched"
+        );
+    }
 
     #[test]
     fn transforms_compose_room_then_placement() {

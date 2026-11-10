@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use glam::{Mat4, Vec3, Vec4};
-use thedas_formats::material::{MaterialDef, Parameter};
+use thedas_formats::material::{MaterialDef, Parameter, Technique};
 use thedas_formats::probe::IrradianceProbe;
 use thedas_formats::state::{CompareFunc, MaterialState, PassState};
 use thedas_shader::bytecode::{Comparison, TextureType};
@@ -147,41 +147,41 @@ fn build(vfs: &Vfs, vs_name: &str, ps_name: &str, state_name: &str) -> Result<D3
 }
 
 impl D3dSource {
-    /// Prepares programs for every material in the scene whose selected technique has a single
-    /// pass and (if `filter` is set) uses one of the listed vertex/pixel shader pairs.
+    /// Prepares programs for every material in the scene whose selected technique's passes
+    /// all (if `filter` is set) use one of the listed vertex/pixel shader pairs.
     pub fn new(vfs: &Vfs, scene: &AreaScene, filter: &ShaderFilter) -> Self {
         let mut programs = HashMap::new();
         let mut failures = Vec::new();
         for m in &scene.materials {
             let Some(t) = &m.technique else { continue };
-            if t.passes.len() != 1 {
-                continue;
-            }
-            let p = &t.passes[0];
-            let (Some(vs), Some(ps), Some(st)) = (&p.vertex_shader, &p.pixel_shader, &p.state)
-            else {
+            let Some(passes) = pass_shaders(t) else {
                 continue;
             };
             if let Some(f) = filter {
-                if !f.iter().any(|(v, q)| {
-                    v.eq_ignore_ascii_case(vs) && (q == "*" || q.eq_ignore_ascii_case(ps))
-                }) {
+                let listed = |(vs, ps, _): &(&str, &str, &str)| {
+                    f.iter().any(|(v, q)| {
+                        v.eq_ignore_ascii_case(vs) && (q == "*" || q.eq_ignore_ascii_case(ps))
+                    })
+                };
+                if !passes.iter().all(listed) {
                     continue;
                 }
             }
-            let key = format!("{vs}+{ps}+{st}").to_ascii_lowercase();
-            if programs.contains_key(&key) {
-                continue;
-            }
-            let built = match build(vfs, vs, ps, st) {
-                Ok(p) => Some(Arc::new(p)),
-                Err(e) => {
-                    log::warn!("original shader unavailable: {e}");
-                    failures.push(e);
-                    None
+            for (vs, ps, st) in passes {
+                let key = format!("{vs}+{ps}+{st}").to_ascii_lowercase();
+                if programs.contains_key(&key) {
+                    continue;
                 }
-            };
-            programs.insert(key, built);
+                let built = match build(vfs, vs, ps, st) {
+                    Ok(p) => Some(Arc::new(p)),
+                    Err(e) => {
+                        log::warn!("original shader unavailable: {e}");
+                        failures.push(e);
+                        None
+                    }
+                };
+                programs.insert(key, built);
+            }
         }
         Self { programs, failures }
     }
@@ -193,17 +193,33 @@ impl D3dSource {
 
 impl ProgramSource for D3dSource {
     fn program(&self, m: &SceneMaterial) -> Option<Program> {
-        let t = m.technique.as_ref()?;
-        let p = t.passes.first()?;
-        let key = format!(
-            "{}+{}+{}",
-            p.vertex_shader.as_deref()?,
-            p.pixel_shader.as_deref()?,
-            p.state.as_deref()?
-        )
-        .to_ascii_lowercase();
-        self.programs.get(&key).cloned().flatten().map(Program::D3d)
+        let passes = pass_shaders(m.technique.as_ref()?)?;
+        let programs: Option<Vec<Arc<D3dProgram>>> = passes
+            .iter()
+            .map(|(vs, ps, st)| {
+                let key = format!("{vs}+{ps}+{st}").to_ascii_lowercase();
+                self.programs.get(&key).cloned().flatten()
+            })
+            .collect();
+        programs.map(Program::D3d)
     }
+}
+
+/// Each pass's (vertex shader, pixel shader, state), if every pass names all three.
+fn pass_shaders(t: &Technique) -> Option<Vec<(&str, &str, &str)>> {
+    if t.passes.is_empty() {
+        return None;
+    }
+    t.passes
+        .iter()
+        .map(|p| {
+            Some((
+                p.vertex_shader.as_deref()?,
+                p.pixel_shader.as_deref()?,
+                p.state.as_deref()?,
+            ))
+        })
+        .collect()
 }
 
 /// Static1 and its variants plus `Black`: every shader the M1 area's geometry uses.
@@ -222,8 +238,10 @@ pub fn static1_filter() -> ShaderFilter {
 }
 
 /// [`static1_filter`] plus the vertex shaders that draw creatures and placeables:
-/// characters (`Char1`), eyes (`Eye0`), cloth (`Cloth1`) and props (`Prop1`), with any pixel
-/// shader.
+/// characters (`Char1`), faces (`Face1`), eyes (`Eye0`), cloth (`Cloth1`) and props
+/// (`Prop1`), with any pixel shader. Still on the stand-in: weapons (`Weapon1`; their tint
+/// colours come from the item's material, not read yet), hair (`Hair0`, four passes, which
+/// draw nothing yet) and lashes (`sm2_Eye0`, whose alpha test does not cut them out yet).
 pub fn object_filter() -> ShaderFilter {
     let mut v = static1_filter().unwrap_or_default();
     for vs in OBJECT_VERTEX_SHADERS {
@@ -233,7 +251,13 @@ pub fn object_filter() -> ShaderFilter {
 }
 
 /// See [`object_filter`].
-pub const OBJECT_VERTEX_SHADERS: [&str; 4] = ["Char1.vsh", "Eye0.vsh", "Cloth1.vsh", "Prop1.vsh"];
+pub const OBJECT_VERTEX_SHADERS: [&str; 5] = [
+    "Char1.vsh",
+    "Face1.vsh",
+    "Eye0.vsh",
+    "Cloth1.vsh",
+    "Prop1.vsh",
+];
 
 /// Point lights chosen for one draw, in slot order A, B, C.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -352,6 +376,20 @@ impl ConstantContext<'_> {
         r
     }
 
+    /// Whether the material object or its definition gives `name` a value.
+    fn material_value(&self, name: &str) -> Option<()> {
+        let mao = &self.material.object;
+        let set = mao.floats.iter().any(|(n, _)| n.eq_ignore_ascii_case(name))
+            || mao
+                .vectors
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case(name));
+        let default = find_param(self.material.definition.as_deref(), name)
+            .and_then(|p| p.default.as_deref())
+            .is_some_and(|d| !parse_floats(d).is_empty());
+        (set || default).then_some(())
+    }
+
     fn value(&self, c: &Constant) -> Option<Value> {
         let def = self.material.definition.as_deref();
         let usage = find_param(def, &c.name).and_then(|p| p.usage.clone());
@@ -392,6 +430,10 @@ impl ConstantContext<'_> {
                 }
                 Value::Vectors(v)
             }
+            // The engine's fade: fully opaque unless the material says otherwise.
+            (_, "mml_fOpacityMultiplier") if self.material_value(&c.name).is_none() => {
+                Value::Vectors(vec![[1.0, 0.0, 0.0, 0.0]])
+            }
             ("FogParameters", _) | ("ShadowData", _) | ("IrradianceParams", _) => {
                 Value::Vectors(Vec::new())
             }
@@ -428,16 +470,21 @@ impl ConstantContext<'_> {
                             .collect(),
                     )
                 } else {
+                    // A default holds as many vectors as the parameter has elements.
                     let d = find_param(def, &c.name).and_then(|p| p.default.as_deref())?;
                     let f = parse_floats(d);
                     if f.is_empty() {
                         return None;
                     }
-                    let mut o = [0.0; 4];
-                    for (x, y) in o.iter_mut().zip(&f) {
-                        *x = *y;
-                    }
-                    Value::Vectors(vec![o])
+                    Value::Vectors(
+                        f.chunks(4)
+                            .map(|q| {
+                                let mut o = [0.0; 4];
+                                o[..q.len()].copy_from_slice(q);
+                                o
+                            })
+                            .collect(),
+                    )
                 }
             }
         })

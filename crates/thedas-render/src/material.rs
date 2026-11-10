@@ -55,15 +55,16 @@ pub struct MaterialProgram {
 pub enum Program {
     /// A hand-written WGSL program using the [`bindings`] interface.
     StandIn(MaterialProgram),
-    /// The material's own D3D9 shaders, translated (see [`crate::d3d`]).
-    D3d(std::sync::Arc<crate::d3d::D3dProgram>),
+    /// The material's own D3D9 shaders, translated (see [`crate::d3d`]): one program per
+    /// pass of its technique, drawn in order.
+    D3d(Vec<std::sync::Arc<crate::d3d::D3dProgram>>),
 }
 
 impl Program {
     pub fn name(&self) -> &str {
         match self {
             Program::StandIn(p) => &p.name,
-            Program::D3d(p) => &p.name,
+            Program::D3d(p) => p.first().map_or("", |p| p.name.as_str()),
         }
     }
 }

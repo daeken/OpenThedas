@@ -12,6 +12,10 @@
 //!   its `m2da_base.gda` id), whose `ModelVariation` row gives the model's type, subtype and
 //!   variation letters. Worn items replace or add body parts; weapons (`w_lsw_ls01a_0`) hang
 //!   from the body's attachment nodes.
+//! - Heads: a creature template's `Appearance Data` names a head morph (`HeadMorph`, a
+//!   `.mor`), which names the head, eyes, hair, beard and lashes and carries the face's
+//!   shape and colours. Part-based creatures without one (the hero, made in character
+//!   creation) get the race's base head (`hm_uhm_basa_0`, eyes and lashes; provisional).
 
 use thedas_formats::gda::Cell;
 use thedas_script::vm::ObjectId;
@@ -34,6 +38,10 @@ pub struct ObjectModel {
     /// The body (or the placeable): models sharing the object's placement.
     pub models: Vec<String>,
     pub attached: Vec<Attached>,
+    /// The head morph resource (without `.mor`), if any.
+    pub morph: Option<String>,
+    /// A helmet hides the morph's hair and beard (provisional).
+    pub hide_hair: bool,
     pub position: [f32; 3],
     /// The game's facing (degrees about Z; see `thedas_sim::world::heading_of`).
     pub facing: f32,
@@ -104,31 +112,86 @@ fn has_model(sim: &Sim, model: &str) -> bool {
     sim.vfs.lookup(&format!("{model}.mmh")).is_some()
 }
 
-/// What draws one creature or placeable: (body models, attached models). Empty when it has
-/// nothing to draw.
-pub fn object_models(sim: &Sim, o: &Object) -> (Vec<String>, Vec<Attached>) {
+/// The head morph a creature's template names (`Appearance Data` / `HeadMorph`), if the
+/// resource exists.
+pub fn head_morph(sim: &Sim, o: &Object) -> Option<String> {
+    use thedas_formats::gff3::{Gff3, Struct, Value};
+    fn field<'a>(s: &'a Struct, label: &str) -> Option<&'a Value> {
+        s.fields.iter().find(|f| f.label == label).map(|f| &f.value)
+    }
+    if o.template.is_empty() {
+        return None;
+    }
+    let (data, _) = sim.vfs.read(&format!("{}.utc", o.template)).ok()?;
+    let g = Gff3::parse(&data).ok()?;
+    let app = match field(g.structs.first()?, "Appearance Data")? {
+        Value::Struct(i) => g.structs.get(*i as usize)?,
+        _ => return None,
+    };
+    let name = match field(app, "HeadMorph")? {
+        Value::ExoString(b) | Value::ResRef(b) => String::from_utf8_lossy(b)
+            .trim_end_matches('\0')
+            .trim()
+            .to_ascii_lowercase(),
+        _ => return None,
+    };
+    let stem = name.strip_suffix(".mor").unwrap_or(&name).to_string();
+    (!stem.is_empty() && sim.vfs.lookup(&format!("{stem}.mor")).is_some()).then_some(stem)
+}
+
+/// The race's base head for a part-based creature without a morph: head, eyes, lashes.
+fn base_head(sim: &Sim, prefix: &str) -> Vec<String> {
+    ["uhm_basa", "uem_basa", "ulm_basa"]
+        .iter()
+        .map(|p| format!("{prefix}_{p}{LOD0}"))
+        .filter(|m| has_model(sim, m))
+        .collect()
+}
+
+/// What draws one creature or placeable.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Drawn {
+    pub models: Vec<String>,
+    pub attached: Vec<Attached>,
+    pub morph: Option<String>,
+    pub hide_hair: bool,
+}
+
+/// What draws one creature or placeable; no models when it has nothing to draw.
+pub fn object_models(sim: &Sim, o: &Object) -> Drawn {
     let tables = sim.world.tables();
     match o.kind {
         ObjectKind::Placeable => {
             let Some(t) = tables.get(0, "placeable_types") else {
-                return Default::default();
+                return Drawn::default();
             };
-            let body = text(t.cell("ModelName", o.appearance as i64))
-                .map(|m| vec![m.to_ascii_lowercase()])
-                .unwrap_or_default();
-            (body, vec![])
+            Drawn {
+                models: text(t.cell("ModelName", o.appearance as i64))
+                    .map(|m| vec![m.to_ascii_lowercase()])
+                    .unwrap_or_default(),
+                ..Default::default()
+            }
         }
         ObjectKind::Creature => {
             let Some(t) = tables.get(0, "apr_base") else {
-                return Default::default();
+                return Drawn::default();
             };
             let app = o.appearance as i64;
             let kind = text(t.cell("ModelType", app)).unwrap_or_default();
-            let body = if kind.eq_ignore_ascii_case("P") {
+            let morph = head_morph(sim, o);
+            let mut hide_hair = false;
+            let models = if kind.eq_ignore_ascii_case("P") {
                 let race = text(t.cell("ModelRace", app)).unwrap_or_default();
                 let gender = o.fields.get("Gender").copied().unwrap_or(1);
                 match part_prefix(&race, gender) {
-                    Some(p) => worn_parts(sim, o, &p),
+                    Some(p) => {
+                        let (mut parts, helmet) = worn_parts(sim, o, &p);
+                        hide_hair = helmet;
+                        if morph.is_none() {
+                            parts.extend(base_head(sim, &p));
+                        }
+                        parts
+                    }
                     None => vec![],
                 }
             } else {
@@ -136,12 +199,17 @@ pub fn object_models(sim: &Sim, o: &Object) -> (Vec<String>, Vec<Attached>) {
                     .map(|m| vec![format!("{}{LOD0}", m.to_ascii_lowercase())])
                     .unwrap_or_default()
             };
-            if body.is_empty() {
-                return Default::default();
+            if models.is_empty() {
+                return Drawn::default();
             }
-            (body, weapons(sim, o))
+            Drawn {
+                models,
+                attached: weapons(sim, o),
+                morph,
+                hide_hair,
+            }
         }
-        _ => Default::default(),
+        _ => Drawn::default(),
     }
 }
 
@@ -154,30 +222,30 @@ fn equipped<'a>(sim: &'a Sim, o: &Object, slot_name: &str) -> Option<&'a Object>
 }
 
 /// A part-based creature's body: each body part from the item in its slot (chest, boots,
-/// gloves), or the unclothed part, plus a helmet when one is worn. A worn item whose model
-/// this race lacks leaves the unclothed part.
-fn worn_parts(sim: &Sim, o: &Object, prefix: &str) -> Vec<String> {
+/// gloves), or the unclothed part, plus a helmet when one is worn (and whether one is). A
+/// worn item whose model this race lacks leaves the unclothed part.
+fn worn_parts(sim: &Sim, o: &Object, prefix: &str) -> (Vec<String>, bool) {
     let slots = [
         "INVENTORY_SLOT_CHEST",
         "INVENTORY_SLOT_BOOTS",
         "INVENTORY_SLOT_GLOVES",
     ];
-    let mut out = Vec::new();
-    for ((_, nude), slot_name) in BODY_PARTS.iter().zip(slots) {
-        let worn = equipped(sim, o, slot_name)
-            .and_then(|i| item_variation(sim, i))
-            .map(|(ty, v)| format!("{prefix}_{ty}_{v}{LOD0}"))
-            .filter(|m| has_model(sim, m));
-        out.push(worn.unwrap_or_else(|| format!("{prefix}_{nude}{LOD0}")));
-    }
-    if let Some(helmet) = equipped(sim, o, "INVENTORY_SLOT_HEAD")
-        .and_then(|i| item_variation(sim, i))
-        .map(|(ty, v)| format!("{prefix}_{ty}_{v}{LOD0}"))
-        .filter(|m| has_model(sim, m))
-    {
-        out.push(helmet);
-    }
-    out
+    let worn = |slot_name: &str| {
+        let (ty, v) = item_variation(sim, equipped(sim, o, slot_name)?)?;
+        let model = format!("{prefix}_{ty}_{v}{LOD0}");
+        has_model(sim, &model).then_some(model)
+    };
+    let mut out: Vec<String> = BODY_PARTS
+        .iter()
+        .zip(slots)
+        .map(|((_, nude), slot_name)| {
+            worn(slot_name).unwrap_or_else(|| format!("{prefix}_{nude}{LOD0}"))
+        })
+        .collect();
+    let helmet = worn("INVENTORY_SLOT_HEAD");
+    let has_helmet = helmet.is_some();
+    out.extend(helmet);
+    (out, has_helmet)
 }
 
 /// The creature's weapons in its hands.
@@ -206,13 +274,15 @@ pub fn area_models(sim: &Sim, area: ObjectId) -> Vec<ObjectModel> {
         .filter(|o| o.area == Some(area) && o.active)
         .filter(|o| matches!(o.kind, ObjectKind::Creature | ObjectKind::Placeable))
         .filter_map(|o| {
-            let (models, attached) = object_models(sim, o);
-            (!models.is_empty()).then(|| ObjectModel {
+            let d = object_models(sim, o);
+            (!d.models.is_empty()).then(|| ObjectModel {
                 id: o.id,
                 tag: o.tag.clone(),
                 kind: o.kind,
-                models,
-                attached,
+                models: d.models,
+                attached: d.attached,
+                morph: d.morph,
+                hide_hair: d.hide_hair,
                 position: o.position,
                 facing: o.facing,
             })
