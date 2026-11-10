@@ -148,6 +148,9 @@ pub struct Prop {
     pub label: String,
     /// Model resources without the `.mmh` extension.
     pub models: Vec<String>,
+    /// Models hung from a node of the first of `models` that has it: (model, node), e.g. a
+    /// sword from the right hand's `Prop01`.
+    pub attached: Vec<(String, String)>,
     /// Model to world.
     pub transform: Mat4,
 }
@@ -696,18 +699,29 @@ impl AreaScene {
                 Some(room) => l.room_probe(level, &room.name),
                 None => l.room_probe(level, ""),
             };
+            let placing = |room| Placing {
+                scale: 1.0,
+                sphere: None,
+                lightmaps: &[],
+                room,
+                probe,
+            };
             for model in &prop.models {
-                l.place(
-                    model,
-                    prop.transform,
-                    Placing {
-                        scale: 1.0,
-                        sphere: None,
-                        lightmaps: &[],
-                        room: &prop.label,
-                        probe,
-                    },
-                );
+                l.place(model, prop.transform, placing(&prop.label));
+            }
+            for (model, node) in &prop.attached {
+                let chain = prop
+                    .models
+                    .iter()
+                    .find_map(|m| l.model(m).and_then(|mmh| mmh.node_chain(node)));
+                let Some(chain) = chain else {
+                    l.warn(format!("{}: no node {node} for {model}", prop.label));
+                    continue;
+                };
+                let at = chain
+                    .iter()
+                    .fold(prop.transform, |m, t| m * transform_matrix(t));
+                l.place(model, at, placing(&prop.label));
             }
             l.scene.props.push(PropDraws {
                 label: prop.label.clone(),

@@ -116,6 +116,7 @@ fn sim_view(
         .map(|m| thedas_render::Prop {
             label: format!("{} {}", m.id, m.tag),
             models: m.models,
+            attached: m.attached.into_iter().map(|a| (a.model, a.node)).collect(),
             transform: thedas_render::Prop::placement(m.position, m.facing),
         })
         .collect();

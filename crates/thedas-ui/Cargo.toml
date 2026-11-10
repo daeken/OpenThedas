@@ -25,5 +25,3 @@ thedas-sim.workspace = true
 thedas-script.workspace = true
 thedas-vfs.workspace = true
 
-[dev-dependencies]
-thedas-script.workspace = true

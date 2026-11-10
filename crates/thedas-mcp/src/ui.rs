@@ -23,7 +23,14 @@ pub struct LoadedScene {
 fn scene_key(layout: &str, props: &[ObjectModel]) -> (String, Vec<(u32, Vec<String>)>) {
     (
         layout.to_string(),
-        props.iter().map(|p| (p.id, p.models.clone())).collect(),
+        props
+            .iter()
+            .map(|p| {
+                let mut models = p.models.clone();
+                models.extend(p.attached.iter().map(|a| format!("{}@{}", a.model, a.node)));
+                (p.id, models)
+            })
+            .collect(),
     )
 }
 
@@ -74,6 +81,11 @@ impl UiWorld {
             .map(|p| thedas_render::Prop {
                 label: format!("{} {}", p.id, p.tag),
                 models: p.models.clone(),
+                attached: p
+                    .attached
+                    .iter()
+                    .map(|a| (a.model.clone(), a.node.clone()))
+                    .collect(),
                 transform: thedas_render::Prop::placement(p.position, p.facing),
             })
             .collect();

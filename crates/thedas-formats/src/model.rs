@@ -148,6 +148,32 @@ impl Mmh {
         })
     }
 
+    /// The transforms from the model root down to the first node named `name` (ignoring
+    /// case), depth first in file order: a bone or attachment point's rest placement.
+    pub fn node_chain(&self, name: &str) -> Option<Vec<Transform>> {
+        fn walk(n: &Node, name: &str, chain: &mut Vec<Transform>) -> bool {
+            chain.push(n.transform);
+            if n.name
+                .as_deref()
+                .is_some_and(|x| x.eq_ignore_ascii_case(name))
+            {
+                return true;
+            }
+            for c in &n.children {
+                if walk(c, name, chain) {
+                    return true;
+                }
+            }
+            chain.pop();
+            false
+        }
+        let mut chain = Vec::new();
+        self.nodes
+            .iter()
+            .any(|n| walk(n, name, &mut chain))
+            .then_some(chain)
+    }
+
     /// Every mesh node, depth first in file order.
     pub fn mesh_pieces(&self) -> Vec<MeshPiece<'_>> {
         fn walk<'a>(n: &'a Node, chain: &mut Vec<Transform>, out: &mut Vec<MeshPiece<'a>>) {
@@ -304,6 +330,11 @@ mod tests {
         assert_eq!(pieces[0].chain.len(), 2);
         assert_eq!(pieces[0].chain[1].position, [0.0, 0.0, 5.0]);
         assert!(mmh.lights().is_empty());
+        let chain = mmh.node_chain("mshmain_WALL").unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].position, [1.0, 2.0, 3.0]);
+        assert_eq!(mmh.node_chain("gob").unwrap().len(), 1);
+        assert!(mmh.node_chain("Prop01").is_none());
     }
 
     #[test]
