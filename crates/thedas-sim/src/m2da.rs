@@ -129,8 +129,8 @@ impl Tables {
         }
     }
 
-    /// Puts a ready-made table under a worksheet name (as `get(_, name)` finds it), for tests.
-    #[cfg(test)]
+    /// Puts a ready-made table under a worksheet name (as `get(_, name)` finds it, and
+    /// `#<id>` as `get(id, "")` does), for tests.
     pub fn insert(&self, worksheet: &str, columns: &[&str], rows: Vec<(i64, Vec<Cell>)>) {
         let mut t = Table::default();
         for (i, c) in columns.iter().enumerate() {

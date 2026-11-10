@@ -26,8 +26,23 @@ pub type MessageHandler =
 /// Looks up a talk-table string.
 pub type StringLookup = Arc<dyn Fn(u32) -> Option<String> + Send + Sync>;
 
-/// Looks up a 2DA cell: the M2DA table id, the row id and the column's hash.
-pub type TableLookup = Arc<dyn Fn(i32, i64, u32) -> Option<UiValue> + Send + Sync>;
+/// A question about the game's 2DA tables (M2DA table ids, column hashes).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TableQuery {
+    /// `Get2DAValue`: the cell at a row id.
+    Cell { table: i32, row: i64, column: u32 },
+    /// `Get2DAValueByRowIndexColumnHash`: the cell at a row's position in the table.
+    CellAt {
+        table: i32,
+        index: usize,
+        column: u32,
+    },
+    /// `GetNum2DARows`.
+    Rows { table: i32 },
+}
+
+/// Answers [`TableQuery`]s.
+pub type TableLookup = Arc<dyn Fn(TableQuery) -> Option<UiValue> + Send + Sync>;
 
 /// The function that starts a movie in game mode.
 pub const START_SCENE: &str = "_global.GUISystem.StartSceneFromGame";
@@ -231,6 +246,13 @@ impl GameBridge {
                     }
                 }
             }
+            // SharedLibrary.Ability.LoadFromToken's call (see `avm1::PRE_CALLS`).
+            "GetAbilityAttributes" => {
+                let Ok(s) = self.state.lock() else {
+                    return UiValue::Undefined;
+                };
+                crate::chains::ability_attributes(|k| s.values.get(k).cloned(), &arg(0))
+            }
             "GetTlkString" => {
                 let id = arg(0).parse::<u32>().ok();
                 match id.and_then(|id| (self.strings)(id)) {
@@ -262,20 +284,46 @@ impl GameBridge {
             }
             // A 2DA cell: the table id, the row id and the column hash (worldmap.gfx reads
             // map names and pin images this way).
-            "Get2DAValue" if call.kind == CallKind::FsCommand => {
+            // The 2DA fscommands: (table id, row id or row position, column hash) and
+            // (table id) for the row count.
+            name @ ("Get2DAValue" | "Get2DAValueByRowIndexColumnHash" | "GetNum2DARows")
+                if call.kind == CallKind::FsCommand =>
+            {
                 let lookup = self.tables.lock().ok().and_then(|t| t.clone());
-                let (table, row, hash) = (
-                    arg(0).trim().parse::<i32>().ok(),
-                    arg(1).trim().parse::<i64>().ok(),
-                    arg(2).trim().parse::<u32>().ok(),
-                );
-                let found = match (lookup, table, row, hash) {
-                    (Some(l), Some(t), Some(r), Some(h)) => l(t, r, h),
+                let table = arg(0).trim().parse::<i32>().ok();
+                let row = arg(1)
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|r| r.fract() == 0.0);
+                let column = arg(2).trim().parse::<u32>().ok();
+                let query = match (name, table, row, column) {
+                    ("Get2DAValue", Some(table), Some(row), Some(column)) => {
+                        Some(TableQuery::Cell {
+                            table,
+                            row: row as i64,
+                            column,
+                        })
+                    }
+                    ("Get2DAValueByRowIndexColumnHash", Some(table), Some(row), Some(column))
+                        if row >= 0.0 =>
+                    {
+                        Some(TableQuery::CellAt {
+                            table,
+                            index: row as usize,
+                            column,
+                        })
+                    }
+                    ("GetNum2DARows", Some(table), _, _) => Some(TableQuery::Rows { table }),
+                    _ => None,
+                };
+                let found = match (lookup, query) {
+                    (Some(l), Some(q)) => l(q),
                     _ => None,
                 };
                 found.unwrap_or_else(|| {
                     if let Ok(mut s) = self.state.lock() {
-                        *s.unanswered.entry("Get2DAValue".into()).or_default() += 1;
+                        *s.unanswered.entry(name.into()).or_default() += 1;
                     }
                     UiValue::Undefined
                 })
@@ -407,6 +455,71 @@ mod tests {
         assert_eq!(
             b.handle(other),
             Some(GameMessage::Send("GUI.HideFullScreenGUI".into(), vec![]))
+        );
+    }
+
+    #[test]
+    fn table_fscommands_and_ability_attributes_are_answered() {
+        let b = bridge();
+        b.set_table_lookup(Some(Arc::new(|q| match q {
+            TableQuery::Cell {
+                table: 111,
+                row: 117,
+                column: 7,
+            } => Some(UiValue::Number(371207.0)),
+            TableQuery::CellAt {
+                table: 3,
+                index: 2,
+                column: 9,
+            } => Some(UiValue::Number(1.0)),
+            TableQuery::Rows { table: 3 } => Some(UiValue::Number(26.0)),
+            _ => None,
+        })));
+        let fs = CallKind::FsCommand;
+        let n = |x: f64| UiValue::Number(x);
+        assert_eq!(
+            b.respond(&call(fs, "Get2DAValue", &["111 117 7"])),
+            n(371207.0)
+        );
+        assert_eq!(
+            b.respond(&call(fs, "Get2DAValueByRowIndexColumnHash", &["3 2 9"])),
+            n(1.0)
+        );
+        assert_eq!(b.respond(&call(fs, "GetNum2DARows", &["3"])), n(26.0));
+        assert_eq!(
+            b.respond(&call(fs, "Get2DAValueByRowIndexColumnHash", &["3 -1 9"])),
+            UiValue::Undefined
+        );
+        assert_eq!(
+            b.unanswered().get("Get2DAValueByRowIndexColumnHash"),
+            Some(&1)
+        );
+        let t = "CharGenCreature.Stats.TalentChains.0";
+        b.set_values([
+            (format!("{t}.ID"), n(14.0)),
+            (format!("{t}.UseType"), n(4.0)),
+            (
+                format!("{t}.Icon"),
+                UiValue::String("tlt_ico_powerful".into()),
+            ),
+            (format!("{t}.GUIType"), n(101.0)),
+            (format!("{t}.PrereqAbilityID"), n(4022.0)),
+            (format!("{t}.DisplayState"), n(2.0)),
+        ]);
+        assert_eq!(
+            b.respond(&call(
+                CallKind::ExternalInterface,
+                "GetAbilityAttributes",
+                &[t]
+            )),
+            UiValue::List(vec![
+                n(14.0),
+                n(4.0),
+                UiValue::String("tlt_ico_powerful".into()),
+                n(101.0),
+                n(4022.0),
+                n(2.0)
+            ])
         );
     }
 

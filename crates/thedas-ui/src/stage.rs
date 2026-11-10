@@ -44,17 +44,33 @@ pub fn vfs_lookup(vfs: &Arc<Vfs>) -> ResourceLookup {
 
 /// The game's 2DA tables, for `Get2DAValue` (by M2DA table id, row id and column hash).
 pub fn table_lookup(vfs: &Arc<Vfs>) -> crate::protocol::TableLookup {
+    use crate::protocol::TableQuery;
     let tables = thedas_sim::m2da::Tables::new(vfs.clone());
-    Arc::new(move |table, row, hash| {
-        let t = tables.get(table, "")?;
-        Some(match t.cell_by_hash(hash, row)? {
-            thedas_formats::gda::Cell::Int(v) => UiValue::Number(*v as f64),
-            thedas_formats::gda::Cell::Float(v) => UiValue::Number(*v),
+    Arc::new(move |q| {
+        let value = |c: &thedas_formats::gda::Cell| match c {
+            thedas_formats::gda::Cell::Int(v) => Some(UiValue::Number(*v as f64)),
+            thedas_formats::gda::Cell::Float(v) => Some(UiValue::Number(*v)),
             thedas_formats::gda::Cell::String(s) => {
-                UiValue::String(s.trim_end_matches('\0').to_string())
+                Some(UiValue::String(s.trim_end_matches('\0').to_string()))
             }
-            _ => return None,
-        })
+            _ => None,
+        };
+        match q {
+            TableQuery::Cell { table, row, column } => {
+                value(tables.get(table, "")?.cell_by_hash(column, row)?)
+            }
+            TableQuery::CellAt {
+                table,
+                index,
+                column,
+            } => {
+                let t = tables.get(table, "")?;
+                value(t.cell_by_hash(column, *t.order.get(index)?)?)
+            }
+            TableQuery::Rows { table } => {
+                Some(UiValue::Number(tables.get(table, "")?.order.len() as f64))
+            }
+        }
     })
 }
 
@@ -212,6 +228,7 @@ impl Stage {
             );
         }
         m.call(START_SCENE, &[]);
+        m.call(crate::avm1::INSTALL, &[]);
         // Movies anchor their elements to the screen when the engine asks them to lay out.
         m.call(LAYOUT, &[]);
         self.movies.push(m);

@@ -14,6 +14,10 @@
 /// The callback name the injected code registers.
 pub const INVOKE_CALLBACK: &str = "thedas_invoke";
 
+/// The function the host calls once, after starting a movie, to wrap [`PRE_CALLS`] (the
+/// movies define those classes after the first frame's actions run).
+pub const INSTALL: &str = "_global.thedas_install";
+
 /// The callback name for setting a movie variable (`object path`, `member`, `value`).
 pub const SET_CALLBACK: &str = "thedas_set";
 
@@ -37,6 +41,34 @@ pub const RETURNING_FSCOMMANDS: &[&str] = &[
     "GetTlkString",
     "FormatFloat",
 ];
+
+/// Functions the game answers by setting a movie variable while the function runs (Scaleform's
+/// `GFxMovie::SetVariable` from inside an `ExternalInterface` handler, which Ruffle's handlers
+/// cannot do). Each is wrapped to set the variable from `ExternalInterface.call(call name, first
+/// argument)` before the original runs, so the original finds it set.
+///
+/// - `SharedLibrary.Ability.LoadFromToken(token)` calls `GetAbilityAttributes` and reads
+///   `_root.ReturnedAbilityAttributes` (its register 1 is `_root`): id, use type, icon, GUI
+///   type, prerequisite, display state.
+pub const PRE_CALLS: &[PreCall] = &[PreCall {
+    object: &["_global", "SharedLibrary", "Ability"],
+    function: "LoadFromToken",
+    target: &["_root"],
+    variable: "ReturnedAbilityAttributes",
+    call: "GetAbilityAttributes",
+}];
+
+/// One of [`PRE_CALLS`].
+pub struct PreCall {
+    /// The path of the object holding the function.
+    pub object: &'static [&'static str],
+    pub function: &'static str,
+    /// The path of the object holding the variable.
+    pub target: &'static [&'static str],
+    pub variable: &'static str,
+    /// The `ExternalInterface` call answering it.
+    pub call: &'static str,
+}
 
 const SET_MEMBER: u8 = 0x4f;
 
@@ -97,6 +129,32 @@ fn wrap_maker() -> Vec<u8> {
     let mut outer = function(&[], &inner);
     outer.push(RETURN);
     function(&["o"], &outer)
+}
+
+/// `function (o, t, m, c) { return function () {
+/// t[m] = flash.external.ExternalInterface.call(c, arguments[0]);
+/// return o.apply(this, arguments); }; }`
+fn prewrap_maker() -> Vec<u8> {
+    let mut inner = Vec::new();
+    get_path(&mut inner, &["t"]);
+    get_path(&mut inner, &["m"]);
+    get_path(&mut inner, &["arguments"]);
+    push(&mut inner, &[Push::Int(0)]);
+    inner.push(GET_MEMBER);
+    get_path(&mut inner, &["c"]);
+    push(&mut inner, &[Push::Int(2)]);
+    get_path(&mut inner, &["flash", "external", "ExternalInterface"]);
+    push(&mut inner, &[Push::Str("call")]);
+    inner.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
+    get_path(&mut inner, &["arguments"]);
+    get_path(&mut inner, &["this"]);
+    push(&mut inner, &[Push::Int(2)]);
+    get_path(&mut inner, &["o"]);
+    push(&mut inner, &[Push::Str("apply")]);
+    inner.extend_from_slice(&[CALL_METHOD, RETURN]);
+    let mut outer = function(&[], &inner);
+    outer.push(RETURN);
+    function(&["o", "t", "m", "c"], &outer)
 }
 
 fn record(out: &mut Vec<u8>, code: u8, body: &[u8]) {
@@ -164,6 +222,36 @@ pub fn register_invoke() -> Vec<u8> {
         push(&mut out, &[Push::Str("thedas_wrap")]);
         out.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
     }
+    // _global.thedas_prewrap = prewrap_maker; _global.thedas_install wraps the PRE_CALLS
+    // functions (the host calls it once the movie's classes exist, see `INSTALL`).
+    get_path(&mut out, &["_global"]);
+    push(&mut out, &[Push::Str("thedas_prewrap")]);
+    out.extend(prewrap_maker());
+    out.push(SET_MEMBER);
+    let mut install = Vec::new();
+    for p in PRE_CALLS {
+        get_path(&mut install, p.object);
+        push(
+            &mut install,
+            &[
+                Push::Str(p.function),
+                Push::Str(p.call),
+                Push::Str(p.variable),
+            ],
+        );
+        get_path(&mut install, p.target);
+        let mut func = p.object.to_vec();
+        func.push(p.function);
+        get_path(&mut install, &func);
+        push(&mut install, &[Push::Int(4)]);
+        get_path(&mut install, &["_global"]);
+        push(&mut install, &[Push::Str("thedas_prewrap")]);
+        install.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
+    }
+    get_path(&mut out, &["_global"]);
+    push(&mut out, &[Push::Str("thedas_install")]);
+    out.extend(function(&[], &install));
+    out.push(SET_MEMBER);
     for (name, f) in [
         (INVOKE_CALLBACK, invoke_function()),
         (SET_CALLBACK, set_function()),

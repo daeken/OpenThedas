@@ -253,6 +253,10 @@ struct LevelUpArgs {
     /// Spend whatever points remain as the creature's auto-level table suggests.
     #[serde(default)]
     auto: bool,
+    /// Only open the level-up screen and leave the choices to the interface (open the
+    /// `levelup` movie with ui_open; its choices go to the game as the screen sends them).
+    #[serde(default)]
+    screen: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1426,7 +1430,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Level up a party member as the level-up screen does: open it (EVENT_TYPE_PLAYERLEVELUP), spend attribute points and learn abilities through the chargen events, and close it. Returns the creature's level, attributes, unspent points (34 attribute, 35 skill, 36 talent) and abilities."
+        description = "Level up a party member as the level-up screen does: open it (EVENT_TYPE_PLAYERLEVELUP), spend attribute points and learn abilities through the chargen events, and close it. Returns the creature's level, attributes, unspent points (34 attribute, 35 skill, 36 talent) and abilities. With screen=true it only opens it, for the levelup movie to drive."
     )]
     async fn level_up(&self, Parameters(a): Parameters<LevelUpArgs>) -> String {
         self.with_sim(|st| {
@@ -1441,6 +1445,9 @@ impl Server {
                 return Err(
                     "the level-up screen did not open (in combat, or not a party member?)".into(),
                 );
+            }
+            if a.screen {
+                return Ok(json!({ "object": who, "level_up_open": true }));
             }
             for (attr, n) in &a.attributes {
                 sim.chargen_event("CHARGEN_ASSIGN_ATTRIBUTES", vec![*attr, *n], Vec::new());
