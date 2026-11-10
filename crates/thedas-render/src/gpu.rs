@@ -870,6 +870,12 @@ impl AreaRenderer {
         &self.depth.as_ref().expect("depth view just created").0
     }
 
+    /// This renderer's depth buffer for a target of the given size, for a later pass to
+    /// draw over (see [`AreaRenderer::render_over`]).
+    pub fn depth(&mut self, device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+        self.depth_view(device, width, height).clone()
+    }
+
     /// Records the area pass into `encoder`, drawing into `target` of the given size.
     pub fn render(
         &mut self,
@@ -879,6 +885,37 @@ impl AreaRenderer {
         width: u32,
         height: u32,
         camera: &Camera,
+    ) {
+        self.render_pass(ctx, encoder, target, width, height, camera, None);
+    }
+
+    /// Records this renderer's draws over what an earlier pass drew into `target`, testing
+    /// against (and writing) that pass's `depth` (see [`AreaRenderer::depth`]): a level
+    /// drawn once, the creatures over it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_over(
+        &mut self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        camera: &Camera,
+        depth: &wgpu::TextureView,
+    ) {
+        self.render_pass(ctx, encoder, target, width, height, camera, Some(depth));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_pass(
+        &mut self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        camera: &Camera,
+        over: Option<&wgpu::TextureView>,
     ) {
         let frame = FrameUniforms {
             view_proj: camera
@@ -895,7 +932,17 @@ impl AreaRenderer {
         ctx.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
         self.d3d.update(ctx, camera, width, height);
-        let depth = self.depth_view(&ctx.device, width, height).clone();
+        let depth = match over {
+            Some(d) => d.clone(),
+            None => self.depth_view(&ctx.device, width, height).clone(),
+        };
+        let (color_load, depth_load) = match over {
+            Some(_) => (wgpu::LoadOp::Load, wgpu::LoadOp::Load),
+            None => (
+                wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                wgpu::LoadOp::Clear(1.0),
+            ),
+        };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("area"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -903,14 +950,14 @@ impl AreaRenderer {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    load: color_load,
                     store: wgpu::StoreOp::Store,
                 },
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &depth,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
+                    load: depth_load,
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
@@ -949,6 +996,19 @@ impl AreaRenderer {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, GpuError> {
+        self.capture_with(ctx, camera, width, height, &mut [])
+    }
+
+    /// [`AreaRenderer::capture`] with `overlays` drawn over this renderer's pass (see
+    /// [`AreaRenderer::render_over`]).
+    pub fn capture_with(
+        &mut self,
+        ctx: &GpuContext,
+        camera: &Camera,
+        width: u32,
+        height: u32,
+        overlays: &mut [&mut AreaRenderer],
+    ) -> Result<Vec<u8>, GpuError> {
         let target = ctx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("capture"),
             size: wgpu::Extent3d {
@@ -977,6 +1037,12 @@ impl AreaRenderer {
                 label: Some("capture"),
             });
         self.render(ctx, &mut encoder, &view, width, height, camera);
+        if !overlays.is_empty() {
+            let depth = self.depth(&ctx.device, width, height);
+            for o in overlays.iter_mut() {
+                o.render_over(ctx, &mut encoder, &view, width, height, camera, &depth);
+            }
+        }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &target,

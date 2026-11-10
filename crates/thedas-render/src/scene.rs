@@ -284,6 +284,8 @@ struct Placing<'a> {
     morph: Option<(&'a str, &'a Morph)>,
     /// An item tint for every material of the model: (name, tint).
     tint: Option<(&'a str, &'a Tint)>,
+    /// Only the model's lights (a level placement in a scene of objects alone).
+    lights_only: bool,
 }
 
 /// The material parameter an item tint fills.
@@ -706,6 +708,7 @@ impl<'a> Loader<'a> {
             probe,
             morph,
             tint,
+            lights_only,
         } = at;
         let Some(model) = self.model(model_name) else {
             return;
@@ -728,6 +731,9 @@ impl<'a> Loader<'a> {
                     name,
                 },
             });
+        }
+        if lights_only {
+            return;
         }
         let pieces = model.mesh_pieces();
         if pieces.is_empty() {
@@ -875,6 +881,22 @@ impl AreaScene {
         level: &str,
         props: &[Prop],
     ) -> Result<AreaScene, SceneError> {
+        Self::load_parts(vfs, level, props, true)
+    }
+
+    /// The objects alone in a level: `props` lit by the level's lights and probes, without
+    /// the level's own meshes, for drawing over a scene of the level drawn once (see
+    /// `AreaRenderer::render_over`): objects that come and go then rebuild only themselves.
+    pub fn load_objects(vfs: &Vfs, level: &str, props: &[Prop]) -> Result<AreaScene, SceneError> {
+        Self::load_parts(vfs, level, props, false)
+    }
+
+    fn load_parts(
+        vfs: &Vfs,
+        level: &str,
+        props: &[Prop],
+        level_meshes: bool,
+    ) -> Result<AreaScene, SceneError> {
         let mut l = Loader {
             vfs,
             scene: AreaScene {
@@ -940,6 +962,7 @@ impl AreaScene {
                         probe: room_probe,
                         morph: None,
                         tint: None,
+                        lights_only: !level_meshes,
                     },
                 );
             }
@@ -960,6 +983,7 @@ impl AreaScene {
                 probe,
                 morph: None,
                 tint: None,
+                lights_only: false,
             };
             // Each tinted model's tint, read once per prop.
             let tints: Vec<(String, String, Option<Arc<Tint>>)> = prop

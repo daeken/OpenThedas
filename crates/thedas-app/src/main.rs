@@ -275,13 +275,11 @@ fn capture(
     let ctx = GpuContext::headless()?;
     let pixels = if let Some(live) = live {
         live.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
-        match live.scene.as_mut() {
-            Some(s) => {
-                log_stats(&s.renderer);
-                s.renderer.capture(&ctx, &camera, w, h)?
-            }
-            None => [0, 0, 0, 255].repeat(w as usize * h as usize),
+        if let Some(l) = live.level.as_ref() {
+            log_stats(&l.renderer);
         }
+        live.capture(&ctx, &camera, (w, h))?
+            .unwrap_or_else(|| [0, 0, 0, 255].repeat(w as usize * h as usize))
     } else {
         match &loaded.scene {
             Some(scene) => {
@@ -469,20 +467,18 @@ impl App {
             live.step(dt);
             live.sync(&g.ctx, g.config.format)?;
         }
-        let renderer = match self.live.as_mut() {
-            Some(live) => live.scene.as_mut().map(|s| &mut s.renderer),
-            None => g.renderer.as_mut(),
+        let size = (g.config.width, g.config.height);
+        let drawn = match (self.live.as_mut(), g.renderer.as_mut()) {
+            (Some(live), _) => live.render(&g.ctx, &mut encoder, &view, size, &self.camera),
+            (None, Some(r)) => {
+                r.render(&g.ctx, &mut encoder, &view, size.0, size.1, &self.camera);
+                true
+            }
+            (None, None) => false,
         };
-        match renderer {
-            Some(r) => r.render(
-                &g.ctx,
-                &mut encoder,
-                &view,
-                g.config.width,
-                g.config.height,
-                &self.camera,
-            ),
-            None => {
+        match drawn {
+            true => {}
+            false => {
                 encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("clear"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -520,14 +516,14 @@ impl App {
             .map_or("ui", |s| s.level.as_str());
         let path = PathBuf::from(format!("{level}-capture-{}.png", self.captures));
         let (w, h) = (g.config.width, g.config.height);
-        let renderer = match self.live.as_mut() {
-            Some(live) => live.scene.as_mut().map(|s| &mut s.renderer),
-            None => g.renderer.as_mut(),
+        let pixels = match (self.live.as_mut(), g.renderer.as_mut()) {
+            (Some(live), _) => live.capture(&g.ctx, &self.camera, (w, h))?,
+            (None, Some(r)) => Some(r.capture(&g.ctx, &self.camera, w, h)?),
+            (None, None) => None,
         };
-        let Some(renderer) = renderer else {
+        let Some(pixels) = pixels else {
             return Ok(());
         };
-        let pixels = renderer.capture(&g.ctx, &self.camera, w, h)?;
         write_png(&path, w, h, &pixels)?;
         println!("wrote {} (camera {})", path.display(), self.camera.spec());
         Ok(())
