@@ -551,10 +551,13 @@ impl App {
         }
         match (self.screens.as_mut(), self.live.as_mut()) {
             (Some(screens), Some(live)) => {
+                let level = live.level.as_ref();
+                g.ui.set_level(level.map(|l| l.layout.as_str()), level.map(|l| &l.vfs));
                 for aim in g.ui.play(screens, &live.sim, dt.min(100.0)) {
                     log::info!("aiming ability {} (click a target)", aim.ability);
                     live.aiming = Some(aim);
                 }
+                g.ui.update_minimap(&live.sim, &self.camera);
             }
             _ => {
                 for call in g.ui.tick(dt.min(100.0)) {
@@ -1073,10 +1076,16 @@ fn main() -> Result<()> {
                             l.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
                             if let Some((layer, s)) = played.as_mut() {
                                 let t = Instant::now();
+                                let level = l.level.as_ref();
+                                layer.set_level(
+                                    level.map(|x| x.layout.as_str()),
+                                    level.map(|x| &x.vfs),
+                                );
                                 if let Some(aim) = layer.play(s, &l.sim, dt).pop() {
                                     println!("aiming ability {}", aim.ability);
                                     l.aiming = Some(aim);
                                 }
+                                layer.update_minimap(&l.sim, &camera);
                                 ui_time += t.elapsed();
                             }
                             frames += 1;

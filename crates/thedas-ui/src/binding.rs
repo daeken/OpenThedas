@@ -74,6 +74,8 @@ pub struct Presentation {
     /// The inventory screen's item category tab (`GUIInventory.SetItemListFilter`, see
     /// [`ItemCategory`]); 0 shows every item.
     pub item_filter: i32,
+    /// The current level's minimap, read from its resources.
+    pub minimap: Option<crate::minimap::MinimapInfo>,
 }
 
 /// The inventory screen's item category tabs (inventory.gfx's `CATEGORY_*`).
@@ -348,6 +350,23 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         .count();
     set("Area.CreatureCount".into(), num(creatures as f64));
     inventory(sim, controlled.or(hero), shown.item_filter, &mut v);
+    // The minimap, as minimap.gfx reads it: the picture, the world corners it spans
+    // (`Left`/`Bottom` the lower, `Right`/`Top` the upper) and the share of the picture
+    // they cover. Provisional: north is taken to be up (0).
+    if let Some(m) = &shown.minimap {
+        let s = |k: &str, x: UiValue| (format!("Area.{k}"), x);
+        v.extend([
+            s("Minimap", UiValue::String(m.texture.clone())),
+            s("MinimapLeft", num(m.min[0])),
+            s("MinimapBottom", num(m.min[1])),
+            s("MinimapRight", num(m.max[0])),
+            s("MinimapTop", num(m.max[1])),
+            s("MinimapWidth", num(m.used[0])),
+            s("MinimapHeight", num(m.used[1])),
+            s("North", num(0)),
+        ]);
+        v.insert("GUI.MinimapOpen".into(), num(1));
+    }
     if let Some(who) = controlled.or(hero) {
         quickbar(sim, who, &mut v);
     }
@@ -648,6 +667,7 @@ mod tests {
             &sim,
             &Presentation {
                 item_filter: ItemCategory::Weapons as i32,
+                ..Default::default()
             },
         );
         assert!(!weapons.contains_key(&format!("{k}.0")));
@@ -655,6 +675,7 @@ mod tests {
             &sim,
             &Presentation {
                 item_filter: ItemCategory::Other as i32,
+                ..Default::default()
             },
         );
         assert!(other.contains_key(&format!("{k}.0")));
@@ -701,6 +722,43 @@ mod tests {
             v["InputMappings.Mappings.ActivateQuickslot10.PrimaryMappedKey"],
             UiValue::String("0".into())
         );
+    }
+
+    #[test]
+    fn the_minimap_spans_its_levels_corners() {
+        let sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        assert!(!sim_values(&sim).contains_key("Area.Minimap"));
+        let shown = Presentation {
+            minimap: Some(crate::minimap::MinimapInfo {
+                texture: "hrt001d_mmap_ph.dds".into(),
+                min: [-70.0, -50.0],
+                max: [25.0, 50.0],
+                used: [0.5, 0.6],
+                size: [512.0, 512.0],
+            }),
+            ..Default::default()
+        };
+        let v = sim_values_for(&sim, &shown);
+        let n = |k: &str| v[k].clone();
+        assert_eq!(
+            n("Area.Minimap"),
+            UiValue::String("hrt001d_mmap_ph.dds".into())
+        );
+        assert_eq!(
+            [
+                n("Area.MinimapLeft"),
+                n("Area.MinimapBottom"),
+                n("Area.MinimapRight"),
+                n("Area.MinimapTop")
+            ],
+            [-70.0, -50.0, 25.0, 50.0].map(UiValue::Number)
+        );
+        assert_eq!(n("Area.MinimapWidth"), UiValue::Number(0.5));
+        assert_eq!(n("GUI.MinimapOpen"), UiValue::Number(1.0));
     }
 
     #[test]
