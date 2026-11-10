@@ -665,6 +665,7 @@ impl Sim {
             due: None,
             from: None,
             approach: None,
+            ring_wait: false,
         };
         if let Some(o) = self.world.get_mut(attacker) {
             o.commands.clear();
@@ -701,6 +702,7 @@ impl Sim {
             due: None,
             from: None,
             approach: None,
+            ring_wait: false,
         };
         if let Some(o) = self.world.get_mut(who).filter(|o| o.commands.is_empty()) {
             o.commands.push(cmd);
@@ -922,11 +924,42 @@ impl Sim {
     }
 }
 
-/// How close a melee attacker gets before swinging (metres). Provisional: rules_core
-/// counts any melee attack from beyond 5 m as a miss.
+/// How close a melee attacker gets before swinging (metres) when neither side's size is
+/// known. Provisional: rules_core counts any melee attack from beyond 5 m as a miss.
 pub const MELEE_REACH: f32 = 2.0;
 
+/// The gap a melee attacker leaves between its body and its target's (metres). Provisional.
+pub const MELEE_GAP: f32 = 0.5;
+
+/// A creature's body radius when its appearance gives none (metres). Provisional.
+pub const DEFAULT_RADIUS: f32 = 0.4;
+
 impl Sim {
+    /// A creature's body radius: its appearance's personal space in `apr_base.gda`
+    /// (`PERSPACE`: 0.35 for humans and walking corpses, 0.4 for hurlocks, 0.95 for an
+    /// ogre), else [`DEFAULT_RADIUS`].
+    pub fn body_radius(&self, id: ObjectId) -> f32 {
+        let app = self.world.get(id).map(|o| o.appearance).filter(|&a| a > 0);
+        app.and_then(|a| {
+            let t = self.world.tables().get(0, "apr_base")?;
+            match t.cell("PERSPACE", a as i64)? {
+                thedas_formats::gda::Cell::Float(v) if *v > 0.0 => Some(*v as f32),
+                _ => None,
+            }
+        })
+        .unwrap_or(DEFAULT_RADIUS)
+    }
+
+    /// How close `id` must be to `target` to attack it: a ranged weapon's range, else the
+    /// two bodies' radii and [`MELEE_GAP`].
+    pub fn reach_to(&self, id: ObjectId, target: ObjectId) -> f32 {
+        let r = self.attack_reach(id);
+        if r > MELEE_REACH {
+            return r;
+        }
+        self.body_radius(id) + self.body_radius(target) + MELEE_GAP
+    }
+
     /// How close `id` must be to attack: its main-hand weapon's range (item stat 9 in
     /// `itemstats.gda`) when that is a ranged weapon, otherwise [`MELEE_REACH`].
     pub fn attack_reach(&self, id: ObjectId) -> f32 {

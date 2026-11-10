@@ -1349,6 +1349,7 @@ pub fn call(
                 due: None,
                 from: None,
                 approach: None,
+                ring_wait: false,
             };
             for (p, v) in f.params.iter().zip(a) {
                 match (&p.ty, v) {
@@ -2711,11 +2712,18 @@ pub fn call(
         "IsPartyAIEnabled" => ok(b(
             h.sim.world.autopilot || Some(obj(a, 0)) != h.sim.world.hero
         )),
+        // The creatures on a creature's melee ring: within reach of it (the two bodies and
+        // the melee gap, see `Sim::reach_to`) and between the two angles, measured from its
+        // facing (0 to 360 or -180 to 180). Provisional geometry; only the main ring (0) is
+        // kept.
         "GetCreaturesInMeleeRing" => {
-            let (who, hostile_only) = (obj(a, 0), int(a, 3) != 0);
-            let Some(me) = h.object(who).map(|o| (o.position, o.area)) else {
+            let who = obj(a, 0);
+            let (start, end, hostile_only) = (float(a, 1), float(a, 2), int(a, 3) != 0);
+            let Some((pos, area, facing)) = h.object(who).map(|o| (o.position, o.area, o.facing))
+            else {
                 return ok(objects(Vec::new()));
             };
+            let mine = h.sim.body_radius(who);
             let list: Vec<ObjectId> = h
                 .sim
                 .world
@@ -2725,8 +2733,21 @@ pub fn call(
                     o.id != who
                         && o.kind == ObjectKind::Creature
                         && !o.dead
-                        && o.area == me.1
-                        && dist(o.position, me.0) <= 2.5
+                        && o.active
+                        && o.area == area
+                        && dist(o.position, pos)
+                            <= mine + h.sim.body_radius(o.id) + crate::combat::MELEE_GAP + 0.25
+                })
+                .filter(|o| {
+                    let ang = (o.position[1] - pos[1])
+                        .atan2(o.position[0] - pos[0])
+                        .to_degrees()
+                        - facing;
+                    let mut rel = ang.rem_euclid(360.0);
+                    if start < 0.0 && rel > 180.0 {
+                        rel -= 360.0;
+                    }
+                    end - start >= 360.0 || (start <= rel && rel <= end)
                 })
                 .filter(|o| !hostile_only || h.sim.hostile(who, o.id))
                 .map(|o| o.id)

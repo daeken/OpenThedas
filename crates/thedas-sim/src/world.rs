@@ -221,6 +221,10 @@ pub struct Command {
     /// (see `Sim::attack_reach`).
     #[serde(default)]
     pub approach: Option<[f32; 3]>,
+    /// For a melee attack: it found the target's melee ring full once and is waiting by it
+    /// (see `Sim::approach_point`).
+    #[serde(default)]
+    pub ring_wait: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
