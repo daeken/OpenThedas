@@ -328,13 +328,17 @@ pub fn call(
             } else {
                 0
             };
-            ok(Value::Object(
-                h.sim
-                    .world
-                    .by_tag(&string(a, 0))
-                    .nth(n)
-                    .map_or(OBJECT_INVALID, |o| o.id),
-            ))
+            // Only the current area is loaded in the game, so its objects come first (an
+            // area-list sibling may hold another copy of a creature, such as Morrigan in the
+            // Wilds and at Flemeth's hut); objects elsewhere follow. Provisional.
+            let here = h.sim.world.area;
+            let mut found: Vec<&crate::world::Object> = h.sim.world.by_tag(&string(a, 0)).collect();
+            found.sort_by_key(|o| match o.area {
+                x if x == here => 0,
+                None => 1,
+                _ => 2,
+            });
+            ok(Value::Object(found.get(n).map_or(OBJECT_INVALID, |o| o.id)))
         }
         "GetObjectsInArea" => {
             let area = obj(a, 0);
@@ -379,7 +383,15 @@ pub fn call(
                 .object(from)
                 .map(|o| o.combat.perceived.clone())
                 .unwrap_or_default();
-            let Some(origin) = h.object(from).map(|o| (o.position, o.area)) else {
+            // From an area, search that area (its own `area` is none).
+            let origin = h.object(from).map(|o| {
+                if o.kind == ObjectKind::Area {
+                    (o.position, Some(o.id))
+                } else {
+                    (o.position, o.area)
+                }
+            });
+            let Some(origin) = origin else {
                 return ok(if name == "UT_GetNearestObjectByTag" {
                     Value::Object(OBJECT_INVALID)
                 } else {
@@ -2487,7 +2499,9 @@ mod tests {
         int PROPERTY_VALUE_CURRENT = 3;\n\
         object CreateItemOnObject(resource r, object o, int n = 1, string s = \"\", int b = FALSE, int d = TRUE) = 6;\n\
         int FALSE = 0;\n\
-        int TRUE = 1;\n";
+        int TRUE = 1;\n\
+        object GetObjectByTag(string s, int n = 0) = 7;\n\
+        object[] GetNearestObjectByTag(object o, string s, int t = 32, int n = 1, int a = 0, int b = 0, int c = 0) = 8;\n";
 
     /// Calls engine function `name` as `caller`.
     fn run(s: &mut Sim, caller: ObjectId, name: &str, a: &[Value]) -> Option<Value> {
@@ -2638,6 +2652,40 @@ mod tests {
         let bag = s.spawn_body_bag(foe, false).unwrap();
         assert_eq!(s.world.get(bag).unwrap().inventory, vec![dropped]);
         assert_eq!(s.world.get(foe).unwrap().inventory, vec![kept]);
+    }
+
+    #[test]
+    fn tag_lookups_prefer_the_current_area_and_areas_search_themselves() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let wilds = s.world.spawn(ObjectKind::Area, "wilds");
+        let hut = s.world.spawn(ObjectKind::Area, "hut");
+        let there = s.world.spawn(ObjectKind::Creature, "morrigan");
+        let here = s.world.spawn(ObjectKind::Creature, "morrigan");
+        s.world.get_mut(there).unwrap().area = Some(wilds);
+        s.world.get_mut(here).unwrap().area = Some(hut);
+        s.world.area = Some(hut);
+        let tag = Value::String("morrigan".into());
+        let by_tag = run(&mut s, hut, "GetObjectByTag", &[tag.clone(), Value::Int(0)]);
+        assert_eq!(by_tag, Some(Value::Object(here)));
+        let near = run(
+            &mut s,
+            hut,
+            "GetNearestObjectByTag",
+            &[
+                Value::Object(hut),
+                tag,
+                Value::Int(32),
+                Value::Int(1),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+            ],
+        );
+        match near {
+            Some(Value::Array { items, .. }) => assert_eq!(items, vec![Value::Object(here)]),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

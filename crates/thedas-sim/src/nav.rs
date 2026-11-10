@@ -61,6 +61,33 @@ fn nearest_walkable(g: &NavGrid, p: [f32; 3]) -> Option<(u32, u32)> {
     None
 }
 
+/// Every cell reachable on foot from `from`'s nearest walkable cell (by the same rules as
+/// [`route`]), as a flag per cell in row-major order; empty when `from` is off the grid.
+pub fn region(g: &NavGrid, from: [f32; 3]) -> Vec<bool> {
+    let Some(start) = nearest_walkable(g, from) else {
+        return Vec::new();
+    };
+    let idx = |c: (u32, u32)| (c.1 * g.columns + c.0) as usize;
+    let mut seen = vec![false; (g.columns * g.rows) as usize];
+    seen[idx(start)] = true;
+    let mut todo = vec![start];
+    while let Some(c) = todo.pop() {
+        let hc = height(g, c);
+        for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+            let (x, y) = (c.0 as i32 + dx, c.1 as i32 + dy);
+            if x < 0 || y < 0 || x as u32 >= g.columns || y as u32 >= g.rows {
+                continue;
+            }
+            let n = (x as u32, y as u32);
+            if !seen[idx(n)] && walkable(g, n) && (height(g, n) - hc).abs() <= MAX_STEP {
+                seen[idx(n)] = true;
+                todo.push(n);
+            }
+        }
+    }
+    seen
+}
+
 /// The route from `from` to `to` as world points (cell centres at floor height, ending at
 /// `to`), or `None` when either end is off the grid or no route exists.
 pub fn route(g: &NavGrid, from: [f32; 3], to: [f32; 3]) -> Option<Vec<[f32; 3]>> {
@@ -230,6 +257,21 @@ mod tests {
         for p in &r {
             assert!(walkable(&g, g.cell(*p).unwrap()), "{p:?}");
         }
+    }
+
+    #[test]
+    fn regions_end_at_walls() {
+        let g = grid();
+        let r = region(&g, [0.5, 0.5, 0.0]);
+        assert_eq!(r.len(), 15);
+        assert!(r[4], "the far corner is reachable through the gap");
+        assert!(!r[2] && !r[7], "wall cells are not");
+        let mut g = g;
+        g.heights[(2 * 5 + 2) as usize] = 16.0;
+        assert!(
+            !region(&g, [0.5, 0.5, 0.0])[4],
+            "nor is anything past a step too high"
+        );
     }
 
     #[test]
