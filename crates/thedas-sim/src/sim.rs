@@ -511,6 +511,55 @@ impl Sim {
         ms.max(1)
     }
 
+    /// Moves an object and sends trigger ENTER/EXIT events for creatures that cross a
+    /// trigger's outline. Movement is a teleport: only the destination is tested.
+    pub fn move_object(&mut self, id: ObjectId, position: [f32; 3], area: Option<ObjectId>) {
+        if let Some(o) = self.world.get_mut(id) {
+            o.position = position;
+            if area.is_some() {
+                o.area = area;
+            }
+        }
+        self.update_triggers(id);
+    }
+
+    /// Queues ENTER for triggers a creature is now in and EXIT for ones it left. Provisional:
+    /// trigger outlines are tested in the XY plane, and the creature is the event's creator
+    /// and object 0.
+    pub fn update_triggers(&mut self, id: ObjectId) {
+        let Some(o) = self.world.get(id) else { return };
+        if o.kind != ObjectKind::Creature {
+            return;
+        }
+        let (pos, area) = (o.position, o.area);
+        let now: Vec<ObjectId> = self
+            .world
+            .objects
+            .values()
+            .filter(|t| {
+                t.kind == ObjectKind::Trigger
+                    && t.active
+                    && t.area == area
+                    && crate::engine::in_trigger(pos, t)
+            })
+            .map(|t| t.id)
+            .collect();
+        let before = self.world.in_triggers.get(&id).cloned().unwrap_or_default();
+        for (list, name) in [(&now, "ENTER"), (&before, "EXIT")] {
+            let other = if name == "ENTER" { &before } else { &now };
+            for &t in list.iter().filter(|t| !other.contains(t)) {
+                let mut ev = self.new_event(name, Some(id));
+                ev.objects = vec![id];
+                self.world.queue_event(0, t, ev, None);
+            }
+        }
+        if now.is_empty() {
+            self.world.in_triggers.remove(&id);
+        } else {
+            self.world.in_triggers.insert(id, now);
+        }
+    }
+
     /// Re-arms a heartbeat after it fires, while the object still has one.
     fn next_heartbeat(&mut self, target: ObjectId, ty: i32) {
         if ty != self.event_type("HEARTBEAT2") || ty == 0 {
@@ -581,6 +630,7 @@ impl Sim {
                 obj.facing = l.facing;
             }
         }
+        self.update_triggers(id);
         self.world.trace.push(TraceEntry::Command {
             t: self.world.time_ms,
             object: id,
@@ -762,6 +812,11 @@ impl Sim {
         }
         let ev = self.new_event("AREALOAD_POSTLOADEXIT", Some(area));
         self.world.queue_event(0, area, ev, None);
+        // The hero starts wherever it was placed; triggers there see it enter.
+        if let Some(hero) = self.world.hero {
+            self.world.in_triggers.remove(&hero);
+            self.update_triggers(hero);
+        }
         Ok(area)
     }
 
@@ -1189,6 +1244,42 @@ mod tests {
         assert_eq!(s.world.area, Some(area));
         assert!(s.world.get(thing).unwrap().active);
         assert!(s.world.transition.is_none());
+    }
+
+    #[test]
+    fn walking_into_a_trigger_sends_enter_and_exit() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let tr = s.world.spawn(ObjectKind::Trigger, "t");
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        {
+            let t = s.world.get_mut(tr).unwrap();
+            t.area = Some(area);
+            t.position = [10.0, 10.0, 0.0];
+            t.geometry = vec![
+                [-1.0, -1.0, 0.0],
+                [1.0, -1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [-1.0, 1.0, 0.0],
+            ];
+        }
+        s.world.get_mut(c).unwrap().area = Some(area);
+        s.move_object(c, [0.0, 0.0, 0.0], None);
+        assert!(s.world.queue.is_empty());
+        s.move_object(c, [10.5, 9.5, 0.0], None);
+        let q: Vec<_> = s
+            .world
+            .queue
+            .values()
+            .map(|q| (q.target, q.event.objects.clone()))
+            .collect();
+        assert_eq!(q, vec![(tr, vec![c])]);
+        s.world.queue.clear();
+        s.move_object(c, [10.2, 10.2, 0.0], None);
+        assert!(s.world.queue.is_empty(), "still inside: no new event");
+        s.move_object(c, [20.0, 10.0, 0.0], None);
+        assert_eq!(s.world.queue.len(), 1);
+        assert!(!s.world.in_triggers.contains_key(&c));
     }
 
     #[test]

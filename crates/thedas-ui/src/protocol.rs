@@ -104,6 +104,15 @@ impl GameBridge {
         }
     }
 
+    /// Records names a movie wanted that nothing answers.
+    pub fn note_unanswered(&self, names: impl IntoIterator<Item = String>) {
+        if let Ok(mut s) = self.state.lock() {
+            for n in names {
+                *s.unanswered.entry(n).or_default() += 1;
+            }
+        }
+    }
+
     /// Every value set so far.
     pub fn values(&self) -> BTreeMap<String, UiValue> {
         self.state
@@ -181,10 +190,13 @@ impl GameBridge {
                 let Ok(s) = self.state.lock() else {
                     return UiValue::Undefined;
                 };
+                // A child counts when it has members of its own or a non-zero value (an empty
+                // party slot is a bare 0).
                 let n = s
                     .values
                     .range(prefix.clone()..)
                     .take_while(|(k, _)| k.starts_with(&prefix))
+                    .filter(|(k, v)| k[prefix.len()..].contains('.') || **v != UiValue::Number(0.0))
                     .filter_map(|(k, _)| k[prefix.len()..].split('.').next())
                     .collect::<std::collections::BTreeSet<_>>()
                     .len();

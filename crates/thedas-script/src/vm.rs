@@ -387,6 +387,13 @@ impl Vm {
                     let a = pop(st)?;
                     match (&a, &b) {
                         (Value::Float(x), Value::Float(y)) => x == y,
+                        // Resources are strings to the original VM: scripts compare a
+                        // resource with a string literal ("NONE") with EQUALSS/NEQUALSS.
+                        (Value::String(x), Value::String(y)) => x == y,
+                        (
+                            Value::String(x) | Value::Resource(x),
+                            Value::String(y) | Value::Resource(y),
+                        ) => x.eq_ignore_ascii_case(y),
                         _ if std::mem::discriminant(&a) == std::mem::discriminant(&b) => a == b,
                         _ => {
                             return Err(VmError::TypeMismatch {
@@ -886,6 +893,28 @@ mod tests {
                 "PrintInteger[Int(9)]",
             ]
         );
+    }
+
+    #[test]
+    fn resources_compare_with_strings() {
+        // PrintInteger(R"Abc" == "abc"); PrintInteger("Abc" == "abc")
+        let mut b: Vec<u8> = Vec::new();
+        b.extend([0x04, 0x60, 0x00, 0x03]);
+        b.extend(b"Abc");
+        b.extend([0x04, 0x05, 0x00, 0x03]);
+        b.extend(b"abc");
+        b.extend([0x0B, 0x23]);
+        b.extend([0x05, 0x00, 0x00, 0x00, 0x01]);
+        b.extend([0x04, 0x05, 0x00, 0x03]);
+        b.extend(b"Abc");
+        b.extend([0x04, 0x05, 0x00, 0x03]);
+        b.extend(b"abc");
+        b.extend([0x0B, 0x23]);
+        b.extend([0x05, 0x00, 0x00, 0x00, 0x01]);
+        b.extend([0x20, 0x00]);
+        let (r, log) = run(&b);
+        r.unwrap();
+        assert_eq!(log, vec!["PrintInteger[Int(1)]", "PrintInteger[Int(0)]"]);
     }
 
     #[test]

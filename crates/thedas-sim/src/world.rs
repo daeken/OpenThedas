@@ -106,6 +106,9 @@ pub struct Object {
     pub money: i32,
     /// Items carried (object ids of `Item` objects).
     pub inventory: Vec<ObjectId>,
+    /// Equipped items by `INVENTORY_SLOT_*`. Equipped items stay in the inventory.
+    #[serde(default)]
+    pub equipment: BTreeMap<i32, ObjectId>,
     /// Integer fields of the template and instance (`Package`, `Race`, `Combatant`, ...),
     /// for engine functions that read them.
     pub fields: BTreeMap<String, i32>,
@@ -142,6 +145,7 @@ impl Object {
             abilities: std::collections::BTreeSet::new(),
             money: 0,
             inventory: Vec::new(),
+            equipment: BTreeMap::new(),
             fields: BTreeMap::new(),
         }
     }
@@ -265,6 +269,12 @@ pub struct World {
     /// The creature in character generation, between `StartCharGen` and `CHARGEN_END`.
     #[serde(default)]
     pub chargen: Option<ObjectId>,
+    /// Group pairs set hostile with `SetGroupHostility`.
+    #[serde(default, with = "pairs")]
+    pub hostility: BTreeMap<(i32, i32), bool>,
+    /// Triggers each creature is standing in, for ENTER/EXIT events.
+    #[serde(default)]
+    pub in_triggers: BTreeMap<ObjectId, Vec<ObjectId>>,
     /// A `DoAreaTransition` waiting for the current scripts to finish (area, waypoint).
     #[serde(default)]
     pub transition: Option<(String, String)>,
@@ -345,6 +355,8 @@ impl World {
             cutscenes: Vec::new(),
             chargen: None,
             transition: None,
+            in_triggers: BTreeMap::new(),
+            hostility: BTreeMap::new(),
             rng: Rng::new(seed),
             trace: Trace::default(),
             tables,
