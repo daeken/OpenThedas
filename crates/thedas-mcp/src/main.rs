@@ -134,6 +134,16 @@ struct UiInvokeArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct AbilityArgs {
+    /// Ability id (ABI_base), e.g. 617 for Shield Bash...
+    ability: Option<i32>,
+    /// ...or the tag of an item in the hero's inventory whose ability to use.
+    item: Option<String>,
+    /// Target object id or tag (default: the hero).
+    target: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct ShotArgs {
     /// Width in pixels (default 1280; match ui_open's size to see the interface).
     width: Option<u32>,
@@ -1092,6 +1102,94 @@ impl Server {
             Ok(json!({
                 "taken": items.iter().map(|&i| summary(sim, i)).collect::<Vec<_>>(),
                 "equipped": equipped.iter().map(|(i, s)| json!({"item": i, "slot": s})).collect::<Vec<_>>(),
+            }))
+        })
+    }
+
+    #[tool(
+        description = "Trace every engine call the object's scripts make (log channel -6 in get_trace), or stop tracing it if it already is. For debugging AI and scripts."
+    )]
+    async fn watch_object(&self, Parameters(a): Parameters<ObjectArg>) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            let id = resolve(sim, &a.object).ok_or("no such object")?;
+            let on = if sim.watch_calls.remove(&id) {
+                false
+            } else {
+                sim.watch_calls.insert(id);
+                true
+            };
+            Ok(json!({ "object": id, "watching": on }))
+        })
+    }
+
+    #[tool(
+        description = "Have the hero use an ability (by id) or an item's ability (by item tag, e.g. a health poultice) on a target (default: the hero), then run time until it resolves."
+    )]
+    async fn use_ability(&self, Parameters(a): Parameters<AbilityArgs>) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            let hero = sim.world.hero.ok_or("no hero")?;
+            let target = match &a.target {
+                Some(t) => resolve(sim, t).ok_or("no such target")?,
+                None => hero,
+            };
+            let (ability, tag) = match &a.item {
+                Some(tag) => {
+                    let item = sim
+                        .world
+                        .get(hero)
+                        .map(|o| o.inventory.clone())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|i| {
+                            sim.world
+                                .get(*i)
+                                .is_some_and(|x| x.tag.eq_ignore_ascii_case(tag))
+                        })
+                        .ok_or("the hero has no such item")?;
+                    let ab = sim
+                        .world
+                        .get(item)
+                        .and_then(|x| x.fields.get("AbilityID").copied())
+                        .unwrap_or(0);
+                    (ab, tag.clone())
+                }
+                None => (a.ability.ok_or("give ability or item")?, String::new()),
+            };
+            let ty = thedas_sim::sim::constant(&sim.table, "COMMAND_TYPE_USE_ABILITY");
+            let cmd = thedas_sim::world::Command {
+                ty,
+                name: "CommandUseAbility".into(),
+                target: Some(target),
+                location: None,
+                seconds: 0.0,
+                ints: vec![ability],
+                strings: vec![tag],
+                due: None,
+            };
+            if let Some(o) = sim.world.get_mut(hero) {
+                o.commands.clear();
+                o.commands.push(cmd);
+            }
+            for _ in 0..30 {
+                sim.tick(100);
+                if sim.world.get(hero).is_none_or(|h| h.commands.is_empty()) {
+                    break;
+                }
+            }
+            let health = thedas_sim::sim::constant(&sim.table, "PROPERTY_DEPLETABLE_HEALTH");
+            let hp = |id| {
+                sim.world
+                    .get(id)
+                    .and_then(|o| o.properties.get(&health).copied())
+            };
+            Ok(json!({
+                "ability": ability,
+                "target": summary(sim, target),
+                "target_health": hp(target),
+                "hero_health": hp(hero),
+                "time_ms": sim.world.time_ms,
             }))
         })
     }
