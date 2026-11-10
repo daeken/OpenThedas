@@ -1019,11 +1019,18 @@ pub fn call(
         "CreateItemOnObject" => {
             let template = string(a, 0);
             let id = h.sim.create_item(&template);
+            // (resource, target, stack size, tag, suppress notification, droppable)
+            let stack = if a.len() > 2 { int(a, 2) } else { 1 };
+            let droppable = a.len() <= 5 || int(a, 5) != 0;
             if let Some(o) = h.sim.world.get_mut(id) {
                 let tag = string(a, 3);
                 if !tag.is_empty() {
                     o.tag = tag;
                 }
+                if stack > 1 {
+                    o.fields.insert("StackSize".into(), stack);
+                }
+                o.fields.insert("Droppable".into(), droppable as i32);
             }
             h.sim.give_item(id, obj(a, 1));
             ok(Value::Object(id))
@@ -2477,7 +2484,10 @@ mod tests {
         void SetCreatureProperty(object o, int p, float f, int t) = 5;\n\
         int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
         int PROPERTY_VALUE_BASE = 2;\n\
-        int PROPERTY_VALUE_CURRENT = 3;\n";
+        int PROPERTY_VALUE_CURRENT = 3;\n\
+        object CreateItemOnObject(resource r, object o, int n = 1, string s = \"\", int b = FALSE, int d = TRUE) = 6;\n\
+        int FALSE = 0;\n\
+        int TRUE = 1;\n";
 
     /// Calls engine function `name` as `caller`.
     fn run(s: &mut Sim, caller: ObjectId, name: &str, a: &[Value]) -> Option<Value> {
@@ -2599,6 +2609,35 @@ mod tests {
         let o = s.world.get(hero).unwrap();
         assert!(!o.dead);
         assert_eq!(o.properties[&7], (120.0, 25.0));
+    }
+
+    #[test]
+    fn items_scripts_create_on_creatures_drop_unless_told_otherwise() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let foe = s.world.spawn(ObjectKind::Creature, "foe");
+        let make = |s: &mut Sim, d: i32| {
+            let a = [
+                Value::Resource("blood.uti".into()),
+                Value::Object(foe),
+                Value::Int(2),
+                Value::String(String::new()),
+                Value::Int(0),
+                Value::Int(d),
+            ];
+            match run(s, foe, "CreateItemOnObject", &a) {
+                Some(Value::Object(i)) => i,
+                other => panic!("{other:?}"),
+            }
+        };
+        let (kept, dropped) = (make(&mut s, 0), make(&mut s, 1));
+        assert_eq!(
+            s.world.get(dropped).unwrap().fields.get("StackSize"),
+            Some(&2)
+        );
+        let bag = s.spawn_body_bag(foe, false).unwrap();
+        assert_eq!(s.world.get(bag).unwrap().inventory, vec![dropped]);
+        assert_eq!(s.world.get(foe).unwrap().inventory, vec![kept]);
     }
 
     #[test]
