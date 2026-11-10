@@ -54,6 +54,8 @@ const TAG_DEFINE_SPRITE: u16 = 39;
 const TAG_IMPORT_ASSETS: u16 = 57;
 const TAG_IMPORT_ASSETS2: u16 = 71;
 const TAG_DEFINE_BITS_LOSSLESS2: u16 = 36;
+const TAG_DEFINE_FONT2: u16 = 48;
+const TAG_DEFINE_FONT3: u16 = 75;
 const TAG_EXTERNAL_IMAGE: u16 = 1001;
 
 #[derive(Clone, Copy, Debug)]
@@ -300,6 +302,77 @@ pub struct RewriteReport {
     pub dropped: BTreeMap<u16, u32>,
     /// Text fields switched from device fonts to embedded outlines (see [`use_outlines`]).
     pub text_fields_outlined: u32,
+    /// Glyph-less fonts replaced by the font library's (see [`FontLibrary`]), by name.
+    pub fonts_resolved: Vec<String>,
+}
+
+/// A font definition's name and glyph count (`DefineFont2`/`DefineFont3` body: id, flags,
+/// language, a length-prefixed name, the glyph count).
+fn font_header(body: &[u8]) -> Option<(String, u16)> {
+    let len = *body.get(4)? as usize;
+    let name = body.get(5..5 + len)?;
+    let glyphs = body.get(5 + len..7 + len)?;
+    let name = String::from_utf8_lossy(name)
+        .trim_end_matches('\0')
+        .to_string();
+    Some((name, u16::from_le_bytes([glyphs[0], glyphs[1]])))
+}
+
+/// The fonts of a Scaleform font library movie, by name.
+///
+/// Scaleform resolves a font a movie names without embedding its glyphs (a `DefineFont3` with
+/// no glyphs, e.g. chanters.gfx's `Dragon Text`) by name in its font library. The game
+/// installs `fonts_en-us.gfx` as that library: the executable names it beside GFx's
+/// "Searching GFxFontLib" messages. Flash players draw such fonts with nothing, so
+/// [`rewrite`] puts the library's definition in their place. Provisional: only the name is
+/// matched (not bold or italic).
+#[derive(Clone, Debug, Default)]
+pub struct FontLibrary {
+    /// Lowercased name: the tag code and the body after the font id.
+    fonts: BTreeMap<String, (u16, Vec<u8>)>,
+}
+
+impl FontLibrary {
+    /// The library movie's fonts that have glyphs.
+    pub fn from_movie(data: &[u8]) -> Result<Self, GfxError> {
+        let m = Movie::parse(data)?;
+        let mut fonts = BTreeMap::new();
+        for t in m.tags()? {
+            if !matches!(t.code, TAG_DEFINE_FONT2 | TAG_DEFINE_FONT3) {
+                continue;
+            }
+            if let Some((name, _)) = font_header(t.body).filter(|f| f.1 > 0) {
+                fonts
+                    .entry(name.to_lowercase())
+                    .or_insert((t.code, t.body[2..].to_vec()));
+            }
+        }
+        Ok(Self { fonts })
+    }
+
+    pub fn len(&self) -> usize {
+        self.fonts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fonts.is_empty()
+    }
+
+    /// The library's definition of a glyph-less font tag, under the tag's own id: the tag's
+    /// code, body and the font's name.
+    fn resolve(&self, code: u16, body: &[u8]) -> Option<(u16, Vec<u8>, String)> {
+        if !matches!(code, TAG_DEFINE_FONT2 | TAG_DEFINE_FONT3) {
+            return None;
+        }
+        let (name, glyphs) = font_header(body)?;
+        if glyphs > 0 {
+            return None;
+        }
+        let (lib_code, rest) = self.fonts.get(&name.to_lowercase())?;
+        let mut out = body.get(..2)?.to_vec();
+        out.extend_from_slice(rest);
+        Some((*lib_code, out, name))
+    }
 }
 
 /// Sets `UseOutlines` on a `DefineEditText` body; returns the new body if it changed.
@@ -380,10 +453,17 @@ pub fn resize(img: &Rgba, w: u32, h: u32) -> Rgba {
 fn rewrite_tags(
     tags: &[Tag],
     images: &mut dyn FnMut(&ExternalImage) -> Option<Rgba>,
+    fonts: Option<&FontLibrary>,
     report: &mut RewriteReport,
     out: &mut Vec<u8>,
 ) {
     for t in tags {
+        if let Some((code, body, name)) = fonts.and_then(|f| f.resolve(t.code, t.body)) {
+            tag_header(code, body.len(), out);
+            out.extend_from_slice(&body);
+            report.fonts_resolved.push(name);
+            continue;
+        }
         match t.code {
             TAG_DEFINE_EDIT_TEXT => match use_outlines(t.body) {
                 Some(body) => {
@@ -412,7 +492,7 @@ fn rewrite_tags(
             TAG_DEFINE_SPRITE if t.body.len() >= 4 => match read_tags(&t.body[4..]) {
                 Ok(inner) => {
                     let mut body = t.body[..4].to_vec();
-                    rewrite_tags(&inner, images, report, &mut body);
+                    rewrite_tags(&inner, images, fonts, report, &mut body);
                     tag_header(t.code, body.len(), out);
                     out.extend_from_slice(&body);
                 }
@@ -425,10 +505,12 @@ fn rewrite_tags(
 }
 
 /// Rewrites a GFx movie as an uncompressed SWF, inlining external images that `images` can
-/// supply. `inject` is a `DoAction` body placed just before the first frame ends.
+/// supply and fonts the movie leaves to the font library (`fonts`). `inject` is a `DoAction`
+/// body placed just before the first frame ends.
 pub fn rewrite(
     data: &[u8],
     images: &mut dyn FnMut(&ExternalImage) -> Option<Rgba>,
+    fonts: Option<&FontLibrary>,
     inject: Option<&[u8]>,
 ) -> Result<(Vec<u8>, RewriteReport), GfxError> {
     let m = Movie::parse(data)?;
@@ -440,12 +522,12 @@ pub fn rewrite(
         .iter()
         .position(|t| t.code == TAG_SHOW_FRAME || t.code == TAG_END)
         .unwrap_or(tags.len());
-    rewrite_tags(&tags[..split], images, &mut report, &mut body);
+    rewrite_tags(&tags[..split], images, fonts, &mut report, &mut body);
     if let Some(actions) = inject {
         tag_header(TAG_DO_ACTION, actions.len(), &mut body);
         body.extend_from_slice(actions);
     }
-    rewrite_tags(&tags[split..], images, &mut report, &mut body);
+    rewrite_tags(&tags[split..], images, fonts, &mut report, &mut body);
     if tags.last().map(|t| t.code) != Some(TAG_END) {
         body.extend_from_slice(&[0, 0]);
     }
@@ -535,6 +617,7 @@ mod tests {
                     pixels: vec![255, 0, 0, 255, 0, 255, 0, 128],
                 })
             },
+            None,
             Some(&[0]),
         )
         .unwrap();
@@ -553,6 +636,67 @@ mod tests {
         // The sprite kept its ShowFrame and End.
         assert_eq!(inv.tags.get(&0), Some(&2));
         assert_eq!(inv.tags.get(&12), Some(&1));
+    }
+
+    /// A plain movie of the given tags (RECT nbits=0, frame rate, one frame).
+    fn movie(tags: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = vec![0u8, 0, 24, 1, 0];
+        for t in tags {
+            body.extend(t);
+        }
+        body.extend(tag(0, b""));
+        let mut out = b"FWS\x08".to_vec();
+        out.extend_from_slice(&((body.len() + 8) as u32).to_le_bytes());
+        out.extend(body);
+        out
+    }
+
+    /// A `DefineFont3` body: id, flags, language, name, glyph count, then `rest`.
+    fn font(id: u16, name: &str, glyphs: u16, rest: &[u8]) -> Vec<u8> {
+        let mut b = id.to_le_bytes().to_vec();
+        b.extend([0x84, 1, name.len() as u8]);
+        b.extend(name.as_bytes());
+        b.extend(glyphs.to_le_bytes());
+        b.extend(rest);
+        b
+    }
+
+    #[test]
+    fn glyphless_fonts_take_the_font_librarys_glyphs() {
+        let lib = movie(&[
+            tag(75, &font(1, "Title", 3, b"title glyphs")),
+            tag(75, &font(2, "Body Text", 2, b"body glyphs")),
+        ]);
+        let lib = FontLibrary::from_movie(&lib).unwrap();
+        assert_eq!(lib.len(), 2);
+        let m = movie(&[
+            tag(75, &font(9, "body text", 0, b"")),
+            tag(75, &font(10, "Unknown", 0, b"")),
+            tag(75, &font(11, "Title", 1, b"own glyph")),
+        ]);
+        let (swf, rep) = rewrite(&m, &mut |_| None, Some(&lib), None).unwrap();
+        assert_eq!(rep.fonts_resolved, vec!["body text".to_string()]);
+        let out = Movie::parse(&swf).unwrap();
+        let fonts: Vec<Vec<u8>> = out
+            .tags()
+            .unwrap()
+            .iter()
+            .filter(|t| t.code == 75)
+            .map(|t| t.body.to_vec())
+            .collect();
+        assert_eq!(
+            fonts[0],
+            font(9, "Body Text", 2, b"body glyphs"),
+            "the library's, own id"
+        );
+        assert_eq!(fonts[1], font(10, "Unknown", 0, b""), "not in the library");
+        assert_eq!(fonts[2], font(11, "Title", 1, b"own glyph"), "has glyphs");
+        // Without a library nothing changes; a truncated font is left alone.
+        let (plain, rep) = rewrite(&m, &mut |_| None, None, None).unwrap();
+        assert!(rep.fonts_resolved.is_empty());
+        assert_eq!(plain, m);
+        assert!(lib.resolve(75, &[9, 0, 0, 1, 40]).is_none());
+        assert!(FontLibrary::from_movie(b"junk").is_err());
     }
 
     #[test]

@@ -366,7 +366,7 @@ fn check_gfx(data: &[u8], location: String, stats: &mut Stats, keep: usize) {
                 .map_or_else(|| code.to_string(), str::to_string);
             *stats.gfx_tags.entry(name).or_default() += n as u64;
         }
-        thedas_formats::gfx::rewrite(data, &mut |_| None, None).map(|_| ())
+        thedas_formats::gfx::rewrite(data, &mut |_| None, None, None).map(|_| ())
     });
     typed_result(
         stats,
