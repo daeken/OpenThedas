@@ -4,7 +4,7 @@
 //!
 //! Provisional, inferred from the plot files and the plot scripts' bytecode: the event carries
 //! the plot GUID as string 0, the flag as int 1, the new and old values as ints 2 and 3, the
-//! conversation owner as object 0 and the party as its creator; a `GET_PLOT` answer is the
+//! conversation owner as object 0 and the hero as its creator; a `GET_PLOT` answer is the
 //! script's integer result. Flags 256 and up are "defined" flags computed by the script; the
 //! engine sets ordinary flags before running the script.
 
@@ -31,6 +31,8 @@ pub struct PlotInfo {
 pub struct Plots {
     by_key: HashMap<String, Arc<PlotInfo>>,
     loaded: bool,
+    /// Defined flags being answered by their plot scripts, innermost last.
+    asking: Vec<(String, i32)>,
 }
 
 fn s(g: &Gff4, id: StructId, l: u32) -> Option<String> {
@@ -135,11 +137,22 @@ impl Sim {
         old: i32,
         owner: ObjectId,
     ) -> crate::world::Event {
-        let mut ev = self.new_event(ty, self.world.party);
+        // The creator is the player: plot scripts search from it for nearby creatures
+        // (`UT_GetNearestCreatureByTag(GetEventCreator(ev), ...)`).
+        let mut ev = self.new_event(ty, self.world.hero.or(self.world.party));
         ev.strings = vec![guid.to_string()];
         ev.ints = vec![0, flag, value, old];
         ev.objects = vec![owner];
         ev
+    }
+
+    /// `OBJECT_SELF` for plot scripts. Provisional: the hero, since plot scripts pass
+    /// `OBJECT_SELF` to `UT_Talk` as the listener.
+    fn plot_self(&self) -> ObjectId {
+        self.world
+            .hero
+            .or(self.world.party)
+            .unwrap_or(OBJECT_INVALID)
     }
 
     /// Reads a flag. Defined flags (256+) ask the plot script when `call_script` is set.
@@ -153,13 +166,14 @@ impl Sim {
         let key = self.plot_key(plot);
         if flag >= 256 || call_script {
             if let Some(script) = self.plot_info(plot).and_then(|p| p.script.clone()) {
-                if flag >= 256 {
+                // A plot script that reads the flag it is answering would recurse forever;
+                // the inner read gets the stored value instead.
+                let asking = (key.clone(), flag);
+                if flag >= 256 && !self.plots.asking.contains(&asking) {
                     let ev = self.plot_event("GET_PLOT", &key, flag, 0, 0, owner);
-                    let r = self.run_script(
-                        &script,
-                        self.world.party.unwrap_or(OBJECT_INVALID),
-                        Some(ev),
-                    );
+                    self.plots.asking.push(asking);
+                    let r = self.run_script(&script, self.plot_self(), Some(ev));
+                    self.plots.asking.pop();
                     return matches!(r, Some(V::Int(v)) if v != 0);
                 }
             }
@@ -193,11 +207,7 @@ impl Sim {
         if call_script {
             if let Some(script) = self.plot_info(plot).and_then(|p| p.script.clone()) {
                 let ev = self.plot_event("SET_PLOT", &key, flag, value as i32, old as i32, owner);
-                self.run_script(
-                    &script,
-                    self.world.party.unwrap_or(OBJECT_INVALID),
-                    Some(ev),
-                );
+                self.run_script(&script, self.plot_self(), Some(ev));
             }
         }
     }
