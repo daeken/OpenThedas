@@ -1,9 +1,14 @@
 //! The quickbar: the abilities a party member can use at a click, and how they are aimed.
 //!
-//! Scripts fill slots with `SetQuickslot`. Provisional: the engine is taken to put the
-//! creature's other usable abilities (talents, spells and skills that are activated or
-//! sustained, `ABI_base` `UseType` 4 or 2) in the free slots, lowest ability first, as a
-//! new game's quickbar shows them; the executable's own rule is not traced.
+//! Each creature's bar has a fixed layout ([`crate::world::Object::quickslots`], saved):
+//! scripts fill slots with `SetQuickslot`, the player drags icons between slots (the
+//! movie's `.SetQuickslot` message), and the engine places what the bar does not have yet.
+//! Provisional: the engine is taken to put a party member's usable abilities (talents,
+//! spells and skills that are activated or sustained, `ABI_base` `UseType` 4 or 2) in the
+//! free slots, lowest ability first, then the party's quick items, as a new game's
+//! quickbar shows them; each once, so what the player takes off stays off; and to drop an
+//! item whose last one is gone and an ability the creature lost. The executable's own rule
+//! is not traced.
 
 use thedas_formats::gda::Cell;
 use thedas_script::vm::ObjectId;
@@ -13,6 +18,20 @@ use crate::world::Quickslot;
 
 /// The slots the quickbar has (`GUI.SelectedChar.Stats.QuickSlots.0` to `.39`).
 pub const QUICKSLOTS: i32 = 40;
+
+/// The message quickbar.gfx sends (after the selected character's token) when the player
+/// puts something in a slot or takes it out: creature, slot, ability (0 empties it), the
+/// item's tag and its template.
+pub const MSG_SET_QUICKSLOT: &str = ".SetQuickslot";
+
+/// What a slot holds, as [`crate::world::Object::quick_placed`] records it.
+pub fn quick_key(q: &Quickslot) -> String {
+    if q.item.is_empty() {
+        format!("ability:{}", q.ability)
+    } else {
+        format!("item:{}", q.item.to_ascii_lowercase())
+    }
+}
 
 /// `ABI_base` `UseType`s an ability can be used with from the quickbar: sustained (2) and
 /// activated (4).
@@ -188,8 +207,92 @@ impl Sim {
             .or_else(|| self.party_backpack().into_iter().find(is))
     }
 
-    /// `who`'s quickbar, by slot: the slots scripts filled, its other usable abilities in the
-    /// free slots, then the party's quick items.
+    /// Puts `ability` (from the item tagged `item`, if any) in `who`'s quickbar slot `slot`, or
+    /// empties the slot when `ability` is 0: a script's `SetQuickslot` or the player's drag.
+    pub fn set_quickslot(&mut self, who: ObjectId, slot: i32, ability: i32, item: &str) {
+        let Some(o) = self.world.get_mut(who) else {
+            return;
+        };
+        if !(0..QUICKSLOTS).contains(&slot) {
+            return;
+        }
+        if ability > 0 {
+            let q = Quickslot {
+                ability,
+                item: item.to_string(),
+            };
+            o.quick_placed.insert(quick_key(&q));
+            o.quickslots.insert(slot, q);
+        } else {
+            o.quickslots.remove(&slot);
+        }
+    }
+
+    /// The player put something in a quickbar slot or took it out (quickbar.gfx's
+    /// `.SetQuickslot`). Returns whether `name` was that message.
+    pub fn quickbar_message(&mut self, name: &str, args: &[String]) -> bool {
+        if !name.ends_with(MSG_SET_QUICKSLOT) {
+            return false;
+        }
+        let int = |i: usize| {
+            args.get(i)
+                .and_then(|a| a.trim().parse::<f64>().ok())
+                .filter(|v| v.is_finite())
+                .map(|v| v as i64)
+        };
+        let (Some(who), Some(slot)) = (int(0), int(1)) else {
+            return true;
+        };
+        let ability = int(2).unwrap_or(0).clamp(0, i32::MAX as i64) as i32;
+        let item = args.get(3).map(|s| s.trim()).unwrap_or_default();
+        self.set_quickslot(who as ObjectId, slot as i32, ability, item);
+        true
+    }
+
+    /// Settles the party's quickbars into their layout: an item whose last one is gone and
+    /// an ability its owner lost leave the bar, and what a member can use that has never been
+    /// on it takes a free slot, to stay there.
+    pub fn settle_quickbars(&mut self) {
+        for who in crate::engine::party_of(self) {
+            let Some(o) = self.world.get(who) else {
+                continue;
+            };
+            let gone: Vec<i32> = o
+                .quickslots
+                .iter()
+                .filter(|(_, q)| {
+                    if q.item.is_empty() {
+                        !o.abilities.contains(&q.ability)
+                    } else {
+                        self.item_count(&q.item) == 0
+                    }
+                })
+                .map(|(s, _)| *s)
+                .collect();
+            if let Some(o) = self.world.get_mut(who) {
+                for s in gone {
+                    if let Some(q) = o.quickslots.remove(&s) {
+                        // Gained again later, it comes back.
+                        o.quick_placed.remove(&quick_key(&q));
+                    }
+                }
+            }
+            let bar = self.quickbar(who);
+            let Some(o) = self.world.get_mut(who) else {
+                continue;
+            };
+            for (slot, q) in bar {
+                if o.quickslots.contains_key(&slot) || o.quick_placed.contains(&quick_key(&q)) {
+                    continue;
+                }
+                o.quick_placed.insert(quick_key(&q));
+                o.quickslots.insert(slot, q);
+            }
+        }
+    }
+
+    /// `who`'s quickbar, by slot: its layout, then (for what was never placed) its other usable
+    /// abilities in the free slots, then the party's quick items.
     pub fn quickbar(&self, who: ObjectId) -> Vec<(i32, Quickslot)> {
         let Some(o) = self.world.get(who) else {
             return Vec::new();
@@ -201,6 +304,7 @@ impl Sim {
             .map(|(s, q)| (*s, q.clone()))
             .collect();
         let placed: Vec<i32> = bar.iter().map(|(_, q)| q.ability).collect();
+        let was_placed = |q: &Quickslot| o.quick_placed.contains(&quick_key(q));
         let mut free = (0..QUICKSLOTS).filter(|s| !o.quickslots.contains_key(s));
         for &ability in &o.abilities {
             if placed.contains(&ability)
@@ -212,21 +316,27 @@ impl Sim {
             {
                 continue;
             }
-            let Some(slot) = free.next() else { break };
-            bar.push((
-                slot,
-                Quickslot {
-                    ability,
-                    item: String::new(),
-                },
-            ));
-        }
-        for (tag, ability, _) in self.quick_items() {
-            if bar.iter().any(|(_, q)| q.item.eq_ignore_ascii_case(&tag)) {
+            let q = Quickslot {
+                ability,
+                item: String::new(),
+            };
+            if was_placed(&q) {
                 continue;
             }
             let Some(slot) = free.next() else { break };
-            bar.push((slot, Quickslot { ability, item: tag }));
+            bar.push((slot, q));
+        }
+        for (tag, ability, _) in self.quick_items() {
+            let q = Quickslot { ability, item: tag };
+            if bar
+                .iter()
+                .any(|(_, b)| b.item.eq_ignore_ascii_case(&q.item))
+                || was_placed(&q)
+            {
+                continue;
+            }
+            let Some(slot) = free.next() else { break };
+            bar.push((slot, q));
         }
         bar.sort_by_key(|(s, _)| *s);
         bar
@@ -330,6 +440,81 @@ mod tests {
         s.order_ability(mage, 3024, friend, "");
         s.tick(5_000);
         assert_eq!(s.world.get(mage).unwrap().position, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn the_bar_keeps_its_layout_and_the_players_changes() {
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let i = |v: i64| Cell::Int(v);
+        s.world.tables().insert(
+            "ABI_base",
+            &["AbilityType", "UseType", "TargetType"],
+            vec![
+                (700, vec![i(1), i(2), i(1)]),
+                (3024, vec![i(1), i(4), i(4)]),
+                (14000, vec![i(2), i(4), i(4)]),
+                (200011, vec![i(4), i(4), i(1)]),
+            ],
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().abilities = [700, 3024].into_iter().collect();
+        let potion = s.world.spawn(ObjectKind::Item, "poultice");
+        s.world
+            .get_mut(potion)
+            .unwrap()
+            .fields
+            .insert("AbilityID".into(), 200011);
+        s.world.get_mut(hero).unwrap().inventory = vec![potion];
+        let layout = |s: &Sim| -> Vec<(i32, i32)> {
+            s.world
+                .get(hero)
+                .unwrap()
+                .quickslots
+                .iter()
+                .map(|(k, q)| (*k, q.ability))
+                .collect()
+        };
+        s.settle_quickbars();
+        assert_eq!(layout(&s), [(0, 700), (1, 3024), (2, 200011)]);
+        // A new ability takes a free slot; nothing moves.
+        s.world.get_mut(hero).unwrap().abilities.insert(14000);
+        s.settle_quickbars();
+        assert_eq!(layout(&s), [(0, 700), (1, 3024), (2, 200011), (3, 14000)]);
+        // The player drags pommel strike off the bar, and the sustained one to slot 9.
+        let msg = |s: &mut Sim, args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            assert!(s.gui_message("GUI.SelectedChar.SetQuickslot", &args));
+        };
+        let h = hero.to_string();
+        msg(&mut s, &[&h, "1", "0", "", ""]);
+        msg(&mut s, &[&h, "0", "0", "", ""]);
+        msg(&mut s, &[&h, "9", "700", "", ""]);
+        s.settle_quickbars();
+        assert_eq!(layout(&s), [(2, 200011), (3, 14000), (9, 700)]);
+        // The last potion gone, its slot empties; found again, it takes the first free one.
+        s.world.get_mut(hero).unwrap().inventory.clear();
+        s.settle_quickbars();
+        assert_eq!(layout(&s), [(3, 14000), (9, 700)]);
+        s.world.get_mut(hero).unwrap().inventory = vec![potion];
+        s.settle_quickbars();
+        assert_eq!(layout(&s), [(0, 200011), (3, 14000), (9, 700)]);
+        // A slot off the bar's end or a creature that does not exist changes nothing.
+        msg(&mut s, &[&h, "99", "3024", "", ""]);
+        msg(&mut s, &["123456", "4", "3024", "", ""]);
+        assert_eq!(layout(&s), [(0, 200011), (3, 14000), (9, 700)]);
+        assert_eq!(s.quickbar(hero).len(), 3);
+        // The layout, and what the player took off, survive a save.
+        let saved = s.save_json().unwrap();
+        let mut t = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        t.load_json(&saved).unwrap();
+        t.world.tables().insert(
+            "ABI_base",
+            &["AbilityType", "UseType", "TargetType"],
+            vec![(3024, vec![i(1), i(4), i(4)])],
+        );
+        t.settle_quickbars();
+        assert_eq!(layout(&t), [(0, 200011), (3, 14000), (9, 700)]);
     }
 
     #[test]

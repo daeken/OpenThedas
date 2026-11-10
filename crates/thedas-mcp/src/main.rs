@@ -179,7 +179,8 @@ struct LiveInputArgs {
     /// scale): `click X,Y`, `rclick X,Y`, `dclick X,Y`, `hover X,Y`, `run MS` (the game runs
     /// that long before the next step), `key i` (inventory), `key f1`-`key f4` (who leads),
     /// `key 1`-`key 0` (quickbar slots), `key space` (pause), `talk TAG` (the leader goes to
-    /// talk to a creature), `reply N` (the conversation's reply N, from 0).
+    /// talk to a creature), `reply N` (the conversation's reply N, from 0), `press X,Y` and
+    /// `release X,Y` (the left button down and up: with hover and run between, a drag).
     steps: String,
 }
 

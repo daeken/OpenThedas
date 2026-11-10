@@ -121,9 +121,15 @@ pub struct Object {
     /// `PROPERTY_VALUE_MODIFIER` part of a total.
     #[serde(default)]
     pub modifiers: BTreeMap<i32, f32>,
-    /// Quickbar slots scripts filled (`SetQuickslot`): ability and the item it comes from.
+    /// The quickbar's layout: what each slot holds (an ability, and the item it comes
+    /// from), as scripts (`SetQuickslot`) or the player put it there or the engine placed it
+    /// (see [`crate::quickbar`]). Saved, so the bar keeps its layout.
     #[serde(default)]
     pub quickslots: BTreeMap<i32, Quickslot>,
+    /// What has been on the quickbar ([`crate::quickbar::quick_key`]): the engine places a
+    /// usable ability or quick item once, so one the player takes off stays off.
+    #[serde(default)]
+    pub quick_placed: std::collections::BTreeSet<String>,
     pub dead: bool,
     /// When the creature last died (simulation milliseconds); `None` while alive. For
     /// presentation (the death animation plays from it) and saves.
@@ -196,6 +202,7 @@ impl Object {
             properties: BTreeMap::new(),
             modifiers: BTreeMap::new(),
             quickslots: BTreeMap::new(),
+            quick_placed: Default::default(),
             dead: false,
             died_at: None,
             head_morph: None,
