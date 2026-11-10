@@ -268,12 +268,12 @@ fn weapons(sim: &Sim, o: &Object) -> Vec<Attached> {
     .collect()
 }
 
-/// An animation to play: the action in the first of `trees` (`.anb`) that has it, at `time`
-/// seconds (wrapped when `looping`, else held at the end).
+/// An animation to play: the first of `actions` in the first of `trees` (`.anb`) that has
+/// one, at `time` seconds (wrapped when `looping`, else held at the end).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Motion {
     pub trees: Vec<String>,
-    pub action: String,
+    pub actions: Vec<String>,
     pub time: f32,
     pub looping: bool,
 }
@@ -283,12 +283,45 @@ pub struct Motion {
 pub const COL_AMBIENT_TREE: u32 = 0x5009_76ec;
 pub const COL_COMBAT_TREE: u32 = 0xde80_b418;
 
-/// Actions in the trees (from `humanoid.anb`, `combat_humanoid.anb`, `movement.anb`).
+/// Actions in the trees (from `humanoid.anb`, `combat_humanoid.anb`, `movement.anb` and the
+/// weapon-style trees).
 pub mod action {
     pub const PAUSE: &str = "pause";
     pub const RUN: &str = "runf";
-    pub const ATTACK: &str = "attk_v1";
     pub const DIE: &str = "die";
+    /// Ranged styles' shot.
+    pub const FIRE: &str = "fire";
+    /// Melee swings `attk_v1` to `attk_v6`; misses `miss_v1` to `miss_v4`.
+    pub const ATTACK_VARIANTS: u64 = 6;
+    pub const MISS_VARIANTS: u64 = 4;
+}
+
+/// The weapon-style animation tree a creature fights with, from the variation types of
+/// what it holds (`.anb` stems): `tw` two-handed (greatsword, battleaxe, maul), `ws` a
+/// one-handed weapon and a shield, `dw` two one-handed weapons, `ow` one alone, `bow`
+/// (short and long bows), `cbow` and `staff`. `None` when it holds nothing with a model.
+/// Provisional: the original's choice of style is not traced; this follows the trees'
+/// names.
+pub fn weapon_style(sim: &Sim, o: &Object) -> Option<&'static str> {
+    let kind = |slot_name: &str| {
+        equipped(sim, o, slot_name)
+            .and_then(|i| item_variation(sim, i))
+            .map(|(ty, _)| ty)
+    };
+    let main = kind("INVENTORY_SLOT_MAIN");
+    let off = kind("INVENTORY_SLOT_OFFHAND");
+    let one_handed = |t: &str| matches!(t, "lsw" | "axe" | "mce" | "dgr" | "wnd");
+    Some(match (main.as_deref(), off.as_deref()) {
+        (Some("gsw" | "gax" | "mal"), _) => "tw",
+        (Some("sbw" | "lbw"), _) => "bow",
+        (Some("cbw"), _) => "cbow",
+        (Some("stf"), _) => "staff",
+        (Some(m), Some("shd")) if one_handed(m) => "ws",
+        (Some(m), Some(x)) if one_handed(m) && one_handed(x) => "dw",
+        (Some(m), _) if one_handed(m) => "ow",
+        (None, Some("shd")) => "ws",
+        _ => return None,
+    })
 }
 
 /// How long an attack plays when the script set no duration (milliseconds). Provisional.
@@ -323,13 +356,14 @@ pub fn motion(sim: &Sim, o: &Object) -> Option<Motion> {
         list.iter().filter_map(|t| (*t).clone()).collect()
     };
     let fighting = o.combat.in_combat;
+    let style = weapon_style(sim, o).map(|s| format!("{s}.anb"));
     if o.dead {
         // From when it died, held on the last frame; a death of unknown time (a save from
         // before deaths were timed) shows the last frame.
         let time = o.died_at.map_or(f32::MAX, |t| secs(now.saturating_sub(t)));
         return Some(Motion {
-            trees: trees(&[&ambient, &combat]),
-            action: action::DIE.into(),
+            trees: trees(&[&style, &ambient, &combat]),
+            actions: vec![action::DIE.into()],
             time,
             looping: false,
         });
@@ -343,7 +377,7 @@ pub fn motion(sim: &Sim, o: &Object) -> Option<Motion> {
             };
             return Some(Motion {
                 trees: list,
-                action: action::RUN.into(),
+                actions: vec![action::RUN.into()],
                 time: secs(now) + phase,
                 looping: true,
             });
@@ -353,8 +387,8 @@ pub fn motion(sim: &Sim, o: &Object) -> Option<Motion> {
                 let length = o.combat.attack_ms.unwrap_or(DEFAULT_ATTACK_MS);
                 let start = due.saturating_sub(length);
                 return Some(Motion {
-                    trees: trees(&[&combat, &ambient]),
-                    action: action::ATTACK.into(),
+                    trees: trees(&[&style, &combat, &ambient]),
+                    actions: attack_actions(sim, o, due),
                     time: secs(now.saturating_sub(start)),
                     looping: false,
                 });
@@ -363,14 +397,32 @@ pub fn motion(sim: &Sim, o: &Object) -> Option<Motion> {
     }
     Some(Motion {
         trees: if fighting {
-            trees(&[&combat, &ambient])
+            trees(&[&style, &combat, &ambient])
         } else {
             trees(&[&ambient, &combat])
         },
-        action: action::PAUSE.into(),
+        actions: vec![action::PAUSE.into()],
         time: secs(now) + phase,
         looping: true,
     })
+}
+
+/// The swing for an attack due at `due`: a ranged style's shot, else one of the variants,
+/// picked per creature and attack so swings vary (a miss tries the miss swings first).
+/// Provisional: the original's choice of variant is not traced.
+fn attack_actions(sim: &Sim, o: &Object, due: u64) -> Vec<String> {
+    let pick = (o.id as u64).wrapping_mul(31).wrapping_add(due / 100);
+    let attack = format!("attk_v{}", 1 + pick % action::ATTACK_VARIANTS);
+    let missed = o.combat.attack.as_ref().is_some_and(|r| {
+        r.results[0] == thedas_sim::sim::constant(&sim.table, "COMBAT_RESULT_MISS")
+    });
+    let mut out = vec![action::FIRE.to_string()];
+    if missed {
+        out.push(format!("miss_v{}", 1 + pick % action::MISS_VARIANTS));
+    }
+    out.push(attack);
+    out.push("attk_v1".into());
+    out
 }
 
 /// Every active creature and placeable in `area` that has a model, in id order.
@@ -475,13 +527,72 @@ mod tests {
         }
         s.world.time_ms = 2_500;
         let m = motion(&s, s.world.get(id).unwrap()).unwrap();
-        assert_eq!(m.action, action::DIE);
+        assert_eq!(m.actions, vec![action::DIE]);
         assert_eq!(m.trees, vec!["humanoid.anb", "combat_humanoid.anb"]);
         assert!(!m.looping);
         assert!((m.time - 1.5).abs() < 1e-6);
         // A death of unknown time shows the end of the animation.
         s.world.get_mut(id).unwrap().died_at = None;
         assert_eq!(motion(&s, s.world.get(id).unwrap()).unwrap().time, f32::MAX);
+    }
+
+    #[test]
+    fn the_weapons_held_pick_the_fighting_style() {
+        use std::sync::Arc;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let ldf = "int INVENTORY_SLOT_MAIN = 0;\nint INVENTORY_SLOT_OFFHAND = 1;\n";
+        let table = Arc::new(EngineTable::parse(ldf.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let t = s.world.tables();
+        let st = |v: &str| Cell::String(v.into());
+        // Base item -> variation table -> model type.
+        let kinds = [
+            (2, 30, "lsw"),
+            (7, 37, "SHD"),
+            (5, 12, "gsw"),
+            (19, 42, "sbw"),
+        ];
+        t.insert(
+            "bitm_base",
+            &["Label", "#43b54707"],
+            kinds
+                .iter()
+                .map(|&(base, table, _)| (base, vec![st("item"), Cell::Int(table)]))
+                .collect(),
+        );
+        for (_, table, ty) in kinds {
+            t.insert(
+                &format!("#{table}"),
+                &["ModelType", "ModelSubType", "ModelVariation"],
+                vec![(1, vec![st(ty), st("x01"), st("a")])],
+            );
+        }
+        let mut item = |base: i32| {
+            let id = s.world.spawn(ObjectKind::Item, "item");
+            let o = s.world.get_mut(id).unwrap();
+            o.fields.insert("BaseItem".into(), base);
+            o.fields.insert("ModelVariation".into(), 1);
+            id
+        };
+        let (sword, sword2, shield, great, bow) = (item(2), item(2), item(7), item(5), item(19));
+        let mut style = |main: Option<u32>, off: Option<u32>| {
+            let c = s.world.spawn(ObjectKind::Creature, "c");
+            let o = s.world.get_mut(c).unwrap();
+            if let Some(m) = main {
+                o.equipment.insert(0, m);
+            }
+            if let Some(f) = off {
+                o.equipment.insert(1, f);
+            }
+            weapon_style(&s, s.world.get(c).unwrap())
+        };
+        assert_eq!(style(Some(sword), Some(shield)), Some("ws"));
+        assert_eq!(style(Some(sword), Some(sword2)), Some("dw"));
+        assert_eq!(style(Some(sword), None), Some("ow"));
+        assert_eq!(style(Some(great), None), Some("tw"));
+        assert_eq!(style(Some(bow), None), Some("bow"));
+        assert_eq!(style(None, None), None);
     }
 
     #[test]
