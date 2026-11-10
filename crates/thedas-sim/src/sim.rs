@@ -152,6 +152,21 @@ fn along(from: [f32; 3], points: &[[f32; 3]], f: f32) -> [f32; 3] {
     last
 }
 
+/// Where the `k`th follower (from 0) arrives with a leader at `p` facing `facing`: a
+/// little behind it, alternating to either side, so the party does not stand in one spot.
+/// Provisional: the game's own arrival formation is not traced.
+fn behind(p: [f32; 3], facing: f32, k: usize) -> [f32; 3] {
+    let heading = crate::world::heading_of(facing).to_radians();
+    let (fx, fy) = (heading.cos(), heading.sin());
+    let back = 1.2 + 0.6 * (k / 2) as f32;
+    let side = if k % 2 == 0 { 0.8 } else { -0.8 };
+    [
+        p[0] - fx * back - fy * side,
+        p[1] - fy * back + fx * side,
+        p[2],
+    ]
+}
+
 /// The horizontal direction of the leg of the route from `from` through `points` that a
 /// mover a share `f` of the way along it is on (the first leg at the start); `None` where
 /// the legs have no horizontal length.
@@ -868,16 +883,17 @@ impl Sim {
             Ok(new) => {
                 self.place_party_on_map(area);
                 self.travel_arrived();
-                let pos = self
+                let at = self
                     .world
                     .hero
                     .and_then(|h| self.world.get(h))
-                    .map(|h| h.position);
-                for id in party.iter().skip(1) {
+                    .map(|h| (h.position, h.facing));
+                for (k, id) in party.iter().skip(1).enumerate() {
                     if let Some(o) = self.world.get_mut(*id) {
                         o.area = Some(new);
-                        if let Some(p) = pos {
-                            o.position = p;
+                        if let Some((p, facing)) = at {
+                            o.position = behind(p, facing, k);
+                            o.facing = facing;
                         }
                         // Followers enter after the hero (whose ENTER `enter_area` sent).
                         let mut ev = self.new_event("ENTER", Some(*id));
@@ -2024,6 +2040,34 @@ impl Sim {
     }
 }
 
+/// The appearance a template gives: placeables keep it at the top, creatures in their
+/// "Appearance Data" struct.
+fn template_appearance(t: &Gff3) -> Option<i32> {
+    let r = t.structs.first()?;
+    int(r, "Appearance").or_else(|| match field(r, "Appearance Data") {
+        Some(G3::Struct(i)) => t
+            .structs
+            .get(*i as usize)
+            .and_then(|a| int(a, "Appearance_Type")),
+        _ => None,
+    })
+}
+
+impl Sim {
+    /// The appearance creature `id`'s template gives it, when the template can be read and
+    /// gives one.
+    pub(crate) fn original_appearance(&self, id: ObjectId) -> Option<i32> {
+        let o = self.world.get(id)?;
+        if o.kind != ObjectKind::Creature || o.template.is_empty() {
+            return None;
+        }
+        let t = self
+            .read_gff3(&format!("{}.utc", o.template.to_ascii_lowercase()))
+            .ok()?;
+        template_appearance(&t).filter(|&a| a > 0)
+    }
+}
+
 /// A template's values on an object: scripts, conversation, name, team, group, rank,
 /// appearance, local variables and every integer field.
 fn apply_template(o: &mut crate::world::Object, t: &Gff3) {
@@ -2036,16 +2080,7 @@ fn apply_template(o: &mut crate::world::Object, t: &Gff3) {
     o.team = int(r, "TeamId").unwrap_or(-1);
     o.group = int(r, "GroupId").unwrap_or(0);
     o.rank = int(r, "Rank").unwrap_or(0);
-    // Placeables keep it at the top; creatures in their "Appearance Data" struct.
-    o.appearance = int(r, "Appearance")
-        .or_else(|| match field(r, "Appearance Data") {
-            Some(G3::Struct(i)) => t
-                .structs
-                .get(*i as usize)
-                .and_then(|a| int(a, "Appearance_Type")),
-            _ => None,
-        })
-        .unwrap_or(0);
+    o.appearance = template_appearance(t).unwrap_or(0);
     read_vars(t, r, &mut o.locals);
     for fl in &r.fields {
         if let Some(v) = int(r, &fl.label) {
@@ -2957,6 +2992,18 @@ mod tests {
         s.tick(8000);
         assert_eq!(s.world.get(id).unwrap().position, [50.0, 0.0, 0.0]);
         assert!(s.world.get(id).unwrap().commands.is_empty());
+    }
+
+    #[test]
+    fn followers_arrive_behind_the_leader_not_on_it() {
+        // A leader facing +X (heading_of 270 is 0 radians): followers stand at smaller x,
+        // on either side, apart from each other.
+        let at: Vec<[f32; 3]> = (0..3).map(|k| behind([10.0, 0.0, 1.0], 270.0, k)).collect();
+        for p in &at {
+            assert!(p[0] < 10.0 && p[2] == 1.0, "{p:?}");
+        }
+        assert!(at[0][1] > 0.0 && at[1][1] < 0.0);
+        assert!(crate::engine::dist(at[0], at[2]) > 0.5);
     }
 
     #[test]
