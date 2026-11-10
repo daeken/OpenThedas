@@ -142,6 +142,8 @@ pub enum SceneLight {
 #[derive(Clone, Debug, Default)]
 pub struct AreaScene {
     pub level: String,
+    /// The level's sun (direction its light travels, colour), when it has one.
+    pub sun: Option<(Vec3, Vec3)>,
     pub name: Option<String>,
     pub bounds: Option<(Vec3, Vec3)>,
     pub rooms: Vec<String>,
@@ -921,6 +923,9 @@ impl AreaScene {
             message: e.to_string(),
         })?;
         l.scene.name = arl.name.clone();
+        l.scene.sun = arl
+            .sun
+            .map(|s| (Vec3::from_array(s.direction), Vec3::from_array(s.color)));
         l.scene.bounds = arl
             .bounds()
             .map(|(lo, hi)| (Vec3::from_array(lo), Vec3::from_array(hi)));

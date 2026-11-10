@@ -96,6 +96,8 @@ pub(crate) struct D3dPass {
     scene_probes: Vec<thedas_formats::probe::IrradianceProbe>,
     /// Each scene draw's ambient light (its room's).
     ambients: Vec<Vec3>,
+    /// The level's sun (direction, colour), if it has one.
+    sun: Option<(Vec3, Vec3)>,
     pub programs: Vec<String>,
 }
 
@@ -676,6 +678,7 @@ impl D3dPass {
             bones: vec![Vec::new(); scene.draws.len()],
             scene_probes: scene.probes.iter().map(|p| p.probe.clone()).collect(),
             ambients: scene.draws.iter().map(|d| ambient(&d.room)).collect(),
+            sun: scene.sun,
             programs,
         }
     }
@@ -732,6 +735,7 @@ impl D3dPass {
                     .copied()
                     .flatten()
                     .and_then(|p| self.scene_probes.get(p)),
+                sun: self.sun,
             };
             put(&mut data, d.slot, &cc.fill(program.vs.ctab.as_ref()), 0);
             put(&mut data, d.slot, &cc.fill(program.ps.ctab.as_ref()), 3);
