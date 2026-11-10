@@ -562,6 +562,11 @@ impl App {
             (Some(screens), Some(live)) => {
                 let level = live.level.as_ref();
                 g.ui.set_level(level.map(|l| l.layout.as_str()), level.map(|l| &l.vfs));
+                let party = thedas_sim::engine::party_of(&live.sim());
+                if g.ui.wants_portraits(party, dt) {
+                    let shots = live.portraits(&g.ctx, ui::PORTRAIT_SIZE);
+                    g.ui.set_portraits(shots);
+                }
                 for aim in g.ui.play(screens, &live.sim, dt.min(100.0)) {
                     log::info!("aiming ability {} (click a target)", aim.ability);
                     live.aiming = Some(aim);
@@ -1113,6 +1118,11 @@ fn main() -> Result<()> {
                                     level.map(|x| x.layout.as_str()),
                                     level.map(|x| &x.vfs),
                                 );
+                                let party = thedas_sim::engine::party_of(&l.sim());
+                                if layer.wants_portraits(party, dt) {
+                                    let shots = l.portraits(&ctx, ui::PORTRAIT_SIZE);
+                                    layer.set_portraits(shots);
+                                }
                                 if let Some(aim) = layer.play(s, &l.sim, dt).pop() {
                                     println!("aiming ability {}", aim.ability);
                                     l.aiming = Some(aim);

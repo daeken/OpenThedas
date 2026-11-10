@@ -76,6 +76,8 @@ pub struct Presentation {
     pub item_filter: i32,
     /// The current level's minimap, read from its resources.
     pub minimap: Option<crate::minimap::MinimapInfo>,
+    /// Party members' portraits: the image the stage serves for each (by creature id).
+    pub portraits: BTreeMap<u32, String>,
 }
 
 /// The inventory screen's item category tabs (inventory.gfx's `CATEGORY_*`).
@@ -214,6 +216,15 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         }
         v.insert("CharGenCreature.Stats.AutoLevelUp".into(), num(0));
         crate::chains::bind(sim, c, "CharGenCreature.Stats", &mut v);
+    }
+    // The portrait the engine drew of each member's head (portraits.gfx loads it).
+    for (i, id) in members.iter().enumerate() {
+        if let Some(p) = shown.portraits.get(id) {
+            v.insert(
+                format!("Party.Members.{i}.Portrait"),
+                UiValue::String(p.clone()),
+            );
+        }
     }
     // Empty slots read as no creature (0); `GetNumMembers` does not count them.
     for i in members.len()..4 {
@@ -622,6 +633,27 @@ mod tests {
         assert!(!v.contains_key("WorldMap.SecondaryMap.Type"));
         // No second map: the screen's map toggle disables itself on 0.
         assert_eq!(v["WorldMap.SecondaryMap"], UiValue::Number(0.0));
+    }
+
+    #[test]
+    fn members_show_the_portraits_drawn_of_them() {
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        sim.world.hero = Some(hero);
+        let shown = Presentation {
+            portraits: [(hero, "thedas_portrait_1_1.png".to_string())].into(),
+            ..Default::default()
+        };
+        let v = sim_values_for(&sim, &shown);
+        assert_eq!(
+            v["Party.Members.0.Portrait"],
+            UiValue::String("thedas_portrait_1_1.png".into())
+        );
+        assert!(!sim_values(&sim).contains_key("Party.Members.0.Portrait"));
     }
 
     #[test]

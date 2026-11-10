@@ -147,6 +147,8 @@ pub struct Stage {
     lookup: ResourceLookup,
     /// The current level's resources (its minimap picture), searched after the stage's own.
     level: Arc<std::sync::Mutex<Option<Arc<Vfs>>>>,
+    /// Images the engine makes (party portraits), by name, served before anything else.
+    made: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
     images: Arc<std::sync::Mutex<ImageSource>>,
     size: (u32, u32),
 }
@@ -154,9 +156,14 @@ pub struct Stage {
 impl Stage {
     pub fn new(gpu: Gpu, vfs: &Arc<Vfs>, size: (u32, u32)) -> Self {
         let level: Arc<std::sync::Mutex<Option<Arc<Vfs>>>> = Default::default();
+        let made: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>> =
+            Default::default();
         let lookup = {
-            let (global, level) = (vfs_lookup(vfs), level.clone());
+            let (global, level, made) = (vfs_lookup(vfs), level.clone(), made.clone());
             let lookup: ResourceLookup = Arc::new(move |name: &str| {
+                if let Some(bytes) = made.lock().ok().and_then(|m| m.get(name).cloned()) {
+                    return Some(bytes);
+                }
                 global(name).or_else(|| {
                     let l = level.lock().ok()?.clone()?;
                     l.read(name).ok().map(|x| x.0)
@@ -182,6 +189,7 @@ impl Stage {
             gpu,
             lookup,
             level,
+            made,
             images,
             size,
         }
@@ -189,6 +197,18 @@ impl Stage {
 
     pub fn size(&self) -> (u32, u32) {
         self.size
+    }
+
+    /// Serves `rgba` (PNG-encoded) to the movies as image `name` (a `.png`); `None` stops
+    /// serving it.
+    pub fn set_image(&self, name: &str, rgba: Option<&Rgba>) {
+        let bytes = rgba.and_then(encode_png);
+        if let Ok(mut m) = self.made.lock() {
+            match bytes {
+                Some(b) => m.insert(name.to_string(), b),
+                None => m.remove(name),
+            };
+        }
     }
 
     /// The level's resources the movies may load from too (the minimap picture), or none.
