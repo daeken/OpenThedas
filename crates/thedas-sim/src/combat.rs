@@ -247,6 +247,15 @@ impl Sim {
         // (EVENT_TYPE_DEATH_RES_PARTY to the module), whatever the game mode is, as long as
         // someone was left standing. When the whole party falls the game is over: the engine
         // shows the death screen itself (no script calls ShowDeathScreen).
+        // The party AI holds followers back until the party is "clear to attack" (the
+        // module's AI_PARTY_CLEAR_TO_ATTACK), which rules_core sets when the controlled
+        // character attacks or uses an ability on a hostile. On autopilot nobody is controlled,
+        // so the autopilot stands in for the player and opens every fight itself.
+        if self.world.autopilot && fighting {
+            if let Some(m) = self.world.module.and_then(|m| self.world.get_mut(m)) {
+                m.locals.ints.insert("AI_PARTY_CLEAR_TO_ATTACK".into(), 1);
+            }
+        }
         let was = std::mem::replace(&mut self.world.party_fighting, fighting);
         let standing = party.iter().any(|&m| self.alive(m));
         if !party.is_empty() && !standing && !self.world.game_over {
@@ -582,6 +591,40 @@ impl Sim {
         }
     }
 
+    /// On autopilot, during a fight: a party member's AI round runs when its command
+    /// completes, so a hero left with nothing to do (its round chose nothing, or it never had
+    /// one) stands for a second, after which its round comes. Called once a tick's events
+    /// are delivered, so that a pending `COMMAND_COMPLETE` gets its round first.
+    pub(crate) fn autopilot_idle_hero(&mut self) {
+        if !self.world.autopilot || !self.world.party_fighting {
+            return;
+        }
+        if let Some(hero) = self.world.hero.filter(|&h| self.alive(h)) {
+            self.order_wait(hero, 1.0);
+        }
+    }
+
+    /// Queues a `CommandWait` for a creature that has nothing to do, as a player does by
+    /// letting the controlled character stand. When it ends the owner hears
+    /// `COMMAND_COMPLETE`, which runs its AI round when its party AI is on.
+    pub fn order_wait(&mut self, who: ObjectId, seconds: f32) {
+        let cmd = crate::world::Command {
+            ty: constant_of(self, "COMMAND_TYPE_WAIT"),
+            name: "CommandWait".into(),
+            target: None,
+            location: None,
+            seconds,
+            ints: Vec::new(),
+            strings: Vec::new(),
+            due: None,
+            from: None,
+            approach: None,
+        };
+        if let Some(o) = self.world.get_mut(who).filter(|o| o.commands.is_empty()) {
+            o.commands.push(cmd);
+        }
+    }
+
     /// The item a `CommandUseAbility` uses: the owner's inventory item whose tag is the
     /// command's string 0, or `OBJECT_INVALID`.
     fn ability_item(&self, id: ObjectId, cmd: &crate::world::Command) -> ObjectId {
@@ -879,6 +922,53 @@ mod tests {
             },
         );
         assert!(!s.world.get(hero).unwrap().dead);
+    }
+
+    #[test]
+    fn on_autopilot_the_party_is_clear_to_attack_and_an_idle_hero_waits_for_its_ai() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let module = s.world.spawn(ObjectKind::Module, "m");
+        s.world.module = Some(module);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let foe = s.world.spawn(ObjectKind::Creature, "foe");
+        s.world.hero = Some(hero);
+        for (id, x, g) in [(hero, 0.0, 0), (foe, 5.0, 2)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = [x, 0.0, 0.0];
+            o.group = g;
+        }
+        s.world.hostility.insert((0, 2), true);
+        let clear = |s: &Sim| {
+            s.world
+                .get(module)
+                .unwrap()
+                .locals
+                .ints
+                .get("AI_PARTY_CLEAR_TO_ATTACK")
+                .copied()
+        };
+        // Under the player's control the player opens fights (the scripts set the flag).
+        s.update_perception();
+        assert_eq!(clear(&s), None);
+        assert!(s.world.get(hero).unwrap().commands.is_empty());
+        s.world.autopilot = true;
+        s.update_perception();
+        assert_eq!(clear(&s), Some(1));
+        s.autopilot_idle_hero();
+        let waits: Vec<_> = s
+            .world
+            .get(hero)
+            .unwrap()
+            .commands
+            .iter()
+            .map(|c| (c.name.clone(), c.seconds))
+            .collect();
+        assert_eq!(waits, vec![("CommandWait".to_string(), 1.0)]);
+        // A busy hero is left alone.
+        s.autopilot_idle_hero();
+        assert_eq!(s.world.get(hero).unwrap().commands.len(), 1);
     }
 
     #[test]

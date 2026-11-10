@@ -124,6 +124,9 @@ enum Command {
         /// One line per run.
         #[arg(long)]
         verbose: bool,
+        /// Leave the hero's fighting to the party AI (autopilot tactics) too.
+        #[arg(long)]
+        ai_hero: bool,
         /// Write the last run's end state here.
         #[arg(long)]
         save_to: Option<PathBuf>,
@@ -278,6 +281,7 @@ fn run() -> Result<()> {
             watch,
             at,
             verbose,
+            ai_hero,
             save_to,
         } => autoplay::run(&autoplay::Options {
             install: &install,
@@ -293,6 +297,7 @@ fn run() -> Result<()> {
             watch: &watch,
             at: &at,
             verbose,
+            ai_hero,
             save_to: save_to.as_deref(),
         }),
         Command::Navgrid {
