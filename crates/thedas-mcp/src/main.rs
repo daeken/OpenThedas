@@ -242,6 +242,10 @@ struct MoveArgs {
     x: Option<f32>,
     y: Option<f32>,
     z: Option<f32>,
+    /// Jump straight there instead of walking (walking runs time and fires triggers on
+    /// the way, stopping if a conversation starts).
+    #[serde(default)]
+    teleport: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -898,9 +902,18 @@ impl Server {
                     sim.world.area,
                 ),
             };
-            sim.move_object(hero, target.0, target.1);
-            sim.tick(0);
-            Ok(summary(sim, hero))
+            let arrived = if a.teleport {
+                sim.move_object(hero, target.0, target.1);
+                sim.tick(0);
+                true
+            } else {
+                sim.walk(hero, target.0, target.1)
+            };
+            let mut out = summary(sim, hero);
+            out["arrived"] = json!(arrived);
+            out["time_ms"] = json!(sim.world.time_ms);
+            out["conversation"] = dialog_json(sim);
+            Ok(out)
         })
     }
 
