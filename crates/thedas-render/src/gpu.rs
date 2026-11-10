@@ -765,6 +765,81 @@ impl AreaRenderer {
         }
     }
 
+    /// Places and poses `scene`'s prop `prop`: its draws move to `transform`; skinned draws
+    /// take their skeleton's pose (`poses[skeleton]`: the rest and posed model-space matrices
+    /// per node; a skeleton missing from it stays at rest) through their skinning palette, or, on the stand-in (which does
+    /// not skin), follow their first palette bone rigidly; attachments follow their node.
+    pub fn pose_prop(
+        &mut self,
+        ctx: &GpuContext,
+        scene: &AreaScene,
+        prop: usize,
+        transform: glam::Mat4,
+        poses: &crate::skeleton::Poses,
+    ) {
+        let Some(p) = scene.props.get(prop) else {
+            return;
+        };
+        let to_model = p.transform.inverse();
+        let attached: std::collections::HashSet<usize> =
+            p.attachments.iter().flat_map(|a| a.draws.clone()).collect();
+        let pose_of = |s: usize| poses.get(&s);
+        for d in p.draws.clone() {
+            if attached.contains(&d) {
+                continue;
+            }
+            let Some(item) = scene.draws.get(d) else {
+                continue;
+            };
+            // The draw's placement in the model.
+            let in_model = to_model * item.transform;
+            let Some(skin) = &item.skin else {
+                self.set_transform(ctx, d, transform * in_model);
+                continue;
+            };
+            let Some((rest, pose)) = pose_of(skin.skeleton) else {
+                self.set_transform(ctx, d, transform * in_model);
+                self.d3d.set_bones(d, Vec::new());
+                continue;
+            };
+            if self.stand_in_of.get(d).copied().flatten().is_some() {
+                let follow = skin
+                    .palette
+                    .iter()
+                    .flatten()
+                    .next()
+                    .filter(|&&n| n < rest.len() && n < pose.len())
+                    .map_or(glam::Mat4::IDENTITY, |&n| pose[n] * rest[n].inverse());
+                self.set_transform(ctx, d, transform * follow * in_model);
+            } else {
+                self.set_transform(ctx, d, transform * in_model);
+                self.d3d.set_bones(
+                    d,
+                    crate::skeleton::palette_rows(rest, pose, &skin.palette, skin.mesh_node),
+                );
+            }
+        }
+        for a in &p.attachments {
+            let Some((rest, pose)) = pose_of(a.skeleton) else {
+                for d in a.draws.clone() {
+                    if let Some(item) = scene.draws.get(d) {
+                        self.set_transform(ctx, d, transform * to_model * item.transform);
+                    }
+                }
+                continue;
+            };
+            let (Some(r), Some(q)) = (rest.get(a.node), pose.get(a.node)) else {
+                continue;
+            };
+            let follow = *q * r.inverse();
+            for d in a.draws.clone() {
+                if let Some(item) = scene.draws.get(d) {
+                    self.set_transform(ctx, d, transform * follow * to_model * item.transform);
+                }
+            }
+        }
+    }
+
     pub fn color_format(&self) -> wgpu::TextureFormat {
         self.color_format
     }
@@ -1082,6 +1157,7 @@ mod tests {
                 model: "tri".into(),
                 room: "room".into(),
                 probe: None,
+                skin: None,
             }],
             ..Default::default()
         };

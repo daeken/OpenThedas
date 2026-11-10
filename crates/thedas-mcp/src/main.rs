@@ -715,7 +715,7 @@ impl Server {
     }
 
     #[tool(
-        description = "A picture of what the party sees: the current area's level geometry, creatures and placeables (in bind pose) from a camera behind the hero, with the open interface movies over it (ui=false for the scene alone)."
+        description = "A picture of what the party sees: the current area's level geometry, creatures and placeables (animated by what each creature is doing: standing, running, attacking or dead) from a camera behind the hero, with the open interface movies over it (ui=false for the scene alone)."
     )]
     async fn screenshot(&self, Parameters(a): Parameters<ShotArgs>) -> CallToolResult {
         let inputs = {

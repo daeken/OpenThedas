@@ -17,6 +17,18 @@ pub struct LoadedScene {
     key: (String, Vec<(u32, Vec<String>)>),
     scene: thedas_render::AreaScene,
     renderer: thedas_render::AreaRenderer,
+    vfs: thedas_vfs::Vfs,
+    animator: thedas_render::Animator,
+}
+
+/// A creature's motion as a clip for the animator.
+pub fn clip(m: &thedas_ui::models::Motion) -> thedas_render::Clip {
+    thedas_render::Clip {
+        trees: m.trees.clone(),
+        action: m.action.clone(),
+        time: m.time,
+        looping: m.looping,
+    }
 }
 
 /// What a capture shows: the level `layout` and the objects in it.
@@ -120,14 +132,24 @@ impl UiWorld {
                 key,
                 scene,
                 renderer,
+                vfs,
+                animator: thedas_render::Animator::default(),
             });
         }
         let loaded = self.scene.as_mut().ok_or("no scene")?;
-        for (i, p) in placed.iter().enumerate() {
-            loaded
-                .renderer
-                .move_prop(ctx, &loaded.scene, i, p.transform);
-        }
+        let posed: Vec<(glam::Mat4, Option<thedas_render::Clip>)> = placed
+            .iter()
+            .zip(props)
+            .map(|(p, m)| (p.transform, m.motion.as_ref().map(clip)))
+            .collect();
+        loaded.animator.pose_props(
+            &loaded.vfs,
+            &loaded.scene,
+            &mut loaded.renderer,
+            ctx,
+            &posed,
+            0.0,
+        );
         let pixels = loaded
             .renderer
             .capture(ctx, camera, w, h)
