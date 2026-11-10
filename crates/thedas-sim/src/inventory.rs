@@ -601,8 +601,9 @@ impl Sim {
         out
     }
 
-    /// Takes everything out of a container, body bag or dead creature into `to`'s inventory.
-    /// Equipped items of a creature stay unless they are droppable. Returns the items taken.
+    /// Takes everything out of a container, body bag or dead creature into `to`'s inventory,
+    /// and its money into `to`'s. Equipped items of a creature stay unless they are
+    /// droppable. Returns the items taken.
     pub fn loot(&mut self, from: ObjectId, to: ObjectId) -> Vec<ObjectId> {
         let Some(src) = self.world.get(from) else {
             return Vec::new();
@@ -620,14 +621,30 @@ impl Sim {
                         .is_some_and(|x| x.fields.get("Droppable").copied().unwrap_or(0) != 0)
             })
             .collect();
+        let money = src.money.max(0);
         for &i in &items {
             self.give_item(i, to);
+        }
+        if money > 0
+            && from != to
+            && self.world.get(to).is_some()
+            && let Some(src) = self.world.get_mut(from)
+        {
+            src.money = 0;
+            if let Some(t) = self.world.get_mut(to) {
+                t.money = t.money.saturating_add(money);
+            }
         }
         items
     }
 
     /// `SpawnBodyBag`: leaves a container where a creature fell holding its droppable items
-    /// (all of them when forced). Nothing is left when there is nothing to take.
+    /// (all of them when forced) and its money. Nothing is left when there is nothing to
+    /// take: no money and no items to drop (DAOrigins.exe 0x6a90d0, the check 0x6a91e0
+    /// makes, counts the creature's money before its droppable items).
+    ///
+    /// Provisional: the original's bag refers back to the creature and is looted from its
+    /// inventory; here the money moves into the bag, as the items do.
     pub fn spawn_body_bag(&mut self, creature: ObjectId, force: bool) -> Option<ObjectId> {
         let c = self.world.get(creature)?;
         let (pos, area) = (c.position, c.area);
@@ -643,7 +660,8 @@ impl Sim {
                         .is_some_and(|x| x.fields.get("Droppable").copied().unwrap_or(0) != 0)
             })
             .collect();
-        if items.is_empty() {
+        let money = c.money.max(0);
+        if items.is_empty() && money == 0 {
             return None;
         }
         let bag = self.world.spawn(ObjectKind::Placeable, "gen_ip_bodybag");
@@ -652,8 +670,10 @@ impl Sim {
             b.area = area;
             b.template = "gen_ip_bodybag".into();
             b.inventory = items.clone();
+            b.money = money;
         }
         if let Some(c) = self.world.get_mut(creature) {
+            c.money -= money;
             c.inventory.retain(|i| !items.contains(i));
             c.equipment.retain(|_, i| !items.contains(i));
             c.other_set.retain(|_, i| !items.contains(i));
@@ -895,6 +915,7 @@ mod tests {
         assert_eq!(s.world.get(foe).unwrap().inventory, vec![sword]);
         assert_eq!(s.loot(bag, hero), vec![blood]);
         assert_eq!(s.world.get(hero).unwrap().inventory, vec![blood]);
+        assert_eq!(s.world.get(hero).unwrap().money, 0);
         let evs: Vec<_> = s
             .world
             .queue
@@ -915,6 +936,30 @@ mod tests {
                 (bag, 7, Some(hero), vec![blood])
             ]
         );
+    }
+
+    #[test]
+    fn a_fallen_creatures_money_goes_into_its_bag_and_to_the_looter() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let foe = s.world.spawn(ObjectKind::Creature, "foe");
+        let sword = s.world.spawn(ObjectKind::Item, "sword");
+        s.world.get_mut(hero).unwrap().money = 50;
+        let f = s.world.get_mut(foe).unwrap();
+        f.inventory = vec![sword];
+        f.money = 181;
+        // Nothing droppable, but money: a bag is still left.
+        let bag = s.spawn_body_bag(foe, false).unwrap();
+        assert_eq!(s.world.get(bag).unwrap().money, 181);
+        assert!(s.world.get(bag).unwrap().inventory.is_empty());
+        assert_eq!(s.world.get(foe).unwrap().money, 0);
+        assert!(s.loot(bag, hero).is_empty());
+        assert_eq!(s.world.get(hero).unwrap().money, 231);
+        assert_eq!(s.world.get(bag).unwrap().money, 0);
+        // A creature with neither leaves nothing.
+        let poor = s.world.spawn(ObjectKind::Creature, "poor");
+        assert_eq!(s.spawn_body_bag(poor, false), None);
     }
 }
 
