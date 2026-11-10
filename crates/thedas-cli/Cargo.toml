@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 thedas-vfs.workspace = true
 thedas-formats.workspace = true
+thedas-shader.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true

@@ -15,6 +15,7 @@
 //! - [`model`]: `.mmh` model hierarchies (GFF4).
 //! - [`mesh`]: `.msh` mesh data with D3D9 vertex declarations (GFF4).
 //! - [`material`]: `.mao` material objects and `.mat` material definitions (XML).
+//! - [`state`]: `.sta` render states (XML).
 //! - [`dds`]: DDS textures, with a CPU decoder for BC1/2/3.
 
 pub mod area;
@@ -26,6 +27,7 @@ pub mod level;
 pub mod material;
 pub mod mesh;
 pub mod model;
+pub mod state;
 pub mod tlk;
 pub mod typed;
 
@@ -38,5 +40,6 @@ pub use level::{Arl, Rml};
 pub use material::{MaterialDef, MaterialObject};
 pub use mesh::Msh;
 pub use model::Mmh;
+pub use state::MaterialState;
 pub use tlk::Tlk;
 pub use typed::TypedError;
