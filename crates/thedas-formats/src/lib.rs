@@ -17,11 +17,13 @@
 //! - [`material`]: `.mao` material objects and `.mat` material definitions (XML).
 //! - [`state`]: `.sta` render states (XML).
 //! - [`dds`]: DDS textures, with a CPU decoder for BC1/2/3.
+//! - [`anim`]: animation trees (`.anb`), animation lengths (`.gad`) and events (`.evt`).
 //!
 //! Interface:
 //!
 //! - [`gfx`]: Scaleform GFx movies (SWF with Scaleform tags), with a rewriter to plain SWF.
 
+pub mod anim;
 pub mod area;
 pub mod dds;
 pub mod gda;

@@ -455,7 +455,7 @@ impl Sim {
     /// Records health a script took from `target` (`TraceEntry::Damage`): the source is the
     /// creator of the effect being applied to it, if any, else the script's owner (a weapon
     /// hit is applied by the attacker's own script); the ability is the effect's (0 for a
-    /// weapon hit).
+    /// weapon hit). Health the module's scripts set outside an effect is not recorded.
     pub(crate) fn record_health_loss(&mut self, caller: ObjectId, target: ObjectId, amount: f32) {
         if amount <= 0.0 {
             return;
@@ -465,6 +465,11 @@ impl Sim {
             .as_ref()
             .filter(|_| self.current_effect_target == Some(target))
             .map(|(e, _)| e);
+        // The module's own scripts set health when they get the fallen up after a fight
+        // (DEATH_RES_PARTY); that is no hit.
+        if effect.is_none() && Some(caller) == self.world.module {
+            return;
+        }
         let source = effect.and_then(|e| e.creator).unwrap_or(caller);
         let (ability, ty) = effect.map_or((0, 0), |e| (e.ability, e.ty));
         let t = self.world.time_ms;
@@ -556,11 +561,17 @@ impl Sim {
 
     /// Marks a creature dead, clears what it was doing and sends it `EVENT_TYPE_DEATH`.
     pub fn kill(&mut self, id: ObjectId, killer: ObjectId) {
+        let health = constant_of(self, "PROPERTY_DEPLETABLE_HEALTH");
         if let Some(o) = self.world.get_mut(id) {
             if o.dead {
                 return;
             }
             o.dead = true;
+            // The fallen have no health left (a killing blow arrives as EFFECT_TYPE_DEATH,
+            // not as damage that empties the bar).
+            if let Some(v) = o.properties.get_mut(&health) {
+                v.1 = 0.0;
+            }
             o.commands.clear();
             o.combat.attack = None;
             o.combat.in_combat = false;
@@ -857,6 +868,60 @@ impl Sim {
     }
 }
 
+/// `bitm_base.gda`: the base item's combat animation tree (`Bow.anb`, `Cbow.anb`,
+/// `Staff.anb`; empty for melee weapons). The column's name is not known.
+const COL_ANIM_TREE: u32 = 0x8bf8_fc78;
+
+impl Sim {
+    /// How long a ranged weapon's shot takes to play: the `fire` action of the weapon's
+    /// animation tree (`bitm_base.gda`), its animation's length (`.gad`) over its speed, in
+    /// milliseconds. 0 for weapons without a tree (melee) or when the data is missing.
+    ///
+    /// A ranged attack is then the attack duration the rules set (`SetAttackDuration`: 1.5 s
+    /// for a bow, 0.3 s for a staff), the aim (`SetAimLoopDuration`) and this shot (bow 0.43
+    /// s, crossbow 0.6 s, staff 1.0 s). Provisional: the scripts' durations match the bows'
+    /// draw animations (`aim`, 1.57 s; crossbow 1.83 s), so they are taken as the draw, not
+    /// the whole attack; melee durations match whole swings (1.9 s against 1.97-2.0 s
+    /// weapon-and-shield attacks) and stay the whole attack. Not confirmed against the
+    /// executable.
+    pub fn fire_ms(&mut self, id: ObjectId) -> u64 {
+        let slot = constant_of(self, "INVENTORY_SLOT_MAIN");
+        let base = self
+            .world
+            .get(id)
+            .and_then(|o| o.equipment.get(&slot))
+            .and_then(|w| self.world.get(*w))
+            .and_then(|w| w.fields.get("BaseItem").copied());
+        let Some(base) = base else { return 0 };
+        let tree = self
+            .world
+            .tables()
+            .get(6, "")
+            .and_then(|t| match t.cell_by_hash(COL_ANIM_TREE, base as i64)? {
+                thedas_formats::gda::Cell::String(s) => Some(crate::engine::clean(s).to_string()),
+                _ => None,
+            })
+            .filter(|s| !s.is_empty());
+        let Some(tree) = tree else { return 0 };
+        if let Some(ms) = self.fire_lengths.get(&tree.to_ascii_lowercase()) {
+            return ms.unwrap_or(0);
+        }
+        let read = |name: &str| self.vfs.read(name).ok().map(|(d, _)| d);
+        let ms = read(&tree)
+            .and_then(|d| thedas_formats::anim::AnimTree::parse(&d).ok())
+            .and_then(|t| {
+                let node = t.action("fire")?.clone();
+                let ani = node.animation?;
+                let gad = format!("{}.gad", ani.strip_suffix(".ani").unwrap_or(&ani));
+                let info = thedas_formats::anim::AnimInfo::parse(&read(&gad)?).ok()?;
+                let speed = (node.speed * info.speed).max(0.01);
+                Some((info.duration / speed * 1000.0).round() as u64)
+            });
+        self.fire_lengths.insert(tree.to_ascii_lowercase(), ms);
+        ms.unwrap_or(0)
+    }
+}
+
 /// How close a melee attacker gets before swinging (metres). Provisional: rules_core
 /// counts any melee attack from beyond 5 m as a miss.
 pub const MELEE_REACH: f32 = 2.0;
@@ -1066,6 +1131,21 @@ mod tests {
         // A busy hero is left alone.
         s.autopilot_idle_hero();
         assert_eq!(s.world.get(hero).unwrap().commands.len(), 1);
+    }
+
+    #[test]
+    fn the_fallen_have_no_health_left() {
+        let mut s = sim();
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        s.world
+            .get_mut(c)
+            .unwrap()
+            .properties
+            .insert(7, (120.0, 64.0));
+        s.kill(c, OBJECT_INVALID);
+        let o = s.world.get(c).unwrap();
+        assert!(o.dead);
+        assert_eq!(o.properties[&7], (120.0, 0.0));
     }
 
     #[test]
