@@ -1,0 +1,9 @@
+/target
+# Never commit original game data, extracted resources or corpus reports.
+/gamedata
+/extracted
+/reports
+*.erf
+*.rim
+*.tlk
+*.gda

@@ -1,0 +1,12 @@
+[package]
+name = "thedas-formats"
+description = "Parsers and writers for Dragon Age data formats (GFF4, GDA, TLK)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+crc32fast.workspace = true
