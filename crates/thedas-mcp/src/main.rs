@@ -185,6 +185,22 @@ struct LoadArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct LevelUpArgs {
+    /// Party member to level up (default: the hero).
+    object: Option<String>,
+    /// Attribute points to spend, as [attribute property id, points] pairs (1 strength,
+    /// 2 dexterity, 3 willpower, 4 magic, 5 cunning, 6 constitution).
+    #[serde(default)]
+    attributes: Vec<(i32, i32)>,
+    /// Talents, spells or skills to learn (ability ids, e.g. from ABI_base).
+    #[serde(default)]
+    abilities: Vec<i32>,
+    /// Spend whatever points remain as the creature's auto-level table suggests.
+    #[serde(default)]
+    auto: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct ChargenArgs {
     /// Event name without EVENT_TYPE_: CHARGEN_SELECT_GENDER, CHARGEN_SELECT_RACE,
     /// CHARGEN_SELECT_CLASS, CHARGEN_SELECT_BACKGROUND, CHARGEN_SELECT_NAME,
@@ -324,6 +340,139 @@ fn resolve(sim: &Sim, s: &str) -> Option<ObjectId> {
         return sim.world.hero;
     }
     sim.world.find_tag(s, 0)
+}
+
+/// Spends a creature's remaining level-up points from its auto-level table, through the
+/// chargen events: the table is the follower's own (`ALAlistair`, ...), its package's
+/// `LevelupTable`, or its class's default (`alwarrior_default`, ...), as player_core picks
+/// it. Provisional reading of the table: column 5 of rows 1-6 weighs the attributes
+/// (strength .. constitution) and columns 1-4 list abilities, earlier rows first; each is
+/// tried while points of its kind remain (skills spend skill points, the rest talent points).
+fn auto_level(sim: &mut Sim, who: ObjectId) {
+    let prop = |sim: &Sim, p: i32| {
+        sim.world
+            .get(who)
+            .and_then(|o| o.properties.get(&p))
+            .map_or(0.0, |v| v.0.max(v.1))
+    };
+    let tag = sim
+        .world
+        .get(who)
+        .map(|o| o.tag.to_ascii_lowercase())
+        .unwrap_or_default();
+    let own = [
+        ("gen00fl_alistair", 256),
+        ("gen00fl_dog", 257),
+        ("gen00fl_leliana", 258),
+        ("gen00fl_loghain", 259),
+        ("gen00fl_morrigan", 260),
+        ("gen00fl_oghren", 261),
+        ("gen00fl_sten", 262),
+        ("gen00fl_wynne", 263),
+    ];
+    let package = sim
+        .world
+        .get(who)
+        .and_then(|o| o.fields.get("Package").copied())
+        .unwrap_or(0);
+    let tables = sim.world.tables();
+    let int_cell = |c: Option<&thedas_formats::gda::Cell>| match c {
+        Some(thedas_formats::gda::Cell::Int(v)) => *v as i32,
+        Some(thedas_formats::gda::Cell::Float(v)) => *v as i32,
+        _ => 0,
+    };
+    let from_package = tables
+        .get(163, "")
+        .map(|t| int_cell(t.cell("LevelupTable", package as i64)))
+        .unwrap_or(0);
+    let class = prop(sim, 27) as i32;
+    let table = own
+        .iter()
+        .find(|(t, _)| *t == tag)
+        .map(|(_, id)| *id)
+        .or((from_package > 0).then_some(from_package))
+        .unwrap_or(match class {
+            2 => 1003,
+            3 => 1004,
+            _ => 1002,
+        });
+    let Some(t) = tables.get(table, "") else {
+        return;
+    };
+    let col = |i: usize| t.columns.iter().find(|(_, c)| **c == i).map(|(h, _)| *h);
+    // Attributes, by weight.
+    let points = prop(sim, 34) as i32;
+    if points > 0 {
+        let weights: Vec<f32> = (1..=6)
+            .map(|r| match col(5).and_then(|h| t.cell_by_hash(h, r)) {
+                Some(thedas_formats::gda::Cell::Float(v)) => *v as f32,
+                Some(thedas_formats::gda::Cell::Int(v)) => *v as f32,
+                _ => 0.0,
+            })
+            .collect();
+        let total: f32 = weights.iter().sum();
+        if total > 0.0 {
+            let mut give: Vec<i32> = weights
+                .iter()
+                .map(|w| (points as f32 * w / total).floor() as i32)
+                .collect();
+            let mut left = points - give.iter().sum::<i32>();
+            let mut order: Vec<usize> = (0..6).collect();
+            order.sort_by(|a, b| weights[*b].total_cmp(&weights[*a]));
+            for i in order.iter().cycle().take(64) {
+                if left <= 0 {
+                    break;
+                }
+                if weights[*i] > 0.0 {
+                    give[*i] += 1;
+                    left -= 1;
+                }
+            }
+            for (i, n) in give.iter().enumerate() {
+                if *n > 0 {
+                    sim.chargen_event(
+                        "CHARGEN_ASSIGN_ATTRIBUTES",
+                        vec![i as i32 + 1, *n],
+                        Vec::new(),
+                    );
+                    sim.tick(0);
+                }
+            }
+        }
+    }
+    // Abilities, in table order.
+    let skill_type = 3;
+    for &row in &t.order {
+        if row == 0 {
+            continue;
+        }
+        for c in 1..=4 {
+            let Some(id) = col(c).map(|h| int_cell(t.cell_by_hash(h, row))) else {
+                continue;
+            };
+            if id <= 0
+                || sim
+                    .world
+                    .get(who)
+                    .is_some_and(|o| o.abilities.contains(&id))
+            {
+                continue;
+            }
+            let kind = tables
+                .get(1, "")
+                .map(|a| int_cell(a.cell("AbilityType", id as i64)))
+                .unwrap_or(0);
+            let pool = if kind == skill_type { 35 } else { 36 };
+            if prop(sim, 35) < 1.0 && prop(sim, 36) < 1.0 {
+                return;
+            }
+            if prop(sim, pool) < 1.0 {
+                continue;
+            }
+            sim.chargen_event("CHARGEN_ASSIGN_ABILITIES", vec![id, 0], Vec::new());
+            sim.tick(0);
+        }
+    }
 }
 
 fn summary(sim: &Sim, id: ObjectId) -> J {
@@ -1051,6 +1200,48 @@ impl Server {
                 "chargen_in_progress": sim.world.chargen.is_some(),
                 "area": sim.world.area.map(|x| summary(sim, x)),
                 "conversation": dialog_json(sim),
+            }))
+        })
+    }
+
+    #[tool(
+        description = "Level up a party member as the level-up screen does: open it (EVENT_TYPE_PLAYERLEVELUP), spend attribute points and learn abilities through the chargen events, and close it. Returns the creature's level, attributes, unspent points (34 attribute, 35 skill, 36 talent) and abilities."
+    )]
+    async fn level_up(&self, Parameters(a): Parameters<LevelUpArgs>) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            let who = match a.object.as_deref() {
+                Some(o) => resolve(sim, o).ok_or("no such object")?,
+                None => sim.world.hero.ok_or("no hero")?,
+            };
+            sim.request_level_up(who);
+            sim.tick(0);
+            if sim.world.chargen != Some(who) {
+                return Err(
+                    "the level-up screen did not open (in combat, or not a party member?)".into(),
+                );
+            }
+            for (attr, n) in &a.attributes {
+                sim.chargen_event("CHARGEN_ASSIGN_ATTRIBUTES", vec![*attr, *n], Vec::new());
+                sim.tick(0);
+            }
+            for ab in &a.abilities {
+                sim.chargen_event("CHARGEN_ASSIGN_ABILITIES", vec![*ab, 0], Vec::new());
+                sim.tick(0);
+            }
+            if a.auto {
+                auto_level(sim, who);
+            }
+            sim.chargen_event("CHARGEN_END", vec![1, 0], Vec::new());
+            sim.tick(0);
+            let o = sim.world.get(who).ok_or("gone")?;
+            let prop = |p: i32| o.properties.get(&p).map(|v| v.0.max(v.1)).unwrap_or(0.0);
+            Ok(json!({
+                "object": who,
+                "level": prop(15),
+                "attributes": (1..=6).map(prop).collect::<Vec<_>>(),
+                "points": { "attribute": prop(34), "skill": prop(35), "talent": prop(36) },
+                "abilities": o.abilities,
             }))
         })
     }

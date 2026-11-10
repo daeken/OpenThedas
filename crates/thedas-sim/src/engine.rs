@@ -890,7 +890,13 @@ pub fn call(
             );
             void()
         }
-        "GetPlotFlagRewardId" => ok(Value::Int(0)),
+        "GetPlotFlagRewardId" => {
+            let p = h.sim.plot_info(&string(a, 0));
+            ok(Value::Int(
+                p.and_then(|p| p.rewards.get(&int(a, 1)).copied())
+                    .unwrap_or(0),
+            ))
+        }
 
         // --- Game state -------------------------------------------------------------------
         "GetGameMode" => ok(Value::Int(h.sim.world.game_mode)),
@@ -1504,10 +1510,18 @@ pub fn call(
             } else {
                 "FollowerSubState"
             };
+            // The hero is in the active party without ever being given a state (creature_core
+            // rewards XP only to party members whose state is set). Provisional: ACTIVE.
+            let hero_default = if name == "GetFollowerState" && Some(obj(a, 0)) == h.sim.world.hero
+            {
+                constant(&h.sim.table, "FOLLOWER_STATE_ACTIVE")
+            } else {
+                0
+            };
             ok(Value::Int(
                 h.object(obj(a, 0))
                     .and_then(|o| o.fields.get(field).copied())
-                    .unwrap_or(0),
+                    .unwrap_or(hero_default),
             ))
         }
         "SetFollowerState" => {
@@ -1714,10 +1728,18 @@ pub fn call(
                 "GetCombatantType" => "Combatant",
                 _ => "Appearance",
             };
+            // The hero is in the active party without ever being given a state (creature_core
+            // rewards XP only to party members whose state is set). Provisional: ACTIVE.
+            let hero_default = if name == "GetFollowerState" && Some(obj(a, 0)) == h.sim.world.hero
+            {
+                constant(&h.sim.table, "FOLLOWER_STATE_ACTIVE")
+            } else {
+                0
+            };
             ok(Value::Int(
                 h.object(obj(a, 0))
                     .and_then(|o| o.fields.get(field).copied())
-                    .unwrap_or(0),
+                    .unwrap_or(hero_default),
             ))
         }
         "GetCreatureGender" => ok(Value::Int(
@@ -1990,6 +2012,11 @@ pub fn call(
             }
             void()
         }
+        "GetAutoLevelUp" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .and_then(|o| o.fields.get("AutoLevelUp").copied())
+                .unwrap_or(0),
+        )),
         "GetCanLevelUp" => ok(Value::Int(
             h.object(obj(a, 0))
                 .and_then(|o| o.fields.get("CanLevelUp").copied())
@@ -2207,10 +2234,18 @@ pub fn call(
             } else {
                 "MaterialProgress"
             };
+            // The hero is in the active party without ever being given a state (creature_core
+            // rewards XP only to party members whose state is set). Provisional: ACTIVE.
+            let hero_default = if name == "GetFollowerState" && Some(obj(a, 0)) == h.sim.world.hero
+            {
+                constant(&h.sim.table, "FOLLOWER_STATE_ACTIVE")
+            } else {
+                0
+            };
             ok(Value::Int(
                 h.object(obj(a, 0))
                     .and_then(|o| o.fields.get(field).copied())
-                    .unwrap_or(0),
+                    .unwrap_or(hero_default),
             ))
         }
         "SetAimLoopDuration" => void(),
@@ -2496,7 +2531,8 @@ mod tests {
         int FALSE = 0;\n\
         int TRUE = 1;\n\
         object GetObjectByTag(string s, int n = 0) = 7;\n\
-        object[] GetNearestObjectByTag(object o, string s, int t = 32, int n = 1, int a = 0, int b = 0, int c = 0) = 8;\n";
+        object[] GetNearestObjectByTag(object o, string s, int t = 32, int n = 1, int a = 0, int b = 0, int c = 0) = 8;\n\
+        int GetFollowerState(object o) = 9;\n";
 
     /// Calls engine function `name` as `caller`.
     fn run(s: &mut Sim, caller: ObjectId, name: &str, a: &[Value]) -> Option<Value> {
@@ -2590,6 +2626,10 @@ mod tests {
         );
         assert_eq!(s.world.get(hero).unwrap().followers, vec![ally]);
         assert_eq!(s.world.get(ally).unwrap().group, 0);
+        // The hero counts as an active party member without being given a state.
+        let state = |s: &mut Sim, o| run(s, hero, "GetFollowerState", &[Value::Object(o)]);
+        assert_eq!(state(&mut s, hero), Some(Value::Int(1)));
+        assert_eq!(state(&mut s, ally), Some(Value::Int(1)));
     }
 
     #[test]

@@ -12,6 +12,7 @@ name = "thedas-mcp"
 path = "src/main.rs"
 
 [dependencies]
+thedas-formats.workspace = true
 thedas-sim.workspace = true
 thedas-script.workspace = true
 rmcp = { version = "3.9", features = ["server", "transport-io", "macros", "schemars"] }
