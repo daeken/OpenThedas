@@ -74,6 +74,9 @@ pub struct Sim {
     pub chargen_policy: ChargenPolicy,
     /// Objects whose scripts' engine calls are all traced (log channel -6), for debugging.
     pub watch_calls: std::collections::BTreeSet<ObjectId>,
+    /// Tags (lowercase) whose objects' engine calls are traced too, including objects
+    /// created later (an area not yet entered).
+    pub watch_tags: std::collections::BTreeSet<String>,
     /// The install root, for files outside the resource stack (layouts' `.arl`).
     pub install_root: Option<std::path::PathBuf>,
     /// Each loaded area's layout name, and the pathing grids loaded per layout.
@@ -142,6 +145,7 @@ impl Sim {
             script_budget: 5_000_000,
             chargen_policy: ChargenPolicy::default(),
             watch_calls: Default::default(),
+            watch_tags: Default::default(),
             current_effect: None,
             current_effect_target: None,
             install_root: None,
@@ -207,10 +211,12 @@ impl Sim {
         if let Some(s) = self.scripts.get(&key) {
             return s.clone();
         }
-        let res = if key.ends_with(".ncs") {
-            key.clone()
-        } else {
-            format!("{key}.ncs")
+        // Scripts name others by their compiled (`.ncs`) or source (`.nss`) resource, or
+        // bare: sp_module_item_acq hands item events to `preev_item_acquired.nss`.
+        let res = match key.strip_suffix(".nss") {
+            Some(stem) => format!("{stem}.ncs"),
+            None if key.ends_with(".ncs") => key.clone(),
+            None => format!("{key}.ncs"),
         };
         let loaded = self
             .vfs
@@ -547,8 +553,8 @@ impl Sim {
     /// Walks an object to `to` at 5 m/s, running the world as it goes, so triggers on the
     /// way fire and the world reacts. The route follows the area's pathing grid when there
     /// is one (see `nav`), otherwise a straight line in half-metre steps. Stops early when a
-    /// conversation starts, the area changes or the walker dies; returns whether it
-    /// arrived. A destination in another area is a teleport.
+    /// conversation starts, the area changes, the walker dies or (for the hero) a fight
+    /// breaks out; returns whether it arrived. A destination in another area is a teleport.
     pub fn walk(&mut self, id: ObjectId, to: [f32; 3], area: Option<ObjectId>) -> bool {
         let Some((from, here)) = self.world.get(id).map(|o| (o.position, o.area)) else {
             return false;
@@ -579,6 +585,8 @@ impl Sim {
             }
         };
         let talking = self.talk.as_ref().is_some_and(|c| !c.ended);
+        let combat = constant(&self.table, "GM_COMBAT");
+        let hero_at_peace = Some(id) == self.world.hero && self.world.game_mode != combat;
         let mut prev = from;
         let n = points.len();
         for (i, p) in points.into_iter().enumerate() {
@@ -596,7 +604,8 @@ impl Sim {
             prev = p;
             let o = self.world.get(id);
             let stopped = o.is_none_or(|o| o.dead || o.area != here)
-                || (!talking && self.talk.as_ref().is_some_and(|c| !c.ended));
+                || (!talking && self.talk.as_ref().is_some_and(|c| !c.ended))
+                || (hero_at_peace && self.world.game_mode == combat);
             if stopped {
                 return i + 1 == n;
             }
@@ -1372,7 +1381,12 @@ impl Host for ScriptHost<'_> {
         f: &Function,
         args: Vec<Value>,
     ) -> VmResult<Option<Value>> {
-        let watched = self.sim.watch_calls.contains(&caller);
+        let watched =
+            self.sim.watch_calls.contains(&caller)
+                || (!self.sim.watch_tags.is_empty()
+                    && self.sim.world.get(caller).is_some_and(|o| {
+                        self.sim.watch_tags.contains(&o.tag.to_ascii_lowercase())
+                    }));
         let result = crate::engine::call(self, caller, f, &args);
         if watched {
             let t = self.sim.world.time_ms;

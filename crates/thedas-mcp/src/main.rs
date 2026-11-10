@@ -323,7 +323,7 @@ fn resolve(sim: &Sim, s: &str) -> Option<ObjectId> {
     if s.eq_ignore_ascii_case("hero") || s.eq_ignore_ascii_case("player") {
         return sim.world.hero;
     }
-    sim.world.by_tag(s).next().map(|o| o.id)
+    sim.world.find_tag(s, 0)
 }
 
 fn summary(sim: &Sim, id: ObjectId) -> J {
@@ -1107,12 +1107,22 @@ impl Server {
     }
 
     #[tool(
-        description = "Trace every engine call the object's scripts make (log channel -6 in get_trace), or stop tracing it if it already is. For debugging AI and scripts."
+        description = "Trace every engine call the object's scripts make (log channel -6 in get_trace), or stop tracing it if it already is. A tag no object has yet is watched for objects created later (an area not yet entered). For debugging AI and scripts."
     )]
     async fn watch_object(&self, Parameters(a): Parameters<ObjectArg>) -> String {
         self.with_sim(|st| {
             let sim = st.sim.as_mut().ok_or("no sim")?;
-            let id = resolve(sim, &a.object).ok_or("no such object")?;
+            let Some(id) = resolve(sim, &a.object) else {
+                // Not there yet: watch whatever later bears this tag.
+                let tag = a.object.to_ascii_lowercase();
+                let on = if sim.watch_tags.remove(&tag) {
+                    false
+                } else {
+                    sim.watch_tags.insert(tag.clone());
+                    true
+                };
+                return Ok(json!({ "tag": tag, "watching": on }));
+            };
             let on = if sim.watch_calls.remove(&id) {
                 false
             } else {

@@ -331,9 +331,8 @@ pub fn call(
             ok(Value::Object(
                 h.sim
                     .world
-                    .by_tag(&string(a, 0))
-                    .nth(n)
-                    .map_or(OBJECT_INVALID, |o| o.id),
+                    .find_tag(&string(a, 0), n)
+                    .unwrap_or(OBJECT_INVALID),
             ))
         }
         "GetObjectsInArea" => {
@@ -379,7 +378,15 @@ pub fn call(
                 .object(from)
                 .map(|o| o.combat.perceived.clone())
                 .unwrap_or_default();
-            let Some(origin) = h.object(from).map(|o| (o.position, o.area)) else {
+            // From an area, search that area (its own `area` is none).
+            let origin = h.object(from).map(|o| {
+                if o.kind == ObjectKind::Area {
+                    (o.position, Some(o.id))
+                } else {
+                    (o.position, o.area)
+                }
+            });
+            let Some(origin) = origin else {
                 return ok(if name == "UT_GetNearestObjectByTag" {
                     Value::Object(OBJECT_INVALID)
                 } else {
@@ -835,6 +842,13 @@ pub fn call(
                     e.0 = v;
                     e.1 = v;
                 }
+                // Scripts bring the dead back by giving them health (module_core's
+                // HandleEvent_Resurrection applies no effect). Provisional.
+                let health = constant(&h.sim.table, "PROPERTY_DEPLETABLE_HEALTH");
+                if int(a, 1) == health && vt != base_type && o.dead && o.properties[&health].1 > 0.0
+                {
+                    o.dead = false;
+                }
             }
             void()
         }
@@ -1012,11 +1026,18 @@ pub fn call(
         "CreateItemOnObject" => {
             let template = string(a, 0);
             let id = h.sim.create_item(&template);
+            // (resource, target, stack size, tag, suppress notification, droppable)
+            let stack = if a.len() > 2 { int(a, 2) } else { 1 };
+            let droppable = a.len() <= 5 || int(a, 5) != 0;
             if let Some(o) = h.sim.world.get_mut(id) {
                 let tag = string(a, 3);
                 if !tag.is_empty() {
                     o.tag = tag;
                 }
+                if stack > 1 {
+                    o.fields.insert("StackSize".into(), stack);
+                }
+                o.fields.insert("Droppable".into(), droppable as i32);
             }
             h.sim.give_item(id, obj(a, 1));
             ok(Value::Object(id))
@@ -1769,8 +1790,9 @@ pub fn call(
                 .and_then(|t| t.cell("Type", int(a, 1) as i64).cloned())
                 .map_or(0, |c| match c {
                     Cell::String(s) if clean(&s).eq_ignore_ascii_case("ATTRIBUTE") => 1,
-                    Cell::String(s) if clean(&s).eq_ignore_ascii_case("DERIVED") => 2,
+                    Cell::String(s) if clean(&s).eq_ignore_ascii_case("SIMPLE") => 2,
                     Cell::String(s) if clean(&s).eq_ignore_ascii_case("DEPLETABLE") => 3,
+                    Cell::String(s) if clean(&s).eq_ignore_ascii_case("DERIVED") => 4,
                     Cell::Int(v) => v as i32,
                     _ => 0,
                 }),
@@ -2443,8 +2465,9 @@ fn property_bounds(sim: &Sim, property: i32) -> Option<(i32, f32, f32)> {
     );
     let ty = match t.cell("Type", property as i64) {
         Some(Cell::String(s)) if clean(s).eq_ignore_ascii_case("ATTRIBUTE") => 1,
-        Some(Cell::String(s)) if clean(s).eq_ignore_ascii_case("DERIVED") => 2,
+        Some(Cell::String(s)) if clean(s).eq_ignore_ascii_case("SIMPLE") => 2,
         Some(Cell::String(s)) if clean(s).eq_ignore_ascii_case("DEPLETABLE") => 3,
+        Some(Cell::String(s)) if clean(s).eq_ignore_ascii_case("DERIVED") => 4,
         _ => 0,
     };
     (min <= max).then_some((ty, min, max))
@@ -2464,7 +2487,16 @@ mod tests {
         void RemoveItem(object o, int n) = 3;\n\
         void SetFollowerState(object o, int n) = 4;\n\
         int FOLLOWER_STATE_ACTIVE = 1;\n\
-        int FOLLOWER_STATE_LOCKEDACTIVE = 5;\n";
+        int FOLLOWER_STATE_LOCKEDACTIVE = 5;\n\
+        void SetCreatureProperty(object o, int p, float f, int t) = 5;\n\
+        int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
+        int PROPERTY_VALUE_BASE = 2;\n\
+        int PROPERTY_VALUE_CURRENT = 3;\n\
+        object CreateItemOnObject(resource r, object o, int n = 1, string s = \"\", int b = FALSE, int d = TRUE) = 6;\n\
+        int FALSE = 0;\n\
+        int TRUE = 1;\n\
+        object GetObjectByTag(string s, int n = 0) = 7;\n\
+        object[] GetNearestObjectByTag(object o, string s, int t = 32, int n = 1, int a = 0, int b = 0, int c = 0) = 8;\n";
 
     /// Calls engine function `name` as `caller`.
     fn run(s: &mut Sim, caller: ObjectId, name: &str, a: &[Value]) -> Option<Value> {
@@ -2558,6 +2590,97 @@ mod tests {
         );
         assert_eq!(s.world.get(hero).unwrap().followers, vec![ally]);
         assert_eq!(s.world.get(ally).unwrap().group, 0);
+    }
+
+    #[test]
+    fn giving_the_dead_health_brings_them_back() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let o = s.world.get_mut(hero).unwrap();
+        o.dead = true;
+        o.properties.insert(7, (100.0, 0.0));
+        let set = |s: &mut Sim, v: f32, t: i32| {
+            let a = [
+                Value::Object(hero),
+                Value::Int(7),
+                Value::Float(v),
+                Value::Int(t),
+            ];
+            run(s, hero, "SetCreatureProperty", &a);
+        };
+        set(&mut s, 120.0, 2);
+        assert!(
+            s.world.get(hero).unwrap().dead,
+            "raising the maximum is not enough"
+        );
+        set(&mut s, 25.0, 3);
+        let o = s.world.get(hero).unwrap();
+        assert!(!o.dead);
+        assert_eq!(o.properties[&7], (120.0, 25.0));
+    }
+
+    #[test]
+    fn items_scripts_create_on_creatures_drop_unless_told_otherwise() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let foe = s.world.spawn(ObjectKind::Creature, "foe");
+        let make = |s: &mut Sim, d: i32| {
+            let a = [
+                Value::Resource("blood.uti".into()),
+                Value::Object(foe),
+                Value::Int(2),
+                Value::String(String::new()),
+                Value::Int(0),
+                Value::Int(d),
+            ];
+            match run(s, foe, "CreateItemOnObject", &a) {
+                Some(Value::Object(i)) => i,
+                other => panic!("{other:?}"),
+            }
+        };
+        let (kept, dropped) = (make(&mut s, 0), make(&mut s, 1));
+        assert_eq!(
+            s.world.get(dropped).unwrap().fields.get("StackSize"),
+            Some(&2)
+        );
+        let bag = s.spawn_body_bag(foe, false).unwrap();
+        assert_eq!(s.world.get(bag).unwrap().inventory, vec![dropped]);
+        assert_eq!(s.world.get(foe).unwrap().inventory, vec![kept]);
+    }
+
+    #[test]
+    fn tag_lookups_prefer_the_current_area_and_areas_search_themselves() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let wilds = s.world.spawn(ObjectKind::Area, "wilds");
+        let hut = s.world.spawn(ObjectKind::Area, "hut");
+        let there = s.world.spawn(ObjectKind::Creature, "morrigan");
+        let here = s.world.spawn(ObjectKind::Creature, "morrigan");
+        s.world.get_mut(there).unwrap().area = Some(wilds);
+        s.world.get_mut(here).unwrap().area = Some(hut);
+        s.world.area = Some(hut);
+        let tag = Value::String("morrigan".into());
+        let by_tag = run(&mut s, hut, "GetObjectByTag", &[tag.clone(), Value::Int(0)]);
+        assert_eq!(by_tag, Some(Value::Object(here)));
+        let near = run(
+            &mut s,
+            hut,
+            "GetNearestObjectByTag",
+            &[
+                Value::Object(hut),
+                tag,
+                Value::Int(32),
+                Value::Int(1),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+            ],
+        );
+        match near {
+            Some(Value::Array { items, .. }) => assert_eq!(items, vec![Value::Object(here)]),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

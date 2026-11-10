@@ -408,6 +408,19 @@ impl World {
     }
 
     /// Objects with a tag in id order (the `nth` of `GetObjectByTag`).
+    /// The `n`th object with a tag, those in the current area first (only it is loaded in
+    /// the game; another area of the same list may hold its own copy of a creature), then
+    /// area-less objects (module, areas), then the rest. Provisional.
+    pub fn find_tag(&self, tag: &str, n: usize) -> Option<ObjectId> {
+        let mut found: Vec<&Object> = self.by_tag(tag).collect();
+        found.sort_by_key(|o| match o.area {
+            x if x.is_some() && x == self.area => 0,
+            None => 1,
+            _ => 2,
+        });
+        found.get(n).map(|o| o.id)
+    }
+
     pub fn by_tag(&self, tag: &str) -> impl Iterator<Item = &Object> {
         let tag = tag.to_ascii_lowercase();
         self.objects

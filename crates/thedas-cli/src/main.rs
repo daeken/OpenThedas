@@ -97,6 +97,10 @@ enum Command {
         /// Print the cells around these world positions (`x,y;x,y`).
         #[arg(long)]
         at: Option<String>,
+        /// Route between two world positions (`x,y,z;x,y,z`), reporting how much of the
+        /// grid is reachable from the first when there is no route.
+        #[arg(long)]
+        route: Option<String>,
     },
     /// Open every archive in an install and parse every GFF4-family resource.
     Corpus {
@@ -223,7 +227,14 @@ fn run() -> Result<()> {
             layout,
             pgm,
             at,
-        } => navgrid(&install, &layout, pgm.as_deref(), at.as_deref()),
+            route,
+        } => navgrid(
+            &install,
+            &layout,
+            pgm.as_deref(),
+            at.as_deref(),
+            route.as_deref(),
+        ),
         Command::Corpus {
             paths,
             report,
@@ -335,6 +346,7 @@ fn navgrid(
     layout: &str,
     pgm: Option<&std::path::Path>,
     at: Option<&str>,
+    route: Option<&str>,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
     let install = thedas_vfs::DaoInstall::open(install)?;
@@ -385,6 +397,41 @@ fn navgrid(
                 }
             }
             None => println!("  ({},{}) outside the grid", v[0], v[1]),
+        }
+    }
+    if let Some(r) = route {
+        let pts: Vec<[f32; 3]> = r
+            .split(';')
+            .filter_map(|p| {
+                let v: Vec<f32> = p.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                (v.len() == 3).then(|| [v[0], v[1], v[2]])
+            })
+            .collect();
+        anyhow::ensure!(pts.len() == 2, "--route wants x,y,z;x,y,z");
+        let (from, to) = (pts[0], pts[1]);
+        match thedas_sim::nav::route(&g, from, to) {
+            Some(r) => println!("route: {} points", r.len()),
+            None => {
+                let reach = thedas_sim::nav::region(&g, from);
+                let n = reach.iter().filter(|&&b| b).count();
+                let closest = (0..g.rows)
+                    .flat_map(|y| (0..g.columns).map(move |x| (x, y)))
+                    .filter(|&(x, y)| reach.get((y * g.columns + x) as usize) == Some(&true))
+                    .map(|c| {
+                        let m = g.center(c);
+                        let d = ((m[0] - to[0]).powi(2) + (m[1] - to[1]).powi(2)).sqrt();
+                        (d, c, thedas_sim::nav::height(&g, c))
+                    })
+                    .min_by(|a, b| a.0.total_cmp(&b.0));
+                println!("no route; {n} cells reachable from the start");
+                if let Some((d, c, h)) = closest {
+                    let m = g.center(c);
+                    println!(
+                        "closest reachable point to the goal: ({:.1},{:.1}) at {h:.2} m, {d:.1} m away",
+                        m[0], m[1]
+                    );
+                }
+            }
         }
     }
     if let Some(path) = pgm {

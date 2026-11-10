@@ -213,36 +213,48 @@ impl Sim {
         }
     }
 
-    /// Out-of-combat recovery: living creatures not in combat regain health and
-    /// mana/stamina at `PROPERTY_ATTRIBUTE_REGENERATION_HEALTH` points per second, up to their
-    /// maximum. Provisional: the rate, and no recovery during combat, are guesses.
+    /// Recovery: living creatures regain health and mana/stamina each second by their
+    /// `Regeneration_Health` and `Regeneration_Stamina` properties (`properties.gda`), or by
+    /// the `_Combat` variants while the game is in combat mode or they are fighting, up to
+    /// their maximum. Provisional: per-second rates are a guess.
     pub fn regenerate(&mut self, ms: u64) {
         if ms == 0 {
             return;
         }
-        let (health, mana, regen) = (
+        let (health, mana) = (
             constant_of(self, "PROPERTY_DEPLETABLE_HEALTH"),
             constant_of(self, "PROPERTY_DEPLETABLE_MANA_STAMINA"),
-            constant_of(self, "PROPERTY_ATTRIBUTE_REGENERATION_HEALTH"),
         );
-        let fighting = self.world.game_mode == constant_of(self, "GM_COMBAT");
-        let party = crate::engine::party_of(self);
+        let rates = {
+            let t = self.world.tables.get(0, "properties");
+            let id = |label: &str| {
+                t.as_ref()
+                    .and_then(|t| t.find("Stat", label))
+                    .map_or(-1, |v| v as i32)
+            };
+            [
+                (id("Regeneration_Health"), id("Regeneration_Stamina")),
+                (
+                    id("Regeneration_Health_Combat"),
+                    id("Regeneration_Stamina_Combat"),
+                ),
+            ]
+        };
+        let combat_mode = self.world.game_mode == constant_of(self, "GM_COMBAT");
         let secs = ms as f32 / 1000.0;
         for o in self.world.objects.values_mut() {
-            if o.kind != ObjectKind::Creature || o.dead || o.combat.in_combat {
+            if o.kind != ObjectKind::Creature || o.dead {
                 continue;
             }
-            if fighting && party.contains(&o.id) {
-                continue;
-            }
-            let rate = o.properties.get(&regen).map_or(0.0, |p| p.0.max(p.1));
-            if rate <= 0.0 {
-                continue;
-            }
-            for p in [health, mana] {
+            let (h, m) = rates[(combat_mode || o.combat.in_combat) as usize];
+            for (p, r) in [(health, h), (mana, m)] {
+                let rate = o.properties.get(&r).map_or(0.0, |p| p.0.max(p.1));
+                if rate == 0.0 {
+                    continue;
+                }
                 if let Some(v) = o.properties.get_mut(&p) {
-                    if v.1 < v.0 {
-                        v.1 = (v.1 + rate * secs).min(v.0);
+                    if v.1 < v.0 || rate < 0.0 {
+                        v.1 = (v.1 + rate * secs).clamp(0.0, v.0);
                     }
                 }
             }
