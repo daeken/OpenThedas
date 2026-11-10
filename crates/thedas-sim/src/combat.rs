@@ -61,6 +61,19 @@ pub struct CombatData {
     pub attack: Option<AttackResult>,
     /// `SetAttackDuration` for the attack in progress.
     pub attack_ms: Option<u64>,
+    /// Tactics slots (`SetTacticEntry`, or a preset).
+    #[serde(default)]
+    pub tactics: Vec<Tactic>,
+}
+
+/// One tactics slot: when `condition` holds for a target of `target` type, do `command`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Tactic {
+    pub enabled: bool,
+    pub target: i32,
+    pub condition: i32,
+    pub command: i32,
+    pub param: i32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -270,6 +283,77 @@ impl Sim {
         let mut ev = self.new_event("DEATH", Some(killer));
         ev.objects = vec![killer];
         self.world.queue_event(0, id, ev, None);
+    }
+
+    /// Fills a creature's tactics slots from a preset: the preset's row in
+    /// `tacticsuserpresets.gda` names an M2DA table (`TacticsTable`, e.g. 2001 for Tank) whose
+    /// rows are the slots in order (target type, condition, command, parameter). Provisional.
+    pub fn apply_tactic_preset(&mut self, id: ObjectId, preset: i32) -> bool {
+        let tables = self.world.tables.clone();
+        let Some(presets) = tables.get(0, "tacticsuserpresets") else {
+            return false;
+        };
+        let table_id = match presets.cell("TacticsTable", preset as i64) {
+            Some(thedas_formats::gda::Cell::Int(v)) => *v as i32,
+            _ => return false,
+        };
+        let Some(t) = tables.get(table_id, "") else {
+            return false;
+        };
+        let int = |row: i64, col: &str| match t.cell(col, row) {
+            Some(thedas_formats::gda::Cell::Int(v)) => *v as i32,
+            _ => 0,
+        };
+        // The parameter column's name is not known; it is the fifth column.
+        let param_hash = t.columns.iter().find(|(_, i)| **i == 4).map(|(h, _)| *h);
+        let slots: Vec<Tactic> = t
+            .order
+            .iter()
+            .map(|&row| Tactic {
+                enabled: true,
+                target: int(row, "TargetType"),
+                condition: int(row, "Condition"),
+                command: int(row, "Command"),
+                param: param_hash
+                    .and_then(|h| t.cell_by_hash(h, row))
+                    .map_or(0, |c| match c {
+                        thedas_formats::gda::Cell::Int(v) => *v as i32,
+                        _ => 0,
+                    }),
+            })
+            .collect();
+        match self.world.get_mut(id) {
+            Some(o) => {
+                o.combat.tactics = slots;
+                o.fields.insert("TacticPreset".into(), preset);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A creature's tactics, applying its first added preset if it has none yet (followers
+    /// get presets with `AddTacticPresetID` and no slots of their own). Provisional.
+    pub fn tactics_of(&mut self, id: ObjectId) -> Vec<Tactic> {
+        let (empty, first) = match self.world.get(id) {
+            Some(o) => (
+                o.combat.tactics.is_empty(),
+                o.fields
+                    .get("TacticPreset")
+                    .or_else(|| o.fields.get("TacticPreset.0"))
+                    .copied(),
+            ),
+            None => return Vec::new(),
+        };
+        if empty {
+            if let Some(p) = first {
+                self.apply_tactic_preset(id, p);
+            }
+        }
+        self.world
+            .get(id)
+            .map(|o| o.combat.tactics.clone())
+            .unwrap_or_default()
     }
 
     /// Orders a creature to attack another, as the player does by clicking an enemy.

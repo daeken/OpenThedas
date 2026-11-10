@@ -596,8 +596,9 @@ impl Sim {
     }
 
     /// Keeps the hero's followers with it: each living follower in the same area that
-    /// follows the leader (`SetFollowPartyLeader`, on unless turned off) and is not busy
-    /// with a command stands a metre behind, one more metre per follower. Provisional: real
+    /// follows the leader (`SetFollowPartyLeader`, on unless turned off) and is not fighting
+    /// or busy with anything but waiting or its own follow move stands a metre behind, one
+    /// more metre per follower. Provisional: real
     /// followers path after the leader.
     pub fn follow_leader(&mut self, leader: ObjectId) {
         let Some((pos, area, facing, followers)) = self.world.get(leader).map(|o| {
@@ -612,7 +613,10 @@ impl Sim {
             let ok = self.world.get(f).is_some_and(|o| {
                 !o.dead
                     && o.area == area
-                    && o.commands.is_empty()
+                    && !o.combat.in_combat
+                    && o.commands.first().is_none_or(|c| {
+                        matches!(c.name.as_str(), "CommandWait" | "CommandMoveToLocation")
+                    })
                     && o.fields.get("FollowPartyLeader").copied().unwrap_or(1) != 0
             });
             if ok {
@@ -1051,13 +1055,19 @@ impl Sim {
             if let Some(t) = &tmpl {
                 if let Some(r) = t.structs.first() {
                     for (list, equip) in [("Equip_ItemList", true), ("ItemList", false)] {
-                        let entries: Vec<(u32, String)> = list_of(r, list)
+                        let entries: Vec<(u32, String, Option<i32>)> = list_of(r, list)
                             .iter()
                             .filter_map(|&si| t.structs.get(si as usize))
-                            .filter_map(|s| resref_field(s, "TemplateResRef").map(|x| (s.id, x)))
+                            .filter_map(|s| {
+                                resref_field(s, "TemplateResRef")
+                                    .map(|x| (s.id, x, int(s, "Droppable")))
+                            })
                             .collect();
-                        for (slot, resref) in entries {
+                        for (slot, resref, droppable) in entries {
                             let item = self.create_item(&resref);
+                            if let (Some(d), Some(o)) = (droppable, self.world.get_mut(item)) {
+                                o.fields.insert("Droppable".into(), d);
+                            }
                             if let Some(o) = self.world.get_mut(id) {
                                 o.inventory.push(item);
                                 if equip {
