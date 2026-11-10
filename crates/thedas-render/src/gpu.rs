@@ -430,6 +430,11 @@ pub struct AreaRenderer {
     opaque: Vec<DrawRef>,
     blended: Vec<DrawRef>,
     depth: Option<(wgpu::TextureView, u32, u32)>,
+    /// The level's frame buffer effects, for a renderer of the level's own meshes.
+    effects: Option<crate::post::FrameEffects>,
+    /// Whether [`AreaRenderer::finish_frame`] draws the level's frame buffer effects (the
+    /// original's "Frame-buffer effects" option). On by default.
+    pub frame_effects: bool,
     pub light: StandInLight,
     pub stats: RenderStats,
 }
@@ -777,6 +782,19 @@ impl AreaRenderer {
             opaque: opaque.into_iter().map(|(_, r)| r).collect(),
             blended: blended.into_iter().map(|(_, r)| r).collect(),
             depth: None,
+            // Only a renderer of the level's own meshes runs its effects; the objects' scene
+            // draws over it.
+            effects: (scene.static_draws > 0)
+                .then(|| {
+                    crate::post::FrameEffects::new(
+                        device,
+                        &scene.effects,
+                        scene.detail,
+                        color_format,
+                    )
+                })
+                .flatten(),
+            frame_effects: true,
             light: StandInLight::default(),
             stats,
         }
@@ -1039,6 +1057,25 @@ impl AreaRenderer {
         }
     }
 
+    /// Records the level's frame buffer effects over `target`, a frame this renderer (and
+    /// any overlays) drew, before the interface goes on. `target` needs `COPY_SRC` usage.
+    /// Does nothing when the level has none or [`AreaRenderer::frame_effects`] is off.
+    pub fn finish_frame(
+        &mut self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+        width: u32,
+        height: u32,
+    ) {
+        if !self.frame_effects {
+            return;
+        }
+        if let Some(e) = self.effects.as_mut() {
+            e.apply(&ctx.device, &ctx.queue, encoder, target, width, height);
+        }
+    }
+
     /// Renders one frame offscreen and returns tightly packed RGBA8 pixels.
     ///
     /// It writes this renderer's per-draw constants and submits at once: not to be called
@@ -1098,6 +1135,7 @@ impl AreaRenderer {
                 o.render_over(ctx, &mut encoder, &view, width, height, camera, &depth);
             }
         }
+        self.finish_frame(ctx, &mut encoder, &target, width, height);
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &target,

@@ -18,6 +18,7 @@ pub mod d3d;
 mod d3d_gpu;
 pub mod gpu;
 pub mod material;
+pub mod post;
 pub mod scene;
 pub mod skeleton;
 
