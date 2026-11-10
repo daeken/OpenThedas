@@ -3603,6 +3603,7 @@ name = "thedas-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytemuck",
  "clap",
  "env_logger",
@@ -3610,6 +3611,7 @@ dependencies = [
  "log",
  "png",
  "pollster",
+ "serde_json",
  "thedas-formats",
  "thedas-render",
  "thedas-script",

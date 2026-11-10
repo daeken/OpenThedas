@@ -22,14 +22,19 @@
 //!
 //! `--ui menu`, `--ui hud` or `--ui movie1,movie2` plays Scaleform movies over the scene;
 //! `--area none` shows them alone.
+//!
+//! `--control 127.0.0.1:7878` lets a local client (`thedas-mcp`'s `attach`) drive the
+//! running game: the same steps as `--steps`, screenshots and the simulation's state (see
+//! [`control`]).
 
+mod control;
 mod follow;
 mod live;
 mod reticle;
 mod screens;
 mod ui;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -37,6 +42,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use glam::Vec3;
+use serde_json::{Value as J, json};
 use thedas_formats::Area;
 use thedas_render::{AreaRenderer, AreaScene, Camera, GpuContext, ProgramRegistry};
 use thedas_vfs::install::TextureQuality;
@@ -109,15 +115,20 @@ struct Args {
     click: Vec<String>,
     /// Headless, playing: input played in order before the capture, `;`-separated:
     /// `click X,Y` (a left click at that pixel), `run MS` (the game and its interface run
-    /// that long), `key i` (the inventory toggle), `key f1`-`key f4` (who leads), `talk TAG` (the leader talks to a creature),
-    /// `rebuild` (the objects are rebuilt as a spawn rebuilds them, timed), `rclick X,Y` and
-    /// `dclick X,Y` (a right or double click for the interface), `hover X,Y` (the mouse rests
-    /// there, for the aiming reticle).
+    /// that long), `key i` (the inventory toggle), `key f1`-`key f4` (who leads), `key 1`-`key
+    /// 0` (quickbar slots), `key space` (pause), `talk TAG` (the leader talks to a creature),
+    /// `reply N` (the conversation's reply N, from 0), `rebuild` (the objects are rebuilt as a
+    /// spawn rebuilds them, timed), `rclick X,Y` and `dclick X,Y` (a right or double click
+    /// for the interface), `hover X,Y` (the mouse rests there, for the aiming reticle).
     #[arg(long, default_value = "")]
     steps: String,
     /// Module for `--save` and `--objects`.
     #[arg(long, default_value = "single player")]
     module: String,
+    /// Window, playing: take input from local clients on this loopback address
+    /// (`127.0.0.1:7878`), as `thedas-mcp`'s `attach` sends it.
+    #[arg(long)]
+    control: Option<String>,
 }
 
 /// Behind and above a hero at `pos` with the game's `facing`, looking the same way (as the
@@ -405,6 +416,19 @@ struct App {
     last_press: Option<(Instant, (f64, f64))>,
     /// The release of a double click the interface already had.
     swallow_release: bool,
+    /// Where clients' requests arrive (`--control`).
+    control: Option<control::Control>,
+    /// Clients' input still playing, first come first played.
+    remote: VecDeque<Remote>,
+}
+
+/// Steps a client sent, playing.
+struct Remote {
+    steps: VecDeque<Step>,
+    /// Milliseconds of a `run` still to go.
+    wait_ms: f64,
+    log: Vec<String>,
+    reply: std::sync::mpsc::Sender<J>,
 }
 
 /// Two left presses this close (seconds, pixels) are a double click. Provisional.
@@ -510,6 +534,7 @@ impl App {
 
     fn redraw(&mut self) -> Result<()> {
         let dt = self.last.elapsed().as_secs_f64() * 1000.0;
+        self.serve_control(dt);
         self.update();
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
@@ -638,6 +663,343 @@ impl App {
         }
     }
 
+    /// A key pressed (not a repeat). Returns whether the game should close.
+    fn key_down(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Escape => return true,
+            KeyCode::KeyP => println!("camera {}", self.camera.spec()),
+            KeyCode::F1 | KeyCode::F2 | KeyCode::F3 | KeyCode::F4 if self.live.is_some() => {
+                let n = match code {
+                    KeyCode::F1 => 0,
+                    KeyCode::F2 => 1,
+                    KeyCode::F3 => 2,
+                    _ => 3,
+                };
+                if let Some(tag) = self.live.as_mut().and_then(|l| l.choose_leader(n)) {
+                    log::info!("leading with {tag}");
+                }
+            }
+            // The quickbar's first ten slots: 1 to 9, then 0.
+            c if self.live.is_some() && quickslot_key(c).is_some() => {
+                let slot = quickslot_key(c).unwrap_or(0);
+                if let Some(ability) = self.live.as_mut().and_then(|l| use_quickslot(l, slot)) {
+                    log::info!("aiming ability {ability} (click a target)");
+                }
+            }
+            KeyCode::KeyI if self.screens.is_some() => {
+                if let Some(s) = self.screens.as_mut() {
+                    s.inventory = !s.inventory;
+                }
+            }
+            KeyCode::KeyF if self.live.is_some() => {
+                self.follow = match self.follow.take() {
+                    Some(_) => None,
+                    None => Some(follow::Follow::behind(self.camera.yaw)),
+                };
+            }
+            KeyCode::Space => {
+                if let Some(live) = self.live.as_mut() {
+                    live.paused = !live.paused;
+                    println!("{}", if live.paused { "paused" } else { "running" });
+                }
+            }
+            KeyCode::F12 => {
+                if let Err(e) = self.save_capture() {
+                    eprintln!("capture failed: {e:#}");
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// The mouse moves to window pixel (`x`, `y`).
+    fn cursor_to(&mut self, x: f64, y: f64) {
+        self.cursor = (x, y);
+        if let Some(g) = self.gfx.as_mut() {
+            g.ui.mouse_move(x, y);
+        }
+    }
+
+    /// The left button goes down or up at the cursor.
+    fn left_button(&mut self, pressed: bool) {
+        let (x, y) = self.cursor;
+        if !pressed && std::mem::take(&mut self.swallow_release) {
+            return;
+        }
+        // A second press close in time and place is a double click (the movies use them:
+        // equipping from the backpack).
+        let double = pressed
+            && self.last_press.is_some_and(|(t, (px, py))| {
+                t.elapsed().as_secs_f64() < DOUBLE_CLICK_SECS
+                    && (px - x).hypot(py - y) < DOUBLE_CLICK_PIXELS
+            });
+        if pressed {
+            self.last_press = (!double).then(|| (Instant::now(), (x, y)));
+        }
+        if double {
+            if let Some(g) = self.gfx.as_mut() {
+                if self.screens.as_ref().is_some_and(|s| !s.exploring()) {
+                    g.ui.click_as(
+                        thedas_ui::avm1::MOUSE_LEFT + thedas_ui::avm1::DOUBLE_CLICK,
+                        x,
+                        y,
+                    );
+                    self.swallow_release = true;
+                    return;
+                }
+            }
+        }
+        // Playing, a click the interface does not take orders the party leader.
+        let mut to_world = pressed && self.live.is_some() && self.ui.is_empty();
+        if let Some(g) = self.gfx.as_mut() {
+            if to_world {
+                to_world = self
+                    .screens
+                    .as_ref()
+                    .is_none_or(|s| world_takes_click(&g.ui, s, x, y));
+            }
+            g.ui.mouse_button(x, y, pressed);
+            if pressed && !to_world && self.live.is_some() && self.screens.is_some() {
+                g.ui.clicked();
+            }
+        }
+        if to_world {
+            self.click(x, y);
+        }
+    }
+
+    /// The right button goes down or up at the cursor.
+    fn right_button(&mut self, pressed: bool) {
+        let (x, y) = self.cursor;
+        // Over the interface (or with a menu up) a right click is the interface's (an item's
+        // actions); elsewhere it turns the camera.
+        if pressed {
+            if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_ref()) {
+                if !s.exploring() || g.ui.covers(x, y) {
+                    g.ui.click_as(thedas_ui::avm1::MOUSE_RIGHT, x, y);
+                    return;
+                }
+            }
+        }
+        // A right click drops an ability waiting for its target.
+        if pressed {
+            if let Some(aim) = self.live.as_mut().and_then(|l| l.aiming.take()) {
+                log::info!("ability {} not aimed", aim.ability);
+                return;
+            }
+        }
+        self.looking = pressed;
+        if let Some(g) = &self.gfx {
+            g.window.set_cursor_visible(!self.looking);
+        }
+    }
+
+    /// Plays one step a client sent (not `run`, which the frames play), as the player's own
+    /// input would.
+    fn play_step(&mut self, step: &Step, log: &mut Vec<String>) {
+        match step {
+            &Step::Click(x, y) => {
+                self.cursor_to(x, y);
+                self.left_button(true);
+                self.left_button(false);
+                log.push(format!("click {x},{y}"));
+            }
+            &Step::ClickAs(button, x, y) => {
+                self.cursor_to(x, y);
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.click_as(button, x, y);
+                }
+                log.push(format!("click {x},{y} as button {button}"));
+            }
+            &Step::Hover(x, y) => {
+                self.cursor_to(x, y);
+                log.push(format!("hover {x},{y}"));
+            }
+            Step::Inventory => {
+                self.key_down(KeyCode::KeyI);
+                log.push("inventory".into());
+            }
+            &Step::Leader(n) => {
+                let tag = self.live.as_mut().and_then(|l| l.choose_leader(n));
+                log.push(match tag {
+                    Some(tag) => format!("leading with {tag}"),
+                    None => format!("no party member {}", n + 1),
+                });
+            }
+            &Step::Quickslot(slot) => {
+                let aim = self.live.as_mut().and_then(|l| use_quickslot(l, slot));
+                log.push(match aim {
+                    Some(ability) => format!("aiming ability {ability} (click a target)"),
+                    None => format!("quickslot {}", slot + 1),
+                });
+            }
+            Step::Pause => {
+                if let Some(live) = self.live.as_mut() {
+                    live.paused = !live.paused;
+                    log.push(if live.paused { "paused" } else { "running" }.into());
+                }
+            }
+            &Step::Reply(n) => {
+                if let Some(live) = self.live.as_mut() {
+                    log.push(reply(live, n));
+                }
+            }
+            Step::Talk(tag) => {
+                let Some(live) = self.live.as_mut() else {
+                    return;
+                };
+                let mut sim = live.sim();
+                let who = sim.world.controlled();
+                let target = sim.world.by_tag(tag).next().map(|o| o.id);
+                log.push(match (who, target) {
+                    (Some(w), Some(t)) => {
+                        sim.order_talk(w, t);
+                        format!("talk to {tag}")
+                    }
+                    _ => format!("talk to {tag}: nobody"),
+                });
+            }
+            Step::Rebuild => log.push("rebuild: headless only".into()),
+            Step::Run(_) => {}
+        }
+    }
+
+    /// Serves the control channel's requests, and plays the steps clients sent: one client's
+    /// at a time, a `run` lasting that long in frames (`dt_ms` is this frame's).
+    fn serve_control(&mut self, dt_ms: f64) {
+        let requests = self.control.as_ref().map(|c| c.poll()).unwrap_or_default();
+        for r in requests {
+            let cmd = r.body["cmd"].as_str().unwrap_or_default().to_string();
+            let answer = match cmd.as_str() {
+                "status" => Some(self.status()),
+                "screenshot" => Some(self.screenshot().unwrap_or_else(control::failure)),
+                "state" => Some(match self.live.as_ref().map(|l| l.sim().save_json()) {
+                    Some(Ok(bytes)) => json!({
+                        "ok": true,
+                        "save": String::from_utf8_lossy(&bytes),
+                    }),
+                    Some(Err(e)) => control::failure(e),
+                    None => control::failure("not playing"),
+                }),
+                "input" => match parse_steps(r.body["steps"].as_str().unwrap_or_default()) {
+                    Ok(steps) => {
+                        self.remote.push_back(Remote {
+                            steps: steps.into(),
+                            wait_ms: 0.0,
+                            log: Vec::new(),
+                            reply: r.reply.clone(),
+                        });
+                        None
+                    }
+                    Err(e) => Some(control::failure(e)),
+                },
+                other => Some(control::failure(format!("unknown cmd {other:?}"))),
+            };
+            if let Some(a) = answer {
+                let _ = r.reply.send(a);
+            }
+        }
+        while let Some(mut r) = self.remote.pop_front() {
+            if r.wait_ms > 0.0 {
+                r.wait_ms -= dt_ms;
+                if r.wait_ms > 0.0 {
+                    self.remote.push_front(r);
+                    return;
+                }
+            }
+            match r.steps.pop_front() {
+                Some(Step::Run(ms)) => {
+                    r.log.push(format!("run {ms}"));
+                    r.wait_ms = ms as f64;
+                    self.remote.push_front(r);
+                }
+                Some(step) => {
+                    self.play_step(&step, &mut r.log);
+                    self.remote.push_front(r);
+                }
+                None => {
+                    let mut out = self.status();
+                    out["log"] = json!(r.log);
+                    let _ = r.reply.send(out);
+                }
+            }
+        }
+    }
+
+    /// Where the game is, for clients.
+    fn status(&self) -> J {
+        let mut out = json!({
+            "ok": true,
+            "camera": self.camera.spec(),
+            "size": self.gfx.as_ref().map(|g| [g.config.width, g.config.height]),
+            "playing": self.live.is_some(),
+        });
+        let Some(live) = self.live.as_ref() else {
+            return out;
+        };
+        let sim = live.sim();
+        let tag = |id: Option<thedas_script::vm::ObjectId>| {
+            id.and_then(|i| sim.world.get(i)).map(|o| o.tag.clone())
+        };
+        let leader = sim.world.controlled().and_then(|l| sim.world.get(l));
+        out["time_ms"] = json!(sim.world.time_ms);
+        out["paused"] = json!(live.paused);
+        out["game_over"] = json!(sim.world.game_over);
+        out["area"] = json!(tag(sim.world.area));
+        out["leader"] = json!(leader.map(|o| json!({
+            "id": o.id,
+            "tag": o.tag,
+            "position": o.position,
+            "commands": o.commands.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        })));
+        out["party"] = json!(
+            thedas_sim::engine::party_of(&sim)
+                .into_iter()
+                .map(|p| tag(Some(p)))
+                .collect::<Vec<_>>()
+        );
+        out["dialog"] = json!(sim.dialog_state().map(|d| json!({
+            "speaker": d.speaker,
+            "line": d.line,
+            "replies": d.replies.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+            "ended": d.ended,
+        })));
+        out["aiming"] = json!(live.aiming.as_ref().map(|a| a.ability));
+        out["screens"] = json!(self.screens.as_ref().map(|s| format!("{:?}", s.shown())));
+        out
+    }
+
+    /// The frame as the player sees it (world, reticle, interface), as a base64 PNG.
+    fn screenshot(&mut self) -> Result<J> {
+        let g = self.gfx.as_mut().context("the window is not up yet")?;
+        let (w, h) = (g.config.width, g.config.height);
+        let mut reticle = Vec::new();
+        let pixels = match (self.live.as_mut(), g.renderer.as_mut()) {
+            (Some(live), _) => {
+                reticle = live.reticle(&self.camera, (w, h), self.cursor);
+                live.capture(&g.ctx, &self.camera, (w, h))?
+            }
+            (None, Some(r)) => Some(r.capture(&g.ctx, &self.camera, w, h)?),
+            (None, None) => None,
+        };
+        let mut frame = thedas_ui::Rgba {
+            width: w,
+            height: h,
+            pixels: pixels.unwrap_or_else(|| [0, 0, 0, 255].repeat(w as usize * h as usize)),
+        };
+        reticle::draw_rgba(&mut frame.pixels, (w, h), &reticle);
+        g.ui.capture_over(&mut frame)?;
+        let png = thedas_ui::stage::encode_png(&frame).context("encoding the screenshot")?;
+        use base64::Engine as _;
+        Ok(json!({
+            "ok": true,
+            "width": w,
+            "height": h,
+            "png": base64::engine::general_purpose::STANDARD.encode(png),
+        }))
+    }
+
     fn fail(&mut self, event_loop: &ActiveEventLoop, e: anyhow::Error) {
         self.error = Some(e);
         event_loop.exit();
@@ -672,72 +1034,8 @@ impl ApplicationHandler for App {
                 };
                 match event.state {
                     ElementState::Pressed => {
-                        if !event.repeat {
-                            match code {
-                                KeyCode::Escape => event_loop.exit(),
-                                KeyCode::KeyP => println!("camera {}", self.camera.spec()),
-                                KeyCode::F1 | KeyCode::F2 | KeyCode::F3 | KeyCode::F4
-                                    if self.live.is_some() =>
-                                {
-                                    let n = match code {
-                                        KeyCode::F1 => 0,
-                                        KeyCode::F2 => 1,
-                                        KeyCode::F3 => 2,
-                                        _ => 3,
-                                    };
-                                    if let Some(tag) =
-                                        self.live.as_mut().and_then(|l| l.choose_leader(n))
-                                    {
-                                        log::info!("leading with {tag}");
-                                    }
-                                }
-                                // The quickbar's first ten slots: 1 to 9, then 0.
-                                c if self.live.is_some() && quickslot_key(c).is_some() => {
-                                    let slot = quickslot_key(c).unwrap_or(0);
-                                    if let Some(live) = self.live.as_mut() {
-                                        let aim = {
-                                            let mut sim = live.sim();
-                                            let who = sim.world.controlled();
-                                            who.and_then(|w| {
-                                                thedas_ui::input::use_quickslot(&mut sim, w, slot)
-                                            })
-                                        };
-                                        if let Some(aim) = aim {
-                                            log::info!(
-                                                "aiming ability {} (click a target)",
-                                                aim.ability
-                                            );
-                                            live.aiming = Some(aim);
-                                        }
-                                    }
-                                }
-                                KeyCode::KeyI if self.screens.is_some() => {
-                                    if let Some(s) = self.screens.as_mut() {
-                                        s.inventory = !s.inventory;
-                                    }
-                                }
-                                KeyCode::KeyF if self.live.is_some() => {
-                                    self.follow = match self.follow.take() {
-                                        Some(_) => None,
-                                        None => Some(follow::Follow::behind(self.camera.yaw)),
-                                    };
-                                }
-                                KeyCode::Space => {
-                                    if let Some(live) = self.live.as_mut() {
-                                        live.paused = !live.paused;
-                                        println!(
-                                            "{}",
-                                            if live.paused { "paused" } else { "running" }
-                                        );
-                                    }
-                                }
-                                KeyCode::F12 => {
-                                    if let Err(e) = self.save_capture() {
-                                        eprintln!("capture failed: {e:#}");
-                                    }
-                                }
-                                _ => {}
-                            }
+                        if !event.repeat && self.key_down(code) {
+                            event_loop.exit();
                         }
                         self.keys.insert(code);
                     }
@@ -746,92 +1044,17 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = (position.x, position.y);
-                if let Some(g) = self.gfx.as_mut() {
-                    g.ui.mouse_move(position.x, position.y);
-                }
-            }
+            WindowEvent::CursorMoved { position, .. } => self.cursor_to(position.x, position.y),
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
                 ..
-            } => {
-                let (x, y) = self.cursor;
-                let pressed = state == ElementState::Pressed;
-                if !pressed && std::mem::take(&mut self.swallow_release) {
-                    return;
-                }
-                // A second press close in time and place is a double click (the movies use
-                // them: equipping from the backpack).
-                let double = pressed
-                    && self.last_press.is_some_and(|(t, (px, py))| {
-                        t.elapsed().as_secs_f64() < DOUBLE_CLICK_SECS
-                            && (px - x).hypot(py - y) < DOUBLE_CLICK_PIXELS
-                    });
-                if pressed {
-                    self.last_press = (!double).then(|| (Instant::now(), (x, y)));
-                }
-                if double {
-                    if let Some(g) = self.gfx.as_mut() {
-                        if self.screens.as_ref().is_some_and(|s| !s.exploring()) {
-                            g.ui.click_as(
-                                thedas_ui::avm1::MOUSE_LEFT + thedas_ui::avm1::DOUBLE_CLICK,
-                                x,
-                                y,
-                            );
-                            self.swallow_release = true;
-                            return;
-                        }
-                    }
-                }
-                // Playing, a click the interface does not take orders the party leader.
-                let mut to_world = pressed && self.live.is_some() && self.ui.is_empty();
-                if let Some(g) = self.gfx.as_mut() {
-                    if to_world {
-                        to_world = self
-                            .screens
-                            .as_ref()
-                            .is_none_or(|s| world_takes_click(&g.ui, s, x, y));
-                    }
-                    g.ui.mouse_button(x, y, pressed);
-                    if pressed && !to_world && self.live.is_some() && self.screens.is_some() {
-                        g.ui.clicked();
-                    }
-                }
-                if to_world {
-                    self.click(x, y);
-                }
-            }
+            } => self.left_button(state == ElementState::Pressed),
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Right,
                 ..
-            } => {
-                let pressed = state == ElementState::Pressed;
-                let (x, y) = self.cursor;
-                // Over the interface (or with a menu up) a right click is the interface's (an
-                // item's actions); elsewhere it turns the camera.
-                if pressed {
-                    if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_ref()) {
-                        if !s.exploring() || g.ui.covers(x, y) {
-                            g.ui.click_as(thedas_ui::avm1::MOUSE_RIGHT, x, y);
-                            return;
-                        }
-                    }
-                }
-                // A right click drops an ability waiting for its target.
-                if pressed {
-                    if let Some(aim) = self.live.as_mut().and_then(|l| l.aiming.take()) {
-                        log::info!("ability {} not aimed", aim.ability);
-                        return;
-                    }
-                }
-                self.looking = pressed;
-                if let Some(g) = &self.gfx {
-                    g.window.set_cursor_visible(!self.looking);
-                }
-            }
+            } => self.right_button(state == ElementState::Pressed),
             WindowEvent::MouseWheel { delta, .. } => {
                 let steps = match delta {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y,
@@ -870,6 +1093,28 @@ impl ApplicationHandler for App {
         if let Some(g) = &self.gfx {
             g.window.request_redraw();
         }
+    }
+}
+
+/// The party leader uses quickbar slot `slot`; an ability that needs aiming waits for its
+/// target (its id is returned).
+fn use_quickslot(live: &mut live::Live, slot: i32) -> Option<i32> {
+    let aim = {
+        let mut sim = live.sim();
+        let who = sim.world.controlled();
+        who.and_then(|w| thedas_ui::input::use_quickslot(&mut sim, w, slot))
+    }?;
+    let ability = aim.ability;
+    live.aiming = Some(aim);
+    Some(ability)
+}
+
+/// The conversation's reply `n` is chosen; what is said next.
+fn reply(live: &mut live::Live, n: usize) -> String {
+    match live.sim().choose_reply(n) {
+        Some(d) if d.ended => format!("reply {n}: the conversation ends"),
+        Some(d) => format!("reply {n}: {}: {}", d.speaker, d.line),
+        None => format!("reply {n}: no conversation"),
     }
 }
 
@@ -913,6 +1158,12 @@ enum Step {
     Hover(f64, f64),
     /// F1-F4: party member n leads.
     Leader(usize),
+    /// 1-9, 0: the quickbar's slot n is used.
+    Quickslot(i32),
+    /// Space: the game pauses or carries on.
+    Pause,
+    /// The conversation's reply n (from 0) is chosen.
+    Reply(usize),
 }
 
 fn parse_steps(spec: &str) -> Result<Vec<Step>> {
@@ -932,6 +1183,12 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
                 "key" if matches!(arg.to_ascii_lowercase().as_str(), "f1" | "f2" | "f3" | "f4") => {
                     Step::Leader(arg[1..].parse::<usize>()? - 1)
                 }
+                "key" if arg.eq_ignore_ascii_case("space") => Step::Pause,
+                "key" if arg.len() == 1 && arg.as_bytes()[0].is_ascii_digit() => {
+                    // 1 is the first slot, 0 the tenth.
+                    Step::Quickslot((arg.as_bytes()[0] - b'0' + 9) as i32 % 10)
+                }
+                "reply" => Step::Reply(arg.parse().context("reply takes a number")?),
                 "talk" if !arg.is_empty() => Step::Talk(arg.to_string()),
                 "rebuild" => Step::Rebuild,
                 "hover" => {
@@ -1160,6 +1417,15 @@ fn main() -> Result<()> {
                             }
                         }
                     }
+                    &Step::Quickslot(slot) => match use_quickslot(l, slot) {
+                        Some(ability) => println!("aiming ability {ability}"),
+                        None => println!("quickslot {}", slot + 1),
+                    },
+                    Step::Pause => {
+                        l.paused = !l.paused;
+                        println!("{}", if l.paused { "paused" } else { "running" });
+                    }
+                    &Step::Reply(n) => println!("{}", reply(l, n)),
                 }
             }
             let sim = l.sim();
@@ -1194,6 +1460,14 @@ fn main() -> Result<()> {
         );
     }
 
+    let control = match &args.control {
+        Some(addr) => {
+            let c = control::Control::listen(addr)?;
+            println!("control: listening on {}", c.addr);
+            Some(c)
+        }
+        None => None,
+    };
     let event_loop = EventLoop::new()?;
     let screens = (live.is_some() && ui.is_empty()).then(screens::Screens::default);
     let mut app = App {
@@ -1213,6 +1487,8 @@ fn main() -> Result<()> {
         captures: 0,
         last_press: None,
         swallow_release: false,
+        control,
+        remote: VecDeque::new(),
     };
     event_loop.run_app(&mut app)?;
     match app.error {
@@ -1244,6 +1520,16 @@ mod tests {
             parse_steps("rclick 1,2; dclick 3,4").unwrap(),
             vec![Step::ClickAs(2.0, 1.0, 2.0), Step::ClickAs(5.0, 3.0, 4.0)]
         );
+        assert_eq!(
+            parse_steps("key 1; key 0; key Space; reply 2").unwrap(),
+            vec![
+                Step::Quickslot(0),
+                Step::Quickslot(9),
+                Step::Pause,
+                Step::Reply(2)
+            ]
+        );
+        assert!(parse_steps("reply x").is_err());
         assert!(parse_steps("dance").is_err());
         assert!(parse_steps("click 10").is_err());
         assert!(parse_steps("").unwrap().is_empty());
