@@ -119,7 +119,7 @@ fn sim_view(
         .map(|m| {
             m.motion.as_ref().map(|c| thedas_render::Clip {
                 trees: c.trees.clone(),
-                action: c.action.clone(),
+                actions: c.actions.clone(),
                 time: c.time,
                 looping: c.looping,
             })

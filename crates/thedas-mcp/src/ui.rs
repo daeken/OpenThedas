@@ -25,7 +25,7 @@ pub struct LoadedScene {
 pub fn clip(m: &thedas_ui::models::Motion) -> thedas_render::Clip {
     thedas_render::Clip {
         trees: m.trees.clone(),
-        action: m.action.clone(),
+        actions: m.actions.clone(),
         time: m.time,
         looping: m.looping,
     }
