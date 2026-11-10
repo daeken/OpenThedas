@@ -667,6 +667,7 @@ impl Sim {
         let wp = (!waypoint.is_empty()).then_some(waypoint);
         match self.enter_area(area, wp) {
             Ok(new) => {
+                self.place_party_on_map(area);
                 self.travel_arrived();
                 let pos = self
                     .world
