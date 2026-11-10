@@ -110,11 +110,11 @@ fn cell_int(c: Option<&Cell>) -> i32 {
 }
 
 /// GDA strings carry a trailing NUL and sometimes padding.
-fn clean(s: &str) -> &str {
+pub(crate) fn clean(s: &str) -> &str {
     s.trim_matches(|c: char| c == '\0' || c.is_whitespace())
 }
 
-fn cell_float(c: Option<&Cell>) -> f32 {
+pub(crate) fn cell_float(c: Option<&Cell>) -> f32 {
     match c {
         Some(Cell::Int(v)) => *v as f32,
         Some(Cell::Float(v)) => *v as f32,
@@ -123,7 +123,7 @@ fn cell_float(c: Option<&Cell>) -> f32 {
     }
 }
 
-fn cell_string(c: Option<&Cell>) -> String {
+pub(crate) fn cell_string(c: Option<&Cell>) -> String {
     match c {
         Some(Cell::Int(v)) => v.to_string(),
         Some(Cell::Float(v)) => v.to_string(),
@@ -1281,6 +1281,7 @@ pub fn call(
                 strings: Vec::new(),
                 due: None,
                 from: None,
+                approach: None,
             };
             for (p, v) in f.params.iter().zip(a) {
                 match (&p.ty, v) {

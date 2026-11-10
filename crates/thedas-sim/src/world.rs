@@ -212,6 +212,10 @@ pub struct Command {
     /// between is interpolated (see `Sim::advance_movers`).
     #[serde(default)]
     pub from: Option<([f32; 3], u64)>,
+    /// For an attack whose target is out of reach: where the attacker is walking to first
+    /// (see `Sim::attack_reach`).
+    #[serde(default)]
+    pub approach: Option<[f32; 3]>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

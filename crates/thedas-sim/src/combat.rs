@@ -525,6 +525,7 @@ impl Sim {
             strings: Vec::new(),
             due: None,
             from: None,
+            approach: None,
         };
         if let Some(o) = self.world.get_mut(attacker) {
             o.commands.clear();
@@ -663,6 +664,39 @@ impl Sim {
         }
         if let Some(o) = self.world.get_mut(id) {
             o.combat.attack = None;
+        }
+    }
+}
+
+/// How close a melee attacker gets before swinging (metres). Provisional: rules_core
+/// counts any melee attack from beyond 5 m as a miss.
+pub const MELEE_REACH: f32 = 2.0;
+
+impl Sim {
+    /// How close `id` must be to attack: its main-hand weapon's range (item stat 9 in
+    /// `itemstats.gda`) when that is a ranged weapon, otherwise [`MELEE_REACH`].
+    pub fn attack_reach(&self, id: ObjectId) -> f32 {
+        let slot = constant_of(self, "INVENTORY_SLOT_MAIN");
+        let base = self
+            .world
+            .get(id)
+            .and_then(|o| o.equipment.get(&slot))
+            .and_then(|w| self.world.get(*w))
+            .and_then(|w| w.fields.get("BaseItem").copied());
+        let tables = self.world.tables();
+        let range = base.and_then(|b| {
+            let label = tables
+                .get(0, "itemstatdefines")
+                .map(|t| crate::engine::cell_string(t.cell("Label", 9)))
+                .filter(|l| !l.is_empty())?;
+            let t = tables.get(0, "itemstats")?;
+            Some(crate::engine::cell_float(
+                t.cell(crate::engine::clean(&label), b as i64),
+            ))
+        });
+        match range {
+            Some(r) if r > 5.0 => r,
+            _ => MELEE_REACH,
         }
     }
 }

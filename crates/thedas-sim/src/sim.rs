@@ -362,7 +362,21 @@ impl Sim {
                 (_, Some((due, id))) if due <= until => {
                     self.world.time_ms = self.world.time_ms.max(due);
                     self.advance_movers();
-                    self.finish_command(id);
+                    let approached = self
+                        .world
+                        .get_mut(id)
+                        .and_then(|o| o.commands.first_mut())
+                        .and_then(|c| {
+                            let at = c.approach.take()?;
+                            c.due = None;
+                            c.from = None;
+                            Some(at)
+                        });
+                    match approached {
+                        // In reach now: the attack itself starts next.
+                        Some(at) => self.move_object(id, at, None),
+                        None => self.finish_command(id),
+                    }
                 }
                 _ => break,
             }
@@ -889,8 +903,8 @@ impl Sim {
                 let (from, t0) = c.from?;
                 let due = c.due?;
                 let to = c
-                    .location
-                    .map(|l| l.position)
+                    .approach
+                    .or(c.location.map(|l| l.position))
                     .or_else(|| c.target.and_then(|t| self.world.get(t)).map(|t| t.position))?;
                 Some((o.id, from, t0, due, to))
             })
@@ -910,6 +924,31 @@ impl Sim {
         }
     }
 
+    /// For an attack whose target is beyond the attacker's reach (in the same area): the
+    /// distance to walk and the point at reach on the straight line to the target.
+    fn approach_point(&self, id: ObjectId, cmd: &Command) -> Option<(f32, [f32; 3])> {
+        let me = self.world.get(id)?;
+        let t = self.world.get(cmd.target?)?;
+        if me.area != t.area {
+            return None;
+        }
+        let (a, b) = (me.position, t.position);
+        let d = crate::engine::dist(a, b);
+        let reach = self.attack_reach(id);
+        if d <= reach + 0.05 {
+            return None;
+        }
+        let f = (d - reach) / d;
+        Some((
+            d - reach,
+            [
+                a[0] + (b[0] - a[0]) * f,
+                a[1] + (b[1] - a[1]) * f,
+                a[2] + (b[2] - a[2]) * f,
+            ],
+        ))
+    }
+
     /// The earliest-finishing front command, starting the clock on fronts that have none.
     fn next_command(&mut self) -> Option<(u64, ObjectId)> {
         let now = self.world.time_ms;
@@ -926,6 +965,25 @@ impl Sim {
                 None => {
                     // An attack asks its owner's script for the result first, which may
                     // also set how long it takes.
+                    // An attacker out of reach walks up first (the attack starts when it
+                    // gets there).
+                    if cmd.name == "CommandAttack" {
+                        if let Some((d, stop)) = self.approach_point(id, &cmd) {
+                            let pos = self.world.get(id).map(|o| o.position);
+                            let due = now + ((d / 5.0) * 1000.0).max(1.0) as u64;
+                            if let Some(c) =
+                                self.world.get_mut(id).and_then(|o| o.commands.first_mut())
+                            {
+                                c.due = Some(due);
+                                c.approach = Some(stop);
+                                c.from = pos.map(|p| (p, now));
+                            }
+                            if best.is_none_or(|(b, bid)| (due, id) < (b, bid)) {
+                                best = Some((due, id));
+                            }
+                            continue;
+                        }
+                    }
                     let attack_ms = if cmd.name == "CommandAttack"
                         || cmd.name == "CommandUseAbility"
                     {
@@ -2047,6 +2105,7 @@ mod tests {
             strings: Vec::new(),
             due: None,
             from: None,
+            approach: None,
         };
         let o = s.world.get_mut(id).unwrap();
         o.commands.push(cmd("CommandPlayAnimation", 0.0));
@@ -2083,6 +2142,7 @@ mod tests {
             strings: Vec::new(),
             due: None,
             from: None,
+            approach: None,
         };
         s.world.get_mut(id).unwrap().commands.push(walk());
         // 5 m/s: two seconds in, ten metres along.
@@ -2096,6 +2156,45 @@ mod tests {
         s.tick(8000);
         assert_eq!(s.world.get(id).unwrap().position, [50.0, 0.0, 0.0]);
         assert!(s.world.get(id).unwrap().commands.is_empty());
+    }
+
+    #[test]
+    fn attackers_out_of_reach_walk_up_first() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let (a, t) = (
+            s.world.spawn(ObjectKind::Creature, "a"),
+            s.world.spawn(ObjectKind::Creature, "t"),
+        );
+        for (id, x) in [(a, 0.0), (t, 12.0)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = [x, 0.0, 0.0];
+        }
+        s.world.get_mut(a).unwrap().commands.push(Command {
+            ty: 0,
+            name: "CommandAttack".into(),
+            target: Some(t),
+            location: None,
+            seconds: 0.0,
+            ints: Vec::new(),
+            strings: Vec::new(),
+            due: None,
+            from: None,
+            approach: None,
+        });
+        // Ten metres to close at 5 m/s: halfway after a second.
+        s.tick(1000);
+        let x = s.world.get(a).unwrap().position[0];
+        assert!((x - 5.0).abs() < 0.01, "{x}");
+        s.tick(1000);
+        let o = s.world.get(a).unwrap();
+        assert!((o.position[0] - (12.0 - crate::combat::MELEE_REACH)).abs() < 0.01);
+        // There, the attack itself is under way (still the front command).
+        assert_eq!(
+            o.commands.first().map(|c| (c.name.as_str(), c.approach)),
+            Some(("CommandAttack", None))
+        );
     }
 
     #[test]
