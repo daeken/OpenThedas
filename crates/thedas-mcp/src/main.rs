@@ -398,7 +398,8 @@ impl Server {
     /// Binds the current engine values, runs `frames`, and returns the engine messages.
     async fn ui_frames(&self, frames: u32) -> Result<J, String> {
         let (_, values) = self.ui_inputs()?;
-        self.ui
+        let (mut out, messages) = self
+            .ui
             .run(move |w| {
                 w.step(frames, &values);
                 let sounds = w
@@ -406,13 +407,46 @@ impl Server {
                     .as_ref()
                     .map(|s| s.bridge.drain_sounds())
                     .unwrap_or_default();
-                json!({
-                    "messages": messages_json(std::mem::take(&mut w.messages)),
-                    "sounds": sounds,
-                    "contexts": w.stage.as_ref().map(|s| s.bridge.contexts()),
-                })
+                let messages = std::mem::take(&mut w.messages);
+                (
+                    json!({
+                        "messages": messages_json(messages.clone()),
+                        "sounds": sounds,
+                        "contexts": w.stage.as_ref().map(|s| s.bridge.contexts()),
+                    }),
+                    messages,
+                )
             })
-            .await
+            .await?;
+        let applied = self.apply_ui_messages(&messages);
+        if !applied.is_empty() {
+            out["applied"] = J::Array(applied);
+        }
+        Ok(out)
+    }
+
+    /// Acts on what the interface asked the game to do, as player input: picking a
+    /// conversation response (`Conversation.SelectResponse N`).
+    fn apply_ui_messages(&self, messages: &[GameMessage]) -> Vec<J> {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(sim) = st.sim.as_mut() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for m in messages {
+            if let GameMessage::Send(name, args) = m {
+                if name == "Conversation.SelectResponse" {
+                    let n = args
+                        .first()
+                        .and_then(|a| a.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    sim.choose_reply(n);
+                    sim.tick(0);
+                    out.push(json!({ "selected_response": n, "conversation": dialog_json(sim) }));
+                }
+            }
+        }
+        out
     }
 
     fn with_sim<F: FnOnce(&mut State) -> Result<J, String>>(&self, f: F) -> String {
@@ -612,6 +646,7 @@ impl Server {
                     "values": values,
                     "unanswered": unanswered,
                     "failed_loads": stage.failed_loads(),
+                    "log": stage.log.iter().rev().take(40).collect::<Vec<_>>(),
                 }))
             })
             .await;
