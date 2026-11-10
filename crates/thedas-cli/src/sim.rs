@@ -27,6 +27,7 @@ pub fn start(o: &Options) -> Result<Sim> {
         waypoint: o.waypoint.map(str::to_string),
         seed: o.seed,
         keep_trace: o.trace.is_some(),
+        cutscenes: Default::default(),
     })
     .with_context(|| format!("opening module {} in {}", o.module, o.install.display()))
 }
