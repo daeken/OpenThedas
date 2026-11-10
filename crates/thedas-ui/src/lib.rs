@@ -218,19 +218,32 @@ pub fn load_movie(
 ) -> Result<(Vec<u8>, RewriteReport), UiError> {
     let data = lookup(name).ok_or_else(|| UiError::NotFound(name.to_string()))?;
     let inject = avm1::register_invoke();
+    let fonts = font_library(lookup);
     Ok(gfx::rewrite(
         &data,
         &mut |e| images.image(&e.file),
+        fonts.as_ref(),
         Some(&inject),
     )?)
 }
 
+/// The font library the game installs for Scaleform (see [`gfx::FontLibrary`]).
+pub const FONT_LIBRARY: &str = "fonts_en-us.gfx";
+
+/// The font library's fonts, if the resources have it.
+pub fn font_library(lookup: &ResourceLookup) -> Option<gfx::FontLibrary> {
+    let lib = gfx::FontLibrary::from_movie(&lookup(FONT_LIBRARY)?).ok()?;
+    (!lib.is_empty()).then_some(lib)
+}
+
 /// Pre-rewrites imported libraries (`gfxfontlib.swf`) the same way when they are fetched.
 fn rewriting_lookup(lookup: ResourceLookup) -> ResourceLookup {
+    let fonts = std::sync::OnceLock::new();
     Arc::new(move |name: &str| {
         let data = lookup(name)?;
         if name.ends_with(".gfx") {
-            if let Ok((swf, _)) = gfx::rewrite(&data, &mut |_| None, None) {
+            let fonts = fonts.get_or_init(|| font_library(&lookup));
+            if let Ok((swf, _)) = gfx::rewrite(&data, &mut |_| None, fonts.as_ref(), None) {
                 return Some(swf);
             }
         }
