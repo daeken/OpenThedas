@@ -36,7 +36,24 @@ pub struct WorldMapState {
     /// Set when the travel transition has been asked for; arrival then sends
     /// `EVENT_TYPE_WORLDMAP_POSTTRANSITION`.
     pub arriving: bool,
+    /// The player swapped the maps on the world map screen (`WorldMap.WorldMapSwapMaps`):
+    /// the secondary map is shown as the primary until the screen closes.
+    #[serde(default)]
+    pub swapped: bool,
+    /// The journey stopped at a random encounter (`WorldMapStartTravelling` with an area);
+    /// `WorldMapCompleteRandomEncounter` resumes it.
+    #[serde(default)]
+    pub encounter: bool,
 }
+
+/// The world map screen's pin click: the area the party is in (`PrimaryMap.PlayerLocation
+/// .AreaTag`) and the pin's index in the shown map's `Locations`.
+pub const MSG_TRAVEL: &str = "GameModeController.AreaTransition";
+/// The world map screen's map toggle button.
+pub const MSG_SWAP: &str = "WorldMap.WorldMapSwapMaps";
+/// The world map screen closing: 1 when it closed for travel (a pin was clicked), 0 when the
+/// player closed it.
+pub const MSG_CLOSED: &str = "WorldMap.WorldMapClosed";
 
 fn text(g: &Gff4, id: StructId, l: u32) -> Option<String> {
     g.field(id, l)
@@ -113,6 +130,77 @@ pub fn map_from_gff4(g: &Gff4) -> Option<WorldMap> {
 }
 
 impl Sim {
+    /// The maps as the world map screen shows them, (primary, secondary): swapped while the
+    /// player has swapped them.
+    pub fn shown_maps(&self) -> (Option<ObjectId>, Option<ObjectId>) {
+        let wm = &self.world.world_map;
+        let valid = |m: Option<ObjectId>| m.filter(|&m| self.is_world_map(m));
+        let (primary, secondary) = (valid(wm.primary), valid(wm.secondary));
+        if wm.swapped && secondary.is_some() {
+            (secondary, primary)
+        } else {
+            (primary, secondary)
+        }
+    }
+
+    /// Whether `id` is a world map (scripts pass OBJECT_INVALID to clear one).
+    pub fn is_world_map(&self, id: ObjectId) -> bool {
+        self.world
+            .get(id)
+            .is_some_and(|o| o.kind == ObjectKind::Map)
+    }
+
+    /// A map's pins in the order the world map screen lists them (`Locations.N`), hidden ones
+    /// included: by object id.
+    pub fn map_pins(&self, map: ObjectId) -> Vec<ObjectId> {
+        self.world
+            .objects
+            .values()
+            .filter(|o| {
+                o.kind == ObjectKind::MapPin && o.locals.objects.get("WM_MAP") == Some(&map)
+            })
+            .map(|o| o.id)
+            .collect()
+    }
+
+    /// The world map screen's messages, as player input (see `MSG_*`). Clicking a pin travels
+    /// exactly as the travel scripts expect ([`Sim::begin_travel`]); the screen only sends
+    /// the click for an active pin, and an inactive one is refused here as well.
+    ///
+    /// Provisional, from worldmap.gfx: `PinClicked` sends [`MSG_TRAVEL`] with the area tag
+    /// and the pin's index into `WorldMap.PrimaryMap.Locations` (the screen always lists the
+    /// map it reports as primary). The area tag is not needed: the area left is the current
+    /// one.
+    pub(crate) fn world_map_message(&mut self, name: &str, args: &[String]) -> bool {
+        match name {
+            MSG_TRAVEL => {
+                let index = args.get(1).and_then(|a| a.trim().parse::<f64>().ok());
+                let pin = match (index, self.shown_maps().0) {
+                    (Some(i), Some(map)) if i >= 0.0 && i.fract() == 0.0 => {
+                        self.map_pins(map).get(i as usize).copied()
+                    }
+                    _ => None,
+                };
+                pin.is_some_and(|p| self.begin_travel(p))
+            }
+            MSG_SWAP => {
+                if self.shown_maps().1.is_none() {
+                    return false;
+                }
+                let wm = &mut self.world.world_map;
+                wm.swapped = !wm.swapped;
+                true
+            }
+            MSG_CLOSED => {
+                let wm = &mut self.world.world_map;
+                wm.open = false;
+                wm.swapped = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Creates an object for every world map in the resources and each of its pins.
     pub fn load_world_maps(&mut self) {
         let mut names: Vec<String> = self
@@ -257,6 +345,8 @@ impl Sim {
             return;
         };
         self.world.world_map.open = false;
+        self.world.world_map.swapped = false;
+        self.world.world_map.encounter = false;
         if let Some(pin) = self.world.world_map.travelling_to.take() {
             self.world.world_map.player_pin = Some(pin);
         }
@@ -290,8 +380,18 @@ impl Sim {
         }
     }
 
-    /// After an area transition: tells the module a world-map journey has arrived.
+    /// After an area transition: the world map screen is gone, and a journey has arrived.
+    /// One that arrived through `EVENT_TYPE_WORLDMAP_PRETRANSITION` is told so with
+    /// `EVENT_TYPE_WORLDMAP_POSTTRANSITION`; one the travel script ended with a transition of
+    /// its own (leaving camp: `DoAreaTransition` back to where the party was) just ends. A
+    /// random encounter's area does not end the journey. Provisional.
     pub(crate) fn travel_arrived(&mut self) {
+        let wm = &mut self.world.world_map;
+        wm.open = false;
+        wm.swapped = false;
+        if !wm.encounter {
+            wm.travelling_to = None;
+        }
         if !std::mem::take(&mut self.world.world_map.arriving) {
             return;
         }
@@ -435,5 +535,61 @@ mod tests {
         let ev = &s.world.queue.values().next().unwrap().event;
         assert_eq!(ev.ints, vec![0, 5, 1]);
         assert_eq!(ev.strings[1], "town_area");
+    }
+
+    #[test]
+    fn clicking_a_pin_travels_to_the_shown_maps_pin_at_that_index() {
+        use std::sync::Arc;
+        let mut s = Sim::new(
+            Arc::new(thedas_vfs::Vfs::new()),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        s.world.module = Some(module);
+        let (main, deep) = (
+            s.world.spawn(ObjectKind::Map, "ferelden"),
+            s.world.spawn(ObjectKind::Map, "deep_roads"),
+        );
+        s.world.world_map.primary = Some(main);
+        // WM_LOCATION_ACTIVE is 0 without script.ldf constants; 1 stands for any other status.
+        let pin = |s: &mut Sim, map, area: &str, status| {
+            let p = s.world.spawn(ObjectKind::MapPin, area);
+            let o = s.world.get_mut(p).unwrap();
+            o.fields.insert("WMStatus".into(), status);
+            o.locals.strings.insert("WM_AREA".into(), area.into());
+            o.locals.objects.insert("WM_MAP".into(), map);
+            p
+        };
+        let _hidden = pin(&mut s, main, "lot100ar_lothering", 1);
+        let town = pin(&mut s, main, "arl100ar_redcliffe", 0);
+        let thaig = pin(&mut s, deep, "orz500ar_thaig", 0);
+        let args = |i: &str| vec!["lot100ar_lothering".to_string(), i.to_string()];
+
+        assert_eq!(s.map_pins(main).len(), 2);
+        assert!(!s.gui_message(MSG_TRAVEL, &args("0")), "not an active pin");
+        assert!(!s.gui_message(MSG_TRAVEL, &args("7")), "no such pin");
+        assert!(!s.gui_message(MSG_TRAVEL, &args("x")));
+        assert!(!s.gui_message(MSG_SWAP, &[]), "nothing to swap to");
+        s.world.world_map.secondary = Some(thedas_script::vm::OBJECT_INVALID);
+        assert!(!s.gui_message(MSG_SWAP, &[]), "a cleared secondary map");
+        assert!(s.world.queue.is_empty());
+        assert!(s.gui_message(MSG_TRAVEL, &args("1")));
+        assert_eq!(s.world.world_map.travelling_to, Some(town));
+        let ev = &s.world.queue.values().next().unwrap().event;
+        assert_eq!(ev.strings[1], "arl100ar_redcliffe");
+
+        // With a second map swapped in, the indices are the second map's.
+        s.world.queue.clear();
+        s.world.world_map.travelling_to = None;
+        s.world.world_map.secondary = Some(deep);
+        assert!(s.gui_message(MSG_SWAP, &[]));
+        assert_eq!(s.shown_maps(), (Some(deep), Some(main)));
+        assert!(s.gui_message(MSG_TRAVEL, &args("0")));
+        assert_eq!(s.world.world_map.travelling_to, Some(thaig));
+        s.world.world_map.open = true;
+        assert!(s.gui_message(MSG_CLOSED, &["0".into()]));
+        assert!(!s.world.world_map.open);
+        assert_eq!(s.shown_maps(), (Some(main), Some(deep)));
     }
 }

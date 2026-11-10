@@ -167,7 +167,14 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
         .unwrap_or_default();
     let tables = sim.world.tables();
     let maps = tables.get(0, "worldmaps");
-    for (key, map) in [("PrimaryMap", wm.primary), ("SecondaryMap", wm.secondary)] {
+    let (primary, secondary) = sim.shown_maps();
+    // Whether there is a second map: the screen disables its map toggle when this is 0.
+    // Provisional: the screen only compares it with 0.
+    set(
+        "WorldMap.SecondaryMap".into(),
+        num(secondary.is_some() as u8),
+    );
+    for (key, map) in [("PrimaryMap", primary), ("SecondaryMap", secondary)] {
         let Some(m) = map
             .and_then(|m| sim.world.get(m))
             .filter(|m| m.kind == ObjectKind::Map)
@@ -191,10 +198,8 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
             format!("{k}.PlayerLocation.AreaTag"),
             UiValue::String(player_area.clone()),
         );
-        let pins = sim.world.objects.values().filter(|o| {
-            o.kind == ObjectKind::MapPin && o.locals.objects.get("WM_MAP") == Some(&m.id)
-        });
-        for (i, p) in pins.enumerate() {
+        let pins = sim.map_pins(m.id);
+        for (i, p) in pins.iter().filter_map(|&p| sim.world.get(p)).enumerate() {
             let pk = format!("{k}.Locations.{i}");
             let name = p
                 .name_strref
@@ -279,6 +284,8 @@ mod tests {
         assert_eq!(v.get(&format!("{l}.X")), Some(&UiValue::Number(0.25)));
         assert_eq!(v.get(&format!("{l}.Y")), Some(&UiValue::Number(0.75)));
         assert!(!v.contains_key("WorldMap.SecondaryMap.Type"));
+        // No second map: the screen's map toggle disables itself on 0.
+        assert_eq!(v["WorldMap.SecondaryMap"], UiValue::Number(0.0));
     }
 
     #[test]
