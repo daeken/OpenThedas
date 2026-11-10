@@ -147,7 +147,6 @@ const PRESENTATION: &[&str] = &[
     "PlayMusic",
     "SetMusicIntensity",
     "ScaleEquippedItems",
-    "SetPartyPickerGUIStatus",
     "SendToRunDatabase",
     "SetCreaturesGlobalMaxTimeBeforeDecay",
     "SetCreatureGoreLevel",
@@ -1879,6 +1878,24 @@ pub fn call(
         // The action a click would take. Provisional: the game derives it from the
         // placeable's state controller; here an area-transition destination makes it a
         // transition, a conversation a dialog, and anything else a plain use.
+        "SetPartyPickerGUIStatus" => {
+            if let Some(m) = h.sim.world.module.and_then(|m| h.sim.world.get_mut(m)) {
+                m.fields.insert("PartyPickerGUIStatus".into(), int(a, 0));
+            }
+            void()
+        }
+        "GetPartyPickerGUIStatus" => ok(Value::Int(
+            h.sim
+                .world
+                .module
+                .and_then(|m| h.object(m))
+                .and_then(|m| m.fields.get("PartyPickerGUIStatus").copied())
+                .unwrap_or(0),
+        )),
+        "ShowPartyPickerGUI" => {
+            h.sim.party_picker();
+            void()
+        }
         // --- World map (see `worldmap`) -----------------------------------------------------
         "SetWorldMapLocationStatus" => {
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {

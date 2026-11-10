@@ -114,7 +114,7 @@ impl Sim {
                 .unwrap_or(false)
     }
 
-    fn alive(&self, id: ObjectId) -> bool {
+    pub(crate) fn alive(&self, id: ObjectId) -> bool {
         self.world
             .get(id)
             .is_some_and(|o| o.kind == ObjectKind::Creature && o.active && !o.dead)

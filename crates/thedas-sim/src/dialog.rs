@@ -43,6 +43,14 @@ pub struct Node {
     pub condition: PlotRef,
     pub action: PlotRef,
     pub children: Vec<usize>,
+    /// Field 12206, taken to be the toolset's "show once": 0 always, 1 once per
+    /// conversation, 2 once per game. Provisional.
+    #[serde(default)]
+    pub show_once: u8,
+    /// Field 12207, taken to mark an ambient line (said in passing, without the dialog
+    /// screen): chants and barks. Provisional.
+    #[serde(default)]
+    pub ambient: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -129,6 +137,12 @@ impl Dlg {
                 condition: plotref(g, st(12208)),
                 action: plotref(g, st(12209)),
                 children: ints(*id, 12400),
+                show_once: g
+                    .field(*id, 12206)
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    .clamp(0, 2) as u8,
+                ambient: g.field(*id, 12207).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
             });
         }
         let n = nodes.len();
@@ -154,6 +168,12 @@ pub struct Conversation {
     /// The player's available replies (node indices).
     pub replies: Vec<usize>,
     pub ended: bool,
+    /// Show-once-per-conversation nodes already used in this one.
+    #[serde(default)]
+    pub shown: Vec<usize>,
+    /// NPC lines just spoken one after another (guards against looping chains).
+    #[serde(default)]
+    pub chain: Vec<usize>,
 }
 
 /// What a conversation looks like to a player: the current line and the choices.
@@ -168,6 +188,37 @@ pub struct DialogState {
 }
 
 impl Sim {
+    /// Whether a node may still be used: its condition passes and, if it shows once, it
+    /// has not been shown (in this conversation, or ever).
+    fn usable(&mut self, c: &Conversation, node: usize) -> bool {
+        let n = &c.dlg.nodes[node];
+        let fresh = match n.show_once {
+            1 => !c.shown.contains(&node),
+            2 => !self
+                .world
+                .dialog_shown
+                .contains(&format!("{}:{node}", c.dlg.name)),
+            _ => true,
+        };
+        fresh && {
+            let cond = n.condition.clone();
+            self.condition(&cond, c.owner)
+        }
+    }
+
+    /// Records that a node was used, for show-once nodes.
+    fn mark_shown(&mut self, c: &mut Conversation, node: usize) {
+        match c.dlg.nodes[node].show_once {
+            1 => c.shown.push(node),
+            2 => {
+                self.world
+                    .dialog_shown
+                    .insert(format!("{}:{node}", c.dlg.name));
+            }
+            _ => {}
+        }
+    }
+
     fn condition(&mut self, c: &PlotRef, owner: ObjectId) -> bool {
         if let Some(script) = &c.script {
             let r = self.run_script(script, owner, None);
@@ -202,6 +253,7 @@ impl Sim {
     /// Speaks a line: runs its action and collects the replies.
     fn speak(&mut self, mut c: Conversation, line: usize) -> Conversation {
         let node = c.dlg.nodes[line].clone();
+        self.mark_shown(&mut c, line);
         self.action(&node.action, c.owner);
         let text = self.node_text(&node);
         let speaker = match node.speaker.as_str() {
@@ -216,17 +268,23 @@ impl Sim {
         c.line = Some(line);
         let mut replies = Vec::new();
         for &r in &node.children {
-            let cond = c.dlg.nodes[r].condition.clone();
-            if self.condition(&cond, c.owner) {
+            if self.usable(&c, r) {
                 replies.push(r);
             }
         }
-        // An NPC line followed directly by another NPC line continues on its own.
+        // An NPC line followed directly by another NPC line continues on its own (but not
+        // round a loop of lines already spoken in this exchange).
         if let Some(&next) = replies.first() {
-            if !c.dlg.nodes[next].reply {
+            if !c.dlg.nodes[next].reply
+                && next != line
+                && c.chain.len() < 64
+                && !c.chain.contains(&next)
+            {
+                c.chain.push(line);
                 return self.speak(c, next);
             }
         }
+        c.chain.clear();
         c.ended = replies.is_empty();
         c.replies = replies;
         c
@@ -277,17 +335,50 @@ impl Sim {
             line: None,
             replies: Vec::new(),
             ended: false,
+            shown: Vec::new(),
+            chain: Vec::new(),
         };
-        let start = d.starts.iter().copied().find(|&s| {
-            let cond = d.nodes[s].condition.clone();
-            self.condition(&cond, target)
-        });
+        let start = d.starts.iter().copied().find(|&s| self.usable(&c, s));
         let c = match start {
             Some(s) => self.speak(c, s),
             None => Conversation { ended: true, ..c },
         };
+        // Between creatures outside the party it is an ambient conversation: it plays out
+        // around the player without waiting for them. Provisional: all at once.
+        let party = crate::engine::party_of(self);
+        let ambient_start = start.is_some_and(|s| d.nodes[s].ambient);
+        if ambient_start || (!party.contains(&initiator) && !party.contains(&target)) {
+            self.run_ambient(c);
+            return true;
+        }
         self.talk = Some(c);
         true
+    }
+
+    /// Plays an ambient conversation to its end, taking the first reply each time and
+    /// stopping if it comes back to a node it has used (chants loop).
+    fn run_ambient(&mut self, mut c: Conversation) {
+        let mut used: Vec<usize> = c.line.into_iter().collect();
+        for _ in 0..64 {
+            if c.ended {
+                break;
+            }
+            let Some(&r) = c.replies.first() else { break };
+            if used.contains(&r) {
+                break;
+            }
+            used.push(r);
+            let node = c.dlg.nodes[r].clone();
+            self.mark_shown(&mut c, r);
+            self.action(&node.action, c.owner);
+            match node.children.iter().copied().find(|&n| self.usable(&c, n)) {
+                Some(n) if !used.contains(&n) => {
+                    used.push(n);
+                    c = self.speak(c, n);
+                }
+                _ => break,
+            }
+        }
     }
 
     /// Picks reply `choice` (an index into the current replies).
@@ -298,16 +389,14 @@ impl Sim {
             return self.dialog_state();
         };
         let node = c.dlg.nodes[reply].clone();
+        self.mark_shown(&mut c, reply);
         self.action(&node.action, c.owner);
         // The action started another conversation (a plot script's UT_Talk): it replaces
         // this one, as in the game.
         if self.talk.is_some() {
             return self.dialog_state();
         }
-        let next = node.children.iter().copied().find(|&n| {
-            let cond = c.dlg.nodes[n].condition.clone();
-            self.condition(&cond, c.owner)
-        });
+        let next = node.children.iter().copied().find(|&n| self.usable(&c, n));
         c = match next {
             Some(n) => self.speak(c, n),
             None => Conversation {
@@ -446,6 +535,8 @@ mod tests {
             line: None,
             replies: vec![],
             ended: false,
+            shown: vec![],
+            chain: vec![],
         });
         let c = sim.talk.take().unwrap();
         let c = sim.speak(c, 0);
@@ -456,5 +547,53 @@ mod tests {
         let st = sim.choose_reply(0).unwrap();
         assert_eq!(st.line, "line 13");
         assert!(st.ended);
+    }
+
+    #[test]
+    fn show_once_lines_are_skipped_the_second_time() {
+        let node = |reply: bool, text: &str, children: Vec<usize>, show_once: u8| Node {
+            reply,
+            strref: None,
+            text: Some(text.into()),
+            speaker: String::new(),
+            listener: String::new(),
+            condition: PlotRef::default(),
+            action: PlotRef::default(),
+            children,
+            show_once,
+            ambient: false,
+        };
+        let d = Dlg {
+            name: "cage".into(),
+            starts: vec![0],
+            nodes: vec![
+                node(false, "...", vec![1], 0),
+                node(true, "", vec![2, 3], 0),
+                node(false, "a prayer", vec![], 2),
+                node(false, "what do you want?", vec![], 0),
+            ],
+        };
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let talk_once = |sim: &mut Sim| {
+            let c = Conversation {
+                dlg: d.clone(),
+                owner: 1,
+                player: 2,
+                line: None,
+                replies: vec![],
+                ended: false,
+                shown: vec![],
+                chain: vec![],
+            };
+            let c = sim.speak(c, 0);
+            sim.talk = Some(c);
+            sim.choose_reply(0).unwrap().line
+        };
+        assert_eq!(talk_once(&mut sim), "a prayer");
+        assert_eq!(talk_once(&mut sim), "what do you want?");
     }
 }
