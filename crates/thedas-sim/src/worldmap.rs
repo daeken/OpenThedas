@@ -197,7 +197,7 @@ impl Sim {
                 wm.swapped = false;
                 true
             }
-            _ => false,
+            _ => self.level_up_message(name, args),
         }
     }
 

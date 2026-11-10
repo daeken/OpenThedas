@@ -103,6 +103,23 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
     if let Some(h) = hero {
         creature("GUI.SelectedChar", h);
     }
+    // The creature in character generation or level-up, as levelup.gfx reads it: its
+    // attributes and points (34 attribute, 35 skill, 36 talent, 38 specialization), with
+    // what equipment adds as each attribute's Modifier. The screen spends the points itself
+    // unless the auto-level option (`Stats.AutoLevelUp`) is on; it is off. Provisional.
+    if let Some(c) = sim.world.chargen {
+        creature("CharGenCreature", c);
+        if let Some(o) = sim.world.get(c) {
+            for p in o.properties.keys() {
+                v.insert(
+                    format!("CharGenCreature.Attributes.{p}.Modifier"),
+                    num(sim.equipment_bonus(c, *p)),
+                );
+            }
+        }
+        v.insert("CharGenCreature.Stats.AutoLevelUp".into(), num(0));
+        crate::chains::bind(sim, c, "CharGenCreature.Stats", &mut v);
+    }
     // Empty slots read as no creature (0); `GetNumMembers` does not count them.
     for i in members.len()..4 {
         v.insert(format!("Party.Members.{i}"), num(0));
