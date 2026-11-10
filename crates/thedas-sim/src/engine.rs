@@ -1518,6 +1518,31 @@ pub fn call(
             Some(EngineData::Command(c)) => c.ty,
             _ => 0,
         })),
+        // A command's arguments, as its constructor took them: integers in order, float 0
+        // (a wait's seconds and the like), object 0 its target. Provisional.
+        "GetCommandInt" | "GetCommandFloat" | "GetCommandObject" => {
+            let c = match h.sim.world.handle(handle(a, 0)) {
+                Some(EngineData::Command(c)) => Some(c.clone()),
+                _ => None,
+            };
+            let i = int(a, 1);
+            ok(match name {
+                "GetCommandInt" => Value::Int(
+                    c.as_ref()
+                        .and_then(|c| c.ints.get(usize::try_from(i).ok()?).copied())
+                        .unwrap_or(0),
+                ),
+                "GetCommandFloat" => {
+                    Value::Float(c.as_ref().filter(|_| i == 0).map_or(0.0, |c| c.seconds))
+                }
+                _ => Value::Object(
+                    c.as_ref()
+                        .filter(|_| i == 0)
+                        .and_then(|c| c.target)
+                        .unwrap_or(OBJECT_INVALID),
+                ),
+            })
+        }
         "AddCommand" => {
             let Some(EngineData::Command(c)) = h.sim.world.handle(handle(a, 1)).cloned() else {
                 return ok(Value::Int(0));
