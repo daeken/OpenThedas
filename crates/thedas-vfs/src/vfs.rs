@@ -3,6 +3,10 @@
 //! Layers are pushed lowest priority first. A lookup returns the hit from the highest layer,
 //! and [`Vfs::hits`] returns every layer that provides a name, so tools can show which files
 //! a mod or patch shadows.
+//!
+//! Layers can be mounted for a while and removed again: take a [`Vfs::mark`], push the
+//! layers (for example a level's own archives while its area is loaded), and later
+//! [`Vfs::truncate`] back to the mark.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,8 +18,16 @@ use crate::{Error, Result, normalize_name};
 
 #[derive(Debug)]
 pub enum LayerSource {
-    Archive { erf: Arc<Erf>, key: Option<DaoKey> },
-    Directory { root: PathBuf, recursive: bool },
+    Archive {
+        erf: Arc<Erf>,
+        key: Option<DaoKey>,
+    },
+    Directory {
+        root: PathBuf,
+        recursive: bool,
+    },
+    /// An explicit list of loose files, such as a level's `.arl` beside its archives.
+    Files,
 }
 
 #[derive(Debug)]
@@ -133,6 +145,50 @@ impl Vfs {
         Ok(())
     }
 
+    /// Adds a layer holding exactly these loose files. Missing files are skipped.
+    pub fn push_files(&mut self, files: &[PathBuf], label: impl Into<String>) {
+        let layer = self.layers.len();
+        let mut named = Vec::with_capacity(files.len());
+        for path in files.iter().filter(|p| p.is_file()) {
+            let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            let i = named.len();
+            let hits = self.index.entry(normalize_name(&name)).or_default();
+            if let Some(last) = hits.last() {
+                if last.0 == layer {
+                    hits.pop();
+                }
+            }
+            hits.push((layer, Slot::File(i)));
+            named.push((name, path.clone()));
+        }
+        self.layers.push(Layer {
+            label: label.into(),
+            source: LayerSource::Files,
+        });
+        self.dir_files.push(named);
+    }
+
+    /// The current top of the stack, for a later [`Vfs::truncate`].
+    pub fn mark(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Removes every layer at or above `mark`, restoring the stack to what it was when the
+    /// mark was taken.
+    pub fn truncate(&mut self, mark: usize) {
+        if mark >= self.layers.len() {
+            return;
+        }
+        self.layers.truncate(mark);
+        self.dir_files.truncate(mark);
+        self.index.retain(|_, hits| {
+            hits.retain(|&(layer, _)| layer < mark);
+            !hits.is_empty()
+        });
+    }
+
     fn provenance(&self, layer: usize, slot: Slot) -> Provenance {
         let l = &self.layers[layer];
         match (&l.source, slot) {
@@ -142,7 +198,7 @@ impl Vfs {
                 file: erf.path().to_path_buf(),
                 entry: erf.entries[i].name.clone(),
             },
-            (LayerSource::Directory { .. }, Slot::File(i)) => Provenance {
+            (LayerSource::Directory { .. } | LayerSource::Files, Slot::File(i)) => Provenance {
                 layer,
                 layer_label: l.label.clone(),
                 file: self.dir_files[layer][i].1.clone(),
@@ -185,7 +241,7 @@ impl Vfs {
             (LayerSource::Archive { erf, key }, Slot::Entry(i)) => {
                 erf.read(&erf.entries[i], key.as_ref())?
             }
-            (LayerSource::Directory { .. }, Slot::File(i)) => {
+            (LayerSource::Directory { .. } | LayerSource::Files, Slot::File(i)) => {
                 let path = &self.dir_files[layer][i].1;
                 std::fs::read(path).map_err(|e| Error::Io {
                     path: path.clone(),
@@ -274,5 +330,36 @@ mod tests {
         assert_eq!(vfs.lookup("only_low.txt").unwrap().layer, 0);
         assert!(vfs.lookup("missing").is_none());
         assert_eq!(vfs.len(), 2);
+    }
+
+    #[test]
+    fn mounted_layers_truncate_away() {
+        let base = std::env::temp_dir().join(format!("thedas-vfs-mount-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("shared.txt"), b"base").unwrap();
+        let extra = base.join("extra");
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(extra.join("shared.txt"), b"mounted").unwrap();
+        std::fs::write(extra.join("level.arl"), b"arl").unwrap();
+
+        let mut vfs = Vfs::new();
+        vfs.push_files(&[base.join("shared.txt"), base.join("missing.txt")], "base");
+        let mark = vfs.mark();
+        vfs.push_files(
+            &[extra.join("shared.txt"), extra.join("level.arl")],
+            "level",
+        );
+        assert_eq!(vfs.read("shared.txt").unwrap().0, b"mounted");
+        assert_eq!(vfs.lookup("LEVEL.ARL").unwrap().layer_label, "level");
+        assert_eq!(vfs.hits("shared.txt").len(), 2);
+
+        vfs.truncate(mark);
+        assert_eq!(vfs.layers().len(), 1);
+        assert_eq!(vfs.read("shared.txt").unwrap().0, b"base");
+        assert!(vfs.lookup("level.arl").is_none());
+        assert!(vfs.lookup("missing.txt").is_none());
+        assert_eq!(vfs.len(), 1);
+        vfs.truncate(10);
+        assert_eq!(vfs.len(), 1);
     }
 }

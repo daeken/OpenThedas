@@ -7,7 +7,8 @@
 //! - [`vfs`]: an ordered stack of layers (archives and loose directories). Lookups return the
 //!   highest-priority hit together with where it came from, so later tooling can show mod
 //!   conflicts and shadowed files.
-//! - [`install`]: discovers a DA:O install and builds the default layer stack for it.
+//! - [`install`]: discovers a DA:O install, builds the default layer stack for it, and mounts
+//!   a level's own archives on top while its area is loaded.
 
 pub mod crypto;
 pub mod erf;
@@ -17,7 +18,7 @@ pub mod vfs;
 use std::path::PathBuf;
 
 pub use erf::{Erf, ErfEntry, ErfVersion};
-pub use install::DaoInstall;
+pub use install::{DaoInstall, LevelMount};
 pub use vfs::{Layer, Provenance, Vfs};
 
 #[derive(Debug, thiserror::Error)]

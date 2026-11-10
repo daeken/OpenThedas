@@ -41,7 +41,13 @@ enum Command {
         raw: bool,
     },
     /// Show which layers of an install provide a resource, winner first.
-    Resolve { install: PathBuf, name: String },
+    Resolve {
+        install: PathBuf,
+        name: String,
+        /// Also mount this level's archives (e.g. `lgt101d`), as when its area is loaded.
+        #[arg(long)]
+        level: Option<String>,
+    },
     /// Open every archive in an install and parse every GFF4-family resource.
     Corpus {
         /// Install roots or individual archives.
@@ -88,7 +94,11 @@ fn run() -> Result<()> {
             let data = load_target(&target)?;
             dump::dump(&data, raw, &mut std::io::stdout().lock())
         }
-        Command::Resolve { install, name } => resolve(&install, &name),
+        Command::Resolve {
+            install,
+            name,
+            level,
+        } => resolve(&install, &name, level.as_deref()),
         Command::Corpus {
             paths,
             report,
@@ -166,9 +176,12 @@ fn load_target(target: &str) -> Result<Vec<u8>> {
     Ok(erf.read(e, None)?)
 }
 
-fn resolve(install: &Path, name: &str) -> Result<()> {
+fn resolve(install: &Path, name: &str, level: Option<&str>) -> Result<()> {
     let install = DaoInstall::open(install)?;
-    let vfs = install.global_vfs(TextureQuality::High)?;
+    let mut vfs = install.global_vfs(TextureQuality::High)?;
+    if let Some(level) = level {
+        install.mount_level(&mut vfs, level)?;
+    }
     let hits = vfs.hits(name);
     if hits.is_empty() {
         bail!("{name}: not found in the global resource stack");
