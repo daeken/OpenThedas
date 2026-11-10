@@ -322,6 +322,64 @@ impl Sim {
         self.check_death(target, creator.unwrap_or(OBJECT_INVALID));
     }
 
+    /// Takes an effect off a creature and tells its script (`EVENT_TYPE_REMOVE_EFFECT`, with
+    /// the effect as the current one), which undoes what applying it did (a property
+    /// modifier's change, for instance). Returns whether the creature had it.
+    pub fn remove_effect(&mut self, target: ObjectId, effect: &Effect) -> bool {
+        let removed = match self.world.get_mut(target) {
+            Some(o) => match o.effects.iter().position(|x| x == effect) {
+                Some(i) => Some(o.effects.remove(i)),
+                None => None,
+            },
+            None => None,
+        };
+        let Some(effect) = removed else { return false };
+        let mut ev = self.new_event("REMOVE_EFFECT", effect.creator);
+        ev.objects = vec![target];
+        let saved = self.current_effect.replace((effect, true));
+        let saved_target = self.current_effect_target.replace(target);
+        let script = self.world.get(target).and_then(|o| o.script.clone());
+        if let Some(script) = script {
+            self.run_script(&script, target, Some(ev));
+        }
+        self.current_effect = saved;
+        self.current_effect_target = saved_target;
+        true
+    }
+
+    /// Removes temporary effects whose time is up.
+    pub fn expire_effects(&mut self) {
+        let now = self.world.time_ms;
+        let due: Vec<(ObjectId, Effect)> = self
+            .world
+            .objects
+            .values()
+            .flat_map(|o| {
+                o.effects
+                    .iter()
+                    .filter(|e| e.expires.is_some_and(|t| t <= now))
+                    .map(move |e| (o.id, e.clone()))
+            })
+            .collect();
+        for (id, e) in due {
+            self.remove_effect(id, &e);
+        }
+    }
+
+    /// Whether a modal ability (a sustained talent or spell) is on: the creature carries an
+    /// effect from it, such as its upkeep (`EFFECT_TYPE_UPKEEP`, ability in integer 1).
+    /// Provisional.
+    pub fn modal_active(&self, id: ObjectId, ability: i32) -> bool {
+        const EFFECT_TYPE_UPKEEP: i32 = 1016;
+        ability != 0
+            && self.world.get(id).is_some_and(|o| {
+                o.effects.iter().any(|e| {
+                    e.ability == ability
+                        || (e.ty == EFFECT_TYPE_UPKEEP && e.ints.get(1) == Some(&ability))
+                })
+            })
+    }
+
     /// Kills a creature whose health ran out.
     pub fn check_death(&mut self, id: ObjectId, killer: ObjectId) {
         let health = constant_of(self, "PROPERTY_DEPLETABLE_HEALTH");
@@ -586,6 +644,8 @@ fn constant_of(sim: &Sim, name: &str) -> i32 {
 mod tests {
     use std::sync::Arc;
 
+    use crate::world::Effect;
+
     use thedas_script::EngineTable;
     use thedas_vfs::Vfs;
 
@@ -602,6 +662,28 @@ mod tests {
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         Sim::new(Arc::new(Vfs::new()), table, 3)
+    }
+
+    #[test]
+    fn modal_abilities_stay_on_until_their_effects_run_out() {
+        let mut s = sim();
+        let who = s.world.spawn(ObjectKind::Creature, "berserker");
+        let upkeep = Effect {
+            ty: 1016,
+            ints: vec![1, 700],
+            expires: Some(1000),
+            ..Default::default()
+        };
+        s.world.get_mut(who).unwrap().effects.push(upkeep);
+        assert!(s.modal_active(who, 700));
+        assert!(!s.modal_active(who, 701));
+        s.world.time_ms = 999;
+        s.expire_effects();
+        assert!(s.modal_active(who, 700), "not yet");
+        s.world.time_ms = 1000;
+        s.expire_effects();
+        assert!(!s.modal_active(who, 700));
+        assert!(s.world.get(who).unwrap().effects.is_empty());
     }
 
     #[test]
