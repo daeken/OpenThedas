@@ -27,14 +27,7 @@ pub fn party(sim: &Sim) -> Vec<u32> {
 }
 
 fn name(sim: &Sim, id: u32) -> String {
-    sim.world
-        .get(id)
-        .and_then(|o| {
-            o.name_strref
-                .and_then(|s| sim.string(s))
-                .or(Some(o.tag.clone()))
-        })
-        .unwrap_or_default()
+    sim.display_name(id)
 }
 
 /// The conversation on screen: one in progress, or one that ended on a line the player has

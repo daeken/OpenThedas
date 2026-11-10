@@ -17,6 +17,10 @@ pub const MSG_ABILITY: &str = "GUICharGen.CharGenAssignAbility";
 pub const MSG_SPECIALIZATION: &str = "GUILevelUp.CharGenAssignAbility";
 /// The screen closed: the creature and how it was left.
 pub const MSG_END: &str = "GUILevelUp.CharGenEnd";
+/// Character creation's name: the creature and the name typed (the interface adds the name
+/// from `GUICharGen.TempCharName`, where the screen leaves it). The module's chargen script
+/// hears `EVENT_TYPE_CHARGEN_SELECT_NAME` with the name and calls `SetName`.
+pub const MSG_SELECT_NAME: &str = "GUICharGen.CharGenSelectName";
 /// The screen asks for the creature's ability lists (creature, ability type, display mode),
 /// which the interface binding provides; nothing changes in the game.
 pub const MSG_CHAINS: &str = "GameModeController.FindAbilityChains";
@@ -230,6 +234,7 @@ impl Sim {
                 | MSG_SPECIALIZATION
                 | MSG_END
                 | MSG_CHAINS
+                | MSG_SELECT_NAME
         ) || self.world.chargen != Some(who)
         {
             return false;
@@ -240,6 +245,14 @@ impl Sim {
                 self.auto_level(who);
                 self.chargen_event("CHARGEN_END", vec![1, 0], Vec::new())
             }
+            MSG_SELECT_NAME => match args.get(1) {
+                Some(name) if !name.trim().is_empty() => self.chargen_event(
+                    "CHARGEN_SELECT_NAME",
+                    Vec::new(),
+                    vec![name.trim().to_string()],
+                ),
+                _ => false,
+            },
             MSG_ATTRIBUTE => match (int(1), int(2)) {
                 (Some(attr), Some(n)) if n != 0 => {
                     self.chargen_event("CHARGEN_ASSIGN_ATTRIBUTES", vec![attr, n], Vec::new())
@@ -337,5 +350,34 @@ mod tests {
                 (module, 59, vec![1, 0]),
             ]
         );
+    }
+
+    #[test]
+    fn the_name_typed_reaches_the_chargen_script_and_names_the_creature() {
+        let table = EngineTable::parse(
+            format!("{LDF}int EVENT_TYPE_CHARGEN_SELECT_NAME = 49;\n").as_bytes(),
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        s.world.module = Some(module);
+        s.world.chargen = Some(hero);
+        let h = hero.to_string();
+        assert!(!s.gui_message(MSG_SELECT_NAME, &[h.clone(), "  ".into()]));
+        assert!(s.gui_message(MSG_SELECT_NAME, &[h, "Elissa".into()]));
+        let sent: Vec<_> = s
+            .world
+            .queue
+            .values()
+            .map(|q| (q.event.ty, q.event.strings.clone()))
+            .collect();
+        assert_eq!(sent, vec![(49, vec!["Elissa".to_string()])]);
+        // What the chargen script then does (SetName), and how the name reads back.
+        assert_eq!(s.display_name(hero), "player");
+        s.world.get_mut(hero).unwrap().name = Some("Elissa".into());
+        assert_eq!(s.display_name(hero), "Elissa");
+        let saved = s.save_json().unwrap();
+        assert!(String::from_utf8_lossy(&saved).contains("\"name\":\"Elissa\""));
     }
 }

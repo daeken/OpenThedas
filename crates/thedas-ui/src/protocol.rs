@@ -17,6 +17,26 @@ use std::sync::{Arc, Mutex};
 
 use crate::{CallKind, Responder, UiCall, UiValue};
 
+/// Messages whose engine side reads a value the screen set just before sending them (the
+/// name typed in character creation): the bridge passes the value on as one more argument.
+/// Provisional: inferred from the movies, which set the value and send the message together.
+const MESSAGE_VALUES: &[(&str, &str)] =
+    &[("GUICharGen.CharGenSelectName", "GUICharGen.TempCharName")];
+
+/// `args` with the value [`MESSAGE_VALUES`] names for message `name`, if any, added.
+fn with_message_values(
+    values: &BTreeMap<String, UiValue>,
+    name: &str,
+    mut args: Vec<String>,
+) -> Vec<String> {
+    for (message, value) in MESSAGE_VALUES {
+        if *message == name {
+            args.push(values.get(*value).map(as_string).unwrap_or_default());
+        }
+    }
+    args
+}
+
 /// The engine value holding the hero's name, for designer tags.
 pub const HERO_NAME: &str = "Party.Hero.Name";
 
@@ -255,7 +275,13 @@ impl GameBridge {
             "SendMessage" | "SendMessageArgs" if call.kind == CallKind::FsCommand => {
                 let handler = self.handler.lock().ok().and_then(|h| h.clone());
                 let name = arg(0);
-                if let Some(changed) = handler.and_then(|h| h(&name, &args[1.min(args.len())..])) {
+                let message_args = match self.state.lock() {
+                    Ok(s) => {
+                        with_message_values(&s.values, &name, args[1.min(args.len())..].to_vec())
+                    }
+                    Err(_) => args[1.min(args.len())..].to_vec(),
+                };
+                if let Some(changed) = handler.and_then(|h| h(&name, &message_args)) {
                     self.set_values(changed);
                     if let Ok(mut s) = self.state.lock() {
                         s.handled.push_back(args.join(" "));
@@ -433,11 +459,12 @@ impl GameBridge {
             "SendMessage" | "SendMessageArgs" => {
                 let mut parts = text.split(' ').map(str::to_string);
                 let name = parts.next().unwrap_or_default();
+                let args = with_message_values(&s.values, &name, parts.collect());
                 if s.handled.front() == Some(&text) {
                     s.handled.pop_front();
-                    return Some(GameMessage::Handled(name, parts.collect()));
+                    return Some(GameMessage::Handled(name, args));
                 }
-                Some(GameMessage::Send(name, parts.collect()))
+                Some(GameMessage::Send(name, args))
             }
             _ => Some(GameMessage::Other(call)),
         }
@@ -476,6 +503,28 @@ mod tests {
         assert_eq!(b.value("Movie.Own"), Some(n(3.0)));
         // The defaults every movie reads stay.
         assert!(b.value("Scaleform.Platform").is_some());
+    }
+
+    #[test]
+    fn the_name_typed_goes_with_its_message() {
+        let b = bridge();
+        let fs = CallKind::FsCommand;
+        b.handle(call(
+            fs,
+            "SetValueUnicode",
+            &["GUICharGen.TempCharName Elissa"],
+        ));
+        assert_eq!(
+            b.handle(call(
+                fs,
+                "SendMessageArgs",
+                &["GUICharGen.CharGenSelectName 12"]
+            )),
+            Some(GameMessage::Send(
+                "GUICharGen.CharGenSelectName".into(),
+                vec!["12".into(), "Elissa".into()]
+            ))
+        );
     }
 
     #[test]

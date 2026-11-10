@@ -2024,6 +2024,17 @@ impl Sim {
         self.load_template_items(id, &t);
     }
 
+    /// An object's name: one given in play (`SetName`), else its template's, else its tag.
+    pub fn display_name(&self, id: ObjectId) -> String {
+        let Some(o) = self.world.get(id) else {
+            return String::new();
+        };
+        o.name
+            .clone()
+            .or_else(|| o.name_strref.and_then(|s| self.string(s)))
+            .unwrap_or_else(|| o.tag.clone())
+    }
+
     /// How an item's template presents it: its icon and description (for the interface).
     pub fn item_look(&self, item: ObjectId) -> ItemLook {
         let Some(template) = self.world.get(item).map(|o| o.template.clone()) else {
