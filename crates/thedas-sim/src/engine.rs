@@ -989,6 +989,10 @@ pub fn call(
                     .object(obj(a, 0))
                     .and_then(|o| o.properties.get(&xp))
                     .map_or(0.0, |v| v.0);
+                if after > before {
+                    let by = h.script.clone();
+                    *h.sim.world.trace.hero_xp.entry(by).or_default() += (after - before) as u64;
+                }
                 h.sim.share_pool_xp(after - before);
             }
             void()
