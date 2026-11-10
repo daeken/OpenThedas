@@ -117,7 +117,8 @@ struct Args {
     /// `click X,Y` (a left click at that pixel), `run MS` (the game and its interface run
     /// that long), `key i` (the inventory toggle), `key f1`-`key f4` (who leads), `key 1`-`key
     /// 0` (quickbar slots), `key space` (pause), `talk TAG` (the leader talks to a creature),
-    /// `reply N` (the conversation's reply N, from 0), `rebuild` (the objects are rebuilt as a
+    /// `reply N` (the conversation's reply N, from 0), `press X,Y` and `release X,Y` (the
+    /// left button down and up, for drags), `rebuild` (the objects are rebuilt as a
     /// spawn rebuilds them, timed), `rclick X,Y` and `dclick X,Y` (a right or double click
     /// for the interface), `hover X,Y` (the mouse rests there, for the aiming reticle).
     #[arg(long, default_value = "")]
@@ -872,6 +873,15 @@ impl App {
                     _ => format!("talk to {tag}: nobody"),
                 });
             }
+            &Step::Press(x, y) | &Step::Release(x, y) => {
+                let down = matches!(step, Step::Press(..));
+                self.cursor_to(x, y);
+                self.left_button(down);
+                log.push(format!(
+                    "{} {x},{y}",
+                    if down { "press" } else { "release" }
+                ));
+            }
             Step::Rebuild => log.push("rebuild: headless only".into()),
             Step::Run(_) => {}
         }
@@ -1181,6 +1191,10 @@ enum Step {
     Pause,
     /// The conversation's reply n (from 0) is chosen.
     Reply(usize),
+    /// The left button goes down, or up, at a pixel: with `hover` and `run` between, a drag
+    /// (the quickbar's icons, the inventory's items).
+    Press(f64, f64),
+    Release(f64, f64),
 }
 
 fn parse_steps(spec: &str) -> Result<Vec<Step>> {
@@ -1206,6 +1220,15 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
                     Step::Quickslot((arg.as_bytes()[0] - b'0' + 9) as i32 % 10)
                 }
                 "reply" => Step::Reply(arg.parse().context("reply takes a number")?),
+                "press" | "release" => {
+                    let (x, y) = arg.split_once(',').context("press takes x,y")?;
+                    let (x, y) = (x.trim().parse()?, y.trim().parse()?);
+                    if verb == "press" {
+                        Step::Press(x, y)
+                    } else {
+                        Step::Release(x, y)
+                    }
+                }
                 "talk" if !arg.is_empty() => Step::Talk(arg.to_string()),
                 "rebuild" => Step::Rebuild,
                 "hover" => {
@@ -1323,7 +1346,22 @@ fn main() -> Result<()> {
             l.sim().tick(args.run_ms);
             for step in &steps {
                 match step {
-                    &Step::Hover(x, y) => cursor = (x, y),
+                    &Step::Hover(x, y) => {
+                        cursor = (x, y);
+                        if let Some((layer, _)) = played.as_mut() {
+                            layer.mouse_move(x, y);
+                        }
+                    }
+                    &Step::Press(x, y) | &Step::Release(x, y) => {
+                        let down = matches!(step, Step::Press(..));
+                        if let Some((layer, _)) = played.as_mut() {
+                            layer.render_movies();
+                            layer.mouse_move(x, y);
+                            layer.mouse_button(x, y, down);
+                        }
+                        cursor = (x, y);
+                        println!("{} {x},{y}", if down { "press" } else { "release" });
+                    }
                     &Step::Leader(n) => match l.choose_leader(n) {
                         Some(tag) => println!("leading with {tag}"),
                         None => println!("no party member {}", n + 1),
@@ -1453,13 +1491,17 @@ fn main() -> Result<()> {
             let sim = l.sim();
             if let Some(h) = sim.world.controlled().and_then(|h| sim.world.get(h)) {
                 log::info!(
-                    "leader at {:?}, doing {:?}, cooling down {:?}, saying: {:?}",
+                    "leader at {:?}, doing {:?}, cooling down {:?}, quickbar {:?}, saying: {:?}",
                     h.position,
                     h.commands
                         .iter()
                         .map(|c| c.name.as_str())
                         .collect::<Vec<_>>(),
                     h.combat.cooldowns.keys().collect::<Vec<_>>(),
+                    h.quickslots
+                        .iter()
+                        .map(|(s, q)| (*s, q.ability))
+                        .collect::<Vec<_>>(),
                     sim.dialog_state().map(|d| (d.line, d.replies, d.ended))
                 );
             }
@@ -1550,6 +1592,10 @@ mod tests {
                 Step::Pause,
                 Step::Reply(2)
             ]
+        );
+        assert_eq!(
+            parse_steps("press 1,2; release 3,4").unwrap(),
+            vec![Step::Press(1.0, 2.0), Step::Release(3.0, 4.0)]
         );
         assert!(parse_steps("reply x").is_err());
         assert!(parse_steps("dance").is_err());

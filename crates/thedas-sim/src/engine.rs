@@ -2474,15 +2474,8 @@ pub fn call(
         // A quickbar slot: an ability and the tag of the item it comes from; no ability
         // empties it.
         "SetQuickslot" => {
-            let (slot, ability, item) = (int(a, 1), int(a, 2), string(a, 3));
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                if ability > 0 {
-                    o.quickslots
-                        .insert(slot, crate::world::Quickslot { ability, item });
-                } else {
-                    o.quickslots.remove(&slot);
-                }
-            }
+            h.sim
+                .set_quickslot(obj(a, 0), int(a, 1), int(a, 2), &string(a, 3));
             void()
         }
         "GetQuickslot" => {

@@ -156,6 +156,9 @@ impl Sim {
             | crate::inventory::MSG_UNEQUIP
             | crate::inventory::MSG_NEXT_CHARACTER
             | crate::inventory::MSG_PREVIOUS_CHARACTER => self.inventory_message(name, args),
+            n if n.ends_with(crate::quickbar::MSG_SET_QUICKSLOT) => {
+                self.quickbar_message(name, args)
+            }
             _ => self.world_map_message(name, args),
         }
     }

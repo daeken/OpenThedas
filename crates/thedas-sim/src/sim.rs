@@ -579,6 +579,7 @@ impl Sim {
         self.regenerate(elapsed);
         self.expire_effects();
         self.world.destroy_due();
+        self.settle_quickbars();
         self.autopilot_idle_hero();
         if held > 0 {
             self.tick(held);
