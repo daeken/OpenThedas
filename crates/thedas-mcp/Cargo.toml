@@ -1,0 +1,22 @@
+[package]
+name = "thedas-mcp"
+description = "MCP server for driving the OpenThedas simulation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "thedas-mcp"
+path = "src/main.rs"
+
+[dependencies]
+thedas-sim.workspace = true
+thedas-script.workspace = true
+rmcp = { version = "3.9", features = ["server", "transport-io", "macros", "schemars"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+schemars = "1"

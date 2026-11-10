@@ -234,6 +234,7 @@ impl Rng {
     }
 }
 
+#[derive(Clone)]
 pub struct World {
     pub time_ms: u64,
     pub objects: BTreeMap<ObjectId, Object>,

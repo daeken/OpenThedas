@@ -33,6 +33,7 @@ Materials outside the Static1 family fall back to a hand-written stand-in unless
 | `thedas-app` | The `thedas-app` binary: a window with a free-fly camera, or a headless capture |
 | `thedas-script` | NWScript: the `script.ldf` engine-function table, NCS bytecode parsing and disassembly, and the stack VM |
 | `thedas-sim` | The headless, deterministic world: modules and areas loaded from their files, objects, events and the event queue, engine functions for the NWScript VM, plots and conversations |
+| `thedas-mcp` | An MCP server over the simulation, so an AI assistant (or any MCP client) can play and test the game |
 | `thedas-cli` | The `thedas` tool: `ls`, `extract`, `dump`, `resolve`, `corpus` |
 
 Planned crates follow the architecture doc: `thedas-ui`,
@@ -82,6 +83,32 @@ GAME=~/path/to/Dragon\ Age\ Origins   # the folder holding packages/ and modules
 back to the same document, and parses GDA, TLK, area, layout, model, mesh, material (XML) and DDS
 files into their typed forms. It exits non-zero
 on any failure. DLC archives encrypted with a key we do not have are counted, not failed.
+
+## Driving the simulation over MCP
+
+`thedas-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server (stdio) over the
+headless simulation. Register it with Claude Code:
+
+```sh
+cargo build --release -p thedas-mcp
+claude mcp add thedas -e THEDAS_INSTALL="$GAME" -- "$PWD/target/release/thedas-mcp"
+```
+
+Then ask Claude to, say, "load the Spoiled Princess and talk to the innkeeper". Tools:
+
+| Tool | What it does |
+| --- | --- |
+| `load` | Load a module and area (default module `single player`; e.g. area `cir110ar_inn`) |
+| `status` | Time, area, hero, conversation, script errors, most-called unimplemented engine functions |
+| `list_objects`, `inspect_object` | Objects by tag and kind; full state of one object |
+| `step` | Advance time, delivering events and running commands |
+| `get_trace` | What scripts and the engine did since the last call, filtered by kind |
+| `interact` | Talk to a creature or use a placeable as the hero |
+| `dialog_state`, `choose_reply`, `end_conversation` | Read and drive the current conversation |
+| `move_hero`, `enter_area`, `list_areas` | Move around and travel |
+| `plot_flag`, `local` | Read or set plot flags and local variables |
+| `call_engine_function`, `run_script` | Call any engine function or compiled script directly |
+| `save_state`, `load_state` | Snapshot and restore the world (in memory) |
 
 ## Development
 

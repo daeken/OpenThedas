@@ -138,7 +138,8 @@ impl Sim {
             }
             m
         });
-        map.get(&strref).cloned()
+        map.get(&strref)
+            .map(|s| s.trim_end_matches('\0').to_string())
     }
 
     pub fn event_name(&self, ty: i32) -> String {
@@ -150,6 +151,16 @@ impl Sim {
 
     pub fn event_type(&self, name: &str) -> i32 {
         constant(&self.table, &format!("EVENT_TYPE_{name}"))
+    }
+
+    /// A copy of the mutable state (world and conversation) to restore later.
+    pub fn snapshot(&self) -> (World, Option<crate::dialog::Conversation>) {
+        (self.world.clone(), self.talk.clone())
+    }
+
+    pub fn restore(&mut self, s: (World, Option<crate::dialog::Conversation>)) {
+        self.world = s.0;
+        self.talk = s.1;
     }
 
     /// Registers a compiled script under a name, ahead of the resource stack (tools, tests).
