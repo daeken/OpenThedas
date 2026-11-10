@@ -22,7 +22,7 @@ use thedas_script::{Ncs, Vm};
 use thedas_vfs::Vfs;
 
 use crate::trace::TraceEntry;
-use crate::world::{Event, Location, Object, ObjectKind, World};
+use crate::world::{Command, Event, Location, Object, ObjectKind, World};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SimError {
@@ -247,6 +247,11 @@ impl Sim {
             vm.run(&mut host, caller)
         };
         self.depth -= 1;
+        // Engine structures live only while scripts run (events, effects and commands are
+        // copied by value into the world), so a finished top-level run frees its handles.
+        if self.depth == 0 {
+            self.world.handles.clear();
+        }
         let (steps, error, value) = match result {
             Ok(r) => (r.steps, None, r.value),
             Err(e) => (0, Some(e.to_string()), None),
@@ -297,11 +302,7 @@ impl Sim {
     pub fn tick(&mut self, ms: u64) {
         let until = self.world.time_ms + ms;
         loop {
-            while let Some((due, q)) = self.world.pop_due(until) {
-                // Events run at their own due time, so delays chain correctly.
-                self.world.time_ms = self.world.time_ms.max(due);
-                self.deliver(q.target, q.event, q.script);
-            }
+            // Engine work that waits for the current scripts: transitions, then cutscenes.
             if let Some((area, waypoint)) = self.world.transition.take() {
                 self.area_transition(&area, &waypoint);
                 continue;
@@ -313,8 +314,24 @@ impl Sim {
                 }
                 continue;
             }
-            if !self.run_commands(until) {
-                break;
+            // Then the earliest of the next event and the next finishing command; events
+            // first on a tie. Both run at their own time, so delays chain correctly.
+            let event = self.world.queue.keys().next().map(|k| k.0);
+            let command = self.next_command();
+            match (event, command) {
+                (Some(e), c) if e <= until && c.is_none_or(|(d, _)| e <= d) => {
+                    if let Some((due, q)) = self.world.pop_due(until) {
+                        self.world.time_ms = self.world.time_ms.max(due);
+                        let (target, ty) = (q.target, q.event.ty);
+                        self.deliver(q.target, q.event, q.script);
+                        self.next_heartbeat(target, ty);
+                    }
+                }
+                (_, Some((due, id))) if due <= until => {
+                    self.world.time_ms = self.world.time_ms.max(due);
+                    self.finish_command(id);
+                }
+                _ => break,
             }
         }
         self.world.time_ms = until;
@@ -461,68 +478,118 @@ impl Sim {
         true
     }
 
-    /// Runs the front command of every object whose command is ready; returns whether any
-    /// command finished (which may have queued more events).
-    fn run_commands(&mut self, until: u64) -> bool {
-        let ids: Vec<ObjectId> = self
+    /// How long a command takes once it reaches the front of its queue. Provisional: there is
+    /// no animation or pathfinding, so moves go at 5 m/s in a straight line, waits take their
+    /// time, and anything else takes half a second. Every command takes at least a
+    /// millisecond, so scripts that queue a new command when one completes cannot loop
+    /// forever within one instant.
+    fn command_duration(&self, id: ObjectId, cmd: &Command) -> u64 {
+        let ms = if cmd.name == "CommandWait" {
+            (cmd.seconds.max(0.0) * 1000.0) as u64
+        } else if cmd.name.starts_with("CommandMoveTo") || cmd.name.starts_with("CommandJumpTo") {
+            let from = self.world.get(id).map(|o| o.position).unwrap_or_default();
+            let to = cmd
+                .location
+                .map(|l| l.position)
+                .or_else(|| {
+                    cmd.target
+                        .and_then(|t| self.world.get(t))
+                        .map(|o| o.position)
+                })
+                .unwrap_or(from);
+            let d =
+                ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2) + (to[2] - from[2]).powi(2))
+                    .sqrt();
+            if cmd.name.starts_with("CommandJumpTo") {
+                0
+            } else {
+                (d / 5.0 * 1000.0) as u64
+            }
+        } else {
+            500
+        };
+        ms.max(1)
+    }
+
+    /// Re-arms a heartbeat after it fires, while the object still has one.
+    fn next_heartbeat(&mut self, target: ObjectId, ty: i32) {
+        if ty != self.event_type("HEARTBEAT2") || ty == 0 {
+            return;
+        }
+        let Some(ms) = self
+            .world
+            .get(target)
+            .and_then(|o| o.fields.get("HeartbeatMs").copied())
+        else {
+            return;
+        };
+        let ev = self.new_event("HEARTBEAT2", Some(target));
+        self.world.queue_event(ms.max(1) as u64, target, ev, None);
+    }
+
+    /// The earliest-finishing front command, starting the clock on fronts that have none.
+    fn next_command(&mut self) -> Option<(u64, ObjectId)> {
+        let now = self.world.time_ms;
+        let fronts: Vec<(ObjectId, Command)> = self
             .world
             .objects
             .values()
-            .filter(|o| !o.commands.is_empty())
-            .map(|o| o.id)
+            .filter_map(|o| o.commands.first().map(|c| (o.id, c.clone())))
             .collect();
-        let mut any = false;
-        let now = self.world.time_ms;
-        for id in ids {
-            let Some(obj) = self.world.get_mut(id) else {
-                continue;
-            };
-            let Some(cmd) = obj.commands.first().cloned() else {
-                continue;
-            };
-            // A wait starts when it reaches the front and records its end time in ints[0].
-            if cmd.name == "CommandWait" {
-                let end = match cmd.ints.first() {
-                    Some(&end) => end as u64,
-                    None => {
-                        let end = now + (cmd.seconds.max(0.0) * 1000.0) as u64;
-                        if let Some(c) = obj.commands.first_mut() {
-                            c.ints.insert(0, end as i32);
-                        }
-                        end
+        let mut best: Option<(u64, ObjectId)> = None;
+        for (id, cmd) in fronts {
+            let due = match cmd.due {
+                Some(d) => d,
+                None => {
+                    let d = now + self.command_duration(id, &cmd);
+                    if let Some(c) = self.world.get_mut(id).and_then(|o| o.commands.first_mut()) {
+                        c.due = Some(d);
                     }
-                };
-                if end > until {
-                    continue;
+                    d
                 }
+            };
+            if best.is_none_or(|(b, bid)| (due, id) < (b, bid)) {
+                best = Some((due, id));
             }
-            let obj = self.world.get_mut(id).expect("checked above");
-            obj.commands.remove(0);
-            if let (Some(t), true) = (cmd.target, cmd.name.starts_with("CommandMoveToObject")) {
-                if let Some(p) = self.world.get(t).map(|o| (o.position, o.area)) {
-                    let obj = self.world.get_mut(id).expect("checked above");
+        }
+        best
+    }
+
+    /// Completes an object's front command: applies its movement and tells the object.
+    fn finish_command(&mut self, id: ObjectId) {
+        let Some(cmd) = self.world.get_mut(id).and_then(|o| {
+            if o.commands.is_empty() {
+                None
+            } else {
+                Some(o.commands.remove(0))
+            }
+        }) else {
+            return;
+        };
+        if let (Some(t), true) = (cmd.target, cmd.name.starts_with("CommandMoveToObject")) {
+            if let Some(p) = self.world.get(t).map(|o| (o.position, o.area)) {
+                if let Some(obj) = self.world.get_mut(id) {
                     obj.position = p.0;
                     obj.area = p.1;
                 }
             }
-            if let Some(l) = cmd.location {
-                let obj = self.world.get_mut(id).expect("checked above");
+        }
+        if let Some(l) = cmd.location {
+            if let Some(obj) = self.world.get_mut(id) {
                 obj.position = l.position;
                 obj.area = Some(l.area);
                 obj.facing = l.facing;
             }
-            self.world.trace.push(TraceEntry::Command {
-                t: self.world.time_ms,
-                object: id,
-                command: cmd.name.clone(),
-                status: "complete".into(),
-            });
-            let mut ev = self.new_event("COMMAND_COMPLETE", Some(id));
-            ev.ints = vec![cmd.ty, 1];
-            self.world.queue_event(0, id, ev, None);
-            any = true;
         }
-        any
+        self.world.trace.push(TraceEntry::Command {
+            t: self.world.time_ms,
+            object: id,
+            command: cmd.name.clone(),
+            status: "complete".into(),
+        });
+        let mut ev = self.new_event("COMMAND_COMPLETE", Some(id));
+        ev.ints = vec![cmd.ty, 1];
+        self.world.queue_event(0, id, ev, None);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1122,6 +1189,42 @@ mod tests {
         assert_eq!(s.world.area, Some(area));
         assert!(s.world.get(thing).unwrap().active);
         assert!(s.world.transition.is_none());
+    }
+
+    #[test]
+    fn commands_take_time() {
+        let mut s = sim();
+        let id = s.world.spawn(ObjectKind::Creature, "c");
+        let cmd = |name: &str, seconds: f32| Command {
+            ty: 0,
+            name: name.into(),
+            target: None,
+            location: None,
+            seconds,
+            ints: Vec::new(),
+            strings: Vec::new(),
+            due: None,
+        };
+        let o = s.world.get_mut(id).unwrap();
+        o.commands.push(cmd("CommandPlayAnimation", 0.0));
+        o.commands.push(cmd("CommandWait", 2.0));
+        s.tick(100);
+        assert_eq!(s.world.get(id).unwrap().commands.len(), 2);
+        s.tick(400);
+        assert_eq!(s.world.get(id).unwrap().commands.len(), 1);
+        s.tick(1999);
+        assert_eq!(s.world.get(id).unwrap().commands.len(), 1);
+        s.tick(1);
+        assert!(s.world.get(id).unwrap().commands.is_empty());
+        assert_eq!(s.world.time_ms, 2500);
+    }
+
+    #[test]
+    fn handles_are_freed_after_a_top_level_run() {
+        let mut s = sim();
+        let id = s.world.spawn(ObjectKind::Creature, "c");
+        s.run_script("counter", id, Some(Event::default()));
+        assert!(s.world.handles.is_empty());
     }
 
     #[test]

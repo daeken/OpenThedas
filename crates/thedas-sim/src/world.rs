@@ -173,6 +173,9 @@ pub struct Command {
     pub seconds: f32,
     pub ints: Vec<i32>,
     pub strings: Vec<String>,
+    /// When the command finishes, set when it reaches the front of the queue.
+    #[serde(default)]
+    pub due: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

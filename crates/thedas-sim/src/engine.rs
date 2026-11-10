@@ -405,7 +405,7 @@ pub fn call(
         }
         "IsDead" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.dead))),
         "IsImmortal" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.immortal))),
-        "SetImmortal" => {
+        "SetImmortal" | "Engine_SetImmortal" => {
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
                 o.immortal = int(a, 1) != 0;
             }
@@ -1056,6 +1056,7 @@ pub fn call(
                 seconds: 0.0,
                 ints: Vec::new(),
                 strings: Vec::new(),
+                due: None,
             };
             for (p, v) in f.params.iter().zip(a) {
                 match (&p.ty, v) {
@@ -1140,6 +1141,170 @@ pub fn call(
             }
             h.sim.world.transition = Some((area, string(a, 1)));
             ok(Value::Int(1))
+        }
+        "GetPackageAI" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .and_then(|o| o.fields.get("PackageAI").copied())
+                .unwrap_or(0),
+        )),
+        "SetEventScript" => {
+            let script = string(a, 1).trim_end_matches(".ncs").to_string();
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.script = (!script.is_empty()).then_some(script);
+            }
+            void()
+        }
+        "IntToHexString" => ok(Value::String(format!("0x{:08x}", int(a, 0)))),
+        "GetPlotSummary" => ok(Value::String(String::new())),
+        "GetItemPossessedBy" => {
+            let tag = string(a, 1);
+            let item = h
+                .object(obj(a, 0))
+                .map(|o| o.inventory.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .find(|i| {
+                    h.object(*i)
+                        .is_some_and(|x| x.tag.eq_ignore_ascii_case(&tag))
+                });
+            ok(Value::Object(item.unwrap_or(OBJECT_INVALID)))
+        }
+        // Followers: ACTIVE and LOCKEDACTIVE put a creature in the active party (the hero's
+        // followers); any other state takes it out. Provisional: the party pool is not
+        // modelled apart from the active party.
+        "GetFollowerState" | "GetFollowerSubState" => {
+            let field = if name == "GetFollowerState" {
+                "FollowerState"
+            } else {
+                "FollowerSubState"
+            };
+            ok(Value::Int(
+                h.object(obj(a, 0))
+                    .and_then(|o| o.fields.get(field).copied())
+                    .unwrap_or(0),
+            ))
+        }
+        "SetFollowerState" => {
+            let (who, state) = (obj(a, 0), int(a, 1));
+            let active = state == constant(&h.sim.table, "FOLLOWER_STATE_ACTIVE")
+                || state == constant(&h.sim.table, "FOLLOWER_STATE_LOCKEDACTIVE");
+            if let Some(o) = h.sim.world.get_mut(who) {
+                o.fields.insert("FollowerState".into(), state);
+            }
+            if let Some(hero) = h.sim.world.hero.filter(|&x| x != who) {
+                if let Some(ho) = h.sim.world.get_mut(hero) {
+                    ho.followers.retain(|&f| f != who);
+                    if active {
+                        ho.followers.push(who);
+                    }
+                }
+            }
+            void()
+        }
+        "AdjustFollowerApproval" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                *o.fields.entry("Approval".into()).or_default() += int(a, 1);
+            }
+            void()
+        }
+        "SetFollowerApprovalDescription" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields.insert("ApprovalDescription".into(), int(a, 1));
+            }
+            void()
+        }
+        // Heartbeats: EVENT_TYPE_HEARTBEAT2 every interval until EndHeartbeat.
+        "InitHeartbeat" => {
+            let who = obj(a, 0);
+            let ms = ((float(a, 1).max(0.1)) * 1000.0) as i32;
+            if let Some(o) = h.sim.world.get_mut(who) {
+                o.fields.insert("HeartbeatMs".into(), ms);
+            }
+            let ev = h.sim.new_event("HEARTBEAT2", Some(who));
+            h.sim.world.queue_event(ms as u64, who, ev, None);
+            void()
+        }
+        "EndHeartbeat" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields.remove("HeartbeatMs");
+            }
+            void()
+        }
+        "SetMaxHealth" => {
+            // PROPERTY_DEPLETABLE_HEALTH: base is the maximum, current is clamped to it.
+            let health = constant(&h.sim.table, "PROPERTY_DEPLETABLE_HEALTH");
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                let max = int(a, 1) as f32;
+                let e = o.properties.entry(health).or_insert((max, max));
+                e.0 = max;
+                if e.1 <= 0.0 || e.1 > max {
+                    e.1 = max;
+                }
+            }
+            void()
+        }
+        // No ambient (bark) conversations are simulated.
+        "DialogIsAmbient" => ok(Value::Int(0)),
+        "ClearAmbientDialogs" => ok(Value::Int(0)),
+        "SetFollowPartyLeader" | "SetTacticPresetID" => {
+            let field = if name == "SetFollowPartyLeader" {
+                "FollowPartyLeader"
+            } else {
+                "TacticPreset"
+            };
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields.insert(field.to_string(), int(a, 1));
+            }
+            void()
+        }
+        "AddTacticPresetID" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                let n = o.fields.get("TacticPresetCount").copied().unwrap_or(0);
+                o.fields.insert(format!("TacticPreset.{n}"), int(a, 1));
+                o.fields.insert("TacticPresetCount".into(), n + 1);
+            }
+            void()
+        }
+        "GetOrientation" => ok(Value::Vector([
+            0.0,
+            0.0,
+            h.object(obj(a, 0)).map_or(0.0, |o| o.facing),
+        ])),
+        "SetOrientation" => {
+            let v = vector(a, 1);
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.facing = v[2];
+            }
+            void()
+        }
+        "GetItemsInInventory" => {
+            let tag = string(a, 3);
+            let items: Vec<ObjectId> = h
+                .object(obj(a, 0))
+                .map(|o| o.inventory.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|i| {
+                    tag.is_empty()
+                        || h.object(*i)
+                            .is_some_and(|x| x.tag.eq_ignore_ascii_case(&tag))
+                })
+                .collect();
+            ok(objects(items))
+        }
+        // Presentation and platform services with no simulation state.
+        "DoAutoSave"
+        | "TakeScreenshot"
+        | "RevealCurrentMap"
+        | "SetWorldMapPrimary"
+        | "SetTacticEntry"
+        | "SetCreatureGoreLevel" => {
+            h.sim.world.trace.push(TraceEntry::Log {
+                t,
+                channel: -3,
+                text: format!("{name} (no effect in the simulation)"),
+            });
+            void()
         }
         "LoadCutscene" => {
             h.sim.world.cutscenes.push(string(a, 0));
@@ -1256,7 +1421,59 @@ pub fn call(
                 })
                 .unwrap_or(0),
         )),
-        "SetGroupHostility" | "SetNumTactics" | "SetStoryPlot" => {
+        "GetTeam" => {
+            let (team, mask) = (int(a, 0), int(a, 1));
+            let mask = if mask == 0 { 32 } else { mask };
+            let v: Vec<ObjectId> = h
+                .sim
+                .world
+                .objects
+                .values()
+                .filter(|o| o.team == team && o.kind.script_type() & mask != 0)
+                .map(|o| o.id)
+                .collect();
+            ok(objects(v))
+        }
+        "GetPlaceableState" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .and_then(|o| o.fields.get("State").copied())
+                .unwrap_or(0),
+        )),
+        "SetNumTactics" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields.insert("NumTactics".into(), int(a, 1));
+            }
+            void()
+        }
+        "GetNumTactics" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .and_then(|o| o.fields.get("NumTactics").copied())
+                .unwrap_or(0),
+        )),
+        "SetPlaceableState" | "SetPlotGiver" | "SetAutoLevelUp" | "SetFollowerApprovalEnabled" => {
+            let field = match name {
+                "SetPlaceableState" => "State",
+                "SetPlotGiver" => "PlotGiver",
+                "SetAutoLevelUp" => "AutoLevelUp",
+                _ => "ApprovalEnabled",
+            };
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields.insert(field.to_string(), int(a, 1));
+            }
+            void()
+        }
+        "IsAbilityAvailable" => ok(b(h
+            .object(obj(a, 0))
+            .is_some_and(|o| o.abilities.contains(&int(a, 1))))),
+        "LogStoryEvent" | "LoadItemsFromTemplate" => {
+            h.sim.world.trace.push(TraceEntry::Log {
+                t,
+                channel: -3,
+                text: format!("{name}{:?} (no effect in the simulation)", a),
+            });
+            void()
+        }
+        "SetGroupHostility" | "SetStoryPlot" => {
             // State the simulation does not use yet; recorded for the trace.
             h.sim.world.trace.push(TraceEntry::Log {
                 t,
@@ -1270,7 +1487,7 @@ pub fn call(
         "GetCombatState" => ok(Value::Int(0)),
         "GetAttackTarget" => ok(Value::Object(OBJECT_INVALID)),
         "IsObjectHostile" => ok(b(false)),
-        "GetFollowerState" => ok(Value::Int(0)),
+        "IsPartyPerceivingHostiles" => ok(b(false)),
         _ => None,
     }
 }
