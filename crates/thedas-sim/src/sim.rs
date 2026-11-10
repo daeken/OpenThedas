@@ -152,6 +152,29 @@ fn along(from: [f32; 3], points: &[[f32; 3]], f: f32) -> [f32; 3] {
     last
 }
 
+/// The horizontal direction of the leg of the route from `from` through `points` that a
+/// mover a share `f` of the way along it is on (the first leg at the start); `None` where
+/// the legs have no horizontal length.
+fn direction_along(from: [f32; 3], points: &[[f32; 3]], f: f32) -> Option<(f32, f32)> {
+    let total = path_length(from, points);
+    let mut left = total * f.clamp(0.0, 1.0);
+    let mut prev = from;
+    let mut dir = None;
+    for &p in points {
+        let (dx, dy) = (p[0] - prev[0], p[1] - prev[1]);
+        if dx * dx + dy * dy > 1e-8 {
+            dir = Some((dx, dy));
+        }
+        let d = crate::engine::dist(prev, p);
+        if left < d && dir.is_some() {
+            return dir;
+        }
+        left -= d;
+        prev = p;
+    }
+    dir
+}
+
 /// Where an attacker goes before its attack starts (see `Sim::approach_point`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Approach {
@@ -1229,8 +1252,13 @@ impl Sim {
             }
             let f = (now.saturating_sub(t0) as f32 / (due - t0) as f32).clamp(0.0, 1.0);
             let p = along(from, &points, f);
+            // A mover faces the way it goes, leg by leg.
+            let dir = direction_along(from, &points, f);
             if let Some(o) = self.world.get_mut(id) {
                 o.position = p;
+                if let Some((dx, dy)) = dir {
+                    o.facing = crate::world::facing_toward(dx, dy);
+                }
             }
         }
     }
@@ -2929,6 +2957,45 @@ mod tests {
         s.tick(8000);
         assert_eq!(s.world.get(id).unwrap().position, [50.0, 0.0, 0.0]);
         assert!(s.world.get(id).unwrap().commands.is_empty());
+    }
+
+    #[test]
+    fn walkers_face_the_way_they_go() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let walker = s.world.spawn(ObjectKind::Creature, "w");
+        // Each way: the facing taken while walking looks along it (heading_of the facing).
+        for (dx, dy) in [
+            (1.0, 0.0),
+            (0.0, 1.0),
+            (-1.0, 0.0),
+            (0.0, -1.0),
+            (1.0, 1.0),
+            (-1.0, 1.0),
+            (-1.0, -1.0),
+            (1.0, -1.0),
+        ] {
+            let o = s.world.get_mut(walker).unwrap();
+            o.area = Some(area);
+            o.position = [0.0; 3];
+            // Facing somewhere else to start with.
+            o.facing = crate::world::facing_toward(-dy, dx);
+            s.order_move(walker, [dx * 20.0, dy * 20.0, 0.0]);
+            s.tick(500);
+            let o = s.world.get(walker).unwrap();
+            assert!(o.position[0] * dx >= 0.0 && o.position[1] * dy >= 0.0);
+            let h = crate::world::heading_of(o.facing).to_radians();
+            let want = dy.atan2(dx);
+            let off = (h - want).sin().abs() + (1.0 - (h - want).cos());
+            assert!(off < 1e-3, "walking ({dx}, {dy}): facing {}", o.facing);
+        }
+        // Along a route, the leg it is on: east, then north.
+        let points = [[10.0, 0.0, 0.0], [10.0, 10.0, 0.0]];
+        assert_eq!(direction_along([0.0; 3], &points, 0.0), Some((10.0, 0.0)));
+        assert_eq!(direction_along([0.0; 3], &points, 0.25), Some((10.0, 0.0)));
+        assert_eq!(direction_along([0.0; 3], &points, 0.75), Some((0.0, 10.0)));
+        assert_eq!(direction_along([0.0; 3], &points, 1.0), Some((0.0, 10.0)));
+        assert_eq!(direction_along([0.0; 3], &[[0.0, 0.0, 5.0]], 0.5), None);
     }
 
     #[test]
