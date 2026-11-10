@@ -257,7 +257,7 @@ pub fn static1_filter() -> ShaderFilter {
 /// characters (`Char1`), hair (`Hair0_Pass1`, `Hair0`: four passes), faces (`Face1`), eyes
 /// and lashes (`Eye0`), cloth (`Cloth1`), props (`Prop1`) and weapons (`Weapon1`), with any
 /// pixel shader; and exterior terrain (`Terrain2`, terrain.mat's pass above Low detail, and
-/// `Terrain3`, its Low detail pass); and the sky dome (`Sky`).
+/// `Terrain3`, its Low detail pass); and the sky's dome and clouds (`Sky`, `Clouds`).
 pub fn object_filter() -> ShaderFilter {
     let mut v = static1_filter().unwrap_or_default();
     for vs in OBJECT_VERTEX_SHADERS {
@@ -267,7 +267,7 @@ pub fn object_filter() -> ShaderFilter {
 }
 
 /// See [`object_filter`].
-pub const OBJECT_VERTEX_SHADERS: [&str; 11] = [
+pub const OBJECT_VERTEX_SHADERS: [&str; 12] = [
     "Char1.vsh",
     "Hair0_Pass1.vsh",
     "Hair0.vsh",
@@ -279,6 +279,7 @@ pub const OBJECT_VERTEX_SHADERS: [&str; 11] = [
     "Terrain2.vsh",
     "Terrain3.vsh",
     "Sky.vsh",
+    "Clouds.vsh",
 ];
 
 /// Point lights chosen for one draw, in slot order A, B, C.
@@ -349,6 +350,8 @@ pub struct ConstantContext<'a> {
     pub fog: [[f32; 4]; 2],
     /// The level's sky registers (`SkyParameters`), when it has an atmosphere.
     pub sky: Option<&'a [[f32; 4]; 9]>,
+    /// The level's cloud registers (`CloudParameters`).
+    pub clouds: [[f32; 4]; 2],
 }
 
 /// Light from every direction for draws in a level with no irradiance probe. Provisional.
@@ -507,6 +510,7 @@ impl ConstantContext<'_> {
                 Value::Vectors(self.sky.map(|s| s.to_vec()).unwrap_or_default())
             }
             ("ApplicationTime", _) => Value::Vectors(vec![[0.0; 4]]),
+            ("CloudParameters", _) => Value::Vectors(self.clouds.to_vec()),
             ("ShadowData", _) | ("IrradianceParams", _) => Value::Vectors(Vec::new()),
             (_, "mml_vLightmapOffsetAndScale") if self.lightmap.is_some() => {
                 let l = self.lightmap?;
@@ -747,6 +751,7 @@ mod tests {
             sun: Some((Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.6, 0.5, 0.3))),
             fog: crate::atmosphere::fog_params(None),
             sky: None,
+            clouds: crate::atmosphere::cloud_params(None),
         };
         let t = table(vec![
             constant(
@@ -862,6 +867,7 @@ mod tests {
             sun: None,
             fog: crate::atmosphere::fog_params(None),
             sky: None,
+            clouds: crate::atmosphere::cloud_params(None),
         };
         let c = cc.fill(Some(&table(vec![constant(
             "mml_vTintColor",
@@ -914,6 +920,7 @@ mod tests {
                 sun: None,
                 fog: crate::atmosphere::fog_params(None),
                 sky: None,
+                clouds: crate::atmosphere::cloud_params(None),
             };
             let c = cc.fill(Some(&table(vec![constant(
                 "aur_mWorld",

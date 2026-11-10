@@ -102,6 +102,7 @@ pub(crate) struct D3dPass {
     sun: Option<(Vec3, Vec3)>,
     fog: [[f32; 4]; 2],
     sky: Option<[[f32; 4]; 9]>,
+    clouds: [[f32; 4]; 2],
     pub programs: Vec<String>,
 }
 
@@ -694,7 +695,11 @@ impl D3dPass {
             ambients: scene.draws.iter().map(|d| ambient(&d.room)).collect(),
             sun: scene.sun,
             fog: crate::atmosphere::fog_params(scene.atmosphere.as_ref()),
-            sky: scene.atmosphere.as_ref().map(crate::atmosphere::sky_params),
+            sky: scene
+                .atmosphere
+                .as_ref()
+                .map(|a| crate::atmosphere::sky_params(a, scene.clouds.as_ref())),
+            clouds: crate::atmosphere::cloud_params(scene.clouds.as_ref()),
             programs,
         }
     }
@@ -754,6 +759,7 @@ impl D3dPass {
                 sun: self.sun,
                 fog: self.fog,
                 sky: self.sky.as_ref(),
+                clouds: self.clouds,
             };
             put(&mut data, d.slot, &cc.fill(program.vs.ctab.as_ref()), 0);
             put(&mut data, d.slot, &cc.fill(program.ps.ctab.as_ref()), 3);
