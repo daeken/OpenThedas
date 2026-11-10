@@ -8,6 +8,9 @@
 //!   [`PERCEPTION_RANGE`] and get `EVENT_TYPE_PERCEPTION_APPEAR` (object 0 is the creature
 //!   seen; integers are hostility changed, stealthed, hostile) and `PERCEPTION_DISAPPEAR`
 //!   when it leaves the range.
+//! - **Game mode.** The party seeing living hostiles switches `GM_EXPLORE` to `GM_COMBAT`
+//!   and back, with `GAMEMODE_CHANGE` to the module; the scripts end combat (and get fallen
+//!   party members up) on the change back.
 //! - **Hostility.** Creatures are hostile when their groups are set hostile with
 //!   `SetGroupHostility`.
 //! - **Attacks.** When a `CommandAttack` reaches the front of the queue, its owner gets
@@ -18,6 +21,8 @@
 //! - **Effects.** `ApplyEffectOnObject` runs the target's `EVENT_TYPE_APPLY_EFFECT` handler at
 //!   once, with `GetCurrentEffect` returning the effect. Unless the handler calls
 //!   `SetIsCurrentEffectValid(FALSE)`, an effect with a duration stays on the target.
+//! - **Resurrection.** An accepted `EFFECT_TYPE_RESURRECTION` brings the target back; its
+//!   handler restores health.
 //! - **Death.** An `EFFECT_TYPE_DEATH` that its handler accepts kills the target (the rules
 //!   scripts turn a lethal hit into one). A creature whose current health (`PROPERTY_DEPLETABLE_HEALTH`) drops to zero
 //!   or below and is neither immortal nor plot dies and gets `EVENT_TYPE_DEATH`, with the
@@ -37,6 +42,9 @@ pub const PERCEPTION_RANGE: f32 = 20.0;
 
 /// `EFFECT_TYPE_DEATH` in effects.gda.
 pub const EFFECT_TYPE_DEATH: i32 = 7;
+
+/// `EFFECT_TYPE_RESURRECTION` in effects.gda.
+pub const EFFECT_TYPE_RESURRECTION: i32 = 1005;
 
 /// How long an attack takes when the script does not say (`SetAttackDuration`). Provisional.
 pub const DEFAULT_ATTACK_MS: u64 = 1500;
@@ -136,6 +144,41 @@ impl Sim {
                 obj.combat.perceived = now;
             }
         }
+        self.update_game_mode();
+    }
+
+    /// Switches between `GM_EXPLORE` and `GM_COMBAT` as the party starts or stops seeing
+    /// living hostiles, telling the module (`GAMEMODE_CHANGE`: new mode, old mode). Other
+    /// modes (conversation, cutscene) are left alone. Provisional.
+    pub fn update_game_mode(&mut self) {
+        let (explore, combat) = (
+            constant_of(self, "GM_EXPLORE"),
+            constant_of(self, "GM_COMBAT"),
+        );
+        let mode = self.world.game_mode;
+        if mode != explore && mode != combat {
+            return;
+        }
+        let party = crate::engine::party_of(self);
+        let fighting = party.iter().any(|&m| {
+            self.alive(m)
+                && self.world.get(m).is_some_and(|o| {
+                    o.combat
+                        .perceived
+                        .iter()
+                        .any(|&p| self.alive(p) && self.hostile(m, p))
+                })
+        });
+        let new = if fighting { combat } else { explore };
+        if new == mode || explore == combat {
+            return;
+        }
+        self.world.game_mode = new;
+        if let Some(m) = self.world.module {
+            let mut ev = self.new_event("GAMEMODE_CHANGE", Some(m));
+            ev.ints = vec![new, mode];
+            self.world.queue_event(0, m, ev, None);
+        }
     }
 
     /// Queues `PERCEPTION_APPEAR` (or `DISAPPEAR`) for `who` about `seen`.
@@ -178,6 +221,12 @@ impl Sim {
             std::mem::replace(&mut self.current_effect, saved).unwrap_or((effect, true));
         // A lethal hit arrives as EFFECT_TYPE_DEATH (7 in effects.gda) rather than as damage
         // that empties the health bar: the engine does the killing.
+        if valid && effect.ty == EFFECT_TYPE_RESURRECTION {
+            if let Some(o) = self.world.get_mut(target) {
+                o.dead = false;
+            }
+            return;
+        }
         if valid && effect.ty == EFFECT_TYPE_DEATH {
             self.kill(target, creator.unwrap_or(OBJECT_INVALID));
             return;
@@ -308,11 +357,55 @@ mod tests {
     const LDF: &str = "int EVENT_TYPE_PERCEPTION_APPEAR = 25;\n\
         int EVENT_TYPE_PERCEPTION_DISAPPEAR = 26;\n\
         int EVENT_TYPE_DEATH = 4;\n\
-        int PROPERTY_DEPLETABLE_HEALTH = 7;\n";
+        int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
+        int GM_EXPLORE = 0;\n\
+        int GM_COMBAT = 1;\n\
+        int EVENT_TYPE_GAMEMODE_CHANGE = 32;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         Sim::new(Arc::new(Vfs::new()), table, 3)
+    }
+
+    #[test]
+    fn seeing_hostiles_starts_combat_and_losing_them_ends_it() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let module = s.world.spawn(ObjectKind::Module, "m");
+        s.world.module = Some(module);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let foe = s.world.spawn(ObjectKind::Creature, "foe");
+        s.world.hero = Some(hero);
+        for (id, x, g) in [(hero, 0.0, 0), (foe, 5.0, 2)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = [x, 0.0, 0.0];
+            o.group = g;
+        }
+        s.world.hostility.insert((0, 2), true);
+        s.update_perception();
+        assert_eq!(s.world.game_mode, 1);
+        let modes: Vec<_> = s
+            .world
+            .queue
+            .values()
+            .filter(|q| q.target == module)
+            .map(|q| q.event.ints.clone())
+            .collect();
+        assert_eq!(modes, vec![vec![1, 0]]);
+        s.world.get_mut(foe).unwrap().dead = true;
+        s.update_perception();
+        assert_eq!(s.world.game_mode, 0);
+        // A resurrection effect brings the dead back.
+        s.world.get_mut(hero).unwrap().dead = true;
+        s.apply_effect(
+            hero,
+            Effect {
+                ty: EFFECT_TYPE_RESURRECTION,
+                ..Default::default()
+            },
+        );
+        assert!(!s.world.get(hero).unwrap().dead);
     }
 
     #[test]
