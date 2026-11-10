@@ -140,6 +140,10 @@ enum Command {
         /// Write the last run's full trace here (JSON lines).
         #[arg(long)]
         trace: Option<PathBuf>,
+        /// Add the runs' coverage counters (unimplemented, stubbed and presentation-only
+        /// engine calls, missing 2DA tables and columns) to this JSON file.
+        #[arg(long)]
+        coverage: Option<PathBuf>,
         /// Write the last run's end state here.
         #[arg(long)]
         save_to: Option<PathBuf>,
@@ -299,6 +303,7 @@ fn run() -> Result<()> {
             pool_xp,
             fights,
             trace,
+            coverage,
             save_to,
         } => autoplay::run(&autoplay::Options {
             install: &install,
@@ -319,6 +324,7 @@ fn run() -> Result<()> {
             pool_xp,
             fights,
             trace_to: trace.as_deref(),
+            coverage_to: coverage.as_deref(),
             save_to: save_to.as_deref(),
         }),
         Command::Navgrid {

@@ -124,6 +124,15 @@ pub struct Trace {
     pub attacks: BTreeMap<ObjectId, AttackTally>,
     /// Health taken, per source and ability (kept even when entries are not).
     pub damage: BTreeMap<(ObjectId, i32), f32>,
+    /// Calls to engine functions the simulation answers with a fixed placeholder because it
+    /// lacks what they need (`engine::STUBS`), per function.
+    pub stubbed: BTreeMap<String, u64>,
+    /// Calls to presentation-only engine functions (no simulation effect by design), per
+    /// function.
+    pub presentation: BTreeMap<String, u64>,
+    /// 2DA lookups that found no such table or column (answered 0 or empty), by
+    /// `function: table / column`.
+    pub m2da_missing: BTreeMap<String, u64>,
     /// Keep full entries (otherwise only the counters are updated).
     pub keep: bool,
 }
@@ -165,6 +174,42 @@ impl Trace {
         }
     }
 
+    /// The coverage counters (unimplemented engine functions, placeholder stubs,
+    /// presentation-only calls, missing 2DA tables and columns) as JSON objects of counts.
+    pub fn coverage(&self) -> serde_json::Value {
+        serde_json::json!({
+            "unimplemented": self.unimplemented,
+            "stubbed": self.stubbed,
+            "presentation": self.presentation,
+            "m2da_missing": self.m2da_missing,
+        })
+    }
+
+    /// Adds this trace's coverage counters to those in a JSON file (created if missing), so
+    /// several runs or processes can be summed.
+    pub fn merge_coverage(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let mut total: serde_json::Value = std::fs::read(path)
+            .ok()
+            .and_then(|d| serde_json::from_slice(&d).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let mine = self.coverage();
+        if let (Some(t), Some(m)) = (total.as_object_mut(), mine.as_object()) {
+            for (kind, counts) in m {
+                let slot = t
+                    .entry(kind.clone())
+                    .or_insert_with(|| serde_json::json!({}));
+                if let (Some(slot), Some(counts)) = (slot.as_object_mut(), counts.as_object()) {
+                    for (k, v) in counts {
+                        let n = slot.get(k).and_then(|x| x.as_u64()).unwrap_or(0)
+                            + v.as_u64().unwrap_or(0);
+                        slot.insert(k.clone(), serde_json::json!(n));
+                    }
+                }
+            }
+        }
+        std::fs::write(path, serde_json::to_vec_pretty(&total).unwrap_or_default())
+    }
+
     /// The trace as JSON lines.
     pub fn to_jsonl(&self) -> String {
         let mut out = String::new();
@@ -181,6 +226,21 @@ impl Trace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coverage_counts_add_up_across_files() {
+        let dir = std::env::temp_dir().join(format!("thedas-cov-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("cov.json");
+        let _ = std::fs::remove_file(&path);
+        let mut t = Trace::default();
+        t.stubbed.insert("GetStealthEnabled".into(), 3);
+        t.merge_coverage(&path).unwrap();
+        t.merge_coverage(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["stubbed"]["GetStealthEnabled"], 6);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn attacks_are_tallied_by_attacker_even_without_entries() {

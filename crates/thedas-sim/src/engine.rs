@@ -170,6 +170,24 @@ const PRESENTATION: &[&str] = &[
     "SetCreatureGoreLevel",
 ];
 
+/// Engine functions answered with a fixed placeholder because the simulation lacks what
+/// they need (stealth, ambient dialog, effect flags, pools, tactics item tags, ...). Calls to
+/// them are counted (`Trace::stubbed`) so coverage work can follow what the game uses.
+pub const STUBS: &[&str] = &[
+    "GetEffectsFlags",
+    "GetPlotSummary",
+    "DialogIsAmbient",
+    "ClearAmbientDialogs",
+    "CreatePool",
+    "GetStealthEnabled",
+    "SetAbilityResult",
+    "GetTacticCommandItemTag",
+    "GetAutoPauseCombatStatus",
+    "Engine_ApplyEffectAtLocation",
+    "RevealCurrentMap",
+    "LogStoryEvent",
+];
+
 /// Converts `CommandMoveToObject` to `COMMAND_TYPE_MOVE_TO_OBJECT`.
 fn command_constant(name: &str) -> String {
     let base = name.trim_start_matches("Command");
@@ -193,7 +211,21 @@ pub fn call(
 ) -> Option<VmResult<Option<Value>>> {
     let name = f.name.as_str();
     if PRESENTATION.contains(&name) {
+        *h.sim
+            .world
+            .trace
+            .presentation
+            .entry(name.to_string())
+            .or_default() += 1;
         return void();
+    }
+    if STUBS.contains(&name) {
+        *h.sim
+            .world
+            .trace
+            .stubbed
+            .entry(name.to_string())
+            .or_default() += 1;
     }
     let ty = h.sim.types;
     let t = h.sim.world.time_ms;
@@ -808,6 +840,27 @@ pub fn call(
             let c = table
                 .as_ref()
                 .and_then(|t| t.cell(&string(a, 1), int(a, 2) as i64));
+            // A missing table or column (not a missing row, which scripts probe for) is
+            // counted for coverage.
+            let missing = match &table {
+                None => Some(format!("table {} {}", int(a, 0), string(a, 3))),
+                Some(t)
+                    if !t
+                        .columns
+                        .contains_key(&thedas_formats::gda::column_hash(&string(a, 1))) =>
+                {
+                    Some(format!(
+                        "table {} {} column {}",
+                        int(a, 0),
+                        string(a, 3),
+                        string(a, 1)
+                    ))
+                }
+                _ => None,
+            };
+            if let Some(m) = missing {
+                *h.sim.world.trace.m2da_missing.entry(m).or_default() += 1;
+            }
             ok(match name {
                 "GetM2DAInt" => Value::Int(cell_int(c)),
                 "GetM2DAFloat" => Value::Float(cell_float(c)),
