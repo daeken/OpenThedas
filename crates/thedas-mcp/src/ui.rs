@@ -196,7 +196,7 @@ impl UiWorld {
             return;
         };
         // Bound once: messages handled during these frames update the values themselves.
-        stage.bridge.set_values(values.iter().cloned());
+        stage.bridge.bind(values.iter().cloned());
         for _ in 0..frames.max(1) {
             self.messages.extend(stage.tick(1000.0 / 30.0));
         }

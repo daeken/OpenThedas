@@ -37,10 +37,32 @@ fn name(sim: &Sim, id: u32) -> String {
         .unwrap_or_default()
 }
 
+/// The conversation on screen: one in progress, or one that ended on a line the player has
+/// not yet continued past (conversation.gfx shows it and sends `Conversation.SelectResponse
+/// 0` from its continue action).
+pub fn conversation(sim: &Sim) -> Option<thedas_sim::dialog::DialogState> {
+    sim.dialog_state()
+        .filter(|d| !d.ended || !d.line.is_empty())
+}
+
+/// The text the simulation gives a reply with no text of its own (a plain "continue").
+const CONTINUE_REPLY: &str = "[continue]";
+
+/// Whether the conversation on screen waits for the player to continue rather than pick a
+/// reply: no replies, or one with no text. conversation.gfx shows no reply buttons then and
+/// its continue action sends `Conversation.SelectResponse 0` (`HasResponses`).
+pub fn awaits_continue(sim: &Sim) -> bool {
+    conversation(sim).is_some_and(|d| match d.replies.as_slice() {
+        [] => true,
+        [(_, t)] => t == CONTINUE_REPLY || t.is_empty(),
+        _ => false,
+    })
+}
+
 /// `GM_DIALOG` (4) while a conversation is on screen, the world's game mode otherwise.
 /// Provisional: the simulation does not switch game modes for conversations itself.
 pub fn game_mode(sim: &Sim) -> i32 {
-    if sim.dialog_state().is_some_and(|d| !d.ended) {
+    if conversation(sim).is_some() {
         4
     } else {
         sim.world.game_mode
@@ -56,16 +78,24 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
     let members = party(sim);
     let hero = members.first().copied();
     set("Party.Hero.ID".into(), num(hero.unwrap_or(0)));
+    if let Some(h) = hero {
+        set(
+            crate::protocol::HERO_NAME.into(),
+            UiValue::String(name(sim, h)),
+        );
+    }
     set(
         "Party.SelectableMemberCount".into(),
         num(members.len() as f64),
     );
     set("Party.SelectedCount".into(), num(hero.is_some() as u8));
     set("Party.QuickbarLocked".into(), num(0));
+    // The member the player controls is the selected one (the hero until another is chosen).
+    let controlled = sim.world.controlled();
     for i in 0..4 {
         set(
             format!("Party.MemberSelected.{i}"),
-            num((i == 0 && hero.is_some()) as u8),
+            num((controlled.is_some() && members.get(i).copied() == controlled) as u8),
         );
     }
     let mut creature = |prefix: &str, id: u32| {
@@ -84,7 +114,7 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
         }
         v.insert(
             format!("{prefix}.UserSelected"),
-            num((Some(id) == sim.world.hero) as u8),
+            num((Some(id) == controlled) as u8),
         );
         let mana = o.properties.contains_key(&8);
         v.insert(format!("{prefix}.Stats.ClassHasMana"), num(mana as u8));
@@ -100,8 +130,8 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
     for (i, id) in members.iter().enumerate() {
         creature(&format!("Party.Members.{i}"), *id);
     }
-    if let Some(h) = hero {
-        creature("GUI.SelectedChar", h);
+    if let Some(c) = controlled.or(hero) {
+        creature("GUI.SelectedChar", c);
     }
     // The creature in character generation or level-up, as levelup.gfx reads it: its
     // attributes and points (34 attribute, 35 skill, 36 talent, 38 specialization), with
@@ -137,17 +167,21 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
         num(game_mode(sim)),
     );
     // The conversation in progress, as conversation.gfx reads it: the NPC line, the
-    // responses (`Responses.N.Text`, counted with GetNumMembers) and a ready flag.
-    if let Some(d) = sim.dialog_state().filter(|d| !d.ended) {
+    // responses (`Responses.N.Text`, counted with GetNumMembers) and a ready flag. The movie
+    // shows the responses when the flag turns 1; here the line has always played (a player
+    // that times lines, as thedas-app does, holds it at 0 while each line plays).
+    if let Some(d) = conversation(sim) {
         set(
             "Conversation.NPCLine".into(),
             UiValue::String(d.line.clone()),
         );
         set("Conversation.Responses".into(), num(d.replies.len() as f64));
         for (i, (_, text)) in d.replies.iter().enumerate() {
+            // A reply without text reaches the movie empty, as the game's would.
+            let text = if text == CONTINUE_REPLY { "" } else { text };
             set(
                 format!("Conversation.Responses.{i}.Text"),
-                UiValue::String(text.clone()),
+                UiValue::String(text.to_string()),
             );
             set(format!("Conversation.Responses.{i}.Icon"), num(0));
         }

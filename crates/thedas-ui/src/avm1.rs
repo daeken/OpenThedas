@@ -10,9 +10,23 @@
 //!   fscommand handler cannot touch the movie, so each such function is wrapped: the original
 //!   sends the fscommand (the host computes and keeps the answer), then the wrapper returns
 //!   `ExternalInterface.call(RETVAL_CALL)`.
+//! - Flash Player (and Ruffle after it) hands an empty string passed through
+//!   `ExternalInterface` to an SWF older than version 9 as `"null"`; Scaleform passed the
+//!   game's values directly, and the movies test for empty text (conversation.gfx's
+//!   continue-only reply). The host sends empty strings as [`EMPTY`], and every way a value
+//!   comes in (`GetValue`, `GetString`, wrapped fscommands, [`INVOKE_CALLBACK`] arguments)
+//!   turns it back into `""`.
 
 /// The callback name the injected code registers.
 pub const INVOKE_CALLBACK: &str = "thedas_invoke";
+
+/// An empty string on its way into a movie (a zero-width space, which Flash's empty-string
+/// conversion leaves alone); the injected code turns it back into `""`.
+pub const EMPTY: &str = "\u{200B}";
+
+/// `ExternalCommands` functions returning an engine value straight from
+/// `ExternalInterface.call`; wrapped to turn [`EMPTY`] back into `""`.
+pub const VALUE_GETTERS: &[&str] = &["GetValue", "GetString"];
 
 /// The function the host calls once, after starting a movie, to wrap [`PRE_CALLS`] (the
 /// movies define those classes after the first frame's actions run).
@@ -71,6 +85,14 @@ pub struct PreCall {
 }
 
 const SET_MEMBER: u8 = 0x4f;
+const SET_VARIABLE: u8 = 0x1d;
+const DEFINE_LOCAL: u8 = 0x3c;
+const STRICT_EQUALS: u8 = 0x66;
+const NOT: u8 = 0x12;
+const LESS2: u8 = 0x48;
+const INCREMENT: u8 = 0x50;
+const IF: u8 = 0x9d;
+const JUMP: u8 = 0x99;
 
 const GET_VARIABLE: u8 = 0x1c;
 const GET_MEMBER: u8 = 0x4e;
@@ -112,8 +134,38 @@ fn function(params: &[&str], body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A jump record (`If` or `Jump`) by `offset` bytes from its end.
+fn branch(out: &mut Vec<u8>, code: u8, offset: usize, back: bool) {
+    let o = offset as i16;
+    record(out, code, &(if back { -o } else { o }).to_le_bytes());
+}
+
+/// Calls `_global.thedas_unempty` on the value on top of the stack.
+fn unempty_top(out: &mut Vec<u8>) {
+    push(out, &[Push::Int(1)]);
+    get_path(out, &["_global"]);
+    push(out, &[Push::Str("thedas_unempty")]);
+    out.push(CALL_METHOD);
+}
+
+/// `function (v) { if (v === EMPTY) return ""; return v; }`
+fn unempty_function() -> Vec<u8> {
+    let mut then = Vec::new();
+    push(&mut then, &[Push::Str("")]);
+    then.push(RETURN);
+    let mut body = Vec::new();
+    get_path(&mut body, &["v"]);
+    push(&mut body, &[Push::Str(EMPTY)]);
+    body.extend_from_slice(&[STRICT_EQUALS, NOT]);
+    branch(&mut body, IF, then.len(), false);
+    body.extend(then);
+    get_path(&mut body, &["v"]);
+    body.push(RETURN);
+    function(&["v"], &body)
+}
+
 /// `function (o) { return function () { o.apply(_global.ExternalCommands, arguments);
-/// return flash.external.ExternalInterface.call(RETVAL_CALL); }; }`
+/// return _global.thedas_unempty(flash.external.ExternalInterface.call(RETVAL_CALL)); }; }`
 fn wrap_maker() -> Vec<u8> {
     let mut inner = Vec::new();
     get_path(&mut inner, &["arguments"]);
@@ -125,7 +177,26 @@ fn wrap_maker() -> Vec<u8> {
     push(&mut inner, &[Push::Str(RETVAL_CALL), Push::Int(1)]);
     get_path(&mut inner, &["flash", "external", "ExternalInterface"]);
     push(&mut inner, &[Push::Str("call")]);
-    inner.extend_from_slice(&[CALL_METHOD, RETURN]);
+    inner.push(CALL_METHOD);
+    unempty_top(&mut inner);
+    inner.push(RETURN);
+    let mut outer = function(&[], &inner);
+    outer.push(RETURN);
+    function(&["o"], &outer)
+}
+
+/// `function (o) { return function () {
+/// return _global.thedas_unempty(o.apply(_global.ExternalCommands, arguments)); }; }`
+fn getter_wrap_maker() -> Vec<u8> {
+    let mut inner = Vec::new();
+    get_path(&mut inner, &["arguments"]);
+    get_path(&mut inner, &["_global", "ExternalCommands"]);
+    push(&mut inner, &[Push::Int(2)]);
+    get_path(&mut inner, &["o"]);
+    push(&mut inner, &[Push::Str("apply")]);
+    inner.push(CALL_METHOD);
+    unempty_top(&mut inner);
+    inner.push(RETURN);
     let mut outer = function(&[], &inner);
     outer.push(RETURN);
     function(&["o"], &outer)
@@ -182,13 +253,37 @@ fn push(out: &mut Vec<u8>, values: &[Push]) {
     record(out, PUSH, &b);
 }
 
-/// `function (p, m, a) { var o = eval(p); return o[m].apply(o, a); }`
+/// `function (p, m, a) { for (var i = 0; i < a.length; i++) a[i] = _global.thedas_unempty(a[i]);
+/// var o = eval(p); return o[m].apply(o, a); }`
 fn invoke_function() -> Vec<u8> {
     invoke_body()
 }
 
 fn invoke_body() -> Vec<u8> {
     let mut body = Vec::new();
+    push(&mut body, &[Push::Str("i"), Push::Int(0)]);
+    body.push(DEFINE_LOCAL);
+    let mut test = Vec::new();
+    get_path(&mut test, &["i"]);
+    get_path(&mut test, &["a", "length"]);
+    test.extend_from_slice(&[LESS2, NOT]);
+    let mut step = Vec::new();
+    get_path(&mut step, &["a"]);
+    get_path(&mut step, &["i"]);
+    get_path(&mut step, &["a"]);
+    get_path(&mut step, &["i"]);
+    step.push(GET_MEMBER);
+    unempty_top(&mut step);
+    step.push(SET_MEMBER);
+    push(&mut step, &[Push::Str("i")]);
+    get_path(&mut step, &["i"]);
+    step.extend_from_slice(&[INCREMENT, SET_VARIABLE]);
+    // Each branch record is 5 bytes.
+    let back = test.len() + 5 + step.len() + 5;
+    body.extend_from_slice(&test);
+    branch(&mut body, IF, step.len() + 5, false);
+    body.extend(step);
+    branch(&mut body, JUMP, back, true);
     push(&mut body, &[Push::Str("a")]);
     body.push(GET_VARIABLE);
     push(&mut body, &[Push::Str("p")]);
@@ -207,11 +302,28 @@ fn invoke_body() -> Vec<u8> {
 /// wrapping [`RETURNING_FSCOMMANDS`].
 pub fn register_invoke() -> Vec<u8> {
     let mut out = Vec::new();
+    get_path(&mut out, &["_global"]);
+    push(&mut out, &[Push::Str("thedas_unempty")]);
+    out.extend(unempty_function());
+    out.push(SET_MEMBER);
     // _global.thedas_wrap = wrap_maker
     get_path(&mut out, &["_global"]);
     push(&mut out, &[Push::Str("thedas_wrap")]);
     out.extend(wrap_maker());
     out.push(SET_MEMBER);
+    get_path(&mut out, &["_global"]);
+    push(&mut out, &[Push::Str("thedas_getter_wrap")]);
+    out.extend(getter_wrap_maker());
+    out.push(SET_MEMBER);
+    for f in VALUE_GETTERS {
+        get_path(&mut out, &["_global", "ExternalCommands"]);
+        push(&mut out, &[Push::Str(f)]);
+        get_path(&mut out, &["_global", "ExternalCommands", f]);
+        push(&mut out, &[Push::Int(1)]);
+        get_path(&mut out, &["_global"]);
+        push(&mut out, &[Push::Str("thedas_getter_wrap")]);
+        out.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
+    }
     for f in RETURNING_FSCOMMANDS {
         // _global.ExternalCommands[f] = _global.thedas_wrap(_global.ExternalCommands[f])
         get_path(&mut out, &["_global", "ExternalCommands"]);
