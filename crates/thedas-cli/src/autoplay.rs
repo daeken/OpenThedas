@@ -3,7 +3,8 @@
 //!
 //! The player is simple and deterministic: it takes the first reply in conversations; the
 //! party fights under autopilot (party AI); when the hero is idle and hostiles are in view it
-//! attacks one (the same one until it falls); when none are in view it walks to the nearest
+//! attacks one (the same one until it falls), or with `--ai-hero` lets its own tactics choose
+//! (as the followers' do, abilities and potions included); when none are in view it walks to the nearest
 //! living hostile in the area; when the area holds none it uses a door to an area it has not
 //! been to (whose tag starts with `--exit-prefix`), levelling the party (the auto-level
 //! tables) first and at the start. It does not drink potions itself.
@@ -41,6 +42,9 @@ pub struct Options<'a> {
     /// Seconds after the mark at which survival is sampled.
     pub at: &'a [u64],
     pub verbose: bool,
+    /// The hero fights only through the party AI (autopilot, with its tactics), as the
+    /// followers do; the player just walks it towards enemies not yet seen.
+    pub ai_hero: bool,
     /// Write the last run's end state here (a save the MCP can load).
     pub save_to: Option<&'a Path>,
 }
@@ -194,6 +198,11 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
     let end;
     loop {
         let now = sim.world.time_ms;
+        let dead = sim.world.get(hero).is_none_or(|h| h.dead);
+        if dead && !was_dead {
+            deaths += 1;
+        }
+        was_dead = dead;
         if mark.is_none() && mark_flag.as_ref().is_some_and(|f| flag(sim, f)) {
             mark = Some(now);
         }
@@ -232,11 +241,6 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
             end = "wipe".to_string();
             break;
         }
-        let dead = sim.world.get(hero).is_none_or(|h| h.dead);
-        if dead && !was_dead {
-            deaths += 1;
-        }
-        was_dead = dead;
         if let Some(d) = sim.dialog_state().filter(|d| !d.ended) {
             let _ = d;
             sim.choose_reply(0);
@@ -260,7 +264,7 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
             .get(hero)
             .is_some_and(|h| h.commands.first().is_none_or(|c| c.name == "CommandWait"));
         if !hostiles.is_empty() {
-            if idle {
+            if idle && !o.ai_hero {
                 let t = target
                     .filter(|t| hostiles.contains(t))
                     .unwrap_or(hostiles[0]);

@@ -390,6 +390,7 @@ impl Sim {
         self.regenerate(elapsed);
         self.expire_effects();
         self.world.destroy_due();
+        self.autopilot_idle_hero();
     }
 
     /// Ends a cutscene the way the engine does when one finishes playing. Provisional, inferred
