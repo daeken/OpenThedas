@@ -46,7 +46,7 @@ pub const PERCEPTION_RANGE: f32 = 30.0;
 
 /// ranges.gda (M2DA 134): a creature's `PerceptionClass` is one of its rows
 /// (`PercepRngShrt` 8 .. `PercepRngLargeCreature` 15).
-const RANGES_TABLE: i32 = 134;
+pub(crate) const RANGES_TABLE: i32 = 134;
 /// ranges.gda rows for creatures whose template gives no `PerceptionClass`.
 const PERCEPTION_DEFAULT: i64 = 11;
 const PERCEPTION_PLAYER: i64 = 12;

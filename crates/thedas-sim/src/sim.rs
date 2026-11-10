@@ -1227,6 +1227,48 @@ impl Sim {
         }
     }
 
+    /// Where a caster goes before its ability can start: within the ability's range
+    /// (`Sim::ability_range`) of its target, or of the place it is aimed at, on the straight
+    /// line toward it. Provisional: the range is measured from the caster's centre to the
+    /// target's body (its centre plus its radius), and a cone aimed at a place (the place
+    /// only gives its direction) is used from where the caster stands.
+    fn ability_approach(&self, id: ObjectId, cmd: &Command) -> Approach {
+        let ability = cmd.ints.first().copied().unwrap_or(0);
+        let (Some(me), Some(range)) = (self.world.get(id), self.ability_range(ability)) else {
+            return Approach::InReach;
+        };
+        let (to, reach) = match cmd.target.filter(|&t| t != id && t != OBJECT_INVALID) {
+            Some(t) => match self.world.get(t) {
+                Some(o) if o.area == me.area => (o.position, range + self.body_radius(t)),
+                _ => return Approach::InReach,
+            },
+            None => match cmd.location {
+                Some(l)
+                    if Some(l.area) == me.area
+                        && !matches!(
+                            self.ability_area(ability),
+                            crate::quickbar::AbilityArea::Cone(..)
+                        ) =>
+                {
+                    (l.position, range)
+                }
+                _ => return Approach::InReach,
+            },
+        };
+        let a = me.position;
+        let d = crate::engine::dist(a, to);
+        if !d.is_finite() || d <= reach + 0.05 {
+            return Approach::InReach;
+        }
+        let f = (d - reach) / d;
+        let p = [
+            a[0] + (to[0] - a[0]) * f,
+            a[1] + (to[1] - a[1]) * f,
+            a[2] + (to[2] - a[2]) * f,
+        ];
+        Approach::Walk(d - reach, p)
+    }
+
     /// Drops an object's front command as failed: it hears `COMMAND_COMPLETE` with the
     /// result (a `COMMAND_FAILED_*` constant).
     /// Fails a move or approach whose way a closed door blocks
@@ -1286,8 +1328,14 @@ impl Sim {
                     // also set how long it takes.
                     // An attacker out of reach walks up first (the attack starts when it
                     // gets there).
-                    if cmd.name == "CommandAttack" {
-                        let (walk, stop, wait) = match self.approach_point(id, &cmd) {
+                    // So does a caster out of its ability's range.
+                    let approach = match cmd.name.as_str() {
+                        "CommandAttack" => Some(self.approach_point(id, &cmd)),
+                        "CommandUseAbility" => Some(self.ability_approach(id, &cmd)),
+                        _ => None,
+                    };
+                    if let Some(approach) = approach {
+                        let (walk, stop, wait) = match approach {
                             Approach::InReach => (None, None, false),
                             Approach::Walk(d, p) => (Some(d), Some(p), false),
                             Approach::WaitAt(d, p) => (Some(d), Some(p), true),
