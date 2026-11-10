@@ -74,6 +74,12 @@ pub enum TraceEntry {
         speaker: ObjectId,
         text: String,
     },
+    /// An effect took health.
+    Damage {
+        t: u64,
+        #[serde(flatten)]
+        loss: HealthLoss,
+    },
     /// An attack landed or missed: its `COMBAT_RESULT_*` (of the main hand) and the damage
     /// its impact effects carry.
     Attack {
@@ -83,6 +89,17 @@ pub enum TraceEntry {
         result: i32,
         damage: f32,
     },
+}
+
+/// Health an effect took from a creature: its creator, the ability it came from (0 for a
+/// weapon attack) and the effect's type. A killing blow counts the health that was left.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct HealthLoss {
+    pub source: ObjectId,
+    pub target: ObjectId,
+    pub ability: i32,
+    pub effect: i32,
+    pub amount: f32,
 }
 
 /// Attacks one creature made: swings, those that hit (hit, critical, deathblow or
@@ -105,6 +122,8 @@ pub struct Trace {
     pub scripts_run: u64,
     /// Attacks per attacker (kept even when entries are not).
     pub attacks: BTreeMap<ObjectId, AttackTally>,
+    /// Health taken, per source and ability (kept even when entries are not).
+    pub damage: BTreeMap<(ObjectId, i32), f32>,
     /// Keep full entries (otherwise only the counters are updated).
     pub keep: bool,
 }
@@ -116,6 +135,9 @@ impl Trace {
                 *self.unimplemented.entry(function.clone()).or_default() += 1;
             }
             TraceEntry::ScriptStart { .. } => self.scripts_run += 1,
+            TraceEntry::Damage { loss, .. } => {
+                *self.damage.entry((loss.source, loss.ability)).or_default() += loss.amount;
+            }
             TraceEntry::Attack {
                 attacker,
                 result,

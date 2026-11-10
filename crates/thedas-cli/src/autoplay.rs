@@ -50,6 +50,8 @@ pub struct Options<'a> {
     pub activity: bool,
     /// Followers waiting in the party pool get the hero's experience (provisional).
     pub pool_xp: bool,
+    /// Write the last run's full trace here (JSON lines).
+    pub trace_to: Option<&'a Path>,
     /// Write the last run's end state here (a save the MCP can load).
     pub save_to: Option<&'a Path>,
 }
@@ -82,6 +84,9 @@ struct Activity {
     fight_ms: u64,
     party: Side,
     foes: Side,
+    /// Health taken, by side ("party" or "others": foes and allies alike), the source's tag
+    /// and the ability (0 for weapon attacks).
+    sources: std::collections::BTreeMap<(&'static str, String, i32), f64>,
 }
 
 /// What a creature is doing: walking (a move, or an attack still closing in), attacking
@@ -267,6 +272,9 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
     let mut was_dead = sim.world.get(hero).is_some_and(|h| h.dead);
     level_party(sim, hero);
     sim.world.trace.attacks.clear();
+    sim.world.trace.keep = o.trace_to.is_some();
+    sim.world.trace.entries.clear();
+    sim.world.trace.damage.clear();
     let mut activity = Activity::default();
     // The states seen at the last step, credited with the time the step took.
     let mut seen: Option<(u64, Vec<usize>, Vec<usize>)> = None;
@@ -436,6 +444,18 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
                 side.hits += a.hits;
                 side.damage += a.damage as f64;
             }
+            for ((src, ability), amount) in &sim.world.trace.damage {
+                let side = if party_ids.contains(src) || Some(*src) == sim.world.hero {
+                    "party"
+                } else {
+                    "others"
+                };
+                let tag = sim
+                    .world
+                    .get(*src)
+                    .map_or_else(|| src.to_string(), |o| o.tag.clone());
+                *activity.sources.entry((side, tag, *ability)).or_default() += *amount as f64;
+            }
             activity
         },
         samples,
@@ -469,6 +489,10 @@ pub fn run(o: &Options) -> Result<()> {
             );
         }
         runs.push(r);
+    }
+    if let Some(p) = o.trace_to {
+        std::fs::write(p, sim.world.trace.to_jsonl())
+            .with_context(|| format!("writing {}", p.display()))?;
     }
     if let Some(p) = o.save_to {
         std::fs::write(p, sim.save_json()?).with_context(|| format!("writing {}", p.display()))?;
@@ -524,6 +548,23 @@ pub fn run(o: &Options) -> Result<()> {
                 100.0 * total.hits as f64 / (total.swings.max(1)) as f64,
                 total.damage / n
             );
+        }
+        let mut sources: std::collections::BTreeMap<(&str, String, i32), f64> =
+            std::collections::BTreeMap::new();
+        for r in &runs {
+            for (k, v) in &r.activity.sources {
+                *sources.entry(k.clone()).or_default() += v;
+            }
+        }
+        println!("health taken per run, by source (ability 0: weapon attacks):");
+        for side in ["others", "party"] {
+            let mut rows: Vec<_> = sources.iter().filter(|(k, _)| k.0 == side).collect();
+            rows.sort_by(|a, b| b.1.total_cmp(a.1));
+            let total: f64 = rows.iter().map(|r| r.1).sum();
+            println!("  by {side}: {:.0}", total / n);
+            for ((_, tag, ability), v) in rows.iter().take(8) {
+                println!("    {tag:<28} ability {ability:<6} {:>6.0}", *v / n);
+            }
         }
     }
     if !o.watch.is_empty() {

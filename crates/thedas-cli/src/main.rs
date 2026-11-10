@@ -134,6 +134,9 @@ enum Command {
         /// no script does it).
         #[arg(long)]
         pool_xp: bool,
+        /// Write the last run's full trace here (JSON lines).
+        #[arg(long)]
+        trace: Option<PathBuf>,
         /// Write the last run's end state here.
         #[arg(long)]
         save_to: Option<PathBuf>,
@@ -291,6 +294,7 @@ fn run() -> Result<()> {
             ai_hero,
             activity,
             pool_xp,
+            trace,
             save_to,
         } => autoplay::run(&autoplay::Options {
             install: &install,
@@ -309,6 +313,7 @@ fn run() -> Result<()> {
             ai_hero,
             activity,
             pool_xp,
+            trace_to: trace.as_deref(),
             save_to: save_to.as_deref(),
         }),
         Command::Navgrid {

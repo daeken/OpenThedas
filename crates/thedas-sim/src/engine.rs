@@ -886,6 +886,16 @@ pub fn call(
             let vt = int(a, 3);
             let base_type = constant(&h.sim.table, "PROPERTY_VALUE_BASE");
             let current = constant(&h.sim.table, "PROPERTY_VALUE_CURRENT");
+            // Health before, to record what a hit takes.
+            let health = constant(&h.sim.table, "PROPERTY_DEPLETABLE_HEALTH");
+            let health_before = (int(a, 1) == health && vt != base_type)
+                .then(|| {
+                    h.object(obj(a, 0))
+                        .filter(|o| !o.dead)
+                        .and_then(|o| o.properties.get(&health))
+                        .map(|v| v.1)
+                })
+                .flatten();
             // The hero's experience before, for followers waiting in the pool.
             let xp = constant(&h.sim.table, "PROPERTY_SIMPLE_EXPERIENCE");
             let hero_xp_before =
@@ -917,6 +927,14 @@ pub fn call(
                 {
                     o.dead = false;
                 }
+            }
+            if let Some(before) = health_before {
+                let after = h
+                    .object(obj(a, 0))
+                    .and_then(|o| o.properties.get(&health))
+                    .map_or(before, |v| v.1);
+                h.sim
+                    .record_health_loss(caller, obj(a, 0), before - after.max(0.0));
             }
             if let Some(before) = hero_xp_before {
                 let after = h
