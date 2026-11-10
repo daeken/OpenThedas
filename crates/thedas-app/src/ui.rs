@@ -132,7 +132,43 @@ pub struct UiLayer {
     level: Option<String>,
     /// Frames since the minimap's creatures were last sent.
     minimap_frame: u32,
+    portraits: PortraitClock,
 }
+
+/// When portraits are drawn: the party they were drawn for, milliseconds since, and how many
+/// times they have been drawn (each drawing gets new image names, so the movies load it
+/// afresh).
+#[derive(Default)]
+struct PortraitClock {
+    party: Vec<u32>,
+    age_ms: f64,
+    drawn: u32,
+}
+
+impl PortraitClock {
+    /// Whether they are due: the party (`party`) changed, or they are [`PORTRAITS_EVERY_MS`]
+    /// old. `dt_ms` is the time since the last call.
+    fn due(&mut self, party: Vec<u32>, dt_ms: f64) -> bool {
+        self.age_ms += dt_ms;
+        if party != self.party || self.age_ms >= PORTRAITS_EVERY_MS {
+            self.party = party;
+            self.age_ms = 0.0;
+            return true;
+        }
+        false
+    }
+
+    /// The image name of member `id`'s portrait in drawing `drawn`.
+    fn name(id: u32, drawn: u32) -> String {
+        format!("thedas_portrait_{id}_{drawn}.png")
+    }
+}
+
+/// Portraits are drawn again this often while playing (milliseconds), and whenever the
+/// party changes. Provisional.
+const PORTRAITS_EVERY_MS: f64 = 3000.0;
+/// Portraits' size (pixels, square).
+pub const PORTRAIT_SIZE: u32 = 128;
 
 /// minimap.gfx's creature flags (`SharedLibrary.CreatureMapIcon.FLAG_*`).
 const MAP_HOSTILE: u32 = 1;
@@ -196,6 +232,7 @@ impl UiLayer {
             line: None,
             level: None,
             minimap_frame: 0,
+            portraits: PortraitClock::default(),
         }
     }
 
@@ -326,6 +363,40 @@ impl UiLayer {
             .find(|m| m.name == "conversation.gfx")
         {
             m.call("_global.Conversation.ContinueButtonAction", &[]);
+        }
+    }
+
+    /// Whether the party's portraits are due to be drawn: the party (`party`) changed, or they
+    /// are [`PORTRAITS_EVERY_MS`] old. `dt_ms` is the time since the last call.
+    pub fn wants_portraits(&mut self, party: Vec<u32>, dt_ms: f64) -> bool {
+        self.portraits.due(party, dt_ms)
+    }
+
+    /// Hands the movies freshly drawn portraits (RGBA8, [`PORTRAIT_SIZE`] square, by member).
+    pub fn set_portraits(&mut self, shots: Vec<(u32, Vec<u8>)>) {
+        let old = self
+            .shown
+            .lock()
+            .map(|s| s.portraits.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for name in old {
+            self.stage.set_image(&name, None);
+        }
+        self.portraits.drawn += 1;
+        let made = self.portraits.drawn;
+        let mut names = std::collections::BTreeMap::new();
+        for (id, pixels) in shots {
+            let name = PortraitClock::name(id, made);
+            let img = Rgba {
+                width: PORTRAIT_SIZE,
+                height: PORTRAIT_SIZE,
+                pixels,
+            };
+            self.stage.set_image(&name, Some(&img));
+            names.insert(id, name);
+        }
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.portraits = names;
         }
     }
 
@@ -619,5 +690,16 @@ mod tests {
         assert_eq!(line_ms("  "), 100.0);
         assert!(line_ms("Short.") < line_ms("A much longer line that takes a while to read."));
         assert_eq!(line_ms(&"x".repeat(1000)), 12_000.0);
+    }
+
+    #[test]
+    fn portraits_are_drawn_when_the_party_changes_and_every_few_seconds() {
+        let mut clock = PortraitClock::default();
+        assert!(clock.due(vec![1], 16.0));
+        assert!(!clock.due(vec![1], 16.0));
+        assert!(clock.due(vec![1, 2], 16.0));
+        assert!(!clock.due(vec![1, 2], PORTRAITS_EVERY_MS - 1.0));
+        assert!(clock.due(vec![1, 2], 1.0));
+        assert_ne!(PortraitClock::name(1, 1), PortraitClock::name(1, 2));
     }
 }

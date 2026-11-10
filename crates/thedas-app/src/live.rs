@@ -35,6 +35,9 @@ pub struct LiveObjects {
     /// Interactive placeables' bounds (centre offset from the object, radius), from their
     /// draws when the scene was built.
     bounds: std::collections::HashMap<ObjectId, (glam::Vec3, f32)>,
+    /// Creatures' faces (their eyes', else their head's mesh centre), offset from the
+    /// creature, from their draws when the scene was built: where portraits look.
+    faces: std::collections::HashMap<ObjectId, glam::Vec3>,
     pub scene: AreaScene,
     pub renderer: AreaRenderer,
 }
@@ -50,6 +53,11 @@ pub struct Live {
     animator: Animator,
     /// A quickbar ability waiting for the player to click its target.
     pub aiming: Option<thedas_ui::input::Aim>,
+    /// Each drawn object's id, placement and motion at the last sync (in the objects' scene
+    /// order).
+    posed: Vec<(ObjectId, Mat4, Option<Clip>)>,
+    /// The colour format the scenes are drawn in (captures come back in it).
+    format: Option<wgpu::TextureFormat>,
     models: ModelCache,
     /// Textures, meshes, pipelines and shader translations of the current level, kept while
     /// its objects are rebuilt.
@@ -98,6 +106,8 @@ impl Live {
             objects: None,
             animator: Animator::default(),
             aiming: None,
+            format: None,
+            posed: Vec::new(),
             models: ModelCache::default(),
             cache: RenderCache::default(),
             owed_ms: 0.0,
@@ -143,6 +153,7 @@ impl Live {
     /// changes, the objects when the set of objects (or what they wear) changes; then places
     /// and poses every object.
     pub fn sync(&mut self, ctx: &GpuContext, format: wgpu::TextureFormat) -> Result<()> {
+        self.format = Some(format);
         let shared = self.sim.clone();
         let mut sim = shared.lock().unwrap_or_else(|p| p.into_inner());
         let Some(layout) = sim.world.area.and_then(|a| sim.area_layout(a)) else {
@@ -181,6 +192,11 @@ impl Live {
             &posed,
             0.0,
         );
+        self.posed = models
+            .iter()
+            .zip(posed)
+            .map(|(m, (t, c))| (m.id, t, c))
+            .collect();
         Ok(())
     }
 
@@ -284,7 +300,22 @@ impl Live {
         // A new scene means new skeleton indices.
         self.animator = Animator::default();
         let mut bounds = std::collections::HashMap::new();
+        let mut faces = std::collections::HashMap::new();
         for (m, p) in models.iter().zip(&scene.props) {
+            // A creature's eyes (`_uem_` meshes) or head (`_uhm_`). Provisional: from the
+            // character models' names.
+            let part = |tag: &str| {
+                p.draws.clone().find_map(|d| {
+                    let d = scene.draws.get(d)?;
+                    d.model
+                        .to_ascii_lowercase()
+                        .contains(tag)
+                        .then_some(d.sphere.0)
+                })
+            };
+            if let Some(face) = part("_uem_").or_else(|| part("_uhm_")) {
+                faces.insert(m.id, face - glam::Vec3::from_array(m.position));
+            }
             let spheres: Vec<(glam::Vec3, f32)> = p
                 .draws
                 .clone()
@@ -303,11 +334,15 @@ impl Live {
         Ok(LiveObjects {
             key,
             bounds,
+            faces,
             scene,
             renderer,
         })
     }
 }
+
+/// How much brighter portraits are than the scene they are drawn in. Provisional.
+const PORTRAIT_GAIN: f32 = 1.8;
 
 /// What a click lands on.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -508,6 +543,120 @@ impl Live {
             glam::Vec3::from_array(at),
         );
         crate::reticle::project(camera, size, &lines)
+    }
+
+    /// Each party member's portrait: its head drawn from the camera `portraits.gda` gives it
+    /// (by tag, else the `default` row), `size` pixels square, RGBA8. Members not drawn are
+    /// left out. Provisional: the camera orbits the face by `CameraRotation` (degrees about
+    /// the facing) and `CameraPitch`, `CameraDistance` away, looking at the eyes (or head)
+    /// mesh, else 0.25 m below the top of the member's drawn bounds; other columns are
+    /// unused.
+    pub fn portraits(&mut self, ctx: &GpuContext, size: u32) -> Vec<(ObjectId, Vec<u8>)> {
+        let (Some(objects), Some(level)) = (self.objects.as_mut(), self.level.as_ref()) else {
+            return Vec::new();
+        };
+        let animator = &mut self.animator;
+        let posed = &self.posed;
+        // Where the head bone is now, and where it is at rest (both in the world), for a drawn
+        // object.
+        let mut head_bone = |id: ObjectId| -> Option<(glam::Vec3, glam::Vec3)> {
+            let i = posed.iter().position(|p| p.0 == id)?;
+            let (_, transform, clip) = &posed[i];
+            objects.scene.prop_skeletons(i).into_iter().find_map(|s| {
+                let skeleton = objects.scene.skeletons.get(s)?;
+                let node = skeleton.node("head")?;
+                let rest = skeleton.rest().get(node)?.w_axis.truncate();
+                let now = clip
+                    .as_ref()
+                    .and_then(|c| animator.pose(&level.vfs, &objects.scene, s, c))
+                    .and_then(|(_, pose)| pose.get(node).map(|m| m.w_axis.truncate()))
+                    .unwrap_or(rest);
+                Some((
+                    transform.transform_point3(now),
+                    transform.transform_point3(rest),
+                ))
+            })
+        };
+        let shared = self.sim.clone();
+        let sim = shared.lock().unwrap_or_else(|p| p.into_inner());
+        let tables = sim.world.tables();
+        let table = tables.get(0, "portraits");
+        let row = |tag: &str| {
+            let t = table.as_ref()?;
+            t.order.iter().copied().find(|&r| {
+                matches!(t.cell("Tag", r), Some(thedas_formats::gda::Cell::String(s))
+                    if s.trim_end_matches('\0').trim().eq_ignore_ascii_case(tag))
+            })
+        };
+        let num = |r: Option<i64>, c: &str, d: f32| {
+            let t = table.as_ref();
+            match r.and_then(|r| t?.cell(c, r).cloned()) {
+                Some(thedas_formats::gda::Cell::Float(v)) => v as f32,
+                Some(thedas_formats::gda::Cell::Int(v)) => v as f32,
+                _ => d,
+            }
+        };
+        let mut out = Vec::new();
+        for id in thedas_sim::engine::party_of(&sim) {
+            let Some(o) = sim.world.get(id) else { continue };
+            if o.area.is_none() || o.area != sim.world.area {
+                continue;
+            }
+            let Some(&(offset, radius)) = objects.bounds.get(&id) else {
+                continue;
+            };
+            let face = objects.faces.get(&id).copied();
+            let r = row(&o.tag).or_else(|| row("default"));
+            let rotation = num(r, "CameraRotation", 0.0).to_radians();
+            let pitch = num(r, "CameraPitch", 0.0).to_radians();
+            let distance = num(r, "CameraDistance", 0.7).max(0.2);
+            let feet = glam::Vec3::from_array(o.position);
+            let rest_face = match face {
+                Some(f) => feet + f,
+                None => feet + glam::Vec3::Z * (offset.z + radius - 0.25).max(0.3),
+            };
+            // The face follows the head bone as the creature moves (it crouches in combat).
+            let head = match head_bone(id) {
+                Some((now, rest)) => now + (rest_face - rest),
+                None => rest_face,
+            };
+            let heading = thedas_sim::world::heading_of(o.facing).to_radians() + rotation;
+            // From in front of the face, looking back at it.
+            let eye = head
+                + glam::Vec3::new(
+                    heading.cos() * pitch.cos(),
+                    heading.sin() * pitch.cos(),
+                    pitch.sin(),
+                ) * distance;
+            let to = head - eye;
+            let mut camera = thedas_render::Camera::new(
+                eye,
+                to.y.atan2(to.x),
+                to.z.atan2(to.truncate().length()),
+            );
+            camera.fov_y = 35f32.to_radians();
+            camera.near = 0.05;
+            let Ok(mut pixels) = objects.renderer.capture(ctx, &camera, size, size) else {
+                continue;
+            };
+            if matches!(
+                self.format,
+                Some(wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb)
+            ) {
+                for p in pixels.chunks_exact_mut(4) {
+                    p.swap(0, 2);
+                }
+            }
+            // The game lights portraits with a rig of their own (portraits.gda's light
+            // columns); the scene's light is brightened instead. Provisional.
+            for p in pixels.chunks_exact_mut(4) {
+                for c in &mut p[..3] {
+                    *c = (*c as f32 * PORTRAIT_GAIN).min(255.0) as u8;
+                }
+            }
+            out.push((id, pixels));
+        }
+        out
     }
 
     /// Makes party member `n` (0 is the hero) the leader the player controls.
