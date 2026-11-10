@@ -1,0 +1,26 @@
+[package]
+name = "thedas-app"
+description = "OpenThedas application: window, input and frame loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "thedas-app"
+path = "src/main.rs"
+
+[dependencies]
+thedas-vfs.workspace = true
+thedas-formats.workspace = true
+thedas-render.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+winit.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+glam.workspace = true
+png.workspace = true
+log.workspace = true
+env_logger.workspace = true

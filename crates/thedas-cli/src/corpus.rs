@@ -1,5 +1,7 @@
-//! The M0 corpus check: open every archive, read every entry, and parse and round-trip every
-//! GFF4-family resource, including loose files outside archives.
+//! The corpus check: open every archive, read every entry, and parse and round-trip every
+//! GFF4-family resource, including loose files outside archives. Formats with a typed reader
+//! (GDA, TLK, areas, layouts, models, meshes, materials, DDS) are also parsed into their typed
+//! form; the `typed` column counts those.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -11,7 +13,7 @@ use anyhow::Result;
 use serde_json::json;
 use thedas_formats::gff3::{Gff3, is_gff3};
 use thedas_formats::gff4::{Gff4, is_gff4};
-use thedas_formats::{Gda, Tlk};
+use thedas_formats::{Area, Arl, Dds, Gda, MaterialDef, MaterialObject, Mmh, Msh, Rml, Tlk};
 use thedas_vfs::erf::sniff_version;
 use thedas_vfs::{DaoInstall, Erf, extension};
 
@@ -212,7 +214,7 @@ fn check_archive(path: &Path, label: &str, stats: &mut Stats, keep: usize) {
             continue;
         }
         match erf.read(entry, None) {
-            Ok(data) => check_data(&data, &ext, location, stats, keep),
+            Ok(data) => check_data(&data, &name, &ext, location, stats, keep),
             Err(e) => {
                 stats.by_ext.get_mut(&ext).unwrap().read_failed += 1;
                 stats.fail("entry-read", location, e.to_string(), keep);
@@ -256,18 +258,73 @@ fn check_loose(path: &Path, label: &str, stats: &mut Stats, keep: usize) {
             let es = stats.by_ext.entry(ext.clone()).or_default();
             es.entries += 1;
             es.bytes += data.len() as u64;
-            check_data(&data, &ext, label.to_string(), stats, keep);
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            check_data(&data, &name, &ext, label.to_string(), stats, keep);
         }
         Err(e) => stats.fail("loose-read", label.to_string(), e.to_string(), keep),
     }
 }
 
-fn check_data(data: &[u8], ext: &str, location: String, stats: &mut Stats, keep: usize) {
+/// Records the outcome of a typed parse for an extension.
+fn typed_result(
+    stats: &mut Stats,
+    ext: &str,
+    location: String,
+    result: std::result::Result<(), String>,
+    keep: usize,
+) {
+    let es = stats.by_ext.entry(ext.to_string()).or_default();
+    match result {
+        Ok(()) => es.typed_ok += 1,
+        Err(e) => {
+            es.typed_failed += 1;
+            stats.fail(&format!("typed/{ext}"), location, e, keep);
+        }
+    }
+}
+
+/// Typed checks for formats that are not GFF: XML materials and DDS textures.
+fn check_other(
+    data: &[u8],
+    name: &str,
+    ext: &str,
+    location: String,
+    stats: &mut Stats,
+    keep: usize,
+) {
+    let lower = name.to_ascii_lowercase();
+    let result = if ext == "mao" {
+        MaterialObject::parse(data)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else if lower.ends_with(".mat.xml") {
+        MaterialDef::parse(data)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else if ext == "dds" {
+        Dds::parse(data).map(|_| ()).map_err(|e| e.to_string())
+    } else {
+        return;
+    };
+    typed_result(stats, ext, location, result, keep);
+}
+
+fn check_data(
+    data: &[u8],
+    name: &str,
+    ext: &str,
+    location: String,
+    stats: &mut Stats,
+    keep: usize,
+) {
     if is_gff3(data) {
         return check_gff3(data, ext, location, stats, keep);
     }
     if !is_gff4(data) {
-        return;
+        return check_other(data, name, ext, location, stats, keep);
     }
     let es = stats
         .by_ext
@@ -306,23 +363,26 @@ fn check_data(data: &[u8], ext: &str, location: String, stats: &mut Stats, keep:
         Err(e) => stats.fail(&format!("gff4-write/{ext}"), location.clone(), e, keep),
     }
 
-    let es = stats.by_ext.get_mut(ext).unwrap();
-    let typed = match &doc.file_type.0 {
-        b"G2DA" => Some(Gda::from_gff4(&doc).map(|_| ()).map_err(|e| e.to_string())),
-        b"TLK " => Some(Tlk::from_gff4(&doc).map(|_| ()).map_err(|e| e.to_string())),
+    let s = |r: std::result::Result<(), thedas_formats::TypedError>| r.map_err(|e| e.to_string());
+    let typed = match (&doc.file_type.0, ext) {
+        (b"G2DA", _) => Some(Gda::from_gff4(&doc).map(|_| ()).map_err(|e| e.to_string())),
+        (b"TLK ", _) => Some(Tlk::from_gff4(&doc).map(|_| ()).map_err(|e| e.to_string())),
+        (_, "arl") => Some(s(Arl::from_gff4(&doc).map(|_| ()))),
+        (_, "rml") => Some(s(Rml::from_gff4(&doc).map(|_| ()))),
+        (_, "mmh") => Some(s(Mmh::from_gff4(&doc).map(|_| ()))),
+        (_, "msh") => Some(s(Msh::from_gff4(&doc).map(|_| ()))),
         _ => None,
     };
-    match typed {
-        Some(Ok(())) => es.typed_ok += 1,
-        Some(Err(e)) => {
-            es.typed_failed += 1;
-            stats.fail(&format!("typed/{ext}"), location, e, keep);
-        }
-        None => {}
+    if let Some(result) = typed {
+        typed_result(stats, ext, location, result, keep);
     }
 }
 
 fn check_gff3(data: &[u8], ext: &str, location: String, stats: &mut Stats, keep: usize) {
+    if ext == "are" {
+        let result = Area::parse(data).map(|_| ()).map_err(|e| e.to_string());
+        typed_result(stats, ext, location.clone(), result, keep);
+    }
     let es = stats
         .by_ext
         .get_mut(ext)
