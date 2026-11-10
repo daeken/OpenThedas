@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use thedas_sim::Sim;
 
+use crate::binding::Presentation;
 use crate::protocol::{GameMessage, MessageHandler};
 
 /// conversation.gfx's reply pick: the reply's index.
@@ -50,11 +51,44 @@ pub fn apply_all(sim: &mut Sim, messages: &[GameMessage]) -> Vec<(String, Vec<St
     ignored
 }
 
+/// inventory.gfx's category tab: the engine lists only that category's items.
+pub const SET_ITEM_FILTER: &str = "GUIInventory.SetItemListFilter";
+
+/// Takes the interface's own messages (not simulation input) into `shown`; returns whether
+/// `name` was one.
+pub fn present(shown: &mut Presentation, name: &str, args: &[String]) -> bool {
+    match name {
+        SET_ITEM_FILTER => {
+            shown.item_filter = args
+                .first()
+                .and_then(|a| a.trim().parse::<f64>().ok())
+                .map_or(0, |v| v as i32);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// A bridge handler acting on `sim` as a movie sends a message, before the movie goes on (a
 /// movie reads values right after some messages, as chanters.gfx does after accepting a
 /// job). When the simulation is busy elsewhere the message waits for [`apply_all`].
 pub fn handler(sim: Arc<Mutex<Sim>>) -> MessageHandler {
+    handler_for(sim, Arc::new(Mutex::new(Presentation::default())))
+}
+
+/// [`handler`] binding values with the interface's own choices (`shown`), which it keeps up
+/// to date from the movies' messages.
+pub fn handler_for(sim: Arc<Mutex<Sim>>, shown: Arc<Mutex<Presentation>>) -> MessageHandler {
     Arc::new(move |name: &str, args: &[String]| {
+        let mut p = shown.lock().ok()?;
+        if present(&mut p, name, args) {
+            let sim = sim.try_lock().ok()?;
+            return Some(
+                crate::binding::sim_values_for(&sim, &p)
+                    .into_iter()
+                    .collect(),
+            );
+        }
         let mut sim = sim.try_lock().ok()?;
         // Replies are picked after the tick, as the MCP does: the movie does not read the
         // next line back in the same call.
@@ -62,7 +96,11 @@ pub fn handler(sim: Arc<Mutex<Sim>>) -> MessageHandler {
             return None;
         }
         sim.tick(0);
-        Some(crate::binding::sim_values(&sim).into_iter().collect())
+        Some(
+            crate::binding::sim_values_for(&sim, &p)
+                .into_iter()
+                .collect(),
+        )
     })
 }
 
@@ -89,6 +127,14 @@ mod tests {
             ],
         );
         assert_eq!(left, vec![("Nobody.Listens".to_string(), vec!["1".into()])]);
+    }
+
+    #[test]
+    fn the_item_tab_is_the_interfaces_own() {
+        let mut shown = Presentation::default();
+        assert!(present(&mut shown, SET_ITEM_FILTER, &["3".into()]));
+        assert_eq!(shown.item_filter, 3);
+        assert!(!present(&mut shown, SELECT_RESPONSE, &["0".into()]));
     }
 
     #[test]

@@ -103,7 +103,8 @@ struct Args {
     /// Headless, playing: input played in order before the capture, `;`-separated:
     /// `click X,Y` (a left click at that pixel), `run MS` (the game and its interface run
     /// that long), `key i` (the inventory toggle), `talk TAG` (the leader talks to a creature),
-    /// `rebuild` (the objects are rebuilt as a spawn rebuilds them, timed).
+    /// `rebuild` (the objects are rebuilt as a spawn rebuilds them, timed), `rclick X,Y` and
+    /// `dclick X,Y` (a right or double click for the interface).
     #[arg(long, default_value = "")]
     steps: String,
     /// Module for `--save` and `--objects`.
@@ -380,7 +381,15 @@ struct App {
     last: Instant,
     error: Option<anyhow::Error>,
     captures: u32,
+    /// The last left press (when, where), to tell a double click.
+    last_press: Option<(Instant, (f64, f64))>,
+    /// The release of a double click the interface already had.
+    swallow_release: bool,
 }
+
+/// Two left presses this close (seconds, pixels) are a double click. Provisional.
+const DOUBLE_CLICK_SECS: f64 = 0.35;
+const DOUBLE_CLICK_PIXELS: f64 = 6.0;
 
 impl App {
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
@@ -692,6 +701,32 @@ impl ApplicationHandler for App {
             } => {
                 let (x, y) = self.cursor;
                 let pressed = state == ElementState::Pressed;
+                if !pressed && std::mem::take(&mut self.swallow_release) {
+                    return;
+                }
+                // A second press close in time and place is a double click (the movies use
+                // them: equipping from the backpack).
+                let double = pressed
+                    && self.last_press.is_some_and(|(t, (px, py))| {
+                        t.elapsed().as_secs_f64() < DOUBLE_CLICK_SECS
+                            && (px - x).hypot(py - y) < DOUBLE_CLICK_PIXELS
+                    });
+                if pressed {
+                    self.last_press = (!double).then(|| (Instant::now(), (x, y)));
+                }
+                if double {
+                    if let Some(g) = self.gfx.as_mut() {
+                        if self.screens.as_ref().is_some_and(|s| !s.exploring()) {
+                            g.ui.click_as(
+                                thedas_ui::avm1::MOUSE_LEFT + thedas_ui::avm1::DOUBLE_CLICK,
+                                x,
+                                y,
+                            );
+                            self.swallow_release = true;
+                            return;
+                        }
+                    }
+                }
                 // Playing, a click the interface does not take orders the party leader.
                 let mut to_world = pressed && self.live.is_some() && self.ui.is_empty();
                 if let Some(g) = self.gfx.as_mut() {
@@ -715,7 +750,19 @@ impl ApplicationHandler for App {
                 button: MouseButton::Right,
                 ..
             } => {
-                self.looking = state == ElementState::Pressed;
+                let pressed = state == ElementState::Pressed;
+                let (x, y) = self.cursor;
+                // Over the interface (or with a menu up) a right click is the interface's (an
+                // item's actions); elsewhere it turns the camera.
+                if pressed {
+                    if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_ref()) {
+                        if !s.exploring() || g.ui.covers(x, y) {
+                            g.ui.click_as(thedas_ui::avm1::MOUSE_RIGHT, x, y);
+                            return;
+                        }
+                    }
+                }
+                self.looking = pressed;
                 if let Some(g) = &self.gfx {
                     g.window.set_cursor_visible(!self.looking);
                 }
@@ -778,6 +825,8 @@ enum Step {
     Talk(String),
     /// The objects' scene is rebuilt, as when a creature spawns (timing).
     Rebuild,
+    /// A right click or a double click at a pixel, for the interface.
+    ClickAs(f64, f64, f64),
 }
 
 fn parse_steps(spec: &str) -> Result<Vec<Step>> {
@@ -796,6 +845,15 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
                 "key" if arg.eq_ignore_ascii_case("i") => Step::Inventory,
                 "talk" if !arg.is_empty() => Step::Talk(arg.to_string()),
                 "rebuild" => Step::Rebuild,
+                "rclick" | "dclick" => {
+                    let (x, y) = arg.split_once(',').context("click takes x,y")?;
+                    let button = if verb == "rclick" {
+                        thedas_ui::avm1::MOUSE_RIGHT
+                    } else {
+                        thedas_ui::avm1::MOUSE_LEFT + thedas_ui::avm1::DOUBLE_CLICK
+                    };
+                    Step::ClickAs(button, x.trim().parse()?, y.trim().parse()?)
+                }
                 _ => bail!("unknown step {s:?}"),
             })
         })
@@ -890,6 +948,12 @@ fn main() -> Result<()> {
             l.sim().tick(args.run_ms);
             for step in &steps {
                 match step {
+                    &Step::ClickAs(button, x, y) => {
+                        if let Some((layer, _)) = played.as_mut() {
+                            layer.click_as(button, x, y);
+                            println!("click {x},{y} as button {button}: interface");
+                        }
+                    }
                     Step::Rebuild => {
                         l.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
                         l.objects = None;
@@ -1023,6 +1087,8 @@ fn main() -> Result<()> {
         last: Instant::now(),
         error: None,
         captures: 0,
+        last_press: None,
+        swallow_release: false,
     };
     event_loop.run_app(&mut app)?;
     match app.error {
@@ -1046,6 +1112,10 @@ mod tests {
             vec![Step::Talk("lot110cr_bryant".into())]
         );
         assert_eq!(parse_steps("rebuild").unwrap(), vec![Step::Rebuild]);
+        assert_eq!(
+            parse_steps("rclick 1,2; dclick 3,4").unwrap(),
+            vec![Step::ClickAs(2.0, 1.0, 2.0), Step::ClickAs(5.0, 3.0, 4.0)]
+        );
         assert!(parse_steps("dance").is_err());
         assert!(parse_steps("click 10").is_err());
         assert!(parse_steps("").unwrap().is_empty());

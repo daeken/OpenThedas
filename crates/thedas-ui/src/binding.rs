@@ -71,6 +71,66 @@ pub fn game_mode(sim: &Sim) -> i32 {
 
 /// Every value this module can answer for the current simulation state.
 pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
+    sim_values_for(sim, &Presentation::default())
+}
+
+/// What the interface shows that is not simulation state: a screen's own choices the engine
+/// keeps for it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Presentation {
+    /// The inventory screen's item category tab (`GUIInventory.SetItemListFilter`, see
+    /// [`ItemCategory`]); 0 shows every item.
+    pub item_filter: i32,
+}
+
+/// The inventory screen's item category tabs (inventory.gfx's `CATEGORY_*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemCategory {
+    Weapons = 1,
+    Armor = 2,
+    Accessories = 3,
+    Other = 4,
+    Crafting = 5,
+    Plot = 6,
+}
+
+/// The inventory tab an item falls under, from its base type's `Type` in `bitm_base` (2
+/// melee, 5 staff, 6 ranged, 7 ammunition: weapons; 3 shield, 4 armour: armour; 1 other: an
+/// accessory when it can be worn) and, for crafting materials and recipes, the base type's
+/// label. Provisional: the game's own grouping is not traced.
+pub fn item_category(sim: &Sim, item: u32) -> ItemCategory {
+    let Some(o) = sim.world.get(item) else {
+        return ItemCategory::Other;
+    };
+    if o.plot {
+        return ItemCategory::Plot;
+    }
+    let base = o.fields.get("BaseItem").copied().unwrap_or(0) as i64;
+    let table = sim.world.tables().get(0, "bitm_base");
+    let int = |c: &str| match table.as_ref().and_then(|t| t.cell(c, base).cloned()) {
+        Some(thedas_formats::gda::Cell::Int(v)) => v,
+        _ => 0,
+    };
+    let label = match table.as_ref().and_then(|t| t.cell("Label", base).cloned()) {
+        Some(thedas_formats::gda::Cell::String(s)) => s.to_ascii_lowercase(),
+        _ => String::new(),
+    };
+    match int("Type") {
+        2 | 5 | 6 | 7 => ItemCategory::Weapons,
+        3 | 4 => ItemCategory::Armor,
+        _ if !sim.item_slots(item).is_empty() => ItemCategory::Accessories,
+        _ if ["herbalism", "making item", "recipe"]
+            .iter()
+            .any(|k| label.contains(k)) =>
+        {
+            ItemCategory::Crafting
+        }
+        _ => ItemCategory::Other,
+    }
+}
+
+/// [`sim_values`] with the interface's own choices.
+pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiValue> {
     let mut v = BTreeMap::new();
     let mut set = |k: String, x: UiValue| {
         v.insert(k, x);
@@ -284,7 +344,114 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
         .filter(|o| o.kind == ObjectKind::Creature && o.active)
         .count();
     set("Area.CreatureCount".into(), num(creatures as f64));
+    inventory(sim, controlled.or(hero), shown.item_filter, &mut v);
     v
+}
+
+/// An item as the inventory screens read it (`<prefix>.ID`, `.Name`, `.Icon`, ...).
+/// Provisional: the fields come from inventory.gfx's reads; flags the simulation does not
+/// keep (damaged, newly acquired) are 0.
+fn item(sim: &Sim, prefix: &str, id: u32, v: &mut BTreeMap<String, UiValue>) {
+    let Some(o) = sim.world.get(id) else { return };
+    let look = sim.item_look(id);
+    let field = |k: &str, d: i32| num(o.fields.get(k).copied().unwrap_or(d));
+    let mask = sim.item_slots(id).iter().fold(0u32, |m, s| m | (1 << s));
+    let text = |s: Option<u32>| UiValue::String(s.and_then(|s| sim.string(s)).unwrap_or_default());
+    let mut set = |k: &str, x: UiValue| {
+        v.insert(format!("{prefix}.{k}"), x);
+    };
+    set("ID", num(id));
+    set("Tag", UiValue::String(o.tag.clone()));
+    set("Name", UiValue::String(name(sim, id)));
+    set("Description", text(look.description));
+    set("Icon", UiValue::String(look.icon));
+    set("BaseItemID", field("BaseItem", 0));
+    // A row of the material types table; the movie names it from the tables itself.
+    set("MaterialType", field("Material", 0));
+    set("EquippableSlots", num(mask));
+    set("StackSize", field("StackSize", 1));
+    set("Cost", num(sim.item_value(id)));
+    set("AbilityID", field("AbilityID", -1));
+    set("RecipeID", field("CraftingRecipeID", 0));
+    set("Unique", field("Unique", 0));
+    set("Irremovable", num(o.plot as u8));
+    for k in [
+        "Damaged",
+        "Indestructible",
+        "InfiniteStock",
+        "NewlyAcquired",
+        "StoreFlag",
+        "RuneSlotMask",
+    ] {
+        set(k, num(0));
+    }
+}
+
+/// The inventory screen: the party's backpack (`GUIInventory.PartyBackpackView.N.Item`, the
+/// items of the chosen category tab, `filter`) with plot items listed apart
+/// (`PartyPlotItemsView`), the money, and what the selected party member (`who`) wears
+/// (`GUI.SelectedChar.Equipment.<INVENTORY_SLOT_*>`, 0 for an empty slot).
+fn inventory(sim: &Sim, who: Option<u32>, filter: i32, v: &mut BTreeMap<String, UiValue>) {
+    let pack = sim.party_backpack();
+    let (plot, gear): (Vec<u32>, Vec<u32>) = pack
+        .iter()
+        .partition(|&&i| sim.world.get(i).is_some_and(|o| o.plot));
+    let shown: Vec<u32> = gear
+        .iter()
+        .copied()
+        .filter(|&i| filter <= 0 || item_category(sim, i) as i32 == filter)
+        .collect();
+    for (view, items) in [("PartyBackpackView", &shown), ("PartyPlotItemsView", &plot)] {
+        // The view's own token, which its list watches: its items, so a change to them
+        // makes the list read them again.
+        let ids: Vec<String> = items.iter().map(|i| i.to_string()).collect();
+        v.insert(
+            format!("GUIInventory.{view}"),
+            UiValue::String(ids.join(",")),
+        );
+        for (i, id) in items.iter().enumerate() {
+            let k = format!("GUIInventory.{view}.{i}");
+            v.insert(k.clone(), num(*id));
+            v.insert(format!("{k}.GroupSize"), num(1));
+            item(sim, &format!("{k}.Item"), *id, v);
+        }
+    }
+    // No container is open (looting goes through the simulation's own commands for now).
+    v.insert("GUIInventory.ShowContainer".into(), num(0));
+    v.insert("GUIInventory.ContainerHasPlotItems".into(), num(0));
+    v.insert("GUIInventory.CanAddItemsToContainer".into(), num(0));
+    v.insert("Party.BackpackSize".into(), num(gear.len() as f64));
+    let hero = sim.world.hero.and_then(|h| sim.world.get(h));
+    v.insert(
+        "Party.BackpackMaxSize".into(),
+        num(hero
+            .and_then(|h| h.fields.get("MaxInventorySize").copied())
+            .unwrap_or(thedas_sim::engine::DEFAULT_INVENTORY_SIZE)),
+    );
+    v.insert("Party.Money.Total".into(), num(hero.map_or(0, |h| h.money)));
+    let Some(o) = who.and_then(|w| sim.world.get(w)) else {
+        return;
+    };
+    v.insert("GUI.SelectedChar.CanChangeEquipment".into(), num(1));
+    v.insert("GUI.SelectedChar.CanSwitchWeaponSets".into(), num(1));
+    v.insert(
+        "GUI.SelectedChar.ActiveWeaponSet".into(),
+        num(o.fields.get("ActiveWeaponSet").copied().unwrap_or(0)),
+    );
+    // Provisional: the slots the screen shows are taken to be INVENTORY_SLOT_* 0 to 19.
+    for slot in 0..20 {
+        let k = format!("GUI.SelectedChar.Equipment.{slot}");
+        match o.equipment.get(&slot) {
+            Some(id) => {
+                v.insert(k.clone(), num(*id));
+                item(sim, &k, *id, v);
+            }
+            None => {
+                v.insert(k.clone(), num(0));
+                v.insert(format!("{k}.ID"), num(0));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -337,6 +504,51 @@ mod tests {
         assert!(!v.contains_key("WorldMap.SecondaryMap.Type"));
         // No second map: the screen's map toggle disables itself on 0.
         assert_eq!(v["WorldMap.SecondaryMap"], UiValue::Number(0.0));
+    }
+
+    #[test]
+    fn the_inventory_lists_the_backpack_by_tab_and_plot_items_apart() {
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        sim.world.hero = Some(hero);
+        let pelt = sim.world.spawn(ObjectKind::Item, "pelt");
+        let key = sim.world.spawn(ObjectKind::Item, "key");
+        sim.world.get_mut(key).unwrap().plot = true;
+        sim.world.get_mut(hero).unwrap().inventory = vec![pelt, key];
+        let all = sim_values(&sim);
+        let k = "GUIInventory.PartyBackpackView";
+        assert_eq!(all[&format!("{k}.0.Item.ID")], UiValue::Number(pelt as f64));
+        assert_eq!(
+            all[&format!("{k}.0.Item.Tag")],
+            UiValue::String("pelt".into())
+        );
+        assert!(!all.contains_key(&format!("{k}.1")));
+        assert_eq!(all[k], UiValue::String(pelt.to_string()));
+        assert_eq!(
+            all["GUIInventory.PartyPlotItemsView.0.Item.ID"],
+            UiValue::Number(key as f64)
+        );
+        assert_eq!(all["Party.BackpackSize"], UiValue::Number(1.0));
+        // An empty slot reads as no item.
+        assert_eq!(all["GUI.SelectedChar.Equipment.0"], UiValue::Number(0.0));
+        let weapons = sim_values_for(
+            &sim,
+            &Presentation {
+                item_filter: ItemCategory::Weapons as i32,
+            },
+        );
+        assert!(!weapons.contains_key(&format!("{k}.0")));
+        let other = sim_values_for(
+            &sim,
+            &Presentation {
+                item_filter: ItemCategory::Other as i32,
+            },
+        );
+        assert!(other.contains_key(&format!("{k}.0")));
     }
 
     #[test]

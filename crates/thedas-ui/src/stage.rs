@@ -227,6 +227,14 @@ impl Stage {
                 UiValue::Number(h as f64),
             );
         }
+        // Scaleform's mouse button constants, which the movies test their clicks against.
+        for (k, b) in [
+            ("LEFT", crate::avm1::MOUSE_LEFT),
+            ("RIGHT", crate::avm1::MOUSE_RIGHT),
+            ("MIDDLE", crate::avm1::MOUSE_MIDDLE),
+        ] {
+            m.set(&format!("_global.Mouse.{k}"), UiValue::Number(b));
+        }
         m.call(START_SCENE, &[]);
         m.call(crate::avm1::INSTALL, &[]);
         // Movies anchor their elements to the screen when the engine asks them to lay out.
@@ -311,6 +319,20 @@ impl Stage {
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
         for m in &mut self.movies {
             m.mouse_button(x, y, down);
+        }
+    }
+
+    /// A whole click (press and release) at (`x`, `y`) that the movies see as Scaleform
+    /// `button` ([`crate::avm1::MOUSE_RIGHT`], or a button + [`crate::avm1::DOUBLE_CLICK`]
+    /// for a double click), delivered as an ordinary click with the button set aside (see
+    /// [`crate::avm1::BUTTON_VAR`]).
+    pub fn click_as(&mut self, button: f64, x: f64, y: f64) {
+        for m in &mut self.movies {
+            m.set(crate::avm1::BUTTON_VAR, UiValue::Number(button));
+            m.mouse_move(x, y);
+            m.mouse_button(x, y, true);
+            m.mouse_button(x, y, false);
+            m.set(crate::avm1::BUTTON_VAR, UiValue::Undefined);
         }
     }
 
