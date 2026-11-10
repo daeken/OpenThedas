@@ -521,6 +521,7 @@ fn check_data(
         (_, "arl") => Some(s(Arl::from_gff4(&doc).map(|_| ()))),
         (_, "rml") => Some(s(Rml::from_gff4(&doc).map(|_| ()))),
         (_, "mmh") => Some(s(Mmh::from_gff4(&doc).map(|_| ()))),
+        (_, "tnt") => Some(s(thedas_formats::tint::Tint::from_gff4(&doc).map(|_| ()))),
         (_, "mor") => Some(s(thedas_formats::morph::Morph::from_gff4(&doc).map(|_| ()))),
         (_, "msh") => Some(s(Msh::from_gff4(&doc).map(|_| ()))),
         (_, "ani") => Some(s(
