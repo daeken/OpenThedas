@@ -122,6 +122,10 @@ fn format_float(f: f32, width: i32, decimals: i32) -> String {
 /// Functions that only drive presentation; accepted as no-ops.
 const PRESENTATION: &[&str] = &[
     "ApplyEffectVisualEffect",
+    "SetAtmosphere",
+    "SetAtmosphereRGB",
+    "FB_SetEffectResource",
+    "FB_SetEffectEnabled",
     "PlaySoundSet",
     "PlaySound",
     "PlaySoundObject",
@@ -231,6 +235,14 @@ pub fn call(
         "abs" => ok(Value::Int(int(a, 0).wrapping_abs())),
         "fabs" => ok(Value::Float(float(a, 0).abs())),
         "sqrt" => ok(Value::Float(float(a, 0).max(0.0).sqrt())),
+        // Radians, per script.ldf; out-of-domain inputs are clamped rather than giving NaN.
+        "sin" => ok(Value::Float(float(a, 0).sin())),
+        "cos" => ok(Value::Float(float(a, 0).cos())),
+        "tan" => ok(Value::Float(float(a, 0).tan())),
+        "asin" => ok(Value::Float(float(a, 0).clamp(-1.0, 1.0).asin())),
+        "acos" => ok(Value::Float(float(a, 0).clamp(-1.0, 1.0).acos())),
+        "atan" => ok(Value::Float(float(a, 0).atan())),
+        "log" => ok(Value::Float(float(a, 0).max(f32::MIN_POSITIVE).ln())),
         "pow" => ok(Value::Float(float(a, 0).powf(float(a, 1)))),
         "Random" => ok(Value::Int(h.sim.world.rng.below(int(a, 0)))),
         "RandomFloat" => ok(Value::Float(h.sim.world.rng.unit())),
