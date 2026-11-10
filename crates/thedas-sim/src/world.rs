@@ -113,6 +113,10 @@ pub struct Object {
     /// Creature properties (`properties.gda` ids): base and current value.
     pub properties: BTreeMap<i32, (f32, f32)>,
     pub dead: bool,
+    /// When the creature last died (simulation milliseconds); `None` while alive. For
+    /// presentation (the death animation plays from it) and saves.
+    #[serde(default)]
+    pub died_at: Option<u64>,
     pub immortal: bool,
     pub plot: bool,
     pub team: i32,
@@ -173,6 +177,7 @@ impl Object {
             dialog: None,
             properties: BTreeMap::new(),
             dead: false,
+            died_at: None,
             immortal: false,
             plot: false,
             team: -1,

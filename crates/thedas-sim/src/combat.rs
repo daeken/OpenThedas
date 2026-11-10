@@ -518,6 +518,7 @@ impl Sim {
         if valid && effect.ty == EFFECT_TYPE_RESURRECTION {
             if let Some(o) = self.world.get_mut(target) {
                 o.dead = false;
+                o.died_at = None;
             }
             return;
         }
@@ -663,11 +664,13 @@ impl Sim {
     /// Marks a creature dead, clears what it was doing and sends it `EVENT_TYPE_DEATH`.
     pub fn kill(&mut self, id: ObjectId, killer: ObjectId) {
         let health = constant_of(self, "PROPERTY_DEPLETABLE_HEALTH");
+        let now = self.world.time_ms;
         if let Some(o) = self.world.get_mut(id) {
             if o.dead {
                 return;
             }
             o.dead = true;
+            o.died_at = Some(now);
             // The fallen have no health left (a killing blow arrives as EFFECT_TYPE_DEATH,
             // not as damage that empties the bar).
             if let Some(v) = o.properties.get_mut(&health) {
@@ -1401,8 +1404,10 @@ mod tests {
             .unwrap()
             .properties
             .insert(7, (10.0, 0.0));
+        s.world.time_ms = 4_200;
         s.check_death(foe, hero);
         assert!(s.world.get(foe).unwrap().dead);
+        assert_eq!(s.world.get(foe).unwrap().died_at, Some(4_200));
         let death: Vec<_> = s
             .world
             .queue
