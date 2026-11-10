@@ -16,6 +16,10 @@
 //!   continue-only reply). The host sends empty strings as [`EMPTY`], and every way a value
 //!   comes in (`GetValue`, `GetString`, wrapped fscommands, [`INVOKE_CALLBACK`] arguments)
 //!   turns it back into `""`.
+//! - Scaleform passed a mouse button (and double clicks, as the button + 4) to the movies'
+//!   press handlers; Flash and Ruffle pass none. `GUI.Element`'s event handler is wrapped to
+//!   take the button from [`BUTTON_VAR`] when none is given, which the host sets around a
+//!   right click or a double click it delivers as an ordinary click.
 
 /// The callback name the injected code registers.
 pub const INVOKE_CALLBACK: &str = "thedas_invoke";
@@ -31,6 +35,16 @@ pub const VALUE_GETTERS: &[&str] = &["GetValue", "GetString"];
 /// The function the host calls once, after starting a movie, to wrap [`PRE_CALLS`] (the
 /// movies define those classes after the first frame's actions run).
 pub const INSTALL: &str = "_global.thedas_install";
+
+/// The global the host sets to the Scaleform mouse button of the click it is delivering
+/// (see [`MOUSE_RIGHT`]); undefined for an ordinary left click.
+pub const BUTTON_VAR: &str = "_global.thedas_button";
+/// Scaleform's `Mouse.LEFT`, `Mouse.RIGHT`, `Mouse.MIDDLE`; a double click is the button + 4.
+/// Provisional: Scaleform's values, as the movies' button tests imply.
+pub const MOUSE_LEFT: f64 = 1.0;
+pub const MOUSE_RIGHT: f64 = 2.0;
+pub const MOUSE_MIDDLE: f64 = 3.0;
+pub const DOUBLE_CLICK: f64 = 4.0;
 
 /// The callback name for setting a movie variable (`object path`, `member`, `value`).
 pub const SET_CALLBACK: &str = "thedas_set";
@@ -88,6 +102,7 @@ const SET_MEMBER: u8 = 0x4f;
 const SET_VARIABLE: u8 = 0x1d;
 const DEFINE_LOCAL: u8 = 0x3c;
 const STRICT_EQUALS: u8 = 0x66;
+const EQUALS2: u8 = 0x49;
 const NOT: u8 = 0x12;
 const LESS2: u8 = 0x48;
 const INCREMENT: u8 = 0x50;
@@ -106,6 +121,7 @@ enum Push<'a> {
     Str(&'a str),
     Int(i32),
     Null,
+    Undefined,
 }
 
 fn get_path(out: &mut Vec<u8>, path: &[&str]) {
@@ -185,6 +201,31 @@ fn wrap_maker() -> Vec<u8> {
     function(&["o"], &outer)
 }
 
+/// `function (o) { return function (ev, b) { if (b == undefined) b = _global.thedas_button;
+/// return o.call(this, ev, b); }; }`: `GUI.Element.prototype.fnEventHandler`'s wrapper.
+fn button_wrap_maker() -> Vec<u8> {
+    let mut then = Vec::new();
+    push(&mut then, &[Push::Str("b")]);
+    get_path(&mut then, &["_global", "thedas_button"]);
+    then.push(SET_VARIABLE);
+    let mut inner = Vec::new();
+    get_path(&mut inner, &["b"]);
+    push(&mut inner, &[Push::Undefined]);
+    inner.extend_from_slice(&[EQUALS2, NOT]);
+    branch(&mut inner, IF, then.len(), false);
+    inner.extend(then);
+    get_path(&mut inner, &["b"]);
+    get_path(&mut inner, &["ev"]);
+    get_path(&mut inner, &["this"]);
+    push(&mut inner, &[Push::Int(3)]);
+    get_path(&mut inner, &["o"]);
+    push(&mut inner, &[Push::Str("call")]);
+    inner.extend_from_slice(&[CALL_METHOD, RETURN]);
+    let mut outer = function(&["ev", "b"], &inner);
+    outer.push(RETURN);
+    function(&["o"], &outer)
+}
+
 /// `function (o) { return function () {
 /// return _global.thedas_unempty(o.apply(_global.ExternalCommands, arguments)); }; }`
 fn getter_wrap_maker() -> Vec<u8> {
@@ -248,6 +289,7 @@ fn push(out: &mut Vec<u8>, values: &[Push]) {
                 b.extend_from_slice(&i.to_le_bytes());
             }
             Push::Null => b.push(2),
+            Push::Undefined => b.push(3),
         }
     }
     record(out, PUSH, &b);
@@ -360,6 +402,22 @@ pub fn register_invoke() -> Vec<u8> {
         push(&mut install, &[Push::Str("thedas_prewrap")]);
         install.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
     }
+    // GUI.Element.prototype.fnEventHandler = thedas_button_wrap(...), for elements set up
+    // from now on (see BUTTON_VAR).
+    let element = ["_global", "GUI", "Element", "prototype"];
+    get_path(&mut install, &element);
+    push(&mut install, &[Push::Str("fnEventHandler")]);
+    let mut handler = element.to_vec();
+    handler.push("fnEventHandler");
+    get_path(&mut install, &handler);
+    push(&mut install, &[Push::Int(1)]);
+    get_path(&mut install, &["_global"]);
+    push(&mut install, &[Push::Str("thedas_button_wrap")]);
+    install.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
+    get_path(&mut out, &["_global"]);
+    push(&mut out, &[Push::Str("thedas_button_wrap")]);
+    out.extend(button_wrap_maker());
+    out.push(SET_MEMBER);
     get_path(&mut out, &["_global"]);
     push(&mut out, &[Push::Str("thedas_install")]);
     out.extend(function(&[], &install));

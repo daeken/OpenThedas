@@ -11,7 +11,147 @@ use thedas_script::vm::{OBJECT_INVALID, ObjectId};
 use crate::sim::Sim;
 use crate::world::ObjectKind;
 
+/// The inventory screen's equip action: the item and the `INVENTORY_SLOT_*` to wear it in,
+/// for the party member the screen shows (the one the player controls).
+pub const MSG_EQUIP: &str = "GUI.SelectedChar.EquipItem";
+/// The inventory screen's unequip action: the item.
+pub const MSG_UNEQUIP: &str = "GUI.SelectedChar.UnequipItem";
+/// The party screens' arrows: the next or previous party member becomes the selected one
+/// (the one the player controls).
+pub const MSG_NEXT_CHARACTER: &str = "GUI.SelectNextCharacterMessage";
+pub const MSG_PREVIOUS_CHARACTER: &str = "GUI.SelectPreviousCharacterMessage";
+
 impl Sim {
+    /// The party's backpack: what the party members carry and do not wear, the hero's first.
+    /// Provisional: the party shares one pack, as the game's inventory screen shows it.
+    pub fn party_backpack(&self) -> Vec<ObjectId> {
+        let mut out = Vec::new();
+        for m in crate::engine::party_of(self) {
+            let Some(o) = self.world.get(m) else { continue };
+            for &i in &o.inventory {
+                let worn =
+                    o.equipment.values().any(|&e| e == i) || o.other_set.values().any(|&e| e == i);
+                if !worn && !out.contains(&i) && self.world.get(i).is_some() {
+                    out.push(i);
+                }
+            }
+        }
+        out
+    }
+
+    /// The party member wearing `item`, if one does.
+    fn wearer(&self, item: ObjectId) -> Option<ObjectId> {
+        crate::engine::party_of(self).into_iter().find(|&m| {
+            self.world.get(m).is_some_and(|o| {
+                o.equipment.values().any(|&e| e == item) || o.other_set.values().any(|&e| e == item)
+            })
+        })
+    }
+
+    /// The player puts `item` (from the party's backpack, or off another party member) on
+    /// party member `who` in `slot`, which must be one the item fits, or
+    /// `INVENTORY_SLOT_INVALID` for wherever it fits. What `who` wore there goes to the
+    /// backpack. Returns whether it was equipped.
+    pub fn equip_item(&mut self, who: ObjectId, item: ObjectId, slot: i32) -> bool {
+        let party = crate::engine::party_of(self);
+        let fits = self.item_slots(item);
+        // No slot given (INVENTORY_SLOT_INVALID, as a double click sends): the first the item
+        // fits that is free, else the first it fits.
+        let slot = if fits.contains(&slot) {
+            slot
+        } else if slot == crate::sim::constant(&self.table, "INVENTORY_SLOT_INVALID") {
+            let worn = self
+                .world
+                .get(who)
+                .map(|o| o.equipment.clone())
+                .unwrap_or_default();
+            match fits.iter().find(|s| !worn.contains_key(s)).or(fits.first()) {
+                Some(&s) => s,
+                None => return false,
+            }
+        } else {
+            return false;
+        };
+        if !party.contains(&who) {
+            return false;
+        }
+        if !self.party_backpack().contains(&item) && self.wearer(item).is_none() {
+            return false;
+        }
+        for m in party {
+            if let Some(o) = self.world.get_mut(m) {
+                o.equipment.retain(|_, i| *i != item);
+                o.other_set.retain(|_, i| *i != item);
+                if m != who {
+                    o.inventory.retain(|i| *i != item);
+                }
+            }
+        }
+        let Some(o) = self.world.get_mut(who) else {
+            return false;
+        };
+        if !o.inventory.contains(&item) {
+            o.inventory.push(item);
+        }
+        o.equipment.insert(slot, item);
+        true
+    }
+
+    /// The player takes `item` off party member `who`; it stays in the backpack. Returns
+    /// whether `who` wore it.
+    pub fn unequip_item(&mut self, who: ObjectId, item: ObjectId) -> bool {
+        if !crate::engine::party_of(self).contains(&who) {
+            return false;
+        }
+        let Some(o) = self.world.get_mut(who) else {
+            return false;
+        };
+        let n = o.equipment.len() + o.other_set.len();
+        o.equipment.retain(|_, i| *i != item);
+        o.other_set.retain(|_, i| *i != item);
+        n != o.equipment.len() + o.other_set.len()
+    }
+
+    /// The inventory screen's messages ([`MSG_EQUIP`], [`MSG_UNEQUIP`]), for the party member
+    /// the player controls, and the arrows choosing that member.
+    pub(crate) fn inventory_message(&mut self, name: &str, args: &[String]) -> bool {
+        if name == MSG_NEXT_CHARACTER || name == MSG_PREVIOUS_CHARACTER {
+            let party = crate::engine::party_of(self);
+            let Some(at) = self
+                .world
+                .controlled()
+                .and_then(|c| party.iter().position(|&m| m == c))
+            else {
+                return false;
+            };
+            let n = party.len();
+            let next = if name == MSG_NEXT_CHARACTER {
+                (at + 1) % n
+            } else {
+                (at + n - 1) % n
+            };
+            self.set_controlled(Some(party[next]));
+            return true;
+        }
+        let int = |i: usize| {
+            args.get(i)
+                .and_then(|a| a.trim().parse::<f64>().ok())
+                .filter(|v| v.fract() == 0.0 && *v >= 0.0 && *v < u32::MAX as f64)
+        };
+        let (Some(who), Some(item)) = (self.world.controlled(), int(0).map(|v| v as ObjectId))
+        else {
+            return false;
+        };
+        match name {
+            MSG_EQUIP => match int(1) {
+                Some(slot) => self.equip_item(who, item, slot as i32),
+                None => false,
+            },
+            MSG_UNEQUIP => self.unequip_item(who, item),
+            _ => false,
+        }
+    }
+
     /// `ScaleEquippedItems`: gives a creature's equipped items the material their material
     /// progression (`TS_Material`, table 199: a row per progression, columns `Material1` to
     /// `Material15`) has at the target level, as the treasure scripts pick an item's
@@ -357,6 +497,85 @@ impl Sim {
             c.other_set.retain(|_, i| !items.contains(i));
         }
         Some(bag)
+    }
+}
+
+#[cfg(test)]
+mod screen_tests {
+    use std::sync::Arc;
+
+    use thedas_formats::gda::Cell;
+    use thedas_script::EngineTable;
+    use thedas_vfs::Vfs;
+
+    use super::*;
+
+    /// A hero and a follower, a sword and a spare sword (base type 2, main hand: slot 0),
+    /// and a pelt that fits no slot.
+    fn party() -> (Sim, ObjectId, ObjectId, [ObjectId; 3]) {
+        let table = EngineTable::parse(b"int INVENTORY_SLOT_INVALID = 255;\n").unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        s.world.tables().insert(
+            "bitm_base",
+            &["EquippableSlots"],
+            vec![(2, vec![Cell::Int(0b11)])],
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let ally = s.world.spawn(ObjectKind::Creature, "ally");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().followers.push(ally);
+        let mut items = [0; 3];
+        for (i, tag) in ["sword", "spare", "pelt"].iter().enumerate() {
+            items[i] = s.world.spawn(ObjectKind::Item, tag);
+            if i < 2 {
+                s.world
+                    .get_mut(items[i])
+                    .unwrap()
+                    .fields
+                    .insert("BaseItem".into(), 2);
+            }
+        }
+        let h = s.world.get_mut(hero).unwrap();
+        h.inventory = items.to_vec();
+        h.equipment.insert(0, items[0]);
+        (s, hero, ally, items)
+    }
+
+    #[test]
+    fn the_backpack_is_what_nobody_wears() {
+        let (s, _, _, [_, spare, pelt]) = party();
+        assert_eq!(s.party_backpack(), vec![spare, pelt]);
+    }
+
+    #[test]
+    fn equipping_swaps_and_moves_between_members() {
+        let (mut s, hero, ally, [sword, spare, pelt]) = party();
+        // Not a slot the pelt fits.
+        assert!(!s.equip_item(hero, pelt, 0));
+        // Into the occupied main hand: the sword goes to the backpack.
+        assert!(s.equip_item(hero, spare, 0));
+        assert_eq!(s.world.get(hero).unwrap().equipment.get(&0), Some(&spare));
+        assert!(s.party_backpack().contains(&sword));
+        // Onto the ally, wherever it fits (slot 0 is free there).
+        assert!(s.equip_item(ally, sword, 255));
+        assert_eq!(s.world.get(ally).unwrap().equipment.get(&0), Some(&sword));
+        assert!(!s.world.get(hero).unwrap().inventory.contains(&sword));
+        // Off again: back in the backpack, carried by the ally.
+        assert!(s.unequip_item(ally, sword));
+        assert!(!s.unequip_item(ally, sword));
+        assert!(s.party_backpack().contains(&sword));
+    }
+
+    #[test]
+    fn the_screen_equips_for_the_controlled_member_and_its_arrows_cycle_the_party() {
+        let (mut s, hero, ally, [_, spare, _]) = party();
+        assert!(s.gui_message(MSG_NEXT_CHARACTER, &[]));
+        assert_eq!(s.world.controlled(), Some(ally));
+        assert!(s.gui_message(MSG_EQUIP, &[spare.to_string(), "255".into()]));
+        assert_eq!(s.world.get(ally).unwrap().equipment.get(&0), Some(&spare));
+        assert!(s.gui_message(MSG_PREVIOUS_CHARACTER, &[]));
+        assert_eq!(s.world.controlled(), Some(hero));
+        assert!(!s.gui_message(MSG_UNEQUIP, &[spare.to_string()]));
     }
 }
 

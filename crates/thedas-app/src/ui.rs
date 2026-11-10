@@ -123,6 +123,9 @@ pub struct UiLayer {
     queue: wgpu::Queue,
     /// Messages the simulation did not take, already logged.
     ignored: std::collections::HashSet<String>,
+    /// The screens' own choices (the inventory's category tab), shared with the message
+    /// handler.
+    shown: Arc<Mutex<thedas_ui::binding::Presentation>>,
     /// The conversation line on screen and how far it has played.
     line: Option<Line>,
 }
@@ -177,6 +180,7 @@ impl UiLayer {
             device: ctx.device.clone(),
             queue: ctx.queue.clone(),
             ignored: Default::default(),
+            shown: Default::default(),
             line: None,
         }
     }
@@ -186,7 +190,10 @@ impl UiLayer {
     pub fn attach(&mut self, sim: &Arc<Mutex<Sim>>) {
         self.stage
             .bridge
-            .set_message_handler(Some(thedas_ui::input::handler(sim.clone())));
+            .set_message_handler(Some(thedas_ui::input::handler_for(
+                sim.clone(),
+                self.shown.clone(),
+            )));
     }
 
     /// One interface frame while playing: binds the simulation's values, brings the screens
@@ -195,7 +202,10 @@ impl UiLayer {
     pub fn play(&mut self, screens: &mut Screens, sim: &Arc<Mutex<Sim>>, dt_ms: f64) {
         let (want, line) = {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
-            self.stage.bridge.bind(thedas_ui::binding::sim_values(&sim));
+            let shown = self.shown.lock().map(|s| s.clone()).unwrap_or_default();
+            self.stage
+                .bridge
+                .bind(thedas_ui::binding::sim_values_for(&sim, &shown));
             let waits = thedas_ui::binding::awaits_continue(&sim);
             let line = thedas_ui::binding::conversation(&sim).map(|d| {
                 let key: LineKey = (d.dialog, d.line, d.replies.iter().map(|r| r.0).collect());
@@ -232,6 +242,14 @@ impl UiLayer {
         let ignored = {
             let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             thedas_ui::input::apply_all(&mut sim, &messages)
+        };
+        // Messages for the interface itself, which the handler did not get to.
+        let ignored: Vec<(String, Vec<String>)> = match self.shown.lock() {
+            Ok(mut shown) => ignored
+                .into_iter()
+                .filter(|(n, a)| !thedas_ui::input::present(&mut shown, n, a))
+                .collect(),
+            Err(_) => ignored,
         };
         for m in &messages {
             if let GameMessage::Handled(name, args) | GameMessage::Send(name, args) = m {
@@ -373,6 +391,11 @@ impl UiLayer {
 
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
         self.stage.mouse_button(x, y, down);
+    }
+
+    /// A click the movies see as Scaleform mouse `button` (a right click, a double click).
+    pub fn click_as(&mut self, button: f64, x: f64, y: f64) {
+        self.stage.click_as(button, x, y);
     }
 
     /// Renders every movie into its texture and draws them over `target`, in order.

@@ -51,6 +51,14 @@ pub struct ModuleInfo {
     pub areas: Vec<AreaEntry>,
 }
 
+/// How an item's template presents it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ItemLook {
+    /// The icon texture (`ico_longsword.dds`).
+    pub icon: String,
+    pub description: Option<u32>,
+}
+
 /// Indexes of engine structures in the engine table (`ENGINE_STRUCTURE_n`).
 #[derive(Clone, Copy, Debug)]
 pub struct EngineTypes {
@@ -97,6 +105,8 @@ pub struct Sim {
     pub(crate) talk: Option<crate::dialog::Conversation>,
     pub(crate) plots: crate::plot::Plots,
     strings: std::sync::OnceLock<std::collections::BTreeMap<u32, String>>,
+    /// Item templates' presentation (icon, description), by template, read once.
+    item_looks: std::sync::Mutex<std::collections::HashMap<String, ItemLook>>,
 }
 
 pub const MAX_DEPTH: usize = 24;
@@ -221,6 +231,7 @@ impl Sim {
             talk: None,
             plots: crate::plot::Plots::default(),
             strings: std::sync::OnceLock::new(),
+            item_looks: Default::default(),
         }
     }
 
@@ -1999,6 +2010,31 @@ impl Sim {
             }
         }
         self.load_template_items(id, &t);
+    }
+
+    /// How an item's template presents it: its icon and description (for the interface).
+    pub fn item_look(&self, item: ObjectId) -> ItemLook {
+        let Some(template) = self.world.get(item).map(|o| o.template.clone()) else {
+            return ItemLook::default();
+        };
+        let Ok(mut cache) = self.item_looks.lock() else {
+            return ItemLook::default();
+        };
+        cache
+            .entry(template.clone())
+            .or_insert_with(|| {
+                let Ok(g) = self.read_gff3(&format!("{template}.uti")) else {
+                    return ItemLook::default();
+                };
+                let Some(r) = g.structs.first() else {
+                    return ItemLook::default();
+                };
+                ItemLook {
+                    icon: text(r, "Icon").unwrap_or_default(),
+                    description: strref(r, "Description"),
+                }
+            })
+            .clone()
     }
 
     /// Creates an item from its `.uti` template, with the template's integer fields
