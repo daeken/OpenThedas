@@ -1,0 +1,14 @@
+[package]
+name = "thedas-vfs"
+description = "Archive readers and layered resource lookup for Dragon Age data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+flate2.workspace = true
+blowfish.workspace = true
+md-5.workspace = true

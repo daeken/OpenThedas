@@ -1,0 +1,19 @@
+[package]
+name = "thedas-cli"
+description = "Command-line tools for inspecting and validating Dragon Age data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "thedas"
+path = "src/main.rs"
+
+[dependencies]
+thedas-vfs.workspace = true
+thedas-formats.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true

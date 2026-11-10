@@ -1,0 +1,278 @@
+//! A stack of resource layers with provenance.
+//!
+//! Layers are pushed lowest priority first. A lookup returns the hit from the highest layer,
+//! and [`Vfs::hits`] returns every layer that provides a name, so tools can show which files
+//! a mod or patch shadows.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::crypto::DaoKey;
+use crate::erf::Erf;
+use crate::{Error, Result, normalize_name};
+
+#[derive(Debug)]
+pub enum LayerSource {
+    Archive { erf: Arc<Erf>, key: Option<DaoKey> },
+    Directory { root: PathBuf, recursive: bool },
+}
+
+#[derive(Debug)]
+pub struct Layer {
+    /// A short human-readable description, such as the archive path relative to the install.
+    pub label: String,
+    pub source: LayerSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slot {
+    /// Index into the archive's entry table.
+    Entry(usize),
+    /// Index into the directory layer's file list.
+    File(usize),
+}
+
+/// Where a resource came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Provenance {
+    /// Position of the layer in the stack; higher wins.
+    pub layer: usize,
+    pub layer_label: String,
+    /// The file on disk: the archive, or the loose file.
+    pub file: PathBuf,
+    /// The entry name inside the archive, for archive hits.
+    pub entry: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct Vfs {
+    layers: Vec<Layer>,
+    /// Loose files per directory layer: (name, path).
+    dir_files: Vec<Vec<(String, PathBuf)>>,
+    /// Normalized name -> hits, lowest layer first.
+    index: HashMap<String, Vec<(usize, Slot)>>,
+}
+
+impl Vfs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn layers(&self) -> &[Layer] {
+        &self.layers
+    }
+
+    /// Number of distinct resource names visible through the stack.
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    pub fn push_archive(&mut self, path: impl AsRef<Path>, label: impl Into<String>) -> Result<()> {
+        let erf = Erf::open(path)?;
+        self.push_erf(Arc::new(erf), None, label);
+        Ok(())
+    }
+
+    pub fn push_erf(&mut self, erf: Arc<Erf>, key: Option<DaoKey>, label: impl Into<String>) {
+        let layer = self.layers.len();
+        for (i, e) in erf.entries.iter().enumerate() {
+            if let Some(name) = &e.name {
+                self.index
+                    .entry(normalize_name(name))
+                    .or_default()
+                    .push((layer, Slot::Entry(i)));
+            }
+        }
+        self.layers.push(Layer {
+            label: label.into(),
+            source: LayerSource::Archive { erf, key },
+        });
+        self.dir_files.push(Vec::new());
+    }
+
+    /// Adds the loose files in a directory. Archives found there are not opened; push them
+    /// separately as archive layers. A missing directory adds an empty layer.
+    pub fn push_directory(
+        &mut self,
+        root: impl AsRef<Path>,
+        recursive: bool,
+        label: impl Into<String>,
+    ) -> Result<()> {
+        let root = root.as_ref().to_path_buf();
+        let mut files = Vec::new();
+        if root.is_dir() {
+            collect_files(&root, recursive, &mut files)?;
+        }
+        files.retain(|p| !is_archive(p));
+        files.sort();
+        let layer = self.layers.len();
+        let mut named = Vec::with_capacity(files.len());
+        for path in files {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let i = named.len();
+            let hits = self.index.entry(normalize_name(&name)).or_default();
+            // Within one recursive directory, a later path shadows an earlier one.
+            if let Some(last) = hits.last() {
+                if last.0 == layer {
+                    hits.pop();
+                }
+            }
+            hits.push((layer, Slot::File(i)));
+            named.push((name, path));
+        }
+        self.layers.push(Layer {
+            label: label.into(),
+            source: LayerSource::Directory { root, recursive },
+        });
+        self.dir_files.push(named);
+        Ok(())
+    }
+
+    fn provenance(&self, layer: usize, slot: Slot) -> Provenance {
+        let l = &self.layers[layer];
+        match (&l.source, slot) {
+            (LayerSource::Archive { erf, .. }, Slot::Entry(i)) => Provenance {
+                layer,
+                layer_label: l.label.clone(),
+                file: erf.path().to_path_buf(),
+                entry: erf.entries[i].name.clone(),
+            },
+            (LayerSource::Directory { .. }, Slot::File(i)) => Provenance {
+                layer,
+                layer_label: l.label.clone(),
+                file: self.dir_files[layer][i].1.clone(),
+                entry: None,
+            },
+            _ => unreachable!("slot kind always matches layer kind"),
+        }
+    }
+
+    /// The winning source for a name, if any layer provides it.
+    pub fn lookup(&self, name: &str) -> Option<Provenance> {
+        let hits = self.index.get(&normalize_name(name))?;
+        let &(layer, slot) = hits.last()?;
+        Some(self.provenance(layer, slot))
+    }
+
+    /// Every source for a name, highest priority first.
+    pub fn hits(&self, name: &str) -> Vec<Provenance> {
+        self.index
+            .get(&normalize_name(name))
+            .map(|h| {
+                h.iter()
+                    .rev()
+                    .map(|&(l, s)| self.provenance(l, s))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Reads the winning version of a resource.
+    pub fn read(&self, name: &str) -> Result<(Vec<u8>, Provenance)> {
+        let hits = self
+            .index
+            .get(&normalize_name(name))
+            .ok_or_else(|| Error::NotFound(name.to_string()))?;
+        let &(layer, slot) = hits
+            .last()
+            .ok_or_else(|| Error::NotFound(name.to_string()))?;
+        let data = match (&self.layers[layer].source, slot) {
+            (LayerSource::Archive { erf, key }, Slot::Entry(i)) => {
+                erf.read(&erf.entries[i], key.as_ref())?
+            }
+            (LayerSource::Directory { .. }, Slot::File(i)) => {
+                let path = &self.dir_files[layer][i].1;
+                std::fs::read(path).map_err(|e| Error::Io {
+                    path: path.clone(),
+                    source: e,
+                })?
+            }
+            _ => unreachable!("slot kind always matches layer kind"),
+        };
+        Ok((data, self.provenance(layer, slot)))
+    }
+
+    /// All visible names, sorted.
+    pub fn names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.index.keys().cloned().collect();
+        v.sort();
+        v
+    }
+}
+
+/// Whether a path has an archive extension (`.erf` or `.rim`).
+pub fn is_archive_path(path: &Path) -> bool {
+    is_archive(path)
+}
+
+pub(crate) fn is_archive(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("erf" | "rim")
+    )
+}
+
+pub(crate) fn collect_files(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> Result<()> {
+    let rd = std::fs::read_dir(dir).map_err(|e| Error::Io {
+        path: dir.to_path_buf(),
+        source: e,
+    })?;
+    for entry in rd {
+        let entry = entry.map_err(|e| Error::Io {
+            path: dir.to_path_buf(),
+            source: e,
+        })?;
+        let path = entry.path();
+        let ft = entry.file_type().map_err(|e| Error::Io {
+            path: path.clone(),
+            source: e,
+        })?;
+        if ft.is_dir() {
+            if recursive {
+                collect_files(&path, true, out)?;
+            }
+        } else if ft.is_file() {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn later_directory_layers_shadow_earlier_ones() {
+        let base = std::env::temp_dir().join(format!("thedas-vfs-layers-{}", std::process::id()));
+        let low = base.join("low");
+        let high = base.join("high");
+        std::fs::create_dir_all(&low).unwrap();
+        std::fs::create_dir_all(&high).unwrap();
+        std::fs::write(low.join("A.txt"), b"low").unwrap();
+        std::fs::write(low.join("only_low.txt"), b"x").unwrap();
+        std::fs::write(high.join("a.TXT"), b"high").unwrap();
+
+        let mut vfs = Vfs::new();
+        vfs.push_directory(&low, false, "low").unwrap();
+        vfs.push_directory(&high, false, "high").unwrap();
+
+        let (data, prov) = vfs.read("a.txt").unwrap();
+        assert_eq!(data, b"high");
+        assert_eq!(prov.layer_label, "high");
+        let hits = vfs.hits("A.TXT");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[1].layer_label, "low");
+        assert_eq!(vfs.lookup("only_low.txt").unwrap().layer, 0);
+        assert!(vfs.lookup("missing").is_none());
+        assert_eq!(vfs.len(), 2);
+    }
+}
