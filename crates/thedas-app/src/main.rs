@@ -25,6 +25,7 @@
 
 mod follow;
 mod live;
+mod reticle;
 mod screens;
 mod ui;
 
@@ -107,9 +108,10 @@ struct Args {
     click: Vec<String>,
     /// Headless, playing: input played in order before the capture, `;`-separated:
     /// `click X,Y` (a left click at that pixel), `run MS` (the game and its interface run
-    /// that long), `key i` (the inventory toggle), `talk TAG` (the leader talks to a creature),
+    /// that long), `key i` (the inventory toggle), `key f1`-`key f4` (who leads), `talk TAG` (the leader talks to a creature),
     /// `rebuild` (the objects are rebuilt as a spawn rebuilds them, timed), `rclick X,Y` and
-    /// `dclick X,Y` (a right or double click for the interface).
+    /// `dclick X,Y` (a right or double click for the interface), `hover X,Y` (the mouse rests
+    /// there, for the aiming reticle).
     #[arg(long, default_value = "")]
     steps: String,
     /// Module for `--save` and `--objects`.
@@ -308,12 +310,15 @@ fn capture(
     ui: &[String],
     ui_frames: u32,
     played: Option<&mut ui::UiLayer>,
+    cursor: (f64, f64),
 ) -> Result<()> {
+    let mut reticle = Vec::new();
     let pixels = if let Some(live) = live {
         live.sync(ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
         if let Some(l) = live.level.as_ref() {
             log_stats(&l.renderer);
         }
+        reticle = live.reticle(&camera, (w, h), cursor);
         live.capture(ctx, &camera, (w, h))?
             .unwrap_or_else(|| [0, 0, 0, 255].repeat(w as usize * h as usize))
     } else {
@@ -337,6 +342,7 @@ fn capture(
         height: h,
         pixels,
     };
+    reticle::draw_rgba(&mut frame.pixels, (w, h), &reticle);
     if let Some(layer) = played {
         layer.log_gaps();
         layer.capture_over(&mut frame)?;
@@ -366,6 +372,7 @@ struct Gfx {
     ctx: GpuContext,
     renderer: Option<AreaRenderer>,
     ui: ui::UiLayer,
+    reticle: reticle::ReticlePass,
 }
 
 struct App {
@@ -451,6 +458,7 @@ impl App {
         if let (Some(live), Some(_)) = (&self.live, &self.screens) {
             ui.attach(&live.sim);
         }
+        let reticle = reticle::ReticlePass::new(&ctx.device, config.format);
         self.gfx = Some(Gfx {
             window,
             surface,
@@ -458,6 +466,7 @@ impl App {
             ctx,
             renderer,
             ui,
+            reticle,
         });
         Ok(())
     }
@@ -564,6 +573,12 @@ impl App {
                     log::debug!("ui call: {call:?}");
                 }
             }
+        }
+        // An ability aimed at a place shows where it would land, under the interface.
+        if let Some(live) = self.live.as_mut() {
+            let lines = live.reticle(&self.camera, size, self.cursor);
+            g.reticle
+                .draw(&g.ctx.device, &mut encoder, &view, size, &lines);
         }
         g.ui.composite(&mut encoder, &view, g.config.format);
         g.ctx.queue.submit([encoder.finish()]);
@@ -881,6 +896,10 @@ enum Step {
     Rebuild,
     /// A right click or a double click at a pixel, for the interface.
     ClickAs(f64, f64, f64),
+    /// The mouse rests at a pixel (where an aimed ability's reticle shows).
+    Hover(f64, f64),
+    /// F1-F4: party member n leads.
+    Leader(usize),
 }
 
 fn parse_steps(spec: &str) -> Result<Vec<Step>> {
@@ -897,8 +916,15 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
                 }
                 "run" => Step::Run(arg.parse().context("run takes milliseconds")?),
                 "key" if arg.eq_ignore_ascii_case("i") => Step::Inventory,
+                "key" if matches!(arg.to_ascii_lowercase().as_str(), "f1" | "f2" | "f3" | "f4") => {
+                    Step::Leader(arg[1..].parse::<usize>()? - 1)
+                }
                 "talk" if !arg.is_empty() => Step::Talk(arg.to_string()),
                 "rebuild" => Step::Rebuild,
+                "hover" => {
+                    let (x, y) = arg.split_once(',').context("hover takes x,y")?;
+                    Step::Hover(x.trim().parse()?, y.trim().parse()?)
+                }
                 "rclick" | "dclick" => {
                     let (x, y) = arg.split_once(',').context("click takes x,y")?;
                     let button = if verb == "rclick" {
@@ -982,6 +1008,7 @@ fn main() -> Result<()> {
     if let Some(out) = &args.capture {
         let ctx = GpuContext::headless()?;
         let mut played: Option<(ui::UiLayer, screens::Screens)> = None;
+        let mut cursor = (size.0 as f64 / 2.0, size.1 as f64 / 2.0);
         if let Some(l) = live.as_mut() {
             if ui.is_empty() {
                 let mut layer = ui::UiLayer::new(&ctx, &loaded.vfs, &[], size);
@@ -1009,6 +1036,11 @@ fn main() -> Result<()> {
             l.sim().tick(args.run_ms);
             for step in &steps {
                 match step {
+                    &Step::Hover(x, y) => cursor = (x, y),
+                    &Step::Leader(n) => match l.choose_leader(n) {
+                        Some(tag) => println!("leading with {tag}"),
+                        None => println!("no party member {}", n + 1),
+                    },
                     &Step::ClickAs(button, x, y) => {
                         if let Some((layer, _)) = played.as_mut() {
                             layer.click_as(button, x, y);
@@ -1115,12 +1147,13 @@ fn main() -> Result<()> {
             let sim = l.sim();
             if let Some(h) = sim.world.controlled().and_then(|h| sim.world.get(h)) {
                 log::info!(
-                    "leader at {:?}, doing {:?}, saying: {:?}",
+                    "leader at {:?}, doing {:?}, cooling down {:?}, saying: {:?}",
                     h.position,
                     h.commands
                         .iter()
                         .map(|c| c.name.as_str())
                         .collect::<Vec<_>>(),
+                    h.combat.cooldowns.keys().collect::<Vec<_>>(),
                     sim.dialog_state().map(|d| (d.line, d.replies, d.ended))
                 );
             }
@@ -1139,6 +1172,7 @@ fn main() -> Result<()> {
             &ui,
             args.ui_frames,
             played.as_mut().map(|(layer, _)| layer),
+            cursor,
         );
     }
 
@@ -1184,6 +1218,10 @@ mod tests {
             vec![Step::Talk("lot110cr_bryant".into())]
         );
         assert_eq!(parse_steps("rebuild").unwrap(), vec![Step::Rebuild]);
+        assert_eq!(
+            parse_steps("hover 5,6; key F4").unwrap(),
+            vec![Step::Hover(5.0, 6.0), Step::Leader(3)]
+        );
         assert_eq!(
             parse_steps("rclick 1,2; dclick 3,4").unwrap(),
             vec![Step::ClickAs(2.0, 1.0, 2.0), Step::ClickAs(5.0, 3.0, 4.0)]

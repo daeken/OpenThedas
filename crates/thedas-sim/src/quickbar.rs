@@ -23,6 +23,19 @@ const OWN_ABILITY_TYPES: [i32; 3] = [1, 2, 3];
 /// `ABI_base` `TargetType` bit for the user itself. Provisional: the bits are read from
 /// the table's contents (1 self, 2 friend, 4 hostile, the rest places).
 pub const TARGET_SELF: i32 = 1;
+/// `ABI_base` `TargetType` bit for a place (fireball, cones, the ogre's hurl). Provisional.
+pub const TARGET_PLACE: i32 = 32;
+
+/// The ground an ability covers (`ABI_base` `aoe_type`, `aoe_param1`, `aoe_param2`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AbilityArea {
+    /// A single target.
+    None,
+    /// A circle of this radius (metres), type 1.
+    Sphere(f32),
+    /// A cone of this angle (degrees) and length (metres) from the user, type 2.
+    Cone(f32, f32),
+}
 
 impl Sim {
     fn abi_int(&self, ability: i32, column: &str) -> i32 {
@@ -47,6 +60,33 @@ impl Sim {
     pub fn ability_on_self(&self, ability: i32) -> bool {
         let t = self.ability_target_type(ability);
         t == 0 || t == TARGET_SELF
+    }
+
+    /// Whether an ability may be aimed at a place on the ground.
+    pub fn ability_targets_place(&self, ability: i32) -> bool {
+        self.ability_target_type(ability) & TARGET_PLACE != 0
+    }
+
+    /// The ground an ability covers. Provisional: types other than 1 and 2 are taken to
+    /// cover no area.
+    pub fn ability_area(&self, ability: i32) -> AbilityArea {
+        let float = |c: &str| match self
+            .world
+            .tables()
+            .get(0, "ABI_base")
+            .and_then(|t| t.cell(c, ability as i64).cloned())
+        {
+            Some(Cell::Float(v)) => v as f32,
+            Some(Cell::Int(v)) => v as f32,
+            _ => 0.0,
+        };
+        match self.abi_int(ability, "aoe_type") {
+            1 if float("aoe_param1") > 0.0 => AbilityArea::Sphere(float("aoe_param1")),
+            2 if float("aoe_param2") > 0.0 => {
+                AbilityArea::Cone(float("aoe_param1"), float("aoe_param2"))
+            }
+            _ => AbilityArea::None,
+        }
     }
 
     /// An ability's `ABI_base` `UseType` (2 sustained, 3 passive, 4 activated).
@@ -129,6 +169,36 @@ mod tests {
 
     use super::*;
     use crate::world::ObjectKind;
+
+    #[test]
+    fn ground_abilities_are_ordered_at_a_place_and_cast_from_where_the_user_stands() {
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let (i, f) = (|v: i64| Cell::Int(v), |v: f64| Cell::Float(v));
+        s.world.tables().insert(
+            "ABI_base",
+            &["TargetType", "aoe_type", "aoe_param1", "aoe_param2"],
+            vec![
+                (10003, vec![i(127), i(1), f(7.5), f(0.0)]),
+                (10201, vec![i(126), i(2), i(35), i(10)]),
+                (3024, vec![i(4), i(0), i(0), i(0)]),
+            ],
+        );
+        assert!(s.ability_targets_place(10003) && s.ability_targets_place(10201));
+        assert!(!s.ability_targets_place(3024));
+        assert_eq!(s.ability_area(10003), AbilityArea::Sphere(7.5));
+        assert_eq!(s.ability_area(10201), AbilityArea::Cone(35.0, 10.0));
+        assert_eq!(s.ability_area(3024), AbilityArea::None);
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let mage = s.world.spawn(ObjectKind::Creature, "mage");
+        s.world.get_mut(mage).unwrap().area = Some(area);
+        s.order_ability_at(mage, 10003, [10.0, 0.0, 0.0], "");
+        let c = s.world.get(mage).unwrap().commands[0].clone();
+        assert_eq!((c.target, c.ints.clone()), (None, vec![10003]));
+        assert_eq!(c.location.unwrap().position, [10.0, 0.0, 0.0]);
+        // Its place is where it lands, not where the mage goes.
+        s.tick(5_000);
+        assert_eq!(s.world.get(mage).unwrap().position, [0.0, 0.0, 0.0]);
+    }
 
     #[test]
     fn the_bar_holds_set_slots_then_usable_abilities() {
