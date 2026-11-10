@@ -19,6 +19,9 @@ pub mod field {
     pub const ARL_NAME: u32 = 3012;
     pub const ARL_ROOMS: u32 = 3016;
     pub const ARL_PATHING: u32 = 3020;
+    pub const ARL_SUN_ON: u32 = 3148;
+    pub const ARL_SUN_COLOR: u32 = 3149;
+    pub const ARL_SUN_DIRECTION: u32 = 3150;
     pub const PATHING_GRID: u32 = 3110;
     pub const GRID_COLUMNS: u32 = 3086;
     pub const GRID_ROWS: u32 = 3087;
@@ -84,6 +87,19 @@ pub struct Arl {
     pub rooms: Vec<ArlRoom>,
     /// The pathing grid the engine routes creatures on, when the layout has one.
     pub grid: Option<NavGrid>,
+    /// The level's sun, when it has one (exteriors).
+    pub sun: Option<Sun>,
+}
+
+/// A level's sun: the direction its light travels (normalized, world space) and its colour.
+///
+/// Provisional, from the layouts' contents: field 3148 is 1 in exteriors and 0 in interiors,
+/// 3149 the colour and 3150 a unit vector pointing down, which the shaders' sun light
+/// (`g_vLightParams` 2 and 3) takes as the light's direction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sun {
+    pub direction: [f32; 3],
+    pub color: [f32; 3],
 }
 
 /// The layout's pathing grid: `columns x rows` square cells of `cell_size` metres from
@@ -198,10 +214,30 @@ impl Arl {
             },
             None => None,
         };
+        let sun = match d.opt_i64(root, field::ARL_SUN_ON)? {
+            Some(on) if on != 0 => {
+                let color = d.opt_vec3(root, field::ARL_SUN_COLOR)?;
+                let direction = d.opt_vec3(root, field::ARL_SUN_DIRECTION)?;
+                match (color, direction) {
+                    (Some(color), Some([x, y, z])) => {
+                        let len = (x * x + y * y + z * z).sqrt();
+                        (len.is_finite() && len > 1e-6 && color.iter().all(|c| c.is_finite())).then(
+                            || Sun {
+                                direction: [x / len, y / len, z / len],
+                                color,
+                            },
+                        )
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         Ok(Arl {
             name: d.opt_str(root, field::ARL_NAME)?,
             rooms,
             grid,
+            sun,
         })
     }
 
@@ -368,6 +404,29 @@ mod tests {
         assert_eq!(arl.rooms.len(), 2);
         assert_eq!(arl.rooms[1].name, "lvl_7");
         assert_eq!(arl.bounds(), Some(([-1.0, -2.0, -3.0], [5.0, 2.0, 3.0])));
+        assert_eq!(arl.sun, None);
+    }
+
+    #[test]
+    fn reads_an_exteriors_sun() {
+        let sun = |on: i32, dir: [f32; 3]| {
+            let mut b = Builder::new(b"ARL ");
+            let root = b.add(
+                b"AREA",
+                vec![
+                    (field::ARL_SUN_ON, Value::I32(on)),
+                    (field::ARL_SUN_COLOR, Value::Vec4([0.6, 0.5, 0.3, 1.0])),
+                    (field::ARL_SUN_DIRECTION, Value::Vec3(dir)),
+                ],
+            );
+            Arl::from_gff4(&b.finish(root)).unwrap().sun
+        };
+        let s = sun(1, [0.0, 0.0, -2.0]).unwrap();
+        assert_eq!(s.direction, [0.0, 0.0, -1.0]);
+        assert_eq!(s.color, [0.6, 0.5, 0.3]);
+        // Interiors have it off; a direction of no length is no sun.
+        assert_eq!(sun(0, [0.0, 0.0, -1.0]), None);
+        assert_eq!(sun(1, [0.0; 3]), None);
     }
 
     #[test]

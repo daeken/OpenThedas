@@ -333,6 +333,8 @@ pub struct ConstantContext<'a> {
     pub bones: &'a [[f32; 4]],
     /// The irradiance probe lighting the draw (`g_mLightParams`), if the level has one.
     pub irradiance: Option<&'a IrradianceProbe>,
+    /// The level's sun: the direction its light travels and its colour.
+    pub sun: Option<(Vec3, Vec3)>,
 }
 
 /// Light from every direction for draws in a level with no irradiance probe. Provisional.
@@ -404,6 +406,12 @@ impl ConstantContext<'_> {
             r[at + 1] = [c.x, c.y, c.z, 1.0];
         }
         r[4] = [self.ambient.x, self.ambient.y, self.ambient.z, 1.0];
+        // The sun takes registers 2 (direction) and 3 (colour), which the shaders read under
+        // control boolean 3. Provisional, from the shaders' use of them.
+        if let Some((d, c)) = self.sun {
+            r[2] = [d.x, d.y, d.z, 0.0];
+            r[3] = [c.x, c.y, c.z, 1.0];
+        }
         r
     }
 
@@ -454,7 +462,7 @@ impl ConstantContext<'_> {
             ("LightsArray", _) | (_, "g_vLightParams") => Value::Vectors(self.light_params()),
             ("ShaderControlBooleans", _) | (_, "g_bShaderControlBooleans") => {
                 let n = self.lights.points.len();
-                Value::Bools(vec![false, n > 1, n > 2, false])
+                Value::Bools(vec![false, n > 1, n > 2, self.sun.is_some()])
             }
             // Three 4x4 matrices, red, green and blue: the vertex shaders light a normal n
             // with n^T M n (see `thedas_formats::probe`).
@@ -717,6 +725,7 @@ mod tests {
             ambient: Vec3::new(0.1, 0.2, 0.3),
             bones: &[],
             irradiance: None,
+            sun: Some((Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.6, 0.5, 0.3))),
         };
         let t = table(vec![
             constant(
@@ -775,6 +784,10 @@ mod tests {
         assert_eq!(c.bools[0][0], 0, "light D stays off");
         assert_eq!(c.bools[1][0], 1, "second point light enables B");
         assert_eq!(c.bools[2][0], 0);
+        // The sun: its direction and colour in registers 2 and 3, and boolean 3 on.
+        assert_eq!(c.floats[2], [0.0, 0.0, -1.0, 0.0]);
+        assert_eq!(c.floats[3], [0.6, 0.5, 0.3, 1.0]);
+        assert_eq!(c.bools[3][0], 1);
         assert_eq!(c.floats[40], [0.0; 4]);
     }
 
@@ -825,6 +838,7 @@ mod tests {
             ambient: Vec3::ZERO,
             bones: &[],
             irradiance: None,
+            sun: None,
         };
         let c = cc.fill(Some(&table(vec![constant(
             "mml_vTintColor",
@@ -874,6 +888,7 @@ mod tests {
                 ambient: Vec3::ZERO,
                 bones: &[],
                 irradiance: None,
+                sun: None,
             };
             let c = cc.fill(Some(&table(vec![constant(
                 "aur_mWorld",
