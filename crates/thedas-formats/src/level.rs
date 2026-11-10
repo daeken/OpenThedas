@@ -35,6 +35,13 @@ pub mod field {
     pub const ATMO_FOG_CAP: u32 = 22531;
     pub const ATMO_FOG_ZENITH: u32 = 22532;
     pub const ATMO_FOG_TACTICAL: u32 = 22535;
+    pub const ARL_CLOUDS: u32 = 22600;
+    pub const CLOUD_DENSITY: u32 = 22620;
+    pub const CLOUD_SHARPNESS: u32 = 22621;
+    pub const CLOUD_DEPTH: u32 = 22622;
+    pub const CLOUD_RANGE_1: u32 = 22623;
+    pub const CLOUD_RANGE_2: u32 = 22624;
+    pub const CLOUD_COLOR: u32 = 22625;
     pub const FBE_NAME: u32 = 5520;
     pub const FBE_EFFECT: u32 = 5521;
     pub const FBE_PARAMETERS: u32 = 5522;
@@ -118,6 +125,21 @@ pub struct Arl {
     pub sky_model: Option<String>,
     /// The level's atmosphere (22500): sky scattering and fog, when it has one.
     pub atmosphere: Option<Atmosphere>,
+    /// The level's clouds (22600), when it has them.
+    pub clouds: Option<Clouds>,
+}
+
+/// A level's clouds (`CLDS`, 22600), which the sky's cloud layer reads.
+///
+/// Field names are xoreos's; DAOrigins.exe's loader (0x5d07bc) reads each as 0 when absent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Clouds {
+    pub density: f32,
+    pub sharpness: f32,
+    pub depth: f32,
+    pub range_1: f32,
+    pub range_2: f32,
+    pub color: [f32; 3],
 }
 
 /// A level's atmosphere (`ATMO`, 22500): what the engine computes the sky's scattering
@@ -372,6 +394,25 @@ impl Arl {
             }
             None => None,
         };
+        let clouds = match d.opt_struct(root, field::ARL_CLOUDS)? {
+            Some(c) => {
+                let f = |l| -> TypedResult<f32> {
+                    Ok(d.opt_f32(c, l)?.filter(|v| v.is_finite()).unwrap_or(0.0))
+                };
+                Some(Clouds {
+                    density: f(field::CLOUD_DENSITY)?,
+                    sharpness: f(field::CLOUD_SHARPNESS)?,
+                    depth: f(field::CLOUD_DEPTH)?,
+                    range_1: f(field::CLOUD_RANGE_1)?,
+                    range_2: f(field::CLOUD_RANGE_2)?,
+                    color: d
+                        .opt_vec3(c, field::CLOUD_COLOR)?
+                        .filter(|v| v.iter().all(|x| x.is_finite()))
+                        .unwrap_or([0.0; 3]),
+                })
+            }
+            None => None,
+        };
         Ok(Arl {
             name: d.opt_str(root, field::ARL_NAME)?,
             rooms,
@@ -382,6 +423,7 @@ impl Arl {
                 .opt_str(root, field::ARL_SKY_MODEL)?
                 .filter(|m| !m.is_empty()),
             atmosphere,
+            clouds,
         })
     }
 
@@ -730,11 +772,19 @@ mod tests {
                 (field::ATMO_FOG_ZENITH, Value::F32(42.0)),
             ],
         );
+        let clouds = b.add(
+            b"CLDS",
+            vec![
+                (field::CLOUD_DENSITY, Value::F32(0.67)),
+                (field::CLOUD_COLOR, Value::Vec3([0.12, 0.14, 0.12])),
+            ],
+        );
         let root = b.add(
             b"AREA",
             vec![
                 (field::ARL_SKY_MODEL, s("sb_day")),
                 (field::ARL_ATMOSPHERE, Value::Struct(Some(atmo))),
+                (field::ARL_CLOUDS, Value::Struct(Some(clouds))),
             ],
         );
         let arl = Arl::from_gff4(&b.finish(root)).unwrap();
@@ -744,5 +794,9 @@ mod tests {
         assert_eq!(a.fog_cap, 0.65);
         assert_eq!(a.mie, 0.0, "absent fields read 0");
         assert_eq!(a.alpha, 1.0, "absent alpha reads 1");
+        let c = arl.clouds.unwrap();
+        assert_eq!(c.density, 0.67);
+        assert_eq!(c.color, [0.12, 0.14, 0.12]);
+        assert_eq!(c.range_1, 0.0);
     }
 }

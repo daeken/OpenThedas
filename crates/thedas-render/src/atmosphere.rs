@@ -9,23 +9,29 @@
 //!   475 nm) times the Rayleigh multiplier;
 //! - Mie extinction `βM = 0.434 · c · 4π³ · K / λ²` with `c = (0.6544 T − 0.6510) · 1e-16`
 //!   for turbidity `T`, `K = 0.67`, times the Mie multiplier;
-//! - the Henyey–Greenstein eccentricity `g` is 0: the loader never reads it.
+//! - the Henyey–Greenstein eccentricity `g` is −0.5: the loader never reads it, so it keeps
+//!   the atmosphere's preset (0x55c910, preset 0), which the loader applies first.
 //!
 //! The registers (vec4s):
 //!
 //! - sky `c0 = (1 + g², 2g, earth reflectance, distance multiplier)`,
 //!   `c1 = (βR + βM, sun red · intensity)`, `c2 = (βM · (1 − g²) / 4π, sun green ·
-//!   intensity)`, `c3 = (3 βR / 16π, sun blue · intensity)`, `c4` the celestial body's
-//!   (zero: nothing sets it from the level), `c5`-`c8` the celestial body's projection;
+//!   intensity)`, `c3 = (3 βR / 16π, sun blue · intensity)`, `c4` the clouds' first vector
+//!   (the sky shader scales the celestial body by its x), `c5`-`c8` the celestial body's
+//!   projection (vertex shader);
+//! - clouds `[0] = (density, sharpness, depth, range 1)`, `[1] = (colour, range 2)`, from
+//!   the level's `CLDS` (loaded at 0x5d07bc into the fields the update packs this way), or
+//!   the preset's `(1, 0.2, −120, 2)`, `(1, 1, 1, 2)` when the level has none;
 //! - fog `[0] = (fog colour, x²)` with `x = lerp(tactical · intensity, intensity, t)`,
 //!   `[1] = (1 − cap, alpha, zenith in radians, 0)`. The shaders fog by
 //!   `exp(−d² · [0].w)` down to a floor of `[1].x`.
 //!
 //! Provisional: `t` is taken as 1 (the game camera; the engine reads it from the camera
-//! each frame, 0 being the tactical view); the celestial body (`c4`-`c8`) is not drawn;
+//! each frame, 0 being the tactical view); the celestial body's projection is not built,
+//! so it is not drawn; the clouds do not drift (the shaders' time is 0);
 //! how the engine packs the vertex shader's nine sky vectors is not traced.
 
-use thedas_formats::level::Atmosphere;
+use thedas_formats::level::{Atmosphere, Clouds};
 
 /// Rayleigh extinction per metre at 650, 570 and 475 nm.
 const BETA_RAYLEIGH: [f32; 3] = [6.95e-6, 1.18e-5, 2.44e-5];
@@ -47,10 +53,24 @@ pub fn fog_params(a: Option<&Atmosphere>) -> [[f32; 4]; 2] {
     ]
 }
 
+/// The cloud registers (`CloudParameters`).
+pub fn cloud_params(c: Option<&Clouds>) -> [[f32; 4]; 2] {
+    match c {
+        Some(c) => [
+            [c.density, c.sharpness, c.depth, c.range_1],
+            [c.color[0], c.color[1], c.color[2], c.range_2],
+        ],
+        None => [[1.0, 0.2, -120.0, 2.0], [1.0, 1.0, 1.0, 2.0]],
+    }
+}
+
+/// The preset's Henyey–Greenstein eccentricity (see the module docs).
+pub const PHASE_ECCENTRICITY: f32 = -0.5;
+
 /// The sky registers `c0`-`c8`.
-pub fn sky_params(a: &Atmosphere) -> [[f32; 4]; 9] {
+pub fn sky_params(a: &Atmosphere, clouds: Option<&Clouds>) -> [[f32; 4]; 9] {
     use std::f64::consts::PI;
-    let g = 0.0f32;
+    let g = PHASE_ECCENTRICITY;
     let c = (a.turbidity as f64 * 6.544 - 6.51) * 1e-17;
     let mie_base = (0.434 * c * 4.0 * PI.powi(3)) as f32;
     let beta_r = BETA_RAYLEIGH.map(|b| b * a.rayleigh);
@@ -68,6 +88,7 @@ pub fn sky_params(a: &Atmosphere) -> [[f32; 4]; 9] {
     r[1][3] = sun[0];
     r[2][3] = sun[1];
     r[3][3] = sun[2];
+    r[4] = cloud_params(clouds)[0];
     // No celestial body: its projection keeps w at 1 so the shader's divide stays finite.
     r[8] = [0.0, 0.0, 0.0, 1.0];
     r
@@ -109,7 +130,7 @@ mod tests {
 
     #[test]
     fn sky_follows_preetham() {
-        let s = sky_params(&atmo());
+        let s = sky_params(&atmo(), None);
         let a = atmo();
         // Rayleigh's angular term is 3/16π of its extinction.
         let br = 6.95e-6 * a.rayleigh;
@@ -123,7 +144,9 @@ mod tests {
             "{} vs {bm}",
             s[1][0] - br
         );
-        assert_eq!(s[0][0], 1.0);
+        assert_eq!(s[0][0], 1.25);
+        assert_eq!(s[0][1], -1.0);
+        assert_eq!(s[4], [1.0, 0.2, -120.0, 2.0]);
         assert!((s[1][3] - 0.74 * 17.378).abs() < 1e-4);
         assert_eq!(s[8][3], 1.0);
     }
