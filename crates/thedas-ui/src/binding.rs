@@ -414,22 +414,10 @@ fn quickbar(sim: &Sim, who: u32, v: &mut BTreeMap<String, UiValue>) {
         } else {
             v.insert(k.clone(), num(q.ability));
         }
-        let item = sim
-            .party_backpack()
-            .into_iter()
-            .chain(
-                sim.world
-                    .get(who)
-                    .map(|o| o.inventory.clone())
-                    .unwrap_or_default(),
-            )
-            .find(|&i| {
-                !q.item.is_empty()
-                    && sim
-                        .world
-                        .get(i)
-                        .is_some_and(|o| o.tag.eq_ignore_ascii_case(&q.item))
-            });
+        // The item the slot comes from: one of the party's, which shares its items.
+        let item = (!q.item.is_empty())
+            .then(|| sim.party_item(who, &q.item))
+            .flatten();
         v.insert(
             format!("{k}.Status"),
             num(sim.modal_active(who, q.ability) as u8),
@@ -467,10 +455,12 @@ fn quickbar(sim: &Sim, who: u32, v: &mut BTreeMap<String, UiValue>) {
                     .unwrap_or_default(),
             ),
         );
-        // How many of the item are left; no text for an ability's slot.
-        let stack = match item.and_then(|i| sim.world.get(i)) {
-            Some(o) => num(o.fields.get("StackSize").copied().unwrap_or(1)),
-            None => UiValue::String(String::new()),
+        // How many of the item the party has left (0, shown red, when they ran out); no
+        // text for an ability's slot.
+        let stack = if q.item.is_empty() {
+            UiValue::String(String::new())
+        } else {
+            num(sim.item_count(&q.item))
         };
         v.insert(format!("{k}.SourceItem.StackSize"), stack);
     }
