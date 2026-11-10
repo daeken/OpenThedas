@@ -17,6 +17,12 @@ use std::sync::{Arc, Mutex};
 
 use crate::{CallKind, Responder, UiCall, UiValue};
 
+/// Acts on a game message as the game does when the movie sends it, before the movie's next
+/// instruction: returns the engine values that changed, or `None` when it did not act (the
+/// message is then passed on as a [`GameMessage::Send`]).
+pub type MessageHandler =
+    Arc<dyn Fn(&str, &[String]) -> Option<Vec<(String, UiValue)>> + Send + Sync>;
+
 /// Looks up a talk-table string.
 pub type StringLookup = Arc<dyn Fn(u32) -> Option<String> + Send + Sync>;
 
@@ -33,6 +39,8 @@ struct State {
     contexts: Vec<String>,
     unanswered: BTreeMap<String, u64>,
     sounds: Vec<String>,
+    /// Messages the handler already acted on, oldest first (their text).
+    handled: std::collections::VecDeque<String>,
 }
 
 /// Engine values and strings the movies ask for, shared by every movie.
@@ -40,6 +48,7 @@ struct State {
 pub struct GameBridge {
     state: Arc<Mutex<State>>,
     strings: StringLookup,
+    handler: Arc<Mutex<Option<MessageHandler>>>,
 }
 
 /// What a call means to the rest of the engine, once the bridge has handled its own part.
@@ -47,6 +56,8 @@ pub struct GameBridge {
 pub enum GameMessage {
     /// `SendMessage`/`SendMessageArgs`: a message to a game system (name, arguments).
     Send(String, Vec<String>),
+    /// A message the bridge's handler acted on when the movie sent it.
+    Handled(String, Vec<String>),
     /// Anything the bridge does not know.
     Other(UiCall),
 }
@@ -94,6 +105,14 @@ impl GameBridge {
         Self {
             state: Arc::new(Mutex::new(state)),
             strings,
+            handler: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Installs (or removes) the handler for game messages the movies send.
+    pub fn set_message_handler(&self, handler: Option<MessageHandler>) {
+        if let Ok(mut h) = self.handler.lock() {
+            *h = handler;
         }
     }
 
@@ -174,6 +193,19 @@ impl GameBridge {
         };
         let arg = |i: usize| args.get(i).cloned().unwrap_or_default();
         match call.name.as_str() {
+            // The game acts on a message before the movie goes on (a movie reads the result
+            // right after sending it, as chanters.gfx does after accepting a job).
+            "SendMessage" | "SendMessageArgs" if call.kind == CallKind::FsCommand => {
+                let handler = self.handler.lock().ok().and_then(|h| h.clone());
+                let name = arg(0);
+                if let Some(changed) = handler.and_then(|h| h(&name, &args[1.min(args.len())..])) {
+                    self.set_values(changed);
+                    if let Ok(mut s) = self.state.lock() {
+                        s.handled.push_back(args.join(" "));
+                    }
+                }
+                UiValue::Undefined
+            }
             "GetValue" | "GetNumber" | "GetString" | "GetBool" => {
                 let name = arg(0);
                 let Ok(mut s) = self.state.lock() else {
@@ -274,6 +306,10 @@ impl GameBridge {
             "SendMessage" | "SendMessageArgs" => {
                 let mut parts = text.split(' ').map(str::to_string);
                 let name = parts.next().unwrap_or_default();
+                if s.handled.front() == Some(&text) {
+                    s.handled.pop_front();
+                    return Some(GameMessage::Handled(name, parts.collect()));
+                }
                 Some(GameMessage::Send(name, parts.collect()))
             }
             _ => Some(GameMessage::Other(call)),
@@ -299,6 +335,47 @@ mod tests {
 
     fn bridge() -> GameBridge {
         GameBridge::new(Arc::new(|id| (id == 5).then(|| "Five".to_string())))
+    }
+
+    #[test]
+    fn handled_messages_update_values_before_the_movie_reads_them() {
+        let b = bridge();
+        b.set_message_handler(Some(Arc::new(|name: &str, args: &[String]| {
+            (name == "Journal.AcceptChantersQuest").then(|| {
+                vec![(
+                    format!(
+                        "Board.{}.Accepted",
+                        args.first().cloned().unwrap_or_default()
+                    ),
+                    UiValue::Number(1.0),
+                )]
+            })
+        })));
+        let fs = CallKind::FsCommand;
+        let accept = call(fs, "SendMessage", &["Journal.AcceptChantersQuest 2"]);
+        b.respond(&accept);
+        assert_eq!(
+            b.respond(&call(
+                CallKind::ExternalInterface,
+                "GetValue",
+                &["Board.2.Accepted"]
+            )),
+            UiValue::Number(1.0)
+        );
+        assert_eq!(
+            b.handle(accept),
+            Some(GameMessage::Handled(
+                "Journal.AcceptChantersQuest".into(),
+                vec!["2".into()]
+            ))
+        );
+        // What the handler does not act on goes to the rest of the engine as before.
+        let other = call(fs, "SendMessage", &["GUI.HideFullScreenGUI"]);
+        b.respond(&other);
+        assert_eq!(
+            b.handle(other),
+            Some(GameMessage::Send("GUI.HideFullScreenGUI".into(), vec![]))
+        );
     }
 
     #[test]

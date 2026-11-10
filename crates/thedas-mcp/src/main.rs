@@ -49,6 +49,21 @@ struct State {
 /// Engine values bound for the interface.
 type UiValues = Vec<(String, UiValue)>;
 
+/// Acts on the movies' game messages as they are sent (see `GameBridge::set_message_handler`),
+/// with the simulation's messages (`Sim::gui_message`). When the simulation is busy (a tool
+/// holds it) the message waits and is applied after the frames instead.
+fn message_handler(state: Arc<Mutex<State>>) -> thedas_ui::protocol::MessageHandler {
+    Arc::new(move |name: &str, args: &[String]| {
+        let mut st = state.try_lock().ok()?;
+        let sim = st.sim.as_mut()?;
+        if !sim.gui_message(name, args) {
+            return None;
+        }
+        sim.tick(0);
+        Some(thedas_ui::binding::sim_values(sim).into_iter().collect())
+    })
+}
+
 #[derive(Clone)]
 struct Server {
     state: Arc<Mutex<State>>,
@@ -82,6 +97,9 @@ fn messages_json(m: Vec<GameMessage>) -> J {
         m.into_iter()
             .map(|m| match m {
                 GameMessage::Send(name, args) => json!({ "send": name, "args": args }),
+                GameMessage::Handled(name, args) => {
+                    json!({ "send": name, "args": args, "handled": true })
+                }
                 GameMessage::Other(c) => json!({
                     "movie": c.movie, "kind": format!("{:?}", c.kind), "name": c.name,
                     "args": c.args.iter().map(ui_json).collect::<Vec<_>>(),
@@ -663,6 +681,9 @@ impl Server {
         };
         let mut out = Vec::new();
         for m in messages {
+            if let GameMessage::Handled(name, args) = m {
+                out.push(json!({ "message": name, "args": args, "when": "sent", "board": board_json(sim) }));
+            }
             if let GameMessage::Send(name, args) = m {
                 if name == "Conversation.SelectResponse" {
                     let n = args
@@ -711,10 +732,12 @@ impl Server {
             a.height.unwrap_or(720).clamp(64, 4096),
         );
         let names = thedas_ui::stage::movie_names(&a.movies);
+        let handler = message_handler(self.state.clone());
         let r = self
             .ui
             .run(move |w| -> Result<J, String> {
                 let stage = w.stage(&vfs, size)?;
+                stage.bridge.set_message_handler(Some(handler.clone()));
                 stage.bridge.set_values(values.clone());
                 let mut failed = Vec::new();
                 for n in &names {

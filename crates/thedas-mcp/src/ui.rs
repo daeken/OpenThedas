@@ -113,8 +113,9 @@ impl UiWorld {
         let Some(stage) = self.stage.as_mut() else {
             return;
         };
+        // Bound once: messages handled during these frames update the values themselves.
+        stage.bridge.set_values(values.iter().cloned());
         for _ in 0..frames.max(1) {
-            stage.bridge.set_values(values.iter().cloned());
             self.messages.extend(stage.tick(1000.0 / 30.0));
         }
     }

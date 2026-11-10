@@ -15,7 +15,8 @@
 //! Open question: jobs are posted by scripts setting their visible flags (a guild box's
 //! plot script, or a finished job posting the next), but nothing in the data posts the first
 //! Lothering job (`BANDITS2_CHANTER_BOARD`), although the area marks the board as having one.
-//! The original engine may post some jobs itself; until that is known, only flagged jobs show.
+//! The original engine may post some jobs itself (its `Journal` handles the movie's messages;
+//! the posting rule is not recovered); until that is known, only flagged jobs show.
 //!
 //! The board's contents are kept in the world while it is open, so the interface reads them
 //! without touching the simulation.
