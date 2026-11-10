@@ -347,6 +347,12 @@ impl Sim {
                 (Some(e), c) if e <= until && c.is_none_or(|(d, _)| e <= d) => {
                     if let Some((due, q)) = self.world.pop_due(until) {
                         self.world.time_ms = self.world.time_ms.max(due);
+                        // Objects in an area the party left do not run; their events wait
+                        // until the party is back. Provisional.
+                        if self.world.get(q.target).is_some_and(|o| o.parked.is_some()) {
+                            self.world.held.push(q);
+                            continue;
+                        }
                         let (target, ty) = (q.target, q.event.ty);
                         self.deliver(q.target, q.event, q.script);
                         self.next_heartbeat(target, ty);
@@ -978,6 +984,15 @@ impl Sim {
                     if let Some(a) = o.parked.take() {
                         o.active = a;
                     }
+                }
+            }
+            // Events that waited while the area was unloaded run now.
+            let held = std::mem::take(&mut self.world.held);
+            for q in held {
+                if self.world.get(q.target).is_some_and(|o| o.parked.is_some()) {
+                    self.world.held.push(q);
+                } else {
+                    self.world.queue_event(0, q.target, q.event, q.script);
                 }
             }
             self.world.area = Some(area);
