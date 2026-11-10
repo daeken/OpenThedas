@@ -185,6 +185,12 @@ pub const STUBS: &[&str] = &[
 
 /// Converts `CommandMoveToObject` to `COMMAND_TYPE_MOVE_TO_OBJECT`.
 fn command_constant(name: &str) -> String {
+    // Where script.ldf spells the type differently from the constructor.
+    match name {
+        "CommandDeathBlow" => return "COMMAND_TYPE_DEATHBLOW".into(),
+        "CommandSwitchWeaponSet" => return "COMMAND_TYPE_SWITCH_WEAPON_SETS".into(),
+        _ => {}
+    }
     let base = name.trim_start_matches("Command");
     let mut out = String::from("COMMAND_TYPE_");
     for (i, c) in base.chars().enumerate() {
@@ -194,6 +200,26 @@ fn command_constant(name: &str) -> String {
         out.push(c.to_ascii_uppercase());
     }
     out
+}
+
+/// Constructors whose command type script.ldf does not name; scripts only check that a
+/// command's type is not 0 (`COMMAND_TYPE_INVALID`: rules_core warns "Something is trying to
+/// add an invalid command"), so these get types of their own above the named ones.
+/// Provisional: the engine's own numbers for them are not recovered.
+const UNNAMED_COMMANDS: &[&str] = &[
+    "CommandMoveAwayFromObject",
+    "CommandMoveToMultiLocations",
+    "CommandSheatheWeapons",
+    "CommandUnsheatheWeapons",
+    "CommandTurn",
+];
+
+/// A command constructor's `COMMAND_TYPE_*` value (see [`UNNAMED_COMMANDS`]).
+fn command_type(table: &thedas_script::EngineTable, name: &str) -> i32 {
+    match UNNAMED_COMMANDS.iter().position(|n| *n == name) {
+        Some(i) => 1000 + i as i32,
+        None => constant(table, &command_constant(name)),
+    }
 }
 
 /// Runs engine function `f`; `None` if it is not implemented.
@@ -311,6 +337,10 @@ pub fn call(
                 "DisplayFloatyMessage" => (-1, string(a, 1)),
                 _ => (0, string(a, 0)),
             };
+            if name == "Warning" {
+                let key: String = text.chars().take(160).collect();
+                *h.sim.world.trace.warnings.entry(key).or_default() += 1;
+            }
             h.sim.world.trace.push(TraceEntry::Log { t, channel, text });
             void()
         }
@@ -1425,7 +1455,7 @@ pub fn call(
         // --- Commands ---------------------------------------------------------------------
         n if n.starts_with("Command") && f.ret == Type::Engine(ty.command) => {
             let mut c = Command {
-                ty: constant(&h.sim.table, &command_constant(n)),
+                ty: command_type(&h.sim.table, n),
                 name: n.to_string(),
                 target: None,
                 location: None,
@@ -1488,6 +1518,31 @@ pub fn call(
             Some(EngineData::Command(c)) => c.ty,
             _ => 0,
         })),
+        // A command's arguments, as its constructor took them: integers in order, float 0
+        // (a wait's seconds and the like), object 0 its target. Provisional.
+        "GetCommandInt" | "GetCommandFloat" | "GetCommandObject" => {
+            let c = match h.sim.world.handle(handle(a, 0)) {
+                Some(EngineData::Command(c)) => Some(c.clone()),
+                _ => None,
+            };
+            let i = int(a, 1);
+            ok(match name {
+                "GetCommandInt" => Value::Int(
+                    c.as_ref()
+                        .and_then(|c| c.ints.get(usize::try_from(i).ok()?).copied())
+                        .unwrap_or(0),
+                ),
+                "GetCommandFloat" => {
+                    Value::Float(c.as_ref().filter(|_| i == 0).map_or(0.0, |c| c.seconds))
+                }
+                _ => Value::Object(
+                    c.as_ref()
+                        .filter(|_| i == 0)
+                        .and_then(|c| c.target)
+                        .unwrap_or(OBJECT_INVALID),
+                ),
+            })
+        }
         "AddCommand" => {
             let Some(EngineData::Command(c)) = h.sim.world.handle(handle(a, 1)).cloned() else {
                 return ok(Value::Int(0));
@@ -2737,8 +2792,10 @@ pub fn call(
         "HasDeathEffect" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.dead))),
         // Damage effects. Provisional: the types are the ids in effects.gda
         // (EFFECT_TYPE_DAMAGE 1013, EFFECT_TYPE_IMPACT 1024); the value layout is how the
-        // rules scripts read them back (float 0 is the damage, integers are the damage type,
-        // flags and visual effect, object 0 is the weapon).
+        // rules scripts read them back. Float 0 is the damage. A damage effect's integers are
+        // the damage type, flags and visual effect; an impact's are its arguments in order,
+        // visual effect, ability and damage type (rules_core's attack impact and
+        // talent_singletarget read integer 2 as the damage type), and object 0 is the weapon.
         "EffectDamage" | "EffectImpact" => {
             let e = if name == "EffectDamage" {
                 Effect {
@@ -2754,7 +2811,7 @@ pub fn call(
                     creator: Some(caller),
                     floats: vec![float(a, 0)],
                     objects: vec![obj(a, 1)],
-                    ints: vec![int(a, 4), 0, int(a, 2)],
+                    ints: vec![int(a, 2), int(a, 3), int(a, 4)],
                     ability: int(a, 3),
                     ..Default::default()
                 }
@@ -3968,6 +4025,20 @@ mod tests {
             "COMMAND_TYPE_MOVE_TO_OBJECT"
         );
         assert_eq!(command_constant("CommandWait"), "COMMAND_TYPE_WAIT");
+        assert_eq!(
+            command_constant("CommandDeathBlow"),
+            "COMMAND_TYPE_DEATHBLOW"
+        );
+        assert_eq!(
+            command_constant("CommandSwitchWeaponSet"),
+            "COMMAND_TYPE_SWITCH_WEAPON_SETS"
+        );
+        let table = thedas_script::EngineTable::default();
+        assert!(
+            UNNAMED_COMMANDS
+                .iter()
+                .all(|n| command_type(&table, n) >= 1000)
+        );
         assert_eq!(format_float(1.5, 0, 6), "1.500000");
         assert_eq!(format_float(2.0, 6, 1), "   2.0");
         let square = [
