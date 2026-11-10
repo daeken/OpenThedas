@@ -757,6 +757,7 @@ mod tests {
             SceneLight::Ambient {
                 color: Vec3::ONE,
                 name: String::new(),
+                room: String::new(),
             },
         ];
         let picked = pick_lights(&lights, (Vec3::ZERO, 1.0));

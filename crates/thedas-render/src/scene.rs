@@ -134,6 +134,8 @@ pub enum SceneLight {
     Ambient {
         color: Vec3,
         name: String,
+        /// The room whose light model holds it: it lights that room.
+        room: String,
     },
 }
 
@@ -729,6 +731,7 @@ impl<'a> Loader<'a> {
                 thedas_formats::model::Light::Ambient { color } => SceneLight::Ambient {
                     color: Vec3::new(color[0], color[1], color[2]),
                     name,
+                    room: room.to_string(),
                 },
             });
         }
@@ -971,10 +974,13 @@ impl AreaScene {
         for prop in props {
             let first = l.scene.draws.len();
             let at = prop.transform.w_axis.truncate();
-            let probe = match room_at(&arl.rooms, at) {
+            let in_room = room_at(&arl.rooms, at);
+            let probe = match in_room {
                 Some(room) => l.room_probe(level, &room.name),
                 None => l.room_probe(level, ""),
             };
+            // Objects are lit as part of the room they stand in.
+            let room_name = in_room.map_or(prop.label.as_str(), |r| r.name.as_str());
             let placing = |room| Placing {
                 scale: 1.0,
                 sphere: None,
@@ -1001,7 +1007,7 @@ impl AreaScene {
             for model in &prop.models {
                 let at = Placing {
                     tint: tint_of(model),
-                    ..placing(&prop.label)
+                    ..placing(room_name)
                 };
                 l.place(model, prop.transform, at);
             }
@@ -1022,7 +1028,7 @@ impl AreaScene {
                 let first = l.scene.draws.len();
                 let placing_at = Placing {
                     tint: tint_of(model),
-                    ..placing(&prop.label)
+                    ..placing(room_name)
                 };
                 l.place(model, at, placing_at);
                 let skeleton = l.skeleton(&body, &mmh);
@@ -1044,7 +1050,7 @@ impl AreaScene {
                         let model = model.to_ascii_lowercase();
                         let at = Placing {
                             morph: Some((name.as_str(), &m)),
-                            ..placing(&prop.label)
+                            ..placing(room_name)
                         };
                         l.place(&model, prop.transform, at);
                     }
