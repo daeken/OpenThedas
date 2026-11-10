@@ -482,13 +482,76 @@ fn attack_actions(sim: &Sim, o: &Object, due: u64) -> Vec<String> {
 
 /// Every active creature and placeable in `area` that has a model, in id order.
 pub fn area_models(sim: &Sim, area: ObjectId) -> Vec<ObjectModel> {
-    sim.world
+    area_models_cached(sim, area, &mut ModelCache::default())
+}
+
+/// What each object draws, kept between calls: working it out reads templates and tables,
+/// so a caller asking every frame (a running game) keeps one of these. An object's entry is
+/// worked out again when anything it depends on changes.
+#[derive(Default)]
+pub struct ModelCache {
+    drawn: std::collections::HashMap<ObjectId, (DrawnKey, Drawn)>,
+}
+
+/// What [`object_models`] reads from an object.
+#[derive(Clone, PartialEq)]
+struct DrawnKey {
+    template: String,
+    appearance: i32,
+    gender: Option<i32>,
+    head_morph: Option<String>,
+    equipment: Vec<(i32, ObjectId, Option<i32>, Option<i32>)>,
+}
+
+impl DrawnKey {
+    fn of(sim: &Sim, o: &Object) -> Self {
+        let field =
+            |id: ObjectId, f: &str| sim.world.get(id).and_then(|i| i.fields.get(f).copied());
+        DrawnKey {
+            template: o.template.clone(),
+            appearance: o.appearance,
+            gender: o.fields.get("Gender").copied(),
+            head_morph: o.head_morph.clone(),
+            equipment: o
+                .equipment
+                .iter()
+                .map(|(&slot, &item)| {
+                    (
+                        slot,
+                        item,
+                        field(item, "BaseItem"),
+                        field(item, "ModelVariation"),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+/// [`area_models`] keeping what objects draw in `cache`.
+pub fn area_models_cached(sim: &Sim, area: ObjectId, cache: &mut ModelCache) -> Vec<ObjectModel> {
+    let objects: Vec<&Object> = sim
+        .world
         .objects
         .values()
         .filter(|o| o.area == Some(area) && o.active)
         .filter(|o| matches!(o.kind, ObjectKind::Creature | ObjectKind::Placeable))
+        .collect();
+    cache
+        .drawn
+        .retain(|id, _| objects.iter().any(|o| o.id == *id));
+    objects
+        .into_iter()
         .filter_map(|o| {
-            let d = object_models(sim, o);
+            let key = DrawnKey::of(sim, o);
+            let d = match cache.drawn.get(&o.id) {
+                Some((k, d)) if *k == key => d.clone(),
+                _ => {
+                    let d = object_models(sim, o);
+                    cache.drawn.insert(o.id, (key, d.clone()));
+                    d
+                }
+            };
             (!d.models.is_empty()).then(|| ObjectModel {
                 id: o.id,
                 tag: o.tag.clone(),

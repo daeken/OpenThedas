@@ -1,14 +1,18 @@
-//! `thedas-app`: walk through one Dragon Age: Origins area.
+//! `thedas-app`: walk through a Dragon Age: Origins area, or play.
 //!
-//! Interactive: WASD to move, Q/E (or C/Space) down/up, Shift to move faster, hold the right
+//! Interactive: WASD to move, Q/E (or C) down/up, Shift to move faster, hold the right
 //! mouse button (or use the arrow keys) to look around, P to print the camera, F12 to save a
 //! capture, Esc to quit.
+//!
+//! Playing: `--save <file>` (a save from the MCP's save_state) or `--new-game` runs the
+//! simulation live at real time; Space pauses it.
 //!
 //! Headless: `--capture out.png --camera x,y,z,yaw,pitch` renders one frame with no window.
 //!
 //! `--ui menu`, `--ui hud` or `--ui movie1,movie2` plays Scaleform movies over the scene;
 //! `--area none` shows them alone.
 
+mod live;
 mod ui;
 
 use std::collections::HashSet;
@@ -75,80 +79,15 @@ struct Args {
     /// area resource given as `--area`).
     #[arg(long)]
     objects: bool,
+    /// Start a new game: the module's start, through character creation's quick start.
+    #[arg(long)]
+    new_game: bool,
+    /// Headless, playing: run the simulation this many milliseconds before capturing.
+    #[arg(long, default_value_t = 0)]
+    run_ms: u64,
     /// Module for `--save` and `--objects`.
     #[arg(long, default_value = "single player")]
     module: String,
-}
-
-/// The simulation's view of the area to draw: the level, its objects' models and the hero.
-struct SimView {
-    layout: String,
-    props: Vec<thedas_render::Prop>,
-    /// Each prop's animation.
-    clips: Vec<Option<thedas_render::Clip>>,
-    hero: Option<([f32; 3], f32)>,
-}
-
-/// Opens a simulation for `area` (or the save's area) and reads its models. The simulation
-/// is only read and never ticked, so the area shows its objects as placed (ticking would
-/// run the module's start, which begins an origin story elsewhere).
-fn sim_view(
-    install: &Path,
-    module: &str,
-    area: Option<&str>,
-    save: Option<&Path>,
-) -> Result<SimView> {
-    let opts = thedas_sim::session::SessionOptions {
-        install: install.to_path_buf(),
-        module: module.to_string(),
-        area: area.map(str::to_string),
-        waypoint: None,
-        seed: 1,
-        keep_trace: false,
-    };
-    let mut sim = thedas_sim::session::open(&opts)?;
-    if let Some(path) = save {
-        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        sim.load_json(&bytes)?;
-    }
-    let area = sim.world.area.context("the simulation is in no area")?;
-    let layout = sim.area_layout(area).context("the area has no layout")?;
-    let models = thedas_ui::models::area_models(&sim, area);
-    let clips = models
-        .iter()
-        .map(|m| {
-            m.motion.as_ref().map(|c| thedas_render::Clip {
-                trees: c.trees.clone(),
-                actions: c.actions.clone(),
-                time: c.time,
-                looping: c.looping,
-            })
-        })
-        .collect();
-    let props = models
-        .into_iter()
-        .map(|m| thedas_render::Prop {
-            label: format!("{} {}", m.id, m.tag),
-            models: m.models,
-            attached: m.attached.into_iter().map(|a| (a.model, a.node)).collect(),
-            morph: m.morph,
-            hide_hair: m.hide_hair,
-            tints: m.tints,
-            transform: thedas_render::Prop::placement(m.position, m.facing),
-        })
-        .collect();
-    let hero = sim
-        .world
-        .hero
-        .and_then(|h| sim.world.get(h))
-        .filter(|h| h.area == Some(area))
-        .map(|h| (h.position, h.facing));
-    Ok(SimView {
-        layout,
-        props,
-        clips,
-        hero,
-    })
 }
 
 /// Behind and above a hero at `pos` with the game's `facing`, looking the same way (as the
@@ -182,21 +121,27 @@ struct Loaded {
     vfs: Arc<Vfs>,
     scene: Option<AreaScene>,
     shaders: String,
-    /// Each prop's placement and animation.
-    posed: Vec<(glam::Mat4, Option<thedas_render::Clip>)>,
 }
 
 impl Loaded {
     fn programs(&self, scene: &AreaScene) -> Result<ProgramRegistry> {
+        programs(&self.vfs, scene, &self.shaders)
+    }
+}
+
+/// The programs drawing `scene`: the original shaders the `--shaders` choice allows, the
+/// stand-in for the rest.
+pub fn programs(vfs: &Vfs, scene: &AreaScene, shaders: &str) -> Result<ProgramRegistry> {
+    {
         let mut reg = ProgramRegistry::default();
-        let filter = match self.shaders.as_str() {
+        let filter = match shaders {
             "standin" => return Ok(reg),
             "original" => thedas_render::d3d::object_filter(),
             "static" => thedas_render::d3d::static1_filter(),
             "all" => None,
             other => bail!("--shaders must be original, static, all or standin, not {other}"),
         };
-        let source = thedas_render::d3d::D3dSource::new(&self.vfs, scene, &filter);
+        let source = thedas_render::d3d::D3dSource::new(vfs, scene, &filter);
         log::info!(
             "original shaders: {} programs, {} failed",
             source.programs().count(),
@@ -222,7 +167,6 @@ fn load(
             vfs: Arc::new(vfs),
             scene: None,
             shaders: shaders.to_string(),
-            posed: Vec::new(),
         });
     }
     let level = match install.mount_level(&mut vfs, area) {
@@ -261,7 +205,6 @@ fn load(
         vfs: Arc::new(vfs),
         scene: Some(scene),
         shaders: shaders.to_string(),
-        posed: Vec::new(),
     })
 }
 
@@ -314,6 +257,7 @@ fn log_stats(r: &AreaRenderer) {
 
 fn capture(
     loaded: &Loaded,
+    live: Option<&mut live::Live>,
     out: &Path,
     camera: Camera,
     (w, h): (u32, u32),
@@ -321,27 +265,30 @@ fn capture(
     ui_frames: u32,
 ) -> Result<()> {
     let ctx = GpuContext::headless()?;
-    let pixels = match &loaded.scene {
-        Some(scene) => {
-            let mut renderer = AreaRenderer::new(
-                &ctx,
-                &loaded.vfs,
-                scene,
-                &loaded.programs(scene)?,
-                thedas_render::gpu::CAPTURE_FORMAT,
-            );
-            log_stats(&renderer);
-            thedas_render::Animator::default().pose_props(
-                &loaded.vfs,
-                scene,
-                &mut renderer,
-                &ctx,
-                &loaded.posed,
-                0.0,
-            );
-            renderer.capture(&ctx, &camera, w, h)?
+    let pixels = if let Some(live) = live {
+        live.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
+        match live.scene.as_mut() {
+            Some(s) => {
+                log_stats(&s.renderer);
+                s.renderer.capture(&ctx, &camera, w, h)?
+            }
+            None => [0, 0, 0, 255].repeat(w as usize * h as usize),
         }
-        None => [0, 0, 0, 255].repeat(w as usize * h as usize),
+    } else {
+        match &loaded.scene {
+            Some(scene) => {
+                let mut renderer = AreaRenderer::new(
+                    &ctx,
+                    &loaded.vfs,
+                    scene,
+                    &loaded.programs(scene)?,
+                    thedas_render::gpu::CAPTURE_FORMAT,
+                );
+                log_stats(&renderer);
+                renderer.capture(&ctx, &camera, w, h)?
+            }
+            None => [0, 0, 0, 255].repeat(w as usize * h as usize),
+        }
     };
     let mut frame = thedas_ui::Rgba {
         width: w,
@@ -378,9 +325,8 @@ struct Gfx {
 
 struct App {
     loaded: Loaded,
-    animator: thedas_render::Animator,
-    /// When the window opened: looping animations play from it.
-    started: Instant,
+    /// The running game, when playing.
+    live: Option<live::Live>,
     ui: Vec<String>,
     cursor: (f64, f64),
     camera: Camera,
@@ -469,10 +415,7 @@ impl App {
         let axis = |pos: bool, neg: bool| (pos as i32 - neg as i32) as f32;
         let fwd = axis(k(KeyCode::KeyW), k(KeyCode::KeyS));
         let right = axis(k(KeyCode::KeyD), k(KeyCode::KeyA));
-        let up = axis(
-            k(KeyCode::KeyE) || k(KeyCode::Space),
-            k(KeyCode::KeyQ) || k(KeyCode::KeyC),
-        );
+        let up = axis(k(KeyCode::KeyE), k(KeyCode::KeyQ) || k(KeyCode::KeyC));
         self.camera.fly(fwd * speed, right * speed, up * speed);
         let turn = 1.5 * dt;
         let yaw = axis(k(KeyCode::ArrowLeft), k(KeyCode::ArrowRight));
@@ -504,18 +447,15 @@ impl App {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        if let (Some(r), Some(scene)) = (g.renderer.as_mut(), self.loaded.scene.as_ref()) {
-            let elapsed = self.started.elapsed().as_secs_f32();
-            self.animator.pose_props(
-                &self.loaded.vfs,
-                scene,
-                r,
-                &g.ctx,
-                &self.loaded.posed,
-                elapsed,
-            );
+        if let Some(live) = self.live.as_mut() {
+            live.step(dt);
+            live.sync(&g.ctx, g.config.format)?;
         }
-        match &mut g.renderer {
+        let renderer = match self.live.as_mut() {
+            Some(live) => live.scene.as_mut().map(|s| &mut s.renderer),
+            None => g.renderer.as_mut(),
+        };
+        match renderer {
             Some(r) => r.render(
                 &g.ctx,
                 &mut encoder,
@@ -562,7 +502,11 @@ impl App {
             .map_or("ui", |s| s.level.as_str());
         let path = PathBuf::from(format!("{level}-capture-{}.png", self.captures));
         let (w, h) = (g.config.width, g.config.height);
-        let Some(renderer) = g.renderer.as_mut() else {
+        let renderer = match self.live.as_mut() {
+            Some(live) => live.scene.as_mut().map(|s| &mut s.renderer),
+            None => g.renderer.as_mut(),
+        };
+        let Some(renderer) = renderer else {
             return Ok(());
         };
         let pixels = renderer.capture(&g.ctx, &self.camera, w, h)?;
@@ -609,6 +553,15 @@ impl ApplicationHandler for App {
                             match code {
                                 KeyCode::Escape => event_loop.exit(),
                                 KeyCode::KeyP => println!("camera {}", self.camera.spec()),
+                                KeyCode::Space => {
+                                    if let Some(live) = self.live.as_mut() {
+                                        live.paused = !live.paused;
+                                        println!(
+                                            "{}",
+                                            if live.paused { "paused" } else { "running" }
+                                        );
+                                    }
+                                }
                                 KeyCode::F12 => {
                                     if let Err(e) = self.save_capture() {
                                         eprintln!("capture failed: {e:#}");
@@ -690,38 +643,37 @@ fn main() -> Result<()> {
         .or_else(|| std::env::var_os("THEDAS_INSTALL").map(PathBuf::from))
         .context("give --install or set THEDAS_INSTALL")?;
     let size = parse_size(&args.size)?;
-    let view = if args.save.is_some() || args.objects {
-        Some(sim_view(
-            &install,
-            &args.module,
-            args.save.is_none().then_some(args.area.as_str()),
-            args.save.as_deref(),
-        )?)
+    let start = if let Some(save) = &args.save {
+        Some(live::Start::Save(save))
+    } else if args.new_game {
+        Some(live::Start::NewGame)
+    } else if args.objects {
+        Some(live::Start::Area(&args.area))
     } else {
         None
     };
-    let (area, props) = match &view {
-        Some(v) => (v.layout.as_str(), v.props.as_slice()),
-        None => (args.area.as_str(), &[][..]),
+    let mut live = match start {
+        Some(start) => Some(live::Live::open(
+            &install,
+            &args.module,
+            start,
+            &args.shaders,
+        )?),
+        None => None,
     };
-    let mut loaded = load(&install, area, &args.shaders, props)?;
-    if let Some(v) = &view {
-        loaded.posed = v
-            .props
-            .iter()
-            .map(|p| p.transform)
-            .zip(v.clips.iter().cloned())
-            .collect();
-    }
-    let hero = view.as_ref().and_then(|v| v.hero);
-    let mut camera = match (&args.camera, &loaded.scene) {
-        (Some(spec), _) => Camera::parse(spec).context("camera must be x,y,z,yaw,pitch")?,
-        (None, Some(_)) if hero.is_some() => {
-            let (pos, facing) = hero.unwrap_or_default();
-            hero_camera(pos, facing)
-        }
-        (None, Some(scene)) => default_camera(scene),
-        (None, None) => Camera::new(Vec3::ZERO, 0.0, 0.0),
+    // Playing, the scene comes from the game; the interface still reads the global stack.
+    let area = if live.is_some() {
+        "none"
+    } else {
+        args.area.as_str()
+    };
+    let loaded = load(&install, area, &args.shaders, &[])?;
+    let hero = live.as_ref().and_then(|l| l.hero());
+    let mut camera = match (&args.camera, &loaded.scene, hero) {
+        (Some(spec), _, _) => Camera::parse(spec).context("camera must be x,y,z,yaw,pitch")?,
+        (None, _, Some((pos, facing))) => hero_camera(pos, facing),
+        (None, Some(scene), None) => default_camera(scene),
+        (None, None, None) => Camera::new(Vec3::ZERO, 0.0, 0.0),
     };
     camera.fov_y = args.fov.clamp(10.0, 150.0).to_radians();
     let ui = args
@@ -731,14 +683,24 @@ fn main() -> Result<()> {
         .unwrap_or_default();
 
     if let Some(out) = &args.capture {
-        return capture(&loaded, out, camera, size, &ui, args.ui_frames);
+        if let Some(l) = live.as_mut() {
+            l.sim.tick(args.run_ms);
+        }
+        return capture(
+            &loaded,
+            live.as_mut(),
+            out,
+            camera,
+            size,
+            &ui,
+            args.ui_frames,
+        );
     }
 
     let event_loop = EventLoop::new()?;
     let mut app = App {
         loaded,
-        animator: thedas_render::Animator::default(),
-        started: Instant::now(),
+        live,
         ui,
         cursor: (0.0, 0.0),
         camera,
