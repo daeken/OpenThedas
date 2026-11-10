@@ -1,0 +1,12 @@
+[package]
+name = "thedas-shader"
+description = "Direct3D 9 shader bytecode parsing and translation to naga IR"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+naga.workspace = true
