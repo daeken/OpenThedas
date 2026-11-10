@@ -1,0 +1,22 @@
+[package]
+name = "thedas-ui"
+description = "Scaleform GFx UI for OpenThedas, played by Ruffle on our wgpu device"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ruffle_core = { git = "https://github.com/ruffle-rs/ruffle", rev = "c8a03ccd335e30031fa51f698d55c5402d450578" }
+ruffle_render_wgpu = { git = "https://github.com/ruffle-rs/ruffle", rev = "c8a03ccd335e30031fa51f698d55c5402d450578" }
+wgpu.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+futures = "0.3"
+url = "2"
+async-channel = "2"
+encoding_rs = "0.8"
+thedas-formats.workspace = true
+roxmltree.workspace = true

@@ -5,6 +5,11 @@
 //! capture, Esc to quit.
 //!
 //! Headless: `--capture out.png --camera x,y,z,yaw,pitch` renders one frame with no window.
+//!
+//! `--ui menu`, `--ui hud` or `--ui movie1,movie2` plays Scaleform movies over the scene;
+//! `--area none` shows them alone.
+
+mod ui;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -35,7 +40,7 @@ struct Args {
     /// Install root (the folder holding packages/ and modules/). Defaults to $THEDAS_INSTALL.
     #[arg(long)]
     install: Option<PathBuf>,
-    /// Environment level (e.g. lgt101d) or area resource (e.g. cir110ar_inn).
+    /// Environment level (e.g. lgt101d), area resource (e.g. cir110ar_inn), or `none`.
     #[arg(long, default_value = "lgt101d")]
     area: String,
     /// Render one frame to this PNG with no window, then exit.
@@ -55,6 +60,12 @@ struct Args {
     /// Vertical field of view in degrees.
     #[arg(long, default_value_t = 60.0)]
     fov: f32,
+    /// Scaleform movies to overlay: `menu`, `hud`, or a comma-separated list of movie names.
+    #[arg(long)]
+    ui: Option<String>,
+    /// Headless: movie frames to run (at 30 fps) before capturing the interface.
+    #[arg(long, default_value_t = 30)]
+    ui_frames: u32,
 }
 
 fn parse_size(s: &str) -> Result<(u32, u32)> {
@@ -69,13 +80,13 @@ fn parse_size(s: &str) -> Result<(u32, u32)> {
 }
 
 struct Loaded {
-    vfs: Vfs,
-    scene: AreaScene,
+    vfs: Arc<Vfs>,
+    scene: Option<AreaScene>,
     shaders: String,
 }
 
 impl Loaded {
-    fn programs(&self) -> Result<ProgramRegistry> {
+    fn programs(&self, scene: &AreaScene) -> Result<ProgramRegistry> {
         let mut reg = ProgramRegistry::default();
         let filter = match self.shaders.as_str() {
             "standin" => return Ok(reg),
@@ -83,7 +94,7 @@ impl Loaded {
             "all" => None,
             other => bail!("--shaders must be original, all or standin, not {other}"),
         };
-        let source = thedas_render::d3d::D3dSource::new(&self.vfs, &self.scene, &filter);
+        let source = thedas_render::d3d::D3dSource::new(&self.vfs, scene, &filter);
         log::info!(
             "original shaders: {} programs, {} failed",
             source.programs().count(),
@@ -99,6 +110,13 @@ impl Loaded {
 fn load(install: &Path, area: &str, shaders: &str) -> Result<Loaded> {
     let install = DaoInstall::open(install)?;
     let mut vfs = install.global_vfs(TextureQuality::High)?;
+    if area == "none" {
+        return Ok(Loaded {
+            vfs: Arc::new(vfs),
+            scene: None,
+            shaders: shaders.to_string(),
+        });
+    }
     let level = match install.mount_level(&mut vfs, area) {
         Ok(mount) => mount.level,
         Err(_) => {
@@ -130,8 +148,8 @@ fn load(install: &Path, area: &str, shaders: &str) -> Result<Loaded> {
         started.elapsed().as_secs_f64()
     );
     Ok(Loaded {
-        vfs,
-        scene,
+        vfs: Arc::new(vfs),
+        scene: Some(scene),
         shaders: shaders.to_string(),
     })
 }
@@ -183,18 +201,45 @@ fn log_stats(r: &AreaRenderer) {
     }
 }
 
-fn capture(loaded: &Loaded, out: &Path, camera: Camera, (w, h): (u32, u32)) -> Result<()> {
+fn capture(
+    loaded: &Loaded,
+    out: &Path,
+    camera: Camera,
+    (w, h): (u32, u32),
+    ui: &[String],
+    ui_frames: u32,
+) -> Result<()> {
     let ctx = GpuContext::headless()?;
-    let mut renderer = AreaRenderer::new(
-        &ctx,
-        &loaded.vfs,
-        &loaded.scene,
-        &loaded.programs()?,
-        thedas_render::gpu::CAPTURE_FORMAT,
-    );
-    log_stats(&renderer);
-    let pixels = renderer.capture(&ctx, &camera, w, h)?;
-    write_png(out, w, h, &pixels)?;
+    let pixels = match &loaded.scene {
+        Some(scene) => {
+            let mut renderer = AreaRenderer::new(
+                &ctx,
+                &loaded.vfs,
+                scene,
+                &loaded.programs(scene)?,
+                thedas_render::gpu::CAPTURE_FORMAT,
+            );
+            log_stats(&renderer);
+            renderer.capture(&ctx, &camera, w, h)?
+        }
+        None => [0, 0, 0, 255].repeat(w as usize * h as usize),
+    };
+    let mut frame = thedas_ui::Rgba {
+        width: w,
+        height: h,
+        pixels,
+    };
+    if !ui.is_empty() {
+        let mut layer = ui::UiLayer::new(&ctx, &loaded.vfs, ui, (w, h));
+        for _ in 0..ui_frames {
+            for call in layer.tick(1000.0 / 30.0) {
+                log::debug!("ui call: {call:?}");
+            }
+        }
+        layer.log_gaps();
+        layer.capture_over(&mut frame)?;
+    }
+    write_png(out, w, h, &frame.pixels)?;
     println!(
         "wrote {} ({w}x{h}, camera {})",
         out.display(),
@@ -208,11 +253,14 @@ struct Gfx {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     ctx: GpuContext,
-    renderer: AreaRenderer,
+    renderer: Option<AreaRenderer>,
+    ui: ui::UiLayer,
 }
 
 struct App {
     loaded: Loaded,
+    ui: Vec<String>,
+    cursor: (f64, f64),
     camera: Camera,
     size: (u32, u32),
     gfx: Option<Gfx>,
@@ -228,11 +276,14 @@ impl App {
         let window = Arc::new(
             event_loop.create_window(
                 Window::default_attributes()
-                    .with_title(format!(
-                        "OpenThedas - {} ({})",
-                        self.loaded.scene.name.as_deref().unwrap_or(""),
-                        self.loaded.scene.level
-                    ))
+                    .with_title(match &self.loaded.scene {
+                        Some(s) => format!(
+                            "OpenThedas - {} ({})",
+                            s.name.as_deref().unwrap_or(""),
+                            s.level
+                        ),
+                        None => "OpenThedas".to_string(),
+                    })
                     .with_inner_size(LogicalSize::new(self.size.0, self.size.1)),
             )?,
         );
@@ -251,21 +302,34 @@ impl App {
         }
         config.present_mode = wgpu::PresentMode::AutoVsync;
         surface.configure(&ctx.device, &config);
-        let renderer = AreaRenderer::new(
+        let renderer = match &self.loaded.scene {
+            Some(scene) => {
+                let r = AreaRenderer::new(
+                    &ctx,
+                    &self.loaded.vfs,
+                    scene,
+                    &self.loaded.programs(scene)?,
+                    config.format,
+                );
+                log_stats(&r);
+                println!("camera {}", self.camera.spec());
+                Some(r)
+            }
+            None => None,
+        };
+        let ui = ui::UiLayer::new(
             &ctx,
             &self.loaded.vfs,
-            &self.loaded.scene,
-            &self.loaded.programs()?,
-            config.format,
+            &self.ui,
+            (config.width, config.height),
         );
-        log_stats(&renderer);
-        println!("camera {}", self.camera.spec());
         self.gfx = Some(Gfx {
             window,
             surface,
             config,
             ctx,
             renderer,
+            ui,
         });
         Ok(())
     }
@@ -295,6 +359,7 @@ impl App {
     }
 
     fn redraw(&mut self) -> Result<()> {
+        let dt = self.last.elapsed().as_secs_f64() * 1000.0;
         self.update();
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
@@ -317,14 +382,35 @@ impl App {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        g.renderer.render(
-            &g.ctx,
-            &mut encoder,
-            &view,
-            g.config.width,
-            g.config.height,
-            &self.camera,
-        );
+        match &mut g.renderer {
+            Some(r) => r.render(
+                &g.ctx,
+                &mut encoder,
+                &view,
+                g.config.width,
+                g.config.height,
+                &self.camera,
+            ),
+            None => {
+                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("clear"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                });
+            }
+        }
+        for call in g.ui.tick(dt.min(100.0)) {
+            log::debug!("ui call: {call:?}");
+        }
+        g.ui.composite(&mut encoder, &view, g.config.format);
         g.ctx.queue.submit([encoder.finish()]);
         g.window.pre_present_notify();
         g.ctx.queue.present(frame);
@@ -336,12 +422,17 @@ impl App {
             return Ok(());
         };
         self.captures += 1;
-        let path = PathBuf::from(format!(
-            "{}-capture-{}.png",
-            self.loaded.scene.level, self.captures
-        ));
+        let level = self
+            .loaded
+            .scene
+            .as_ref()
+            .map_or("ui", |s| s.level.as_str());
+        let path = PathBuf::from(format!("{level}-capture-{}.png", self.captures));
         let (w, h) = (g.config.width, g.config.height);
-        let pixels = g.renderer.capture(&g.ctx, &self.camera, w, h)?;
+        let Some(renderer) = g.renderer.as_mut() else {
+            return Ok(());
+        };
+        let pixels = renderer.capture(&g.ctx, &self.camera, w, h)?;
         write_png(&path, w, h, &pixels)?;
         println!("wrote {} (camera {})", path.display(), self.camera.spec());
         Ok(())
@@ -371,6 +462,7 @@ impl ApplicationHandler for App {
                         g.config.width = size.width;
                         g.config.height = size.height;
                         g.surface.configure(&g.ctx.device, &g.config);
+                        g.ui.resize((size.width, size.height));
                     }
                 }
             }
@@ -397,6 +489,22 @@ impl ApplicationHandler for App {
                     ElementState::Released => {
                         self.keys.remove(&code);
                     }
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x, position.y);
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.mouse_move(position.x, position.y);
+                }
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let (x, y) = self.cursor;
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.mouse_button(x, y, state == ElementState::Pressed);
                 }
             }
             WindowEvent::MouseInput {
@@ -450,19 +558,23 @@ fn main() -> Result<()> {
         .context("give --install or set THEDAS_INSTALL")?;
     let size = parse_size(&args.size)?;
     let loaded = load(&install, &args.area, &args.shaders)?;
-    let mut camera = match &args.camera {
-        Some(spec) => Camera::parse(spec).context("camera must be x,y,z,yaw,pitch")?,
-        None => default_camera(&loaded.scene),
+    let mut camera = match (&args.camera, &loaded.scene) {
+        (Some(spec), _) => Camera::parse(spec).context("camera must be x,y,z,yaw,pitch")?,
+        (None, Some(scene)) => default_camera(scene),
+        (None, None) => Camera::new(Vec3::ZERO, 0.0, 0.0),
     };
     camera.fov_y = args.fov.clamp(10.0, 150.0).to_radians();
+    let ui = args.ui.as_deref().map(ui::movie_names).unwrap_or_default();
 
     if let Some(out) = &args.capture {
-        return capture(&loaded, out, camera, size);
+        return capture(&loaded, out, camera, size, &ui, args.ui_frames);
     }
 
     let event_loop = EventLoop::new()?;
     let mut app = App {
         loaded,
+        ui,
+        cursor: (0.0, 0.0),
         camera,
         size,
         gfx: None,

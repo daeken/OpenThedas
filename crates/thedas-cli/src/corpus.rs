@@ -47,6 +47,8 @@ struct Stats {
     archive_versions: BTreeMap<String, u64>,
     /// Shader model counts (`vs_3_0`, `ps_2_1`, ...).
     shader_models: BTreeMap<String, u64>,
+    /// Scaleform tags in GFx movies, by name, with the movies' external images.
+    gfx_tags: BTreeMap<String, u64>,
 }
 
 impl Stats {
@@ -184,6 +186,9 @@ fn merge(into: &mut Stats, from: Stats, keep: usize) {
     into.loose_files += from.loose_files;
     for (k, v) in from.archive_versions {
         *into.archive_versions.entry(k).or_default() += v;
+    }
+    for (k, v) in from.gfx_tags {
+        *into.gfx_tags.entry(k).or_default() += v;
     }
     for (k, v) in from.shader_models {
         *into.shader_models.entry(k).or_default() += v;
@@ -337,6 +342,8 @@ fn check_other(
             .map_err(|e| e.to_string())
     } else if ext == "dds" {
         Dds::parse(data).map(|_| ()).map_err(|e| e.to_string())
+    } else if ext == "gfx" {
+        return check_gfx(data, location, stats, keep);
     } else if ext == "fxo" {
         return check_shader(data, location, stats, keep);
     } else if ext == "ncs" {
@@ -349,6 +356,25 @@ fn check_other(
         return;
     };
     typed_result(stats, ext, location, result, keep);
+}
+
+/// GFx movies: inventory the Scaleform tags and rewrite to plain SWF (without images).
+fn check_gfx(data: &[u8], location: String, stats: &mut Stats, keep: usize) {
+    let result = thedas_formats::gfx::scan(data).and_then(|inv| {
+        for (code, n) in inv.scaleform_tags() {
+            let name = thedas_formats::gfx::scaleform_tag_name(code)
+                .map_or_else(|| code.to_string(), str::to_string);
+            *stats.gfx_tags.entry(name).or_default() += n as u64;
+        }
+        thedas_formats::gfx::rewrite(data, &mut |_| None, None).map(|_| ())
+    });
+    typed_result(
+        stats,
+        "gfx",
+        location,
+        result.map_err(|e| e.to_string()),
+        keep,
+    );
 }
 
 /// Scripts: parse and disassemble, and check every engine call against the engine table
@@ -572,6 +598,9 @@ fn print_summary(stats: &Stats, secs: f64) -> bool {
         stats.loose_files,
         stats.archive_versions
     );
+    if !stats.gfx_tags.is_empty() {
+        println!("Scaleform tags: {:?}", stats.gfx_tags);
+    }
     if !stats.shader_models.is_empty() {
         println!("Shader models: {:?}", stats.shader_models);
     }
@@ -671,6 +700,7 @@ fn to_report(stats: &Stats, ok: bool) -> serde_json::Value {
         "archives_failed": stats.archives_failed,
         "archive_versions": stats.archive_versions,
         "shader_models": stats.shader_models,
+        "gfx_tags": stats.gfx_tags,
         "loose_gff4_files": stats.loose_files,
         "by_extension": by_ext,
         "failure_counts": stats.failure_counts,
