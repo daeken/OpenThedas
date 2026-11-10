@@ -20,6 +20,21 @@ pub mod field {
     pub const ARL_ROOMS: u32 = 3016;
     pub const ARL_PATHING: u32 = 3020;
     pub const ARL_FRAME_EFFECTS: u32 = 3026;
+    pub const ARL_SKY_MODEL: u32 = 3025;
+    pub const ARL_ATMOSPHERE: u32 = 22500;
+    pub const ATMO_SUN_COLOR: u32 = 22519;
+    pub const ATMO_SUN_INTENSITY: u32 = 22520;
+    pub const ATMO_TURBIDITY: u32 = 22521;
+    pub const ATMO_EARTH_REFLECTANCE: u32 = 22522;
+    pub const ATMO_MIE: u32 = 22523;
+    pub const ATMO_RAYLEIGH: u32 = 22524;
+    pub const ATMO_DISTANCE: u32 = 22526;
+    pub const ATMO_ALPHA: u32 = 22528;
+    pub const ATMO_FOG_COLOR: u32 = 22529;
+    pub const ATMO_FOG_INTENSITY: u32 = 22530;
+    pub const ATMO_FOG_CAP: u32 = 22531;
+    pub const ATMO_FOG_ZENITH: u32 = 22532;
+    pub const ATMO_FOG_TACTICAL: u32 = 22535;
     pub const FBE_NAME: u32 = 5520;
     pub const FBE_EFFECT: u32 = 5521;
     pub const FBE_PARAMETERS: u32 = 5522;
@@ -99,6 +114,37 @@ pub struct Arl {
     pub sun: Option<Sun>,
     /// The frame buffer effects the level runs over each frame, in the order listed.
     pub effects: Vec<FrameEffect>,
+    /// The sky model drawn around the camera (3025, e.g. `sb_day`), when the level has one.
+    pub sky_model: Option<String>,
+    /// The level's atmosphere (22500): sky scattering and fog, when it has one.
+    pub atmosphere: Option<Atmosphere>,
+}
+
+/// A level's atmosphere (`ATMO`, 22500): what the engine computes the sky's scattering
+/// and the fog from.
+///
+/// Field names are xoreos's (read for the format only). Which fields the engine reads, and
+/// their defaults, are DAOrigins.exe's loader's (0x5d00ce): every field reads 0 when absent
+/// except `alpha` (1); 22525 (in-scatter power) and 22527 (phase eccentricity) are not
+/// read, and the water fog fields are not kept here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Atmosphere {
+    pub sun_color: [f32; 3],
+    pub sun_intensity: f32,
+    pub turbidity: f32,
+    pub earth_reflectance: f32,
+    pub mie: f32,
+    pub rayleigh: f32,
+    pub distance: f32,
+    pub alpha: f32,
+    pub fog_color: [f32; 3],
+    pub fog_intensity: f32,
+    /// The most the fog covers (0-1).
+    pub fog_cap: f32,
+    /// Degrees.
+    pub fog_zenith: f32,
+    /// How much of the fog the tactical (zoomed-out) camera sees.
+    pub fog_tactical: f32,
 }
 
 /// One of a level's frame buffer effects: the `.ffx.xml` effect it names (`da_bloom`,
@@ -295,12 +341,47 @@ impl Arl {
             }
             effects.push(FrameEffect { name, parameters });
         }
+        let atmosphere = match d.opt_struct(root, field::ARL_ATMOSPHERE)? {
+            Some(a) => {
+                let f = |l| -> TypedResult<f32> {
+                    Ok(d.opt_f32(a, l)?.filter(|v| v.is_finite()).unwrap_or(0.0))
+                };
+                let c = |l| -> TypedResult<[f32; 3]> {
+                    Ok(d.opt_vec3(a, l)?
+                        .filter(|v| v.iter().all(|x| x.is_finite()))
+                        .unwrap_or([0.0; 3]))
+                };
+                Some(Atmosphere {
+                    sun_color: c(field::ATMO_SUN_COLOR)?,
+                    sun_intensity: f(field::ATMO_SUN_INTENSITY)?,
+                    turbidity: f(field::ATMO_TURBIDITY)?,
+                    earth_reflectance: f(field::ATMO_EARTH_REFLECTANCE)?,
+                    mie: f(field::ATMO_MIE)?,
+                    rayleigh: f(field::ATMO_RAYLEIGH)?,
+                    distance: f(field::ATMO_DISTANCE)?,
+                    alpha: d
+                        .opt_f32(a, field::ATMO_ALPHA)?
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(1.0),
+                    fog_color: c(field::ATMO_FOG_COLOR)?,
+                    fog_intensity: f(field::ATMO_FOG_INTENSITY)?,
+                    fog_cap: f(field::ATMO_FOG_CAP)?,
+                    fog_zenith: f(field::ATMO_FOG_ZENITH)?,
+                    fog_tactical: f(field::ATMO_FOG_TACTICAL)?,
+                })
+            }
+            None => None,
+        };
         Ok(Arl {
             name: d.opt_str(root, field::ARL_NAME)?,
             rooms,
             grid,
             sun,
             effects,
+            sky_model: d
+                .opt_str(root, field::ARL_SKY_MODEL)?
+                .filter(|m| !m.is_empty()),
+            atmosphere,
         })
     }
 
@@ -632,5 +713,36 @@ mod tests {
         assert_eq!(arl.effects[0].parameter("Label"), None);
         assert_eq!(arl.effects[1].name, "da_hsvmatrix");
         assert!(arl.effects[1].parameters.is_empty());
+    }
+
+    #[test]
+    fn reads_the_atmosphere_and_sky() {
+        let mut b = Builder::new(b"ARL ");
+        let atmo = b.add(
+            b"ATMO",
+            vec![
+                (field::ATMO_SUN_COLOR, Value::Vec3([0.74, 0.32, 0.14])),
+                (field::ATMO_SUN_INTENSITY, Value::F32(17.4)),
+                (field::ATMO_TURBIDITY, Value::F32(1.03)),
+                (field::ATMO_FOG_COLOR, Value::Vec3([0.16, 0.19, 0.16])),
+                (field::ATMO_FOG_INTENSITY, Value::F32(0.008)),
+                (field::ATMO_FOG_CAP, Value::F32(0.65)),
+                (field::ATMO_FOG_ZENITH, Value::F32(42.0)),
+            ],
+        );
+        let root = b.add(
+            b"AREA",
+            vec![
+                (field::ARL_SKY_MODEL, s("sb_day")),
+                (field::ARL_ATMOSPHERE, Value::Struct(Some(atmo))),
+            ],
+        );
+        let arl = Arl::from_gff4(&b.finish(root)).unwrap();
+        assert_eq!(arl.sky_model.as_deref(), Some("sb_day"));
+        let a = arl.atmosphere.unwrap();
+        assert_eq!(a.sun_intensity, 17.4);
+        assert_eq!(a.fog_cap, 0.65);
+        assert_eq!(a.mie, 0.0, "absent fields read 0");
+        assert_eq!(a.alpha, 1.0, "absent alpha reads 1");
     }
 }

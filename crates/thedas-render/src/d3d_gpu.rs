@@ -100,6 +100,8 @@ pub(crate) struct D3dPass {
     ambients: Vec<Vec3>,
     /// The level's sun (direction, colour), if it has one.
     sun: Option<(Vec3, Vec3)>,
+    fog: [[f32; 4]; 2],
+    sky: Option<[[f32; 4]; 9]>,
     pub programs: Vec<String>,
 }
 
@@ -691,6 +693,8 @@ impl D3dPass {
             scene_probes: scene.probes.iter().map(|p| p.probe.clone()).collect(),
             ambients: scene.draws.iter().map(|d| ambient(&d.room)).collect(),
             sun: scene.sun,
+            fog: crate::atmosphere::fog_params(scene.atmosphere.as_ref()),
+            sky: scene.atmosphere.as_ref().map(crate::atmosphere::sky_params),
             programs,
         }
     }
@@ -748,6 +752,8 @@ impl D3dPass {
                     .flatten()
                     .and_then(|p| self.scene_probes.get(p)),
                 sun: self.sun,
+                fog: self.fog,
+                sky: self.sky.as_ref(),
             };
             put(&mut data, d.slot, &cc.fill(program.vs.ctab.as_ref()), 0);
             put(&mut data, d.slot, &cc.fill(program.ps.ctab.as_ref()), 3);
