@@ -82,7 +82,8 @@ pub(crate) struct D3dPass {
     /// Each scene draw's skinning palette rows (empty: every bone at rest).
     bones: Vec<Vec<[f32; 4]>>,
     scene_probes: Vec<thedas_formats::probe::IrradianceProbe>,
-    ambient: Vec3,
+    /// Each scene draw's ambient light (its room's).
+    ambients: Vec<Vec3>,
     pub programs: Vec<String>,
 }
 
@@ -427,6 +428,32 @@ fn create_pipeline(
     })
 }
 
+/// The ambient light of each room: the sum of the ambient lights its light model holds. A
+/// draw in a room with none (or outside every room) takes the average over the rooms that
+/// have one. Provisional: the original's choice is not traced; summing every room's ambient
+/// into one, as before, washed out levels of many rooms.
+fn room_ambients(scene: &AreaScene) -> impl Fn(&str) -> Vec3 {
+    let mut by_room: HashMap<String, Vec3> = HashMap::new();
+    for l in &scene.lights {
+        if let SceneLight::Ambient { color, room, .. } = l {
+            *by_room
+                .entry(room.to_ascii_lowercase())
+                .or_insert(Vec3::ZERO) += *color;
+        }
+    }
+    let average = if by_room.is_empty() {
+        Vec3::ZERO
+    } else {
+        by_room.values().copied().sum::<Vec3>() / by_room.len() as f32
+    };
+    move |room: &str| {
+        by_room
+            .get(&room.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(average)
+    }
+}
+
 impl D3dPass {
     /// `material_programs[i]` holds the programs (one per pass) for scene material `i`;
     /// empty when it is not drawn with its original shaders.
@@ -446,14 +473,7 @@ impl D3dPass {
         let mut by_name: HashMap<String, usize> = HashMap::new();
         let mut samplers: HashMap<String, wgpu::Sampler> = HashMap::new();
         let mut vbufs: HashMap<(usize, String), wgpu::Buffer> = HashMap::new();
-        let ambient = scene
-            .lights
-            .iter()
-            .filter_map(|l| match l {
-                SceneLight::Ambient { color, .. } => Some(*color),
-                _ => None,
-            })
-            .fold(Vec3::ZERO, |a, c| a + c);
+        let ambient = room_ambients(scene);
 
         let mut pending = Vec::new();
         for (di, d) in scene.draws.iter().enumerate() {
@@ -632,7 +652,7 @@ impl D3dPass {
             probes: scene.draws.iter().map(|d| d.probe).collect(),
             bones: vec![Vec::new(); scene.draws.len()],
             scene_probes: scene.probes.iter().map(|p| p.probe.clone()).collect(),
-            ambient,
+            ambients: scene.draws.iter().map(|d| ambient(&d.room)).collect(),
             programs,
         }
     }
@@ -681,7 +701,7 @@ impl D3dPass {
                 material: &self.materials[*material],
                 lightmap: lightmap.as_ref(),
                 lights: &d.lights,
-                ambient: self.ambient,
+                ambient: self.ambients.get(d.draw).copied().unwrap_or(Vec3::ZERO),
                 bones: self.bones.get(d.draw).map_or(&[][..], |b| b.as_slice()),
                 irradiance: self
                     .probes
