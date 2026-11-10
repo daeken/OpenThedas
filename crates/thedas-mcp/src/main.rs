@@ -1241,8 +1241,10 @@ impl Server {
             let id = resolve(sim, &a.object).ok_or("no such object")?;
             let kind = sim.world.get(id).map(|o| o.kind).ok_or("no such object")?;
             let before = sim.world.trace.entries.len();
-            let dialog = sim.world.get(id).and_then(|o| o.dialog.clone());
-            if kind == ObjectKind::Creature || dialog.is_some() {
+            // Clicking a placeable uses it: its script decides (placeable_core starts the
+            // placeable's conversation when it has one; a door's own script may only talk
+            // while it is locked). Creatures are talked to.
+            if kind == ObjectKind::Creature {
                 if !sim.start_conversation(hero, id, "") {
                     return Err("it has nothing to say".into());
                 }
@@ -1702,6 +1704,7 @@ impl Server {
                 ints: vec![ability],
                 strings: vec![tag],
                 due: None,
+                from: None,
             };
             if let Some(o) = sim.world.get_mut(hero) {
                 o.commands.clear();

@@ -208,6 +208,10 @@ pub struct Command {
     /// When the command finishes, set when it reaches the front of the queue.
     #[serde(default)]
     pub due: Option<u64>,
+    /// For a move: where the mover was and the time when it set off. Its position in
+    /// between is interpolated (see `Sim::advance_movers`).
+    #[serde(default)]
+    pub from: Option<([f32; 3], u64)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -233,6 +237,16 @@ pub enum EngineData {
     Location(Location),
     Command(Command),
     Effect(Effect),
+}
+
+/// The plot actions control: the set shown (0 hides it), whether it is enabled, and each
+/// action's state (0 invalid, 1 enabled, 2 used, 3 active) and count.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlotActions {
+    pub set: i32,
+    pub disabled: bool,
+    pub states: std::collections::BTreeMap<i32, i32>,
+    pub counts: std::collections::BTreeMap<i32, i32>,
 }
 
 /// A message box shown by `ShowPopup`: its text, kind (`nPopupType`), owner and whether it
@@ -333,6 +347,9 @@ pub struct World {
     /// The followers the player wants when the party picker opens.
     #[serde(default)]
     pub party_choice: Option<Vec<ObjectId>>,
+    /// The plot actions control (`SetPlotActionSet` and friends; see `plotactions.gda`).
+    #[serde(default)]
+    pub plot_actions: PlotActions,
     /// The job board on screen (`ShowChantersGUI`).
     #[serde(default)]
     pub chanter_board: Option<crate::chanters::ChanterBoard>,
@@ -443,6 +460,7 @@ impl World {
             popup: None,
             store: None,
             chanter_board: None,
+            plot_actions: PlotActions::default(),
             party_choice: None,
             world_map: Default::default(),
             rng: Rng::new(seed),

@@ -524,6 +524,7 @@ impl Sim {
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
+            from: None,
         };
         if let Some(o) = self.world.get_mut(attacker) {
             o.commands.clear();
