@@ -101,6 +101,9 @@ pub struct Object {
     /// Pending commands (front first).
     pub commands: Vec<Command>,
     pub followers: Vec<ObjectId>,
+    /// Non-party followers (`AddNonPartyFollower`): they follow but are not in the party.
+    #[serde(default)]
+    pub escorts: Vec<ObjectId>,
     pub effects: Vec<Effect>,
     /// Combat bookkeeping (perception, threat, the pending attack); see `combat`.
     #[serde(default)]
@@ -144,6 +147,7 @@ impl Object {
             geometry: Vec::new(),
             commands: Vec::new(),
             followers: Vec::new(),
+            escorts: Vec::new(),
             effects: Vec::new(),
             combat: Default::default(),
             abilities: std::collections::BTreeSet::new(),

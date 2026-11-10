@@ -18,6 +18,16 @@ pub mod field {
 
     pub const ARL_NAME: u32 = 3012;
     pub const ARL_ROOMS: u32 = 3016;
+    pub const ARL_PATHING: u32 = 3020;
+    pub const PATHING_GRID: u32 = 3110;
+    pub const GRID_COLUMNS: u32 = 3086;
+    pub const GRID_ROWS: u32 = 3087;
+    pub const GRID_CELL_SIZE: u32 = 3088;
+    pub const GRID_CLEARANCE: u32 = 3089;
+    pub const GRID_BASE: u32 = 3090;
+    pub const GRID_NORMAL: u32 = 3091;
+    pub const GRID_DATA: u32 = 3092;
+    pub const GRID_HEIGHT: u32 = 3093;
     pub const ROOM_ID: u32 = 3031;
     pub const ROOM_NAME: u32 = 3033;
     pub const ROOM_BOUNDS_MIN: u32 = 3140;
@@ -72,6 +82,58 @@ pub struct ArlRoom {
 pub struct Arl {
     pub name: Option<String>,
     pub rooms: Vec<ArlRoom>,
+    /// The pathing grid the engine routes creatures on, when the layout has one.
+    pub grid: Option<NavGrid>,
+}
+
+/// The layout's pathing grid: `columns x rows` square cells of `cell_size` metres from
+/// `base` (the grid's minimum corner), one data byte and one height per cell, row-major.
+///
+/// Provisional: field meanings come from their names in xoreos's GFF4 field list (read for
+/// the format only) and from the data itself; the meaning of the data byte's bits is not
+/// known yet beyond 0 being unwalkable.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NavGrid {
+    pub columns: u32,
+    pub rows: u32,
+    pub cell_size: f32,
+    /// Headroom a creature needs, in metres.
+    pub clearance: f32,
+    pub base: [f32; 3],
+    pub normal: [f32; 3],
+    pub data: Vec<u8>,
+    pub heights: Vec<f32>,
+}
+
+impl NavGrid {
+    /// The cell holding a world position, if inside the grid.
+    pub fn cell(&self, p: [f32; 3]) -> Option<(u32, u32)> {
+        let x = ((p[0] - self.base[0]) / self.cell_size).floor();
+        let y = ((p[1] - self.base[1]) / self.cell_size).floor();
+        (x >= 0.0 && y >= 0.0 && (x as u32) < self.columns && (y as u32) < self.rows)
+            .then_some((x as u32, y as u32))
+    }
+
+    /// The centre of a cell, at its stored height when there is one.
+    pub fn center(&self, (x, y): (u32, u32)) -> [f32; 3] {
+        let z = self
+            .heights
+            .get((y * self.columns + x) as usize)
+            .copied()
+            .unwrap_or(self.base[2]);
+        [
+            self.base[0] + (x as f32 + 0.5) * self.cell_size,
+            self.base[1] + (y as f32 + 0.5) * self.cell_size,
+            z,
+        ]
+    }
+
+    pub fn value(&self, (x, y): (u32, u32)) -> u8 {
+        self.data
+            .get((y * self.columns + x) as usize)
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 impl Arl {
@@ -93,9 +155,53 @@ impl Arl {
                 bounds_max: d.opt_vec3(r, field::ROOM_BOUNDS_MAX)?.unwrap_or_default(),
             });
         }
+        let grid = match d.opt_struct(root, field::ARL_PATHING)? {
+            Some(p) => match d.opt_struct(p, field::PATHING_GRID)? {
+                Some(g) => {
+                    let n = |l| d.opt_i64(g, l).map(|x| x.unwrap_or(0).max(0) as u32);
+                    let (columns, rows) = (n(field::GRID_COLUMNS)?, n(field::GRID_ROWS)?);
+                    let data = d.bytes(g, field::GRID_DATA)?.to_vec();
+                    let cells = columns as usize * rows as usize;
+                    let heights = d.numbers(g, field::GRID_HEIGHT)?;
+                    (data.len() == cells && cells > 0).then(|| NavGrid {
+                        columns,
+                        rows,
+                        cell_size: d
+                            .opt_f32(g, field::GRID_CELL_SIZE)
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0.5),
+                        clearance: d
+                            .opt_f32(g, field::GRID_CLEARANCE)
+                            .ok()
+                            .flatten()
+                            .unwrap_or(2.0),
+                        base: d
+                            .opt_vec3(g, field::GRID_BASE)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default(),
+                        normal: d
+                            .opt_vec3(g, field::GRID_NORMAL)
+                            .ok()
+                            .flatten()
+                            .unwrap_or([0.0, 0.0, 1.0]),
+                        data,
+                        heights: if heights.len() == cells {
+                            heights
+                        } else {
+                            Vec::new()
+                        },
+                    })
+                }
+                None => None,
+            },
+            None => None,
+        };
         Ok(Arl {
             name: d.opt_str(root, field::ARL_NAME)?,
             rooms,
+            grid,
         })
     }
 
