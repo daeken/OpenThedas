@@ -212,6 +212,32 @@ pub enum Routed {
     Straight,
 }
 
+/// Whether a wall of the pathing grid lies on the straight line between two points: a
+/// cell valued 9 (bits 0 and 3: the walls between rooms indoors, buildings outdoors) sampled
+/// every half cell, leaving out the first and last 0.75 m (a creature against a wall still
+/// sees). Cells valued 10 (terrain beyond the walkable mesh, the void around a level) and
+/// other unwalkable cells do not block. Provisional: the original most likely tests sight
+/// against the level geometry, which the simulation does not have; large furniture, rubble
+/// and some water are marked 9 too, so they block.
+pub fn wall_between(g: &NavGrid, a: [f32; 3], b: [f32; 3]) -> bool {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len <= 1.5 {
+        return false;
+    }
+    let step = (g.cell_size * 0.5).max(0.05);
+    let mut d = 0.75;
+    while d < len - 0.75 {
+        let t = d / len;
+        let p = [a[0] + dx * t, a[1] + dy * t, a[2] + (b[2] - a[2]) * t];
+        if g.cell(p).is_some_and(|c| g.value(c) == 9) {
+            return true;
+        }
+        d += step;
+    }
+    false
+}
+
 impl Sim {
     /// The closed doors of an area with the pathing-grid cells of their doorways: doors are
     /// the placeables whose appearance's state controller (`placeable_types.gda`) is
@@ -305,6 +331,25 @@ impl Sim {
         out
     }
 
+    /// Whether one point of an area can see another: no closed door's doorway and no wall
+    /// of the pathing grid on the line between them (see [`wall_between`]). Provisional.
+    pub fn line_of_sight(
+        &mut self,
+        area: thedas_script::vm::ObjectId,
+        a: [f32; 3],
+        b: [f32; 3],
+    ) -> bool {
+        let doors: Vec<[f32; 3]> = self
+            .closed_doors(area)
+            .into_iter()
+            .filter_map(|(d, _)| self.world.get(d).map(|o| o.position))
+            .collect();
+        if Sim::door_between(&doors, a, b) {
+            return false;
+        }
+        !self.nav_grid(area).is_some_and(|g| wall_between(&g, a, b))
+    }
+
     /// Whether the straight line between two points passes through a closed door's
     /// doorway: within [`DOORWAY_RADIUS`] of one of `doors` (their positions), leaving out
     /// the first and last 0.75 m (two creatures standing by a door see each other).
@@ -394,6 +439,39 @@ mod tests {
             data,
             heights: vec![0.0; (w * h) as usize],
         }
+    }
+
+    #[test]
+    fn walls_block_sight_and_the_void_does_not() {
+        // A row of 9s (a wall) at x = 5 with a 10 (void) beside it at x = 7.
+        let (w, h) = (10u32, 3u32);
+        let mut data = vec![1u8; (w * h) as usize];
+        for y in 0..h {
+            data[(y * w + 5) as usize] = 9;
+            data[(y * w + 7) as usize] = 10;
+        }
+        let g = NavGrid {
+            columns: w,
+            rows: h,
+            cell_size: 1.0,
+            clearance: 2.0,
+            base: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            data,
+            heights: vec![0.0; (w * h) as usize],
+        };
+        let at = |x: f32| [x, 1.5, 0.0];
+        assert!(wall_between(&g, at(1.5), at(8.5)), "through the wall");
+        assert!(!wall_between(&g, at(1.5), at(4.5)), "same side");
+        assert!(!wall_between(&g, at(6.5), at(9.5)), "across the void");
+        assert!(
+            !wall_between(&g, at(4.9), at(1.0)),
+            "against the wall, along its side"
+        );
+        assert!(
+            wall_between(&g, at(4.6), at(6.4)),
+            "either side of a thin wall"
+        );
     }
 
     #[test]

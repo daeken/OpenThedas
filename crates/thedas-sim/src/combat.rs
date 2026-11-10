@@ -11,6 +11,7 @@
 //!   effect's handlers call) is not perceived by those hostile to it: they get one
 //!   appearance with the stealthed flag, on which rules_core runs its own detection check.
 //!   The scripts also end stealth themselves (after an attack, when targeted, on detection).
+//!   Walls (`nav::wall_between`) and closed doors block noticing.
 //! - **Game mode.** The party seeing living hostiles switches `GM_EXPLORE` to `GM_COMBAT`
 //!   and back, with `GAMEMODE_CHANGE` to the module; the scripts end combat (and get fallen
 //!   party members up) on the change back.
@@ -208,13 +209,20 @@ impl Sim {
             .filter_map(|(d, _)| self.world.get(d).map(|o| o.position))
             .collect();
         let blocked = |a: [f32; 3], b: [f32; 3]| Sim::door_between(&doors, a, b);
+        // Walls block noticing (`nav::wall_between`); once noticed, a creature is kept
+        // track of round corners out to the visual radius.
+        let grid = self.nav_grid(area);
+        let wall = |a: [f32; 3], b: [f32; 3]| {
+            grid.as_ref()
+                .is_some_and(|g| crate::nav::wall_between(g, a, b))
+        };
         for &(id, pos) in &creatures {
             let alive = self.alive(id);
             // A creature notices others within its perception range (see
             // `Sim::perception_range`) and keeps track of those it has noticed out to the
-            // visual radius. Closed doors block sight; walls are not checked: the pathing
-            // grid, the only geometry the simulation has, marks furniture and rubble that do
-            // not block sight the same way.
+            // visual radius. Closed doors block sight, and a wall of the pathing grid blocks
+            // noticing. Provisional: the grid, the only geometry the simulation has, marks
+            // large furniture and rubble the same way as walls, so those block too.
             let ring = self.perception_range(id);
             let seen = self
                 .world
@@ -229,12 +237,12 @@ impl Sim {
                             return false;
                         }
                         let d = dist(pos, p);
-                        let range = if seen.contains(&o) && !self.hidden_from(id, o) {
-                            VISUAL_RANGE
+                        let tracked = seen.contains(&o) && !self.hidden_from(id, o);
+                        if tracked {
+                            d <= VISUAL_RANGE && !blocked(pos, p)
                         } else {
-                            ring
-                        };
-                        d <= range && !blocked(pos, p)
+                            d <= ring && !blocked(pos, p) && !wall(pos, p)
+                        }
                     })
                     .map(|&(o, _)| o)
                     .collect()

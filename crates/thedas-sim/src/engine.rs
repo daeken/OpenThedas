@@ -2568,10 +2568,18 @@ pub fn call(
             void()
         }
         // No occlusion is simulated: two objects in the same area can see each other.
-        "CheckLineOfSightObject" => ok(b(match (h.object(obj(a, 0)), h.object(obj(a, 1))) {
-            (Some(x), Some(y)) => x.area == y.area,
-            _ => false,
-        })),
+        // The same test as perception's (walls of the pathing grid and closed doors).
+        "CheckLineOfSightObject" => {
+            let seen = match (h.object(obj(a, 0)), h.object(obj(a, 1))) {
+                (Some(x), Some(y)) if x.area == y.area => Some((x.area, x.position, y.position)),
+                _ => None,
+            };
+            ok(b(match seen {
+                Some((Some(area), p, q)) => h.sim.line_of_sight(area, p, q),
+                Some((None, ..)) => true,
+                None => false,
+            }))
+        }
         "CountItemsByTag" => {
             let tag = string(a, 1);
             let n = h
