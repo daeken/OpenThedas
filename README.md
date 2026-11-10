@@ -140,7 +140,7 @@ Then ask Claude to, say, "load the Spoiled Princess and talk to the innkeeper". 
 | `get_trace` | What scripts and the engine did since the last call, filtered by kind |
 | `interact` | Talk to a creature or use a placeable as the hero |
 | `dialog_state`, `choose_reply`, `end_conversation` | Read and drive the current conversation |
-| `move_hero`, `enter_area`, `list_areas` | Move around and travel |
+| `move_hero`, `enter_area`, `list_areas` | Walk (time runs, triggers on the way fire, followers keep up; or `teleport`) and travel |
 | `plot_flag`, `local` | Read or set plot flags and local variables |
 | `call_engine_function`, `run_script` | Call any engine function or compiled script directly |
 | `chargen_event` | Drive character creation yourself after `load` with `chargen: "manual"` (by default a new game takes the chargen script's defaults and starts the origin) |

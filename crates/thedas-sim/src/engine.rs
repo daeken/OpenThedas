@@ -278,11 +278,10 @@ pub fn call(
         }
         "GetParty" => ok(Value::Object(h.sim.world.party.unwrap_or(OBJECT_INVALID))),
         "GetPartyList" => {
-            let hero = h.sim.world.hero;
-            let mut v: Vec<ObjectId> = hero.into_iter().collect();
-            if let Some(x) = hero.and_then(|x| h.object(x)) {
-                v.extend(x.followers.iter().copied());
-            }
+            let v: Vec<ObjectId> = party_of(h.sim)
+                .into_iter()
+                .filter(|&m| h.object(m).is_some())
+                .collect();
             ok(objects(v))
         }
         "GetArea" => ok(Value::Object(
@@ -1006,9 +1005,8 @@ pub fn call(
         }
         "CreateItemOnObject" => {
             let template = string(a, 0);
-            let id = h.sim.world.spawn(ObjectKind::Item, &template);
+            let id = h.sim.create_item(&template);
             if let Some(o) = h.sim.world.get_mut(id) {
-                o.template = template.trim_end_matches(".uti").to_string();
                 let tag = string(a, 3);
                 if !tag.is_empty() {
                     o.tag = tag;
@@ -1330,6 +1328,9 @@ pub fn call(
         }
         "SetFollowerState" => {
             let (who, state) = (obj(a, 0), int(a, 1));
+            if h.object(who).is_none() {
+                return void();
+            }
             let active = state == constant(&h.sim.table, "FOLLOWER_STATE_ACTIVE")
                 || state == constant(&h.sim.table, "FOLLOWER_STATE_LOCKEDACTIVE");
             if let Some(o) = h.sim.world.get_mut(who) {
@@ -1540,7 +1541,8 @@ pub fn call(
             });
             void()
         }
-        "GetActiveWeaponSet" | "GetCreatureGoreLevel" => ok(Value::Int(0)),
+        "GetActiveWeaponSet" => ok(Value::Int(0)),
+        "GetCreatureGoreLevel" => ok(Value::Float(0.0)),
         "GetCreaturePropertyType" => ok(Value::Int(
             h.sim
                 .world
@@ -1709,7 +1711,7 @@ pub fn call(
             ok(b(any))
         }
         // Loot bags and achievements have no simulation state.
-        "SpawnBodyBag" | "UnlockAchievementByID" => {
+        "SpawnBodyBag" | "UnlockAchievementByID" | "IncrementAchievementCountByID" => {
             h.sim.world.trace.push(TraceEntry::Log {
                 t,
                 channel: -3,
@@ -1828,7 +1830,47 @@ pub fn call(
         }
         // Items: stats come from the item's base type in the rules 2DAs, which are not
         // read yet; scripts see 0 and fall back on attributes.
-        "GetItemStat" => ok(Value::Float(0.0)),
+        // GetItemStat: the item's base-type row in itemstats.gda, in the column named by
+        // the stat's label in itemstatdefines.gda (Attack, Damage, ArmorPenetration, ...).
+        // Provisional: item properties (material, enchantments) are not added yet.
+        "GetItemStat" => {
+            let base = h
+                .object(obj(a, 0))
+                .and_then(|o| o.fields.get("BaseItem").copied());
+            let stat = int(a, 1);
+            let tables = h.sim.world.tables.clone();
+            let label = tables
+                .get(0, "itemstatdefines")
+                .map(|t| cell_string(t.cell("Label", stat as i64)))
+                .filter(|l| !l.is_empty());
+            let v = match (base, label) {
+                (Some(b), Some(l)) => tables
+                    .get(0, "itemstats")
+                    .and_then(|t| t.cell(clean(&l), b as i64).map(|c| cell_float(Some(c))))
+                    .unwrap_or(0.0),
+                _ => 0.0,
+            };
+            ok(Value::Float(v))
+        }
+        "GetItemUnique" | "GetItemMaterialProgression" => {
+            let field = if name == "GetItemUnique" {
+                "Unique"
+            } else {
+                "MaterialProgress"
+            };
+            ok(Value::Int(
+                h.object(obj(a, 0))
+                    .and_then(|o| o.fields.get(field).copied())
+                    .unwrap_or(0),
+            ))
+        }
+        "SetAimLoopDuration" => void(),
+        // Tactics and area-of-effect abilities are not simulated yet.
+        "IsTacticEnabled" => ok(b(false)),
+        "GetAbilitiesDueToAOEs" => ok(Value::Array {
+            elem: Type::Int,
+            items: Vec::new(),
+        }),
         "GetItemEquipSlot" => {
             let item = obj(a, 0);
             let slot = h.sim.world.objects.values().find_map(|o| {
