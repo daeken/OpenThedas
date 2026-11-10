@@ -211,10 +211,12 @@ impl Sim {
         if let Some(s) = self.scripts.get(&key) {
             return s.clone();
         }
-        let res = if key.ends_with(".ncs") {
-            key.clone()
-        } else {
-            format!("{key}.ncs")
+        // Scripts name others by their compiled (`.ncs`) or source (`.nss`) resource, or
+        // bare: sp_module_item_acq hands item events to `preev_item_acquired.nss`.
+        let res = match key.strip_suffix(".nss") {
+            Some(stem) => format!("{stem}.ncs"),
+            None if key.ends_with(".ncs") => key.clone(),
+            None => format!("{key}.ncs"),
         };
         let loaded = self
             .vfs

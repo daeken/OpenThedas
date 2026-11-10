@@ -328,17 +328,12 @@ pub fn call(
             } else {
                 0
             };
-            // Only the current area is loaded in the game, so its objects come first (an
-            // area-list sibling may hold another copy of a creature, such as Morrigan in the
-            // Wilds and at Flemeth's hut); objects elsewhere follow. Provisional.
-            let here = h.sim.world.area;
-            let mut found: Vec<&crate::world::Object> = h.sim.world.by_tag(&string(a, 0)).collect();
-            found.sort_by_key(|o| match o.area {
-                x if x == here => 0,
-                None => 1,
-                _ => 2,
-            });
-            ok(Value::Object(found.get(n).map_or(OBJECT_INVALID, |o| o.id)))
+            ok(Value::Object(
+                h.sim
+                    .world
+                    .find_tag(&string(a, 0), n)
+                    .unwrap_or(OBJECT_INVALID),
+            ))
         }
         "GetObjectsInArea" => {
             let area = obj(a, 0);

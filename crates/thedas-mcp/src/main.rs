@@ -323,7 +323,7 @@ fn resolve(sim: &Sim, s: &str) -> Option<ObjectId> {
     if s.eq_ignore_ascii_case("hero") || s.eq_ignore_ascii_case("player") {
         return sim.world.hero;
     }
-    sim.world.by_tag(s).next().map(|o| o.id)
+    sim.world.find_tag(s, 0)
 }
 
 fn summary(sim: &Sim, id: ObjectId) -> J {
