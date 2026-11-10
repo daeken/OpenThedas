@@ -1439,7 +1439,8 @@ impl Sim {
                 }
             }
         }
-        if let Some(l) = cmd.location {
+        // A command's location is where it goes, except an ability's, which is where it lands.
+        if let Some(l) = cmd.location.filter(|_| cmd.name != "CommandUseAbility") {
             // Cross the triggers between where the move began and its end on the way (along
             // its route, or a straight line).
             let here = self.world.get(id).map(|o| (o.position, o.area));

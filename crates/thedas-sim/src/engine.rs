@@ -1496,6 +1496,17 @@ pub fn call(
                             c.location = Some(*l);
                         }
                     }
+                    // A place in the caller's area (CommandUseAbility's vTarget); the
+                    // default [0, 0, 0] is none. Provisional.
+                    (Type::Vector, Value::Vector(v)) if *v != [0.0; 3] && c.location.is_none() => {
+                        if let Some(area) = h.object(caller).and_then(|o| o.area) {
+                            c.location = Some(crate::world::Location {
+                                area,
+                                position: *v,
+                                facing: 0.0,
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }

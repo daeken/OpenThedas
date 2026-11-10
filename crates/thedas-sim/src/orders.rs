@@ -87,6 +87,32 @@ impl Sim {
         }
     }
 
+    /// Has `who` use `ability` at place `at` in its area (a fireball's centre), from the item
+    /// tagged `item` when it is an item's: a `CommandUseAbility` with a location and no
+    /// target. Provisional: ability range is not modelled, so it is used from where `who`
+    /// stands.
+    pub fn order_ability_at(&mut self, who: ObjectId, ability: i32, at: [f32; 3], item: &str) {
+        let Some((area, from)) = self
+            .world
+            .get(who)
+            .and_then(|o| Some((o.area?, o.position)))
+        else {
+            return;
+        };
+        let mut c = command(self, "COMMAND_TYPE_USE_ABILITY", "CommandUseAbility");
+        c.location = Some(Location {
+            area,
+            position: at,
+            facing: facing_toward(at[0] - from[0], at[1] - from[1]),
+        });
+        c.ints = vec![ability];
+        c.strings = vec![item.to_string()];
+        if let Some(o) = self.world.get_mut(who) {
+            o.commands.clear();
+            o.commands.push(c);
+        }
+    }
+
     /// Walks `who` up to `target` (a door, a container, a lever) and uses it.
     pub fn order_use(&mut self, who: ObjectId, target: ObjectId) {
         let mut then = command(self, "COMMAND_TYPE_USE_OBJECT", "CommandUseObject");

@@ -403,24 +403,35 @@ impl Live {
     pub fn click(&mut self, pick: Pick) -> Option<String> {
         let shared = self.sim.clone();
         let mut sim = shared.lock().unwrap_or_else(|p| p.into_inner());
-        // An ability waiting for its target takes the click: a creature is the target;
-        // anything else lets it go. Provisional: abilities aimed at a place are not
-        // supported yet.
+        // An ability waiting for its target takes the click: a creature is the target, or
+        // for an ability aimed at places, a point on the ground; anything else lets it go.
         if let Some(aim) = self.aiming.take() {
             let target = match pick {
                 Pick::Object(id) => sim
                     .world
                     .get(id)
                     .filter(|o| o.kind == thedas_sim::world::ObjectKind::Creature && !o.dead)
-                    .map(|o| (id, o.tag.clone())),
+                    .map(|o| (id, o.tag.clone(), o.position)),
                 Pick::Ground(_) => None,
             };
-            return Some(match target {
-                Some((id, tag)) => {
+            let place = sim.ability_targets_place(aim.ability);
+            let only_place = place
+                && sim.ability_target_type(aim.ability) & !thedas_sim::quickbar::TARGET_PLACE == 0;
+            return Some(match (target, pick) {
+                // An ability only for places is cast at the creature's feet.
+                (Some((_, tag, at)), _) if only_place => {
+                    sim.order_ability_at(aim.caster, aim.ability, at, &aim.item);
+                    format!("use ability {} at {tag}", aim.ability)
+                }
+                (Some((id, tag, _)), _) => {
                     sim.order_ability(aim.caster, aim.ability, id, &aim.item);
                     format!("use ability {} on {tag}", aim.ability)
                 }
-                None => format!("ability {} not aimed", aim.ability),
+                (None, Pick::Ground(at)) if place => {
+                    sim.order_ability_at(aim.caster, aim.ability, at, &aim.item);
+                    format!("use ability {} at {:.1} {:.1}", aim.ability, at[0], at[1])
+                }
+                _ => format!("ability {} not aimed", aim.ability),
             });
         }
         let leader = sim.world.controlled()?;
@@ -455,6 +466,48 @@ impl Live {
                 }
             }
         }
+    }
+
+    /// The aiming reticle on a `size` view with the mouse at `cursor` (pixels), while an
+    /// ability aimed at places waits for its click: empty otherwise, or when the mouse is off
+    /// the ground.
+    pub fn reticle(
+        &mut self,
+        camera: &thedas_render::Camera,
+        size: (u32, u32),
+        cursor: (f64, f64),
+    ) -> Vec<[glam::Vec2; 2]> {
+        let Some(aim) = self.aiming.clone() else {
+            return Vec::new();
+        };
+        let (origin, dir) = camera.ray(
+            cursor.0 as f32,
+            cursor.1 as f32,
+            size.0 as f32,
+            size.1 as f32,
+        );
+        let shared = self.sim.clone();
+        let mut sim = shared.lock().unwrap_or_else(|p| p.into_inner());
+        if !sim.ability_targets_place(aim.ability) {
+            return Vec::new();
+        }
+        let (Some(area), Some(from)) = (
+            sim.world.area,
+            sim.world
+                .get(aim.caster)
+                .map(|o| glam::Vec3::from_array(o.position)),
+        ) else {
+            return Vec::new();
+        };
+        let Some(at) = sim.ground_hit(area, origin.to_array(), dir.to_array(), 300.0) else {
+            return Vec::new();
+        };
+        let lines = crate::reticle::outline(
+            sim.ability_area(aim.ability),
+            from,
+            glam::Vec3::from_array(at),
+        );
+        crate::reticle::project(camera, size, &lines)
     }
 
     /// Makes party member `n` (0 is the hero) the leader the player controls.
