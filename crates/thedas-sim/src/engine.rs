@@ -278,7 +278,9 @@ pub fn call(
             ok(Value::Object(h.sim.world.hero.unwrap_or(OBJECT_INVALID)))
         }
         "IsHero" => ok(b(Some(obj(a, 0)) == h.sim.world.hero)),
-        "IsControlled" => ok(b(Some(obj(a, 0)) == h.sim.world.hero)),
+        "IsControlled" => ok(b(
+            !h.sim.world.autopilot && Some(obj(a, 0)) == h.sim.world.hero
+        )),
         "IsFollower" => {
             let o = obj(a, 0);
             let hero = h.sim.world.hero;
@@ -2332,7 +2334,9 @@ pub fn call(
             ok(Value::Int(if n == 0 { 0 } else { 1 }))
         }
         // Followers fight on their own; the hero is the player's.
-        "IsPartyAIEnabled" => ok(b(Some(obj(a, 0)) != h.sim.world.hero)),
+        "IsPartyAIEnabled" => ok(b(
+            h.sim.world.autopilot || Some(obj(a, 0)) != h.sim.world.hero
+        )),
         "GetCreaturesInMeleeRing" => {
             let (who, hostile_only) = (obj(a, 0), int(a, 3) != 0);
             let Some(me) = h.object(who).map(|o| (o.position, o.area)) else {
@@ -2593,7 +2597,9 @@ mod tests {
         int TRUE = 1;\n\
         object GetObjectByTag(string s, int n = 0) = 7;\n\
         object[] GetNearestObjectByTag(object o, string s, int t = 32, int n = 1, int a = 0, int b = 0, int c = 0) = 8;\n\
-        int GetFollowerState(object o) = 9;\n";
+        int GetFollowerState(object o) = 9;\n\
+        int IsControlled(object o) = 10;\n\
+        int IsPartyAIEnabled(object o) = 11;\n";
 
     /// Calls engine function `name` as `caller`.
     fn run(s: &mut Sim, caller: ObjectId, name: &str, a: &[Value]) -> Option<Value> {
@@ -2782,6 +2788,20 @@ mod tests {
             Some(Value::Array { items, .. }) => assert_eq!(items, vec![Value::Object(here)]),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn on_autopilot_the_party_ai_drives_the_hero_too() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.hero = Some(hero);
+        let ask = |s: &mut Sim, f| run(s, hero, f, &[Value::Object(hero)]);
+        assert_eq!(ask(&mut s, "IsControlled"), Some(Value::Int(1)));
+        assert_eq!(ask(&mut s, "IsPartyAIEnabled"), Some(Value::Int(0)));
+        s.world.autopilot = true;
+        assert_eq!(ask(&mut s, "IsControlled"), Some(Value::Int(0)));
+        assert_eq!(ask(&mut s, "IsPartyAIEnabled"), Some(Value::Int(1)));
     }
 
     #[test]
