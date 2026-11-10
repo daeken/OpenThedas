@@ -1486,9 +1486,19 @@ pub fn call(
         "GetCommandQueueSize" => ok(Value::Int(
             h.object(obj(a, 0)).map_or(0, |o| o.commands.len() as i32),
         )),
+        // Cancelling a command in progress completes it (COMMAND_RESULT_INVALID), which is
+        // how the AI notices it has nothing to do. Provisional.
         "ClearAllCommands" => {
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+            let who = obj(a, 0);
+            let running = h.sim.world.get_mut(who).and_then(|o| {
+                let first = o.commands.first().map(|c| c.ty);
                 o.commands.clear();
+                first
+            });
+            if let Some(ty) = running {
+                let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(who));
+                ev.ints = vec![ty, constant(&h.sim.table, "COMMAND_RESULT_INVALID")];
+                h.sim.world.queue_event(0, who, ev, None);
             }
             ok(Value::Int(1))
         }

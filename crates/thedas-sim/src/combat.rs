@@ -57,6 +57,10 @@ pub struct CombatData {
     pub in_combat: bool,
     /// Creatures this one currently perceives.
     pub perceived: Vec<ObjectId>,
+    /// Those of them it perceived as hostile (an appearance is announced again when a
+    /// perceived creature turns hostile).
+    #[serde(default)]
+    pub perceived_hostile: Vec<ObjectId>,
     /// Threat by enemy.
     pub threat: Vec<(ObjectId, f32)>,
     /// What the script decided for the attack in progress (`SetAttackResult`).
@@ -144,22 +148,42 @@ impl Sim {
             } else {
                 Vec::new()
             };
-            let before = self
+            let (before, before_hostile) = self
                 .world
                 .get(id)
-                .map(|o| o.combat.perceived.clone())
+                .map(|o| {
+                    (
+                        o.combat.perceived.clone(),
+                        o.combat.perceived_hostile.clone(),
+                    )
+                })
                 .unwrap_or_default();
-            if now == before {
+            let now_hostile: Vec<ObjectId> = now
+                .iter()
+                .copied()
+                .filter(|&o| self.hostile(id, o))
+                .collect();
+            if now == before && now_hostile == before_hostile {
                 continue;
             }
-            for &o in now.iter().filter(|o| !before.contains(o)) {
-                self.perceive(id, o, true);
+            // A creature already in view whose hostility changes (a group turning hostile
+            // mid-conversation, or surrendering) is announced again, with its new hostility:
+            // the AI wakes for a new enemy, and rules_core ends combat when an appearance
+            // leaves it seeing no hostiles. Provisional.
+            for &o in now.iter().filter(|o| {
+                !before.contains(o) || now_hostile.contains(o) != before_hostile.contains(o)
+            }) {
+                // The flag carries what the creature was seen as: rules_core takes "hostile
+                // but no longer hostile" as the cue to check whether its fight is over.
+                let flag = now_hostile.contains(&o) || before_hostile.contains(&o);
+                self.perceive_flagged(id, o, true, flag);
             }
             for &o in before.iter().filter(|o| !now.contains(o)) {
                 self.perceive(id, o, false);
             }
             if let Some(obj) = self.world.get_mut(id) {
                 obj.combat.perceived = now;
+                obj.combat.perceived_hostile = now_hostile;
             }
         }
         self.update_game_mode();
@@ -263,6 +287,12 @@ impl Sim {
 
     /// Queues `PERCEPTION_APPEAR` (or `DISAPPEAR`) for `who` about `seen`.
     pub fn perceive(&mut self, who: ObjectId, seen: ObjectId, appear: bool) {
+        let hostile = self.hostile(who, seen);
+        self.perceive_flagged(who, seen, appear, hostile);
+    }
+
+    /// As [`Sim::perceive`], with the hostility flag (integer 2) given.
+    pub fn perceive_flagged(&mut self, who: ObjectId, seen: ObjectId, appear: bool, hostile: bool) {
         let name = if appear {
             "PERCEPTION_APPEAR"
         } else {
@@ -270,7 +300,7 @@ impl Sim {
         };
         let mut ev = self.new_event(name, Some(seen));
         ev.objects = vec![seen];
-        ev.ints = vec![0, 0, self.hostile(who, seen) as i32];
+        ev.ints = vec![0, 0, hostile as i32];
         self.world.queue_event(0, who, ev, None);
     }
 
@@ -662,6 +692,46 @@ mod tests {
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         Sim::new(Arc::new(Vfs::new()), table, 3)
+    }
+
+    #[test]
+    fn creatures_in_view_are_announced_again_when_their_hostility_changes() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let bandit = s.world.spawn(ObjectKind::Creature, "bandit");
+        s.world.hero = Some(hero);
+        for (id, x, g) in [(hero, 0.0, 0), (bandit, 5.0, 2)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = [x, 0.0, 0.0];
+            o.group = g;
+        }
+        // (time, target, hostile flag) of the appearances the bandit is told about.
+        let appearances = |s: &Sim| -> Vec<i32> {
+            s.world
+                .queue
+                .values()
+                .filter(|q| q.target == bandit && q.event.ty == 25)
+                .map(|q| q.event.ints[2])
+                .collect()
+        };
+        s.update_perception();
+        assert_eq!(appearances(&s), vec![0], "first seen, not hostile");
+        s.world.queue.clear();
+        s.update_perception();
+        assert!(appearances(&s).is_empty(), "nothing changed");
+        s.world.hostility.insert((0, 2), true);
+        s.update_perception();
+        assert_eq!(appearances(&s), vec![1], "turned hostile");
+        s.world.queue.clear();
+        s.world.hostility.insert((0, 2), false);
+        s.update_perception();
+        assert_eq!(
+            appearances(&s),
+            vec![1],
+            "no longer hostile: flagged as it was seen"
+        );
     }
 
     #[test]
