@@ -28,6 +28,8 @@ fn scene_key(layout: &str, props: &[ObjectModel]) -> (String, Vec<(u32, Vec<Stri
             .map(|p| {
                 let mut models = p.models.clone();
                 models.extend(p.attached.iter().map(|a| format!("{}@{}", a.model, a.node)));
+                models.extend(p.morph.iter().map(|m| format!("{m}.mor{}", p.hide_hair)));
+
                 (p.id, models)
             })
             .collect(),
@@ -86,6 +88,9 @@ impl UiWorld {
                     .iter()
                     .map(|a| (a.model.clone(), a.node.clone()))
                     .collect(),
+                morph: p.morph.clone(),
+                hide_hair: p.hide_hair,
+
                 transform: thedas_render::Prop::placement(p.position, p.facing),
             })
             .collect();

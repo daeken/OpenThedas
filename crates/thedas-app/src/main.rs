@@ -117,6 +117,8 @@ fn sim_view(
             label: format!("{} {}", m.id, m.tag),
             models: m.models,
             attached: m.attached.into_iter().map(|a| (a.model, a.node)).collect(),
+            morph: m.morph,
+            hide_hair: m.hide_hair,
             transform: thedas_render::Prop::placement(m.position, m.facing),
         })
         .collect();

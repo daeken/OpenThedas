@@ -570,21 +570,21 @@ impl AreaRenderer {
         let mut material_program: Vec<Option<usize>> = Vec::new();
         let mut material_groups = Vec::new();
         let mut material_group_index: Vec<usize> = Vec::new();
-        let mut d3d_programs: Vec<Option<std::sync::Arc<crate::d3d::D3dProgram>>> = Vec::new();
+        let mut d3d_programs: Vec<Vec<std::sync::Arc<crate::d3d::D3dProgram>>> = Vec::new();
         for m in &scene.materials {
             let program = match programs.resolve(m) {
                 Resolved::Draw(Program::StandIn(p)) => {
-                    d3d_programs.push(None);
+                    d3d_programs.push(Vec::new());
                     p
                 }
                 Resolved::Draw(Program::D3d(p)) => {
-                    d3d_programs.push(Some(p));
+                    d3d_programs.push(p);
                     material_program.push(None);
                     material_group_index.push(0);
                     continue;
                 }
                 Resolved::Skip => {
-                    d3d_programs.push(None);
+                    d3d_programs.push(Vec::new());
                     material_program.push(None);
                     material_group_index.push(0);
                     continue;
@@ -628,7 +628,7 @@ impl AreaRenderer {
         let mut stand_in_of = vec![None; scene.draws.len()];
         for (di, d) in scene.draws.iter().enumerate() {
             let Some(pipeline) = material_program.get(d.material).copied().flatten() else {
-                if !matches!(d3d_programs.get(d.material), Some(Some(_))) {
+                if d3d_programs.get(d.material).is_none_or(|p| p.is_empty()) {
                     stats.draws_skipped += 1;
                 }
                 continue;
@@ -672,7 +672,7 @@ impl AreaRenderer {
         let d3d =
             crate::d3d_gpu::D3dPass::new(ctx, vfs, scene, &d3d_programs, &mut cache, color_format);
         for (k, d) in d3d.draws.iter().enumerate() {
-            if d3d.is_blended(d) {
+            if d3d.is_blended(d) || d.multipass {
                 blended.push((d.draw, DrawRef::D3d(k)));
             } else {
                 opaque.push((d.draw, DrawRef::D3d(k)));
@@ -1063,6 +1063,7 @@ mod tests {
                 indices: vec![0, 1, 2],
                 chunk,
                 raw_vertices: vec![],
+                positions: None,
             }],
             materials: vec![SceneMaterial {
                 mao: "t.mao".into(),

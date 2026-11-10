@@ -66,6 +66,9 @@ pub(crate) struct D3dDraw {
     slot: u64,
     pub draw: usize,
     lights: DrawLights,
+    /// One pass of a multi-pass technique: drawn in pass order with the material's other
+    /// passes, after the opaque draws.
+    pub multipass: bool,
 }
 
 pub(crate) struct D3dPass {
@@ -111,6 +114,12 @@ fn expand_vertices(mesh: &SceneMesh, inputs: &[IoSlot]) -> Vec<f32> {
     for v in 0..n {
         for slot in inputs {
             let usage = decl_usage(slot.semantic.usage);
+            if let (DeclUsage::Position, 0, Some(p)) =
+                (usage, slot.semantic.index, mesh.positions.as_ref())
+            {
+                out.extend_from_slice(&p.get(v).copied().unwrap_or([0.0, 0.0, 0.0, 1.0]));
+                continue;
+            }
             let value = c
                 .element(usage, slot.semantic.index as u32)
                 .and_then(|e| {
@@ -410,14 +419,14 @@ fn create_pipeline(
 }
 
 impl D3dPass {
-    /// `material_programs[i]` is the program for scene material `i`, if it is drawn with its
-    /// original shaders.
+    /// `material_programs[i]` holds the programs (one per pass) for scene material `i`;
+    /// empty when it is not drawn with its original shaders.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         ctx: &GpuContext,
         vfs: &Vfs,
         scene: &AreaScene,
-        material_programs: &[Option<Arc<D3dProgram>>],
+        material_programs: &[Vec<Arc<D3dProgram>>],
         textures: &mut TextureCache,
         color_format: wgpu::TextureFormat,
     ) -> Self {
@@ -439,21 +448,24 @@ impl D3dPass {
 
         let mut pending = Vec::new();
         for (di, d) in scene.draws.iter().enumerate() {
-            let Some(Some(program)) = material_programs.get(d.material) else {
+            let Some(passes) = material_programs.get(d.material) else {
                 continue;
             };
-            let pi = *by_name.entry(program.name.clone()).or_insert_with(|| {
-                let tl = texture_layout(device, program);
-                let pipeline = create_pipeline(device, program, &consts_layout, &tl, color_format);
-                pipelines.push(D3dPipeline {
-                    pipeline,
-                    program: program.clone(),
-                    blended: program.pass.blend.is_some(),
+            for program in passes {
+                let pi = *by_name.entry(program.name.clone()).or_insert_with(|| {
+                    let tl = texture_layout(device, program);
+                    let pipeline =
+                        create_pipeline(device, program, &consts_layout, &tl, color_format);
+                    pipelines.push(D3dPipeline {
+                        pipeline,
+                        program: program.clone(),
+                        blended: program.pass.blend.is_some(),
+                    });
+                    layouts.push(tl);
+                    pipelines.len() - 1
                 });
-                layouts.push(tl);
-                pipelines.len() - 1
-            });
-            pending.push((di, pi));
+                pending.push((di, pi, passes.len() > 1));
+            }
         }
 
         let slot_size = SLOT[7];
@@ -467,7 +479,7 @@ impl D3dPass {
         });
 
         let mut draws = Vec::new();
-        for (k, (di, pi)) in pending.into_iter().enumerate() {
+        for (k, (di, pi, multipass)) in pending.into_iter().enumerate() {
             let d = &scene.draws[di];
             let program = pipelines[pi].program.clone();
             let mesh = &scene.meshes[d.mesh];
@@ -594,6 +606,7 @@ impl D3dPass {
                 slot,
                 draw: di,
                 lights: pick_lights(&scene.lights, d.sphere),
+                multipass,
             });
         }
         let programs = pipelines.iter().map(|p| p.program.name.clone()).collect();
