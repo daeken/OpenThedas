@@ -23,6 +23,7 @@ pub mod m2da;
 pub mod nav;
 pub mod orders;
 pub mod plot;
+pub mod quickbar;
 pub mod save;
 pub mod session;
 pub mod sim;

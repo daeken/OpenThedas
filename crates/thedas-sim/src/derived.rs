@@ -35,6 +35,30 @@ impl Sim {
             + self.effect_modifier(id, property)
     }
 
+    /// A property's total, as `GetCreatureProperty` gives `PROPERTY_VALUE_TOTAL`: a
+    /// depletable's maximum (base and modifiers), anything else's larger of base and current
+    /// plus modifiers (equipment, attributes, effects), within `properties.gda`'s bounds.
+    pub fn property_total(&self, id: ObjectId, property: i32) -> f32 {
+        let (base, cur) = self
+            .world
+            .get(id)
+            .and_then(|o| o.properties.get(&property).copied())
+            .unwrap_or((0.0, 0.0));
+        let gear = self.equipment_bonus(id, property)
+            + self.attribute_bonus(id, property)
+            + self.effect_modifier(id, property);
+        let bounds = crate::engine::property_bounds(self, property);
+        let v = if bounds.is_some_and(|b| b.0 == 3) {
+            base + gear
+        } else {
+            base.max(cur) + gear
+        };
+        match bounds {
+            Some((_, min, max)) => v.clamp(min, max),
+            None => v,
+        }
+    }
+
     /// What effects add to a property (worn items' properties, buffs): see
     /// [`crate::world::Object::modifiers`].
     pub fn effect_modifier(&self, id: ObjectId, property: i32) -> f32 {

@@ -48,6 +48,8 @@ pub struct Live {
     pub level: Option<LiveLevel>,
     pub objects: Option<LiveObjects>,
     animator: Animator,
+    /// A quickbar ability waiting for the player to click its target.
+    pub aiming: Option<thedas_ui::input::Aim>,
     models: ModelCache,
     /// Textures, meshes, pipelines and shader translations of the current level, kept while
     /// its objects are rebuilt.
@@ -95,6 +97,7 @@ impl Live {
             level: None,
             objects: None,
             animator: Animator::default(),
+            aiming: None,
             models: ModelCache::default(),
             cache: RenderCache::default(),
             owed_ms: 0.0,
@@ -400,6 +403,26 @@ impl Live {
     pub fn click(&mut self, pick: Pick) -> Option<String> {
         let shared = self.sim.clone();
         let mut sim = shared.lock().unwrap_or_else(|p| p.into_inner());
+        // An ability waiting for its target takes the click: a creature is the target;
+        // anything else lets it go. Provisional: abilities aimed at a place are not
+        // supported yet.
+        if let Some(aim) = self.aiming.take() {
+            let target = match pick {
+                Pick::Object(id) => sim
+                    .world
+                    .get(id)
+                    .filter(|o| o.kind == thedas_sim::world::ObjectKind::Creature && !o.dead)
+                    .map(|o| (id, o.tag.clone())),
+                Pick::Ground(_) => None,
+            };
+            return Some(match target {
+                Some((id, tag)) => {
+                    sim.order_ability(aim.caster, aim.ability, id, &aim.item);
+                    format!("use ability {} on {tag}", aim.ability)
+                }
+                None => format!("ability {} not aimed", aim.ability),
+            });
+        }
         let leader = sim.world.controlled()?;
         match pick {
             Pick::Ground(p) => {

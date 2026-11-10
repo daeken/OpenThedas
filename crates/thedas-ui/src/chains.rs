@@ -180,55 +180,74 @@ pub fn bind(sim: &Sim, who: u32, prefix: &str, v: &mut BTreeMap<String, UiValue>
     let Some(abi) = tables.get(ABILITIES, "") else {
         return;
     };
-    let num = |x: i64| UiValue::Number(x as f64);
     for (list, ty) in LISTS {
         for (i, e) in chains(sim, who, ty, DISPLAYMODE_LEVELUP).iter().enumerate() {
-            let k = format!("{prefix}.{list}.{i}");
-            let id = e.id;
-            let name_strref = int(&abi, "NameStrRef", id);
-            let name = u32::try_from(name_strref)
-                .ok()
-                .and_then(|s| sim.string(s))
-                .unwrap_or_default();
-            v.insert(k.clone(), num(id));
-            for (key, value) in [
-                ("ID", num(id)),
-                ("UseType", num(int(&abi, "UseType", id))),
-                ("Icon", UiValue::String(text(&abi, "Icon", id))),
-                ("GUIType", num(int(&abi, "GUIType", id))),
-                ("PrereqAbilityID", num(int(&abi, "prereqability", id))),
-                ("DisplayState", num(e.state)),
-                ("AbilityInstance", num(0)),
-                ("IsError", num(0)),
-                ("CooldownPercentage", num(0)),
-            ] {
-                v.insert(format!("{k}.{key}"), value);
-            }
-            let t = format!("{k}.AbilityTemplate");
-            for (key, value) in [
-                ("AbilityType", num(ty)),
-                ("Name", UiValue::String(name)),
-                ("NameStrRef", num(name_strref)),
-                ("DescStrRef", num(int(&abi, "DescStrRef", id))),
-                ("TooltipStrRef", num(int(&abi, "TooltipStrRef", id))),
-                ("Conditions", num(int(&abi, "conditions", id))),
-                ("ConditionMode", num(int(&abi, "condition_mode", id))),
-                ("Cooldown", num(int(&abi, "cooldown", id))),
-                ("Cost", num(int(&abi, "cost", id))),
-                ("CostUpkeep", num(int(&abi, "costupkeep", id))),
-                ("PrereqLevel", num(int(&abi, "prereqlevel", id))),
-                ("PrereqAttributeID", num(int(&abi, "prereqattribute", id))),
-                (
-                    "PrereqAttributeValue",
-                    num(int_hash(&abi, PREREQ_VALUE, id)),
-                ),
-                ("Speed", num(int(&abi, "Speed", id))),
-                ("RequiresCombatTraining", num(0)),
-                ("Rank", num(0)),
-            ] {
-                v.insert(format!("{t}.{key}"), value);
-            }
+            ability(
+                sim,
+                &abi,
+                &format!("{prefix}.{list}.{i}"),
+                e.id,
+                ty,
+                e.state,
+                v,
+            );
         }
+    }
+}
+
+/// An ability's values under token `k` (`k` itself is the id; `.ID`, `.UseType`, `.Icon`,
+/// ..., `.AbilityTemplate.*`), as the screens read an ability icon. `ty` is its ability type
+/// and `state` its display state (`DISPLAYSTATE_*`).
+pub fn ability(
+    sim: &Sim,
+    abi: &thedas_sim::m2da::Table,
+    k: &str,
+    id: i64,
+    ty: i64,
+    state: i64,
+    v: &mut BTreeMap<String, UiValue>,
+) {
+    let num = |x: i64| UiValue::Number(x as f64);
+    let name_strref = int(abi, "NameStrRef", id);
+    let name = u32::try_from(name_strref)
+        .ok()
+        .and_then(|s| sim.string(s))
+        .unwrap_or_default();
+    v.insert(k.to_string(), num(id));
+    for (key, value) in [
+        ("ID", num(id)),
+        ("UseType", num(int(abi, "UseType", id))),
+        ("Icon", UiValue::String(text(abi, "Icon", id))),
+        ("GUIType", num(int(abi, "GUIType", id))),
+        ("PrereqAbilityID", num(int(abi, "prereqability", id))),
+        ("DisplayState", num(state)),
+        ("AbilityInstance", num(0)),
+        ("IsError", num(0)),
+        ("CooldownPercentage", num(0)),
+    ] {
+        v.insert(format!("{k}.{key}"), value);
+    }
+    let t = format!("{k}.AbilityTemplate");
+    for (key, value) in [
+        ("ID", num(id)),
+        ("AbilityType", num(ty)),
+        ("Name", UiValue::String(name)),
+        ("NameStrRef", num(name_strref)),
+        ("DescStrRef", num(int(abi, "DescStrRef", id))),
+        ("TooltipStrRef", num(int(abi, "TooltipStrRef", id))),
+        ("Conditions", num(int(abi, "conditions", id))),
+        ("ConditionMode", num(int(abi, "condition_mode", id))),
+        ("Cooldown", num(int(abi, "cooldown", id))),
+        ("Cost", num(int(abi, "cost", id))),
+        ("CostUpkeep", num(int(abi, "costupkeep", id))),
+        ("PrereqLevel", num(int(abi, "prereqlevel", id))),
+        ("PrereqAttributeID", num(int(abi, "prereqattribute", id))),
+        ("PrereqAttributeValue", num(int_hash(abi, PREREQ_VALUE, id))),
+        ("Speed", num(int(abi, "Speed", id))),
+        ("RequiresCombatTraining", num(0)),
+        ("Rank", num(0)),
+    ] {
+        v.insert(format!("{t}.{key}"), value);
     }
 }
 

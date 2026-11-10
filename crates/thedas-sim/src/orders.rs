@@ -73,6 +73,20 @@ impl Sim {
         self.approach_then(who, target, then);
     }
 
+    /// Has `who` use `ability` on `target` (itself for an ability used on its user), from
+    /// the item tagged `item` when it is an item's (a potion): an ordinary
+    /// `CommandUseAbility`, which brings it in range and uses it.
+    pub fn order_ability(&mut self, who: ObjectId, ability: i32, target: ObjectId, item: &str) {
+        let mut c = command(self, "COMMAND_TYPE_USE_ABILITY", "CommandUseAbility");
+        c.target = Some(target);
+        c.ints = vec![ability];
+        c.strings = vec![item.to_string()];
+        if let Some(o) = self.world.get_mut(who) {
+            o.commands.clear();
+            o.commands.push(c);
+        }
+    }
+
     /// Walks `who` up to `target` (a door, a container, a lever) and uses it.
     pub fn order_use(&mut self, who: ObjectId, target: ObjectId) {
         let mut then = command(self, "COMMAND_TYPE_USE_OBJECT", "CommandUseObject");

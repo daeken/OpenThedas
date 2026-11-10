@@ -8,7 +8,9 @@
 //! simulation live at real time; Space pauses it. The camera follows the party leader: hold
 //! the right mouse button to orbit, the wheel to zoom, Q/E to turn; F switches to the
 //! free-flying camera and back. A left click orders the leader: walk to the ground clicked,
-//! attack a hostile, talk to someone, use a door or container. 1-4 choose the leader.
+//! attack a hostile, talk to someone, use a door or container. F1-F4 choose the leader;
+//! 1-9 and 0 use the quickbar's slots (an ability aimed at someone waits for a click on its
+//! target; a right click drops it).
 //! The game's own interface plays over the world: the HUD while exploring, the conversation
 //! screen (click a reply), and the screens scripts open (world map, store, job board,
 //! level-up); I opens the inventory. A click the interface draws under is the interface's.
@@ -544,8 +546,13 @@ impl App {
                 });
             }
         }
-        match (self.screens.as_mut(), self.live.as_ref()) {
-            (Some(screens), Some(live)) => g.ui.play(screens, &live.sim, dt.min(100.0)),
+        match (self.screens.as_mut(), self.live.as_mut()) {
+            (Some(screens), Some(live)) => {
+                for aim in g.ui.play(screens, &live.sim, dt.min(100.0)) {
+                    log::info!("aiming ability {} (click a target)", aim.ability);
+                    live.aiming = Some(aim);
+                }
+            }
             _ => {
                 for call in g.ui.tick(dt.min(100.0)) {
                     log::debug!("ui call: {call:?}");
@@ -635,22 +642,39 @@ impl ApplicationHandler for App {
                             match code {
                                 KeyCode::Escape => event_loop.exit(),
                                 KeyCode::KeyP => println!("camera {}", self.camera.spec()),
-                                KeyCode::Digit1
-                                | KeyCode::Digit2
-                                | KeyCode::Digit3
-                                | KeyCode::Digit4
+                                KeyCode::F1 | KeyCode::F2 | KeyCode::F3 | KeyCode::F4
                                     if self.live.is_some() =>
                                 {
                                     let n = match code {
-                                        KeyCode::Digit1 => 0,
-                                        KeyCode::Digit2 => 1,
-                                        KeyCode::Digit3 => 2,
+                                        KeyCode::F1 => 0,
+                                        KeyCode::F2 => 1,
+                                        KeyCode::F3 => 2,
                                         _ => 3,
                                     };
                                     if let Some(tag) =
                                         self.live.as_mut().and_then(|l| l.choose_leader(n))
                                     {
                                         log::info!("leading with {tag}");
+                                    }
+                                }
+                                // The quickbar's first ten slots: 1 to 9, then 0.
+                                c if self.live.is_some() && quickslot_key(c).is_some() => {
+                                    let slot = quickslot_key(c).unwrap_or(0);
+                                    if let Some(live) = self.live.as_mut() {
+                                        let aim = {
+                                            let mut sim = live.sim();
+                                            let who = sim.world.controlled();
+                                            who.and_then(|w| {
+                                                thedas_ui::input::use_quickslot(&mut sim, w, slot)
+                                            })
+                                        };
+                                        if let Some(aim) = aim {
+                                            log::info!(
+                                                "aiming ability {} (click a target)",
+                                                aim.ability
+                                            );
+                                            live.aiming = Some(aim);
+                                        }
                                     }
                                 }
                                 KeyCode::KeyI if self.screens.is_some() => {
@@ -762,6 +786,13 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+                // A right click drops an ability waiting for its target.
+                if pressed {
+                    if let Some(aim) = self.live.as_mut().and_then(|l| l.aiming.take()) {
+                        log::info!("ability {} not aimed", aim.ability);
+                        return;
+                    }
+                }
                 self.looking = pressed;
                 if let Some(g) = &self.gfx {
                     g.window.set_cursor_visible(!self.looking);
@@ -806,6 +837,23 @@ impl ApplicationHandler for App {
             g.window.request_redraw();
         }
     }
+}
+
+/// The quickbar slot a digit key uses (1 is the first, 0 the tenth).
+fn quickslot_key(code: KeyCode) -> Option<i32> {
+    Some(match code {
+        KeyCode::Digit1 => 0,
+        KeyCode::Digit2 => 1,
+        KeyCode::Digit3 => 2,
+        KeyCode::Digit4 => 3,
+        KeyCode::Digit5 => 4,
+        KeyCode::Digit6 => 5,
+        KeyCode::Digit7 => 6,
+        KeyCode::Digit8 => 7,
+        KeyCode::Digit9 => 8,
+        KeyCode::Digit0 => 9,
+        _ => return None,
+    })
 }
 
 /// Whether a left click at window pixel (`x`, `y`) goes to the world: only the HUD is up
@@ -926,7 +974,7 @@ fn main() -> Result<()> {
                 let mut layer = ui::UiLayer::new(&ctx, &loaded.vfs, &[], size);
                 layer.attach(&l.sim);
                 let mut s = screens::Screens::default();
-                layer.play(&mut s, &l.sim, 0.0);
+                l.aiming = layer.play(&mut s, &l.sim, 0.0).pop();
                 played = Some((layer, s));
             }
             if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
@@ -1015,7 +1063,10 @@ fn main() -> Result<()> {
                             l.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
                             if let Some((layer, s)) = played.as_mut() {
                                 let t = Instant::now();
-                                layer.play(s, &l.sim, dt);
+                                if let Some(aim) = layer.play(s, &l.sim, dt).pop() {
+                                    println!("aiming ability {}", aim.ability);
+                                    l.aiming = Some(aim);
+                                }
                                 ui_time += t.elapsed();
                             }
                             frames += 1;
@@ -1035,7 +1086,9 @@ fn main() -> Result<()> {
                     Step::Inventory => {
                         if let Some((layer, s)) = played.as_mut() {
                             s.inventory = !s.inventory;
-                            layer.play(s, &l.sim, 0.0);
+                            if let Some(aim) = layer.play(s, &l.sim, 0.0).pop() {
+                                l.aiming = Some(aim);
+                            }
                         }
                     }
                 }
