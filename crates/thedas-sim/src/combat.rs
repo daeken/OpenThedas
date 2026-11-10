@@ -391,6 +391,16 @@ impl Sim {
                 effect.ty, creator, effect.floats
             ),
         });
+        let health = constant_of(self, "PROPERTY_DEPLETABLE_HEALTH");
+        let health_of = |s: &Sim| {
+            s.world
+                .get(target)
+                .filter(|o| !o.dead)
+                .and_then(|o| o.properties.get(&health))
+                .map_or(0.0, |v| v.1.max(0.0))
+        };
+        let before = health_of(self);
+        let (ability, ty) = (effect.ability, effect.ty);
         let mut ev = self.new_event("APPLY_EFFECT", creator);
         ev.objects = vec![target];
         let saved = self.current_effect.replace((effect.clone(), true));
@@ -410,6 +420,25 @@ impl Sim {
             }
             return;
         }
+        // Health the scripts take is recorded where they set it (`record_health_loss`); a
+        // killing blow arrives as EFFECT_TYPE_DEATH and takes what was left.
+        let lost = if valid && effect.ty == EFFECT_TYPE_DEATH {
+            before
+        } else {
+            0.0
+        };
+        if lost > 0.0 {
+            self.world.trace.push(crate::trace::TraceEntry::Damage {
+                t,
+                loss: crate::trace::HealthLoss {
+                    source: creator.unwrap_or(OBJECT_INVALID),
+                    target,
+                    ability,
+                    effect: ty,
+                    amount: lost,
+                },
+            });
+        }
         if valid && effect.ty == EFFECT_TYPE_DEATH {
             self.kill(target, creator.unwrap_or(OBJECT_INVALID));
             return;
@@ -421,6 +450,34 @@ impl Sim {
             }
         }
         self.check_death(target, creator.unwrap_or(OBJECT_INVALID));
+    }
+
+    /// Records health a script took from `target` (`TraceEntry::Damage`): the source is the
+    /// creator of the effect being applied to it, if any, else the script's owner (a weapon
+    /// hit is applied by the attacker's own script); the ability is the effect's (0 for a
+    /// weapon hit).
+    pub(crate) fn record_health_loss(&mut self, caller: ObjectId, target: ObjectId, amount: f32) {
+        if amount <= 0.0 {
+            return;
+        }
+        let effect = self
+            .current_effect
+            .as_ref()
+            .filter(|_| self.current_effect_target == Some(target))
+            .map(|(e, _)| e);
+        let source = effect.and_then(|e| e.creator).unwrap_or(caller);
+        let (ability, ty) = effect.map_or((0, 0), |e| (e.ability, e.ty));
+        let t = self.world.time_ms;
+        self.world.trace.push(crate::trace::TraceEntry::Damage {
+            t,
+            loss: crate::trace::HealthLoss {
+                source,
+                target,
+                ability,
+                effect: ty,
+                amount,
+            },
+        });
     }
 
     /// Takes an effect off a creature and tells its script (`EVENT_TYPE_REMOVE_EFFECT`, with
@@ -713,13 +770,37 @@ impl Sim {
         self.run_script(ABILITY_SCRIPT, id, Some(ev));
     }
 
-    /// The ability's casting time is up: `ABILITY_CAST_IMPACT` to its owner.
+    /// The ability's casting time is up: `ABILITY_CAST_IMPACT` to its owner. An ability
+    /// that fires a projectile (`projectile` in `ABI_base`) first announces the launch
+    /// (`ABILITY_PROJECTILE_LAUNCHED`, on which `ability_core` starts the cooldown of a
+    /// projectile spell; objects caster, target, item, as `ability_core` reads them).
+    /// Provisional: the projectile's flight is not simulated, it lands at once.
     pub(crate) fn finish_ability(&mut self, id: ObjectId, cmd: &crate::world::Command) {
         if !self.alive(id) {
             return;
         }
         let target = cmd.target.unwrap_or(OBJECT_INVALID);
         let ability = cmd.ints.first().copied().unwrap_or(0);
+        let projectile = self
+            .world
+            .tables()
+            .get(1, "")
+            .and_then(|t| match t.cell("projectile", ability as i64) {
+                Some(thedas_formats::gda::Cell::Int(v)) => Some(*v),
+                _ => None,
+            })
+            .unwrap_or(0);
+        if projectile > 0 {
+            let item = self.ability_item(id, cmd);
+            let mut ev = self.new_event("ABILITY_PROJECTILE_LAUNCHED", Some(id));
+            ev.objects = vec![id, target, item];
+            ev.ints = vec![ability, 0, 0, 0];
+            ev.strings = cmd.strings.clone();
+            self.run_script(ABILITY_SCRIPT, id, Some(ev));
+            if !self.alive(id) {
+                return;
+            }
+        }
         self.ability_event("ABILITY_CAST_IMPACT", id, target, ability, cmd);
     }
 
@@ -985,6 +1066,35 @@ mod tests {
         // A busy hero is left alone.
         s.autopilot_idle_hero();
         assert_eq!(s.world.get(hero).unwrap().commands.len(), 1);
+    }
+
+    #[test]
+    fn health_taken_is_credited_to_the_effect_creator_or_the_scripts_owner() {
+        let mut s = sim();
+        let (archer, mage, hero) = (
+            s.world.spawn(ObjectKind::Creature, "archer"),
+            s.world.spawn(ObjectKind::Creature, "mage"),
+            s.world.spawn(ObjectKind::Creature, "hero"),
+        );
+        // A weapon hit: the attacker's own script lowers the target's health.
+        s.record_health_loss(archer, hero, 8.0);
+        // A spell: the target's script applies the mage's damage effect.
+        s.current_effect = Some((
+            Effect {
+                ty: 1013,
+                creator: Some(mage),
+                ability: 14001,
+                ..Default::default()
+            },
+            true,
+        ));
+        s.current_effect_target = Some(hero);
+        s.record_health_loss(hero, hero, 30.0);
+        s.record_health_loss(hero, hero, 0.0);
+        let d = &s.world.trace.damage;
+        assert_eq!(d.get(&(archer, 0)), Some(&8.0));
+        assert_eq!(d.get(&(mage, 14001)), Some(&30.0));
+        assert_eq!(d.len(), 2);
     }
 
     #[test]
