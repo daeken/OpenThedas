@@ -73,7 +73,8 @@ struct Args {
     /// Which shaders draw the area: `original` (Static1 and its variants translated from the
     /// game's D3D9 bytecode, and the creature and placeable shaders; stand-in for the rest),
     /// `static` (Static1 only), `all` (every material whose original shaders translate), or
-    /// `standin` (hand-written WGSL only).
+    /// `standin` (hand-written WGSL only). `original+Foo.vsh` adds vertex shaders to the
+    /// original set.
     #[arg(long, default_value = "original")]
     shaders: String,
     /// Vertical field of view in degrees.
@@ -178,13 +179,20 @@ pub fn programs_cached(
 ) -> Result<ProgramRegistry> {
     {
         let mut reg = ProgramRegistry::default();
-        let filter = match shaders {
+        // `original+Foo.vsh+...` adds vertex shaders (with any pixel shader) to the
+        // original set, for trying shaders not yet drawn by default.
+        let mut parts = shaders.split('+');
+        let base = parts.next().unwrap_or_default();
+        let mut filter = match base {
             "standin" => return Ok(reg),
             "original" => thedas_render::d3d::object_filter(),
             "static" => thedas_render::d3d::static1_filter(),
             "all" => None,
             other => bail!("--shaders must be original, static, all or standin, not {other}"),
         };
+        if let Some(f) = filter.as_mut() {
+            f.extend(parts.map(|vs| (vs.to_string(), "*".to_string())));
+        }
         let source = thedas_render::d3d::D3dSource::new_cached(vfs, scene, &filter, cache);
         log::debug!(
             "original shaders: {} programs, {} failed",
