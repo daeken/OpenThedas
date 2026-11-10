@@ -18,16 +18,23 @@ use thedas_vfs::{DaoInstall, Vfs};
 /// (a level loading) does not leap the world ahead.
 pub const MAX_STEP_MS: f64 = 100.0;
 
-/// What a drawn scene was built for: the level and each object's models. A change rebuilds
-/// it.
-type SceneKey = (String, Vec<(u32, Vec<String>)>);
+/// What the objects' scene was built for: each object's models. A change rebuilds it.
+type ObjectsKey = Vec<(u32, Vec<String>)>;
 
-pub struct LiveScene {
-    key: SceneKey,
+/// The level of the current area, drawn first; built when the area's layout changes.
+pub struct LiveLevel {
+    layout: String,
+    pub vfs: Arc<Vfs>,
+    pub renderer: AreaRenderer,
+}
+
+/// The area's creatures and placeables, drawn over the level; rebuilt (alone) when an object
+/// comes, goes or changes what it wears.
+pub struct LiveObjects {
+    key: ObjectsKey,
     /// Interactive placeables' bounds (centre offset from the object, radius), from their
     /// draws when the scene was built.
     bounds: std::collections::HashMap<ObjectId, (glam::Vec3, f32)>,
-    pub vfs: Arc<Vfs>,
     pub scene: AreaScene,
     pub renderer: AreaRenderer,
 }
@@ -37,7 +44,8 @@ pub struct Live {
     pub paused: bool,
     install: PathBuf,
     shaders: String,
-    pub scene: Option<LiveScene>,
+    pub level: Option<LiveLevel>,
+    pub objects: Option<LiveObjects>,
     animator: Animator,
     models: ModelCache,
     /// Simulation time not yet ticked (fractions of a millisecond).
@@ -80,7 +88,8 @@ impl Live {
             paused: false,
             install: install.to_path_buf(),
             shaders: shaders.to_string(),
-            scene: None,
+            level: None,
+            objects: None,
             animator: Animator::default(),
             models: ModelCache::default(),
             owed_ms: 0.0,
@@ -120,23 +129,26 @@ impl Live {
         (h.area.is_some() && h.area == w.area).then_some((h.position, h.facing))
     }
 
-    /// Brings the drawn scene up to the simulation: rebuilds it when the area or the set
-    /// of objects changed, then places and poses every object.
+    /// Brings the drawn scenes up to the simulation: the level when the area's layout
+    /// changes, the objects when the set of objects (or what they wear) changes; then places
+    /// and poses every object.
     pub fn sync(&mut self, ctx: &GpuContext, format: wgpu::TextureFormat) -> Result<()> {
-        let Some(area) = self.sim.world.area else {
-            self.scene = None;
+        let Some(layout) = self.sim.world.area.and_then(|a| self.sim.area_layout(a)) else {
+            self.level = None;
+            self.objects = None;
             return Ok(());
         };
-        let Some(layout) = self.sim.area_layout(area) else {
-            self.scene = None;
-            return Ok(());
-        };
-        let models = thedas_ui::models::area_models_cached(&self.sim, area, &mut self.models);
-        let key = scene_key(&layout, &models);
-        if self.scene.as_ref().map(|s| &s.key) != Some(&key) {
-            self.scene = Some(self.build(ctx, format, &layout, &models, key)?);
+        let area = self.sim.world.area.unwrap_or_default();
+        if self.level.as_ref().map(|l| l.layout.as_str()) != Some(layout.as_str()) {
+            self.objects = None;
+            self.level = Some(self.build_level(ctx, format, &layout)?);
         }
-        let Some(live) = self.scene.as_mut() else {
+        let models = thedas_ui::models::area_models_cached(&self.sim, area, &mut self.models);
+        let key = objects_key(&models);
+        if self.objects.as_ref().map(|o| &o.key) != Some(&key) {
+            self.objects = Some(self.build_objects(ctx, format, &layout, &models, key)?);
+        }
+        let (Some(level), Some(objects)) = (self.level.as_ref(), self.objects.as_mut()) else {
             return Ok(());
         };
         let posed: Vec<(Mat4, Option<Clip>)> = models
@@ -148,25 +160,102 @@ impl Live {
                 )
             })
             .collect();
-        self.animator
-            .pose_props(&live.vfs, &live.scene, &mut live.renderer, ctx, &posed, 0.0);
+        self.animator.pose_props(
+            &level.vfs,
+            &objects.scene,
+            &mut objects.renderer,
+            ctx,
+            &posed,
+            0.0,
+        );
         Ok(())
     }
 
-    fn build(
+    /// Records the frame: the level, then the objects over it.
+    pub fn render(
+        &mut self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        (width, height): (u32, u32),
+        camera: &thedas_render::Camera,
+    ) -> bool {
+        let Some(level) = self.level.as_mut() else {
+            return false;
+        };
+        level
+            .renderer
+            .render(ctx, encoder, target, width, height, camera);
+        if let Some(o) = self.objects.as_mut() {
+            let depth = level.renderer.depth(&ctx.device, width, height);
+            o.renderer
+                .render_over(ctx, encoder, target, width, height, camera, &depth);
+        }
+        true
+    }
+
+    /// The frame as RGBA8 pixels, when there is a level to draw.
+    pub fn capture(
+        &mut self,
+        ctx: &GpuContext,
+        camera: &thedas_render::Camera,
+        (width, height): (u32, u32),
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(level) = self.level.as_mut() else {
+            return Ok(None);
+        };
+        let mut overlays: Vec<&mut AreaRenderer> =
+            self.objects.iter_mut().map(|o| &mut o.renderer).collect();
+        Ok(Some(level.renderer.capture_with(
+            ctx,
+            camera,
+            width,
+            height,
+            &mut overlays,
+        )?))
+    }
+
+    fn build_level(
+        &mut self,
+        ctx: &GpuContext,
+        format: wgpu::TextureFormat,
+        layout: &str,
+    ) -> Result<LiveLevel> {
+        let started = std::time::Instant::now();
+        let install = DaoInstall::open(&self.install)?;
+        let mut vfs = install.global_vfs(TextureQuality::High)?;
+        install.mount_level(&mut vfs, layout)?;
+        let scene = AreaScene::load(&vfs, layout)?;
+        let programs = crate::programs(&vfs, &scene, &self.shaders)?;
+        let renderer = AreaRenderer::new(ctx, &vfs, &scene, &programs, format);
+        log::info!(
+            "{layout}: level of {} draws built in {:.2}s",
+            scene.draws.len(),
+            started.elapsed().as_secs_f64()
+        );
+        Ok(LiveLevel {
+            layout: layout.to_string(),
+            vfs: Arc::new(vfs),
+            renderer,
+        })
+    }
+
+    fn build_objects(
         &mut self,
         ctx: &GpuContext,
         format: wgpu::TextureFormat,
         layout: &str,
         models: &[ObjectModel],
-        key: SceneKey,
-    ) -> Result<LiveScene> {
+        key: ObjectsKey,
+    ) -> Result<LiveObjects> {
         let started = std::time::Instant::now();
-        let install = DaoInstall::open(&self.install)?;
-        let mut vfs = install.global_vfs(TextureQuality::High)?;
-        install.mount_level(&mut vfs, layout)?;
+        let vfs = self
+            .level
+            .as_ref()
+            .map(|l| l.vfs.clone())
+            .context("objects before their level")?;
         let props: Vec<Prop> = models.iter().map(prop).collect();
-        let scene = AreaScene::load_with_props(&vfs, layout, &props)?;
+        let scene = AreaScene::load_objects(&vfs, layout, &props)?;
         let programs = crate::programs(&vfs, &scene, &self.shaders)?;
         let renderer = AreaRenderer::new(ctx, &vfs, &scene, &programs, format);
         log::info!(
@@ -194,10 +283,9 @@ impl Live {
                 .fold(0.0, f32::max);
             bounds.insert(m.id, (centre - glam::Vec3::from_array(m.position), radius));
         }
-        Ok(LiveScene {
+        Ok(LiveObjects {
             key,
             bounds,
-            vfs: Arc::new(vfs),
             scene,
             renderer,
         })
@@ -267,7 +355,7 @@ impl Live {
                     ray_cylinder(origin, dir, p, r, PICK_HEIGHT)
                 }
                 thedas_sim::world::ObjectKind::Placeable if o.interactive => self
-                    .scene
+                    .objects
                     .as_ref()
                     .and_then(|s| s.bounds.get(&o.id))
                     .and_then(|&(off, r)| ray_sphere(origin, dir, p + off, r)),
@@ -341,20 +429,17 @@ impl Live {
     }
 }
 
-fn scene_key(layout: &str, models: &[ObjectModel]) -> SceneKey {
-    (
-        layout.to_string(),
-        models
-            .iter()
-            .map(|m| {
-                let mut v = m.models.clone();
-                v.extend(m.attached.iter().map(|a| format!("{}@{}", a.model, a.node)));
-                v.extend(m.morph.iter().map(|x| format!("{x}.mor{}", m.hide_hair)));
-                v.extend(m.tints.iter().map(|(a, t)| format!("{a}:{t}")));
-                (m.id, v)
-            })
-            .collect(),
-    )
+fn objects_key(models: &[ObjectModel]) -> ObjectsKey {
+    models
+        .iter()
+        .map(|m| {
+            let mut v = m.models.clone();
+            v.extend(m.attached.iter().map(|a| format!("{}@{}", a.model, a.node)));
+            v.extend(m.morph.iter().map(|x| format!("{x}.mor{}", m.hide_hair)));
+            v.extend(m.tints.iter().map(|(a, t)| format!("{a}:{t}")));
+            (m.id, v)
+        })
+        .collect()
 }
 
 /// An object's models as a scene prop.
