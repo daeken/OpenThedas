@@ -453,6 +453,27 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
                 target = Some(t);
                 sim.order_attack(hero, t);
             }
+            // The party AI does not chase a hostile far from the controlled character (a
+            // wolf seen 35 m off that has not noticed the party): with everyone idle, the
+            // player walks toward the nearest one, as they would.
+            if idle && o.ai_hero && party_idle(sim, hero) {
+                let near = hostiles.iter().copied().min_by(|&a, &b| {
+                    let d = |c| {
+                        sim.world.get(c).map_or(f32::MAX, |x| {
+                            let h = sim.world.get(hero).map(|h| h.position).unwrap_or_default();
+                            (x.position[0] - h[0]).hypot(x.position[1] - h[1])
+                        })
+                    };
+                    d(a).total_cmp(&d(b))
+                });
+                if let Some((p, a)) = near
+                    .and_then(|f| sim.world.get(f))
+                    .map(|f| (f.position, f.area))
+                {
+                    let next = leg(sim, hero, p);
+                    sim.walk(hero, next, a);
+                }
+            }
             sim.tick(500);
             continue;
         }
@@ -538,6 +559,22 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
             activity
         },
         samples,
+    })
+}
+
+/// Whether the hero's party is doing nothing (each member's queue empty or waiting).
+fn party_idle(sim: &Sim, hero: ObjectId) -> bool {
+    let mut party = vec![hero];
+    party.extend(
+        sim.world
+            .get(hero)
+            .map(|h| h.followers.clone())
+            .unwrap_or_default(),
+    );
+    party.iter().all(|&m| {
+        sim.world
+            .get(m)
+            .is_none_or(|x| x.dead || x.commands.first().is_none_or(|c| c.name == "CommandWait"))
     })
 }
 
