@@ -130,9 +130,14 @@ impl Sim {
     /// How far a creature notices others, in metres: the `PrimaryRange` of its
     /// `PerceptionClass` row of ranges.gda (`PercepRngShrt` 10, `PercepRngMed` 30,
     /// `PercepRngLng` 40, `PercepRngMonster` 30, ...); a creature with none uses
-    /// `PercepRngPlayer` if it is in the party, `PercepRngDefault` otherwise. Provisional: the
-    /// table's `SecondaryRange` (20 for the medium and monster rows, 30 for the long ones) is
-    /// not used, its meaning not recovered.
+    /// `PercepRngPlayer` if it is in the party, `PercepRngDefault` otherwise.
+    ///
+    /// From DAOrigins.exe: template loading reads `PerceptionClass` and stores ranges.gda
+    /// (M2DA 134) column hash 0x45bd822c (`PrimaryRange`) of that row on the creature
+    /// (0x71f5f0); the perception test (0x6a8d60) compares the distance with that range, or
+    /// with 60 m (0xadef18) when its caller asks for the visual radius, before its sight
+    /// check, with no dependence on combat state. `SecondaryRange`'s hash appears nowhere in
+    /// the executable. The rows for creatures without a `PerceptionClass` are provisional.
     pub fn perception_range(&self, id: ObjectId) -> f32 {
         let class = self
             .world
