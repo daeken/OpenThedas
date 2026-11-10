@@ -923,9 +923,15 @@ impl AreaScene {
             message: e.to_string(),
         })?;
         l.scene.name = arl.name.clone();
-        l.scene.sun = arl
-            .sun
-            .map(|s| (Vec3::from_array(s.direction), Vec3::from_array(s.color)));
+        // Characters (the objects' scene) take the sun's character colour.
+        l.scene.sun = arl.sun.map(|s| {
+            let color = if level_meshes {
+                s.color
+            } else {
+                s.character_color
+            };
+            (Vec3::from_array(s.direction), Vec3::from_array(color))
+        });
         l.scene.bounds = arl
             .bounds()
             .map(|(lo, hi)| (Vec3::from_array(lo), Vec3::from_array(hi)));
