@@ -47,6 +47,11 @@ struct Args {
     /// Output or window size, WIDTHxHEIGHT.
     #[arg(long, default_value = "1280x720")]
     size: String,
+    /// Which shaders draw the area: `original` (Static1 and its variants translated from the
+    /// game's D3D9 bytecode, stand-in for the rest), `all` (every material whose original
+    /// shaders translate), or `standin` (hand-written WGSL only).
+    #[arg(long, default_value = "original")]
+    shaders: String,
     /// Vertical field of view in degrees.
     #[arg(long, default_value_t = 60.0)]
     fov: f32,
@@ -66,11 +71,32 @@ fn parse_size(s: &str) -> Result<(u32, u32)> {
 struct Loaded {
     vfs: Vfs,
     scene: AreaScene,
+    shaders: String,
+}
+
+impl Loaded {
+    fn programs(&self) -> Result<ProgramRegistry> {
+        let mut reg = ProgramRegistry::default();
+        let filter = match self.shaders.as_str() {
+            "standin" => return Ok(reg),
+            "original" => thedas_render::d3d::static1_filter(),
+            "all" => None,
+            other => bail!("--shaders must be original, all or standin, not {other}"),
+        };
+        let source = thedas_render::d3d::D3dSource::new(&self.vfs, &self.scene, &filter);
+        log::info!(
+            "original shaders: {} programs, {} failed",
+            source.programs().count(),
+            source.failures.len()
+        );
+        reg.push_front(Box::new(source));
+        Ok(reg)
+    }
 }
 
 /// Opens the install, mounts the level (resolving an area name through its `.are` file) and
 /// loads the scene.
-fn load(install: &Path, area: &str) -> Result<Loaded> {
+fn load(install: &Path, area: &str, shaders: &str) -> Result<Loaded> {
     let install = DaoInstall::open(install)?;
     let mut vfs = install.global_vfs(TextureQuality::High)?;
     let level = match install.mount_level(&mut vfs, area) {
@@ -93,16 +119,21 @@ fn load(install: &Path, area: &str) -> Result<Loaded> {
     let started = Instant::now();
     let scene = AreaScene::load(&vfs, &level)?;
     log::info!(
-        "{level} ({}): {} rooms, {} draws, {} meshes, {} materials, {} warnings, loaded in {:.2}s",
+        "{level} ({}): {} rooms, {} draws, {} lights, {} meshes, {} materials, {} warnings, loaded in {:.2}s",
         scene.name.as_deref().unwrap_or("?"),
         scene.rooms.len(),
         scene.draws.len(),
+        scene.lights.len(),
         scene.meshes.len(),
         scene.materials.len(),
         scene.warnings.len(),
         started.elapsed().as_secs_f64()
     );
-    Ok(Loaded { vfs, scene })
+    Ok(Loaded {
+        vfs,
+        scene,
+        shaders: shaders.to_string(),
+    })
 }
 
 /// A starting camera: above the centroid of the placed models at standing height (1.7 above
@@ -158,7 +189,7 @@ fn capture(loaded: &Loaded, out: &Path, camera: Camera, (w, h): (u32, u32)) -> R
         &ctx,
         &loaded.vfs,
         &loaded.scene,
-        &ProgramRegistry::default(),
+        &loaded.programs()?,
         thedas_render::gpu::CAPTURE_FORMAT,
     );
     log_stats(&renderer);
@@ -224,7 +255,7 @@ impl App {
             &ctx,
             &self.loaded.vfs,
             &self.loaded.scene,
-            &ProgramRegistry::default(),
+            &self.loaded.programs()?,
             config.format,
         );
         log_stats(&renderer);
@@ -418,7 +449,7 @@ fn main() -> Result<()> {
         .or_else(|| std::env::var_os("THEDAS_INSTALL").map(PathBuf::from))
         .context("give --install or set THEDAS_INSTALL")?;
     let size = parse_size(&args.size)?;
-    let loaded = load(&install, &args.area)?;
+    let loaded = load(&install, &args.area, &args.shaders)?;
     let mut camera = match &args.camera {
         Some(spec) => Camera::parse(spec).context("camera must be x,y,z,yaw,pitch")?,
         None => default_camera(&loaded.scene),
