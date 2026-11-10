@@ -1040,6 +1040,10 @@ impl AreaRenderer {
     }
 
     /// Renders one frame offscreen and returns tightly packed RGBA8 pixels.
+    ///
+    /// It writes this renderer's per-draw constants and submits at once: not to be called
+    /// between [`AreaRenderer::render`] encoding a frame and that frame's submission, which
+    /// would then draw with this capture's camera.
     pub fn capture(
         &mut self,
         ctx: &GpuContext,
