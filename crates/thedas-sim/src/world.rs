@@ -245,6 +245,13 @@ pub struct Effect {
     /// When a temporary effect runs out (simulation milliseconds).
     #[serde(default)]
     pub expires: Option<u64>,
+    /// Made by a hostile constructor (`EffectModifyPropertyHostile`): a debuff.
+    #[serde(default)]
+    pub hostile: bool,
+    /// The engine data integers scripts set (`SetEffectEngineInteger`; write-only for
+    /// scripts), by index.
+    #[serde(default)]
+    pub engine_ints: Vec<(i32, i32)>,
 }
 
 /// Engine structures held by handle (scripts copy handles; every `Set*` makes a new one).
