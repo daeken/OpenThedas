@@ -56,6 +56,9 @@ pub struct Options<'a> {
     pub fights: u32,
     /// Write the last run's full trace here (JSON lines).
     pub trace_to: Option<&'a Path>,
+    /// Add the runs' coverage counters (unimplemented, stubbed and presentation-only engine
+    /// calls, missing 2DA data) to this JSON file.
+    pub coverage_to: Option<&'a Path>,
     /// Write the last run's end state here (a save the MCP can load).
     pub save_to: Option<&'a Path>,
 }
@@ -565,6 +568,12 @@ pub fn run(o: &Options) -> Result<()> {
             );
         }
         runs.push(r);
+    }
+    if let Some(p) = o.coverage_to {
+        sim.world
+            .trace
+            .merge_coverage(p)
+            .with_context(|| format!("writing {}", p.display()))?;
     }
     if let Some(p) = o.trace_to {
         std::fs::write(p, sim.world.trace.to_jsonl())
