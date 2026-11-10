@@ -1004,6 +1004,22 @@ impl Server {
         })
     }
 
+    #[tool(
+        description = "Take everything from a container, body bag or dead creature into the hero's inventory (walk there first). Returns the items taken."
+    )]
+    async fn loot(&self, Parameters(a): Parameters<ObjectArg>) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            let hero = sim.world.hero.ok_or("no hero")?;
+            let from = resolve(sim, &a.object).ok_or("no such object")?;
+            let items = sim.loot(from, hero);
+            sim.tick(0);
+            Ok(json!({
+                "taken": items.iter().map(|&i| summary(sim, i)).collect::<Vec<_>>(),
+            }))
+        })
+    }
+
     #[tool(description = "Pick a reply in the current conversation by index.")]
     async fn choose_reply(&self, Parameters(a): Parameters<ReplyArgs>) -> String {
         self.with_sim(|st| {
