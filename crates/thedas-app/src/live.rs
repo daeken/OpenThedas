@@ -23,7 +23,7 @@ type ObjectsKey = Vec<(u32, Vec<String>)>;
 
 /// The level of the current area, drawn first; built when the area's layout changes.
 pub struct LiveLevel {
-    layout: String,
+    pub layout: String,
     pub vfs: Arc<Vfs>,
     pub renderer: AreaRenderer,
 }

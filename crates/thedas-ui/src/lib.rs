@@ -14,6 +14,7 @@ pub mod avm1;
 pub mod binding;
 pub mod chains;
 pub mod input;
+pub mod minimap;
 pub mod models;
 pub mod protocol;
 pub mod stage;

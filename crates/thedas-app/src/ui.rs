@@ -128,7 +128,19 @@ pub struct UiLayer {
     shown: Arc<Mutex<thedas_ui::binding::Presentation>>,
     /// The conversation line on screen and how far it has played.
     line: Option<Line>,
+    /// The level whose resources and minimap the interface has.
+    level: Option<String>,
+    /// Frames since the minimap's creatures were last sent.
+    minimap_frame: u32,
 }
+
+/// minimap.gfx's creature flags (`SharedLibrary.CreatureMapIcon.FLAG_*`).
+const MAP_HOSTILE: u32 = 1;
+const MAP_IN_PARTY: u32 = 2;
+const MAP_PLAYER: u32 = 8;
+const MAP_WITHIN_RADIUS: u32 = 16;
+/// The minimap's creatures are sent every this many frames.
+const MINIMAP_EVERY: u32 = 3;
 
 /// A conversation line: the dialog, the line's text and its replies' nodes.
 type LineKey = (String, String, Vec<usize>);
@@ -182,6 +194,8 @@ impl UiLayer {
             ignored: Default::default(),
             shown: Default::default(),
             line: None,
+            level: None,
+            minimap_frame: 0,
         }
     }
 
@@ -313,6 +327,108 @@ impl UiLayer {
         {
             m.call("_global.Conversation.ContinueButtonAction", &[]);
         }
+    }
+
+    /// The level being played (its layout and resources): the movies may load from them, and
+    /// the minimap shows its picture. Does nothing when it is the same level.
+    pub fn set_level(&mut self, layout: Option<&str>, vfs: Option<&Arc<Vfs>>) {
+        if self.level.as_deref() == layout {
+            return;
+        }
+        self.level = layout.map(str::to_string);
+        self.stage.set_level_resources(vfs.cloned());
+        let minimap = match (layout, vfs) {
+            (Some(l), Some(v)) => thedas_ui::minimap::MinimapInfo::read(v, l),
+            _ => None,
+        };
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.minimap = minimap;
+        }
+    }
+
+    /// Sends the minimap where the camera and the area's creatures are (the engine writes
+    /// `SharedLibrary.SharedMap`'s batch arrays: the camera first, then each creature's
+    /// place on the map picture, in its pixels, and facing, three numbers each, and flags),
+    /// then has it redraw. Provisional: every living creature in the area is shown, all
+    /// within the map's radius.
+    pub fn update_minimap(&mut self, sim: &Arc<Mutex<Sim>>, camera: &thedas_render::Camera) {
+        self.minimap_frame += 1;
+        if self.minimap_frame < MINIMAP_EVERY {
+            return;
+        }
+        self.minimap_frame = 0;
+        let Some(info) = self.shown.lock().ok().and_then(|s| s.minimap.clone()) else {
+            return;
+        };
+        let Some(m) = self
+            .stage
+            .movies
+            .iter_mut()
+            .find(|m| m.name == "minimap.gfx")
+        else {
+            return;
+        };
+        let num = |x: f64| thedas_ui::UiValue::Number(x);
+        // The camera's facing, as creatures' (degrees, 0 looking along +Y).
+        let mut ids = vec![num(0.0)];
+        let at = info.to_map(camera.position.x, camera.position.y);
+        let mut places = vec![
+            num(at[0] as f64),
+            num(at[1] as f64),
+            num(camera.yaw.to_degrees() as f64 - 90.0),
+        ];
+        let mut flags = vec![num(0.0)];
+        {
+            let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+            let area = sim.world.area;
+            let party = thedas_sim::engine::party_of(&sim);
+            let (hero, controlled) = (sim.world.hero, sim.world.controlled());
+            for o in sim.world.objects.values() {
+                if o.kind != thedas_sim::world::ObjectKind::Creature
+                    || !o.active
+                    || o.dead
+                    || o.area.is_none()
+                    || o.area != area
+                {
+                    continue;
+                }
+                let mut f = MAP_WITHIN_RADIUS;
+                if party.contains(&o.id) {
+                    f |= MAP_IN_PARTY;
+                }
+                if Some(o.id) == controlled {
+                    f |= MAP_PLAYER;
+                }
+                if hero.is_some_and(|h| sim.hostile(h, o.id)) {
+                    f |= MAP_HOSTILE;
+                }
+                ids.push(num(o.id as f64));
+                let at = info.to_map(o.position[0], o.position[1]);
+                places.extend([num(at[0] as f64), num(at[1] as f64), num(o.facing as f64)]);
+                flags.push(num(f as f64));
+            }
+        }
+        let map = "_global.SharedLibrary.SharedMap";
+        m.set(
+            &format!("{map}.BatchCreatureIDs"),
+            thedas_ui::UiValue::List(ids),
+        );
+        m.set(
+            &format!("{map}.BatchCreaturePositionsOrientations"),
+            thedas_ui::UiValue::List(places),
+        );
+        m.set(
+            &format!("{map}.BatchCreatureFlags"),
+            thedas_ui::UiValue::List(flags),
+        );
+        // The map picture's clip is authored fully transparent and nothing in the movie
+        // raises it once the picture has loaded. Provisional: the game shows it, so it is
+        // shown here.
+        m.set(
+            "_global.MiniMap.Instance.m_mcMapImage._alpha",
+            thedas_ui::UiValue::Number(100.0),
+        );
+        m.call("_global.MiniMap.Instance.UpdateMinimap", &[]);
     }
 
     /// Renders every movie into its texture (the window does this as it composites).

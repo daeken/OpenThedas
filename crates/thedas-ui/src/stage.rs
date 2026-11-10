@@ -145,13 +145,25 @@ pub struct Stage {
     pub bridge: GameBridge,
     gpu: Gpu,
     lookup: ResourceLookup,
+    /// The current level's resources (its minimap picture), searched after the stage's own.
+    level: Arc<std::sync::Mutex<Option<Arc<Vfs>>>>,
     images: Arc<std::sync::Mutex<ImageSource>>,
     size: (u32, u32),
 }
 
 impl Stage {
     pub fn new(gpu: Gpu, vfs: &Arc<Vfs>, size: (u32, u32)) -> Self {
-        let lookup = vfs_lookup(vfs);
+        let level: Arc<std::sync::Mutex<Option<Arc<Vfs>>>> = Default::default();
+        let lookup = {
+            let (global, level) = (vfs_lookup(vfs), level.clone());
+            let lookup: ResourceLookup = Arc::new(move |name: &str| {
+                global(name).or_else(|| {
+                    let l = level.lock().ok()?.clone()?;
+                    l.read(name).ok().map(|x| x.0)
+                })
+            });
+            lookup
+        };
         let atlases = vfs
             .names()
             .into_iter()
@@ -169,6 +181,7 @@ impl Stage {
             },
             gpu,
             lookup,
+            level,
             images,
             size,
         }
@@ -176,6 +189,13 @@ impl Stage {
 
     pub fn size(&self) -> (u32, u32) {
         self.size
+    }
+
+    /// The level's resources the movies may load from too (the minimap picture), or none.
+    pub fn set_level_resources(&self, vfs: Option<Arc<Vfs>>) {
+        if let Ok(mut l) = self.level.lock() {
+            *l = vfs;
+        }
     }
 
     /// Loads a movie (`mainmenu.gfx`) on top of the others and starts it.
