@@ -26,8 +26,9 @@
 //!   `c7`/`c8` point light C, `c9`/`c11` light D (position/radius, colour). Light A is always
 //!   evaluated; `b0`..`b3` of `g_bShaderControlBooleans` enable D, B, C and the directional
 //!   light. Lights A-C and the directional light are multiplied by the lightmap alpha; D is not.
-//! - Fog, shadows, the environment cubemap and the depth-of-field output are disabled (fog
-//!   density 0, no directional light, black cubemap, `oC1` dropped).
+//! - Fog and the sky's scattering come from the level's atmosphere ([`crate::atmosphere`]).
+//!   Shadows, the environment cubemap and the depth-of-field output are disabled (no shadow
+//!   maps, black cubemap, `oC1` dropped).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -256,7 +257,7 @@ pub fn static1_filter() -> ShaderFilter {
 /// characters (`Char1`), hair (`Hair0_Pass1`, `Hair0`: four passes), faces (`Face1`), eyes
 /// and lashes (`Eye0`), cloth (`Cloth1`), props (`Prop1`) and weapons (`Weapon1`), with any
 /// pixel shader; and exterior terrain (`Terrain2`, terrain.mat's pass above Low detail, and
-/// `Terrain3`, its Low detail pass).
+/// `Terrain3`, its Low detail pass); and the sky dome (`Sky`).
 pub fn object_filter() -> ShaderFilter {
     let mut v = static1_filter().unwrap_or_default();
     for vs in OBJECT_VERTEX_SHADERS {
@@ -266,7 +267,7 @@ pub fn object_filter() -> ShaderFilter {
 }
 
 /// See [`object_filter`].
-pub const OBJECT_VERTEX_SHADERS: [&str; 10] = [
+pub const OBJECT_VERTEX_SHADERS: [&str; 11] = [
     "Char1.vsh",
     "Hair0_Pass1.vsh",
     "Hair0.vsh",
@@ -277,6 +278,7 @@ pub const OBJECT_VERTEX_SHADERS: [&str; 10] = [
     "Weapon1.vsh",
     "Terrain2.vsh",
     "Terrain3.vsh",
+    "Sky.vsh",
 ];
 
 /// Point lights chosen for one draw, in slot order A, B, C.
@@ -343,6 +345,10 @@ pub struct ConstantContext<'a> {
     pub irradiance: Option<&'a IrradianceProbe>,
     /// The level's sun: the direction its light travels and its colour.
     pub sun: Option<(Vec3, Vec3)>,
+    /// The level's fog registers (`FogParameters`, see [`crate::atmosphere`]).
+    pub fog: [[f32; 4]; 2],
+    /// The level's sky registers (`SkyParameters`), when it has an atmosphere.
+    pub sky: Option<&'a [[f32; 4]; 9]>,
 }
 
 /// Light from every direction for draws in a level with no irradiance probe. Provisional.
@@ -456,6 +462,7 @@ impl ConstantContext<'_> {
             ("View", _) => Some(self.view),
             ("ViewInv", _) => Some(self.view.inverse()),
             ("Projection", _) => Some(self.projection),
+            ("ViewProjection", _) => Some(self.projection * self.view),
             _ => None,
         };
         if let Some(m) = matrix {
@@ -495,9 +502,12 @@ impl ConstantContext<'_> {
             (_, "mml_fOpacityMultiplier") if self.material_value(&c.name).is_none() => {
                 Value::Vectors(vec![[1.0, 0.0, 0.0, 0.0]])
             }
-            ("FogParameters", _) | ("ShadowData", _) | ("IrradianceParams", _) => {
-                Value::Vectors(Vec::new())
+            ("FogParameters", _) => Value::Vectors(self.fog.to_vec()),
+            ("SkyParameters", _) => {
+                Value::Vectors(self.sky.map(|s| s.to_vec()).unwrap_or_default())
             }
+            ("ApplicationTime", _) => Value::Vectors(vec![[0.0; 4]]),
+            ("ShadowData", _) | ("IrradianceParams", _) => Value::Vectors(Vec::new()),
             (_, "mml_vLightmapOffsetAndScale") if self.lightmap.is_some() => {
                 let l = self.lightmap?;
                 Value::Vectors(vec![[l.offset[0], l.offset[1], l.scale[0], l.scale[1]]])
@@ -735,6 +745,8 @@ mod tests {
             bones: &[],
             irradiance: None,
             sun: Some((Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.6, 0.5, 0.3))),
+            fog: crate::atmosphere::fog_params(None),
+            sky: None,
         };
         let t = table(vec![
             constant(
@@ -848,6 +860,8 @@ mod tests {
             bones: &[],
             irradiance: None,
             sun: None,
+            fog: crate::atmosphere::fog_params(None),
+            sky: None,
         };
         let c = cc.fill(Some(&table(vec![constant(
             "mml_vTintColor",
@@ -898,6 +912,8 @@ mod tests {
                 bones: &[],
                 irradiance: None,
                 sun: None,
+                fog: crate::atmosphere::fog_params(None),
+                sky: None,
             };
             let c = cc.fill(Some(&table(vec![constant(
                 "aur_mWorld",

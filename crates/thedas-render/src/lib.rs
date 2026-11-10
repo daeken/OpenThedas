@@ -12,6 +12,7 @@
 //! Presentation only: nothing here writes simulation state.
 
 pub mod animate;
+pub mod atmosphere;
 pub mod camera;
 pub mod collide;
 pub mod d3d;

@@ -203,6 +203,8 @@ pub struct AreaScene {
     pub effects: Vec<thedas_formats::level::FrameEffect>,
     /// The graphics detail level the materials' techniques were chosen for.
     pub detail: Detail,
+    /// The level's atmosphere: its sky's scattering and its fog.
+    pub atmosphere: Option<thedas_formats::level::Atmosphere>,
     /// The models the simulation placed, in the order given, with their draws.
     pub props: Vec<PropDraws>,
 }
@@ -991,6 +993,7 @@ impl AreaScene {
         })?;
         l.scene.name = arl.name.clone();
         l.scene.effects = arl.effects.clone();
+        l.scene.atmosphere = arl.atmosphere;
         // Characters (the objects' scene) take the sun's character colour.
         l.scene.sun = arl.sun.map(|s| {
             let color = if level_meshes {
@@ -1048,6 +1051,32 @@ impl AreaScene {
                     },
                 );
             }
+        }
+        // The sky, around the camera (its vertex shader centres it there). Only its dome
+        // (the `Sky` semantic) is drawn: the clouds' material is not drawn yet.
+        if level_meshes && let Some(sky) = arl.sky_model.as_deref() {
+            let first = l.scene.draws.len();
+            l.place(
+                &sky.to_ascii_lowercase(),
+                Mat4::IDENTITY,
+                Placing {
+                    scale: 1.0,
+                    sphere: None,
+                    lightmaps: &[],
+                    room: "",
+                    probe: None,
+                    morph: None,
+                    tint: None,
+                    lights_only: false,
+                },
+            );
+            let materials = &l.scene.materials;
+            let mut i = 0;
+            l.scene.draws.retain(|d| {
+                let keep = i < first || materials[d.material].semantic.eq_ignore_ascii_case("Sky");
+                i += 1;
+                keep
+            });
         }
         l.scene.static_draws = l.scene.draws.len();
         for prop in props {
