@@ -798,15 +798,22 @@ pub fn call(
                 .object(obj(a, 0))
                 .and_then(|o| o.properties.get(&int(a, 1)).copied())
                 .unwrap_or((0.0, 0.0));
-            ok(Value::Float(if vt == base_type {
+            let v = if vt == base_type {
                 base
             } else if vt == modifier {
-                0.0
+                return ok(Value::Float(0.0));
             } else if vt == current {
                 cur
             } else {
                 base.max(cur)
-            }))
+            };
+            // Totals and attributes stay within `properties.gda`'s Min and Max (a depletable's
+            // current value may still run down to 0). Provisional: inferred from the table.
+            let v = match property_bounds(h.sim, int(a, 1)) {
+                Some((ty, min, max)) if !(vt == current && ty == 3) => v.clamp(min, max),
+                _ => v,
+            };
+            ok(Value::Float(v))
         }
         "SetCreatureProperty" | "UpdateCreatureProperty" => {
             let vt = int(a, 3);
@@ -1095,6 +1102,10 @@ pub fn call(
                 let creator = obj(a, 4);
                 if creator != OBJECT_INVALID && creator != 0 {
                     e.creator = Some(creator);
+                }
+                // The ability the effect comes from (`GetEffectAbilityID`).
+                if a.len() > 5 && int(a, 5) != 0 {
+                    e.ability = int(a, 5);
                 }
                 h.sim.apply_effect(obj(a, 2), e);
             }
@@ -1489,11 +1500,17 @@ pub fn call(
                 o.fields.insert("FollowerState".into(), state);
             }
             if let Some(hero) = h.sim.world.hero.filter(|&x| x != who) {
+                let hero_group = h.object(hero).map(|o| o.group);
                 if let Some(ho) = h.sim.world.get_mut(hero) {
                     ho.followers.retain(|&f| f != who);
                     if active {
                         ho.followers.push(who);
                     }
+                }
+                // Joining the active party puts a follower on the player's side
+                // (GROUP_PC), whatever group it had as an NPC. Provisional.
+                if let (true, Some(g), Some(o)) = (active, hero_group, h.sim.world.get_mut(who)) {
+                    o.group = g;
                 }
             }
             void()
@@ -2268,8 +2285,97 @@ pub fn call(
             }
             void()
         }
-        // No ability cooldowns or tactic items are simulated yet.
-        "GetRemainingCooldown" => ok(Value::Float(0.0)),
+        // Cooldowns are kept per ability and source item tag; an item's cooldown is shared by
+        // every item with its tag. Provisional.
+        "GetRemainingCooldown" => {
+            let key = cooldown_key(int(a, 1), &string(a, 2));
+            let now = h.sim.world.time_ms;
+            ok(Value::Float(
+                h.object(obj(a, 0))
+                    .and_then(|o| o.combat.cooldowns.get(&key))
+                    .map_or(0.0, |&until| until.saturating_sub(now) as f32 / 1000.0),
+            ))
+        }
+        "SetCooldown" => {
+            let key = cooldown_key(int(a, 1), &string(a, 3));
+            let until = h.sim.world.time_ms + (float(a, 2).clamp(0.0, 1.0e6) * 1000.0) as u64;
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                if until > o.combat.cooldowns.get(&key).copied().unwrap_or(0) {
+                    o.combat.cooldowns.insert(key, until);
+                }
+            }
+            void()
+        }
+        // Removes `count` from an item's stack, destroying it when none are left.
+        "RemoveItem" => {
+            let (item, count) = (obj(a, 0), int(a, 1).max(0));
+            let Some(left) = h
+                .object(item)
+                .filter(|o| o.kind == ObjectKind::Item)
+                .map(|o| o.fields.get("StackSize").copied().unwrap_or(1).max(1) - count)
+            else {
+                return void();
+            };
+            if left > 0 {
+                if let Some(o) = h.sim.world.get_mut(item) {
+                    o.fields.insert("StackSize".into(), left);
+                }
+            } else {
+                for o in h.sim.world.objects.values_mut() {
+                    o.inventory.retain(|&i| i != item);
+                    o.equipment.retain(|_, i| *i != item);
+                }
+                h.sim.world.objects.remove(&item);
+            }
+            void()
+        }
+        // Ability results only steer animations, which the simulation does not play.
+        "SetAbilityResult" => void(),
+        "GetShowSpecialMoveFloaties" => ok(Value::Int(0)),
+        "GetEventLocation" => {
+            let l = match h.sim.world.handle(handle(a, 0)) {
+                Some(EngineData::Event(e)) => e.locations.get(int(a, 1).max(0) as usize).copied(),
+                _ => None,
+            };
+            let l = l.unwrap_or(Location {
+                area: OBJECT_INVALID,
+                position: [0.0; 3],
+                facing: 0.0,
+            });
+            let hd = h.sim.world.store(EngineData::Location(l));
+            ok(Value::Engine {
+                ty: ty.location,
+                handle: Some(hd),
+            })
+        }
+        "SetEventLocation" => {
+            let mut ev = match h.sim.world.handle(handle(a, 0)) {
+                Some(EngineData::Event(e)) => e.clone(),
+                _ => Event::default(),
+            };
+            let i = int(a, 1).max(0) as usize;
+            if let (true, Some(EngineData::Location(l))) =
+                (i < 64, h.sim.world.handle(handle(a, 2)))
+            {
+                let l = *l;
+                if ev.locations.len() <= i {
+                    ev.locations.resize(
+                        i + 1,
+                        Location {
+                            area: OBJECT_INVALID,
+                            position: [0.0; 3],
+                            facing: 0.0,
+                        },
+                    );
+                }
+                ev.locations[i] = l;
+            }
+            let hd = h.sim.world.store(EngineData::Event(ev));
+            ok(Value::Engine {
+                ty: ty.event,
+                handle: Some(hd),
+            })
+        }
         "GetTacticCommandItemTag" => ok(Value::String(String::new())),
         "GetAutoPauseCombatStatus" => ok(Value::Int(0)),
         "EnableWeaponTrail" => void(),
@@ -2318,9 +2424,141 @@ pub fn inside(p: [f32; 3], poly: &[[f32; 3]]) -> bool {
     inside
 }
 
+/// The key `SetCooldown` and `GetRemainingCooldown` share: the ability and source item tag.
+fn cooldown_key(ability: i32, item: &str) -> String {
+    format!("{ability}:{}", item.to_ascii_lowercase())
+}
+
+/// A property's type (as `GetCreaturePropertyType`), Min and Max from `properties.gda`.
+fn property_bounds(sim: &Sim, property: i32) -> Option<(i32, f32, f32)> {
+    let t = sim.world.tables.get(0, "properties")?;
+    let num = |c: Option<&Cell>| match c {
+        Some(Cell::Int(v)) => Some(*v as f32),
+        Some(Cell::Float(v)) => Some(*v as f32),
+        _ => None,
+    };
+    let (min, max) = (
+        num(t.cell("Min", property as i64))?,
+        num(t.cell("Max", property as i64))?,
+    );
+    let ty = match t.cell("Type", property as i64) {
+        Some(Cell::String(s)) if clean(s).eq_ignore_ascii_case("ATTRIBUTE") => 1,
+        Some(Cell::String(s)) if clean(s).eq_ignore_ascii_case("DERIVED") => 2,
+        Some(Cell::String(s)) if clean(s).eq_ignore_ascii_case("DEPLETABLE") => 3,
+        _ => 0,
+    };
+    (min <= max).then_some((ty, min, max))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use thedas_script::EngineTable;
+    use thedas_vfs::Vfs;
+
     use super::*;
+
+    const LDF: &str = "void SetCooldown(object o, int n, float f, string s) = 1;\n\
+        float GetRemainingCooldown(object o, int n, string s) = 2;\n\
+        void RemoveItem(object o, int n) = 3;\n\
+        void SetFollowerState(object o, int n) = 4;\n\
+        int FOLLOWER_STATE_ACTIVE = 1;\n\
+        int FOLLOWER_STATE_LOCKEDACTIVE = 5;\n";
+
+    /// Calls engine function `name` as `caller`.
+    fn run(s: &mut Sim, caller: ObjectId, name: &str, a: &[Value]) -> Option<Value> {
+        let f = s.table.function_by_name(name).cloned().unwrap();
+        let mut h = ScriptHost {
+            sim: s,
+            event: None,
+            script: "test".into(),
+        };
+        call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn cooldowns_run_out_and_used_items_leave_the_stack() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let potion = s.world.spawn(ObjectKind::Item, "potion");
+        s.world
+            .get_mut(potion)
+            .unwrap()
+            .fields
+            .insert("StackSize".into(), 2);
+        s.world.get_mut(hero).unwrap().inventory.push(potion);
+        let tag = Value::String("Potion".into());
+        run(
+            &mut s,
+            hero,
+            "SetCooldown",
+            &[
+                Value::Object(hero),
+                Value::Int(7),
+                Value::Float(5.0),
+                tag.clone(),
+            ],
+        );
+        s.world.time_ms += 2000;
+        let left = run(
+            &mut s,
+            hero,
+            "GetRemainingCooldown",
+            &[
+                Value::Object(hero),
+                Value::Int(7),
+                Value::String("potion".into()),
+            ],
+        );
+        assert_eq!(left, Some(Value::Float(3.0)));
+        s.world.time_ms += 4000;
+        let left = run(
+            &mut s,
+            hero,
+            "GetRemainingCooldown",
+            &[Value::Object(hero), Value::Int(7), tag],
+        );
+        assert_eq!(left, Some(Value::Float(0.0)));
+
+        run(
+            &mut s,
+            hero,
+            "RemoveItem",
+            &[Value::Object(potion), Value::Int(1)],
+        );
+        assert_eq!(
+            s.world.get(potion).unwrap().fields.get("StackSize"),
+            Some(&1)
+        );
+        run(
+            &mut s,
+            hero,
+            "RemoveItem",
+            &[Value::Object(potion), Value::Int(1)],
+        );
+        assert!(s.world.get(potion).is_none());
+        assert!(s.world.get(hero).unwrap().inventory.is_empty());
+    }
+
+    #[test]
+    fn followers_joining_the_party_take_the_heros_side() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let ally = s.world.spawn(ObjectKind::Creature, "ally");
+        s.world.hero = Some(hero);
+        s.world.get_mut(ally).unwrap().group = 2;
+        run(
+            &mut s,
+            hero,
+            "SetFollowerState",
+            &[Value::Object(ally), Value::Int(1)],
+        );
+        assert_eq!(s.world.get(hero).unwrap().followers, vec![ally]);
+        assert_eq!(s.world.get(ally).unwrap().group, 0);
+    }
 
     #[test]
     fn helpers() {

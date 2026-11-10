@@ -47,6 +47,8 @@ pub const EFFECT_TYPE_DEATH: i32 = 7;
 pub const EFFECT_TYPE_RESURRECTION: i32 = 1005;
 
 /// How long an attack takes when the script does not say (`SetAttackDuration`). Provisional.
+/// The script the original executable sends ability cast events to.
+pub const ABILITY_SCRIPT: &str = "ability_core";
 pub const DEFAULT_ATTACK_MS: u64 = 1500;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -64,6 +66,9 @@ pub struct CombatData {
     /// Tactics slots (`SetTacticEntry`, or a preset).
     #[serde(default)]
     pub tactics: Vec<Tactic>,
+    /// When each cooldown ends (simulation milliseconds), by `ability:item tag`.
+    #[serde(default)]
+    pub cooldowns: std::collections::BTreeMap<String, u64>,
 }
 
 /// One tactics slot: when `condition` holds for a target of `target` type, do `command`.
@@ -169,9 +174,6 @@ impl Sim {
             constant_of(self, "GM_COMBAT"),
         );
         let mode = self.world.game_mode;
-        if mode != explore && mode != combat {
-            return;
-        }
         let party = crate::engine::party_of(self);
         let fighting = party.iter().any(|&m| {
             self.alive(m)
@@ -182,6 +184,23 @@ impl Sim {
                         .any(|&p| self.alive(p) && self.hostile(m, p))
                 })
         });
+        // A fight that ended with fallen party members gets them up
+        // (EVENT_TYPE_DEATH_RES_PARTY to the module), whatever the game mode is.
+        let was = std::mem::replace(&mut self.world.party_fighting, fighting);
+        if was
+            && !fighting
+            && party
+                .iter()
+                .any(|&m| self.world.get(m).is_some_and(|o| o.dead))
+        {
+            if let Some(m) = self.world.module {
+                let ev = self.new_event("DEATH_RES_PARTY", Some(m));
+                self.world.queue_event(0, m, ev, None);
+            }
+        }
+        if mode != explore && mode != combat {
+            return;
+        }
         let new = if fighting { combat } else { explore };
         if new == mode || explore == combat {
             return;
@@ -411,6 +430,90 @@ impl Sim {
             o.commands.push(cmd);
             o.combat.in_combat = true;
         }
+    }
+
+    /// The item a `CommandUseAbility` uses: the owner's inventory item whose tag is the
+    /// command's string 0, or `OBJECT_INVALID`.
+    fn ability_item(&self, id: ObjectId, cmd: &crate::world::Command) -> ObjectId {
+        let Some(tag) = cmd.strings.first().filter(|t| !t.is_empty()) else {
+            return OBJECT_INVALID;
+        };
+        self.world
+            .get(id)
+            .and_then(|o| {
+                o.inventory.iter().copied().find(|i| {
+                    self.world
+                        .get(*i)
+                        .is_some_and(|x| x.tag.eq_ignore_ascii_case(tag))
+                })
+            })
+            .unwrap_or(OBJECT_INVALID)
+    }
+
+    /// The front `CommandUseAbility` started: the owner's script vets it
+    /// (`COMMAND_PENDING`: objects owner, target, item; integers command type, ability), then
+    /// `ability_core` hears `ABILITY_CAST_START`.
+    /// Provisional: the pending event's third object is inferred from `ability_core`, which
+    /// reads it as the item.
+    pub(crate) fn start_ability(&mut self, id: ObjectId, cmd: &crate::world::Command) {
+        let target = cmd.target.unwrap_or(OBJECT_INVALID);
+        let ability = cmd.ints.first().copied().unwrap_or(0);
+        let item = self.ability_item(id, cmd);
+        let mut ev = self.new_event("COMMAND_PENDING", Some(id));
+        ev.objects = vec![id, target, item];
+        ev.ints = vec![cmd.ty, ability];
+        let script = self.world.get(id).and_then(|o| o.script.clone());
+        if let Some(s) = &script {
+            self.run_script(s, id, Some(ev));
+        }
+        let still = self
+            .world
+            .get(id)
+            .and_then(|o| o.commands.first())
+            .is_some_and(|c| c.name == cmd.name && c.ints == cmd.ints && c.target == cmd.target);
+        if !still {
+            return;
+        }
+        self.ability_event("ABILITY_CAST_START", id, target, ability, cmd);
+    }
+
+    /// `ABILITY_CAST_START` or `ABILITY_CAST_IMPACT` to `ability_core`, which the original
+    /// executable names directly (the rules scripts do not handle these events): objects
+    /// caster, item, target; integers ability, then three the script reads but we leave 0.
+    /// Provisional: the layout is read from `ability_core`'s bytecode, the zeros are guesses.
+    fn ability_event(
+        &mut self,
+        name: &str,
+        id: ObjectId,
+        target: ObjectId,
+        ability: i32,
+        cmd: &crate::world::Command,
+    ) {
+        let item = self.ability_item(id, cmd);
+        let mut ev = self.new_event(name, Some(id));
+        ev.objects = vec![id, item, target];
+        ev.ints = vec![ability, 0, 0, 0];
+        ev.strings = cmd.strings.clone();
+        if let Some(l) = cmd.location {
+            ev.locations = vec![l];
+        }
+        let t = self.world.time_ms;
+        self.world.trace.push(crate::trace::TraceEntry::Log {
+            t,
+            channel: -4,
+            text: format!("{name} {id} -> {target}: ability {ability}"),
+        });
+        self.run_script(ABILITY_SCRIPT, id, Some(ev));
+    }
+
+    /// The ability's casting time is up: `ABILITY_CAST_IMPACT` to its owner.
+    pub(crate) fn finish_ability(&mut self, id: ObjectId, cmd: &crate::world::Command) {
+        if !self.alive(id) {
+            return;
+        }
+        let target = cmd.target.unwrap_or(OBJECT_INVALID);
+        let ability = cmd.ints.first().copied().unwrap_or(0);
+        self.ability_event("ABILITY_CAST_IMPACT", id, target, ability, cmd);
     }
 
     /// The front command started: an attack asks its owner's script for the result.

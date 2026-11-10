@@ -277,6 +277,9 @@ pub struct World {
     /// The creature in character generation, between `StartCharGen` and `CHARGEN_END`.
     #[serde(default)]
     pub chargen: Option<ObjectId>,
+    /// Whether the party was fighting at the last perception update.
+    #[serde(default)]
+    pub party_fighting: bool,
     /// Group pairs set hostile with `SetGroupHostility`.
     #[serde(default, with = "pairs")]
     pub hostility: BTreeMap<(i32, i32), bool>,
@@ -365,6 +368,7 @@ impl World {
             transition: None,
             in_triggers: BTreeMap::new(),
             hostility: BTreeMap::new(),
+            party_fighting: false,
             rng: Rng::new(seed),
             trace: Trace::default(),
             tables,

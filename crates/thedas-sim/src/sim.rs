@@ -72,6 +72,8 @@ pub struct Sim {
     /// Instructions a single script run may take.
     pub script_budget: u64,
     pub chargen_policy: ChargenPolicy,
+    /// Objects whose scripts' engine calls are all traced (log channel -6), for debugging.
+    pub watch_calls: std::collections::BTreeSet<ObjectId>,
     /// The install root, for files outside the resource stack (layouts' `.arl`).
     pub install_root: Option<std::path::PathBuf>,
     /// Each loaded area's layout name, and the pathing grids loaded per layout.
@@ -139,6 +141,7 @@ impl Sim {
             depth: 0,
             script_budget: 5_000_000,
             chargen_policy: ChargenPolicy::default(),
+            watch_calls: Default::default(),
             current_effect: None,
             current_effect_target: None,
             install_root: None,
@@ -702,8 +705,17 @@ impl Sim {
                 None => {
                     // An attack asks its owner's script for the result first, which may
                     // also set how long it takes.
-                    let attack_ms = if cmd.name == "CommandAttack" {
-                        self.start_attack(id, cmd.target.unwrap_or(OBJECT_INVALID), cmd.ty);
+                    let attack_ms = if cmd.name == "CommandAttack"
+                        || cmd.name == "CommandUseAbility"
+                    {
+                        if cmd.name == "CommandAttack" {
+                            self.start_attack(id, cmd.target.unwrap_or(OBJECT_INVALID), cmd.ty);
+                        } else {
+                            if let Some(o) = self.world.get_mut(id) {
+                                o.combat.attack_ms = None;
+                            }
+                            self.start_ability(id, &cmd);
+                        }
                         let still = self.world.get(id).and_then(|o| o.commands.first()).cloned();
                         if still.as_ref().map(|c| (&c.name, c.target))
                             != Some((&cmd.name, cmd.target))
@@ -779,6 +791,8 @@ impl Sim {
         self.update_triggers(id);
         if cmd.name == "CommandAttack" {
             self.finish_attack(id, cmd.target.unwrap_or(OBJECT_INVALID));
+        } else if cmd.name == "CommandUseAbility" {
+            self.finish_ability(id, &cmd);
         }
         self.update_perception();
         self.world.trace.push(TraceEntry::Command {
@@ -1358,7 +1372,24 @@ impl Host for ScriptHost<'_> {
         f: &Function,
         args: Vec<Value>,
     ) -> VmResult<Option<Value>> {
-        match crate::engine::call(self, caller, f, &args) {
+        let watched = self.sim.watch_calls.contains(&caller);
+        let result = crate::engine::call(self, caller, f, &args);
+        if watched {
+            let t = self.sim.world.time_ms;
+            let shown = match &result {
+                Some(Ok(v)) => format!("{v:?}"),
+                Some(Err(e)) => format!("error {e}"),
+                None => "unimplemented".into(),
+            };
+            let mut text = format!("{} {}{:?} -> {shown}", self.script, f.name, args);
+            text.truncate(400);
+            self.sim.world.trace.push(TraceEntry::Log {
+                t,
+                channel: -6,
+                text,
+            });
+        }
+        match result {
             Some(r) => {
                 *self
                     .sim

@@ -25,3 +25,4 @@ thedas-vfs.workspace = true
 thedas-render.workspace = true
 png.workspace = true
 base64 = "0.23"
+glam.workspace = true
