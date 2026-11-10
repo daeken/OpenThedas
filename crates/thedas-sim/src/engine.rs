@@ -166,6 +166,8 @@ const PRESENTATION: &[&str] = &[
     "SendToRunDatabase",
     "SetCreaturesGlobalMaxTimeBeforeDecay",
     "SetCreatureGoreLevel",
+    // Only the indicator on the quickbar; the modal effect itself is the scripts'.
+    "Engine_SetModalAbilityGUI",
 ];
 
 /// Engine functions answered with a fixed placeholder because the simulation lacks what
@@ -1238,6 +1240,22 @@ pub fn call(
                 "GetEffectFloat" => Value::Float(e.floats.get(i).copied().unwrap_or(0.0)),
                 "GetEffectCreator" => Value::Object(e.creator.unwrap_or(OBJECT_INVALID)),
                 _ => Value::Object(e.objects.get(i).copied().unwrap_or(OBJECT_INVALID)),
+            })
+        }
+        // Engine data integers are write-only for scripts: kept, and the effect returned
+        // (scripts assign the result, so answering nothing made the effect invalid).
+        "SetEffectEngineInteger" => {
+            let mut e = match h.sim.world.handle(handle(a, 0)) {
+                Some(EngineData::Effect(e)) => e.clone(),
+                _ => Effect::default(),
+            };
+            let (i, v) = (int(a, 1), int(a, 2));
+            e.engine_ints.retain(|x| x.0 != i);
+            e.engine_ints.push((i, v));
+            let hd = h.sim.world.store(EngineData::Effect(e));
+            ok(Value::Engine {
+                ty: ty.effect,
+                handle: Some(hd),
             })
         }
         "SetEffectInteger"
@@ -2584,12 +2602,15 @@ pub fn call(
         ))),
         // EffectModifyProperty is EFFECT_TYPE_MODIFY_PROPERTY (1012 in effects.gda):
         // integers are the property ids, floats their changes (provisional layout).
-        "EffectModifyProperty" => {
+        // The hostile constructor makes the same effect, marked as a debuff. Provisional:
+        // what else the executable does with the mark is not known.
+        "EffectModifyProperty" | "EffectModifyPropertyHostile" => {
             let e = Effect {
                 ty: 1012,
                 creator: Some(caller),
                 ints: vec![int(a, 0), int(a, 2), int(a, 4)],
                 floats: vec![float(a, 1), float(a, 3), float(a, 5)],
+                hostile: name == "EffectModifyPropertyHostile",
                 ..Default::default()
             };
             let hd = h.sim.world.store(EngineData::Effect(e));
@@ -3219,6 +3240,10 @@ mod tests {
         void SetPlaceableActionResult(object o, int a, int s, int v = FALSE) = 24;\n\
         int GetPlaceableState(object o) = 25;\n\
         int GetEffectsFlags(object o) = 26;\n\
+        #define ENGINE_STRUCTURE_3 effect\n\
+        effect EffectModifyPropertyHostile(int p0, float c0, int p1 = 0, float c1 = 0.0, int p2 = 0, float c2 = 0.0) = 27;\n\
+        effect SetEffectEngineInteger(effect e, int i, int v) = 28;\n\
+        int GetEffectType(effect e) = 29;\n\
         int FOLLOWER_STATE_AVAILABLE = 2;\n\
         int PROPERTY_SIMPLE_EXPERIENCE = 19;\n\
         int PROPERTY_SIMPLE_LEVEL = 15;\n";
@@ -3232,6 +3257,47 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn hostile_modifiers_and_engine_integers_keep_their_effects_valid() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let e = run(
+            &mut s,
+            c,
+            "EffectModifyPropertyHostile",
+            &[Value::Int(10), Value::Float(-5.0)],
+        )
+        .unwrap();
+        let effect = |s: &Sim, v: &Value| match v {
+            Value::Engine {
+                handle: Some(hd), ..
+            } => match s.world.handle(Some(*hd)) {
+                Some(EngineData::Effect(e)) => Some(e.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let made = effect(&s, &e).expect("a valid effect");
+        assert_eq!(
+            (made.ty, made.hostile, made.ints[0], made.floats[0]),
+            (1012, true, 10, -5.0)
+        );
+        // Scripts assign the result: it must be the same effect, with the integer kept.
+        let back = run(
+            &mut s,
+            c,
+            "SetEffectEngineInteger",
+            &[e, Value::Int(2), Value::Int(7)],
+        )
+        .unwrap();
+        let kept = effect(&s, &back).expect("still a valid effect");
+        assert_eq!(
+            (kept.ty, kept.hostile, kept.engine_ints.clone()),
+            (1012, true, vec![(2, 7)])
+        );
     }
 
     #[test]
