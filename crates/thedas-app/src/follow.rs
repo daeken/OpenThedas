@@ -1,6 +1,7 @@
 //! The game camera: it follows the party leader from behind and above, orbiting with the
-//! right mouse button and zooming with the wheel. Provisional: distances and speeds are
-//! chosen to look right, not read from the game.
+//! right mouse button and zooming with the wheel. A wall or anything solid between it and
+//! the leader brings it in to the near side, quickly; once clear it backs out again, slowly.
+//! Provisional: distances and speeds are chosen to look right, not read from the game.
 
 use glam::Vec3;
 use thedas_render::Camera;
@@ -14,6 +15,26 @@ pub const MIN_PITCH: f32 = -1.4;
 pub const MAX_PITCH: f32 = 0.3;
 /// How fast the camera catches up with the leader (per second; higher is snappier).
 pub const CATCH_UP: f32 = 8.0;
+/// How far short of a surface in the way the camera stops (metres): its near plane stays
+/// clear of the surface.
+pub const CLEARANCE: f32 = 0.4;
+/// The closest the camera comes to the look point when something is in the way (metres).
+pub const MIN_CLEAR: f32 = 0.5;
+/// How fast the camera comes in when something is in the way, and goes back out when it
+/// clears (per second).
+pub const PULL_IN: f32 = 25.0;
+pub const LET_OUT: f32 = 3.0;
+
+/// What a segment meets first: the share of the way from its start, as
+/// [`thedas_render::collide::Collider::first_hit`] says.
+pub type FirstHit<'a> = &'a dyn Fn(Vec3, Vec3) -> Option<f32>;
+
+/// The distance shown after `dt` seconds, going from `shown` toward `clear` (quickly when
+/// coming in, slowly going out).
+pub fn settle_distance(shown: f32, clear: f32, dt: f32) -> f32 {
+    let rate = if clear < shown { PULL_IN } else { LET_OUT };
+    shown + (clear - shown) * (1.0 - (-rate * dt.max(0.0)).exp())
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Follow {
@@ -24,6 +45,9 @@ pub struct Follow {
     pub distance: f32,
     /// The look point the camera has caught up to.
     focus: Option<Vec3>,
+    /// How far from the look point it stands now (short of `distance` while something is
+    /// in the way).
+    shown: Option<f32>,
 }
 
 impl Follow {
@@ -34,6 +58,7 @@ impl Follow {
             pitch: -0.45,
             distance: 7.0,
             focus: None,
+            shown: None,
         }
     }
 
@@ -48,9 +73,16 @@ impl Follow {
     }
 
     /// The camera this frame, following a leader standing at `feet`, `dt` seconds after the
-    /// last.
+    /// last, with nothing in the way.
+    #[cfg(test)]
     pub fn camera(&mut self, feet: Vec3, dt: f32, base: &Camera) -> Camera {
+        self.camera_clear(feet, dt, base, &|_, _| None)
+    }
+
+    /// [`Follow::camera`] kept on the leader's side of whatever `hit` finds between them.
+    pub fn camera_clear(&mut self, feet: Vec3, dt: f32, base: &Camera, hit: FirstHit) -> Camera {
         let target = feet + Vec3::Z * LOOK_HEIGHT;
+        let cut = !matches!(self.focus, Some(f) if f.distance(target) < 10.0);
         let focus = match self.focus {
             // A long jump (a transition, a teleport) cuts rather than glides.
             Some(f) if f.distance(target) < 10.0 => {
@@ -63,7 +95,18 @@ impl Follow {
         c.fov_y = base.fov_y;
         c.near = base.near;
         c.far = base.far;
-        c.position = focus - c.forward() * self.distance;
+        let reach = self.distance + CLEARANCE;
+        let clear = match hit(focus, focus - c.forward() * reach) {
+            Some(t) => (t * reach - CLEARANCE).max(MIN_CLEAR),
+            None => self.distance,
+        };
+        // After a cut (a transition), or with no time to glide in, it stands where it can.
+        let shown = match self.shown {
+            Some(s) if !cut && dt > 0.0 => settle_distance(s, clear, dt),
+            _ => clear,
+        };
+        self.shown = Some(shown);
+        c.position = focus - c.forward() * shown;
         c
     }
 }
@@ -93,6 +136,42 @@ mod tests {
         assert!(moved > 0.0 && moved < 1.0, "{moved}");
         let c2 = f.camera(Vec3::new(100.0, 0.0, 0.0), 0.016, &base);
         assert!((c2.position.x + c2.forward().x * f.distance - 100.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn comes_in_before_a_wall_and_backs_out_slowly() {
+        let mut f = Follow::behind(0.0);
+        let base = Camera::new(Vec3::ZERO, 0.0, 0.0);
+        // A wall 3 m behind the look point (the camera wants 7 m): anything past it is hit.
+        let wall = |a: Vec3, b: Vec3| {
+            let (da, db) = (
+                (a - Vec3::new(0.0, 0.0, LOOK_HEIGHT)).length(),
+                (b - a).length(),
+            );
+            (db > 3.0 - da).then(|| (3.0 - da) / db)
+        };
+        let dist = |c: &Camera| (c.position - Vec3::new(0.0, 0.0, LOOK_HEIGHT)).length();
+        let c = f.camera_clear(Vec3::ZERO, 0.0, &base, &wall);
+        assert!((dist(&c) - (3.0 - CLEARANCE)).abs() < 1e-3, "{}", dist(&c));
+        // Clear again, it backs out over time rather than at once.
+        let c1 = f.camera_clear(Vec3::ZERO, 0.1, &base, &|_, _| None);
+        assert!(
+            dist(&c1) > 3.0 - CLEARANCE && dist(&c1) < 4.0,
+            "{}",
+            dist(&c1)
+        );
+        for _ in 0..100 {
+            f.camera_clear(Vec3::ZERO, 0.1, &base, &|_, _| None);
+        }
+        let c2 = f.camera_clear(Vec3::ZERO, 0.1, &base, &|_, _| None);
+        assert!((dist(&c2) - 7.0).abs() < 1e-2);
+        // Into the wall again: quickly in.
+        let c3 = f.camera_clear(Vec3::ZERO, 0.2, &base, &wall);
+        assert!(dist(&c3) < 3.0, "{}", dist(&c3));
+        // Never nearer than the minimum, however close the wall.
+        let c4 = f.camera_clear(Vec3::ZERO, 0.0, &base, &|_, _| Some(0.0));
+        assert!((dist(&c4) - MIN_CLEAR).abs() < 1e-3);
+        assert!((settle_distance(2.0, 6.0, 0.0) - 2.0).abs() < 1e-6);
     }
 
     #[test]

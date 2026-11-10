@@ -26,6 +26,8 @@ pub struct LiveLevel {
     pub layout: String,
     pub vfs: Arc<Vfs>,
     pub renderer: AreaRenderer,
+    /// Its solid surfaces, which the game camera keeps on the party's side of.
+    pub collider: thedas_render::collide::Collider,
 }
 
 /// The area's creatures and placeables, drawn over the level; rebuilt (alone) when an object
@@ -132,6 +134,11 @@ impl Live {
     }
 
     /// Where the party leader stands, when it is in the current area.
+    /// Where a segment first meets the level's solid surfaces (share of the way), if it does.
+    pub fn first_hit(&self, from: glam::Vec3, to: glam::Vec3) -> Option<f32> {
+        self.level.as_ref()?.collider.first_hit(from, to)
+    }
+
     pub fn leader_feet(&self) -> Option<glam::Vec3> {
         let sim = self.sim();
         let w = &sim.world;
@@ -262,10 +269,12 @@ impl Live {
             scene.draws.len(),
             started.elapsed().as_secs_f64()
         );
+        let collider = thedas_render::collide::Collider::from_scene(&scene);
         Ok(LiveLevel {
             layout: layout.to_string(),
             vfs: Arc::new(vfs),
             renderer,
+            collider,
         })
     }
 
