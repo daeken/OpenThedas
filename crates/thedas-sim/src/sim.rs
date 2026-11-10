@@ -363,6 +363,7 @@ impl Sim {
         self.world.time_ms = until;
         self.regenerate(elapsed);
         self.expire_effects();
+        self.world.destroy_due();
     }
 
     /// Ends a cutscene the way the engine does when one finishes playing. Provisional, inferred
@@ -468,6 +469,7 @@ impl Sim {
         let wp = (!waypoint.is_empty()).then_some(waypoint);
         match self.enter_area(area, wp) {
             Ok(new) => {
+                self.travel_arrived();
                 let pos = self
                     .world
                     .hero
@@ -921,6 +923,7 @@ impl Sim {
             }
         }
         self.world.module = Some(module);
+        self.load_world_maps();
         // The hero, with a default identity until character creation is simulated.
         let party = self.world.spawn(ObjectKind::Party, "party");
         let hero = self.world.spawn(ObjectKind::Creature, "player");

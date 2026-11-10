@@ -138,7 +138,6 @@ const PRESENTATION: &[&str] = &[
     "SetObjectInteractive",
     "SetPlaceableHealth",
     "SetMapPinState",
-    "SetWorldMapGuiStatus",
     "ShowPopup",
     "SetCameraTarget",
     "SetPlaceableActionResult",
@@ -527,7 +526,10 @@ pub fn call(
                 handle: Some(hd),
             })
         }
-        "GetPositionFromLocation" | "GetAreaFromLocation" | "GetFacingFromLocation" => {
+        "GetPositionFromLocation"
+        | "GetAreaFromLocation"
+        | "GetFacingFromLocation"
+        | "GetOrientationFromLocation" => {
             let l = match h.sim.world.handle(handle(a, 0)) {
                 Some(EngineData::Location(l)) => *l,
                 _ => Location {
@@ -539,6 +541,8 @@ pub fn call(
             ok(match name {
                 "GetPositionFromLocation" => Value::Vector(l.position),
                 "GetAreaFromLocation" => Value::Object(l.area),
+                // Provisional: the facing as a rotation about z, in degrees.
+                "GetOrientationFromLocation" => Value::Vector([0.0, 0.0, l.facing]),
                 _ => Value::Float(l.facing),
             })
         }
@@ -1716,11 +1720,7 @@ pub fn call(
             ok(objects(items))
         }
         // Presentation and platform services with no simulation state.
-        "DoAutoSave"
-        | "TakeScreenshot"
-        | "RevealCurrentMap"
-        | "SetWorldMapPrimary"
-        | "SetCreatureGoreLevel" => {
+        "DoAutoSave" | "TakeScreenshot" | "RevealCurrentMap" | "SetCreatureGoreLevel" => {
             h.sim.world.trace.push(TraceEntry::Log {
                 t,
                 channel: -3,
@@ -1869,6 +1869,108 @@ pub fn call(
         // The action a click would take. Provisional: the game derives it from the
         // placeable's state controller; here an area-transition destination makes it a
         // transition, a conversation a dialog, and anything else a plain use.
+        // --- World map (see `worldmap`) -----------------------------------------------------
+        "SetWorldMapLocationStatus" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields.insert("WMStatus".into(), int(a, 1));
+            }
+            void()
+        }
+        "SetWorldMapLocationLocName" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.name_strref = Some(int(a, 1).max(0) as u32);
+            }
+            void()
+        }
+        "SetWorldMapPlayerLocation" => {
+            h.sim.world.world_map.player_pin = Some(obj(a, 1));
+            void()
+        }
+        "SetWorldMapPrimary" => {
+            h.sim.world.world_map.primary = Some(obj(a, 0));
+            void()
+        }
+        "SetWorldMapSecondary" => {
+            h.sim.world.world_map.secondary = Some(obj(a, 0));
+            void()
+        }
+        "SetWorldMapGuiStatus" => {
+            h.sim.world.world_map.gui_status = int(a, 0);
+            void()
+        }
+        "OpenPrimaryWorldMap" => {
+            h.sim.world.world_map.open = true;
+            void()
+        }
+        "ClosePrimaryWorldMap" => {
+            h.sim.world.world_map.open = false;
+            void()
+        }
+        // An encounter on the way stops the journey in the encounter's area; otherwise the
+        // party arrives (EVENT_TYPE_WORLDMAP_PRETRANSITION). Provisional: travel is instant.
+        "WorldMapStartTravelling" => {
+            let area = string(a, 0);
+            h.sim.world.world_map.open = false;
+            if area.is_empty() {
+                h.sim.finish_travel();
+            } else {
+                h.sim.world.transition = Some((area, string(a, 1)));
+            }
+            void()
+        }
+        "WorldMapCompleteRandomEncounter" => {
+            h.sim.finish_travel();
+            void()
+        }
+        // Projectiles fly at a fixed speed (provisional) and, if given an impact event, deliver
+        // it to their event target (the firer by default) when they arrive.
+        "FireProjectile" | "FireHomingProjectile" => {
+            let from = vector(a, 1);
+            let (to, event_target) = if name == "FireProjectile" {
+                (vector(a, 2), obj(a, 5))
+            } else {
+                let tgt = h.object(obj(a, 2)).map_or(from, |o| o.position);
+                (tgt, obj(a, 4))
+            };
+            const SPEED: f32 = 20.0;
+            let ms = (dist(from, to) / SPEED * 1000.0).clamp(0.0, 60_000.0) as i32;
+            let area = h.object(caller).and_then(|o| o.area);
+            let id = h.sim.world.spawn(ObjectKind::Projectile, "");
+            if let Some(o) = h.sim.world.get_mut(id) {
+                o.area = area;
+                o.position = from;
+                o.fields.insert("FlightMs".into(), ms);
+                o.fields.insert("ProjectileType".into(), int(a, 0));
+                o.locals.objects.insert(
+                    "EVENT_TARGET".into(),
+                    if event_target == OBJECT_INVALID {
+                        caller
+                    } else {
+                        event_target
+                    },
+                );
+            }
+            let delay = ms as u64;
+            h.sim.world.queue_destroy(delay, id);
+            ok(Value::Object(id))
+        }
+        "SetProjectileImpactEvent" => {
+            let proj = obj(a, 0);
+            if let (Some(p), Some(EngineData::Event(ev))) = (
+                h.object(proj).cloned(),
+                h.sim.world.handle(handle(a, 1)).cloned(),
+            ) {
+                let target = p
+                    .locals
+                    .objects
+                    .get("EVENT_TARGET")
+                    .copied()
+                    .unwrap_or(caller);
+                let ms = p.fields.get("FlightMs").copied().unwrap_or(0).max(0) as u64;
+                h.sim.world.queue_event(ms, target, ev, None);
+            }
+            void()
+        }
         "StoreFollowerInventory" => {
             h.sim.store_inventory(obj(a, 0), obj(a, 1), true);
             void()
@@ -2770,6 +2872,15 @@ mod tests {
         let tag = Value::String("morrigan".into());
         let by_tag = run(&mut s, hut, "GetObjectByTag", &[tag.clone(), Value::Int(0)]);
         assert_eq!(by_tag, Some(Value::Object(here)));
+        let none = Value::String(String::new());
+        let untagged = s.world.spawn(ObjectKind::Placeable, "");
+        s.world.get_mut(untagged).unwrap().area = Some(hut);
+        let by_tag = run(&mut s, hut, "GetObjectByTag", &[none, Value::Int(0)]);
+        assert_eq!(
+            by_tag,
+            Some(Value::Object(OBJECT_INVALID)),
+            "an empty tag names nothing"
+        );
         let near = run(
             &mut s,
             hut,
