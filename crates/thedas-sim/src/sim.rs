@@ -1454,6 +1454,11 @@ impl Sim {
             self.finish_attack(id, cmd.target.unwrap_or(OBJECT_INVALID));
         } else if cmd.name == "CommandUseAbility" {
             self.finish_ability(id, &cmd);
+        } else if cmd.name == "CommandStartConversation" {
+            // A conversation ordered by the player (see `Sim::order_talk`).
+            if let Some(t) = cmd.target.filter(|&t| self.world.get(t).is_some()) {
+                self.start_conversation(id, t, "");
+            }
         } else if cmd.name == "CommandUseObject" {
             // Using a placeable (a door, a lever) sends it EVENT_TYPE_USE, as clicking it does.
             if let Some(t) = cmd.target.filter(|&t| self.world.get(t).is_some()) {
