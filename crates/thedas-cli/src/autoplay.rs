@@ -426,6 +426,11 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
                 .unwrap_or_default();
             // A few metres at a time, so the clock (and the samples) keep pace.
             if !sim.walk(hero, leg(sim, hero, p), a) {
+                // A closed door in the way: the player opens it (uses it), as by clicking.
+                if let Some(door) = sim.walk_blocked_by {
+                    let ev = sim.new_event("USE", Some(hero));
+                    sim.deliver(door, ev, None);
+                }
                 sim.tick(500);
             }
             continue;

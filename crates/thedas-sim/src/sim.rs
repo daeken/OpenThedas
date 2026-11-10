@@ -87,6 +87,8 @@ pub struct Sim {
     /// Each area's doors and their doorways' grid cells (doors do not move; see
     /// `Sim::closed_doors`).
     pub(crate) door_cells: HashMap<ObjectId, Arc<Vec<crate::nav::Doorway>>>,
+    /// The closed door that stopped the last `walk`, if one did.
+    pub walk_blocked_by: Option<ObjectId>,
     pub(crate) nav_grids: HashMap<String, Option<Arc<thedas_formats::level::NavGrid>>>,
     /// The effect an `APPLY_EFFECT` handler is looking at, and whether it is still valid.
     pub(crate) current_effect: Option<(crate::world::Effect, bool)>,
@@ -215,6 +217,7 @@ impl Sim {
             nav_grids: HashMap::new(),
             fire_lengths: HashMap::new(),
             door_cells: HashMap::new(),
+            walk_blocked_by: None,
             talk: None,
             plots: crate::plot::Plots::default(),
             strings: std::sync::OnceLock::new(),
@@ -825,7 +828,10 @@ impl Sim {
     /// is one (see `nav`), otherwise a straight line in half-metre steps. Stops early when a
     /// conversation starts, the area changes, the walker dies or (for the hero) a fight
     /// breaks out; returns whether it arrived. A destination in another area is a teleport.
+    /// A closed door in the way stops it before it sets out (the door is left in
+    /// `walk_blocked_by`; the player opens doors by using them).
     pub fn walk(&mut self, id: ObjectId, to: [f32; 3], area: Option<ObjectId>) -> bool {
+        self.walk_blocked_by = None;
         let Some((from, here)) = self.world.get(id).map(|o| (o.position, o.area)) else {
             return false;
         };
@@ -834,9 +840,14 @@ impl Sim {
             self.tick(0);
             return true;
         }
-        let routed = here
-            .and_then(|a| self.nav_grid(a))
-            .and_then(|g| crate::nav::route(&g, from, to));
+        let routed = match self.route_to(id, to) {
+            crate::nav::Routed::Path(p) => Some(p),
+            crate::nav::Routed::Straight => None,
+            crate::nav::Routed::Door(d) => {
+                self.walk_blocked_by = Some(d);
+                return false;
+            }
+        };
         let points: Vec<[f32; 3]> = match routed {
             Some(p) if !p.is_empty() => p,
             _ => {
