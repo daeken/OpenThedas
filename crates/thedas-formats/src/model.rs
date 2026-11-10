@@ -24,11 +24,34 @@ pub mod field {
     pub const TRANSLATION: u32 = 6047;
     pub const ROTATION: u32 = 6048;
     pub const CHILDREN: u32 = 6999;
+    pub const LIGHT_COLOR: u32 = 6007;
+    pub const LIGHT_RADIUS: u32 = 6008;
+    pub const AMBIENT_COLOR: u32 = 6010;
+    pub const LIGHT_KIND: u32 = 6296;
 }
 
 pub const KIND_TRANSLATION: FourCC = FourCC::new(b"trsl");
 pub const KIND_ROTATION: FourCC = FourCC::new(b"rota");
 pub const KIND_MESH: FourCC = FourCC::new(b"mshh");
+pub const KIND_POINT_LIGHT: FourCC = FourCC::new(b"nplt");
+pub const KIND_AMBIENT_LIGHT: FourCC = FourCC::new(b"nalt");
+
+/// A light node, as found in a level's `<room>_ll` model.
+///
+/// Provisional: `6007` is the colour and `6008` the radius of point lights (`nplt`), `6010`
+/// the colour of ambient lights (`nalt`); `6296` is kept raw (2 on every light in the
+/// candidate levels; plausibly whether the light is baked, dynamic or both).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Light {
+    Point {
+        color: [f32; 4],
+        radius: f32,
+        kind: Option<i64>,
+    },
+    Ambient {
+        color: [f32; 4],
+    },
+}
 
 /// What a mesh node draws.
 #[derive(Clone, Debug, PartialEq)]
@@ -48,6 +71,7 @@ pub struct Node {
     /// Local transform relative to the parent.
     pub transform: Transform,
     pub mesh: Option<MeshRef>,
+    pub light: Option<Light>,
     pub children: Vec<Node>,
 }
 
@@ -68,7 +92,39 @@ pub struct Mmh {
     pub nodes: Vec<Node>,
 }
 
+/// A light node with the chain of local transforms from the model root down to it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LightPiece<'a> {
+    pub light: &'a Light,
+    pub name: Option<&'a str>,
+    pub chain: Vec<Transform>,
+}
+
 impl Mmh {
+    /// Every light node, depth first in file order.
+    pub fn lights(&self) -> Vec<LightPiece<'_>> {
+        fn walk<'a>(n: &'a Node, chain: &mut Vec<Transform>, out: &mut Vec<LightPiece<'a>>) {
+            chain.push(n.transform);
+            if let Some(l) = &n.light {
+                out.push(LightPiece {
+                    light: l,
+                    name: n.name.as_deref(),
+                    chain: chain.clone(),
+                });
+            }
+            for c in &n.children {
+                walk(c, chain, out);
+            }
+            chain.pop();
+        }
+        let mut out = Vec::new();
+        let mut chain = Vec::new();
+        for n in &self.nodes {
+            walk(n, &mut chain, &mut out);
+        }
+        out
+    }
+
     pub fn parse(data: &[u8]) -> TypedResult<Self> {
         Self::from_gff4(&Gff4::parse(data)?)
     }
@@ -160,11 +216,27 @@ fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>
     } else {
         None
     };
+    let light = if kind == KIND_POINT_LIGHT {
+        Some(Light::Point {
+            color: d.opt_vec4(id, field::LIGHT_COLOR, 1.0)?.unwrap_or([1.0; 4]),
+            radius: d.opt_f32(id, field::LIGHT_RADIUS)?.unwrap_or(0.0),
+            kind: d.opt_i64(id, field::LIGHT_KIND)?,
+        })
+    } else if kind == KIND_AMBIENT_LIGHT {
+        Some(Light::Ambient {
+            color: d
+                .opt_vec4(id, field::AMBIENT_COLOR, 1.0)?
+                .unwrap_or([0.0; 4]),
+        })
+    } else {
+        None
+    };
     Ok(Some(Node {
         kind,
         name: d.opt_str(id, field::NAME)?,
         transform,
         mesh,
+        light,
         children,
     }))
 }
@@ -231,6 +303,45 @@ mod tests {
         assert_eq!(pieces[0].mesh.lightmap_id.as_deref(), Some("_7u"));
         assert_eq!(pieces[0].chain.len(), 2);
         assert_eq!(pieces[0].chain[1].position, [0.0, 0.0, 5.0]);
+        assert!(mmh.lights().is_empty());
+    }
+
+    #[test]
+    fn reads_lights() {
+        let mut b = Builder::new(b"MMH ");
+        let t = b.add(
+            b"trsl",
+            vec![(field::TRANSLATION, Value::Vec4([1.0, 2.0, 3.0, 1.0]))],
+        );
+        let p = b.add(
+            b"nplt",
+            vec![
+                (field::NAME, s("Candle")),
+                (field::LIGHT_COLOR, Value::Color([0.5, 0.25, 0.0, 1.0])),
+                (field::LIGHT_RADIUS, Value::F32(12.0)),
+                (field::LIGHT_KIND, Value::I32(2)),
+                (field::CHILDREN, generic(&[t])),
+            ],
+        );
+        let a = b.add(
+            b"nalt",
+            vec![(field::AMBIENT_COLOR, Value::Color([0.1, 0.2, 0.3, 1.0]))],
+        );
+        let gob = b.add(b"node", vec![(field::CHILDREN, generic(&[p, a]))]);
+        let root = b.add(b"mdlh", vec![(field::CHILDREN, generic(&[gob]))]);
+        let mmh = Mmh::from_gff4(&b.finish(root)).unwrap();
+        let lights = mmh.lights();
+        assert_eq!(lights.len(), 2);
+        assert_eq!(
+            lights[0].light,
+            &Light::Point {
+                color: [0.5, 0.25, 0.0, 1.0],
+                radius: 12.0,
+                kind: Some(2)
+            }
+        );
+        assert_eq!(lights[0].chain[1].position, [1.0, 2.0, 3.0]);
+        assert!(matches!(lights[1].light, Light::Ambient { .. }));
     }
 
     #[test]
