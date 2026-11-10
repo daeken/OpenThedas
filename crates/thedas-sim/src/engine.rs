@@ -171,14 +171,13 @@ const PRESENTATION: &[&str] = &[
 ];
 
 /// Engine functions answered with a fixed placeholder because the simulation lacks what
-/// they need (stealth, ambient dialog, effect flags, pools, tactics item tags, ...). Calls to
+/// they need (ambient dialog, pools, combat auto-pause, ...). Calls to
 /// them are counted (`Trace::stubbed`) so coverage work can follow what the game uses.
 pub const STUBS: &[&str] = &[
     "GetPlotSummary",
     "DialogIsAmbient",
     "ClearAmbientDialogs",
     "CreatePool",
-    "GetStealthEnabled",
     "GetAutoPauseCombatStatus",
     "RevealCurrentMap",
     "LogStoryEvent",
@@ -2916,7 +2915,15 @@ pub fn call(
                 .and_then(|o| o.name_strref)
                 .map_or(0, |s| s as i32),
         )),
-        "GetStealthEnabled" => ok(Value::Int(0)),
+        "GetStealthEnabled" => ok(Value::Int(
+            h.object(obj(a, 0)).is_some_and(|o| o.combat.stealth) as i32,
+        )),
+        "SetStealthEnabled" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.combat.stealth = int(a, 1) != 0;
+            }
+            void()
+        }
         "GetCanDiePermanently" => ok(b(h.object(obj(a, 0)).is_some_and(|o| !o.immortal))),
         "GetCreatureTreasureCategory" => ok(Value::Int(
             h.object(obj(a, 0))

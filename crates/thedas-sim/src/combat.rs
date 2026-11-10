@@ -7,7 +7,10 @@
 //! - **Perception.** Creatures in the hero's area perceive each other within
 //!   [`PERCEPTION_RANGE`] and get `EVENT_TYPE_PERCEPTION_APPEAR` (object 0 is the creature
 //!   seen; integers are hostility changed, stealthed, hostile) and `PERCEPTION_DISAPPEAR`
-//!   when it leaves the range.
+//!   when it leaves the range. A creature in stealth (`SetStealthEnabled`, which the stealth
+//!   effect's handlers call) is not perceived by those hostile to it: they get one
+//!   appearance with the stealthed flag, on which rules_core runs its own detection check.
+//!   The scripts also end stealth themselves (after an attack, when targeted, on detection).
 //! - **Game mode.** The party seeing living hostiles switches `GM_EXPLORE` to `GM_COMBAT`
 //!   and back, with `GAMEMODE_CHANGE` to the module; the scripts end combat (and get fallen
 //!   party members up) on the change back.
@@ -86,6 +89,14 @@ pub struct CombatData {
     /// The last command that finished or failed (`GetPreviousCommand`).
     #[serde(default)]
     pub previous_command: Option<crate::world::Command>,
+    /// `SetStealthEnabled`: the creature is in stealth (the stealth effect's handler sets
+    /// and clears it).
+    #[serde(default)]
+    pub stealth: bool,
+    /// Stealthed hostiles in range this creature has been told about (`PERCEPTION_APPEAR`
+    /// with the stealthed flag), without perceiving them.
+    #[serde(default)]
+    pub noticed_stealthed: Vec<ObjectId>,
 }
 
 /// One tactics slot: when `condition` holds for a target of `target` type, do `command`.
@@ -176,7 +187,7 @@ impl Sim {
                 .get(id)
                 .map(|o| o.combat.perceived.clone())
                 .unwrap_or_default();
-            let now: Vec<ObjectId> = if alive {
+            let in_view: Vec<ObjectId> = if alive {
                 creatures
                     .iter()
                     .filter(|&&(o, p)| {
@@ -184,7 +195,7 @@ impl Sim {
                             return false;
                         }
                         let d = dist(pos, p);
-                        let range = if seen.contains(&o) {
+                        let range = if seen.contains(&o) && !self.hidden_from(id, o) {
                             VISUAL_RANGE
                         } else {
                             ring
@@ -196,6 +207,24 @@ impl Sim {
             } else {
                 Vec::new()
             };
+            // A stealthed hostile is not perceived: the creature is told it is there once
+            // (PERCEPTION_APPEAR with the stealthed flag), and rules_core runs its own
+            // detection check on it ("Perception check for ... detecting ...") without the AI
+            // taking it on. Provisional: allies and neutrals see stealthed creatures, and the
+            // notice is not repeated while the creature stays in range.
+            let (stealthed, now): (Vec<ObjectId>, Vec<ObjectId>) =
+                in_view.into_iter().partition(|&o| self.hidden_from(id, o));
+            let noticed = self
+                .world
+                .get(id)
+                .map(|o| o.combat.noticed_stealthed.clone())
+                .unwrap_or_default();
+            for &o in stealthed.iter().filter(|o| !noticed.contains(o)) {
+                self.perceive_with(id, o, true, true, true);
+            }
+            if let Some(obj) = self.world.get_mut(id) {
+                obj.combat.noticed_stealthed = stealthed;
+            }
             let (before, before_hostile) = self
                 .world
                 .get(id)
@@ -377,6 +406,18 @@ impl Sim {
 
     /// As [`Sim::perceive`], with the hostility flag (integer 2) given.
     pub fn perceive_flagged(&mut self, who: ObjectId, seen: ObjectId, appear: bool, hostile: bool) {
+        self.perceive_with(who, seen, appear, hostile, false);
+    }
+
+    /// As [`Sim::perceive_flagged`], with the stealthed flag (integer 1) given.
+    pub fn perceive_with(
+        &mut self,
+        who: ObjectId,
+        seen: ObjectId,
+        appear: bool,
+        hostile: bool,
+        stealthed: bool,
+    ) {
         let name = if appear {
             "PERCEPTION_APPEAR"
         } else {
@@ -384,8 +425,13 @@ impl Sim {
         };
         let mut ev = self.new_event(name, Some(seen));
         ev.objects = vec![seen];
-        ev.ints = vec![0, 0, hostile as i32];
+        ev.ints = vec![0, stealthed as i32, hostile as i32];
         self.world.queue_event(0, who, ev, None);
+    }
+
+    /// Whether `seen` is in stealth and hidden from `who` (a creature it is hostile to).
+    pub fn hidden_from(&self, who: ObjectId, seen: ObjectId) -> bool {
+        self.world.get(seen).is_some_and(|o| o.combat.stealth) && self.hostile(who, seen)
     }
 
     /// Runs a target's `APPLY_EFFECT` handler for an effect, keeps it if it lasts, and
@@ -1262,6 +1308,59 @@ mod tests {
         s.world.get_mut(near_sighted).unwrap().position = [70.0, 0.0, 0.0];
         s.update_perception();
         assert!(s.world.get(hero).unwrap().combat.perceived.is_empty());
+    }
+
+    #[test]
+    fn a_stealthed_hostile_is_noticed_once_but_not_perceived() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let foe = s.world.spawn(ObjectKind::Creature, "foe");
+        let dog = s.world.spawn(ObjectKind::Creature, "dog");
+        s.world.hero = Some(hero);
+        for (id, x, g) in [(hero, 0.0, 0), (foe, 5.0, 2), (dog, 2.0, 0)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = [x, 0.0, 0.0];
+            o.group = g;
+        }
+        s.world.hostility.insert((0, 2), true);
+        s.world.get_mut(hero).unwrap().combat.stealth = true;
+        let events = |s: &mut Sim| {
+            let e: Vec<_> = s
+                .world
+                .queue
+                .values()
+                .map(|q| (q.target, q.event.objects[0], q.event.ints.clone()))
+                .collect();
+            s.world.queue.clear();
+            e
+        };
+        s.update_perception();
+        // The foe is told the stealthed hero is there, but does not see it; the dog does.
+        assert_eq!(s.world.get(foe).unwrap().combat.perceived, vec![dog]);
+        assert!(s.world.get(dog).unwrap().combat.perceived.contains(&hero));
+        let e = events(&mut s);
+        assert!(e.contains(&(foe, hero, vec![0, 1, 1])));
+        assert!(e.contains(&(dog, hero, vec![0, 0, 0])));
+        s.update_perception();
+        assert!(events(&mut s).is_empty(), "noticed once");
+        // Out of stealth, the foe sees the hero.
+        s.world.get_mut(hero).unwrap().combat.stealth = false;
+        s.update_perception();
+        assert_eq!(s.world.get(foe).unwrap().combat.perceived, vec![hero, dog]);
+        assert!(events(&mut s).contains(&(foe, hero, vec![0, 0, 1])));
+        // Back into stealth: the foe loses sight of it and is told it is stealthed.
+        s.world.get_mut(hero).unwrap().combat.stealth = true;
+        s.update_perception();
+        assert_eq!(s.world.get(foe).unwrap().combat.perceived, vec![dog]);
+        let e = events(&mut s);
+        assert!(
+            e.contains(&(foe, hero, vec![0, 1, 1])),
+            "noticed in stealth"
+        );
+        let disappear = e.iter().filter(|(t, o, _)| (*t, *o) == (foe, hero)).count();
+        assert_eq!(disappear, 2, "and lost from sight");
     }
 
     #[test]
