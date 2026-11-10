@@ -1265,6 +1265,90 @@ pub fn call(
                 handle: hd,
             })
         }
+        "GetHealth" => {
+            let health = constant(&h.sim.table, "PROPERTY_DEPLETABLE_HEALTH");
+            ok(Value::Int(
+                h.object(obj(a, 0))
+                    .and_then(|o| o.properties.get(&health))
+                    .map_or(0, |p| p.1.round() as i32),
+            ))
+        }
+        "MoveItem" => {
+            let (from, to, item) = (obj(a, 0), obj(a, 1), obj(a, 2));
+            let had = h.object(from).is_some_and(|o| o.inventory.contains(&item));
+            if had && h.object(to).is_some() {
+                if let Some(o) = h.sim.world.get_mut(from) {
+                    o.inventory.retain(|&i| i != item);
+                    o.equipment.retain(|_, i| *i != item);
+                }
+                if let Some(o) = h.sim.world.get_mut(to) {
+                    o.inventory.push(item);
+                }
+            }
+            void()
+        }
+        // Area effects and map notifications are not simulated yet.
+        "Engine_ApplyEffectAtLocation" | "ShowAreaUnlockedNotification" => {
+            h.sim.world.trace.push(TraceEntry::Log {
+                t,
+                channel: -3,
+                text: format!("{name}{:?} (no effect in the simulation)", a),
+            });
+            void()
+        }
+        "GetCommandByIndex" => {
+            let c = h
+                .object(obj(a, 0))
+                .and_then(|o| o.commands.get(int(a, 1).max(0) as usize).cloned());
+            let hd = c.map(|c| h.sim.world.store(EngineData::Command(c)));
+            ok(Value::Engine {
+                ty: ty.command,
+                handle: hd,
+            })
+        }
+        // Where a follower would stand behind the party leader (see `Sim::follow_leader`).
+        "GetFollowerWouldBeLocation" => {
+            let who = obj(a, 0);
+            let hero = h.sim.world.hero.and_then(|x| h.object(x));
+            let l = match (hero, h.object(who)) {
+                (Some(leader), Some(me)) => {
+                    let i = leader.followers.iter().position(|&f| f == who).unwrap_or(0);
+                    let (s, c) = leader.facing.to_radians().sin_cos();
+                    let back = 1.0 + i as f32;
+                    Location {
+                        area: leader.area.or(me.area).unwrap_or(OBJECT_INVALID),
+                        position: [
+                            leader.position[0] - c * back,
+                            leader.position[1] - s * back,
+                            leader.position[2],
+                        ],
+                        facing: leader.facing,
+                    }
+                }
+                _ => Location {
+                    area: OBJECT_INVALID,
+                    position: [0.0; 3],
+                    facing: 0.0,
+                },
+            };
+            let hd = h.sim.world.store(EngineData::Location(l));
+            ok(Value::Engine {
+                ty: ty.location,
+                handle: Some(hd),
+            })
+        }
+        // Non-party followers (an escort that tags along) follow like party members.
+        "AddNonPartyFollower" | "RemoveNonPartyFollower" => {
+            let who = obj(a, 0);
+            let exists = h.object(who).is_some();
+            if let Some(ho) = h.sim.world.hero.and_then(|x| h.sim.world.get_mut(x)) {
+                ho.escorts.retain(|&f| f != who);
+                if name == "AddNonPartyFollower" && exists {
+                    ho.escorts.push(who);
+                }
+            }
+            ok(Value::Int(exists as i32))
+        }
         "GetCommandQueueSize" => ok(Value::Int(
             h.object(obj(a, 0)).map_or(0, |o| o.commands.len() as i32),
         )),

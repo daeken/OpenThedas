@@ -72,6 +72,11 @@ pub struct Sim {
     /// Instructions a single script run may take.
     pub script_budget: u64,
     pub chargen_policy: ChargenPolicy,
+    /// The install root, for files outside the resource stack (layouts' `.arl`).
+    pub install_root: Option<std::path::PathBuf>,
+    /// Each loaded area's layout name, and the pathing grids loaded per layout.
+    pub(crate) area_layouts: HashMap<ObjectId, String>,
+    pub(crate) nav_grids: HashMap<String, Option<Arc<thedas_formats::level::NavGrid>>>,
     /// The effect an `APPLY_EFFECT` handler is looking at, and whether it is still valid.
     pub(crate) current_effect: Option<(crate::world::Effect, bool)>,
     pub(crate) talk: Option<crate::dialog::Conversation>,
@@ -133,6 +138,9 @@ impl Sim {
             script_budget: 5_000_000,
             chargen_policy: ChargenPolicy::default(),
             current_effect: None,
+            install_root: None,
+            area_layouts: HashMap::new(),
+            nav_grids: HashMap::new(),
             talk: None,
             plots: crate::plot::Plots::default(),
             strings: std::sync::OnceLock::new(),
@@ -527,11 +535,11 @@ impl Sim {
         self.update_triggers(id);
     }
 
-    /// Walks an object in a straight line to `to` at 5 m/s, half a metre per step, running
-    /// the world as it goes, so triggers on the way fire and the world reacts. Stops early
-    /// when a conversation starts, the area changes or the walker dies; returns whether it
-    /// arrived. Provisional: there is no pathfinding, so walls are walked through. A
-    /// destination in another area is a teleport.
+    /// Walks an object to `to` at 5 m/s, running the world as it goes, so triggers on the
+    /// way fire and the world reacts. The route follows the area's pathing grid when there
+    /// is one (see `nav`), otherwise a straight line in half-metre steps. Stops early when a
+    /// conversation starts, the area changes or the walker dies; returns whether it
+    /// arrived. A destination in another area is a teleport.
     pub fn walk(&mut self, id: ObjectId, to: [f32; 3], area: Option<ObjectId>) -> bool {
         let Some((from, here)) = self.world.get(id).map(|o| (o.position, o.area)) else {
             return false;
@@ -541,31 +549,47 @@ impl Sim {
             self.tick(0);
             return true;
         }
-        let d = crate::engine::dist(from, to);
-        if d > 0.01 {
-            if let Some(o) = self.world.get_mut(id) {
-                o.facing = (to[1] - from[1]).atan2(to[0] - from[0]).to_degrees();
+        let routed = here
+            .and_then(|a| self.nav_grid(a))
+            .and_then(|g| crate::nav::route(&g, from, to));
+        let points: Vec<[f32; 3]> = match routed {
+            Some(p) if !p.is_empty() => p,
+            _ => {
+                let d = crate::engine::dist(from, to);
+                let steps = (d / 0.5).ceil().max(1.0) as usize;
+                (1..=steps)
+                    .map(|i| {
+                        let f = i as f32 / steps as f32;
+                        [
+                            from[0] + (to[0] - from[0]) * f,
+                            from[1] + (to[1] - from[1]) * f,
+                            from[2] + (to[2] - from[2]) * f,
+                        ]
+                    })
+                    .collect()
             }
-        }
-        let steps = (d / 0.5).ceil().max(1.0) as usize;
+        };
         let talking = self.talk.as_ref().is_some_and(|c| !c.ended);
-        for i in 1..=steps {
-            let f = i as f32 / steps as f32;
-            let p = [
-                from[0] + (to[0] - from[0]) * f,
-                from[1] + (to[1] - from[1]) * f,
-                from[2] + (to[2] - from[2]) * f,
-            ];
+        let mut prev = from;
+        let n = points.len();
+        for (i, p) in points.into_iter().enumerate() {
+            let d = crate::engine::dist(prev, p);
+            if d > 0.01 {
+                if let Some(o) = self.world.get_mut(id) {
+                    o.facing = (p[1] - prev[1]).atan2(p[0] - prev[0]).to_degrees();
+                }
+            }
             self.move_object(id, p, None);
             if Some(id) == self.world.hero {
                 self.follow_leader(id);
             }
-            self.tick(100);
+            self.tick(((d / 5.0) * 1000.0).round().max(1.0) as u64);
+            prev = p;
             let o = self.world.get(id);
             let stopped = o.is_none_or(|o| o.dead || o.area != here)
                 || (!talking && self.talk.as_ref().is_some_and(|c| !c.ended));
             if stopped {
-                return i == steps;
+                return i + 1 == n;
             }
         }
         true
@@ -576,11 +600,11 @@ impl Sim {
     /// with a command stands a metre behind, one more metre per follower. Provisional: real
     /// followers path after the leader.
     pub fn follow_leader(&mut self, leader: ObjectId) {
-        let Some((pos, area, facing, followers)) = self
-            .world
-            .get(leader)
-            .map(|o| (o.position, o.area, o.facing, o.followers.clone()))
-        else {
+        let Some((pos, area, facing, followers)) = self.world.get(leader).map(|o| {
+            let mut all = o.followers.clone();
+            all.extend(o.escorts.iter().copied());
+            (o.position, o.area, o.facing, all)
+        }) else {
             return;
         };
         let (s, c) = facing.to_radians().sin_cos();
@@ -772,6 +796,7 @@ impl Sim {
     /// Loads a module's campaign file (`modules/<dir>/*.cif`): module variables, script, start
     /// area and the area tree. Creates the module object, the hero and the party.
     pub fn load_module(&mut self, install_root: &Path, module_dir: &str) -> Result<(), SimError> {
+        self.install_root = Some(install_root.to_path_buf());
         let dir = install_root.join("modules").join(module_dir);
         let cif = std::fs::read_dir(&dir)
             .map_err(|_| SimError::NotFound(dir.display().to_string()))?
@@ -868,6 +893,9 @@ impl Sim {
             a.script = resref_field(root, "ScriptResRefID");
             a.name_strref = strref(root, "Name");
             read_vars(&are, root, &mut a.locals);
+        }
+        if let Some(layout) = text(root, "Layout").or_else(|| resref_field(root, "Layout")) {
+            self.area_layouts.insert(area, layout.to_ascii_lowercase());
         }
         self.created(area);
         self.world.area = Some(area);

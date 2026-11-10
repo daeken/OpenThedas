@@ -86,6 +86,18 @@ enum Command {
         #[arg(long, value_delimiter = ',')]
         replies: Vec<usize>,
     },
+    /// Summarise a layout's pathing grid and optionally write it as a PGM image.
+    Navgrid {
+        install: PathBuf,
+        /// Layout name (`hrt201n`) or area resource (`bhn200ar_castle_after_siege`).
+        layout: String,
+        /// Write the grid's data bytes as a greyscale PGM here.
+        #[arg(long)]
+        pgm: Option<PathBuf>,
+        /// Print the cells around these world positions (`x,y;x,y`).
+        #[arg(long)]
+        at: Option<String>,
+    },
     /// Open every archive in an install and parse every GFF4-family resource.
     Corpus {
         /// Install roots or individual archives.
@@ -206,6 +218,12 @@ fn run() -> Result<()> {
             talk: talk.as_deref(),
             replies: &replies,
         }),
+        Command::Navgrid {
+            install,
+            layout,
+            pgm,
+            at,
+        } => navgrid(&install, &layout, pgm.as_deref(), at.as_deref()),
         Command::Corpus {
             paths,
             report,
@@ -308,6 +326,77 @@ fn resolve(install: &Path, name: &str, level: Option<&str>) -> Result<()> {
                 install.relative(&h.file)
             ),
         }
+    }
+    Ok(())
+}
+
+fn navgrid(
+    install: &std::path::Path,
+    layout: &str,
+    pgm: Option<&std::path::Path>,
+    at: Option<&str>,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let install = thedas_vfs::DaoInstall::open(install)?;
+    let mut vfs = install.global_vfs(thedas_vfs::install::TextureQuality::High)?;
+    let layout = match vfs.read(&format!("{layout}.are")) {
+        Ok((data, _)) => thedas_formats::Area::parse(&data)?
+            .layout
+            .context("area names no layout")?,
+        Err(_) => layout.to_string(),
+    };
+    install.mount_level(&mut vfs, &layout)?;
+    let (data, _) = vfs
+        .read(&format!("{layout}.arl"))
+        .with_context(|| format!("{layout}.arl"))?;
+    let arl = thedas_formats::Arl::parse(&data)?;
+    let g = arl.grid.context("the layout has no pathing grid")?;
+    let mut hist = std::collections::BTreeMap::<u8, usize>::new();
+    for &b in &g.data {
+        *hist.entry(b).or_default() += 1;
+    }
+    let (lo, hi) = g
+        .heights
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(l, h), &x| (l.min(x), h.max(x)));
+    println!(
+        "{layout}: {}x{} cells of {} m from {:?}, clearance {}, heights {lo}..{hi}",
+        g.columns, g.rows, g.cell_size, g.base, g.clearance
+    );
+    println!("data byte histogram: {hist:?}");
+    for p in at.unwrap_or("").split(';').filter(|s| !s.is_empty()) {
+        let v: Vec<f32> = p.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if v.len() < 2 {
+            continue;
+        }
+        match g.cell([v[0], v[1], 0.0]) {
+            Some((cx, cy)) => {
+                for dy in -1i32..=1 {
+                    let row: Vec<String> = (-1i32..=1)
+                        .map(|dx| {
+                            let c = (
+                                (cx as i32 + dx).max(0) as u32,
+                                (cy as i32 - dy).max(0) as u32,
+                            );
+                            format!("{}@{:.2}", g.value(c), g.center(c)[2])
+                        })
+                        .collect();
+                    println!("  ({},{}) {}", v[0], v[1], row.join("  "));
+                }
+            }
+            None => println!("  ({},{}) outside the grid", v[0], v[1]),
+        }
+    }
+    if let Some(path) = pgm {
+        let mut out = format!("P5\n{} {}\n255\n", g.columns, g.rows).into_bytes();
+        // Rows top to bottom with +Y up.
+        for y in (0..g.rows).rev() {
+            for x in 0..g.columns {
+                out.push(g.value((x, y)));
+            }
+        }
+        std::fs::write(path, out)?;
+        println!("wrote {}", path.display());
     }
     Ok(())
 }
