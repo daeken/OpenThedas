@@ -37,6 +37,8 @@ pub struct LiveObjects {
     /// Interactive placeables' bounds (centre offset from the object, radius), from their
     /// draws when the scene was built.
     bounds: std::collections::HashMap<ObjectId, (glam::Vec3, f32)>,
+    /// Interactive placeables' surfaces as drawn, which a click must touch to pick them.
+    shapes: std::collections::HashMap<ObjectId, thedas_render::collide::Collider>,
     /// Creatures' faces (their eyes', else their head's mesh centre), offset from the
     /// creature, from their draws when the scene was built: where portraits look.
     faces: std::collections::HashMap<ObjectId, glam::Vec3>,
@@ -307,7 +309,21 @@ impl Live {
         self.animator = Animator::default();
         let mut bounds = std::collections::HashMap::new();
         let mut faces = std::collections::HashMap::new();
+        let mut shapes = std::collections::HashMap::new();
         for (m, p) in models.iter().zip(&scene.props) {
+            let interactive = {
+                let sim = self.sim();
+                sim.world.get(m.id).is_some_and(|o| {
+                    o.interactive && o.kind == thedas_sim::world::ObjectKind::Placeable
+                })
+            };
+            if interactive {
+                let shape =
+                    thedas_render::collide::Collider::from_draws(&scene, p.draws.clone(), false);
+                if !shape.is_empty() {
+                    shapes.insert(m.id, shape);
+                }
+            }
             // A creature's eyes (`_uem_` meshes) or head (`_uhm_`). Provisional: from the
             // character models' names.
             let part = |tag: &str| {
@@ -340,6 +356,7 @@ impl Live {
         Ok(LiveObjects {
             key,
             bounds,
+            shapes,
             faces,
             scene,
             renderer,
@@ -359,6 +376,8 @@ pub enum Pick {
 
 /// Creatures are picked as upright cylinders this tall (metres). Provisional.
 pub const PICK_HEIGHT: f32 = 1.9;
+/// How far a click reaches into the scene (metres).
+pub const PICK_REACH: f32 = 300.0;
 
 /// Where a ray first meets an upright cylinder (base `p`, radius `r`, height `h`).
 fn ray_cylinder(o: glam::Vec3, d: glam::Vec3, p: glam::Vec3, r: f32, h: f32) -> Option<f32> {
@@ -414,11 +433,23 @@ impl Live {
                     let r = sim.body_radius(o.id).max(0.35);
                     ray_cylinder(origin, dir, p, r, PICK_HEIGHT)
                 }
-                thedas_sim::world::ObjectKind::Placeable if o.interactive => self
-                    .objects
-                    .as_ref()
-                    .and_then(|s| s.bounds.get(&o.id))
-                    .and_then(|&(off, r)| ray_sphere(origin, dir, p + off, r)),
+                // A placeable is picked where the click meets its surfaces (a door's
+                // bounding sphere reaches far past the door, over whoever stands by it);
+                // one with nothing drawn, by its bounds.
+                thedas_sim::world::ObjectKind::Placeable if o.interactive => {
+                    let objects = self.objects.as_ref();
+                    match objects.and_then(|s| s.shapes.get(&o.id)) {
+                        Some(shape) => {
+                            let len = dir.length().max(1e-6);
+                            shape
+                                .first_hit(origin, origin + dir * (PICK_REACH / len))
+                                .map(|f| f * PICK_REACH / len)
+                        }
+                        None => objects
+                            .and_then(|s| s.bounds.get(&o.id))
+                            .and_then(|&(off, r)| ray_sphere(origin, dir, p + off, r)),
+                    }
+                }
                 _ => None,
             };
             if let Some(t) = t {
