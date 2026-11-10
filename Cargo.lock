@@ -2080,6 +2080,7 @@ dependencies = [
  "clap",
  "serde_json",
  "thedas-formats",
+ "thedas-script",
  "thedas-shader",
  "thedas-vfs",
 ]
@@ -2107,6 +2108,13 @@ dependencies = [
  "thedas-vfs",
  "thiserror 2.0.21",
  "wgpu",
+]
+
+[[package]]
+name = "thedas-script"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
 ]
 
 [[package]]
