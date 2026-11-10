@@ -12,6 +12,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 thedas-vfs = { path = "crates/thedas-vfs" }
 thedas-formats = { path = "crates/thedas-formats" }
+thedas-render = { path = "crates/thedas-render" }
 thiserror = "2"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 blowfish = "0.9"
@@ -21,6 +22,14 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 serde_json = "1"
 roxmltree = "0.21"
+wgpu = "30"
+winit = "0.30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+glam = { version = "0.30", features = ["bytemuck"] }
+png = "0.18"
+log = "0.4"
+env_logger = "0.11"
 
 [profile.release]
 debug = 1
