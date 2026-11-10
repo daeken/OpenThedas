@@ -6,6 +6,51 @@ use thedas_script::vm::ObjectId;
 use crate::sim::Sim;
 
 impl Sim {
+    /// With [`World::pool_xp`](crate::world::World::pool_xp) on, the experience the hero
+    /// just gained goes to the followers waiting in the pool (not in the active party) as
+    /// well, up to the level cap's experience; one that reaches its next level may level up
+    /// (`SetCanLevelUp`), as `RewardXP` marks the active party. Provisional and off by
+    /// default: in the original, companions left in camp are said to keep pace with the
+    /// hero, but no script gives them experience (`RewardXPParty` pays `GetPartyList`, the
+    /// active party), so if it happens the executable does it, by a rule not recovered.
+    pub fn share_pool_xp(&mut self, gained: f32) {
+        if !self.world.pool_xp || gained <= 0.0 {
+            return;
+        }
+        let xp = crate::sim::constant(&self.table, "PROPERTY_SIMPLE_EXPERIENCE");
+        let level = crate::sim::constant(&self.table, "PROPERTY_SIMPLE_LEVEL");
+        let tables = self.world.tables();
+        let needed = |l: i64| {
+            tables
+                .get(0, "exptable")
+                .and_then(|t| match t.cell("XP", l)? {
+                    thedas_formats::gda::Cell::Int(v) => Some(*v as f32),
+                    thedas_formats::gda::Cell::Float(v) => Some(*v as f32),
+                    _ => None,
+                })
+        };
+        let cap = tables
+            .get(0, "exptable")
+            .and_then(|t| t.order.iter().max().copied())
+            .and_then(needed)
+            .unwrap_or(f32::MAX);
+        let active = crate::engine::party_of(self);
+        for id in self.party_pool() {
+            if active.contains(&id) {
+                continue;
+            }
+            let Some(o) = self.world.get_mut(id) else {
+                continue;
+            };
+            let e = o.properties.entry(xp).or_insert((0.0, 0.0));
+            e.0 = (e.0 + gained).min(cap);
+            let (have, lvl) = (e.0, o.properties.get(&level).map_or(1.0, |l| l.0.max(l.1)));
+            if needed(lvl as i64 + 1).is_some_and(|n| have >= n) {
+                o.fields.insert("CanLevelUp".into(), 1);
+            }
+        }
+    }
+
     /// Spends a creature's remaining level-up points from its auto-level table, through the
     /// chargen events: the table is the follower's own (`ALAlistair`, ...), its package's
     /// `LevelupTable`, or its class's default (`alwarrior_default`, ...), as player_core picks

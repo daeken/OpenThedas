@@ -127,6 +127,13 @@ enum Command {
         /// Leave the hero's fighting to the party AI (autopilot tactics) too.
         #[arg(long)]
         ai_hero: bool,
+        /// Report how the party and its foes spent the fighting time, and their attacks.
+        #[arg(long)]
+        activity: bool,
+        /// Followers waiting in the party pool get the experience the hero gets (provisional:
+        /// no script does it).
+        #[arg(long)]
+        pool_xp: bool,
         /// Write the last run's end state here.
         #[arg(long)]
         save_to: Option<PathBuf>,
@@ -282,6 +289,8 @@ fn run() -> Result<()> {
             at,
             verbose,
             ai_hero,
+            activity,
+            pool_xp,
             save_to,
         } => autoplay::run(&autoplay::Options {
             install: &install,
@@ -298,6 +307,8 @@ fn run() -> Result<()> {
             at: &at,
             verbose,
             ai_hero,
+            activity,
+            pool_xp,
             save_to: save_to.as_deref(),
         }),
         Command::Navgrid {

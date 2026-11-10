@@ -3,17 +3,18 @@
 //!
 //! The player is simple and deterministic: it takes the first reply in conversations; the
 //! party fights under autopilot (party AI); when the hero is idle and hostiles are in view it
-//! attacks one (the same one until it falls), or with `--ai-hero` lets its own tactics choose
-//! (as the followers' do, abilities and potions included); when none are in view it walks to the nearest
-//! living hostile in the area; when the area holds none it uses a door to an area it has not
-//! been to (whose tag starts with `--exit-prefix`), levelling the party (the auto-level
-//! tables) first and at the start. It does not drink potions itself.
+//! attacks one (the same one until it falls), or with `--ai-hero` leaves the hero to its own
+//! tactics as the followers are; when none are in view it walks to the nearest living hostile
+//! in the area; when the area holds none it uses a door to an area it has not been to (whose
+//! tag starts with `--exit-prefix`), levelling the party (the auto-level tables) first and at
+//! the start. It drinks no potions beyond what the tactics do.
 //!
 //! Each run loads the save, reseeds the simulation's generator with the run's seed and plays
 //! until a plot flag is set, an area is reached, the whole party falls (a wipe: game over),
-//! or the time limit. The report gives hero
-//! deaths (mean, spread, range) and, for each watched creature, how often it was alive at
-//! fixed times after a marker flag (or the start).
+//! or the time limit. The report gives hero deaths (mean, spread, range) and, for each
+//! watched creature, how often it was alive at fixed times after a marker flag (or the
+//! start). `--activity` adds how the party and the foes it fights spent the fighting time
+//! (walking, attacking, using abilities, idle, down) and their attacks (swings, hits, damage).
 
 use std::path::Path;
 
@@ -45,6 +46,10 @@ pub struct Options<'a> {
     /// The hero fights only through the party AI (autopilot, with its tactics), as the
     /// followers do; the player just walks it towards enemies not yet seen.
     pub ai_hero: bool,
+    /// Report how the party and its foes spent the fighting time, and their attacks.
+    pub activity: bool,
+    /// Followers waiting in the party pool get the hero's experience (provisional).
+    pub pool_xp: bool,
     /// Write the last run's end state here (a save the MCP can load).
     pub save_to: Option<&'a Path>,
 }
@@ -58,6 +63,71 @@ struct RunResult {
     samples: Vec<Vec<bool>>,
     /// When each watched creature fell, in seconds from the mark (negative: before it).
     died: Vec<Option<f64>>,
+    activity: Activity,
+}
+
+/// What a side was doing while the party fought: milliseconds summed over its members.
+const STATES: [&str; 5] = ["walking", "attacking", "ability", "idle", "down"];
+
+#[derive(Default, Clone)]
+struct Side {
+    ms: [u64; 5],
+    swings: u32,
+    hits: u32,
+    damage: f64,
+}
+
+#[derive(Default, Clone)]
+struct Activity {
+    fight_ms: u64,
+    party: Side,
+    foes: Side,
+}
+
+/// What a creature is doing: walking (a move, or an attack still closing in), attacking
+/// (an attack in reach), using an ability, idle (nothing, or waiting), or down.
+fn state(sim: &Sim, id: ObjectId) -> usize {
+    let Some(o) = sim.world.get(id) else { return 4 };
+    if o.dead {
+        return 4;
+    }
+    match o.commands.first() {
+        Some(c) if c.name == "CommandAttack" && c.approach.is_some() => 0,
+        Some(c) if c.name == "CommandAttack" => 1,
+        Some(c) if c.name == "CommandUseAbility" => 2,
+        Some(c) if c.name.starts_with("CommandMove") => 0,
+        _ => 3,
+    }
+}
+
+/// The party (hero and followers) and the living hostiles in the hero's area that are in the
+/// fight (they see a party member or are attacking).
+fn sides(sim: &Sim, hero: ObjectId) -> (Vec<ObjectId>, Vec<ObjectId>) {
+    let mut party = vec![hero];
+    party.extend(
+        sim.world
+            .get(hero)
+            .map(|h| h.followers.clone())
+            .unwrap_or_default(),
+    );
+    let area = sim.world.get(hero).and_then(|h| h.area);
+    let foes = sim
+        .world
+        .objects
+        .values()
+        .filter(|o| {
+            o.kind == ObjectKind::Creature
+                && o.area == area
+                && alive(sim, o.id)
+                && sim.hostile(hero, o.id)
+                && (o.combat.perceived_hostile.iter().any(|p| party.contains(p))
+                    || o.commands
+                        .first()
+                        .is_some_and(|c| c.name == "CommandAttack"))
+        })
+        .map(|o| o.id)
+        .collect();
+    (party, foes)
 }
 
 fn parse_flag(s: &str) -> Result<(String, i32)> {
@@ -159,6 +229,7 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
     sim.load_json(save).context("loading the save")?;
     sim.world.rng = Rng::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5EED);
     sim.world.autopilot = true;
+    sim.world.pool_xp = o.pool_xp;
     let hero = sim.world.hero.context("the save has no hero")?;
     let until_flag = o.until_flag.map(parse_flag).transpose()?;
     let mark_flag = o.mark_flag.map(parse_flag).transpose()?;
@@ -195,9 +266,39 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
     let mut deaths = 0;
     let mut was_dead = sim.world.get(hero).is_some_and(|h| h.dead);
     level_party(sim, hero);
+    sim.world.trace.attacks.clear();
+    let mut activity = Activity::default();
+    // The states seen at the last step, credited with the time the step took.
+    let mut seen: Option<(u64, Vec<usize>, Vec<usize>)> = None;
+    let mut party_ids: Vec<ObjectId> = Vec::new();
     let end;
     loop {
         let now = sim.world.time_ms;
+        if o.activity {
+            if let Some((t0, p, f)) = seen.take() {
+                let dt = now.saturating_sub(t0);
+                activity.fight_ms += dt;
+                for s in p {
+                    activity.party.ms[s] += dt;
+                }
+                for s in f {
+                    activity.foes.ms[s] += dt;
+                }
+            }
+            if sim.world.party_fighting {
+                let (party, foes) = sides(sim, hero);
+                for m in &party {
+                    if !party_ids.contains(m) {
+                        party_ids.push(*m);
+                    }
+                }
+                seen = Some((
+                    now,
+                    party.iter().map(|&m| state(sim, m)).collect(),
+                    foes.iter().map(|&m| state(sim, m)).collect(),
+                ));
+            }
+        }
         let dead = sim.world.get(hero).is_none_or(|h| h.dead);
         if dead && !was_dead {
             deaths += 1;
@@ -324,6 +425,19 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
         deaths,
         end,
         ms: sim.world.time_ms - start,
+        activity: {
+            for (id, a) in &sim.world.trace.attacks {
+                let side = if party_ids.contains(id) || Some(*id) == sim.world.hero {
+                    &mut activity.party
+                } else {
+                    &mut activity.foes
+                };
+                side.swings += a.swings;
+                side.hits += a.hits;
+                side.damage += a.damage as f64;
+            }
+            activity
+        },
         samples,
     })
 }
@@ -378,6 +492,40 @@ pub fn run(o: &Options) -> Result<()> {
         o.first_seed + o.seeds - 1,
         secs.iter().sum::<f64>() / n
     );
+    if o.activity {
+        let fight = runs.iter().map(|r| r.activity.fight_ms).sum::<u64>() as f64;
+        println!(
+            "fighting: mean {:.0} s per run; share of member-time (and attacks per run):",
+            fight / n / 1000.0
+        );
+        for name in ["party", "foes"] {
+            let mut total = Side::default();
+            for r in &runs {
+                let s = if name == "party" {
+                    &r.activity.party
+                } else {
+                    &r.activity.foes
+                };
+                for i in 0..5 {
+                    total.ms[i] += s.ms[i];
+                }
+                total.swings += s.swings;
+                total.hits += s.hits;
+                total.damage += s.damage;
+            }
+            let all = total.ms.iter().sum::<u64>().max(1) as f64;
+            print!("  {name:<6}");
+            for (i, st) in STATES.iter().enumerate() {
+                print!(" {st} {:.0}%", 100.0 * total.ms[i] as f64 / all);
+            }
+            println!(
+                "; {:.1} swings, {:.0}% hit, {:.0} damage",
+                total.swings as f64 / n,
+                100.0 * total.hits as f64 / (total.swings.max(1)) as f64,
+                total.damage / n
+            );
+        }
+    }
     if !o.watch.is_empty() {
         print!("{:<24} {:>9}", "alive at", "fell at");
         for t in o.at {

@@ -856,21 +856,27 @@ pub fn call(
                 .and_then(|o| o.properties.get(&int(a, 1)).copied())
                 .unwrap_or((0.0, 0.0));
             // Equipped items add their stats to the properties itemstatdefines.gda links
-            // them to (armour to Armor, defence to Defense, ...): part of the total, not the
-            // base.
-            let gear = h.sim.equipment_bonus(obj(a, 0), int(a, 1));
+            // them to (armour to Armor, defence to Defense, ...).
+            // Equipment and attributes (see `derived`) are the modifier: part of the total.
+            let gear = h.sim.equipment_bonus(obj(a, 0), int(a, 1))
+                + h.sim.attribute_bonus(obj(a, 0), int(a, 1));
+            let bounds = property_bounds(h.sim, int(a, 1));
             let v = if vt == base_type {
                 base
             } else if vt == modifier {
                 return ok(Value::Float(gear));
             } else if vt == current {
                 cur
+            } else if bounds.is_some_and(|b| b.0 == 3) {
+                // A depletable's total is its maximum: the base and its modifiers, whatever
+                // is left of it now.
+                base + gear
             } else {
                 base.max(cur) + gear
             };
             // Totals and attributes stay within `properties.gda`'s Min and Max (a depletable's
             // current value may still run down to 0). Provisional: inferred from the table.
-            let v = match property_bounds(h.sim, int(a, 1)) {
+            let v = match bounds {
                 Some((ty, min, max)) if !(vt == current && ty == 3) => v.clamp(min, max),
                 _ => v,
             };
@@ -880,6 +886,14 @@ pub fn call(
             let vt = int(a, 3);
             let base_type = constant(&h.sim.table, "PROPERTY_VALUE_BASE");
             let current = constant(&h.sim.table, "PROPERTY_VALUE_CURRENT");
+            // The hero's experience before, for followers waiting in the pool.
+            let xp = constant(&h.sim.table, "PROPERTY_SIMPLE_EXPERIENCE");
+            let hero_xp_before =
+                (int(a, 1) == xp && Some(obj(a, 0)) == h.sim.world.hero).then(|| {
+                    h.object(obj(a, 0))
+                        .and_then(|o| o.properties.get(&xp))
+                        .map_or(0.0, |v| v.0)
+                });
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
                 let e = o.properties.entry(int(a, 1)).or_insert((0.0, 0.0));
                 let v = float(a, 2);
@@ -903,6 +917,13 @@ pub fn call(
                 {
                     o.dead = false;
                 }
+            }
+            if let Some(before) = hero_xp_before {
+                let after = h
+                    .object(obj(a, 0))
+                    .and_then(|o| o.properties.get(&xp))
+                    .map_or(0.0, |v| v.0);
+                h.sim.share_pool_xp(after - before);
             }
             void()
         }
@@ -1890,12 +1911,11 @@ pub fn call(
                 .and_then(|o| o.fields.get("BaseItem").copied())
                 .unwrap_or(0),
         )),
+        // The hero, then the followers in the pool, in the active party or not (script.ldf:
+        // "the array of followers belonging to the party pool").
         "GetPartyPoolList" => {
-            let hero = h.sim.world.hero;
-            let mut v: Vec<ObjectId> = hero.into_iter().collect();
-            if let Some(x) = hero.and_then(|x| h.object(x)) {
-                v.extend(x.followers.iter().copied());
-            }
+            let mut v: Vec<ObjectId> = h.sim.world.hero.into_iter().collect();
+            v.extend(h.sim.party_pool());
             ok(objects(v))
         }
         "IsStringEmpty" => ok(b(string(a, 0).is_empty())),
@@ -2976,7 +2996,11 @@ mod tests {
         int GetPlotActionState(int a) = 20;\n\
         int EquipItem(object o, object i, int s = 255, int w = -1) = 21;\n\
         object GetItemInEquipSlot(int s, object o, int w = -1) = 22;\n\
-        int INVENTORY_SLOT_INVALID = 255;\n";
+        int INVENTORY_SLOT_INVALID = 255;\n\
+        object[] GetPartyPoolList() = 23;\n\
+        int FOLLOWER_STATE_AVAILABLE = 2;\n\
+        int PROPERTY_SIMPLE_EXPERIENCE = 19;\n\
+        int PROPERTY_SIMPLE_LEVEL = 15;\n";
 
     /// Calls engine function `name` as `caller`.
     fn run(s: &mut Sim, caller: ObjectId, name: &str, a: &[Value]) -> Option<Value> {
@@ -2987,6 +3011,99 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn the_pool_holds_waiting_followers_and_can_share_the_heros_experience() {
+        use thedas_formats::gda::Cell;
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let t = crate::m2da::Tables::empty();
+        t.insert(
+            "exptable",
+            &["ID", "XP"],
+            (1..=3)
+                .map(|l| {
+                    (
+                        l,
+                        vec![Cell::Int(l), Cell::Int([0, 0, 2001, 4501][l as usize])],
+                    )
+                })
+                .collect(),
+        );
+        s.world.tables = Arc::new(t);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.hero = Some(hero);
+        let (alistair, dog) = (
+            s.world.spawn(ObjectKind::Creature, "alistair"),
+            s.world.spawn(ObjectKind::Creature, "dog"),
+        );
+        run(
+            &mut s,
+            hero,
+            "SetFollowerState",
+            &[Value::Object(alistair), Value::Int(1)],
+        );
+        run(
+            &mut s,
+            hero,
+            "SetFollowerState",
+            &[Value::Object(dog), Value::Int(2)],
+        );
+        let pool = run(&mut s, hero, "GetPartyPoolList", &[]);
+        assert_eq!(
+            pool,
+            Some(objects(vec![hero, alistair, dog])),
+            "the dog waits in the pool, out of the active party"
+        );
+        let xp = |s: &Sim, o| {
+            s.world
+                .get(o)
+                .unwrap()
+                .properties
+                .get(&19)
+                .map_or(0.0, |v| v.0)
+        };
+        let give = |s: &mut Sim, v: f32| {
+            run(
+                s,
+                hero,
+                "SetCreatureProperty",
+                &[
+                    Value::Object(hero),
+                    Value::Int(19),
+                    Value::Float(v),
+                    Value::Int(2),
+                ],
+            );
+        };
+        give(&mut s, 1000.0);
+        assert_eq!(
+            (xp(&s, alistair), xp(&s, dog)),
+            (0.0, 0.0),
+            "off by default"
+        );
+        s.world.pool_xp = true;
+        give(&mut s, 2500.0);
+        // Only the waiting follower shares it (the active party is paid by the scripts).
+        assert_eq!((xp(&s, alistair), xp(&s, dog)), (0.0, 1500.0));
+        assert!(!s.world.get(dog).unwrap().fields.contains_key("CanLevelUp"));
+        give(&mut s, 3100.0);
+        assert_eq!(xp(&s, dog), 2100.0);
+        assert_eq!(s.world.get(dog).unwrap().fields.get("CanLevelUp"), Some(&1));
+        // Followers do not pass their experience on.
+        run(
+            &mut s,
+            hero,
+            "SetCreatureProperty",
+            &[
+                Value::Object(alistair),
+                Value::Int(19),
+                Value::Float(9000.0),
+                Value::Int(2),
+            ],
+        );
+        assert_eq!(xp(&s, dog), 2100.0);
     }
 
     #[test]
