@@ -26,6 +26,9 @@ pub type MessageHandler =
 /// Looks up a talk-table string.
 pub type StringLookup = Arc<dyn Fn(u32) -> Option<String> + Send + Sync>;
 
+/// Looks up a 2DA cell: the M2DA table id, the row id and the column's hash.
+pub type TableLookup = Arc<dyn Fn(i32, i64, u32) -> Option<UiValue> + Send + Sync>;
+
 /// The function that starts a movie in game mode.
 pub const START_SCENE: &str = "_global.GUISystem.StartSceneFromGame";
 pub const FINISH_SCENE: &str = "_global.GUISystem.FinishSceneFromGame";
@@ -49,6 +52,7 @@ pub struct GameBridge {
     state: Arc<Mutex<State>>,
     strings: StringLookup,
     handler: Arc<Mutex<Option<MessageHandler>>>,
+    tables: Arc<Mutex<Option<TableLookup>>>,
 }
 
 /// What a call means to the rest of the engine, once the bridge has handled its own part.
@@ -106,10 +110,18 @@ impl GameBridge {
             state: Arc::new(Mutex::new(state)),
             strings,
             handler: Arc::new(Mutex::new(None)),
+            tables: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Installs (or removes) the handler for game messages the movies send.
+    /// Where `Get2DAValue` finds the game's tables.
+    pub fn set_table_lookup(&self, tables: Option<TableLookup>) {
+        if let Ok(mut t) = self.tables.lock() {
+            *t = tables;
+        }
+    }
+
     pub fn set_message_handler(&self, handler: Option<MessageHandler>) {
         if let Ok(mut h) = self.handler.lock() {
             *h = handler;
@@ -247,6 +259,26 @@ impl GameBridge {
                 let v = arg(0).parse::<f64>().unwrap_or(0.0);
                 let digits = arg(1).parse::<usize>().unwrap_or(0).min(10);
                 UiValue::String(format!("{v:.digits$}"))
+            }
+            // A 2DA cell: the table id, the row id and the column hash (worldmap.gfx reads
+            // map names and pin images this way).
+            "Get2DAValue" if call.kind == CallKind::FsCommand => {
+                let lookup = self.tables.lock().ok().and_then(|t| t.clone());
+                let (table, row, hash) = (
+                    arg(0).trim().parse::<i32>().ok(),
+                    arg(1).trim().parse::<i64>().ok(),
+                    arg(2).trim().parse::<u32>().ok(),
+                );
+                let found = match (lookup, table, row, hash) {
+                    (Some(l), Some(t), Some(r), Some(h)) => l(t, r, h),
+                    _ => None,
+                };
+                found.unwrap_or_else(|| {
+                    if let Ok(mut s) = self.state.lock() {
+                        *s.unanswered.entry("Get2DAValue".into()).or_default() += 1;
+                    }
+                    UiValue::Undefined
+                })
             }
             name if call.kind == CallKind::FsCommand
                 && crate::avm1::RETURNING_FSCOMMANDS.contains(&name) =>

@@ -150,6 +150,77 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
             set(format!("{k}.Accepted"), num(j.accepted as u8));
         }
     }
+    // The world map, as worldmap.gfx reads it: the primary and secondary maps (their
+    // worldmaps.gda row as `Type`, the row's image as `ResourceName`), where the party is,
+    // and each map's pins. Provisional: the pin states are taken to be the scripts'
+    // WM_LOCATION_* values.
+    let wm = &sim.world.world_map;
+    set("WorldMap.GUIStatus".into(), num(wm.gui_status));
+    set(
+        "WorldMap.GUITravelStatus".into(),
+        num(wm.travelling_to.is_some() as u8),
+    );
+    let player_area = wm
+        .player_pin
+        .and_then(|p| sim.world.get(p))
+        .and_then(|p| p.locals.strings.get("WM_AREA").cloned())
+        .unwrap_or_default();
+    let tables = sim.world.tables();
+    let maps = tables.get(0, "worldmaps");
+    for (key, map) in [("PrimaryMap", wm.primary), ("SecondaryMap", wm.secondary)] {
+        let Some(m) = map
+            .and_then(|m| sim.world.get(m))
+            .filter(|m| m.kind == ObjectKind::Map)
+        else {
+            continue;
+        };
+        let k = format!("WorldMap.{key}");
+        let id = m.fields.get("MapId").copied().unwrap_or(0);
+        set(format!("{k}.Type"), num(id));
+        let image = maps
+            .as_ref()
+            .and_then(|t| match t.cell_by_hash(0xa90d_54b7, id as i64) {
+                Some(thedas_formats::gda::Cell::String(s)) => {
+                    Some(s.trim_end_matches('\0').trim().to_string())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        set(format!("{k}.ResourceName"), UiValue::String(image));
+        set(
+            format!("{k}.PlayerLocation.AreaTag"),
+            UiValue::String(player_area.clone()),
+        );
+        let pins = sim.world.objects.values().filter(|o| {
+            o.kind == ObjectKind::MapPin && o.locals.objects.get("WM_MAP") == Some(&m.id)
+        });
+        for (i, p) in pins.enumerate() {
+            let pk = format!("{k}.Locations.{i}");
+            let name = p
+                .name_strref
+                .and_then(|s| sim.string(s))
+                .unwrap_or_default();
+            set(format!("{pk}.Tag"), UiValue::String(p.tag.clone()));
+            set(format!("{pk}.Name"), UiValue::String(name.clone()));
+            set(format!("{pk}.Tooltip"), UiValue::String(name));
+            set(
+                format!("{pk}.AreaTag"),
+                UiValue::String(p.locals.strings.get("WM_AREA").cloned().unwrap_or_default()),
+            );
+            set(
+                format!("{pk}.State"),
+                num(p.fields.get("WMStatus").copied().unwrap_or(0)),
+            );
+            set(
+                format!("{pk}.Type"),
+                num(p.fields.get("WMIcon").copied().unwrap_or(0)),
+            );
+            set(format!("{pk}.RecentlyActivated"), num(0));
+            // The pin's place on the map image, as the map file gives it.
+            set(format!("{pk}.X"), num(p.position[0]));
+            set(format!("{pk}.Y"), num(p.position[1]));
+        }
+    }
     let creatures = sim
         .world
         .objects
@@ -163,6 +234,52 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_world_map_shows_its_pins_and_where_the_party_is() {
+        use thedas_sim::world::ObjectKind;
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let map = sim.world.spawn(ObjectKind::Map, "wide_open_world");
+        sim.world
+            .get_mut(map)
+            .unwrap()
+            .fields
+            .insert("MapId".into(), 1);
+        let pin = sim.world.spawn(ObjectKind::MapPin, "wml_wow_lothering");
+        {
+            let p = sim.world.get_mut(pin).unwrap();
+            p.locals.objects.insert("WM_MAP".into(), map);
+            p.locals
+                .strings
+                .insert("WM_AREA".into(), "lot100ar_lothering".into());
+            p.fields
+                .extend([("WMStatus".to_string(), 2), ("WMIcon".to_string(), 7)]);
+            p.position = [0.25, 0.75, 0.0];
+        }
+        sim.world.world_map.primary = Some(map);
+        sim.world.world_map.player_pin = Some(pin);
+        let v = sim_values(&sim);
+        let k = "WorldMap.PrimaryMap";
+        assert_eq!(v.get(&format!("{k}.Type")), Some(&UiValue::Number(1.0)));
+        assert_eq!(
+            v.get(&format!("{k}.PlayerLocation.AreaTag")),
+            Some(&UiValue::String("lot100ar_lothering".into()))
+        );
+        let l = format!("{k}.Locations.0");
+        assert_eq!(
+            v.get(&format!("{l}.Tag")),
+            Some(&UiValue::String("wml_wow_lothering".into()))
+        );
+        assert_eq!(v.get(&format!("{l}.State")), Some(&UiValue::Number(2.0)));
+        assert_eq!(v.get(&format!("{l}.Type")), Some(&UiValue::Number(7.0)));
+        assert_eq!(v.get(&format!("{l}.X")), Some(&UiValue::Number(0.25)));
+        assert_eq!(v.get(&format!("{l}.Y")), Some(&UiValue::Number(0.75)));
+        assert!(!v.contains_key("WorldMap.SecondaryMap.Type"));
+    }
 
     #[test]
     fn an_empty_world_has_no_party() {
