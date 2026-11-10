@@ -1,12 +1,8 @@
 //! `thedas sim`: run the headless simulation for a module and area.
 
-use std::path::Path;
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
+use std::path::Path;
 use thedas_sim::Sim;
-use thedas_vfs::DaoInstall;
-use thedas_vfs::install::TextureQuality;
 
 pub struct Options<'a> {
     pub install: &'a Path,
@@ -22,34 +18,17 @@ pub struct Options<'a> {
     pub replies: &'a [usize],
 }
 
-/// Opens the install, loads the module and area. Shared with the MCP server.
+/// Opens the install, loads the module and area.
 pub fn start(o: &Options) -> Result<Sim> {
-    let install = DaoInstall::open(o.install)?;
-    let mut vfs = install.global_vfs(TextureQuality::High)?;
-    let table = Arc::new(crate::script::engine_table(&vfs)?.with_inferred());
-    let module = o.module;
-    // The area's level archives hold nothing the simulation needs except through the .are,
-    // but mounting them keeps resource lookup identical to the renderer's.
-    let mut sim_area = o.area.map(str::to_string);
-    if let Some(area) = &sim_area {
-        if let Ok(data) = vfs.read(&format!("{area}.are")).map(|x| x.0) {
-            if let Ok(Some(layout)) = thedas_formats::Area::parse(&data).map(|a| a.layout) {
-                let _ = install.mount_level(&mut vfs, &layout);
-            }
-        }
-    }
-    let mut sim = Sim::new(Arc::new(vfs), table, o.seed);
-    sim.world.trace.keep = o.trace.is_some();
-    sim.load_module(install.root(), module)
-        .with_context(|| format!("loading module {module}"))?;
-    if sim_area.is_none() {
-        sim_area = sim.module_info.start_area.clone();
-    }
-    if let Some(area) = &sim_area {
-        sim.enter_area(area, o.waypoint)
-            .with_context(|| format!("loading area {area}"))?;
-    }
-    Ok(sim)
+    thedas_sim::session::open(&thedas_sim::session::SessionOptions {
+        install: o.install.to_path_buf(),
+        module: o.module.to_string(),
+        area: o.area.map(str::to_string),
+        waypoint: o.waypoint.map(str::to_string),
+        seed: o.seed,
+        keep_trace: o.trace.is_some(),
+    })
+    .with_context(|| format!("opening module {} in {}", o.module, o.install.display()))
 }
 
 pub fn run(o: &Options) -> Result<()> {

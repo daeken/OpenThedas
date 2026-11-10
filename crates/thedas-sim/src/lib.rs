@@ -16,6 +16,7 @@ pub mod dialog;
 pub mod engine;
 pub mod m2da;
 pub mod plot;
+pub mod session;
 pub mod sim;
 pub mod trace;
 pub mod world;
