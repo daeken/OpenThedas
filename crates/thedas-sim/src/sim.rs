@@ -84,6 +84,9 @@ pub struct Sim {
     /// The length of each weapon animation tree's fire animation, in milliseconds (see
     /// `Sim::fire_ms`).
     pub(crate) fire_lengths: HashMap<String, Option<u64>>,
+    /// Each area's doors and their doorways' grid cells (doors do not move; see
+    /// `Sim::closed_doors`).
+    pub(crate) door_cells: HashMap<ObjectId, Arc<Vec<crate::nav::Doorway>>>,
     pub(crate) nav_grids: HashMap<String, Option<Arc<thedas_formats::level::NavGrid>>>,
     /// The effect an `APPLY_EFFECT` handler is looking at, and whether it is still valid.
     pub(crate) current_effect: Option<(crate::world::Effect, bool)>,
@@ -211,6 +214,7 @@ impl Sim {
             area_layouts: HashMap::new(),
             nav_grids: HashMap::new(),
             fire_lengths: HashMap::new(),
+            door_cells: HashMap::new(),
             talk: None,
             plots: crate::plot::Plots::default(),
             strings: std::sync::OnceLock::new(),
@@ -973,13 +977,40 @@ impl Sim {
     /// The route a mover takes from where it is to `to` in its area: the area's pathing
     /// grid's route (see `nav::route`), as waypoints ending at `to`; empty (a straight line)
     /// when there is no grid, either end is off it or no route exists.
-    pub(crate) fn route_to(&mut self, id: ObjectId, to: [f32; 3]) -> Vec<[f32; 3]> {
+    ///
+    /// Closed doors block the way (see `Sim::closed_doors`): when the only route passes
+    /// through one, the result is that door (the original fails such a move with
+    /// `COMMAND_FAILED_PATH_ACTION_REQUIRED`, and the AI opens the door and tries again).
+    pub(crate) fn route_to(&mut self, id: ObjectId, to: [f32; 3]) -> crate::nav::Routed {
+        use crate::nav::Routed;
         let Some((from, Some(area))) = self.world.get(id).map(|o| (o.position, o.area)) else {
-            return Vec::new();
+            return Routed::Straight;
         };
-        self.nav_grid(area)
-            .and_then(|g| crate::nav::route(&g, from, to))
-            .unwrap_or_default()
+        let Some(g) = self.nav_grid(area) else {
+            return Routed::Straight;
+        };
+        let doors = self.closed_doors(area);
+        let blocked: std::collections::HashSet<usize> =
+            doors.iter().flat_map(|d| d.1.iter().copied()).collect();
+        if let Some(p) = crate::nav::route_avoiding(&g, from, to, &blocked) {
+            return Routed::Path(p);
+        }
+        let Some(p) = crate::nav::route(&g, from, to) else {
+            return Routed::Straight;
+        };
+        if blocked.is_empty() {
+            return Routed::Path(p);
+        }
+        // The first closed door the open-door route goes through.
+        for q in &p {
+            if let Some(c) = g.cell(*q) {
+                let i = (c.1 * g.columns + c.0) as usize;
+                if let Some((door, _)) = doors.iter().find(|d| d.1.contains(&i)) {
+                    return Routed::Door(*door);
+                }
+            }
+        }
+        Routed::Path(p)
     }
 
     fn advance_movers(&mut self) {
@@ -1099,7 +1130,18 @@ impl Sim {
 
     /// Drops an object's front command as failed: it hears `COMMAND_COMPLETE` with the
     /// result (a `COMMAND_FAILED_*` constant).
+    /// Fails a move or approach whose way a closed door blocks
+    /// (`COMMAND_FAILED_PATH_ACTION_REQUIRED`, the door as the event's object 2, where
+    /// rules_core looks for it: its AI then uses the door and repeats the command).
+    pub(crate) fn fail_blocked(&mut self, id: ObjectId, door: ObjectId) {
+        self.fail_front_command_with(id, "COMMAND_FAILED_PATH_ACTION_REQUIRED", Some(door));
+    }
+
     pub(crate) fn fail_front_command(&mut self, id: ObjectId, result: &str) {
+        self.fail_front_command_with(id, result, None);
+    }
+
+    fn fail_front_command_with(&mut self, id: ObjectId, result: &str, blocker: Option<ObjectId>) {
         let result = constant(&self.table, result);
         let Some(c) = self
             .world
@@ -1118,6 +1160,12 @@ impl Sim {
         });
         let mut ev = self.new_event("COMMAND_COMPLETE", Some(id));
         ev.ints = vec![c.ty, result];
+        if let Some(b) = blocker {
+            ev.objects = vec![OBJECT_INVALID, OBJECT_INVALID, b];
+        }
+        if let Some(o) = self.world.get_mut(id) {
+            o.combat.previous_command = Some(c);
+        }
         self.world.queue_event(0, id, ev, None);
     }
 
@@ -1156,7 +1204,14 @@ impl Sim {
                         if let Some(stop) = stop {
                             let pos = self.world.get(id).map(|o| o.position);
                             let path = if walk.is_some() {
-                                self.route_to(id, stop)
+                                match self.route_to(id, stop) {
+                                    crate::nav::Routed::Path(p) => p,
+                                    crate::nav::Routed::Straight => Vec::new(),
+                                    crate::nav::Routed::Door(door) => {
+                                        self.fail_blocked(id, door);
+                                        continue;
+                                    }
+                                }
                             } else {
                                 Vec::new()
                             };
@@ -1235,7 +1290,14 @@ impl Sim {
                                 .map(|o| o.position)
                         });
                         if let (Some(to), Some(p)) = (to, pos) {
-                            path = self.route_to(id, to);
+                            path = match self.route_to(id, to) {
+                                crate::nav::Routed::Path(p) => p,
+                                crate::nav::Routed::Straight => Vec::new(),
+                                crate::nav::Routed::Door(door) => {
+                                    self.fail_blocked(id, door);
+                                    continue;
+                                }
+                            };
                             if !path.is_empty() {
                                 ms = (path_length(p, &path) / self.move_speed(id) * 1000.0) as u64;
                             }
@@ -1306,6 +1368,15 @@ impl Sim {
             self.finish_attack(id, cmd.target.unwrap_or(OBJECT_INVALID));
         } else if cmd.name == "CommandUseAbility" {
             self.finish_ability(id, &cmd);
+        } else if cmd.name == "CommandUseObject" {
+            // Using a placeable (a door, a lever) sends it EVENT_TYPE_USE, as clicking it does.
+            if let Some(t) = cmd.target.filter(|&t| self.world.get(t).is_some()) {
+                let ev = self.new_event("USE", Some(id));
+                self.deliver(t, ev, None);
+            }
+        }
+        if let Some(o) = self.world.get_mut(id) {
+            o.combat.previous_command = Some(cmd.clone());
         }
         self.update_perception();
         self.world.trace.push(TraceEntry::Command {

@@ -159,7 +159,6 @@ const PRESENTATION: &[&str] = &[
     "SetPlaceableHealth",
     "SetMapPinState",
     "SetCameraTarget",
-    "SetPlaceableActionResult",
     "ApplyEffectVisualEffectOnLocation",
     "SetLookAtEnabled",
     "SetSoundSet",
@@ -1431,6 +1430,16 @@ pub fn call(
                 None => ok(Value::Int(0)),
             }
         }
+        "GetPreviousCommand" => {
+            let c = h
+                .object(obj(a, 0))
+                .and_then(|o| o.combat.previous_command.clone());
+            let hd = c.map(|c| h.sim.world.store(EngineData::Command(c)));
+            ok(Value::Engine {
+                ty: ty.command,
+                handle: hd,
+            })
+        }
         "GetCurrentCommand" => {
             let c = h
                 .object(obj(a, 0))
@@ -2199,6 +2208,18 @@ pub fn call(
         // (placeable_types.gda, e.g. StateCnt_Informational) gives each state's default
         // action. Without one, an area-transition destination means a transition, a
         // conversation a dialog, anything else a plain use (provisional fallback).
+        "SetPlaceableActionResult" => {
+            let (id, action, success, variation) =
+                (obj(a, 0), int(a, 1), int(a, 2) != 0, int(a, 3) != 0);
+            if success {
+                if let Some(next) = placeable_transition(h.sim, id, action, variation) {
+                    if let Some(o) = h.sim.world.get_mut(id) {
+                        o.fields.insert("State".into(), next);
+                    }
+                }
+            }
+            void()
+        }
         "GetPlaceableAction" => {
             let id = obj(a, 0);
             if let Some(action) = placeable_default_action(h.sim, id) {
@@ -2293,9 +2314,16 @@ pub fn call(
             void()
         }
         "HasConversation" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.dialog.is_some()))),
+        // The state set by SetPlaceableState or an action's result, else the template's
+        // starting state (`AnimContState`).
         "GetPlaceableState" => ok(Value::Int(
             h.object(obj(a, 0))
-                .and_then(|o| o.fields.get("State").copied())
+                .and_then(|o| {
+                    o.fields
+                        .get("State")
+                        .or_else(|| o.fields.get("AnimContState"))
+                        .copied()
+                })
                 .unwrap_or(0),
         )),
         "SetNumTactics" => {
@@ -2948,13 +2976,57 @@ fn cooldown_key(ability: i32, item: &str) -> String {
     format!("{ability}:{}", item.to_ascii_lowercase())
 }
 
+/// The state a placeable moves to when `action` succeeds (`SetPlaceableActionResult`): its
+/// state controller's row for the current state gives the default action, the state it
+/// leads to and the state its variation leads to (`statecnt_door.gda`: Closed_Unlocked opens
+/// to Open, or Open_2 as the variation; Closed_Locked unlocks to Closed_Unlocked; Open closes
+/// to Closed_Unlocked). Provisional: only the default action is known to move the state;
+/// other actions leave it.
+fn placeable_transition(sim: &Sim, id: ObjectId, action: i32, variation: bool) -> Option<i32> {
+    let o = sim.world.get(id)?;
+    let appearance = *o.fields.get("Appearance")? as i64;
+    let state = o
+        .fields
+        .get("State")
+        .or_else(|| o.fields.get("AnimContState"))
+        .copied()
+        .unwrap_or(0) as i64;
+    let tables = sim.world.tables();
+    let types = tables.get(93, "")?;
+    let col = types
+        .columns
+        .iter()
+        .find(|(_, i)| **i == 8)
+        .map(|(h, _)| *h)?;
+    let controller = match types.cell_by_hash(col, appearance)? {
+        Cell::String(s) => clean(s).to_ascii_lowercase(),
+        _ => return None,
+    };
+    let t = tables.get(0, &controller)?;
+    let int = |h: u32| match t.cell_by_hash(h, state) {
+        Some(Cell::Int(v)) => Some(*v as i32),
+        _ => None,
+    };
+    if int(0x52be_3c5e)? != action {
+        return None;
+    }
+    let next = int(0xa2b4_782c)?;
+    let alt = int(0x5ad0_780d).filter(|&v| v > 0);
+    Some(if variation { alt.unwrap_or(next) } else { next })
+}
+
 /// A placeable's default action in its current state, from its type's state controller:
 /// `placeable_types.gda` (the ninth column names the controller table) and the controller's
 /// action column (hash 0x52be3c5e) at the row of the placeable's state. Provisional.
 fn placeable_default_action(sim: &Sim, id: ObjectId) -> Option<i32> {
     let o = sim.world.get(id)?;
     let appearance = *o.fields.get("Appearance")? as i64;
-    let state = o.fields.get("State").copied().unwrap_or(0) as i64;
+    let state = o
+        .fields
+        .get("State")
+        .or_else(|| o.fields.get("AnimContState"))
+        .copied()
+        .unwrap_or(0) as i64;
     let tables = sim.world.tables();
     let types = tables.get(93, "")?;
     let col = types
@@ -3038,6 +3110,8 @@ mod tests {
         object GetItemInEquipSlot(int s, object o, int w = -1) = 22;\n\
         int INVENTORY_SLOT_INVALID = 255;\n\
         object[] GetPartyPoolList() = 23;\n\
+        void SetPlaceableActionResult(object o, int a, int s, int v = FALSE) = 24;\n\
+        int GetPlaceableState(object o) = 25;\n\
         int FOLLOWER_STATE_AVAILABLE = 2;\n\
         int PROPERTY_SIMPLE_EXPERIENCE = 19;\n\
         int PROPERTY_SIMPLE_LEVEL = 15;\n";
@@ -3051,6 +3125,92 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn a_successful_action_moves_a_placeable_along_its_state_controller() {
+        use thedas_formats::gda::Cell;
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let t = crate::m2da::Tables::empty();
+        // placeable_types: the ninth column names the state controller.
+        let mut cols = vec![
+            "ID",
+            "Label",
+            "c2",
+            "c3",
+            "c4",
+            "c5",
+            "c6",
+            "c7",
+            "Controller",
+        ];
+        let row = |id: i64, ctl: &str| {
+            let mut v: Vec<Cell> = (0..8).map(Cell::Int).collect();
+            v[0] = Cell::Int(id);
+            v.push(Cell::String(ctl.into()));
+            (id, v)
+        };
+        t.insert("#93", &cols, vec![row(93, "StateCnt_Door")]);
+        cols.clear();
+        // statecnt_door: default action, next state, the variation's next state.
+        let st = |id: i64, act: i64, next: i64, alt: i64| {
+            (
+                id,
+                vec![
+                    Cell::Int(id),
+                    Cell::Int(act),
+                    Cell::Int(next),
+                    Cell::Int(alt),
+                ],
+            )
+        };
+        t.insert(
+            "statecnt_door",
+            &["ID", "#52be3c5e", "#a2b4782c", "#5ad0780d"],
+            vec![st(0, 1, 2, 4), st(1, 3, 0, 0), st(2, 2, 0, 0)],
+        );
+        s.world.tables = Arc::new(t);
+        let door = s.world.spawn(ObjectKind::Placeable, "door");
+        s.world.get_mut(door).unwrap().fields.extend([
+            ("Appearance".to_string(), 93),
+            ("AnimContState".to_string(), 1),
+        ]);
+        let state = |s: &mut Sim| run(s, door, "GetPlaceableState", &[Value::Object(door)]);
+        let act = |s: &mut Sim, a: i32, ok: i32, var: i32| {
+            run(
+                s,
+                door,
+                "SetPlaceableActionResult",
+                &[
+                    Value::Object(door),
+                    Value::Int(a),
+                    Value::Int(ok),
+                    Value::Int(var),
+                ],
+            );
+        };
+        assert_eq!(state(&mut s), Some(Value::Int(1)), "locked at the start");
+        act(&mut s, 1, 1, 0);
+        assert_eq!(
+            state(&mut s),
+            Some(Value::Int(1)),
+            "opening a locked door does nothing"
+        );
+        act(&mut s, 3, 0, 0);
+        assert_eq!(
+            state(&mut s),
+            Some(Value::Int(1)),
+            "a failed unlock leaves it"
+        );
+        act(&mut s, 3, 1, 0);
+        assert_eq!(state(&mut s), Some(Value::Int(0)));
+        act(&mut s, 1, 1, 1);
+        assert_eq!(
+            state(&mut s),
+            Some(Value::Int(4)),
+            "the variation's open state"
+        );
     }
 
     #[test]
