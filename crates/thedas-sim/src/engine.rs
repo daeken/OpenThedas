@@ -995,6 +995,11 @@ pub fn call(
         }
 
         // --- Plots ------------------------------------------------------------------------
+        // The GUID of a plot named by resource or GUID; blank when the plot is unknown.
+        "GetPlotGUID" => {
+            let p = h.sim.plot_info(&string(a, 0));
+            ok(Value::String(p.map(|p| p.guid.clone()).unwrap_or_default()))
+        }
         "GetPlotResRef" => {
             let p = h.sim.plot_info(&string(a, 0));
             ok(Value::String(
@@ -3244,6 +3249,7 @@ mod tests {
         effect EffectModifyPropertyHostile(int p0, float c0, int p1 = 0, float c1 = 0.0, int p2 = 0, float c2 = 0.0) = 27;\n\
         effect SetEffectEngineInteger(effect e, int i, int v) = 28;\n\
         int GetEffectType(effect e) = 29;\n\
+        string GetPlotGUID(string s) = 30;\n\
         int FOLLOWER_STATE_AVAILABLE = 2;\n\
         int PROPERTY_SIMPLE_EXPERIENCE = 19;\n\
         int PROPERTY_SIMPLE_LEVEL = 15;\n";
@@ -3257,6 +3263,36 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn plot_guids_come_from_resource_names() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.plots.insert(crate::plot::PlotInfo {
+            guid: "41A427F27CAB4027A8B6C00BC123A0E1".into(),
+            resref: "plt_lot100pt_bears".into(),
+            script: None,
+            name_strref: None,
+            flags: Default::default(),
+            rewards: Default::default(),
+            journal: Default::default(),
+        });
+        let guid = |s: &mut Sim, name: &str| {
+            run(
+                s,
+                OBJECT_INVALID,
+                "GetPlotGUID",
+                &[Value::String(name.into())],
+            )
+        };
+        let want = Some(Value::String("41A427F27CAB4027A8B6C00BC123A0E1".into()));
+        assert_eq!(guid(&mut s, "plt_lot100pt_bears"), want);
+        assert_eq!(guid(&mut s, "41a427f27cab4027a8b6c00bc123a0e1"), want);
+        assert_eq!(
+            guid(&mut s, "plt_nothing"),
+            Some(Value::String(String::new()))
+        );
     }
 
     #[test]

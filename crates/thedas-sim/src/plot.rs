@@ -106,6 +106,15 @@ pub fn plots_from_gff4(g: &Gff4, resref: &str) -> Vec<PlotInfo> {
 }
 
 impl Plots {
+    /// Registers a plot by its GUID and resource name, for tests.
+    #[cfg(test)]
+    pub(crate) fn insert(&mut self, p: PlotInfo) {
+        self.loaded = true;
+        let p = Arc::new(p);
+        self.by_key.insert(p.guid.clone(), p.clone());
+        self.by_key.insert(p.resref.clone(), p);
+    }
+
     fn load(&mut self, vfs: &Vfs) {
         if self.loaded {
             return;
