@@ -255,6 +255,16 @@ pub struct World {
     #[serde(with = "pairs")]
     pub plots: BTreeMap<(String, i32), bool>,
     pub game_mode: i32,
+    /// Cutscenes loaded with `LoadCutscene` that have not "played" yet. There is no cutscene
+    /// playback; a loaded cutscene ends on the next tick.
+    #[serde(default)]
+    pub cutscenes: Vec<String>,
+    /// The creature in character generation, between `StartCharGen` and `CHARGEN_END`.
+    #[serde(default)]
+    pub chargen: Option<ObjectId>,
+    /// A `DoAreaTransition` waiting for the current scripts to finish (area, waypoint).
+    #[serde(default)]
+    pub transition: Option<(String, String)>,
     pub rng: Rng,
     #[serde(skip)]
     pub trace: Trace,
@@ -329,6 +339,9 @@ impl World {
             party: None,
             plots: BTreeMap::new(),
             game_mode: 0,
+            cutscenes: Vec::new(),
+            chargen: None,
+            transition: None,
             rng: Rng::new(seed),
             trace: Trace::default(),
             tables,

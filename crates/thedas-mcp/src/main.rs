@@ -159,6 +159,23 @@ struct LoadArgs {
     waypoint: Option<String>,
     /// Random seed (default 1).
     seed: Option<u64>,
+    /// Character generation when a new game starts it: "quick" (default: the chargen
+    /// script's pre-made character and origin) or "manual" (send events with chargen_event).
+    chargen: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ChargenArgs {
+    /// Event name without EVENT_TYPE_: CHARGEN_SELECT_GENDER, CHARGEN_SELECT_RACE,
+    /// CHARGEN_SELECT_CLASS, CHARGEN_SELECT_BACKGROUND, CHARGEN_SELECT_NAME,
+    /// CHARGEN_ASSIGN_ATTRIBUTES, CHARGEN_ASSIGN_ABILITIES, CHARGEN_END, ...
+    event: String,
+    /// Integer parameters (e.g. [race, 0]; CHARGEN_END takes [mode, quick start]).
+    #[serde(default)]
+    ints: Vec<i32>,
+    /// String parameters (e.g. a name).
+    #[serde(default)]
+    strings: Vec<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -626,6 +643,9 @@ impl Server {
         };
         match open(&opts) {
             Ok(mut sim) => {
+                if a.chargen.as_deref() == Some("manual") {
+                    sim.chargen_policy = thedas_sim::sim::ChargenPolicy::Manual;
+                }
                 sim.tick(0);
                 let area = sim.world.area;
                 let objects: Vec<J> = sim
@@ -885,6 +905,25 @@ impl Server {
         self.with_sim(|st| {
             let sim = st.sim.as_ref().ok_or("no sim")?;
             Ok(dialog_json(sim))
+        })
+    }
+
+    #[tool(
+        description = "Send a character-generation event for the creature in character generation (after load with chargen=manual), then run the events it causes."
+    )]
+    async fn chargen_event(&self, Parameters(a): Parameters<ChargenArgs>) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            let event = a.event.trim_start_matches("EVENT_TYPE_").to_string();
+            if !sim.chargen_event(&event, a.ints, a.strings) {
+                return Err("no character generation in progress".into());
+            }
+            sim.tick(0);
+            Ok(json!({
+                "chargen_in_progress": sim.world.chargen.is_some(),
+                "area": sim.world.area.map(|x| summary(sim, x)),
+                "conversation": dialog_json(sim),
+            }))
         })
     }
 
