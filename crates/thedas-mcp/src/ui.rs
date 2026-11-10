@@ -14,6 +14,9 @@ use thedas_vfs::Vfs;
 #[derive(Default)]
 pub struct UiWorld {
     gpu: Option<Gpu>,
+    ctx: Option<thedas_render::GpuContext>,
+    /// The level loaded for scene captures: its layout name, resources and renderer.
+    scene: Option<(String, thedas_vfs::Vfs, thedas_render::AreaRenderer)>,
     pub stage: Option<Stage>,
     /// Messages for the engine since the last read.
     pub messages: Vec<GameMessage>,
@@ -24,13 +27,76 @@ impl UiWorld {
         if self.gpu.is_none() {
             let ctx = thedas_render::GpuContext::headless().map_err(|e| e.to_string())?;
             self.gpu = Some(Gpu {
-                instance: ctx.instance,
-                adapter: ctx.adapter,
-                device: ctx.device,
-                queue: ctx.queue,
+                instance: ctx.instance.clone(),
+                adapter: ctx.adapter.clone(),
+                device: ctx.device.clone(),
+                queue: ctx.queue.clone(),
             });
+            self.ctx = Some(ctx);
         }
         self.gpu.clone().ok_or_else(|| "no GPU".to_string())
+    }
+
+    /// Renders the level `layout` from `camera` (RGBA8), loading it on first use. Uses the
+    /// game's Static1 shaders where they translate and the stand-in elsewhere.
+    pub fn render_scene(
+        &mut self,
+        install: &std::path::Path,
+        layout: &str,
+        camera: &thedas_render::Camera,
+        (w, h): (u32, u32),
+    ) -> Result<Rgba, String> {
+        self.gpu()?;
+        let ctx = self.ctx.as_ref().ok_or("no GPU")?;
+        if self.scene.as_ref().map(|s| s.0.as_str()) != Some(layout) {
+            let inst = thedas_vfs::DaoInstall::open(install).map_err(|e| e.to_string())?;
+            let mut vfs = inst
+                .global_vfs(thedas_vfs::install::TextureQuality::High)
+                .map_err(|e| e.to_string())?;
+            inst.mount_level(&mut vfs, layout)
+                .map_err(|e| e.to_string())?;
+            let scene = thedas_render::AreaScene::load(&vfs, layout).map_err(|e| e.to_string())?;
+            let mut programs = thedas_render::ProgramRegistry::default();
+            let filter = thedas_render::d3d::static1_filter();
+            programs.push_front(Box::new(thedas_render::d3d::D3dSource::new(
+                &vfs, &scene, &filter,
+            )));
+            let renderer = thedas_render::AreaRenderer::new(
+                ctx,
+                &vfs,
+                &scene,
+                &programs,
+                thedas_render::gpu::CAPTURE_FORMAT,
+            );
+            self.scene = Some((layout.to_string(), vfs, renderer));
+        }
+        let (_, _, renderer) = self.scene.as_mut().ok_or("no scene")?;
+        let pixels = renderer
+            .capture(ctx, camera, w, h)
+            .map_err(|e| e.to_string())?;
+        Ok(Rgba {
+            width: w,
+            height: h,
+            pixels,
+        })
+    }
+
+    /// The scene (if any) with the open movies over it, as PNG bytes.
+    pub fn compose(&mut self, base: Option<Rgba>, ui: bool) -> Result<Vec<u8>, String> {
+        let size = self.stage.as_ref().map(|s| s.size()).unwrap_or((1280, 720));
+        let mut frame = base.unwrap_or_else(|| Rgba {
+            width: size.0,
+            height: size.1,
+            pixels: [0, 0, 0, 255].repeat(size.0 as usize * size.1 as usize),
+        });
+        if ui {
+            if let Some(stage) = self.stage.as_mut() {
+                if stage.size() == (frame.width, frame.height) {
+                    stage.capture_over(&mut frame).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        thedas_ui::stage::encode_png(&frame).ok_or_else(|| "PNG encoding failed".to_string())
     }
 
     /// The stage, created for `vfs` at `size` if there is none (or the size changed).

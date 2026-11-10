@@ -134,6 +134,16 @@ struct UiInvokeArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct ShotArgs {
+    /// Width in pixels (default 1280; match ui_open's size to see the interface).
+    width: Option<u32>,
+    /// Height in pixels (default 720).
+    height: Option<u32>,
+    /// Draw the open interface movies over the scene (default true).
+    ui: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct UiValuesArgs {
     /// Only keys starting with this prefix.
     prefix: Option<String>,
@@ -586,6 +596,69 @@ impl Server {
         match self.ui_frames(1).await {
             Ok(v) => pretty(v),
             Err(e) => err(e),
+        }
+    }
+
+    #[tool(
+        description = "A picture of what the party sees: the current area's level geometry from a camera behind the hero, with the open interface movies over it (ui=false for the scene alone). Creatures and placeables are not drawn yet."
+    )]
+    async fn screenshot(&self, Parameters(a): Parameters<ShotArgs>) -> CallToolResult {
+        let inputs = {
+            let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            match st.sim.as_mut() {
+                None => Err("no module loaded; call load first".to_string()),
+                Some(sim) => {
+                    let hero = sim
+                        .world
+                        .hero
+                        .and_then(|h| sim.world.get(h))
+                        .map(|h| (h.position, h.facing, h.area));
+                    match (hero, sim.install_root.clone()) {
+                        (Some((pos, facing, Some(area))), Some(root)) => {
+                            match sim.area_layout(area) {
+                                Some(layout) => Ok((root, layout, pos, facing)),
+                                None => Err("the area has no layout".to_string()),
+                            }
+                        }
+                        _ => Err("no hero in an area".to_string()),
+                    }
+                }
+            }
+        };
+        let (root, layout, pos, facing) = match inputs {
+            Ok(x) => x,
+            Err(e) => return CallToolResult::error(vec![ContentBlock::text(err(e))]),
+        };
+        let size = (
+            a.width.unwrap_or(1280).clamp(64, 4096),
+            a.height.unwrap_or(720).clamp(64, 4096),
+        );
+        let ui = a.ui.unwrap_or(true);
+        // Behind and above the hero, looking along its facing, slightly down.
+        let yaw = facing.to_radians();
+        let back = 4.0;
+        let camera = thedas_render::Camera::new(
+            glam::Vec3::new(
+                pos[0] - yaw.cos() * back,
+                pos[1] - yaw.sin() * back,
+                pos[2] + 2.5,
+            ),
+            yaw,
+            -0.3,
+        );
+        let r = self
+            .ui
+            .run(move |w| -> Result<Vec<u8>, String> {
+                let scene = w.render_scene(&root, &layout, &camera, size)?;
+                w.compose(Some(scene), ui)
+            })
+            .await;
+        match r {
+            Ok(Ok(png)) => CallToolResult::success(vec![ContentBlock::image(
+                base64::engine::general_purpose::STANDARD.encode(png),
+                "image/png",
+            )]),
+            Ok(Err(e)) | Err(e) => CallToolResult::error(vec![ContentBlock::text(err(e))]),
         }
     }
 

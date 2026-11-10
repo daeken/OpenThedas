@@ -152,6 +152,17 @@ pub fn route(g: &NavGrid, from: [f32; 3], to: [f32; 3]) -> Option<Vec<[f32; 3]>>
 impl Sim {
     /// The pathing grid of an area (by its object id), loaded once per layout.
     pub fn nav_grid(&mut self, area: thedas_script::vm::ObjectId) -> Option<Arc<NavGrid>> {
+        let name = self.area_layout(area)?;
+        if let Some(g) = self.nav_grids.get(&name) {
+            return g.clone();
+        }
+        let grid = self.load_nav_grid(&name).map(Arc::new);
+        self.nav_grids.insert(name, grid.clone());
+        grid
+    }
+
+    /// The layout (environment level) an area is built on, from its `.are`.
+    pub fn area_layout(&mut self, area: thedas_script::vm::ObjectId) -> Option<String> {
         let name = match self.area_layouts.get(&area) {
             Some(n) => n.clone(),
             None => {
@@ -163,12 +174,7 @@ impl Sim {
                 name
             }
         };
-        if let Some(g) = self.nav_grids.get(&name) {
-            return g.clone();
-        }
-        let grid = self.load_nav_grid(&name).map(Arc::new);
-        self.nav_grids.insert(name, grid.clone());
-        grid
+        Some(name)
     }
 
     fn load_nav_grid(&self, layout: &str) -> Option<NavGrid> {
