@@ -130,6 +130,10 @@ enum Command {
         /// Report how the party and its foes spent the fighting time, and their attacks.
         #[arg(long)]
         activity: bool,
+        /// Harness play beyond the party AI, as a player would: the hero drinks a health
+        /// potion when badly hurt. Numbers from such runs measure the harness, not parity.
+        #[arg(long)]
+        player: bool,
         /// Followers waiting in the party pool get the experience the hero gets (provisional:
         /// no script does it).
         #[arg(long)]
@@ -300,6 +304,7 @@ fn run() -> Result<()> {
             verbose,
             ai_hero,
             activity,
+            player,
             pool_xp,
             fights,
             trace,
@@ -321,6 +326,7 @@ fn run() -> Result<()> {
             verbose,
             ai_hero,
             activity,
+            player,
             pool_xp,
             fights,
             trace_to: trace.as_deref(),

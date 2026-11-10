@@ -49,6 +49,9 @@ pub struct Options<'a> {
     pub ai_hero: bool,
     /// Report how the party and its foes spent the fighting time, and their attacks.
     pub activity: bool,
+    /// Harness play beyond the party AI (see [`drink_if_hurt`]). Measures the harness, not
+    /// parity.
+    pub player: bool,
     /// Followers waiting in the party pool get the hero's experience (provisional).
     pub pool_xp: bool,
     /// End a run ("won") once this many fights are won: every hostile the party saw in the
@@ -227,6 +230,68 @@ fn new_door(sim: &Sim, hero: ObjectId, seen: &[String], prefix: &str) -> Option<
 
 /// Waits (up to 30 s) until every standing party member has 95% of its health, as a player
 /// pauses between fights, stopping if a fight starts.
+/// Harness play (`--player`): a hero below 35% of its health drinks the strongest health
+/// potion it carries (`gen_im_qck_health_*`), through `CommandUseAbility` with the item, as
+/// the quick bar does, at most every 10 s of game time. Not parity: a player's choice.
+fn drink_if_hurt(sim: &mut Sim, hero: ObjectId, last: &mut Option<u64>) {
+    let now = sim.world.time_ms;
+    if last.is_some_and(|t| now < t + 10_000) {
+        return;
+    }
+    let health = thedas_sim::sim::constant(&sim.table, "PROPERTY_DEPLETABLE_HEALTH");
+    let Some(h) = sim.world.get(hero) else {
+        return;
+    };
+    if h.dead
+        || h.commands
+            .first()
+            .is_some_and(|c| c.name == "CommandUseAbility")
+    {
+        return;
+    }
+    let current = h.properties.get(&health).map_or(0.0, |v| v.1);
+    let max = sim.depletable_max(hero, health);
+    if max <= 0.0 || current >= 0.35 * max {
+        return;
+    }
+    let mut potions: Vec<(String, i32)> = h
+        .inventory
+        .iter()
+        .filter_map(|&i| sim.world.get(i))
+        .filter(|i| i.tag.starts_with("gen_im_qck_health"))
+        .map(|i| {
+            (
+                i.tag.clone(),
+                i.fields.get("AbilityID").copied().unwrap_or(0),
+            )
+        })
+        .filter(|p| p.1 > 0)
+        .collect();
+    potions.sort();
+    let Some((tag, ability)) = potions.pop() else {
+        return;
+    };
+    let cmd = thedas_sim::world::Command {
+        ty: thedas_sim::sim::constant(&sim.table, "COMMAND_TYPE_USE_ABILITY"),
+        name: "CommandUseAbility".into(),
+        target: Some(hero),
+        location: None,
+        seconds: 0.0,
+        ints: vec![ability],
+        strings: vec![tag],
+        due: None,
+        from: None,
+        approach: None,
+        ring_wait: false,
+        path: Vec::new(),
+    };
+    if let Some(o) = sim.world.get_mut(hero) {
+        o.commands.clear();
+        o.commands.push(cmd);
+    }
+    *last = Some(now);
+}
+
 fn rest(sim: &mut Sim, hero: ObjectId) {
     let health = 7;
     for _ in 0..30 {
@@ -316,6 +381,7 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
     let mut seen: Option<(u64, Vec<usize>, Vec<usize>)> = None;
     let mut party_ids: Vec<ObjectId> = Vec::new();
     let (mut fight_ms, mut fights_won, mut last_t) = (0u64, 0u32, sim.world.time_ms);
+    let mut last_potion: Option<u64> = None;
     let mut engaged: std::collections::BTreeSet<ObjectId> = std::collections::BTreeSet::new();
     let end;
     loop {
@@ -432,6 +498,9 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
         if dead {
             sim.tick(1000);
             continue;
+        }
+        if o.player && sim.world.party_fighting {
+            drink_if_hurt(sim, hero, &mut last_potion);
         }
         let hostiles: Vec<ObjectId> = sim
             .world
