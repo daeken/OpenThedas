@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use thedas_vfs::Vfs;
 
-use crate::protocol::{GameBridge, GameMessage, LAYOUT, START_SCENE};
+use crate::protocol::{FINISH_SCENE, GameBridge, GameMessage, LAYOUT, START_SCENE};
 use crate::{Gpu, ImageSource, ResourceLookup, Rgba, UiError, UiMovie, UiValue};
 
 /// Movie sets by name (`menu`, `hud`); anything else is a comma-separated list of movie names.
@@ -234,18 +234,37 @@ impl Stage {
     }
 
     /// Advances every movie; returns the messages meant for the rest of the engine.
+    ///
+    /// A movie that asks for its full-screen interface to be hidden (`GUI.HideFullScreenGUI`,
+    /// e.g. the world map's close button) is finished as the game finishes it, with
+    /// `GUISystem.FinishSceneFromGame` (the movie's own closing messages, such as
+    /// `WorldMap.WorldMapClosed`, are returned too), then closed. Provisional: inferred from
+    /// the movies, which send the message and close themselves only in that function.
     pub fn tick(&mut self, dt_ms: f64) -> Vec<GameMessage> {
         let mut out = Vec::new();
         let bridge = self.bridge.clone();
+        let mut finished = Vec::new();
         for m in &mut self.movies {
             let missing = m.sync_tokens(&|t| bridge.value(t));
             bridge.note_unanswered(missing);
             m.tick(dt_ms);
-            out.extend(
-                m.drain_calls()
-                    .into_iter()
-                    .filter_map(|c| self.bridge.handle(c)),
-            );
+            let messages: Vec<GameMessage> = m
+                .drain_calls()
+                .into_iter()
+                .filter_map(|c| self.bridge.handle(c))
+                .collect();
+            if messages.iter().any(is_hide_request) {
+                m.call(FINISH_SCENE, &[]);
+                out.extend(messages);
+                out.extend(
+                    m.drain_calls()
+                        .into_iter()
+                        .filter_map(|c| self.bridge.handle(c)),
+                );
+                finished.push(m.name.clone());
+            } else {
+                out.extend(messages);
+            }
             for line in m.drain_log() {
                 log::debug!("ui: {}: {line}", m.name);
                 self.log.push(format!("{}: {line}", m.name));
@@ -254,6 +273,7 @@ impl Stage {
                 self.log.drain(..self.log.len() - 500);
             }
         }
+        self.movies.retain(|m| !finished.contains(&m.name));
         out
     }
 
@@ -301,6 +321,11 @@ impl Stage {
         }
         Ok(())
     }
+}
+
+/// `GUI.HideFullScreenGUI`: the movie asks the game to take its screen away.
+fn is_hide_request(m: &GameMessage) -> bool {
+    matches!(m, GameMessage::Send(n, _) if n == "GUI.HideFullScreenGUI")
 }
 
 #[cfg(test)]

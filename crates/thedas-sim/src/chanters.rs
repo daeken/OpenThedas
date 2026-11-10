@@ -152,7 +152,7 @@ impl Sim {
                 }
             }
             MSG_CLEAR => self.world.chanter_board.take().is_some(),
-            _ => false,
+            _ => self.world_map_message(name, args),
         }
     }
 }

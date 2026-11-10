@@ -2204,12 +2204,14 @@ pub fn call(
             h.sim.world.world_map.player_pin = Some(obj(a, 1));
             void()
         }
-        "SetWorldMapPrimary" => {
-            h.sim.world.world_map.primary = Some(obj(a, 0));
-            void()
-        }
-        "SetWorldMapSecondary" => {
-            h.sim.world.world_map.secondary = Some(obj(a, 0));
+        // Scripts clear the secondary map with OBJECT_INVALID.
+        "SetWorldMapPrimary" | "SetWorldMapSecondary" => {
+            let map = Some(obj(a, 0)).filter(|&m| h.sim.is_world_map(m));
+            if name == "SetWorldMapPrimary" {
+                h.sim.world.world_map.primary = map;
+            } else {
+                h.sim.world.world_map.secondary = map;
+            }
             void()
         }
         "SetWorldMapGuiStatus" => {
@@ -2232,6 +2234,7 @@ pub fn call(
             if area.is_empty() {
                 h.sim.finish_travel();
             } else {
+                h.sim.world.world_map.encounter = true;
                 h.sim.world.transition = Some((area, string(a, 1)));
             }
             void()
