@@ -492,6 +492,17 @@ fn check_data(
         (_, "rml") => Some(s(Rml::from_gff4(&doc).map(|_| ()))),
         (_, "mmh") => Some(s(Mmh::from_gff4(&doc).map(|_| ()))),
         (_, "msh") => Some(s(Msh::from_gff4(&doc).map(|_| ()))),
+        (_, "dlg") => Some(
+            thedas_sim::dialog::Dlg::from_gff4(&doc, "")
+                .map(|_| ())
+                .ok_or_else(|| format!("not a conversation (file type {})", doc.file_type)),
+        ),
+        (_, "plo") => Some(if &doc.file_type.0 == b"PLTS" {
+            let _ = thedas_sim::plot::plots_from_gff4(&doc, "");
+            Ok(())
+        } else {
+            Err(format!("not a plot file (file type {})", doc.file_type))
+        }),
         _ => None,
     };
     if let Some(result) = typed {

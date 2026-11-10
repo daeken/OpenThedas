@@ -3,6 +3,7 @@
 mod corpus;
 mod dump;
 mod script;
+mod sim;
 
 use std::path::{Path, PathBuf};
 
@@ -40,6 +41,9 @@ enum Command {
         /// Print GDA and TLK files as their raw GFF4 tree.
         #[arg(long)]
         raw: bool,
+        /// Look `target` up by resource name in this install's resource stack.
+        #[arg(long)]
+        install: Option<PathBuf>,
     },
     /// Show which layers of an install provide a resource, winner first.
     Resolve {
@@ -53,6 +57,34 @@ enum Command {
     Script {
         #[command(subcommand)]
         command: ScriptCommand,
+    },
+    /// Run the headless simulation: load a module and area, tick, report.
+    Sim {
+        install: PathBuf,
+        /// Module folder under `modules/`.
+        #[arg(long, default_value = "single player")]
+        module: String,
+        /// Area resource (e.g. cir110ar_inn); defaults to the module's start area.
+        #[arg(long)]
+        area: Option<String>,
+        /// Waypoint tag to place the hero at.
+        #[arg(long)]
+        waypoint: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        ticks: u64,
+        #[arg(long, default_value_t = 50)]
+        tick_ms: u64,
+        /// Write the trace as JSON lines here.
+        #[arg(long)]
+        trace: Option<PathBuf>,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Talk to the creature with this tag after ticking.
+        #[arg(long)]
+        talk: Option<String>,
+        /// Replies to pick, by index, in order (default: always the first).
+        #[arg(long, value_delimiter = ',')]
+        replies: Vec<usize>,
     },
     /// Open every archive in an install and parse every GFF4-family resource.
     Corpus {
@@ -121,8 +153,20 @@ fn run() -> Result<()> {
             names,
             out,
         } => extract(&archive, &names, &out),
-        Command::Dump { target, raw } => {
-            let data = load_target(&target)?;
+        Command::Dump {
+            target,
+            raw,
+            install,
+        } => {
+            let data = match install {
+                Some(root) => {
+                    let vfs = DaoInstall::open(&root)?.global_vfs(TextureQuality::High)?;
+                    vfs.read(&target)
+                        .with_context(|| format!("{target}: not in the resource stack"))?
+                        .0
+                }
+                None => load_target(&target)?,
+            };
             dump::dump(&data, raw, &mut std::io::stdout().lock())
         }
         Command::Resolve {
@@ -139,6 +183,29 @@ fn run() -> Result<()> {
             } => script::run(&install, &script, caller),
             ScriptCommand::Stats { install, report } => script::stats(&install, report.as_deref()),
         },
+        Command::Sim {
+            install,
+            module,
+            area,
+            waypoint,
+            ticks,
+            tick_ms,
+            trace,
+            seed,
+            talk,
+            replies,
+        } => sim::run(&sim::Options {
+            install: &install,
+            module: &module,
+            area: area.as_deref(),
+            waypoint: waypoint.as_deref(),
+            ticks,
+            tick_ms,
+            trace: trace.as_deref(),
+            seed,
+            talk: talk.as_deref(),
+            replies: &replies,
+        }),
         Command::Corpus {
             paths,
             report,

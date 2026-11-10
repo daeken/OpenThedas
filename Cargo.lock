@@ -2082,6 +2082,7 @@ dependencies = [
  "thedas-formats",
  "thedas-script",
  "thedas-shader",
+ "thedas-sim",
  "thedas-vfs",
 ]
 
@@ -2122,6 +2123,18 @@ name = "thedas-shader"
 version = "0.1.0"
 dependencies = [
  "naga",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "thedas-sim"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thedas-formats",
+ "thedas-script",
+ "thedas-vfs",
  "thiserror 2.0.21",
 ]
 
