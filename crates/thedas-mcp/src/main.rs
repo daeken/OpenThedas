@@ -1578,6 +1578,7 @@ impl Server {
                 due: None,
                 from: None,
                 approach: None,
+                ring_wait: false,
             };
             if let Some(o) = sim.world.get_mut(hero) {
                 o.commands.clear();
