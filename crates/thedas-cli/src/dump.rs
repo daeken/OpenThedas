@@ -1,17 +1,24 @@
-//! Readable dumps of GFF4, GDA and TLK resources.
+//! Readable dumps of GFF4, GFF3, GDA and TLK resources.
 
 use std::io::Write;
 
 use anyhow::{Result, bail};
 use serde_json::{Map, Value as Json, json};
 use thedas_formats::gda::Cell;
+use thedas_formats::gff3::{self, Gff3, is_gff3};
 use thedas_formats::gff4::{GenericSlot, Gff4, List, StructId, Value, is_gff4};
 use thedas_formats::{Gda, Tlk};
 
 pub fn dump(data: &[u8], raw: bool, out: &mut impl Write) -> Result<()> {
+    if is_gff3(data) {
+        let doc = Gff3::parse(data)?;
+        serde_json::to_writer_pretty(&mut *out, &gff3_json(&doc))?;
+        writeln!(out)?;
+        return Ok(());
+    }
     if !is_gff4(data) {
         bail!(
-            "not a GFF4 file (first bytes {:02x?})",
+            "not a GFF3 or GFF4 file (first bytes {:02x?})",
             &data[..data.len().min(8)]
         );
     }
@@ -144,5 +151,105 @@ fn list_json(doc: &Gff4, l: &List, seen: &mut [bool]) -> Json {
                 .collect(),
         ),
         List::Generic(v) => Json::Array(v.iter().map(|s| slot_json(doc, s, seen)).collect()),
+    }
+}
+
+/// A GFF3 document as JSON. Fields keep their labels; each struct shows its type id. Struct
+/// references that would revisit a struct already on the current path print as
+/// `{"$ref": n}`, so malformed cyclic files still terminate.
+pub fn gff3_json(doc: &Gff3) -> Json {
+    let mut path = vec![false; doc.structs.len()];
+    json!({
+        "file_type": String::from_utf8_lossy(&doc.file_type),
+        "file_version": String::from_utf8_lossy(&doc.file_version),
+        "root": gff3_struct(doc, 0, &mut path),
+    })
+}
+
+fn gff3_struct(doc: &Gff3, index: u32, path: &mut [bool]) -> Json {
+    let Some(st) = doc.structs.get(index as usize) else {
+        return json!({ "$missing": index });
+    };
+    if std::mem::replace(&mut path[index as usize], true) {
+        return json!({ "$ref": index });
+    }
+    let mut m = Map::new();
+    m.insert("$struct".into(), json!(format!("{:#x} #{index}", st.id)));
+    for f in &st.fields {
+        m.insert(f.label.clone(), gff3_value(doc, &f.value, path));
+    }
+    path[index as usize] = false;
+    Json::Object(m)
+}
+
+fn gff3_value(doc: &Gff3, v: &gff3::Value, path: &mut [bool]) -> Json {
+    use gff3::Value as V;
+    let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    match v {
+        V::Byte(x) => json!(x),
+        V::Char(x) => json!(x),
+        V::Word(x) => json!(x),
+        V::Short(x) => json!(x),
+        V::Dword(x) => json!(x),
+        V::Int(x) => json!(x),
+        V::Dword64(x) => json!(x),
+        V::Int64(x) => json!(x),
+        V::Float(x) => json!(f64::from(*x)),
+        V::Double(x) => json!(x),
+        V::ExoString(b) => json!(text(b)),
+        V::ResRef(b) => json!({ "resref": text(b) }),
+        V::LocString(l) => json!({
+            "strref": l.strref,
+            "strings": l.strings.iter().map(|(id, b)| json!({ "id": id, "text": text(b) })).collect::<Vec<_>>(),
+        }),
+        V::Void(b) if b.len() > 64 => json!(format!("<{} bytes>", b.len())),
+        V::Void(b) => json!({ "void": b }),
+        V::Struct(i) => gff3_struct(doc, *i, path),
+        V::List(items) => Json::Array(items.iter().map(|&i| gff3_struct(doc, i, path)).collect()),
+        V::Orientation(q) => floats(q),
+        V::Vector(v) => floats(v),
+        V::StrRef(r) => json!({ "strref": r }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thedas_formats::gff3::{Field, Struct, Value as V};
+
+    #[test]
+    fn gff3_json_follows_lists_and_stops_on_cycles() {
+        let doc = Gff3 {
+            file_type: *b"ARE ",
+            file_version: *b"V3.2",
+            structs: vec![
+                Struct {
+                    id: 0xFFFF_FFFF,
+                    fields: vec![
+                        Field {
+                            label: "Layout".into(),
+                            value: V::ExoString(b"abc123d".to_vec()),
+                        },
+                        Field {
+                            label: "List".into(),
+                            value: V::List(vec![1]),
+                        },
+                    ],
+                },
+                Struct {
+                    id: 4,
+                    fields: vec![Field {
+                        label: "Back".into(),
+                        value: V::Struct(0),
+                    }],
+                },
+            ],
+        };
+        let j = gff3_json(&doc);
+        assert_eq!(j["root"]["Layout"], "abc123d");
+        assert_eq!(j["root"]["List"][0]["Back"]["$ref"], 0);
+        let mut out = Vec::new();
+        dump(&doc.write().unwrap(), false, &mut out).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains("abc123d"));
     }
 }

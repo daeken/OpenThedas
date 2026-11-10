@@ -32,7 +32,8 @@ enum Command {
         #[arg(short, long, default_value = ".")]
         out: PathBuf,
     },
-    /// Print a resource in readable form. Use `archive.erf:entry.gda` for an archive entry.
+    /// Print a resource in readable form (GFF3 and GFF4 as JSON, GDA and TLK as tables). Use
+    /// `archive.erf:entry.gda` for an archive entry.
     Dump {
         target: String,
         /// Print GDA and TLK files as their raw GFF4 tree.
