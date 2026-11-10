@@ -731,8 +731,8 @@ impl App {
                 .as_ref()
                 .is_some_and(screens::Screens::in_cutscene)
         {
-            if let Some(g) = self.gfx.as_mut() {
-                g.ui.skip_cutscene();
+            if let Some(live) = self.live.as_ref() {
+                live.sim().skip_cutscene();
             }
             return;
         }
@@ -1354,9 +1354,9 @@ fn main() -> Result<()> {
                         }
                     }
                     &Step::Click(x, y) => {
-                        if let Some((layer, s)) = played.as_mut().filter(|(_, s)| s.in_cutscene()) {
-                            layer.skip_cutscene();
-                            println!("click {x},{y}: skips the cutscene ({:?})", s.shown());
+                        if played.as_ref().is_some_and(|(_, s)| s.in_cutscene()) {
+                            l.sim().skip_cutscene();
+                            println!("click {x},{y}: skips the cutscene");
                             continue;
                         }
                         let to_world = match played.as_mut() {

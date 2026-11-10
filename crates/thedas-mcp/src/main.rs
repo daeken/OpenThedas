@@ -909,6 +909,7 @@ impl Server {
             waypoint: a.waypoint,
             seed: a.seed.unwrap_or(1),
             keep_trace: true,
+            cutscenes: Default::default(),
         };
         match open(&opts) {
             Ok(mut sim) => {
@@ -1930,6 +1931,7 @@ impl Server {
                     waypoint: None,
                     seed: 1,
                     keep_trace: true,
+                    cutscenes: Default::default(),
                 })
                 .map_err(|e| e.to_string())?;
                 st.sim = Some(sim);

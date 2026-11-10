@@ -187,9 +187,10 @@ pub enum CutscenePolicy {
     /// End it at once, as if it had played (headless runs: nobody watches).
     #[default]
     Skip,
-    /// Hold it as [`crate::world::World::cutscene`] for a presentation to show (its lines
-    /// said, for as long as it runs) and then end with [`Sim::finish_cutscene`]. A cutscene
-    /// that cannot be read ends at once.
+    /// Play it as [`crate::world::World::cutscene`]: the world stands still while its clock
+    /// runs its length on the simulation's ticks (a presentation shows the line being said,
+    /// [`crate::cutscene::Cutscene::line_now`]), then it ends; [`Sim::skip_cutscene`] ends it
+    /// early. A cutscene that cannot be read ends at once.
     Play,
 }
 
@@ -485,9 +486,19 @@ impl Sim {
 
     /// Advances time by `ms`, delivering every event that falls due and running commands.
     pub fn tick(&mut self, ms: u64) {
+        // A cutscene playing holds the world still: its own clock runs instead, and what
+        // is left of the tick once it ends goes on as usual.
+        let ms = match self.world.cutscene.is_some() {
+            true => match self.run_cutscene(ms) {
+                Some(left) => left,
+                None => return,
+            },
+            false => ms,
+        };
         let start = self.world.time_ms;
-        let until = start + ms;
+        let mut until = start + ms;
         self.update_perception();
+        let mut held = 0;
         loop {
             // Engine work that waits for the current scripts: transitions, then cutscenes.
             if let Some((area, waypoint)) = self.world.transition.take() {
@@ -511,7 +522,10 @@ impl Sim {
                             ),
                         });
                         self.world.cutscene = Some(c);
-                        continue;
+                        // The world stops here; the rest of the tick plays the cutscene.
+                        held = until - self.world.time_ms;
+                        until = self.world.time_ms;
+                        break;
                     }
                 }
                 self.end_cutscene(&name);
@@ -566,6 +580,28 @@ impl Sim {
         self.expire_effects();
         self.world.destroy_due();
         self.autopilot_idle_hero();
+        if held > 0 {
+            self.tick(held);
+        }
+    }
+
+    /// Runs the playing cutscene's clock `ms`; once it has run its length it ends, and the
+    /// milliseconds left over are returned (`None` while it still plays).
+    fn run_cutscene(&mut self, ms: u64) -> Option<u64> {
+        let c = self.world.cutscene.as_mut()?;
+        c.elapsed_ms += ms;
+        let length = (c.seconds as f64 * 1000.0).ceil() as u64;
+        if c.elapsed_ms < length {
+            return None;
+        }
+        let left = c.elapsed_ms - length;
+        self.finish_cutscene();
+        Some(left)
+    }
+
+    /// The player skips the cutscene playing: it ends now.
+    pub fn skip_cutscene(&mut self) {
+        self.finish_cutscene();
     }
 
     /// Ends a cutscene the way the engine does when one finishes playing. Provisional, inferred
@@ -576,9 +612,9 @@ impl Sim {
         self.close_cutscene(name, false);
     }
 
-    /// The cutscene playing has been shown (or the player skipped it): it ends as
+    /// The cutscene playing has run (or the player skipped it): it ends as
     /// [`Sim::end_cutscene`] says, and the next one loaded may start.
-    pub fn finish_cutscene(&mut self) {
+    fn finish_cutscene(&mut self) {
         if let Some(c) = self.world.cutscene.take() {
             self.close_cutscene(&c.name, true);
         }
@@ -2509,7 +2545,7 @@ mod tests {
     }
 
     #[test]
-    fn a_played_cutscene_holds_the_next_until_it_is_finished() {
+    fn a_played_cutscene_holds_the_world_for_its_length() {
         let mut s = sim();
         s.cutscene_policy = CutscenePolicy::Play;
         let m = with_module(&mut s);
@@ -2517,27 +2553,44 @@ mod tests {
         s.world.cutscenes.push("missing".into());
         s.tick(0);
         assert!(s.world.cutscenes.is_empty() && s.world.cutscene.is_none());
-        // One playing: what it sets waits for it to be finished, and so does the next.
-        s.world.cutscene = Some(crate::cutscene::Cutscene {
+        let playing = |seconds| crate::cutscene::Cutscene {
             name: "intro.cut".into(),
-            seconds: 5.0,
-            lines: Vec::new(),
-        });
+            seconds,
+            lines: vec![crate::cutscene::CutsceneLine {
+                start: 1.0,
+                end: 2.0,
+                strref: 7,
+                actor: "duncan".into(),
+            }],
+            elapsed_ms: 0,
+        };
+        // While one plays the world stands still; what it sets waits for its end, and so
+        // does the next one loaded.
+        s.world.cutscene = Some(playing(5.0));
         let l = &mut s.world.get_mut(m).unwrap().locals;
         l.strings.insert("CUTSCENE_SET_PLOT".into(), "ABC".into());
         l.ints.insert("CUTSCENE_SET_PLOT_FLAG".into(), 13);
         s.world.cutscenes.push("next".into());
-        s.tick(1000);
+        let t0 = s.world.time_ms;
+        s.tick(1500);
+        assert_eq!(s.world.time_ms, t0);
+        let c = s.world.cutscene.as_ref().unwrap();
+        assert_eq!(c.line_now().map(|l| l.strref), Some(7));
         assert_eq!(s.world.cutscenes, ["next"]);
         assert!(s.world.plots.is_empty());
-        s.finish_cutscene();
+        // It ends at its length; the rest of the tick runs the world.
+        s.tick(4000);
+        assert!(s.world.cutscene.is_none() && s.world.cutscenes.is_empty());
+        assert_eq!(s.world.time_ms, t0 + 500);
         assert_eq!(s.world.plots.get(&("ABC".to_string(), 13)), Some(&true));
-        s.tick(0);
-        assert!(s.world.cutscenes.is_empty() && s.world.cutscene.is_none());
         assert!(s.world.trace.entries.iter().any(|e| matches!(
             e,
             TraceEntry::Log { text, .. } if text == "cutscene intro.cut ends"
         )));
+        // The player may skip one.
+        s.world.cutscene = Some(playing(60.0));
+        s.skip_cutscene();
+        assert!(s.world.cutscene.is_none());
     }
 
     #[test]

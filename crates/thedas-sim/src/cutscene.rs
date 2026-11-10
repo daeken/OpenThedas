@@ -33,8 +33,7 @@ pub struct CutsceneLine {
     pub actor: String,
 }
 
-/// A cutscene playing: the presentation shows it and then finishes it
-/// ([`crate::sim::Sim::finish_cutscene`]).
+/// A cutscene, and how far it has played.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Cutscene {
     /// The resource, e.g. `pre100cs_intro.cut`.
@@ -42,6 +41,9 @@ pub struct Cutscene {
     pub seconds: f32,
     /// By start time.
     pub lines: Vec<CutsceneLine>,
+    /// Milliseconds it has played.
+    #[serde(default)]
+    pub elapsed_ms: u64,
 }
 
 impl Cutscene {
@@ -109,7 +111,13 @@ impl Cutscene {
             name: Self::resource(name),
             seconds,
             lines,
+            elapsed_ms: 0,
         })
+    }
+
+    /// The line being said now, as far as it has played.
+    pub fn line_now(&self) -> Option<&CutsceneLine> {
+        self.line_at(self.elapsed_ms as f32 / 1000.0)
     }
 
     /// The line showing `seconds` into the cutscene, if any.

@@ -42,10 +42,10 @@ impl Screen {
         }
     }
 
-    /// A menu the world waits behind (everything but the HUD and conversations; a cutscene
-    /// holds the world while it plays).
+    /// A menu the world waits behind (everything but the HUD, conversations and cutscenes:
+    /// a cutscene runs on the simulation's ticks, which hold the world still meanwhile).
     pub fn stops_the_world(self) -> bool {
-        !matches!(self, Screen::Hud | Screen::Conversation)
+        !matches!(self, Screen::Hud | Screen::Conversation | Screen::Cutscene)
     }
 }
 
@@ -237,8 +237,10 @@ mod tests {
             name: "intro.cut".into(),
             seconds: 1.0,
             lines: Vec::new(),
+            elapsed_ms: 0,
         });
         assert_eq!(wanted(&sim, true), set(&[Screen::Cutscene]));
-        assert!(Screen::Cutscene.stops_the_world());
+        // The simulation holds the world itself while its cutscene's clock runs.
+        assert!(!Screen::Cutscene.stops_the_world());
     }
 }

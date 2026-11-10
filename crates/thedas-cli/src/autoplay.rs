@@ -590,6 +590,7 @@ pub fn run(o: &Options) -> Result<()> {
         waypoint: None,
         seed: 1,
         keep_trace: false,
+        cutscenes: Default::default(),
     })
     .with_context(|| format!("opening module {}", o.module))?;
     let mut runs = Vec::new();

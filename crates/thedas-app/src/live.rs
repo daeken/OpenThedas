@@ -86,6 +86,7 @@ impl Live {
             waypoint: None,
             seed: 1,
             keep_trace: false,
+            cutscenes: thedas_sim::sim::CutscenePolicy::Play,
         };
         let mut sim = thedas_sim::session::open(&opts)?;
         if let Start::Save(path) = start {
@@ -93,10 +94,8 @@ impl Live {
                 std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
             sim.load_json(&bytes)?;
         }
-        // The player is in control (saves made by test drivers may have the autopilot on),
-        // and watches the cutscenes scripts load.
+        // The player is in control (saves made by test drivers may have the autopilot on).
         sim.world.autopilot = false;
-        sim.cutscene_policy = thedas_sim::sim::CutscenePolicy::Play;
         Ok(Self {
             sim: Arc::new(Mutex::new(sim)),
             paused: false,
