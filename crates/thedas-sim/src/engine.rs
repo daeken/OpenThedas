@@ -110,11 +110,11 @@ fn cell_int(c: Option<&Cell>) -> i32 {
 }
 
 /// GDA strings carry a trailing NUL and sometimes padding.
-fn clean(s: &str) -> &str {
+pub(crate) fn clean(s: &str) -> &str {
     s.trim_matches(|c: char| c == '\0' || c.is_whitespace())
 }
 
-fn cell_float(c: Option<&Cell>) -> f32 {
+pub(crate) fn cell_float(c: Option<&Cell>) -> f32 {
     match c {
         Some(Cell::Int(v)) => *v as f32,
         Some(Cell::Float(v)) => *v as f32,
@@ -123,7 +123,7 @@ fn cell_float(c: Option<&Cell>) -> f32 {
     }
 }
 
-fn cell_string(c: Option<&Cell>) -> String {
+pub(crate) fn cell_string(c: Option<&Cell>) -> String {
     match c {
         Some(Cell::Int(v)) => v.to_string(),
         Some(Cell::Float(v)) => v.to_string(),
@@ -601,18 +601,26 @@ pub fn call(
                 Some(EngineData::Location(l)) => Some(*l),
                 _ => None,
             };
-            let id = h.sim.world.spawn(kind, &template);
+            let (area, pos, facing) = match loc {
+                Some(l) => (Some(l.area), l.position, l.facing),
+                None => (None, [0.0; 3], 0.0),
+            };
+            let id = h
+                .sim
+                .create_from_template(kind, &template, area, pos, facing);
+            let active = a.get(4).is_none_or(|_| int(a, 4) != 0);
             if let Some(o) = h.sim.world.get_mut(id) {
-                o.template = template;
-                if let Some(l) = loc {
-                    o.area = Some(l.area);
-                    o.position = l.position;
-                    o.facing = l.facing;
-                }
                 let script = string(a, 3);
                 if !script.is_empty() {
                     o.script = Some(script);
                 }
+                o.active = active;
+            }
+            // Created creatures and placeables hear EVENT_TYPE_SPAWN, as those an area loads
+            // do.
+            if matches!(kind, ObjectKind::Creature | ObjectKind::Placeable) {
+                let ev = h.sim.new_event("SPAWN", Some(id));
+                h.sim.world.queue_event(0, id, ev, None);
             }
             ok(Value::Object(id))
         }
@@ -1272,6 +1280,8 @@ pub fn call(
                 ints: Vec::new(),
                 strings: Vec::new(),
                 due: None,
+                from: None,
+                approach: None,
             };
             for (p, v) in f.params.iter().zip(a) {
                 match (&p.ty, v) {
@@ -1869,7 +1879,61 @@ pub fn call(
             });
             void()
         }
-        "GetActiveWeaponSet" => ok(Value::Int(0)),
+        // The active weapon set (0 or 1). Provisional: the simulation keeps one set of
+        // equipment, so switching records the set without swapping items.
+        "GetActiveWeaponSet" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .and_then(|o| o.fields.get("ActiveWeaponSet").copied())
+                .unwrap_or(0),
+        )),
+        "SwitchWeaponSet" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                let now = o.fields.get("ActiveWeaponSet").copied().unwrap_or(0);
+                let to = match int(a, 1) {
+                    s @ (0 | 1) => s,
+                    _ => 1 - now,
+                };
+                o.fields.insert("ActiveWeaponSet".into(), to);
+            }
+            void()
+        }
+        // The plot actions control (world state the interface shows).
+        "SetPlotActionSet" => {
+            h.sim.world.plot_actions.set = int(a, 0);
+            void()
+        }
+        "SetPlotActionsEnabled" => {
+            h.sim.world.plot_actions.disabled = int(a, 0) == 0;
+            void()
+        }
+        "SetPlotActionState" => {
+            h.sim.world.plot_actions.states.insert(int(a, 0), int(a, 1));
+            void()
+        }
+        "GetPlotActionState" => ok(Value::Int(
+            h.sim
+                .world
+                .plot_actions
+                .states
+                .get(&int(a, 0))
+                .copied()
+                .unwrap_or(0),
+        )),
+        "SetPlotActionCount" => {
+            h.sim.world.plot_actions.counts.insert(int(a, 0), int(a, 1));
+            void()
+        }
+        "GetPlotActionCount" => ok(Value::Int(
+            h.sim
+                .world
+                .plot_actions
+                .counts
+                .get(&int(a, 0))
+                .copied()
+                .unwrap_or(0),
+        )),
+        // Pools only make creatures ahead of time; CreateObject makes them either way.
+        "CreatePool" => ok(Value::Int(1)),
         "GetCreatureGoreLevel" => ok(Value::Float(0.0)),
         "GetCreaturePropertyType" => ok(Value::Int(
             h.sim
@@ -2876,7 +2940,11 @@ mod tests {
         void ShowPopup(int s, int t, object o, int b = FALSE, int d = 0) = 13;\n\
         void OpenStore(object o) = 14;\n\
         int GetMaxInventorySize(object o) = 15;\n\
-        void SetMaxInventorySize(int n, object o) = 16;\n";
+        void SetMaxInventorySize(int n, object o) = 16;\n\
+        void SwitchWeaponSet(object o, int n = -1) = 17;\n\
+        int GetActiveWeaponSet(object o) = 18;\n\
+        void SetPlotActionState(int a, int s) = 19;\n\
+        int GetPlotActionState(int a) = 20;\n";
 
     /// Calls engine function `name` as `caller`.
     fn run(s: &mut Sim, caller: ObjectId, name: &str, a: &[Value]) -> Option<Value> {
@@ -2887,6 +2955,43 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn weapon_sets_and_plot_actions_are_remembered() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let set = |s: &mut Sim| run(s, c, "GetActiveWeaponSet", &[Value::Object(c)]);
+        assert_eq!(set(&mut s), Some(Value::Int(0)));
+        run(
+            &mut s,
+            c,
+            "SwitchWeaponSet",
+            &[Value::Object(c), Value::Int(-1)],
+        );
+        assert_eq!(
+            set(&mut s),
+            Some(Value::Int(1)),
+            "no set given: the other one"
+        );
+        run(
+            &mut s,
+            c,
+            "SwitchWeaponSet",
+            &[Value::Object(c), Value::Int(1)],
+        );
+        assert_eq!(set(&mut s), Some(Value::Int(1)));
+        run(
+            &mut s,
+            c,
+            "SetPlotActionState",
+            &[Value::Int(4), Value::Int(2)],
+        );
+        assert_eq!(
+            run(&mut s, c, "GetPlotActionState", &[Value::Int(4)]),
+            Some(Value::Int(2))
+        );
     }
 
     #[test]
