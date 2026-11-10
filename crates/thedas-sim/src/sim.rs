@@ -1023,11 +1023,16 @@ impl Sim {
                         {
                             continue;
                         }
+                        // A ranged attack aims first (SetAimLoopDuration), then shoots.
                         Some(
                             self.world
                                 .get(id)
-                                .and_then(|o| o.combat.attack_ms)
-                                .unwrap_or(crate::combat::DEFAULT_ATTACK_MS),
+                                .map_or(crate::combat::DEFAULT_ATTACK_MS, |o| {
+                                    o.combat
+                                        .attack_ms
+                                        .unwrap_or(crate::combat::DEFAULT_ATTACK_MS)
+                                        + o.combat.aim_ms.unwrap_or(0)
+                                }),
                         )
                     } else {
                         None

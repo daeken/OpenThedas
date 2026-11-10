@@ -9,7 +9,8 @@
 //! tables) first and at the start. It does not drink potions itself.
 //!
 //! Each run loads the save, reseeds the simulation's generator with the run's seed and plays
-//! until a plot flag is set, an area is reached, or the time limit. The report gives hero
+//! until a plot flag is set, an area is reached, the whole party falls (a wipe: game over),
+//! or the time limit. The report gives hero
 //! deaths (mean, spread, range) and, for each watched creature, how often it was alive at
 //! fixed times after a marker flag (or the start).
 
@@ -51,6 +52,8 @@ struct RunResult {
     ms: u64,
     /// For each sample time, which watched creatures were alive.
     samples: Vec<Vec<bool>>,
+    /// When each watched creature fell, in seconds from the mark (negative: before it).
+    died: Vec<Option<f64>>,
 }
 
 fn parse_flag(s: &str) -> Result<(String, i32)> {
@@ -97,6 +100,21 @@ fn nearest_hostile(sim: &Sim, hero: ObjectId) -> Option<ObjectId> {
 
 fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+}
+
+/// A point at most four metres from the hero towards `to`.
+fn leg(sim: &Sim, hero: ObjectId, to: [f32; 3]) -> [f32; 3] {
+    let from = sim.world.get(hero).map_or(to, |h| h.position);
+    let d = dist(from, to);
+    if d <= 4.0 {
+        return to;
+    }
+    let f = 4.0 / d;
+    [
+        from[0] + (to[0] - from[0]) * f,
+        from[1] + (to[1] - from[1]) * f,
+        from[2] + (to[2] - from[2]) * f,
+    ]
 }
 
 /// A door in the hero's area to an area not yet visited.
@@ -167,6 +185,7 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
         })
         .collect();
     let mut samples: Vec<Vec<bool>> = Vec::new();
+    let mut died_at: Vec<Option<u64>> = vec![None; watch.len()];
     let mut seen_areas = vec![area_tag(sim)];
     let mut target: Option<ObjectId> = None;
     let mut deaths = 0;
@@ -177,6 +196,11 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
         let now = sim.world.time_ms;
         if mark.is_none() && mark_flag.as_ref().is_some_and(|f| flag(sim, f)) {
             mark = Some(now);
+        }
+        for (i, w) in watch.iter().enumerate() {
+            if died_at[i].is_none() && w.is_some_and(|w| sim.world.get(w).is_some_and(|o| o.dead)) {
+                died_at[i] = Some(now);
+            }
         }
         if let Some(m) = mark {
             while samples.len() < o.at.len() && now >= m + o.at[samples.len()] * 1000 {
@@ -202,6 +226,10 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
         }
         if now >= deadline {
             end = "time".to_string();
+            break;
+        }
+        if sim.world.game_over {
+            end = "wipe".to_string();
             break;
         }
         let dead = sim.world.get(hero).is_none_or(|h| h.dead);
@@ -248,7 +276,8 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
                 .get(foe)
                 .map(|f| (f.position, f.area))
                 .unwrap_or_default();
-            if !sim.walk(hero, p, a) {
+            // A few metres at a time, so the clock (and the samples) keep pace.
+            if !sim.walk(hero, leg(sim, hero, p), a) {
                 sim.tick(500);
             }
             continue;
@@ -280,7 +309,13 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
                 .collect(),
         );
     }
+    let m = mark.unwrap_or(start) as f64;
+    let died = died_at
+        .iter()
+        .map(|d| d.map(|t| (t as f64 - m) / 1000.0))
+        .collect();
     Ok(RunResult {
+        died,
         seed,
         deaths,
         end,
@@ -340,13 +375,19 @@ pub fn run(o: &Options) -> Result<()> {
         secs.iter().sum::<f64>() / n
     );
     if !o.watch.is_empty() {
-        print!("{:<24}", "alive at");
+        print!("{:<24} {:>9}", "alive at", "fell at");
         for t in o.at {
             print!(" {:>6}", format!("{t}s"));
         }
         println!();
         for (i, tag) in o.watch.iter().enumerate() {
-            print!("{tag:<24}");
+            let fell: Vec<f64> = runs.iter().filter_map(|r| r.died[i]).collect();
+            let fell = if fell.is_empty() {
+                "-".to_string()
+            } else {
+                format!("{:.0}s", fell.iter().sum::<f64>() / fell.len() as f64)
+            };
+            print!("{tag:<24} {fell:>9}");
             for s in 0..o.at.len() {
                 let alive = runs.iter().filter(|r| r.samples[s][i]).count();
                 print!(" {:>5.0}%", 100.0 * alive as f64 / n);

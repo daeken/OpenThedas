@@ -339,6 +339,9 @@ pub struct World {
     /// Whether the party was fighting at the last perception update.
     #[serde(default)]
     pub party_fighting: bool,
+    /// The whole party fell: the original shows its death screen and the game ends there.
+    #[serde(default)]
+    pub game_over: bool,
     /// Nobody is under the player's direct control: the party AI (tactics) drives every
     /// party member, the hero included, as it drives followers the player is not
     /// controlling. For playing without a player.
@@ -465,6 +468,7 @@ impl World {
             in_triggers: BTreeMap::new(),
             hostility: BTreeMap::new(),
             party_fighting: false,
+            game_over: false,
             autopilot: false,
             destroy_at: Vec::new(),
             held: Vec::new(),
