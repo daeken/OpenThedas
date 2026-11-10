@@ -49,6 +49,7 @@ pub fn scaleform_tag_name(code: u16) -> Option<&'static str> {
 const TAG_END: u16 = 0;
 const TAG_SHOW_FRAME: u16 = 1;
 const TAG_DO_ACTION: u16 = 12;
+const TAG_DEFINE_EDIT_TEXT: u16 = 37;
 const TAG_DEFINE_SPRITE: u16 = 39;
 const TAG_IMPORT_ASSETS: u16 = 57;
 const TAG_IMPORT_ASSETS2: u16 = 71;
@@ -297,6 +298,27 @@ pub struct RewriteReport {
     pub images_missing: Vec<String>,
     /// Scaleform tags dropped, by code.
     pub dropped: BTreeMap<u16, u32>,
+    /// Text fields switched from device fonts to embedded outlines (see [`use_outlines`]).
+    pub text_fields_outlined: u32,
+}
+
+/// Sets `UseOutlines` on a `DefineEditText` body; returns the new body if it changed.
+///
+/// Scaleform draws "device font" text fields with the fonts in its font library (the
+/// movies' `gfxfontlib` import), so a field that asks for `Dragon Text` without embedding
+/// gets the library's `Dragon Text`. Flash players draw such fields with system fonts,
+/// which we do not have; switching them to outlines gets Scaleform's result. Provisional.
+pub fn use_outlines(body: &[u8]) -> Option<Vec<u8>> {
+    let first = *body.get(2)?;
+    let rect = (5 + 4 * (first >> 3) as usize).div_ceil(8);
+    let at = 2 + rect + 1;
+    let flags = *body.get(at)?;
+    if flags & 0x01 != 0 {
+        return None;
+    }
+    let mut out = body.to_vec();
+    out[at] = flags | 0x01;
+    Some(out)
 }
 
 fn lossless2(id: u16, img: &Rgba) -> Option<Vec<u8>> {
@@ -363,6 +385,14 @@ fn rewrite_tags(
 ) {
     for t in tags {
         match t.code {
+            TAG_DEFINE_EDIT_TEXT => match use_outlines(t.body) {
+                Some(body) => {
+                    tag_header(t.code, body.len(), out);
+                    out.extend_from_slice(&body);
+                    report.text_fields_outlined += 1;
+                }
+                None => out.extend_from_slice(t.raw),
+            },
             TAG_EXTERNAL_IMAGE => {
                 let Some(ext) = ExternalImage::parse(t.body) else {
                     *report.dropped.entry(t.code).or_default() += 1;
@@ -545,6 +575,16 @@ mod tests {
             body,
         };
         assert_eq!(m.stage_size(), Some((1024.0, 768.0)));
+    }
+
+    #[test]
+    fn device_font_text_fields_use_outlines() {
+        // id 1; RECT nbits=0 (one byte); flags 0x80 (HasText), 0x02 (HTML).
+        let body = [1u8, 0, 0x00, 0x80, 0x02, b'x'];
+        let out = use_outlines(&body).unwrap();
+        assert_eq!(out[4], 0x03);
+        assert!(use_outlines(&out).is_none());
+        assert!(use_outlines(&[1, 0]).is_none());
     }
 
     #[test]
