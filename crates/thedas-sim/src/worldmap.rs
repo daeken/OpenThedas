@@ -265,6 +265,31 @@ impl Sim {
         self.world.queue_event(0, module, ev, None);
     }
 
+    /// After entering an area: the party's place on the world map becomes the pin that
+    /// leads to that area (`WM_AREA`), the primary map's first. No script calls
+    /// `SetWorldMapPlayerLocation`, so the engine keeps it. Provisional: inferred from that
+    /// and from the travel event carrying the pin the party is at.
+    pub(crate) fn place_party_on_map(&mut self, area_tag: &str) {
+        let primary = self.world.world_map.primary;
+        let mut pins: Vec<(bool, ObjectId)> = self
+            .world
+            .objects
+            .values()
+            .filter(|o| o.kind == ObjectKind::MapPin)
+            .filter(|o| {
+                o.locals
+                    .strings
+                    .get("WM_AREA")
+                    .is_some_and(|a| a.eq_ignore_ascii_case(area_tag))
+            })
+            .map(|o| (o.locals.objects.get("WM_MAP").copied() != primary, o.id))
+            .collect();
+        pins.sort();
+        if let Some(&(_, pin)) = pins.first() {
+            self.world.world_map.player_pin = Some(pin);
+        }
+    }
+
     /// After an area transition: tells the module a world-map journey has arrived.
     pub(crate) fn travel_arrived(&mut self) {
         if !std::mem::take(&mut self.world.world_map.arriving) {
@@ -281,6 +306,37 @@ impl Sim {
 mod tests {
     use super::*;
     use thedas_formats::gff4::{FieldDef, FourCC, StructData, StructTemplate, TlkString, Version};
+
+    #[test]
+    fn entering_an_area_puts_the_party_on_its_pin_on_the_primary_map() {
+        use std::sync::Arc;
+        let mut s = Sim::new(
+            Arc::new(thedas_vfs::Vfs::new()),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let (main, other) = (
+            s.world.spawn(ObjectKind::Map, "ferelden"),
+            s.world.spawn(ObjectKind::Map, "denerim"),
+        );
+        s.world.world_map.primary = Some(main);
+        let pin = |s: &mut Sim, map, area: &str| {
+            let p = s.world.spawn(ObjectKind::MapPin, "pin");
+            let o = s.world.get_mut(p).unwrap();
+            o.locals.strings.insert("WM_AREA".into(), area.into());
+            o.locals.objects.insert("WM_MAP".into(), map);
+            p
+        };
+        let elsewhere = pin(&mut s, other, "lot100ar_lothering");
+        let lothering = pin(&mut s, main, "lot100ar_lothering");
+        let _camp = pin(&mut s, main, "cam100ar_camp_plains");
+        s.place_party_on_map("LOT100AR_Lothering");
+        assert_eq!(s.world.world_map.player_pin, Some(lothering));
+        assert_ne!(Some(elsewhere), s.world.world_map.player_pin);
+        // An area with no pin leaves the party where it was.
+        s.place_party_on_map("pre410ar_tower_level_1");
+        assert_eq!(s.world.world_map.player_pin, Some(lothering));
+    }
 
     #[test]
     fn parses_world_maps() {

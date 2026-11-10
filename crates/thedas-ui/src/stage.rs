@@ -42,6 +42,22 @@ pub fn vfs_lookup(vfs: &Arc<Vfs>) -> ResourceLookup {
     Arc::new(move |name: &str| vfs.read(name).ok().map(|x| x.0))
 }
 
+/// The game's 2DA tables, for `Get2DAValue` (by M2DA table id, row id and column hash).
+pub fn table_lookup(vfs: &Arc<Vfs>) -> crate::protocol::TableLookup {
+    let tables = thedas_sim::m2da::Tables::new(vfs.clone());
+    Arc::new(move |table, row, hash| {
+        let t = tables.get(table, "")?;
+        Some(match t.cell_by_hash(hash, row)? {
+            thedas_formats::gda::Cell::Int(v) => UiValue::Number(*v as f64),
+            thedas_formats::gda::Cell::Float(v) => UiValue::Number(*v),
+            thedas_formats::gda::Cell::String(s) => {
+                UiValue::String(s.trim_end_matches('\0').to_string())
+            }
+            _ => return None,
+        })
+    })
+}
+
 /// English talk-table strings from every `*en-us.tlk` in the stack.
 pub fn talk_table(vfs: &Vfs) -> crate::protocol::StringLookup {
     let mut map = std::collections::HashMap::new();
@@ -130,7 +146,11 @@ impl Stage {
         Self {
             movies: Vec::new(),
             log: Vec::new(),
-            bridge: GameBridge::new(talk_table(vfs)),
+            bridge: {
+                let b = GameBridge::new(talk_table(vfs));
+                b.set_table_lookup(Some(table_lookup(vfs)));
+                b
+            },
             gpu,
             lookup,
             images,
