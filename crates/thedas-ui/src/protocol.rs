@@ -94,6 +94,24 @@ impl GameBridge {
         }
     }
 
+    /// Replaces many values at once (e.g. [`crate::binding::sim_values`] every frame).
+    pub fn set_values(&self, values: impl IntoIterator<Item = (String, UiValue)>) {
+        if let Ok(mut s) = self.state.lock() {
+            for (k, v) in values {
+                s.unanswered.remove(&k);
+                s.values.insert(k, v);
+            }
+        }
+    }
+
+    /// Every value set so far.
+    pub fn values(&self) -> BTreeMap<String, UiValue> {
+        self.state
+            .lock()
+            .map(|s| s.values.clone())
+            .unwrap_or_default()
+    }
+
     pub fn value(&self, name: &str) -> Option<UiValue> {
         self.state.lock().ok()?.values.get(name).cloned()
     }
@@ -157,6 +175,20 @@ impl GameBridge {
                     Some(text) => UiValue::String(text),
                     None => UiValue::String(arg(1)),
                 }
+            }
+            "GetNumMembers" => {
+                let prefix = format!("{}.", arg(0));
+                let Ok(s) = self.state.lock() else {
+                    return UiValue::Undefined;
+                };
+                let n = s
+                    .values
+                    .range(prefix.clone()..)
+                    .take_while(|(k, _)| k.starts_with(&prefix))
+                    .filter_map(|(k, _)| k[prefix.len()..].split('.').next())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len();
+                UiValue::Number(n as f64)
             }
             "FormatFloat" => {
                 let v = arg(0).parse::<f64>().unwrap_or(0.0);
@@ -276,6 +308,20 @@ mod tests {
         assert_eq!(
             b.respond(&call(CallKind::FsCommand, "FormatFloat", &["2.345 1"])),
             UiValue::String("2.3".into())
+        );
+        b.set_values([
+            ("Party.Members.0.ID".to_string(), UiValue::Number(3.0)),
+            ("Party.Members.0.Name".to_string(), UiValue::Null),
+            ("Party.Members.1.ID".to_string(), UiValue::Number(4.0)),
+            ("Party.MembersX".to_string(), UiValue::Null),
+        ]);
+        assert_eq!(
+            b.respond(&call(
+                CallKind::FsCommand,
+                "GetNumMembers",
+                &["Party.Members"]
+            )),
+            UiValue::Number(2.0)
         );
     }
 

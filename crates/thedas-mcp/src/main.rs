@@ -1,7 +1,8 @@
 //! `thedas-mcp`: a Model Context Protocol server (stdio) for driving the OpenThedas
 //! simulation: load a module and area, look at objects, step time, walk the hero around, use
 //! things, talk to people, pick dialog replies, poke plot flags and locals, call engine
-//! functions and scripts, and snapshot/restore the world.
+//! functions and scripts, and snapshot/restore the world. The `ui_*` tools play the game's
+//! Scaleform interface on a headless GPU, bound to the simulation, with screenshots.
 //!
 //! Register it with Claude Code:
 //!
@@ -9,8 +10,16 @@
 //! claude mcp add thedas -e THEDAS_INSTALL=/path/to/Dragon\ Age -- /path/to/thedas-mcp
 //! ```
 
+mod ui;
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+
+use base64::Engine as _;
+use rmcp::model::{CallToolResult, ContentBlock};
+use thedas_ui::UiValue;
+use thedas_ui::protocol::GameMessage;
+use thedas_vfs::Vfs;
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::schemars::JsonSchema;
@@ -33,11 +42,101 @@ struct State {
     slots: BTreeMap<String, Snapshot>,
     /// Trace entries already returned by `get_trace`.
     trace_cursor: usize,
+    /// Resources for the interface when no simulation is loaded.
+    ui_vfs: Option<Arc<Vfs>>,
 }
+
+/// Engine values bound for the interface.
+type UiValues = Vec<(String, UiValue)>;
 
 #[derive(Clone)]
 struct Server {
     state: Arc<Mutex<State>>,
+    ui: ui::UiThread,
+}
+
+fn ui_json(v: &UiValue) -> J {
+    match v {
+        UiValue::Undefined | UiValue::Null => J::Null,
+        UiValue::Bool(b) => json!(b),
+        UiValue::Number(n) => json!(n),
+        UiValue::String(s) => json!(s),
+        UiValue::List(l) => J::Array(l.iter().map(ui_json).collect()),
+        UiValue::Object(o) => J::Object(o.iter().map(|(k, v)| (k.clone(), ui_json(v))).collect()),
+    }
+}
+
+fn json_ui(v: &J) -> UiValue {
+    match v {
+        J::Null => UiValue::Null,
+        J::Bool(b) => UiValue::Bool(*b),
+        J::Number(n) => UiValue::Number(n.as_f64().unwrap_or(0.0)),
+        J::String(s) => UiValue::String(s.clone()),
+        J::Array(a) => UiValue::List(a.iter().map(json_ui).collect()),
+        J::Object(o) => UiValue::Object(o.iter().map(|(k, v)| (k.clone(), json_ui(v))).collect()),
+    }
+}
+
+fn messages_json(m: Vec<GameMessage>) -> J {
+    J::Array(
+        m.into_iter()
+            .map(|m| match m {
+                GameMessage::Send(name, args) => json!({ "send": name, "args": args }),
+                GameMessage::Other(c) => json!({
+                    "movie": c.movie, "kind": format!("{:?}", c.kind), "name": c.name,
+                    "args": c.args.iter().map(ui_json).collect::<Vec<_>>(),
+                }),
+            })
+            .collect(),
+    )
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct UiOpenArgs {
+    /// `menu` (in-game menu), `hud` (portraits, quick bar, minimap), `startmenu2` (title
+    /// screen), or comma-separated movie names (`conversation,floatylayer`).
+    movies: String,
+    /// Stage width in pixels (default 1280).
+    width: Option<u32>,
+    /// Stage height in pixels (default 720).
+    height: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct UiMovieArg {
+    /// Movie name, e.g. `mainmenu.gfx`.
+    movie: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct UiStepArgs {
+    /// Movie frames to run at 30 fps (default 1).
+    frames: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct UiPointArgs {
+    /// X in stage pixels (screenshot coordinates).
+    x: f64,
+    /// Y in stage pixels.
+    y: f64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct UiInvokeArgs {
+    /// Function path, e.g. `_global.GUISystem.FinishSceneFromGame`.
+    path: String,
+    /// Arguments (JSON values).
+    #[serde(default)]
+    args: Vec<J>,
+    /// Movie to call into (default: the topmost).
+    movie: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct UiValuesArgs {
+    /// Only keys starting with this prefix.
+    prefix: Option<String>,
 }
 
 fn err(msg: impl std::fmt::Display) -> String {
@@ -253,7 +352,47 @@ impl Server {
     fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(State::default())),
+            ui: ui::UiThread::spawn(),
         }
+    }
+
+    /// Resources and bound engine values for the interface: the simulation's when one is
+    /// loaded, otherwise the install's global resources with no values.
+    fn ui_inputs(&self) -> Result<(Arc<Vfs>, UiValues), String> {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(sim) = &st.sim {
+            let values = thedas_ui::binding::sim_values(sim).into_iter().collect();
+            return Ok((sim.vfs.clone(), values));
+        }
+        if st.ui_vfs.is_none() {
+            let root = install_from_env().ok_or("no install: set THEDAS_INSTALL or call load")?;
+            let install = thedas_vfs::DaoInstall::open(&root).map_err(|e| e.to_string())?;
+            let vfs = install
+                .global_vfs(thedas_vfs::install::TextureQuality::High)
+                .map_err(|e| e.to_string())?;
+            st.ui_vfs = Some(Arc::new(vfs));
+        }
+        Ok((st.ui_vfs.clone().ok_or("no resources")?, Vec::new()))
+    }
+
+    /// Binds the current engine values, runs `frames`, and returns the engine messages.
+    async fn ui_frames(&self, frames: u32) -> Result<J, String> {
+        let (_, values) = self.ui_inputs()?;
+        self.ui
+            .run(move |w| {
+                w.step(frames, &values);
+                let sounds = w
+                    .stage
+                    .as_ref()
+                    .map(|s| s.bridge.drain_sounds())
+                    .unwrap_or_default();
+                json!({
+                    "messages": messages_json(std::mem::take(&mut w.messages)),
+                    "sounds": sounds,
+                    "contexts": w.stage.as_ref().map(|s| s.bridge.contexts()),
+                })
+            })
+            .await
     }
 
     fn with_sim<F: FnOnce(&mut State) -> Result<J, String>>(&self, f: F) -> String {
@@ -273,6 +412,195 @@ impl Server {
 
 #[tool_router]
 impl Server {
+    #[tool(
+        description = "Open interface movies (the game's Scaleform UI, played headless and bound to the simulation if one is loaded). Use ui_screenshot to see them, ui_click to press things."
+    )]
+    async fn ui_open(&self, Parameters(a): Parameters<UiOpenArgs>) -> String {
+        let (vfs, values) = match self.ui_inputs() {
+            Ok(x) => x,
+            Err(e) => return err(e),
+        };
+        let size = (
+            a.width.unwrap_or(1280).clamp(64, 4096),
+            a.height.unwrap_or(720).clamp(64, 4096),
+        );
+        let names = thedas_ui::stage::movie_names(&a.movies);
+        let r = self
+            .ui
+            .run(move |w| -> Result<J, String> {
+                let stage = w.stage(&vfs, size)?;
+                stage.bridge.set_values(values.clone());
+                let mut failed = Vec::new();
+                for n in &names {
+                    stage.close(n);
+                    if let Err(e) = stage.open(n) {
+                        failed.push(format!("{n}: {e}"));
+                    }
+                }
+                w.step(2, &values);
+                let stage = w.stage.as_ref().ok_or("no stage")?;
+                Ok(json!({
+                    "open": stage.movies.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+                    "failed": failed,
+                    "size": size,
+                    "messages": messages_json(std::mem::take(&mut w.messages)),
+                }))
+            })
+            .await;
+        match r {
+            Ok(Ok(v)) => pretty(v),
+            Ok(Err(e)) | Err(e) => err(e),
+        }
+    }
+
+    #[tool(description = "Close one interface movie.")]
+    async fn ui_close(&self, Parameters(a): Parameters<UiMovieArg>) -> String {
+        let movie = a.movie;
+        match self
+            .ui
+            .run(move |w| w.stage.as_mut().is_some_and(|s| s.close(&movie)))
+            .await
+        {
+            Ok(closed) => pretty(json!({ "closed": closed })),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(
+        description = "Run interface frames (30 fps) with engine values re-bound from the simulation. Returns the messages the movies sent to the engine, GUI sounds and the context stack."
+    )]
+    async fn ui_step(&self, Parameters(a): Parameters<UiStepArgs>) -> String {
+        match self.ui_frames(a.frames.unwrap_or(1).min(600)).await {
+            Ok(v) => pretty(v),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(description = "Move the mouse over the interface (stage pixels), then run a frame.")]
+    async fn ui_hover(&self, Parameters(a): Parameters<UiPointArgs>) -> String {
+        let (x, y) = (a.x, a.y);
+        if let Err(e) = self
+            .ui
+            .run(move |w| {
+                if let Some(s) = w.stage.as_mut() {
+                    s.mouse_move(x, y);
+                }
+            })
+            .await
+        {
+            return err(e);
+        }
+        match self.ui_frames(1).await {
+            Ok(v) => pretty(v),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(
+        description = "Left-click the interface at stage pixels (as in ui_screenshot), then run a few frames. Returns what the movies sent to the engine."
+    )]
+    async fn ui_click(&self, Parameters(a): Parameters<UiPointArgs>) -> String {
+        let (x, y) = (a.x, a.y);
+        let (_, values) = match self.ui_inputs() {
+            Ok(x) => x,
+            Err(e) => return err(e),
+        };
+        let r = self
+            .ui
+            .run(move |w| {
+                if let Some(s) = w.stage.as_mut() {
+                    s.mouse_move(x, y);
+                }
+                w.step(1, &values);
+                if let Some(s) = w.stage.as_mut() {
+                    s.mouse_button(x, y, true);
+                }
+                w.step(1, &values);
+                if let Some(s) = w.stage.as_mut() {
+                    s.mouse_button(x, y, false);
+                }
+                w.step(3, &values);
+            })
+            .await;
+        if let Err(e) = r {
+            return err(e);
+        }
+        match self.ui_frames(1).await {
+            Ok(v) => pretty(v),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(description = "Screenshot of the open interface movies (PNG, over black).")]
+    async fn ui_screenshot(&self) -> CallToolResult {
+        match self.ui.run(|w| w.screenshot()).await {
+            Ok(Ok(png)) => CallToolResult::success(vec![ContentBlock::image(
+                base64::engine::general_purpose::STANDARD.encode(png),
+                "image/png",
+            )]),
+            Ok(Err(e)) | Err(e) => CallToolResult::error(vec![ContentBlock::text(err(e))]),
+        }
+    }
+
+    #[tool(
+        description = "Call a movie function by path, as the game engine does (e.g. _global.GUISystem.FinishSceneFromGame)."
+    )]
+    async fn ui_invoke(&self, Parameters(a): Parameters<UiInvokeArgs>) -> String {
+        let args: Vec<UiValue> = a.args.iter().map(json_ui).collect();
+        let (path, movie) = (a.path, a.movie);
+        let r = self
+            .ui
+            .run(move |w| -> Result<J, String> {
+                let stage = w.stage.as_mut().ok_or("no movies open")?;
+                let m = match &movie {
+                    Some(n) => stage.movies.iter_mut().find(|m| m.name == *n),
+                    None => stage.movies.last_mut(),
+                }
+                .ok_or("no such movie")?;
+                Ok(ui_json(&m.call(&path, &args)))
+            })
+            .await;
+        match r {
+            Ok(Ok(v)) => pretty(json!({ "result": v })),
+            Ok(Err(e)) | Err(e) => err(e),
+        }
+    }
+
+    #[tool(
+        description = "Engine values the interface has read or been given, and the names it asked for that nothing answers."
+    )]
+    async fn ui_values(&self, Parameters(a): Parameters<UiValuesArgs>) -> String {
+        let prefix = a.prefix.unwrap_or_default();
+        let r = self
+            .ui
+            .run(move |w| -> Result<J, String> {
+                let stage = w.stage.as_ref().ok_or("no movies open")?;
+                let values: serde_json::Map<String, J> = stage
+                    .bridge
+                    .values()
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(&prefix))
+                    .map(|(k, v)| (k.clone(), ui_json(v)))
+                    .collect();
+                let unanswered: Vec<String> = stage
+                    .bridge
+                    .unanswered()
+                    .into_keys()
+                    .filter(|k| k.starts_with(&prefix))
+                    .collect();
+                Ok(json!({
+                    "values": values,
+                    "unanswered": unanswered,
+                    "failed_loads": stage.failed_loads(),
+                }))
+            })
+            .await;
+        match r {
+            Ok(Ok(v)) => pretty(v),
+            Ok(Err(e)) | Err(e) => err(e),
+        }
+    }
+
     #[tool(
         description = "Load a module and area into a fresh simulation (replaces any running one). Returns the area, the hero and the objects."
     )]
@@ -701,7 +1029,7 @@ impl Server {
 #[tool_handler(
     name = "thedas",
     version = "0.1.0",
-    instructions = "Drives the OpenThedas Dragon Age: Origins simulation. Start with load (e.g. area cir110ar_inn for the Spoiled Princess), then list_objects, interact to talk or use things, choose_reply to pick dialog options, step to advance time, and get_trace to see what scripts did."
+    instructions = "Drives the OpenThedas Dragon Age: Origins simulation. Start with load (e.g. area cir110ar_inn for the Spoiled Princess), then list_objects, interact to talk or use things, choose_reply to pick dialog options, step to advance time, and get_trace to see what scripts did. The game's own interface runs too: ui_open (menu, hud, startmenu2, or movie names), ui_screenshot to look, ui_click at screenshot pixels, ui_step, and ui_values for what it reads from the engine."
 )]
 impl rmcp::ServerHandler for Server {}
 

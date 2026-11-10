@@ -3646,12 +3646,17 @@ name = "thedas-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
+ "png",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
+ "thedas-render",
  "thedas-script",
  "thedas-sim",
+ "thedas-ui",
+ "thedas-vfs",
  "tokio",
 ]
 
@@ -3710,6 +3715,9 @@ dependencies = [
  "ruffle_core",
  "ruffle_render_wgpu",
  "thedas-formats",
+ "thedas-script",
+ "thedas-sim",
+ "thedas-vfs",
  "thiserror 2.0.18",
  "url",
  "wgpu",
