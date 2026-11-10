@@ -82,6 +82,7 @@ pub struct Sim {
     /// Instructions a single script run may take.
     pub script_budget: u64,
     pub chargen_policy: ChargenPolicy,
+    pub cutscene_policy: CutscenePolicy,
     /// Objects whose scripts' engine calls are all traced (log channel -6), for debugging.
     pub watch_calls: std::collections::BTreeSet<ObjectId>,
     /// Tags (lowercase) whose objects' engine calls are traced too, including objects
@@ -180,6 +181,18 @@ pub enum ChargenPolicy {
     Manual,
 }
 
+/// What the simulation does with a cutscene a script loads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CutscenePolicy {
+    /// End it at once, as if it had played (headless runs: nobody watches).
+    #[default]
+    Skip,
+    /// Hold it as [`crate::world::World::cutscene`] for a presentation to show (its lines
+    /// said, for as long as it runs) and then end with [`Sim::finish_cutscene`]. A cutscene
+    /// that cannot be read ends at once.
+    Play,
+}
+
 /// Looks up an integer constant from the engine table (0 if absent).
 /// Movement speed (m/s) for a creature whose appearance gives none. Provisional.
 pub const DEFAULT_SPEED: f32 = 5.0;
@@ -220,6 +233,7 @@ impl Sim {
             depth: 0,
             script_budget: 5_000_000,
             chargen_policy: ChargenPolicy::default(),
+            cutscene_policy: CutscenePolicy::default(),
             watch_calls: Default::default(),
             watch_tags: Default::default(),
             current_effect: None,
@@ -480,11 +494,27 @@ impl Sim {
                 self.area_transition(&area, &waypoint);
                 continue;
             }
-            if !self.world.cutscenes.is_empty() {
-                let cutscenes = std::mem::take(&mut self.world.cutscenes);
-                for c in cutscenes {
-                    self.end_cutscene(&c);
+            // One cutscene at a time: the next waits for the one playing.
+            if !self.world.cutscenes.is_empty() && self.world.cutscene.is_none() {
+                let name = self.world.cutscenes.remove(0);
+                if self.cutscene_policy == CutscenePolicy::Play {
+                    if let Some(c) = self.read_cutscene(&name) {
+                        let t = self.world.time_ms;
+                        self.world.trace.push(TraceEntry::Log {
+                            t,
+                            channel: -1,
+                            text: format!(
+                                "cutscene {} plays ({:.1} s, {} lines)",
+                                c.name,
+                                c.seconds,
+                                c.lines.len()
+                            ),
+                        });
+                        self.world.cutscene = Some(c);
+                        continue;
+                    }
                 }
+                self.end_cutscene(&name);
                 continue;
             }
             // Then the earliest of the next event and the next finishing command; events
@@ -543,11 +573,33 @@ impl Sim {
     /// `CUTSCENE_SET_PLOT_FLAG`) and a creature to talk to (`CUTSCENE_TALK_SPEAKER`) in module
     /// locals before loading the cutscene, and nothing in the scripts reads them back.
     pub fn end_cutscene(&mut self, name: &str) {
+        self.close_cutscene(name, false);
+    }
+
+    /// The cutscene playing has been shown (or the player skipped it): it ends as
+    /// [`Sim::end_cutscene`] says, and the next one loaded may start.
+    pub fn finish_cutscene(&mut self) {
+        if let Some(c) = self.world.cutscene.take() {
+            self.close_cutscene(&c.name, true);
+        }
+    }
+
+    /// A loaded cutscene's file (its length and lines), if it can be read.
+    fn read_cutscene(&self, name: &str) -> Option<crate::cutscene::Cutscene> {
+        let res = crate::cutscene::Cutscene::resource(name);
+        let (data, _) = self.vfs.read(&res).ok()?;
+        crate::cutscene::Cutscene::parse(&data, &res)
+    }
+
+    fn close_cutscene(&mut self, name: &str, played: bool) {
         let t = self.world.time_ms;
         self.world.trace.push(TraceEntry::Log {
             t,
             channel: -1,
-            text: format!("cutscene {name} ends (not played)"),
+            text: format!(
+                "cutscene {name} ends{}",
+                if played { "" } else { " (not played)" }
+            ),
         });
         let Some(module) = self.world.module else {
             return;
@@ -2454,6 +2506,38 @@ mod tests {
         assert_eq!(s.world.plots.get(&("ABC".to_string(), 13)), Some(&true));
         let l = &s.world.get(m).unwrap().locals;
         assert!(!l.strings.contains_key("CUTSCENE_SET_PLOT"));
+    }
+
+    #[test]
+    fn a_played_cutscene_holds_the_next_until_it_is_finished() {
+        let mut s = sim();
+        s.cutscene_policy = CutscenePolicy::Play;
+        let m = with_module(&mut s);
+        // One that cannot be read ends at once, as when skipping.
+        s.world.cutscenes.push("missing".into());
+        s.tick(0);
+        assert!(s.world.cutscenes.is_empty() && s.world.cutscene.is_none());
+        // One playing: what it sets waits for it to be finished, and so does the next.
+        s.world.cutscene = Some(crate::cutscene::Cutscene {
+            name: "intro.cut".into(),
+            seconds: 5.0,
+            lines: Vec::new(),
+        });
+        let l = &mut s.world.get_mut(m).unwrap().locals;
+        l.strings.insert("CUTSCENE_SET_PLOT".into(), "ABC".into());
+        l.ints.insert("CUTSCENE_SET_PLOT_FLAG".into(), 13);
+        s.world.cutscenes.push("next".into());
+        s.tick(1000);
+        assert_eq!(s.world.cutscenes, ["next"]);
+        assert!(s.world.plots.is_empty());
+        s.finish_cutscene();
+        assert_eq!(s.world.plots.get(&("ABC".to_string(), 13)), Some(&true));
+        s.tick(0);
+        assert!(s.world.cutscenes.is_empty() && s.world.cutscene.is_none());
+        assert!(s.world.trace.entries.iter().any(|e| matches!(
+            e,
+            TraceEntry::Log { text, .. } if text == "cutscene intro.cut ends"
+        )));
     }
 
     #[test]

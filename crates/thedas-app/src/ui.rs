@@ -133,6 +133,8 @@ pub struct UiLayer {
     /// Frames since the minimap's creatures were last sent.
     minimap_frame: u32,
     portraits: PortraitClock,
+    /// The cutscene playing (its resource) and how long it has been up (milliseconds).
+    cutscene: Option<(String, f64)>,
 }
 
 /// When portraits are drawn: the party they were drawn for, milliseconds since, and how many
@@ -201,7 +203,8 @@ impl Line {
 
 /// How long a line plays before the conversation goes on by itself (milliseconds), standing
 /// in for its voice-over: a reading time for its text, a moment for a line without text (a
-/// cutscene beat, whose staging is not played). Provisional.
+/// node that only moves the conversation on: across the game's conversations none of them
+/// carries staging of its own). Provisional.
 pub fn line_ms(text: &str) -> f64 {
     let chars = text.trim().chars().count() as f64;
     if chars == 0.0 {
@@ -233,6 +236,7 @@ impl UiLayer {
             level: None,
             minimap_frame: 0,
             portraits: PortraitClock::default(),
+            cutscene: None,
         }
     }
 
@@ -296,6 +300,7 @@ impl UiLayer {
                 self.continue_conversation();
             }
         }
+        self.play_cutscene(sim, dt_ms);
         let messages = self.stage.tick(dt_ms);
         let ignored = {
             let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
@@ -397,6 +402,46 @@ impl UiLayer {
         }
         if let Ok(mut shown) = self.shown.lock() {
             shown.portraits = names;
+        }
+    }
+
+    /// Plays the cutscene the simulation holds: its lines show as subtitles
+    /// (`Cutscene.SubtitleText`, which cutscene.gfx shows) when they are said, and once it
+    /// has run its length the simulation finishes it. Provisional: nothing is staged (no
+    /// camera, animation or voice), so the world stands still behind the subtitles.
+    fn play_cutscene(&mut self, sim: &Arc<Mutex<Sim>>, dt_ms: f64) {
+        let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(c) = sim.world.cutscene.clone() else {
+            self.cutscene = None;
+            return;
+        };
+        let t = match self.cutscene.take() {
+            Some((name, t)) if name == c.name => t + dt_ms,
+            _ => 0.0,
+        };
+        let text = c
+            .line_at((t / 1000.0) as f32)
+            .and_then(|l| sim.string(l.strref))
+            .unwrap_or_default();
+        self.stage
+            .bridge
+            .set_value("Cutscene.SubtitleText", thedas_ui::UiValue::String(text));
+        if t >= c.seconds as f64 * 1000.0 {
+            sim.finish_cutscene();
+            sim.tick(0);
+            self.stage.bridge.set_value(
+                "Cutscene.SubtitleText",
+                thedas_ui::UiValue::String(String::new()),
+            );
+            return;
+        }
+        self.cutscene = Some((c.name, t));
+    }
+
+    /// Skips the rest of the cutscene playing (the player clicked).
+    pub fn skip_cutscene(&mut self) {
+        if let Some((_, t)) = self.cutscene.as_mut() {
+            *t = f64::INFINITY;
         }
     }
 

@@ -724,6 +724,18 @@ impl App {
     /// The left button goes down or up at the cursor.
     fn left_button(&mut self, pressed: bool) {
         let (x, y) = self.cursor;
+        // A click skips a cutscene. Provisional: the game's own skip key is not traced.
+        if pressed
+            && self
+                .screens
+                .as_ref()
+                .is_some_and(screens::Screens::in_cutscene)
+        {
+            if let Some(g) = self.gfx.as_mut() {
+                g.ui.skip_cutscene();
+            }
+            return;
+        }
         if !pressed && std::mem::take(&mut self.swallow_release) {
             return;
         }
@@ -966,6 +978,11 @@ impl App {
             "ended": d.ended,
         })));
         out["aiming"] = json!(live.aiming.as_ref().map(|a| a.ability));
+        out["cutscene"] = json!(sim.world.cutscene.as_ref().map(|c| json!({
+            "name": c.name,
+            "seconds": c.seconds,
+            "lines": c.lines.len(),
+        })));
         out["screens"] = json!(self.screens.as_ref().map(|s| format!("{:?}", s.shown())));
         out
     }
@@ -1337,6 +1354,11 @@ fn main() -> Result<()> {
                         }
                     }
                     &Step::Click(x, y) => {
+                        if let Some((layer, s)) = played.as_mut().filter(|(_, s)| s.in_cutscene()) {
+                            layer.skip_cutscene();
+                            println!("click {x},{y}: skips the cutscene ({:?})", s.shown());
+                            continue;
+                        }
                         let to_world = match played.as_mut() {
                             Some((layer, s)) => {
                                 layer.render_movies();
