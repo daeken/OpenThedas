@@ -57,11 +57,18 @@ impl DaoInstall {
         &self.root
     }
 
-    /// A path relative to the install root, for labels and reports.
+    /// A path relative to the install root, for labels and reports. Always uses `/` as the
+    /// separator, so labels read the same on every platform.
     pub fn relative<'a>(&self, path: &'a Path) -> std::borrow::Cow<'a, str> {
-        path.strip_prefix(&self.root)
+        let rel = path
+            .strip_prefix(&self.root)
             .unwrap_or(path)
-            .to_string_lossy()
+            .to_string_lossy();
+        if std::path::MAIN_SEPARATOR == '/' {
+            rel
+        } else {
+            rel.replace(std::path::MAIN_SEPARATOR, "/").into()
+        }
     }
 
     /// Every ERF and RIM file anywhere in the install, sorted by path.
