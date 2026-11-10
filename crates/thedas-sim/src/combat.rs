@@ -816,22 +816,14 @@ impl Sim {
         }
     }
 
-    /// The item a `CommandUseAbility` uses: the owner's inventory item whose tag is the
-    /// command's string 0, or `OBJECT_INVALID`.
+    /// The item a `CommandUseAbility` uses: the item tagged as the command's string 0, the
+    /// owner's own or else one in the party's pack ([`Sim::party_item`]), or
+    /// `OBJECT_INVALID`.
     fn ability_item(&self, id: ObjectId, cmd: &crate::world::Command) -> ObjectId {
         let Some(tag) = cmd.strings.first().filter(|t| !t.is_empty()) else {
             return OBJECT_INVALID;
         };
-        self.world
-            .get(id)
-            .and_then(|o| {
-                o.inventory.iter().copied().find(|i| {
-                    self.world
-                        .get(*i)
-                        .is_some_and(|x| x.tag.eq_ignore_ascii_case(tag))
-                })
-            })
-            .unwrap_or(OBJECT_INVALID)
+        self.party_item(id, tag).unwrap_or(OBJECT_INVALID)
     }
 
     /// The front `CommandUseAbility` started: the owner's script vets it

@@ -122,8 +122,54 @@ impl Sim {
         (left / total).clamp(0.0, 1.0)
     }
 
-    /// `who`'s quickbar, by slot: the slots scripts filled, and its other usable abilities
-    /// in the free slots.
+    /// The items the party can use from the quickbar (potions, poultices, grenades: items with
+    /// an activated ability), one entry per tag, in the order the pack holds them: the tag,
+    /// the ability and how many there are. Provisional: grouped by tag.
+    pub fn quick_items(&self) -> Vec<(String, i32, i32)> {
+        let mut out: Vec<(String, i32, i32)> = Vec::new();
+        for item in self.party_backpack() {
+            let Some(o) = self.world.get(item) else {
+                continue;
+            };
+            let ability = o.fields.get("AbilityID").copied().unwrap_or(0);
+            if ability <= 0 || self.ability_use_type(ability) != USE_ACTIVATED {
+                continue;
+            }
+            let count = o.fields.get("StackSize").copied().unwrap_or(1).max(1);
+            match out.iter_mut().find(|q| q.0.eq_ignore_ascii_case(&o.tag)) {
+                Some(q) => q.2 += count,
+                None => out.push((o.tag.clone(), ability, count)),
+            }
+        }
+        out
+    }
+
+    /// How many of the items tagged `tag` the party carries.
+    pub fn item_count(&self, tag: &str) -> i32 {
+        self.party_backpack()
+            .into_iter()
+            .filter_map(|i| self.world.get(i))
+            .filter(|o| o.tag.eq_ignore_ascii_case(tag))
+            .map(|o| o.fields.get("StackSize").copied().unwrap_or(1).max(1))
+            .sum()
+    }
+
+    /// The item tagged `tag` that `who` would use: its own first, else one in the party's
+    /// pack (the party shares its items).
+    pub fn party_item(&self, who: ObjectId, tag: &str) -> Option<ObjectId> {
+        let is = |i: &ObjectId| {
+            self.world
+                .get(*i)
+                .is_some_and(|x| x.tag.eq_ignore_ascii_case(tag))
+        };
+        self.world
+            .get(who)
+            .and_then(|o| o.inventory.iter().copied().find(is))
+            .or_else(|| self.party_backpack().into_iter().find(is))
+    }
+
+    /// `who`'s quickbar, by slot: the slots scripts filled, its other usable abilities in the
+    /// free slots, then the party's quick items.
     pub fn quickbar(&self, who: ObjectId) -> Vec<(i32, Quickslot)> {
         let Some(o) = self.world.get(who) else {
             return Vec::new();
@@ -154,6 +200,13 @@ impl Sim {
                     item: String::new(),
                 },
             ));
+        }
+        for (tag, ability, _) in self.quick_items() {
+            if bar.iter().any(|(_, q)| q.item.eq_ignore_ascii_case(&tag)) {
+                continue;
+            }
+            let Some(slot) = free.next() else { break };
+            bar.push((slot, Quickslot { ability, item: tag }));
         }
         bar.sort_by_key(|(s, _)| *s);
         bar
@@ -198,6 +251,50 @@ mod tests {
         // Its place is where it lands, not where the mage goes.
         s.tick(5_000);
         assert_eq!(s.world.get(mage).unwrap().position, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn the_party_shares_its_quick_items() {
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let i = |v: i64| Cell::Int(v);
+        s.world.tables().insert(
+            "ABI_base",
+            &["AbilityType", "UseType", "TargetType"],
+            vec![
+                (700, vec![i(1), i(2), i(1)]),
+                (200011, vec![i(4), i(4), i(1)]),
+                (200111, vec![i(4), i(3), i(1)]), // passive: not usable
+            ],
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let mage = s.world.spawn(ObjectKind::Creature, "mage");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().followers.push(mage);
+        s.world.get_mut(mage).unwrap().abilities.insert(700);
+        let item = |s: &mut Sim, tag: &str, ability: i32, stack: i32| {
+            let it = s.world.spawn(ObjectKind::Item, tag);
+            let o = s.world.get_mut(it).unwrap();
+            o.fields.insert("AbilityID".into(), ability);
+            o.fields.insert("StackSize".into(), stack);
+            it
+        };
+        let a = item(&mut s, "poultice", 200011, 2);
+        let b = item(&mut s, "poultice", 200011, 1);
+        let c = item(&mut s, "coating", 200111, 1);
+        s.world.get_mut(hero).unwrap().inventory = vec![a, b, c];
+        assert_eq!(s.quick_items(), vec![("poultice".to_string(), 200011, 3)]);
+        assert_eq!(s.item_count("POULTICE"), 3);
+        // The mage carries none but uses the hero's.
+        assert_eq!(s.party_item(mage, "poultice"), Some(a));
+        let bar: Vec<(i32, i32, String)> = s
+            .quickbar(mage)
+            .into_iter()
+            .map(|(slot, q)| (slot, q.ability, q.item))
+            .collect();
+        assert_eq!(
+            bar,
+            vec![(0, 700, String::new()), (1, 200011, "poultice".to_string())]
+        );
     }
 
     #[test]
