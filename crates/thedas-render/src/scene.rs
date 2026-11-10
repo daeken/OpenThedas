@@ -92,9 +92,27 @@ pub struct DrawItem {
     /// Model to world.
     pub transform: Mat4,
     pub lightmap: Option<LightmapRef>,
+    /// World-space bounding sphere of the placed model (from the room layout, or the mesh
+    /// chunk's bounds), used to pick lights.
+    pub sphere: (Vec3, f32),
     /// The placed model and room, for diagnostics.
     pub model: String,
     pub room: String,
+}
+
+/// A light placed in the level (from the room's `_ll` light model).
+#[derive(Clone, Debug, PartialEq)]
+pub enum SceneLight {
+    Point {
+        position: Vec3,
+        color: Vec3,
+        radius: f32,
+        name: String,
+    },
+    Ambient {
+        color: Vec3,
+        name: String,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -106,6 +124,7 @@ pub struct AreaScene {
     pub meshes: Vec<SceneMesh>,
     pub materials: Vec<SceneMaterial>,
     pub draws: Vec<DrawItem>,
+    pub lights: Vec<SceneLight>,
     /// Where each resource the scene used came from (resource -> provenance label).
     pub provenance: BTreeMap<String, String>,
     /// Resources that were missing or failed to parse; the scene loads without them.
@@ -412,6 +431,27 @@ impl AreaScene {
                 let placement = room_m
                     * transform_matrix(&p.transform)
                     * Mat4::from_scale(Vec3::splat(p.scale));
+                for lp in model.lights() {
+                    let m = lp
+                        .chain
+                        .iter()
+                        .fold(placement, |m, t| m * transform_matrix(t));
+                    let name = lp.name.unwrap_or("").to_string();
+                    l.scene.lights.push(match lp.light {
+                        thedas_formats::model::Light::Point { color, radius, .. } => {
+                            SceneLight::Point {
+                                position: m.transform_point3(Vec3::ZERO),
+                                color: Vec3::new(color[0], color[1], color[2]),
+                                radius: *radius,
+                                name,
+                            }
+                        }
+                        thedas_formats::model::Light::Ambient { color } => SceneLight::Ambient {
+                            color: Vec3::new(color[0], color[1], color[2]),
+                            name,
+                        },
+                    });
+                }
                 let pieces = model.mesh_pieces();
                 if pieces.is_empty() {
                     continue;
@@ -441,11 +481,28 @@ impl AreaScene {
                                 scale: b.scale,
                             })
                     });
+                    let transform = placement * node;
+                    let sphere = match p.sphere {
+                        Some((c, r)) => (Vec3::from_array(c), r),
+                        None => {
+                            let m = &l.scene.meshes[mesh];
+                            let (lo, hi) = m.vertices.iter().fold(
+                                (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+                                |(lo, hi), v| {
+                                    let p = Vec3::from_array(v.position);
+                                    (lo.min(p), hi.max(p))
+                                },
+                            );
+                            let c = transform.transform_point3((lo + hi) * 0.5);
+                            (c, (hi - lo).length() * 0.5 * p.scale)
+                        }
+                    };
                     l.scene.draws.push(DrawItem {
                         mesh,
                         material,
-                        transform: placement * node,
+                        transform,
                         lightmap,
+                        sphere,
                         model: p.model.clone(),
                         room: room.name.clone(),
                     });

@@ -10,6 +10,8 @@ rust-version.workspace = true
 [dependencies]
 thedas-vfs.workspace = true
 thedas-formats.workspace = true
+thedas-shader.workspace = true
+naga.workspace = true
 thiserror.workspace = true
 wgpu.workspace = true
 bytemuck.workspace = true

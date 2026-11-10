@@ -8,7 +8,7 @@ use thedas_vfs::Vfs;
 use wgpu::util::DeviceExt;
 
 use crate::camera::Camera;
-use crate::material::{BlendMode, MaterialProgram, ProgramRegistry, Resolved};
+use crate::material::{BlendMode, MaterialProgram, Program, ProgramRegistry, Resolved};
 use crate::scene::{AreaScene, Vertex};
 
 #[derive(Debug, thiserror::Error)]
@@ -90,15 +90,17 @@ impl GpuContext {
     }
 }
 
-struct GpuTexture {
-    view: wgpu::TextureView,
+pub(crate) struct GpuTexture {
+    pub view: wgpu::TextureView,
+    pub kind: DdsKind,
 }
 
-/// Uploads a 2D DDS (all mips), compressed when the device allows it.
+/// Uploads a 2D or cube DDS (all mips), compressed when the device allows it.
 fn upload_dds(ctx: &GpuContext, name: &str, dds: &Dds) -> Option<GpuTexture> {
-    if dds.kind != DdsKind::Texture2D {
+    if dds.kind == DdsKind::Volume {
         return None;
     }
+    let faces = dds.faces();
     let compressed =
         ctx.bc && dds.format.is_compressed() && dds.width % 4 == 0 && dds.height % 4 == 0;
     let format = match (compressed, dds.format) {
@@ -124,7 +126,7 @@ fn upload_dds(ctx: &GpuContext, name: &str, dds: &Dds) -> Option<GpuTexture> {
         size: wgpu::Extent3d {
             width: dds.width,
             height: dds.height,
-            depth_or_array_layers: 1,
+            depth_or_array_layers: faces,
         },
         mip_level_count: mips.max(1),
         sample_count: 1,
@@ -133,10 +135,10 @@ fn upload_dds(ctx: &GpuContext, name: &str, dds: &Dds) -> Option<GpuTexture> {
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    for mip in 0..mips.max(1) {
+    for (face, mip) in (0..faces).flat_map(|f| (0..mips.max(1)).map(move |m| (f, m))) {
         let (w, h, _) = dds.mip_size(mip);
         let (data, bytes_per_row, rows) = if compressed {
-            let s = dds.surface(0, mip).ok()?;
+            let s = dds.surface(face, mip).ok()?;
             let bw = w.div_ceil(4);
             (
                 s.data.to_vec(),
@@ -144,13 +146,17 @@ fn upload_dds(ctx: &GpuContext, name: &str, dds: &Dds) -> Option<GpuTexture> {
                 h.div_ceil(4),
             )
         } else {
-            (dds.decode_rgba8(0, mip).ok()?, w * 4, h)
+            (dds.decode_rgba8(face, mip).ok()?, w * 4, h)
         };
         ctx.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
                 mip_level: mip,
-                origin: wgpu::Origin3d::ZERO,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: face,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             &data,
@@ -166,9 +172,137 @@ fn upload_dds(ctx: &GpuContext, name: &str, dds: &Dds) -> Option<GpuTexture> {
             },
         );
     }
+    let dimension = if dds.kind == DdsKind::Cube {
+        Some(wgpu::TextureViewDimension::Cube)
+    } else {
+        Some(wgpu::TextureViewDimension::D2)
+    };
     Some(GpuTexture {
-        view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+        view: texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension,
+            ..Default::default()
+        }),
+        kind: dds.kind,
     })
+}
+
+/// Textures loaded from the resource stack, by name, plus solid fallbacks per texture type.
+#[derive(Default)]
+pub(crate) struct TextureCache {
+    map: HashMap<String, Option<GpuTexture>>,
+    solids: HashMap<(u8, [u8; 4]), wgpu::TextureView>,
+    pub loaded: usize,
+    pub compressed: usize,
+    pub missing: Vec<String>,
+}
+
+impl TextureCache {
+    pub fn get(&mut self, ctx: &GpuContext, vfs: &Vfs, name: &str) -> Option<&GpuTexture> {
+        if !self.map.contains_key(name) {
+            let tex = match vfs.read(name) {
+                Ok((data, _)) => match Dds::parse(&data) {
+                    Ok(dds) => {
+                        let t = upload_dds(ctx, name, &dds);
+                        if t.is_some() {
+                            self.loaded += 1;
+                            if ctx.bc && dds.format.is_compressed() {
+                                self.compressed += 1;
+                            }
+                        }
+                        t
+                    }
+                    Err(e) => {
+                        log::warn!("{name}: {e}");
+                        None
+                    }
+                },
+                Err(_) => None,
+            };
+            if tex.is_none() {
+                self.missing.push(name.to_string());
+            }
+            self.map.insert(name.to_string(), tex);
+        }
+        self.map.get(name).and_then(|t| t.as_ref())
+    }
+
+    /// A view of a texture if it exists and matches the sampler's texture type.
+    pub fn view(
+        &mut self,
+        ctx: &GpuContext,
+        vfs: &Vfs,
+        name: &str,
+        ty: thedas_shader::bytecode::TextureType,
+    ) -> Option<wgpu::TextureView> {
+        use thedas_shader::bytecode::TextureType as T;
+        let t = self.get(ctx, vfs, name)?;
+        let ok = matches!(
+            (ty, t.kind),
+            (T::Tex2D | T::Unknown, DdsKind::Texture2D) | (T::Cube, DdsKind::Cube)
+        );
+        ok.then(|| t.view.clone())
+    }
+
+    /// A 1x1 texture (all six faces for cubes) of one colour, matching a sampler type.
+    pub fn solid(
+        &mut self,
+        ctx: &GpuContext,
+        ty: thedas_shader::bytecode::TextureType,
+        rgba: [u8; 4],
+    ) -> wgpu::TextureView {
+        use thedas_shader::bytecode::TextureType as T;
+        let kind = match ty {
+            T::Cube => 1u8,
+            T::Volume => 2,
+            _ => 0,
+        };
+        self.solids
+            .entry((kind, rgba))
+            .or_insert_with(|| {
+                let (layers, dim, vdim) = match kind {
+                    1 => (
+                        6,
+                        wgpu::TextureDimension::D2,
+                        wgpu::TextureViewDimension::Cube,
+                    ),
+                    2 => (
+                        1,
+                        wgpu::TextureDimension::D3,
+                        wgpu::TextureViewDimension::D3,
+                    ),
+                    _ => (
+                        1,
+                        wgpu::TextureDimension::D2,
+                        wgpu::TextureViewDimension::D2,
+                    ),
+                };
+                let data: Vec<u8> = (0..layers).flat_map(|_| rgba).collect();
+                let texture = ctx.device.create_texture_with_data(
+                    &ctx.queue,
+                    &wgpu::TextureDescriptor {
+                        label: Some("solid"),
+                        size: wgpu::Extent3d {
+                            width: 1,
+                            height: 1,
+                            depth_or_array_layers: layers,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: dim,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    },
+                    wgpu::util::TextureDataOrder::LayerMajor,
+                    &data,
+                );
+                texture.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(vdim),
+                    ..Default::default()
+                })
+            })
+            .clone()
+    }
 }
 
 fn solid_texture(ctx: &GpuContext, rgba: [u8; 4]) -> GpuTexture {
@@ -193,6 +327,7 @@ fn solid_texture(ctx: &GpuContext, rgba: [u8; 4]) -> GpuTexture {
     );
     GpuTexture {
         view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+        kind: DdsKind::Texture2D,
     }
 }
 
@@ -239,6 +374,12 @@ struct GpuMesh {
     count: u32,
 }
 
+#[derive(Clone, Copy)]
+enum DrawRef {
+    StandIn(usize),
+    D3d(usize),
+}
+
 struct Draw {
     mesh: usize,
     pipeline: usize,
@@ -270,8 +411,10 @@ pub struct AreaRenderer {
     pipelines: Vec<(wgpu::RenderPipeline, BlendMode)>,
     material_groups: Vec<wgpu::BindGroup>,
     lightmap_groups: Vec<wgpu::BindGroup>,
-    opaque: Vec<Draw>,
-    blended: Vec<Draw>,
+    stand_in: Vec<Draw>,
+    d3d: crate::d3d_gpu::D3dPass,
+    opaque: Vec<DrawRef>,
+    blended: Vec<DrawRef>,
     depth: Option<(wgpu::TextureView, u32, u32)>,
     pub light: StandInLight,
     pub stats: RenderStats,
@@ -309,31 +452,11 @@ impl AreaRenderer {
         stats.meshes = meshes.len();
 
         // Textures.
-        let mut textures: HashMap<String, Option<GpuTexture>> = HashMap::new();
+        let mut cache = TextureCache::default();
+        let mut textures: HashMap<String, Option<wgpu::TextureView>> = HashMap::new();
         for name in scene.textures() {
-            let tex = match vfs.read(&name) {
-                Ok((data, _)) => match Dds::parse(&data) {
-                    Ok(dds) => {
-                        let t = upload_dds(ctx, &name, &dds);
-                        if t.is_some() {
-                            stats.textures_loaded += 1;
-                            if ctx.bc && dds.format.is_compressed() {
-                                stats.textures_compressed += 1;
-                            }
-                        }
-                        t
-                    }
-                    Err(e) => {
-                        log::warn!("{name}: {e}");
-                        None
-                    }
-                },
-                Err(_) => None,
-            };
-            if tex.is_none() {
-                stats.textures_missing.push(name.clone());
-            }
-            textures.insert(name, tex);
+            let view = cache.get(ctx, vfs, &name).map(|t| t.view.clone());
+            textures.insert(name, view);
         }
         let grey = solid_texture(ctx, [160, 160, 160, 255]);
         let white = solid_texture(ctx, [255, 255, 255, 255]);
@@ -446,10 +569,21 @@ impl AreaRenderer {
         let mut material_program: Vec<Option<usize>> = Vec::new();
         let mut material_groups = Vec::new();
         let mut material_group_index: Vec<usize> = Vec::new();
+        let mut d3d_programs: Vec<Option<std::sync::Arc<crate::d3d::D3dProgram>>> = Vec::new();
         for m in &scene.materials {
             let program = match programs.resolve(m) {
-                Resolved::Draw(p) => p,
+                Resolved::Draw(Program::StandIn(p)) => {
+                    d3d_programs.push(None);
+                    p
+                }
+                Resolved::Draw(Program::D3d(p)) => {
+                    d3d_programs.push(Some(p));
+                    material_program.push(None);
+                    material_group_index.push(0);
+                    continue;
+                }
                 Resolved::Skip => {
+                    d3d_programs.push(None);
                     material_program.push(None);
                     material_group_index.push(0);
                     continue;
@@ -475,7 +609,7 @@ impl AreaRenderer {
             let diffuse = m
                 .texture("mml_tDiffuse")
                 .and_then(|n| textures.get(&n).and_then(|t| t.as_ref()))
-                .map_or(&grey.view, |t| &t.view);
+                .unwrap_or(&grey.view);
             material_groups.push(texture_group(diffuse, &sampler));
             material_group_index.push(material_groups.len() - 1);
         }
@@ -486,17 +620,22 @@ impl AreaRenderer {
 
         // Draws and their uniforms.
         let mut uniforms: Vec<u8> = Vec::new();
-        let (mut opaque, mut blended) = (Vec::new(), Vec::new());
-        for d in &scene.draws {
+        // (scene draw index, draw) per list.
+        let mut opaque: Vec<(usize, DrawRef)> = Vec::new();
+        let mut blended: Vec<(usize, DrawRef)> = Vec::new();
+        let mut stand_in: Vec<Draw> = Vec::new();
+        for (di, d) in scene.draws.iter().enumerate() {
             let Some(pipeline) = material_program.get(d.material).copied().flatten() else {
-                stats.draws_skipped += 1;
+                if !matches!(d3d_programs.get(d.material), Some(Some(_))) {
+                    stats.draws_skipped += 1;
+                }
                 continue;
             };
             let (lightmap_group, lm, has_lm) = match &d.lightmap {
                 Some(l) => match textures.get(&l.texture).and_then(|t| t.as_ref()) {
                     Some(t) => {
                         let g = *lightmap_index.entry(l.texture.clone()).or_insert_with(|| {
-                            lightmap_groups.push(texture_group(&t.view, &lm_sampler));
+                            lightmap_groups.push(texture_group(t, &lm_sampler));
                             lightmap_groups.len() - 1
                         });
                         (g, [l.offset[0], l.offset[1], l.scale[0], l.scale[1]], 1.0)
@@ -521,14 +660,32 @@ impl AreaRenderer {
                 uniform_offset: offset,
             };
             if pipelines[pipeline].1 == BlendMode::AlphaBlend {
-                blended.push(draw);
+                blended.push((di, DrawRef::StandIn(stand_in.len())));
             } else {
-                opaque.push(draw);
+                opaque.push((di, DrawRef::StandIn(stand_in.len())));
+            }
+            stand_in.push(draw);
+        }
+        let d3d =
+            crate::d3d_gpu::D3dPass::new(ctx, vfs, scene, &d3d_programs, &mut cache, color_format);
+        for (k, d) in d3d.draws.iter().enumerate() {
+            if d3d.is_blended(d) {
+                blended.push((d.draw, DrawRef::D3d(k)));
+            } else {
+                opaque.push((d.draw, DrawRef::D3d(k)));
             }
         }
-        // Group opaque draws by pipeline to cut state changes.
-        opaque.sort_by_key(|d| (d.pipeline, d.material_group));
+        // Blended draws keep scene order; opaque ones are grouped to cut state changes.
+        blended.sort_by_key(|(di, _)| *di);
+        opaque.sort_by_key(|(_, r)| match r {
+            DrawRef::StandIn(i) => (0, stand_in[*i].pipeline, stand_in[*i].material_group),
+            DrawRef::D3d(i) => (1, d3d.draws[*i].pipeline, 0),
+        });
         stats.draws = opaque.len() + blended.len();
+        stats.programs.extend(d3d.programs.iter().cloned());
+        stats.textures_loaded = cache.loaded;
+        stats.textures_compressed = cache.compressed;
+        stats.textures_missing = cache.missing.clone();
         if uniforms.is_empty() {
             uniforms.resize(DRAW_STRIDE as usize, 0);
         }
@@ -560,8 +717,10 @@ impl AreaRenderer {
             pipelines,
             material_groups,
             lightmap_groups,
-            opaque,
-            blended,
+            stand_in,
+            d3d,
+            opaque: opaque.into_iter().map(|(_, r)| r).collect(),
+            blended: blended.into_iter().map(|(_, r)| r).collect(),
             depth: None,
             light: StandInLight::default(),
             stats,
@@ -622,6 +781,7 @@ impl AreaRenderer {
         };
         ctx.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
+        self.d3d.update(ctx, camera, width, height);
         let depth = self.depth_view(&ctx.device, width, height).clone();
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("area"),
@@ -646,9 +806,18 @@ impl AreaRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_bind_group(0, &self.frame_group, &[]);
-        for d in self.opaque.iter().chain(&self.blended) {
+        for r in self.opaque.iter().chain(&self.blended) {
+            let d = match *r {
+                DrawRef::StandIn(i) => &self.stand_in[i],
+                DrawRef::D3d(i) => {
+                    let d = &self.d3d.draws[i];
+                    let mesh = &self.meshes[d.mesh];
+                    self.d3d.draw(&mut pass, d, &mesh.indices, mesh.count);
+                    continue;
+                }
+            };
             let mesh = &self.meshes[d.mesh];
+            pass.set_bind_group(0, &self.frame_group, &[]);
             pass.set_pipeline(&self.pipelines[d.pipeline].0);
             pass.set_bind_group(1, &self.material_groups[d.material_group], &[]);
             pass.set_bind_group(2, &self.lightmap_groups[d.lightmap_group], &[]);
@@ -870,6 +1039,7 @@ mod tests {
                 material: 0,
                 transform: Mat4::IDENTITY,
                 lightmap: None,
+                sphere: (Vec3::new(5.0, 0.0, 0.0), 3.0),
                 model: "tri".into(),
                 room: "room".into(),
             }],

@@ -4,12 +4,16 @@
 //! - [`scene`]: CPU-side loading (layout -> rooms -> models -> meshes, materials, lightmaps).
 //! - [`material`]: which program draws each material. A hand-written stand-in for now; the
 //!   translated original shaders plug in per material.
+//! - [`d3d`]: materials drawn with their original D3D9 shaders: program building, constant
+//!   and sampler binding.
 //! - [`gpu`]: device setup, uploads, pipelines, the draw loop and offscreen capture.
 //! - [`camera`]: a free-fly camera in DA:O's Z-up world.
 //!
 //! Presentation only: nothing here writes simulation state.
 
 pub mod camera;
+pub mod d3d;
+mod d3d_gpu;
 pub mod gpu;
 pub mod material;
 pub mod scene;

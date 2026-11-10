@@ -63,12 +63,18 @@ impl Camera {
         )
     }
 
+    pub fn view(&self) -> Mat4 {
+        Mat4::look_to_rh(self.position, self.forward(), Vec3::Z)
+    }
+
+    pub fn projection(&self, aspect: f32) -> Mat4 {
+        Mat4::perspective_rh(self.fov_y, aspect.max(1e-3), self.near, self.far)
+    }
+
     /// Right-handed, Z up; depth 0..1 as wgpu expects. Provisional: handedness has not been
     /// checked against the original yet.
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
-        let view = Mat4::look_to_rh(self.position, self.forward(), Vec3::Z);
-        let proj = Mat4::perspective_rh(self.fov_y, aspect.max(1e-3), self.near, self.far);
-        proj * view
+        self.projection(aspect) * self.view()
     }
 
     /// Moves relative to the view: `forward` along the view direction, `right` sideways,
