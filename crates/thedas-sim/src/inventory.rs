@@ -21,7 +21,138 @@ pub const MSG_UNEQUIP: &str = "GUI.SelectedChar.UnequipItem";
 pub const MSG_NEXT_CHARACTER: &str = "GUI.SelectNextCharacterMessage";
 pub const MSG_PREVIOUS_CHARACTER: &str = "GUI.SelectPreviousCharacterMessage";
 
+/// `itemprps.gda` columns whose names are not known: the property's kind (1 while worn, 2
+/// on hit, 3 a restriction, 4 other) and the effect parameter its power scales (`Float0`).
+const ITEMPRPS_KIND: u32 = 0x4fe5_e973;
+const ITEMPRPS_POWER_PARAM: u32 = 0x3600_1b03;
+/// An item property kind that holds while the item is worn.
+const ITEMPRPS_WORN: i64 = 1;
+/// `Int0` of a property that modifies every attribute (`Increase All Attributes`).
+const ALL_ATTRIBUTES: i32 = -1000;
+
 impl Sim {
+    /// The effects an item's properties put on whoever wears it: for each of its template's
+    /// properties of the worn kind, `itemprps.gda`'s effect with its `Int0`/`Int1`,
+    /// `Float0`/`Float1`, the parameter the row names scaled by the property's power, the
+    /// item as creator. Provisional: the kinds, the power rule and the all-attributes row
+    /// are read from the table's contents, not traced in the executable; on-hit
+    /// properties and restrictions are not applied here.
+    pub fn property_effects(&self, item: ObjectId) -> Vec<crate::world::Effect> {
+        use thedas_formats::gda::Cell;
+        let props = self.item_look(item).properties;
+        if props.is_empty() {
+            return Vec::new();
+        }
+        let tables = self.world.tables();
+        let Some(t) = tables.get(0, "itemprps") else {
+            return Vec::new();
+        };
+        let int = |c: Option<&Cell>| match c {
+            Some(Cell::Int(v)) => *v as i32,
+            Some(Cell::Float(v)) => *v as i32,
+            _ => 0,
+        };
+        let float = |c: Option<&Cell>| match c {
+            Some(Cell::Float(v)) => *v as f32,
+            Some(Cell::Int(v)) => *v as f32,
+            _ => 0.0,
+        };
+        let permanent = crate::sim::constant(&self.table, "EFFECT_DURATION_TYPE_PERMANENT");
+        let mut out = Vec::new();
+        for (row, power) in props {
+            let row = row as i64;
+            if int(t.cell_by_hash(ITEMPRPS_KIND, row)) as i64 != ITEMPRPS_WORN {
+                continue;
+            }
+            let ty = int(t.cell("Effect", row));
+            if ty == 0 {
+                continue;
+            }
+            let mut ints = vec![int(t.cell("Int0", row)), int(t.cell("Int1", row))];
+            let mut floats = vec![float(t.cell("Float0", row)), float(t.cell("Float1", row))];
+            let scaled = match t.cell_by_hash(ITEMPRPS_POWER_PARAM, row) {
+                Some(Cell::String(s)) => s.trim_end_matches('\0').trim().to_ascii_lowercase(),
+                _ => String::new(),
+            };
+            match scaled.as_str() {
+                "float0" => floats[0] *= power as f32,
+                "float1" => floats[1] *= power as f32,
+                "int0" => ints[0] *= power,
+                "int1" => ints[1] *= power,
+                _ => {}
+            }
+            // Every attribute: strength to constitution (properties 1 to 6).
+            if ty == 1012 && ints[0] == ALL_ATTRIBUTES {
+                ints = (1..=6).collect();
+                floats = vec![floats[0]; 6];
+            }
+            out.push(crate::world::Effect {
+                ty,
+                creator: Some(item),
+                ints,
+                floats,
+                duration_type: permanent,
+                ..Default::default()
+            });
+        }
+        out
+    }
+
+    /// The engine's side of `who` putting on `item` (already in `slot`): the item's
+    /// properties take effect through the creature's `APPLY_EFFECT` handler, and its script
+    /// hears `EVENT_TYPE_EQUIP` (object 0 the item, integer 0 the slot, integer 1 the active
+    /// weapon set). Provisional: the event's integers are read from how player_core uses
+    /// them (integer 0 compared with the main- and off-hand slots); the second is a guess.
+    pub(crate) fn wear(&mut self, who: ObjectId, item: ObjectId, slot: i32) {
+        for e in self.property_effects(item) {
+            self.apply_effect(who, e);
+        }
+        self.equip_event("EQUIP", who, item, slot);
+    }
+
+    /// The engine's side of `who` taking off `item` (from `slot`): the effects it created on
+    /// `who` go through the `REMOVE_EFFECT` handler, and the script hears
+    /// `EVENT_TYPE_UNEQUIP`, laid out as [`Sim::wear`]'s event.
+    pub(crate) fn take_off(&mut self, who: ObjectId, item: ObjectId, slot: i32) {
+        let mine: Vec<crate::world::Effect> = self
+            .world
+            .get(who)
+            .map(|o| {
+                o.effects
+                    .iter()
+                    .filter(|e| e.creator == Some(item))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        for e in mine {
+            self.remove_effect(who, &e);
+        }
+        self.equip_event("UNEQUIP", who, item, slot);
+    }
+
+    fn equip_event(&mut self, name: &str, who: ObjectId, item: ObjectId, slot: i32) {
+        let set = self
+            .world
+            .get(who)
+            .and_then(|o| o.fields.get("ActiveWeaponSet").copied())
+            .unwrap_or(0);
+        let mut ev = self.new_event(name, Some(who));
+        ev.objects = vec![item];
+        ev.ints = vec![slot, set];
+        self.world.queue_event(0, who, ev, None);
+    }
+
+    /// The slot `who` wears `item` in.
+    pub fn worn_slot(&self, who: ObjectId, item: ObjectId) -> Option<i32> {
+        self.world
+            .get(who)?
+            .equipment
+            .iter()
+            .find(|(_, i)| **i == item)
+            .map(|(s, _)| *s)
+    }
+
     /// The party's backpack: what the party members carry and do not wear, the hero's first.
     /// Provisional: the party shares one pack, as the game's inventory screen shows it.
     pub fn party_backpack(&self) -> Vec<ObjectId> {
@@ -78,11 +209,20 @@ impl Sim {
         if !self.party_backpack().contains(&item) && self.wearer(item).is_none() {
             return false;
         }
+        // Whoever wore it takes it off, and what `who` wore in the slot comes off.
+        if let Some(m) = self.wearer(item) {
+            self.unequip(m, item);
+        }
+        if let Some(old) = self
+            .world
+            .get(who)
+            .and_then(|o| o.equipment.get(&slot).copied())
+        {
+            self.unequip(who, old);
+        }
         for m in party {
-            if let Some(o) = self.world.get_mut(m) {
-                o.equipment.retain(|_, i| *i != item);
-                o.other_set.retain(|_, i| *i != item);
-                if m != who {
+            if m != who {
+                if let Some(o) = self.world.get_mut(m) {
                     o.inventory.retain(|i| *i != item);
                 }
             }
@@ -94,7 +234,31 @@ impl Sim {
             o.inventory.push(item);
         }
         o.equipment.insert(slot, item);
+        self.wear(who, item, slot);
         true
+    }
+
+    /// Takes `item` off `who` (either weapon set) as the engine does: see [`Sim::take_off`].
+    /// Returns whether `who` wore it.
+    pub(crate) fn unequip(&mut self, who: ObjectId, item: ObjectId) -> bool {
+        let Some(o) = self.world.get_mut(who) else {
+            return false;
+        };
+        let slot = o
+            .equipment
+            .iter()
+            .chain(o.other_set.iter())
+            .find(|(_, i)| **i == item)
+            .map(|(s, _)| *s);
+        o.equipment.retain(|_, i| *i != item);
+        o.other_set.retain(|_, i| *i != item);
+        match slot {
+            Some(slot) => {
+                self.take_off(who, item, slot);
+                true
+            }
+            None => false,
+        }
     }
 
     /// The player takes `item` off party member `who`; it stays in the backpack. Returns
@@ -103,13 +267,7 @@ impl Sim {
         if !crate::engine::party_of(self).contains(&who) {
             return false;
         }
-        let Some(o) = self.world.get_mut(who) else {
-            return false;
-        };
-        let n = o.equipment.len() + o.other_set.len();
-        o.equipment.retain(|_, i| *i != item);
-        o.other_set.retain(|_, i| *i != item);
-        n != o.equipment.len() + o.other_set.len()
+        self.unequip(who, item)
     }
 
     /// The inventory screen's messages ([`MSG_EQUIP`], [`MSG_UNEQUIP`]), for the party member
@@ -396,13 +554,16 @@ impl Sim {
             .copied()
             .find(|s| !taken.contains_key(s))
             .or_else(|| slots.first().copied())?;
+        self.unequip(who, item);
+        if let Some(old) = self.world.get(who)?.equipment.get(&slot).copied() {
+            self.unequip(who, old);
+        }
         let o = self.world.get_mut(who)?;
         if !o.inventory.contains(&item) {
             o.inventory.push(item);
         }
-        o.equipment.retain(|_, i| *i != item);
-        o.other_set.retain(|_, i| *i != item);
         o.equipment.insert(slot, item);
+        self.wear(who, item, slot);
         Some(slot)
     }
 
@@ -433,6 +594,7 @@ impl Sim {
             };
             if let (Some(slot), Some(o)) = (free, self.world.get_mut(who)) {
                 o.equipment.insert(slot, item);
+                self.wear(who, item, slot);
                 out.push((item, slot));
             }
         }
@@ -564,6 +726,94 @@ mod screen_tests {
         assert!(s.unequip_item(ally, sword));
         assert!(!s.unequip_item(ally, sword));
         assert!(s.party_backpack().contains(&sword));
+    }
+
+    #[test]
+    fn wearing_applies_the_items_properties_and_tells_the_script() {
+        let table = EngineTable::parse(
+            b"int INVENTORY_SLOT_INVALID = 255;\nint EVENT_TYPE_EQUIP = 11;\n\
+              int EVENT_TYPE_UNEQUIP = 12;\nint EFFECT_DURATION_TYPE_INSTANT = 1;\n\
+              int EFFECT_DURATION_TYPE_PERMANENT = 3;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let tables = s.world.tables();
+        tables.insert(
+            "bitm_base",
+            &["EquippableSlots"],
+            vec![(29, vec![Cell::Int(1 << 11)])],
+        );
+        // Increase Constitution: EFFECT_TYPE_MODIFY_PROPERTY on property 6, Float0 per
+        // power; a restriction, which is not an effect.
+        tables.insert(
+            "itemprps",
+            &[
+                "#4fe5e973",
+                "Effect",
+                "Int0",
+                "Int1",
+                "Float0",
+                "Float1",
+                "#36001b03",
+            ],
+            vec![
+                (
+                    1005,
+                    vec![
+                        Cell::Int(1),
+                        Cell::Int(1012),
+                        Cell::Int(6),
+                        Cell::Int(0),
+                        Cell::Float(1.0),
+                        Cell::Float(0.0),
+                        Cell::String("Float0".into()),
+                    ],
+                ),
+                (
+                    10018,
+                    vec![
+                        Cell::Int(3),
+                        Cell::Int(0),
+                        Cell::Int(0),
+                        Cell::Int(0),
+                        Cell::Float(0.0),
+                        Cell::Float(0.0),
+                        Cell::String(String::new()),
+                    ],
+                ),
+            ],
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.hero = Some(hero);
+        let amulet = s.world.spawn(ObjectKind::Item, "amulet");
+        let o = s.world.get_mut(amulet).unwrap();
+        o.template = "amulet".into();
+        o.fields.insert("BaseItem".into(), 29);
+        s.set_item_look(
+            "amulet",
+            crate::sim::ItemLook {
+                properties: vec![(1005, 2), (10018, 1)],
+                ..Default::default()
+            },
+        );
+        s.world.get_mut(hero).unwrap().inventory.push(amulet);
+        assert!(s.equip_item(hero, amulet, 255));
+        let worn = &s.world.get(hero).unwrap().effects;
+        assert_eq!(worn.len(), 1);
+        assert_eq!((worn[0].ty, worn[0].creator), (1012, Some(amulet)));
+        assert_eq!((worn[0].ints[0], worn[0].floats[0]), (6, 2.0));
+        let events = |s: &Sim| -> Vec<(i32, Vec<ObjectId>, Vec<i32>)> {
+            s.world
+                .queue
+                .values()
+                .filter(|q| q.target == hero)
+                .map(|q| (q.event.ty, q.event.objects.clone(), q.event.ints.clone()))
+                .collect()
+        };
+        assert_eq!(events(&s), vec![(11, vec![amulet], vec![11, 0])]);
+        assert!(s.unequip_item(hero, amulet));
+        assert!(s.world.get(hero).unwrap().effects.is_empty());
+        assert_eq!(events(&s)[1], (12, vec![amulet], vec![11, 0]));
     }
 
     #[test]

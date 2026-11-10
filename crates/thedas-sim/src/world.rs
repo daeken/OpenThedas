@@ -112,6 +112,11 @@ pub struct Object {
     pub dialog: Option<String>,
     /// Creature properties (`properties.gda` ids): base and current value.
     pub properties: BTreeMap<i32, (f32, f32)>,
+    /// What effects add to properties (`ApplyEffectModifyProperty`, from buffs and worn
+    /// items), apart from the base so that scripts setting a base keep them: the
+    /// `PROPERTY_VALUE_MODIFIER` part of a total.
+    #[serde(default)]
+    pub modifiers: BTreeMap<i32, f32>,
     pub dead: bool,
     /// When the creature last died (simulation milliseconds); `None` while alive. For
     /// presentation (the death animation plays from it) and saves.
@@ -181,6 +186,7 @@ impl Object {
             script: None,
             dialog: None,
             properties: BTreeMap::new(),
+            modifiers: BTreeMap::new(),
             dead: false,
             died_at: None,
             head_morph: None,
