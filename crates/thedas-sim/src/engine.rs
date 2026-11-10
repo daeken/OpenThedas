@@ -1350,6 +1350,7 @@ pub fn call(
                 from: None,
                 approach: None,
                 ring_wait: false,
+                path: Vec::new(),
             };
             for (p, v) in f.params.iter().zip(a) {
                 match (&p.ty, v) {

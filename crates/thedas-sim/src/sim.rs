@@ -96,6 +96,44 @@ pub struct Sim {
 
 pub const MAX_DEPTH: usize = 24;
 
+/// The length of a route from `from` through `points`.
+fn path_length(from: [f32; 3], points: &[[f32; 3]]) -> f32 {
+    let mut prev = from;
+    let mut len = 0.0;
+    for &p in points {
+        len += crate::engine::dist(prev, p);
+        prev = p;
+    }
+    len
+}
+
+/// The point a fraction `f` (0 to 1) of the way along a route from `from` through `points`.
+fn along(from: [f32; 3], points: &[[f32; 3]], f: f32) -> [f32; 3] {
+    let total = path_length(from, points);
+    let Some(&last) = points.last() else {
+        return from;
+    };
+    if total <= 0.0 || f >= 1.0 {
+        return last;
+    }
+    let mut left = total * f.max(0.0);
+    let mut prev = from;
+    for &p in points {
+        let d = crate::engine::dist(prev, p);
+        if left <= d && d > 0.0 {
+            let k = left / d;
+            return [
+                prev[0] + (p[0] - prev[0]) * k,
+                prev[1] + (p[1] - prev[1]) * k,
+                prev[2] + (p[2] - prev[2]) * k,
+            ];
+        }
+        left -= d;
+        prev = p;
+    }
+    last
+}
+
 /// Where an attacker goes before its attack starts (see `Sim::approach_point`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Approach {
@@ -932,36 +970,48 @@ impl Sim {
     /// that is replaced before it finishes so starts the next one from there, as continuous
     /// movement does. Provisional: the path is straight and triggers on the way are crossed
     /// only when the move finishes.
+    /// The route a mover takes from where it is to `to` in its area: the area's pathing
+    /// grid's route (see `nav::route`), as waypoints ending at `to`; empty (a straight line)
+    /// when there is no grid, either end is off it or no route exists.
+    pub(crate) fn route_to(&mut self, id: ObjectId, to: [f32; 3]) -> Vec<[f32; 3]> {
+        let Some((from, Some(area))) = self.world.get(id).map(|o| (o.position, o.area)) else {
+            return Vec::new();
+        };
+        self.nav_grid(area)
+            .and_then(|g| crate::nav::route(&g, from, to))
+            .unwrap_or_default()
+    }
+
     fn advance_movers(&mut self) {
         let now = self.world.time_ms;
-        // (mover, start, start time, due, destination)
-        type Move = (ObjectId, [f32; 3], u64, u64, [f32; 3]);
-        let moving: Vec<Move> = self
-            .world
-            .objects
-            .values()
-            .filter_map(|o| {
-                let c = o.commands.first()?;
-                let (from, t0) = c.from?;
-                let due = c.due?;
-                let to = c
-                    .approach
-                    .or(c.location.map(|l| l.position))
-                    .or_else(|| c.target.and_then(|t| self.world.get(t)).map(|t| t.position))?;
-                Some((o.id, from, t0, due, to))
-            })
-            .collect();
-        for (id, from, t0, due, to) in moving {
+        // (mover, start, start time, due, the points after the start)
+        type Move = (ObjectId, [f32; 3], u64, u64, Vec<[f32; 3]>);
+        let moving: Vec<Move> =
+            self.world
+                .objects
+                .values()
+                .filter_map(|o| {
+                    let c = o.commands.first()?;
+                    let (from, t0) = c.from?;
+                    let due = c.due?;
+                    let points = if c.path.is_empty() {
+                        vec![c.approach.or(c.location.map(|l| l.position)).or_else(|| {
+                            c.target.and_then(|t| self.world.get(t)).map(|t| t.position)
+                        })?]
+                    } else {
+                        c.path.clone()
+                    };
+                    Some((o.id, from, t0, due, points))
+                })
+                .collect();
+        for (id, from, t0, due, points) in moving {
             if due <= t0 {
                 continue;
             }
             let f = (now.saturating_sub(t0) as f32 / (due - t0) as f32).clamp(0.0, 1.0);
+            let p = along(from, &points, f);
             if let Some(o) = self.world.get_mut(id) {
-                o.position = [
-                    from[0] + (to[0] - from[0]) * f,
-                    from[1] + (to[1] - from[1]) * f,
-                    from[2] + (to[2] - from[2]) * f,
-                ];
+                o.position = p;
             }
         }
     }
@@ -1105,6 +1155,15 @@ impl Sim {
                         };
                         if let Some(stop) = stop {
                             let pos = self.world.get(id).map(|o| o.position);
+                            let path = if walk.is_some() {
+                                self.route_to(id, stop)
+                            } else {
+                                Vec::new()
+                            };
+                            let walk = walk.map(|d| match pos {
+                                Some(p) if !path.is_empty() => path_length(p, &path),
+                                _ => d,
+                            });
                             let ms = match walk {
                                 Some(d) => ((d / self.move_speed(id)) * 1000.0).max(1.0) as u64,
                                 None => 1000,
@@ -1117,6 +1176,7 @@ impl Sim {
                                 c.approach = Some(stop);
                                 c.from = pos.map(|p| (p, now));
                                 c.ring_wait |= wait;
+                                c.path = path;
                             }
                             if best.is_none_or(|(b, bid)| (due, id) < (b, bid)) {
                                 best = Some((due, id));
@@ -1163,15 +1223,30 @@ impl Sim {
                     } else {
                         None
                     };
-                    let d = now
-                        + attack_ms
-                            .unwrap_or_else(|| self.command_duration(id, &cmd))
-                            .max(1);
+                    // A move follows the area's pathing grid (see `route_to`) and takes as
+                    // long as its route at the mover's speed.
                     let pos = self.world.get(id).map(|o| o.position);
+                    let mut path = Vec::new();
+                    let mut ms = attack_ms.unwrap_or_else(|| self.command_duration(id, &cmd));
+                    if cmd.name.starts_with("CommandMoveTo") {
+                        let to = cmd.location.map(|l| l.position).or_else(|| {
+                            cmd.target
+                                .and_then(|t| self.world.get(t))
+                                .map(|o| o.position)
+                        });
+                        if let (Some(to), Some(p)) = (to, pos) {
+                            path = self.route_to(id, to);
+                            if !path.is_empty() {
+                                ms = (path_length(p, &path) / self.move_speed(id) * 1000.0) as u64;
+                            }
+                        }
+                    }
+                    let d = now + ms.max(1);
                     if let Some(c) = self.world.get_mut(id).and_then(|o| o.commands.first_mut()) {
                         c.due = Some(d);
                         if c.name.starts_with("CommandMoveTo") {
                             c.from = pos.map(|p| (p, now));
+                            c.path = path;
                         }
                     }
                     d
@@ -1204,17 +1279,19 @@ impl Sim {
             }
         }
         if let Some(l) = cmd.location {
-            // Cross the triggers between here and there on the way (straight line).
-            let from = self.world.get(id).map(|o| (o.position, o.area));
-            if let Some((from, Some(a))) = from.filter(|f| f.1 == Some(l.area)) {
-                let steps = (crate::engine::dist(from, l.position) / 0.5).ceil() as usize;
+            // Cross the triggers between where the move began and its end on the way (along
+            // its route, or a straight line).
+            let here = self.world.get(id).map(|o| (o.position, o.area));
+            if let Some((now_at, Some(a))) = here.filter(|f| f.1 == Some(l.area)) {
+                let from = cmd.from.map_or(now_at, |f| f.0);
+                let points = if cmd.path.is_empty() {
+                    vec![l.position]
+                } else {
+                    cmd.path.clone()
+                };
+                let steps = (path_length(from, &points) / 0.5).ceil() as usize;
                 for i in 1..steps {
-                    let f = i as f32 / steps as f32;
-                    let p = [
-                        from[0] + (l.position[0] - from[0]) * f,
-                        from[1] + (l.position[1] - from[1]) * f,
-                        from[2] + (l.position[2] - from[2]) * f,
-                    ];
+                    let p = along(from, &points, i as f32 / steps as f32);
                     self.move_object(id, p, Some(a));
                 }
             }
@@ -2284,6 +2361,7 @@ mod tests {
             from: None,
             approach: None,
             ring_wait: false,
+            path: Vec::new(),
         };
         let o = s.world.get_mut(id).unwrap();
         o.commands.push(cmd("CommandPlayAnimation", 0.0));
@@ -2322,6 +2400,7 @@ mod tests {
             from: None,
             approach: None,
             ring_wait: false,
+            path: Vec::new(),
         };
         s.world.get_mut(id).unwrap().commands.push(walk());
         // 5 m/s: two seconds in, ten metres along.
@@ -2362,6 +2441,7 @@ mod tests {
             from: None,
             approach: None,
             ring_wait: false,
+            path: Vec::new(),
         });
         // At 5 m/s: five metres after a second.
         s.tick(1000);
@@ -2418,6 +2498,7 @@ mod tests {
             from: None,
             approach: None,
             ring_wait: false,
+            path: Vec::new(),
         });
         // It walks to just outside the crowd and waits; the ring is still full, so the
         // attack fails and its owner hears so.
