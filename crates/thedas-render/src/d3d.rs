@@ -255,7 +255,8 @@ pub fn static1_filter() -> ShaderFilter {
 /// [`static1_filter`] plus the vertex shaders that draw creatures and placeables:
 /// characters (`Char1`), hair (`Hair0_Pass1`, `Hair0`: four passes), faces (`Face1`), eyes
 /// and lashes (`Eye0`), cloth (`Cloth1`), props (`Prop1`) and weapons (`Weapon1`), with any
-/// pixel shader; and exterior terrain (`Terrain2`, terrain.mat's high-detail pass).
+/// pixel shader; and exterior terrain (`Terrain2`, terrain.mat's pass above Low detail, and
+/// `Terrain3`, its Low detail pass).
 pub fn object_filter() -> ShaderFilter {
     let mut v = static1_filter().unwrap_or_default();
     for vs in OBJECT_VERTEX_SHADERS {
@@ -265,7 +266,7 @@ pub fn object_filter() -> ShaderFilter {
 }
 
 /// See [`object_filter`].
-pub const OBJECT_VERTEX_SHADERS: [&str; 9] = [
+pub const OBJECT_VERTEX_SHADERS: [&str; 10] = [
     "Char1.vsh",
     "Hair0_Pass1.vsh",
     "Hair0.vsh",
@@ -275,6 +276,7 @@ pub const OBJECT_VERTEX_SHADERS: [&str; 9] = [
     "Prop1.vsh",
     "Weapon1.vsh",
     "Terrain2.vsh",
+    "Terrain3.vsh",
 ];
 
 /// Point lights chosen for one draw, in slot order A, B, C.
