@@ -221,6 +221,14 @@ pub struct Command {
     /// (see `Sim::attack_reach`).
     #[serde(default)]
     pub approach: Option<[f32; 3]>,
+    /// For a melee attack: it found the target's melee ring full once and is waiting by it
+    /// (see `Sim::approach_point`).
+    #[serde(default)]
+    pub ring_wait: bool,
+    /// For a move or an approach under way: the route's waypoints after `from`, ending at
+    /// the destination (empty: a straight line). See `Sim::route_to`.
+    #[serde(default)]
+    pub path: Vec<[f32; 3]>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

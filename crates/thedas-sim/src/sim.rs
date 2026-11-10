@@ -96,6 +96,59 @@ pub struct Sim {
 
 pub const MAX_DEPTH: usize = 24;
 
+/// The length of a route from `from` through `points`.
+fn path_length(from: [f32; 3], points: &[[f32; 3]]) -> f32 {
+    let mut prev = from;
+    let mut len = 0.0;
+    for &p in points {
+        len += crate::engine::dist(prev, p);
+        prev = p;
+    }
+    len
+}
+
+/// The point a fraction `f` (0 to 1) of the way along a route from `from` through `points`.
+fn along(from: [f32; 3], points: &[[f32; 3]], f: f32) -> [f32; 3] {
+    let total = path_length(from, points);
+    let Some(&last) = points.last() else {
+        return from;
+    };
+    if total <= 0.0 || f >= 1.0 {
+        return last;
+    }
+    let mut left = total * f.max(0.0);
+    let mut prev = from;
+    for &p in points {
+        let d = crate::engine::dist(prev, p);
+        if left <= d && d > 0.0 {
+            let k = left / d;
+            return [
+                prev[0] + (p[0] - prev[0]) * k,
+                prev[1] + (p[1] - prev[1]) * k,
+                prev[2] + (p[2] - prev[2]) * k,
+            ];
+        }
+        left -= d;
+        prev = p;
+    }
+    last
+}
+
+/// Where an attacker goes before its attack starts (see `Sim::approach_point`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Approach {
+    /// In reach already: the attack starts.
+    InReach,
+    /// Walk this far to this point first.
+    Walk(f32, [f32; 3]),
+    /// The melee ring is full: walk this far to wait just outside it.
+    WaitAt(f32, [f32; 3]),
+    /// The melee ring is full and the attacker is by it: stand a second.
+    Wait([f32; 3]),
+    /// Still full after waiting: the attack fails.
+    Full,
+}
+
 /// What the simulation does when a script starts character generation, since there is no
 /// player at the character-creation screens.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -917,63 +970,155 @@ impl Sim {
     /// that is replaced before it finishes so starts the next one from there, as continuous
     /// movement does. Provisional: the path is straight and triggers on the way are crossed
     /// only when the move finishes.
+    /// The route a mover takes from where it is to `to` in its area: the area's pathing
+    /// grid's route (see `nav::route`), as waypoints ending at `to`; empty (a straight line)
+    /// when there is no grid, either end is off it or no route exists.
+    pub(crate) fn route_to(&mut self, id: ObjectId, to: [f32; 3]) -> Vec<[f32; 3]> {
+        let Some((from, Some(area))) = self.world.get(id).map(|o| (o.position, o.area)) else {
+            return Vec::new();
+        };
+        self.nav_grid(area)
+            .and_then(|g| crate::nav::route(&g, from, to))
+            .unwrap_or_default()
+    }
+
     fn advance_movers(&mut self) {
         let now = self.world.time_ms;
-        // (mover, start, start time, due, destination)
-        type Move = (ObjectId, [f32; 3], u64, u64, [f32; 3]);
-        let moving: Vec<Move> = self
-            .world
-            .objects
-            .values()
-            .filter_map(|o| {
-                let c = o.commands.first()?;
-                let (from, t0) = c.from?;
-                let due = c.due?;
-                let to = c
-                    .approach
-                    .or(c.location.map(|l| l.position))
-                    .or_else(|| c.target.and_then(|t| self.world.get(t)).map(|t| t.position))?;
-                Some((o.id, from, t0, due, to))
-            })
-            .collect();
-        for (id, from, t0, due, to) in moving {
+        // (mover, start, start time, due, the points after the start)
+        type Move = (ObjectId, [f32; 3], u64, u64, Vec<[f32; 3]>);
+        let moving: Vec<Move> =
+            self.world
+                .objects
+                .values()
+                .filter_map(|o| {
+                    let c = o.commands.first()?;
+                    let (from, t0) = c.from?;
+                    let due = c.due?;
+                    let points = if c.path.is_empty() {
+                        vec![c.approach.or(c.location.map(|l| l.position)).or_else(|| {
+                            c.target.and_then(|t| self.world.get(t)).map(|t| t.position)
+                        })?]
+                    } else {
+                        c.path.clone()
+                    };
+                    Some((o.id, from, t0, due, points))
+                })
+                .collect();
+        for (id, from, t0, due, points) in moving {
             if due <= t0 {
                 continue;
             }
             let f = (now.saturating_sub(t0) as f32 / (due - t0) as f32).clamp(0.0, 1.0);
+            let p = along(from, &points, f);
             if let Some(o) = self.world.get_mut(id) {
-                o.position = [
-                    from[0] + (to[0] - from[0]) * f,
-                    from[1] + (to[1] - from[1]) * f,
-                    from[2] + (to[2] - from[2]) * f,
-                ];
+                o.position = p;
             }
         }
     }
 
-    /// For an attack whose target is beyond the attacker's reach (in the same area): the
-    /// distance to walk and the point at reach on the straight line to the target.
-    fn approach_point(&self, id: ObjectId, cmd: &Command) -> Option<(f32, [f32; 3])> {
-        let me = self.world.get(id)?;
-        let t = self.world.get(cmd.target?)?;
+    /// Where an attacker goes before its attack can start. Melee attackers take a place on
+    /// the target's melee ring: the free one nearest their line of approach, on a circle at
+    /// the two bodies' reach (`Sim::reach_to`), a place being free when no other creature's
+    /// body overlaps it. Ranged attackers stop at range on the straight line.
+    ///
+    /// The original keeps melee rings (`GetCreaturesInMeleeRing`, `GetMeleeRingPosition`)
+    /// and fails an attack on a full one (`COMMAND_FAILED_NO_SPACE_IN_MELEE_RING`); the
+    /// geometry here is provisional: bodies are circles of the appearances' personal space
+    /// (`PERSPACE`), and an attacker that finds the ring full waits by it once (walking to
+    /// just outside it, or standing a second) before its attack fails.
+    fn approach_point(&self, id: ObjectId, cmd: &Command) -> Approach {
+        let (Some(me), Some(target)) = (self.world.get(id), cmd.target) else {
+            return Approach::InReach;
+        };
+        let Some(t) = self.world.get(target) else {
+            return Approach::InReach;
+        };
         if me.area != t.area {
-            return None;
+            return Approach::InReach;
         }
         let (a, b) = (me.position, t.position);
         let d = crate::engine::dist(a, b);
-        let reach = self.attack_reach(id);
+        let reach = self.reach_to(id, target);
         if d <= reach + 0.05 {
-            return None;
+            return Approach::InReach;
         }
-        let f = (d - reach) / d;
-        Some((
-            d - reach,
-            [
+        if reach > crate::combat::MELEE_REACH {
+            let f = (d - reach) / d;
+            let p = [
                 a[0] + (b[0] - a[0]) * f,
                 a[1] + (b[1] - a[1]) * f,
                 a[2] + (b[2] - a[2]) * f,
-            ],
-        ))
+            ];
+            return Approach::Walk(d - reach, p);
+        }
+        let mine = self.body_radius(id);
+        let ring = reach - crate::combat::MELEE_GAP * 0.5;
+        let near = ring + mine + 2.0;
+        let others: Vec<([f32; 3], f32)> = self
+            .world
+            .objects
+            .values()
+            .filter(|o| {
+                o.id != id
+                    && o.id != target
+                    && o.kind == crate::world::ObjectKind::Creature
+                    && o.area == me.area
+                    && o.active
+                    && !o.dead
+                    && crate::engine::dist(o.position, b) <= near
+            })
+            .map(|o| (o.position, self.body_radius(o.id)))
+            .collect();
+        let free = |p: [f32; 3]| {
+            others.iter().all(|(q, r)| {
+                ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt() >= (mine + r) * 0.9
+            })
+        };
+        let at = |ang: f32, rad: f32| [b[0] + rad * ang.cos(), b[1] + rad * ang.sin(), b[2]];
+        let base = (a[1] - b[1]).atan2(a[0] - b[0]);
+        let step = (2.0 * mine / ring.max(0.1)).clamp(0.05, std::f32::consts::PI);
+        let n = (std::f32::consts::PI / step).ceil() as i32;
+        let slot = (0..=n)
+            .flat_map(|k| [k, -k])
+            .map(|k| at(base + k as f32 * step, ring))
+            .find(|&p| free(p));
+        match slot {
+            Some(p) => Approach::Walk(crate::engine::dist(a, p), p),
+            None if cmd.ring_wait => Approach::Full,
+            None => {
+                let p = at(base, ring + 2.0 * mine + 0.3);
+                let walk = crate::engine::dist(a, p);
+                if walk < 0.3 {
+                    Approach::Wait(a)
+                } else {
+                    Approach::WaitAt(walk, p)
+                }
+            }
+        }
+    }
+
+    /// Drops an object's front command as failed: it hears `COMMAND_COMPLETE` with the
+    /// result (a `COMMAND_FAILED_*` constant).
+    pub(crate) fn fail_front_command(&mut self, id: ObjectId, result: &str) {
+        let result = constant(&self.table, result);
+        let Some(c) = self
+            .world
+            .get_mut(id)
+            .filter(|o| !o.commands.is_empty())
+            .map(|o| o.commands.remove(0))
+        else {
+            return;
+        };
+        let t = self.world.time_ms;
+        self.world.trace.push(TraceEntry::Command {
+            t,
+            object: id,
+            command: c.name.clone(),
+            status: format!("failed {result}"),
+        });
+        let mut ev = self.new_event("COMMAND_COMPLETE", Some(id));
+        ev.ints = vec![c.ty, result];
+        self.world.queue_event(0, id, ev, None);
     }
 
     /// The earliest-finishing front command, starting the clock on fronts that have none.
@@ -995,15 +1140,43 @@ impl Sim {
                     // An attacker out of reach walks up first (the attack starts when it
                     // gets there).
                     if cmd.name == "CommandAttack" {
-                        if let Some((d, stop)) = self.approach_point(id, &cmd) {
+                        let (walk, stop, wait) = match self.approach_point(id, &cmd) {
+                            Approach::InReach => (None, None, false),
+                            Approach::Walk(d, p) => (Some(d), Some(p), false),
+                            Approach::WaitAt(d, p) => (Some(d), Some(p), true),
+                            Approach::Wait(p) => (None, Some(p), true),
+                            Approach::Full => {
+                                self.fail_front_command(
+                                    id,
+                                    "COMMAND_FAILED_NO_SPACE_IN_MELEE_RING",
+                                );
+                                continue;
+                            }
+                        };
+                        if let Some(stop) = stop {
                             let pos = self.world.get(id).map(|o| o.position);
-                            let due = now + ((d / self.move_speed(id)) * 1000.0).max(1.0) as u64;
+                            let path = if walk.is_some() {
+                                self.route_to(id, stop)
+                            } else {
+                                Vec::new()
+                            };
+                            let walk = walk.map(|d| match pos {
+                                Some(p) if !path.is_empty() => path_length(p, &path),
+                                _ => d,
+                            });
+                            let ms = match walk {
+                                Some(d) => ((d / self.move_speed(id)) * 1000.0).max(1.0) as u64,
+                                None => 1000,
+                            };
+                            let due = now + ms;
                             if let Some(c) =
                                 self.world.get_mut(id).and_then(|o| o.commands.first_mut())
                             {
                                 c.due = Some(due);
                                 c.approach = Some(stop);
                                 c.from = pos.map(|p| (p, now));
+                                c.ring_wait |= wait;
+                                c.path = path;
                             }
                             if best.is_none_or(|(b, bid)| (due, id) < (b, bid)) {
                                 best = Some((due, id));
@@ -1050,15 +1223,30 @@ impl Sim {
                     } else {
                         None
                     };
-                    let d = now
-                        + attack_ms
-                            .unwrap_or_else(|| self.command_duration(id, &cmd))
-                            .max(1);
+                    // A move follows the area's pathing grid (see `route_to`) and takes as
+                    // long as its route at the mover's speed.
                     let pos = self.world.get(id).map(|o| o.position);
+                    let mut path = Vec::new();
+                    let mut ms = attack_ms.unwrap_or_else(|| self.command_duration(id, &cmd));
+                    if cmd.name.starts_with("CommandMoveTo") {
+                        let to = cmd.location.map(|l| l.position).or_else(|| {
+                            cmd.target
+                                .and_then(|t| self.world.get(t))
+                                .map(|o| o.position)
+                        });
+                        if let (Some(to), Some(p)) = (to, pos) {
+                            path = self.route_to(id, to);
+                            if !path.is_empty() {
+                                ms = (path_length(p, &path) / self.move_speed(id) * 1000.0) as u64;
+                            }
+                        }
+                    }
+                    let d = now + ms.max(1);
                     if let Some(c) = self.world.get_mut(id).and_then(|o| o.commands.first_mut()) {
                         c.due = Some(d);
                         if c.name.starts_with("CommandMoveTo") {
                             c.from = pos.map(|p| (p, now));
+                            c.path = path;
                         }
                     }
                     d
@@ -1091,17 +1279,19 @@ impl Sim {
             }
         }
         if let Some(l) = cmd.location {
-            // Cross the triggers between here and there on the way (straight line).
-            let from = self.world.get(id).map(|o| (o.position, o.area));
-            if let Some((from, Some(a))) = from.filter(|f| f.1 == Some(l.area)) {
-                let steps = (crate::engine::dist(from, l.position) / 0.5).ceil() as usize;
+            // Cross the triggers between where the move began and its end on the way (along
+            // its route, or a straight line).
+            let here = self.world.get(id).map(|o| (o.position, o.area));
+            if let Some((now_at, Some(a))) = here.filter(|f| f.1 == Some(l.area)) {
+                let from = cmd.from.map_or(now_at, |f| f.0);
+                let points = if cmd.path.is_empty() {
+                    vec![l.position]
+                } else {
+                    cmd.path.clone()
+                };
+                let steps = (path_length(from, &points) / 0.5).ceil() as usize;
                 for i in 1..steps {
-                    let f = i as f32 / steps as f32;
-                    let p = [
-                        from[0] + (l.position[0] - from[0]) * f,
-                        from[1] + (l.position[1] - from[1]) * f,
-                        from[2] + (l.position[2] - from[2]) * f,
-                    ];
+                    let p = along(from, &points, i as f32 / steps as f32);
                     self.move_object(id, p, Some(a));
                 }
             }
@@ -2170,6 +2360,8 @@ mod tests {
             due: None,
             from: None,
             approach: None,
+            ring_wait: false,
+            path: Vec::new(),
         };
         let o = s.world.get_mut(id).unwrap();
         o.commands.push(cmd("CommandPlayAnimation", 0.0));
@@ -2207,6 +2399,8 @@ mod tests {
             due: None,
             from: None,
             approach: None,
+            ring_wait: false,
+            path: Vec::new(),
         };
         s.world.get_mut(id).unwrap().commands.push(walk());
         // 5 m/s: two seconds in, ten metres along.
@@ -2246,18 +2440,80 @@ mod tests {
             due: None,
             from: None,
             approach: None,
+            ring_wait: false,
+            path: Vec::new(),
         });
-        // Ten metres to close at 5 m/s: halfway after a second.
+        // At 5 m/s: five metres after a second.
         s.tick(1000);
         let x = s.world.get(a).unwrap().position[0];
         assert!((x - 5.0).abs() < 0.01, "{x}");
-        s.tick(1000);
+        // It stops on the target's melee ring, facing it: two default bodies apart plus
+        // half the melee gap.
+        s.tick(1500);
+        let ring = 2.0 * crate::combat::DEFAULT_RADIUS + crate::combat::MELEE_GAP * 0.5;
         let o = s.world.get(a).unwrap();
-        assert!((o.position[0] - (12.0 - crate::combat::MELEE_REACH)).abs() < 0.01);
+        assert!(
+            (o.position[0] - (12.0 - ring)).abs() < 0.01,
+            "{:?}",
+            o.position
+        );
         // There, the attack itself is under way (still the front command).
         assert_eq!(
             o.commands.first().map(|c| (c.name.as_str(), c.approach)),
             Some(("CommandAttack", None))
+        );
+    }
+
+    #[test]
+    fn a_full_melee_ring_turns_attackers_away() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let t = s.world.spawn(ObjectKind::Creature, "target");
+        let late = s.world.spawn(ObjectKind::Creature, "late");
+        let ring = 2.0 * crate::combat::DEFAULT_RADIUS + crate::combat::MELEE_GAP * 0.5;
+        // Bodies all round the target, close enough that no place is left.
+        let mut crowd = Vec::new();
+        for k in 0..12 {
+            let ang = k as f32 * std::f32::consts::TAU / 12.0;
+            let c = s.world.spawn(ObjectKind::Creature, "crowd");
+            let o = s.world.get_mut(c).unwrap();
+            o.area = Some(area);
+            o.position = [ring * ang.cos(), ring * ang.sin(), 0.0];
+            crowd.push(c);
+        }
+        for (id, x) in [(t, 0.0), (late, 8.0)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = [x, 0.0, 0.0];
+        }
+        s.world.get_mut(late).unwrap().commands.push(Command {
+            ty: 7,
+            name: "CommandAttack".into(),
+            target: Some(t),
+            location: None,
+            seconds: 0.0,
+            ints: Vec::new(),
+            strings: Vec::new(),
+            due: None,
+            from: None,
+            approach: None,
+            ring_wait: false,
+            path: Vec::new(),
+        });
+        // It walks to just outside the crowd and waits; the ring is still full, so the
+        // attack fails and its owner hears so.
+        s.tick(3000);
+        let o = s.world.get(late).unwrap();
+        assert!(o.commands.is_empty(), "{:?}", o.commands);
+        let x = o.position[0];
+        assert!(x > ring && x < 8.0, "{x}");
+        // Its owner was told (COMMAND_COMPLETE, queued to it).
+        assert!(
+            s.world
+                .trace
+                .entries
+                .iter()
+                .any(|e| matches!(e, TraceEntry::EventQueued { target, .. } if *target == late))
         );
     }
 
