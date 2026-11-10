@@ -17,6 +17,15 @@ use std::sync::{Arc, Mutex};
 
 use crate::{CallKind, Responder, UiCall, UiValue};
 
+/// The engine value holding the hero's name, for designer tags.
+pub const HERO_NAME: &str = "Party.Hero.Name";
+
+/// Text with the game's designer tags filled in: `<FirstName/>` is the hero's name.
+/// Provisional: other tags (gendered text and the like) are left as written.
+pub fn replace_designer_tags(text: &str, hero: &str) -> String {
+    text.replace("<FirstName/>", hero)
+}
+
 /// Acts on a game message as the game does when the movie sends it, before the movie's next
 /// instruction: returns the engine values that changed, or `None` when it did not act (the
 /// message is then passed on as a [`GameMessage::Send`]).
@@ -59,6 +68,8 @@ struct State {
     sounds: Vec<String>,
     /// Messages the handler already acted on, oldest first (their text).
     handled: std::collections::VecDeque<String>,
+    /// The names the last [`GameBridge::bind`] set.
+    bound: std::collections::BTreeSet<String>,
 }
 
 /// Engine values and strings the movies ask for, shared by every movie.
@@ -156,6 +167,25 @@ impl GameBridge {
                 s.unanswered.remove(&k);
                 s.values.insert(k, v);
             }
+        }
+    }
+
+    /// Binds the engine's whole state (e.g. [`crate::binding::sim_values`] every frame):
+    /// values the last bind set that are not in `values` are gone (a conversation's earlier
+    /// replies, a party member who left); values the movies set themselves are kept.
+    pub fn bind(&self, values: impl IntoIterator<Item = (String, UiValue)>) {
+        if let Ok(mut s) = self.state.lock() {
+            let mut bound = std::collections::BTreeSet::new();
+            for (k, v) in values {
+                s.unanswered.remove(&k);
+                s.values.insert(k.clone(), v);
+                bound.insert(k);
+            }
+            let stale: Vec<String> = s.bound.difference(&bound).cloned().collect();
+            for k in stale {
+                s.values.remove(&k);
+            }
+            s.bound = bound;
         }
     }
 
@@ -276,6 +306,23 @@ impl GameBridge {
                     .collect::<std::collections::BTreeSet<_>>()
                     .len();
                 UiValue::Number(n as f64)
+            }
+            // The whole argument string is the text (it has spaces of its own).
+            "ReplaceDesignerTags" => {
+                let text = match call.kind {
+                    CallKind::FsCommand => call.args.first().map(as_string).unwrap_or_default(),
+                    CallKind::ExternalInterface => arg(0),
+                };
+                let hero = match self
+                    .state
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.values.get(HERO_NAME).cloned())
+                {
+                    Some(UiValue::String(n)) => n,
+                    _ => String::new(),
+                };
+                UiValue::String(replace_designer_tags(&text, &hero))
             }
             "FormatFloat" => {
                 let v = arg(0).parse::<f64>().unwrap_or(0.0);
@@ -415,6 +462,35 @@ mod tests {
 
     fn bridge() -> GameBridge {
         GameBridge::new(Arc::new(|id| (id == 5).then(|| "Five".to_string())))
+    }
+
+    #[test]
+    fn binding_drops_what_the_engine_no_longer_has() {
+        let b = bridge();
+        let n = |x: f64| UiValue::Number(x);
+        b.bind([("R.0.Text".into(), n(1.0)), ("R.1.Text".into(), n(2.0))]);
+        b.set_value("Movie.Own", n(3.0));
+        b.bind([("R.0.Text".into(), n(4.0))]);
+        assert_eq!(b.value("R.0.Text"), Some(n(4.0)));
+        assert_eq!(b.value("R.1.Text"), None);
+        assert_eq!(b.value("Movie.Own"), Some(n(3.0)));
+        // The defaults every movie reads stay.
+        assert!(b.value("Scaleform.Platform").is_some());
+    }
+
+    #[test]
+    fn designer_tags_take_the_heros_name() {
+        let b = bridge();
+        b.set_value(HERO_NAME, UiValue::String("Aeducan".into()));
+        let text = "I am the Grey Warden <FirstName/>.";
+        assert_eq!(
+            b.respond(&call(CallKind::FsCommand, "ReplaceDesignerTags", &[text])),
+            UiValue::String("I am the Grey Warden Aeducan.".into())
+        );
+        assert_eq!(
+            replace_designer_tags("<male>x</male>", "A"),
+            "<male>x</male>"
+        );
     }
 
     #[test]

@@ -9,14 +9,21 @@
 //! the right mouse button to orbit, the wheel to zoom, Q/E to turn; F switches to the
 //! free-flying camera and back. A left click orders the leader: walk to the ground clicked,
 //! attack a hostile, talk to someone, use a door or container. 1-4 choose the leader.
+//! The game's own interface plays over the world: the HUD while exploring, the conversation
+//! screen (click a reply), and the screens scripts open (world map, store, job board,
+//! level-up); I opens the inventory. A click the interface draws under is the interface's.
 //!
 //! Headless: `--capture out.png --camera x,y,z,yaw,pitch` renders one frame with no window.
+//! Playing headless, `--steps "click 640,400; run 3000; click 300,650; key i"` plays input
+//! in order (clicks go to the interface or the world as in the window) before the capture;
+//! `talk <tag>` orders the leader to talk to a creature as a click on it would.
 //!
 //! `--ui menu`, `--ui hud` or `--ui movie1,movie2` plays Scaleform movies over the scene;
 //! `--area none` shows them alone.
 
 mod follow;
 mod live;
+mod screens;
 mod ui;
 
 use std::collections::HashSet;
@@ -93,6 +100,11 @@ struct Args {
     /// player would (repeatable).
     #[arg(long)]
     click: Vec<String>,
+    /// Headless, playing: input played in order before the capture, `;`-separated:
+    /// `click X,Y` (a left click at that pixel), `run MS` (the game and its interface run
+    /// that long), `key i` (the inventory toggle), `talk TAG` (the leader talks to a creature).
+    #[arg(long, default_value = "")]
+    steps: String,
     /// Module for `--save` and `--objects`.
     #[arg(long, default_value = "single player")]
     module: String,
@@ -263,7 +275,9 @@ fn log_stats(r: &AreaRenderer) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture(
+    ctx: &GpuContext,
     loaded: &Loaded,
     live: Option<&mut live::Live>,
     out: &Path,
@@ -271,27 +285,27 @@ fn capture(
     (w, h): (u32, u32),
     ui: &[String],
     ui_frames: u32,
+    played: Option<&mut ui::UiLayer>,
 ) -> Result<()> {
-    let ctx = GpuContext::headless()?;
     let pixels = if let Some(live) = live {
-        live.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
+        live.sync(ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
         if let Some(l) = live.level.as_ref() {
             log_stats(&l.renderer);
         }
-        live.capture(&ctx, &camera, (w, h))?
+        live.capture(ctx, &camera, (w, h))?
             .unwrap_or_else(|| [0, 0, 0, 255].repeat(w as usize * h as usize))
     } else {
         match &loaded.scene {
             Some(scene) => {
                 let mut renderer = AreaRenderer::new(
-                    &ctx,
+                    ctx,
                     &loaded.vfs,
                     scene,
                     &loaded.programs(scene)?,
                     thedas_render::gpu::CAPTURE_FORMAT,
                 );
                 log_stats(&renderer);
-                renderer.capture(&ctx, &camera, w, h)?
+                renderer.capture(ctx, &camera, w, h)?
             }
             None => [0, 0, 0, 255].repeat(w as usize * h as usize),
         }
@@ -301,8 +315,11 @@ fn capture(
         height: h,
         pixels,
     };
-    if !ui.is_empty() {
-        let mut layer = ui::UiLayer::new(&ctx, &loaded.vfs, ui, (w, h));
+    if let Some(layer) = played {
+        layer.log_gaps();
+        layer.capture_over(&mut frame)?;
+    } else if !ui.is_empty() {
+        let mut layer = ui::UiLayer::new(ctx, &loaded.vfs, ui, (w, h));
         for _ in 0..ui_frames {
             for call in layer.tick(1000.0 / 30.0) {
                 log::debug!("ui call: {call:?}");
@@ -335,6 +352,8 @@ struct App {
     live: Option<live::Live>,
     /// The game camera, when following the party leader (playing; F toggles free-fly).
     follow: Option<follow::Follow>,
+    /// The game's screens over a running game (playing without `--ui`).
+    screens: Option<screens::Screens>,
     ui: Vec<String>,
     cursor: (f64, f64),
     camera: Camera,
@@ -393,12 +412,15 @@ impl App {
             }
             None => None,
         };
-        let ui = ui::UiLayer::new(
+        let mut ui = ui::UiLayer::new(
             &ctx,
             &self.loaded.vfs,
             &self.ui,
             (config.width, config.height),
         );
+        if let (Some(live), Some(_)) = (&self.live, &self.screens) {
+            ui.attach(&live.sim);
+        }
         self.gfx = Some(Gfx {
             window,
             surface,
@@ -463,8 +485,11 @@ impl App {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
+        let stopped = self.screens.as_ref().is_some_and(|s| s.world_stopped());
         if let Some(live) = self.live.as_mut() {
-            live.step(dt);
+            if !stopped {
+                live.step(dt);
+            }
             live.sync(&g.ctx, g.config.format)?;
         }
         let size = (g.config.width, g.config.height);
@@ -494,8 +519,13 @@ impl App {
                 });
             }
         }
-        for call in g.ui.tick(dt.min(100.0)) {
-            log::debug!("ui call: {call:?}");
+        match (self.screens.as_mut(), self.live.as_ref()) {
+            (Some(screens), Some(live)) => g.ui.play(screens, &live.sim, dt.min(100.0)),
+            _ => {
+                for call in g.ui.tick(dt.min(100.0)) {
+                    log::debug!("ui call: {call:?}");
+                }
+            }
         }
         g.ui.composite(&mut encoder, &view, g.config.format);
         g.ctx.queue.submit([encoder.finish()]);
@@ -598,6 +628,11 @@ impl ApplicationHandler for App {
                                         log::info!("leading with {tag}");
                                     }
                                 }
+                                KeyCode::KeyI if self.screens.is_some() => {
+                                    if let Some(s) = self.screens.as_mut() {
+                                        s.inventory = !s.inventory;
+                                    }
+                                }
                                 KeyCode::KeyF if self.live.is_some() => {
                                     self.follow = match self.follow.take() {
                                         Some(_) => None,
@@ -640,11 +675,22 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 let (x, y) = self.cursor;
+                let pressed = state == ElementState::Pressed;
+                // Playing, a click the interface does not take orders the party leader.
+                let mut to_world = pressed && self.live.is_some() && self.ui.is_empty();
                 if let Some(g) = self.gfx.as_mut() {
-                    g.ui.mouse_button(x, y, state == ElementState::Pressed);
+                    if to_world {
+                        to_world = self
+                            .screens
+                            .as_ref()
+                            .is_none_or(|s| world_takes_click(&g.ui, s, x, y));
+                    }
+                    g.ui.mouse_button(x, y, pressed);
+                    if pressed && !to_world && self.live.is_some() && self.screens.is_some() {
+                        g.ui.clicked();
+                    }
                 }
-                // Playing with no interface movie open, a click orders the party leader.
-                if state == ElementState::Pressed && self.ui.is_empty() {
+                if to_world {
                     self.click(x, y);
                 }
             }
@@ -697,6 +743,44 @@ impl ApplicationHandler for App {
             g.window.request_redraw();
         }
     }
+}
+
+/// Whether a left click at window pixel (`x`, `y`) goes to the world: only the HUD is up
+/// and it draws nothing there.
+fn world_takes_click(layer: &ui::UiLayer, screens: &screens::Screens, x: f64, y: f64) -> bool {
+    screens.exploring() && !layer.covers(x, y)
+}
+
+/// One step of `--steps`.
+#[derive(Clone, Debug, PartialEq)]
+enum Step {
+    Click(f64, f64),
+    Run(u64),
+    Inventory,
+    /// The leader is ordered to talk to the first creature with this tag (as a click on it
+    /// does, for creatures hard to reach on screen).
+    Talk(String),
+}
+
+fn parse_steps(spec: &str) -> Result<Vec<Step>> {
+    spec.split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let (verb, arg) = s.split_once(' ').unwrap_or((s, ""));
+            let arg = arg.trim();
+            Ok(match verb {
+                "click" => {
+                    let (x, y) = arg.split_once(',').context("click takes x,y")?;
+                    Step::Click(x.trim().parse()?, y.trim().parse()?)
+                }
+                "run" => Step::Run(arg.parse().context("run takes milliseconds")?),
+                "key" if arg.eq_ignore_ascii_case("i") => Step::Inventory,
+                "talk" if !arg.is_empty() => Step::Talk(arg.to_string()),
+                _ => bail!("unknown step {s:?}"),
+            })
+        })
+        .collect()
 }
 
 fn main() -> Result<()> {
@@ -756,8 +840,18 @@ fn main() -> Result<()> {
         )),
         _ => None,
     };
+    let steps = parse_steps(&args.steps)?;
     if let Some(out) = &args.capture {
+        let ctx = GpuContext::headless()?;
+        let mut played: Option<(ui::UiLayer, screens::Screens)> = None;
         if let Some(l) = live.as_mut() {
+            if ui.is_empty() {
+                let mut layer = ui::UiLayer::new(&ctx, &loaded.vfs, &[], size);
+                layer.attach(&l.sim);
+                let mut s = screens::Screens::default();
+                layer.play(&mut s, &l.sim, 0.0);
+                played = Some((layer, s));
+            }
             if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
                 camera = f.camera(feet, 0.0, &camera);
             }
@@ -774,8 +868,87 @@ fn main() -> Result<()> {
                     None => println!("click {x},{y}: nothing"),
                 }
             }
-            l.sim.tick(args.run_ms);
-            if let Some(h) = l.leader().and_then(|h| l.sim.world.get(h)) {
+            l.sim().tick(args.run_ms);
+            for step in &steps {
+                match step {
+                    Step::Talk(tag) => {
+                        let mut sim = l.sim();
+                        let who = sim.world.controlled();
+                        let target = sim.world.by_tag(tag).next().map(|o| o.id);
+                        match (who, target) {
+                            (Some(w), Some(t)) => {
+                                sim.order_talk(w, t);
+                                println!("talk to {tag}");
+                            }
+                            _ => println!("talk to {tag}: nobody"),
+                        }
+                    }
+                    &Step::Click(x, y) => {
+                        let to_world = match played.as_mut() {
+                            Some((layer, s)) => {
+                                layer.render_movies();
+                                let w = world_takes_click(layer, s, x, y);
+                                layer.mouse_move(x, y);
+                                layer.mouse_button(x, y, true);
+                                layer.mouse_button(x, y, false);
+                                if !w {
+                                    layer.clicked();
+                                }
+                                w
+                            }
+                            None => true,
+                        };
+                        if !to_world {
+                            println!("click {x},{y}: interface");
+                            continue;
+                        }
+                        let (o, d) = camera.ray(x as f32, y as f32, size.0 as f32, size.1 as f32);
+                        match l.pick(o, d).and_then(|p| l.click(p)) {
+                            Some(order) => println!("click {x},{y}: {order}"),
+                            None => println!("click {x},{y}: nothing"),
+                        }
+                    }
+                    &Step::Run(ms) => {
+                        const FRAME: f64 = 1000.0 / 30.0;
+                        let started = Instant::now();
+                        let mut ui_time = std::time::Duration::ZERO;
+                        let mut frames = 0u32;
+                        let mut left = ms as f64;
+                        while left > 0.0 {
+                            let dt = left.min(FRAME);
+                            left -= dt;
+                            if !played.as_ref().is_some_and(|(_, s)| s.world_stopped()) {
+                                l.step(dt);
+                            }
+                            if let Some((layer, s)) = played.as_mut() {
+                                let t = Instant::now();
+                                layer.play(s, &l.sim, dt);
+                                ui_time += t.elapsed();
+                            }
+                            frames += 1;
+                            if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
+                                camera = f.camera(feet, dt as f32 / 1000.0, &camera);
+                            }
+                        }
+                        if let Some((_, s)) = played.as_ref() {
+                            println!(
+                                "run {ms}: screens {:?} ({frames} frames in {:.2}s, interface {:.1} ms a frame)",
+                                s.shown(),
+                                started.elapsed().as_secs_f64(),
+                                ui_time.as_secs_f64() * 1000.0 / frames.max(1) as f64
+                            );
+                        }
+                    }
+                    Step::Inventory => {
+                        if let Some((layer, s)) = played.as_mut() {
+                            s.inventory = !s.inventory;
+                            layer.play(s, &l.sim, 0.0);
+                        }
+                    }
+                }
+            }
+            let sim = l.sim();
+            if let Some(h) = sim.world.controlled().and_then(|h| sim.world.get(h)) {
                 log::info!(
                     "leader at {:?}, doing {:?}, saying: {:?}",
                     h.position,
@@ -783,14 +956,16 @@ fn main() -> Result<()> {
                         .iter()
                         .map(|c| c.name.as_str())
                         .collect::<Vec<_>>(),
-                    l.sim.dialog_state().map(|d| d.line)
+                    sim.dialog_state().map(|d| (d.line, d.replies, d.ended))
                 );
             }
+            drop(sim);
             if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
                 camera = f.camera(feet, 0.0, &camera);
             }
         }
         return capture(
+            &ctx,
             &loaded,
             live.as_mut(),
             out,
@@ -798,14 +973,17 @@ fn main() -> Result<()> {
             size,
             &ui,
             args.ui_frames,
+            played.as_mut().map(|(layer, _)| layer),
         );
     }
 
     let event_loop = EventLoop::new()?;
+    let screens = (live.is_some() && ui.is_empty()).then(screens::Screens::default);
     let mut app = App {
         loaded,
         live,
         follow,
+        screens,
         ui,
         cursor: (0.0, 0.0),
         camera,
@@ -827,6 +1005,21 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_steps() {
+        assert_eq!(
+            parse_steps("click 10,20.5; run 300 ;key i;").unwrap(),
+            vec![Step::Click(10.0, 20.5), Step::Run(300), Step::Inventory]
+        );
+        assert_eq!(
+            parse_steps("talk lot110cr_bryant").unwrap(),
+            vec![Step::Talk("lot110cr_bryant".into())]
+        );
+        assert!(parse_steps("dance").is_err());
+        assert!(parse_steps("click 10").is_err());
+        assert!(parse_steps("").unwrap().is_empty());
+    }
 
     #[test]
     fn parses_sizes() {

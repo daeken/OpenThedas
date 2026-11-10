@@ -568,16 +568,13 @@ impl Server {
                 out.push(json!({ "message": name, "args": args, "when": "sent", "board": board_json(sim) }));
             }
             if let GameMessage::Send(name, args) = m {
-                if name == "Conversation.SelectResponse" {
-                    let n = args
-                        .first()
-                        .and_then(|a| a.parse::<usize>().ok())
-                        .unwrap_or(0);
-                    sim.choose_reply(n);
-                    sim.tick(0);
-                    out.push(json!({ "selected_response": n, "conversation": dialog_json(sim) }));
-                } else if sim.gui_message(name, args) {
-                    sim.tick(0);
+                if !thedas_ui::input::apply(sim, name, args) {
+                    continue;
+                }
+                if name == thedas_ui::input::SELECT_RESPONSE {
+                    let n = args.first().cloned().unwrap_or_default();
+                    out.push(json!({ "selected_response": n.parse::<usize>().unwrap_or(0), "conversation": dialog_json(sim) }));
+                } else {
                     out.push(json!({ "message": name, "args": args, "board": board_json(sim) }));
                 }
             }
@@ -621,7 +618,7 @@ impl Server {
             .run(move |w| -> Result<J, String> {
                 let stage = w.stage(&vfs, size)?;
                 stage.bridge.set_message_handler(Some(handler.clone()));
-                stage.bridge.set_values(values.clone());
+                stage.bridge.bind(values.clone());
                 let mut failed = Vec::new();
                 for n in &names {
                     stage.close(n);

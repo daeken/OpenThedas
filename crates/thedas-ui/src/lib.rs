@@ -6,12 +6,14 @@
 //!
 //! The interface reads simulation state and never writes it: calls the movie makes through
 //! `fscommand` and `ExternalInterface.call` are queued as [`UiCall`]s for the application to
-//! act on, and an optional responder answers `ExternalInterface.call` return values.
+//! act on, and an optional responder answers `ExternalInterface.call` return values. The
+//! messages a movie sends reach the simulation only as player input ([`input`]).
 
 pub mod atlas;
 pub mod avm1;
 pub mod binding;
 pub mod chains;
+pub mod input;
 pub mod models;
 pub mod protocol;
 pub mod stage;
@@ -68,6 +70,7 @@ impl From<&RValue> for UiValue {
             RValue::Null => Self::Null,
             RValue::Bool(b) => Self::Bool(*b),
             RValue::Number(n) => Self::Number(*n),
+            RValue::String(s) if s == avm1::EMPTY => Self::String(String::new()),
             RValue::String(s) => Self::String(s.clone()),
             RValue::List(l) => Self::List(l.iter().map(Into::into).collect()),
             RValue::Object(o) => {
@@ -84,6 +87,8 @@ impl From<&UiValue> for RValue {
             UiValue::Null => Self::Null,
             UiValue::Bool(b) => Self::Bool(*b),
             UiValue::Number(n) => Self::Number(*n),
+            // See `avm1::EMPTY`.
+            UiValue::String(s) if s.is_empty() => Self::String(avm1::EMPTY.to_string()),
             UiValue::String(s) => Self::String(s.clone()),
             UiValue::List(l) => Self::List(l.iter().map(Into::into).collect()),
             UiValue::Object(o) => {

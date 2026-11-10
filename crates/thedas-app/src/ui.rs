@@ -1,14 +1,20 @@
 //! The Scaleform interface layer: movies played by `thedas-ui` into offscreen textures,
 //! composited over the scene with premultiplied alpha.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use thedas_render::GpuContext;
+use thedas_sim::Sim;
 use thedas_ui::protocol::GameMessage;
 use thedas_ui::stage::Stage;
 use thedas_ui::{Gpu, Rgba};
 use thedas_vfs::Vfs;
+
+use crate::screens::Screens;
+
+/// A movie pixel at least this opaque (of 255) takes a click from the world.
+pub const COVER_ALPHA: u8 = 16;
 
 const COMPOSITE_WGSL: &str = r#"
 @group(0) @binding(0) var tex: texture_2d<f32>;
@@ -114,6 +120,44 @@ pub struct UiLayer {
     pub stage: Stage,
     composite: Option<Composite>,
     device: wgpu::Device,
+    queue: wgpu::Queue,
+    /// Messages the simulation did not take, already logged.
+    ignored: std::collections::HashSet<String>,
+    /// The conversation line on screen and how far it has played.
+    line: Option<Line>,
+}
+
+/// A conversation line: the dialog, the line's text and its replies' nodes.
+type LineKey = (String, String, Vec<usize>);
+
+/// The conversation line on screen: while it plays its replies are held back
+/// (`Conversation.ResponsesReady` 0, which conversation.gfx watches to show them); once it
+/// has played they show, or, with nothing to choose, the conversation goes on.
+struct Line {
+    key: LineKey,
+    /// Milliseconds it has been up.
+    t: f64,
+    /// Nothing to choose: it continues by itself once played.
+    waits: bool,
+    continued: bool,
+}
+
+impl Line {
+    fn played(&self) -> bool {
+        self.t >= line_ms(&self.key.1)
+    }
+}
+
+/// How long a line plays before the conversation goes on by itself (milliseconds), standing
+/// in for its voice-over: a reading time for its text, a moment for a line without text (a
+/// cutscene beat, whose staging is not played). Provisional.
+pub fn line_ms(text: &str) -> f64 {
+    let chars = text.trim().chars().count() as f64;
+    if chars == 0.0 {
+        100.0
+    } else {
+        (1500.0 + 55.0 * chars).min(12_000.0)
+    }
 }
 
 impl UiLayer {
@@ -131,7 +175,188 @@ impl UiLayer {
             stage,
             composite: None,
             device: ctx.device.clone(),
+            queue: ctx.queue.clone(),
+            ignored: Default::default(),
+            line: None,
         }
+    }
+
+    /// Plays the game's screens over a running game: the movies act on `sim` as they send
+    /// messages (see [`thedas_ui::input`]).
+    pub fn attach(&mut self, sim: &Arc<Mutex<Sim>>) {
+        self.stage
+            .bridge
+            .set_message_handler(Some(thedas_ui::input::handler(sim.clone())));
+    }
+
+    /// One interface frame while playing: binds the simulation's values, brings the screens
+    /// up to it, runs the movies `dt_ms` and applies the messages nothing handled yet. The
+    /// simulation is not locked while the movies run (their handler locks it).
+    pub fn play(&mut self, screens: &mut Screens, sim: &Arc<Mutex<Sim>>, dt_ms: f64) {
+        let (want, line) = {
+            let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+            self.stage.bridge.bind(thedas_ui::binding::sim_values(&sim));
+            let waits = thedas_ui::binding::awaits_continue(&sim);
+            let line = thedas_ui::binding::conversation(&sim).map(|d| {
+                let key: LineKey = (d.dialog, d.line, d.replies.iter().map(|r| r.0).collect());
+                (key, waits)
+            });
+            (crate::screens::wanted(&sim, screens.inventory), line)
+        };
+        screens.sync(want, &mut self.stage);
+        self.line = match (line, self.line.take()) {
+            (Some((key, _)), Some(mut l)) if l.key == key => {
+                l.t += dt_ms;
+                Some(l)
+            }
+            (Some((key, waits)), _) => Some(Line {
+                key,
+                t: 0.0,
+                waits,
+                continued: false,
+            }),
+            (None, _) => None,
+        };
+        if let Some(l) = self.line.as_mut() {
+            let played = l.played();
+            self.stage.bridge.set_value(
+                "Conversation.ResponsesReady",
+                thedas_ui::UiValue::Number(played as u8 as f64),
+            );
+            if played && l.waits && !l.continued {
+                l.continued = true;
+                self.continue_conversation();
+            }
+        }
+        let messages = self.stage.tick(dt_ms);
+        let ignored = {
+            let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+            thedas_ui::input::apply_all(&mut sim, &messages)
+        };
+        for m in &messages {
+            if let GameMessage::Handled(name, args) | GameMessage::Send(name, args) = m {
+                log::info!("ui: {name} {args:?}");
+            }
+        }
+        for (name, _) in ignored {
+            // The stage closes a movie that asks for this itself.
+            if name != "GUI.HideFullScreenGUI" && self.ignored.insert(name.clone()) {
+                log::warn!("ui: the simulation does not handle {name} yet");
+            }
+        }
+    }
+
+    /// A left click while playing reached the interface: a conversation line still playing is
+    /// skipped to its end, and one with nothing to choose is continued (conversation.gfx's
+    /// `ContinueButtonAction`). Provisional: the game's input bindings for the conversation's
+    /// contexts are not traced; any click stands in for them.
+    pub fn clicked(&mut self) {
+        let Some(l) = self.line.as_mut() else {
+            return;
+        };
+        if !l.played() {
+            // Skip to the end of the line: its replies show (or it goes on) next frame.
+            l.t = f64::INFINITY;
+        } else if l.waits && !l.continued {
+            l.continued = true;
+            self.continue_conversation();
+        }
+    }
+
+    /// conversation.gfx's continue action (it sends `Conversation.SelectResponse 0` when the
+    /// line has nothing to choose).
+    fn continue_conversation(&mut self) {
+        if let Some(m) = self
+            .stage
+            .movies
+            .iter_mut()
+            .find(|m| m.name == "conversation.gfx")
+        {
+            m.call("_global.Conversation.ContinueButtonAction", &[]);
+        }
+    }
+
+    /// Renders every movie into its texture (the window does this as it composites).
+    pub fn render_movies(&mut self) {
+        for m in &mut self.stage.movies {
+            m.render();
+        }
+    }
+
+    /// Whether a movie drew at window pixel (`x`, `y`) in its last rendered frame: a click
+    /// there is the interface's, not the world's. Provisional: the game hit-tests the movies'
+    /// shapes; an opaque pixel stands in for that.
+    pub fn covers(&self, x: f64, y: f64) -> bool {
+        let textures: Vec<wgpu::Texture> = self
+            .stage
+            .movies
+            .iter()
+            .filter_map(|m| m.texture())
+            .filter(|t| x >= 0.0 && y >= 0.0 && (x as u32) < t.width() && (y as u32) < t.height())
+            .collect();
+        if textures.is_empty() {
+            return false;
+        }
+        const ROW: u64 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ui probe"),
+            size: ROW * textures.len() as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("ui probe"),
+            });
+        for (i, t) in textures.iter().enumerate() {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: t,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: x as u32,
+                        y: y as u32,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: ROW * i as u64,
+                        bytes_per_row: Some(ROW as u32),
+                        rows_per_image: Some(1),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        self.queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        if self
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .is_err()
+            || !matches!(rx.recv(), Ok(Ok(())))
+        {
+            return false;
+        }
+        let Ok(data) = buffer.slice(..).get_mapped_range() else {
+            return false;
+        };
+        // RGBA or BGRA: alpha is the fourth byte either way.
+        (0..textures.len()).any(|i| {
+            data.get(i * ROW as usize + 3)
+                .is_some_and(|&a| a >= COVER_ALPHA)
+        })
     }
 
     pub fn tick(&mut self, dt_ms: f64) -> Vec<GameMessage> {
@@ -209,6 +434,7 @@ impl UiLayer {
             log::warn!("ui: {movie}: load of {url} failed");
         }
         let gaps = self.stage.bridge.unanswered();
+        log::debug!("ui: unanswered: {:?}", gaps.keys().collect::<Vec<_>>());
         if !gaps.is_empty() {
             log::info!(
                 "ui: {} engine values unanswered: {:?}",
@@ -220,5 +446,18 @@ impl UiLayer {
 
     pub fn capture_over(&mut self, base: &mut Rgba) -> Result<()> {
         Ok(self.stage.capture_over(base)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lines_play_for_a_reading_time() {
+        assert_eq!(line_ms(""), 100.0);
+        assert_eq!(line_ms("  "), 100.0);
+        assert!(line_ms("Short.") < line_ms("A much longer line that takes a while to read."));
+        assert_eq!(line_ms(&"x".repeat(1000)), 12_000.0);
     }
 }
