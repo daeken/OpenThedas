@@ -721,7 +721,7 @@ impl Server {
                 "queued_events": sim.world.queue.len(),
                 "scripts_run": tr.scripts_run,
                 "script_errors": tr.script_errors,
-                "unimplemented_top": un.iter().take(15).map(|(f, n)| json!({"function": f, "calls": n})).collect::<Vec<_>>(),
+                "unimplemented_top": un.iter().take(40).map(|(f, n)| json!({"function": f, "calls": n})).collect::<Vec<_>>(),
                 "conversation": dialog_json(sim),
             }))
         })
@@ -955,6 +955,38 @@ impl Server {
                 "chargen_in_progress": sim.world.chargen.is_some(),
                 "area": sim.world.area.map(|x| summary(sim, x)),
                 "conversation": dialog_json(sim),
+            }))
+        })
+    }
+
+    #[tool(
+        description = "Order the hero to attack a creature (as clicking an enemy does), then run time until the attack resolves. Returns the target's health and whether it died."
+    )]
+    async fn attack(&self, Parameters(a): Parameters<ObjectArg>) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            let hero = sim.world.hero.ok_or("no hero")?;
+            let target = resolve(sim, &a.object).ok_or("no such object")?;
+            sim.order_attack(hero, target);
+            for _ in 0..30 {
+                sim.tick(100);
+                if sim.world.get(hero).is_none_or(|h| h.commands.is_empty()) {
+                    break;
+                }
+            }
+            let health = thedas_sim::sim::constant(&sim.table, "PROPERTY_DEPLETABLE_HEALTH");
+            let hp = |id| {
+                sim.world
+                    .get(id)
+                    .and_then(|o| o.properties.get(&health).copied())
+            };
+            Ok(json!({
+                "target": summary(sim, target),
+                "target_health": hp(target),
+                "target_dead": sim.world.get(target).is_some_and(|o| o.dead),
+                "hero_health": hp(hero),
+                "hero_dead": sim.world.get(hero).is_some_and(|o| o.dead),
+                "time_ms": sim.world.time_ms,
             }))
         })
     }
