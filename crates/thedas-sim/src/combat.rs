@@ -323,19 +323,33 @@ impl Sim {
         };
         let combat_mode = self.world.game_mode == constant_of(self, "GM_COMBAT");
         let secs = ms as f32 / 1000.0;
-        for o in self.world.objects.values_mut() {
-            if o.kind != ObjectKind::Creature || o.dead {
+        // Each living creature's maxima (base, equipment and attributes).
+        let maxima: Vec<(ObjectId, f32, f32)> = self
+            .world
+            .objects
+            .values()
+            .filter(|o| o.kind == ObjectKind::Creature && !o.dead)
+            .map(|o| {
+                (
+                    o.id,
+                    self.depletable_max(o.id, health),
+                    self.depletable_max(o.id, mana),
+                )
+            })
+            .collect();
+        for (id, max_h, max_m) in maxima {
+            let Some(o) = self.world.objects.get_mut(&id) else {
                 continue;
-            }
+            };
             let (h, m) = rates[(combat_mode || o.combat.in_combat) as usize];
-            for (p, r) in [(health, h), (mana, m)] {
+            for (p, r, max) in [(health, h, max_h), (mana, m, max_m)] {
                 let rate = o.properties.get(&r).map_or(0.0, |p| p.0.max(p.1));
                 if rate == 0.0 {
                     continue;
                 }
                 if let Some(v) = o.properties.get_mut(&p) {
-                    if v.1 < v.0 || rate < 0.0 {
-                        v.1 = (v.1 + rate * secs).clamp(0.0, v.0);
+                    if v.1 < max || rate < 0.0 {
+                        v.1 = (v.1 + rate * secs).clamp(0.0, max);
                     }
                 }
             }
@@ -734,18 +748,20 @@ impl Sim {
             return;
         }
         let t = self.world.time_ms;
-        self.world.trace.push(crate::trace::TraceEntry::Log {
+        // The damage the impact carries (float 0 of EFFECT_TYPE_IMPACT or _DAMAGE).
+        let damage = result
+            .effects
+            .iter()
+            .flatten()
+            .filter(|e| matches!(e.ty, 1013 | 1024))
+            .map(|e| e.floats.first().copied().unwrap_or(0.0))
+            .sum();
+        self.world.trace.push(crate::trace::TraceEntry::Attack {
             t,
-            channel: -4,
-            text: format!(
-                "attack {id} -> {target}: results {:?}, effects {:?}",
-                result.results,
-                result
-                    .effects
-                    .iter()
-                    .map(|e| e.as_ref().map(|e| (e.ty, e.floats.clone())))
-                    .collect::<Vec<_>>()
-            ),
+            attacker: id,
+            target,
+            result: result.results[0],
+            damage,
         });
         let mut ev = self.new_event("ATTACK_IMPACT", Some(id));
         ev.objects = vec![id, target];

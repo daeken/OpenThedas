@@ -347,6 +347,10 @@ pub struct World {
     /// controlling. For playing without a player.
     #[serde(default)]
     pub autopilot: bool,
+    /// Followers waiting in the party pool get the experience the hero gets (see
+    /// `Sim::share_pool_xp`). Off by default: provisional, no script does it.
+    #[serde(default)]
+    pub pool_xp: bool,
     /// Objects to remove at a time (projectiles when they land).
     #[serde(default)]
     pub destroy_at: Vec<(u64, ObjectId)>,
@@ -470,6 +474,7 @@ impl World {
             party_fighting: false,
             game_over: false,
             autopilot: false,
+            pool_xp: false,
             destroy_at: Vec::new(),
             held: Vec::new(),
             dialog_shown: Default::default(),

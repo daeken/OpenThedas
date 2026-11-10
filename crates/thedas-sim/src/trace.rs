@@ -74,6 +74,24 @@ pub enum TraceEntry {
         speaker: ObjectId,
         text: String,
     },
+    /// An attack landed or missed: its `COMBAT_RESULT_*` (of the main hand) and the damage
+    /// its impact effects carry.
+    Attack {
+        t: u64,
+        attacker: ObjectId,
+        target: ObjectId,
+        result: i32,
+        damage: f32,
+    },
+}
+
+/// Attacks one creature made: swings, those that hit (hit, critical, deathblow or
+/// backstab) and the damage they carried.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AttackTally {
+    pub swings: u32,
+    pub hits: u32,
+    pub damage: f32,
 }
 
 /// The trace, plus counters that summarise it.
@@ -85,6 +103,8 @@ pub struct Trace {
     pub implemented_calls: BTreeMap<String, u64>,
     pub script_errors: BTreeMap<String, u64>,
     pub scripts_run: u64,
+    /// Attacks per attacker (kept even when entries are not).
+    pub attacks: BTreeMap<ObjectId, AttackTally>,
     /// Keep full entries (otherwise only the counters are updated).
     pub keep: bool,
 }
@@ -96,6 +116,20 @@ impl Trace {
                 *self.unimplemented.entry(function.clone()).or_default() += 1;
             }
             TraceEntry::ScriptStart { .. } => self.scripts_run += 1,
+            TraceEntry::Attack {
+                attacker,
+                result,
+                damage,
+                ..
+            } => {
+                let a = self.attacks.entry(*attacker).or_default();
+                a.swings += 1;
+                // COMBAT_RESULT_HIT, _CRITICALHIT, _DEATHBLOW, _BACKSTAB.
+                if matches!(result, 1 | 2 | 4 | 9) {
+                    a.hits += 1;
+                    a.damage += damage;
+                }
+            }
             TraceEntry::ScriptEnd {
                 error: Some(err), ..
             } => {
@@ -119,5 +153,33 @@ impl Trace {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attacks_are_tallied_by_attacker_even_without_entries() {
+        let mut t = Trace::default();
+        for (result, damage) in [(1, 9.0), (3, 0.0), (2, 14.5), (5, 0.0)] {
+            t.push(TraceEntry::Attack {
+                t: 0,
+                attacker: 7,
+                target: 8,
+                result,
+                damage,
+            });
+        }
+        assert!(t.entries.is_empty());
+        assert_eq!(
+            t.attacks.get(&7),
+            Some(&AttackTally {
+                swings: 4,
+                hits: 2,
+                damage: 23.5
+            })
+        );
     }
 }
