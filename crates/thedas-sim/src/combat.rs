@@ -920,8 +920,17 @@ impl Sim {
         self.ability_event("ABILITY_CAST_IMPACT", id, target, ability, cmd);
     }
 
-    /// The front command started: an attack asks its owner's script for the result.
+    /// The front command started: the attacker turns to face its target, then asks its
+    /// owner's script for the result.
+    ///
+    /// Facing: no script turns attackers (`rules_core`, `ability_core` and `creature_core`
+    /// never call `SetFacing*`), while the engine requires them to face their target:
+    /// DAOrigins.exe 0x7a2410 accepts a target only within 67.5 degrees (0xb2117c) of the
+    /// attacker's facing (0x4d4bf0 measures the angle). How the engine turns them (at once
+    /// or at a turn rate) is not confirmed; here they turn at once when the swing starts
+    /// (provisional).
     pub(crate) fn start_attack(&mut self, id: ObjectId, target: ObjectId, ty: i32) {
+        self.face_target(id, target);
         let mut ev = self.new_event("COMMAND_PENDING", Some(id));
         ev.objects = vec![id, target];
         ev.ints = vec![ty, 0];
@@ -933,6 +942,20 @@ impl Sim {
         let script = self.world.get(id).and_then(|o| o.script.clone());
         if let Some(script) = script {
             self.run_script(&script, id, Some(ev));
+        }
+    }
+
+    /// Turns `id` to face `target` (both in the same area; nothing when they stand on the
+    /// same spot).
+    pub(crate) fn face_target(&mut self, id: ObjectId, target: ObjectId) {
+        let Some(t) = self.world.get(target).map(|t| (t.position, t.area)) else {
+            return;
+        };
+        if let Some(o) = self.world.get_mut(id) {
+            let (dx, dy) = (t.0[0] - o.position[0], t.0[1] - o.position[1]);
+            if id != target && o.area == t.1 && dx * dx + dy * dy > 1e-6 {
+                o.facing = crate::world::facing_toward(dx, dy);
+            }
         }
     }
 
@@ -1118,6 +1141,29 @@ mod tests {
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         Sim::new(Arc::new(Vfs::new()), table, 3)
+    }
+
+    #[test]
+    fn attackers_turn_to_face_their_target_when_the_swing_starts() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let bandit = s.world.spawn(ObjectKind::Creature, "bandit");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        for (id, p) in [(bandit, [0.0, 0.0, 0.0]), (hero, [0.0, -2.0, 0.0])] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = p;
+            o.facing = 0.0; // looking along +Y, away from the hero
+        }
+        s.start_attack(bandit, hero, 0);
+        // The hero is along -Y: a half turn.
+        let f = s.world.get(bandit).unwrap().facing;
+        assert!((f - 180.0).abs() < 1e-3, "{f}");
+        // A target elsewhere or the attacker itself leaves the facing alone.
+        s.face_target(bandit, bandit);
+        s.world.get_mut(hero).unwrap().area = None;
+        s.face_target(bandit, hero);
+        assert!((s.world.get(bandit).unwrap().facing - 180.0).abs() < 1e-3);
     }
 
     #[test]
