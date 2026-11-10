@@ -68,6 +68,27 @@ fn void() -> Option<VmResult<Option<Value>>> {
     Some(Ok(None))
 }
 
+/// The party's inventory slots before any backpack (provisional).
+pub const DEFAULT_INVENTORY_SIZE: i32 = 70;
+
+fn store_field(h: &ScriptHost, store: ObjectId, name: &str, default: i32) -> i32 {
+    h.object(store)
+        .and_then(|o| o.fields.get(name).copied())
+        .unwrap_or(default)
+}
+
+fn set_store_field(
+    h: &mut ScriptHost,
+    store: ObjectId,
+    name: &str,
+    v: i32,
+) -> Option<VmResult<Option<Value>>> {
+    if let Some(o) = h.sim.world.get_mut(store) {
+        o.fields.insert(name.to_string(), v);
+    }
+    void()
+}
+
 fn b(v: bool) -> Value {
     Value::Int(v as i32)
 }
@@ -135,10 +156,8 @@ const PRESENTATION: &[&str] = &[
     "SendGameEventRunDatabase",
     "SetTrainingMode",
     "SetItemMaterialType",
-    "SetObjectInteractive",
     "SetPlaceableHealth",
     "SetMapPinState",
-    "ShowPopup",
     "SetCameraTarget",
     "SetPlaceableActionResult",
     "ApplyEffectVisualEffectOnLocation",
@@ -1796,11 +1815,10 @@ pub fn call(
                 .and_then(|o| o.fields.get("Gender").copied())
                 .unwrap_or(0),
         )),
-        "SetCreatureRacialType" | "SetCreatureGender" | "SetMaxInventorySize" => {
+        "SetCreatureRacialType" | "SetCreatureGender" => {
             let field = match name {
                 "SetCreatureRacialType" => "Race",
-                "SetCreatureGender" => "Gender",
-                _ => "MaxInventorySize",
+                _ => "Gender",
             };
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
                 o.fields.insert(field.to_string(), int(a, 1));
@@ -1881,12 +1899,15 @@ pub fn call(
         "GetTeam" => {
             let (team, mask) = (int(a, 0), int(a, 1));
             let mask = if mask == 0 { 32 } else { mask };
+            // Only the loaded area's objects (active or not): areas left behind keep
+            // their teams, and those must not keep a team here alive.
+            let here = h.sim.world.area;
             let v: Vec<ObjectId> = h
                 .sim
                 .world
                 .objects
                 .values()
-                .filter(|o| o.team == team && o.kind.script_type() & mask != 0)
+                .filter(|o| o.team == team && o.kind.script_type() & mask != 0 && o.area == here)
                 .map(|o| o.id)
                 .collect();
             ok(objects(v))
@@ -2060,6 +2081,72 @@ pub fn call(
         "ShowChantersGUI" => {
             if let Some(m) = h.sim.world.module.and_then(|m| h.sim.world.get_mut(m)) {
                 m.fields.insert("ChantersBoard".into(), int(a, 0));
+            }
+            void()
+        }
+        "SetObjectInteractive" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.interactive = int(a, 1) != 0;
+            }
+            void()
+        }
+        "GetObjectInteractive" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.interactive))),
+        "GetDistanceBetweenLocations" => {
+            let loc = |i: usize| match h.sim.world.handle(handle(a, i)) {
+                Some(EngineData::Location(l)) => Some(*l),
+                _ => None,
+            };
+            ok(Value::Float(match (loc(0), loc(1)) {
+                (Some(x), Some(y)) if x.area == y.area => dist(x.position, y.position),
+                _ => -1.0,
+            }))
+        }
+        // A message box: it waits for the player's answer (EVENT_TYPE_POPUP_RESULT to its
+        // owner, see Sim::answer_popup).
+        "ShowPopup" => {
+            h.sim.world.popup = Some(crate::world::Popup {
+                strref: int(a, 0),
+                kind: int(a, 1),
+                owner: obj(a, 2),
+                input: int(a, 3) != 0,
+            });
+            void()
+        }
+        // --- Stores (see store.rs) ----------------------------------------------------------
+        "OpenStore" => {
+            let st = obj(a, 0);
+            h.sim.world.store = h.object(st).map(|_| st);
+            void()
+        }
+        "GetItemValue" => ok(Value::Int(h.sim.item_value(obj(a, 0)))),
+        "GetStoreMoney" => ok(Value::Int(store_field(h, obj(a, 0), "StoreMoney", -1))),
+        "SetStoreMoney" => set_store_field(h, obj(a, 0), "StoreMoney", int(a, 1)),
+        "GetStoreMaxBuyPrice" => ok(Value::Int(store_field(h, obj(a, 0), "MaxBuyPrice", -1))),
+        "SetStoreMaxBuyPrice" => set_store_field(h, obj(a, 0), "MaxBuyPrice", int(a, 1)),
+        "GetStoreMarkUp" => ok(Value::Int(store_field(h, obj(a, 0), "MarkUp", 100))),
+        "SetStoreMarkUp" => set_store_field(h, obj(a, 0), "MarkUp", int(a, 1)),
+        "GetStoreMarkDown" => ok(Value::Int(store_field(h, obj(a, 0), "MarkDown", 100))),
+        "SetStoreMarkDown" => set_store_field(h, obj(a, 0), "MarkDown", int(a, 1)),
+        // The party's inventory size, kept on the hero (backpacks raise it). The starting
+        // size is provisional.
+        "GetMaxInventorySize" => {
+            let who = match obj(a, 0) {
+                OBJECT_INVALID => h.sim.world.hero.unwrap_or(OBJECT_INVALID),
+                o => o,
+            };
+            ok(Value::Int(
+                h.object(who)
+                    .and_then(|o| o.fields.get("MaxInventorySize").copied())
+                    .unwrap_or(DEFAULT_INVENTORY_SIZE),
+            ))
+        }
+        "SetMaxInventorySize" => {
+            let who = match obj(a, 1) {
+                OBJECT_INVALID => h.sim.world.hero.unwrap_or(OBJECT_INVALID),
+                o => o,
+            };
+            if let Some(o) = h.sim.world.get_mut(who) {
+                o.fields.insert("MaxInventorySize".into(), int(a, 0));
             }
             void()
         }
@@ -2786,7 +2873,12 @@ mod tests {
         object[] GetNearestObjectByTag(object o, string s, int t = 32, int n = 1, int a = 0, int b = 0, int c = 0) = 8;\n\
         int GetFollowerState(object o) = 9;\n\
         int IsControlled(object o) = 10;\n\
-        int IsPartyAIEnabled(object o) = 11;\n";
+        int IsPartyAIEnabled(object o) = 11;\n\
+        object[] GetTeam(int n, int t = 32) = 12;\n\
+        void ShowPopup(int s, int t, object o, int b = FALSE, int d = 0) = 13;\n\
+        void OpenStore(object o) = 14;\n\
+        int GetMaxInventorySize(object o) = 15;\n\
+        void SetMaxInventorySize(int n, object o) = 16;\n";
 
     /// Calls engine function `name` as `caller`.
     fn run(s: &mut Sim, caller: ObjectId, name: &str, a: &[Value]) -> Option<Value> {
@@ -2797,6 +2889,81 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn teams_are_counted_in_the_loaded_area_only() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let (here, there) = (
+            s.world.spawn(ObjectKind::Area, "here"),
+            s.world.spawn(ObjectKind::Area, "there"),
+        );
+        s.world.area = Some(here);
+        let mut team = Vec::new();
+        for (area, active) in [(here, true), (here, false), (there, true)] {
+            let c = s.world.spawn(ObjectKind::Creature, "darkspawn");
+            let o = s.world.get_mut(c).unwrap();
+            o.team = 16;
+            o.area = Some(area);
+            o.active = active;
+            team.push(c);
+        }
+        let r = run(&mut s, here, "GetTeam", &[Value::Int(16), Value::Int(32)]);
+        assert_eq!(
+            r,
+            Some(objects(vec![team[0], team[1]])),
+            "inactive members count, other areas' do not"
+        );
+    }
+
+    #[test]
+    fn popups_wait_for_an_answer_and_stores_open() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let door = s.world.spawn(ObjectKind::Placeable, "exit");
+        let store = s.world.spawn(ObjectKind::Store, "store");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.hero = Some(hero);
+        run(
+            &mut s,
+            door,
+            "ShowPopup",
+            &[Value::Int(321), Value::Int(1), Value::Object(door)],
+        );
+        assert_eq!(
+            s.world.popup.as_ref().map(|p| (p.strref, p.owner)),
+            Some((321, door))
+        );
+        assert!(s.answer_popup(1));
+        assert!(s.world.popup.is_none());
+        let q: Vec<_> = s
+            .world
+            .queue
+            .values()
+            .map(|q| (q.target, q.event.ints.clone()))
+            .collect();
+        assert_eq!(q, vec![(door, vec![1, 1])]);
+        assert!(!s.answer_popup(1), "nothing left to answer");
+
+        run(&mut s, hero, "OpenStore", &[Value::Object(store)]);
+        assert_eq!(s.world.store, Some(store));
+        let size = |s: &mut Sim| {
+            run(
+                s,
+                hero,
+                "GetMaxInventorySize",
+                &[Value::Object(OBJECT_INVALID)],
+            )
+        };
+        assert_eq!(size(&mut s), Some(Value::Int(DEFAULT_INVENTORY_SIZE)));
+        run(
+            &mut s,
+            hero,
+            "SetMaxInventorySize",
+            &[Value::Int(80), Value::Object(OBJECT_INVALID)],
+        );
+        assert_eq!(size(&mut s), Some(Value::Int(80)));
     }
 
     #[test]
