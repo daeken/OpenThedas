@@ -60,7 +60,24 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
     }
     let mut creature = |prefix: &str, id: u32| {
         let Some(o) = sim.world.get(id) else { return };
+        v.insert(prefix.to_string(), num(id));
         v.insert(format!("{prefix}.ID"), num(id));
+        // No combat or status simulation yet: nothing is poisoned, paralysed or busy.
+        for k in [
+            "Poisoned",
+            "Paralyzed",
+            "AbilityUpkeepCost",
+            "CurrentAction",
+            "PendingAction",
+        ] {
+            v.insert(format!("{prefix}.{k}"), num(0));
+        }
+        v.insert(
+            format!("{prefix}.UserSelected"),
+            num((Some(id) == sim.world.hero) as u8),
+        );
+        let mana = o.properties.contains_key(&8);
+        v.insert(format!("{prefix}.Stats.ClassHasMana"), num(mana as u8));
         v.insert(format!("{prefix}.Name"), UiValue::String(name(sim, id)));
         v.insert(format!("{prefix}.Dead"), num(o.dead as u8));
         // The simulation keeps (base, current); for depletable properties (health, mana)
@@ -75,6 +92,11 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
     }
     if let Some(h) = hero {
         creature("GUI.SelectedChar", h);
+    }
+    // Empty slots read as no creature (0); `GetNumMembers` does not count them.
+    for i in members.len()..4 {
+        v.insert(format!("Party.Members.{i}"), num(0));
+        v.insert(format!("Party.Summons.{i}"), num(0));
     }
     let mut set = |k: String, x: UiValue| {
         v.insert(k, x);

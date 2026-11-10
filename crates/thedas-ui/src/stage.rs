@@ -160,7 +160,10 @@ impl Stage {
     /// Advances every movie; returns the messages meant for the rest of the engine.
     pub fn tick(&mut self, dt_ms: f64) -> Vec<GameMessage> {
         let mut out = Vec::new();
+        let bridge = self.bridge.clone();
         for m in &mut self.movies {
+            let missing = m.sync_tokens(&|t| bridge.value(t));
+            bridge.note_unanswered(missing);
             m.tick(dt_ms);
             out.extend(
                 m.drain_calls()
