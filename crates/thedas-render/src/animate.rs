@@ -11,12 +11,12 @@ use thedas_vfs::Vfs;
 
 use crate::scene::AreaScene;
 
-/// What to play: `action` from the first of `trees` that has it, at `time` seconds,
-/// wrapped when `looping`, else held at the end.
+/// What to play: the first of `actions` that the first tree able to has, trying `trees` in
+/// order, at `time` seconds, wrapped when `looping`, else held at the end.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Clip {
     pub trees: Vec<String>,
-    pub action: String,
+    pub actions: Vec<String>,
     pub time: f32,
     pub looping: bool,
 }
@@ -63,7 +63,11 @@ impl Animator {
             let Some(t) = load(&mut self.trees, vfs, &name, |d| AnimTree::parse(d).ok()) else {
                 continue;
             };
-            let Some(ani) = t.action(&clip.action).and_then(|n| n.animation.clone()) else {
+            let Some(ani) = clip
+                .actions
+                .iter()
+                .find_map(|a| t.action(a).and_then(|n| n.animation.clone()))
+            else {
                 continue;
             };
             return load(&mut self.animations, vfs, &ani, |d| {
