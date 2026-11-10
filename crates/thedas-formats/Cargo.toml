@@ -11,3 +11,4 @@ rust-version.workspace = true
 thiserror.workspace = true
 crc32fast.workspace = true
 roxmltree.workspace = true
+flate2.workspace = true

@@ -17,12 +17,17 @@
 //! - [`material`]: `.mao` material objects and `.mat` material definitions (XML).
 //! - [`state`]: `.sta` render states (XML).
 //! - [`dds`]: DDS textures, with a CPU decoder for BC1/2/3.
+//!
+//! Interface:
+//!
+//! - [`gfx`]: Scaleform GFx movies (SWF with Scaleform tags), with a rewriter to plain SWF.
 
 pub mod area;
 pub mod dds;
 pub mod gda;
 pub mod gff3;
 pub mod gff4;
+pub mod gfx;
 pub mod level;
 pub mod material;
 pub mod mesh;

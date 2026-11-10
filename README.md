@@ -22,22 +22,28 @@ renderer binds constants, samplers and render states the way the material files 
 Materials outside the Static1 family fall back to a hand-written stand-in unless you pass
 `--shaders all`.
 
+The interface is the game's own Scaleform movies, played by [Ruffle](https://ruffle.rs) on the
+renderer's wgpu device: the main menu, start menu and HUD movies load, render with their fonts
+and atlas images, and talk to the engine through the same `fscommand`/`ExternalInterface`
+protocol the game used. The HUD shows placeholders until engine values are bound to the
+simulation.
+
 ## Layout
 
 | Crate | What it does |
 | --- | --- |
 | `thedas-vfs` | ERF V2.0/V2.1/V2.2/V3.0 and RIM archives, DLC decryption, layered lookup with provenance, install discovery |
-| `thedas-formats` | GFF3 and GFF4 readers and writers, GDA tables, talk tables; typed readers for areas (`.are`), layouts (`.arl`, `.rml`), models (`.mmh`), meshes (`.msh`), materials (`.mao`, `.mat`) and DDS textures |
+| `thedas-formats` | GFF3 and GFF4 readers and writers, GDA tables, talk tables; typed readers for areas (`.are`), layouts (`.arl`, `.rml`), models (`.mmh`), meshes (`.msh`), materials (`.mao`, `.mat`), DDS textures and Scaleform GFx movies |
 | `thedas-shader` | D3D9 shader bytecode and constant-table parsing; translation to validated naga IR |
 | `thedas-render` | wgpu renderer: loads an area's static geometry, draws each material with its translated original shaders (or a stand-in), captures |
 | `thedas-app` | The `thedas-app` binary: a window with a free-fly camera, or a headless capture |
 | `thedas-script` | NWScript: the `script.ldf` engine-function table, NCS bytecode parsing and disassembly, and the stack VM |
 | `thedas-sim` | The headless, deterministic world: modules and areas loaded from their files, objects, events and the event queue, engine functions for the NWScript VM, plots and conversations |
+| `thedas-ui` | Scaleform GFx movies on Ruffle: GFx-to-SWF rewriting with atlas images inlined, offscreen rendering into a wgpu texture, and the engine side of the game's GUI protocol |
 | `thedas-mcp` | An MCP server over the simulation, so an AI assistant (or any MCP client) can play and test the game |
 | `thedas-cli` | The `thedas` tool: `ls`, `extract`, `dump`, `resolve`, `corpus` |
 
-Planned crates follow the architecture doc: `thedas-ui`,
-`thedas-audio`, `thedas-video`.
+Planned crates follow the architecture doc: `thedas-audio`, `thedas-video`.
 
 ## Walking through an area
 
@@ -59,6 +65,35 @@ For side-by-side comparisons, render a fixed view with no window:
 ```
 
 The camera is `x,y,z,yaw,pitch` in world units and degrees; Z is up and yaw 0 looks along +X.
+
+`--ui` plays interface movies over the scene: `--ui menu` (the in-game menu), `--ui hud`
+(portraits, quick bar, minimap), or any comma-separated movie names (`--ui startmenu2`).
+`--area none` shows the interface alone. With `--capture`, `--ui-frames` sets how many movie
+frames run before the shot:
+
+```sh
+./target/release/thedas-app --install "$GAME" --area none --ui startmenu2 --capture menu.png
+```
+
+How the Scaleform-only parts are handled, all provisional (inferred from the movies' bytecode):
+
+- `DefineExternalImage` (6,419 in a full install): the movies name images that live in the
+  `atl_*_dat.xml` texture atlases. `thedas-formats::gfx` rewrites each movie to a plain SWF,
+  and `thedas-ui` crops the image out of its atlas page and inlines it as `DefineBitsLossless2`.
+- `ExporterInfo` is dropped. Ruffle reads the `GFX`/`CFX` signatures natively.
+- Fonts come from `gfxfontlib.gfx` through `importAssets`, served from the game's resources.
+  Other locales would need the font-config mapping to `fonts_<locale>.gfx`.
+- The game calls movie functions by path (`GFxMovie::Invoke`). A small injected frame-one
+  action registers an `ExternalInterface` callback that does the same, so the engine can call
+  `_global.GUISystem.StartSceneFromGame` (without it the movies run in standalone Flash mode
+  and show raw `LOC_*` keys).
+- `ExternalCommands` functions that return values send an `fscommand` and read
+  `ExternalCommands.fsc_retval`, which the game set from its handler. Ruffle's handler cannot
+  write into the movie, so those functions are wrapped to fetch the answer through
+  `ExternalInterface` instead. That is how `GetTlkString` reaches the talk table.
+- Engine values (`GetValue`/`GetNumber`/`GetString`, `SetValue`) are a dotted key-value store;
+  hundreds of HUD keys (`GUI.SelectedChar.Stats.QuickSlots.N`, `Party.MemberSelected.N`,
+  `Area.Minimap*`) are not bound to the simulation yet.
 
 ## Using the CLI
 
