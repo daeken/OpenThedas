@@ -10,6 +10,7 @@ use glam::{Mat4, Quat, Vec3};
 use thedas_formats::level::{ArlRoom, LightmapBinding, Transform};
 use thedas_formats::material::{MaterialDef, MaterialObject, Technique, TextureBinding};
 use thedas_formats::mesh::{DeclUsage, MeshChunk, Msh};
+pub use thedas_formats::model::{DOMAIN_CHARACTERS, DOMAIN_LEVEL};
 use thedas_formats::morph::{Morph, MorphNode, slot as morph_slot};
 use thedas_formats::probe::IrradianceProbe;
 use thedas_formats::tint::Tint;
@@ -130,6 +131,9 @@ pub enum SceneLight {
         color: Vec3,
         radius: f32,
         name: String,
+        /// What it lights, as a mask of [`DOMAIN_LEVEL`] and [`DOMAIN_CHARACTERS`]; `None`
+        /// when its node does not say (it then lights everything).
+        domain: Option<i64>,
     },
     Ambient {
         color: Vec3,
@@ -724,11 +728,16 @@ impl<'a> Loader<'a> {
                 .fold(placement, |m, t| m * transform_matrix(t));
             let name = lp.name.unwrap_or("").to_string();
             self.scene.lights.push(match lp.light {
-                thedas_formats::model::Light::Point { color, radius, .. } => SceneLight::Point {
+                thedas_formats::model::Light::Point {
+                    color,
+                    radius,
+                    affect_domain,
+                } => SceneLight::Point {
                     position: m.transform_point3(Vec3::ZERO),
                     color: Vec3::new(color[0], color[1], color[2]),
                     radius: *radius,
                     name,
+                    domain: *affect_domain,
                 },
                 thedas_formats::model::Light::Ambient { color } => SceneLight::Ambient {
                     color: Vec3::new(color[0], color[1], color[2]),

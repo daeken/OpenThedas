@@ -283,10 +283,12 @@ pub struct DrawLights {
     pub points: Vec<(Vec3, f32, Vec3)>,
 }
 
-/// Picks up to three point lights whose radius reaches the draw's bounding sphere, strongest
-/// first by colour brightness times the shader's own attenuation at the sphere centre.
-/// Provisional: the original's light selection is unknown.
-pub fn pick_lights(lights: &[SceneLight], sphere: (Vec3, f32)) -> DrawLights {
+/// Picks up to three point lights whose radius reaches the draw's bounding sphere and whose
+/// affect domain includes `domain` (level geometry or characters), strongest first by colour
+/// brightness times the shader's own attenuation at the sphere centre. The domain keeps the
+/// rooms' character lights (`Char_sun`, `Char_bounce`, reaching 600 units) off the
+/// lightmapped level. Provisional: the original's light selection is unknown beyond that.
+pub fn pick_lights(lights: &[SceneLight], sphere: (Vec3, f32), domain: i64) -> DrawLights {
     let mut cands: Vec<(f32, Vec3, f32, Vec3)> = lights
         .iter()
         .filter_map(|l| match l {
@@ -294,8 +296,12 @@ pub fn pick_lights(lights: &[SceneLight], sphere: (Vec3, f32)) -> DrawLights {
                 position,
                 color,
                 radius,
+                domain: lit,
                 ..
             } => {
+                if lit.is_some_and(|m| m & domain == 0) {
+                    return None;
+                }
                 let d = position.distance(sphere.0);
                 if d > radius + sphere.1 || *radius <= 0.0 {
                     return None;
@@ -654,6 +660,7 @@ pub fn sampler_texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scene::{DOMAIN_CHARACTERS, DOMAIN_LEVEL};
     use thedas_formats::MaterialObject;
     use thedas_formats::material::MaterialDef;
 
@@ -914,6 +921,7 @@ mod tests {
             color: Vec3::splat(c),
             radius: r,
             name: String::new(),
+            domain: None,
         };
         let lights = vec![
             light(1.0, 5.0, 1.0),
@@ -927,9 +935,35 @@ mod tests {
                 room: String::new(),
             },
         ];
-        let picked = pick_lights(&lights, (Vec3::ZERO, 1.0));
+        let picked = pick_lights(&lights, (Vec3::ZERO, 1.0), DOMAIN_LEVEL);
         assert_eq!(picked.points.len(), 3);
         assert_eq!(picked.points[0].0.x, 1.0);
         assert!(picked.points.iter().all(|p| p.0.x < 50.0));
+    }
+
+    #[test]
+    fn lights_only_their_domain() {
+        let light = |x: f32, c: f32, domain| SceneLight::Point {
+            position: Vec3::new(x, 0.0, 0.0),
+            color: Vec3::splat(c),
+            radius: 600.0,
+            name: String::new(),
+            domain,
+        };
+        let lights = vec![
+            light(1.0, 9.0, Some(DOMAIN_CHARACTERS)),
+            light(2.0, 1.0, Some(DOMAIN_LEVEL)),
+            light(3.0, 0.5, Some(DOMAIN_LEVEL | DOMAIN_CHARACTERS)),
+            light(4.0, 0.1, None),
+        ];
+        let at = |domain| {
+            pick_lights(&lights, (Vec3::ZERO, 1.0), domain)
+                .points
+                .iter()
+                .map(|p| p.0.x)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(at(DOMAIN_LEVEL), [2.0, 3.0, 4.0]);
+        assert_eq!(at(DOMAIN_CHARACTERS), [1.0, 3.0, 4.0]);
     }
 }
