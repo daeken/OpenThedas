@@ -1034,7 +1034,7 @@ impl App {
                 };
                 let mut sim = live.sim();
                 let who = sim.world.controlled();
-                let target = sim.world.by_tag(tag).next().map(|o| o.id);
+                let target = who.and_then(|w| nearest_tagged(&sim, w, tag));
                 log.push(match (who, target) {
                     (Some(w), Some(t)) => {
                         sim.order_talk(w, t);
@@ -1051,6 +1051,16 @@ impl App {
                     "{} {x},{y}",
                     if down { "press" } else { "release" }
                 ));
+            }
+            &Step::Orbit(dyaw, dpitch) => {
+                orbit_camera(self.follow.as_mut(), &mut self.camera, dyaw, dpitch);
+                log.push(format!("orbit {dyaw},{dpitch}"));
+            }
+            &Step::Zoom(n) => {
+                if let Some(f) = self.follow.as_mut() {
+                    f.zoom(n);
+                }
+                log.push(format!("zoom {n}"));
             }
             Step::Rebuild => log.push("rebuild: headless only".into()),
             Step::Run(_) => {}
@@ -1328,6 +1338,35 @@ fn reply(live: &mut live::Live, n: usize) -> String {
     }
 }
 
+/// The creature tagged `tag` nearest to `who`, in `who`'s area (an area left behind keeps its
+/// own creatures of the same tag, which a talk order cannot reach).
+fn nearest_tagged(
+    sim: &thedas_sim::Sim,
+    who: thedas_script::vm::ObjectId,
+    tag: &str,
+) -> Option<thedas_script::vm::ObjectId> {
+    let me = sim.world.get(who)?;
+    sim.world
+        .by_tag(tag)
+        .filter(|o| o.area.is_some() && o.area == me.area && o.id != who)
+        .min_by(|a, b| {
+            let d =
+                |o: &thedas_sim::world::Object| thedas_sim::engine::dist(o.position, me.position);
+            d(a).total_cmp(&d(b))
+        })
+        .map(|o| o.id)
+}
+
+/// Turns the camera `dyaw` and `dpitch` degrees: the game camera when it follows the leader,
+/// else the free camera.
+fn orbit_camera(follow: Option<&mut follow::Follow>, camera: &mut Camera, dyaw: f32, dpitch: f32) {
+    let (y, p) = (dyaw.to_radians(), dpitch.to_radians());
+    match follow {
+        Some(f) => f.orbit(y, p),
+        None => camera.look(y, p),
+    }
+}
+
 /// The quickbar slot a digit key uses (1 is the first, 0 the tenth).
 fn quickslot_key(code: KeyCode) -> Option<i32> {
     Some(match code {
@@ -1374,6 +1413,11 @@ enum Step {
     Pause,
     /// The conversation's reply n (from 0) is chosen.
     Reply(usize),
+    /// The game camera turns (degrees of yaw, then pitch), as dragging with the right
+    /// button or Q/E does.
+    Orbit(f32, f32),
+    /// The game camera zooms in (positive) or out, in wheel steps.
+    Zoom(f32),
     /// The left button goes down, or up, at a pixel: with `hover` and `run` between, a drag
     /// (the quickbar's icons, the inventory's items).
     Press(f64, f64),
@@ -1403,6 +1447,14 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
                     Step::Quickslot((arg.as_bytes()[0] - b'0' + 9) as i32 % 10)
                 }
                 "reply" => Step::Reply(arg.parse().context("reply takes a number")?),
+                "orbit" => {
+                    let (x, y) = arg.split_once(',').unwrap_or((arg, "0"));
+                    Step::Orbit(x.trim().parse()?, y.trim().parse()?)
+                }
+                "zoom" => Step::Zoom(arg.parse().context("zoom takes a number of steps")?),
+                // Q and E turn the camera; a step turns it an eighth of the way round.
+                "key" if arg.eq_ignore_ascii_case("q") => Step::Orbit(45.0, 0.0),
+                "key" if arg.eq_ignore_ascii_case("e") => Step::Orbit(-45.0, 0.0),
                 "press" | "release" => {
                     let (x, y) = arg.split_once(',').context("press takes x,y")?;
                     let (x, y) = (x.trim().parse()?, y.trim().parse()?);
@@ -1565,7 +1617,7 @@ fn main() -> Result<()> {
                     Step::Talk(tag) => {
                         let mut sim = l.sim();
                         let who = sim.world.controlled();
-                        let target = sim.world.by_tag(tag).next().map(|o| o.id);
+                        let target = who.and_then(|w| nearest_tagged(&sim, w, tag));
                         match (who, target) {
                             (Some(w), Some(t)) => {
                                 sim.order_talk(w, t);
@@ -1672,6 +1724,19 @@ fn main() -> Result<()> {
                         println!("{}", if l.paused { "paused" } else { "running" });
                     }
                     &Step::Reply(n) => println!("{}", reply(l, n)),
+                    &Step::Orbit(dyaw, dpitch) => {
+                        orbit_camera(follow.as_mut(), &mut camera, dyaw, dpitch);
+                        if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
+                            camera = f.camera_clear(feet, 0.0, &camera, &|a, b| l.first_hit(a, b));
+                        }
+                        println!("orbit {dyaw},{dpitch}");
+                    }
+                    &Step::Zoom(n) => {
+                        if let Some(f) = follow.as_mut() {
+                            f.zoom(n);
+                        }
+                        println!("zoom {n}");
+                    }
                 }
             }
             let sim = l.sim();
@@ -1793,6 +1858,17 @@ mod tests {
                 Step::Reply(2)
             ]
         );
+        assert_eq!(
+            parse_steps("orbit 30,-10; orbit 15; zoom -2; key q; key E").unwrap(),
+            vec![
+                Step::Orbit(30.0, -10.0),
+                Step::Orbit(15.0, 0.0),
+                Step::Zoom(-2.0),
+                Step::Orbit(45.0, 0.0),
+                Step::Orbit(-45.0, 0.0)
+            ]
+        );
+        assert!(parse_steps("zoom far").is_err());
         assert_eq!(
             parse_steps("press 1,2; release 3,4").unwrap(),
             vec![Step::Press(1.0, 2.0), Step::Release(3.0, 4.0)]
