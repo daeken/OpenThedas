@@ -1591,7 +1591,8 @@ impl Server {
             let hero = sim.world.hero.ok_or("no hero")?;
             let target = resolve(sim, &a.object).ok_or("no such object")?;
             sim.order_attack(hero, target);
-            for _ in 0..30 {
+            // Until the swing resolves (walking up first if out of reach), at most 10 s.
+            for _ in 0..100 {
                 sim.tick(100);
                 if sim.world.get(hero).is_none_or(|h| h.commands.is_empty()) {
                     break;
