@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use thedas_vfs::Vfs;
 
-use crate::protocol::{GameBridge, GameMessage, START_SCENE};
-use crate::{Gpu, ImageSource, ResourceLookup, Rgba, UiError, UiMovie};
+use crate::protocol::{GameBridge, GameMessage, LAYOUT, START_SCENE};
+use crate::{Gpu, ImageSource, ResourceLookup, Rgba, UiError, UiMovie, UiValue};
 
 /// Movie sets by name (`menu`, `hud`); anything else is a comma-separated list of movie names.
 pub fn movie_names(spec: &str) -> Vec<String> {
@@ -79,6 +79,8 @@ pub fn blend_premultiplied(base: &mut Rgba, src: &Rgba) {
 
 pub struct Stage {
     pub movies: Vec<UiMovie>,
+    /// Recent ActionScript traces and warnings, newest last (at most 500).
+    pub log: Vec<String>,
     pub bridge: GameBridge,
     gpu: Gpu,
     lookup: ResourceLookup,
@@ -97,6 +99,7 @@ impl Stage {
         log::info!("ui: {} atlas images indexed", images.len());
         Self {
             movies: Vec::new(),
+            log: Vec::new(),
             bridge: GameBridge::new(talk_table(vfs)),
             gpu,
             lookup,
@@ -137,7 +140,24 @@ impl Stage {
             }
             m.run_frame();
         }
+        // StartSceneFromFlash records the authored stage size; when the game starts the movie
+        // it sets the size itself, and layout depends on it.
+        if let Some((w, h)) = crate::gfx::Movie::parse(&swf)
+            .ok()
+            .and_then(|x| x.stage_size())
+        {
+            m.set(
+                "_global.GUISystem.OriginalStageWidth",
+                UiValue::Number(w as f64),
+            );
+            m.set(
+                "_global.GUISystem.OriginalStageHeight",
+                UiValue::Number(h as f64),
+            );
+        }
         m.call(START_SCENE, &[]);
+        // Movies anchor their elements to the screen when the engine asks them to lay out.
+        m.call(LAYOUT, &[]);
         self.movies.push(m);
         Ok(())
     }
@@ -172,6 +192,10 @@ impl Stage {
             );
             for line in m.drain_log() {
                 log::debug!("ui: {}: {line}", m.name);
+                self.log.push(format!("{}: {line}", m.name));
+            }
+            if self.log.len() > 500 {
+                self.log.drain(..self.log.len() - 500);
             }
         }
         out
@@ -181,6 +205,7 @@ impl Stage {
         self.size = size;
         for m in &mut self.movies {
             m.resize(size);
+            m.call(LAYOUT, &[]);
         }
     }
 

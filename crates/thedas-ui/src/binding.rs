@@ -37,6 +37,16 @@ fn name(sim: &Sim, id: u32) -> String {
         .unwrap_or_default()
 }
 
+/// `GM_DIALOG` (4) while a conversation is on screen, the world's game mode otherwise.
+/// Provisional: the simulation does not switch game modes for conversations itself.
+pub fn game_mode(sim: &Sim) -> i32 {
+    if sim.dialog_state().is_some_and(|d| !d.ended) {
+        4
+    } else {
+        sim.world.game_mode
+    }
+}
+
 /// Every value this module can answer for the current simulation state.
 pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
     let mut v = BTreeMap::new();
@@ -107,8 +117,26 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
     }
     set(
         "GameModeController.CurrentGameMode".into(),
-        num(sim.world.game_mode),
+        num(game_mode(sim)),
     );
+    // The conversation in progress, as conversation.gfx reads it: the NPC line, the
+    // responses (`Responses.N.Text`, counted with GetNumMembers) and a ready flag.
+    if let Some(d) = sim.dialog_state().filter(|d| !d.ended) {
+        set(
+            "Conversation.NPCLine".into(),
+            UiValue::String(d.line.clone()),
+        );
+        set("Conversation.Responses".into(), num(d.replies.len() as f64));
+        for (i, (_, text)) in d.replies.iter().enumerate() {
+            set(
+                format!("Conversation.Responses.{i}.Text"),
+                UiValue::String(text.clone()),
+            );
+            set(format!("Conversation.Responses.{i}.Icon"), num(0));
+        }
+        set("Conversation.ResponsesReady".into(), num(1));
+        set("Conversation.HasVO".into(), num(0));
+    }
     let creatures = sim
         .world
         .objects

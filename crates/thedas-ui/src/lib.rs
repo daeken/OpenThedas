@@ -246,8 +246,10 @@ pub struct UiMovie {
     shared: Arc<Shared>,
     fetches: navigator::FetchLog,
     size: (u32, u32),
-    /// Token observers the movie registered: callback id -> engine value name.
-    observers: std::collections::BTreeMap<String, String>,
+    /// Token observers the movie registered (callback id, engine value name), in
+    /// registration order: values are pushed in that order, so a movie that registers a
+    /// "ready" token after the data it guards sees the data first.
+    observers: Vec<(String, String)>,
     /// The value last pushed to each observer.
     sent: std::collections::HashMap<String, UiValue>,
 }
@@ -302,6 +304,10 @@ impl UiMovie {
             .with_fs_commands(Box::new(bridge()))
             .with_external_interface(Box::new(bridge()))
             .with_viewport_dimensions(size.0, size.1, 1.0)
+            // Provisional: the movies compute a screen rectangle from Stage.width/height and
+            // their authored size (SceneManager.sm_rScreenRect), which suggests Scaleform's
+            // no-scale stage, but their anchoring does not follow it yet; show-all keeps
+            // every element on screen.
             .with_autoplay(true)
             .with_movie(movie)
             .build();
@@ -423,22 +429,18 @@ impl UiMovie {
             if let (Some(id), Some(UiValue::String(token))) =
                 (t.first().and_then(callback_key), t.get(1))
             {
-                self.observers.insert(id, token.clone());
+                self.observers.retain(|(i, _)| *i != id);
+                self.observers.push((id, token.clone()));
             }
         }
         for r in take(self, "RemoveTokenObserverBatchData") {
             if let Some(id) = callback_key(&r) {
-                self.observers.remove(&id);
+                self.observers.retain(|(i, _)| *i != id);
                 self.sent.remove(&id);
             }
         }
         let mut missing = Vec::new();
-        let observers: Vec<(String, String)> = self
-            .observers
-            .iter()
-            .map(|(a, b)| (a.clone(), b.clone()))
-            .collect();
-        for (id, token) in observers {
+        for (id, token) in self.observers.clone() {
             match value(&token) {
                 Some(v) => {
                     if self.sent.get(&id) != Some(&v) {
@@ -469,6 +471,21 @@ impl UiMovie {
                 UiValue::List(args.to_vec()),
             ],
         )
+    }
+
+    /// Sets a movie variable by path (`_global.GUISystem.OriginalStageWidth`), as Scaleform's
+    /// `SetVariable` does. Needs a movie from [`load_movie`].
+    pub fn set(&mut self, path: &str, value: UiValue) {
+        if let Some((object, member)) = path.rsplit_once('.') {
+            self.invoke(
+                avm1::SET_CALLBACK,
+                &[
+                    UiValue::String(object.to_string()),
+                    UiValue::String(member.to_string()),
+                    value,
+                ],
+            );
+        }
     }
 
     /// Calls a function the movie registered with `ExternalInterface.addCallback`.

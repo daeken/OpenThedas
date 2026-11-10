@@ -398,7 +398,8 @@ impl Server {
     /// Binds the current engine values, runs `frames`, and returns the engine messages.
     async fn ui_frames(&self, frames: u32) -> Result<J, String> {
         let (_, values) = self.ui_inputs()?;
-        self.ui
+        let (mut out, messages) = self
+            .ui
             .run(move |w| {
                 w.step(frames, &values);
                 let sounds = w
@@ -406,13 +407,46 @@ impl Server {
                     .as_ref()
                     .map(|s| s.bridge.drain_sounds())
                     .unwrap_or_default();
-                json!({
-                    "messages": messages_json(std::mem::take(&mut w.messages)),
-                    "sounds": sounds,
-                    "contexts": w.stage.as_ref().map(|s| s.bridge.contexts()),
-                })
+                let messages = std::mem::take(&mut w.messages);
+                (
+                    json!({
+                        "messages": messages_json(messages.clone()),
+                        "sounds": sounds,
+                        "contexts": w.stage.as_ref().map(|s| s.bridge.contexts()),
+                    }),
+                    messages,
+                )
             })
-            .await
+            .await?;
+        let applied = self.apply_ui_messages(&messages);
+        if !applied.is_empty() {
+            out["applied"] = J::Array(applied);
+        }
+        Ok(out)
+    }
+
+    /// Acts on what the interface asked the game to do, as player input: picking a
+    /// conversation response (`Conversation.SelectResponse N`).
+    fn apply_ui_messages(&self, messages: &[GameMessage]) -> Vec<J> {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(sim) = st.sim.as_mut() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for m in messages {
+            if let GameMessage::Send(name, args) = m {
+                if name == "Conversation.SelectResponse" {
+                    let n = args
+                        .first()
+                        .and_then(|a| a.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    sim.choose_reply(n);
+                    sim.tick(0);
+                    out.push(json!({ "selected_response": n, "conversation": dialog_json(sim) }));
+                }
+            }
+        }
+        out
     }
 
     fn with_sim<F: FnOnce(&mut State) -> Result<J, String>>(&self, f: F) -> String {
@@ -612,6 +646,7 @@ impl Server {
                     "values": values,
                     "unanswered": unanswered,
                     "failed_loads": stage.failed_loads(),
+                    "log": stage.log.iter().rev().take(40).collect::<Vec<_>>(),
                 }))
             })
             .await;
@@ -686,7 +721,7 @@ impl Server {
                 "queued_events": sim.world.queue.len(),
                 "scripts_run": tr.scripts_run,
                 "script_errors": tr.script_errors,
-                "unimplemented_top": un.iter().take(15).map(|(f, n)| json!({"function": f, "calls": n})).collect::<Vec<_>>(),
+                "unimplemented_top": un.iter().take(40).map(|(f, n)| json!({"function": f, "calls": n})).collect::<Vec<_>>(),
                 "conversation": dialog_json(sim),
             }))
         })
@@ -920,6 +955,38 @@ impl Server {
                 "chargen_in_progress": sim.world.chargen.is_some(),
                 "area": sim.world.area.map(|x| summary(sim, x)),
                 "conversation": dialog_json(sim),
+            }))
+        })
+    }
+
+    #[tool(
+        description = "Order the hero to attack a creature (as clicking an enemy does), then run time until the attack resolves. Returns the target's health and whether it died."
+    )]
+    async fn attack(&self, Parameters(a): Parameters<ObjectArg>) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            let hero = sim.world.hero.ok_or("no hero")?;
+            let target = resolve(sim, &a.object).ok_or("no such object")?;
+            sim.order_attack(hero, target);
+            for _ in 0..30 {
+                sim.tick(100);
+                if sim.world.get(hero).is_none_or(|h| h.commands.is_empty()) {
+                    break;
+                }
+            }
+            let health = thedas_sim::sim::constant(&sim.table, "PROPERTY_DEPLETABLE_HEALTH");
+            let hp = |id| {
+                sim.world
+                    .get(id)
+                    .and_then(|o| o.properties.get(&health).copied())
+            };
+            Ok(json!({
+                "target": summary(sim, target),
+                "target_health": hp(target),
+                "target_dead": sim.world.get(target).is_some_and(|o| o.dead),
+                "hero_health": hp(hero),
+                "hero_dead": sim.world.get(hero).is_some_and(|o| o.dead),
+                "time_ms": sim.world.time_ms,
             }))
         })
     }

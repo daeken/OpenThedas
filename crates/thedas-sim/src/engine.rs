@@ -12,7 +12,7 @@ use thedas_formats::gda::Cell;
 use thedas_script::ldf::{Function, Type};
 use thedas_script::vm::{OBJECT_INVALID, ObjectId, Value, VmResult};
 
-use crate::sim::{ScriptHost, constant};
+use crate::sim::{ScriptHost, Sim, constant};
 use crate::trace::TraceEntry;
 use crate::world::{Command, Effect, EngineData, Event, Location, ObjectKind};
 
@@ -354,13 +354,33 @@ pub fn call(
                     .collect(),
             ))
         }
-        "GetNearestObjectByTag" | "GetNearestObject" | "UT_GetNearestObjectByTag" => {
+        "GetNearestObjectByTag"
+        | "GetNearestObject"
+        | "UT_GetNearestObjectByTag"
+        | "GetNearestObjectByGroup"
+        | "GetNearestObjectByHostility" => {
             let from = obj(a, 0);
+            let by_group = (name == "GetNearestObjectByGroup").then(|| int(a, 1));
+            let by_hostility = (name == "GetNearestObjectByHostility").then(|| int(a, 1) != 0);
             let (tag, kind, count, include_self) = match name {
                 "GetNearestObjectByTag" => (string(a, 1), int(a, 2), int(a, 3), int(a, 6)),
+                "GetNearestObjectByGroup" | "GetNearestObjectByHostility" => {
+                    (String::new(), int(a, 2), int(a, 3), int(a, 6))
+                }
                 "GetNearestObject" => (String::new(), int(a, 1), int(a, 2), int(a, 5)),
                 _ => (string(a, 1), -1, 1, int(a, 2)),
             };
+            let (living, perceived) = match name {
+                "GetNearestObjectByTag"
+                | "GetNearestObjectByGroup"
+                | "GetNearestObjectByHostility" => (int(a, 4) != 0, int(a, 5) != 0),
+                "GetNearestObject" => (int(a, 3) != 0, int(a, 4) != 0),
+                _ => (false, false),
+            };
+            let seen = h
+                .object(from)
+                .map(|o| o.combat.perceived.clone())
+                .unwrap_or_default();
             let Some(origin) = h.object(from).map(|o| (o.position, o.area)) else {
                 return ok(if name == "UT_GetNearestObjectByTag" {
                     Value::Object(OBJECT_INVALID)
@@ -377,6 +397,10 @@ pub fn call(
                 .filter(|o| o.area == origin.1 && o.area.is_some())
                 .filter(|o| include_self != 0 || o.id != from)
                 .filter(|o| tag.is_empty() || o.tag.to_ascii_lowercase() == tag)
+                .filter(|o| !living || !o.dead)
+                .filter(|o| by_group.is_none_or(|g| o.group == g))
+                .filter(|o| by_hostility.is_none_or(|x| h.sim.hostile(from, o.id) == x))
+                .filter(|o| !perceived || seen.contains(&o.id))
                 .filter(|o| {
                     kind == -1
                         || kind == 0
@@ -1063,9 +1087,30 @@ pub fn call(
         "Engine_ApplyEffectOnObject" | "ApplyEffectOnObject" => {
             if let Some(EngineData::Effect(mut e)) = h.sim.world.handle(handle(a, 1)).cloned() {
                 e.duration_type = int(a, 0);
-                if let Some(o) = h.sim.world.get_mut(obj(a, 2)) {
-                    o.effects.push(e);
+                let creator = obj(a, 4);
+                if creator != OBJECT_INVALID && creator != 0 {
+                    e.creator = Some(creator);
                 }
+                h.sim.apply_effect(obj(a, 2), e);
+            }
+            void()
+        }
+        "GetCurrentEffect" => {
+            let e = h
+                .sim
+                .current_effect
+                .as_ref()
+                .map(|x| x.0.clone())
+                .unwrap_or_default();
+            let hd = h.sim.world.store(EngineData::Effect(e));
+            ok(Value::Engine {
+                ty: ty.effect,
+                handle: Some(hd),
+            })
+        }
+        "SetIsCurrentEffectValid" => {
+            if let Some(c) = h.sim.current_effect.as_mut() {
+                c.1 = int(a, 0) != 0;
             }
             void()
         }
@@ -1155,6 +1200,30 @@ pub fn call(
                 handle: Some(hd),
             })
         }
+        "SetCommandFloat" => {
+            // Provisional: float 0 is the command's time (`seconds`); others are dropped.
+            let mut c = match h.sim.world.handle(handle(a, 0)) {
+                Some(EngineData::Command(c)) => c.clone(),
+                _ => {
+                    return ok(Value::Engine {
+                        ty: ty.command,
+                        handle: None,
+                    });
+                }
+            };
+            if int(a, 2) == 0 {
+                c.seconds = float(a, 1);
+            }
+            let hd = h.sim.world.store(EngineData::Command(c));
+            ok(Value::Engine {
+                ty: ty.command,
+                handle: Some(hd),
+            })
+        }
+        "IsLocationValid" => ok(b(matches!(
+            h.sim.world.handle(handle(a, 0)),
+            Some(EngineData::Location(l)) if h.sim.world.get(l.area).is_some()
+        ))),
         "GetCommandType" => ok(Value::Int(match h.sim.world.handle(handle(a, 0)) {
             Some(EngineData::Command(c)) => c.ty,
             _ => 0,
@@ -1471,7 +1540,7 @@ pub fn call(
             });
             void()
         }
-        "GetActiveWeaponSet" | "GetCreatureGoreLevel" | "HasDeathEffect" => ok(Value::Int(0)),
+        "GetActiveWeaponSet" | "GetCreatureGoreLevel" => ok(Value::Int(0)),
         "GetCreaturePropertyType" => ok(Value::Int(
             h.sim
                 .world
@@ -1558,13 +1627,313 @@ pub fn call(
             void()
         }
 
-        // --- Combat and perception (no combat simulation yet) -------------------------------
-        "GetCombatState" => ok(Value::Int(0)),
-        "GetAttackTarget" => ok(Value::Object(OBJECT_INVALID)),
-        "IsObjectHostile" => ok(b(false)),
-        "IsPartyPerceivingHostiles" => ok(b(false)),
+        // --- Combat and perception (see `combat`) ------------------------------------------
+        "GetCombatState" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.combat.in_combat))),
+        "SetCombatState" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.combat.in_combat = int(a, 1) != 0;
+            }
+            void()
+        }
+        "GetAttackTarget" => ok(Value::Object(
+            h.object(obj(a, 0))
+                .and_then(|o| o.commands.first())
+                .filter(|c| c.name == "CommandAttack")
+                .and_then(|c| c.target)
+                .unwrap_or(OBJECT_INVALID),
+        )),
+        "IsObjectHostile" => ok(b(h.sim.hostile(obj(a, 0), obj(a, 1)))),
+        "IsPartyPerceivingHostiles" => {
+            let party = crate::engine::party_of(h.sim);
+            let any = party.iter().any(|&m| {
+                h.object(m)
+                    .is_some_and(|o| o.combat.perceived.iter().any(|&p| h.sim.hostile(m, p)))
+            });
+            ok(b(any))
+        }
+        "GetPerceivedCreatureList" => {
+            let who = obj(a, 0);
+            let hostile_only = int(a, 1) != 0;
+            let list: Vec<ObjectId> = h
+                .object(who)
+                .map(|o| o.combat.perceived.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|&p| !hostile_only || h.sim.hostile(who, p))
+                .collect();
+            ok(objects(list))
+        }
+        "TriggerPerception" => {
+            let (who, seen) = (obj(a, 0), obj(a, 1));
+            let new = h
+                .object(who)
+                .is_some_and(|o| !o.combat.perceived.contains(&seen));
+            if new && h.object(seen).is_some() {
+                if let Some(o) = h.sim.world.get_mut(who) {
+                    o.combat.perceived.push(seen);
+                }
+                h.sim.perceive(who, seen, true);
+            }
+            ok(b(new))
+        }
+        "ClearPerceptionList" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.combat.perceived.clear();
+            }
+            void()
+        }
+        "UpdateThreatTable" => {
+            let (enemy, delta) = (obj(a, 1), float(a, 2));
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                match o.combat.threat.iter_mut().find(|t| t.0 == enemy) {
+                    Some(t) => t.1 += delta,
+                    None => o.combat.threat.push((enemy, delta)),
+                }
+                o.combat
+                    .threat
+                    .sort_by(|x, y| y.1.total_cmp(&x.1).then(x.0.cmp(&y.0)));
+            }
+            void()
+        }
+        "ClearThreatTable" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.combat.threat.clear();
+            }
+            void()
+        }
+        "IsPerceivingHostiles" => {
+            let who = obj(a, 0);
+            let any = h
+                .object(who)
+                .is_some_and(|o| o.combat.perceived.iter().any(|&p| h.sim.hostile(who, p)));
+            ok(b(any))
+        }
+        // Loot bags and achievements have no simulation state.
+        "SpawnBodyBag" | "UnlockAchievementByID" => {
+            h.sim.world.trace.push(TraceEntry::Log {
+                t,
+                channel: -3,
+                text: format!("{name}{:?} (no effect in the simulation)", a),
+            });
+            void()
+        }
+        "ClearEnemyThreat" => {
+            let enemy = obj(a, 1);
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.combat.threat.retain(|t| t.0 != enemy);
+            }
+            void()
+        }
+        "GetThreatTableSize" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .map_or(0, |o| o.combat.threat.len() as i32),
+        )),
+        "GetThreatEnemy" => ok(Value::Object(
+            h.object(obj(a, 0))
+                .and_then(|o| o.combat.threat.get(int(a, 1).max(0) as usize))
+                .map_or(OBJECT_INVALID, |t| t.0),
+        )),
+        "GetThreatValueByIndex" => ok(Value::Float(
+            h.object(obj(a, 0))
+                .and_then(|o| o.combat.threat.get(int(a, 1).max(0) as usize))
+                .map_or(0.0, |t| t.1),
+        )),
+        "GetThreatValueByObjectID" => {
+            let enemy = obj(a, 1);
+            ok(Value::Float(
+                h.object(obj(a, 0))
+                    .and_then(|o| o.combat.threat.iter().find(|t| t.0 == enemy))
+                    .map_or(0.0, |t| t.1),
+            ))
+        }
+        "SetAttackResult" => {
+            let effect = |i: usize| match h.sim.world.handle(handle(a, i)) {
+                Some(EngineData::Effect(e)) => Some(e.clone()),
+                _ => None,
+            };
+            let result = crate::combat::AttackResult {
+                results: [int(a, 1), int(a, 3)],
+                effects: [effect(2), effect(4)],
+            };
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.combat.attack = Some(result);
+            }
+            void()
+        }
+        "SetAttackDuration" => {
+            let ms = (float(a, 1).max(0.0) * 1000.0) as u64;
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.combat.attack_ms = Some(ms);
+            }
+            void()
+        }
+        "GetAttackImpactDamageEffect" => {
+            let i = int(a, 1).clamp(0, 1) as usize;
+            let e = h
+                .object(obj(a, 0))
+                .and_then(|o| o.combat.attack.as_ref())
+                .and_then(|r| r.effects[i].clone())
+                .unwrap_or_default();
+            let hd = h.sim.world.store(EngineData::Effect(e));
+            ok(Value::Engine {
+                ty: ty.effect,
+                handle: Some(hd),
+            })
+        }
+        "SetCommandResult" => {
+            // A failed command is dropped; the owner hears COMMAND_COMPLETE with the result.
+            let (who, result) = (obj(a, 0), int(a, 1));
+            let failed = result == constant(&h.sim.table, "COMMAND_RESULT_FAILED");
+            if let Some(o) = h.sim.world.get_mut(who) {
+                o.fields.insert("CommandResult".into(), result);
+                if failed && !o.commands.is_empty() {
+                    let c = o.commands.remove(0);
+                    let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(who));
+                    ev.ints = vec![c.ty, result];
+                    h.sim.world.queue_event(0, who, ev, None);
+                }
+            }
+            void()
+        }
+        "HasDeathEffect" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.dead))),
+        // Damage effects. Provisional: the types are the ids in effects.gda
+        // (EFFECT_TYPE_DAMAGE 1013, EFFECT_TYPE_IMPACT 1024); the value layout is how the
+        // rules scripts read them back (float 0 is the damage, integers are the damage type,
+        // flags and visual effect, object 0 is the weapon).
+        "EffectDamage" | "EffectImpact" => {
+            let e = if name == "EffectDamage" {
+                Effect {
+                    ty: 1013,
+                    creator: Some(caller),
+                    floats: vec![float(a, 0)],
+                    ints: vec![int(a, 1), int(a, 2), int(a, 3)],
+                    ..Default::default()
+                }
+            } else {
+                Effect {
+                    ty: 1024,
+                    creator: Some(caller),
+                    floats: vec![float(a, 0)],
+                    objects: vec![obj(a, 1)],
+                    ints: vec![int(a, 4), 0, int(a, 2)],
+                    ability: int(a, 3),
+                    ..Default::default()
+                }
+            };
+            let hd = h.sim.world.store(EngineData::Effect(e));
+            ok(Value::Engine {
+                ty: ty.effect,
+                handle: Some(hd),
+            })
+        }
+        // Items: stats come from the item's base type in the rules 2DAs, which are not
+        // read yet; scripts see 0 and fall back on attributes.
+        "GetItemStat" => ok(Value::Float(0.0)),
+        "GetItemEquipSlot" => {
+            let item = obj(a, 0);
+            let slot = h.sim.world.objects.values().find_map(|o| {
+                o.equipment
+                    .iter()
+                    .find(|(_, i)| **i == item)
+                    .map(|(s, _)| *s)
+            });
+            ok(Value::Int(slot.unwrap_or_else(|| {
+                constant(&h.sim.table, "INVENTORY_SLOT_INVALID")
+            })))
+        }
+        "GetWeaponStyle" => {
+            let n = h.object(obj(a, 0)).map_or(0, |o| o.equipment.len());
+            ok(Value::Int(if n == 0 { 0 } else { 1 }))
+        }
+        // Followers fight on their own; the hero is the player's.
+        "IsPartyAIEnabled" => ok(b(Some(obj(a, 0)) != h.sim.world.hero)),
+        "GetCreaturesInMeleeRing" => {
+            let (who, hostile_only) = (obj(a, 0), int(a, 3) != 0);
+            let Some(me) = h.object(who).map(|o| (o.position, o.area)) else {
+                return ok(objects(Vec::new()));
+            };
+            let list: Vec<ObjectId> = h
+                .sim
+                .world
+                .objects
+                .values()
+                .filter(|o| {
+                    o.id != who
+                        && o.kind == ObjectKind::Creature
+                        && !o.dead
+                        && o.area == me.1
+                        && dist(o.position, me.0) <= 2.5
+                })
+                .filter(|o| !hostile_only || h.sim.hostile(who, o.id))
+                .map(|o| o.id)
+                .collect();
+            ok(objects(list))
+        }
+        "ObjectToString" => ok(Value::String(format!("{}", obj(a, 0)))),
+        "GetNameStrref" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .and_then(|o| o.name_strref)
+                .map_or(0, |s| s as i32),
+        )),
+        "GetStealthEnabled" => ok(Value::Int(0)),
+        "GetCanDiePermanently" => ok(b(h.object(obj(a, 0)).is_some_and(|o| !o.immortal))),
+        "GetCreatureTreasureCategory" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .and_then(|o| o.fields.get("TreasureCategory").copied())
+                .unwrap_or(0),
+        )),
+        // Presentation only.
+        "PlayAdditiveAnimation" | "SignalDamage" => void(),
+        "SetCreatureIsStatue" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields.insert("Statue".into(), int(a, 1));
+            }
+            void()
+        }
+        "IsPerceiving" => ok(b(h
+            .object(obj(a, 0))
+            .is_some_and(|o| o.combat.perceived.contains(&obj(a, 1))))),
+        "GetAngleBetweenObjects" => {
+            let (x, y) = (h.object(obj(a, 0)), h.object(obj(a, 1)));
+            ok(Value::Float(match (x, y) {
+                (Some(x), Some(y)) => {
+                    let d = [y.position[0] - x.position[0], y.position[1] - x.position[1]];
+                    let to = d[1].atan2(d[0]).to_degrees();
+                    let mut a = (to - x.facing).rem_euclid(360.0);
+                    if a > 180.0 {
+                        a = 360.0 - a;
+                    }
+                    a
+                }
+                _ => 0.0,
+            }))
+        }
+        "SetFacingObject" => {
+            let target = h.object(obj(a, 1)).map(|o| o.position);
+            if let (Some(t), Some(o)) = (target, h.sim.world.get_mut(obj(a, 0))) {
+                o.facing = (t[1] - o.position[1])
+                    .atan2(t[0] - o.position[0])
+                    .to_degrees();
+            }
+            void()
+        }
+        // No ability cooldowns or tactic items are simulated yet.
+        "GetRemainingCooldown" => ok(Value::Float(0.0)),
+        "GetTacticCommandItemTag" => ok(Value::String(String::new())),
+        "GetAutoPauseCombatStatus" => ok(Value::Int(0)),
+        "EnableWeaponTrail" => void(),
         _ => None,
     }
+}
+
+/// The hero and its followers.
+pub fn party_of(sim: &Sim) -> Vec<ObjectId> {
+    let hero = sim.world.hero;
+    let mut v: Vec<ObjectId> = hero.into_iter().collect();
+    if let Some(h) = hero.and_then(|h| sim.world.get(h)) {
+        v.extend(h.followers.iter().copied());
+    }
+    v
 }
 
 pub fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {

@@ -23,6 +23,9 @@ pub type StringLookup = Arc<dyn Fn(u32) -> Option<String> + Send + Sync>;
 /// The function that starts a movie in game mode.
 pub const START_SCENE: &str = "_global.GUISystem.StartSceneFromGame";
 pub const FINISH_SCENE: &str = "_global.GUISystem.FinishSceneFromGame";
+/// Lays a movie out against the current screen (safe zone, anchors); the engine calls it
+/// after starting a movie and when the resolution changes.
+pub const LAYOUT: &str = "_global.MovieUtils.UpdateAllLayouts";
 
 #[derive(Default)]
 struct State {
@@ -74,6 +77,12 @@ impl GameBridge {
             ("SaveLoad.SavingEnabled", UiValue::Number(0.0)),
             ("DebugOptions.EnableController", UiValue::Number(0.0)),
             ("DebugOptions.EnableDebugHelpers", UiValue::Number(0.0)),
+            ("DebugOptions.E3Mode", UiValue::Number(0.0)),
+            (
+                "DebugOptions.ShowConversationResponsesImmediately",
+                UiValue::Number(0.0),
+            ),
+            ("Scaleform.IsMac", UiValue::Number(0.0)),
             ("OnlineFeatures.LoggedIn", UiValue::Number(0.0)),
             (
                 "ClientOptions.OnlineOptions.EnableOnlineFeatures",

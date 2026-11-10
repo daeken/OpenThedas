@@ -14,6 +14,9 @@
 /// The callback name the injected code registers.
 pub const INVOKE_CALLBACK: &str = "thedas_invoke";
 
+/// The callback name for setting a movie variable (`object path`, `member`, `value`).
+pub const SET_CALLBACK: &str = "thedas_set";
+
 /// The `ExternalInterface.call` name wrappers use to fetch the last fscommand's answer.
 pub const RETVAL_CALL: &str = "thedas_retval";
 
@@ -161,24 +164,43 @@ pub fn register_invoke() -> Vec<u8> {
         push(&mut out, &[Push::Str("thedas_wrap")]);
         out.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
     }
-    out.extend(invoke_function());
-    push(
-        &mut out,
-        &[
-            Push::Null,
-            Push::Str(INVOKE_CALLBACK),
-            Push::Int(3),
-            Push::Str("flash"),
-        ],
-    );
-    out.push(GET_VARIABLE);
-    push(&mut out, &[Push::Str("external")]);
-    out.push(GET_MEMBER);
-    push(&mut out, &[Push::Str("ExternalInterface")]);
-    out.push(GET_MEMBER);
-    push(&mut out, &[Push::Str("addCallback")]);
-    out.extend_from_slice(&[CALL_METHOD, POP, 0]);
+    for (name, f) in [
+        (INVOKE_CALLBACK, invoke_function()),
+        (SET_CALLBACK, set_function()),
+    ] {
+        out.extend(f);
+        push(
+            &mut out,
+            &[
+                Push::Null,
+                Push::Str(name),
+                Push::Int(3),
+                Push::Str("flash"),
+            ],
+        );
+        out.push(GET_VARIABLE);
+        push(&mut out, &[Push::Str("external")]);
+        out.push(GET_MEMBER);
+        push(&mut out, &[Push::Str("ExternalInterface")]);
+        out.push(GET_MEMBER);
+        push(&mut out, &[Push::Str("addCallback")]);
+        out.extend_from_slice(&[CALL_METHOD, POP]);
+    }
+    out.push(0);
     out
+}
+
+/// `function (p, m, v) { eval(p)[m] = v; }`: how the engine sets movie variables
+/// (Scaleform's `GFxMovie::SetVariable`).
+fn set_function() -> Vec<u8> {
+    let mut body = Vec::new();
+    push(&mut body, &[Push::Str("p")]);
+    body.extend_from_slice(&[GET_VARIABLE, GET_VARIABLE]);
+    push(&mut body, &[Push::Str("m")]);
+    body.push(GET_VARIABLE);
+    push(&mut body, &[Push::Str("v")]);
+    body.extend_from_slice(&[GET_VARIABLE, SET_MEMBER]);
+    function(&["p", "m", "v"], &body)
 }
 
 #[cfg(test)]

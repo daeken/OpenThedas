@@ -98,6 +98,35 @@ impl Movie {
         matches!(&self.signature, b"GFX" | b"CFX")
     }
 
+    /// The authored stage size in pixels, from the header's RECT.
+    pub fn stage_size(&self) -> Option<(f32, f32)> {
+        let first = *self.body.first()?;
+        let bits = (first >> 3) as usize;
+        let total = 5 + 4 * bits;
+        if total.div_ceil(8) > self.body.len() || bits == 0 {
+            return None;
+        }
+        let read = |start: usize| -> i64 {
+            let mut v: i64 = 0;
+            for i in start..start + bits {
+                let bit = (self.body[i / 8] >> (7 - i % 8)) & 1;
+                v = (v << 1) | bit as i64;
+            }
+            // Sign-extend.
+            if v & (1 << (bits - 1)) != 0 {
+                v -= 1 << bits;
+            }
+            v
+        };
+        let (x0, x1, y0, y1) = (
+            read(5),
+            read(5 + bits),
+            read(5 + 2 * bits),
+            read(5 + 3 * bits),
+        );
+        Some(((x1 - x0) as f32 / 20.0, (y1 - y0) as f32 / 20.0))
+    }
+
     /// Length of the RECT, frame rate and frame count that precede the tags.
     fn header_len(&self) -> Result<usize, GfxError> {
         let first = *self.body.first().ok_or(GfxError::Truncated)?;
@@ -494,6 +523,28 @@ mod tests {
         // The sprite kept its ShowFrame and End.
         assert_eq!(inv.tags.get(&0), Some(&2));
         assert_eq!(inv.tags.get(&12), Some(&1));
+    }
+
+    #[test]
+    fn reads_the_stage_size() {
+        // RECT nbits=16: 0, 20480 (1024 px), 0, 15360 (768 px).
+        let mut bits = String::from("10000");
+        for v in [0u32, 20480, 0, 15360] {
+            bits.push_str(&format!("{v:016b}"));
+        }
+        while bits.len() % 8 != 0 {
+            bits.push('0');
+        }
+        let mut body: Vec<u8> = (0..bits.len() / 8)
+            .map(|i| u8::from_str_radix(&bits[i * 8..i * 8 + 8], 2).unwrap())
+            .collect();
+        body.extend([0, 24, 1, 0, 0, 0]);
+        let m = Movie {
+            signature: *b"FWS",
+            version: 8,
+            body,
+        };
+        assert_eq!(m.stage_size(), Some((1024.0, 768.0)));
     }
 
     #[test]

@@ -102,6 +102,9 @@ pub struct Object {
     pub commands: Vec<Command>,
     pub followers: Vec<ObjectId>,
     pub effects: Vec<Effect>,
+    /// Combat bookkeeping (perception, threat, the pending attack); see `combat`.
+    #[serde(default)]
+    pub combat: crate::combat::CombatData,
     pub abilities: std::collections::BTreeSet<i32>,
     pub money: i32,
     /// Items carried (object ids of `Item` objects).
@@ -142,6 +145,7 @@ impl Object {
             commands: Vec::new(),
             followers: Vec::new(),
             effects: Vec::new(),
+            combat: Default::default(),
             abilities: std::collections::BTreeSet::new(),
             money: 0,
             inventory: Vec::new(),

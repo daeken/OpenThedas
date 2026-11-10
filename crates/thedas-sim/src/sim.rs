@@ -72,6 +72,8 @@ pub struct Sim {
     /// Instructions a single script run may take.
     pub script_budget: u64,
     pub chargen_policy: ChargenPolicy,
+    /// The effect an `APPLY_EFFECT` handler is looking at, and whether it is still valid.
+    pub(crate) current_effect: Option<(crate::world::Effect, bool)>,
     pub(crate) talk: Option<crate::dialog::Conversation>,
     pub(crate) plots: crate::plot::Plots,
     strings: std::sync::OnceLock<std::collections::BTreeMap<u32, String>>,
@@ -130,6 +132,7 @@ impl Sim {
             depth: 0,
             script_budget: 5_000_000,
             chargen_policy: ChargenPolicy::default(),
+            current_effect: None,
             talk: None,
             plots: crate::plot::Plots::default(),
             strings: std::sync::OnceLock::new(),
@@ -301,6 +304,7 @@ impl Sim {
     /// Advances time by `ms`, delivering every event that falls due and running commands.
     pub fn tick(&mut self, ms: u64) {
         let until = self.world.time_ms + ms;
+        self.update_perception();
         loop {
             // Engine work that waits for the current scripts: transitions, then cutscenes.
             if let Some((area, waypoint)) = self.world.transition.take() {
@@ -590,7 +594,29 @@ impl Sim {
             let due = match cmd.due {
                 Some(d) => d,
                 None => {
-                    let d = now + self.command_duration(id, &cmd);
+                    // An attack asks its owner's script for the result first, which may
+                    // also set how long it takes.
+                    let attack_ms = if cmd.name == "CommandAttack" {
+                        self.start_attack(id, cmd.target.unwrap_or(OBJECT_INVALID), cmd.ty);
+                        let still = self.world.get(id).and_then(|o| o.commands.first()).cloned();
+                        if still.as_ref().map(|c| (&c.name, c.target))
+                            != Some((&cmd.name, cmd.target))
+                        {
+                            continue;
+                        }
+                        Some(
+                            self.world
+                                .get(id)
+                                .and_then(|o| o.combat.attack_ms)
+                                .unwrap_or(crate::combat::DEFAULT_ATTACK_MS),
+                        )
+                    } else {
+                        None
+                    };
+                    let d = now
+                        + attack_ms
+                            .unwrap_or_else(|| self.command_duration(id, &cmd))
+                            .max(1);
                     if let Some(c) = self.world.get_mut(id).and_then(|o| o.commands.first_mut()) {
                         c.due = Some(d);
                     }
@@ -631,6 +657,10 @@ impl Sim {
             }
         }
         self.update_triggers(id);
+        if cmd.name == "CommandAttack" {
+            self.finish_attack(id, cmd.target.unwrap_or(OBJECT_INVALID));
+        }
+        self.update_perception();
         self.world.trace.push(TraceEntry::Command {
             t: self.world.time_ms,
             object: id,

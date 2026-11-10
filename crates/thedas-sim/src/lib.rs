@@ -12,6 +12,7 @@
 //! Nothing here reads the wall clock, the frame rate or a GPU: time advances only through
 //! [`Sim::tick`], and randomness comes from a seeded generator.
 
+pub mod combat;
 pub mod dialog;
 pub mod engine;
 pub mod m2da;
