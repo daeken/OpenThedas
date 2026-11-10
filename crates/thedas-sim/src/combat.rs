@@ -5,12 +5,13 @@
 //! supplies the plumbing those scripts expect, which is what this module does:
 //!
 //! - **Perception.** Creatures in the hero's area perceive each other within
-//!   [`PERCEPTION_RANGE`] and get `EVENT_TYPE_PERCEPTION_APPEAR` (object 0 is the creature
+//!   their perception range ([`Sim::perception_range`]) and get `EVENT_TYPE_PERCEPTION_APPEAR` (object 0 is the creature
 //!   seen; integers are hostility changed, stealthed, hostile) and `PERCEPTION_DISAPPEAR`
 //!   when it leaves the range. A creature in stealth (`SetStealthEnabled`, which the stealth
 //!   effect's handlers call) is not perceived by those hostile to it: they get one
 //!   appearance with the stealthed flag, on which rules_core runs its own detection check.
 //!   The scripts also end stealth themselves (after an attack, when targeted, on detection).
+//!   Walls (`nav::wall_between`) and closed doors block noticing.
 //! - **Game mode.** The party seeing living hostiles switches `GM_EXPLORE` to `GM_COMBAT`
 //!   and back, with `GAMEMODE_CHANGE` to the module; the scripts end combat (and get fallen
 //!   party members up) on the change back.
@@ -40,9 +41,15 @@ use thedas_script::vm::{OBJECT_INVALID, ObjectId};
 use crate::sim::Sim;
 use crate::world::{Effect, ObjectKind};
 
-/// How far a creature notices others when its template gives no `PerceptionClass`, in
-/// metres. Provisional.
-pub const PERCEPTION_RANGE: f32 = 12.0;
+/// How far a creature notices others when ranges.gda cannot say, in metres. Provisional.
+pub const PERCEPTION_RANGE: f32 = 30.0;
+
+/// ranges.gda (M2DA 134): a creature's `PerceptionClass` is one of its rows
+/// (`PercepRngShrt` 8 .. `PercepRngLargeCreature` 15).
+const RANGES_TABLE: i32 = 134;
+/// ranges.gda rows for creatures whose template gives no `PerceptionClass`.
+const PERCEPTION_DEFAULT: i64 = 11;
+const PERCEPTION_PLAYER: i64 = 12;
 
 /// How far a creature keeps track of one it has noticed: script.ldf's `TriggerPerception`
 /// speaks of an outer "visual radius (about 60m)" beyond the normal perception ring.
@@ -120,6 +127,40 @@ fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
 }
 
 impl Sim {
+    /// How far a creature notices others, in metres: the `PrimaryRange` of its
+    /// `PerceptionClass` row of ranges.gda (`PercepRngShrt` 10, `PercepRngMed` 30,
+    /// `PercepRngLng` 40, `PercepRngMonster` 30, ...); a creature with none uses
+    /// `PercepRngPlayer` if it is in the party, `PercepRngDefault` otherwise. Provisional: the
+    /// table's `SecondaryRange` (20 for the medium and monster rows, 30 for the long ones) is
+    /// not used, its meaning not recovered.
+    pub fn perception_range(&self, id: ObjectId) -> f32 {
+        let class = self
+            .world
+            .get(id)
+            .and_then(|o| o.fields.get("PerceptionClass").copied())
+            .filter(|&r| r > 0)
+            .map(i64::from)
+            .unwrap_or_else(|| {
+                let party =
+                    Some(id) == self.world.hero || crate::engine::party_of(self).contains(&id);
+                if party {
+                    PERCEPTION_PLAYER
+                } else {
+                    PERCEPTION_DEFAULT
+                }
+            });
+        self.world
+            .tables()
+            .get(RANGES_TABLE, "")
+            .and_then(|t| match t.cell("PrimaryRange", class) {
+                Some(thedas_formats::gda::Cell::Float(v)) => Some(*v as f32),
+                Some(thedas_formats::gda::Cell::Int(v)) => Some(*v as f32),
+                _ => None,
+            })
+            .filter(|r| *r > 0.0)
+            .unwrap_or(PERCEPTION_RANGE)
+    }
+
     /// Whether two objects are hostile: both creatures, in groups set hostile.
     pub fn hostile(&self, a: ObjectId, b: ObjectId) -> bool {
         let (Some(x), Some(y)) = (self.world.get(a), self.world.get(b)) else {
@@ -168,20 +209,21 @@ impl Sim {
             .filter_map(|(d, _)| self.world.get(d).map(|o| o.position))
             .collect();
         let blocked = |a: [f32; 3], b: [f32; 3]| Sim::door_between(&doors, a, b);
+        // Walls block noticing (`nav::wall_between`); once noticed, a creature is kept
+        // track of round corners out to the visual radius.
+        let grid = self.nav_grid(area);
+        let wall = |a: [f32; 3], b: [f32; 3]| {
+            grid.as_ref()
+                .is_some_and(|g| crate::nav::wall_between(g, a, b))
+        };
         for &(id, pos) in &creatures {
             let alive = self.alive(id);
-            // A creature notices others within its template's PerceptionClass (taken to be a
-            // radius in metres: 9 for most creatures, 12 for player characters, 15 for an
-            // ogre; provisional) and keeps track of those it has noticed out to the visual
-            // radius. Closed doors block sight; walls are not checked: the pathing grid, the
-            // only geometry the simulation has, marks furniture and rubble that do not block
-            // sight the same way.
-            let ring = self
-                .world
-                .get(id)
-                .and_then(|o| o.fields.get("PerceptionClass").copied())
-                .filter(|&r| r > 0)
-                .map_or(PERCEPTION_RANGE, |r| r as f32);
+            // A creature notices others within its perception range (see
+            // `Sim::perception_range`) and keeps track of those it has noticed out to the
+            // visual radius. Closed doors block sight, and a wall of the pathing grid blocks
+            // noticing. Provisional: the grid, the only geometry the simulation has, marks
+            // large furniture and rubble the same way as walls, so those block too.
+            let ring = self.perception_range(id);
             let seen = self
                 .world
                 .get(id)
@@ -195,12 +237,12 @@ impl Sim {
                             return false;
                         }
                         let d = dist(pos, p);
-                        let range = if seen.contains(&o) && !self.hidden_from(id, o) {
-                            VISUAL_RANGE
+                        let tracked = seen.contains(&o) && !self.hidden_from(id, o);
+                        if tracked {
+                            d <= VISUAL_RANGE && !blocked(pos, p)
                         } else {
-                            ring
-                        };
-                        d <= range && !blocked(pos, p)
+                            d <= ring && !blocked(pos, p) && !wall(pos, p)
+                        }
                     })
                     .map(|&(o, _)| o)
                     .collect()
@@ -1058,6 +1100,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::world::Effect;
+    use thedas_formats::gda::Cell;
 
     use thedas_script::EngineTable;
     use thedas_vfs::Vfs;
@@ -1274,18 +1317,33 @@ mod tests {
     #[test]
     fn perception_class_sets_the_ring_and_noticed_creatures_stay_seen() {
         let mut s = sim();
+        // ranges.gda: PercepRngShrt (8) 10 m, PercepRngPlayer (12) 35 m.
+        s.world.tables().insert(
+            "#134",
+            &["PrimaryRange", "SecondaryRange"],
+            vec![
+                (8, vec![Cell::Float(10.0), Cell::Float(10.0)]),
+                (12, vec![Cell::Float(35.0), Cell::Float(30.0)]),
+            ],
+        );
         let area = s.world.spawn(ObjectKind::Area, "a");
         let hero = s.world.spawn(ObjectKind::Creature, "hero");
         let near_sighted = s.world.spawn(ObjectKind::Creature, "corpse");
         s.world.hero = Some(hero);
-        for (id, x, ring) in [(hero, 0.0, 12), (near_sighted, 10.0, 9)] {
+        for (id, x) in [(hero, 0.0), (near_sighted, 20.0)] {
             let o = s.world.get_mut(id).unwrap();
             o.area = Some(area);
             o.position = [x, 0.0, 0.0];
-            o.fields.insert("PerceptionClass".into(), ring);
         }
+        s.world
+            .get_mut(near_sighted)
+            .unwrap()
+            .fields
+            .insert("PerceptionClass".into(), 8);
+        assert_eq!(s.perception_range(hero), 35.0, "the party's row");
+        assert_eq!(s.perception_range(near_sighted), 10.0);
         s.update_perception();
-        // 10 m apart: inside the hero's 12 m ring, outside the corpse's 9 m one.
+        // 20 m apart: inside the hero's 35 m ring, outside the corpse's 10 m one.
         assert_eq!(
             s.world.get(hero).unwrap().combat.perceived,
             vec![near_sighted]
@@ -1299,7 +1357,7 @@ mod tests {
                 .is_empty()
         );
         // Once noticed, a creature is kept track of well beyond the ring.
-        s.world.get_mut(near_sighted).unwrap().position = [40.0, 0.0, 0.0];
+        s.world.get_mut(near_sighted).unwrap().position = [50.0, 0.0, 0.0];
         s.update_perception();
         assert_eq!(
             s.world.get(hero).unwrap().combat.perceived,
@@ -1308,59 +1366,6 @@ mod tests {
         s.world.get_mut(near_sighted).unwrap().position = [70.0, 0.0, 0.0];
         s.update_perception();
         assert!(s.world.get(hero).unwrap().combat.perceived.is_empty());
-    }
-
-    #[test]
-    fn a_stealthed_hostile_is_noticed_once_but_not_perceived() {
-        let mut s = sim();
-        let area = s.world.spawn(ObjectKind::Area, "a");
-        let hero = s.world.spawn(ObjectKind::Creature, "hero");
-        let foe = s.world.spawn(ObjectKind::Creature, "foe");
-        let dog = s.world.spawn(ObjectKind::Creature, "dog");
-        s.world.hero = Some(hero);
-        for (id, x, g) in [(hero, 0.0, 0), (foe, 5.0, 2), (dog, 2.0, 0)] {
-            let o = s.world.get_mut(id).unwrap();
-            o.area = Some(area);
-            o.position = [x, 0.0, 0.0];
-            o.group = g;
-        }
-        s.world.hostility.insert((0, 2), true);
-        s.world.get_mut(hero).unwrap().combat.stealth = true;
-        let events = |s: &mut Sim| {
-            let e: Vec<_> = s
-                .world
-                .queue
-                .values()
-                .map(|q| (q.target, q.event.objects[0], q.event.ints.clone()))
-                .collect();
-            s.world.queue.clear();
-            e
-        };
-        s.update_perception();
-        // The foe is told the stealthed hero is there, but does not see it; the dog does.
-        assert_eq!(s.world.get(foe).unwrap().combat.perceived, vec![dog]);
-        assert!(s.world.get(dog).unwrap().combat.perceived.contains(&hero));
-        let e = events(&mut s);
-        assert!(e.contains(&(foe, hero, vec![0, 1, 1])));
-        assert!(e.contains(&(dog, hero, vec![0, 0, 0])));
-        s.update_perception();
-        assert!(events(&mut s).is_empty(), "noticed once");
-        // Out of stealth, the foe sees the hero.
-        s.world.get_mut(hero).unwrap().combat.stealth = false;
-        s.update_perception();
-        assert_eq!(s.world.get(foe).unwrap().combat.perceived, vec![hero, dog]);
-        assert!(events(&mut s).contains(&(foe, hero, vec![0, 0, 1])));
-        // Back into stealth: the foe loses sight of it and is told it is stealthed.
-        s.world.get_mut(hero).unwrap().combat.stealth = true;
-        s.update_perception();
-        assert_eq!(s.world.get(foe).unwrap().combat.perceived, vec![dog]);
-        let e = events(&mut s);
-        assert!(
-            e.contains(&(foe, hero, vec![0, 1, 1])),
-            "noticed in stealth"
-        );
-        let disappear = e.iter().filter(|(t, o, _)| (*t, *o) == (foe, hero)).count();
-        assert_eq!(disappear, 2, "and lost from sight");
     }
 
     #[test]

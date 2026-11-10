@@ -1756,6 +1756,15 @@ impl Server {
             let snap = sim.snapshot();
             let mut out = json!({});
             if let Some(path) = &a.path {
+                // For scripted playthroughs: a game that ended in a wipe is not carried into
+                // later steps (THEDAS_NO_GAME_OVER_SAVES=1).
+                if sim.world.game_over
+                    && std::env::var_os("THEDAS_NO_GAME_OVER_SAVES").is_some_and(|v| v == "1")
+                {
+                    return Err(format!(
+                        "refused to save {path}: the whole party has fallen (game over)"
+                    ));
+                }
                 let bytes = sim.save_json().map_err(|e| e.to_string())?;
                 std::fs::write(path, &bytes).map_err(|e| format!("writing {path}: {e}"))?;
                 out["file"] = json!(path);
