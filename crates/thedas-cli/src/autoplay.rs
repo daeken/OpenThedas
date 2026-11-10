@@ -7,7 +7,8 @@
 //! tactics as the followers are; when none are in view it walks to the nearest living hostile
 //! in the area; when the area holds none it uses a door to an area it has not been to (whose
 //! tag starts with `--exit-prefix`), levelling the party (the auto-level tables) first and at
-//! the start. It drinks no potions beyond what the tactics do.
+//! the start; it opens closed doors in its way; after each fight it waits (up to 30 s) for the
+//! party's health to come back. It drinks no potions beyond what the tactics do.
 //!
 //! Each run loads the save, reseeds the simulation's generator with the run's seed and plays
 //! until a plot flag is set, an area is reached, the whole party falls (a wipe: game over),
@@ -221,6 +222,33 @@ fn new_door(sim: &Sim, hero: ObjectId, seen: &[String], prefix: &str) -> Option<
         .map(|o| o.id)
 }
 
+/// Waits (up to 30 s) until every standing party member has 95% of its health, as a player
+/// pauses between fights, stopping if a fight starts.
+fn rest(sim: &mut Sim, hero: ObjectId) {
+    let health = 7;
+    for _ in 0..30 {
+        let mut party = vec![hero];
+        party.extend(
+            sim.world
+                .get(hero)
+                .map(|h| h.followers.clone())
+                .unwrap_or_default(),
+        );
+        let rested = party.iter().all(|&m| {
+            !alive(sim, m)
+                || sim
+                    .world
+                    .get(m)
+                    .and_then(|o| o.properties.get(&health))
+                    .is_none_or(|v| v.1 >= 0.95 * sim.depletable_max(m, health))
+        });
+        if rested || sim.world.party_fighting || sim.world.game_over {
+            return;
+        }
+        sim.tick(1000);
+    }
+}
+
 /// Spends every party member's pending level-up points (auto-level tables).
 fn level_party(sim: &mut Sim, hero: ObjectId) {
     let mut party = vec![hero];
@@ -376,7 +404,8 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
                 }
             }
         }
-        if !engaged.is_empty() && engaged.iter().all(|&f| !alive(sim, f)) {
+        let won = !engaged.is_empty() && engaged.iter().all(|&f| !alive(sim, f));
+        if won {
             fights_won += 1;
             engaged.clear();
         }
@@ -384,6 +413,12 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
         if o.fights > 0 && fights_won >= o.fights {
             end = "won".to_string();
             break;
+        }
+        // After a fight, the player lets the party get its breath back (health regenerates
+        // quickly out of combat) before seeking the next.
+        if won {
+            rest(sim, hero);
+            continue;
         }
         if let Some(d) = sim.dialog_state().filter(|d| !d.ended) {
             let _ = d;
