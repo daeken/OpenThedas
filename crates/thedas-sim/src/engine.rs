@@ -502,7 +502,7 @@ pub fn call(
         "IsInTrigger" => {
             let (o, tr) = (h.object(obj(a, 0)), h.object(obj(a, 1)));
             ok(b(match (o, tr) {
-                (Some(o), Some(tr)) => o.area == tr.area && inside(o.position, &tr.geometry),
+                (Some(o), Some(tr)) => o.area == tr.area && in_trigger(o.position, tr),
                 _ => false,
             }))
         }
@@ -904,7 +904,82 @@ pub fn call(
             .object(obj(a, 0))
             .is_some_and(|o| o.abilities.contains(&int(a, 1))))),
         "IsModalAbilityActive" => ok(Value::Int(0)),
-        "GetItemInEquipSlot" => ok(Value::Object(OBJECT_INVALID)),
+        "GetItemInEquipSlot" => {
+            let who = obj(a, 1);
+            ok(Value::Object(
+                h.object(who)
+                    .and_then(|o| o.equipment.get(&int(a, 0)).copied())
+                    .unwrap_or(OBJECT_INVALID),
+            ))
+        }
+        // Provisional: an unspecified slot (INVENTORY_SLOT_INVALID) means slot 0 (main hand);
+        // weapon sets are not modelled.
+        "EquipItem" => {
+            let (who, item, slot) = (obj(a, 0), obj(a, 1), int(a, 2));
+            let slot = if slot == constant(&h.sim.table, "INVENTORY_SLOT_INVALID") {
+                0
+            } else {
+                slot
+            };
+            let ok_ = h.object(item).is_some();
+            if let (true, Some(o)) = (ok_, h.sim.world.get_mut(who)) {
+                if !o.inventory.contains(&item) {
+                    o.inventory.push(item);
+                }
+                o.equipment.retain(|_, &mut i| i != item);
+                o.equipment.insert(slot, item);
+            }
+            ok(b(ok_))
+        }
+        "UnequipItem" => {
+            let item = obj(a, 1);
+            let found = match h.sim.world.get_mut(obj(a, 0)) {
+                Some(o) => {
+                    let n = o.equipment.len();
+                    o.equipment.retain(|_, &mut i| i != item);
+                    n != o.equipment.len()
+                }
+                None => false,
+            };
+            ok(b(found))
+        }
+        "RemoveItemsByTag" => {
+            let (who, tag, n) = (obj(a, 0), string(a, 1), int(a, 2));
+            let items: Vec<ObjectId> = h
+                .object(who)
+                .map(|o| o.inventory.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|i| {
+                    h.object(*i)
+                        .is_some_and(|x| x.tag.eq_ignore_ascii_case(&tag))
+                })
+                .take(if n < 0 { usize::MAX } else { n as usize })
+                .collect();
+            if let Some(o) = h.sim.world.get_mut(who) {
+                o.inventory.retain(|i| !items.contains(i));
+                o.equipment.retain(|_, i| !items.contains(i));
+            }
+            for i in items {
+                h.sim.world.objects.remove(&i);
+            }
+            void()
+        }
+        "SetGroupHostility" => {
+            let (x, y, hostile) = (int(a, 0), int(a, 1), int(a, 2) != 0);
+            h.sim.world.hostility.insert((x.min(y), x.max(y)), hostile);
+            void()
+        }
+        "GetGroupHostility" => {
+            let (x, y) = (int(a, 0), int(a, 1));
+            ok(b(h
+                .sim
+                .world
+                .hostility
+                .get(&(x.min(y), x.max(y)))
+                .copied()
+                .unwrap_or(false)))
+        }
         "CreateItemOnObject" => {
             let template = string(a, 0);
             let id = h.sim.world.spawn(ObjectKind::Item, &template);
@@ -1473,7 +1548,7 @@ pub fn call(
             });
             void()
         }
-        "SetGroupHostility" | "SetStoryPlot" => {
+        "SetStoryPlot" => {
             // State the simulation does not use yet; recorded for the trace.
             h.sim.world.trace.push(TraceEntry::Log {
                 t,
@@ -1497,6 +1572,18 @@ pub fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
 }
 
 /// Point-in-polygon on the XY plane (even-odd rule).
+/// Whether a point is inside a trigger. The outline is relative to the trigger's position
+/// and rotated by its facing (provisional: degrees about Z, as `facing` is derived).
+pub fn in_trigger(p: [f32; 3], trigger: &crate::world::Object) -> bool {
+    if trigger.geometry.len() < 3 {
+        return false;
+    }
+    let (dx, dy) = (p[0] - trigger.position[0], p[1] - trigger.position[1]);
+    let (s, c) = (-trigger.facing.to_radians()).sin_cos();
+    let local = [dx * c - dy * s, dx * s + dy * c, p[2]];
+    inside(local, &trigger.geometry)
+}
+
 pub fn inside(p: [f32; 3], poly: &[[f32; 3]]) -> bool {
     let mut inside = false;
     let n = poly.len();

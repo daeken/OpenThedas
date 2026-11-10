@@ -863,11 +863,8 @@ impl Server {
                     sim.world.area,
                 ),
             };
-            let h = sim.world.get_mut(hero).ok_or("no hero")?;
-            h.position = target.0;
-            if target.1.is_some() {
-                h.area = target.1;
-            }
+            sim.move_object(hero, target.0, target.1);
+            sim.tick(0);
             Ok(summary(sim, hero))
         })
     }
