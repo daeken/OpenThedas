@@ -192,6 +192,13 @@ impl Live {
             self.level = Some(self.build_level(ctx, format, &layout)?);
         }
         let models = thedas_ui::models::area_models_cached(&sim, area, &mut self.models);
+        // A staged conversation line draws its actors at their stage marks.
+        let base = thedas_render::Camera::new(glam::Vec3::ZERO, 0.0, 0.0);
+        let marks = self
+            .talk_camera
+            .staging(&sim, &base)
+            .map(|s| s.marks.clone())
+            .unwrap_or_default();
         drop(sim);
         let key = objects_key(&models);
         if self.objects.as_ref().map(|o| &o.key) != Some(&key) {
@@ -203,10 +210,8 @@ impl Live {
         let posed: Vec<(Mat4, Option<Clip>)> = models
             .iter()
             .map(|m| {
-                (
-                    Prop::placement(m.position, m.facing),
-                    m.motion.as_ref().map(clip),
-                )
+                let (at, facing) = marks.get(&m.id).copied().unwrap_or((m.position, m.facing));
+                (Prop::placement(at, facing), m.motion.as_ref().map(clip))
             })
             .collect();
         self.animator.pose_props(
