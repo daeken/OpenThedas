@@ -60,6 +60,18 @@ impl Table {
         self.rows.get(&row)?.get(c)
     }
 
+    /// The id of the first row whose `column` is the string `value` (ignoring case and any
+    /// trailing NUL).
+    pub fn find(&self, column: &str, value: &str) -> Option<i64> {
+        let c = *self
+            .columns
+            .get(&thedas_formats::gda::column_hash(column))?;
+        self.order.iter().copied().find(|id| {
+            matches!(self.rows.get(id).and_then(|r| r.get(c)),
+                Some(Cell::String(s)) if s.trim_end_matches('\0').trim().eq_ignore_ascii_case(value))
+        })
+    }
+
     pub fn cell_by_hash(&self, hash: u32, row: i64) -> Option<&Cell> {
         let c = *self.columns.get(&hash)?;
         self.rows.get(&row)?.get(c)

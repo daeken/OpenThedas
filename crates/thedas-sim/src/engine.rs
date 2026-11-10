@@ -835,6 +835,13 @@ pub fn call(
                     e.0 = v;
                     e.1 = v;
                 }
+                // Scripts bring the dead back by giving them health (module_core's
+                // HandleEvent_Resurrection applies no effect). Provisional.
+                let health = constant(&h.sim.table, "PROPERTY_DEPLETABLE_HEALTH");
+                if int(a, 1) == health && vt != base_type && o.dead && o.properties[&health].1 > 0.0
+                {
+                    o.dead = false;
+                }
             }
             void()
         }
@@ -1769,8 +1776,9 @@ pub fn call(
                 .and_then(|t| t.cell("Type", int(a, 1) as i64).cloned())
                 .map_or(0, |c| match c {
                     Cell::String(s) if clean(&s).eq_ignore_ascii_case("ATTRIBUTE") => 1,
-                    Cell::String(s) if clean(&s).eq_ignore_ascii_case("DERIVED") => 2,
+                    Cell::String(s) if clean(&s).eq_ignore_ascii_case("SIMPLE") => 2,
                     Cell::String(s) if clean(&s).eq_ignore_ascii_case("DEPLETABLE") => 3,
+                    Cell::String(s) if clean(&s).eq_ignore_ascii_case("DERIVED") => 4,
                     Cell::Int(v) => v as i32,
                     _ => 0,
                 }),
@@ -2443,8 +2451,9 @@ fn property_bounds(sim: &Sim, property: i32) -> Option<(i32, f32, f32)> {
     );
     let ty = match t.cell("Type", property as i64) {
         Some(Cell::String(s)) if clean(s).eq_ignore_ascii_case("ATTRIBUTE") => 1,
-        Some(Cell::String(s)) if clean(s).eq_ignore_ascii_case("DERIVED") => 2,
+        Some(Cell::String(s)) if clean(s).eq_ignore_ascii_case("SIMPLE") => 2,
         Some(Cell::String(s)) if clean(s).eq_ignore_ascii_case("DEPLETABLE") => 3,
+        Some(Cell::String(s)) if clean(s).eq_ignore_ascii_case("DERIVED") => 4,
         _ => 0,
     };
     (min <= max).then_some((ty, min, max))
@@ -2464,7 +2473,11 @@ mod tests {
         void RemoveItem(object o, int n) = 3;\n\
         void SetFollowerState(object o, int n) = 4;\n\
         int FOLLOWER_STATE_ACTIVE = 1;\n\
-        int FOLLOWER_STATE_LOCKEDACTIVE = 5;\n";
+        int FOLLOWER_STATE_LOCKEDACTIVE = 5;\n\
+        void SetCreatureProperty(object o, int p, float f, int t) = 5;\n\
+        int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
+        int PROPERTY_VALUE_BASE = 2;\n\
+        int PROPERTY_VALUE_CURRENT = 3;\n";
 
     /// Calls engine function `name` as `caller`.
     fn run(s: &mut Sim, caller: ObjectId, name: &str, a: &[Value]) -> Option<Value> {
@@ -2558,6 +2571,34 @@ mod tests {
         );
         assert_eq!(s.world.get(hero).unwrap().followers, vec![ally]);
         assert_eq!(s.world.get(ally).unwrap().group, 0);
+    }
+
+    #[test]
+    fn giving_the_dead_health_brings_them_back() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let o = s.world.get_mut(hero).unwrap();
+        o.dead = true;
+        o.properties.insert(7, (100.0, 0.0));
+        let set = |s: &mut Sim, v: f32, t: i32| {
+            let a = [
+                Value::Object(hero),
+                Value::Int(7),
+                Value::Float(v),
+                Value::Int(t),
+            ];
+            run(s, hero, "SetCreatureProperty", &a);
+        };
+        set(&mut s, 120.0, 2);
+        assert!(
+            s.world.get(hero).unwrap().dead,
+            "raising the maximum is not enough"
+        );
+        set(&mut s, 25.0, 3);
+        let o = s.world.get(hero).unwrap();
+        assert!(!o.dead);
+        assert_eq!(o.properties[&7], (120.0, 25.0));
     }
 
     #[test]
