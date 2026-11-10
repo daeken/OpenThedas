@@ -49,6 +49,21 @@ struct State {
 /// Engine values bound for the interface.
 type UiValues = Vec<(String, UiValue)>;
 
+/// Acts on the movies' game messages as they are sent (see `GameBridge::set_message_handler`),
+/// with the simulation's messages (`Sim::gui_message`). When the simulation is busy (a tool
+/// holds it) the message waits and is applied after the frames instead.
+fn message_handler(state: Arc<Mutex<State>>) -> thedas_ui::protocol::MessageHandler {
+    Arc::new(move |name: &str, args: &[String]| {
+        let mut st = state.try_lock().ok()?;
+        let sim = st.sim.as_mut()?;
+        if !sim.gui_message(name, args) {
+            return None;
+        }
+        sim.tick(0);
+        Some(thedas_ui::binding::sim_values(sim).into_iter().collect())
+    })
+}
+
 #[derive(Clone)]
 struct Server {
     state: Arc<Mutex<State>>,
@@ -82,6 +97,9 @@ fn messages_json(m: Vec<GameMessage>) -> J {
         m.into_iter()
             .map(|m| match m {
                 GameMessage::Send(name, args) => json!({ "send": name, "args": args }),
+                GameMessage::Handled(name, args) => {
+                    json!({ "send": name, "args": args, "handled": true })
+                }
                 GameMessage::Other(c) => json!({
                     "movie": c.movie, "kind": format!("{:?}", c.kind), "name": c.name,
                     "args": c.args.iter().map(ui_json).collect::<Vec<_>>(),
@@ -199,6 +217,14 @@ struct ChoosePartyArgs {
     /// Followers (ids or tags) the party picker should take, at most three; empty to let
     /// it keep the current party.
     members: Vec<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct BoardArgs {
+    /// Take the job at this index (as the board's Accept button does).
+    accept: Option<usize>,
+    /// Close the board.
+    close: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -358,6 +384,25 @@ struct SlotArgs {
 
 fn kind_name(k: ObjectKind) -> String {
     format!("{k:?}").to_ascii_lowercase()
+}
+
+/// The open job board as the player sees it.
+fn board_json(sim: &Sim) -> J {
+    let Some(b) = &sim.world.chanter_board else {
+        return J::Null;
+    };
+    let text = |s: Option<u32>| s.and_then(|s| sim.string(s));
+    json!({
+        "board": b.board,
+        "header": text(b.header_strref),
+        "jobs": b.jobs.iter().enumerate().map(|(i, j)| json!({
+            "index": i,
+            "plot": j.plot,
+            "name": text(j.name_strref),
+            "text": text(j.text_strref),
+            "accepted": j.accepted,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 fn resolve(sim: &Sim, s: &str) -> Option<ObjectId> {
@@ -636,6 +681,9 @@ impl Server {
         };
         let mut out = Vec::new();
         for m in messages {
+            if let GameMessage::Handled(name, args) = m {
+                out.push(json!({ "message": name, "args": args, "when": "sent", "board": board_json(sim) }));
+            }
             if let GameMessage::Send(name, args) = m {
                 if name == "Conversation.SelectResponse" {
                     let n = args
@@ -645,6 +693,9 @@ impl Server {
                     sim.choose_reply(n);
                     sim.tick(0);
                     out.push(json!({ "selected_response": n, "conversation": dialog_json(sim) }));
+                } else if sim.gui_message(name, args) {
+                    sim.tick(0);
+                    out.push(json!({ "message": name, "args": args, "board": board_json(sim) }));
                 }
             }
         }
@@ -681,10 +732,12 @@ impl Server {
             a.height.unwrap_or(720).clamp(64, 4096),
         );
         let names = thedas_ui::stage::movie_names(&a.movies);
+        let handler = message_handler(self.state.clone());
         let r = self
             .ui
             .run(move |w| -> Result<J, String> {
                 let stage = w.stage(&vfs, size)?;
+                stage.bridge.set_message_handler(Some(handler.clone()));
                 stage.bridge.set_values(values.clone());
                 let mut failed = Vec::new();
                 for n in &names {
@@ -1403,6 +1456,28 @@ impl Server {
             }
             sim.world.party_choice = (!ids.is_empty()).then_some(ids.clone());
             Ok(json!({ "party_choice": ids }))
+        })
+    }
+
+    #[tool(
+        description = "The open job board (Chantry board or guild box, ShowChantersGUI): its jobs with their text and whether each is taken. accept takes a job by index; close closes the board. Same messages the board's movie sends."
+    )]
+    async fn job_board(&self, Parameters(a): Parameters<BoardArgs>) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            if sim.world.chanter_board.is_none() {
+                return Ok(json!({ "board": null }));
+            }
+            let mut taken = None;
+            if let Some(i) = a.accept {
+                taken = Some(sim.gui_message(thedas_sim::chanters::MSG_ACCEPT, &[i.to_string()]));
+                sim.tick(0);
+            }
+            let board = board_json(sim);
+            if a.close == Some(true) {
+                sim.gui_message(thedas_sim::chanters::MSG_CLEAR, &[]);
+            }
+            Ok(json!({ "accepted": taken, "board": board, "closed": a.close == Some(true) }))
         })
     }
 

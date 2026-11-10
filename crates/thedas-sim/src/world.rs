@@ -333,6 +333,9 @@ pub struct World {
     /// The followers the player wants when the party picker opens.
     #[serde(default)]
     pub party_choice: Option<Vec<ObjectId>>,
+    /// The job board on screen (`ShowChantersGUI`).
+    #[serde(default)]
+    pub chanter_board: Option<crate::chanters::ChanterBoard>,
     /// The store whose screen is open (`OpenStore`).
     #[serde(default)]
     pub store: Option<ObjectId>,
@@ -439,6 +442,7 @@ impl World {
             dialog_shown: Default::default(),
             popup: None,
             store: None,
+            chanter_board: None,
             party_choice: None,
             world_map: Default::default(),
             rng: Rng::new(seed),

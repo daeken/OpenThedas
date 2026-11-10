@@ -2079,9 +2079,7 @@ pub fn call(
         // The quest board screen: which board is open (jobboards.gda row) is kept for the
         // interface; accepting a job is the screen's business.
         "ShowChantersGUI" => {
-            if let Some(m) = h.sim.world.module.and_then(|m| h.sim.world.get_mut(m)) {
-                m.fields.insert("ChantersBoard".into(), int(a, 0));
-            }
+            h.sim.open_chanter_board(int(a, 0));
             void()
         }
         "SetObjectInteractive" => {
