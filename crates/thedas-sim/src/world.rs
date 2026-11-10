@@ -235,6 +235,16 @@ pub enum EngineData {
     Effect(Effect),
 }
 
+/// A message box shown by `ShowPopup`: its text, kind (`nPopupType`), owner and whether it
+/// asks for typed input.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Popup {
+    pub strref: i32,
+    pub kind: i32,
+    pub owner: ObjectId,
+    pub input: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QueuedEvent {
     pub target: ObjectId,
@@ -317,6 +327,15 @@ pub struct World {
     /// Show-once-per-game conversation nodes already used ("dialog:node").
     #[serde(default)]
     pub dialog_shown: std::collections::BTreeSet<String>,
+    /// A message box waiting for an answer (`ShowPopup`).
+    #[serde(default)]
+    pub popup: Option<Popup>,
+    /// The followers the player wants when the party picker opens.
+    #[serde(default)]
+    pub party_choice: Option<Vec<ObjectId>>,
+    /// The store whose screen is open (`OpenStore`).
+    #[serde(default)]
+    pub store: Option<ObjectId>,
     /// The world map (see `worldmap`).
     #[serde(default)]
     pub world_map: crate::worldmap::WorldMapState,
@@ -418,6 +437,9 @@ impl World {
             destroy_at: Vec::new(),
             held: Vec::new(),
             dialog_shown: Default::default(),
+            popup: None,
+            store: None,
+            party_choice: None,
             world_map: Default::default(),
             rng: Rng::new(seed),
             trace: Trace::default(),

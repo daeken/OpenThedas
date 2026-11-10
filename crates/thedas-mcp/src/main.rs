@@ -185,6 +185,29 @@ struct LoadArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct StoreArgs {
+    /// Item (id or tag) to buy from the open store.
+    buy: Option<String>,
+    /// Item (id or tag) the party carries to sell to the open store.
+    sell: Option<String>,
+    /// Close the store screen.
+    close: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ChoosePartyArgs {
+    /// Followers (ids or tags) the party picker should take, at most three; empty to let
+    /// it keep the current party.
+    members: Vec<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct PopupArgs {
+    /// Button to press (1 for the first, e.g. Yes/OK); omit to just read the popup.
+    button: Option<i32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct AutopilotArgs {
     /// On: the party AI (tactics) fights for every party member, the hero included.
     on: bool,
@@ -1269,6 +1292,141 @@ impl Server {
                 "time_ms": sim.world.time_ms,
                 "conversation": dialog_json(sim),
             }))
+        })
+    }
+
+    #[tool(
+        description = "The open store (OpenStore): its stock with prices, the party's money and what the party could sell. buy or sell an item by id or tag; close to leave the screen."
+    )]
+    async fn store(&self, Parameters(a): Parameters<StoreArgs>) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            let Some(store) = sim.world.store else {
+                return Ok(json!({ "store": null }));
+            };
+            let mut done = json!(null);
+            if let Some(b) = &a.buy {
+                let item = sim
+                    .world
+                    .get(store)
+                    .and_then(|s| {
+                        s.inventory.iter().copied().find(|&i| {
+                            i.to_string() == *b
+                                || sim
+                                    .world
+                                    .get(i)
+                                    .is_some_and(|o| o.tag.eq_ignore_ascii_case(b))
+                        })
+                    })
+                    .ok_or("the store has no such item")?;
+                let price = sim.buy_price(store, item);
+                let got = sim.store_buy(store, item).map_err(|e| e.to_string())?;
+                done = json!({ "bought": summary(sim, got), "price": price });
+            }
+            if let Some(x) = &a.sell {
+                let item = resolve(sim, x).ok_or("no such item")?;
+                let price = sim.store_sell(store, item).map_err(|e| e.to_string())?;
+                done = json!({ "sold": item, "price": price });
+            }
+            sim.tick(0);
+            if a.close == Some(true) {
+                sim.world.store = None;
+                return Ok(json!({ "closed": store, "done": done }));
+            }
+            let hero = sim.world.hero.unwrap_or(OBJECT_INVALID);
+            let stock: Vec<J> = sim
+                .world
+                .get(store)
+                .map(|s| s.inventory.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|i| {
+                    let mut j = summary(sim, i);
+                    j["price"] = json!(sim.buy_price(store, i));
+                    j["stack"] = json!(
+                        sim.world
+                            .get(i)
+                            .and_then(|o| o.fields.get("StackSize").copied())
+                            .unwrap_or(1)
+                    );
+                    j
+                })
+                .collect();
+            let mut carriers = vec![hero];
+            carriers.extend(
+                sim.world
+                    .get(hero)
+                    .map(|h| h.followers.clone())
+                    .unwrap_or_default(),
+            );
+            let mut sellable = Vec::new();
+            for c in carriers {
+                let inv = sim.world.get(c).map(|o| {
+                    (
+                        o.inventory.clone(),
+                        o.equipment.values().copied().collect::<Vec<_>>(),
+                    )
+                });
+                let Some((inv, worn)) = inv else { continue };
+                for i in inv {
+                    if worn.contains(&i) || sim.world.get(i).is_none_or(|o| o.plot) {
+                        continue;
+                    }
+                    let mut j = summary(sim, i);
+                    j["price"] = json!(sim.sell_price(store, i));
+                    j["carrier"] = json!(c);
+                    sellable.push(j);
+                }
+            }
+            Ok(json!({
+                "store": summary(sim, store),
+                "money": sim.world.get(hero).map_or(0, |h| h.money),
+                "done": done,
+                "stock": stock,
+                "sellable": sellable,
+            }))
+        })
+    }
+
+    #[tool(
+        description = "Choose who the party picker takes (when the game shows it, e.g. leaving camp): up to three followers by id or tag."
+    )]
+    async fn choose_party(&self, Parameters(a): Parameters<ChoosePartyArgs>) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            let mut ids = Vec::new();
+            for m in &a.members {
+                ids.push(resolve(sim, m).ok_or_else(|| format!("no such follower: {m}"))?);
+            }
+            if ids.len() > 3 {
+                return Err("at most three followers".into());
+            }
+            sim.world.party_choice = (!ids.is_empty()).then_some(ids.clone());
+            Ok(json!({ "party_choice": ids }))
+        })
+    }
+
+    #[tool(
+        description = "The open message box (ShowPopup), if any: its text and kind. With button, answer it (1 = the first button, e.g. Yes) and run what that causes."
+    )]
+    async fn popup(&self, Parameters(a): Parameters<PopupArgs>) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            let Some(p) = sim.world.popup.clone() else {
+                return Ok(json!({ "popup": null }));
+            };
+            let text = sim.string(p.strref.max(0) as u32);
+            if let Some(b) = a.button {
+                sim.answer_popup(b);
+                sim.tick(0);
+                return Ok(json!({
+                    "answered": b,
+                    "text": text,
+                    "area": sim.world.area.and_then(|x| sim.world.get(x)).map(|x| x.tag.clone()),
+                    "world_map_open": sim.world.world_map.open,
+                }));
+            }
+            Ok(json!({ "popup": { "text": text, "kind": p.kind, "owner": p.owner, "input": p.input } }))
         })
     }
 

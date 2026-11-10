@@ -441,6 +441,29 @@ impl Sim {
             .collect()
     }
 
+    /// The player answers the open message box: `EVENT_TYPE_POPUP_RESULT` to its owner (the
+    /// module when it has none), object 0 the owner, integers the popup's kind and the
+    /// button pressed (1 for the first). Provisional layout, read from the scripts that
+    /// handle it. Returns false when no popup is open.
+    pub fn answer_popup(&mut self, button: i32) -> bool {
+        let Some(p) = self.world.popup.take() else {
+            return false;
+        };
+        let target = if self.world.get(p.owner).is_some() {
+            p.owner
+        } else {
+            match self.world.module {
+                Some(m) => m,
+                None => return false,
+            }
+        };
+        let mut ev = self.new_event("POPUP_RESULT", self.world.hero);
+        ev.objects = vec![p.owner];
+        ev.ints = vec![p.kind, button];
+        self.world.queue_event(0, target, ev, None);
+        true
+    }
+
     /// `ShowPartyPickerGUI` with no player to pick: the module hears the picker open
     /// (`EVENT_TYPE_PARTYPICKER_INIT`), the active party keeps its members and free places
     /// (three followers in all) go to the pool in the order they were recruited, then the
@@ -451,13 +474,32 @@ impl Sim {
         };
         let init = self.new_event("PARTYPICKER_INIT", Some(hero));
         self.world.queue_event(0, module, init, None);
-        let mut chosen = self
-            .world
-            .get(hero)
-            .map(|h| h.followers.clone())
-            .unwrap_or_default();
+        // The player's choice when one was made, else the party as it was, filled up from
+        // the pool.
         let mut pool = self.party_pool();
+        let mut chosen = match &self.world.party_choice {
+            Some(c) => c
+                .iter()
+                .copied()
+                .filter(|p| {
+                    pool.contains(p)
+                        || self
+                            .world
+                            .get(hero)
+                            .is_some_and(|h| h.followers.contains(p))
+                })
+                .take(3)
+                .collect(),
+            None => self
+                .world
+                .get(hero)
+                .map(|h| h.followers.clone())
+                .unwrap_or_default(),
+        };
         pool.sort();
+        if self.world.party_choice.is_some() {
+            pool.clear();
+        }
         for p in pool {
             if chosen.len() >= 3 {
                 break;
@@ -516,6 +558,17 @@ impl Sim {
             )
             .chain(self.party_pool())
             .collect();
+        // The party leaves the old area: its script hears each member go
+        // (EVENT_TYPE_EXIT, creator and object 0 the member), before the area unloads.
+        if let Some(old) = old {
+            for &id in &party {
+                if self.world.get(id).is_some_and(|o| o.area == Some(old)) {
+                    let mut ev = self.new_event("EXIT", Some(id));
+                    ev.objects = vec![id];
+                    self.deliver(old, ev, None);
+                }
+            }
+        }
         // The old area unloads: its objects go inactive, remembering whether they were
         // active for when the party comes back.
         if let Some(old) = old {
@@ -541,6 +594,10 @@ impl Sim {
                         if let Some(p) = pos {
                             o.position = p;
                         }
+                        // Followers enter after the hero (whose ENTER `enter_area` sent).
+                        let mut ev = self.new_event("ENTER", Some(*id));
+                        ev.objects = vec![*id];
+                        self.world.queue_event(0, new, ev, None);
                     }
                 }
             }
@@ -1226,9 +1283,11 @@ impl Sim {
                 }
             }
         }
-        if kind == ObjectKind::Creature {
-            if let Some(t) = &tmpl {
-                self.load_template_items(id, t);
+        if let Some(t) = &tmpl {
+            match kind {
+                ObjectKind::Creature => self.load_template_items(id, t),
+                ObjectKind::Store => self.load_store_items(id, t),
+                _ => {}
             }
         }
         self.created(id);
@@ -1388,7 +1447,7 @@ impl Sim {
     }
 }
 
-fn list_of<'a>(s: &'a Struct, label: &str) -> &'a [u32] {
+pub(crate) fn list_of<'a>(s: &'a Struct, label: &str) -> &'a [u32] {
     match field(s, label) {
         Some(G3::List(v)) => v,
         _ => &[],
@@ -1713,6 +1772,59 @@ mod tests {
         assert!(s.world.get(awake).unwrap().active);
         assert!(!s.world.get(asleep).unwrap().active);
         assert_eq!(s.world.get(hero).unwrap().area, Some(a));
+    }
+
+    #[test]
+    fn the_party_leaves_and_enters_areas() {
+        let mut s = sim();
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let dog = s.world.spawn(ObjectKind::Creature, "dog");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().followers = vec![dog];
+        let mut areas = Vec::new();
+        for name in ["a", "b"] {
+            let id = s.world.spawn(ObjectKind::Area, name);
+            let o = s.world.get_mut(id).unwrap();
+            o.template = name.into();
+            o.script = Some("counter".into());
+            areas.push(id);
+        }
+        let (a, b) = (areas[0], areas[1]);
+        s.world.area = Some(a);
+        for id in [hero, dog] {
+            s.world.get_mut(id).unwrap().area = Some(a);
+        }
+        s.area_transition("b", "");
+        // The old area heard both leave before it unloaded.
+        assert_eq!(s.world.get(a).unwrap().locals.ints.get("n"), Some(&2));
+        let entering: Vec<_> = s
+            .world
+            .queue
+            .values()
+            .filter(|q| q.target == b && q.event.objects.len() == 1)
+            .map(|q| q.event.objects[0])
+            .collect();
+        assert_eq!(entering, vec![hero, dog]);
+    }
+
+    #[test]
+    fn popup_answers_go_to_the_module_without_an_owner() {
+        let mut s = sim();
+        let m = with_module(&mut s);
+        s.world.popup = Some(crate::world::Popup {
+            strref: 5,
+            kind: 2,
+            owner: OBJECT_INVALID,
+            input: false,
+        });
+        assert!(s.answer_popup(0));
+        let q: Vec<_> = s
+            .world
+            .queue
+            .values()
+            .map(|q| (q.target, q.event.ints.clone()))
+            .collect();
+        assert_eq!(q, vec![(m, vec![2, 0])]);
     }
 
     #[test]
