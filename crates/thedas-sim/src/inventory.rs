@@ -45,6 +45,79 @@ impl Sim {
         true
     }
 
+    /// The equipment slots an item fits (`EquippableSlots` bitmask of its base type in
+    /// `bitm_base.gda`), lowest first.
+    pub fn item_slots(&self, item: ObjectId) -> Vec<i32> {
+        let Some(base) = self
+            .world
+            .get(item)
+            .and_then(|o| o.fields.get("BaseItem").copied())
+        else {
+            return Vec::new();
+        };
+        let mask = self
+            .world
+            .tables
+            .get(0, "bitm_base")
+            .and_then(|t| match t.cell("EquippableSlots", base as i64) {
+                Some(thedas_formats::gda::Cell::Int(v)) => Some(*v),
+                _ => None,
+            })
+            .unwrap_or(0);
+        (0..32).filter(|b| mask & (1 << b) != 0).collect()
+    }
+
+    /// Equips an item in its first free slot (or its first slot); returns the slot.
+    pub fn equip_default(&mut self, who: ObjectId, item: ObjectId) -> Option<i32> {
+        let slots = self.item_slots(item);
+        let taken = self.world.get(who)?.equipment.clone();
+        let slot = slots
+            .iter()
+            .copied()
+            .find(|s| !taken.contains_key(s))
+            .or_else(|| slots.first().copied())?;
+        let o = self.world.get_mut(who)?;
+        if !o.inventory.contains(&item) {
+            o.inventory.push(item);
+        }
+        o.equipment.retain(|_, i| *i != item);
+        o.equipment.insert(slot, item);
+        Some(slot)
+    }
+
+    /// Equips whatever unequipped items fit free slots, as a player would after picking up
+    /// their gear. Returns (item, slot) pairs.
+    pub fn equip_free_slots(&mut self, who: ObjectId) -> Vec<(ObjectId, i32)> {
+        let Some(o) = self.world.get(who) else {
+            return Vec::new();
+        };
+        let equipped: Vec<ObjectId> = o.equipment.values().copied().collect();
+        let loose: Vec<ObjectId> = o
+            .inventory
+            .iter()
+            .copied()
+            .filter(|i| !equipped.contains(i))
+            .collect();
+        let mut out = Vec::new();
+        for item in loose {
+            let free = {
+                let taken = &self
+                    .world
+                    .get(who)
+                    .map(|o| o.equipment.clone())
+                    .unwrap_or_default();
+                self.item_slots(item)
+                    .into_iter()
+                    .find(|s| !taken.contains_key(s))
+            };
+            if let (Some(slot), Some(o)) = (free, self.world.get_mut(who)) {
+                o.equipment.insert(slot, item);
+                out.push((item, slot));
+            }
+        }
+        out
+    }
+
     /// Takes everything out of a container, body bag or dead creature into `to`'s inventory.
     /// Equipped items of a creature stay unless they are droppable. Returns the items taken.
     pub fn loot(&mut self, from: ObjectId, to: ObjectId) -> Vec<ObjectId> {

@@ -1005,7 +1005,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Take everything from a container, body bag or dead creature into the hero's inventory (walk there first). Returns the items taken."
+        description = "Take everything from a container, body bag or dead creature into the hero's inventory (walk there first), putting on what fits a free equipment slot. Returns the items taken and equipped."
     )]
     async fn loot(&self, Parameters(a): Parameters<ObjectArg>) -> String {
         self.with_sim(|st| {
@@ -1013,9 +1013,12 @@ impl Server {
             let hero = sim.world.hero.ok_or("no hero")?;
             let from = resolve(sim, &a.object).ok_or("no such object")?;
             let items = sim.loot(from, hero);
+            // Put on whatever fits a free slot, as a player picking their gear back up would.
+            let equipped = sim.equip_free_slots(hero);
             sim.tick(0);
             Ok(json!({
                 "taken": items.iter().map(|&i| summary(sim, i)).collect::<Vec<_>>(),
+                "equipped": equipped.iter().map(|(i, s)| json!({"item": i, "slot": s})).collect::<Vec<_>>(),
             }))
         })
     }

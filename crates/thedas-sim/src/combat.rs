@@ -194,6 +194,42 @@ impl Sim {
         }
     }
 
+    /// Out-of-combat recovery: living creatures not in combat regain health and
+    /// mana/stamina at `PROPERTY_ATTRIBUTE_REGENERATION_HEALTH` points per second, up to their
+    /// maximum. Provisional: the rate, and no recovery during combat, are guesses.
+    pub fn regenerate(&mut self, ms: u64) {
+        if ms == 0 {
+            return;
+        }
+        let (health, mana, regen) = (
+            constant_of(self, "PROPERTY_DEPLETABLE_HEALTH"),
+            constant_of(self, "PROPERTY_DEPLETABLE_MANA_STAMINA"),
+            constant_of(self, "PROPERTY_ATTRIBUTE_REGENERATION_HEALTH"),
+        );
+        let fighting = self.world.game_mode == constant_of(self, "GM_COMBAT");
+        let party = crate::engine::party_of(self);
+        let secs = ms as f32 / 1000.0;
+        for o in self.world.objects.values_mut() {
+            if o.kind != ObjectKind::Creature || o.dead || o.combat.in_combat {
+                continue;
+            }
+            if fighting && party.contains(&o.id) {
+                continue;
+            }
+            let rate = o.properties.get(&regen).map_or(0.0, |p| p.0.max(p.1));
+            if rate <= 0.0 {
+                continue;
+            }
+            for p in [health, mana] {
+                if let Some(v) = o.properties.get_mut(&p) {
+                    if v.1 < v.0 {
+                        v.1 = (v.1 + rate * secs).min(v.0);
+                    }
+                }
+            }
+        }
+    }
+
     /// Queues `PERCEPTION_APPEAR` (or `DISAPPEAR`) for `who` about `seen`.
     pub fn perceive(&mut self, who: ObjectId, seen: ObjectId, appear: bool) {
         let name = if appear {
@@ -226,12 +262,14 @@ impl Sim {
         let mut ev = self.new_event("APPLY_EFFECT", creator);
         ev.objects = vec![target];
         let saved = self.current_effect.replace((effect.clone(), true));
+        let saved_target = self.current_effect_target.replace(target);
         let script = self.world.get(target).and_then(|o| o.script.clone());
         if let Some(script) = script {
             self.run_script(&script, target, Some(ev));
         }
         let (effect, valid) =
             std::mem::replace(&mut self.current_effect, saved).unwrap_or((effect, true));
+        self.current_effect_target = saved_target;
         // A lethal hit arrives as EFFECT_TYPE_DEATH (7 in effects.gda) rather than as damage
         // that empties the health bar: the engine does the killing.
         if valid && effect.ty == EFFECT_TYPE_RESURRECTION {
