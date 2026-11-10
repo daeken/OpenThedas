@@ -98,6 +98,10 @@ pub struct Object {
     /// Template resource (without extension).
     pub template: String,
     pub name_strref: Option<u32>,
+    /// A name given in play (`SetName`: the hero's, chosen in character creation), which
+    /// takes the place of the template's.
+    #[serde(default)]
+    pub name: Option<String>,
     pub area: Option<ObjectId>,
     pub position: [f32; 3],
     /// Degrees: the object's rotation about Z, as the game keeps it (an instance's
@@ -181,6 +185,7 @@ impl Object {
             tag: tag.to_string(),
             template: String::new(),
             name_strref: None,
+            name: None,
             area: None,
             position: [0.0; 3],
             facing: 0.0,

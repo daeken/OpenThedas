@@ -95,6 +95,9 @@ struct Args {
     /// Start a new game: the module's start, through character creation's quick start.
     #[arg(long)]
     new_game: bool,
+    /// With `--new-game`: the hero's name (character creation's quick start does not ask).
+    #[arg(long)]
+    name: Option<String>,
     /// Headless, playing: run the simulation this many milliseconds before capturing.
     #[arg(long, default_value_t = 0)]
     run_ms: u64,
@@ -937,6 +940,13 @@ fn main() -> Result<()> {
         )?),
         None => None,
     };
+    // The name character creation would have taken (its script calls SetName with it).
+    if let (Some(l), Some(name), true) = (live.as_ref(), &args.name, args.new_game) {
+        let mut sim = l.sim();
+        if let Some(h) = sim.world.hero.and_then(|h| sim.world.get_mut(h)) {
+            h.name = Some(name.trim().to_string()).filter(|n| !n.is_empty());
+        }
+    }
     // Playing, the scene comes from the game; the interface still reads the global stack.
     let area = if live.is_some() {
         "none"

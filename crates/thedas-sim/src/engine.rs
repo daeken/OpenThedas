@@ -401,14 +401,15 @@ pub fn call(
                 .map(|o| o.template.clone())
                 .unwrap_or_default(),
         )),
-        "GetName" => ok(Value::String(
-            h.object(obj(a, 0))
-                .map(|o| match o.name_strref {
-                    Some(s) => h.sim.string(s).unwrap_or_else(|| o.tag.clone()),
-                    None => o.tag.clone(),
-                })
-                .unwrap_or_default(),
-        )),
+        "GetName" => ok(Value::String(h.sim.display_name(obj(a, 0)))),
+        // An empty name gives the template's back. Provisional.
+        "SetName" => {
+            let name = string(a, 1);
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.name = (!name.is_empty()).then_some(name);
+            }
+            void()
+        }
         "GetObjectByTag" => {
             let n = if a.len() > 1 {
                 int(a, 1).max(0) as usize
