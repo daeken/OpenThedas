@@ -314,6 +314,9 @@ pub struct World {
     /// Events for objects in an unloaded area, waiting for the party to come back.
     #[serde(default)]
     pub held: Vec<QueuedEvent>,
+    /// Show-once-per-game conversation nodes already used ("dialog:node").
+    #[serde(default)]
+    pub dialog_shown: std::collections::BTreeSet<String>,
     /// The world map (see `worldmap`).
     #[serde(default)]
     pub world_map: crate::worldmap::WorldMapState,
@@ -414,6 +417,7 @@ impl World {
             autopilot: false,
             destroy_at: Vec::new(),
             held: Vec::new(),
+            dialog_shown: Default::default(),
             world_map: Default::default(),
             rng: Rng::new(seed),
             trace: Trace::default(),

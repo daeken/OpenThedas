@@ -441,6 +441,60 @@ impl Sim {
             .collect()
     }
 
+    /// `ShowPartyPickerGUI` with no player to pick: the module hears the picker open
+    /// (`EVENT_TYPE_PARTYPICKER_INIT`), the active party keeps its members and free places
+    /// (three followers in all) go to the pool in the order they were recruited, then the
+    /// picker closes (`EVENT_TYPE_PARTYPICKER_CLOSED`). Provisional.
+    pub fn party_picker(&mut self) {
+        let (Some(module), Some(hero)) = (self.world.module, self.world.hero) else {
+            return;
+        };
+        let init = self.new_event("PARTYPICKER_INIT", Some(hero));
+        self.world.queue_event(0, module, init, None);
+        let mut chosen = self
+            .world
+            .get(hero)
+            .map(|h| h.followers.clone())
+            .unwrap_or_default();
+        let mut pool = self.party_pool();
+        pool.sort();
+        for p in pool {
+            if chosen.len() >= 3 {
+                break;
+            }
+            if !chosen.contains(&p) && self.alive(p) {
+                chosen.push(p);
+            }
+        }
+        let (active, available) = (
+            constant(&self.table, "FOLLOWER_STATE_ACTIVE"),
+            constant(&self.table, "FOLLOWER_STATE_AVAILABLE"),
+        );
+        let area = self.world.get(hero).and_then(|h| h.area);
+        let group = self.world.get(hero).map_or(0, |h| h.group);
+        for p in self.party_pool() {
+            let on = chosen.contains(&p);
+            if let Some(o) = self.world.get_mut(p) {
+                let locked = o.fields.get("FollowerState")
+                    == Some(&constant(&self.table, "FOLLOWER_STATE_LOCKEDACTIVE"));
+                if !locked {
+                    o.fields
+                        .insert("FollowerState".into(), if on { active } else { available });
+                }
+                o.active = on || locked;
+                if on {
+                    o.area = area;
+                    o.group = group;
+                }
+            }
+        }
+        if let Some(h) = self.world.get_mut(hero) {
+            h.followers = chosen;
+        }
+        let closed = self.new_event("PARTYPICKER_CLOSED", Some(hero));
+        self.world.queue_event(0, module, closed, None);
+    }
+
     pub fn area_transition(&mut self, area: &str, waypoint: &str) {
         let t = self.world.time_ms;
         self.world.trace.push(TraceEntry::Log {
