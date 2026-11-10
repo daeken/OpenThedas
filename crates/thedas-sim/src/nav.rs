@@ -88,29 +88,6 @@ pub fn region(g: &NavGrid, from: [f32; 3]) -> Vec<bool> {
     seen
 }
 
-/// Whether nothing blocks the straight line between two points on the grid: every cell it
-/// crosses (sampled at half-cell steps, ignoring the metre around each end, where the
-/// creatures stand) is walkable. Off-grid samples do not block. Provisional: the pathing
-/// grid stands in for the level's collision geometry.
-pub fn line_clear(g: &NavGrid, a: [f32; 3], b: [f32; 3]) -> bool {
-    let d = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
-    let step = (g.cell_size * 0.5).max(0.1);
-    let n = (d / step).ceil() as usize;
-    for i in 1..n {
-        let t = i as f32 / n as f32;
-        if t * d < 1.0 || (1.0 - t) * d < 1.0 {
-            continue;
-        }
-        let p = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2]];
-        if let Some(c) = g.cell(p) {
-            if !walkable(g, c) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
 /// The route from `from` to `to` as world points (cell centres at floor height, ending at
 /// `to`), or `None` when either end is off the grid or no route exists.
 pub fn route(g: &NavGrid, from: [f32; 3], to: [f32; 3]) -> Option<Vec<[f32; 3]>> {
@@ -295,14 +272,6 @@ mod tests {
             !region(&g, [0.5, 0.5, 0.0])[4],
             "nor is anything past a step too high"
         );
-    }
-
-    #[test]
-    fn walls_block_the_line_of_sight() {
-        let g = grid();
-        // Across the wall in the bottom row: blocked; along the open top row: clear.
-        assert!(!line_clear(&g, [0.5, 0.5, 0.0], [4.5, 0.5, 0.0]));
-        assert!(line_clear(&g, [0.5, 2.5, 0.0], [4.5, 2.5, 0.0]));
     }
 
     #[test]

@@ -143,13 +143,13 @@ impl Sim {
             .filter(|o| o.kind == ObjectKind::Creature && o.area == Some(area))
             .map(|o| (o.id, o.position))
             .collect();
-        let grid = self.nav_grid(area);
         for &(id, pos) in &creatures {
             let alive = self.alive(id);
             // A creature notices others within its template's PerceptionClass (taken to be a
             // radius in metres: 9 for most creatures, 12 for player characters, 15 for an
-            // ogre; provisional) when nothing blocks the line between them, and keeps track
-            // of those it has noticed out to the visual radius.
+            // ogre; provisional) and keeps track of those it has noticed out to the visual
+            // radius. Line of sight is not checked: the pathing grid, the only geometry the
+            // simulation has, marks furniture and rubble that do not block sight.
             let ring = self
                 .world
                 .get(id)
@@ -173,9 +173,6 @@ impl Sim {
                             return d <= VISUAL_RANGE;
                         }
                         d <= ring
-                            && grid
-                                .as_ref()
-                                .is_none_or(|g| crate::nav::line_clear(g, pos, p))
                     })
                     .map(|&(o, _)| o)
                     .collect()

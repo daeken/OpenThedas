@@ -129,6 +129,27 @@ impl Tables {
         }
     }
 
+    /// Puts a ready-made table under a worksheet name (as `get(_, name)` finds it), for tests.
+    #[cfg(test)]
+    pub fn insert(&self, worksheet: &str, columns: &[&str], rows: Vec<(i64, Vec<Cell>)>) {
+        let mut t = Table::default();
+        for (i, c) in columns.iter().enumerate() {
+            // `#1234abcd` names a column by its hash (for columns whose names are unknown).
+            let h = match c.strip_prefix('#') {
+                Some(x) => u32::from_str_radix(x, 16).unwrap_or(0),
+                None => thedas_formats::gda::column_hash(c),
+            };
+            t.columns.insert(h, i);
+        }
+        for (id, cells) in rows {
+            t.order.push(id);
+            t.rows.insert(id, cells);
+        }
+        if let Ok(mut l) = self.loaded.lock() {
+            l.insert(worksheet.to_ascii_lowercase(), std::sync::Arc::new(t));
+        }
+    }
+
     /// The table for an id, or for an explicit worksheet name when `worksheet` is non-empty.
     pub fn get(&self, id: i32, worksheet: &str) -> Option<std::sync::Arc<Table>> {
         let key = if worksheet.is_empty() {

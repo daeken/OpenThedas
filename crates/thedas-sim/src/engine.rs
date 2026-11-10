@@ -2585,25 +2585,7 @@ pub fn call(
         // GetItemStat: the item's base-type row in itemstats.gda, in the column named by
         // the stat's label in itemstatdefines.gda (Attack, Damage, ArmorPenetration, ...).
         // Provisional: item properties (material, enchantments) are not added yet.
-        "GetItemStat" => {
-            let base = h
-                .object(obj(a, 0))
-                .and_then(|o| o.fields.get("BaseItem").copied());
-            let stat = int(a, 1);
-            let tables = h.sim.world.tables.clone();
-            let label = tables
-                .get(0, "itemstatdefines")
-                .map(|t| cell_string(t.cell("Label", stat as i64)))
-                .filter(|l| !l.is_empty());
-            let v = match (base, label) {
-                (Some(b), Some(l)) => tables
-                    .get(0, "itemstats")
-                    .and_then(|t| t.cell(clean(&l), b as i64).map(|c| cell_float(Some(c))))
-                    .unwrap_or(0.0),
-                _ => 0.0,
-            };
-            ok(Value::Float(v))
-        }
+        "GetItemStat" => ok(Value::Float(h.sim.item_stat(obj(a, 0), int(a, 1)))),
         "GetItemStackSize" => ok(Value::Int(
             h.object(obj(a, 0))
                 .and_then(|o| o.fields.get("StackSize").copied())

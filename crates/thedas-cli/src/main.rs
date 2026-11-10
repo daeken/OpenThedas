@@ -1,5 +1,6 @@
 //! `thedas`: command-line tools for inspecting and validating Dragon Age: Origins data.
 
+mod autoplay;
 mod corpus;
 mod dump;
 mod script;
@@ -85,6 +86,47 @@ enum Command {
         /// Replies to pick, by index, in order (default: always the first).
         #[arg(long, value_delimiter = ',')]
         replies: Vec<usize>,
+    },
+    /// Play a scenario from a save over several seeds (simple deterministic player: party AI,
+    /// attack what is seen, seek the nearest hostile, take doors to new areas) and report hero
+    /// deaths and who was alive at given times.
+    Autoplay {
+        install: PathBuf,
+        /// A save made with the MCP's save_state.
+        save: PathBuf,
+        #[arg(long, default_value = "single player")]
+        module: String,
+        #[arg(long, default_value_t = 10)]
+        seeds: u64,
+        #[arg(long, default_value_t = 1)]
+        first_seed: u64,
+        /// Game minutes before a run gives up.
+        #[arg(long, default_value_t = 30)]
+        minutes: u64,
+        /// Stop when this plot flag is set (`plot:flag`, plot by resource name or GUID).
+        #[arg(long)]
+        until_flag: Option<String>,
+        /// Stop on reaching this area.
+        #[arg(long)]
+        until_area: Option<String>,
+        /// Take doors only to new areas whose tag starts with this (e.g. `pre4`).
+        #[arg(long)]
+        exit_prefix: Option<String>,
+        /// Time the samples from when this plot flag is first set.
+        #[arg(long)]
+        mark_flag: Option<String>,
+        /// Creature tags whose survival to report.
+        #[arg(long, value_delimiter = ',')]
+        watch: Vec<String>,
+        /// Seconds after the mark to sample survival at.
+        #[arg(long, value_delimiter = ',', default_value = "30,60,120")]
+        at: Vec<u64>,
+        /// One line per run.
+        #[arg(long)]
+        verbose: bool,
+        /// Write the last run's end state here.
+        #[arg(long)]
+        save_to: Option<PathBuf>,
     },
     /// Summarise a layout's pathing grid and optionally write it as a PGM image.
     Navgrid {
@@ -221,6 +263,37 @@ fn run() -> Result<()> {
             seed,
             talk: talk.as_deref(),
             replies: &replies,
+        }),
+        Command::Autoplay {
+            install,
+            save,
+            module,
+            seeds,
+            first_seed,
+            minutes,
+            until_flag,
+            until_area,
+            exit_prefix,
+            mark_flag,
+            watch,
+            at,
+            verbose,
+            save_to,
+        } => autoplay::run(&autoplay::Options {
+            install: &install,
+            module: &module,
+            save: &save,
+            seeds,
+            first_seed,
+            minutes,
+            until_flag: until_flag.as_deref(),
+            until_area: until_area.as_deref(),
+            exit_prefix: exit_prefix.as_deref(),
+            mark_flag: mark_flag.as_deref(),
+            watch: &watch,
+            at: &at,
+            verbose,
+            save_to: save_to.as_deref(),
         }),
         Command::Navgrid {
             install,

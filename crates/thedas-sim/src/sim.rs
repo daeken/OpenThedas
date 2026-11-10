@@ -108,6 +108,9 @@ pub enum ChargenPolicy {
 }
 
 /// Looks up an integer constant from the engine table (0 if absent).
+/// Movement speed (m/s) for a creature whose appearance gives none. Provisional.
+pub const DEFAULT_SPEED: f32 = 5.0;
+
 pub fn constant(table: &EngineTable, name: &str) -> i32 {
     match table.constant(name).map(|c| &c.value) {
         Some(ConstValue::Int(v)) => *v as i32,
@@ -717,7 +720,7 @@ impl Sim {
             if cmd.name.starts_with("CommandJumpTo") {
                 0
             } else {
-                (d / 5.0 * 1000.0) as u64
+                (d / self.move_speed(id) * 1000.0) as u64
             }
         } else {
             500
@@ -737,7 +740,25 @@ impl Sim {
         self.update_triggers(id);
     }
 
-    /// Walks an object to `to` at 5 m/s, running the world as it goes, so triggers on the
+    /// How fast a creature runs, in metres per second: its appearance's run speed in
+    /// `apr_base.gda` (the column hashing to 0xbd6d4446: 3.62 for humans, elves and
+    /// dwarves, 2.86 for walking corpses, 3.75 for the mabari, 1.42 for a revenant; taken to
+    /// be the run speed, provisional), else [`DEFAULT_SPEED`].
+    pub fn move_speed(&self, id: ObjectId) -> f32 {
+        const COL_RUN: u32 = 0xbd6d_4446;
+        let app = self.world.get(id).map(|o| o.appearance).filter(|&a| a > 0);
+        app.and_then(|a| {
+            let t = self.world.tables().get(0, "apr_base")?;
+            match t.cell_by_hash(COL_RUN, a as i64)? {
+                thedas_formats::gda::Cell::Float(v) if *v > 0.1 => Some(*v as f32),
+                thedas_formats::gda::Cell::Int(v) if *v > 0 => Some(*v as f32),
+                _ => None,
+            }
+        })
+        .unwrap_or(DEFAULT_SPEED)
+    }
+
+    /// Walks an object to `to` at its run speed, running the world as it goes, so triggers on the
     /// way fire and the world reacts. The route follows the area's pathing grid when there
     /// is one (see `nav`), otherwise a straight line in half-metre steps. Stops early when a
     /// conversation starts, the area changes, the walker dies or (for the hero) a fight
@@ -771,6 +792,7 @@ impl Sim {
                     .collect()
             }
         };
+        let speed = self.move_speed(id);
         let talking = self.talk.as_ref().is_some_and(|c| !c.ended);
         let combat = constant(&self.table, "GM_COMBAT");
         let hero_at_peace = Some(id) == self.world.hero && self.world.game_mode != combat;
@@ -787,7 +809,7 @@ impl Sim {
             if Some(id) == self.world.hero {
                 self.follow_leader(id);
             }
-            self.tick(((d / 5.0) * 1000.0).round().max(1.0) as u64);
+            self.tick(((d / speed) * 1000.0).round().max(1.0) as u64);
             prev = p;
             let o = self.world.get(id);
             let stopped = o.is_none_or(|o| o.dead || o.area != here)
@@ -970,7 +992,7 @@ impl Sim {
                     if cmd.name == "CommandAttack" {
                         if let Some((d, stop)) = self.approach_point(id, &cmd) {
                             let pos = self.world.get(id).map(|o| o.position);
-                            let due = now + ((d / 5.0) * 1000.0).max(1.0) as u64;
+                            let due = now + ((d / self.move_speed(id)) * 1000.0).max(1.0) as u64;
                             if let Some(c) =
                                 self.world.get_mut(id).and_then(|o| o.commands.first_mut())
                             {
@@ -1465,7 +1487,16 @@ fn apply_template(o: &mut crate::world::Object, t: &Gff3) {
     o.team = int(r, "TeamId").unwrap_or(-1);
     o.group = int(r, "GroupId").unwrap_or(0);
     o.rank = int(r, "Rank").unwrap_or(0);
-    o.appearance = int(r, "Appearance").unwrap_or(0);
+    // Placeables keep it at the top; creatures in their "Appearance Data" struct.
+    o.appearance = int(r, "Appearance")
+        .or_else(|| match field(r, "Appearance Data") {
+            Some(G3::Struct(i)) => t
+                .structs
+                .get(*i as usize)
+                .and_then(|a| int(a, "Appearance_Type")),
+            _ => None,
+        })
+        .unwrap_or(0);
     read_vars(t, r, &mut o.locals);
     for fl in &r.fields {
         if let Some(v) = int(r, &fl.label) {
@@ -2209,6 +2240,37 @@ mod tests {
         assert_eq!(
             o.commands.first().map(|c| (c.name.as_str(), c.approach)),
             Some(("CommandAttack", None))
+        );
+    }
+
+    #[test]
+    fn creatures_move_at_their_appearance_speed() {
+        use thedas_formats::gda::Cell;
+        let mut s = sim();
+        let t = crate::m2da::Tables::empty();
+        t.insert(
+            "apr_base",
+            &["ID", "Label", "#bd6d4446"],
+            vec![(
+                29,
+                vec![
+                    Cell::Int(29),
+                    Cell::String("Corpse E".into()),
+                    Cell::Float(2.5),
+                ],
+            )],
+        );
+        s.world.tables = Arc::new(t);
+        let (corpse, other) = (
+            s.world.spawn(ObjectKind::Creature, "corpse"),
+            s.world.spawn(ObjectKind::Creature, "other"),
+        );
+        s.world.get_mut(corpse).unwrap().appearance = 29;
+        assert_eq!(s.move_speed(corpse), 2.5);
+        assert_eq!(
+            s.move_speed(other),
+            DEFAULT_SPEED,
+            "no appearance row: the default"
         );
     }
 

@@ -59,38 +59,72 @@ impl Sim {
             return 0.0;
         }
         let tables = self.world.tables();
-        let (Some(defs), Some(stats)) =
-            (tables.get(0, "itemstatdefines"), tables.get(0, "itemstats"))
-        else {
+        let Some(defs) = tables.get(0, "itemstatdefines") else {
             return 0.0;
         };
-        let labels: Vec<String> = defs
+        let stats: Vec<i64> = defs
             .order
             .iter()
-            .filter(|&&r| match defs.cell_by_hash(COL_PROPERTY, r) {
+            .copied()
+            .filter(|&r| match defs.cell_by_hash(COL_PROPERTY, r) {
                 Some(thedas_formats::gda::Cell::Int(p)) => *p == property as i64,
                 _ => false,
             })
-            .map(|&r| crate::engine::cell_string(defs.cell("Label", r)))
-            .filter(|l| !l.is_empty())
             .collect();
-        if labels.is_empty() {
+        o.equipment
+            .values()
+            .flat_map(|&item| stats.iter().map(move |&r| (item, r)))
+            .map(|(item, r)| self.item_stat(item, r as i32))
+            .sum()
+    }
+
+    /// `GetItemStat`: an item's stat (a row of `itemstatdefines.gda`) from `itemstats.gda` by
+    /// its base item type, times its material's multiplier for that stat. The item's
+    /// `Material` is a row of `materialtypes.gda`, whose `Material` column is a tier in
+    /// `materialrules.gda` (Iron, Grey Iron, Steel, ... with Damage, Armor,
+    /// CritChanceModifier, ArmorPenetration, Spellpower and MissileDeflection multipliers;
+    /// script.ldf says GetItemStat includes the material modifier). Provisional: inferred
+    /// from the tables; stats without a material column are not scaled.
+    pub fn item_stat(&self, item: ObjectId, stat: i32) -> f32 {
+        use crate::engine::{cell_float, cell_string, clean};
+        let Some(it) = self.world.get(item) else {
+            return 0.0;
+        };
+        let Some(base) = it.fields.get("BaseItem").copied() else {
+            return 0.0;
+        };
+        let tables = self.world.tables();
+        let Some(label) = tables
+            .get(0, "itemstatdefines")
+            .map(|t| cell_string(t.cell("Label", stat as i64)))
+            .filter(|l| !l.is_empty())
+        else {
+            return 0.0;
+        };
+        let label = clean(&label).to_string();
+        let v = tables
+            .get(0, "itemstats")
+            .and_then(|t| t.cell(&label, base as i64).map(|c| cell_float(Some(c))))
+            .unwrap_or(0.0);
+        if v == 0.0 {
             return 0.0;
         }
-        let mut sum = 0.0;
-        for item in o.equipment.values() {
-            let Some(base) = self
-                .world
-                .get(*item)
-                .and_then(|i| i.fields.get("BaseItem").copied())
-            else {
-                continue;
-            };
-            for l in &labels {
-                sum += crate::engine::cell_float(stats.cell(crate::engine::clean(l), base as i64));
+        let tier = it.fields.get("Material").copied().and_then(|m| {
+            match tables.get(0, "materialtypes")?.cell("Material", m as i64)? {
+                thedas_formats::gda::Cell::Int(t) if *t > 0 => Some(*t),
+                _ => None,
             }
-        }
-        sum
+        });
+        let mult = tier
+            .and_then(|t| {
+                tables
+                    .get(0, "materialrules")?
+                    .cell(&label, t)
+                    .map(|c| cell_float(Some(c)))
+            })
+            .filter(|m| *m > 0.0)
+            .unwrap_or(1.0);
+        v * mult
     }
 
     /// `StoreFollowerInventory`: moves a creature's items (equipped ones too, remembering
@@ -373,5 +407,61 @@ mod tests {
                 (bag, 7, Some(hero), vec![blood])
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod stat_tests {
+    use std::sync::Arc;
+
+    use thedas_formats::gda::Cell;
+    use thedas_script::EngineTable;
+    use thedas_vfs::Vfs;
+
+    use crate::sim::Sim;
+    use crate::world::ObjectKind;
+
+    #[test]
+    fn item_stats_scale_by_material_and_add_to_linked_properties() {
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let t = crate::m2da::Tables::empty();
+        let (i, f, st) = (Cell::Int, Cell::Float, |x: &str| Cell::String(x.into()));
+        // Armor (stat 1) is linked to property 11; Damage (2) to nothing.
+        let defs_cols = ["ID", "Label", "NameStrRef", "#d6505aa1"];
+        let mut defs = vec![
+            (1, vec![i(1), st("Armor"), i(0), i(11)]),
+            (2, vec![i(2), st("Damage"), i(0), i(0)]),
+        ];
+        // The linked property column is known only by its hash.
+        let defs_cols: Vec<&str> = defs_cols.to_vec();
+        t.insert("itemstatdefines", &defs_cols, std::mem::take(&mut defs));
+        t.insert(
+            "itemstats",
+            &["ID", "Label", "Armor", "Damage"],
+            vec![(9, vec![i(9), st("Chest"), f(2.0), f(0.0)])],
+        );
+        t.insert(
+            "materialtypes",
+            &["ID", "Label", "Material"],
+            vec![(3, vec![i(3), st("Armor, Steel"), i(3)])],
+        );
+        t.insert(
+            "materialrules",
+            &["ID", "Label", "Armor"],
+            vec![(3, vec![i(3), st("Steel"), f(1.5)])],
+        );
+        s.world.tables = Arc::new(t);
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let chest = s.world.spawn(ObjectKind::Item, "chest");
+        s.world
+            .get_mut(chest)
+            .unwrap()
+            .fields
+            .extend([("BaseItem".to_string(), 9), ("Material".to_string(), 3)]);
+        assert_eq!(s.item_stat(chest, 1), 3.0, "2 armour, steel x1.5");
+        assert_eq!(s.equipment_bonus(c, 11), 0.0, "not worn yet");
+        s.world.get_mut(c).unwrap().equipment.insert(4, chest);
+        assert_eq!(s.equipment_bonus(c, 11), 3.0);
+        assert_eq!(s.equipment_bonus(c, 10), 0.0);
     }
 }

@@ -17,6 +17,7 @@ pub mod combat;
 pub mod dialog;
 pub mod engine;
 pub mod inventory;
+pub mod levelup;
 pub mod m2da;
 pub mod nav;
 pub mod plot;
