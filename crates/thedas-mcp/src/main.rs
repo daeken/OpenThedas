@@ -265,6 +265,9 @@ struct AreaArgs {
 struct SlotArgs {
     /// Slot name (default "quick").
     slot: Option<String>,
+    /// Also write to (save_state) or read from (load_state) this JSON file. Loading needs the
+    /// same module loaded.
+    path: Option<String>,
 }
 
 fn kind_name(k: ObjectKind) -> String {
@@ -1004,19 +1007,39 @@ impl Server {
         })
     }
 
-    #[tool(description = "Save the simulation state to an in-memory slot.")]
+    #[tool(
+        description = "Save the simulation state to an in-memory slot, and to a JSON file if path is given."
+    )]
     async fn save_state(&self, Parameters(a): Parameters<SlotArgs>) -> String {
         self.with_sim(|st| {
-            let snap = st.sim.as_ref().ok_or("no sim")?.snapshot();
+            let sim = st.sim.as_ref().ok_or("no sim")?;
+            let snap = sim.snapshot();
+            let mut out = json!({});
+            if let Some(path) = &a.path {
+                let bytes = sim.save_json().map_err(|e| e.to_string())?;
+                std::fs::write(path, &bytes).map_err(|e| format!("writing {path}: {e}"))?;
+                out["file"] = json!(path);
+                out["bytes"] = json!(bytes.len());
+            }
             let slot = a.slot.unwrap_or_else(|| "quick".into());
             st.slots.insert(slot.clone(), snap);
-            Ok(json!({ "saved": slot }))
+            out["saved"] = json!(slot);
+            Ok(out)
         })
     }
 
-    #[tool(description = "Restore the simulation state from an in-memory slot.")]
+    #[tool(
+        description = "Restore the simulation state from an in-memory slot, or from a JSON file written by save_state if path is given."
+    )]
     async fn load_state(&self, Parameters(a): Parameters<SlotArgs>) -> String {
         self.with_sim(|st| {
+            if let Some(path) = &a.path {
+                let bytes = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
+                let sim = st.sim.as_mut().ok_or("no sim")?;
+                sim.load_json(&bytes).map_err(|e| e.to_string())?;
+                st.trace_cursor = 0;
+                return Ok(json!({ "restored": path, "time_ms": sim.world.time_ms }));
+            }
             let slot = a.slot.unwrap_or_else(|| "quick".into());
             let snap = st.slots.get(&slot).cloned().ok_or("no such slot")?;
             let sim = st.sim.as_mut().ok_or("no sim")?;
