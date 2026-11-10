@@ -715,7 +715,7 @@ impl Server {
     }
 
     #[tool(
-        description = "A picture of what the party sees: the current area's level geometry from a camera behind the hero, with the open interface movies over it (ui=false for the scene alone). Creatures and placeables are not drawn yet."
+        description = "A picture of what the party sees: the current area's level geometry, creatures and placeables (in bind pose) from a camera behind the hero, with the open interface movies over it (ui=false for the scene alone)."
     )]
     async fn screenshot(&self, Parameters(a): Parameters<ShotArgs>) -> CallToolResult {
         let inputs = {
@@ -731,7 +731,13 @@ impl Server {
                     match (hero, sim.install_root.clone()) {
                         (Some((pos, facing, Some(area))), Some(root)) => {
                             match sim.area_layout(area) {
-                                Some(layout) => Ok((root, layout, pos, facing)),
+                                Some(layout) => Ok((
+                                    root,
+                                    layout,
+                                    pos,
+                                    facing,
+                                    thedas_ui::models::area_models(sim, area),
+                                )),
                                 None => Err("the area has no layout".to_string()),
                             }
                         }
@@ -740,7 +746,7 @@ impl Server {
                 }
             }
         };
-        let (root, layout, pos, facing) = match inputs {
+        let (root, layout, pos, facing, props) = match inputs {
             Ok(x) => x,
             Err(e) => return CallToolResult::error(vec![ContentBlock::text(err(e))]),
         };
@@ -750,7 +756,7 @@ impl Server {
         );
         let ui = a.ui.unwrap_or(true);
         // Behind and above the hero, looking along its facing, slightly down.
-        let yaw = facing.to_radians();
+        let yaw = thedas_sim::world::heading_of(facing).to_radians();
         let back = 4.0;
         let camera = thedas_render::Camera::new(
             glam::Vec3::new(
@@ -764,7 +770,7 @@ impl Server {
         let r = self
             .ui
             .run(move |w| -> Result<Vec<u8>, String> {
-                let scene = w.render_scene(&root, &layout, &camera, size)?;
+                let scene = w.render_scene(&root, &layout, &props, &camera, size)?;
                 w.compose(Some(scene), ui)
             })
             .await;

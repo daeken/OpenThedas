@@ -21,4 +21,4 @@ pub mod scene;
 pub use camera::Camera;
 pub use gpu::{AreaRenderer, GpuContext};
 pub use material::{ProgramRegistry, ProgramSource};
-pub use scene::AreaScene;
+pub use scene::{AreaScene, Prop, PropDraws, SceneProbe};

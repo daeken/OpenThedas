@@ -74,6 +74,9 @@ pub(crate) struct D3dPass {
     buffer: Option<wgpu::Buffer>,
     materials: Vec<SceneMaterial>,
     worlds: Vec<(glam::Mat4, Option<crate::scene::LightmapRef>, usize)>,
+    /// Each scene draw's irradiance probe.
+    probes: Vec<Option<usize>>,
+    scene_probes: Vec<thedas_formats::probe::IrradianceProbe>,
     ambient: Vec3,
     pub programs: Vec<String>,
 }
@@ -604,8 +607,17 @@ impl D3dPass {
                 .iter()
                 .map(|d| (d.transform, d.lightmap.clone(), d.material))
                 .collect(),
+            probes: scene.draws.iter().map(|d| d.probe).collect(),
+            scene_probes: scene.probes.iter().map(|p| p.probe.clone()).collect(),
             ambient,
             programs,
+        }
+    }
+
+    /// Sets scene draw `draw`'s model-to-world transform for the next frames.
+    pub fn set_world(&mut self, draw: usize, world: glam::Mat4) {
+        if let Some(w) = self.worlds.get_mut(draw) {
+            w.0 = world;
         }
     }
 
@@ -640,6 +652,13 @@ impl D3dPass {
                 lightmap: lightmap.as_ref(),
                 lights: &d.lights,
                 ambient: self.ambient,
+                bones: &[],
+                irradiance: self
+                    .probes
+                    .get(d.draw)
+                    .copied()
+                    .flatten()
+                    .and_then(|p| self.scene_probes.get(p)),
             };
             put(&mut data, d.slot, &cc.fill(program.vs.ctab.as_ref()), 0);
             put(&mut data, d.slot, &cc.fill(program.ps.ctab.as_ref()), 3);

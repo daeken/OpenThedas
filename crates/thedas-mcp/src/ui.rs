@@ -5,18 +5,35 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::mpsc;
 
+use thedas_ui::models::ObjectModel;
 use thedas_ui::protocol::GameMessage;
 use thedas_ui::stage::Stage;
 use thedas_ui::{Gpu, Rgba, UiValue};
 use thedas_vfs::Vfs;
+
+/// A level and the props placed in it, uploaded.
+pub struct LoadedScene {
+    /// The layout and each prop's object and models: a change reloads the scene.
+    key: (String, Vec<(u32, Vec<String>)>),
+    scene: thedas_render::AreaScene,
+    renderer: thedas_render::AreaRenderer,
+}
+
+/// What a capture shows: the level `layout` and the objects in it.
+fn scene_key(layout: &str, props: &[ObjectModel]) -> (String, Vec<(u32, Vec<String>)>) {
+    (
+        layout.to_string(),
+        props.iter().map(|p| (p.id, p.models.clone())).collect(),
+    )
+}
 
 /// Everything the UI thread owns.
 #[derive(Default)]
 pub struct UiWorld {
     gpu: Option<Gpu>,
     ctx: Option<thedas_render::GpuContext>,
-    /// The level loaded for scene captures: its layout name, resources and renderer.
-    scene: Option<(String, thedas_vfs::Vfs, thedas_render::AreaRenderer)>,
+    /// The level loaded for scene captures, with the simulation's models in it.
+    scene: Option<LoadedScene>,
     pub stage: Option<Stage>,
     /// Messages for the engine since the last read.
     pub messages: Vec<GameMessage>,
@@ -37,27 +54,41 @@ impl UiWorld {
         self.gpu.clone().ok_or_else(|| "no GPU".to_string())
     }
 
-    /// Renders the level `layout` from `camera` (RGBA8), loading it on first use. Uses the
-    /// game's Static1 shaders where they translate and the stand-in elsewhere.
+    /// Renders the level `layout` with the simulation's creatures and placeables (`props`)
+    /// from `camera` (RGBA8). The level loads again when the layout or the set of objects
+    /// changes; objects that only moved are moved. Uses the game's Static1, character and prop
+    /// shaders where they translate and the stand-in elsewhere.
     pub fn render_scene(
         &mut self,
         install: &std::path::Path,
         layout: &str,
+        props: &[ObjectModel],
         camera: &thedas_render::Camera,
         (w, h): (u32, u32),
     ) -> Result<Rgba, String> {
         self.gpu()?;
         let ctx = self.ctx.as_ref().ok_or("no GPU")?;
-        if self.scene.as_ref().map(|s| s.0.as_str()) != Some(layout) {
+        let key = scene_key(layout, props);
+        let placed: Vec<thedas_render::Prop> = props
+            .iter()
+            .map(|p| thedas_render::Prop {
+                label: format!("{} {}", p.id, p.tag),
+                models: p.models.clone(),
+                transform: thedas_render::Prop::placement(p.position, p.facing),
+            })
+            .collect();
+        if self.scene.as_ref().map(|s| &s.key) != Some(&key) {
+            self.scene = None;
             let inst = thedas_vfs::DaoInstall::open(install).map_err(|e| e.to_string())?;
             let mut vfs = inst
                 .global_vfs(thedas_vfs::install::TextureQuality::High)
                 .map_err(|e| e.to_string())?;
             inst.mount_level(&mut vfs, layout)
                 .map_err(|e| e.to_string())?;
-            let scene = thedas_render::AreaScene::load(&vfs, layout).map_err(|e| e.to_string())?;
+            let scene = thedas_render::AreaScene::load_with_props(&vfs, layout, &placed)
+                .map_err(|e| e.to_string())?;
             let mut programs = thedas_render::ProgramRegistry::default();
-            let filter = thedas_render::d3d::static1_filter();
+            let filter = thedas_render::d3d::object_filter();
             programs.push_front(Box::new(thedas_render::d3d::D3dSource::new(
                 &vfs, &scene, &filter,
             )));
@@ -68,10 +99,20 @@ impl UiWorld {
                 &programs,
                 thedas_render::gpu::CAPTURE_FORMAT,
             );
-            self.scene = Some((layout.to_string(), vfs, renderer));
+            self.scene = Some(LoadedScene {
+                key,
+                scene,
+                renderer,
+            });
         }
-        let (_, _, renderer) = self.scene.as_mut().ok_or("no scene")?;
-        let pixels = renderer
+        let loaded = self.scene.as_mut().ok_or("no scene")?;
+        for (i, p) in placed.iter().enumerate() {
+            loaded
+                .renderer
+                .move_prop(ctx, &loaded.scene, i, p.transform);
+        }
+        let pixels = loaded
+            .renderer
             .capture(ctx, camera, w, h)
             .map_err(|e| e.to_string())?;
         Ok(Rgba {

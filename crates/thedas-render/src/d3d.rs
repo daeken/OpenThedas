@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 use glam::{Mat4, Vec3, Vec4};
 use thedas_formats::material::{MaterialDef, Parameter};
+use thedas_formats::probe::IrradianceProbe;
 use thedas_formats::state::{CompareFunc, MaterialState, PassState};
 use thedas_shader::bytecode::{Comparison, TextureType};
 use thedas_shader::ctab::{Constant, ConstantTable, ParamClass, RegisterSet};
@@ -70,7 +71,7 @@ impl PartialEq for D3dProgram {
 }
 
 /// Which shader pairs [`D3dSource`] takes over. `None` takes every material whose technique
-/// translates.
+/// translates; a pixel shader of `*` matches any.
 pub type ShaderFilter = Option<Vec<(String, String)>>;
 
 /// Builds [`D3dProgram`]s for the materials of one scene. Shaders and states are read from the
@@ -162,10 +163,9 @@ impl D3dSource {
                 continue;
             };
             if let Some(f) = filter {
-                if !f
-                    .iter()
-                    .any(|(v, q)| v.eq_ignore_ascii_case(vs) && q.eq_ignore_ascii_case(ps))
-                {
+                if !f.iter().any(|(v, q)| {
+                    v.eq_ignore_ascii_case(vs) && (q == "*" || q.eq_ignore_ascii_case(ps))
+                }) {
                     continue;
                 }
             }
@@ -221,6 +221,20 @@ pub fn static1_filter() -> ShaderFilter {
     Some(v)
 }
 
+/// [`static1_filter`] plus the vertex shaders that draw creatures and placeables:
+/// characters (`Char1`), eyes (`Eye0`), cloth (`Cloth1`) and props (`Prop1`), with any pixel
+/// shader.
+pub fn object_filter() -> ShaderFilter {
+    let mut v = static1_filter().unwrap_or_default();
+    for vs in OBJECT_VERTEX_SHADERS {
+        v.push((vs.to_string(), "*".to_string()));
+    }
+    Some(v)
+}
+
+/// See [`object_filter`].
+pub const OBJECT_VERTEX_SHADERS: [&str; 4] = ["Char1.vsh", "Eye0.vsh", "Cloth1.vsh", "Prop1.vsh"];
+
 /// Point lights chosen for one draw, in slot order A, B, C.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DrawLights {
@@ -272,7 +286,22 @@ pub struct ConstantContext<'a> {
     pub lightmap: Option<&'a LightmapRef>,
     pub lights: &'a DrawLights,
     pub ambient: Vec3,
+    /// The skinning palette (`bsm_bones`): three rows of a 3x4 matrix per bone, in the
+    /// mesh chunk's bone order. Empty means every bone at rest (identity), i.e. bind pose.
+    pub bones: &'a [[f32; 4]],
+    /// The irradiance probe lighting the draw (`g_mLightParams`), if the level has one.
+    pub irradiance: Option<&'a IrradianceProbe>,
 }
+
+/// Light from every direction for draws in a level with no irradiance probe. Provisional.
+pub const NO_PROBE_IRRADIANCE: [f32; 3] = [0.35, 0.35, 0.35];
+
+/// The rows of an identity 3x4 bone matrix.
+pub const IDENTITY_BONE: [[f32; 4]; 3] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+];
 
 /// Register contents for one stage: floats, ints, bools.
 pub struct StageConstants {
@@ -343,6 +372,25 @@ impl ConstantContext<'_> {
             ("ShaderControlBooleans", _) | (_, "g_bShaderControlBooleans") => {
                 let n = self.lights.points.len();
                 Value::Bools(vec![false, n > 1, n > 2, false])
+            }
+            // Three 4x4 matrices, red, green and blue: the vertex shaders light a normal n
+            // with n^T M n (see `thedas_formats::probe`).
+            (_, "g_mLightParams") => Value::Vectors(
+                self.irradiance
+                    .cloned()
+                    .unwrap_or_else(|| IrradianceProbe::uniform(NO_PROBE_IRRADIANCE))
+                    .rows()
+                    .to_vec(),
+            ),
+            // Provisional: rows of 3x4 bone matrices, as the character vertex shaders read
+            // them (three `dp4`s per bone).
+            (_, "bsm_bones") => {
+                let n = c.count.max(1) as usize;
+                let mut v: Vec<[f32; 4]> = self.bones.iter().take(n).copied().collect();
+                while v.len() < n {
+                    v.push(IDENTITY_BONE[v.len() % 3]);
+                }
+                Value::Vectors(v)
             }
             ("FogParameters", _) | ("ShadowData", _) | ("IrradianceParams", _) => {
                 Value::Vectors(Vec::new())
@@ -579,6 +627,8 @@ mod tests {
             lightmap: Some(&lm),
             lights: &lights,
             ambient: Vec3::new(0.1, 0.2, 0.3),
+            bones: &[],
+            irradiance: None,
         };
         let t = table(vec![
             constant(

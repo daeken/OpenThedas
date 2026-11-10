@@ -12,6 +12,7 @@ pub mod atlas;
 pub mod avm1;
 pub mod binding;
 pub mod chains;
+pub mod models;
 pub mod protocol;
 pub mod stage;
 

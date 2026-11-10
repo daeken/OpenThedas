@@ -404,8 +404,9 @@ pub struct AreaRenderer {
     color_format: wgpu::TextureFormat,
     frame_buffer: wgpu::Buffer,
     frame_group: wgpu::BindGroup,
-    /// Kept alive for the draw bind group.
-    _draw_buffer: wgpu::Buffer,
+    draw_buffer: wgpu::Buffer,
+    /// Each scene draw's stand-in draw, if it has one.
+    stand_in_of: Vec<Option<usize>>,
     draw_group: wgpu::BindGroup,
     meshes: Vec<GpuMesh>,
     pipelines: Vec<(wgpu::RenderPipeline, BlendMode)>,
@@ -624,6 +625,7 @@ impl AreaRenderer {
         let mut opaque: Vec<(usize, DrawRef)> = Vec::new();
         let mut blended: Vec<(usize, DrawRef)> = Vec::new();
         let mut stand_in: Vec<Draw> = Vec::new();
+        let mut stand_in_of = vec![None; scene.draws.len()];
         for (di, d) in scene.draws.iter().enumerate() {
             let Some(pipeline) = material_program.get(d.material).copied().flatten() else {
                 if !matches!(d3d_programs.get(d.material), Some(Some(_))) {
@@ -659,6 +661,7 @@ impl AreaRenderer {
                 lightmap_group,
                 uniform_offset: offset,
             };
+            stand_in_of[di] = Some(stand_in.len());
             if pipelines[pipeline].1 == BlendMode::AlphaBlend {
                 blended.push((di, DrawRef::StandIn(stand_in.len())));
             } else {
@@ -692,7 +695,7 @@ impl AreaRenderer {
         let draw_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("draws"),
             contents: &uniforms,
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let draw_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("draws"),
@@ -711,7 +714,8 @@ impl AreaRenderer {
             color_format,
             frame_buffer,
             frame_group,
-            _draw_buffer: draw_buffer,
+            draw_buffer,
+            stand_in_of,
             draw_group,
             meshes,
             pipelines,
@@ -724,6 +728,40 @@ impl AreaRenderer {
             depth: None,
             light: StandInLight::default(),
             stats,
+        }
+    }
+
+    /// Moves scene draw `draw` to `transform` (model to world). The lights picked for it at
+    /// load stay.
+    pub fn set_transform(&mut self, ctx: &GpuContext, draw: usize, transform: glam::Mat4) {
+        if let Some(Some(i)) = self.stand_in_of.get(draw) {
+            let model = transform.to_cols_array_2d();
+            ctx.queue.write_buffer(
+                &self.draw_buffer,
+                self.stand_in[*i].uniform_offset as u64,
+                bytemuck::bytes_of(&model),
+            );
+        }
+        self.d3d.set_world(draw, transform);
+    }
+
+    /// Moves every draw of `scene`'s prop `prop` from where the scene placed it to
+    /// `transform`.
+    pub fn move_prop(
+        &mut self,
+        ctx: &GpuContext,
+        scene: &AreaScene,
+        prop: usize,
+        transform: glam::Mat4,
+    ) {
+        let Some(p) = scene.props.get(prop) else {
+            return;
+        };
+        let delta = transform * p.transform.inverse();
+        for d in p.draws.clone() {
+            if let Some(item) = scene.draws.get(d) {
+                self.set_transform(ctx, d, delta * item.transform);
+            }
         }
     }
 
@@ -1042,6 +1080,7 @@ mod tests {
                 sphere: (Vec3::new(5.0, 0.0, 0.0), 3.0),
                 model: "tri".into(),
                 room: "room".into(),
+                probe: None,
             }],
             ..Default::default()
         };

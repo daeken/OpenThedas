@@ -7,9 +7,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use glam::{Mat4, Quat, Vec3};
-use thedas_formats::level::Transform;
+use thedas_formats::level::{ArlRoom, LightmapBinding, Transform};
 use thedas_formats::material::{MaterialDef, MaterialObject, Technique};
 use thedas_formats::mesh::{DeclUsage, MeshChunk, Msh};
+use thedas_formats::probe::IrradianceProbe;
 use thedas_formats::{Arl, Mmh, Rml};
 use thedas_vfs::{Provenance, Vfs};
 
@@ -98,6 +99,8 @@ pub struct DrawItem {
     /// The placed model and room, for diagnostics.
     pub model: String,
     pub room: String,
+    /// The irradiance probe lighting it ([`AreaScene::probes`]).
+    pub probe: Option<usize>,
 }
 
 /// A light placed in the level (from the room's `_ll` light model).
@@ -129,6 +132,52 @@ pub struct AreaScene {
     pub provenance: BTreeMap<String, String>,
     /// Resources that were missing or failed to parse; the scene loads without them.
     pub warnings: Vec<String>,
+    /// The level's irradiance probes.
+    pub probes: Vec<SceneProbe>,
+    /// How many of `draws` are the level's own; the props' follow.
+    pub static_draws: usize,
+    /// The models the simulation placed, in the order given, with their draws.
+    pub props: Vec<PropDraws>,
+}
+
+/// A model (or several, drawn together) the simulation places in the level: a creature or a
+/// placeable.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Prop {
+    /// For diagnostics and lookups, e.g. the object's id and tag.
+    pub label: String,
+    /// Model resources without the `.mmh` extension.
+    pub models: Vec<String>,
+    /// Model to world.
+    pub transform: Mat4,
+}
+
+impl Prop {
+    /// The transform of a model standing at `position` with the game's `facing`: a
+    /// rotation of `facing` degrees about Z (models face +Y, so facing 0 looks along +Y).
+    pub fn placement(position: [f32; 3], facing: f32) -> Mat4 {
+        Mat4::from_translation(Vec3::from_array(position))
+            * Mat4::from_rotation_z(facing.to_radians())
+    }
+}
+
+/// An irradiance probe and the archive it came from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SceneProbe {
+    /// The `.mtx` resource.
+    pub name: String,
+    /// The archive's stem: a room (`hrt001d_0`) or the level (`ost000t`).
+    pub archive: String,
+    pub probe: IrradianceProbe,
+}
+
+/// One prop's draws in [`AreaScene::draws`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PropDraws {
+    pub label: String,
+    /// Where the prop was placed when the scene loaded.
+    pub transform: Mat4,
+    pub draws: std::ops::Range<usize>,
 }
 
 impl AreaScene {
@@ -159,6 +208,18 @@ pub fn transform_matrix(t: &Transform) -> Mat4 {
         Quat::IDENTITY
     };
     Mat4::from_rotation_translation(q, Vec3::from_array(t.position))
+}
+
+/// Where and how a model is placed, besides its transform.
+struct Placing<'a> {
+    /// Its uniform scale (for the fallback bounding sphere).
+    scale: f32,
+    /// World-space bounds the room layout gives, if any.
+    sphere: Option<(Vec3, f32)>,
+    lightmaps: &'a [LightmapBinding],
+    /// The room, or the prop's label.
+    room: &'a str,
+    probe: Option<usize>,
 }
 
 struct Loader<'a> {
@@ -332,7 +393,9 @@ impl<'a> Loader<'a> {
     }
 
     fn material(&mut self, mao_stem: &str) -> Option<usize> {
-        let key = format!("{}.mao", mao_stem.to_ascii_lowercase());
+        // Terrain chunks name their material with the extension, other meshes without.
+        let stem = mao_stem.to_ascii_lowercase();
+        let key = format!("{}.mao", stem.strip_suffix(".mao").unwrap_or(&stem));
         if let Some(i) = self.material_index.get(&key) {
             return *i;
         }
@@ -379,6 +442,169 @@ impl<'a> Loader<'a> {
         self.material_index.insert(key, index);
         index
     }
+
+    /// Reads every irradiance probe the mounted level carries (`<level>_probe_*.mtx`).
+    fn load_probes(&mut self, level: &str) {
+        let prefix = format!("{}_probe_", level.to_ascii_lowercase());
+        let names: Vec<String> = self
+            .vfs
+            .names()
+            .into_iter()
+            .filter(|n| {
+                let n = n.to_ascii_lowercase();
+                n.starts_with(&prefix) && n.ends_with(".mtx")
+            })
+            .collect();
+        for name in names {
+            let archive = self
+                .vfs
+                .lookup(&name)
+                .and_then(|p| {
+                    p.file
+                        .file_name()
+                        .map(|f| f.to_string_lossy().to_ascii_lowercase())
+                })
+                .map(|f| {
+                    f.trim_end_matches(".rim")
+                        .trim_end_matches(".erf")
+                        .trim_end_matches(".gpu")
+                        .to_string()
+                })
+                .unwrap_or_default();
+            let probe = match self.read(&name) {
+                Ok(d) => match IrradianceProbe::parse(&d) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.warn(format!("{name}: {e}"));
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    self.warn(e.to_string());
+                    continue;
+                }
+            };
+            self.scene.probes.push(SceneProbe {
+                name: name.to_ascii_lowercase(),
+                archive,
+                probe,
+            });
+        }
+    }
+
+    /// The probe of a room: the one in the room's own archive, else the level's, else the
+    /// first (provisional: the original's choice of probe is not known).
+    fn room_probe(&self, level: &str, room: &str) -> Option<usize> {
+        let room = room.to_ascii_lowercase();
+        let level = level.to_ascii_lowercase();
+        let find = |stem: &str| self.scene.probes.iter().position(|p| p.archive == stem);
+        (!room.is_empty())
+            .then(|| find(&room).or_else(|| find(&format!("{room}_0"))))
+            .flatten()
+            .or_else(|| find(&level))
+            .or_else(|| (!self.scene.probes.is_empty()).then_some(0))
+    }
+
+    /// Adds the draws (and lights) of one placed model: `placement` is model to world.
+    fn place(&mut self, model_name: &str, placement: Mat4, at: Placing<'_>) {
+        let Placing {
+            scale,
+            sphere,
+            lightmaps,
+            room,
+            probe,
+        } = at;
+        let Some(model) = self.model(model_name) else {
+            return;
+        };
+        for lp in model.lights() {
+            let m = lp
+                .chain
+                .iter()
+                .fold(placement, |m, t| m * transform_matrix(t));
+            let name = lp.name.unwrap_or("").to_string();
+            self.scene.lights.push(match lp.light {
+                thedas_formats::model::Light::Point { color, radius, .. } => SceneLight::Point {
+                    position: m.transform_point3(Vec3::ZERO),
+                    color: Vec3::new(color[0], color[1], color[2]),
+                    radius: *radius,
+                    name,
+                },
+                thedas_formats::model::Light::Ambient { color } => SceneLight::Ambient {
+                    color: Vec3::new(color[0], color[1], color[2]),
+                    name,
+                },
+            });
+        }
+        let pieces = model.mesh_pieces();
+        if pieces.is_empty() {
+            return;
+        }
+        let Some(msh_name) = model.mesh_file.clone() else {
+            self.warn(format!("{model_name}.mmh: mesh nodes but no .msh"));
+            return;
+        };
+        for piece in pieces {
+            let Some(mesh) = self.mesh(&msh_name, &piece.mesh.chunk) else {
+                continue;
+            };
+            let Some(material) = self.material(&piece.mesh.material) else {
+                continue;
+            };
+            let node = piece
+                .chain
+                .iter()
+                .fold(Mat4::IDENTITY, |m, t| m * transform_matrix(t));
+            let lightmap = piece.mesh.lightmap_id.as_ref().and_then(|id| {
+                lightmaps
+                    .iter()
+                    .find(|b| b.chunk.eq_ignore_ascii_case(id))
+                    .map(|b| LightmapRef {
+                        texture: b.texture.to_ascii_lowercase(),
+                        offset: b.offset,
+                        scale: b.scale,
+                    })
+            });
+            let transform = placement * node;
+            let sphere = sphere.unwrap_or_else(|| {
+                let m = &self.scene.meshes[mesh];
+                let (lo, hi) = m.vertices.iter().fold(
+                    (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+                    |(lo, hi), v| {
+                        let p = Vec3::from_array(v.position);
+                        (lo.min(p), hi.max(p))
+                    },
+                );
+                let c = transform.transform_point3((lo + hi) * 0.5);
+                (c, (hi - lo).length() * 0.5 * scale)
+            });
+            self.scene.draws.push(DrawItem {
+                mesh,
+                material,
+                transform,
+                lightmap,
+                sphere,
+                model: model_name.to_string(),
+                room: room.to_string(),
+                probe,
+            });
+        }
+    }
+}
+
+/// The smallest room whose bounds hold `p`.
+fn room_at(rooms: &[ArlRoom], p: Vec3) -> Option<&ArlRoom> {
+    rooms
+        .iter()
+        .filter(|r| (0..3).all(|i| r.bounds_min[i] <= p[i] && p[i] <= r.bounds_max[i]))
+        .min_by(|a, b| {
+            let vol = |r: &ArlRoom| {
+                (0..3)
+                    .map(|i| r.bounds_max[i] - r.bounds_min[i])
+                    .product::<f32>()
+            };
+            vol(a).total_cmp(&vol(b))
+        })
 }
 
 impl AreaScene {
@@ -388,6 +614,16 @@ impl AreaScene {
     /// Transform rule (provisional): `world = room * T(position) * R(rotation) * S(scale) *
     /// node chain`, where the node chain runs from the model root down to the mesh node.
     pub fn load(vfs: &Vfs, level: &str) -> Result<AreaScene, SceneError> {
+        Self::load_with_props(vfs, level, &[])
+    }
+
+    /// [`AreaScene::load`], then the models the simulation places (creatures and
+    /// placeables), each prop's draws after the level's (see [`AreaScene::props`]).
+    pub fn load_with_props(
+        vfs: &Vfs,
+        level: &str,
+        props: &[Prop],
+    ) -> Result<AreaScene, SceneError> {
         let mut l = Loader {
             vfs,
             scene: AreaScene {
@@ -409,9 +645,19 @@ impl AreaScene {
         l.scene.bounds = arl
             .bounds()
             .map(|(lo, hi)| (Vec3::from_array(lo), Vec3::from_array(hi)));
+        l.load_probes(level);
         for room in &arl.rooms {
             l.scene.rooms.push(room.name.clone());
-            let rml_name = format!("{}.rml", room.name);
+            let room_probe = l.room_probe(level, &room.name);
+            // Exterior (terrain) levels keep each sector's layout per level of detail:
+            // `<room>_0.rml` is the most detailed.
+            let mut rml_name = format!("{}.rml", room.name);
+            if l.vfs.lookup(&rml_name).is_none() {
+                let lod0 = format!("{}_0.rml", room.name);
+                if l.vfs.lookup(&lod0).is_some() {
+                    rml_name = lod0;
+                }
+            }
             let rml = match l.read(&rml_name).map(|d| Rml::parse(&d)) {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
@@ -425,89 +671,49 @@ impl AreaScene {
             };
             let room_m = transform_matrix(&rml.transform);
             for p in &rml.placements {
-                let Some(model) = l.model(&p.model) else {
-                    continue;
-                };
                 let placement = room_m
                     * transform_matrix(&p.transform)
                     * Mat4::from_scale(Vec3::splat(p.scale));
-                for lp in model.lights() {
-                    let m = lp
-                        .chain
-                        .iter()
-                        .fold(placement, |m, t| m * transform_matrix(t));
-                    let name = lp.name.unwrap_or("").to_string();
-                    l.scene.lights.push(match lp.light {
-                        thedas_formats::model::Light::Point { color, radius, .. } => {
-                            SceneLight::Point {
-                                position: m.transform_point3(Vec3::ZERO),
-                                color: Vec3::new(color[0], color[1], color[2]),
-                                radius: *radius,
-                                name,
-                            }
-                        }
-                        thedas_formats::model::Light::Ambient { color } => SceneLight::Ambient {
-                            color: Vec3::new(color[0], color[1], color[2]),
-                            name,
-                        },
-                    });
-                }
-                let pieces = model.mesh_pieces();
-                if pieces.is_empty() {
-                    continue;
-                }
-                let Some(msh_name) = model.mesh_file.clone() else {
-                    l.warn(format!("{}.mmh: mesh nodes but no .msh", p.model));
-                    continue;
-                };
-                for piece in pieces {
-                    let Some(mesh) = l.mesh(&msh_name, &piece.mesh.chunk) else {
-                        continue;
-                    };
-                    let Some(material) = l.material(&piece.mesh.material) else {
-                        continue;
-                    };
-                    let node = piece
-                        .chain
-                        .iter()
-                        .fold(Mat4::IDENTITY, |m, t| m * transform_matrix(t));
-                    let lightmap = piece.mesh.lightmap_id.as_ref().and_then(|id| {
-                        p.lightmaps
-                            .iter()
-                            .find(|b| b.chunk.eq_ignore_ascii_case(id))
-                            .map(|b| LightmapRef {
-                                texture: b.texture.to_ascii_lowercase(),
-                                offset: b.offset,
-                                scale: b.scale,
-                            })
-                    });
-                    let transform = placement * node;
-                    let sphere = match p.sphere {
-                        Some((c, r)) => (Vec3::from_array(c), r),
-                        None => {
-                            let m = &l.scene.meshes[mesh];
-                            let (lo, hi) = m.vertices.iter().fold(
-                                (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
-                                |(lo, hi), v| {
-                                    let p = Vec3::from_array(v.position);
-                                    (lo.min(p), hi.max(p))
-                                },
-                            );
-                            let c = transform.transform_point3((lo + hi) * 0.5);
-                            (c, (hi - lo).length() * 0.5 * p.scale)
-                        }
-                    };
-                    l.scene.draws.push(DrawItem {
-                        mesh,
-                        material,
-                        transform,
-                        lightmap,
+                let sphere = p.sphere.map(|(c, r)| (Vec3::from_array(c), r));
+                l.place(
+                    &p.model,
+                    placement,
+                    Placing {
+                        scale: p.scale,
                         sphere,
-                        model: p.model.clone(),
-                        room: room.name.clone(),
-                    });
-                }
+                        lightmaps: &p.lightmaps,
+                        room: &room.name,
+                        probe: room_probe,
+                    },
+                );
             }
+        }
+        l.scene.static_draws = l.scene.draws.len();
+        for prop in props {
+            let first = l.scene.draws.len();
+            let at = prop.transform.w_axis.truncate();
+            let probe = match room_at(&arl.rooms, at) {
+                Some(room) => l.room_probe(level, &room.name),
+                None => l.room_probe(level, ""),
+            };
+            for model in &prop.models {
+                l.place(
+                    model,
+                    prop.transform,
+                    Placing {
+                        scale: 1.0,
+                        sphere: None,
+                        lightmaps: &[],
+                        room: &prop.label,
+                        probe,
+                    },
+                );
+            }
+            l.scene.props.push(PropDraws {
+                label: prop.label.clone(),
+                transform: prop.transform,
+                draws: first..l.scene.draws.len(),
+            });
         }
         Ok(l.scene)
     }

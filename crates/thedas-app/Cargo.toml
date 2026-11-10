@@ -16,6 +16,7 @@ thedas-vfs.workspace = true
 thedas-formats.workspace = true
 thedas-render.workspace = true
 thedas-ui.workspace = true
+thedas-sim.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 winit.workspace = true

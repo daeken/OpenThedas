@@ -17,6 +17,7 @@
 //! - [`material`]: `.mao` material objects and `.mat` material definitions (XML).
 //! - [`state`]: `.sta` render states (XML).
 //! - [`dds`]: DDS textures, with a CPU decoder for BC1/2/3.
+//! - [`probe`]: irradiance probes (`.mtx`), the diffuse light characters and props receive.
 //! - [`anim`]: animation trees (`.anb`), animation lengths (`.gad`) and events (`.evt`).
 //!
 //! Interface:
@@ -34,6 +35,7 @@ pub mod level;
 pub mod material;
 pub mod mesh;
 pub mod model;
+pub mod probe;
 pub mod state;
 pub mod tlk;
 pub mod typed;
