@@ -143,21 +143,20 @@ fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>
             children.push(n);
         }
     }
+    // A mesh node without a chunk name (such as the `GOB` root of many props) only groups
+    // its children.
     let mesh = if kind == KIND_MESH {
         let d = Doc::new(gff, "mmh mesh");
-        let name = d.opt_str(id, field::NAME)?;
-        let chunk = d
-            .opt_str(id, field::MESH_CHUNK)?
-            .filter(|s| !s.is_empty())
-            .or_else(|| name.clone())
-            .ok_or_else(|| TypedError::Invalid("mmh mesh node without a chunk name".into()))?;
-        Some(MeshRef {
-            chunk,
-            material: d.opt_str(id, field::MESH_MATERIAL)?.unwrap_or_default(),
-            lightmap_id: d
-                .opt_str(id, field::MESH_LIGHTMAP_ID)?
-                .filter(|s| !s.is_empty()),
-        })
+        match d.opt_str(id, field::MESH_CHUNK)?.filter(|s| !s.is_empty()) {
+            Some(chunk) => Some(MeshRef {
+                chunk,
+                material: d.opt_str(id, field::MESH_MATERIAL)?.unwrap_or_default(),
+                lightmap_id: d
+                    .opt_str(id, field::MESH_LIGHTMAP_ID)?
+                    .filter(|s| !s.is_empty()),
+            }),
+            None => None,
+        }
     } else {
         None
     };
@@ -202,11 +201,13 @@ mod tests {
             ],
         );
         let bbox = b.add(b"bbox", vec![]);
+        // A chunk-less mesh node is a plain group.
+        let group = b.add(b"mshh", vec![(field::NAME, s("GOB"))]);
         let gob = b.add(
             b"node",
             vec![
                 (field::NAME, s("GOB")),
-                (field::CHILDREN, generic(&[t1, r1, bbox, mesh])),
+                (field::CHILDREN, generic(&[t1, r1, bbox, mesh, group])),
             ],
         );
         let root = b.add(
@@ -223,7 +224,7 @@ mod tests {
         let gob = &mmh.nodes[0];
         assert_eq!(gob.transform.position, [1.0, 2.0, 3.0]);
         assert_eq!(gob.transform.rotation, [0.0, 0.0, 1.0, 0.0]);
-        assert_eq!(gob.children.len(), 2, "trsl/rota fold into the parent");
+        assert_eq!(gob.children.len(), 3, "trsl/rota fold into the parent");
         let pieces = mmh.mesh_pieces();
         assert_eq!(pieces.len(), 1);
         assert_eq!(pieces[0].mesh.material, "wall_master");
