@@ -16,8 +16,11 @@ GFF3/GFF4/GDA/TLK parsers, checked against every file in a DA:O install by the c
 Milestone M1, "walk through one area", is in progress. Typed readers cover the whole chain from
 an area file to the GPU (areas, layouts, room layouts, models, meshes, materials, DDS), and
 `thedas-app` loads an area (the Spoiled Princess, `lgt101d`, by default) and lets you fly
-through it. It draws with a hand-written stand-in shader (diffuse times lightmap) for now;
-translating the original D3D9 shaders comes next.
+through it. World geometry is drawn with the game's own shaders: `thedas-shader` translates the
+D3D9 bytecode in `shaders.erf` to naga IR (all 532 shaders translate and validate), and the
+renderer binds constants, samplers and render states the way the material files describe.
+Materials outside the Static1 family fall back to a hand-written stand-in unless you pass
+`--shaders all`.
 
 ## Layout
 
@@ -25,7 +28,8 @@ translating the original D3D9 shaders comes next.
 | --- | --- |
 | `thedas-vfs` | ERF V2.0/V2.1/V2.2/V3.0 and RIM archives, DLC decryption, layered lookup with provenance, install discovery |
 | `thedas-formats` | GFF3 and GFF4 readers and writers, GDA tables, talk tables; typed readers for areas (`.are`), layouts (`.arl`, `.rml`), models (`.mmh`), meshes (`.msh`), materials (`.mao`, `.mat`) and DDS textures |
-| `thedas-render` | wgpu renderer: loads an area's static geometry, picks a program per material, draws and captures |
+| `thedas-shader` | D3D9 shader bytecode and constant-table parsing; translation to validated naga IR |
+| `thedas-render` | wgpu renderer: loads an area's static geometry, draws each material with its translated original shaders (or a stand-in), captures |
 | `thedas-app` | The `thedas-app` binary: a window with a free-fly camera, or a headless capture |
 | `thedas-cli` | The `thedas` tool: `ls`, `extract`, `dump`, `resolve`, `corpus` |
 
@@ -41,7 +45,8 @@ Planned crates follow the architecture doc: `thedas-script`, `thedas-sim`, `thed
 
 WASD moves, Q/E (or C/Space) go down/up, Shift is faster, hold the right mouse button or use the
 arrow keys to look, P prints the camera, F12 saves a PNG, Esc quits. `THEDAS_INSTALL` can stand in
-for `--install`.
+for `--install`. `--shaders original` (the default) uses the game's Static1 and Black shaders,
+`--shaders all` every original shader that translates, `--shaders standin` none.
 
 For side-by-side comparisons, render a fixed view with no window:
 

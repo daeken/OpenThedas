@@ -2080,6 +2080,7 @@ dependencies = [
  "clap",
  "serde_json",
  "thedas-formats",
+ "thedas-shader",
  "thedas-vfs",
 ]
 
@@ -2099,11 +2100,21 @@ dependencies = [
  "bytemuck",
  "glam",
  "log",
+ "naga",
  "pollster",
  "thedas-formats",
+ "thedas-shader",
  "thedas-vfs",
  "thiserror 2.0.21",
  "wgpu",
+]
+
+[[package]]
+name = "thedas-shader"
+version = "0.1.0"
+dependencies = [
+ "naga",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

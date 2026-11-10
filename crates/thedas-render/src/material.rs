@@ -50,15 +50,33 @@ pub struct MaterialProgram {
     pub cull_back: bool,
 }
 
+/// How a material is drawn.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Program {
+    /// A hand-written WGSL program using the [`bindings`] interface.
+    StandIn(MaterialProgram),
+    /// The material's own D3D9 shaders, translated (see [`crate::d3d`]).
+    D3d(std::sync::Arc<crate::d3d::D3dProgram>),
+}
+
+impl Program {
+    pub fn name(&self) -> &str {
+        match self {
+            Program::StandIn(p) => &p.name,
+            Program::D3d(p) => &p.name,
+        }
+    }
+}
+
 pub trait ProgramSource: Send + Sync {
     /// The program for a material, or `None` to let the next source decide.
-    fn program(&self, material: &SceneMaterial) -> Option<MaterialProgram>;
+    fn program(&self, material: &SceneMaterial) -> Option<Program>;
 }
 
 /// What a material resolves to after asking every source.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Resolved {
-    Draw(MaterialProgram),
+    Draw(Program),
     /// Not drawn (for example effects the stand-in does not cover).
     Skip,
 }
@@ -96,7 +114,13 @@ pub struct StandIn;
 pub const STAND_IN_WGSL: &str = include_str!("standin.wgsl");
 
 impl ProgramSource for StandIn {
-    fn program(&self, m: &SceneMaterial) -> Option<MaterialProgram> {
+    fn program(&self, m: &SceneMaterial) -> Option<Program> {
+        self.stand_in(m).map(Program::StandIn)
+    }
+}
+
+impl StandIn {
+    pub fn stand_in(&self, m: &SceneMaterial) -> Option<MaterialProgram> {
         let material = m.material_name();
         let semantic = m.semantic.to_ascii_lowercase();
         let class = m.render_class.as_deref().unwrap_or("").to_ascii_lowercase();
@@ -165,8 +189,8 @@ mod tests {
     fn stand_in_classifies_materials() {
         let reg = ProgramRegistry::default();
         let prog = |m| match reg.resolve(&m) {
-            Resolved::Draw(p) => Some((p.name, p.blend)),
-            Resolved::Skip => None,
+            Resolved::Draw(Program::StandIn(p)) => Some((p.name, p.blend)),
+            _ => None,
         };
         assert_eq!(
             prog(material("static.mat", "Default", Some("Opaque,Static1"))),
@@ -197,21 +221,23 @@ mod tests {
     fn earlier_sources_win() {
         struct Translated;
         impl ProgramSource for Translated {
-            fn program(&self, m: &SceneMaterial) -> Option<MaterialProgram> {
-                (m.material_name() == "static.mat").then(|| MaterialProgram {
-                    name: "translated-static1".into(),
-                    wgsl: Cow::Borrowed(""),
-                    vs_entry: "vs",
-                    fs_entry: "fs",
-                    blend: BlendMode::Opaque,
-                    cull_back: true,
+            fn program(&self, m: &SceneMaterial) -> Option<Program> {
+                (m.material_name() == "static.mat").then(|| {
+                    Program::StandIn(MaterialProgram {
+                        name: "translated-static1".into(),
+                        wgsl: Cow::Borrowed(""),
+                        vs_entry: "vs",
+                        fs_entry: "fs",
+                        blend: BlendMode::Opaque,
+                        cull_back: true,
+                    })
                 })
             }
         }
         let mut reg = ProgramRegistry::default();
         reg.push_front(Box::new(Translated));
         let name = |m| match reg.resolve(&m) {
-            Resolved::Draw(p) => p.name,
+            Resolved::Draw(p) => p.name().to_string(),
             Resolved::Skip => "skip".into(),
         };
         assert_eq!(

@@ -421,16 +421,25 @@ impl MaterialDef {
     /// Picks the technique for a semantic on a device with the given shader model and detail
     /// level: the first `Logic` block in document order (depth first) whose test passes and
     /// that holds a technique. A test passes when its shader model is at most `shader_model`
-    /// and its detail, if any, equals `detail` ignoring case. Provisional.
+    /// and its detail level, if any, is at most `detail` (LOW < MEDIUM < HIGH). Provisional:
+    /// the ordering is inferred from `static.mat`, whose opaque semantic offers only MEDIUM
+    /// and LOW SM3 techniques.
     pub fn select(&self, semantic: &str, shader_model: u32, detail: &str) -> Option<&Technique> {
+        fn rank(d: &str) -> u32 {
+            match d.to_ascii_uppercase().as_str() {
+                "LOW" => 0,
+                "MEDIUM" => 1,
+                "HIGH" => 2,
+                "VERYHIGH" | "VERY_HIGH" | "ULTRA" => 3,
+                _ => 1,
+            }
+        }
         fn passes(l: &Logic, sm: u32, detail: &str) -> bool {
             match &l.test {
                 None => true,
                 Some(t) => {
                     t.shader_model.is_none_or(|m| m <= sm)
-                        && t.detail
-                            .as_deref()
-                            .is_none_or(|d| d.eq_ignore_ascii_case(detail))
+                        && t.detail.as_deref().is_none_or(|d| rank(d) <= rank(detail))
                 }
             }
         }
@@ -531,6 +540,7 @@ mod tests {
         assert_eq!(pass(3, "MEDIUM").as_deref(), Some("Static1.psh"));
         assert_eq!(pass(3, "high").as_deref(), Some("Hi.psh"));
         assert_eq!(pass(3, "LOW").as_deref(), Some("SM2.psh"));
+        assert_eq!(pass(3, "VERYHIGH").as_deref(), Some("Hi.psh"));
         assert_eq!(pass(2, "MEDIUM").as_deref(), Some("SM2.psh"));
         assert_eq!(pass(1, "MEDIUM"), None);
         let t = mat.select("Default", 3, "medium").unwrap();

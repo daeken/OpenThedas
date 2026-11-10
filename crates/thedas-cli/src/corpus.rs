@@ -13,7 +13,9 @@ use anyhow::Result;
 use serde_json::json;
 use thedas_formats::gff3::{Gff3, is_gff3};
 use thedas_formats::gff4::{Gff4, is_gff4};
-use thedas_formats::{Area, Arl, Dds, Gda, MaterialDef, MaterialObject, Mmh, Msh, Rml, Tlk};
+use thedas_formats::{
+    Area, Arl, Dds, Gda, MaterialDef, MaterialObject, MaterialState, Mmh, Msh, Rml, Tlk,
+};
 use thedas_vfs::erf::sniff_version;
 use thedas_vfs::{DaoInstall, Erf, extension};
 
@@ -42,6 +44,8 @@ struct Stats {
     failures: BTreeMap<String, Vec<(String, String)>>,
     failure_counts: BTreeMap<String, u64>,
     archive_versions: BTreeMap<String, u64>,
+    /// Shader model counts (`vs_3_0`, `ps_2_1`, ...).
+    shader_models: BTreeMap<String, u64>,
 }
 
 impl Stats {
@@ -160,6 +164,9 @@ fn merge(into: &mut Stats, from: Stats, keep: usize) {
     into.loose_files += from.loose_files;
     for (k, v) in from.archive_versions {
         *into.archive_versions.entry(k).or_default() += v;
+    }
+    for (k, v) in from.shader_models {
+        *into.shader_models.entry(k).or_default() += v;
     }
     for (ext, s) in from.by_ext {
         let t = into.by_ext.entry(ext).or_default();
@@ -304,12 +311,52 @@ fn check_other(
         MaterialDef::parse(data)
             .map(|_| ())
             .map_err(|e| e.to_string())
+    } else if lower.ends_with(".sta.xml") {
+        MaterialState::parse(data)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     } else if ext == "dds" {
         Dds::parse(data).map(|_| ()).map_err(|e| e.to_string())
+    } else if ext == "fxo" {
+        return check_shader(data, location, stats, keep);
     } else {
         return;
     };
     typed_result(stats, ext, location, result, keep);
+}
+
+/// Shaders: parse the D3D9 bytecode, translate it to naga IR and validate it. Failures are
+/// grouped by the missing opcode or feature, so coverage gaps show up as counts.
+fn check_shader(data: &[u8], location: String, stats: &mut Stats, keep: usize) {
+    let result = match thedas_shader::Shader::parse(data) {
+        Err(e) => Err(("parse".to_string(), e.to_string())),
+        Ok(shader) => {
+            *stats
+                .shader_models
+                .entry(format!(
+                    "{}_{}_{}",
+                    if shader.stage == thedas_shader::Stage::Vertex {
+                        "vs"
+                    } else {
+                        "ps"
+                    },
+                    shader.major,
+                    shader.minor
+                ))
+                .or_default() += 1;
+            thedas_shader::translate(&shader, &Default::default())
+                .map(|_| ())
+                .map_err(|e| (e.key(), e.to_string()))
+        }
+    };
+    let es = stats.by_ext.entry("fxo".into()).or_default();
+    match result {
+        Ok(()) => es.typed_ok += 1,
+        Err((key, msg)) => {
+            es.typed_failed += 1;
+            stats.fail(&format!("shader/{key}"), location, msg, keep);
+        }
+    }
 }
 
 fn check_data(
@@ -440,6 +487,9 @@ fn print_summary(stats: &Stats, secs: f64) -> bool {
         stats.loose_files,
         stats.archive_versions
     );
+    if !stats.shader_models.is_empty() {
+        println!("Shader models: {:?}", stats.shader_models);
+    }
     println!(
         "\n{:<8} {:>9} {:>10} {:>9} {:>8} {:>7} {:>7} {:>9} {:>10} {:>10} {:>8}",
         "ext",
@@ -535,6 +585,7 @@ fn to_report(stats: &Stats, ok: bool) -> serde_json::Value {
         "archives": stats.archives,
         "archives_failed": stats.archives_failed,
         "archive_versions": stats.archive_versions,
+        "shader_models": stats.shader_models,
         "loose_gff4_files": stats.loose_files,
         "by_extension": by_ext,
         "failure_counts": stats.failure_counts,
