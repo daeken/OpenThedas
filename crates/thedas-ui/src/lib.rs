@@ -246,6 +246,19 @@ pub struct UiMovie {
     shared: Arc<Shared>,
     fetches: navigator::FetchLog,
     size: (u32, u32),
+    /// Token observers the movie registered: callback id -> engine value name.
+    observers: std::collections::BTreeMap<String, String>,
+    /// The value last pushed to each observer.
+    sent: std::collections::HashMap<String, UiValue>,
+}
+
+/// Turns a callback id from the movie (a number) into its `cm_mapCallbacks` key.
+fn callback_key(v: &UiValue) -> Option<String> {
+    match v {
+        UiValue::Number(n) if n.fract() == 0.0 => Some(format!("{}", *n as i64)),
+        UiValue::String(s) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
 }
 
 impl UiMovie {
@@ -302,6 +315,8 @@ impl UiMovie {
             shared,
             fetches,
             size,
+            observers: Default::default(),
+            sent: Default::default(),
         })
     }
 
@@ -387,6 +402,57 @@ impl UiMovie {
             PlayerEvent::MouseUp { x, y, button }
         };
         self.with_player(|p| p.handle_event(ev));
+    }
+
+    /// The engine side of the movies' `TokenManager`: collects observers registered with
+    /// `AddTokenObserverWithID` (batched as `[id, token, flags]` triples in
+    /// `TokenManager.AddTokenObserverBatchData`) and removed ones, then pushes each observed
+    /// value that changed to `TokenManager.cm_mapCallbacks[id](value)`. `value` answers a
+    /// token or returns `None` (the observer is then left alone). Returns the tokens nothing
+    /// answered. Provisional, from the movies' bytecode.
+    pub fn sync_tokens(&mut self, value: &dyn Fn(&str) -> Option<UiValue>) -> Vec<String> {
+        const TM: &str = "_global.TokenManager";
+        let take = |m: &mut Self, list: &str| match m
+            .call(&format!("{TM}.{list}.splice"), &[UiValue::Number(0.0)])
+        {
+            UiValue::List(v) => v,
+            _ => Vec::new(),
+        };
+        let added = take(self, "AddTokenObserverBatchData");
+        for t in added.chunks(3) {
+            if let (Some(id), Some(UiValue::String(token))) =
+                (t.first().and_then(callback_key), t.get(1))
+            {
+                self.observers.insert(id, token.clone());
+            }
+        }
+        for r in take(self, "RemoveTokenObserverBatchData") {
+            if let Some(id) = callback_key(&r) {
+                self.observers.remove(&id);
+                self.sent.remove(&id);
+            }
+        }
+        let mut missing = Vec::new();
+        let observers: Vec<(String, String)> = self
+            .observers
+            .iter()
+            .map(|(a, b)| (a.clone(), b.clone()))
+            .collect();
+        for (id, token) in observers {
+            match value(&token) {
+                Some(v) => {
+                    if self.sent.get(&id) != Some(&v) {
+                        self.call(
+                            &format!("{TM}.cm_mapCallbacks.{id}"),
+                            std::slice::from_ref(&v),
+                        );
+                        self.sent.insert(id, v);
+                    }
+                }
+                None => missing.push(token),
+            }
+        }
+        missing
     }
 
     /// Calls a movie function by path, as Scaleform's `Invoke` does
