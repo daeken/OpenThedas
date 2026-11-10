@@ -311,6 +311,9 @@ pub struct World {
     /// Objects to remove at a time (projectiles when they land).
     #[serde(default)]
     pub destroy_at: Vec<(u64, ObjectId)>,
+    /// Events for objects in an unloaded area, waiting for the party to come back.
+    #[serde(default)]
+    pub held: Vec<QueuedEvent>,
     /// The world map (see `worldmap`).
     #[serde(default)]
     pub world_map: crate::worldmap::WorldMapState,
@@ -410,6 +413,7 @@ impl World {
             party_fighting: false,
             autopilot: false,
             destroy_at: Vec::new(),
+            held: Vec::new(),
             world_map: Default::default(),
             rng: Rng::new(seed),
             trace: Trace::default(),
