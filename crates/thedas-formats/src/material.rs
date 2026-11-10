@@ -193,6 +193,13 @@ impl MaterialObject {
                 let name = req(&n, "Vector4fArray", "Name")?;
                 let v = floats("Vector4fArray", name, req(&n, "Vector4fArray", "value")?)?;
                 mao.vector_arrays.push((name.to_string(), v));
+            } else if is(&n, "Matrix4x4f") {
+                // A matrix fills four registers, a row each, in the order written
+                // (terrain's per-layer UV scales). Provisional.
+                let name = req(&n, "Matrix4x4f", "Name")?;
+                let mut v = floats("Matrix4x4f", name, req(&n, "Matrix4x4f", "value")?)?;
+                v.resize(16, 0.0);
+                mao.vector_arrays.push((name.to_string(), v));
             }
         }
         if mao.material.is_empty() {
@@ -482,6 +489,7 @@ mod tests {
 	<texture Name='mml_tNormalMap' ResName='test_n' />
 	<Float Name="mml_fOpacityMultiplier" value="0.5"></Float>
 	<Vector4f Name="mml_vTintColor" value="1 0.5 0.25 1"></Vector4f>
+	<Matrix4x4f Name="mml_mUVScaleValues" value="10 15 10 10 9 6 10 10"></Matrix4x4f>
 </MaterialObject>"#;
 
     const MAT: &str = r#"<?xml version="1.0" encoding="UTF-8" ?>
@@ -554,6 +562,10 @@ mod tests {
         assert!(mao.texture("mml_tLightmap").unwrap().requires_id);
         assert_eq!(mao.floats, vec![("mml_fOpacityMultiplier".into(), 0.5)]);
         assert_eq!(mao.vectors[0].1, [1.0, 0.5, 0.25, 1.0]);
+        let (name, m) = &mao.vector_arrays[0];
+        assert_eq!(name, "mml_mUVScaleValues");
+        assert_eq!(m.len(), 16);
+        assert_eq!(&m[..8], &[10.0, 15.0, 10.0, 10.0, 9.0, 6.0, 10.0, 10.0]);
     }
 
     #[test]

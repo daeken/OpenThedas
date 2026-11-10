@@ -255,7 +255,7 @@ pub fn static1_filter() -> ShaderFilter {
 /// [`static1_filter`] plus the vertex shaders that draw creatures and placeables:
 /// characters (`Char1`), hair (`Hair0_Pass1`, `Hair0`: four passes), faces (`Face1`), eyes
 /// and lashes (`Eye0`), cloth (`Cloth1`), props (`Prop1`) and weapons (`Weapon1`), with any
-/// pixel shader.
+/// pixel shader; and exterior terrain (`Terrain2`, terrain.mat's high-detail pass).
 pub fn object_filter() -> ShaderFilter {
     let mut v = static1_filter().unwrap_or_default();
     for vs in OBJECT_VERTEX_SHADERS {
@@ -265,7 +265,7 @@ pub fn object_filter() -> ShaderFilter {
 }
 
 /// See [`object_filter`].
-pub const OBJECT_VERTEX_SHADERS: [&str; 8] = [
+pub const OBJECT_VERTEX_SHADERS: [&str; 9] = [
     "Char1.vsh",
     "Hair0_Pass1.vsh",
     "Hair0.vsh",
@@ -274,6 +274,7 @@ pub const OBJECT_VERTEX_SHADERS: [&str; 8] = [
     "Cloth1.vsh",
     "Prop1.vsh",
     "Weapon1.vsh",
+    "Terrain2.vsh",
 ];
 
 /// Point lights chosen for one draw, in slot order A, B, C.
@@ -424,13 +425,28 @@ impl ConstantContext<'_> {
         let usage = find_param(self.material, &c.name).and_then(|p| p.usage.clone());
         let usage = usage.as_deref().unwrap_or("");
         let world_view = self.view * self.world;
-        Some(match (usage, c.name.as_str()) {
-            ("ModelViewProjectionTrans", _) | (_, "aur_mWorldViewProj") => {
-                Value::Matrix(self.projection * world_view)
+        // Matrices: a usage ending in `Trans` (`ModelViewProjectionTrans`, `PartTrans`) is
+        // the layout the shaders bound to it read as rows (`mad` by the vertex's
+        // components); the plain usages (`ModelViewProjection`, `Part`, `ModelView`, `View`,
+        // `ViewInv`) are its transpose, which their shaders read with `dp4` (Terrain2,
+        // Static1's view depth). A matrix known only by name takes the `Trans` layout.
+        // Provisional, from the shaders' code and the material definitions' usages.
+        let matrix = match (usage, c.name.as_str()) {
+            ("ModelViewProjectionTrans" | "ModelViewProjection", _) | (_, "aur_mWorldViewProj") => {
+                Some(self.projection * world_view)
             }
-            ("PartTrans", _) | (_, "aur_mWorld") => Value::Matrix(self.world),
-            ("ModelView", _) | (_, "aur_mModelView") => Value::Matrix(world_view),
-            ("View", _) => Value::Matrix(self.view),
+            ("PartTrans" | "Part", _) | (_, "aur_mWorld") => Some(self.world),
+            ("ModelView", _) | (_, "aur_mModelView") => Some(world_view),
+            ("View", _) => Some(self.view),
+            ("ViewInv", _) => Some(self.view.inverse()),
+            ("Projection", _) => Some(self.projection),
+            _ => None,
+        };
+        if let Some(m) = matrix {
+            let plain = !usage.is_empty() && !usage.ends_with("Trans");
+            return Some(Value::Matrix(if plain { m.transpose() } else { m }));
+        }
+        Some(match (usage, c.name.as_str()) {
             ("CameraPosition", _) | (_, "g_vCameraPosition") => {
                 Value::Vectors(vec![[self.camera.x, self.camera.y, self.camera.z, 1.0]])
             }
@@ -818,6 +834,62 @@ mod tests {
             ParamClass::Vector,
         )])));
         assert_eq!(c.floats[3], [0.25, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn plain_matrix_usages_are_the_transpose_of_trans_ones() {
+        let def = |usage: &str| {
+            MaterialDef::parse(
+                format!(
+                    r#"<Material Name="m"><ParameterSet Name="p">
+                    <InternalParameter Type="Matrix4x4f" Name="aur_mWorld" Usage="{usage}"/>
+                    </ParameterSet></Material>"#
+                )
+                .as_bytes(),
+            )
+            .unwrap()
+        };
+        let world = Mat4::from_translation(Vec3::new(7.0, 8.0, 9.0));
+        let lights = DrawLights::default();
+        let regs = |usage: &str| {
+            let material = SceneMaterial {
+                mao: "m.mao".into(),
+                object: MaterialObject::parse(
+                    br#"<MaterialObject Name="m"><Material Name="m.mat"/></MaterialObject>"#,
+                )
+                .unwrap(),
+                definition: Some(Arc::new(def(usage))),
+                semantic: "Default".into(),
+                render_class: None,
+                technique: None,
+            };
+            let cc = ConstantContext {
+                view: Mat4::IDENTITY,
+                projection: Mat4::IDENTITY,
+                world,
+                camera: Vec3::ZERO,
+                material: &material,
+                lightmap: None,
+                lights: &lights,
+                ambient: Vec3::ZERO,
+                bones: &[],
+                irradiance: None,
+            };
+            let c = cc.fill(Some(&table(vec![constant(
+                "aur_mWorld",
+                RegisterSet::Float4,
+                0,
+                4,
+                ParamClass::MatrixRows,
+            )])));
+            c.floats[..4].to_vec()
+        };
+        // `PartTrans` (read with mad): the translation is the fourth register.
+        assert_eq!(regs("PartTrans")[3], [7.0, 8.0, 9.0, 1.0]);
+        // `Part` (read with dp4): the translation is each register's w.
+        let plain = regs("Part");
+        assert_eq!([plain[0][3], plain[1][3], plain[2][3]], [7.0, 8.0, 9.0]);
+        assert_eq!(plain[3], [0.0, 0.0, 0.0, 1.0]);
     }
 
     #[test]
