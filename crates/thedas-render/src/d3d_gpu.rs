@@ -397,7 +397,14 @@ fn create_pipeline(
             format: DEPTH_FORMAT,
             depth_write_enabled: Some(pass.z_enable && pass.z_write),
             depth_compare: Some(if pass.z_enable {
-                compare(pass.z_func)
+                // An "equal" test (a later pass drawing exactly over an earlier one's depth,
+                // as hair's passes do) becomes "less or equal": the passes' shaders are
+                // translated separately and need not reach bit-identical depths
+                // (provisional).
+                match compare(pass.z_func) {
+                    wgpu::CompareFunction::Equal => wgpu::CompareFunction::LessEqual,
+                    c => c,
+                }
             } else {
                 wgpu::CompareFunction::Always
             }),

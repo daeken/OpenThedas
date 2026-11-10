@@ -321,7 +321,8 @@ impl MaterialState {
         } else {
             None
         };
-        let color_write = match get("DS_COLORWRITEENABLE") {
+        // Some states (the hair passes) name it DS_COLORWRITEMASK.
+        let color_write = match get("DS_COLORWRITEENABLE").or_else(|| get("DS_COLORWRITEMASK")) {
             None => 0xf,
             Some(v) => match v.parse::<u32>() {
                 Ok(n) => (n & 0xf) as u8,
@@ -437,6 +438,10 @@ mod tests {
             ))
         );
         assert!(!p.z_write);
+        let depth_only = br#"<MaterialState Name="h">
+            <DeviceState State = "DS_COLORWRITEMASK" Value = "0"/></MaterialState>"#;
+        let p = MaterialState::parse(depth_only).unwrap().pass().unwrap();
+        assert_eq!(p.color_write, 0, "DS_COLORWRITEMASK is the same setting");
         let odd = br#"<MaterialState Name="b">
             <DeviceState State="DS_ALPHABLENDENABLE" Value="TRUE" />
             <DeviceState State="DS_SRCBLEND" Value="BLEND_ALPHA" /></MaterialState>"#;

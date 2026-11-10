@@ -238,10 +238,11 @@ pub fn static1_filter() -> ShaderFilter {
 }
 
 /// [`static1_filter`] plus the vertex shaders that draw creatures and placeables:
-/// characters (`Char1`), faces (`Face1`), eyes (`Eye0`), cloth (`Cloth1`) and props
-/// (`Prop1`), with any pixel shader. Still on the stand-in: weapons (`Weapon1`; their tint
-/// colours come from the item's material, not read yet), hair (`Hair0`, four passes, which
-/// draw nothing yet) and lashes (`sm2_Eye0`, whose alpha test does not cut them out yet).
+/// characters (`Char1`), hair (`Hair0_Pass1`, `Hair0`: four passes), faces (`Face1`), eyes
+/// (`Eye0`), cloth (`Cloth1`) and props (`Prop1`), with any pixel shader. Still on the
+/// stand-in: weapons (`Weapon1`, which draw black on the translated path for a reason not
+/// yet found) and lashes (`sm2_Eye0`, whose alpha test does not cut them out yet). Hair
+/// draws darker than its morph's colours (cause not yet found).
 pub fn object_filter() -> ShaderFilter {
     let mut v = static1_filter().unwrap_or_default();
     for vs in OBJECT_VERTEX_SHADERS {
@@ -251,8 +252,10 @@ pub fn object_filter() -> ShaderFilter {
 }
 
 /// See [`object_filter`].
-pub const OBJECT_VERTEX_SHADERS: [&str; 5] = [
+pub const OBJECT_VERTEX_SHADERS: [&str; 7] = [
     "Char1.vsh",
+    "Hair0_Pass1.vsh",
+    "Hair0.vsh",
     "Face1.vsh",
     "Eye0.vsh",
     "Cloth1.vsh",

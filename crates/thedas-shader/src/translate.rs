@@ -1322,15 +1322,17 @@ fn pixel_interface(g: &mut Gen) -> Result<(String, String, String, String)> {
             Comparison::Ne => "!=",
             Comparison::Le => "<=",
         };
+        // D3D9 tests the pixel's alpha as an 8-bit value against the 8-bit reference
+        // (ALPHAREF), so an alpha a hair under 1.0 still passes `>= 255`.
         let a = if g.color_outputs.contains(&0) {
-            "saturate(oc0.w)"
+            "round(saturate(oc0.w) * 255.0)"
         } else {
             "0.0"
         };
         let _ = writeln!(
             epi,
             "    if (!({a} {o} {})) {{ discard; }}",
-            flit(reference)
+            flit((reference * 255.0).round())
         );
     }
     epi.push_str("    var out: StageOut;\n");
@@ -1393,6 +1395,11 @@ mod tests {
             tr.wgsl
         );
         assert!(tr.wgsl.contains("discard"));
+        assert!(
+            tr.wgsl.contains("round(saturate(oc0.w) * 255.0) > 128"),
+            "alpha tests compare 8-bit alpha: {}",
+            tr.wgsl
+        );
         assert_eq!(tr.interface.samplers, vec![(0, TextureType::Tex2D)]);
         assert_eq!(tr.interface.inputs[0].location, 0);
         assert_eq!(tr.interface.color_outputs, vec![0]);
