@@ -104,6 +104,10 @@ pub struct Object {
     /// Non-party followers (`AddNonPartyFollower`): they follow but are not in the party.
     #[serde(default)]
     pub escorts: Vec<ObjectId>,
+    /// Inventories stored on this container (`StoreFollowerInventory`): by owner, each item
+    /// with the equipment slot it was in (-1 for none).
+    #[serde(default)]
+    pub stored: BTreeMap<ObjectId, Vec<(ObjectId, i32)>>,
     pub effects: Vec<Effect>,
     /// Combat bookkeeping (perception, threat, the pending attack); see `combat`.
     #[serde(default)]
@@ -148,6 +152,7 @@ impl Object {
             commands: Vec::new(),
             followers: Vec::new(),
             escorts: Vec::new(),
+            stored: BTreeMap::new(),
             effects: Vec::new(),
             combat: Default::default(),
             abilities: std::collections::BTreeSet::new(),

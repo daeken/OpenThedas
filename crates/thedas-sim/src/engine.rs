@@ -1867,6 +1867,25 @@ pub fn call(
         // The action a click would take. Provisional: the game derives it from the
         // placeable's state controller; here an area-transition destination makes it a
         // transition, a conversation a dialog, and anything else a plain use.
+        "StoreFollowerInventory" => {
+            h.sim.store_inventory(obj(a, 0), obj(a, 1), true);
+            void()
+        }
+        "RestoreFollowerInventory" => {
+            h.sim.restore_inventory(obj(a, 0), obj(a, 1));
+            void()
+        }
+        // The party inventory is the hero's backpack (not what anyone wears). Provisional.
+        "StorePartyInventory" | "RestorePartyInventory" => {
+            if let Some(hero) = h.sim.world.hero {
+                if name == "StorePartyInventory" {
+                    h.sim.store_inventory(hero, obj(a, 0), false);
+                } else {
+                    h.sim.restore_inventory(hero, obj(a, 0));
+                }
+            }
+            void()
+        }
         "GetPlaceableAction" => {
             let o = h.object(obj(a, 0));
             let dest = o.is_some_and(|o| {
