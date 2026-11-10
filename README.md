@@ -143,6 +143,7 @@ Then ask Claude to, say, "load the Spoiled Princess and talk to the innkeeper". 
 | `move_hero`, `enter_area`, `list_areas` | Move around and travel |
 | `plot_flag`, `local` | Read or set plot flags and local variables |
 | `call_engine_function`, `run_script` | Call any engine function or compiled script directly |
+| `chargen_event` | Drive character creation yourself after `load` with `chargen: "manual"` (by default a new game takes the chargen script's defaults and starts the origin) |
 | `save_state`, `load_state` | Snapshot and restore the world, in memory or to a JSON file (`path`) |
 | `ui_open`, `ui_close` | Play interface movies (`menu`, `hud`, `startmenu2`, any movie names) on a headless GPU, bound to the simulation |
 | `ui_screenshot` | The open movies as a PNG image |

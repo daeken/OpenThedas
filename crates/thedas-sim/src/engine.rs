@@ -1133,6 +1133,23 @@ pub fn call(
         }
 
         // --- Conversation -----------------------------------------------------------------
+        "DoAreaTransition" => {
+            let area = string(a, 0);
+            if area.is_empty() {
+                return ok(Value::Int(0));
+            }
+            h.sim.world.transition = Some((area, string(a, 1)));
+            ok(Value::Int(1))
+        }
+        "LoadCutscene" => {
+            h.sim.world.cutscenes.push(string(a, 0));
+            void()
+        }
+        "PreloadCharGen" => void(),
+        "StartCharGen" => {
+            h.sim.start_chargen(obj(a, 0), int(a, 1), int(a, 2));
+            void()
+        }
         "BeginConversation" => {
             let ok_ = h
                 .sim
@@ -1153,6 +1170,43 @@ pub fn call(
                     .and_then(|o| o.fields.get(field).copied())
                     .unwrap_or(0),
             ))
+        }
+        "GetCreatureGender" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .and_then(|o| o.fields.get("Gender").copied())
+                .unwrap_or(0),
+        )),
+        "SetCreatureRacialType" | "SetCreatureGender" | "SetMaxInventorySize" => {
+            let field = match name {
+                "SetCreatureRacialType" => "Race",
+                "SetCreatureGender" => "Gender",
+                _ => "MaxInventorySize",
+            };
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields.insert(field.to_string(), int(a, 1));
+            }
+            void()
+        }
+        "SetAppearanceType" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.appearance = int(a, 1);
+            }
+            void()
+        }
+        "SetCreatureRank" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.rank = int(a, 1);
+            }
+            void()
+        }
+        "GetAbilityCount" => ok(Value::Int(
+            h.object(obj(a, 0)).map_or(0, |o| o.abilities.len() as i32),
+        )),
+        "CharGen_ClearAbilityList" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.abilities.clear();
+            }
+            void()
         }
         "GetBaseItemType" => ok(Value::Int(
             h.object(obj(a, 0))

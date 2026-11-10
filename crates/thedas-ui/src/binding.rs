@@ -3,7 +3,7 @@
 //!
 //! Provisional: key names come from the movies' bytecode, and their meanings are inferred from
 //! how the movies use them (`Party.Members.N.ID` is a creature id, `Attributes.P.Current` and
-//! `.Total` are a property's current and maximum values, as in `properties.gda`).
+//! `.Total` are a property's current and base (maximum) values, as in `properties.gda`).
 
 use std::collections::BTreeMap;
 
@@ -63,7 +63,9 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
         v.insert(format!("{prefix}.ID"), num(id));
         v.insert(format!("{prefix}.Name"), UiValue::String(name(sim, id)));
         v.insert(format!("{prefix}.Dead"), num(o.dead as u8));
-        for (p, (cur, total)) in &o.properties {
+        // The simulation keeps (base, current); for depletable properties (health, mana)
+        // the base is the maximum the bars show as Total.
+        for (p, (total, cur)) in &o.properties {
             v.insert(format!("{prefix}.Attributes.{p}.Current"), num(*cur));
             v.insert(format!("{prefix}.Attributes.{p}.Total"), num(*total));
         }
