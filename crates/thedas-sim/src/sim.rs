@@ -17,7 +17,7 @@ use std::sync::Arc;
 use thedas_formats::gff3::{Gff3, Struct, Value as G3};
 use thedas_formats::{Gff4, StructId};
 use thedas_script::ldf::{ConstValue, EngineTable, Function};
-use thedas_script::vm::{Host, ObjectId, Value, VmError, VmResult};
+use thedas_script::vm::{Host, OBJECT_INVALID, ObjectId, Value, VmError, VmResult};
 use thedas_script::{Ncs, Vm};
 use thedas_vfs::Vfs;
 
@@ -71,12 +71,27 @@ pub struct Sim {
     depth: usize,
     /// Instructions a single script run may take.
     pub script_budget: u64,
+    pub chargen_policy: ChargenPolicy,
     pub(crate) talk: Option<crate::dialog::Conversation>,
     pub(crate) plots: crate::plot::Plots,
     strings: std::sync::OnceLock<std::collections::BTreeMap<u32, String>>,
 }
 
 pub const MAX_DEPTH: usize = 24;
+
+/// What the simulation does when a script starts character generation, since there is no
+/// player at the character-creation screens.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum ChargenPolicy {
+    /// End character generation at once with the chargen script's defaults: `CHARGEN_END`
+    /// with mode 0 and "quick start" 0 makes `sys_chargen` pick a pre-made character and
+    /// origin ("Setting default values for player character"); 1 and 2 keep the current
+    /// choices and 3 starts in Lothering. Provisional, read from `sys_chargen`.
+    #[default]
+    QuickStart,
+    /// Leave it running; a caller sends the `CHARGEN_*` events (see [`Sim::chargen_event`]).
+    Manual,
+}
 
 /// Looks up an integer constant from the engine table (0 if absent).
 pub fn constant(table: &EngineTable, name: &str) -> i32 {
@@ -114,6 +129,7 @@ impl Sim {
             event_names,
             depth: 0,
             script_budget: 5_000_000,
+            chargen_policy: ChargenPolicy::default(),
             talk: None,
             plots: crate::plot::Plots::default(),
             strings: std::sync::OnceLock::new(),
@@ -286,11 +302,163 @@ impl Sim {
                 self.world.time_ms = self.world.time_ms.max(due);
                 self.deliver(q.target, q.event, q.script);
             }
+            if let Some((area, waypoint)) = self.world.transition.take() {
+                self.area_transition(&area, &waypoint);
+                continue;
+            }
+            if !self.world.cutscenes.is_empty() {
+                let cutscenes = std::mem::take(&mut self.world.cutscenes);
+                for c in cutscenes {
+                    self.end_cutscene(&c);
+                }
+                continue;
+            }
             if !self.run_commands(until) {
                 break;
             }
         }
         self.world.time_ms = until;
+    }
+
+    /// Ends a cutscene the way the engine does when one finishes playing. Provisional, inferred
+    /// from `cutscenes_h`: the scripts leave a plot flag to set (`CUTSCENE_SET_PLOT`,
+    /// `CUTSCENE_SET_PLOT_FLAG`) and a creature to talk to (`CUTSCENE_TALK_SPEAKER`) in module
+    /// locals before loading the cutscene, and nothing in the scripts reads them back.
+    pub fn end_cutscene(&mut self, name: &str) {
+        let t = self.world.time_ms;
+        self.world.trace.push(TraceEntry::Log {
+            t,
+            channel: -1,
+            text: format!("cutscene {name} ends (not played)"),
+        });
+        let Some(module) = self.world.module else {
+            return;
+        };
+        let (plot, flag, speaker) = match self.world.get_mut(module) {
+            Some(m) => {
+                let l = &mut m.locals;
+                (
+                    l.strings.remove("CUTSCENE_SET_PLOT").unwrap_or_default(),
+                    l.ints.remove("CUTSCENE_SET_PLOT_FLAG").unwrap_or(0),
+                    l.strings
+                        .remove("CUTSCENE_TALK_SPEAKER")
+                        .unwrap_or_default(),
+                )
+            }
+            None => return,
+        };
+        if !plot.is_empty() {
+            self.set_plot_flag(&plot, flag, true, true, OBJECT_INVALID);
+        }
+        if !speaker.is_empty() {
+            let hero = self.world.hero.unwrap_or(OBJECT_INVALID);
+            let target = self.world.by_tag(&speaker).next().map(|o| o.id);
+            if let Some(target) = target {
+                self.start_conversation(hero, target, "");
+            }
+        }
+    }
+
+    /// Moves the party to another area (`DoAreaTransition`), loading it. Provisional: the
+    /// area left behind stays in the world, inactive, and is not reused on return.
+    pub fn area_transition(&mut self, area: &str, waypoint: &str) {
+        let t = self.world.time_ms;
+        self.world.trace.push(TraceEntry::Log {
+            t,
+            channel: -1,
+            text: format!("area transition to {area} ({waypoint})"),
+        });
+        let old = self.world.area;
+        let party: Vec<ObjectId> = self
+            .world
+            .hero
+            .into_iter()
+            .chain(
+                self.world
+                    .hero
+                    .and_then(|h| self.world.get(h))
+                    .map(|h| h.followers.clone())
+                    .unwrap_or_default(),
+            )
+            .collect();
+        if let Some(old) = old {
+            for o in self.world.objects.values_mut() {
+                if o.area == Some(old) && !party.contains(&o.id) || o.id == old {
+                    o.active = false;
+                }
+            }
+        }
+        let wp = (!waypoint.is_empty()).then_some(waypoint);
+        match self.enter_area(area, wp) {
+            Ok(new) => {
+                let pos = self
+                    .world
+                    .hero
+                    .and_then(|h| self.world.get(h))
+                    .map(|h| h.position);
+                for id in party.iter().skip(1) {
+                    if let Some(o) = self.world.get_mut(*id) {
+                        o.area = Some(new);
+                        if let Some(p) = pos {
+                            o.position = p;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if let Some(old) = old {
+                    for o in self.world.objects.values_mut() {
+                        if o.area == Some(old) || o.id == old {
+                            o.active = true;
+                        }
+                    }
+                }
+                self.world.trace.push(TraceEntry::Log {
+                    t,
+                    channel: -1,
+                    text: format!("area transition to {area} failed: {e}"),
+                });
+            }
+        }
+    }
+
+    fn chargen_event_for(&self, ty: &str, creature: ObjectId) -> Event {
+        let mut ev = self.new_event(ty, Some(creature));
+        ev.objects = vec![creature];
+        ev
+    }
+
+    /// `StartCharGen`: tells the module character generation started, and under
+    /// [`ChargenPolicy::QuickStart`] ends it at once with the quick-start flag.
+    pub fn start_chargen(&mut self, creature: ObjectId, mode: i32, import: i32) {
+        let Some(module) = self.world.module else {
+            return;
+        };
+        self.world.chargen = Some(creature);
+        let mut ev = self.chargen_event_for("CHARGEN_START", creature);
+        ev.ints = vec![mode, import];
+        self.world.queue_event(0, module, ev, None);
+        if self.chargen_policy == ChargenPolicy::QuickStart {
+            self.chargen_event("CHARGEN_END", vec![mode, 0], Vec::new());
+        }
+    }
+
+    /// Sends a character-generation event (`CHARGEN_SELECT_RACE`, `CHARGEN_END`, ...) for the
+    /// creature in character generation to the module, as the chargen screens would: the
+    /// creature is object 0 and the choices are the integers and strings. Provisional: the
+    /// argument layout is inferred from `sys_chargen`.
+    pub fn chargen_event(&mut self, ty: &str, ints: Vec<i32>, strings: Vec<String>) -> bool {
+        let (Some(module), Some(creature)) = (self.world.module, self.world.chargen) else {
+            return false;
+        };
+        let mut ev = self.chargen_event_for(ty, creature);
+        ev.ints = ints;
+        ev.strings = strings;
+        if ty == "CHARGEN_END" {
+            self.world.chargen = None;
+        }
+        self.world.queue_event(0, module, ev, None);
+        true
     }
 
     /// Runs the front command of every object whose command is ready; returns whether any
@@ -889,6 +1057,71 @@ mod tests {
         s.world.trace.keep = true;
         s.add_script("counter", counter_script());
         s
+    }
+
+    fn with_module(s: &mut Sim) -> ObjectId {
+        let m = s.world.spawn(ObjectKind::Module, "module");
+        s.world.module = Some(m);
+        m
+    }
+
+    #[test]
+    fn a_loaded_cutscene_ends_and_sets_its_plot_flag() {
+        let mut s = sim();
+        let m = with_module(&mut s);
+        let l = &mut s.world.get_mut(m).unwrap().locals;
+        l.strings.insert("CUTSCENE_SET_PLOT".into(), "ABC".into());
+        l.ints.insert("CUTSCENE_SET_PLOT_FLAG".into(), 13);
+        s.world.cutscenes.push("intro.cut".into());
+        s.tick(0);
+        assert!(s.world.cutscenes.is_empty());
+        assert_eq!(s.world.plots.get(&("ABC".to_string(), 13)), Some(&true));
+        let l = &s.world.get(m).unwrap().locals;
+        assert!(!l.strings.contains_key("CUTSCENE_SET_PLOT"));
+    }
+
+    #[test]
+    fn chargen_quick_start_ends_at_once_and_manual_waits() {
+        let mut s = sim();
+        let m = with_module(&mut s);
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        s.start_chargen(hero, 0, 0);
+        let queued: Vec<_> = s
+            .world
+            .queue
+            .values()
+            .map(|q| (q.target, q.event.objects.clone(), q.event.ints.clone()))
+            .collect();
+        assert_eq!(
+            queued,
+            vec![(m, vec![hero], vec![0, 0]), (m, vec![hero], vec![0, 0])]
+        );
+        assert_eq!(s.world.chargen, None);
+
+        let mut s = sim();
+        with_module(&mut s);
+        s.chargen_policy = ChargenPolicy::Manual;
+        s.start_chargen(hero, 0, 0);
+        assert_eq!(s.world.queue.len(), 1);
+        assert_eq!(s.world.chargen, Some(hero));
+        assert!(s.chargen_event("CHARGEN_SELECT_RACE", vec![1, 0], Vec::new()));
+        assert!(s.chargen_event("CHARGEN_END", vec![0, 0], Vec::new()));
+        assert_eq!(s.world.chargen, None);
+        assert!(!s.chargen_event("CHARGEN_END", vec![0, 0], Vec::new()));
+    }
+
+    #[test]
+    fn a_failed_area_transition_keeps_the_old_area() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "here");
+        s.world.area = Some(area);
+        let thing = s.world.spawn(ObjectKind::Placeable, "thing");
+        s.world.get_mut(thing).unwrap().area = Some(area);
+        s.world.transition = Some(("nowhere".into(), "".into()));
+        s.tick(0);
+        assert_eq!(s.world.area, Some(area));
+        assert!(s.world.get(thing).unwrap().active);
+        assert!(s.world.transition.is_none());
     }
 
     #[test]
