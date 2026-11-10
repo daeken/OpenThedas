@@ -89,8 +89,7 @@ impl Sim {
 
     /// Has `who` use `ability` at place `at` in its area (a fireball's centre), from the item
     /// tagged `item` when it is an item's: a `CommandUseAbility` with a location and no
-    /// target. Provisional: ability range is not modelled, so it is used from where `who`
-    /// stands.
+    /// target, which walks `who` into the ability's range first (see `Sim::ability_range`).
     pub fn order_ability_at(&mut self, who: ObjectId, ability: i32, at: [f32; 3], item: &str) {
         let Some((area, from)) = self
             .world

@@ -89,6 +89,26 @@ impl Sim {
         }
     }
 
+    /// How far from its target an ability can be used (metres): the `PrimaryRange` of the
+    /// ranges.gda row its `ABI_base` `Range` names (`SpellRngTouch` 2.25, `SpellRngShrt` 8,
+    /// `SpellRngMed` 25, `SpellRngLng` 35, `SpellRngXLong` 60). `None` for one used where its
+    /// user stands (`SpellRngPers` and `SpellRngParty` are 0, and most talents name row 0).
+    pub fn ability_range(&self, ability: i32) -> Option<f32> {
+        let row = self.abi_int(ability, "Range");
+        if row <= 0 {
+            return None;
+        }
+        self.world
+            .tables()
+            .get(crate::combat::RANGES_TABLE, "")
+            .and_then(|t| match t.cell("PrimaryRange", row as i64) {
+                Some(Cell::Float(v)) => Some(*v as f32),
+                Some(Cell::Int(v)) => Some(*v as f32),
+                _ => None,
+            })
+            .filter(|r| r.is_finite() && *r > 0.0)
+    }
+
     /// An ability's `ABI_base` `UseType` (2 sustained, 3 passive, 4 activated).
     pub fn ability_use_type(&self, ability: i32) -> i32 {
         self.abi_int(ability, "UseType")
@@ -223,24 +243,46 @@ mod tests {
     use super::*;
     use crate::world::ObjectKind;
 
-    #[test]
-    fn ground_abilities_are_ordered_at_a_place_and_cast_from_where_the_user_stands() {
-        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+    /// ABI_base rows for fireball (a circle, medium range), a cone (short range), pommel
+    /// strike (no range) and heal (on a friend, medium range), and ranges.gda's rows.
+    fn ranged_sim() -> Sim {
+        let s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
         let (i, f) = (|v: i64| Cell::Int(v), |v: f64| Cell::Float(v));
         s.world.tables().insert(
             "ABI_base",
-            &["TargetType", "aoe_type", "aoe_param1", "aoe_param2"],
+            &[
+                "TargetType",
+                "aoe_type",
+                "aoe_param1",
+                "aoe_param2",
+                "Range",
+            ],
             vec![
-                (10003, vec![i(127), i(1), f(7.5), f(0.0)]),
-                (10201, vec![i(126), i(2), i(35), i(10)]),
-                (3024, vec![i(4), i(0), i(0), i(0)]),
+                (10003, vec![i(127), i(1), f(7.5), f(0.0), i(3)]),
+                (10201, vec![i(126), i(2), i(35), i(10), i(2)]),
+                (3024, vec![i(4), i(0), i(0), i(0), i(0)]),
+                (10104, vec![i(3), i(0), i(0), i(0), i(3)]),
             ],
         );
+        s.world.tables().insert(
+            "#134",
+            &["PrimaryRange"],
+            vec![(0, vec![f(0.0)]), (2, vec![f(8.0)]), (3, vec![f(25.0)])],
+        );
+        s
+    }
+
+    #[test]
+    fn ground_abilities_are_ordered_at_a_place_and_cast_within_range() {
+        let mut s = ranged_sim();
         assert!(s.ability_targets_place(10003) && s.ability_targets_place(10201));
         assert!(!s.ability_targets_place(3024));
         assert_eq!(s.ability_area(10003), AbilityArea::Sphere(7.5));
         assert_eq!(s.ability_area(10201), AbilityArea::Cone(35.0, 10.0));
         assert_eq!(s.ability_area(3024), AbilityArea::None);
+        assert_eq!(s.ability_range(10003), Some(25.0));
+        assert_eq!(s.ability_range(10201), Some(8.0));
+        assert_eq!(s.ability_range(3024), None);
         let area = s.world.spawn(ObjectKind::Area, "a");
         let mage = s.world.spawn(ObjectKind::Creature, "mage");
         s.world.get_mut(mage).unwrap().area = Some(area);
@@ -248,7 +290,44 @@ mod tests {
         let c = s.world.get(mage).unwrap().commands[0].clone();
         assert_eq!((c.target, c.ints.clone()), (None, vec![10003]));
         assert_eq!(c.location.unwrap().position, [10.0, 0.0, 0.0]);
-        // Its place is where it lands, not where the mage goes.
+        // In range: its place is where it lands, not where the mage goes.
+        s.tick(5_000);
+        assert_eq!(s.world.get(mage).unwrap().position, [0.0, 0.0, 0.0]);
+        // Out of range: the mage walks until the place is 25 m off, then casts.
+        s.order_ability_at(mage, 10003, [40.0, 0.0, 0.0], "");
+        s.tick(10_000);
+        let o = s.world.get(mage).unwrap();
+        assert!((o.position[0] - 15.0).abs() < 0.01, "{:?}", o.position);
+        // A cone aimed at a place only takes its direction there: no walk.
+        s.world.get_mut(mage).unwrap().position = [0.0; 3];
+        s.order_ability_at(mage, 10201, [40.0, 0.0, 0.0], "");
+        s.tick(5_000);
+        assert_eq!(s.world.get(mage).unwrap().position, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn abilities_on_a_creature_walk_into_range_of_its_body() {
+        let mut s = ranged_sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let mage = s.world.spawn(ObjectKind::Creature, "mage");
+        let friend = s.world.spawn(ObjectKind::Creature, "friend");
+        for (id, x) in [(mage, 0.0), (friend, 40.0)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = [x, 0.0, 0.0];
+        }
+        s.order_ability(mage, 10104, friend, "");
+        // At 5 m/s, a second in: walking.
+        s.tick(1_000);
+        let x = s.world.get(mage).unwrap().position[0];
+        assert!((x - 5.0).abs() < 0.01, "{x}");
+        s.tick(10_000);
+        let reach = 25.0 + crate::combat::DEFAULT_RADIUS;
+        let x = s.world.get(mage).unwrap().position[0];
+        assert!((x - (40.0 - reach)).abs() < 0.01, "{x}");
+        // An ability with no range is used where its user stands.
+        s.world.get_mut(mage).unwrap().position = [0.0; 3];
+        s.order_ability(mage, 3024, friend, "");
         s.tick(5_000);
         assert_eq!(s.world.get(mage).unwrap().position, [0.0, 0.0, 0.0]);
     }
