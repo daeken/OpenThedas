@@ -246,6 +246,9 @@ pub struct Pass {
     pub pixel_shader: Option<String>,
     pub state: Option<String>,
     pub parameter_sets: Vec<String>,
+    /// Parameters declared in the pass itself rather than in a referenced set (weapon.mat
+    /// and hairalpha.mat declare all of theirs this way).
+    pub parameters: Vec<Parameter>,
     pub streams: Vec<String>,
 }
 
@@ -342,6 +345,7 @@ fn read_logic(n: roxmltree::Node, depth: usize) -> Result<Logic> {
                 passes: Vec::new(),
             };
             for p in c.children().filter(|p| is(p, "Pass")) {
+                let parameters = read_params(p)?;
                 t.passes.push(Pass {
                     name: attr(&p, "Name").map(str::to_string),
                     vertex_shader: attr(&p, "VertexShader").map(str::to_string),
@@ -352,6 +356,7 @@ fn read_logic(n: roxmltree::Node, depth: usize) -> Result<Logic> {
                         .filter(|r| is(r, "ParameterSetRef"))
                         .filter_map(|r| attr(&r, "Ref").map(str::to_string))
                         .collect(),
+                    parameters,
                     streams: p
                         .children()
                         .filter(|r| is(r, "RequiredStreamData"))
@@ -419,11 +424,12 @@ impl MaterialDef {
     }
 
     /// Picks the technique for a semantic on a device with the given shader model and detail
-    /// level: the first `Logic` block in document order (depth first) whose test passes and
-    /// that holds a technique. A test passes when its shader model is at most `shader_model`
-    /// and its detail level, if any, is at most `detail` (LOW < MEDIUM < HIGH). Provisional:
-    /// the ordering is inferred from `static.mat`, whose opaque semantic offers only MEDIUM
-    /// and LOW SM3 techniques.
+    /// level: among sibling `Logic` blocks whose tests pass, those for the highest shader
+    /// model first, then in document order (depth first), the first that holds a technique.
+    /// A test passes when its shader model is at most `shader_model` and its detail level, if
+    /// any, is at most `detail` (LOW < MEDIUM < HIGH). Provisional: the ordering is inferred
+    /// from `static.mat`, whose opaque semantic offers only MEDIUM and LOW SM3 techniques, and
+    /// from `eye.mat`, whose eyelash semantic lists its shader model 2 block before the 3.
     pub fn select(&self, semantic: &str, shader_model: u32, detail: &str) -> Option<&Technique> {
         fn rank(d: &str) -> u32 {
             match d.to_ascii_uppercase().as_str() {
@@ -444,10 +450,12 @@ impl MaterialDef {
             }
         }
         fn find<'a>(blocks: &'a [Logic], sm: u32, detail: &str) -> Option<&'a Technique> {
-            for l in blocks {
-                if !passes(l, sm, detail) {
-                    continue;
-                }
+            let mut passing: Vec<&Logic> =
+                blocks.iter().filter(|l| passes(l, sm, detail)).collect();
+            passing.sort_by_key(|l| {
+                std::cmp::Reverse(l.test.as_ref().and_then(|t| t.shader_model).unwrap_or(0))
+            });
+            for l in passing {
                 if let Some(t) = l.techniques.first() {
                     return Some(t);
                 }
@@ -507,6 +515,26 @@ mod tests {
       </Logic>
     </Logic>
   </Semantic>
+  <Semantic Name = "Eyelash" RenderClass = "Character,eye">
+    <Logic Note = "Root">
+      <Logic Note = "SM2">
+        <LogicTest ShaderModel = "2"/>
+        <Technique Name = "DefaultTechnique">
+          <Pass Name = "Pass 1" VertexShader = "SM2_Eye0.vsh" PixelShader = "SM2_Eyelash0.psh" State = "EyelashPnch.sta"/>
+        </Technique>
+      </Logic>
+      <Logic Note = "SM3">
+        <LogicTest ShaderModel = "3"/>
+        <Technique Name = "DefaultTechnique">
+          <Pass Name = "Pass 1" VertexShader = "Eye0.vsh" PixelShader = "Eyelash0.psh" State = "EyelashPnch.sta">
+            <!-- <Parameter Type = "Float" Name = "mml_fCommentedOut" Default = "0"/> -->
+            <Parameter Type = "Texture" Name = "mml_tHeraldryMap" SamplerName = "smpHeraldry" Default = "Default_Black"/>
+            <InternalParameter Type = "Vector4f" Name = "g_vCameraPosition" Usage = "CameraPosition"/>
+          </Pass>
+        </Technique>
+      </Logic>
+    </Logic>
+  </Semantic>
 </Material>"#;
 
     #[test]
@@ -547,6 +575,27 @@ mod tests {
         assert_eq!(t.passes[0].parameter_sets, vec!["Common"]);
         assert_eq!(t.passes[0].streams, vec!["POSITION"]);
         assert!(mat.select("Missing", 3, "MEDIUM").is_none());
+    }
+
+    #[test]
+    fn prefers_the_highest_shader_model_and_reads_parameters_in_passes() {
+        let mat = MaterialDef::parse(MAT.as_bytes()).unwrap();
+        // The shader model 2 block comes first, but a shader model 3 device takes the 3.
+        let t = mat.select("Eyelash", 3, "MEDIUM").unwrap();
+        let p = &t.passes[0];
+        assert_eq!(p.pixel_shader.as_deref(), Some("Eyelash0.psh"));
+        assert_eq!(
+            mat.select("Eyelash", 2, "MEDIUM").unwrap().passes[0]
+                .pixel_shader
+                .as_deref(),
+            Some("SM2_Eyelash0.psh")
+        );
+        // Parameters declared in the pass itself (comments are not parameters).
+        let names: Vec<&str> = p.parameters.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["mml_tHeraldryMap", "g_vCameraPosition"]);
+        assert_eq!(p.parameters[0].sampler.as_deref(), Some("smpHeraldry"));
+        assert!(p.parameters[1].internal);
+        assert!(mat.parameter_sets.iter().all(|s| s.name == "Common"));
     }
 
     #[test]

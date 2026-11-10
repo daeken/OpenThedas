@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use glam::{Mat4, Vec3, Vec4};
-use thedas_formats::material::{MaterialDef, Parameter, Technique};
+use thedas_formats::material::{Parameter, Technique};
 use thedas_formats::probe::IrradianceProbe;
 use thedas_formats::state::{CompareFunc, MaterialState, PassState};
 use thedas_shader::bytecode::{Comparison, TextureType};
@@ -254,10 +254,8 @@ pub fn static1_filter() -> ShaderFilter {
 
 /// [`static1_filter`] plus the vertex shaders that draw creatures and placeables:
 /// characters (`Char1`), hair (`Hair0_Pass1`, `Hair0`: four passes), faces (`Face1`), eyes
-/// (`Eye0`), cloth (`Cloth1`) and props (`Prop1`), with any pixel shader. Still on the
-/// stand-in: weapons (`Weapon1`, which draw black on the translated path for a reason not
-/// yet found) and lashes (`sm2_Eye0`, whose alpha test does not cut them out yet). Hair
-/// draws darker than its morph's colours (cause not yet found).
+/// and lashes (`Eye0`), cloth (`Cloth1`), props (`Prop1`) and weapons (`Weapon1`), with any
+/// pixel shader.
 pub fn object_filter() -> ShaderFilter {
     let mut v = static1_filter().unwrap_or_default();
     for vs in OBJECT_VERTEX_SHADERS {
@@ -267,7 +265,7 @@ pub fn object_filter() -> ShaderFilter {
 }
 
 /// See [`object_filter`].
-pub const OBJECT_VERTEX_SHADERS: [&str; 7] = [
+pub const OBJECT_VERTEX_SHADERS: [&str; 8] = [
     "Char1.vsh",
     "Hair0_Pass1.vsh",
     "Hair0.vsh",
@@ -275,6 +273,7 @@ pub const OBJECT_VERTEX_SHADERS: [&str; 7] = [
     "Eye0.vsh",
     "Cloth1.vsh",
     "Prop1.vsh",
+    "Weapon1.vsh",
 ];
 
 /// Point lights chosen for one draw, in slot order A, B, C.
@@ -374,11 +373,24 @@ fn parse_floats(s: &str) -> Vec<f32> {
         .collect()
 }
 
-fn find_param<'a>(def: Option<&'a MaterialDef>, name: &str) -> Option<&'a Parameter> {
-    def?.parameter_sets
+/// The parameters a material's draws see: those its technique's passes declare, then its
+/// definition's parameter sets.
+fn parameters(m: &SceneMaterial) -> impl Iterator<Item = &Parameter> {
+    let passes = m
+        .technique
         .iter()
-        .flat_map(|s| s.parameters.iter())
-        .find(|p| p.name.eq_ignore_ascii_case(name))
+        .flat_map(|t| t.passes.iter())
+        .flat_map(|p| p.parameters.iter());
+    let sets = m
+        .definition
+        .iter()
+        .flat_map(|d| d.parameter_sets.iter())
+        .flat_map(|s| s.parameters.iter());
+    passes.chain(sets)
+}
+
+fn find_param<'a>(m: &'a SceneMaterial, name: &str) -> Option<&'a Parameter> {
+    parameters(m).find(|p| p.name.eq_ignore_ascii_case(name))
 }
 
 impl ConstantContext<'_> {
@@ -402,15 +414,14 @@ impl ConstantContext<'_> {
                 .vectors
                 .iter()
                 .any(|(n, _)| n.eq_ignore_ascii_case(name));
-        let default = find_param(self.material.definition.as_deref(), name)
+        let default = find_param(self.material, name)
             .and_then(|p| p.default.as_deref())
             .is_some_and(|d| !parse_floats(d).is_empty());
         (set || default).then_some(())
     }
 
     fn value(&self, c: &Constant) -> Option<Value> {
-        let def = self.material.definition.as_deref();
-        let usage = find_param(def, &c.name).and_then(|p| p.usage.clone());
+        let usage = find_param(self.material, &c.name).and_then(|p| p.usage.clone());
         let usage = usage.as_deref().unwrap_or("");
         let world_view = self.view * self.world;
         Some(match (usage, c.name.as_str()) {
@@ -489,7 +500,8 @@ impl ConstantContext<'_> {
                     )
                 } else {
                     // A default holds as many vectors as the parameter has elements.
-                    let d = find_param(def, &c.name).and_then(|p| p.default.as_deref())?;
+                    let d =
+                        find_param(self.material, &c.name).and_then(|p| p.default.as_deref())?;
                     let f = parse_floats(d);
                     if f.is_empty() {
                         return None;
@@ -581,16 +593,10 @@ pub fn sampler_texture(
         return (None, TextureSource::Black);
     };
     let sampler = c.name.clone();
-    let def = material.definition.as_deref();
-    let param = def.and_then(|d| {
-        d.parameter_sets
-            .iter()
-            .flat_map(|s| s.parameters.iter())
-            .find(|p| {
-                p.sampler
-                    .as_deref()
-                    .is_some_and(|s| s.eq_ignore_ascii_case(&sampler))
-            })
+    let param = parameters(material).find(|p| {
+        p.sampler
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case(&sampler))
     });
     let Some(param) = param else {
         return (Some(sampler), TextureSource::Black);
@@ -625,6 +631,7 @@ pub fn sampler_texture(
 mod tests {
     use super::*;
     use thedas_formats::MaterialObject;
+    use thedas_formats::material::MaterialDef;
 
     fn table(constants: Vec<Constant>) -> ConstantTable {
         ConstantTable {
@@ -753,6 +760,64 @@ mod tests {
         assert_eq!(c.bools[1][0], 1, "second point light enables B");
         assert_eq!(c.bools[2][0], 0);
         assert_eq!(c.floats[40], [0.0; 4]);
+    }
+
+    #[test]
+    fn parameters_declared_in_the_pass_bind_samplers_and_defaults() {
+        // weapon.mat and hairalpha.mat declare their parameters in the pass, in no set.
+        let def = MaterialDef::parse(
+            br#"<Material Name="Weapon"><Semantic Name="Default"><Logic><LogicTest ShaderModel="3"/>
+                <Technique Name="LOD1"><Pass VertexShader="W.vsh" PixelShader="W.psh" State="W.sta">
+                <Parameter Type="Texture" Name="mml_tDiffuse" SamplerName="smpDecal" Default="Default_Missing"/>
+                <Parameter Type="Texture" Name="mml_tTintMask" SamplerName="smpTintMask" Default="Default_Black"/>
+                <Parameter Type="Vector4f" Name="mml_vTintColor" Default="0.25 0 0 1"/>
+                </Pass></Technique></Logic></Semantic></Material>"#,
+        )
+        .unwrap();
+        let xml = br#"<MaterialObject Name="w"><Material Name="weapon.mat"/>
+            <Texture Name="mml_tDiffuse" ResName="w_d.dds"/></MaterialObject>"#;
+        let material = SceneMaterial {
+            mao: "w.mao".into(),
+            object: MaterialObject::parse(xml).unwrap(),
+            technique: def.select("Default", 3, "HIGH").cloned(),
+            definition: Some(Arc::new(def)),
+            semantic: "Default".into(),
+            render_class: None,
+        };
+        let sampler = |name: &str, register| Constant {
+            ty: 12,
+            ..constant(name, RegisterSet::Sampler, register, 1, ParamClass::Object)
+        };
+        let t = table(vec![
+            sampler("smpDecal", 0),
+            sampler("smpTintMask", 1),
+            sampler("smpUnknown", 2),
+        ]);
+        let tex = |r| sampler_texture(Some(&t), r, TextureType::Tex2D, &material, None).1;
+        assert_eq!(tex(0), TextureSource::Resource("w_d.dds".into()));
+        assert_eq!(tex(1), TextureSource::Resource("default_black.dds".into()));
+        assert_eq!(tex(2), TextureSource::Black);
+        let lights = DrawLights::default();
+        let cc = ConstantContext {
+            view: Mat4::IDENTITY,
+            projection: Mat4::IDENTITY,
+            world: Mat4::IDENTITY,
+            camera: Vec3::ZERO,
+            material: &material,
+            lightmap: None,
+            lights: &lights,
+            ambient: Vec3::ZERO,
+            bones: &[],
+            irradiance: None,
+        };
+        let c = cc.fill(Some(&table(vec![constant(
+            "mml_vTintColor",
+            RegisterSet::Float4,
+            3,
+            1,
+            ParamClass::Vector,
+        )])));
+        assert_eq!(c.floats[3], [0.25, 0.0, 0.0, 1.0]);
     }
 
     #[test]
