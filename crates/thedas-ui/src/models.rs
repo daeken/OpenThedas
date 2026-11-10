@@ -17,6 +17,9 @@
 //!   shape and colours. A morph kept on the creature (the player's face from character
 //!   creation) comes first. Part-based creatures with neither get the race's base head
 //!   (`hm_uhm_basa_0`, eyes and lashes; provisional).
+//! - Body tints: a whole-body creature's `Appearance Data` / `BodyTint` is a row of
+//!   `body_tints.gda`, whose `TintFile` (`T3_DOG_O00.tnt`) colours the body through its
+//!   material's tint mask. The mabari's diffuse texture is grey: its coat comes from this.
 
 use thedas_formats::gda::Cell;
 use thedas_script::vm::ObjectId;
@@ -128,6 +131,20 @@ pub fn head_morph(sim: &Sim, o: &Object) -> Option<String> {
     {
         return Some(m.clone());
     }
+    use thedas_formats::gff3::Value;
+    let name = match appearance_data(sim, o, "HeadMorph")? {
+        Value::ExoString(b) | Value::ResRef(b) => String::from_utf8_lossy(&b)
+            .trim_end_matches('\0')
+            .trim()
+            .to_ascii_lowercase(),
+        _ => return None,
+    };
+    let stem = name.strip_suffix(".mor").unwrap_or(&name).to_string();
+    (!stem.is_empty() && sim.vfs.lookup(&format!("{stem}.mor")).is_some()).then_some(stem)
+}
+
+/// A field of creature `o`'s template's `Appearance Data` struct.
+fn appearance_data(sim: &Sim, o: &Object, label: &str) -> Option<thedas_formats::gff3::Value> {
     use thedas_formats::gff3::{Gff3, Struct, Value};
     fn field<'a>(s: &'a Struct, label: &str) -> Option<&'a Value> {
         s.fields.iter().find(|f| f.label == label).map(|f| &f.value)
@@ -141,15 +158,54 @@ pub fn head_morph(sim: &Sim, o: &Object) -> Option<String> {
         Value::Struct(i) => g.structs.get(*i as usize)?,
         _ => return None,
     };
-    let name = match field(app, "HeadMorph")? {
-        Value::ExoString(b) | Value::ResRef(b) => String::from_utf8_lossy(b)
-            .trim_end_matches('\0')
-            .trim()
-            .to_ascii_lowercase(),
+    field(app, label).cloned()
+}
+
+/// The `.tnt` (without extension) `body_tints.gda` gives tint `id` on appearance
+/// `appearance`; id 0 is none.
+///
+/// The table numbers each appearance's tints on its own: rows share ids (63 is both "Dog -
+/// Party Member - Tint 0", `T3_DOG_O00.tnt`, and "Deepstalker - jumper", `T3_DPS_B03.tnt`)
+/// and an `Apr` column names the appearance each row is for. So the row is the one with this
+/// id and appearance, else one with this id for no appearance (`Apr` 0). Provisional, from
+/// the table's layout.
+pub fn body_tint_file(gda: &thedas_formats::Gda, id: i64, appearance: i64) -> Option<String> {
+    use thedas_formats::gda::column_hash;
+    if id <= 0 {
+        return None;
+    }
+    let col = |name: &str| gda.columns.iter().position(|c| c.hash == column_hash(name));
+    let (file, apr) = (col("TintFile")?, col("Apr")?);
+    let int = |row: &[Cell], i: usize| match row.get(i) {
+        Some(Cell::Int(v)) => Some(*v),
+        _ => None,
+    };
+    let rows = || gda.rows.iter().filter(|r| int(r, 0) == Some(id));
+    let row = rows()
+        .find(|r| int(r, apr) == Some(appearance))
+        .or_else(|| rows().find(|r| int(r, apr).unwrap_or(0) == 0))?;
+    let file = text(row.get(file))?.to_ascii_lowercase();
+    let stem = file.strip_suffix(".tnt").unwrap_or(&file).to_string();
+    (!stem.is_empty()).then_some(stem)
+}
+
+/// Creature `o`'s body tint (its template's `Appearance Data` / `BodyTint`), as a `.tnt`
+/// without extension. Provisional: read for whole-body creatures only; scripts that change
+/// it are not followed.
+fn body_tint(sim: &Sim, o: &Object) -> Option<String> {
+    use thedas_formats::gff3::Value;
+    let row = match appearance_data(sim, o, "BodyTint")? {
+        Value::Byte(v) => v as i64,
+        Value::Char(v) => v as i64,
+        Value::Word(v) => v as i64,
+        Value::Short(v) => v as i64,
+        Value::Dword(v) => v as i64,
+        Value::Int(v) => v as i64,
         _ => return None,
     };
-    let stem = name.strip_suffix(".mor").unwrap_or(&name).to_string();
-    (!stem.is_empty() && sim.vfs.lookup(&format!("{stem}.mor")).is_some()).then_some(stem)
+    let (data, _) = sim.vfs.read("body_tints.gda").ok()?;
+    let gda = thedas_formats::Gda::parse(&data).ok()?;
+    body_tint_file(&gda, row, o.appearance as i64)
 }
 
 /// The race's base head for a part-based creature without a morph: head, eyes, lashes.
@@ -219,10 +275,16 @@ pub fn object_models(sim: &Sim, o: &Object) -> Drawn {
             if models.is_empty() {
                 return Drawn::default();
             }
+            let mut tints = equipment_tints(sim, o, prefix.as_deref());
+            if prefix.is_none()
+                && let Some(t) = body_tint(sim, o)
+            {
+                tints.push((models[0].clone(), t));
+            }
             Drawn {
                 models,
                 attached: weapons(sim, o),
-                tints: equipment_tints(sim, o, prefix.as_deref()),
+                tints,
                 morph,
                 hide_hair,
             }
@@ -763,5 +825,39 @@ mod tests {
         );
         assert_eq!(text(Some(&Cell::String("\0".into()))), None);
         assert_eq!(text(Some(&Cell::Int(3))), None);
+    }
+
+    #[test]
+    fn body_tints_are_numbered_per_appearance() {
+        use thedas_formats::gda::{Column, column_hash};
+        let col = |n: &str| Column {
+            hash: column_hash(n),
+            kind: None,
+        };
+        let st = |v: &str| Cell::String(v.into());
+        let gda = thedas_formats::Gda {
+            version: thedas_formats::FourCC(*b"V0.2"),
+            columns: vec![col("ID"), col("Label"), col("TintFile"), col("Apr")],
+            rows: vec![
+                vec![
+                    Cell::Int(63),
+                    st("Dog 0"),
+                    st("T3_DOG_O00.tnt\0"),
+                    Cell::Int(35),
+                ],
+                vec![
+                    Cell::Int(63),
+                    st("Jumper"),
+                    st("T3_DPS_B03.tnt"),
+                    Cell::Int(33),
+                ],
+                vec![Cell::Int(5), st("Any"), st("T3_ANY.tnt"), Cell::Int(0)],
+            ],
+        };
+        assert_eq!(body_tint_file(&gda, 63, 35).as_deref(), Some("t3_dog_o00"));
+        assert_eq!(body_tint_file(&gda, 63, 33).as_deref(), Some("t3_dps_b03"));
+        assert_eq!(body_tint_file(&gda, 63, 34), None);
+        assert_eq!(body_tint_file(&gda, 5, 34).as_deref(), Some("t3_any"));
+        assert_eq!(body_tint_file(&gda, 0, 35), None);
     }
 }

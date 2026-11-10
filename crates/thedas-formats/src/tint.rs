@@ -2,25 +2,36 @@
 //! rough hide, ...) gives tint-masked shaders as `mml_vTintMaskColours`.
 //! `materialtypes.gda` names each material's file in its `TintFile` column.
 //!
-//! The vectors are fields 14000 to 14009. DAOrigins.exe's loader (0x7496b9) reads them into
-//! ten consecutive vectors in the order 14008, 14009, 14006, 14000, 14001, 14002, 14007,
-//! 14003, 14004, 14005, a missing field reading as (1, 1, 1, 1); [`Tint::colours`] keeps
-//! that order. That the block reaches the shader's registers in the same order is
-//! provisional.
+//! The vectors are fields 14000 to 14009, a missing field reading as (1, 1, 1, 1).
+//! [`Tint::colours`] holds them in the order the tint-masked shaders read
+//! `mml_vTintMaskColours` (`Ch1ArmTnt.psh`; `character.mat.xml` describes the array): a
+//! diffuse and a specular opacity vector (14008, 14009; x, y, z, w weigh the tint mask's red,
+//! green, blue and alpha channels), then a diffuse/specular colour pair per channel: red
+//! 14000/14003, green 14001/14004, blue 14002/14005, and alpha, the skin channel, which the
+//! shader lerps the diffuse texture towards, 14006/14007.
+//!
+//! Provisional. DAOrigins.exe's loader (0x7496b9) stores the fields in memory as 14008,
+//! 14009, then 14006, 14000, 14001, 14002 and 14007, 14003, 14004, 14005: read here as four
+//! diffuse colours (skin first) and four specular ones, which the engine interleaves into
+//! pairs; that step is not traced. The data agrees: item tints give zero skin opacity and
+//! white skin colours, and the mabari's body tint (`t3_dog_o00`) and skin tints
+//! (`t1_skn_*`) give white channel colours, their colour in 14006 and opacity on alpha only.
+//! Cousland's soldiers then wear the reference screenshot's dark steel and brown, not silver
+//! or cyan.
 
 use crate::gff4::Gff4;
 use crate::typed::{Doc, TypedError, TypedResult};
 
 pub const COLOURS: usize = 10;
 
-/// The field each slot of [`Tint::colours`] is read from (DAOrigins.exe 0x7496b9).
+/// The field each slot of [`Tint::colours`] is read from, in the shaders' order.
 pub const FIELD_ORDER: [u32; COLOURS] = [
-    14008, 14009, 14006, 14000, 14001, 14002, 14007, 14003, 14004, 14005,
+    14008, 14009, 14000, 14003, 14001, 14004, 14002, 14005, 14006, 14007,
 ];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tint {
-    /// In the engine's order (see [`FIELD_ORDER`]).
+    /// In the shaders' order (see [`FIELD_ORDER`]).
     pub colours: [[f32; 4]; COLOURS],
 }
 
@@ -54,7 +65,7 @@ mod tests {
     use crate::typed::testutil::Builder;
 
     #[test]
-    fn reads_the_colours_in_the_engines_order() {
+    fn reads_the_colours_in_the_shaders_order() {
         let mut b = Builder::new(b"GFF ");
         let fields = (0..COLOURS as u32)
             .filter(|&i| i != 7)
@@ -64,8 +75,8 @@ mod tests {
         let t = Tint::from_gff4(&b.finish(root)).unwrap();
         let firsts: Vec<f32> = t.colours.iter().map(|c| c[0]).collect();
         // 14007 is missing and reads as ones.
-        assert_eq!(firsts, [8.0, 9.0, 6.0, 0.0, 1.0, 2.0, 1.0, 3.0, 4.0, 5.0]);
-        assert_eq!(t.colours[6], [1.0; 4]);
+        assert_eq!(firsts, [8.0, 9.0, 0.0, 3.0, 1.0, 4.0, 2.0, 5.0, 6.0, 1.0]);
+        assert_eq!(t.colours[9], [1.0; 4]);
     }
 
     #[test]
