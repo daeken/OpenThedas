@@ -143,7 +143,7 @@ Then ask Claude to, say, "load the Spoiled Princess and talk to the innkeeper". 
 | `move_hero`, `enter_area`, `list_areas` | Move around and travel |
 | `plot_flag`, `local` | Read or set plot flags and local variables |
 | `call_engine_function`, `run_script` | Call any engine function or compiled script directly |
-| `save_state`, `load_state` | Snapshot and restore the world (in memory) |
+| `save_state`, `load_state` | Snapshot and restore the world, in memory or to a JSON file (`path`) |
 | `ui_open`, `ui_close` | Play interface movies (`menu`, `hud`, `startmenu2`, any movie names) on a headless GPU, bound to the simulation |
 | `ui_screenshot` | The open movies as a PNG image |
 | `ui_click`, `ui_hover`, `ui_step` | Mouse input at screenshot pixels and frame stepping; return what the movies sent to the engine |
