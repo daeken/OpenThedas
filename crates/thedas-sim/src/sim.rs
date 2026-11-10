@@ -81,6 +81,9 @@ pub struct Sim {
     pub install_root: Option<std::path::PathBuf>,
     /// Each loaded area's layout name, and the pathing grids loaded per layout.
     pub(crate) area_layouts: HashMap<ObjectId, String>,
+    /// The length of each weapon animation tree's fire animation, in milliseconds (see
+    /// `Sim::fire_ms`).
+    pub(crate) fire_lengths: HashMap<String, Option<u64>>,
     pub(crate) nav_grids: HashMap<String, Option<Arc<thedas_formats::level::NavGrid>>>,
     /// The effect an `APPLY_EFFECT` handler is looking at, and whether it is still valid.
     pub(crate) current_effect: Option<(crate::world::Effect, bool)>,
@@ -154,6 +157,7 @@ impl Sim {
             install_root: None,
             area_layouts: HashMap::new(),
             nav_grids: HashMap::new(),
+            fire_lengths: HashMap::new(),
             talk: None,
             plots: crate::plot::Plots::default(),
             strings: std::sync::OnceLock::new(),
@@ -1024,7 +1028,14 @@ impl Sim {
                         {
                             continue;
                         }
-                        // A ranged attack aims first (SetAimLoopDuration), then shoots.
+                        // A ranged attack draws (the attack duration), aims
+                        // (SetAimLoopDuration), then shoots (its fire animation; see
+                        // `Sim::fire_ms`).
+                        let fire = if cmd.name == "CommandAttack" {
+                            self.fire_ms(id)
+                        } else {
+                            0
+                        };
                         Some(
                             self.world
                                 .get(id)
@@ -1033,7 +1044,8 @@ impl Sim {
                                         .attack_ms
                                         .unwrap_or(crate::combat::DEFAULT_ATTACK_MS)
                                         + o.combat.aim_ms.unwrap_or(0)
-                                }),
+                                })
+                                + fire,
                         )
                     } else {
                         None

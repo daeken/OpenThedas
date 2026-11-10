@@ -50,6 +50,9 @@ pub struct Options<'a> {
     pub activity: bool,
     /// Followers waiting in the party pool get the hero's experience (provisional).
     pub pool_xp: bool,
+    /// End a run ("won") once this many fights are won: every hostile the party saw in the
+    /// fight is down (0: no such end).
+    pub fights: u32,
     /// Write the last run's full trace here (JSON lines).
     pub trace_to: Option<&'a Path>,
     /// Write the last run's end state here (a save the MCP can load).
@@ -59,6 +62,8 @@ pub struct Options<'a> {
 struct RunResult {
     seed: u64,
     deaths: u32,
+    /// Milliseconds the party spent fighting (from seeing hostiles to seeing none).
+    fight_ms: u64,
     end: String,
     ms: u64,
     /// For each sample time, which watched creatures were alive.
@@ -279,6 +284,8 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
     // The states seen at the last step, credited with the time the step took.
     let mut seen: Option<(u64, Vec<usize>, Vec<usize>)> = None;
     let mut party_ids: Vec<ObjectId> = Vec::new();
+    let (mut fight_ms, mut fights_won, mut last_t) = (0u64, 0u32, sim.world.time_ms);
+    let mut engaged: std::collections::BTreeSet<ObjectId> = std::collections::BTreeSet::new();
     let end;
     loop {
         let now = sim.world.time_ms;
@@ -348,6 +355,34 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
         }
         if sim.world.game_over {
             end = "wipe".to_string();
+            break;
+        }
+        // A fight is won when every hostile the party saw in it is down.
+        let fighting = sim.world.party_fighting;
+        if fighting {
+            fight_ms += now.saturating_sub(last_t);
+            let (_, foes) = sides(sim, hero);
+            engaged.extend(foes);
+            let mut party = vec![hero];
+            party.extend(
+                sim.world
+                    .get(hero)
+                    .map(|h| h.followers.clone())
+                    .unwrap_or_default(),
+            );
+            for m in party {
+                if let Some(x) = sim.world.get(m) {
+                    engaged.extend(x.combat.perceived_hostile.iter().copied());
+                }
+            }
+        }
+        if !engaged.is_empty() && engaged.iter().all(|&f| !alive(sim, f)) {
+            fights_won += 1;
+            engaged.clear();
+        }
+        last_t = now;
+        if o.fights > 0 && fights_won >= o.fights {
+            end = "won".to_string();
             break;
         }
         if let Some(d) = sim.dialog_state().filter(|d| !d.ended) {
@@ -433,6 +468,7 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
         deaths,
         end,
         ms: sim.world.time_ms - start,
+        fight_ms,
         activity: {
             for (id, a) in &sim.world.trace.attacks {
                 let side = if party_ids.contains(id) || Some(*id) == sim.world.hero {
@@ -510,11 +546,12 @@ pub fn run(o: &Options) -> Result<()> {
     let secs: Vec<f64> = runs.iter().map(|r| r.ms as f64 / 1000.0).collect();
     println!(
         "{} runs (seeds {}..{}): hero deaths mean {mean:.1}, sd {sd:.1}, range {min}-{max}; \
-         ended {ends:?}; game time mean {:.0} s",
+         ended {ends:?}; game time mean {:.0} s, fighting {:.0} s",
         runs.len(),
         o.first_seed,
         o.first_seed + o.seeds - 1,
-        secs.iter().sum::<f64>() / n
+        secs.iter().sum::<f64>() / n,
+        runs.iter().map(|r| r.fight_ms as f64).sum::<f64>() / n / 1000.0
     );
     if o.activity {
         let fight = runs.iter().map(|r| r.activity.fight_ms).sum::<u64>() as f64;

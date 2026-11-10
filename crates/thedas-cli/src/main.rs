@@ -134,6 +134,9 @@ enum Command {
         /// no script does it).
         #[arg(long)]
         pool_xp: bool,
+        /// End a run ("won") once this many fights are won (every hostile seen in it is down).
+        #[arg(long, default_value_t = 0)]
+        fights: u32,
         /// Write the last run's full trace here (JSON lines).
         #[arg(long)]
         trace: Option<PathBuf>,
@@ -294,6 +297,7 @@ fn run() -> Result<()> {
             ai_hero,
             activity,
             pool_xp,
+            fights,
             trace,
             save_to,
         } => autoplay::run(&autoplay::Options {
@@ -313,6 +317,7 @@ fn run() -> Result<()> {
             ai_hero,
             activity,
             pool_xp,
+            fights,
             trace_to: trace.as_deref(),
             save_to: save_to.as_deref(),
         }),

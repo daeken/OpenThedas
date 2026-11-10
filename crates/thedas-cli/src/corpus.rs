@@ -518,6 +518,9 @@ fn check_data(
         (_, "rml") => Some(s(Rml::from_gff4(&doc).map(|_| ()))),
         (_, "mmh") => Some(s(Mmh::from_gff4(&doc).map(|_| ()))),
         (_, "msh") => Some(s(Msh::from_gff4(&doc).map(|_| ()))),
+        (_, "anb") => Some(s(thedas_formats::anim::AnimTree::from_gff(&doc).map(|_| ()))),
+        (_, "gad") => Some(s(thedas_formats::anim::AnimInfo::from_gff(&doc).map(|_| ()))),
+        (_, "evt") => Some(s(thedas_formats::anim::events_from_gff(&doc).map(|_| ()))),
         (_, "dlg") => Some(
             thedas_sim::dialog::Dlg::from_gff4(&doc, "")
                 .map(|_| ())
