@@ -935,9 +935,11 @@ pub fn call(
                 .unwrap_or((0.0, 0.0));
             // Equipped items add their stats to the properties itemstatdefines.gda links
             // them to (armour to Armor, defence to Defense, ...).
-            // Equipment and attributes (see `derived`) are the modifier: part of the total.
+            // Equipment, attributes (see `derived`) and effects' modifiers are the modifier:
+            // part of the total.
             let gear = h.sim.equipment_bonus(obj(a, 0), int(a, 1))
-                + h.sim.attribute_bonus(obj(a, 0), int(a, 1));
+                + h.sim.attribute_bonus(obj(a, 0), int(a, 1))
+                + h.sim.effect_modifier(obj(a, 0), int(a, 1));
             let bounds = property_bounds(h.sim, int(a, 1));
             let v = if vt == base_type {
                 base
@@ -1164,36 +1166,49 @@ pub fn call(
             }
             let set = a.get(3).map_or(-1, |_| int(a, 3));
             let ok_ = h.object(item).is_some();
-            if let (true, Some(o)) = (ok_, h.sim.world.get_mut(who)) {
-                if !o.inventory.contains(&item) {
-                    o.inventory.push(item);
-                }
-                o.equipment.retain(|_, &mut i| i != item);
-                o.other_set.retain(|_, &mut i| i != item);
-                let active = o.fields.get("ActiveWeaponSet").copied().unwrap_or(0);
+            if ok_ && h.sim.world.get(who).is_some() {
+                // Off wherever it was, and what the slot held comes off (the engine's side
+                // of both: see `Sim::take_off`).
+                h.sim.unequip(who, item);
+                let (active, in_hand, other) = h
+                    .sim
+                    .world
+                    .get(who)
+                    .map(|o| {
+                        (
+                            o.fields.get("ActiveWeaponSet").copied().unwrap_or(0),
+                            o.equipment.get(&slot).copied(),
+                            o.other_set.get(&slot).copied(),
+                        )
+                    })
+                    .unwrap_or((0, None, None));
                 // A weapon for the set not in hand goes to the inactive set.
-                if (set == 0 || set == 1)
+                let inactive = (set == 0 || set == 1)
                     && set != active
-                    && crate::world::WEAPON_SET_SLOTS.contains(&slot)
-                {
-                    o.other_set.insert(slot, item);
-                } else {
-                    o.equipment.insert(slot, item);
+                    && crate::world::WEAPON_SET_SLOTS.contains(&slot);
+                let held = if inactive { other } else { in_hand };
+                if let Some(old) = held {
+                    h.sim.unequip(who, old);
+                }
+                if let Some(o) = h.sim.world.get_mut(who) {
+                    if !o.inventory.contains(&item) {
+                        o.inventory.push(item);
+                    }
+                    if inactive {
+                        o.other_set.insert(slot, item);
+                    } else {
+                        o.equipment.insert(slot, item);
+                    }
+                }
+                // Only what is in hand takes effect. Provisional.
+                if !inactive {
+                    h.sim.wear(who, item, slot);
                 }
             }
             ok(b(ok_))
         }
         "UnequipItem" => {
-            let item = obj(a, 1);
-            let found = match h.sim.world.get_mut(obj(a, 0)) {
-                Some(o) => {
-                    let n = o.equipment.len() + o.other_set.len();
-                    o.equipment.retain(|_, &mut i| i != item);
-                    o.other_set.retain(|_, &mut i| i != item);
-                    n != o.equipment.len() + o.other_set.len()
-                }
-                None => false,
-            };
+            let found = h.sim.unequip(obj(a, 0), obj(a, 1));
             ok(b(found))
         }
         "RemoveItemsByTag" => {
@@ -2856,12 +2871,16 @@ pub fn call(
             } else {
                 -1.0
             };
+            // The changes are modifiers, kept apart from the base (PROPERTY_VALUE_MODIFIER).
             let target = h.sim.current_effect_target.unwrap_or(caller);
             if let Some(o) = h.sim.world.get_mut(target) {
                 for (p, d) in e.ints.iter().zip(e.floats.iter()) {
                     if *p != 0 {
-                        let v = o.properties.entry(*p).or_insert((0.0, 0.0));
-                        v.0 += sign * d;
+                        let v = o.modifiers.entry(*p).or_insert(0.0);
+                        *v += sign * d;
+                        if v.abs() < 1e-4 {
+                            o.modifiers.remove(p);
+                        }
                     }
                 }
             }
@@ -3299,8 +3318,11 @@ mod tests {
         int FOLLOWER_STATE_LOCKEDACTIVE = 5;\n\
         void SetCreatureProperty(object o, int p, float f, int t) = 5;\n\
         int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
+        int PROPERTY_VALUE_TOTAL = 1;\n\
         int PROPERTY_VALUE_BASE = 2;\n\
         int PROPERTY_VALUE_CURRENT = 3;\n\
+        int PROPERTY_VALUE_MODIFIER = 4;\n\
+        float GetCreatureProperty(object o, int p, int t) = 31;\n\
         object CreateItemOnObject(resource r, object o, int n = 1, string s = \"\", int b = FALSE, int d = TRUE) = 6;\n\
         int FALSE = 0;\n\
         int TRUE = 1;\n\
@@ -3414,6 +3436,33 @@ mod tests {
             (kept.ty, kept.hostile, kept.engine_ints.clone()),
             (1012, true, vec![(2, 7)])
         );
+    }
+
+    #[test]
+    fn effect_modifiers_survive_a_script_setting_the_base() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        // A worn amulet's +2 to property 30 (no attribute or equipment bonus there).
+        s.world.get_mut(c).unwrap().modifiers.insert(30, 2.0);
+        let o = Value::Object(c);
+        run(
+            &mut s,
+            c,
+            "SetCreatureProperty",
+            &[o.clone(), Value::Int(30), Value::Float(15.0), Value::Int(2)],
+        );
+        let get = |s: &mut Sim, t: i32| {
+            run(
+                s,
+                c,
+                "GetCreatureProperty",
+                &[o.clone(), Value::Int(30), Value::Int(t)],
+            )
+        };
+        assert_eq!(get(&mut s, 1), Some(Value::Float(17.0)));
+        assert_eq!(get(&mut s, 2), Some(Value::Float(15.0)));
+        assert_eq!(get(&mut s, 4), Some(Value::Float(2.0)));
     }
 
     #[test]

@@ -57,6 +57,8 @@ pub struct ItemLook {
     /// The icon texture (`ico_longsword.dds`).
     pub icon: String,
     pub description: Option<u32>,
+    /// The template's item properties (`PropertiesList`): `itemprps.gda` row and power.
+    pub properties: Vec<(i32, i32)>,
 }
 
 /// Indexes of engine structures in the engine table (`ENGINE_STRUCTURE_n`).
@@ -1966,6 +1968,7 @@ impl Sim {
                 if let (Some(d), Some(o)) = (droppable, self.world.get_mut(item)) {
                     o.fields.insert("Droppable".into(), d);
                 }
+                let mut worn = false;
                 if let Some(o) = self.world.get_mut(id) {
                     o.inventory.push(item);
                     if equip {
@@ -1976,7 +1979,16 @@ impl Sim {
                             o.other_set.insert(slot, item);
                         } else {
                             o.equipment.insert(slot, item);
+                            worn = true;
                         }
+                    }
+                }
+                // What it starts out wearing takes effect as anything worn does (the item's
+                // properties through APPLY_EFFECT). Provisional: whether the engine also sends
+                // EVENT_TYPE_EQUIP for a template's equipment is not known; it is not sent.
+                if worn {
+                    for e in self.property_effects(item) {
+                        self.apply_effect(id, e);
                     }
                 }
             }
@@ -2029,12 +2041,28 @@ impl Sim {
                 let Some(r) = g.structs.first() else {
                     return ItemLook::default();
                 };
+                let properties = list_of(r, "PropertiesList")
+                    .iter()
+                    .filter_map(|&i| g.structs.get(i as usize))
+                    .filter_map(|p| {
+                        Some((int(p, "PropertyID")?, int(p, "PropertyPower").unwrap_or(1)))
+                    })
+                    .collect();
                 ItemLook {
                     icon: text(r, "Icon").unwrap_or_default(),
                     description: strref(r, "Description"),
+                    properties,
                 }
             })
             .clone()
+    }
+
+    /// Sets how a template presents its items, as if read from it (tests).
+    #[cfg(test)]
+    pub(crate) fn set_item_look(&self, template: &str, look: ItemLook) {
+        if let Ok(mut c) = self.item_looks.lock() {
+            c.insert(template.to_string(), look);
+        }
     }
 
     /// Creates an item from its `.uti` template, with the template's integer fields

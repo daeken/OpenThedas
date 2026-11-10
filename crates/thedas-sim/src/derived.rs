@@ -30,7 +30,18 @@ impl Sim {
             .get(id)
             .and_then(|o| o.properties.get(&property))
             .map_or(0.0, |v| v.0);
-        base + self.equipment_bonus(id, property) + self.attribute_bonus(id, property)
+        base + self.equipment_bonus(id, property)
+            + self.attribute_bonus(id, property)
+            + self.effect_modifier(id, property)
+    }
+
+    /// What effects add to a property (worn items' properties, buffs): see
+    /// [`crate::world::Object::modifiers`].
+    pub fn effect_modifier(&self, id: ObjectId, property: i32) -> f32 {
+        self.world
+            .get(id)
+            .and_then(|o| o.modifiers.get(&property).copied())
+            .unwrap_or(0.0)
     }
 
     /// What a creature's attributes add to `property`'s total (0 for the other properties).
@@ -43,6 +54,7 @@ impl Sim {
             o.properties
                 .get(&c(n))
                 .map_or(ATTRIBUTE_BASE, |v| v.0.max(v.1))
+                + o.modifiers.get(&c(n)).copied().unwrap_or(0.0)
                 - ATTRIBUTE_BASE
         };
         if property == c("PROPERTY_DEPLETABLE_HEALTH") {

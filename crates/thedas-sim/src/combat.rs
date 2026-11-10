@@ -427,7 +427,8 @@ impl Sim {
             };
             let (h, m) = rates[(combat_mode || o.combat.in_combat) as usize];
             for (p, r, max) in [(health, h, max_h), (mana, m, max_m)] {
-                let rate = o.properties.get(&r).map_or(0.0, |p| p.0.max(p.1));
+                let rate = o.properties.get(&r).map_or(0.0, |p| p.0.max(p.1))
+                    + o.modifiers.get(&r).copied().unwrap_or(0.0);
                 if rate == 0.0 {
                     continue;
                 }
