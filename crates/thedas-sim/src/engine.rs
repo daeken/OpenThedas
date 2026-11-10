@@ -1718,7 +1718,9 @@ pub fn call(
             let l = match (hero, h.object(who)) {
                 (Some(leader), Some(me)) => {
                     let i = leader.followers.iter().position(|&f| f == who).unwrap_or(0);
-                    let (s, c) = leader.facing.to_radians().sin_cos();
+                    let (s, c) = crate::world::heading_of(leader.facing)
+                        .to_radians()
+                        .sin_cos();
                     let back = 1.0 + i as f32;
                     Location {
                         area: leader.area.or(me.area).unwrap_or(OBJECT_INVALID),
@@ -2959,10 +2961,9 @@ pub fn call(
                             <= mine + h.sim.body_radius(o.id) + crate::combat::MELEE_GAP + 0.25
                 })
                 .filter(|o| {
-                    let ang = (o.position[1] - pos[1])
-                        .atan2(o.position[0] - pos[0])
-                        .to_degrees()
-                        - facing;
+                    let ang =
+                        crate::world::facing_toward(o.position[0] - pos[0], o.position[1] - pos[1])
+                            - facing;
                     let mut rel = ang.rem_euclid(360.0);
                     if start < 0.0 && rel > 180.0 {
                         rel -= 360.0;
@@ -3011,7 +3012,7 @@ pub fn call(
             ok(Value::Float(match (x, y) {
                 (Some(x), Some(y)) => {
                     let d = [y.position[0] - x.position[0], y.position[1] - x.position[1]];
-                    let to = d[1].atan2(d[0]).to_degrees();
+                    let to = crate::world::facing_toward(d[0], d[1]);
                     let mut a = (to - x.facing).rem_euclid(360.0);
                     if a > 180.0 {
                         a = 360.0 - a;
@@ -3024,9 +3025,7 @@ pub fn call(
         "SetFacingObject" => {
             let target = h.object(obj(a, 1)).map(|o| o.position);
             if let (Some(t), Some(o)) = (target, h.sim.world.get_mut(obj(a, 0))) {
-                o.facing = (t[1] - o.position[1])
-                    .atan2(t[0] - o.position[0])
-                    .to_degrees();
+                o.facing = crate::world::facing_toward(t[0] - o.position[0], t[1] - o.position[1]);
             }
             void()
         }
@@ -3157,7 +3156,7 @@ pub fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
 
 /// Point-in-polygon on the XY plane (even-odd rule).
 /// Whether a point is inside a trigger. The outline is relative to the trigger's position
-/// and rotated by its facing (provisional: degrees about Z, as `facing` is derived).
+/// and rotated by its facing (degrees about Z).
 pub fn in_trigger(p: [f32; 3], trigger: &crate::world::Object) -> bool {
     if trigger.geometry.len() < 3 {
         return false;
