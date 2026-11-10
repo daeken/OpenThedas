@@ -70,6 +70,8 @@ pub struct Live {
     pub frame_effects: bool,
     /// The graphics detail level scenes are loaded at.
     pub detail: thedas_render::scene::Detail,
+    /// The conversation camera's resources and current shot.
+    talk_camera: crate::talkcam::TalkCamera,
 }
 
 /// How to start the game.
@@ -119,6 +121,7 @@ impl Live {
             owed_ms: 0.0,
             frame_effects: true,
             detail: Default::default(),
+            talk_camera: Default::default(),
         })
     }
 
@@ -145,6 +148,16 @@ impl Live {
     /// Where a segment first meets the level's solid surfaces (share of the way), if it does.
     pub fn first_hit(&self, from: glam::Vec3, to: glam::Vec3) -> Option<f32> {
         self.level.as_ref()?.collider.first_hit(from, to)
+    }
+
+    /// The open conversation's camera, when its lines are staged (see [`crate::talkcam`]);
+    /// `base` gives the clip planes. `None` leaves the game camera as it is.
+    pub fn conversation_camera(
+        &mut self,
+        base: &thedas_render::Camera,
+    ) -> Option<thedas_render::Camera> {
+        let sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
+        self.talk_camera.camera(&sim, base)
     }
 
     pub fn leader_feet(&self) -> Option<glam::Vec3> {

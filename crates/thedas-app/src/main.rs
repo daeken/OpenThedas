@@ -32,6 +32,7 @@ mod follow;
 mod live;
 mod reticle;
 mod screens;
+mod talkcam;
 mod ui;
 
 use std::collections::{HashSet, VecDeque};
@@ -683,6 +684,14 @@ impl App {
                 let live = self.live.as_ref();
                 let hit = |a, b| live.and_then(|l| l.first_hit(a, b));
                 self.camera = f.camera_clear(feet, dt, &self.camera, &hit);
+            }
+            // A staged conversation line frames itself.
+            if let Some(c) = self
+                .live
+                .as_mut()
+                .and_then(|l| l.conversation_camera(&self.camera))
+            {
+                self.camera = c;
             }
             return;
         }
@@ -1769,6 +1778,10 @@ fn main() -> Result<()> {
                         println!("zoom {n}");
                     }
                 }
+                // A staged conversation line's shot is held for the lines after it.
+                if follow.is_some() {
+                    let _ = l.conversation_camera(&camera);
+                }
             }
             let sim = l.sim();
             if let Some(h) = sim.world.controlled().and_then(|h| sim.world.get(h)) {
@@ -1790,6 +1803,11 @@ fn main() -> Result<()> {
             drop(sim);
             if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
                 camera = f.camera_clear(feet, 0.0, &camera, &|a, b| l.first_hit(a, b));
+            }
+            if follow.is_some()
+                && let Some(c) = l.conversation_camera(&camera)
+            {
+                camera = c;
             }
         }
         return capture(
