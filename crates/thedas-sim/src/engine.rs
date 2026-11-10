@@ -934,15 +934,15 @@ pub fn call(
                     .unwrap_or(OBJECT_INVALID),
             ))
         }
-        // Provisional: an unspecified slot (INVENTORY_SLOT_INVALID) means slot 0 (main hand);
-        // weapon sets are not modelled.
+        // An unspecified slot (INVENTORY_SLOT_INVALID) means the base type's first free
+        // slot (bitm_base EquippableSlots). Weapon sets are not modelled (provisional).
         "EquipItem" => {
             let (who, item, slot) = (obj(a, 0), obj(a, 1), int(a, 2));
-            let slot = if slot == constant(&h.sim.table, "INVENTORY_SLOT_INVALID") {
-                0
-            } else {
-                slot
-            };
+            if slot == constant(&h.sim.table, "INVENTORY_SLOT_INVALID") {
+                // The base type's first free slot.
+                let done = h.object(item).is_some() && h.sim.equip_default(who, item).is_some();
+                return ok(b(done));
+            }
             let ok_ = h.object(item).is_some();
             if let (true, Some(o)) = (ok_, h.sim.world.get_mut(who)) {
                 if !o.inventory.contains(&item) {
@@ -1812,7 +1812,12 @@ pub fn call(
         "IsAbilityAvailable" => ok(b(h
             .object(obj(a, 0))
             .is_some_and(|o| o.abilities.contains(&int(a, 1))))),
-        "LogStoryEvent" | "LoadItemsFromTemplate" => {
+        "LoadItemsFromTemplate" => {
+            h.sim
+                .load_items_from_template(obj(a, 0), &string(a, 1), int(a, 2) != 0);
+            void()
+        }
+        "LogStoryEvent" => {
             h.sim.world.trace.push(TraceEntry::Log {
                 t,
                 channel: -3,
@@ -2121,6 +2126,41 @@ pub fn call(
                 _ => 0.0,
             };
             ok(Value::Float(v))
+        }
+        "GetItemStackSize" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .and_then(|o| o.fields.get("StackSize").copied())
+                .unwrap_or(1)
+                .max(1),
+        )),
+        "SetItemStackSize" => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields.insert("StackSize".into(), int(a, 1).max(1));
+            }
+            void()
+        }
+        // ApplyEffectModifyProperty: the effect's integers are property ids and its floats
+        // the changes (EffectModifyProperty's layout); applied to the current effect's owner.
+        "ApplyEffectModifyProperty" | "RemoveEffectModifyProperty" => {
+            let e = match h.sim.world.handle(handle(a, 0)) {
+                Some(EngineData::Effect(e)) => e.clone(),
+                _ => return void(),
+            };
+            let sign = if name == "ApplyEffectModifyProperty" {
+                1.0
+            } else {
+                -1.0
+            };
+            let target = h.sim.current_effect_target.unwrap_or(caller);
+            if let Some(o) = h.sim.world.get_mut(target) {
+                for (p, d) in e.ints.iter().zip(e.floats.iter()) {
+                    if *p != 0 {
+                        let v = o.properties.entry(*p).or_insert((0.0, 0.0));
+                        v.0 += sign * d;
+                    }
+                }
+            }
+            void()
         }
         "GetItemUnique" | "GetItemMaterialProgression" => {
             let field = if name == "GetItemUnique" {
