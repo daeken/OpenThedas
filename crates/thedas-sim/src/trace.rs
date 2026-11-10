@@ -135,6 +135,8 @@ pub struct Trace {
     pub m2da_missing: BTreeMap<String, u64>,
     /// Experience the hero gained, by the script that gave it.
     pub hero_xp: BTreeMap<String, u64>,
+    /// Script `Warning` messages (the scripts' own consistency checks), by text.
+    pub warnings: BTreeMap<String, u64>,
     /// Keep full entries (otherwise only the counters are updated).
     pub keep: bool,
 }
@@ -185,6 +187,7 @@ impl Trace {
             "presentation": self.presentation,
             "m2da_missing": self.m2da_missing,
             "hero_xp": self.hero_xp,
+            "warnings": self.warnings,
         })
     }
 

@@ -552,7 +552,9 @@ impl Sim {
     /// `ShowPartyPickerGUI` with no player to pick: the module hears the picker open
     /// (`EVENT_TYPE_PARTYPICKER_INIT`), the active party keeps its members and free places
     /// (three followers in all) go to the pool in the order they were recruited, then the
-    /// picker closes (`EVENT_TYPE_PARTYPICKER_CLOSED`). Provisional.
+    /// picker closes (`EVENT_TYPE_PARTYPICKER_CLOSED`). No script sets the chosen members'
+    /// states after the picker, so the engine does, switching their event scripts as
+    /// `WR_SetFollowerState` would. Provisional.
     pub fn party_picker(&mut self) {
         let (Some(module), Some(hero)) = (self.world.module, self.world.hero) else {
             return;
@@ -607,6 +609,10 @@ impl Sim {
                 if !locked {
                     o.fields
                         .insert("FollowerState".into(), if on { active } else { available });
+                    // As rules_core's WR_SetFollowerState switches them: party members fire
+                    // their events into player_core, those left in the pool into
+                    // creature_core (which warns when a party member's events reach it).
+                    o.script = Some(if on { "player_core" } else { "creature_core" }.into());
                 }
                 o.active = on || locked;
                 if on {
@@ -2174,6 +2180,32 @@ impl ScriptHost<'_> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_party_picker_switches_event_scripts_as_follower_states_change() {
+        let ldf = "int FOLLOWER_STATE_ACTIVE = 1;\nint FOLLOWER_STATE_AVAILABLE = 2;\n";
+        let table = Arc::new(thedas_script::EngineTable::parse(ldf.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        s.world.module = Some(module);
+        s.world.hero = Some(hero);
+        let mut members = Vec::new();
+        for tag in ["alistair", "leliana", "sten", "morrigan"] {
+            let id = s.world.spawn(ObjectKind::Creature, tag);
+            let o = s.world.get_mut(id).unwrap();
+            o.fields.insert("FollowerState".into(), 2);
+            o.script = Some("creature_core".into());
+            members.push(id);
+        }
+        s.world.party_choice = Some(vec![members[1], members[3], members[0]]);
+        s.party_picker();
+        let script = |s: &Sim, id| s.world.get(id).unwrap().script.clone().unwrap();
+        for &m in &[members[0], members[1], members[3]] {
+            assert_eq!(script(&s, m), "player_core");
+        }
+        assert_eq!(script(&s, members[2]), "creature_core", "left in the pool");
+    }
     use super::*;
 
     const LDF: &str = "#define ENGINE_STRUCTURE_0 event\n\
