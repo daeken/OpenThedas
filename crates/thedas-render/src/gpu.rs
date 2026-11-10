@@ -368,10 +368,23 @@ impl Default for StandInLight {
     }
 }
 
-struct GpuMesh {
+#[derive(Clone)]
+pub(crate) struct GpuMesh {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     count: u32,
+}
+
+/// GPU resources kept between renderers built over the same resources (an area's objects,
+/// rebuilt as creatures come and go): textures, pipelines and vertex buffers, by name. Clear
+/// it (make a new one) when the resource stack changes.
+#[derive(Default)]
+pub struct RenderCache {
+    pub(crate) textures: TextureCache,
+    pub(crate) meshes: HashMap<String, GpuMesh>,
+    pub(crate) d3d: crate::d3d_gpu::D3dCache,
+    /// Translated programs by `vs+ps+state` key (`None`: did not translate).
+    pub(crate) programs: HashMap<String, Option<std::sync::Arc<crate::d3d::D3dProgram>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -429,6 +442,25 @@ impl AreaRenderer {
         programs: &ProgramRegistry,
         color_format: wgpu::TextureFormat,
     ) -> Self {
+        Self::new_cached(
+            ctx,
+            vfs,
+            scene,
+            programs,
+            color_format,
+            &mut RenderCache::default(),
+        )
+    }
+
+    /// [`AreaRenderer::new`], taking what it can from `cache` and leaving what it makes there.
+    pub fn new_cached(
+        ctx: &GpuContext,
+        vfs: &Vfs,
+        scene: &AreaScene,
+        programs: &ProgramRegistry,
+        color_format: wgpu::TextureFormat,
+        render_cache: &mut RenderCache,
+    ) -> Self {
         let device = &ctx.device;
         let mut stats = RenderStats::default();
 
@@ -436,24 +468,36 @@ impl AreaRenderer {
         let meshes: Vec<GpuMesh> = scene
             .meshes
             .iter()
-            .map(|m| GpuMesh {
-                vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(&m.key),
-                    contents: bytemuck::cast_slice(&m.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-                indices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(&m.key),
-                    contents: bytemuck::cast_slice(&m.indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                }),
-                count: m.indices.len() as u32,
+            .map(|m| {
+                render_cache
+                    .meshes
+                    .entry(m.key.clone())
+                    .or_insert_with(|| GpuMesh {
+                        vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some(&m.key),
+                            contents: bytemuck::cast_slice(&m.vertices),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        }),
+                        indices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some(&m.key),
+                            contents: bytemuck::cast_slice(&m.indices),
+                            usage: wgpu::BufferUsages::INDEX,
+                        }),
+                        count: m.indices.len() as u32,
+                    })
+                    .clone()
             })
             .collect();
         stats.meshes = meshes.len();
 
         // Textures.
-        let mut cache = TextureCache::default();
+        let RenderCache {
+            textures: cache,
+            d3d: d3d_cache,
+            ..
+        } = render_cache;
+        let (loaded0, compressed0, missing0) =
+            (cache.loaded, cache.compressed, cache.missing.len());
         let mut textures: HashMap<String, Option<wgpu::TextureView>> = HashMap::new();
         for name in scene.textures() {
             let view = cache.get(ctx, vfs, &name).map(|t| t.view.clone());
@@ -669,8 +713,15 @@ impl AreaRenderer {
             }
             stand_in.push(draw);
         }
-        let d3d =
-            crate::d3d_gpu::D3dPass::new(ctx, vfs, scene, &d3d_programs, &mut cache, color_format);
+        let d3d = crate::d3d_gpu::D3dPass::new(
+            ctx,
+            vfs,
+            scene,
+            &d3d_programs,
+            cache,
+            d3d_cache,
+            color_format,
+        );
         for (k, d) in d3d.draws.iter().enumerate() {
             if d3d.is_blended(d) || d.multipass {
                 blended.push((d.draw, DrawRef::D3d(k)));
@@ -686,9 +737,9 @@ impl AreaRenderer {
         });
         stats.draws = opaque.len() + blended.len();
         stats.programs.extend(d3d.programs.iter().cloned());
-        stats.textures_loaded = cache.loaded;
-        stats.textures_compressed = cache.compressed;
-        stats.textures_missing = cache.missing.clone();
+        stats.textures_loaded = cache.loaded - loaded0;
+        stats.textures_compressed = cache.compressed - compressed0;
+        stats.textures_missing = cache.missing[missing0..].to_vec();
         if uniforms.is_empty() {
             uniforms.resize(DRAW_STRIDE as usize, 0);
         }

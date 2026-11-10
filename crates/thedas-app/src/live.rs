@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use glam::Mat4;
-use thedas_render::{Animator, AreaRenderer, AreaScene, Clip, GpuContext, Prop};
+use thedas_render::{Animator, AreaRenderer, AreaScene, Clip, GpuContext, Prop, RenderCache};
 use thedas_script::vm::ObjectId;
 use thedas_sim::Sim;
 use thedas_ui::models::{ModelCache, ObjectModel};
@@ -49,6 +49,9 @@ pub struct Live {
     pub objects: Option<LiveObjects>,
     animator: Animator,
     models: ModelCache,
+    /// Textures, meshes, pipelines and shader translations of the current level, kept while
+    /// its objects are rebuilt.
+    cache: RenderCache,
     /// Simulation time not yet ticked (fractions of a millisecond).
     owed_ms: f64,
 }
@@ -93,6 +96,7 @@ impl Live {
             objects: None,
             animator: Animator::default(),
             models: ModelCache::default(),
+            cache: RenderCache::default(),
             owed_ms: 0.0,
         })
     }
@@ -232,8 +236,11 @@ impl Live {
         let mut vfs = install.global_vfs(TextureQuality::High)?;
         install.mount_level(&mut vfs, layout)?;
         let scene = AreaScene::load(&vfs, layout)?;
-        let programs = crate::programs(&vfs, &scene, &self.shaders)?;
-        let renderer = AreaRenderer::new(ctx, &vfs, &scene, &programs, format);
+        // A new resource stack: nothing cached carries over.
+        self.cache = RenderCache::default();
+        let programs = crate::programs_cached(&vfs, &scene, &self.shaders, &mut self.cache)?;
+        let renderer =
+            AreaRenderer::new_cached(ctx, &vfs, &scene, &programs, format, &mut self.cache);
         log::info!(
             "{layout}: level of {} draws built in {:.2}s",
             scene.draws.len(),
@@ -262,8 +269,9 @@ impl Live {
             .context("objects before their level")?;
         let props: Vec<Prop> = models.iter().map(prop).collect();
         let scene = AreaScene::load_objects(&vfs, layout, &props)?;
-        let programs = crate::programs(&vfs, &scene, &self.shaders)?;
-        let renderer = AreaRenderer::new(ctx, &vfs, &scene, &programs, format);
+        let programs = crate::programs_cached(&vfs, &scene, &self.shaders, &mut self.cache)?;
+        let renderer =
+            AreaRenderer::new_cached(ctx, &vfs, &scene, &programs, format, &mut self.cache);
         log::info!(
             "{layout}: {} objects, {} draws, built in {:.2}s",
             models.len(),

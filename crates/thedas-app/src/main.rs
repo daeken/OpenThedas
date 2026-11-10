@@ -102,7 +102,8 @@ struct Args {
     click: Vec<String>,
     /// Headless, playing: input played in order before the capture, `;`-separated:
     /// `click X,Y` (a left click at that pixel), `run MS` (the game and its interface run
-    /// that long), `key i` (the inventory toggle), `talk TAG` (the leader talks to a creature).
+    /// that long), `key i` (the inventory toggle), `talk TAG` (the leader talks to a creature),
+    /// `rebuild` (the objects are rebuilt as a spawn rebuilds them, timed).
     #[arg(long, default_value = "")]
     steps: String,
     /// Module for `--save` and `--objects`.
@@ -152,6 +153,21 @@ impl Loaded {
 /// The programs drawing `scene`: the original shaders the `--shaders` choice allows, the
 /// stand-in for the rest.
 pub fn programs(vfs: &Vfs, scene: &AreaScene, shaders: &str) -> Result<ProgramRegistry> {
+    programs_cached(
+        vfs,
+        scene,
+        shaders,
+        &mut thedas_render::RenderCache::default(),
+    )
+}
+
+/// [`programs`], reusing translations kept in `cache`.
+pub fn programs_cached(
+    vfs: &Vfs,
+    scene: &AreaScene,
+    shaders: &str,
+    cache: &mut thedas_render::RenderCache,
+) -> Result<ProgramRegistry> {
     {
         let mut reg = ProgramRegistry::default();
         let filter = match shaders {
@@ -161,8 +177,8 @@ pub fn programs(vfs: &Vfs, scene: &AreaScene, shaders: &str) -> Result<ProgramRe
             "all" => None,
             other => bail!("--shaders must be original, static, all or standin, not {other}"),
         };
-        let source = thedas_render::d3d::D3dSource::new(vfs, scene, &filter);
-        log::info!(
+        let source = thedas_render::d3d::D3dSource::new_cached(vfs, scene, &filter, cache);
+        log::debug!(
             "original shaders: {} programs, {} failed",
             source.programs().count(),
             source.failures.len()
@@ -760,6 +776,8 @@ enum Step {
     /// The leader is ordered to talk to the first creature with this tag (as a click on it
     /// does, for creatures hard to reach on screen).
     Talk(String),
+    /// The objects' scene is rebuilt, as when a creature spawns (timing).
+    Rebuild,
 }
 
 fn parse_steps(spec: &str) -> Result<Vec<Step>> {
@@ -777,6 +795,7 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
                 "run" => Step::Run(arg.parse().context("run takes milliseconds")?),
                 "key" if arg.eq_ignore_ascii_case("i") => Step::Inventory,
                 "talk" if !arg.is_empty() => Step::Talk(arg.to_string()),
+                "rebuild" => Step::Rebuild,
                 _ => bail!("unknown step {s:?}"),
             })
         })
@@ -871,6 +890,13 @@ fn main() -> Result<()> {
             l.sim().tick(args.run_ms);
             for step in &steps {
                 match step {
+                    Step::Rebuild => {
+                        l.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
+                        l.objects = None;
+                        let t = Instant::now();
+                        l.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
+                        println!("rebuild: {:.3}s", t.elapsed().as_secs_f64());
+                    }
                     Step::Talk(tag) => {
                         let mut sim = l.sim();
                         let who = sim.world.controlled();
@@ -920,6 +946,9 @@ fn main() -> Result<()> {
                             if !played.as_ref().is_some_and(|(_, s)| s.world_stopped()) {
                                 l.step(dt);
                             }
+                            // As the window does: the drawn scenes follow the world (objects
+                            // that come and go are rebuilt).
+                            l.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
                             if let Some((layer, s)) = played.as_mut() {
                                 let t = Instant::now();
                                 layer.play(s, &l.sim, dt);
@@ -1016,6 +1045,7 @@ mod tests {
             parse_steps("talk lot110cr_bryant").unwrap(),
             vec![Step::Talk("lot110cr_bryant".into())]
         );
+        assert_eq!(parse_steps("rebuild").unwrap(), vec![Step::Rebuild]);
         assert!(parse_steps("dance").is_err());
         assert!(parse_steps("click 10").is_err());
         assert!(parse_steps("").unwrap().is_empty());

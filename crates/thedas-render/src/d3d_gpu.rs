@@ -71,6 +71,18 @@ pub(crate) struct D3dDraw {
     pub multipass: bool,
 }
 
+/// Pipelines and vertex buffers kept between passes (see [`crate::gpu::RenderCache`]).
+#[derive(Default)]
+pub(crate) struct D3dCache {
+    /// The constants layout every cached pipeline was made with.
+    consts_layout: Option<wgpu::BindGroupLayout>,
+    /// By program name and target format: the pipeline and its texture layout.
+    pipelines:
+        HashMap<(String, wgpu::TextureFormat), (wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
+    /// By mesh key and vertex input signature.
+    vertices: HashMap<(String, String), wgpu::Buffer>,
+}
+
 pub(crate) struct D3dPass {
     pipelines: Vec<D3dPipeline>,
     pub draws: Vec<D3dDraw>,
@@ -464,15 +476,18 @@ impl D3dPass {
         scene: &AreaScene,
         material_programs: &[Vec<Arc<D3dProgram>>],
         textures: &mut TextureCache,
+        cache: &mut D3dCache,
         color_format: wgpu::TextureFormat,
     ) -> Self {
         let device = &ctx.device;
-        let consts_layout = const_layout(device);
+        let consts_layout = cache
+            .consts_layout
+            .get_or_insert_with(|| const_layout(device))
+            .clone();
         let mut pipelines: Vec<D3dPipeline> = Vec::new();
         let mut layouts: Vec<wgpu::BindGroupLayout> = Vec::new();
         let mut by_name: HashMap<String, usize> = HashMap::new();
         let mut samplers: HashMap<String, wgpu::Sampler> = HashMap::new();
-        let mut vbufs: HashMap<(usize, String), wgpu::Buffer> = HashMap::new();
         let ambient = room_ambients(scene);
 
         let mut pending = Vec::new();
@@ -482,9 +497,16 @@ impl D3dPass {
             };
             for program in passes {
                 let pi = *by_name.entry(program.name.clone()).or_insert_with(|| {
-                    let tl = texture_layout(device, program);
-                    let pipeline =
-                        create_pipeline(device, program, &consts_layout, &tl, color_format);
+                    let (pipeline, tl) = cache
+                        .pipelines
+                        .entry((program.name.clone(), color_format))
+                        .or_insert_with(|| {
+                            let tl = texture_layout(device, program);
+                            let pipeline =
+                                create_pipeline(device, program, &consts_layout, &tl, color_format);
+                            (pipeline, tl)
+                        })
+                        .clone();
                     pipelines.push(D3dPipeline {
                         pipeline,
                         program: program.clone(),
@@ -517,8 +539,9 @@ impl D3dPass {
                 .iter()
                 .map(|s| format!("{:?}{}@{};", s.semantic.usage, s.semantic.index, s.location))
                 .collect();
-            let vertices = vbufs
-                .entry((d.mesh, sig))
+            let vertices = cache
+                .vertices
+                .entry((mesh.key.clone(), sig))
                 .or_insert_with(|| {
                     use wgpu::util::DeviceExt;
                     let data = expand_vertices(mesh, inputs);
