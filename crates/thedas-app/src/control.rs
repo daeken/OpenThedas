@@ -16,7 +16,7 @@
 //! Every reply has `"ok"`; failures carry `"error"`. Input reaches the simulation only as
 //! the player's own does (orders, interface clicks), so it stays deterministic.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -26,6 +26,10 @@ use serde_json::{Value as J, json};
 
 /// How long a connection waits for the game to answer one request.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The longest request line taken (bytes); a longer one is answered with an error and the
+/// connection closed, so a stray client cannot grow the game's memory without bound.
+pub const MAX_REQUEST: usize = 4 << 20;
 
 /// A request from a client, with where its reply goes.
 pub struct Request {
@@ -76,18 +80,32 @@ fn serve(stream: TcpStream, tx: mpsc::Sender<Request>) {
     let Ok(mut out) = stream.try_clone() else {
         return;
     };
-    for line in BufReader::new(stream).lines() {
-        let Ok(line) = line else { return };
-        if line.trim().is_empty() {
-            continue;
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut line = Vec::new();
+        let read = (&mut reader)
+            .take(MAX_REQUEST as u64 + 1)
+            .read_until(b'\n', &mut line);
+        match read {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
         }
-        let reply = match serde_json::from_str::<J>(&line) {
-            Ok(body) => ask(&tx, body),
-            Err(e) => failure(format!("not JSON: {e}")),
+        let too_long = line.len() > MAX_REQUEST;
+        let reply = if too_long {
+            failure(format!("request longer than {MAX_REQUEST} bytes"))
+        } else {
+            let text = String::from_utf8_lossy(&line);
+            if text.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<J>(&text) {
+                Ok(body) => ask(&tx, body),
+                Err(e) => failure(format!("not JSON: {e}")),
+            }
         };
         let mut text = reply.to_string();
         text.push('\n');
-        if out.write_all(text.as_bytes()).is_err() {
+        if out.write_all(text.as_bytes()).is_err() || too_long {
             return;
         }
     }
@@ -140,5 +158,12 @@ mod tests {
         let (a, b) = client.join().unwrap();
         assert_eq!(a["time_ms"], 5);
         assert_eq!(b["ok"], false);
+        // A request past the limit is refused and the connection closed.
+        let mut s = TcpStream::connect(addr).unwrap();
+        let _ = s.write_all(&vec![b'x'; MAX_REQUEST + 10]);
+        let mut lines = BufReader::new(s).lines();
+        let refused: J = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        assert!(refused["error"].as_str().unwrap().contains("longer than"));
+        assert!(lines.next().is_none());
     }
 }

@@ -395,10 +395,13 @@ pub struct World {
     #[serde(with = "pairs")]
     pub plots: BTreeMap<(String, i32), bool>,
     pub game_mode: i32,
-    /// Cutscenes loaded with `LoadCutscene` that have not "played" yet. There is no cutscene
-    /// playback; a loaded cutscene ends on the next tick.
+    /// Cutscenes loaded with `LoadCutscene` that have not played yet, in order. Each starts
+    /// once the scripts that loaded it have run (see [`crate::sim::CutscenePolicy`]).
     #[serde(default)]
     pub cutscenes: Vec<String>,
+    /// The cutscene playing, while a presentation shows it ([`crate::sim::CutscenePolicy::Play`]).
+    #[serde(default)]
+    pub cutscene: Option<crate::cutscene::Cutscene>,
     /// The creature in character generation, between `StartCharGen` and `CHARGEN_END`.
     #[serde(default)]
     pub chargen: Option<ObjectId>,
@@ -534,6 +537,7 @@ impl World {
             plots: BTreeMap::new(),
             game_mode: 0,
             cutscenes: Vec::new(),
+            cutscene: None,
             chargen: None,
             transition: None,
             in_triggers: BTreeMap::new(),

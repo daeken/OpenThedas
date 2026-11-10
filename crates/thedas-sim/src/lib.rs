@@ -14,6 +14,7 @@
 
 pub mod chanters;
 pub mod combat;
+pub mod cutscene;
 pub mod derived;
 pub mod dialog;
 pub mod engine;

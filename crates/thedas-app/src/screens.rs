@@ -1,6 +1,7 @@
 //! Which of the game's interface screens are up while playing, from the simulation: the HUD
-//! while exploring, the conversation screen while someone talks, and the screens scripts
-//! open (world map, store, job board, level-up) or the player opens (inventory).
+//! while exploring, the conversation screen while someone talks, the cutscene screen (its
+//! subtitles) while a cutscene plays, and the screens scripts open (world map, store, job
+//! board, level-up) or the player opens (inventory).
 //!
 //! A screen opens when it becomes wanted and closes when it stops being wanted. A screen
 //! that closes itself (its close button) stays closed until it is wanted afresh, so a
@@ -18,6 +19,7 @@ use thedas_ui::stage::Stage;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Screen {
     Hud,
+    Cutscene,
     Conversation,
     WorldMap,
     Store,
@@ -30,6 +32,7 @@ impl Screen {
     pub fn movies(self) -> &'static [&'static str] {
         match self {
             Screen::Hud => &["portraits.gfx", "quickbar.gfx", "minimap.gfx"],
+            Screen::Cutscene => &["cutscene.gfx"],
             Screen::Conversation => &["conversation.gfx"],
             Screen::WorldMap => &["worldmap.gfx"],
             Screen::Store => &["store.gfx"],
@@ -39,18 +42,22 @@ impl Screen {
         }
     }
 
-    /// A menu the world waits behind (everything but the HUD and conversations).
+    /// A menu the world waits behind (everything but the HUD and conversations; a cutscene
+    /// holds the world while it plays).
     pub fn stops_the_world(self) -> bool {
         !matches!(self, Screen::Hud | Screen::Conversation)
     }
 }
 
 /// The screen the simulation's state calls for; `inventory` is the player's own toggle. One
-/// screen is up at a time: a conversation first (a store or job board it opens waits for it
-/// to end), then the screens scripts open, then the inventory, else the HUD.
+/// screen is up at a time: a cutscene first (what it hands on to waits for it), then a
+/// conversation (a store or job board it opens waits for it to end), then the screens
+/// scripts open, then the inventory, else the HUD.
 pub fn wanted(sim: &Sim, inventory: bool) -> BTreeSet<Screen> {
     let w = &sim.world;
-    let screen = if thedas_ui::binding::conversation(sim).is_some() {
+    let screen = if w.cutscene.is_some() {
+        Screen::Cutscene
+    } else if thedas_ui::binding::conversation(sim).is_some() {
         Screen::Conversation
     } else if w.chargen.is_some() {
         Screen::LevelUp
@@ -93,6 +100,11 @@ impl Screens {
     /// Whether a menu the world waits behind is up.
     pub fn world_stopped(&self) -> bool {
         self.shown.iter().any(|s| s.stops_the_world())
+    }
+
+    /// Whether a cutscene is playing (a click skips it).
+    pub fn in_cutscene(&self) -> bool {
+        self.shown.contains(&Screen::Cutscene)
     }
 
     /// Whether only the HUD is up: clicks that miss it reach the world.
@@ -221,5 +233,12 @@ mod tests {
         assert_eq!(wanted(&sim, true), set(&[Screen::Store]));
         sim.world.store = None;
         assert_eq!(wanted(&sim, true), set(&[Screen::WorldMap]));
+        sim.world.cutscene = Some(thedas_sim::cutscene::Cutscene {
+            name: "intro.cut".into(),
+            seconds: 1.0,
+            lines: Vec::new(),
+        });
+        assert_eq!(wanted(&sim, true), set(&[Screen::Cutscene]));
+        assert!(Screen::Cutscene.stops_the_world());
     }
 }
