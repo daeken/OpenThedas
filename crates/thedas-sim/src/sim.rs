@@ -882,7 +882,7 @@ impl Sim {
             let d = crate::engine::dist(prev, p);
             if d > 0.01 {
                 if let Some(o) = self.world.get_mut(id) {
-                    o.facing = (p[1] - prev[1]).atan2(p[0] - prev[0]).to_degrees();
+                    o.facing = crate::world::facing_toward(p[0] - prev[0], p[1] - prev[1]);
                 }
             }
             self.move_object(id, p, None);
@@ -915,7 +915,7 @@ impl Sim {
         }) else {
             return;
         };
-        let (s, c) = facing.to_radians().sin_cos();
+        let (s, c) = crate::world::heading_of(facing).to_radians().sin_cos();
         for (i, f) in followers.into_iter().enumerate() {
             let ok = self.world.get(f).is_some_and(|o| {
                 !o.dead
@@ -1736,7 +1736,7 @@ impl Sim {
             float(inst, "YPosition"),
             float(inst, "ZPosition"),
         ];
-        // Rotation about Z from the quaternion, in degrees (provisional convention).
+        // Rotation about Z from the quaternion, in degrees.
         o.facing = (2.0 * q[2].atan2(q[3])).to_degrees().rem_euclid(360.0);
         if let Some(a) = int(inst, "Active") {
             o.active = a != 0;

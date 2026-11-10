@@ -77,6 +77,19 @@ pub struct Location {
     pub facing: f32,
 }
 
+/// The direction a facing looks, in degrees anticlockwise from +X. A facing is a rotation
+/// about Z (`GetOrientationFromLocation` returns it as the orientation's z) and models face
+/// +Y in their own space (the mabari's eyes and every humanoid's toes are at +Y), so a
+/// facing of 0 looks along +Y.
+pub fn heading_of(facing: f32) -> f32 {
+    facing + 90.0
+}
+
+/// The facing that looks along a direction (dx, dy).
+pub fn facing_toward(dx: f32, dy: f32) -> f32 {
+    (dy.atan2(dx).to_degrees() - 90.0).rem_euclid(360.0)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Object {
     pub id: ObjectId,
@@ -87,8 +100,9 @@ pub struct Object {
     pub name_strref: Option<u32>,
     pub area: Option<ObjectId>,
     pub position: [f32; 3],
-    /// Degrees (provisional convention: derived from the instance quaternion's rotation
-    /// about Z).
+    /// Degrees: the object's rotation about Z, as the game keeps it (an instance's
+    /// quaternion, a location's orientation z). Models face +Y, so facing 0 looks along +Y;
+    /// see [`heading_of`] and [`facing_toward`].
     pub facing: f32,
     pub active: bool,
     pub locals: Locals,
@@ -611,5 +625,23 @@ impl World {
             return None;
         }
         self.queue.remove(&key).map(|q| (key.0, q))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn facings_are_rotations_with_models_looking_along_plus_y() {
+        // Facing 0 looks along +Y; looking along +X is a quarter turn clockwise.
+        assert_eq!(heading_of(0.0), 90.0);
+        assert!((facing_toward(0.0, 1.0) - 0.0).abs() < 1e-4);
+        assert!((facing_toward(1.0, 0.0) - 270.0).abs() < 1e-4);
+        assert!((facing_toward(-1.0, 0.0) - 90.0).abs() < 1e-4);
+        for f in [0.0f32, 45.0, 92.5, 180.0, 300.0] {
+            let h = heading_of(f).to_radians();
+            assert!((facing_toward(h.cos(), h.sin()) - f).abs() < 1e-3, "{f}");
+        }
     }
 }

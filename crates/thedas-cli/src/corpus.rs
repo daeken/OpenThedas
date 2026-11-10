@@ -342,6 +342,10 @@ fn check_other(
             .map_err(|e| e.to_string())
     } else if ext == "dds" {
         Dds::parse(data).map(|_| ()).map_err(|e| e.to_string())
+    } else if ext == "mtx" {
+        thedas_formats::probe::IrradianceProbe::parse(data)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     } else if ext == "gfx" {
         return check_gfx(data, location, stats, keep);
     } else if ext == "fxo" {

@@ -3611,6 +3611,7 @@ dependencies = [
  "pollster",
  "thedas-formats",
  "thedas-render",
+ "thedas-sim",
  "thedas-ui",
  "thedas-vfs",
  "wgpu",

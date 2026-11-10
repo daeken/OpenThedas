@@ -53,8 +53,9 @@ struct Args {
     #[arg(long, default_value = "1280x720")]
     size: String,
     /// Which shaders draw the area: `original` (Static1 and its variants translated from the
-    /// game's D3D9 bytecode, stand-in for the rest), `all` (every material whose original
-    /// shaders translate), or `standin` (hand-written WGSL only).
+    /// game's D3D9 bytecode, and the creature and placeable shaders; stand-in for the rest),
+    /// `static` (Static1 only), `all` (every material whose original shaders translate), or
+    /// `standin` (hand-written WGSL only).
     #[arg(long, default_value = "original")]
     shaders: String,
     /// Vertical field of view in degrees.
@@ -66,6 +67,86 @@ struct Args {
     /// Headless: movie frames to run (at 30 fps) before capturing the interface.
     #[arg(long, default_value_t = 30)]
     ui_frames: u32,
+    /// Draw the creatures and placeables of a simulation save (from the MCP's save_state),
+    /// in its current area; `--area` is then ignored and the camera starts behind the hero.
+    #[arg(long)]
+    save: Option<PathBuf>,
+    /// Draw the creatures and placeables an area starts with (runs the simulation for the
+    /// area resource given as `--area`).
+    #[arg(long)]
+    objects: bool,
+    /// Module for `--save` and `--objects`.
+    #[arg(long, default_value = "single player")]
+    module: String,
+}
+
+/// The simulation's view of the area to draw: the level, its objects' models and the hero.
+struct SimView {
+    layout: String,
+    props: Vec<thedas_render::Prop>,
+    hero: Option<([f32; 3], f32)>,
+}
+
+/// Opens a simulation for `area` (or the save's area) and reads its models. The simulation
+/// is only read and never ticked, so the area shows its objects as placed (ticking would
+/// run the module's start, which begins an origin story elsewhere).
+fn sim_view(
+    install: &Path,
+    module: &str,
+    area: Option<&str>,
+    save: Option<&Path>,
+) -> Result<SimView> {
+    let opts = thedas_sim::session::SessionOptions {
+        install: install.to_path_buf(),
+        module: module.to_string(),
+        area: area.map(str::to_string),
+        waypoint: None,
+        seed: 1,
+        keep_trace: false,
+    };
+    let mut sim = thedas_sim::session::open(&opts)?;
+    if let Some(path) = save {
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        sim.load_json(&bytes)?;
+    }
+    let area = sim.world.area.context("the simulation is in no area")?;
+    let layout = sim.area_layout(area).context("the area has no layout")?;
+    let props = thedas_ui::models::area_models(&sim, area)
+        .into_iter()
+        .map(|m| thedas_render::Prop {
+            label: format!("{} {}", m.id, m.tag),
+            models: m.models,
+            attached: m.attached.into_iter().map(|a| (a.model, a.node)).collect(),
+            transform: thedas_render::Prop::placement(m.position, m.facing),
+        })
+        .collect();
+    let hero = sim
+        .world
+        .hero
+        .and_then(|h| sim.world.get(h))
+        .filter(|h| h.area == Some(area))
+        .map(|h| (h.position, h.facing));
+    Ok(SimView {
+        layout,
+        props,
+        hero,
+    })
+}
+
+/// Behind and above a hero at `pos` with the game's `facing`, looking the same way (as the
+/// MCP screenshot does).
+fn hero_camera(pos: [f32; 3], facing: f32) -> Camera {
+    let yaw = thedas_sim::world::heading_of(facing).to_radians();
+    let back = 4.0;
+    Camera::new(
+        Vec3::new(
+            pos[0] - yaw.cos() * back,
+            pos[1] - yaw.sin() * back,
+            pos[2] + 2.5,
+        ),
+        yaw,
+        -0.3,
+    )
 }
 
 fn parse_size(s: &str) -> Result<(u32, u32)> {
@@ -90,9 +171,10 @@ impl Loaded {
         let mut reg = ProgramRegistry::default();
         let filter = match self.shaders.as_str() {
             "standin" => return Ok(reg),
-            "original" => thedas_render::d3d::static1_filter(),
+            "original" => thedas_render::d3d::object_filter(),
+            "static" => thedas_render::d3d::static1_filter(),
             "all" => None,
-            other => bail!("--shaders must be original, all or standin, not {other}"),
+            other => bail!("--shaders must be original, static, all or standin, not {other}"),
         };
         let source = thedas_render::d3d::D3dSource::new(&self.vfs, scene, &filter);
         log::info!(
@@ -107,7 +189,12 @@ impl Loaded {
 
 /// Opens the install, mounts the level (resolving an area name through its `.are` file) and
 /// loads the scene.
-fn load(install: &Path, area: &str, shaders: &str) -> Result<Loaded> {
+fn load(
+    install: &Path,
+    area: &str,
+    shaders: &str,
+    props: &[thedas_render::Prop],
+) -> Result<Loaded> {
     let install = DaoInstall::open(install)?;
     let mut vfs = install.global_vfs(TextureQuality::High)?;
     if area == "none" {
@@ -135,12 +222,14 @@ fn load(install: &Path, area: &str, shaders: &str) -> Result<Loaded> {
         }
     };
     let started = Instant::now();
-    let scene = AreaScene::load(&vfs, &level)?;
+    let scene = AreaScene::load_with_props(&vfs, &level, props)?;
     log::info!(
-        "{level} ({}): {} rooms, {} draws, {} lights, {} meshes, {} materials, {} warnings, loaded in {:.2}s",
+        "{level} ({}): {} rooms, {} draws ({} of {} props), {} lights, {} meshes, {} materials, {} warnings, loaded in {:.2}s",
         scene.name.as_deref().unwrap_or("?"),
         scene.rooms.len(),
         scene.draws.len(),
+        scene.draws.len() - scene.static_draws,
+        scene.props.len(),
         scene.lights.len(),
         scene.meshes.len(),
         scene.materials.len(),
@@ -557,9 +646,28 @@ fn main() -> Result<()> {
         .or_else(|| std::env::var_os("THEDAS_INSTALL").map(PathBuf::from))
         .context("give --install or set THEDAS_INSTALL")?;
     let size = parse_size(&args.size)?;
-    let loaded = load(&install, &args.area, &args.shaders)?;
+    let view = if args.save.is_some() || args.objects {
+        Some(sim_view(
+            &install,
+            &args.module,
+            args.save.is_none().then_some(args.area.as_str()),
+            args.save.as_deref(),
+        )?)
+    } else {
+        None
+    };
+    let (area, props) = match &view {
+        Some(v) => (v.layout.as_str(), v.props.as_slice()),
+        None => (args.area.as_str(), &[][..]),
+    };
+    let loaded = load(&install, area, &args.shaders, props)?;
+    let hero = view.as_ref().and_then(|v| v.hero);
     let mut camera = match (&args.camera, &loaded.scene) {
         (Some(spec), _) => Camera::parse(spec).context("camera must be x,y,z,yaw,pitch")?,
+        (None, Some(_)) if hero.is_some() => {
+            let (pos, facing) = hero.unwrap_or_default();
+            hero_camera(pos, facing)
+        }
         (None, Some(scene)) => default_camera(scene),
         (None, None) => Camera::new(Vec3::ZERO, 0.0, 0.0),
     };
