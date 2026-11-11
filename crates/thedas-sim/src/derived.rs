@@ -14,12 +14,13 @@
 //! | 3 | 0x83a430 | Armor | 0 |
 //! | 4 | 0x79cd40 | AP_BONUS | (Cunning − 10) / 7 |
 //! | 5 | 0x79cdf0 | SpellPower | Magic − 10 |
-//! | 6 | 0x79cea0 | Health | Constitution − 10 |
+//! | 6 | 0x79cea0 | Health | 5 (Constitution − 10) |
 //! | 7 | 0x79cf50 | Mana_Stamina | 5 (Willpower − 10) |
 //! | 8 | 0x79d000 | Resistance_Mind | 0.5 ((Willpower − 10) + (Magic − 10) + (Cunning − 10)) |
 //! | 9 | 0x79d0f0 | Resistance_Physical | 0.5 ((Strength − 10) + (Constitution − 10) + (Dexterity − 10)) |
 //!
-//! Scores under 10 subtract.
+//! Scores under 10 subtract. An original save agrees: a hero with Constitution 14 and
+//! Willpower 11 stores Health base 100, current 120 and Mana base 100, current 105.
 
 use thedas_script::vm::ObjectId;
 
@@ -111,7 +112,7 @@ impl Sim {
             2 => dex,
             4 => cun / 7.0,
             5 => mag,
-            6 => con,
+            6 => 5.0 * con,
             7 => 5.0 * wil,
             8 => 0.5 * (wil + mag + cun),
             9 => 0.5 * (str_ + con + dex),
@@ -180,7 +181,7 @@ mod tests {
             s.world.get_mut(c).unwrap().properties.insert(p, (v, 0.0));
         }
         let bonus = |p| s.attribute_bonus(c, p);
-        assert_eq!(bonus(7), 6.0, "health: constitution 16, one a point");
+        assert_eq!(bonus(7), 30.0, "health: constitution 16, five a point");
         assert_eq!(bonus(8), 5.0, "mana/stamina: willpower 11, five a point");
         assert_eq!(bonus(9), 10.5, "attack: half of strength's and dexterity's");
         assert_eq!(bonus(10), 9.0);
