@@ -55,14 +55,14 @@ impl GpuContext {
         let bc = adapter
             .features()
             .contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
+        // Clamping to a border colour (D3D's `TEXADD_BORDER`: the sky's celestial body) when
+        // the adapter can; samplers fall back to clamping to the edge otherwise.
+        let wanted =
+            wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("thedas"),
-                required_features: if bc {
-                    wgpu::Features::TEXTURE_COMPRESSION_BC
-                } else {
-                    wgpu::Features::empty()
-                },
+                required_features: adapter.features() & wanted,
                 required_limits: wgpu::Limits::default(),
                 ..Default::default()
             })
@@ -437,6 +437,9 @@ pub struct AreaRenderer {
     pub frame_effects: bool,
     pub light: StandInLight,
     pub stats: RenderStats,
+    /// The shaders' `ApplicationTime` in seconds: the graphics clock DAOrigins.exe advances
+    /// by every frame's time (0x52ae80), which drifts the clouds.
+    time: f64,
 }
 
 impl AreaRenderer {
@@ -795,6 +798,7 @@ impl AreaRenderer {
                 })
                 .flatten(),
             frame_effects: true,
+            time: 0.0,
             light: StandInLight::default(),
             stats,
         }
@@ -909,6 +913,23 @@ impl AreaRenderer {
         }
     }
 
+    /// Advances the shaders' clock (`ApplicationTime`) by a frame's time, in seconds.
+    pub fn advance_time(&mut self, seconds: f64) {
+        if seconds.is_finite() && seconds > 0.0 {
+            self.time += seconds;
+        }
+    }
+
+    /// Sets the shaders' clock (`ApplicationTime`), in seconds.
+    pub fn set_time(&mut self, seconds: f64) {
+        self.time = if seconds.is_finite() { seconds } else { 0.0 };
+    }
+
+    /// The shaders' clock, in seconds.
+    pub fn time(&self) -> f64 {
+        self.time
+    }
+
     pub fn color_format(&self) -> wgpu::TextureFormat {
         self.color_format
     }
@@ -1000,7 +1021,8 @@ impl AreaRenderer {
         };
         ctx.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
-        self.d3d.update(ctx, camera, width, height);
+        self.d3d
+            .update(ctx, camera, width, height, self.time as f32);
         let depth = match over {
             Some(d) => d.clone(),
             None => self.depth_view(&ctx.device, width, height).clone(),

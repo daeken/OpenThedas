@@ -15,17 +15,31 @@
 //! 4. the `Default` of the parameter in the material definition;
 //! 5. zero.
 //!
+//! `g_vLightParams` (usage `LightsArray`) is what DAOrigins.exe's per-object light packer
+//! (0x46b260, reached through the usage dispatch 0x4f8a10 and 0x46baf0) writes: point
+//! lights A, B, C at positions (radius in `w`) `c0`, `c5`, `c7` and colours `c1`, `c6`, `c8`
+//! (slot tables at 0xae7fb0 and 0xae7fbc), light D at `c9`/`c11` (0xae7fc8, 0xae7fd4),
+//! unused slots zero; `c2`/`c3` the directional light; and the ambient term
+//! `c4 = (base + Σ ambient lights, 1)`: the colours of the ambient light nodes the light
+//! manager picked for the object (0x4644f8 → 0x463e40 over its ambient list, ranked by
+//! `(|r| + |g| + |b|) / 3`, 0x53d040), plus the base the render parameters carry at `+0xc0`
+//! (0x46baf0's last argument). That base is written only by the graphics detail setter
+//! (0x458eb0): `(0.2, 0.2, 0.2)` in its fallback mode 0 and zero at every Graphics Detail
+//! setting (Low, Medium, High: modes 1-3), so an exterior with no ambient light nodes (such
+//! as Lothering) gets no ambient term at all: its lightmaps carry it ([`BASE_AMBIENT`]).
+//! `g_bShaderControlBooleans` `b0`-`b2` say lights D, B and C are present and `b3` that the
+//! directional light is (0x46be70).
+//!
 //! Provisional, inferred by reading Static1's bytecode rather than verified against the
 //! original executable:
 //!
 //! - Matrices of class `MatrixRows` occupy one register per column of our column-major
 //!   matrices (the shader computes `x*c[n] + y*c[n+1] + z*c[n+2] + c[n+3]`); `MatrixColumns`
 //!   one register per row.
-//! - `g_vLightParams` layout: `c0` point light A position and radius, `c1` its colour, `c2`
-//!   directional light direction, `c3` its colour, `c4` ambient colour, `c5`/`c6` point light B,
-//!   `c7`/`c8` point light C, `c9`/`c11` light D (position/radius, colour). Light A is always
-//!   evaluated; `b0`..`b3` of `g_bShaderControlBooleans` enable D, B, C and the directional
-//!   light. Lights A-C and the directional light are multiplied by the lightmap alpha; D is not.
+//! - Which ambient lights reach a draw: those of its room (the engine's pick also filters
+//!   by the object's light visibility list, not traced); the directional light's registers
+//!   (not traced to their writer). Light A is always evaluated; lights A-C and the
+//!   directional light are multiplied by the lightmap alpha; D is not.
 //! - Fog and the sky's scattering come from the level's atmosphere ([`crate::atmosphere`]).
 //!   Shadows, the environment cubemap and the depth-of-field output are disabled (no shadow
 //!   maps, black cubemap, `oC1` dropped).
@@ -351,8 +365,14 @@ pub struct ConstantContext<'a> {
     /// The level's sky registers (`SkyParameters`), when it has an atmosphere.
     pub sky: Option<&'a [[f32; 4]; 9]>,
     /// The level's cloud registers (`CloudParameters`).
-    pub clouds: [[f32; 4]; 2],
+    pub clouds: [[f32; 4]; 3],
+    /// The shaders' `ApplicationTime`, in seconds (see [`crate::atmosphere`]).
+    pub time: f32,
 }
+
+/// The ambient term's base (see the module docs): zero at every Graphics Detail setting
+/// (DAOrigins.exe 0x458eb0 writes `(0.2, 0.2, 0.2)` only in its fallback mode 0).
+pub const BASE_AMBIENT: [f32; 3] = [0.0; 3];
 
 /// Light from every direction for draws in a level with no irradiance probe. Provisional.
 pub const NO_PROBE_IRRADIANCE: [f32; 3] = [0.35, 0.35, 0.35];
@@ -422,7 +442,9 @@ impl ConstantContext<'_> {
             r[at] = [p.x, p.y, p.z, *radius];
             r[at + 1] = [c.x, c.y, c.z, 1.0];
         }
-        r[4] = [self.ambient.x, self.ambient.y, self.ambient.z, 1.0];
+        let base = Vec3::from_array(BASE_AMBIENT);
+        let ambient = base + self.ambient;
+        r[4] = [ambient.x, ambient.y, ambient.z, 1.0];
         // The sun takes registers 2 (direction) and 3 (colour), which the shaders read under
         // control boolean 3. Provisional, from the shaders' use of them.
         if let Some((d, c)) = self.sun {
@@ -509,7 +531,7 @@ impl ConstantContext<'_> {
             ("SkyParameters", _) => {
                 Value::Vectors(self.sky.map(|s| s.to_vec()).unwrap_or_default())
             }
-            ("ApplicationTime", _) => Value::Vectors(vec![[0.0; 4]]),
+            ("ApplicationTime", _) => Value::Vectors(vec![[self.time, 0.0, 0.0, 0.0]]),
             ("CloudParameters", _) => Value::Vectors(self.clouds.to_vec()),
             ("ShadowData", _) | ("IrradianceParams", _) => Value::Vectors(Vec::new()),
             (_, "mml_vLightmapOffsetAndScale") if self.lightmap.is_some() => {
@@ -751,7 +773,8 @@ mod tests {
             sun: Some((Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.6, 0.5, 0.3))),
             fog: crate::atmosphere::fog_params(None),
             sky: None,
-            clouds: crate::atmosphere::cloud_params(None),
+            clouds: crate::atmosphere::cloud_params(None, None),
+            time: 0.0,
         };
         let t = table(vec![
             constant(
@@ -867,7 +890,8 @@ mod tests {
             sun: None,
             fog: crate::atmosphere::fog_params(None),
             sky: None,
-            clouds: crate::atmosphere::cloud_params(None),
+            clouds: crate::atmosphere::cloud_params(None, None),
+            time: 0.0,
         };
         let c = cc.fill(Some(&table(vec![constant(
             "mml_vTintColor",
@@ -920,7 +944,8 @@ mod tests {
                 sun: None,
                 fog: crate::atmosphere::fog_params(None),
                 sky: None,
-                clouds: crate::atmosphere::cloud_params(None),
+                clouds: crate::atmosphere::cloud_params(None, None),
+                time: 0.0,
             };
             let c = cc.fill(Some(&table(vec![constant(
                 "aur_mWorld",
