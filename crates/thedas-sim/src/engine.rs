@@ -1522,6 +1522,21 @@ pub fn call(
             .object(obj(a, 0))
             .is_some_and(|o| o.abilities.contains(&int(a, 1))))),
         "IsModalAbilityActive" => ok(b(h.sim.modal_active(obj(a, 0), int(a, 1)))),
+        "GetConditionedAbilities" => ok(Value::Array {
+            elem: Type::Int,
+            items: h
+                .sim
+                .conditioned_abilities(obj(a, 0), int(a, 1))
+                .into_iter()
+                .map(Value::Int)
+                .collect(),
+        }),
+        // DAOrigins.exe 0x66c1f0: the same check, for one ability (no script calls it).
+        "CanUseConditionedAbility" => ok(b(h.sim.ability_conditions_met(
+            obj(a, 0),
+            int(a, 1),
+            a.get(2).map_or(-1, |_| int(a, 2)),
+        ))),
         "GetItemInEquipSlot" => {
             let (slot, who) = (int(a, 0), obj(a, 1));
             let set = a.get(2).map_or(-1, |_| int(a, 2));
