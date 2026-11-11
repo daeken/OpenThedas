@@ -1606,7 +1606,12 @@ impl Server {
             let equipped = sim.equip_free_slots(hero);
             sim.tick(0);
             Ok(json!({
-                "taken": items.iter().map(|&i| summary(sim, i)).collect::<Vec<_>>(),
+                // Coin is counted into the money and is gone as an item.
+                "taken": items
+                    .iter()
+                    .filter(|&&i| sim.world.get(i).is_some())
+                    .map(|&i| summary(sim, i))
+                    .collect::<Vec<_>>(),
                 "money": money,
                 "equipped": equipped.iter().map(|(i, s)| json!({"item": i, "slot": s})).collect::<Vec<_>>(),
             }))
