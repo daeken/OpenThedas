@@ -58,6 +58,14 @@ const PERCEPTION_PLAYER: i64 = 12;
 /// Provisional.
 pub const VISUAL_RANGE: f32 = 60.0;
 
+/// `properties.gda`: a depletable's regeneration property out of combat and in combat
+/// (DAOrigins.exe reads them at 0x796620 and 0x79663c; see [`Sim::regenerate`]).
+const COL_REGEN: u32 = 0x7a3d_f160;
+const COL_REGEN_COMBAT: u32 = 0xe24b_074d;
+/// How often a creature regenerates, out of combat and in combat (0x71b101, 0x71b0f5).
+pub const REGEN_PERIOD_MS: u64 = 3000;
+pub const REGEN_PERIOD_COMBAT_MS: u64 = 2000;
+
 /// `EFFECT_TYPE_DEATH` in effects.gda.
 pub const EFFECT_TYPE_DEATH: i32 = 7;
 
@@ -86,6 +94,9 @@ pub struct CombatData {
     pub attack: Option<AttackResult>,
     /// `SetAttackDuration` for the attack in progress.
     pub attack_ms: Option<u64>,
+    /// Milliseconds gathered towards the next regeneration pass (see `Sim::regenerate`).
+    #[serde(default)]
+    pub regen_ms: u64,
     /// `SetAimLoopDuration` for a ranged attack in progress: the time spent aiming before
     /// the shot, on top of the attack's own duration. Provisional.
     #[serde(default)]
@@ -381,10 +392,19 @@ impl Sim {
         }
     }
 
-    /// Recovery: living creatures regain health and mana/stamina each second by their
-    /// `Regeneration_Health` and `Regeneration_Stamina` properties (`properties.gda`), or by
-    /// the `_Combat` variants while the game is in combat mode or they are fighting, up to
-    /// their maximum. Provisional: per-second rates are a guess.
+    /// Recovery, as DAOrigins.exe ticks it: each creature's update (0x6be829) passes its
+    /// stats the elapsed milliseconds and whether it is in combat (its combat state,
+    /// `GetCombatState`: `*(creature + 0xc60) == 1`, as 0x6a2580 reads it). The stats
+    /// (0x71b0e0) add the time to their own clock (+0x58) and, while it is past the period
+    /// (2000 ms in combat, 3000 ms out of it; 0x71b0f5, 0x71b101), take a period off and,
+    /// when the creature's health is above 0 (0x71b1d2), run one regeneration pass
+    /// (0x795ba0): every depletable property adds the total of its regeneration property
+    /// once (0x79cad0 -> 0x79c4a0), the out-of-combat one (`properties.gda` column
+    /// 0x7a3df160, read at 0x796620: `Regeneration_Health` 14 for health,
+    /// `Regeneration_Stamina` 29 for mana/stamina) or in combat the combat one (column
+    /// 0xe24b074d, 0x79663c: 28 and 30). So a rate is an amount per pass, not per second,
+    /// and outside combat only the creature's own combat state counts, not the game mode.
+    /// The current value stays within 0 and the property's maximum.
     pub fn regenerate(&mut self, ms: u64) {
         if ms == 0 {
             return;
@@ -393,51 +413,70 @@ impl Sim {
             constant_of(self, "PROPERTY_DEPLETABLE_HEALTH"),
             constant_of(self, "PROPERTY_DEPLETABLE_MANA_STAMINA"),
         );
-        let rates = {
-            let t = self.world.tables.get(0, "properties");
-            let id = |label: &str| {
+        // Each depletable's regeneration properties: out of combat, in combat.
+        let regen = |sim: &Sim, depletable: i32| -> [i32; 2] {
+            let t = sim.world.tables.get(0, "properties");
+            let col = |hash: u32| {
                 t.as_ref()
-                    .and_then(|t| t.find("Stat", label))
-                    .map_or(-1, |v| v as i32)
+                    .and_then(|t| match t.cell_by_hash(hash, depletable as i64)? {
+                        thedas_formats::gda::Cell::Int(v) => Some(*v as i32),
+                        _ => None,
+                    })
+                    .unwrap_or(0)
             };
-            [
-                (id("Regeneration_Health"), id("Regeneration_Stamina")),
-                (
-                    id("Regeneration_Health_Combat"),
-                    id("Regeneration_Stamina_Combat"),
-                ),
-            ]
+            [col(COL_REGEN), col(COL_REGEN_COMBAT)]
         };
-        let combat_mode = self.world.game_mode == constant_of(self, "GM_COMBAT");
-        let secs = ms as f32 / 1000.0;
-        // Each living creature's maxima (base, equipment and attributes).
-        let maxima: Vec<(ObjectId, f32, f32)> = self
+        let rates = [(health, regen(self, health)), (mana, regen(self, mana))];
+        let living: Vec<ObjectId> = self
             .world
             .objects
             .values()
             .filter(|o| o.kind == ObjectKind::Creature && !o.dead)
-            .map(|o| {
-                (
-                    o.id,
-                    self.depletable_max(o.id, health),
-                    self.depletable_max(o.id, mana),
-                )
-            })
+            .map(|o| o.id)
             .collect();
-        for (id, max_h, max_m) in maxima {
+        for id in living {
             let Some(o) = self.world.objects.get_mut(&id) else {
                 continue;
             };
-            let (h, m) = rates[(combat_mode || o.combat.in_combat) as usize];
-            for (p, r, max) in [(health, h, max_h), (mana, m, max_m)] {
-                let rate = o.properties.get(&r).map_or(0.0, |p| p.0)
-                    + o.modifiers.get(&r).copied().unwrap_or(0.0);
-                if rate == 0.0 {
-                    continue;
+            let combat = o.combat.in_combat;
+            let period = if combat {
+                REGEN_PERIOD_COMBAT_MS
+            } else {
+                REGEN_PERIOD_MS
+            };
+            o.combat.regen_ms += ms;
+            let mut passes = 0;
+            while o.combat.regen_ms > period {
+                o.combat.regen_ms -= period;
+                passes += 1;
+            }
+            for _ in 0..passes {
+                let alive = self
+                    .world
+                    .get(id)
+                    .and_then(|o| o.properties.get(&health))
+                    .is_some_and(|v| v.1 > 0.0);
+                if !alive {
+                    break;
                 }
-                if let Some(v) = o.properties.get_mut(&p) {
-                    if v.1 < max || rate < 0.0 {
-                        v.1 = (v.1 + rate * secs).clamp(0.0, max);
+                for (p, ids) in rates {
+                    let r = ids[combat as usize];
+                    if r <= 0 {
+                        continue;
+                    }
+                    let rate = self.property_total(id, r);
+                    if rate == 0.0 {
+                        continue;
+                    }
+                    let max = self.depletable_max(id, p);
+                    if let Some(v) = self
+                        .world
+                        .get_mut(id)
+                        .and_then(|o| o.properties.get_mut(&p))
+                    {
+                        if v.1 < max || rate < 0.0 {
+                            v.1 = (v.1 + rate).clamp(0.0, max);
+                        }
                     }
                 }
             }
@@ -1495,6 +1534,7 @@ mod tests {
         int EVENT_TYPE_PERCEPTION_DISAPPEAR = 26;\n\
         int EVENT_TYPE_DEATH = 4;\n\
         int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
+        int PROPERTY_DEPLETABLE_MANA_STAMINA = 8;\n\
         int GM_EXPLORE = 0;\n\
         int GM_COMBAT = 1;\n\
         int EVENT_TYPE_GAMEMODE_CHANGE = 32;\n";
@@ -1590,6 +1630,77 @@ mod tests {
         s.world.get_mut(hero).unwrap().area = None;
         s.face_target(bandit, hero);
         assert!((s.world.get(bandit).unwrap().facing - 180.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn regeneration_adds_each_rate_once_a_period_by_the_creatures_combat_state() {
+        let mut s = sim();
+        let t = crate::m2da::Tables::empty();
+        // Health (7) regenerates by 14 out of combat and 28 in it, mana/stamina (8) by 29
+        // and 30; the regeneration properties' bounds clamp their totals.
+        let row = |id: i64, ty: &str, min: i64, max: i64, regen: i64, combat: i64| {
+            (
+                id,
+                vec![
+                    Cell::Int(id),
+                    Cell::String(ty.into()),
+                    Cell::Int(min),
+                    Cell::Int(max),
+                    Cell::Int(regen),
+                    Cell::Int(combat),
+                ],
+            )
+        };
+        t.insert(
+            "properties",
+            &["ID", "Type", "Min", "Max", "#7a3df160", "#e24b074d"],
+            vec![
+                row(7, "DEPLETABLE", 1, 9999, 14, 28),
+                row(8, "DEPLETABLE", 0, 9999, 29, 30),
+                row(14, "ATTRIBUTE", 0, 50, 0, 0),
+                row(28, "ATTRIBUTE", 0, 20, 0, 0),
+                row(29, "ATTRIBUTE", -20, 50, 0, 0),
+                row(30, "ATTRIBUTE", -20, 20, 0, 0),
+            ],
+        );
+        s.world.tables = Arc::new(t);
+        let c = s.world.spawn(ObjectKind::Creature, "warden");
+        {
+            let o = s.world.get_mut(c).unwrap();
+            for (p, v) in [(7, (100.0, 50.0)), (8, (100.0, 0.0))] {
+                o.properties.insert(p, v);
+            }
+            for (p, v) in [(14, 6.0), (28, 2.0), (29, 3.0), (30, 1.0)] {
+                o.properties.insert(p, (v, 0.0));
+            }
+        }
+        let now = |s: &Sim| {
+            let o = s.world.get(c).unwrap();
+            (o.properties[&7].1, o.properties[&8].1)
+        };
+        // Out of combat, a pass comes once more than 3 s have gathered.
+        s.regenerate(3000);
+        assert_eq!(now(&s), (50.0, 0.0));
+        s.regenerate(1);
+        assert_eq!(now(&s), (56.0, 3.0));
+        // Many periods at once: one pass each.
+        s.regenerate(6000);
+        assert_eq!(now(&s), (68.0, 9.0));
+        // In combat (the creature's own state), every 2 s, by the combat rates.
+        s.world.get_mut(c).unwrap().combat.in_combat = true;
+        s.regenerate(2000);
+        assert_eq!(now(&s), (70.0, 10.0));
+        // Never past the maximum; nothing for the fallen (no health left).
+        s.world.get_mut(c).unwrap().combat.in_combat = false;
+        s.regenerate(30_000);
+        assert_eq!(now(&s), (100.0, 40.0));
+        s.world
+            .get_mut(c)
+            .unwrap()
+            .properties
+            .insert(7, (100.0, 0.0));
+        s.regenerate(9000);
+        assert_eq!(now(&s), (0.0, 40.0));
     }
 
     #[test]
