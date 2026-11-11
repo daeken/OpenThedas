@@ -384,11 +384,11 @@ mod tests {
         c
     }
 
-    /// The events queued for `aoe`: (type, target, creator, integer 0, object 0).
-    fn queued(
-        s: &Sim,
-        aoe: ObjectId,
-    ) -> Vec<(i32, Option<ObjectId>, Option<ObjectId>, i32, ObjectId)> {
+    /// A queued event: (type, target, creator, integer 0, object 0).
+    type Queued = (i32, Option<ObjectId>, Option<ObjectId>, i32, ObjectId);
+
+    /// The events queued for `aoe`.
+    fn queued(s: &Sim, aoe: ObjectId) -> Vec<Queued> {
         s.world
             .queue
             .values()
