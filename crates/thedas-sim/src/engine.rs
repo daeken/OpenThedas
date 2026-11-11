@@ -1580,6 +1580,36 @@ pub fn call(
             }
             void()
         }
+        // DAOrigins.exe (0x673ab0) removes every effect but those of duration types 4, 5
+        // and 6 (EFFECT_DURATION_TYPE_DEATH; 0x7a0c90); with bIgnoreInjuries (default TRUE)
+        // also keeps injuries, abilities 500001 to 500099 (0x651850), and with bDeath keeps
+        // effects whose type's effects.gda `IgnoreDeath` is set (0x651830).
+        "RemoveAllEffects" => {
+            let (who, keep_injuries) = (obj(a, 0), a.len() < 2 || int(a, 1) != 0);
+            let death = int(a, 2) != 0;
+            let table = h.sim.world.tables.get(0, "effects");
+            let gone: Vec<Effect> = h
+                .object(who)
+                .map(|o| {
+                    o.effects
+                        .iter()
+                        .filter(|e| !(4..=6).contains(&e.duration_type))
+                        .filter(|e| !(keep_injuries && e.ability > 500_000 && e.ability < 500_100))
+                        .filter(|e| {
+                            !death
+                                || table.as_ref().is_none_or(|t| {
+                                    cell_int(t.cell("IgnoreDeath", e.ty as i64)) == 0
+                                })
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            for e in gone {
+                h.sim.remove_effect(who, &e);
+            }
+            void()
+        }
         "RemoveEffectsByParameters" => {
             let who = obj(a, 0);
             let f = EffectFilter::new(int(a, 1), int(a, 2), obj(a, 3), 0);
@@ -4990,7 +5020,8 @@ mod coverage_tests {
         object[] GetNearestObjectToLocation(location l, int t = 4294967295, int n = 1) = 71;\n\
         int GetCreatureMana(object o) = 72;\n\
         void SetCreatureMana(object o, int n) = 73;\n\
-        int GetCreatureMaxMana(object o) = 74;\n";
+        int GetCreatureMaxMana(object o) = 74;\n\
+        void RemoveAllEffects(object o, int i = TRUE, int d = FALSE) = 75;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -5139,5 +5170,62 @@ mod coverage_tests {
             );
             assert_eq!(get(&mut s, "GetCreatureMana", mage), Some(Value::Int(want)));
         }
+    }
+
+    #[test]
+    fn removing_all_effects_spares_injuries_and_what_outlasts_death() {
+        let mut s = sim();
+        let t = crate::m2da::Tables::empty();
+        t.insert(
+            "effects",
+            &["ID", "IgnoreDeath"],
+            vec![
+                (7, vec![Cell::Int(7), Cell::Int(1)]),
+                (1012, vec![Cell::Int(1012), Cell::Int(0)]),
+            ],
+        );
+        s.world.tables = Arc::new(t);
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let give = |s: &mut Sim| {
+            let o = s.world.get_mut(c).unwrap();
+            o.effects.clear();
+            for (ty, ability, duration_type) in [
+                (1012, 10, 3),      // a buff
+                (1012, 500_001, 3), // an injury
+                (7, 0, 3),          // outlasts death
+                (1012, 0, 6),       // duration type 6 always stays
+                (1012, 0, 4),       // so do types 4 and 5
+            ] {
+                o.effects.push(Effect {
+                    ty,
+                    ability,
+                    duration_type,
+                    ..Default::default()
+                });
+            }
+        };
+        let left = |s: &Sim| -> Vec<(i32, i32, i32)> {
+            s.world
+                .get(c)
+                .unwrap()
+                .effects
+                .iter()
+                .map(|e| (e.ty, e.ability, e.duration_type))
+                .collect()
+        };
+        give(&mut s);
+        run(&mut s, c, "RemoveAllEffects", &[Value::Object(c)]);
+        assert_eq!(
+            left(&s),
+            vec![(1012, 500_001, 3), (1012, 0, 6), (1012, 0, 4)]
+        );
+        give(&mut s);
+        run(
+            &mut s,
+            c,
+            "RemoveAllEffects",
+            &[Value::Object(c), Value::Int(0), Value::Int(1)],
+        );
+        assert_eq!(left(&s), vec![(7, 0, 3), (1012, 0, 6), (1012, 0, 4)]);
     }
 }
