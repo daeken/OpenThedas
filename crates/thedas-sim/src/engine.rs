@@ -924,51 +924,58 @@ pub fn call(
         )),
 
         // --- Creature properties ----------------------------------------------------------
+        // Creature properties as DAOrigins.exe keeps them (see `Sim::property_total`): a base
+        // for every kind, a modifier for attributes and depletables, a current value for
+        // depletables only. By value type (0x66cf60, setters 0x669890, adders 0x6699c0):
+        // - TOTAL: the base, derivation and modifiers (simple ones: base and derivation),
+        //   within properties.gda's bounds; BASE: the base as set; MODIFIER: the modifiers
+        //   (0 for a simple property); CURRENT: a depletable's current value, -1 otherwise
+        //   (0xae2e00).
+        // - Setting TOTAL or BASE sets the base; CURRENT sets a depletable's current value
+        //   (within its minimum and total; nothing for other kinds); MODIFIER sets the
+        //   modifiers (nothing for a simple property). A depletable's current value is kept
+        //   within its total when the base or modifiers change.
+        // - UpdateCreatureProperty adds to the current value or the modifiers in the same
+        //   way; for TOTAL and BASE it does nothing.
         "GetCreatureProperty" => {
-            let vt = int(a, 2);
-            let base_type = constant(&h.sim.table, "PROPERTY_VALUE_BASE");
-            let modifier = constant(&h.sim.table, "PROPERTY_VALUE_MODIFIER");
-            let current = constant(&h.sim.table, "PROPERTY_VALUE_CURRENT");
-            let (base, cur) = h
-                .object(obj(a, 0))
-                .and_then(|o| o.properties.get(&int(a, 1)).copied())
-                .unwrap_or((0.0, 0.0));
-            // Equipped items add their stats to the properties itemstatdefines.gda links
-            // them to (armour to Armor, defence to Defense, ...).
-            // Equipment, attributes (see `derived`) and effects' modifiers are the modifier:
-            // part of the total.
-            let gear = h.sim.equipment_bonus(obj(a, 0), int(a, 1))
-                + h.sim.attribute_bonus(obj(a, 0), int(a, 1))
-                + h.sim.effect_modifier(obj(a, 0), int(a, 1));
-            let bounds = property_bounds(h.sim, int(a, 1));
-            let v = if vt == base_type {
-                base
-            } else if vt == modifier {
-                return ok(Value::Float(gear));
-            } else if vt == current {
-                cur
+            let (id, p, vt) = (obj(a, 0), int(a, 1), int(a, 2));
+            let kind = property_kind(h.sim, p);
+            let v = if vt == constant(&h.sim.table, "PROPERTY_VALUE_BASE") {
+                h.object(id)
+                    .and_then(|o| o.properties.get(&p))
+                    .map_or(0.0, |v| v.0)
+            } else if vt == constant(&h.sim.table, "PROPERTY_VALUE_MODIFIER") {
+                if kind == PropertyKind::Simple {
+                    0.0
+                } else {
+                    h.sim.property_modifier(id, p)
+                }
+            } else if vt == constant(&h.sim.table, "PROPERTY_VALUE_CURRENT") {
+                if kind == PropertyKind::Depletable {
+                    h.object(id)
+                        .and_then(|o| o.properties.get(&p))
+                        .map_or(0.0, |v| v.1)
+                } else {
+                    -1.0
+                }
             } else {
-                // A depletable's total is its maximum: the base and its modifiers, whatever
-                // is left of it now (see `Sim::property_total`).
-                return ok(Value::Float(h.sim.property_total(obj(a, 0), int(a, 1))));
-            };
-            // Totals and attributes stay within `properties.gda`'s Min and Max (a depletable's
-            // current value may still run down to 0). Provisional: inferred from the table.
-            let v = match bounds {
-                Some((ty, min, max)) if !(vt == current && ty == 3) => v.clamp(min, max),
-                _ => v,
+                h.sim.property_total(id, p)
             };
             ok(Value::Float(v))
         }
         "SetCreatureProperty" | "UpdateCreatureProperty" => {
-            let vt = int(a, 3);
+            let (id, p, value, vt) = (obj(a, 0), int(a, 1), float(a, 2), int(a, 3));
+            let update = name == "UpdateCreatureProperty";
             let base_type = constant(&h.sim.table, "PROPERTY_VALUE_BASE");
+            let total_type = constant(&h.sim.table, "PROPERTY_VALUE_TOTAL");
             let current = constant(&h.sim.table, "PROPERTY_VALUE_CURRENT");
+            let modifier = constant(&h.sim.table, "PROPERTY_VALUE_MODIFIER");
+            let kind = property_kind(h.sim, p);
             // Health before, to record what a hit takes.
             let health = constant(&h.sim.table, "PROPERTY_DEPLETABLE_HEALTH");
-            let health_before = (int(a, 1) == health && vt != base_type)
+            let health_before = (p == health && vt == current)
                 .then(|| {
-                    h.object(obj(a, 0))
+                    h.object(id)
                         .filter(|o| !o.dead)
                         .and_then(|o| o.properties.get(&health))
                         .map(|v| v.1)
@@ -976,32 +983,39 @@ pub fn call(
                 .flatten();
             // The hero's experience before, for followers waiting in the pool.
             let xp = constant(&h.sim.table, "PROPERTY_SIMPLE_EXPERIENCE");
-            let hero_xp_before =
-                (int(a, 1) == xp && Some(obj(a, 0)) == h.sim.world.hero).then(|| {
-                    h.object(obj(a, 0))
-                        .and_then(|o| o.properties.get(&xp))
-                        .map_or(0.0, |v| v.0)
-                });
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                let e = o.properties.entry(int(a, 1)).or_insert((0.0, 0.0));
-                let v = float(a, 2);
-                let v = if name == "UpdateCreatureProperty" {
-                    if vt == base_type { e.0 + v } else { e.1 + v }
-                } else {
-                    v
-                };
-                if vt == base_type {
-                    e.0 = v;
-                } else if vt == current {
-                    e.1 = v;
-                } else {
-                    e.0 = v;
-                    e.1 = v;
+            let hero_xp_before = (p == xp && Some(id) == h.sim.world.hero).then(|| {
+                h.object(id)
+                    .and_then(|o| o.properties.get(&xp))
+                    .map_or(0.0, |v| v.0)
+            });
+            if (vt == base_type || vt == total_type) && !update {
+                if let Some(o) = h.sim.world.get_mut(id) {
+                    o.properties.entry(p).or_insert((0.0, 0.0)).0 = value;
                 }
-                // Scripts bring the dead back by giving them health (module_core's
-                // HandleEvent_Resurrection applies no effect). Provisional.
-                let health = constant(&h.sim.table, "PROPERTY_DEPLETABLE_HEALTH");
-                if int(a, 1) == health && vt != base_type && o.dead && o.properties[&health].1 > 0.0
+            } else if vt == current && kind == PropertyKind::Depletable {
+                let max = h.sim.property_total(id, p);
+                if let Some(o) = h.sim.world.get_mut(id) {
+                    let e = o.properties.entry(p).or_insert((0.0, 0.0));
+                    let v = if update { e.1 + value } else { value };
+                    e.1 = v.clamp(0.0, max.max(0.0));
+                }
+            } else if vt == modifier && kind != PropertyKind::Simple {
+                let gear = h.sim.equipment_bonus(id, p);
+                if let Some(o) = h.sim.world.get_mut(id) {
+                    let m = o.modifiers.entry(p).or_insert(0.0);
+                    *m = if update { *m + value } else { value - gear };
+                }
+            }
+            if kind == PropertyKind::Depletable && vt != current {
+                h.sim.clamp_current(id, p);
+            }
+            // Scripts bring the dead back by giving them health (module_core's
+            // HandleEvent_Resurrection applies no effect). Provisional.
+            if let Some(o) = h.sim.world.get_mut(id) {
+                if p == health
+                    && vt == current
+                    && o.dead
+                    && o.properties.get(&health).is_some_and(|v| v.1 > 0.0)
                 {
                     o.dead = false;
                     o.died_at = None;
@@ -3377,6 +3391,28 @@ fn placeable_default_action(sim: &Sim, id: ObjectId) -> Option<i32> {
 }
 
 /// A property's type (as `GetCreaturePropertyType`), Min and Max from `properties.gda`.
+/// A property's kind (`properties.gda`'s Type), which decides which of its values exist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PropertyKind {
+    Attribute,
+    Simple,
+    Depletable,
+    Derived,
+}
+
+/// A property's kind; when the table does not say, Health and Mana_Stamina (7, 8) are
+/// depletables and the rest attributes.
+pub fn property_kind(sim: &Sim, property: i32) -> PropertyKind {
+    match property_bounds(sim, property).map(|b| b.0) {
+        Some(2) => PropertyKind::Simple,
+        Some(3) => PropertyKind::Depletable,
+        Some(4) => PropertyKind::Derived,
+        Some(_) => PropertyKind::Attribute,
+        None if property == 7 || property == 8 => PropertyKind::Depletable,
+        None => PropertyKind::Attribute,
+    }
+}
+
 pub(crate) fn property_bounds(sim: &Sim, property: i32) -> Option<(i32, f32, f32)> {
     let t = sim.world.tables.get(0, "properties")?;
     let num = |c: Option<&Cell>| match c {
@@ -3414,6 +3450,7 @@ mod tests {
         int FOLLOWER_STATE_ACTIVE = 1;\n\
         int FOLLOWER_STATE_LOCKEDACTIVE = 5;\n\
         void SetCreatureProperty(object o, int p, float f, int t) = 5;\n\
+        void UpdateCreatureProperty(object o, int p, float f, int t) = 43;\n\
         int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
         int PROPERTY_VALUE_TOTAL = 1;\n\
         int PROPERTY_VALUE_BASE = 2;\n\
@@ -4143,6 +4180,84 @@ mod tests {
         let state = |s: &mut Sim, o| run(s, hero, "GetFollowerState", &[Value::Object(o)]);
         assert_eq!(state(&mut s, hero), Some(Value::Int(1)));
         assert_eq!(state(&mut s, ally), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn property_values_follow_their_kind() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let t = crate::m2da::Tables::empty();
+        let row = |id: i64, ty: &str, min: f64, max: f64| {
+            (
+                id,
+                vec![
+                    Cell::Int(id),
+                    Cell::String(ty.into()),
+                    Cell::Float(min),
+                    Cell::Float(max),
+                ],
+            )
+        };
+        t.insert(
+            "properties",
+            &["ID", "Type", "Min", "Max"],
+            vec![
+                row(7, "DEPLETABLE", 1.0, 9999.0),
+                row(11, "ATTRIBUTE", 0.0, 1000.0),
+                row(40, "SIMPLE", -1000.0, 1000.0),
+            ],
+        );
+        s.world.tables = Arc::new(t);
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let call = |s: &mut Sim, f: &str, p: i32, v: f32, ty: i32| {
+            let a = [
+                Value::Object(c),
+                Value::Int(p),
+                Value::Float(v),
+                Value::Int(ty),
+            ];
+            run(s, c, f, &a);
+        };
+        let get = |s: &mut Sim, p: i32, ty: i32| match run(
+            s,
+            c,
+            "GetCreatureProperty",
+            &[Value::Object(c), Value::Int(p), Value::Int(ty)],
+        ) {
+            Some(Value::Float(v)) => v,
+            other => panic!("{other:?}"),
+        };
+        let (total, base, current, modifier) = (1, 2, 3, 4);
+        // A simple property keeps a negative base, and has no modifier or current value.
+        call(&mut s, "SetCreatureProperty", 40, -0.5, base);
+        call(&mut s, "SetCreatureProperty", 40, 3.0, modifier);
+        call(&mut s, "SetCreatureProperty", 40, 9.0, current);
+        assert_eq!(get(&mut s, 40, total), -0.5);
+        assert_eq!(get(&mut s, 40, modifier), 0.0);
+        assert_eq!(get(&mut s, 40, current), -1.0);
+        // An attribute: setting the total sets the base; current is not kept; modifiers add.
+        call(&mut s, "SetCreatureProperty", 11, 4.0, total);
+        call(&mut s, "SetCreatureProperty", 11, 99.0, current);
+        call(&mut s, "SetCreatureProperty", 11, -6.0, modifier);
+        assert_eq!(get(&mut s, 11, base), 4.0);
+        assert_eq!(get(&mut s, 11, current), -1.0);
+        assert_eq!(get(&mut s, 11, total), 0.0, "4 - 6, within the minimum 0");
+        call(&mut s, "UpdateCreatureProperty", 11, 3.0, modifier);
+        assert_eq!(get(&mut s, 11, total), 1.0);
+        call(&mut s, "UpdateCreatureProperty", 11, 50.0, base);
+        assert_eq!(get(&mut s, 11, base), 4.0, "updating the base does nothing");
+        // A depletable's current value stays within its total.
+        call(&mut s, "SetCreatureProperty", 7, 100.0, base);
+        call(&mut s, "SetCreatureProperty", 7, 150.0, current);
+        assert_eq!(get(&mut s, 7, current), 100.0);
+        call(&mut s, "UpdateCreatureProperty", 7, -30.0, current);
+        assert_eq!(get(&mut s, 7, current), 70.0);
+        call(&mut s, "SetCreatureProperty", 7, 50.0, base);
+        assert_eq!(
+            get(&mut s, 7, current),
+            50.0,
+            "lowering the maximum lowers what is left"
+        );
     }
 
     #[test]

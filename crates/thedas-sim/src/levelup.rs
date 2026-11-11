@@ -64,7 +64,7 @@ impl Sim {
             };
             let e = o.properties.entry(xp).or_insert((0.0, 0.0));
             e.0 = (e.0 + gained).min(cap);
-            let (have, lvl) = (e.0, o.properties.get(&level).map_or(1.0, |l| l.0.max(l.1)));
+            let (have, lvl) = (e.0, o.properties.get(&level).map_or(1.0, |l| l.0));
             if needed(lvl as i64 + 1).is_some_and(|n| have >= n) {
                 o.fields.insert("CanLevelUp".into(), 1);
             }
@@ -83,7 +83,7 @@ impl Sim {
             sim.world
                 .get(who)
                 .and_then(|o| o.properties.get(&p))
-                .map_or(0.0, |v| v.0.max(v.1))
+                .map_or(0.0, |v| v.0)
         };
         let tag = sim
             .world

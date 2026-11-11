@@ -47,27 +47,45 @@ impl Sim {
             + self.effect_modifier(id, property)
     }
 
-    /// A property's total, as `GetCreatureProperty` gives `PROPERTY_VALUE_TOTAL`: a
-    /// depletable's maximum (base and modifiers), anything else's larger of base and current
-    /// plus modifiers (equipment, attributes, effects), within `properties.gda`'s bounds.
+    /// A property's total, as `GetCreatureProperty` gives `PROPERTY_VALUE_TOTAL`
+    /// (DAOrigins.exe 0x79c760 for attributes and depletables, 0x79c6d0 for simple
+    /// properties): its base, plus its derivation, plus its modifiers (none for a simple
+    /// property), within `properties.gda`'s bounds (0x79c2d0). A depletable's total is its
+    /// maximum, whatever is left of it now.
     pub fn property_total(&self, id: ObjectId, property: i32) -> f32 {
-        let (base, cur) = self
+        use crate::engine::PropertyKind;
+        let base = self
             .world
             .get(id)
-            .and_then(|o| o.properties.get(&property).copied())
-            .unwrap_or((0.0, 0.0));
-        let gear = self.equipment_bonus(id, property)
-            + self.attribute_bonus(id, property)
-            + self.effect_modifier(id, property);
-        let bounds = crate::engine::property_bounds(self, property);
-        let v = if bounds.is_some_and(|b| b.0 == 3) {
-            base + gear
-        } else {
-            base.max(cur) + gear
+            .and_then(|o| o.properties.get(&property))
+            .map_or(0.0, |v| v.0);
+        let derived = self.attribute_bonus(id, property);
+        let v = match crate::engine::property_kind(self, property) {
+            PropertyKind::Simple => base + derived,
+            _ => base + derived + self.property_modifier(id, property),
         };
-        match bounds {
+        match crate::engine::property_bounds(self, property) {
             Some((_, min, max)) => v.clamp(min, max),
             None => v,
+        }
+    }
+
+    /// A property's modifiers (`PROPERTY_VALUE_MODIFIER`): what worn items' stats and
+    /// effects add.
+    pub fn property_modifier(&self, id: ObjectId, property: i32) -> f32 {
+        self.equipment_bonus(id, property) + self.effect_modifier(id, property)
+    }
+
+    /// Keeps a depletable's current value within its total (as the executable does when
+    /// its base or modifiers change, 0x79c860, 0x79c890).
+    pub fn clamp_current(&mut self, id: ObjectId, property: i32) {
+        let max = self.property_total(id, property).max(0.0);
+        if let Some(v) = self
+            .world
+            .get_mut(id)
+            .and_then(|o| o.properties.get_mut(&property))
+        {
+            v.1 = v.1.clamp(0.0, max);
         }
     }
 
