@@ -2032,7 +2032,13 @@ impl Server {
                     sim.world.rng = thedas_sim::world::Rng::new(seed);
                 }
                 st.trace_cursor = 0;
-                return Ok(json!({ "restored": path, "time_ms": sim.world.time_ms }));
+                // Damage an older build left in the save (see thedas_sim::save::SaveIssue).
+                let issues: Vec<String> = sim.save_issues.iter().map(|i| i.to_string()).collect();
+                return Ok(json!({
+                    "restored": path,
+                    "time_ms": sim.world.time_ms,
+                    "save_issues": issues,
+                }));
             }
             let slot = a.slot.unwrap_or_else(|| "quick".into());
             let snap = st.slots.get(&slot).cloned().ok_or("no such slot")?;

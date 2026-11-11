@@ -103,6 +103,16 @@ impl Live {
             let bytes =
                 std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
             sim.load_json(&bytes)?;
+            for issue in &sim.save_issues {
+                log::warn!("save {}: {issue}", path.display());
+            }
+            if sim.save_issues.iter().any(|i| !i.repaired) {
+                log::warn!(
+                    "save {}: made by an older build that damaged character properties; \
+                     starting a new game is advised",
+                    path.display()
+                );
+            }
         }
         // The player is in control (saves made by test drivers may have the autopilot on).
         sim.world.autopilot = false;

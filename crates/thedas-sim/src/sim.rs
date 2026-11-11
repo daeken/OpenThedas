@@ -72,6 +72,9 @@ pub struct EngineTypes {
 
 pub struct Sim {
     pub world: World,
+    /// What loading the last save found of older builds' damage (see
+    /// [`crate::save::SaveIssue`]).
+    pub save_issues: Vec<crate::save::SaveIssue>,
     pub vfs: Arc<Vfs>,
     pub table: Arc<EngineTable>,
     pub module_info: ModuleInfo,
@@ -284,6 +287,7 @@ impl Sim {
             nav_grids: HashMap::new(),
             fire_lengths: HashMap::new(),
             attack_lengths: HashMap::new(),
+            save_issues: Vec::new(),
             door_cells: HashMap::new(),
             walk_blocked_by: None,
             talk: None,

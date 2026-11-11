@@ -22,7 +22,54 @@ pub const SAVE_FORMAT: u32 = 1;
 ///   not applied; loading a revision 0 save applies them).
 /// - 2: creatures keep an appearance: saves from earlier runs have party members whose
 ///   appearance was lost (0, so they drew nothing); loading gives them their template's.
-pub const SAVE_REVISION: u32 = 2;
+/// - 3: creature properties keep their values by kind (a script writing a property's
+///   modifier no longer overwrites its base). Earlier saves may carry bases that such
+///   writes destroyed; loading one checks for what can be seen of that (see
+///   [`SaveIssue`]).
+pub const SAVE_REVISION: u32 = 3;
+
+/// The trace channel loading reports save damage on.
+pub const SAVE_CHANNEL: i32 = -7;
+
+/// Properties only ever changed through their modifier (every script write to them is a
+/// MODIFIER write), so their base is 0: Fatigue and Damage_Shield_points.
+pub const MODIFIER_ONLY_PROPERTIES: [i32; 2] = [41, 47];
+
+/// Damage an older save shows from before revision 3, when a script adding to a property's
+/// modifier set its base (and current value) to the current value plus what it added
+/// instead: an attribute (1-6) left at 0, which none can be; or a non-depletable property
+/// whose current value equals its base and is not 0, which only that write left (their
+/// current value is otherwise never set). The latter is repaired for
+/// [`MODIFIER_ONLY_PROPERTIES`] (their base and current value back to 0); otherwise the true
+/// base is lost and nothing records it, so the save is only reported.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SaveIssue {
+    pub creature: ObjectId,
+    pub tag: String,
+    pub property: i32,
+    pub base: f32,
+    pub current: f32,
+    pub repaired: bool,
+}
+
+impl std::fmt::Display for SaveIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({}): property {} has base {} and current {}, damaged by an older build ({})",
+            self.tag,
+            self.creature,
+            self.property,
+            self.base,
+            self.current,
+            if self.repaired {
+                "reset to 0"
+            } else {
+                "its true value is lost; starting a new game is advised"
+            }
+        )
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct SaveGame {
@@ -67,6 +114,64 @@ impl Sim {
                 self.apply_effect(who, e);
             }
         }
+    }
+
+    /// Looks for what a pre-revision-3 save shows of property writes that destroyed bases
+    /// (see [`SaveIssue`]), repairing what can be, and reports each on the trace.
+    fn check_property_damage(&mut self) -> Vec<SaveIssue> {
+        use crate::engine::{PropertyKind, property_kind};
+        let mut found = Vec::new();
+        let creatures: Vec<ObjectId> = self
+            .world
+            .objects
+            .values()
+            .filter(|o| o.kind == crate::world::ObjectKind::Creature)
+            .map(|o| o.id)
+            .collect();
+        for id in creatures {
+            let Some(o) = self.world.get(id) else {
+                continue;
+            };
+            let tag = o.tag.clone();
+            let props: Vec<(i32, f32, f32)> =
+                o.properties.iter().map(|(&p, &(b, c))| (p, b, c)).collect();
+            for (p, base, current) in props {
+                let zero_attribute = (1..=6).contains(&p) && base <= 0.0;
+                let written_both = property_kind(self, p) != PropertyKind::Depletable
+                    && current != 0.0
+                    && base == current;
+                if !zero_attribute && !written_both {
+                    continue;
+                }
+                let repaired = written_both && MODIFIER_ONLY_PROPERTIES.contains(&p);
+                if repaired {
+                    if let Some(v) = self
+                        .world
+                        .get_mut(id)
+                        .and_then(|o| o.properties.get_mut(&p))
+                    {
+                        *v = (0.0, 0.0);
+                    }
+                }
+                found.push(SaveIssue {
+                    creature: id,
+                    tag: tag.clone(),
+                    property: p,
+                    base,
+                    current,
+                    repaired,
+                });
+            }
+        }
+        let t = self.world.time_ms;
+        for issue in &found {
+            self.world.trace.push(crate::trace::TraceEntry::Log {
+                t,
+                channel: SAVE_CHANNEL,
+                text: issue.to_string(),
+            });
+        }
+        found
     }
 
     /// Gives creatures with no appearance their template's (saves from before revision 2).
@@ -125,6 +230,11 @@ impl Sim {
         if save_revision < 2 {
             self.restore_lost_appearances();
         }
+        self.save_issues = if save_revision < 3 {
+            self.check_property_damage()
+        } else {
+            Vec::new()
+        };
         // Saves from before world maps were simulated have none.
         if !self
             .world
@@ -229,6 +339,46 @@ mod tests {
             e,
             crate::trace::TraceEntry::Log { text, .. } if text.contains("leaves it nothing to draw")
         )));
+    }
+
+    #[test]
+    fn older_saves_report_bases_lost_to_modifier_writes() {
+        let mut s = sim();
+        let c = s.world.spawn(ObjectKind::Creature, "alistair");
+        let o = s.world.get_mut(c).unwrap();
+        o.properties.insert(1, (18.0, 0.0));
+        o.properties.insert(2, (0.0, 0.0)); // dexterity lost
+        o.properties.insert(7, (100.0, 100.0)); // a depletable: current is its own
+        o.properties.insert(41, (5.0, 5.0)); // fatigue written into its base
+        o.properties.insert(9, (60.0, 60.0)); // attack: damaged, but its base is unknown
+        let mut save = s.save_game();
+        save.revision = 2;
+        let data = serde_json::to_vec(&save).unwrap();
+        let mut t = sim();
+        t.world.trace.keep = true;
+        t.load_json(&data).unwrap();
+        let found: Vec<(i32, bool)> = t
+            .save_issues
+            .iter()
+            .map(|i| (i.property, i.repaired))
+            .collect();
+        assert_eq!(found, vec![(2, false), (9, false), (41, true)]);
+        let p = &t.world.get(c).unwrap().properties;
+        assert_eq!(p[&41], (0.0, 0.0), "fatigue is only ever a modifier");
+        assert_eq!(p[&9], (60.0, 60.0), "reported, not guessed at");
+        assert!(
+            t.world.trace.entries.iter().any(|e| matches!(
+                e,
+                crate::trace::TraceEntry::Log { channel: SAVE_CHANNEL, text, .. }
+                    if text.contains("property 2")
+            )),
+            "loading reports on the trace"
+        );
+        assert!(t.save_issues[0].to_string().contains("starting a new game"));
+        // The same world saved by this build is not suspect.
+        let mut u = sim();
+        u.load_json(&s.save_json().unwrap()).unwrap();
+        assert!(u.save_issues.is_empty());
     }
 
     #[test]
