@@ -22,6 +22,22 @@ mod field {
     pub const TEXTURE_VALUE: u32 = 23003;
     pub const TEXTURES: u32 = 23004;
     pub const VECTORS: u32 = 23005;
+    // Morph presets (`.mop`).
+    pub const PRESET_NAME: u32 = 23008;
+    pub const PARAM_NODE: u32 = 23009;
+    pub const PARAM_NAME: u32 = 23010;
+    pub const PARAM_INDEX: u32 = 23011;
+    pub const PARAM_SCALAR: u32 = 23012;
+    pub const PARAM_VECTOR: u32 = 23013;
+    pub const SCALARS: u32 = 23014;
+    pub const PRESET_VECTORS: u32 = 23015;
+    pub const TARGET_NAME: u32 = 23016;
+    pub const TARGET_WEIGHT: u32 = 23017;
+    pub const TARGETS: u32 = 23018;
+    pub const TEXTURE_NODE: u32 = 23019;
+    pub const TEXTURE_PARAM: u32 = 23020;
+    pub const TEXTURE_NAME: u32 = 23021;
+    pub const PRESET_TEXTURES: u32 = 23022;
 }
 
 /// The model list's slots, in file order (provisional: named from the files' contents).
@@ -93,6 +109,194 @@ impl Morph {
             .iter()
             .find(|n| n.name.eq_ignore_ascii_case(name))
     }
+}
+
+/// A face preset (`.mop`, GFF4 file type `MOP `): the settings character creation's face
+/// screen starts from (`chargenmorphcfg.xml` lists them per race and gender). Where a
+/// [`Morph`] holds a finished face, a preset holds the choices: the same model and tint
+/// lists, material parameters per node (a vector's index into the parameter's list, a
+/// scalar's index), texture overrides, and the weights of the face's morph targets
+/// (`UH_NOS_30a_0`), which the face screen blends into the head's vertices.
+///
+/// Field meanings are read from the shipped presets (provisional).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MorphPreset {
+    pub name: Option<String>,
+    /// Model resources by [`slot`], as in a [`Morph`].
+    pub models: Vec<Option<String>>,
+    pub tints: Vec<Option<String>>,
+    /// (node, parameter, index, value).
+    pub scalars: Vec<(String, String, i64, f32)>,
+    /// (node, parameter, index into the parameter's vectors, value).
+    pub vectors: Vec<(String, String, i64, [f32; 4])>,
+    /// (node, parameter, texture resource).
+    pub textures: Vec<(String, String, String)>,
+    /// Morph target weights: (target, weight).
+    pub targets: Vec<(String, f32)>,
+}
+
+/// Vector indices are kept below this (a head's parameters hold a handful).
+const MAX_PARAM_INDEX: i64 = 64;
+
+impl MorphPreset {
+    pub fn parse(data: &[u8]) -> TypedResult<Self> {
+        Self::from_gff4(&Gff4::parse(data)?)
+    }
+
+    pub fn from_gff4(gff: &Gff4) -> TypedResult<Self> {
+        let d = Doc::new(gff, "mop");
+        d.expect_type("MOP ")?;
+        let root = gff.root;
+        let text =
+            |id, label| -> TypedResult<String> { Ok(d.opt_str(id, label)?.unwrap_or_default()) };
+        let mut scalars = Vec::new();
+        for p in d.structs(root, field::SCALARS)? {
+            scalars.push((
+                text(p, field::PARAM_NODE)?,
+                text(p, field::PARAM_NAME)?,
+                d.opt_i64(p, field::PARAM_INDEX)?.unwrap_or(0),
+                d.opt_f32(p, field::PARAM_SCALAR)?.unwrap_or(0.0),
+            ));
+        }
+        let mut vectors = Vec::new();
+        for p in d.structs(root, field::PRESET_VECTORS)? {
+            let index = d.opt_i64(p, field::PARAM_INDEX)?.unwrap_or(0);
+            if !(0..MAX_PARAM_INDEX).contains(&index) {
+                return Err(TypedError::Invalid(format!("mop: vector index {index}")));
+            }
+            let Some(value) = d.opt_vec4(p, field::PARAM_VECTOR, 1.0)? else {
+                continue;
+            };
+            vectors.push((
+                text(p, field::PARAM_NODE)?,
+                text(p, field::PARAM_NAME)?,
+                index,
+                value,
+            ));
+        }
+        let mut textures = Vec::new();
+        for t in d.structs(root, field::PRESET_TEXTURES)? {
+            textures.push((
+                text(t, field::TEXTURE_NODE)?,
+                text(t, field::TEXTURE_PARAM)?,
+                text(t, field::TEXTURE_NAME)?,
+            ));
+        }
+        let mut targets = Vec::new();
+        for t in d.structs(root, field::TARGETS)? {
+            targets.push((
+                text(t, field::TARGET_NAME)?,
+                d.opt_f32(t, field::TARGET_WEIGHT)?.unwrap_or(0.0),
+            ));
+        }
+        Ok(MorphPreset {
+            name: d.opt_str(root, field::PRESET_NAME)?,
+            models: strings(&d, root, field::MODELS)?,
+            tints: strings(&d, root, field::TINTS)?,
+            scalars,
+            vectors,
+            textures,
+            targets,
+        })
+    }
+}
+
+impl Morph {
+    /// `self` (a finished face, the race and gender's base) with a preset's choices on it:
+    /// the preset's models and tints, its vector parameters and its textures. Provisional:
+    /// the preset's morph targets (the face's shape) and scalar parameters are not applied,
+    /// so the face keeps the base's shape and hair weights.
+    pub fn with_preset(&self, preset: &MorphPreset) -> Morph {
+        let mut m = self.clone();
+        if let Some(n) = &preset.name {
+            m.name = Some(n.clone());
+        }
+        if !preset.models.is_empty() {
+            m.models = preset.models.clone();
+        }
+        if !preset.tints.is_empty() {
+            m.tints = preset.tints.clone();
+        }
+        let node = |m: &mut Morph, name: &str| -> usize {
+            match m
+                .nodes
+                .iter()
+                .position(|n| n.name.eq_ignore_ascii_case(name))
+            {
+                Some(i) => i,
+                None => {
+                    m.nodes.push(MorphNode {
+                        name: name.to_string(),
+                        ..Default::default()
+                    });
+                    m.nodes.len() - 1
+                }
+            }
+        };
+        for (n, param, index, value) in &preset.vectors {
+            let i = node(&mut m, n);
+            let vectors = &mut m.nodes[i].vectors;
+            let j = match vectors
+                .iter()
+                .position(|(p, _)| p.eq_ignore_ascii_case(param))
+            {
+                Some(j) => j,
+                None => {
+                    vectors.push((param.clone(), Vec::new()));
+                    vectors.len() - 1
+                }
+            };
+            let list = &mut vectors[j].1;
+            let index = (*index).clamp(0, MAX_PARAM_INDEX - 1) as usize;
+            if list.len() <= index {
+                list.resize(index + 1, [0.0; 4]);
+            }
+            list[index] = *value;
+        }
+        for (n, param, texture) in &preset.textures {
+            let i = node(&mut m, n);
+            let textures = &mut m.nodes[i].textures;
+            match textures
+                .iter_mut()
+                .find(|(p, _)| p.eq_ignore_ascii_case(param))
+            {
+                Some(t) => t.1 = texture.clone(),
+                None => textures.push((param.clone(), texture.clone())),
+            }
+        }
+        m
+    }
+}
+
+/// The faces character creation's face screen offers one race and gender (`human_male`,
+/// `elf_female`; `chargenmorphcfg.xml`'s `heads`), in order, as preset names without
+/// `.mop` (`hm_cps_p01`).
+pub fn face_screen_heads(xml: &[u8], race_gender: &str) -> TypedResult<Vec<String>> {
+    let text = std::str::from_utf8(xml)
+        .map_err(|e| TypedError::Invalid(format!("chargenmorphcfg: {e}")))?;
+    let text = text.trim_start_matches('\u{feff}');
+    let doc = roxmltree::Document::parse(text)
+        .map_err(|e| TypedError::Invalid(format!("chargenmorphcfg: {e}")))?;
+    let Some(heads) = doc
+        .root_element()
+        .children()
+        .find(|n| n.has_tag_name("heads"))
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(list) = heads.children().find(|n| n.has_tag_name(race_gender)) else {
+        return Ok(Vec::new());
+    };
+    Ok(list
+        .children()
+        .filter(|n| n.has_tag_name("resource"))
+        .filter_map(|n| n.attribute("name"))
+        .map(|n| {
+            let n = n.trim().to_ascii_lowercase();
+            n.strip_suffix(".mop").map(str::to_string).unwrap_or(n)
+        })
+        .filter(|n| !n.is_empty())
+        .collect())
 }
 
 /// A list of strings; empty strings read as `None`.
@@ -290,5 +494,92 @@ mod tests {
             "wrong file type"
         );
         assert!(Morph::parse(b"not a gff").is_err());
+    }
+
+    #[test]
+    fn a_preset_puts_its_hair_colours_and_textures_on_the_base_face() {
+        let mut b = Builder::new(b"MOP ");
+        let colour = b.add(
+            b"MAT4",
+            vec![
+                (field::PARAM_NODE, s("HairM1")),
+                (field::PARAM_NAME, s("mml_vTintMaskColours")),
+                (field::PARAM_INDEX, Value::I32(2)),
+                (field::PARAM_VECTOR, Value::Vec4([0.4, 0.2, 0.1, 1.0])),
+            ],
+        );
+        let tex = b.add(
+            b"TEX ",
+            vec![
+                (field::TEXTURE_NODE, s("FaceM1")),
+                (field::TEXTURE_PARAM, s("mml_tDiffuse")),
+                (field::TEXTURE_NAME, s("uh_hed_test_0d")),
+            ],
+        );
+        let target = b.add(
+            b"MOD ",
+            vec![
+                (field::TARGET_NAME, s("UH_NOS_30a_0")),
+                (field::TARGET_WEIGHT, Value::F32(0.5)),
+            ],
+        );
+        let root = b.add(
+            b"MOP ",
+            vec![
+                (
+                    field::MODELS,
+                    strings_value(&[Some("HM_UHM_BASa_0"), None, Some("hm_har_hb4a_0")]),
+                ),
+                (field::TINTS, strings_value(&[Some("t1_skn_001")])),
+                (field::PRESET_NAME, s("hm_cps_p01")),
+                (field::PRESET_VECTORS, structs(&[colour])),
+                (field::PRESET_TEXTURES, structs(&[tex])),
+                (field::TARGETS, structs(&[target])),
+            ],
+        );
+        let p = MorphPreset::from_gff4(&b.finish(root)).unwrap();
+        assert_eq!(p.name.as_deref(), Some("hm_cps_p01"));
+        assert_eq!(p.targets, vec![("UH_NOS_30a_0".to_string(), 0.5)]);
+        // On a bald base face: the preset's hair, colour and texture.
+        let base = Morph {
+            name: Some("hm_pcc_b01".into()),
+            models: vec![
+                Some("HM_UHM_BASa_0".into()),
+                None,
+                Some("hm_har_blda_0".into()),
+            ],
+            tints: vec![],
+            nodes: vec![MorphNode {
+                name: "FaceM1".into(),
+                vertices: vec![[0.0, 0.0, 1.0, 1.0]],
+                ..Default::default()
+            }],
+        };
+        let m = base.with_preset(&p);
+        assert_eq!(m.model(slot::HAIR), Some("hm_har_hb4a_0"));
+        assert_eq!(m.name.as_deref(), Some("hm_cps_p01"));
+        let hair = m.node("HairM1").unwrap();
+        assert_eq!(hair.vectors[0].1[2], [0.4, 0.2, 0.1, 1.0]);
+        let face = m.node("facem1").unwrap();
+        assert_eq!(face.vertices.len(), 1, "the base face's shape stays");
+        assert_eq!(face.textures[0].1, "uh_hed_test_0d");
+    }
+
+    #[test]
+    fn the_face_screen_lists_its_heads_per_race_and_gender() {
+        let xml = "\u{feff}<?xml version=\"1.0\"?><morph_config><heads><human_male>\
+            <resource name=\"HM_CPS_P01.mop\"/><resource name=\"HM_PCC_B01.mop\"/>\
+            </human_male></heads><hairs><human_male><resource name=\"hm_har_blda_0\"/>\
+            </human_male></hairs></morph_config>";
+        assert_eq!(
+            face_screen_heads(xml.as_bytes(), "human_male").unwrap(),
+            vec!["hm_cps_p01", "hm_pcc_b01"]
+        );
+        assert!(
+            face_screen_heads(xml.as_bytes(), "elf_female")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(face_screen_heads(b"<not xml", "human_male").is_err());
     }
 }
