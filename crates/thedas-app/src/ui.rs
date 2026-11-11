@@ -135,27 +135,36 @@ pub struct UiLayer {
     portraits: PortraitClock,
 }
 
-/// When portraits are drawn: the party they were drawn for, milliseconds since, and how many
-/// times they have been drawn (each drawing gets new image names, so the movies load it
-/// afresh).
+/// When portraits are drawn: once, then again only when what they show changes (see
+/// [`portrait_key`]), as the original's are updated by message (`UpdatePortraitMessage`,
+/// built at 0x607b70, vtable 0xb02298, handled by `GUIPaperdoll`) rather than continuously.
+/// A member left out of a drawing (its model not drawn yet) is retried every
+/// [`PORTRAIT_RETRY_MS`]. Each drawing gets new image names, so the movies load it afresh.
+/// Provisional: which changes the original posts the message for is not traced.
 #[derive(Default)]
 struct PortraitClock {
-    party: Vec<u32>,
-    age_ms: f64,
+    key: Vec<(u32, u64)>,
+    missing: bool,
+    since_ms: f64,
     drawn: u32,
 }
 
 impl PortraitClock {
-    /// Whether they are due: the party (`party`) changed, or they are [`PORTRAITS_EVERY_MS`]
-    /// old. `dt_ms` is the time since the last call.
-    fn due(&mut self, party: Vec<u32>, dt_ms: f64) -> bool {
-        self.age_ms += dt_ms;
-        if party != self.party || self.age_ms >= PORTRAITS_EVERY_MS {
-            self.party = party;
-            self.age_ms = 0.0;
+    /// Whether they are due: what they show (`key`) changed, or a member was left out of the
+    /// last drawing [`PORTRAIT_RETRY_MS`] ago. `dt_ms` is the time since the last call.
+    fn due(&mut self, key: Vec<(u32, u64)>, dt_ms: f64) -> bool {
+        self.since_ms += dt_ms;
+        if key != self.key || (self.missing && self.since_ms >= PORTRAIT_RETRY_MS) {
+            self.key = key;
+            self.since_ms = 0.0;
             return true;
         }
         false
+    }
+
+    /// Notes which members the last drawing has.
+    fn drew(&mut self, ids: &[u32]) {
+        self.missing = self.key.iter().any(|(id, _)| !ids.contains(id));
     }
 
     /// The image name of member `id`'s portrait in drawing `drawn`.
@@ -164,9 +173,27 @@ impl PortraitClock {
     }
 }
 
-/// Portraits are drawn again this often while playing (milliseconds), and whenever the
-/// party changes. Provisional.
-const PORTRAITS_EVERY_MS: f64 = 3000.0;
+/// How soon a member missing from the last portraits is tried again (milliseconds).
+const PORTRAIT_RETRY_MS: f64 = 1000.0;
+
+/// What the party's portraits show, by member: who, in which slot, with which appearance,
+/// head morph and equipment. They are drawn again when it changes.
+pub fn portrait_key(sim: &thedas_sim::Sim) -> Vec<(u32, u64)> {
+    use std::hash::{Hash, Hasher};
+    thedas_sim::engine::party_of(sim)
+        .into_iter()
+        .map(|id| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            if let Some(o) = sim.world.get(id) {
+                o.appearance.hash(&mut h);
+                o.head_morph.hash(&mut h);
+                o.equipment.hash(&mut h);
+                o.area.hash(&mut h);
+            }
+            (id, h.finish())
+        })
+        .collect()
+}
 /// Portraits' size (pixels, square).
 pub const PORTRAIT_SIZE: u32 = 128;
 
@@ -372,10 +399,10 @@ impl UiLayer {
         }
     }
 
-    /// Whether the party's portraits are due to be drawn: the party (`party`) changed, or they
-    /// are [`PORTRAITS_EVERY_MS`] old. `dt_ms` is the time since the last call.
-    pub fn wants_portraits(&mut self, party: Vec<u32>, dt_ms: f64) -> bool {
-        self.portraits.due(party, dt_ms)
+    /// Whether the party's portraits are due to be drawn (see [`PortraitClock`]): `key` is
+    /// [`portrait_key`]'s. `dt_ms` is the time since the last call.
+    pub fn wants_portraits(&mut self, key: Vec<(u32, u64)>, dt_ms: f64) -> bool {
+        self.portraits.due(key, dt_ms)
     }
 
     /// Hands the movies freshly drawn portraits (RGBA8, [`PORTRAIT_SIZE`] square, by member).
@@ -389,6 +416,8 @@ impl UiLayer {
             self.stage.set_image(&name, None);
         }
         self.portraits.drawn += 1;
+        let ids: Vec<u32> = shots.iter().map(|(id, _)| *id).collect();
+        self.portraits.drew(&ids);
         let made = self.portraits.drawn;
         let mut names = std::collections::BTreeMap::new();
         for (id, pixels) in shots {
@@ -716,13 +745,22 @@ mod tests {
     }
 
     #[test]
-    fn portraits_are_drawn_when_the_party_changes_and_every_few_seconds() {
+    fn portraits_are_drawn_once_and_again_only_when_what_they_show_changes() {
         let mut clock = PortraitClock::default();
-        assert!(clock.due(vec![1], 16.0));
-        assert!(!clock.due(vec![1], 16.0));
-        assert!(clock.due(vec![1, 2], 16.0));
-        assert!(!clock.due(vec![1, 2], PORTRAITS_EVERY_MS - 1.0));
-        assert!(clock.due(vec![1, 2], 1.0));
+        assert!(clock.due(vec![(1, 7)], 16.0));
+        clock.drew(&[1]);
+        // Nothing changed: never again, however long it plays.
+        assert!(!clock.due(vec![(1, 7)], 16.0));
+        assert!(!clock.due(vec![(1, 7)], 60_000.0));
+        // A member joins, or one's equipment or appearance changes.
+        assert!(clock.due(vec![(1, 7), (2, 9)], 16.0));
+        clock.drew(&[1, 2]);
+        assert!(!clock.due(vec![(1, 7), (2, 9)], 16.0));
+        assert!(clock.due(vec![(1, 8), (2, 9)], 16.0));
+        // A member left out (not drawn yet) is retried, after a while.
+        clock.drew(&[1]);
+        assert!(!clock.due(vec![(1, 8), (2, 9)], PORTRAIT_RETRY_MS - 1.0));
+        assert!(clock.due(vec![(1, 8), (2, 9)], 1.0));
         assert_ne!(PortraitClock::name(1, 1), PortraitClock::name(1, 2));
     }
 }
