@@ -197,7 +197,11 @@ impl Sim {
                 wm.swapped = false;
                 true
             }
-            _ => self.level_up_message(name, args),
+            _ => {
+                self.client_option_message(name, args)
+                    || self.chargen_message(name, args)
+                    || self.level_up_message(name, args)
+            }
         }
     }
 

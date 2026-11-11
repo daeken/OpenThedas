@@ -121,7 +121,8 @@ pub struct Sim {
     pub(crate) dialog_ambient: bool,
     pub(crate) talk: Option<crate::dialog::Conversation>,
     pub(crate) plots: crate::plot::Plots,
-    strings: std::sync::OnceLock<std::collections::BTreeMap<u32, String>>,
+    /// The talk tables' strings, read once (tests set them).
+    pub(crate) strings: std::sync::OnceLock<std::collections::BTreeMap<u32, String>>,
     /// Item templates' presentation (icon, description), by template, read once.
     item_looks: std::sync::Mutex<std::collections::HashMap<String, ItemLook>>,
 }
@@ -1151,6 +1152,7 @@ impl Sim {
             return;
         };
         self.world.chargen = Some(creature);
+        self.world.chargen_mode = mode;
         let mut ev = self.chargen_event_for("CHARGEN_START", creature);
         ev.ints = vec![mode, import];
         self.world.queue_event(0, module, ev, None);
@@ -2769,6 +2771,14 @@ impl Sim {
         o.name
             .clone()
             .or_else(|| o.name_strref.and_then(|s| self.string(s)))
+            // A hero nobody named (quick start: the chargen script picks a character but no
+            // name) goes by the name character creation would have offered. Provisional: the
+            // executable's choice for an unnamed hero is not traced.
+            .or_else(|| {
+                (self.world.hero == Some(id))
+                    .then(|| self.default_first_name(id))
+                    .flatten()
+            })
             .unwrap_or_else(|| o.tag.clone())
     }
 

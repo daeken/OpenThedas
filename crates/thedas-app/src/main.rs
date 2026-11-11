@@ -4,8 +4,9 @@
 //! mouse button (or use the arrow keys) to look around, P to print the camera, F12 to save a
 //! capture, Esc to quit.
 //!
-//! Playing: `--save <file>` (a save from the MCP's save_state) or `--new-game` runs the
-//! simulation live at real time; Space pauses it. The camera follows the party leader: hold
+//! Playing: `--save <file>` (a save from the MCP's save_state) or `--new-game` (through the
+//! character creation screens; `--quick-start` skips them) runs the simulation live at real
+//! time; Space pauses it. The camera follows the party leader: hold
 //! the right mouse button to orbit, the wheel to zoom, Q/E to turn; F switches to the
 //! free-flying camera and back. A left click orders the leader: walk to the ground clicked,
 //! attack a hostile, talk to someone, use a door or container. F1-F4 choose the leader;
@@ -102,10 +103,16 @@ struct Args {
     /// area resource given as `--area`).
     #[arg(long)]
     objects: bool,
-    /// Start a new game: the module's start, through character creation's quick start.
+    /// Start a new game: the module's start, through the character creation screens.
     #[arg(long)]
     new_game: bool,
-    /// With `--new-game`: the hero's name (character creation's quick start does not ask).
+    /// With `--new-game`: skip the character creation screens (the chargen script's quick
+    /// start: a pre-made character and origin).
+    #[arg(long)]
+    quick_start: bool,
+    /// With `--new-game --quick-start`: the hero's name (quick start does not ask). The
+    /// creation screen names the hero itself: its name entry offers the background's default
+    /// name, which stands, as nothing types into the movies yet.
     #[arg(long)]
     name: Option<String>,
     /// Headless, playing: run the simulation this many milliseconds before capturing.
@@ -1752,6 +1759,8 @@ fn main() -> Result<()> {
         .unwrap_or_else(saves::SaveStore::default_dir);
     let start = if let Some(save) = &args.save {
         Some(live::Start::Save(save))
+    } else if args.new_game && args.quick_start {
+        Some(live::Start::NewGameQuick)
     } else if args.new_game {
         Some(live::Start::NewGame)
     } else if args.objects {
@@ -1769,7 +1778,9 @@ fn main() -> Result<()> {
         None => None,
     };
     // The name character creation would have taken (its script calls SetName with it).
-    if let (Some(l), Some(name), true) = (live.as_ref(), &args.name, args.new_game) {
+    if let (Some(l), Some(name), true) =
+        (live.as_ref(), &args.name, args.new_game && args.quick_start)
+    {
         let mut sim = l.sim();
         if let Some(h) = sim.world.hero.and_then(|h| sim.world.get_mut(h)) {
             h.name = Some(name.trim().to_string()).filter(|n| !n.is_empty());

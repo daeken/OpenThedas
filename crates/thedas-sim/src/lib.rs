@@ -14,6 +14,7 @@
 
 pub mod aoe;
 pub mod chanters;
+pub mod chargen;
 pub mod combat;
 pub mod cutscene;
 pub mod derived;
