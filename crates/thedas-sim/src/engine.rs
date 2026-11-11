@@ -355,6 +355,12 @@ fn cluster_center(
             }
             if d != 0.0 {
                 for &m in &members {
+                    // As DAOrigins.exe reads it (0x671ecc-0x671ef4): row m of the table for
+                    // m <= i, which every iteration sizes to the candidates, zero-filled,
+                    // before its center is tested (0x671d34, 0x652430's memset), so the row
+                    // of a candidate that was never a center (an ally, the dead) reads 0 and
+                    // excludes no one; for m > i, the center's own distance to m
+                    // (0x671ef6-0x671f49), which is within the span already.
                     let dm = if m <= i {
                         table[m][j]
                     } else {
@@ -5793,6 +5799,16 @@ mod coverage_tests {
             (area, [21.0, 0.0, 0.0])
         );
         assert_eq!(center(&mut s, vec![lone, a, c], 2, 2, 0).0, OBJECT_INVALID);
+        // The engine's distance table: an ally first in line is never a center, so its row
+        // stays zero and lets in B (5.5 from it); B, joining after the center, lets in C
+        // (4.6 from B). Measured pair by pair there would be no cluster of three foes.
+        let x2 = put(&mut s, 1, [100.0, 0.0, 0.0]);
+        let a2 = put(&mut s, 2, [102.0, 0.0, 0.0]);
+        let b2 = put(&mut s, 2, [105.5, 0.0, 0.0]);
+        let c2 = put(&mut s, 2, [102.0, 3.0, 0.0]);
+        let (got_area, p) = center(&mut s, vec![x2, a2, b2, c2], 1, 3, 0);
+        assert_eq!(got_area, area);
+        assert!((p[0] - 309.5 / 3.0).abs() < 1e-4 && (p[1] - 1.0).abs() < 1e-4);
     }
 
     #[test]
