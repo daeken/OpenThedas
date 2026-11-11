@@ -1586,11 +1586,21 @@ impl Sim {
         if blocked.is_empty() {
             return Routed::Path(p);
         }
+        let cell_of = |q: [f32; 3]| g.cell(q).map(|c| (c.1 * g.columns + c.0) as usize);
+        // A destination inside a closed door (walking to the door itself) is reached at the
+        // door: the walk ends where the route would enter it.
+        let goal_door = cell_of(to).and_then(|i| doors.iter().find(|d| d.1.contains(&i)));
         // The first closed door the open-door route goes through.
-        for q in &p {
-            if let Some(c) = g.cell(*q) {
-                let i = (c.1 * g.columns + c.0) as usize;
+        for (n, q) in p.iter().enumerate() {
+            if let Some(i) = cell_of(*q) {
                 if let Some((door, _)) = doors.iter().find(|d| d.1.contains(&i)) {
+                    if goal_door.is_some_and(|g| g.0 == *door) {
+                        let mut up_to = p[..n].to_vec();
+                        if up_to.is_empty() {
+                            up_to.push(from);
+                        }
+                        return Routed::Path(up_to);
+                    }
                     return Routed::Door(*door);
                 }
             }
