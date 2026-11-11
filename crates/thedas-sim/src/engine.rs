@@ -1725,6 +1725,34 @@ pub fn call(
                 handle: hd,
             })
         }
+        // DAOrigins.exe answers it in the handler of the GetNearestObject family (0x671510):
+        // fewer than one object asked for means one; the location's area then gives the
+        // objects whose type is in the mask, nearest first by 3D distance (0x684dd0), with
+        // no living, perception, active or self test. Provisional: the order of objects at
+        // the same distance (here by id).
+        "GetNearestObjectToLocation" => {
+            let l = match h.sim.world.handle(handle(a, 0)) {
+                Some(EngineData::Location(l)) => Some(*l),
+                _ => None,
+            };
+            let (mask, count) = (int(a, 1), int(a, 2).max(1) as usize);
+            let mut found: Vec<(f32, ObjectId)> = match l {
+                Some(l) if l.area != OBJECT_INVALID => h
+                    .sim
+                    .world
+                    .objects
+                    .values()
+                    .filter(|o| o.area == Some(l.area))
+                    .filter(|o| o.kind.script_type() & mask != 0)
+                    .map(|o| (dist(o.position, l.position), o.id))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            found.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+            ok(objects(
+                found.into_iter().take(count).map(|(_, id)| id).collect(),
+            ))
+        }
         "GetObjectsInShape" => {
             // Provisional: every shape is treated as a sphere of its largest dimension.
             let (mask, excl_dead) = (int(a, 0), int(a, 6) != 0);
@@ -4924,7 +4952,8 @@ mod coverage_tests {
         #define ENGINE_STRUCTURE_1 location\n\
         #define ENGINE_STRUCTURE_3 effect\n\
         location Location(object a, vector v, float f) = 41;\n\
-        void Engine_ApplyEffectOnParty(int d, effect e, float f = 0.0, object c = OBJECT_INVALID, int n = 0, int x = FALSE) = 70;\n";
+        void Engine_ApplyEffectOnParty(int d, effect e, float f = 0.0, object c = OBJECT_INVALID, int n = 0, int x = FALSE) = 70;\n\
+        object[] GetNearestObjectToLocation(location l, int t = 4294967295, int n = 1) = 71;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -4994,5 +5023,52 @@ mod coverage_tests {
         assert_eq!(got.expires, Some(s.world.time_ms + 5000));
         apply(&mut s, 0);
         assert_eq!((count(&s, hero), count(&s, follower)), (1, 2));
+    }
+
+    fn location(s: &mut Sim, area: ObjectId, p: [f32; 3]) -> Value {
+        run(
+            s,
+            OBJECT_INVALID,
+            "Location",
+            &[Value::Object(area), Value::Vector(p), Value::Float(0.0)],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_nearest_objects_to_a_location_are_of_its_area_and_type() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        let elsewhere = s.world.spawn(ObjectKind::Area, "elsewhere");
+        let put = |s: &mut Sim, kind, area, x: f32, dead| {
+            let o = s.world.spawn(kind, "o");
+            let obj = s.world.get_mut(o).unwrap();
+            obj.area = Some(area);
+            obj.position = [x, 0.0, 0.0];
+            obj.dead = dead;
+            o
+        };
+        let far = put(&mut s, ObjectKind::Creature, area, 9.0, false);
+        let near_dead = put(&mut s, ObjectKind::Creature, area, 1.0, true);
+        let mid = put(&mut s, ObjectKind::Creature, area, 4.0, false);
+        let chest = put(&mut s, ObjectKind::Placeable, area, 0.5, false);
+        put(&mut s, ObjectKind::Creature, elsewhere, 0.0, false);
+        let l = location(&mut s, area, [0.0; 3]);
+        let nearest = |s: &mut Sim, mask: i64, n: i32| {
+            run(
+                s,
+                OBJECT_INVALID,
+                "GetNearestObjectToLocation",
+                &[l.clone(), Value::Int(mask as i32), Value::Int(n)],
+            )
+        };
+        // Creatures only (32), the dead included, nearest first.
+        assert_eq!(
+            nearest(&mut s, 32, 5),
+            Some(objects(vec![near_dead, mid, far]))
+        );
+        // Fewer than one asked for means one; OBJECT_TYPE_ALL takes the placeable too.
+        assert_eq!(nearest(&mut s, 4294967295, 0), Some(objects(vec![chest])));
+        assert_eq!(nearest(&mut s, 0, 3), Some(objects(Vec::new())));
     }
 }
