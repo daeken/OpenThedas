@@ -115,9 +115,16 @@ pub(crate) struct D3dPass {
     /// reads what the level's placed this frame).
     places_partitions: bool,
     reach: [f32; 2],
+    /// The first partition gets its variance blur (Medium and High detail; see
+    /// [`ShadowBlur`]).
+    blur_shadows: bool,
     caster_pipelines: Vec<wgpu::RenderPipeline>,
     casters: Vec<CasterDraw>,
     caster_buffer: Option<wgpu::Buffer>,
+    /// This frame's casters in reach of each partition (see [`D3dPass::update`]).
+    caster_visible: std::sync::Mutex<Vec<[bool; 2]>>,
+    /// What the casters' constants were last filled for (see [`shadow_key`]).
+    casters_filled: std::sync::Mutex<Option<u64>>,
     caster_programs: Vec<Arc<D3dProgram>>,
     /// The (empty) texture bindings of the casters' programs.
     empty_group: wgpu::BindGroup,
@@ -140,6 +147,24 @@ pub struct ShadowTargets {
     /// stood when last drawn: world bounding spheres. Provisional: the level's pass fits
     /// the partitions to them a frame late.
     others: std::sync::Mutex<Vec<(Vec3, f32)>>,
+    /// What each pass (0 the level's, 1 the objects') has to draw this frame and drew last
+    /// (see [`shadow_key`]): when nothing changed the partitions are left as they are.
+    keys: std::sync::Mutex<ShadowKeys>,
+    /// The first partition's variance blur (see [`ShadowBlur`]).
+    blur: ShadowBlur,
+    /// The partitions' boxes as last placed, which the next frame's smooth towards their
+    /// new fit (see [`crate::shadow::partitions_smoothed`]).
+    boxes: std::sync::Mutex<[Option<crate::shadow::LightBox>; 2]>,
+}
+
+/// The passes' shadow keys (see [`ShadowTargets::keys`]).
+#[derive(Default)]
+struct ShadowKeys {
+    current: [Option<u64>; 2],
+    drawn: [Option<u64>; 2],
+    /// This frame's partitions are kept from the last (decided by the level's pass, which
+    /// draws first; the objects' pass follows it).
+    keep: bool,
 }
 
 impl ShadowTargets {
@@ -162,6 +187,7 @@ impl ShadowTargets {
             })
         };
         let t0 = make("shadow partition 0", SHADOW_FORMAT);
+        let t0_view_for_blur = t0.create_view(&Default::default());
         let t1 = make("shadow partition 1", SHADOW_FORMAT);
         let make = |label, format| {
             make(label, format).create_view(&wgpu::TextureViewDescriptor::default())
@@ -177,11 +203,242 @@ impl ShadowTargets {
             ],
             frame: std::sync::Mutex::new(None),
             others: std::sync::Mutex::new(Vec::new()),
+            keys: std::sync::Mutex::new(ShadowKeys::default()),
+            blur: ShadowBlur::new(device, size, &t0_view_for_blur),
+            boxes: std::sync::Mutex::new([None, None]),
         }
     }
 
     fn frame(&self) -> Option<PlacedPartitions> {
         *self.frame.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+impl ShadowTargets {
+    /// Blurs the first partition, as `BlurShadowTargets` does at Medium and High detail
+    /// (see [`ShadowBlur`]), unless this frame kept the partitions as they were (they are
+    /// blurred already).
+    pub fn blur_first(&self, encoder: &mut wgpu::CommandEncoder) {
+        if self.frame().is_none() {
+            return;
+        }
+        if self.keys.lock().unwrap_or_else(|e| e.into_inner()).keep {
+            return;
+        }
+        self.blur.encode(encoder);
+    }
+}
+
+/// The variance blur of the first shadow partition, as DAOrigins.exe runs it at Medium and
+/// High detail: `BlurShadowTargets` → 0x4518e0 runs the slot's filter chain (0x45fd40 →
+/// 0x45fcd0) for partition 0 only and only when the shadow quality `[0xbf22c8]` is at least
+/// 2. The chain, built at 0x4545e4-0x454b8a: `gaussianblur.mat`'s `HBlurShadow` from the
+/// partition into a temporary target, then `VBlurShadow` from it back into the partition,
+/// `fBlurWidth` 0.35 (`[0xbf20ac]`, never written) and `fWindowWidth`/`fWindowHeight` the
+/// partition's size (`[0xc1e800]`), point sampled and clamped (`PPQuadStateNoBlend.sta`).
+///
+/// `HorizontalBlurShadows.vsh` / `VerticalBlurShadows.vsh` give the step
+/// `fBlurWidth / size` along one axis; `TwoPassBlurShadows.psh` keeps the texel's red (the
+/// depth), sums its green and the greens 2, 3 and 4 steps either side, and writes that sum
+/// squared over seven, saturated, as green (blue and alpha 0). Each pass maps target pixel
+/// `(i, j)` to texture coordinate `(i, j) / size`, as D3D9 did a full-screen quad with no
+/// half-texel correction. Transcribed from the shaders' code.
+///
+/// Provisional: the temporary target's format (taken as the partition's).
+struct ShadowBlur {
+    pipeline: wgpu::RenderPipeline,
+    temp: wgpu::TextureView,
+    /// Partition 0 into the temporary target (across), then back (down).
+    passes: [wgpu::BindGroup; 2],
+    target: wgpu::TextureView,
+}
+
+/// `fBlurWidth` for the shadow blur (`[0xbf20ac]`).
+pub const SHADOW_BLUR_WIDTH: f32 = 0.35;
+
+const SHADOW_BLUR_WGSL: &str = r#"
+struct Params {
+    // The step between taps in texture coordinates, and the target's size in texels.
+    step: vec2<f32>,
+    size: vec2<f32>,
+}
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var smp: sampler;
+@group(0) @binding(2) var<uniform> p: Params;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let x = f32((i << 1u) & 2u) * 2.0 - 1.0;
+    let y = f32(i & 2u) * 2.0 - 1.0;
+    return vec4<f32>(x, y, 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let uv = (pos.xy - vec2<f32>(0.5)) / p.size;
+    let c = textureSampleLevel(src, smp, uv, 0.0);
+    var g = c.y;
+    for (var k = 2; k <= 4; k = k + 1) {
+        let o = p.step * f32(k);
+        g = g + textureSampleLevel(src, smp, uv + o, 0.0).y;
+        g = g + textureSampleLevel(src, smp, uv - o, 0.0).y;
+    }
+    return vec4<f32>(c.x, clamp(g * g * (1.0 / 7.0), 0.0, 1.0), 0.0, 0.0);
+}
+"#;
+
+impl ShadowBlur {
+    fn new(device: &wgpu::Device, size: u32, partition: &wgpu::TextureView) -> Self {
+        use wgpu::util::DeviceExt;
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shadow blur"),
+            source: wgpu::ShaderSource::Wgsl(SHADOW_BLUR_WGSL.into()),
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow blur"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadow blur"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shadow blur"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: SHADOW_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shadow blur"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let temp = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("shadow blur target"),
+                size: wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: SHADOW_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        let n = size.max(1) as f32;
+        let step = SHADOW_BLUR_WIDTH / n;
+        let group = |src: &wgpu::TextureView, step: [f32; 2]| {
+            let params: [f32; 4] = [step[0], step[1], n, n];
+            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("shadow blur"),
+                contents: bytemuck::cast_slice(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("shadow blur"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(src),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: buffer.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+        let passes = [group(partition, [step, 0.0]), group(&temp, [0.0, step])];
+        ShadowBlur {
+            pipeline,
+            temp,
+            passes,
+            target: partition.clone(),
+        }
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        for (k, out) in [&self.temp, &self.target].into_iter().enumerate() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow blur"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: out,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.passes[k], &[]);
+            pass.draw(0..3, 0..1);
+        }
     }
 }
 
@@ -198,6 +455,63 @@ struct CasterDraw {
     /// The draw's bounding sphere in its own space (centre, radius), which the partitions
     /// fit (see [`crate::shadow::partitions`]).
     sphere: (Vec3, f32),
+}
+
+/// The largest scale a transform applies along any axis (a sphere's radius grows by it).
+fn max_scale(m: &glam::Mat4) -> f32 {
+    m.x_axis
+        .truncate()
+        .length()
+        .max(m.y_axis.truncate().length())
+        .max(m.z_axis.truncate().length())
+}
+
+/// Whether a caster's world bounding sphere reaches into a partition's box: anything
+/// outside it draws nothing there (the box clips it). Conservative: the box is
+/// orthographic, so the sphere's extent along each clip axis is its radius times that
+/// row's length.
+fn in_partition(p: &crate::shadow::Partition, centre: Vec3, radius: f32) -> bool {
+    let m = &p.view_proj;
+    let c = m.transform_point3(centre);
+    let reach = |row: usize| radius * m.row(row).truncate().length();
+    let (rx, ry, rz) = (reach(0), reach(1), reach(2));
+    c.x.abs() <= 1.0 + rx && c.y.abs() <= 1.0 + ry && c.z >= -rz && c.z <= 1.0 + rz
+}
+
+/// What a pass's shadow draws depend on: the partitions, which casters each draws, and
+/// those casters' transforms and bones. The same key, the same partitions drawn.
+fn shadow_key(
+    partitions: &[crate::shadow::Partition; 2],
+    casters: &[CasterDraw],
+    visible: &[[bool; 2]],
+    worlds: &[(glam::Mat4, Option<crate::scene::LightmapRef>, usize)],
+    bones: &[Vec<[f32; 4]>],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in partitions {
+        for v in p.view_proj.to_cols_array() {
+            v.to_bits().hash(&mut h);
+        }
+    }
+    for (c, v) in casters.iter().zip(visible) {
+        if !v[0] && !v[1] {
+            continue;
+        }
+        c.draw.hash(&mut h);
+        v.hash(&mut h);
+        for x in worlds[c.draw].0.to_cols_array() {
+            x.to_bits().hash(&mut h);
+        }
+        if let Some(b) = bones.get(c.draw) {
+            for r in b {
+                for x in r {
+                    x.to_bits().hash(&mut h);
+                }
+            }
+        }
+    }
+    h.finish()
 }
 
 fn decl_usage(u: Usage) -> DeclUsage {
@@ -920,7 +1234,10 @@ impl D3dPass {
             shadows,
             places_partitions: scene.static_draws > 0,
             reach: crate::shadow::partition_reach(scene.detail),
+            blur_shadows: scene.detail != crate::scene::Detail::Low,
             caster_pipelines,
+            caster_visible: std::sync::Mutex::new(Vec::new()),
+            casters_filled: std::sync::Mutex::new(None),
             casters,
             caster_buffer,
             caster_programs: caster_programs_used,
@@ -970,7 +1287,11 @@ impl D3dPass {
                             .iter()
                             .copied(),
                     );
-                    let p = crate::shadow::partitions(camera, aspect, dir, self.reach, &casters);
+                    let previous = *t.boxes.lock().unwrap_or_else(|e| e.into_inner());
+                    let (p, kept) = crate::shadow::partitions_smoothed(
+                        camera, aspect, dir, self.reach, &casters, &previous,
+                    );
+                    *t.boxes.lock().unwrap_or_else(|e| e.into_inner()) = kept;
                     let data = crate::shadow::shadow_data(&p, camera);
                     *t.frame.lock().unwrap_or_else(|e| e.into_inner()) = Some((p, data));
                 } else {
@@ -983,8 +1304,42 @@ impl D3dPass {
         let shadow = partitions
             .map(|(_, d)| d)
             .unwrap_or(crate::d3d::NO_SHADOW_DATA);
-        if let (Some(buf), Some((p, _))) = (&self.caster_buffer, partitions) {
-            self.update_casters(ctx, buf, camera, &p);
+        if let (Some(t), Some((p, _))) = (&self.shadows, partitions) {
+            let pass = usize::from(!self.places_partitions);
+            let visible: Vec<[bool; 2]> = self
+                .casters
+                .iter()
+                .map(|c| {
+                    let (world, _, _) = &self.worlds[c.draw];
+                    let centre = world.transform_point3(c.sphere.0);
+                    let radius = c.sphere.1 * max_scale(world);
+                    [0, 1].map(|k| in_partition(&p[k], centre, radius))
+                })
+                .collect();
+            let key = shadow_key(&p, &self.casters, &visible, &self.worlds, &self.bones);
+            {
+                let mut keys = t.keys.lock().unwrap_or_else(|e| e.into_inner());
+                // The level's pass comes first each frame: an objects' pass that no longer
+                // runs leaves no key behind.
+                if pass == 0 {
+                    keys.current[1] = None;
+                }
+                keys.current[pass] = Some(key);
+            }
+            let mut filled = self
+                .casters_filled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(buf) = &self.caster_buffer
+                && *filled != Some(key)
+            {
+                self.update_casters(ctx, buf, camera, &p, &visible);
+                *filled = Some(key);
+            }
+            *self
+                .caster_visible
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = visible;
         }
         let Some(buffer) = &self.buffer else { return };
         let (view, projection) = (camera.view(), camera.projection(aspect));
@@ -1045,16 +1400,23 @@ impl D3dPass {
         buffer: &wgpu::Buffer,
         camera: &Camera,
         partitions: &[crate::shadow::Partition; 2],
+        visible: &[[bool; 2]],
     ) {
-        let mut data = vec![0u8; buffer.size() as usize];
+        // One slot's constants at a time, for the casters a partition draws.
+        let slot_size = SLOT[7] as usize;
+        let mut data = vec![0u8; slot_size];
         let lights = DrawLights::default();
-        for c in &self.casters {
+        for (c, seen) in self.casters.iter().zip(visible) {
             let (world, _, material) = &self.worlds[c.draw];
             let program = &self.caster_programs[c.pipeline];
             let Some(Some(material)) = self.caster_materials.get(*material) else {
                 continue;
             };
             for (k, slot) in c.slots.iter().enumerate() {
+                if !seen[k] {
+                    continue;
+                }
+                data.fill(0);
                 let cc = ConstantContext {
                     view: glam::Mat4::IDENTITY,
                     projection: partitions[k].view_proj,
@@ -1077,7 +1439,7 @@ impl D3dPass {
                 for (table, base) in [(program.vs.ctab.as_ref(), 0), (program.ps.ctab.as_ref(), 3)]
                 {
                     let c = cc.fill(table);
-                    let o = *slot as usize;
+                    let o = 0;
                     let f: &[u8] = bytemuck::cast_slice(&c.floats);
                     let i: &[u8] = bytemuck::cast_slice(&c.ints);
                     let b: &[u8] = bytemuck::cast_slice(&c.bools);
@@ -1086,11 +1448,10 @@ impl D3dPass {
                     data[o + SLOT[base + 2] as usize..][..b.len()].copy_from_slice(b);
                 }
                 let fix = [1.0 / PARTITION_TEXELS, 1.0 / PARTITION_TEXELS, 0.0, 0.0];
-                data[(*slot + SLOT[6]) as usize..][..16]
-                    .copy_from_slice(bytemuck::cast_slice(&fix));
+                data[SLOT[6] as usize..][..16].copy_from_slice(bytemuck::cast_slice(&fix));
+                ctx.queue.write_buffer(buffer, *slot, &data);
             }
         }
-        ctx.queue.write_buffer(buffer, 0, &data);
     }
 
     /// Records this pass's shadow casters into the partitions; `clear` starts them afresh
@@ -1106,6 +1467,25 @@ impl D3dPass {
         if t.frame().is_none() || (!clear && self.casters.is_empty()) {
             return;
         }
+        {
+            let mut keys = t.keys.lock().unwrap_or_else(|e| e.into_inner());
+            if clear {
+                // Nothing any pass draws changed since the partitions were last drawn:
+                // they are kept as they are.
+                keys.keep = keys.drawn == keys.current && keys.current[0].is_some();
+                if !keys.keep {
+                    keys.drawn = keys.current;
+                }
+            }
+            if keys.keep {
+                return;
+            }
+        }
+        let visible = self
+            .caster_visible
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         for k in 0..2 {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow partition"),
@@ -1138,7 +1518,10 @@ impl D3dPass {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            for c in &self.casters {
+            for (i, c) in self.casters.iter().enumerate() {
+                if !visible.get(i).is_some_and(|v| v[k]) {
+                    continue;
+                }
                 let Some(mesh) = meshes.get(c.mesh) else {
                     continue;
                 };
@@ -1149,6 +1532,14 @@ impl D3dPass {
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.count, 0, 0..1);
             }
+        }
+    }
+
+    /// After every renderer of the frame recorded its casters: the first partition's blur
+    /// (the level's pass, at Medium and High).
+    pub fn finish_shadows(&self, encoder: &mut wgpu::CommandEncoder) {
+        if let (Some(t), true, true) = (&self.shadows, self.places_partitions, self.blur_shadows) {
+            t.blur_first(encoder);
         }
     }
 
@@ -1171,6 +1562,27 @@ impl D3dPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn casters_count_for_a_partition_only_within_its_box() {
+        let camera = Camera::new(Vec3::new(10.0, 20.0, 2.0), 0.3, -0.1);
+        let sun = Vec3::new(-0.48, -0.83, -0.3).normalize();
+        let p = crate::shadow::partitions(&camera, 16.0 / 9.0, sun, [5.0, 15.0], &[]);
+        let ahead = camera.position + camera.forward() * 3.0;
+        // Over the near slice: in the first partition.
+        assert!(in_partition(&p[0], ahead, 0.5));
+        // Up towards the sun from there, still within the box's reach: in.
+        assert!(in_partition(&p[0], ahead - sun * 20.0, 0.5));
+        // Far to the side, or behind the slice from the sun: out.
+        let side = camera.forward().cross(Vec3::Z) * 100.0;
+        assert!(!in_partition(&p[0], ahead + side, 0.5));
+        assert!(!in_partition(&p[0], ahead + sun * 100.0, 0.5));
+        // A big sphere reaches in from outside.
+        assert!(in_partition(&p[0], ahead + side, 100.0));
+        // Scale grows a sphere's radius by its largest axis.
+        let m = glam::Mat4::from_scale(Vec3::new(1.0, 3.0, 2.0));
+        assert_eq!(max_scale(&m), 3.0);
+    }
 
     #[test]
     fn border_colours_map_to_the_nearest_wgpu_offers() {
