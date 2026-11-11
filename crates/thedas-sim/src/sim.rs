@@ -825,8 +825,10 @@ impl Sim {
     /// Tells the module a creature joined or left the active party
     /// (`EVENT_TYPE_PARTYMEMBER_ADDED` / `EVENT_TYPE_PARTYMEMBER_DROPPED`, object 0 the
     /// follower), on which module_core keeps the party plot's `GEN_<name>_IN_PARTY` flags.
-    /// No script raises these events, so the engine does when membership changes.
-    /// Provisional: where the executable raises them is not traced.
+    /// DAOrigins.exe raises them only from the party picker, for each member whose state the
+    /// picker changed (0x636f50: available to active posts ADDED at 0x63710e, active to
+    /// available DROPPED at 0x637168; also the picker GUI, 0x766c10), never from
+    /// `SetFollowerState`.
     pub(crate) fn party_membership_changed(&mut self, who: ObjectId, joined: bool) {
         let Some(module) = self.world.module else {
             return;

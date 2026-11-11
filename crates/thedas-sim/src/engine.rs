@@ -2487,15 +2487,17 @@ pub fn call(
             }
             if let Some(hero) = h.sim.world.hero.filter(|&x| x != who) {
                 let hero_group = h.object(hero).map(|o| o.group);
-                let was = h.object(hero).is_some_and(|o| o.followers.contains(&who));
+                // No PARTYMEMBER_ADDED/DROPPED: DAOrigins.exe's SetFollowerState (0x65e6e0 →
+                // 0x63b9a0, by state through 0x63ba0c) only moves the follower between the
+                // pool and the party; only the party picker raises those events (0x636f50,
+                // 0x766c10; see `Sim::party_picker`). Raising them here made the party plot's
+                // handlers, which set the state again, answer each other forever (the Human
+                // Noble siege, leaving Flemeth's hut).
                 if let Some(ho) = h.sim.world.get_mut(hero) {
                     ho.followers.retain(|&f| f != who);
                     if active {
                         ho.followers.push(who);
                     }
-                }
-                if was != active {
-                    h.sim.party_membership_changed(who, active);
                 }
                 // Joining the active party puts a follower on the player's side
                 // (GROUP_PC), whatever group it had as an NPC, and at the leader's side if
@@ -5214,7 +5216,7 @@ mod tests {
     }
 
     #[test]
-    fn the_module_hears_followers_join_and_leave_the_party() {
+    fn a_follower_state_set_by_script_raises_no_party_events() {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
         let hero = s.world.spawn(ObjectKind::Creature, "hero");
@@ -5241,12 +5243,15 @@ mod tests {
             s.world.queue.clear();
             q
         };
+        // As DAOrigins.exe's SetFollowerState: the follower joins and leaves the active
+        // party, and the module hears nothing (only the party picker raises
+        // PARTYMEMBER_ADDED/DROPPED).
         set(&mut s, 1);
-        assert_eq!(heard(&mut s), vec![(66, vec![ally])], "joined");
-        set(&mut s, 1);
-        assert!(heard(&mut s).is_empty(), "already a member");
+        assert!(heard(&mut s).is_empty());
+        assert!(s.world.get(hero).unwrap().followers.contains(&ally));
         set(&mut s, 2);
-        assert_eq!(heard(&mut s), vec![(67, vec![ally])], "left for the pool");
+        assert!(heard(&mut s).is_empty());
+        assert!(!s.world.get(hero).unwrap().followers.contains(&ally));
     }
 
     #[test]
