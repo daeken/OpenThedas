@@ -30,6 +30,8 @@ const ITEMPRPS_WORN: i64 = 1;
 /// `Int0` of a property that modifies every attribute (`Increase All Attributes`).
 const ALL_ATTRIBUTES: i32 = -1000;
 
+/// `BITM_base.gda`'s `Money - Copper`.
+const BASE_ITEM_COPPER: i32 = 17;
 impl Sim {
     /// The effects an item's properties put on whoever wears it: for each of its template's
     /// properties of the worn kind, `itemprps.gda`'s effect with its `Int0`/`Int1`,
@@ -350,10 +352,22 @@ impl Sim {
     }
 
     /// Moves an item into `to`'s inventory (from wherever it is) and tells both owners.
+    ///
+    /// Coin (base item 17, `Money - Copper`) the hero receives is counted into the hero's
+    /// money and the item is gone, as DAOrigins.exe's inventory add does (0x7409fa: an item
+    /// of base type 0x11 added to the player's inventory adds its stack size to the money
+    /// and deletes the item). Provisional: the owner it compares with is taken to be the
+    /// hero, and no inventory events are sent for the coin.
     pub fn give_item(&mut self, item: ObjectId, to: ObjectId) -> bool {
-        if self.world.get(item).is_none() || self.world.get(to).is_none() {
+        let Some(it) = self.world.get(item) else {
+            return false;
+        };
+        if self.world.get(to).is_none() {
             return false;
         }
+        let coin = (it.fields.get("BaseItem") == Some(&BASE_ITEM_COPPER)
+            && Some(to) == self.world.hero)
+            .then(|| it.fields.get("StackSize").copied().unwrap_or(1).max(1));
         let from = self
             .world
             .objects
@@ -364,6 +378,14 @@ impl Sim {
             f.inventory.retain(|&i| i != item);
             f.equipment.retain(|_, i| *i != item);
             f.other_set.retain(|_, i| *i != item);
+        }
+        if let Some(coppers) = coin {
+            if let Some(t) = self.world.get_mut(to) {
+                t.inventory.retain(|&i| i != item);
+                t.money = t.money.saturating_add(coppers);
+            }
+            self.world.objects.remove(&item);
+            return true;
         }
         if let Some(t) = self.world.get_mut(to) {
             if !t.inventory.contains(&item) {
@@ -936,6 +958,36 @@ mod tests {
                 (bag, 7, Some(hero), vec![blood])
             ]
         );
+    }
+
+    #[test]
+    fn coin_the_hero_picks_up_becomes_money() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.hero = Some(hero);
+        let ally = s.world.spawn(ObjectKind::Creature, "ally");
+        let chest = s.world.spawn(ObjectKind::Placeable, "chest");
+        let coin = |s: &mut Sim, n: i32| {
+            let c = s.world.spawn(ObjectKind::Item, "gen_im_copper");
+            let f = &mut s.world.get_mut(c).unwrap().fields;
+            f.insert("BaseItem".into(), 17);
+            f.insert("StackSize".into(), n);
+            c
+        };
+        let (a, b) = (coin(&mut s, 37), coin(&mut s, 5));
+        let gem = s.world.spawn(ObjectKind::Item, "gem");
+        s.world.get_mut(chest).unwrap().inventory = vec![a, gem];
+        assert_eq!(s.loot(chest, hero), vec![a, gem]);
+        let h = s.world.get(hero).unwrap();
+        assert_eq!(h.money, 37);
+        assert_eq!(h.inventory, vec![gem]);
+        assert!(s.world.get(a).is_none());
+        assert!(s.world.get(chest).unwrap().inventory.is_empty());
+        // Anyone else keeps coin as an item.
+        assert!(s.give_item(b, ally));
+        assert_eq!(s.world.get(ally).unwrap().inventory, vec![b]);
+        assert_eq!(s.world.get(ally).unwrap().money, 0);
     }
 
     #[test]

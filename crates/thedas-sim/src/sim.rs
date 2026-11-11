@@ -2019,6 +2019,13 @@ impl Sim {
         if let Some(r) = int(inst, "Rank") {
             o.rank = r;
         }
+        // So do its other integer fields (the treasure category a designer sets on each
+        // chest or creature placed, a lock's difficulty, ...).
+        for fl in &inst.fields {
+            if let Some(v) = int(inst, &fl.label) {
+                o.fields.insert(fl.label.clone(), v);
+            }
+        }
         read_vars(are, inst, &mut o.locals);
         if kind == ObjectKind::Trigger {
             for &p in list_of(inst, "Geometry") {

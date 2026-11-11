@@ -2064,7 +2064,29 @@ pub fn call(
         }
 
         // --- Template-backed getters --------------------------------------------------------
-        "GetPackage" | "GetCreatureRacialType" | "GetCombatantType" | "GetPlaceableBaseType" => {
+        // A placeable's type (1 door, 2 container, ...): the placeables table's (93)
+        // `BaseType` at its appearance, as DAOrigins.exe reads it when loading one
+        // (0x75084d) into the byte the command returns (0x65efc0). placeable_core
+        // generates a container's treasure on spawn only for type 2.
+        "GetPlaceableBaseType" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::Placeable)
+                .and_then(|o| o.fields.get("Appearance").copied())
+                .and_then(|ap| {
+                    match h
+                        .sim
+                        .world
+                        .tables()
+                        .get(93, "")?
+                        .cell("BaseType", ap as i64)?
+                    {
+                        Cell::Int(v) => Some(*v as i32),
+                        _ => None,
+                    }
+                })
+                .unwrap_or(0),
+        )),
+        "GetPackage" | "GetCreatureRacialType" | "GetCombatantType" => {
             let field = match name {
                 "GetPackage" => "Package",
                 "GetCreatureRacialType" => "Race",
@@ -3062,6 +3084,14 @@ pub fn call(
             void()
         }
         "GetCanDiePermanently" => ok(b(h.object(obj(a, 0)).is_some_and(|o| !o.immortal))),
+        // A placeable's treasure category and rank, as its instance sets them (`TreasureCategory`,
+        // `Rank`). Provisional: the rank is taken to be the placed object's `Rank`.
+        "GetPlaceableTreasureCategory" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .and_then(|o| o.fields.get("TreasureCategory").copied())
+                .unwrap_or(0),
+        )),
+        "GetPlaceableTreasureRank" => ok(Value::Int(h.object(obj(a, 0)).map_or(0, |o| o.rank))),
         "GetCreatureTreasureCategory" => ok(Value::Int(
             h.object(obj(a, 0))
                 .and_then(|o| o.fields.get("TreasureCategory").copied())
@@ -3402,6 +3432,7 @@ mod tests {
         effect SetEffectEngineInteger(effect e, int i, int v) = 28;\n\
         int GetEffectType(effect e) = 29;\n\
         string GetPlotGUID(string s) = 30;\n\
+        int GetPlaceableBaseType(object o) = 40;\n\
         int FOLLOWER_STATE_AVAILABLE = 2;\n\
         int PROPERTY_SIMPLE_EXPERIENCE = 19;\n\
         int PROPERTY_SIMPLE_LEVEL = 15;\n";
@@ -3558,6 +3589,47 @@ mod tests {
             });
         }
         assert_eq!(flags(&mut s), Some(Value::Int(7 | 512)));
+    }
+
+    #[test]
+    fn a_placeables_base_type_comes_from_its_appearance_row() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let t = crate::m2da::Tables::empty();
+        // Placeables (93): appearance 5 is a container (2), 7 a door (1).
+        t.insert(
+            "#93",
+            &["ID", "Label", "BaseType"],
+            vec![
+                (
+                    5,
+                    vec![Cell::Int(5), Cell::String("chest".into()), Cell::Int(2)],
+                ),
+                (
+                    7,
+                    vec![Cell::Int(7), Cell::String("door".into()), Cell::Int(1)],
+                ),
+            ],
+        );
+        s.world.tables = Arc::new(t);
+        let spawn = |s: &mut Sim, kind, appearance| {
+            let id = s.world.spawn(kind, "x");
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .fields
+                .insert("Appearance".into(), appearance);
+            id
+        };
+        let chest = spawn(&mut s, ObjectKind::Placeable, 5);
+        let door = spawn(&mut s, ObjectKind::Placeable, 7);
+        let odd = spawn(&mut s, ObjectKind::Placeable, 99);
+        let wolf = spawn(&mut s, ObjectKind::Creature, 5);
+        let base = |s: &mut Sim, o| run(s, o, "GetPlaceableBaseType", &[Value::Object(o)]);
+        assert_eq!(base(&mut s, chest), Some(Value::Int(2)));
+        assert_eq!(base(&mut s, door), Some(Value::Int(1)));
+        assert_eq!(base(&mut s, odd), Some(Value::Int(0)));
+        assert_eq!(base(&mut s, wolf), Some(Value::Int(0)));
     }
 
     #[test]
