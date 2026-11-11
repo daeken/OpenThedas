@@ -216,6 +216,35 @@ pub const STUBS: &[&str] = &[
     "LogStoryEvent",
 ];
 
+/// The effect behind `effect` as an apply function hands it on: with its duration type, a
+/// temporary effect's end (`duration` seconds from now), its creator (if valid) and the
+/// ability it comes from (`GetEffectAbilityID`; if given and not 0).
+fn applied_effect(
+    h: &ScriptHost,
+    effect: Option<u64>,
+    duration_type: i32,
+    duration: f32,
+    creator: ObjectId,
+    ability: Option<i32>,
+) -> Option<Effect> {
+    let Some(EngineData::Effect(e)) = h.sim.world.handle(effect) else {
+        return None;
+    };
+    let mut e = e.clone();
+    e.duration_type = duration_type;
+    if creator != OBJECT_INVALID && creator != 0 {
+        e.creator = Some(creator);
+    }
+    if let Some(ability) = ability.filter(|&x| x != 0) {
+        e.ability = ability;
+    }
+    let temporary = constant(&h.sim.table, "EFFECT_DURATION_TYPE_TEMPORARY");
+    if e.duration_type == temporary && duration > 0.0 {
+        e.expires = Some(h.sim.world.time_ms + (duration.min(1.0e6) * 1000.0) as u64);
+    }
+    Some(e)
+}
+
 /// Converts `CommandMoveToObject` to `COMMAND_TYPE_MOVE_TO_OBJECT`.
 fn command_constant(name: &str) -> String {
     // Where script.ldf spells the type differently from the constructor.
@@ -1441,22 +1470,30 @@ pub fn call(
             })
         }
         "Engine_ApplyEffectOnObject" | "ApplyEffectOnObject" => {
-            if let Some(EngineData::Effect(mut e)) = h.sim.world.handle(handle(a, 1)).cloned() {
-                e.duration_type = int(a, 0);
-                let creator = obj(a, 4);
-                if creator != OBJECT_INVALID && creator != 0 {
-                    e.creator = Some(creator);
-                }
-                // The ability the effect comes from (`GetEffectAbilityID`).
-                if a.len() > 5 && int(a, 5) != 0 {
-                    e.ability = int(a, 5);
-                }
-                // A temporary effect lasts its duration (seconds).
-                let temporary = constant(&h.sim.table, "EFFECT_DURATION_TYPE_TEMPORARY");
-                if e.duration_type == temporary && float(a, 3) > 0.0 {
-                    e.expires = Some(t + (float(a, 3).min(1.0e6) * 1000.0) as u64);
-                }
+            let ability = (a.len() > 5).then(|| int(a, 5));
+            if let Some(e) =
+                applied_effect(h, handle(a, 1), int(a, 0), float(a, 3), obj(a, 4), ability)
+            {
                 h.sim.apply_effect(obj(a, 2), e);
+            }
+            void()
+        }
+        // DAOrigins.exe (0x672200) gives the effect its duration, creator and ability as
+        // Engine_ApplyEffectOnObject does, then applies a copy to every member of the party
+        // list (the one GetPartyList returns, 0x672ba0), skipping the creator when
+        // bExcludeCreator is set.
+        "Engine_ApplyEffectOnParty" => {
+            let creator = obj(a, 3);
+            let exclude = int(a, 5) != 0;
+            let ability = (a.len() > 4).then(|| int(a, 4));
+            if let Some(e) =
+                applied_effect(h, handle(a, 1), int(a, 0), float(a, 2), creator, ability)
+            {
+                for m in party_of(h.sim) {
+                    if !(exclude && m == creator) {
+                        h.sim.apply_effect(m, e.clone());
+                    }
+                }
             }
             void()
         }
@@ -4865,5 +4902,97 @@ mod tests {
         ];
         assert!(inside([1.0, 1.0, 5.0], &square));
         assert!(!inside([3.0, 1.0, 0.0], &square));
+    }
+}
+
+/// Engine functions taken off the coverage list; their own script header, so ids do not
+/// collide with `tests`.
+#[cfg(test)]
+mod coverage_tests {
+    use std::sync::Arc;
+
+    use thedas_script::EngineTable;
+    use thedas_vfs::Vfs;
+
+    use super::*;
+
+    const LDF: &str = "int FALSE = 0;\n\
+        int TRUE = 1;\n\
+        int EFFECT_DURATION_TYPE_INSTANT = 1;\n\
+        int EFFECT_DURATION_TYPE_TEMPORARY = 2;\n\
+        int EFFECT_DURATION_TYPE_PERMANENT = 3;\n\
+        #define ENGINE_STRUCTURE_1 location\n\
+        #define ENGINE_STRUCTURE_3 effect\n\
+        location Location(object a, vector v, float f) = 41;\n\
+        void Engine_ApplyEffectOnParty(int d, effect e, float f = 0.0, object c = OBJECT_INVALID, int n = 0, int x = FALSE) = 70;\n";
+
+    fn sim() -> Sim {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        Sim::new(Arc::new(Vfs::new()), table, 1)
+    }
+
+    /// Calls engine function `name` as `caller`.
+    fn run(s: &mut Sim, caller: ObjectId, name: &str, a: &[Value]) -> Option<Value> {
+        let f = s.table.function_by_name(name).cloned().unwrap();
+        let mut h = ScriptHost {
+            sim: s,
+            event: None,
+            script: "test".into(),
+        };
+        call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    fn effect_value(s: &mut Sim, e: Effect) -> Value {
+        let hd = s.world.store(EngineData::Effect(e));
+        Value::Engine {
+            ty: s.types.effect,
+            handle: Some(hd),
+        }
+    }
+
+    #[test]
+    fn a_party_effect_reaches_every_member_but_an_excluded_creator() {
+        let mut s = sim();
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let follower = s.world.spawn(ObjectKind::Creature, "follower");
+        let stranger = s.world.spawn(ObjectKind::Creature, "stranger");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().followers.push(follower);
+        let e = effect_value(
+            &mut s,
+            Effect {
+                ty: 1012,
+                ..Default::default()
+            },
+        );
+        let apply = |s: &mut Sim, exclude: i32| {
+            run(
+                s,
+                hero,
+                "Engine_ApplyEffectOnParty",
+                &[
+                    Value::Int(2),
+                    e.clone(),
+                    Value::Float(5.0),
+                    Value::Object(hero),
+                    Value::Int(300),
+                    Value::Int(exclude),
+                ],
+            );
+        };
+        apply(&mut s, 1);
+        let count = |s: &Sim, o: ObjectId| s.world.get(o).unwrap().effects.len();
+        assert_eq!(
+            (count(&s, hero), count(&s, follower), count(&s, stranger)),
+            (0, 1, 0)
+        );
+        let got = s.world.get(follower).unwrap().effects[0].clone();
+        assert_eq!(
+            (got.creator, got.ability, got.duration_type),
+            (Some(hero), 300, 2)
+        );
+        assert_eq!(got.expires, Some(s.world.time_ms + 5000));
+        apply(&mut s, 0);
+        assert_eq!((count(&s, hero), count(&s, follower)), (1, 2));
     }
 }
