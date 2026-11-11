@@ -208,9 +208,9 @@ const PRESENTATION: &[&str] = &[
 ];
 
 /// Engine functions answered with a fixed placeholder because the simulation lacks what
-/// they need (pools, ...). Calls to
-/// them are counted (`Trace::stubbed`) so coverage work can follow what the game uses.
-pub const STUBS: &[&str] = &["GetPlotSummary", "CreatePool", "LogStoryEvent"];
+/// they need (the plot summary text, ...). Calls to them are counted (`Trace::stubbed`) so
+/// coverage work can follow what the game uses.
+pub const STUBS: &[&str] = &["GetPlotSummary"];
 
 /// Whether an object lies in a script shape at `l` (DAOrigins.exe 0x670eb0): its body is a
 /// circle on the ground (z is ignored) of the creature's personal space (0 for other
@@ -2842,6 +2842,9 @@ pub fn call(
                 .unwrap_or(0),
         )),
         // Pools only make creatures ahead of time; CreateObject makes them either way.
+        // DAOrigins.exe (0x6598d0) builds a pool of creatures from the template in the current
+        // area ahead of the scripts' CreateObject calls, and returns TRUE: a loading
+        // optimisation the simulation does without (it creates objects when asked).
         "CreatePool" => ok(Value::Int(1)),
         "GetCreatureGoreLevel" => ok(Value::Float(0.0)),
         "GetCreaturePropertyType" => ok(Value::Int(
@@ -3199,12 +3202,13 @@ pub fn call(
                 .load_items_from_template(obj(a, 0), &string(a, 1), int(a, 2) != 0);
             void()
         }
+        // DAOrigins.exe (0x666da0, 0x643bf0) adds an event with an id above 0 to the save's
+        // "Story So Far" list, with the time. Provisional: the time kept is game time (the
+        // engine records the play time and the wall clock).
         "LogStoryEvent" => {
-            h.sim.world.trace.push(TraceEntry::Log {
-                t,
-                channel: -3,
-                text: format!("{name}{:?} (no effect in the simulation)", a),
-            });
+            if int(a, 0) > 0 {
+                h.sim.world.story_events.push((int(a, 0), t));
+            }
             void()
         }
         "SetStoryPlot" => {
@@ -5436,7 +5440,9 @@ mod coverage_tests {
         void DisplayPortraitMessage(object o, string s, int c = 16777215) = 95;\n\
         void SetLocation(object o, location l) = 96;\n\
         resource GetCurrentScriptResource() = 97;\n\
-        void SetItemIndestructible(object o, int b) = 98;\n";
+        void SetItemIndestructible(object o, int b) = 98;\n\
+        void LogStoryEvent(int n) = 99;\n\
+        int CreatePool(resource r, int n) = 100;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -6079,5 +6085,25 @@ mod coverage_tests {
             s.world.get(shield).unwrap().fields.get("Indestructible"),
             Some(&1)
         );
+    }
+
+    #[test]
+    fn story_events_are_kept_and_pools_need_nothing() {
+        let mut s = sim();
+        s.world.time_ms = 4000;
+        for id in [12, 0, 7] {
+            run(&mut s, 1, "LogStoryEvent", &[Value::Int(id)]);
+        }
+        assert_eq!(s.world.story_events, vec![(12, 4000), (7, 4000)]);
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "CreatePool",
+                &[Value::Resource("c.utc".into()), Value::Int(3)]
+            ),
+            Some(Value::Int(1))
+        );
+        assert!(s.world.trace.stubbed.is_empty());
     }
 }
