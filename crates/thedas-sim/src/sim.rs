@@ -765,6 +765,25 @@ impl Sim {
         true
     }
 
+    /// Tells the module a creature joined or left the active party
+    /// (`EVENT_TYPE_PARTYMEMBER_ADDED` / `EVENT_TYPE_PARTYMEMBER_DROPPED`, object 0 the
+    /// follower), on which module_core keeps the party plot's `GEN_<name>_IN_PARTY` flags.
+    /// No script raises these events, so the engine does when membership changes.
+    /// Provisional: where the executable raises them is not traced.
+    pub(crate) fn party_membership_changed(&mut self, who: ObjectId, joined: bool) {
+        let Some(module) = self.world.module else {
+            return;
+        };
+        let name = if joined {
+            "PARTYMEMBER_ADDED"
+        } else {
+            "PARTYMEMBER_DROPPED"
+        };
+        let mut ev = self.new_event(name, self.world.hero);
+        ev.objects = vec![who];
+        self.world.queue_event(0, module, ev, None);
+    }
+
     /// `ShowPartyPickerGUI` with no player to pick: the module hears the picker open
     /// (`EVENT_TYPE_PARTYPICKER_INIT`), the active party keeps its members and free places
     /// (three followers in all) go to the pool in the order they were recruited, then the
@@ -836,6 +855,17 @@ impl Sim {
                     o.group = group;
                 }
             }
+        }
+        let before = self
+            .world
+            .get(hero)
+            .map(|h| h.followers.clone())
+            .unwrap_or_default();
+        for &p in before.iter().filter(|p| !chosen.contains(p)) {
+            self.party_membership_changed(p, false);
+        }
+        for &p in chosen.iter().filter(|p| !before.contains(p)) {
+            self.party_membership_changed(p, true);
         }
         if let Some(h) = self.world.get_mut(hero) {
             h.followers = chosen;
