@@ -1,7 +1,7 @@
 //! Which of the game's interface screens are up while playing, from the simulation: the HUD
 //! while exploring, the conversation screen while someone talks, the cutscene screen (its
 //! subtitles) while a cutscene plays, and the screens scripts open (world map, store, job
-//! board, level-up) or the player opens (inventory).
+//! board, level-up) or the player opens (inventory, character record, tactics).
 //!
 //! A screen opens when it becomes wanted and closes when it stops being wanted. A screen
 //! that closes itself (its close button) stays closed until it is wanted afresh, so a
@@ -26,6 +26,9 @@ pub enum Screen {
     Chanters,
     LevelUp,
     Inventory,
+    CharacterRecord,
+    Tactics,
+    AreaMap,
 }
 
 impl Screen {
@@ -39,6 +42,9 @@ impl Screen {
             Screen::Chanters => &["chanters.gfx"],
             Screen::LevelUp => &["levelup.gfx"],
             Screen::Inventory => &["inventory.gfx"],
+            Screen::CharacterRecord => &["characterrecord.gfx"],
+            Screen::Tactics => &["tactics.gfx"],
+            Screen::AreaMap => &["map.gfx"],
         }
     }
 
@@ -49,11 +55,11 @@ impl Screen {
     }
 }
 
-/// The screen the simulation's state calls for; `inventory` is the player's own toggle. One
-/// screen is up at a time: a cutscene first (what it hands on to waits for it), then a
-/// conversation (a store or job board it opens waits for it to end), then the screens
-/// scripts open, then the inventory, else the HUD.
-pub fn wanted(sim: &Sim, inventory: bool) -> BTreeSet<Screen> {
+/// The screen the simulation's state calls for; `menu` is the one the player opened
+/// (inventory, character record, tactics). One screen is up at a time: a cutscene first
+/// (what it hands on to waits for it), then a conversation (a store or job board it opens
+/// waits for it to end), then the screens scripts open, then the player's, else the HUD.
+pub fn wanted(sim: &Sim, menu: Option<Screen>) -> BTreeSet<Screen> {
     let w = &sim.world;
     let screen = if w.cutscene.is_some() {
         Screen::Cutscene
@@ -67,8 +73,8 @@ pub fn wanted(sim: &Sim, inventory: bool) -> BTreeSet<Screen> {
         Screen::Chanters
     } else if w.world_map.open {
         Screen::WorldMap
-    } else if inventory {
-        Screen::Inventory
+    } else if let Some(m) = menu {
+        m
     } else {
         Screen::Hud
     };
@@ -81,8 +87,11 @@ pub struct Screens {
     shown: BTreeSet<Screen>,
     /// Closed by their own movie while still wanted.
     dismissed: BTreeSet<Screen>,
-    /// The player's inventory toggle (I).
-    pub inventory: bool,
+    /// The screen the player opened (I the inventory, C the character record, T tactics, M
+    /// the area map).
+    pub menu: Option<Screen>,
+    /// Screens whose movies closed themselves since the last [`Screens::sync`].
+    closed_by_player: Vec<Screen>,
 }
 
 /// What [`Screens::update`] changed.
@@ -90,6 +99,16 @@ pub struct Screens {
 pub struct Changes {
     pub opened: Vec<Screen>,
     pub closed: Vec<Screen>,
+    /// Closed by their own movie (a close button): the store's must be closed in the
+    /// simulation too.
+    pub dismissed: Vec<Screen>,
+}
+
+impl Screens {
+    /// The player opens or closes one of their screens (a key).
+    pub fn toggle(&mut self, s: Screen) {
+        self.menu = if self.menu == Some(s) { None } else { Some(s) };
+    }
 }
 
 impl Screens {
@@ -122,8 +141,9 @@ impl Screens {
             .collect();
         for s in gone {
             self.shown.remove(&s);
-            if s == Screen::Inventory {
-                self.inventory = false;
+            self.closed_by_player.push(s);
+            if self.menu == Some(s) {
+                self.menu = None;
             } else {
                 self.dismissed.insert(s);
             }
@@ -137,6 +157,7 @@ impl Screens {
         let changes = Changes {
             opened: want.difference(&self.shown).copied().collect(),
             closed: self.shown.difference(&want).copied().collect(),
+            dismissed: Vec::new(),
         };
         self.shown = want;
         changes
@@ -146,7 +167,8 @@ impl Screens {
     /// opened screens loaded (failures logged).
     pub fn sync(&mut self, want: BTreeSet<Screen>, stage: &mut Stage) -> Changes {
         self.note_open(&|m| stage.movies.iter().any(|x| x.name == m));
-        let changes = self.update(want);
+        let mut changes = self.update(want);
+        changes.dismissed = std::mem::take(&mut self.closed_by_player);
         for s in &changes.closed {
             for m in s.movies() {
                 stage.close(m);
@@ -200,14 +222,17 @@ mod tests {
     }
 
     #[test]
-    fn closing_the_inventory_clears_the_toggle() {
-        let mut s = Screens {
-            inventory: true,
-            ..Default::default()
-        };
-        s.update(set(&[Screen::Inventory]));
-        s.note_open(&|m| m != "inventory.gfx");
-        assert!(!s.inventory);
+    fn closing_the_players_screen_clears_the_toggle() {
+        let mut s = Screens::default();
+        s.toggle(Screen::CharacterRecord);
+        s.update(set(&[Screen::CharacterRecord]));
+        s.note_open(&|m| m != "characterrecord.gfx");
+        assert_eq!(s.menu, None);
+        s.toggle(Screen::Tactics);
+        s.toggle(Screen::Inventory);
+        assert_eq!(s.menu, Some(Screen::Inventory));
+        s.toggle(Screen::Inventory);
+        assert_eq!(s.menu, None);
     }
 
     #[test]
@@ -217,8 +242,12 @@ mod tests {
             std::sync::Arc::new(thedas_script::EngineTable::default()),
             1,
         );
-        assert_eq!(wanted(&sim, false), set(&[Screen::Hud]));
-        assert_eq!(wanted(&sim, true), set(&[Screen::Inventory]));
+        assert_eq!(wanted(&sim, None), set(&[Screen::Hud]));
+        assert_eq!(
+            wanted(&sim, Some(Screen::Inventory)),
+            set(&[Screen::Inventory])
+        );
+        assert_eq!(wanted(&sim, Some(Screen::Tactics)), set(&[Screen::Tactics]));
     }
 
     #[test]
@@ -230,16 +259,22 @@ mod tests {
         );
         sim.world.world_map.open = true;
         sim.world.store = Some(1);
-        assert_eq!(wanted(&sim, true), set(&[Screen::Store]));
+        assert_eq!(wanted(&sim, Some(Screen::Inventory)), set(&[Screen::Store]));
         sim.world.store = None;
-        assert_eq!(wanted(&sim, true), set(&[Screen::WorldMap]));
+        assert_eq!(
+            wanted(&sim, Some(Screen::Inventory)),
+            set(&[Screen::WorldMap])
+        );
         sim.world.cutscene = Some(thedas_sim::cutscene::Cutscene {
             name: "intro.cut".into(),
             seconds: 1.0,
             lines: Vec::new(),
             elapsed_ms: 0,
         });
-        assert_eq!(wanted(&sim, true), set(&[Screen::Cutscene]));
+        assert_eq!(
+            wanted(&sim, Some(Screen::Inventory)),
+            set(&[Screen::Cutscene])
+        );
         // The simulation holds the world itself while its cutscene's clock runs.
         assert!(!Screen::Cutscene.stops_the_world());
     }

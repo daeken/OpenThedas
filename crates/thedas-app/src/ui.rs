@@ -11,7 +11,7 @@ use thedas_ui::stage::Stage;
 use thedas_ui::{Gpu, Rgba};
 use thedas_vfs::Vfs;
 
-use crate::screens::Screens;
+use crate::screens::{Screen, Screens};
 
 /// A movie pixel at least this opaque (of 255) takes a click from the world.
 pub const COVER_ALPHA: u8 = 16;
@@ -270,9 +270,13 @@ impl UiLayer {
                 let key: LineKey = (d.dialog, d.line, d.replies.iter().map(|r| r.0).collect());
                 (key, waits)
             });
-            (crate::screens::wanted(&sim, screens.inventory), line)
+            (crate::screens::wanted(&sim, screens.menu), line)
         };
-        screens.sync(want, &mut self.stage);
+        let changes = screens.sync(want, &mut self.stage);
+        // The store's close button: the simulation's store closes too.
+        if changes.dismissed.contains(&Screen::Store) {
+            sim.lock().unwrap_or_else(|p| p.into_inner()).close_store();
+        }
         self.line = match (line, self.line.take()) {
             (Some((key, _)), Some(mut l)) if l.key == key => {
                 l.t += dt_ms;
