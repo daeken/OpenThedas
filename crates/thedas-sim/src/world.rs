@@ -33,6 +33,8 @@ pub enum ObjectKind {
     MapPin,
     /// A projectile in flight (`FireProjectile`).
     Projectile,
+    /// A lasting area of effect (see [`crate::aoe`]).
+    AreaOfEffect,
 }
 
 impl ObjectKind {
@@ -54,6 +56,7 @@ impl ObjectKind {
             // Provisional: pins are taken to be the map patches.
             ObjectKind::MapPin => 65536,
             ObjectKind::Projectile => 256,
+            ObjectKind::AreaOfEffect => 2048,
         }
     }
 }
@@ -185,6 +188,9 @@ pub struct Object {
     /// `KeyName`).
     #[serde(default)]
     pub text_fields: BTreeMap<String, String>,
+    /// What an area-of-effect object keeps (see [`crate::aoe`]).
+    #[serde(default)]
+    pub aoe: Option<crate::aoe::AoeState>,
 }
 
 impl Object {
@@ -232,6 +238,7 @@ impl Object {
             other_set: BTreeMap::new(),
             fields: BTreeMap::new(),
             text_fields: BTreeMap::new(),
+            aoe: None,
         }
     }
 }
