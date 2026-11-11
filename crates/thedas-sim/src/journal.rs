@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::plot::PlotInfo;
+use crate::plot::{DEFINED_FLAGS, PlotInfo};
 use crate::sim::Sim;
 
 /// The quest the player marked as active (its plot resource).
@@ -104,7 +104,7 @@ impl Sim {
     /// Notes a quest's new journal entry when one of its flags with journal text is set
     /// (called as flags are set).
     pub(crate) fn note_journal_flag(&mut self, info: &PlotInfo, flag: i32) {
-        if flag >= 256 || !info.journal.get(&flag).is_some_and(|&t| self.has_text(t)) {
+        if flag >= DEFINED_FLAGS || !info.journal.get(&flag).is_some_and(|&t| self.has_text(t)) {
             return;
         }
         self.world.journal_seq += 1;
@@ -123,11 +123,7 @@ impl Sim {
     /// entry (a Chanter's Board posting starts set, with the board's text): the journal holds
     /// what happened. Provisional.
     fn flag_on(&self, info: &PlotInfo, flag: i32) -> bool {
-        self.world
-            .plots
-            .get(&(info.guid.clone(), flag))
-            .copied()
-            .unwrap_or(false)
+        self.script_set_plot_flag(&info.guid, flag)
     }
 
     /// The journal as it stands.
@@ -167,7 +163,7 @@ impl Sim {
             let set: Vec<i32> = p
                 .journal
                 .iter()
-                .filter(|(f, t)| **f < 256 && self.flag_on(p, **f) && self.has_text(**t))
+                .filter(|(f, t)| **f < DEFINED_FLAGS && self.flag_on(p, **f) && self.has_text(**t))
                 .map(|(f, _)| *f)
                 .collect();
             if set.is_empty() {
@@ -229,7 +225,7 @@ impl Sim {
                             .journal
                             .iter()
                             .filter(|(f, t)| {
-                                **f < 256 && self.flag_on(p, **f) && self.has_text(**t)
+                                **f < DEFINED_FLAGS && self.flag_on(p, **f) && self.has_text(**t)
                             })
                             .map(|(_, t)| *t)
                             .collect(),
@@ -295,7 +291,7 @@ mod tests {
             "lot100pt_bears",
             KIND_QUEST,
             Some("lot_plot_group"),
-            &[(0, 500), (1, 501), (2, 502), (3, 503)],
+            &[(0, 500), (1, 501), (2, 502), (3, 503), (300, 504)],
         );
         bears.finals.insert(2);
         s.plots.insert(bears);
@@ -320,7 +316,7 @@ mod tests {
             ],
         );
         let _ = s.strings.set(
-            [500, 501, 502, 600, 700, 800, 801, 900]
+            [500, 501, 502, 504, 600, 700, 800, 801, 900]
                 .into_iter()
                 .map(|t| (t, format!("entry {t}")))
                 .chain([(503, String::new())])
@@ -334,8 +330,9 @@ mod tests {
         s.set_plot_flag("lot100pt_bears_sub", 0, true, false, o);
         s.set_plot_flag("lot000pt_ambient", 0, true, false, o);
         s.set_plot_flag("cod_crt_ogre", 1, true, false, o);
-        // A flag whose text is empty makes no entry.
+        // A flag whose text is empty makes no entry, nor does a defined flag (never stored).
         s.set_plot_flag("lot100pt_bears", 3, true, false, o);
+        s.set_plot_flag("lot100pt_bears", 300, true, false, o);
         let j = s.journal();
         assert_eq!(j.groups.len(), 1);
         assert_eq!(j.groups[0].resref, "plt_lot_plot_group");

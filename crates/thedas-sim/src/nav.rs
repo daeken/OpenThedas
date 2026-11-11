@@ -622,6 +622,22 @@ mod tests {
         assert_eq!(doors.len(), 1);
         assert_eq!(doors[0].0, door);
         assert_eq!(s.route_to(walker, [4.5, 0.5, 0.0]), Routed::Door(door));
+        // Walking to the door itself goes up to it and stops where it would enter it.
+        match s.route_to(walker, [2.5, 2.5, 0.0]) {
+            Routed::Path(p) => {
+                let end = *p.last().unwrap();
+                let i = g
+                    .cell(end)
+                    .map(|c| (c.1 * g.columns + c.0) as usize)
+                    .unwrap();
+                assert!(!doors[0].1.contains(&i), "stops outside the door");
+                assert!(
+                    crate::engine::dist(end, [2.5, 2.5, 0.0]) < 2.5,
+                    "next to it"
+                );
+            }
+            r => panic!("walking to the door: {r:?}"),
+        }
         let at = [[2.5, 2.5, 0.0]];
         assert!(Sim::door_between(&at, [0.5, 2.5, 0.0], [4.5, 2.5, 0.0]));
         assert!(!Sim::door_between(&at, [0.5, 0.5, 0.0], [0.5, 2.5, 0.0]));

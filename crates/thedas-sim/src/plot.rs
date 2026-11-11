@@ -5,8 +5,8 @@
 //! Provisional, inferred from the plot files and the plot scripts' bytecode: the event carries
 //! the plot GUID as string 0, the flag as int 1, the new and old values as ints 2 and 3, the
 //! conversation owner as object 0 and the hero as its creator; a `GET_PLOT` answer is the
-//! script's integer result. Flags 256 and up are "defined" flags computed by the script; the
-//! engine sets ordinary flags before running the script.
+//! script's integer result. Flags above 127 are "defined" flags the script answers (see
+//! [`DEFINED_FLAGS`]); the engine sets ordinary flags before running the script.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -17,6 +17,15 @@ use thedas_vfs::Vfs;
 
 use crate::sim::Sim;
 use crate::trace::TraceEntry;
+
+/// The first "defined" flag. DAOrigins.exe keeps flags 0 to 127 in the plot record's
+/// four-dword flag set (the stored read, 0x75bc70, answers false past dword 3) and hands every
+/// higher flag to the plot script: the flag read (0x75ea60, `cmp 0x7f` at 0x75eb5a) asks the
+/// script with `EVENT_TYPE_GET_PLOT` and answers false for a plot without one; the flag set
+/// (0x75f7e0, `cmp 0x7f` at 0x75f944) sends `EVENT_TYPE_SET_PLOT` whether or not the caller
+/// asked for the script, and stores nothing. The shipped plots number their defined flags from
+/// 256, so nothing between 128 and 255 exists in the data.
+pub const DEFINED_FLAGS: i32 = 128;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PlotInfo {
@@ -242,7 +251,10 @@ impl Sim {
             .unwrap_or(OBJECT_INVALID)
     }
 
-    /// Reads a flag. Defined flags (256+) ask the plot script when `call_script` is set.
+    /// Reads a flag. Defined flags ([`DEFINED_FLAGS`] and up) are the plot script's answer
+    /// (false without a script). An ordinary flag read with `call_script` runs the script's
+    /// `GET_PLOT` too, as DAOrigins.exe does (0x75ec7b to 0x75ecf8), but answers with the stored
+    /// value regardless (0x75ed36).
     pub fn get_plot_flag(
         &mut self,
         plot: &str,
@@ -251,17 +263,20 @@ impl Sim {
         owner: ObjectId,
     ) -> bool {
         let key = self.plot_key(plot);
-        if flag >= 256 || call_script {
+        let defined = flag >= DEFINED_FLAGS;
+        if defined || call_script {
             if let Some(script) = self.plot_info(plot).and_then(|p| p.script.clone()) {
                 // A plot script that reads the flag it is answering would recurse forever;
                 // the inner read gets the stored value instead.
                 let asking = (key.clone(), flag);
-                if flag >= 256 && !self.plots.asking.contains(&asking) {
+                if !self.plots.asking.contains(&asking) {
                     let ev = self.plot_event("GET_PLOT", &key, flag, 0, 0, owner);
                     self.plots.asking.push(asking);
                     let r = self.run_script(&script, self.plot_self(), Some(ev));
                     self.plots.asking.pop();
-                    return matches!(r, Some(V::Int(v)) if v != 0);
+                    if defined {
+                        return matches!(r, Some(V::Int(v)) if v != 0);
+                    }
                 }
             }
         }
@@ -269,13 +284,34 @@ impl Sim {
     }
 
     /// A flag's stored value: what was set, else the value the plot file starts it with.
+    /// Defined flags store nothing and read false here.
     fn stored_plot_flag(&mut self, plot: &str, key: String, flag: i32) -> bool {
+        if flag >= DEFINED_FLAGS {
+            return false;
+        }
         match self.world.plots.get(&(key, flag)) {
             Some(&v) => v,
             None => self.plot_info(plot).is_some_and(|p| p.initial_value(flag)),
         }
     }
 
+    /// Whether a script has set an ordinary flag: the stored value only, not the value the
+    /// plot file starts it with (the journal counts what happened; a Chanter's Board posting
+    /// starts set). Defined flags are never stored and read false.
+    pub(crate) fn script_set_plot_flag(&self, guid: &str, flag: i32) -> bool {
+        flag < DEFINED_FLAGS
+            && self
+                .world
+                .plots
+                .get(&(guid.to_string(), flag))
+                .copied()
+                .unwrap_or(false)
+    }
+
+    /// Sets a flag. An ordinary flag is stored and its script runs when `call_script` is set; a
+    /// defined flag ([`DEFINED_FLAGS`] and up) is not stored and always goes to the script, as
+    /// DAOrigins.exe's flag set does (0x75f7e0; the defined branch at 0x75f951 to 0x75f9eb
+    /// does not test the caller's flag).
     pub fn set_plot_flag(
         &mut self,
         plot: &str,
@@ -286,10 +322,14 @@ impl Sim {
     ) {
         let key = self.plot_key(plot);
         let old = self.stored_plot_flag(plot, key.clone(), flag);
-        self.world.plots.insert((key.clone(), flag), value);
-        if value {
-            if let Some(info) = self.plot_info(plot) {
-                self.note_journal_flag(&info, flag);
+        let defined = flag >= DEFINED_FLAGS;
+        if !defined {
+            self.world.plots.insert((key.clone(), flag), value);
+            // A stored flag with journal text makes the quest's latest entry.
+            if value {
+                if let Some(info) = self.plot_info(plot) {
+                    self.note_journal_flag(&info, flag);
+                }
             }
         }
         let t = self.world.time_ms;
@@ -299,7 +339,7 @@ impl Sim {
             flag,
             value,
         });
-        if call_script {
+        if call_script || defined {
             if let Some(script) = self.plot_info(plot).and_then(|p| p.script.clone()) {
                 let ev = self.plot_event("SET_PLOT", &key, flag, value as i32, old as i32, owner);
                 self.run_script(&script, self.plot_self(), Some(ev));
@@ -312,6 +352,30 @@ impl Sim {
 mod tests {
     use super::*;
     use thedas_formats::gff4::{FieldDef, FourCC, StructData, StructTemplate, TlkString, Version};
+
+    #[test]
+    fn flags_past_127_are_defined_and_never_stored() {
+        use thedas_script::EngineTable;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let none = OBJECT_INVALID;
+        s.set_plot_flag("plt_test", 127, true, false, none);
+        assert!(
+            s.get_plot_flag("plt_test", 127, false, none),
+            "the last stored flag"
+        );
+        s.set_plot_flag("plt_test", 128, true, false, none);
+        s.set_plot_flag("plt_test", 200, true, true, none);
+        assert!(
+            !s.get_plot_flag("plt_test", 128, false, none),
+            "no script answers it"
+        );
+        assert!(!s.get_plot_flag("plt_test", 200, true, none));
+        let key = s.plot_key("plt_test");
+        assert!(
+            !s.world.plots.contains_key(&(key, 128)),
+            "defined flags store nothing"
+        );
+    }
 
     #[test]
     fn parses_plot_files() {
