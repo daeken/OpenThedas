@@ -210,6 +210,11 @@ enum Approach {
     Full,
 }
 
+/// How far beyond the two bodies' radii a personal-range ability reaches (DAOrigins.exe
+/// 0xafebc0), and the tolerance its check allows on top (0xade218).
+const MELEE_TALENT_REACH: f32 = 1.2;
+const MELEE_TALENT_TOLERANCE: f32 = 1.0;
+
 /// What the simulation does when a script starts character generation, since there is no
 /// player at the character-creation screens.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1403,9 +1408,48 @@ impl Sim {
     /// line toward it. Provisional: the range is measured from the caster's centre to the
     /// target's body (its centre plus its radius), and a cone aimed at a place (the place
     /// only gives its direction) is used from where the caster stands.
+    ///
+    /// An ability of personal range (`ABI_base` `range` row 0, the melee talents: Shield Bash,
+    /// Pummel, Cripple) aimed at another creature needs its target within melee reach: the
+    /// two creatures' radii, 1.2 m and a metre's tolerance across the ground, which
+    /// DAOrigins.exe's check for the command requires (0x7a7525 calling 0x6a3dc0 and
+    /// 0x695320; constants 0xafebc0, 0xade218). The caster walks until the target is within
+    /// the radii and 1.2 m. Provisional: that the engine walks the caster up when the check
+    /// fails (rather than failing the command) is inferred from the game's AI, which orders
+    /// these talents at enemies out of reach and does not otherwise close in; the radii are
+    /// taken to be `PERSPACE` ([`Sim::body_radius`]).
     fn ability_approach(&self, id: ObjectId, cmd: &Command) -> Approach {
         let ability = cmd.ints.first().copied().unwrap_or(0);
-        let (Some(me), Some(range)) = (self.world.get(id), self.ability_range(ability)) else {
+        let Some(me) = self.world.get(id) else {
+            return Approach::InReach;
+        };
+        if self.abi_int(ability, "range") == 0 {
+            let target = cmd
+                .target
+                .filter(|&t| t != id && t != OBJECT_INVALID)
+                .and_then(|t| self.world.get(t))
+                .filter(|o| o.kind == ObjectKind::Creature && o.area == me.area);
+            if let Some(t) = target {
+                let (dx, dy) = (
+                    t.position[0] - me.position[0],
+                    t.position[1] - me.position[1],
+                );
+                let d = (dx * dx + dy * dy).sqrt();
+                let reach = self.body_radius(id) + self.body_radius(t.id) + MELEE_TALENT_REACH;
+                if d.is_finite() && d > reach + MELEE_TALENT_TOLERANCE {
+                    let f = (d - reach) / d;
+                    let a = me.position;
+                    let p = [
+                        a[0] + dx * f,
+                        a[1] + dy * f,
+                        a[2] + (t.position[2] - a[2]) * f,
+                    ];
+                    return Approach::Walk(d - reach, p);
+                }
+            }
+            return Approach::InReach;
+        }
+        let Some(range) = self.ability_range(ability) else {
             return Approach::InReach;
         };
         let (to, reach) = match cmd.target.filter(|&t| t != id && t != OBJECT_INVALID) {
