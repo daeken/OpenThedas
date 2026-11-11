@@ -3361,6 +3361,30 @@ pub fn call(
         }
         // Presentation only.
         "PlayAdditiveAnimation" | "SignalDamage" => void(),
+        // Creature switches that DAOrigins.exe sets in one handler (0x66be50), kept on the
+        // creature for what reads them: SetCreatureIsGhost (0x69f4a0: a ghost walks through
+        // other creatures but around other ghosts; the simulation's movement does not yet
+        // collide creatures), SetQuickslotBar (0x719ae0: the bar the quickbar shows, taken
+        // only below 5) and LockQuickslotBar (0x719ac0: locked when bLock > 0).
+        "SetCreatureIsGhost" | "SetQuickslotBar" | "LockQuickslotBar" => {
+            let (who, v) = (obj(a, 0), int(a, 1));
+            let field = match name {
+                "SetCreatureIsGhost" => Some(("Ghost", (v != 0) as i32)),
+                "SetQuickslotBar" => (v < 5).then_some(("QuickslotBar", v)),
+                _ => Some(("QuickslotBarLocked", (v > 0) as i32)),
+            };
+            if let Some(o) = h
+                .sim
+                .world
+                .get_mut(who)
+                .filter(|o| o.kind == ObjectKind::Creature)
+            {
+                if let Some((f, v)) = field {
+                    o.fields.insert(f.into(), v);
+                }
+            }
+            void()
+        }
         "SetCreatureIsStatue" => {
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
                 o.fields.insert("Statue".into(), int(a, 1));
@@ -5021,7 +5045,10 @@ mod coverage_tests {
         int GetCreatureMana(object o) = 72;\n\
         void SetCreatureMana(object o, int n) = 73;\n\
         int GetCreatureMaxMana(object o) = 74;\n\
-        void RemoveAllEffects(object o, int i = TRUE, int d = FALSE) = 75;\n";
+        void RemoveAllEffects(object o, int i = TRUE, int d = FALSE) = 75;\n\
+        void SetCreatureIsGhost(object o, int v) = 76;\n\
+        void SetQuickslotBar(object o, int n) = 77;\n\
+        void LockQuickslotBar(object o, int b) = 78;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -5227,5 +5254,29 @@ mod coverage_tests {
             &[Value::Object(c), Value::Int(0), Value::Int(1)],
         );
         assert_eq!(left(&s), vec![(7, 0, 3), (1012, 0, 6), (1012, 0, 4)]);
+    }
+
+    #[test]
+    fn ghost_and_quickbar_switches_are_kept_on_the_creature() {
+        let mut s = sim();
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let chest = s.world.spawn(ObjectKind::Placeable, "chest");
+        let set = |s: &mut Sim, f: &str, o: ObjectId, v: i32| {
+            run(s, o, f, &[Value::Object(o), Value::Int(v)]);
+        };
+        let field = |s: &Sim, o: ObjectId, f: &str| s.world.get(o).unwrap().fields.get(f).copied();
+        set(&mut s, "SetCreatureIsGhost", c, 7);
+        set(&mut s, "SetQuickslotBar", c, 3);
+        set(&mut s, "SetQuickslotBar", c, 5);
+        set(&mut s, "LockQuickslotBar", c, 1);
+        set(&mut s, "SetCreatureIsGhost", chest, 1);
+        assert_eq!(field(&s, c, "Ghost"), Some(1));
+        assert_eq!(field(&s, c, "QuickslotBar"), Some(3));
+        assert_eq!(field(&s, c, "QuickslotBarLocked"), Some(1));
+        assert_eq!(field(&s, chest, "Ghost"), None);
+        set(&mut s, "SetCreatureIsGhost", c, 0);
+        set(&mut s, "LockQuickslotBar", c, -1);
+        assert_eq!(field(&s, c, "Ghost"), Some(0));
+        assert_eq!(field(&s, c, "QuickslotBarLocked"), Some(0));
     }
 }
