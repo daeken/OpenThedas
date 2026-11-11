@@ -2073,6 +2073,7 @@ impl Sim {
                 o.fields.insert(fl.label.clone(), v);
             }
         }
+        read_text_fields(o, inst);
         read_vars(are, inst, &mut o.locals);
         if kind == ObjectKind::Trigger {
             for &p in list_of(inst, "Geometry") {
@@ -2139,6 +2140,18 @@ fn apply_template(o: &mut crate::world::Object, t: &Gff3) {
     for fl in &r.fields {
         if let Some(v) = int(r, &fl.label) {
             o.fields.insert(fl.label.clone(), v);
+        }
+    }
+    read_text_fields(o, r);
+}
+
+/// The string fields engine functions read, as [`crate::world::Object::text_fields`].
+const TEXT_FIELDS: [&str; 1] = ["KeyName"];
+
+fn read_text_fields(o: &mut crate::world::Object, s: &Struct) {
+    for label in TEXT_FIELDS {
+        if let Some(v) = text(s, label) {
+            o.text_fields.insert(label.to_string(), v);
         }
     }
 }

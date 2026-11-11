@@ -2144,6 +2144,26 @@ pub fn call(
         // `BaseType` at its appearance, as DAOrigins.exe reads it when loading one
         // (0x75084d) into the byte the command returns (0x65efc0). placeable_core
         // generates a container's treasure on spawn only for type 2.
+        // A lock's template fields, as DAOrigins.exe's getters read them off the placeable
+        // (0x65f020, 0x65f080, 0x65f0e0, 0x65f1c0): `AutoRemoveKey`, `KeyRequired`,
+        // `KeyName` and `PickLock`.
+        "GetPlaceableAutoRemoveKey" | "GetPlaceableKeyRequired" | "GetPlaceablePickLockLevel" => {
+            let label = match name {
+                "GetPlaceableAutoRemoveKey" => "AutoRemoveKey",
+                "GetPlaceableKeyRequired" => "KeyRequired",
+                _ => "PickLock",
+            };
+            ok(Value::Int(
+                h.object(obj(a, 0))
+                    .and_then(|o| o.fields.get(label).copied())
+                    .unwrap_or(0),
+            ))
+        }
+        "GetPlaceableKeyTag" => ok(Value::String(
+            h.object(obj(a, 0))
+                .and_then(|o| o.text_fields.get("KeyName").cloned())
+                .unwrap_or_default(),
+        )),
         "GetPlaceableBaseType" => ok(Value::Int(
             h.object(obj(a, 0))
                 .filter(|o| o.kind == ObjectKind::Placeable)
@@ -3588,6 +3608,10 @@ mod tests {
         int GetAbilityCount(object o, int t = 0, int g = 0) = 54;\n\
         void CharGen_ClearAbilityList(object o, int t = 0) = 55;\n\
         void SetQuickslot(object o, int n, int a, string s = \"\") = 56;\n\
+        int GetPlaceablePickLockLevel(object o) = 57;\n\
+        int GetPlaceableKeyRequired(object o) = 58;\n\
+        string GetPlaceableKeyTag(object o) = 59;\n\
+        int GetPlaceableAutoRemoveKey(object o) = 60;\n\
         int GetHasAchievement(string s) = 61;\n\
         void UnlockAchievement(string s) = 62;\n\
         int EVENT_TYPE_PARTYMEMBER_ADDED = 66;\n\
@@ -4376,6 +4400,40 @@ mod tests {
         run(&mut s, hero, "RemoveItem", &[o(potion), i(-1)]);
         assert!(s.world.get(potion).is_none());
         assert!(s.world.get(hero).unwrap().inventory.is_empty());
+    }
+
+    #[test]
+    fn locks_read_their_template_fields() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let door = s.world.spawn(ObjectKind::Placeable, "door");
+        let o = s.world.get_mut(door).unwrap();
+        o.fields.insert("PickLock".into(), 10000);
+        o.fields.insert("KeyRequired".into(), 1);
+        o.fields.insert("AutoRemoveKey".into(), 1);
+        o.text_fields.insert("KeyName".into(), "gate_key".into());
+        let d = [Value::Object(door)];
+        assert_eq!(
+            run(&mut s, door, "GetPlaceablePickLockLevel", &d),
+            Some(Value::Int(10000))
+        );
+        assert_eq!(
+            run(&mut s, door, "GetPlaceableKeyRequired", &d),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            run(&mut s, door, "GetPlaceableAutoRemoveKey", &d),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            run(&mut s, door, "GetPlaceableKeyTag", &d),
+            Some(Value::String("gate_key".into()))
+        );
+        let none = [Value::Object(OBJECT_INVALID)];
+        assert_eq!(
+            run(&mut s, door, "GetPlaceableKeyTag", &none),
+            Some(Value::String(String::new()))
+        );
     }
 
     #[test]
