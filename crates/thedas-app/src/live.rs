@@ -326,6 +326,7 @@ impl Live {
         if let Some(o) = self.objects.as_mut() {
             o.renderer.encode_shadows(encoder, false);
         }
+        level.renderer.finish_shadows(encoder);
         level
             .renderer
             .render_main(ctx, encoder, target, width, height, camera);
