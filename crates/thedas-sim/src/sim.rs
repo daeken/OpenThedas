@@ -2361,6 +2361,18 @@ fn apply_template(o: &mut crate::world::Object, t: &Gff3) {
             o.fields.insert(fl.label.clone(), v);
         }
     }
+    // A creature template keeps its gender, tints and the like in its "Appearance Data"
+    // struct (Morrigan's Gender 2 is there); its integers count as the creature's fields
+    // where the top level does not give them.
+    if let Some(G3::Struct(i)) = field(r, "Appearance Data")
+        && let Some(a) = t.structs.get(*i as usize)
+    {
+        for fl in &a.fields {
+            if let Some(v) = int(a, &fl.label) {
+                o.fields.entry(fl.label.clone()).or_insert(v);
+            }
+        }
+    }
     read_text_fields(o, r);
 }
 
@@ -2815,6 +2827,44 @@ impl ScriptHost<'_> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn creature_templates_give_their_appearance_datas_fields() {
+        use thedas_formats::gff3::{Field, Gff3, Struct, Value};
+        let f = |label: &str, value| Field {
+            label: label.into(),
+            value,
+        };
+        let t = Gff3 {
+            file_type: *b"UTC ",
+            file_version: *b"V3.2",
+            structs: vec![
+                Struct {
+                    id: 0xFFFF_FFFF,
+                    fields: vec![
+                        f("Race", Value::Byte(3)),
+                        f("SkinTint", Value::Int(7)),
+                        f("Appearance Data", Value::Struct(1)),
+                    ],
+                },
+                Struct {
+                    id: 0,
+                    fields: vec![
+                        f("Gender", Value::Byte(2)),
+                        f("SkinTint", Value::Int(3)),
+                        f("Appearance_Type", Value::Dword(15)),
+                    ],
+                },
+            ],
+        };
+        let mut o = crate::world::Object::new(1, ObjectKind::Creature, "morrigan");
+        apply_template(&mut o, &t);
+        assert_eq!(o.appearance, 15);
+        assert_eq!(o.fields.get("Gender"), Some(&2));
+        // The top level wins where both give a value.
+        assert_eq!(o.fields.get("SkinTint"), Some(&7));
+        assert_eq!(o.fields.get("Race"), Some(&3));
+    }
 
     #[test]
     fn the_party_picker_switches_event_scripts_as_follower_states_change() {
