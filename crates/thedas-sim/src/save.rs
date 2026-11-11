@@ -223,7 +223,11 @@ impl Sim {
         world.trace = std::mem::take(&mut self.world.trace);
         world.trace.entries.clear();
         self.world = world;
-        self.talk = save.talk;
+        // A conversation whose last line was already shown does not come back: the game
+        // cannot be saved during a conversation, so a loaded game never resumes one at its
+        // end (saves made by test drivers can hold one; reloading it would put the last
+        // line on screen again). One still going is kept.
+        self.talk = save.talk.filter(|c| !c.ended);
         // Caches keyed by object id belong to the world just replaced.
         self.area_layouts.clear();
         self.door_cells.clear();
@@ -284,6 +288,37 @@ mod tests {
         let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 7);
         s.module_info.name = "test".into();
         s
+    }
+
+    #[test]
+    fn a_finished_conversation_does_not_come_back_with_a_load() {
+        use crate::dialog::{Conversation, Dlg};
+        let mut s = sim();
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        s.world.hero = Some(hero);
+        let talk = |ended| Conversation {
+            dlg: Dlg {
+                name: "test".into(),
+                starts: Vec::new(),
+                nodes: Vec::new(),
+            },
+            owner: hero,
+            player: hero,
+            line: None,
+            replies: Vec::new(),
+            ended,
+            shown: Vec::new(),
+            chain: Vec::new(),
+        };
+        s.talk = Some(talk(true));
+        let save = s.save_game();
+        assert!(save.talk.is_some());
+        s.load_game(save).unwrap();
+        assert!(s.talk.is_none());
+        // One still going is resumed.
+        s.talk = Some(talk(false));
+        s.load_game(s.save_game()).unwrap();
+        assert!(s.talk.as_ref().is_some_and(|c| !c.ended));
     }
 
     #[test]
