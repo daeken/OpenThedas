@@ -50,10 +50,10 @@ fn obj(a: &[Value], i: usize) -> ObjectId {
 /// script.ldf documents them: an effect type (`EFFECT_TYPE_INVALID`, 0, for any), an ability
 /// (−1 for any, `GetHasEffects`' default; 0, `ABILITY_INVALID`, for any, the other two's
 /// default), a creator (`OBJECT_INVALID` for any) and a duration type
-/// (`EFFECT_DURATION_TYPE_INVALID`, 0, for any). Provisional: that `GetHasEffects` with an
-/// ability of 0 matches any ability (727 calls in the game's scripts pass 0) is not checked
-/// against the executable; `GetEffects`' effect id filter is not applied (effects carry no
-/// ids yet).
+/// (`EFFECT_DURATION_TYPE_INVALID`, 0, for any). DAOrigins.exe agrees on the ability: the one
+/// handler of both queries (0x673d70) turns −1 into 0, and its filter (0xa64950) skips the
+/// ability test for 0. Provisional: `GetEffects`' effect id filter is not applied (effects
+/// carry no ids yet).
 #[derive(Clone, Copy, Debug)]
 struct EffectFilter {
     ty: i32,
@@ -2232,12 +2232,33 @@ pub fn call(
             }
             void()
         }
-        "GetAbilityCount" => ok(Value::Int(
-            h.object(obj(a, 0)).map_or(0, |o| o.abilities.len() as i32),
-        )),
+        // The abilities of a type (`ABI_base` `AbilityType`, 0 for any) and GUI type
+        // (`guitype`, 0 for any), as script.ldf documents.
+        "GetAbilityCount" => {
+            let (ty, gui) = (int(a, 1), int(a, 2));
+            let abilities: Vec<i32> = h
+                .object(obj(a, 0))
+                .map(|o| o.abilities.iter().copied().collect())
+                .unwrap_or_default();
+            let n = abilities
+                .into_iter()
+                .filter(|&ab| ty == 0 || h.sim.abi_int(ab, "AbilityType") == ty)
+                .filter(|&ab| gui == 0 || h.sim.abi_int(ab, "guitype") == gui)
+                .count();
+            ok(Value::Int(n as i32))
+        }
+        // One list (an `AbilityType`), or every list for `ABILITY_TYPE_INVALID` (0).
         "CharGen_ClearAbilityList" => {
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.abilities.clear();
+            let (who, ty) = (obj(a, 0), int(a, 1));
+            let keep: Vec<i32> = h
+                .object(who)
+                .map(|o| o.abilities.iter().copied().collect::<Vec<i32>>())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|&ab| ty != 0 && h.sim.abi_int(ab, "AbilityType") != ty)
+                .collect();
+            if let Some(o) = h.sim.world.get_mut(who) {
+                o.abilities = keep.into_iter().collect();
             }
             void()
         }
@@ -3243,11 +3264,16 @@ pub fn call(
         }
         // Removes `count` from an item's stack, destroying it when none are left.
         "RemoveItem" => {
-            let (item, count) = (obj(a, 0), int(a, 1).max(0));
+            // A count below 0 (−1 is the default; the scripts pass it 23 times) takes the
+            // whole stack, as RemoveItemsByTag documents for its count.
+            let (item, count) = (obj(a, 0), int(a, 1));
             let Some(left) = h
                 .object(item)
                 .filter(|o| o.kind == ObjectKind::Item)
-                .map(|o| o.fields.get("StackSize").copied().unwrap_or(1).max(1) - count)
+                .map(|o| {
+                    let stack = o.fields.get("StackSize").copied().unwrap_or(1).max(1);
+                    if count < 0 { 0 } else { stack - count }
+                })
             else {
                 return void();
             };
@@ -3557,6 +3583,9 @@ mod tests {
         int GetHasEffects(object o, int t = 0, int a = -1) = 51;\n\
         effect[] GetEffects(object o, int t = 0, int a = 0, object c = OBJECT_INVALID, int d = 0, int i = -1) = 52;\n\
         void RemoveEffectsByParameters(object o, int t = 0, int a = 0, object c = OBJECT_INVALID) = 53;\n\
+        int GetAbilityCount(object o, int t = 0, int g = 0) = 54;\n\
+        void CharGen_ClearAbilityList(object o, int t = 0) = 55;\n\
+        void SetQuickslot(object o, int n, int a, string s = \"\") = 56;\n\
         int EVENT_TYPE_PARTYMEMBER_ADDED = 66;\n\
         int EVENT_TYPE_PARTYMEMBER_DROPPED = 67;\n\
         #define ENGINE_STRUCTURE_1 location\n\
@@ -4274,6 +4303,73 @@ mod tests {
             "RemoveItem",
             &[Value::Object(potion), Value::Int(1)],
         );
+        assert!(s.world.get(potion).is_none());
+        assert!(s.world.get(hero).unwrap().inventory.is_empty());
+    }
+
+    #[test]
+    fn default_arguments_mean_what_script_ldf_says() {
+        use thedas_formats::gda::Cell;
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let t = crate::m2da::Tables::empty();
+        let row =
+            |id: i64, ty: i64, gui: i64| (id, vec![Cell::Int(id), Cell::Int(ty), Cell::Int(gui)]);
+        t.insert(
+            "ABI_base",
+            &["ID", "AbilityType", "guitype"],
+            vec![row(1, 1, 18), row(2, 1, 3), row(3, 2, 18), row(4, 3, 0)],
+        );
+        s.world.tables = Arc::new(t);
+        let (o, i) = (Value::Object, Value::Int);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.get_mut(hero).unwrap().abilities = [1, 2, 3, 4].into_iter().collect();
+        let count =
+            |s: &mut Sim, ty, gui| run(s, hero, "GetAbilityCount", &[o(hero), i(ty), i(gui)]);
+        assert_eq!(count(&mut s, 0, 0), Some(i(4)));
+        assert_eq!(count(&mut s, 1, 0), Some(i(2)));
+        assert_eq!(count(&mut s, 1, 18), Some(i(1)));
+        assert_eq!(count(&mut s, 0, 18), Some(i(2)));
+        // One list cleared, then all of them.
+        run(&mut s, hero, "CharGen_ClearAbilityList", &[o(hero), i(1)]);
+        let left: Vec<i32> = s
+            .world
+            .get(hero)
+            .unwrap()
+            .abilities
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(left, vec![3, 4]);
+        run(&mut s, hero, "CharGen_ClearAbilityList", &[o(hero), i(0)]);
+        assert!(s.world.get(hero).unwrap().abilities.is_empty());
+        // Slot −1 is the first slot nothing was set in, once per ability.
+        let tag = || Value::String(String::new());
+        run(&mut s, hero, "SetQuickslot", &[o(hero), i(0), i(10), tag()]);
+        run(
+            &mut s,
+            hero,
+            "SetQuickslot",
+            &[o(hero), i(-1), i(11), tag()],
+        );
+        run(
+            &mut s,
+            hero,
+            "SetQuickslot",
+            &[o(hero), i(-1), i(11), tag()],
+        );
+        let slots = &s.world.get(hero).unwrap().quickslots;
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots.get(&1).map(|q| q.ability), Some(11));
+        // A count of −1 takes the whole stack.
+        let potion = s.world.spawn(ObjectKind::Item, "potion");
+        s.world
+            .get_mut(potion)
+            .unwrap()
+            .fields
+            .insert("StackSize".into(), 5);
+        s.world.get_mut(hero).unwrap().inventory.push(potion);
+        run(&mut s, hero, "RemoveItem", &[o(potion), i(-1)]);
         assert!(s.world.get(potion).is_none());
         assert!(s.world.get(hero).unwrap().inventory.is_empty());
     }
