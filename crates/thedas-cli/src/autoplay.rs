@@ -1,14 +1,16 @@
 //! `thedas autoplay`: plays a scenario from a save over several seeds and reports how it went,
 //! so changes to the simulation can be judged by numbers rather than single runs.
 //!
-//! The player is simple and deterministic: it takes the first reply in conversations; the
-//! party fights under autopilot (party AI); when the hero is idle and hostiles are in view it
-//! attacks one (the same one until it falls), or with `--ai-hero` leaves the hero to its own
-//! tactics as the followers are; when none are in view it walks to the nearest living hostile
-//! in the area; when the area holds none it uses a door to an area it has not been to (whose
-//! tag starts with `--exit-prefix`), levelling the party (the auto-level tables) first and at
-//! the start; it opens closed doors in its way; after each fight it waits (up to 30 s) for the
-//! party's health to come back. It drinks no potions beyond what the tactics do.
+//! The player is simple and deterministic: it takes the first reply in conversations, and the
+//! party fights under autopilot (party AI, the hero's own tactics included). It steers only
+//! when the party has been out of a fight for 30 s: it then walks towards the nearest living
+//! hostile in the area (in view or not), and when the area holds none it uses a door to an
+//! area it has not been to (whose tag starts with `--exit-prefix`), levelling the party (the
+//! auto-level tables) first and at the start; it opens closed doors in its way. After each
+//! fight it waits (up to 30 s) for the party's health to come back. It drinks no potions
+//! beyond what the tactics do. With `--steer` it plays as before: once hostiles are in view it
+//! orders the hero's attacks (the same target until it falls; `--ai-hero` leaves the hero to
+//! its tactics) and walks the idle party towards them, and it seeks unseen hostiles at once.
 //!
 //! Each run loads the save, reseeds the simulation's generator with the run's seed and plays
 //! until a plot flag is set, an area is reached, the whole party falls (a wipe: game over),
@@ -47,6 +49,14 @@ pub struct Options<'a> {
     /// The hero fights only through the party AI (autopilot, with its tactics), as the
     /// followers do; the player just walks it towards enemies not yet seen.
     pub ai_hero: bool,
+    /// The older harness player: it orders the hero's attacks (unless `ai_hero`) and walks
+    /// the party towards hostiles in view. Without it (the standard measurement) the party
+    /// AI alone fights, the hero included, and the harness only explores while nothing is
+    /// going on (see [`QUIET_MS`]).
+    pub steer: bool,
+    /// Before anything else, walk the hero up to the first creature with this tag and talk
+    /// to it (to start an encounter that begins with that conversation).
+    pub approach: Option<&'a str>,
     /// Report how the party and its foes spent the fighting time, and their attacks.
     pub activity: bool,
     /// Followers waiting in the party pool get the hero's experience (provisional).
@@ -173,6 +183,11 @@ fn area_tag(sim: &Sim) -> String {
         .unwrap_or_default()
 }
 
+/// How long the party must have been out of a fight before the harness, in its standard mode,
+/// walks towards hostiles (seen or not) or takes a door: enemies that are coming get to
+/// arrive, and the party is not steered into a fight the game would bring to it.
+const QUIET_MS: u64 = 30_000;
+
 /// The living hostile nearest the hero in its area.
 fn nearest_hostile(sim: &Sim, hero: ObjectId) -> Option<ObjectId> {
     let h = sim.world.get(hero)?;
@@ -272,6 +287,11 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
     sim.world.autopilot = true;
     sim.world.pool_xp = o.pool_xp;
     let hero = sim.world.hero.context("the save has no hero")?;
+    // A save taken after a wipe that the party got up from still carries the game-over
+    // latch; a run starts from a standing party, so the harness clears it.
+    if sim.world.game_over && alive(sim, hero) {
+        sim.world.game_over = false;
+    }
     let until_flag = o.until_flag.map(parse_flag).transpose()?;
     let mark_flag = o.mark_flag.map(parse_flag).transpose()?;
     let start = sim.world.time_ms;
@@ -317,6 +337,24 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
     let mut party_ids: Vec<ObjectId> = Vec::new();
     let (mut fight_ms, mut fights_won, mut last_t) = (0u64, 0u32, sim.world.time_ms);
     let mut engaged: std::collections::BTreeSet<ObjectId> = std::collections::BTreeSet::new();
+    let mut quiet_since = sim.world.time_ms;
+    if let Some(tag) = o.approach {
+        let to = sim
+            .world
+            .by_tag(tag)
+            .find(|x| x.kind == ObjectKind::Creature)
+            .map(|x| (x.id, x.position, x.area));
+        if let Some((who, p, a)) = to {
+            // One walk along the route, as the player clicks there: it stops when a
+            // conversation or a fight starts on the way.
+            sim.walk(hero, p, a);
+            // Then talk to it, as the player does by clicking it (from where the walk ended:
+            // the route may not reach it).
+            if !sim.world.party_fighting && sim.dialog_state().is_none_or(|d| d.ended) {
+                sim.start_conversation(hero, who, "");
+            }
+        }
+    }
     let end;
     loop {
         let now = sim.world.time_ms;
@@ -423,9 +461,14 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
             rest(sim, hero);
             continue;
         }
-        if let Some(d) = sim.dialog_state().filter(|d| !d.ended) {
-            let _ = d;
-            sim.choose_reply(0);
+        // A conversation is answered with its first reply; one that has shown its last line
+        // is closed the same way, as continuing does in the game (its end may start a fight).
+        if let Some(d) = sim.dialog_state() {
+            if d.ended {
+                sim.end_conversation();
+            } else {
+                sim.choose_reply(0);
+            }
             sim.tick(0);
             continue;
         }
@@ -445,8 +488,18 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
             .world
             .get(hero)
             .is_some_and(|h| h.commands.first().is_none_or(|c| c.name == "CommandWait"));
+        if sim.world.party_fighting {
+            quiet_since = now;
+        }
+        let quiet = now.saturating_sub(quiet_since) >= QUIET_MS;
+        // The standard measurement: while a fight is on or one may be coming, the party AI
+        // alone plays; the harness waits.
+        if !o.steer && !quiet {
+            sim.tick(500);
+            continue;
+        }
         if !hostiles.is_empty() {
-            if idle && !o.ai_hero {
+            if idle && !o.ai_hero && o.steer {
                 let t = target
                     .filter(|t| hostiles.contains(t))
                     .unwrap_or(hostiles[0]);
@@ -456,7 +509,7 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
             // The party AI does not chase a hostile far from the controlled character (a
             // wolf seen 35 m off that has not noticed the party): with everyone idle, the
             // player walks toward the nearest one, as they would.
-            if idle && o.ai_hero && party_idle(sim, hero) {
+            if idle && (o.ai_hero || !o.steer) && party_idle(sim, hero) {
                 let near = hostiles.iter().copied().min_by(|&a, &b| {
                     let d = |c| {
                         sim.world.get(c).map_or(f32::MAX, |x| {

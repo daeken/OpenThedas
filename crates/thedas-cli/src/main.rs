@@ -124,9 +124,17 @@ enum Command {
         /// One line per run.
         #[arg(long)]
         verbose: bool,
-        /// Leave the hero's fighting to the party AI (autopilot tactics) too.
+        /// With --steer: leave the hero's fighting to the party AI (autopilot tactics) too.
         #[arg(long)]
         ai_hero: bool,
+        /// The older harness player: order the hero's attacks and walk the party towards
+        /// hostiles in view. Without it the party AI alone fights (the standard measurement).
+        #[arg(long)]
+        steer: bool,
+        /// First walk the hero up to the creature with this tag (to start an encounter that
+        /// begins on approach).
+        #[arg(long)]
+        approach: Option<String>,
         /// Report how the party and its foes spent the fighting time, and their attacks.
         #[arg(long)]
         activity: bool,
@@ -299,6 +307,8 @@ fn run() -> Result<()> {
             at,
             verbose,
             ai_hero,
+            steer,
+            approach,
             activity,
             pool_xp,
             fights,
@@ -320,6 +330,8 @@ fn run() -> Result<()> {
             at: &at,
             verbose,
             ai_hero,
+            steer,
+            approach: approach.as_deref(),
             activity,
             pool_xp,
             fights,
