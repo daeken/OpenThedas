@@ -275,6 +275,7 @@ mod tests {
                 rewards: Default::default(),
                 journal: Default::default(),
                 initial: [initial, 0, 0, 0],
+                ..Default::default()
             });
         }
         s.open_chanter_board(3);
