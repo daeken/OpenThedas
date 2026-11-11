@@ -87,6 +87,23 @@ pub struct Presentation {
     pub open_slot: i32,
     /// The journal, while its screen is up (the app builds it: [`thedas_sim::Sim::journal`]).
     pub journal: Option<thedas_sim::journal::JournalView>,
+    /// The entry the journal opens on (a HUD notification clicked: `GUI.GoToQuest`,
+    /// `GUI.GoToCodex`).
+    pub journal_focus: Option<JournalFocus>,
+}
+
+/// The journal entry a notification opens the journal on, as journal.gfx reads it
+/// (`GUIJournal.Notification*`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct JournalFocus {
+    /// A codex entry rather than a quest.
+    pub codex: bool,
+    /// The plot resource.
+    pub resref: String,
+    /// The quest's group (its resource) or the codex entry's group (its plot type).
+    pub group: String,
+    /// The quest is done (it is under Completed Quests).
+    pub completed: bool,
 }
 
 /// A saved game as the save and load screens list it.
@@ -447,6 +464,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     party_picker(sim, shown, &mut v);
     saves(sim, shown, &mut v);
     journal(sim, shown, &mut v);
+    alerts(sim, &mut v);
     // The difficulty, as character creation's difficulty prompt starts from it.
     v.insert(
         "ClientOptions.GameOptions.DifficultyLevel".into(),
@@ -665,8 +683,8 @@ fn store(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
 /// (`Journal.CodexGroups.N`: the plot type as `CodexGroup`, its name and `CodexList.M`, each
 /// entry's resource, name, `Locked`, `Index` and `Descriptions.K`); and the quest marked
 /// active (`Journal.ActivePlot.ResRef`). Each list's own value lists its entries, so the
-/// movie's list observers fire. Nothing is marked new (`Updated`, `CodexUpdated` 0) and there
-/// is no conversation history (`Journal.Conversations`). Provisional: the layout is read from
+/// movie's list observers fire. New entries are marked (`Updated`, `CodexUpdated`) until read,
+/// and there is no conversation history (`Journal.Conversations`). Provisional: the layout is read from
 /// journal.gfx; the attribute names are the executable's (see [`thedas_sim::journal`]).
 fn journal(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
     let Some(j) = &shown.journal else {
@@ -687,7 +705,7 @@ fn journal(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
             v.insert(format!("{k}.Name"), text(q.name));
             v.insert(format!("{k}.Description"), text(q.description));
             v.insert(format!("{k}.Completed"), num(q.completed as u8));
-            v.insert(format!("{k}.Updated"), num(0));
+            v.insert(format!("{k}.Updated"), num(q.updated as u8));
             v.insert(format!("{k}.PlotGroup"), s(&q.group));
             v.insert(
                 format!("{k}.ParentPlot"),
@@ -731,7 +749,10 @@ fn journal(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
             v.insert(format!("{c}.ResRef"), s(&e.resref));
             v.insert(format!("{c}.Name"), text(e.name));
             v.insert(format!("{c}.Locked"), num(e.texts.is_empty() as u8));
-            v.insert(format!("{c}.Updated"), num(0));
+            v.insert(
+                format!("{c}.Updated"),
+                num((e.updated && !e.texts.is_empty()) as u8),
+            );
             v.insert(format!("{c}.Index"), s(&(n + 1).to_string()));
             v.insert(format!("{c}.Descriptions"), num(e.texts.len() as f64));
             for (d, t) in e.texts.iter().enumerate() {
@@ -739,25 +760,76 @@ fn journal(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
             }
         }
     }
-    // No journal notification is pending, so the screen opens on its quests (an unset
-    // `NotificationOpenPRCTab` reads as "open the downloadable content tab").
-    for k in [
-        "NotificationQuest",
-        "NotificationQuestGroup",
-        "NotificationCodex",
-        "NotificationCodexGroup",
-        "NotificationContentID",
-    ] {
-        v.insert(format!("GUIJournal.{k}"), s(""));
-    }
-    v.insert("GUIJournal.NotificationQuestIsCompleted".into(), num(0));
+    // The entry a clicked notification opens the journal on, else none (the screen opens on
+    // its quests; an unset `NotificationOpenPRCTab` reads as "open the downloadable content
+    // tab").
+    let focus = shown.journal_focus.clone().unwrap_or_default();
+    let (quest, codex) = match &shown.journal_focus {
+        Some(f) if f.codex => (JournalFocus::default(), focus),
+        Some(_) => (focus, JournalFocus::default()),
+        None => Default::default(),
+    };
+    v.insert("GUIJournal.NotificationQuest".into(), s(&quest.resref));
+    v.insert("GUIJournal.NotificationQuestGroup".into(), s(&quest.group));
+    v.insert(
+        "GUIJournal.NotificationQuestIsCompleted".into(),
+        num(quest.completed as u8),
+    );
+    v.insert("GUIJournal.NotificationCodex".into(), s(&codex.resref));
+    v.insert(
+        "GUIJournal.NotificationCodexGroup".into(),
+        match codex.group.parse::<f64>() {
+            Ok(n) => num(n),
+            Err(_) => s(""),
+        },
+    );
+    v.insert("GUIJournal.NotificationContentID".into(), s(""));
     v.insert("GUIJournal.NotificationOpenPRCTab".into(), num(0));
-    v.insert("Journal.CodexUpdated".into(), num(0));
+    v.insert("Journal.CodexUpdated".into(), num(j.codex_updated as u8));
     v.insert("Journal.Conversations".into(), s(""));
     v.insert(
         "Journal.ActivePlot.ResRef".into(),
         s(j.active_quest.as_deref().unwrap_or_default()),
     );
+}
+
+/// The HUD's notifications, as notifications.gfx reads them (`Party.Alerts.N`: the alert
+/// type, 1 a quest's new journal entry and 2 a codex entry, new, the plot's resource and
+/// name and whether the quest is done), with the list's own value listing them so the
+/// movie's observer fires; no large ("uber") alerts. Provisional: every alert shows as new,
+/// and which events raise one is inferred (see [`thedas_sim::journal::Alert`]).
+fn alerts(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
+    let alerts = &sim.world.alerts;
+    v.insert(
+        "Party.Alerts".into(),
+        UiValue::String(
+            alerts
+                .iter()
+                .map(|a| format!("{}:{}:{}", a.kind, a.resref, a.completed as u8))
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    );
+    for (i, a) in alerts.iter().enumerate() {
+        let k = format!("Party.Alerts.{i}");
+        v.insert(k.clone(), num(a.kind));
+        v.insert(format!("{k}.Type"), num(a.kind));
+        v.insert(format!("{k}.New"), num(1));
+        v.insert(format!("{k}.WasUber"), num(0));
+        v.insert(
+            format!("{k}.QuestResRef"),
+            UiValue::String(a.resref.clone()),
+        );
+        v.insert(
+            format!("{k}.QuestName"),
+            UiValue::String(a.name.and_then(|t| sim.string(t)).unwrap_or_default()),
+        );
+        v.insert(format!("{k}.QuestCompleted"), num(a.completed as u8));
+        v.insert(format!("{k}.IntegerArg"), num(0));
+        v.insert(format!("{k}.CustomText"), UiValue::String(String::new()));
+        v.insert(format!("{k}.CustomIcon"), UiValue::String(String::new()));
+    }
+    v.insert("Party.UberAlerts".into(), UiValue::String(String::new()));
 }
 
 /// Character creation's own values for chargen.gfx: it is the game's creation screen, not the
@@ -1451,6 +1523,7 @@ mod tests {
             group: "plt_pre_plot_group".into(),
             parent: parent.map(str::to_string),
             seq: 0,
+            updated: r == "plt_tower_sub",
         };
         let shown = Presentation {
             journal: Some(JournalView {
@@ -1472,19 +1545,45 @@ mod tests {
                             resref: "plt_cod_cha_duncan".into(),
                             name: None,
                             texts: vec![1, 2],
+                            updated: true,
                         },
                         CodexEntryView {
                             resref: "plt_cod_cha_cailan".into(),
                             name: None,
                             texts: vec![],
+                            updated: false,
                         },
                     ],
                 }],
                 active_quest: Some("plt_tower".into()),
+                codex_updated: true,
+            }),
+            journal_focus: Some(JournalFocus {
+                codex: false,
+                resref: "plt_tower_sub".into(),
+                group: "plt_pre_plot_group".into(),
+                completed: false,
             }),
             ..Default::default()
         };
         let v = sim_values_for(&sim, &shown);
+        // New entries are marked; a clicked notification's quest is the one to open on.
+        assert_eq!(v["Journal.PlotList.1.Updated"], num(1));
+        assert_eq!(v["Journal.PlotList.0.Updated"], num(0));
+        assert_eq!(v["Journal.CodexGroups.0.CodexList.0.Updated"], num(1));
+        assert_eq!(v["Journal.CodexUpdated"], num(1));
+        assert_eq!(
+            v["GUIJournal.NotificationQuest"],
+            UiValue::String("plt_tower_sub".into())
+        );
+        assert_eq!(
+            v["GUIJournal.NotificationQuestGroup"],
+            UiValue::String("plt_pre_plot_group".into())
+        );
+        assert_eq!(
+            v["GUIJournal.NotificationCodex"],
+            UiValue::String(String::new())
+        );
         let s = |x: &str| UiValue::String(x.into());
         assert_eq!(v["Journal.PlotList"], s("plt_tower,plt_tower_sub"));
         assert_eq!(v["Journal.PlotList.1.ParentPlot"], s("plt_tower"));
@@ -1502,5 +1601,46 @@ mod tests {
         assert_eq!(v["GUIJournal.NotificationOpenPRCTab"], num(0));
         // No journal up: nothing bound.
         assert!(!sim_values(&sim).contains_key("Journal.PlotList"));
+    }
+
+    #[test]
+    fn the_hud_lists_the_journal_and_codex_notifications() {
+        use thedas_sim::journal::{ALERT_CODEX, ALERT_QUEST, Alert};
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        assert_eq!(
+            sim_values(&sim)["Party.Alerts"],
+            UiValue::String(String::new())
+        );
+        sim.world.alerts = vec![
+            Alert {
+                kind: ALERT_QUEST,
+                resref: "plt_bhn100pt_father".into(),
+                name: None,
+                completed: true,
+            },
+            Alert {
+                kind: ALERT_CODEX,
+                resref: "plt_cod_cha_duncan".into(),
+                name: None,
+                completed: false,
+            },
+        ];
+        let v = sim_values(&sim);
+        assert_eq!(
+            v["Party.Alerts"],
+            UiValue::String("1:plt_bhn100pt_father:1,2:plt_cod_cha_duncan:0".into())
+        );
+        assert_eq!(v["Party.Alerts.0.Type"], num(ALERT_QUEST));
+        assert_eq!(v["Party.Alerts.0.QuestCompleted"], num(1));
+        assert_eq!(v["Party.Alerts.0.New"], num(1));
+        assert_eq!(
+            v["Party.Alerts.1.QuestResRef"],
+            UiValue::String("plt_cod_cha_duncan".into())
+        );
+        assert_eq!(v["Party.Alerts.1.Type"], num(ALERT_CODEX));
     }
 }

@@ -39,7 +39,13 @@ pub enum Screen {
 impl Screen {
     pub fn movies(self) -> &'static [&'static str] {
         match self {
-            Screen::Hud => &["portraits.gfx", "quickbar.gfx", "minimap.gfx"],
+            // notifications.gfx: the journal's and codex's notifications (`Party.Alerts`).
+            Screen::Hud => &[
+                "portraits.gfx",
+                "quickbar.gfx",
+                "minimap.gfx",
+                "notifications.gfx",
+            ],
             Screen::Cutscene => &["cutscene.gfx"],
             Screen::Conversation => &["conversation.gfx"],
             Screen::WorldMap => &["worldmap.gfx"],

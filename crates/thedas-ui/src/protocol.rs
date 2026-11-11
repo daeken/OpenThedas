@@ -498,7 +498,14 @@ impl GameBridge {
             "SetValue" | "SetValueUnicode" => {
                 let (k, v) = text.split_once(' ').unwrap_or((&text, ""));
                 s.values.insert(k.to_string(), parse_value(v));
-                None
+                // The journal's own attributes are game state: a movie writing one (journal.gfx
+                // clearing a quest's `Updated` as it is read) is passed on to the game.
+                k.starts_with("Journal.").then(|| {
+                    GameMessage::Send(
+                        thedas_sim::journal::MSG_SET_ATTRIBUTE.into(),
+                        vec![k.to_string(), v.to_string()],
+                    )
+                })
             }
             "PlayGUISound" => {
                 s.sounds.push(text);
@@ -565,6 +572,21 @@ mod tests {
         assert_eq!(b.value("Movie.Own"), Some(n(3.0)));
         // The defaults every movie reads stay.
         assert!(b.value("Scaleform.Platform").is_some());
+    }
+
+    #[test]
+    fn the_journals_attributes_written_by_a_movie_go_to_the_game() {
+        let b = bridge();
+        let fs = CallKind::FsCommand;
+        assert_eq!(
+            b.handle(call(fs, "SetValue", &["Journal.PlotList.0.Updated false"])),
+            Some(GameMessage::Send(
+                thedas_sim::journal::MSG_SET_ATTRIBUTE.into(),
+                vec!["Journal.PlotList.0.Updated".into(), "false".into()]
+            ))
+        );
+        // Other values a movie sets stay the interface's.
+        assert_eq!(b.handle(call(fs, "SetValue", &["GUI.Page 20"])), None);
     }
 
     #[test]

@@ -295,6 +295,60 @@ impl UiLayer {
         screens.menu = Some(Screen::SaveLoad);
     }
 
+    /// A HUD notification clicked: notifications.gfx's `GUI.GoToQuest` (the quest's plot
+    /// resource and whether it is done, in either order) and `GUI.GoToCodex` (the entry's
+    /// resource) open the journal on that entry (its `GUIJournal.Notification*` values).
+    /// Returns whether the message was one of these.
+    fn go_to_journal(
+        &mut self,
+        screens: &mut Screens,
+        sim: &Arc<Mutex<Sim>>,
+        name: &str,
+        args: &[String],
+    ) -> bool {
+        let codex = match name {
+            "GUI.GoToQuest" => false,
+            "GUI.GoToCodex" => true,
+            _ => return false,
+        };
+        let Some(resref) = args
+            .iter()
+            .map(|a| a.trim())
+            .find(|a| a.starts_with("plt_"))
+        else {
+            return true;
+        };
+        let view = sim.lock().unwrap_or_else(|p| p.into_inner()).journal();
+        let focus = if codex {
+            view.codex
+                .iter()
+                .find(|g| g.entries.iter().any(|e| e.resref == resref))
+                .map(|g| thedas_ui::binding::JournalFocus {
+                    codex: true,
+                    resref: resref.to_string(),
+                    group: g.kind.to_string(),
+                    completed: false,
+                })
+        } else {
+            let done = view.completed.iter().any(|q| q.resref == resref);
+            view.active
+                .iter()
+                .chain(&view.completed)
+                .find(|q| q.resref == resref)
+                .map(|q| thedas_ui::binding::JournalFocus {
+                    codex: false,
+                    resref: resref.to_string(),
+                    group: q.group.clone(),
+                    completed: done,
+                })
+        };
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.journal_focus = focus;
+        }
+        screens.menu = Some(Screen::Journal);
+        true
+    }
+
     /// The popup layer's messages: a movie's `GUI.ShowDialogBox` (after it set the dialog's
     /// text, buttons and callbacks in `GUIPopupLayer.*`) shows it with popuplayer.gfx's
     /// `PopupLayer.ShowDialogBoxFromGame` (the executable invokes it at 0x60bba4), and the
@@ -462,6 +516,10 @@ impl UiLayer {
         let journal = (screens.menu == Some(Screen::Journal))
             .then(|| sim.lock().unwrap_or_else(|p| p.into_inner()).journal());
         if let Ok(mut shown) = self.shown.lock() {
+            // A notification's entry is the journal's to open on while it is up.
+            if journal.is_none() {
+                shown.journal_focus = None;
+            }
             shown.journal = journal;
         }
         let (want, line) = {
@@ -545,7 +603,11 @@ impl UiLayer {
         }
         let ignored: Vec<(String, Vec<String>)> = ignored
             .into_iter()
-            .filter(|(n, a)| !self.popup_message(n, a) && !self.save_message(screens, sim, n, a))
+            .filter(|(n, a)| {
+                !self.popup_message(n, a)
+                    && !self.save_message(screens, sim, n, a)
+                    && !self.go_to_journal(screens, sim, n, a)
+            })
             .collect();
         let mut aims = Vec::new();
         {
