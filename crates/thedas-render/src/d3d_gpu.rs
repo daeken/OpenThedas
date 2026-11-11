@@ -21,6 +21,9 @@ use crate::d3d::{
     sampler_texture,
 };
 use crate::gpu::{DEPTH_FORMAT, GpuContext, TextureCache};
+
+/// The partitions' size as a float, for the half-pixel fix-up constant.
+const PARTITION_TEXELS: f32 = crate::shadow::PARTITION_SIZE as f32;
 use crate::scene::{
     AreaScene, DOMAIN_CHARACTERS, DOMAIN_LEVEL, SceneLight, SceneMaterial, SceneMesh,
 };
@@ -90,6 +93,8 @@ pub(crate) struct D3dPass {
     pub draws: Vec<D3dDraw>,
     buffer: Option<wgpu::Buffer>,
     materials: Vec<SceneMaterial>,
+    /// Each material switched to its `PSSM` semantic, for the shadow casters' constants.
+    caster_materials: Vec<Option<SceneMaterial>>,
     worlds: Vec<(glam::Mat4, Option<crate::scene::LightmapRef>, usize)>,
     /// Each scene draw's irradiance probe.
     probes: Vec<Option<usize>>,
@@ -104,6 +109,95 @@ pub(crate) struct D3dPass {
     sky: Option<[[f32; 4]; 9]>,
     clouds: [[f32; 4]; 3],
     pub programs: Vec<String>,
+    /// The shadow partitions this pass draws its casters into and its receivers read.
+    pub(crate) shadows: Option<Arc<ShadowTargets>>,
+    /// Whether this pass places the partitions (the level's own pass; an objects' pass
+    /// reads what the level's placed this frame).
+    places_partitions: bool,
+    reach: [f32; 2],
+    caster_pipelines: Vec<wgpu::RenderPipeline>,
+    casters: Vec<CasterDraw>,
+    caster_buffer: Option<wgpu::Buffer>,
+    caster_programs: Vec<Arc<D3dProgram>>,
+    /// The (empty) texture bindings of the casters' programs.
+    empty_group: wgpu::BindGroup,
+}
+
+/// The format of the shadow partitions: `PSSMStatic.psh` writes depth and its square into
+/// red and green (the state masks the rest).
+pub const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// A frame's partitions and the `g_vShadowData` they give.
+type PlacedPartitions = ([crate::shadow::Partition; 2], [[f32; 4]; 9]);
+
+/// The two shadow partitions' targets, shared by the renderers of one level (see
+/// [`crate::shadow`]), and the partitions placed this frame.
+pub struct ShadowTargets {
+    views: [wgpu::TextureView; 2],
+    depth: [wgpu::TextureView; 2],
+    frame: std::sync::Mutex<Option<PlacedPartitions>>,
+    /// The casters of the passes that do not place the partitions (the objects'), as they
+    /// stood when last drawn: world bounding spheres. Provisional: the level's pass fits
+    /// the partitions to them a frame late.
+    others: std::sync::Mutex<Vec<(Vec3, f32)>>,
+}
+
+impl ShadowTargets {
+    pub fn new(device: &wgpu::Device, size: u32) -> Self {
+        let make = |label, format| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        };
+        let t0 = make("shadow partition 0", SHADOW_FORMAT);
+        let t1 = make("shadow partition 1", SHADOW_FORMAT);
+        let make = |label, format| {
+            make(label, format).create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        ShadowTargets {
+            views: [
+                t0.create_view(&Default::default()),
+                t1.create_view(&Default::default()),
+            ],
+            depth: [
+                make("shadow depth 0", DEPTH_FORMAT),
+                make("shadow depth 1", DEPTH_FORMAT),
+            ],
+            frame: std::sync::Mutex::new(None),
+            others: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn frame(&self) -> Option<PlacedPartitions> {
+        *self.frame.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// One shadow caster: a scene draw drawn with its material's `PSSM` program into both
+/// partitions.
+struct CasterDraw {
+    pipeline: usize,
+    vertices: wgpu::Buffer,
+    mesh: usize,
+    draw: usize,
+    /// One constant slot per partition.
+    consts: [wgpu::BindGroup; 2],
+    slots: [u64; 2],
+    /// The draw's bounding sphere in its own space (centre, radius), which the partitions
+    /// fit (see [`crate::shadow::partitions`]).
+    sphere: (Vec3, f32),
 }
 
 fn decl_usage(u: Usage) -> DeclUsage {
@@ -350,6 +444,36 @@ fn const_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
+/// One draw's constants: the bindings of the slot at `slot` in `buf`.
+fn const_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    buf: &wgpu::Buffer,
+    slot: u64,
+) -> wgpu::BindGroup {
+    let range = |i: usize, size: u64| {
+        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: buf,
+            offset: slot + SLOT[i],
+            size: wgpu::BufferSize::new(size),
+        })
+    };
+    let entry = |binding, resource| wgpu::BindGroupEntry { binding, resource };
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("d3d draw constants"),
+        layout,
+        entries: &[
+            entry(translate::binding_float(Stage::Vertex), range(0, FLOATS)),
+            entry(translate::binding_int(Stage::Vertex), range(1, INTS)),
+            entry(translate::binding_bool(Stage::Vertex), range(2, BOOLS)),
+            entry(translate::binding_float(Stage::Pixel), range(3, FLOATS)),
+            entry(translate::binding_int(Stage::Pixel), range(4, INTS)),
+            entry(translate::binding_bool(Stage::Pixel), range(5, BOOLS)),
+            entry(translate::BINDING_FIXUP, range(6, 16)),
+        ],
+    })
+}
+
 fn create_pipeline(
     device: &wgpu::Device,
     program: &D3dProgram,
@@ -504,6 +628,8 @@ impl D3dPass {
         vfs: &Vfs,
         scene: &AreaScene,
         material_programs: &[Vec<Arc<D3dProgram>>],
+        caster_programs: &[Option<crate::d3d::CasterMaterial>],
+        shadows: Option<Arc<ShadowTargets>>,
         textures: &mut TextureCache,
         cache: &mut D3dCache,
         color_format: wgpu::TextureFormat,
@@ -583,47 +709,7 @@ impl D3dPass {
                 .clone();
             let buf = buffer.as_ref().expect("buffer exists when there are draws");
             let slot = slot_size * k as u64;
-            let range = |i: usize, size: u64| {
-                wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: buf,
-                    offset: slot + SLOT[i],
-                    size: wgpu::BufferSize::new(size),
-                })
-            };
-            let consts = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("d3d draw constants"),
-                layout: &consts_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: translate::binding_float(Stage::Vertex),
-                        resource: range(0, FLOATS),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: translate::binding_int(Stage::Vertex),
-                        resource: range(1, INTS),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: translate::binding_bool(Stage::Vertex),
-                        resource: range(2, BOOLS),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: translate::binding_float(Stage::Pixel),
-                        resource: range(3, FLOATS),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: translate::binding_int(Stage::Pixel),
-                        resource: range(4, INTS),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: translate::binding_bool(Stage::Pixel),
-                        resource: range(5, BOOLS),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: translate::BINDING_FIXUP,
-                        resource: range(6, 16),
-                    },
-                ],
-            });
+            let consts = const_group(device, &consts_layout, buf, slot);
 
             // Textures and samplers.
             let material = &scene.materials[d.material];
@@ -638,6 +724,9 @@ impl D3dPass {
                     sampler_texture(table, s, ty, material, d.lightmap.as_ref());
                 let view = match &source {
                     TextureSource::Resource(name) => textures.view(ctx, vfs, name, ty),
+                    TextureSource::Shadow(i) => shadows
+                        .as_ref()
+                        .and_then(|t| t.views.get(*i as usize).cloned()),
                     TextureSource::White => None,
                     TextureSource::Black => None,
                 }
@@ -645,7 +734,7 @@ impl D3dPass {
                     textures.solid(
                         ctx,
                         ty,
-                        if source == TextureSource::White {
+                        if matches!(source, TextureSource::White | TextureSource::Shadow(_)) {
                             [255; 4]
                         } else {
                             [0, 0, 0, 255]
@@ -700,6 +789,103 @@ impl D3dPass {
                 multipass,
             });
         }
+        // Shadow casters: the level's meshes whose model says they cast run-time shadows
+        // (6176), and the objects' meshes unless their model says they do not; eyes never
+        // (`exclude class eye`). Each is drawn with its material's `PSSM` program.
+        let mut caster_pipelines = Vec::new();
+        let mut caster_programs_used: Vec<Arc<D3dProgram>> = Vec::new();
+        let mut caster_by_name: HashMap<String, usize> = HashMap::new();
+        let mut pending_casters = Vec::new();
+        let empty = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow caster textures"),
+            entries: &[],
+        });
+        let empty_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow caster textures"),
+            layout: &empty,
+            entries: &[],
+        });
+        if shadows.is_some() {
+            for (di, d) in scene.draws.iter().enumerate() {
+                let casts = d.cast_shadow.unwrap_or(di >= scene.static_draws);
+                let eye = scene.materials[d.material]
+                    .render_class
+                    .as_deref()
+                    .is_some_and(|c| c.split(',').any(|k| k.trim().eq_ignore_ascii_case("eye")));
+                if !casts || eye {
+                    continue;
+                }
+                let Some((program, _)) = caster_programs.get(d.material).and_then(Option::as_ref)
+                else {
+                    continue;
+                };
+                if !program.ps.interface.samplers.is_empty()
+                    || !program.vs.interface.samplers.is_empty()
+                {
+                    continue;
+                }
+                let pi = *caster_by_name
+                    .entry(program.name.clone())
+                    .or_insert_with(|| {
+                        caster_pipelines.push(create_pipeline(
+                            device,
+                            program,
+                            &consts_layout,
+                            &empty,
+                            SHADOW_FORMAT,
+                        ));
+                        caster_programs_used.push(program.clone());
+                        caster_pipelines.len() - 1
+                    });
+                pending_casters.push((di, pi));
+            }
+        }
+        let caster_buffer = (!pending_casters.is_empty()).then(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("shadow caster constants"),
+                size: slot_size * 2 * pending_casters.len() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        let mut casters = Vec::new();
+        for (k, (di, pi)) in pending_casters.into_iter().enumerate() {
+            let d = &scene.draws[di];
+            let program = &caster_programs_used[pi];
+            let mesh = &scene.meshes[d.mesh];
+            let inputs = &program.vs.interface.inputs;
+            let sig: String = inputs
+                .iter()
+                .map(|s| format!("{:?}{}@{};", s.semantic.usage, s.semantic.index, s.location))
+                .collect();
+            let vertices = cache
+                .vertices
+                .entry((mesh.key.clone(), sig))
+                .or_insert_with(|| {
+                    use wgpu::util::DeviceExt;
+                    let data = expand_vertices(mesh, inputs);
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(&mesh.key),
+                        contents: bytemuck::cast_slice(&data),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    })
+                })
+                .clone();
+            let buf = caster_buffer.as_ref().expect("buffer exists with casters");
+            let slots = [slot_size * 2 * k as u64, slot_size * (2 * k as u64 + 1)];
+            let consts = slots.map(|slot| const_group(device, &consts_layout, buf, slot));
+            let local = d.transform.inverse().transform_point3(d.sphere.0);
+            casters.push(CasterDraw {
+                pipeline: pi,
+                vertices,
+                mesh: d.mesh,
+                draw: di,
+                consts,
+                slots,
+                sphere: (local, d.sphere.1),
+            });
+        }
+
         let programs = pipelines.iter().map(|p| p.program.name.clone()).collect();
         let celestial = scene
             .atmosphere
@@ -710,6 +896,10 @@ impl D3dPass {
             draws,
             buffer,
             materials: scene.materials.clone(),
+            caster_materials: caster_programs
+                .iter()
+                .map(|c| c.as_ref().map(|(_, m)| m.clone()))
+                .collect(),
             worlds: scene
                 .draws
                 .iter()
@@ -727,6 +917,14 @@ impl D3dPass {
                 .map(|(c, a)| crate::atmosphere::sky_params(a, c)),
             clouds: crate::atmosphere::cloud_params(scene.clouds.as_ref(), celestial.as_ref()),
             programs,
+            shadows,
+            places_partitions: scene.static_draws > 0,
+            reach: crate::shadow::partition_reach(scene.detail),
+            caster_pipelines,
+            casters,
+            caster_buffer,
+            caster_programs: caster_programs_used,
+            empty_group,
         }
     }
 
@@ -751,8 +949,44 @@ impl D3dPass {
     /// Fills every draw's constants for this frame; `time` is the shaders' `ApplicationTime`
     /// in seconds.
     pub fn update(&self, ctx: &GpuContext, camera: &Camera, width: u32, height: u32, time: f32) {
-        let Some(buffer) = &self.buffer else { return };
         let aspect = width as f32 / height.max(1) as f32;
+        // The level's pass places this frame's partitions; the objects' pass reads them.
+        let partitions = match (&self.shadows, self.sun) {
+            (Some(t), Some((dir, _))) => {
+                let mine: Vec<(Vec3, f32)> = self
+                    .casters
+                    .iter()
+                    .filter_map(|c| {
+                        let (world, _, _) = self.worlds.get(c.draw)?;
+                        Some((world.transform_point3(c.sphere.0), c.sphere.1))
+                    })
+                    .collect();
+                if self.places_partitions {
+                    let mut casters = mine;
+                    casters.extend(
+                        t.others
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .iter()
+                            .copied(),
+                    );
+                    let p = crate::shadow::partitions(camera, aspect, dir, self.reach, &casters);
+                    let data = crate::shadow::shadow_data(&p, camera);
+                    *t.frame.lock().unwrap_or_else(|e| e.into_inner()) = Some((p, data));
+                } else {
+                    *t.others.lock().unwrap_or_else(|e| e.into_inner()) = mine;
+                }
+                t.frame()
+            }
+            _ => None,
+        };
+        let shadow = partitions
+            .map(|(_, d)| d)
+            .unwrap_or(crate::d3d::NO_SHADOW_DATA);
+        if let (Some(buf), Some((p, _))) = (&self.caster_buffer, partitions) {
+            self.update_casters(ctx, buf, camera, &p);
+        }
+        let Some(buffer) = &self.buffer else { return };
         let (view, projection) = (camera.view(), camera.projection(aspect));
         let mut data = vec![0u8; buffer.size() as usize];
         let put = |data: &mut [u8], at: u64, c: &StageConstants, base: usize| {
@@ -788,6 +1022,8 @@ impl D3dPass {
                 sky: self.sky.as_ref(),
                 clouds: self.clouds,
                 time,
+                shadow,
+                partition: None,
             };
             put(&mut data, d.slot, &cc.fill(program.vs.ctab.as_ref()), 0);
             put(&mut data, d.slot, &cc.fill(program.ps.ctab.as_ref()), 3);
@@ -800,6 +1036,120 @@ impl D3dPass {
             data[(d.slot + SLOT[6]) as usize..][..16].copy_from_slice(bytemuck::cast_slice(&fix));
         }
         ctx.queue.write_buffer(buffer, 0, &data);
+    }
+
+    /// The casters' constants: their world and each partition's matrix.
+    fn update_casters(
+        &self,
+        ctx: &GpuContext,
+        buffer: &wgpu::Buffer,
+        camera: &Camera,
+        partitions: &[crate::shadow::Partition; 2],
+    ) {
+        let mut data = vec![0u8; buffer.size() as usize];
+        let lights = DrawLights::default();
+        for c in &self.casters {
+            let (world, _, material) = &self.worlds[c.draw];
+            let program = &self.caster_programs[c.pipeline];
+            let Some(Some(material)) = self.caster_materials.get(*material) else {
+                continue;
+            };
+            for (k, slot) in c.slots.iter().enumerate() {
+                let cc = ConstantContext {
+                    view: glam::Mat4::IDENTITY,
+                    projection: partitions[k].view_proj,
+                    world: *world,
+                    camera: camera.position,
+                    material,
+                    lightmap: None,
+                    lights: &lights,
+                    ambient: Vec3::ZERO,
+                    bones: self.bones.get(c.draw).map_or(&[][..], |b| b.as_slice()),
+                    irradiance: None,
+                    sun: None,
+                    fog: self.fog,
+                    sky: None,
+                    clouds: self.clouds,
+                    time: 0.0,
+                    shadow: crate::d3d::NO_SHADOW_DATA,
+                    partition: Some(partitions[k].view_proj),
+                };
+                for (table, base) in [(program.vs.ctab.as_ref(), 0), (program.ps.ctab.as_ref(), 3)]
+                {
+                    let c = cc.fill(table);
+                    let o = *slot as usize;
+                    let f: &[u8] = bytemuck::cast_slice(&c.floats);
+                    let i: &[u8] = bytemuck::cast_slice(&c.ints);
+                    let b: &[u8] = bytemuck::cast_slice(&c.bools);
+                    data[o + SLOT[base] as usize..][..f.len()].copy_from_slice(f);
+                    data[o + SLOT[base + 1] as usize..][..i.len()].copy_from_slice(i);
+                    data[o + SLOT[base + 2] as usize..][..b.len()].copy_from_slice(b);
+                }
+                let fix = [1.0 / PARTITION_TEXELS, 1.0 / PARTITION_TEXELS, 0.0, 0.0];
+                data[(*slot + SLOT[6]) as usize..][..16]
+                    .copy_from_slice(bytemuck::cast_slice(&fix));
+            }
+        }
+        ctx.queue.write_buffer(buffer, 0, &data);
+    }
+
+    /// Records this pass's shadow casters into the partitions; `clear` starts them afresh
+    /// (the level's pass, before any objects' pass adds its casters). Does nothing without
+    /// partitions or casters (but still clears when asked, so no stale shadows remain).
+    pub fn encode_shadows(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        meshes: &[crate::gpu::GpuMesh],
+        clear: bool,
+    ) {
+        let Some(t) = &self.shadows else { return };
+        if t.frame().is_none() || (!clear && self.casters.is_empty()) {
+            return;
+        }
+        for k in 0..2 {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow partition"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &t.views[k],
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: if clear {
+                            wgpu::LoadOp::Clear(wgpu::Color::WHITE)
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &t.depth[k],
+                    depth_ops: Some(wgpu::Operations {
+                        load: if clear {
+                            wgpu::LoadOp::Clear(1.0)
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            for c in &self.casters {
+                let Some(mesh) = meshes.get(c.mesh) else {
+                    continue;
+                };
+                pass.set_pipeline(&self.caster_pipelines[c.pipeline]);
+                pass.set_bind_group(0, &c.consts[k], &[]);
+                pass.set_bind_group(1, &self.empty_group, &[]);
+                pass.set_vertex_buffer(0, c.vertices.slice(..));
+                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.count, 0, 0..1);
+            }
+        }
     }
 
     pub fn draw(
