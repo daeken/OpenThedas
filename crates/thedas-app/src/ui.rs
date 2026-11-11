@@ -513,6 +513,9 @@ impl UiLayer {
                 sim.clone(),
                 self.shown.clone(),
             )));
+        self.stage
+            .bridge
+            .set_query_handler(Some(thedas_ui::input::query_for(sim.clone())));
     }
 
     /// One interface frame while playing: binds the simulation's values, brings the screens

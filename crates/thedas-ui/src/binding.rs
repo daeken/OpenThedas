@@ -1005,8 +1005,9 @@ fn party_picker(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValu
 /// type 0, "Off"), whether its slots were edited since (`Dirty`) and whether its tactics are
 /// on (`Enabled`). DAOrigins.exe's PartyTactics keeps these tokens (set up at 0x7b11xx). The
 /// list's own token changes with its rows, so tactics.gfx's list observer reads them again
-/// after a preset is loaded. Provisional: a creature with `NumTactics` set shows that many
-/// rows, `TargetID` and `ConditionID` repeat the target and condition, and there are no
+/// after a preset is loaded. A slot's `TargetID` and `ConditionID` are the party members its
+/// per-follower target and condition name (-1 none), `CommandItem` the item it uses.
+/// Provisional: a creature with `NumTactics` set shows that many rows, and there are no
 /// custom presets (`NumCustomSlots` 0).
 fn tactics(sim: &Sim, who: u32, v: &mut BTreeMap<String, UiValue>) {
     use thedas_sim::tactics::{FIELD_DIRTY, FIELD_ENABLED, FIELD_PRESET_TYPE, PRESET_PREDEFINED};
@@ -1049,20 +1050,38 @@ fn tactics(sim: &Sim, who: u32, v: &mut BTreeMap<String, UiValue>) {
         let r = format!("{k}.TacticsList.{i}");
         v.insert(format!("{r}.Enabled"), num(t.enabled as u8));
         v.insert(format!("{r}.Target"), num(t.target));
-        v.insert(format!("{r}.TargetID"), num(t.target));
+        let object = |o: Option<u32>| num(o.map_or(-1.0, f64::from));
+        v.insert(format!("{r}.TargetID"), object(t.target_object));
         v.insert(format!("{r}.Condition"), num(t.condition));
-        v.insert(format!("{r}.ConditionID"), num(t.condition));
+        v.insert(format!("{r}.ConditionID"), object(t.condition_object));
         v.insert(format!("{r}.Command"), num(t.command));
         v.insert(format!("{r}.CommandParam"), num(t.param));
-        v.insert(format!("{r}.CommandItem"), num(0));
-        v.insert(format!("{r}.ItemName"), UiValue::String(String::new()));
-        v.insert(format!("{r}.ItemIcon"), UiValue::String(String::new()));
+        v.insert(format!("{r}.CommandItem"), num(t.item.unwrap_or(0)));
+        v.insert(
+            format!("{r}.ItemName"),
+            UiValue::String(t.item.map(|i| name(sim, i)).unwrap_or_default()),
+        );
+        v.insert(
+            format!("{r}.ItemIcon"),
+            UiValue::String(t.item.map(|i| sim.item_look(i).icon).unwrap_or_default()),
+        );
         token.push(format!(
             "{}:{}:{}:{}:{}",
             t.enabled as u8, t.target, t.condition, t.command, t.param
         ));
     }
-    v.insert(format!("{k}.TacticsList"), UiValue::String(token.join(",")));
+    v.insert(format!("{k}.TacticsList"), UiValue::String(token.join(","))); // The use-item picker names the party's items by `Objects.<id>.Name`.
+    for item in sim
+        .tactic_items(0)
+        .into_iter()
+        .chain(sim.tactic_items(1))
+        .chain(sim.tactic_items(3))
+    {
+        v.insert(
+            format!("Objects.{item}.Name"),
+            UiValue::String(name(sim, item)),
+        );
+    }
 }
 
 /// The inventory screen: the party's backpack/// The inventory screen: the party's backpack (`GUIInventory.PartyBackpackView.N.Item`, the
@@ -1469,6 +1488,7 @@ mod tests {
                 condition: 9,
                 command: 4,
                 param: 3000,
+                ..Default::default()
             });
             for (k, v) in [
                 ("TacticPresetCount", 2),
@@ -1498,6 +1518,12 @@ mod tests {
         assert_eq!(v[&format!("{t}.Condition")], UiValue::Number(9.0));
         assert_eq!(v[&format!("{t}.CommandParam")], UiValue::Number(3000.0));
         assert_eq!(v[&format!("{t}.Enabled")], UiValue::Number(1.0));
+        assert_eq!(
+            v[&format!("{t}.TargetID")],
+            UiValue::Number(-1.0),
+            "no follower"
+        );
+        assert_eq!(v[&format!("{t}.CommandItem")], UiValue::Number(0.0));
         let k = "GUI.SelectedChar.Tactics";
         assert!(!v.contains_key(&format!("{k}.TacticsList.1.Condition")));
         assert_eq!(

@@ -26,7 +26,7 @@
 //!   entry saw the release and no choice was ever made (tactics.gfx's presets and behaviours).
 //!   `MovieUtils.HideMovie` is wrapped to put off hiding while the host delivers a release
 //!   ([`HIDE_LATER`] is an array then); the host hides what was put off afterwards
-//!   ([`HIDE_FLUSH`]). Provisional: the order is inferred from the movies working in the game.
+//!   ([`HIDE_FLUSH`]), unless `MovieUtils.ShowMovie` showed it again meanwhile. Provisional: the order is inferred from the movies working in the game.
 
 /// The callback name the injected code registers.
 pub const INVOKE_CALLBACK: &str = "thedas_invoke";
@@ -81,6 +81,23 @@ pub const RETURNING_FSCOMMANDS: &[&str] = &[
     "GetM2DAValueByIndex",
     "GetTlkString",
     "FormatFloat",
+];
+
+/// `DAExternalCommands` functions that send an fscommand and return what the game set in
+/// `_root.fsc_retval` (and `fsc_retval2`) meanwhile (tactics.gfx's pickers). They are wrapped
+/// like [`RETURNING_FSCOMMANDS`] (once the movie defines them, see [`INSTALL`]): the
+/// wrapper returns the game's whole answer, which for `ListTacticTargets` and
+/// `ListTacticConditions` is the `{Targets, IDs}` / `{Conditions, IDs}` object the originals
+/// build from the two variables.
+pub const DA_RETURNING_FSCOMMANDS: &[&str] = &[
+    "ListTacticTargets",
+    "ListTacticBaseConditions",
+    "ListTacticConditions",
+    "ListTacticActions",
+    "ListTacticAbilities",
+    "ListTacticModalAbilities",
+    "ListTacticItems",
+    "GetObjectNameByID",
 ];
 
 /// Functions the game answers by setting a movie variable while the function runs (Scaleform's
@@ -245,6 +262,9 @@ fn button_wrap_maker() -> Vec<u8> {
 fn hide_wrap_maker() -> Vec<u8> {
     let mut then = Vec::new();
     get_path(&mut then, &["mc"]);
+    push(&mut then, &[Push::Str(PENDING), Push::Int(1)]);
+    then.push(SET_MEMBER);
+    get_path(&mut then, &["mc"]);
     push(&mut then, &[Push::Int(1)]);
     get_path(&mut then, &["_global", "thedas_later"]);
     push(&mut then, &[Push::Str("push")]);
@@ -269,8 +289,32 @@ fn hide_wrap_maker() -> Vec<u8> {
     function(&["o"], &outer)
 }
 
+/// The member marking a clip whose hiding is put off (cleared by a `ShowMovie` meanwhile).
+const PENDING: &str = "thedas_hide_pending";
+
+/// `function (o) { return function (mc) { mc.thedas_hide_pending = 0;
+/// return o.apply(this, arguments); }; }`: `MovieUtils.ShowMovie`'s wrapper. A clip shown
+/// again after a hide was put off stays shown (tactics.gfx's action picker hides its ability
+/// list and shows it again in the click that opens it).
+fn show_wrap_maker() -> Vec<u8> {
+    let mut inner = Vec::new();
+    get_path(&mut inner, &["mc"]);
+    push(&mut inner, &[Push::Str(PENDING), Push::Int(0)]);
+    inner.push(SET_MEMBER);
+    get_path(&mut inner, &["arguments"]);
+    get_path(&mut inner, &["this"]);
+    push(&mut inner, &[Push::Int(2)]);
+    get_path(&mut inner, &["o"]);
+    push(&mut inner, &[Push::Str("apply")]);
+    inner.extend_from_slice(&[CALL_METHOD, RETURN]);
+    let mut outer = function(&["mc"], &inner);
+    outer.push(RETURN);
+    function(&["o"], &outer)
+}
+
 /// `function () { var a = _global.thedas_later; _global.thedas_later = undefined;
-/// while (a.length) _global.MovieUtils.HideMovie(a.pop()); }` (see [`HIDE_FLUSH`]).
+/// while (a.length) { var m = a.pop(); if (m.thedas_hide_pending) {
+/// m.thedas_hide_pending = 0; _global.MovieUtils.HideMovie(m); } } }` (see [`HIDE_FLUSH`]).
 fn flush_function() -> Vec<u8> {
     let mut body = Vec::new();
     push(&mut body, &[Push::Str("a")]);
@@ -283,14 +327,23 @@ fn flush_function() -> Vec<u8> {
     get_path(&mut test, &["a", "length"]);
     test.push(NOT);
     let mut step = Vec::new();
-    push(&mut step, &[Push::Int(0)]);
+    push(&mut step, &[Push::Str("m"), Push::Int(0)]);
     get_path(&mut step, &["a"]);
     push(&mut step, &[Push::Str("pop")]);
-    step.push(CALL_METHOD);
-    push(&mut step, &[Push::Int(1)]);
-    get_path(&mut step, &["_global", "MovieUtils"]);
-    push(&mut step, &[Push::Str("HideMovie")]);
-    step.extend_from_slice(&[CALL_METHOD, POP]);
+    step.extend_from_slice(&[CALL_METHOD, DEFINE_LOCAL]);
+    let mut hide = Vec::new();
+    get_path(&mut hide, &["m"]);
+    push(&mut hide, &[Push::Str(PENDING), Push::Int(0)]);
+    hide.push(SET_MEMBER);
+    get_path(&mut hide, &["m"]);
+    push(&mut hide, &[Push::Int(1)]);
+    get_path(&mut hide, &["_global", "MovieUtils"]);
+    push(&mut hide, &[Push::Str("HideMovie")]);
+    hide.extend_from_slice(&[CALL_METHOD, POP]);
+    get_path(&mut step, &["m", PENDING]);
+    step.push(NOT);
+    branch(&mut step, IF, hide.len(), false);
+    step.extend(hide);
     // Each branch record is 5 bytes.
     let back = test.len() + 5 + step.len() + 5;
     body.extend_from_slice(&test);
@@ -457,6 +510,16 @@ pub fn register_invoke() -> Vec<u8> {
     out.extend(prewrap_maker());
     out.push(SET_MEMBER);
     let mut install = Vec::new();
+    for f in DA_RETURNING_FSCOMMANDS {
+        // _global.DAExternalCommands[f] = _global.thedas_wrap(_global.DAExternalCommands[f])
+        get_path(&mut install, &["_global", "DAExternalCommands"]);
+        push(&mut install, &[Push::Str(f)]);
+        get_path(&mut install, &["_global", "DAExternalCommands", f]);
+        push(&mut install, &[Push::Int(1)]);
+        get_path(&mut install, &["_global"]);
+        push(&mut install, &[Push::Str("thedas_wrap")]);
+        install.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
+    }
     for p in PRE_CALLS {
         get_path(&mut install, p.object);
         push(
@@ -504,6 +567,18 @@ pub fn register_invoke() -> Vec<u8> {
     get_path(&mut out, &["_global"]);
     push(&mut out, &[Push::Str("thedas_hide_wrap")]);
     out.extend(hide_wrap_maker());
+    out.push(SET_MEMBER);
+    // _global.MovieUtils.ShowMovie = thedas_show_wrap(_global.MovieUtils.ShowMovie).
+    get_path(&mut install, &["_global", "MovieUtils"]);
+    push(&mut install, &[Push::Str("ShowMovie")]);
+    get_path(&mut install, &["_global", "MovieUtils", "ShowMovie"]);
+    push(&mut install, &[Push::Int(1)]);
+    get_path(&mut install, &["_global"]);
+    push(&mut install, &[Push::Str("thedas_show_wrap")]);
+    install.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
+    get_path(&mut out, &["_global"]);
+    push(&mut out, &[Push::Str("thedas_show_wrap")]);
+    out.extend(show_wrap_maker());
     out.push(SET_MEMBER);
     get_path(&mut out, &["_global"]);
     push(&mut out, &[Push::Str("thedas_flush")]);
