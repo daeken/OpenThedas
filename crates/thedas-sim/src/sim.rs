@@ -615,6 +615,7 @@ impl Sim {
         self.world.time_ms = until;
         self.advance_movers();
         self.regenerate(elapsed);
+        self.update_threat(elapsed);
         self.expire_effects();
         self.world.destroy_due();
         self.settle_quickbars();

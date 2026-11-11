@@ -2683,15 +2683,8 @@ pub fn call(
             void()
         }
         "UpdateThreatTable" => {
-            let (enemy, delta) = (obj(a, 1), float(a, 2));
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                match o.combat.threat.iter_mut().find(|t| t.0 == enemy) {
-                    Some(t) => t.1 += delta,
-                    None => o.combat.threat.push((enemy, delta)),
-                }
-                o.combat
-                    .threat
-                    .sort_by(|x, y| y.1.total_cmp(&x.1).then(x.0.cmp(&y.0)));
+                crate::threat::update(&mut o.combat.threat, obj(a, 1), float(a, 2));
             }
             void()
         }
@@ -2805,7 +2798,7 @@ pub fn call(
         "ClearEnemyThreat" => {
             let enemy = obj(a, 1);
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.combat.threat.retain(|t| t.0 != enemy);
+                o.combat.threat.retain(|t| t.enemy != enemy);
             }
             void()
         }
@@ -2816,19 +2809,19 @@ pub fn call(
         "GetThreatEnemy" => ok(Value::Object(
             h.object(obj(a, 0))
                 .and_then(|o| o.combat.threat.get(int(a, 1).max(0) as usize))
-                .map_or(OBJECT_INVALID, |t| t.0),
+                .map_or(OBJECT_INVALID, |t| t.enemy),
         )),
         "GetThreatValueByIndex" => ok(Value::Float(
             h.object(obj(a, 0))
                 .and_then(|o| o.combat.threat.get(int(a, 1).max(0) as usize))
-                .map_or(0.0, |t| t.1),
+                .map_or(0.0, |t| t.total()),
         )),
         "GetThreatValueByObjectID" => {
             let enemy = obj(a, 1);
             ok(Value::Float(
                 h.object(obj(a, 0))
-                    .and_then(|o| o.combat.threat.iter().find(|t| t.0 == enemy))
-                    .map_or(0.0, |t| t.1),
+                    .and_then(|o| o.combat.threat.iter().find(|t| t.enemy == enemy))
+                    .map_or(0.0, |t| t.total()),
             ))
         }
         "SetAttackResult" => {
