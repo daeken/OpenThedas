@@ -78,6 +78,26 @@ pub struct Presentation {
     pub minimap: Option<crate::minimap::MinimapInfo>,
     /// Party members' portraits: the image the stage serves for each (by creature id).
     pub portraits: BTreeMap<u32, String>,
+    /// The player's saved games, newest first (the save, load and death screens list them).
+    pub saves: Vec<SaveListing>,
+    /// The save and load screen's mode: 1 saving, 2 loading (saveload.gfx's `SAVE_MODE`,
+    /// `LOAD_MODE`).
+    pub save_mode: i32,
+    /// The slot a new save would take.
+    pub open_slot: i32,
+}
+
+/// A saved game as the save and load screens list it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SaveListing {
+    pub slot: i32,
+    pub name: String,
+    /// Where the party was.
+    pub area: String,
+    /// How long the game had been played, seconds.
+    pub time_played_s: u64,
+    /// When it was written, as text.
+    pub last_played: String,
 }
 
 /// The inventory screen's item category tabs (inventory.gfx's `CATEGORY_*`).
@@ -416,6 +436,16 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     inventory(sim, controlled.or(hero), shown.item_filter, &mut v);
     store(sim, &mut v);
     party_picker(sim, shown, &mut v);
+    saves(sim, shown, &mut v);
+    // No tutorials are queued: popuplayer.gfx hides its tutorial panel when it sees the empty
+    // list (`Tutorials.TutorialList`, observed). Provisional: the game's tutorial queue is
+    // not modelled.
+    v.insert(
+        "Tutorials.TutorialList".into(),
+        UiValue::String(String::new()),
+    );
+    v.insert("Tutorials.Enabled".into(), num(0));
+    v.insert("Tutorials.TrainingStep".into(), num(0));
     if let Some(who) = controlled.or(hero) {
         tactics(sim, who, &mut v);
     }
@@ -612,6 +642,91 @@ fn store(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
             }
         }
     }
+}
+
+/// The saved games, as saveload.gfx and deathscreen.gfx read them: the screen's mode, the
+/// slot a new save takes, the one hero whose saves they are (`SaveLoad.HeroList.0`,
+/// `SaveLoad.CurrentHero`) and each save (`SaveLoad.SaveFileList.N`: name, slot, area,
+/// kind, time played, when). The death screen offers loading only when there is a save
+/// (it counts the list). Provisional: no screenshots, every save of kind 0; a party is never
+/// captured on death (`Party.CapturedOnDeath` 0) and the death screen has no hint.
+fn saves(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
+    v.insert("SaveLoad.Mode".into(), num(shown.save_mode));
+    v.insert("SaveLoad.OpenSlot".into(), num(shown.open_slot));
+    v.insert("SaveLoad.CurrentHero".into(), num(0));
+    if let Some(h) = sim.world.hero {
+        let k = "SaveLoad.HeroList.0";
+        v.insert(k.into(), num(h));
+        v.insert(format!("{k}.Name"), UiValue::String(name(sim, h)));
+        let last = shown.saves.first();
+        v.insert(
+            format!("{k}.TimePlayed"),
+            UiValue::String(played(
+                last.map_or(sim.world.time_ms / 1000, |s| s.time_played_s),
+            )),
+        );
+        v.insert(
+            format!("{k}.LastPlayed"),
+            UiValue::String(last.map(|s| s.last_played.clone()).unwrap_or_default()),
+        );
+        v.insert(
+            format!("{k}.LastLocation"),
+            UiValue::String(last.map(|s| s.area.clone()).unwrap_or_default()),
+        );
+        v.insert(format!("{k}.Screenshot"), UiValue::String(String::new()));
+    }
+    // Saving lists a new save first (slot -1: the movie names it after the area and saves it
+    // to the open slot), then the saves it may overwrite.
+    let new_save = SaveListing {
+        slot: -1,
+        area: sim.world.area.map(|a| name(sim, a)).unwrap_or_default(),
+        time_played_s: sim.world.time_ms / 1000,
+        ..Default::default()
+    };
+    let rows: Vec<&SaveListing> = (shown.save_mode == 1)
+        .then_some(&new_save)
+        .into_iter()
+        .chain(&shown.saves)
+        .collect();
+    // The list tokens the movies observe (the rows are rebuilt when they change).
+    v.insert(
+        "SaveLoad.SaveFileList".into(),
+        UiValue::String(
+            rows.iter()
+                .map(|s| s.slot.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    );
+    if let Some(h) = sim.world.hero {
+        v.insert("SaveLoad.HeroList".into(), UiValue::String(h.to_string()));
+    }
+    for (i, s) in rows.into_iter().enumerate() {
+        let k = format!("SaveLoad.SaveFileList.{i}");
+        v.insert(k.clone(), num(s.slot));
+        v.insert(format!("{k}.Name"), UiValue::String(s.name.clone()));
+        v.insert(format!("{k}.Slot"), num(s.slot));
+        v.insert(format!("{k}.Area"), UiValue::String(s.area.clone()));
+        v.insert(format!("{k}.SaveType"), num(0));
+        v.insert(
+            format!("{k}.TimePlayed"),
+            UiValue::String(played(s.time_played_s)),
+        );
+        v.insert(
+            format!("{k}.LastPlayed"),
+            UiValue::String(s.last_played.clone()),
+        );
+        v.insert(format!("{k}.Story"), UiValue::String(String::new()));
+        v.insert(format!("{k}.Screenshot"), UiValue::String(String::new()));
+        v.insert(format!("{k}.ClassID"), num(0));
+    }
+    v.insert("Party.CapturedOnDeath".into(), num(0));
+    v.insert("GUIDeath.DeathHint".into(), UiValue::String(String::new()));
+}
+
+/// Time played as the screens show it, hours and minutes.
+fn played(secs: u64) -> String {
+    format!("{}:{:02}", secs / 3600, secs % 3600 / 60)
 }
 
 /// The open party picker, as partypicker.gfx reads it: the scripts' picker status
@@ -1120,5 +1235,49 @@ mod tests {
         assert_eq!(v["PartyPicker.SelectedPartyMember.1.ID"], num(dog));
         assert_eq!(v["PartyPicker.SelectedPartyMember.2"], num(0));
         assert_eq!(v["Party.PartyPickerGUIStatus"], num(0));
+    }
+
+    #[test]
+    fn the_saves_are_listed_for_the_save_load_and_death_screens() {
+        use thedas_sim::world::ObjectKind;
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        sim.world.hero = Some(hero);
+        let shown = Presentation {
+            saves: vec![SaveListing {
+                slot: 3,
+                name: "Before the tower".into(),
+                area: "Ostagar".into(),
+                time_played_s: 3725,
+                last_played: "2026-11-11 10:00".into(),
+            }],
+            save_mode: 2,
+            open_slot: 4,
+            ..Default::default()
+        };
+        let v = sim_values_for(&sim, &shown);
+        assert_eq!(v["SaveLoad.Mode"], num(2));
+        assert_eq!(v["SaveLoad.OpenSlot"], num(4));
+        assert_eq!(v["SaveLoad.SaveFileList.0.Slot"], num(3));
+        assert_eq!(
+            v["SaveLoad.SaveFileList.0.TimePlayed"],
+            UiValue::String("1:02".into())
+        );
+        assert_eq!(v["SaveLoad.HeroList.0"], num(hero));
+        assert_eq!(v["Party.CapturedOnDeath"], num(0));
+        assert_eq!(v["SaveLoad.SaveFileList"], UiValue::String("3".into()));
+        assert!(!sim_values(&sim).contains_key("SaveLoad.SaveFileList.0"));
+        // Saving lists a new save first.
+        let saving = Presentation {
+            save_mode: 1,
+            ..shown
+        };
+        let v = sim_values_for(&sim, &saving);
+        assert_eq!(v["SaveLoad.SaveFileList.0.Slot"], num(-1));
+        assert_eq!(v["SaveLoad.SaveFileList.1.Slot"], num(3));
     }
 }

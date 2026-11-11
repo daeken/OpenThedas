@@ -133,6 +133,8 @@ pub struct UiLayer {
     /// Frames since the minimap's creatures were last sent.
     minimap_frame: u32,
     portraits: PortraitClock,
+    /// Where the player's games are saved (none: the save and load screens list nothing).
+    saves: Option<crate::saves::SaveStore>,
 }
 
 /// When portraits are drawn: the party they were drawn for, milliseconds since, and how many
@@ -234,7 +236,175 @@ impl UiLayer {
             level: None,
             minimap_frame: 0,
             portraits: PortraitClock::default(),
+            saves: None,
         }
+    }
+
+    /// Where the player's games are saved and loaded from.
+    pub fn set_saves(&mut self, store: crate::saves::SaveStore) {
+        self.saves = Some(store);
+        self.refresh_saves();
+    }
+
+    /// Lists the saves again for the screens.
+    fn refresh_saves(&self) {
+        let (list, open) = match &self.saves {
+            Some(s) => (s.list(), s.open_slot()),
+            None => (Vec::new(), 1),
+        };
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.saves = list;
+            shown.open_slot = open;
+        }
+    }
+
+    /// Opens the save and load screen in `mode` (1 save, 2 load), as F5 and F9 do.
+    pub fn open_saves(&mut self, screens: &mut Screens, mode: i32) {
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.save_mode = mode;
+        }
+        self.refresh_saves();
+        screens.menu = Some(Screen::SaveLoad);
+    }
+
+    /// The popup layer's messages: a movie's `GUI.ShowDialogBox` (after it set the dialog's
+    /// text, buttons and callbacks in `GUIPopupLayer.*`) shows it with popuplayer.gfx's
+    /// `PopupLayer.ShowDialogBoxFromGame` (the executable invokes it at 0x60bba4), and the
+    /// dialog's buttons send `GUI.InvokeCallback <file> <function>`, which calls the function
+    /// in that movie. Provisional: only screens that list the popup layer show dialogs.
+    /// Returns whether the message was one of these.
+    fn popup_message(&mut self, name: &str, args: &[String]) -> bool {
+        match name {
+            "GUI.ShowDialogBox" => {
+                let shown = self.stage.call_in(
+                    thedas_ui::stage::POPUP_LAYER,
+                    "_global.PopupLayer.ShowDialogBoxFromGame",
+                    &[],
+                );
+                if shown.is_none() {
+                    log::warn!("ui: a dialog box was asked for with no popup layer up");
+                }
+            }
+            "GUI.InvokeCallback" => {
+                let (Some(movie), Some(function)) = (args.first(), args.get(1)) else {
+                    return true;
+                };
+                if self.stage.call_in(movie, function, &[]).is_none() {
+                    log::warn!("ui: no movie {movie} to call back ({function})");
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// The save, load and death screens' messages, which the app acts on (the saves are
+    /// files): saveload.gfx's `SaveLoad.SaveGame` (slot, and the name typed),
+    /// `LoadGame`/`DeleteSaveGame` (slot, kind), deathscreen.gfx's `ResumeGame` (the newest
+    /// save) and `SetSaveLoadMode` + `GameModeController.PushGUIScreen SaveLoad` (its Load
+    /// Game button), and `GameModeController.HideGUIScreen`. Loading replaces the
+    /// simulation's state with the save's (`Sim::load_json`); saving writes `Sim::save_json`.
+    /// Returns whether the message was one of these.
+    fn save_message(
+        &mut self,
+        screens: &mut Screens,
+        sim: &Arc<Mutex<Sim>>,
+        name: &str,
+        args: &[String],
+    ) -> bool {
+        let int = |i: usize| {
+            args.get(i)
+                .and_then(|a| a.trim().parse::<f64>().ok())
+                .map(|v| v as i32)
+        };
+        match name {
+            "SaveLoad.SetSaveLoadMode" => {
+                if let (Ok(mut shown), Some(m)) = (self.shown.lock(), int(0)) {
+                    shown.save_mode = m;
+                }
+            }
+            "GameModeController.PushGUIScreen"
+                if args.first().map(String::as_str) == Some("SaveLoad") =>
+            {
+                self.refresh_saves();
+                screens.menu = Some(Screen::SaveLoad);
+            }
+            "GameModeController.HideGUIScreen" => {
+                if screens.menu == Some(Screen::SaveLoad) {
+                    screens.menu = None;
+                }
+            }
+            "SaveLoad.LoadGame" | "SaveLoad.ResumeGame" => {
+                let slot = match name {
+                    "SaveLoad.LoadGame" => int(0),
+                    _ => self.saves.as_ref().and_then(|s| s.latest()),
+                };
+                let bytes = slot.and_then(|slot| self.saves.as_ref().map(|s| s.read(slot)));
+                match bytes {
+                    Some(Ok(b)) => {
+                        let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+                        match sim.load_json(&b) {
+                            Ok(()) => log::info!("ui: loaded save {slot:?}"),
+                            Err(e) => log::warn!("ui: save {slot:?} did not load: {e}"),
+                        }
+                    }
+                    Some(Err(e)) => log::warn!("ui: save {slot:?}: {e}"),
+                    None => log::warn!("ui: no save to load"),
+                }
+                screens.menu = None;
+            }
+            "SaveLoad.SaveGame" => {
+                let (Some(store), Some(slot)) = (self.saves.as_ref(), int(0)) else {
+                    return true;
+                };
+                // The list's new save (slot -1) goes in the open slot.
+                let slot = if slot > 0 { slot } else { store.open_slot() };
+                let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+                let area = sim
+                    .world
+                    .area
+                    .map(|a| sim.display_name(a))
+                    .unwrap_or_default();
+                let typed = args
+                    .get(1)
+                    .map(|n| n.trim().to_string())
+                    .unwrap_or_default();
+                let meta = crate::saves::SaveMeta {
+                    name: if typed.is_empty() {
+                        area.clone()
+                    } else {
+                        typed
+                    },
+                    area,
+                    time_ms: sim.world.time_ms,
+                    written: crate::saves::now_secs(),
+                };
+                match sim.save_json() {
+                    Ok(b) => match store.write(slot, &b, &meta) {
+                        Ok(()) => log::info!("ui: saved to slot {slot}"),
+                        Err(e) => log::warn!("ui: saving to slot {slot}: {e}"),
+                    },
+                    Err(e) => log::warn!("ui: the game could not be saved: {e}"),
+                }
+                drop(sim);
+                self.refresh_saves();
+                screens.menu = None;
+            }
+            "SaveLoad.DeleteSaveGame" => {
+                if let (Some(store), Some(slot)) = (self.saves.as_ref(), int(0)) {
+                    if let Err(e) = store.delete(slot) {
+                        log::warn!("ui: deleting save {slot}: {e}");
+                    }
+                }
+                self.refresh_saves();
+            }
+            // Provisional: there is no start menu to go back to yet.
+            "GameModeController.ShutDownToStartMenuMessage" => {
+                log::warn!("ui: quitting to the start menu is not available yet");
+            }
+            _ => return false,
+        }
+        true
     }
 
     /// Plays the game's screens over a running game: the movies act on `sim` as they send
@@ -310,6 +480,17 @@ impl UiLayer {
         }
         self.show_cutscene_line(sim);
         let messages = self.stage.tick(dt_ms);
+        // A dialog focuses its text field (a save's name) once it is up. Nothing types into
+        // the movies yet, and with the field focused the first press on a dialog button only
+        // moves the focus (the button's press is cancelled), so the field gives its focus up
+        // and its default text stands. Provisional: until keyboard input reaches the movies.
+        if self.stage.dialog_up() {
+            self.stage.call_in(
+                thedas_ui::stage::POPUP_LAYER,
+                "_global.Selection.setFocus",
+                &[thedas_ui::UiValue::Null],
+            );
+        }
         let ignored = {
             let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             thedas_ui::input::apply_all(&mut sim, &messages)
@@ -327,6 +508,10 @@ impl UiLayer {
                 log::info!("ui: {name} {args:?}");
             }
         }
+        let ignored: Vec<(String, Vec<String>)> = ignored
+            .into_iter()
+            .filter(|(n, a)| !self.popup_message(n, a) && !self.save_message(screens, sim, n, a))
+            .collect();
         let mut aims = Vec::new();
         {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());

@@ -31,6 +31,7 @@ mod control;
 mod follow;
 mod live;
 mod reticle;
+mod saves;
 mod screens;
 mod talkcam;
 mod ui;
@@ -121,7 +122,8 @@ struct Args {
     /// `reply N` (the conversation's reply N, from 0), `press X,Y` and `release X,Y` (the
     /// left button down and up, for drags), `rebuild` (the objects are rebuilt as a
     /// spawn rebuilds them, timed), `picker` (the party picker opens as a script would open
-    /// it), `rclick X,Y` and `dclick X,Y` (a right or double click
+    /// it), `wipe` (the whole party falls), `key f5` and `key f9` (the save and load
+    /// screens), `rclick X,Y` and `dclick X,Y` (a right or double click
     /// for the interface), `hover X,Y` (the mouse rests there, for the aiming reticle).
     #[arg(long, default_value = "")]
     steps: String,
@@ -144,6 +146,10 @@ struct Args {
     /// on from there through `run` steps. The clouds drift with it.
     #[arg(long, default_value_t = 0.0)]
     time: f64,
+    /// Where the player's games are saved and loaded (F5 the save screen, F9 the load
+    /// screen, the death screen's load). Defaults to `$HOME/.openthedas/saves`.
+    #[arg(long)]
+    saves: Option<PathBuf>,
 }
 
 /// Behind and above a hero at `pos` with the game's `facing`, looking the same way (as the
@@ -426,6 +432,8 @@ struct App {
     /// The game's screens over a running game (playing without `--ui`).
     screens: Option<screens::Screens>,
     ui: Vec<String>,
+    /// Where the player's games are saved.
+    saves_dir: PathBuf,
     cursor: (f64, f64),
     camera: Camera,
     size: (u32, u32),
@@ -665,6 +673,7 @@ impl App {
         );
         if let (Some(live), Some(_)) = (&self.live, &self.screens) {
             ui.attach(&live.sim);
+            ui.set_saves(saves::SaveStore::new(self.saves_dir.clone()));
         }
         let reticle = reticle::ReticlePass::new(&ctx.device, config.format);
         self.gfx = Some(Gfx {
@@ -882,6 +891,13 @@ impl App {
         match code {
             KeyCode::Escape => return true,
             KeyCode::KeyP => println!("camera {}", self.camera.spec()),
+            // F5 the save screen, F9 the load screen. Provisional: the game's own bindings
+            // (quick save and quick load) are not traced.
+            KeyCode::F5 | KeyCode::F9 if self.screens.is_some() => {
+                if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_mut()) {
+                    g.ui.open_saves(s, if code == KeyCode::F5 { 1 } else { 2 });
+                }
+            }
             KeyCode::F1 | KeyCode::F2 | KeyCode::F3 | KeyCode::F4 if self.live.is_some() => {
                 let n = match code {
                     KeyCode::F1 => 0,
@@ -1051,6 +1067,16 @@ impl App {
                     l.sim().party_picker();
                 }
                 log.push("party picker".into());
+            }
+            &Step::Saves(mode) => {
+                self.key_down(if mode == 1 { KeyCode::F5 } else { KeyCode::F9 });
+                log.push(format!("saves {mode}"));
+            }
+            Step::Wipe => {
+                if let Some(l) = self.live.as_ref() {
+                    wipe(&mut l.sim());
+                }
+                log.push("the party falls".into());
             }
             &Step::Menu(m) => {
                 self.key_down(match m {
@@ -1459,6 +1485,11 @@ enum Step {
     /// The party picker opens as a script's `ShowPartyPickerGUI` opens it (for trying the
     /// picker headless).
     Picker,
+    /// F5 or F9: the save screen (1) or the load screen (2) opens.
+    Saves(i32),
+    /// The whole party falls, as the game sees it after a wipe (for trying the death screen
+    /// headless).
+    Wipe,
     /// The leader is ordered to talk to the first creature with this tag (as a click on it
     /// does, for creatures hard to reach on screen).
     Talk(String),
@@ -1496,6 +1527,14 @@ fn menu_key(code: KeyCode) -> Option<screens::Screen> {
         KeyCode::KeyM => Some(screens::Screen::AreaMap),
         _ => None,
     }
+}
+
+/// Every party member falls (the `wipe` step): what a lost fight leaves, for the death screen.
+fn wipe(sim: &mut thedas_sim::Sim) {
+    for m in thedas_sim::engine::party_of(sim) {
+        sim.kill(m, thedas_script::vm::OBJECT_INVALID);
+    }
+    sim.tick(0);
 }
 
 fn parse_steps(spec: &str) -> Result<Vec<Step>> {
@@ -1546,6 +1585,9 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
                 "talk" if !arg.is_empty() => Step::Talk(arg.to_string()),
                 "rebuild" => Step::Rebuild,
                 "picker" => Step::Picker,
+                "wipe" => Step::Wipe,
+                "key" if arg.eq_ignore_ascii_case("f5") => Step::Saves(1),
+                "key" if arg.eq_ignore_ascii_case("f9") => Step::Saves(2),
                 "hover" => {
                     let (x, y) = arg.split_once(',').context("hover takes x,y")?;
                     Step::Hover(x.trim().parse()?, y.trim().parse()?)
@@ -1576,6 +1618,10 @@ fn main() -> Result<()> {
         .or_else(|| std::env::var_os("THEDAS_INSTALL").map(PathBuf::from))
         .context("give --install or set THEDAS_INSTALL")?;
     let size = parse_size(&args.size)?;
+    let saves_dir = args
+        .saves
+        .clone()
+        .unwrap_or_else(saves::SaveStore::default_dir);
     let start = if let Some(save) = &args.save {
         Some(live::Start::Save(save))
     } else if args.new_game {
@@ -1645,6 +1691,7 @@ fn main() -> Result<()> {
             if ui.is_empty() {
                 let mut layer = ui::UiLayer::new(&ctx, &loaded.vfs, &[], size);
                 layer.attach(&l.sim);
+                layer.set_saves(saves::SaveStore::new(saves_dir.clone()));
                 let mut s = screens::Screens::default();
                 l.aiming = layer.play(&mut s, &l.sim, 0.0).pop();
                 played = Some((layer, s));
@@ -1799,6 +1846,16 @@ fn main() -> Result<()> {
                         l.sim().party_picker();
                         println!("party picker");
                     }
+                    &Step::Saves(mode) => {
+                        if let Some((layer, s)) = played.as_mut() {
+                            layer.open_saves(s, mode);
+                        }
+                        println!("{} screen", if mode == 1 { "save" } else { "load" });
+                    }
+                    Step::Wipe => {
+                        wipe(&mut l.sim());
+                        println!("the party falls");
+                    }
                     &Step::Menu(m) => {
                         if let Some((layer, s)) = played.as_mut() {
                             s.toggle(m);
@@ -1893,6 +1950,7 @@ fn main() -> Result<()> {
         follow,
         screens,
         ui,
+        saves_dir: saves_dir.clone(),
         cursor: (0.0, 0.0),
         camera,
         size,

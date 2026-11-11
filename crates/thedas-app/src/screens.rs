@@ -30,6 +30,8 @@ pub enum Screen {
     Tactics,
     AreaMap,
     PartyPicker,
+    Death,
+    SaveLoad,
 }
 
 impl Screen {
@@ -47,6 +49,9 @@ impl Screen {
             Screen::Tactics => &["tactics.gfx"],
             Screen::AreaMap => &["map.gfx"],
             Screen::PartyPicker => &["partypicker.gfx"],
+            Screen::Death => &["deathscreen.gfx"],
+            // Its save names and confirmations are dialog boxes on the popup layer.
+            Screen::SaveLoad => &["saveload.gfx", "popuplayer.gfx"],
         }
     }
 
@@ -63,7 +68,14 @@ impl Screen {
 /// waits for it to end), then the screens scripts open, then the player's, else the HUD.
 pub fn wanted(sim: &Sim, menu: Option<Screen>) -> BTreeSet<Screen> {
     let w = &sim.world;
-    let screen = if w.cutscene.is_some() {
+    // The whole party fell: the death screen, or the load screen it opens.
+    let screen = if w.game_over {
+        if menu == Some(Screen::SaveLoad) {
+            Screen::SaveLoad
+        } else {
+            Screen::Death
+        }
+    } else if w.cutscene.is_some() {
         Screen::Cutscene
     } else if thedas_ui::binding::conversation(sim).is_some() {
         Screen::Conversation
@@ -287,5 +299,27 @@ mod tests {
         );
         // The simulation holds the world itself while its cutscene's clock runs.
         assert!(!Screen::Cutscene.stops_the_world());
+    }
+
+    #[test]
+    fn game_over_shows_the_death_screen_and_the_load_screen_it_opens() {
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        assert_eq!(
+            wanted(&sim, Some(Screen::SaveLoad)),
+            set(&[Screen::SaveLoad])
+        );
+        sim.world.game_over = true;
+        sim.world.store = Some(1);
+        assert_eq!(wanted(&sim, None), set(&[Screen::Death]));
+        assert_eq!(wanted(&sim, Some(Screen::Inventory)), set(&[Screen::Death]));
+        assert_eq!(
+            wanted(&sim, Some(Screen::SaveLoad)),
+            set(&[Screen::SaveLoad])
+        );
+        assert!(Screen::Death.stops_the_world());
     }
 }
