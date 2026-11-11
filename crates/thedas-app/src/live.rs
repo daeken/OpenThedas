@@ -276,9 +276,17 @@ impl Live {
         let Some(level) = self.level.as_mut() else {
             return false;
         };
+        // Every renderer's shadow casters go into the partitions before anything is drawn.
         level
             .renderer
-            .render(ctx, encoder, target, width, height, camera);
+            .encode_shadows(ctx, encoder, camera, width, height, true);
+        if let Some(o) = self.objects.as_mut() {
+            o.renderer
+                .encode_shadows(ctx, encoder, camera, width, height, false);
+        }
+        level
+            .renderer
+            .render_main(ctx, encoder, target, width, height, camera);
         if let Some(o) = self.objects.as_mut() {
             let depth = level.renderer.depth(&ctx.device, width, height);
             o.renderer

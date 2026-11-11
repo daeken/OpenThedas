@@ -371,8 +371,8 @@ impl Default for StandInLight {
 #[derive(Clone)]
 pub(crate) struct GpuMesh {
     vertices: wgpu::Buffer,
-    indices: wgpu::Buffer,
-    count: u32,
+    pub(crate) indices: wgpu::Buffer,
+    pub(crate) count: u32,
 }
 
 /// GPU resources kept between renderers built over the same resources (an area's objects,
@@ -385,6 +385,8 @@ pub struct RenderCache {
     pub(crate) d3d: crate::d3d_gpu::D3dCache,
     /// Translated programs by `vs+ps+state` key (`None`: did not translate).
     pub(crate) programs: HashMap<String, Option<std::sync::Arc<crate::d3d::D3dProgram>>>,
+    /// The shadow partitions every renderer made with this cache draws into and reads.
+    pub(crate) shadows: Option<std::sync::Arc<crate::d3d_gpu::ShadowTargets>>,
 }
 
 #[derive(Clone, Copy)]
@@ -440,6 +442,8 @@ pub struct AreaRenderer {
     /// The shaders' `ApplicationTime` in seconds: the graphics clock DAOrigins.exe advances
     /// by every frame's time (0x52ae80), which drifts the clouds.
     time: f64,
+    /// Whether [`AreaRenderer::encode_shadows`] already filled this frame's constants.
+    updated: bool,
 }
 
 /// The colour curve `da_hsvmatrix` reads by default: `da_defaultcc` (DAOrigins.exe loads it
@@ -509,6 +513,29 @@ impl AreaRenderer {
             })
             .collect();
         stats.meshes = meshes.len();
+
+        // Shadow casters' programs (their materials' `PSSM` semantics) and the shadow
+        // partitions the level's renderers share (see `crate::shadow`); only under a sun.
+        let caster_programs: Vec<Option<crate::d3d::CasterMaterial>> = if scene.sun.is_some() {
+            scene
+                .materials
+                .iter()
+                .map(|m| crate::d3d::pssm_program(vfs, m, scene.detail.name(), render_cache))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let shadows = scene.sun.is_some().then(|| {
+            render_cache
+                .shadows
+                .get_or_insert_with(|| {
+                    std::sync::Arc::new(crate::d3d_gpu::ShadowTargets::new(
+                        device,
+                        crate::shadow::PARTITION_SIZE,
+                    ))
+                })
+                .clone()
+        });
 
         // Textures.
         let RenderCache {
@@ -738,6 +765,8 @@ impl AreaRenderer {
             vfs,
             scene,
             &d3d_programs,
+            &caster_programs,
+            shadows,
             cache,
             d3d_cache,
             color_format,
@@ -813,6 +842,7 @@ impl AreaRenderer {
                 .flatten(),
             frame_effects: true,
             time: 0.0,
+            updated: false,
             light: StandInLight::default(),
             stats,
         }
@@ -990,7 +1020,41 @@ impl AreaRenderer {
         height: u32,
         camera: &Camera,
     ) {
+        self.encode_shadows(ctx, encoder, camera, width, height, true);
         self.render_pass(ctx, encoder, target, width, height, camera, None);
+    }
+
+    /// [`AreaRenderer::render`] after [`AreaRenderer::encode_shadows`] recorded this frame's
+    /// shadows (with every other renderer's casters).
+    pub fn render_main(
+        &mut self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        camera: &Camera,
+    ) {
+        self.render_pass(ctx, encoder, target, width, height, camera, None);
+    }
+
+    /// Fills this frame's constants (placing the shadow partitions, for a renderer of the
+    /// level's own meshes) and records this renderer's shadow casters into the partitions:
+    /// `clear` for the first renderer of a frame (the level's), not for the objects drawn
+    /// over it. Call it for every renderer of a frame before any of them draws.
+    pub fn encode_shadows(
+        &mut self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        camera: &Camera,
+        width: u32,
+        height: u32,
+        clear: bool,
+    ) {
+        self.d3d
+            .update(ctx, camera, width, height, self.time as f32);
+        self.updated = true;
+        self.d3d.encode_shadows(encoder, &self.meshes, clear);
     }
 
     /// Records this renderer's draws over what an earlier pass drew into `target`, testing
@@ -1035,8 +1099,10 @@ impl AreaRenderer {
         };
         ctx.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
-        self.d3d
-            .update(ctx, camera, width, height, self.time as f32);
+        if !std::mem::take(&mut self.updated) {
+            self.d3d
+                .update(ctx, camera, width, height, self.time as f32);
+        }
         let depth = match over {
             Some(d) => d.clone(),
             None => self.depth_view(&ctx.device, width, height).clone(),
@@ -1164,7 +1230,11 @@ impl AreaRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("capture"),
             });
-        self.render(ctx, &mut encoder, &view, width, height, camera);
+        self.encode_shadows(ctx, &mut encoder, camera, width, height, true);
+        for o in overlays.iter_mut() {
+            o.encode_shadows(ctx, &mut encoder, camera, width, height, false);
+        }
+        self.render_pass(ctx, &mut encoder, &view, width, height, camera, None);
         if !overlays.is_empty() {
             let depth = self.depth(&ctx.device, width, height);
             for o in overlays.iter_mut() {
@@ -1353,6 +1423,7 @@ mod tests {
                 room: "room".into(),
                 probe: None,
                 skin: None,
+                cast_shadow: None,
             }],
             ..Default::default()
         };

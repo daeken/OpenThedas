@@ -110,6 +110,9 @@ pub struct DrawItem {
     pub probe: Option<usize>,
     /// For a skinned mesh: how its vertices follow its model's skeleton.
     pub skin: Option<DrawSkin>,
+    /// Whether its model says the mesh casts run-time shadows (6176), when it says (see
+    /// [`crate::shadow`]).
+    pub cast_shadow: Option<bool>,
 }
 
 /// A skinned draw's bones.
@@ -896,6 +899,7 @@ impl<'a> Loader<'a> {
                 room: room.to_string(),
                 probe,
                 skin,
+                cast_shadow: piece.mesh.cast_runtime_shadow,
             });
         }
     }
