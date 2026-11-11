@@ -19,7 +19,7 @@
 //! (0x46b260, reached through the usage dispatch 0x4f8a10 and 0x46baf0) writes: point
 //! lights A, B, C at positions (radius in `w`) `c0`, `c5`, `c7` and colours `c1`, `c6`, `c8`
 //! (slot tables at 0xae7fb0 and 0xae7fbc), light D at `c9`/`c11` (0xae7fc8, 0xae7fd4),
-//! unused slots zero; `c2`/`c3` the directional light; and the ambient term
+//! unused slots zero; `c2`/`c3` the directional light (below); and the ambient term
 //! `c4 = (base + Σ ambient lights, 1)`: the colours of the ambient light nodes the light
 //! manager picked for the object (0x4644f8 → 0x463e40 over its ambient list, ranked by
 //! `(|r| + |g| + |b|) / 3`, 0x53d040), plus the base the render parameters carry at `+0xc0`
@@ -30,6 +30,15 @@
 //! `g_bShaderControlBooleans` `b0`-`b2` say lights D, B and C are present and `b3` that the
 //! directional light is (0x46be70).
 //!
+//! The directional light: every frame the light manager (0x45be65 → 0x4654e0 → 0x464310)
+//! gives each node `c2 = (direction, 1)` and `c3 = (colour · v, w)` (0x462470, 0x46bb80),
+//! from the layout's sun (0x4625d0: 3150's direction, 3152's colour for the level and
+//! 3149's for characters, the nodes flagged 0x4000) in layouts that set 3122, a black light
+//! otherwise; `v` is a per-node visibility that eases (at a rate times the frame time,
+//! 0x46a520) towards 1, or 0.1 when the sun is occluded from a character in a layout whose
+//! 3148 allows it. `b3` is `c3.w` non-zero (0x46bf5d). No multiplier: 3153 and the ATMO sun
+//! intensity are not involved.
+//!
 //! Provisional, inferred by reading Static1's bytecode rather than verified against the
 //! original executable:
 //!
@@ -37,9 +46,9 @@
 //!   matrices (the shader computes `x*c[n] + y*c[n+1] + z*c[n+2] + c[n+3]`); `MatrixColumns`
 //!   one register per row.
 //! - Which ambient lights reach a draw: those of its room (the engine's pick also filters
-//!   by the object's light visibility list, not traced); the directional light's registers
-//!   (not traced to their writer). Light A is always evaluated; lights A-C and the
-//!   directional light are multiplied by the lightmap alpha; D is not.
+//!   by the object's light visibility list, not traced). The sun's visibility is taken as 1
+//!   (the occlusion test that lowers it is not traced). Light A is always evaluated; lights
+//!   A-C and the directional light are multiplied by the lightmap alpha; D is not.
 //! - Fog and the sky's scattering come from the level's atmosphere ([`crate::atmosphere`]).
 //!   Shadows, the environment cubemap and the depth-of-field output are disabled (no shadow
 //!   maps, black cubemap, `oC1` dropped).
@@ -445,10 +454,11 @@ impl ConstantContext<'_> {
         let base = Vec3::from_array(BASE_AMBIENT);
         let ambient = base + self.ambient;
         r[4] = [ambient.x, ambient.y, ambient.z, 1.0];
-        // The sun takes registers 2 (direction) and 3 (colour), which the shaders read under
-        // control boolean 3. Provisional, from the shaders' use of them.
+        // The sun takes registers 2 (direction, w 1) and 3 (colour, w 1: the stored colour's
+        // w, which boolean 3 tests), as the light manager writes them (0x4625d0 → 0x462470
+        // → 0x46bb80).
         if let Some((d, c)) = self.sun {
-            r[2] = [d.x, d.y, d.z, 0.0];
+            r[2] = [d.x, d.y, d.z, 1.0];
             r[3] = [c.x, c.y, c.z, 1.0];
         }
         r
@@ -834,7 +844,7 @@ mod tests {
         assert_eq!(c.bools[1][0], 1, "second point light enables B");
         assert_eq!(c.bools[2][0], 0);
         // The sun: its direction and colour in registers 2 and 3, and boolean 3 on.
-        assert_eq!(c.floats[2], [0.0, 0.0, -1.0, 0.0]);
+        assert_eq!(c.floats[2], [0.0, 0.0, -1.0, 1.0]);
         assert_eq!(c.floats[3], [0.6, 0.5, 0.3, 1.0]);
         assert_eq!(c.bools[3][0], 1);
         assert_eq!(c.floats[40], [0.0; 4]);

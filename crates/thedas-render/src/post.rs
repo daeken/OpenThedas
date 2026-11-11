@@ -24,6 +24,11 @@
 //! coordinate `(i, j) / target size`, as D3D9 does a full-screen quad with no half-texel
 //! correction. All in the frame's stored (gamma) values, as D3D9 had them.
 //!
+//! No gamma pass follows: DAOrigins.exe applies its Gamma option only as the device's gamma
+//! ramp (0x53ab10 → `SetGammaRamp` at 0x869c30), `clamp((x^(1/g) − 0.5) · tan(π/4) + 0.5)`
+//! with `g` the option mapped by 0x5ddb00 (`option + 0.5` up to 0.5): at the default 0.50
+//! the ramp is the identity.
+//!
 //! Provisional: the frame's alpha is taken as 1 (an `X8R8G8B8` back buffer, so its copy
 //! reads opaque); the original's back buffer format is not traced. The level gives the
 //! parameters; the defaults below are the `.ffx.xml` file's.
