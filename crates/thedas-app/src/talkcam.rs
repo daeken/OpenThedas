@@ -82,6 +82,9 @@ impl TalkCamera {
             let shots = self.shots(sim, &line.0.0)?;
             shots.get(l).cloned().flatten()
         });
+        if shot.is_none() {
+            log::debug!("line {:?} of {}: no shot", open.line, line.0.0);
+        }
         if let Some(shot) = shot
             && let Some(staged) = self.stage_line(sim, &shot, &open, base)
         {
@@ -144,8 +147,18 @@ impl TalkCamera {
         open: &OpenLine,
         base: &Camera,
     ) -> Option<Staged> {
-        let stage = self.stage(sim, &shot.stage_file)?;
-        let cam = stage.camera_for(&shot.place)?;
+        let Some(stage) = self.stage(sim, &shot.stage_file) else {
+            log::debug!("staged line: no stage file {}", shot.stage_file);
+            return None;
+        };
+        let Some(cam) = stage.camera_for(&shot.place) else {
+            log::debug!(
+                "staged line: stage {} has no camera for {}",
+                shot.stage_file,
+                shot.place
+            );
+            return None;
+        };
         let near = sim
             .world
             .get(open.owner)
@@ -159,7 +172,26 @@ impl TalkCamera {
                 let d =
                     |o: &&Object| near.map_or(0.0, |n| n.distance(Vec3::from_array(o.position)));
                 d(a).total_cmp(&d(b))
-            })?;
+            });
+        let Some(placed) = placed else {
+            log::debug!(
+                "staged line: no stage tagged {} in the area ({} placed elsewhere)",
+                shot.stage,
+                sim.world.by_tag(&shot.stage).count()
+            );
+            return None;
+        };
+        log::debug!(
+            "staged line: stage {} ({}) place {} at {:?} facing {} (owner at {:?}), camera {:?} {:?}",
+            shot.stage,
+            shot.stage_file,
+            shot.place,
+            placed.position,
+            placed.facing,
+            near,
+            cam.position,
+            cam.rotation
+        );
         let mut marks = HashMap::new();
         for (actor, place) in &shot.actors {
             let (Some(id), Some(p)) = (
