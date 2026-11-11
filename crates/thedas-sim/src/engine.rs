@@ -1998,7 +1998,9 @@ pub fn call(
                 .and_then(|o| o.fields.get("NumTactics").copied())
                 .unwrap_or(i32::MAX);
             let tactics = h.sim.tactics_of(who);
-            let t = (i >= 0 && i < num)
+            // Slots are numbered from 1 to GetNumTactics: player_core fills them from 1 and
+            // rules_core reads them while the index is no more than GetNumTactics.
+            let t = (i >= 0 && i <= num)
                 .then(|| tactics.get(i as usize))
                 .flatten();
             ok(Value::Int(match (name, t) {
@@ -3448,6 +3450,8 @@ mod tests {
         int FOLLOWER_STATE_LOCKEDACTIVE = 5;\n\
         void SetCreatureProperty(object o, int p, float f, int t) = 5;\n\
         void UpdateCreatureProperty(object o, int p, float f, int t) = 43;\n\
+        void SetTacticEntry(object o, int i, int e, int t, int c, int m, int p) = 44;\n\
+        int GetTacticCondition(object o, int i) = 45;\n\
         int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
         int PROPERTY_VALUE_TOTAL = 1;\n\
         int PROPERTY_VALUE_BASE = 2;\n\
@@ -4177,6 +4181,49 @@ mod tests {
         let state = |s: &mut Sim, o| run(s, hero, "GetFollowerState", &[Value::Object(o)]);
         assert_eq!(state(&mut s, hero), Some(Value::Int(1)));
         assert_eq!(state(&mut s, ally), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn tactics_slots_run_from_one_to_the_number_of_tactics() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let c = s.world.spawn(ObjectKind::Creature, "alistair");
+        s.world
+            .get_mut(c)
+            .unwrap()
+            .fields
+            .insert("NumTactics".into(), 3);
+        for i in 1..=4 {
+            let a = [
+                Value::Object(c),
+                Value::Int(i),
+                Value::Int(1),
+                Value::Int(1),
+                Value::Int(100 + i),
+                Value::Int(4),
+                Value::Int(617),
+            ];
+            run(&mut s, c, "SetTacticEntry", &a);
+        }
+        let cond = |s: &mut Sim, i: i32| {
+            run(
+                s,
+                c,
+                "GetTacticCondition",
+                &[Value::Object(c), Value::Int(i)],
+            )
+        };
+        assert_eq!(cond(&mut s, 1), Some(Value::Int(101)));
+        assert_eq!(
+            cond(&mut s, 3),
+            Some(Value::Int(103)),
+            "the last slot counts"
+        );
+        assert_eq!(
+            cond(&mut s, 4),
+            Some(Value::Int(0)),
+            "past the number of tactics"
+        );
     }
 
     #[test]
