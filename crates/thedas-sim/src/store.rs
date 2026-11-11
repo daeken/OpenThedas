@@ -189,7 +189,37 @@ impl Sim {
         }
         Ok(price)
     }
+
+    /// The store screen closed (its close button): the store is no longer open.
+    pub fn close_store(&mut self) {
+        self.world.store = None;
+    }
+
+    /// store.gfx's trades, as player input: `Store.BuyItem` (buyer, item, quantity) and
+    /// `Store.SellItem` (seller, item, quantity) with the open store. Provisional, from the
+    /// movie's `BuyItem`/`SellItem`: a stack is traded whole (the quantity is not used).
+    pub(crate) fn store_message(&mut self, name: &str, args: &[String]) -> bool {
+        let Some(store) = self.world.store else {
+            return false;
+        };
+        let item = args
+            .get(1)
+            .and_then(|a| a.trim().parse::<f64>().ok())
+            .filter(|v| v.fract() == 0.0 && *v >= 0.0 && *v < u32::MAX as f64)
+            .map(|v| v as ObjectId);
+        let Some(item) = item else { return false };
+        match name {
+            MSG_BUY => self.store_buy(store, item).is_ok(),
+            MSG_SELL => self.store_sell(store, item).is_ok(),
+            _ => false,
+        }
+    }
 }
+
+/// store.gfx's purchase: buyer, item, quantity.
+pub const MSG_BUY: &str = "Store.BuyItem";
+/// store.gfx's sale: seller, item, quantity.
+pub const MSG_SELL: &str = "Store.SellItem";
 
 #[cfg(test)]
 mod tests {
@@ -265,5 +295,22 @@ mod tests {
         s.world.get_mut(plot).unwrap().plot = true;
         s.world.get_mut(hero).unwrap().inventory.push(plot);
         assert_eq!(s.store_sell(store, plot), Err(TradeError::Plot));
+    }
+
+    #[test]
+    fn the_store_screens_trades_go_through_the_open_store() {
+        let (mut s, hero, store, item) = setup();
+        let args =
+            |who: ObjectId, what: ObjectId| vec![who.to_string(), what.to_string(), "1".into()];
+        s.world.get_mut(hero).unwrap().money = 2000;
+        assert!(!s.gui_message(MSG_BUY, &args(hero, item)), "no store open");
+        s.world.store = Some(store);
+        assert!(s.gui_message(MSG_BUY, &args(hero, item)));
+        assert!(s.world.get(hero).unwrap().inventory.contains(&item));
+        assert!(!s.gui_message(MSG_BUY, &args(hero, item)), "sold out");
+        assert!(s.gui_message(MSG_SELL, &args(hero, item)));
+        assert_eq!(s.world.get(hero).unwrap().money, 750);
+        s.close_store();
+        assert_eq!(s.world.store, None);
     }
 }

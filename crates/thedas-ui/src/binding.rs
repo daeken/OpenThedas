@@ -184,14 +184,45 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             thedas_sim::sim::constant(&sim.table, "PROPERTY_DEPLETABLE_HEALTH"),
             thedas_sim::sim::constant(&sim.table, "PROPERTY_DEPLETABLE_MANA_STAMINA"),
         ];
-        for (p, (total, cur)) in &o.properties {
+        // The character record shows each attribute as its base and what gear and effects
+        // add (`Base`, `Modifier`); `Total` is both, as the game's PROPERTY_VALUE_TOTAL.
+        for (p, (base, cur)) in &o.properties {
             let total = if depletable.contains(p) && *p != 0 {
                 sim.depletable_max(id, *p)
             } else {
-                *total
+                sim.property_total(id, *p)
             };
             v.insert(format!("{prefix}.Attributes.{p}.Current"), num(*cur));
             v.insert(format!("{prefix}.Attributes.{p}.Total"), num(total));
+            v.insert(format!("{prefix}.Attributes.{p}.Base"), num(*base));
+            v.insert(
+                format!("{prefix}.Attributes.{p}.Modifier"),
+                num(sim.property_modifier(id, *p)),
+            );
+        }
+        v.insert(
+            format!("{prefix}.Stats.Race"),
+            num(o.fields.get("Race").copied().unwrap_or(0)),
+        );
+        // The auto-level option is off (the player spends the points).
+        v.insert(format!("{prefix}.Stats.AutoLevelUp"), num(0));
+        v.insert(format!("{prefix}.InCombat"), num(o.combat.in_combat as u8));
+        // Properties the creature has no value of (resistances, mostly) read as their
+        // total of nothing: what derivation, gear and effects give. Provisional: the
+        // character record's rows are taken to be properties 1 to 60.
+        for p in 1..=60 {
+            if o.properties.contains_key(&p) {
+                continue;
+            }
+            v.insert(
+                format!("{prefix}.Attributes.{p}.Total"),
+                num(sim.property_total(id, p)),
+            );
+            v.insert(format!("{prefix}.Attributes.{p}.Base"), num(0));
+            v.insert(
+                format!("{prefix}.Attributes.{p}.Modifier"),
+                num(sim.property_modifier(id, p)),
+            );
         }
     };
     for (i, id) in members.iter().enumerate() {
@@ -207,11 +238,22 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     if let Some(c) = sim.world.chargen {
         creature("CharGenCreature", c);
         if let Some(o) = sim.world.get(c) {
-            for p in o.properties.keys() {
+            for (p, (base, _)) in &o.properties {
                 v.insert(
                     format!("CharGenCreature.Attributes.{p}.Modifier"),
                     num(sim.equipment_bonus(c, *p)),
                 );
+                // The points being spent go on the base, which the screen shows as Total
+                // (depletables keep their maximum).
+                let depletable = [
+                    "PROPERTY_DEPLETABLE_HEALTH",
+                    "PROPERTY_DEPLETABLE_MANA_STAMINA",
+                ]
+                .iter()
+                .any(|k| thedas_sim::sim::constant(&sim.table, k) == *p);
+                if !depletable {
+                    v.insert(format!("CharGenCreature.Attributes.{p}.Total"), num(*base));
+                }
             }
         }
         v.insert("CharGenCreature.Stats.AutoLevelUp".into(), num(0));
@@ -225,6 +267,17 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
                 UiValue::String(p.clone()),
             );
         }
+    }
+    // Who may level up now (the character record's button): a party member the game marked
+    // (`SetCanLevelUp`, or experience reaching the next level) out of combat.
+    for id in &members {
+        let can = sim.world.get(*id).is_some_and(|o| {
+            o.fields.get("CanLevelUp").copied().unwrap_or(0) != 0 && !o.combat.in_combat
+        });
+        v.insert(
+            format!("{}.{id}", crate::protocol::CAN_LEVEL_UP),
+            num(can as u8),
+        );
     }
     // Empty slots read as no creature (0); `GetNumMembers` does not count them.
     for i in members.len()..4 {
@@ -361,6 +414,10 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         .count();
     set("Area.CreatureCount".into(), num(creatures as f64));
     inventory(sim, controlled.or(hero), shown.item_filter, &mut v);
+    store(sim, &mut v);
+    if let Some(who) = controlled.or(hero) {
+        tactics(sim, who, &mut v);
+    }
     // The minimap, as minimap.gfx reads it: the picture, the world corners it spans
     // (`Left`/`Bottom` the lower, `Right`/`Top` the upper) and the share of the picture
     // they cover. Provisional: north is taken to be up (0).
@@ -516,7 +573,82 @@ fn item(sim: &Sim, prefix: &str, id: u32, v: &mut BTreeMap<String, UiValue>) {
     }
 }
 
-/// The inventory screen: the party's backpack (`GUIInventory.PartyBackpackView.N.Item`, the
+/// The open store, as store.gfx reads it: its name, its mark-up and mark-down (percent; the
+/// movie prices items from their `Cost` with them), its stock (`GUIStore.StoreView.N.Item`)
+/// and what the party could sell (`GUIStore.PartyBackpackView`, the backpack without plot
+/// items). Provisional: the lists' layout is taken from inventory.gfx's, which store.gfx
+/// shares.
+fn store(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
+    let Some(st) = sim.world.store.and_then(|s| sim.world.get(s)) else {
+        return;
+    };
+    let field = |k: &str, d: i32| st.fields.get(k).copied().unwrap_or(d);
+    v.insert("Store.Name".into(), UiValue::String(name(sim, st.id)));
+    v.insert("Store.MarkUp".into(), num(field("MarkUp", 100)));
+    v.insert("Store.MarkDown".into(), num(field("MarkDown", 100)));
+    v.insert("Party.BackpackSort".into(), num(0));
+    let stock = st.inventory.clone();
+    let sellable: Vec<u32> = sim
+        .party_backpack()
+        .into_iter()
+        .filter(|&i| !sim.world.get(i).is_some_and(|o| o.plot))
+        .collect();
+    for (view, items) in [("StoreView", &stock), ("PartyBackpackView", &sellable)] {
+        let ids: Vec<String> = items.iter().map(|i| i.to_string()).collect();
+        v.insert(format!("GUIStore.{view}"), UiValue::String(ids.join(",")));
+        for (i, id) in items.iter().enumerate() {
+            let k = format!("GUIStore.{view}.{i}");
+            v.insert(k.clone(), num(*id));
+            v.insert(format!("{k}.GroupSize"), num(1));
+            item(sim, &format!("{k}.Item"), *id, v);
+            if view == "StoreView" {
+                let infinite = sim
+                    .world
+                    .get(*id)
+                    .is_some_and(|o| o.fields.get("Infinite").copied().unwrap_or(0) != 0);
+                v.insert(format!("{k}.Item.InfiniteStock"), num(infinite as u8));
+                v.insert(format!("{k}.Item.StoreFlag"), num(1));
+            }
+        }
+    }
+}
+
+/// The tactics of the party member the player controls, as tactics.gfx reads them
+/// (`GUI.SelectedChar.Tactics.TacticsList.N`: whether the slot is on, its target type,
+/// condition, command and the command's parameter). Read only: the screen's edits are not
+/// taken yet. Provisional: `TargetID` and `ConditionID` are taken to repeat the target and
+/// condition, and a member with no slots of its own shows none (its preset is applied when
+/// its tactics first run).
+fn tactics(sim: &Sim, who: u32, v: &mut BTreeMap<String, UiValue>) {
+    let Some(o) = sim.world.get(who) else { return };
+    let k = "GUI.SelectedChar.Tactics";
+    v.insert(format!("{k}.Enabled"), num(1));
+    v.insert(format!("{k}.Dirty"), num(0));
+    v.insert(format!("{k}.DirtyPreset"), num(0));
+    v.insert(
+        format!("{k}.PresetIndex"),
+        num(o.fields.get("TacticPreset").copied().unwrap_or(0)),
+    );
+    v.insert(format!("{k}.PresetType"), num(0));
+    v.insert("Party.InCamp".into(), num(0));
+    let list = &o.combat.tactics;
+    v.insert(format!("{k}.TacticsList"), num(list.len() as f64));
+    for (i, t) in list.iter().enumerate() {
+        let r = format!("{k}.TacticsList.{i}");
+        v.insert(format!("{r}.Enabled"), num(t.enabled as u8));
+        v.insert(format!("{r}.Target"), num(t.target));
+        v.insert(format!("{r}.TargetID"), num(t.target));
+        v.insert(format!("{r}.Condition"), num(t.condition));
+        v.insert(format!("{r}.ConditionID"), num(t.condition));
+        v.insert(format!("{r}.Command"), num(t.command));
+        v.insert(format!("{r}.CommandParam"), num(t.param));
+        v.insert(format!("{r}.CommandItem"), num(0));
+        v.insert(format!("{r}.ItemName"), UiValue::String(String::new()));
+        v.insert(format!("{r}.ItemIcon"), UiValue::String(String::new()));
+    }
+}
+
+/// The inventory screen: the party's backpack/// The inventory screen: the party's backpack (`GUIInventory.PartyBackpackView.N.Item`, the
 /// items of the chosen category tab, `filter`) with plot items listed apart
 /// (`PartyPlotItemsView`), the money, and what the selected party member (`who`) wears
 /// (`GUI.SelectedChar.Equipment.<INVENTORY_SLOT_*>`, 0 for an empty slot).
@@ -823,5 +955,102 @@ mod tests {
         );
         assert_eq!(v.get(&format!("{k}.Accepted")), Some(&UiValue::Number(1.0)));
         assert!(!v.contains_key("Journal.ChanterBoard.ChanterEntries.1.PlotName"));
+    }
+
+    #[test]
+    fn the_store_its_stock_and_what_the_party_could_sell() {
+        use thedas_sim::world::ObjectKind;
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        sim.world.hero = Some(hero);
+        let store = sim.world.spawn(ObjectKind::Store, "store_gorim");
+        let helm = sim.world.spawn(ObjectKind::Item, "helm");
+        let pelt = sim.world.spawn(ObjectKind::Item, "pelt");
+        let key = sim.world.spawn(ObjectKind::Item, "key");
+        sim.world.get_mut(key).unwrap().plot = true;
+        {
+            let s = sim.world.get_mut(store).unwrap();
+            s.inventory.push(helm);
+            s.fields.insert("MarkUp".into(), 150);
+            s.fields.insert("MarkDown".into(), 25);
+        }
+        sim.world
+            .get_mut(helm)
+            .unwrap()
+            .fields
+            .insert("Infinite".into(), 1);
+        sim.world
+            .get_mut(hero)
+            .unwrap()
+            .inventory
+            .extend([pelt, key]);
+        assert!(!sim_values(&sim).contains_key("GUIStore.StoreView"));
+        sim.world.store = Some(store);
+        let v = sim_values(&sim);
+        assert_eq!(v["Store.MarkUp"], UiValue::Number(150.0));
+        assert_eq!(v["Store.MarkDown"], UiValue::Number(25.0));
+        assert_eq!(v["GUIStore.StoreView.0.Item.ID"], num(helm));
+        assert_eq!(v["GUIStore.StoreView.0.Item.InfiniteStock"], num(1));
+        assert_eq!(v["GUIStore.PartyBackpackView.0.Item.ID"], num(pelt));
+        assert!(
+            !v.contains_key("GUIStore.PartyBackpackView.1"),
+            "no plot items"
+        );
+    }
+
+    #[test]
+    fn the_character_record_and_tactics_of_the_selected_member() {
+        use thedas_sim::world::ObjectKind;
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        sim.world.hero = Some(hero);
+        {
+            let o = sim.world.get_mut(hero).unwrap();
+            o.properties.insert(1, (20.0, 0.0));
+            o.modifiers.insert(1, 3.0);
+            o.fields.insert("CanLevelUp".into(), 1);
+            o.fields.insert("Race".into(), 2);
+            o.combat.tactics.push(thedas_sim::combat::Tactic {
+                enabled: true,
+                target: 2,
+                condition: 9,
+                command: 4,
+                param: 3000,
+            });
+        }
+        let v = sim_values(&sim);
+        let a = "GUI.SelectedChar.Attributes.1";
+        assert_eq!(v[&format!("{a}.Base")], UiValue::Number(20.0));
+        assert_eq!(v[&format!("{a}.Modifier")], UiValue::Number(3.0));
+        assert_eq!(v[&format!("{a}.Total")], UiValue::Number(23.0));
+        // A property it has no value of reads as nothing added.
+        assert_eq!(
+            v["GUI.SelectedChar.Attributes.42.Total"],
+            UiValue::Number(0.0)
+        );
+        assert_eq!(v["GUI.SelectedChar.Stats.Race"], UiValue::Number(2.0));
+        assert_eq!(
+            v[&format!("{}.{hero}", crate::protocol::CAN_LEVEL_UP)],
+            UiValue::Number(1.0)
+        );
+        let t = "GUI.SelectedChar.Tactics.TacticsList.0";
+        assert_eq!(v[&format!("{t}.Condition")], UiValue::Number(9.0));
+        assert_eq!(v[&format!("{t}.CommandParam")], UiValue::Number(3000.0));
+        assert_eq!(v[&format!("{t}.Enabled")], UiValue::Number(1.0));
+        sim.world.get_mut(hero).unwrap().combat.in_combat = true;
+        let v = sim_values(&sim);
+        assert_eq!(
+            v[&format!("{}.{hero}", crate::protocol::CAN_LEVEL_UP)],
+            UiValue::Number(0.0),
+            "not in combat"
+        );
     }
 }
