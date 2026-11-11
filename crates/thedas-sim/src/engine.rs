@@ -3475,6 +3475,26 @@ pub fn call(
         // the stat's label in itemstatdefines.gda (Attack, Damage, ArmorPenetration, ...).
         // Provisional: item properties (material, enchantments) are not added yet.
         "GetItemStat" => ok(Value::Float(h.sim.item_stat(obj(a, 0), int(a, 1)))),
+        // DAOrigins.exe (0x665570, 0x7556d0) adds up the power of every one of the item's
+        // properties with that id, then, with bIncludeSubItems, its sub-items' (runes) the
+        // same way; 0 for what is not an item. Provisional: the properties are the
+        // template's (properties added in play are not kept) and items hold no sub-items.
+        "GetItemPropertyPower" => {
+            let (item, p) = (obj(a, 0), int(a, 1));
+            let power = if h.object(item).is_some_and(|o| o.kind == ObjectKind::Item) {
+                h.sim
+                    .item_look(item)
+                    .properties
+                    .iter()
+                    .filter(|(id, _)| *id == p)
+                    .map(|(_, power)| *power)
+                    .sum()
+            } else {
+                0
+            };
+            ok(Value::Int(power))
+        }
+
         "GetItemStackSize" => ok(Value::Int(
             h.object(obj(a, 0))
                 .and_then(|o| o.fields.get("StackSize").copied())
@@ -5381,7 +5401,8 @@ mod coverage_tests {
         location SetLocationFacing(location l, float f) = 90;\n\
         vector GetPositionFromLocation(location l) = 91;\n\
         float GetFacingFromLocation(location l) = 92;\n\
-        void AddItemVisualEffect(object o, int n) = 93;\n";
+        void AddItemVisualEffect(object o, int n) = 93;\n\
+        int GetItemPropertyPower(object o, int p, int s = FALSE) = 94;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -5929,5 +5950,32 @@ mod coverage_tests {
             (4, 3, vec![1077])
         );
         assert!(s.world.get(man).unwrap().effects.is_empty());
+    }
+
+    #[test]
+    fn an_items_property_power_adds_up_its_matching_properties() {
+        let mut s = sim();
+        let ring = s.world.spawn(ObjectKind::Item, "ring");
+        s.world.get_mut(ring).unwrap().template = "gen_im_ring".into();
+        s.set_item_look(
+            "gen_im_ring",
+            crate::sim::ItemLook {
+                properties: vec![(1005, 2), (10018, 1), (1005, 3)],
+                ..Default::default()
+            },
+        );
+        let man = s.world.spawn(ObjectKind::Creature, "man");
+        let power = |s: &mut Sim, o: ObjectId, p: i32| {
+            run(
+                s,
+                o,
+                "GetItemPropertyPower",
+                &[Value::Object(o), Value::Int(p), Value::Int(1)],
+            )
+        };
+        assert_eq!(power(&mut s, ring, 1005), Some(Value::Int(5)));
+        assert_eq!(power(&mut s, ring, 10018), Some(Value::Int(1)));
+        assert_eq!(power(&mut s, ring, 7), Some(Value::Int(0)));
+        assert_eq!(power(&mut s, man, 1005), Some(Value::Int(0)));
     }
 }
