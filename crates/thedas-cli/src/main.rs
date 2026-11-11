@@ -87,9 +87,9 @@ enum Command {
         #[arg(long, value_delimiter = ',')]
         replies: Vec<usize>,
     },
-    /// Play a scenario from a save over several seeds (simple deterministic player: party AI,
-    /// attack what is seen, seek the nearest hostile, take doors to new areas) and report hero
-    /// deaths and who was alive at given times.
+    /// Play a scenario from a save over several seeds (simple deterministic player: the party
+    /// AI fights; between fights the harness seeks the nearest hostile and takes doors to new
+    /// areas) and report hero deaths and who was alive at given times.
     Autoplay {
         install: PathBuf,
         /// A save made with the MCP's save_state.
@@ -131,6 +131,12 @@ enum Command {
         /// hostiles in view. Without it the party AI alone fights (the standard measurement).
         #[arg(long)]
         steer: bool,
+        /// Harness player mode (not the game's AI): before the run and after each fight it
+        /// puts the best gear in the party's pack on the party (same item type, higher stats),
+        /// and in fights it orders the party's talents and spells on their foes and drinks
+        /// health and lyrium potions when low, as a human player would. Off by default.
+        #[arg(long)]
+        player: bool,
         /// First walk the hero up to the creature with this tag (to start an encounter that
         /// begins on approach).
         #[arg(long)]
@@ -308,6 +314,7 @@ fn run() -> Result<()> {
             verbose,
             ai_hero,
             steer,
+            player,
             approach,
             activity,
             pool_xp,
@@ -331,6 +338,7 @@ fn run() -> Result<()> {
             verbose,
             ai_hero,
             steer,
+            player,
             approach: approach.as_deref(),
             activity,
             pool_xp,
