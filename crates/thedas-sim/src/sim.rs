@@ -1939,7 +1939,17 @@ impl Sim {
     }
 
     /// Drops an object's front command as failed: it hears `COMMAND_COMPLETE` with the
-    /// result (a `COMMAND_FAILED_*` constant).
+    /// result (a `COMMAND_FAILED_*` constant) one update later ([`APPROACH_CHECK_MS`]).
+    ///
+    /// Every caller fails a command as it starts (its way blocked by a closed door, or no
+    /// room on the target's melee ring), before any time has passed. DAOrigins.exe runs a
+    /// command's executor once per update, so a script that answers the failure by queueing
+    /// the same command again (rules_core does, for a follower on autopilot whose target
+    /// stands behind a closed door: only the controlled character and non-followers use the
+    /// door) tries again on a later update while the game goes on. Answered at once, the
+    /// command failed and was queued again forever at the same instant and the simulation
+    /// stopped. Provisional: the delay is the simulation's stand-in for an update, not a
+    /// value read from the executable.
     /// Fails a move or approach whose way a closed door blocks
     /// (`COMMAND_FAILED_PATH_ACTION_REQUIRED`, the door as the event's object 2, where
     /// rules_core looks for it: its AI then uses the door and repeats the command).
@@ -1976,7 +1986,7 @@ impl Sim {
         if let Some(o) = self.world.get_mut(id) {
             o.combat.previous_command = Some(c);
         }
-        self.world.queue_event(0, id, ev, None);
+        self.world.queue_event(APPROACH_CHECK_MS, id, ev, None);
     }
 
     /// The earliest-finishing front command, starting the clock on fronts that have none.
