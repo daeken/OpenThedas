@@ -67,20 +67,28 @@ pub fn aim(sim: &Sim, name: &str, args: &[String]) -> Option<Aim> {
     })
 }
 
+/// The player picks reply `n` of the conversation on screen; continuing past the last line
+/// of one that ended closes it (the conversation screen goes with it). Returns whether the
+/// conversation closed.
+pub fn reply(sim: &mut Sim, n: usize) -> bool {
+    if sim.dialog_state().is_some_and(|d| d.ended) {
+        sim.end_conversation();
+        return true;
+    }
+    sim.choose_reply(n);
+    false
+}
+
 /// Acts on a message a movie sent: a conversation reply is picked (continuing past the last
 /// line of one that ended closes it), anything else goes to the simulation's interface
 /// handlers. Returns whether the simulation acted on it.
 pub fn apply(sim: &mut Sim, name: &str, args: &[String]) -> bool {
     if name == SELECT_RESPONSE {
-        if sim.dialog_state().is_some_and(|d| d.ended) {
-            sim.end_conversation();
-        } else {
-            let n = args
-                .first()
-                .and_then(|a| a.parse::<usize>().ok())
-                .unwrap_or(0);
-            sim.choose_reply(n);
-        }
+        let n = args
+            .first()
+            .and_then(|a| a.parse::<usize>().ok())
+            .unwrap_or(0);
+        reply(sim, n);
         sim.tick(0);
         return true;
     }
@@ -191,6 +199,38 @@ mod tests {
             Arc::new(thedas_script::EngineTable::default()),
             1,
         )
+    }
+
+    #[test]
+    fn continuing_past_the_last_line_closes_the_conversation() {
+        use thedas_sim::dialog::{Conversation, Dlg};
+        let mut s = sim();
+        let hero = s
+            .world
+            .spawn(thedas_sim::world::ObjectKind::Creature, "hero");
+        let talk = |ended| Conversation {
+            dlg: Dlg {
+                name: "test".into(),
+                starts: Vec::new(),
+                nodes: Vec::new(),
+            },
+            owner: hero,
+            player: hero,
+            line: None,
+            replies: Vec::new(),
+            ended,
+            shown: Vec::new(),
+            chain: Vec::new(),
+        };
+        // Still going with nothing to pick: a reply leaves it be.
+        let world = s.world.clone();
+        s.restore((world.clone(), Some(talk(false))));
+        assert!(!reply(&mut s, 0));
+        assert!(s.dialog_state().is_some());
+        // Its last line shown: any reply, as the continue click, closes it.
+        s.restore((world, Some(talk(true))));
+        assert!(reply(&mut s, 3));
+        assert!(s.dialog_state().is_none());
     }
 
     #[test]

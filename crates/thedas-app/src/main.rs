@@ -1535,10 +1535,18 @@ fn use_quickslot(live: &mut live::Live, slot: i32) -> Option<i32> {
 
 /// The conversation's reply `n` is chosen; what is said next.
 fn reply(live: &mut live::Live, n: usize) -> String {
-    match live.sim().choose_reply(n) {
+    let mut sim = live.sim();
+    if sim.dialog_state().is_none() {
+        return format!("reply {n}: no conversation");
+    }
+    // As the conversation screen's continue does: past the last line it closes.
+    if thedas_ui::input::reply(&mut sim, n) {
+        return format!("reply {n}: the conversation closes");
+    }
+    match sim.dialog_state() {
         Some(d) if d.ended => format!("reply {n}: the conversation ends"),
         Some(d) => format!("reply {n}: {}: {}", d.speaker, d.line),
-        None => format!("reply {n}: no conversation"),
+        None => format!("reply {n}: the conversation closes"),
     }
 }
 
