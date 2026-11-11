@@ -20,8 +20,10 @@
 //! - **Attacks.** When a `CommandAttack` reaches the front of the queue, its owner gets
 //!   `EVENT_TYPE_COMMAND_PENDING` (objects: owner, target; integers: command type, id). The
 //!   script answers with `SetAttackResult` and `SetAttackDuration`. When the attack's time is
-//!   up, the owner gets `EVENT_TYPE_ATTACK_IMPACT` (objects: attacker, target; integer 0: the
-//!   hit result), and `GetAttackImpactDamageEffect` returns the damage effect the script set.
+//!   up, the owner gets one `EVENT_TYPE_ATTACK_IMPACT` per hand the script gave a result
+//!   (objects: attacker, target; integers: that hand's hit result and its damage effect), and
+//!   `GetAttackImpactDamageEffect` returns that hand's damage effect (see
+//!   [`Sim::finish_attack`]).
 //! - **Effects.** `ApplyEffectOnObject` runs the target's `EVENT_TYPE_APPLY_EFFECT` handler at
 //!   once, with `GetCurrentEffect` returning the effect. Unless the handler calls
 //!   `SetIsCurrentEffectValid(FALSE)`, an effect with a duration stays on the target.
@@ -1109,36 +1111,53 @@ impl Sim {
         }
     }
 
-    /// The attack's time is up: its owner applies the impact.
+    /// The attack's time is up: its owner applies the impact, once for each of the two hands
+    /// (`SetAttackResult`'s result and damage effect pairs) that has a result.
+    ///
+    /// As DAOrigins.exe does it: `SetAttackResult` (0x65de40) keeps each hand's result,
+    /// target and damage effect in its own slot of the attacker's combat state (0x6a0160 for
+    /// the main hand, 0x6a0170 for the off hand). Each hit event of the attack animation
+    /// (0x6c0c46 calls 0x6a6230) sends the impact of one slot, the off hand's when the
+    /// animation event's name holds `Left` (0xb0f840); the impact (0x6a6080) is
+    /// `EVENT_TYPE_ATTACK_IMPACT` (0x1d) with objects attacker and the slot's target and
+    /// integers the slot's result and its damage effect's id, and nothing at all for a slot
+    /// whose result is `COMBAT_RESULT_INVALID` (0). rules_core passes integer 1 to
+    /// `GetAttackImpactDamageEffect`; here the id is the hand's index, which that function
+    /// reads. rules_core's dual-weapon attacks give one hand a result and the other none
+    /// (alternating), so the off hand's blows land only through their own impact.
+    ///
+    /// Provisional: animation events are not played, so both hands' impacts come when the
+    /// attack's time is up, main hand first.
     pub(crate) fn finish_attack(&mut self, id: ObjectId, target: ObjectId) {
         let Some(result) = self.world.get(id).and_then(|o| o.combat.attack.clone()) else {
             return;
         };
-        if !self.alive(id) {
-            return;
-        }
-        let t = self.world.time_ms;
-        // The damage the impact carries (float 0 of EFFECT_TYPE_IMPACT or _DAMAGE).
-        let damage = result
-            .effects
-            .iter()
-            .flatten()
-            .filter(|e| matches!(e.ty, 1013 | 1024))
-            .map(|e| e.floats.first().copied().unwrap_or(0.0))
-            .sum();
-        self.world.trace.push(crate::trace::TraceEntry::Attack {
-            t,
-            attacker: id,
-            target,
-            result: result.results[0],
-            damage,
-        });
-        let mut ev = self.new_event("ATTACK_IMPACT", Some(id));
-        ev.objects = vec![id, target];
-        ev.ints = vec![result.results[0], result.results[1]];
-        let script = self.world.get(id).and_then(|o| o.script.clone());
-        if let Some(script) = script {
-            self.run_script(&script, id, Some(ev));
+        for hand in 0..2 {
+            let hit = result.results[hand];
+            if hit == 0 || !self.alive(id) {
+                continue;
+            }
+            let t = self.world.time_ms;
+            // The damage the impact carries (float 0 of EFFECT_TYPE_IMPACT or _DAMAGE).
+            let damage = result.effects[hand]
+                .iter()
+                .filter(|e| matches!(e.ty, 1013 | 1024))
+                .map(|e| e.floats.first().copied().unwrap_or(0.0))
+                .sum();
+            self.world.trace.push(crate::trace::TraceEntry::Attack {
+                t,
+                attacker: id,
+                target,
+                result: hit,
+                damage,
+            });
+            let mut ev = self.new_event("ATTACK_IMPACT", Some(id));
+            ev.objects = vec![id, target];
+            ev.ints = vec![hit, hand as i32];
+            let script = self.world.get(id).and_then(|o| o.script.clone());
+            if let Some(script) = script {
+                self.run_script(&script, id, Some(ev));
+            }
         }
         if let Some(o) = self.world.get_mut(id) {
             o.combat.attack = None;
@@ -1571,6 +1590,43 @@ mod tests {
         s.world.get_mut(hero).unwrap().area = None;
         s.face_target(bandit, hero);
         assert!((s.world.get(bandit).unwrap().facing - 180.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn each_hand_with_a_result_lands_its_own_blow() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let rogue = s.world.spawn(ObjectKind::Creature, "rogue");
+        let wolf = s.world.spawn(ObjectKind::Creature, "wolf");
+        for id in [rogue, wolf] {
+            s.world.get_mut(id).unwrap().area = Some(area);
+        }
+        let hit = |amount: f32| {
+            Some(Effect {
+                ty: 1024,
+                floats: vec![amount],
+                ..Default::default()
+            })
+        };
+        let attack = |s: &mut Sim, results: [i32; 2], effects: [Option<Effect>; 2]| {
+            s.world.get_mut(rogue).unwrap().combat.attack = Some(AttackResult { results, effects });
+            s.finish_attack(rogue, wolf);
+            assert!(s.world.get(rogue).unwrap().combat.attack.is_none());
+            let a = s
+                .world
+                .trace
+                .attacks
+                .get(&rogue)
+                .cloned()
+                .unwrap_or_default();
+            (a.swings, a.hits, a.damage)
+        };
+        // The off hand alone (the main hand has no result, 0): its blow lands.
+        assert_eq!(attack(&mut s, [0, 1], [None, hit(7.0)]), (1, 1, 7.0));
+        // The main hand alone misses (3); nothing for the empty off hand.
+        assert_eq!(attack(&mut s, [3, 0], [None, None]), (2, 1, 7.0));
+        // Both hands: two blows, each with its own damage.
+        assert_eq!(attack(&mut s, [1, 2], [hit(5.0), hit(9.0)]), (4, 3, 21.0));
     }
 
     #[test]
