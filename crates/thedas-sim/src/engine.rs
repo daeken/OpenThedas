@@ -523,6 +523,12 @@ pub fn call(
         "StringToFloat" => ok(Value::Float(string(a, 0).trim().parse().unwrap_or(0.0))),
         "ResourceToString" => ok(Value::String(string(a, 0))),
         "StringToResource" => ok(Value::Resource(string(a, 0))),
+        // The running script's name with ".ncs" (DAOrigins.exe 0x654d70).
+        "GetCurrentScriptResource" => ok(Value::Resource(format!(
+            "{}.ncs",
+            h.script.trim_end_matches(".ncs")
+        ))),
+
         "GetStringLength" => ok(Value::Int(string(a, 0).chars().count() as i32)),
         "StringUpperCase" => ok(Value::String(string(a, 0).to_uppercase())),
         "StringLowerCase" => ok(Value::String(string(a, 0).to_lowercase())),
@@ -1837,6 +1843,20 @@ pub fn call(
         // A lasting visual effect on an item (a weapon's glow): DAOrigins.exe (0x65d4a0)
         // makes an effect of type 4 (EffectVisualEffect), permanent, with the VFX id as its
         // integer 0, and gives it to the item. It stays on the item for presentation.
+        // DAOrigins.exe (0x665510) sets the item's indestructible flag (0x752c30); kept
+        // in the item's fields.
+        "SetItemIndestructible" => {
+            if let Some(o) = h
+                .sim
+                .world
+                .get_mut(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::Item)
+            {
+                o.fields
+                    .insert("Indestructible".into(), (int(a, 1) != 0) as i32);
+            }
+            void()
+        }
         "AddItemVisualEffect" => {
             let item = obj(a, 0);
             let permanent = constant(&h.sim.table, "EFFECT_DURATION_TYPE_PERMANENT");
@@ -5414,7 +5434,9 @@ mod coverage_tests {
         void AddItemVisualEffect(object o, int n) = 93;\n\
         int GetItemPropertyPower(object o, int p, int s = FALSE) = 94;\n\
         void DisplayPortraitMessage(object o, string s, int c = 16777215) = 95;\n\
-        void SetLocation(object o, location l) = 96;\n";
+        void SetLocation(object o, location l) = 96;\n\
+        resource GetCurrentScriptResource() = 97;\n\
+        void SetItemIndestructible(object o, int b) = 98;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -6036,6 +6058,26 @@ mod coverage_tests {
         assert_eq!(
             go(&mut s, 999, [4.0, 5.0, 6.0], 0.0),
             (Some(there), [4.0, 5.0, 6.0], 0.0)
+        );
+    }
+
+    #[test]
+    fn the_running_script_and_indestructible_items() {
+        let mut s = sim();
+        assert_eq!(
+            run(&mut s, 1, "GetCurrentScriptResource", &[]),
+            Some(Value::Resource("test.ncs".into()))
+        );
+        let shield = s.world.spawn(ObjectKind::Item, "shield");
+        run(
+            &mut s,
+            1,
+            "SetItemIndestructible",
+            &[Value::Object(shield), Value::Int(5)],
+        );
+        assert_eq!(
+            s.world.get(shield).unwrap().fields.get("Indestructible"),
+            Some(&1)
         );
     }
 }
