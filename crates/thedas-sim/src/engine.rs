@@ -845,6 +845,24 @@ pub fn call(
             }
             void()
         }
+        // DAOrigins.exe (0x65b3b0) puts the object in the location's area if it is in
+        // another and that area exists, then sets its position and orientation. Provisional:
+        // like SetPosition, no trigger is told of the move.
+        "SetLocation" => {
+            let l = match h.sim.world.handle(handle(a, 1)) {
+                Some(EngineData::Location(l)) => *l,
+                _ => return void(),
+            };
+            let area_exists = h.object(l.area).is_some_and(|o| o.kind == ObjectKind::Area);
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                if area_exists {
+                    o.area = Some(l.area);
+                }
+                o.position = l.position;
+                o.facing = l.facing;
+            }
+            void()
+        }
         "GetFacing" => ok(Value::Float(h.object(obj(a, 0)).map_or(0.0, |o| o.facing))),
         "SetFacing" => {
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
@@ -5395,7 +5413,8 @@ mod coverage_tests {
         float GetFacingFromLocation(location l) = 92;\n\
         void AddItemVisualEffect(object o, int n) = 93;\n\
         int GetItemPropertyPower(object o, int p, int s = FALSE) = 94;\n\
-        void DisplayPortraitMessage(object o, string s, int c = 16777215) = 95;\n";
+        void DisplayPortraitMessage(object o, string s, int c = 16777215) = 95;\n\
+        void SetLocation(object o, location l) = 96;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -5988,5 +6007,35 @@ mod coverage_tests {
         );
         assert!(s.world.trace.entries.iter().any(|e| matches!(e,
             TraceEntry::Log { channel: -1, text, .. } if text == "Approval +5")));
+    }
+
+    #[test]
+    fn set_location_moves_into_an_existing_area() {
+        let mut s = sim();
+        let here = s.world.spawn(ObjectKind::Area, "here");
+        let there = s.world.spawn(ObjectKind::Area, "there");
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        s.world.get_mut(c).unwrap().area = Some(here);
+        let go = |s: &mut Sim, area: ObjectId, p: [f32; 3], f: f32| {
+            let l = run(
+                s,
+                OBJECT_INVALID,
+                "Location",
+                &[Value::Object(area), Value::Vector(p), Value::Float(f)],
+            )
+            .unwrap();
+            run(s, c, "SetLocation", &[Value::Object(c), l]);
+            let o = s.world.get(c).unwrap();
+            (o.area, o.position, o.facing)
+        };
+        assert_eq!(
+            go(&mut s, there, [1.0, 2.0, 3.0], 90.0),
+            (Some(there), [1.0, 2.0, 3.0], 90.0)
+        );
+        // No such area: it stays where it is, at the new position.
+        assert_eq!(
+            go(&mut s, 999, [4.0, 5.0, 6.0], 0.0),
+            (Some(there), [4.0, 5.0, 6.0], 0.0)
+        );
     }
 }
