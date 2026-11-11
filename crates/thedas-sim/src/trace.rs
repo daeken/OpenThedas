@@ -80,8 +80,8 @@ pub enum TraceEntry {
         #[serde(flatten)]
         loss: HealthLoss,
     },
-    /// An attack landed or missed: its `COMBAT_RESULT_*` (of the main hand) and the damage
-    /// its impact effects carry.
+    /// An attack's blow landed or missed: one hand's `COMBAT_RESULT_*` and the damage its
+    /// impact effect carries (an attack with both hands has one entry for each).
     Attack {
         t: u64,
         attacker: ObjectId,

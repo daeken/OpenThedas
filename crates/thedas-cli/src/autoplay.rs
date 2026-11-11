@@ -20,7 +20,8 @@
 //! or the time limit. The report gives hero deaths (mean, spread, range) and, for each
 //! watched creature, how often it was alive at fixed times after a marker flag (or the
 //! start). `--activity` adds how the party and the foes it fights spent the fighting time
-//! (walking, attacking, using abilities, idle, down) and their attacks (swings, hits, damage).
+//! (walking, attacking, using abilities, idle, down) and their attacks (swings, hits, damage;
+//! for the foes, those of hostiles that took part in the party's fights, see [`sides`]).
 
 use std::path::Path;
 
@@ -132,7 +133,9 @@ fn state(sim: &Sim, id: ObjectId) -> usize {
 }
 
 /// The party (hero and followers) and the living hostiles in the hero's area that are in the
-/// fight (they see a party member or are attacking).
+/// fight: they see a party member, or a party member sees them attacking (anyone: allies of
+/// the party count). A hostile attacking out of the party's sight (the Wilds' darkspawn
+/// fighting the hero's immortal mabari far off, before it joins) is not in the party's fight.
 fn sides(sim: &Sim, hero: ObjectId) -> (Vec<ObjectId>, Vec<ObjectId>) {
     let mut party = vec![hero];
     party.extend(
@@ -141,6 +144,11 @@ fn sides(sim: &Sim, hero: ObjectId) -> (Vec<ObjectId>, Vec<ObjectId>) {
             .map(|h| h.followers.clone())
             .unwrap_or_default(),
     );
+    let seen: Vec<ObjectId> = party
+        .iter()
+        .filter_map(|&m| sim.world.get(m))
+        .flat_map(|m| m.combat.perceived_hostile.iter().copied())
+        .collect();
     let area = sim.world.get(hero).and_then(|h| h.area);
     let foes = sim
         .world
@@ -152,9 +160,10 @@ fn sides(sim: &Sim, hero: ObjectId) -> (Vec<ObjectId>, Vec<ObjectId>) {
                 && alive(sim, o.id)
                 && sim.hostile(hero, o.id)
                 && (o.combat.perceived_hostile.iter().any(|p| party.contains(p))
-                    || o.commands
-                        .first()
-                        .is_some_and(|c| c.name == "CommandAttack"))
+                    || (seen.contains(&o.id)
+                        && o.commands
+                            .first()
+                            .is_some_and(|c| c.name == "CommandAttack")))
         })
         .map(|o| o.id)
         .collect();
@@ -510,6 +519,8 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
     // The states seen at the last step, credited with the time the step took.
     let mut seen: Option<(u64, Vec<usize>, Vec<usize>)> = None;
     let mut party_ids: Vec<ObjectId> = Vec::new();
+    // The hostiles that took part in the party's fights (whose attacks count for the foes).
+    let mut foe_ids: std::collections::BTreeSet<ObjectId> = std::collections::BTreeSet::new();
     let (mut fight_ms, mut fights_won, mut last_t) = (0u64, 0u32, sim.world.time_ms);
     let mut engaged: std::collections::BTreeSet<ObjectId> = std::collections::BTreeSet::new();
     // Hostiles of fights already won: a fallen foe can stay in a party member's perceived
@@ -554,6 +565,7 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
                         party_ids.push(*m);
                     }
                 }
+                foe_ids.extend(foes.iter().copied());
                 seen = Some((
                     now,
                     party.iter().map(|&m| state(sim, m)).collect(),
@@ -784,8 +796,10 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
             for (id, a) in &sim.world.trace.attacks {
                 let side = if party_ids.contains(id) || Some(*id) == sim.world.hero {
                     &mut activity.party
-                } else {
+                } else if foe_ids.contains(id) {
                     &mut activity.foes
+                } else {
+                    continue;
                 };
                 side.swings += a.swings;
                 side.hits += a.hits;
