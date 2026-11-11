@@ -115,6 +115,9 @@ pub(crate) struct D3dPass {
     /// reads what the level's placed this frame).
     places_partitions: bool,
     reach: [f32; 2],
+    /// The first partition gets its variance blur (Medium and High detail; see
+    /// [`ShadowBlur`]).
+    blur_shadows: bool,
     caster_pipelines: Vec<wgpu::RenderPipeline>,
     casters: Vec<CasterDraw>,
     caster_buffer: Option<wgpu::Buffer>,
@@ -147,6 +150,11 @@ pub struct ShadowTargets {
     /// What each pass (0 the level's, 1 the objects') has to draw this frame and drew last
     /// (see [`shadow_key`]): when nothing changed the partitions are left as they are.
     keys: std::sync::Mutex<ShadowKeys>,
+    /// The first partition's variance blur (see [`ShadowBlur`]).
+    blur: ShadowBlur,
+    /// The partitions' boxes as last placed, which the next frame's smooth towards their
+    /// new fit (see [`crate::shadow::partitions_smoothed`]).
+    boxes: std::sync::Mutex<[Option<crate::shadow::LightBox>; 2]>,
 }
 
 /// The passes' shadow keys (see [`ShadowTargets::keys`]).
@@ -179,6 +187,7 @@ impl ShadowTargets {
             })
         };
         let t0 = make("shadow partition 0", SHADOW_FORMAT);
+        let t0_view_for_blur = t0.create_view(&Default::default());
         let t1 = make("shadow partition 1", SHADOW_FORMAT);
         let make = |label, format| {
             make(label, format).create_view(&wgpu::TextureViewDescriptor::default())
@@ -195,11 +204,241 @@ impl ShadowTargets {
             frame: std::sync::Mutex::new(None),
             others: std::sync::Mutex::new(Vec::new()),
             keys: std::sync::Mutex::new(ShadowKeys::default()),
+            blur: ShadowBlur::new(device, size, &t0_view_for_blur),
+            boxes: std::sync::Mutex::new([None, None]),
         }
     }
 
     fn frame(&self) -> Option<PlacedPartitions> {
         *self.frame.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+impl ShadowTargets {
+    /// Blurs the first partition, as `BlurShadowTargets` does at Medium and High detail
+    /// (see [`ShadowBlur`]), unless this frame kept the partitions as they were (they are
+    /// blurred already).
+    pub fn blur_first(&self, encoder: &mut wgpu::CommandEncoder) {
+        if self.frame().is_none() {
+            return;
+        }
+        if self.keys.lock().unwrap_or_else(|e| e.into_inner()).keep {
+            return;
+        }
+        self.blur.encode(encoder);
+    }
+}
+
+/// The variance blur of the first shadow partition, as DAOrigins.exe runs it at Medium and
+/// High detail: `BlurShadowTargets` → 0x4518e0 runs the slot's filter chain (0x45fd40 →
+/// 0x45fcd0) for partition 0 only and only when the shadow quality `[0xbf22c8]` is at least
+/// 2. The chain, built at 0x4545e4-0x454b8a: `gaussianblur.mat`'s `HBlurShadow` from the
+/// partition into a temporary target, then `VBlurShadow` from it back into the partition,
+/// `fBlurWidth` 0.35 (`[0xbf20ac]`, never written) and `fWindowWidth`/`fWindowHeight` the
+/// partition's size (`[0xc1e800]`), point sampled and clamped (`PPQuadStateNoBlend.sta`).
+///
+/// `HorizontalBlurShadows.vsh` / `VerticalBlurShadows.vsh` give the step
+/// `fBlurWidth / size` along one axis; `TwoPassBlurShadows.psh` keeps the texel's red (the
+/// depth), sums its green and the greens 2, 3 and 4 steps either side, and writes that sum
+/// squared over seven, saturated, as green (blue and alpha 0). Each pass maps target pixel
+/// `(i, j)` to texture coordinate `(i, j) / size`, as D3D9 did a full-screen quad with no
+/// half-texel correction. Transcribed from the shaders' code.
+///
+/// Provisional: the temporary target's format (taken as the partition's).
+struct ShadowBlur {
+    pipeline: wgpu::RenderPipeline,
+    temp: wgpu::TextureView,
+    /// Partition 0 into the temporary target (across), then back (down).
+    passes: [wgpu::BindGroup; 2],
+    target: wgpu::TextureView,
+}
+
+/// `fBlurWidth` for the shadow blur (`[0xbf20ac]`).
+pub const SHADOW_BLUR_WIDTH: f32 = 0.35;
+
+const SHADOW_BLUR_WGSL: &str = r#"
+struct Params {
+    // The step between taps in texture coordinates, and the target's size in texels.
+    step: vec2<f32>,
+    size: vec2<f32>,
+}
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var smp: sampler;
+@group(0) @binding(2) var<uniform> p: Params;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let x = f32((i << 1u) & 2u) * 2.0 - 1.0;
+    let y = f32(i & 2u) * 2.0 - 1.0;
+    return vec4<f32>(x, y, 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let uv = (pos.xy - vec2<f32>(0.5)) / p.size;
+    let c = textureSampleLevel(src, smp, uv, 0.0);
+    var g = c.y;
+    for (var k = 2; k <= 4; k = k + 1) {
+        let o = p.step * f32(k);
+        g = g + textureSampleLevel(src, smp, uv + o, 0.0).y;
+        g = g + textureSampleLevel(src, smp, uv - o, 0.0).y;
+    }
+    return vec4<f32>(c.x, clamp(g * g * (1.0 / 7.0), 0.0, 1.0), 0.0, 0.0);
+}
+"#;
+
+impl ShadowBlur {
+    fn new(device: &wgpu::Device, size: u32, partition: &wgpu::TextureView) -> Self {
+        use wgpu::util::DeviceExt;
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shadow blur"),
+            source: wgpu::ShaderSource::Wgsl(SHADOW_BLUR_WGSL.into()),
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow blur"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadow blur"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shadow blur"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: SHADOW_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shadow blur"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let temp = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("shadow blur target"),
+                size: wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: SHADOW_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        let n = size.max(1) as f32;
+        let step = SHADOW_BLUR_WIDTH / n;
+        let group = |src: &wgpu::TextureView, step: [f32; 2]| {
+            let params: [f32; 4] = [step[0], step[1], n, n];
+            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("shadow blur"),
+                contents: bytemuck::cast_slice(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("shadow blur"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(src),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: buffer.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+        let passes = [group(partition, [step, 0.0]), group(&temp, [0.0, step])];
+        ShadowBlur {
+            pipeline,
+            temp,
+            passes,
+            target: partition.clone(),
+        }
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        for (k, out) in [&self.temp, &self.target].into_iter().enumerate() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow blur"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: out,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.passes[k], &[]);
+            pass.draw(0..3, 0..1);
+        }
     }
 }
 
@@ -995,6 +1234,7 @@ impl D3dPass {
             shadows,
             places_partitions: scene.static_draws > 0,
             reach: crate::shadow::partition_reach(scene.detail),
+            blur_shadows: scene.detail != crate::scene::Detail::Low,
             caster_pipelines,
             caster_visible: std::sync::Mutex::new(Vec::new()),
             casters_filled: std::sync::Mutex::new(None),
@@ -1047,7 +1287,11 @@ impl D3dPass {
                             .iter()
                             .copied(),
                     );
-                    let p = crate::shadow::partitions(camera, aspect, dir, self.reach, &casters);
+                    let previous = *t.boxes.lock().unwrap_or_else(|e| e.into_inner());
+                    let (p, kept) = crate::shadow::partitions_smoothed(
+                        camera, aspect, dir, self.reach, &casters, &previous,
+                    );
+                    *t.boxes.lock().unwrap_or_else(|e| e.into_inner()) = kept;
                     let data = crate::shadow::shadow_data(&p, camera);
                     *t.frame.lock().unwrap_or_else(|e| e.into_inner()) = Some((p, data));
                 } else {
@@ -1288,6 +1532,14 @@ impl D3dPass {
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.count, 0, 0..1);
             }
+        }
+    }
+
+    /// After every renderer of the frame recorded its casters: the first partition's blur
+    /// (the level's pass, at Medium and High).
+    pub fn finish_shadows(&self, encoder: &mut wgpu::CommandEncoder) {
+        if let (Some(t), true, true) = (&self.shadows, self.places_partitions, self.blur_shadows) {
+            t.blur_first(encoder);
         }
     }
 
