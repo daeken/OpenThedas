@@ -1470,7 +1470,7 @@ pub fn call(
             }
             void()
         }
-        "GetGameDifficulty" => ok(Value::Int(1)),
+        "GetGameDifficulty" => ok(Value::Int(h.sim.world.difficulty)),
         // The headless simulation has no graphics setting; scripts only pick visual effects
         // by it. Provisional: medium (1).
         "GetGraphicsDetailLevel" => ok(Value::Int(1)),

@@ -28,6 +28,7 @@ pub fn start(o: &Options) -> Result<Sim> {
         seed: o.seed,
         keep_trace: o.trace.is_some(),
         cutscenes: Default::default(),
+        chargen: Default::default(),
     })
     .with_context(|| format!("opening module {} in {}", o.module, o.install.display()))
 }

@@ -438,12 +438,20 @@ pub struct World {
     /// The creature in character generation, between `StartCharGen` and `CHARGEN_END`.
     #[serde(default)]
     pub chargen: Option<ObjectId>,
+    /// `StartCharGen`'s mode for [`World::chargen`]: 0 character creation (chargen.gfx), 1
+    /// level-up (levelup.gfx).
+    #[serde(default)]
+    pub chargen_mode: i32,
     /// Whether the party was fighting at the last perception update.
     #[serde(default)]
     pub party_fighting: bool,
     /// The whole party fell: the original shows its death screen and the game ends there.
     #[serde(default)]
     pub game_over: bool,
+    /// The game difficulty (`difficulty.gda`'s rows: 0 casual, 1 normal, 2 hard, 3
+    /// nightmare), as the difficulty option sets it and `GetGameDifficulty` reads it.
+    #[serde(default = "normal_difficulty")]
+    pub difficulty: i32,
     /// Nobody is under the player's direct control: the party AI (tactics) drives every
     /// party member, the hero included, as it drives followers the player is not
     /// controlling. For playing without a player.
@@ -579,11 +587,13 @@ impl World {
             cutscenes: Vec::new(),
             cutscene: None,
             chargen: None,
+            chargen_mode: 0,
             transition: None,
             in_triggers: BTreeMap::new(),
             hostility: BTreeMap::new(),
             party_fighting: false,
             game_over: false,
+            difficulty: normal_difficulty(),
             autopilot: false,
             pool_xp: false,
             destroy_at: Vec::new(),
@@ -723,6 +733,11 @@ impl World {
         }
         self.queue.remove(&key).map(|q| (key.0, q))
     }
+}
+
+/// The difficulty a new game and an older save have: normal.
+fn normal_difficulty() -> i32 {
+    1
 }
 
 #[cfg(test)]
