@@ -573,17 +573,21 @@ impl UiMovie {
 
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
         let button = MouseButton::Left;
-        let ev = if down {
-            PlayerEvent::MouseDown {
+        if down {
+            let ev = PlayerEvent::MouseDown {
                 x,
                 y,
                 button,
                 index: None,
-            }
-        } else {
-            PlayerEvent::MouseUp { x, y, button }
-        };
-        self.with_player(|p| p.handle_event(ev));
+            };
+            self.with_player(|p| p.handle_event(ev));
+            return;
+        }
+        // The button under the mouse is released before the movies' mouse-up handlers hide
+        // anything (see `avm1::HIDE_LATER`).
+        self.set(avm1::HIDE_LATER, UiValue::List(Vec::new()));
+        self.with_player(|p| p.handle_event(PlayerEvent::MouseUp { x, y, button }));
+        self.call(avm1::HIDE_FLUSH, &[]);
     }
 
     /// The engine side of the movies' `TokenManager`: collects observers registered with

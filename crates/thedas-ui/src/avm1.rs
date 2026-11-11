@@ -20,6 +20,13 @@
 //!   press handlers; Flash and Ruffle pass none. `GUI.Element`'s event handler is wrapped to
 //!   take the button from [`BUTTON_VAR`] when none is given, which the host sets around a
 //!   right click or a double click it delivers as an ordinary click.
+//! - Ruffle runs the movies' `onMouseUp` handlers before it releases the button under the
+//!   mouse; Scaleform released it first. The movies' pickers close on any mouse up
+//!   (`MovieUtils.HideMovie` of their list), so under Ruffle the list was gone before its
+//!   entry saw the release and no choice was ever made (tactics.gfx's presets and behaviours).
+//!   `MovieUtils.HideMovie` is wrapped to put off hiding while the host delivers a release
+//!   ([`HIDE_LATER`] is an array then); the host hides what was put off afterwards
+//!   ([`HIDE_FLUSH`]). Provisional: the order is inferred from the movies working in the game.
 
 /// The callback name the injected code registers.
 pub const INVOKE_CALLBACK: &str = "thedas_invoke";
@@ -45,6 +52,12 @@ pub const MOUSE_LEFT: f64 = 1.0;
 pub const MOUSE_RIGHT: f64 = 2.0;
 pub const MOUSE_MIDDLE: f64 = 3.0;
 pub const DOUBLE_CLICK: f64 = 4.0;
+
+/// While an array, the clips `MovieUtils.HideMovie` was asked to hide (the host sets it around
+/// a mouse release).
+pub const HIDE_LATER: &str = "_global.thedas_later";
+/// Hides the clips put off in [`HIDE_LATER`] and ends the putting off.
+pub const HIDE_FLUSH: &str = "_global.thedas_flush";
 
 /// The callback name for setting a movie variable (`object path`, `member`, `value`).
 pub const SET_CALLBACK: &str = "thedas_set";
@@ -224,6 +237,67 @@ fn button_wrap_maker() -> Vec<u8> {
     let mut outer = function(&["ev", "b"], &inner);
     outer.push(RETURN);
     function(&["o"], &outer)
+}
+
+/// `function (o) { return function (mc) { if (_global.thedas_later != undefined) {
+/// _global.thedas_later.push(mc); return; } return o.apply(this, arguments); }; }`:
+/// `MovieUtils.HideMovie`'s wrapper (see [`HIDE_LATER`]).
+fn hide_wrap_maker() -> Vec<u8> {
+    let mut then = Vec::new();
+    get_path(&mut then, &["mc"]);
+    push(&mut then, &[Push::Int(1)]);
+    get_path(&mut then, &["_global", "thedas_later"]);
+    push(&mut then, &[Push::Str("push")]);
+    then.extend_from_slice(&[CALL_METHOD, POP]);
+    push(&mut then, &[Push::Undefined]);
+    then.push(RETURN);
+    let mut inner = Vec::new();
+    get_path(&mut inner, &["_global", "thedas_later"]);
+    push(&mut inner, &[Push::Undefined]);
+    inner.extend_from_slice(&[EQUALS2]);
+    // Skip the putting off when it is undefined.
+    branch(&mut inner, IF, then.len(), false);
+    inner.extend(then);
+    get_path(&mut inner, &["arguments"]);
+    get_path(&mut inner, &["this"]);
+    push(&mut inner, &[Push::Int(2)]);
+    get_path(&mut inner, &["o"]);
+    push(&mut inner, &[Push::Str("apply")]);
+    inner.extend_from_slice(&[CALL_METHOD, RETURN]);
+    let mut outer = function(&["mc"], &inner);
+    outer.push(RETURN);
+    function(&["o"], &outer)
+}
+
+/// `function () { var a = _global.thedas_later; _global.thedas_later = undefined;
+/// while (a.length) _global.MovieUtils.HideMovie(a.pop()); }` (see [`HIDE_FLUSH`]).
+fn flush_function() -> Vec<u8> {
+    let mut body = Vec::new();
+    push(&mut body, &[Push::Str("a")]);
+    get_path(&mut body, &["_global", "thedas_later"]);
+    body.push(DEFINE_LOCAL);
+    get_path(&mut body, &["_global"]);
+    push(&mut body, &[Push::Str("thedas_later"), Push::Undefined]);
+    body.push(SET_MEMBER);
+    let mut test = Vec::new();
+    get_path(&mut test, &["a", "length"]);
+    test.push(NOT);
+    let mut step = Vec::new();
+    push(&mut step, &[Push::Int(0)]);
+    get_path(&mut step, &["a"]);
+    push(&mut step, &[Push::Str("pop")]);
+    step.push(CALL_METHOD);
+    push(&mut step, &[Push::Int(1)]);
+    get_path(&mut step, &["_global", "MovieUtils"]);
+    push(&mut step, &[Push::Str("HideMovie")]);
+    step.extend_from_slice(&[CALL_METHOD, POP]);
+    // Each branch record is 5 bytes.
+    let back = test.len() + 5 + step.len() + 5;
+    body.extend_from_slice(&test);
+    branch(&mut body, IF, step.len() + 5, false);
+    body.extend(step);
+    branch(&mut body, JUMP, back, true);
+    function(&[], &body)
 }
 
 /// `function (o) { return function () {
@@ -417,6 +491,23 @@ pub fn register_invoke() -> Vec<u8> {
     get_path(&mut out, &["_global"]);
     push(&mut out, &[Push::Str("thedas_button_wrap")]);
     out.extend(button_wrap_maker());
+    out.push(SET_MEMBER);
+    // _global.MovieUtils.HideMovie = thedas_hide_wrap(_global.MovieUtils.HideMovie) (see
+    // HIDE_LATER).
+    get_path(&mut install, &["_global", "MovieUtils"]);
+    push(&mut install, &[Push::Str("HideMovie")]);
+    get_path(&mut install, &["_global", "MovieUtils", "HideMovie"]);
+    push(&mut install, &[Push::Int(1)]);
+    get_path(&mut install, &["_global"]);
+    push(&mut install, &[Push::Str("thedas_hide_wrap")]);
+    install.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
+    get_path(&mut out, &["_global"]);
+    push(&mut out, &[Push::Str("thedas_hide_wrap")]);
+    out.extend(hide_wrap_maker());
+    out.push(SET_MEMBER);
+    get_path(&mut out, &["_global"]);
+    push(&mut out, &[Push::Str("thedas_flush")]);
+    out.extend(flush_function());
     out.push(SET_MEMBER);
     get_path(&mut out, &["_global"]);
     push(&mut out, &[Push::Str("thedas_install")]);
