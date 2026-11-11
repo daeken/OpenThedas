@@ -100,8 +100,12 @@ pub fn image_lookup(
 ) -> ResourceLookup {
     Arc::new(move |name: &str| {
         if name.ends_with(".dds") || name.ends_with(".tga") {
-            let img = images.lock().ok()?.image(name)?;
-            return encode_png(&img);
+            if let Some(img) = images.lock().ok()?.image(name) {
+                return encode_png(&img);
+            }
+            // A picture the engine made under a texture's name (map.gfx's `mapmask`), served
+            // as made (see [`Stage::set_image`]).
+            return lookup(name).filter(|b| b.starts_with(b"\x89PNG"));
         }
         lookup(name)
     })
@@ -219,6 +223,13 @@ impl Stage {
                 // (a per-frame 0 raced the movie's own value and the bar's width changed from
                 // run to run). Provisional: closed (0) to start, as no profile is read.
                 b.set_value(QUICKBAR_EXPAND_VALUE, UiValue::Number(0.0));
+                // The area map's zoom (0 the whole map to 1 the closest) and whether its
+                // legend shows: the player's, kept by the engine (map.gfx writes them back as
+                // they change), seeded once likewise. Unset, the zoom read as NaN and the map
+                // was neither scaled nor centred. Provisional: the whole map and the legend
+                // shown to start.
+                b.set_value("Player.MapZoom", UiValue::Number(0.0));
+                b.set_value("Player.LegendVisible", UiValue::Number(1.0));
                 b
             },
             gpu,
