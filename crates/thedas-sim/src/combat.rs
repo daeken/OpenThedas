@@ -1040,11 +1040,14 @@ impl Sim {
     ///
     /// A ranged attack is then the attack duration the rules set (`SetAttackDuration`: 1.5 s
     /// for a bow, 0.3 s for a staff), the aim (`SetAimLoopDuration`) and this shot (bow 0.43
-    /// s, crossbow 0.6 s, staff 1.0 s). Provisional: the scripts' durations match the bows'
-    /// draw animations (`aim`, 1.57 s; crossbow 1.83 s), so they are taken as the draw, not
-    /// the whole attack; melee durations match whole swings (1.9 s against 1.97-2.0 s
-    /// weapon-and-shield attacks) and stay the whole attack. Not confirmed against the
-    /// executable.
+    /// s, crossbow 0.6 s, staff 1.0 s), as DAOrigins.exe sequences it: the attack's start
+    /// step (0x7a87c0, calling 0x7a4dd0) plays `Aim` (anim_combat.gda 249) at the speed
+    /// that makes it last the attack duration (0x7a4e6d-0x7a4ea6: its length over the
+    /// duration, which `SetAttackDuration`, 0x659d30, keeps in milliseconds), then `Fire`
+    /// (243, 0x7a4f51) at its own speed; between them the attack's executor (0x7a2410)
+    /// holds for the aim loop duration (0x7a244b). Melee durations match whole swings
+    /// (1.9 s against 1.97-2.0 s weapon-and-shield attacks) and stay the whole attack
+    /// (provisional).
     pub fn fire_ms(&mut self, id: ObjectId) -> u64 {
         let slot = constant_of(self, "INVENTORY_SLOT_MAIN");
         let base = self
@@ -1268,8 +1271,15 @@ impl Sim {
 /// known. Provisional: rules_core counts any melee attack from beyond 5 m as a miss.
 pub const MELEE_REACH: f32 = 2.0;
 
-/// The gap a melee attacker leaves between its body and its target's (metres). Provisional.
-pub const MELEE_GAP: f32 = 0.5;
+/// How far past the two bodies a melee attack reaches (metres): DAOrigins.exe's melee range
+/// test (0x6a3dc0, used by the attack command's start step 0x7a87c0) adds 1.2 (0xafebc0) to
+/// the two creatures' radii (0x695320, which adds nothing between them, 0xade210) and
+/// measures across the ground. The radii are taken to be `PERSPACE` (provisional).
+pub const MELEE_GAP: f32 = 1.2;
+
+/// The slack the same test allows past that reach (metres, 0xade218): an attack may start
+/// with the target up to this much farther away.
+pub const MELEE_REACH_TOLERANCE: f32 = 1.0;
 
 /// A creature's body radius when its appearance gives none (metres). Provisional.
 pub const DEFAULT_RADIUS: f32 = 0.4;
@@ -1291,7 +1301,8 @@ impl Sim {
     }
 
     /// How close `id` must be to `target` to attack it: a ranged weapon's range, else the
-    /// two bodies' radii and [`MELEE_GAP`].
+    /// two bodies' radii and [`MELEE_GAP`] (an attack may start from up to
+    /// [`MELEE_REACH_TOLERANCE`] farther).
     pub fn reach_to(&self, id: ObjectId, target: ObjectId) -> f32 {
         let r = self.attack_reach(id);
         if r > MELEE_REACH {
