@@ -499,13 +499,17 @@ impl GameBridge {
                 let (k, v) = text.split_once(' ').unwrap_or((&text, ""));
                 s.values.insert(k.to_string(), parse_value(v));
                 // The journal's own attributes are game state: a movie writing one (journal.gfx
-                // clearing a quest's `Updated` as it is read) is passed on to the game.
-                k.starts_with("Journal.").then(|| {
-                    GameMessage::Send(
-                        thedas_sim::journal::MSG_SET_ATTRIBUTE.into(),
-                        vec![k.to_string(), v.to_string()],
-                    )
-                })
+                // clearing a quest's `Updated` as it is read) is passed on to the game, as are
+                // the tactics screen's (tactics.gfx writing a slot's target, condition, command
+                // or switch: the creature's tactics).
+                let to = if k.starts_with("Journal.") {
+                    Some(thedas_sim::journal::MSG_SET_ATTRIBUTE)
+                } else if k.starts_with(thedas_sim::tactics::PREFIX) {
+                    Some(thedas_sim::tactics::MSG_SET_ATTRIBUTE)
+                } else {
+                    None
+                };
+                to.map(|m| GameMessage::Send(m.into(), vec![k.to_string(), v.to_string()]))
             }
             "PlayGUISound" => {
                 s.sounds.push(text);
@@ -837,6 +841,25 @@ mod tests {
                 &["Party.Members"]
             )),
             UiValue::Number(2.0)
+        );
+    }
+
+    #[test]
+    fn the_tactics_attributes_written_by_a_movie_go_to_the_game() {
+        let b = bridge();
+        let fs = CallKind::FsCommand;
+        let key = "GUI.SelectedChar.Tactics.TacticsList.3.Condition";
+        assert_eq!(
+            b.handle(call(fs, "SetValue", &[&format!("{key} 12")])),
+            Some(GameMessage::Send(
+                thedas_sim::tactics::MSG_SET_ATTRIBUTE.into(),
+                vec![key.into(), "12".into()]
+            ))
+        );
+        assert_eq!(b.value(key), Some(UiValue::Number(12.0)));
+        assert_eq!(
+            b.handle(call(fs, "SetValue", &["GUI.SelectedChar.Name x"])),
+            None
         );
     }
 

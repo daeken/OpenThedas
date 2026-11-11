@@ -142,6 +142,9 @@ pub const SET_ITEM_FILTER: &str = "GUIInventory.SetItemListFilter";
 /// Takes the interface's own messages (not simulation input) into `shown`; returns whether
 /// `name` was one.
 pub fn present(shown: &mut Presentation, name: &str, args: &[String]) -> bool {
+    if crate::options::option_message(&mut shown.options, name, args) {
+        return true;
+    }
     match name {
         SET_ITEM_FILTER => {
             shown.item_filter = args
@@ -179,9 +182,12 @@ pub fn handler_for(sim: Arc<Mutex<Sim>>, shown: Arc<Mutex<Presentation>>) -> Mes
         // next line back in the same call. Dismissed notifications are dropped after the
         // frame too: notifications.gfx names its alerts by their place in `Party.Alerts`,
         // and an alert gone mid-frame shifted the list under a click being handled (a quest
-        // alert's click read the codex alert's plot).
+        // alert's click read the codex alert's plot). The tactics screen's messages wait for
+        // the slot edits it wrote just before them (those reach the game after the frame):
+        // binding now would put the old slots back under the movie.
         if name == SELECT_RESPONSE
             || name == thedas_sim::journal::MSG_HIDE_ALERT
+            || name.starts_with(thedas_sim::tactics::PREFIX)
             || !sim.gui_message(name, args)
         {
             return None;
