@@ -427,6 +427,15 @@ pub struct World {
     /// Plot flags by (plot resource, flag).
     #[serde(with = "pairs")]
     pub plots: BTreeMap<(String, i32), bool>,
+    /// Each quest's latest journal entry, by plot GUID (see [`crate::journal`]).
+    #[serde(default)]
+    pub journal: BTreeMap<String, crate::journal::JournalMark>,
+    /// How many journal entries have been made (orders them).
+    #[serde(default)]
+    pub journal_seq: u64,
+    /// The quest the player marked active in the journal (its plot resource).
+    #[serde(default)]
+    pub active_quest: Option<String>,
     pub game_mode: i32,
     /// Cutscenes loaded with `LoadCutscene` that have not played yet, in order. Each starts
     /// once the scripts that loaded it have run (see [`crate::sim::CutscenePolicy`]).
@@ -583,6 +592,9 @@ impl World {
             controlled: None,
             party: None,
             plots: BTreeMap::new(),
+            journal: BTreeMap::new(),
+            journal_seq: 0,
+            active_quest: None,
             game_mode: 0,
             cutscenes: Vec::new(),
             cutscene: None,
