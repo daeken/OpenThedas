@@ -29,6 +29,7 @@ pub enum Screen {
     CharacterRecord,
     Tactics,
     AreaMap,
+    PartyPicker,
 }
 
 impl Screen {
@@ -45,6 +46,7 @@ impl Screen {
             Screen::CharacterRecord => &["characterrecord.gfx"],
             Screen::Tactics => &["tactics.gfx"],
             Screen::AreaMap => &["map.gfx"],
+            Screen::PartyPicker => &["partypicker.gfx"],
         }
     }
 
@@ -65,6 +67,8 @@ pub fn wanted(sim: &Sim, menu: Option<Screen>) -> BTreeSet<Screen> {
         Screen::Cutscene
     } else if thedas_ui::binding::conversation(sim).is_some() {
         Screen::Conversation
+    } else if w.party_picker.is_some() {
+        Screen::PartyPicker
     } else if w.chargen.is_some() {
         Screen::LevelUp
     } else if w.store.is_some() {
@@ -129,6 +133,12 @@ impl Screens {
     /// Whether only the HUD is up: clicks that miss it reach the world.
     pub fn exploring(&self) -> bool {
         self.shown.iter().all(|&s| s == Screen::Hud)
+    }
+
+    /// Whether the party picker is up: the player picks followers by clicking them in the
+    /// world, around the picker's panels.
+    pub fn picking_party(&self) -> bool {
+        self.shown.contains(&Screen::PartyPicker)
     }
 
     /// Notes screens whose movies closed themselves (given which movies are open).

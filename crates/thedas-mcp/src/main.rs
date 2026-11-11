@@ -248,7 +248,11 @@ struct StoreArgs {
 struct ChoosePartyArgs {
     /// Followers (ids or tags) the party picker should take, at most three; empty to let
     /// it keep the current party.
+    #[serde(default)]
     members: Vec<String>,
+    /// Let the picker wait for the player instead (true: partypicker.gfx's messages and
+    /// clicks pick), or decide at once again (false).
+    interactive: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1417,7 +1421,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Choose who the party picker takes (when the game shows it, e.g. leaving camp): up to three followers by id or tag."
+        description = "Choose who the party picker takes (when the game shows it, e.g. leaving camp): up to three followers by id or tag. interactive=true makes the picker wait for the player instead."
     )]
     async fn choose_party(&self, Parameters(a): Parameters<ChoosePartyArgs>) -> String {
         self.with_sim(|st| {
@@ -1429,8 +1433,18 @@ impl Server {
             if ids.len() > 3 {
                 return Err("at most three followers".into());
             }
+            if let Some(on) = a.interactive {
+                sim.party_picker_policy = if on {
+                    thedas_sim::sim::PartyPickerPolicy::Player
+                } else {
+                    thedas_sim::sim::PartyPickerPolicy::Instant
+                };
+            }
             sim.world.party_choice = (!ids.is_empty()).then_some(ids.clone());
-            Ok(json!({ "party_choice": ids }))
+            Ok(json!({
+                "party_choice": ids,
+                "open_picker": sim.world.party_picker.as_ref().map(|p| p.selected.clone()),
+            }))
         })
     }
 

@@ -157,6 +157,28 @@ impl Sim {
             | crate::inventory::MSG_NEXT_CHARACTER
             | crate::inventory::MSG_PREVIOUS_CHARACTER => self.inventory_message(name, args),
             crate::store::MSG_BUY | crate::store::MSG_SELL => self.store_message(name, args),
+            MSG_PICKER_SUBMIT => self.party_picker_submit(),
+            MSG_PICKER_CLEAR => self.party_picker_clear(),
+            MSG_PICKER_UNSELECT => args
+                .first()
+                .and_then(|a| a.trim().parse::<f64>().ok())
+                .filter(|v| v.fract() == 0.0 && *v >= 0.0)
+                .is_some_and(|v| self.party_picker_unselect(v as usize)),
+            // The HUD's party button (portraits.gfx), usable while the scripts allow it
+            // (`SetPartyPickerGUIStatus(PP_GUI_STATUS_USE)`, 2).
+            MSG_PICKER_SHOW => {
+                let status = self
+                    .world
+                    .module
+                    .and_then(|m| self.world.get(m))
+                    .and_then(|m| m.fields.get("PartyPickerGUIStatus").copied())
+                    .unwrap_or(0);
+                if status != 2 || self.world.party_picker.is_some() {
+                    return false;
+                }
+                self.party_picker();
+                true
+            }
             n if n.ends_with(crate::quickbar::MSG_SET_QUICKSLOT) => {
                 self.quickbar_message(name, args)
             }
@@ -164,6 +186,15 @@ impl Sim {
         }
     }
 }
+
+/// partypicker.gfx's Accept.
+pub const MSG_PICKER_SUBMIT: &str = "GameModeController.SubmitPartyChanges";
+/// partypicker.gfx's Remove All.
+pub const MSG_PICKER_CLEAR: &str = "GameModeController.ClearPartyPicker";
+/// partypicker.gfx's portrait click: the portrait's slot (0 the hero).
+pub const MSG_PICKER_UNSELECT: &str = "GameModeController.UnselectPartyMember";
+/// portraits.gfx's party button.
+pub const MSG_PICKER_SHOW: &str = "GameModeController.ShowPartyPicker";
 
 #[cfg(test)]
 mod tests {

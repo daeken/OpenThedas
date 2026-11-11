@@ -120,7 +120,8 @@ struct Args {
     /// 0` (quickbar slots), `key space` (pause), `talk TAG` (the leader talks to a creature),
     /// `reply N` (the conversation's reply N, from 0), `press X,Y` and `release X,Y` (the
     /// left button down and up, for drags), `rebuild` (the objects are rebuilt as a
-    /// spawn rebuilds them, timed), `rclick X,Y` and `dclick X,Y` (a right or double click
+    /// spawn rebuilds them, timed), `picker` (the party picker opens as a script would open
+    /// it), `rclick X,Y` and `dclick X,Y` (a right or double click
     /// for the interface), `hover X,Y` (the mouse rests there, for the aiming reticle).
     #[arg(long, default_value = "")]
     steps: String,
@@ -753,7 +754,7 @@ impl App {
             // draws use too: they are drawn (and submitted) before the frame is encoded, so
             // the frame is not drawn from the portrait camera.
             if self.screens.is_some() {
-                let party = thedas_sim::engine::party_of(&live.sim());
+                let party = live::portrait_subjects(&live.sim());
                 if g.ui.wants_portraits(party, dt) {
                     let shots = live.portraits(&g.ctx, ui::PORTRAIT_SIZE);
                     g.ui.set_portraits(shots);
@@ -1044,6 +1045,12 @@ impl App {
             &Step::Hover(x, y) => {
                 self.cursor_to(x, y);
                 log.push(format!("hover {x},{y}"));
+            }
+            Step::Picker => {
+                if let Some(l) = self.live.as_ref() {
+                    l.sim().party_picker();
+                }
+                log.push("party picker".into());
             }
             &Step::Menu(m) => {
                 self.key_down(match m {
@@ -1438,7 +1445,7 @@ fn quickslot_key(code: KeyCode) -> Option<i32> {
 /// Whether a left click at window pixel (`x`, `y`) goes to the world: only the HUD is up
 /// and it draws nothing there.
 fn world_takes_click(layer: &ui::UiLayer, screens: &screens::Screens, x: f64, y: f64) -> bool {
-    screens.exploring() && !layer.covers(x, y)
+    (screens.exploring() || screens.picking_party()) && !layer.covers(x, y)
 }
 
 /// One step of `--steps`.
@@ -1449,6 +1456,9 @@ enum Step {
     /// I, C, T or M: the player's inventory, character record, tactics or area map opens or
     /// closes.
     Menu(screens::Screen),
+    /// The party picker opens as a script's `ShowPartyPickerGUI` opens it (for trying the
+    /// picker headless).
+    Picker,
     /// The leader is ordered to talk to the first creature with this tag (as a click on it
     /// does, for creatures hard to reach on screen).
     Talk(String),
@@ -1535,6 +1545,7 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
                 }
                 "talk" if !arg.is_empty() => Step::Talk(arg.to_string()),
                 "rebuild" => Step::Rebuild,
+                "picker" => Step::Picker,
                 "hover" => {
                     let (x, y) = arg.split_once(',').context("hover takes x,y")?;
                     Step::Hover(x.trim().parse()?, y.trim().parse()?)
@@ -1755,7 +1766,7 @@ fn main() -> Result<()> {
                                     level.map(|x| x.layout.as_str()),
                                     level.map(|x| &x.vfs),
                                 );
-                                let party = thedas_sim::engine::party_of(&l.sim());
+                                let party = live::portrait_subjects(&l.sim());
                                 if layer.wants_portraits(party, dt) {
                                     let shots = l.portraits(&ctx, ui::PORTRAIT_SIZE);
                                     layer.set_portraits(shots);
@@ -1783,6 +1794,10 @@ fn main() -> Result<()> {
                                 ui_time.as_secs_f64() * 1000.0 / frames.max(1) as f64
                             );
                         }
+                    }
+                    Step::Picker => {
+                        l.sim().party_picker();
+                        println!("party picker");
                     }
                     &Step::Menu(m) => {
                         if let Some((layer, s)) = played.as_mut() {

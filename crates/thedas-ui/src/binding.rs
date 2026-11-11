@@ -415,6 +415,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     set("Area.CreatureCount".into(), num(creatures as f64));
     inventory(sim, controlled.or(hero), shown.item_filter, &mut v);
     store(sim, &mut v);
+    party_picker(sim, shown, &mut v);
     if let Some(who) = controlled.or(hero) {
         tactics(sim, who, &mut v);
     }
@@ -611,6 +612,51 @@ fn store(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
             }
         }
     }
+}
+
+/// The open party picker, as partypicker.gfx reads it: the scripts' picker status
+/// (`Party.PartyPickerGUIStatus`, `SetPartyPickerGUIStatus`), the hero and the followers
+/// picked so far (`PartyPicker.SelectedPartyMember.N.ID`, `.Portrait`: 0 the hero, then up
+/// to three) and those that cannot be left out (`PartyPicker.LockedPartyMembers.N`). The
+/// player picks followers in the world (they stand in camp) and the movie's buttons send
+/// the rest. Provisional: no hover text (`PartyPicker.MouseOverName`) yet.
+fn party_picker(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
+    let status = sim
+        .world
+        .module
+        .and_then(|m| sim.world.get(m))
+        .and_then(|m| m.fields.get("PartyPickerGUIStatus").copied())
+        .unwrap_or(0);
+    v.insert("Party.PartyPickerGUIStatus".into(), num(status));
+    let Some(p) = &sim.world.party_picker else {
+        return;
+    };
+    let members = sim.world.hero.into_iter().chain(p.selected.iter().copied());
+    for i in 0..4 {
+        v.insert(format!("PartyPicker.SelectedPartyMember.{i}"), num(0));
+    }
+    for (i, id) in members.enumerate().take(4) {
+        let k = format!("PartyPicker.SelectedPartyMember.{i}");
+        v.insert(k.clone(), num(id));
+        v.insert(format!("{k}.ID"), num(id));
+        v.insert(format!("{k}.Name"), UiValue::String(name(sim, id)));
+        v.insert(
+            format!("{k}.Portrait"),
+            UiValue::String(shown.portraits.get(&id).cloned().unwrap_or_default()),
+        );
+        v.insert(format!("{k}.PortraitProperties.PortraitTint"), num(0));
+    }
+    for (i, id) in sim.locked_followers().iter().enumerate() {
+        v.insert(format!("PartyPicker.LockedPartyMembers.{i}"), num(*id));
+    }
+    v.insert(
+        "PartyPicker.MouseOverName".into(),
+        UiValue::String(String::new()),
+    );
+    v.insert(
+        "PartyPicker.MouseOverDescription".into(),
+        UiValue::String(String::new()),
+    );
 }
 
 /// The tactics of the party member the player controls, as tactics.gfx reads them
@@ -1052,5 +1098,27 @@ mod tests {
             UiValue::Number(0.0),
             "not in combat"
         );
+    }
+
+    #[test]
+    fn the_open_party_picker_shows_the_hero_and_the_followers_picked() {
+        use thedas_sim::world::ObjectKind;
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        let dog = sim.world.spawn(ObjectKind::Creature, "dog");
+        sim.world.hero = Some(hero);
+        assert!(!sim_values(&sim).contains_key("PartyPicker.SelectedPartyMember.0"));
+        sim.world.party_picker = Some(thedas_sim::world::PartyPicker {
+            selected: vec![dog],
+        });
+        let v = sim_values(&sim);
+        assert_eq!(v["PartyPicker.SelectedPartyMember.0.ID"], num(hero));
+        assert_eq!(v["PartyPicker.SelectedPartyMember.1.ID"], num(dog));
+        assert_eq!(v["PartyPicker.SelectedPartyMember.2"], num(0));
+        assert_eq!(v["Party.PartyPickerGUIStatus"], num(0));
     }
 }

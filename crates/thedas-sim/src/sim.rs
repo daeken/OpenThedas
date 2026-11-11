@@ -86,6 +86,7 @@ pub struct Sim {
     pub script_budget: u64,
     pub chargen_policy: ChargenPolicy,
     pub cutscene_policy: CutscenePolicy,
+    pub party_picker_policy: PartyPickerPolicy,
     /// The player's "auto-pause when combat starts" option (`GetAutoPauseCombatStatus`);
     /// off, as the game's options start.
     pub auto_pause_combat: bool,
@@ -263,6 +264,18 @@ pub enum CutscenePolicy {
     Play,
 }
 
+/// What the simulation does when a script shows the party picker (`ShowPartyPickerGUI`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PartyPickerPolicy {
+    /// Decide at once (headless runs: nobody picks): the choice given beforehand
+    /// ([`crate::world::World::party_choice`]), else the party as it was, filled from the pool.
+    #[default]
+    Instant,
+    /// Wait for the player: [`crate::world::World::party_picker`] holds the members picked so
+    /// far, and [`Sim::party_picker_submit`] applies them.
+    Player,
+}
+
 /// Looks up an integer constant from the engine table (0 if absent).
 /// Movement speed (m/s) for a creature whose appearance gives none. Provisional.
 pub const DEFAULT_SPEED: f32 = 5.0;
@@ -310,6 +323,7 @@ impl Sim {
             script_budget: 5_000_000,
             chargen_policy: ChargenPolicy::default(),
             cutscene_policy: CutscenePolicy::default(),
+            party_picker_policy: PartyPickerPolicy::default(),
             auto_pause_combat: false,
             watch_calls: Default::default(),
             watch_tags: Default::default(),
@@ -830,18 +844,124 @@ impl Sim {
         self.world.queue_event(0, module, ev, None);
     }
 
-    /// `ShowPartyPickerGUI` with no player to pick: the module hears the picker open
-    /// (`EVENT_TYPE_PARTYPICKER_INIT`), the active party keeps its members and free places
-    /// (three followers in all) go to the pool in the order they were recruited, then the
-    /// picker closes (`EVENT_TYPE_PARTYPICKER_CLOSED`). No script sets the chosen members'
-    /// states after the picker, so the engine does, switching their event scripts as
-    /// `WR_SetFollowerState` would. Provisional.
+    /// `ShowPartyPickerGUI`: the module hears the picker open (`EVENT_TYPE_PARTYPICKER_INIT`).
+    /// Under [`PartyPickerPolicy::Player`] the picker then waits for the player, starting from
+    /// the party as it is; otherwise it is decided at once ([`Sim::resolve_party_picker`]).
     pub fn party_picker(&mut self) {
         let (Some(module), Some(hero)) = (self.world.module, self.world.hero) else {
             return;
         };
         let init = self.new_event("PARTYPICKER_INIT", Some(hero));
         self.world.queue_event(0, module, init, None);
+        if self.party_picker_policy == PartyPickerPolicy::Player {
+            let mut selected: Vec<ObjectId> = self
+                .world
+                .get(hero)
+                .map(|h| h.followers.clone())
+                .unwrap_or_default();
+            for l in self.locked_followers() {
+                if !selected.contains(&l) {
+                    selected.push(l);
+                }
+            }
+            self.world.party_picker = Some(crate::world::PartyPicker { selected });
+            return;
+        }
+        self.resolve_party_picker();
+    }
+
+    /// Followers whose state is `FOLLOWER_STATE_LOCKEDACTIVE`: the picker cannot leave
+    /// them out.
+    pub fn locked_followers(&self) -> Vec<ObjectId> {
+        let locked = constant(&self.table, "FOLLOWER_STATE_LOCKEDACTIVE");
+        let mut v: Vec<ObjectId> = self
+            .party_pool()
+            .into_iter()
+            .filter(|&p| {
+                locked != 0
+                    && self
+                        .world
+                        .get(p)
+                        .is_some_and(|o| o.fields.get("FollowerState") == Some(&locked))
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// The player picks or drops a follower in the open picker (clicking them in camp): one
+    /// not picked joins while fewer than three are, one picked leaves unless it is locked.
+    /// Returns whether the pick changed.
+    pub fn party_picker_toggle(&mut self, who: ObjectId) -> bool {
+        let locked = self.locked_followers();
+        let in_pool = self.party_pool().contains(&who) && self.alive(who);
+        let Some(p) = self.world.party_picker.as_mut() else {
+            return false;
+        };
+        if let Some(i) = p.selected.iter().position(|&m| m == who) {
+            if locked.contains(&who) {
+                return false;
+            }
+            p.selected.remove(i);
+            return true;
+        }
+        if !in_pool || p.selected.len() >= 3 {
+            return false;
+        }
+        p.selected.push(who);
+        true
+    }
+
+    /// The picker's portrait `slot` is clicked (partypicker.gfx's
+    /// `GameModeController.UnselectPartyMember`): slot 0 is the hero, 1 to 3 the followers
+    /// picked, in order.
+    pub fn party_picker_unselect(&mut self, slot: usize) -> bool {
+        let who = self
+            .world
+            .party_picker
+            .as_ref()
+            .and_then(|p| slot.checked_sub(1).and_then(|i| p.selected.get(i)).copied());
+        who.is_some_and(|w| self.party_picker_toggle(w))
+    }
+
+    /// partypicker.gfx's Remove All (`GameModeController.ClearPartyPicker`): only the locked
+    /// followers stay picked.
+    pub fn party_picker_clear(&mut self) -> bool {
+        let locked = self.locked_followers();
+        match self.world.party_picker.as_mut() {
+            Some(p) => {
+                p.selected.retain(|m| locked.contains(m));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// partypicker.gfx's Accept (`GameModeController.SubmitPartyChanges`): the picked
+    /// followers become the party, as [`Sim::resolve_party_picker`] applies a choice.
+    pub fn party_picker_submit(&mut self) -> bool {
+        let Some(p) = self.world.party_picker.take() else {
+            return false;
+        };
+        let before = self.world.party_choice.replace(p.selected);
+        self.resolve_party_picker();
+        self.world.party_choice = before;
+        true
+    }
+
+    /// The picker's choice applied, as DAOrigins.exe's `ApplyPartyPickerChanges` handler
+    /// (0x636f50) does: each follower whose place changed is announced to the module
+    /// (`EVENT_TYPE_PARTYMEMBER_ADDED` 66, `_DROPPED` 67, the follower as object 0), then
+    /// `EVENT_TYPE_PARTYPICKER_CLOSED` (71). The choice is
+    /// [`crate::world::World::party_choice`] when one was made, else the party as it was,
+    /// free places (three followers in all) going to the pool in the order they were
+    /// recruited. No script sets the chosen members' states after the picker, so the engine
+    /// does, switching their event scripts as `WR_SetFollowerState` would. Provisional: the
+    /// fill from the pool when nobody picks.
+    pub fn resolve_party_picker(&mut self) {
+        let (Some(module), Some(hero)) = (self.world.module, self.world.hero) else {
+            return;
+        };
         // The player's choice when one was made, else the party as it was, filled up from
         // the pool.
         let mut pool = self.party_pool();
@@ -2890,6 +3010,72 @@ mod tests {
             assert_eq!(script(&s, m), "player_core");
         }
         assert_eq!(script(&s, members[2]), "creature_core", "left in the pool");
+    }
+
+    #[test]
+    fn the_player_picks_the_party_in_an_open_picker() {
+        let ldf = "int FOLLOWER_STATE_ACTIVE = 1;\nint FOLLOWER_STATE_AVAILABLE = 2;\n\
+            int FOLLOWER_STATE_LOCKEDACTIVE = 5;\nint EVENT_TYPE_PARTYMEMBER_ADDED = 66;\n\
+            int EVENT_TYPE_PARTYMEMBER_DROPPED = 67;\nint EVENT_TYPE_PARTYPICKER_CLOSED = 71;\n\
+            int EVENT_TYPE_PARTYPICKER_INIT = 104;\n";
+        let table = Arc::new(thedas_script::EngineTable::parse(ldf.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.party_picker_policy = PartyPickerPolicy::Player;
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        s.world.module = Some(module);
+        s.world.hero = Some(hero);
+        let mut m = Vec::new();
+        for tag in ["alistair", "leliana", "sten", "morrigan", "dog"] {
+            let id = s.world.spawn(ObjectKind::Creature, tag);
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .fields
+                .insert("FollowerState".into(), 2);
+            m.push(id);
+        }
+        // Alistair travels with the party and cannot be left out.
+        s.world
+            .get_mut(m[0])
+            .unwrap()
+            .fields
+            .insert("FollowerState".into(), 5);
+        s.world.get_mut(hero).unwrap().followers = vec![m[0], m[1]];
+        s.party_picker();
+        assert_eq!(
+            s.world.party_picker.as_ref().unwrap().selected,
+            vec![m[0], m[1]]
+        );
+        assert!(!s.party_picker_toggle(m[0]), "locked");
+        assert!(s.party_picker_toggle(m[2]));
+        assert!(!s.party_picker_toggle(m[3]), "three already");
+        // The second portrait drops Leliana; Remove All keeps the locked.
+        assert!(s.gui_message(crate::chanters::MSG_PICKER_UNSELECT, &["2".into()]));
+        assert_eq!(
+            s.world.party_picker.as_ref().unwrap().selected,
+            vec![m[0], m[2]]
+        );
+        assert!(s.gui_message(crate::chanters::MSG_PICKER_CLEAR, &[]));
+        assert_eq!(s.world.party_picker.as_ref().unwrap().selected, vec![m[0]]);
+        assert!(s.party_picker_toggle(m[3]));
+        s.world.queue.clear();
+        assert!(s.gui_message(crate::chanters::MSG_PICKER_SUBMIT, &[]));
+        assert!(s.world.party_picker.is_none());
+        assert_eq!(s.world.get(hero).unwrap().followers, vec![m[0], m[3]]);
+        let events: Vec<(i32, Vec<ObjectId>)> = s
+            .world
+            .queue
+            .values()
+            .filter(|q| q.target == module)
+            .map(|q| (q.event.ty, q.event.objects.clone()))
+            .collect();
+        assert_eq!(
+            events,
+            vec![(67, vec![m[1]]), (66, vec![m[3]]), (71, vec![])]
+        );
+        // Nothing open: the messages do nothing.
+        assert!(!s.gui_message(crate::chanters::MSG_PICKER_SUBMIT, &[]));
     }
     use super::*;
 

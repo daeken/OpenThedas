@@ -321,6 +321,12 @@ pub struct Effect {
     pub engine_vectors: Vec<(i32, [f32; 3])>,
 }
 
+/// The open party picker: the followers picked so far (at most three), in order.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PartyPicker {
+    pub selected: Vec<ObjectId>,
+}
+
 /// A quickbar slot: an ability, and the tag of the item it comes from (a potion), if any.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Quickslot {
@@ -466,6 +472,9 @@ pub struct World {
     /// The followers the player wants when the party picker opens.
     #[serde(default)]
     pub party_choice: Option<Vec<ObjectId>>,
+    /// The party picker waiting for the player (see [`crate::sim::PartyPickerPolicy`]).
+    #[serde(default)]
+    pub party_picker: Option<PartyPicker>,
     /// The plot actions control (`SetPlotActionSet` and friends; see `plotactions.gda`).
     #[serde(default)]
     pub plot_actions: PlotActions,
@@ -586,6 +595,7 @@ impl World {
             chanter_board: None,
             plot_actions: PlotActions::default(),
             party_choice: None,
+            party_picker: None,
             world_map: Default::default(),
             rng: Rng::new(seed),
             trace: Trace::default(),

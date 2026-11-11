@@ -277,6 +277,13 @@ impl UiLayer {
         if changes.dismissed.contains(&Screen::Store) {
             sim.lock().unwrap_or_else(|p| p.into_inner()).close_store();
         }
+        // A picker that closed itself without its Accept keeps the members picked so far.
+        // Provisional: partypicker.gfx has no other way out.
+        if changes.dismissed.contains(&Screen::PartyPicker) {
+            sim.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .party_picker_submit();
+        }
         self.line = match (line, self.line.take()) {
             (Some((key, _)), Some(mut l)) if l.key == key => {
                 l.t += dt_ms;
