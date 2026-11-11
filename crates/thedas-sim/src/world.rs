@@ -299,6 +299,9 @@ pub struct Effect {
     /// scripts), by index.
     #[serde(default)]
     pub engine_ints: Vec<(i32, i32)>,
+    /// The engine data vectors scripts set (`SetEffectEngineVector`), by index.
+    #[serde(default)]
+    pub engine_vectors: Vec<(i32, [f32; 3])>,
 }
 
 /// A quickbar slot: an ability, and the tag of the item it comes from (a potion), if any.
