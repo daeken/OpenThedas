@@ -899,9 +899,13 @@ impl App {
                     log::info!("aiming ability {ability} (click a target)");
                 }
             }
-            KeyCode::KeyI if self.screens.is_some() => {
-                if let Some(s) = self.screens.as_mut() {
-                    s.inventory = !s.inventory;
+            // The player's screens: I the inventory, C the character record, T tactics, M the
+            // area map. Provisional: the game's own key bindings are not traced.
+            KeyCode::KeyI | KeyCode::KeyC | KeyCode::KeyT | KeyCode::KeyM
+                if self.screens.is_some() =>
+            {
+                if let (Some(s), Some(m)) = (self.screens.as_mut(), menu_key(code)) {
+                    s.toggle(m);
                 }
             }
             KeyCode::KeyF if self.live.is_some() => {
@@ -1041,9 +1045,14 @@ impl App {
                 self.cursor_to(x, y);
                 log.push(format!("hover {x},{y}"));
             }
-            Step::Inventory => {
-                self.key_down(KeyCode::KeyI);
-                log.push("inventory".into());
+            &Step::Menu(m) => {
+                self.key_down(match m {
+                    screens::Screen::CharacterRecord => KeyCode::KeyC,
+                    screens::Screen::Tactics => KeyCode::KeyT,
+                    screens::Screen::AreaMap => KeyCode::KeyM,
+                    _ => KeyCode::KeyI,
+                });
+                log.push(format!("{m:?}"));
             }
             &Step::Leader(n) => {
                 let tag = self.live.as_mut().and_then(|l| l.choose_leader(n));
@@ -1437,7 +1446,9 @@ fn world_takes_click(layer: &ui::UiLayer, screens: &screens::Screens, x: f64, y:
 enum Step {
     Click(f64, f64),
     Run(u64),
-    Inventory,
+    /// I, C, T or M: the player's inventory, character record, tactics or area map opens or
+    /// closes.
+    Menu(screens::Screen),
     /// The leader is ordered to talk to the first creature with this tag (as a click on it
     /// does, for creatures hard to reach on screen).
     Talk(String),
@@ -1466,6 +1477,17 @@ enum Step {
     Release(f64, f64),
 }
 
+/// The player's screen a key opens (I, C, T).
+fn menu_key(code: KeyCode) -> Option<screens::Screen> {
+    match code {
+        KeyCode::KeyI => Some(screens::Screen::Inventory),
+        KeyCode::KeyC => Some(screens::Screen::CharacterRecord),
+        KeyCode::KeyT => Some(screens::Screen::Tactics),
+        KeyCode::KeyM => Some(screens::Screen::AreaMap),
+        _ => None,
+    }
+}
+
 fn parse_steps(spec: &str) -> Result<Vec<Step>> {
     spec.split(';')
         .map(str::trim)
@@ -1479,7 +1501,12 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
                     Step::Click(x.trim().parse()?, y.trim().parse()?)
                 }
                 "run" => Step::Run(arg.parse().context("run takes milliseconds")?),
-                "key" if arg.eq_ignore_ascii_case("i") => Step::Inventory,
+                "key" if arg.eq_ignore_ascii_case("i") => Step::Menu(screens::Screen::Inventory),
+                "key" if arg.eq_ignore_ascii_case("c") => {
+                    Step::Menu(screens::Screen::CharacterRecord)
+                }
+                "key" if arg.eq_ignore_ascii_case("t") => Step::Menu(screens::Screen::Tactics),
+                "key" if arg.eq_ignore_ascii_case("m") => Step::Menu(screens::Screen::AreaMap),
                 "key" if matches!(arg.to_ascii_lowercase().as_str(), "f1" | "f2" | "f3" | "f4") => {
                     Step::Leader(arg[1..].parse::<usize>()? - 1)
                 }
@@ -1757,9 +1784,9 @@ fn main() -> Result<()> {
                             );
                         }
                     }
-                    Step::Inventory => {
+                    &Step::Menu(m) => {
                         if let Some((layer, s)) = played.as_mut() {
-                            s.inventory = !s.inventory;
+                            s.toggle(m);
                             if let Some(aim) = layer.play(s, &l.sim, 0.0).pop() {
                                 l.aiming = Some(aim);
                             }
@@ -1894,7 +1921,19 @@ mod tests {
     fn parses_steps() {
         assert_eq!(
             parse_steps("click 10,20.5; run 300 ;key i;").unwrap(),
-            vec![Step::Click(10.0, 20.5), Step::Run(300), Step::Inventory]
+            vec![
+                Step::Click(10.0, 20.5),
+                Step::Run(300),
+                Step::Menu(screens::Screen::Inventory)
+            ]
+        );
+        assert_eq!(
+            parse_steps("key c; key t; key m").unwrap(),
+            vec![
+                Step::Menu(screens::Screen::CharacterRecord),
+                Step::Menu(screens::Screen::Tactics),
+                Step::Menu(screens::Screen::AreaMap)
+            ]
         );
         assert_eq!(
             parse_steps("talk lot110cr_bryant").unwrap(),

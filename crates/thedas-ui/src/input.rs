@@ -12,6 +12,8 @@ use crate::protocol::{GameMessage, MessageHandler};
 
 /// conversation.gfx's reply pick: the reply's index.
 pub const SELECT_RESPONSE: &str = "Conversation.SelectResponse";
+/// characterrecord.gfx's and portraits.gfx's level-up button: the creature and 0.
+pub const GO_TO_LEVEL_UP: &str = "GUI.GoToLevelUp";
 /// quickbar.gfx's slot use: the ability, the party member and the item it comes from.
 pub const PERFORM_ABILITY: &str = "GameModeController.PerformAbility";
 
@@ -89,6 +91,20 @@ pub fn apply(sim: &mut Sim, name: &str, args: &[String]) -> bool {
             return false;
         }
         sim.order_ability(a.caster, a.ability, a.caster, &a.item);
+        return true;
+    }
+    // The level-up button (character record, a portrait's level-up arrow): the creature and
+    // 0. The game asks the module to open level-up for it (`EVENT_TYPE_PLAYERLEVELUP`).
+    if name == GO_TO_LEVEL_UP {
+        let who = args
+            .first()
+            .and_then(|a| a.trim().parse::<f64>().ok())
+            .filter(|v| v.fract() == 0.0 && *v > 0.0 && *v < u32::MAX as f64)
+            .map(|v| v as u32)
+            .filter(|w| thedas_sim::engine::party_of(sim).contains(w));
+        let Some(who) = who else { return false };
+        sim.request_level_up(who);
+        sim.tick(0);
         return true;
     }
     if sim.gui_message(name, args) {
@@ -175,6 +191,38 @@ mod tests {
             Arc::new(thedas_script::EngineTable::default()),
             1,
         )
+    }
+
+    #[test]
+    fn the_level_up_button_asks_the_module_for_a_party_members_level_up() {
+        let table =
+            thedas_script::EngineTable::parse(b"int EVENT_TYPE_PLAYERLEVELUP = 64;\n").unwrap();
+        let mut s = Sim::new(Arc::new(thedas_vfs::Vfs::new()), Arc::new(table), 1);
+        let module = s
+            .world
+            .spawn(thedas_sim::world::ObjectKind::Module, "module");
+        s.world.module = Some(module);
+        let hero = s
+            .world
+            .spawn(thedas_sim::world::ObjectKind::Creature, "hero");
+        let stranger = s
+            .world
+            .spawn(thedas_sim::world::ObjectKind::Creature, "stranger");
+        s.world.hero = Some(hero);
+        s.world.trace.keep = true;
+        assert!(!apply(
+            &mut s,
+            GO_TO_LEVEL_UP,
+            &[stranger.to_string(), "0".into()]
+        ));
+        assert!(apply(
+            &mut s,
+            GO_TO_LEVEL_UP,
+            &[hero.to_string(), "0".into()]
+        ));
+        // The module was told (its chargen script would open the screen).
+        assert!(s.world.trace.entries.iter().any(|e| matches!(e,
+            thedas_sim::trace::TraceEntry::EventQueued { target, ty: 64, .. } if *target == module)));
     }
 
     #[test]

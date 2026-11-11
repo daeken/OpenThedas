@@ -3366,6 +3366,32 @@ pub fn call(
             ok(b(any))
         }
         // Loot bags and achievements have no simulation state.
+        // The bag a creature's loot was left in (DAOrigins.exe 0x65f3d0 reads the creature's
+        // +0x790, which SpawnBodyBag sets, 0x6a9302); OBJECT_INVALID for none or what is
+        // not a creature.
+        "GetCreatureBodyBag" => ok(Value::Object(
+            h.object(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::Creature)
+                .and_then(|o| o.fields.get(crate::inventory::BODY_BAG_FIELD))
+                .map_or(OBJECT_INVALID, |&b| b as ObjectId),
+        )),
+        // DAOrigins.exe (0x65d0c0, 0x67c230) switches the current area's sound objects with
+        // that tag on or off (0x7c2190). Kept as the objects' active flag; there is no
+        // audio yet. Provisional: tags are compared ignoring case.
+        "ActivateSoundByTag" => {
+            let (tag, on) = (string(a, 0), int(a, 1) != 0);
+            let area = h.sim.world.area;
+            for o in h.sim.world.objects.values_mut() {
+                if o.kind == ObjectKind::Sound
+                    && o.area.is_some()
+                    && o.area == area
+                    && o.tag.eq_ignore_ascii_case(&tag)
+                {
+                    o.active = on;
+                }
+            }
+            void()
+        }
         "SpawnBodyBag" => {
             h.sim.spawn_body_bag(obj(a, 0), int(a, 1) != 0);
             void()
@@ -3578,14 +3604,12 @@ pub fn call(
         "GetItemStat" => ok(Value::Float(h.sim.item_stat(obj(a, 0), int(a, 1)))),
         // DAOrigins.exe (0x665570, 0x7556d0) adds up the power of every one of the item's
         // properties with that id, then, with bIncludeSubItems, its sub-items' (runes) the
-        // same way; 0 for what is not an item. Provisional: the properties are the
-        // template's (properties added in play are not kept) and items hold no sub-items.
+        // same way; 0 for what is not an item. Provisional: items hold no sub-items.
         "GetItemPropertyPower" => {
             let (item, p) = (obj(a, 0), int(a, 1));
             let power = if h.object(item).is_some_and(|o| o.kind == ObjectKind::Item) {
                 h.sim
-                    .item_look(item)
-                    .properties
+                    .item_properties(item)
                     .iter()
                     .filter(|(id, _)| *id == p)
                     .map(|(_, power)| *power)
@@ -3594,6 +3618,31 @@ pub fn call(
                 0
             };
             ok(Value::Int(power))
+        }
+        // The item's property ids, in order (DAOrigins.exe 0x674260). Provisional: the
+        // order and, with bIncludeSubItems, sub-items' (items hold none yet).
+        "GetItemProperties" => ok(Value::Array {
+            elem: Type::Int,
+            items: if h
+                .object(obj(a, 0))
+                .is_some_and(|o| o.kind == ObjectKind::Item)
+            {
+                h.sim
+                    .item_properties(obj(a, 0))
+                    .into_iter()
+                    .map(|(id, _)| Value::Int(id))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        }),
+        "AddItemProperty" => {
+            h.sim.add_item_property(obj(a, 0), int(a, 1), int(a, 2));
+            void()
+        }
+        "RemoveItemProperty" => {
+            h.sim.remove_item_property(obj(a, 0), int(a, 1));
+            void()
         }
 
         "GetItemStackSize" => ok(Value::Int(
@@ -5520,7 +5569,12 @@ mod coverage_tests {
         resource GetCurrentScriptResource() = 97;\n\
         void SetItemIndestructible(object o, int b) = 98;\n\
         void LogStoryEvent(int n) = 99;\n\
-        int CreatePool(resource r, int n) = 100;\n";
+        int CreatePool(resource r, int n) = 100;\n\
+        object GetCreatureBodyBag(object o) = 101;\n\
+        void ActivateSoundByTag(string s, int b) = 102;\n\
+        void AddItemProperty(object o, int p, int n) = 103;\n\
+        void RemoveItemProperty(object o, int p) = 104;\n\
+        int[] GetItemProperties(object o, int s = FALSE) = 105;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -6193,5 +6247,103 @@ mod coverage_tests {
             Some(Value::Int(1))
         );
         assert!(s.world.trace.stubbed.is_empty());
+    }
+
+    #[test]
+    fn a_creature_remembers_its_body_bag_and_uses_it_again() {
+        let mut s = sim();
+        let foe = s.world.spawn(ObjectKind::Creature, "foe");
+        let chest = s.world.spawn(ObjectKind::Placeable, "chest");
+        let bag_of =
+            |s: &mut Sim, o: ObjectId| run(s, 1, "GetCreatureBodyBag", &[Value::Object(o)]);
+        assert_eq!(bag_of(&mut s, foe), Some(Value::Object(OBJECT_INVALID)));
+        s.world.get_mut(foe).unwrap().money = 12;
+        let bag = s.spawn_body_bag(foe, false).unwrap();
+        assert_eq!(bag_of(&mut s, foe), Some(Value::Object(bag)));
+        assert_eq!(bag_of(&mut s, chest), Some(Value::Object(OBJECT_INVALID)));
+        // Later loot goes into the same bag, which moves to the creature.
+        s.world.get_mut(foe).unwrap().money = 5;
+        s.world.get_mut(foe).unwrap().position = [3.0, 4.0, 0.0];
+        assert_eq!(s.spawn_body_bag(foe, false), Some(bag));
+        let b = s.world.get(bag).unwrap();
+        assert_eq!((b.money, b.position), (17, [3.0, 4.0, 0.0]));
+    }
+
+    #[test]
+    fn sounds_are_switched_by_tag_in_the_current_area() {
+        let mut s = sim();
+        let here = s.world.spawn(ObjectKind::Area, "here");
+        let there = s.world.spawn(ObjectKind::Area, "there");
+        s.world.area = Some(here);
+        let sound = |s: &mut Sim, area: ObjectId, tag: &str| {
+            let o = s.world.spawn(ObjectKind::Sound, tag);
+            s.world.get_mut(o).unwrap().area = Some(area);
+            o
+        };
+        let bells = sound(&mut s, here, "snd_bells");
+        let other = sound(&mut s, here, "snd_wind");
+        let far = sound(&mut s, there, "snd_bells");
+        run(
+            &mut s,
+            1,
+            "ActivateSoundByTag",
+            &[Value::String("snd_bells".into()), Value::Int(0)],
+        );
+        let active = |s: &Sim, o: ObjectId| s.world.get(o).unwrap().active;
+        assert!(!active(&s, bells) && active(&s, other) && active(&s, far));
+        run(
+            &mut s,
+            1,
+            "ActivateSoundByTag",
+            &[Value::String("SND_BELLS".into()), Value::Int(1)],
+        );
+        assert!(active(&s, bells));
+    }
+
+    #[test]
+    fn item_properties_added_in_play_are_the_items_own() {
+        let mut s = sim();
+        let ring = s.world.spawn(ObjectKind::Item, "ring");
+        s.world.get_mut(ring).unwrap().template = "gen_im_ring".into();
+        s.set_item_look(
+            "gen_im_ring",
+            crate::sim::ItemLook {
+                properties: vec![(1005, 2)],
+                ..Default::default()
+            },
+        );
+        let props = |s: &mut Sim| run(s, 1, "GetItemProperties", &[Value::Object(ring)]);
+        let ints = |v: &[i32]| {
+            Some(Value::Array {
+                elem: Type::Int,
+                items: v.iter().map(|&x| Value::Int(x)).collect(),
+            })
+        };
+        let add = |s: &mut Sim, p: i32, n: i32| {
+            run(
+                s,
+                1,
+                "AddItemProperty",
+                &[Value::Object(ring), Value::Int(p), Value::Int(n)],
+            );
+        };
+        add(&mut s, 10018, 3);
+        // Already there, or a power or property below 1: nothing.
+        add(&mut s, 1005, 9);
+        add(&mut s, 7, 0);
+        add(&mut s, 0, 4);
+        assert_eq!(props(&mut s), ints(&[1005, 10018]));
+        assert_eq!(s.item_properties(ring), vec![(1005, 2), (10018, 3)]);
+        run(
+            &mut s,
+            1,
+            "RemoveItemProperty",
+            &[Value::Object(ring), Value::Int(1005)],
+        );
+        assert_eq!(props(&mut s), ints(&[10018]));
+        // The template's list is untouched for other rings.
+        let other = s.world.spawn(ObjectKind::Item, "ring2");
+        s.world.get_mut(other).unwrap().template = "gen_im_ring".into();
+        assert_eq!(s.item_properties(other), vec![(1005, 2)]);
     }
 }

@@ -30,6 +30,10 @@ const ITEMPRPS_WORN: i64 = 1;
 /// `Int0` of a property that modifies every attribute (`Increase All Attributes`).
 const ALL_ATTRIBUTES: i32 = -1000;
 
+/// The creature field keeping the body bag it left (`GetCreatureBodyBag`; the creature's
+/// +0x790 in DAOrigins.exe).
+pub const BODY_BAG_FIELD: &str = "BodyBag";
+
 /// `BITM_base.gda`'s `Money - Copper`.
 const BASE_ITEM_COPPER: i32 = 17;
 impl Sim {
@@ -40,8 +44,95 @@ impl Sim {
     /// are read from the table's contents, not traced in the executable; on-hit
     /// properties and restrictions are not applied here.
     pub fn property_effects(&self, item: ObjectId) -> Vec<crate::world::Effect> {
+        self.effects_of_properties(item, &self.item_properties(item))
+    }
+
+    /// An item's properties (`itemprps.gda` row and power), in order: its own list once a
+    /// script has changed it, else its template's.
+    pub fn item_properties(&self, item: ObjectId) -> Vec<(i32, i32)> {
+        match self.world.get(item).and_then(|o| o.item_properties.clone()) {
+            Some(p) => p,
+            None => self.item_look(item).properties,
+        }
+    }
+
+    /// The creature wearing `item` in its active equipment, if one does.
+    fn worn_by(&self, item: ObjectId) -> Option<ObjectId> {
+        let mut who: Vec<ObjectId> = self
+            .world
+            .objects
+            .values()
+            .filter(|o| o.equipment.values().any(|&e| e == item))
+            .map(|o| o.id)
+            .collect();
+        who.sort_unstable();
+        who.first().copied()
+    }
+
+    /// `AddItemProperty`: DAOrigins.exe (0x665290, 0x756800) adds the property with its
+    /// power when both are above 0 and the item does not have it yet; worn, the item's new
+    /// property takes effect on its wearer (0x6ac9a0, 0x759190). Returns whether it was
+    /// added.
+    pub fn add_item_property(&mut self, item: ObjectId, property: i32, power: i32) -> bool {
+        if property <= 0
+            || power <= 0
+            || !self
+                .world
+                .get(item)
+                .is_some_and(|o| o.kind == ObjectKind::Item)
+        {
+            return false;
+        }
+        let mut props = self.item_properties(item);
+        if props.iter().any(|&(id, _)| id == property) {
+            return false;
+        }
+        props.push((property, power));
+        if let Some(o) = self.world.get_mut(item) {
+            o.item_properties = Some(props);
+        }
+        if let Some(who) = self.worn_by(item) {
+            for e in self.effects_of_properties(item, &[(property, power)]) {
+                self.apply_effect(who, e);
+            }
+        }
+        true
+    }
+
+    /// `RemoveItemProperty`: DAOrigins.exe (0x665370, 0x7562e0) takes the first entry with
+    /// that property off the item; worn, the effect it gave its wearer goes too (0x6b3540).
+    /// Returns whether it had one.
+    pub fn remove_item_property(&mut self, item: ObjectId, property: i32) -> bool {
+        let mut props = self.item_properties(item);
+        let Some(i) = props.iter().position(|&(id, _)| id == property) else {
+            return false;
+        };
+        let gone = props.remove(i);
+        if let Some(o) = self.world.get_mut(item) {
+            o.item_properties = Some(props);
+        }
+        if let Some(who) = self.worn_by(item) {
+            for e in self.effects_of_properties(item, &[gone]) {
+                let held = self
+                    .world
+                    .get(who)
+                    .and_then(|o| o.effects.iter().find(|x| **x == e).cloned());
+                if let Some(held) = held {
+                    self.remove_effect(who, &held);
+                }
+            }
+        }
+        true
+    }
+
+    /// The effects the worn-kind properties `props` of `item` put on its wearer.
+    fn effects_of_properties(
+        &self,
+        item: ObjectId,
+        props: &[(i32, i32)],
+    ) -> Vec<crate::world::Effect> {
         use thedas_formats::gda::Cell;
-        let props = self.item_look(item).properties;
+        let props = props.to_vec();
         if props.is_empty() {
             return Vec::new();
         }
@@ -669,6 +760,13 @@ impl Sim {
     /// inventory; here the money moves into the bag, as the items do.
     pub fn spawn_body_bag(&mut self, creature: ObjectId, force: bool) -> Option<ObjectId> {
         let c = self.world.get(creature)?;
+        // A bag the creature already left is used again, moved to where it is now
+        // (DAOrigins.exe 0x6a92b9-0x6a931e).
+        let old_bag = c
+            .fields
+            .get(BODY_BAG_FIELD)
+            .map(|&b| b as ObjectId)
+            .filter(|&b| self.world.get(b).is_some());
         let (pos, area) = (c.position, c.area);
         let items: Vec<ObjectId> = c
             .inventory
@@ -683,18 +781,22 @@ impl Sim {
             })
             .collect();
         let money = c.money.max(0);
-        if items.is_empty() && money == 0 {
+        if items.is_empty() && money == 0 && old_bag.is_none() {
             return None;
         }
-        let bag = self.world.spawn(ObjectKind::Placeable, "gen_ip_bodybag");
+        let bag = match old_bag {
+            Some(b) => b,
+            None => self.world.spawn(ObjectKind::Placeable, "gen_ip_bodybag"),
+        };
         if let Some(b) = self.world.get_mut(bag) {
             b.position = pos;
             b.area = area;
             b.template = "gen_ip_bodybag".into();
-            b.inventory = items.clone();
-            b.money = money;
+            b.inventory.extend(items.iter().copied());
+            b.money = b.money.saturating_add(money);
         }
         if let Some(c) = self.world.get_mut(creature) {
+            c.fields.insert(BODY_BAG_FIELD.into(), bag as i32);
             c.money -= money;
             c.inventory.retain(|i| !items.contains(i));
             c.equipment.retain(|_, i| !items.contains(i));
@@ -853,6 +955,12 @@ mod screen_tests {
                 .collect()
         };
         assert_eq!(events(&s), vec![(11, vec![amulet], vec![11, 0])]);
+        // Changing a worn item's properties changes what it gives its wearer.
+        assert!(s.remove_item_property(amulet, 1005));
+        assert!(s.world.get(hero).unwrap().effects.is_empty());
+        assert!(s.add_item_property(amulet, 1005, 3));
+        let worn = &s.world.get(hero).unwrap().effects;
+        assert_eq!((worn.len(), worn[0].floats[0]), (1, 3.0));
         assert!(s.unequip_item(hero, amulet));
         assert!(s.world.get(hero).unwrap().effects.is_empty());
         assert_eq!(events(&s)[1], (12, vec![amulet], vec![11, 0]));
