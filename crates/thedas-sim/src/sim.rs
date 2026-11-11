@@ -3299,6 +3299,38 @@ mod tests {
     }
 
     #[test]
+    fn a_command_failing_as_it_starts_is_reported_an_update_later() {
+        let mut s = sim();
+        let c = s.world.spawn(ObjectKind::Creature, "follower");
+        s.world.get_mut(c).unwrap().script = Some("counter".into());
+        s.world.get_mut(c).unwrap().commands.push(Command {
+            ty: 1,
+            name: "CommandAttack".into(),
+            target: None,
+            location: None,
+            seconds: 0.0,
+            ints: Vec::new(),
+            strings: Vec::new(),
+            due: None,
+            from: None,
+            approach: None,
+            ring_wait: false,
+            path: Vec::new(),
+        });
+        let t0 = s.world.time_ms;
+        s.fail_front_command(c, "COMMAND_FAILED_PATH_ACTION_REQUIRED");
+        assert!(s.world.get(c).unwrap().commands.is_empty());
+        // Nothing hears it at the same instant (a script queueing the command again would
+        // fail it again there forever); the owner hears it one update on.
+        let due: Vec<u64> = s.world.queue.keys().map(|k| k.0).collect();
+        assert_eq!(due, vec![t0 + APPROACH_CHECK_MS]);
+        s.tick(APPROACH_CHECK_MS - 1);
+        assert_eq!(s.world.get(c).unwrap().locals.ints.get("n"), None);
+        s.tick(1);
+        assert_eq!(s.world.get(c).unwrap().locals.ints.get("n"), Some(&1));
+    }
+
+    #[test]
     fn a_loaded_cutscene_ends_and_sets_its_plot_flag() {
         let mut s = sim();
         let m = with_module(&mut s);
