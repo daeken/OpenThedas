@@ -434,6 +434,41 @@ mod tests {
     }
 
     #[test]
+    fn personal_range_abilities_walk_into_melee_reach_of_a_creature() {
+        let mut s = ranged_sim();
+        s.world.trace.keep = true;
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let warrior = s.world.spawn(ObjectKind::Creature, "warrior");
+        let archer = s.world.spawn(ObjectKind::Creature, "archer");
+        for (id, x) in [(warrior, 0.0), (archer, 20.0)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = [x, 0.0, 0.0];
+        }
+        let casts = |s: &Sim| {
+            s.world
+                .trace
+                .entries
+                .iter()
+                .filter(|e| {
+                    matches!(e, crate::trace::TraceEntry::Log { text, .. }
+                        if text.starts_with("ABILITY_CAST_START"))
+                })
+                .count()
+        };
+        // 3024 has personal range (row 0): 20 m off, the bash is not cast from there; the
+        // warrior walks until the archer is within the radii and 1.2 m (2.0 m for two
+        // default bodies), then casts.
+        s.order_ability(warrior, 3024, archer, "");
+        s.tick(1);
+        assert_eq!(casts(&s), 0);
+        s.tick(10_000);
+        let o = s.world.get(warrior).unwrap();
+        assert!((o.position[0] - 18.0).abs() < 0.01, "{:?}", o.position);
+        assert_eq!(casts(&s), 1);
+    }
+
+    #[test]
     fn abilities_on_a_creature_walk_into_range_of_its_body() {
         let mut s = ranged_sim();
         let area = s.world.spawn(ObjectKind::Area, "a");
@@ -453,9 +488,10 @@ mod tests {
         let reach = 25.0 + crate::combat::DEFAULT_RADIUS;
         let x = s.world.get(mage).unwrap().position[0];
         assert!((x - (40.0 - reach)).abs() < 0.01, "{x}");
-        // An ability with no range is used where its user stands.
+        // An ability with no range used on oneself is used where its user stands (on
+        // another creature it walks into melee reach: see the next test).
         s.world.get_mut(mage).unwrap().position = [0.0; 3];
-        s.order_ability(mage, 3024, friend, "");
+        s.order_ability(mage, 3024, mage, "");
         s.tick(5_000);
         assert_eq!(s.world.get(mage).unwrap().position, [0.0, 0.0, 0.0]);
     }
