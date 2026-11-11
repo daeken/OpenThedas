@@ -10,7 +10,9 @@
 //!   steps taking that long in the game's own frames.
 //! - `screenshot`: the frame as the player sees it, read back from the window as it is
 //!   presented (`"presented": true`; drawn again offscreen where the window's surface cannot
-//!   be read), a PNG in base64 under `"png"`. `"scale": k` makes it `k` times smaller.
+//!   be read, and `"presented": false` while the window has no frame to present, e.g.
+//!   hidden or occluded), a PNG in base64 under `"png"`. `"scale": k` makes it `k` times
+//!   smaller. The game keeps running while nothing is presented.
 //! - `state`: the simulation's save (the JSON `thedas-mcp`'s `save_state` writes) under
 //!   `"save"`, as a string.
 //!

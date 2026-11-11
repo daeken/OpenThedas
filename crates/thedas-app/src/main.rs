@@ -446,6 +446,66 @@ struct App {
     frame_requests: Vec<(std::sync::mpsc::Sender<J>, u32)>,
 }
 
+/// What the window's surface gave a redraw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurfaceState {
+    /// A frame to draw into and present.
+    Ready,
+    /// The surface must be configured again (outdated or lost); no frame this time.
+    Stale,
+    /// No frame for now (timed out or occluded: the window hidden, the display asleep).
+    Unavailable,
+}
+
+/// A redraw's work for a surface state: the game always runs (the simulation, the clients'
+/// requests and the interface tick whether or not anything is drawn, so a hidden window
+/// neither freezes the game nor leaves a client waiting); only drawing needs a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FramePlan {
+    /// The frame is drawn and presented (and waiting clients read it back).
+    draw: bool,
+    /// The surface is configured again first.
+    reconfigure: bool,
+    /// Clients waiting for a presented frame get one drawn offscreen instead.
+    offscreen_frames: bool,
+}
+
+fn frame_plan(surface: SurfaceState, frames_waiting: bool) -> FramePlan {
+    let draw = surface == SurfaceState::Ready;
+    FramePlan {
+        draw,
+        reconfigure: surface == SurfaceState::Stale,
+        offscreen_frames: !draw && frames_waiting,
+    }
+}
+
+/// The interface's frame: the screens shown over a game (and the aims they start), or the
+/// movies alone.
+fn play_interface(
+    ui: &mut ui::UiLayer,
+    screens: Option<&mut screens::Screens>,
+    live: Option<&mut live::Live>,
+    camera: &Camera,
+    dt: f64,
+) {
+    match (screens, live) {
+        (Some(screens), Some(live)) => {
+            let level = live.level.as_ref();
+            ui.set_level(level.map(|l| l.layout.as_str()), level.map(|l| &l.vfs));
+            for aim in ui.play(screens, &live.sim, dt.min(100.0)) {
+                log::info!("aiming ability {} (click a target)", aim.ability);
+                live.aiming = Some(aim);
+            }
+            ui.update_minimap(&live.sim, camera);
+        }
+        _ => {
+            for call in ui.tick(dt.min(100.0)) {
+                log::debug!("ui call: {call:?}");
+            }
+        }
+    }
+}
+
 /// A presented frame being copied out: the buffer and its size and row pitch.
 struct FrameReadback {
     buffer: wgpu::Buffer,
@@ -724,14 +784,28 @@ impl App {
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
         };
-        let frame = match g.surface.get_current_texture() {
+        let (frame, surface) = match g.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => (Some(f), SurfaceState::Ready),
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                g.surface.configure(&g.ctx.device, &g.config);
-                return Ok(());
+                (None, SurfaceState::Stale)
             }
-            _ => return Ok(()),
+            _ => (None, SurfaceState::Unavailable),
+        };
+        let plan = frame_plan(surface, !self.frame_requests.is_empty());
+        if plan.reconfigure {
+            g.surface.configure(&g.ctx.device, &g.config);
+        }
+        debug_assert_eq!(plan.draw, frame.is_some());
+        // No frame to draw into (the window hidden or occluded, the display asleep, a
+        // resize): the game runs on all the same, only nothing is drawn, and clients waiting
+        // for a presented frame get one drawn offscreen instead.
+        let Some(frame) = frame else {
+            self.tick_unpresented(dt)?;
+            if plan.offscreen_frames {
+                self.answer_frames_offscreen();
+            }
+            return Ok(());
         };
         let view = frame
             .texture
@@ -798,22 +872,13 @@ impl App {
                 });
             }
         }
-        match (self.screens.as_mut(), self.live.as_mut()) {
-            (Some(screens), Some(live)) => {
-                let level = live.level.as_ref();
-                g.ui.set_level(level.map(|l| l.layout.as_str()), level.map(|l| &l.vfs));
-                for aim in g.ui.play(screens, &live.sim, dt.min(100.0)) {
-                    log::info!("aiming ability {} (click a target)", aim.ability);
-                    live.aiming = Some(aim);
-                }
-                g.ui.update_minimap(&live.sim, &self.camera);
-            }
-            _ => {
-                for call in g.ui.tick(dt.min(100.0)) {
-                    log::debug!("ui call: {call:?}");
-                }
-            }
-        }
+        play_interface(
+            &mut g.ui,
+            self.screens.as_mut(),
+            self.live.as_mut(),
+            &self.camera,
+            dt,
+        );
         // An ability aimed at a place shows where it would land, under the interface.
         if let Some(live) = self.live.as_mut() {
             let lines = live.reticle(&self.camera, size, self.cursor);
@@ -836,6 +901,53 @@ impl App {
         g.window.pre_present_notify();
         g.ctx.queue.present(frame);
         Ok(())
+    }
+
+    /// A frame with nothing to draw into: the simulation, its presentation and the interface
+    /// run as on a drawn frame (see [`App::redraw`]); the drawing alone is skipped.
+    fn tick_unpresented(&mut self, dt: f64) -> Result<()> {
+        let Some(g) = self.gfx.as_mut() else {
+            return Ok(());
+        };
+        let stopped = self.screens.as_ref().is_some_and(|s| s.world_stopped());
+        if let Some(live) = self.live.as_mut() {
+            if !stopped {
+                live.step(dt);
+            }
+            live.advance_presentation(dt);
+            live.sync(&g.ctx, g.config.format)?;
+        }
+        if self.live.is_none() {
+            if let Some(r) = g.renderer.as_mut() {
+                r.advance_time(dt / 1000.0);
+            }
+        }
+        play_interface(
+            &mut g.ui,
+            self.screens.as_mut(),
+            self.live.as_mut(),
+            &self.camera,
+            dt,
+        );
+        Ok(())
+    }
+
+    /// Answers the clients waiting for a presented frame with one drawn offscreen (marked
+    /// `"presented": false`), when the window has no frame to present.
+    fn answer_frames_offscreen(&mut self) {
+        let frame = self.screenshot_rgba();
+        for (reply, scale) in std::mem::take(&mut self.frame_requests) {
+            let answer = match &frame {
+                Ok(f) => frame_reply(f, scale)
+                    .map(|mut j| {
+                        j["presented"] = json!(false);
+                        j
+                    })
+                    .unwrap_or_else(control::failure),
+                Err(e) => control::failure(e),
+            };
+            let _ = reply.send(answer);
+        }
     }
 
     fn save_capture(&mut self) -> Result<()> {
@@ -1243,6 +1355,21 @@ impl App {
 
     /// The frame as the player sees it (world, reticle, interface), as a base64 PNG.
     fn screenshot(&mut self) -> Result<J> {
+        let frame = self.screenshot_rgba()?;
+        let (w, h) = (frame.width, frame.height);
+        let png = thedas_ui::stage::encode_png(&frame).context("encoding the screenshot")?;
+        use base64::Engine as _;
+        Ok(json!({
+            "ok": true,
+            "width": w,
+            "height": h,
+            "png": base64::engine::general_purpose::STANDARD.encode(png),
+        }))
+    }
+
+    /// The frame as the player would see it, drawn offscreen: the world, the aiming reticle
+    /// and the interface.
+    fn screenshot_rgba(&mut self) -> Result<thedas_ui::Rgba> {
         let g = self.gfx.as_mut().context("the window is not up yet")?;
         let (w, h) = (g.config.width, g.config.height);
         let mut reticle = Vec::new();
@@ -1261,14 +1388,7 @@ impl App {
         };
         reticle::draw_rgba(&mut frame.pixels, (w, h), &reticle);
         g.ui.capture_over(&mut frame)?;
-        let png = thedas_ui::stage::encode_png(&frame).context("encoding the screenshot")?;
-        use base64::Engine as _;
-        Ok(json!({
-            "ok": true,
-            "width": w,
-            "height": h,
-            "png": base64::engine::general_purpose::STANDARD.encode(png),
-        }))
+        Ok(frame)
     }
 
     fn fail(&mut self, event_loop: &ActiveEventLoop, e: anyhow::Error) {
@@ -1902,6 +2022,21 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_frame_without_a_surface_still_runs_the_game() {
+        // Drawn and presented only with a frame; never reconfigured unless stale.
+        let ready = frame_plan(SurfaceState::Ready, true);
+        assert!(ready.draw && !ready.reconfigure && !ready.offscreen_frames);
+        for s in [SurfaceState::Stale, SurfaceState::Unavailable] {
+            let p = frame_plan(s, false);
+            assert!(!p.draw && !p.offscreen_frames);
+            // A client waiting for a frame is answered offscreen rather than left waiting.
+            assert!(frame_plan(s, true).offscreen_frames);
+        }
+        assert!(frame_plan(SurfaceState::Stale, false).reconfigure);
+        assert!(!frame_plan(SurfaceState::Unavailable, false).reconfigure);
+    }
+
     use super::*;
 
     #[test]
