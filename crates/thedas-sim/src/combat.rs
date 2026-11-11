@@ -689,7 +689,8 @@ impl Sim {
 
     /// Fills a creature's tactics slots from a preset: the preset's row in
     /// `tacticsuserpresets.gda` names an M2DA table (`TacticsTable`, e.g. 2001 for Tank) whose
-    /// rows are the slots in order (target type, condition, command, parameter). Provisional.
+    /// rows are the slots in order (target type, condition, command, parameter), numbered from
+    /// 1 as the scripts number them (slot 0 is unused). Provisional.
     pub fn apply_tactic_preset(&mut self, id: ObjectId, preset: i32) -> bool {
         let tables = self.world.tables.clone();
         let Some(presets) = tables.get(0, "tacticsuserpresets") else {
@@ -708,21 +709,21 @@ impl Sim {
         };
         // The parameter column's name is not known; it is the fifth column.
         let param_hash = t.columns.iter().find(|(_, i)| **i == 4).map(|(h, _)| *h);
-        let slots: Vec<Tactic> = t
-            .order
-            .iter()
-            .map(|&row| Tactic {
-                enabled: true,
-                target: int(row, "TargetType"),
-                condition: int(row, "Condition"),
-                command: int(row, "Command"),
-                param: param_hash
-                    .and_then(|h| t.cell_by_hash(h, row))
-                    .map_or(0, |c| match c {
-                        thedas_formats::gda::Cell::Int(v) => *v as i32,
-                        _ => 0,
-                    }),
-            })
+        let slots: Vec<Tactic> = std::iter::once(Tactic::default())
+            .chain(t.order.iter().map(|&row| {
+                Tactic {
+                    enabled: true,
+                    target: int(row, "TargetType"),
+                    condition: int(row, "Condition"),
+                    command: int(row, "Command"),
+                    param: param_hash
+                        .and_then(|h| t.cell_by_hash(h, row))
+                        .map_or(0, |c| match c {
+                            thedas_formats::gda::Cell::Int(v) => *v as i32,
+                            _ => 0,
+                        }),
+                }
+            }))
             .collect();
         match self.world.get_mut(id) {
             Some(o) => {
