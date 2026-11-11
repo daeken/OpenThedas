@@ -181,6 +181,10 @@ pub struct Object {
     /// Integer fields of the template and instance (`Package`, `Race`, `Combatant`, ...),
     /// for engine functions that read them.
     pub fields: BTreeMap<String, i32>,
+    /// String fields of the template and instance that engine functions read (a lock's
+    /// `KeyName`).
+    #[serde(default)]
+    pub text_fields: BTreeMap<String, String>,
 }
 
 impl Object {
@@ -227,6 +231,7 @@ impl Object {
             equipment: BTreeMap::new(),
             other_set: BTreeMap::new(),
             fields: BTreeMap::new(),
+            text_fields: BTreeMap::new(),
         }
     }
 }
