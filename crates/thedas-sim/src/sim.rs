@@ -1655,7 +1655,11 @@ impl Sim {
         }) else {
             return;
         };
-        if let (Some(t), true) = (cmd.target, cmd.name.starts_with("CommandMoveToObject")) {
+        // A move or jump to an object ends where the object stands (the Fade's mouse holes
+        // jump the hero to a waypoint this way). Provisional: the jumper keeps its facing.
+        let to_object =
+            cmd.name.starts_with("CommandMoveToObject") || cmd.name == "CommandJumpToObject";
+        if let (Some(t), true) = (cmd.target, to_object) {
             if let Some(p) = self.world.get(t).map(|o| (o.position, o.area)) {
                 if let Some(obj) = self.world.get_mut(id) {
                     obj.position = p.0;
@@ -3003,6 +3007,37 @@ mod tests {
         s.tick(1);
         assert!(s.world.get(id).unwrap().commands.is_empty());
         assert_eq!(s.world.time_ms, 2500);
+    }
+
+    #[test]
+    fn a_jump_to_an_object_lands_on_it() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let id = s.world.spawn(ObjectKind::Creature, "c");
+        let wp = s.world.spawn(ObjectKind::Waypoint, "wp");
+        s.world.get_mut(id).unwrap().area = Some(area);
+        let w = s.world.get_mut(wp).unwrap();
+        w.area = Some(area);
+        w.position = [80.0, 120.0, 29.5];
+        s.world.get_mut(id).unwrap().commands.push(Command {
+            ty: 0,
+            name: "CommandJumpToObject".into(),
+            target: Some(wp),
+            location: None,
+            seconds: 0.0,
+            ints: Vec::new(),
+            strings: Vec::new(),
+            due: None,
+            from: None,
+            approach: None,
+            ring_wait: false,
+            path: Vec::new(),
+        });
+        s.tick(1);
+        let o = s.world.get(id).unwrap();
+        assert!(o.commands.is_empty());
+        assert_eq!(o.position, [80.0, 120.0, 29.5]);
+        assert_eq!(o.area, Some(area));
     }
 
     #[test]
