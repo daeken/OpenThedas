@@ -293,6 +293,13 @@ pub struct Command {
     /// the destination (empty: a straight line). See `Sim::route_to`.
     #[serde(default)]
     pub path: Vec<[f32; 3]>,
+    /// For an ability whose impact comes before the end of its animation (see
+    /// `Sim::ability_timing`): what is left of the command once the impact is due.
+    #[serde(default)]
+    pub after_impact_ms: Option<u64>,
+    /// The ability's impact has been dealt; the command runs on to its end.
+    #[serde(default)]
+    pub impacted: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

@@ -1985,6 +1985,8 @@ pub fn call(
                 from: None,
                 approach: None,
                 ring_wait: false,
+                after_impact_ms: None,
+                impacted: false,
                 path: Vec::new(),
             };
             for (p, v) in f.params.iter().zip(a) {
@@ -5180,6 +5182,8 @@ mod tests {
                 from: None,
                 approach: None,
                 ring_wait: false,
+                after_impact_ms: None,
+                impacted: false,
                 path: vec![],
             });
         assert_eq!(
