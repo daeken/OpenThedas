@@ -556,14 +556,49 @@ impl Sim {
             .then_some(name)
     }
 
-    /// Keeps a face on a creature that leaves character creation without one: the first
-    /// head preset of its race and gender (provisional: the face screen is not simulated,
-    /// and its default is taken to be the first preset).
+    /// The face character creation's face screen starts on for a creature: the first head
+    /// `chargenmorphcfg.xml` lists for its race and gender (`hm_cps_p01`, a `.mop` preset:
+    /// face shape, hair and colours), when that preset exists.
+    pub fn face_screen_default(&self, id: ObjectId) -> Option<String> {
+        let o = self.world.get(id)?;
+        let t = self.world.tables().get(0, "apr_base")?;
+        let race = match t.cell("ModelRace", o.appearance as i64)? {
+            thedas_formats::gda::Cell::String(s) => {
+                s.trim_end_matches('\0').trim().to_ascii_lowercase()
+            }
+            _ => return None,
+        };
+        let race = match race.chars().next()? {
+            'h' => "human",
+            'e' => "elf",
+            'd' => "dwarf",
+            _ => return None,
+        };
+        let gender = if o.fields.get("Gender").copied() == Some(2) {
+            "female"
+        } else {
+            "male"
+        };
+        let (xml, _) = self.vfs.read("chargenmorphcfg.xml").ok()?;
+        let heads =
+            thedas_formats::morph::face_screen_heads(&xml, &format!("{race}_{gender}")).ok()?;
+        heads
+            .into_iter()
+            .next()
+            .filter(|h| self.vfs.lookup(&format!("{h}.mop")).is_some())
+    }
+
+    /// Keeps a face on a creature that leaves character creation without one: the face the
+    /// face screen starts on ([`Sim::face_screen_default`]), else the first head preset of
+    /// its race and gender. Provisional: the face screen is not simulated, and its default
+    /// is taken to be its first entry; the quick start's own choice is not traced.
     pub fn keep_chargen_face(&mut self, id: ObjectId) {
         if self.world.get(id).is_none_or(|o| o.head_morph.is_some()) {
             return;
         }
-        let preset = self.chargen_head_preset(id, 1);
+        let preset = self
+            .face_screen_default(id)
+            .or_else(|| self.chargen_head_preset(id, 1));
         if let Some(o) = self.world.get_mut(id) {
             o.head_morph = preset;
         }
@@ -3370,6 +3405,50 @@ mod tests {
         s.set_head_morph(hero, Some("  ".into()));
         assert_eq!(s.world.get(hero).unwrap().head_morph, None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_character_keeps_the_face_screens_first_face() {
+        use thedas_formats::gda::Cell;
+        let dir = std::env::temp_dir().join(format!("thedas-face-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let xml = dir.join("chargenmorphcfg.xml");
+        std::fs::write(
+            &xml,
+            "<morph_config><heads><human_male><resource name=\"HM_CPS_P01.mop\"/>\
+             <resource name=\"HM_PCC_B01.mop\"/></human_male></heads></morph_config>",
+        )
+        .unwrap();
+        let mop = dir.join("hm_cps_p01.mop");
+        std::fs::write(&mop, b"").unwrap();
+        let mut vfs = Vfs::new();
+        vfs.push_files(&[xml, mop], "test");
+        let mut s = Sim::new(Arc::new(vfs), Arc::new(EngineTable::default()), 1);
+        s.world.tables().insert(
+            "apr_base",
+            &["ModelRace"],
+            vec![(1, vec![Cell::String("h".into())])],
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        s.world.get_mut(hero).unwrap().appearance = 1;
+        s.world
+            .get_mut(hero)
+            .unwrap()
+            .fields
+            .insert("Gender".into(), 1);
+        s.keep_chargen_face(hero);
+        // The face screen's first face (hair and all), not the bald base preset.
+        assert_eq!(
+            s.world.get(hero).unwrap().head_morph.as_deref(),
+            Some("hm_cps_p01")
+        );
+        // A face already kept stays.
+        s.world.get_mut(hero).unwrap().head_morph = Some("hm_own".into());
+        s.keep_chargen_face(hero);
+        assert_eq!(
+            s.world.get(hero).unwrap().head_morph.as_deref(),
+            Some("hm_own")
+        );
     }
 
     #[test]
