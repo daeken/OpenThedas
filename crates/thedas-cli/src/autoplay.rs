@@ -512,6 +512,9 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
     let mut party_ids: Vec<ObjectId> = Vec::new();
     let (mut fight_ms, mut fights_won, mut last_t) = (0u64, 0u32, sim.world.time_ms);
     let mut engaged: std::collections::BTreeSet<ObjectId> = std::collections::BTreeSet::new();
+    // Hostiles of fights already won: a fallen foe can stay in a party member's perceived
+    // list, and counting it again would win the same fight over and over.
+    let mut beaten: std::collections::BTreeSet<ObjectId> = std::collections::BTreeSet::new();
     let mut quiet_since = sim.world.time_ms;
     if let Some(tag) = o.approach {
         let to = sim
@@ -606,7 +609,7 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
         if fighting {
             fight_ms += now.saturating_sub(last_t);
             let (_, foes) = sides(sim, hero);
-            engaged.extend(foes);
+            engaged.extend(foes.into_iter().filter(|f| !beaten.contains(f)));
             let mut party = vec![hero];
             party.extend(
                 sim.world
@@ -616,14 +619,20 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
             );
             for m in party {
                 if let Some(x) = sim.world.get(m) {
-                    engaged.extend(x.combat.perceived_hostile.iter().copied());
+                    engaged.extend(
+                        x.combat
+                            .perceived_hostile
+                            .iter()
+                            .copied()
+                            .filter(|f| !beaten.contains(f)),
+                    );
                 }
             }
         }
         let won = !engaged.is_empty() && engaged.iter().all(|&f| !alive(sim, f));
         if won {
             fights_won += 1;
-            engaged.clear();
+            beaten.append(&mut engaged);
         }
         last_t = now;
         if o.fights > 0 && fights_won >= o.fights {
@@ -637,6 +646,10 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
                 player_gear(sim, hero);
             }
             rest(sim, hero);
+            // Time moves on even when the party is still in combat (rest returns at once).
+            if sim.world.time_ms == now {
+                sim.tick(500);
+            }
             continue;
         }
         if o.player && sim.world.party_fighting && sim.dialog_state().is_none_or(|d| d.ended) {
