@@ -51,7 +51,7 @@
 //!   A-C and the directional light are multiplied by the lightmap alpha; D is not.
 //! - Fog and the sky's scattering come from the level's atmosphere ([`crate::atmosphere`]).
 //!   Shadows, the environment cubemap and the depth-of-field output are disabled (no shadow
-//!   maps, black cubemap, `oC1` dropped).
+//!   maps: [`NO_SHADOW_DATA`]; black cubemap, `oC1` dropped).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -383,6 +383,30 @@ pub struct ConstantContext<'a> {
 /// (DAOrigins.exe 0x458eb0 writes `(0.2, 0.2, 0.2)` only in its fallback mode 0).
 pub const BASE_AMBIENT: [f32; 3] = [0.0; 3];
 
+/// `g_vShadowData` (usage `ShadowData`, the nine vectors at 0xc1e750 the usage dispatch
+/// hands out, 0x4f8bc5) with no shadow partition drawn: both partitions' projections the
+/// identity with its depth row zeroed, as the shadow reset writes them (0x452cb0), the
+/// partition-2 range `w` 1 and the view-depth plane zero (never written). With these the
+/// Static shaders' shadow tests read every point as lit, whatever the shadow textures hold:
+/// every lookup compares the map against a depth of 0.
+///
+/// The original draws shadow partitions at every Graphics Detail setting (0x458ff7 → 0x4556e0
+/// with the detail mode as the shadow quality: at Low, 512-texel maps, 0x45569e, with ranges
+/// of 5 and 15 m, 0x455777); a point those find in shadow gets the sun and point lights
+/// scaled by the shadow and the lightmap by `0.5 · (shadow − 1) + 1`. Those partitions are
+/// not drawn here (provisional): this is the engine's own unshadowed state.
+pub const NO_SHADOW_DATA: [[f32; 4]; 9] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+    [0.0, 0.0, 0.0, 0.0],
+];
+
 /// Light from every direction for draws in a level with no irradiance probe. Provisional.
 pub const NO_PROBE_IRRADIANCE: [f32; 3] = [0.35, 0.35, 0.35];
 
@@ -543,7 +567,8 @@ impl ConstantContext<'_> {
             }
             ("ApplicationTime", _) => Value::Vectors(vec![[self.time, 0.0, 0.0, 0.0]]),
             ("CloudParameters", _) => Value::Vectors(self.clouds.to_vec()),
-            ("ShadowData", _) | ("IrradianceParams", _) => Value::Vectors(Vec::new()),
+            ("ShadowData", _) => Value::Vectors(NO_SHADOW_DATA.to_vec()),
+            ("IrradianceParams", _) => Value::Vectors(Vec::new()),
             (_, "mml_vLightmapOffsetAndScale") if self.lightmap.is_some() => {
                 let l = self.lightmap?;
                 Value::Vectors(vec![[l.offset[0], l.offset[1], l.scale[0], l.scale[1]]])
@@ -911,6 +936,38 @@ mod tests {
             ParamClass::Vector,
         )])));
         assert_eq!(c.floats[3], [0.25, 0.0, 0.0, 1.0]);
+    }
+
+    /// The Static1_fast shadow test (registers c12-c20, shadow maps s7 and s15) on the CPU.
+    fn shadow_lit(sd: &[[f32; 4]; 9], pos: [f32; 3], map: [f32; 2]) -> f32 {
+        let p = [pos[0], pos[1], pos[2], 1.0];
+        let dp4 = |r: [f32; 4], v: [f32; 4]| r.iter().zip(v).map(|(a, b)| a * b).sum::<f32>();
+        let sat = |x: f32| if x.is_nan() { 0.0 } else { x.clamp(0.0, 1.0) };
+        let d = dp4([sd[8][0], sd[8][1], sd[8][2], 0.0], p) + sd[8][3];
+        let near = sat(d * 10000.0);
+        // Partition 2.
+        let w2 = dp4([sd[7][0], sd[7][1], sd[7][2], 1.0], p);
+        let z2 = sat(dp4(sd[6], p) / w2);
+        let lit2 = if map[0] - z2 >= 0.0 { 1.0 } else { 0.0 };
+        let fade = sat((sd[7][3] - d) / (0.25 * sd[7][3]));
+        let far = fade * (lit2 - 1.0) + 1.0;
+        // Partition 1.
+        let z1 = sat(dp4(sd[2], p) / dp4(sd[3], p));
+        let lit1 = if map[0] - z1 >= 0.0 { 1.0 } else { sat(map[1]) };
+        if -near >= 0.0 { far } else { lit1 }
+    }
+
+    #[test]
+    fn without_partitions_every_point_is_lit() {
+        for pos in [[0.0, 0.0, 0.0], [12.5, -40.0, 3.0], [300.0, 250.0, 5.0]] {
+            for map in [[0.0, 0.0], [1.0, 1.0], [0.3, 0.0]] {
+                assert_eq!(
+                    shadow_lit(&NO_SHADOW_DATA, pos, map),
+                    1.0,
+                    "{pos:?} {map:?}"
+                );
+            }
+        }
     }
 
     #[test]
