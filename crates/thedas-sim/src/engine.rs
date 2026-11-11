@@ -2632,8 +2632,14 @@ pub fn call(
             }
             void()
         }
+        // DAOrigins.exe (0x651710, the list's add at 0x7af4e0): a preset already in the
+        // creature's list is not added again.
         "AddTacticPresetID" => {
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+            let (who, preset) = (obj(a, 0), int(a, 1));
+            if h.sim.tactic_presets(who).contains(&preset) {
+                return void();
+            }
+            if let Some(o) = h.sim.world.get_mut(who) {
                 let n = o.fields.get("TacticPresetCount").copied().unwrap_or(0);
                 o.fields.insert(format!("TacticPreset.{n}"), int(a, 1));
                 o.fields.insert("TacticPresetCount".into(), n + 1);
@@ -3249,11 +3255,18 @@ pub fn call(
             }
             void()
         }
-        "GetNumTactics" => ok(Value::Int(
-            h.object(obj(a, 0))
-                .and_then(|o| o.fields.get("NumTactics").copied())
-                .unwrap_or(0),
-        )),
+        // DAOrigins.exe (0x66d580): the length of the creature's tactics list while its
+        // tactics are on (the tactics screen's `Enabled`), else 0.
+        "GetNumTactics" => {
+            let who = obj(a, 0);
+            ok(Value::Int(if h.sim.tactics_enabled(who) {
+                h.object(who)
+                    .and_then(|o| o.fields.get("NumTactics").copied())
+                    .unwrap_or(0)
+            } else {
+                0
+            }))
+        }
         "SetPlaceableState" | "SetPlotGiver" | "SetAutoLevelUp" | "SetFollowerApprovalEnabled" => {
             let field = match name {
                 "SetPlaceableState" => "State",
@@ -4268,6 +4281,8 @@ mod tests {
         int GetPlaceableAutoRemoveKey(object o) = 60;\n\
         int GetHasAchievement(string s) = 61;\n\
         void UnlockAchievement(string s) = 62;\n\
+        int GetNumTactics(object o) = 63;\n\
+        void AddTacticPresetID(object o, int n) = 64;\n\
         int EVENT_TYPE_PARTYMEMBER_ADDED = 66;\n\
         int EVENT_TYPE_PARTYMEMBER_DROPPED = 67;\n\
         #define ENGINE_STRUCTURE_1 location\n\
@@ -5297,6 +5312,25 @@ mod tests {
             Some(Value::Int(0)),
             "past the number of tactics"
         );
+        // Tactics switched off on the tactics screen: there are none to run.
+        let num = |s: &mut Sim| run(s, c, "GetNumTactics", &[Value::Object(c)]);
+        assert_eq!(num(&mut s), Some(Value::Int(3)));
+        s.world
+            .get_mut(c)
+            .unwrap()
+            .fields
+            .insert(crate::tactics::FIELD_ENABLED.into(), 0);
+        assert_eq!(num(&mut s), Some(Value::Int(0)));
+        // A preset is added to the list once.
+        for p in [4, 6, 4] {
+            run(
+                &mut s,
+                c,
+                "AddTacticPresetID",
+                &[Value::Object(c), Value::Int(p)],
+            );
+        }
+        assert_eq!(s.tactic_presets(c), vec![4, 6]);
     }
 
     #[test]

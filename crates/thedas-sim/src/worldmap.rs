@@ -202,6 +202,7 @@ impl Sim {
                     || self.journal_message(name, args)
                     || self.chargen_message(name, args)
                     || self.level_up_message(name, args)
+                    || self.tactics_message(name, args)
             }
         }
     }

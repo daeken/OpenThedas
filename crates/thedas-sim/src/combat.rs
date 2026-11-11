@@ -818,17 +818,29 @@ impl Sim {
     /// rows are the slots in order (target type, condition, command, parameter), numbered from
     /// 1 as the scripts number them (slot 0 is unused). Provisional.
     pub fn apply_tactic_preset(&mut self, id: ObjectId, preset: i32) -> bool {
-        let tables = self.world.tables.clone();
-        let Some(presets) = tables.get(0, "tacticsuserpresets") else {
+        let Some(slots) = self.preset_tactics(preset) else {
             return false;
         };
+        match self.world.get_mut(id) {
+            Some(o) => {
+                o.combat.tactics = slots;
+                o.fields.insert("TacticPreset".into(), preset);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The slots a preset gives (see [`Sim::apply_tactic_preset`]), slot 0 unused.
+    /// Provisional.
+    pub fn preset_tactics(&self, preset: i32) -> Option<Vec<Tactic>> {
+        let tables = self.world.tables.clone();
+        let presets = tables.get(0, "tacticsuserpresets")?;
         let table_id = match presets.cell("TacticsTable", preset as i64) {
             Some(thedas_formats::gda::Cell::Int(v)) => *v as i32,
-            _ => return false,
+            _ => return None,
         };
-        let Some(t) = tables.get(table_id, "") else {
-            return false;
-        };
+        let t = tables.get(table_id, "")?;
         let int = |row: i64, col: &str| match t.cell(col, row) {
             Some(thedas_formats::gda::Cell::Int(v)) => *v as i32,
             _ => 0,
@@ -851,14 +863,23 @@ impl Sim {
                 }
             }))
             .collect();
-        match self.world.get_mut(id) {
-            Some(o) => {
-                o.combat.tactics = slots;
-                o.fields.insert("TacticPreset".into(), preset);
-                true
-            }
-            None => false,
+        Some(slots)
+    }
+
+    /// A creature's tactics as [`Sim::tactics_of`] gives them, without applying a preset:
+    /// the slots of the preset it would apply when it has none of its own.
+    pub fn tactics_shown(&self, id: ObjectId) -> Vec<Tactic> {
+        let Some(o) = self.world.get(id) else {
+            return Vec::new();
+        };
+        if !o.combat.tactics.is_empty() {
+            return o.combat.tactics.clone();
         }
+        o.fields
+            .get("TacticPreset")
+            .or_else(|| o.fields.get("TacticPreset.0"))
+            .and_then(|&p| self.preset_tactics(p))
+            .unwrap_or_default()
     }
 
     /// A creature's tactics, applying its first added preset if it has none yet (followers
