@@ -1162,7 +1162,9 @@ pub fn call(
         "GetMaxLevel" => ok(Value::Int(20)),
         "GetTime" => ok(Value::Int((h.sim.world.time_ms / 1000) as i32)),
         "ReadIniEntry" => ok(Value::String(String::new())),
-        "GetPRCEnabled" | "GetHasAchievementByID" => ok(Value::Int(0)),
+        // Achievements belong to the player's profile, not the game: the simulation's profile has
+        // none (by id or, the older form, by name).
+        "GetPRCEnabled" | "GetHasAchievementByID" | "GetHasAchievement" => ok(Value::Int(0)),
         "IsPackageLoaded" => {
             // Inferred (#862): whether a package's archives are in our resource stack.
             let pkg = format!("packages/{}/", string(a, 0).to_ascii_lowercase());
@@ -2904,7 +2906,7 @@ pub fn call(
             }
             void()
         }
-        "UnlockAchievementByID" | "IncrementAchievementCountByID" => {
+        "UnlockAchievementByID" | "UnlockAchievement" | "IncrementAchievementCountByID" => {
             h.sim.world.trace.push(TraceEntry::Log {
                 t,
                 channel: -3,
@@ -3610,6 +3612,8 @@ mod tests {
         int GetPlaceableKeyRequired(object o) = 58;\n\
         string GetPlaceableKeyTag(object o) = 59;\n\
         int GetPlaceableAutoRemoveKey(object o) = 60;\n\
+        int GetHasAchievement(string s) = 61;\n\
+        void UnlockAchievement(string s) = 62;\n\
         int EVENT_TYPE_PARTYMEMBER_ADDED = 66;\n\
         int EVENT_TYPE_PARTYMEMBER_DROPPED = 67;\n\
         #define ENGINE_STRUCTURE_1 location\n\
@@ -4429,6 +4433,19 @@ mod tests {
         assert_eq!(
             run(&mut s, door, "GetPlaceableKeyTag", &none),
             Some(Value::String(String::new()))
+        );
+    }
+
+    #[test]
+    fn the_simulations_profile_has_no_achievements() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let id = || [Value::String("ACH_DALISH".into())];
+        assert_eq!(run(&mut s, hero, "UnlockAchievement", &id()), None);
+        assert_eq!(
+            run(&mut s, hero, "GetHasAchievement", &id()),
+            Some(Value::Int(0))
         );
     }
 
