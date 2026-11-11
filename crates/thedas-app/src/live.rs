@@ -81,8 +81,11 @@ pub struct Live {
 pub enum Start<'a> {
     /// A save from the MCP's save_state.
     Save(&'a Path),
-    /// The module's start, through character creation's quick start.
+    /// The module's start, through the character creation screens.
     NewGame,
+    /// The module's start, through character creation's quick start (a pre-made character
+    /// and origin, no screens).
+    NewGameQuick,
     /// An area of the module, its objects as placed.
     Area(&'a str),
 }
@@ -114,6 +117,12 @@ impl Live {
             seed: 1,
             keep_trace: false,
             cutscenes: thedas_sim::sim::CutscenePolicy::Play,
+            // A new game waits at character creation for the player's choices (chargen.gfx
+            // sends them); quick start lets the chargen script choose.
+            chargen: match start {
+                Start::NewGame => thedas_sim::sim::ChargenPolicy::Manual,
+                _ => thedas_sim::sim::ChargenPolicy::QuickStart,
+            },
         };
         let mut sim = thedas_sim::session::open(&opts)?;
         if let Start::Save(path) = start {

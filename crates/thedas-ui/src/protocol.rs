@@ -277,6 +277,17 @@ impl GameBridge {
         };
         let arg = |i: usize| args.get(i).cloned().unwrap_or_default();
         match call.name.as_str() {
+            // A value a movie sets is there at once for the messages it sends next: chargen.gfx
+            // sets `GUICharGen.TempCharName` and then sends `CharGenSelectName`, whose handler
+            // reads it (see [`MESSAGE_VALUES`]). [`GameBridge::handle`] sets it again later.
+            "SetValue" | "SetValueUnicode" if call.kind == CallKind::FsCommand => {
+                let text = call.args.first().map(as_string).unwrap_or_default();
+                let (k, v) = text.split_once(' ').unwrap_or((&text, ""));
+                if let Ok(mut s) = self.state.lock() {
+                    s.values.insert(k.to_string(), parse_value(v));
+                }
+                UiValue::Undefined
+            }
             // The game acts on a message before the movie goes on (a movie reads the result
             // right after sending it, as chanters.gfx does after accepting a job).
             "SendMessage" | "SendMessageArgs" if call.kind == CallKind::FsCommand => {
@@ -386,10 +397,13 @@ impl GameBridge {
             // (table id) for the row count.
             // `GetM2DAValue` and `GetNumM2DARows` ask the same of the multi-file tables
             // (ABI_base), which the lookup serves alike.
+            // `Get2DAValueByRowIndexColumnName` takes the row position and names the column
+            // (chargen.gfx filters classes and backgrounds by race this way).
             name @ ("Get2DAValue"
             | "GetM2DAValue"
             | "Get2DAValueByColumnName"
             | "Get2DAValueByRowIndexColumnHash"
+            | "Get2DAValueByRowIndexColumnName"
             | "GetNum2DARows"
             | "GetNumM2DARows")
                 if call.kind == CallKind::FsCommand =>
@@ -402,7 +416,10 @@ impl GameBridge {
                     .ok()
                     .filter(|r| r.fract() == 0.0);
                 // `Get2DAValueByColumnName` names the column (the hash is its name's).
-                let column = if name == "Get2DAValueByColumnName" {
+                let column = if matches!(
+                    name,
+                    "Get2DAValueByColumnName" | "Get2DAValueByRowIndexColumnName"
+                ) {
                     Some(arg(2).trim())
                         .filter(|c| !c.is_empty())
                         .map(thedas_formats::gda::column_hash)
@@ -420,15 +437,16 @@ impl GameBridge {
                         row: row as i64,
                         column,
                     }),
-                    ("Get2DAValueByRowIndexColumnHash", Some(table), Some(row), Some(column))
-                        if row >= 0.0 =>
-                    {
-                        Some(TableQuery::CellAt {
-                            table,
-                            index: row as usize,
-                            column,
-                        })
-                    }
+                    (
+                        "Get2DAValueByRowIndexColumnHash" | "Get2DAValueByRowIndexColumnName",
+                        Some(table),
+                        Some(row),
+                        Some(column),
+                    ) if row >= 0.0 => Some(TableQuery::CellAt {
+                        table,
+                        index: row as usize,
+                        column,
+                    }),
                     ("GetNum2DARows" | "GetNumM2DARows", Some(table), _, _) => {
                         Some(TableQuery::Rows { table })
                     }
@@ -572,6 +590,37 @@ mod tests {
     }
 
     #[test]
+    fn a_value_set_is_there_for_the_message_sent_right_after() {
+        // The movie sets the name and sends the message in one go; the game acts on the
+        // message at once (the handler), before the calls are drained.
+        let b = bridge();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s2 = seen.clone();
+        b.set_message_handler(Some(Arc::new(move |name: &str, args: &[String]| {
+            s2.lock().unwrap().push((name.to_string(), args.to_vec()));
+            None
+        })));
+        let fs = CallKind::FsCommand;
+        b.respond(&call(
+            fs,
+            "SetValueUnicode",
+            &["GUICharGen.TempCharName Elissa"],
+        ));
+        b.respond(&call(
+            fs,
+            "SendMessageArgs",
+            &["GUICharGen.CharGenSelectName 12"],
+        ));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(
+                "GUICharGen.CharGenSelectName".to_string(),
+                vec!["12".to_string(), "Elissa".to_string()]
+            )]
+        );
+    }
+
+    #[test]
     fn designer_tags_take_the_heros_name() {
         let b = bridge();
         b.set_value(HERO_NAME, UiValue::String("Aeducan".into()));
@@ -649,6 +698,11 @@ mod tests {
             } if column == thedas_formats::gda::column_hash("Icon") => {
                 Some(UiValue::String("race_elf".into()))
             }
+            TableQuery::CellAt {
+                table: 97,
+                index: 4,
+                column,
+            } if column == thedas_formats::gda::column_hash("Human") => Some(UiValue::Number(1.0)),
             _ => None,
         })));
         let fs = CallKind::FsCommand;
@@ -666,6 +720,15 @@ mod tests {
             n(1.0)
         );
         assert_eq!(b.respond(&call(fs, "GetNum2DARows", &["3"])), n(26.0));
+        // chargen.gfx: (table, row position, column name).
+        assert_eq!(
+            b.respond(&call(
+                fs,
+                "Get2DAValueByRowIndexColumnName",
+                &["97 4 Human"]
+            )),
+            n(1.0)
+        );
         assert_eq!(b.respond(&call(fs, "GetNumM2DARows", &["3"])), n(26.0));
         assert_eq!(
             b.respond(&call(fs, "GetM2DAValue", &["111 117 7"])),
