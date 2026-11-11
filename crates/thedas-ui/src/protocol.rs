@@ -37,6 +37,10 @@ fn with_message_values(
     args
 }
 
+/// Engine values (`.<creature id>`) saying a party member may level up now, for
+/// `CanLevelUpFromCharacterSheet`.
+pub const CAN_LEVEL_UP: &str = "Party.CanLevelUp";
+
 /// The engine value holding the hero's name, for designer tags.
 pub const HERO_NAME: &str = "Party.Hero.Name";
 
@@ -302,6 +306,16 @@ impl GameBridge {
                     }
                 }
             }
+            // `DAExternalCommands.CanLevelUpFromCharacterSheet(creature)`: whether the
+            // character record's level-up button is on for the creature (the binding's
+            // `Party.CanLevelUp.<id>`).
+            "CanLevelUpFromCharacterSheet" => {
+                let Ok(s) = self.state.lock() else {
+                    return UiValue::Undefined;
+                };
+                let key = format!("{CAN_LEVEL_UP}.{}", arg(0).trim());
+                UiValue::Bool(s.values.get(&key) == Some(&UiValue::Number(1.0)))
+            }
             // SharedLibrary.Ability.LoadFromToken's call (see `avm1::PRE_CALLS`).
             "GetAbilityAttributes" => {
                 let Ok(s) = self.state.lock() else {
@@ -350,16 +364,25 @@ impl GameBridge {
                 };
                 UiValue::String(replace_designer_tags(&text, &hero))
             }
+            // The movies' `ExternalCommands.FormatFloat(a_nPrecision, a_nValue)` sends the
+            // precision first ("FormatFloat 1 2.345").
             "FormatFloat" => {
-                let v = arg(0).parse::<f64>().unwrap_or(0.0);
-                let digits = arg(1).parse::<usize>().unwrap_or(0).min(10);
+                let digits = arg(0).parse::<usize>().unwrap_or(0).min(10);
+                let v = arg(1).parse::<f64>().unwrap_or(0.0);
                 UiValue::String(format!("{v:.digits$}"))
             }
             // A 2DA cell: the table id, the row id and the column hash (worldmap.gfx reads
             // map names and pin images this way).
             // The 2DA fscommands: (table id, row id or row position, column hash) and
             // (table id) for the row count.
-            name @ ("Get2DAValue" | "Get2DAValueByRowIndexColumnHash" | "GetNum2DARows")
+            // `GetM2DAValue` and `GetNumM2DARows` ask the same of the multi-file tables
+            // (ABI_base), which the lookup serves alike.
+            name @ ("Get2DAValue"
+            | "GetM2DAValue"
+            | "Get2DAValueByColumnName"
+            | "Get2DAValueByRowIndexColumnHash"
+            | "GetNum2DARows"
+            | "GetNumM2DARows")
                 if call.kind == CallKind::FsCommand =>
             {
                 let lookup = self.tables.lock().ok().and_then(|t| t.clone());
@@ -369,15 +392,25 @@ impl GameBridge {
                     .parse::<f64>()
                     .ok()
                     .filter(|r| r.fract() == 0.0);
-                let column = arg(2).trim().parse::<u32>().ok();
+                // `Get2DAValueByColumnName` names the column (the hash is its name's).
+                let column = if name == "Get2DAValueByColumnName" {
+                    Some(arg(2).trim())
+                        .filter(|c| !c.is_empty())
+                        .map(thedas_formats::gda::column_hash)
+                } else {
+                    arg(2).trim().parse::<u32>().ok()
+                };
                 let query = match (name, table, row, column) {
-                    ("Get2DAValue", Some(table), Some(row), Some(column)) => {
-                        Some(TableQuery::Cell {
-                            table,
-                            row: row as i64,
-                            column,
-                        })
-                    }
+                    (
+                        "Get2DAValue" | "GetM2DAValue" | "Get2DAValueByColumnName",
+                        Some(table),
+                        Some(row),
+                        Some(column),
+                    ) => Some(TableQuery::Cell {
+                        table,
+                        row: row as i64,
+                        column,
+                    }),
                     ("Get2DAValueByRowIndexColumnHash", Some(table), Some(row), Some(column))
                         if row >= 0.0 =>
                     {
@@ -387,7 +420,9 @@ impl GameBridge {
                             column,
                         })
                     }
-                    ("GetNum2DARows", Some(table), _, _) => Some(TableQuery::Rows { table }),
+                    ("GetNum2DARows" | "GetNumM2DARows", Some(table), _, _) => {
+                        Some(TableQuery::Rows { table })
+                    }
                     _ => None,
                 };
                 let found = match (lookup, query) {
@@ -598,9 +633,20 @@ mod tests {
                 column: 9,
             } => Some(UiValue::Number(1.0)),
             TableQuery::Rows { table: 3 } => Some(UiValue::Number(26.0)),
+            TableQuery::Cell {
+                table: 50,
+                row: 4,
+                column,
+            } if column == thedas_formats::gda::column_hash("Icon") => {
+                Some(UiValue::String("race_elf".into()))
+            }
             _ => None,
         })));
         let fs = CallKind::FsCommand;
+        assert_eq!(
+            b.respond(&call(fs, "Get2DAValueByColumnName", &["50 4 Icon"])),
+            UiValue::String("race_elf".into())
+        );
         let n = |x: f64| UiValue::Number(x);
         assert_eq!(
             b.respond(&call(fs, "Get2DAValue", &["111 117 7"])),
@@ -611,6 +657,11 @@ mod tests {
             n(1.0)
         );
         assert_eq!(b.respond(&call(fs, "GetNum2DARows", &["3"])), n(26.0));
+        assert_eq!(b.respond(&call(fs, "GetNumM2DARows", &["3"])), n(26.0));
+        assert_eq!(
+            b.respond(&call(fs, "GetM2DAValue", &["111 117 7"])),
+            n(371207.0)
+        );
         assert_eq!(
             b.respond(&call(fs, "Get2DAValueByRowIndexColumnHash", &["3 -1 9"])),
             UiValue::Undefined
@@ -674,7 +725,7 @@ mod tests {
             UiValue::String("Five".into())
         );
         assert_eq!(
-            b.respond(&call(CallKind::FsCommand, "FormatFloat", &["2.345 1"])),
+            b.respond(&call(CallKind::FsCommand, "FormatFloat", &["1 2.345"])),
             UiValue::String("2.3".into())
         );
         b.set_values([
