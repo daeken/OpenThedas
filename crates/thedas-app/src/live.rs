@@ -728,10 +728,13 @@ impl Live {
                 Some(f) => feet + f,
                 None => feet + glam::Vec3::Z * (offset.z + radius - 0.25).max(0.3),
             };
-            // The face follows the head bone as the creature moves (it crouches in combat).
-            let head = match head_bone(id) {
-                Some((now, rest)) => now + (rest_face - rest),
-                None => rest_face,
+            // The face follows the head bone as the creature moves (it crouches in combat). A
+            // creature with no face mesh (the mabari) is looked at on its head bone: the top
+            // of its bounds is its back, not its head.
+            let head = match (face, head_bone(id)) {
+                (Some(_), Some((now, rest))) => now + (rest_face - rest),
+                (None, Some((now, _))) => now,
+                (_, None) => rest_face,
             };
             let heading = thedas_sim::world::heading_of(o.facing).to_radians() + rotation;
             // From in front of the face, looking back at it.
@@ -749,8 +752,19 @@ impl Live {
             );
             camera.fov_y = 35f32.to_radians();
             camera.near = 0.05;
+            // The member alone, as the original's portrait shows them: drawing the whole
+            // scene put a companion standing beside them into their portrait.
+            let own: std::collections::HashSet<usize> = posed
+                .iter()
+                .position(|p| p.0 == id)
+                .and_then(|i| objects.scene.props.get(i))
+                .map(|p| p.draws.clone().collect())
+                .unwrap_or_default();
+            objects.renderer.only_draws = Some(own);
             // Captures come back RGBA whatever the renderer draws in.
-            let Ok(mut pixels) = objects.renderer.capture(ctx, &camera, size, size) else {
+            let shot = objects.renderer.capture(ctx, &camera, size, size);
+            objects.renderer.only_draws = None;
+            let Ok(mut pixels) = shot else {
                 continue;
             };
             // The game lights portraits with a rig of their own (portraits.gda's light
