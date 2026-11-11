@@ -46,6 +46,40 @@ fn obj(a: &[Value], i: usize) -> ObjectId {
     }
 }
 
+/// What `GetHasEffects`, `GetEffects` and `RemoveEffectsByParameters` select effects by, as
+/// script.ldf documents them: an effect type (`EFFECT_TYPE_INVALID`, 0, for any), an ability
+/// (−1 for any, `GetHasEffects`' default; 0, `ABILITY_INVALID`, for any, the other two's
+/// default), a creator (`OBJECT_INVALID` for any) and a duration type
+/// (`EFFECT_DURATION_TYPE_INVALID`, 0, for any). Provisional: that `GetHasEffects` with an
+/// ability of 0 matches any ability (727 calls in the game's scripts pass 0) is not checked
+/// against the executable; `GetEffects`' effect id filter is not applied (effects carry no
+/// ids yet).
+#[derive(Clone, Copy, Debug)]
+struct EffectFilter {
+    ty: i32,
+    ability: Option<i32>,
+    creator: Option<ObjectId>,
+    duration_type: i32,
+}
+
+impl EffectFilter {
+    fn new(ty: i32, ability: i32, creator: ObjectId, duration_type: i32) -> Self {
+        EffectFilter {
+            ty,
+            ability: (ability != -1 && ability != 0).then_some(ability),
+            creator: (creator != OBJECT_INVALID).then_some(creator),
+            duration_type,
+        }
+    }
+
+    fn matches(&self, e: &Effect) -> bool {
+        (self.ty == 0 || e.ty == self.ty)
+            && self.ability.is_none_or(|a| e.ability == a)
+            && self.creator.is_none_or(|c| e.creator == Some(c))
+            && (self.duration_type == 0 || e.duration_type == self.duration_type)
+    }
+}
+
 fn handle(a: &[Value], i: usize) -> Option<u64> {
     match a.get(i) {
         Some(Value::Engine { handle, .. }) => *handle,
@@ -1444,24 +1478,16 @@ pub fn call(
             void()
         }
         "GetHasEffects" => {
-            let (et, ab) = (int(a, 1), int(a, 2));
-            ok(b(h.object(obj(a, 0)).is_some_and(|o| {
-                o.effects
-                    .iter()
-                    .any(|e| (et == 0 || e.ty == et) && (ab == 0 || e.ability == ab))
-            })))
+            let f = EffectFilter::new(int(a, 1), int(a, 2), OBJECT_INVALID, 0);
+            ok(b(h
+                .object(obj(a, 0))
+                .is_some_and(|o| o.effects.iter().any(|e| f.matches(e)))))
         }
         "GetEffects" => {
-            let (et, ab) = (int(a, 1), int(a, 2));
+            let f = EffectFilter::new(int(a, 1), int(a, 2), obj(a, 3), int(a, 4));
             let list: Vec<Effect> = h
                 .object(obj(a, 0))
-                .map(|o| {
-                    o.effects
-                        .iter()
-                        .filter(|e| (et == 0 || e.ty == et) && (ab == 0 || e.ability == ab))
-                        .cloned()
-                        .collect()
-                })
+                .map(|o| o.effects.iter().filter(|e| f.matches(e)).cloned().collect())
                 .unwrap_or_default();
             let items = list
                 .into_iter()
@@ -1482,16 +1508,11 @@ pub fn call(
             void()
         }
         "RemoveEffectsByParameters" => {
-            let (who, et, ab) = (obj(a, 0), int(a, 1), int(a, 2));
+            let who = obj(a, 0);
+            let f = EffectFilter::new(int(a, 1), int(a, 2), obj(a, 3), 0);
             let gone: Vec<Effect> = h
                 .object(who)
-                .map(|o| {
-                    o.effects
-                        .iter()
-                        .filter(|e| (et == 0 || e.ty == et) && (ab == 0 || e.ability == ab))
-                        .cloned()
-                        .collect()
-                })
+                .map(|o| o.effects.iter().filter(|e| f.matches(e)).cloned().collect())
                 .unwrap_or_default();
             for e in gone {
                 h.sim.remove_effect(who, &e);
@@ -3533,6 +3554,9 @@ mod tests {
         void OpenFadeMap() = 48;\n\
         int GetGraphicsDetailLevel() = 49;\n\
         effect SetEffectEngineVector(effect e, int i, vector v) = 50;\n\
+        int GetHasEffects(object o, int t = 0, int a = -1) = 51;\n\
+        effect[] GetEffects(object o, int t = 0, int a = 0, object c = OBJECT_INVALID, int d = 0, int i = -1) = 52;\n\
+        void RemoveEffectsByParameters(object o, int t = 0, int a = 0, object c = OBJECT_INVALID) = 53;\n\
         int EVENT_TYPE_PARTYMEMBER_ADDED = 66;\n\
         int EVENT_TYPE_PARTYMEMBER_DROPPED = 67;\n\
         #define ENGINE_STRUCTURE_1 location\n\
@@ -3649,6 +3673,68 @@ mod tests {
         assert_eq!(get(&mut s, 1), Some(Value::Float(17.0)));
         assert_eq!(get(&mut s, 2), Some(Value::Float(15.0)));
         assert_eq!(get(&mut s, 4), Some(Value::Float(2.0)));
+    }
+
+    #[test]
+    fn effect_queries_filter_as_documented() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let (hunter, mage) = (
+            s.world.spawn(ObjectKind::Creature, "hunter"),
+            s.world.spawn(ObjectKind::Creature, "mage"),
+        );
+        let bleed = Effect {
+            ty: 1017,
+            ability: 5,
+            creator: Some(hunter),
+            duration_type: 2,
+            ..Default::default()
+        };
+        let curse = Effect {
+            ty: 1012,
+            ability: 7,
+            creator: Some(mage),
+            duration_type: 3,
+            ..Default::default()
+        };
+        s.world.get_mut(c).unwrap().effects = vec![bleed, curse];
+        let (o, i) = (Value::Object, Value::Int);
+        let has = |s: &mut Sim, ty, ab| run(s, c, "GetHasEffects", &[o(c), i(ty), i(ab)]);
+        // −1, GetHasEffects' default, is no ability filter.
+        assert_eq!(has(&mut s, 1017, -1), Some(i(1)));
+        assert_eq!(has(&mut s, 1017, 0), Some(i(1)));
+        assert_eq!(has(&mut s, 1017, 5), Some(i(1)));
+        assert_eq!(has(&mut s, 1017, 9), Some(i(0)));
+        assert_eq!(has(&mut s, 1013, -1), Some(i(0)));
+        let count = |s: &mut Sim, args: &[Value]| match run(s, c, "GetEffects", args) {
+            Some(Value::Array { items, .. }) => items.len(),
+            v => panic!("{v:?}"),
+        };
+        let any = o(OBJECT_INVALID);
+        assert_eq!(
+            count(&mut s, &[o(c), i(0), i(0), any.clone(), i(0), i(-1)]),
+            2
+        );
+        assert_eq!(count(&mut s, &[o(c), i(0), i(0), o(mage), i(0), i(-1)]), 1);
+        assert_eq!(
+            count(&mut s, &[o(c), i(0), i(0), any.clone(), i(2), i(-1)]),
+            1
+        );
+        assert_eq!(
+            count(&mut s, &[o(c), i(1012), i(0), o(hunter), i(0), i(-1)]),
+            0
+        );
+        // Removing by creator leaves the others' effects.
+        run(
+            &mut s,
+            c,
+            "RemoveEffectsByParameters",
+            &[o(c), i(0), i(0), o(hunter)],
+        );
+        let left = &s.world.get(c).unwrap().effects;
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].creator, Some(mage));
     }
 
     #[test]
