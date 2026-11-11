@@ -201,6 +201,10 @@ const PRESENTATION: &[&str] = &[
     "SetCreatureGoreLevel",
     // Only the indicator on the quickbar; the modal effect itself is the scripts'.
     "Engine_SetModalAbilityGUI",
+    // An icon over a creature's head (DAOrigins.exe 0x662db0) and the specialisation
+    // notice (0x663b80): interface only.
+    "ShowFloatyIcon",
+    "ShowSpecUnlockedNotification",
 ];
 
 /// Engine functions answered with a fixed placeholder because the simulation lacks what
@@ -597,12 +601,15 @@ pub fn call(
         | "PrintFloat"
         | "Warning"
         | "DisplayFloatyMessage"
+        | "DisplayPortraitMessage"
         | "PrintToLogWindow" => {
             let (channel, text) = match name {
                 "LogTrace" => (int(a, 0), string(a, 1)),
                 "PrintInteger" => (0, int(a, 0).to_string()),
                 "PrintFloat" => (0, float(a, 0).to_string()),
-                "DisplayFloatyMessage" => (-1, string(a, 1)),
+                // A message by a party member's portrait (DAOrigins.exe 0x661f40 hands it
+                // to the interface): logged as floaty messages are.
+                "DisplayFloatyMessage" | "DisplayPortraitMessage" => (-1, string(a, 1)),
                 _ => (0, string(a, 0)),
             };
             if name == "Warning" {
@@ -5402,7 +5409,8 @@ mod coverage_tests {
         vector GetPositionFromLocation(location l) = 91;\n\
         float GetFacingFromLocation(location l) = 92;\n\
         void AddItemVisualEffect(object o, int n) = 93;\n\
-        int GetItemPropertyPower(object o, int p, int s = FALSE) = 94;\n";
+        int GetItemPropertyPower(object o, int p, int s = FALSE) = 94;\n\
+        void DisplayPortraitMessage(object o, string s, int c = 16777215) = 95;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -5977,5 +5985,23 @@ mod coverage_tests {
         assert_eq!(power(&mut s, ring, 10018), Some(Value::Int(1)));
         assert_eq!(power(&mut s, ring, 7), Some(Value::Int(0)));
         assert_eq!(power(&mut s, man, 1005), Some(Value::Int(0)));
+    }
+
+    #[test]
+    fn portrait_messages_are_logged() {
+        let mut s = sim();
+        s.world.trace.keep = true;
+        run(
+            &mut s,
+            1,
+            "DisplayPortraitMessage",
+            &[
+                Value::Object(1),
+                Value::String("Approval +5".into()),
+                Value::Int(0xff),
+            ],
+        );
+        assert!(s.world.trace.entries.iter().any(|e| matches!(e,
+            TraceEntry::Log { channel: -1, text, .. } if text == "Approval +5")));
     }
 }
