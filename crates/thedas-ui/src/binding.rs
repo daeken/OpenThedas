@@ -307,6 +307,10 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     // `GetNumMembers` does not count them.
     for i in members.len()..4 {
         v.insert(format!("Party.Members.{i}"), UiValue::Null);
+    }
+    // Nobody has a summoned creature (no summoning yet): every summon slot is empty, also
+    // beside the members there are (portraits.gfx reads all four).
+    for i in 0..4 {
         v.insert(format!("Party.Summons.{i}"), UiValue::Null);
     }
     let mut set = |k: String, x: UiValue| {
@@ -315,6 +319,24 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     if let Some(a) = sim.world.area.and_then(|a| sim.world.get(a)) {
         set("Area.ResRef".into(), UiValue::String(a.tag.clone()));
         set("Area.Name".into(), UiValue::String(name(sim, a.id)));
+    }
+    // Where the camera looks (world metres): the area map (map.gfx) opens centred there
+    // (`SetMapFocus` from `CameraPivotPosition`). Provisional: the camera follows the party
+    // member the player controls, so its pivot is taken to be that member's place.
+    if let Some(o) = sim
+        .world
+        .controlled()
+        .or(sim.world.hero)
+        .and_then(|id| sim.world.get(id))
+    {
+        set(
+            "GameModeExplore.CameraPivotPositionX".into(),
+            num(o.position[0]),
+        );
+        set(
+            "GameModeExplore.CameraPivotPositionY".into(),
+            num(o.position[1]),
+        );
     }
     set(
         "GameModeController.CurrentGameMode".into(),
@@ -493,8 +515,6 @@ fn quickbar(sim: &Sim, who: u32, v: &mut BTreeMap<String, UiValue>) {
     let abi = tables.get(0, "ABI_base");
     let bar = sim.quickbar(who);
     v.insert("GUI.SelectedChar.Stats.QuickbarLocked".into(), num(0));
-    // The quickbar shows its first row only. Provisional.
-    v.insert("Party.QuickbarExpandValue".into(), num(0));
     // The keys shown on the first ten slots: the game's default bindings, 1 to 0.
     for n in 1..=10 {
         v.insert(
@@ -1022,8 +1042,12 @@ mod tests {
         assert_eq!(v.get("Party.Members.0"), Some(&num(hero)));
         assert_eq!(v.get("Party.Members.1"), Some(&num(dog)));
         // portraits.gfx hides a portrait whose token reads null (a 0 drew a dead member).
+        // How far the quickbar is open is the movie's to keep (seeded once by the stage).
+        assert!(!v.contains_key(crate::stage::QUICKBAR_EXPAND_VALUE));
         for i in 2..4 {
             assert_eq!(v.get(&format!("Party.Members.{i}")), Some(&UiValue::Null));
+        }
+        for i in 0..4 {
             assert_eq!(v.get(&format!("Party.Summons.{i}")), Some(&UiValue::Null));
         }
     }
@@ -1496,5 +1520,22 @@ mod tests {
         assert_eq!(v["GUIJournal.NotificationOpenPRCTab"], num(0));
         // No journal up: nothing bound.
         assert!(!sim_values(&sim).contains_key("Journal.PlotList"));
+    }
+
+    #[test]
+    fn the_area_map_centres_on_the_party_member_the_camera_follows() {
+        use thedas_sim::world::ObjectKind;
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        assert!(!sim_values(&sim).contains_key("GameModeExplore.CameraPivotPositionX"));
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        sim.world.hero = Some(hero);
+        sim.world.get_mut(hero).unwrap().position = [12.5, -3.0, 1.0];
+        let v = sim_values(&sim);
+        assert_eq!(v["GameModeExplore.CameraPivotPositionX"], num(12.5));
+        assert_eq!(v["GameModeExplore.CameraPivotPositionY"], num(-3.0));
     }
 }

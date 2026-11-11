@@ -42,6 +42,9 @@ pub struct LiveObjects {
     /// Creatures' faces (their eyes', else their head's mesh centre), offset from the
     /// creature, from their draws when the scene was built: where portraits look.
     faces: std::collections::HashMap<ObjectId, glam::Vec3>,
+    /// The placeables' opaque surfaces as drawn (doors, furniture), which the game camera
+    /// keeps on the near side of, as it does the level's.
+    solid: thedas_render::collide::Collider,
     pub scene: AreaScene,
     pub renderer: AreaRenderer,
 }
@@ -183,10 +186,22 @@ impl Live {
         }
     }
 
-    /// Where the party leader stands, when it is in the current area.
-    /// Where a segment first meets the level's solid surfaces (share of the way), if it does.
+    /// Where a segment first meets a solid surface (share of the way), if it does: the
+    /// level's, or a placeable's as drawn (a door shut across a doorway). Provisional: the
+    /// game's own camera collision (its physics shapes) is not traced.
     pub fn first_hit(&self, from: glam::Vec3, to: glam::Vec3) -> Option<f32> {
-        self.level.as_ref()?.collider.first_hit(from, to)
+        let level = self
+            .level
+            .as_ref()
+            .and_then(|l| l.collider.first_hit(from, to));
+        let objects = self
+            .objects
+            .as_ref()
+            .and_then(|o| o.solid.first_hit(from, to));
+        match (level, objects) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Advances what runs while the world may be stopped (the conversation camera's clock).
@@ -218,6 +233,7 @@ impl Live {
         self.talk_camera.camera(&sim, base)
     }
 
+    /// Where the party leader stands, when it is in the current area.
     pub fn leader_feet(&self) -> Option<glam::Vec3> {
         let sim = self.sim();
         let w = &sim.world;
@@ -411,13 +427,20 @@ impl Live {
         let mut bounds = std::collections::HashMap::new();
         let mut faces = std::collections::HashMap::new();
         let mut shapes = std::collections::HashMap::new();
+        let mut placeable_draws = Vec::new();
         for (m, p) in models.iter().zip(&scene.props) {
-            let interactive = {
+            let (interactive, placeable) = {
                 let sim = self.sim();
-                sim.world.get(m.id).is_some_and(|o| {
-                    o.interactive && o.kind == thedas_sim::world::ObjectKind::Placeable
-                })
+                let placeable = sim
+                    .world
+                    .get(m.id)
+                    .is_some_and(|o| o.kind == thedas_sim::world::ObjectKind::Placeable);
+                let interactive = placeable && sim.world.get(m.id).is_some_and(|o| o.interactive);
+                (interactive, placeable)
             };
+            if placeable {
+                placeable_draws.extend(p.draws.clone());
+            }
             if interactive {
                 let shape =
                     thedas_render::collide::Collider::from_draws(&scene, p.draws.clone(), false);
@@ -454,11 +477,13 @@ impl Live {
                 .fold(0.0, f32::max);
             bounds.insert(m.id, (centre - glam::Vec3::from_array(m.position), radius));
         }
+        let solid = thedas_render::collide::Collider::from_draws(&scene, placeable_draws, true);
         Ok(LiveObjects {
             key,
             bounds,
             shapes,
             faces,
+            solid,
             scene,
             renderer,
         })

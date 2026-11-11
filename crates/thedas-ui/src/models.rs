@@ -124,11 +124,12 @@ fn has_model(sim: &Sim, model: &str) -> bool {
 /// from character creation), else the one its template names (`Appearance Data` /
 /// `HeadMorph`).
 pub fn head_morph(sim: &Sim, o: &Object) -> Option<String> {
-    if let Some(m) = o
-        .head_morph
-        .as_ref()
-        .filter(|m| sim.vfs.lookup(&format!("{m}.mor")).is_some())
-    {
+    // A kept face is a finished morph, or a face-screen preset (`.mop`) the renderer puts
+    // on its race and gender's base face.
+    if let Some(m) = o.head_morph.as_ref().filter(|m| {
+        sim.vfs.lookup(&format!("{m}.mor")).is_some()
+            || sim.vfs.lookup(&format!("{m}.mop")).is_some()
+    }) {
         return Some(m.clone());
     }
     use thedas_formats::gff3::Value;
