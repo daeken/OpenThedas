@@ -997,7 +997,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Everything about one object: locals, properties, effects, commands, inventory."
+        description = "Everything about one object: locals, properties (each as [base, current]), effects, commands, inventory; for a creature, also its health (current and max)."
     )]
     async fn inspect_object(&self, Parameters(a): Parameters<ObjectArg>) -> String {
         self.with_sim(|st| {
@@ -1006,6 +1006,18 @@ impl Server {
             let o = sim.world.get(id).ok_or("no such object")?;
             let mut v = serde_json::to_value(o).map_err(|e| e.to_string())?;
             v["name"] = json!(o.name_strref.and_then(|s| sim.string(s)));
+            // `properties` holds each property's base and current value; health is also
+            // given as its current value and its maximum (the total, as
+            // GetCreatureProperty reports it).
+            if o.kind == ObjectKind::Creature {
+                let health = thedas_sim::sim::constant(&sim.table, "PROPERTY_DEPLETABLE_HEALTH");
+                if let Some(&(_, current)) = o.properties.get(&health) {
+                    v["health"] = json!({
+                        "current": current,
+                        "max": sim.property_total(id, health),
+                    });
+                }
+            }
             Ok(v)
         })
     }
@@ -1167,7 +1179,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Interact with an object as the hero: talk to a creature (starts its conversation) or use a placeable (sends it EVENT_TYPE_USE)."
+        description = "Interact with an object as the hero: talk to a creature (starts its conversation) or use a placeable (sends it EVENT_TYPE_USE). A finished conversation left open is closed first."
     )]
     async fn interact(&self, Parameters(a): Parameters<ObjectArg>) -> String {
         self.with_sim(|st| {
@@ -1175,6 +1187,11 @@ impl Server {
             let hero = sim.world.hero.ok_or("no hero")?;
             let id = resolve(sim, &a.object).ok_or("no such object")?;
             let kind = sim.world.get(id).map(|o| o.kind).ok_or("no such object")?;
+            // A finished conversation still showing its last line is closed first, as the
+            // player's click past it would.
+            if sim.dialog_state().is_some_and(|d| d.ended) {
+                sim.end_conversation();
+            }
             let before = sim.world.trace.entries.len();
             // Clicking a placeable uses it: its script decides (placeable_core starts the
             // placeable's conversation when it has one; a door's own script may only talk
@@ -1698,15 +1715,21 @@ impl Server {
         })
     }
 
-    #[tool(description = "Pick a reply in the current conversation by index.")]
+    #[tool(
+        description = "Pick a reply in the current conversation by index. On a conversation that has ended (its last line shown), any reply closes it, as continuing does in the game's conversation screen."
+    )]
     async fn choose_reply(&self, Parameters(a): Parameters<ReplyArgs>) -> String {
         self.with_sim(|st| {
             let sim = st.sim.as_mut().ok_or("no sim")?;
-            if sim.dialog_state().is_none() {
+            let Some(state) = sim.dialog_state() else {
                 return Err("no conversation".into());
-            }
+            };
             let before = sim.world.trace.entries.len();
-            sim.choose_reply(a.reply);
+            if state.ended {
+                sim.end_conversation();
+            } else {
+                sim.choose_reply(a.reply);
+            }
             sim.tick(0);
             let effects: Vec<&TraceEntry> = sim.world.trace.entries[before..]
                 .iter()
