@@ -338,13 +338,19 @@ impl GameBridge {
                 let Ok(s) = self.state.lock() else {
                     return UiValue::Undefined;
                 };
-                // A child counts when it has members of its own or a non-zero value (an empty
-                // party slot is a bare 0).
+                // A child counts when it has members of its own or a value (an empty party
+                // slot is a bare null, or 0).
                 let n = s
                     .values
                     .range(prefix.clone()..)
                     .take_while(|(k, _)| k.starts_with(&prefix))
-                    .filter(|(k, v)| k[prefix.len()..].contains('.') || **v != UiValue::Number(0.0))
+                    .filter(|(k, v)| {
+                        k[prefix.len()..].contains('.')
+                            || !matches!(
+                                **v,
+                                UiValue::Number(0.0) | UiValue::Null | UiValue::Undefined
+                            )
+                    })
                     .filter_map(|(k, _)| k[prefix.len()..].split('.').next())
                     .collect::<std::collections::BTreeSet<_>>()
                     .len();
@@ -735,6 +741,8 @@ mod tests {
             ("Party.Members.0.ID".to_string(), UiValue::Number(3.0)),
             ("Party.Members.0.Name".to_string(), UiValue::Null),
             ("Party.Members.1.ID".to_string(), UiValue::Number(4.0)),
+            ("Party.Members.2".to_string(), UiValue::Null),
+            ("Party.Members.3".to_string(), UiValue::Number(0.0)),
             ("Party.MembersX".to_string(), UiValue::Null),
         ]);
         assert_eq!(

@@ -299,10 +299,13 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             num(can as u8),
         );
     }
-    // Empty slots read as no creature (0); `GetNumMembers` does not count them.
+    // Empty slots read as no creature: null, which portraits.gfx's portraits hide on
+    // (`SharedLibrary.Portrait.SetCreatureToken`'s observer: `GetValue(token) == null` →
+    // `HideMovie`, else `ShowMovie`; a 0 showed an empty slot as a dead member's skull).
+    // `GetNumMembers` does not count them.
     for i in members.len()..4 {
-        v.insert(format!("Party.Members.{i}"), num(0));
-        v.insert(format!("Party.Summons.{i}"), num(0));
+        v.insert(format!("Party.Members.{i}"), UiValue::Null);
+        v.insert(format!("Party.Summons.{i}"), UiValue::Null);
     }
     let mut set = |k: String, x: UiValue| {
         v.insert(k, x);
@@ -879,6 +882,28 @@ fn inventory(sim: &Sim, who: Option<u32>, filter: i32, v: &mut BTreeMap<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_party_slots_read_as_no_creature() {
+        use thedas_sim::world::ObjectKind;
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "player");
+        let dog = sim.world.spawn(ObjectKind::Creature, "dog");
+        sim.world.hero = Some(hero);
+        sim.world.get_mut(hero).unwrap().followers.push(dog);
+        let v = sim_values(&sim);
+        assert_eq!(v.get("Party.Members.0"), Some(&num(hero)));
+        assert_eq!(v.get("Party.Members.1"), Some(&num(dog)));
+        // portraits.gfx hides a portrait whose token reads null (a 0 drew a dead member).
+        for i in 2..4 {
+            assert_eq!(v.get(&format!("Party.Members.{i}")), Some(&UiValue::Null));
+            assert_eq!(v.get(&format!("Party.Summons.{i}")), Some(&UiValue::Null));
+        }
+    }
 
     #[test]
     fn the_world_map_shows_its_pins_and_where_the_party_is() {
