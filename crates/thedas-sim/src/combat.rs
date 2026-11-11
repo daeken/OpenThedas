@@ -61,6 +61,9 @@ pub const VISUAL_RANGE: f32 = 60.0;
 /// `EFFECT_TYPE_DEATH` in effects.gda.
 pub const EFFECT_TYPE_DEATH: i32 = 7;
 
+/// `EFFECT_TYPE_DOT` in effects.gda.
+pub const EFFECT_TYPE_DOT: i32 = 1017;
+
 /// `EFFECT_TYPE_RESURRECTION` in effects.gda.
 pub const EFFECT_TYPE_RESURRECTION: i32 = 1005;
 
@@ -574,6 +577,13 @@ impl Sim {
     /// creator of the effect being applied to it, if any, else the script's owner (a weapon
     /// hit is applied by the attacker's own script); the ability is the effect's (0 for a
     /// weapon hit). Health the module's scripts set outside an effect is not recorded.
+    ///
+    /// Damage over time is the exception: rules_core's tick for it runs in the burning
+    /// creature's own script and lowers its health directly, with no effect being applied,
+    /// so the owner would be credited with its own burn. When a creature's own script takes
+    /// its health outside an effect and it carries an `EFFECT_TYPE_DOT` (1017) from someone
+    /// else, the loss is credited to that effect's creator and ability (the latest such
+    /// effect when there are several). Attribution only: nothing in the simulation reads it.
     pub(crate) fn record_health_loss(&mut self, caller: ObjectId, target: ObjectId, amount: f32) {
         if amount <= 0.0 {
             return;
@@ -588,6 +598,18 @@ impl Sim {
         if effect.is_none() && Some(caller) == self.world.module {
             return;
         }
+        let dot = effect
+            .is_none()
+            .then(|| self.world.get(target))
+            .flatten()
+            .filter(|_| caller == target)
+            .and_then(|o| {
+                o.effects
+                    .iter()
+                    .rev()
+                    .find(|e| e.ty == EFFECT_TYPE_DOT && e.creator.is_some_and(|c| c != target))
+            });
+        let effect = effect.or(dot);
         let source = effect.and_then(|e| e.creator).unwrap_or(caller);
         let (ability, ty) = effect.map_or((0, 0), |e| (e.ability, e.ty));
         let t = self.world.time_ms;
@@ -1855,6 +1877,23 @@ mod tests {
         assert_eq!(d.get(&(archer, 0)), Some(&8.0));
         assert_eq!(d.get(&(mage, 14001)), Some(&30.0));
         assert_eq!(d.len(), 2);
+        // A burn's tick: the burning hero's own script takes its health, outside any
+        // effect; the burn's creator (and ability) is credited, the latest burn's when there
+        // are several.
+        s.current_effect = None;
+        let burn = |creator, ability| Effect {
+            ty: EFFECT_TYPE_DOT,
+            creator: Some(creator),
+            ability,
+            ..Default::default()
+        };
+        s.world.get_mut(hero).unwrap().effects = vec![burn(archer, 3000), burn(mage, 10003)];
+        s.record_health_loss(hero, hero, 9.0);
+        assert_eq!(s.world.trace.damage.get(&(mage, 10003)), Some(&9.0));
+        // Without a burn from someone else, the owner is credited as before.
+        s.world.get_mut(hero).unwrap().effects = vec![burn(hero, 1)];
+        s.record_health_loss(hero, hero, 4.0);
+        assert_eq!(s.world.trace.damage.get(&(hero, 0)), Some(&4.0));
     }
 
     #[test]

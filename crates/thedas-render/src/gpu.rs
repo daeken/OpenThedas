@@ -1024,7 +1024,9 @@ impl AreaRenderer {
         height: u32,
         camera: &Camera,
     ) {
-        self.encode_shadows(ctx, encoder, camera, width, height, true);
+        self.prepare_shadows(ctx, camera, width, height);
+        self.encode_shadows(encoder, true);
+        self.finish_shadows(encoder);
         self.render_pass(ctx, encoder, target, width, height, camera, None);
     }
 
@@ -1042,23 +1044,28 @@ impl AreaRenderer {
         self.render_pass(ctx, encoder, target, width, height, camera, None);
     }
 
-    /// Fills this frame's constants (placing the shadow partitions, for a renderer of the
-    /// level's own meshes) and records this renderer's shadow casters into the partitions:
-    /// `clear` for the first renderer of a frame (the level's), not for the objects drawn
-    /// over it. Call it for every renderer of a frame before any of them draws.
-    pub fn encode_shadows(
-        &mut self,
-        ctx: &GpuContext,
-        encoder: &mut wgpu::CommandEncoder,
-        camera: &Camera,
-        width: u32,
-        height: u32,
-        clear: bool,
-    ) {
+    /// Fills this frame's constants: placing the shadow partitions (a renderer of the
+    /// level's own meshes) and choosing the casters each draws. Call it for every renderer
+    /// of a frame, the level's first, before [`AreaRenderer::encode_shadows`] for any of
+    /// them: whether the partitions need drawing again depends on all of them.
+    pub fn prepare_shadows(&mut self, ctx: &GpuContext, camera: &Camera, width: u32, height: u32) {
         self.d3d
             .update(ctx, camera, width, height, self.time as f32);
         self.updated = true;
+    }
+
+    /// Records this renderer's shadow casters into the partitions: `clear` for the first
+    /// renderer of a frame (the level's), not for the objects drawn over it. Nothing is
+    /// drawn when no renderer's casters, nor the partitions, changed since they were last
+    /// drawn: the partitions still hold them.
+    pub fn encode_shadows(&mut self, encoder: &mut wgpu::CommandEncoder, clear: bool) {
         self.d3d.encode_shadows(encoder, &self.meshes, clear);
+    }
+
+    /// Once every renderer of a frame recorded its casters: what the partitions get then
+    /// (the first one's blur at Medium and High), from the renderer of the level's meshes.
+    pub fn finish_shadows(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        self.d3d.finish_shadows(encoder);
     }
 
     /// Records this renderer's draws over what an earlier pass drew into `target`, testing
@@ -1241,10 +1248,15 @@ impl AreaRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("capture"),
             });
-        self.encode_shadows(ctx, &mut encoder, camera, width, height, true);
+        self.prepare_shadows(ctx, camera, width, height);
         for o in overlays.iter_mut() {
-            o.encode_shadows(ctx, &mut encoder, camera, width, height, false);
+            o.prepare_shadows(ctx, camera, width, height);
         }
+        self.encode_shadows(&mut encoder, true);
+        for o in overlays.iter_mut() {
+            o.encode_shadows(&mut encoder, false);
+        }
+        self.finish_shadows(&mut encoder);
         self.render_pass(ctx, &mut encoder, &view, width, height, camera, None);
         if !overlays.is_empty() {
             let depth = self.depth(&ctx.device, width, height);
