@@ -1047,6 +1047,187 @@ impl Sim {
     }
 }
 
+/// `apr_base.gda`: the appearance's combat animation tree (`combat_humanoid.anb`,
+/// `C_DOGa_cbt.anb`, ...).
+const COL_COMBAT_TREE: u32 = 0xde80_b418;
+/// `bitm_base.gda`: the slots an item fits (1 main hand, 2 off hand, 3 either).
+const COL_EQUIPPABLE_SLOTS: u32 = 0xd5b0_ae22;
+/// `bitm_base.gda`: what an item is (`Melee`, `Ranged`, `Wand`, `Shield`, ...).
+const COL_ITEM_TYPE: u32 = 0xc0d6_c7f2;
+
+impl Sim {
+    /// How long a melee swing takes when the rules set no duration: its attack animation
+    /// played at its own speed, as DAOrigins.exe does when the attack duration is not set
+    /// (0x7a4e6d; `SetAttackDuration`, 0x659d30, scales the animation to fit only when the
+    /// rules give one, and rules_core gives one for ranged weapons only). One of the six
+    /// attack actions (`attk_v1`-`attk_v6`) of the creature's combat animation tree
+    /// (`apr_base.gda`), by the simulation's dice; a humanoid's tree is its weapon style's:
+    /// `ws` (weapon and shield, 2.0 s), `ow` (one weapon, 2.0 s), `tw` (two-handed, 2.3-2.5
+    /// s), `dw` (two weapons, 1.47 s), or the humanoid tree itself unarmed (1.5 s).
+    ///
+    /// Provisional: how the executable picks the weapon-style tree and the attack variant is
+    /// not traced; the style is read from the weapons' slots and kinds (`bitm_base.gda`),
+    /// the tree from its name.
+    pub fn melee_attack_ms(&mut self, id: ObjectId) -> Option<u64> {
+        let o = self.world.get(id)?;
+        let appearance = o.appearance;
+        let slot_item = |slot: &str| {
+            let slot = constant_of(self, slot);
+            o.equipment
+                .get(&slot)
+                .and_then(|i| self.world.get(*i))
+                .and_then(|i| i.fields.get("BaseItem").copied())
+        };
+        let (main, off) = (
+            slot_item("INVENTORY_SLOT_MAIN"),
+            slot_item("INVENTORY_SLOT_OFFHAND"),
+        );
+        let tables = self.world.tables();
+        let tree = tables
+            .get(2, "")
+            .and_then(
+                |t| match t.cell_by_hash(COL_COMBAT_TREE, appearance as i64)? {
+                    thedas_formats::gda::Cell::String(s) => {
+                        Some(crate::engine::clean(s).to_ascii_lowercase())
+                    }
+                    _ => None,
+                },
+            )
+            .filter(|s| !s.is_empty())?;
+        let items = tables.get(6, "");
+        let kind = |b: Option<i32>| {
+            b.and_then(
+                |b| match items.as_ref()?.cell_by_hash(COL_ITEM_TYPE, b as i64)? {
+                    thedas_formats::gda::Cell::String(s) => {
+                        Some(crate::engine::clean(s).to_ascii_lowercase())
+                    }
+                    _ => None,
+                },
+            )
+            .unwrap_or_default()
+        };
+        let slots = |b: Option<i32>| {
+            b.and_then(|b| {
+                match items
+                    .as_ref()?
+                    .cell_by_hash(COL_EQUIPPABLE_SLOTS, b as i64)?
+                {
+                    thedas_formats::gda::Cell::Int(v) => Some(*v),
+                    _ => None,
+                }
+            })
+            .unwrap_or(0)
+        };
+        let tree = attack_tree(&tree, &kind(main), slots(main), &kind(off));
+        let lengths = match self.attack_lengths.get(&tree) {
+            Some(l) => l.clone(),
+            None => {
+                let l = self.read_attack_lengths(&tree);
+                self.attack_lengths.insert(tree.clone(), l.clone());
+                l
+            }
+        };
+        if lengths.is_empty() {
+            return None;
+        }
+        let pick = self.world.rng.below(lengths.len() as i32).max(0) as usize;
+        lengths.get(pick).copied()
+    }
+
+    /// The lengths (milliseconds) of an animation tree's attack actions (`attk_v1`-`attk_v6`,
+    /// in order), each its animation's `.gad` duration over its speeds.
+    fn read_attack_lengths(&self, tree: &str) -> Vec<u64> {
+        let read = |name: &str| self.vfs.read(name).ok().map(|(d, _)| d);
+        let Some(t) = read(tree).and_then(|d| thedas_formats::anim::AnimTree::parse(&d).ok())
+        else {
+            return Vec::new();
+        };
+        (1..=6)
+            .filter_map(|v| {
+                let node = t.action(&format!("attk_v{v}"))?;
+                let ani = node.animation.as_ref()?;
+                let gad = format!("{}.gad", ani.strip_suffix(".ani").unwrap_or(ani));
+                let info = thedas_formats::anim::AnimInfo::parse(&read(&gad)?).ok()?;
+                let speed = (node.speed * info.speed).max(0.01);
+                Some((info.duration / speed * 1000.0).round() as u64)
+            })
+            .collect()
+    }
+}
+
+/// The animation tree a creature's melee attacks come from: a humanoid's (`combat_humanoid`)
+/// by its weapons (the main hand's kind and slots, the off hand's kind; see
+/// [`Sim::melee_attack_ms`]), any other creature's its own combat tree. Provisional.
+pub fn attack_tree(combat_tree: &str, main: &str, main_slots: i64, off: &str) -> String {
+    if combat_tree != "combat_humanoid.anb" || main != "melee" {
+        return combat_tree.to_string();
+    }
+    match off {
+        "melee" => "dw.anb",
+        "shield" => "ws.anb",
+        _ if main_slots == 1 => "tw.anb",
+        _ => "ow.anb",
+    }
+    .to_string()
+}
+
+impl Sim {
+    /// `GetWeaponStyle`: `WEAPONSTYLE_NONE` without a main-hand weapon; with a melee one,
+    /// `DUAL` beside an off-hand melee weapon, `TWOHANDED` for one that fits only the main
+    /// hand, else `SINGLE`; ranged weapons and wands `SINGLE`. Provisional: the executable
+    /// keeps the style in the creature's combat state (0x6a3c30); how it sets it is not
+    /// traced, so it is read from the weapons as [`attack_tree`] reads them.
+    pub fn weapon_style(&self, id: ObjectId) -> i32 {
+        let Some(o) = self.world.get(id) else {
+            return constant_of(self, "WEAPONSTYLE_NONE");
+        };
+        let base = |slot: &str| {
+            let slot = constant_of(self, slot);
+            o.equipment
+                .get(&slot)
+                .and_then(|i| self.world.get(*i))
+                .and_then(|i| i.fields.get("BaseItem").copied())
+        };
+        let Some(main) = base("INVENTORY_SLOT_MAIN") else {
+            return constant_of(self, "WEAPONSTYLE_NONE");
+        };
+        let items = self.world.tables().get(6, "");
+        let kind = |b: Option<i32>| {
+            b.and_then(
+                |b| match items.as_ref()?.cell_by_hash(COL_ITEM_TYPE, b as i64)? {
+                    thedas_formats::gda::Cell::String(s) => {
+                        Some(crate::engine::clean(s).to_ascii_lowercase())
+                    }
+                    _ => None,
+                },
+            )
+            .unwrap_or_default()
+        };
+        let slots = items
+            .as_ref()
+            .and_then(
+                |t| match t.cell_by_hash(COL_EQUIPPABLE_SLOTS, main as i64)? {
+                    thedas_formats::gda::Cell::Int(v) => Some(*v),
+                    _ => None,
+                },
+            )
+            .unwrap_or(0);
+        let name = match attack_tree(
+            "combat_humanoid.anb",
+            &kind(Some(main)),
+            slots,
+            &kind(base("INVENTORY_SLOT_OFFHAND")),
+        )
+        .as_str()
+        {
+            "dw.anb" => "WEAPONSTYLE_DUAL",
+            "tw.anb" => "WEAPONSTYLE_TWOHANDED",
+            _ => "WEAPONSTYLE_SINGLE",
+        };
+        constant_of(self, name)
+    }
+}
+
 /// How close a melee attacker gets before swinging (metres) when neither side's size is
 /// known. Provisional: rules_core counts any melee attack from beyond 5 m as a miss.
 pub const MELEE_REACH: f32 = 2.0;
@@ -1459,5 +1640,25 @@ mod tests {
         s.world.queue.clear();
         s.update_perception();
         assert!(s.world.get(hero).unwrap().combat.perceived.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod attack_tree_tests {
+    use super::attack_tree;
+
+    #[test]
+    fn a_humanoids_weapons_pick_its_attack_tree() {
+        let h = "combat_humanoid.anb";
+        assert_eq!(attack_tree(h, "melee", 3, "shield"), "ws.anb");
+        assert_eq!(attack_tree(h, "melee", 3, "melee"), "dw.anb");
+        assert_eq!(attack_tree(h, "melee", 1, ""), "tw.anb");
+        assert_eq!(attack_tree(h, "melee", 3, ""), "ow.anb");
+        assert_eq!(attack_tree(h, "", 0, ""), h, "unarmed");
+        assert_eq!(attack_tree(h, "ranged", 1, ""), h);
+        assert_eq!(
+            attack_tree("c_doga_cbt.anb", "melee", 3, ""),
+            "c_doga_cbt.anb"
+        );
     }
 }

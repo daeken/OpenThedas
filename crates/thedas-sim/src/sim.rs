@@ -95,6 +95,8 @@ pub struct Sim {
     /// The length of each weapon animation tree's fire animation, in milliseconds (see
     /// `Sim::fire_ms`).
     pub(crate) fire_lengths: HashMap<String, Option<u64>>,
+    /// Attack animation lengths by combat animation tree (see `Sim::melee_attack_ms`).
+    pub(crate) attack_lengths: HashMap<String, Vec<u64>>,
     /// Each area's doors and their doorways' grid cells (doors do not move; see
     /// `Sim::closed_doors`).
     pub(crate) door_cells: HashMap<ObjectId, Arc<Vec<crate::nav::Doorway>>>,
@@ -281,6 +283,7 @@ impl Sim {
             area_layouts: HashMap::new(),
             nav_grids: HashMap::new(),
             fire_lengths: HashMap::new(),
+            attack_lengths: HashMap::new(),
             door_cells: HashMap::new(),
             walk_blocked_by: None,
             talk: None,
@@ -1545,13 +1548,18 @@ impl Sim {
                         } else {
                             0
                         };
+                        // A melee swing the rules gave no duration lasts its animation.
+                        let set = self.world.get(id).and_then(|o| o.combat.attack_ms);
+                        let unset = if set.is_none() && cmd.name == "CommandAttack" && fire == 0 {
+                            self.melee_attack_ms(id)
+                        } else {
+                            None
+                        };
                         Some(
                             self.world
                                 .get(id)
                                 .map_or(crate::combat::DEFAULT_ATTACK_MS, |o| {
-                                    o.combat
-                                        .attack_ms
-                                        .unwrap_or(crate::combat::DEFAULT_ATTACK_MS)
+                                    set.or(unset).unwrap_or(crate::combat::DEFAULT_ATTACK_MS)
                                         + o.combat.aim_ms.unwrap_or(0)
                                 })
                                 + fire,
