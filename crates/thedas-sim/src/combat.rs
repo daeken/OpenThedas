@@ -759,6 +759,34 @@ impl Sim {
             .unwrap_or_default()
     }
 
+    /// Makes `set` (0 or 1) a creature's active weapon set, swapping the weapon slots with
+    /// the inactive set's; any other value (`INVALID_WEAPON_SET`) takes the next set. As
+    /// DAOrigins.exe's creature switch (0x6a8fa0) does for both `SwitchWeaponSet` (0x65ccc0)
+    /// and the `CommandSwitchWeaponSet` command's executor (0x7a1ed0). Provisional: no equip
+    /// events are sent for the swap.
+    pub fn switch_weapon_set(&mut self, id: ObjectId, set: i32) {
+        let Some(o) = self.world.get_mut(id) else {
+            return;
+        };
+        let now = o.fields.get("ActiveWeaponSet").copied().unwrap_or(0);
+        let to = match set {
+            s @ (0 | 1) => s,
+            _ => 1 - now,
+        };
+        if to != now {
+            for slot in crate::world::WEAPON_SET_SLOTS {
+                let held = o.equipment.remove(&slot);
+                if let Some(i) = o.other_set.remove(&slot) {
+                    o.equipment.insert(slot, i);
+                }
+                if let Some(i) = held {
+                    o.other_set.insert(slot, i);
+                }
+            }
+        }
+        o.fields.insert("ActiveWeaponSet".into(), to);
+    }
+
     /// Orders a creature to attack another, as the player does by clicking an enemy.
     pub fn order_attack(&mut self, attacker: ObjectId, target: ObjectId) {
         let cmd = crate::world::Command {
