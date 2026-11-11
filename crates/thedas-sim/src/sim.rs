@@ -221,6 +221,21 @@ enum Approach {
 const MELEE_TALENT_REACH: f32 = 1.2;
 const MELEE_TALENT_TOLERANCE: f32 = 1.0;
 
+/// How often an attacker or caster walking up to a creature checks whether it can start
+/// (milliseconds). DAOrigins.exe runs a command's executor every update and the attack's
+/// start step (0x7a87c0) tests the two creatures' current positions (0x6a3dc0); the
+/// simulation has no frames, so it looks this often. Provisional.
+const APPROACH_CHECK_MS: u64 = 100;
+
+/// How far inside its reach a melee attacker's place on the target's ring is (metres).
+/// Provisional.
+pub(crate) const MELEE_RING_INSET: f32 = 0.05;
+
+/// How far the place an approach is heading for may drift (the target having moved) before
+/// the walker sets off again for the new one (metres). Provisional: the executable's
+/// re-pathing rule is not traced.
+const APPROACH_REPLAN: f32 = 1.0;
+
 /// What the simulation does when a script starts character generation, since there is no
 /// player at the character-creation screens.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -593,6 +608,17 @@ impl Sim {
             // first on a tie. Both run at their own time, so delays chain correctly.
             let event = self.world.queue.keys().next().map(|k| k.0);
             let command = self.next_command();
+            // Walkers closing in on a creature look again every so often: the target may
+            // have come into reach, or moved away from where they are heading.
+            if let Some(w) = self.approach_check_due() {
+                let first = event.into_iter().chain(command.map(|c| c.0)).min();
+                if w <= until && first.is_none_or(|f| w < f) {
+                    self.world.time_ms = w;
+                    self.advance_movers();
+                    self.close_approaches();
+                    continue;
+                }
+            }
             match (event, command) {
                 (Some(e), c) if e <= until && c.is_none_or(|(d, _)| e <= d) => {
                     if let Some((due, q)) = self.world.pop_due(until) {
@@ -1333,6 +1359,92 @@ impl Sim {
         }
     }
 
+    /// When walkers closing in on a creature next look again (see [`APPROACH_CHECK_MS`]):
+    /// `None` when nobody is.
+    fn approach_check_due(&self) -> Option<u64> {
+        self.world
+            .objects
+            .values()
+            .any(|o| {
+                o.commands.first().is_some_and(|c| {
+                    c.approach.is_some()
+                        && c.from.is_some()
+                        && c.target.is_some_and(|t| t != o.id)
+                        && (c.name == "CommandAttack" || c.name == "CommandUseAbility")
+                })
+            })
+            .then_some(self.world.time_ms + APPROACH_CHECK_MS)
+    }
+
+    /// Stops a walker whose target has come within reach (its attack or ability starts
+    /// next), and sends one whose target has moved off toward the new place, from where it
+    /// stands. DAOrigins.exe's attack start step (0x7a87c0) tests the creatures' current
+    /// positions with the melee range test (0x6a3dc0), so a target that walks up to its
+    /// attacker is in reach at once; when the rest of the walk is re-planned is provisional
+    /// ([`APPROACH_REPLAN`]).
+    fn close_approaches(&mut self) {
+        let walkers: Vec<(ObjectId, Command)> = self
+            .world
+            .objects
+            .values()
+            .filter_map(|o| {
+                let c = o.commands.first()?;
+                (c.approach.is_some()
+                    && c.from.is_some()
+                    && c.target.is_some_and(|t| t != o.id)
+                    && (c.name == "CommandAttack" || c.name == "CommandUseAbility"))
+                    .then(|| (o.id, c.clone()))
+            })
+            .collect();
+        for (id, cmd) in walkers {
+            let now = if cmd.name == "CommandAttack" {
+                self.approach_point(id, &cmd)
+            } else {
+                self.ability_approach(id, &cmd)
+            };
+            // A melee attacker under way walks on until the target is within the bodies'
+            // reach itself; the test's slack (`MELEE_REACH_TOLERANCE`) only spares a walk
+            // to one that is already that close. Provisional.
+            // So does one walking up to use a personal-range talent (its slack being
+            // `MELEE_TALENT_TOLERANCE`).
+            let melee_reach = match cmd.target {
+                Some(t) if cmd.name == "CommandAttack" => (self.attack_reach(id)
+                    <= crate::combat::MELEE_REACH)
+                    .then(|| self.reach_to(id, t)),
+                Some(t) if self.abi_int(cmd.ints.first().copied().unwrap_or(0), "range") == 0 => {
+                    Some(self.body_radius(id) + self.body_radius(t) + MELEE_TALENT_REACH)
+                }
+                _ => None,
+            };
+            let reached = match (now, melee_reach, cmd.target) {
+                (Approach::InReach, Some(reach), Some(t)) => {
+                    let (a, b) = (
+                        self.world.get(id).map(|o| o.position).unwrap_or_default(),
+                        self.world.get(t).map(|o| o.position).unwrap_or_default(),
+                    );
+                    ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt() <= reach + 0.001
+                }
+                (Approach::InReach, _, _) => true,
+                _ => false,
+            };
+            let again = match now {
+                Approach::InReach => reached,
+                Approach::Walk(_, p) => cmd.approach.is_some_and(|q| {
+                    ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt() > APPROACH_REPLAN
+                }),
+                _ => false,
+            };
+            if again {
+                if let Some(c) = self.world.get_mut(id).and_then(|o| o.commands.first_mut()) {
+                    c.approach = None;
+                    c.due = None;
+                    c.from = None;
+                    c.path.clear();
+                }
+            }
+        }
+    }
+
     /// Where an attacker goes before its attack can start. Melee attackers take a place on
     /// the target's melee ring: the free one nearest their line of approach, on a circle at
     /// the two bodies' reach (`Sim::reach_to`), a place being free when no other creature's
@@ -1356,10 +1468,16 @@ impl Sim {
         let (a, b) = (me.position, t.position);
         let d = crate::engine::dist(a, b);
         let reach = self.reach_to(id, target);
-        if d <= reach + 0.05 {
+        let ranged = self.attack_reach(id) > crate::combat::MELEE_REACH;
+        // A melee attack starts once the target is within reach and the executable's slack,
+        // across the ground (0x6a3dc0).
+        let ground = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+        if (ranged && d <= reach + 0.05)
+            || (!ranged && ground <= reach + crate::combat::MELEE_REACH_TOLERANCE)
+        {
             return Approach::InReach;
         }
-        if reach > crate::combat::MELEE_REACH {
+        if ranged {
             let f = (d - reach) / d;
             let p = [
                 a[0] + (b[0] - a[0]) * f,
@@ -1369,7 +1487,9 @@ impl Sim {
             return Approach::Walk(d - reach, p);
         }
         let mine = self.body_radius(id);
-        let ring = reach - crate::combat::MELEE_GAP * 0.5;
+        // Places just inside the reach. Provisional: the executable's ring (built from
+        // apr_base.gda and the meleering tables, 0x6ac2a0) is not traced further.
+        let ring = reach - MELEE_RING_INSET;
         let near = ring + mine + 2.0;
         let others: Vec<([f32; 3], f32)> = self
             .world
@@ -3265,13 +3385,14 @@ mod tests {
         s.tick(1000);
         let x = s.world.get(a).unwrap().position[0];
         assert!((x - 5.0).abs() < 0.01, "{x}");
-        // It stops on the target's melee ring, facing it: two default bodies apart plus
-        // half the melee gap.
+        // It stops at the target's reach, facing it: two default bodies apart plus the
+        // melee gap (its place on the ring is just inside).
         s.tick(1500);
-        let ring = 2.0 * crate::combat::DEFAULT_RADIUS + crate::combat::MELEE_GAP * 0.5;
+        let reach = 2.0 * crate::combat::DEFAULT_RADIUS + crate::combat::MELEE_GAP;
         let o = s.world.get(a).unwrap();
+        let x = o.position[0];
         assert!(
-            (o.position[0] - (12.0 - ring)).abs() < 0.01,
+            x >= 12.0 - reach - 0.01 && x <= 12.0 - reach + MELEE_RING_INSET + 0.01,
             "{:?}",
             o.position
         );
@@ -3282,13 +3403,106 @@ mod tests {
         );
     }
 
+    /// Two creatures in an area, `a` at `pa` attacking `t` at `pt`, which walks to `to`.
+    fn chase(pa: [f32; 3], pt: [f32; 3], to: [f32; 3]) -> (Sim, ObjectId, ObjectId) {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let (a, t) = (
+            s.world.spawn(ObjectKind::Creature, "a"),
+            s.world.spawn(ObjectKind::Creature, "t"),
+        );
+        for (id, p) in [(a, pa), (t, pt)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = p;
+        }
+        let cmd = |name: &str, target, location| Command {
+            ty: 0,
+            name: String::from(name),
+            target,
+            location,
+            seconds: 0.0,
+            ints: Vec::new(),
+            strings: Vec::new(),
+            due: None,
+            from: None,
+            approach: None,
+            ring_wait: false,
+            path: Vec::new(),
+        };
+        let walk = cmd(
+            "CommandMoveToLocation",
+            None,
+            Some(crate::world::Location {
+                area,
+                position: to,
+                facing: 0.0,
+            }),
+        );
+        s.world.get_mut(t).unwrap().commands.push(walk);
+        let attack = cmd("CommandAttack", Some(t), None);
+        s.world.get_mut(a).unwrap().commands.push(attack);
+        (s, a, t)
+    }
+
+    #[test]
+    fn a_target_walking_up_is_attacked_where_they_meet() {
+        // They close at 10 m/s: within reach (two default bodies and the gap, 2 m) after
+        // 1.8 s, the attacker at about 9 m, far short of where it was first heading.
+        let (mut s, a, _) = chase([0.0; 3], [20.0, 0.0, 0.0], [0.0; 3]);
+        s.tick(2000);
+        let o = s.world.get(a).unwrap();
+        assert!(o.position[0] < 10.0, "{:?}", o.position);
+        assert_eq!(
+            o.commands.first().map(|c| (c.name.as_str(), c.approach)),
+            Some(("CommandAttack", None)),
+            "the swing is under way"
+        );
+    }
+
+    #[test]
+    fn an_attacker_follows_a_target_that_moves_off() {
+        // The target walks 10 m sideways; the attacker ends up beside it, not where it stood.
+        let (mut s, a, t) = chase([0.0; 3], [10.0, 0.0, 0.0], [10.0, 10.0, 0.0]);
+        s.tick(5000);
+        let (pa, pt) = (
+            s.world.get(a).unwrap().position,
+            s.world.get(t).unwrap().position,
+        );
+        let d = ((pa[0] - pt[0]).powi(2) + (pa[1] - pt[1]).powi(2)).sqrt();
+        // Within the reach and its slack, from where the swing may start (0x6a3dc0).
+        let reach = 2.0 * crate::combat::DEFAULT_RADIUS
+            + crate::combat::MELEE_GAP
+            + crate::combat::MELEE_REACH_TOLERANCE;
+        assert!(d <= reach + 0.01, "{pa:?} {pt:?}");
+        assert!(pa[1] > 5.0, "it went after the target: {pa:?}");
+    }
+
+    #[test]
+    fn a_melee_attack_starts_within_the_reach_slack() {
+        // 2.8 m apart: past the 2 m reach but within its 1 m slack, so no walk.
+        let (mut s, a, _) = chase([0.0; 3], [2.8, 0.0, 0.0], [2.8, 0.0, 0.0]);
+        if let Some(o) = s.world.get_mut(a) {
+            o.commands.truncate(1);
+        }
+        s.tick(1);
+        let o = s.world.get(a).unwrap();
+        assert_eq!(o.position, [0.0; 3]);
+        assert!(
+            o.commands
+                .first()
+                .is_some_and(|c| c.approach.is_none() && c.due.is_some())
+        );
+    }
+
     #[test]
     fn a_full_melee_ring_turns_attackers_away() {
         let mut s = sim();
         let area = s.world.spawn(ObjectKind::Area, "a");
         let t = s.world.spawn(ObjectKind::Creature, "target");
         let late = s.world.spawn(ObjectKind::Creature, "late");
-        let ring = 2.0 * crate::combat::DEFAULT_RADIUS + crate::combat::MELEE_GAP * 0.5;
+        let ring =
+            2.0 * crate::combat::DEFAULT_RADIUS + crate::combat::MELEE_GAP - MELEE_RING_INSET;
         // Bodies all round the target, close enough that no place is left.
         let mut crowd = Vec::new();
         for k in 0..12 {
