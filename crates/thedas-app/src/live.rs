@@ -87,6 +87,20 @@ pub enum Start<'a> {
     Area(&'a str),
 }
 
+/// Who gets a portrait drawn: the party, and the followers picked in an open party picker
+/// (partypicker.gfx shows theirs).
+pub fn portrait_subjects(sim: &Sim) -> Vec<ObjectId> {
+    let mut v = thedas_sim::engine::party_of(sim);
+    if let Some(p) = &sim.world.party_picker {
+        for &m in &p.selected {
+            if !v.contains(&m) {
+                v.push(m);
+            }
+        }
+    }
+    v
+}
+
 impl Live {
     pub fn open(install: &Path, module: &str, start: Start, shaders: &str) -> Result<Self> {
         let opts = thedas_sim::session::SessionOptions {
@@ -119,6 +133,8 @@ impl Live {
         }
         // The player is in control (saves made by test drivers may have the autopilot on).
         sim.world.autopilot = false;
+        // The player chooses the party when the scripts show the picker.
+        sim.party_picker_policy = thedas_sim::sim::PartyPickerPolicy::Player;
         Ok(Self {
             sim: Arc::new(Mutex::new(sim)),
             paused: false,
@@ -582,6 +598,16 @@ impl Live {
                 _ => format!("ability {} not aimed", aim.ability),
             });
         }
+        // The party picker is open: a click on a follower picks or drops them.
+        if sim.world.party_picker.is_some() {
+            return Some(match pick {
+                Pick::Object(id) if sim.party_picker_toggle(id) => {
+                    let tag = sim.world.get(id).map(|o| o.tag.clone()).unwrap_or_default();
+                    format!("party picker: {tag} picked or dropped")
+                }
+                _ => "party picker: nobody to pick there".to_string(),
+            });
+        }
         let leader = sim.world.controlled()?;
         match pick {
             Pick::Ground(p) => {
@@ -710,7 +736,7 @@ impl Live {
             }
         };
         let mut out = Vec::new();
-        for id in thedas_sim::engine::party_of(&sim) {
+        for id in portrait_subjects(&sim) {
             let Some(o) = sim.world.get(id) else { continue };
             if o.area.is_none() || o.area != sim.world.area {
                 continue;
