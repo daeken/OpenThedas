@@ -601,6 +601,10 @@ impl Sim {
             None => None,
         };
         let Some(effect) = removed else { return false };
+        // An area of effect goes with its effect (DAOrigins.exe 0x7a0520).
+        let aoe = (effect.ty == crate::aoe::EFFECT_TYPE_AOE)
+            .then(|| effect.objects.first().copied())
+            .flatten();
         let mut ev = self.new_event("REMOVE_EFFECT", effect.creator);
         ev.objects = vec![target];
         let saved = self.current_effect.replace((effect, true));
@@ -611,6 +615,9 @@ impl Sim {
         }
         self.current_effect = saved;
         self.current_effect_target = saved_target;
+        if let Some(a) = aoe {
+            self.destroy_aoe(a);
+        }
         true
     }
 
