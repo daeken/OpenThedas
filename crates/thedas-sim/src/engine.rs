@@ -3097,6 +3097,30 @@ pub fn call(
                 .and_then(|o| o.fields.get("TreasureCategory").copied())
                 .unwrap_or(0),
         )),
+        // One target's share of an area ability: DAOrigins.exe (0x65c580) queues event 1066
+        // to the calling script's object, after a random 0-149 ms plus the base delay, with
+        // the ability (int 0), caster, target and the location's area (objects 0-2), its
+        // position (floats 0-2) and the running script's name (string 0), so that script
+        // (spell_aoe_instant and the like) applies it.
+        "SetIndividualImpactAOEEvent" => {
+            let l = match h.sim.world.handle(handle(a, 3)) {
+                Some(EngineData::Location(l)) => Some(*l),
+                _ => None,
+            };
+            let mut ev = Event {
+                ty: 1066,
+                creator: Some(caller),
+                ..Default::default()
+            };
+            ev.ints = vec![int(a, 2)];
+            ev.objects = vec![obj(a, 0), obj(a, 1), l.map_or(OBJECT_INVALID, |l| l.area)];
+            ev.floats = l.map_or(vec![0.0; 3], |l| l.position.to_vec());
+            let script = h.script.trim_end_matches(".ncs").to_string();
+            ev.strings = vec![script.clone()];
+            let delay = h.sim.world.rng.below(150).max(0) as u64 + int(a, 4).max(0) as u64;
+            h.sim.world.queue_event(delay, caller, ev, Some(script));
+            void()
+        }
         // Presentation only.
         "PlayAdditiveAnimation" | "SignalDamage" => void(),
         "SetCreatureIsStatue" => {
@@ -3433,6 +3457,9 @@ mod tests {
         int GetEffectType(effect e) = 29;\n\
         string GetPlotGUID(string s) = 30;\n\
         int GetPlaceableBaseType(object o) = 40;\n\
+        #define ENGINE_STRUCTURE_1 location\n\
+        location Location(object a, vector v, float f) = 41;\n\
+        void SetIndividualImpactAOEEvent(object c, object t, int n, location l, int d = 0) = 42;\n\
         int FOLLOWER_STATE_AVAILABLE = 2;\n\
         int PROPERTY_SIMPLE_EXPERIENCE = 19;\n\
         int PROPERTY_SIMPLE_LEVEL = 15;\n";
@@ -3589,6 +3616,55 @@ mod tests {
             });
         }
         assert_eq!(flags(&mut s), Some(Value::Int(7 | 512)));
+    }
+
+    #[test]
+    fn an_area_ability_queues_each_targets_impact_back_to_its_script() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let caster = s.world.spawn(ObjectKind::Creature, "mage");
+        let foe = s.world.spawn(ObjectKind::Creature, "foe");
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        let l = run(
+            &mut s,
+            caster,
+            "Location",
+            &[
+                Value::Object(area),
+                Value::Vector([1.0, 2.0, 3.0]),
+                Value::Float(0.0),
+            ],
+        )
+        .unwrap();
+        let f = s
+            .table
+            .function_by_name("SetIndividualImpactAOEEvent")
+            .cloned()
+            .unwrap();
+        let mut h = ScriptHost {
+            sim: &mut s,
+            event: None,
+            script: "spell_aoe_instant.ncs".into(),
+        };
+        let args = [
+            Value::Object(caster),
+            Value::Object(foe),
+            Value::Int(14000),
+            l,
+            Value::Int(500),
+        ];
+        call(&mut h, caster, &f, &args).unwrap().unwrap();
+        let q: Vec<_> = s.world.queue.iter().collect();
+        assert_eq!(q.len(), 1);
+        let ((due, _), e) = q[0];
+        assert!((500..650).contains(due), "{due}");
+        assert_eq!(e.target, caster);
+        assert_eq!(e.script.as_deref(), Some("spell_aoe_instant"));
+        assert_eq!(e.event.ty, 1066);
+        assert_eq!(e.event.ints, vec![14000]);
+        assert_eq!(e.event.objects, vec![caster, foe, area]);
+        assert_eq!(e.event.floats, vec![1.0, 2.0, 3.0]);
+        assert_eq!(e.event.strings, vec!["spell_aoe_instant".to_string()]);
     }
 
     #[test]
