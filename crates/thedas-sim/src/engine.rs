@@ -1106,6 +1106,25 @@ pub fn call(
             void()
         }
         "GetGameDifficulty" => ok(Value::Int(1)),
+        // The headless simulation has no graphics setting; scripts only pick visual effects
+        // by it. Provisional: medium (1).
+        "GetGraphicsDetailLevel" => ok(Value::Int(1)),
+        // The one active ability an item grants on the quickbar: its template's AbilityID.
+        "GetItemAbilityId" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .and_then(|o| o.fields.get("AbilityID").copied())
+                .unwrap_or_else(|| constant(&h.sim.table, "ABILITY_INVALID")),
+        )),
+        // Casting: an ability in hand whose cast has started (it has a time to land).
+        // Provisional: the simulation's cast runs from ABILITY_CAST_START to its impact.
+        "IsConjuring" => ok(b(h.object(obj(a, 0)).is_some_and(|o| {
+            o.commands.first().is_some_and(|c| {
+                c.name == "CommandUseAbility"
+                    && c.due.is_some()
+                    && c.approach.is_none()
+                    && c.from.is_none()
+            })
+        }))),
         "GetMaxLevel" => ok(Value::Int(20)),
         "GetTime" => ok(Value::Int((h.sim.world.time_ms / 1000) as i32)),
         "ReadIniEntry" => ok(Value::String(String::new())),
@@ -1319,6 +1338,20 @@ pub fn call(
             let (i, v) = (int(a, 1), int(a, 2));
             e.engine_ints.retain(|x| x.0 != i);
             e.engine_ints.push((i, v));
+            let hd = h.sim.world.store(EngineData::Effect(e));
+            ok(Value::Engine {
+                ty: ty.effect,
+                handle: Some(hd),
+            })
+        }
+        "SetEffectEngineVector" => {
+            let mut e = match h.sim.world.handle(handle(a, 0)) {
+                Some(EngineData::Effect(e)) => e.clone(),
+                _ => Effect::default(),
+            };
+            let i = int(a, 1);
+            e.engine_vectors.retain(|x| x.0 != i);
+            e.engine_vectors.push((i, vector(a, 2)));
             let hd = h.sim.world.store(EngineData::Effect(e));
             ok(Value::Engine {
                 ty: ty.effect,
@@ -2366,7 +2399,9 @@ pub fn call(
             h.sim.world.world_map.gui_status = int(a, 0);
             void()
         }
-        "OpenPrimaryWorldMap" => {
+        // The Fade map: the Circle Tower's Fade scripts make it the primary map before they
+        // open it (cir000ip_fade_pedistal). Provisional: taken to open the primary map.
+        "OpenPrimaryWorldMap" | "OpenFadeMap" => {
             h.sim.world.world_map.open = true;
             void()
         }
@@ -3492,6 +3527,12 @@ mod tests {
         int GetEffectType(effect e) = 29;\n\
         string GetPlotGUID(string s) = 30;\n\
         int GetPlaceableBaseType(object o) = 40;\n\
+        int ABILITY_INVALID = 0;\n\
+        int GetItemAbilityId(object o) = 46;\n\
+        int IsConjuring(object o) = 47;\n\
+        void OpenFadeMap() = 48;\n\
+        int GetGraphicsDetailLevel() = 49;\n\
+        effect SetEffectEngineVector(effect e, int i, vector v) = 50;\n\
         int EVENT_TYPE_PARTYMEMBER_ADDED = 66;\n\
         int EVENT_TYPE_PARTYMEMBER_DROPPED = 67;\n\
         #define ENGINE_STRUCTURE_1 location\n\
@@ -4187,6 +4228,80 @@ mod tests {
         let state = |s: &mut Sim, o| run(s, hero, "GetFollowerState", &[Value::Object(o)]);
         assert_eq!(state(&mut s, hero), Some(Value::Int(1)));
         assert_eq!(state(&mut s, ally), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn item_abilities_casting_and_the_fade_map() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let mage = s.world.spawn(ObjectKind::Creature, "mage");
+        let rune = s.world.spawn(ObjectKind::Item, "rune");
+        let stone = s.world.spawn(ObjectKind::Item, "stone");
+        s.world
+            .get_mut(rune)
+            .unwrap()
+            .fields
+            .insert("AbilityID".into(), 200011);
+        let ability = |s: &mut Sim, o| run(s, mage, "GetItemAbilityId", &[Value::Object(o)]);
+        assert_eq!(ability(&mut s, rune), Some(Value::Int(200011)));
+        assert_eq!(
+            ability(&mut s, stone),
+            Some(Value::Int(0)),
+            "ABILITY_INVALID"
+        );
+        let conjuring = |s: &mut Sim| run(s, mage, "IsConjuring", &[Value::Object(mage)]);
+        assert_eq!(conjuring(&mut s), Some(Value::Int(0)));
+        s.world
+            .get_mut(mage)
+            .unwrap()
+            .commands
+            .push(crate::world::Command {
+                ty: 0,
+                name: "CommandUseAbility".into(),
+                target: None,
+                location: None,
+                seconds: 0.0,
+                ints: vec![],
+                strings: vec![],
+                due: Some(5000),
+                from: None,
+                approach: None,
+                ring_wait: false,
+                path: vec![],
+            });
+        assert_eq!(
+            conjuring(&mut s),
+            Some(Value::Int(1)),
+            "its cast has started"
+        );
+        run(&mut s, mage, "OpenFadeMap", &[]);
+        assert!(s.world.world_map.open);
+        assert_eq!(
+            run(&mut s, mage, "GetGraphicsDetailLevel", &[]),
+            Some(Value::Int(1))
+        );
+        let e = run(
+            &mut s,
+            mage,
+            "SetEffectEngineVector",
+            &[
+                Value::Engine {
+                    ty: 3,
+                    handle: None,
+                },
+                Value::Int(0),
+                Value::Vector([1.0, 2.0, 3.0]),
+            ],
+        );
+        let Some(Value::Engine { handle, .. }) = e else {
+            panic!("{e:?}")
+        };
+        match s.world.handle(handle) {
+            Some(EngineData::Effect(e)) => {
+                assert_eq!(e.engine_vectors, vec![(0, [1.0, 2.0, 3.0])])
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
