@@ -216,6 +216,10 @@ pub const STUBS: &[&str] = &[
     "LogStoryEvent",
 ];
 
+/// `PROPERTY_DEPLETABLE_MANA_STAMINA`, the property the mana functions use (DAOrigins.exe
+/// indexes the creature's property list with 8 directly).
+const PROPERTY_MANA_STAMINA: i32 = 8;
+
 /// The effect behind `effect` as an apply function hands it on: with its duration type, a
 /// temporary effect's end (`duration` seconds from now), its creator (if valid) and the
 /// ability it comes from (`GetEffectAbilityID`; if given and not 0).
@@ -1025,6 +1029,36 @@ pub fn call(
                 h.sim.property_total(id, p)
             };
             ok(Value::Float(v))
+        }
+        // Mana (or stamina): DAOrigins.exe reads and writes the creature's depletable
+        // property 8 (PROPERTY_DEPLETABLE_MANA_STAMINA) directly: GetCreatureMana its current
+        // value (0x66cc30), GetCreatureMaxMana its total (0x66cdc0), both truncated to
+        // whole numbers and -1 for what is not a creature; SetCreatureMana its current value
+        // (0x66cd00). Provisional: the setter is taken to keep the value within 0 and the
+        // total as SetCreatureProperty's does.
+        "GetCreatureMana" | "GetCreatureMaxMana" => {
+            let (id, p) = (obj(a, 0), PROPERTY_MANA_STAMINA);
+            let creature = h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature);
+            ok(Value::Int(if !creature {
+                -1
+            } else if name == "GetCreatureMana" {
+                h.object(id)
+                    .and_then(|o| o.properties.get(&p))
+                    .map_or(0.0, |v| v.1) as i32
+            } else {
+                h.sim.property_total(id, p) as i32
+            }))
+        }
+        "SetCreatureMana" => {
+            let (id, p) = (obj(a, 0), PROPERTY_MANA_STAMINA);
+            if h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature) {
+                let max = h.sim.property_total(id, p);
+                if let Some(o) = h.sim.world.get_mut(id) {
+                    o.properties.entry(p).or_insert((0.0, 0.0)).1 =
+                        (int(a, 1) as f32).clamp(0.0, max.max(0.0));
+                }
+            }
+            void()
         }
         "SetCreatureProperty" | "UpdateCreatureProperty" => {
             let (id, p, value, vt) = (obj(a, 0), int(a, 1), float(a, 2), int(a, 3));
@@ -4953,7 +4987,10 @@ mod coverage_tests {
         #define ENGINE_STRUCTURE_3 effect\n\
         location Location(object a, vector v, float f) = 41;\n\
         void Engine_ApplyEffectOnParty(int d, effect e, float f = 0.0, object c = OBJECT_INVALID, int n = 0, int x = FALSE) = 70;\n\
-        object[] GetNearestObjectToLocation(location l, int t = 4294967295, int n = 1) = 71;\n";
+        object[] GetNearestObjectToLocation(location l, int t = 4294967295, int n = 1) = 71;\n\
+        int GetCreatureMana(object o) = 72;\n\
+        void SetCreatureMana(object o, int n) = 73;\n\
+        int GetCreatureMaxMana(object o) = 74;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -5070,5 +5107,37 @@ mod coverage_tests {
         // Fewer than one asked for means one; OBJECT_TYPE_ALL takes the placeable too.
         assert_eq!(nearest(&mut s, 4294967295, 0), Some(objects(vec![chest])));
         assert_eq!(nearest(&mut s, 0, 3), Some(objects(Vec::new())));
+    }
+
+    #[test]
+    fn mana_is_the_mana_stamina_property() {
+        let mut s = sim();
+        let mage = s.world.spawn(ObjectKind::Creature, "mage");
+        let chest = s.world.spawn(ObjectKind::Placeable, "chest");
+        s.world
+            .get_mut(mage)
+            .unwrap()
+            .properties
+            .insert(PROPERTY_MANA_STAMINA, (40.0, 12.7));
+        let get = |s: &mut Sim, f: &str, o: ObjectId| run(s, o, f, &[Value::Object(o)]);
+        assert_eq!(get(&mut s, "GetCreatureMana", mage), Some(Value::Int(12)));
+        assert_eq!(
+            get(&mut s, "GetCreatureMaxMana", mage),
+            Some(Value::Int(40))
+        );
+        assert_eq!(get(&mut s, "GetCreatureMana", chest), Some(Value::Int(-1)));
+        assert_eq!(
+            get(&mut s, "GetCreatureMaxMana", chest),
+            Some(Value::Int(-1))
+        );
+        for (set, want) in [(30, 30), (90, 40), (-5, 0)] {
+            run(
+                &mut s,
+                mage,
+                "SetCreatureMana",
+                &[Value::Object(mage), Value::Int(set)],
+            );
+            assert_eq!(get(&mut s, "GetCreatureMana", mage), Some(Value::Int(want)));
+        }
     }
 }
