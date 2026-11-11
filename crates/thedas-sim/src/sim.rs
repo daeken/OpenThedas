@@ -91,6 +91,8 @@ pub struct Sim {
     pub auto_pause_combat: bool,
     /// Objects whose scripts' engine calls are all traced (log channel -6), for debugging.
     pub watch_calls: std::collections::BTreeSet<ObjectId>,
+    /// Followers whose front command is the move [`Sim::keep_party_together`] gave them.
+    following: std::collections::BTreeSet<ObjectId>,
     /// Tags (lowercase) whose objects' engine calls are traced too, including objects
     /// created later (an area not yet entered).
     pub watch_tags: std::collections::BTreeSet<String>,
@@ -236,6 +238,13 @@ pub(crate) const MELEE_RING_INSET: f32 = 0.05;
 /// re-pathing rule is not traced.
 const APPROACH_REPLAN: f32 = 1.0;
 
+/// How far a follower may fall from its place behind the leader before it runs after it
+/// (metres; see [`Sim::keep_party_together`]). Provisional.
+pub const FOLLOW_START: f32 = 2.0;
+/// How far its place may move from where a following follower is heading before it is sent
+/// on again (metres). Provisional.
+pub const FOLLOW_RETARGET: f32 = 1.0;
+
 /// What the simulation does when a script starts character generation, since there is no
 /// player at the character-creation screens.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -312,6 +321,7 @@ impl Sim {
             cutscene_policy: CutscenePolicy::default(),
             auto_pause_combat: false,
             watch_calls: Default::default(),
+            following: Default::default(),
             watch_tags: Default::default(),
             current_effect: None,
             current_effect_target: None,
@@ -577,6 +587,7 @@ impl Sim {
         let start = self.world.time_ms;
         let mut until = start + ms;
         self.update_perception();
+        self.keep_party_together();
         let mut held = 0;
         loop {
             // Engine work that waits for the current scripts: transitions, then cutscenes.
@@ -1258,6 +1269,111 @@ impl Sim {
                 let p = [pos[0] - c * back, pos[1] - s * back, pos[2]];
                 self.move_object(f, p, None);
             }
+        }
+    }
+
+    /// Keeps the party with the member the player controls as it moves by command (a click,
+    /// a script's move): out of combat, each follower that is alive, in the leader's area,
+    /// follows the leader (`SetFollowPartyLeader`, on unless turned off), is not fighting
+    /// and has nothing to do but wait or its own follow move runs to its place behind the
+    /// leader once it is more than [`FOLLOW_START`] from it, and is sent on again when that
+    /// place moves more than [`FOLLOW_RETARGET`] from where it is heading. Places are where
+    /// followers arrive with the leader (`behind`). Provisional: the original's party follow
+    /// (its distances, formation and pathing) is not traced; this keeps followers with the
+    /// leader the way [`Sim::follow_leader`] does for [`Sim::walk`].
+    pub fn keep_party_together(&mut self) {
+        let combat = constant(&self.table, "GM_COMBAT");
+        let Some(leader) = self.world.controlled().or(self.world.hero) else {
+            return;
+        };
+        let Some((pos, area, facing)) = self
+            .world
+            .get(leader)
+            .map(|o| (o.position, o.area, o.facing))
+        else {
+            return;
+        };
+        // Follow moves that have ended are no longer ours.
+        let ended: Vec<ObjectId> = self
+            .following
+            .iter()
+            .copied()
+            .filter(|&f| {
+                self.world.get(f).is_none_or(|o| {
+                    o.commands
+                        .first()
+                        .is_none_or(|c| c.name != "CommandMoveToLocation")
+                })
+            })
+            .collect();
+        for f in ended {
+            self.following.remove(&f);
+        }
+        if combat != 0 && self.world.game_mode == combat {
+            return;
+        }
+        let followers: Vec<ObjectId> = crate::engine::party_of(self)
+            .into_iter()
+            .filter(|&f| f != leader)
+            .collect();
+        for (i, f) in followers.into_iter().enumerate() {
+            let ours = self.following.contains(&f);
+            let Some(o) = self.world.get(f) else { continue };
+            let free = !o.dead
+                && o.area == area
+                && !o.combat.in_combat
+                && o.fields.get("FollowPartyLeader").copied().unwrap_or(1) != 0
+                && (ours || o.commands.first().is_none_or(|c| c.name == "CommandWait"));
+            if !free {
+                continue;
+            }
+            let place = behind(pos, facing, i);
+            let heading = o
+                .commands
+                .first()
+                .filter(|_| ours)
+                .and_then(|c| c.location)
+                .map(|l| l.position);
+            let due = match heading {
+                Some(h) => crate::engine::dist(h, place) > FOLLOW_RETARGET,
+                None => crate::engine::dist(o.position, place) > FOLLOW_START,
+            };
+            if !due {
+                continue;
+            }
+            let Some(area) = area else { continue };
+            let from = o.position;
+            let mut cmd = Command {
+                ty: constant(&self.table, "COMMAND_TYPE_MOVE_TO_LOCATION"),
+                name: "CommandMoveToLocation".into(),
+                target: None,
+                location: Some(crate::world::Location {
+                    area,
+                    position: place,
+                    facing: crate::world::facing_toward(place[0] - from[0], place[1] - from[1]),
+                }),
+                seconds: 0.0,
+                ints: Vec::new(),
+                strings: Vec::new(),
+                due: None,
+                from: None,
+                approach: None,
+                ring_wait: false,
+                path: Vec::new(),
+            };
+            // A follow move already under way goes on from where it has got to.
+            if ours {
+                self.advance_movers();
+                if let Some(now) = self.world.get(f).map(|o| o.position) {
+                    cmd.location.as_mut().expect("set above").facing =
+                        crate::world::facing_toward(place[0] - now[0], place[1] - now[1]);
+                }
+            }
+            if let Some(o) = self.world.get_mut(f) {
+                o.commands.clear();
+                o.commands.push(cmd);
+            }
+            self.following.insert(f);
         }
     }
 
@@ -3402,6 +3518,50 @@ mod tests {
         }
         assert!(at[0][1] > 0.0 && at[1][1] < 0.0);
         assert!(crate::engine::dist(at[0], at[2]) > 0.5);
+    }
+
+    #[test]
+    fn followers_keep_up_with_a_leader_moved_by_an_order() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let (dog, mage) = (
+            s.world.spawn(ObjectKind::Creature, "dog"),
+            s.world.spawn(ObjectKind::Creature, "mage"),
+        );
+        s.world.hero = Some(hero);
+        s.world.area = Some(area);
+        for (id, x) in [(hero, 0.0), (dog, -1.0), (mage, -2.0)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = [x, 0.0, 0.0];
+        }
+        s.world.get_mut(hero).unwrap().followers = vec![dog, mage];
+        // The player clicks 20 m ahead: only the leader is ordered.
+        s.order_move(hero, [20.0, 0.0, 0.0]);
+        for _ in 0..100 {
+            s.tick(100);
+        }
+        let at = |s: &Sim, id| s.world.get(id).unwrap().position;
+        assert!((at(&s, hero)[0] - 20.0).abs() < 0.01);
+        for f in [dog, mage] {
+            let d = crate::engine::dist(at(&s, f), at(&s, hero));
+            assert!(d < 3.0, "a follower stayed behind: {:?}", at(&s, f));
+        }
+        assert!(crate::engine::dist(at(&s, dog), at(&s, mage)) > 0.5);
+        // A follower told to stay put does.
+        s.world
+            .get_mut(mage)
+            .unwrap()
+            .fields
+            .insert("FollowPartyLeader".into(), 0);
+        let before = at(&s, mage);
+        s.order_move(hero, [40.0, 0.0, 0.0]);
+        for _ in 0..100 {
+            s.tick(100);
+        }
+        assert_eq!(at(&s, mage), before);
+        assert!(crate::engine::dist(at(&s, dog), at(&s, hero)) < 3.0);
     }
 
     #[test]
