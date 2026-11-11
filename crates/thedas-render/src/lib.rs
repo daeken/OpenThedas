@@ -21,6 +21,7 @@ pub mod gpu;
 pub mod material;
 pub mod post;
 pub mod scene;
+pub mod shadow;
 pub mod skeleton;
 
 pub use animate::{Animator, Clip};

@@ -244,6 +244,46 @@ impl ProgramSource for D3dSource {
     }
 }
 
+/// A shadow caster's material: `material` switched to its `PSSM` semantic (the submission
+/// queue's `force semantic PSSM`, see [`crate::shadow`]), so its constants take that
+/// technique's usages (`aur_mWorld` is `Part` there, `PartTrans` in the Default semantic).
+pub type CasterMaterial = (Arc<D3dProgram>, SceneMaterial);
+
+/// The program a material's `PSSM` semantic draws shadow casters with (its first pass, at
+/// shader model 3) and the material switched to that semantic. `None` when the material
+/// has no such semantic or it does not translate.
+pub fn pssm_program(
+    vfs: &Vfs,
+    material: &SceneMaterial,
+    detail: &str,
+    cache: &mut crate::RenderCache,
+) -> Option<CasterMaterial> {
+    let def = material.definition.as_ref()?;
+    let technique = def.select("PSSM", 3, detail)?;
+    let (vs, ps, st) = pass_shaders(technique)?.into_iter().next()?;
+    let key = format!("{vs}+{ps}+{st}").to_ascii_lowercase();
+    let program = match cache.programs.get(&key) {
+        Some(built) => built.clone(),
+        None => {
+            let built = match build(vfs, vs, ps, st) {
+                Ok(p) => Some(Arc::new(p)),
+                Err(e) => {
+                    log::warn!("shadow caster shader unavailable: {e}");
+                    None
+                }
+            };
+            cache.programs.insert(key, built.clone());
+            built
+        }
+    }?;
+    let material = SceneMaterial {
+        technique: Some(technique.clone()),
+        semantic: "PSSM".into(),
+        ..material.clone()
+    };
+    Some((program, material))
+}
+
 /// Each pass's (vertex shader, pixel shader, state), if every pass names all three.
 fn pass_shaders(t: &Technique) -> Option<Vec<(&str, &str, &str)>> {
     if t.passes.is_empty() {
@@ -377,6 +417,11 @@ pub struct ConstantContext<'a> {
     pub clouds: [[f32; 4]; 3],
     /// The shaders' `ApplicationTime`, in seconds (see [`crate::atmosphere`]).
     pub time: f32,
+    /// `g_vShadowData` (see [`crate::shadow`]); [`NO_SHADOW_DATA`] with no partitions drawn.
+    pub shadow: [[f32; 4]; 9],
+    /// The shadow partition being drawn into (`ShadowPartitionMatrix`, world to the
+    /// partition's clip space), for the casters' `PSSM` programs.
+    pub partition: Option<Mat4>,
 }
 
 /// The ambient term's base (see the module docs): zero at every Graphics Detail setting
@@ -567,7 +612,13 @@ impl ConstantContext<'_> {
             }
             ("ApplicationTime", _) => Value::Vectors(vec![[self.time, 0.0, 0.0, 0.0]]),
             ("CloudParameters", _) => Value::Vectors(self.clouds.to_vec()),
-            ("ShadowData", _) => Value::Vectors(NO_SHADOW_DATA.to_vec()),
+            ("ShadowData", _) => Value::Vectors(self.shadow.to_vec()),
+            // Four rows of the partition's matrix, as `PSSMMesh.vsh` reads them (`dp4`).
+            ("ShadowPartitionMatrix", _) => Value::Vectors(
+                self.partition
+                    .map(|m| [0, 1, 2, 3].map(|i| m.row(i).to_array()).to_vec())
+                    .unwrap_or_default(),
+            ),
             ("IrradianceParams", _) => Value::Vectors(Vec::new()),
             (_, "mml_vLightmapOffsetAndScale") if self.lightmap.is_some() => {
                 let l = self.lightmap?;
@@ -681,6 +732,9 @@ pub enum TextureSource {
     White,
     /// Opaque black.
     Black,
+    /// Shadow partition 0 (`ShadowTexture_Primary`) or 1 (`ShadowTexture_Secondary`); opaque
+    /// white (every texel lit) when no partitions are drawn.
+    Shadow(u8),
 }
 
 /// The texture a sampler register reads, via the constant table's sampler name and the
@@ -706,7 +760,8 @@ pub fn sampler_texture(
     };
     let usage = param.usage.as_deref().unwrap_or("");
     if usage.starts_with("ShadowTexture") {
-        return (Some(sampler), TextureSource::White);
+        let slot = u8::from(usage.eq_ignore_ascii_case("ShadowTexture_Secondary"));
+        return (Some(sampler), TextureSource::Shadow(slot));
     }
     if param.name.eq_ignore_ascii_case("mml_tLightmap") {
         return (
@@ -810,6 +865,8 @@ mod tests {
             sky: None,
             clouds: crate::atmosphere::cloud_params(None, None),
             time: 0.0,
+            shadow: NO_SHADOW_DATA,
+            partition: None,
         };
         let t = table(vec![
             constant(
@@ -927,6 +984,8 @@ mod tests {
             sky: None,
             clouds: crate::atmosphere::cloud_params(None, None),
             time: 0.0,
+            shadow: NO_SHADOW_DATA,
+            partition: None,
         };
         let c = cc.fill(Some(&table(vec![constant(
             "mml_vTintColor",
@@ -1013,6 +1072,8 @@ mod tests {
                 sky: None,
                 clouds: crate::atmosphere::cloud_params(None, None),
                 time: 0.0,
+                shadow: NO_SHADOW_DATA,
+                partition: None,
             };
             let c = cc.fill(Some(&table(vec![constant(
                 "aur_mWorld",

@@ -436,6 +436,9 @@ pub struct World {
     /// The quest the player marked active in the journal (its plot resource).
     #[serde(default)]
     pub active_quest: Option<String>,
+    /// The HUD's notifications not yet dismissed (see [`crate::journal::Alert`]).
+    #[serde(default)]
+    pub alerts: Vec<crate::journal::Alert>,
     pub game_mode: i32,
     /// Cutscenes loaded with `LoadCutscene` that have not played yet, in order. Each starts
     /// once the scripts that loaded it have run (see [`crate::sim::CutscenePolicy`]).
@@ -595,6 +598,7 @@ impl World {
             journal: BTreeMap::new(),
             journal_seq: 0,
             active_quest: None,
+            alerts: Vec::new(),
             game_mode: 0,
             cutscenes: Vec::new(),
             cutscene: None,

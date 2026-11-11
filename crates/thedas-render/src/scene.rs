@@ -11,7 +11,9 @@ use thedas_formats::level::{ArlRoom, LightmapBinding, Transform};
 use thedas_formats::material::{MaterialDef, MaterialObject, Technique, TextureBinding};
 use thedas_formats::mesh::{DeclUsage, MeshChunk, Msh};
 pub use thedas_formats::model::{DOMAIN_CHARACTERS, DOMAIN_LEVEL};
-use thedas_formats::morph::{Morph, MorphNode, MorphPreset, slot as morph_slot};
+use thedas_formats::morph::{
+    Morph, MorphNode, MorphPreset, TargetMesh, blend_targets, slot as morph_slot,
+};
 use thedas_formats::probe::IrradianceProbe;
 use thedas_formats::tint::Tint;
 use thedas_formats::{Arl, Mmh, Rml};
@@ -110,6 +112,9 @@ pub struct DrawItem {
     pub probe: Option<usize>,
     /// For a skinned mesh: how its vertices follow its model's skeleton.
     pub skin: Option<DrawSkin>,
+    /// Whether its model says the mesh casts run-time shadows (6176), when it says (see
+    /// [`crate::shadow`]).
+    pub cast_shadow: Option<bool>,
 }
 
 /// A skinned draw's bones.
@@ -647,7 +652,78 @@ impl<'a> Loader<'a> {
         };
         let prefix: String = name.chars().take(2).collect();
         let base = self.morph(&format!("{prefix}_pcc_b01"))?;
-        Some(Arc::new(base.with_preset(&preset)))
+        let mut morph = base.with_preset(&preset);
+        // The preset's morph targets reshape the head's meshes (see
+        // `thedas_formats::morph::blend_targets`).
+        let models: Vec<String> = morph.models.iter().flatten().cloned().collect();
+        let targets: Vec<(f32, Vec<FacePiece>)> = preset
+            .targets
+            .iter()
+            .map(|(t, w)| (*w, self.face_pieces(t)))
+            .collect();
+        for model in models {
+            for piece in self.face_pieces(&model) {
+                let meshes: Vec<TargetMesh> = targets
+                    .iter()
+                    .flat_map(|(w, pieces)| {
+                        pieces
+                            .iter()
+                            .filter(|p| p.node.eq_ignore_ascii_case(&piece.node))
+                            .map(move |p| TargetMesh {
+                                weight: *w,
+                                positions: &p.positions,
+                                indices: &p.indices,
+                                uvs: &p.uvs,
+                            })
+                    })
+                    .collect();
+                let Some(vertices) =
+                    blend_targets(&piece.positions, &piece.indices, &piece.uvs, &meshes)
+                else {
+                    continue;
+                };
+                match morph
+                    .nodes
+                    .iter_mut()
+                    .find(|n| n.name.eq_ignore_ascii_case(&piece.node))
+                {
+                    Some(n) => n.vertices = vertices,
+                    None => morph.nodes.push(MorphNode {
+                        name: piece.node.clone(),
+                        vertices,
+                        ..Default::default()
+                    }),
+                }
+            }
+        }
+        Some(Arc::new(morph))
+    }
+
+    /// A head model's mesh pieces by node (`FaceM1`): positions, triangles and texture
+    /// coordinates, as a morph target blend reads them.
+    fn face_pieces(&mut self, model: &str) -> Vec<FacePiece> {
+        let Some(mmh) = self.model(model) else {
+            return Vec::new();
+        };
+        let Some(msh) = mmh.mesh_file.as_deref().and_then(|f| self.mesh_file(f)) else {
+            return Vec::new();
+        };
+        mmh.mesh_pieces()
+            .into_iter()
+            .filter_map(|p| {
+                let c = msh.chunk(&p.mesh.chunk)?;
+                Some(FacePiece {
+                    node: p.node_name?.to_string(),
+                    positions: msh.attribute(c, DeclUsage::Position, 0).ok()??,
+                    indices: msh.indices(c).ok()?,
+                    uvs: msh
+                        .attribute(c, DeclUsage::TexCoord, 0)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default(),
+                })
+            })
+            .collect()
     }
 
     /// A copy of mesh `base` with a head morph's vertex positions, shared by every draw of
@@ -925,6 +1001,7 @@ impl<'a> Loader<'a> {
                 room: room.to_string(),
                 probe,
                 skin,
+                cast_shadow: piece.mesh.cast_runtime_shadow,
             });
         }
     }
@@ -1222,6 +1299,14 @@ impl AreaScene {
         }
         Ok(l.scene)
     }
+}
+
+/// One mesh piece of a head model (see `Loader::face_pieces`).
+struct FacePiece {
+    node: String,
+    positions: Vec<[f32; 4]>,
+    indices: Vec<u32>,
+    uvs: Vec<[f32; 4]>,
 }
 
 #[cfg(test)]

@@ -29,9 +29,20 @@ use crate::sim::Sim;
 
 /// The quest the player marked as active (its plot resource).
 pub const MSG_SET_ACTIVE: &str = "Journal.SetActiveQuest";
-/// The player read a codex entry, or all of them; nothing is marked as new here.
+/// The player read a codex entry (its plot resource), or all of them.
 pub const MSG_MARK_CODEX_READ: &str = "Journal.MarkCodexAsRead";
 pub const MSG_MARK_ALL_CODEX_READ: &str = "Journal.MarkAllCodexAsRead";
+/// A movie wrote one of the journal's attributes (the attribute and the value): journal.gfx
+/// clears a quest's `Journal.PlotList.N.Updated` (or `CompletedPlots`) when the player reads
+/// it, and for every quest with "Mark All as Read". The interface passes these on.
+pub const MSG_SET_ATTRIBUTE: &str = "Journal.SetAttribute";
+/// The HUD's notification for a kind of alert was dismissed or faded (the alert type).
+pub const MSG_HIDE_ALERT: &str = "Party.HideAlert";
+pub const MSG_HIDE_UBER_ALERT: &str = "Party.HideUberAlert";
+
+/// notifications.gfx's alert types (`ALERT_QUEST`, `ALERT_CODEX`).
+pub const ALERT_QUEST: i32 = 1;
+pub const ALERT_CODEX: i32 = 2;
 
 /// Quests, Chanter's Board jobs and quest groups (`plottypes.gda` rows).
 const KIND_QUEST: i32 = 1;
@@ -49,6 +60,23 @@ const HASH_IS_CODEX: u32 = 0xeb84_ee4d;
 pub struct JournalMark {
     pub flag: i32,
     pub seq: u64,
+    /// Not yet read in the journal (its `Updated`).
+    #[serde(default)]
+    pub unread: bool,
+}
+
+/// A HUD notification (notifications.gfx's `Party.Alerts.N`): a quest's new journal entry or
+/// a codex entry unlocked, one per type.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Alert {
+    /// [`ALERT_QUEST`] or [`ALERT_CODEX`].
+    pub kind: i32,
+    /// The plot resource (`QuestResRef`).
+    pub resref: String,
+    /// The plot's name (`QuestName`, a talk-table string).
+    pub name: Option<u32>,
+    /// The quest is done (`QuestCompleted`).
+    pub completed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -64,6 +92,8 @@ pub struct QuestView {
     /// The quest it belongs under, for a sub-quest.
     pub parent: Option<String>,
     pub seq: u64,
+    /// A new entry not yet read (`Updated`).
+    pub updated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -79,6 +109,8 @@ pub struct CodexEntryView {
     pub name: Option<u32>,
     /// The text of each flag set, in flag order (none: locked).
     pub texts: Vec<u32>,
+    /// Unlocked or added to and not yet read (`Updated`).
+    pub updated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -98,6 +130,8 @@ pub struct JournalView {
     pub completed: Vec<QuestView>,
     pub codex: Vec<CodexGroupView>,
     pub active_quest: Option<String>,
+    /// A codex entry is unread (`Journal.CodexUpdated`).
+    pub codex_updated: bool,
 }
 
 impl Sim {
@@ -109,9 +143,59 @@ impl Sim {
         }
         self.world.journal_seq += 1;
         let seq = self.world.journal_seq;
+        self.world.journal.insert(
+            info.guid.clone(),
+            JournalMark {
+                flag,
+                seq,
+                unread: true,
+            },
+        );
+        // The HUD's notification: a codex entry, or a quest the journal lists. There is one
+        // per type, naming the latest plot (notifications.gfx hides them by type,
+        // `Party.HideAlert <type>`). Provisional: inferred from that message.
+        let kind = if self.is_codex_kind(info.kind) {
+            ALERT_CODEX
+        } else if matches!(info.kind, KIND_QUEST | KIND_CHANTERS) && info.parent.is_some() {
+            ALERT_QUEST
+        } else {
+            return;
+        };
+        let completed = kind == ALERT_QUEST && info.finals.iter().any(|&f| self.flag_on(info, f));
+        self.world.alerts.retain(|a| a.kind != kind);
+        self.world.alerts.push(Alert {
+            kind,
+            resref: info.resref.clone(),
+            name: info.name_strref,
+            completed,
+        });
+    }
+
+    /// Whether a plot type is a codex category (`plottypes.gda`'s `IsCodex`).
+    fn is_codex_kind(&self, kind: i32) -> bool {
         self.world
-            .journal
-            .insert(info.guid.clone(), JournalMark { flag, seq });
+            .tables()
+            .get(TABLE_PLOT_TYPES, "")
+            .is_some_and(|t| {
+                matches!(
+                    t.cell_by_hash(HASH_IS_CODEX, i64::from(kind)),
+                    Some(thedas_formats::gda::Cell::Int(1))
+                )
+            })
+    }
+
+    /// Marks a plot's journal entry read (its plot resource).
+    pub fn mark_journal_read(&mut self, resref: &str) -> bool {
+        let Some(info) = self.plot_info(resref) else {
+            return false;
+        };
+        match self.world.journal.get_mut(&info.guid) {
+            Some(m) => {
+                m.unread = false;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Whether a journal text says something: many flags name a string that is empty.
@@ -183,6 +267,7 @@ impl Sim {
                 group: top.resref.clone(),
                 parent: (parent.kind != KIND_GROUP).then(|| parent.resref.clone()),
                 seq: mark.map_or(0, |m| m.seq),
+                updated: mark.is_some_and(|m| m.unread),
             };
             groups.entry(top.resref.clone()).or_insert(QuestGroupView {
                 resref: top.resref.clone(),
@@ -221,6 +306,7 @@ impl Sim {
                     .map(|p| CodexEntryView {
                         resref: p.resref.clone(),
                         name: p.name_strref,
+                        updated: self.world.journal.get(&p.guid).is_some_and(|m| m.unread),
                         texts: p
                             .journal
                             .iter()
@@ -240,11 +326,16 @@ impl Sim {
                 }
             }
         }
+        view.codex_updated = view
+            .codex
+            .iter()
+            .any(|g| g.entries.iter().any(|e| e.updated && !e.texts.is_empty()));
         view
     }
 
-    /// journal.gfx's messages: marking a quest active (its plot resource; map markers follow
-    /// it in the original), and reading codex entries (nothing is marked as new here).
+    /// journal.gfx's and notifications.gfx's messages: marking a quest active (its plot
+    /// resource; map markers follow it in the original), reading quests (the movie clears
+    /// their `Updated`) and codex entries, and dismissing the HUD's notifications.
     pub(crate) fn journal_message(&mut self, name: &str, args: &[String]) -> bool {
         match name {
             MSG_SET_ACTIVE => {
@@ -252,7 +343,63 @@ impl Sim {
                 self.world.active_quest = (!r.is_empty()).then(|| r.to_string());
                 true
             }
-            MSG_MARK_CODEX_READ | MSG_MARK_ALL_CODEX_READ => true,
+            MSG_MARK_CODEX_READ => {
+                let r = args.first().map(|a| a.trim()).unwrap_or_default();
+                self.mark_journal_read(r);
+                true
+            }
+            MSG_MARK_ALL_CODEX_READ => {
+                let codex: Vec<String> = self
+                    .journal()
+                    .codex
+                    .into_iter()
+                    .flat_map(|g| g.entries)
+                    .filter(|e| e.updated)
+                    .map(|e| e.resref)
+                    .collect();
+                for r in codex {
+                    self.mark_journal_read(&r);
+                }
+                true
+            }
+            MSG_SET_ATTRIBUTE => {
+                // `Journal.PlotList.N.Updated` (or `CompletedPlots`) set false: the quest at
+                // that place in the list the movie was given is read. Other attributes the
+                // movies write (selections, expanded groups) stay the interface's.
+                let key = args.first().map(|a| a.trim()).unwrap_or_default();
+                let cleared = matches!(args.get(1).map(|v| v.trim()), Some("0" | "false" | ""));
+                let parts: Vec<&str> = key.split('.').collect();
+                if let [
+                    "Journal",
+                    list @ ("PlotList" | "CompletedPlots"),
+                    i,
+                    "Updated",
+                ] = parts.as_slice()
+                {
+                    if cleared {
+                        let view = self.journal();
+                        let quests = if *list == "PlotList" {
+                            view.active
+                        } else {
+                            view.completed
+                        };
+                        if let Some(q) = i.parse::<usize>().ok().and_then(|i| quests.get(i)) {
+                            let r = q.resref.clone();
+                            self.mark_journal_read(&r);
+                        }
+                    }
+                }
+                true
+            }
+            MSG_HIDE_ALERT => {
+                let kind = args.first().and_then(|a| a.trim().parse::<f64>().ok());
+                match kind {
+                    Some(k) => self.world.alerts.retain(|a| f64::from(a.kind) != k),
+                    None => self.world.alerts.clear(),
+                }
+                true
+            }
+            MSG_HIDE_UBER_ALERT => true,
             _ => false,
         }
     }
@@ -367,5 +514,38 @@ mod tests {
             s.journal().active_quest.as_deref(),
             Some("plt_lot100pt_bears_sub")
         );
+
+        // New entries are unread and raise the HUD's notifications, one per type naming the
+        // latest plot: the quests' ("bears", now completed) and the codex entry's, not the
+        // bookkeeping plot's.
+        let j = s.journal();
+        assert!(j.completed[0].updated && j.active[0].updated);
+        assert!(j.codex_updated);
+        let alerts: Vec<(i32, &str, bool)> = s
+            .world
+            .alerts
+            .iter()
+            .map(|a| (a.kind, a.resref.as_str(), a.completed))
+            .collect();
+        assert_eq!(
+            alerts,
+            [
+                (ALERT_CODEX, "plt_cod_crt_ogre", false),
+                (ALERT_QUEST, "plt_lot100pt_bears", true),
+            ]
+        );
+        // The movie clears a quest's `Updated` as it is read (its place in the list).
+        assert!(s.journal_message(
+            MSG_SET_ATTRIBUTE,
+            &["Journal.CompletedPlots.0.Updated".into(), "false".into()]
+        ));
+        assert!(!s.journal().completed[0].updated);
+        assert!(s.journal().active[0].updated, "the others stay new");
+        assert!(s.journal_message(MSG_MARK_CODEX_READ, &["plt_cod_crt_ogre".into()]));
+        assert!(!s.journal().codex_updated);
+        // Dismissing a kind of notification drops those.
+        assert!(s.journal_message(MSG_HIDE_ALERT, &[ALERT_QUEST.to_string()]));
+        assert_eq!(s.world.alerts.len(), 1);
+        assert_eq!(s.world.alerts[0].kind, ALERT_CODEX);
     }
 }

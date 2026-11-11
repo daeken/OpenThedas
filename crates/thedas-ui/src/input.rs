@@ -176,8 +176,14 @@ pub fn handler_for(sim: Arc<Mutex<Sim>>, shown: Arc<Mutex<Presentation>>) -> Mes
         }
         let mut sim = sim.try_lock().ok()?;
         // Replies are picked after the tick, as the MCP does: the movie does not read the
-        // next line back in the same call.
-        if name == SELECT_RESPONSE || !sim.gui_message(name, args) {
+        // next line back in the same call. Dismissed notifications are dropped after the
+        // frame too: notifications.gfx names its alerts by their place in `Party.Alerts`,
+        // and an alert gone mid-frame shifted the list under a click being handled (a quest
+        // alert's click read the codex alert's plot).
+        if name == SELECT_RESPONSE
+            || name == thedas_sim::journal::MSG_HIDE_ALERT
+            || !sim.gui_message(name, args)
+        {
             return None;
         }
         sim.tick(0);

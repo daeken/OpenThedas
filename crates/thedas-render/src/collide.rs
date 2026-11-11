@@ -303,6 +303,7 @@ mod tests {
             room: String::new(),
             probe: None,
             skin: None,
+            cast_shadow: None,
         };
         let scene = AreaScene {
             meshes: vec![mesh],
