@@ -31,6 +31,20 @@ pub struct PlotInfo {
     /// Each flag's journal text (field 13004, a talk-table id). Provisional: the field is
     /// inferred from the data.
     pub journal: BTreeMap<i32, u32>,
+    /// The values flags 0 to 127 start with: fields 13011 to 13014, a bit per flag, 32 flags
+    /// a field. DAOrigins.exe's plot loader (0x75db80) copies them into the plot record's
+    /// four-dword flag set (+0x8 to +0x14, at 0x75dff9), which the flag read (0x75bc70,
+    /// bit `flag & 31` of dword `flag >> 5`) answers from. Lothering's first Chanter's Board
+    /// job is posted this way (`lot100pt_bandits2` has field 13011 = 32: flag 5,
+    /// `BANDITS2_CHANTER_BOARD`; no script sets it).
+    pub initial: [u32; 4],
+}
+
+impl PlotInfo {
+    /// A flag's value before any script has set it (see [`PlotInfo::initial`]).
+    pub fn initial_value(&self, flag: i32) -> bool {
+        (0..128).contains(&flag) && self.initial[(flag >> 5) as usize] & (1 << (flag & 31)) != 0
+    }
 }
 
 #[derive(Default)]
@@ -88,6 +102,10 @@ pub fn plots_from_gff4(g: &Gff4, resref: &str) -> Vec<PlotInfo> {
                 }
             }
         }
+        let mut initial = [0u32; 4];
+        for (i, label) in (13011..=13014).enumerate() {
+            initial[i] = g.field(p, label).and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+        }
         let name_strref = match g.field(p, 13008) {
             Some(Value::Tlk(t)) => Some(t.id),
             _ => None,
@@ -100,6 +118,7 @@ pub fn plots_from_gff4(g: &Gff4, resref: &str) -> Vec<PlotInfo> {
             flags,
             rewards,
             journal,
+            initial,
         });
     }
     out
@@ -212,7 +231,15 @@ impl Sim {
                 }
             }
         }
-        self.world.plots.get(&(key, flag)).copied().unwrap_or(false)
+        self.stored_plot_flag(plot, key, flag)
+    }
+
+    /// A flag's stored value: what was set, else the value the plot file starts it with.
+    fn stored_plot_flag(&mut self, plot: &str, key: String, flag: i32) -> bool {
+        match self.world.plots.get(&(key, flag)) {
+            Some(&v) => v,
+            None => self.plot_info(plot).is_some_and(|p| p.initial_value(flag)),
+        }
     }
 
     pub fn set_plot_flag(
@@ -224,12 +251,7 @@ impl Sim {
         owner: ObjectId,
     ) {
         let key = self.plot_key(plot);
-        let old = self
-            .world
-            .plots
-            .get(&(key.clone(), flag))
-            .copied()
-            .unwrap_or(false);
+        let old = self.stored_plot_flag(plot, key.clone(), flag);
         self.world.plots.insert((key.clone(), flag), value);
         let t = self.world.time_ms;
         self.world.trace.push(TraceEntry::PlotFlag {
@@ -279,7 +301,7 @@ mod tests {
             file_version: FourCC::new(b"V0.1"),
             templates: vec![
                 tmpl(b"PLTS", &[13016]),
-                tmpl(b"PLOT", &[13000, 13007, 13008, 13009]),
+                tmpl(b"PLOT", &[13000, 13007, 13008, 13009, 13011, 13012]),
                 tmpl(b"FLAG", &[13001, 13002, 13003]),
             ],
             structs: vec![
@@ -297,6 +319,8 @@ mod tests {
                         Value::String(Some("abcd\0".into())),
                         Value::Tlk(TlkString { id: 7, text: None }),
                         Value::String(Some("plt_script\0".into())),
+                        Value::U32(1 << 5),
+                        Value::U32(1),
                     ],
                 ),
                 st(
@@ -327,5 +351,9 @@ mod tests {
         assert_eq!(p[0].flags.get(&256).map(String::as_str), Some("DEFINED"));
         assert_eq!(p[0].rewards.get(&0), Some(&142));
         assert_eq!(p[0].rewards.get(&256), None, "no reward is not a reward");
+        // Fields 13011.. start flags set, 32 to a field.
+        assert_eq!(p[0].initial, [32, 1, 0, 0]);
+        assert!(p[0].initial_value(5) && p[0].initial_value(32));
+        assert!(!p[0].initial_value(4) && !p[0].initial_value(256));
     }
 }
