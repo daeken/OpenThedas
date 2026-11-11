@@ -142,6 +142,9 @@ pub const SET_ITEM_FILTER: &str = "GUIInventory.SetItemListFilter";
 /// Takes the interface's own messages (not simulation input) into `shown`; returns whether
 /// `name` was one.
 pub fn present(shown: &mut Presentation, name: &str, args: &[String]) -> bool {
+    if crate::options::option_message(&mut shown.options, name, args) {
+        return true;
+    }
     match name {
         SET_ITEM_FILTER => {
             shown.item_filter = args
