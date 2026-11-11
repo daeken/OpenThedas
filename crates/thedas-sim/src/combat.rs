@@ -77,8 +77,9 @@ pub struct CombatData {
     /// perceived creature turns hostile).
     #[serde(default)]
     pub perceived_hostile: Vec<ObjectId>,
-    /// Threat by enemy.
-    pub threat: Vec<(ObjectId, f32)>,
+    /// Threat by enemy, highest first (see [`crate::threat`]).
+    #[serde(deserialize_with = "crate::threat::de_table")]
+    pub threat: Vec<crate::threat::Threat>,
     /// What the script decided for the attack in progress (`SetAttackResult`).
     pub attack: Option<AttackResult>,
     /// `SetAttackDuration` for the attack in progress.
