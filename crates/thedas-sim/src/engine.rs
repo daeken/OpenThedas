@@ -208,6 +208,54 @@ const PRESENTATION: &[&str] = &[
 /// them are counted (`Trace::stubbed`) so coverage work can follow what the game uses.
 pub const STUBS: &[&str] = &["GetPlotSummary", "CreatePool", "LogStoryEvent"];
 
+/// Whether an object lies in a script shape at `l` (DAOrigins.exe 0x670eb0): its body is a
+/// circle on the ground (z is ignored) of the creature's personal space (0 for other
+/// objects). A sphere (`SHAPE_SPHERE`) of radius `fa` takes it when the circles touch
+/// (0x4eb340). A cone (`SHAPE_CONE`) of `fa` degrees (0 to 180) and length `fb` along the
+/// location's facing takes it when it touches the cone's circle and lies between the
+/// cone's edges or within its radius of one (0x4eb3b0). Provisional: the body radius
+/// (the engine asks the object, virtual 0x9c) is taken to be [`Sim::body_radius`].
+fn in_shape(sim: &Sim, id: ObjectId, shape: i32, l: &Location, fa: f32, fb: f32) -> bool {
+    let Some(o) = sim.world.get(id) else {
+        return false;
+    };
+    let r = if o.kind == ObjectKind::Creature {
+        sim.body_radius(id)
+    } else {
+        0.0
+    };
+    let (px, py) = (o.position[0] - l.position[0], o.position[1] - l.position[1]);
+    let within = |reach: f32| px * px + py * py <= (r + reach) * (r + reach);
+    match shape {
+        1 => within(fa),
+        2 => {
+            if !(0.0..=180.0).contains(&fa) || !within(fb) {
+                return false;
+            }
+            let heading = (l.facing + 90.0).to_radians();
+            let half = (fa * 0.5).to_radians();
+            let edge = |a: f32| [a.cos() * fb, a.sin() * fb];
+            let (left, right) = (edge(heading + half), edge(heading - half));
+            let cross = |e: [f32; 2]| e[0] * py - e[1] * px;
+            if cross(right) >= 0.0 && cross(left) <= 0.0 {
+                return true;
+            }
+            let near_edge = |e: [f32; 2]| {
+                let len2 = e[0] * e[0] + e[1] * e[1];
+                let t = if len2 > 0.0 {
+                    ((px * e[0] + py * e[1]) / len2).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let (dx, dy) = (px - e[0] * t, py - e[1] * t);
+                dx * dx + dy * dy <= r * r
+            };
+            near_edge(left) || near_edge(right)
+        }
+        _ => false,
+    }
+}
+
 /// `ABI_base`'s column (hash 0x5d3e0787, name unknown) naming the `VFX Persistent` row
 /// (M2DA 96) of an ability's lasting area, whose `Radius` then sizes its clusters.
 const ABI_PERSISTENT_AREA: u32 = 0x5d3e_0787;
@@ -1970,25 +2018,54 @@ pub fn call(
                 found.into_iter().take(count).map(|(_, id)| id).collect(),
             ))
         }
-        "GetObjectsInShape" => {
-            // Provisional: every shape is treated as a sphere of its largest dimension.
-            let (mask, excl_dead) = (int(a, 0), int(a, 6) != 0);
-            let radius = float(a, 3).max(float(a, 4)).max(float(a, 5));
+        // DAOrigins.exe answers both in one handler (0x670eb0): GetObjectsInShape looks at
+        // the objects of the location's area, FilterObjectsInShape at the array it is given
+        // (wherever they are). Each must be of a type in the mask, in the world and, with
+        // bExcludeDead, alive, and lie in the shape (see [`in_shape`]); an unknown shape
+        // takes nothing. Provisional: "in the world" (virtual 0x6c) is taken to be active.
+        "GetObjectsInShape" | "FilterObjectsInShape" => {
+            let (given, a) = match name {
+                "FilterObjectsInShape" => {
+                    let list: Vec<ObjectId> = match a.first() {
+                        Some(Value::Array { items, .. }) => items
+                            .iter()
+                            .filter_map(|v| match v {
+                                Value::Object(o) => Some(*o),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    (Some(list), &a[1.min(a.len())..])
+                }
+                _ => (None, a),
+            };
+            let (mask, shape, excl_dead) = (int(a, 0), int(a, 1), int(a, 6) != 0);
+            let (fa, fb) = (float(a, 3), float(a, 4));
             let l = match h.sim.world.handle(handle(a, 2)) {
                 Some(EngineData::Location(l)) => Some(*l),
                 _ => None,
             };
-            let list: Vec<ObjectId> = match l {
-                Some(l) => h
+            let candidates: Vec<ObjectId> = match (given, l) {
+                (Some(list), _) => list,
+                (None, Some(l)) => h
                     .sim
                     .world
                     .objects
                     .values()
-                    .filter(|o| o.area == Some(l.area) && o.active)
-                    .filter(|o| mask == 0 || o.kind.script_type() & mask != 0)
-                    .filter(|o| !excl_dead || !o.dead)
-                    .filter(|o| dist(o.position, l.position) <= radius)
+                    .filter(|o| o.area == Some(l.area))
                     .map(|o| o.id)
+                    .collect(),
+                (None, None) => Vec::new(),
+            };
+            let list: Vec<ObjectId> = match l {
+                Some(l) => candidates
+                    .into_iter()
+                    .filter(|&id| {
+                        h.object(id).is_some_and(|o| {
+                            o.active && o.kind.script_type() & mask != 0 && !(excl_dead && o.dead)
+                        }) && in_shape(h.sim, id, shape, &l, fa, fb)
+                    })
                     .collect(),
                 None => Vec::new(),
             };
@@ -5224,7 +5301,9 @@ mod coverage_tests {
         int ClearAmbientDialogs(object o = OBJECT_INVALID) = 80;\n\
         void RevealCurrentMap() = 81;\n\
         int GetAutoPauseCombatStatus() = 82;\n\
-        location GetClusterCenter(object c, int a, int n, int f, int b) = 83;\n";
+        location GetClusterCenter(object c, int a, int n, int f, int b) = 83;\n\
+        object[] GetObjectsInShape(int m, int s, location l, float a, float b = 0.0, float c = 0.0, int d = FALSE) = 84;\n\
+        object[] FilterObjectsInShape(object[] o, int m, int s, location l, float a, float b = 0.0, float c = 0.0, int d = FALSE) = 85;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -5575,5 +5654,105 @@ mod coverage_tests {
             (area, [21.0, 0.0, 0.0])
         );
         assert_eq!(center(&mut s, vec![lone, a, c], 2, 2, 0).0, OBJECT_INVALID);
+    }
+
+    #[test]
+    fn shapes_take_what_their_ground_touches() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        let put = |s: &mut Sim, kind, p: [f32; 3]| {
+            let c = s.world.spawn(kind, "o");
+            let o = s.world.get_mut(c).unwrap();
+            (o.area, o.position) = (Some(area), p);
+            c
+        };
+        // Bodies are 0.4 across ([`DEFAULT_RADIUS`]) and only their ground position counts.
+        let near = put(&mut s, ObjectKind::Creature, [2.3, 0.0, 9.0]);
+        let edge = put(&mut s, ObjectKind::Placeable, [2.3, 0.0, 0.0]);
+        let behind = put(&mut s, ObjectKind::Creature, [0.0, -1.0, 0.0]);
+        let side = put(&mut s, ObjectKind::Creature, [1.0, 1.2, 0.0]);
+        let dead = put(&mut s, ObjectKind::Creature, [0.0, 1.0, 0.0]);
+        s.world.get_mut(dead).unwrap().dead = true;
+        // Facing 270 looks along +x.
+        let l = run(
+            &mut s,
+            OBJECT_INVALID,
+            "Location",
+            &[
+                Value::Object(area),
+                Value::Vector([0.0; 3]),
+                Value::Float(270.0),
+            ],
+        )
+        .unwrap();
+        let shape = |s: &mut Sim,
+                     f: &str,
+                     pre: Option<Vec<ObjectId>>,
+                     mask: i32,
+                     shape: i32,
+                     fa: f32,
+                     fb: f32,
+                     d: i32| {
+            let mut args: Vec<Value> = pre.map(|v| vec![objects(v)]).unwrap_or_default();
+            args.extend([
+                Value::Int(mask),
+                Value::Int(shape),
+                l.clone(),
+                Value::Float(fa),
+                Value::Float(fb),
+                Value::Float(0.0),
+                Value::Int(d),
+            ]);
+            let mut got = match run(s, OBJECT_INVALID, f, &args) {
+                Some(Value::Array { items, .. }) => items,
+                _ => panic!("no array"),
+            };
+            got.sort_by_key(|v| match v {
+                Value::Object(o) => *o,
+                _ => 0,
+            });
+            got
+        };
+        let o = |v: &[ObjectId]| v.iter().map(|&x| Value::Object(x)).collect::<Vec<_>>();
+        // A sphere of 2: the creature at 2.3 touches it, the placeable (no body) does not.
+        assert_eq!(
+            shape(&mut s, "GetObjectsInShape", None, -1, 1, 2.0, 0.0, 1),
+            o(&[near, behind, side])
+        );
+        assert_eq!(
+            shape(&mut s, "GetObjectsInShape", None, -1, 1, 2.0, 0.0, 0),
+            o(&[near, behind, side, dead])
+        );
+        assert_eq!(
+            shape(&mut s, "GetObjectsInShape", None, 512, 1, 3.0, 0.0, 0),
+            o(&[edge])
+        );
+        // A 90-degree cone 3 long along +x: not what is behind or well to the side.
+        assert_eq!(
+            shape(&mut s, "GetObjectsInShape", None, -1, 2, 90.0, 3.0, 0),
+            o(&[near, edge, side])
+        );
+        assert_eq!(
+            shape(&mut s, "GetObjectsInShape", None, -1, 2, 20.0, 3.0, 0),
+            o(&[near, edge])
+        );
+        assert_eq!(
+            shape(&mut s, "GetObjectsInShape", None, -1, 3, 9.0, 9.0, 0),
+            o(&[])
+        );
+        // Filtering keeps only the given objects that are in the shape.
+        assert_eq!(
+            shape(
+                &mut s,
+                "FilterObjectsInShape",
+                Some(vec![behind, edge, side]),
+                32,
+                1,
+                2.0,
+                0.0,
+                0
+            ),
+            o(&[behind, side])
+        );
     }
 }
