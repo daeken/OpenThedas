@@ -208,6 +208,142 @@ const PRESENTATION: &[&str] = &[
 /// them are counted (`Trace::stubbed`) so coverage work can follow what the game uses.
 pub const STUBS: &[&str] = &["GetPlotSummary", "CreatePool", "LogStoryEvent"];
 
+/// `ABI_base`'s column (hash 0x5d3e0787, name unknown) naming the `VFX Persistent` row
+/// (M2DA 96) of an ability's lasting area, whose `Radius` then sizes its clusters.
+const ABI_PERSISTENT_AREA: u32 = 0x5d3e_0787;
+/// The M2DA id of `VFX Persistent`.
+const VFX_PERSISTENT_TABLE: i32 = 96;
+
+/// `GetClusterCenter`, as DAOrigins.exe works it out (0x671980):
+/// - The cluster's span is the ability's `aoe_param1` in `ABI_base` (or, for an ability with
+///   a lasting area, its `VFX Persistent` row's `Radius`), doubled for a sphere
+///   (`aoe_type` 1).
+/// - The candidates are the creatures the creator perceives. Each hostile one in turn is a
+///   cluster's center; the others join it, in candidate order, when within the span of the
+///   center and of every member already in (a quirk kept: distances are read from a table
+///   filled row by row, so a member after the center, or one that was never a center, is
+///   not measured against and lets anyone in).
+/// - A cluster with at least `size` foes scores foes less allies; one scoring at least the
+///   best so far replaces it unless a d100 roll falls below allies × `ally_fail`.
+/// - The answer is the mean position of the best cluster's foes. The first candidate's
+///   cluster can never be chosen (the engine tests the best index for being above 0).
+///
+/// `bReturnFirstMatch` is read but unused. Provisional: the candidates are the
+/// simulation's perception list (the engine's perception query, which also drops creatures
+/// beyond a per-creature limit, is not traced), and creatures the engine skips (virtual
+/// 0x1d0 returning 1) are taken to be the dead.
+fn cluster_center(
+    sim: &mut Sim,
+    creator: ObjectId,
+    ability: i32,
+    size: i32,
+    ally_fail: i32,
+) -> Option<[f32; 3]> {
+    let me = sim.world.get(creator)?;
+    if me.kind != ObjectKind::Creature {
+        return None;
+    }
+    let candidates: Vec<(ObjectId, [f32; 3], bool)> = me
+        .combat
+        .perceived
+        .iter()
+        .filter_map(|&c| sim.world.get(c).map(|o| (c, o.position, o.dead)))
+        .collect();
+    let tables = sim.world.tables.clone();
+    let abi = tables.get(0, "ABI_base");
+    let abi_cell = |col: &str| {
+        abi.as_ref()
+            .and_then(|t| t.cell(col, ability as i64).cloned())
+    };
+    let persistent = abi.as_ref().map_or(0, |t| {
+        cell_int(t.cell_by_hash(ABI_PERSISTENT_AREA, ability as i64))
+    });
+    let mut span = if persistent == 0 {
+        cell_float(abi_cell("aoe_param1").as_ref())
+    } else {
+        tables
+            .get(VFX_PERSISTENT_TABLE, "")
+            .map_or(0.0, |t| cell_float(t.cell("Radius", persistent as i64)))
+    };
+    if cell_int(abi_cell("aoe_type").as_ref()) == 1 {
+        span *= 2.0;
+    }
+    let n = candidates.len();
+    let hostile: Vec<bool> = candidates
+        .iter()
+        .map(|c| sim.hostile(creator, c.0))
+        .collect();
+    let mut table = vec![vec![0.0f32; n]; n];
+    let mut clusters: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let (mut best_score, mut best) = (-1i32, -1i64);
+    for i in 0..n {
+        if !hostile[i] || candidates[i].2 {
+            continue;
+        }
+        let at = candidates[i].1;
+        let mut members: Vec<usize> = Vec::new();
+        let mut allies = 0;
+        'join: for j in 0..n {
+            let d = if j == i {
+                0.0
+            } else {
+                if candidates[j].2 {
+                    continue;
+                }
+                let cached = if j < i { table[j][i] } else { 0.0 };
+                if cached != 0.0 {
+                    cached
+                } else {
+                    dist(at, candidates[j].1)
+                }
+            };
+            table[i][j] = d;
+            if span < d {
+                continue;
+            }
+            if d != 0.0 {
+                for &m in &members {
+                    let dm = if m <= i {
+                        table[m][j]
+                    } else {
+                        dist(at, candidates[m].1)
+                    };
+                    if span < dm {
+                        continue 'join;
+                    }
+                }
+            }
+            members.push(j);
+            if !hostile[j] {
+                allies += 1;
+            }
+        }
+        let foes = members.len() as i32 - allies;
+        if foes >= size {
+            let score = foes - allies;
+            if score >= best_score && sim.world.rng.below(100) >= allies * ally_fail {
+                best_score = score;
+                best = i as i64;
+            }
+        }
+        clusters[i] = members;
+    }
+    if best <= 0 {
+        return None;
+    }
+    let best = best as usize;
+    let foes: Vec<[f32; 3]> = clusters[best]
+        .iter()
+        .filter(|&&m| hostile[m])
+        .map(|&m| candidates[m].1)
+        .collect();
+    let k = foes.len() as f32;
+    let sum = foes
+        .iter()
+        .fold([0.0f32; 3], |s, p| [s[0] + p[0], s[1] + p[1], s[2] + p[2]]);
+    Some([sum[0] / k, sum[1] / k, sum[2] / k])
+}
+
 /// `PROPERTY_DEPLETABLE_MANA_STAMINA`, the property the mana functions use (DAOrigins.exe
 /// indexes the creature's property list with 8 directly).
 const PROPERTY_MANA_STAMINA: i32 = 8;
@@ -1779,6 +1915,31 @@ pub fn call(
             ok(Value::Engine {
                 ty: ty.command,
                 handle: hd,
+            })
+        }
+        // Where to aim an area ability for the most foes: see [`cluster_center`]. The
+        // location is in the creator's area; with no cluster good enough it is the invalid
+        // location (0x7abd00).
+        "GetClusterCenter" => {
+            let creator = obj(a, 0);
+            let area = h.object(creator).and_then(|o| o.area);
+            let center = cluster_center(h.sim, creator, int(a, 1), int(a, 2), int(a, 3));
+            let l = match (center, area) {
+                (Some(p), Some(area)) => Location {
+                    area,
+                    position: p,
+                    facing: 0.0,
+                },
+                _ => Location {
+                    area: OBJECT_INVALID,
+                    position: [0.0; 3],
+                    facing: 0.0,
+                },
+            };
+            let hd = h.sim.world.store(EngineData::Location(l));
+            ok(Value::Engine {
+                ty: ty.location,
+                handle: Some(hd),
             })
         }
         // DAOrigins.exe answers it in the handler of the GetNearestObject family (0x671510):
@@ -5062,7 +5223,8 @@ mod coverage_tests {
         int DialogIsAmbient() = 79;\n\
         int ClearAmbientDialogs(object o = OBJECT_INVALID) = 80;\n\
         void RevealCurrentMap() = 81;\n\
-        int GetAutoPauseCombatStatus() = 82;\n";
+        int GetAutoPauseCombatStatus() = 82;\n\
+        location GetClusterCenter(object c, int a, int n, int f, int b) = 83;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -5332,5 +5494,86 @@ mod coverage_tests {
             Some(Value::Int(1))
         );
         assert!(s.world.trace.stubbed.is_empty());
+    }
+
+    #[test]
+    fn an_area_ability_aims_at_the_middle_of_the_best_cluster_of_foes() {
+        let mut s = sim();
+        let t = crate::m2da::Tables::empty();
+        t.insert(
+            "ABI_base",
+            &["ID", "aoe_type", "aoe_param1", "#5d3e0787"],
+            vec![
+                // A sphere of radius 2: clusters span 4.
+                (
+                    1,
+                    vec![Cell::Int(1), Cell::Int(1), Cell::Float(2.0), Cell::Int(0)],
+                ),
+                // A lasting area whose VFX Persistent radius (3) is the span.
+                (
+                    2,
+                    vec![Cell::Int(2), Cell::Int(0), Cell::Float(0.0), Cell::Int(7)],
+                ),
+            ],
+        );
+        t.insert(
+            "#96",
+            &["ID", "Radius"],
+            vec![(7, vec![Cell::Int(7), Cell::Float(3.0)])],
+        );
+        s.world.tables = Arc::new(t);
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        s.world.hostility.insert((1, 2), true);
+        let put = |s: &mut Sim, group: i32, p: [f32; 3]| {
+            let c = s.world.spawn(ObjectKind::Creature, "c");
+            let o = s.world.get_mut(c).unwrap();
+            (o.area, o.group, o.position) = (Some(area), group, p);
+            c
+        };
+        let mage = put(&mut s, 1, [0.0, -10.0, 0.0]);
+        let lone = put(&mut s, 2, [0.0, 0.0, 0.0]);
+        let a = put(&mut s, 2, [20.0, 0.0, 0.0]);
+        let b = put(&mut s, 2, [22.0, 0.0, 0.0]);
+        let c = put(&mut s, 2, [21.0, 3.0, 0.0]);
+        let ally = put(&mut s, 1, [21.0, 1.0, 0.0]);
+        let far = put(&mut s, 2, [50.0, 0.0, 0.0]);
+        let center = |s: &mut Sim, seen: Vec<ObjectId>, ability: i32, size: i32, fail: i32| {
+            s.world.get_mut(mage).unwrap().combat.perceived = seen;
+            let v = run(
+                s,
+                mage,
+                "GetClusterCenter",
+                &[
+                    Value::Object(mage),
+                    Value::Int(ability),
+                    Value::Int(size),
+                    Value::Int(fail),
+                    Value::Int(0),
+                ],
+            );
+            match v {
+                Some(Value::Engine { handle, .. }) => match s.world.handle(handle) {
+                    Some(EngineData::Location(l)) => (l.area, l.position),
+                    _ => panic!("no location"),
+                },
+                _ => panic!("no location"),
+            }
+        };
+        // The three foes around the ally; the ally is not in the mean.
+        let crowd = vec![lone, a, b, c, ally, far];
+        assert_eq!(
+            center(&mut s, crowd.clone(), 1, 2, 0),
+            (area, [21.0, 1.0, 0.0])
+        );
+        // An ally in every cluster fails every roll at 100%.
+        assert_eq!(center(&mut s, crowd, 1, 2, 100).0, OBJECT_INVALID);
+        // The first candidate's cluster is never the answer.
+        assert_eq!(center(&mut s, vec![a, ally], 1, 1, 0).0, OBJECT_INVALID);
+        // A lasting area's radius is the span itself.
+        assert_eq!(
+            center(&mut s, vec![lone, a, b], 2, 2, 0),
+            (area, [21.0, 0.0, 0.0])
+        );
+        assert_eq!(center(&mut s, vec![lone, a, c], 2, 2, 0).0, OBJECT_INVALID);
     }
 }
