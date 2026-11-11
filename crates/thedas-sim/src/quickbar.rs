@@ -57,7 +57,7 @@ pub enum AbilityArea {
 }
 
 impl Sim {
-    fn abi_int(&self, ability: i32, column: &str) -> i32 {
+    pub(crate) fn abi_int(&self, ability: i32, column: &str) -> i32 {
         match self
             .world
             .tables()
@@ -209,9 +209,27 @@ impl Sim {
 
     /// Puts `ability` (from the item tagged `item`, if any) in `who`'s quickbar slot `slot`, or
     /// empties the slot when `ability` is 0: a script's `SetQuickslot` or the player's drag.
+    /// `SetQuickslot`: a slot of −1 is the first slot nothing was set in, as script.ldf
+    /// documents (the game's scripts pass −1 2000 times). Provisional: an ability or item
+    /// already set in a slot is not set again in another.
     pub fn set_quickslot(&mut self, who: ObjectId, slot: i32, ability: i32, item: &str) {
         let Some(o) = self.world.get_mut(who) else {
             return;
+        };
+        let slot = if slot == -1 && ability > 0 {
+            let q = Quickslot {
+                ability,
+                item: item.to_string(),
+            };
+            if o.quickslots.values().any(|x| quick_key(x) == quick_key(&q)) {
+                return;
+            }
+            match (0..QUICKSLOTS).find(|s| !o.quickslots.contains_key(s)) {
+                Some(s) => s,
+                None => return,
+            }
+        } else {
+            slot
         };
         if !(0..QUICKSLOTS).contains(&slot) {
             return;
