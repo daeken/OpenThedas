@@ -32,6 +32,9 @@ pub mod field {
     pub const BONE_INDEX: u32 = 6254;
     /// A skinned mesh's palette: the bone index each of its vertices' blend indices names.
     pub const MESH_BONES: u32 = 6255;
+    /// Whether a mesh casts the engine's run-time (shadow partition) shadows; xoreos's
+    /// `MMHMeshCastRuntimeShadow`.
+    pub const MESH_CAST_RUNTIME_SHADOW: u32 = 6176;
 }
 
 pub const KIND_TRANSLATION: FourCC = FourCC::new(b"trsl");
@@ -82,6 +85,10 @@ pub struct MeshRef {
     /// For a skinned mesh, the bone index (a skeleton node's [`Node::bone`]) that each
     /// value of its vertices' blend indices stands for; empty for rigid meshes.
     pub bones: Vec<u32>,
+    /// Whether the mesh casts run-time shadows (6176): static level geometry that the
+    /// submission queue's shadow groups draw into the shadow partitions. `None` when the
+    /// node does not say.
+    pub cast_runtime_shadow: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -272,6 +279,9 @@ fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>
                         }
                     })
                     .collect::<TypedResult<_>>()?,
+                cast_runtime_shadow: d
+                    .opt_i64(id, field::MESH_CAST_RUNTIME_SHADOW)?
+                    .map(|v| v != 0),
             }),
             None => None,
         }
