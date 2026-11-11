@@ -1261,8 +1261,15 @@ impl Sim {
 /// known. Provisional: rules_core counts any melee attack from beyond 5 m as a miss.
 pub const MELEE_REACH: f32 = 2.0;
 
-/// The gap a melee attacker leaves between its body and its target's (metres). Provisional.
-pub const MELEE_GAP: f32 = 0.5;
+/// How far past the two bodies a melee attack reaches (metres): DAOrigins.exe's melee range
+/// test (0x6a3dc0, used by the attack command's start step 0x7a87c0) adds 1.2 (0xafebc0) to
+/// the two creatures' radii (0x695320, which adds nothing between them, 0xade210) and
+/// measures across the ground. The radii are taken to be `PERSPACE` (provisional).
+pub const MELEE_GAP: f32 = 1.2;
+
+/// The slack the same test allows past that reach (metres, 0xade218): an attack may start
+/// with the target up to this much farther away.
+pub const MELEE_REACH_TOLERANCE: f32 = 1.0;
 
 /// A creature's body radius when its appearance gives none (metres). Provisional.
 pub const DEFAULT_RADIUS: f32 = 0.4;
@@ -1284,7 +1291,8 @@ impl Sim {
     }
 
     /// How close `id` must be to `target` to attack it: a ranged weapon's range, else the
-    /// two bodies' radii and [`MELEE_GAP`].
+    /// two bodies' radii and [`MELEE_GAP`] (an attack may start from up to
+    /// [`MELEE_REACH_TOLERANCE`] farther).
     pub fn reach_to(&self, id: ObjectId, target: ObjectId) -> f32 {
         let r = self.attack_reach(id);
         if r > MELEE_REACH {
