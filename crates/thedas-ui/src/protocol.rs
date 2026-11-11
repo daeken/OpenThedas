@@ -20,8 +20,11 @@ use crate::{CallKind, Responder, UiCall, UiValue};
 /// Messages whose engine side reads a value the screen set just before sending them (the
 /// name typed in character creation): the bridge passes the value on as one more argument.
 /// Provisional: inferred from the movies, which set the value and send the message together.
-const MESSAGE_VALUES: &[(&str, &str)] =
-    &[("GUICharGen.CharGenSelectName", "GUICharGen.TempCharName")];
+const MESSAGE_VALUES: &[(&str, &str)] = &[
+    ("GUICharGen.CharGenSelectName", "GUICharGen.TempCharName"),
+    // saveload.gfx sets the name typed, then sends the save.
+    ("SaveLoad.SaveGame", "SaveLoad.SaveName"),
+];
 
 /// `args` with the value [`MESSAGE_VALUES`] names for message `name`, if any, added.
 fn with_message_values(

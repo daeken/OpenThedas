@@ -3611,6 +3611,7 @@ dependencies = [
  "log",
  "png",
  "pollster",
+ "serde",
  "serde_json",
  "thedas-formats",
  "thedas-render",

@@ -138,6 +138,11 @@ pub fn blend_premultiplied(base: &mut Rgba, src: &Rgba) {
     }
 }
 
+/// The movie that shows the game's dialog boxes (`PopupLayer.ShowDialogBoxFromGame`).
+pub const POPUP_LAYER: &str = "popuplayer.gfx";
+/// The context the popup layer pushes while a dialog box is up.
+const POPUP_CONTEXT: &str = "GUIPopup";
+
 pub struct Stage {
     pub movies: Vec<UiMovie>,
     /// Recent ActionScript traces and warnings, newest last (at most 500).
@@ -266,6 +271,12 @@ impl Stage {
                 "_global.GUISystem.OriginalStageHeight",
                 UiValue::Number(h as f64),
             );
+            // The engine also sets them on `_root` when it starts a movie (the executable
+            // pushes `_root.OriginalStageWidth` at 0x51a289, beside `_root.Filename`), as
+            // StartSceneFromFlash does; the HUD's layout and popuplayer.gfx's dialog boxes
+            // read those.
+            m.set("_root.OriginalStageWidth", UiValue::Number(w as f64));
+            m.set("_root.OriginalStageHeight", UiValue::Number(h as f64));
         }
         // Scaleform's mouse button constants, which the movies test their clicks against.
         for (k, b) in [
@@ -275,6 +286,12 @@ impl Stage {
         ] {
             m.set(&format!("_global.Mouse.{k}"), UiValue::Number(b));
         }
+        // The engine names each movie's file in `_root.Filename` (the executable pushes the
+        // name at 0x51a242, in the routine that sets the stage size); the popup layer's
+        // buttons name the movie to call back with it (`GUI.InvokeCallback <file>
+        // _root.DialogBoxCallbackN`). Provisional: the value's form (the file name with its
+        // extension) is inferred from the movies.
+        m.set("_root.Filename", UiValue::String(name.to_string()));
         m.call(START_SCENE, &[]);
         m.call(crate::avm1::INSTALL, &[]);
         // Movies anchor their elements to the screen when the engine asks them to lay out.
@@ -350,14 +367,37 @@ impl Stage {
         }
     }
 
+    /// Calls a function in the movie named `movie` (`None` when it is not open).
+    pub fn call_in(&mut self, movie: &str, path: &str, args: &[UiValue]) -> Option<UiValue> {
+        let m = self.movies.iter_mut().find(|m| m.name == movie)?;
+        Some(m.call(path, args))
+    }
+
+    /// Whether one of the popup layer's dialog boxes is up.
+    pub fn dialog_up(&self) -> bool {
+        self.bridge.contexts().last().map(String::as_str) == Some(POPUP_CONTEXT)
+            && self.movies.iter().any(|m| m.name == POPUP_LAYER)
+    }
+
+    /// The movies that take the mouse: all of them, or only the popup layer while one of its
+    /// dialogs is up (it pushes the `GUIPopup` context then and pops it when the dialog
+    /// closes). Provisional: the game's context system decides which input reaches which
+    /// movie; this follows only the popup's context.
+    fn input_movies(&mut self) -> impl Iterator<Item = &mut UiMovie> {
+        let popup = self.dialog_up();
+        self.movies
+            .iter_mut()
+            .filter(move |m| !popup || m.name == POPUP_LAYER)
+    }
+
     pub fn mouse_move(&mut self, x: f64, y: f64) {
-        for m in &mut self.movies {
+        for m in self.input_movies() {
             m.mouse_move(x, y);
         }
     }
 
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
-        for m in &mut self.movies {
+        for m in self.input_movies() {
             m.mouse_button(x, y, down);
         }
     }
@@ -367,7 +407,7 @@ impl Stage {
     /// for a double click), delivered as an ordinary click with the button set aside (see
     /// [`crate::avm1::BUTTON_VAR`]).
     pub fn click_as(&mut self, button: f64, x: f64, y: f64) {
-        for m in &mut self.movies {
+        for m in self.input_movies() {
             m.set(crate::avm1::BUTTON_VAR, UiValue::Number(button));
             m.mouse_move(x, y);
             m.mouse_button(x, y, true);
