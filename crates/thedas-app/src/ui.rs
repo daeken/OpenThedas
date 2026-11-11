@@ -422,8 +422,12 @@ impl UiLayer {
                 self.refresh_saves();
                 screens.menu = Some(Screen::SaveLoad);
             }
+            // The save screen's, or optionsmenu.gfx's OK and Cancel (`HideGUIScreen Options`).
             "GameModeController.HideGUIScreen" => {
-                if screens.menu == Some(Screen::SaveLoad) {
+                if screens.menu == Some(Screen::SaveLoad)
+                    || (screens.menu == Some(Screen::Options)
+                        && args.first().map(|a| a.trim()) == Some("Options"))
+                {
                     screens.menu = None;
                 }
             }
@@ -526,7 +530,9 @@ impl UiLayer {
         // mutably, which the bindings do not have).
         let journal = (screens.menu == Some(Screen::Journal))
             .then(|| sim.lock().unwrap_or_else(|p| p.into_inner()).journal());
+        let resolution = self.stage.size();
         if let Ok(mut shown) = self.shown.lock() {
+            shown.resolution = resolution;
             // A notification's entry is the journal's to open on while it is up.
             if journal.is_none() {
                 shown.journal_focus = None;

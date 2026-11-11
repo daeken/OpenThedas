@@ -90,6 +90,10 @@ pub struct Presentation {
     /// The entry the journal opens on (a HUD notification clicked: `GUI.GoToQuest`,
     /// `GUI.GoToCodex`).
     pub journal_focus: Option<JournalFocus>,
+    /// The player's settings changed from their defaults (see [`crate::options`]).
+    pub options: BTreeMap<String, f64>,
+    /// The size the game draws at, the options screen's resolution.
+    pub resolution: (u32, u32),
 }
 
 /// The journal entry a notification opens the journal on, as journal.gfx reads it
@@ -483,6 +487,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     saves(sim, shown, &mut v);
     journal(sim, shown, &mut v);
     alerts(sim, &mut v);
+    crate::options::values(&shown.options, shown.resolution, &mut v);
     // The difficulty, as character creation's difficulty prompt starts from it.
     v.insert(
         "ClientOptions.GameOptions.DifficultyLevel".into(),
