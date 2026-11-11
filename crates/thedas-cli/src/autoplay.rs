@@ -838,6 +838,7 @@ pub fn run(o: &Options) -> Result<()> {
         seed: 1,
         keep_trace: false,
         cutscenes: Default::default(),
+        chargen: Default::default(),
     })
     .with_context(|| format!("opening module {}", o.module))?;
     let mut runs = Vec::new();

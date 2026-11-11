@@ -32,6 +32,7 @@ pub enum Screen {
     PartyPicker,
     Death,
     SaveLoad,
+    CharGen,
 }
 
 impl Screen {
@@ -52,6 +53,8 @@ impl Screen {
             Screen::Death => &["deathscreen.gfx"],
             // Its save names and confirmations are dialog boxes on the popup layer.
             Screen::SaveLoad => &["saveload.gfx", "popuplayer.gfx"],
+            // Quick Play and finishing ask for confirmation on the popup layer.
+            Screen::CharGen => &["chargen.gfx", "popuplayer.gfx"],
         }
     }
 
@@ -82,7 +85,12 @@ pub fn wanted(sim: &Sim, menu: Option<Screen>) -> BTreeSet<Screen> {
     } else if w.party_picker.is_some() {
         Screen::PartyPicker
     } else if w.chargen.is_some() {
-        Screen::LevelUp
+        // StartCharGen's mode: 0 character creation, else level-up.
+        if w.chargen_mode == 0 {
+            Screen::CharGen
+        } else {
+            Screen::LevelUp
+        }
     } else if w.store.is_some() {
         Screen::Store
     } else if w.chanter_board.is_some() {
@@ -321,5 +329,20 @@ mod tests {
             set(&[Screen::SaveLoad])
         );
         assert!(Screen::Death.stops_the_world());
+    }
+
+    #[test]
+    fn character_creation_and_level_up_have_their_own_screens() {
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        sim.world.chargen = Some(1);
+        sim.world.chargen_mode = 0;
+        assert_eq!(wanted(&sim, None), set(&[Screen::CharGen]));
+        assert!(Screen::CharGen.stops_the_world());
+        sim.world.chargen_mode = 1;
+        assert_eq!(wanted(&sim, None), set(&[Screen::LevelUp]));
     }
 }

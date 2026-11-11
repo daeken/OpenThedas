@@ -917,12 +917,15 @@ impl Server {
             seed: a.seed.unwrap_or(1),
             keep_trace: true,
             cutscenes: Default::default(),
+            // Before the module loads: a new game starts character creation then.
+            chargen: if a.chargen.as_deref() == Some("manual") {
+                thedas_sim::sim::ChargenPolicy::Manual
+            } else {
+                Default::default()
+            },
         };
         match open(&opts) {
             Ok(mut sim) => {
-                if a.chargen.as_deref() == Some("manual") {
-                    sim.chargen_policy = thedas_sim::sim::ChargenPolicy::Manual;
-                }
                 sim.tick(0);
                 let area = sim.world.area;
                 let objects: Vec<J> = sim
@@ -1980,6 +1983,7 @@ impl Server {
                     seed: 1,
                     keep_trace: true,
                     cutscenes: Default::default(),
+                    chargen: Default::default(),
                 })
                 .map_err(|e| e.to_string())?;
                 st.sim = Some(sim);

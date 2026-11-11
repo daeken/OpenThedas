@@ -22,6 +22,9 @@ pub struct SessionOptions {
     pub keep_trace: bool,
     /// What happens to cutscenes scripts load, from the module's first scripts on.
     pub cutscenes: crate::sim::CutscenePolicy,
+    /// What happens when a script starts character creation, from the module's first
+    /// scripts on (a new game starts it while the module loads).
+    pub chargen: crate::sim::ChargenPolicy,
 }
 
 /// Opens the install and loads the module and area.
@@ -45,6 +48,7 @@ pub fn open(o: &SessionOptions) -> Result<Sim, SimError> {
     let mut sim = Sim::new(Arc::new(vfs), Arc::new(table), o.seed);
     sim.world.trace.keep = o.keep_trace;
     sim.cutscene_policy = o.cutscenes;
+    sim.chargen_policy = o.chargen.clone();
     sim.load_module(install.root(), &o.module)?;
     let area = o
         .area
