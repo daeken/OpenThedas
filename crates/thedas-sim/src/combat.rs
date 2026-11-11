@@ -61,6 +61,9 @@ pub const VISUAL_RANGE: f32 = 60.0;
 /// `EFFECT_TYPE_DEATH` in effects.gda.
 pub const EFFECT_TYPE_DEATH: i32 = 7;
 
+/// `EFFECT_TYPE_DOT` in effects.gda.
+pub const EFFECT_TYPE_DOT: i32 = 1017;
+
 /// `EFFECT_TYPE_RESURRECTION` in effects.gda.
 pub const EFFECT_TYPE_RESURRECTION: i32 = 1005;
 
@@ -562,6 +565,13 @@ impl Sim {
     /// creator of the effect being applied to it, if any, else the script's owner (a weapon
     /// hit is applied by the attacker's own script); the ability is the effect's (0 for a
     /// weapon hit). Health the module's scripts set outside an effect is not recorded.
+    ///
+    /// Damage over time is the exception: rules_core's tick for it runs in the burning
+    /// creature's own script and lowers its health directly, with no effect being applied,
+    /// so the owner would be credited with its own burn. When a creature's own script takes
+    /// its health outside an effect and it carries an `EFFECT_TYPE_DOT` (1017) from someone
+    /// else, the loss is credited to that effect's creator and ability (the latest such
+    /// effect when there are several). Attribution only: nothing in the simulation reads it.
     pub(crate) fn record_health_loss(&mut self, caller: ObjectId, target: ObjectId, amount: f32) {
         if amount <= 0.0 {
             return;
@@ -576,6 +586,18 @@ impl Sim {
         if effect.is_none() && Some(caller) == self.world.module {
             return;
         }
+        let dot = effect
+            .is_none()
+            .then(|| self.world.get(target))
+            .flatten()
+            .filter(|_| caller == target)
+            .and_then(|o| {
+                o.effects
+                    .iter()
+                    .rev()
+                    .find(|e| e.ty == EFFECT_TYPE_DOT && e.creator.is_some_and(|c| c != target))
+            });
+        let effect = effect.or(dot);
         let source = effect.and_then(|e| e.creator).unwrap_or(caller);
         let (ability, ty) = effect.map_or((0, 0), |e| (e.ability, e.ty));
         let t = self.world.time_ms;
@@ -818,17 +840,29 @@ impl Sim {
     /// rows are the slots in order (target type, condition, command, parameter), numbered from
     /// 1 as the scripts number them (slot 0 is unused). Provisional.
     pub fn apply_tactic_preset(&mut self, id: ObjectId, preset: i32) -> bool {
-        let tables = self.world.tables.clone();
-        let Some(presets) = tables.get(0, "tacticsuserpresets") else {
+        let Some(slots) = self.preset_tactics(preset) else {
             return false;
         };
+        match self.world.get_mut(id) {
+            Some(o) => {
+                o.combat.tactics = slots;
+                o.fields.insert("TacticPreset".into(), preset);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The slots a preset gives (see [`Sim::apply_tactic_preset`]), slot 0 unused.
+    /// Provisional.
+    pub fn preset_tactics(&self, preset: i32) -> Option<Vec<Tactic>> {
+        let tables = self.world.tables.clone();
+        let presets = tables.get(0, "tacticsuserpresets")?;
         let table_id = match presets.cell("TacticsTable", preset as i64) {
             Some(thedas_formats::gda::Cell::Int(v)) => *v as i32,
-            _ => return false,
+            _ => return None,
         };
-        let Some(t) = tables.get(table_id, "") else {
-            return false;
-        };
+        let t = tables.get(table_id, "")?;
         let int = |row: i64, col: &str| match t.cell(col, row) {
             Some(thedas_formats::gda::Cell::Int(v)) => *v as i32,
             _ => 0,
@@ -851,14 +885,23 @@ impl Sim {
                 }
             }))
             .collect();
-        match self.world.get_mut(id) {
-            Some(o) => {
-                o.combat.tactics = slots;
-                o.fields.insert("TacticPreset".into(), preset);
-                true
-            }
-            None => false,
+        Some(slots)
+    }
+
+    /// A creature's tactics as [`Sim::tactics_of`] gives them, without applying a preset:
+    /// the slots of the preset it would apply when it has none of its own.
+    pub fn tactics_shown(&self, id: ObjectId) -> Vec<Tactic> {
+        let Some(o) = self.world.get(id) else {
+            return Vec::new();
+        };
+        if !o.combat.tactics.is_empty() {
+            return o.combat.tactics.clone();
         }
+        o.fields
+            .get("TacticPreset")
+            .or_else(|| o.fields.get("TacticPreset.0"))
+            .and_then(|&p| self.preset_tactics(p))
+            .unwrap_or_default()
     }
 
     /// A creature's tactics, applying its first added preset if it has none yet (followers
@@ -1821,6 +1864,23 @@ mod tests {
         assert_eq!(d.get(&(archer, 0)), Some(&8.0));
         assert_eq!(d.get(&(mage, 14001)), Some(&30.0));
         assert_eq!(d.len(), 2);
+        // A burn's tick: the burning hero's own script takes its health, outside any
+        // effect; the burn's creator (and ability) is credited, the latest burn's when there
+        // are several.
+        s.current_effect = None;
+        let burn = |creator, ability| Effect {
+            ty: EFFECT_TYPE_DOT,
+            creator: Some(creator),
+            ability,
+            ..Default::default()
+        };
+        s.world.get_mut(hero).unwrap().effects = vec![burn(archer, 3000), burn(mage, 10003)];
+        s.record_health_loss(hero, hero, 9.0);
+        assert_eq!(s.world.trace.damage.get(&(mage, 10003)), Some(&9.0));
+        // Without a burn from someone else, the owner is credited as before.
+        s.world.get_mut(hero).unwrap().effects = vec![burn(hero, 1)];
+        s.record_health_loss(hero, hero, 4.0);
+        assert_eq!(s.world.trace.damage.get(&(hero, 0)), Some(&4.0));
     }
 
     #[test]

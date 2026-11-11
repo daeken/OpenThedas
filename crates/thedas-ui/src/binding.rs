@@ -90,6 +90,10 @@ pub struct Presentation {
     /// The entry the journal opens on (a HUD notification clicked: `GUI.GoToQuest`,
     /// `GUI.GoToCodex`).
     pub journal_focus: Option<JournalFocus>,
+    /// The player's settings changed from their defaults (see [`crate::options`]).
+    pub options: BTreeMap<String, f64>,
+    /// The size the game draws at, the options screen's resolution.
+    pub resolution: (u32, u32),
 }
 
 /// The journal entry a notification opens the journal on, as journal.gfx reads it
@@ -483,6 +487,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     saves(sim, shown, &mut v);
     journal(sim, shown, &mut v);
     alerts(sim, &mut v);
+    crate::options::values(&shown.options, shown.resolution, &mut v);
     // The difficulty, as character creation's difficulty prompt starts from it.
     v.insert(
         "ClientOptions.GameOptions.DifficultyLevel".into(),
@@ -994,25 +999,53 @@ fn party_picker(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValu
 
 /// The tactics of the party member the player controls, as tactics.gfx reads them
 /// (`GUI.SelectedChar.Tactics.TacticsList.N`: whether the slot is on, its target type,
-/// condition, command and the command's parameter). Read only: the screen's edits are not
-/// taken yet. Provisional: `TargetID` and `ConditionID` are taken to repeat the target and
-/// condition, and a member with no slots of its own shows none (its preset is applied when
-/// its tactics first run).
+/// condition, command and the command's parameter; row N is slot N + 1, as the scripts number
+/// slots from 1), with the presets it can pick (`PresetIdList.N`, its `AddTacticPresetID`
+/// presets), the one in use (`PresetType` 2 and its place in the list as `PresetIndex`, or
+/// type 0, "Off"), whether its slots were edited since (`Dirty`) and whether its tactics are
+/// on (`Enabled`). DAOrigins.exe's PartyTactics keeps these tokens (set up at 0x7b11xx). The
+/// list's own token changes with its rows, so tactics.gfx's list observer reads them again
+/// after a preset is loaded. Provisional: a creature with `NumTactics` set shows that many
+/// rows, `TargetID` and `ConditionID` repeat the target and condition, and there are no
+/// custom presets (`NumCustomSlots` 0).
 fn tactics(sim: &Sim, who: u32, v: &mut BTreeMap<String, UiValue>) {
+    use thedas_sim::tactics::{FIELD_DIRTY, FIELD_ENABLED, FIELD_PRESET_TYPE, PRESET_PREDEFINED};
     let Some(o) = sim.world.get(who) else { return };
     let k = "GUI.SelectedChar.Tactics";
-    v.insert(format!("{k}.Enabled"), num(1));
-    v.insert(format!("{k}.Dirty"), num(0));
+    let field = |f: &str| o.fields.get(f).copied();
+    v.insert(
+        format!("{k}.Enabled"),
+        num((field(FIELD_ENABLED).unwrap_or(1) != 0) as u8),
+    );
+    v.insert(format!("{k}.Dirty"), num(field(FIELD_DIRTY).unwrap_or(0)));
     v.insert(format!("{k}.DirtyPreset"), num(0));
+    let presets = sim.tactic_presets(who);
+    v.insert(format!("{k}.PresetIdList"), num(presets.len() as f64));
+    for (i, p) in presets.iter().enumerate() {
+        v.insert(format!("{k}.PresetIdList.{i}"), num(*p));
+    }
+    let current = field("TacticPreset").or_else(|| presets.first().copied());
+    let index = current.and_then(|c| presets.iter().position(|&p| p == c));
+    let kind = match (field(FIELD_PRESET_TYPE), index) {
+        (Some(t), _) => t,
+        (None, Some(_)) => PRESET_PREDEFINED,
+        (None, None) => 0,
+    };
+    v.insert(format!("{k}.PresetType"), num(kind));
     v.insert(
         format!("{k}.PresetIndex"),
-        num(o.fields.get("TacticPreset").copied().unwrap_or(0)),
+        num(index.filter(|_| kind == PRESET_PREDEFINED).unwrap_or(0) as f64),
     );
-    v.insert(format!("{k}.PresetType"), num(0));
+    v.insert(format!("{k}.NumCustomSlots"), num(0));
     v.insert("Party.InCamp".into(), num(0));
-    let list = &o.combat.tactics;
-    v.insert(format!("{k}.TacticsList"), num(list.len() as f64));
-    for (i, t) in list.iter().enumerate() {
+    let slots = sim.tactics_shown(who);
+    let rows = match field("NumTactics") {
+        Some(n) if n > 0 => n as usize,
+        _ => slots.len().saturating_sub(1),
+    };
+    let mut token = Vec::with_capacity(rows);
+    for i in 0..rows {
+        let t = slots.get(i + 1).cloned().unwrap_or_default();
         let r = format!("{k}.TacticsList.{i}");
         v.insert(format!("{r}.Enabled"), num(t.enabled as u8));
         v.insert(format!("{r}.Target"), num(t.target));
@@ -1024,7 +1057,12 @@ fn tactics(sim: &Sim, who: u32, v: &mut BTreeMap<String, UiValue>) {
         v.insert(format!("{r}.CommandItem"), num(0));
         v.insert(format!("{r}.ItemName"), UiValue::String(String::new()));
         v.insert(format!("{r}.ItemIcon"), UiValue::String(String::new()));
+        token.push(format!(
+            "{}:{}:{}:{}:{}",
+            t.enabled as u8, t.target, t.condition, t.command, t.param
+        ));
     }
+    v.insert(format!("{k}.TacticsList"), UiValue::String(token.join(",")));
 }
 
 /// The inventory screen: the party's backpack/// The inventory screen: the party's backpack (`GUIInventory.PartyBackpackView.N.Item`, the
@@ -1423,6 +1461,8 @@ mod tests {
             o.modifiers.insert(1, 3.0);
             o.fields.insert("CanLevelUp".into(), 1);
             o.fields.insert("Race".into(), 2);
+            // Slot 0 is unused: the scripts number slots from 1.
+            o.combat.tactics.push(Default::default());
             o.combat.tactics.push(thedas_sim::combat::Tactic {
                 enabled: true,
                 target: 2,
@@ -1430,6 +1470,14 @@ mod tests {
                 command: 4,
                 param: 3000,
             });
+            for (k, v) in [
+                ("TacticPresetCount", 2),
+                ("TacticPreset.0", 5),
+                ("TacticPreset.1", 7),
+                ("TacticPreset", 7),
+            ] {
+                o.fields.insert(k.into(), v);
+            }
         }
         let v = sim_values(&sim);
         let a = "GUI.SelectedChar.Attributes.1";
@@ -1450,6 +1498,28 @@ mod tests {
         assert_eq!(v[&format!("{t}.Condition")], UiValue::Number(9.0));
         assert_eq!(v[&format!("{t}.CommandParam")], UiValue::Number(3000.0));
         assert_eq!(v[&format!("{t}.Enabled")], UiValue::Number(1.0));
+        let k = "GUI.SelectedChar.Tactics";
+        assert!(!v.contains_key(&format!("{k}.TacticsList.1.Condition")));
+        assert_eq!(
+            v[&format!("{k}.TacticsList")],
+            UiValue::String("1:2:9:4:3000".into())
+        );
+        assert_eq!(v[&format!("{k}.PresetIdList.1")], UiValue::Number(7.0));
+        assert_eq!(v[&format!("{k}.PresetType")], UiValue::Number(2.0));
+        assert_eq!(v[&format!("{k}.PresetIndex")], UiValue::Number(1.0));
+        assert_eq!(v[&format!("{k}.Enabled")], UiValue::Number(1.0));
+        // Three slots to fill: the rows past its own are empty.
+        sim.world
+            .get_mut(hero)
+            .unwrap()
+            .fields
+            .insert("NumTactics".into(), 3);
+        let v = sim_values(&sim);
+        assert_eq!(
+            v[&format!("{k}.TacticsList.2.Condition")],
+            UiValue::Number(0.0)
+        );
+        assert!(!v.contains_key(&format!("{k}.TacticsList.3.Condition")));
         sim.world.get_mut(hero).unwrap().combat.in_combat = true;
         let v = sim_values(&sim);
         assert_eq!(

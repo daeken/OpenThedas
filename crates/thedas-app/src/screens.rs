@@ -34,6 +34,7 @@ pub enum Screen {
     SaveLoad,
     CharGen,
     Journal,
+    Options,
 }
 
 impl Screen {
@@ -63,6 +64,8 @@ impl Screen {
             // Quick Play and finishing ask for confirmation on the popup layer.
             Screen::CharGen => &["chargen.gfx", "popuplayer.gfx"],
             Screen::Journal => &["journal.gfx"],
+            // Settings that need confirming (a new resolution) ask on the popup layer.
+            Screen::Options => &["optionsmenu.gfx", "popuplayer.gfx"],
         }
     }
 

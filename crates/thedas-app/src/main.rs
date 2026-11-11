@@ -124,8 +124,10 @@ struct Args {
     click: Vec<String>,
     /// Headless, playing: input played in order before the capture, `;`-separated:
     /// `click X,Y` (a left click at that pixel), `run MS` (the game and its interface run
-    /// that long), `key i` (the inventory toggle), `key f1`-`key f4` (who leads), `key 1`-`key
-    /// 0` (quickbar slots), `key space` (pause), `talk TAG` (the leader talks to a creature),
+    /// that long), `key i` (the inventory toggle; `c`, `t`, `m`, `j` and `o` likewise toggle the
+    /// character record, tactics, area map, journal and options), `key f1`-`key f4` (who
+    /// leads), `key 1`-`key 0` (quickbar slots), `key space` (pause), `talk TAG` (the leader
+    /// talks to a creature),
     /// `reply N` (the conversation's reply N, from 0), `press X,Y` and `release X,Y` (the
     /// left button down and up, for drags), `rebuild` (the objects are rebuilt as a
     /// spawn rebuilds them, timed), `picker` (the party picker opens as a script would open
@@ -1085,9 +1087,15 @@ impl App {
                 }
             }
             // The player's screens: I the inventory, C the character record, T tactics, M the
-            // area map, J the journal (the executable's `ToggleJournal` action). Provisional:
-            // the game's own key bindings are not traced.
-            KeyCode::KeyI | KeyCode::KeyC | KeyCode::KeyT | KeyCode::KeyM | KeyCode::KeyJ
+            // area map, J the journal (the executable's `ToggleJournal` action), O the options.
+            // Provisional: the game's own key bindings are not traced (it opens its options
+            // from the game menu).
+            KeyCode::KeyI
+            | KeyCode::KeyC
+            | KeyCode::KeyT
+            | KeyCode::KeyM
+            | KeyCode::KeyJ
+            | KeyCode::KeyO
                 if self.screens.is_some() =>
             {
                 if let (Some(s), Some(m)) = (self.screens.as_mut(), menu_key(code)) {
@@ -1267,6 +1275,7 @@ impl App {
                     screens::Screen::Tactics => KeyCode::KeyT,
                     screens::Screen::AreaMap => KeyCode::KeyM,
                     screens::Screen::Journal => KeyCode::KeyJ,
+                    screens::Screen::Options => KeyCode::KeyO,
                     _ => KeyCode::KeyI,
                 });
                 log.push(format!("{m:?}"));
@@ -1747,7 +1756,7 @@ fn text_key(name: &str) -> Option<thedas_ui::UiKey> {
     })
 }
 
-/// The player's screen a key opens (I, C, T, M, J).
+/// The player's screen a key opens (I, C, T, M, J, O).
 fn menu_key(code: KeyCode) -> Option<screens::Screen> {
     match code {
         KeyCode::KeyI => Some(screens::Screen::Inventory),
@@ -1755,6 +1764,7 @@ fn menu_key(code: KeyCode) -> Option<screens::Screen> {
         KeyCode::KeyT => Some(screens::Screen::Tactics),
         KeyCode::KeyM => Some(screens::Screen::AreaMap),
         KeyCode::KeyJ => Some(screens::Screen::Journal),
+        KeyCode::KeyO => Some(screens::Screen::Options),
         _ => None,
     }
 }
@@ -1787,6 +1797,7 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
                 "key" if arg.eq_ignore_ascii_case("t") => Step::Menu(screens::Screen::Tactics),
                 "key" if arg.eq_ignore_ascii_case("m") => Step::Menu(screens::Screen::AreaMap),
                 "key" if arg.eq_ignore_ascii_case("j") => Step::Menu(screens::Screen::Journal),
+                "key" if arg.eq_ignore_ascii_case("o") => Step::Menu(screens::Screen::Options),
                 "key" if matches!(arg.to_ascii_lowercase().as_str(), "f1" | "f2" | "f3" | "f4") => {
                     Step::Leader(arg[1..].parse::<usize>()? - 1)
                 }
