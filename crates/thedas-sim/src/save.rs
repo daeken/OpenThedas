@@ -26,7 +26,10 @@ pub const SAVE_FORMAT: u32 = 1;
 ///   modifier no longer overwrites its base). Earlier saves may carry bases that such
 ///   writes destroyed; loading one checks for what can be seen of that (see
 ///   [`SaveIssue`]).
-pub const SAVE_REVISION: u32 = 3;
+/// - 4: the module hears followers join and leave the party (`EVENT_TYPE_PARTYMEMBER_ADDED`
+///   / `_DROPPED`), on which module_core keeps the party plot's `GEN_<name>_IN_PARTY` flags.
+///   Loading an earlier save tells it of the party as it stands.
+pub const SAVE_REVISION: u32 = 4;
 
 /// The trace channel loading reports save damage on.
 pub const SAVE_CHANNEL: i32 = -7;
@@ -230,6 +233,17 @@ impl Sim {
         if save_revision < 2 {
             self.restore_lost_appearances();
         }
+        if save_revision < 4 {
+            let members = self
+                .world
+                .hero
+                .and_then(|h| self.world.get(h))
+                .map(|h| h.followers.clone())
+                .unwrap_or_default();
+            for m in members {
+                self.party_membership_changed(m, true);
+            }
+        }
         self.save_issues = if save_revision < 3 {
             self.check_property_damage()
         } else {
@@ -339,6 +353,38 @@ mod tests {
             e,
             crate::trace::TraceEntry::Log { text, .. } if text.contains("leaves it nothing to draw")
         )));
+    }
+
+    #[test]
+    fn older_saves_tell_the_module_who_is_in_the_party() {
+        let table = EngineTable::parse(b"int EVENT_TYPE_PARTYMEMBER_ADDED = 66;\n").unwrap();
+        let mk = || {
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table.clone()), 7);
+            s.module_info.name = "test".into();
+            s
+        };
+        let mut s = mk();
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let ally = s.world.spawn(ObjectKind::Creature, "ally");
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        s.world.hero = Some(hero);
+        s.world.module = Some(module);
+        s.world.get_mut(hero).unwrap().followers = vec![ally];
+        let mut old = s.save_game();
+        old.revision = 3;
+        let mut t = mk();
+        t.load_game(old).unwrap();
+        let heard: Vec<_> = t
+            .world
+            .queue
+            .values()
+            .filter(|q| q.target == module)
+            .map(|q| (q.event.ty, q.event.objects.clone()))
+            .collect();
+        assert_eq!(heard, vec![(66, vec![ally])]);
+        let mut u = mk();
+        u.load_game(s.save_game()).unwrap();
+        assert!(u.world.queue.values().all(|q| q.target != module));
     }
 
     #[test]

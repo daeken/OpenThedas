@@ -1887,11 +1887,15 @@ pub fn call(
             }
             if let Some(hero) = h.sim.world.hero.filter(|&x| x != who) {
                 let hero_group = h.object(hero).map(|o| o.group);
+                let was = h.object(hero).is_some_and(|o| o.followers.contains(&who));
                 if let Some(ho) = h.sim.world.get_mut(hero) {
                     ho.followers.retain(|&f| f != who);
                     if active {
                         ho.followers.push(who);
                     }
+                }
+                if was != active {
+                    h.sim.party_membership_changed(who, active);
                 }
                 // Joining the active party puts a follower on the player's side
                 // (GROUP_PC), whatever group it had as an NPC, and at the leader's side if
@@ -3488,6 +3492,8 @@ mod tests {
         int GetEffectType(effect e) = 29;\n\
         string GetPlotGUID(string s) = 30;\n\
         int GetPlaceableBaseType(object o) = 40;\n\
+        int EVENT_TYPE_PARTYMEMBER_ADDED = 66;\n\
+        int EVENT_TYPE_PARTYMEMBER_DROPPED = 67;\n\
         #define ENGINE_STRUCTURE_1 location\n\
         location Location(object a, vector v, float f) = 41;\n\
         void SetIndividualImpactAOEEvent(object c, object t, int n, location l, int d = 0) = 42;\n\
@@ -4181,6 +4187,42 @@ mod tests {
         let state = |s: &mut Sim, o| run(s, hero, "GetFollowerState", &[Value::Object(o)]);
         assert_eq!(state(&mut s, hero), Some(Value::Int(1)));
         assert_eq!(state(&mut s, ally), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn the_module_hears_followers_join_and_leave_the_party() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let ally = s.world.spawn(ObjectKind::Creature, "ally");
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        s.world.hero = Some(hero);
+        s.world.module = Some(module);
+        let set = |s: &mut Sim, state: i32| {
+            run(
+                s,
+                hero,
+                "SetFollowerState",
+                &[Value::Object(ally), Value::Int(state)],
+            );
+        };
+        let heard = |s: &mut Sim| -> Vec<(i32, Vec<ObjectId>)> {
+            let q: Vec<_> = s
+                .world
+                .queue
+                .values()
+                .filter(|q| q.target == module)
+                .map(|q| (q.event.ty, q.event.objects.clone()))
+                .collect();
+            s.world.queue.clear();
+            q
+        };
+        set(&mut s, 1);
+        assert_eq!(heard(&mut s), vec![(66, vec![ally])], "joined");
+        set(&mut s, 1);
+        assert!(heard(&mut s).is_empty(), "already a member");
+        set(&mut s, 2);
+        assert_eq!(heard(&mut s), vec![(67, vec![ally])], "left for the pool");
     }
 
     #[test]
