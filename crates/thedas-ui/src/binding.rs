@@ -337,6 +337,24 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         set("Area.ResRef".into(), UiValue::String(a.tag.clone()));
         set("Area.Name".into(), UiValue::String(name(sim, a.id)));
     }
+    // Where the camera looks (world metres): the area map (map.gfx) opens centred there
+    // (`SetMapFocus` from `CameraPivotPosition`). Provisional: the camera follows the party
+    // member the player controls, so its pivot is taken to be that member's place.
+    if let Some(o) = sim
+        .world
+        .controlled()
+        .or(sim.world.hero)
+        .and_then(|id| sim.world.get(id))
+    {
+        set(
+            "GameModeExplore.CameraPivotPositionX".into(),
+            num(o.position[0]),
+        );
+        set(
+            "GameModeExplore.CameraPivotPositionY".into(),
+            num(o.position[1]),
+        );
+    }
     set(
         "GameModeController.CurrentGameMode".into(),
         num(game_mode(sim)),
@@ -1642,5 +1660,22 @@ mod tests {
             UiValue::String("plt_cod_cha_duncan".into())
         );
         assert_eq!(v["Party.Alerts.1.Type"], num(ALERT_CODEX));
+    }
+
+    #[test]
+    fn the_area_map_centres_on_the_party_member_the_camera_follows() {
+        use thedas_sim::world::ObjectKind;
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        assert!(!sim_values(&sim).contains_key("GameModeExplore.CameraPivotPositionX"));
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        sim.world.hero = Some(hero);
+        sim.world.get_mut(hero).unwrap().position = [12.5, -3.0, 1.0];
+        let v = sim_values(&sim);
+        assert_eq!(v["GameModeExplore.CameraPivotPositionX"], num(12.5));
+        assert_eq!(v["GameModeExplore.CameraPivotPositionY"], num(-3.0));
     }
 }

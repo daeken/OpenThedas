@@ -66,7 +66,7 @@ pub struct JournalMark {
 }
 
 /// A HUD notification (notifications.gfx's `Party.Alerts.N`): a quest's new journal entry or
-/// a codex entry unlocked.
+/// a codex entry unlocked, one per type.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Alert {
     /// [`ALERT_QUEST`] or [`ALERT_CODEX`].
@@ -151,8 +151,9 @@ impl Sim {
                 unread: true,
             },
         );
-        // The HUD's notification: a codex entry, or a quest the journal lists. A newer one
-        // for the same plot replaces the old.
+        // The HUD's notification: a codex entry, or a quest the journal lists. There is one
+        // per type, naming the latest plot (notifications.gfx hides them by type,
+        // `Party.HideAlert <type>`). Provisional: inferred from that message.
         let kind = if self.is_codex_kind(info.kind) {
             ALERT_CODEX
         } else if matches!(info.kind, KIND_QUEST | KIND_CHANTERS) && info.parent.is_some() {
@@ -161,7 +162,7 @@ impl Sim {
             return;
         };
         let completed = kind == ALERT_QUEST && info.finals.iter().any(|&f| self.flag_on(info, f));
-        self.world.alerts.retain(|a| a.resref != info.resref);
+        self.world.alerts.retain(|a| a.kind != kind);
         self.world.alerts.push(Alert {
             kind,
             resref: info.resref.clone(),
@@ -514,8 +515,8 @@ mod tests {
             Some("plt_lot100pt_bears_sub")
         );
 
-        // New entries are unread and raise the HUD's notifications: the quests' (one per
-        // quest, the latest; "bears" now completed) and the codex entry's, not the
+        // New entries are unread and raise the HUD's notifications, one per type naming the
+        // latest plot: the quests' ("bears", now completed) and the codex entry's, not the
         // bookkeeping plot's.
         let j = s.journal();
         assert!(j.completed[0].updated && j.active[0].updated);
@@ -529,7 +530,6 @@ mod tests {
         assert_eq!(
             alerts,
             [
-                (ALERT_QUEST, "plt_lot100pt_bears_sub", false),
                 (ALERT_CODEX, "plt_cod_crt_ogre", false),
                 (ALERT_QUEST, "plt_lot100pt_bears", true),
             ]

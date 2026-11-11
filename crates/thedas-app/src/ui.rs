@@ -252,6 +252,17 @@ impl UiLayer {
             queue: ctx.queue.clone(),
         };
         let mut stage = Stage::new(gpu, vfs, size);
+        // The area map's explored-area mask (map.gfx loads `mapmask`, a picture the engine
+        // makes; no resource has it): clear, so the whole map shows as explored.
+        // Provisional: exploration is not tracked.
+        stage.set_image(
+            "mapmask.dds",
+            Some(&Rgba {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 4],
+            }),
+        );
         stage.open_all(names);
         Self {
             stage,
@@ -573,17 +584,6 @@ impl UiLayer {
         }
         self.show_cutscene_line(sim);
         let messages = self.stage.tick(dt_ms);
-        // A dialog focuses its text field (a save's name) once it is up. Nothing types into
-        // the movies yet, and with the field focused the first press on a dialog button only
-        // moves the focus (the button's press is cancelled), so the field gives its focus up
-        // and its default text stands. Provisional: until keyboard input reaches the movies.
-        if self.stage.dialog_up() {
-            self.stage.call_in(
-                thedas_ui::stage::POPUP_LAYER,
-                "_global.Selection.setFocus",
-                &[thedas_ui::UiValue::Null],
-            );
-        }
         let ignored = {
             let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             thedas_ui::input::apply_all(&mut sim, &messages)
@@ -731,11 +731,12 @@ impl UiLayer {
         }
     }
 
-    /// Sends the minimap where the camera and the area's creatures are (the engine writes
+    /// Sends the maps where the camera and the area's creatures are (the engine writes
     /// `SharedLibrary.SharedMap`'s batch arrays: the camera first, then each creature's
     /// place on the map picture, in its pixels, and facing, three numbers each, and flags),
-    /// then has it redraw. Provisional: every living creature in the area is shown, all
-    /// within the map's radius.
+    /// then has them redraw: the HUD's minimap (minimap.gfx) and the area map screen
+    /// (map.gfx), which share the picture (`Area.Minimap`) and the arrays. Provisional: every
+    /// living creature in the area is shown, all within the map's radius.
     pub fn update_minimap(&mut self, sim: &Arc<Mutex<Sim>>, camera: &thedas_render::Camera) {
         self.minimap_frame += 1;
         if self.minimap_frame < MINIMAP_EVERY {
@@ -743,14 +744,6 @@ impl UiLayer {
         }
         self.minimap_frame = 0;
         let Some(info) = self.shown.lock().ok().and_then(|s| s.minimap.clone()) else {
-            return;
-        };
-        let Some(m) = self
-            .stage
-            .movies
-            .iter_mut()
-            .find(|m| m.name == "minimap.gfx")
-        else {
             return;
         };
         let num = |x: f64| thedas_ui::UiValue::Number(x);
@@ -794,26 +787,49 @@ impl UiLayer {
             }
         }
         let map = "_global.SharedLibrary.SharedMap";
-        m.set(
-            &format!("{map}.BatchCreatureIDs"),
-            thedas_ui::UiValue::List(ids),
-        );
-        m.set(
-            &format!("{map}.BatchCreaturePositionsOrientations"),
-            thedas_ui::UiValue::List(places),
-        );
-        m.set(
-            &format!("{map}.BatchCreatureFlags"),
-            thedas_ui::UiValue::List(flags),
-        );
-        // The map picture's clip is authored fully transparent and nothing in the movie
-        // raises it once the picture has loaded. Provisional: the game shows it, so it is
-        // shown here.
-        m.set(
-            "_global.MiniMap.Instance.m_mcMapImage._alpha",
-            thedas_ui::UiValue::Number(100.0),
-        );
-        m.call("_global.MiniMap.Instance.UpdateMinimap", &[]);
+        for m in self
+            .stage
+            .movies
+            .iter_mut()
+            .filter(|m| m.name == "minimap.gfx" || m.name == "map.gfx")
+        {
+            m.set(
+                &format!("{map}.BatchCreatureIDs"),
+                thedas_ui::UiValue::List(ids.clone()),
+            );
+            m.set(
+                &format!("{map}.BatchCreaturePositionsOrientations"),
+                thedas_ui::UiValue::List(places.clone()),
+            );
+            m.set(
+                &format!("{map}.BatchCreatureFlags"),
+                thedas_ui::UiValue::List(flags.clone()),
+            );
+            if m.name == "minimap.gfx" {
+                // The map picture's clip is authored fully transparent and nothing in the
+                // movie raises it once the picture has loaded. Provisional: the game shows
+                // it, so it is shown here.
+                m.set(
+                    "_global.MiniMap.Instance.m_mcMapImage._alpha",
+                    thedas_ui::UiValue::Number(100.0),
+                );
+                m.call("_global.MiniMap.Instance.UpdateMinimap", &[]);
+            } else {
+                // map.gfx draws its picture and its explored-area mask with the `alpha` and
+                // `erase` blend modes, in a clip that is not a layer. The player follows
+                // Flash and draws nothing of them there, while the game shows the map: they
+                // are drawn as `normal`, as Scaleform appears to. Provisional: the
+                // executable's renderer is not traced.
+                let clip = "_global.Map.cm_MapContainer.Map_mc";
+                for c in ["MapImage_mc", "MapImageAlpha_mc", "MapMask_mc"] {
+                    m.set(
+                        &format!("{clip}.{c}.blendMode"),
+                        thedas_ui::UiValue::String("normal".into()),
+                    );
+                }
+                m.call("_global.Map.cm_SharedMap.UpdateMap", &[]);
+            }
+        }
     }
 
     /// Renders every movie into its texture (the window does this as it composites).
@@ -918,6 +934,21 @@ impl UiLayer {
     /// A click the movies see as Scaleform mouse `button` (a right click, a double click).
     pub fn click_as(&mut self, button: f64, x: f64, y: f64) {
         self.stage.click_as(button, x, y);
+    }
+
+    /// Whether a movie's text field has focus (keys type into it, not the game's).
+    pub fn typing(&mut self) -> bool {
+        self.stage.text_focus().is_some()
+    }
+
+    /// A key for the focused text field; false when there is none.
+    pub fn key(&mut self, key: thedas_ui::UiKey) -> bool {
+        self.stage.key(key)
+    }
+
+    /// Types text into the focused text field; false when there is none.
+    pub fn type_text(&mut self, text: &str) -> bool {
+        self.stage.type_text(text)
     }
 
     /// Renders every movie into its texture and draws them over `target`, in order.

@@ -27,7 +27,10 @@ use std::sync::{Arc, Mutex};
 
 use ruffle_core::backend::navigator::NullExecutor;
 use ruffle_core::context::UpdateContext;
-use ruffle_core::events::{MouseButton, PlayerEvent};
+use ruffle_core::events::{
+    KeyDescriptor, KeyLocation, LogicalKey, MouseButton, NamedKey, PhysicalKey, PlayerEvent,
+    TextControlCode,
+};
 use ruffle_core::external::{ExternalInterfaceProvider, FsCommandProvider, Value as RValue};
 use ruffle_core::tag_utils::SwfMovieData;
 use ruffle_core::{FloatDuration, Player, PlayerBuilder, StageScaleMode};
@@ -49,6 +52,109 @@ pub enum UiError {
     Swf(String),
     #[error("renderer: {0}")]
     Render(String),
+}
+
+/// A key for the movies: a character typed, or a key that edits text or moves its cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiKey {
+    Char(char),
+    Backspace,
+    Delete,
+    Enter,
+    Escape,
+    Tab,
+    Left,
+    Right,
+    Home,
+    End,
+    /// Ctrl+A: select the field's text (typing then replaces it).
+    SelectAll,
+}
+
+impl UiKey {
+    fn descriptor(self) -> (PhysicalKey, LogicalKey) {
+        let named = |p, n| (p, LogicalKey::Named(n));
+        match self {
+            UiKey::Char(c) => (char_physical(c), LogicalKey::Character(c)),
+            UiKey::Backspace => named(PhysicalKey::Backspace, NamedKey::Backspace),
+            UiKey::Delete => named(PhysicalKey::Delete, NamedKey::Delete),
+            UiKey::Enter => named(PhysicalKey::Enter, NamedKey::Enter),
+            UiKey::Escape => named(PhysicalKey::Escape, NamedKey::Escape),
+            UiKey::Tab => named(PhysicalKey::Tab, NamedKey::Tab),
+            UiKey::Left => named(PhysicalKey::ArrowLeft, NamedKey::ArrowLeft),
+            UiKey::Right => named(PhysicalKey::ArrowRight, NamedKey::ArrowRight),
+            UiKey::Home => named(PhysicalKey::Home, NamedKey::Home),
+            UiKey::End => named(PhysicalKey::End, NamedKey::End),
+            UiKey::SelectAll => (PhysicalKey::KeyA, LogicalKey::Character('a')),
+        }
+    }
+
+    /// The edit a text field makes for the key.
+    fn text_control(self) -> Option<TextControlCode> {
+        Some(match self {
+            UiKey::Backspace => TextControlCode::Backspace,
+            UiKey::Delete => TextControlCode::Delete,
+            UiKey::Enter => TextControlCode::Enter,
+            UiKey::Left => TextControlCode::MoveLeft,
+            UiKey::Right => TextControlCode::MoveRight,
+            UiKey::Home => TextControlCode::MoveLeftDocument,
+            UiKey::End => TextControlCode::MoveRightDocument,
+            UiKey::SelectAll => TextControlCode::SelectAll,
+            _ => return None,
+        })
+    }
+}
+
+/// The physical key that types a character on a US layout (Unknown for others).
+fn char_physical(c: char) -> PhysicalKey {
+    use PhysicalKey as P;
+    const LETTERS: [PhysicalKey; 26] = [
+        P::KeyA,
+        P::KeyB,
+        P::KeyC,
+        P::KeyD,
+        P::KeyE,
+        P::KeyF,
+        P::KeyG,
+        P::KeyH,
+        P::KeyI,
+        P::KeyJ,
+        P::KeyK,
+        P::KeyL,
+        P::KeyM,
+        P::KeyN,
+        P::KeyO,
+        P::KeyP,
+        P::KeyQ,
+        P::KeyR,
+        P::KeyS,
+        P::KeyT,
+        P::KeyU,
+        P::KeyV,
+        P::KeyW,
+        P::KeyX,
+        P::KeyY,
+        P::KeyZ,
+    ];
+    const DIGITS: [PhysicalKey; 10] = [
+        P::Digit0,
+        P::Digit1,
+        P::Digit2,
+        P::Digit3,
+        P::Digit4,
+        P::Digit5,
+        P::Digit6,
+        P::Digit7,
+        P::Digit8,
+        P::Digit9,
+    ];
+    match c {
+        'a'..='z' => LETTERS[c as usize - 'a' as usize],
+        'A'..='Z' => LETTERS[c as usize - 'A' as usize],
+        '0'..='9' => DIGITS[c as usize - '0' as usize],
+        ' ' => P::Space,
+        _ => P::Unknown,
+    }
 }
 
 /// A value passed between a movie and the application.
@@ -440,6 +546,31 @@ impl UiMovie {
         self.with_player(|p| p.handle_event(PlayerEvent::MouseMove { x, y }));
     }
 
+    /// A key pressed and released: the movie's key listeners hear it (`Key.getCode`), and a
+    /// focused text field takes the character or the edit.
+    pub fn key(&mut self, key: UiKey) {
+        let (physical, logical) = key.descriptor();
+        let descriptor = || KeyDescriptor {
+            physical_key: physical,
+            logical_key: logical,
+            key_location: KeyLocation::Standard,
+        };
+        self.with_player(|p| {
+            p.handle_event(PlayerEvent::KeyDown { key: descriptor() });
+            match key {
+                UiKey::Char(c) => {
+                    p.handle_event(PlayerEvent::TextInput { codepoint: c });
+                }
+                _ => {
+                    if let Some(code) = key.text_control() {
+                        p.handle_event(PlayerEvent::TextControl { code });
+                    }
+                }
+            }
+            p.handle_event(PlayerEvent::KeyUp { key: descriptor() });
+        });
+    }
+
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
         let button = MouseButton::Left;
         let ev = if down {
@@ -572,6 +703,35 @@ impl UiMovie {
     /// Every URL the movie fetched, with whether a resource served it.
     pub fn fetches(&self) -> Vec<(String, bool)> {
         self.fetches.lock().map(|f| f.clone()).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    #[test]
+    fn keys_reach_the_player_as_its_key_and_text_events() {
+        assert_eq!(
+            UiKey::Char('a').descriptor(),
+            (PhysicalKey::KeyA, LogicalKey::Character('a'))
+        );
+        assert_eq!(
+            UiKey::Char('R').descriptor(),
+            (PhysicalKey::KeyR, LogicalKey::Character('R'))
+        );
+        assert_eq!(UiKey::Char('é').descriptor().0, PhysicalKey::Unknown);
+        assert_eq!(
+            UiKey::Enter.descriptor(),
+            (PhysicalKey::Enter, LogicalKey::Named(NamedKey::Enter))
+        );
+        assert_eq!(UiKey::Enter.text_control(), Some(TextControlCode::Enter));
+        assert_eq!(
+            UiKey::SelectAll.text_control(),
+            Some(TextControlCode::SelectAll)
+        );
+        assert_eq!(UiKey::Char('x').text_control(), None);
+        assert_eq!(UiKey::Escape.text_control(), None);
     }
 }
 
