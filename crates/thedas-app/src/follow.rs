@@ -96,10 +96,20 @@ impl Follow {
         c.near = base.near;
         c.far = base.far;
         let reach = self.distance + CLEARANCE;
-        let clear = match hit(focus, focus - c.forward() * reach) {
-            Some(t) => (t * reach - CLEARANCE).max(MIN_CLEAR),
-            None => self.distance,
-        };
+        // The line of sight, and lines to either side of and above and below the camera:
+        // a wall beside the camera (not between it and the leader) also brings it in.
+        // Provisional: the game's own camera collision is not traced.
+        let forward = c.forward();
+        let right = forward.cross(Vec3::Z).normalize_or(Vec3::X);
+        let up = right.cross(forward);
+        let clear = [Vec3::ZERO, right, -right, up, -up]
+            .iter()
+            .filter_map(|side| {
+                let to = focus - forward * reach + *side * CLEARANCE;
+                hit(focus, to).map(|t| t * (to - focus).length())
+            })
+            .fold(None, |a: Option<f32>, d| Some(a.map_or(d, |a| a.min(d))))
+            .map_or(self.distance, |d| (d - CLEARANCE).max(MIN_CLEAR));
         // After a cut (a transition), or with no time to glide in, it stands where it can.
         let shown = match self.shown {
             Some(s) if !cut && dt > 0.0 => settle_distance(s, clear, dt),
@@ -172,6 +182,28 @@ mod tests {
         let c4 = f.camera_clear(Vec3::ZERO, 0.0, &base, &|_, _| Some(0.0));
         assert!((dist(&c4) - MIN_CLEAR).abs() < 1e-3);
         assert!((settle_distance(2.0, 6.0, 0.0) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_wall_beside_the_camera_brings_it_in_too() {
+        let mut f = Follow::behind(0.0);
+        let base = Camera::new(Vec3::ZERO, 0.0, 0.0);
+        let free = f.camera_clear(Vec3::ZERO, 0.0, &base, &|_, _| None);
+        // A wall on the camera's left (+Y when it looks along +X), behind the leader: the
+        // line of sight is clear, a line to the camera's left side is not.
+        let wall = |a: Vec3, b: Vec3| -> Option<f32> {
+            let (ya, yb) = (a.y, b.y);
+            (yb > 0.2 && ya < 0.2).then(|| (0.2 - ya) / (yb - ya))
+        };
+        let mut g = Follow::behind(0.0);
+        let near = g.camera_clear(Vec3::ZERO, 0.0, &base, &wall);
+        let look = Vec3::new(0.0, 0.0, LOOK_HEIGHT);
+        assert!(
+            (near.position - look).length() < (free.position - look).length() - 1.0,
+            "{:?} {:?}",
+            near.position,
+            free.position
+        );
     }
 
     #[test]
