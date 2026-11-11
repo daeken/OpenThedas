@@ -318,12 +318,13 @@ impl Live {
             return false;
         };
         // Every renderer's shadow casters go into the partitions before anything is drawn.
-        level
-            .renderer
-            .encode_shadows(ctx, encoder, camera, width, height, true);
+        level.renderer.prepare_shadows(ctx, camera, width, height);
         if let Some(o) = self.objects.as_mut() {
-            o.renderer
-                .encode_shadows(ctx, encoder, camera, width, height, false);
+            o.renderer.prepare_shadows(ctx, camera, width, height);
+        }
+        level.renderer.encode_shadows(encoder, true);
+        if let Some(o) = self.objects.as_mut() {
+            o.renderer.encode_shadows(encoder, false);
         }
         level
             .renderer

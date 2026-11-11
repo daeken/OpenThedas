@@ -118,6 +118,10 @@ pub(crate) struct D3dPass {
     caster_pipelines: Vec<wgpu::RenderPipeline>,
     casters: Vec<CasterDraw>,
     caster_buffer: Option<wgpu::Buffer>,
+    /// This frame's casters in reach of each partition (see [`D3dPass::update`]).
+    caster_visible: std::sync::Mutex<Vec<[bool; 2]>>,
+    /// What the casters' constants were last filled for (see [`shadow_key`]).
+    casters_filled: std::sync::Mutex<Option<u64>>,
     caster_programs: Vec<Arc<D3dProgram>>,
     /// The (empty) texture bindings of the casters' programs.
     empty_group: wgpu::BindGroup,
@@ -140,6 +144,19 @@ pub struct ShadowTargets {
     /// stood when last drawn: world bounding spheres. Provisional: the level's pass fits
     /// the partitions to them a frame late.
     others: std::sync::Mutex<Vec<(Vec3, f32)>>,
+    /// What each pass (0 the level's, 1 the objects') has to draw this frame and drew last
+    /// (see [`shadow_key`]): when nothing changed the partitions are left as they are.
+    keys: std::sync::Mutex<ShadowKeys>,
+}
+
+/// The passes' shadow keys (see [`ShadowTargets::keys`]).
+#[derive(Default)]
+struct ShadowKeys {
+    current: [Option<u64>; 2],
+    drawn: [Option<u64>; 2],
+    /// This frame's partitions are kept from the last (decided by the level's pass, which
+    /// draws first; the objects' pass follows it).
+    keep: bool,
 }
 
 impl ShadowTargets {
@@ -177,6 +194,7 @@ impl ShadowTargets {
             ],
             frame: std::sync::Mutex::new(None),
             others: std::sync::Mutex::new(Vec::new()),
+            keys: std::sync::Mutex::new(ShadowKeys::default()),
         }
     }
 
@@ -198,6 +216,63 @@ struct CasterDraw {
     /// The draw's bounding sphere in its own space (centre, radius), which the partitions
     /// fit (see [`crate::shadow::partitions`]).
     sphere: (Vec3, f32),
+}
+
+/// The largest scale a transform applies along any axis (a sphere's radius grows by it).
+fn max_scale(m: &glam::Mat4) -> f32 {
+    m.x_axis
+        .truncate()
+        .length()
+        .max(m.y_axis.truncate().length())
+        .max(m.z_axis.truncate().length())
+}
+
+/// Whether a caster's world bounding sphere reaches into a partition's box: anything
+/// outside it draws nothing there (the box clips it). Conservative: the box is
+/// orthographic, so the sphere's extent along each clip axis is its radius times that
+/// row's length.
+fn in_partition(p: &crate::shadow::Partition, centre: Vec3, radius: f32) -> bool {
+    let m = &p.view_proj;
+    let c = m.transform_point3(centre);
+    let reach = |row: usize| radius * m.row(row).truncate().length();
+    let (rx, ry, rz) = (reach(0), reach(1), reach(2));
+    c.x.abs() <= 1.0 + rx && c.y.abs() <= 1.0 + ry && c.z >= -rz && c.z <= 1.0 + rz
+}
+
+/// What a pass's shadow draws depend on: the partitions, which casters each draws, and
+/// those casters' transforms and bones. The same key, the same partitions drawn.
+fn shadow_key(
+    partitions: &[crate::shadow::Partition; 2],
+    casters: &[CasterDraw],
+    visible: &[[bool; 2]],
+    worlds: &[(glam::Mat4, Option<crate::scene::LightmapRef>, usize)],
+    bones: &[Vec<[f32; 4]>],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in partitions {
+        for v in p.view_proj.to_cols_array() {
+            v.to_bits().hash(&mut h);
+        }
+    }
+    for (c, v) in casters.iter().zip(visible) {
+        if !v[0] && !v[1] {
+            continue;
+        }
+        c.draw.hash(&mut h);
+        v.hash(&mut h);
+        for x in worlds[c.draw].0.to_cols_array() {
+            x.to_bits().hash(&mut h);
+        }
+        if let Some(b) = bones.get(c.draw) {
+            for r in b {
+                for x in r {
+                    x.to_bits().hash(&mut h);
+                }
+            }
+        }
+    }
+    h.finish()
 }
 
 fn decl_usage(u: Usage) -> DeclUsage {
@@ -921,6 +996,8 @@ impl D3dPass {
             places_partitions: scene.static_draws > 0,
             reach: crate::shadow::partition_reach(scene.detail),
             caster_pipelines,
+            caster_visible: std::sync::Mutex::new(Vec::new()),
+            casters_filled: std::sync::Mutex::new(None),
             casters,
             caster_buffer,
             caster_programs: caster_programs_used,
@@ -983,8 +1060,42 @@ impl D3dPass {
         let shadow = partitions
             .map(|(_, d)| d)
             .unwrap_or(crate::d3d::NO_SHADOW_DATA);
-        if let (Some(buf), Some((p, _))) = (&self.caster_buffer, partitions) {
-            self.update_casters(ctx, buf, camera, &p);
+        if let (Some(t), Some((p, _))) = (&self.shadows, partitions) {
+            let pass = usize::from(!self.places_partitions);
+            let visible: Vec<[bool; 2]> = self
+                .casters
+                .iter()
+                .map(|c| {
+                    let (world, _, _) = &self.worlds[c.draw];
+                    let centre = world.transform_point3(c.sphere.0);
+                    let radius = c.sphere.1 * max_scale(world);
+                    [0, 1].map(|k| in_partition(&p[k], centre, radius))
+                })
+                .collect();
+            let key = shadow_key(&p, &self.casters, &visible, &self.worlds, &self.bones);
+            {
+                let mut keys = t.keys.lock().unwrap_or_else(|e| e.into_inner());
+                // The level's pass comes first each frame: an objects' pass that no longer
+                // runs leaves no key behind.
+                if pass == 0 {
+                    keys.current[1] = None;
+                }
+                keys.current[pass] = Some(key);
+            }
+            let mut filled = self
+                .casters_filled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(buf) = &self.caster_buffer
+                && *filled != Some(key)
+            {
+                self.update_casters(ctx, buf, camera, &p, &visible);
+                *filled = Some(key);
+            }
+            *self
+                .caster_visible
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = visible;
         }
         let Some(buffer) = &self.buffer else { return };
         let (view, projection) = (camera.view(), camera.projection(aspect));
@@ -1045,16 +1156,23 @@ impl D3dPass {
         buffer: &wgpu::Buffer,
         camera: &Camera,
         partitions: &[crate::shadow::Partition; 2],
+        visible: &[[bool; 2]],
     ) {
-        let mut data = vec![0u8; buffer.size() as usize];
+        // One slot's constants at a time, for the casters a partition draws.
+        let slot_size = SLOT[7] as usize;
+        let mut data = vec![0u8; slot_size];
         let lights = DrawLights::default();
-        for c in &self.casters {
+        for (c, seen) in self.casters.iter().zip(visible) {
             let (world, _, material) = &self.worlds[c.draw];
             let program = &self.caster_programs[c.pipeline];
             let Some(Some(material)) = self.caster_materials.get(*material) else {
                 continue;
             };
             for (k, slot) in c.slots.iter().enumerate() {
+                if !seen[k] {
+                    continue;
+                }
+                data.fill(0);
                 let cc = ConstantContext {
                     view: glam::Mat4::IDENTITY,
                     projection: partitions[k].view_proj,
@@ -1077,7 +1195,7 @@ impl D3dPass {
                 for (table, base) in [(program.vs.ctab.as_ref(), 0), (program.ps.ctab.as_ref(), 3)]
                 {
                     let c = cc.fill(table);
-                    let o = *slot as usize;
+                    let o = 0;
                     let f: &[u8] = bytemuck::cast_slice(&c.floats);
                     let i: &[u8] = bytemuck::cast_slice(&c.ints);
                     let b: &[u8] = bytemuck::cast_slice(&c.bools);
@@ -1086,11 +1204,10 @@ impl D3dPass {
                     data[o + SLOT[base + 2] as usize..][..b.len()].copy_from_slice(b);
                 }
                 let fix = [1.0 / PARTITION_TEXELS, 1.0 / PARTITION_TEXELS, 0.0, 0.0];
-                data[(*slot + SLOT[6]) as usize..][..16]
-                    .copy_from_slice(bytemuck::cast_slice(&fix));
+                data[SLOT[6] as usize..][..16].copy_from_slice(bytemuck::cast_slice(&fix));
+                ctx.queue.write_buffer(buffer, *slot, &data);
             }
         }
-        ctx.queue.write_buffer(buffer, 0, &data);
     }
 
     /// Records this pass's shadow casters into the partitions; `clear` starts them afresh
@@ -1106,6 +1223,25 @@ impl D3dPass {
         if t.frame().is_none() || (!clear && self.casters.is_empty()) {
             return;
         }
+        {
+            let mut keys = t.keys.lock().unwrap_or_else(|e| e.into_inner());
+            if clear {
+                // Nothing any pass draws changed since the partitions were last drawn:
+                // they are kept as they are.
+                keys.keep = keys.drawn == keys.current && keys.current[0].is_some();
+                if !keys.keep {
+                    keys.drawn = keys.current;
+                }
+            }
+            if keys.keep {
+                return;
+            }
+        }
+        let visible = self
+            .caster_visible
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         for k in 0..2 {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow partition"),
@@ -1138,7 +1274,10 @@ impl D3dPass {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            for c in &self.casters {
+            for (i, c) in self.casters.iter().enumerate() {
+                if !visible.get(i).is_some_and(|v| v[k]) {
+                    continue;
+                }
                 let Some(mesh) = meshes.get(c.mesh) else {
                     continue;
                 };
@@ -1171,6 +1310,27 @@ impl D3dPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn casters_count_for_a_partition_only_within_its_box() {
+        let camera = Camera::new(Vec3::new(10.0, 20.0, 2.0), 0.3, -0.1);
+        let sun = Vec3::new(-0.48, -0.83, -0.3).normalize();
+        let p = crate::shadow::partitions(&camera, 16.0 / 9.0, sun, [5.0, 15.0], &[]);
+        let ahead = camera.position + camera.forward() * 3.0;
+        // Over the near slice: in the first partition.
+        assert!(in_partition(&p[0], ahead, 0.5));
+        // Up towards the sun from there, still within the box's reach: in.
+        assert!(in_partition(&p[0], ahead - sun * 20.0, 0.5));
+        // Far to the side, or behind the slice from the sun: out.
+        let side = camera.forward().cross(Vec3::Z) * 100.0;
+        assert!(!in_partition(&p[0], ahead + side, 0.5));
+        assert!(!in_partition(&p[0], ahead + sun * 100.0, 0.5));
+        // A big sphere reaches in from outside.
+        assert!(in_partition(&p[0], ahead + side, 100.0));
+        // Scale grows a sphere's radius by its largest axis.
+        let m = glam::Mat4::from_scale(Vec3::new(1.0, 3.0, 2.0));
+        assert_eq!(max_scale(&m), 3.0);
+    }
 
     #[test]
     fn border_colours_map_to_the_nearest_wgpu_offers() {

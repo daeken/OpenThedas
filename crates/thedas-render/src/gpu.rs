@@ -1024,7 +1024,8 @@ impl AreaRenderer {
         height: u32,
         camera: &Camera,
     ) {
-        self.encode_shadows(ctx, encoder, camera, width, height, true);
+        self.prepare_shadows(ctx, camera, width, height);
+        self.encode_shadows(encoder, true);
         self.render_pass(ctx, encoder, target, width, height, camera, None);
     }
 
@@ -1042,22 +1043,21 @@ impl AreaRenderer {
         self.render_pass(ctx, encoder, target, width, height, camera, None);
     }
 
-    /// Fills this frame's constants (placing the shadow partitions, for a renderer of the
-    /// level's own meshes) and records this renderer's shadow casters into the partitions:
-    /// `clear` for the first renderer of a frame (the level's), not for the objects drawn
-    /// over it. Call it for every renderer of a frame before any of them draws.
-    pub fn encode_shadows(
-        &mut self,
-        ctx: &GpuContext,
-        encoder: &mut wgpu::CommandEncoder,
-        camera: &Camera,
-        width: u32,
-        height: u32,
-        clear: bool,
-    ) {
+    /// Fills this frame's constants: placing the shadow partitions (a renderer of the
+    /// level's own meshes) and choosing the casters each draws. Call it for every renderer
+    /// of a frame, the level's first, before [`AreaRenderer::encode_shadows`] for any of
+    /// them: whether the partitions need drawing again depends on all of them.
+    pub fn prepare_shadows(&mut self, ctx: &GpuContext, camera: &Camera, width: u32, height: u32) {
         self.d3d
             .update(ctx, camera, width, height, self.time as f32);
         self.updated = true;
+    }
+
+    /// Records this renderer's shadow casters into the partitions: `clear` for the first
+    /// renderer of a frame (the level's), not for the objects drawn over it. Nothing is
+    /// drawn when no renderer's casters, nor the partitions, changed since they were last
+    /// drawn: the partitions still hold them.
+    pub fn encode_shadows(&mut self, encoder: &mut wgpu::CommandEncoder, clear: bool) {
         self.d3d.encode_shadows(encoder, &self.meshes, clear);
     }
 
@@ -1241,9 +1241,13 @@ impl AreaRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("capture"),
             });
-        self.encode_shadows(ctx, &mut encoder, camera, width, height, true);
+        self.prepare_shadows(ctx, camera, width, height);
         for o in overlays.iter_mut() {
-            o.encode_shadows(ctx, &mut encoder, camera, width, height, false);
+            o.prepare_shadows(ctx, camera, width, height);
+        }
+        self.encode_shadows(&mut encoder, true);
+        for o in overlays.iter_mut() {
+            o.encode_shadows(&mut encoder, false);
         }
         self.render_pass(ctx, &mut encoder, &view, width, height, camera, None);
         if !overlays.is_empty() {
