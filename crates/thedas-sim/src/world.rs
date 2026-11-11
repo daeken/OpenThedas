@@ -191,6 +191,10 @@ pub struct Object {
     /// What an area-of-effect object keeps (see [`crate::aoe`]).
     #[serde(default)]
     pub aoe: Option<crate::aoe::AoeState>,
+    /// An item's own property list (`itemprps.gda` row and power), once a script has
+    /// changed it (`AddItemProperty`, `RemoveItemProperty`); until then its template's.
+    #[serde(default)]
+    pub item_properties: Option<Vec<(i32, i32)>>,
 }
 
 impl Object {
@@ -239,6 +243,7 @@ impl Object {
             fields: BTreeMap::new(),
             text_fields: BTreeMap::new(),
             aoe: None,
+            item_properties: None,
         }
     }
 }
