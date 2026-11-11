@@ -444,6 +444,10 @@ pub struct World {
     /// Show-once-per-game conversation nodes already used ("dialog:node").
     #[serde(default)]
     pub dialog_shown: std::collections::BTreeSet<String>,
+    /// The hero's "Story So Far" (`LogStoryEvent`): event ids, in order, with the game time
+    /// each was logged at (ms).
+    #[serde(default)]
+    pub story_events: Vec<(i32, u64)>,
     /// A message box waiting for an answer (`ShowPopup`).
     #[serde(default)]
     pub popup: Option<Popup>,
@@ -564,6 +568,7 @@ impl World {
             destroy_at: Vec::new(),
             held: Vec::new(),
             dialog_shown: Default::default(),
+            story_events: Vec::new(),
             popup: None,
             store: None,
             chanter_board: None,

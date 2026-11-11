@@ -86,6 +86,9 @@ pub struct Sim {
     pub script_budget: u64,
     pub chargen_policy: ChargenPolicy,
     pub cutscene_policy: CutscenePolicy,
+    /// The player's "auto-pause when combat starts" option (`GetAutoPauseCombatStatus`);
+    /// off, as the game's options start.
+    pub auto_pause_combat: bool,
     /// Objects whose scripts' engine calls are all traced (log channel -6), for debugging.
     pub watch_calls: std::collections::BTreeSet<ObjectId>,
     /// Tags (lowercase) whose objects' engine calls are traced too, including objects
@@ -110,6 +113,9 @@ pub struct Sim {
     pub(crate) current_effect: Option<(crate::world::Effect, bool)>,
     /// Who the effect in `current_effect` is being applied to.
     pub(crate) current_effect_target: Option<ObjectId>,
+    /// Whether the conversation line whose condition or action last ran is ambient
+    /// (`DialogIsAmbient`; DAOrigins.exe's server flag at +0x214).
+    pub(crate) dialog_ambient: bool,
     pub(crate) talk: Option<crate::dialog::Conversation>,
     pub(crate) plots: crate::plot::Plots,
     strings: std::sync::OnceLock<std::collections::BTreeMap<u32, String>>,
@@ -298,10 +304,12 @@ impl Sim {
             script_budget: 5_000_000,
             chargen_policy: ChargenPolicy::default(),
             cutscene_policy: CutscenePolicy::default(),
+            auto_pause_combat: false,
             watch_calls: Default::default(),
             watch_tags: Default::default(),
             current_effect: None,
             current_effect_target: None,
+            dialog_ambient: false,
             install_root: None,
             area_layouts: HashMap::new(),
             nav_grids: HashMap::new(),
