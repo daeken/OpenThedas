@@ -47,8 +47,9 @@ pub struct Node {
     /// conversation, 2 once per game. Provisional.
     #[serde(default)]
     pub show_once: u8,
-    /// Field 12207, taken to mark an ambient line (said in passing, without the dialog
-    /// screen): chants and barks. Provisional.
+    /// Field 12207, the line's ambient flag (said in passing, without the dialog screen:
+    /// chants and barks). DAOrigins.exe reads it before running the line's scripts and
+    /// answers `DialogIsAmbient` from it (0x7f049a).
     #[serde(default)]
     pub ambient: bool,
 }
@@ -215,6 +216,7 @@ impl Sim {
         };
         fresh && {
             let cond = n.condition.clone();
+            self.dialog_ambient = n.ambient;
             self.condition(&cond, c.owner)
         }
     }
@@ -245,6 +247,12 @@ impl Sim {
         }
     }
 
+    /// Runs a line's action, with `DialogIsAmbient` telling whether the line is ambient.
+    fn node_action(&mut self, node: &Node, owner: ObjectId) {
+        self.dialog_ambient = node.ambient;
+        self.action(&node.action, owner);
+    }
+
     fn action(&mut self, a: &PlotRef, owner: ObjectId) {
         if let Some(plot) = &a.plot {
             if a.flag >= 0 {
@@ -267,7 +275,7 @@ impl Sim {
     fn speak(&mut self, mut c: Conversation, line: usize) -> Conversation {
         let node = c.dlg.nodes[line].clone();
         self.mark_shown(&mut c, line);
-        self.action(&node.action, c.owner);
+        self.node_action(&node, c.owner);
         let text = self.node_text(&node);
         let speaker = match node.speaker.as_str() {
             "OWNER" | "" => c.owner,
@@ -383,7 +391,7 @@ impl Sim {
             used.push(r);
             let node = c.dlg.nodes[r].clone();
             self.mark_shown(&mut c, r);
-            self.action(&node.action, c.owner);
+            self.node_action(&node, c.owner);
             match node.children.iter().copied().find(|&n| self.usable(&c, n)) {
                 Some(n) if !used.contains(&n) => {
                     used.push(n);
@@ -403,7 +411,7 @@ impl Sim {
         };
         let node = c.dlg.nodes[reply].clone();
         self.mark_shown(&mut c, reply);
-        self.action(&node.action, c.owner);
+        self.node_action(&node, c.owner);
         // The action started another conversation (a plot script's UT_Talk): it replaces
         // this one, as in the game.
         if self.talk.is_some() {
@@ -623,5 +631,46 @@ mod tests {
         };
         assert_eq!(talk_once(&mut sim), "a prayer");
         assert_eq!(talk_once(&mut sim), "what do you want?");
+    }
+
+    #[test]
+    fn a_lines_scripts_run_knowing_whether_it_is_ambient() {
+        let node = |ambient: bool| Node {
+            reply: false,
+            strref: None,
+            text: Some("...".into()),
+            speaker: String::new(),
+            listener: String::new(),
+            condition: PlotRef::default(),
+            action: PlotRef::default(),
+            children: vec![],
+            show_once: 0,
+            ambient,
+        };
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let c = Conversation {
+            dlg: Dlg {
+                name: "bark".into(),
+                starts: vec![0],
+                nodes: vec![node(true), node(false)],
+            },
+            owner: 1,
+            player: 2,
+            line: None,
+            replies: vec![],
+            ended: false,
+            shown: vec![],
+            chain: vec![],
+        };
+        assert!(sim.usable(&c, 0) && sim.dialog_ambient);
+        assert!(sim.usable(&c, 1) && !sim.dialog_ambient);
+        let c = sim.speak(c, 0);
+        assert!(sim.dialog_ambient, "the ambient line's action ran");
+        sim.speak(c, 1);
+        assert!(!sim.dialog_ambient);
     }
 }

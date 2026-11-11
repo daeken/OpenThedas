@@ -201,20 +201,238 @@ const PRESENTATION: &[&str] = &[
     "SetCreatureGoreLevel",
     // Only the indicator on the quickbar; the modal effect itself is the scripts'.
     "Engine_SetModalAbilityGUI",
+    // An icon over a creature's head (DAOrigins.exe 0x662db0) and the specialisation
+    // notice (0x663b80): interface only.
+    "ShowFloatyIcon",
+    "ShowSpecUnlockedNotification",
 ];
 
 /// Engine functions answered with a fixed placeholder because the simulation lacks what
-/// they need (ambient dialog, pools, combat auto-pause, ...). Calls to
-/// them are counted (`Trace::stubbed`) so coverage work can follow what the game uses.
-pub const STUBS: &[&str] = &[
-    "GetPlotSummary",
-    "DialogIsAmbient",
-    "ClearAmbientDialogs",
-    "CreatePool",
-    "GetAutoPauseCombatStatus",
-    "RevealCurrentMap",
-    "LogStoryEvent",
-];
+/// they need (the plot summary text, ...). Calls to them are counted (`Trace::stubbed`) so
+/// coverage work can follow what the game uses.
+pub const STUBS: &[&str] = &["GetPlotSummary"];
+
+/// Whether an object lies in a script shape at `l` (DAOrigins.exe 0x670eb0): its body is a
+/// circle on the ground (z is ignored) of the creature's personal space (0 for other
+/// objects). A sphere (`SHAPE_SPHERE`) of radius `fa` takes it when the circles touch
+/// (0x4eb340). A cone (`SHAPE_CONE`) of `fa` degrees (0 to 180) and length `fb` along the
+/// location's facing takes it when it touches the cone's circle and lies between the
+/// cone's edges or within its radius of one (0x4eb3b0). Provisional: the body radius
+/// (the engine asks the object, virtual 0x9c) is taken to be [`Sim::body_radius`].
+fn in_shape(sim: &Sim, id: ObjectId, shape: i32, l: &Location, fa: f32, fb: f32) -> bool {
+    let Some(o) = sim.world.get(id) else {
+        return false;
+    };
+    let r = if o.kind == ObjectKind::Creature {
+        sim.body_radius(id)
+    } else {
+        0.0
+    };
+    let (px, py) = (o.position[0] - l.position[0], o.position[1] - l.position[1]);
+    let within = |reach: f32| px * px + py * py <= (r + reach) * (r + reach);
+    match shape {
+        1 => within(fa),
+        2 => {
+            if !(0.0..=180.0).contains(&fa) || !within(fb) {
+                return false;
+            }
+            let heading = (l.facing + 90.0).to_radians();
+            let half = (fa * 0.5).to_radians();
+            let edge = |a: f32| [a.cos() * fb, a.sin() * fb];
+            let (left, right) = (edge(heading + half), edge(heading - half));
+            let cross = |e: [f32; 2]| e[0] * py - e[1] * px;
+            if cross(right) >= 0.0 && cross(left) <= 0.0 {
+                return true;
+            }
+            let near_edge = |e: [f32; 2]| {
+                let len2 = e[0] * e[0] + e[1] * e[1];
+                let t = if len2 > 0.0 {
+                    ((px * e[0] + py * e[1]) / len2).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let (dx, dy) = (px - e[0] * t, py - e[1] * t);
+                dx * dx + dy * dy <= r * r
+            };
+            near_edge(left) || near_edge(right)
+        }
+        _ => false,
+    }
+}
+
+/// `ABI_base`'s column (hash 0x5d3e0787, name unknown) naming the `VFX Persistent` row
+/// (M2DA 96) of an ability's lasting area, whose `Radius` then sizes its clusters.
+const ABI_PERSISTENT_AREA: u32 = 0x5d3e_0787;
+/// The M2DA id of `VFX Persistent`.
+const VFX_PERSISTENT_TABLE: i32 = 96;
+
+/// `GetClusterCenter`, as DAOrigins.exe works it out (0x671980):
+/// - The cluster's span is the ability's `aoe_param1` in `ABI_base` (or, for an ability with
+///   a lasting area, its `VFX Persistent` row's `Radius`), doubled for a sphere
+///   (`aoe_type` 1).
+/// - The candidates are the creatures the creator perceives. Each hostile one in turn is a
+///   cluster's center; the others join it, in candidate order, when within the span of the
+///   center and of every member already in (a quirk kept: distances are read from a table
+///   filled row by row, so a member after the center, or one that was never a center, is
+///   not measured against and lets anyone in).
+/// - A cluster with at least `size` foes scores foes less allies; one scoring at least the
+///   best so far replaces it unless a d100 roll falls below allies × `ally_fail`.
+/// - The answer is the mean position of the best cluster's foes. The first candidate's
+///   cluster can never be chosen (the engine tests the best index for being above 0).
+///
+/// `bReturnFirstMatch` is read but unused. Provisional: the candidates are the
+/// simulation's perception list (the engine's perception query, which also drops creatures
+/// beyond a per-creature limit, is not traced), and creatures the engine skips (virtual
+/// 0x1d0 returning 1) are taken to be the dead.
+fn cluster_center(
+    sim: &mut Sim,
+    creator: ObjectId,
+    ability: i32,
+    size: i32,
+    ally_fail: i32,
+) -> Option<[f32; 3]> {
+    let me = sim.world.get(creator)?;
+    if me.kind != ObjectKind::Creature {
+        return None;
+    }
+    let candidates: Vec<(ObjectId, [f32; 3], bool)> = me
+        .combat
+        .perceived
+        .iter()
+        .filter_map(|&c| sim.world.get(c).map(|o| (c, o.position, o.dead)))
+        .collect();
+    let tables = sim.world.tables.clone();
+    let abi = tables.get(0, "ABI_base");
+    let abi_cell = |col: &str| {
+        abi.as_ref()
+            .and_then(|t| t.cell(col, ability as i64).cloned())
+    };
+    let persistent = abi.as_ref().map_or(0, |t| {
+        cell_int(t.cell_by_hash(ABI_PERSISTENT_AREA, ability as i64))
+    });
+    let mut span = if persistent == 0 {
+        cell_float(abi_cell("aoe_param1").as_ref())
+    } else {
+        tables
+            .get(VFX_PERSISTENT_TABLE, "")
+            .map_or(0.0, |t| cell_float(t.cell("Radius", persistent as i64)))
+    };
+    if cell_int(abi_cell("aoe_type").as_ref()) == 1 {
+        span *= 2.0;
+    }
+    let n = candidates.len();
+    let hostile: Vec<bool> = candidates
+        .iter()
+        .map(|c| sim.hostile(creator, c.0))
+        .collect();
+    let mut table = vec![vec![0.0f32; n]; n];
+    let mut clusters: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let (mut best_score, mut best) = (-1i32, -1i64);
+    for i in 0..n {
+        if !hostile[i] || candidates[i].2 {
+            continue;
+        }
+        let at = candidates[i].1;
+        let mut members: Vec<usize> = Vec::new();
+        let mut allies = 0;
+        'join: for j in 0..n {
+            let d = if j == i {
+                0.0
+            } else {
+                if candidates[j].2 {
+                    continue;
+                }
+                let cached = if j < i { table[j][i] } else { 0.0 };
+                if cached != 0.0 {
+                    cached
+                } else {
+                    dist(at, candidates[j].1)
+                }
+            };
+            table[i][j] = d;
+            if span < d {
+                continue;
+            }
+            if d != 0.0 {
+                for &m in &members {
+                    let dm = if m <= i {
+                        table[m][j]
+                    } else {
+                        dist(at, candidates[m].1)
+                    };
+                    if span < dm {
+                        continue 'join;
+                    }
+                }
+            }
+            members.push(j);
+            if !hostile[j] {
+                allies += 1;
+            }
+        }
+        let foes = members.len() as i32 - allies;
+        if foes >= size {
+            let score = foes - allies;
+            if score >= best_score && sim.world.rng.below(100) >= allies * ally_fail {
+                best_score = score;
+                best = i as i64;
+            }
+        }
+        clusters[i] = members;
+    }
+    if best <= 0 {
+        return None;
+    }
+    let best = best as usize;
+    let foes: Vec<[f32; 3]> = clusters[best]
+        .iter()
+        .filter(|&&m| hostile[m])
+        .map(|&m| candidates[m].1)
+        .collect();
+    let k = foes.len() as f32;
+    let sum = foes
+        .iter()
+        .fold([0.0f32; 3], |s, p| [s[0] + p[0], s[1] + p[1], s[2] + p[2]]);
+    Some([sum[0] / k, sum[1] / k, sum[2] / k])
+}
+
+/// DAOrigins.exe's degrees-to-radians factor (0xaf14c0; a little under pi/180).
+const DEG_TO_RAD: f64 = 0.017_453_279_346_227_646;
+/// DAOrigins.exe's radians-to-degrees factor (0xaf0e50).
+const RAD_TO_DEG: f64 = 57.295_825_958_251_95;
+
+/// `PROPERTY_DEPLETABLE_MANA_STAMINA`, the property the mana functions use (DAOrigins.exe
+/// indexes the creature's property list with 8 directly).
+const PROPERTY_MANA_STAMINA: i32 = 8;
+
+/// The effect behind `effect` as an apply function hands it on: with its duration type, a
+/// temporary effect's end (`duration` seconds from now), its creator (if valid) and the
+/// ability it comes from (`GetEffectAbilityID`; if given and not 0).
+fn applied_effect(
+    h: &ScriptHost,
+    effect: Option<u64>,
+    duration_type: i32,
+    duration: f32,
+    creator: ObjectId,
+    ability: Option<i32>,
+) -> Option<Effect> {
+    let Some(EngineData::Effect(e)) = h.sim.world.handle(effect) else {
+        return None;
+    };
+    let mut e = e.clone();
+    e.duration_type = duration_type;
+    if creator != OBJECT_INVALID && creator != 0 {
+        e.creator = Some(creator);
+    }
+    if let Some(ability) = ability.filter(|&x| x != 0) {
+        e.ability = ability;
+    }
+    let temporary = constant(&h.sim.table, "EFFECT_DURATION_TYPE_TEMPORARY");
+    if e.duration_type == temporary && duration > 0.0 {
+        e.expires = Some(h.sim.world.time_ms + (duration.min(1.0e6) * 1000.0) as u64);
+    }
+    Some(e)
+}
 
 /// Converts `CommandMoveToObject` to `COMMAND_TYPE_MOVE_TO_OBJECT`.
 fn command_constant(name: &str) -> String {
@@ -305,6 +523,12 @@ pub fn call(
         "StringToFloat" => ok(Value::Float(string(a, 0).trim().parse().unwrap_or(0.0))),
         "ResourceToString" => ok(Value::String(string(a, 0))),
         "StringToResource" => ok(Value::Resource(string(a, 0))),
+        // The running script's name with ".ncs" (DAOrigins.exe 0x654d70).
+        "GetCurrentScriptResource" => ok(Value::Resource(format!(
+            "{}.ncs",
+            h.script.trim_end_matches(".ncs")
+        ))),
+
         "GetStringLength" => ok(Value::Int(string(a, 0).chars().count() as i32)),
         "StringUpperCase" => ok(Value::String(string(a, 0).to_uppercase())),
         "StringLowerCase" => ok(Value::String(string(a, 0).to_lowercase())),
@@ -349,6 +573,27 @@ pub fn call(
         "Random" => ok(Value::Int(h.sim.world.rng.below(int(a, 0)))),
         "RandomFloat" => ok(Value::Float(h.sim.world.rng.unit())),
         "Vector" => ok(Value::Vector([float(a, 0), float(a, 1), float(a, 2)])),
+        // DAOrigins.exe's conversions (0x64f260, 0x64f310), in its own constants: an angle
+        // a (degrees) is the ground vector (-sin a, cos a, 0), and a vector's angle is
+        // atan2(-x, y) in degrees, -180 to 180 (0x4ee570).
+        "AngleToVector" => {
+            let r = -(float(a, 0) as f64) * DEG_TO_RAD;
+            ok(Value::Vector([r.sin() as f32, r.cos() as f32, 0.0]))
+        }
+        "VectorToAngle" => {
+            let v = vector(a, 0);
+            let (x, y) = (-(v[0] as f64), v[1] as f64);
+            ok(Value::Float((x.atan2(y) * RAD_TO_DEG) as f32))
+        }
+        // "%f %f %f" (0x64f9d0).
+        "VectorToString" => {
+            let v = vector(a, 0);
+            ok(Value::String(format!(
+                "{:.6} {:.6} {:.6}",
+                v[0] as f64, v[1] as f64, v[2] as f64
+            )))
+        }
+
         "GetArraySize" => ok(Value::Int(match a.first() {
             Some(Value::Array { items, .. }) => items.len() as i32,
             _ => 0,
@@ -362,12 +607,15 @@ pub fn call(
         | "PrintFloat"
         | "Warning"
         | "DisplayFloatyMessage"
+        | "DisplayPortraitMessage"
         | "PrintToLogWindow" => {
             let (channel, text) = match name {
                 "LogTrace" => (int(a, 0), string(a, 1)),
                 "PrintInteger" => (0, int(a, 0).to_string()),
                 "PrintFloat" => (0, float(a, 0).to_string()),
-                "DisplayFloatyMessage" => (-1, string(a, 1)),
+                // A message by a party member's portrait (DAOrigins.exe 0x661f40 hands it
+                // to the interface): logged as floaty messages are.
+                "DisplayFloatyMessage" | "DisplayPortraitMessage" => (-1, string(a, 1)),
                 _ => (0, string(a, 0)),
             };
             if name == "Warning" {
@@ -603,6 +851,24 @@ pub fn call(
             }
             void()
         }
+        // DAOrigins.exe (0x65b3b0) puts the object in the location's area if it is in
+        // another and that area exists, then sets its position and orientation. Provisional:
+        // like SetPosition, no trigger is told of the move.
+        "SetLocation" => {
+            let l = match h.sim.world.handle(handle(a, 1)) {
+                Some(EngineData::Location(l)) => *l,
+                _ => return void(),
+            };
+            let area_exists = h.object(l.area).is_some_and(|o| o.kind == ObjectKind::Area);
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                if area_exists {
+                    o.area = Some(l.area);
+                }
+                o.position = l.position;
+                o.facing = l.facing;
+            }
+            void()
+        }
         "GetFacing" => ok(Value::Float(h.object(obj(a, 0)).map_or(0.0, |o| o.facing))),
         "SetFacing" => {
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
@@ -635,6 +901,29 @@ pub fn call(
                 position: vector(a, 1),
                 facing: float(a, 2),
             };
+            let hd = h.sim.world.store(EngineData::Location(l));
+            ok(Value::Engine {
+                ty: ty.location,
+                handle: Some(hd),
+            })
+        }
+        // A location with a new position or facing (DAOrigins.exe 0x65b580, 0x65b6f0: the
+        // popped copy is changed and pushed back). An invalid location stays invalid
+        // (with its new part).
+        "SetLocationPosition" | "SetLocationFacing" => {
+            let mut l = match h.sim.world.handle(handle(a, 0)) {
+                Some(EngineData::Location(l)) => *l,
+                _ => Location {
+                    area: OBJECT_INVALID,
+                    position: [0.0; 3],
+                    facing: 0.0,
+                },
+            };
+            if name == "SetLocationPosition" {
+                l.position = vector(a, 1);
+            } else {
+                l.facing = float(a, 1);
+            }
             let hd = h.sim.world.store(EngineData::Location(l));
             ok(Value::Engine {
                 ty: ty.location,
@@ -996,6 +1285,36 @@ pub fn call(
                 h.sim.property_total(id, p)
             };
             ok(Value::Float(v))
+        }
+        // Mana (or stamina): DAOrigins.exe reads and writes the creature's depletable
+        // property 8 (PROPERTY_DEPLETABLE_MANA_STAMINA) directly: GetCreatureMana its current
+        // value (0x66cc30), GetCreatureMaxMana its total (0x66cdc0), both truncated to
+        // whole numbers and -1 for what is not a creature; SetCreatureMana its current value
+        // (0x66cd00). Provisional: the setter is taken to keep the value within 0 and the
+        // total as SetCreatureProperty's does.
+        "GetCreatureMana" | "GetCreatureMaxMana" => {
+            let (id, p) = (obj(a, 0), PROPERTY_MANA_STAMINA);
+            let creature = h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature);
+            ok(Value::Int(if !creature {
+                -1
+            } else if name == "GetCreatureMana" {
+                h.object(id)
+                    .and_then(|o| o.properties.get(&p))
+                    .map_or(0.0, |v| v.1) as i32
+            } else {
+                h.sim.property_total(id, p) as i32
+            }))
+        }
+        "SetCreatureMana" => {
+            let (id, p) = (obj(a, 0), PROPERTY_MANA_STAMINA);
+            if h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature) {
+                let max = h.sim.property_total(id, p);
+                if let Some(o) = h.sim.world.get_mut(id) {
+                    o.properties.entry(p).or_insert((0.0, 0.0)).1 =
+                        (int(a, 1) as f32).clamp(0.0, max.max(0.0));
+                }
+            }
+            void()
         }
         "SetCreatureProperty" | "UpdateCreatureProperty" => {
             let (id, p, value, vt) = (obj(a, 0), int(a, 1), float(a, 2), int(a, 3));
@@ -1441,22 +1760,30 @@ pub fn call(
             })
         }
         "Engine_ApplyEffectOnObject" | "ApplyEffectOnObject" => {
-            if let Some(EngineData::Effect(mut e)) = h.sim.world.handle(handle(a, 1)).cloned() {
-                e.duration_type = int(a, 0);
-                let creator = obj(a, 4);
-                if creator != OBJECT_INVALID && creator != 0 {
-                    e.creator = Some(creator);
-                }
-                // The ability the effect comes from (`GetEffectAbilityID`).
-                if a.len() > 5 && int(a, 5) != 0 {
-                    e.ability = int(a, 5);
-                }
-                // A temporary effect lasts its duration (seconds).
-                let temporary = constant(&h.sim.table, "EFFECT_DURATION_TYPE_TEMPORARY");
-                if e.duration_type == temporary && float(a, 3) > 0.0 {
-                    e.expires = Some(t + (float(a, 3).min(1.0e6) * 1000.0) as u64);
-                }
+            let ability = (a.len() > 5).then(|| int(a, 5));
+            if let Some(e) =
+                applied_effect(h, handle(a, 1), int(a, 0), float(a, 3), obj(a, 4), ability)
+            {
                 h.sim.apply_effect(obj(a, 2), e);
+            }
+            void()
+        }
+        // DAOrigins.exe (0x672200) gives the effect its duration, creator and ability as
+        // Engine_ApplyEffectOnObject does, then applies a copy to every member of the party
+        // list (the one GetPartyList returns, 0x672ba0), skipping the creator when
+        // bExcludeCreator is set.
+        "Engine_ApplyEffectOnParty" => {
+            let creator = obj(a, 3);
+            let exclude = int(a, 5) != 0;
+            let ability = (a.len() > 4).then(|| int(a, 4));
+            if let Some(e) =
+                applied_effect(h, handle(a, 1), int(a, 0), float(a, 2), creator, ability)
+            {
+                for m in party_of(h.sim) {
+                    if !(exclude && m == creator) {
+                        h.sim.apply_effect(m, e.clone());
+                    }
+                }
             }
             void()
         }
@@ -1506,6 +1833,71 @@ pub fn call(
         "RemoveEffect" => {
             if let Some(EngineData::Effect(e)) = h.sim.world.handle(handle(a, 1)).cloned() {
                 h.sim.remove_effect(obj(a, 0), &e);
+            }
+            void()
+        }
+        // DAOrigins.exe (0x673ab0) removes every effect but those of duration types 4, 5
+        // and 6 (EFFECT_DURATION_TYPE_DEATH; 0x7a0c90); with bIgnoreInjuries (default TRUE)
+        // also keeps injuries, abilities 500001 to 500099 (0x651850), and with bDeath keeps
+        // effects whose type's effects.gda `IgnoreDeath` is set (0x651830).
+        // A lasting visual effect on an item (a weapon's glow): DAOrigins.exe (0x65d4a0)
+        // makes an effect of type 4 (EffectVisualEffect), permanent, with the VFX id as its
+        // integer 0, and gives it to the item. It stays on the item for presentation.
+        // DAOrigins.exe (0x665510) sets the item's indestructible flag (0x752c30); kept
+        // in the item's fields.
+        "SetItemIndestructible" => {
+            if let Some(o) = h
+                .sim
+                .world
+                .get_mut(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::Item)
+            {
+                o.fields
+                    .insert("Indestructible".into(), (int(a, 1) != 0) as i32);
+            }
+            void()
+        }
+        "AddItemVisualEffect" => {
+            let item = obj(a, 0);
+            let permanent = constant(&h.sim.table, "EFFECT_DURATION_TYPE_PERMANENT");
+            if let Some(o) = h
+                .sim
+                .world
+                .get_mut(item)
+                .filter(|o| o.kind == ObjectKind::Item)
+            {
+                o.effects.push(Effect {
+                    ty: 4,
+                    duration_type: permanent,
+                    ints: vec![int(a, 1)],
+                    ..Default::default()
+                });
+            }
+            void()
+        }
+        "RemoveAllEffects" => {
+            let (who, keep_injuries) = (obj(a, 0), a.len() < 2 || int(a, 1) != 0);
+            let death = int(a, 2) != 0;
+            let table = h.sim.world.tables.get(0, "effects");
+            let gone: Vec<Effect> = h
+                .object(who)
+                .map(|o| {
+                    o.effects
+                        .iter()
+                        .filter(|e| !(4..=6).contains(&e.duration_type))
+                        .filter(|e| !(keep_injuries && e.ability > 500_000 && e.ability < 500_100))
+                        .filter(|e| {
+                            !death
+                                || table.as_ref().is_none_or(|t| {
+                                    cell_int(t.cell("IgnoreDeath", e.ty as i64)) == 0
+                                })
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            for e in gone {
+                h.sim.remove_effect(who, &e);
             }
             void()
         }
@@ -1688,25 +2080,107 @@ pub fn call(
                 handle: hd,
             })
         }
-        "GetObjectsInShape" => {
-            // Provisional: every shape is treated as a sphere of its largest dimension.
-            let (mask, excl_dead) = (int(a, 0), int(a, 6) != 0);
-            let radius = float(a, 3).max(float(a, 4)).max(float(a, 5));
-            let l = match h.sim.world.handle(handle(a, 2)) {
+        // Where to aim an area ability for the most foes: see [`cluster_center`]. The
+        // location is in the creator's area; with no cluster good enough it is the invalid
+        // location (0x7abd00).
+        "GetClusterCenter" => {
+            let creator = obj(a, 0);
+            let area = h.object(creator).and_then(|o| o.area);
+            let center = cluster_center(h.sim, creator, int(a, 1), int(a, 2), int(a, 3));
+            let l = match (center, area) {
+                (Some(p), Some(area)) => Location {
+                    area,
+                    position: p,
+                    facing: 0.0,
+                },
+                _ => Location {
+                    area: OBJECT_INVALID,
+                    position: [0.0; 3],
+                    facing: 0.0,
+                },
+            };
+            let hd = h.sim.world.store(EngineData::Location(l));
+            ok(Value::Engine {
+                ty: ty.location,
+                handle: Some(hd),
+            })
+        }
+        // DAOrigins.exe answers it in the handler of the GetNearestObject family (0x671510):
+        // fewer than one object asked for means one; the location's area then gives the
+        // objects whose type is in the mask, nearest first by 3D distance (0x684dd0), with
+        // no living, perception, active or self test. Provisional: the order of objects at
+        // the same distance (here by id).
+        "GetNearestObjectToLocation" => {
+            let l = match h.sim.world.handle(handle(a, 0)) {
                 Some(EngineData::Location(l)) => Some(*l),
                 _ => None,
             };
-            let list: Vec<ObjectId> = match l {
-                Some(l) => h
+            let (mask, count) = (int(a, 1), int(a, 2).max(1) as usize);
+            let mut found: Vec<(f32, ObjectId)> = match l {
+                Some(l) if l.area != OBJECT_INVALID => h
                     .sim
                     .world
                     .objects
                     .values()
-                    .filter(|o| o.area == Some(l.area) && o.active)
-                    .filter(|o| mask == 0 || o.kind.script_type() & mask != 0)
-                    .filter(|o| !excl_dead || !o.dead)
-                    .filter(|o| dist(o.position, l.position) <= radius)
+                    .filter(|o| o.area == Some(l.area))
+                    .filter(|o| o.kind.script_type() & mask != 0)
+                    .map(|o| (dist(o.position, l.position), o.id))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            found.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+            ok(objects(
+                found.into_iter().take(count).map(|(_, id)| id).collect(),
+            ))
+        }
+        // DAOrigins.exe answers both in one handler (0x670eb0): GetObjectsInShape looks at
+        // the objects of the location's area, FilterObjectsInShape at the array it is given
+        // (wherever they are). Each must be of a type in the mask, in the world and, with
+        // bExcludeDead, alive, and lie in the shape (see [`in_shape`]); an unknown shape
+        // takes nothing. Provisional: "in the world" (virtual 0x6c) is taken to be active.
+        "GetObjectsInShape" | "FilterObjectsInShape" => {
+            let (given, a) = match name {
+                "FilterObjectsInShape" => {
+                    let list: Vec<ObjectId> = match a.first() {
+                        Some(Value::Array { items, .. }) => items
+                            .iter()
+                            .filter_map(|v| match v {
+                                Value::Object(o) => Some(*o),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    (Some(list), &a[1.min(a.len())..])
+                }
+                _ => (None, a),
+            };
+            let (mask, shape, excl_dead) = (int(a, 0), int(a, 1), int(a, 6) != 0);
+            let (fa, fb) = (float(a, 3), float(a, 4));
+            let l = match h.sim.world.handle(handle(a, 2)) {
+                Some(EngineData::Location(l)) => Some(*l),
+                _ => None,
+            };
+            let candidates: Vec<ObjectId> = match (given, l) {
+                (Some(list), _) => list,
+                (None, Some(l)) => h
+                    .sim
+                    .world
+                    .objects
+                    .values()
+                    .filter(|o| o.area == Some(l.area))
                     .map(|o| o.id)
+                    .collect(),
+                (None, None) => Vec::new(),
+            };
+            let list: Vec<ObjectId> = match l {
+                Some(l) => candidates
+                    .into_iter()
+                    .filter(|&id| {
+                        h.object(id).is_some_and(|o| {
+                            o.active && o.kind.script_type() & mask != 0 && !(excl_dead && o.dead)
+                        }) && in_shape(h.sim, id, shape, &l, fa, fb)
+                    })
                     .collect(),
                 None => Vec::new(),
             };
@@ -2018,9 +2492,16 @@ pub fn call(
             }
             void()
         }
-        // No ambient (bark) conversations are simulated.
-        "DialogIsAmbient" => ok(Value::Int(0)),
-        "ClearAmbientDialogs" => ok(Value::Int(0)),
+        // Whether the conversation line whose condition or action is running is ambient:
+        // DAOrigins.exe (0x65dc00) returns the flag the conversation sets from the line's
+        // field 12207 before running its scripts (0x7f04ca). Provisional: another path
+        // (0x7eee00) sets it from a flag of the conversation itself, not traced; here it is
+        // always the line's.
+        "DialogIsAmbient" => ok(b(h.sim.dialog_ambient)),
+        // DAOrigins.exe (0x6510f0) stops the ambient lines still to be spoken by an object
+        // (all of them for OBJECT_INVALID) and returns TRUE. The simulation plays an ambient
+        // conversation to its end when it starts, so none are ever waiting.
+        "ClearAmbientDialogs" => ok(Value::Int(1)),
         "SetTacticPresetID" => {
             h.sim.apply_tactic_preset(obj(a, 0), int(a, 1));
             void()
@@ -2115,7 +2596,15 @@ pub fn call(
             ok(objects(items))
         }
         // Presentation and platform services with no simulation state.
-        "DoAutoSave" | "TakeScreenshot" | "RevealCurrentMap" | "SetCreatureGoreLevel" => {
+        // DAOrigins.exe (0x665030) clears the fog on the current area's map. The simulation
+        // keeps the area's `MapRevealed` field for the map to read.
+        "RevealCurrentMap" => {
+            if let Some(o) = h.sim.world.area.and_then(|a| h.sim.world.get_mut(a)) {
+                o.fields.insert("MapRevealed".into(), 1);
+            }
+            void()
+        }
+        "DoAutoSave" | "TakeScreenshot" | "SetCreatureGoreLevel" => {
             h.sim.world.trace.push(TraceEntry::Log {
                 t,
                 channel: -3,
@@ -2353,6 +2842,9 @@ pub fn call(
                 .unwrap_or(0),
         )),
         // Pools only make creatures ahead of time; CreateObject makes them either way.
+        // DAOrigins.exe (0x6598d0) builds a pool of creatures from the template in the current
+        // area ahead of the scripts' CreateObject calls, and returns TRUE: a loading
+        // optimisation the simulation does without (it creates objects when asked).
         "CreatePool" => ok(Value::Int(1)),
         "GetCreatureGoreLevel" => ok(Value::Float(0.0)),
         "GetCreaturePropertyType" => ok(Value::Int(
@@ -2710,12 +3202,13 @@ pub fn call(
                 .load_items_from_template(obj(a, 0), &string(a, 1), int(a, 2) != 0);
             void()
         }
+        // DAOrigins.exe (0x666da0, 0x643bf0) adds an event with an id above 0 to the save's
+        // "Story So Far" list, with the time. Provisional: the time kept is game time (the
+        // engine records the play time and the wall clock).
         "LogStoryEvent" => {
-            h.sim.world.trace.push(TraceEntry::Log {
-                t,
-                channel: -3,
-                text: format!("{name}{:?} (no effect in the simulation)", a),
-            });
+            if int(a, 0) > 0 {
+                h.sim.world.story_events.push((int(a, 0), t));
+            }
             void()
         }
         "SetStoryPlot" => {
@@ -3013,6 +3506,26 @@ pub fn call(
         // the stat's label in itemstatdefines.gda (Attack, Damage, ArmorPenetration, ...).
         // Provisional: item properties (material, enchantments) are not added yet.
         "GetItemStat" => ok(Value::Float(h.sim.item_stat(obj(a, 0), int(a, 1)))),
+        // DAOrigins.exe (0x665570, 0x7556d0) adds up the power of every one of the item's
+        // properties with that id, then, with bIncludeSubItems, its sub-items' (runes) the
+        // same way; 0 for what is not an item. Provisional: the properties are the
+        // template's (properties added in play are not kept) and items hold no sub-items.
+        "GetItemPropertyPower" => {
+            let (item, p) = (obj(a, 0), int(a, 1));
+            let power = if h.object(item).is_some_and(|o| o.kind == ObjectKind::Item) {
+                h.sim
+                    .item_look(item)
+                    .properties
+                    .iter()
+                    .filter(|(id, _)| *id == p)
+                    .map(|(_, power)| *power)
+                    .sum()
+            } else {
+                0
+            };
+            ok(Value::Int(power))
+        }
+
         "GetItemStackSize" => ok(Value::Int(
             h.object(obj(a, 0))
                 .and_then(|o| o.fields.get("StackSize").copied())
@@ -3214,6 +3727,30 @@ pub fn call(
         }
         // Presentation only.
         "PlayAdditiveAnimation" | "SignalDamage" => void(),
+        // Creature switches that DAOrigins.exe sets in one handler (0x66be50), kept on the
+        // creature for what reads them: SetCreatureIsGhost (0x69f4a0: a ghost walks through
+        // other creatures but around other ghosts; the simulation's movement does not yet
+        // collide creatures), SetQuickslotBar (0x719ae0: the bar the quickbar shows, taken
+        // only below 5) and LockQuickslotBar (0x719ac0: locked when bLock > 0).
+        "SetCreatureIsGhost" | "SetQuickslotBar" | "LockQuickslotBar" => {
+            let (who, v) = (obj(a, 0), int(a, 1));
+            let field = match name {
+                "SetCreatureIsGhost" => Some(("Ghost", (v != 0) as i32)),
+                "SetQuickslotBar" => (v < 5).then_some(("QuickslotBar", v)),
+                _ => Some(("QuickslotBarLocked", (v > 0) as i32)),
+            };
+            if let Some(o) = h
+                .sim
+                .world
+                .get_mut(who)
+                .filter(|o| o.kind == ObjectKind::Creature)
+            {
+                if let Some((f, v)) = field {
+                    o.fields.insert(f.into(), v);
+                }
+            }
+            void()
+        }
         "SetCreatureIsStatue" => {
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
                 o.fields.insert("Statue".into(), int(a, 1));
@@ -3358,7 +3895,10 @@ pub fn call(
         // only the player's tactics screen (and a save holding its rows) gives one; the
         // simulation has neither, so every entry's tag is empty.
         "GetTacticCommandItemTag" => ok(Value::String(String::new())),
-        "GetAutoPauseCombatStatus" => ok(Value::Int(0)),
+        // The player's "auto-pause when combat starts" option: DAOrigins.exe (0x65e520)
+        // reads it from the game options, where it starts off (0x5e8d57) until the player's
+        // settings (`AutoPauseCombat`) say otherwise.
+        "GetAutoPauseCombatStatus" => ok(b(h.sim.auto_pause_combat)),
         "EnableWeaponTrail" => void(),
         _ => None,
     }
@@ -4850,5 +5390,720 @@ mod tests {
         ];
         assert!(inside([1.0, 1.0, 5.0], &square));
         assert!(!inside([3.0, 1.0, 0.0], &square));
+    }
+}
+
+/// Engine functions taken off the coverage list; their own script header, so ids do not
+/// collide with `tests`.
+#[cfg(test)]
+mod coverage_tests {
+    use std::sync::Arc;
+
+    use thedas_script::EngineTable;
+    use thedas_vfs::Vfs;
+
+    use super::*;
+
+    const LDF: &str = "int FALSE = 0;\n\
+        int TRUE = 1;\n\
+        int EFFECT_DURATION_TYPE_INSTANT = 1;\n\
+        int EFFECT_DURATION_TYPE_TEMPORARY = 2;\n\
+        int EFFECT_DURATION_TYPE_PERMANENT = 3;\n\
+        #define ENGINE_STRUCTURE_1 location\n\
+        #define ENGINE_STRUCTURE_3 effect\n\
+        location Location(object a, vector v, float f) = 41;\n\
+        void Engine_ApplyEffectOnParty(int d, effect e, float f = 0.0, object c = OBJECT_INVALID, int n = 0, int x = FALSE) = 70;\n\
+        object[] GetNearestObjectToLocation(location l, int t = 4294967295, int n = 1) = 71;\n\
+        int GetCreatureMana(object o) = 72;\n\
+        void SetCreatureMana(object o, int n) = 73;\n\
+        int GetCreatureMaxMana(object o) = 74;\n\
+        void RemoveAllEffects(object o, int i = TRUE, int d = FALSE) = 75;\n\
+        void SetCreatureIsGhost(object o, int v) = 76;\n\
+        void SetQuickslotBar(object o, int n) = 77;\n\
+        void LockQuickslotBar(object o, int b) = 78;\n\
+        int DialogIsAmbient() = 79;\n\
+        int ClearAmbientDialogs(object o = OBJECT_INVALID) = 80;\n\
+        void RevealCurrentMap() = 81;\n\
+        int GetAutoPauseCombatStatus() = 82;\n\
+        location GetClusterCenter(object c, int a, int n, int f, int b) = 83;\n\
+        object[] GetObjectsInShape(int m, int s, location l, float a, float b = 0.0, float c = 0.0, int d = FALSE) = 84;\n\
+        object[] FilterObjectsInShape(object[] o, int m, int s, location l, float a, float b = 0.0, float c = 0.0, int d = FALSE) = 85;\n\
+        vector AngleToVector(float f) = 86;\n\
+        float VectorToAngle(vector v) = 87;\n\
+        string VectorToString(vector v) = 88;\n\
+        location SetLocationPosition(location l, vector v) = 89;\n\
+        location SetLocationFacing(location l, float f) = 90;\n\
+        vector GetPositionFromLocation(location l) = 91;\n\
+        float GetFacingFromLocation(location l) = 92;\n\
+        void AddItemVisualEffect(object o, int n) = 93;\n\
+        int GetItemPropertyPower(object o, int p, int s = FALSE) = 94;\n\
+        void DisplayPortraitMessage(object o, string s, int c = 16777215) = 95;\n\
+        void SetLocation(object o, location l) = 96;\n\
+        resource GetCurrentScriptResource() = 97;\n\
+        void SetItemIndestructible(object o, int b) = 98;\n\
+        void LogStoryEvent(int n) = 99;\n\
+        int CreatePool(resource r, int n) = 100;\n";
+
+    fn sim() -> Sim {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        Sim::new(Arc::new(Vfs::new()), table, 1)
+    }
+
+    /// Calls engine function `name` as `caller`.
+    fn run(s: &mut Sim, caller: ObjectId, name: &str, a: &[Value]) -> Option<Value> {
+        let f = s.table.function_by_name(name).cloned().unwrap();
+        let mut h = ScriptHost {
+            sim: s,
+            event: None,
+            script: "test".into(),
+        };
+        call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    fn effect_value(s: &mut Sim, e: Effect) -> Value {
+        let hd = s.world.store(EngineData::Effect(e));
+        Value::Engine {
+            ty: s.types.effect,
+            handle: Some(hd),
+        }
+    }
+
+    #[test]
+    fn a_party_effect_reaches_every_member_but_an_excluded_creator() {
+        let mut s = sim();
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let follower = s.world.spawn(ObjectKind::Creature, "follower");
+        let stranger = s.world.spawn(ObjectKind::Creature, "stranger");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().followers.push(follower);
+        let e = effect_value(
+            &mut s,
+            Effect {
+                ty: 1012,
+                ..Default::default()
+            },
+        );
+        let apply = |s: &mut Sim, exclude: i32| {
+            run(
+                s,
+                hero,
+                "Engine_ApplyEffectOnParty",
+                &[
+                    Value::Int(2),
+                    e.clone(),
+                    Value::Float(5.0),
+                    Value::Object(hero),
+                    Value::Int(300),
+                    Value::Int(exclude),
+                ],
+            );
+        };
+        apply(&mut s, 1);
+        let count = |s: &Sim, o: ObjectId| s.world.get(o).unwrap().effects.len();
+        assert_eq!(
+            (count(&s, hero), count(&s, follower), count(&s, stranger)),
+            (0, 1, 0)
+        );
+        let got = s.world.get(follower).unwrap().effects[0].clone();
+        assert_eq!(
+            (got.creator, got.ability, got.duration_type),
+            (Some(hero), 300, 2)
+        );
+        assert_eq!(got.expires, Some(s.world.time_ms + 5000));
+        apply(&mut s, 0);
+        assert_eq!((count(&s, hero), count(&s, follower)), (1, 2));
+    }
+
+    fn location(s: &mut Sim, area: ObjectId, p: [f32; 3]) -> Value {
+        run(
+            s,
+            OBJECT_INVALID,
+            "Location",
+            &[Value::Object(area), Value::Vector(p), Value::Float(0.0)],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_nearest_objects_to_a_location_are_of_its_area_and_type() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        let elsewhere = s.world.spawn(ObjectKind::Area, "elsewhere");
+        let put = |s: &mut Sim, kind, area, x: f32, dead| {
+            let o = s.world.spawn(kind, "o");
+            let obj = s.world.get_mut(o).unwrap();
+            obj.area = Some(area);
+            obj.position = [x, 0.0, 0.0];
+            obj.dead = dead;
+            o
+        };
+        let far = put(&mut s, ObjectKind::Creature, area, 9.0, false);
+        let near_dead = put(&mut s, ObjectKind::Creature, area, 1.0, true);
+        let mid = put(&mut s, ObjectKind::Creature, area, 4.0, false);
+        let chest = put(&mut s, ObjectKind::Placeable, area, 0.5, false);
+        put(&mut s, ObjectKind::Creature, elsewhere, 0.0, false);
+        let l = location(&mut s, area, [0.0; 3]);
+        let nearest = |s: &mut Sim, mask: i64, n: i32| {
+            run(
+                s,
+                OBJECT_INVALID,
+                "GetNearestObjectToLocation",
+                &[l.clone(), Value::Int(mask as i32), Value::Int(n)],
+            )
+        };
+        // Creatures only (32), the dead included, nearest first.
+        assert_eq!(
+            nearest(&mut s, 32, 5),
+            Some(objects(vec![near_dead, mid, far]))
+        );
+        // Fewer than one asked for means one; OBJECT_TYPE_ALL takes the placeable too.
+        assert_eq!(nearest(&mut s, 4294967295, 0), Some(objects(vec![chest])));
+        assert_eq!(nearest(&mut s, 0, 3), Some(objects(Vec::new())));
+    }
+
+    #[test]
+    fn mana_is_the_mana_stamina_property() {
+        let mut s = sim();
+        let mage = s.world.spawn(ObjectKind::Creature, "mage");
+        let chest = s.world.spawn(ObjectKind::Placeable, "chest");
+        s.world
+            .get_mut(mage)
+            .unwrap()
+            .properties
+            .insert(PROPERTY_MANA_STAMINA, (40.0, 12.7));
+        let get = |s: &mut Sim, f: &str, o: ObjectId| run(s, o, f, &[Value::Object(o)]);
+        assert_eq!(get(&mut s, "GetCreatureMana", mage), Some(Value::Int(12)));
+        assert_eq!(
+            get(&mut s, "GetCreatureMaxMana", mage),
+            Some(Value::Int(40))
+        );
+        assert_eq!(get(&mut s, "GetCreatureMana", chest), Some(Value::Int(-1)));
+        assert_eq!(
+            get(&mut s, "GetCreatureMaxMana", chest),
+            Some(Value::Int(-1))
+        );
+        for (set, want) in [(30, 30), (90, 40), (-5, 0)] {
+            run(
+                &mut s,
+                mage,
+                "SetCreatureMana",
+                &[Value::Object(mage), Value::Int(set)],
+            );
+            assert_eq!(get(&mut s, "GetCreatureMana", mage), Some(Value::Int(want)));
+        }
+    }
+
+    #[test]
+    fn removing_all_effects_spares_injuries_and_what_outlasts_death() {
+        let mut s = sim();
+        let t = crate::m2da::Tables::empty();
+        t.insert(
+            "effects",
+            &["ID", "IgnoreDeath"],
+            vec![
+                (7, vec![Cell::Int(7), Cell::Int(1)]),
+                (1012, vec![Cell::Int(1012), Cell::Int(0)]),
+            ],
+        );
+        s.world.tables = Arc::new(t);
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let give = |s: &mut Sim| {
+            let o = s.world.get_mut(c).unwrap();
+            o.effects.clear();
+            for (ty, ability, duration_type) in [
+                (1012, 10, 3),      // a buff
+                (1012, 500_001, 3), // an injury
+                (7, 0, 3),          // outlasts death
+                (1012, 0, 6),       // duration type 6 always stays
+                (1012, 0, 4),       // so do types 4 and 5
+            ] {
+                o.effects.push(Effect {
+                    ty,
+                    ability,
+                    duration_type,
+                    ..Default::default()
+                });
+            }
+        };
+        let left = |s: &Sim| -> Vec<(i32, i32, i32)> {
+            s.world
+                .get(c)
+                .unwrap()
+                .effects
+                .iter()
+                .map(|e| (e.ty, e.ability, e.duration_type))
+                .collect()
+        };
+        give(&mut s);
+        run(&mut s, c, "RemoveAllEffects", &[Value::Object(c)]);
+        assert_eq!(
+            left(&s),
+            vec![(1012, 500_001, 3), (1012, 0, 6), (1012, 0, 4)]
+        );
+        give(&mut s);
+        run(
+            &mut s,
+            c,
+            "RemoveAllEffects",
+            &[Value::Object(c), Value::Int(0), Value::Int(1)],
+        );
+        assert_eq!(left(&s), vec![(7, 0, 3), (1012, 0, 6), (1012, 0, 4)]);
+    }
+
+    #[test]
+    fn ghost_and_quickbar_switches_are_kept_on_the_creature() {
+        let mut s = sim();
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let chest = s.world.spawn(ObjectKind::Placeable, "chest");
+        let set = |s: &mut Sim, f: &str, o: ObjectId, v: i32| {
+            run(s, o, f, &[Value::Object(o), Value::Int(v)]);
+        };
+        let field = |s: &Sim, o: ObjectId, f: &str| s.world.get(o).unwrap().fields.get(f).copied();
+        set(&mut s, "SetCreatureIsGhost", c, 7);
+        set(&mut s, "SetQuickslotBar", c, 3);
+        set(&mut s, "SetQuickslotBar", c, 5);
+        set(&mut s, "LockQuickslotBar", c, 1);
+        set(&mut s, "SetCreatureIsGhost", chest, 1);
+        assert_eq!(field(&s, c, "Ghost"), Some(1));
+        assert_eq!(field(&s, c, "QuickslotBar"), Some(3));
+        assert_eq!(field(&s, c, "QuickslotBarLocked"), Some(1));
+        assert_eq!(field(&s, chest, "Ghost"), None);
+        set(&mut s, "SetCreatureIsGhost", c, 0);
+        set(&mut s, "LockQuickslotBar", c, -1);
+        assert_eq!(field(&s, c, "Ghost"), Some(0));
+        assert_eq!(field(&s, c, "QuickslotBarLocked"), Some(0));
+    }
+
+    #[test]
+    fn ambient_dialog_queries_answer_from_the_conversation() {
+        let mut s = sim();
+        assert_eq!(run(&mut s, 1, "DialogIsAmbient", &[]), Some(Value::Int(0)));
+        s.dialog_ambient = true;
+        assert_eq!(run(&mut s, 1, "DialogIsAmbient", &[]), Some(Value::Int(1)));
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "ClearAmbientDialogs",
+                &[Value::Object(OBJECT_INVALID)]
+            ),
+            Some(Value::Int(1))
+        );
+        assert!(s.world.trace.stubbed.is_empty());
+    }
+
+    #[test]
+    fn the_current_map_is_revealed_and_auto_pause_follows_the_option() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        s.world.area = Some(area);
+        run(&mut s, 1, "RevealCurrentMap", &[]);
+        assert_eq!(
+            s.world.get(area).unwrap().fields.get("MapRevealed"),
+            Some(&1)
+        );
+        assert_eq!(
+            run(&mut s, 1, "GetAutoPauseCombatStatus", &[]),
+            Some(Value::Int(0))
+        );
+        s.auto_pause_combat = true;
+        assert_eq!(
+            run(&mut s, 1, "GetAutoPauseCombatStatus", &[]),
+            Some(Value::Int(1))
+        );
+        assert!(s.world.trace.stubbed.is_empty());
+    }
+
+    #[test]
+    fn an_area_ability_aims_at_the_middle_of_the_best_cluster_of_foes() {
+        let mut s = sim();
+        let t = crate::m2da::Tables::empty();
+        t.insert(
+            "ABI_base",
+            &["ID", "aoe_type", "aoe_param1", "#5d3e0787"],
+            vec![
+                // A sphere of radius 2: clusters span 4.
+                (
+                    1,
+                    vec![Cell::Int(1), Cell::Int(1), Cell::Float(2.0), Cell::Int(0)],
+                ),
+                // A lasting area whose VFX Persistent radius (3) is the span.
+                (
+                    2,
+                    vec![Cell::Int(2), Cell::Int(0), Cell::Float(0.0), Cell::Int(7)],
+                ),
+            ],
+        );
+        t.insert(
+            "#96",
+            &["ID", "Radius"],
+            vec![(7, vec![Cell::Int(7), Cell::Float(3.0)])],
+        );
+        s.world.tables = Arc::new(t);
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        s.world.hostility.insert((1, 2), true);
+        let put = |s: &mut Sim, group: i32, p: [f32; 3]| {
+            let c = s.world.spawn(ObjectKind::Creature, "c");
+            let o = s.world.get_mut(c).unwrap();
+            (o.area, o.group, o.position) = (Some(area), group, p);
+            c
+        };
+        let mage = put(&mut s, 1, [0.0, -10.0, 0.0]);
+        let lone = put(&mut s, 2, [0.0, 0.0, 0.0]);
+        let a = put(&mut s, 2, [20.0, 0.0, 0.0]);
+        let b = put(&mut s, 2, [22.0, 0.0, 0.0]);
+        let c = put(&mut s, 2, [21.0, 3.0, 0.0]);
+        let ally = put(&mut s, 1, [21.0, 1.0, 0.0]);
+        let far = put(&mut s, 2, [50.0, 0.0, 0.0]);
+        let center = |s: &mut Sim, seen: Vec<ObjectId>, ability: i32, size: i32, fail: i32| {
+            s.world.get_mut(mage).unwrap().combat.perceived = seen;
+            let v = run(
+                s,
+                mage,
+                "GetClusterCenter",
+                &[
+                    Value::Object(mage),
+                    Value::Int(ability),
+                    Value::Int(size),
+                    Value::Int(fail),
+                    Value::Int(0),
+                ],
+            );
+            match v {
+                Some(Value::Engine { handle, .. }) => match s.world.handle(handle) {
+                    Some(EngineData::Location(l)) => (l.area, l.position),
+                    _ => panic!("no location"),
+                },
+                _ => panic!("no location"),
+            }
+        };
+        // The three foes around the ally; the ally is not in the mean.
+        let crowd = vec![lone, a, b, c, ally, far];
+        assert_eq!(
+            center(&mut s, crowd.clone(), 1, 2, 0),
+            (area, [21.0, 1.0, 0.0])
+        );
+        // An ally in every cluster fails every roll at 100%.
+        assert_eq!(center(&mut s, crowd, 1, 2, 100).0, OBJECT_INVALID);
+        // The first candidate's cluster is never the answer.
+        assert_eq!(center(&mut s, vec![a, ally], 1, 1, 0).0, OBJECT_INVALID);
+        // A lasting area's radius is the span itself.
+        assert_eq!(
+            center(&mut s, vec![lone, a, b], 2, 2, 0),
+            (area, [21.0, 0.0, 0.0])
+        );
+        assert_eq!(center(&mut s, vec![lone, a, c], 2, 2, 0).0, OBJECT_INVALID);
+    }
+
+    #[test]
+    fn shapes_take_what_their_ground_touches() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        let put = |s: &mut Sim, kind, p: [f32; 3]| {
+            let c = s.world.spawn(kind, "o");
+            let o = s.world.get_mut(c).unwrap();
+            (o.area, o.position) = (Some(area), p);
+            c
+        };
+        // Bodies are 0.4 across ([`DEFAULT_RADIUS`]) and only their ground position counts.
+        let near = put(&mut s, ObjectKind::Creature, [2.3, 0.0, 9.0]);
+        let edge = put(&mut s, ObjectKind::Placeable, [2.3, 0.0, 0.0]);
+        let behind = put(&mut s, ObjectKind::Creature, [0.0, -1.0, 0.0]);
+        let side = put(&mut s, ObjectKind::Creature, [1.0, 1.2, 0.0]);
+        let dead = put(&mut s, ObjectKind::Creature, [0.0, 1.0, 0.0]);
+        s.world.get_mut(dead).unwrap().dead = true;
+        // Facing 270 looks along +x.
+        let l = run(
+            &mut s,
+            OBJECT_INVALID,
+            "Location",
+            &[
+                Value::Object(area),
+                Value::Vector([0.0; 3]),
+                Value::Float(270.0),
+            ],
+        )
+        .unwrap();
+        let shape = |s: &mut Sim,
+                     f: &str,
+                     pre: Option<Vec<ObjectId>>,
+                     mask: i32,
+                     shape: i32,
+                     fa: f32,
+                     fb: f32,
+                     d: i32| {
+            let mut args: Vec<Value> = pre.map(|v| vec![objects(v)]).unwrap_or_default();
+            args.extend([
+                Value::Int(mask),
+                Value::Int(shape),
+                l.clone(),
+                Value::Float(fa),
+                Value::Float(fb),
+                Value::Float(0.0),
+                Value::Int(d),
+            ]);
+            let mut got = match run(s, OBJECT_INVALID, f, &args) {
+                Some(Value::Array { items, .. }) => items,
+                _ => panic!("no array"),
+            };
+            got.sort_by_key(|v| match v {
+                Value::Object(o) => *o,
+                _ => 0,
+            });
+            got
+        };
+        let o = |v: &[ObjectId]| v.iter().map(|&x| Value::Object(x)).collect::<Vec<_>>();
+        // A sphere of 2: the creature at 2.3 touches it, the placeable (no body) does not.
+        assert_eq!(
+            shape(&mut s, "GetObjectsInShape", None, -1, 1, 2.0, 0.0, 1),
+            o(&[near, behind, side])
+        );
+        assert_eq!(
+            shape(&mut s, "GetObjectsInShape", None, -1, 1, 2.0, 0.0, 0),
+            o(&[near, behind, side, dead])
+        );
+        assert_eq!(
+            shape(&mut s, "GetObjectsInShape", None, 512, 1, 3.0, 0.0, 0),
+            o(&[edge])
+        );
+        // A 90-degree cone 3 long along +x: not what is behind or well to the side.
+        assert_eq!(
+            shape(&mut s, "GetObjectsInShape", None, -1, 2, 90.0, 3.0, 0),
+            o(&[near, edge, side])
+        );
+        assert_eq!(
+            shape(&mut s, "GetObjectsInShape", None, -1, 2, 20.0, 3.0, 0),
+            o(&[near, edge])
+        );
+        assert_eq!(
+            shape(&mut s, "GetObjectsInShape", None, -1, 3, 9.0, 9.0, 0),
+            o(&[])
+        );
+        // Filtering keeps only the given objects that are in the shape.
+        assert_eq!(
+            shape(
+                &mut s,
+                "FilterObjectsInShape",
+                Some(vec![behind, edge, side]),
+                32,
+                1,
+                2.0,
+                0.0,
+                0
+            ),
+            o(&[behind, side])
+        );
+    }
+
+    #[test]
+    fn angles_vectors_and_locations_convert_as_the_engine_does() {
+        let mut s = sim();
+        let f = |s: &mut Sim, n: &str, a: &[Value]| run(s, OBJECT_INVALID, n, a).unwrap();
+        let close = |v: Value, want: [f32; 3]| match v {
+            Value::Vector(v) => (0..3).all(|i| (v[i] - want[i]).abs() < 1e-4),
+            _ => false,
+        };
+        // Facing 270 looks along +x, 0 along +y, 90 along -x.
+        assert!(close(
+            f(&mut s, "AngleToVector", &[Value::Float(270.0)]),
+            [1.0, 0.0, 0.0]
+        ));
+        assert!(close(
+            f(&mut s, "AngleToVector", &[Value::Float(0.0)]),
+            [0.0, 1.0, 0.0]
+        ));
+        assert!(close(
+            f(&mut s, "AngleToVector", &[Value::Float(90.0)]),
+            [-1.0, 0.0, 0.0]
+        ));
+        let angle = |s: &mut Sim, v: [f32; 3]| match f(s, "VectorToAngle", &[Value::Vector(v)]) {
+            Value::Float(x) => x,
+            _ => f32::NAN,
+        };
+        assert!((angle(&mut s, [1.0, 0.0, 0.0]) + 90.0).abs() < 1e-3);
+        assert!((angle(&mut s, [-2.0, 0.0, 5.0]) - 90.0).abs() < 1e-3);
+        // Straight back: -x is -0, so atan2 gives -180.
+        assert!((angle(&mut s, [0.0, -1.0, 0.0]) + 180.0).abs() < 1e-3);
+        assert_eq!(
+            f(
+                &mut s,
+                "VectorToString",
+                &[Value::Vector([1.5, -2.0, 0.25])]
+            ),
+            Value::String("1.500000 -2.000000 0.250000".into())
+        );
+        let l = f(
+            &mut s,
+            "Location",
+            &[
+                Value::Object(5),
+                Value::Vector([1.0, 2.0, 3.0]),
+                Value::Float(10.0),
+            ],
+        );
+        let moved = f(
+            &mut s,
+            "SetLocationPosition",
+            &[l.clone(), Value::Vector([7.0, 8.0, 9.0])],
+        );
+        let turned = f(
+            &mut s,
+            "SetLocationFacing",
+            &[moved.clone(), Value::Float(45.0)],
+        );
+        assert_eq!(
+            f(
+                &mut s,
+                "GetPositionFromLocation",
+                std::slice::from_ref(&turned)
+            ),
+            Value::Vector([7.0, 8.0, 9.0])
+        );
+        assert_eq!(
+            f(&mut s, "GetFacingFromLocation", &[turned]),
+            Value::Float(45.0)
+        );
+        // The location passed in is a copy: it keeps its position.
+        assert_eq!(
+            f(&mut s, "GetPositionFromLocation", &[l]),
+            Value::Vector([1.0, 2.0, 3.0])
+        );
+    }
+
+    #[test]
+    fn an_item_keeps_its_visual_effect() {
+        let mut s = sim();
+        let sword = s.world.spawn(ObjectKind::Item, "sword");
+        let man = s.world.spawn(ObjectKind::Creature, "man");
+        for o in [sword, man] {
+            run(
+                &mut s,
+                o,
+                "AddItemVisualEffect",
+                &[Value::Object(o), Value::Int(1077)],
+            );
+        }
+        let e = &s.world.get(sword).unwrap().effects;
+        assert_eq!(e.len(), 1);
+        assert_eq!(
+            (e[0].ty, e[0].duration_type, e[0].ints.clone()),
+            (4, 3, vec![1077])
+        );
+        assert!(s.world.get(man).unwrap().effects.is_empty());
+    }
+
+    #[test]
+    fn an_items_property_power_adds_up_its_matching_properties() {
+        let mut s = sim();
+        let ring = s.world.spawn(ObjectKind::Item, "ring");
+        s.world.get_mut(ring).unwrap().template = "gen_im_ring".into();
+        s.set_item_look(
+            "gen_im_ring",
+            crate::sim::ItemLook {
+                properties: vec![(1005, 2), (10018, 1), (1005, 3)],
+                ..Default::default()
+            },
+        );
+        let man = s.world.spawn(ObjectKind::Creature, "man");
+        let power = |s: &mut Sim, o: ObjectId, p: i32| {
+            run(
+                s,
+                o,
+                "GetItemPropertyPower",
+                &[Value::Object(o), Value::Int(p), Value::Int(1)],
+            )
+        };
+        assert_eq!(power(&mut s, ring, 1005), Some(Value::Int(5)));
+        assert_eq!(power(&mut s, ring, 10018), Some(Value::Int(1)));
+        assert_eq!(power(&mut s, ring, 7), Some(Value::Int(0)));
+        assert_eq!(power(&mut s, man, 1005), Some(Value::Int(0)));
+    }
+
+    #[test]
+    fn portrait_messages_are_logged() {
+        let mut s = sim();
+        s.world.trace.keep = true;
+        run(
+            &mut s,
+            1,
+            "DisplayPortraitMessage",
+            &[
+                Value::Object(1),
+                Value::String("Approval +5".into()),
+                Value::Int(0xff),
+            ],
+        );
+        assert!(s.world.trace.entries.iter().any(|e| matches!(e,
+            TraceEntry::Log { channel: -1, text, .. } if text == "Approval +5")));
+    }
+
+    #[test]
+    fn set_location_moves_into_an_existing_area() {
+        let mut s = sim();
+        let here = s.world.spawn(ObjectKind::Area, "here");
+        let there = s.world.spawn(ObjectKind::Area, "there");
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        s.world.get_mut(c).unwrap().area = Some(here);
+        let go = |s: &mut Sim, area: ObjectId, p: [f32; 3], f: f32| {
+            let l = run(
+                s,
+                OBJECT_INVALID,
+                "Location",
+                &[Value::Object(area), Value::Vector(p), Value::Float(f)],
+            )
+            .unwrap();
+            run(s, c, "SetLocation", &[Value::Object(c), l]);
+            let o = s.world.get(c).unwrap();
+            (o.area, o.position, o.facing)
+        };
+        assert_eq!(
+            go(&mut s, there, [1.0, 2.0, 3.0], 90.0),
+            (Some(there), [1.0, 2.0, 3.0], 90.0)
+        );
+        // No such area: it stays where it is, at the new position.
+        assert_eq!(
+            go(&mut s, 999, [4.0, 5.0, 6.0], 0.0),
+            (Some(there), [4.0, 5.0, 6.0], 0.0)
+        );
+    }
+
+    #[test]
+    fn the_running_script_and_indestructible_items() {
+        let mut s = sim();
+        assert_eq!(
+            run(&mut s, 1, "GetCurrentScriptResource", &[]),
+            Some(Value::Resource("test.ncs".into()))
+        );
+        let shield = s.world.spawn(ObjectKind::Item, "shield");
+        run(
+            &mut s,
+            1,
+            "SetItemIndestructible",
+            &[Value::Object(shield), Value::Int(5)],
+        );
+        assert_eq!(
+            s.world.get(shield).unwrap().fields.get("Indestructible"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn story_events_are_kept_and_pools_need_nothing() {
+        let mut s = sim();
+        s.world.time_ms = 4000;
+        for id in [12, 0, 7] {
+            run(&mut s, 1, "LogStoryEvent", &[Value::Int(id)]);
+        }
+        assert_eq!(s.world.story_events, vec![(12, 4000), (7, 4000)]);
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "CreatePool",
+                &[Value::Resource("c.utc".into()), Value::Int(3)]
+            ),
+            Some(Value::Int(1))
+        );
+        assert!(s.world.trace.stubbed.is_empty());
     }
 }
