@@ -457,6 +457,13 @@ impl UiLayer {
         sim: &Arc<Mutex<Sim>>,
         dt_ms: f64,
     ) -> Vec<thedas_ui::input::Aim> {
+        // The journal, while its screen is up (built from the plots: it needs the simulation
+        // mutably, which the bindings do not have).
+        let journal = (screens.menu == Some(Screen::Journal))
+            .then(|| sim.lock().unwrap_or_else(|p| p.into_inner()).journal());
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.journal = journal;
+        }
         let (want, line) = {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             let shown = self.shown.lock().map(|s| s.clone()).unwrap_or_default();

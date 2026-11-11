@@ -161,6 +161,9 @@ fn release_text_focus(m: &mut UiMovie) {
 
 /// The movie that shows the game's dialog boxes (`PopupLayer.ShowDialogBoxFromGame`).
 pub const POPUP_LAYER: &str = "popuplayer.gfx";
+/// The engine value holding how far the quickbar is dragged open (see [`Stage::new`]).
+pub const QUICKBAR_EXPAND_VALUE: &str = "Party.QuickbarExpandValue";
+
 /// The context the popup layer pushes while a dialog box is up.
 const POPUP_CONTEXT: &str = "GUIPopup";
 
@@ -210,6 +213,12 @@ impl Stage {
             bridge: {
                 let b = GameBridge::new(talk_table(vfs));
                 b.set_table_lookup(Some(table_lookup(vfs)));
+                // How far the player has dragged the quickbar open (quickbar.gfx reads it in
+                // `UpdateLayout` and writes it back as the handle moves): the engine keeps
+                // it, so it is seeded once here and left to the movie, not bound every frame
+                // (a per-frame 0 raced the movie's own value and the bar's width changed from
+                // run to run). Provisional: closed (0) to start, as no profile is read.
+                b.set_value(QUICKBAR_EXPAND_VALUE, UiValue::Number(0.0));
                 b
             },
             gpu,

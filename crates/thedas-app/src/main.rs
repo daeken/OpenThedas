@@ -1084,8 +1084,9 @@ impl App {
                 }
             }
             // The player's screens: I the inventory, C the character record, T tactics, M the
-            // area map. Provisional: the game's own key bindings are not traced.
-            KeyCode::KeyI | KeyCode::KeyC | KeyCode::KeyT | KeyCode::KeyM
+            // area map, J the journal (the executable's `ToggleJournal` action). Provisional:
+            // the game's own key bindings are not traced.
+            KeyCode::KeyI | KeyCode::KeyC | KeyCode::KeyT | KeyCode::KeyM | KeyCode::KeyJ
                 if self.screens.is_some() =>
             {
                 if let (Some(s), Some(m)) = (self.screens.as_mut(), menu_key(code)) {
@@ -1264,6 +1265,7 @@ impl App {
                     screens::Screen::CharacterRecord => KeyCode::KeyC,
                     screens::Screen::Tactics => KeyCode::KeyT,
                     screens::Screen::AreaMap => KeyCode::KeyM,
+                    screens::Screen::Journal => KeyCode::KeyJ,
                     _ => KeyCode::KeyI,
                 });
                 log.push(format!("{m:?}"));
@@ -1744,13 +1746,14 @@ fn text_key(name: &str) -> Option<thedas_ui::UiKey> {
     })
 }
 
-/// The player's screen a key opens (I, C, T).
+/// The player's screen a key opens (I, C, T, M, J).
 fn menu_key(code: KeyCode) -> Option<screens::Screen> {
     match code {
         KeyCode::KeyI => Some(screens::Screen::Inventory),
         KeyCode::KeyC => Some(screens::Screen::CharacterRecord),
         KeyCode::KeyT => Some(screens::Screen::Tactics),
         KeyCode::KeyM => Some(screens::Screen::AreaMap),
+        KeyCode::KeyJ => Some(screens::Screen::Journal),
         _ => None,
     }
 }
@@ -1782,6 +1785,7 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
                 }
                 "key" if arg.eq_ignore_ascii_case("t") => Step::Menu(screens::Screen::Tactics),
                 "key" if arg.eq_ignore_ascii_case("m") => Step::Menu(screens::Screen::AreaMap),
+                "key" if arg.eq_ignore_ascii_case("j") => Step::Menu(screens::Screen::Journal),
                 "key" if matches!(arg.to_ascii_lowercase().as_str(), "f1" | "f2" | "f3" | "f4") => {
                     Step::Leader(arg[1..].parse::<usize>()? - 1)
                 }

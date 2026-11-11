@@ -11,7 +11,7 @@ use thedas_formats::level::{ArlRoom, LightmapBinding, Transform};
 use thedas_formats::material::{MaterialDef, MaterialObject, Technique, TextureBinding};
 use thedas_formats::mesh::{DeclUsage, MeshChunk, Msh};
 pub use thedas_formats::model::{DOMAIN_CHARACTERS, DOMAIN_LEVEL};
-use thedas_formats::morph::{Morph, MorphNode, slot as morph_slot};
+use thedas_formats::morph::{Morph, MorphNode, MorphPreset, slot as morph_slot};
 use thedas_formats::probe::IrradianceProbe;
 use thedas_formats::tint::Tint;
 use thedas_formats::{Arl, Mmh, Rml};
@@ -604,6 +604,16 @@ impl<'a> Loader<'a> {
         if let Some(m) = self.morphs.get(&key) {
             return m.clone();
         }
+        // A face-screen preset (`hm_cps_p01.mop`) on its race and gender's base face
+        // (`hm_pcc_b01.mor`, the face screen's last preset). Provisional: the base is named
+        // after the preset's first two letters.
+        let preset = format!("{}.mop", name.to_ascii_lowercase());
+        let is_base = name.to_ascii_lowercase().ends_with("_pcc_b01");
+        if !is_base && self.read(&key).is_err() && self.read(&preset).is_ok() {
+            let loaded = self.preset_morph(name);
+            self.morphs.insert(key, loaded.clone());
+            return loaded;
+        }
         let loaded = match self.read(&key) {
             Ok(d) => match Morph::parse(&d) {
                 Ok(m) => Some(Arc::new(m)),
@@ -619,6 +629,25 @@ impl<'a> Loader<'a> {
         };
         self.morphs.insert(key, loaded.clone());
         loaded
+    }
+
+    /// A preset face: the race and gender's base face with the preset's choices on it.
+    fn preset_morph(&mut self, name: &str) -> Option<Arc<Morph>> {
+        let file = format!("{}.mop", name.to_ascii_lowercase());
+        let preset = match self.read(&file).map(|d| MorphPreset::parse(&d)) {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                self.warn(format!("{file}: {e}"));
+                return None;
+            }
+            Err(e) => {
+                self.warn(e.to_string());
+                return None;
+            }
+        };
+        let prefix: String = name.chars().take(2).collect();
+        let base = self.morph(&format!("{prefix}_pcc_b01"))?;
+        Some(Arc::new(base.with_preset(&preset)))
     }
 
     /// A copy of mesh `base` with a head morph's vertex positions, shared by every draw of
