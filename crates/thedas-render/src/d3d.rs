@@ -19,7 +19,7 @@
 //! (0x46b260, reached through the usage dispatch 0x4f8a10 and 0x46baf0) writes: point
 //! lights A, B, C at positions (radius in `w`) `c0`, `c5`, `c7` and colours `c1`, `c6`, `c8`
 //! (slot tables at 0xae7fb0 and 0xae7fbc), light D at `c9`/`c11` (0xae7fc8, 0xae7fd4),
-//! unused slots zero; `c2`/`c3` the directional light; and the ambient term
+//! unused slots zero; `c2`/`c3` the directional light (below); and the ambient term
 //! `c4 = (base + Σ ambient lights, 1)`: the colours of the ambient light nodes the light
 //! manager picked for the object (0x4644f8 → 0x463e40 over its ambient list, ranked by
 //! `(|r| + |g| + |b|) / 3`, 0x53d040), plus the base the render parameters carry at `+0xc0`
@@ -30,6 +30,15 @@
 //! `g_bShaderControlBooleans` `b0`-`b2` say lights D, B and C are present and `b3` that the
 //! directional light is (0x46be70).
 //!
+//! The directional light: every frame the light manager (0x45be65 → 0x4654e0 → 0x464310)
+//! gives each node `c2 = (direction, 1)` and `c3 = (colour · v, w)` (0x462470, 0x46bb80),
+//! from the layout's sun (0x4625d0: 3150's direction, 3152's colour for the level and
+//! 3149's for characters, the nodes flagged 0x4000) in layouts that set 3122, a black light
+//! otherwise; `v` is a per-node visibility that eases (at a rate times the frame time,
+//! 0x46a520) towards 1, or 0.1 when the sun is occluded from a character in a layout whose
+//! 3148 allows it. `b3` is `c3.w` non-zero (0x46bf5d). No multiplier: 3153 and the ATMO sun
+//! intensity are not involved.
+//!
 //! Provisional, inferred by reading Static1's bytecode rather than verified against the
 //! original executable:
 //!
@@ -37,12 +46,12 @@
 //!   matrices (the shader computes `x*c[n] + y*c[n+1] + z*c[n+2] + c[n+3]`); `MatrixColumns`
 //!   one register per row.
 //! - Which ambient lights reach a draw: those of its room (the engine's pick also filters
-//!   by the object's light visibility list, not traced); the directional light's registers
-//!   (not traced to their writer). Light A is always evaluated; lights A-C and the
-//!   directional light are multiplied by the lightmap alpha; D is not.
+//!   by the object's light visibility list, not traced). The sun's visibility is taken as 1
+//!   (the occlusion test that lowers it is not traced). Light A is always evaluated; lights
+//!   A-C and the directional light are multiplied by the lightmap alpha; D is not.
 //! - Fog and the sky's scattering come from the level's atmosphere ([`crate::atmosphere`]).
 //!   Shadows, the environment cubemap and the depth-of-field output are disabled (no shadow
-//!   maps, black cubemap, `oC1` dropped).
+//!   maps: [`NO_SHADOW_DATA`]; black cubemap, `oC1` dropped).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -374,6 +383,30 @@ pub struct ConstantContext<'a> {
 /// (DAOrigins.exe 0x458eb0 writes `(0.2, 0.2, 0.2)` only in its fallback mode 0).
 pub const BASE_AMBIENT: [f32; 3] = [0.0; 3];
 
+/// `g_vShadowData` (usage `ShadowData`, the nine vectors at 0xc1e750 the usage dispatch
+/// hands out, 0x4f8bc5) with no shadow partition drawn: both partitions' projections the
+/// identity with its depth row zeroed, as the shadow reset writes them (0x452cb0), the
+/// partition-2 range `w` 1 and the view-depth plane zero (never written). With these the
+/// Static shaders' shadow tests read every point as lit, whatever the shadow textures hold:
+/// every lookup compares the map against a depth of 0.
+///
+/// The original draws shadow partitions at every Graphics Detail setting (0x458ff7 → 0x4556e0
+/// with the detail mode as the shadow quality: at Low, 512-texel maps, 0x45569e, with ranges
+/// of 5 and 15 m, 0x455777); a point those find in shadow gets the sun and point lights
+/// scaled by the shadow and the lightmap by `0.5 · (shadow − 1) + 1`. Those partitions are
+/// not drawn here (provisional): this is the engine's own unshadowed state.
+pub const NO_SHADOW_DATA: [[f32; 4]; 9] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+    [0.0, 0.0, 0.0, 0.0],
+];
+
 /// Light from every direction for draws in a level with no irradiance probe. Provisional.
 pub const NO_PROBE_IRRADIANCE: [f32; 3] = [0.35, 0.35, 0.35];
 
@@ -445,10 +478,11 @@ impl ConstantContext<'_> {
         let base = Vec3::from_array(BASE_AMBIENT);
         let ambient = base + self.ambient;
         r[4] = [ambient.x, ambient.y, ambient.z, 1.0];
-        // The sun takes registers 2 (direction) and 3 (colour), which the shaders read under
-        // control boolean 3. Provisional, from the shaders' use of them.
+        // The sun takes registers 2 (direction, w 1) and 3 (colour, w 1: the stored colour's
+        // w, which boolean 3 tests), as the light manager writes them (0x4625d0 → 0x462470
+        // → 0x46bb80).
         if let Some((d, c)) = self.sun {
-            r[2] = [d.x, d.y, d.z, 0.0];
+            r[2] = [d.x, d.y, d.z, 1.0];
             r[3] = [c.x, c.y, c.z, 1.0];
         }
         r
@@ -533,7 +567,8 @@ impl ConstantContext<'_> {
             }
             ("ApplicationTime", _) => Value::Vectors(vec![[self.time, 0.0, 0.0, 0.0]]),
             ("CloudParameters", _) => Value::Vectors(self.clouds.to_vec()),
-            ("ShadowData", _) | ("IrradianceParams", _) => Value::Vectors(Vec::new()),
+            ("ShadowData", _) => Value::Vectors(NO_SHADOW_DATA.to_vec()),
+            ("IrradianceParams", _) => Value::Vectors(Vec::new()),
             (_, "mml_vLightmapOffsetAndScale") if self.lightmap.is_some() => {
                 let l = self.lightmap?;
                 Value::Vectors(vec![[l.offset[0], l.offset[1], l.scale[0], l.scale[1]]])
@@ -834,7 +869,7 @@ mod tests {
         assert_eq!(c.bools[1][0], 1, "second point light enables B");
         assert_eq!(c.bools[2][0], 0);
         // The sun: its direction and colour in registers 2 and 3, and boolean 3 on.
-        assert_eq!(c.floats[2], [0.0, 0.0, -1.0, 0.0]);
+        assert_eq!(c.floats[2], [0.0, 0.0, -1.0, 1.0]);
         assert_eq!(c.floats[3], [0.6, 0.5, 0.3, 1.0]);
         assert_eq!(c.bools[3][0], 1);
         assert_eq!(c.floats[40], [0.0; 4]);
@@ -901,6 +936,38 @@ mod tests {
             ParamClass::Vector,
         )])));
         assert_eq!(c.floats[3], [0.25, 0.0, 0.0, 1.0]);
+    }
+
+    /// The Static1_fast shadow test (registers c12-c20, shadow maps s7 and s15) on the CPU.
+    fn shadow_lit(sd: &[[f32; 4]; 9], pos: [f32; 3], map: [f32; 2]) -> f32 {
+        let p = [pos[0], pos[1], pos[2], 1.0];
+        let dp4 = |r: [f32; 4], v: [f32; 4]| r.iter().zip(v).map(|(a, b)| a * b).sum::<f32>();
+        let sat = |x: f32| if x.is_nan() { 0.0 } else { x.clamp(0.0, 1.0) };
+        let d = dp4([sd[8][0], sd[8][1], sd[8][2], 0.0], p) + sd[8][3];
+        let near = sat(d * 10000.0);
+        // Partition 2.
+        let w2 = dp4([sd[7][0], sd[7][1], sd[7][2], 1.0], p);
+        let z2 = sat(dp4(sd[6], p) / w2);
+        let lit2 = if map[0] - z2 >= 0.0 { 1.0 } else { 0.0 };
+        let fade = sat((sd[7][3] - d) / (0.25 * sd[7][3]));
+        let far = fade * (lit2 - 1.0) + 1.0;
+        // Partition 1.
+        let z1 = sat(dp4(sd[2], p) / dp4(sd[3], p));
+        let lit1 = if map[0] - z1 >= 0.0 { 1.0 } else { sat(map[1]) };
+        if -near >= 0.0 { far } else { lit1 }
+    }
+
+    #[test]
+    fn without_partitions_every_point_is_lit() {
+        for pos in [[0.0, 0.0, 0.0], [12.5, -40.0, 3.0], [300.0, 250.0, 5.0]] {
+            for map in [[0.0, 0.0], [1.0, 1.0], [0.3, 0.0]] {
+                assert_eq!(
+                    shadow_lit(&NO_SHADOW_DATA, pos, map),
+                    1.0,
+                    "{pos:?} {map:?}"
+                );
+            }
+        }
     }
 
     #[test]

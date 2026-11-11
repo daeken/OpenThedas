@@ -654,6 +654,123 @@ impl Sim {
             })
     }
 
+    /// The modal abilities a creature has on, in the order their upkeep effects were applied
+    /// (see [`Sim::modal_active`]).
+    pub fn active_modal_abilities(&self, id: ObjectId) -> Vec<i32> {
+        const EFFECT_TYPE_UPKEEP: i32 = 1016;
+        let mut v: Vec<i32> = Vec::new();
+        if let Some(o) = self.world.get(id) {
+            for e in o.effects.iter().filter(|e| e.ty == EFFECT_TYPE_UPKEEP) {
+                if let Some(&a) = e.ints.get(1).filter(|&&a| a != 0) {
+                    if !v.contains(&a) {
+                        v.push(a);
+                    }
+                }
+            }
+        }
+        v
+    }
+
+    /// Whether a creature meets an ability's use conditions (`ABI_base` column hashed
+    /// 0xb1caee1d) among those in `mask`, as DAOrigins.exe checks them (0x71c310, reached
+    /// from `GetConditionedAbilities` 0x6743a0 through 0x71dd10 with no reason wanted):
+    ///
+    /// - weapon bits, by the `bitm_base.gda` `Type` of the main-hand and off-hand items
+    ///   (2 melee, 3 shield, 6 ranged): 0x4 a ranged main weapon (the others are then not
+    ///   checked); otherwise 0x1 a melee weapon in either hand or none in the main hand, 0x2 a
+    ///   shield, 0x40 melee weapons in both hands, each overriding the one before; 0x80 a
+    ///   two-handed melee weapon decides on its own;
+    /// - 0xe00, by `CurrentClass` (0x71b010 reads property 27): a warrior needs 0x800, a mage
+    ///   0x200, a rogue 0x400;
+    /// - 0x10: the modal ability in column 0x07342ea2 must be on (0x66dd60).
+    ///
+    /// Provisional: "two-handed" is the simulation's weapon style (the executable compares
+    /// two item fields, 0xa664c0, not traced), and 0x100 (column 0xc7e5bb24 against the
+    /// appearance's flags, 0x71a210; only the mabari crunch items use it) is not checked.
+    pub fn ability_conditions_met(&self, id: ObjectId, ability: i32, mask: i32) -> bool {
+        const COL_CONDITIONS: u32 = 0xb1ca_ee1d;
+        const COL_REQUIRED_MODAL: u32 = 0x0734_2ea2;
+        let tables = self.world.tables();
+        let abi = tables.get(0, "ABI_base");
+        let col = |h: u32| -> i32 {
+            match abi.as_ref().and_then(|t| t.cell_by_hash(h, ability as i64)) {
+                Some(thedas_formats::gda::Cell::Int(v)) => *v as i32,
+                Some(thedas_formats::gda::Cell::Float(v)) => *v as i32,
+                _ => 0,
+            }
+        };
+        let c = col(COL_CONDITIONS) & mask;
+        if c == 0 {
+            return true;
+        }
+        let Some(o) = self.world.get(id) else {
+            return true;
+        };
+        let item_type = |slot: i32| -> i32 {
+            o.equipment
+                .get(&slot)
+                .and_then(|i| self.world.get(*i))
+                .and_then(|i| i.fields.get("BaseItem").copied())
+                .and_then(|b| match tables.get(6, "")?.cell("Type", b as i64)? {
+                    thedas_formats::gda::Cell::Int(v) => Some(*v as i32),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        };
+        if c & 0xc7 != 0 {
+            let (main, off) = (item_type(0), item_type(1));
+            let ok = if c & 0x80 != 0 {
+                main == 2 && self.weapon_style(id) == constant_of(self, "WEAPONSTYLE_TWOHANDED")
+            } else if c & 0x4 != 0 {
+                main == 6
+            } else {
+                let mut ok = true;
+                if c & 0x1 != 0 {
+                    ok = main == 2 || off == 2 || main == 0;
+                }
+                if c & 0x2 != 0 {
+                    ok = off == 3;
+                }
+                if c & 0x40 != 0 {
+                    ok = off == 2 && main == 2;
+                }
+                ok
+            };
+            if !ok {
+                return false;
+            }
+        }
+        if c & 0xe00 != 0 {
+            let class = self.property_total(id, 27) as i32;
+            let needs = match class {
+                1 => 0x800,
+                2 => 0x200,
+                3 => 0x400,
+                _ => 0,
+            };
+            if needs != 0 && c & needs == 0 {
+                return false;
+            }
+        }
+        if c & 0x10 != 0 {
+            let required = col(COL_REQUIRED_MODAL);
+            if required != 0 && !self.modal_active(id, required) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `GetConditionedAbilities`: the modal abilities a creature has on whose conditions in
+    /// `mask` it no longer meets (DAOrigins.exe 0x6743a0, 0x71dd10). player_core asks on
+    /// equipping and unequipping and turns them off.
+    pub fn conditioned_abilities(&self, id: ObjectId, mask: i32) -> Vec<i32> {
+        self.active_modal_abilities(id)
+            .into_iter()
+            .filter(|&a| !self.ability_conditions_met(id, a, mask))
+            .collect()
+    }
+
     /// Kills a creature whose health ran out.
     pub fn check_death(&mut self, id: ObjectId, killer: ObjectId) {
         let health = constant_of(self, "PROPERTY_DEPLETABLE_HEALTH");
@@ -1366,6 +1483,71 @@ mod tests {
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         Sim::new(Arc::new(Vfs::new()), table, 3)
+    }
+
+    #[test]
+    fn modal_abilities_whose_conditions_break_are_listed() {
+        let mut s = sim();
+        let t = crate::m2da::Tables::empty();
+        // Shield Wall needs a melee weapon and a shield (1 | 2), a sword-only stance a
+        // melee weapon (1), a follow-up stance the first (0x10, needing 12), and a
+        // warrior-only one 0x800.
+        t.insert(
+            "ABI_base",
+            &["ID", "#b1caee1d", "#07342ea2"],
+            vec![
+                (12, vec![Cell::Int(12), Cell::Int(3), Cell::Int(0)]),
+                (20, vec![Cell::Int(20), Cell::Int(1), Cell::Int(0)]),
+                (21, vec![Cell::Int(21), Cell::Int(0x10), Cell::Int(12)]),
+                (22, vec![Cell::Int(22), Cell::Int(0x800), Cell::Int(0)]),
+            ],
+        );
+        // bitm_base Type: 2 melee, 3 shield.
+        t.insert(
+            "#6",
+            &["ID", "Type"],
+            vec![
+                (2, vec![Cell::Int(2), Cell::Int(2)]),
+                (7, vec![Cell::Int(7), Cell::Int(3)]),
+            ],
+        );
+        s.world.tables = Arc::new(t);
+        let c = s.world.spawn(ObjectKind::Creature, "warrior");
+        let sword = s.world.spawn(ObjectKind::Item, "sword");
+        let shield = s.world.spawn(ObjectKind::Item, "shield");
+        s.world
+            .get_mut(sword)
+            .unwrap()
+            .fields
+            .insert("BaseItem".into(), 2);
+        s.world
+            .get_mut(shield)
+            .unwrap()
+            .fields
+            .insert("BaseItem".into(), 7);
+        let upkeep = |a: i32| Effect {
+            ty: 1016,
+            ints: vec![0, a],
+            ..Default::default()
+        };
+        {
+            let o = s.world.get_mut(c).unwrap();
+            o.equipment.insert(0, sword);
+            o.equipment.insert(1, shield);
+            o.properties.insert(27, (2.0, 0.0)); // a mage
+            o.effects = vec![upkeep(12), upkeep(20), upkeep(21), upkeep(22)];
+        }
+        assert_eq!(s.active_modal_abilities(c), vec![12, 20, 21, 22]);
+        // All met but the warrior-only one (the creature is a mage).
+        assert_eq!(s.conditioned_abilities(c, 199 | 0xe00 | 0x10), vec![22]);
+        // The mask limits what is checked.
+        assert!(s.conditioned_abilities(c, 199).is_empty());
+        // Unequipping the shield breaks Shield Wall only; the sword stance still holds.
+        s.world.get_mut(c).unwrap().equipment.remove(&1);
+        assert_eq!(s.conditioned_abilities(c, 199), vec![12]);
+        // With Shield Wall gone, the stance that needs it breaks.
+        s.world.get_mut(c).unwrap().effects.remove(0);
+        assert_eq!(s.conditioned_abilities(c, 0x10), vec![21]);
     }
 
     #[test]

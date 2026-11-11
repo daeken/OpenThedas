@@ -442,6 +442,18 @@ pub struct AreaRenderer {
     time: f64,
 }
 
+/// The colour curve `da_hsvmatrix` reads by default: `da_defaultcc` (DAOrigins.exe loads it
+/// at 0x458cda), its first row as RGBA texels, or an identity ramp when it does not load.
+fn color_curve(vfs: &Vfs) -> Vec<u8> {
+    let decoded = vfs.read("da_defaultcc.dds").ok().and_then(|(d, _)| {
+        let dds = thedas_formats::dds::Dds::parse(&d).ok()?;
+        let px = dds.decode_rgba8(0, 0).ok()?;
+        let row = dds.width as usize * 4;
+        (row > 0 && px.len() >= row).then(|| px[..row].to_vec())
+    });
+    decoded.unwrap_or_else(crate::post::identity_curve)
+}
+
 impl AreaRenderer {
     pub fn new(
         ctx: &GpuContext,
@@ -791,9 +803,11 @@ impl AreaRenderer {
                 .then(|| {
                     crate::post::FrameEffects::new(
                         device,
+                        &ctx.queue,
                         &scene.effects,
                         scene.detail,
                         color_format,
+                        &color_curve(vfs),
                     )
                 })
                 .flatten(),

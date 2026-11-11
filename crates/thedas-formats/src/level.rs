@@ -55,9 +55,10 @@ pub mod field {
     pub const FBEP_VALUE: u32 = 5524;
     pub const ARL_SUN_COLOR_CHAR: u32 = 3149;
     pub const ARL_SUN_DIRECTION: u32 = 3150;
-    pub const ARL_SUN_ENABLED: u32 = 3151;
     pub const ARL_SUN_COLOR: u32 = 3152;
-    pub const ARL_SUN_COLOR_MULT: u32 = 3153;
+    /// xoreos's "EnvAreaChunkIsChunk"; DAOrigins.exe's layout loader takes the sun from the
+    /// layout only when it is set (0x5d1617).
+    pub const ARL_LAYOUT_SUN: u32 = 3122;
     pub const PATHING_GRID: u32 = 3110;
     pub const GRID_COLUMNS: u32 = 3086;
     pub const GRID_ROWS: u32 = 3087;
@@ -224,11 +225,15 @@ impl FrameEffect {
 /// A level's sun: the direction its light travels (normalized, world space), its colour on
 /// the level's surfaces and its colour on characters.
 ///
-/// Provisional. The fields are named as xoreos's GFF4 field list names them (read for the
-/// format only): 3150 sunlight direction (a unit vector pointing down), 3151 sunlight
-/// enabled (absent in the layouts seen, taken as on), 3152 sunlight colour, 3153 its
-/// multiplier (absent, taken as 1) and 3149 the sunlight colour for characters. Interiors
-/// give black colours: no sun.
+/// As DAOrigins.exe's layout loader reads them (0x5d1448-0x5d1574): 3152 the colour, 3150
+/// the direction, 3149 the characters' colour (3152's when absent). The light manager
+/// (0x4625d0) lights with them only in layouts that set 3122 (mode 1, 0x5d168e); every
+/// other layout (interiors, whatever colours they store) gets a black directional light
+/// (0x456320), which we give as no sun. 3151 and 3153 (xoreos's "enabled" and
+/// "multiplier") are not read by the engine, nor present in any layout seen. Field names are
+/// xoreos's (read for the format only). Provisional: the normalization (the engine uploads
+/// the stored vector; every layout seen stores a unit one); a black or directionless sun
+/// is dropped, which draws the same as the engine's zero light.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sun {
     pub direction: [f32; 3],
@@ -348,15 +353,16 @@ impl Arl {
             },
             None => None,
         };
-        let enabled = d
-            .opt_i64(root, field::ARL_SUN_ENABLED)?
-            .is_none_or(|v| v != 0);
-        let mult = d.opt_f32(root, field::ARL_SUN_COLOR_MULT)?.unwrap_or(1.0);
-        let color = d
-            .opt_vec3(root, field::ARL_SUN_COLOR)?
-            .map(|c| c.map(|v| v * mult));
+        let layout_sun = d
+            .opt_i64(root, field::ARL_LAYOUT_SUN)?
+            .is_some_and(|v| v != 0);
+        let color = d.opt_vec3(root, field::ARL_SUN_COLOR)?;
         let character_color = d.opt_vec3(root, field::ARL_SUN_COLOR_CHAR)?;
-        let sun = match (enabled, color, d.opt_vec3(root, field::ARL_SUN_DIRECTION)?) {
+        let sun = match (
+            layout_sun,
+            color,
+            d.opt_vec3(root, field::ARL_SUN_DIRECTION)?,
+        ) {
             (true, Some(color), Some([x, y, z])) => {
                 let character_color = character_color.unwrap_or(color);
                 let len = (x * x + y * y + z * z).sqrt();
@@ -655,34 +661,38 @@ mod tests {
         let dir = (field::ARL_SUN_DIRECTION, Value::Vec3([0.0, 0.0, -2.0]));
         let level = (field::ARL_SUN_COLOR, Value::Vec4([0.6, 0.5, 0.3, 1.0]));
         let chars = (field::ARL_SUN_COLOR_CHAR, Value::Vec4([0.4, 0.4, 0.4, 1.0]));
-        let s = sun(vec![dir.clone(), level.clone(), chars.clone()]).unwrap();
-        assert_eq!(s.direction, [0.0, 0.0, -1.0]);
-        assert_eq!(s.color, [0.6, 0.5, 0.3]);
-        assert_eq!(s.character_color, [0.4, 0.4, 0.4]);
-        // The multiplier scales the level's colour.
+        let outdoors = (field::ARL_LAYOUT_SUN, Value::I32(1));
         let s = sun(vec![
             dir.clone(),
             level.clone(),
-            (field::ARL_SUN_COLOR_MULT, Value::F32(2.0)),
+            chars.clone(),
+            outdoors.clone(),
         ])
         .unwrap();
-        assert_eq!(s.color, [1.2, 1.0, 0.6]);
-        assert_eq!(s.character_color, s.color);
-        // Disabled, black (an interior), or of no direction: no sun.
+        assert_eq!(s.direction, [0.0, 0.0, -1.0]);
+        assert_eq!(s.color, [0.6, 0.5, 0.3]);
+        assert_eq!(s.character_color, [0.4, 0.4, 0.4]);
+        // Only a layout that takes its sun from the layout (3122) has one: an interior's
+        // stored colours light nothing.
         assert_eq!(
             sun(vec![
                 dir.clone(),
                 level.clone(),
-                (field::ARL_SUN_ENABLED, Value::I32(0))
+                (field::ARL_LAYOUT_SUN, Value::I32(0))
             ]),
             None
         );
+        assert_eq!(sun(vec![dir.clone(), level.clone()]), None);
+        // No characters' colour: the level's.
+        let s = sun(vec![dir.clone(), level.clone(), outdoors.clone()]).unwrap();
+        assert_eq!(s.character_color, s.color);
         let black = (field::ARL_SUN_COLOR, Value::Vec4([0.0, 0.0, 0.0, 1.0]));
-        assert_eq!(sun(vec![dir.clone(), black]), None);
+        assert_eq!(sun(vec![dir.clone(), black, outdoors.clone()]), None);
         assert_eq!(
             sun(vec![
                 (field::ARL_SUN_DIRECTION, Value::Vec3([0.0; 3])),
-                level
+                level,
+                outdoors
             ]),
             None
         );

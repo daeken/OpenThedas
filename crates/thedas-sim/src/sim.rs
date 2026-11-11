@@ -267,6 +267,12 @@ pub enum CutscenePolicy {
 /// Movement speed (m/s) for a creature whose appearance gives none. Provisional.
 pub const DEFAULT_SPEED: f32 = 5.0;
 
+/// `apr_base.gda` speed columns DAOrigins.exe's locomotion reads (0xa6b4f6-0xa6b5ad,
+/// 0xa63120): walk, run, and run in combat stance.
+const COL_WALK: u32 = 0x958f_23c8;
+const COL_RUN: u32 = 0xa0dc_d78c;
+const COL_COMBAT_RUN: u32 = 0x0dc3_ebb2;
+
 pub fn constant(table: &EngineTable, name: &str) -> i32 {
     match table.constant(name).map(|c| &c.value) {
         Some(ConstValue::Int(v)) => *v as i32,
@@ -1082,7 +1088,7 @@ impl Sim {
             if cmd.name.starts_with("CommandJumpTo") {
                 0
             } else {
-                (d / self.move_speed(id) * 1000.0) as u64
+                (d / self.command_speed(id, cmd) * 1000.0) as u64
             }
         } else {
             500
@@ -1102,22 +1108,53 @@ impl Sim {
         self.update_triggers(id);
     }
 
-    /// How fast a creature runs, in metres per second: its appearance's run speed in
-    /// `apr_base.gda` (the column hashing to 0xbd6d4446: 3.62 for humans, elves and
-    /// dwarves, 2.86 for walking corpses, 3.75 for the mabari, 1.42 for a revenant; taken to
-    /// be the run speed, provisional), else [`DEFAULT_SPEED`].
+    /// How fast a creature runs, in metres per second, as DAOrigins.exe's locomotion picks
+    /// its target speed (0xa63120): an `apr_base.gda` column by the creature's appearance,
+    /// 0xa0dcd78c for a run (6.0 for humans, hurlocks and walking corpses) or, in combat
+    /// stance, 0x0dc3ebb2 (4.66). The stance is the creature's combat state: the locomotion's
+    /// flag (+0xf9, set through 0x6a7f30) follows it each update (0x6be1b6 reads 0x6a2580,
+    /// the state `SetCombatState` writes, 0x6ae0a0). Else [`DEFAULT_SPEED`].
+    ///
+    /// Provisional: the target speed's multiplier and bonus (+0xd4, +0xdc; 1 and 0 when the
+    /// locomotion is made, 0xa633a2) and its second stance column (0x03186054, 3.5, under a
+    /// flag at +0xf8 whose setter is not traced) are not modelled, and creatures reach their
+    /// speed at once where the executable accelerates at 8 m/s per second (0xa635d0,
+    /// 0xb1b7c8). The column 0xbd6d4446 (3.62), used before, is the run animation's
+    /// reference speed for blending (0xa6aa70), not a movement speed.
     pub fn move_speed(&self, id: ObjectId) -> f32 {
-        const COL_RUN: u32 = 0xbd6d_4446;
-        let app = self.world.get(id).map(|o| o.appearance).filter(|&a| a > 0);
-        app.and_then(|a| {
-            let t = self.world.tables().get(0, "apr_base")?;
-            match t.cell_by_hash(COL_RUN, a as i64)? {
-                thedas_formats::gda::Cell::Float(v) if *v > 0.1 => Some(*v as f32),
-                thedas_formats::gda::Cell::Int(v) if *v > 0 => Some(*v as f32),
-                _ => None,
+        let combat = self.world.get(id).is_some_and(|o| o.combat.in_combat);
+        self.appearance_speed(id, if combat { COL_COMBAT_RUN } else { COL_RUN })
+            .or_else(|| self.appearance_speed(id, COL_RUN))
+            .unwrap_or(DEFAULT_SPEED)
+    }
+
+    /// How fast a command moves its owner: a move ordered not to run
+    /// (`CommandMoveToLocation`'s or `CommandMoveToObject`'s `bRunToLocation` FALSE) walks,
+    /// at the appearance's walk speed (column 0x958f23c8, 1.54 for humans; the locomotion's
+    /// mode 1 in 0xa63120); anything else runs ([`Sim::move_speed`]).
+    pub fn command_speed(&self, id: ObjectId, cmd: &Command) -> f32 {
+        let walks = cmd.name.starts_with("CommandMoveTo") && cmd.ints.first() == Some(&0);
+        if walks {
+            if let Some(v) = self.appearance_speed(id, COL_WALK) {
+                return v;
             }
-        })
-        .unwrap_or(DEFAULT_SPEED)
+        }
+        self.move_speed(id)
+    }
+
+    /// An `apr_base.gda` speed column for a creature's appearance, if it gives one.
+    fn appearance_speed(&self, id: ObjectId, column: u32) -> Option<f32> {
+        let a = self
+            .world
+            .get(id)
+            .map(|o| o.appearance)
+            .filter(|&a| a > 0)?;
+        let t = self.world.tables().get(0, "apr_base")?;
+        match t.cell_by_hash(column, a as i64)? {
+            thedas_formats::gda::Cell::Float(v) if *v > 0.1 => Some(*v as f32),
+            thedas_formats::gda::Cell::Int(v) if *v > 0 => Some(*v as f32),
+            _ => None,
+        }
     }
 
     /// Walks an object to `to` at its run speed, running the world as it goes, so triggers on the
@@ -1798,7 +1835,8 @@ impl Sim {
                                 }
                             };
                             if !path.is_empty() {
-                                ms = (path_length(p, &path) / self.move_speed(id) * 1000.0) as u64;
+                                ms = (path_length(p, &path) / self.command_speed(id, &cmd) * 1000.0)
+                                    as u64;
                             }
                         }
                     }
@@ -2323,6 +2361,18 @@ fn apply_template(o: &mut crate::world::Object, t: &Gff3) {
             o.fields.insert(fl.label.clone(), v);
         }
     }
+    // A creature template keeps its gender, tints and the like in its "Appearance Data"
+    // struct (Morrigan's Gender 2 is there); its integers count as the creature's fields
+    // where the top level does not give them.
+    if let Some(G3::Struct(i)) = field(r, "Appearance Data")
+        && let Some(a) = t.structs.get(*i as usize)
+    {
+        for fl in &a.fields {
+            if let Some(v) = int(a, &fl.label) {
+                o.fields.entry(fl.label.clone()).or_insert(v);
+            }
+        }
+    }
     read_text_fields(o, r);
 }
 
@@ -2777,6 +2827,44 @@ impl ScriptHost<'_> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn creature_templates_give_their_appearance_datas_fields() {
+        use thedas_formats::gff3::{Field, Gff3, Struct, Value};
+        let f = |label: &str, value| Field {
+            label: label.into(),
+            value,
+        };
+        let t = Gff3 {
+            file_type: *b"UTC ",
+            file_version: *b"V3.2",
+            structs: vec![
+                Struct {
+                    id: 0xFFFF_FFFF,
+                    fields: vec![
+                        f("Race", Value::Byte(3)),
+                        f("SkinTint", Value::Int(7)),
+                        f("Appearance Data", Value::Struct(1)),
+                    ],
+                },
+                Struct {
+                    id: 0,
+                    fields: vec![
+                        f("Gender", Value::Byte(2)),
+                        f("SkinTint", Value::Int(3)),
+                        f("Appearance_Type", Value::Dword(15)),
+                    ],
+                },
+            ],
+        };
+        let mut o = crate::world::Object::new(1, ObjectKind::Creature, "morrigan");
+        apply_template(&mut o, &t);
+        assert_eq!(o.appearance, 15);
+        assert_eq!(o.fields.get("Gender"), Some(&2));
+        // The top level wins where both give a value.
+        assert_eq!(o.fields.get("SkinTint"), Some(&7));
+        assert_eq!(o.fields.get("Race"), Some(&3));
+    }
 
     #[test]
     fn the_party_picker_switches_event_scripts_as_follower_states_change() {
@@ -3555,25 +3643,59 @@ mod tests {
         use thedas_formats::gda::Cell;
         let mut s = sim();
         let t = crate::m2da::Tables::empty();
+        // Walk, run, combat run and the run animation's reference speed (not a movement
+        // speed).
         t.insert(
             "apr_base",
-            &["ID", "Label", "#bd6d4446"],
+            &[
+                "ID",
+                "Label",
+                "#958f23c8",
+                "#a0dcd78c",
+                "#0dc3ebb2",
+                "#bd6d4446",
+            ],
             vec![(
-                29,
+                15,
                 vec![
-                    Cell::Int(29),
-                    Cell::String("Corpse E".into()),
-                    Cell::Float(2.5),
+                    Cell::Int(15),
+                    Cell::String("Human".into()),
+                    Cell::Float(1.54),
+                    Cell::Float(6.0),
+                    Cell::Float(4.66),
+                    Cell::Float(3.62),
                 ],
             )],
         );
         s.world.tables = Arc::new(t);
-        let (corpse, other) = (
-            s.world.spawn(ObjectKind::Creature, "corpse"),
+        let (human, other) = (
+            s.world.spawn(ObjectKind::Creature, "human"),
             s.world.spawn(ObjectKind::Creature, "other"),
         );
-        s.world.get_mut(corpse).unwrap().appearance = 29;
-        assert_eq!(s.move_speed(corpse), 2.5);
+        s.world.get_mut(human).unwrap().appearance = 15;
+        assert_eq!(s.move_speed(human), 6.0, "a run out of combat");
+        s.world.get_mut(human).unwrap().combat.in_combat = true;
+        assert_eq!(s.move_speed(human), 4.66, "a run in combat stance");
+        let walk = |run: i32| Command {
+            ty: 0,
+            name: "CommandMoveToLocation".into(),
+            target: None,
+            location: None,
+            seconds: 0.0,
+            ints: vec![run, 0],
+            strings: Vec::new(),
+            due: None,
+            from: None,
+            approach: None,
+            ring_wait: false,
+            path: Vec::new(),
+        };
+        assert_eq!(
+            s.command_speed(human, &walk(0)),
+            1.54,
+            "told not to run: a walk"
+        );
+        assert_eq!(s.command_speed(human, &walk(1)), 4.66);
         assert_eq!(
             s.move_speed(other),
             DEFAULT_SPEED,
