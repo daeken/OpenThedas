@@ -18,7 +18,7 @@ use thedas_vfs::Vfs;
 use crate::sim::Sim;
 use crate::trace::TraceEntry;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PlotInfo {
     pub guid: String,
     pub resref: String,
@@ -38,6 +38,19 @@ pub struct PlotInfo {
     /// job is posted this way (`lot100pt_bandits2` has field 13011 = 32: flag 5,
     /// `BANDITS2_CHANTER_BOARD`; no script sets it).
     pub initial: [u32; 4],
+    /// The plot's type (field 13022, a `plottypes.gda` row): 1 a quest, 2 the story so far,
+    /// 3 to 11 and 16 codex categories, 12 a Chanter's Board job, 13 and 15 tutorials, 14 a
+    /// quest group. Provisional: the field is inferred from the data (every `plt_cod_*` plot
+    /// has a codex type, every `*_plot_group` plot 14).
+    pub kind: i32,
+    /// The plot's priority (field 13010, 0 to 3), which orders quest groups. Provisional.
+    pub priority: i32,
+    /// The plot it belongs under (field 13017, a plot resource): a quest group for a quest, a
+    /// quest for a sub-quest. Provisional.
+    pub parent: Option<String>,
+    /// The flags that end the quest (field 13005 non-zero: 255 on a quest's reward or ending
+    /// flags). Provisional.
+    pub finals: std::collections::BTreeSet<i32>,
 }
 
 impl PlotInfo {
@@ -83,6 +96,7 @@ pub fn plots_from_gff4(g: &Gff4, resref: &str) -> Vec<PlotInfo> {
         let mut flags = BTreeMap::new();
         let mut rewards = BTreeMap::new();
         let mut journal = BTreeMap::new();
+        let mut finals = std::collections::BTreeSet::new();
         for f in structs(g, p, 13000) {
             if let (Some(id), Some(name)) =
                 (g.field(f, 13001).and_then(|v| v.as_i64()), s(g, f, 13002))
@@ -94,6 +108,9 @@ pub fn plots_from_gff4(g: &Gff4, resref: &str) -> Vec<PlotInfo> {
                     .filter(|&r| r != 0)
                 {
                     rewards.insert(id as i32, r as i32);
+                }
+                if g.field(f, 13005).and_then(|v| v.as_i64()).unwrap_or(0) != 0 {
+                    finals.insert(id as i32);
                 }
                 if let Some(Value::Tlk(t)) = g.field(f, 13004) {
                     if t.id != u32::MAX {
@@ -119,6 +136,10 @@ pub fn plots_from_gff4(g: &Gff4, resref: &str) -> Vec<PlotInfo> {
             rewards,
             journal,
             initial,
+            kind: g.field(p, 13022).and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            priority: g.field(p, 13010).and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            parent: s(g, p, 13017).map(|r| r.to_ascii_lowercase()),
+            finals,
         });
     }
     out
@@ -150,6 +171,19 @@ impl Plots {
                 self.by_key.entry(res.clone()).or_insert(p);
             }
         }
+    }
+
+    /// Every plot, once each (by GUID order).
+    pub fn all(&mut self, vfs: &Vfs) -> Vec<Arc<PlotInfo>> {
+        self.load(vfs);
+        let mut v: Vec<Arc<PlotInfo>> = self
+            .by_key
+            .iter()
+            .filter(|(k, p)| **k == p.guid)
+            .map(|(_, p)| p.clone())
+            .collect();
+        v.sort_by(|a, b| a.guid.cmp(&b.guid));
+        v
     }
 
     /// A plot by GUID or resource name.
@@ -253,6 +287,11 @@ impl Sim {
         let key = self.plot_key(plot);
         let old = self.stored_plot_flag(plot, key.clone(), flag);
         self.world.plots.insert((key.clone(), flag), value);
+        if value {
+            if let Some(info) = self.plot_info(plot) {
+                self.note_journal_flag(&info, flag);
+            }
+        }
         let t = self.world.time_ms;
         self.world.trace.push(TraceEntry::PlotFlag {
             t,
