@@ -965,6 +965,12 @@ pub fn call(
         }
         "DestroyObject" => {
             let id = obj(a, 0);
+            if h.object(id)
+                .is_some_and(|o| o.kind == ObjectKind::AreaOfEffect)
+            {
+                h.sim.destroy_aoe(id);
+                return void();
+            }
             if Some(id) != h.sim.world.hero {
                 h.sim.world.objects.remove(&id);
             }
@@ -1767,10 +1773,25 @@ pub fn call(
         }
         "Engine_ApplyEffectOnObject" | "ApplyEffectOnObject" => {
             let ability = (a.len() > 5).then(|| int(a, 5));
-            if let Some(e) =
+            if let Some(mut e) =
                 applied_effect(h, handle(a, 1), int(a, 0), float(a, 3), obj(a, 4), ability)
             {
-                h.sim.apply_effect(obj(a, 2), e);
+                let target = obj(a, 2);
+                // An area of effect on an object goes with it (see [`crate::aoe`]); the
+                // effect names it (object 0, as 0x7a0230 sets it) and takes it away when it
+                // goes.
+                let instant = constant(&h.sim.table, "EFFECT_DURATION_TYPE_INSTANT");
+                let at = h
+                    .object(target)
+                    .and_then(|o| Some((o.area?, o.position, o.facing)));
+                if let (true, Some((area, p, f))) = (
+                    e.ty == crate::aoe::EFFECT_TYPE_AOE && e.duration_type != instant,
+                    at,
+                ) {
+                    let id = h.sim.create_aoe(&e, area, p, f, Some(target), None);
+                    e.objects = vec![id];
+                }
+                h.sim.apply_effect(target, e);
             }
             void()
         }
@@ -2253,6 +2274,34 @@ pub fn call(
             void()
         }
         // Area effects and map notifications are not simulated yet.
+        // An area of effect at a location (DAOrigins.exe 0x65c830 gives the effect its
+        // duration, creator and ability, its position and orientation, and applies it to
+        // the location's area, whose type-5 handler 0x7a0230 makes the object): see
+        // [`crate::aoe`]. A temporary one lasts its duration.
+        "Engine_ApplyEffectAtLocation"
+            if matches!(h.sim.world.handle(handle(a, 1)),
+                Some(EngineData::Effect(e)) if e.ty == crate::aoe::EFFECT_TYPE_AOE) =>
+        {
+            let l = match h.sim.world.handle(handle(a, 2)) {
+                Some(EngineData::Location(l)) => *l,
+                _ => return void(),
+            };
+            if !h.object(l.area).is_some_and(|o| o.kind == ObjectKind::Area) {
+                return void();
+            }
+            let ability = (a.len() > 5).then(|| int(a, 5));
+            let Some(e) =
+                applied_effect(h, handle(a, 1), int(a, 0), float(a, 3), obj(a, 4), ability)
+            else {
+                return void();
+            };
+            let instant = constant(&h.sim.table, "EFFECT_DURATION_TYPE_INSTANT");
+            if e.duration_type != instant {
+                h.sim
+                    .create_aoe(&e, l.area, l.position, l.facing, None, e.expires);
+            }
+            void()
+        }
         "Engine_ApplyEffectAtLocation" | "ShowAreaUnlockedNotification" => {
             let effect = match h.sim.world.handle(handle(a, 1)) {
                 Some(EngineData::Effect(e)) => Some(e.ty),
@@ -3616,6 +3665,14 @@ pub fn call(
             void()
         }
         // Tactics and area-of-effect abilities are not simulated yet.
+        // The creatures inside an area of effect (DAOrigins.exe 0x672cc0, 0x7e5e60: the
+        // creatures of its area that are its members). See [`crate::aoe`].
+        "GetCreaturesInAOE" => ok(objects(h.sim.aoe_members(obj(a, 0)))),
+        // Membership of the creature (DAOrigins.exe 0x66e040, 0x6ae2b0).
+        "IsInAOE" => ok(b(h
+            .object(obj(a, 1))
+            .and_then(|o| o.aoe.as_ref())
+            .is_some_and(|s| s.members.contains(&obj(a, 0))))),
         "GetAbilitiesDueToAOEs" => ok(Value::Array {
             elem: Type::Int,
             items: Vec::new(),
