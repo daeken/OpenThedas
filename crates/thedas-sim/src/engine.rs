@@ -204,15 +204,9 @@ const PRESENTATION: &[&str] = &[
 ];
 
 /// Engine functions answered with a fixed placeholder because the simulation lacks what
-/// they need (pools, combat auto-pause, ...). Calls to
+/// they need (pools, ...). Calls to
 /// them are counted (`Trace::stubbed`) so coverage work can follow what the game uses.
-pub const STUBS: &[&str] = &[
-    "GetPlotSummary",
-    "CreatePool",
-    "GetAutoPauseCombatStatus",
-    "RevealCurrentMap",
-    "LogStoryEvent",
-];
+pub const STUBS: &[&str] = &["GetPlotSummary", "CreatePool", "LogStoryEvent"];
 
 /// `PROPERTY_DEPLETABLE_MANA_STAMINA`, the property the mana functions use (DAOrigins.exe
 /// indexes the creature's property list with 8 directly).
@@ -2249,7 +2243,15 @@ pub fn call(
             ok(objects(items))
         }
         // Presentation and platform services with no simulation state.
-        "DoAutoSave" | "TakeScreenshot" | "RevealCurrentMap" | "SetCreatureGoreLevel" => {
+        // DAOrigins.exe (0x665030) clears the fog on the current area's map. The simulation
+        // keeps the area's `MapRevealed` field for the map to read.
+        "RevealCurrentMap" => {
+            if let Some(o) = h.sim.world.area.and_then(|a| h.sim.world.get_mut(a)) {
+                o.fields.insert("MapRevealed".into(), 1);
+            }
+            void()
+        }
+        "DoAutoSave" | "TakeScreenshot" | "SetCreatureGoreLevel" => {
             h.sim.world.trace.push(TraceEntry::Log {
                 t,
                 channel: -3,
@@ -3531,7 +3533,10 @@ pub fn call(
         // Tactics set by scripts (SetTacticEntry) and presets carry no item; only the
         // player's tactics screen gives one, which the simulation does not have.
         "GetTacticCommandItemTag" => ok(Value::String(String::new())),
-        "GetAutoPauseCombatStatus" => ok(Value::Int(0)),
+        // The player's "auto-pause when combat starts" option: DAOrigins.exe (0x65e520)
+        // reads it from the game options, where it starts off (0x5e8d57) until the player's
+        // settings (`AutoPauseCombat`) say otherwise.
+        "GetAutoPauseCombatStatus" => ok(b(h.sim.auto_pause_combat)),
         "EnableWeaponTrail" => void(),
         _ => None,
     }
@@ -5055,7 +5060,9 @@ mod coverage_tests {
         void SetQuickslotBar(object o, int n) = 77;\n\
         void LockQuickslotBar(object o, int b) = 78;\n\
         int DialogIsAmbient() = 79;\n\
-        int ClearAmbientDialogs(object o = OBJECT_INVALID) = 80;\n";
+        int ClearAmbientDialogs(object o = OBJECT_INVALID) = 80;\n\
+        void RevealCurrentMap() = 81;\n\
+        int GetAutoPauseCombatStatus() = 82;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -5300,6 +5307,28 @@ mod coverage_tests {
                 "ClearAmbientDialogs",
                 &[Value::Object(OBJECT_INVALID)]
             ),
+            Some(Value::Int(1))
+        );
+        assert!(s.world.trace.stubbed.is_empty());
+    }
+
+    #[test]
+    fn the_current_map_is_revealed_and_auto_pause_follows_the_option() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        s.world.area = Some(area);
+        run(&mut s, 1, "RevealCurrentMap", &[]);
+        assert_eq!(
+            s.world.get(area).unwrap().fields.get("MapRevealed"),
+            Some(&1)
+        );
+        assert_eq!(
+            run(&mut s, 1, "GetAutoPauseCombatStatus", &[]),
+            Some(Value::Int(0))
+        );
+        s.auto_pause_combat = true;
+        assert_eq!(
+            run(&mut s, 1, "GetAutoPauseCombatStatus", &[]),
             Some(Value::Int(1))
         );
         assert!(s.world.trace.stubbed.is_empty());
