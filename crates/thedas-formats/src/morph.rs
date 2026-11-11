@@ -114,8 +114,10 @@ impl Morph {
 /// A face preset (`.mop`, GFF4 file type `MOP `): the settings character creation's face
 /// screen starts from (`chargenmorphcfg.xml` lists them per race and gender). Where a
 /// [`Morph`] holds a finished face, a preset holds the choices: the same model and tint
-/// lists, material parameters per node (a vector's index into the parameter's list, a
-/// scalar's index), texture overrides, and the weights of the face's morph targets
+/// lists, material parameters per node (a vector's index into the parameter's list of
+/// four-float vectors; a scalar's index counts the list's components, four to a vector:
+/// `g_vFacialHairWeights` 1 is the first vector's `y`, as the shipped morphs made from the
+/// presets hold them), texture overrides, and the weights of the face's morph targets
 /// (`UH_NOS_30a_0`), which the face screen blends into the head's vertices.
 ///
 /// Field meanings are read from the shipped presets (provisional).
@@ -175,6 +177,12 @@ impl MorphPreset {
             ));
         }
         let mut textures = Vec::new();
+        if let Some(s) = scalars
+            .iter()
+            .find(|s| !(0..MAX_PARAM_INDEX * 4).contains(&s.2))
+        {
+            return Err(TypedError::Invalid(format!("mop: scalar index {}", s.2)));
+        }
         for t in d.structs(root, field::PRESET_TEXTURES)? {
             textures.push((
                 text(t, field::TEXTURE_NODE)?,
@@ -203,9 +211,10 @@ impl MorphPreset {
 
 impl Morph {
     /// `self` (a finished face, the race and gender's base) with a preset's choices on it:
-    /// the preset's models and tints, its vector parameters and its textures. Provisional:
-    /// the preset's morph targets (the face's shape) and scalar parameters are not applied,
-    /// so the face keeps the base's shape and hair weights.
+    /// the preset's models and tints, its vector and scalar parameters (vectors first, then
+    /// the scalars' single components; provisional order) and its textures. The preset's
+    /// morph targets reshape the meshes separately ([`blend_targets`]), as they need the
+    /// models' vertices.
     pub fn with_preset(&self, preset: &MorphPreset) -> Morph {
         let mut m = self.clone();
         if let Some(n) = &preset.name {
@@ -253,6 +262,26 @@ impl Morph {
             }
             list[index] = *value;
         }
+        for (n, param, index, value) in &preset.scalars {
+            let i = node(&mut m, n);
+            let vectors = &mut m.nodes[i].vectors;
+            let j = match vectors
+                .iter()
+                .position(|(p, _)| p.eq_ignore_ascii_case(param))
+            {
+                Some(j) => j,
+                None => {
+                    vectors.push((param.clone(), Vec::new()));
+                    vectors.len() - 1
+                }
+            };
+            let list = &mut vectors[j].1;
+            let index = (*index).clamp(0, MAX_PARAM_INDEX * 4 - 1) as usize;
+            if list.len() <= index / 4 {
+                list.resize(index / 4 + 1, [0.0; 4]);
+            }
+            list[index / 4][index % 4] = *value;
+        }
         for (n, param, texture) in &preset.textures {
             let i = node(&mut m, n);
             let textures = &mut m.nodes[i].textures;
@@ -266,6 +295,101 @@ impl Morph {
         }
         m
     }
+}
+
+/// One morph target's mesh for a face node (`UH_NOS_30a_0`'s `FaceM1`): its weight in the
+/// preset and its vertex positions, triangle list and first texture coordinates.
+#[derive(Clone, Copy, Debug)]
+pub struct TargetMesh<'a> {
+    pub weight: f32,
+    pub positions: &'a [[f32; 4]],
+    pub indices: &'a [u32],
+    pub uvs: &'a [[f32; 4]],
+}
+
+/// A face mesh's vertices with a preset's morph targets blended in: `base + Σ wᵢ · tᵢ`.
+///
+/// A preset's weights for one mesh sum to zero: each family's neutral target
+/// (`UH_UHM_BASa_0`, `UH_UEM_BASa_0`, `UH_ULM_BASa_0`) carries minus the sum of the others,
+/// so the blend is the base plus each target's offset from the neutral, weighted. Read from
+/// the shipped presets: blending them this way reproduces the shipped morphs made from them
+/// (`hm_pcc_b02`–`b04`, `hf_pcc_b02`, `em_pcc_b02`: the faces within a millimetre at the
+/// median, a centimetre at worst). Provisional: how DAOrigins.exe blends them is not traced.
+///
+/// The target meshes have their own vertex order but the base's triangles, so a vertex is
+/// matched through the triangle corners it appears at (the corner whose texture coordinate
+/// is nearest the base vertex's, where seams split it), and copies of a vertex at one
+/// position move together. `None` when no target has the base's triangle list.
+pub fn blend_targets(
+    base: &[[f32; 4]],
+    indices: &[u32],
+    uvs: &[[f32; 4]],
+    targets: &[TargetMesh],
+) -> Option<Vec<[f32; 4]>> {
+    let mut out = base.to_vec();
+    let mut any = false;
+    for t in targets {
+        if t.indices.len() != indices.len() || t.weight == 0.0 {
+            continue;
+        }
+        let uv_gap = |b: usize, v: usize| -> f32 {
+            match (uvs.get(b), t.uvs.get(v)) {
+                (Some(a), Some(c)) => (a[0] - c[0]).abs() + (a[1] - c[1]).abs(),
+                _ => 0.0,
+            }
+        };
+        let mut map: Vec<Option<usize>> = vec![None; base.len()];
+        for (&b, &v) in indices.iter().zip(t.indices) {
+            let (b, v) = (b as usize, v as usize);
+            if b >= base.len() || v >= t.positions.len() {
+                continue;
+            }
+            match map[b] {
+                Some(old) if old == v || uv_gap(b, old) <= uv_gap(b, v) => {}
+                _ => map[b] = Some(v),
+            }
+        }
+        for (o, m) in out.iter_mut().zip(&map) {
+            if let Some(v) = m {
+                let q = t.positions[*v];
+                for k in 0..3 {
+                    o[k] += t.weight * q[k];
+                }
+            }
+        }
+        any = true;
+    }
+    if !any {
+        return None;
+    }
+    // Copies of one vertex (split at a seam) move by their mean, so the seam stays shut.
+    let key = |p: &[f32; 4]| {
+        (
+            (p[0] * 1e5).round() as i64,
+            (p[1] * 1e5).round() as i64,
+            (p[2] * 1e5).round() as i64,
+        )
+    };
+    /// The base vertices at one position, and their offsets' sum.
+    type Group = (Vec<usize>, [f32; 3]);
+    let mut groups: std::collections::HashMap<(i64, i64, i64), Group> =
+        std::collections::HashMap::new();
+    for (i, p) in base.iter().enumerate() {
+        let g = groups.entry(key(p)).or_default();
+        g.0.push(i);
+        for k in 0..3 {
+            g.1[k] += out[i][k] - p[k];
+        }
+    }
+    for (ids, sum) in groups.into_values() {
+        let n = ids.len() as f32;
+        for i in ids {
+            for k in 0..3 {
+                out[i][k] = base[i][k] + sum[k] / n;
+            }
+        }
+    }
+    Some(out)
 }
 
 /// The faces character creation's face screen offers one race and gender (`human_male`,
@@ -516,6 +640,15 @@ mod tests {
                 (field::TEXTURE_NAME, s("uh_hed_test_0d")),
             ],
         );
+        let weight = b.add(
+            b"MAT ",
+            vec![
+                (field::PARAM_NODE, s("FaceM1")),
+                (field::PARAM_NAME, s("g_vFacialHairWeights")),
+                (field::PARAM_INDEX, Value::I32(5)),
+                (field::PARAM_SCALAR, Value::F32(0.72)),
+            ],
+        );
         let target = b.add(
             b"MOD ",
             vec![
@@ -533,6 +666,7 @@ mod tests {
                 (field::TINTS, strings_value(&[Some("t1_skn_001")])),
                 (field::PRESET_NAME, s("hm_cps_p01")),
                 (field::PRESET_VECTORS, structs(&[colour])),
+                (field::SCALARS, structs(&[weight])),
                 (field::PRESET_TEXTURES, structs(&[tex])),
                 (field::TARGETS, structs(&[target])),
             ],
@@ -563,6 +697,14 @@ mod tests {
         let face = m.node("facem1").unwrap();
         assert_eq!(face.vertices.len(), 1, "the base face's shape stays");
         assert_eq!(face.textures[0].1, "uh_hed_test_0d");
+        // Scalar 5: the second vector's `y`.
+        let weights = &face
+            .vectors
+            .iter()
+            .find(|v| v.0 == "g_vFacialHairWeights")
+            .unwrap()
+            .1;
+        assert_eq!(weights, &vec![[0.0; 4], [0.0, 0.72, 0.0, 0.0]]);
     }
 
     #[test]
@@ -581,5 +723,59 @@ mod tests {
                 .is_empty()
         );
         assert!(face_screen_heads(b"<not xml", "human_male").is_err());
+    }
+
+    #[test]
+    fn targets_blend_as_offsets_from_their_neutral_through_shared_triangles() {
+        // A base triangle and two targets in another vertex order: the neutral (as the base)
+        // and one with the first corner raised.
+        let base = [
+            [0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+        ];
+        let uvs = [
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+        ];
+        let indices = [0, 1, 2];
+        let neutral = [
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let nuv = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ];
+        let raised = [
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 0.5, 1.0],
+        ];
+        let nidx = [2, 0, 1];
+        let t = |weight, positions: &'static [[f32; 4]]| TargetMesh {
+            weight,
+            positions,
+            indices: &nidx,
+            uvs: &nuv,
+        };
+        let neutral: &'static [[f32; 4]] = Box::leak(Box::new(neutral));
+        let raised: &'static [[f32; 4]] = Box::leak(Box::new(raised));
+        let out =
+            blend_targets(&base, &indices, &uvs, &[t(-0.4, neutral), t(0.4, raised)]).unwrap();
+        assert!((out[0][2] - 0.2).abs() < 1e-6, "{out:?}");
+        assert_eq!(out[1], base[1]);
+        assert_eq!(out[2], base[2]);
+        // A target with another triangle list does not apply.
+        let other = TargetMesh {
+            weight: 1.0,
+            positions: raised,
+            indices: &[0, 1, 2, 0, 1, 2],
+            uvs: &nuv,
+        };
+        assert!(blend_targets(&base, &indices, &uvs, &[other]).is_none());
     }
 }
