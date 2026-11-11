@@ -2,10 +2,21 @@
 //! the world, before the interface.
 //!
 //! A level's layout lists its effects ([`thedas_formats::level::FrameEffect`]); each names a
-//! `.ffx.xml` effect and gives values for its exposed parameters. Only `da_bloom` is drawn
-//! here: it is on all but five of the 216 layouts. `da_hsvmatrix` (204 layouts, identity on
-//! all but about sixteen) needs the engine's `ColorCurve` texture, which the data does not
-//! hold; `da_fade` and `da_dof` are on fourteen layouts between them.
+//! `.ffx.xml` effect and gives values for its exposed parameters. `da_bloom` (on all but five
+//! of the 216 layouts) and `da_hsvmatrix` (204 layouts, identity on all but about sixteen)
+//! are drawn here, in their layers' order (bloom's 10, then the matrix's 20; each reads the
+//! frame the one before left, as their `Finish` copies keep it). `da_fade` and `da_dof` are on
+//! fourteen layouts between them and not drawn.
+//!
+//! `da_hsvmatrix` (`hslmatrix.mat.xml`) runs `HSLMatrix.vsh`/`HSLMatrix.psh` over the frame:
+//! the vertex shader turns the effect's Hue, Saturation, Brightness and Contrast into three
+//! rows (see [`HsvMatrix::rows`]), and the pixel shader looks each channel's
+//! `dot((r, g, b, 1), row)` up in the `ColorCurve` texture (point filtered, clamped, at
+//! `v = 0.5`), taking that channel of the texel; alpha is 1. The engine binds `ColorCurve`
+//! (usage `ColorCurveTexture`, 0x4f8d65 → 0x4560d0) to an override when one is set (0x458990,
+//! from a game object's resource name, 0x67b1b0) and otherwise to `da_defaultcc` (loaded at
+//! 0x458cda), an identity ramp in the data: with the default curve and a level's identity
+//! values (Hue 0, Saturation 1, Brightness 1, Contrast 1) the pass changes nothing.
 //!
 //! `da_bloom` (`da_bloom.ffx.xml`, `dabloom.mat.xml`, `gaussianblur.mat.xml`) runs four
 //! filters, each mirrored here from its shader:
@@ -68,6 +79,135 @@ impl Bloom {
         })
     }
 }
+
+/// `da_hsvmatrix`'s parameters, as the level gives them (or `da_hsvmatrix.ffx.xml`'s
+/// defaults: Hue 0, Saturation 1, Brightness 1, Contrast 1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HsvMatrix {
+    /// Degrees.
+    pub hue: f32,
+    pub saturation: f32,
+    pub brightness: f32,
+    pub contrast: f32,
+}
+
+impl HsvMatrix {
+    /// The level's `da_hsvmatrix`, when it lists one.
+    pub fn from_effects(effects: &[FrameEffect]) -> Option<HsvMatrix> {
+        let e = effects
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case("da_hsvmatrix"))?;
+        let v = |name: &str, default: f32| {
+            e.parameter(name)
+                .filter(|v| v.is_finite())
+                .unwrap_or(default)
+        };
+        Some(HsvMatrix {
+            hue: v("Hue", 0.0),
+            saturation: v("Saturation", 1.0),
+            brightness: v("Brightness", 1.0),
+            contrast: v("Contrast", 1.0),
+        })
+    }
+
+    /// The rows `HSLMatrix.vsh` hands the pixel shader (`TEXCOORD1`-`3`), red, green and
+    /// blue: a saturation matrix about the luminance weights `(0.2125, 0.7154, 0.0721)`,
+    /// scaled by `contrast · brightness`, turned by `hue` about the grey axis, with
+    /// `0.5 (1 − contrast)` added. Transcribed from the shader's arithmetic.
+    pub fn rows(&self) -> [[f32; 4]; 3] {
+        let lum = [0.2125f32, 0.7154, 0.0721];
+        let (s, cb) = (self.saturation, self.contrast * self.brightness);
+        // Off-diagonal (r1) and diagonal (r3) saturation terms, scaled.
+        let off = lum.map(|l| (1.0 - s) * l * cb);
+        let diag = lum.map(|l| ((1.0 - s) * l + s) * cb);
+        // The hue angle, wrapped to [-π, π) as the shader's frc does.
+        let turn = (self.hue / 360.0 + 0.5).rem_euclid(1.0);
+        let a = turn * std::f32::consts::TAU - std::f32::consts::PI;
+        let (sin, cos) = a.sin_cos();
+        let k = sin * 0.577_350_26;
+        let h = [
+            (1.0 - cos) / 3.0 + k,
+            (1.0 - cos) / 3.0 - k,
+            1.0 / 3.0 + 2.0 / 3.0 * cos,
+        ];
+        let dot = |v: [f32; 3]| v[0] * h[0] + v[1] * h[1] + v[2] * h[2];
+        let o = 0.5 * (1.0 - self.contrast);
+        // Columns of the saturation matrix as the shader swizzles them into each row.
+        let (d, f) = (diag, off);
+        [
+            [
+                dot([f[0], f[0], d[0]]),
+                dot([d[1], f[1], f[1]]),
+                dot([f[2], d[2], f[2]]),
+                o,
+            ],
+            [
+                dot([f[0], d[0], f[0]]),
+                dot([f[1], f[1], d[1]]),
+                dot([d[2], f[2], f[2]]),
+                o,
+            ],
+            [
+                dot([d[0], f[0], f[0]]),
+                dot([f[1], d[1], f[1]]),
+                dot([f[2], f[2], d[2]]),
+                o,
+            ],
+        ]
+    }
+}
+
+/// An identity colour curve, for an install without `da_defaultcc`: 256 RGBA texels.
+/// Provisional (the engine would bind no texture).
+pub fn identity_curve() -> Vec<u8> {
+    (0..=255u8).flat_map(|v| [v, v, v, 255]).collect()
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct HsvParams {
+    rows: [[f32; 4]; 3],
+    /// The frame's size.
+    dest: [f32; 2],
+    _pad: [f32; 2],
+}
+
+const HSV_SHADER: &str = r#"
+struct HsvParams {
+    rows: array<vec4<f32>, 3>,
+    dest: vec2<f32>,
+    pad: vec2<f32>,
+};
+
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var curve: texture_2d<f32>;
+@group(0) @binding(2) var<uniform> p: HsvParams;
+@group(0) @binding(3) var smp: sampler;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let t = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(t * 2.0 - 1.0, 0.0, 1.0);
+}
+
+// The curve texel at u (point filtering, clamped), row 0.
+fn lookup(u: f32) -> vec4<f32> {
+    let w = i32(textureDimensions(curve).x);
+    let t = clamp(i32(floor(u * f32(w) + 1e-4)), 0, w - 1);
+    return textureLoad(curve, vec2<i32>(t, 0), 0);
+}
+
+// HSLMatrix.psh: each channel looked up through the colour curve. The input is sampled
+// linearly (HSVMatrixBlend.sta) at D3D9's (i, j) / size, as the bloom's passes are.
+@fragment
+fn hsv(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let c = vec4<f32>(textureSample(src, smp, (pos.xy - vec2<f32>(0.5)) / p.dest).rgb, 1.0);
+    let r = lookup(dot(c, p.rows[0])).r;
+    let g = lookup(dot(c, p.rows[1])).g;
+    let b = lookup(dot(c, p.rows[2])).b;
+    return vec4<f32>(r, g, b, 1.0);
+}
+"#;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -163,9 +303,22 @@ struct Targets {
     b: wgpu::TextureView,
 }
 
+/// `da_hsvmatrix`'s GPU state: its pipeline, layout, uniforms and colour curve.
+struct HsvPass {
+    matrix: HsvMatrix,
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+    params: wgpu::Buffer,
+    curve: wgpu::TextureView,
+    /// Reads the frame copy taken after the bloom; rebuilt with the targets.
+    group: Option<((u32, u32), wgpu::BindGroup)>,
+}
+
 /// The frame buffer effects of one level, drawn over frames of `color_format`.
 pub struct FrameEffects {
-    pub bloom: Bloom,
+    /// `da_bloom`'s parameters; with no bloom the bloom passes are skipped.
+    pub bloom: Option<Bloom>,
+    hsv: Option<HsvPass>,
     /// Taps each side of the blur's centre: three (`TwoPassBlurBloom7`) above Low detail, two
     /// (`TwoPassBlurBloom5`) at Low, as `gaussianblur.mat.xml`'s logic tests choose.
     pub blur_taps: u32,
@@ -183,13 +336,21 @@ pub struct FrameEffects {
 
 impl FrameEffects {
     /// The effects `effects` lists that are drawn here, or `None` when there are none.
+    /// `curve` is the colour curve `da_hsvmatrix` reads: RGBA texels of its first row
+    /// (`da_defaultcc`, or [`identity_curve`]).
     pub fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         effects: &[FrameEffect],
         detail: crate::scene::Detail,
         color_format: wgpu::TextureFormat,
+        curve: &[u8],
     ) -> Option<Self> {
-        let bloom = Bloom::from_effects(effects)?;
+        let bloom = Bloom::from_effects(effects);
+        let matrix = HsvMatrix::from_effects(effects);
+        if bloom.is_none() && matrix.is_none() {
+            return None;
+        }
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("frame effects"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -291,8 +452,10 @@ impl FrameEffects {
                 mapped_at_creation: false,
             })
         });
+        let hsv = matrix.map(|m| hsv_pass(device, queue, m, color_format, curve));
         Some(FrameEffects {
             bloom,
+            hsv,
             blur_taps: if detail == crate::scene::Detail::Low {
                 2
             } else {
@@ -392,7 +555,105 @@ impl FrameEffects {
         if width < 2 || height < 2 {
             return;
         }
-        let b = self.bloom;
+        self.make_targets(device, width, height);
+        if let Some(b) = self.bloom {
+            self.apply_bloom(queue, encoder, target, b, width, height);
+        }
+        if self.hsv.is_some() {
+            self.apply_hsv(device, queue, encoder, target, width, height);
+        }
+    }
+
+    fn copy_frame(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::Texture) {
+        let t = self.targets.as_ref().expect("targets made");
+        let (width, height) = t.size;
+        encoder.copy_texture_to_texture(
+            target.as_image_copy(),
+            t.copy.as_image_copy(),
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// `da_hsvmatrix` over the frame as the bloom left it.
+    fn apply_hsv(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+        width: u32,
+        height: u32,
+    ) {
+        self.copy_frame(encoder, target);
+        let t = self.targets.as_ref().expect("targets made");
+        let Some(h) = self.hsv.as_mut() else { return };
+        let p = HsvParams {
+            rows: h.matrix.rows(),
+            dest: [width as f32, height as f32],
+            _pad: [0.0; 2],
+        };
+        queue.write_buffer(&h.params, 0, bytemuck::bytes_of(&p));
+        if h.group.as_ref().map(|(s, _)| *s) != Some(t.size) {
+            let copy = t.copy.create_view(&wgpu::TextureViewDescriptor::default());
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("hsv matrix"),
+                layout: &h.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&copy),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&h.curve),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: h.params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.linear),
+                    },
+                ],
+            });
+            h.group = Some((t.size, group));
+        }
+        let frame = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("hsv matrix"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &frame,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&h.pipeline);
+        pass.set_bind_group(0, &h.group.as_ref().expect("group just made").1, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    fn apply_bloom(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+        b: Bloom,
+        width: u32,
+        height: u32,
+    ) {
         let window = [width as f32, height as f32];
         let half = [(width / 2) as f32, (height / 2) as f32];
         let params = |blur: f32, direction: [f32; 2], target: [f32; 2]| Params {
@@ -415,17 +676,8 @@ impl FrameEffects {
         for (buffer, p) in self.params.iter().zip(&all) {
             queue.write_buffer(buffer, 0, bytemuck::bytes_of(p));
         }
-        self.make_targets(device, width, height);
-        let t = self.targets.as_ref().expect("targets just made");
-        encoder.copy_texture_to_texture(
-            target.as_image_copy(),
-            t.copy.as_image_copy(),
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
+        self.copy_frame(encoder, target);
+        let t = self.targets.as_ref().expect("targets made");
         let frame = target.create_view(&wgpu::TextureViewDescriptor::default());
         let passes: [(&wgpu::RenderPipeline, &wgpu::TextureView, usize, bool); 4] = [
             (&self.mask, &t.a, 0, false),
@@ -461,6 +713,135 @@ impl FrameEffects {
     }
 }
 
+/// Builds `da_hsvmatrix`'s pipeline over frames of `color_format`, with `curve` (RGBA
+/// texels) as its colour curve.
+fn hsv_pass(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    matrix: HsvMatrix,
+    color_format: wgpu::TextureFormat,
+    curve: &[u8],
+) -> HsvPass {
+    let texels = (curve.len() / 4).max(1) as u32;
+    let identity;
+    let curve = if curve.len() >= 4 {
+        &curve[..texels as usize * 4]
+    } else {
+        identity = identity_curve();
+        &identity[..]
+    };
+    let texels = (curve.len() / 4) as u32;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("colour curve"),
+        size: wgpu::Extent3d {
+            width: texels,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        texture.as_image_copy(),
+        curve,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(texels * 4),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width: texels,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("hsv matrix"),
+        source: wgpu::ShaderSource::Wgsl(HSV_SHADER.into()),
+    });
+    let tex = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("hsv matrix"),
+        entries: &[
+            tex(0),
+            tex(1),
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("hsv matrix"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("hsv matrix"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("hsv"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    let params = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("hsv matrix"),
+        size: std::mem::size_of::<HsvParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    HsvPass {
+        matrix,
+        layout,
+        pipeline,
+        params,
+        curve: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+        group: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,6 +855,96 @@ mod tests {
         )
         .validate(&module)
         .expect("validates");
+    }
+
+    #[test]
+    fn hsv_shader_validates() {
+        let module = naga::front::wgsl::parse_str(HSV_SHADER).expect("parses");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("validates");
+    }
+
+    fn apply(rows: &[[f32; 4]; 3], c: [f32; 3]) -> [f32; 3] {
+        rows.map(|r| r[0] * c[0] + r[1] * c[1] + r[2] * c[2] + r[3])
+    }
+
+    #[test]
+    fn hsv_matrix_is_the_identity_at_its_defaults() {
+        let m = HsvMatrix::from_effects(&[FrameEffect {
+            name: "da_hsvmatrix".into(),
+            parameters: vec![("Brightness".into(), 1.0), ("Hue".into(), f32::NAN)],
+        }])
+        .unwrap();
+        assert_eq!(
+            m,
+            HsvMatrix {
+                hue: 0.0,
+                saturation: 1.0,
+                brightness: 1.0,
+                contrast: 1.0
+            }
+        );
+        let rows = m.rows();
+        for (i, r) in rows.iter().enumerate() {
+            for (j, v) in r.iter().enumerate() {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((v - want).abs() < 1e-5, "{rows:?}");
+            }
+        }
+        assert_eq!(HsvMatrix::from_effects(&[]), None);
+    }
+
+    #[test]
+    fn hsv_matrix_desaturates_scales_and_turns() {
+        let base = HsvMatrix {
+            hue: 0.0,
+            saturation: 1.0,
+            brightness: 1.0,
+            contrast: 1.0,
+        };
+        // Saturation 0: every channel the luminance.
+        let grey = HsvMatrix {
+            saturation: 0.0,
+            ..base
+        }
+        .rows();
+        let c = apply(&grey, [1.0, 0.0, 0.0]);
+        assert!(c.iter().all(|v| (v - 0.2125).abs() < 1e-5), "{c:?}");
+        // Brightness scales; contrast scales about 0.5.
+        let bright = apply(
+            &HsvMatrix {
+                brightness: 2.0,
+                ..base
+            }
+            .rows(),
+            [0.25; 3],
+        );
+        assert!(bright.iter().all(|v| (v - 0.5).abs() < 1e-5));
+        let flat = apply(
+            &HsvMatrix {
+                contrast: 0.5,
+                ..base
+            }
+            .rows(),
+            [1.0, 0.0, 0.5],
+        );
+        assert!((flat[0] - 0.75).abs() < 1e-5 && (flat[1] - 0.25).abs() < 1e-5);
+        assert!((flat[2] - 0.5).abs() < 1e-5);
+        // A hue turn keeps grey grey; at 120 degrees the shader's turn takes red to blue.
+        let turned = HsvMatrix { hue: 120.0, ..base }.rows();
+        let g = apply(&turned, [0.4; 3]);
+        assert!(g.iter().all(|v| (v - 0.4).abs() < 1e-5), "{g:?}");
+        let r = apply(&turned, [1.0, 0.0, 0.0]);
+        assert!(
+            r[2] > 0.99 && r[0].abs() < 1e-5 && r[1].abs() < 1e-5,
+            "{r:?}"
+        );
+        assert_eq!(identity_curve().len(), 1024);
+        assert_eq!(&identity_curve()[4 * 200..4 * 201], &[200, 200, 200, 255]);
     }
 
     #[test]
