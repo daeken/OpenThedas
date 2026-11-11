@@ -4301,6 +4301,7 @@ mod tests {
             rewards: Default::default(),
             journal: Default::default(),
             initial: [0; 4],
+            ..Default::default()
         });
         let guid = |s: &mut Sim, name: &str| {
             run(

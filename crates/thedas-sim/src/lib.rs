@@ -21,6 +21,7 @@ pub mod derived;
 pub mod dialog;
 pub mod engine;
 pub mod inventory;
+pub mod journal;
 pub mod levelup;
 pub mod m2da;
 pub mod nav;

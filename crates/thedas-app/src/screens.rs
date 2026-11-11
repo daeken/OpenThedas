@@ -33,6 +33,7 @@ pub enum Screen {
     Death,
     SaveLoad,
     CharGen,
+    Journal,
 }
 
 impl Screen {
@@ -55,6 +56,7 @@ impl Screen {
             Screen::SaveLoad => &["saveload.gfx", "popuplayer.gfx"],
             // Quick Play and finishing ask for confirmation on the popup layer.
             Screen::CharGen => &["chargen.gfx", "popuplayer.gfx"],
+            Screen::Journal => &["journal.gfx"],
         }
     }
 

@@ -85,6 +85,8 @@ pub struct Presentation {
     pub save_mode: i32,
     /// The slot a new save would take.
     pub open_slot: i32,
+    /// The journal, while its screen is up (the app builds it: [`thedas_sim::Sim::journal`]).
+    pub journal: Option<thedas_sim::journal::JournalView>,
 }
 
 /// A saved game as the save and load screens list it.
@@ -444,6 +446,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     store(sim, &mut v);
     party_picker(sim, shown, &mut v);
     saves(sim, shown, &mut v);
+    journal(sim, shown, &mut v);
     // The difficulty, as character creation's difficulty prompt starts from it.
     v.insert(
         "ClientOptions.GameOptions.DifficultyLevel".into(),
@@ -653,6 +656,108 @@ fn store(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
             }
         }
     }
+}
+
+/// The journal, as journal.gfx reads it: the quests in progress (`Journal.PlotList.N`) and
+/// done (`Journal.CompletedPlots.N`), each with its plot resource, name, latest entry
+/// (`Description`), quest group and parent quest (resources); the quest groups
+/// (`Journal.PlotGroups.N`: resource, name, priority, shown expanded); the codex
+/// (`Journal.CodexGroups.N`: the plot type as `CodexGroup`, its name and `CodexList.M`, each
+/// entry's resource, name, `Locked`, `Index` and `Descriptions.K`); and the quest marked
+/// active (`Journal.ActivePlot.ResRef`). Each list's own value lists its entries, so the
+/// movie's list observers fire. Nothing is marked new (`Updated`, `CodexUpdated` 0) and there
+/// is no conversation history (`Journal.Conversations`). Provisional: the layout is read from
+/// journal.gfx; the attribute names are the executable's (see [`thedas_sim::journal`]).
+fn journal(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
+    let Some(j) = &shown.journal else {
+        return;
+    };
+    let text = |s: Option<u32>| UiValue::String(s.and_then(|s| sim.string(s)).unwrap_or_default());
+    let s = |x: &str| UiValue::String(x.to_string());
+    let joined = |it: &mut dyn Iterator<Item = &str>| s(&it.collect::<Vec<_>>().join(","));
+    for (list, quests) in [("PlotList", &j.active), ("CompletedPlots", &j.completed)] {
+        v.insert(
+            format!("Journal.{list}"),
+            joined(&mut quests.iter().map(|q| q.resref.as_str())),
+        );
+        for (i, q) in quests.iter().enumerate() {
+            let k = format!("Journal.{list}.{i}");
+            v.insert(k.clone(), s(&q.resref));
+            v.insert(format!("{k}.ResRef"), s(&q.resref));
+            v.insert(format!("{k}.Name"), text(q.name));
+            v.insert(format!("{k}.Description"), text(q.description));
+            v.insert(format!("{k}.Completed"), num(q.completed as u8));
+            v.insert(format!("{k}.Updated"), num(0));
+            v.insert(format!("{k}.PlotGroup"), s(&q.group));
+            v.insert(
+                format!("{k}.ParentPlot"),
+                s(q.parent.as_deref().unwrap_or_default()),
+            );
+        }
+    }
+    v.insert(
+        "Journal.PlotGroups".into(),
+        joined(&mut j.groups.iter().map(|g| g.resref.as_str())),
+    );
+    for (i, g) in j.groups.iter().enumerate() {
+        let k = format!("Journal.PlotGroups.{i}");
+        v.insert(k.clone(), s(&g.resref));
+        v.insert(format!("{k}.ResRef"), s(&g.resref));
+        v.insert(format!("{k}.Name"), text(g.name));
+        v.insert(format!("{k}.Priority"), num(g.priority));
+        v.insert(format!("{k}.ExpandedInCurrentQuests"), num(1));
+        v.insert(format!("{k}.ExpandedInCompletedQuests"), num(1));
+    }
+    v.insert(
+        "Journal.CodexGroups".into(),
+        s(&j.codex
+            .iter()
+            .map(|g| g.kind.to_string())
+            .collect::<Vec<_>>()
+            .join(",")),
+    );
+    for (i, g) in j.codex.iter().enumerate() {
+        let k = format!("Journal.CodexGroups.{i}");
+        v.insert(k.clone(), num(g.kind));
+        v.insert(format!("{k}.CodexGroup"), num(g.kind));
+        v.insert(format!("{k}.Name"), text(g.name));
+        v.insert(
+            format!("{k}.CodexList"),
+            joined(&mut g.entries.iter().map(|e| e.resref.as_str())),
+        );
+        for (n, e) in g.entries.iter().enumerate() {
+            let c = format!("{k}.CodexList.{n}");
+            v.insert(c.clone(), s(&e.resref));
+            v.insert(format!("{c}.ResRef"), s(&e.resref));
+            v.insert(format!("{c}.Name"), text(e.name));
+            v.insert(format!("{c}.Locked"), num(e.texts.is_empty() as u8));
+            v.insert(format!("{c}.Updated"), num(0));
+            v.insert(format!("{c}.Index"), s(&(n + 1).to_string()));
+            v.insert(format!("{c}.Descriptions"), num(e.texts.len() as f64));
+            for (d, t) in e.texts.iter().enumerate() {
+                v.insert(format!("{c}.Descriptions.{d}"), text(Some(*t)));
+            }
+        }
+    }
+    // No journal notification is pending, so the screen opens on its quests (an unset
+    // `NotificationOpenPRCTab` reads as "open the downloadable content tab").
+    for k in [
+        "NotificationQuest",
+        "NotificationQuestGroup",
+        "NotificationCodex",
+        "NotificationCodexGroup",
+        "NotificationContentID",
+    ] {
+        v.insert(format!("GUIJournal.{k}"), s(""));
+    }
+    v.insert("GUIJournal.NotificationQuestIsCompleted".into(), num(0));
+    v.insert("GUIJournal.NotificationOpenPRCTab".into(), num(0));
+    v.insert("Journal.CodexUpdated".into(), num(0));
+    v.insert("Journal.Conversations".into(), s(""));
+    v.insert(
+        "Journal.ActivePlot.ResRef".into(),
+        s(j.active_quest.as_deref().unwrap_or_default()),
+    );
 }
 
 /// Character creation's own values for chargen.gfx: it is the game's creation screen, not the
@@ -1328,5 +1433,74 @@ mod tests {
         let v = sim_values_for(&sim, &saving);
         assert_eq!(v["SaveLoad.SaveFileList.0.Slot"], num(-1));
         assert_eq!(v["SaveLoad.SaveFileList.1.Slot"], num(3));
+    }
+
+    #[test]
+    fn the_journal_lists_quests_groups_and_the_codex() {
+        use thedas_sim::journal::*;
+        let sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let quest = |r: &str, parent: Option<&str>| QuestView {
+            resref: r.into(),
+            name: None,
+            description: None,
+            completed: false,
+            group: "plt_pre_plot_group".into(),
+            parent: parent.map(str::to_string),
+            seq: 0,
+        };
+        let shown = Presentation {
+            journal: Some(JournalView {
+                groups: vec![QuestGroupView {
+                    resref: "plt_pre_plot_group".into(),
+                    name: None,
+                    priority: 2,
+                }],
+                active: vec![
+                    quest("plt_tower", None),
+                    quest("plt_tower_sub", Some("plt_tower")),
+                ],
+                completed: vec![quest("plt_joining", None)],
+                codex: vec![CodexGroupView {
+                    kind: 7,
+                    name: None,
+                    entries: vec![
+                        CodexEntryView {
+                            resref: "plt_cod_cha_duncan".into(),
+                            name: None,
+                            texts: vec![1, 2],
+                        },
+                        CodexEntryView {
+                            resref: "plt_cod_cha_cailan".into(),
+                            name: None,
+                            texts: vec![],
+                        },
+                    ],
+                }],
+                active_quest: Some("plt_tower".into()),
+            }),
+            ..Default::default()
+        };
+        let v = sim_values_for(&sim, &shown);
+        let s = |x: &str| UiValue::String(x.into());
+        assert_eq!(v["Journal.PlotList"], s("plt_tower,plt_tower_sub"));
+        assert_eq!(v["Journal.PlotList.1.ParentPlot"], s("plt_tower"));
+        assert_eq!(v["Journal.PlotList.0.ParentPlot"], s(""));
+        assert_eq!(v["Journal.PlotList.0.PlotGroup"], s("plt_pre_plot_group"));
+        assert_eq!(v["Journal.CompletedPlots.0.ResRef"], s("plt_joining"));
+        assert_eq!(v["Journal.PlotGroups.0.ResRef"], s("plt_pre_plot_group"));
+        assert_eq!(v["Journal.PlotGroups.0.Priority"], num(2));
+        assert_eq!(v["Journal.CodexGroups.0.CodexGroup"], num(7));
+        assert_eq!(v["Journal.CodexGroups.0.CodexList.0.Locked"], num(0));
+        assert_eq!(v["Journal.CodexGroups.0.CodexList.1.Locked"], num(1));
+        assert_eq!(v["Journal.CodexGroups.0.CodexList.1.Index"], s("2"));
+        assert!(v.contains_key("Journal.CodexGroups.0.CodexList.0.Descriptions.1"));
+        assert_eq!(v["Journal.ActivePlot.ResRef"], s("plt_tower"));
+        assert_eq!(v["GUIJournal.NotificationOpenPRCTab"], num(0));
+        // No journal up: nothing bound.
+        assert!(!sim_values(&sim).contains_key("Journal.PlotList"));
     }
 }
