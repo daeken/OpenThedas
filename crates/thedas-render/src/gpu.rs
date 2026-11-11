@@ -427,8 +427,11 @@ pub struct AreaRenderer {
     lightmap_groups: Vec<wgpu::BindGroup>,
     stand_in: Vec<Draw>,
     d3d: crate::d3d_gpu::D3dPass,
-    opaque: Vec<DrawRef>,
-    blended: Vec<DrawRef>,
+    /// (scene draw index, draw) in drawing order.
+    opaque: Vec<(usize, DrawRef)>,
+    blended: Vec<(usize, DrawRef)>,
+    /// When set, only these scene draws are drawn (a portrait draws its member alone).
+    pub only_draws: Option<std::collections::HashSet<usize>>,
     depth: Option<(wgpu::TextureView, u32, u32)>,
     /// The level's frame buffer effects, for a renderer of the level's own meshes.
     effects: Option<crate::post::FrameEffects>,
@@ -794,8 +797,9 @@ impl AreaRenderer {
             lightmap_groups,
             stand_in,
             d3d,
-            opaque: opaque.into_iter().map(|(_, r)| r).collect(),
-            blended: blended.into_iter().map(|(_, r)| r).collect(),
+            opaque,
+            blended,
+            only_draws: None,
             depth: None,
             // Only a renderer of the level's own meshes runs its effects; the objects' scene
             // draws over it.
@@ -1071,7 +1075,14 @@ impl AreaRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        for r in self.opaque.iter().chain(&self.blended) {
+        for (di, r) in self.opaque.iter().chain(&self.blended) {
+            if self
+                .only_draws
+                .as_ref()
+                .is_some_and(|only| !only.contains(di))
+            {
+                continue;
+            }
             let d = match *r {
                 DrawRef::StandIn(i) => &self.stand_in[i],
                 DrawRef::D3d(i) => {

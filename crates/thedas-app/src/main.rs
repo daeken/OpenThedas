@@ -754,8 +754,8 @@ impl App {
             // draws use too: they are drawn (and submitted) before the frame is encoded, so
             // the frame is not drawn from the portrait camera.
             if self.screens.is_some() {
-                let party = live::portrait_subjects(&live.sim());
-                if g.ui.wants_portraits(party, dt) {
+                let key = ui::portrait_key(&live.sim());
+                if g.ui.wants_portraits(key, dt) {
                     let shots = live.portraits(&g.ctx, ui::PORTRAIT_SIZE);
                     g.ui.set_portraits(shots);
                 }
@@ -1766,8 +1766,8 @@ fn main() -> Result<()> {
                                     level.map(|x| x.layout.as_str()),
                                     level.map(|x| &x.vfs),
                                 );
-                                let party = live::portrait_subjects(&l.sim());
-                                if layer.wants_portraits(party, dt) {
+                                let key = ui::portrait_key(&l.sim());
+                                if layer.wants_portraits(key, dt) {
                                     let shots = l.portraits(&ctx, ui::PORTRAIT_SIZE);
                                     layer.set_portraits(shots);
                                 }

@@ -1,14 +1,19 @@
 //! `thedas autoplay`: plays a scenario from a save over several seeds and reports how it went,
 //! so changes to the simulation can be judged by numbers rather than single runs.
 //!
-//! The player is simple and deterministic: it takes the first reply in conversations; the
-//! party fights under autopilot (party AI); when the hero is idle and hostiles are in view it
-//! attacks one (the same one until it falls), or with `--ai-hero` leaves the hero to its own
-//! tactics as the followers are; when none are in view it walks to the nearest living hostile
-//! in the area; when the area holds none it uses a door to an area it has not been to (whose
-//! tag starts with `--exit-prefix`), levelling the party (the auto-level tables) first and at
-//! the start; it opens closed doors in its way; after each fight it waits (up to 30 s) for the
-//! party's health to come back. It drinks no potions beyond what the tactics do.
+//! The player is simple and deterministic: it takes the first reply in conversations, and the
+//! party fights under autopilot (party AI, the hero's own tactics included). It steers only
+//! when the party has been out of a fight for 30 s: it then walks towards the nearest living
+//! hostile in the area (in view or not), and when the area holds none it uses a door to an
+//! area it has not been to (whose tag starts with `--exit-prefix`), levelling the party (the
+//! auto-level tables) first and at the start; it opens closed doors in its way. After each
+//! fight it waits (up to 30 s) for the party's health to come back. It drinks no potions
+//! beyond what the tactics do. With `--player` (harness player mode, not the game's AI) it
+//! also plays the party as a human would: it puts the best gear in the pack on the party
+//! before the run and after each fight, and in fights orders talents and spells on foes and
+//! drinks health and lyrium potions when low. With `--steer` it plays as before: once hostiles are in view it
+//! orders the hero's attacks (the same target until it falls; `--ai-hero` leaves the hero to
+//! its tactics) and walks the idle party towards them, and it seeks unseen hostiles at once.
 //!
 //! Each run loads the save, reseeds the simulation's generator with the run's seed and plays
 //! until a plot flag is set, an area is reached, the whole party falls (a wipe: game over),
@@ -47,6 +52,18 @@ pub struct Options<'a> {
     /// The hero fights only through the party AI (autopilot, with its tactics), as the
     /// followers do; the player just walks it towards enemies not yet seen.
     pub ai_hero: bool,
+    /// The older harness player: it orders the hero's attacks (unless `ai_hero`) and walks
+    /// the party towards hostiles in view. Without it (the standard measurement) the party
+    /// AI alone fights, the hero included, and the harness only explores while nothing is
+    /// going on (see [`QUIET_MS`]).
+    pub steer: bool,
+    /// Harness player mode (see [`player_gear`] and [`player_act`]): the harness equips the
+    /// best gear in the pack and orders abilities and potions in fights, as a human would.
+    /// None of it is the game's AI.
+    pub player: bool,
+    /// Before anything else, walk the hero up to the first creature with this tag and talk
+    /// to it (to start an encounter that begins with that conversation).
+    pub approach: Option<&'a str>,
     /// Report how the party and its foes spent the fighting time, and their attacks.
     pub activity: bool,
     /// Followers waiting in the party pool get the hero's experience (provisional).
@@ -173,6 +190,11 @@ fn area_tag(sim: &Sim) -> String {
         .unwrap_or_default()
 }
 
+/// How long the party must have been out of a fight before the harness, in its standard mode,
+/// walks towards hostiles (seen or not) or takes a door: enemies that are coming get to
+/// arrive, and the party is not steered into a fight the game would bring to it.
+const QUIET_MS: u64 = 30_000;
+
 /// The living hostile nearest the hero in its area.
 fn nearest_hostile(sim: &Sim, hero: ObjectId) -> Option<ObjectId> {
     let h = sim.world.get(hero)?;
@@ -266,12 +288,181 @@ fn level_party(sim: &mut Sim, hero: ObjectId) {
     }
 }
 
+/// The hero and its followers.
+fn members(sim: &Sim, hero: ObjectId) -> Vec<ObjectId> {
+    let mut party = vec![hero];
+    party.extend(
+        sim.world
+            .get(hero)
+            .map(|h| h.followers.clone())
+            .unwrap_or_default(),
+    );
+    party
+}
+
+/// `PROPERTY_DEPLETABLE_HEALTH` and `PROPERTY_DEPLETABLE_MANA_STAMINA`.
+const HEALTH: i32 = 7;
+const MANA: i32 = 8;
+
+/// Harness player mode (not the game): puts the best gear in the party's pack on the party,
+/// as a player does between fights. An item replaces what a member wears in a slot only when
+/// it has the same base item type (so weapon style, armour weight and class restrictions stay
+/// as the save has them) and its armour, damage, defence and spellpower (`Sim::item_stat`)
+/// sum higher. Provisional: attribute requirements are not checked (the simulation does not
+/// model them), so it may equip something the game would refuse.
+fn player_gear(sim: &mut Sim, hero: ObjectId) {
+    const STATS: [i32; 4] = [1, 2, 3, 10];
+    let score = |sim: &Sim, i: ObjectId| STATS.iter().map(|&s| sim.item_stat(i, s)).sum::<f32>();
+    let base = |sim: &Sim, i: ObjectId| {
+        sim.world
+            .get(i)
+            .and_then(|o| o.fields.get("BaseItem").copied())
+    };
+    for m in members(sim, hero) {
+        if !alive(sim, m) {
+            continue;
+        }
+        let worn: Vec<(i32, ObjectId)> = sim
+            .world
+            .get(m)
+            .map(|o| o.equipment.iter().map(|(s, i)| (*s, *i)).collect())
+            .unwrap_or_default();
+        for (slot, cur) in worn {
+            let Some(b) = base(sim, cur) else { continue };
+            let mut best = (cur, score(sim, cur));
+            for i in sim.party_backpack() {
+                if base(sim, i) == Some(b) && sim.item_slots(i).contains(&slot) {
+                    let v = score(sim, i);
+                    if v > best.1 + 1e-3 {
+                        best = (i, v);
+                    }
+                }
+            }
+            if best.0 != cur {
+                sim.equip_item(m, best.0, slot);
+            }
+        }
+    }
+}
+
+/// An `ABI_base` cell as a number (0 when missing).
+fn abi(sim: &Sim, ability: i32, column: &str) -> f32 {
+    use thedas_formats::gda::Cell;
+    match sim
+        .world
+        .tables()
+        .get(0, "ABI_base")
+        .and_then(|t| t.cell(column, ability as i64).cloned())
+    {
+        Some(Cell::Int(v)) => v as f32,
+        Some(Cell::Float(v)) => v as f32,
+        _ => 0.0,
+    }
+}
+
+/// Harness player mode (not the game's AI), in a fight, every half second: what a human
+/// player orders. A member under 40% health drinks a health potion or poultice (the lesser
+/// first), a mage under 20% mana a lyrium potion; otherwise a member attacking (or doing
+/// nothing) uses its first ready talent or spell aimed at foes on its target, or the nearest
+/// foe it sees: an activated (`UseType` 4) talent, spell or skill (`AbilityType` 1 to 3)
+/// whose `TargetType` takes a hostile (bit 4; a place, bit 32, is aimed at the foe's feet),
+/// whose use conditions hold, whose cooldown is over and whose `cost` the member's mana or
+/// stamina covers. A member it ordered is left alone for 3 s. Sustained abilities are not
+/// switched on.
+fn player_act(
+    sim: &mut Sim,
+    hero: ObjectId,
+    ordered: &mut std::collections::BTreeMap<ObjectId, u64>,
+) {
+    let now = sim.world.time_ms;
+    let wizard = thedas_sim::sim::constant(&sim.table, "CLASS_WIZARD");
+    for m in members(sim, hero) {
+        if !alive(sim, m) || ordered.get(&m).is_some_and(|&t| now < t + 3000) {
+            continue;
+        }
+        let Some(o) = sim.world.get(m) else { continue };
+        let front = o.commands.first().map(|c| (c.name.clone(), c.target));
+        if front
+            .as_ref()
+            .is_some_and(|(n, _)| n != "CommandAttack" && n != "CommandWait")
+        {
+            continue;
+        }
+        let cur = |p: i32| o.properties.get(&p).map_or(0.0, |v| v.1);
+        let (hp, mp) = (cur(HEALTH), cur(MANA));
+        let (pos, area) = (o.position, o.area);
+        let mut seen: Vec<ObjectId> = o.combat.perceived_hostile.clone();
+        let abilities: Vec<i32> = o.abilities.iter().copied().collect();
+        seen.retain(|&f| alive(sim, f) && sim.hostile(m, f));
+        let potion = |sim: &Sim, prefix: &str| {
+            let mut all: Vec<(String, i32, i32)> = sim
+                .quick_items()
+                .into_iter()
+                .filter(|(t, a, n)| {
+                    *n > 0
+                        && t.to_ascii_lowercase().starts_with(prefix)
+                        && sim.cooldown_left(m, *a, t) == 0.0
+                })
+                .collect();
+            all.sort();
+            all.into_iter().next()
+        };
+        let class = sim.property_total(m, 27) as i32;
+        let drink = if hp < 0.4 * sim.depletable_max(m, HEALTH) {
+            potion(sim, "gen_im_qck_health")
+        } else if class == wizard && mp < 0.2 * sim.depletable_max(m, MANA) {
+            potion(sim, "gen_im_qck_mana")
+        } else {
+            None
+        };
+        if let Some((tag, ability, _)) = drink {
+            sim.order_ability(m, ability, m, &tag);
+            ordered.insert(m, now);
+            continue;
+        }
+        let target = front
+            .and_then(|(n, t)| t.filter(|_| n == "CommandAttack"))
+            .filter(|&t| alive(sim, t))
+            .or_else(|| {
+                seen.iter()
+                    .copied()
+                    .filter(|&f| sim.world.get(f).is_some_and(|x| x.area == area))
+                    .min_by(|&a, &b| {
+                        let d = |c| sim.world.get(c).map_or(f32::MAX, |x| dist(pos, x.position));
+                        d(a).total_cmp(&d(b))
+                    })
+            });
+        let Some(target) = target else { continue };
+        let usable = abilities.into_iter().find(|&a| {
+            let tt = sim.ability_target_type(a);
+            sim.ability_use_type(a) == 4
+                && (1..=3).contains(&(abi(sim, a, "AbilityType") as i32))
+                && tt & (4 | 32) != 0
+                && sim.ability_conditions_met(m, a, -1)
+                && sim.cooldown_left(m, a, "") == 0.0
+                && abi(sim, a, "cost") <= mp
+        });
+        let Some(a) = usable else { continue };
+        if sim.ability_target_type(a) & 4 != 0 {
+            sim.order_ability(m, a, target, "");
+        } else if let Some(p) = sim.world.get(target).map(|x| x.position) {
+            sim.order_ability_at(m, a, p, "");
+        }
+        ordered.insert(m, now);
+    }
+}
+
 fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult> {
     sim.load_json(save).context("loading the save")?;
     sim.world.rng = Rng::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5EED);
     sim.world.autopilot = true;
     sim.world.pool_xp = o.pool_xp;
     let hero = sim.world.hero.context("the save has no hero")?;
+    // A save taken after a wipe that the party got up from still carries the game-over
+    // latch; a run starts from a standing party, so the harness clears it.
+    if sim.world.game_over && alive(sim, hero) {
+        sim.world.game_over = false;
+    }
     let until_flag = o.until_flag.map(parse_flag).transpose()?;
     let mark_flag = o.mark_flag.map(parse_flag).transpose()?;
     let start = sim.world.time_ms;
@@ -307,6 +498,10 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
     let mut deaths = 0;
     let mut was_dead = sim.world.get(hero).is_some_and(|h| h.dead);
     level_party(sim, hero);
+    if o.player {
+        player_gear(sim, hero);
+    }
+    let mut ordered = std::collections::BTreeMap::new();
     sim.world.trace.attacks.clear();
     sim.world.trace.keep = o.trace_to.is_some();
     sim.world.trace.entries.clear();
@@ -317,6 +512,24 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
     let mut party_ids: Vec<ObjectId> = Vec::new();
     let (mut fight_ms, mut fights_won, mut last_t) = (0u64, 0u32, sim.world.time_ms);
     let mut engaged: std::collections::BTreeSet<ObjectId> = std::collections::BTreeSet::new();
+    let mut quiet_since = sim.world.time_ms;
+    if let Some(tag) = o.approach {
+        let to = sim
+            .world
+            .by_tag(tag)
+            .find(|x| x.kind == ObjectKind::Creature)
+            .map(|x| (x.id, x.position, x.area));
+        if let Some((who, p, a)) = to {
+            // One walk along the route, as the player clicks there: it stops when a
+            // conversation or a fight starts on the way.
+            sim.walk(hero, p, a);
+            // Then talk to it, as the player does by clicking it (from where the walk ended:
+            // the route may not reach it).
+            if !sim.world.party_fighting && sim.dialog_state().is_none_or(|d| d.ended) {
+                sim.start_conversation(hero, who, "");
+            }
+        }
+    }
     let end;
     loop {
         let now = sim.world.time_ms;
@@ -420,12 +633,23 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
         // After a fight, the player lets the party get its breath back (health regenerates
         // quickly out of combat) before seeking the next.
         if won {
+            if o.player {
+                player_gear(sim, hero);
+            }
             rest(sim, hero);
             continue;
         }
-        if let Some(d) = sim.dialog_state().filter(|d| !d.ended) {
-            let _ = d;
-            sim.choose_reply(0);
+        if o.player && sim.world.party_fighting && sim.dialog_state().is_none_or(|d| d.ended) {
+            player_act(sim, hero, &mut ordered);
+        }
+        // A conversation is answered with its first reply; one that has shown its last line
+        // is closed the same way, as continuing does in the game (its end may start a fight).
+        if let Some(d) = sim.dialog_state() {
+            if d.ended {
+                sim.end_conversation();
+            } else {
+                sim.choose_reply(0);
+            }
             sim.tick(0);
             continue;
         }
@@ -445,8 +669,18 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
             .world
             .get(hero)
             .is_some_and(|h| h.commands.first().is_none_or(|c| c.name == "CommandWait"));
+        if sim.world.party_fighting {
+            quiet_since = now;
+        }
+        let quiet = now.saturating_sub(quiet_since) >= QUIET_MS;
+        // The standard measurement: while a fight is on or one may be coming, the party AI
+        // alone plays; the harness waits.
+        if !o.steer && !quiet {
+            sim.tick(500);
+            continue;
+        }
         if !hostiles.is_empty() {
-            if idle && !o.ai_hero {
+            if idle && !o.ai_hero && o.steer {
                 let t = target
                     .filter(|t| hostiles.contains(t))
                     .unwrap_or(hostiles[0]);
@@ -456,7 +690,7 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
             // The party AI does not chase a hostile far from the controlled character (a
             // wolf seen 35 m off that has not noticed the party): with everyone idle, the
             // player walks toward the nearest one, as they would.
-            if idle && o.ai_hero && party_idle(sim, hero) {
+            if idle && (o.ai_hero || !o.steer) && party_idle(sim, hero) {
                 let near = hostiles.iter().copied().min_by(|&a, &b| {
                     let d = |c| {
                         sim.world.get(c).map_or(f32::MAX, |x| {
