@@ -1035,6 +1035,9 @@ impl Sim {
     fn command_duration(&self, id: ObjectId, cmd: &Command) -> u64 {
         let ms = if cmd.name == "CommandWait" {
             (cmd.seconds.max(0.0) * 1000.0) as u64
+        } else if cmd.name == "CommandSwitchWeaponSet" {
+            // Done as soon as it runs (its executor, 0x7a1ed0, returns complete).
+            0
         } else if cmd.name.starts_with("CommandMoveTo") || cmd.name.starts_with("CommandJumpTo") {
             let from = self.world.get(id).map(|o| o.position).unwrap_or_default();
             let to = cmd
@@ -1753,6 +1756,11 @@ impl Sim {
             if let Some(t) = cmd.target.filter(|&t| self.world.get(t).is_some()) {
                 self.start_conversation(id, t, "");
             }
+        } else if cmd.name == "CommandSwitchWeaponSet" {
+            // The command's executor (DAOrigins.exe 0x7a1ed0) switches the set (0x6a8fa0)
+            // and reports itself done at once.
+            let set = cmd.ints.first().copied().unwrap_or(-1);
+            self.switch_weapon_set(id, set);
         } else if cmd.name == "CommandUseObject" {
             // Using a placeable (a door, a lever) sends it EVENT_TYPE_USE, as clicking it does.
             if let Some(t) = cmd.target.filter(|&t| self.world.get(t).is_some()) {
@@ -3072,6 +3080,37 @@ mod tests {
         s.tick(1);
         assert!(s.world.get(id).unwrap().commands.is_empty());
         assert_eq!(s.world.time_ms, 2500);
+    }
+
+    #[test]
+    fn a_weapon_set_switch_command_switches_at_once() {
+        let mut s = sim();
+        let id = s.world.spawn(ObjectKind::Creature, "archer");
+        let bow = s.world.spawn(ObjectKind::Item, "bow");
+        let axe = s.world.spawn(ObjectKind::Item, "axe");
+        let o = s.world.get_mut(id).unwrap();
+        o.equipment.insert(0, bow);
+        o.other_set.insert(0, axe);
+        o.commands.push(Command {
+            ty: 0,
+            name: "CommandSwitchWeaponSet".into(),
+            target: None,
+            location: None,
+            seconds: 0.0,
+            ints: vec![1],
+            strings: Vec::new(),
+            due: None,
+            from: None,
+            approach: None,
+            ring_wait: false,
+            path: Vec::new(),
+        });
+        s.tick(1);
+        let o = s.world.get(id).unwrap();
+        assert!(o.commands.is_empty(), "done as soon as it runs");
+        assert_eq!(o.equipment.get(&0), Some(&axe), "the axe is in hand");
+        assert_eq!(o.other_set.get(&0), Some(&bow));
+        assert_eq!(o.fields.get("ActiveWeaponSet"), Some(&1));
     }
 
     #[test]

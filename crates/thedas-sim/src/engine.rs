@@ -2765,25 +2765,7 @@ pub fn call(
                 .unwrap_or(0),
         )),
         "SwitchWeaponSet" => {
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                let now = o.fields.get("ActiveWeaponSet").copied().unwrap_or(0);
-                let to = match int(a, 1) {
-                    s @ (0 | 1) => s,
-                    _ => 1 - now,
-                };
-                if to != now {
-                    for slot in crate::world::WEAPON_SET_SLOTS {
-                        let held = o.equipment.remove(&slot);
-                        if let Some(i) = o.other_set.remove(&slot) {
-                            o.equipment.insert(slot, i);
-                        }
-                        if let Some(i) = held {
-                            o.other_set.insert(slot, i);
-                        }
-                    }
-                }
-                o.fields.insert("ActiveWeaponSet".into(), to);
-            }
+            h.sim.switch_weapon_set(obj(a, 0), int(a, 1));
             void()
         }
         // The plot actions control (world state the interface shows).
@@ -3865,8 +3847,11 @@ pub fn call(
                 handle: Some(hd),
             })
         }
-        // Tactics set by scripts (SetTacticEntry) and presets carry no item; only the
-        // player's tactics screen gives one, which the simulation does not have.
+        // DAOrigins.exe (0x6614f0) returns the item tag string kept in the tactic entry
+        // (index - 1, entry + 0x128). SetTacticEntry (0x6615f0) takes no tag and the preset
+        // tables (tacticsuserpresets.gda's TacticsTable worksheets) have no item column, so
+        // only the player's tactics screen (and a save holding its rows) gives one; the
+        // simulation has neither, so every entry's tag is empty.
         "GetTacticCommandItemTag" => ok(Value::String(String::new())),
         // The player's "auto-pause when combat starts" option: DAOrigins.exe (0x65e520)
         // reads it from the game options, where it starts off (0x5e8d57) until the player's
