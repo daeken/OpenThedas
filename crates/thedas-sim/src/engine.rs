@@ -392,6 +392,11 @@ fn cluster_center(
     Some([sum[0] / k, sum[1] / k, sum[2] / k])
 }
 
+/// DAOrigins.exe's degrees-to-radians factor (0xaf14c0; a little under pi/180).
+const DEG_TO_RAD: f64 = 0.017_453_279_346_227_646;
+/// DAOrigins.exe's radians-to-degrees factor (0xaf0e50).
+const RAD_TO_DEG: f64 = 57.295_825_958_251_95;
+
 /// `PROPERTY_DEPLETABLE_MANA_STAMINA`, the property the mana functions use (DAOrigins.exe
 /// indexes the creature's property list with 8 directly).
 const PROPERTY_MANA_STAMINA: i32 = 8;
@@ -558,6 +563,27 @@ pub fn call(
         "Random" => ok(Value::Int(h.sim.world.rng.below(int(a, 0)))),
         "RandomFloat" => ok(Value::Float(h.sim.world.rng.unit())),
         "Vector" => ok(Value::Vector([float(a, 0), float(a, 1), float(a, 2)])),
+        // DAOrigins.exe's conversions (0x64f260, 0x64f310), in its own constants: an angle
+        // a (degrees) is the ground vector (-sin a, cos a, 0), and a vector's angle is
+        // atan2(-x, y) in degrees, -180 to 180 (0x4ee570).
+        "AngleToVector" => {
+            let r = -(float(a, 0) as f64) * DEG_TO_RAD;
+            ok(Value::Vector([r.sin() as f32, r.cos() as f32, 0.0]))
+        }
+        "VectorToAngle" => {
+            let v = vector(a, 0);
+            let (x, y) = (-(v[0] as f64), v[1] as f64);
+            ok(Value::Float((x.atan2(y) * RAD_TO_DEG) as f32))
+        }
+        // "%f %f %f" (0x64f9d0).
+        "VectorToString" => {
+            let v = vector(a, 0);
+            ok(Value::String(format!(
+                "{:.6} {:.6} {:.6}",
+                v[0] as f64, v[1] as f64, v[2] as f64
+            )))
+        }
+
         "GetArraySize" => ok(Value::Int(match a.first() {
             Some(Value::Array { items, .. }) => items.len() as i32,
             _ => 0,
@@ -844,6 +870,29 @@ pub fn call(
                 position: vector(a, 1),
                 facing: float(a, 2),
             };
+            let hd = h.sim.world.store(EngineData::Location(l));
+            ok(Value::Engine {
+                ty: ty.location,
+                handle: Some(hd),
+            })
+        }
+        // A location with a new position or facing (DAOrigins.exe 0x65b580, 0x65b6f0: the
+        // popped copy is changed and pushed back). An invalid location stays invalid
+        // (with its new part).
+        "SetLocationPosition" | "SetLocationFacing" => {
+            let mut l = match h.sim.world.handle(handle(a, 0)) {
+                Some(EngineData::Location(l)) => *l,
+                _ => Location {
+                    area: OBJECT_INVALID,
+                    position: [0.0; 3],
+                    facing: 0.0,
+                },
+            };
+            if name == "SetLocationPosition" {
+                l.position = vector(a, 1);
+            } else {
+                l.facing = float(a, 1);
+            }
             let hd = h.sim.world.store(EngineData::Location(l));
             ok(Value::Engine {
                 ty: ty.location,
@@ -5303,7 +5352,14 @@ mod coverage_tests {
         int GetAutoPauseCombatStatus() = 82;\n\
         location GetClusterCenter(object c, int a, int n, int f, int b) = 83;\n\
         object[] GetObjectsInShape(int m, int s, location l, float a, float b = 0.0, float c = 0.0, int d = FALSE) = 84;\n\
-        object[] FilterObjectsInShape(object[] o, int m, int s, location l, float a, float b = 0.0, float c = 0.0, int d = FALSE) = 85;\n";
+        object[] FilterObjectsInShape(object[] o, int m, int s, location l, float a, float b = 0.0, float c = 0.0, int d = FALSE) = 85;\n\
+        vector AngleToVector(float f) = 86;\n\
+        float VectorToAngle(vector v) = 87;\n\
+        string VectorToString(vector v) = 88;\n\
+        location SetLocationPosition(location l, vector v) = 89;\n\
+        location SetLocationFacing(location l, float f) = 90;\n\
+        vector GetPositionFromLocation(location l) = 91;\n\
+        float GetFacingFromLocation(location l) = 92;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -5753,6 +5809,81 @@ mod coverage_tests {
                 0
             ),
             o(&[behind, side])
+        );
+    }
+
+    #[test]
+    fn angles_vectors_and_locations_convert_as_the_engine_does() {
+        let mut s = sim();
+        let f = |s: &mut Sim, n: &str, a: &[Value]| run(s, OBJECT_INVALID, n, a).unwrap();
+        let close = |v: Value, want: [f32; 3]| match v {
+            Value::Vector(v) => (0..3).all(|i| (v[i] - want[i]).abs() < 1e-4),
+            _ => false,
+        };
+        // Facing 270 looks along +x, 0 along +y, 90 along -x.
+        assert!(close(
+            f(&mut s, "AngleToVector", &[Value::Float(270.0)]),
+            [1.0, 0.0, 0.0]
+        ));
+        assert!(close(
+            f(&mut s, "AngleToVector", &[Value::Float(0.0)]),
+            [0.0, 1.0, 0.0]
+        ));
+        assert!(close(
+            f(&mut s, "AngleToVector", &[Value::Float(90.0)]),
+            [-1.0, 0.0, 0.0]
+        ));
+        let angle = |s: &mut Sim, v: [f32; 3]| match f(s, "VectorToAngle", &[Value::Vector(v)]) {
+            Value::Float(x) => x,
+            _ => f32::NAN,
+        };
+        assert!((angle(&mut s, [1.0, 0.0, 0.0]) + 90.0).abs() < 1e-3);
+        assert!((angle(&mut s, [-2.0, 0.0, 5.0]) - 90.0).abs() < 1e-3);
+        // Straight back: -x is -0, so atan2 gives -180.
+        assert!((angle(&mut s, [0.0, -1.0, 0.0]) + 180.0).abs() < 1e-3);
+        assert_eq!(
+            f(
+                &mut s,
+                "VectorToString",
+                &[Value::Vector([1.5, -2.0, 0.25])]
+            ),
+            Value::String("1.500000 -2.000000 0.250000".into())
+        );
+        let l = f(
+            &mut s,
+            "Location",
+            &[
+                Value::Object(5),
+                Value::Vector([1.0, 2.0, 3.0]),
+                Value::Float(10.0),
+            ],
+        );
+        let moved = f(
+            &mut s,
+            "SetLocationPosition",
+            &[l.clone(), Value::Vector([7.0, 8.0, 9.0])],
+        );
+        let turned = f(
+            &mut s,
+            "SetLocationFacing",
+            &[moved.clone(), Value::Float(45.0)],
+        );
+        assert_eq!(
+            f(
+                &mut s,
+                "GetPositionFromLocation",
+                std::slice::from_ref(&turned)
+            ),
+            Value::Vector([7.0, 8.0, 9.0])
+        );
+        assert_eq!(
+            f(&mut s, "GetFacingFromLocation", &[turned]),
+            Value::Float(45.0)
+        );
+        // The location passed in is a copy: it keeps its position.
+        assert_eq!(
+            f(&mut s, "GetPositionFromLocation", &[l]),
+            Value::Vector([1.0, 2.0, 3.0])
         );
     }
 }
