@@ -204,12 +204,10 @@ const PRESENTATION: &[&str] = &[
 ];
 
 /// Engine functions answered with a fixed placeholder because the simulation lacks what
-/// they need (ambient dialog, pools, combat auto-pause, ...). Calls to
+/// they need (pools, combat auto-pause, ...). Calls to
 /// them are counted (`Trace::stubbed`) so coverage work can follow what the game uses.
 pub const STUBS: &[&str] = &[
     "GetPlotSummary",
-    "DialogIsAmbient",
-    "ClearAmbientDialogs",
     "CreatePool",
     "GetAutoPauseCombatStatus",
     "RevealCurrentMap",
@@ -2147,9 +2145,16 @@ pub fn call(
             }
             void()
         }
-        // No ambient (bark) conversations are simulated.
-        "DialogIsAmbient" => ok(Value::Int(0)),
-        "ClearAmbientDialogs" => ok(Value::Int(0)),
+        // Whether the conversation line whose condition or action is running is ambient:
+        // DAOrigins.exe (0x65dc00) returns the flag the conversation sets from the line's
+        // field 12207 before running its scripts (0x7f04ca). Provisional: another path
+        // (0x7eee00) sets it from a flag of the conversation itself, not traced; here it is
+        // always the line's.
+        "DialogIsAmbient" => ok(b(h.sim.dialog_ambient)),
+        // DAOrigins.exe (0x6510f0) stops the ambient lines still to be spoken by an object
+        // (all of them for OBJECT_INVALID) and returns TRUE. The simulation plays an ambient
+        // conversation to its end when it starts, so none are ever waiting.
+        "ClearAmbientDialogs" => ok(Value::Int(1)),
         "SetTacticPresetID" => {
             h.sim.apply_tactic_preset(obj(a, 0), int(a, 1));
             void()
@@ -5048,7 +5053,9 @@ mod coverage_tests {
         void RemoveAllEffects(object o, int i = TRUE, int d = FALSE) = 75;\n\
         void SetCreatureIsGhost(object o, int v) = 76;\n\
         void SetQuickslotBar(object o, int n) = 77;\n\
-        void LockQuickslotBar(object o, int b) = 78;\n";
+        void LockQuickslotBar(object o, int b) = 78;\n\
+        int DialogIsAmbient() = 79;\n\
+        int ClearAmbientDialogs(object o = OBJECT_INVALID) = 80;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -5278,5 +5285,23 @@ mod coverage_tests {
         set(&mut s, "LockQuickslotBar", c, -1);
         assert_eq!(field(&s, c, "Ghost"), Some(0));
         assert_eq!(field(&s, c, "QuickslotBarLocked"), Some(0));
+    }
+
+    #[test]
+    fn ambient_dialog_queries_answer_from_the_conversation() {
+        let mut s = sim();
+        assert_eq!(run(&mut s, 1, "DialogIsAmbient", &[]), Some(Value::Int(0)));
+        s.dialog_ambient = true;
+        assert_eq!(run(&mut s, 1, "DialogIsAmbient", &[]), Some(Value::Int(1)));
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "ClearAmbientDialogs",
+                &[Value::Object(OBJECT_INVALID)]
+            ),
+            Some(Value::Int(1))
+        );
+        assert!(s.world.trace.stubbed.is_empty());
     }
 }

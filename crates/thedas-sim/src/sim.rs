@@ -110,6 +110,9 @@ pub struct Sim {
     pub(crate) current_effect: Option<(crate::world::Effect, bool)>,
     /// Who the effect in `current_effect` is being applied to.
     pub(crate) current_effect_target: Option<ObjectId>,
+    /// Whether the conversation line whose condition or action last ran is ambient
+    /// (`DialogIsAmbient`; DAOrigins.exe's server flag at +0x214).
+    pub(crate) dialog_ambient: bool,
     pub(crate) talk: Option<crate::dialog::Conversation>,
     pub(crate) plots: crate::plot::Plots,
     strings: std::sync::OnceLock<std::collections::BTreeMap<u32, String>>,
@@ -287,6 +290,7 @@ impl Sim {
             watch_tags: Default::default(),
             current_effect: None,
             current_effect_target: None,
+            dialog_ambient: false,
             install_root: None,
             area_layouts: HashMap::new(),
             nav_grids: HashMap::new(),
