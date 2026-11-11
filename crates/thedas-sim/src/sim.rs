@@ -1939,7 +1939,17 @@ impl Sim {
     }
 
     /// Drops an object's front command as failed: it hears `COMMAND_COMPLETE` with the
-    /// result (a `COMMAND_FAILED_*` constant).
+    /// result (a `COMMAND_FAILED_*` constant) one update later ([`APPROACH_CHECK_MS`]).
+    ///
+    /// Every caller fails a command as it starts (its way blocked by a closed door, or no
+    /// room on the target's melee ring), before any time has passed. DAOrigins.exe runs a
+    /// command's executor once per update, so a script that answers the failure by queueing
+    /// the same command again (rules_core does, for a follower on autopilot whose target
+    /// stands behind a closed door: only the controlled character and non-followers use the
+    /// door) tries again on a later update while the game goes on. Answered at once, the
+    /// command failed and was queued again forever at the same instant and the simulation
+    /// stopped. Provisional: the delay is the simulation's stand-in for an update, not a
+    /// value read from the executable.
     /// Fails a move or approach whose way a closed door blocks
     /// (`COMMAND_FAILED_PATH_ACTION_REQUIRED`, the door as the event's object 2, where
     /// rules_core looks for it: its AI then uses the door and repeats the command).
@@ -1976,7 +1986,7 @@ impl Sim {
         if let Some(o) = self.world.get_mut(id) {
             o.combat.previous_command = Some(c);
         }
-        self.world.queue_event(0, id, ev, None);
+        self.world.queue_event(APPROACH_CHECK_MS, id, ev, None);
     }
 
     /// The earliest-finishing front command, starting the clock on fronts that have none.
@@ -3286,6 +3296,38 @@ mod tests {
         let m = s.world.spawn(ObjectKind::Module, "module");
         s.world.module = Some(m);
         m
+    }
+
+    #[test]
+    fn a_command_failing_as_it_starts_is_reported_an_update_later() {
+        let mut s = sim();
+        let c = s.world.spawn(ObjectKind::Creature, "follower");
+        s.world.get_mut(c).unwrap().script = Some("counter".into());
+        s.world.get_mut(c).unwrap().commands.push(Command {
+            ty: 1,
+            name: "CommandAttack".into(),
+            target: None,
+            location: None,
+            seconds: 0.0,
+            ints: Vec::new(),
+            strings: Vec::new(),
+            due: None,
+            from: None,
+            approach: None,
+            ring_wait: false,
+            path: Vec::new(),
+        });
+        let t0 = s.world.time_ms;
+        s.fail_front_command(c, "COMMAND_FAILED_PATH_ACTION_REQUIRED");
+        assert!(s.world.get(c).unwrap().commands.is_empty());
+        // Nothing hears it at the same instant (a script queueing the command again would
+        // fail it again there forever); the owner hears it one update on.
+        let due: Vec<u64> = s.world.queue.keys().map(|k| k.0).collect();
+        assert_eq!(due, vec![t0 + APPROACH_CHECK_MS]);
+        s.tick(APPROACH_CHECK_MS - 1);
+        assert_eq!(s.world.get(c).unwrap().locals.ints.get("n"), None);
+        s.tick(1);
+        assert_eq!(s.world.get(c).unwrap().locals.ints.get("n"), Some(&1));
     }
 
     #[test]
