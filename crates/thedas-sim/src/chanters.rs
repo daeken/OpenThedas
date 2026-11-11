@@ -12,15 +12,11 @@
 //!   when the player takes a job and `Journal.ClearChanterBoard` when it closes. Taking a job
 //!   sets its accepted flag (running the plot's script).
 //!
-//! Jobs are posted by setting their visible flags: a script (a guild box's plot script, or a
-//! finished job posting the next), or the plot file itself, whose fields 13011 to 13014 give
-//! the flags' starting values (see [`crate::plot::PlotInfo::initial`]): Lothering's first
-//! job, `BANDITS2_CHANTER_BOARD`, is set that way and by no script.
-//!
-//! The board is built as DAOrigins.exe's `ShowChantersGUI` (0x662f40 → 0x6f46a0) builds it:
-//! for each `jobboardplots` row (m2da 0x74) on the board, a plot the journal does not hold
-//! (0x6ebbf0) gets an entry (0x6f3370) when its visible flag reads set (0x75ea60, without
-//! the plot script).
+//! Open question: jobs are posted by scripts setting their visible flags (a guild box's
+//! plot script, or a finished job posting the next), but nothing in the data posts the first
+//! Lothering job (`BANDITS2_CHANTER_BOARD`), although the area marks the board as having one.
+//! The original engine may post some jobs itself (its `Journal` handles the movie's messages;
+//! the posting rule is not recovered); until that is known, only flagged jobs show.
 //!
 //! The board's contents are kept in the world while it is open, so the interface reads them
 //! without touching the simulation.
@@ -236,56 +232,6 @@ mod tests {
         assert!(!s.gui_message(MSG_ACCEPT, &["0".into()]), "already taken");
         assert!(s.gui_message(MSG_CLEAR, &[]));
         assert!(s.world.chanter_board.is_none());
-    }
-
-    #[test]
-    fn a_job_the_plot_file_starts_visible_is_on_the_board() {
-        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
-        s.world.tables().insert(
-            "jobboardplots",
-            &["#67cf4c46", "#e24463ff", "#9623699d", "#861798a2"],
-            vec![
-                (
-                    11,
-                    vec![
-                        Cell::String("bandits".into()),
-                        Cell::Int(3),
-                        Cell::Int(5),
-                        Cell::Int(0),
-                    ],
-                ),
-                (
-                    5,
-                    vec![
-                        Cell::String("bears".into()),
-                        Cell::Int(3),
-                        Cell::Int(3),
-                        Cell::Int(2),
-                    ],
-                ),
-            ],
-        );
-        for (name, initial) in [("bandits", 1 << 5), ("bears", 0)] {
-            s.plots.insert(crate::plot::PlotInfo {
-                guid: name.to_ascii_uppercase(),
-                resref: format!("plt_{name}"),
-                script: None,
-                name_strref: None,
-                flags: Default::default(),
-                rewards: Default::default(),
-                journal: Default::default(),
-                initial: [initial, 0, 0, 0],
-            });
-        }
-        s.open_chanter_board(3);
-        let jobs = &s.world.chanter_board.as_ref().unwrap().jobs;
-        assert_eq!(jobs.len(), 1, "only the job the plot file posts");
-        assert_eq!(jobs[0].plot, "bandits");
-        // A script taking it down (as accepting the job does) wins over the file's value.
-        let owner = thedas_script::vm::OBJECT_INVALID;
-        s.set_plot_flag("bandits", 5, false, false, owner);
-        s.open_chanter_board(3);
-        assert!(s.world.chanter_board.as_ref().unwrap().jobs.is_empty());
     }
 
     #[test]
