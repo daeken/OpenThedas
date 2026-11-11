@@ -987,6 +987,8 @@ impl Sim {
             from: None,
             approach: None,
             ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
             path: Vec::new(),
         };
         if let Some(o) = self.world.get_mut(attacker) {
@@ -1025,6 +1027,8 @@ impl Sim {
             from: None,
             approach: None,
             ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
             path: Vec::new(),
         };
         if let Some(o) = self.world.get_mut(who).filter(|o| o.commands.is_empty()) {
@@ -1304,6 +1308,26 @@ impl Sim {
     /// not traced; the style is read from the weapons' slots and kinds (`bitm_base.gda`),
     /// the tree from its name.
     pub fn melee_attack_ms(&mut self, id: ObjectId) -> Option<u64> {
+        let tree = self.style_tree(id)?;
+        let lengths = match self.attack_lengths.get(&tree) {
+            Some(l) => l.clone(),
+            None => {
+                let l = self.read_attack_lengths(&tree);
+                self.attack_lengths.insert(tree.clone(), l.clone());
+                l
+            }
+        };
+        if lengths.is_empty() {
+            return None;
+        }
+        let pick = self.world.rng.below(lengths.len() as i32).max(0) as usize;
+        lengths.get(pick).copied()
+    }
+
+    /// The combat animation tree of a creature (`apr_base.gda`, lower case) and the tree its
+    /// weapons pick from it ([`attack_tree`]): a humanoid's weapon-style tree, any other
+    /// creature's own combat tree. None without a combat tree.
+    fn combat_trees(&self, id: ObjectId) -> Option<(String, String)> {
         let o = self.world.get(id)?;
         let appearance = o.appearance;
         let slot_item = |slot: &str| {
@@ -1353,20 +1377,13 @@ impl Sim {
             })
             .unwrap_or(0)
         };
-        let tree = attack_tree(&tree, &kind(main), slots(main), &kind(off));
-        let lengths = match self.attack_lengths.get(&tree) {
-            Some(l) => l.clone(),
-            None => {
-                let l = self.read_attack_lengths(&tree);
-                self.attack_lengths.insert(tree.clone(), l.clone());
-                l
-            }
-        };
-        if lengths.is_empty() {
-            return None;
-        }
-        let pick = self.world.rng.below(lengths.len() as i32).max(0) as usize;
-        lengths.get(pick).copied()
+        let style = attack_tree(&tree, &kind(main), slots(main), &kind(off));
+        Some((tree, style))
+    }
+
+    /// The weapon-style tree a creature's melee attacks come from (see [`attack_tree`]).
+    fn style_tree(&self, id: ObjectId) -> Option<String> {
+        self.combat_trees(id).map(|t| t.1)
     }
 
     /// The lengths (milliseconds) of an animation tree's attack actions (`attk_v1`-`attk_v6`,
@@ -1389,6 +1406,206 @@ impl Sim {
             .collect()
     }
 }
+
+/// `ABI_base.gda` columns the cast reads: `castanim` (DAOrigins.exe 0x7a749f) and
+/// `conjureanim` (0x744559), animation ids; `speed` (0x744587), a row of
+/// `spellconjuringspeeds.gda`, whose own `speed` column (0x74463b) counts conjure loops.
+const COL_CAST_ANIM: u32 = 0xf954_09f5;
+const COL_CONJURE_ANIM: u32 = 0x9abe_aef1;
+const COL_CONJURE_SPEED: u32 = 0x07f4_f006;
+/// M2DA 0x87 (0x744641): `spellconjuringspeeds`.
+const SPELL_CONJURING_SPEEDS: i32 = 0x87;
+/// The animation tables (M2DA 0, `anim_*.gda`): the tree action an animation id plays
+/// (0x5cb558 maps the actions to ids), and the animation that follows it (0x5ca6c3: a
+/// conjure's start is followed by its loop).
+const COL_ANIM_ACTION: u32 = 0x7a39_8af9;
+const COL_ANIM_NEXT: u32 = 0xffc3_72e7;
+/// Animation event kinds that deliver an ability: the creature's animation-event handler
+/// (0x6c0bf0, its switch at 0x6c0c37) sends `ABILITY_CAST_IMPACT` on kind 7 (0x6c0c5f,
+/// 0x6af430); kind 9 goes on (0x6c0d2e, 0x694ee0) to the creature's release (0x6b6f60),
+/// which for an ability with no projectile (`ABI_base` `projectile`, 0x6b71ce) also calls
+/// 0x6af430 (0x6b7323) and otherwise launches the projectile, whose arrival sends the
+/// impact (0x7e71c0). The impact is sent once: 0x6af430 consumes the cast's slot.
+const IMPACT_EVENT_KINDS: [i64; 2] = [7, 9];
+
+/// When an ability's impact comes and when its command ends, in milliseconds from its
+/// start (see [`Sim::ability_timing`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AbilityTiming {
+    pub impact_ms: u64,
+    pub end_ms: u64,
+}
+
+impl Sim {
+    /// When a `CommandUseAbility` deals its impact and ends, from its animations, as
+    /// DAOrigins.exe plays them; None (the caller keeps its default) for an ability with no
+    /// cast animation or whose animations the creature's trees lack.
+    ///
+    /// - **Conjure** (spells: `conjureanim` set). The use-ability command (0x743f50, the
+    ///   handler of command type 25) times it at 0x7445cf-0x744665: the start animation's
+    ///   length, plus, when the following animation (the loop, `COL_ANIM_NEXT`) loops
+    ///   (0x695390), the loop's length times the conjure speed's count
+    ///   (`spellconjuringspeeds.gda`: Instant 0, Fast 1, Normal 2, Slow 4, Ritual 6). Lengths
+    ///   are the animations' `.gad` length (field 4009) in milliseconds (0x694e50 ->
+    ///   0xa5f7a0 -> 0xa38ed0: the length times 1000.0, 0xaebc00). A count of 0 leaves the
+    ///   start animation alone, so the conjure lasts its length.
+    /// - **Cast**: `castanim`'s animation (the cast step, 0x7a7440, starts it after
+    ///   `ABILITY_CAST_START`); the impact comes at its first kind 7 or 9 event (see
+    ///   `IMPACT_EVENT_KINDS`), the command ends with it.
+    ///
+    /// Provisional: which of the creature's trees supplies an action is not traced (the
+    ///   weapon's own tree, then its weapon-style tree, then its combat tree are searched, as
+    ///   the attack timings choose theirs); the cast's length and event times are scaled by
+    ///   the tree node's and animation's speeds as the attack lengths are, while the conjure
+    ///   uses the raw length as the executable does; the cast's end is taken as the command's
+    ///   end (the following `_end` animation is not counted); a projectile's flight is not
+    ///   simulated (the impact comes at the release).
+    pub fn ability_timing(&mut self, id: ObjectId, ability: i32) -> Option<AbilityTiming> {
+        let abi = self.world.tables().get(1, "")?;
+        let int = |t: &crate::m2da::Table, hash: u32, row: i64| match t.cell_by_hash(hash, row) {
+            Some(thedas_formats::gda::Cell::Int(v)) => Some(*v),
+            Some(thedas_formats::gda::Cell::Float(v)) => Some(*v as i64),
+            _ => None,
+        };
+        let cast = int(&abi, COL_CAST_ANIM, ability as i64).filter(|&c| c > 0)?;
+        let conjure = int(&abi, COL_CONJURE_ANIM, ability as i64).unwrap_or(0);
+        let speed_row = int(&abi, COL_CONJURE_SPEED, ability as i64).unwrap_or(0);
+        let anims = self.world.tables().get(0, "")?;
+        let action = |anim: i64| match anims.cell_by_hash(COL_ANIM_ACTION, anim) {
+            Some(thedas_formats::gda::Cell::String(s)) => {
+                Some(crate::engine::clean(s).to_ascii_lowercase()).filter(|s| !s.is_empty())
+            }
+            _ => None,
+        };
+        let trees = self.ability_trees(id);
+        let cast = self.ability_anim(&trees, &action(cast)?)?;
+        let cast_impact = cast.impact_ms?;
+        let conjure_ms = if conjure > 0 {
+            let start = self.ability_anim(&trees, &action(conjure)?)?;
+            let loop_ms = int(&anims, COL_ANIM_NEXT, conjure)
+                .filter(|&n| n > 0 && anim_loops(&anims, n))
+                .and_then(action)
+                .and_then(|a| self.ability_anim(&trees, &a))
+                .map(|a| a.raw_ms);
+            let count = self
+                .world
+                .tables()
+                .get(SPELL_CONJURING_SPEEDS, "")
+                .and_then(|t| int(&t, COL_CONJURE_SPEED, speed_row))
+                .unwrap_or(0)
+                .max(0) as u64;
+            match loop_ms {
+                Some(l) if count > 0 => count * l + start.raw_ms,
+                _ => start.raw_ms,
+            }
+        } else {
+            0
+        };
+        Some(AbilityTiming {
+            impact_ms: conjure_ms + cast_impact,
+            end_ms: conjure_ms + cast.len_ms.max(cast_impact),
+        })
+    }
+
+    /// The trees a creature's ability animations are looked up in, first to last: its main
+    /// weapon's own tree (`bitm_base.gda`, e.g. `Staff.anb`), its weapon-style tree, its
+    /// combat tree. Provisional (see [`Sim::ability_timing`]).
+    fn ability_trees(&self, id: ObjectId) -> Vec<String> {
+        let mut trees = Vec::new();
+        let slot = constant_of(self, "INVENTORY_SLOT_MAIN");
+        let weapon = self
+            .world
+            .get(id)
+            .and_then(|o| o.equipment.get(&slot))
+            .and_then(|w| self.world.get(*w))
+            .and_then(|w| w.fields.get("BaseItem").copied())
+            .and_then(|base| {
+                match self
+                    .world
+                    .tables()
+                    .get(6, "")?
+                    .cell_by_hash(COL_ANIM_TREE, base as i64)?
+                {
+                    thedas_formats::gda::Cell::String(s) => {
+                        Some(crate::engine::clean(s).to_ascii_lowercase())
+                    }
+                    _ => None,
+                }
+            })
+            .filter(|s| !s.is_empty());
+        trees.extend(weapon);
+        if let Some((combat, style)) = self.combat_trees(id) {
+            if style != combat {
+                trees.push(style);
+            }
+            trees.push(combat);
+        }
+        trees
+    }
+
+    /// An action's animation in the first of `trees` that has it (cached by tree and
+    /// action).
+    fn ability_anim(&mut self, trees: &[String], action: &str) -> Option<AbilityAnimLen> {
+        for tree in trees {
+            let key = format!("{tree}|{action}");
+            let found = match self.ability_anims.get(&key) {
+                Some(a) => *a,
+                None => {
+                    let a = self.read_ability_anim(tree, action);
+                    self.ability_anims.insert(key, a);
+                    a
+                }
+            };
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+
+    fn read_ability_anim(&self, tree: &str, action: &str) -> Option<AbilityAnimLen> {
+        let read = |name: &str| self.vfs.read(name).ok().map(|(d, _)| d);
+        let t = thedas_formats::anim::AnimTree::parse(&read(tree)?).ok()?;
+        let node = t.action(action)?;
+        let ani = node.animation.as_ref()?;
+        let base = ani.strip_suffix(".ani").unwrap_or(ani);
+        let info = thedas_formats::anim::AnimInfo::parse(&read(&format!("{base}.gad"))?).ok()?;
+        let speed = (node.speed * info.speed).max(0.01);
+        let events = read(&format!("{base}.evt"))
+            .and_then(|d| thedas_formats::anim::parse_events(&d).ok())
+            .unwrap_or_default();
+        let impact = events
+            .iter()
+            .filter(|e| IMPACT_EVENT_KINDS.contains(&e.kind))
+            .map(|e| e.time)
+            .min_by(f32::total_cmp);
+        Some(AbilityAnimLen {
+            raw_ms: (info.duration * 1000.0).round() as u64,
+            len_ms: (info.duration / speed * 1000.0).round() as u64,
+            impact_ms: impact.map(|t| (t / speed * 1000.0).round() as u64),
+        })
+    }
+}
+
+/// An animation's lengths for [`Sim::ability_timing`]: as the executable measures it
+/// (`raw_ms`), as it plays (`len_ms`, over its speeds), and its first impact event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AbilityAnimLen {
+    pub raw_ms: u64,
+    pub len_ms: u64,
+    pub impact_ms: Option<u64>,
+}
+
+/// Whether an animation loops: bit 0 of the animation tables' flags column (0x12a02374),
+/// as DAOrigins.exe's test (0x695390) reads it when the creature has no animation component
+/// to ask (0x6953ad -> 0x5ca610 with mask 1): set on the conjure loops (4097), clear on
+/// their starts (4096). With a component it asks the component (0xa5e940), not traced.
+fn anim_loops(anims: &crate::m2da::Table, anim: i64) -> bool {
+    matches!(anims.cell_by_hash(COL_ANIM_FLAGS, anim), Some(thedas_formats::gda::Cell::Int(v)) if v & 1 != 0)
+}
+
+/// The animation tables' flags column (see [`anim_loops`]).
+const COL_ANIM_FLAGS: u32 = 0x12a0_2374;
 
 /// The animation tree a creature's melee attacks come from: a humanoid's (`combat_humanoid`)
 /// by its weapons (the main hand's kind and slots, the off hand's kind; see
@@ -1651,6 +1868,149 @@ mod tests {
         s.world.get_mut(hero).unwrap().area = None;
         s.face_target(bandit, hero);
         assert!((s.world.get(bandit).unwrap().facing - 180.0).abs() < 1e-3);
+    }
+
+    /// A creature with the combat tree `test.anb` and the tables an ability's timing reads:
+    /// a spell (10) conjured with 244 (followed by its loop, 264) and cast with 246 at
+    /// conjure speed row `speed`, and a talent (20) cast with 147.
+    fn timed(speed: i64) -> (Sim, ObjectId) {
+        let mut s = sim();
+        let t = crate::m2da::Tables::empty();
+        t.insert(
+            "#1",
+            &["ID", "#f95409f5", "#9abeaef1", "#07f4f006"],
+            vec![
+                (
+                    10,
+                    vec![
+                        Cell::Int(10),
+                        Cell::Int(246),
+                        Cell::Int(244),
+                        Cell::Int(speed),
+                    ],
+                ),
+                (
+                    20,
+                    vec![Cell::Int(20), Cell::Int(147), Cell::Int(0), Cell::Int(3)],
+                ),
+            ],
+        );
+        let anim = |id: i64, action: &str, flags: i64| {
+            (
+                id,
+                vec![
+                    Cell::Int(id),
+                    Cell::String(action.into()),
+                    Cell::Int(flags),
+                    Cell::Int(if id == 244 { 264 } else { 1 }),
+                ],
+            )
+        };
+        t.insert(
+            "#0",
+            &["ID", "#7a398af9", "#12a02374", "#ffc372e7"],
+            vec![
+                anim(147, "talent_charge", 4096),
+                anim(244, "ua_dconjure_start", 4096),
+                anim(246, "ua_dcast", 4096),
+                anim(264, "ua_dconjure_loop", 4097),
+            ],
+        );
+        t.insert(
+            "#135",
+            &["ID", "#07f4f006"],
+            (1..=3)
+                .map(|r| (r, vec![Cell::Int(r), Cell::Int(r - 1)]))
+                .collect(),
+        );
+        t.insert(
+            "#2",
+            &["ID", "#de80b418"],
+            vec![(1, vec![Cell::Int(1), Cell::String("test.anb".into())])],
+        );
+        s.world.tables = Arc::new(t);
+        // The animations as the trees would give them: lengths and first impact event.
+        let len = |raw_ms, impact_ms| {
+            Some(AbilityAnimLen {
+                raw_ms,
+                len_ms: raw_ms,
+                impact_ms,
+            })
+        };
+        for (action, a) in [
+            ("talent_charge", len(1567, Some(970))),
+            ("ua_dconjure_start", len(467, None)),
+            ("ua_dconjure_loop", len(3400, None)),
+            ("ua_dcast", len(1333, Some(900))),
+        ] {
+            s.ability_anims.insert(format!("test.anb|{action}"), a);
+        }
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let c = s.world.spawn(ObjectKind::Creature, "caster");
+        let o = s.world.get_mut(c).unwrap();
+        o.appearance = 1;
+        o.area = Some(area);
+        (s, c)
+    }
+
+    #[test]
+    fn an_abilitys_impact_and_end_come_from_its_animations() {
+        // A talent: its cast animation's impact event, and its end.
+        let (mut s, c) = timed(1);
+        let t = s.ability_timing(c, 20).unwrap();
+        assert_eq!((t.impact_ms, t.end_ms), (970, 1567));
+        // An instant spell: the conjure's start animation, then the cast's.
+        assert_eq!(
+            s.ability_timing(c, 10),
+            Some(AbilityTiming {
+                impact_ms: 467 + 900,
+                end_ms: 467 + 1333,
+            })
+        );
+        // A fast one loops the conjure once, a normal one twice.
+        let (mut s, c) = timed(2);
+        assert_eq!(s.ability_timing(c, 10).unwrap().impact_ms, 467 + 3400 + 900);
+        let (mut s, c) = timed(3);
+        assert_eq!(
+            s.ability_timing(c, 10).unwrap().impact_ms,
+            467 + 2 * 3400 + 900
+        );
+        // No cast animation, or none in the creature's trees: no timing (the default holds).
+        assert_eq!(s.ability_timing(c, 30), None);
+        s.world.get_mut(c).unwrap().appearance = 2;
+        assert_eq!(s.ability_timing(c, 20), None);
+    }
+
+    #[test]
+    fn an_ability_lands_at_its_impact_and_its_command_ends_with_the_animation() {
+        let (mut s, c) = timed(1);
+        s.world.trace.keep = true;
+        s.order_ability(c, 20, c, "");
+        s.tick(0);
+        let t0 = s.world.time_ms;
+        let impacts = |s: &Sim| {
+            s.world
+                .trace
+                .entries
+                .iter()
+                .filter(|e| {
+                    matches!(e, crate::trace::TraceEntry::Log { text, .. }
+                        if text.starts_with("ABILITY_CAST_IMPACT"))
+                })
+                .count()
+        };
+        s.tick(969);
+        assert_eq!(impacts(&s), 0);
+        s.tick(1);
+        assert_eq!(impacts(&s), 1);
+        // The command runs on to the animation's end, without a second impact.
+        assert_eq!(s.world.get(c).unwrap().commands.len(), 1);
+        s.tick(1567 - 970 - 1);
+        assert_eq!(s.world.get(c).unwrap().commands.len(), 1);
+        s.tick(1);
+        assert!(s.world.get(c).unwrap().commands.is_empty());
+        assert_eq!(impacts(&s), 1);
+        assert_eq!(s.world.time_ms, t0 + 1567);
     }
 
     #[test]
