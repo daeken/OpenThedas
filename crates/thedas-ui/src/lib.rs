@@ -27,10 +27,13 @@ use std::sync::{Arc, Mutex};
 
 use ruffle_core::backend::navigator::NullExecutor;
 use ruffle_core::context::UpdateContext;
-use ruffle_core::events::{MouseButton, PlayerEvent};
+use ruffle_core::events::{
+    KeyDescriptor, KeyLocation, LogicalKey, MouseButton, NamedKey, PhysicalKey, PlayerEvent,
+    TextControlCode,
+};
 use ruffle_core::external::{ExternalInterfaceProvider, FsCommandProvider, Value as RValue};
 use ruffle_core::tag_utils::SwfMovieData;
-use ruffle_core::{FloatDuration, Player, PlayerBuilder};
+use ruffle_core::{FloatDuration, Player, PlayerBuilder, StageScaleMode};
 use ruffle_render_wgpu::backend::WgpuRenderBackend;
 use ruffle_render_wgpu::descriptors::Descriptors;
 use ruffle_render_wgpu::target::TextureTarget;
@@ -49,6 +52,109 @@ pub enum UiError {
     Swf(String),
     #[error("renderer: {0}")]
     Render(String),
+}
+
+/// A key for the movies: a character typed, or a key that edits text or moves its cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiKey {
+    Char(char),
+    Backspace,
+    Delete,
+    Enter,
+    Escape,
+    Tab,
+    Left,
+    Right,
+    Home,
+    End,
+    /// Ctrl+A: select the field's text (typing then replaces it).
+    SelectAll,
+}
+
+impl UiKey {
+    fn descriptor(self) -> (PhysicalKey, LogicalKey) {
+        let named = |p, n| (p, LogicalKey::Named(n));
+        match self {
+            UiKey::Char(c) => (char_physical(c), LogicalKey::Character(c)),
+            UiKey::Backspace => named(PhysicalKey::Backspace, NamedKey::Backspace),
+            UiKey::Delete => named(PhysicalKey::Delete, NamedKey::Delete),
+            UiKey::Enter => named(PhysicalKey::Enter, NamedKey::Enter),
+            UiKey::Escape => named(PhysicalKey::Escape, NamedKey::Escape),
+            UiKey::Tab => named(PhysicalKey::Tab, NamedKey::Tab),
+            UiKey::Left => named(PhysicalKey::ArrowLeft, NamedKey::ArrowLeft),
+            UiKey::Right => named(PhysicalKey::ArrowRight, NamedKey::ArrowRight),
+            UiKey::Home => named(PhysicalKey::Home, NamedKey::Home),
+            UiKey::End => named(PhysicalKey::End, NamedKey::End),
+            UiKey::SelectAll => (PhysicalKey::KeyA, LogicalKey::Character('a')),
+        }
+    }
+
+    /// The edit a text field makes for the key.
+    fn text_control(self) -> Option<TextControlCode> {
+        Some(match self {
+            UiKey::Backspace => TextControlCode::Backspace,
+            UiKey::Delete => TextControlCode::Delete,
+            UiKey::Enter => TextControlCode::Enter,
+            UiKey::Left => TextControlCode::MoveLeft,
+            UiKey::Right => TextControlCode::MoveRight,
+            UiKey::Home => TextControlCode::MoveLeftDocument,
+            UiKey::End => TextControlCode::MoveRightDocument,
+            UiKey::SelectAll => TextControlCode::SelectAll,
+            _ => return None,
+        })
+    }
+}
+
+/// The physical key that types a character on a US layout (Unknown for others).
+fn char_physical(c: char) -> PhysicalKey {
+    use PhysicalKey as P;
+    const LETTERS: [PhysicalKey; 26] = [
+        P::KeyA,
+        P::KeyB,
+        P::KeyC,
+        P::KeyD,
+        P::KeyE,
+        P::KeyF,
+        P::KeyG,
+        P::KeyH,
+        P::KeyI,
+        P::KeyJ,
+        P::KeyK,
+        P::KeyL,
+        P::KeyM,
+        P::KeyN,
+        P::KeyO,
+        P::KeyP,
+        P::KeyQ,
+        P::KeyR,
+        P::KeyS,
+        P::KeyT,
+        P::KeyU,
+        P::KeyV,
+        P::KeyW,
+        P::KeyX,
+        P::KeyY,
+        P::KeyZ,
+    ];
+    const DIGITS: [PhysicalKey; 10] = [
+        P::Digit0,
+        P::Digit1,
+        P::Digit2,
+        P::Digit3,
+        P::Digit4,
+        P::Digit5,
+        P::Digit6,
+        P::Digit7,
+        P::Digit8,
+        P::Digit9,
+    ];
+    match c {
+        'a'..='z' => LETTERS[c as usize - 'a' as usize],
+        'A'..='Z' => LETTERS[c as usize - 'A' as usize],
+        '0'..='9' => DIGITS[c as usize - '0' as usize],
+        ' ' => P::Space,
+        _ => P::Unknown,
+    }
 }
 
 /// A value passed between a movie and the application.
@@ -259,6 +365,28 @@ fn rewriting_lookup(lookup: ResourceLookup) -> ResourceLookup {
     })
 }
 
+/// How many window pixels one stage pixel takes: the movie's authored size fitted inside the
+/// window (`size`), whole, centred.
+///
+/// DAOrigins.exe leaves its movies in Scaleform's show-all scale mode (the movie root's
+/// constructor sets it, 0x95af2a, and the engine never calls `SetViewScaleMode`) and centres
+/// them (`SetViewAlignment(Align_Center)` on each new movie view, 0x514aaa). Scaleform's
+/// `Stage.width`/`height` then report the whole visible area in stage units, wider than the
+/// authored stage on a wide window; the movies anchor to that rectangle
+/// (`SceneManager.SetSafeZone`: `sm_rScreenRect` is `Stage.width` x `Stage.height` at
+/// `((OriginalStageWidth - Stage.width) / 2, ...)`). Flash (and Ruffle) report the authored
+/// size under show-all, so the stage runs in no-scale mode with this scale factor instead:
+/// the same picture, with `Stage.width`/`height` the visible area. Provisional: the
+/// visible-area reading of `Stage.width` is inferred from the movies' code, not checked
+/// against Scaleform's own.
+pub fn stage_scale(size: (u32, u32), authored: (f64, f64)) -> f64 {
+    let (w, h) = (f64::from(size.0.max(1)), f64::from(size.1.max(1)));
+    if authored.0 <= 0.0 || authored.1 <= 0.0 {
+        return 1.0;
+    }
+    (w / authored.0).min(h / authored.1)
+}
+
 /// One Scaleform movie playing into an offscreen texture.
 pub struct UiMovie {
     pub name: String,
@@ -267,6 +395,8 @@ pub struct UiMovie {
     shared: Arc<Shared>,
     fetches: navigator::FetchLog,
     size: (u32, u32),
+    /// The movie's authored stage size (pixels), which [`stage_scale`] fits to the window.
+    authored: (f64, f64),
     /// Token observers the movie registered (callback id, engine value name), in
     /// registration order: values are pushed in that order, so a movie that registers a
     /// "ready" token after the data it guards sees the data first.
@@ -308,6 +438,7 @@ impl UiMovie {
         let url = format!("{}{name}", navigator::BASE_URL);
         let movie = SwfMovieData::from_data(swf, url, None, None)
             .map_err(|e| UiError::Swf(e.to_string()))?;
+        let authored = (movie.width().to_pixels(), movie.height().to_pixels());
         let shared = Arc::new(Shared::default());
         let executor = NullExecutor::new();
         let fetches = navigator::FetchLog::default();
@@ -324,11 +455,8 @@ impl UiMovie {
             .with_log(Log(shared.clone()))
             .with_fs_commands(Box::new(bridge()))
             .with_external_interface(Box::new(bridge()))
-            .with_viewport_dimensions(size.0, size.1, 1.0)
-            // Provisional: the movies compute a screen rectangle from Stage.width/height and
-            // their authored size (SceneManager.sm_rScreenRect), which suggests Scaleform's
-            // no-scale stage, but their anchoring does not follow it yet; show-all keeps
-            // every element on screen.
+            .with_viewport_dimensions(size.0, size.1, stage_scale(size, authored))
+            .with_scale_mode(StageScaleMode::NoScale, true)
             .with_autoplay(true)
             .with_movie(movie)
             .build();
@@ -342,6 +470,7 @@ impl UiMovie {
             shared,
             fetches,
             size,
+            authored,
             observers: Default::default(),
             sent: Default::default(),
         })
@@ -355,11 +484,12 @@ impl UiMovie {
     pub fn resize(&mut self, (w, h): (u32, u32)) {
         let size = (w.clamp(1, 8192), h.clamp(1, 8192));
         self.size = size;
+        let scale_factor = stage_scale(size, self.authored);
         self.with_player(|p| {
             p.set_viewport_dimensions(ruffle_core::ViewportDimensions {
                 width: size.0,
                 height: size.1,
-                scale_factor: 1.0,
+                scale_factor,
             })
         });
     }
@@ -414,6 +544,31 @@ impl UiMovie {
 
     pub fn mouse_move(&mut self, x: f64, y: f64) {
         self.with_player(|p| p.handle_event(PlayerEvent::MouseMove { x, y }));
+    }
+
+    /// A key pressed and released: the movie's key listeners hear it (`Key.getCode`), and a
+    /// focused text field takes the character or the edit.
+    pub fn key(&mut self, key: UiKey) {
+        let (physical, logical) = key.descriptor();
+        let descriptor = || KeyDescriptor {
+            physical_key: physical,
+            logical_key: logical,
+            key_location: KeyLocation::Standard,
+        };
+        self.with_player(|p| {
+            p.handle_event(PlayerEvent::KeyDown { key: descriptor() });
+            match key {
+                UiKey::Char(c) => {
+                    p.handle_event(PlayerEvent::TextInput { codepoint: c });
+                }
+                _ => {
+                    if let Some(code) = key.text_control() {
+                        p.handle_event(PlayerEvent::TextControl { code });
+                    }
+                }
+            }
+            p.handle_event(PlayerEvent::KeyUp { key: descriptor() });
+        });
     }
 
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
@@ -548,5 +703,56 @@ impl UiMovie {
     /// Every URL the movie fetched, with whether a resource served it.
     pub fn fetches(&self) -> Vec<(String, bool)> {
         self.fetches.lock().map(|f| f.clone()).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    #[test]
+    fn keys_reach_the_player_as_its_key_and_text_events() {
+        assert_eq!(
+            UiKey::Char('a').descriptor(),
+            (PhysicalKey::KeyA, LogicalKey::Character('a'))
+        );
+        assert_eq!(
+            UiKey::Char('R').descriptor(),
+            (PhysicalKey::KeyR, LogicalKey::Character('R'))
+        );
+        assert_eq!(UiKey::Char('é').descriptor().0, PhysicalKey::Unknown);
+        assert_eq!(
+            UiKey::Enter.descriptor(),
+            (PhysicalKey::Enter, LogicalKey::Named(NamedKey::Enter))
+        );
+        assert_eq!(UiKey::Enter.text_control(), Some(TextControlCode::Enter));
+        assert_eq!(
+            UiKey::SelectAll.text_control(),
+            Some(TextControlCode::SelectAll)
+        );
+        assert_eq!(UiKey::Char('x').text_control(), None);
+        assert_eq!(UiKey::Escape.text_control(), None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_stage_fits_the_authored_movie_whole_and_reports_the_visible_area() {
+        let authored = (1024.0, 768.0);
+        // 16:9: height-limited, so the stage is wider than authored (1365 x 768 stage units).
+        let k = stage_scale((1920, 1080), authored);
+        assert!((k - 1.40625).abs() < 1e-9);
+        assert_eq!((1920.0 / k).round(), 1365.0);
+        assert_eq!((1080.0 / k).round(), 768.0);
+        // 4:3 at the authored size: one to one.
+        assert_eq!(stage_scale((1024, 768), authored), 1.0);
+        // Taller than 4:3: width-limited, the stage grows downwards instead.
+        let k = stage_scale((1000, 1000), authored);
+        assert!((1000.0 / k - 1024.0).abs() < 1e-9 && 1000.0 / k > 768.0);
+        // A movie with no size of its own is not scaled.
+        assert_eq!(stage_scale((800, 600), (0.0, 0.0)), 1.0);
     }
 }

@@ -1005,6 +1005,54 @@ impl App {
         }
     }
 
+    /// A key for a movie's focused text field: an edit (backspace, delete, enter, the arrows,
+    /// home, end, Ctrl/Cmd+A) or the text typed. Returns false when no text field has focus,
+    /// so the key is the game's. Provisional: the game forwards keys and characters to its
+    /// movies (Scaleform key and char events) by rules not traced here.
+    fn text_key(&mut self, code: KeyCode, text: Option<&str>) -> bool {
+        let Some(g) = self.gfx.as_mut() else {
+            return false;
+        };
+        if !g.ui.typing() {
+            return false;
+        }
+        use thedas_ui::UiKey;
+        let command = self.keys.iter().any(|k| {
+            matches!(
+                k,
+                KeyCode::ControlLeft
+                    | KeyCode::ControlRight
+                    | KeyCode::SuperLeft
+                    | KeyCode::SuperRight
+            )
+        });
+        let key = match code {
+            KeyCode::Backspace => Some(UiKey::Backspace),
+            KeyCode::Delete => Some(UiKey::Delete),
+            KeyCode::Enter | KeyCode::NumpadEnter => Some(UiKey::Enter),
+            KeyCode::Escape => Some(UiKey::Escape),
+            KeyCode::Tab => Some(UiKey::Tab),
+            KeyCode::ArrowLeft => Some(UiKey::Left),
+            KeyCode::ArrowRight => Some(UiKey::Right),
+            KeyCode::Home => Some(UiKey::Home),
+            KeyCode::End => Some(UiKey::End),
+            KeyCode::KeyA if command => Some(UiKey::SelectAll),
+            _ => None,
+        };
+        match key {
+            Some(k) => {
+                g.ui.key(k);
+            }
+            None if !command => {
+                for c in text.unwrap_or_default().chars().filter(|c| !c.is_control()) {
+                    g.ui.key(UiKey::Char(c));
+                }
+            }
+            None => {}
+        }
+        true
+    }
+
     /// A key pressed (not a repeat). Returns whether the game should close.
     fn key_down(&mut self, code: KeyCode) -> bool {
         match code {
@@ -1036,8 +1084,9 @@ impl App {
                 }
             }
             // The player's screens: I the inventory, C the character record, T tactics, M the
-            // area map. Provisional: the game's own key bindings are not traced.
-            KeyCode::KeyI | KeyCode::KeyC | KeyCode::KeyT | KeyCode::KeyM
+            // area map, J the journal (the executable's `ToggleJournal` action). Provisional:
+            // the game's own key bindings are not traced.
+            KeyCode::KeyI | KeyCode::KeyC | KeyCode::KeyT | KeyCode::KeyM | KeyCode::KeyJ
                 if self.screens.is_some() =>
             {
                 if let (Some(s), Some(m)) = (self.screens.as_mut(), menu_key(code)) {
@@ -1191,6 +1240,20 @@ impl App {
                 self.key_down(if mode == 1 { KeyCode::F5 } else { KeyCode::F9 });
                 log.push(format!("saves {mode}"));
             }
+            Step::Type(t) => {
+                let typed = self.gfx.as_mut().is_some_and(|g| g.ui.type_text(t));
+                log.push(format!(
+                    "type {t:?}: {}",
+                    if typed { "typed" } else { "no text field" }
+                ));
+            }
+            &Step::TextKey(k) => {
+                let typed = self.gfx.as_mut().is_some_and(|g| g.ui.key(k));
+                log.push(format!(
+                    "key {k:?}: {}",
+                    if typed { "typed" } else { "no text field" }
+                ));
+            }
             Step::Wipe => {
                 if let Some(l) = self.live.as_ref() {
                     wipe(&mut l.sim());
@@ -1202,6 +1265,7 @@ impl App {
                     screens::Screen::CharacterRecord => KeyCode::KeyC,
                     screens::Screen::Tactics => KeyCode::KeyT,
                     screens::Screen::AreaMap => KeyCode::KeyM,
+                    screens::Screen::Journal => KeyCode::KeyJ,
                     _ => KeyCode::KeyI,
                 });
                 log.push(format!("{m:?}"));
@@ -1463,6 +1527,12 @@ impl ApplicationHandler for App {
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
                 };
+                // While a movie's text field has focus, keys type into it (repeats too).
+                if event.state == ElementState::Pressed
+                    && self.text_key(code, event.text.as_deref())
+                {
+                    return;
+                }
                 match event.state {
                     ElementState::Pressed => {
                         if !event.repeat && self.key_down(code) {
@@ -1622,6 +1692,11 @@ enum Step {
     Picker,
     /// F5 or F9: the save screen (1) or the load screen (2) opens.
     Saves(i32),
+    /// Text typed into the focused text field (`type <text>`).
+    Type(String),
+    /// A key for the focused text field (`key backspace`, `enter`, `delete`, `left`, `right`,
+    /// `home`, `end`, `tab`, `escape`, `ctrl+a`).
+    TextKey(thedas_ui::UiKey),
     /// The whole party falls, as the game sees it after a wipe (for trying the death screen
     /// headless).
     Wipe,
@@ -1653,13 +1728,32 @@ enum Step {
     Release(f64, f64),
 }
 
-/// The player's screen a key opens (I, C, T).
+/// A `key` step's text-field key, by name.
+fn text_key(name: &str) -> Option<thedas_ui::UiKey> {
+    use thedas_ui::UiKey;
+    Some(match name.to_ascii_lowercase().as_str() {
+        "backspace" => UiKey::Backspace,
+        "delete" => UiKey::Delete,
+        "enter" => UiKey::Enter,
+        "escape" => UiKey::Escape,
+        "tab" => UiKey::Tab,
+        "left" => UiKey::Left,
+        "right" => UiKey::Right,
+        "home" => UiKey::Home,
+        "end" => UiKey::End,
+        "ctrl+a" => UiKey::SelectAll,
+        _ => return None,
+    })
+}
+
+/// The player's screen a key opens (I, C, T, M, J).
 fn menu_key(code: KeyCode) -> Option<screens::Screen> {
     match code {
         KeyCode::KeyI => Some(screens::Screen::Inventory),
         KeyCode::KeyC => Some(screens::Screen::CharacterRecord),
         KeyCode::KeyT => Some(screens::Screen::Tactics),
         KeyCode::KeyM => Some(screens::Screen::AreaMap),
+        KeyCode::KeyJ => Some(screens::Screen::Journal),
         _ => None,
     }
 }
@@ -1691,6 +1785,7 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
                 }
                 "key" if arg.eq_ignore_ascii_case("t") => Step::Menu(screens::Screen::Tactics),
                 "key" if arg.eq_ignore_ascii_case("m") => Step::Menu(screens::Screen::AreaMap),
+                "key" if arg.eq_ignore_ascii_case("j") => Step::Menu(screens::Screen::Journal),
                 "key" if matches!(arg.to_ascii_lowercase().as_str(), "f1" | "f2" | "f3" | "f4") => {
                     Step::Leader(arg[1..].parse::<usize>()? - 1)
                 }
@@ -1721,6 +1816,10 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
                 "rebuild" => Step::Rebuild,
                 "picker" => Step::Picker,
                 "wipe" => Step::Wipe,
+                "type" => Step::Type(arg.to_string()),
+                "key" if text_key(arg).is_some() => {
+                    Step::TextKey(text_key(arg).unwrap_or(thedas_ui::UiKey::Enter))
+                }
                 "key" if arg.eq_ignore_ascii_case("f5") => Step::Saves(1),
                 "key" if arg.eq_ignore_ascii_case("f9") => Step::Saves(2),
                 "hover" => {
@@ -1985,6 +2084,20 @@ fn main() -> Result<()> {
                         l.sim().party_picker();
                         println!("party picker");
                     }
+                    Step::Type(t) => {
+                        let typed = played.as_mut().is_some_and(|(layer, _)| layer.type_text(t));
+                        println!(
+                            "type {t:?}: {}",
+                            if typed { "typed" } else { "no text field" }
+                        );
+                    }
+                    &Step::TextKey(k) => {
+                        let typed = played.as_mut().is_some_and(|(layer, _)| layer.key(k));
+                        println!(
+                            "key {k:?}: {}",
+                            if typed { "typed" } else { "no text field" }
+                        );
+                    }
                     &Step::Saves(mode) => {
                         if let Some((layer, s)) = played.as_mut() {
                             layer.open_saves(s, mode);
@@ -2167,6 +2280,15 @@ mod tests {
             vec![Step::Talk("lot110cr_bryant".into())]
         );
         assert_eq!(parse_steps("rebuild").unwrap(), vec![Step::Rebuild]);
+        assert_eq!(
+            parse_steps("type Rowan Cousland; key backspace; key ctrl+a; key Enter").unwrap(),
+            vec![
+                Step::Type("Rowan Cousland".into()),
+                Step::TextKey(thedas_ui::UiKey::Backspace),
+                Step::TextKey(thedas_ui::UiKey::SelectAll),
+                Step::TextKey(thedas_ui::UiKey::Enter),
+            ]
+        );
         assert_eq!(
             parse_steps("hover 5,6; key F4").unwrap(),
             vec![Step::Hover(5.0, 6.0), Step::Leader(3)]
