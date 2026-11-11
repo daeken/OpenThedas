@@ -1809,6 +1809,27 @@ pub fn call(
         // and 6 (EFFECT_DURATION_TYPE_DEATH; 0x7a0c90); with bIgnoreInjuries (default TRUE)
         // also keeps injuries, abilities 500001 to 500099 (0x651850), and with bDeath keeps
         // effects whose type's effects.gda `IgnoreDeath` is set (0x651830).
+        // A lasting visual effect on an item (a weapon's glow): DAOrigins.exe (0x65d4a0)
+        // makes an effect of type 4 (EffectVisualEffect), permanent, with the VFX id as its
+        // integer 0, and gives it to the item. It stays on the item for presentation.
+        "AddItemVisualEffect" => {
+            let item = obj(a, 0);
+            let permanent = constant(&h.sim.table, "EFFECT_DURATION_TYPE_PERMANENT");
+            if let Some(o) = h
+                .sim
+                .world
+                .get_mut(item)
+                .filter(|o| o.kind == ObjectKind::Item)
+            {
+                o.effects.push(Effect {
+                    ty: 4,
+                    duration_type: permanent,
+                    ints: vec![int(a, 1)],
+                    ..Default::default()
+                });
+            }
+            void()
+        }
         "RemoveAllEffects" => {
             let (who, keep_injuries) = (obj(a, 0), a.len() < 2 || int(a, 1) != 0);
             let death = int(a, 2) != 0;
@@ -5359,7 +5380,8 @@ mod coverage_tests {
         location SetLocationPosition(location l, vector v) = 89;\n\
         location SetLocationFacing(location l, float f) = 90;\n\
         vector GetPositionFromLocation(location l) = 91;\n\
-        float GetFacingFromLocation(location l) = 92;\n";
+        float GetFacingFromLocation(location l) = 92;\n\
+        void AddItemVisualEffect(object o, int n) = 93;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -5885,5 +5907,27 @@ mod coverage_tests {
             f(&mut s, "GetPositionFromLocation", &[l]),
             Value::Vector([1.0, 2.0, 3.0])
         );
+    }
+
+    #[test]
+    fn an_item_keeps_its_visual_effect() {
+        let mut s = sim();
+        let sword = s.world.spawn(ObjectKind::Item, "sword");
+        let man = s.world.spawn(ObjectKind::Creature, "man");
+        for o in [sword, man] {
+            run(
+                &mut s,
+                o,
+                "AddItemVisualEffect",
+                &[Value::Object(o), Value::Int(1077)],
+            );
+        }
+        let e = &s.world.get(sword).unwrap().effects;
+        assert_eq!(e.len(), 1);
+        assert_eq!(
+            (e[0].ty, e[0].duration_type, e[0].ints.clone()),
+            (4, 3, vec![1077])
+        );
+        assert!(s.world.get(man).unwrap().effects.is_empty());
     }
 }
