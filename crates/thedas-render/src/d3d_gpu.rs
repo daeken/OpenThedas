@@ -23,7 +23,6 @@ use crate::d3d::{
 use crate::gpu::{DEPTH_FORMAT, GpuContext, TextureCache};
 
 /// The partitions' size as a float, for the half-pixel fix-up constant.
-const PARTITION_TEXELS: f32 = crate::shadow::PARTITION_SIZE as f32;
 use crate::scene::{
     AreaScene, DOMAIN_CHARACTERS, DOMAIN_LEVEL, SceneLight, SceneMaterial, SceneMesh,
 };
@@ -155,6 +154,8 @@ pub struct ShadowTargets {
     /// The partitions' boxes as last placed, which the next frame's smooth towards their
     /// new fit (see [`crate::shadow::partitions_smoothed`]).
     boxes: std::sync::Mutex<[Option<crate::shadow::LightBox>; 2]>,
+    /// Texels on a side of each partition (see [`crate::shadow::partition_size`]).
+    size: u32,
 }
 
 /// The passes' shadow keys (see [`ShadowTargets::keys`]).
@@ -206,7 +207,13 @@ impl ShadowTargets {
             keys: std::sync::Mutex::new(ShadowKeys::default()),
             blur: ShadowBlur::new(device, size, &t0_view_for_blur),
             boxes: std::sync::Mutex::new([None, None]),
+            size,
         }
+    }
+
+    /// Texels on a side of each partition.
+    pub fn size(&self) -> u32 {
+        self.size
     }
 
     fn frame(&self) -> Option<PlacedPartitions> {
@@ -1406,6 +1413,11 @@ impl D3dPass {
         let slot_size = SLOT[7] as usize;
         let mut data = vec![0u8; slot_size];
         let lights = DrawLights::default();
+        let texel = 1.0
+            / self
+                .shadows
+                .as_ref()
+                .map_or(crate::shadow::PARTITION_SIZE, |t| t.size()) as f32;
         for (c, seen) in self.casters.iter().zip(visible) {
             let (world, _, material) = &self.worlds[c.draw];
             let program = &self.caster_programs[c.pipeline];
@@ -1447,7 +1459,7 @@ impl D3dPass {
                     data[o + SLOT[base + 1] as usize..][..i.len()].copy_from_slice(i);
                     data[o + SLOT[base + 2] as usize..][..b.len()].copy_from_slice(b);
                 }
-                let fix = [1.0 / PARTITION_TEXELS, 1.0 / PARTITION_TEXELS, 0.0, 0.0];
+                let fix = [texel, texel, 0.0, 0.0];
                 data[SLOT[6] as usize..][..16].copy_from_slice(bytemuck::cast_slice(&fix));
                 ctx.queue.write_buffer(buffer, *slot, &data);
             }

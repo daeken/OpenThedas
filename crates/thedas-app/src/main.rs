@@ -146,7 +146,8 @@ struct Args {
     #[arg(long, default_value = "on", value_parser = ["on", "off"])]
     frame_effects: String,
     /// The original's "Graphics Detail" video option, which picks the materials' techniques
-    /// and the bloom's blur: `low`, `medium` or `high` (High draws as Medium).
+    /// and the bloom's blur: `low`, `medium` or `high` (High's materials draw as Medium's; its
+    /// sun shadows are 1024 texels a side and reach further).
     #[arg(long, default_value = "medium", value_parser = ["low", "medium", "high"])]
     detail: String,
     /// Headless: the shaders' clock (`ApplicationTime`) at the capture, in seconds; it runs
