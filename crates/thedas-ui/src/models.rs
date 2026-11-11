@@ -143,6 +143,24 @@ pub fn head_morph(sim: &Sim, o: &Object) -> Option<String> {
     (!stem.is_empty() && sim.vfs.lookup(&format!("{stem}.mor")).is_some()).then_some(stem)
 }
 
+/// Creature `o`'s gender: its `Gender` field, or its template's `Appearance Data` one (for
+/// objects saved before the simulation read that struct), male when neither says.
+fn creature_gender(sim: &Sim, o: &Object) -> i32 {
+    use thedas_formats::gff3::Value;
+    o.fields
+        .get("Gender")
+        .copied()
+        .unwrap_or_else(|| match appearance_data(sim, o, "Gender") {
+            Some(Value::Byte(v)) => v as i32,
+            Some(Value::Char(v)) => v as i32,
+            Some(Value::Word(v)) => v as i32,
+            Some(Value::Short(v)) => v as i32,
+            Some(Value::Dword(v)) => v as i32,
+            Some(Value::Int(v)) => v,
+            _ => 1,
+        })
+}
+
 /// A field of creature `o`'s template's `Appearance Data` struct.
 fn appearance_data(sim: &Sim, o: &Object, label: &str) -> Option<thedas_formats::gff3::Value> {
     use thedas_formats::gff3::{Gff3, Struct, Value};
@@ -254,7 +272,7 @@ pub fn object_models(sim: &Sim, o: &Object) -> Drawn {
             let mut prefix: Option<String> = None;
             let models = if kind.eq_ignore_ascii_case("P") {
                 let race = text(t.cell("ModelRace", app)).unwrap_or_default();
-                let gender = o.fields.get("Gender").copied().unwrap_or(1);
+                let gender = creature_gender(sim, o);
                 match part_prefix(&race, gender) {
                     Some(p) => {
                         let (mut parts, helmet) = worn_parts(sim, o, &p);
