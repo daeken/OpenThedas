@@ -3026,10 +3026,7 @@ pub fn call(
                 constant(&h.sim.table, "INVENTORY_SLOT_INVALID")
             })))
         }
-        "GetWeaponStyle" => {
-            let n = h.object(obj(a, 0)).map_or(0, |o| o.equipment.len());
-            ok(Value::Int(if n == 0 { 0 } else { 1 }))
-        }
+        "GetWeaponStyle" => ok(Value::Int(h.sim.weapon_style(obj(a, 0)))),
         // Followers fight on their own; the member the player controls is the player's.
         "IsPartyAIEnabled" => ok(b(
             h.sim.world.autopilot || Some(obj(a, 0)) != h.sim.world.controlled()
