@@ -663,6 +663,7 @@ impl Sim {
         self.regenerate(elapsed);
         self.update_threat(elapsed);
         self.expire_effects();
+        self.update_aoes();
         self.world.destroy_due();
         self.settle_quickbars();
         self.autopilot_idle_hero();
