@@ -121,7 +121,8 @@ pub struct Sim {
     pub(crate) dialog_ambient: bool,
     pub(crate) talk: Option<crate::dialog::Conversation>,
     pub(crate) plots: crate::plot::Plots,
-    strings: std::sync::OnceLock<std::collections::BTreeMap<u32, String>>,
+    /// The talk tables' strings, read once (tests set them).
+    pub(crate) strings: std::sync::OnceLock<std::collections::BTreeMap<u32, String>>,
     /// Item templates' presentation (icon, description), by template, read once.
     item_looks: std::sync::Mutex<std::collections::HashMap<String, ItemLook>>,
 }
@@ -1151,6 +1152,7 @@ impl Sim {
             return;
         };
         self.world.chargen = Some(creature);
+        self.world.chargen_mode = mode;
         let mut ev = self.chargen_event_for("CHARGEN_START", creature);
         ev.ints = vec![mode, import];
         self.world.queue_event(0, module, ev, None);
@@ -1584,11 +1586,21 @@ impl Sim {
         if blocked.is_empty() {
             return Routed::Path(p);
         }
+        let cell_of = |q: [f32; 3]| g.cell(q).map(|c| (c.1 * g.columns + c.0) as usize);
+        // A destination inside a closed door (walking to the door itself) is reached at the
+        // door: the walk ends where the route would enter it.
+        let goal_door = cell_of(to).and_then(|i| doors.iter().find(|d| d.1.contains(&i)));
         // The first closed door the open-door route goes through.
-        for q in &p {
-            if let Some(c) = g.cell(*q) {
-                let i = (c.1 * g.columns + c.0) as usize;
+        for (n, q) in p.iter().enumerate() {
+            if let Some(i) = cell_of(*q) {
                 if let Some((door, _)) = doors.iter().find(|d| d.1.contains(&i)) {
+                    if goal_door.is_some_and(|g| g.0 == *door) {
+                        let mut up_to = p[..n].to_vec();
+                        if up_to.is_empty() {
+                            up_to.push(from);
+                        }
+                        return Routed::Path(up_to);
+                    }
                     return Routed::Door(*door);
                 }
             }
@@ -2769,6 +2781,14 @@ impl Sim {
         o.name
             .clone()
             .or_else(|| o.name_strref.and_then(|s| self.string(s)))
+            // A hero nobody named (quick start: the chargen script picks a character but no
+            // name) goes by the name character creation would have offered. Provisional: the
+            // executable's choice for an unnamed hero is not traced.
+            .or_else(|| {
+                (self.world.hero == Some(id))
+                    .then(|| self.default_first_name(id))
+                    .flatten()
+            })
             .unwrap_or_else(|| o.tag.clone())
     }
 

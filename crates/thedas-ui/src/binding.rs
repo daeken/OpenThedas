@@ -444,6 +444,12 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     store(sim, &mut v);
     party_picker(sim, shown, &mut v);
     saves(sim, shown, &mut v);
+    // The difficulty, as character creation's difficulty prompt starts from it.
+    v.insert(
+        "ClientOptions.GameOptions.DifficultyLevel".into(),
+        num(sim.world.difficulty),
+    );
+    chargen_screen(sim, &mut v);
     // No tutorials are queued: popuplayer.gfx hides its tutorial panel when it sees the empty
     // list (`Tutorials.TutorialList`, observed). Provisional: the game's tutorial queue is
     // not modelled.
@@ -647,6 +653,18 @@ fn store(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
             }
         }
     }
+}
+
+/// Character creation's own values for chargen.gfx: it is the game's creation screen, not the
+/// toolset's character creator (`GUICharGen.CharCreatorRunning` 0), and importing a hero
+/// from another module is off (`ImportEnabled` 0: there are no other modules' saves).
+/// Provisional: read from the movie.
+fn chargen_screen(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
+    if sim.world.chargen.is_none() || sim.world.chargen_mode != 0 {
+        return;
+    }
+    v.insert("GUICharGen.CharCreatorRunning".into(), num(0));
+    v.insert("GUICharGen.ImportEnabled".into(), num(0));
 }
 
 /// The saved games, as saveload.gfx and deathscreen.gfx read them: the screen's mode, the
