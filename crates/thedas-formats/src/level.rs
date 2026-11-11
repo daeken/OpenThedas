@@ -34,7 +34,13 @@ pub mod field {
     pub const ATMO_FOG_INTENSITY: u32 = 22530;
     pub const ATMO_FOG_CAP: u32 = 22531;
     pub const ATMO_FOG_ZENITH: u32 = 22532;
+    pub const ATMO_FOG_WATER_INTENSITY: u32 = 22533;
+    pub const ATMO_FOG_WATER_CAP: u32 = 22534;
     pub const ATMO_FOG_TACTICAL: u32 = 22535;
+    pub const ATMO_MOON_SCALE: u32 = 22700;
+    pub const ATMO_MOON_ALPHA: u32 = 22701;
+    pub const ATMO_MOON_CLOUD_ALPHA: u32 = 22702;
+    pub const ATMO_MOON_ROTATION: u32 = 22703;
     pub const ARL_CLOUDS: u32 = 22600;
     pub const CLOUD_DENSITY: u32 = 22620;
     pub const CLOUD_SHARPNESS: u32 = 22621;
@@ -119,6 +125,10 @@ pub struct Arl {
     pub grid: Option<NavGrid>,
     /// The level's sun, when it has one (exteriors).
     pub sun: Option<Sun>,
+    /// The sunlight direction (3150) as stored, whatever [`Arl::sun`] makes of it: the
+    /// direction the sky's celestial body is placed against (DAOrigins.exe's layout loader
+    /// keeps it at 0x5d14e4 whether or not the sun lights anything).
+    pub sunlight_direction: Option<[f32; 3]>,
     /// The frame buffer effects the level runs over each frame, in the order listed.
     pub effects: Vec<FrameEffect>,
     /// The sky model drawn around the camera (3025, e.g. `sb_day`), when the level has one.
@@ -147,10 +157,15 @@ pub struct Clouds {
 ///
 /// Field names are xoreos's (read for the format only). Which fields the engine reads, and
 /// their defaults, are DAOrigins.exe's loader's (0x5d00ce): every field reads 0 when absent
-/// except `alpha` (1); 22525 (in-scatter power) and 22527 (phase eccentricity) are not
-/// read, and the water fog fields are not kept here.
+/// except `alpha` (1), the water fog (the fog's own intensity and cap), the celestial body
+/// (the atmosphere preset 0x55c910 keeps scale 10, the rest 0) and the sun colour (see
+/// [`Atmosphere::sun_color`]); 22525 (in-scatter power) and 22527 (phase eccentricity) are
+/// not read.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Atmosphere {
+    /// Field 22519. When absent, the loader takes the layout's sunlight colour (3152) if its
+    /// luminance (`0.299 |r| + 0.587 |g| + 0.114 |b|`) exceeds 0.1, white otherwise
+    /// (0x5d06d6).
     pub sun_color: [f32; 3],
     pub sun_intensity: f32,
     pub turbidity: f32,
@@ -167,6 +182,18 @@ pub struct Atmosphere {
     pub fog_zenith: f32,
     /// How much of the fog the tactical (zoomed-out) camera sees.
     pub fog_tactical: f32,
+    /// The water fog's intensity (22533; the fog's when absent).
+    pub water_fog_intensity: f32,
+    /// The water fog's cap (22534; the fog's when absent).
+    pub water_fog_cap: f32,
+    /// The celestial body the sky draws (the sky material's `CelestialBody` texture: the
+    /// sun on `sb_day`): its size (22700, as a divisor of the dome's coordinates), its
+    /// opacity (22701), its opacity through clouds (22702) and its rotation about its own
+    /// axis (22703, radians). xoreos calls these the moon's.
+    pub moon_scale: f32,
+    pub moon_alpha: f32,
+    pub moon_cloud_alpha: f32,
+    pub moon_rotation: f32,
 }
 
 /// One of a level's frame buffer effects: the `.ffx.xml` effect it names (`da_bloom`,
@@ -365,16 +392,30 @@ impl Arl {
         }
         let atmosphere = match d.opt_struct(root, field::ARL_ATMOSPHERE)? {
             Some(a) => {
-                let f = |l| -> TypedResult<f32> {
-                    Ok(d.opt_f32(a, l)?.filter(|v| v.is_finite()).unwrap_or(0.0))
+                let o = |l| -> TypedResult<Option<f32>> {
+                    Ok(d.opt_f32(a, l)?.filter(|v| v.is_finite()))
                 };
-                let c = |l| -> TypedResult<[f32; 3]> {
+                let f = |l| -> TypedResult<f32> { Ok(o(l)?.unwrap_or(0.0)) };
+                let oc = |l| -> TypedResult<Option<[f32; 3]>> {
                     Ok(d.opt_vec3(a, l)?
-                        .filter(|v| v.iter().all(|x| x.is_finite()))
-                        .unwrap_or([0.0; 3]))
+                        .filter(|v| v.iter().all(|x| x.is_finite())))
                 };
+                let c = |l| -> TypedResult<[f32; 3]> { Ok(oc(l)?.unwrap_or([0.0; 3])) };
+                let sun_color = match oc(field::ATMO_SUN_COLOR)? {
+                    Some(c) => c,
+                    None => {
+                        let l = d
+                            .opt_vec3(root, field::ARL_SUN_COLOR)?
+                            .filter(|v| v.iter().all(|x| x.is_finite()))
+                            .unwrap_or([0.0; 3]);
+                        let lum = 0.299 * l[0].abs() + 0.587 * l[1].abs() + 0.114 * l[2].abs();
+                        if lum > 0.1 { l } else { [1.0; 3] }
+                    }
+                };
+                let fog_intensity = f(field::ATMO_FOG_INTENSITY)?;
+                let fog_cap = f(field::ATMO_FOG_CAP)?;
                 Some(Atmosphere {
-                    sun_color: c(field::ATMO_SUN_COLOR)?,
+                    sun_color,
                     sun_intensity: f(field::ATMO_SUN_INTENSITY)?,
                     turbidity: f(field::ATMO_TURBIDITY)?,
                     earth_reflectance: f(field::ATMO_EARTH_REFLECTANCE)?,
@@ -386,10 +427,17 @@ impl Arl {
                         .filter(|v| v.is_finite())
                         .unwrap_or(1.0),
                     fog_color: c(field::ATMO_FOG_COLOR)?,
-                    fog_intensity: f(field::ATMO_FOG_INTENSITY)?,
-                    fog_cap: f(field::ATMO_FOG_CAP)?,
+                    fog_intensity,
+                    fog_cap,
                     fog_zenith: f(field::ATMO_FOG_ZENITH)?,
                     fog_tactical: f(field::ATMO_FOG_TACTICAL)?,
+                    water_fog_intensity: o(field::ATMO_FOG_WATER_INTENSITY)?
+                        .unwrap_or(fog_intensity),
+                    water_fog_cap: o(field::ATMO_FOG_WATER_CAP)?.unwrap_or(fog_cap),
+                    moon_scale: o(field::ATMO_MOON_SCALE)?.unwrap_or(10.0),
+                    moon_alpha: f(field::ATMO_MOON_ALPHA)?,
+                    moon_cloud_alpha: f(field::ATMO_MOON_CLOUD_ALPHA)?,
+                    moon_rotation: f(field::ATMO_MOON_ROTATION)?,
                 })
             }
             None => None,
@@ -418,6 +466,9 @@ impl Arl {
             rooms,
             grid,
             sun,
+            sunlight_direction: d
+                .opt_vec3(root, field::ARL_SUN_DIRECTION)?
+                .filter(|v| v.iter().all(|x| x.is_finite())),
             effects,
             sky_model: d
                 .opt_str(root, field::ARL_SKY_MODEL)?
@@ -794,9 +845,67 @@ mod tests {
         assert_eq!(a.fog_cap, 0.65);
         assert_eq!(a.mie, 0.0, "absent fields read 0");
         assert_eq!(a.alpha, 1.0, "absent alpha reads 1");
+        assert_eq!(
+            a.water_fog_intensity, 0.008,
+            "absent water fog is the fog's"
+        );
+        assert_eq!(a.water_fog_cap, 0.65);
+        assert_eq!(a.moon_scale, 10.0, "absent celestial body keeps the preset");
+        assert_eq!((a.moon_alpha, a.moon_rotation), (0.0, 0.0));
+        assert_eq!(arl.sunlight_direction, None);
         let c = arl.clouds.unwrap();
         assert_eq!(c.density, 0.67);
         assert_eq!(c.color, [0.12, 0.14, 0.12]);
         assert_eq!(c.range_1, 0.0);
+    }
+
+    #[test]
+    fn reads_the_celestial_body_and_falls_back_to_the_sunlight_colour() {
+        let arl = |atmo_fields: Vec<(u32, Value)>, sun: [f32; 3]| {
+            let mut b = Builder::new(b"ARL ");
+            let atmo = b.add(b"ATMO", atmo_fields);
+            let root = b.add(
+                b"AREA",
+                vec![
+                    (field::ARL_ATMOSPHERE, Value::Struct(Some(atmo))),
+                    (field::ARL_SUN_COLOR, Value::Vec3(sun)),
+                    (field::ARL_SUN_DIRECTION, Value::Vec3([0.0, -0.6, -0.8])),
+                ],
+            );
+            Arl::from_gff4(&b.finish(root)).unwrap()
+        };
+        let a = arl(
+            vec![
+                (field::ATMO_MOON_SCALE, Value::F32(4.0)),
+                (field::ATMO_MOON_ALPHA, Value::F32(0.75)),
+                (field::ATMO_MOON_CLOUD_ALPHA, Value::F32(0.25)),
+                (field::ATMO_MOON_ROTATION, Value::F32(1.5)),
+                (field::ATMO_FOG_WATER_INTENSITY, Value::F32(0.02)),
+                (field::ATMO_FOG_WATER_CAP, Value::F32(0.3)),
+            ],
+            [0.5, 0.4, 0.3],
+        );
+        assert_eq!(a.sunlight_direction, Some([0.0, -0.6, -0.8]));
+        let m = a.atmosphere.unwrap();
+        assert_eq!(
+            (
+                m.moon_scale,
+                m.moon_alpha,
+                m.moon_cloud_alpha,
+                m.moon_rotation
+            ),
+            (4.0, 0.75, 0.25, 1.5)
+        );
+        assert_eq!((m.water_fog_intensity, m.water_fog_cap), (0.02, 0.3));
+        // No ATMO sun colour: the layout's sunlight colour, bright enough here...
+        assert_eq!(m.sun_color, [0.5, 0.4, 0.3]);
+        // ...or white when its luminance is 0.1 or less.
+        let dim = arl(vec![], [0.1, 0.1, 0.1]).atmosphere.unwrap();
+        assert_eq!(dim.sun_color, [1.0; 3]);
+        let own = arl(
+            vec![(field::ATMO_SUN_COLOR, Value::Vec3([0.2, 0.0, 0.0]))],
+            [0.5, 0.4, 0.3],
+        );
+        assert_eq!(own.atmosphere.unwrap().sun_color, [0.2, 0.0, 0.0]);
     }
 }

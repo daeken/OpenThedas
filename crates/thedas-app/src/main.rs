@@ -139,6 +139,10 @@ struct Args {
     /// and the bloom's blur: `low`, `medium` or `high` (High draws as Medium).
     #[arg(long, default_value = "medium", value_parser = ["low", "medium", "high"])]
     detail: String,
+    /// Headless: the shaders' clock (`ApplicationTime`) at the capture, in seconds; it runs
+    /// on from there through `run` steps. The clouds drift with it.
+    #[arg(long, default_value_t = 0.0)]
+    time: f64,
 }
 
 /// Behind and above a hero at `pos` with the game's `facing`, looking the same way (as the
@@ -345,6 +349,7 @@ fn capture(
     ui_frames: u32,
     played: Option<&mut ui::UiLayer>,
     cursor: (f64, f64),
+    shader_time: f64,
 ) -> Result<()> {
     let mut reticle = Vec::new();
     let pixels = if let Some(live) = live {
@@ -366,6 +371,7 @@ fn capture(
                     thedas_render::gpu::CAPTURE_FORMAT,
                 );
                 renderer.frame_effects = loaded.frame_effects;
+                renderer.set_time(shader_time);
                 log_stats(&renderer);
                 renderer.capture(ctx, &camera, w, h)?
             }
@@ -758,6 +764,7 @@ impl App {
         let drawn = match (self.live.as_mut(), g.renderer.as_mut()) {
             (Some(live), _) => live.render(&g.ctx, &mut encoder, &view, size, &self.camera),
             (None, Some(r)) => {
+                r.advance_time(dt / 1000.0);
                 r.render(&g.ctx, &mut encoder, &view, size.0, size.1, &self.camera);
                 true
             }
@@ -1596,6 +1603,7 @@ fn main() -> Result<()> {
         let mut played: Option<(ui::UiLayer, screens::Screens)> = None;
         let mut cursor = (size.0 as f64 / 2.0, size.1 as f64 / 2.0);
         if let Some(l) = live.as_mut() {
+            l.shader_time = args.time;
             if ui.is_empty() {
                 let mut layer = ui::UiLayer::new(&ctx, &loaded.vfs, &[], size);
                 layer.attach(&l.sim);
@@ -1823,6 +1831,7 @@ fn main() -> Result<()> {
             args.ui_frames,
             played.as_mut().map(|(layer, _)| layer),
             cursor,
+            args.time,
         );
     }
 

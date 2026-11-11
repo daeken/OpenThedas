@@ -72,6 +72,9 @@ pub struct Live {
     pub detail: thedas_render::scene::Detail,
     /// The conversation camera's resources and current shot.
     talk_camera: crate::talkcam::TalkCamera,
+    /// The shaders' clock (`ApplicationTime`), in seconds: real time, running while the
+    /// world is stopped too.
+    pub shader_time: f64,
 }
 
 /// How to start the game.
@@ -132,6 +135,7 @@ impl Live {
             frame_effects: true,
             detail: Default::default(),
             talk_camera: Default::default(),
+            shader_time: 0.0,
         })
     }
 
@@ -163,6 +167,20 @@ impl Live {
     /// Advances what runs while the world may be stopped (the conversation camera's clock).
     pub fn advance_presentation(&mut self, dt_ms: f64) {
         self.talk_camera.advance(dt_ms);
+        if dt_ms.is_finite() && dt_ms > 0.0 {
+            self.shader_time += dt_ms / 1000.0;
+        }
+    }
+
+    /// Gives the renderers the shaders' clock.
+    fn set_shader_time(&mut self) {
+        let t = self.shader_time;
+        if let Some(l) = self.level.as_mut() {
+            l.renderer.set_time(t);
+        }
+        if let Some(o) = self.objects.as_mut() {
+            o.renderer.set_time(t);
+        }
     }
 
     /// The open conversation's camera, when its lines are staged (see [`crate::talkcam`]);
@@ -254,6 +272,7 @@ impl Live {
         (width, height): (u32, u32),
         camera: &thedas_render::Camera,
     ) -> bool {
+        self.set_shader_time();
         let Some(level) = self.level.as_mut() else {
             return false;
         };
@@ -291,6 +310,7 @@ impl Live {
         camera: &thedas_render::Camera,
         (width, height): (u32, u32),
     ) -> Result<Option<Vec<u8>>> {
+        self.set_shader_time();
         let Some(level) = self.level.as_mut() else {
             return Ok(None);
         };

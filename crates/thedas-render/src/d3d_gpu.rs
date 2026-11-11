@@ -102,7 +102,7 @@ pub(crate) struct D3dPass {
     sun: Option<(Vec3, Vec3)>,
     fog: [[f32; 4]; 2],
     sky: Option<[[f32; 4]; 9]>,
-    clouds: [[f32; 4]; 2],
+    clouds: [[f32; 4]; 3],
     pub programs: Vec<String>,
 }
 
@@ -214,12 +214,26 @@ fn blend_op(o: BlendOp) -> wgpu::BlendOperation {
     }
 }
 
-fn address(a: AddressMode) -> wgpu::AddressMode {
+/// `border` says the device can clamp to a border colour; without it, clamping to the edge
+/// is the closest match.
+fn address(a: AddressMode, border: bool) -> wgpu::AddressMode {
     match a {
         AddressMode::Wrap => wgpu::AddressMode::Repeat,
         AddressMode::Mirror | AddressMode::MirrorOnce => wgpu::AddressMode::MirrorRepeat,
-        // Border needs a device feature; clamp is the closest portable match.
+        AddressMode::Border if border => wgpu::AddressMode::ClampToBorder,
         AddressMode::Clamp | AddressMode::Border => wgpu::AddressMode::ClampToEdge,
+    }
+}
+
+/// The D3D border colour (`SAMP_BORDERCOLOR`, ARGB) as the nearest colour wgpu offers:
+/// transparent black, opaque black or opaque white.
+fn border_color(argb: u32) -> wgpu::SamplerBorderColor {
+    let alpha = argb >> 24;
+    let rgb = argb & 0x00ff_ffff;
+    match (alpha >= 0x80, rgb >= 0x0080_8080) {
+        (false, _) => wgpu::SamplerBorderColor::TransparentBlack,
+        (true, false) => wgpu::SamplerBorderColor::OpaqueBlack,
+        (true, true) => wgpu::SamplerBorderColor::OpaqueWhite,
     }
 }
 
@@ -235,11 +249,17 @@ fn sampler_key(s: &SamplerSettings) -> String {
 }
 
 fn make_sampler(device: &wgpu::Device, s: &SamplerSettings) -> wgpu::Sampler {
+    let border = device
+        .features()
+        .contains(wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER);
+    let modes = [s.address_u, s.address_v, s.address_w];
+    let uses_border = border && modes.contains(&AddressMode::Border);
     device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("d3d sampler"),
-        address_mode_u: address(s.address_u),
-        address_mode_v: address(s.address_v),
-        address_mode_w: address(s.address_w),
+        address_mode_u: address(s.address_u, border),
+        address_mode_v: address(s.address_v, border),
+        address_mode_w: address(s.address_w, border),
+        border_color: uses_border.then(|| border_color(s.border)),
         mag_filter: filter(s.mag),
         min_filter: filter(s.min),
         mipmap_filter: match s.mip {
@@ -449,8 +469,10 @@ fn create_pipeline(
 
 /// The ambient light of each room: the sum of the ambient lights its light model holds. A
 /// draw in a room with none (or outside every room) takes the average over the rooms that
-/// have one. Provisional: the original's choice is not traced; summing every room's ambient
-/// into one, as before, washed out levels of many rooms.
+/// have one. Provisional: the original sums the ambient light nodes its light manager picks
+/// for the object (see [`crate::d3d`]), filtered by a light visibility list not traced
+/// here; summing every room's ambient into one, as before, washed out levels of many rooms.
+/// A level with no ambient light nodes (Lothering) gets none, as in the original.
 fn room_ambients(scene: &AreaScene) -> impl Fn(&str) -> Vec3 {
     let mut by_room: HashMap<String, Vec3> = HashMap::new();
     for l in &scene.lights {
@@ -679,6 +701,10 @@ impl D3dPass {
             });
         }
         let programs = pipelines.iter().map(|p| p.program.name.clone()).collect();
+        let celestial = scene
+            .atmosphere
+            .as_ref()
+            .map(|a| crate::atmosphere::celestial(a, scene.sunlight_direction));
         D3dPass {
             pipelines,
             draws,
@@ -695,11 +721,11 @@ impl D3dPass {
             ambients: scene.draws.iter().map(|d| ambient(&d.room)).collect(),
             sun: scene.sun,
             fog: crate::atmosphere::fog_params(scene.atmosphere.as_ref()),
-            sky: scene
-                .atmosphere
+            sky: celestial
                 .as_ref()
-                .map(|a| crate::atmosphere::sky_params(a, scene.clouds.as_ref())),
-            clouds: crate::atmosphere::cloud_params(scene.clouds.as_ref()),
+                .zip(scene.atmosphere.as_ref())
+                .map(|(c, a)| crate::atmosphere::sky_params(a, c)),
+            clouds: crate::atmosphere::cloud_params(scene.clouds.as_ref(), celestial.as_ref()),
             programs,
         }
     }
@@ -722,8 +748,9 @@ impl D3dPass {
         self.pipelines[d.pipeline].blended
     }
 
-    /// Fills every draw's constants for this frame.
-    pub fn update(&self, ctx: &GpuContext, camera: &Camera, width: u32, height: u32) {
+    /// Fills every draw's constants for this frame; `time` is the shaders' `ApplicationTime`
+    /// in seconds.
+    pub fn update(&self, ctx: &GpuContext, camera: &Camera, width: u32, height: u32, time: f32) {
         let Some(buffer) = &self.buffer else { return };
         let aspect = width as f32 / height.max(1) as f32;
         let (view, projection) = (camera.view(), camera.projection(aspect));
@@ -760,6 +787,7 @@ impl D3dPass {
                 fog: self.fog,
                 sky: self.sky.as_ref(),
                 clouds: self.clouds,
+                time,
             };
             put(&mut data, d.slot, &cc.fill(program.vs.ctab.as_ref()), 0);
             put(&mut data, d.slot, &cc.fill(program.ps.ctab.as_ref()), 3);
@@ -793,6 +821,22 @@ impl D3dPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn border_colours_map_to_the_nearest_wgpu_offers() {
+        use wgpu::SamplerBorderColor as B;
+        assert_eq!(border_color(0), B::TransparentBlack);
+        assert_eq!(border_color(0xff00_0000), B::OpaqueBlack);
+        assert_eq!(border_color(0xffff_ffff), B::OpaqueWhite);
+        assert_eq!(
+            address(AddressMode::Border, true),
+            wgpu::AddressMode::ClampToBorder
+        );
+        assert_eq!(
+            address(AddressMode::Border, false),
+            wgpu::AddressMode::ClampToEdge
+        );
+    }
 
     #[test]
     fn constant_slot_is_aligned() {

@@ -207,6 +207,10 @@ pub struct AreaScene {
     pub atmosphere: Option<thedas_formats::level::Atmosphere>,
     /// The level's clouds.
     pub clouds: Option<thedas_formats::level::Clouds>,
+    /// The layout's sunlight direction as stored (see
+    /// [`thedas_formats::level::Arl::sunlight_direction`]): the sky's celestial body sits
+    /// against it.
+    pub sunlight_direction: Option<Vec3>,
     /// The models the simulation placed, in the order given, with their draws.
     pub props: Vec<PropDraws>,
 }
@@ -1006,6 +1010,7 @@ impl AreaScene {
         l.scene.effects = arl.effects.clone();
         l.scene.atmosphere = arl.atmosphere;
         l.scene.clouds = arl.clouds;
+        l.scene.sunlight_direction = arl.sunlight_direction.map(Vec3::from_array);
         // Characters (the objects' scene) take the sun's character colour.
         l.scene.sun = arl.sun.map(|s| {
             let color = if level_meshes {
