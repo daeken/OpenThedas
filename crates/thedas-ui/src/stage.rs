@@ -138,6 +138,27 @@ pub fn blend_premultiplied(base: &mut Rgba, src: &Rgba) {
     }
 }
 
+/// The path of the movie's focused text field when it is an input field
+/// (`Selection.getFocus`, then the field's `type`).
+fn focused_input_field(m: &mut UiMovie) -> Option<String> {
+    let UiValue::String(path) = m.call("_global.Selection.getFocus", &[]) else {
+        return None;
+    };
+    let kind = m.call(&format!("{path}.type.toString"), &[]);
+    (kind == UiValue::String("input".into())).then_some(path)
+}
+
+/// A press lets go of the text field's focus first; one on the field takes it back. In the
+/// player the focus moves during the press, and the field losing it there cancels a dialog
+/// button's press (popuplayer.gfx's push buttons: the first click on Save only moved the
+/// focus, the second saved). Provisional: Scaleform's focus handling is not traced; this keeps
+/// one click enough.
+fn release_text_focus(m: &mut UiMovie) {
+    if focused_input_field(m).is_some() {
+        m.call("_global.Selection.setFocus", &[UiValue::Null]);
+    }
+}
+
 /// The movie that shows the game's dialog boxes (`PopupLayer.ShowDialogBoxFromGame`).
 pub const POPUP_LAYER: &str = "popuplayer.gfx";
 /// The engine value holding how far the quickbar is dragged open (see [`Stage::new`]).
@@ -407,8 +428,41 @@ impl Stage {
 
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
         for m in self.input_movies() {
+            if down {
+                release_text_focus(m);
+            }
             m.mouse_button(x, y, down);
         }
+    }
+
+    /// The movie whose focused text field takes typing (an input field: a save's name in a
+    /// dialog box, the hero's name at character creation), if any. Keys go there instead of
+    /// to the game while it has one.
+    pub fn text_focus(&mut self) -> Option<String> {
+        for m in self.input_movies() {
+            if focused_input_field(m).is_some() {
+                return Some(m.name.clone());
+            }
+        }
+        None
+    }
+
+    /// A key for the focused text field (see [`Stage::text_focus`]); false when no field
+    /// has focus (the key is the game's).
+    pub fn key(&mut self, key: crate::UiKey) -> bool {
+        for m in self.input_movies() {
+            if focused_input_field(m).is_some() {
+                m.key(key);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Types each character of `text` into the focused text field; false when none has
+    /// focus.
+    pub fn type_text(&mut self, text: &str) -> bool {
+        text.chars().all(|c| self.key(crate::UiKey::Char(c)))
     }
 
     /// A whole click (press and release) at (`x`, `y`) that the movies see as Scaleform
@@ -419,6 +473,7 @@ impl Stage {
         for m in self.input_movies() {
             m.set(crate::avm1::BUTTON_VAR, UiValue::Number(button));
             m.mouse_move(x, y);
+            release_text_focus(m);
             m.mouse_button(x, y, true);
             m.mouse_button(x, y, false);
             m.set(crate::avm1::BUTTON_VAR, UiValue::Undefined);

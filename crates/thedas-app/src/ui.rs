@@ -515,17 +515,6 @@ impl UiLayer {
         }
         self.show_cutscene_line(sim);
         let messages = self.stage.tick(dt_ms);
-        // A dialog focuses its text field (a save's name) once it is up. Nothing types into
-        // the movies yet, and with the field focused the first press on a dialog button only
-        // moves the focus (the button's press is cancelled), so the field gives its focus up
-        // and its default text stands. Provisional: until keyboard input reaches the movies.
-        if self.stage.dialog_up() {
-            self.stage.call_in(
-                thedas_ui::stage::POPUP_LAYER,
-                "_global.Selection.setFocus",
-                &[thedas_ui::UiValue::Null],
-            );
-        }
         let ignored = {
             let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             thedas_ui::input::apply_all(&mut sim, &messages)
@@ -856,6 +845,21 @@ impl UiLayer {
     /// A click the movies see as Scaleform mouse `button` (a right click, a double click).
     pub fn click_as(&mut self, button: f64, x: f64, y: f64) {
         self.stage.click_as(button, x, y);
+    }
+
+    /// Whether a movie's text field has focus (keys type into it, not the game's).
+    pub fn typing(&mut self) -> bool {
+        self.stage.text_focus().is_some()
+    }
+
+    /// A key for the focused text field; false when there is none.
+    pub fn key(&mut self, key: thedas_ui::UiKey) -> bool {
+        self.stage.key(key)
+    }
+
+    /// Types text into the focused text field; false when there is none.
+    pub fn type_text(&mut self, text: &str) -> bool {
+        self.stage.type_text(text)
     }
 
     /// Renders every movie into its texture and draws them over `target`, in order.
