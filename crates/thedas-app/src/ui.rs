@@ -1125,8 +1125,9 @@ impl UiLayer {
         }
         let changes = screens.sync(want, &mut self.stage);
         // A screen that closes takes its tooltip with it: the movie that showed it is gone
-        // and cannot clear it (a picker's tooltip stayed drawn over the HUD).
-        if !changes.closed.is_empty() {
+        // and cannot clear it (a picker's tooltip stayed drawn over the HUD; a portrait's
+        // over the tactics screen that replaced the HUD).
+        if !changes.closed.is_empty() || !changes.opened.is_empty() {
             for k in ["GUI.TooltipText", "GUITooltips.TooltipText"] {
                 self.stage
                     .bridge
