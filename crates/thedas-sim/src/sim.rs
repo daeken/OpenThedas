@@ -3783,7 +3783,25 @@ impl Host for ScriptHost<'_> {
                     && self.sim.world.get(caller).is_some_and(|o| {
                         self.sim.watch_tags.contains(&o.tag.to_ascii_lowercase())
                     }));
+        // Mana or stamina reaching 0 tells the creature (see `Sim::note_mana_change`).
+        let mana_target = match f.name.as_str() {
+            "SetCreatureMana" => args.first(),
+            "SetCreatureProperty" | "UpdateCreatureProperty"
+                if matches!(args.get(1), Some(Value::Int(8))) =>
+            {
+                args.first()
+            }
+            _ => None,
+        }
+        .and_then(|v| match v {
+            Value::Object(o) => Some(*o),
+            _ => None,
+        });
+        let mana_before = mana_target.map(|id| (id, self.sim.mana_now(id)));
         let result = crate::engine::call(self, caller, f, &args);
+        if let Some((id, before)) = mana_before {
+            self.sim.note_mana_change(id, before);
+        }
         if watched {
             let t = self.sim.world.time_ms;
             let shown = match &result {
