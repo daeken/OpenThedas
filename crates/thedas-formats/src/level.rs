@@ -59,6 +59,9 @@ pub mod field {
     /// xoreos's "EnvAreaChunkIsChunk"; DAOrigins.exe's layout loader takes the sun from the
     /// layout only when it is set (0x5d1617).
     pub const ARL_LAYOUT_SUN: u32 = 3122;
+    /// Which camera height cuts away roofs in an interior: 0, 1 or 2 for 3.0, 4.0 or 5.5 m
+    /// (read at 0x5d15e4).
+    pub const ARL_CUTAWAY_HEIGHT: u32 = 3129;
     pub const PATHING_GRID: u32 = 3110;
     pub const GRID_COLUMNS: u32 = 3086;
     pub const GRID_ROWS: u32 = 3087;
@@ -165,6 +168,10 @@ pub struct Arl {
     /// The SpeedTrees the rooms place (`.spt` stems, 3355), indexed by
     /// [`TreePlacement::tree`].
     pub trees: Vec<String>,
+    /// How far above the party leader's feet the game camera's eye must be for meshes
+    /// flagged `CutAway` to be cut away, in metres: by 3129 (3.0, 4.0 or 5.5) in a layout
+    /// without its own sun, else 5.5 (DAOrigins.exe 0x76fd30, table 0xb1d91c).
+    pub cutaway_height: f32,
 }
 
 /// A level's clouds (`CLDS`, 22600), which the sky's cloud layer reads.
@@ -519,8 +526,15 @@ impl Arl {
             }
             None => None,
         };
+        // An absent 3129 reads as 0 (the loader's object starts zeroed, 0x5c9c75).
+        let cutaway_index = d.opt_i64(root, field::ARL_CUTAWAY_HEIGHT)?.unwrap_or(0);
+        let cutaway_height = match (layout_sun, cutaway_index) {
+            (false, i @ 0..=2) => [3.0, 4.0, 5.5][i as usize],
+            _ => 5.5,
+        };
         Ok(Arl {
             name: d.opt_str(root, field::ARL_NAME)?,
+            cutaway_height,
             rooms,
             grid,
             sun,

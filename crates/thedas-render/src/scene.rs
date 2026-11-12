@@ -355,6 +355,12 @@ pub struct AreaScene {
     pub props: Vec<PropDraws>,
     /// The particle emitters of every placed model (see [`crate::particles`]).
     pub emitters: Vec<SceneEmitter>,
+    /// The draws of meshes flagged `CutAway` (ceilings and roofs), which fade out while the
+    /// game camera is high (see [`thedas_formats::level::Arl::cutaway_height`]).
+    pub cut_away: Vec<usize>,
+    /// The layout's cutaway height ([`thedas_formats::level::Arl::cutaway_height`]), when
+    /// the scene has a layout.
+    pub cutaway_height: Option<f32>,
 }
 
 /// A model (or several, drawn together) the simulation places in the level: a creature or a
@@ -1533,6 +1539,9 @@ impl<'a> Loader<'a> {
                 cast_shadow: piece.mesh.cast_runtime_shadow,
                 lod: None,
             });
+            if piece.mesh.cut_away {
+                self.scene.cut_away.push(self.scene.draws.len() - 1);
+            }
         }
         rigid
     }
@@ -1806,6 +1815,7 @@ impl AreaScene {
         l.scene.atmosphere = arl.atmosphere;
         l.scene.clouds = arl.clouds;
         l.scene.sunlight_direction = arl.sunlight_direction.map(Vec3::from_array);
+        l.scene.cutaway_height = Some(arl.cutaway_height);
         // Characters (the objects' scene) take the sun's character colour.
         l.scene.sun = arl.sun.map(|s| {
             let color = if level_meshes {
