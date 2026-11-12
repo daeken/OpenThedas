@@ -3597,6 +3597,11 @@ fn main() -> Result<()> {
                             // As the window does: the drawn scenes follow the world (objects
                             // that come and go are rebuilt).
                             l.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
+                            // As the window's frames do: a cutscene's view is noted for the
+                            // conversation line it plays over (see `Live::conversation_camera`).
+                            if follow.is_some() {
+                                let _ = l.cutscene_camera(&camera);
+                            }
                             // A level building on its worker (THEDAS_ASYNC_LOADS) is waited
                             // for here, so the next frame, capture or input finds the world
                             // up: headless frames run far faster than a load.
