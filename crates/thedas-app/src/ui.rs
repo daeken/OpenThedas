@@ -184,8 +184,8 @@ pub struct UiLayer {
     loading: Option<Loading>,
     /// The world map is held up as the loading screen (see [`UiLayer::hold_world_map`]).
     travel_map: bool,
-    /// How long the held world map has been playing out since its load ended.
-    travel_out_ms: Option<f64>,
+    /// When the held world map began playing out, its load done.
+    travel_out: Option<std::time::Instant>,
     /// The screens up last frame, for the events of opening one (see
     /// [`UiLayer::screens_opened`]).
     screens_up: std::collections::BTreeSet<Screen>,
@@ -461,7 +461,7 @@ impl UiLayer {
             script_popup: None,
             loading: None,
             travel_map: false,
-            travel_out_ms: None,
+            travel_out: None,
             screens_up: Default::default(),
             floaties: Vec::new(),
             stat_floaties: Default::default(),
@@ -657,32 +657,36 @@ impl UiLayer {
     ///
     /// When the hold ends the movie is told the area has loaded
     /// (`WorldMap.AreaLoadedNotify`, which the exe invokes; its name is at 0xb19ed9): it
-    /// plays the journey's last leg and closes itself, and the screen stays up for that, at
-    /// most [`LOADING_OUTRO_MAX_MS`]. While it travels the movie takes no pin clicks itself
+    /// plays the journey's last leg, and the screen stays up for that (see
+    /// [`UiLayer::travel_map_frame`]). While it travels the movie takes no pin clicks itself
     /// (its `m_bTravelling`).
     pub fn hold_world_map(&mut self, hold: bool) {
         if hold {
             self.travel_map = true;
-            self.travel_out_ms = None;
-        } else if self.travel_map && self.travel_out_ms.is_none() {
+            self.travel_out = None;
+        } else if self.travel_map && self.travel_out.is_none() {
             self.stage
                 .call_in("worldmap.gfx", "_global.WorldMap.AreaLoadedNotify", &[]);
-            self.travel_out_ms = Some(0.0);
+            self.travel_out = Some(std::time::Instant::now());
         }
     }
 
-    /// The held world map playing out after its load: it goes when its movie has closed
-    /// itself, or after [`LOADING_OUTRO_MAX_MS`].
-    fn travel_map_frame(&mut self, dt_ms: f64) {
-        let Some(ms) = self.travel_out_ms else {
+    /// The held world map playing out after its load: it goes once the movie has finished
+    /// the journey's last leg (`WorldMap.GetTravelling()` false: the movie clears its
+    /// `m_bTravelling` when its animation is done and does not close itself), or has closed,
+    /// or after [`LOADING_OUTRO_MAX_MS`] of real time (frames while a level settles can be
+    /// long, and the interface's frame time is capped).
+    fn travel_map_frame(&mut self) {
+        let Some(since) = self.travel_out else {
             return;
         };
-        let open = self.stage.movies.iter().any(|m| m.name == "worldmap.gfx");
-        if !open || ms + dt_ms >= LOADING_OUTRO_MAX_MS {
+        let travelling = self
+            .stage
+            .call_in("worldmap.gfx", "_global.WorldMap.GetTravelling", &[]);
+        let done = !matches!(travelling, Some(thedas_ui::UiValue::Bool(true)));
+        if done || since.elapsed().as_secs_f64() * 1000.0 >= LOADING_OUTRO_MAX_MS {
             self.travel_map = false;
-            self.travel_out_ms = None;
-        } else {
-            self.travel_out_ms = Some(ms + dt_ms);
+            self.travel_out = None;
         }
     }
 
@@ -1118,7 +1122,7 @@ impl UiLayer {
         self.show_cutscene_line(sim);
         self.show_script_popup(sim);
         self.loading_frame(dt_ms);
-        self.travel_map_frame(dt_ms);
+        self.travel_map_frame();
         let mut messages = self.stage.tick(dt_ms);
         // A script message box's answer carries the text typed into it, which the box set
         // as `GUIPopupLayer.InputText` just before (popuplayer.gfx's `OnButtonAction`); the
