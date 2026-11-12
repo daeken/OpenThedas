@@ -18,7 +18,7 @@ Each item: original / ours / evidence / size / dependencies. Sizes: S < 1 day, M
 
 ### Lighting and materials
 5. **Scene brightness: residual after the area colour curves.** Each area's `areadata.gda` colour curve now grades the frame (the missing ~1.8× warm lift). Centre means at load against the original: alienage (71, 55, 38) vs (65, 51, 36), Highever hall (68, 56, 56) vs (66, 49, 45), Orzammar Commons (99, 37, 29) vs (115, 49, 39). Left: the hall is a little blue (traced non-moving lights in c9–c12 not added), and re-judging the traced level light rule (c4 = 0 on level and terrain) now that the curve is on. Size S-M. Depends: none.
-6. **Weapon and shield tints.** HN shield wood near black: T3_SHD_HRN ch0 colour (0.10, 0.08, 0.08) times the mask. Original: grained wood, gold rim (wine cg7). Weapon tint field order or brightening untraced. Size S-M (exe trace).
+6. **Weapon tints.** The Highever shield now reads as wood planks with an iron rim, as in the original (QA run41, with the area colour curve). Left: the weapon tint field order or brightening is untraced. Size S (exe trace).
 7. **Armour rim/specular too hot** (Dwarf Noble, Dalish), shield specular. QA medium. Size M (specular/env terms per shader).
 8. **Dalish clearing lit sepia** instead of green; Dalish hunters' faces black against bright sky. Likely light/probe selection for that level. Size M.
 9. **Environment cubemaps**: now the probe .dds (#302), but the binding is inferred, not traced. Size S to verify.
