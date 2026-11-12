@@ -186,8 +186,8 @@ fn tube(
             let binormal = cross(radial, tangent);
             let position = if i < m {
                 let mut r = v.radius;
-                // A zero maximum (a zero radius curve) makes 0/0 in the original; take 0, so
-                // the tube collapses onto its skeleton (provisional, asked of the spec).
+                // A zero maximum (a zero radius curve) makes 0/0, a NaN, in the original; 3.8
+                // says take 0 and put every point on the centre (a deliberate deviation).
                 let k = if branch.max_radius != 0.0 {
                     v.radius / branch.max_radius
                 } else {
@@ -206,11 +206,19 @@ fn tube(
                 let b = bank[out.roughness_index % BANK];
                 out.roughness_index += 1;
                 r += (b - 0.5) * 2.0 * info.random_roughness * size * k * roughness;
-                let mut flare = 1.0f32;
-                for fl in &branch.flares {
-                    flare += flare_distance(fl, alpha, t);
-                }
-                let p = add(v.position, scale(scale(radial, r), flare));
+                // 3.8: the distances summed from 0, then 1 + D; no multiply when exactly 1.
+                let flare = 1.0
+                    + branch
+                        .flares
+                        .iter()
+                        .fold(0.0f32, |sum, fl| sum + flare_distance(fl, alpha, t));
+                let p = if branch.max_radius == 0.0 {
+                    v.position
+                } else if flare == 1.0 {
+                    add(v.position, scale(radial, r))
+                } else {
+                    add(v.position, scale(scale(radial, r), flare))
+                };
                 if i == 0 {
                     first = p;
                 }
