@@ -1101,11 +1101,8 @@ fn objects_key(models: &[ObjectModel]) -> ObjectsKey {
 }
 
 /// What the character creation stage draws: creature `id` alone, standing at the stage's
-/// mark with its facing (0x7bb9d6-0x7bba2d). A creature that draws nothing yet (the
-/// simulation's hero has no appearance until a race is chosen) is drawn as the game builds
-/// the player, from [`crate::chargen_stage::PLAYER_TEMPLATE`] (0x69d953): the original's
-/// creature is human from the start. Provisional: that stand-in is presentation only; the
-/// simulation does not build its hero from the template.
+/// mark with its facing (0x7bb9d6-0x7bba2d). The simulation builds the new game's hero from
+/// the `default_player` template (0x69d953, #188), so it is drawn from the first page.
 fn stage_models(
     sim: &Sim,
     id: ObjectId,
@@ -1120,9 +1117,7 @@ fn stage_models(
             .into_iter()
             .find(|m| m.id == id)
     });
-    let Some(mut m) = drawn.or_else(|| {
-        thedas_ui::models::template_look(sim, o, crate::chargen_stage::PLAYER_TEMPLATE)
-    }) else {
+    let Some(mut m) = drawn else {
         return Vec::new();
     };
     m.position = stage.mark;

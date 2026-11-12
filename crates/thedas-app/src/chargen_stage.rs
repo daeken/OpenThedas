@@ -14,7 +14,7 @@
 //! - The creature is the one in character creation (`GUICharGen`'s `CharGenStart` handler,
 //!   0x736680, hands it to the paperdoll, 0x7b8870). The game made it from the
 //!   `default_player` template (0x69d953): a human male (appearance 15) in common clothes,
-//!   so it shows before any choice is made.
+//!   so it shows before any choice is made. The simulation builds its hero the same way.
 //! - Camera presets (0x7b38a0, also `Paperdoll.SetCameraPreset`, handler 0x7b49b0): in stage
 //!   mode the main game camera is moved (0x6c4b20 field of view, 0x6c45f0 position,
 //!   0x6c4ec0 orientation) rather than the paperdoll's own `SceneCamera`. See [`camera`].
@@ -33,8 +33,6 @@ use thedas_vfs::Vfs;
 pub const STAGE_AREA: &str = "char_stage";
 /// The waypoint the creature stands at (0xb21db4).
 pub const MARK: &str = "char_chargen";
-/// The template the game builds the player creature from (0xb0f21c, pushed at 0x69d953).
-pub const PLAYER_TEMPLATE: &str = "default_player";
 
 /// Camera preset 0: the whole body (character creation's first pages). Any other preset
 /// frames the face (chargen.gfx's appearance page sends `Paperdoll.SetCameraPreset 1`).
