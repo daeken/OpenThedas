@@ -220,6 +220,9 @@ pub enum Edge {
     /// Pressed, then again after [`REPEAT_DELAY_MS`] and every [`REPEAT_MS`] while held.
     Repeat,
     Release,
+    /// Let go without another button joining it in a chord meanwhile (LB alone changes the
+    /// leader; LB with RB selects the whole party).
+    Tap,
 }
 
 /// What a button does. Each is something the mouse or keyboard already does.
@@ -332,6 +335,17 @@ const fn repeat(context: Context, button: Button, action: Action, exe: &'static 
     }
 }
 
+const fn tap(context: Context, button: Button, action: Action, exe: &'static str) -> Binding {
+    Binding {
+        context,
+        button,
+        with: None,
+        edge: Edge::Tap,
+        action,
+        exe,
+    }
+}
+
 const fn release(context: Context, button: Button, action: Action, exe: &'static str) -> Binding {
     Binding {
         context,
@@ -360,8 +374,8 @@ pub const BINDINGS: &[Binding] = &[
     chord(Field, RT, X, Do::Quickslot(3), "ActivateQuickslot4"),
     chord(Field, RT, Y, Do::Quickslot(4), "ActivateQuickslot5"),
     chord(Field, RT, B, Do::Quickslot(5), "ActivateQuickslot6"),
-    bind(Field, LB, Do::PrevMember, "RadialPartySelectMode"),
-    bind(Field, RB, Do::NextMember, "RadialPartySelectMode"),
+    tap(Field, LB, Do::PrevMember, "SelectPreviousCharacterMessage"),
+    tap(Field, RB, Do::NextMember, "SelectNextCharacterMessage"),
     chord(Field, RB, LB, Do::WholeParty, "ToggleFullPartySelect"),
     chord(Field, LB, RB, Do::WholeParty, "ToggleFullPartySelect"),
     bind(Field, LT, Do::Picker, "RadialTargetMode"),
@@ -396,10 +410,10 @@ pub const BINDINGS: &[Binding] = &[
     bind(Screen, Back, Do::CloseScreen, "ToggleInventory"),
     bind(Screen, LB, Do::PrevPage, ""),
     bind(Screen, RB, Do::NextPage, ""),
-    repeat(Screen, Left, Do::PointerStep(-1, 0), "NavigateLeft"),
-    repeat(Screen, Right, Do::PointerStep(1, 0), "NavigateRight"),
-    repeat(Screen, Up, Do::PointerStep(0, -1), "NavigateUp"),
-    repeat(Screen, Down, Do::PointerStep(0, 1), "NavigateDown"),
+    repeat(Screen, Left, Do::PointerStep(-1, 0), ""),
+    repeat(Screen, Right, Do::PointerStep(1, 0), ""),
+    repeat(Screen, Up, Do::PointerStep(0, -1), ""),
+    repeat(Screen, Down, Do::PointerStep(0, 1), ""),
     // Conversations.
     repeat(Conversation, Up, Do::PrevReply, "ConversationRadialSelectY"),
     repeat(
@@ -408,7 +422,7 @@ pub const BINDINGS: &[Binding] = &[
         Do::NextReply,
         "ConversationRadialSelectY",
     ),
-    bind(Conversation, A, Do::ChooseReply, "Pre_Selection"),
+    bind(Conversation, A, Do::ChooseReply, "SelectResponseMessage"),
     bind(Conversation, X, Do::Skip, ""),
     // Cutscenes.
     bind(Cutscene, A, Do::Skip, ""),
@@ -429,6 +443,9 @@ pub enum StickRole {
     /// Up and down step the conversation's reply choice, as the D-pad does
     /// (`ConversationRadialSelectY`).
     Replies,
+    /// Up and down scroll the list or text under the pointer, as the mouse wheel does (the
+    /// console fed the movies' `AnalogScrollValue` from `Gamepad_ThumbRY`).
+    Scroll,
 }
 
 /// The sticks' roles, by context. Unlisted, a stick does nothing.
@@ -438,6 +455,7 @@ pub const STICKS: &[(Context, Stick, StickRole)] = &[
     (Picker, Stick::Left, StickRole::Pointer),
     (Picker, Stick::Right, StickRole::Camera),
     (Screen, Stick::Left, StickRole::Pointer),
+    (Screen, Stick::Right, StickRole::Scroll),
     (Conversation, Stick::Left, StickRole::Replies),
     (Conversation, Stick::Right, StickRole::Camera),
 ];
@@ -454,6 +472,8 @@ pub const MOVE_EVERY_MS: f64 = 250.0;
 pub const MOVE_TURN: f32 = 0.35;
 /// The pointer's top speed, pixels a second (it rises with the square of the deflection).
 pub const POINTER_SPEED: f32 = 1100.0;
+/// The scroll at full deflection (wheel lines a second).
+pub const SCROLL_SPEED: f32 = 8.0;
 /// The camera's turn at full deflection (radians a second) and zoom (wheel steps a second).
 pub const TURN_SPEED: f32 = 2.4;
 pub const ZOOM_SPEED: f32 = 6.0;
@@ -470,6 +490,8 @@ pub enum Order {
     Camera { yaw: f32, zoom: f32 },
     /// Move the pointer (pixels).
     Pointer(Vec2),
+    /// Turn the mouse wheel (whole lines, up positive).
+    Scroll(f32),
 }
 
 /// Turns pad states into [`Order`]s: edges, chords, repeats and the sticks.
@@ -488,6 +510,10 @@ pub struct Controller {
     /// Walking: the direction last ordered and how long ago.
     walking: Option<Vec2>,
     walk_ms: f64,
+    /// Buttons that joined a chord since they went down (their taps are off).
+    chorded: [bool; 16],
+    /// Wheel lines owed by the right stick, not yet whole.
+    scroll: f32,
 }
 
 impl Controller {
@@ -502,6 +528,17 @@ impl Controller {
                 self.pressed_in[i] = Some(context);
                 self.held_ms[i] = 0.0;
                 self.next_repeat[i] = REPEAT_DELAY_MS;
+                if let Some(row) = BINDINGS.iter().find(|r| {
+                    r.context == context
+                        && r.button == b
+                        && r.edge == Edge::Press
+                        && r.with.is_some_and(|w| now.held(w))
+                }) {
+                    self.chorded[i] = true;
+                    if let Some(w) = row.with {
+                        self.chorded[w as usize] = true;
+                    }
+                }
                 if let Some(a) = action_for(context, b, now, Edge::Press) {
                     push_once(&mut out, Order::Act(a));
                 }
@@ -520,8 +557,14 @@ impl Controller {
                     if let Some(a) = action_for(context, b, now, Edge::Release) {
                         out.push(Order::Act(a));
                     }
+                    if !self.chorded[i] {
+                        if let Some(a) = action_for(context, b, now, Edge::Tap) {
+                            out.push(Order::Act(a));
+                        }
+                    }
                 }
                 self.pressed_in[i] = None;
+                self.chorded[i] = false;
             }
         }
         for (ctx, stick, role) in STICKS {
@@ -543,6 +586,17 @@ impl Controller {
                     out.push(Order::Pointer(Vec2::new(v.x, -v.y) * s));
                 }
                 StickRole::Replies => self.stick_replies(now.stick(*stick), dt_ms, &mut out),
+                StickRole::Scroll => {
+                    self.scroll += v.y * SCROLL_SPEED * (dt_ms / 1000.0) as f32;
+                    let whole = self.scroll.trunc();
+                    if whole != 0.0 {
+                        self.scroll -= whole;
+                        out.push(Order::Scroll(whole));
+                    }
+                    if v == Vec2::ZERO {
+                        self.scroll = 0.0;
+                    }
+                }
                 _ => {}
             }
         }
@@ -668,6 +722,7 @@ pub fn describe() -> Vec<String> {
             let with = b.with.map(|w| format!("{w:?}+")).unwrap_or_default();
             let edge = match b.edge {
                 Edge::Press => "",
+                Edge::Tap => " (tapped)",
                 Edge::Repeat => " (repeats)",
                 Edge::Release => " (released)",
             };
@@ -762,14 +817,21 @@ mod tests {
     fn both_bumpers_select_the_whole_party() {
         let mut c = Controller::default();
         let mut s = PadState::default();
-        assert_eq!(
-            acts(&c.update(&press(&mut s, RB), Field, 16.0)),
-            vec![Action::NextMember]
-        );
+        // Alone, a bumper changes the leader when it is let go.
+        assert!(acts(&c.update(&press(&mut s, RB), Field, 16.0)).is_empty());
+        s.set(RB, false);
+        assert_eq!(acts(&c.update(&s, Field, 16.0)), vec![Action::NextMember]);
+        // The other joining makes it a chord: no leader change after.
+        press(&mut s, RB);
+        c.update(&s, Field, 16.0);
         assert_eq!(
             acts(&c.update(&press(&mut s, LB), Field, 16.0)),
             vec![Action::WholeParty]
         );
+        s.set(RB, false);
+        assert!(acts(&c.update(&s, Field, 16.0)).is_empty());
+        s.set(LB, false);
+        assert!(acts(&c.update(&s, Field, 16.0)).is_empty());
         // Both going down in the same frame: one chord.
         let mut c = Controller::default();
         let mut s = PadState::default();
@@ -853,6 +915,24 @@ mod tests {
             [Order::Camera { yaw, zoom }] => assert!(*yaw < 0.0 && *zoom > 0.0),
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn the_right_stick_scrolls_screens_in_whole_lines() {
+        let mut c = Controller::default();
+        let s = PadState {
+            right: Vec2::new(0.0, -1.0),
+            ..Default::default()
+        };
+        // Under a line: nothing yet; past it, whole lines down.
+        assert!(c.update(&s, Screen, 50.0).is_empty());
+        let o = c.update(&s, Screen, 400.0);
+        assert!(matches!(o.as_slice(), [Order::Scroll(l)] if *l <= -1.0 && l.fract() == 0.0));
+        // In the field the right stick is the camera's.
+        assert!(matches!(
+            c.update(&s, Field, 100.0).as_slice(),
+            [Order::Camera { .. }]
+        ));
     }
 
     #[test]

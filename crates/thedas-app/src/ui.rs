@@ -691,6 +691,36 @@ impl UiLayer {
         self.line.as_ref().map(|l| (l.played(), l.waits))
     }
 
+    /// Highlights conversation reply `n` (from 0) the way the reply buttons highlight
+    /// themselves when the console's focus lands on them (`NavigateOn` and `NavigateOff` on
+    /// `_root.ButtonContainer_mc.Buttons_mc.Response1_mc`-`Response6_mc`, looked up afresh
+    /// each time as the screen re-places them). False when the conversation screen is not
+    /// up. The PC game has no such highlight (the mouse's hover is its own): a deliberate
+    /// addition for the pad. Provisional: reply n is taken to be button n + 1, as the screen
+    /// numbers them.
+    pub fn highlight_reply(&mut self, n: usize) -> bool {
+        let Some(m) = self
+            .stage
+            .movies
+            .iter_mut()
+            .find(|m| m.name == "conversation.gfx")
+        else {
+            return false;
+        };
+        for k in 1..=6 {
+            let f = if k == n + 1 {
+                "NavigateOn"
+            } else {
+                "NavigateOff"
+            };
+            m.call(
+                &format!("_root.ButtonContainer_mc.Buttons_mc.Response{k}_mc.{f}"),
+                &[],
+            );
+        }
+        true
+    }
+
     /// conversation.gfx's continue action (it sends `Conversation.SelectResponse 0` when the
     /// line has nothing to choose).
     fn continue_conversation(&mut self) {
@@ -1024,6 +1054,12 @@ impl UiLayer {
 
     pub fn mouse_move(&mut self, x: f64, y: f64) {
         self.stage.mouse_move(x, y);
+    }
+
+    /// The mouse wheel turned `lines` (up positive) at (`x`, `y`): lists and text under the
+    /// mouse scroll.
+    pub fn mouse_wheel(&mut self, x: f64, y: f64, lines: f64) {
+        self.stage.mouse_wheel(x, y, lines);
     }
 
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {

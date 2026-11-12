@@ -894,6 +894,17 @@ impl UiMovie {
         self.with_player(|p| p.handle_event(PlayerEvent::MouseMove { x, y }));
     }
 
+    /// The mouse wheel turned `lines` (up positive) with the mouse at (`x`, `y`): the movie's
+    /// `onMouseWheel` listeners and the scrollable under the mouse hear it.
+    pub fn mouse_wheel(&mut self, x: f64, y: f64, lines: f64) {
+        self.with_player(|p| {
+            p.handle_event(PlayerEvent::MouseMove { x, y });
+            p.handle_event(PlayerEvent::MouseWheel {
+                delta: ruffle_core::events::MouseWheelDelta::Lines(lines),
+            });
+        });
+    }
+
     /// A key pressed and released: the movie's key listeners hear it (`Key.getCode`), and a
     /// focused text field takes the character or the edit.
     pub fn key(&mut self, key: UiKey) {

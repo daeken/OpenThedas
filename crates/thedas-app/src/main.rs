@@ -1176,6 +1176,25 @@ impl App {
         false
     }
 
+    /// The mouse wheel turns `steps` (up positive): over the interface, or with a screen up,
+    /// the list or text under the mouse scrolls; elsewhere the game camera zooms.
+    fn wheel(&mut self, steps: f64) {
+        let (x, y) = self.cursor;
+        if let Some(g) = self.gfx.as_mut() {
+            let on_ui = self
+                .screens
+                .as_ref()
+                .is_some_and(|s| !s.exploring() || g.ui.covers(x, y));
+            if on_ui {
+                g.ui.mouse_wheel(x, y, steps);
+                return;
+            }
+        }
+        if let Some(f) = self.follow.as_mut() {
+            f.zoom(steps as f32);
+        }
+    }
+
     /// The mouse moves to window pixel (`x`, `y`).
     fn cursor_to(&mut self, x: f64, y: f64) {
         self.cursor = (x, y);
@@ -1686,6 +1705,14 @@ impl padplay::Host for App {
             g.ui.clicked();
         }
     }
+
+    fn scroll(&mut self, lines: f64) {
+        App::wheel(self, lines);
+    }
+
+    fn highlight_reply(&mut self, n: usize) -> bool {
+        self.gfx.as_mut().is_some_and(|g| g.ui.highlight_reply(n))
+    }
 }
 
 impl ApplicationHandler for App {
@@ -1748,9 +1775,7 @@ impl ApplicationHandler for App {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y,
                     winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
                 };
-                if let Some(f) = self.follow.as_mut() {
-                    f.zoom(steps);
-                }
+                self.wheel(steps as f64);
             }
             WindowEvent::Focused(false) => {
                 self.keys.clear();
@@ -2002,6 +2027,20 @@ impl padplay::Host for HeadlessHost<'_> {
         if let Some((layer, _)) = self.played.as_deref_mut() {
             layer.clicked();
         }
+    }
+
+    fn scroll(&mut self, lines: f64) {
+        let (x, y) = *self.cursor;
+        if let Some((layer, _)) = self.played.as_deref_mut() {
+            layer.mouse_wheel(x, y, lines);
+            println!("pad scroll {lines} at {x:.0},{y:.0}");
+        }
+    }
+
+    fn highlight_reply(&mut self, n: usize) -> bool {
+        self.played
+            .as_deref_mut()
+            .is_some_and(|(layer, _)| layer.highlight_reply(n))
     }
 }
 
@@ -2600,6 +2639,18 @@ fn main() -> Result<()> {
                     sim.dialog_state().map(|d| (d.line, d.replies, d.ended))
                 );
             }
+            let party: Vec<_> = thedas_sim::engine::party_of(&sim)
+                .into_iter()
+                .filter_map(|m| sim.world.get(m))
+                .map(|o| {
+                    (
+                        o.tag.clone(),
+                        o.position,
+                        o.commands.first().map(|c| c.name.clone()),
+                    )
+                })
+                .collect();
+            log::info!("party: {party:?}");
             drop(sim);
             if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
                 camera = f.camera_clear(feet, 0.0, &camera, &|a, b| l.first_hit(a, b));
