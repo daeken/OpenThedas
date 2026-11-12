@@ -197,7 +197,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 - **AUD-047** **Output limiter (deliberate difference).** Original: FMOD's mixer clips (per comment; whether the exe adds a limiter is not traced). Ours: a -0.3 dBFS limiter with 0.2 s release. Evidence: `crates/thedas-audio/src/mixer.rs:207`. Size: S. Depends: none. Kind: provisional.
 - **AUD-048** **Volume options are not persisted.** Original: volume options persisted. Ours: the options screen's slider values feed `volumes()` but nothing writes the player's settings file. Evidence: `crates/thedas-ui/src/options.rs:11`, `crates/thedas-app/src/audio.rs:1527`. Size: S. Depends: CAM-044. Kind: missing.
 - **AUD-049** **Pause does not pause audio.** Original: pause behaviour. Ours: no code found; `Mixer::set_paused` has no caller and the game's pause does not reach `GameAudio`. Evidence: `crates/thedas-audio/src/mixer.rs:150`. Size: S. Depends: none. Kind: missing.
-- **AUD-050** **Audio during loading.** Original: audio during loading. Ours: no code found for an explicit loading-time policy. Evidence: `crates/thedas-app/src/audio.rs:1344`. Size: S. Depends: CAM-037. Kind: missing.
+- **AUD-050** **Audio during loading waits on the load state.** Original: `GM_LOADING` plays `OnGameLoading` (world sounds down 60 dB; music and voice carry on) and pauses music-volume delays (0x5bd220, 0x5bb669). Ours: done when `AudioState::loading` is set, which nothing sets until the app has a load state. Evidence: `crates/thedas-app/src/audio.rs:1243`. Size: S. Depends: CAM-037. Kind: missing.
 
 ### Voice-over
 
