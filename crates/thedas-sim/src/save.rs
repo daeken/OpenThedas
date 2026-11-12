@@ -307,6 +307,10 @@ impl Sim {
             }
         }
         self.learn_held_recipes();
+        // A loot panel does not outlive a load: the game is saved from its menu, with the
+        // panel closed, and an open one from a scripted save would point at a container that
+        // may be in another area. Provisional: the exe's save holds no open GUI.
+        self.world.container = None;
         // Saves made before the ability functions checked their ids may hold ones the exe
         // never would (0 from player_core's hire handler; see `Sim::ability_known`).
         let bad: Vec<(ObjectId, Vec<i32>)> = self
@@ -446,6 +450,15 @@ mod tests {
         s.talk = Some(talk(false));
         s.load_game(s.save_game()).unwrap();
         assert!(s.talk.as_ref().is_some_and(|c| !c.ended));
+    }
+
+    #[test]
+    fn an_open_loot_panel_does_not_survive_a_load() {
+        let mut s = sim();
+        let chest = s.world.spawn(crate::world::ObjectKind::Placeable, "chest");
+        s.open_container(chest);
+        s.load_game(s.save_game()).unwrap();
+        assert_eq!(s.world.container, None);
     }
 
     #[test]
