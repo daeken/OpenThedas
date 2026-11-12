@@ -40,8 +40,22 @@ impl Collider {
         draws: impl IntoIterator<Item = usize>,
         solid_only: bool,
     ) -> Self {
+        Self::from_draws_at(scene, draws, solid_only, |_| None)
+    }
+
+    /// [`Self::from_draws`] with each draw where `world` puts it (a door swung open), or
+    /// where the scene placed it when `world` gives none.
+    pub fn from_draws_at(
+        scene: &AreaScene,
+        draws: impl IntoIterator<Item = usize>,
+        solid_only: bool,
+        world: impl Fn(usize) -> Option<Mat4>,
+    ) -> Self {
         let mut triangles = Vec::new();
-        for d in draws.into_iter().filter_map(|i| scene.draws.get(i)) {
+        for (i, d) in draws
+            .into_iter()
+            .filter_map(|i| scene.draws.get(i).map(|d| (i, d)))
+        {
             if d.skin.is_some() {
                 continue;
             }
@@ -61,7 +75,7 @@ impl Collider {
                 continue;
             };
             triangles.extend(world_triangles(
-                &d.transform,
+                &world(i).unwrap_or(d.transform),
                 mesh.vertices.iter().map(|v| v.position),
                 &mesh.indices,
             ));
