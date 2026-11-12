@@ -176,7 +176,7 @@ impl Sim {
     /// Provisional: the game's Show Tutorials option is taken to be on, and a flag with no
     /// text queues nothing.
     pub(crate) fn queue_tutorial(&mut self, info: &PlotInfo, flag: i32) {
-        if flag >= DEFINED_FLAGS || !self.is_tutorial_kind(info.kind) {
+        if flag >= DEFINED_FLAGS || !self.is_tutorial_kind(info.kind) || !self.show_tutorials {
             return;
         }
         let Some(text) = info

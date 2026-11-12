@@ -176,8 +176,6 @@ Concrete defects found during the code read. Each is small and independent.
 | `RND-043` | Alpha-tested casters are skipped, so foliage, fences and hair cast no sun shadow |
 | `RND-095` | Location effects with an instant duration are discarded and never drawn |
 | `RND-139` | Compressed textures lose their smallest mip levels |
-| `UI-060` | The auto-pause option never reaches the simulation |
-| `UI-058` | Tutorials stay on whatever the setting says |
 | `UI-003` | Three interface queries are never answered |
 | `UI-006` | Unknown interface commands are dropped without a log line |
 | `UI-156` | With the free camera on, C both lowers the camera and opens the character record |
