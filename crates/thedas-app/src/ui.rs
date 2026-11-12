@@ -252,7 +252,9 @@ pub fn portrait_key(sim: &thedas_sim::Sim) -> Vec<(u32, u64)> {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             if let Some(o) = sim.world.get(id) {
                 o.appearance.hash(&mut h);
-                o.head_morph.hash(&mut h);
+                sim.face_name(id)
+                    .or_else(|| o.head_morph.clone())
+                    .hash(&mut h);
                 o.equipment.hash(&mut h);
                 o.area.hash(&mut h);
                 o.fields.get("Gender").hash(&mut h);

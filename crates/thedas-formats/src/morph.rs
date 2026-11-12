@@ -465,6 +465,9 @@ pub struct FaceOverlay {
     pub tints: Vec<(usize, Option<String>)>,
 }
 
+/// The material parameter tints fill.
+const TINT_PARAMETER: &str = "mml_vTintMaskColours";
+
 /// Slots past this are ignored (a morph holds a dozen tints).
 const MAX_OVERLAY_SLOT: usize = 32;
 
@@ -512,7 +515,81 @@ impl FaceOverlay {
     }
 }
 
+/// Where a face's tint slot puts its colours: on the nodes named with these prefixes, the
+/// `mml_vTintMaskColours` entries (in the tint's shader order, [`crate::tint::FIELD_ORDER`])
+/// it fills. Read from the exe's appearance setters (which slot each choice sets: lips 1,
+/// eyes 2, hair 3, eye shadow 4, blush 5, skin 0) and from the face presets, whose baked
+/// colours match their tints this way: the face takes its red pair from the lips, green from
+/// the eye shadow, blue from the blush and skin from the skin tone; eyes and hair take their
+/// three colour pairs from their own tint and skin from the skin tone. Provisional: the
+/// exe's own composition step (its morph rebuild job) is not traced; the opacity entries (0,
+/// 1), set by the intensity sliders, are left as they are.
+pub fn tint_slot_targets(slot: usize) -> &'static [(&'static str, &'static [usize])] {
+    const COLOURS: &[usize] = &[2, 3, 4, 5, 6, 7];
+    const SKIN: &[usize] = &[8, 9];
+    match slot {
+        0 => &[
+            ("FaceM", SKIN),
+            ("EyesM", SKIN),
+            ("HairM", SKIN),
+            ("BeardM", SKIN),
+        ],
+        1 => &[("FaceM", &[2, 3])],
+        2 => &[("EyesM", COLOURS)],
+        3 => &[("HairM", COLOURS), ("BeardM", COLOURS)],
+        4 => &[("FaceM", &[4, 5])],
+        5 => &[("FaceM", &[6, 7])],
+        _ => &[],
+    }
+}
+
+/// The nodes a tint reaches when the face has none of them yet (a hair model the face's
+/// preset did not have): the head models' usual mesh nodes.
+const TINT_NODES: &[&str] = &[
+    "FaceM1", "EyesM1", "HairM1", "HairM2", "HairM3", "BeardM1", "BeardM2", "BeardM3",
+];
+
 impl Morph {
+    /// `self` with tint slot `slot`'s colours put on its nodes (see [`tint_slot_targets`]).
+    pub fn with_tint(&self, slot: usize, tint: &crate::tint::Tint) -> Morph {
+        let mut m = self.clone();
+        for (prefix, entries) in tint_slot_targets(slot) {
+            let starts =
+                |n: &str| n.len() >= prefix.len() && n[..prefix.len()].eq_ignore_ascii_case(prefix);
+            for name in TINT_NODES.iter().filter(|n| starts(n)) {
+                if !m.nodes.iter().any(|n| n.name.eq_ignore_ascii_case(name)) {
+                    m.nodes.push(MorphNode {
+                        name: name.to_string(),
+                        ..Default::default()
+                    });
+                }
+            }
+            for node in m.nodes.iter_mut().filter(|n| starts(&n.name)) {
+                let j = match node
+                    .vectors
+                    .iter()
+                    .position(|(p, _)| p.eq_ignore_ascii_case(TINT_PARAMETER))
+                {
+                    Some(j) => j,
+                    None => {
+                        // Untouched entries keep the tint's own (as an item tint fills all).
+                        node.vectors
+                            .push((TINT_PARAMETER.to_string(), tint.colours.to_vec()));
+                        node.vectors.len() - 1
+                    }
+                };
+                let list = &mut node.vectors[j].1;
+                if list.len() < tint.colours.len() {
+                    list.resize(tint.colours.len(), [1.0; 4]);
+                }
+                for &e in *entries {
+                    list[e] = tint.colours[e];
+                }
+            }
+        }
+        m
+    }
+
     /// `self` with an overlay's model and tint slots put in.
     pub fn with_overlay(&self, o: &FaceOverlay) -> Morph {
         let mut m = self.clone();
@@ -648,6 +725,41 @@ mod tests {
         assert_eq!(m.model(slot::BEARD), None);
         assert_eq!(m.tints[3].as_deref(), Some("t3_har_bln"));
         assert_eq!(m.tints[0].as_deref(), Some("skin"));
+    }
+
+    #[test]
+    fn a_tint_slot_colours_its_nodes_entries() {
+        let mut t = crate::tint::Tint {
+            colours: [[0.0; 4]; crate::tint::COLOURS],
+        };
+        for (i, c) in t.colours.iter_mut().enumerate() {
+            *c = [i as f32; 4];
+        }
+        let m = Morph {
+            nodes: vec![MorphNode {
+                name: "HairM1".into(),
+                vectors: vec![("mml_vTintMaskColours".into(), vec![[9.0; 4]; 10])],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // Hair: its colour pairs, not its opacity or skin entries.
+        let h = m.with_tint(3, &t);
+        let v = &h.node("HairM1").unwrap().vectors[0].1;
+        assert_eq!(v[0], [9.0; 4]);
+        assert_eq!(v[2], [2.0; 4]);
+        assert_eq!(v[7], [7.0; 4]);
+        assert_eq!(v[8], [9.0; 4]);
+        // A hair node the face lacked gets the whole tint.
+        assert_eq!(h.node("HairM2").unwrap().vectors[0].1[0], [0.0; 4]);
+        // Skin: the skin pair of every head mesh.
+        let s = m.with_tint(0, &t);
+        assert_eq!(s.node("HairM1").unwrap().vectors[0].1[8], [8.0; 4]);
+        assert_eq!(s.node("HairM1").unwrap().vectors[0].1[2], [9.0; 4]);
+        // Lips: the face's red pair only.
+        let l = m.with_tint(1, &t);
+        assert_eq!(l.node("FaceM1").unwrap().vectors[0].1[2], [2.0; 4]);
+        assert!(tint_slot_targets(11).is_empty());
     }
 
     #[test]
