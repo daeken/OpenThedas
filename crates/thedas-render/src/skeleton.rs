@@ -103,25 +103,34 @@ impl Skeleton {
 
     /// The pose `anim` gives at `time` seconds (clamped to its length).
     pub fn pose(&self, anim: &Animation, time: f32) -> Vec<Mat4> {
-        let t = time.clamp(0.0, anim.length.max(0.0));
+        self.pose_layers(&[(anim, time, false)])
+    }
+
+    /// The pose of animations laid one over another: each sets the bones it has tracks for,
+    /// over what the ones before it set (a cutscene's head or gesture animation over a
+    /// body's). A bone's translation moves it from its rest by how far it is from the
+    /// animation's first key; for a layer marked as measured against the first (a
+    /// cutscene's), from the first layer's first key where that has one (a sitting
+    /// animation's lowered hips stay lowered against the standing pose). Provisional: from
+    /// what the animations look like; the executable's blend layers and weights are not
+    /// followed.
+    pub fn pose_layers(&self, layers: &[(&Animation, f32, bool)]) -> Vec<Mat4> {
         let mut rot: Vec<Option<Quat>> = vec![None; self.bones.len()];
         let mut pos: Vec<Option<Vec3>> = vec![None; self.bones.len()];
-        for track in &anim.tracks {
-            let Some(i) = self.node(&track.bone) else {
-                continue;
-            };
-            match track.channel {
-                Channel::Rotation => rot[i] = sample_rotation(&track.keys, t),
-                Channel::Translation => {
-                    let first = track
-                        .keys
-                        .first()
-                        .map(|k| Vec3::new(k.value[0], k.value[1], k.value[2]));
-                    pos[i] = sample_translation(&track.keys, t)
-                        .zip(first)
-                        .map(|(v, f)| self.bones[i].rest_translation + (v - f));
+        let mut reference: Vec<Option<Vec3>> = vec![None; self.bones.len()];
+        if let Some((base, _, _)) = layers.first() {
+            for track in &base.tracks {
+                if track.channel == Channel::Translation
+                    && let (Some(i), Some(k)) = (self.node(&track.bone), track.keys.first())
+                    && let Some(slot) = reference.get_mut(i)
+                {
+                    *slot = Some(Vec3::new(k.value[0], k.value[1], k.value[2]));
                 }
             }
+        }
+        for (n, (anim, time, against_base)) in layers.iter().enumerate() {
+            let r = (n > 0 && *against_base).then_some(reference.as_slice());
+            self.sample_into(anim, *time, r, &mut rot, &mut pos);
         }
         self.globals(|i| {
             let b = &self.bones[i];
@@ -130,6 +139,44 @@ impl Skeleton {
                 rot[i].unwrap_or(b.rest_rotation),
             )
         })
+    }
+
+    fn sample_into(
+        &self,
+        anim: &Animation,
+        time: f32,
+        reference: Option<&[Option<Vec3>]>,
+        rot: &mut [Option<Quat>],
+        pos: &mut [Option<Vec3>],
+    ) {
+        let t = time.clamp(0.0, anim.length.max(0.0));
+        for track in &anim.tracks {
+            let Some(i) = self.node(&track.bone) else {
+                continue;
+            };
+            match track.channel {
+                Channel::Rotation => {
+                    if let Some(r) = sample_rotation(&track.keys, t) {
+                        if let Some(slot) = rot.get_mut(i) {
+                            *slot = Some(r);
+                        }
+                    }
+                }
+                Channel::Translation => {
+                    let own = track
+                        .keys
+                        .first()
+                        .map(|k| Vec3::new(k.value[0], k.value[1], k.value[2]));
+                    let first = reference.and_then(|r| r.get(i).copied().flatten()).or(own);
+                    let p = sample_translation(&track.keys, t)
+                        .zip(first)
+                        .map(|(v, f)| self.bones[i].rest_translation + (v - f));
+                    if let (Some(p), Some(slot)) = (p, pos.get_mut(i)) {
+                        *slot = Some(p);
+                    }
+                }
+            }
+        }
     }
 }
 

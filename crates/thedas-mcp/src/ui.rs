@@ -28,6 +28,8 @@ pub fn clip(m: &thedas_ui::models::Motion) -> thedas_render::Clip {
         actions: m.actions.clone(),
         time: m.time,
         looping: m.looping,
+        layers: Vec::new(),
+        absolute: false,
     }
 }
 

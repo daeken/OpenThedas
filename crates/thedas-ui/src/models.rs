@@ -699,6 +699,11 @@ pub fn motion(sim: &Sim, o: &Object) -> Option<Motion> {
                 looping: true,
             });
         }
+        if c.name == "CommandPlayAnimation"
+            && let Some(m) = played_animation(sim, o, c, &trees(&[&ambient, &combat]))
+        {
+            return Some(m);
+        }
         if c.name == "CommandAttack" {
             if let Some(due) = c.due {
                 let length = o.combat.attack_ms.unwrap_or(DEFAULT_ATTACK_MS);
@@ -721,6 +726,47 @@ pub fn motion(sim: &Sim, o: &Object) -> Option<Motion> {
         actions: vec![action::PAUSE.into()],
         time: secs(now) + phase,
         looping: true,
+    })
+}
+
+/// `anim_base.gda`'s column naming the action an animation id plays in a creature's
+/// trees (`wichair_loop` for 912, "Chair Loop"). Column name not known; found by matching
+/// the rows' labels with the trees' actions.
+pub const COL_ANIM_ACTION: u32 = 0x7a39_8af9;
+
+/// What a creature playing `CommandPlayAnimation` (nAnimation, nLoops, bPlayNext,
+/// bBlendIn; `script.ldf`) shows: the `anim_base.gda` row's action in its ambient trees.
+/// An animation played forever (nLoops -1: the ambient system's sitting, leaning and
+/// working loops, `ambient_anim_patterns.gda`) loops on the world's clock, out of step per
+/// creature; any other plays from the command's start, held at its end. Provisional: the
+/// executable's command executor and its loop count are not traced; the simulation ends
+/// the command after half a second and the ambient scripts queue it again.
+fn played_animation(
+    sim: &Sim,
+    o: &Object,
+    c: &thedas_sim::world::Command,
+    trees: &[String],
+) -> Option<Motion> {
+    let id = *c.ints.first()?;
+    let action = text(
+        sim.world
+            .tables()
+            .get(0, "anim_base")?
+            .cell_by_hash(COL_ANIM_ACTION, id as i64),
+    )?;
+    let now = sim.world.time_ms;
+    let looping = c.ints.get(1) == Some(&-1);
+    let time = if looping {
+        now as f32 / 1000.0 + (o.id % 97) as f32 * 0.37
+    } else {
+        let start = c.due.map_or(now, |d| d.saturating_sub(500));
+        now.saturating_sub(start) as f32 / 1000.0
+    };
+    Some(Motion {
+        trees: trees.to_vec(),
+        actions: vec![action.to_ascii_lowercase(), action::PAUSE.into()],
+        time,
+        looping,
     })
 }
 

@@ -114,6 +114,8 @@ pub struct Sim {
     /// The closed door that stopped the last `walk`, if one did.
     pub walk_blocked_by: Option<ObjectId>,
     pub(crate) nav_grids: HashMap<String, Option<Arc<thedas_formats::level::NavGrid>>>,
+    /// Conversations' line staging, read once (see [`crate::cutactors::LineCut`]).
+    pub(crate) line_cuts: HashMap<String, Arc<Vec<crate::cutactors::LineCut>>>,
     /// Each layout's collision for sight lines (see `crate::collision`), loaded when first
     /// needed; `None` when the layout's files cannot be found.
     pub(crate) collisions: HashMap<String, Option<Arc<crate::collision::Collision>>>,
@@ -353,6 +355,7 @@ impl Sim {
             install_root: None,
             area_layouts: HashMap::new(),
             nav_grids: HashMap::new(),
+            line_cuts: HashMap::new(),
             collisions: HashMap::new(),
             placeable_collisions: HashMap::new(),
             fire_lengths: HashMap::new(),
@@ -728,6 +731,7 @@ impl Sim {
                 if self.cutscene_policy == CutscenePolicy::Play {
                     if let Some(mut c) = self.read_cutscene(&name) {
                         c.from_dialog = from_dialog;
+                        (c.bound, c.placement) = self.bind_cutscene_file(&res, from_dialog);
                         let t = self.world.time_ms;
                         self.world.trace.push(TraceEntry::Log {
                             t,
@@ -747,6 +751,9 @@ impl Sim {
                     }
                 }
                 if from_dialog {
+                    // Not played, but begun and ended all the same.
+                    let (bound, _) = self.bind_cutscene_file(&res, true);
+                    self.release_cutscene_actors(bound);
                     self.close_dialog_cutscene(&name, false);
                 } else {
                     self.end_cutscene(&name);
@@ -867,7 +874,9 @@ impl Sim {
     /// The cutscene playing has run (or the player skipped it): it ends as
     /// [`Sim::end_cutscene`] says, and the next one loaded may start.
     fn finish_cutscene(&mut self) {
-        if let Some(c) = self.world.cutscene.take() {
+        if let Some(mut c) = self.world.cutscene.take() {
+            let bound = std::mem::take(&mut c.bound);
+            self.release_cutscene_actors(bound);
             if c.from_dialog {
                 self.close_dialog_cutscene(&c.name, true);
             } else {
@@ -889,6 +898,45 @@ impl Sim {
                 if played { "" } else { " (not played)" }
             ),
         });
+    }
+
+    /// The objects cutscene file `res`'s actors take as it starts (see
+    /// [`crate::cutactors`]); for a conversation line's cutscene, as the line that queued it
+    /// plays it.
+    fn bind_cutscene_file(
+        &mut self,
+        res: &str,
+        from_dialog: bool,
+    ) -> (
+        Vec<crate::cutactors::Bound>,
+        Option<crate::cuttracks::Placement>,
+    ) {
+        let Some(tracks) = self
+            .vfs
+            .read(res)
+            .ok()
+            .map(|(data, _)| crate::cuttracks::Tracks::parse(&data))
+        else {
+            return (Vec::new(), None);
+        };
+        let line = if from_dialog {
+            let Some(c) = self.talk.take() else {
+                return (Vec::new(), None);
+            };
+            let ctx = c.cut_from.and_then(|l| self.line_context(&c, l, &tracks));
+            self.talk = Some(c);
+            // Its stage is not in the area: nobody is moved.
+            let Some(ctx) = ctx else {
+                return (Vec::new(), None);
+            };
+            Some(ctx)
+        } else {
+            None
+        };
+        (
+            self.bind_cutscene_actors(&tracks, line),
+            line.map(|l| l.placement),
+        )
     }
 
     /// A loaded cutscene's file (its length and lines), if it can be read. Lines that say
@@ -3718,6 +3766,8 @@ mod tests {
             }],
             elapsed_ms: 0,
             from_dialog: false,
+            bound: Vec::new(),
+            placement: None,
         };
         // While one plays the world stands still; what it sets waits for its end, and so
         // does the next one loaded.

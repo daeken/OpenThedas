@@ -389,6 +389,8 @@ mod tests {
             lines: Vec::new(),
             elapsed_ms: 0,
             from_dialog: false,
+            bound: Vec::new(),
+            placement: None,
         });
         assert_eq!(
             wanted(&sim, Some(Screen::Inventory)),
