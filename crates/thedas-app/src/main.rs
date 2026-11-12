@@ -436,6 +436,23 @@ fn capture(
             log_stats(&l.renderer);
         }
         reticle.extend(live.reticle(&camera, (w, h), cursor));
+        // THEDAS_BENCH_FRAMES=n: draws the frame n more times first and reports how long
+        // each took (with its read back to memory), for comparing builds.
+        if let Some(n) = std::env::var("THEDAS_BENCH_FRAMES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|n| *n > 0)
+        {
+            let mut ms = Vec::new();
+            for _ in 0..n {
+                let t = Instant::now();
+                live.capture(ctx, &camera, (w, h))?;
+                ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            let avg = ms.iter().sum::<f64>() / ms.len() as f64;
+            let worst = ms.iter().cloned().fold(0.0, f64::max);
+            println!("bench: {n} frames, avg {avg:.1} ms, worst {worst:.1} ms");
+        }
         live.capture(ctx, &camera, (w, h))?
             .unwrap_or_else(|| [0, 0, 0, 255].repeat(w as usize * h as usize))
     } else {

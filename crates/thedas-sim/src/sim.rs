@@ -361,6 +361,9 @@ const MELEE_TALENT_TOLERANCE: f32 = 1.0;
 /// start step (0x7a87c0) tests the two creatures' current positions (0x6a3dc0); the
 /// simulation has no frames, so it looks this often. Provisional.
 const APPROACH_CHECK_MS: u64 = 100;
+/// How far above or below the pathing grid's floor a creature placed in an area may stand
+/// and still be put on it (metres; see `Sim::spawn_instance`). Provisional.
+const SPAWN_SNAP_RANGE: f32 = 2.0;
 /// How far apart a moving creature's position is tested against triggers as it walks, in metres.
 const TRIGGER_STEP: f32 = 0.5;
 
@@ -3286,6 +3289,30 @@ impl Sim {
                         .push([float(s, "XPoint"), float(s, "YPoint"), float(s, "ZPoint")]);
                 }
             }
+        }
+        // A creature stands on the ground: DAOrigins.exe sets a loaded creature's position
+        // again through its physics controller (0x695540 -> 0x6b5ef0 -> 0x6b1790), which
+        // projects it onto the walkable surface (0x73e370, 0x73e7f0), so one placed a little
+        // above or below the floor lands on it (Dust Town's slum guard is placed 1.3 m up).
+        // Provisional: the pathing grid's floor stands in for the walk surface; only a floor
+        // within [`SPAWN_SNAP_RANGE`] with no level geometry in between is used, so
+        // creatures placed on a level the grid does not hold keep their height.
+        if kind == ObjectKind::Creature
+            && let Some(p) = self.world.get(id).map(|o| o.position)
+            && let Some(floor) = self.floor_at(area, p)
+            && (p[2] - floor).abs() > 0.05
+            && (p[2] - floor).abs() <= SPAWN_SNAP_RANGE
+            // A creature on a ledge, balcony or bridge the grid does not hold has the
+            // level's geometry between it and the grid's floor: it keeps its height.
+            && !self.collision(area).is_some_and(|c| {
+                c.blocked(
+                    [p[0], p[1], p[2] + 0.05],
+                    [p[0], p[1], floor + 0.05 * (p[2] - floor).signum()],
+                )
+            })
+            && let Some(o) = self.world.get_mut(id)
+        {
+            o.position[2] = floor;
         }
         if let Some(t) = &tmpl {
             match kind {

@@ -287,6 +287,16 @@ cargo test
 
 Unit tests use synthetic fixtures only. Tests never need, and must never commit, game data.
 
+To compare frame cost between builds, set `THEDAS_BENCH_FRAMES=n` on a headless capture. The
+capture's final frame is then drawn `n` more times first, and the time of each draw, including
+its read back to memory, is printed as `bench: n frames, avg … ms, worst … ms`. Use the same
+save, steps and size on both builds; the read back makes the numbers an upper bound, so compare
+ratios, not absolutes. Unset, nothing changes.
+
+```sh
+THEDAS_BENCH_FRAMES=30 thedas-app --save wilds.json --size 1280x720 --capture x.png --steps "run 2000"
+```
+
 xoreos is a useful reference for file formats. It is GPLv3 and this project is MIT, so read it
 to understand a format, then write our own implementation; never copy its code. The same applies
 to any proprietary SDK source.
