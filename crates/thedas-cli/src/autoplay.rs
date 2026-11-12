@@ -819,7 +819,7 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
             if !sim.walk(hero, leg(sim, hero, p), a) {
                 // A closed door in the way: the player opens it (uses it), as by clicking.
                 if let Some(door) = sim.walk_blocked_by {
-                    let ev = sim.new_event("USE", Some(hero));
+                    let ev = sim.use_event(hero, door);
                     sim.deliver(door, ev, None);
                 }
                 sim.tick(500);
@@ -837,7 +837,7 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
                 .map(|d| (d.position, d.area))
                 .unwrap_or_default();
             sim.walk(hero, p, a);
-            let ev = sim.new_event("USE", Some(hero));
+            let ev = sim.use_event(hero, door);
             sim.deliver(door, ev, None);
             sim.tick(500);
             continue;

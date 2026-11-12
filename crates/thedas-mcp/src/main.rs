@@ -1215,7 +1215,7 @@ impl Server {
                     return Err("it has nothing to say".into());
                 }
             } else {
-                let ev = sim.new_event("USE", Some(hero));
+                let ev = sim.use_event(hero, id);
                 sim.deliver(id, ev, None);
             }
             sim.tick(0);
