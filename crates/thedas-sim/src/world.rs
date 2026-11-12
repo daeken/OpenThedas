@@ -428,8 +428,9 @@ pub struct FloatyMessage {
     pub duration: f32,
 }
 
-/// A sound a script asked for (`PlaySound`, `PlaySoundSet`, `PlaySoundObject`, `PlayMusic`,
-/// `SetMusicIntensity`), for the presentation to play. Output only.
+/// A sound a script asked for (`PlaySound`, `PlaySoundSet`, `PlaySoundObject`, `PlayMusic`)
+/// or a blow made, for the presentation to play. Output only. (`SetMusicIntensity` is kept
+/// in [`World::music_intensity`].)
 #[derive(Clone, Debug, PartialEq)]
 pub enum SoundRequest {
     /// `PlaySound(oTarget, sSoundEventName)`: an FMOD event at the object.
@@ -445,8 +446,6 @@ pub enum SoundRequest {
     Object { sound: ObjectId },
     /// `PlayMusic(sMusicName)`.
     Music { name: String },
-    /// `SetMusicIntensity(nIntensity)`.
-    MusicIntensity { intensity: i32 },
     /// An attack's blow landed or missed (one hand's impact): the attacker, the target,
     /// the `COMBAT_RESULT_*`, and the base items (`BaseItem`) of the attacker's weapon in
     /// that hand and of the target's armour (body slot) and off-hand item (a shield).
@@ -525,6 +524,11 @@ pub struct World {
     /// The whole party fell: the original shows its death screen and the game ends there.
     #[serde(default)]
     pub game_over: bool,
+    /// The music's intensity, as scripts last set it (`SetMusicIntensity`; 1 until then).
+    /// Only the presentation reads it; it is saved so a loaded game sounds as it did.
+    /// Provisional: whether the original keeps it in its saves is not traced.
+    #[serde(default = "music_intensity_default")]
+    pub music_intensity: i32,
     /// The game difficulty (`difficulty.gda`'s rows: 0 casual, 1 normal, 2 hard, 3
     /// nightmare), as the difficulty option sets it and `GetGameDifficulty` reads it.
     #[serde(default = "normal_difficulty")]
@@ -595,6 +599,10 @@ pub struct World {
     pub sounds: Vec<SoundRequest>,
     #[serde(skip, default = "no_tables")]
     pub(crate) tables: Arc<crate::m2da::Tables>,
+}
+
+fn music_intensity_default() -> i32 {
+    1
 }
 
 fn no_tables() -> Arc<crate::m2da::Tables> {
@@ -685,6 +693,7 @@ impl World {
             hostility: BTreeMap::new(),
             party_fighting: false,
             game_over: false,
+            music_intensity: 1,
             difficulty: normal_difficulty(),
             autopilot: false,
             pool_xp: false,
