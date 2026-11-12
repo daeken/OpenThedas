@@ -2110,6 +2110,12 @@ impl Server {
                         "refused to save {path}: the whole party has fallen (game over)"
                     ));
                 }
+                // As the game refuses: no save holds a training step (see
+                // `Sim::saving_blocked`), so scripted playthroughs do not mint saves the
+                // original could never make. Finish or dismiss the training first.
+                if let Some(why) = sim.saving_blocked() {
+                    return Err(format!("refused to save {path}: {why}"));
+                }
                 let bytes = sim.save_json().map_err(|e| e.to_string())?;
                 std::fs::write(path, &bytes).map_err(|e| format!("writing {path}: {e}"))?;
                 out["file"] = json!(path);

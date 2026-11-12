@@ -430,6 +430,14 @@ mod tests {
     }
 
     #[test]
+    fn training_blocks_saving() {
+        let mut s = sim();
+        assert!(s.saving_blocked().is_none());
+        s.world.training.mode = 5;
+        assert!(s.saving_blocked().is_some());
+    }
+
+    #[test]
     fn a_finished_conversation_does_not_come_back_with_a_load() {
         use crate::dialog::{Conversation, Dlg};
         let mut s = sim();
