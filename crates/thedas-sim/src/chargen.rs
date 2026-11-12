@@ -81,7 +81,7 @@ impl Sim {
     /// [`Sim::show_tutorials`]) but left for the interface to keep. Other options are not
     /// taken. Provisional: the executable keeps the difficulty
     /// with the client options; the save does not record it there (here the world does).
-    pub(crate) fn client_option_message(&mut self, name: &str, args: &[String]) -> bool {
+    pub fn client_option_message(&mut self, name: &str, args: &[String]) -> bool {
         match name {
             MSG_CLIENT_OPTION
                 if args.first().map(|a| a.trim()) == Some("GameOptions.DifficultyLevel") =>
