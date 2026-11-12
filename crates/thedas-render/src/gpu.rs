@@ -956,6 +956,11 @@ impl AreaRenderer {
 
     /// Moves scene draw `draw` to `transform` (model to world). The lights picked for it at
     /// load stay.
+    /// A draw's model-to-world transform as last placed or posed.
+    pub fn draw_world(&self, draw: usize) -> Option<glam::Mat4> {
+        self.d3d.world(draw)
+    }
+
     pub fn set_transform(&mut self, ctx: &GpuContext, draw: usize, transform: glam::Mat4) {
         if let Some(Some(i)) = self.stand_in_of.get(draw) {
             let model = transform.to_cols_array_2d();

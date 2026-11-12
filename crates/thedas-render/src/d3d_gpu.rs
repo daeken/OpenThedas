@@ -1789,6 +1789,11 @@ impl D3dPass {
     }
 
     /// Sets scene draw `draw`'s model-to-world transform for the next frames.
+    /// A draw's model-to-world transform as last placed.
+    pub fn world(&self, draw: usize) -> Option<glam::Mat4> {
+        self.worlds.get(draw).map(|w| w.0)
+    }
+
     pub fn set_world(&mut self, draw: usize, world: glam::Mat4) {
         if let Some(w) = self.worlds.get_mut(draw) {
             w.0 = world;

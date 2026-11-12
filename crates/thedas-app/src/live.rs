@@ -45,8 +45,62 @@ pub struct LiveObjects {
     /// The placeables' opaque surfaces as drawn (doors, furniture), which the game camera
     /// keeps on the near side of, as it does the level's.
     solid: thedas_render::collide::Collider,
+    /// Placeables that animate (doors), apart from `solid`: their surfaces as posed, rebuilt
+    /// as they move. DAOrigins.exe's door collision is a shape under the leaf's mesh node
+    /// (`plc_doorlgdwf_05_0.phy`: `DoorLow` > `cobj` > `shap`), so it swings with the leaf.
+    moving: std::collections::HashMap<ObjectId, Moving>,
     pub scene: AreaScene,
     pub renderer: AreaRenderer,
+}
+
+/// An animating placeable's surfaces as last posed.
+struct Moving {
+    /// Its prop in the objects' scene.
+    prop: usize,
+    interactive: bool,
+    /// Its draws' transforms when its surfaces were last built.
+    worlds: Vec<Mat4>,
+    solid: thedas_render::collide::Collider,
+}
+
+impl LiveObjects {
+    /// Rebuilds the surfaces of animating placeables that moved since their last build.
+    fn follow_poses(&mut self) {
+        for (id, m) in &mut self.moving {
+            let Some(p) = self.scene.props.get(m.prop) else {
+                continue;
+            };
+            let worlds: Vec<Mat4> = p
+                .draws
+                .clone()
+                .map(|d| self.renderer.draw_world(d).unwrap_or(Mat4::IDENTITY))
+                .collect();
+            if worlds == m.worlds {
+                continue;
+            }
+            let at = |d: usize| self.renderer.draw_world(d);
+            m.solid = thedas_render::collide::Collider::from_draws_at(
+                &self.scene,
+                p.draws.clone(),
+                true,
+                at,
+            );
+            if m.interactive {
+                let shape = thedas_render::collide::Collider::from_draws_at(
+                    &self.scene,
+                    p.draws.clone(),
+                    false,
+                    at,
+                );
+                if shape.is_empty() {
+                    self.shapes.remove(id);
+                } else {
+                    self.shapes.insert(*id, shape);
+                }
+            }
+            m.worlds = worlds;
+        }
+    }
 }
 
 pub struct Live {
@@ -254,10 +308,12 @@ impl Live {
             .level
             .as_ref()
             .and_then(|l| l.collider.sweep(from, to, radius));
-        let objects = self
-            .objects
-            .as_ref()
-            .and_then(|o| o.solid.sweep(from, to, radius));
+        let objects = self.objects.as_ref().and_then(|o| {
+            std::iter::once(&o.solid)
+                .chain(o.moving.values().map(|m| &m.solid))
+                .filter_map(|c| c.sweep(from, to, radius))
+                .reduce(f32::min)
+        });
         match (level, objects) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -621,6 +677,7 @@ impl Live {
             &posed,
             0.0,
         );
+        objects.follow_poses();
         self.posed = models
             .iter()
             .zip(posed)
@@ -782,7 +839,8 @@ impl Live {
         let mut faces = std::collections::HashMap::new();
         let mut shapes = std::collections::HashMap::new();
         let mut placeable_draws = Vec::new();
-        for (m, p) in models.iter().zip(&scene.props) {
+        let mut moving = std::collections::HashMap::new();
+        for (i, (m, p)) in models.iter().zip(&scene.props).enumerate() {
             let (interactive, placeable) = {
                 let sim = self.sim();
                 let placeable = sim
@@ -792,7 +850,17 @@ impl Live {
                 let interactive = placeable && sim.world.get(m.id).is_some_and(|o| o.interactive);
                 (interactive, placeable)
             };
-            if placeable {
+            if placeable && m.motion.is_some() {
+                moving.insert(
+                    m.id,
+                    Moving {
+                        prop: i,
+                        interactive,
+                        worlds: Vec::new(),
+                        solid: Default::default(),
+                    },
+                );
+            } else if placeable {
                 placeable_draws.extend(p.draws.clone());
             }
             if interactive {
@@ -838,6 +906,7 @@ impl Live {
             shapes,
             faces,
             solid,
+            moving,
             scene,
             renderer,
         })
