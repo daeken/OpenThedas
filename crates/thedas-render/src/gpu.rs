@@ -1589,6 +1589,19 @@ fn create_pipeline(
 
 #[cfg(test)]
 mod tests {
+
+    /// A level can be built on a worker thread (the load screen's) and handed back: the
+    /// renderer moves between threads and the GPU context is shared.
+    #[test]
+    fn renderers_build_on_worker_threads() {
+        fn send<T: Send>() {}
+        fn shared<T: Send + Sync>() {}
+        send::<AreaRenderer>();
+        send::<crate::scene::AreaScene>();
+        send::<RenderCache>();
+        shared::<GpuContext>();
+        shared::<thedas_vfs::Vfs>();
+    }
     use super::*;
     use crate::scene::{DrawItem, SceneMaterial, SceneMesh};
     use glam::{Mat4, Vec3};

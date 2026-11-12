@@ -10,7 +10,7 @@ repository.
 
 ## Status
 
-Last updated 2026-11-12 19:00 UTC, main 8a39900
+Last updated 2026-11-12 20:15 UTC, main 14e8c8b
 
 For everything that is wrong or missing, in detail and split into items that can be picked up in
 parallel, see [docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md).
@@ -44,6 +44,9 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Creatures the camera is inside fade out as the exe does (0.25 m sphere against the models' creature-group physics shapes, head included; opacity 0.05; not in dialog or cutscenes). Provisional: the shapes are placed by rest pose, not the animated skeleton.
   - With a pad, A walks through open doors instead of using them.
   - The follow camera resets behind the leader after a load and at the end of a cutscene, as the exe does, and keeps its zoom across loads.
+  - A new area's level and objects are built on a worker thread while the window keeps presenting a loading frame (black for now; the original's loading movies are next). The world holds still and its sounds duck meanwhile, and the camera resets as the world comes up. The simulation's own load is unchanged and still takes one frame (about 0.4 s into the Commons). Headless captures load within the frame as before; `THEDAS_ASYNC_LOADS=1` uses the worker there too.
+  - The field of view narrows from 60° to 42.5° toward the far, tactical end of zoom, as the exe does. Page Up and Page Down zoom.
+  - Creatures placed by an area stand on its floor, as the exe projects them (this was the "see-through guard" in the Dust Town opening).
 - 🟡 **Combat and simulation**:
   - NWScript VM with a large share of the engine functions; melee and ability timing; threat; AI-driven party; tactics; loot.
   - Containers hold their template's items and open on USE with the original loot panel (Take All, Close).
@@ -81,9 +84,12 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Lava draws with its own shaders. Level-wide layouts draw (horizons, water, tents), with probe cubemaps as the environment map. Missing material textures fall back to the parameter's default, not black.
   - Per-object opacity, for the camera fade and corpse decay. Faded objects cast no shadow, as in the exe.
   - Level terrain and static meshes take no ambient light nodes, as traced; this removed a green cast from daylight ground.
+  - Each area is graded with its own colour curve and brightness, contrast, hue and saturation from the area table, as the exe does. Daylight areas now match the original's brightness and warmth (QA: alienage and Commons).
+  - Looking down from high above the party cuts away ceilings marked for it in the models, with the exe's height threshold and 0.2 s fade.
+  - Only per-frame shader constants are rewritten per draw, and first-use work is done at the end of a load, which took about a fifth off frame time and removed the stutter after arriving in an area.
   - Open:
-    - SpeedTrees draw as billboards from the level's billboard atlas (interim). A clean-room tree generator, written from our own format and generation spec (`docs/speedtree/`), now builds trunk, branch, frond and leaf meshes for all 552 tree files; drawing them, wind, grass and bushes are not done.
-    - Daylight scenes are still about half as bright and cooler than the original. Gamma, sRGB, lightmap scale and light selection have been ruled out by traces; the missing term is not found yet.
+    - Trees, bushes and grass are real geometry from a clean-room SpeedTree generator written from our own spec (`docs/speedtree/`): trunks, branches, fronds, leaf cards and mesh leaves, with the game's distance rule for switching to billboards, batched per ground cell. Wind, camera-facing leaf cards and the game's own tree shaders are not done.
+    - Emitters in a cut-away model do not fade with it.
   - The backend stays on wgpu, and its types are kept inside `thedas-render`.
 - 🟡 **Audio**:
   - Merged:
@@ -93,7 +99,8 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
     - movement: footsteps by walkmesh surface, foley and vegetation rustles, as traced;
     - effects: UI sounds, boot movie sound, script PlaySound, animation sound events (swings, armour foley) and bodyfalls; blows sound at the hit frame with the weapon's action;
     - voices: conversation and cutscene voice-over, sound-set and engine barks with the exe's sound-set player (counts, shuffle bag, gender), creature sound-set events, party picker lines, the chargen voice preview.
-  - Not yet: PlayMusic, voice-over positioning, and the master and secondary reverb chain.
+  - Also merged: the ducking of world sound in conversations, cutscenes, death and loads (#392), music volume triggers, area music carrying on across areas that share a theme, and placeables' animation sounds.
+  - Not yet: voice-over positioning, and the master and secondary reverb chain. (The PlayMusic and StopMusic script calls do nothing in the original either, traced in #395.)
   - Sound is off with `--control` (unless `--audio`) and in headless captures.
 - 🟡 **Controller**: Xbox 360-style layout; menus and in-game screens use focus navigation, and A dismisses tutorial popups. The PC right-click radial menu doesn't exist as a movie in the game data, so LT opens a quickbar picker instead.
 - ✅ **Saves**: F5/F9 quick save and load, save/load screens, typed names. Revision 7 fills older saves' empty containers.
@@ -102,7 +109,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
 
 ### Known blockers
 
-None open. The Proving armour chest was fixed by #253 and #254.
+None open. Loading screens are in progress: today the window freezes while an area loads, with nothing shown. The Proving armour chest was fixed by #253 and #254.
 
 ### Origin openings
 

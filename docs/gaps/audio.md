@@ -14,15 +14,12 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
 
 1. **Music changes.**
    - Done: a change waits for the playing track's next marker (first sync point 0.4–15 s ahead, else 0.4 s on); the stinger, started paused, and the new track start together there, and the old track fades out (0x5c4b10 states 3–7). An area with the same theme as the last keeps its music playing (SetTheme ignores the theme already playing, 0x5c0ec9).
-   - Not done: the 12 s load timeout ("Music failed to start") and delayed theme changes (state 9, counted in frames); both come with `PlayMusic` (item 2).
+   - Not done: the 12 s load timeout ("Music failed to start") and delayed theme changes (state 9, counted in frames); both belong to theme changes (SetTheme 0x5c0e60), not traced from area entry yet.
    - Size: small.
-2. **Script `PlayMusic` and `SetMusicIntensity`.**
-   - Original: `PlayMusic` names a project; `SetMusicIntensity` sets the `music_state` parameter.
-   - Ours: `SetMusicIntensity` is stored in the World and applied; `PlayMusic` is only logged.
-   - Size: small to medium. Depends on item 1.
 4. **Music during cutscenes and conversations.**
-   - Whether the area music ducks, stops or keeps playing isn't traced.
-   - Ours: left alone apart from the `#duck` categories. Medium.
+   - Done: the game mode's ducking (0x5bd220): dialog and cutscenes play `OnCutscene` (music −3 dB, ambience and effects lower), death `OnDeath`, loading `OnGameLoading` (world sounds −60 dB; music and voice untouched).
+   - Not done: the music director's own mode changes (0x5bb630: cues per mode, `chargen`), and `OnExploreMusic` / `OnCombatMusic`, which the exe swaps as the music changes between explore and combat (0x5bc761..0x5bce5b, under a volume check not traced).
+   - Medium.
 5. **Death and party-wipe music.** The `Death` track plays when the game is over; exactly when the original switches isn't traced. Small.
 6. **Other main-menu music** (after the credits, DLC menus). Only `music/_menu` is wired. Small.
 7. **Credits music** (exe string `credits_df`). Not wired. Small.
@@ -126,7 +123,7 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
     - `PlayGUISound` comes from the interface movies. Rows with no event (for example 55, "open tutorial") are correctly silent.
     - Coverage of the movies' sound calls isn't checked.
     - Small.
-38. **Pause.** Whether world audio pauses in menus and the inventory isn't traced. Small.
+38. **Pause.** The exe plays `audio_categories/ducking/OnGamePause` (0x5d6814, 0x5d68fb; callers not traced), which pauses movement, footsteps and voice categories (`#pause:`, AUD-027) and ducks the rest; and `OnMovie` for movies (0x6dc0ba, 0x7ce7cb). Neither is played. Small.
 
 ### Loading and system
 
@@ -176,9 +173,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 
 ### Music
 
-- **AUD-032** **`PlayMusic` is dropped.** Original: not traced. Ours: the sim queues `SoundRequest::Music`; the app logs "not done yet" and discards it. Evidence: `crates/thedas-sim/src/engine.rs:502`, `crates/thedas-app/src/main.rs:2335`. Size: S. Depends: none. Kind: missing.
-- **AUD-033** **The script path of `SetMusicIntensity` is inferred.** Original: the music object's SetMusicIntensity (0x5c0150) sets `music_state` on the theme's main, combat and third events; how the script command reaches it is not traced. Ours: sets `music_state` on the area track to the integer given. Evidence: `crates/thedas-app/src/audio.rs:1570`. Size: S. Depends: none. Kind: provisional.
-- **AUD-034** **Music during cutscenes and conversations is left alone.** Original: not traced. Ours: the area track keeps playing through cutscenes and conversations. Evidence: `crates/thedas-app/src/audio.rs:1141`. Size: S. Depends: none. Kind: provisional.
+- **AUD-034** **Cutscene mode is taken from the cutscene playing.** Original: `GM_CUTSCENE` (5) plays `OnCutscene` (0x5bd220). Ours: a cutscene playing outside dialog counts as `GM_CUTSCENE`, as our simulation does not switch to that mode; an app load state must set `AudioState::loading`. Evidence: `crates/thedas-app/src/audio.rs:1240`. Size: S. Depends: none. Kind: provisional.
 
 ### World sound, reverb, occlusion
 
@@ -186,7 +181,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 - **AUD-036** **The reverb is our own algorithm.** Original: FMOD Ex software I3DL2 reverb. Ours: four taps, two diffusers, 8-line FDN; decay LF ratio, modulation, echo, environment and room rolloff are unused. Evidence: `crates/thedas-audio/src/reverb.rs:27`. Size: M. Depends: none. Kind: provisional.
 - **AUD-037** **Reverb trigger entry rule is guessed.** Original: enter handler 0x79b3d0 (caller not traced). Ours: the party leader's entering counts; of several entered in one step, the last listed wins. Evidence: `crates/thedas-audio/src/area.rs:166`. Size: S. Depends: none. Kind: provisional.
 - **AUD-064** **Placeable sounds play where the placeable stands.** Original: kind-27 sounds play at the centre of the model's bounds, transformed by its placement (0x74c4e2..0x74c686). Ours: at the placeable's position. Evidence: `crates/thedas-app/src/audio.rs:952`. Size: S. Depends: none. Kind: provisional.
-- **AUD-063** **Music volume entry rule and pause are guessed.** Original: the enter handler 0x799380 stores the volume's state and delay on the music director, whose update (0x5bb630) counts the delay down except in game mode 9 (0x5bb669, not identified). Ours: the party leader's entering counts, the last listed of several wins, and the countdown never pauses. Evidence: `crates/thedas-audio/src/area.rs:222`, `crates/thedas-app/src/audio.rs:1579`. Size: S. Depends: none. Kind: provisional.
+- **AUD-063** **Music volume entry rule is guessed.** Original: the enter handler 0x799380 stores the volume's state and delay on the music director, whose update (0x5bb630) counts the delay down except while loading (`GM_LOADING`, 0x5bb669). Ours: the party leader's entering counts, the last listed of several wins, and the countdown pauses only while the app says it is loading. Evidence: `crates/thedas-audio/src/area.rs:222`, `crates/thedas-app/src/audio.rs:1579`. Size: S. Depends: none. Kind: provisional.
 - **AUD-038** **Audio-volume triggers act only as reverb triggers.** Original: `CCTriggerAudioVolume` (type 4, loader 0x79a5d0) subclasses the reverb trigger. Ours: type 4 sets reverb and weighs 0.15 in the starting preset; any other behaviour of the subclass is not traced. Evidence: `crates/thedas-audio/src/area.rs:74`. Size: M. Depends: none. Kind: unverified.
 - **AUD-039** **Occlusion and obstruction.** Original: occlusion. Ours: no code found. Evidence: `crates/thedas-audio/src/engine.rs:837`. Size: L. Depends: AUD-004. Kind: missing.
 - **AUD-040** **Placed sounds' reach and replay are guessed.** Original: not traced. Ours: a placed sound starts within 1.1 x its event's max distance times `MaxDistanceMult` and stops outside; a one-shot that finished plays again only after the listener leaves and returns. Orientation fields are not read. Evidence: `crates/thedas-app/src/audio.rs:1231`, `crates/thedas-audio/src/area.rs:66`. Size: S. Depends: none. Kind: unverified.
@@ -202,7 +197,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 - **AUD-047** **Output limiter (deliberate difference).** Original: FMOD's mixer clips (per comment; whether the exe adds a limiter is not traced). Ours: a -0.3 dBFS limiter with 0.2 s release. Evidence: `crates/thedas-audio/src/mixer.rs:207`. Size: S. Depends: none. Kind: provisional.
 - **AUD-048** **Volume options are not persisted.** Original: volume options persisted. Ours: the options screen's slider values feed `volumes()` but nothing writes the player's settings file. Evidence: `crates/thedas-ui/src/options.rs:11`, `crates/thedas-app/src/audio.rs:1527`. Size: S. Depends: CAM-044. Kind: missing.
 - **AUD-049** **Pause does not pause audio.** Original: pause behaviour. Ours: no code found; `Mixer::set_paused` has no caller and the game's pause does not reach `GameAudio`. Evidence: `crates/thedas-audio/src/mixer.rs:150`. Size: S. Depends: none. Kind: missing.
-- **AUD-050** **Audio during loading.** Original: audio during loading. Ours: no code found for an explicit loading-time policy. Evidence: `crates/thedas-app/src/audio.rs:1344`. Size: S. Depends: CAM-037. Kind: missing.
+- **AUD-050** **Audio during loading waits on the load state.** Original: `GM_LOADING` plays `OnGameLoading` (world sounds down 60 dB; music and voice carry on) and pauses music-volume delays (0x5bd220, 0x5bb669). Ours: done when `AudioState::loading` is set, which nothing sets until the app has a load state. Evidence: `crates/thedas-app/src/audio.rs:1243`. Size: S. Depends: CAM-037. Kind: missing.
 
 ### Voice-over
 

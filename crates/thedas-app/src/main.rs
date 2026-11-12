@@ -431,7 +431,13 @@ fn capture(
 ) -> Result<()> {
     let mut reticle = overlay;
     let pixels = if let Some(live) = live {
+        live.frame_size = (w, h);
         live.sync(ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
+        // A load still building on its worker (THEDAS_ASYNC_LOADS) finishes first.
+        while live.loading() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            live.sync(ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
+        }
         if let Some(l) = live.level.as_ref() {
             log_stats(&l.renderer);
         }
@@ -876,7 +882,9 @@ impl App {
         let dt = (now - self.last).as_secs_f32().min(0.1);
         self.last = now;
         let k = |c| self.keys.contains(&c);
-        if let (Some(f), Some(l)) = (self.follow.as_mut(), self.live.as_mut()) {
+        // The camera waits for a load to finish: it resets as the world comes up.
+        let loading = self.live.as_ref().is_some_and(|l| l.loading());
+        if let (Some(f), Some(l), false) = (self.follow.as_mut(), self.live.as_mut(), loading) {
             if let Some(heading) = l.camera_reset_due() {
                 f.reset(heading);
             }
@@ -1067,7 +1075,11 @@ impl App {
             if !stopped {
                 live.step(dt);
             }
-            live.advance_presentation(dt);
+            // While a level loads the world holds still: its presentation too.
+            if !live.loading() {
+                live.advance_presentation(dt);
+            }
+            live.frame_size = (g.config.width, g.config.height);
             live.sync(&g.ctx, g.config.format)?;
             // Portraits are drawn by the objects' renderers, whose constants this frame's
             // draws use too: they are drawn (and submitted) before the frame is encoded, so
@@ -1203,7 +1215,11 @@ impl App {
             if !stopped {
                 live.step(dt);
             }
-            live.advance_presentation(dt);
+            // While a level loads the world holds still: its presentation too.
+            if !live.loading() {
+                live.advance_presentation(dt);
+            }
+            live.frame_size = (g.config.width, g.config.height);
             live.sync(&g.ctx, g.config.format)?;
         }
         if self.live.is_none() {
@@ -1990,6 +2006,7 @@ impl App {
                         self.camera.fov_y = fov;
                     }
                     self.screens = Some(screens::Screens::new(l.front_end));
+                    l.async_loads = true;
                     self.live = Some(l);
                 }
                 Err(e) => log::warn!("front end: {r:?} failed: {e:#}"),
@@ -2269,6 +2286,8 @@ fn audio_state(
     let Some(live) = live else {
         return state;
     };
+    // The loading frame is up: the world's sounds duck as in the exe's loading mode.
+    state.loading = live.loading();
     // Animations' sound events (see `Live::animation_clocks`), with what each creature
     // wears and wields.
     if !live.front_end {
@@ -2450,8 +2469,8 @@ fn audio_state(
                         state.sound_sets.push((set, entry, probability, at));
                     }
                 }
-                // PlayMusic names the music project (`music`, from the Music M2DA by
-                // module), which is always the one used here.
+                // PlayMusic and StopMusic do nothing in DAOrigins.exe: their shared handler
+                // (0x65cfd0, commands 484 and 485) reads the name and drops it.
                 other => log::debug!("audio: not done yet: {other:?}"),
             }
         }
@@ -2501,6 +2520,7 @@ fn audio_state(
             state.combat = sim.world.party_fighting;
             state.music_intensity = Some(sim.world.music_intensity);
             state.dead = sim.world.game_over;
+            state.game_mode = sim.world.game_mode;
             state.inactive_sounds = sim
                 .world
                 .objects
@@ -3181,6 +3201,11 @@ fn main() -> Result<()> {
         )?),
         None => None,
     };
+    // THEDAS_ASYNC_LOADS: headless too, a new level builds on a worker while frames run on
+    // (as the window does), for testing that path.
+    if let Some(l) = live.as_mut() {
+        l.async_loads = std::env::var_os("THEDAS_ASYNC_LOADS").is_some();
+    }
     // The name character creation would have taken (its script calls SetName with it).
     if let (Some(l), Some(name), true) =
         (live.as_ref(), &args.name, args.new_game && args.quick_start)
@@ -3759,6 +3784,10 @@ fn main() -> Result<()> {
         None => None,
     };
     let event_loop = EventLoop::new()?;
+    // The window keeps presenting while a new level builds (a loading frame).
+    if let Some(l) = live.as_mut() {
+        l.async_loads = true;
+    }
     let screens = (live.is_some() && ui.is_empty())
         .then(|| screens::Screens::new(live.as_ref().is_some_and(|l| l.front_end)));
     let loaded_vfs = loaded.vfs.clone();

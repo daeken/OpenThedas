@@ -980,10 +980,15 @@ impl AudioEngine {
         // Retire events that finished or faded out.
         self.instances.retain(|inst| {
             let silent = inst.stopping && inst.fade <= 0.0;
-            let done = inst
-                .slots
-                .iter()
-                .all(|s| s.finished && s.voices.is_empty() && s.pending == 0);
+            // An event that plays nothing but ducks (DA:O's `audio_categories/ducking/*`,
+            // which the game starts and stops with its modes) lasts until it is stopped.
+            // Provisional: FMOD's lifetime for an event with no sounds is not traced; the
+            // exe stops these explicitly (0x5bd220), which says they last.
+            let done = !(inst.slots.is_empty() && !inst.ducks.is_empty())
+                && inst
+                    .slots
+                    .iter()
+                    .all(|s| s.finished && s.voices.is_empty() && s.pending == 0);
             if silent {
                 for s in &inst.slots {
                     for v in &s.voices {
@@ -1283,6 +1288,9 @@ mod tests {
         let d = e.play("test/grp/duck", PlayOptions::default()).unwrap();
         let ducked = run(&mut e, &m, 0.5);
         assert!((ducked - full * 0.1).abs() < 1e-3, "{full} -> {ducked}");
+        // An event that only ducks lasts until it is stopped.
+        run(&mut e, &m, 2.0);
+        assert!(e.is_playing(d));
         e.stop(d, true);
         let back = run(&mut e, &m, 0.5);
         assert!((back - full).abs() < 1e-3, "{back}");
