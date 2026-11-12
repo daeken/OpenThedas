@@ -22,11 +22,17 @@ pub fn under(targets: &[FocusTarget], (x, y): (f64, f64)) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-/// The targets the focus may move among: with a picker's list open (its entries are up,
+/// The targets the focus may move among: not the drop areas, and with a picker's list open (its entries are up,
 /// `PickerList_mc`), only that list's entries, since the list is modal over the screen
 /// (its overlay closes it on a click outside) and the buttons under it are not to be had.
 pub fn modal(targets: Vec<FocusTarget>) -> Vec<FocusTarget> {
     const LIST: &str = ".PickerList_mc.";
+    // Areas that only take a dragged item (the inventory's list as a whole, its destroy
+    // icon) are not buttons to step onto.
+    let targets: Vec<FocusTarget> = targets
+        .into_iter()
+        .filter(|t| !t.path.contains("DropArea") && !t.path.contains("DropTarget"))
+        .collect();
     if targets.iter().any(|t| t.path.contains(LIST)) {
         targets
             .into_iter()
@@ -107,18 +113,28 @@ pub fn step(targets: &[FocusTarget], from: usize, (dx, dy): (i8, i8)) -> usize {
     // Nearly in line counts as in line: a button a little above or below the row (the
     // tactics screen's two pickers, 17 px apart in height) is still the one beside it, rather
     // than a nearer button a row away.
-    let slack = (cur.rect[2] - cur.rect[0]).min(cur.rect[3] - cur.rect[1]) * 0.75;
+    // Only for a button of the same size (a sibling control): a different one near the row
+    // (the inventory's category icons above its list) is not beside it.
+    let size = |t: &FocusTarget| (t.rect[2] - t.rect[0], t.rect[3] - t.rect[1]);
+    let (cw, ch) = size(cur);
+    let slack = |t: &FocusTarget| {
+        let (w, h) = size(t);
+        let alike = (w - cw).abs() <= cw * 0.2 && (h - ch).abs() <= ch * 0.2;
+        if alike { cw.min(ch) * 0.75 } else { 0.0 }
+    };
     let ahead = targets
         .iter()
         .enumerate()
         .filter(|&(i, _)| i != from)
-        .map(|(i, t)| (i, measure(t)))
-        .filter(|&(_, (along, _))| along > 1.0)
+        .map(|(i, t)| (i, measure(t), slack(t)))
+        .filter(|&(_, (along, _), _)| along > 1.0)
         .min_by(|a, b| {
-            let score = |(along, across): (f64, f64)| (across > slack, along + across * 3.0);
-            let (sa, sb) = (score(a.1), score(b.1));
+            let score =
+                |(along, across): (f64, f64), slack: f64| (across > slack, along + across * 3.0);
+            let (sa, sb) = (score(a.1, a.2), score(b.1, b.2));
             sa.0.cmp(&sb.0).then(sa.1.total_cmp(&sb.1))
-        });
+        })
+        .map(|(i, m, _)| (i, m));
     if let Some((i, _)) = ahead {
         return i;
     }
