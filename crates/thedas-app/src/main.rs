@@ -2902,6 +2902,10 @@ impl padplay::Host for HeadlessHost<'_> {
 /// Provisional: load_town.gfx for every load; the exe shows load_light.gfx for an area
 /// change within the same area list, which the app does not tell apart yet.
 fn loading_screen(live: &live::Live, ui: &mut ui::UiLayer, up: &mut bool) {
+    // THEDAS_NO_LOAD_MOVIE: no loading movie; a load shows the interface over black.
+    if std::env::var_os("THEDAS_NO_LOAD_MOVIE").is_some() {
+        return;
+    }
     match (live.loading(), *up) {
         (true, false) => {
             let sim = live.sim();
@@ -3917,7 +3921,7 @@ fn main() -> Result<()> {
         }
         None => None,
     };
-    // THEDAS_HIDDEN_WINDOW: the window is never shown (and on macOS the app neither takes
+    // A test hook. THEDAS_HIDDEN_WINDOW: the window is never shown (and on macOS the app neither takes
     // the foreground nor shows in the Dock), for driving it with --control in tests; it
     // runs as an occluded window does, its frames drawn offscreen for screenshots.
     let event_loop = {
