@@ -2389,6 +2389,13 @@ fn audio_state(
     };
     // The loading frame is up: the world's sounds duck as in the exe's loading mode.
     state.loading = live.loading();
+    {
+        let sim = live.sim();
+        state.container = sim
+            .world
+            .container
+            .and_then(|c| Some((c, sim.world.get(c)?.appearance as i64)));
+    }
     // Animations' sound events (see `Live::animation_clocks`), with what each creature
     // wears and wields.
     if !live.front_end {
