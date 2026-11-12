@@ -259,6 +259,8 @@ pub struct GameAudio {
     music_request: Option<(i32, f32)>,
     /// The game mode's ducking event playing (see [`mode_duck`]): its path and handle.
     mode_duck: Option<(&'static str, Option<EventHandle>)>,
+    /// The music track's ambience ducking event playing (see [`music_duck`]).
+    music_duck: Option<(&'static str, Option<EventHandle>)>,
     /// The simulation's music intensity last seen (scripts' `SetMusicIntensity`).
     script_intensity: Option<i32>,
     /// `ss_types.gda`: each sound set type's first entry row and default probability.
@@ -353,6 +355,23 @@ fn blow_event(
     struck: i64,
 ) -> Option<String> {
     table_event(hits, weapon?, *labels.get(&struck)?)
+}
+
+/// The ambience ducking event for the music track playing (DAOrigins.exe 0x5bccd0, run
+/// as the music changes, and 0x5bc6f6..0x5bc7bf, which stops both when the music volume
+/// falls to nothing): `OnExploreMusic` while `main` plays and `OnCombatMusic` while
+/// `combat` does, each only while the music volume is above 0; none otherwise. The explore
+/// one lowers ambient one-shots 4 dB; the combat one lowers ambience and one-shots 4 dB and
+/// silences `vfxamb_combat`.
+fn music_duck(track: Option<&str>, music_volume: f32) -> Option<&'static str> {
+    if music_volume <= 0.0 {
+        return None;
+    }
+    match track? {
+        "main" => Some("audio_categories/ducking/OnExploreMusic"),
+        "combat" => Some("audio_categories/ducking/OnCombatMusic"),
+        _ => None,
+    }
 }
 
 const GM_DEAD: i32 = 2;
@@ -658,6 +677,7 @@ impl GameAudio {
             music_request: None,
             mode_duck: None,
             script_intensity: None,
+            music_duck: None,
             ss_types: ss_types(vfs),
             sound_set_entries: Default::default(),
             sound_set_bags: Default::default(),
@@ -1191,7 +1211,8 @@ impl GameAudio {
         );
         let n = sounds.len();
         // The same theme carries on across areas (DAOrigins.exe's SetTheme does nothing when
-        // the theme it is given is the one playing, 0x5c0ec9); another stops it.
+        // the theme it is given is the one playing, 0x5c0ec9); another replaces it once the
+        // load is over (see `follow_area`), so the old music plays under the load screen.
         let mut track = None;
         if let Some((carried, name, h)) = self.carried.take() {
             if theme
@@ -1200,7 +1221,7 @@ impl GameAudio {
             {
                 track = Some((name, h));
             } else {
-                self.engine.stop(h, false);
+                self.carried = Some((carried, name, h));
             }
         }
         self.area = Some(AreaPlay {
@@ -1264,6 +1285,25 @@ impl GameAudio {
         });
     }
 
+    /// The playing music track's ambience ducking (see [`music_duck`]): when it changes the
+    /// new event starts and the old one stops.
+    fn follow_music_duck(&mut self, state: &AudioState) {
+        let track = self.area.as_ref().and_then(|a| a.track).map(|t| t.0);
+        let want = music_duck(track, state.volumes.music);
+        if self.music_duck.as_ref().map(|d| d.0) == want {
+            return;
+        }
+        if let Some(path) = want {
+            log::debug!("audio: music {track:?}: duck {path}");
+        }
+        let new = want.map(|path| (path, self.engine.play(path, PlayOptions::default())));
+        if let Some((path, Some(h))) = self.music_duck.take() {
+            log::debug!("audio: music duck {path} ends");
+            self.engine.stop(h, false);
+        }
+        self.music_duck = new;
+    }
+
     /// Sets the music's intensity, `music_state` on the area track (DAOrigins.exe's
     /// SetMusicIntensity, 0x5c0150, sets it on the theme's main, combat and third events).
     fn set_music_state(&mut self, s: f32) {
@@ -1297,10 +1337,19 @@ impl GameAudio {
             self.end_area();
             return;
         }
+        // A theme set during a load is applied when the load ends (DAOrigins.exe: SetTheme,
+        // music slot 0x8 at 0x5bfdf0, queues it at +0xd8; leaving `GM_LOADING`, the director
+        // 0x5b7070 calls slot 0x10, 0x5c4060, which starts it). Until then the last area's
+        // music plays on and the new area's waits.
+        if !state.loading
+            && let Some((_, _, h)) = self.carried.take()
+        {
+            self.engine.stop(h, false);
+        }
         let Some(a) = self.area.as_mut() else {
             return;
         };
-        if let Some(theme) = a.theme.clone() {
+        if let Some(theme) = a.theme.clone().filter(|_| !state.loading) {
             let want = if state.dead {
                 "Death"
             } else if state.combat {
@@ -1678,6 +1727,7 @@ impl GameAudio {
         }
         self.follow_mode(&state);
         self.follow_area(&state, dt);
+        self.follow_music_duck(&state);
         self.follow_cutscene(state.cutscene.clone());
         // Voice-over.
         if self.voice.as_ref().map(|v| &v.0) != state.line.as_ref() {
@@ -1818,6 +1868,22 @@ mod tests {
         assert_eq!(blow_event(&hits, &labels, Some(19), 12), None);
         assert_eq!(blow_event(&hits, &labels, Some(1), 99), None);
         assert_eq!(blow_event(&hits, &labels, None, 16), None);
+    }
+
+    #[test]
+    fn music_tracks_duck_the_ambience_while_heard() {
+        assert_eq!(
+            music_duck(Some("main"), 1.0),
+            Some("audio_categories/ducking/OnExploreMusic")
+        );
+        assert_eq!(
+            music_duck(Some("combat"), 0.2),
+            Some("audio_categories/ducking/OnCombatMusic")
+        );
+        assert_eq!(music_duck(Some("Death"), 1.0), None);
+        assert_eq!(music_duck(None, 1.0), None);
+        // Music turned off: no ducking.
+        assert_eq!(music_duck(Some("main"), 0.0), None);
     }
 
     #[test]
