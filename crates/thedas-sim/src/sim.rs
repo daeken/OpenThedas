@@ -123,6 +123,9 @@ pub struct Sim {
     pub(crate) collisions: HashMap<String, Option<Arc<crate::collision::Collision>>>,
     /// Each area's placeables' collision and the key of the placeables it was built from.
     pub(crate) placeable_collisions: HashMap<ObjectId, (u64, Arc<crate::collision::Collision>)>,
+    /// Walkers held up by another creature's body: since when, and whether that was
+    /// reported (see `Sim::advance_movers`). Not saved.
+    pub(crate) blocked_since: HashMap<ObjectId, (u64, bool)>,
     /// The effect an `APPLY_EFFECT` handler is looking at, and whether it is still valid.
     pub(crate) current_effect: Option<(crate::world::Effect, bool)>,
     /// Who the effect in `current_effect` is being applied to.
@@ -176,6 +179,74 @@ fn along(from: [f32; 3], points: &[[f32; 3]], f: f32) -> [f32; 3] {
         prev = p;
     }
     last
+}
+
+/// How long a walker held up by bodies may make no progress before it is reported.
+const BLOCKED_REPORT_MS: u64 = 3_000;
+
+/// Moving from `at` by `d`, against a circle at `c` of radius `r`: where the move stops on
+/// the circle and what is left of it slid along the circle's tangent, or `None` when the
+/// move does not run into it. A move out of a circle it starts inside is not stopped; one
+/// further in loses its inward part.
+fn slide_circle(at: [f32; 2], d: [f32; 2], c: [f32; 2], r: f32) -> Option<([f32; 2], [f32; 2])> {
+    let m = [at[0] - c[0], at[1] - c[1]];
+    let dd = d[0] * d[0] + d[1] * d[1];
+    if dd <= 1e-12 {
+        return None;
+    }
+    let mm = m[0] * m[0] + m[1] * m[1];
+    let md = m[0] * d[0] + m[1] * d[1];
+    if mm < r * r {
+        // Already inside (placed overlapping): only moves that go further in are trimmed.
+        if md >= 0.0 || mm <= 1e-12 {
+            return None;
+        }
+        let n = mm.sqrt();
+        let nrm = [m[0] / n, m[1] / n];
+        let k = d[0] * nrm[0] + d[1] * nrm[1];
+        return Some((at, [d[0] - k * nrm[0], d[1] - k * nrm[1]]));
+    }
+    if md >= 0.0 {
+        return None;
+    }
+    // First t in [0, 1] with |m + t d| = r.
+    let disc = md * md - dd * (mm - r * r);
+    if disc < 0.0 {
+        return None;
+    }
+    let t = (-md - disc.sqrt()) / dd;
+    if !(0.0..=1.0).contains(&t) {
+        return None;
+    }
+    let q = [at[0] + d[0] * t, at[1] + d[1] * t];
+    let qn = [q[0] - c[0], q[1] - c[1]];
+    let ql = (qn[0] * qn[0] + qn[1] * qn[1]).sqrt().max(1e-6);
+    let nrm = [qn[0] / ql, qn[1] / ql];
+    let rest = [d[0] * (1.0 - t), d[1] * (1.0 - t)];
+    let k = rest[0] * nrm[0] + rest[1] * nrm[1];
+    let slid = if k < 0.0 {
+        [rest[0] - k * nrm[0], rest[1] - k * nrm[1]]
+    } else {
+        rest
+    };
+    Some((q, slid))
+}
+
+/// The points of a path still ahead at fraction `f` of it (the end of the leg under way
+/// and those after it).
+fn remaining_points(from: [f32; 3], points: &[[f32; 3]], f: f32) -> Vec<[f32; 3]> {
+    let total = path_length(from, points);
+    let mut left = total * f.clamp(0.0, 1.0);
+    let mut prev = from;
+    for (i, &p) in points.iter().enumerate() {
+        let d = crate::engine::dist(prev, p);
+        if left < d {
+            return points[i..].to_vec();
+        }
+        left -= d;
+        prev = p;
+    }
+    points.last().map(|&p| vec![p]).unwrap_or_default()
 }
 
 /// The party formation (DAOrigins.exe's default table at 0xc0d240, chosen in 0x7605b0): each
@@ -407,6 +478,7 @@ impl Sim {
             line_cuts: HashMap::new(),
             collisions: HashMap::new(),
             placeable_collisions: HashMap::new(),
+            blocked_since: HashMap::new(),
             fire_lengths: HashMap::new(),
             attack_lengths: HashMap::new(),
             ability_anims: HashMap::new(),
@@ -1983,6 +2055,90 @@ impl Sim {
         Routed::Path(p)
     }
 
+    /// A creature's collision capsule radius: 0.6 of its personal space, at least 0.1 m
+    /// (DAOrigins.exe's character controller, set up at 0x6b1fb7).
+    pub fn capsule_radius(&self, id: ObjectId) -> f32 {
+        (0.6 * self.body_radius(id)).max(0.1)
+    }
+
+    /// Where a creature walking from `a` toward `b` ends up when other creatures' bodies are
+    /// in the way, or `None` when none is. As DAOrigins.exe moves its creatures (0x6b6880
+    /// calling the PhysX controller's move, 0x838240, whose active groups take in the other
+    /// controllers): a living creature's capsule blocks every other creature's, the walker
+    /// slides along it, nothing is pushed, and there is no steering round it. Dead creatures
+    /// do not block (their controllers stop interacting: 0x6a0df0). Bodies are circles on
+    /// the ground. Provisional: one slide per body met, in turn, rather than PhysX's
+    /// iterated sweep; the step offset (0.5 m) is not modelled.
+    fn slide_past_bodies(&self, id: ObjectId, a: [f32; 3], b: [f32; 3]) -> Option<[f32; 3]> {
+        let me = self.world.get(id)?;
+        let area = me.area?;
+        let mine = self.capsule_radius(id);
+        let reach = crate::engine::dist(a, b) + mine + 2.0;
+        let bodies: Vec<([f32; 2], f32)> = self
+            .world
+            .objects
+            .values()
+            .filter(|o| {
+                o.id != id
+                    && o.kind == crate::world::ObjectKind::Creature
+                    && o.area == Some(area)
+                    && o.active
+                    && !o.dead
+                    && o.parked.is_none()
+                    && ((o.position[0] - a[0]).powi(2) + (o.position[1] - a[1]).powi(2)).sqrt()
+                        <= reach
+            })
+            .map(|o| {
+                (
+                    [o.position[0], o.position[1]],
+                    mine + self.capsule_radius(o.id),
+                )
+            })
+            .collect();
+        if bodies.is_empty() {
+            return None;
+        }
+        let mut at = [a[0], a[1]];
+        let mut d = [b[0] - a[0], b[1] - a[1]];
+        let mut hit = false;
+        for (c, r) in bodies {
+            if let Some((q, rest)) = slide_circle(at, d, c, r) {
+                hit = true;
+                at = q;
+                d = rest;
+            }
+        }
+        if !hit {
+            return None;
+        }
+        Some([at[0] + d[0], at[1] + d[1], b[2]])
+    }
+
+    /// Keeps track of a walker held up by bodies, logging once when it has made no progress
+    /// for [`BLOCKED_REPORT_MS`] (for finding stuck walkers).
+    fn note_blocked(&mut self, id: ObjectId, progressed: bool) {
+        let now = self.world.time_ms;
+        let e = self.blocked_since.entry(id).or_insert((now, false));
+        if progressed {
+            *e = (now, false);
+            return;
+        }
+        if !e.1 && now.saturating_sub(e.0) >= BLOCKED_REPORT_MS {
+            e.1 = true;
+            let tag = self
+                .world
+                .get(id)
+                .map(|o| o.tag.clone())
+                .unwrap_or_default();
+            let text = format!("walker {id} ({tag}) blocked by bodies for {} ms", now - e.0);
+            self.world.trace.push(crate::trace::TraceEntry::Log {
+                t: now,
+                channel: 0,
+                text,
+            });
+        }
+    }
+
     fn advance_movers(&mut self) {
         let now = self.world.time_ms;
         // (mover, start, start time, due, the points after the start)
@@ -2010,12 +2166,29 @@ impl Sim {
                 continue;
             }
             let f = (now.saturating_sub(t0) as f32 / (due - t0) as f32).clamp(0.0, 1.0);
-            let p = along(from, &points, f);
+            let mut p = along(from, &points, f);
             // A mover faces the way it goes, leg by leg.
             let dir = direction_along(from, &points, f);
             let Some(was) = self.world.get(id).map(|o| o.position) else {
                 continue;
             };
+            // Other creatures' bodies stop it: it slides along them, and its move carries on
+            // from where it got to.
+            if let Some(slid) = self.slide_past_bodies(id, was, p) {
+                p = slid;
+                let rest = remaining_points(from, &points, f);
+                let speed = self.move_speed(id).max(0.01);
+                let left = path_length(p, &rest);
+                let progressed = crate::engine::dist(was, p) > 0.01;
+                if let Some(c) = self.world.get_mut(id).and_then(|o| o.commands.first_mut()) {
+                    c.from = Some((p, now));
+                    c.due = Some(now + ((left / speed) * 1000.0).max(1.0) as u64);
+                    c.path = rest;
+                }
+                self.note_blocked(id, progressed);
+            } else {
+                self.blocked_since.remove(&id);
+            }
             // Triggers are crossed on the way, not only where a move ends: a move replaced
             // before it finishes (a held stick re-aiming the hero ahead, a new click) still
             // enters and leaves what it walked through. Sampled every half metre between
@@ -4789,6 +4962,47 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, TraceEntry::EventQueued { target, .. } if *target == late))
         );
+    }
+
+    #[test]
+    fn a_walker_slides_round_a_creature_in_its_way() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let w = s.world.spawn(ObjectKind::Creature, "walker");
+        let post = s.world.spawn(ObjectKind::Creature, "post");
+        for (id, p) in [(w, [0.0, 0.0, 0.0]), (post, [5.0, 0.05, 0.0])] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = p;
+        }
+        s.order_move(w, [10.0, 0.0, 0.0]);
+        // Ticked as the app does, a frame at a time.
+        let mut closest = f32::MAX;
+        for _ in 0..150 {
+            s.tick(33);
+            let p = s.world.get(w).unwrap().position;
+            closest = closest.min(((p[0] - 5.0).powi(2) + (p[1] - 0.05).powi(2)).sqrt());
+        }
+        // Never inside the two capsules (0.36 m each by default), and it gets there.
+        let r = 2.0 * s.capsule_radius(w);
+        assert!(closest >= r - 0.01, "{closest} < {r}");
+        let p = s.world.get(w).unwrap().position;
+        assert!((p[0] - 10.0).abs() < 0.05 && p[1].abs() < 0.05, "{p:?}");
+        assert!(s.world.get(w).unwrap().commands.is_empty());
+        // The dead do not block.
+        s.world.get_mut(post).unwrap().dead = true;
+        s.order_move(w, [0.0, 0.0, 0.0]);
+        s.tick(1);
+        assert!(
+            s.world
+                .get(w)
+                .unwrap()
+                .commands
+                .first()
+                .is_some_and(|c| c.path.len() <= 1)
+        );
+        s.tick(2_100);
+        assert_eq!(s.world.get(w).unwrap().position, [0.0, 0.0, 0.0]);
     }
 
     #[test]
