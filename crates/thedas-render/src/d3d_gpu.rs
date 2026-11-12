@@ -18,12 +18,14 @@ use thedas_vfs::Vfs;
 use crate::camera::Camera;
 use crate::d3d::{
     ConstantContext, D3dProgram, DrawLights, LightClass, StageConstants, TextureSource, ambient_of,
-    pick_lights, pick_rig_lights, sampler_texture,
+    pick_level_lights, pick_lights, pick_rig_lights, sampler_texture,
 };
 use crate::gpu::{DEPTH_FORMAT, GpuContext, TextureCache};
 
 /// The partitions' size as a float, for the half-pixel fix-up constant.
-use crate::scene::{AreaScene, SceneLight, SceneMaterial, SceneMesh};
+use crate::scene::{
+    AreaScene, DOMAIN_CHARACTERS, DOMAIN_LEVEL, SceneLight, SceneMaterial, SceneMesh,
+};
 
 /// How `CULL_CW` / `CULL_CCW` map onto wgpu. D3D9 culls by screen-space winding; whether our
 /// right-handed camera mirrors the original's is checked by comparing against captures
@@ -625,7 +627,14 @@ fn repick(
             let lights = match picked.iter().find(|(c, _)| *c == class) {
                 Some((_, l)) => l.clone(),
                 None => {
-                    let l = pick_lights(input.lights, input.light_rooms, bound, room, class);
+                    // Level-class draws of an object keep the old rule (see
+                    // `pick_level_lights`), as before: the characters' domain.
+                    let l = match class {
+                        LightClass::Level => {
+                            pick_level_lights(input.lights, bound, DOMAIN_CHARACTERS)
+                        }
+                        c => pick_lights(input.lights, input.light_rooms, bound, room, c),
+                    };
                     picked.push((class, l.clone()));
                     l
                 }
@@ -1269,10 +1278,20 @@ impl D3dPass {
         let mut by_name: HashMap<String, usize> = HashMap::new();
         let mut samplers: HashMap<String, wgpu::Sampler> = HashMap::new();
         let ambient = room_ambients(scene);
+        // The level's own meshes (placed props such as benches included) keep the old
+        // rule whatever their render class (see `pick_level_lights`); the placed objects'
+        // draws go by their render class.
         let classes: Vec<LightClass> = scene
             .draws
             .iter()
-            .map(|d| LightClass::of(scene.materials[d.material].render_class.as_deref()))
+            .enumerate()
+            .map(|(di, d)| {
+                if di < scene.static_draws {
+                    LightClass::Level
+                } else {
+                    LightClass::of(scene.materials[d.material].render_class.as_deref())
+                }
+            })
             .collect();
 
         let mut pending = Vec::new();
@@ -1363,14 +1382,21 @@ impl D3dPass {
                 slot,
                 draw: di,
                 // By its material's render class: characters from the characters' lights,
-                // the rest from the level's, among those whose room reaches the draw's.
-                lights: pick_lights(
-                    &scene.lights,
-                    &scene.light_rooms,
-                    d.sphere,
-                    d.room_id,
-                    classes[di],
-                ),
+                // placeables from the level's, among those whose room reaches the draw's.
+                // Level-class draws keep the old rule (`pick_level_lights`): the level's own
+                // meshes with the level's domain, an object's with the characters'.
+                lights: match classes[di] {
+                    LightClass::Level => pick_level_lights(
+                        &scene.lights,
+                        d.sphere,
+                        if di < scene.static_draws {
+                            DOMAIN_LEVEL
+                        } else {
+                            DOMAIN_CHARACTERS
+                        },
+                    ),
+                    c => pick_lights(&scene.lights, &scene.light_rooms, d.sphere, d.room_id, c),
+                },
                 multipass,
                 sphere: {
                     // The sky and its clouds follow the camera (`sky.vsh`, `clouds.vsh`):

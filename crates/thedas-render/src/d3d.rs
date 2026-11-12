@@ -375,8 +375,9 @@ pub struct DrawLights {
 /// rest to 0x464310).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LightClass {
-    /// Level geometry (and anything else neither character nor prop): the level's point
-    /// lists, no ambient light nodes.
+    /// Level geometry (and anything else neither character nor prop). Traced: the level's
+    /// point lists and no ambient light nodes; not yet applied, these draws keep the old
+    /// rule ([`pick_level_lights`]).
     Level,
     /// Placeables (`Prop`): the level's point lists, and the brightest ambient light node.
     Prop,
@@ -480,6 +481,57 @@ pub fn pick_lights(
     })
 }
 
+/// The light choice for level draws ([`LightClass::Level`]), kept as it was before the
+/// light manager was traced: up to three point lights whose radius reaches the draw's
+/// bounding sphere and whose affect domain (read as a mask) includes `domain` (a missing
+/// domain matches any), strongest first by colour brightness times the shader's
+/// attenuation at the sphere centre; no room test, no D/E lights.
+///
+/// Not yet applied to level draws: the traced rule ([`pick_lights`] with
+/// [`LightClass::Level`]: domains other than 1, the room test with RML 3164, `R − d`
+/// ranking, static lights in A-C and the others in D-E; and no ambient light node) is the
+/// same selection function the exe runs for every object, but whether level meshes reach
+/// it by the per-object pass (0x4654e0) is not verified, and applied to them it loses the
+/// bright window light on the Cousland hall's floor and darkens the Highever hall, which
+/// the original appears to keep. With no reference for those views it waits for one.
+/// Provisional.
+pub fn pick_level_lights(lights: &[SceneLight], sphere: (Vec3, f32), domain: i64) -> DrawLights {
+    let mut cands: Vec<(f32, Vec3, f32, Vec3)> = lights
+        .iter()
+        .filter_map(|l| match l {
+            SceneLight::Point {
+                position,
+                color,
+                radius,
+                domain: lit,
+                ..
+            } => {
+                if lit.is_some_and(|m| m & domain == 0) {
+                    return None;
+                }
+                let d = position.distance(sphere.0);
+                if d > radius + sphere.1 || *radius <= 0.0 {
+                    return None;
+                }
+                let t = (d / radius).clamp(0.0, 1.0);
+                let att = (t * std::f32::consts::FRAC_PI_2).cos().powi(2);
+                let weight = (color.x + color.y + color.z) * att.max(1e-3);
+                Some((weight, *position, *radius, *color))
+            }
+            SceneLight::Ambient { .. } => None,
+        })
+        .collect();
+    cands.sort_by(|a, b| b.0.total_cmp(&a.0));
+    DrawLights {
+        points: cands
+            .into_iter()
+            .take(3)
+            .map(|(_, p, r, c)| (p, r, c))
+            .collect(),
+        dynamic: Vec::new(),
+    }
+}
+
 /// [`pick_lights`] for a light rig (the paperdoll's): every light whose domain is unset or
 /// the characters', whatever its room.
 pub fn pick_rig_lights(lights: &[SceneLight], sphere: (Vec3, f32)) -> DrawLights {
@@ -539,9 +591,9 @@ fn pick_where(
 /// light of the level. Characters (0x465570 passes 0) get none.
 ///
 /// Level geometry gets none from this path either (0x464310 without the `prop` flag skips
-/// the ambient list at 0x4644eb), but the Highever hall drawn so is far darker than the
-/// original's, so whether level meshes reach that path, or get their ambient elsewhere, is
-/// open: `D3dPass` keeps their room's ambient (provisional) and this returns zero for them.
+/// the ambient list at 0x4644eb), but that rule is not applied to level draws yet (see
+/// [`pick_level_lights`]): `D3dPass` keeps their room's ambient and this returns zero for
+/// them.
 pub fn ambient_of(lights: &[SceneLight], class: LightClass) -> Vec3 {
     if class != LightClass::Prop {
         return Vec3::ZERO;

@@ -1070,13 +1070,21 @@ impl<'a> Loader<'a> {
     /// rooms' light models place their probes: among the probes whose room reaches the
     /// draw's ([`crate::d3d::reaches`]), the nearest to its bounds' centre (DAOrigins.exe's
     /// probe influence is `1 / d`, 0x53d3e0, one slot). Draws no placed probe reaches keep
-    /// the room's (provisional).
+    /// the room's (provisional). Only the placed objects' character and placeable draws
+    /// ([`crate::d3d::LightClass`]): the level's own draws and level-class draws keep their room's probe (see
+    /// [`crate::d3d::pick_level_lights`] for why the traced rule is not applied to them yet).
     fn assign_probes(&mut self) {
         let scene = &mut self.scene;
         if scene.probes.iter().all(|p| p.position.is_none()) {
             return;
         }
-        for d in &mut scene.draws {
+        let first = scene.static_draws;
+        for d in scene.draws.iter_mut().skip(first) {
+            let class =
+                crate::d3d::LightClass::of(scene.materials[d.material].render_class.as_deref());
+            if class == crate::d3d::LightClass::Level {
+                continue;
+            }
             if let Some(p) = nearest_probe(&scene.probes, &scene.light_rooms, d.sphere.0, d.room_id)
             {
                 d.probe = Some(p);
