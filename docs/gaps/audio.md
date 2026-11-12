@@ -177,7 +177,6 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 
 ### Music
 
-- **AUD-032** **`PlayMusic` is dropped.** Original: not traced. Ours: the sim queues `SoundRequest::Music`; the app logs "not done yet" and discards it. Evidence: `crates/thedas-sim/src/engine.rs:502`, `crates/thedas-app/src/main.rs:2335`. Size: S. Depends: none. Kind: missing.
 - **AUD-033** **The script path of `SetMusicIntensity` is inferred.** Original: the music object's SetMusicIntensity (0x5c0150) sets `music_state` on the theme's main, combat and third events; how the script command reaches it is not traced. Ours: sets `music_state` on the area track to the integer given. Evidence: `crates/thedas-app/src/audio.rs:1570`. Size: S. Depends: none. Kind: provisional.
 - **AUD-034** **Cutscene mode is taken from the cutscene playing.** Original: `GM_CUTSCENE` (5) plays `OnCutscene` (0x5bd220). Ours: a cutscene playing outside dialog counts as `GM_CUTSCENE`, as our simulation does not switch to that mode; an app load state must set `AudioState::loading`. Evidence: `crates/thedas-app/src/audio.rs:1240`. Size: S. Depends: none. Kind: provisional.
 
