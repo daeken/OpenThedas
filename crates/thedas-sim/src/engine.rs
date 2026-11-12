@@ -5185,6 +5185,13 @@ mod tests {
             .map(|q| (q.target, q.event.ints.clone()))
             .collect();
         assert_eq!(q, vec![(door, vec![1, 1])]);
+        // Text typed into the box rides along as string 0.
+        assert!(
+            s.world
+                .queue
+                .values()
+                .all(|q| q.event.strings == vec![String::new()])
+        );
         assert!(!s.answer_popup(1), "nothing left to answer");
 
         run(&mut s, hero, "OpenStore", &[Value::Object(store)]);
