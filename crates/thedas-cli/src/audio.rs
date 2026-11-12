@@ -9,6 +9,86 @@ use thedas_audio::{decode, wav};
 use thedas_formats::fev::{EventBody, Fev, WaveformKind};
 use thedas_formats::fsb::Fsb;
 
+pub fn play(
+    install: &Path,
+    events: &[String],
+    seconds: f32,
+    out: &Path,
+    stop_at: Option<f32>,
+    language: &str,
+    rate: u32,
+) -> Result<()> {
+    use std::sync::{Arc, Mutex};
+    use thedas_audio::{AudioEngine, Library, Mixer, PlayOptions};
+    let lib = Arc::new(Library::new(Library::install_dirs(install, language)));
+    let mixer = Arc::new(Mutex::new(Mixer::new(rate)));
+    let mut engine = AudioEngine::new(lib, mixer.clone());
+    engine.synchronous = true;
+    // (start time, path, programmer sound)
+    let mut queue: Vec<(f32, String, Option<String>)> = events
+        .iter()
+        .map(|e| {
+            let (e, prog) = match e.split_once(':') {
+                Some((a, b)) => (a, Some(b.to_string())),
+                None => (e.as_str(), None),
+            };
+            let (path, at) = match e.split_once('@') {
+                Some((p, t)) => (p, t.parse().unwrap_or(0.0)),
+                None => (e, 0.0),
+            };
+            (at, path.to_string(), prog)
+        })
+        .collect();
+    queue.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let tick = rate as usize / 100;
+    let total = (seconds * rate as f32) as usize;
+    let mut samples = Vec::with_capacity(total * 2);
+    let mut buf = vec![0.0f32; tick * 2];
+    let mut handles = Vec::new();
+    let mut t = 0.0f32;
+    let mut stopped = false;
+    while samples.len() < total * 2 {
+        while queue.first().is_some_and(|q| q.0 <= t) {
+            let (_, path, prog) = queue.remove(0);
+            match engine.play(
+                &path,
+                PlayOptions {
+                    programmer_sound: prog,
+                    ..Default::default()
+                },
+            ) {
+                Some(h) => handles.push(h),
+                None => eprintln!("{path}: no such event"),
+            }
+        }
+        if !stopped && stop_at.is_some_and(|s| t >= s) {
+            for h in &handles {
+                engine.stop(*h, false);
+            }
+            stopped = true;
+        }
+        engine.update(tick as f32 / rate as f32);
+        mixer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("mixer poisoned"))?
+            .render(&mut buf);
+        samples.extend_from_slice(&buf);
+        t += tick as f32 / rate as f32;
+    }
+    samples.truncate(total * 2);
+    let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len().max(1) as f32).sqrt();
+    println!(
+        "{}: {seconds}s, peak {:.1} dBFS, rms {:.1} dBFS, {} events still playing",
+        out.display(),
+        20.0 * peak.max(1e-9).log10(),
+        20.0 * rms.max(1e-9).log10(),
+        engine.active_events()
+    );
+    wav::write_wav(BufWriter::new(File::create(out)?), rate, 2, &samples)?;
+    Ok(())
+}
+
 fn files_under(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
