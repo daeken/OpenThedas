@@ -204,6 +204,9 @@ pub struct GameAudio {
     voice: Option<(VoiceLine, Option<EventHandle>, Option<f64>)>,
     cutscene: Option<CutsceneSounds>,
     area: Option<AreaPlay>,
+    /// The music of an area just left, kept playing until the next area says whether it
+    /// keeps the same theme: (theme, track, its event).
+    carried: Option<(String, &'static str, EventHandle)>,
     movie: Option<MovieSound>,
     /// The resources animation events are read from.
     vfs: Arc<Vfs>,
@@ -587,6 +590,7 @@ impl GameAudio {
             voice: None,
             cutscene: None,
             area: None,
+            carried: None,
             movie: None,
             vfs: vfs.clone(),
             anim_events: Default::default(),
@@ -1118,10 +1122,23 @@ impl GameAudio {
             reverb.triggers.len()
         );
         let n = sounds.len();
+        // The same theme carries on across areas (DAOrigins.exe's SetTheme does nothing when
+        // the theme it is given is the one playing, 0x5c0ec9); another stops it.
+        let mut track = None;
+        if let Some((carried, name, h)) = self.carried.take() {
+            if theme
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(&carried))
+            {
+                track = Some((name, h));
+            } else {
+                self.engine.stop(h, false);
+            }
+        }
         self.area = Some(AreaPlay {
             resref: resref.to_string(),
             theme,
-            track: None,
+            track,
             switch: None,
             sounds,
             playing: vec![None; n],
@@ -1137,14 +1154,16 @@ impl GameAudio {
                 self.engine
                     .set_reverb(thedas_formats::fev::ReverbProperties::OFF, 0.0);
             }
-            for h in a
-                .playing
-                .into_iter()
-                .flatten()
-                .flatten()
-                .chain(a.track.map(|t| t.1))
-            {
+            for h in a.playing.into_iter().flatten().flatten() {
                 self.engine.stop(h, false);
+            }
+            if let Some(h) = self.carried.take() {
+                self.engine.stop(h.2, false);
+            }
+            match (a.theme, a.track) {
+                (Some(theme), Some((name, h))) => self.carried = Some((theme, name, h)),
+                (_, Some((_, h))) => self.engine.stop(h, false),
+                _ => {}
             }
         }
     }
@@ -1413,6 +1432,12 @@ impl GameAudio {
         self.hero_female = state.hero_female;
         if let Some((pos, right)) = state.listener {
             self.engine.set_listener(pos, right);
+        }
+        // Back at the menus: an area's music still carried stops.
+        if (state.front_end || state.chargen)
+            && let Some((_, _, h)) = self.carried.take()
+        {
+            self.engine.stop(h, false);
         }
         // Menu music.
         let want = if state.chargen {

@@ -370,7 +370,7 @@ use Context::*;
 
 /// The default mapping: the Xbox 360 version's controls (A acts, X/Y/B the battle-menu
 /// shortcuts with RT holding a second set, LB/RB the party, LT the radial menu, the D-pad
-/// the target, Back the character screens, Start pause), with a pointer for the PC's
+/// the target, Back the character screens, Start the game menu), with a pointer for the PC's
 /// mouse-driven screens. A binding with `with` wins over the same button without it.
 pub const BINDINGS: &[Binding] = &[
     // Exploring and fighting.

@@ -154,4 +154,29 @@ mod tests {
         s.set_training_mode(2);
         assert!(!s.training_paused());
     }
+
+    #[test]
+    fn zooming_fully_in_ends_the_tactical_step_once() {
+        let mut s = sim();
+        s.set_training_mode(1);
+        s.begin_training_step(1, 1065, 0);
+        s.world.queue.clear();
+        assert!(s.player_zoomed_in());
+        assert_eq!(queued(&s), vec![(1065, vec![1])]);
+        // Heard once: zooming in again does nothing more.
+        assert!(!s.player_zoomed_in());
+    }
+
+    #[test]
+    fn with_tutorials_off_or_the_mode_done_no_tactical_step_starts() {
+        let mut s = sim();
+        s.show_tutorials = false;
+        s.set_training_mode(1);
+        assert!(!s.training_paused());
+        let mut s = sim();
+        s.training_done = 1;
+        s.set_training_mode(1);
+        assert!(!s.training_paused());
+        assert!(s.world.zoom_request.is_none());
+    }
 }

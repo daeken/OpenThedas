@@ -10,7 +10,7 @@ repository.
 
 ## Status
 
-Last updated 2026-11-12 17:50 UTC, main 477f24e
+Last updated 2026-11-12 19:00 UTC, main 8a39900
 
 For everything that is wrong or missing, in detail and split into items that can be picked up in
 parallel, see [docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md).
@@ -38,7 +38,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
 - 🟡 **Exploration and camera**:
   - Walking, click-to-pick, doors and companions following. Followers come along on area changes, and they stand in the exe's formation slots and follow by its rules.
   - The area map shows map notes and only perceived enemies.
-  - The follow camera uses the exe's 0.25 m sphere sweep, pull-in and ease-out, and its starting shot (3 m behind, at the leader's height). QA confirmed it at all six origin starts.
+  - The follow camera uses the exe's 0.25 m sphere sweep, pull-in and ease-out, and its starting shot (3 m behind, at the leader's height). With tutorials on, a new game's first control is the tactical overhead view, as in the original: the first training step zooms fully out (`SetZoomLevel`), and zooming back in by wheel, Page Down or the pad ends the step. Page Up and Page Down zoom while held.
   - Doors are posed by their state (open, Open_2, swinging, fallen), and their camera and click shapes follow the pose.
   - With a pad, walking aims at a point ahead and the route goes round obstacles; it no longer stops dead at the first one.
   - Creatures the camera is inside fade out as the exe does (0.25 m sphere against the models' creature-group physics shapes, head included; opacity 0.05; not in dialog or cutscenes). Provisional: the shapes are placed by rest pose, not the animated skeleton.
@@ -56,6 +56,9 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Corpses decay and fade as the exe does them; a body bag takes the corpse's place and draws its corpse model.
   - Live creatures block each other as the exe's capsules do (slide, no push, no re-path; the dead do not block), and a blocked walker keeps its own speed. QA graded it in the live app.
   - Ability functions ignore unknown ability ids as the exe does, and saves drop invalid ones on load.
+  - Training tutorials (the original's step-by-step first-play lessons) run from the scripts: SetTrainingMode, BeginTrainingStep, the completed-steps gate and the events that end each step. The camera half of the first step is in progress.
+  - The engine raises the mana-or-stamina-depleted, area-load-from-save and module pre-save events. Opening a screen tells the module. The damaged event and eight others were confirmed to come from scripts only.
+  - Followers walking with the leader take their formation slots.
   - Visual effects applied at places (the Proving crowd) are exposed to rendering and drawn.
   - Not every script engine function is implemented.
 - 🟡 **Party, inventory, journal and other UI screens**:
@@ -67,6 +70,8 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - With a pad: the D-pad types letters into a focused text field, and focus reaches empty equipment slots.
   - Items with no icon of their own show their base type's.
   - Save screens show the hero's name, level and class. The character record lists Heroic Accomplishments.
+  - Script message boxes show, answer the script, and pass typed text along (the dog-naming prompt works).
+  - The auto-pause and show-tutorials options reach the simulation.
   - Level Up shows the member's portrait. In combat each party portrait shows what that member is doing, and hovering a portrait shows the class.
   - Open: screens have not all been audited against the original.
 - 🟡 **Rendering**:
@@ -74,14 +79,16 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Characters have hair, sampled with its mips and noise. Bare hands and arms take the head's skin tint.
   - Characters and props pick their lights by the exe's rules (room reach, light class, influence).
   - Lava draws with its own shaders. Level-wide layouts draw (horizons, water, tents), with probe cubemaps as the environment map. Missing material textures fall back to the parameter's default, not black.
-  - Per-object opacity, for the camera fade and corpse decay.
+  - Per-object opacity, for the camera fade and corpse decay. Faded objects cast no shadow, as in the exe.
+  - Level terrain and static meshes take no ambient light nodes, as traced; this removed a green cast from daylight ground.
   - Open:
-    - SpeedTrees draw as billboards from the level's billboard atlas (interim); full SpeedTree geometry, grass and bushes are not drawn.
+    - SpeedTrees draw as billboards from the level's billboard atlas (interim). A clean-room tree generator, written from our own format and generation spec (`docs/speedtree/`), now builds trunk, branch, frond and leaf meshes for all 552 tree files; drawing them, wind, grass and bushes are not done.
+    - Daylight scenes are still about half as bright and cooler than the original. Gamma, sRGB, lightmap scale and light selection have been ruled out by traces; the missing term is not found yet.
   - The backend stays on wgpu, and its types are kept inside `thedas-render`.
 - 🟡 **Audio**:
   - Merged:
-    - playback: FMOD event (`.fev`) and bank (`.fsb`) playback, mixer, the exe's slider-to-dB volume mapping;
-    - music: menu and area music, SetMusicIntensity driving `music_state` (kept in saves);
+    - playback: FMOD event (`.fev`) and bank (`.fsb`) playback, mixer, the exe's slider-to-dB volume mapping, event and sound-definition pitch, and per-play random pitch and volume, so repeated sounds vary;
+    - music: menu and area music, SetMusicIntensity driving `music_state` (kept in saves), with changes timed to the music's markers as the original does;
     - world: world reverb (area presets and reverb triggers as traced, levels per I3DL2 with room LF), placed 3D sounds;
     - movement: footsteps by walkmesh surface, foley and vegetation rustles, as traced;
     - effects: UI sounds, boot movie sound, script PlaySound, animation sound events (swings, armour foley) and bodyfalls; blows sound at the hit frame with the weapon's action;
