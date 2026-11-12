@@ -1636,6 +1636,7 @@ mod tests {
                 probe: None,
                 skin: None,
                 cast_shadow: None,
+                lod: None,
             }],
             ..Default::default()
         };

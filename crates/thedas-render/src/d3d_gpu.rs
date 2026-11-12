@@ -76,6 +76,8 @@ pub(crate) struct D3dDraw {
     /// The draw's bounding sphere in its own space (centre, radius), for the view culling
     /// (see [`in_view`]); `None` for draws that are never culled.
     sphere: Option<(Vec3, f32)>,
+    /// A SpeedTree part's draw distances ([`crate::scene::DrawLod`]).
+    lod: Option<crate::scene::DrawLod>,
 }
 
 /// Pipelines and vertex buffers kept between passes (see [`crate::gpu::RenderCache`]).
@@ -1452,6 +1454,7 @@ impl D3dPass {
                     c => pick_lights(&scene.lights, &scene.light_rooms, d.sphere, d.room_id, c),
                 },
                 multipass,
+                lod: d.lod,
                 sphere: {
                     // The sky and its clouds follow the camera (`sky.vsh`, `clouds.vsh`):
                     // drawn whatever their bounds (the original draws them through their own
@@ -2027,8 +2030,10 @@ impl D3dPass {
             .draws
             .iter()
             .map(|d| {
-                self.world_sphere(d)
-                    .is_none_or(|(centre, radius)| in_view(&view_proj, centre, radius))
+                d.lod.is_none_or(|l| l.shown(camera.position))
+                    && self
+                        .world_sphere(d)
+                        .is_none_or(|(centre, radius)| in_view(&view_proj, centre, radius))
             })
             .collect();
         let slot_size = SLOT[7] as usize;
