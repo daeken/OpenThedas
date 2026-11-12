@@ -825,14 +825,16 @@ fn walk(host: &mut dyn Host, v: Vec2, group: bool) -> Option<String> {
             sim.order_move(who, at.to_array());
             continue;
         }
-        for ahead in WALK_AHEAD {
-            let p = at + (dir * ahead).extend(0.0);
-            let from = [p.x, p.y, p.z + 2.5];
-            if let Some(g) = sim.ground_hit(area, from, [0.0, 0.0, -1.0], 6.0) {
-                sim.order_move(who, g);
-                break;
-            }
-        }
+        // A point a little ahead, on the ground there when it can be found; else at the
+        // leader's own height, as a click on the far side of a rock would be: the walk's
+        // route finds the way round (the ground under a point ahead is often a tree's or a
+        // rock's, and probing only for open ground there stopped the leader dead).
+        let ahead = WALK_AHEAD[0];
+        let p = at + (dir * ahead).extend(0.0);
+        let to = sim
+            .ground_hit(area, [p.x, p.y, p.z + 4.0], [0.0, 0.0, -1.0], 8.0)
+            .unwrap_or(p.to_array());
+        sim.order_move(who, to);
     }
     None
 }
