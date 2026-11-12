@@ -163,7 +163,7 @@ struct LevelCurves {
 }
 
 /// `BezierSpline 0 1 0 { 2  0 1 1 0 0.1  1 1 1 0 0.1 }`: the flat default of value 1.
-fn flat_one() -> BezierSpline {
+pub(super) fn flat_one() -> BezierSpline {
     let point = |x| SplinePoint {
         x,
         y: 1.0,
@@ -882,7 +882,7 @@ impl<'t> Grower<'t> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::speedtree::{Floor, Fronds, TreeInfo};
 
@@ -896,7 +896,7 @@ mod tests {
     }
 
     /// A level with no randomness: length 1 (times the size), straight growth.
-    fn level(start_angle: f32, frequency: f32) -> BranchLevel {
+    pub(crate) fn level(start_angle: f32, frequency: f32) -> BranchLevel {
         BranchLevel {
             disturbance: constant(0.0, 0.0),
             gravity: constant(0.0, 0.0),
@@ -915,7 +915,7 @@ mod tests {
         }
     }
 
-    fn tree(levels: Vec<BranchLevel>) -> SpeedTree {
+    pub(crate) fn tree(levels: Vec<BranchLevel>) -> SpeedTree {
         SpeedTree {
             tree: TreeInfo {
                 seed: 1234,

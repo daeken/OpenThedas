@@ -6,8 +6,10 @@
 //!
 //! Stage 1 (this file): the single random stream and the curve parameters. Stage 2
 //! ([`skeleton`]): tree set-up and the branch skeleton, on the rotation frames of [`frame`].
+//! Stage 3 ([`geometry`]): branch tubes and branch LOD.
 
 pub mod frame;
+pub mod geometry;
 pub mod skeleton;
 
 pub use skeleton::{Branch, Bud, Flare, Skeleton, Vertex, grow};
@@ -346,13 +348,31 @@ pub fn check(tree: &SpeedTree) -> Result<(), String> {
             return Err(format!("{name}: table entry {i} is {}", curve.table()[i]));
         }
     }
-    let (skeleton, _) = grow(tree);
+    let (skeleton, mut random) = grow(tree);
     for (i, branch) in skeleton.branches.iter().enumerate() {
         let finite = branch.vertices.iter().all(|v| {
             v.position.iter().all(|x| x.is_finite()) && v.radius.is_finite() && v.length.is_finite()
         });
         if !finite {
             return Err(format!("branch {i} (level {}) is not finite", branch.level));
+        }
+    }
+    let geometry = geometry::build(tree, &skeleton, &mut random);
+    let finite = |v: &[f32; 3]| v.iter().all(|x| x.is_finite());
+    if let Some(i) = geometry.vertices.iter().position(|v| {
+        !(finite(&v.position)
+            && finite(&v.normal)
+            && v.texcoords.iter().flatten().all(|x| x.is_finite()))
+    }) {
+        return Err(format!("branch vertex {i} is not finite"));
+    }
+    let count = geometry.vertices.len() as u32;
+    for tube in geometry.tubes.iter().flatten() {
+        if tube.strip.iter().any(|&i| i >= count) {
+            return Err(format!(
+                "branch strip at {} indexes past the vertices",
+                tube.start
+            ));
         }
     }
     Ok(())
