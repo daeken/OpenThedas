@@ -488,6 +488,8 @@ pub struct AreaRenderer {
     blended: Vec<(usize, DrawRef)>,
     /// When set, only these scene draws are drawn (a portrait draws its member alone).
     pub only_draws: Option<std::collections::HashSet<usize>>,
+    /// Scene draws left out of the main pass (a creature the game camera has faded out).
+    pub hidden_draws: std::collections::HashSet<usize>,
     /// What a frame drawn on its own starts as (black; a paperdoll draws over white too, to
     /// find its coverage).
     pub clear: wgpu::Color,
@@ -915,6 +917,7 @@ impl AreaRenderer {
             opaque,
             blended,
             only_draws: None,
+            hidden_draws: Default::default(),
             clear: wgpu::Color::BLACK,
             depth: None,
             // Only a renderer of the level's own meshes runs its effects; the objects' scene
@@ -1275,6 +1278,7 @@ impl AreaRenderer {
                 .only_draws
                 .as_ref()
                 .is_some_and(|only| !only.contains(di))
+                || self.hidden_draws.contains(di)
             {
                 continue;
             }

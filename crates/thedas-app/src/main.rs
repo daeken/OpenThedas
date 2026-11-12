@@ -46,6 +46,7 @@
 //! [`control`]).
 
 mod audio;
+mod camfade;
 mod chargen_stage;
 mod control;
 mod cutactors;
@@ -853,12 +854,16 @@ impl App {
         if let Some(f) = self.follow.as_mut() {
             let turn = (k(KeyCode::KeyQ) as i32 - k(KeyCode::KeyE) as i32) as f32;
             f.orbit(turn * 1.8 * dt, 0.0);
-            if let Some(c) = self
+            let eye = self
                 .live
                 .as_ref()
-                .and_then(|l| l.follow_camera(f, dt, &self.camera))
-            {
+                .and_then(|l| l.follow_camera(f, dt, &self.camera));
+            if let Some(c) = eye {
                 self.camera = c;
+            }
+            // Creatures the game camera is inside fade (see `camfade`).
+            if let Some(l) = self.live.as_mut() {
+                l.fade_near_camera(eye.map(|c| c.position), dt);
             }
             // A staged conversation line frames itself.
             if let Some(c) = self
@@ -3165,12 +3170,13 @@ fn main() -> Result<()> {
                                 }
                             }
                             frames += 1;
-                            if let Some(c) = follow
+                            let eye = follow
                                 .as_mut()
-                                .and_then(|f| l.follow_camera(f, dt as f32 / 1000.0, &camera))
-                            {
+                                .and_then(|f| l.follow_camera(f, dt as f32 / 1000.0, &camera));
+                            if let Some(c) = eye {
                                 camera = c;
                             }
+                            l.fade_near_camera(eye.map(|c| c.position), dt as f32 / 1000.0);
                         }
                         if let Some((_, s)) = played.as_ref() {
                             println!(
