@@ -1577,6 +1577,7 @@ mod tests {
                 sphere: (Vec3::new(5.0, 0.0, 0.0), 3.0),
                 model: "tri".into(),
                 room: "room".into(),
+                room_id: None,
                 probe: None,
                 skin: None,
                 cast_shadow: None,

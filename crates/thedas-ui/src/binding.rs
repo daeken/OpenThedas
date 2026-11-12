@@ -14,6 +14,10 @@ use crate::UiValue;
 
 /// The creature's class (`properties.gda` row 27, `PROPERTY_SIMPLE_CURRENT_CLASS`).
 const PROPERTY_CLASS: i32 = 27;
+/// `properties.gda`'s Level.
+const PROPERTY_LEVEL: i32 = 15;
+/// "New Save" (talk table).
+const NEW_SAVE: u32 = 336_242;
 /// The mage class (`CLASS_WIZARD`, `cla_base.gda` row 2; the scripts' constant, not the
 /// engine's).
 const CLASS_WIZARD: i32 = 2;
@@ -974,7 +978,26 @@ fn item(sim: &Sim, prefix: &str, id: u32, v: &mut BTreeMap<String, UiValue>) {
     set("Tag", UiValue::String(o.tag.clone()));
     set("Name", UiValue::String(name(sim, id)));
     set("Description", text(look.description));
-    set("Icon", UiValue::String(look.icon));
+    // An item whose template names no icon shows its base type's (`bitm_base`'s icon column,
+    // 0xa980657e: `ico_potion` for a quick item): Orzammar's "Wine" has none of its own.
+    // Provisional: the exe's fallback is not traced.
+    let icon = if look.icon.trim().is_empty() {
+        let base = o.fields.get("BaseItem").copied().unwrap_or(0) as i64;
+        match sim
+            .world
+            .tables()
+            .get(0, "bitm_base")
+            .and_then(|t| t.cell_by_hash(0xa980_657e, base).cloned())
+        {
+            Some(thedas_formats::gda::Cell::String(s)) => {
+                s.trim_end_matches('\0').trim().to_string()
+            }
+            _ => look.icon,
+        }
+    } else {
+        look.icon
+    };
+    set("Icon", UiValue::String(icon));
     set("BaseItemID", field("BaseItem", 0));
     // A row of the material types table; the movie names it from the tables itself.
     set("MaterialType", field("Material", 0));
@@ -1278,11 +1301,25 @@ fn saves(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
             UiValue::String(last.map(|s| s.area.clone()).unwrap_or_default()),
         );
         v.insert(format!("{k}.Screenshot"), UiValue::String(String::new()));
+        // The details pane's level and class icon: the hero's.
+        if let Some(h) = sim.world.hero {
+            v.insert(
+                format!("{k}.Level"),
+                num(sim.property_total(h, PROPERTY_LEVEL)),
+            );
+            v.insert(
+                format!("{k}.ClassID"),
+                num(sim.property_total(h, PROPERTY_CLASS)),
+            );
+        }
     }
     // Saving lists a new save first (slot -1: the movie names it after the area and saves it
     // to the open slot), then the saves it may overwrite.
+    // Its row reads "New Save" (talk-table 336242). Provisional: where the exe names it is
+    // not traced.
     let new_save = SaveListing {
         slot: -1,
+        name: sim.string(NEW_SAVE).unwrap_or_default(),
         area: sim.world.area.map(|a| name(sim, a)).unwrap_or_default(),
         time_played_s: sim.world.time_ms / 1000,
         ..Default::default()
@@ -1322,7 +1359,11 @@ fn saves(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
         );
         v.insert(format!("{k}.Story"), UiValue::String(String::new()));
         v.insert(format!("{k}.Screenshot"), UiValue::String(String::new()));
-        v.insert(format!("{k}.ClassID"), num(0));
+        let class = sim
+            .world
+            .hero
+            .map_or(0.0, |h| sim.property_total(h, PROPERTY_CLASS));
+        v.insert(format!("{k}.ClassID"), num(class));
     }
     v.insert("Party.CapturedOnDeath".into(), num(0));
     v.insert("GUIDeath.DeathHint".into(), UiValue::String(String::new()));
