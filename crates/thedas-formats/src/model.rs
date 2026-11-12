@@ -317,18 +317,26 @@ impl Mmh {
     }
 }
 
-/// Reads one child struct. Returns `None` for `trsl`/`rota`, which are folded into their parent.
-fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>> {
+/// A node being read: its own transform so far, its children read so far, and the child
+/// structs still to read.
+struct OpenNode {
+    id: StructId,
+    kind: FourCC,
+    depth: usize,
+    transform: Transform,
+    children: Vec<Node>,
+    pending: std::vec::IntoIter<StructId>,
+}
+
+/// Starts reading node `id`: folds its `trsl`/`rota` children into its transform and lists
+/// the rest.
+fn open_node(gff: &Gff4, id: StructId, kind: FourCC, depth: usize) -> TypedResult<OpenNode> {
     if depth > MAX_DEPTH {
         return Err(TypedError::Invalid("mmh: node tree too deep".into()));
     }
     let d = Doc::new(gff, "mmh node");
-    let kind = d.label(id);
-    if kind == KIND_TRANSLATION || kind == KIND_ROTATION {
-        return Ok(None);
-    }
     let mut transform = Transform::default();
-    let mut children = Vec::new();
+    let mut pending = Vec::new();
     for c in d.structs(id, field::CHILDREN)? {
         let ck = d.label(c);
         if ck == KIND_TRANSLATION {
@@ -339,16 +347,53 @@ fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>
             if let Some(r) = d.opt_vec4(c, field::ROTATION, 1.0)? {
                 transform.rotation = r;
             }
-        } else if let Some(n) = read_node(gff, c, depth + 1)? {
-            children.push(n);
+        } else {
+            pending.push(c);
         }
     }
-    finish_node(gff, id, kind, transform, children).map(Some)
+    Ok(OpenNode {
+        id,
+        kind,
+        depth,
+        transform,
+        children: Vec::new(),
+        pending: pending.into_iter(),
+    })
 }
 
-/// A node's own fields, once its children are read. Kept out of line so that the recursion
-/// in [`read_node`] carries only the child walk: a deep (or cyclic, until [`MAX_DEPTH`])
-/// tree would otherwise overflow the stack in debug builds.
+/// Reads one child struct and its subtree. Returns `None` for `trsl`/`rota`, which are
+/// folded into their parent. The tree is walked with a stack on the heap rather than by
+/// recursion, so a deep tree needs no more thread stack than a shallow one (models are read
+/// on worker threads with small stacks); [`MAX_DEPTH`] still bounds it, against cycles.
+fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>> {
+    let d = Doc::new(gff, "mmh node");
+    let kind = d.label(id);
+    if kind == KIND_TRANSLATION || kind == KIND_ROTATION {
+        return Ok(None);
+    }
+    let mut stack = vec![open_node(gff, id, kind, depth)?];
+    loop {
+        let Some(top) = stack.last_mut() else {
+            return Ok(None);
+        };
+        if let Some(c) = top.pending.next() {
+            let depth = top.depth + 1;
+            let open = open_node(gff, c, d.label(c), depth)?;
+            stack.push(open);
+            continue;
+        }
+        let Some(done) = stack.pop() else {
+            return Ok(None);
+        };
+        let node = finish_node(gff, done.id, done.kind, done.transform, done.children)?;
+        match stack.last_mut() {
+            Some(parent) => parent.children.push(node),
+            None => return Ok(Some(node)),
+        }
+    }
+}
+
+/// A node's own fields, once its children are read.
 #[inline(never)]
 fn finish_node(
     gff: &Gff4,
@@ -587,7 +632,15 @@ mod tests {
             offset: 0,
         });
         let root = b.add(b"mdlh", vec![(field::CHILDREN, generic(&[n]))]);
-        assert!(Mmh::from_gff4(&b.finish(root)).is_err());
+        let doc = b.finish(root);
+        assert!(Mmh::from_gff4(&doc).is_err());
+        // Walking it to the depth bound needs little thread stack: worker threads that read
+        // models may have small ones.
+        let small = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || Mmh::from_gff4(&doc).is_err())
+            .unwrap();
+        assert!(small.join().unwrap());
 
         let mut b = Builder::new(b"MMH ");
         let root = b.add(b"mdlh", vec![(field::CHILDREN, Value::U32(3))]);
