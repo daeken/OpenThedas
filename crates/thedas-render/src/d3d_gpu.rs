@@ -141,6 +141,26 @@ pub(crate) struct D3dPass {
     caster_programs: Vec<Arc<D3dProgram>>,
     /// The (empty) texture bindings of the casters' programs.
     empty_group: wgpu::BindGroup,
+    /// One draw per scene emitter whose material has a program (see [`ParticleDraw`]).
+    pub particles: Vec<ParticleDraw>,
+    particle_buffer: Option<wgpu::Buffer>,
+    /// Two triangles per quad, for [`crate::particles::MAX_PARTICLES`] quads.
+    quad_indices: Option<wgpu::Buffer>,
+}
+
+/// A particle emitter's draw: its quads, rebuilt each frame into `vertices` in the layout its
+/// program's vertex shader reads, with its material's constants and textures.
+pub(crate) struct ParticleDraw {
+    pipeline: usize,
+    vertices: wgpu::Buffer,
+    consts: wgpu::BindGroup,
+    textures: wgpu::BindGroup,
+    slot: u64,
+    material: usize,
+    /// The scene emitter it draws ([`AreaScene::emitters`]).
+    pub emitter: usize,
+    /// How many indices to draw this frame (six per quad).
+    count: std::sync::atomic::AtomicU32,
 }
 
 /// The format of the shadow partitions: `PSSMStatic.psh` writes depth and its square into
@@ -1005,6 +1025,92 @@ fn create_pipeline(
 /// for the object (see [`crate::d3d`]), filtered by a light visibility list not traced
 /// here; summing every room's ambient into one, as before, washed out levels of many rooms.
 /// A level with no ambient light nodes (Lothering) gets none, as in the original.
+/// A draw's texture and sampler bindings: each sampler its program reads, bound to the
+/// texture the material (or lightmap, or shadow partition) gives it.
+#[allow(clippy::too_many_arguments)]
+fn texture_group(
+    ctx: &GpuContext,
+    vfs: &Vfs,
+    textures: &mut TextureCache,
+    shadows: Option<&ShadowTargets>,
+    samplers: &mut HashMap<String, wgpu::Sampler>,
+    layout: &wgpu::BindGroupLayout,
+    program: &D3dProgram,
+    material: &SceneMaterial,
+    lightmap: Option<&crate::scene::LightmapRef>,
+) -> wgpu::BindGroup {
+    let device = &ctx.device;
+    let mut views: Vec<(u32, wgpu::TextureView, String)> = Vec::new();
+    for (stage, s, ty) in texture_entries(program) {
+        let table = if stage == Stage::Vertex {
+            program.vs.ctab.as_ref()
+        } else {
+            program.ps.ctab.as_ref()
+        };
+        let (sampler_name, source) = sampler_texture(table, s, ty, material, lightmap);
+        let view = match &source {
+            TextureSource::Resource(name) => textures.view(ctx, vfs, name, ty),
+            TextureSource::Shadow(i) => shadows.and_then(|t| t.views.get(*i as usize).cloned()),
+            TextureSource::White => None,
+            TextureSource::Black => None,
+        }
+        .unwrap_or_else(|| {
+            textures.solid(
+                ctx,
+                ty,
+                if matches!(source, TextureSource::White | TextureSource::Shadow(_)) {
+                    [255; 4]
+                } else {
+                    [0, 0, 0, 255]
+                },
+            )
+        });
+        let settings = sampler_name
+            .as_deref()
+            .and_then(|n| program.state.sampler(n).ok())
+            .unwrap_or_default();
+        let key = sampler_key(&settings);
+        samplers
+            .entry(key.clone())
+            .or_insert_with(|| make_sampler(device, &settings));
+        views.push((translate::binding_texture(stage, s), view, key));
+    }
+    let mut entries = Vec::new();
+    for (b, view, key) in &views {
+        entries.push(wgpu::BindGroupEntry {
+            binding: *b,
+            resource: wgpu::BindingResource::TextureView(view),
+        });
+        entries.push(wgpu::BindGroupEntry {
+            binding: *b + 1,
+            resource: wgpu::BindingResource::Sampler(&samplers[key]),
+        });
+    }
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("d3d draw textures"),
+        layout,
+        entries: &entries,
+    })
+}
+
+/// Particle quad corners laid out as `inputs` (a vertex shader's inputs) read them, one
+/// `Float32x4` each: `POSITION` (w 1), `COLOR0`, `TEXCOORD0`; anything else (0, 0, 0, 1).
+fn particle_vertices(quads: &[crate::particles::ParticleVertex], inputs: &[IoSlot]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(quads.len() * inputs.len() * 4);
+    for v in quads {
+        for slot in inputs {
+            let value = match (decl_usage(slot.semantic.usage), slot.semantic.index) {
+                (DeclUsage::Position, 0) => [v.position[0], v.position[1], v.position[2], 1.0],
+                (DeclUsage::Color, 0) => v.color,
+                (DeclUsage::TexCoord, 0) => v.texcoord,
+                _ => [0.0, 0.0, 0.0, 1.0],
+            };
+            out.extend_from_slice(&value);
+        }
+    }
+    out
+}
+
 fn room_ambients(scene: &AreaScene) -> impl Fn(&str) -> Vec3 {
     let mut by_room: HashMap<String, Vec3> = HashMap::new();
     for l in &scene.lights {
@@ -1121,61 +1227,17 @@ impl D3dPass {
             let consts = const_group(device, &consts_layout, buf, slot);
 
             // Textures and samplers.
-            let material = &scene.materials[d.material];
-            let mut views: Vec<(u32, wgpu::TextureView, String)> = Vec::new();
-            for (stage, s, ty) in texture_entries(&program) {
-                let table = if stage == Stage::Vertex {
-                    program.vs.ctab.as_ref()
-                } else {
-                    program.ps.ctab.as_ref()
-                };
-                let (sampler_name, source) =
-                    sampler_texture(table, s, ty, material, d.lightmap.as_ref());
-                let view = match &source {
-                    TextureSource::Resource(name) => textures.view(ctx, vfs, name, ty),
-                    TextureSource::Shadow(i) => shadows
-                        .as_ref()
-                        .and_then(|t| t.views.get(*i as usize).cloned()),
-                    TextureSource::White => None,
-                    TextureSource::Black => None,
-                }
-                .unwrap_or_else(|| {
-                    textures.solid(
-                        ctx,
-                        ty,
-                        if matches!(source, TextureSource::White | TextureSource::Shadow(_)) {
-                            [255; 4]
-                        } else {
-                            [0, 0, 0, 255]
-                        },
-                    )
-                });
-                let settings = sampler_name
-                    .as_deref()
-                    .and_then(|n| program.state.sampler(n).ok())
-                    .unwrap_or_default();
-                let key = sampler_key(&settings);
-                samplers
-                    .entry(key.clone())
-                    .or_insert_with(|| make_sampler(device, &settings));
-                views.push((translate::binding_texture(stage, s), view, key));
-            }
-            let mut entries = Vec::new();
-            for (b, view, key) in &views {
-                entries.push(wgpu::BindGroupEntry {
-                    binding: *b,
-                    resource: wgpu::BindingResource::TextureView(view),
-                });
-                entries.push(wgpu::BindGroupEntry {
-                    binding: *b + 1,
-                    resource: wgpu::BindingResource::Sampler(&samplers[key]),
-                });
-            }
-            let textures_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("d3d draw textures"),
-                layout: &layouts[pi],
-                entries: &entries,
-            });
+            let textures_group = texture_group(
+                ctx,
+                vfs,
+                textures,
+                shadows.as_deref(),
+                &mut samplers,
+                &layouts[pi],
+                &program,
+                &scene.materials[d.material],
+                d.lightmap.as_ref(),
+            );
             draws.push(D3dDraw {
                 pipeline: pi,
                 vertices,
@@ -1310,6 +1372,100 @@ impl D3dPass {
             });
         }
 
+        // Particle emitters: one draw each, with its material's first pass.
+        let mut pending_particles = Vec::new();
+        for (ei, e) in scene.emitters.iter().enumerate() {
+            let Some(program) = material_programs.get(e.material).and_then(|p| p.first()) else {
+                continue;
+            };
+            // Volume textures (the smoke's `VolTex` semantics) do not load yet: such draws
+            // would sample black.
+            if texture_entries(program)
+                .iter()
+                .any(|(_, _, ty)| *ty == TextureType::Volume)
+            {
+                continue;
+            }
+            let pi = *by_name.entry(program.name.clone()).or_insert_with(|| {
+                let (pipeline, tl) = cache
+                    .pipelines
+                    .entry((program.name.clone(), color_format))
+                    .or_insert_with(|| {
+                        let tl = texture_layout(device, program);
+                        let pipeline =
+                            create_pipeline(device, program, &consts_layout, &tl, color_format);
+                        (pipeline, tl)
+                    })
+                    .clone();
+                pipelines.push(D3dPipeline {
+                    pipeline,
+                    program: program.clone(),
+                    blended: program.pass.blend.is_some(),
+                });
+                layouts.push(tl);
+                pipelines.len() - 1
+            });
+            pending_particles.push((ei, pi));
+        }
+        let particle_buffer = (!pending_particles.is_empty()).then(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("particle constants"),
+                size: slot_size * pending_particles.len() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        let quad_indices = (!pending_particles.is_empty()).then(|| {
+            use wgpu::util::DeviceExt;
+            let quads = crate::particles::MAX_PARTICLES as u32;
+            let indices: Vec<u32> = (0..quads)
+                .flat_map(|q| [0, 1, 2, 0, 2, 3].map(|k| q * 4 + k))
+                .collect();
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("particle quads"),
+                contents: bytemuck::cast_slice(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            })
+        });
+        let mut particles = Vec::new();
+        for (k, (ei, pi)) in pending_particles.into_iter().enumerate() {
+            let e = &scene.emitters[ei];
+            let program = pipelines[pi].program.clone();
+            let stride = 16 * program.vs.interface.inputs.len().max(1) as u64;
+            let vertices = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("particle vertices"),
+                size: stride * 4 * crate::particles::MAX_PARTICLES as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let buf = particle_buffer
+                .as_ref()
+                .expect("buffer exists with particles");
+            let slot = slot_size * k as u64;
+            let consts = const_group(device, &consts_layout, buf, slot);
+            let textures_group = texture_group(
+                ctx,
+                vfs,
+                textures,
+                shadows.as_deref(),
+                &mut samplers,
+                &layouts[pi],
+                &program,
+                &scene.materials[e.material],
+                None,
+            );
+            particles.push(ParticleDraw {
+                pipeline: pi,
+                vertices,
+                consts,
+                textures: textures_group,
+                slot,
+                material: e.material,
+                emitter: ei,
+                count: std::sync::atomic::AtomicU32::new(0),
+            });
+        }
+
         let programs = pipelines.iter().map(|p| p.program.name.clone()).collect();
         let celestial = scene
             .atmosphere
@@ -1354,6 +1510,108 @@ impl D3dPass {
             caster_buffer,
             caster_programs: caster_programs_used,
             empty_group,
+            particles,
+            particle_buffer,
+            quad_indices,
+        }
+    }
+
+    /// Fills each particle draw's vertices with its emitter's quads (`emitters` indexed as
+    /// the scene's) and its constants for this frame. The quads are in world space.
+    pub fn update_particles(
+        &self,
+        ctx: &GpuContext,
+        camera: &Camera,
+        width: u32,
+        height: u32,
+        time: f32,
+        emitters: &[crate::particles::EmitterState],
+    ) {
+        let Some(buffer) = &self.particle_buffer else {
+            return;
+        };
+        let aspect = width as f32 / height.max(1) as f32;
+        let (view, projection) = (camera.view(), camera.projection(aspect));
+        let inv = view.inverse();
+        let (right, up) = (inv.x_axis.truncate(), inv.y_axis.truncate());
+        let forward = camera.forward();
+        let slot_size = SLOT[7] as usize;
+        let lights = DrawLights::default();
+        let mut quads = Vec::new();
+        for d in &self.particles {
+            let Some(e) = emitters.get(d.emitter) else {
+                d.count.store(0, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            };
+            quads.clear();
+            e.quads(right, up, forward, &mut quads);
+            let program = &self.pipelines[d.pipeline].program;
+            let n = quads.len() / 4;
+            d.count
+                .store(6 * n as u32, std::sync::atomic::Ordering::Relaxed);
+            if n == 0 {
+                continue;
+            }
+            let data = particle_vertices(&quads, &program.vs.interface.inputs);
+            ctx.queue
+                .write_buffer(&d.vertices, 0, bytemuck::cast_slice(&data));
+            let cc = ConstantContext {
+                view,
+                projection,
+                world: glam::Mat4::IDENTITY,
+                camera: camera.position,
+                material: &self.materials[d.material],
+                lightmap: None,
+                lights: &lights,
+                ambient: Vec3::ZERO,
+                bones: &[],
+                irradiance: None,
+                sun: self.sun,
+                fog: self.fog,
+                sky: self.sky.as_ref(),
+                clouds: self.clouds,
+                time,
+                shadow: crate::d3d::NO_SHADOW_DATA,
+                partition: None,
+            };
+            let mut data = vec![0u8; slot_size];
+            for (table, base) in [(program.vs.ctab.as_ref(), 0), (program.ps.ctab.as_ref(), 3)] {
+                let mut c = StageConstants::default();
+                cc.fill_into(table, &mut c, |_| true);
+                let f: &[u8] = bytemuck::cast_slice(&c.floats);
+                let i: &[u8] = bytemuck::cast_slice(&c.ints);
+                let b: &[u8] = bytemuck::cast_slice(&c.bools);
+                data[SLOT[base] as usize..][..f.len()].copy_from_slice(f);
+                data[SLOT[base + 1] as usize..][..i.len()].copy_from_slice(i);
+                data[SLOT[base + 2] as usize..][..b.len()].copy_from_slice(b);
+            }
+            let fix = [
+                1.0 / width.max(1) as f32,
+                1.0 / height.max(1) as f32,
+                0.0,
+                0.0,
+            ];
+            data[SLOT[6] as usize..][..16].copy_from_slice(bytemuck::cast_slice(&fix));
+            ctx.queue.write_buffer(buffer, d.slot, &data);
+        }
+    }
+
+    /// Draws the particle draws filled by [`D3dPass::update_particles`].
+    pub fn draw_particles(&self, pass: &mut wgpu::RenderPass<'_>) {
+        let Some(indices) = &self.quad_indices else {
+            return;
+        };
+        for d in &self.particles {
+            let count = d.count.load(std::sync::atomic::Ordering::Relaxed);
+            if count == 0 {
+                continue;
+            }
+            pass.set_pipeline(&self.pipelines[d.pipeline].pipeline);
+            pass.set_bind_group(0, &d.consts, &[]);
+            pass.set_bind_group(1, &d.textures, &[]);
+            pass.set_vertex_buffer(0, d.vertices.slice(..));
+            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..count, 0, 0..1);
         }
     }
 

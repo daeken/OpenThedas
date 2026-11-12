@@ -128,6 +128,25 @@ pub struct DrawSkin {
     pub mesh_node: Mat4,
 }
 
+/// The VFX contact-sheet shaders' frame grid (`VFX0_CS_*.vsh` read it as columns, rows and
+/// frame count). Provisional: who fills it in the original (the emitter's flipbook columns
+/// and rows, as here, or the material) is not traced.
+pub const CONTACT_SHEET_PARAMETER: &str = "mml_vContactSheetParams";
+
+/// A particle emitter placed in the level, by a level model or a placed object's model.
+#[derive(Clone, Debug)]
+pub struct SceneEmitter {
+    pub emitter: Arc<thedas_formats::emitter::Emitter>,
+    /// Emitter node to world.
+    pub transform: Mat4,
+    /// The material its particles draw with ([`AreaScene::materials`]); a flipbook's
+    /// carries `mml_vContactSheetParams` (columns, rows, frames, 0).
+    pub material: usize,
+    /// The placed model and node, for diagnostics.
+    pub model: String,
+    pub node: String,
+}
+
 /// A light placed in the level (from the room's `_ll` light model).
 #[derive(Clone, Debug, PartialEq)]
 pub enum SceneLight {
@@ -219,6 +238,8 @@ pub struct AreaScene {
     pub sunlight_direction: Option<Vec3>,
     /// The models the simulation placed, in the order given, with their draws.
     pub props: Vec<PropDraws>,
+    /// The particle emitters of every placed model (see [`crate::particles`]).
+    pub emitters: Vec<SceneEmitter>,
 }
 
 /// A model (or several, drawn together) the simulation places in the level: a creature or a
@@ -908,6 +929,7 @@ impl<'a> Loader<'a> {
         if lights_only {
             return;
         }
+        self.place_emitters(model_name, &model, placement);
         let pieces = model.mesh_pieces();
         if pieces.is_empty() {
             return;
@@ -1003,6 +1025,50 @@ impl<'a> Loader<'a> {
                 probe,
                 skin,
                 cast_shadow: piece.mesh.cast_runtime_shadow,
+            });
+        }
+    }
+
+    /// The particle emitters of a placed model. Mesh-particle and physics emitters are left
+    /// out (not mirrored yet), as are emitters whose material does not load.
+    fn place_emitters(&mut self, model_name: &str, model: &Mmh, placement: Mat4) {
+        for piece in model.emitters() {
+            let e = piece.emitter;
+            if e.mesh_model.is_some() || e.physics || e.material.is_empty() {
+                continue;
+            }
+            let Some(mut material) = self.material(&e.material) else {
+                continue;
+            };
+            if e.flipbook {
+                let (c, r) = (e.flipbook_columns.max(1), e.flipbook_rows.max(1));
+                material = self.overridden_material(
+                    material,
+                    &format!("sheet{c}x{r}"),
+                    &[],
+                    &[(
+                        CONTACT_SHEET_PARAMETER.to_string(),
+                        vec![[c as f32, r as f32, (c * r) as f32, 0.0]],
+                    )],
+                );
+            }
+            let node = piece
+                .chain
+                .iter()
+                .fold(Mat4::IDENTITY, |m, t| m * transform_matrix(t));
+            let transform = placement * node;
+            log::debug!(
+                "emitter {model_name}:{} at {:?} ({})",
+                piece.name.unwrap_or(""),
+                transform.w_axis.truncate(),
+                e.material
+            );
+            self.scene.emitters.push(SceneEmitter {
+                emitter: Arc::new(e.clone()),
+                transform,
+                material,
+                model: model_name.to_string(),
+                node: piece.name.unwrap_or("").to_string(),
             });
         }
     }

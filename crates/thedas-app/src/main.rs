@@ -360,9 +360,11 @@ fn write_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
 fn log_stats(r: &AreaRenderer) {
     let s = &r.stats;
     log::info!(
-        "renderer: {} draws ({} skipped), {} meshes, {} textures ({} compressed, {} missing), programs {:?}",
+        "renderer: {} draws ({} skipped), {} emitters ({} drawn), {} meshes, {} textures ({} compressed, {} missing), programs {:?}",
         s.draws,
         s.draws_skipped,
+        s.emitters,
+        s.particle_draws,
         s.meshes,
         s.textures_loaded,
         s.textures_compressed,
