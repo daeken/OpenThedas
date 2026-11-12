@@ -5,6 +5,7 @@
 //! Provisional until checked against the executable.
 
 use super::frame::{Vec3, add, cos, cross, lerp, lerp3, normalize, scale, sin, sub};
+use super::limits::{GenerateError, MAX_SURFACE_VERTICES};
 use super::skeleton::{BANK, Branch, Flare};
 use super::{Curve, Random, Skeleton};
 use crate::speedtree::{BezierSpline, BranchLevel, SpeedTree, TEXTURE_LAYERS, TexLayer};
@@ -42,7 +43,7 @@ pub struct Tube {
 }
 
 /// A tree's branch geometry.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct BranchGeometry {
     pub vertices: Vec<BranchVertex>,
     /// Per skeleton branch (same indices as [`Skeleton::branches`]): its tube, if it has one.
@@ -86,7 +87,11 @@ impl GeometryCurves {
 
 /// Builds the branch tubes (3.2–3.6) in growth order, then selects branches for each LOD
 /// level (3.7), drawing from `random`.
-pub fn build(tree: &SpeedTree, skeleton: &Skeleton, random: &mut Random) -> BranchGeometry {
+pub fn build(
+    tree: &SpeedTree,
+    skeleton: &Skeleton,
+    random: &mut Random,
+) -> Result<BranchGeometry, GenerateError> {
     let levels: Vec<GeometryCurves> = tree.branch_levels.iter().map(GeometryCurves::new).collect();
     let roots = tree.roots.as_ref().map(|r| GeometryCurves::new(&r.roots));
     let first_level = tree.cluster_first_branch_level.unwrap_or(0);
@@ -96,6 +101,20 @@ pub fn build(tree: &SpeedTree, skeleton: &Skeleton, random: &mut Random) -> Bran
         lods: Vec::new(),
         roughness_index: 0,
     };
+    // The tube points, before building any, against the limit.
+    let points: usize = skeleton
+        .branches
+        .iter()
+        .filter(|b| !b.frond && b.level >= first_level)
+        .flat_map(|b| &b.vertices)
+        .map(|v| v.cross_sections.max(0) as usize + 1)
+        .sum();
+    if points > MAX_SURFACE_VERTICES {
+        return Err(GenerateError::TooLarge {
+            what: "branch vertices",
+            max: MAX_SURFACE_VERTICES,
+        });
+    }
     for branch in &skeleton.branches {
         let (info, curves) = if branch.root {
             match (tree.roots.as_ref(), roots.as_ref()) {
@@ -117,7 +136,13 @@ pub fn build(tree: &SpeedTree, skeleton: &Skeleton, random: &mut Random) -> Bran
                 }
             }
         };
-        let tube = if !branch.frond && branch.level >= first_level && branch.vertices.len() >= 2 {
+        // A cross section needs at least two points to make a surface; fewer only comes from
+        // a malformed file (provisional: no tube).
+        let tube = if !branch.frond
+            && branch.level >= first_level
+            && branch.vertices.len() >= 2
+            && branch.vertices.iter().all(|v| v.cross_sections >= 2)
+        {
             Some(tube(
                 &mut out,
                 branch,
@@ -132,7 +157,7 @@ pub fn build(tree: &SpeedTree, skeleton: &Skeleton, random: &mut Random) -> Bran
         out.tubes.push(tube);
     }
     lod(tree, skeleton, &mut out, random);
-    out
+    Ok(out)
 }
 
 /// Per-branch values of 3.1.
@@ -265,6 +290,13 @@ fn texcoord(layer: &TexLayer, f: f32, t: f32, v: &BranchValues) -> [f32; 2] {
         let mut start = layer.s_offset * 90.0;
         if start < 0.0 {
             start = 0.0;
+        }
+        // Wrapped by repeated subtraction as specified; a huge or infinite offset would never
+        // finish, so past a few turns take the remainder (malformed input only).
+        if !start.is_finite() {
+            start = 0.0;
+        } else if start > 360.0 * 64.0 {
+            start = start.rem_euclid(360.0);
         }
         while start > 360.0 {
             start -= 360.0;
@@ -494,8 +526,8 @@ mod tests {
     }
 
     fn build_tree(t: &SpeedTree) -> (Skeleton, BranchGeometry) {
-        let (skeleton, mut random) = grow(t);
-        let geometry = build(t, &skeleton, &mut random);
+        let (skeleton, mut random) = grow(t).unwrap();
+        let geometry = build(t, &skeleton, &mut random).unwrap();
         (skeleton, geometry)
     }
 
