@@ -691,6 +691,34 @@ impl UiLayer {
         self.line.as_ref().map(|l| (l.played(), l.waits))
     }
 
+    /// Calls a function in an open movie by path (the `call` step, for probing the movies
+    /// headless); arguments that parse as numbers are passed as numbers.
+    pub fn probe_call(
+        &mut self,
+        movie: &str,
+        path: &str,
+        args: &[String],
+    ) -> Option<thedas_ui::UiValue> {
+        let args: Vec<_> = args
+            .iter()
+            .map(|a| match a.parse::<f64>() {
+                Ok(n) => thedas_ui::UiValue::Number(n),
+                Err(_) => thedas_ui::UiValue::String(a.clone()),
+            })
+            .collect();
+        self.stage.call_in(movie, path, &args)
+    }
+
+    /// Sets an engine value the movies read (the `setvalue` step): a number when it parses
+    /// as one, else a string.
+    pub fn probe_set_value(&mut self, name: &str, value: &str) {
+        let v = value
+            .parse::<f64>()
+            .map(thedas_ui::UiValue::Number)
+            .unwrap_or_else(|_| thedas_ui::UiValue::String(value.to_string()));
+        self.stage.bridge.set_value(name, v);
+    }
+
     /// conversation.gfx's continue action (it sends `Conversation.SelectResponse 0` when the
     /// line has nothing to choose).
     fn continue_conversation(&mut self) {

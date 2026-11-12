@@ -1337,6 +1337,19 @@ impl App {
                 }
                 log.push("the party falls".into());
             }
+            Step::Call(movie, path, args) => {
+                let r = self
+                    .gfx
+                    .as_mut()
+                    .and_then(|g| g.ui.probe_call(movie, path, args));
+                log.push(format!("call {movie} {path}{args:?}: {r:?}"));
+            }
+            Step::SetValue(k, v) => {
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.probe_set_value(k, v);
+                }
+                log.push(format!("setvalue {k} = {v}"));
+            }
             &Step::Menu(m) => {
                 self.key_down(match m {
                     screens::Screen::CharacterRecord => KeyCode::KeyC,
@@ -2061,6 +2074,11 @@ enum Step {
     /// A game controller's stick is pushed (x, y; +y up): `pad stick-left 0,1 500` holds it
     /// there for a `run` of 500 ms, then lets go.
     PadStick(pad::Stick, f32, f32),
+    /// A movie function called by path, its answer printed, for probing the movies headless:
+    /// `call inventory.gfx _global.GUISystem.InConsoleMode [arg ...]` (numbers, else strings).
+    Call(String, String, Vec<String>),
+    /// An engine value the movies read with `GetValue` (`setvalue DebugOptions.EnableController 1`).
+    SetValue(String, String),
 }
 
 /// A `pad` step: a button by name (pressed and let go), `press`/`release` and a button, or
@@ -2158,6 +2176,18 @@ fn parse_step(s: &str) -> Result<Step> {
             Step::Click(x.trim().parse()?, y.trim().parse()?)
         }
         "run" => Step::Run(arg.parse().context("run takes milliseconds")?),
+        "call" => {
+            let mut w = arg.split_whitespace().map(str::to_string);
+            let movie = w.next().context("call takes a movie and a path")?;
+            let path = w.next().context("call takes a movie and a path")?;
+            Step::Call(movie, path, w.collect())
+        }
+        "setvalue" => {
+            let (k, v) = arg
+                .split_once(' ')
+                .context("setvalue takes a name and a value")?;
+            Step::SetValue(k.to_string(), v.trim().to_string())
+        }
         "key" if arg.eq_ignore_ascii_case("i") => Step::Menu(screens::Screen::Inventory),
         "key" if arg.eq_ignore_ascii_case("c") => Step::Menu(screens::Screen::CharacterRecord),
         "key" if arg.eq_ignore_ascii_case("t") => Step::Menu(screens::Screen::Tactics),
@@ -2520,6 +2550,18 @@ fn main() -> Result<()> {
                     Step::Wipe => {
                         wipe(&mut l.sim());
                         println!("the party falls");
+                    }
+                    Step::Call(movie, path, args) => {
+                        let r = played
+                            .as_mut()
+                            .and_then(|(layer, _)| layer.probe_call(movie, path, args));
+                        println!("call {movie} {path}{args:?}: {r:?}");
+                    }
+                    Step::SetValue(k, v) => {
+                        if let Some((layer, _)) = played.as_mut() {
+                            layer.probe_set_value(k, v);
+                        }
+                        println!("setvalue {k} = {v}");
                     }
                     &Step::Menu(m) => {
                         if let Some((layer, s)) = played.as_mut() {
