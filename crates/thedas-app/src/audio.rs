@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use thedas_audio::area::{AreaSound, area_audio};
+use thedas_audio::area::{AreaReverb, AreaSound, area_audio, area_reverb};
 use thedas_audio::{AudioEngine, EventHandle, Library, PlayOptions, Volumes};
 use thedas_formats::anim::AnimEventText;
 use thedas_vfs::Vfs;
@@ -93,6 +93,8 @@ pub struct AudioState {
     pub dead: bool,
     /// Where the listener is (between the party leader and the camera) and its right.
     pub listener: Option<([f32; 3], [f32; 3])>,
+    /// Where the party leader stands (reverb triggers follow it).
+    pub leader: Option<[f32; 3]>,
     /// The area's sound objects the simulation has switched off (`ActivateSoundByTag`), by
     /// tag (lowercase).
     pub inactive_sounds: Vec<String>,
@@ -152,6 +154,9 @@ struct AreaPlay {
     /// Per sound: playing (`Some(Some)`), played through while in reach (`Some(None)`: it
     /// plays again once the listener has left and come back), or not started.
     playing: Vec<Option<Option<EventHandle>>>,
+    reverb: AreaReverb,
+    /// The reverb preset applied (`None` until the first).
+    preset: Option<String>,
 }
 
 /// A cutscene's sound tracks and which of them are playing.
@@ -200,7 +205,8 @@ pub struct GameAudio {
     picker_lines: std::collections::HashMap<String, (i32, i32)>,
     /// Who the open party picker had picked last frame, and when it last spoke.
     picked: Option<Vec<u32>>,
-    picker_spoke: Instant,
+    /// Seconds of frame time since the picker last spoke.
+    picker_spoke: f32,
     /// Creature templates' sound sets (`.utc` `SoundSet`), for creatures that do not carry
     /// theirs (from a save made before the simulation kept it).
     template_sets: std::collections::HashMap<String, Option<String>>,
@@ -550,7 +556,7 @@ impl GameAudio {
             template_sets: Default::default(),
             picker_lines: picker_lines(vfs),
             picked: None,
-            picker_spoke: Instant::now(),
+            picker_spoke: f32::INFINITY,
             last: Instant::now(),
         }
     }
@@ -825,9 +831,13 @@ impl GameAudio {
     pub fn set_area(&mut self, resref: &str, data: &[u8]) {
         self.end_area();
         let (theme, sounds) = area_audio(data);
+        let reverb = area_reverb(data);
         log::info!(
-            "audio: area {resref}: music {theme:?}, {} placed sounds",
-            sounds.len()
+            "audio: area {resref}: music {theme:?}, {} placed sounds, reverb {:?} and {} \
+             reverb triggers",
+            sounds.len(),
+            reverb.preset,
+            reverb.triggers.len()
         );
         let n = sounds.len();
         self.area = Some(AreaPlay {
@@ -836,11 +846,17 @@ impl GameAudio {
             track: None,
             sounds,
             playing: vec![None; n],
+            reverb,
+            preset: None,
         });
     }
 
     fn end_area(&mut self) {
         if let Some(a) = self.area.take() {
+            if a.preset.is_some() {
+                self.engine
+                    .set_reverb(thedas_formats::fev::ReverbProperties::OFF, 0.0);
+            }
             for h in a
                 .playing
                 .into_iter()
@@ -909,6 +925,20 @@ impl GameAudio {
                     log::debug!("audio: no music {theme}/{want}");
                 }
             }
+        }
+        // The reverb: the area's preset, or a reverb trigger's while the party leader is in
+        // it, faded over 0.33 s (DAOrigins.exe 0xaff1c8; set at once on arrival).
+        let at = state.leader.or(state.listener.map(|l| l.0));
+        let want = at.map_or(a.reverb.preset.as_str(), |p| a.reverb.preset_at(p));
+        if a.preset.as_deref() != Some(want) {
+            let props = self.engine.reverb_preset(want).unwrap_or_else(|| {
+                log::debug!("audio: no reverb preset {want:?}");
+                thedas_formats::fev::ReverbProperties::OFF
+            });
+            let fade = if a.preset.is_some() { 0.33 } else { 0.0 };
+            log::debug!("audio: reverb {want:?} over {fade} s");
+            self.engine.set_reverb(props, fade);
+            a.preset = Some(want.to_string());
         }
         let Some((listener, _)) = state.listener else {
             return;
@@ -1114,6 +1144,7 @@ impl GameAudio {
         // The party picker (DAOrigins.exe 0x766040, 0x7661b0): picking a follower has it say
         // its picked line, unpicking its unpicked line, at most one every 0.1 s
         // (0xc0d718), always (probability 1).
+        self.picker_spoke += dt;
         match state.picker.take() {
             Some(members) => {
                 let ids: Vec<u32> = members.iter().map(|m| m.0).collect();
@@ -1130,7 +1161,7 @@ impl GameAudio {
                         )
                         .next();
                     if let Some(((_, template, set, at), picked)) = changed
-                        && self.picker_spoke.elapsed().as_secs_f32() > 0.1
+                        && self.picker_spoke > 0.1
                         && let Some(set) = set
                     {
                         let lines = self
@@ -1141,7 +1172,7 @@ impl GameAudio {
                         if let Some((yes, no)) = lines {
                             let entry = if picked { yes } else { no };
                             state.sound_sets.push((set.clone(), entry, 1.0, Some(*at)));
-                            self.picker_spoke = Instant::now();
+                            self.picker_spoke = 0.0;
                         }
                     }
                 }
