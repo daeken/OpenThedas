@@ -30,6 +30,8 @@ pub struct FrondVertex {
     pub texture: usize,
     /// LOD fade hint (4.6); 0 until a level sets it.
     pub fade: f32,
+    /// The guide vertex's wind values (7.7).
+    pub wind: super::Wind,
 }
 
 /// A tree's fronds.
@@ -99,7 +101,7 @@ pub fn build(
             max: MAX_SURFACE_VERTICES,
         });
     }
-    let profile = Curve::new(&fronds.profile.clone().unwrap_or_default());
+    let profile = Curve::new(&fronds.profile.clone().unwrap_or_else(default_profile));
     let fade_extrusions = tree.lod.and_then(|l| l.fade_extrusions).unwrap_or(false);
     let atlas = tree.texcoords.as_ref().map(|t| t.fronds.as_slice());
     for &g in &level0 {
@@ -166,6 +168,28 @@ pub fn build(
         }
     }
     Ok(out)
+}
+
+/// The built-in profile of a file without one (5.7 C): a rounded arch, highest in the middle.
+#[allow(clippy::excessive_precision)]
+fn default_profile() -> crate::speedtree::BezierSpline {
+    use crate::speedtree::{BezierSpline, SplinePoint};
+    let point = |x, y, tx, ty, tangent_length| SplinePoint {
+        x,
+        y,
+        tangent: [tx, ty],
+        tangent_length,
+    };
+    BezierSpline {
+        min: 0.0,
+        max: 1.0,
+        variance: 0.0,
+        points: vec![
+            point(0.0, 0.00138887, 0.337009, 0.941501, 0.132767),
+            point(0.493215, 0.998903, 1.0, 0.00102074, 0.23702),
+            point(1.0, -6.24607e-8, 0.307222, -0.951638, 0.126974),
+        ],
+    }
 }
 
 /// Maps a frond texture coordinate into its atlas rectangle (4.6).
@@ -310,6 +334,7 @@ fn blades(
                     texcoord: [s, t],
                     texture: 0,
                     fade: 0.0,
+                    wind: verts[i].wind,
                 });
             }
         }
@@ -406,6 +431,7 @@ fn extrusion(
                 texcoord: st,
                 texture: 0,
                 fade: 0.0,
+                wind: verts[i].wind,
             });
         }
     }
@@ -566,5 +592,15 @@ mod tests {
         t.fronds.as_mut().unwrap().enabled = false;
         let g = generate(&t).unwrap();
         assert!(g.fronds.vertices.is_empty());
+    }
+
+    #[test]
+    fn a_missing_profile_uses_the_built_in_arch() {
+        let mut t = frondy(1);
+        t.fronds.as_mut().unwrap().profile = None;
+        let g = generate(&t).unwrap();
+        assert!(!g.fronds.vertices.is_empty());
+        let arch = Curve::new(&default_profile());
+        assert!(arch.value(0.5) > 0.99 && arch.value(0.0) < 0.01 && arch.value(1.0).abs() < 0.01);
     }
 }
