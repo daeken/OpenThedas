@@ -9,11 +9,32 @@
 
 use thedas_ui::FocusTarget;
 
-/// The target the pointer is on (the last that contains it: the topmost drawn).
+/// The target the pointer is on: the smallest that contains it (the last of equals, the
+/// topmost drawn). An open picker's full-screen overlay (which closes it on a click outside)
+/// contains its entries' places too, and is not the one focused there.
 pub fn under(targets: &[FocusTarget], (x, y): (f64, f64)) -> Option<usize> {
+    let area = |t: &FocusTarget| (t.rect[2] - t.rect[0]) * (t.rect[3] - t.rect[1]);
     targets
         .iter()
-        .rposition(|t| x >= t.rect[0] && x <= t.rect[2] && y >= t.rect[1] && y <= t.rect[3])
+        .enumerate()
+        .filter(|(_, t)| x >= t.rect[0] && x <= t.rect[2] && y >= t.rect[1] && y <= t.rect[3])
+        .min_by(|a, b| area(a.1).total_cmp(&area(b.1)).then(b.0.cmp(&a.0)))
+        .map(|(i, _)| i)
+}
+
+/// The targets the focus may move among: with a picker's list open (its entries are up,
+/// `PickerList_mc`), only that list's entries, since the list is modal over the screen
+/// (its overlay closes it on a click outside) and the buttons under it are not to be had.
+pub fn modal(targets: Vec<FocusTarget>) -> Vec<FocusTarget> {
+    const LIST: &str = ".PickerList_mc.";
+    if targets.iter().any(|t| t.path.contains(LIST)) {
+        targets
+            .into_iter()
+            .filter(|t| t.path.contains(LIST))
+            .collect()
+    } else {
+        targets
+    }
 }
 
 /// The first target in reading order: the topmost row, then its leftmost.
@@ -59,7 +80,7 @@ fn gap(a0: f64, a1: f64, b0: f64, b1: f64) -> f64 {
 
 /// The target a step `(dx, dy)` (one of them ±1, the other 0) from `from` lands on: the
 /// nearest whose centre lies that way, preferring those in line (overlapping across the
-/// step). Past the last one, it wraps to the farthest in line the other way; nothing in
+/// step, or nearly). Past the last one, it wraps to the farthest in line the other way; nothing in
 /// line, it stays.
 pub fn step(targets: &[FocusTarget], from: usize, (dx, dy): (i8, i8)) -> usize {
     let Some(cur) = targets.get(from) else {
@@ -83,6 +104,10 @@ pub fn step(targets: &[FocusTarget], from: usize, (dx, dy): (i8, i8)) -> usize {
             )
         }
     };
+    // Nearly in line counts as in line: a button a little above or below the row (the
+    // tactics screen's two pickers, 17 px apart in height) is still the one beside it, rather
+    // than a nearer button a row away.
+    let slack = (cur.rect[2] - cur.rect[0]).min(cur.rect[3] - cur.rect[1]) * 0.75;
     let ahead = targets
         .iter()
         .enumerate()
@@ -90,8 +115,9 @@ pub fn step(targets: &[FocusTarget], from: usize, (dx, dy): (i8, i8)) -> usize {
         .map(|(i, t)| (i, measure(t)))
         .filter(|&(_, (along, _))| along > 1.0)
         .min_by(|a, b| {
-            let score = |(along, across): (f64, f64)| along + across * 3.0;
-            score(a.1).total_cmp(&score(b.1))
+            let score = |(along, across): (f64, f64)| (across > slack, along + across * 3.0);
+            let (sa, sb) = (score(a.1), score(b.1));
+            sa.0.cmp(&sb.0).then(sa.1.total_cmp(&sb.1))
         });
     if let Some((i, _)) = ahead {
         return i;
@@ -215,6 +241,25 @@ mod tests {
         assert_eq!(step(&g, 1, (0, 1)), 4);
         assert_eq!(step(&g, 4, (0, -1)), 1);
         assert_eq!(step(&g, 5, (-1, 0)), 4);
+        // A button a little out of line (the tactics screen's Presets, lower than its
+        // Behaviour picker) is still the one beside it, not a nearer button a row away.
+        let pickers = [
+            t("behaviour", 668.0, 100.0, 230.0, 28.0),
+            t("preset", 256.0, 145.0, 230.0, 28.0),
+            t("row_action", 529.0, 183.0, 340.0, 28.0),
+        ];
+        assert_eq!(step(&pickers, 0, (-1, 0)), 1);
+        // An open picker's list keeps the focus to its entries.
+        let open = vec![
+            t("s.Row.Button", 150.0, 183.0, 340.0, 28.0),
+            t("s.P.PickerList_mc.E1.HitArea_mc", 258.0, 173.0, 225.0, 32.0),
+            t("s.P.PickerList_mc.E2.HitArea_mc", 258.0, 205.0, 225.0, 32.0),
+            t("s.P.Overlay_mc", -170.0, -3.0, 1365.0, 768.0),
+        ];
+        let entries = modal(open.clone());
+        assert_eq!(entries.len(), 2);
+        assert_eq!(step(&entries, 0, (0, 1)), 1);
+        assert_eq!(under(&open, (300.0, 190.0)), Some(1));
         // From the row's end, right reaches the far one only when nothing is in line.
         assert_eq!(step(&g, 2, (1, 0)), 6);
         assert_eq!(first(&g), Some(0));
