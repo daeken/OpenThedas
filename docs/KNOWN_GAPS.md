@@ -75,7 +75,7 @@ these, so they are the places where one person or stream can take a large, separ
   limit or wall sliding, and the pathfinder is an untraced grid search (`SIM-011` to `SIM-013`).
   Creature bodies do block each other (#320, #322, #329; graded by QA).
 - **No patrols or ambient life.** Nothing walks a multi-point route, and there is no ambient
-  animation, commoner walking or engine-side behaviour for idle creatures (`SIM-003`, `SIM-079`).
+  animation, commoner walking or engine-side behaviour for idle creatures (`SIM-079`).
 - **Blows and projectiles are not timed by animation.** In the simulation both hands land when
   the attack ends, and projectiles arrive instantly (`SIM-041`, `SIM-047`, `SIM-063`).
 - **Traps.** No detect, arm, trigger or disarm logic (`SCR-082`).

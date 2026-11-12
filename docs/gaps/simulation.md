@@ -227,7 +227,7 @@ modules, not that the scripts cannot do it.
 - **SIM-076** **Custom tactics presets are not kept.** Original: `LoadPreset` type 1 and `SavePreset` (custom presets). Ours: messages accepted and ignored. Evidence: `crates/thedas-sim/src/tactics.rs:11-12`, `crates/thedas-sim/src/tactics.rs:28-29`. Size: S. Depends: none. Kind: missing.
 - **SIM-077** **Tactics slot writes are not traced in the exe.** Original: handlers `LoadPreset` 0x7ae4b0, `DirtyPreset` 0x7ad100, `SetBehaviour` 0x7ad120 are traced; slot writes are not. Ours: slot writes read from tactics.gfx. Evidence: `crates/thedas-sim/src/tactics.rs:11`. Size: S. Depends: none. Kind: provisional.
 - **SIM-078** **`ListTacticAbilities` target-type test.** Original: 0x7aed50 tests the target type's bits against 7 (always set). Ours: the target type limits nothing, kept as observed. Evidence: `crates/thedas-sim/src/tactics.rs:231-234`. Size: S. Depends: none. Kind: provisional.
-- **SIM-079** **Hostile AI packages and ambient behaviour.** Original: AI packages for hostiles, ambient animations, patrols, commoner walking. Ours: no engine code found; hostile AI runs only as scripts, ambient animation and patrol behaviour have no code (see SIM-003). Evidence: `crates/thedas-sim/src/combat.rs:3-5`. Size: L. Depends: SIM-002, SIM-003. Kind: missing.
+- **SIM-079** **Hostile AI packages and ambient behaviour.** Original: AI packages for hostiles, ambient animations, patrols, commoner walking. Ours: no engine code found; hostile AI runs only as scripts, ambient animation and patrol behaviour have no code (waypoint walks now run, see SCR-055). Evidence: `crates/thedas-sim/src/combat.rs:3-5`. Size: L. Depends: SIM-002. Kind: missing.
 
 ### Party
 
