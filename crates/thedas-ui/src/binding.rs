@@ -97,6 +97,13 @@ pub struct Presentation {
     /// How far the player has turned the paperdoll from facing them (radians; the
     /// inventory's and character record's rotate buttons, see `crate::input::PAPERDOLL_TURN`).
     pub paperdoll_yaw: f32,
+    /// The paperdoll's camera preset (`Paperdoll.SetCameraPreset`, DAOrigins.exe's
+    /// `SetCameraPresetMessage`, handled at 0x7b49b0): 0 the whole body, 1 the face (character
+    /// creation's appearance page). Character creation starts at 0 (0x7bbc4d).
+    pub paperdoll_preset: i32,
+    /// How many times the movies asked for the portraits to be drawn again
+    /// (`Paperdoll.UpdatePortrait`, `UpdatePortraitMessage`, handled at 0x7bc6c0).
+    pub portrait_requests: u32,
     /// The item being examined (see [`Examine`]), while the examine screen is up.
     pub examine: Option<Examine>,
     /// Whether the player paused the game (floatylayer.gfx's pause border).
@@ -385,6 +392,21 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
                 format!("Party.Members.{i}.Portrait"),
                 UiValue::String(p.clone()),
             );
+        }
+    }
+    // The creature in character creation as its paperdoll shows it (chargen.gfx's
+    // `Paperdoll.PaperCreature`), with the portrait drawn of it, which the appearance page's
+    // portrait loads (`.Portrait`; it reads `CharGenCreature.Portrait` too).
+    if let Some(c) = sim.world.chargen.filter(|_| sim.world.chargen_mode == 0) {
+        v.insert("Paperdoll.PaperCreature".into(), num(c));
+        v.insert("Paperdoll.PaperCreature.ID".into(), num(c));
+        if let Some(p) = shown.portraits.get(&c) {
+            for k in ["Paperdoll.PaperCreature", "CharGenCreature"] {
+                v.insert(format!("{k}.Portrait"), UiValue::String(p.clone()));
+            }
+        }
+        for k in ["Paperdoll.PaperCreature", "CharGenCreature"] {
+            v.insert(format!("{k}.PortraitProperties.PortraitTint"), num(0));
         }
     }
     // Who may level up now (the character record's button): a party member the game marked
@@ -1409,6 +1431,32 @@ mod tests {
             UiValue::String("thedas_portrait_1_1.png".into())
         );
         assert!(!sim_values(&sim).contains_key("Party.Members.0.Portrait"));
+    }
+
+    #[test]
+    fn character_creation_shows_the_portrait_drawn_of_its_creature() {
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "player");
+        sim.world.hero = Some(hero);
+        let shown = Presentation {
+            portraits: [(hero, "thedas_portrait_1_2.png".to_string())].into(),
+            ..Default::default()
+        };
+        assert!(!sim_values_for(&sim, &shown).contains_key("Paperdoll.PaperCreature"));
+        sim.world.chargen = Some(hero);
+        sim.world.chargen_mode = 0;
+        let v = sim_values_for(&sim, &shown);
+        assert_eq!(v["Paperdoll.PaperCreature"], UiValue::Number(hero as f64));
+        let p = UiValue::String("thedas_portrait_1_2.png".into());
+        assert_eq!(v["Paperdoll.PaperCreature.Portrait"], p);
+        assert_eq!(v["CharGenCreature.Portrait"], p);
+        // Level-up (mode 1) is not character creation's paperdoll.
+        sim.world.chargen_mode = 1;
+        assert!(!sim_values_for(&sim, &shown).contains_key("Paperdoll.PaperCreature"));
     }
 
     #[test]

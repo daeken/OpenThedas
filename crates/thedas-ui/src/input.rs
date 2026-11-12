@@ -154,6 +154,13 @@ pub const PAPERDOLL_RIGHT: &str = "Paperdoll.RotatePaperdollRight";
 /// vertical movement times -0.8 (`RotatePaperdollCameraMessage`). Provisional: taken as
 /// degrees about the member; the vertical part (the camera's pitch) is not used.
 pub const PAPERDOLL_DRAG: &str = "Paperdoll.RotatePaperdollCamera";
+/// The paperdoll's camera preset chosen (chargen.gfx: 1 on the appearance page), and the
+/// portrait asked to be drawn again (see [`crate::binding::Presentation`]).
+pub const PAPERDOLL_PRESET: &str = "Paperdoll.SetCameraPreset";
+pub const PAPERDOLL_PORTRAIT: &str = "Paperdoll.UpdatePortrait";
+/// Character creation opening (`GUICharGen.CharGenStart`): the paperdoll starts on camera
+/// preset 0 (0x7bbc4d). The simulation takes the message too.
+pub const CHARGEN_START: &str = "GUICharGen.CharGenStart";
 /// How far one press turns the paperdoll (radians). Provisional: the game's step is not
 /// traced.
 pub const PAPERDOLL_TURN: f32 = std::f32::consts::PI / 8.0;
@@ -204,6 +211,22 @@ pub fn present(shown: &mut Presentation, name: &str, args: &[String]) -> bool {
             shown.paperdoll_yaw =
                 (shown.paperdoll_yaw + degrees.to_radians()) % std::f32::consts::TAU;
             true
+        }
+        PAPERDOLL_PRESET => {
+            shown.paperdoll_preset = args
+                .first()
+                .and_then(|a| a.trim().parse::<f64>().ok())
+                .filter(|v| v.is_finite())
+                .map_or(0, |v| v as i32);
+            true
+        }
+        PAPERDOLL_PORTRAIT => {
+            shown.portrait_requests = shown.portrait_requests.wrapping_add(1);
+            true
+        }
+        CHARGEN_START => {
+            shown.paperdoll_preset = 0;
+            false
         }
         SET_ITEM_FILTER => {
             shown.item_filter = args
@@ -349,6 +372,20 @@ mod tests {
         assert!(present(&mut p, PAPERDOLL_LEFT, &[]));
         assert!(present(&mut p, PAPERDOLL_DRAG, &a(&["-8", "4"])));
         assert!((p.paperdoll_yaw + 8f32.to_radians()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_paperdoll_camera_preset_and_portrait_requests_are_kept() {
+        let mut p = Presentation::default();
+        let a = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(present(&mut p, PAPERDOLL_PRESET, &a(&["1"])));
+        assert_eq!(p.paperdoll_preset, 1);
+        assert!(present(&mut p, PAPERDOLL_PORTRAIT, &[]));
+        assert_eq!(p.portrait_requests, 1);
+        // Character creation opening starts on the body preset, and still reaches the
+        // simulation.
+        assert!(!present(&mut p, CHARGEN_START, &a(&["0", "0"])));
+        assert_eq!(p.paperdoll_preset, 0);
     }
 
     fn sim() -> Sim {
