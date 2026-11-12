@@ -355,7 +355,7 @@ pub const VFX_VERTEX_SHADERS: [&str; 8] = [
 ];
 
 /// See [`object_filter`].
-pub const OBJECT_VERTEX_SHADERS: [&str; 15] = [
+pub const OBJECT_VERTEX_SHADERS: [&str; 17] = [
     "Char1.vsh",
     "Hair0_Pass1.vsh",
     "Hair0.vsh",
@@ -371,6 +371,8 @@ pub const OBJECT_VERTEX_SHADERS: [&str; 15] = [
     "Lava0.vsh",
     "Water0.vsh",
     "SPT_LeafCards.vsh",
+    "SPT_Branch.vsh",
+    "SPT_Fronds.vsh",
 ];
 
 /// Point lights chosen for one draw.

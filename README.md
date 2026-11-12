@@ -10,7 +10,7 @@ repository.
 
 ## Status
 
-Last updated 2026-11-12 21:55 UTC, main 1262f72
+Last updated 2026-11-12 22:15 UTC, main 99232ea
 
 For everything that is wrong or missing, in detail and split into items that can be picked up in
 parallel, see [docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md).
@@ -88,7 +88,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Looking down from high above the party cuts away ceilings marked for it in the models, with the exe's height threshold and 0.2 s fade.
   - Only per-frame shader constants are rewritten per draw, and first-use work is done at the end of a load, which took about a fifth off frame time and removed the stutter after arriving in an area.
   - Open:
-    - Trees, bushes and grass are real geometry from a clean-room SpeedTree generator written from our own spec (`docs/speedtree/`): trunks, branches, fronds, leaf cards and mesh leaves, with the game's distance rule for switching to billboards, batched per ground cell. Wind, camera-facing leaf cards and the game's own tree shaders are not done.
+    - Trees, bushes and grass are real geometry from a clean-room SpeedTree generator written from our own spec (`docs/speedtree/`): trunks, branches, fronds, leaf cards and mesh leaves, with the game's distance rule for switching to billboards, batched per ground cell. Leaf cards face the camera through the game's own leaf-card shader, held still (#422). Wind, leaf rocking, fades between levels and the game's shaders for branches, fronds and mesh leaves are not done.
     - Emitters in a cut-away model do not fade with it.
   - The backend stays on wgpu, and its types are kept inside `thedas-render`.
 - 🟡 **Audio**:
