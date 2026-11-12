@@ -694,7 +694,16 @@ impl<'a> Loader<'a> {
         // Choices made over a face (character creation's sliders) ride after its name.
         let (base, overlay) = FaceOverlay::split(name);
         if !overlay.is_empty() {
-            let loaded = self.morph(base).map(|m| Arc::new(m.with_overlay(&overlay)));
+            let loaded = self.morph(base).map(|m| {
+                let mut m = m.with_overlay(&overlay);
+                // A tint chosen for a slot colours that slot's meshes.
+                for (slot, name) in &overlay.tints {
+                    if let Some(t) = name.as_deref().and_then(|n| self.tint(n)) {
+                        m = m.with_tint(*slot, &t);
+                    }
+                }
+                Arc::new(m)
+            });
             self.morphs.insert(key, loaded.clone());
             return loaded;
         }
