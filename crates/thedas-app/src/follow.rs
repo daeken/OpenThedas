@@ -42,6 +42,14 @@ pub const NEAR_DISTANCE: f32 = 3.0;
 pub const NEAR_POLAR_DEG: f32 = 85.0;
 /// The angle the far half of the zoom brings the camera to at the far end (0xc0e014; 0x76f221).
 pub const FAR_POLAR_DEG: f32 = 45.0;
+/// The vertical field of view in the near half of the zoom, and the one the far half narrows
+/// it to at the far end (degrees). `CameraControllerExplore` sets the game camera's field of
+/// view every frame (0x76f120, through 0x6c4b20): 60 (0xc0e000) while the zoom is at or above
+/// [`ZOOM_SPLIT`], else `60 + (42.5 - 60) * t` (42.5 at 0xc0e004), `t` being how far into the
+/// far half the zoom is (0x76eab0 with its argument set). Provisional: taken as the vertical
+/// field of view, which is what the original's tactical frame measures to.
+pub const NEAR_FOV_DEG: f32 = 60.0;
+pub const FAR_FOV_DEG: f32 = 42.5;
 /// How far the player can turn the camera over or under the look point in the near half
 /// (degrees from overhead; 0x76f1d7 sets the game camera's limits from 0xc0e050, 0xc0e054).
 pub const MIN_POLAR_DEG: f32 = 30.0;
@@ -224,6 +232,12 @@ impl Follow {
         }
     }
 
+    /// The vertical field of view (radians): [`NEAR_FOV_DEG`] in the near half, narrowing to
+    /// [`FAR_FOV_DEG`] at the far end (0x76f120).
+    pub fn fov_y(&self) -> f32 {
+        (NEAR_FOV_DEG + (FAR_FOV_DEG - NEAR_FOV_DEG) * self.far_t()).to_radians()
+    }
+
     /// From the look point to where the camera wants to be (metres).
     pub fn distance(&self) -> f32 {
         FAR_DISTANCE + (NEAR_DISTANCE - FAR_DISTANCE) * self.zoom_t()
@@ -284,7 +298,7 @@ impl Follow {
         self.ease_zoom(dt);
 
         let mut c = Camera::new(pivot, self.yaw, self.shot_pitch());
-        c.fov_y = base.fov_y;
+        c.fov_y = self.fov_y();
         c.near = base.near;
         c.far = base.far;
         let toward = c.forward();
@@ -575,5 +589,26 @@ mod tests {
         assert!((MIN_PITCH.to_degrees() + 60.0).abs() < 1e-4);
         f.orbit(0.0, 10.0);
         assert_eq!(f.pitch, MAX_PITCH);
+    }
+
+    #[test]
+    fn far_half_narrows_the_field_of_view() {
+        let mut f = Follow::behind(0.0);
+        let deg = |f: &Follow| f.fov_y().to_degrees();
+        f.zoom = ZOOM_MAX;
+        assert!((deg(&f) - 60.0).abs() < 1e-4);
+        f.zoom = ZOOM_SPLIT;
+        assert!((deg(&f) - 60.0).abs() < 1e-4);
+        f.zoom = ZOOM_MIN;
+        assert!((deg(&f) - 42.5).abs() < 1e-4);
+        // Half way through the far half, half way between.
+        f.zoom = (ZOOM_SPLIT + ZOOM_MIN) * 0.5;
+        assert!((deg(&f) - 51.25).abs() < 1e-3);
+        // The camera it hands out carries it, whatever the base camera had.
+        let mut base = Camera::new(Vec3::ZERO, 0.0, 0.0);
+        base.fov_y = 18f32.to_radians();
+        f.zoom = ZOOM_MIN;
+        let c = f.camera(Vec3::ZERO, 0.0, &base);
+        assert!((c.fov_y.to_degrees() - 42.5).abs() < 1e-4);
     }
 }
