@@ -50,8 +50,8 @@
 //!   (the occlusion test that lowers it is not traced). Light A is always evaluated; lights
 //!   A-C and the directional light are multiplied by the lightmap alpha; D is not.
 //! - Fog and the sky's scattering come from the level's atmosphere ([`crate::atmosphere`]).
-//!   Shadows, the environment cubemap and the depth-of-field output are disabled (no shadow
-//!   maps: [`NO_SHADOW_DATA`]; black cubemap, `oC1` dropped).
+//!   The environment cubemap (`EnvironmentMap`) is the draw's light probe's `.dds` (see
+//!   [`sampler_texture`]); the depth-of-field output `oC1` is dropped.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -321,8 +321,8 @@ pub fn static1_filter() -> ShaderFilter {
 /// characters (`Char1`), hair (`Hair0_Pass1`, `Hair0`: four passes), faces (`Face1`), eyes
 /// and lashes (`Eye0`), cloth (`Cloth1`), props (`Prop1`) and weapons (`Weapon1`), with any
 /// pixel shader; and exterior terrain (`Terrain2`, terrain.mat's pass above Low detail, and
-/// `Terrain3`, its Low detail pass); the sky's dome and clouds (`Sky`, `Clouds`); and lava
-/// (`Lava0`).
+/// `Terrain3`, its Low detail pass); the sky's dome and clouds (`Sky`, `Clouds`); lava
+/// (`Lava0`); and water (`Water0`).
 pub fn object_filter() -> ShaderFilter {
     let mut v = static1_filter().unwrap_or_default();
     for vs in OBJECT_VERTEX_SHADERS.iter().chain(&VFX_VERTEX_SHADERS) {
@@ -346,7 +346,7 @@ pub const VFX_VERTEX_SHADERS: [&str; 8] = [
 ];
 
 /// See [`object_filter`].
-pub const OBJECT_VERTEX_SHADERS: [&str; 13] = [
+pub const OBJECT_VERTEX_SHADERS: [&str; 14] = [
     "Char1.vsh",
     "Hair0_Pass1.vsh",
     "Hair0.vsh",
@@ -360,6 +360,7 @@ pub const OBJECT_VERTEX_SHADERS: [&str; 13] = [
     "Sky.vsh",
     "Clouds.vsh",
     "Lava0.vsh",
+    "Water0.vsh",
 ];
 
 /// Point lights chosen for one draw.
@@ -1049,6 +1050,7 @@ pub fn sampler_texture(
     ty: TextureType,
     material: &SceneMaterial,
     lightmap: Option<&LightmapRef>,
+    probe: Option<&str>,
 ) -> (Option<String>, TextureSource) {
     let Some(c) = table.and_then(|t| t.at(RegisterSet::Sampler, register)) else {
         return (None, TextureSource::Black);
@@ -1081,6 +1083,23 @@ pub fn sampler_texture(
         .as_deref()
         .filter(|d| !d.is_empty())
         .map(|d| format!("{}.dds", d.to_ascii_lowercase()));
+    // The environment cubemap (`aur_cmLightProbe0`, usage `EnvironmentMap`): the light
+    // probe's own cubemap, the `.dds` the level ships beside each probe's `.mtx`
+    // (`ost000t_probe_7yo.dds`, 256² DXT1, six faces). Provisional: inferred from the names
+    // and the files; the exe's binding is not traced.
+    if usage.eq_ignore_ascii_case("EnvironmentMap")
+        && let Some(p) = probe
+    {
+        let p = p.to_ascii_lowercase();
+        let cube = format!("{}.dds", p.trim_end_matches(".mtx"));
+        return (
+            Some(sampler),
+            match default {
+                Some(d) => TextureSource::ResourceOr(cube, d),
+                None => TextureSource::Resource(cube),
+            },
+        );
+    }
     if let Some(t) = material.texture(&param.name) {
         return (
             Some(sampler),
@@ -1289,7 +1308,7 @@ mod tests {
             sampler("smpTintMask", 1),
             sampler("smpUnknown", 2),
         ]);
-        let tex = |r| sampler_texture(Some(&t), r, TextureType::Tex2D, &material, None).1;
+        let tex = |r| sampler_texture(Some(&t), r, TextureType::Tex2D, &material, None, None).1;
         // The material's own texture, else (missing) the parameter's default.
         assert_eq!(
             tex(0),
