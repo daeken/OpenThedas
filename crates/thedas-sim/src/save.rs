@@ -307,6 +307,29 @@ impl Sim {
             }
         }
         self.learn_held_recipes();
+        // Saves made before the ability functions checked their ids may hold ones the exe
+        // never would (0 from player_core's hire handler; see `Sim::ability_known`).
+        let bad: Vec<(ObjectId, Vec<i32>)> = self
+            .world
+            .objects
+            .values()
+            .filter_map(|o| {
+                let b: Vec<i32> = o
+                    .abilities
+                    .iter()
+                    .copied()
+                    .filter(|&a| !self.ability_known(a))
+                    .collect();
+                (!b.is_empty()).then_some((o.id, b))
+            })
+            .collect();
+        for (id, ids) in bad {
+            if let Some(o) = self.world.get_mut(id) {
+                for a in ids {
+                    o.abilities.remove(&a);
+                }
+            }
+        }
         // A tutorial pause holds until the queue is empty (0x693630); a save that holds it
         // with no tutorial left to dismiss would never resume. Provisional: whether the
         // original saves the tutorial queue at all is not traced.
@@ -389,6 +412,19 @@ mod tests {
         s.talk = Some(talk(false));
         s.load_game(s.save_game()).unwrap();
         assert!(s.talk.as_ref().is_some_and(|c| !c.ended));
+    }
+
+    #[test]
+    fn invalid_ability_ids_are_dropped_on_load() {
+        let mut s = sim();
+        let c = s.world.spawn(crate::world::ObjectKind::Creature, "c");
+        let o = s.world.get_mut(c).unwrap();
+        o.abilities.insert(0);
+        o.abilities.insert(-3);
+        o.abilities.insert(617);
+        s.load_game(s.save_game()).unwrap();
+        let a: Vec<i32> = s.world.get(c).unwrap().abilities.iter().copied().collect();
+        assert_eq!(a, vec![617]);
     }
 
     #[test]
