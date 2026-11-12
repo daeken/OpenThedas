@@ -1095,7 +1095,14 @@ impl<'a> Loader<'a> {
     }
 
     /// Adds the draws (and lights) of one placed model: `placement` is model to world.
-    fn place(&mut self, model_name: &str, placement: Mat4, at: Placing<'_>) {
+    /// Returns its rigid (unskinned) draws with the names of their mesh nodes, which an
+    /// animation of the model moves (a door's `DoorLow`).
+    fn place(
+        &mut self,
+        model_name: &str,
+        placement: Mat4,
+        at: Placing<'_>,
+    ) -> Vec<(usize, String)> {
         let Placing {
             scale,
             sphere,
@@ -1110,8 +1117,9 @@ impl<'a> Loader<'a> {
             user_params,
             skin,
         } = at;
+        let mut rigid = Vec::new();
         let Some(model) = self.model(model_name) else {
-            return;
+            return rigid;
         };
         for lp in model.lights() {
             let m = lp
@@ -1164,16 +1172,16 @@ impl<'a> Loader<'a> {
             }
         }
         if lights_only {
-            return;
+            return rigid;
         }
         self.place_emitters(model_name, &model, placement, user_params);
         let pieces = model.mesh_pieces();
         if pieces.is_empty() {
-            return;
+            return rigid;
         }
         let Some(msh_name) = model.mesh_file.clone() else {
             self.warn(format!("{model_name}.mmh: mesh nodes but no .msh"));
-            return;
+            return rigid;
         };
         for piece in pieces {
             let Some(mut mesh) = self.mesh(&msh_name, &piece.mesh.chunk) else {
@@ -1254,6 +1262,11 @@ impl<'a> Loader<'a> {
                 let c = transform.transform_point3((lo + hi) * 0.5);
                 (c, (hi - lo).length() * 0.5 * scale)
             });
+            if skin.is_none()
+                && let Some(n) = piece.node_name
+            {
+                rigid.push((self.scene.draws.len(), n.to_string()));
+            }
             self.scene.draws.push(DrawItem {
                 mesh,
                 material,
@@ -1268,6 +1281,7 @@ impl<'a> Loader<'a> {
                 cast_shadow: piece.mesh.cast_runtime_shadow,
             });
         }
+        rigid
     }
 
     /// The particle emitters of a placed model. Mesh-particle and physics emitters are left
@@ -1692,15 +1706,35 @@ impl AreaScene {
                         .flatten()
                 })
             };
+            let mut rigid_draws = Vec::new();
             for model in &prop.models {
                 let at = Placing {
                     tint: tint_of(model),
                     skin: skin_tint.as_deref(),
                     ..placing(room_name)
                 };
-                l.place(model, prop.transform, at);
+                let rigid = l.place(model, prop.transform, at);
+                rigid_draws.push((model.clone(), rigid));
             }
+            // A model's rigid meshes follow their nodes as its animation moves them (a
+            // door's leaf swinging open), as attachments to its own skeleton.
             let mut attachments = Vec::new();
+            for (model, rigid) in rigid_draws {
+                if rigid.is_empty() {
+                    continue;
+                }
+                let Some(mmh) = l.model(&model) else { continue };
+                let skeleton = l.skeleton(&model, &mmh);
+                for (d, node) in rigid {
+                    if let Some(n) = l.scene.skeletons[skeleton].node(&node) {
+                        attachments.push(PropAttachment {
+                            draws: d..d + 1,
+                            skeleton,
+                            node: n,
+                        });
+                    }
+                }
+            }
             for (model, node) in &prop.attached {
                 let body = prop.models.iter().find_map(|m| {
                     let mmh = l.model(m)?;

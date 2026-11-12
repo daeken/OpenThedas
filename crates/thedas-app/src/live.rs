@@ -66,6 +66,8 @@ pub struct Live {
     /// order).
     posed: Vec<(ObjectId, Mat4, Option<Clip>)>,
     models: ModelCache,
+    /// Placeables' state changes, for their swings (a door opening).
+    swings: thedas_ui::models::PlaceableSwings,
     /// Textures, meshes, pipelines and shader translations of the current level, kept while
     /// its objects are rebuilt.
     cache: RenderCache,
@@ -198,6 +200,7 @@ impl Live {
             aiming: None,
             posed: Vec::new(),
             models: ModelCache::default(),
+            swings: Default::default(),
             cache: RenderCache::default(),
             owed_ms: 0.0,
             frame_effects: true,
@@ -530,6 +533,7 @@ impl Live {
             Some((id, stage)) => stage_models(&sim, *id, stage, &mut self.models),
             None => thedas_ui::models::area_models_cached(&sim, area, &mut self.models),
         };
+        self.swings.apply(&sim, &mut models);
         let was = self.staged;
         self.staged = staged.map(|(id, s)| (id, s.mark, s.facing));
         if self.staged.map(|s| s.0) != was.map(|s| s.0) {
