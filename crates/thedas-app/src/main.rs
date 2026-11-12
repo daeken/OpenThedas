@@ -2153,6 +2153,49 @@ fn audio_state(
         let sim = live.sim();
         let grid = sim.world.area.and_then(|a| sim.loaded_nav_grid(a));
         let appearances = sim.world.tables().get(0, "apr_base");
+        let items = sim.world.tables().get(0, "bitm_base");
+        // A creature's sound material as DAOrigins.exe keeps it (+0x930, 0x6a0a00..0x6a0cb0):
+        // its appearance's (`apr_base.gda` column 0x8ea8dc24), replaced by its chest
+        // armour's unless the appearance says not to (column 0x429ca38f); anything but
+        // armour (10-13), hides (16-18) and golems' and bone (23-25) counts as flesh (16).
+        // Provisional: the armour's material is its base item's (`BITM_base.gda` column
+        // 0x7e0505a1); the exe goes through the item's material type (worksheet 89).
+        let sound_material = |id: u32| -> i64 {
+            let int = |c: Option<&thedas_formats::gda::Cell>| match c {
+                Some(thedas_formats::gda::Cell::Int(v)) => Some(*v),
+                _ => None,
+            };
+            let Some(o) = sim.world.get(id) else {
+                return 16;
+            };
+            let apr = |h: u32| {
+                appearances
+                    .as_ref()
+                    .and_then(|t| int(t.cell_by_hash(h, o.appearance as i64)))
+            };
+            let mut m = apr(0x8ea8_dc24).unwrap_or(16);
+            if apr(0x429c_a38f).unwrap_or(0) == 0 {
+                let chest = thedas_sim::sim::constant(&sim.table, "INVENTORY_SLOT_CHEST");
+                let armour = o
+                    .equipment
+                    .get(&chest)
+                    .and_then(|i| sim.world.get(*i))
+                    .and_then(|i| i.fields.get("BaseItem").copied())
+                    .and_then(|b| {
+                        items
+                            .as_ref()
+                            .and_then(|t| int(t.cell_by_hash(0x7e05_05a1, b as i64)))
+                    });
+                if let Some(a) = armour.filter(|a| *a > 0) {
+                    m = a;
+                }
+            }
+            if matches!(m, 10..=13 | 16..=18 | 23..=25) {
+                m
+            } else {
+                16
+            }
+        };
         for (id, ..) in &state.animations {
             let Some(o) = sim.world.get(*id) else {
                 continue;
@@ -2174,6 +2217,23 @@ fn audio_state(
                         t.cell_by_hash(audio::APR_FOOTSTEP, o.appearance as i64)
                     }))),
                     surface: grid.as_ref().map_or(0, |g| g.surface(o.position)),
+                    hands: [0, 1].map(|hand| {
+                        sim.hand_attack(*id, hand).and_then(|(result, target)| {
+                            let at = sim.world.get(target)?.position;
+                            Some((result, sound_material(target), at))
+                        })
+                    }),
+                    attack_target: sim.attack_target(*id).and_then(|t| {
+                        let at = sim.world.get(t)?.position;
+                        Some((sound_material(t), at))
+                    }),
+                    unarmed: appearances
+                        .as_ref()
+                        .and_then(|t| t.cell_by_hash(audio::APR_UNARMED, o.appearance as i64))
+                        .and_then(|c| match c {
+                            thedas_formats::gda::Cell::Int(v) => Some(*v),
+                            _ => None,
+                        }),
                     size: appearances
                         .as_ref()
                         .and_then(|t| t.cell_by_hash(audio::APR_SIZE, o.appearance as i64))
