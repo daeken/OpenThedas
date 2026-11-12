@@ -1463,7 +1463,7 @@ fn journal(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
 /// The HUD's notifications, as notifications.gfx reads them (`Party.Alerts.N`: the alert
 /// type, 1 a quest's new journal entry and 2 a codex entry, new, the plot's resource and
 /// name and whether the quest is done), with the list's own value listing them so the
-/// movie's observer fires; no large ("uber") alerts. Provisional: every alert shows as new,
+/// movie's observer fires, and the large ones (`Party.UberAlerts`). Provisional: every alert shows as new,
 /// and which events raise one is inferred (see [`thedas_sim::journal::Alert`]).
 fn alerts(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
     let alerts = &sim.world.alerts;
@@ -1496,7 +1496,32 @@ fn alerts(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
         v.insert(format!("{k}.CustomText"), UiValue::String(String::new()));
         v.insert(format!("{k}.CustomIcon"), UiValue::String(String::new()));
     }
-    v.insert("Party.UberAlerts".into(), UiValue::String(String::new()));
+    // The large notifications waiting: the first shows (`Party.UberAlerts.0`), and the
+    // movie asks for the next when it is done (`Party.HideUberAlert`).
+    let uber = &sim.world.uber_alerts;
+    v.insert(
+        "Party.UberAlerts".into(),
+        UiValue::String(
+            uber.iter()
+                .map(|a| format!("{}:{}", a.kind, a.resref))
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    );
+    for (i, a) in uber.iter().enumerate() {
+        let k = format!("Party.UberAlerts.{i}");
+        v.insert(k.clone(), num(a.kind));
+        v.insert(format!("{k}.Type"), num(a.kind));
+        v.insert(format!("{k}.New"), num(1));
+        v.insert(
+            format!("{k}.QuestName"),
+            UiValue::String(a.name.and_then(|t| sim.string(t)).unwrap_or_default()),
+        );
+        v.insert(format!("{k}.IntegerArg"), num(0));
+        v.insert(format!("{k}.CustomText"), UiValue::String(String::new()));
+        v.insert(format!("{k}.CustomIcon"), UiValue::String(String::new()));
+        v.insert(format!("{k}.Portrait"), UiValue::String(String::new()));
+    }
 }
 
 /// Character creation's own values for chargen.gfx: it is the game's creation screen, not the

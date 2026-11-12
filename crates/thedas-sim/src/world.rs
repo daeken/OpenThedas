@@ -535,6 +535,10 @@ pub struct World {
     /// The HUD's notifications not yet dismissed (see [`crate::journal::Alert`]).
     #[serde(default)]
     pub alerts: Vec<crate::journal::Alert>,
+    /// The HUD's large notifications waiting, the first on screen (notifications.gfx's
+    /// `Party.UberAlerts`: "New Quest: ..."), see [`crate::journal::Alert`].
+    #[serde(default)]
+    pub uber_alerts: Vec<crate::journal::Alert>,
     pub game_mode: i32,
     /// While a conversation holds the game (`GM_DIALOG`, 4): the mode it replaced, and a
     /// mode a script asked for meanwhile, which waits until the conversation ends.
@@ -759,6 +763,7 @@ impl World {
             tutorial_paused: false,
             training: Default::default(),
             alerts: Vec::new(),
+            uber_alerts: Vec::new(),
             game_mode: 0,
             mode_before_talk: None,
             mode_after_talk: None,
