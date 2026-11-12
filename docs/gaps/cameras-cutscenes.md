@@ -59,7 +59,6 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 
 ### Startup, configuration, user files
 
-- **CAM-037** **Loading screens.** Original: loading screens. Ours: no code found; `SetLoadHint` is a presentation no-op. Evidence: `crates/thedas-sim/src/engine.rs:187`. Size: M. Depends: none. Kind: missing.
 - **CAM-038** **The original's command-line flags.** Original: command-line flags (window, resolution, console). Ours: no code found; only our own clap flags. Evidence: `crates/thedas-app/src/main.rs:93`. Size: S. Depends: none. Kind: missing.
 - **CAM-039** **Fullscreen and resolution.** Original: fullscreen and resolution options. Ours: window size only from `--size`; no fullscreen code; the options screen's resolution changes nothing. Evidence: `crates/thedas-app/src/main.rs:108`, `crates/thedas-app/src/main.rs:788`, `crates/thedas-ui/src/options.rs:12`. Size: M. Depends: CAM-044. Kind: missing.
 - **CAM-040** **Developer console and debug scripts.** Original: developer console. Ours: no code found in the app (the CLI autoplay calls developer scripts through the sim). Evidence: `crates/thedas-cli/src/main.rs:152`. Size: M. Depends: none. Kind: missing.
