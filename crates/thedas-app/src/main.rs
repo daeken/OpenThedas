@@ -3425,12 +3425,15 @@ fn main() -> Result<()> {
                 .collect();
             log::info!("party: {party:?}");
             drop(sim);
-            if let Some(c) = follow
+            let eye = follow
                 .as_mut()
-                .and_then(|f| l.follow_camera(f, 0.0, &camera))
-            {
+                .and_then(|f| l.follow_camera(f, 0.0, &camera));
+            if let Some(c) = eye {
                 camera = c;
             }
+            // The capture's camera is the settled one, so its fade is settled too (a fade
+            // reaches its opacity within a second).
+            l.fade_near_camera(eye.map(|c| c.position), 1.0);
             if follow.is_some()
                 && let Some(c) = l.conversation_camera(&camera)
             {

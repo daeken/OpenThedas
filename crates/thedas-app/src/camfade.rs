@@ -91,11 +91,12 @@ impl Shape {
     }
 }
 
-/// The body of a creature whose models have no creature shapes (humanoids: their `.phy`
-/// files are their equipment's, with none in the creatures group): an upright capsule from
-/// its feet to its `height`, of its appearance's `PERSPACE` `radius`, in its model's space.
-/// Provisional: the executable's creatures-group shape for such a creature (taken to be its
-/// character controller's capsule) is not traced.
+/// A creature's body: an upright capsule from its feet to its `height`, of its
+/// appearance's `PERSPACE` `radius`, in its model's space, tested along with its models'
+/// own creature shapes. Provisional: which creatures-group shapes the executable's sphere
+/// query (0x648c00) meets for a creature is not traced. Humanoids' equipment `.phy` files
+/// carry only small per-bone capsules in that group (torso, shoulders, hips; none on the
+/// head), so this capsule stands in for the character controller's, taken to be there too.
 pub fn body_capsule(radius: f32, height: f32) -> Shape {
     let r = radius.max(0.0);
     Shape::Capsule {

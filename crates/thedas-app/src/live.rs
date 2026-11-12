@@ -357,7 +357,7 @@ impl Live {
         };
         let eye = eye.filter(|_| !blocked);
         // Each creature's body: its appearance's `PERSPACE` radius and height (see
-        // `crate::camfade::body_capsule`), for models with no creature shapes of their own.
+        // `crate::camfade::body_capsule`), tested as well as its models' own shapes.
         let bodies: std::collections::HashMap<ObjectId, (f32, f32)> = match eye {
             Some(_) => {
                 let sim = self.sim();
@@ -385,7 +385,6 @@ impl Live {
                 let Some(&(radius, height)) = bodies.get(id) else {
                     continue;
                 };
-                let mut own_shapes = false;
                 let touches = models.iter().any(|m| {
                     let key = m.to_ascii_lowercase();
                     let shapes = self.creature_shapes.entry(key.clone()).or_insert_with(|| {
@@ -399,18 +398,16 @@ impl Live {
                                 .unwrap_or_default(),
                         )
                     });
-                    own_shapes |= !shapes.is_empty();
                     shapes
                         .iter()
                         .any(|s| s.touches(placement, eye, crate::camfade::FADE_RADIUS))
                 });
                 let touches = touches
-                    || (!own_shapes
-                        && crate::camfade::body_capsule(radius, height).touches(
-                            placement,
-                            eye,
-                            crate::camfade::FADE_RADIUS,
-                        ));
+                    || (crate::camfade::body_capsule(radius, height).touches(
+                        placement,
+                        eye,
+                        crate::camfade::FADE_RADIUS,
+                    ));
                 if touches {
                     touching.push(*id);
                 }
