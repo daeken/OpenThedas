@@ -492,6 +492,20 @@ impl PadPlay {
                 return None;
             }
             Action::CloseScreen => {
+                // An open picker's list first: B closes the list alone (a click on its
+                // overlay, outside the entries, as the mouse closes it), not the screen under
+                // it.
+                let targets = host.focus_targets();
+                if targets.iter().any(|t| t.path.contains(".PickerList_mc.")) {
+                    // The overlay covers the whole screen: its corner is outside any list.
+                    let back = host.cursor();
+                    pointer_to(host, 3.0, 3.0);
+                    host.left_button(true);
+                    host.left_button(false);
+                    pointer_to(host, back.0, back.1);
+                    self.snapped = false;
+                    return Some("picker list closed".into());
+                }
                 // The player's screen, when it is the one up: a screen the game put up over it
                 // (level-up, opened from the character record) is left by its own buttons.
                 let menu = !host.popup()
