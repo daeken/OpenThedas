@@ -574,6 +574,12 @@ struct App {
     quit: bool,
     /// What the menus asked this frame, acted on once it is done.
     requests: Vec<ui::FrontEnd>,
+    /// A game opening on a worker (what was asked, its result to come, when it started).
+    opening: Option<(
+        String,
+        std::sync::mpsc::Receiver<Result<live::Live>>,
+        Instant,
+    )>,
     /// The boot movies, while they play (before the start menu takes input).
     intro: Option<intro::Intro>,
     /// Music, interface sounds and voice-over (none with `--no-audio` or no output device).
@@ -818,7 +824,8 @@ impl App {
                         ),
                         None => "OpenThedas".to_string(),
                     })
-                    .with_inner_size(LogicalSize::new(self.size.0, self.size.1)),
+                    .with_inner_size(LogicalSize::new(self.size.0, self.size.1))
+                    .with_visible(std::env::var_os("THEDAS_HIDDEN_WINDOW").is_none()),
             )?,
         );
         let instance =
@@ -1994,38 +2001,114 @@ impl App {
                 ui::FrontEnd::Load(b) => live::Start::SaveBytes(b),
                 ui::FrontEnd::StartMenu => live::Start::Menu,
             };
-            match live::Live::open(&self.install, &self.module, start, &self.shaders) {
-                Ok(mut l) => {
-                    if let Some(g) = self.gfx.as_mut() {
-                        l.frame_effects = self.loaded.frame_effects;
-                        g.ui.close_all();
-                        g.ui.attach(&l.sim);
-                        seed_client_options(&l, &g.ui);
-                    }
-                    // One explore camera for the whole process: a load turns it behind the
-                    // hero again but keeps its zoom (see `Follow::reset`).
-                    self.follow = l.hero().map(|(_, facing)| {
-                        let heading = thedas_sim::world::heading_of(facing).to_radians();
-                        match self.follow.take() {
-                            Some(mut f) => {
-                                f.reset(heading);
-                                f
-                            }
-                            None => follow::Follow::behind(heading),
-                        }
-                    });
-                    if let Some((pos, facing)) = l.hero() {
-                        let fov = self.camera.fov_y;
-                        self.camera = hero_camera(pos, facing);
-                        self.camera.fov_y = fov;
-                    }
-                    self.screens = Some(screens::Screens::new(l.front_end));
-                    l.async_loads = true;
-                    self.live = Some(l);
+            // A game (new or loaded) opens on a worker while the window keeps presenting,
+            // the running one held behind it (see `Live::hold`); the start menu opens at once.
+            if matches!(r, ui::FrontEnd::StartMenu) {
+                match live::Live::open(&self.install, &self.module, start, &self.shaders) {
+                    Ok(l) => self.install_live(l),
+                    Err(e) => log::warn!("front end: {r:?} failed: {e:#}"),
                 }
-                Err(e) => log::warn!("front end: {r:?} failed: {e:#}"),
+                continue;
+            }
+            if self.opening.is_some() {
+                log::info!("front end: {r:?} ignored, a game is already opening");
+                continue;
+            }
+            let (install, module, shaders) = (
+                self.install.clone(),
+                self.module.clone(),
+                self.shaders.clone(),
+            );
+            let save = match &r {
+                ui::FrontEnd::Load(b) => Some(b.clone()),
+                _ => None,
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let spawned = std::thread::Builder::new()
+                .name("game-open".into())
+                .spawn(move || {
+                    let start = match &save {
+                        Some(b) => live::Start::SaveBytes(b),
+                        None => live::Start::NewGame,
+                    };
+                    let _ = tx.send(live::Live::open(&install, &module, start, &shaders));
+                });
+            match spawned {
+                Ok(_) => {
+                    if let Some(l) = self.live.as_mut() {
+                        l.hold(true);
+                    }
+                    self.opening = Some((format!("{r:?}"), rx, Instant::now()));
+                }
+                Err(e) => log::warn!("front end: {r:?} failed: {e}"),
             }
         }
+        self.poll_opening();
+    }
+
+    /// The game opening on its worker (see [`App::front_end`]), once it is ready: it
+    /// replaces the running one. One that failed to open leaves the running one to carry on.
+    fn poll_opening(&mut self) {
+        let Some((what, rx, started)) = self.opening.as_ref() else {
+            return;
+        };
+        let opened = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(anyhow::anyhow!("the game's loading stopped"))
+            }
+        };
+        let (what, elapsed) = (what.clone(), started.elapsed());
+        self.opening = None;
+        match opened {
+            Ok(l) => {
+                log::info!(
+                    "front end: {what}: the game opened in {:.2}s",
+                    elapsed.as_secs_f64()
+                );
+                self.install_live(l);
+            }
+            Err(e) => {
+                log::warn!("front end: {what} failed: {e:#}");
+                if let Some(l) = self.live.as_mut() {
+                    l.hold(false);
+                }
+            }
+        }
+    }
+
+    /// A newly opened game (or the start menu) becomes the running one.
+    fn install_live(&mut self, mut l: live::Live) {
+        if let Some(g) = self.gfx.as_mut() {
+            l.frame_effects = self.loaded.frame_effects;
+            g.ui.close_all();
+            g.ui.attach(&l.sim);
+            seed_client_options(&l, &g.ui);
+            // Closing everything took the loading screen down too: it comes up again for
+            // the new game's own build (see `loading_screen`).
+            self.load_screen_up = false;
+        }
+        // One explore camera for the whole process: a load turns it behind the hero again
+        // but keeps its zoom (see `Follow::reset`).
+        self.follow = l.hero().map(|(_, facing)| {
+            let heading = thedas_sim::world::heading_of(facing).to_radians();
+            match self.follow.take() {
+                Some(mut f) => {
+                    f.reset(heading);
+                    f
+                }
+                None => follow::Follow::behind(heading),
+            }
+        });
+        if let Some((pos, facing)) = l.hero() {
+            let fov = self.camera.fov_y;
+            self.camera = hero_camera(pos, facing);
+            self.camera.fov_y = fov;
+        }
+        self.screens = Some(screens::Screens::new(l.front_end));
+        l.async_loads = true;
+        self.live = Some(l);
     }
 
     fn fail(&mut self, event_loop: &ActiveEventLoop, e: anyhow::Error) {
@@ -2819,6 +2902,10 @@ impl padplay::Host for HeadlessHost<'_> {
 /// Provisional: load_town.gfx for every load; the exe shows load_light.gfx for an area
 /// change within the same area list, which the app does not tell apart yet.
 fn loading_screen(live: &live::Live, ui: &mut ui::UiLayer, up: &mut bool) {
+    // THEDAS_NO_LOAD_MOVIE: no loading movie; a load shows the interface over black.
+    if std::env::var_os("THEDAS_NO_LOAD_MOVIE").is_some() {
+        return;
+    }
     match (live.loading(), *up) {
         (true, false) => {
             let sim = live.sim();
@@ -3834,7 +3921,19 @@ fn main() -> Result<()> {
         }
         None => None,
     };
-    let event_loop = EventLoop::new()?;
+    // A test hook. THEDAS_HIDDEN_WINDOW: the window is never shown (and on macOS the app neither takes
+    // the foreground nor shows in the Dock), for driving it with --control in tests; it
+    // runs as an occluded window does, its frames drawn offscreen for screenshots.
+    let event_loop = {
+        let mut b = EventLoop::builder();
+        #[cfg(target_os = "macos")]
+        if std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some() {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+            b.with_activation_policy(ActivationPolicy::Prohibited)
+                .with_activate_ignoring_other_apps(false);
+        }
+        b.build()?
+    };
     // The window keeps presenting while a new level builds (a loading frame).
     if let Some(l) = live.as_mut() {
         l.async_loads = true;
@@ -3873,6 +3972,7 @@ fn main() -> Result<()> {
         shaders: args.shaders.clone(),
         quit: false,
         requests: Vec::new(),
+        opening: None,
         // Clients driving the window (`--control`) get the start menu at once.
         intro: (boot && !args.no_intro && args.control.is_none())
             .then(|| intro::Intro::boot(&install))
