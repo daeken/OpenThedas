@@ -2354,6 +2354,8 @@ fn audio_state(
                             }
                             _ => None,
                         }),
+                    placeable: (o.kind == thedas_sim::world::ObjectKind::Placeable)
+                        .then_some(o.appearance as i64),
                 },
             );
         }
