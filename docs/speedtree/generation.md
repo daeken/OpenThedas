@@ -425,4 +425,141 @@ Answers to the implementer's questions on stages 1 and 2.
 11. **Gravity units.** Yes: the rotation angle profile · gravity · g · facing is in degrees with
     g in degrees, exactly as written.
 
-Stages 3 and later: in progress.
+## Stage 3 — Branch geometry
+
+Every branch that is not a frond and whose level is at or above the first branch level gets a
+tube of vertices around its skeleton. A tree's branch vertices go into one shared vertex list,
+branch after branch in the order branches are grown (2.4 is depth-first: a branch's own
+vertices are emitted while its skeleton is grown, before any of its children). Each branch
+remembers the index of its first vertex (its *start*).
+
+### 3.1 Per-branch values
+
+- **Tile offset** = (azimuth + 180) / 360 + p (azimuth from 2.4 step 4, p the percent of parent).
+- **Base radius** = the first vertex's radius (2.4 step 8.3).
+- **Maximum radius** as clamped in 2.4 step 6.
+- **Relative length** = branch length / S.
+- Whether the gnarl was negated (2.4 step 8.5) also negates twist (3.3).
+
+### 3.2 One cross section (built at each skeleton vertex as it is made)
+
+For the vertex with frame F (rows r₀, r₁, r₂), position C, radius r, branch progress t (0 for
+the first vertex, the packed progress for the others), and its cross-section count m (2.4 steps
+8.7 and 9.2):
+
+- Roughness factor ρ = roughness_profile.evaluate_without_variance(t).
+- A running angle fraction f starts at 0 and **is increased by the float 1/m after each point**
+  (accumulated, not recomputed as i/m).
+- For i = 0 … m (m + 1 points):
+  1. angle α = 2π · f (2π = 6.283185 as a float).
+  2. **Texture coordinates** for each of the seven layers except the shadow layer (`layers[0..6]`
+     in our parser's order: diffuse, detail, normal, height, specular, user 1, user 2), see 3.3,
+     using f as the radial progress.
+  3. **Radial direction** ν = cos α · r₁ + sin α · r₂.
+     **Tangent** τ = cos(α + π/2) · r₁ + sin(α + π/2) · r₂ (π/2 = 1.570796).
+     **Binormal** = ν × τ.
+  4. If i < m (a real point):
+     - radius ρr = r; k = r / maximum radius;
+     - ρr += k · `roughness` · S · ρ · sin(`roughness_vertical_frequency` · t) ·
+       sin(`roughness_horizontal_frequency` · t) · cos(`roughness_horizontal_frequency` · α);
+     - clamp ρr to the maximum radius;
+     - ρr += (B[roughness index mod 1000] − 0.5) · 2 · `random_roughness` · S · k · ρ, then
+       increase the shared roughness index (2.3) by one;
+     - flare factor φ = 1 + Σ over the branch's flares of flare_distance(α, t) (3.4);
+     - position = C + ν · ρr · φ.
+     If i == 0 remember this position.
+  5. If i == m: position = the remembered first position (the seam repeats the first point;
+     its texture coordinates, tangent and binormal are those computed at f ≈ 1).
+  6. Wind attributes: stage 7.
+
+Normals are not taken from ν; they are computed once the whole branch exists (3.5).
+
+### 3.3 Texture coordinates of one layer
+
+Inputs: the layer's controls (`TexLayer`), radial progress f, branch progress t, the tile
+offset, base radius, relative length, negated flag. If a layer other than the diffuse one has
+`sync` set, it uses the diffuse layer's controls instead of its own.
+
+- S tile = `s_tile` if `s_tile_absolute`, else `s_tile` · base radius · 2π.
+  T tile = `t_tile` if `t_tile_absolute`, else `t_tile` · relative length.
+  Twist = `twist`, negated if the branch's gnarl was negated.
+- **s:**
+  - with `clamp_s`: left/right = `clamp[0]`/`clamp[1]`. Start angle = `s_offset` · 90, then 0
+    if negative, then wrapped into [0, 360] by subtracting/adding 360 while above 360/below 0.
+    Sweep = 0 if S tile is 0, else 360 / S tile. End = start + sweep; if end > 360 then
+    end = 360 and start = 360 − sweep. This angle = f · 360, clamped into [start, end].
+    s = lerp(left, right, (this − start) / sweep).
+  - otherwise s = f · S tile + `s_offset` + twist · t.
+- **t** = (t + (tile offset if `random_t_offset` else 0)) · T tile − `t_offset`.
+  With `clamp_t`: clamp to [0, 1], then t = lerp(`clamp[2]`, `clamp[3]`, t) (bottom, top).
+
+### 3.4 Flare distance
+
+For one flare (2.6: angle a_f, radial influence ri in radians, radial exponent re, length
+influence li, length exponent le, distance d) at angle α and branch progress t:
+
+- difference = |α − a_f|; if it exceeds π (3.141593), add 2π to whichever of α and a_f is
+  smaller, and recompute the difference.
+- If difference < ri and li − t > 0: radial = (1 − difference/ri) ^ re, vertical =
+  ((li − t)/li) ^ le (both powers computed in double precision, then converted to float);
+  result = d · radial · vertical. Otherwise 0.
+
+### 3.5 Normals (per branch, after its vertices exist)
+
+Let the branch have n skeleton vertices, vertex i having mᵢ + 1 tube points starting at offset
+oᵢ (o₀ = the branch start, oᵢ₊₁ = oᵢ + mᵢ + 1). For each i and each j = 0 … mᵢ:
+
+- **Around:** prev = oᵢ + (mᵢ − 1 if j == 0 else j − 1); next = oᵢ + (1 if j == mᵢ else
+  j + 1). h = normalize(position[next] − position[prev]).
+- **Along:** fraction g = j / mᵢ. prev = oᵢ + j if i == 0, else oᵢ − ((mᵢ₋₁ + 1) −
+  (int)(mᵢ₋₁ · g)); next = oᵢ + j if i == n − 1, else oᵢ + (mᵢ + 1) + (int)(mᵢ₊₁ · g).
+  w = normalize(position[next] − position[prev]).
+- Normal = h × w; if exactly zero, use the skeleton vertex's direction D.
+- **Light-seam reduction:** e = light_seam_profile.evaluate_without_variance(i / (n − 1));
+  b = light_seam_bias.evaluate_without_variance(p) (p the branch's percent of parent);
+  normal = normalize(lerp(D, normal, e · lerp(b, 1, (i/(n − 1)) ^ 0.5))).
+
+### 3.6 Triangles
+
+A branch's surface is one triangle strip over its tube points, with degenerate joins (the
+same index lists serve every LOD, 3.7). For each consecutive pair of skeleton vertices
+(i, i + 1), with a = mᵢ + 1 and b = mᵢ₊₁ + 1 points and M = max(a, b):
+
+- for j = 0 … M − 1: g = j / (M − 1); x = (int)((a − 1) · g + 0.5); y = (int)((b − 1) · g +
+  0.5); emit (start + run + a + y) then (start + run + x), where run is the number of points
+  in skeleton vertices before i;
+- then emit the second-to-last emitted index twice more;
+- run += a.
+
+Read the list as a triangle strip (each index forms a triangle with the two before it,
+alternating winding; triangles with a repeated index are degenerate and drawn as nothing).
+
+### 3.7 Branch LOD
+
+Parameters: `Lod::branch_lod_count` (L_n), `branch_max_volume_percent`,
+`branch_min_volume_percent`, `branch_reduction_fuzziness`, `large_branch_percent`.
+
+After the whole tree has been grown (after stage 2's recursion and everything drawn during
+it), and before leaves are reduced:
+
+1. List the branches in growth order: the trunk, then recursively each branch followed by its
+   kept children in the order they were made. Fronds and pruned branches are not in the list
+   (but skeleton-only branches below the first branch level are).
+2. Total = Σ max(volume, 0); largest = the largest volume.
+3. In list order, a branch whose volume > largest · (1 − `large_branch_percent`) is *kept*
+   (moved, in order, to a separate kept list). For every other branch draw f =
+   uniform(0, `branch_reduction_fuzziness`) from the stream (one draw each, in order) and set
+   its fuzzy volume to max((1 − f) · volume + f · largest, 0).
+4. Sort the others by fuzzy volume, descending. Then insert the kept branches one by one at
+   the front of that list, in kept-list order (so the last kept branch ends first).
+   (The kept branches' fuzzy volume is 0; the original also "sorts" the kept list by it, which
+   leaves an unspecified order for ties: keep kept-list order.)
+5. For each LOD level k = 0 … L_n − 1: fraction = 1 if L_n < 2, else lerp(max percent, min
+   percent, k / (L_n − 1)); target = fraction · total. Walk the list adding each branch's
+   (real) volume while the running sum < target; every branch walked contributes its strip
+   (3.6) to LOD k (branches with no geometry contribute nothing). If no branch is walked at
+   LOD 0, LOD 0 is empty.
+6. **Fade hints**: every index in a branch's strip for LOD k sets that vertex's fade hint to
+   −1 if k is the last level, else 1 − (k + 1)/L_n; later levels overwrite earlier ones.
+
+Stages 4 and later: in progress.
