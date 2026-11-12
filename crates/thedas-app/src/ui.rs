@@ -2061,8 +2061,7 @@ impl UiLayer {
         };
         let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
         if thedas_sim::engine::party_of(&sim).contains(&id) {
-            sim.set_controlled(Some(id));
-            sim.training_event("FOLLOWER_SELECTED", 0);
+            sim.player_selects(id);
         }
     }
 

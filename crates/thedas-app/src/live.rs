@@ -2167,8 +2167,7 @@ impl Live {
         let party = thedas_sim::engine::party_of(&sim);
         let id = *party.get(n)?;
         // The simulation learns who the player controls, so that member's AI stands down.
-        sim.set_controlled(Some(id));
-        sim.training_event("FOLLOWER_SELECTED", 0);
+        sim.player_selects(id);
         sim.world.get(id).map(|o| o.tag.clone())
     }
 }

@@ -441,7 +441,7 @@ impl Sim {
             } else {
                 (at + n - 1) % n
             };
-            self.set_controlled(Some(party[next]));
+            self.player_selects(party[next]);
             return true;
         }
         let int = |i: usize| {
