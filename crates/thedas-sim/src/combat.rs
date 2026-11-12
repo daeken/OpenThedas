@@ -2502,6 +2502,7 @@ mod tests {
                 normal: [0.0, 0.0, 1.0],
                 data,
                 heights: vec![0.0; (w * h) as usize],
+                surfaces: Vec::new(),
             })),
         );
         let hero = s.world.spawn(ObjectKind::Creature, "hero");
