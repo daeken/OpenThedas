@@ -19,8 +19,9 @@
 //!   mode the main game camera is moved (0x6c4b20 field of view, 0x6c45f0 position,
 //!   0x6c4ec0 orientation) rather than the paperdoll's own `SceneCamera`. See [`camera`].
 //!
-//! Provisional: the move between presets is a cut here (the executable blends when
-//! +0x1c4 is not set, 0x7b4057); the head height of the face preset is sampled when the
+//! The move between presets blends over [`BLEND_MS`] (the executable's timer at +0x1c8 runs
+//! to 4.0 plus a value never set, 0x7b4cdf). Provisional: the blend is linear here (the
+//! exe's interpolation, 0x5b0db0, is not traced); the head height of the face preset is sampled when the
 //! preset is first framed for the creature's current look.
 
 use glam::{Quat, Vec3};
@@ -139,6 +140,23 @@ fn orientation() -> Quat {
 ///   (provisional).
 ///
 /// The field of view is [`FOV_DEGREES`], taken as vertical (provisional).
+/// How long the camera takes to move to a new preset (milliseconds).
+pub const BLEND_MS: f64 = 4000.0;
+
+/// The camera `t` (0 to 1) of the way from `a` to `b`: position and pitch straight, yaw the
+/// short way round.
+pub fn blend(a: &Camera, b: &Camera, t: f32) -> Camera {
+    let t = t.clamp(0.0, 1.0);
+    let tau = std::f32::consts::TAU;
+    let dyaw = (b.yaw - a.yaw + std::f32::consts::PI).rem_euclid(tau) - std::f32::consts::PI;
+    Camera {
+        position: a.position.lerp(b.position, t),
+        yaw: a.yaw + dyaw * t,
+        pitch: a.pitch + (b.pitch - a.pitch) * t,
+        ..*b
+    }
+}
+
 pub fn camera(preset: i32, feet: Vec3, head: Option<Vec3>, base: &Camera) -> Camera {
     let q = orientation();
     let forward = q * Vec3::Y;
@@ -168,6 +186,19 @@ pub fn camera(preset: i32, feet: Vec3, head: Option<Vec3>, base: &Camera) -> Cam
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_preset_change_blends_the_short_way_round() {
+        let a = Camera::new(Vec3::ZERO, 3.0, 0.0);
+        let b = Camera::new(Vec3::new(2.0, 0.0, 0.0), -3.0, 0.4);
+        let m = blend(&a, &b, 0.5);
+        assert!((m.position.x - 1.0).abs() < 1e-6);
+        assert!((m.pitch - 0.2).abs() < 1e-6);
+        // 3 to -3 radians is shorter through pi than through 0.
+        assert!(m.yaw > 3.0);
+        assert_eq!(blend(&a, &b, 1.0).position, b.position);
+        assert_eq!(blend(&a, &b, 7.0).position, b.position);
+    }
 
     #[test]
     fn the_body_preset_frames_the_creature_from_in_front_and_to_its_left() {

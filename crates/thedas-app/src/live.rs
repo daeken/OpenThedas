@@ -88,6 +88,11 @@ pub struct Live {
     /// The stage camera framed for a preset, kept until the preset or the drawn creature
     /// changes (the executable frames a preset once, when it is set).
     stage_camera: Option<(i32, thedas_render::Camera)>,
+    /// The stage camera last shown and its preset, the move to a new preset under way (the
+    /// camera it left, when it left on the presentation clock), and that clock (ms).
+    stage_shown: Option<(i32, thedas_render::Camera)>,
+    stage_blend: Option<(thedas_render::Camera, f64)>,
+    stage_clock_ms: f64,
     /// The playing cutscene's movies (see [`crate::intro::CutsceneMovies`]).
     cutscene_movies: crate::intro::CutsceneMovies,
     /// Whether a cutscene's movie waits for its decoder (a capture, whose frames must show
@@ -198,6 +203,9 @@ impl Live {
             stage: None,
             staged: None,
             stage_camera: None,
+            stage_shown: None,
+            stage_blend: None,
+            stage_clock_ms: 0.0,
             cutscene_movies: Default::default(),
             movies_wait: false,
             format: None,
@@ -246,6 +254,7 @@ impl Live {
         self.talk_camera.advance(dt_ms);
         if dt_ms.is_finite() && dt_ms > 0.0 {
             self.shader_time += dt_ms / 1000.0;
+            self.stage_clock_ms += dt_ms;
         }
         self.follow_cutscene_movies();
     }
@@ -303,17 +312,39 @@ impl Live {
         preset: i32,
     ) -> Option<thedas_render::Camera> {
         let (id, mark, _) = self.staged?;
-        if let Some((p, c)) = self.stage_camera
-            && p == preset
+        let target = match self.stage_camera {
+            Some((p, c)) if p == preset => c,
+            _ => {
+                let head = self.head_now(id);
+                let c =
+                    crate::chargen_stage::camera(preset, glam::Vec3::from_array(mark), head, base);
+                // Kept only once the creature is drawn (its head found).
+                if head.is_some() || preset == crate::chargen_stage::PRESET_BODY {
+                    self.stage_camera = Some((preset, c));
+                }
+                c
+            }
+        };
+        // A new preset is moved to from where the camera was, as the exe blends (see
+        // `crate::chargen_stage::BLEND_MS`).
+        if let Some((p, shown)) = self.stage_shown
+            && p != preset
         {
-            return Some(c);
+            self.stage_blend = Some((shown, self.stage_clock_ms));
         }
-        let head = self.head_now(id);
-        let c = crate::chargen_stage::camera(preset, glam::Vec3::from_array(mark), head, base);
-        // Kept only once the creature is drawn (its head found).
-        if head.is_some() || preset == crate::chargen_stage::PRESET_BODY {
-            self.stage_camera = Some((preset, c));
-        }
+        let c = match self.stage_blend {
+            Some((from, start)) => {
+                let t = (self.stage_clock_ms - start) / crate::chargen_stage::BLEND_MS;
+                if t >= 1.0 {
+                    self.stage_blend = None;
+                    target
+                } else {
+                    crate::chargen_stage::blend(&from, &target, t.max(0.0) as f32)
+                }
+            }
+            None => target,
+        };
+        self.stage_shown = Some((preset, c));
         Some(c)
     }
 
@@ -405,6 +436,8 @@ impl Live {
         self.staged = staged.map(|(id, s)| (id, s.mark, s.facing));
         if self.staged.map(|s| s.0) != was.map(|s| s.0) {
             self.stage_camera = None;
+            self.stage_shown = None;
+            self.stage_blend = None;
         }
         // A staged conversation line draws its actors at their stage marks.
         let base = thedas_render::Camera::new(glam::Vec3::ZERO, 0.0, 0.0);
