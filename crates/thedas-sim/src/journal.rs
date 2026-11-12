@@ -43,6 +43,8 @@ pub const MSG_HIDE_UBER_ALERT: &str = "Party.HideUberAlert";
 /// notifications.gfx's alert types (`ALERT_QUEST`, `ALERT_CODEX`).
 pub const ALERT_QUEST: i32 = 1;
 pub const ALERT_CODEX: i32 = 2;
+/// notifications.gfx's `Alert.ALERT_ITEMS`: "Items received".
+pub const ALERT_ITEMS: i32 = 3;
 
 /// Quests, Chanter's Board jobs and quest groups (`plottypes.gda` rows).
 const KIND_QUEST: i32 = 1;
@@ -225,6 +227,7 @@ impl Sim {
         }
         self.world.journal_seq += 1;
         let seq = self.world.journal_seq;
+        let first = !self.world.journal.contains_key(&info.guid);
         self.world.journal.insert(
             info.guid.clone(),
             JournalMark {
@@ -245,12 +248,21 @@ impl Sim {
         };
         let completed = kind == ALERT_QUEST && info.finals.iter().any(|&f| self.flag_on(info, f));
         self.world.alerts.retain(|a| a.kind != kind);
-        self.world.alerts.push(Alert {
+        let alert = Alert {
             kind,
             resref: info.resref.clone(),
             name: info.name_strref,
             completed,
-        });
+        };
+        // A quest's first entry also shows large ("New Quest: A Day For Celebration"), one
+        // at a time (`Party.UberAlerts`; the movie asks for the next with
+        // `Party.HideUberAlert`). Provisional: seen in the original at the City Elf's first
+        // quest; which other alerts the exe shows large (the movie has headers for a new
+        // codex entry, ability, specialization and map area) is not traced.
+        if first && kind == ALERT_QUEST && !completed {
+            self.world.uber_alerts.push(alert.clone());
+        }
+        self.world.alerts.push(alert);
     }
 
     /// Whether a plot type is a codex category (`plottypes.gda`'s `IsCodex`).
@@ -531,7 +543,12 @@ impl Sim {
                 }
                 true
             }
-            MSG_HIDE_UBER_ALERT => true,
+            MSG_HIDE_UBER_ALERT => {
+                if !self.world.uber_alerts.is_empty() {
+                    self.world.uber_alerts.remove(0);
+                }
+                true
+            }
             MSG_CONSUME_TUTORIAL => {
                 let all = args
                     .first()
@@ -751,6 +768,22 @@ mod tests {
                 (ALERT_QUEST, "plt_lot100pt_bears", true),
             ]
         );
+        // A quest's first entry also waits to show large ("New Quest"), each quest once;
+        // the movie takes them one at a time.
+        let uber: Vec<&str> = s
+            .world
+            .uber_alerts
+            .iter()
+            .map(|a| a.resref.as_str())
+            .collect();
+        assert!(!uber.is_empty());
+        assert!(s.world.uber_alerts.iter().all(|a| a.kind == ALERT_QUEST));
+        let mut once = uber.clone();
+        once.dedup();
+        assert_eq!(uber, once);
+        let waiting = uber.len();
+        assert!(s.journal_message(MSG_HIDE_UBER_ALERT, &[]));
+        assert_eq!(s.world.uber_alerts.len(), waiting - 1);
         // The movie clears a quest's `Updated` as it is read (its place in the list).
         assert!(s.journal_message(
             MSG_SET_ATTRIBUTE,

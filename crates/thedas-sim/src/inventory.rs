@@ -582,6 +582,17 @@ impl Sim {
     /// up entirely is destroyed (0x752c90). Returns the item that holds it now (the last
     /// stack it went into, or itself).
     pub(crate) fn stack_into(&mut self, to: ObjectId, item: ObjectId) -> ObjectId {
+        // The party receiving an item raises the HUD's "Items received" notification (one
+        // of its kind at a time). Provisional: seen in the original at first control, for
+        // the items character creation gave; where the exe raises it is not traced.
+        if self.in_party(to) {
+            let kind = crate::journal::ALERT_ITEMS;
+            self.world.alerts.retain(|a| a.kind != kind);
+            self.world.alerts.push(crate::journal::Alert {
+                kind,
+                ..Default::default()
+            });
+        }
         let mut landed = item;
         let max = self.max_stack(item);
         if max > 1 {

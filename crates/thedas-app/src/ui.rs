@@ -180,6 +180,9 @@ pub struct UiLayer {
     /// it has waited for its values to reach the popup layer (see
     /// [`UiLayer::show_script_popup`]).
     script_popup: Option<((i32, i32, u32), u8)>,
+    /// The large notification whose splash has been dealt with (see
+    /// [`UiLayer::uber_alert_splash`]).
+    uber_splash: Option<String>,
     /// The loading screen up, if any (see [`UiLayer::loading_begin`]).
     loading: Option<Loading>,
     /// The world map is held up as the loading screen (see [`UiLayer::hold_world_map`]).
@@ -459,6 +462,7 @@ impl UiLayer {
             tooltip_text: None,
             tooltip_relayout: 0,
             script_popup: None,
+            uber_splash: None,
             loading: None,
             travel_map: false,
             travel_out: None,
@@ -765,6 +769,52 @@ impl UiLayer {
                 }
             }
             _ => self.loading = None,
+        }
+    }
+
+    /// A large notification ("New Quest") draws a blood splash behind its plate with the
+    /// multiply blend, meant to darken the game's picture under it. The interface is drawn
+    /// into its own transparent picture, where a multiply leaves the splash's white paper
+    /// showing as a white block, so the splash is hidden and the plate shows alone.
+    /// Provisional: until the interface can multiply onto the scene.
+    fn uber_alert_splash(&mut self, sim: &Arc<Mutex<Sim>>) {
+        let head = {
+            let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+            sim.world.uber_alerts.first().map(|a| a.resref.clone())
+        };
+        let Some(head) = head else {
+            self.uber_splash = None;
+            return;
+        };
+        if self.uber_splash.as_deref() == Some(head.as_str()) {
+            return;
+        }
+        // The notification's clip is named as it is added (`UberNotification<n>`); its
+        // splash is its `instance1`.
+        let Some(thedas_ui::UiValue::String(tree)) =
+            self.stage
+                .call_in("notifications.gfx", "_global.thedas_tree_list", &[])
+        else {
+            return;
+        };
+        let splash = tree.split(';').find_map(|e| {
+            let path = e.split('|').next()?;
+            let rest = path
+                .split_once("UberNotificationArea_mc.UberNotification")?
+                .1;
+            let (n, tail) = rest.split_once('.')?;
+            (n.chars().all(|c| c.is_ascii_digit()) && tail == "instance1").then_some(path)
+        });
+        if let Some(path) = splash {
+            for m in self
+                .stage
+                .movies
+                .iter_mut()
+                .filter(|m| m.name == "notifications.gfx")
+            {
+                m.set(&format!("{path}._visible"), thedas_ui::UiValue::Bool(false));
+            }
+            self.uber_splash = Some(head);
         }
     }
 
@@ -1121,6 +1171,7 @@ impl UiLayer {
         }
         self.show_cutscene_line(sim);
         self.show_script_popup(sim);
+        self.uber_alert_splash(sim);
         self.loading_frame(dt_ms);
         self.travel_map_frame();
         let mut messages = self.stage.tick(dt_ms);
