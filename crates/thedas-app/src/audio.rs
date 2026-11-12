@@ -32,10 +32,6 @@ pub struct VoiceLine {
     pub ambient: bool,
 }
 
-/// An attack's blow: where the target stands, the `COMBAT_RESULT_*`, and the base items of
-/// the attacker's weapon and the target's armour and shield.
-pub type Impact = ([f32; 3], i32, Option<i32>, Option<i32>, Option<i32>);
-
 /// A creature's body armour, main-hand and off-hand base items (`BaseItem`), and whether
 /// it is fighting.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -89,9 +85,6 @@ pub struct AudioState {
     /// What the animated creatures wear and wield, for their animations' foley and swings:
     /// id -> (body armour, main-hand, off-hand base items, footstep column, ground).
     pub gear: std::collections::HashMap<u32, Gear>,
-    /// Attacks' blows: (target position, result, attacker's weapon, target's armour and
-    /// shield base items).
-    pub impacts: Vec<Impact>,
     /// Sound set lines to say: (set, `ss_types.gda` type, probability override (0: the
     /// type's own), where the speaker stands (none: 2D)).
     pub sound_sets: Vec<(String, i32, f32, Option<[f32; 3]>)>,
@@ -1405,9 +1398,6 @@ impl GameAudio {
                 None => log::debug!("audio: GUI sound {s:?} has no event"),
             }
         }
-        // Blows sound at their animation's hit frame (see `follow_animations`), not when
-        // the simulation resolves the attack, so its impact requests are not played.
-        state.impacts.clear();
         // Sound set lines come from scripts (`PlaySoundSet`; rules and AI scripts pass the
         // grunt and pain types themselves) and character creation's preview. DAOrigins.exe
         // calls its sound set player (0x6b5740) only from the script command (0x6625c6), two

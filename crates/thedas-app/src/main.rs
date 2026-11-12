@@ -2304,7 +2304,7 @@ fn audio_state(
             }
         }
     }
-    // Sounds the simulation asked for (scripts, blows, character creation's voice preview).
+    // Sounds the simulation asked for (scripts, character creation's voice preview).
     {
         let mut sim = live.sim();
         for req in std::mem::take(&mut sim.world.sounds) {
@@ -2328,18 +2328,6 @@ fn audio_state(
                     if let Some(set) = set {
                         let at = o.map(|o| o.position);
                         state.sound_sets.push((set, entry, probability, at));
-                    }
-                }
-                thedas_sim::world::SoundRequest::Impact {
-                    target,
-                    result,
-                    weapon,
-                    armour,
-                    shield,
-                    ..
-                } => {
-                    if let Some(at) = sim.world.get(target).map(|o| o.position) {
-                        state.impacts.push((at, result, weapon, armour, shield));
                     }
                 }
                 // PlayMusic names the music project (`music`, from the Music M2DA by

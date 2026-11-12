@@ -322,10 +322,15 @@ pub fn query(sim: &Sim, name: &str, args: &[String]) -> UiValue {
         // `HasAbility(creature, ability)`: whether the creature has learned the ability
         // (characterrecord.gfx shows a class's rank icon when the creature has the class's
         // starting ability).
+        // No ability (0) is never had: the character record asks for every class row,
+        // and the rows with none (the invalid class, the monster classes) showed as
+        // ranks the hero held (a column of dog icons running off the page).
         "HasAbility" => UiValue::Bool(
-            sim.world
-                .get(who)
-                .is_some_and(|o| o.abilities.contains(&(int(1) as i32))),
+            int(1) != 0
+                && sim
+                    .world
+                    .get(who)
+                    .is_some_and(|o| o.abilities.contains(&(int(1) as i32))),
         ),
         // `CreatureCanUseItem(item, creature)`: whether the creature may use the item;
         // inventory.gfx dims the rows of items it cannot (`ItemEquippable_mc`). The exe's

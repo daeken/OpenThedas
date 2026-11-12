@@ -1317,35 +1317,6 @@ impl Sim {
                 result: hit,
                 damage,
             });
-            // The impact's sound, for the presentation (output only).
-            let base = |who: ObjectId, slot: &str| {
-                let slot = constant_of(self, slot);
-                self.world
-                    .get(who)?
-                    .equipment
-                    .get(&slot)
-                    .and_then(|i| self.world.get(*i))
-                    .and_then(|i| i.fields.get("BaseItem").copied())
-            };
-            let impact = crate::world::SoundRequest::Impact {
-                attacker: id,
-                target,
-                result: hit,
-                weapon: base(
-                    id,
-                    if hand == 0 {
-                        "INVENTORY_SLOT_MAIN"
-                    } else {
-                        "INVENTORY_SLOT_OFFHAND"
-                    },
-                ),
-                armour: base(target, "INVENTORY_SLOT_CHEST"),
-                shield: base(target, "INVENTORY_SLOT_OFFHAND"),
-            };
-            if self.world.sounds.len() >= 64 {
-                self.world.sounds.remove(0);
-            }
-            self.world.sounds.push(impact);
             let mut ev = self.new_event("ATTACK_IMPACT", Some(id));
             ev.objects = vec![id, target];
             ev.ints = vec![hit, hand as i32];
