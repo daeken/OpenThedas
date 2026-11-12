@@ -118,6 +118,38 @@ pub fn events_from_gff(doc: &Gff4) -> TypedResult<Vec<AnimEvent>> {
     Ok(out)
 }
 
+/// One event of an animation with its text (field 4019): kind 20 names an FMOD event to
+/// play (`glo_fly_wep/...`), kind 14 footstep tags (`|Left`, `|Scuff`). Provisional: read
+/// from the files.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnimEventText {
+    pub time: f32,
+    pub kind: i64,
+    pub text: Option<String>,
+}
+
+/// The events of an animation (`.evt`) with their texts, in file order.
+pub fn parse_events_with_text(data: &[u8]) -> TypedResult<Vec<AnimEventText>> {
+    events_with_text_from_gff(&Gff4::parse(data)?)
+}
+
+pub fn events_with_text_from_gff(doc: &Gff4) -> TypedResult<Vec<AnimEventText>> {
+    let d = Doc::new(doc, "animation events");
+    d.expect_type("EVT ")?;
+    let mut out = Vec::new();
+    for e in d.structs(doc.root, 4020)? {
+        out.push(AnimEventText {
+            time: d.opt_f32(e, 4016)?.unwrap_or(0.0),
+            kind: d.opt_i64(e, 4017)?.unwrap_or(0),
+            text: d
+                .opt_str(e, 4019)?
+                .map(|t| t.trim_end_matches('\0').to_string())
+                .filter(|t| !t.is_empty()),
+        });
+    }
+    Ok(out)
+}
+
 /// The labels of an animation (`.ani`): the root holds 4005 the tracks, 4006 the name and
 /// 4009 the length in seconds. A track holds 4000 its target (`<bone>_rotation`,
 /// `<bone>_translation`), 4001 its kind and 4004 a struct whose 4004 lists the keys; a key
@@ -424,6 +456,26 @@ mod tests {
             ]
         );
         assert!(parse_events(b"not a gff").is_err());
+
+        let mut b = Builder::new(b"EVT ");
+        let e = b.add(
+            b"evt ",
+            vec![
+                (4016, Value::F32(0.63)),
+                (4017, Value::I32(20)),
+                (4019, s("glo_dog/dog/ss/bite\0")),
+            ],
+        );
+        let root = b.add(b"evtl", vec![(4020, structs(&[e]))]);
+        assert_eq!(
+            events_with_text_from_gff(&b.finish(root)).unwrap(),
+            vec![AnimEventText {
+                time: 0.63,
+                kind: 20,
+                text: Some("glo_dog/dog/ss/bite".into())
+            }]
+        );
+        assert!(parse_events_with_text(b"junk").is_err());
         assert!(AnimTree::parse(&[]).is_err());
         assert!(AnimInfo::parse(&[0xff; 64]).is_err());
     }

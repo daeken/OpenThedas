@@ -20,6 +20,7 @@ use std::time::Instant;
 
 use thedas_audio::area::{AreaSound, area_audio};
 use thedas_audio::{AudioEngine, EventHandle, Library, PlayOptions, Volumes};
+use thedas_formats::anim::AnimEventText;
 use thedas_vfs::Vfs;
 
 /// The voice-over a conversation line wants.
@@ -43,6 +44,9 @@ pub struct AudioState {
     pub line: Option<VoiceLine>,
     /// The cutscene playing (resource name) and how far it has played (seconds).
     pub cutscene: Option<(String, f32)>,
+    /// Each drawn creature's animation now: id, `.ani` resource, seconds into it, its
+    /// length, position (see `Live::animation_clocks`).
+    pub animations: Vec<(u32, String, f32, f32, [f32; 3])>,
     /// Events scripts played (`PlaySound`), with where the object stands (none: 2D).
     pub script_sounds: Vec<(String, Option<[f32; 3]>)>,
     /// A boot movie playing (its file) and how far it has played (milliseconds): its own
@@ -133,7 +137,42 @@ pub struct GameAudio {
     cutscene: Option<CutsceneSounds>,
     area: Option<AreaPlay>,
     movie: Option<MovieSound>,
+    /// The resources animation events are read from.
+    vfs: Arc<Vfs>,
+    /// Animation events by `.ani` resource (lowercase), read once.
+    anim_events: std::collections::HashMap<String, Arc<Vec<AnimEventText>>>,
+    /// Each creature's animation and time last frame.
+    anim_clocks: std::collections::HashMap<u32, (String, f32)>,
+    /// `sound_movement_footsteps.gda` row 0 (no surface known): the humanoid and dog
+    /// footstep events.
+    footsteps: (Option<String>, Option<String>),
     last: Instant,
+}
+
+/// `sound_movement_footsteps.gda`'s first row (surface unknown): the small humanoid's and the
+/// dog's footstep events. Provisional: the walkmesh's surface and the creature's footstep
+/// type (the other rows and columns) are not chosen yet.
+fn footstep_events(vfs: &Vfs) -> (Option<String>, Option<String>) {
+    let Ok((data, _)) = vfs.read("sound_movement_footsteps.gda") else {
+        return (None, None);
+    };
+    let Ok(gda) = thedas_formats::Gda::parse(&data) else {
+        return (None, None);
+    };
+    let Some(row) = gda.row_by_id(0) else {
+        return (None, None);
+    };
+    let events: Vec<String> = row
+        .iter()
+        .filter_map(|c| match c {
+            thedas_formats::gda::Cell::String(s) if s.contains('/') => {
+                Some(s.trim_end_matches('\0').trim().to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    let find = |part: &str| events.iter().find(|e| e.contains(part)).cloned();
+    (find("/humanoid/small/"), find("/dog/"))
 }
 
 /// `sound_gui.gda`: the interface sound ids' events.
@@ -166,7 +205,7 @@ fn gui_table(vfs: &Vfs) -> Vec<Option<String>> {
 
 impl GameAudio {
     /// The game's sound on the default output; `None` (logged) with no output device.
-    pub fn open(install: &Path, module: &str, vfs: &Vfs, language: &str) -> Option<GameAudio> {
+    pub fn open(install: &Path, module: &str, vfs: &Arc<Vfs>, language: &str) -> Option<GameAudio> {
         let output = thedas_audio::device::Output::open()?;
         let library = Arc::new(Library::new(Library::install_dirs(
             install, module, language,
@@ -181,8 +220,83 @@ impl GameAudio {
             cutscene: None,
             area: None,
             movie: None,
+            vfs: vfs.clone(),
+            anim_events: Default::default(),
+            anim_clocks: Default::default(),
+            footsteps: footstep_events(vfs),
             last: Instant::now(),
         })
+    }
+
+    /// Animations' sound events: as a creature's animation passes an event, kind 20 plays the
+    /// event it names (weapon swings, creature noises: `glo_fly_wep/...`) and kind 14 a
+    /// footstep (see [`footstep_events`]) where the creature stands. Provisional: events on
+    /// the frame an animation starts are those at its time 0 onward; footsteps sound for
+    /// humanoids and dogs only.
+    fn follow_animations(&mut self, clocks: Vec<(u32, String, f32, f32, [f32; 3])>) {
+        let mut seen = std::collections::HashMap::new();
+        for (id, ani, t, length, pos) in clocks {
+            let key = ani.to_ascii_lowercase();
+            let prev = self.anim_clocks.get(&id).cloned();
+            seen.insert(id, (key.clone(), t));
+            let events = match self.anim_events.get(&key) {
+                Some(e) => e.clone(),
+                None => {
+                    let stem = key.strip_suffix(".ani").unwrap_or(&key);
+                    let e = Arc::new(
+                        self.vfs
+                            .read(&format!("{stem}.evt"))
+                            .ok()
+                            .and_then(|(d, _)| {
+                                thedas_formats::anim::parse_events_with_text(&d).ok()
+                            })
+                            .unwrap_or_default(),
+                    );
+                    self.anim_events.insert(key.clone(), e.clone());
+                    e
+                }
+            };
+            if events.is_empty() {
+                continue;
+            }
+            // Which stretch of the animation passed since last frame.
+            let crossed = |e: f32| match &prev {
+                Some((k, p)) if *k == key => {
+                    if t >= *p {
+                        e > *p && e <= t
+                    } else {
+                        // Wrapped (a loop).
+                        e > *p && e <= length || e <= t
+                    }
+                }
+                _ => e <= t && t - e < 0.25,
+            };
+            for ev in events.iter().filter(|e| crossed(e.time)) {
+                let event = match (ev.kind, &ev.text) {
+                    (20, Some(path)) => Some(path.clone()),
+                    (14, Some(tags)) if tags.contains("Left") => {
+                        if key.starts_with("c_dog") {
+                            self.footsteps.1.clone()
+                        } else if is_humanoid(&key) {
+                            self.footsteps.0.clone()
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    self.engine.play(
+                        &event,
+                        PlayOptions {
+                            position: Some(pos),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+        }
+        self.anim_clocks = seen;
     }
 
     /// A boot movie's own sound track plays along with it (DA:O's logos carry theirs in the
@@ -510,6 +624,7 @@ impl GameAudio {
                 log::debug!("audio: script sound {event} has no event");
             }
         }
+        self.follow_animations(std::mem::take(&mut state.animations));
         self.follow_movie(state.movie.take());
         self.follow_area(&state);
         self.follow_cutscene(state.cutscene.clone());
@@ -556,6 +671,15 @@ impl GameAudio {
     }
 }
 
+/// Whether an animation resource is a humanoid's: the shared humanoid animations are
+/// `mh.*` / `fh.*` (male, female) and their variants `mh_*`, `fh_*`, and cutscene actors
+/// `cs_*`. Provisional (from the resource names).
+fn is_humanoid(ani: &str) -> bool {
+    ["mh.", "mh_", "fh.", "fh_", "cs_", "csmale"]
+        .iter()
+        .any(|p| ani.starts_with(p))
+}
+
 /// The options screen's volumes (`ClientOptions.AudioOptions.*`, 0..10, with their disable
 /// switches) as gains.
 pub fn volumes(option: impl Fn(&str) -> Option<f64>) -> Volumes {
@@ -570,5 +694,29 @@ pub fn volumes(option: impl Fn(&str) -> Option<f64>) -> Volumes {
         music: v("AudioOptions.MusicVolume", "AudioOptions.MusicDisabled"),
         sfx: v("AudioOptions.SoundFXVolume", "AudioOptions.SFXDisabled"),
         dialog: v("AudioOptions.DialogVolume", "AudioOptions.DialogDisabled"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn humanoid_animations_by_name() {
+        assert!(is_humanoid("mh.walk.ani"));
+        assert!(is_humanoid("fh_c.attk_v1.ani"));
+        assert!(!is_humanoid("c_dog.cwalkf.ani"));
+        assert!(!is_humanoid("ip_dbldoor.open.ani"));
+    }
+
+    #[test]
+    fn volumes_follow_the_options() {
+        let opts = |n: &str| match n {
+            "AudioOptions.MusicVolume" => Some(5.0),
+            "AudioOptions.SFXDisabled" => Some(1.0),
+            _ => None,
+        };
+        let v = volumes(opts);
+        assert_eq!((v.music, v.sfx, v.dialog), (0.5, 0.0, 1.0));
     }
 }

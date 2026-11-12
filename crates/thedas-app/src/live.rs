@@ -368,6 +368,37 @@ impl Live {
         })
     }
 
+    /// What each drawn creature is animating now: its id, the `.ani` resource, seconds into
+    /// it (wrapped when looping), the animation's length, and where it stands. For the
+    /// animations' sound events (see `crate::audio`).
+    pub fn animation_clocks(&mut self) -> Vec<(ObjectId, String, f32, f32, [f32; 3])> {
+        let Some(level) = self.level.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (id, transform, clip) in &self.posed {
+            let Some(clip) = clip else {
+                continue;
+            };
+            let Some((ani, anim)) = self.animator.animation_resource(&level.vfs, clip) else {
+                continue;
+            };
+            let t = if clip.looping && anim.length > 0.0 {
+                clip.time.rem_euclid(anim.length)
+            } else {
+                clip.time.min(anim.length)
+            };
+            out.push((
+                *id,
+                ani,
+                t,
+                anim.length,
+                transform.w_axis.truncate().to_array(),
+            ));
+        }
+        out
+    }
+
     /// Where the party leader stands, when it is in the current area.
     pub fn leader_feet(&self) -> Option<glam::Vec3> {
         let sim = self.sim();
