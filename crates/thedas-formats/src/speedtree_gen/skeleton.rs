@@ -71,6 +71,39 @@ pub struct Flare {
     pub distance: f32,
 }
 
+/// Wind matrices the game animates (7.1); groups pick among them.
+pub const WIND_MATRICES: u8 = 6;
+
+/// The two wind pairs of a skeleton vertex or leaf as the computation carries them (7.7):
+/// weights where 1 is rigid, and the round-robin groups.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Wind {
+    pub weights: [f32; 2],
+    pub groups: [i32; 2],
+}
+
+impl Wind {
+    /// The output form (7.7): weights `clamp(1 − w, 0, 1)` (0 rigid, 1 free) and matrix
+    /// indices `(g as an unsigned byte) mod 6`.
+    pub fn output(&self) -> ([f32; 2], [u8; 2]) {
+        (
+            self.weights.map(|w| (1.0 - w).clamp(0.0, 1.0)),
+            self.groups.map(|g| (g as u8) % WIND_MATRICES),
+        )
+    }
+
+    /// Weights interpolated between two vertices, groups from `groups`.
+    fn between(a: Wind, b: Wind, s: f32, groups: [i32; 2]) -> Wind {
+        Wind {
+            weights: [
+                lerp(a.weights[0], b.weights[0], s),
+                lerp(a.weights[1], b.weights[1], s),
+            ],
+            groups,
+        }
+    }
+}
+
 /// One vertex along a branch.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vertex {
@@ -88,6 +121,8 @@ pub struct Vertex {
     pub length: f32,
     /// Branch progress: 0 at the first vertex, the packed progress after (2.4 step 9.1).
     pub progress: f32,
+    /// Wind weights and groups (7.7).
+    pub wind: Wind,
 }
 
 /// One branch (the trunk is the first).
@@ -116,6 +151,8 @@ pub struct Branch {
     pub cross_sections: i32,
     /// The gnarl was negated for this branch.
     pub gnarl_negated: bool,
+    /// The wind values it was grown with, its groups as assigned at its start (7.7).
+    pub wind: Wind,
     pub flares: Vec<Flare>,
     pub vertices: Vec<Vertex>,
     pub volume: f32,
@@ -236,6 +273,7 @@ struct Sprout {
     seed: i32,
     root: bool,
     parent: Option<usize>,
+    wind: Wind,
 }
 
 struct Grower<'t> {
@@ -258,6 +296,10 @@ struct Grower<'t> {
     vertex_count: usize,
     candidates: usize,
     exceeded: Option<GenerateError>,
+    /// The wind group counter and settings (7.7).
+    wind_counter: i32,
+    wind_level: i32,
+    propagate_flexibility: bool,
 }
 
 /// Grows a tree's skeleton (stage 2). The stream is returned in its final state so later
@@ -300,6 +342,9 @@ pub fn grow(tree: &SpeedTree) -> Result<(Skeleton, Random), GenerateError> {
         vertex_count: 0,
         candidates: 0,
         exceeded: None,
+        wind_counter: seed.max(1),
+        wind_level: tree.wind_level.unwrap_or(1),
+        propagate_flexibility: tree.propagate_flexibility.unwrap_or(false),
     };
     // Step 7: the trunk.
     if !tree.branch_levels.is_empty() {
@@ -313,6 +358,10 @@ pub fn grow(tree: &SpeedTree) -> Result<(Skeleton, Random), GenerateError> {
             seed,
             root: false,
             parent: None,
+            wind: Wind {
+                weights: [1.0, 1.0],
+                groups: [seed.max(1), tree.flare_seed.unwrap_or(0)],
+            },
         });
     }
     if let Some(e) = grower.exceeded {
@@ -459,6 +508,23 @@ fn apply_gravity(frame: Frame, curves_profile: f32, gravity: f32) -> Frame {
 impl<'t> Grower<'t> {
     /// Grows one branch and its children (2.4, 2.5). Returns its index, or `None` when the
     /// frond rules prune it.
+    /// One skeleton vertex's wind weights (7.7) from those the branch was grown with, its
+    /// progress `t` and its vertex flexibility `f`.
+    fn vertex_wind(&self, level: i32, received: Wind, t: f32, f: f32) -> Wind {
+        let w = self.wind_level;
+        let mut out = received;
+        if level < w {
+            out.weights = [1.0, 1.0];
+        } else if level == w {
+            out.weights = [1.0 - t * f, 1.0];
+        } else if level == w.wrapping_add(1) {
+            out.weights[1] = 1.0 - t * f;
+        } else if self.propagate_flexibility {
+            out.weights[1] = lerp(received.weights[1], 0.0, f);
+        }
+        out
+    }
+
     /// Records the first limit passed; growth stops from then on.
     fn exceed(&mut self, what: &'static str, max: usize) {
         if self.exceeded.is_none() {
@@ -491,6 +557,15 @@ impl<'t> Grower<'t> {
             FrondRule::Enabled => !sprout.root,
             FrondRule::Disabled => false,
         };
+        // 7.7: the round-robin wind groups, right after the frond test.
+        let mut wind = sprout.wind;
+        if level == self.wind_level {
+            wind.groups[0] = self.wind_counter;
+            self.wind_counter = self.wind_counter.wrapping_add(1);
+        } else if level == self.wind_level.wrapping_add(1) {
+            wind.groups[1] = self.wind_counter;
+            self.wind_counter = self.wind_counter.wrapping_add(1);
+        }
         // Step 2: flares.
         let flares = if frond { Vec::new() } else { self.flares(info) };
 
@@ -558,6 +633,7 @@ impl<'t> Grower<'t> {
             flexibility,
             cross_sections,
             gnarl_negated: false,
+            wind,
             flares,
             vertices: Vec::new(),
             volume: 0.0,
@@ -616,6 +692,7 @@ impl<'t> Grower<'t> {
             forks: 0,
             length: 0.0,
             progress: 0.0,
+            wind: self.vertex_wind(level, wind, 0.0, vertex_flexibility),
         });
 
         // Step 9: the remaining vertices.
@@ -639,6 +716,7 @@ impl<'t> Grower<'t> {
                 gnarl = -gnarl;
             }
             frame = frame.then(&Frame::about_z(gnarl));
+            let vertex_wind = self.vertex_wind(level, wind, t, vertex_flexibility);
             let mut position = add(previous.position, scale(previous.direction, segment));
             // Step 9.9: the floor.
             if floor_applies
@@ -662,6 +740,7 @@ impl<'t> Grower<'t> {
                 forks: 0,
                 length: previous.length + segment,
                 progress: t,
+                wind: vertex_wind,
             });
         }
 
@@ -687,6 +766,7 @@ impl<'t> Grower<'t> {
     }
 
     /// A bud on branch `index` (5.2): its own two draws, then a leaf (5.3).
+    #[allow(clippy::too_many_arguments)]
     fn bud(
         &mut self,
         index: usize,
@@ -695,6 +775,7 @@ impl<'t> Grower<'t> {
         frame0: Frame,
         direction: Vec3,
         percent: f32,
+        wind: Wind,
     ) {
         let tree = self.tree;
         let (Some(info), Some(c)) = (self.info(level, false), self.curves(level, false)) else {
@@ -755,6 +836,7 @@ impl<'t> Grower<'t> {
             index,
             nu,
             delta,
+            wind,
         );
     }
 
@@ -959,7 +1041,18 @@ impl<'t> Grower<'t> {
                     along: q,
                     percent,
                 });
-                self.bud(index, child_level, position, a.frame, a.direction, percent);
+                let groups = self.branches[index].wind.groups;
+                let mut wind = Wind::between(a.wind, b.wind, fraction, groups);
+                wind.weights = wind.weights.map(|w| w.clamp(0.0, 1.0));
+                self.bud(
+                    index,
+                    child_level,
+                    position,
+                    a.frame,
+                    a.direction,
+                    percent,
+                    wind,
+                );
                 continue;
             }
             let (frame, azimuth_axis) = if child_level == self.first_level {
@@ -977,6 +1070,7 @@ impl<'t> Grower<'t> {
                 seed,
                 root: is_root,
                 parent: Some(index),
+                wind: Wind::between(a.wind, b.wind, fraction, self.branches[index].wind.groups),
             });
         }
     }
@@ -1198,5 +1292,30 @@ pub(super) mod tests {
         assert!(flares.iter().all(|f| (0.0..=TWO_PI).contains(&f.angle)));
         // Flares draw nothing from the stream.
         assert_eq!(random.draws(), 1000 + 1 + 7 + 5 + 4 * 5);
+    }
+
+    #[test]
+    fn wind_groups_and_weights_follow_the_levels() {
+        // Wind level 1: the trunk (level 0) is rigid; level-1 branches take groups from the
+        // counter (starting at the seed) and bend with their progress and flexibility.
+        let mut t = tree(vec![level(-90.0, 2.0), level(0.0, 0.0), level(0.0, 0.0)]);
+        t.wind_level = Some(1);
+        let (skeleton, _) = grow(&t).unwrap();
+        let trunk = &skeleton.branches[0];
+        assert_eq!(trunk.wind.groups, [1234, 1]);
+        assert!(trunk.vertices.iter().all(|v| v.wind.weights == [1.0, 1.0]));
+        assert_eq!(
+            trunk.vertices[0].wind.output(),
+            ([0.0, 0.0], [(1234u32 % 256 % 6) as u8, 1])
+        );
+        let children: Vec<_> = skeleton.branches.iter().filter(|b| b.level == 1).collect();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].wind.groups, [1234, 1]);
+        assert_eq!(children[1].wind.groups, [1235, 1]);
+        for v in &children[0].vertices {
+            // flexibility 0.5 · flexibility_scale 1.
+            assert!((v.wind.weights[0] - (1.0 - v.progress * 0.5)).abs() < 1e-6);
+            assert_eq!(v.wind.weights[1], 1.0);
+        }
     }
 }

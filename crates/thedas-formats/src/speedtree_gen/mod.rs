@@ -18,7 +18,7 @@ pub mod limits;
 pub mod mesh;
 pub mod skeleton;
 
-pub use skeleton::{Branch, Bud, Flare, Guide, Skeleton, Vertex, grow};
+pub use skeleton::{Branch, Bud, Flare, Guide, Skeleton, Vertex, Wind, grow};
 
 use crate::speedtree::{BezierSpline, BranchLevel, SpeedTree};
 
