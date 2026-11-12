@@ -45,6 +45,8 @@ pub struct LiveObjects {
     /// The placeables' opaque surfaces as drawn (doors, furniture), which the game camera
     /// keeps on the near side of, as it does the level's.
     solid: thedas_render::collide::Collider,
+    /// Each prop's object and its own models (not what it holds), in the scene's order.
+    bodies: Vec<(ObjectId, Vec<String>)>,
     pub scene: AreaScene,
     pub renderer: AreaRenderer,
 }
@@ -60,6 +62,10 @@ pub struct Live {
     pub level: Option<LiveLevel>,
     pub objects: Option<LiveObjects>,
     animator: Animator,
+    /// The creatures the game camera has faded (see [`crate::camfade`]) and the models'
+    /// creature shapes read so far.
+    camera_fade: crate::camfade::CameraFade,
+    creature_shapes: std::collections::HashMap<String, Arc<Vec<crate::camfade::Shape>>>,
     /// A quickbar ability waiting for the player to click its target.
     pub aiming: Option<thedas_ui::input::Aim>,
     /// Each drawn object's id, placement and motion at the last sync (in the objects' scene
@@ -195,6 +201,8 @@ impl Live {
             level: None,
             objects: None,
             animator: Animator::default(),
+            camera_fade: Default::default(),
+            creature_shapes: Default::default(),
             aiming: None,
             posed: Vec::new(),
             models: ModelCache::default(),
@@ -272,6 +280,69 @@ impl Live {
         let feet = self.leader_feet()?;
         let height = self.leader_look_height();
         Some(follow.camera_clear(feet, height, dt, base, &|a, b, r| self.sweep(a, b, r)))
+    }
+
+    /// The game camera's fade of the creatures it is inside (see [`crate::camfade`]), `dt`
+    /// seconds after the last: `eye` is where the game camera stands, or `None` while it is
+    /// not the view (a conversation or cutscene frames the shot: no creature starts fading
+    /// then, as in the executable's `GM_DIALOG` and `GM_CUTSCENE`). Creatures faded out are
+    /// left out of the frame.
+    pub fn fade_near_camera(&mut self, eye: Option<glam::Vec3>, dt: f32) {
+        let blocked = {
+            let sim = self.sim();
+            sim.world.cutscene.is_some() || sim.conversation_line().is_some()
+        };
+        let eye = eye.filter(|_| !blocked);
+        let mut touching = Vec::new();
+        if let (Some(eye), Some(level), Some(objects)) =
+            (eye, self.level.as_ref(), self.objects.as_ref())
+        {
+            for (i, (id, models)) in objects.bodies.iter().enumerate() {
+                let Some((_, placement, _)) = self.posed.get(i).filter(|p| p.0 == *id) else {
+                    continue;
+                };
+                // Cheap reject: creatures stand within a few metres of their origin.
+                if placement.w_axis.truncate().distance(eye) > 4.0 {
+                    continue;
+                }
+                let touches = models.iter().any(|m| {
+                    let key = m.to_ascii_lowercase();
+                    let shapes = self.creature_shapes.entry(key.clone()).or_insert_with(|| {
+                        let read = |n: &str| level.vfs.read(n).ok().map(|(d, _)| d);
+                        let phy = read(&format!("{key}.phy"))
+                            .and_then(|d| thedas_formats::phy::Phy::parse(&d).ok());
+                        let mmh = read(&format!("{key}.mmh"))
+                            .and_then(|d| thedas_formats::model::Mmh::parse(&d).ok());
+                        Arc::new(
+                            phy.map(|p| crate::camfade::model_shapes(&p, mmh.as_ref()))
+                                .unwrap_or_default(),
+                        )
+                    });
+                    shapes
+                        .iter()
+                        .any(|s| s.touches(placement, eye, crate::camfade::FADE_RADIUS))
+                });
+                if touches {
+                    touching.push(*id);
+                }
+            }
+        }
+        self.camera_fade.update(touching, dt);
+        if let Some(objects) = self.objects.as_mut() {
+            let mut hidden = std::collections::HashSet::new();
+            for (i, (id, _)) in objects.bodies.iter().enumerate() {
+                if self.camera_fade.drawn(*id) {
+                    continue;
+                }
+                if let Some(p) = objects.scene.props.get(i) {
+                    hidden.extend(p.draws.clone());
+                    for a in &p.attachments {
+                        hidden.extend(a.draws.clone());
+                    }
+                }
+            }
+            objects.renderer.hidden_draws = hidden;
+        }
     }
 
     /// How high above its feet the camera looks at the party leader: its appearance's
@@ -834,6 +905,7 @@ impl Live {
             shapes,
             faces,
             solid,
+            bodies: models.iter().map(|m| (m.id, m.models.clone())).collect(),
             scene,
             renderer,
         })
