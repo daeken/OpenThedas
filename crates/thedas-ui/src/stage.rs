@@ -220,6 +220,11 @@ fn add_book_backdrop(m: &mut UiMovie) {
         &[s(&format!("img://{BOOK_IMAGE}"))],
     );
 }
+/// The quickbar's movie.
+const QUICKBAR: &str = "quickbar.gfx";
+/// The frames quickbar.gfx takes to lay itself out before its width is put back.
+const QUICKBAR_SETTLE_FRAMES: u32 = 3;
+
 /// The engine value holding how far the quickbar is dragged open (see [`Stage::new`]).
 pub const QUICKBAR_EXPAND_VALUE: &str = "Party.QuickbarExpandValue";
 
@@ -228,6 +233,9 @@ const POPUP_CONTEXT: &str = "GUIPopup";
 
 pub struct Stage {
     pub movies: Vec<UiMovie>,
+    /// The quickbar's width as the engine held it when quickbar.gfx opened, put back after
+    /// the movie's first frame (see [`QUICKBAR_EXPAND_VALUE`]).
+    quickbar_width: Option<(UiValue, u32)>,
     /// Recent ActionScript traces and warnings, newest last (at most 500).
     pub log: Vec<String>,
     pub bridge: GameBridge,
@@ -270,6 +278,7 @@ impl Stage {
         let images = Arc::new(std::sync::Mutex::new(images));
         Self {
             movies: Vec::new(),
+            quickbar_width: None,
             log: Vec::new(),
             bridge: {
                 let b = GameBridge::new(talk_table(vfs));
@@ -337,6 +346,12 @@ impl Stage {
 
     /// Loads a movie (`mainmenu.gfx`) on top of the others and starts it.
     pub fn open(&mut self, name: &str) -> Result<(), UiError> {
+        if name == QUICKBAR {
+            self.quickbar_width = self
+                .bridge
+                .value(QUICKBAR_EXPAND_VALUE)
+                .map(|v| (v, QUICKBAR_SETTLE_FRAMES));
+        }
         let (swf, rep) = {
             let mut images = self
                 .images
@@ -450,6 +465,25 @@ impl Stage {
             let missing = m.sync_tokens(&|t| bridge.value(t));
             bridge.note_unanswered(missing);
             m.tick(dt_ms);
+            // quickbar.gfx's first frame places its expansion handle before the handle's
+            // own init (Ruffle runs the clips' init in another order than Scaleform): the
+            // handle sits at its authored place, the bar's full width, and the movie writes
+            // that back as the player's choice. The engine's value is put back and laid out
+            // again once that frame is done. Provisional: inferred from the movie's code
+            // (`UpdateExpansionMaskPosition` before `ExpansionHandle_mc_init`).
+            if m.name == QUICKBAR {
+                match self.quickbar_width.take() {
+                    Some((width, 0)) => {
+                        self.bridge.set_value(QUICKBAR_EXPAND_VALUE, width.clone());
+                        m.call(
+                            "_level0.QuickbarAndEffectBar_mc.Quickbar_mc.ExpandQuickbarFromGameData",
+                            &[width],
+                        );
+                    }
+                    Some((width, n)) => self.quickbar_width = Some((width, n - 1)),
+                    None => {}
+                }
+            }
             let messages: Vec<GameMessage> = m
                 .drain_calls()
                 .into_iter()
