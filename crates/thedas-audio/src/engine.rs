@@ -199,6 +199,8 @@ pub struct AudioEngine {
     /// Ducking now applied per category: dB now, the fade-out it releases over (ms) and the
     /// duck's depth (dB, positive), which the ramps cover in their fade times.
     ducking: HashMap<String, (f32, f32, f32)>,
+    /// Each ducked category's target last update (for the debug log of changes).
+    duck_targets: HashMap<String, f32>,
     pub volumes: Volumes,
     listener: Listener,
     rng: u64,
@@ -288,6 +290,7 @@ impl AudioEngine {
             categories,
             parents,
             ducking: HashMap::new(),
+            duck_targets: HashMap::new(),
             volumes: Volumes::default(),
             listener: Listener {
                 position: [0.0; 3],
@@ -860,6 +863,13 @@ impl AudioEngine {
                 Some((db, fin, _)) => (*db, *fin),
                 None => (0.0, e.1),
             };
+            if self.duck_targets.get(k) != Some(&target) {
+                log::debug!(
+                    "audio: duck {k}: {:.1} dB -> {target:.1} dB over {fade_ms:.0} ms",
+                    e.0
+                );
+                self.duck_targets.insert(k.clone(), target);
+            }
             let span = e.2.max(1.0);
             let step = if fade_ms > 0.0 {
                 span * dt * 1000.0 / fade_ms
@@ -874,6 +884,8 @@ impl AudioEngine {
         }
         self.ducking
             .retain(|k, d| d.0 < -1e-3 || targets.contains_key(k));
+        let ducking = &self.ducking;
+        self.duck_targets.retain(|k, _| ducking.contains_key(k));
         // Gains and pans.
         let listener = &self.listener;
         let mut mixer = match self.mixer.lock() {

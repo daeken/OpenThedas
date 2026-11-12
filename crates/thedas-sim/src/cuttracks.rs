@@ -43,14 +43,13 @@
 //!
 //! - Kind 24, `ActionJumpToCamera` (`AJSC`; built by 0x7dc450, update 0x7df2f0): see
 //!   [`CameraJump`].
+//! - Kind 27, `ActionLinkToActor` (built by 0x7db900, update 0x7d3cf0): see [`ActorLink`].
 //!
 //! Provisional: which way a camera actor looks (taken as its local +Y, as a stage camera's;
 //! up is +Z); whether a field of view is vertical; tracks outside their span (a track is
 //! taken to apply from its start and to hold its value at its end after it); an actor with
 //! no motion track stands at its base; a camera with no field-of-view track sees 45°; a
-//! missing transition is linear. Not followed yet: a camera actor linked to another actor
-//! (`ActionLinkToActor`, kind 27: 14 camera tracks in the game's cutscenes); while one is,
-//! [`Tracks::camera_at`] gives no camera.
+//! missing transition is linear.
 
 use thedas_formats::Gff4;
 use thedas_formats::gff4::{StructId, Value};
@@ -78,6 +77,10 @@ const FIELD_TRACK_END: u32 = 5302;
 const FIELD_TRACK_CURVES: u32 = 5303;
 const FIELD_CAMERA_ACTOR: u32 = 5610;
 const FIELD_JUMP_BY_PLACE: u32 = 5570;
+const FIELD_LINK_TARGET: u32 = 5630;
+const FIELD_LINK_NODE: u32 = 5631;
+const FIELD_LINK_BY_BONE: u32 = 5636;
+const FIELD_LINK_KEEP_OFFSET: u32 = 5637;
 const FIELD_ANIMATION: u32 = 5400;
 const FIELD_ANIMATION_TREE: u32 = 5401;
 const FIELD_ANIMATION_SPEED: u32 = 5402;
@@ -342,6 +345,85 @@ pub struct CameraJump {
     pub by_place: bool,
 }
 
+/// What a link names on the actor it links to: fields 5631 and 5636 of an
+/// `ActionLinkToActor` (see [`ActorLink`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LinkNode {
+    /// 5631 is -1: the root of the actor's model (0x7d3df0, its vfunc +0x68), which stands
+    /// and turns as the actor does.
+    Root,
+    /// 5636 set: the bone with this index in the actor's skeleton (0x7d3d53 looks the
+    /// index up in a map of the model's, 0x562e00, and takes the name of what it finds),
+    /// found by that name among the model's nodes (vfunc +0x10, 0x7d3dfe).
+    Bone(u32),
+    /// 5636 clear: row 5631 of an engine table (0x7d3d8d: table 0x5b, column hash
+    /// 0x90028895) names the node. Only props use it (a dagger in a hand); no camera does.
+    Table(i64),
+}
+
+/// An `ActionLinkToActor` track (kind 27): while it plays, the actor (the camera, a prop, an
+/// effect) is carried by a node of another actor, as a child carried by its parent.
+///
+/// Traced: the constructor 0x7db900 reads the actor linked to (field 5630, +0x28: an actor
+/// id, 5201, found by 0x7d0470), the node (5631, +0x4c), whether that is a bone index
+/// (5636, +0x49; see [`LinkNode`]) and whether the actor keeps its own place relative to
+/// the node (5637, +0x48). Each update (0x7d3cf0) finds the node of the linked actor's model
+/// and attaches the actor's model to it (vfunc +0xf0) with an offset: with 5637, the
+/// actor's own position and rotation in the cutscene's space (0x7cf640, 0x7cf6f0: as its
+/// motion and rotation tracks set them this update) taken back from its base (5214, 5215,
+/// actor +0xe0 and +0xf0): `offset = base⁻¹·(own − base)`, `turn = base⁻¹·own`, which are
+/// the motion and rotation curves' own values; without it, no offset (the node's own
+/// place). The actor is then where the node is, offset in the node's frame: position
+/// `node + node_rotation·offset`, rotation `node_rotation·turn` (worked out explicitly,
+/// when the cutscene's +0x94 is 5, at 0x7d3f56 -> 0x7cf450 and 0x7d3f98 -> 0x7cdde0;
+/// otherwise the scene graph composes the attachment). Its field of view stays its own. An
+/// update at or past the track's end (time since its start ≥ end − start) detaches it
+/// again (vfunc +0xf8, 0x7d4027), as does the actor's reset (0x7d1150, vtable slot 2): the
+/// actor is then where its own tracks put it. The action dispatcher (0x7da2ff) updates a
+/// track from 1e-4 s before its start to 1e-4 s after its end. A linked actor the cutscene
+/// cannot find, or one without a model, links nothing (0x7d3d19, 0x7d3e08).
+///
+/// The toolset keys a linked camera's curves as offsets from the node while the link plays
+/// and back in the cutscene's space after it (`den600cs_loghains_duel_qun`'s Camera 2: x
+/// 15.08 until 12.23 s, 0.15 at the link's start, 15.08 again after its end at 14.9 s).
+///
+/// Provisional: every link follows the linked actor's root. The offsets of the game's
+/// camera links to bones fit the root's frame and not the bone's: `ntb100cs_attackondalish`'s
+/// Camera 8 (linked to bone 7, the model hierarchy's `Chest2` on an elf) sits 1.5 m in
+/// front of the elf, 1.45 m up and turned back towards it (a close-up of the face from the
+/// root; from `Chest2`, whose frame is turned a quarter about two axes, it would sit 0.4 m
+/// off the ground looking past the elf), and `124383`'s Camera 2 (bone 7 of Bhelen) 0.78 m
+/// in front of the dwarf at 1.31 m, looking back. Which node the bone index names, and
+/// table nodes, are not followed. A linked actor the world does not draw is taken where
+/// its own tracks put it. The link is taken to end at its end: the executable detaches
+/// only on an update within 1e-4 s of the end, and that the toolset keys the curves back
+/// in the cutscene's space there says it is meant to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ActorLink {
+    pub start: f32,
+    pub end: f32,
+    /// The id (5201) of the actor linked to.
+    pub target: i64,
+    pub node: LinkNode,
+    /// Field 5637: the actor keeps its own tracks' place as an offset from the node.
+    pub keep_offset: bool,
+}
+
+impl ActorLink {
+    /// Whether the link holds `t` seconds into the cutscene: from its start (a hair early,
+    /// as the dispatcher updates it) until its end, where it detaches.
+    pub fn holds(&self, t: f32) -> bool {
+        self.start <= t + KEY_SNAP && t < self.end
+    }
+}
+
+/// Where a cutscene's actor (an index into [`Tracks::actors`]) is drawn in the world: its
+/// model's root's position and rotation (x, y, z, w). `None` when it is not drawn.
+pub type RootLookup<'a> = dyn Fn(usize) -> Option<([f32; 3], [f32; 4])> + 'a;
+
+/// How deep links of links are followed (a camera linked to a camera linked to a creature).
+const MAX_LINK_DEPTH: u32 = 8;
+
 /// A stage camera's pose in the cutscene's space, by its name (or, when the flag is set,
 /// by the name of the place whose default camera it is); see [`CameraJump`].
 pub type StageCameraLookup<'a> = dyn Fn(&str, bool) -> Option<Pose> + 'a;
@@ -386,9 +468,8 @@ pub struct Actor {
     pub places: Vec<PlaceTrack>,
     /// Kind-24 tracks, in the file's order.
     pub camera_jumps: Vec<CameraJump>,
-    /// Spans (start, end) of tracks that place the actor by other means, which are not
-    /// followed: `ActionLinkToActor` (kind 27).
-    pub placed_elsewhere: Vec<(f32, f32)>,
+    /// Kind-27 tracks, in the file's order.
+    pub links: Vec<ActorLink>,
 }
 
 /// Where an actor is at a moment of the cutscene.
@@ -469,6 +550,24 @@ impl Actor {
             };
         }
         pose
+    }
+
+    /// The link that holds the actor `t` seconds into the cutscene: the last in the file's
+    /// order, as the actions update in that order.
+    pub fn link_at(&self, t: f32) -> Option<&ActorLink> {
+        self.links.iter().rev().find(|l| l.holds(t))
+    }
+
+    /// The offset a link that keeps it gives the actor whose own pose (in the cutscene's
+    /// space) is `own`: that pose taken back from the actor's base (see [`ActorLink`]).
+    pub fn link_offset(&self, own: &Pose) -> ([f32; 3], [f32; 4]) {
+        let back = conjugate(normalize(self.rotation));
+        let d = [
+            own.position[0] - self.position[0],
+            own.position[1] - self.position[1],
+            own.position[2] - self.position[2],
+        ];
+        (rotate(back, d), mul(back, normalize(own.rotation)))
     }
 
     /// Where the actor is `t` seconds into the cutscene: the last of each kind of track
@@ -653,7 +752,7 @@ impl Tracks {
                 animations: Vec::new(),
                 places: Vec::new(),
                 camera_jumps: Vec::new(),
-                placed_elsewhere: Vec::new(),
+                links: Vec::new(),
             };
             for tr in structs(g, a, FIELD_ACTOR_TRACKS) {
                 let Some(kind) = g.field(tr, FIELD_TRACK_KIND).and_then(Value::as_u64) else {
@@ -701,7 +800,31 @@ impl Tracks {
                             by_place,
                         });
                     }
-                    TRACK_LINK_TO_ACTOR => actor.placed_elsewhere.push((start, end)),
+                    TRACK_LINK_TO_ACTOR => {
+                        let int = |l| g.field(tr, l).and_then(Value::as_i64);
+                        let flag = |l| {
+                            g.field(tr, l)
+                                .and_then(Value::as_u64)
+                                .is_some_and(|v| v != 0)
+                        };
+                        if let Some(target) = int(FIELD_LINK_TARGET) {
+                            let index = int(FIELD_LINK_NODE).unwrap_or(-1);
+                            let node = match index {
+                                i if i < 0 => LinkNode::Root,
+                                i if flag(FIELD_LINK_BY_BONE) => {
+                                    u32::try_from(i).map_or(LinkNode::Root, LinkNode::Bone)
+                                }
+                                i => LinkNode::Table(i),
+                            };
+                            actor.links.push(ActorLink {
+                                start,
+                                end,
+                                target,
+                                node,
+                                keep_offset: flag(FIELD_LINK_KEEP_OFFSET),
+                            });
+                        }
+                    }
                     TRACK_SNAP_TO_WALKMESH => actor.snaps = true,
                     TRACK_JUMP_TO_PLACE => {
                         let text = |l| {
@@ -759,36 +882,93 @@ impl Tracks {
     }
 
     /// The camera's world pose `t` seconds into the cutscene, once a cut has made one: the
-    /// camera actor's pose placed as the cutscene is (the camera reads the actor's world
-    /// position and rotation, 0x7dd6b8 -> 0x7cdd30 and 0x7cdea0, which its tracks set
-    /// through the cutscene's placement, 0x7d0660 and 0x7cf6b0), or the stage camera a
-    /// jump puts it on (see [`CameraJump`]; `camera` finds the stage's cameras). `None`
-    /// while the camera actor is placed by a track not followed (see
-    /// [`Actor::placed_elsewhere`]) or jumps to a camera the stage does not have.
-    pub fn camera_at(
+    /// camera actor's world pose (see [`Tracks::world_pose`]; the camera reads the actor's
+    /// world position and rotation, 0x7dd6b8 -> 0x7cdd30 and 0x7cdea0). `None` while it
+    /// jumps to a camera the stage does not have.
+    pub fn camera_at(&self, t: f32, placement: Placement, find: &Finders) -> Option<Pose> {
+        let id = self.cuts.iter().rev().find(|(at, _)| *at <= t)?.1;
+        let i = self.actors.iter().position(|a| a.id == id)?;
+        self.world_pose(i, t, placement, find)
+    }
+
+    /// Where actor `i` is in the world `t` seconds into the cutscene: on the stage camera a
+    /// jump puts it on (see [`CameraJump`]); carried by the node of another actor a link
+    /// holds it to (see [`ActorLink`]; `find.root` gives where a drawn actor is, and an
+    /// actor not drawn is where its own tracks put it); else where its own tracks put it
+    /// ([`Actor::stage_pose_at`]) placed as the cutscene is (its tracks set its world pose
+    /// through the cutscene's placement, 0x7d0660 and 0x7cf6b0). `None` for an actor it does
+    /// not have or a jump to a camera the stage does not have.
+    pub fn world_pose(
         &self,
+        i: usize,
         t: f32,
         placement: Placement,
-        camera: &StageCameraLookup,
+        find: &Finders,
     ) -> Option<Pose> {
-        let actor = self.camera_actor(t)?;
+        self.world_pose_within(i, t, placement, find, MAX_LINK_DEPTH)
+    }
+
+    fn world_pose_within(
+        &self,
+        i: usize,
+        t: f32,
+        placement: Placement,
+        find: &Finders,
+        depth: u32,
+    ) -> Option<Pose> {
+        let actor = self.actors.get(i)?;
         if let Some(j) = actor
             .camera_jumps
             .iter()
             .rev()
             .find(|j| j.start <= t && t <= j.end)
         {
-            return camera(&j.camera, j.by_place).map(|p| placement.pose(p));
+            return (find.camera)(&j.camera, j.by_place).map(|p| placement.pose(p));
         }
-        if actor
-            .placed_elsewhere
-            .iter()
-            .any(|&(start, end)| start <= t && t <= end)
+        let own = actor.stage_pose_at(t, find.place);
+        if let Some(link) = actor.link_at(t)
+            && depth > 0
+            && let Some(target) = self.actors.iter().position(|a| a.id == link.target)
+            && target != i
         {
-            return None;
+            let node = (find.root)(target).or_else(|| {
+                self.world_pose_within(target, t, placement, find, depth - 1)
+                    .map(|p| (p.position, p.rotation))
+            });
+            if let Some((at, turn)) = node {
+                let turn = normalize(turn);
+                let (offset, own_turn) = if link.keep_offset {
+                    actor.link_offset(&own)
+                } else {
+                    ([0.0; 3], [0.0, 0.0, 0.0, 1.0])
+                };
+                let o = rotate(turn, offset);
+                return Some(Pose {
+                    position: [at[0] + o[0], at[1] + o[1], at[2] + o[2]],
+                    rotation: mul(turn, own_turn),
+                    fov: own.fov,
+                });
+            }
         }
-        Some(placement.pose(actor.pose_at(t)))
+        Some(placement.pose(own))
     }
+}
+
+/// What places a cutscene's actors besides their tracks: its stage's cameras and places,
+/// and where its actors are drawn.
+pub struct Finders<'a> {
+    pub camera: &'a StageCameraLookup<'a>,
+    pub place: &'a PlaceLookup<'a>,
+    pub root: &'a RootLookup<'a>,
+}
+
+impl Finders<'_> {
+    /// Nothing besides the tracks: no stage, nothing drawn.
+    pub const NONE: Finders<'static> = Finders {
+        camera: &|_, _| None,
+        place: &|_| None,
+        root: &|_| None,
+    };
 }
 
 fn f32_field(g: &Gff4, id: StructId, label: u32) -> Option<f32> {
@@ -814,6 +994,11 @@ pub fn mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
 pub fn rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
     let p = mul(mul(q, [v[0], v[1], v[2], 0.0]), [-q[0], -q[1], -q[2], q[3]]);
     [p[0], p[1], p[2]]
+}
+
+/// The inverse of the unit quaternion `q` (0x4cbcb0).
+fn conjugate(q: [f32; 4]) -> [f32; 4] {
+    [-q[0], -q[1], -q[2], q[3]]
 }
 
 fn normalize(q: [f32; 4]) -> [f32; 4] {
@@ -1079,7 +1264,7 @@ mod tests {
         let t = Tracks::from_gff4(&cut());
         assert_eq!(t.cuts, [(0.5, 7)]);
         assert_eq!(t.actors.len(), 1);
-        let none = |_: &str, _: bool| None;
+        let none = Finders::NONE;
         assert!(t.camera_at(0.25, Placement::NONE, &none).is_none());
         let p = t.camera_at(1.0, Placement::NONE, &none).unwrap();
         // x 5 turned a quarter about Z is y 5, from the base at x 100.
@@ -1107,11 +1292,6 @@ mod tests {
             "{:?}",
             q.position
         );
-        // A camera linked to another actor is not followed while it is.
-        let mut linked = t.clone();
-        linked.actors[0].placed_elsewhere.push((0.75, 1.5));
-        assert!(linked.camera_at(1.0, Placement::NONE, &none).is_none());
-        assert!(linked.camera_at(1.6, Placement::NONE, &none).is_some());
         // A jump to a stage camera wins over the curves while it plays, placed as the
         // cutscene is; a camera the stage lacks gives none.
         let mut jumps = t.clone();
@@ -1121,12 +1301,16 @@ mod tests {
             camera: "wide".into(),
             by_place: false,
         });
-        let stage = |name: &str, by_place: bool| {
+        let cameras = |name: &str, by_place: bool| {
             (name == "wide" && !by_place).then_some(Pose {
                 position: [0.0, 1.0, 10.0],
                 rotation: [0.0, 0.0, 0.0, 1.0],
                 fov: 45.0,
             })
+        };
+        let stage = Finders {
+            camera: &cameras,
+            ..Finders::NONE
         };
         let j = jumps.camera_at(1.0, half, &stage).unwrap();
         assert!(
@@ -1148,6 +1332,205 @@ mod tests {
         other.file_type = FourCC::new(b"CONV");
         assert_eq!(Tracks::from_gff4(&other), Tracks::default());
         assert_eq!(Tracks::parse(b"junk"), Tracks::default());
+    }
+
+    /// `cut()` with link tracks (kind 27) on its camera: (target 5630, node 5631, bone 5636,
+    /// keep 5637) each.
+    fn cut_with_links(links: &[(i32, i32, u8, u8)]) -> Gff4 {
+        let mut g = cut();
+        let tid = g.templates.len() as u32;
+        g.templates.push(template(
+            b"ALTA",
+            &[
+                FIELD_TRACK_KIND,
+                FIELD_TRACK_START,
+                FIELD_TRACK_END,
+                FIELD_LINK_TARGET,
+                FIELD_LINK_NODE,
+                FIELD_LINK_BY_BONE,
+                FIELD_LINK_KEEP_OFFSET,
+            ],
+        ));
+        for &(target, node, bone, keep) in links {
+            let id = g.structs.len();
+            g.structs.push(StructData {
+                template: tid,
+                values: vec![
+                    Value::U8(27),
+                    Value::F32(0.75),
+                    Value::F32(1.5),
+                    Value::I32(target),
+                    Value::I32(node),
+                    Value::U8(bone),
+                    Value::U8(keep),
+                ],
+            });
+            let Value::List(Some(List::Generic(tracks))) = &mut g.structs[1].values[4] else {
+                unreachable!()
+            };
+            tracks.push(slot(id));
+        }
+        g
+    }
+
+    fn near(a: [f32; 3], b: [f32; 3]) -> bool {
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-4)
+    }
+
+    #[test]
+    fn reads_links_to_actors() {
+        let t = Tracks::from_gff4(&cut_with_links(&[
+            (9, -1, 0, 255),
+            (9, 4, 255, 0),
+            (9, 14, 0, 0),
+        ]));
+        let links = &t.actors[0].links;
+        assert_eq!(links.len(), 3);
+        assert_eq!(
+            links[0],
+            ActorLink {
+                start: 0.75,
+                end: 1.5,
+                target: 9,
+                node: LinkNode::Root,
+                keep_offset: true,
+            }
+        );
+        assert_eq!(links[1].node, LinkNode::Bone(4));
+        assert!(!links[1].keep_offset);
+        assert_eq!(links[2].node, LinkNode::Table(14));
+        // The last link holding wins; it holds a hair before its start and not at its end.
+        assert_eq!(t.actors[0].link_at(1.0), Some(&links[2]));
+        assert!(t.actors[0].link_at(0.75 - 5e-5).is_some());
+        assert!(t.actors[0].link_at(0.7).is_none());
+        assert!(t.actors[0].link_at(1.5).is_none());
+    }
+
+    /// The camera of `cut()` (id 7) linked to an actor (id 9) standing at (10, 20, 0),
+    /// unturned, from 0.75 s to 1.5 s.
+    fn linked(node: LinkNode, keep_offset: bool) -> Tracks {
+        let mut t = Tracks::from_gff4(&cut());
+        let mut target = t.actors[0].clone();
+        target.id = 9;
+        target.name = "OWNER".into();
+        target.position = [10.0, 20.0, 0.0];
+        target.rotation = [0.0, 0.0, 0.0, 1.0];
+        target.motion.clear();
+        target.turn.clear();
+        t.actors.push(target);
+        t.actors[0].links.push(ActorLink {
+            start: 0.75,
+            end: 1.5,
+            target: 9,
+            node,
+            keep_offset,
+        });
+        t
+    }
+
+    #[test]
+    fn carries_a_linked_camera_on_its_node() {
+        let t = linked(LinkNode::Root, true);
+        let none = Finders::NONE;
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        let quarter = [0.0, 0.0, h, h];
+        // At 1 s the camera's own curves are x 5, z 2, turned 90° about Z: from its base
+        // (100, 0, 0) turned a quarter, it stands at (100, 5, 2). Linked, those curves are
+        // its offset from the node, in the node's frame: (10, 20, 0) + (5, 0, 2).
+        let p = t.camera_at(1.0, Placement::NONE, &none).unwrap();
+        assert!(near(p.position, [15.0, 20.0, 2.0]), "{:?}", p.position);
+        assert!(near(rotate(p.rotation, [0.0, 1.0, 0.0]), [-1.0, 0.0, 0.0]));
+        assert_eq!(p.fov, 30.0);
+        // The node is placed as the cutscene is, and the offset turns with it.
+        let half = Placement {
+            position: [1.0, 2.0, 3.0],
+            rotation: [0.0, 0.0, 1.0, 0.0],
+        };
+        let q = t.camera_at(1.0, half, &none).unwrap();
+        assert!(near(q.position, [-14.0, -18.0, 5.0]), "{:?}", q.position);
+        assert!(near(rotate(q.rotation, [0.0, 1.0, 0.0]), [1.0, 0.0, 0.0]));
+        // Before the link and after its end, the camera's own tracks place it.
+        let own = Tracks::from_gff4(&cut());
+        for at in [0.6, 1.5, 1.6] {
+            assert_eq!(
+                t.camera_at(at, half, &none),
+                own.camera_at(at, half, &none),
+                "{at}"
+            );
+        }
+        // A drawn actor: carried by its root as drawn, whatever node the link names.
+        let drawn = |i: usize| (i == 1).then_some(([1.0, 1.0, 1.0], quarter));
+        let find = Finders {
+            root: &drawn,
+            ..Finders::NONE
+        };
+        let b = t.camera_at(1.0, half, &find).unwrap();
+        assert!(near(b.position, [1.0, 6.0, 3.0]), "{:?}", b.position);
+        for node in [LinkNode::Bone(4), LinkNode::Table(14)] {
+            assert_eq!(linked(node, true).camera_at(1.0, half, &find), Some(b));
+        }
+        // Without keeping its offset, the camera is the node's place and turn.
+        let snap = linked(LinkNode::Bone(4), false);
+        let s = snap.camera_at(1.0, half, &find).unwrap();
+        assert_eq!(s.position, [1.0, 1.0, 1.0]);
+        assert!(near(rotate(s.rotation, [0.0, 1.0, 0.0]), [-1.0, 0.0, 0.0]));
+        assert_eq!(s.fov, 30.0);
+    }
+
+    #[test]
+    fn follows_links_of_links_and_ignores_bad_ones() {
+        // A camera (id 3, unturned at the origin, offset (0, -2, 1)) linked to the camera
+        // linked to the actor: carried along both.
+        let mut t = linked(LinkNode::Root, true);
+        let mut outer = t.actors[1].clone();
+        outer.id = 3;
+        outer.position = [0.0; 3];
+        outer.motion = vec![CurveTrack {
+            start: 0.0,
+            end: f32::INFINITY,
+            curves: vec![
+                Curve::constant(0.0),
+                Curve::constant(-2.0),
+                Curve::constant(1.0),
+            ],
+        }];
+        outer.links.push(ActorLink {
+            start: 0.0,
+            end: 10.0,
+            target: 7,
+            node: LinkNode::Root,
+            keep_offset: true,
+        });
+        t.actors.push(outer);
+        t.cuts = vec![(0.0, 3)];
+        // The inner camera stands at (15, 20, 2) looking along -X; (0, -2, 1) in its
+        // frame is (2, 0, 1).
+        let p = t.camera_at(1.0, Placement::NONE, &Finders::NONE).unwrap();
+        assert!(near(p.position, [17.0, 20.0, 3.0]), "{:?}", p.position);
+        // Links in a ring end where the depth runs out; a link to itself or to an actor
+        // the cutscene lacks is ignored.
+        let mut ring = t.clone();
+        ring.actors[1].links.push(ActorLink {
+            start: 0.0,
+            end: 10.0,
+            target: 3,
+            node: LinkNode::Root,
+            keep_offset: true,
+        });
+        assert!(
+            ring.camera_at(1.0, Placement::NONE, &Finders::NONE)
+                .is_some()
+        );
+        for target in [3, 42] {
+            let mut bad = t.clone();
+            bad.actors[2].links[0].target = target;
+            let own = bad.actors[2].pose_at(1.0);
+            assert_eq!(
+                bad.camera_at(1.0, Placement::NONE, &Finders::NONE),
+                Some(own),
+                "{target}"
+            );
+        }
     }
 
     #[test]

@@ -160,7 +160,7 @@ struct Args {
     /// that long), `key i` (the inventory toggle; `c`, `t`, `m`, `j` and `o` likewise toggle the
     /// character record, tactics, area map, journal and options), `key f1`-`key f4` (who
     /// leads), `key 1`-`key 0` (quickbar slots), `key space` (pause), `talk TAG` (the leader
-    /// talks to a creature),
+    /// talks to a creature), `cutscene NAME` (a cutscene plays, as a script would play it),
     /// `reply N` (the conversation's reply N, from 0), `press X,Y` and `release X,Y` (the
     /// left button down and up, for drags), `rebuild` (the objects are rebuilt as a
     /// spawn rebuilds them, timed), `picker` (the party picker opens as a script would open
@@ -1696,6 +1696,12 @@ impl App {
                 }
                 log.push(format!("plot {plot} {flag}"));
             }
+            Step::Cutscene(name) => {
+                if let Some(l) = self.live.as_ref() {
+                    l.sim().world.cutscenes.push(name.clone());
+                }
+                log.push(format!("cutscene {name}"));
+            }
             &Step::Menu(m) => {
                 self.key_down(match m {
                     screens::Screen::CharacterRecord => KeyCode::KeyC,
@@ -2907,6 +2913,9 @@ enum Step {
     /// Sets a plot flag as a script would (`plot plt_tut_explore 0`), running the plot's
     /// script, for trying journal entries and tutorial popups headless.
     Plot(String, i32),
+    /// A cutscene plays as a script's `CS_LoadCutscene` queues it (`cutscene 25860_m`), for
+    /// trying cutscenes headless where the story would play them.
+    Cutscene(String),
     /// The player does a training action (`training MAXIMUM_ZOOM_IN`): the training step
     /// waiting for it hears of it (`EVENT_TYPE_TRAINING_<name>`, see `thedas_sim::training`).
     Training(String),
@@ -3155,6 +3164,7 @@ fn parse_step(s: &str) -> Result<Step> {
             }
         }
         "talk" if !arg.is_empty() => Step::Talk(arg.to_string()),
+        "cutscene" if !arg.is_empty() => Step::Cutscene(arg.to_string()),
         "use" if !arg.is_empty() => Step::Use(arg.to_string()),
         "rebuild" => Step::Rebuild,
         "picker" => Step::Picker,
@@ -3605,6 +3615,10 @@ fn main() -> Result<()> {
                             thedas_script::vm::OBJECT_INVALID,
                         );
                         println!("plot {plot} {flag}");
+                    }
+                    Step::Cutscene(name) => {
+                        l.sim().world.cutscenes.push(name.clone());
+                        println!("cutscene {name}");
                     }
                     &Step::Menu(m) => {
                         if let Some((layer, s)) = played.as_mut() {
