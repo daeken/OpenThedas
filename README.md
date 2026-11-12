@@ -38,7 +38,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
 - 🟡 **Exploration and camera**:
   - Walking, click-to-pick, doors and companions following. Followers come along on area changes, and they stand in the exe's formation slots and follow by its rules.
   - The area map shows map notes and only perceived enemies.
-  - The follow camera uses the exe's 0.25 m sphere sweep, pull-in and ease-out, and its starting shot (3 m behind, at the leader's height). With tutorials on, the original instead opens a new game in the tactical overhead view (its first training step zooms the camera out by script); that part is in progress.
+  - The follow camera uses the exe's 0.25 m sphere sweep, pull-in and ease-out, and its starting shot (3 m behind, at the leader's height). With tutorials on, a new game's first control is the tactical overhead view, as in the original: the first training step zooms fully out (`SetZoomLevel`), and zooming back in by wheel, Page Down or the pad ends the step. Page Up and Page Down zoom while held.
   - Doors are posed by their state (open, Open_2, swinging, fallen), and their camera and click shapes follow the pose.
   - With a pad, walking aims at a point ahead and the route goes round obstacles; it no longer stops dead at the first one.
   - Creatures the camera is inside fade out as the exe does (0.25 m sphere against the models' creature-group physics shapes, head included; opacity 0.05; not in dialog or cutscenes). Provisional: the shapes are placed by rest pose, not the animated skeleton.

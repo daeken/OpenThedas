@@ -3639,6 +3639,19 @@ pub fn call(
         // DAOrigins.exe's SetCanLevelUp (0x662ea0 -> 0x6aca10) ignores its value: whether a
         // creature can level up is whether it has points to spend (attribute, skill and
         // talent points, properties 34-36).
+        // The explore camera's zoom (0x666790 sets its target to 2z - 1, which its update
+        // eases the zoom to): kept for the presentation, which applies each request once.
+        "SetZoomLevel" => {
+            let level = float(a, 0);
+            let level = if level.is_finite() {
+                level.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let seq = h.sim.world.zoom_request.map_or(0, |r| r.1).wrapping_add(1);
+            h.sim.world.zoom_request = Some((level, seq));
+            void()
+        }
         "SetCanLevelUp" => {
             let who = obj(a, 0);
             let points: f32 = [34, 35, 36]
@@ -5946,7 +5959,8 @@ mod coverage_tests {
         void Engine_ApplyEffectAtLocation(int d, effect e, location l, float f = 0.0, object c = OBJECT_INVALID, int n = 0) = 111;\n\
         effect[] GetEffects(object o, int t = 0, int a = 0, object c = OBJECT_INVALID, int d = 0, int i = -1) = 112;\n\
         void RemoveEffect(object o, effect e) = 113;\n\
-        void SetGameMode(int n) = 114;\n";
+        void SetGameMode(int n) = 114;\n\
+        void SetZoomLevel(float f) = 115;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -6792,6 +6806,18 @@ mod coverage_tests {
             &[Value::String("SND_BELLS".into()), Value::Int(1)],
         );
         assert!(active(&s, bells));
+    }
+
+    #[test]
+    fn zoom_requests_count_up_and_raise_no_training_event() {
+        let mut s = sim();
+        assert_eq!(s.world.zoom_request, None);
+        run(&mut s, 1, "SetZoomLevel", &[Value::Float(0.0)]);
+        assert_eq!(s.world.zoom_request, Some((0.0, 1)));
+        run(&mut s, 1, "SetZoomLevel", &[Value::Float(2.0)]);
+        assert_eq!(s.world.zoom_request, Some((1.0, 2)));
+        // A script's zoom never counts as the player's: nothing is queued for training.
+        assert!(s.world.queue.is_empty());
     }
 
     #[test]
