@@ -57,6 +57,20 @@ pub enum AbilityArea {
 }
 
 impl Sim {
+    /// Whether an ability's `ABI_base` icon is `hidden`: the class abilities (4022 Warrior,
+    /// 4023 Mage, ...) and other bookkeeping abilities the screens never show. The quickbar
+    /// leaves them off (its movie has no `hidden.dds` to draw). Provisional: the exe's own
+    /// placement rule is not traced; the icon is the tell the data gives.
+    pub fn ability_hidden(&self, ability: i32) -> bool {
+        matches!(
+            self.world
+                .tables()
+                .get(0, "ABI_base")
+                .and_then(|t| t.cell("Icon", ability as i64).cloned()),
+            Some(Cell::String(s)) if s.trim_end_matches('\0').trim().eq_ignore_ascii_case("hidden")
+        )
+    }
+
     pub(crate) fn abi_int(&self, ability: i32, column: &str) -> i32 {
         match self
             .world
@@ -213,6 +227,12 @@ impl Sim {
     /// documents (the game's scripts pass −1 2000 times). Provisional: an ability or item
     /// already set in a slot is not set again in another.
     pub fn set_quickslot(&mut self, who: ObjectId, slot: i32, ability: i32, item: &str) {
+        // A hidden ability (a class's, see [`Sim::ability_hidden`]) is not put on the bar:
+        // the scripts add the class ability "to the quickbar" with the rest, and the
+        // original's bar shows no gap for it. Provisional.
+        if ability > 0 && item.is_empty() && self.ability_hidden(ability) {
+            return;
+        }
         let Some(o) = self.world.get_mut(who) else {
             return;
         };
@@ -319,13 +339,18 @@ impl Sim {
             .quickslots
             .iter()
             .filter(|(s, _)| (0..QUICKSLOTS).contains(*s))
+            // A hidden ability placed by an earlier build (saves made before the rule)
+            // leaves its slot empty.
+            .filter(|(_, q)| !(q.item.is_empty() && self.ability_hidden(q.ability)))
             .map(|(s, q)| (*s, q.clone()))
             .collect();
         let placed: Vec<i32> = bar.iter().map(|(_, q)| q.ability).collect();
         let was_placed = |q: &Quickslot| o.quick_placed.contains(&quick_key(q));
-        let mut free = (0..QUICKSLOTS).filter(|s| !o.quickslots.contains_key(s));
+        let taken: Vec<i32> = bar.iter().map(|(s, _)| *s).collect();
+        let mut free = (0..QUICKSLOTS).filter(|s| !taken.contains(s));
         for &ability in &o.abilities {
             if placed.contains(&ability)
+                || self.ability_hidden(ability)
                 || !OWN_ABILITY_TYPES.contains(&self.abi_int(ability, "AbilityType"))
                 || !matches!(
                     self.ability_use_type(ability),
