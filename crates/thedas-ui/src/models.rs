@@ -70,11 +70,26 @@ pub const BODY_PARTS: [(&str, &str); 3] = [
 /// known; found by matching every base item against the variation tables' ids).
 pub const COL_VARIATION_TABLE: u32 = 0x43b5_4707;
 
-/// Where weapons hang: the main hand's and the off hand's attachment nodes, under the
-/// wrists of the humanoid skeletons. Provisional: weapons are shown drawn, whatever the
-/// creature is doing.
+/// Where weapons hang when no table says: the main hand's and the off hand's attachment
+/// nodes, under the wrists of the humanoid skeletons (`weaponparts.gda` rows 14 and 15).
 pub const MAIN_HAND_NODE: &str = "Prop01";
 pub const OFF_HAND_NODE: &str = "Prop02";
+
+/// `BITM_base.gda`'s `weaponparts.gda` rows a base item hangs from (column names not known):
+/// sheathed from the main hand's slot and from the off hand's, drawn in the main hand's and
+/// in the off hand's. The executable picks among the four at 0x6a64b0 (drawn, and main
+/// hand, select the column; the cutscenes' `ActionDrawWeapon`, 0x7d1210, reads them too).
+/// A longsword is sheathed on the upper right back (`Prop10`) and drawn into the right hand
+/// (`Prop01`); a shield goes on the back (`Prop11`) and onto the left forearm (`Prop03`); a
+/// bow on the back (`Prop17`) and into the left hand (`Prop02`).
+pub const COL_SHEATHED_MAIN: u32 = 0x7083_f7d4;
+pub const COL_SHEATHED_OFF: u32 = 0xa4c2_c80b;
+pub const COL_DRAWN_MAIN: u32 = 0x4885_9b70;
+pub const COL_DRAWN_OFF: u32 = 0x9cc4_a4af;
+
+/// `weaponparts.gda`'s attachment node name (`Prop10`; column name not known, read by the
+/// executable at 0x7d3da2 and 0xa66bfb).
+pub const COL_PART_NODE: u32 = 0x9002_8895;
 
 fn text(cell: Option<&Cell>) -> Option<String> {
     match cell? {
@@ -517,22 +532,57 @@ fn equipment_tints(
     out
 }
 
-/// The creature's weapons in its hands.
+/// The creature's weapons: drawn into its hands while it is in combat, else sheathed (see
+/// [`weapon_node`]). In the hands they sit in the grip only once the combat stance closes
+/// the hands around them (the combat animation trees animate the fingers; nothing else
+/// poses them). Provisional: the original draws and sheathes them with animations
+/// (`COMMAND_UNSHEATHEWEAPONS`, `COMMAND_SHEATHEWEAPONS`) whose timing is not traced; here
+/// they are drawn for as long as the creature's combat state (`GetCombatState`) is set.
 fn weapons(sim: &Sim, o: &Object, gear: Gear) -> Vec<Attached> {
+    let drawn = o.combat.in_combat;
     [
-        ("INVENTORY_SLOT_MAIN", MAIN_HAND_NODE),
-        ("INVENTORY_SLOT_OFFHAND", OFF_HAND_NODE),
+        ("INVENTORY_SLOT_MAIN", true),
+        ("INVENTORY_SLOT_OFFHAND", false),
     ]
     .into_iter()
-    .filter_map(|(slot_name, node)| {
-        let (ty, v) = item_variation(sim, equipped_in(sim, o, slot_name, gear)?)?;
+    .filter_map(|(slot_name, main)| {
+        let item = equipped_in(sim, o, slot_name, gear)?;
+        let (ty, v) = item_variation(sim, item)?;
         let model = format!("w_{ty}_{v}{LOD0}");
-        has_model(sim, &model).then(|| Attached {
-            model,
-            node: node.to_string(),
-        })
+        let node = weapon_node(sim, item, main, drawn)?;
+        has_model(sim, &model).then_some(Attached { model, node })
     })
     .collect()
+}
+
+/// The node an item hangs from: `BITM_base.gda`'s part for its slot (main or off hand) and
+/// state (drawn or sheathed), named by `weaponparts.gda`. `None` when the item has no part
+/// there (part 0: a shield is not sheathed from the main hand's slot). Without the tables,
+/// the hands' nodes.
+pub fn weapon_node(sim: &Sim, item: &Object, main: bool, drawn: bool) -> Option<String> {
+    let hand = || Some(if main { MAIN_HAND_NODE } else { OFF_HAND_NODE }.to_string());
+    let tables = sim.world.tables();
+    let (Some(bitm), Some(parts), Some(&base)) = (
+        tables.get(0, "bitm_base"),
+        tables.get(0, "weaponparts"),
+        item.fields.get("BaseItem"),
+    ) else {
+        return hand();
+    };
+    let col = match (drawn, main) {
+        (false, true) => COL_SHEATHED_MAIN,
+        (false, false) => COL_SHEATHED_OFF,
+        (true, true) => COL_DRAWN_MAIN,
+        (true, false) => COL_DRAWN_OFF,
+    };
+    let part = match bitm.cell_by_hash(col, base as i64) {
+        Some(Cell::Int(p)) => *p,
+        _ => return hand(),
+    };
+    if part <= 0 {
+        return None;
+    }
+    text(parts.cell_by_hash(COL_PART_NODE, part))
 }
 
 /// An animation to play: the first of `actions` in the first of `trees` (`.anb`) that has
@@ -948,6 +998,68 @@ mod tests {
         assert!(calm != fighting);
         s.world.chargen = Some(c);
         assert!(key(&s) != fighting);
+    }
+
+    #[test]
+    fn weapons_hang_from_the_parts_their_base_item_names() {
+        use std::sync::Arc;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let table = Arc::new(EngineTable::parse(b"int X = 0;\n".as_slice()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let item = |s: &mut Sim, base: i32| {
+            let id = s.world.spawn(ObjectKind::Item, "item");
+            let o = s.world.get_mut(id).unwrap();
+            o.fields.insert("BaseItem".into(), base);
+            id
+        };
+        // No tables: the hands.
+        let sword = item(&mut s, 2);
+        let node = |s: &Sim, id, main, drawn| weapon_node(s, s.world.get(id).unwrap(), main, drawn);
+        assert_eq!(
+            node(&s, sword, true, false).as_deref(),
+            Some(MAIN_HAND_NODE)
+        );
+        assert_eq!(node(&s, sword, false, true).as_deref(), Some(OFF_HAND_NODE));
+        let t = s.world.tables();
+        let cols = [
+            format!("#{COL_SHEATHED_MAIN:08x}"),
+            format!("#{COL_SHEATHED_OFF:08x}"),
+            format!("#{COL_DRAWN_MAIN:08x}"),
+            format!("#{COL_DRAWN_OFF:08x}"),
+        ];
+        let cols: Vec<&str> = cols.iter().map(String::as_str).collect();
+        let parts = |v: [i64; 4]| v.map(Cell::Int).to_vec();
+        // As the game's: a longsword, and a shield (not sheathed from the main hand).
+        t.insert(
+            "bitm_base",
+            &cols,
+            vec![(2, parts([5, 10, 14, 15])), (6, parts([0, 8, 0, 16]))],
+        );
+        let st = |v: &str| Cell::String(v.into());
+        t.insert(
+            "weaponparts",
+            &[&format!("#{COL_PART_NODE:08x}")],
+            [
+                (5, "Prop10"),
+                (8, "Prop11"),
+                (10, "Prop07"),
+                (14, "Prop01"),
+                (15, "Prop02"),
+                (16, "Prop03"),
+            ]
+            .into_iter()
+            .map(|(r, n)| (r, vec![st(n)]))
+            .collect(),
+        );
+        let shield = item(&mut s, 6);
+        assert_eq!(node(&s, sword, true, false).as_deref(), Some("Prop10"));
+        assert_eq!(node(&s, sword, false, false).as_deref(), Some("Prop07"));
+        assert_eq!(node(&s, sword, true, true).as_deref(), Some("Prop01"));
+        assert_eq!(node(&s, sword, false, true).as_deref(), Some("Prop02"));
+        assert_eq!(node(&s, shield, false, false).as_deref(), Some("Prop11"));
+        assert_eq!(node(&s, shield, false, true).as_deref(), Some("Prop03"));
+        assert_eq!(node(&s, shield, true, false), None);
     }
 
     #[test]
