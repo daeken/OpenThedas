@@ -953,6 +953,22 @@ impl UiLayer {
         self.show_cutscene_line(sim);
         self.show_script_popup(sim);
         let mut messages = self.stage.tick(dt_ms);
+        // A script message box's answer carries the text typed into it, which the box set
+        // as `GUIPopupLayer.InputText` just before (popuplayer.gfx's `OnButtonAction`); the
+        // exe passes it on as the result event's string 0 (0x709971).
+        for m in &mut messages {
+            if let GameMessage::Send(name, args) = m {
+                if name == thedas_ui::input::SCRIPT_DIALOG_RESULT {
+                    let typed = match self.stage.bridge.value("GUIPopupLayer.InputText") {
+                        Some(thedas_ui::UiValue::String(s)) => s,
+                        _ => String::new(),
+                    };
+                    args.truncate(3);
+                    args.resize(3, String::new());
+                    args.push(typed);
+                }
+            }
+        }
         if std::mem::take(&mut self.continue_pending) {
             messages.push(GameMessage::Send(
                 "Conversation.SelectResponse".into(),
