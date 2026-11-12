@@ -53,6 +53,13 @@ pub struct Gear {
     pub size: Option<u32>,
 }
 
+/// A sound set's lines (`sse_<set>.gda`: row -> strref) and each type's number of them
+/// (`sst_<set>.gda`: type -> count).
+type SoundSetLines = (
+    std::collections::HashMap<i64, i64>,
+    std::collections::HashMap<i64, i64>,
+);
+
 /// A party-picker member: id, template, sound set, position.
 pub type PickerMember = (u32, String, Option<String>, [f32; 3]);
 
@@ -102,6 +109,8 @@ pub struct AudioState {
     pub listener: Option<([f32; 3], [f32; 3])>,
     /// Where the party leader stands (reverb triggers follow it).
     pub leader: Option<[f32; 3]>,
+    /// Whether the hero is female.
+    pub hero_female: bool,
     /// The area's sound objects the simulation has switched off (`ActivateSoundByTag`), by
     /// tag (lowercase).
     pub inactive_sounds: Vec<String>,
@@ -198,6 +207,12 @@ pub struct GameAudio {
     /// `sound_movement_scuffing.gda` (rows: ground material).
     footsteps: Option<thedas_formats::Gda>,
     scuffs: Option<thedas_formats::Gda>,
+    /// `sound_bodyfall_creat_size.gda` (rows: ground material; columns: size),
+    /// `sound_bodyfall_foley.gda` (rows: ground material; columns: armour material by
+    /// label) and `sound_item_materials.gda`'s labels (sound material -> that column).
+    bodyfalls: Option<thedas_formats::Gda>,
+    bodyfall_foley: Option<thedas_formats::Gda>,
+    item_material_labels: std::collections::HashMap<i64, u32>,
     /// `sound_vegetation_type.gda`, worksheet 155 "Sound Movement Vegetation" (rows:
     /// vegetation; columns: size `small`/`medium`/`large`).
     vegetation: Option<thedas_formats::Gda>,
@@ -214,7 +229,11 @@ pub struct GameAudio {
     /// `ss_types.gda`: each sound set type's first entry row and default probability.
     ss_types: std::collections::HashMap<i32, (i64, f32)>,
     /// Each sound set's entries (`sse_<set>.gda`: entry row -> line strref), read once.
-    sound_set_entries: std::collections::HashMap<String, Arc<Vec<(i64, i64)>>>,
+    sound_set_entries: std::collections::HashMap<String, Arc<SoundSetLines>>,
+    /// Per (set, type): the lines not yet drawn from its bag.
+    sound_set_bags: std::collections::HashMap<(String, i32), Vec<i64>>,
+    /// Whether the hero is female (sound set lines prefer their `_f` events).
+    hero_female: bool,
     rng: u64,
     /// `partypicker.gda`: each follower template's picked and unpicked sound set entries
     /// ("default" for any other).
@@ -247,6 +266,27 @@ pub fn footstep_column(cell: Option<&thedas_formats::gda::Cell>) -> u32 {
         _ => "Unknown",
     };
     thedas_formats::gda::column_hash(name)
+}
+
+/// `sound_item_materials.gda`: each sound material's label (`Armor-leather`, ...) as a
+/// column hash, the column DAOrigins.exe's bodyfall reads its armour sweetener from
+/// (0x5b6f60: the row's `Label`, hashed).
+fn item_material_labels(vfs: &Vfs) -> std::collections::HashMap<i64, u32> {
+    use thedas_formats::gda::Cell;
+    let mut out = std::collections::HashMap::new();
+    let Some(t) = read_gda(vfs, "sound_item_materials.gda") else {
+        return out;
+    };
+    let Some(lc) = t.columns.iter().position(|c| c.hash == 0xb49c_a166) else {
+        return out;
+    };
+    for row in &t.rows {
+        if let (Some(Cell::Int(id)), Some(Cell::String(label))) = (row.first(), row.get(lc)) {
+            let label = label.trim_end_matches('\0').trim();
+            out.insert(*id, thedas_formats::gda::column_hash(label));
+        }
+    }
+    out
 }
 
 fn read_gda(vfs: &Vfs, name: &str) -> Option<thedas_formats::Gda> {
@@ -577,12 +617,17 @@ impl GameAudio {
             footsteps: read_gda(vfs, "sound_movement_footsteps.gda"),
             scuffs: read_gda(vfs, "sound_movement_scuffing.gda"),
             vegetation: read_gda(vfs, "sound_vegetation_type.gda"),
+            bodyfalls: read_gda(vfs, "sound_bodyfall_creat_size.gda"),
+            bodyfall_foley: read_gda(vfs, "sound_bodyfall_foley.gda"),
+            item_material_labels: item_material_labels(vfs),
             rustles: Default::default(),
             impacts: Impacts::read(vfs),
             foley: Foley::read(vfs),
             music_state: 1.0,
             ss_types: ss_types(vfs),
             sound_set_entries: Default::default(),
+            sound_set_bags: Default::default(),
+            hero_female: false,
             rng: 0x2545_f491_4f6c_dd1d,
             template_sets: Default::default(),
             picker_lines: picker_lines(vfs),
@@ -630,80 +675,132 @@ impl GameAudio {
         self.rng
     }
 
-    /// A line of sound set `set` of type `entry` (`ss_types.gda`): one of the set's entries
-    /// for that type (`sse_<set>.gda` rows from the type's first row on, below the next
-    /// type's) at random, said with the type's probability (or the override). It plays the
-    /// set's `VO/VOambient_ss` event with the line's sample (`<strref>_m`, else `_f`).
-    /// Provisional: which event a set's lines use, and engine-side throttling (the
-    /// `sound_settings.gda` playback limits) beyond the event's own max playbacks.
+    /// A line of sound set `set` of type `entry` (`ss_types.gda`), as DAOrigins.exe's
+    /// sound-set player says it (0x6b5740):
+    /// - `sst_<set>.gda` gives the type's number of lines `n` (column 0x1bd4c5a2, row = the
+    ///   type); none, nothing is said. The lines are `sse_<set>.gda` rows `100 * type + k`
+    ///   for `k < n` (column 0xd7bb7367: the line's strref).
+    /// - With more than one, the next is drawn from a bag of the type's lines that refills
+    ///   once all have been drawn (0x5b8890, 0x5b8970), whether or not it is then said.
+    /// - It is said with probability `probability` (0: the type's, `ss_types.gda` column
+    ///   0xa3000ead), against `(rand() % 100 + 1) / 100`.
+    /// - The line is named as a conversation line is (0x7f2b70): `<set>/VO/<strref>` with
+    ///   `_f` for a female hero when the event `<set>/VO/<strref>_f` exists, else `_m`. An
+    ///   event of that name (creature sets: `ss_wolf/VO/179451_m`, which picks among the
+    ///   line's variants) plays as itself; otherwise the set's `VO/VOambient_ss` plays the
+    ///   sample of that name (voiced sets: `179996_m`).
+    ///
+    /// Provisional: the bag's draw order (taken as random), a per-creature multiplier on
+    /// the probability for some types (table 0x119, column 0x29f4e2fb, when the type's
+    /// column 0x6ddd6b8b is set) and a creature flag (+0x969) that makes it certain; how
+    /// the name is played (the event when it exists, else the sample) is inferred from the
+    /// data, as the builder returns both.
     fn say_sound_set(&mut self, set: &str, entry: i32, probability: f32, at: Option<[f32; 3]>) {
-        let Some(&(base, p)) = self.ss_types.get(&entry) else {
+        let Some(&(_, p)) = self.ss_types.get(&entry) else {
             log::debug!("audio: no sound set type {entry}");
             return;
         };
-        let chance = if probability > 0.0 { probability } else { p };
-        if (self.random() % 10_000) as f32 / 10_000.0 >= chance {
-            return;
-        }
         let key = set.to_ascii_lowercase();
         let entries = match self.sound_set_entries.get(&key) {
             Some(e) => e.clone(),
             None => {
                 use thedas_formats::gda::Cell;
-                let rows: Vec<(i64, i64)> = self
-                    .vfs
-                    .read(&format!("sse_{key}.gda"))
-                    .ok()
-                    .and_then(|(d, _)| thedas_formats::Gda::parse(&d).ok())
-                    .map(|t| {
-                        t.rows
-                            .iter()
-                            .filter_map(|r| match (r.first(), r.get(1)) {
-                                (Some(Cell::Int(id)), Some(Cell::Int(s))) => Some((*id, *s)),
-                                _ => None,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let rows = Arc::new(rows);
-                self.sound_set_entries.insert(key.clone(), rows.clone());
-                rows
+                let rows: std::collections::HashMap<i64, i64> =
+                    read_gda(&self.vfs, &format!("sse_{key}.gda"))
+                        .map(|t| {
+                            let col = t
+                                .columns
+                                .iter()
+                                .position(|c| c.hash == 0xd7bb_7367)
+                                .unwrap_or(1);
+                            t.rows
+                                .iter()
+                                .filter_map(|r| match (r.first(), r.get(col)) {
+                                    (Some(Cell::Int(id)), Some(Cell::Int(s))) => Some((*id, *s)),
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                let counts: std::collections::HashMap<i64, i64> =
+                    read_gda(&self.vfs, &format!("sst_{key}.gda"))
+                        .map(|t| {
+                            let col = t
+                                .columns
+                                .iter()
+                                .position(|c| c.hash == 0x1bd4_c5a2)
+                                .unwrap_or(1);
+                            t.rows
+                                .iter()
+                                .filter_map(|r| match (r.first(), r.get(col)) {
+                                    (Some(Cell::Int(id)), Some(Cell::Int(n))) => Some((*id, *n)),
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                let e = Arc::new((rows, counts));
+                self.sound_set_entries.insert(key.clone(), e.clone());
+                e
             }
         };
-        let lines: Vec<i64> = entries
-            .iter()
-            .filter(|(id, s)| *id >= base && *id < base + 100 && *s > 0)
-            .map(|(_, s)| *s)
-            .collect();
-        if lines.is_empty() {
+        let (rows, counts) = &*entries;
+        let n = counts.get(&(entry as i64)).copied().unwrap_or(0);
+        if n <= 0 {
             return;
         }
-        let strref = lines[(self.random() % lines.len() as u64) as usize];
-        // Creature sets (`ss_wolf`) have an event per line, `<set>/VO/<strref>_m` (in
-        // `CRambient_ss`), that picks among the line's variants; voiced sets only have the
-        // samples, played through `VOambient_ss`.
-        for g in ["m", "f"] {
-            let event = format!("{key}/VO/{strref}_{g}");
-            let project = self.engine.library.project(&key);
-            if project.is_some_and(|p| p.event(&event).is_some()) {
-                self.engine.play(
-                    &event,
-                    PlayOptions {
-                        position: at,
-                        ..Default::default()
-                    },
-                );
-                return;
+        let first = 100 * entry as i64;
+        let strref = if n == 1 {
+            rows.get(&first).copied()
+        } else {
+            let bag_key = (key.clone(), entry);
+            if self
+                .sound_set_bags
+                .get(&bag_key)
+                .is_none_or(|b| b.is_empty())
+            {
+                let all: Vec<i64> = (0..n)
+                    .filter_map(|k| rows.get(&(first + k)).copied())
+                    .collect();
+                self.sound_set_bags.insert(bag_key.clone(), all);
             }
-        }
-        let lib = self.engine.library.clone();
-        let sample = [format!("{strref}_m"), format!("{strref}_f")]
-            .into_iter()
-            .find(|s| lib.find_sample(&key, s).is_some());
-        let Some(sample) = sample else {
-            log::debug!("audio: sound set {key} has no sample for {strref}");
+            let r = self.random();
+            self.sound_set_bags
+                .get_mut(&bag_key)
+                .and_then(|b| (!b.is_empty()).then(|| b.swap_remove((r % b.len() as u64) as usize)))
+        };
+        let Some(strref) = strref.filter(|s| *s > 0) else {
             return;
         };
+        let chance = if probability > 0.0 { probability } else { p };
+        let roll = (self.random() % 100 + 1) as f32 / 100.0;
+        if chance < roll {
+            return;
+        }
+        let project = self.engine.library.project(&key);
+        let has_event = |name: &str| project.as_ref().is_some_and(|p| p.event(name).is_some());
+        let female_event = format!("{key}/VO/{strref}_f");
+        let suffix = if self.hero_female && has_event(&female_event) {
+            "f"
+        } else {
+            "m"
+        };
+        let event = format!("{key}/VO/{strref}_{suffix}");
+        if has_event(&event) {
+            self.engine.play(
+                &event,
+                PlayOptions {
+                    position: at,
+                    ..Default::default()
+                },
+            );
+            return;
+        }
+        let sample = format!("{strref}_{suffix}");
+        if self.engine.library.find_sample(&key, &sample).is_none() {
+            log::debug!("audio: sound set {key} has no event or sample for {strref}_{suffix}");
+            return;
+        }
         self.engine.play(
             &format!("{key}/VO/VOambient_ss"),
             PlayOptions {
@@ -831,6 +928,41 @@ impl GameAudio {
                         let col = thedas_formats::gda::column_hash(size.trim());
                         let m = self.impacts.material(g.armour).unwrap_or(0);
                         self.foley.cell("movement", Some(m), col)
+                    }
+                    // A bodyfall (kind 18: 0x6a5ad0 -> 0x5b8cc1): the body's event from
+                    // `sound_bodyfall_creat_size.gda` (the ground's material, the creature's
+                    // size), and its armour's from `sound_bodyfall_foley.gda` (the ground's
+                    // material, the armour's sound material by label), where there is one.
+                    // Provisional: the creature's armour material (+0x930) is taken from
+                    // its chest item, as for its foley.
+                    (18, _) => {
+                        let g = gear.get(&id).copied().unwrap_or_default();
+                        let row = (g.surface & 0xf) as i64;
+                        let armour = self.impacts.material(g.armour).unwrap_or(0);
+                        log::trace!(
+                            "audio: bodyfall: armour item {:?} material {armour}",
+                            g.armour
+                        );
+                        let sweetener = self.item_material_labels.get(&armour).and_then(|col| {
+                            self.bodyfall_foley
+                                .as_ref()
+                                .and_then(|t| table_event(t, row, *col))
+                        });
+                        if let Some(e) = sweetener {
+                            self.engine.play(
+                                &e,
+                                PlayOptions {
+                                    position: Some(pos),
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                        let size = g
+                            .size
+                            .unwrap_or(thedas_formats::gda::column_hash("Unknown"));
+                        self.bodyfalls
+                            .as_ref()
+                            .and_then(|t| table_event(t, row, size))
                     }
                     // A footstep (0x6aaaa0 -> 0x5b8d51): the ground's material under the
                     // creature picks the row; an event marked `|Scuff` plays the scuffing
@@ -1201,6 +1333,7 @@ impl GameAudio {
 
     fn frame_dt(&mut self, mut state: AudioState, dt: f32) {
         self.engine.volumes = state.volumes;
+        self.hero_female = state.hero_female;
         if let Some((pos, right)) = state.listener {
             self.engine.set_listener(pos, right);
         }
