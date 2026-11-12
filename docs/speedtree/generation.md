@@ -972,7 +972,7 @@ The game ignores the file's `near` and `far` and computes its own per placement:
   t = (clamp(r, 2, 30) − 2) / 28; near = (15 + 5·t) · M, far = (35 + 85·t) · M, with
   M from a three-entry table indexed by the placement's LOD class (RML field 3379, a signed
   byte): class 0 → 1, class 1 → 1.5, class 2 → 2. Every Korcari Wilds placement has class 0.
-  Other values were not seen; the game does not range-check the index, so clamping to 0–2 is
+  Other values were not seen and how the game treats them is not traced; clamping to 0–2 is
   an acceptable choice.
 - Each frame, with d² the squared distance from the camera to the placement point (not the
   box centre) and G = (detail scale × zoom)² (detail scale 0.5, 1.0, 1.2 or 1.5 by the
