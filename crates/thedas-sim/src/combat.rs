@@ -240,10 +240,16 @@ impl Sim {
         let blocked = |a: [f32; 3], b: [f32; 3]| Sim::door_between(&doors, a, b);
         // Walls block noticing (`nav::wall_between`); once noticed, a creature is kept
         // track of round corners out to the visual radius.
+        // A hostile's sight line is a ray through the level's collision from 1.8 m above
+        // each one's feet (see `crate::collision`); without the level's collision files, the
+        // pathing grid's walls stand in.
         let grid = self.nav_grid(area);
-        let wall = |a: [f32; 3], b: [f32; 3]| {
-            grid.as_ref()
-                .is_some_and(|g| crate::nav::wall_between(g, a, b))
+        let solid = self.collision(area).filter(|c| !c.is_empty());
+        let wall = |a: [f32; 3], b: [f32; 3]| match &solid {
+            Some(c) => c.sight_blocked(a, b),
+            None => grid
+                .as_ref()
+                .is_some_and(|g| crate::nav::wall_between(g, a, b)),
         };
         for &(id, pos) in &creatures {
             let alive = self.alive(id);
