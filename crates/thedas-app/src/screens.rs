@@ -62,6 +62,8 @@ impl Screen {
                 "notifications.gfx",
                 "navbar.gfx",
                 "tooltips.gfx",
+                // Its tutorial popups (`Tutorials.TutorialList`).
+                "popuplayer.gfx",
             ],
             Screen::Cutscene => &["cutscene.gfx"],
             Screen::Conversation => &["conversation.gfx"],

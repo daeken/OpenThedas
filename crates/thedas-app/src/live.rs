@@ -226,6 +226,10 @@ impl Live {
         if self.paused || self.front_end {
             return;
         }
+        // A tutorial that pauses the game holds it until its popup is dismissed.
+        if self.sim().world.tutorial_paused {
+            return;
+        }
         self.owed_ms += dt_ms.clamp(0.0, MAX_STEP_MS);
         let whole = self.owed_ms.floor();
         if whole >= 1.0 {

@@ -60,6 +60,10 @@ pub struct PlotInfo {
     /// The flags that end the quest (field 13005 non-zero: 255 on a quest's reward or ending
     /// flags). Provisional.
     pub finals: std::collections::BTreeSet<i32>,
+    /// Whether the game pauses while this tutorial's popup shows (field 13023 non-zero; 255
+    /// on `plt_tut_combat_basic` and `plt_tut_combat_basic_magic`), as DAOrigins.exe reads
+    /// it (0x75f350, field 0x32df) when it queues a tutorial (0x693f10).
+    pub pauses: bool,
 }
 
 impl PlotInfo {
@@ -149,6 +153,7 @@ pub fn plots_from_gff4(g: &Gff4, resref: &str) -> Vec<PlotInfo> {
             priority: g.field(p, 13010).and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             parent: s(g, p, 13017).map(|r| r.to_ascii_lowercase()),
             finals,
+            pauses: g.field(p, 13023).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
         });
     }
     out
@@ -325,10 +330,14 @@ impl Sim {
         let defined = flag >= DEFINED_FLAGS;
         if !defined {
             self.world.plots.insert((key.clone(), flag), value);
-            // A stored flag with journal text makes the quest's latest entry.
+            // A stored flag with journal text makes the quest's latest entry; a tutorial's
+            // newly set flag queues its popup.
             if value {
                 if let Some(info) = self.plot_info(plot) {
                     self.note_journal_flag(&info, flag);
+                    if !old {
+                        self.queue_tutorial(&info, flag);
+                    }
                 }
             }
         }

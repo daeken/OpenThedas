@@ -54,6 +54,27 @@ const TABLE_PLOT_TYPES: i32 = 108;
 const HASH_TYPE_NAME: u32 = 0xa422_7c06;
 const HASH_IS_CODEX: u32 = 0xeb84_ee4d;
 
+/// popuplayer.gfx's tutorial buttons: Next (`0`) takes the one shown off the queue, Close
+/// (`1`) all of them (DAOrigins.exe's TutorialControl handler, 0x693630, loops while the
+/// message's flag is set).
+pub const MSG_CONSUME_TUTORIAL: &str = "Tutorials.ConsumeTutorial";
+
+/// `plottypes.gda`'s column saying a type is a tutorial (13 controls, 15 plot), as
+/// DAOrigins.exe reads it (0x75bcf0).
+const HASH_IS_TUTORIAL: u32 = 0x12e4_743c;
+
+/// A tutorial popup waiting to show (`Tutorials.TutorialList.N`): its title (the plot's
+/// name), its text (the flag's journal text) and the codex entry its Codex button opens
+/// (the plot's resource name, field 3). DAOrigins.exe's TutorialControl builds one
+/// (0x693390) when a flag of a tutorial plot is set (0x76014d, 0x693f10).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Tutorial {
+    pub resref: String,
+    pub title: Option<u32>,
+    pub text: Option<u32>,
+    pub pauses: bool,
+}
+
 /// A quest's latest journal entry: the flag whose text it shows and when it was set (a
 /// running count).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -137,6 +158,67 @@ pub struct JournalView {
 impl Sim {
     /// Notes a quest's new journal entry when one of its flags with journal text is set
     /// (called as flags are set).
+    /// Whether a plot type is a tutorial's.
+    fn is_tutorial_kind(&self, kind: i32) -> bool {
+        self.world
+            .tables()
+            .get(TABLE_PLOT_TYPES, "")
+            .is_some_and(|t| {
+                matches!(
+                    t.cell_by_hash(HASH_IS_TUTORIAL, i64::from(kind)),
+                    Some(thedas_formats::gda::Cell::Int(1))
+                )
+            })
+    }
+
+    /// Queues a tutorial plot's popup for a flag just set: one per plot at a time (a plot
+    /// already queued is skipped, 0x694032), pausing the game when the plot asks (0x6940c0).
+    /// Provisional: the game's Show Tutorials option is taken to be on, and a flag with no
+    /// text queues nothing.
+    pub(crate) fn queue_tutorial(&mut self, info: &PlotInfo, flag: i32) {
+        if flag >= DEFINED_FLAGS || !self.is_tutorial_kind(info.kind) {
+            return;
+        }
+        let Some(text) = info
+            .journal
+            .get(&flag)
+            .copied()
+            .filter(|&t| self.has_text(t))
+        else {
+            return;
+        };
+        let resref = info.resref.trim_start_matches("plt_").to_string();
+        if self.world.tutorials.iter().any(|t| t.resref == resref) {
+            return;
+        }
+        self.world.tutorials.push(Tutorial {
+            resref,
+            title: info.name_strref,
+            text: Some(text),
+            pauses: info.pauses,
+        });
+        if info.pauses {
+            self.world.tutorial_paused = true;
+        }
+    }
+
+    /// Takes the tutorial shown off the queue, or all of them; the game resumes once none is
+    /// left if a tutorial paused it.
+    pub fn consume_tutorial(&mut self, all: bool) {
+        loop {
+            if self.world.tutorials.is_empty() {
+                break;
+            }
+            self.world.tutorials.remove(0);
+            if !all {
+                break;
+            }
+        }
+        if self.world.tutorials.is_empty() {
+            self.world.tutorial_paused = false;
+        }
+    }
+
     pub(crate) fn note_journal_flag(&mut self, info: &PlotInfo, flag: i32) {
         if flag >= DEFINED_FLAGS || !info.journal.get(&flag).is_some_and(|&t| self.has_text(t)) {
             return;
@@ -450,6 +532,14 @@ impl Sim {
                 true
             }
             MSG_HIDE_UBER_ALERT => true,
+            MSG_CONSUME_TUTORIAL => {
+                let all = args
+                    .first()
+                    .and_then(|a| a.trim().parse::<f64>().ok())
+                    .is_some_and(|v| v != 0.0);
+                self.consume_tutorial(all);
+                true
+            }
             _ => false,
         }
     }
@@ -476,6 +566,61 @@ mod tests {
             parent: parent.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn tutorial_flags_queue_popups_that_next_and_close_take_off() {
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        s.plots
+            .insert(plot("tut_explore", 13, None, &[(0, 10), (1, 11)]));
+        let mut combat = plot("tut_combat_basic", 13, None, &[(0, 20)]);
+        combat.pauses = true;
+        s.plots.insert(combat);
+        s.plots
+            .insert(plot("lot100pt_bears", KIND_QUEST, None, &[(0, 30)]));
+        s.world.tables().insert(
+            "#108",
+            &["#eb84ee4d", "#12e4743c"],
+            vec![
+                (1, vec![Cell::Int(0), Cell::Int(0)]),
+                (13, vec![Cell::Int(1), Cell::Int(1)]),
+            ],
+        );
+        let _ = s.strings.set(
+            [10, 11, 20, 30]
+                .into_iter()
+                .map(|t| (t, format!("text {t}")))
+                .collect(),
+        );
+        let o = OBJECT_INVALID;
+        s.set_plot_flag("lot100pt_bears", 0, true, false, o);
+        assert!(s.world.tutorials.is_empty(), "a quest is no tutorial");
+        s.set_plot_flag("tut_explore", 0, true, false, o);
+        // One per plot at a time; a flag already set queues nothing again.
+        s.set_plot_flag("tut_explore", 1, true, false, o);
+        s.set_plot_flag("tut_explore", 0, true, false, o);
+        s.set_plot_flag("tut_combat_basic", 0, true, false, o);
+        let queued: Vec<(&str, Option<u32>)> = s
+            .world
+            .tutorials
+            .iter()
+            .map(|t| (t.resref.as_str(), t.text))
+            .collect();
+        assert_eq!(
+            queued,
+            [("tut_explore", Some(10)), ("tut_combat_basic", Some(20))]
+        );
+        assert!(s.world.tutorial_paused);
+        // Next takes the first off; the pause holds while any is left.
+        assert!(s.journal_message(MSG_CONSUME_TUTORIAL, &["0".into()]));
+        assert_eq!(s.world.tutorials.len(), 1);
+        assert!(s.world.tutorial_paused);
+        s.set_plot_flag("tut_explore", 1, false, false, o);
+        s.set_plot_flag("tut_explore", 1, true, false, o);
+        // Close takes them all off and the game resumes.
+        assert!(s.journal_message(MSG_CONSUME_TUTORIAL, &["1".into()]));
+        assert!(s.world.tutorials.is_empty());
+        assert!(!s.world.tutorial_paused);
     }
 
     #[test]
