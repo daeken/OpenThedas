@@ -492,7 +492,12 @@ impl PadPlay {
                 return None;
             }
             Action::CloseScreen => {
-                let menu = !host.popup() && host.screens().is_some_and(|s| s.menu.is_some());
+                // The player's screen, when it is the one up: a screen the game put up over it
+                // (level-up, opened from the character record) is left by its own buttons.
+                let menu = !host.popup()
+                    && host
+                        .screens()
+                        .is_some_and(|s| s.menu.is_some_and(|m| s.shown().contains(&m)));
                 if !menu {
                     // A dialog box, the start menu, character creation: its own Back,
                     // Previous, Cancel, Close or No button; in a dialog box whose buttons
@@ -500,7 +505,13 @@ impl PadPlay {
                     // Provisional: the 360 version's B is not traced.
                     let popup = host.popup();
                     let targets = host.focus_targets();
-                    let named = targets.iter().rev().find(|t| crate::focusnav::is_back(t));
+                    // A way out (Close, Cancel, No) before a step back (Back, Previous).
+                    let named = targets
+                        .iter()
+                        .rev()
+                        .filter_map(|t| crate::focusnav::back_rank(t).map(|r| (r, t)))
+                        .min_by_key(|(r, _)| *r)
+                        .map(|(_, t)| t);
                     let last = || crate::focusnav::last(&targets).map(|i| &targets[i]);
                     let Some(t) = named.or_else(|| if popup { last() } else { None }) else {
                         return Some("no back button on this screen".into());

@@ -115,6 +115,29 @@ pub fn rest(t: &FocusTarget) -> (f64, f64) {
 /// Whether a target's own name (the clip that takes the click, or the button holding its
 /// hit area) says it goes back: Back, Previous, Cancel, Close or No.
 pub fn is_back(t: &FocusTarget) -> bool {
+    back_rank(t).is_some()
+}
+
+/// How a back button ranks for B: a way out of the screen (Close, Cancel, No) first, then a
+/// step back within it (Back, Previous). The level-up wizard has both: B leaves it, as its
+/// close button does, rather than paging back. Provisional: the 360 version's B is not
+/// traced.
+pub fn back_rank(t: &FocusTarget) -> Option<u8> {
+    ["close", "cancel", "no"]
+        .iter()
+        .any(|w| names_it(t, w))
+        .then_some(0)
+        .or_else(|| {
+            ["back", "previous", "prev"]
+                .iter()
+                .any(|w| names_it(t, w))
+                .then_some(1)
+        })
+}
+
+/// Whether a target's own name starts with the word `w` (then a capital, `_`, a digit or
+/// nothing).
+fn names_it(t: &FocusTarget, w: &str) -> bool {
     let mut parts = t.path.rsplit('.');
     let own = parts.next().unwrap_or("");
     let name = if own.starts_with("HitArea") || own.starts_with("hit") {
@@ -123,15 +146,11 @@ pub fn is_back(t: &FocusTarget) -> bool {
         own
     };
     let lower = name.to_ascii_lowercase();
-    ["back", "previous", "prev", "cancel", "close", "no"]
-        .iter()
-        .any(|w| {
-            lower.starts_with(w)
-                && name[w.len()..]
-                    .chars()
-                    .next()
-                    .is_none_or(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
-        })
+    lower.starts_with(w)
+        && name[w.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
 }
 
 #[cfg(test)]
