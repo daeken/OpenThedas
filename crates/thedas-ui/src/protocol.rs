@@ -353,8 +353,10 @@ impl GameBridge {
                 }
                 UiValue::Undefined
             }
-            name if call.kind == CallKind::FsCommand
-                && crate::avm1::DA_RETURNING_FSCOMMANDS.contains(&name) =>
+            name if (call.kind == CallKind::FsCommand
+                && crate::avm1::DA_RETURNING_FSCOMMANDS.contains(&name))
+                || (call.kind == CallKind::ExternalInterface
+                    && crate::avm1::DA_EXTERNAL_QUERIES.contains(&name)) =>
             {
                 let query = self.query.lock().ok().and_then(|q| q.clone());
                 query
