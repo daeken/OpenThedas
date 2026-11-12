@@ -15,9 +15,11 @@
 //! When more corpses lie waiting than the graphics detail allows (5, 10, 15 or 20), the
 //! ones over start fading.
 //!
+//! Corpses that never decay unless forced: party members, non-combatants, creatures that
+//! cannot die permanently (`NoPermDeath`) and creatures placed dead.
+//!
 //! Provisional: the clock runs from death (the exe waits for the death animation to settle);
-//! party members never decay (the exe skips creatures found in a list taken to be the
-//! party's); the corpse cap uses the highest detail level (20); the bag's model swap is left
+//! the corpse cap uses the highest detail level (20); the bag's model swap is left
 //! to the presentation; bags that die when empty are not removed.
 
 use thedas_script::vm::ObjectId;
@@ -48,7 +50,21 @@ impl Sim {
         if o.decay_forced {
             return true;
         }
-        if party.contains(&id) || Some(id) == self.world.hero {
+        // Party members, non-combatants (template `Combatant` 1), creatures that cannot die
+        // permanently (`NoPermDeath`) and creatures placed dead (`CREATURE_SPAWN_DEAD`) lie
+        // where they fell (0x6a3ad0: +0xbd4, +0xbd8, the party list 0x5d57c0, the local
+        // int with reserved id 4). Pool creatures (`CreatePool`) are not modelled.
+        if party.contains(&id)
+            || Some(id) == self.world.hero
+            || o.fields.get("Combatant").copied().unwrap_or(0) != 0
+            || o.fields.get("NoPermDeath").copied().unwrap_or(0) != 0
+            || o.locals
+                .ints
+                .get("CREATURE_SPAWN_DEAD")
+                .copied()
+                .unwrap_or(0)
+                > 0
+        {
             return false;
         }
         matches!(self.decay_behaviour(id), 0 | 3)
@@ -202,6 +218,34 @@ mod tests {
         o.dead = true;
         o.died_at = Some(0);
         c
+    }
+
+    #[test]
+    fn non_combatants_and_creatures_placed_dead_stay() {
+        let mut s = sim();
+        let a = corpse(&mut s);
+        s.world
+            .get_mut(a)
+            .unwrap()
+            .fields
+            .insert("Combatant".into(), 1);
+        let b = corpse(&mut s);
+        s.world
+            .get_mut(b)
+            .unwrap()
+            .locals
+            .ints
+            .insert("CREATURE_SPAWN_DEAD".into(), 1);
+        let c = corpse(&mut s);
+        s.world
+            .get_mut(c)
+            .unwrap()
+            .fields
+            .insert("NoPermDeath".into(), 1);
+        s.tick(120_000);
+        for id in [a, b, c] {
+            assert!(s.world.get(id).is_some());
+        }
     }
 
     #[test]
