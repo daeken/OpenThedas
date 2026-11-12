@@ -945,7 +945,7 @@ fn command_display(sim: &Sim, who: u32, c: &thedas_sim::world::Command) -> (Stri
         return Default::default();
     };
     let int = |t: &thedas_sim::m2da::Table, h: u32, row: i64| match t.cell_by_hash(h, row) {
-        Some(Cell::Int(n)) => *n as i64,
+        Some(Cell::Int(n)) => *n,
         _ => 0,
     };
     let text = |t: &thedas_sim::m2da::Table, h: u32, row: i64| match t.cell_by_hash(h, row) {
