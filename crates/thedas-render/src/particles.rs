@@ -11,7 +11,7 @@
 //!   a range it births `trunc(x)` of `x = (rate + u·range)·dt` when `x > 1`, else one with
 //!   probability `x`. A burst emitter births `trunc(rate + u·range)` once.
 //! - **Birth** (0x5525b0, 0x53f980): life `Life + u·LifeRange` (`Life` when that is not
-//!   positive), rotation speed `RotSpeed + u·RotSpeedRange`, size factor `1 + u·ScaleRange`,
+//!   positive; a negative `Life` makes particles that never die), rotation speed `RotSpeed + u·RotSpeedRange`, size factor `1 + u·ScaleRange`,
 //!   flipbook phase random in `[0, 1)` with `RandomStartFrame`. It moves along the emitter's
 //!   +Z, turned about the emitter's X and Y axes by `u·spread` each, at
 //!   `InitialSpeed + u·InitialSpeedRange`.
@@ -271,11 +271,9 @@ impl EmitterState {
         if life <= 0.0 {
             life = e.life;
         }
-        let inv_life = if life > 0.0 {
-            1.0 / life
-        } else {
-            f32::INFINITY
-        };
+        // 0x5525b0 stores 1/life as it is: a negative life (the Proving crowd's -1) gives a
+        // negative fraction lived, so the particle never dies and keeps its first age key.
+        let inv_life = 1.0 / life;
         let spin = r.signed() * e.rotation_speed_range + e.rotation_speed;
         let scale = 1.0 + r.signed() * e.scale_range;
         let phase = if e.random_start_frame { r.unit() } else { 0.0 };
@@ -502,6 +500,18 @@ mod tests {
         }
         s.advance(1.2);
         assert!(s.particles.iter().all(|p| p.age < 1.0));
+    }
+
+    #[test]
+    fn a_negative_life_never_ends() {
+        let mut e = fire();
+        e.life = -1.0;
+        e.life_range = 0.0;
+        let mut s = EmitterState::new(Arc::new(e), Mat4::IDENTITY, 3);
+        s.spawn();
+        s.advance(30.0);
+        assert!(!s.particles.is_empty());
+        assert!(s.particles.iter().any(|p| p.age > 29.0));
     }
 
     #[test]

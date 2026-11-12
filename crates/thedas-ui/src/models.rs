@@ -939,6 +939,41 @@ impl DrawnKey {
     }
 }
 
+/// Where the ids of [`location_vfx_models`] start: above any object id the world hands out.
+pub const LOCATION_VFX_IDS: ObjectId = 0xf000_0000;
+
+/// The visual effects scripts applied at places in `area` (`World::location_vfx`, such as
+/// the Proving's crowd), each drawn as its `VFX_base.gda` row's model (`ModelName`:
+/// `fxe_sprite_arena_p` for 10011) where the effect was applied. They are not objects:
+/// their ids are [`LOCATION_VFX_IDS`] plus the effect's handle, and their kind is `Area`.
+/// Provisional: the row's other columns (its type, attachment, scale) are not mirrored.
+pub fn location_vfx_models(sim: &Sim, area: ObjectId) -> Vec<ObjectModel> {
+    let Some(t) = sim.world.tables().get(0, "vfx_base") else {
+        return Vec::new();
+    };
+    sim.world
+        .location_vfx
+        .iter()
+        .filter(|v| v.area == area)
+        .filter_map(|v| {
+            let model = text(t.cell("ModelName", v.vfx as i64))?.to_ascii_lowercase();
+            Some(ObjectModel {
+                id: LOCATION_VFX_IDS.wrapping_add(v.handle as ObjectId),
+                tag: format!("vfx_{}", v.vfx),
+                kind: ObjectKind::Area,
+                models: vec![model],
+                attached: Vec::new(),
+                tints: Vec::new(),
+                morph: None,
+                hide_hair: false,
+                motion: None,
+                position: v.position,
+                facing: v.facing,
+            })
+        })
+        .collect()
+}
+
 /// [`area_models`] keeping what objects draw in `cache`.
 pub fn area_models_cached(sim: &Sim, area: ObjectId, cache: &mut ModelCache) -> Vec<ObjectModel> {
     let objects: Vec<&Object> = sim

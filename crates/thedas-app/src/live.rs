@@ -587,7 +587,11 @@ impl Live {
         }
         let mut models = match &staged {
             Some((id, stage)) => stage_models(&sim, *id, stage, &mut self.models),
-            None => thedas_ui::models::area_models_cached(&sim, area, &mut self.models),
+            None => {
+                let mut m = thedas_ui::models::area_models_cached(&sim, area, &mut self.models);
+                m.extend(thedas_ui::models::location_vfx_models(&sim, area));
+                m
+            }
         };
         self.swings.apply(&sim, &mut models);
         let was = self.staged;

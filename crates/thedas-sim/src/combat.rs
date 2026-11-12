@@ -1061,6 +1061,7 @@ impl Sim {
             ring_wait: false,
             after_impact_ms: None,
             impacted: false,
+            arrived: false,
             path: Vec::new(),
         };
         if let Some(o) = self.world.get_mut(attacker) {
@@ -1101,6 +1102,7 @@ impl Sim {
             ring_wait: false,
             after_impact_ms: None,
             impacted: false,
+            arrived: false,
             path: Vec::new(),
         };
         if let Some(o) = self.world.get_mut(who).filter(|o| o.commands.is_empty()) {
@@ -1264,6 +1266,34 @@ impl Sim {
     ///
     /// Provisional: animation events are not played, so both hands' impacts come when the
     /// attack's time is up, main hand first.
+    /// The target of the attack `id` is making: its `CommandAttack`'s target while the
+    /// command is running. Read-only, for the presentation.
+    pub fn attack_target(&self, id: ObjectId) -> Option<ObjectId> {
+        let cmd = self.world.get(id)?.commands.first()?;
+        (cmd.name == "CommandAttack")
+            .then_some(cmd.target)
+            .flatten()
+            .filter(|&t| t != OBJECT_INVALID)
+    }
+
+    /// One hand's (0 main, 1 off) result for the attack in progress, as `SetAttackResult`
+    /// gave it (`COMBAT_RESULT_*`), and its target; `None` for a hand with no result
+    /// (`COMBAT_RESULT_INVALID`), which sends no impact. Read-only, for the presentation.
+    ///
+    /// The exe keeps a target per hand slot (0x6a0160 main, 0x6a0170 off); rules_core gives
+    /// both the attack's target, so here both hands report the `CommandAttack` target.
+    pub fn hand_attack(&self, id: ObjectId, hand: usize) -> Option<(i32, ObjectId)> {
+        let result = *self
+            .world
+            .get(id)?
+            .combat
+            .attack
+            .as_ref()?
+            .results
+            .get(hand)?;
+        (result != 0).then_some((result, self.attack_target(id)?))
+    }
+
     pub(crate) fn finish_attack(&mut self, id: ObjectId, target: ObjectId) {
         let Some(result) = self.world.get(id).and_then(|o| o.combat.attack.clone()) else {
             return;
@@ -1788,15 +1818,17 @@ pub const MELEE_REACH: f32 = 2.0;
 /// How far past the two bodies a melee attack reaches (metres): DAOrigins.exe's melee range
 /// test (0x6a3dc0, used by the attack command's start step 0x7a87c0) adds 1.2 (0xafebc0) to
 /// the two creatures' radii (0x695320, which adds nothing between them, 0xade210) and
-/// measures across the ground. The radii are taken to be `PERSPACE` (provisional).
+/// measures across the ground. The radii are `PERSPACE` (0x6a21a0 reads the appearance's
+/// copy of it, set by 0x748a40).
 pub const MELEE_GAP: f32 = 1.2;
 
 /// The slack the same test allows past that reach (metres, 0xade218): an attack may start
 /// with the target up to this much farther away.
 pub const MELEE_REACH_TOLERANCE: f32 = 1.0;
 
-/// A creature's body radius when its appearance gives none (metres). Provisional.
-pub const DEFAULT_RADIUS: f32 = 0.4;
+/// A creature's body radius when its appearance gives none (metres): DAOrigins.exe's
+/// `SetAppearanceType` (0x748a40) default for a missing `PERSPACE` (0xaf7618).
+pub const DEFAULT_RADIUS: f32 = 0.6;
 
 impl Sim {
     /// A creature's body radius: its appearance's personal space in `apr_base.gda`
@@ -2260,6 +2292,38 @@ mod tests {
                 .unwrap_or_default();
             (a.swings, a.hits, a.damage)
         };
+        // The presentation's view of an attack in progress: each hand's result and target.
+        s.world
+            .get_mut(rogue)
+            .unwrap()
+            .commands
+            .push(crate::world::Command {
+                ty: 0,
+                name: "CommandAttack".into(),
+                target: Some(wolf),
+                location: None,
+                seconds: 0.0,
+                ints: Vec::new(),
+                strings: Vec::new(),
+                due: None,
+                from: None,
+                approach: None,
+                ring_wait: false,
+                after_impact_ms: None,
+                impacted: false,
+                arrived: false,
+                path: Vec::new(),
+            });
+        s.world.get_mut(rogue).unwrap().combat.attack = Some(AttackResult {
+            results: [0, 2],
+            effects: [None, None],
+        });
+        assert_eq!(s.attack_target(rogue), Some(wolf));
+        assert_eq!(s.hand_attack(rogue, 0), None);
+        assert_eq!(s.hand_attack(rogue, 1), Some((2, wolf)));
+        assert_eq!(s.hand_attack(rogue, 2), None);
+        s.world.get_mut(rogue).unwrap().commands.clear();
+        assert_eq!(s.attack_target(rogue), None);
         // The off hand alone (the main hand has no result, 0): its blow lands.
         assert_eq!(attack(&mut s, [0, 1], [None, hit(7.0)]), (1, 1, 7.0));
         // The main hand alone misses (3); nothing for the empty off hand.
