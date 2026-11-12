@@ -84,6 +84,11 @@ pub mod field {
     pub const MDL_SPHERE_CENTER: u32 = 3321;
     pub const MDL_SPHERE_RADIUS: u32 = 3322;
     pub const MDL_LIGHTMAPS: u32 = 3326;
+    /// A placed model's user parameters (`UPAR` structs: 3507 name, 3508 value), which its
+    /// emitters naming that parameter take.
+    pub const MDL_USER_PARAMS: u32 = 3506;
+    pub const UPAR_NAME: u32 = 3507;
+    pub const UPAR_VALUE: u32 = 3508;
     pub const LMAT_CHUNK: u32 = 3235;
     pub const LMAT_TEXTURE: u32 = 3323;
     pub const LMAT_OFFSET_SCALE: u32 = 3324;
@@ -528,6 +533,9 @@ pub struct Placement {
     /// World-space bounding sphere as stored by the toolset.
     pub sphere: Option<([f32; 3], f32)>,
     pub lightmaps: Vec<LightmapBinding>,
+    /// Named values the placement gives its model (`UPAR`), e.g. char_stage's floor fog
+    /// emitter's `fog`.
+    pub user_params: Vec<(String, [f32; 4])>,
 }
 
 /// A room layout.
@@ -595,6 +603,15 @@ fn read_placement(gff: &Gff4, m: StructId) -> TypedResult<Placement> {
             scale: [sx, sy],
         });
     }
+    let mut user_params = Vec::new();
+    for u in d.structs(m, field::MDL_USER_PARAMS)? {
+        let d = Doc::new(gff, "rml user parameter");
+        let Some(name) = d.opt_str(u, field::UPAR_NAME)?.filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let value = d.opt_vec4(u, field::UPAR_VALUE, 1.0)?.unwrap_or([1.0; 4]);
+        user_params.push((name, value));
+    }
     Ok(Placement {
         id: d.opt_i64(m, field::MDL_ID)?,
         name,
@@ -604,6 +621,7 @@ fn read_placement(gff: &Gff4, m: StructId) -> TypedResult<Placement> {
         lightmap_name: d.opt_str(m, field::MDL_LIGHTMAP_NAME)?,
         sphere,
         lightmaps,
+        user_params,
     })
 }
 

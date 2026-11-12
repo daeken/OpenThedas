@@ -183,6 +183,14 @@ impl LightRig {
 /// and rows, as here, or the material) is not traced.
 pub const CONTACT_SHEET_PARAMETER: &str = "mml_vContactSheetParams";
 
+/// What a placement's user parameter (`UPAR`) sets on the emitters naming it (their
+/// `UserParamName`): the VFX shaders' colour multiplier, which scales the particles' colour
+/// and alpha. Provisional: DAOrigins.exe stores the placement's parameters on its object
+/// (0xa29d43-0xa29dee) and the emitter blueprint keeps the name (+0x2f0, 0x593ad7); how the
+/// value reaches the draw is not traced. char_stage's floor fog gives `fog` = (0.3, 0.25,
+/// 0.25, 0.75).
+pub const USER_COLOR_PARAMETER: &str = "mml_vUserColorMultiplier";
+
 /// A particle emitter placed in the level, by a level model or a placed object's model.
 #[derive(Clone, Debug)]
 pub struct SceneEmitter {
@@ -415,6 +423,8 @@ struct Placing<'a> {
     tint: Option<(&'a str, &'a Tint)>,
     /// Only the model's lights (a level placement in a scene of objects alone).
     lights_only: bool,
+    /// The placement's user parameters, for its emitters (see [`USER_COLOR_PARAMETER`]).
+    user_params: &'a [(String, [f32; 4])],
 }
 
 /// The material parameter an item tint fills.
@@ -947,6 +957,7 @@ impl<'a> Loader<'a> {
             morph,
             tint,
             lights_only,
+            user_params,
         } = at;
         let Some(model) = self.model(model_name) else {
             return;
@@ -979,7 +990,7 @@ impl<'a> Loader<'a> {
         if lights_only {
             return;
         }
-        self.place_emitters(model_name, &model, placement);
+        self.place_emitters(model_name, &model, placement, user_params);
         let pieces = model.mesh_pieces();
         if pieces.is_empty() {
             return;
@@ -1081,7 +1092,13 @@ impl<'a> Loader<'a> {
 
     /// The particle emitters of a placed model. Mesh-particle and physics emitters are left
     /// out (not mirrored yet), as are emitters whose material does not load.
-    fn place_emitters(&mut self, model_name: &str, model: &Mmh, placement: Mat4) {
+    fn place_emitters(
+        &mut self,
+        model_name: &str,
+        model: &Mmh,
+        placement: Mat4,
+        user_params: &[(String, [f32; 4])],
+    ) {
         for piece in model.emitters() {
             let e = piece.emitter;
             if e.mesh_model.is_some() || e.physics || e.material.is_empty() {
@@ -1100,6 +1117,19 @@ impl<'a> Loader<'a> {
                         CONTACT_SHEET_PARAMETER.to_string(),
                         vec![[c as f32, r as f32, (c * r) as f32, 0.0]],
                     )],
+                );
+            }
+            let user = e.user_param.as_deref().and_then(|name| {
+                user_params
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            });
+            if let Some((name, value)) = user {
+                material = self.overridden_material(
+                    material,
+                    &format!("upar:{name}:{value:?}"),
+                    &[],
+                    &[(USER_COLOR_PARAMETER.to_string(), vec![*value])],
                 );
             }
             let node = piece
@@ -1288,6 +1318,7 @@ impl AreaScene {
                         morph: None,
                         tint: None,
                         lights_only: !level_meshes,
+                        user_params: &p.user_params,
                     },
                 );
             }
@@ -1308,6 +1339,7 @@ impl AreaScene {
                     morph: None,
                     tint: None,
                     lights_only: false,
+                    user_params: &[],
                 },
             );
             let materials = &l.scene.materials;
@@ -1341,6 +1373,7 @@ impl AreaScene {
                 morph: None,
                 tint: None,
                 lights_only: false,
+                user_params: &[],
             };
             // Each tinted model's tint, read once per prop.
             let tints: Vec<(String, String, Option<Arc<Tint>>)> = prop
