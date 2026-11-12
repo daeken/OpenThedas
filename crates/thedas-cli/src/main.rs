@@ -1,5 +1,6 @@
 //! `thedas`: command-line tools for inspecting and validating Dragon Age: Origins data.
 
+mod audio;
 mod autoplay;
 mod corpus;
 mod dump;
@@ -184,6 +185,21 @@ enum Command {
         #[arg(long)]
         route: Option<String>,
     },
+    /// List an FMOD sound bank (`.fsb`), decode its samples to WAV, or check that every
+    /// sample of the banks under a folder decodes.
+    Fsb {
+        /// A bank, or (with --check) a folder searched for banks.
+        path: PathBuf,
+        /// Decode samples to WAV files in this folder.
+        #[arg(long)]
+        wav: Option<PathBuf>,
+        /// Only these samples (by name, with or without `.wav`).
+        #[arg(long)]
+        sample: Vec<String>,
+        /// Decode every sample of every bank and report failures and length mismatches.
+        #[arg(long)]
+        check: bool,
+    },
     /// Open every archive in an install and parse every GFF4-family resource.
     Corpus {
         /// Install roots or individual archives.
@@ -246,6 +262,12 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Ls { archive } => ls(&archive),
+        Command::Fsb {
+            path,
+            wav,
+            sample,
+            check,
+        } => audio::fsb(&path, wav.as_deref(), &sample, check),
         Command::Extract {
             archive,
             names,

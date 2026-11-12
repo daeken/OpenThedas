@@ -23,6 +23,10 @@
 //! - [`stage`]: conversation stages (`.stg`) and the shot each conversation line takes.
 //! - [`anim`]: animation trees (`.anb`), animation lengths (`.gad`) and events (`.evt`).
 //!
+//! Audio:
+//!
+//! - [`fsb`]: FMOD sound banks (FSB4), the waveforms behind the game's sound events.
+//!
 //! Interface:
 //!
 //! - [`gfx`]: Scaleform GFx movies (SWF with Scaleform tags), with a rewriter to plain SWF.
@@ -31,6 +35,7 @@ pub mod anim;
 pub mod area;
 pub mod dds;
 pub mod emitter;
+pub mod fsb;
 pub mod gda;
 pub mod gff3;
 pub mod gff4;
