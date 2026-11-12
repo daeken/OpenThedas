@@ -426,6 +426,11 @@ impl Live {
         for (id, alpha) in self.camera_fade.faded() {
             *self.opacity.entry(id).or_insert(1.0) *= alpha;
         }
+        // Corpses fading out at the end of their decay (see `thedas_sim::decay`).
+        let corpses = self.sim().corpse_fades();
+        for (id, alpha) in corpses {
+            *self.opacity.entry(id).or_insert(1.0) *= alpha;
+        }
         self.opacity.retain(|_, a| *a < 1.0);
     }
 

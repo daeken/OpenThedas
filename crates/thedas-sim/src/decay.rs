@@ -42,6 +42,21 @@ pub fn default_max_ms() -> u64 {
 }
 
 impl Sim {
+    /// The corpses fading out now and their opacity, for the presentation: the exe's alpha
+    /// over the last [`FADE_MS`] of the clock (0x6bc670: remaining / 2000, through 0x695060).
+    pub fn corpse_fades(&self) -> Vec<(ObjectId, f32)> {
+        let max = self.world.corpse_decay_max_ms;
+        self.world
+            .objects
+            .values()
+            .filter(|o| o.kind == ObjectKind::Creature && o.dead && o.decay_ms > 0)
+            .filter_map(|o| {
+                let left = max.saturating_sub(o.decay_ms);
+                (left < FADE_MS).then(|| (o.id, left as f32 / FADE_MS as f32))
+            })
+            .collect()
+    }
+
     /// Whether a dead creature may decay (DAOrigins.exe 0x6a3ad0).
     fn may_decay(&self, id: ObjectId, party: &[ObjectId]) -> bool {
         let Some(o) = self.world.get(id) else {
@@ -285,6 +300,17 @@ mod tests {
         assert!(s.world.get(c).is_some());
         s.tick(1_700);
         assert!(s.world.get(c).is_none());
+    }
+
+    #[test]
+    fn a_fading_corpse_reports_its_opacity() {
+        let mut s = sim();
+        let c = corpse(&mut s);
+        s.tick(58_500);
+        let f = s.corpse_fades();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].0, c);
+        assert!((f[0].1 - 0.75).abs() < 1e-3, "{f:?}");
     }
 
     #[test]
