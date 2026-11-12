@@ -40,14 +40,16 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
 }
 "#;
 
-struct Composite {
-    pipeline: wgpu::RenderPipeline,
-    layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
+/// Draws a texture over the whole of a pass's viewport (the movies' textures; the intro
+/// movies' frames).
+pub(crate) struct Composite {
+    pub(crate) pipeline: wgpu::RenderPipeline,
+    pub(crate) layout: wgpu::BindGroupLayout,
+    pub(crate) sampler: wgpu::Sampler,
 }
 
 impl Composite {
-    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    pub(crate) fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ui composite"),
             source: wgpu::ShaderSource::Wgsl(COMPOSITE_WGSL.into()),
