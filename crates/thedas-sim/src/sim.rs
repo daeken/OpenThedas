@@ -93,6 +93,9 @@ pub struct Sim {
     /// The player's "show tutorials" option: off, no tutorial popup is queued. On, as the
     /// game's options start.
     pub show_tutorials: bool,
+    /// The training modes done (bit `mode - 1`), which do not start again (see
+    /// [`crate::training`]). The player's, not the game's: not saved.
+    pub training_done: u32,
     /// Objects whose scripts' engine calls are all traced (log channel -6), for debugging.
     pub watch_calls: std::collections::BTreeSet<ObjectId>,
     /// Followers whose front command is the move [`Sim::keep_party_together`] gave them.
@@ -498,6 +501,7 @@ impl Sim {
             party_picker_policy: PartyPickerPolicy::default(),
             auto_pause_combat: false,
             show_tutorials: true,
+            training_done: 0,
             watch_calls: Default::default(),
             following: Default::default(),
             next_follow_ms: 0,

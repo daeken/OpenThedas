@@ -306,8 +306,9 @@ impl Live {
         if self.paused || self.front_end {
             return;
         }
-        // A tutorial that pauses the game holds it until its popup is dismissed.
-        if self.sim().world.tutorial_paused {
+        // A tutorial that pauses the game holds it until its popup is dismissed; a training
+        // tutorial until its mode ends.
+        if self.sim().world.tutorial_paused || self.sim().training_paused() {
             return;
         }
         self.owed_ms += dt_ms.clamp(0.0, MAX_STEP_MS);
@@ -1268,6 +1269,7 @@ impl Live {
         match pick {
             Pick::Ground(p) => {
                 sim.order_move(leader, p);
+                sim.training_event("MOVEMENT_COMMAND_ISSUED", 0);
                 Some(format!("move to {:.1} {:.1}", p[0], p[1]))
             }
             Pick::Object(id) => {
@@ -1576,6 +1578,19 @@ impl Live {
         Some(out)
     }
 
+    /// The player's pause key (Space). During a training tutorial the game may not be
+    /// unpaused: the key is the training action `EVENT_TYPE_TRAINING_UNPAUSE` instead (see
+    /// `thedas_sim::training`), and the player's own pause is left as it was.
+    pub fn toggle_pause(&mut self) {
+        let mut sim = self.sim();
+        if sim.training_paused() {
+            sim.training_event("UNPAUSE", 0);
+            return;
+        }
+        drop(sim);
+        self.paused = !self.paused;
+    }
+
     /// Makes party member `n` (0 is the hero) the leader the player controls.
     pub fn choose_leader(&mut self, n: usize) -> Option<String> {
         let mut sim = self.sim();
@@ -1583,6 +1598,7 @@ impl Live {
         let id = *party.get(n)?;
         // The simulation learns who the player controls, so that member's AI stands down.
         sim.set_controlled(Some(id));
+        sim.training_event("FOLLOWER_SELECTED", 0);
         sim.world.get(id).map(|o| o.tag.clone())
     }
 }

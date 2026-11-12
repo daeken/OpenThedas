@@ -687,7 +687,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     // sets both; a tutorial that pauses the game sets only `Client.Paused`, as
     // DAOrigins.exe's TutorialControl does (0x6940ec: the client pause, 0x5d6740, with
     // its user flag off), so the border shows then too.
-    let paused = shown.paused || sim.world.tutorial_paused;
+    let paused = shown.paused || sim.world.tutorial_paused || sim.training_paused();
     v.insert("Client.Paused".into(), num(u8::from(paused)));
     v.insert("Client.UserPaused".into(), num(u8::from(shown.paused)));
     if let Some(p) = shown.book_page {
@@ -793,7 +793,11 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         "Tutorials.Enabled".into(),
         num(u8::from(sim.show_tutorials)),
     );
-    v.insert("Tutorials.TrainingStep".into(), num(0));
+    // The training step shown (`trainingsteps.gda`'s row; 0 none), see `thedas_sim::training`.
+    v.insert(
+        "Tutorials.TrainingStep".into(),
+        num(sim.world.training.step),
+    );
     // The tutorials' screen highlights (DAConstants `GUI_HIGHLIGHT_*`: 0 follower, 1
     // tactics, 2 inventory, 3 health poultice, 4 empty quickbar, 5 tactic preset, 6
     // equipment slot, 7 unequipped item) are all off: no tutorial asks for one. A movie

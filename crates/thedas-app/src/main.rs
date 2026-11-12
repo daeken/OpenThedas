@@ -1357,7 +1357,7 @@ impl App {
             }
             KeyCode::Space => {
                 if let Some(live) = self.live.as_mut() {
-                    live.paused = !live.paused;
+                    live.toggle_pause();
                     println!("{}", if live.paused { "paused" } else { "running" });
                 }
             }
@@ -1585,6 +1585,16 @@ impl App {
                         _ => log.push(format!("use {tag}: nothing")),
                     }
                 }
+            }
+            Step::Training(name) => {
+                let heard = self
+                    .live
+                    .as_ref()
+                    .is_some_and(|l| l.sim().training_event(name, 0));
+                log.push(format!(
+                    "training {name}: {}",
+                    if heard { "heard" } else { "not awaited" }
+                ));
             }
             Step::Plot(plot, flag) => {
                 if let Some(l) = self.live.as_ref() {
@@ -2754,6 +2764,9 @@ enum Step {
     /// Sets a plot flag as a script would (`plot plt_tut_explore 0`), running the plot's
     /// script, for trying journal entries and tutorial popups headless.
     Plot(String, i32),
+    /// The player does a training action (`training MAXIMUM_ZOOM_IN`): the training step
+    /// waiting for it hears of it (`EVENT_TYPE_TRAINING_<name>`, see `thedas_sim::training`).
+    Training(String),
     /// Uses the nearest object with a tag, as clicking it would (`use bdc140ip_everds_chest`).
     Use(String),
 }
@@ -2883,6 +2896,7 @@ fn parse_step(s: &str) -> Result<Step> {
             Step::SetValue(k.to_string(), v.trim().to_string())
         }
         "floaty" => Step::Floaty(arg.to_string()),
+        "training" => Step::Training(arg.trim().to_ascii_uppercase()),
         "plot" => {
             let (plot, flag) = arg
                 .rsplit_once(' ')
@@ -3326,6 +3340,10 @@ fn main() -> Result<()> {
                             }
                             _ => println!("use {tag}: nothing"),
                         }
+                    }
+                    Step::Training(name) => {
+                        let heard = l.sim().training_event(name, 0);
+                        println!("training {name}: {heard}");
                     }
                     Step::Plot(plot, flag) => {
                         l.sim().set_plot_flag(
