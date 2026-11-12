@@ -16,5 +16,7 @@
   `cargo clippy --all-targets` and `cargo test` on that exact result. Several streams merge in
   parallel, and two PRs that each pass alone can break `main` together. If `main` moved while
   the checks ran, do it again.
+  Run the tests in a debug build (plain `cargo test`), not only `--release`: debug stack frames
+  and overflow checks catch things a release build hides.
 - Mark anything taken from xoreos or guesswork, rather than verified against the original
   executable, as provisional in its doc comment.
