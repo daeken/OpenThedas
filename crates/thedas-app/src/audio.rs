@@ -51,6 +51,11 @@ pub struct Gear {
     /// Its size column (`Small`, `Medium`, `Large` as a column hash: its appearance's
     /// `apr_base.gda` column 0xc7cb6561, 0x6a0a1f).
     pub size: Option<u32>,
+    /// Each hand's (main, off) attack in progress, with a result: (`COMBAT_RESULT_*`, the
+    /// target's sound material, where the target stands).
+    pub hands: [Option<(i32, i64, [f32; 3])>; 2],
+    /// The attack in progress's target: its sound material and where it stands.
+    pub attack_target: Option<(i64, [f32; 3])>,
     /// Its hands' sound material when they hold no weapon (`apr_base.gda` column
     /// 0x7d86f95a: 19 bare hands, 20 claws, 27 large claws; 0x6a0b05..0x6a0b53).
     pub unarmed: Option<i64>,
@@ -214,6 +219,9 @@ pub struct GameAudio {
     /// `sound_bodyfall_foley.gda` (rows: ground material; columns: armour material by
     /// label) and `sound_item_materials.gda`'s labels (sound material -> that column).
     bodyfalls: Option<thedas_formats::Gda>,
+    /// `sound_weapon_hits.gda` (rows: the weapon's sound material; columns: the struck
+    /// material by label).
+    weapon_hits: Option<thedas_formats::Gda>,
     bodyfall_foley: Option<thedas_formats::Gda>,
     item_material_labels: std::collections::HashMap<i64, u32>,
     /// `sound_vegetation_type.gda`, worksheet 155 "Sound Movement Vegetation" (rows:
@@ -436,24 +444,15 @@ fn picker_lines(vfs: &Vfs) -> std::collections::HashMap<String, (i32, i32)> {
     out
 }
 
-/// What an attack's blow sounds like.
-///
-/// `BITM_base.gda`'s column 0x7e0505a1 gives each base item a sound material
-/// (`sound_item_materials.gda`: 1 sword, 2 axe, 3 blunt, 4 dagger, 5/6 wood/steel shield,
-/// 7 staff, 8 bow, 9 crossbow, 10-13 leather/cloth/chain/metal armour, ...); found by its
-/// values (every weapon kind matches), the column's name is not known. A blow plays
-/// `sound_weapon_hits.gda`'s event for the weapon's material (bare hands without one) and
-/// what it struck: the target's armour (flesh without), its shield when blocked (wood or
-/// metal). Misses play nothing here: the swing's whoosh is the animation's own event.
-/// Provisional: creatures' hides (fur, scale, bone, stone) are taken as flesh.
+/// Items' sound materials: `BITM_base.gda`'s column 0x7e0505a1 gives each base item a
+/// sound material (`sound_item_materials.gda`: 1 sword, 2 axe, ... 10-13 leather, cloth,
+/// chain and metal armour; DAOrigins.exe reads it at 0x6a0b89).
 #[derive(Default)]
 struct Impacts {
     materials: std::collections::HashMap<i64, i64>,
-    hits: std::collections::HashMap<i64, Vec<String>>,
 }
 
 const COL_SOUND_MATERIAL: u32 = 0x7e05_05a1;
-const BARE_HANDS: i64 = 19;
 
 impl Impacts {
     fn read(vfs: &Vfs) -> Impacts {
@@ -476,64 +475,12 @@ impl Impacts {
                 }
             }
         }
-        if let Some(t) = table("sound_weapon_hits.gda") {
-            for row in &t.rows {
-                let id = match row.first() {
-                    Some(thedas_formats::gda::Cell::Int(i)) => *i,
-                    _ => continue,
-                };
-                let events = row
-                    .iter()
-                    .filter_map(|c| match c {
-                        thedas_formats::gda::Cell::String(s) if s.contains('/') => {
-                            Some(s.trim_end_matches('\0').trim().to_string())
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                out.hits.insert(id, events);
-            }
-        }
         out
     }
 
     /// A base item's sound material.
     fn material(&self, base: Option<i32>) -> Option<i64> {
         base.and_then(|b| self.materials.get(&(b as i64)).copied())
-    }
-
-    /// The event a blow plays, if any.
-    fn event(
-        &self,
-        result: i32,
-        weapon: Option<i32>,
-        armour: Option<i32>,
-        shield: Option<i32>,
-    ) -> Option<String> {
-        const HIT: i32 = 1;
-        const CRITICAL: i32 = 2;
-        const DEATHBLOW: i32 = 4;
-        const BLOCKED: i32 = 5;
-        const BACKSTAB: i32 = 9;
-        let material = |b: Option<i32>| b.and_then(|b| self.materials.get(&(b as i64)).copied());
-        let w = material(weapon).filter(|m| self.hits.get(m).is_some_and(|e| !e.is_empty()));
-        let events = self.hits.get(&w.unwrap_or(BARE_HANDS))?;
-        let ending = match result {
-            BLOCKED => match material(shield) {
-                Some(6) => "/impact_materials/metal",
-                Some(_) => "/impact_materials/wood",
-                None => return None,
-            },
-            HIT | CRITICAL | DEATHBLOW | BACKSTAB => match material(armour) {
-                Some(10) => "/impact_armor/leather_arm",
-                Some(11) => "/impact_armor/cloth_arm",
-                Some(12) => "/impact_armor/chain_arm",
-                Some(13) => "/impact_armor/metal_arm",
-                _ => "/impact_armor/flesh",
-            },
-            _ => return None,
-        };
-        events.iter().find(|e| e.ends_with(ending)).cloned()
     }
 }
 
@@ -625,6 +572,7 @@ impl GameAudio {
             scuffs: read_gda(vfs, "sound_movement_scuffing.gda"),
             vegetation: read_gda(vfs, "sound_vegetation_type.gda"),
             bodyfalls: read_gda(vfs, "sound_bodyfall_creat_size.gda"),
+            weapon_hits: read_gda(vfs, "sound_weapon_hits.gda"),
             bodyfall_foley: read_gda(vfs, "sound_bodyfall_foley.gda"),
             item_material_labels: item_material_labels(vfs),
             rustles: Default::default(),
@@ -953,6 +901,50 @@ impl GameAudio {
                         let col = thedas_formats::gda::column_hash(size.trim());
                         let m = self.impacts.material(g.armour).unwrap_or(0);
                         self.foley.cell("movement", Some(m), col)
+                    }
+                    // A blow (kind 1, 0x6a04a0; request type 4, 0x5b8d2e): at the attack
+                    // animation's hit frame, the hand the event names (`|Left`: off) sounds
+                    // its attack's result unless it is invalid, a miss or 8 (0x6a04dc):
+                    // `sound_weapon_hits.gda`'s event in the row of the hand's sound
+                    // material, the column of the target's (by label, 0x5b6f60). Kind 7
+                    // (0x6a5b00) does the same for the attack's target when the event says
+                    // `|PlayHit` (0x69e720), whatever the result.
+                    // Provisional: placeable targets (table 93) are not sounded, and the
+                    // sound plays where the target stands.
+                    (1 | 7, text) => {
+                        let g = gear.get(&id).copied().unwrap_or_default();
+                        let left = text.as_deref().is_some_and(|t| t.contains("|Left"));
+                        let target = if ev.kind == 1 {
+                            g.hands[left as usize]
+                                .filter(|(r, ..)| !matches!(r, 0 | 3 | 8))
+                                .map(|(_, m, at)| (m, at))
+                        } else if text.as_deref().is_some_and(|t| t.contains("|PlayHit")) {
+                            g.attack_target
+                        } else {
+                            None
+                        };
+                        if let Some((struck, at)) = target {
+                            let w = if left { g.off } else { g.main };
+                            let weapon = self.impacts.material(w).or(g.unarmed);
+                            let event = match (weapon, self.item_material_labels.get(&struck)) {
+                                (Some(row), Some(col)) => self
+                                    .weapon_hits
+                                    .as_ref()
+                                    .and_then(|t| table_event(t, row, *col)),
+                                _ => None,
+                            };
+                            if let Some(e) = event {
+                                log::debug!("audio: blow {e} (creature {id}, struck {struck})");
+                                self.engine.play(
+                                    &e,
+                                    PlayOptions {
+                                        position: Some(at),
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                        }
+                        None
                     }
                     // A bodyfall (kind 18: 0x6a5ad0 -> 0x5b8cc1): the body's event from
                     // `sound_bodyfall_creat_size.gda` (the ground's material, the creature's
@@ -1394,17 +1386,9 @@ impl GameAudio {
                 None => log::debug!("audio: GUI sound {s:?} has no event"),
             }
         }
-        for (at, result, weapon, armour, shield) in std::mem::take(&mut state.impacts) {
-            if let Some(event) = self.impacts.event(result, weapon, armour, shield) {
-                self.engine.play(
-                    &event,
-                    PlayOptions {
-                        position: Some(at),
-                        ..Default::default()
-                    },
-                );
-            }
-        }
+        // Blows sound at their animation's hit frame (see `follow_animations`), not when
+        // the simulation resolves the attack, so its impact requests are not played.
+        state.impacts.clear();
         // Sound set lines come from scripts (`PlaySoundSet`; rules and AI scripts pass the
         // grunt and pain types themselves) and character creation's preview. DAOrigins.exe
         // calls its sound set player (0x6b5740) only from the script command (0x6625c6), two
@@ -1602,52 +1586,5 @@ mod tests {
         assert_eq!((v.sfx, v.dialog), (0.0, 1.0));
         assert_eq!(slider_db(0.0), -60.0);
         assert_eq!(db_gain(-60.0), 0.0);
-    }
-}
-
-#[cfg(test)]
-mod impact_tests {
-    use super::*;
-
-    #[test]
-    fn blows_sound_by_weapon_and_what_they_strike() {
-        let ev = |w: &str, t: &str| format!("glo_fly_wep/weapon_impacts/{w}/{t}");
-        let mut i = Impacts::default();
-        i.materials
-            .extend([(2, 1), (3, 4), (60, 13), (61, 11), (70, 6)]);
-        i.hits.insert(
-            1,
-            vec![
-                ev("sword", "impact_materials/wood"),
-                ev("sword", "impact_materials/metal"),
-                ev("sword", "impact_armor/metal_arm"),
-                ev("sword", "impact_armor/cloth_arm"),
-                ev("sword", "impact_armor/flesh"),
-            ],
-        );
-        i.hits
-            .insert(19, vec![ev("barehand", "impact_armor/flesh")]);
-        assert_eq!(
-            i.event(1, Some(2), Some(60), None),
-            Some(ev("sword", "impact_armor/metal_arm"))
-        );
-        assert_eq!(
-            i.event(2, Some(2), Some(61), None),
-            Some(ev("sword", "impact_armor/cloth_arm"))
-        );
-        assert_eq!(
-            i.event(5, Some(2), None, Some(70)),
-            Some(ev("sword", "impact_materials/metal"))
-        );
-        // No weapon (or one without impacts): bare hands; a miss sounds nothing here.
-        assert_eq!(
-            i.event(1, None, None, None),
-            Some(ev("barehand", "impact_armor/flesh"))
-        );
-        assert_eq!(
-            i.event(1, Some(3), None, None),
-            Some(ev("barehand", "impact_armor/flesh"))
-        );
-        assert_eq!(i.event(3, Some(2), None, None), None);
     }
 }
