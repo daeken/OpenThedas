@@ -474,6 +474,68 @@ pub struct UiMovie {
     slots: BTreeMap<String, gfx::Slot>,
     engine_images: BTreeMap<String, String>,
     slots_loaded: Vec<String>,
+    /// How many inline images each text field (by its index, see `avm1::IMG_TAKE`) shows.
+    inline_images: std::collections::HashMap<u32, usize>,
+}
+
+/// An `<img>` tag in HTML text: where it is, its linkage name and its horizontal space.
+#[derive(Clone, Debug, PartialEq)]
+struct InlineImage {
+    start: usize,
+    end: usize,
+    src: String,
+    hspace: f64,
+}
+
+/// The `<img .../>` tags of `html`, in order.
+fn inline_images(html: &str) -> Vec<InlineImage> {
+    let lower = html.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = lower[from..].find("<img") {
+        let start = from + i;
+        let Some(j) = lower[start..].find('>') else {
+            break;
+        };
+        let end = start + j + 1;
+        let tag = &html[start..end];
+        let attr = |name: &str| -> Option<String> {
+            let l = tag.to_ascii_lowercase();
+            let p = l.find(&format!("{name}="))? + name.len() + 1;
+            let rest = &tag[p..];
+            let q = rest.chars().next()?;
+            if q == '\'' || q == '"' {
+                let e = rest[1..].find(q)?;
+                Some(rest[1..1 + e].to_string())
+            } else {
+                Some(
+                    rest.split(|c: char| c.is_whitespace() || c == '/' || c == '>')
+                        .next()?
+                        .to_string(),
+                )
+            }
+        };
+        if let Some(src) = attr("src") {
+            out.push(InlineImage {
+                start,
+                end,
+                src,
+                hspace: attr("hspace").and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            });
+        }
+        from = end;
+    }
+    out
+}
+
+/// Where the last line of `html` starts (after its last line break).
+fn last_line_start(html: &str) -> usize {
+    let lower = html.to_ascii_lowercase();
+    ["<br>", "<br/>", "<br />", "</p>", "\n", "\r"]
+        .iter()
+        .filter_map(|b| lower.rfind(b).map(|i| i + b.len()))
+        .max()
+        .unwrap_or(0)
 }
 
 /// Turns a callback id from the movie (a number) into its `cm_mapCallbacks` key.
@@ -549,6 +611,7 @@ impl UiMovie {
             slots: BTreeMap::new(),
             engine_images: BTreeMap::new(),
             slots_loaded: Vec::new(),
+            inline_images: Default::default(),
         })
     }
 
@@ -669,6 +732,116 @@ impl UiMovie {
         self.call(avm1::POST_LOAD_RUN, &[]);
         self.layout_scale9();
         self.fill_slots();
+        self.layout_inline_images();
+    }
+
+    /// Draws the inline images of the text fields that took new text (see
+    /// [`avm1::IMG_TAKE`]): each `<img>` is replaced in the text by enough non-breaking
+    /// spaces to hold it, and the image, by its linkage name, is placed over them. An image
+    /// is centred on its line. Provisional: Scaleform's own image layout (`align`, `vspace`,
+    /// `hspace`) is not traced, and a line the field wraps by itself is not followed.
+    fn layout_inline_images(&mut self) {
+        let UiValue::List(v) = self.call(avm1::IMG_TAKE, &[]) else {
+            return;
+        };
+        let num = |x: &UiValue| match x {
+            UiValue::Number(n) => *n,
+            _ => 0.0,
+        };
+        for pair in v.chunks(2) {
+            let (Some(UiValue::Number(k)), Some(UiValue::String(html))) =
+                (pair.first(), pair.get(1))
+            else {
+                continue;
+            };
+            let k = *k;
+            let images = inline_images(html);
+            let old = self
+                .inline_images
+                .insert(k as u32, images.len())
+                .unwrap_or(0);
+            // Clear what an earlier text placed beyond this one's images.
+            for n in images.len()..old {
+                let args = [k, n as f64].map(UiValue::Number);
+                self.call(
+                    avm1::IMG_PUT,
+                    &[
+                        args[0].clone(),
+                        args[1].clone(),
+                        UiValue::String(String::new()),
+                        UiValue::Number(0.0),
+                        UiValue::Number(0.0),
+                    ],
+                );
+            }
+            if images.is_empty() {
+                continue;
+            }
+            let put = |m: &mut Self, n: usize, src: &str, x: f64, y: f64| -> (f64, f64) {
+                match m.call(
+                    avm1::IMG_PUT,
+                    &[
+                        UiValue::Number(k),
+                        UiValue::Number(n as f64),
+                        UiValue::String(src.to_string()),
+                        UiValue::Number(x),
+                        UiValue::Number(y),
+                    ],
+                ) {
+                    UiValue::List(l) if l.len() == 2 => (num(&l[0]), num(&l[1])),
+                    _ => (0.0, 0.0),
+                }
+            };
+            let measure = |m: &mut Self, h: &str, wrap: bool| -> (f64, f64) {
+                match m.call(
+                    avm1::IMG_MEASURE,
+                    &[
+                        UiValue::Number(k),
+                        UiValue::String(h.to_string()),
+                        UiValue::Bool(wrap),
+                    ],
+                ) {
+                    UiValue::List(l) if l.len() == 2 => (num(&l[0]), num(&l[1])),
+                    _ => (0.0, 0.0),
+                }
+            };
+            // The images' sizes, then room for them in the text.
+            let sizes: Vec<(f64, f64)> = images
+                .iter()
+                .enumerate()
+                .map(|(n, im)| put(self, n, &im.src, -10000.0, -10000.0))
+                .collect();
+            let space = (measure(self, "&nbsp;&nbsp;&nbsp;&nbsp;", false).0 / 4.0).max(1.0);
+            let mut text = String::new();
+            let mut at = Vec::new();
+            let mut last = 0;
+            for (im, (w, _)) in images.iter().zip(&sizes) {
+                text.push_str(&html[last..im.start]);
+                at.push(text.len());
+                let n = ((w + 2.0 * im.hspace) / space).ceil().max(1.0) as usize;
+                text.push_str(&"&nbsp;".repeat(n));
+                last = im.end;
+            }
+            text.push_str(&html[last..]);
+            self.call(
+                avm1::IMG_SET,
+                &[UiValue::Number(k), UiValue::String(text.clone())],
+            );
+            let line = measure(self, "&nbsp;", true).1.max(1.0);
+            for (n, ((im, &(w, h)), &pos)) in images.iter().zip(&sizes).zip(&at).enumerate() {
+                let before = &text[..pos];
+                let lines = measure(self, &format!("{before}&nbsp;"), true).1;
+                let line_start = last_line_start(before);
+                let x = measure(self, &before[line_start..], false).0 + im.hspace;
+                let y = (lines - line) + (line - h) / 2.0;
+                // The text field's gutter (2 pixels each way), and a pixel's gap from the
+                // text before (the measuring field came out a little narrower than the
+                // field's own text). Provisional.
+                let _ = w;
+                let gap = if pos > 0 { 1.0 } else { 0.0 };
+                put(self, n, &im.src, x + 2.0 + gap, y + 2.0);
+            }
+        }
     }
 
     /// Advances the movie by `dt_ms` of wall time and runs pending loads.
@@ -924,6 +1097,31 @@ mod key_tests {
         );
         assert_eq!(UiKey::Char('x').text_control(), None);
         assert_eq!(UiKey::Escape.text_control(), None);
+    }
+}
+
+#[cfg(test)]
+mod inline_image_tests {
+    use super::*;
+
+    #[test]
+    fn img_tags_are_found_with_their_names_and_spacing() {
+        let html = "Value: 1<img src='ico_silver' align='baseline' vspace='-10'/> \
+                    0<IMG SRC=\"ico_copper\" hspace=3>";
+        let im = inline_images(html);
+        assert_eq!(im.len(), 2);
+        assert_eq!(&html[im[0].start..im[0].start + 4], "<img");
+        assert_eq!(im[0].src, "ico_silver");
+        assert_eq!((im[1].src.as_str(), im[1].hspace), ("ico_copper", 3.0));
+        assert_eq!(im[1].end, html.len());
+        assert!(inline_images("no images").is_empty());
+    }
+
+    #[test]
+    fn the_last_line_starts_after_the_last_break() {
+        assert_eq!(last_line_start("abc"), 0);
+        assert_eq!(last_line_start("a<br>bc"), 5);
+        assert_eq!(last_line_start("a<BR/>b\nc"), 8);
     }
 }
 
