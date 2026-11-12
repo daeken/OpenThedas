@@ -52,13 +52,15 @@ impl Screen {
         match self {
             // notifications.gfx: the journal's and codex's notifications (`Party.Alerts`).
             // floatylayer.gfx: the pause border and the text and bars over creatures,
-            // under the panels.
+            // under the panels. navbar.gfx: the screens' tab bar at the top, which the
+            // original's exploration HUD shows too (no tab selected).
             Screen::Hud => &[
                 "floatylayer.gfx",
                 "portraits.gfx",
                 "quickbar.gfx",
                 "minimap.gfx",
                 "notifications.gfx",
+                "navbar.gfx",
                 "tooltips.gfx",
             ],
             Screen::Cutscene => &["cutscene.gfx"],

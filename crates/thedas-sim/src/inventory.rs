@@ -193,19 +193,29 @@ impl Sim {
 
     /// The engine's side of `who` putting on `item` (already in `slot`): the item's
     /// properties take effect through the creature's `APPLY_EFFECT` handler, and its script
-    /// hears `EVENT_TYPE_EQUIP` (object 0 the item, integer 0 the slot, integer 1 the active
-    /// weapon set). Provisional: the event's integers are read from how player_core uses
-    /// them (integer 0 compared with the main- and off-hand slots); the second is a guess.
+    /// hears `EVENT_TYPE_EQUIP`. DAOrigins.exe sends that from one routine (0x6c16e0, type
+    /// 0xb set at 0x6c190f), the equipment container's item-added hook, so every way of
+    /// equipping reaches it: `EquipItem`, `LoadItemsFromTemplate` and a creature's template
+    /// gear when it is created. Object 0 is the item, integer 0 the slot, integer 1 whether
+    /// the player equipped it on the inventory screen (bit 0x80 of the flag word 0xc371b4,
+    /// set only by the screen's handler 0x6be330). rules_core works out the main-hand
+    /// damage (property 50) the record shows from it.
     pub(crate) fn wear(&mut self, who: ObjectId, item: ObjectId, slot: i32) {
+        self.wear_as(who, item, slot, false);
+    }
+
+    /// [`Sim::wear`], saying whether the player did it on the inventory screen.
+    pub(crate) fn wear_as(&mut self, who: ObjectId, item: ObjectId, slot: i32, by_player: bool) {
         for e in self.property_effects(item) {
             self.apply_effect(who, e);
         }
-        self.equip_event("EQUIP", who, item, slot);
+        self.equip_event("EQUIP", who, item, slot, by_player);
     }
 
     /// The engine's side of `who` taking off `item` (from `slot`): the effects it created on
     /// `who` go through the `REMOVE_EFFECT` handler, and the script hears
-    /// `EVENT_TYPE_UNEQUIP`, laid out as [`Sim::wear`]'s event.
+    /// `EVENT_TYPE_UNEQUIP` (type 0xc, 0x6c1b2d), laid out as [`Sim::wear`]'s event.
+    /// Provisional: its integer 1 is taken to mean the same as the equip event's.
     pub(crate) fn take_off(&mut self, who: ObjectId, item: ObjectId, slot: i32) {
         let mine: Vec<crate::world::Effect> = self
             .world
@@ -221,18 +231,20 @@ impl Sim {
         for e in mine {
             self.remove_effect(who, &e);
         }
-        self.equip_event("UNEQUIP", who, item, slot);
+        self.equip_event("UNEQUIP", who, item, slot, false);
     }
 
-    fn equip_event(&mut self, name: &str, who: ObjectId, item: ObjectId, slot: i32) {
-        let set = self
-            .world
-            .get(who)
-            .and_then(|o| o.fields.get("ActiveWeaponSet").copied())
-            .unwrap_or(0);
+    fn equip_event(
+        &mut self,
+        name: &str,
+        who: ObjectId,
+        item: ObjectId,
+        slot: i32,
+        by_player: bool,
+    ) {
         let mut ev = self.new_event(name, Some(who));
         ev.objects = vec![item];
-        ev.ints = vec![slot, set];
+        ev.ints = vec![slot, by_player as i32];
         self.world.queue_event(0, who, ev, None);
     }
 
@@ -327,7 +339,7 @@ impl Sim {
             o.inventory.push(item);
         }
         o.equipment.insert(slot, item);
-        self.wear(who, item, slot);
+        self.wear_as(who, item, slot, true);
         true
     }
 
@@ -403,37 +415,68 @@ impl Sim {
         }
     }
 
-    /// `ScaleEquippedItems`: gives a creature's equipped items the material their material
-    /// progression (`TS_Material`, table 199: a row per progression, columns `Material1` to
-    /// `Material15`) has at the target level, as the treasure scripts pick an item's
-    /// material: tier (level - 1) / 3 + 1 with the level between 1 and 45 and the tier
-    /// between 1 and 15. Unique items and items without a progression keep theirs; party
-    /// members are not scaled (script.ldf). Provisional: the treasure scripts' rule taken for
-    /// the engine's.
+    /// `ScaleEquippedItems` (action 386, handler 0x6664d0 calling 0x6a88f0): gives a
+    /// creature's equipped items the material their material progression (`TS_Material`,
+    /// table 199: a row per progression, columns `Material1` to `Material15`) has at the
+    /// target level. As DAOrigins.exe does it:
+    /// - party members are not scaled;
+    /// - the tier is `level / 3`, reading column `Material{tier + 1}` (the exe's eight column
+    ///   hashes at 0xb0f860 are `Material1` to `Material8`); from level 24 (tier 8) on
+    ///   nothing changes;
+    /// - only the slots in the exe's list at 0xb0f880 (every slot to 13 but the cloak's and
+    ///   slot 3);
+    /// - only items whose base item's `BITM_base.gda` column `#66f63962` is set (0x752c80
+    ///   reads the column the item loader keeps at item+0x6e4, 0x754822): weapons, shields,
+    ///   armour, gloves, boots and helmets; never clothing (base item 38), so a noble's
+    ///   doublet keeps its `Clothing, Noble` material and tint;
+    /// - with a progression (`MaterialProgress`) and a non-zero material at that tier.
+    ///
+    /// Provisional: a level of 0 or less makes the exe read the area's level from table
+    /// 0xe1 (and skip a creature already scaled); here it reads tier 0. The unique flag is
+    /// not consulted (the exe's loop does not read it).
     pub fn scale_equipped_items(&mut self, creature: ObjectId, level: i32) {
+        /// Slots the exe's loop visits (0xb0f880..0xb0f8b0).
+        const SLOTS: [i32; 12] = [0, 1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 13];
+        /// `BITM_base.gda`'s column of base items that scale (name unknown).
+        const SCALES: u32 = 0x66f6_3962;
         if crate::engine::party_of(self).contains(&creature) {
             return;
         }
-        let tier = ((level.clamp(1, 45) - 1) / 3 + 1).clamp(1, 15);
+        let tier = level.max(0) / 3;
+        if tier > 7 {
+            return;
+        }
         let items: Vec<ObjectId> = self
             .world
             .get(creature)
-            .map(|o| o.equipment.values().copied().collect())
+            .map(|o| {
+                SLOTS
+                    .iter()
+                    .filter_map(|s| o.equipment.get(s).copied())
+                    .collect()
+            })
             .unwrap_or_default();
         let tables = self.world.tables();
         let Some(t) = tables.get(199, "") else {
             return;
         };
+        let bitm = tables.get(0, "bitm_base");
         for item in items {
             let Some(o) = self.world.get(item) else {
                 continue;
             };
+            let scales = o.fields.get("BaseItem").is_some_and(|&b| {
+                matches!(
+                    bitm.as_ref().and_then(|g| g.cell_by_hash(SCALES, b as i64)),
+                    Some(thedas_formats::gda::Cell::Int(v)) if *v != 0
+                )
+            });
             let progression = o.fields.get("MaterialProgress").copied().unwrap_or(0);
-            if progression <= 0 || o.fields.get("Unique").copied().unwrap_or(0) != 0 {
+            if !scales || progression == 0 {
                 continue;
             }
-            let material = match t.cell(&format!("Material{tier}"), progression as i64) {
-                Some(thedas_formats::gda::Cell::Int(m)) if *m > 0 => *m as i32,
+            let material = match t.cell(&format!("Material{}", tier + 1), progression as i64) {
+                Some(thedas_formats::gda::Cell::Int(m)) if *m != 0 => *m as i32,
                 _ => continue,
             };
             if let Some(o) = self.world.get_mut(item) {
@@ -954,7 +997,8 @@ mod screen_tests {
                 .map(|q| (q.event.ty, q.event.objects.clone(), q.event.ints.clone()))
                 .collect()
         };
-        assert_eq!(events(&s), vec![(11, vec![amulet], vec![11, 0])]);
+        // Put on from the inventory screen: integer 1 says the player did it.
+        assert_eq!(events(&s), vec![(11, vec![amulet], vec![11, 1])]);
         // Changing a worn item's properties changes what it gives its wearer.
         assert!(s.remove_item_property(amulet, 1005));
         assert!(s.world.get(hero).unwrap().effects.is_empty());
@@ -1152,34 +1196,53 @@ mod stat_tests {
                 ],
             )],
         );
+        // Boots (1) scale; clothing (38) does not. The column is known only by its hash.
+        t.insert(
+            "bitm_base",
+            &["ID", "Label", "#66f63962"],
+            vec![
+                (
+                    1,
+                    vec![Cell::Int(1), Cell::String("Boots".into()), Cell::Int(1)],
+                ),
+                (
+                    38,
+                    vec![Cell::Int(38), Cell::String("Clothing".into()), Cell::Int(0)],
+                ),
+            ],
+        );
         s.world.tables = Arc::new(t);
         let foe = s.world.spawn(ObjectKind::Creature, "hurlock");
         let hero = s.world.spawn(ObjectKind::Creature, "hero");
         s.world.hero = Some(hero);
-        let give = |s: &mut Sim, who, unique| {
-            let i = s.world.spawn(ObjectKind::Item, "boots");
+        let give = |s: &mut Sim, who, slot, base| {
+            let i = s.world.spawn(ObjectKind::Item, "item");
             s.world.get_mut(i).unwrap().fields.extend([
                 ("MaterialProgress".to_string(), 46),
-                ("Material".to_string(), 1),
-                ("Unique".to_string(), unique),
+                ("Material".to_string(), 76),
+                ("BaseItem".to_string(), base),
             ]);
-            s.world.get_mut(who).unwrap().equipment.insert(unique, i);
+            s.world.get_mut(who).unwrap().equipment.insert(slot, i);
             i
         };
-        let (plain, unique, heros) = (
-            give(&mut s, foe, 0),
-            give(&mut s, foe, 1),
-            give(&mut s, hero, 0),
+        let (boots, clothes, cloak, heros) = (
+            give(&mut s, foe, 6, 1),
+            give(&mut s, foe, 4, 38),
+            give(&mut s, foe, 8, 1),
+            give(&mut s, hero, 6, 1),
         );
         let material = |s: &Sim, i| s.world.get(i).unwrap().fields["Material"];
-        // Level 7: tier (7 - 1) / 3 + 1 = 3.
+        // Level 7: tier 7 / 3 = 2, Material3.
         s.scale_equipped_items(foe, 7);
-        assert_eq!(material(&s, plain), 8);
-        assert_eq!(material(&s, unique), 1, "unique items keep theirs");
+        assert_eq!(material(&s, boots), 8);
+        assert_eq!(material(&s, clothes), 76, "clothing keeps its material");
+        assert_eq!(material(&s, cloak), 76, "the cloak slot is not visited");
         s.scale_equipped_items(hero, 7);
-        assert_eq!(material(&s, heros), 1, "the party is not scaled");
-        s.scale_equipped_items(foe, 4);
-        assert_eq!(material(&s, plain), 2);
+        assert_eq!(material(&s, heros), 76, "the party is not scaled");
+        s.scale_equipped_items(foe, 3);
+        assert_eq!(material(&s, boots), 2);
+        s.scale_equipped_items(foe, 24);
+        assert_eq!(material(&s, boots), 2, "past tier 7 nothing changes");
     }
 
     #[test]

@@ -1154,9 +1154,12 @@ fn texture_group(
                 },
             )
         });
-        let settings = sampler_name
-            .as_deref()
-            .and_then(|n| program.state.sampler(n).ok())
+        // A state file names a sampler or a stage: a pixel shader's sampler register is its
+        // stage (see `thedas_formats::state`); vertex samplers are named only.
+        let at = (stage == Stage::Pixel).then_some(s);
+        let settings = program
+            .state
+            .sampler_at(sampler_name.as_deref(), at)
             .unwrap_or_default();
         let key = sampler_key(&settings);
         samplers

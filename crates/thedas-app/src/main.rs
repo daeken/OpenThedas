@@ -45,6 +45,7 @@
 //! running game: the same steps as `--steps`, screenshots and the simulation's state (see
 //! [`control`]).
 
+mod audio;
 mod chargen_stage;
 mod control;
 mod cutcam;
@@ -201,6 +202,20 @@ struct Args {
     /// Booting to the start menu: skip the logo and intro movies the game plays first.
     #[arg(long)]
     no_intro: bool,
+    /// No sound. Sound is also off with `--control` (clients driving the game headless or
+    /// unattended) unless `--audio` asks for it, and when THEDAS_NO_AUDIO is set.
+    #[arg(long)]
+    no_audio: bool,
+    /// Sound even with `--control`.
+    #[arg(long)]
+    audio: bool,
+    /// Headless (`--steps`): record the game's sound to this WAV file (stereo, 48 kHz),
+    /// never to the speakers.
+    #[arg(long)]
+    audio_wav: Option<PathBuf>,
+    /// The voice-over language folder (`audio/vo/<language>`).
+    #[arg(long, default_value = "en-us")]
+    language: String,
 }
 
 /// Behind and above a hero at `pos` with the game's `facing`, looking the same way (as the
@@ -528,6 +543,8 @@ struct App {
     requests: Vec<ui::FrontEnd>,
     /// The boot movies, while they play (before the start menu takes input).
     intro: Option<intro::Intro>,
+    /// Music, interface sounds and voice-over (none with `--no-audio` or no output device).
+    audio: Option<audio::GameAudio>,
     /// The pad's skip buttons were held last frame (a skip is a fresh press).
     intro_pad_held: bool,
 }
@@ -945,6 +962,7 @@ impl App {
     }
 
     fn redraw(&mut self) -> Result<()> {
+        self.audio_frame();
         if self.intro.is_some() {
             return self.intro_frame();
         }
@@ -1093,6 +1111,27 @@ impl App {
         g.window.pre_present_notify();
         g.ctx.queue.present(frame);
         Ok(())
+    }
+
+    /// The sound follows the game: the menus' music, the interface's sounds, the open
+    /// conversation line's voice (see [`audio`]).
+    fn audio_frame(&mut self) {
+        let Some(a) = self.audio.as_mut() else {
+            return;
+        };
+        let movie = self
+            .intro
+            .as_ref()
+            .and_then(|i| i.now_playing())
+            .map(|(p, ms)| (p.to_path_buf(), ms));
+        let live = self.live.as_mut().filter(|_| self.intro.is_none());
+        let ui = self.gfx.as_mut().map(|g| &mut g.ui);
+        let state = audio_state(a, live, ui, &self.camera, movie);
+        a.frame(state);
+        let voice = a.voice_ms();
+        if let Some(g) = self.gfx.as_mut() {
+            g.ui.set_line_voice_ms(voice);
+        }
     }
 
     /// A frame with nothing to draw into: the simulation, its presentation and the interface
@@ -2043,6 +2082,132 @@ impl ApplicationHandler for App {
     }
 }
 
+/// What the sound follows this frame (see [`audio`]): the game playing (`live`, none during
+/// the boot movies), its interface (`ui`: the sounds it asked for, the player's volumes),
+/// the camera, and a boot movie playing. A cutscene's or area's sound data is read here
+/// when it starts.
+fn audio_state(
+    a: &mut audio::GameAudio,
+    live: Option<&mut live::Live>,
+    ui: Option<&mut ui::UiLayer>,
+    camera: &Camera,
+    movie: Option<(PathBuf, f64)>,
+) -> audio::AudioState {
+    let mut state = audio::AudioState {
+        movie,
+        ..Default::default()
+    };
+    if let Some(ui) = ui {
+        state.gui_sounds = ui.stage.bridge.drain_sounds();
+        state.volumes = audio::volumes(|n| ui.client_option(n));
+    }
+    let Some(live) = live else {
+        return state;
+    };
+    // Animations' sound events (see `Live::animation_clocks`).
+    if !live.front_end {
+        state.animations = live.animation_clocks();
+    }
+    {
+        let sim = live.sim();
+        state.front_end = live.front_end;
+        state.chargen = sim.world.chargen.is_some();
+        state.line = sim.conversation_line().and_then(|l| {
+            let female = sim
+                .world
+                .get(l.player)
+                .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
+            Some(audio::VoiceLine {
+                dialog: l.dialog.to_string(),
+                strref: l.strref?,
+                female,
+                ambient: l.ambient,
+            })
+        });
+        // A cutscene's sound tracks, and its line's voice when the line has its own.
+        if let Some(c) = sim.world.cutscene.as_ref() {
+            if a.wants_cutscene(&c.name) {
+                let tracks = sim
+                    .vfs
+                    .read(&c.name)
+                    .map(|(data, _)| thedas_sim::cutscene::sounds(&data))
+                    .unwrap_or_default();
+                a.set_cutscene(&c.name, tracks);
+            }
+            state.cutscene = Some((c.name.clone(), c.elapsed_ms as f32 / 1000.0));
+            if state.line.is_none()
+                && let Some(l) = c.line_now()
+                && l.vo_mode == 0
+                && let Some(conv) = l.conversation.as_ref()
+            {
+                let female = sim
+                    .world
+                    .hero
+                    .and_then(|h| sim.world.get(h))
+                    .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
+                state.line = Some(audio::VoiceLine {
+                    dialog: conv.clone(),
+                    strref: l.strref,
+                    female,
+                    ambient: false,
+                });
+            }
+        }
+    }
+    if live.front_end {
+        return state;
+    }
+    // The area: its music and placed sounds.
+    {
+        let mut sim = live.sim();
+        let area = sim
+            .world
+            .area
+            .and_then(|a| sim.world.get(a))
+            .map(|a| (a.id, a.template.clone()));
+        if let Some((area_id, resref)) = area.filter(|a| !a.1.is_empty()) {
+            if a.wants_area(&resref) {
+                let data = sim
+                    .vfs
+                    .read(&format!("{resref}.are"))
+                    .map(|(d, _)| d)
+                    .unwrap_or_default();
+                a.set_area(&resref, &data);
+            }
+            state.area = Some(resref);
+            state.combat = sim.world.party_fighting;
+            // Sounds scripts asked for. Sound sets, PlayMusic and SetMusicIntensity are not
+            // done yet (logged).
+            for req in std::mem::take(&mut sim.world.sounds) {
+                match req {
+                    thedas_sim::world::SoundRequest::Event { target, event } => {
+                        let at = sim.world.get(target).map(|o| o.position);
+                        state.script_sounds.push((event, at));
+                    }
+                    other => log::debug!("audio: not done yet: {other:?}"),
+                }
+            }
+            state.dead = sim.world.game_over;
+            state.inactive_sounds = sim
+                .world
+                .objects
+                .values()
+                .filter(|o| o.kind == thedas_sim::world::ObjectKind::Sound)
+                .filter(|o| o.area == Some(area_id) && !o.active)
+                .map(|o| o.tag.to_ascii_lowercase())
+                .collect();
+        }
+    }
+    // Between the party leader and the camera (`sound_settings.gda` "Camera / player
+    // listener balance position": 0.17 of the way to the camera).
+    let cam = camera.position;
+    let feet = live.leader_feet().unwrap_or(cam);
+    let p = feet + (cam - feet) * 0.17;
+    let right = [camera.yaw.sin(), -camera.yaw.cos(), 0.0];
+    state.listener = Some((p.to_array(), right));
+    state
+}
+
 /// The party leader uses quickbar slot `slot`; an ability that needs aiming waits for its
 /// target (its id is returned).
 fn use_quickslot(live: &mut live::Live, slot: i32) -> Option<i32> {
@@ -2641,6 +2806,10 @@ fn main() -> Result<()> {
     if let Some(out) = &args.capture {
         let ctx = GpuContext::headless()?;
         let mut played: Option<(ui::UiLayer, screens::Screens)> = None;
+        // The game's sound, recorded rather than played (`--audio-wav`).
+        let mut recording = args.audio_wav.as_ref().map(|_| {
+            audio::GameAudio::recording(&install, &args.module, &loaded.vfs, &args.language, 48000)
+        });
         let mut cursor = (size.0 as f64 / 2.0, size.1 as f64 / 2.0);
         // The game controller as `pad` steps hold it, and its part of the game.
         let mut pad_state = pad::PadState::default();
@@ -2813,6 +2982,15 @@ fn main() -> Result<()> {
                                 layer.update_minimap(&l.sim, &camera);
                                 layer.update_floaties(&l.sim, &camera, dt);
                                 ui_time += t.elapsed();
+                            }
+                            if let Some(a) = recording.as_mut() {
+                                let ui = played.as_mut().map(|(layer, _)| layer);
+                                let state = audio_state(a, Some(&mut *l), ui, &camera, None);
+                                a.record(state, dt as f32 / 1000.0);
+                                let voice = a.voice_ms();
+                                if let Some((layer, _)) = played.as_mut() {
+                                    layer.set_line_voice_ms(voice);
+                                }
                             }
                             frames += 1;
                             if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
@@ -3029,6 +3207,24 @@ fn main() -> Result<()> {
                 pad_play.pointer(cursor, ctx),
             );
         }
+        if let (Some(a), Some(path)) = (recording.as_ref(), args.audio_wav.as_ref()) {
+            let n = a.recorded.len().max(1) as f32;
+            let peak = a.recorded.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            let rms = (a.recorded.iter().map(|s| s * s).sum::<f32>() / n).sqrt();
+            thedas_audio::wav::write_wav(
+                std::io::BufWriter::new(std::fs::File::create(path)?),
+                48000,
+                2,
+                &a.recorded,
+            )?;
+            println!(
+                "audio: {} ({:.1}s, peak {:.1} dBFS, rms {:.1} dBFS)",
+                path.display(),
+                a.recorded.len() as f32 / 96000.0,
+                20.0 * peak.max(1e-9).log10(),
+                20.0 * rms.max(1e-9).log10()
+            );
+        }
         return capture(
             &ctx,
             &loaded,
@@ -3056,6 +3252,7 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::new()?;
     let screens = (live.is_some() && ui.is_empty())
         .then(|| screens::Screens::new(live.as_ref().is_some_and(|l| l.front_end)));
+    let loaded_vfs = loaded.vfs.clone();
     let mut app = App {
         loaded,
         live,
@@ -3091,6 +3288,17 @@ fn main() -> Result<()> {
             .then(|| intro::Intro::boot(&install))
             .flatten(),
         intro_pad_held: false,
+        audio: {
+            let off = args.no_audio
+                || std::env::var_os("THEDAS_NO_AUDIO").is_some()
+                || (args.control.is_some() && !args.audio);
+            if off {
+                log::info!("audio: off");
+                None
+            } else {
+                audio::GameAudio::open(&install, &args.module, &loaded_vfs, &args.language)
+            }
+        },
     };
     for line in pad::describe() {
         log::debug!("pad binding: {line}");

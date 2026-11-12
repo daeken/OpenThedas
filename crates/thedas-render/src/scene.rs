@@ -425,6 +425,9 @@ struct Placing<'a> {
     lights_only: bool,
     /// The placement's user parameters, for its emitters (see [`USER_COLOR_PARAMETER`]).
     user_params: &'a [(String, [f32; 4])],
+    /// The wearer's skin tone (its head morph's skin tint, slot 0): the tint mask's skin
+    /// entries of every material of the model.
+    skin: Option<&'a Tint>,
 }
 
 /// Face morph target families' neutral targets: the head's, the eyes' and the lashes'
@@ -466,6 +469,15 @@ fn rebalance_neutrals(weights: &mut Vec<(String, f32)>) {
 
 /// The material parameter an item tint fills.
 pub const TINT_PARAMETER: &str = "mml_vTintMaskColours";
+
+/// The tint mask entries a skin tone fills: its diffuse and specular colours (see
+/// `thedas_formats::morph::tint_slot_targets`).
+const SKIN_ENTRIES: [usize; 2] = [8, 9];
+
+/// The tint mask entries whose `w` is the skin channel's opacity (diffuse, specular):
+/// `Ch1ArmTnt.psh` lerps the diffuse texture towards the skin colour by the tint mask's alpha
+/// times entry 0's `w`.
+const SKIN_OPACITY_ENTRIES: [usize; 2] = [0, 1];
 
 struct Loader<'a> {
     vfs: &'a Vfs,
@@ -1034,6 +1046,7 @@ impl<'a> Loader<'a> {
             tint,
             lights_only,
             user_params,
+            skin,
         } = at;
         let Some(model) = self.model(model_name) else {
             return;
@@ -1108,6 +1121,9 @@ impl<'a> Loader<'a> {
                     &[],
                     &[(TINT_PARAMETER.to_string(), t.colours.to_vec())],
                 );
+            }
+            if let Some(skin) = skin {
+                material = self.skinned_material(material, skin);
             }
 
             let node = piece
@@ -1227,6 +1243,68 @@ impl<'a> Loader<'a> {
                 node: piece.name.unwrap_or("").to_string(),
             });
         }
+    }
+
+    /// `base` with a wearer's skin tone in its tint mask's skin channel: the skin colours
+    /// (entries 8, 9 in the tint's shader order) and the skin opacities (the `w` of entries 0
+    /// and 1). Bare hands and arms of a body, clothing or glove model take the face's skin
+    /// tint (its morph's slot 0, `t1_skn_*`, whose opacities are (0, 0, 0, 1)); the item tint
+    /// (or the material's own colours) keeps the red, green and blue channels. Item tints
+    /// carry zero skin opacity, and a material without a tint array has the definition's
+    /// default (opacities 0), so without this every body part's skin stays the white of
+    /// its diffuse texture. The tint masks' alpha marks only skin (`hm_arm_nuda_0t` 95%,
+    /// noble clothing `pm_cth_nblc_0t` 4%). Only the `*ArmourSkinTint` semantics take it:
+    /// their shader (`Ch1ArmTnt.psh`) multiplies the diffuse texture by the skin colour,
+    /// where the `LerpedTint` one (`Ch1.psh`) would replace the texture with it (Rica's arms
+    /// in Dust Town turned flat and pale). Provisional: the exe's composition of the body
+    /// tint is not traced.
+    fn skinned_material(&mut self, base: usize, skin: &Tint) -> usize {
+        let m = &self.scene.materials[base];
+        if !m.semantic.to_ascii_lowercase().contains("skintint") {
+            return base;
+        }
+        let mut colours: Vec<[f32; 4]> = m
+            .object
+            .vector_arrays
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(TINT_PARAMETER))
+            .map(|(_, v)| {
+                v.chunks_exact(4)
+                    .map(|c| [c[0], c[1], c[2], c[3]])
+                    .collect()
+            })
+            .or_else(|| crate::d3d::default_vectors(m, TINT_PARAMETER))
+            .unwrap_or_default();
+        if colours.len() < thedas_formats::tint::COLOURS {
+            // The definitions' default: zero opacities, white colours.
+            let start = colours.len();
+            colours.extend((start..thedas_formats::tint::COLOURS).map(|i| {
+                if SKIN_OPACITY_ENTRIES.contains(&i) {
+                    [0.0; 4]
+                } else {
+                    [1.0; 4]
+                }
+            }));
+        }
+        for e in SKIN_OPACITY_ENTRIES {
+            colours[e][3] = skin.colours[e][3];
+        }
+        for e in SKIN_ENTRIES {
+            colours[e] = skin.colours[e];
+        }
+        let key: String = SKIN_ENTRIES
+            .iter()
+            .flat_map(|&e| skin.colours[e])
+            .chain(SKIN_OPACITY_ENTRIES.iter().map(|&e| skin.colours[e][3]))
+            .map(|x| format!("{x:.4}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        self.overridden_material(
+            base,
+            &format!("skin:{key}"),
+            &[],
+            &[(TINT_PARAMETER.to_string(), colours)],
+        )
     }
 
     /// The skeleton of a model, built once.
@@ -1395,6 +1473,7 @@ impl AreaScene {
                         tint: None,
                         lights_only: !level_meshes,
                         user_params: &p.user_params,
+                        skin: None,
                     },
                 );
             }
@@ -1416,6 +1495,7 @@ impl AreaScene {
                     tint: None,
                     lights_only: false,
                     user_params: &[],
+                    skin: None,
                 },
             );
             let materials = &l.scene.materials;
@@ -1450,7 +1530,15 @@ impl AreaScene {
                 tint: None,
                 lights_only: false,
                 user_params: &[],
+                skin: None,
             };
+            // The face's skin tone (its skin tint, slot 0), for the body's bare skin.
+            let skin_tint: Option<Arc<Tint>> = prop
+                .morph
+                .as_ref()
+                .and_then(|n| l.morph(n))
+                .and_then(|m| m.tints.first().cloned().flatten())
+                .and_then(|t| l.tint(&t));
             // Each tinted model's tint, read once per prop.
             let tints: Vec<(String, String, Option<Arc<Tint>>)> = prop
                 .tints
@@ -1467,6 +1555,7 @@ impl AreaScene {
             for model in &prop.models {
                 let at = Placing {
                     tint: tint_of(model),
+                    skin: skin_tint.as_deref(),
                     ..placing(room_name)
                 };
                 l.place(model, prop.transform, at);

@@ -665,6 +665,14 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     );
     v.insert("Tutorials.Enabled".into(), num(0));
     v.insert("Tutorials.TrainingStep".into(), num(0));
+    // The tutorials' screen highlights (DAConstants `GUI_HIGHLIGHT_*`: 0 follower, 1
+    // tactics, 2 inventory, 3 health poultice, 4 empty quickbar, 5 tactic preset, 6
+    // equipment slot, 7 unequipped item) are all off: no tutorial asks for one. A movie
+    // hearing nothing leaves its glow on (the portraits' halo, the quickbar's).
+    for i in 0..8 {
+        v.insert(format!("GUI.GuiHighlights.{i}"), num(i));
+        v.insert(format!("GUI.GuiHighlights.{i}.Highlight"), num(0));
+    }
     if let Some(who) = controlled.or(hero) {
         tactics(sim, who, &mut v);
     }
@@ -967,6 +975,32 @@ fn journal(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
             Ok(n) => num(n),
             Err(_) => s(""),
         },
+    );
+    // The quest the journal opens on when no notification picked one: the active quest, else
+    // the one with the latest entry (`active` is latest first), its group expanded.
+    // Provisional: the exe keeps the player's last selection here (GUIJournal.LastSelected*);
+    // it is not kept yet, and the latest entry stands in for it.
+    let opened = j
+        .active_quest
+        .as_deref()
+        .and_then(|r| j.active.iter().find(|q| q.resref == r))
+        .or_else(|| j.active.first());
+    v.insert(
+        "GUIJournal.LastSelectedQuest".into(),
+        s(opened.map_or("", |q| q.resref.as_str())),
+    );
+    v.insert(
+        "GUIJournal.LastSelectedQuestGroup".into(),
+        s(opened.map_or("", |q| q.group.as_str())),
+    );
+    let done = j.completed.first();
+    v.insert(
+        "GUIJournal.LastSelectedCompletedQuest".into(),
+        s(done.map_or("", |q| q.resref.as_str())),
+    );
+    v.insert(
+        "GUIJournal.LastSelectedCompletedQuestGroup".into(),
+        s(done.map_or("", |q| q.group.as_str())),
     );
     v.insert("GUIJournal.NotificationContentID".into(), s(""));
     v.insert("GUIJournal.NotificationOpenPRCTab".into(), num(0));

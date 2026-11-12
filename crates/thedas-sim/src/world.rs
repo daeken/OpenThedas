@@ -428,6 +428,27 @@ pub struct FloatyMessage {
     pub duration: f32,
 }
 
+/// A sound a script asked for (`PlaySound`, `PlaySoundSet`, `PlaySoundObject`, `PlayMusic`,
+/// `SetMusicIntensity`), for the presentation to play. Output only.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SoundRequest {
+    /// `PlaySound(oTarget, sSoundEventName)`: an FMOD event at the object.
+    Event { target: ObjectId, event: String },
+    /// `PlaySoundSet(oTarget, nSoundSetEntry, fProbabilityOverride)`: an entry of the
+    /// creature's sound set.
+    SoundSet {
+        target: ObjectId,
+        entry: i32,
+        probability: f32,
+    },
+    /// `PlaySoundObject(oSound)`: a placed sound object plays.
+    Object { sound: ObjectId },
+    /// `PlayMusic(sMusicName)`.
+    Music { name: String },
+    /// `SetMusicIntensity(nIntensity)`.
+    MusicIntensity { intensity: i32 },
+}
+
 /// Everything a save holds. The trace and the tables are not saved: the trace starts afresh
 /// and the tables come from the resources of the simulation that loads the save.
 #[derive(Clone, Serialize, Deserialize)]
@@ -553,6 +574,10 @@ pub struct World {
     /// the simulation reads it.
     #[serde(skip)]
     pub floaties: Vec<FloatyMessage>,
+    /// The sounds scripts asked for that the presentation has not taken yet. Output only:
+    /// nothing in the simulation reads it.
+    #[serde(skip)]
+    pub sounds: Vec<SoundRequest>,
     #[serde(skip, default = "no_tables")]
     pub(crate) tables: Arc<crate::m2da::Tables>,
 }
@@ -661,6 +686,7 @@ impl World {
             rng: Rng::new(seed),
             trace: Trace::default(),
             floaties: Vec::new(),
+            sounds: Vec::new(),
             tables,
         }
     }

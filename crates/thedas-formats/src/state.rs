@@ -8,8 +8,17 @@
 //!   <DeviceState State="DS_ALPHAREF" Value="127" />
 //!   <DeviceState State="DS_CULLMODE" Value="CULL_CW" />
 //!   <SamplerState SamplerName="smpDecal" State="SAMP_ADDRESSU" Value="TEXADD_WRAP" />
+//!   <SamplerState Stage="1" State="SAMP_MIPFILTER" Value="TEXFILT_LINEAR" />
 //! </MaterialState>
 //! ```
+//!
+//! A sampler state names its sampler by HLSL name (`SamplerName`) or by sampler stage
+//! (`Stage`, 83 of the install's 178 files, the hair passes' among them; never both). A
+//! stage is the pixel shader's sampler register (`s1` for stage 1), as D3D9's
+//! `SetSamplerState(stage, ...)` addresses it. Provisional: the engine's state loader is not
+//! traced; the stage numbers match the shaders' sampler registers (`HairAlphaPass2.sta`
+//! sets stages 0 and 1, `Hair0.psh` samples `smpHairTexture` at s0 and `smpNoiseTexture` at
+//! s1).
 //!
 //! State and value names mirror `D3DRENDERSTATETYPE` / `D3DSAMPLERSTATETYPE` with a `DS_` /
 //! `SAMP_` prefix. [`MaterialState`] keeps every pair as written and offers typed accessors for
@@ -20,7 +29,10 @@ use crate::material::MaterialError;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SamplerState {
+    /// The HLSL sampler name; empty when the state names a stage instead.
     pub sampler: String,
+    /// The sampler stage (pixel shader sampler register), when the state names one.
+    pub stage: Option<u32>,
     pub state: String,
     pub value: String,
 }
@@ -244,8 +256,17 @@ impl MaterialState {
             if tag.eq_ignore_ascii_case("DeviceState") {
                 st.device.push((state, value));
             } else if tag.eq_ignore_ascii_case("SamplerState") {
+                let stage = match attr(&n, "Stage") {
+                    None => None,
+                    Some(v) => Some(v.parse::<u32>().map_err(|_| MaterialError::BadValue {
+                        element: "SamplerState",
+                        name: "Stage".into(),
+                        value: v.clone(),
+                    })?),
+                };
                 st.samplers.push(SamplerState {
                     sampler: attr(&n, "SamplerName").unwrap_or_default(),
+                    stage,
                     state,
                     value,
                 });
@@ -254,7 +275,7 @@ impl MaterialState {
         // Validate the values the typed accessors interpret, so bad files fail at parse time.
         st.pass()?;
         for s in &st.samplers {
-            st.sampler(&s.sampler)?;
+            st.sampler_at(Some(&s.sampler), s.stage)?;
         }
         Ok(st)
     }
@@ -354,12 +375,23 @@ impl MaterialState {
 
     /// Settings for one sampler (by its HLSL sampler name, e.g. `smpDecal`).
     pub fn sampler(&self, name: &str) -> Result<SamplerSettings, MaterialError> {
+        self.sampler_at(Some(name), None)
+    }
+
+    /// Settings for the sampler a shader names `name` and reads at stage (pixel shader
+    /// sampler register) `stage`: the states for either, in file order.
+    pub fn sampler_at(
+        &self,
+        name: Option<&str>,
+        stage: Option<u32>,
+    ) -> Result<SamplerSettings, MaterialError> {
         let mut s = SamplerSettings::default();
-        for x in self
-            .samplers
-            .iter()
-            .filter(|x| x.sampler.eq_ignore_ascii_case(name))
-        {
+        for x in self.samplers.iter().filter(|x| {
+            let by_name =
+                !x.sampler.is_empty() && name.is_some_and(|n| x.sampler.eq_ignore_ascii_case(n));
+            let by_stage = x.stage.is_some() && x.stage == stage;
+            by_name || by_stage
+        }) {
             let v = x.value.as_str();
             let berr = || MaterialError::BadValue {
                 element: "SamplerState",
@@ -401,6 +433,39 @@ mod tests {
   <SamplerState SamplerName="smpLightmap" State="SAMP_MINFILTER" Value="TEXFILT_LINEAR" />
   <SamplerState SamplerName="smpShadow" State="SAMP_BORDERCOLOR" Value="4294967295" />
 </MaterialState>"#;
+
+    #[test]
+    fn sampler_states_by_stage_reach_the_register_they_name() {
+        let st = MaterialState::parse(
+            br#"<MaterialState Name="HairPass">
+  <SamplerState Stage="0" State="SAMP_MINFILTER" Value="TEXFILT_LINEAR" />
+  <SamplerState Stage="0" State="SAMP_MIPFILTER" Value="TEXFILT_LINEAR" />
+  <SamplerState Stage="1" State="SAMP_ADDRESSU" Value="TEXADD_CLAMP" />
+  <SamplerState SamplerName="smpShadow" State="SAMP_MAGFILTER" Value="TEXFILT_LINEAR" />
+</MaterialState>"#,
+        )
+        .unwrap();
+        let s0 = st.sampler_at(Some("smpHairTexture"), Some(0)).unwrap();
+        assert_eq!((s0.min, s0.mip), (Filter::Linear, Filter::Linear));
+        assert_eq!(s0.address_u, AddressMode::Wrap);
+        let s1 = st.sampler_at(Some("smpNoiseTexture"), Some(1)).unwrap();
+        assert_eq!((s1.min, s1.address_u), (Filter::Point, AddressMode::Clamp));
+        // By name alone, the stage states do not apply.
+        assert_eq!(
+            st.sampler("smpHairTexture").unwrap(),
+            SamplerSettings::default()
+        );
+        assert_eq!(
+            st.sampler_at(Some("smpShadow"), Some(5)).unwrap().mag,
+            Filter::Linear
+        );
+        assert!(
+            MaterialState::parse(
+                br#"<MaterialState><SamplerState Stage="x" State="SAMP_MINFILTER" Value="TEXFILT_LINEAR"/></MaterialState>"#
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn reads_pass_and_sampler_state() {

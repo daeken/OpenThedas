@@ -52,6 +52,37 @@ fn load<T>(
 }
 
 impl Animator {
+    /// The `.ani` resource a clip plays (the first tree with one of its actions), and the
+    /// animation itself: its events (`<stem>.evt`) are named after it.
+    pub fn animation_resource(
+        &mut self,
+        vfs: &Vfs,
+        clip: &Clip,
+    ) -> Option<(String, Arc<Animation>)> {
+        for tree in &clip.trees {
+            let name = if tree.ends_with(".anb") {
+                tree.clone()
+            } else {
+                format!("{tree}.anb")
+            };
+            let Some(t) = load(&mut self.trees, vfs, &name, |d| AnimTree::parse(d).ok()) else {
+                continue;
+            };
+            let Some(ani) = clip
+                .actions
+                .iter()
+                .find_map(|a| t.action(a).and_then(|n| n.animation.clone()))
+            else {
+                continue;
+            };
+            let anim = load(&mut self.animations, vfs, &ani, |d| {
+                Animation::parse(d).ok()
+            })?;
+            return Some((ani, anim));
+        }
+        None
+    }
+
     /// The animation a clip names, if a tree has the action and its keyframes load.
     pub fn animation(&mut self, vfs: &Vfs, clip: &Clip) -> Option<Arc<Animation>> {
         for tree in &clip.trees {

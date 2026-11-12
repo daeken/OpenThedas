@@ -33,7 +33,9 @@ const FIELD_LINE_TEXT: u32 = 22;
 const FIELD_LINE_START: u32 = 5301;
 const FIELD_LINE_END: u32 = 5302;
 const FIELD_MOVIE: u32 = 5740;
-const FIELD_LINE_DIALOG: u32 = 5562;
+const FIELD_SOUND_EVENT: u32 = 5670;
+const FIELD_LINE_CONVERSATION: u32 = 5562;
+const FIELD_LINE_VO: u32 = 5564;
 
 /// The longest a cutscene is taken to run (seconds), whatever its file says.
 pub const MAX_SECONDS: f32 = 600.0;
@@ -47,6 +49,16 @@ pub struct CutsceneLine {
     pub strref: u32,
     /// The actor saying it, as the cutscene names it.
     pub actor: String,
+    /// The conversation the line comes from (field 5562): its voice-over is in that
+    /// conversation's FMOD project.
+    #[serde(default)]
+    pub conversation: Option<String>,
+    /// Field 5564. Taken to say whether the line's own voice-over plays: 0 plays it, 2 is a
+    /// line whose voice is mixed into one of the cutscene's sound tracks (the intro's
+    /// narration: `game_intro`'s lines are 2 but for three later additions, which are 0).
+    /// Provisional.
+    #[serde(default)]
+    pub vo_mode: u8,
 }
 
 /// A cutscene, and how far it has played.
@@ -117,11 +129,22 @@ impl Cutscene {
                 if t.id == u32::MAX || end < start {
                     continue;
                 }
+                let conversation = g
+                    .field(track, FIELD_LINE_CONVERSATION)
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim_end_matches('\0').trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let vo_mode = g
+                    .field(track, FIELD_LINE_VO)
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0) as u8;
                 lines.push(CutsceneLine {
                     start: start.clamp(0.0, seconds),
                     end: end.clamp(0.0, seconds),
                     strref: t.id,
                     actor: name.clone(),
+                    conversation,
+                    vo_mode,
                 });
             }
         }
@@ -179,7 +202,7 @@ pub fn dialog_refs(g: &Gff4) -> Vec<DialogRef> {
                 continue;
             }
             let Some(dialog) = g
-                .field(track, FIELD_LINE_DIALOG)
+                .field(track, FIELD_LINE_CONVERSATION)
                 .and_then(Value::as_str)
                 .map(|s| s.trim_end_matches('\0').trim().to_string())
                 .filter(|s| !s.is_empty())
@@ -267,6 +290,80 @@ pub fn movies_of(g: &Gff4) -> Vec<CutsceneMovie> {
                 start: start.clamp(0.0, seconds),
                 end: end.clamp(0.0, seconds),
                 name,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.start.total_cmp(&b.start));
+    out
+}
+
+/// A sound a cutscene plays (an `ACSP` track, track type 31): an FMOD event by path, from
+/// the track's start until its end.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CutsceneSound {
+    /// Seconds into the cutscene it starts, and stops (at most the cutscene's length).
+    pub start: f32,
+    pub end: f32,
+    /// The event (`game_intro/game_intro/game_intro`).
+    pub event: String,
+    /// The actor the track is on (a 3D sound plays from it). Provisional.
+    pub actor: String,
+}
+
+/// The sounds a cutscene's file plays, by start time (none when it is not a cutscene).
+/// Nothing in the simulation reads them: they are for the presentation.
+pub fn sounds(data: &[u8]) -> Vec<CutsceneSound> {
+    match Gff4::parse(data) {
+        Ok(g) => sounds_of(&g),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The sounds a parsed cutscene plays, by start time.
+pub fn sounds_of(g: &Gff4) -> Vec<CutsceneSound> {
+    if g.file_type.0 != *b"CUT " {
+        return Vec::new();
+    }
+    let seconds = g
+        .field(g.root, FIELD_SECONDS)
+        .and_then(Value::as_f64)
+        .map(|s| s as f32)
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .unwrap_or(0.0)
+        .min(MAX_SECONDS);
+    let mut out = Vec::new();
+    for actor in structs(g, g.root, FIELD_ACTORS) {
+        let actor_name = g
+            .field(actor, FIELD_ACTOR_NAME)
+            .and_then(Value::as_str)
+            .map(|s| s.trim_end_matches('\0').to_string())
+            .unwrap_or_default();
+        for track in structs(g, actor, FIELD_TRACKS) {
+            if g.template_of(track).label.0 != *b"ACSP" {
+                continue;
+            }
+            let event = g
+                .field(track, FIELD_SOUND_EVENT)
+                .and_then(Value::as_str)
+                .map(|s| s.trim_end_matches('\0').trim().to_string())
+                .unwrap_or_default();
+            let time = |l| {
+                g.field(track, l)
+                    .and_then(Value::as_f64)
+                    .map(|s| s as f32)
+                    .filter(|s| !s.is_nan())
+            };
+            let (Some(start), Some(end)) = (time(FIELD_LINE_START), time(FIELD_LINE_END)) else {
+                continue;
+            };
+            if event.is_empty() || end <= start {
+                continue;
+            }
+            out.push(CutsceneSound {
+                start: start.clamp(0.0, seconds),
+                end: end.min(seconds.max(start)),
+                event,
+                actor: actor_name.clone(),
             });
         }
     }
@@ -363,6 +460,10 @@ mod tests {
                 ),
                 template(b"TRAK", &[]),
                 template(b"APBM", &[FIELD_MOVIE, FIELD_LINE_START, FIELD_LINE_END]),
+                template(
+                    b"ACSP",
+                    &[FIELD_SOUND_EVENT, FIELD_LINE_START, FIELD_LINE_END],
+                ),
             ],
             structs: vec![
                 StructData {
@@ -382,6 +483,7 @@ mod tests {
                             slot(4),
                             slot(5),
                             slot(6),
+                            slot(7),
                         ]))),
                     ],
                 },
@@ -393,6 +495,14 @@ mod tests {
                 line(100, 0.5, 3.5),
                 movie("later\0", 2.0, 1e10),
                 movie("first\0", 0.0, 2.0),
+                StructData {
+                    template: 5,
+                    values: vec![
+                        Value::String(Some("game_intro/game_intro/game_intro\0".into())),
+                        Value::F32(0.0),
+                        Value::F32(1e10),
+                    ],
+                },
             ],
             root: StructId(0),
             shared_strings: None,
@@ -437,5 +547,21 @@ mod tests {
         assert_eq!(got, [("first", 0.0, 2.0), ("later", 2.0, 10.0)]);
         assert!(movies_of(&cut(b"CONV", 10.0)).is_empty());
         assert!(movies(b"junk").is_empty());
+    }
+
+    #[test]
+    fn reads_the_sounds_played() {
+        let s = sounds_of(&cut(b"CUT ", 10.0));
+        assert_eq!(
+            s,
+            [CutsceneSound {
+                start: 0.0,
+                end: 10.0,
+                event: "game_intro/game_intro/game_intro".into(),
+                actor: "duncan".into(),
+            }]
+        );
+        assert!(sounds_of(&cut(b"CONV", 10.0)).is_empty());
+        assert!(sounds(b"junk").is_empty());
     }
 }

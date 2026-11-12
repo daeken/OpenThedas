@@ -3020,13 +3020,13 @@ impl Sim {
                         }
                     }
                 }
-                // What it starts out wearing takes effect as anything worn does (the item's
-                // properties through APPLY_EFFECT). Provisional: whether the engine also sends
-                // EVENT_TYPE_EQUIP for a template's equipment is not known; it is not sent.
+                // What it starts out wearing is put on as anything else is: the item's
+                // properties take effect and the creature hears EVENT_TYPE_EQUIP
+                // (DAOrigins.exe: 0x6bcc30 reads Equip_ItemList and equips each item through
+                // 0x6bc7f0, whose container hook sends the event; see `Sim::wear`). Weapons
+                // put in the inactive set get no event (0x797d10).
                 if worn {
-                    for e in self.property_effects(item) {
-                        self.apply_effect(id, e);
-                    }
+                    self.wear(id, item, slot as i32);
                 }
             }
         }
@@ -3607,6 +3607,8 @@ mod tests {
                 end: 2.0,
                 strref: 7,
                 actor: "duncan".into(),
+                conversation: None,
+                vo_mode: 0,
             }],
             elapsed_ms: 0,
             from_dialog: false,

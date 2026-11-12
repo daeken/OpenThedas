@@ -20,3 +20,4 @@ thedas-sim.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
+thedas-audio = { workspace = true, default-features = false }
