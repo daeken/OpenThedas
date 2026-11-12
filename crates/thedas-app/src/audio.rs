@@ -308,6 +308,18 @@ fn read_gda(vfs: &Vfs, name: &str) -> Option<thedas_formats::Gda> {
         .and_then(|(d, _)| thedas_formats::Gda::parse(&d).ok())
 }
 
+/// A blow's event (DAOrigins.exe 0x5b8d2e): `sound_weapon_hits.gda`'s cell in the row of
+/// the striking hand's sound material and the column of the struck material's label
+/// (`labels`: sound material -> label hash, from `sound_item_materials.gda`).
+fn blow_event(
+    hits: &thedas_formats::Gda,
+    labels: &std::collections::HashMap<i64, u32>,
+    weapon: Option<i64>,
+    struck: i64,
+) -> Option<String> {
+    table_event(hits, weapon?, *labels.get(&struck)?)
+}
+
 /// The event in row `row`, column `col` (by hash) of a sound table, if any.
 fn table_event(t: &thedas_formats::Gda, row: i64, col: u32) -> Option<String> {
     let c = t.columns.iter().position(|c| c.hash == col)?;
@@ -932,13 +944,9 @@ impl GameAudio {
                         if let Some((struck, at)) = target {
                             let w = if left { g.off } else { g.main };
                             let weapon = self.impacts.material(w).or(g.unarmed);
-                            let event = match (weapon, self.item_material_labels.get(&struck)) {
-                                (Some(row), Some(col)) => self
-                                    .weapon_hits
-                                    .as_ref()
-                                    .and_then(|t| table_event(t, row, *col)),
-                                _ => None,
-                            };
+                            let event = self.weapon_hits.as_ref().and_then(|t| {
+                                blow_event(t, &self.item_material_labels, weapon, struck)
+                            });
                             if let Some(e) = event {
                                 log::debug!("audio: blow {e} (creature {id}, struck {struck})");
                                 self.engine.play(
@@ -1567,6 +1575,47 @@ fn db_gain(db: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blows_look_up_weapon_by_struck_material() {
+        use thedas_formats::gda::{Cell, Column, Gda, column_hash};
+        let col = |name: &str| Column {
+            hash: column_hash(name),
+            kind: None,
+        };
+        let hits = Gda {
+            version: thedas_formats::FourCC(*b"V0.2"),
+            columns: vec![col("ID"), col("Label"), col("Armor-chain"), col("Flesh")],
+            rows: vec![
+                vec![
+                    Cell::Int(1),
+                    Cell::String("Sword".into()),
+                    Cell::String("w/sword/chain".into()),
+                    Cell::String("w/sword/flesh".into()),
+                ],
+                vec![
+                    Cell::Int(19),
+                    Cell::String("BareHands".into()),
+                    Cell::Empty,
+                    Cell::String("w/fist/flesh".into()),
+                ],
+            ],
+        };
+        let labels: std::collections::HashMap<i64, u32> =
+            [(12, column_hash("Armor-chain")), (16, column_hash("Flesh"))].into();
+        assert_eq!(
+            blow_event(&hits, &labels, Some(1), 12).as_deref(),
+            Some("w/sword/chain")
+        );
+        assert_eq!(
+            blow_event(&hits, &labels, Some(19), 16).as_deref(),
+            Some("w/fist/flesh")
+        );
+        // An empty cell, an unknown struck material or no weapon material: no blow.
+        assert_eq!(blow_event(&hits, &labels, Some(19), 12), None);
+        assert_eq!(blow_event(&hits, &labels, Some(1), 99), None);
+        assert_eq!(blow_event(&hits, &labels, None, 16), None);
+    }
 
     #[test]
     fn footstep_columns_come_from_the_appearance_type() {

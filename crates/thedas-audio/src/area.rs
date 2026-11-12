@@ -129,6 +129,9 @@ impl AreaReverb {
     /// A reverb trigger counts 1 and an audio volume 0.15 (0x6867d1..0x6867e7: the
     /// trigger's +0x1d8 virtual, its cast to an audio volume, 0x79af30 for type 4 and null,
     /// 0x4137b0, for type 3).
+    /// The sums are `f32`, added in trigger order as the exe adds them (each sum stored back
+    /// to a float, 0x686811..0x68682b), so near-ties such as twenty volumes (`0.15 * 20`)
+    /// against three triggers round the same way; an exact tie goes to the first by name.
     ///
     /// Provisional: the exe also loads the next two most-used presets into secondary reverb
     /// instances, which only events that name a preset use; those are not modelled.
