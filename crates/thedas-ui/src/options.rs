@@ -10,8 +10,8 @@
 //! `ClientOptions.RestoreDefaults` from its button. The defaults are those DAOrigins.exe's
 //! ClientOptions sets up (0x5e8735-0x5ec18d). Provisional: Cancel keeps what was set (the
 //! executable's handlers, registered at 0x7946c0, are not traced) and nothing is written to the
-//! player's settings file. The audio volumes and mutes, auto-pause in combat and the
-//! tutorials take effect; the other settings change nothing yet but what the screen shows.
+//! player's settings file. The audio volumes and mutes, auto-pause in combat, the
+//! tutorials, mouse sensitivity and the inverted axes take effect; the other settings change nothing yet but what the screen shows.
 
 use std::collections::BTreeMap;
 

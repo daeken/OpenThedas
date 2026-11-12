@@ -2152,10 +2152,24 @@ impl ApplicationHandler for App {
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta } = event {
             if self.looking {
-                let s = 0.003;
+                // The player's control options: mouse sensitivity scales the turn (1, the
+                // default, is the old fixed 0.003 radians a pixel) and the axes may be
+                // inverted. Provisional: the exe's sensitivity curve is not traced.
+                let opt = |name: &str, default: f64| {
+                    self.gfx
+                        .as_ref()
+                        .and_then(|g| g.ui.client_option(name))
+                        .unwrap_or(default) as f32
+                };
+                let s = 0.003 * opt("ControlOptions.MouseSensitivity", 1.0).clamp(0.05, 4.0);
+                let sign = |name: &str| if opt(name, 0.0) != 0.0 { -1.0 } else { 1.0 };
+                let (dx, dy) = (
+                    -delta.0 as f32 * s * sign("ControlOptions.InvertXAxis"),
+                    -delta.1 as f32 * s * sign("ControlOptions.InvertYAxis"),
+                );
                 match self.follow.as_mut() {
-                    Some(f) => f.orbit(-delta.0 as f32 * s, -delta.1 as f32 * s),
-                    None => self.camera.look(-delta.0 as f32 * s, -delta.1 as f32 * s),
+                    Some(f) => f.orbit(dx, dy),
+                    None => self.camera.look(dx, dy),
                 }
             }
         }
