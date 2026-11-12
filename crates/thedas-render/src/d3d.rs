@@ -463,10 +463,17 @@ pub const IDENTITY_BONE: [[f32; 4]; 3] = [
 ];
 
 /// Register contents for one stage: floats, ints, bools.
+#[derive(Clone)]
 pub struct StageConstants {
     pub floats: Vec<[f32; 4]>,
     pub ints: Vec<[i32; 4]>,
     pub bools: Vec<[u32; 4]>,
+}
+
+impl Default for StageConstants {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StageConstants {
@@ -674,11 +681,57 @@ impl ConstantContext<'_> {
         })
     }
 
+    /// Whether a constant's value follows the camera, the draw's placement and pose, the
+    /// clock or the shadow partitions, and so changes from frame to frame; every other
+    /// constant (the material's, the draw's lights, the level's fog and sky) stays as the
+    /// draw was made. Mirrors the cases of [`ConstantContext::value`].
+    pub fn per_frame(&self, c: &Constant) -> bool {
+        let usage = find_param(self.material, &c.name).and_then(|p| p.usage.as_deref());
+        matches!(
+            usage.unwrap_or(""),
+            "ModelViewProjectionTrans"
+                | "ModelViewProjection"
+                | "PartTrans"
+                | "Part"
+                | "ModelView"
+                | "View"
+                | "ViewInv"
+                | "Projection"
+                | "ViewProjection"
+                | "CameraPosition"
+                | "ApplicationTime"
+                | "ShadowData"
+                | "ShadowPartitionMatrix"
+        ) || matches!(
+            c.name.as_str(),
+            "aur_mWorldViewProj"
+                | "aur_mWorld"
+                | "aur_mModelView"
+                | "g_vCameraPosition"
+                | "bsm_bones"
+        )
+    }
+
     /// Fills the registers a shader's constant table names.
     pub fn fill(&self, table: Option<&ConstantTable>) -> StageConstants {
         let mut out = StageConstants::new();
-        let Some(table) = table else { return out };
-        for c in &table.constants {
+        self.fill_into(table, &mut out, |_| true);
+        out
+    }
+
+    /// Fills into `out` the registers of the constants (by index in the table) `pick`
+    /// accepts, leaving the rest as they are.
+    pub fn fill_into(
+        &self,
+        table: Option<&ConstantTable>,
+        out: &mut StageConstants,
+        pick: impl Fn(usize) -> bool,
+    ) {
+        let Some(table) = table else { return };
+        for (k, c) in table.constants.iter().enumerate() {
+            if !pick(k) {
+                continue;
+            }
             let Some(v) = self.value(c) else { continue };
             let base = c.register as usize;
             let count = c.count.max(1) as usize;
@@ -719,7 +772,6 @@ impl ConstantContext<'_> {
                 _ => {}
             }
         }
-        out
     }
 }
 
@@ -930,6 +982,16 @@ mod tests {
         assert_eq!(c.floats[3], [0.6, 0.5, 0.3, 1.0]);
         assert_eq!(c.bools[3][0], 1);
         assert_eq!(c.floats[40], [0.0; 4]);
+        // Only the matrix follows the frame; filled in two halves, what stays and what
+        // changes, the registers come out the same.
+        let per_frame: Vec<bool> = t.constants.iter().map(|k| cc.per_frame(k)).collect();
+        assert_eq!(per_frame, [true, false, false, false, false, false, false]);
+        let mut split = StageConstants::default();
+        cc.fill_into(Some(&t), &mut split, |k| !per_frame[k]);
+        cc.fill_into(Some(&t), &mut split, |k| per_frame[k]);
+        assert_eq!(split.floats, c.floats);
+        assert_eq!(split.ints, c.ints);
+        assert_eq!(split.bools, c.bools);
     }
 
     #[test]
