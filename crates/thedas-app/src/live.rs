@@ -210,6 +210,9 @@ pub struct Live {
     failed_layout: Option<String>,
     /// Held while the game that replaces it opens on a worker (see [`Live::hold`]).
     held: bool,
+    /// The area (its resource) whose world was last shown, for the loading screen a change
+    /// of area gets (see [`Live::area_change_screen`]).
+    shown_area: Option<String>,
 }
 
 /// A level, or a level's objects, being built on a worker thread. While one is under way
@@ -218,6 +221,8 @@ pub struct Live {
 struct Loading {
     started: std::time::Instant,
     layout: String,
+    /// The loading screen it shows (see [`Live::load_screen`]).
+    screen: crate::ui::LoadScreen,
     building: Building,
     /// How long the level's and the objects' builds took (seconds).
     level_s: f64,
@@ -251,6 +256,32 @@ fn share(ctx: &GpuContext) -> GpuContext {
         device: ctx.device.clone(),
         queue: ctx.queue.clone(),
         bc: ctx.bc,
+    }
+}
+
+/// The area the party is in (its resource).
+fn current_area(sim: &Sim) -> Option<String> {
+    sim.world
+        .area
+        .and_then(|a| sim.world.get(a))
+        .map(|a| a.template.clone())
+}
+
+/// An area's area list (the module's area tree, field 3291's second name).
+fn area_list(sim: &Sim, resref: &str) -> Option<String> {
+    sim.module_info
+        .areas
+        .iter()
+        .find(|a| a.resref.eq_ignore_ascii_case(resref))
+        .and_then(|a| a.area_list.clone())
+}
+
+/// load_light between areas of one area list, else load_town (the exe's loading sub-modes 5
+/// and 4, picked at 0x6c7080).
+fn load_screen_for(from: Option<&str>, to: Option<&str>) -> crate::ui::LoadScreen {
+    match (from, to) {
+        (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => crate::ui::LoadScreen::Light,
+        _ => crate::ui::LoadScreen::Town,
     }
 }
 
@@ -417,6 +448,7 @@ impl Live {
             loading: None,
             failed_layout: None,
             held: false,
+            shown_area: None,
             owed_ms: 0.0,
             frame_effects: true,
             detail: Default::default(),
@@ -501,29 +533,38 @@ impl Live {
         }
         let sim = self.sim();
         let (to, _) = sim.world.transition.as_ref()?;
-        let list = |resref: &str| {
-            sim.module_info
-                .areas
-                .iter()
-                .find(|a| a.resref.eq_ignore_ascii_case(resref))
-                .and_then(|a| a.area_list.clone())
-        };
-        let here = sim
-            .world
-            .area
-            .and_then(|a| sim.world.get(a))
-            .map(|a| a.template.clone());
-        let (from_list, to_list) = (here.as_deref().and_then(list), list(to));
-        let same = match (&from_list, &to_list) {
-            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-            _ => false,
-        };
-        log::debug!("transition {here:?} ({from_list:?}) -> {to} ({to_list:?}): same list {same}");
-        Some(if same {
-            crate::ui::LoadScreen::Light
-        } else {
-            crate::ui::LoadScreen::Town
-        })
+        let here = current_area(&sim);
+        Some(load_screen_for(
+            here.as_deref().and_then(|h| area_list(&sim, h)).as_deref(),
+            area_list(&sim, to).as_deref(),
+        ))
+    }
+
+    /// The loading screen a load now starting gets: a change of area from the one last shown
+    /// to one of the same area list gets load_light, any other load (another list, a save, a
+    /// new game, the first area) load_town. Taken from the change itself, so a transition
+    /// performed in the very update that asked for it (no frame saw it pending) still gets
+    /// its screen.
+    fn area_change_screen(&self) -> crate::ui::LoadScreen {
+        if self.held {
+            return crate::ui::LoadScreen::Town;
+        }
+        let sim = self.sim();
+        let now = current_area(&sim);
+        let from = self.shown_area.as_deref().and_then(|a| area_list(&sim, a));
+        let to = now.as_deref().and_then(|a| area_list(&sim, a));
+        load_screen_for(from.as_deref(), to.as_deref())
+    }
+
+    /// The loading screen up now: a pending transition's, else the load under way's.
+    pub fn load_screen(&self) -> Option<crate::ui::LoadScreen> {
+        if let Some(s) = self.pending_load_screen() {
+            return Some(s);
+        }
+        if self.held {
+            return Some(crate::ui::LoadScreen::Town);
+        }
+        self.loading.as_ref().map(|l| l.screen)
     }
 
     /// Holds this game while another opens to replace it (a save loading, a new game): it
@@ -554,6 +595,7 @@ impl Live {
         let building = matches!(&self.loading, Some(l) if l.layout == layout
             && matches!(l.building, Building::Level(_)));
         if !building {
+            let screen = self.area_change_screen();
             // Drop the old level now: its world is gone.
             self.level = None;
             self.cache = RenderCache::default();
@@ -578,6 +620,7 @@ impl Live {
                 layout: layout.to_string(),
                 building: Building::Level(rx),
                 level_s: 0.0,
+                screen,
             });
             return None;
         }
@@ -642,6 +685,7 @@ impl Live {
                         layout: layout.to_string(),
                         building,
                         level_s: 0.0,
+                        screen: crate::ui::LoadScreen::Town,
                     })
                 }
             }
@@ -1243,6 +1287,11 @@ impl Live {
             self.objects = Some(self.build_objects(ctx, format, &layout, &models, key)?);
             // A new look is framed afresh.
             self.stage_camera = None;
+        }
+        // The world shown now is this area's (see `Live::area_change_screen`).
+        if !self.loading() && self.level.is_some() && self.objects.is_some() {
+            let shown = current_area(&self.sim());
+            self.shown_area = shown;
         }
         let (Some(level), Some(objects)) = (self.level.as_ref(), self.objects.as_mut()) else {
             return Ok(());
@@ -2233,5 +2282,28 @@ mod cutaway_tests {
         assert_eq!(c.shown(), 1.0);
         c.update(Some(true), 0.0);
         assert_eq!(c.shown(), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod load_screen_tests {
+    use super::load_screen_for;
+    use crate::ui::LoadScreen;
+
+    #[test]
+    fn same_area_list_gets_the_light_screen() {
+        let list = Some("al_bec01al_alienage");
+        assert_eq!(load_screen_for(list, list), LoadScreen::Light);
+        assert_eq!(
+            load_screen_for(list, Some("AL_BEC01AL_ALIENAGE")),
+            LoadScreen::Light
+        );
+        assert_eq!(
+            load_screen_for(Some("al_bdc02al_slums"), Some("al_bdc01al_commons")),
+            LoadScreen::Town
+        );
+        // No area before (the first load), or an area outside the tree.
+        assert_eq!(load_screen_for(None, list), LoadScreen::Town);
+        assert_eq!(load_screen_for(list, None), LoadScreen::Town);
     }
 }
