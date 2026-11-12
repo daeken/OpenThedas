@@ -216,6 +216,18 @@ pub struct Live {
     /// A journey on the world map is under way, latched until its area has loaded (see
     /// [`Live::travel_load`]).
     travel: bool,
+    /// The last view of a cutscene that played over a conversation line, held for the rest
+    /// of that line (see [`Live::conversation_camera`]).
+    cut_held: Option<(TalkLine, thedas_render::Camera)>,
+}
+
+/// A conversation line shown: its dialog, owner and node.
+type TalkLine = (String, ObjectId, Option<usize>);
+
+/// The conversation line `sim` shows, if one is up.
+fn talk_line(sim: &Sim) -> Option<TalkLine> {
+    sim.conversation_line()
+        .map(|o| (o.dialog.to_string(), o.owner, o.line))
 }
 
 /// A level, or a level's objects, being built on a worker thread. While one is under way
@@ -460,6 +472,7 @@ impl Live {
             held: false,
             shown_area: None,
             travel: false,
+            cut_held: None,
             owed_ms: 0.0,
             frame_effects: true,
             detail: Default::default(),
@@ -1069,6 +1082,21 @@ impl Live {
         base: &thedas_render::Camera,
     ) -> Option<thedas_render::Camera> {
         let sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
+        // A cutscene that played over this line (the opening `start_wake.cut` over City
+        // Elf's first line) leaves its last view for the rest of the line: the original
+        // shows the line's replies in that view, not the line's stage camera. Provisional:
+        // from the reference frame (reference/original/triage/city_elf_opening_shianni.png),
+        // not traced in the exe.
+        let line = talk_line(&sim);
+        match (&self.cut_held, &line) {
+            (Some((held, view)), Some(now)) if held == now => {
+                let mut c = *view;
+                c.near = base.near;
+                c.far = base.far;
+                return Some(c);
+            }
+            _ => self.cut_held = None,
+        }
         let faces = self.objects.as_ref().map(|o| &o.faces);
         let face = |id| faces.and_then(|f| f.get(&id).copied());
         self.talk_camera.camera(&sim, base, &face)
@@ -1082,8 +1110,14 @@ impl Live {
     ) -> Option<thedas_render::Camera> {
         let sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
         let posed = &self.posed;
-        self.cutscene_camera
-            .camera(&sim, base, &|id| drawn_root(posed, id))
+        let view = self
+            .cutscene_camera
+            .camera(&sim, base, &|id| drawn_root(posed, id));
+        // Held for the conversation line it plays over (see `Live::conversation_camera`).
+        if let (Some(v), Some(line)) = (view, talk_line(&sim)) {
+            self.cut_held = Some((line, v));
+        }
+        view
     }
 
     /// The camera character creation's stage is seen through, while it is up (see
