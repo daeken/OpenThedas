@@ -321,7 +321,8 @@ pub fn static1_filter() -> ShaderFilter {
 /// characters (`Char1`), hair (`Hair0_Pass1`, `Hair0`: four passes), faces (`Face1`), eyes
 /// and lashes (`Eye0`), cloth (`Cloth1`), props (`Prop1`) and weapons (`Weapon1`), with any
 /// pixel shader; and exterior terrain (`Terrain2`, terrain.mat's pass above Low detail, and
-/// `Terrain3`, its Low detail pass); and the sky's dome and clouds (`Sky`, `Clouds`).
+/// `Terrain3`, its Low detail pass); the sky's dome and clouds (`Sky`, `Clouds`); and lava
+/// (`Lava0`).
 pub fn object_filter() -> ShaderFilter {
     let mut v = static1_filter().unwrap_or_default();
     for vs in OBJECT_VERTEX_SHADERS.iter().chain(&VFX_VERTEX_SHADERS) {
@@ -345,7 +346,7 @@ pub const VFX_VERTEX_SHADERS: [&str; 8] = [
 ];
 
 /// See [`object_filter`].
-pub const OBJECT_VERTEX_SHADERS: [&str; 12] = [
+pub const OBJECT_VERTEX_SHADERS: [&str; 13] = [
     "Char1.vsh",
     "Hair0_Pass1.vsh",
     "Hair0.vsh",
@@ -358,6 +359,7 @@ pub const OBJECT_VERTEX_SHADERS: [&str; 12] = [
     "Terrain3.vsh",
     "Sky.vsh",
     "Clouds.vsh",
+    "Lava0.vsh",
 ];
 
 /// Point lights chosen for one draw.

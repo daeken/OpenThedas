@@ -695,10 +695,12 @@ impl<'a> Loader<'a> {
                 Ok(object) => {
                     let mut semantic = object.semantic().to_string();
                     let definition = self.material_def(&object.material_resource());
-                    // An object that names no semantic, of a material without `Default`, takes
-                    // the material's first (the sky's cloud layer: `Clouds`). Provisional.
-                    if object.default_semantic.is_none()
-                        && let Some(d) = definition.as_ref()
+                    // An object whose semantic its material lacks (no semantic named, of a
+                    // material without `Default`: the sky's cloud layer, `Clouds`; or a name
+                    // the material does not have: the lava's `Diffuse`, `Lava.mat` having
+                    // only `Opaque` and `OpaqueVolume`) takes the material's first.
+                    // Provisional: the exe's lookup on a missing semantic is not traced.
+                    if let Some(d) = definition.as_ref()
                         && d.semantic(&semantic).is_none()
                         && let Some(first) = d.semantics.first()
                     {
