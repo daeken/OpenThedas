@@ -210,6 +210,85 @@ fn rect_shape(id: u16, r: Rect) -> Vec<u8> {
     out
 }
 
+/// The fill style of a shape filled with exactly one bitmap and drawn with no line styles
+/// (the GUI's framed panels): its bytes (type 0x40-0x43, bitmap id, matrix).
+fn single_bitmap_fill(code: u16, body: &[u8]) -> Option<Vec<u8>> {
+    let (_, n) = read_rect(body.get(2..)?)?;
+    let mut o = 2 + n;
+    if code == TAG_DEFINE_SHAPE4 {
+        // Edge bounds, then a flags byte.
+        let (_, n) = read_rect(body.get(o..)?)?;
+        o += n + 1;
+    }
+    if *body.get(o)? != 1 {
+        return None;
+    }
+    o += 1;
+    let start = o;
+    let kind = *body.get(o)?;
+    if !(0x40..=0x43).contains(&kind) {
+        return None;
+    }
+    o += 3;
+    let (_, n) = read_matrix_bytes(body.get(o..)?)?;
+    o += n;
+    // No line styles.
+    (*body.get(o)? == 0).then(|| body[start..o].to_vec())
+}
+
+/// The length of a MATRIX record (any matrix, rotated or not).
+fn read_matrix_bytes(d: &[u8]) -> Option<((), usize)> {
+    let mut b = Bits { d, pos: 0 };
+    for _ in 0..2 {
+        if b.u(1)? == 1 {
+            let n = b.u(5)? as usize;
+            b.s(n)?;
+            b.s(n)?;
+        }
+    }
+    let n = b.u(5)? as usize;
+    b.s(n)?;
+    b.s(n)?;
+    Some(((), b.byte_end()))
+}
+
+/// `DefineShape3` of a rectangle filled with `fill` (a fill style's bytes, see
+/// [`single_bitmap_fill`]): one cell of a bitmap-filled shape, in the shape's own coordinates.
+fn filled_rect_shape(id: u16, r: Rect, fill: &[u8]) -> Vec<u8> {
+    let mut b = BitOut::default();
+    rect_bytes(r, &mut b);
+    let mut body = id.to_le_bytes().to_vec();
+    body.extend(b.out);
+    // One fill style, no line styles; one fill bit, no line bits.
+    body.push(1);
+    body.extend_from_slice(fill);
+    body.extend_from_slice(&[0, 0x10]);
+    let mut s = BitOut::default();
+    s.put(0, 1);
+    s.put(0b00101, 5);
+    let n = sbits(&[r[0], r[1]]);
+    s.put(n as u32, 5);
+    s.signed(r[0], n);
+    s.signed(r[1], n);
+    s.put(1, 1);
+    let (w, h) = (r[2] - r[0], r[3] - r[1]);
+    for (vertical, d) in [(false, w), (true, h), (false, -w), (true, -h)] {
+        let n = sbits(&[d]).max(2);
+        s.put(1, 1);
+        s.put(1, 1);
+        s.put(n as u32 - 2, 4);
+        s.put(0, 1);
+        s.put(vertical as u32, 1);
+        s.signed(d, n);
+    }
+    s.put(0, 6);
+    body.extend(s.out);
+    let mut out = Vec::new();
+    tag_header(TAG_DEFINE_SHAPE3, body.len(), &mut out);
+    out.extend(body);
+    out
+}
+
 /// `PlaceObject2` of a character at a depth, with a name or a clip depth.
 fn place(depth: u16, ch: u16, name: Option<&str>, clip: Option<u16>) -> Vec<u8> {
     let flags =
@@ -317,6 +396,9 @@ pub(super) fn register_action_in(list: &str, member: &str, value: Member) -> Vec
 pub(super) struct Plan {
     grids: BTreeMap<u16, Rect>,
     shapes: BTreeMap<u16, Rect>,
+    /// The shapes filled with one bitmap and nothing else (no line styles): their fill
+    /// style's bytes (type, bitmap id, matrix), which a cell of the shape can reuse.
+    bitmap_fills: BTreeMap<u16, Vec<u8>>,
     next_id: u32,
 }
 
@@ -325,6 +407,7 @@ pub(super) fn plan(tags: &[Tag]) -> Plan {
     let mut p = Plan {
         grids: BTreeMap::new(),
         shapes: BTreeMap::new(),
+        bitmap_fills: BTreeMap::new(),
         next_id: 0,
     };
     for t in tags {
@@ -341,6 +424,9 @@ pub(super) fn plan(tags: &[Tag]) -> Plan {
             ) => {
                 if let Some((r, _)) = read_rect(&t.body[2..]) {
                     p.shapes.insert(id, r);
+                }
+                if let Some(fill) = single_bitmap_fill(t.code, t.body) {
+                    p.bitmap_fills.insert(id, fill);
                 }
             }
             _ => {}
@@ -444,6 +530,19 @@ impl Plan {
         content
             .get_mut(start..start + 2)?
             .copy_from_slice(&2u16.to_le_bytes());
+        // For a bitmap-filled shape placed with PlaceObject2: its placement moved to depth 1,
+        // and where its character id sits there, to place each cell in its stead.
+        let bitmap_fill = self.bitmap_fills.get(&ch).cloned();
+        let cell_content = (place_tag.code == TAG_PLACE_OBJECT2
+            && place_tag.body.first().is_some_and(|f| f & 0x02 != 0))
+        .then(|| {
+            let mut raw = place_tag.raw.to_vec();
+            let head = place_tag.raw.len() - place_tag.body.len();
+            raw.get_mut(head + 1..head + 3)?
+                .copy_from_slice(&1u16.to_le_bytes());
+            Some((head + 3, raw))
+        })
+        .flatten();
         let mut defs = Vec::new();
         let mut pieces = Vec::new();
         for r in 0..3 {
@@ -453,16 +552,51 @@ impl Plan {
                     pieces.push(None);
                     continue;
                 }
-                let (mask, piece) = (self.alloc()?, self.alloc()?);
-                defs.extend(rect_shape(mask, cell));
-                let mut sprite = piece.to_le_bytes().to_vec();
-                sprite.extend_from_slice(&1u16.to_le_bytes());
-                sprite.extend(place(1, mask, None, Some(2)));
-                sprite.extend(&content);
+                let mut sprite = Vec::new();
+                match (&bitmap_fill, cell_content.as_ref()) {
+                    // A bitmap-filled shape: the piece is the cell itself, a rectangle with
+                    // the same fill, so the piece's bounds are its cell's. Masked pieces
+                    // measure as the whole shape, and a movie sizing the grid sprite by
+                    // `_width`/`_height` then got the wrong scale once the pieces had
+                    // stretched (tooltips.gfx's box came out half its height).
+                    (Some(fill), Some((at, raw))) => {
+                        let (shape, piece) = (self.alloc()?, self.alloc()?);
+                        let to_shape = |v: i32, s: f64, t: f64| ((v as f64 - t) / s).round() as i32;
+                        let mut r = [
+                            to_shape(cell[0], sx, tx),
+                            to_shape(cell[1], sy, ty),
+                            to_shape(cell[2], sx, tx),
+                            to_shape(cell[3], sy, ty),
+                        ];
+                        if r[0] > r[2] {
+                            r.swap(0, 2);
+                        }
+                        if r[1] > r[3] {
+                            r.swap(1, 3);
+                        }
+                        defs.extend(filled_rect_shape(shape, r, fill));
+                        let mut placed = raw.clone();
+                        placed
+                            .get_mut(*at..*at + 2)?
+                            .copy_from_slice(&shape.to_le_bytes());
+                        sprite.extend(piece.to_le_bytes());
+                        sprite.extend_from_slice(&1u16.to_le_bytes());
+                        sprite.extend(placed);
+                        pieces.push(Some(piece));
+                    }
+                    _ => {
+                        let (mask, piece) = (self.alloc()?, self.alloc()?);
+                        defs.extend(rect_shape(mask, cell));
+                        sprite.extend(piece.to_le_bytes());
+                        sprite.extend_from_slice(&1u16.to_le_bytes());
+                        sprite.extend(place(1, mask, None, Some(2)));
+                        sprite.extend(&content);
+                        pieces.push(Some(piece));
+                    }
+                }
                 sprite.extend(tag(TAG_SHOW_FRAME, &[]));
                 sprite.extend(tag(TAG_END, &[]));
                 defs.extend(tag(TAG_DEFINE_SPRITE, &sprite));
-                pieces.push(Some(piece));
             }
         }
         let mut sprite = id.to_le_bytes().to_vec();
