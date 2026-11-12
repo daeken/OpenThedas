@@ -2415,6 +2415,7 @@ fn audio_state(
     };
     // The loading frame is up: the world's sounds duck as in the exe's loading mode.
     state.loading = live.loading();
+    state.paused = live.paused;
     {
         let sim = live.sim();
         state.container = sim

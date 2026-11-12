@@ -4,8 +4,8 @@ What is wrong or missing in OpenThedas compared with the original Dragon Age: Or
 detail as we can currently give. The [README](../README.md) says what works; this says what does
 not, so that people (and agents) can pick items up in parallel without stepping on each other.
 
-Last full pass: 2026-11-12, at main `f5ae46b`. Last refresh: 2026-11-12 22:15 UTC, at main
-`99232ea`. The counts measured against a real install were added at `477f24e`. It is refreshed with the
+Last full pass: 2026-11-12, at main `f5ae46b`. Last refresh: 2026-11-12 23:25 UTC, at main
+`4f84bcf`. The counts measured against a real install were added at `477f24e`. It is refreshed with the
 README status.
 
 ## How to read it
@@ -37,7 +37,7 @@ so an untraced item starts with a trace, not with a guess.
 | Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 167 (`SIM-`), plus ability coverage by family |
 | Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 96 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
 | Rendering | [gaps/rendering.md](gaps/rendering.md) | 151 (`RND-`) |
-| Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 185 (`UI-`), plus the movies never opened and the values no screen gets answered |
+| Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 186 (`UI-`), plus the movies never opened and the values no screen gets answered |
 | Audio | [gaps/audio.md](gaps/audio.md) | 55 (`AUD-`) |
 | Cameras, cutscene presentation, startup | [gaps/cameras-cutscenes.md](gaps/cameras-cutscenes.md) | 44 (`CAM-`) |
 | File formats and file system | [gaps/formats.md](gaps/formats.md) | 46 (`FMT-`), plus a table of every resource type and the tables and types nothing reads |
@@ -117,7 +117,6 @@ these, so they are the places where one person or stream can take a large, separ
 
 ### Interface and input
 
-- **Loading screens** show for area changes, save loads and new games; the world map does not yet stay up as the loading screen while travelling (`UI-078`).
 - **Screens never built**: crafting, item upgrade, the slideshow, the army
   screen, the party camp gift screen, store buyback, credits, and the online,
   downloadable-content and achievement screens (`UI-052`, `UI-077`, `UI-124`, `UI-126`,
