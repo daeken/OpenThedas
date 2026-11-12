@@ -258,9 +258,37 @@ const APPROACH_CHECK_MS: u64 = 100;
 /// How far apart a moving creature's position is tested against triggers as it walks, in metres.
 const TRIGGER_STEP: f32 = 0.5;
 
-/// How far inside its reach a melee attacker's place on the target's ring is (metres).
-/// Provisional.
-pub(crate) const MELEE_RING_INSET: f32 = 0.05;
+/// The melee ring around a creature: 40 places 9 degrees apart (DAOrigins.exe ring set-up
+/// 0x6ac2a0, slot count table 0xb230f8). Provisional: the slots are taken at fixed world
+/// angles; whether the exe turns them with the target's facing is not traced.
+const MELEE_RING_SLOTS: i32 = 40;
+const MELEE_RING_STEP_DEG: f32 = 360.0 / MELEE_RING_SLOTS as f32;
+/// How far from its place an attacker may stand and skip the walk to it (0x7a3090: 1.2 and
+/// its 0.05 tolerance, 0xae7540, 0xaf70b0).
+const MELEE_GAP_AT_SLOT: f32 = 1.25;
+
+/// The ring slot nearest the bearing from `centre` to `p`.
+fn melee_slot_toward(centre: [f32; 3], p: [f32; 3]) -> i32 {
+    let deg = (p[1] - centre[1]).atan2(p[0] - centre[0]).to_degrees();
+    (deg / MELEE_RING_STEP_DEG).round() as i32
+}
+
+/// How many slots either side of its own an attacker of radius `attacker` covers on the ring
+/// of a target of radius `target` (DAOrigins.exe 0x7cb9e0): the attacker's circle, scaled
+/// to the ring's radius, is laid on its slot, and each step out to a neighbour whose chord
+/// it still touches counts. Provisional: the segment-against-circle test (0x7cb790 calling
+/// 0x4eb240) is read as "the nearer end of the chord is inside the circle".
+fn melee_slot_span(target: f32, attacker: f32) -> i32 {
+    let ring = target + crate::combat::MELEE_GAP + 0.1;
+    let d = target + attacker + crate::combat::MELEE_GAP;
+    let w = attacker * ring / d;
+    let half = (MELEE_RING_STEP_DEG / 2.0).to_radians();
+    let mut k = 1;
+    while k < MELEE_RING_SLOTS / 2 && 2.0 * ring * (k as f32 * half).sin() < w {
+        k += 1;
+    }
+    k
+}
 
 /// How far the place an approach is heading for may drift (the target having moved) before
 /// the walker sets off again for the new one (metres). Provisional: the executable's
@@ -729,6 +757,7 @@ impl Sim {
         self.world
             .location_vfx
             .retain(|v| v.duration_ms.is_none_or(|d| v.started_ms + d > end));
+        self.leave_conversation_mode();
         self.update_perception();
         self.keep_party_together();
         let mut held = 0;
@@ -823,6 +852,7 @@ impl Sim {
                             let at = c.approach.take()?;
                             c.due = None;
                             c.from = None;
+                            c.arrived = c.name == "CommandAttack";
                             Some(at)
                         });
                     // An ability whose impact comes before its animation ends deals the
@@ -1805,6 +1835,7 @@ impl Sim {
                 ring_wait: false,
                 after_impact_ms: None,
                 impacted: false,
+                arrived: false,
                 path: Vec::new(),
             };
             // A follow move already under way goes on from where it has got to.
@@ -2103,16 +2134,22 @@ impl Sim {
         }
     }
 
-    /// Where an attacker goes before its attack can start. Melee attackers take a place on
-    /// the target's melee ring: the free one nearest their line of approach, on a circle at
-    /// the two bodies' reach (`Sim::reach_to`), a place being free when no other creature's
-    /// body overlaps it. Ranged attackers stop at range on the straight line.
+    /// Where an attacker goes before its attack can start. Ranged attackers stop at range
+    /// on the straight line. Melee attackers walk to a place on the target's melee ring, as
+    /// DAOrigins.exe's attack command does (0x742fd0 queues move-to-object 0x7aa560, then
+    /// the start step 0x7a87c0): the ring has 40 slots 9 degrees apart at the two bodies'
+    /// reach (`Sim::reach_to`); the attacker takes the free span nearest its bearing
+    /// (0x7cc2b0: searching +1, -1, +2, -2 ...), a span being the slots its body covers
+    /// (`melee_slot_span`), and slots being held by the target's other melee attackers. The
+    /// walk is skipped when the attacker is within the reach and 1.25 m of its place
+    /// (0x6a3d00); after the walk the start step allows the 1 m slack.
     ///
-    /// The original keeps melee rings (`GetCreaturesInMeleeRing`, `GetMeleeRingPosition`)
-    /// and fails an attack on a full one (`COMMAND_FAILED_NO_SPACE_IN_MELEE_RING`); the
-    /// geometry here is provisional: bodies are circles of the appearances' personal space
-    /// (`PERSPACE`), and an attacker that finds the ring full waits by it once (walking to
-    /// just outside it, or standing a second) before its attack fails.
+    /// Provisional: the exe reserves slots explicitly (0x7cb0e0) and fails the command when
+    /// none is free (`COMMAND_FAILED_NO_SPACE_IN_MELEE_RING`); here an attacker's place is
+    /// read from where it is heading or standing, and one that finds the ring full waits by
+    /// it once (walking to just outside it, or standing a second) before its attack fails.
+    /// The appearance's ring offset (apr_base column 0xed58b0c9, 0 for almost every row)
+    /// and the extra rings of meleering1..9.gda (three bosses) are not read.
     fn approach_point(&self, id: ObjectId, cmd: &Command) -> Approach {
         let (Some(me), Some(target)) = (self.world.get(id), cmd.target) else {
             return Approach::InReach;
@@ -2127,12 +2164,13 @@ impl Sim {
         let d = crate::engine::dist(a, b);
         let reach = self.reach_to(id, target);
         let ranged = self.attack_reach(id) > crate::combat::MELEE_REACH;
-        // A melee attack starts once the target is within reach and the executable's slack,
-        // across the ground (0x6a3dc0).
+        // Once the walk to its place has ended, the attack's start step (0x7a87c0) tests the
+        // range with the executable's slack, across the ground (0x6a3dc0).
         let ground = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
-        if (ranged && d <= reach + 0.05)
-            || (!ranged && ground <= reach + crate::combat::MELEE_REACH_TOLERANCE)
-        {
+        if ranged && d <= reach + 0.05 {
+            return Approach::InReach;
+        }
+        if !ranged && cmd.arrived && ground <= reach + crate::combat::MELEE_REACH_TOLERANCE {
             return Approach::InReach;
         }
         if ranged {
@@ -2144,12 +2182,10 @@ impl Sim {
             ];
             return Approach::Walk(d - reach, p);
         }
+        // The other melee attackers of the same target hold their places on its ring.
         let mine = self.body_radius(id);
-        // Places just inside the reach. Provisional: the executable's ring (built from
-        // apr_base.gda and the meleering tables, 0x6ac2a0) is not traced further.
-        let ring = reach - MELEE_RING_INSET;
-        let near = ring + mine + 2.0;
-        let others: Vec<([f32; 3], f32)> = self
+        let target_r = self.body_radius(target);
+        let held: Vec<(i32, i32)> = self
             .world
             .objects
             .values()
@@ -2160,28 +2196,49 @@ impl Sim {
                     && o.area == me.area
                     && o.active
                     && !o.dead
-                    && crate::engine::dist(o.position, b) <= near
+                    && self.attack_reach(o.id) <= crate::combat::MELEE_REACH
             })
-            .map(|o| (o.position, self.body_radius(o.id)))
+            .filter_map(|o| {
+                let c = o.commands.first()?;
+                (c.name == "CommandAttack" && c.target == Some(target)).then_some(())?;
+                let p = c.approach.unwrap_or(o.position);
+                let r = self.body_radius(o.id);
+                Some((melee_slot_toward(b, p), melee_slot_span(target_r, r)))
+            })
             .collect();
-        let free = |p: [f32; 3]| {
-            others.iter().all(|(q, r)| {
-                ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt() >= (mine + r) * 0.9
+        let span = melee_slot_span(target_r, mine);
+        let free = |slot: i32| {
+            held.iter().all(|&(s, k)| {
+                let gap = (slot - s).rem_euclid(MELEE_RING_SLOTS);
+                gap.min(MELEE_RING_SLOTS - gap) > span + k
             })
         };
-        let at = |ang: f32, rad: f32| [b[0] + rad * ang.cos(), b[1] + rad * ang.sin(), b[2]];
-        let base = (a[1] - b[1]).atan2(a[0] - b[0]);
-        let step = (2.0 * mine / ring.max(0.1)).clamp(0.05, std::f32::consts::PI);
-        let n = (std::f32::consts::PI / step).ceil() as i32;
-        let slot = (0..=n)
+        let base = melee_slot_toward(b, a);
+        let ring = reach;
+        let at = |slot: i32| {
+            let ang = (slot as f32 * MELEE_RING_STEP_DEG).to_radians();
+            [b[0] + ring * ang.cos(), b[1] + ring * ang.sin(), b[2]]
+        };
+        let slot = (0..=MELEE_RING_SLOTS / 2)
             .flat_map(|k| [k, -k])
-            .map(|k| at(base + k as f32 * step, ring))
-            .find(|&p| free(p));
+            .map(|k| base + k)
+            .find(|&s| free(s))
+            .map(at);
+        // The walk is skipped when the attacker is within the bodies' reach (without the
+        // slack) and by its place already (0x6a3d00, 0x7a3090).
+        if let Some(p) = slot {
+            let off = ((p[0] - a[0]).powi(2) + (p[1] - a[1]).powi(2)).sqrt();
+            if ground <= reach && off <= MELEE_GAP_AT_SLOT {
+                return Approach::InReach;
+            }
+        }
         match slot {
             Some(p) => Approach::Walk(crate::engine::dist(a, p), p),
             None if cmd.ring_wait => Approach::Full,
             None => {
-                let p = at(base, ring + 2.0 * mine + 0.3);
+                let ang = (base as f32 * MELEE_RING_STEP_DEG).to_radians();
+                let r = ring + 2.0 * mine + 0.3;
+                let p = [b[0] + r * ang.cos(), b[1] + r * ang.sin(), b[2]];
                 let walk = crate::engine::dist(a, p);
                 if walk < 0.3 {
                     Approach::Wait(a)
@@ -2392,6 +2449,7 @@ impl Sim {
                                 c.approach = Some(stop);
                                 c.from = pos.map(|p| (p, now));
                                 c.ring_wait |= wait;
+                                c.arrived = false;
                                 c.path = path;
                             }
                             if best.is_none_or(|(b, bid)| (due, id) < (b, bid)) {
@@ -2564,9 +2622,17 @@ impl Sim {
         } else if cmd.name == "CommandUseAbility" && !cmd.impacted {
             self.finish_ability(id, &cmd);
         } else if cmd.name == "CommandStartConversation" {
-            // A conversation ordered by the player (see `Sim::order_talk`).
-            if let Some(t) = cmd.target.filter(|&t| self.world.get(t).is_some()) {
-                self.start_conversation(id, t, "");
+            // DAOrigins.exe's executor (0x7a3700) sends the target EVENT_TYPE_DIALOGUE (18),
+            // its creator the one talking and its resource the conversation, unless the target
+            // is dead; rules_core answers it with UT_Talk, which begins the conversation.
+            let target = cmd
+                .target
+                .filter(|&t| self.world.get(t).is_some_and(|o| !o.dead));
+            if let Some(t) = target {
+                let mut ev = self.new_event("DIALOGUE", Some(id));
+                ev.resources = vec![cmd.strings.first().cloned().unwrap_or_default()];
+                ev.objects = vec![id];
+                self.world.queue_event(0, t, ev, None);
             }
         } else if cmd.name == "CommandSwitchWeaponSet" {
             // The command's executor (DAOrigins.exe 0x7a1ed0) switches the set (0x6a8fa0)
@@ -3758,6 +3824,7 @@ mod tests {
             ring_wait: false,
             after_impact_ms: None,
             impacted: false,
+            arrived: false,
             path: Vec::new(),
         });
         let t0 = s.world.time_ms;
@@ -4231,6 +4298,7 @@ mod tests {
             ring_wait: false,
             after_impact_ms: None,
             impacted: false,
+            arrived: false,
             path: Vec::new(),
         };
         let o = s.world.get_mut(id).unwrap();
@@ -4270,6 +4338,7 @@ mod tests {
             ring_wait: false,
             after_impact_ms: None,
             impacted: false,
+            arrived: false,
             path: Vec::new(),
         });
         s.tick(1);
@@ -4304,6 +4373,7 @@ mod tests {
             ring_wait: false,
             after_impact_ms: None,
             impacted: false,
+            arrived: false,
             path: Vec::new(),
         });
         s.tick(1);
@@ -4338,6 +4408,7 @@ mod tests {
             ring_wait: false,
             after_impact_ms: None,
             impacted: false,
+            arrived: false,
             path: Vec::new(),
         };
         s.world.get_mut(id).unwrap().commands.push(walk());
@@ -4476,6 +4547,7 @@ mod tests {
             ring_wait: false,
             after_impact_ms: None,
             impacted: false,
+            arrived: false,
             path: Vec::new(),
         });
         // At 5 m/s: five metres after a second.
@@ -4483,16 +4555,12 @@ mod tests {
         let x = s.world.get(a).unwrap().position[0];
         assert!((x - 5.0).abs() < 0.01, "{x}");
         // It stops at the target's reach, facing it: two default bodies apart plus the
-        // melee gap (its place on the ring is just inside).
+        // melee gap (its place on the ring).
         s.tick(1500);
         let reach = 2.0 * crate::combat::DEFAULT_RADIUS + crate::combat::MELEE_GAP;
         let o = s.world.get(a).unwrap();
         let x = o.position[0];
-        assert!(
-            x >= 12.0 - reach - 0.01 && x <= 12.0 - reach + MELEE_RING_INSET + 0.01,
-            "{:?}",
-            o.position
-        );
+        assert!((x - (12.0 - reach)).abs() < 0.01, "{:?}", o.position);
         // There, the attack itself is under way (still the front command).
         assert_eq!(
             o.commands.first().map(|c| (c.name.as_str(), c.approach)),
@@ -4527,6 +4595,7 @@ mod tests {
             ring_wait: false,
             after_impact_ms: None,
             impacted: false,
+            arrived: false,
             path: Vec::new(),
         };
         let walk = cmd(
@@ -4607,15 +4676,39 @@ mod tests {
     }
 
     #[test]
-    fn a_melee_attack_starts_within_the_reach_slack() {
-        // 2.8 m apart: past the 2 m reach but within its 1 m slack, so no walk.
-        let (mut s, a, _) = chase([0.0; 3], [2.8, 0.0, 0.0], [2.8, 0.0, 0.0]);
+    fn a_melee_attack_skips_the_walk_only_within_the_reach_itself() {
+        // Two default bodies and the gap: 2.4 m. From 2.3 m the attacker is by its place
+        // already and the swing starts where it stands (0x6a3d00 needs no slack).
+        let (mut s, a, _) = chase([0.0; 3], [2.3, 0.0, 0.0], [2.3, 0.0, 0.0]);
         if let Some(o) = s.world.get_mut(a) {
             o.commands.truncate(1);
         }
         s.tick(1);
         let o = s.world.get(a).unwrap();
         assert_eq!(o.position, [0.0; 3]);
+        assert!(
+            o.commands
+                .first()
+                .is_some_and(|c| c.approach.is_none() && c.due.is_some())
+        );
+        // From 2.8 m, inside the start step's slack but past the reach, it walks to its
+        // place on the ring first (the exe's move step comes before the start step).
+        let (mut s, a, _) = chase([0.0; 3], [2.8, 0.0, 0.0], [2.8, 0.0, 0.0]);
+        if let Some(o) = s.world.get_mut(a) {
+            o.commands.truncate(1);
+        }
+        s.tick(1);
+        assert!(
+            s.world
+                .get(a)
+                .unwrap()
+                .commands
+                .first()
+                .is_some_and(|c| c.approach.is_some())
+        );
+        s.tick(1000);
+        let o = s.world.get(a).unwrap();
+        assert!((o.position[0] - 0.4).abs() < 0.01, "{:?}", o.position);
         assert!(
             o.commands
                 .first()
@@ -4629,16 +4722,33 @@ mod tests {
         let area = s.world.spawn(ObjectKind::Area, "a");
         let t = s.world.spawn(ObjectKind::Creature, "target");
         let late = s.world.spawn(ObjectKind::Creature, "late");
-        let ring =
-            2.0 * crate::combat::DEFAULT_RADIUS + crate::combat::MELEE_GAP - MELEE_RING_INSET;
-        // Bodies all round the target, close enough that no place is left.
+        let ring = 2.0 * crate::combat::DEFAULT_RADIUS + crate::combat::MELEE_GAP;
+        // Eight attackers already hold places all round the target: each covers its own
+        // slot and two either side, so no span of five is left.
         let mut crowd = Vec::new();
-        for k in 0..12 {
-            let ang = k as f32 * std::f32::consts::TAU / 12.0;
+        for k in 0..8 {
+            let ang = (k as f32 * 45.0).to_radians();
             let c = s.world.spawn(ObjectKind::Creature, "crowd");
             let o = s.world.get_mut(c).unwrap();
             o.area = Some(area);
             o.position = [ring * ang.cos(), ring * ang.sin(), 0.0];
+            o.commands.push(Command {
+                ty: 7,
+                name: "CommandAttack".into(),
+                target: Some(t),
+                location: None,
+                seconds: 0.0,
+                ints: Vec::new(),
+                strings: Vec::new(),
+                due: Some(u64::MAX / 2),
+                from: None,
+                approach: None,
+                ring_wait: false,
+                after_impact_ms: None,
+                impacted: false,
+                arrived: false,
+                path: Vec::new(),
+            });
             crowd.push(c);
         }
         for (id, x) in [(t, 0.0), (late, 8.0)] {
@@ -4660,6 +4770,7 @@ mod tests {
             ring_wait: false,
             after_impact_ms: None,
             impacted: false,
+            arrived: false,
             path: Vec::new(),
         });
         // It walks to just outside the crowd and waits; the ring is still full, so the
@@ -4731,6 +4842,7 @@ mod tests {
             ring_wait: false,
             after_impact_ms: None,
             impacted: false,
+            arrived: false,
             path: Vec::new(),
         };
         assert_eq!(

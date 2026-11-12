@@ -1711,6 +1711,7 @@ impl Server {
                 ring_wait: false,
                 after_impact_ms: None,
                 impacted: false,
+                arrived: false,
                 path: Vec::new(),
             };
             if let Some(o) = sim.world.get_mut(hero) {

@@ -482,14 +482,14 @@ mod tests {
                 .count()
         };
         // 3024 has personal range (row 0): 20 m off, the bash is not cast from there; the
-        // warrior walks until the archer is within the radii and 1.2 m (2.0 m for two
+        // warrior walks until the archer is within the radii and 1.2 m (2.4 m for two
         // default bodies), then casts.
         s.order_ability(warrior, 3024, archer, "");
         s.tick(1);
         assert_eq!(casts(&s), 0);
         s.tick(10_000);
         let o = s.world.get(warrior).unwrap();
-        assert!((o.position[0] - 18.0).abs() < 0.01, "{:?}", o.position);
+        assert!((o.position[0] - 17.6).abs() < 0.01, "{:?}", o.position);
         assert_eq!(casts(&s), 1);
     }
 

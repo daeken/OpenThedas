@@ -305,6 +305,10 @@ pub struct Command {
     /// The ability's impact has been dealt; the command runs on to its end.
     #[serde(default)]
     pub impacted: bool,
+    /// For a melee attack: the walk to its place on the target's melee ring has just ended,
+    /// so the attack's start step tests the range with its slack (see `Sim::approach_point`).
+    #[serde(default)]
+    pub arrived: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -530,6 +534,12 @@ pub struct World {
     #[serde(default)]
     pub alerts: Vec<crate::journal::Alert>,
     pub game_mode: i32,
+    /// While a conversation holds the game (`GM_DIALOG`, 4): the mode it replaced, and a
+    /// mode a script asked for meanwhile, which waits until the conversation ends.
+    #[serde(default)]
+    pub mode_before_talk: Option<i32>,
+    #[serde(default)]
+    pub mode_after_talk: Option<i32>,
     /// Cutscenes loaded with `LoadCutscene` that have not played yet, in order. Each starts
     /// once the scripts that loaded it have run (see [`crate::sim::CutscenePolicy`]).
     #[serde(default)]
@@ -724,6 +734,8 @@ impl World {
             tutorial_paused: false,
             alerts: Vec::new(),
             game_mode: 0,
+            mode_before_talk: None,
+            mode_after_talk: None,
             cutscenes: Vec::new(),
             dialog_cutscenes: Vec::new(),
             cutscene: None,

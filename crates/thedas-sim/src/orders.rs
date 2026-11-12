@@ -28,6 +28,7 @@ fn command(sim: &Sim, ty: &str, name: &str) -> Command {
         ring_wait: false,
         after_impact_ms: None,
         impacted: false,
+        arrived: false,
         path: Vec::new(),
     }
 }
