@@ -117,6 +117,10 @@ pub(crate) struct D3dPass {
     ambients: Vec<Vec3>,
     /// Each scene draw's SpeedTree placement constants, for the `spt_*` shaders.
     trees: Vec<Option<crate::d3d::TreeConstants>>,
+    /// Each scene draw's SpeedTree level of detail, and what it came to this frame: the
+    /// index range to draw and the alpha reference, `None` when the part is not drawn.
+    tree_lods: Vec<Option<crate::scene::TreeLod>>,
+    tree_frame: std::sync::Mutex<Vec<Option<(u32, u32, f32)>>>,
     /// The level's sun (direction, colour), if it has one.
     sun: Option<(Vec3, Vec3)>,
     fog: [[f32; 4]; 2],
@@ -1008,7 +1012,9 @@ fn const_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             entry(translate::binding_float(Stage::Pixel), f),
             entry(translate::binding_int(Stage::Pixel), f),
             entry(translate::binding_bool(Stage::Pixel), f),
-            entry(translate::BINDING_FIXUP, v),
+            // The fix-up vector: the vertex stage's half-pixel shift, and in `z` the alpha
+            // reference of draws that set it per draw (the trees').
+            entry(translate::BINDING_FIXUP, v | f),
         ],
     })
 }
@@ -1710,6 +1716,10 @@ impl D3dPass {
             trees: (0..scene.draws.len())
                 .map(|i| scene.tree_constants.get(&i).copied())
                 .collect(),
+            tree_lods: (0..scene.draws.len())
+                .map(|i| scene.tree_lods.get(&i).cloned())
+                .collect(),
+            tree_frame: std::sync::Mutex::new(vec![None; scene.draws.len()]),
             ambients: scene
                 .draws
                 .iter()
@@ -2058,12 +2068,24 @@ impl D3dPass {
         // Only the draws in view get constants (and are drawn); a skinned draw's bounds
         // follow its bones (see [`skinned_sphere`]).
         let view_proj = projection * view;
+        // The trees' levels of detail for this camera.
+        let mut tree_frame = self.tree_frame.lock().unwrap_or_else(|e| e.into_inner());
+        if !warm {
+            for (frame, lod) in tree_frame.iter_mut().zip(&self.tree_lods) {
+                *frame = lod.as_ref().and_then(|l| l.frame(camera.position));
+            }
+        }
         let in_view: Vec<bool> = self
             .draws
             .iter()
             .map(|d| {
                 if warm {
                     return true;
+                }
+                if self.tree_lods.get(d.draw).is_some_and(|l| l.is_some())
+                    && tree_frame.get(d.draw).is_none_or(|f| f.is_none())
+                {
+                    return false;
                 }
                 // A draw faded all the way out is not drawn (a cut-away ceiling).
                 self.opacity.get(d.draw).is_none_or(|&o| o > 0.0)
@@ -2213,6 +2235,18 @@ impl D3dPass {
                         partial_spans.push((d.slot + offset + lo as u64, at..partial.len()));
                     }
                 }
+                // A tree's alpha reference moves with its LOD.
+                if let Some(Some((_, _, alpha))) = tree_frame.get(d.draw) {
+                    let fix = [
+                        1.0 / width.max(1) as f32,
+                        1.0 / height.max(1) as f32,
+                        *alpha,
+                        0.0,
+                    ];
+                    let at = partial.len();
+                    partial.extend_from_slice(bytemuck::cast_slice(&fix));
+                    partial_spans.push((d.slot + SLOT[6], at..partial.len()));
+                }
                 statics[i] = Some(fixed);
                 continue;
             }
@@ -2243,7 +2277,12 @@ impl D3dPass {
             let fix = [
                 1.0 / width.max(1) as f32,
                 1.0 / height.max(1) as f32,
-                0.0,
+                // A tree's alpha reference (84, the full-detail value, until its LOD is
+                // worked out).
+                match tree_frame.get(d.draw) {
+                    Some(Some((_, _, alpha))) => *alpha,
+                    _ => 84.0,
+                },
                 0.0,
             ];
             data[SLOT[6] as usize..][..16].copy_from_slice(bytemuck::cast_slice(&fix));
@@ -2517,7 +2556,17 @@ impl D3dPass {
         pass.set_bind_group(1, &d.textures, &[]);
         pass.set_vertex_buffer(0, d.vertices.slice(..));
         pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..count, 0, 0..1);
+        // A tree part draws its current level's indices only.
+        let range = match self
+            .tree_frame
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(d.draw)
+        {
+            Some(Some((first, n, _))) => *first..(*first + *n).min(count),
+            _ => 0..count,
+        };
+        pass.draw_indexed(range, 0, 0..1);
     }
 }
 

@@ -152,6 +152,8 @@ fn build(vfs: &Vfs, vs_name: &str, ps_name: &str, state_name: &str) -> Result<D3
         &Options {
             color_targets: Some(1),
             alpha_test,
+            // The game sets the trees' alpha reference per draw (their LOD fades).
+            alpha_ref_uniform: spt,
             ..Default::default()
         },
     )
