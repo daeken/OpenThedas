@@ -11,8 +11,8 @@ Written by the stream that works on this area. Entries marked traced were read f
 Each item: original / ours / evidence / size / dependencies. Sizes: S < 1 day, M 1-3 days, L a week or more.
 
 ### Vegetation
-1. **SpeedTree geometry.** Original: SpeedTreeRT, statically linked, builds branches, fronds and leaf cards from the .spt parameters at load, draws them with the spt_branch/fronds/leafcards/leafmesh shaders, with LOD fades to billboards. Ours: billboards only (#311, two crossed quads per tree). Evidence: notes/speedtree.md; parser exists (#204). Size L+. Needs the SDK read as a format reference only (no code copied), plus checking the exe's vertex packing.
-2. **Grass and bushes** (gra_*, bsh_* .spt). Original: leaf-card clumps. Ours: nothing (no billboard image). Size M once (1) exists, or S as an interim of crossed cards from the leaf texcoords.
+1. **SpeedTree geometry.** Original: speedtreert.dll builds branches, fronds, leaf cards and mesh leaves at load, drawn with the game's spt_branch/fronds/leafcards/leafmeshes shaders (half-float vertices), with LOD and alpha-test fades to per-forest billboards. Ours: branches, fronds and leaf cards from the generator at LOD 0 with `prop.mat` stand-in materials; leaf cards are fixed crossed quads; mesh leaves are not drawn. Evidence: OpenThedas-testdata notes/speedtree-exe-trace.md. Size M.
+2. **Grass and bushes** now draw from their fronds and leaf cards; see (1) for what is still stand-in.
 3. **Tree wind and leaf motion.** Original: g_amWindMatrices, SpeedWind. Ours: static. Size M. Needs (1).
 4. **Tree per-instance colour** (RML 3375), billboard lighting from the normal_billboards atlas, and LOD transitions. Ours: none. Size S-M.
 
@@ -160,8 +160,8 @@ Scope: `crates/thedas-render`, `crates/thedas-shader`, the rendering-facing read
 
 ### Vegetation
 
-- **RND-075** **SpeedTree geometry is not built.** Original: SpeedTreeRT builds the trunks, branches, fronds and leaves at run time, and shows billboards only far away. Ours: every tree is two crossed quads from the level's billboard atlas at all distances, drawn with `prop.mat` `Punch`. Evidence: `crates/thedas-render/src/scene.rs:686`. Size: L. Depends: none. Kind: provisional.
-- **RND-076** **Trees without a billboard are not drawn.** Original: grass and bushes are SpeedTrees. Ours: trees with no billboard image are left out, so grass and bushes are missing. Evidence: `crates/thedas-render/src/scene.rs:693`. Size: L. Depends: RND-075. Kind: missing.
+- **RND-075** **SpeedTrees draw with stand-in materials and no LOD.** Original: the `spt_*` shaders with half-float vertices, the game's own squared-distance LOD (bounding radius, RML 3379, detail option, zoom) and alpha-test fades to billboards. Ours: generated branches, fronds and leaf cards at LOD 0 at every distance, drawn with `prop.mat` `Default` (bark) and `Punch` (the level atlas); billboards only for a tree with no geometry. Evidence: `crates/thedas-render/src/scene.rs:694`. Size: M. Depends: none. Kind: provisional.
+- **RND-076** **Leaf cards do not face the camera, and mesh leaves are not drawn.** Original: cards turned to the camera in `spt_leafcards` (6 vertices of 48 bytes per leaf); 446 of 552 trees also draw mesh leaves with `spt_leafmeshes`. Ours: each card is two fixed crossed quads; mesh leaves are absent. Evidence: `crates/thedas-render/src/scene.rs` `leaf_cards`. Size: M. Depends: none. Kind: missing.
 - **RND-077** **SpeedTree wind is not applied.** Original: wind. Ours: the `.spt` wind sections are parsed, and no renderer code uses them. Evidence: `crates/thedas-formats/src/speedtree.rs:13`. Size: M. Depends: RND-075. Kind: missing.
 - **RND-078** **SpeedTree LOD and leaf clusters are unused.** Original: LOD transitions. Ours: the LOD and leaf-cluster sections are parsed and unused. Evidence: `crates/thedas-formats/src/speedtree.rs:489`. Size: M. Depends: RND-075. Kind: missing.
 - **RND-079** **The SpeedTree format layout comes from the SDK.** Original: not traced. Ours: token numbers, nesting and defaults follow the SpeedTree 4 SDK reader. Evidence: `crates/thedas-formats/src/speedtree.rs:18`. Size: S. Depends: none. Kind: provisional.
