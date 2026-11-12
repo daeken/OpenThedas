@@ -119,8 +119,10 @@ pub struct AreaReverb {
 
 impl AreaReverb {
     /// The preset the area starts with (DAOrigins.exe 0x6866f8..0x686a32): its own if it
-    /// has one, else the preset the most reverb triggers use (ties: the first by name, the
-    /// exe's map order; triggers with no preset are not counted, 0x6867b6), else none.
+    /// has one, else the preset the most reverb triggers use (ties: the first by name in the
+    /// exe's map order, a case-sensitive compare of UTF-16 code units (0x413800), which is
+    /// byte order for these ASCII names; triggers with no preset are not counted, 0x6867b6),
+    /// else none.
     ///
     /// Provisional: the exe counts a trigger for which a virtual (+0x1d8) holds as 0.15
     /// instead of 1; that check is not traced, so every trigger counts 1. It also loads the
@@ -149,10 +151,14 @@ impl AreaReverb {
     }
 
     /// The preset to switch to as the party leader moves from where `was` says it was to
-    /// `p`: the preset of a trigger it has just entered (the last listed, if several), as
-    /// entering a reverb trigger sets its preset (0x79b3d0 -> 0x5b7790 -> 0x5c35f0, with the
-    /// default fade). Leaving a trigger changes nothing: the reverb stays until another is
-    /// entered. `Priority` is read (0x799a5f) but nothing uses it.
+    /// `p`: the preset of a trigger it has just entered, as entering a reverb trigger sets
+    /// its preset (0x79b3d0 -> 0x5b7790 -> 0x5c35f0, with the default fade). Leaving a
+    /// trigger changes nothing: the reverb stays until another is entered. `Priority` is
+    /// read (0x799a5f) but nothing uses it.
+    ///
+    /// Provisional: that the party leader's entering is what counts (the caller of the
+    /// enter handler is not traced), and that of several triggers entered in one step the
+    /// last listed wins.
     pub fn entered(&self, was: &[bool], p: [f32; 3]) -> (Vec<bool>, Option<&str>) {
         let now = self.inside(p);
         let mut preset = None;

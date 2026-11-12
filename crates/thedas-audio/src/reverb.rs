@@ -11,11 +11,24 @@
 //!   event sends at full level (0x5bf217..0x5bf255, 0x5be6a0), times its own reverb wet
 //!   level.
 //!
-//! Provisional: the reverb's sound. FMOD Ex's software reverb is an I3DL2 reverb taking the
-//! properties listed in [`Params`] (DAOrigins.exe 0x5bfc70 maps them onto it); this is our
-//! own I3DL2-style reverb (filtered input, early reflections, a feedback delay network whose
-//! decay follows the decay time and HF ratio), not FMOD's algorithm, so its colour and
-//! level only approximate the original's.
+//! The properties take their documented I3DL2 meanings (FMOD Ex's software reverb is an
+//! I3DL2 reverb; DAOrigins.exe 0x5bfc70 lists the ones it takes: room, room HF and LF,
+//! decay time and HF ratio, reflections and reverb levels and delays, diffusion, density,
+//! and the HF and LF references):
+//! - `room` scales everything the reverb adds; `room_hf` and `room_lf` attenuate it at
+//!   `hf_reference` (a low-pass) and `lf_reference` (a low shelf).
+//! - `reflections` is the early reflections' level relative to `room`, `reverb` the late
+//!   reverberation's: each is an energy, so a unit impulse sent at `room` 0 and level 0 mB
+//!   comes back with unit energy in each (per output channel).
+//! - `decay_time` is the late reverberation's 60 dB decay at middle frequencies,
+//!   `decay_hf_ratio` scales it at `hf_reference`; `reflections_delay` is the first
+//!   reflection's delay and `reverb_delay` the late reverberation's after it.
+//!
+//! Provisional: the algorithm. This is our own reverb (filtered input, four early taps, two
+//! diffusers, an 8-line feedback delay network), not FMOD's, so its colour (and how
+//! `diffusion` and `density` shape it) only approximates the original's. `room_rolloff_factor`
+//! (0 in every DA:O preset), the decay LF ratio and the modulation, echo and environment
+//! properties, which FMOD's software reverb does not take, are unused.
 
 use thedas_formats::fev::ReverbProperties;
 
@@ -94,6 +107,8 @@ impl Delay {
 const LINES: [usize; 8] = [1061, 1187, 1291, 1373, 1471, 1553, 1657, 1733];
 /// Early reflection taps, as fractions after the reflections delay.
 const TAPS: [(f32, f32); 4] = [(0.0, 1.0), (0.31, -0.8), (0.57, 0.7), (0.83, -0.6)];
+/// The taps' combined energy (their gains' squares), to normalise them by.
+const TAPS_ENERGY: f32 = 1.0 + 0.64 + 0.49 + 0.36;
 
 /// The mixer's per-frame reverb.
 pub struct Reverb {
@@ -106,6 +121,10 @@ pub struct Reverb {
     now: ReverbProperties,
     input_lp: f32,
     input_b: f32,
+    /// The room LF shelf: a low-pass state, its coefficient and the shelf's gain.
+    lf_lp: f32,
+    lf_b: f32,
+    lf_gain: f32,
     pre: Delay,
     diffusers: [Delay; 2],
     lines: Vec<Delay>,
@@ -137,6 +156,9 @@ impl Reverb {
             now: ReverbProperties::OFF,
             input_lp: 0.0,
             input_b: 0.0,
+            lf_lp: 0.0,
+            lf_b: 0.0,
+            lf_gain: 1.0,
             // Reflections delay (to 0.3 s) plus reverb delay (to 0.1 s), with room.
             pre: Delay::new((rate * 0.45) as usize),
             diffusers: [
@@ -192,7 +214,9 @@ impl Reverb {
         let room = mb(p.room as f32);
         let w = |hz: f32| std::f32::consts::TAU * hz.min(self.rate * 0.45).max(1.0) / self.rate;
         self.input_b = lowpass(mb(p.room_hf as f32), w(p.hf_reference));
-        self.early_gain = room * mb(p.reflections as f32) * 0.5;
+        self.lf_b = (-w(p.lf_reference)).exp();
+        self.lf_gain = mb(p.room_lf as f32);
+        self.early_gain = room * mb(p.reflections as f32) / TAPS_ENERGY.sqrt();
         self.diffusion = (p.diffusion / 100.0).clamp(0.0, 1.0) * 0.6;
         self.early_at = (p.reflections_delay.clamp(0.0, 0.3) * self.rate) as usize + 1;
         self.late_at = ((p.reflections_delay.clamp(0.0, 0.3) + p.reverb_delay.clamp(0.0, 0.1))
@@ -202,7 +226,7 @@ impl Reverb {
         let density = 0.5 + 0.5 * (p.density / 100.0).clamp(0.0, 1.0);
         let decay = p.decay_time.clamp(0.1, 20.0);
         let decay_hf = (decay * p.decay_hf_ratio.clamp(0.1, 2.0)).max(0.05);
-        let mut energy = 0.0;
+        let mut kept = 0.0;
         for i in 0..8 {
             let len = ((self.line_len[i] as f32 * density) as usize).max(1);
             let secs = len as f32 / self.rate;
@@ -210,10 +234,15 @@ impl Reverb {
             let g_hf = 10f32.powf(-3.0 * secs / decay_hf);
             self.feedback[i] = g;
             self.damp_b[i] = lowpass((g_hf / g).min(1.0), w(p.hf_reference));
-            energy += 1.0 - g * g;
+            kept += g * g / 8.0;
         }
-        // Keep the tail's energy at the reverb level whatever the decay.
-        self.late_gain = room * mb(p.reverb as f32) * (energy / 8.0).sqrt() * 0.7;
+        // The tail's energy at the reverb level whatever the decay: an impulse puts unit
+        // energy into each of the 8 lines; each pass through the (energy-preserving) mix
+        // keeps `g^2` of it, so the lines carry `8 / (1 - g^2)` in all, half of it to each
+        // output channel (4 lines each). Paths of equal length through the network add
+        // coherently, which measures about 1.7 dB over that (0.3..8 s decays), so take it
+        // off.
+        self.late_gain = room * mb(p.reverb as f32) * ((1.0 - kept) / 4.0).sqrt() * 0.82;
     }
 
     fn line_tap(&self, i: usize) -> usize {
@@ -237,17 +266,17 @@ impl Reverb {
         for f in 0..frames {
             let x = (send[2 * f] + send[2 * f + 1]) * 0.5;
             self.input_lp += (1.0 - self.input_b) * (x - self.input_lp);
-            self.pre.push(self.input_lp);
-            // Early reflections: a few taps between the reflections and reverb delays.
+            self.lf_lp += (1.0 - self.lf_b) * (self.input_lp - self.lf_lp);
+            self.pre
+                .push(self.input_lp + (self.lf_gain - 1.0) * self.lf_lp);
+            // Early reflections: four taps between the reflections and reverb delays, to both
+            // sides (alternate ones inverted on the right, to decorrelate them).
             let (mut el, mut er) = (0.0, 0.0);
             for (k, (at, g)) in TAPS.iter().enumerate() {
                 let n = self.early_at + (at * span) as usize;
                 let v = self.pre.tap(n) * g * self.early_gain;
-                if k % 2 == 0 {
-                    el += v;
-                } else {
-                    er += v;
-                }
+                el += v;
+                er += if k % 2 == 0 { v } else { -v };
             }
             // Late reverb: two all-pass diffusers into an 8-line feedback delay network
             // mixed by a Hadamard matrix.
@@ -348,5 +377,89 @@ mod tests {
         assert_eq!(r.properties().room, -1500);
         r.process(&vec![0.0; 2 * 12000], &mut out);
         assert_eq!(r.properties(), b);
+    }
+
+    fn flat(mut p: ReverbProperties) -> ReverbProperties {
+        p.room = 0;
+        p.room_hf = 0;
+        p.room_lf = 0;
+        p.decay_time = 1.0;
+        p.decay_hf_ratio = 1.0;
+        p.diffusion = 100.0;
+        p.density = 100.0;
+        p
+    }
+
+    #[test]
+    fn levels_are_energies_relative_to_room() {
+        let db = |e: f32| 10.0 * e.log10();
+        // Early only: exactly unit energy per channel.
+        let mut p = flat(ReverbProperties::GENERIC);
+        p.reflections = 0;
+        p.reverb = -10000;
+        let mut r = Reverb::new(48000);
+        r.set(p, 0.0);
+        let out = impulse(&mut r, 1.0);
+        let left: Vec<f32> = out.iter().step_by(2).copied().collect();
+        // (The impulse is in both input channels at 1, so the send is 1.)
+        assert!(db(energy(&left)).abs() < 0.1, "{} dB", db(energy(&left)));
+        // Late only: unit energy per channel, within the network's spread.
+        p.reflections = -10000;
+        p.reverb = 0;
+        let mut r = Reverb::new(48000);
+        r.set(p, 0.0);
+        let out = impulse(&mut r, 4.0);
+        let left: Vec<f32> = out.iter().step_by(2).copied().collect();
+        assert!(db(energy(&left)).abs() < 1.5, "{} dB", db(energy(&left)));
+        // Room scales both: -600 mB is -6 dB.
+        p.room = -600;
+        let mut r = Reverb::new(48000);
+        r.set(p, 0.0);
+        let out = impulse(&mut r, 4.0);
+        let quieter: Vec<f32> = out.iter().step_by(2).copied().collect();
+        assert!((db(energy(&left)) - db(energy(&quieter)) - 6.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn room_lf_attenuates_low_frequencies() {
+        let mut p = flat(ReverbProperties::GENERIC);
+        p.reverb = -10000;
+        p.reflections = 0;
+        let tone = |r: &mut Reverb, hz: f32| {
+            let n = 48000;
+            let send: Vec<f32> = (0..2 * n)
+                .map(|i| (std::f32::consts::TAU * hz * (i / 2) as f32 / 48000.0).sin())
+                .collect();
+            let mut out = vec![0.0; 2 * n];
+            r.process(&send, &mut out);
+            energy(&out[n..])
+        };
+        let mut flat_r = Reverb::new(48000);
+        flat_r.set(p, 0.0);
+        p.room_lf = -1200;
+        let mut cut = Reverb::new(48000);
+        cut.set(p, 0.0);
+        let low = 10.0 * (tone(&mut flat_r, 40.0) / tone(&mut cut, 40.0)).log10();
+        let high = 10.0 * (tone(&mut flat_r, 4000.0) / tone(&mut cut, 4000.0)).log10();
+        assert!(low > 8.0, "{low} dB at 40 Hz");
+        assert!(high < 1.0, "{high} dB at 4 kHz");
+    }
+
+    #[test]
+    fn late_level_holds_across_decay_times() {
+        for decay in [0.3f32, 1.0, 4.0] {
+            let mut p = flat(ReverbProperties::GENERIC);
+            p.reflections = -10000;
+            p.reverb = 0;
+            p.decay_time = decay;
+            let mut r = Reverb::new(48000);
+            r.set(p, 0.0);
+            let out = impulse(&mut r, decay * 2.5 + 0.5);
+            for side in 0..2 {
+                let e: f32 = out.iter().skip(side).step_by(2).map(|v| v * v).sum();
+                let db = 10.0 * e.log10();
+                assert!(db.abs() < 1.5, "decay {decay} side {side}: {db} dB");
+            }
+        }
     }
 }

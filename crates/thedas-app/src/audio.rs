@@ -679,6 +679,23 @@ impl GameAudio {
             return;
         }
         let strref = lines[(self.random() % lines.len() as u64) as usize];
+        // Creature sets (`ss_wolf`) have an event per line, `<set>/VO/<strref>_m` (in
+        // `CRambient_ss`), that picks among the line's variants; voiced sets only have the
+        // samples, played through `VOambient_ss`.
+        for g in ["m", "f"] {
+            let event = format!("{key}/VO/{strref}_{g}");
+            let project = self.engine.library.project(&key);
+            if project.is_some_and(|p| p.event(&event).is_some()) {
+                self.engine.play(
+                    &event,
+                    PlayOptions {
+                        position: at,
+                        ..Default::default()
+                    },
+                );
+                return;
+            }
+        }
         let lib = self.engine.library.clone();
         let sample = [format!("{strref}_m"), format!("{strref}_f")]
             .into_iter()
@@ -734,14 +751,23 @@ impl GameAudio {
                 (Some(t), Some(col)) => table_event(t, veg, col),
                 _ => None,
             };
-            if let Some(event) = event {
-                self.engine.play(
-                    &event,
-                    PlayOptions {
-                        position: Some(*pos),
-                        ..Default::default()
-                    },
-                );
+            match &event {
+                Some(event) => {
+                    log::debug!(
+                        "audio: vegetation rustle {event} (creature {id}, vegetation {veg})"
+                    );
+                    self.engine.play(
+                        event,
+                        PlayOptions {
+                            position: Some(*pos),
+                            ..Default::default()
+                        },
+                    );
+                }
+                None => log::debug!(
+                    "audio: vegetation {veg} under creature {id} has no rustle (size {:?})",
+                    g.size
+                ),
             }
             let reach = (self.random() % 100) as f32 * 0.004 + 0.8;
             rustled.insert(*id, (*pos, reach));
