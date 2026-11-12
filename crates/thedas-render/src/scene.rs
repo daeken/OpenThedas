@@ -766,7 +766,8 @@ impl<'a> Loader<'a> {
         // By ground cell, tree, part mesh, material and whether it is the billboard: the
         // placements' transforms, points and far distances.
         type Batch = Vec<(Mat4, Vec3, f32)>;
-        let mut batches: BTreeMap<((i64, i64), usize, usize, usize, bool), Batch> = BTreeMap::new();
+        type BatchKey = ((i64, i64), usize, usize, usize, bool);
+        let mut batches: BTreeMap<BatchKey, Batch> = BTreeMap::new();
         for &(tree, placement, scale) in spots {
             let built = built_trees.entry(tree).or_insert_with(|| {
                 let name = format!("{}.spt", trees.get(tree)?.to_ascii_lowercase());
