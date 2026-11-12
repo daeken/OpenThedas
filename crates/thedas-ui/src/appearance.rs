@@ -17,8 +17,9 @@ use thedas_sim::sim::Sim;
 
 use crate::UiValue;
 
-/// The groups, in order: their labels (talk table strrefs).
-pub const GROUPS: [u32; 9] = [
+/// The groups, in order: their labels (talk table strrefs). The last, Voice, has no sliders:
+/// chargen.gfx shows its sound set list instead (its `SOUNDSET_GROUP`, 9).
+pub const GROUPS: [u32; 10] = [
     374691, // Preset
     374692, // Skin
     374704, // Hair
@@ -28,6 +29,7 @@ pub const GROUPS: [u32; 9] = [
     374736, // Jaw / Cheeks
     374746, // Neck / Ears
     374750, // Portrait
+    374758, // Voice
 ];
 
 /// A slider's range: fixed, or a face-screen list's indices.
@@ -220,10 +222,21 @@ pub fn values(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
             43 => !beards,
             _ => female,
         };
-        let label = if second { s.label.1 } else { s.label.0 };
+        // The preset's slider has no label (the original shows only the group's name).
+        let label = match s.id {
+            PRESET => 0,
+            _ if second => s.label.1,
+            _ => s.label.0,
+        };
         v.insert(k.clone(), UiValue::Number(s.id as f64));
         v.insert(format!("{k}.Group"), UiValue::Number(s.group as f64));
-        v.insert(format!("{k}.Name"), text(label));
+        v.insert(
+            format!("{k}.Name"),
+            match label {
+                0 => UiValue::String(String::new()),
+                l => text(l),
+            },
+        );
         v.insert(
             format!("{k}.Value"),
             UiValue::Number(value(sim, id, &s, min, max) as f64),

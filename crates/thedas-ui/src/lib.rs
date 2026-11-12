@@ -1130,7 +1130,7 @@ impl UiMovie {
                 let (tw, th) = (t.rect[2] - t.rect[0], t.rect[3] - t.rect[1]);
                 // A clip as big as most of the window catches clicks behind a dialog box (a
                 // popup's background), not a button.
-                let shows = tw >= 2.0 && th >= 2.0 && tw * th < w * h * 0.5;
+                let shows = tw >= 2.0 && th >= 2.0 && tw * th < w * h * 0.25;
                 (shows && seen.insert(t.path.clone())).then(|| {
                     t.movie = self.name.clone();
                     t
