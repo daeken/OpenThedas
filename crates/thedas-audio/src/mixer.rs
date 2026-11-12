@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use crate::decode::Pcm;
 
-/// The volume groups the options screen controls. DA:O's `audio_categories.fev` nests finer
-/// categories under these; until it is read, a voice names the group directly.
+/// The volume groups the options screen controls. An event's category (from
+/// `audio_categories.fev`, which the engine reads for category volumes and ducking) picks its
+/// group by name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Bus {
     Music,

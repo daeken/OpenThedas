@@ -1,18 +1,22 @@
-//! The game's sound: the start menu's and character creation's music, the interface's sounds
-//! and conversation voice-over, played through [`thedas_audio`] on the system output.
+//! The game's sound, played through [`thedas_audio`] on the system output.
 //!
 //! - Music: the front end plays `music/_menu/main` (DAOrigins.exe names the `music/_menu`
-//!   theme, 0xafed94); character creation `music/_menu/chargen`; both stop when the game
-//!   proper starts. In-game music (area themes and combat) is not done yet.
+//!   theme, 0xafed94); character creation `music/_menu/chargen`. In the game, the area's
+//!   theme (`MusicPreset`) plays `main`, `combat` or `Death` with its stingers (see
+//!   `follow_area`).
 //! - Interface: the movies' `PlayGUISound <id> ...` plays `sound_gui.gda`'s event for the id.
 //! - Voice-over: a conversation line plays its dialog project's `VO/VOconversation` event
 //!   (`VO/VOambient` for an ambient line) with the line's own sample as the programmer sound:
 //!   `<strref>_f` for a female hero when the bank has it, else `<strref>_m` (DAOrigins.exe
 //!   builds `%ls/VO/%ld` and the suffix at 0x7f2be9). The line stays up for the length of its
 //!   voice.
+//! - The world: area ambience and placed sounds, script sounds, sound sets, animation sound
+//!   events (footsteps, foley, weapon actions, blows, bodyfalls, vegetation) and the world
+//!   reverb, each documented where it is played.
+//! - Volumes: the options screen's sliders map to dB as DAOrigins.exe maps them (see
+//!   [`volumes`]).
 //!
-//! Provisional: voice-over is not positioned at the speaker yet, and the options screen's
-//! volumes map linearly (0..10 to silent..full).
+//! Provisional: voice-over is not positioned at the speaker.
 
 use std::path::Path;
 use std::sync::Arc;
