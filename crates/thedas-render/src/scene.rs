@@ -772,7 +772,13 @@ impl<'a> Loader<'a> {
             let built = built_trees.entry(tree).or_insert_with(|| {
                 let name = format!("{}.spt", trees.get(tree)?.to_ascii_lowercase());
                 let spt = thedas_formats::speedtree::parse(&self.read(&name).ok()?).ok()?;
-                let mesh = TreeMesh::new(&spt);
+                let mesh = match TreeMesh::try_new(&spt) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        self.warn(format!("{name}: {e}"));
+                        return None;
+                    }
+                };
                 let mut parts = Vec::new();
                 let bark = bark_texture(&spt.tree.branch_texture);
                 if let Some(lod) = mesh.branches.lods.first()

@@ -184,7 +184,6 @@ const PRESENTATION: &[&str] = &[
     "PlaySoundSet",
     "PlaySound",
     "PlaySoundObject",
-    "SetLoadHint",
     "LinkAreaMiniMaps",
     "SendGameEventRunDatabase",
     "SetPlaceableHealth",
@@ -3583,6 +3582,15 @@ pub fn call(
             }
             void()
         }
+        // The loading screen's hint for the next area-list transition: a row of `n2DAReference`
+        // (206 "Load Hints" by default, or 271 "LoadHintsRandom"), cleared once that
+        // transition takes it (see `World::load_hint`). Provisional: when the exe clears it
+        // is taken from the movie's behaviour, not traced.
+        "SetLoadHint" => {
+            let table = if a.len() > 1 { int(a, 1) } else { 206 };
+            h.sim.world.load_hint = Some((int(a, 0), table));
+            void()
+        }
         "SpawnBodyBag" => {
             let c = obj(a, 0);
             h.sim.spawn_body_bag(c, int(a, 1) != 0);
@@ -5960,7 +5968,26 @@ mod coverage_tests {
         effect[] GetEffects(object o, int t = 0, int a = 0, object c = OBJECT_INVALID, int d = 0, int i = -1) = 112;\n\
         void RemoveEffect(object o, effect e) = 113;\n\
         void SetGameMode(int n) = 114;\n\
-        void SetZoomLevel(float f) = 115;\n";
+        void SetZoomLevel(float f) = 115;\n\
+        void SetLoadHint(int n, int t = 206) = 116;\n";
+
+    #[test]
+    fn a_load_hint_waits_for_the_next_transition() {
+        let mut s = sim();
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        run(&mut s, hero, "SetLoadHint", &[Value::Int(12)]);
+        assert_eq!(s.world.load_hint, Some((12, 206)));
+        run(
+            &mut s,
+            hero,
+            "SetLoadHint",
+            &[Value::Int(3), Value::Int(271)],
+        );
+        assert_eq!(s.world.load_hint, Some((3, 271)));
+        s.area_transition("nowhere", "");
+        assert_eq!(s.world.load_hint, None);
+        assert_eq!(s.world.transition_hint, Some((3, 271)));
+    }
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());

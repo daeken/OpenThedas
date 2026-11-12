@@ -59,6 +59,9 @@ pub struct Gear {
     /// Its hands' sound material when they hold no weapon (`apr_base.gda` column
     /// 0x7d86f95a: 19 bare hands, 20 claws, 27 large claws; 0x6a0b05..0x6a0b53).
     pub unarmed: Option<i64>,
+    /// For a placeable: its type, the row of `placeable_types.gda` (worksheet 93, the
+    /// placeable's +0x4f0) that names its sounds.
+    pub placeable: Option<i64>,
 }
 
 /// A sound set's lines (`sse_<set>.gda`: row -> strref) and each type's number of them
@@ -110,6 +113,12 @@ pub struct AudioState {
     /// The party is fighting / has fallen.
     pub combat: bool,
     pub dead: bool,
+    /// The simulation's game mode (`GM_*` in `script.ldf`: 0 explore, 1 combat, 2 dead,
+    /// 4 dialog, 5 cutscene, 9 loading, ...).
+    pub game_mode: i32,
+    /// An area is loading (the load screen is up): the game mode is `GM_LOADING` for the
+    /// sound, whatever the simulation's says.
+    pub loading: bool,
     /// Where the listener is (between the party leader and the camera) and its right.
     pub listener: Option<([f32; 3], [f32; 3])>,
     /// Where the party leader stands (reverb triggers follow it).
@@ -228,6 +237,9 @@ pub struct GameAudio {
     /// material by label).
     weapon_hits: Option<thedas_formats::Gda>,
     bodyfall_foley: Option<thedas_formats::Gda>,
+    /// `placeable_types.gda`: each placeable type's sounds, by column (`ClosedToOpened`,
+    /// `OpenedToClosed`, `Destroyed`, `Used`, `Locked`, `Hit` and others).
+    placeable_types: Option<thedas_formats::Gda>,
     item_material_labels: std::collections::HashMap<i64, u32>,
     /// `sound_vegetation_type.gda`, worksheet 155 "Sound Movement Vegetation" (rows:
     /// vegetation; columns: size `small`/`medium`/`large`).
@@ -245,6 +257,10 @@ pub struct GameAudio {
     /// A music volume's request waiting for its delay: the intensity and the seconds left
     /// (see `AreaReverb::music_entered`).
     music_request: Option<(i32, f32)>,
+    /// The game mode's ducking event playing (see [`mode_duck`]): its path and handle.
+    mode_duck: Option<(&'static str, Option<EventHandle>)>,
+    /// The simulation's music intensity last seen (scripts' `SetMusicIntensity`).
+    script_intensity: Option<i32>,
     /// `ss_types.gda`: each sound set type's first entry row and default probability.
     ss_types: std::collections::HashMap<i32, (i64, f32)>,
     /// Each sound set's entries (`sse_<set>.gda`: entry row -> line strref), read once.
@@ -337,6 +353,33 @@ fn blow_event(
     struck: i64,
 ) -> Option<String> {
     table_event(hits, weapon?, *labels.get(&struck)?)
+}
+
+const GM_DEAD: i32 = 2;
+const GM_DIALOG: i32 = 4;
+const GM_CUTSCENE: i32 = 5;
+const GM_LOADING: i32 = 9;
+
+/// The ducking event a game mode plays while it lasts (DAOrigins.exe's mode-change handler
+/// 0x5bd220, tables 0x5bd618 and 0x5bd638): `OnDeath` for `GM_DEAD`, `OnCutscene` for
+/// `GM_DIALOG` and `GM_CUTSCENE` (one event across a change between the two), and
+/// `OnGameLoading` for `GM_LOADING`. The loading one turns world sounds (movement,
+/// footsteps, effects, ambience, placeables) down 60 dB over 0.2 s and leaves music, voice
+/// and the interface alone; the cutscene one lowers ambience and effects and the music by
+/// 3 dB.
+fn mode_duck(mode: i32) -> Option<&'static str> {
+    match mode {
+        GM_DEAD => Some("audio_categories/ducking/OnDeath"),
+        GM_DIALOG | GM_CUTSCENE => Some("audio_categories/ducking/OnCutscene"),
+        GM_LOADING => Some("audio_categories/ducking/OnGameLoading"),
+        _ => None,
+    }
+}
+
+/// The `placeable_types.gda` column a placeable sound event (kind 27) names: its text
+/// trimmed of spaces, tabs and the string's terminator, hashed as a column name.
+fn placeable_sound_column(label: &str) -> u32 {
+    thedas_formats::gda::column_hash(label.trim_matches(|c| matches!(c, ' ' | '\t' | '\0')))
 }
 
 /// The event in row `row`, column `col` (by hash) of a sound table, if any.
@@ -606,12 +649,15 @@ impl GameAudio {
             bodyfalls: read_gda(vfs, "sound_bodyfall_creat_size.gda"),
             weapon_hits: read_gda(vfs, "sound_weapon_hits.gda"),
             bodyfall_foley: read_gda(vfs, "sound_bodyfall_foley.gda"),
+            placeable_types: read_gda(vfs, "placeable_types.gda"),
             item_material_labels: item_material_labels(vfs),
             rustles: Default::default(),
             impacts: Impacts::read(vfs),
             foley: Foley::read(vfs),
             music_state: 1.0,
             music_request: None,
+            mode_duck: None,
+            script_intensity: None,
             ss_types: ss_types(vfs),
             sound_set_entries: Default::default(),
             sound_set_bags: Default::default(),
@@ -929,6 +975,22 @@ impl GameAudio {
                     // Armour foley (0x69e7f0): `sound_movement_foley.gda`'s column the event
                     // names (`Small`, `Medium`, `Large`) for the armour's sound material
                     // (none: row 0).
+                    // A placeable's sound (kind 27, the placeable's handler 0x74c360): the
+                    // event's text, trimmed of spaces and tabs (0x4c3310), names a column of
+                    // `placeable_types.gda` (worksheet 93), read in the row of the
+                    // placeable's type; door animations name `ClosedToOpened` and
+                    // `OpenedToClosed`. Creatures ignore the kind (0x6b62fb).
+                    // Provisional: the exe plays it at the centre of the model's bounds
+                    // (0x74c4e2..0x74c686); we play it where the placeable stands.
+                    (27, Some(label)) => gear.get(&id).and_then(|g| g.placeable).and_then(|row| {
+                        let col = placeable_sound_column(label);
+                        let e = self
+                            .placeable_types
+                            .as_ref()
+                            .and_then(|t| table_event(t, row, col));
+                        log::debug!("audio: placeable {id} {label:?}: {e:?}");
+                        e
+                    }),
                     (17, Some(size)) => {
                         let g = gear.get(&id).copied().unwrap_or_default();
                         let col = thedas_formats::gda::column_hash(size.trim());
@@ -1175,6 +1237,33 @@ impl GameAudio {
         }
     }
 
+    /// The game mode's ducking (see [`mode_duck`]): on a change of mode the old mode's event
+    /// stops (its ducks ramp back over their fade-outs) and the new one's starts, unless both
+    /// modes use the same event, which then plays on.
+    fn follow_mode(&mut self, state: &AudioState) {
+        let mode = if state.loading {
+            GM_LOADING
+        } else if state.dead {
+            GM_DEAD
+        } else if state.cutscene.is_some() && state.game_mode != GM_DIALOG {
+            GM_CUTSCENE
+        } else {
+            state.game_mode
+        };
+        let want = mode_duck(mode);
+        if self.mode_duck.as_ref().map(|d| d.0) == want {
+            return;
+        }
+        if let Some((path, Some(h))) = self.mode_duck.take() {
+            log::debug!("audio: game mode duck {path} ends");
+            self.engine.stop(h, false);
+        }
+        self.mode_duck = want.map(|path| {
+            log::debug!("audio: game mode {mode}: duck {path}");
+            (path, self.engine.play(path, PlayOptions::default()))
+        });
+    }
+
     /// Sets the music's intensity, `music_state` on the area track (DAOrigins.exe's
     /// SetMusicIntensity, 0x5c0150, sets it on the theme's main, combat and third events).
     fn set_music_state(&mut self, s: f32) {
@@ -1201,8 +1290,8 @@ impl GameAudio {
     /// starts and the old one stops over its event's fade-out.
     ///
     /// Provisional: when the stinger plays (taken as at the change; the exe waits for it in
-    /// state 7), cutscenes and conversations leaving the music alone, and `PlayMusic`
-    /// (dropped).
+    /// state 7), and cutscenes and conversations keeping the track (they only duck it, see
+    /// [`mode_duck`]). Scripts' `PlayMusic` and `StopMusic` do nothing in the exe.
     fn follow_area(&mut self, state: &AudioState, dt: f32) {
         if state.area.is_none() {
             self.end_area();
@@ -1562,21 +1651,24 @@ impl GameAudio {
         let gear = std::mem::take(&mut state.gear);
         self.follow_animations(std::mem::take(&mut state.animations), &gear);
         self.follow_movie(state.movie.take());
-        // Scripts' SetMusicIntensity sets the area music's `music_state` (DAOrigins.exe logs
-        // it as "music state= %2.1f"): the tracks' sounds sit around 1, so 0 silences the
-        // music (pre100pt_light_beacon) and cutscene endings (gen00cs_cs_end_music_int_*)
-        // set 0 to 4. Provisional: that scripts reach the music object's SetMusicIntensity
-        // (0x5c0150) directly is not traced.
-        if let Some(i) = state.music_intensity.take() {
-            self.set_music_state(i as f32);
+        // Scripts' SetMusicIntensity (command 486, handler 0x65d070) asks the music director
+        // for that intensity with no delay (0x5b6cd0), as a music volume does: it replaces a
+        // request still waiting and applies on the director's next update. The tracks' sounds
+        // sit around 1, so 0 silences the music (pre100pt_light_beacon) and cutscene endings
+        // (gen00cs_cs_end_music_int_*) set 0 to 4. The simulation keeps the latest call's
+        // value, so a change of it is a call (a repeat of the same value is not seen).
+        if let Some(i) = state.music_intensity.take()
+            && self.script_intensity != Some(i)
+        {
+            self.script_intensity = Some(i);
+            self.music_request = Some((i, 0.0));
         }
         // A music volume's request (see `AreaReverb::music_entered`) counts down on the
         // music director's update (0x5bb630, given the frame's seconds as the music update
         // is) and then sets the intensity (0x5b6df0 -> the music object's SetMusicIntensity,
         // vtable slot 0x1c). A delay of 0 applies on the next update.
-        // Provisional: the director skips the countdown in game mode 9 (0x5bb669), which is
-        // not identified, so it is not modelled.
-        if let Some((s, left)) = self.music_request.as_mut() {
+        // The director skips the countdown while loading (`GM_LOADING`, 0x5bb669).
+        if let Some((s, left)) = self.music_request.as_mut().filter(|_| !state.loading) {
             *left -= dt;
             if *left <= 0.0 {
                 let s = *s as f32;
@@ -1584,6 +1676,7 @@ impl GameAudio {
                 self.set_music_state(s);
             }
         }
+        self.follow_mode(&state);
         self.follow_area(&state, dt);
         self.follow_cutscene(state.cutscene.clone());
         // Voice-over.
@@ -1725,6 +1818,46 @@ mod tests {
         assert_eq!(blow_event(&hits, &labels, Some(19), 12), None);
         assert_eq!(blow_event(&hits, &labels, Some(1), 99), None);
         assert_eq!(blow_event(&hits, &labels, None, 16), None);
+    }
+
+    #[test]
+    fn game_modes_duck_through_their_events() {
+        assert_eq!(mode_duck(0), None);
+        assert_eq!(mode_duck(1), None);
+        assert_eq!(mode_duck(GM_DIALOG), mode_duck(GM_CUTSCENE));
+        assert_eq!(
+            mode_duck(GM_LOADING),
+            Some("audio_categories/ducking/OnGameLoading")
+        );
+        assert_eq!(mode_duck(GM_DEAD), Some("audio_categories/ducking/OnDeath"));
+    }
+
+    #[test]
+    fn placeable_sounds_name_a_column_of_their_type() {
+        use thedas_formats::gda::{Cell, Column, Gda, column_hash};
+        let col = |name: &str| Column {
+            hash: column_hash(name),
+            kind: None,
+        };
+        let types = Gda {
+            version: thedas_formats::FourCC(*b"V0.2"),
+            columns: vec![col("ID"), col("ClosedToOpened"), col("Used")],
+            rows: vec![vec![
+                Cell::Int(1),
+                Cell::String("plc/doors/small_open ".into()),
+                Cell::Empty,
+            ]],
+        };
+        // The event's text, as `.evt` files store it (with its terminator), or padded.
+        let open = placeable_sound_column("ClosedToOpened\0");
+        assert_eq!(open, placeable_sound_column(" \tClosedToOpened "));
+        assert_eq!(
+            table_event(&types, 1, open).as_deref(),
+            Some("plc/doors/small_open")
+        );
+        // An empty cell or another type: nothing.
+        assert_eq!(table_event(&types, 1, placeable_sound_column("Used")), None);
+        assert_eq!(table_event(&types, 2, open), None);
     }
 
     #[test]

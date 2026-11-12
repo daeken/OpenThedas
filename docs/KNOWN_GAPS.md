@@ -4,8 +4,8 @@ What is wrong or missing in OpenThedas compared with the original Dragon Age: Or
 detail as we can currently give. The [README](../README.md) says what works; this says what does
 not, so that people (and agents) can pick items up in parallel without stepping on each other.
 
-Last full pass: 2026-11-12, at main `f5ae46b`. Last refresh: 2026-11-12 19:00 UTC, at main
-`8a39900`. The counts measured against a real install were added at `477f24e`. It is refreshed with the
+Last full pass: 2026-11-12, at main `f5ae46b`. Last refresh: 2026-11-12 20:15 UTC, at main
+`14e8c8b`. The counts measured against a real install were added at `477f24e`. It is refreshed with the
 README status.
 
 ## How to read it
@@ -35,10 +35,10 @@ so an untraced item starts with a trace, not with a guess.
 | Area | File | Inventory items |
 | --- | --- | --- |
 | Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 168 (`SIM-`), plus ability coverage by family |
-| Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 95 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
-| Rendering | [gaps/rendering.md](gaps/rendering.md) | 151 (`RND-`) |
-| Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 189 (`UI-`), plus the movies never opened and the values no screen gets answered |
-| Audio | [gaps/audio.md](gaps/audio.md) | 56 (`AUD-`) |
+| Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 96 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
+| Rendering | [gaps/rendering.md](gaps/rendering.md) | 152 (`RND-`) |
+| Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 183 (`UI-`), plus the movies never opened and the values no screen gets answered |
+| Audio | [gaps/audio.md](gaps/audio.md) | 58 (`AUD-`) |
 | Cameras, cutscene presentation, startup | [gaps/cameras-cutscenes.md](gaps/cameras-cutscenes.md) | 45 (`CAM-`) |
 | File formats and file system | [gaps/formats.md](gaps/formats.md) | 46 (`FMT-`), plus a table of every resource type and the tables and types nothing reads |
 | Tooling, platforms and project | [gaps/tooling.md](gaps/tooling.md) | 23 (`TOOL-`) |
@@ -97,8 +97,9 @@ these, so they are the places where one person or stream can take a large, separ
 
 - **Shader families outside the default set** fall back to a hand-written stand-in or are
   skipped (`RND-112`, `RND-113`).
-- **SpeedTree.** Trees are two crossed billboards at every distance; trunks, branches, fronds,
-  leaves and wind are not built, and grass and bushes are absent (`RND-075` to `RND-078`).
+- **SpeedTree.** Trees draw as real geometry with distance levels and billboards far away, but
+  leaf cards do not turn to the camera, nothing sways in the wind, and grass and bushes are
+  absent (`RND-075` to `RND-078`).
 - **Effects on creatures and items.** Spell effects, crust effects and weapon glows are not
   drawn; only effects placed at a location are (`RND-094`).
 - **Animation blending.** No blend weights, crossfades, additive layers, inverse kinematics or
@@ -117,7 +118,8 @@ these, so they are the places where one person or stream can take a large, separ
 
 ### Interface and input
 
-- **Screens never built**: loading screens, crafting, item upgrade, the slideshow, the army
+- **Loading screens** are in progress: an area change still freezes the last frame.
+- **Screens never built**: crafting, item upgrade, the slideshow, the army
   screen, the party camp gift screen, store buyback, credits, and the online,
   downloadable-content and achievement screens (`UI-052`, `UI-077`, `UI-124`, `UI-126`,
   `UI-127`, and the stream's list). Of the install's 68 interface movies, 37 are never opened.

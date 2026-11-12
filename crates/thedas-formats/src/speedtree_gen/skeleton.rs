@@ -9,6 +9,9 @@ use super::frame::{
     sub,
 };
 use super::leaves::{Leaf, LeafContext, about_y, make_leaf};
+use super::limits::{
+    GenerateError, MAX_BRANCHES, MAX_CHILD_CANDIDATES, MAX_LEAVES, MAX_SKELETON_VERTICES,
+};
 use super::{Curve, Random};
 use crate::speedtree::{BezierSpline, BranchLevel, SpeedTree, SplinePoint};
 use std::rc::Rc;
@@ -23,7 +26,7 @@ const DOWN: Vec3 = [0.0, 0.0, -1.0];
 
 /// A grown skeleton: the trunk, branches and roots in growth order (each branch before its
 /// children), and the leaf sites.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Skeleton {
     /// The random tree size, the `S` every branch grows with.
     pub size: f32,
@@ -251,11 +254,16 @@ struct Grower<'t> {
     leaves: Vec<Leaf>,
     /// Per branch, its leaf-mesh rotation counter (5.3 step 8).
     mesh_counters: Vec<usize>,
+    /// Running totals against the limits, and the first limit passed.
+    vertex_count: usize,
+    candidates: usize,
+    exceeded: Option<GenerateError>,
 }
 
 /// Grows a tree's skeleton (stage 2). The stream is returned in its final state so later
 /// stages continue the same sequence.
-pub fn grow(tree: &SpeedTree) -> (Skeleton, Random) {
+pub fn grow(tree: &SpeedTree) -> Result<(Skeleton, Random), GenerateError> {
+    super::limits::validate(tree)?;
     let seed = tree.tree.seed as i32;
     // 2.3 steps 1–2: the bank.
     let mut random = Random::new(seed);
@@ -289,6 +297,9 @@ pub fn grow(tree: &SpeedTree) -> (Skeleton, Random) {
         guides: Vec::new(),
         leaves: Vec::new(),
         mesh_counters: Vec::new(),
+        vertex_count: 0,
+        candidates: 0,
+        exceeded: None,
     };
     // Step 7: the trunk.
     if !tree.branch_levels.is_empty() {
@@ -304,6 +315,9 @@ pub fn grow(tree: &SpeedTree) -> (Skeleton, Random) {
             parent: None,
         });
     }
+    if let Some(e) = grower.exceeded {
+        return Err(e);
+    }
     let skeleton = Skeleton {
         size,
         bank: grower.bank,
@@ -313,7 +327,7 @@ pub fn grow(tree: &SpeedTree) -> (Skeleton, Random) {
         guides: grower.guides,
         leaves: grower.leaves,
     };
-    (skeleton, grower.random)
+    Ok((skeleton, grower.random))
 }
 
 impl<'t> Grower<'t> {
@@ -445,7 +459,21 @@ fn apply_gravity(frame: Frame, curves_profile: f32, gravity: f32) -> Frame {
 impl<'t> Grower<'t> {
     /// Grows one branch and its children (2.4, 2.5). Returns its index, or `None` when the
     /// frond rules prune it.
+    /// Records the first limit passed; growth stops from then on.
+    fn exceed(&mut self, what: &'static str, max: usize) {
+        if self.exceeded.is_none() {
+            self.exceeded = Some(GenerateError::TooLarge { what, max });
+        }
+    }
+
     fn grow(&mut self, sprout: Sprout) -> Option<usize> {
+        if self.exceeded.is_some() {
+            return None;
+        }
+        if self.branches.len() >= MAX_BRANCHES {
+            self.exceed("branches", MAX_BRANCHES);
+            return None;
+        }
         let tree = self.tree;
         let (Some(info), Some(c)) = (
             self.info(sprout.level, sprout.root),
@@ -534,6 +562,11 @@ impl<'t> Grower<'t> {
             vertices: Vec::new(),
             volume: 0.0,
         };
+        self.vertex_count += n.max(0) as usize;
+        if self.vertex_count > MAX_SKELETON_VERTICES {
+            self.exceed("skeleton vertices", MAX_SKELETON_VERTICES);
+            return None;
+        }
         if n < 2 {
             self.branches.push(branch);
             return Some(self.branches.len() - 1);
@@ -701,6 +734,10 @@ impl<'t> Grower<'t> {
                 .unwrap_or(base);
             normalize(sub(position, base))
         };
+        if self.leaves.len() >= MAX_LEAVES {
+            self.exceed("leaves", MAX_LEAVES);
+            return;
+        }
         if self.mesh_counters.len() <= index {
             self.mesh_counters.resize(index + 1, 0);
         }
@@ -805,6 +842,13 @@ impl<'t> Grower<'t> {
         let seed0 = seed;
         let mut seed = seed;
         for k in 0..count.saturating_add(roots) {
+            self.candidates += 1;
+            if self.candidates > MAX_CHILD_CANDIDATES {
+                self.exceed("child candidates", MAX_CHILD_CANDIDATES);
+            }
+            if self.exceeded.is_some() {
+                return;
+            }
             let is_root = k >= count;
             // Step 5.1: reseeding.
             if k == count {
@@ -1025,7 +1069,7 @@ pub(super) mod tests {
     #[test]
     fn a_trunk_pitched_minus_90_grows_straight_up() {
         let t = tree(vec![level(-90.0, 0.0), level(0.0, 0.0), level(0.0, 0.0)]);
-        let (skeleton, _) = grow(&t);
+        let (skeleton, _) = grow(&t).unwrap();
         assert_eq!(skeleton.size, 10.0);
         assert_eq!(skeleton.branches.len(), 1);
         let trunk = &skeleton.branches[0];
@@ -1045,7 +1089,7 @@ pub(super) mod tests {
     #[test]
     fn draws_follow_the_spec_order() {
         let t = tree(vec![level(-90.0, 0.0), level(0.0, 0.0), level(0.0, 0.0)]);
-        let (_, random) = grow(&t);
+        let (_, random) = grow(&t).unwrap();
         // Bank 1000, size 1; the trunk: length, azimuth, start angle, gravity, radius,
         // flexibility, first radius (7); first vertex: two disturbances, radius,
         // flexibility, angle profile (5); four more vertices of 5 each.
@@ -1056,7 +1100,7 @@ pub(super) mod tests {
     fn children_grow_between_first_and_last() {
         // Frequency 2 per unit length over a trunk of 10 → 2 children, then buds.
         let t = tree(vec![level(-90.0, 2.0), level(0.0, 3.0), level(0.0, 0.0)]);
-        let (skeleton, _) = grow(&t);
+        let (skeleton, _) = grow(&t).unwrap();
         let children: Vec<_> = skeleton.branches.iter().filter(|b| b.level == 1).collect();
         assert_eq!(children.len(), 2);
         for child in &children {
@@ -1072,7 +1116,7 @@ pub(super) mod tests {
         assert!(skeleton.buds.iter().all(|b| b.branch != 0));
         assert_eq!(skeleton.buds.len(), 2 * 3);
         // Growing twice gives the same tree.
-        let (again, _) = grow(&t);
+        let (again, _) = grow(&t).unwrap();
         assert_eq!(again.branches, skeleton.branches);
     }
 
@@ -1085,7 +1129,7 @@ pub(super) mod tests {
             level(0.0, 0.0),
         ];
         levels[0].pruning_percent = 2.0;
-        let (skeleton, _) = grow(&tree(levels));
+        let (skeleton, _) = grow(&tree(levels)).unwrap();
         assert_eq!(skeleton.branches.len(), 1);
     }
 
@@ -1105,7 +1149,7 @@ pub(super) mod tests {
             below_condition: 0,
             ..Fronds::default()
         });
-        let (skeleton, _) = grow(&t);
+        let (skeleton, _) = grow(&t).unwrap();
         assert_eq!(skeleton.branches.len(), 3);
         assert!(!skeleton.branches[0].frond);
         assert!(
@@ -1114,7 +1158,7 @@ pub(super) mod tests {
                 .all(|b| b.frond && b.flares.is_empty())
         );
         t.fronds.as_mut().unwrap().above_condition = 2;
-        let (skeleton, _) = grow(&t);
+        let (skeleton, _) = grow(&t).unwrap();
         assert_eq!(skeleton.branches.len(), 1);
     }
 
@@ -1131,7 +1175,7 @@ pub(super) mod tests {
             exponent: Some(1.0),
             bias: Some(0.0),
         });
-        let (skeleton, _) = grow(&t);
+        let (skeleton, _) = grow(&t).unwrap();
         // The base is at 0 ≥ −1, so the branch counts as above the floor; with bias 0 every
         // vertex that would go below is put on it.
         let zs: Vec<f32> = skeleton.branches[0]
@@ -1148,7 +1192,7 @@ pub(super) mod tests {
         let mut levels = vec![level(-90.0, 0.0), level(0.0, 0.0), level(0.0, 0.0)];
         levels[0].flares.count = 3;
         levels[0].flares.balance = 0.5;
-        let (skeleton, random) = grow(&tree(levels));
+        let (skeleton, random) = grow(&tree(levels)).unwrap();
         let flares = &skeleton.branches[0].flares;
         assert_eq!(flares.len(), 3);
         assert!(flares.iter().all(|f| (0.0..=TWO_PI).contains(&f.angle)));
