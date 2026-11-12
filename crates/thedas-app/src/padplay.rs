@@ -703,7 +703,7 @@ impl PadPlay {
     /// with no buttons found nudges the pointer instead.
     fn focus(&mut self, host: &mut dyn Host, dx: i8, dy: i8) -> Option<String> {
         use crate::focusnav;
-        let targets = host.focus_targets();
+        let targets = focusnav::modal(host.focus_targets());
         if targets.is_empty() {
             self.snapped = false;
             let (x, y) = host.cursor();
