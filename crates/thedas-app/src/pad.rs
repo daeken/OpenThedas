@@ -205,7 +205,8 @@ pub enum Context {
     /// The quickbar picker LT opens over the field (the game paused, a pointer on screen).
     Picker,
     /// A screen or popup over the world: inventory, journal, save and load, store, character
-    /// creation, dialog boxes. The pad drives a pointer.
+    /// creation, dialog boxes. The pad moves a focus between their buttons (see
+    /// [`crate::focusnav`]).
     Screen,
     /// A conversation's lines and replies.
     Conversation,
@@ -269,6 +270,10 @@ pub enum Action {
     DoubleClick,
     /// Nudge the pointer one step.
     PointerStep(i8, i8),
+    /// Move the focus to the next button that way on the screen (see [`crate::focusnav`]).
+    Focus(i8, i8),
+    /// The left stick drives a free pointer on screens, or moves the focus again.
+    TogglePointer,
     /// Close the screen (as its key again, or Escape).
     CloseScreen,
     /// The previous or next of the player's screens.
@@ -401,7 +406,8 @@ pub const BINDINGS: &[Binding] = &[
     repeat(Picker, Up, Do::PointerStep(0, -1), ""),
     repeat(Picker, Down, Do::PointerStep(0, 1), ""),
     bind(Picker, Start, Do::Pause, "TogglePause"),
-    // Screens and popups: a pointer.
+    // Screens and popups: the focus moves between their buttons, the pointer resting on the
+    // one focused (LS frees the pointer for the left stick).
     bind(Screen, A, Do::PointerDown, "GUILeftCursorButton"),
     release(Screen, A, Do::PointerUp, "GUILeftCursorButton"),
     bind(Screen, X, Do::DoubleClick, "GUILeftCursorButton"),
@@ -412,10 +418,11 @@ pub const BINDINGS: &[Binding] = &[
     bind(Screen, Back, Do::CloseScreen, "ToggleInventory"),
     bind(Screen, LB, Do::PrevPage, ""),
     bind(Screen, RB, Do::NextPage, ""),
-    repeat(Screen, Left, Do::PointerStep(-1, 0), ""),
-    repeat(Screen, Right, Do::PointerStep(1, 0), ""),
-    repeat(Screen, Up, Do::PointerStep(0, -1), ""),
-    repeat(Screen, Down, Do::PointerStep(0, 1), ""),
+    bind(Screen, LS, Do::TogglePointer, ""),
+    repeat(Screen, Left, Do::Focus(-1, 0), ""),
+    repeat(Screen, Right, Do::Focus(1, 0), ""),
+    repeat(Screen, Up, Do::Focus(0, -1), ""),
+    repeat(Screen, Down, Do::Focus(0, 1), ""),
     // Conversations.
     repeat(Conversation, Up, Do::PrevReply, "ConversationRadialSelectY"),
     repeat(
@@ -442,6 +449,9 @@ pub enum StickRole {
     Camera,
     /// Move the pointer (`CursorPosition`).
     Pointer,
+    /// Pushed past [`STICK_AS_DPAD`], move the focus as the D-pad does; a free pointer
+    /// instead once LS has freed it ([`Action::TogglePointer`]).
+    Focus,
     /// Up and down step the conversation's reply choice, as the D-pad does
     /// (`ConversationRadialSelectY`).
     Replies,
@@ -456,7 +466,7 @@ pub const STICKS: &[(Context, Stick, StickRole)] = &[
     (Field, Stick::Right, StickRole::Camera),
     (Picker, Stick::Left, StickRole::Pointer),
     (Picker, Stick::Right, StickRole::Camera),
-    (Screen, Stick::Left, StickRole::Pointer),
+    (Screen, Stick::Left, StickRole::Focus),
     (Screen, Stick::Right, StickRole::Scroll),
     (Conversation, Stick::Left, StickRole::Replies),
     (Conversation, Stick::Right, StickRole::Camera),
@@ -516,6 +526,12 @@ pub struct Controller {
     chorded: [bool; 16],
     /// Wheel lines owed by the right stick, not yet whole.
     scroll: f32,
+    /// LS freed the pointer: the left stick moves it on screens instead of the focus.
+    pub free_pointer: bool,
+    /// The left stick as a D-pad (for the focus): which way, how long.
+    focus_dir: (i8, i8),
+    focus_ms: f64,
+    focus_next: f64,
 }
 
 impl Controller {
@@ -583,9 +599,14 @@ impl Controller {
                         zoom: v.y * ZOOM_SPEED * s,
                     });
                 }
-                StickRole::Pointer if v != Vec2::ZERO => {
+                StickRole::Pointer | StickRole::Focus
+                    if v != Vec2::ZERO && (*role == StickRole::Pointer || self.free_pointer) =>
+                {
                     let s = (dt_ms / 1000.0) as f32 * POINTER_SPEED * v.length();
                     out.push(Order::Pointer(Vec2::new(v.x, -v.y) * s));
+                }
+                StickRole::Focus if !self.free_pointer => {
+                    self.stick_focus(now.stick(*stick), dt_ms, &mut out)
                 }
                 StickRole::Replies => self.stick_replies(now.stick(*stick), dt_ms, &mut out),
                 StickRole::Scroll => {
@@ -605,9 +626,39 @@ impl Controller {
         if !STICKS.contains(&(context, Stick::Left, StickRole::Replies)) {
             self.stick_dir = 0;
         }
+        if self.free_pointer || !STICKS.contains(&(context, Stick::Left, StickRole::Focus)) {
+            self.focus_dir = (0, 0);
+        }
         self.walk(now, context, dt_ms, &mut out);
         self.last = *now;
         out
+    }
+
+    /// The left stick moving the focus: past [`STICK_AS_DPAD`] along its stronger axis as a
+    /// D-pad press, repeating while held.
+    fn stick_focus(&mut self, v: Vec2, dt_ms: f64, out: &mut Vec<Order>) {
+        let dir = if v.length() < STICK_AS_DPAD {
+            (0, 0)
+        } else if v.x.abs() > v.y.abs() {
+            (v.x.signum() as i8, 0)
+        } else {
+            // Up on the stick is up the screen (smaller y).
+            (0, -v.y.signum() as i8)
+        };
+        if dir != self.focus_dir {
+            self.focus_dir = dir;
+            self.focus_ms = 0.0;
+            self.focus_next = REPEAT_DELAY_MS;
+            if dir != (0, 0) {
+                out.push(Order::Act(Action::Focus(dir.0, dir.1)));
+            }
+        } else if dir != (0, 0) {
+            self.focus_ms += dt_ms;
+            while self.focus_ms >= self.focus_next {
+                self.focus_next += REPEAT_MS;
+                out.push(Order::Act(Action::Focus(dir.0, dir.1)));
+            }
+        }
     }
 
     /// The left stick stepping replies: up or down past [`STICK_AS_DPAD`] as a D-pad press,
@@ -900,7 +951,27 @@ mod tests {
         s.left = Vec2::new(0.05, 0.0);
         assert_eq!(c.update(&s, Field, 16.0), vec![Order::Walk(Vec2::ZERO)]);
         assert!(c.update(&s, Field, 16.0).is_empty());
-        // On a screen the left stick moves the pointer instead.
+        // On a screen the left stick moves the focus, as the D-pad does, repeating while
+        // held; up on the stick is up the screen.
+        s.left = Vec2::new(1.0, 0.0);
+        assert_eq!(
+            c.update(&s, Screen, 16.0),
+            vec![Order::Act(Action::Focus(1, 0))]
+        );
+        assert!(c.update(&s, Screen, 100.0).is_empty());
+        assert_eq!(
+            c.update(&s, Screen, REPEAT_DELAY_MS),
+            vec![Order::Act(Action::Focus(1, 0))]
+        );
+        s.left = Vec2::new(0.1, 0.8);
+        assert_eq!(
+            c.update(&s, Screen, 16.0),
+            vec![Order::Act(Action::Focus(0, -1))]
+        );
+        s.left = Vec2::ZERO;
+        assert!(c.update(&s, Screen, 16.0).is_empty());
+        // Freed (LS), it moves the pointer.
+        c.free_pointer = true;
         s.left = Vec2::new(1.0, 0.0);
         let o = c.update(&s, Screen, 100.0);
         assert!(matches!(o.as_slice(), [Order::Pointer(p)] if p.x > 50.0 && p.y == 0.0));

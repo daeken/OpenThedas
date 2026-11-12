@@ -449,6 +449,46 @@ pub fn stage_scale(size: (u32, u32), authored: (f64, f64)) -> f64 {
     (w / authored.0).min(h / authored.1)
 }
 
+/// A clip a pad's focus can land on: the movie, its path, and its bounds in window pixels
+/// (`x0, y0, x1, y1`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FocusTarget {
+    pub movie: String,
+    pub path: String,
+    pub rect: [f64; 4],
+}
+
+impl FocusTarget {
+    pub fn center(&self) -> (f64, f64) {
+        (
+            (self.rect[0] + self.rect[2]) / 2.0,
+            (self.rect[1] + self.rect[3]) / 2.0,
+        )
+    }
+}
+
+/// Reads `thedas_focus_list`'s `path|xMin|yMin|xMax|yMax;...`, taking the bounds to window
+/// pixels (scaled by `scale`, then moved by `offset`); entries that do not parse, or have
+/// no area, are left out.
+pub fn parse_focus_list(list: &str, scale: f64, offset: (f64, f64)) -> Vec<FocusTarget> {
+    list.split(';')
+        .filter_map(|e| {
+            let mut f = e.split('|');
+            let path = f.next()?.to_string();
+            let mut r = [0.0; 4];
+            for (i, v) in r.iter_mut().enumerate() {
+                let o = if i % 2 == 0 { offset.0 } else { offset.1 };
+                *v = o + f.next()?.parse::<f64>().ok()? * scale;
+            }
+            (r.iter().all(|v| v.is_finite()) && r[2] > r[0] && r[3] > r[1]).then_some(FocusTarget {
+                movie: String::new(),
+                path,
+                rect: r,
+            })
+        })
+        .collect()
+}
+
 /// One Scaleform movie playing into an offscreen texture.
 pub struct UiMovie {
     pub name: String,
@@ -1058,6 +1098,44 @@ impl UiMovie {
                 ],
             );
         }
+    }
+
+    /// What a pad's focus can land on in this movie: each visible, enabled clip that takes a
+    /// click, with its bounds in window pixels (see `avm1::focus_function`).
+    pub fn focus_targets(&mut self) -> Vec<FocusTarget> {
+        let UiValue::String(list) = self.call(avm1::FOCUS_LIST, &[]) else {
+            return Vec::new();
+        };
+        // The stage plays unscaled (`NoScale`) at `stage_scale`, its authored rectangle
+        // centred in the window. Provisional: read from where the start menu's buttons and
+        // its login panel are drawn, not from Ruffle's view matrix (which is not exposed).
+        let scale = stage_scale(self.size, self.authored);
+        let (w, h) = (f64::from(self.size.0), f64::from(self.size.1));
+        let offset = (
+            (w - self.authored.0 * scale) / 2.0,
+            (h - self.authored.1 * scale) / 2.0,
+        );
+        let mut seen = std::collections::HashSet::new();
+        parse_focus_list(&list, scale, offset)
+            .into_iter()
+            .filter_map(|mut t| {
+                // Only what shows in the window, clipped to it.
+                t.rect = [
+                    t.rect[0].max(0.0),
+                    t.rect[1].max(0.0),
+                    t.rect[2].min(w),
+                    t.rect[3].min(h),
+                ];
+                let (tw, th) = (t.rect[2] - t.rect[0], t.rect[3] - t.rect[1]);
+                // A clip as big as most of the window catches clicks behind a dialog box (a
+                // popup's background), not a button.
+                let shows = tw >= 2.0 && th >= 2.0 && tw * th < w * h * 0.5;
+                (shows && seen.insert(t.path.clone())).then(|| {
+                    t.movie = self.name.clone();
+                    t
+                })
+            })
+            .collect()
     }
 
     /// Calls a function the movie registered with `ExternalInterface.addCallback`.
