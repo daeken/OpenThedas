@@ -32,6 +32,24 @@ pub struct Skeleton {
     pub frequency_index: usize,
     pub branches: Vec<Branch>,
     pub buds: Vec<Bud>,
+    /// Frond guides, in the order frond branches grew (4.1).
+    pub guides: Vec<Guide>,
+}
+
+/// A frond branch's record for stage 4 (4.1), made when its vertices are done.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Guide {
+    /// The frond branch in [`Skeleton::branches`].
+    pub branch: usize,
+    /// Its length along the vertices (by the approximate square root).
+    pub length: f32,
+    /// Index into `Fronds::textures`.
+    pub texture: usize,
+    pub radius: f32,
+    /// Degrees about the guide's X axis.
+    pub angle_offset: f32,
+    /// Length times the branch's first radius.
+    pub area: f32,
 }
 
 /// One flare of a branch's base (2.6).
@@ -62,6 +80,8 @@ pub struct Vertex {
     pub forks: i32,
     /// Length along the branch to here.
     pub length: f32,
+    /// Branch progress: 0 at the first vertex, the packed progress after (2.4 step 9.1).
+    pub progress: f32,
 }
 
 /// One branch (the trunk is the first).
@@ -81,6 +101,8 @@ pub struct Branch {
     pub gravity: f32,
     /// The branch radius before the per-vertex profile.
     pub radius: f32,
+    /// The radius limit of 2.4 step 6.
+    pub max_radius: f32,
     /// The radius at the base by the unscaled profile (fronds use it).
     pub first_radius: f32,
     pub flexibility: f32,
@@ -222,6 +244,7 @@ struct Grower<'t> {
     frequency_index: usize,
     branches: Vec<Branch>,
     buds: Vec<Bud>,
+    guides: Vec<Guide>,
 }
 
 /// Grows a tree's skeleton (stage 2). The stream is returned in its final state so later
@@ -257,6 +280,7 @@ pub fn grow(tree: &SpeedTree) -> (Skeleton, Random) {
         frequency_index: 0,
         branches: Vec::new(),
         buds: Vec::new(),
+        guides: Vec::new(),
     };
     // Step 7: the trunk.
     if !tree.branch_levels.is_empty() {
@@ -278,6 +302,7 @@ pub fn grow(tree: &SpeedTree) -> (Skeleton, Random) {
         frequency_index: grower.frequency_index,
         branches: grower.branches,
         buds: grower.buds,
+        guides: grower.guides,
     };
     (skeleton, grower.random)
 }
@@ -458,7 +483,11 @@ impl<'t> Grower<'t> {
 
         // Step 7: vertex count.
         let mut n = info.segments + 1;
-        if !frond {
+        let fronds = tree.fronds.as_ref();
+        let segment_override = fronds.filter(|f| frond && f.use_segment_override);
+        if let Some(f) = segment_override {
+            n = f.segment_override + 1;
+        } else {
             let (lmin, lmax) = (c.length.min, c.length.max);
             if info.min_length_percent != 1.0 && lmin < lmax {
                 let f = ((length - lmin * s) / (lmax * s - lmin * s)).clamp(0.0, 1.0);
@@ -487,6 +516,7 @@ impl<'t> Grower<'t> {
             start_angle,
             gravity,
             radius,
+            max_radius,
             first_radius,
             flexibility,
             cross_sections,
@@ -536,6 +566,7 @@ impl<'t> Grower<'t> {
             cross_sections: cross_count(c, 0.0),
             forks: 0,
             length: 0.0,
+            progress: 0.0,
         });
 
         // Step 9: the remaining vertices.
@@ -581,6 +612,7 @@ impl<'t> Grower<'t> {
                 cross_sections: cross,
                 forks: 0,
                 length: previous.length + segment,
+                progress: t,
             });
         }
 
@@ -596,9 +628,54 @@ impl<'t> Grower<'t> {
 
         self.branches.push(branch);
         let index = self.branches.len() - 1;
+        // Step 10a: a frond branch becomes a guide.
+        if frond {
+            self.guide(index);
+        }
         // Step 11: children.
         self.children(index, info, sprout.seed);
         Some(index)
+    }
+
+    /// Records frond branch `index` as a guide (4.1), drawing the texture choice and angle
+    /// offset when the fronds have textures.
+    fn guide(&mut self, index: usize) {
+        let branch = &self.branches[index];
+        let length = branch
+            .vertices
+            .windows(2)
+            .map(|w| {
+                let d = sub(w[1].position, w[0].position);
+                fast_sqrt(dot(d, d))
+            })
+            .fold(0.0, |sum, d| sum + d);
+        let area = length * branch.first_radius;
+        let textures = self
+            .tree
+            .fronds
+            .as_ref()
+            .map(|f| f.textures.as_slice())
+            .unwrap_or_default();
+        let (texture, radius, angle_offset) = if textures.is_empty() {
+            (0, length * 0.5, 0.0)
+        } else {
+            let texture = self.random.uniform(0.0, 100_000.0) as u32 as usize % textures.len();
+            let x = &textures[texture];
+            let radius = length * x.aspect_ratio * 0.5 * x.size_scale;
+            let mut offset = self.random.uniform(x.min_angle_offset, x.max_angle_offset);
+            if (self.guides.len() + 1) % 2 == 1 {
+                offset = -offset;
+            }
+            (texture, radius, offset)
+        };
+        self.guides.push(Guide {
+            branch: index,
+            length,
+            texture,
+            radius,
+            angle_offset,
+            area,
+        });
     }
 
     /// Finds the segment holding running length `g`: the first vertex `i ≥ 1` whose running
