@@ -299,7 +299,7 @@ impl Sim {
     }
 
     /// The pathing grid's floor under `p` in `area`, where it is walkable.
-    fn floor_at(&mut self, area: ObjectId, p: [f32; 3]) -> Option<f32> {
+    pub(crate) fn floor_at(&mut self, area: ObjectId, p: [f32; 3]) -> Option<f32> {
         let g = self.nav_grid(area)?;
         let c = g.cell(p)?;
         crate::nav::walkable(&g, c).then(|| crate::nav::height(&g, c))
