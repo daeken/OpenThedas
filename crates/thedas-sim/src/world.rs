@@ -594,6 +594,14 @@ pub struct World {
     /// Objects to remove at a time (projectiles when they land).
     #[serde(default)]
     pub destroy_at: Vec<(u64, ObjectId)>,
+    /// `SetLoadHint`: the hint (row, M2DA table) the next area transition's loading screen
+    /// shows; taken by that transition into [`World::transition_hint`].
+    #[serde(default)]
+    pub load_hint: Option<(i32, i32)>,
+    /// The hint for the transition under way or last made (what the loading screen reads);
+    /// `None` when no script set one for it.
+    #[serde(default)]
+    pub transition_hint: Option<(i32, i32)>,
     /// How long a corpse lies before it is gone (`SetCreaturesGlobalMaxTimeBeforeDecay`;
     /// see [`crate::decay`]).
     #[serde(default = "crate::decay::default_max_ms")]
@@ -767,6 +775,8 @@ impl World {
             pool_xp: false,
             destroy_at: Vec::new(),
             corpse_decay_max_ms: crate::decay::DEFAULT_MAX_MS,
+            load_hint: None,
+            transition_hint: None,
             held: Vec::new(),
             dialog_shown: Default::default(),
             story_events: Vec::new(),
