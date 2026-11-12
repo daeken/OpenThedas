@@ -433,6 +433,20 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             v.insert(format!("{k}.PortraitProperties.PortraitTint"), num(0));
         }
     }
+    // Levelling up (chargen mode 1): levelup.gfx's portrait is the member's
+    // (`CharGenCreature.Portrait`); it showed an empty grey disc.
+    if let Some(c) = sim.world.chargen.filter(|_| sim.world.chargen_mode != 0) {
+        if let Some(p) = shown.portraits.get(&c) {
+            v.insert(
+                "CharGenCreature.Portrait".into(),
+                UiValue::String(p.clone()),
+            );
+        }
+        v.insert(
+            "CharGenCreature.PortraitProperties.PortraitTint".into(),
+            num(0),
+        );
+    }
     // Who may level up now (the character record's button): a party member out of combat
     // the game marked (`SetCanLevelUp`, or experience reaching the next level), or with
     // points to spend: DAOrigins.exe's test (0x6acbc0) sums the attribute, skill,
