@@ -10,7 +10,7 @@
 pub mod frame;
 pub mod skeleton;
 
-pub use skeleton::{grow, Branch, Bud, Flare, Skeleton, Vertex};
+pub use skeleton::{Branch, Bud, Flare, Skeleton, Vertex, grow};
 
 use crate::speedtree::{BezierSpline, BranchLevel, SpeedTree};
 
@@ -337,12 +337,22 @@ pub fn curves(tree: &SpeedTree) -> Vec<(String, &BezierSpline)> {
     out
 }
 
-/// Builds every curve of a tree and checks its table is finite (a corpus check).
-pub fn check_curves(tree: &SpeedTree) -> Result<(), String> {
+/// Builds every curve of a tree and grows its skeleton, checking every value is finite (a
+/// corpus check).
+pub fn check(tree: &SpeedTree) -> Result<(), String> {
     for (name, spline) in curves(tree) {
         let curve = Curve::new(spline);
         if let Some(i) = curve.table().iter().position(|y| !y.is_finite()) {
             return Err(format!("{name}: table entry {i} is {}", curve.table()[i]));
+        }
+    }
+    let (skeleton, _) = grow(tree);
+    for (i, branch) in skeleton.branches.iter().enumerate() {
+        let finite = branch.vertices.iter().all(|v| {
+            v.position.iter().all(|x| x.is_finite()) && v.radius.is_finite() && v.length.is_finite()
+        });
+        if !finite {
+            return Err(format!("branch {i} (level {}) is not finite", branch.level));
         }
     }
     Ok(())
