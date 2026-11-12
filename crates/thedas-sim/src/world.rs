@@ -655,6 +655,10 @@ pub struct World {
     /// A `DoAreaTransition` waiting for the current scripts to finish (area, waypoint).
     #[serde(default)]
     pub transition: Option<(String, String)>,
+    /// When the pending [`World::transition`] happens (simulation milliseconds); `None`
+    /// for at once.
+    #[serde(default)]
+    pub transition_at: Option<u64>,
     pub rng: Rng,
     #[serde(skip)]
     pub trace: Trace,
@@ -764,6 +768,7 @@ impl World {
             chargen: None,
             chargen_mode: 0,
             transition: None,
+            transition_at: None,
             in_triggers: BTreeMap::new(),
             hostility: BTreeMap::new(),
             party_fighting: false,
