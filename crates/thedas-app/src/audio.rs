@@ -259,6 +259,8 @@ pub struct GameAudio {
     music_request: Option<(i32, f32)>,
     /// The game mode's ducking event playing (see [`mode_duck`]): its path and handle.
     mode_duck: Option<(&'static str, Option<EventHandle>)>,
+    /// The simulation's music intensity last seen (scripts' `SetMusicIntensity`).
+    script_intensity: Option<i32>,
     /// `ss_types.gda`: each sound set type's first entry row and default probability.
     ss_types: std::collections::HashMap<i32, (i64, f32)>,
     /// Each sound set's entries (`sse_<set>.gda`: entry row -> line strref), read once.
@@ -655,6 +657,7 @@ impl GameAudio {
             music_state: 1.0,
             music_request: None,
             mode_duck: None,
+            script_intensity: None,
             ss_types: ss_types(vfs),
             sound_set_entries: Default::default(),
             sound_set_bags: Default::default(),
@@ -1287,8 +1290,8 @@ impl GameAudio {
     /// starts and the old one stops over its event's fade-out.
     ///
     /// Provisional: when the stinger plays (taken as at the change; the exe waits for it in
-    /// state 7), cutscenes and conversations leaving the music alone, and `PlayMusic`
-    /// (dropped).
+    /// state 7), and cutscenes and conversations keeping the track (they only duck it, see
+    /// [`mode_duck`]). Scripts' `PlayMusic` and `StopMusic` do nothing in the exe.
     fn follow_area(&mut self, state: &AudioState, dt: f32) {
         if state.area.is_none() {
             self.end_area();
@@ -1648,13 +1651,17 @@ impl GameAudio {
         let gear = std::mem::take(&mut state.gear);
         self.follow_animations(std::mem::take(&mut state.animations), &gear);
         self.follow_movie(state.movie.take());
-        // Scripts' SetMusicIntensity sets the area music's `music_state` (DAOrigins.exe logs
-        // it as "music state= %2.1f"): the tracks' sounds sit around 1, so 0 silences the
-        // music (pre100pt_light_beacon) and cutscene endings (gen00cs_cs_end_music_int_*)
-        // set 0 to 4. Provisional: that scripts reach the music object's SetMusicIntensity
-        // (0x5c0150) directly is not traced.
-        if let Some(i) = state.music_intensity.take() {
-            self.set_music_state(i as f32);
+        // Scripts' SetMusicIntensity (command 486, handler 0x65d070) asks the music director
+        // for that intensity with no delay (0x5b6cd0), as a music volume does: it replaces a
+        // request still waiting and applies on the director's next update. The tracks' sounds
+        // sit around 1, so 0 silences the music (pre100pt_light_beacon) and cutscene endings
+        // (gen00cs_cs_end_music_int_*) set 0 to 4. The simulation keeps the latest call's
+        // value, so a change of it is a call (a repeat of the same value is not seen).
+        if let Some(i) = state.music_intensity.take()
+            && self.script_intensity != Some(i)
+        {
+            self.script_intensity = Some(i);
+            self.music_request = Some((i, 0.0));
         }
         // A music volume's request (see `AreaReverb::music_entered`) counts down on the
         // music director's update (0x5bb630, given the frame's seconds as the music update
