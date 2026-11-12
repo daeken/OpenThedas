@@ -18,7 +18,7 @@ thedas-render.workspace = true
 thedas-ui.workspace = true
 thedas-sim.workspace = true
 thedas-script.workspace = true
-thedas-audio.workspace = true
+thedas-audio = { workspace = true, features = ["device"] }
 anyhow.workspace = true
 clap.workspace = true
 winit.workspace = true

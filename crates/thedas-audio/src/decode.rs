@@ -21,7 +21,14 @@ pub enum DecodeError {
     Channels(String, u16),
     #[error("sample {0}: MP3 decoder: {1}")]
     Mp3(String, String),
+    #[error("sample {0}: {1} frames is longer than any sound the game has")]
+    Length(String, u32),
 }
+
+/// The longest sample decoded (frames): 30 minutes at 48 kHz. The game's longest (the
+/// streamed music) runs under 4; a header claiming more is malformed (or not DA:O's), and
+/// decoding it is refused rather than allocating gigabytes.
+pub const MAX_FRAMES: u32 = 48_000 * 60 * 30;
 
 /// Decoded audio: interleaved `f32` frames in -1..=1.
 #[derive(Clone, Debug, PartialEq)]
@@ -47,6 +54,9 @@ pub fn decode(sample: &FsbSample, data: &[u8]) -> Result<Pcm, DecodeError> {
     let ch = sample.channels;
     if !(1..=2).contains(&ch) {
         return Err(DecodeError::Channels(sample.name.clone(), ch));
+    }
+    if sample.length > MAX_FRAMES {
+        return Err(DecodeError::Length(sample.name.clone(), sample.length));
     }
     let mut samples = match sample.codec() {
         Codec::ImaAdpcm => decode_ima(data, ch as usize),

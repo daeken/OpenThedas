@@ -253,7 +253,13 @@ impl Fsb {
 
     /// A sample's encoded bytes out of the whole file.
     pub fn sample_data<'a>(&self, file: &'a [u8], index: usize) -> FsbResult<&'a [u8]> {
-        let s = &self.samples[index];
+        let Some(s) = self.samples.get(index) else {
+            return Err(FsbError::Truncated {
+                what: "sample index",
+                need: index..index + 1,
+                have: self.samples.len(),
+            });
+        };
         slice(file, s.data.start, s.data.len(), "sample data")
     }
 }

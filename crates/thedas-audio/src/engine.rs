@@ -120,8 +120,9 @@ struct Instance {
 }
 
 impl Instance {
-    fn event(&self) -> &Event {
-        resolve(&self.project, &self.event).expect("event located at play")
+    /// The instance's event (found when it started, so always there).
+    fn event(&self) -> Option<&Event> {
+        resolve(&self.project, &self.event)
     }
 }
 
@@ -402,7 +403,7 @@ impl AudioEngine {
         let Some(i) = self.instances.iter_mut().find(|i| i.handle == handle) else {
             return;
         };
-        let fade_out = i.event().fade_out_ms as f32 / 1000.0;
+        let fade_out = i.event().map_or(0, |e| e.fade_out_ms) as f32 / 1000.0;
         if immediate || fade_out <= 0.0 {
             i.fade = 0.0;
         }
@@ -533,7 +534,9 @@ impl AudioEngine {
     fn spawn(&mut self, ii: usize, si: usize) {
         let inst = &self.instances[ii];
         let fev = inst.project.clone();
-        let ev = inst.event();
+        let Some(ev) = inst.event() else {
+            return;
+        };
         let slot = &inst.slots[si];
         let sound = match &ev.body {
             EventBody::Simple { sound, .. } => sound,

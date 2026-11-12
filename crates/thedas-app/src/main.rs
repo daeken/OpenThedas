@@ -2184,6 +2184,18 @@ fn audio_state(
                         let at = sim.world.get(target).map(|o| o.position);
                         state.script_sounds.push((event, at));
                     }
+                    thedas_sim::world::SoundRequest::Impact {
+                        target,
+                        result,
+                        weapon,
+                        armour,
+                        shield,
+                        ..
+                    } => {
+                        if let Some(at) = sim.world.get(target).map(|o| o.position) {
+                            state.impacts.push((at, result, weapon, armour, shield));
+                        }
+                    }
                     other => log::debug!("audio: not done yet: {other:?}"),
                 }
             }
