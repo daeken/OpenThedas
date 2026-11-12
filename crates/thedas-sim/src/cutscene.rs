@@ -205,7 +205,7 @@ pub fn movies_of(g: &Gff4) -> Vec<CutsceneMovie> {
 }
 
 /// The structs of a list field, whether a struct list or a generic one.
-fn structs(g: &Gff4, id: StructId, label: u32) -> Vec<StructId> {
+pub(crate) fn structs(g: &Gff4, id: StructId, label: u32) -> Vec<StructId> {
     match g.field(id, label) {
         Some(Value::List(Some(List::Struct(v)))) => v.iter().flatten().copied().collect(),
         Some(Value::List(Some(List::Generic(slots)))) => slots

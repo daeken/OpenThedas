@@ -47,6 +47,7 @@
 
 mod chargen_stage;
 mod control;
+mod cutcam;
 mod focusnav;
 mod follow;
 mod intro;
@@ -844,6 +845,14 @@ impl App {
                 .live
                 .as_mut()
                 .and_then(|l| l.conversation_camera(&self.camera))
+            {
+                self.camera = c;
+            }
+            // A playing cutscene's camera (see `cutcam`).
+            if let Some(c) = self
+                .live
+                .as_mut()
+                .and_then(|l| l.cutscene_camera(&self.camera))
             {
                 self.camera = c;
             }
@@ -2993,6 +3002,12 @@ fn main() -> Result<()> {
             }
             if follow.is_some()
                 && let Some(c) = l.conversation_camera(&camera)
+            {
+                camera = c;
+            }
+            // A playing cutscene's camera (see `cutcam`).
+            if follow.is_some()
+                && let Some(c) = l.cutscene_camera(&camera)
             {
                 camera = c;
             }

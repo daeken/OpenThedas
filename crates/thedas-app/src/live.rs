@@ -77,6 +77,8 @@ pub struct Live {
     pub detail: thedas_render::scene::Detail,
     /// The conversation camera's resources and current shot.
     talk_camera: crate::talkcam::TalkCamera,
+    /// The playing cutscene's camera tracks.
+    cutscene_camera: crate::cutcam::CutsceneCamera,
     /// The shaders' clock (`ApplicationTime`), in seconds: real time, running while the
     /// world is stopped too.
     pub shader_time: f64,
@@ -194,6 +196,7 @@ impl Live {
             frame_effects: true,
             detail: Default::default(),
             talk_camera: Default::default(),
+            cutscene_camera: Default::default(),
             shader_time: 0.0,
             stage: None,
             staged: None,
@@ -292,6 +295,16 @@ impl Live {
     ) -> Option<thedas_render::Camera> {
         let sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
         self.talk_camera.camera(&sim, base)
+    }
+
+    /// The playing cutscene's camera (see [`crate::cutcam`]); `base` gives the clip planes.
+    /// `None` leaves the game camera as it is.
+    pub fn cutscene_camera(
+        &mut self,
+        base: &thedas_render::Camera,
+    ) -> Option<thedas_render::Camera> {
+        let sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
+        self.cutscene_camera.camera(&sim, base)
     }
 
     /// The camera character creation's stage is seen through, while it is up (see
