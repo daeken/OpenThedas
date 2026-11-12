@@ -59,6 +59,22 @@ pub const HIDE_LATER: &str = "_global.thedas_later";
 /// Hides the clips put off in [`HIDE_LATER`] and ends the putting off.
 pub const HIDE_FLUSH: &str = "_global.thedas_flush";
 
+/// Runs the post-load functions put off by `GUI.Element.RegisterPostLoadFunction`'s wrapper
+/// (the host calls it after each frame and each mouse event). Ruffle runs a new element's
+/// `onLoad` as `attachMovie` makes it, so an element was already loaded (`m_bLoaded`, its
+/// post-load functions called) when the movie registers functions for it right after making
+/// it, and they never ran: an open dropdown's list background was never grown to the list
+/// (`ExpandBackground`) nor its entries fitted (`FitButtons`), leaving the list see-through
+/// over the controls below. Scaleform ran `onLoad` after the movie's code; the wrapper puts
+/// such a function off until then. Provisional: the order is inferred from the movies.
+pub const POST_LOAD_RUN: &str = "_global.thedas_run_after";
+
+/// The scaling-grid sprites the movie made (`_global.thedas_s9`, see
+/// `thedas_formats::gfx::Scale9`): `[id, x scale, y scale, ...]`, one triple each.
+pub const SCALE9_SCALES: &str = "_global.thedas_s9_scales";
+/// Lays out one piece of a scaling-grid sprite: (sprite index, piece, x, y, x scale, y scale).
+pub const SCALE9_SET: &str = "_global.thedas_s9_set";
+
 /// The callback name for setting a movie variable (`object path`, `member`, `value`).
 pub const SET_CALLBACK: &str = "thedas_set";
 
@@ -146,6 +162,8 @@ const RETURN: u8 = 0x3e;
 const POP: u8 = 0x17;
 const PUSH: u8 = 0x96;
 const DEFINE_FUNCTION: u8 = 0x9b;
+const NEW_OBJECT: u8 = 0x40;
+const ADD2: u8 = 0x47;
 
 enum Push<'a> {
     Str(&'a str),
@@ -287,6 +305,136 @@ fn hide_wrap_maker() -> Vec<u8> {
     let mut outer = function(&["mc"], &inner);
     outer.push(RETURN);
     function(&["o"], &outer)
+}
+
+/// `function (o) { return function (f) {
+/// if (_global.GUI.Element.cm_mcLastCreatedElement.m_bLoaded) { _global.thedas_after.push(f);
+/// return; } return o.apply(this, arguments); }; }`: see [`POST_LOAD_RUN`].
+fn post_load_wrap_maker() -> Vec<u8> {
+    let mut then = Vec::new();
+    get_path(&mut then, &["f"]);
+    push(&mut then, &[Push::Int(1)]);
+    get_path(&mut then, &["_global", "thedas_after"]);
+    push(&mut then, &[Push::Str("push")]);
+    then.extend_from_slice(&[CALL_METHOD, POP]);
+    push(&mut then, &[Push::Undefined]);
+    then.push(RETURN);
+    let mut inner = Vec::new();
+    get_path(
+        &mut inner,
+        &[
+            "_global",
+            "GUI",
+            "Element",
+            "cm_mcLastCreatedElement",
+            "m_bLoaded",
+        ],
+    );
+    inner.push(NOT);
+    branch(&mut inner, IF, then.len(), false);
+    inner.extend(then);
+    get_path(&mut inner, &["arguments"]);
+    get_path(&mut inner, &["this"]);
+    push(&mut inner, &[Push::Int(2)]);
+    get_path(&mut inner, &["o"]);
+    push(&mut inner, &[Push::Str("apply")]);
+    inner.extend_from_slice(&[CALL_METHOD, RETURN]);
+    let mut outer = function(&["f"], &inner);
+    outer.push(RETURN);
+    function(&["o"], &outer)
+}
+
+/// `function () { var a = _global.thedas_after; while (a.length) { var f = a.shift(); f(); } }`
+/// (see [`POST_LOAD_RUN`]).
+fn run_after_function() -> Vec<u8> {
+    let mut body = Vec::new();
+    push(&mut body, &[Push::Str("a")]);
+    get_path(&mut body, &["_global", "thedas_after"]);
+    body.push(DEFINE_LOCAL);
+    let mut test = Vec::new();
+    get_path(&mut test, &["a", "length"]);
+    test.push(NOT);
+    let mut step = Vec::new();
+    push(&mut step, &[Push::Str("f"), Push::Int(0)]);
+    get_path(&mut step, &["a"]);
+    push(&mut step, &[Push::Str("shift")]);
+    step.extend_from_slice(&[CALL_METHOD, DEFINE_LOCAL]);
+    push(&mut step, &[Push::Int(0)]);
+    get_path(&mut step, &["f"]);
+    push(&mut step, &[Push::Undefined]);
+    step.extend_from_slice(&[CALL_METHOD, POP]);
+    // Each branch record is 5 bytes.
+    let back = test.len() + 5 + step.len() + 5;
+    body.extend_from_slice(&test);
+    branch(&mut body, IF, step.len() + 5, false);
+    body.extend(step);
+    branch(&mut body, JUMP, back, true);
+    function(&[], &body)
+}
+
+/// `function () { var a = _global.thedas_s9; var o = new Array(); var i = 0;
+/// while (i < a.length) { var c = a[i]; o.push(c.thedas_s9id); o.push(c._xscale);
+/// o.push(c._yscale); i++; } return o; }` (see [`SCALE9_SCALES`]).
+fn scale9_scales_function() -> Vec<u8> {
+    let mut body = Vec::new();
+    push(&mut body, &[Push::Str("a")]);
+    get_path(&mut body, &["_global", "thedas_s9"]);
+    body.push(DEFINE_LOCAL);
+    push(
+        &mut body,
+        &[Push::Str("o"), Push::Int(0), Push::Str("Array")],
+    );
+    body.extend_from_slice(&[NEW_OBJECT, DEFINE_LOCAL]);
+    push(&mut body, &[Push::Str("i"), Push::Int(0)]);
+    body.push(DEFINE_LOCAL);
+    let mut test = Vec::new();
+    get_path(&mut test, &["i"]);
+    get_path(&mut test, &["a", "length"]);
+    test.extend_from_slice(&[LESS2, NOT]);
+    let mut step = Vec::new();
+    push(&mut step, &[Push::Str("c")]);
+    get_path(&mut step, &["a"]);
+    get_path(&mut step, &["i"]);
+    step.extend_from_slice(&[GET_MEMBER, DEFINE_LOCAL]);
+    for m in ["thedas_s9id", "_xscale", "_yscale"] {
+        get_path(&mut step, &["c", m]);
+        push(&mut step, &[Push::Int(1)]);
+        get_path(&mut step, &["o"]);
+        push(&mut step, &[Push::Str("push")]);
+        step.extend_from_slice(&[CALL_METHOD, POP]);
+    }
+    push(&mut step, &[Push::Str("i")]);
+    get_path(&mut step, &["i"]);
+    step.extend_from_slice(&[INCREMENT, SET_VARIABLE]);
+    // Each branch record is 5 bytes.
+    let back = test.len() + 5 + step.len() + 5;
+    body.extend_from_slice(&test);
+    branch(&mut body, IF, step.len() + 5, false);
+    body.extend(step);
+    branch(&mut body, JUMP, back, true);
+    get_path(&mut body, &["o"]);
+    body.push(RETURN);
+    function(&[], &body)
+}
+
+/// `function (i, k, x, y, a, b) { var p = _global.thedas_s9[i]["thedas_s9_" + k];
+/// p._x = x; p._y = y; p._xscale = a; p._yscale = b; }` (see [`SCALE9_SET`]).
+fn scale9_set_function() -> Vec<u8> {
+    let mut body = Vec::new();
+    push(&mut body, &[Push::Str("p")]);
+    get_path(&mut body, &["_global", "thedas_s9"]);
+    get_path(&mut body, &["i"]);
+    body.push(GET_MEMBER);
+    push(&mut body, &[Push::Str("thedas_s9_")]);
+    get_path(&mut body, &["k"]);
+    body.extend_from_slice(&[ADD2, GET_MEMBER, DEFINE_LOCAL]);
+    for (m, v) in [("_x", "x"), ("_y", "y"), ("_xscale", "a"), ("_yscale", "b")] {
+        get_path(&mut body, &["p"]);
+        push(&mut body, &[Push::Str(m)]);
+        get_path(&mut body, &[v]);
+        body.push(SET_MEMBER);
+    }
+    function(&["i", "k", "x", "y", "a", "b"], &body)
 }
 
 /// The member marking a clip whose hiding is put off (cleared by a `ShowMovie` meanwhile).
@@ -580,6 +728,42 @@ pub fn register_invoke() -> Vec<u8> {
     push(&mut out, &[Push::Str("thedas_show_wrap")]);
     out.extend(show_wrap_maker());
     out.push(SET_MEMBER);
+    // _global.thedas_after = new Array(); GUI.Element.RegisterPostLoadFunction wrapped (see
+    // POST_LOAD_RUN).
+    get_path(&mut out, &["_global"]);
+    push(
+        &mut out,
+        &[Push::Str("thedas_after"), Push::Int(0), Push::Str("Array")],
+    );
+    out.extend_from_slice(&[NEW_OBJECT, SET_MEMBER]);
+    for (name, f) in [
+        ("thedas_s9_scales", scale9_scales_function()),
+        ("thedas_s9_set", scale9_set_function()),
+    ] {
+        get_path(&mut out, &["_global"]);
+        push(&mut out, &[Push::Str(name)]);
+        out.extend(f);
+        out.push(SET_MEMBER);
+    }
+    get_path(&mut out, &["_global"]);
+    push(&mut out, &[Push::Str("thedas_run_after")]);
+    out.extend(run_after_function());
+    out.push(SET_MEMBER);
+    get_path(&mut out, &["_global"]);
+    push(&mut out, &[Push::Str("thedas_post_load_wrap")]);
+    out.extend(post_load_wrap_maker());
+    out.push(SET_MEMBER);
+    let element = ["_global", "GUI", "Element"];
+    get_path(&mut install, &element);
+    push(&mut install, &[Push::Str("RegisterPostLoadFunction")]);
+    get_path(
+        &mut install,
+        &["_global", "GUI", "Element", "RegisterPostLoadFunction"],
+    );
+    push(&mut install, &[Push::Int(1)]);
+    get_path(&mut install, &["_global"]);
+    push(&mut install, &[Push::Str("thedas_post_load_wrap")]);
+    install.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
     get_path(&mut out, &["_global"]);
     push(&mut out, &[Push::Str("thedas_flush")]);
     out.extend(flush_function());

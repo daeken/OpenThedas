@@ -17,6 +17,9 @@ use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 
+mod scale9;
+pub use scale9::{Scale9, layout as scale9_layout};
+
 #[derive(Debug, thiserror::Error)]
 pub enum GfxError {
     #[error("not an SWF/GFx movie")]
@@ -57,6 +60,7 @@ const TAG_DEFINE_BITS_LOSSLESS2: u16 = 36;
 const TAG_DEFINE_FONT2: u16 = 48;
 const TAG_DEFINE_FONT3: u16 = 75;
 const TAG_EXTERNAL_IMAGE: u16 = 1001;
+const TAG_DEFINE_SCALING_GRID: u16 = 78;
 
 #[derive(Clone, Copy, Debug)]
 struct Tag<'a> {
@@ -304,6 +308,9 @@ pub struct RewriteReport {
     pub text_fields_outlined: u32,
     /// Glyph-less fonts replaced by the font library's (see [`FontLibrary`]), by name.
     pub fonts_resolved: Vec<String>,
+    /// Sprites with a scaling grid split into nine pieces for the host to lay out (see
+    /// [`scale9_layout`]), by sprite id.
+    pub scale9: BTreeMap<u16, Scale9>,
 }
 
 /// A font definition's name and glyph count (`DefineFont2`/`DefineFont3` body: id, flags,
@@ -455,9 +462,30 @@ fn rewrite_tags(
     images: &mut dyn FnMut(&ExternalImage) -> Option<Rgba>,
     fonts: Option<&FontLibrary>,
     report: &mut RewriteReport,
+    mut grids: Option<&mut scale9::Plan>,
     out: &mut Vec<u8>,
 ) {
     for t in tags {
+        if let Some(plan) = grids.as_deref_mut() {
+            if t.code == TAG_DEFINE_SPRITE
+                && let Some((defs, s9)) = plan.rewrite_sprite(t.body)
+            {
+                out.extend(defs);
+                report
+                    .scale9
+                    .insert(u16::from_le_bytes([t.body[0], t.body[1]]), s9);
+                continue;
+            }
+            // The grid of a sprite split above: the player must not slice it again.
+            if t.code == TAG_DEFINE_SCALING_GRID
+                && t.body.len() >= 2
+                && report
+                    .scale9
+                    .contains_key(&u16::from_le_bytes([t.body[0], t.body[1]]))
+            {
+                continue;
+            }
+        }
         if let Some((code, body, name)) = fonts.and_then(|f| f.resolve(t.code, t.body)) {
             tag_header(code, body.len(), out);
             out.extend_from_slice(&body);
@@ -492,7 +520,7 @@ fn rewrite_tags(
             TAG_DEFINE_SPRITE if t.body.len() >= 4 => match read_tags(&t.body[4..]) {
                 Ok(inner) => {
                     let mut body = t.body[..4].to_vec();
-                    rewrite_tags(&inner, images, fonts, report, &mut body);
+                    rewrite_tags(&inner, images, fonts, report, None, &mut body);
                     tag_header(t.code, body.len(), out);
                     out.extend_from_slice(&body);
                 }
@@ -522,12 +550,27 @@ pub fn rewrite(
         .iter()
         .position(|t| t.code == TAG_SHOW_FRAME || t.code == TAG_END)
         .unwrap_or(tags.len());
-    rewrite_tags(&tags[..split], images, fonts, &mut report, &mut body);
+    let mut grids = scale9::plan(&tags);
+    rewrite_tags(
+        &tags[..split],
+        images,
+        fonts,
+        &mut report,
+        Some(&mut grids),
+        &mut body,
+    );
     if let Some(actions) = inject {
         tag_header(TAG_DO_ACTION, actions.len(), &mut body);
         body.extend_from_slice(actions);
     }
-    rewrite_tags(&tags[split..], images, fonts, &mut report, &mut body);
+    rewrite_tags(
+        &tags[split..],
+        images,
+        fonts,
+        &mut report,
+        Some(&mut grids),
+        &mut body,
+    );
     if tags.last().map(|t| t.code) != Some(TAG_END) {
         body.extend_from_slice(&[0, 0]);
     }
