@@ -95,6 +95,8 @@ struct Slot {
     /// Played its one shot (oneshot instances) or cannot play.
     finished: bool,
     started: bool,
+    /// The sample it last picked (bank, index).
+    sample: Option<(String, usize)>,
 }
 
 struct Instance {
@@ -118,6 +120,8 @@ struct Instance {
     bus: Bus,
     /// Linear level sent to the world reverb.
     reverb_send: f32,
+    /// Playback-rate factor from the event's pitch and its random offset.
+    rate: f32,
     age: f32,
 }
 
@@ -378,6 +382,18 @@ impl AudioEngine {
             db(event.reverb_wet)
         };
         let category_gain = category_gain * db(event.reverb_dry);
+        let (rate, random_gain) = {
+            let u = |e: &mut Self| (e.random() % 32768) as f32 / 32767.0;
+            let (u1, u2) = (u(self), u(self));
+            event_variation(
+                event.pitch,
+                event.pitch_randomization,
+                event.volume_randomization,
+                event.flags,
+                (u1, u2),
+            )
+        };
+        let category_gain = category_gain * random_gain;
         let fade_in = event.fade_in_ms as f32 / 1000.0;
         let inst = Instance {
             handle,
@@ -396,6 +412,7 @@ impl AudioEngine {
                     next_spawn: None,
                     finished: false,
                     started: false,
+                    sample: None,
                 })
                 .collect(),
             fade: if fade_in > 0.0 { 0.0 } else { 1.0 },
@@ -407,6 +424,7 @@ impl AudioEngine {
             ducks,
             bus: bus_for(&category),
             reverb_send,
+            rate,
             age: 0.0,
         };
         log::debug!("audio: play {path}");
@@ -441,6 +459,26 @@ impl AudioEngine {
             .iter()
             .find(|r| r.name.eq_ignore_ascii_case(name))
             .and_then(|r| r.properties())
+    }
+
+    /// Where a playing event is in its (first playing) sample, and that sample's sync points
+    /// (music markers), in seconds; `None` until a voice plays.
+    pub fn position(&self, handle: EventHandle) -> Option<(f64, Vec<f64>)> {
+        let inst = self.instances.iter().find(|i| i.handle == handle)?;
+        let mixer = self.mixer.lock().ok()?;
+        for slot in &inst.slots {
+            for v in &slot.voices {
+                if let Some(at) = mixer.position(*v) {
+                    let markers = slot
+                        .sample
+                        .as_ref()
+                        .map(|(b, i)| self.library.sync_points(b, *i))
+                        .unwrap_or_default();
+                    return Some((at, markers));
+                }
+            }
+        }
+        None
     }
 
     /// Stop an event: faded over its fade-out time, or at once.
@@ -606,6 +644,7 @@ impl AudioEngine {
             slot.finished = true;
             return;
         };
+        slot.sample = Some((bank.clone(), index));
         // A lone looping waveform loops in the mixer; several play one after another.
         let looping = loops && single && !spawning;
         slot.pending += 1;
@@ -655,6 +694,7 @@ impl AudioEngine {
                         looping: l.looping.then_some((0, frames)),
                         bus: inst.bus,
                         reverb_send: inst.reverb_send,
+                        pitch: inst.rate,
                         ..Default::default()
                     },
                 )
@@ -925,6 +965,29 @@ impl AudioEngine {
             !(silent || done)
         });
     }
+}
+
+/// An event's playback-rate factor and gain factor for one play (its raw pitch `pitch`, pitch
+/// randomization `r`, volume randomization `v` and flags), from two uniform draws in
+/// 0..=1 (`rand() / 32767` in `fmod_event.dll`):
+/// - pitch: the event's raw pitch plus a random offset `2 * u1 * r - r` for its pitch
+///   randomization `r`, rounded to semitones (1/48) or tones (1/24) when the event's flags say
+///   so (bits 30, 31; 0x1000f7c3), as a rate `2^(4 * raw)` (raw 1 is 4 octaves);
+/// - volume: `1 - v + u2 * v` for its volume randomization `v` (0x10010184).
+fn event_variation(pitch: f32, r: f32, v: f32, flags: u32, (u1, u2): (f32, f32)) -> (f32, f32) {
+    let mut offset = 0.0;
+    if r != 0.0 {
+        let v = 2.0 * u1 * r;
+        let v = match flags & 0xc000_0000 {
+            0x4000_0000 => (v * 48.0 + 0.5).trunc() / 48.0,
+            0x8000_0000 => (v * 24.0 + 0.5).trunc() / 24.0,
+            _ => v,
+        };
+        offset = v - r;
+    }
+    let rate = 2f32.powf(4.0 * (pitch + offset));
+    let gain = if v != 0.0 { 1.0 - v + u2 * v } else { 1.0 };
+    (rate, gain)
 }
 
 /// Decibels to linear gain.
@@ -1199,5 +1262,24 @@ mod tests {
         assert!(!e.is_playing(none));
         assert!(e.play("test/grp/missing", PlayOptions::default()).is_none());
         assert!(e.play("nothere/grp/x", PlayOptions::default()).is_none());
+    }
+
+    #[test]
+    fn events_vary_pitch_and_volume_as_fmod_event_does() {
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        // Raw pitch 0.25 is one octave up.
+        assert!(close(event_variation(0.25, 0.0, 0.0, 0, (0.5, 0.5)).0, 2.0));
+        // Pitch randomization 0.025 (0.1 octave) spans -0.1..+0.1 octave.
+        let lo = event_variation(0.0, 0.025, 0.0, 0, (0.0, 0.0)).0;
+        let hi = event_variation(0.0, 0.025, 0.0, 0, (1.0, 0.0)).0;
+        assert!(close(lo, 2f32.powf(-0.1)) && close(hi, 2f32.powf(0.1)));
+        // Semitone rounding (flag bit 30): the offset lands on 1/48 steps.
+        let semi = event_variation(0.0, 0.03, 0.0, 0x4000_0000, (0.3, 0.0)).0;
+        let steps = semi.log2() / 4.0 * 48.0 + 0.03 * 48.0;
+        assert!((steps - steps.round()).abs() < 1e-3);
+        // Volume randomization 0.5: gain from 0.5 to 1.
+        assert!(close(event_variation(0.0, 0.0, 0.5, 0, (0.0, 0.0)).1, 0.5));
+        assert!(close(event_variation(0.0, 0.0, 0.5, 0, (0.0, 1.0)).1, 1.0));
+        assert!(close(event_variation(0.0, 0.0, 0.0, 0, (0.0, 0.3)).1, 1.0));
     }
 }

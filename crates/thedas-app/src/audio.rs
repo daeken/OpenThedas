@@ -1,18 +1,22 @@
-//! The game's sound: the start menu's and character creation's music, the interface's sounds
-//! and conversation voice-over, played through [`thedas_audio`] on the system output.
+//! The game's sound, played through [`thedas_audio`] on the system output.
 //!
 //! - Music: the front end plays `music/_menu/main` (DAOrigins.exe names the `music/_menu`
-//!   theme, 0xafed94); character creation `music/_menu/chargen`; both stop when the game
-//!   proper starts. In-game music (area themes and combat) is not done yet.
+//!   theme, 0xafed94); character creation `music/_menu/chargen`. In the game, the area's
+//!   theme (`MusicPreset`) plays `main`, `combat` or `Death` with its stingers (see
+//!   `follow_area`).
 //! - Interface: the movies' `PlayGUISound <id> ...` plays `sound_gui.gda`'s event for the id.
 //! - Voice-over: a conversation line plays its dialog project's `VO/VOconversation` event
 //!   (`VO/VOambient` for an ambient line) with the line's own sample as the programmer sound:
 //!   `<strref>_f` for a female hero when the bank has it, else `<strref>_m` (DAOrigins.exe
 //!   builds `%ls/VO/%ld` and the suffix at 0x7f2be9). The line stays up for the length of its
 //!   voice.
+//! - The world: area ambience and placed sounds, script sounds, sound sets, animation sound
+//!   events (footsteps, foley, weapon actions, blows, bodyfalls, vegetation) and the world
+//!   reverb, each documented where it is played.
+//! - Volumes: the options screen's sliders map to dB as DAOrigins.exe maps them (see
+//!   [`volumes`]).
 //!
-//! Provisional: voice-over is not positioned at the speaker yet, and the options screen's
-//! volumes map linearly (0..10 to silent..full).
+//! Provisional: voice-over is not positioned at the speaker.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -167,6 +171,9 @@ struct AreaPlay {
     resref: String,
     theme: Option<String>,
     track: Option<(&'static str, EventHandle)>,
+    /// A change of track waiting for its moment: the track wanted, when to change (seconds
+    /// into the playing track), where that track was last frame, and seconds waited.
+    switch: Option<(&'static str, f64, f64, f32)>,
     sounds: Vec<AreaSound>,
     /// Per sound: playing (`Some(Some)`), played through while in reach (`Some(None)`: it
     /// plays again once the listener has left and come back), or not started.
@@ -250,6 +257,17 @@ pub struct GameAudio {
     /// theirs (from a save made before the simulation kept it).
     template_sets: std::collections::HashMap<String, Option<String>>,
     last: Instant,
+}
+
+/// When a music change takes effect, in seconds into the playing track at `pos` with markers
+/// (sync points) `markers`: the first marker more than 0.4 s ahead and less than 15 s ahead,
+/// else 0.4 s on (DAOrigins.exe 0x5c4b10 state 4: 0x190 ms, 0x3a98 ms).
+fn music_switch_at(pos: f64, markers: &[f64]) -> f64 {
+    markers
+        .iter()
+        .copied()
+        .find(|m| *m > pos + 0.4 && *m - pos < 15.0)
+        .unwrap_or(pos + 0.4)
 }
 
 /// `apr_base.gda`'s footstep type column (DAOrigins.exe 0x6a098a).
@@ -1104,6 +1122,7 @@ impl GameAudio {
             resref: resref.to_string(),
             theme,
             track: None,
+            switch: None,
             sounds,
             playing: vec![None; n],
             reverb,
@@ -1138,11 +1157,14 @@ impl GameAudio {
     /// `to_main` or `to_death` marks the change. Placed sounds play their events where they
     /// stand while the listener is within their reach and the simulation has them on.
     ///
-    /// Provisional, not traced in DAOrigins.exe: when the music changes (it waits for
-    /// markers in the original; `sound_settings.gda` "max time between markers"), the
-    /// stinger choice, cutscenes and conversations leaving the music alone, and scripts'
-    /// `PlayMusic`/`SetMusicIntensity` (ignored).
-    fn follow_area(&mut self, state: &AudioState) {
+    /// A change of track waits for the playing track's next marker, as DAOrigins.exe's music
+    /// update does (0x5c4b10, states 4 to 6; see [`music_switch_at`]); then the new track
+    /// starts and the old one stops over its event's fade-out.
+    ///
+    /// Provisional: when the stinger plays (taken as at the change; the exe waits for it in
+    /// state 7), cutscenes and conversations leaving the music alone, and `PlayMusic`
+    /// (dropped).
+    fn follow_area(&mut self, state: &AudioState, dt: f32) {
         if state.area.is_none() {
             self.end_area();
             return;
@@ -1158,7 +1180,33 @@ impl GameAudio {
             } else {
                 "main"
             };
-            if a.track.map(|t| t.0) != Some(want) {
+            // A change waits for the playing track's next marker (DAOrigins.exe 0x5c4b10, states
+            // 4 and 5): the first sync point more than 0.4 s ahead (0x190 ms) and less than
+            // 15 s ahead (0x3a98 ms), else 0.4 s on. The first track of an area starts at once.
+            let mut now = a.track.is_none();
+            match a.track {
+                Some((playing, _)) if playing == want => a.switch = None,
+                Some((_, h)) => match (a.switch, self.engine.position(h)) {
+                    (Some((w, at, last, waited)), Some((pos, _))) if w == want => {
+                        // Due, past the end of a loop, or waited past the longest wait.
+                        if pos >= at || pos + 0.001 < last || waited > 15.5 {
+                            now = true;
+                        } else {
+                            a.switch = Some((w, at, pos, waited + dt));
+                        }
+                    }
+                    (_, Some((pos, markers))) => {
+                        let at = music_switch_at(pos, &markers);
+                        log::debug!("audio: music to {want} at {at:.2} s (now {pos:.2} s)");
+                        a.switch = Some((want, at, pos, 0.0));
+                    }
+                    // Not playing a sample yet: change at once.
+                    (_, None) => now = true,
+                },
+                None => {}
+            }
+            if now && a.track.map(|t| t.0) != Some(want) {
+                a.switch = None;
                 let from = a.track.map(|t| t.0);
                 if let Some((_, h)) = a.track.take() {
                     self.engine.stop(h, false);
@@ -1475,7 +1523,7 @@ impl GameAudio {
                     .set_parameter(h, "music_state", self.music_state);
             }
         }
-        self.follow_area(&state);
+        self.follow_area(&state, dt);
         self.follow_cutscene(state.cutscene.clone());
         // Voice-over.
         if self.voice.as_ref().map(|v| &v.0) != state.line.as_ref() {
@@ -1565,6 +1613,17 @@ fn db_gain(db: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn music_changes_wait_for_the_next_marker() {
+        let bars = [0.0, 4.0, 8.0, 12.0, 16.0, 40.0];
+        // The next marker more than 0.4 s ahead.
+        assert_eq!(music_switch_at(1.0, &bars), 4.0);
+        assert_eq!(music_switch_at(3.7, &bars), 8.0);
+        // None within 15 s (or none at all): 0.4 s on.
+        assert!((music_switch_at(17.0, &bars) - 17.4).abs() < 1e-9);
+        assert!((music_switch_at(2.0, &[]) - 2.4).abs() < 1e-9);
+    }
 
     #[test]
     fn blows_look_up_weapon_by_struck_material() {

@@ -12,11 +12,10 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
 
 ### Music
 
-1. **Switching between explore and combat music is not marker-timed.**
-   - Original: a theme's `main` and `combat` events are both loaded at area entry (0x5c2aaf..0x5c2c3e), with callbacks that are probably music-marker sync points. Switches wait for a marker and crossfade (the exe's debug dump at 0x5c13a0 shows "sw to theme" and "combat fdin"), and the stingers are cached (`_stingerprecache`).
-   - Ours: we stop one event and start the other at once, playing `stingers/from_main`, `to_main` or `to_death` immediately.
-   - Evidence: the exe strings and the loader trace; the per-frame logic isn't traced yet.
-   - Size: large. Dependencies: none, though marker callbacks need FEV sync-point data.
+1. **Music changes: stinger timing and loading.**
+   - Done: a change waits for the playing track's next marker (first sync point 0.4–15 s ahead, else 0.4 s on), then the new track starts and the old fades out (0x5c4b10 states 4–6).
+   - Not done: the stinger's timing (the exe waits for it in state 7; we play it at the change), the 12 s load timeout ("Music failed to start"), and delayed theme changes (state 9, counted in frames).
+   - Size: small.
 2. **Script `PlayMusic` and `SetMusicIntensity`.**
    - Original: `PlayMusic` names a project; `SetMusicIntensity` sets the `music_state` parameter.
    - Ours: `SetMusicIntensity` is stored in the World and applied; `PlayMusic` is only logged.
@@ -150,8 +149,8 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 
 ### FMOD event playback (thedas-audio engine)
 
-- **AUD-001** **Event and category pitch are ignored.** Original: not traced. Ours: `Event::pitch` (octaves) and `Category::pitch` are parsed and never read; every voice plays at pitch 1.0 (`Mixer::set_pitch` has no caller). Evidence: `crates/thedas-formats/src/fev.rs:158`, `crates/thedas-formats/src/fev.rs:108`, `crates/thedas-audio/src/mixer.rs:169`. Size: S. Depends: none. Kind: missing.
-- **AUD-002** **Random pitch and volume variation are ignored.** Original: random pitch/volume (FMOD Designer randomization). Ours: `Event::pitch_randomization`, `Event::volume_randomization` and the sound-definition template's `pitch`, `pitch_randomization_method`, `volume_randomization_method` (and its unnamed `f14`..`f2c`) have no reader outside the parser; repeated sounds (footsteps, blows) play identically. Evidence: `crates/thedas-formats/src/fev.rs:159`, `crates/thedas-formats/src/fev.rs:361`, `crates/thedas-formats/src/fev.rs:366`. Size: S. Depends: AUD-001. Kind: missing.
+- **AUD-001** **Category pitch is ignored.** Original: not traced. Ours: event pitch is applied (raw x 4 octaves, `EventI::getPitch` 0x100103e0); `Category::pitch` is parsed and never read. Evidence: `crates/thedas-formats/src/fev.rs:108`. Size: S. Depends: none. Kind: missing.
+- **AUD-002** **Sound-definition randomization is ignored.** Original: per-definition pitch and volume randomization. Ours: the event-level randomization is applied as traced (pitch 0x1000f790, volume 0x10010184); the sound-definition template's `pitch`, `pitch_randomization_method`, `volume_randomization_method` and unnamed `f14`..`f2c` are still unread. Evidence: `crates/thedas-formats/src/fev.rs:361`. Size: S. Depends: none. Kind: missing.
 - **AUD-003** **Only volume envelopes are applied.** Original: not traced. Ours: layer envelopes are applied only when they have no effect name and the `VOLUME` flag; pitch, pan, surround pan, 3D speaker spread, reverb level, 3D pan level, reverb balance, spawn intensity and time-offset envelopes are parsed and ignored. Evidence: `crates/thedas-audio/src/engine.rs:884`, `crates/thedas-formats/src/fev.rs:262`. Size: M. Depends: AUD-001. Kind: missing.
 - **AUD-004** **Layer DSP effects are not run.** Original: envelopes that name a DSP effect (`FMOD Lowpass Simple` and others) drive that effect's parameter. Ours: no DSP chain exists; effect envelopes are skipped. Evidence: `crates/thedas-formats/src/fev.rs:280`, `crates/thedas-audio/src/engine.rs:884`. Size: L. Depends: AUD-003. Kind: missing.
 - **AUD-005** **Parameter automation is not modelled.** Original: parameter velocity (self-advancing parameters), seek speed and sustain points / key-off. Ours: `Parameter::velocity`, `seek_speed`, `f2c` and `sustain_points` are parsed and unused; parameters only change when the game sets them. Evidence: `crates/thedas-formats/src/fev.rs:330`. Size: M. Depends: none. Kind: missing.
@@ -182,8 +181,6 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 
 ### Music
 
-- **AUD-030** **Music changes ignore markers.** Original: waits for markers (`sound_settings.gda` "max time between markers", per the comment). Ours: the track switches at once on combat/death change; stinger choice is guessed. Evidence: `crates/thedas-app/src/audio.rs:1141`, `crates/thedas-app/src/audio.rs:1166`. Size: M. Depends: AUD-031. Kind: provisional.
-- **AUD-031** **FSB SYNC points are unused.** Original: cue points the music system cuts at. Ours: `sync_points` parsed and only printed by the CLI. Evidence: `crates/thedas-formats/src/fsb.rs:98`, `crates/thedas-cli/src/audio.rs:416`. Size: M. Depends: none. Kind: missing.
 - **AUD-032** **`PlayMusic` is dropped.** Original: not traced. Ours: the sim queues `SoundRequest::Music`; the app logs "not done yet" and discards it. Evidence: `crates/thedas-sim/src/engine.rs:502`, `crates/thedas-app/src/main.rs:2335`. Size: S. Depends: none. Kind: missing.
 - **AUD-033** **`SetMusicIntensity` mapping is inferred.** Original: logs "music state= %2.1f" (per comment). Ours: sets `music_state` on the area track to the integer given; read from data and scripts, not traced. Evidence: `crates/thedas-app/src/audio.rs:1468`. Size: S. Depends: none. Kind: provisional.
 - **AUD-034** **Music during cutscenes and conversations is left alone.** Original: not traced. Ours: the area track keeps playing through cutscenes and conversations. Evidence: `crates/thedas-app/src/audio.rs:1141`. Size: S. Depends: none. Kind: provisional.
@@ -231,8 +228,6 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 
 ### Documentation inside the code
 
-- **AUD-061** **`audio.rs` module doc is stale.** Original: n/a. Ours: says in-game music is not done and volumes map linearly; the same file does area/combat music and the exe's -3 dB per step mapping. Evidence: `crates/thedas-app/src/audio.rs:6`, `crates/thedas-app/src/audio.rs:14`, `crates/thedas-app/src/audio.rs:1526`. Size: S. Depends: none. Kind: bug.
-- **AUD-062** **`Bus` doc is stale.** Original: n/a. Ours: says `audio_categories.fev` is not read yet; the engine reads it. Evidence: `crates/thedas-audio/src/mixer.rs:12`, `crates/thedas-audio/src/engine.rs:270`. Size: S. Depends: none. Kind: bug.
 
 ### Checked and looks complete
 
@@ -246,7 +241,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 - Reverb preset lookup by name (`force_generic`, empty = off) and 0.33 s blended fades, as traced.
 - Area starting reverb preset by weighted trigger count, as traced.
 - Options sliders to dB (-3 dB per step, -60 dB floor), as traced (0x5b61b0, 0x5b6110).
-- Area music themes: main/combat/Death with stingers (timing provisional, see AUD-030).
+- Area music themes: main/combat/Death with stingers; changes wait for the playing track's next marker, as traced (0x5c4b10).
 - Placed area sounds with `ActivateSoundByTag`.
 - UI sounds through `sound_gui.gda`.
 - Script `PlaySound` and `PlaySoundSet`.

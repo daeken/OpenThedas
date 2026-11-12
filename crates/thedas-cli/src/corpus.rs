@@ -402,8 +402,8 @@ fn check_other(
         return check_script(data, location, stats, keep);
     } else if ext == "spt" {
         thedas_formats::speedtree::parse(data)
-            .map(|_| ())
             .map_err(|e| e.to_string())
+            .and_then(|tree| thedas_formats::speedtree_gen::check_curves(&tree))
     } else if ext == "ldf" {
         EngineTable::parse(data)
             .map(|_| ())

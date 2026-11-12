@@ -90,6 +90,9 @@ pub struct Sim {
     /// The player's "auto-pause when combat starts" option (`GetAutoPauseCombatStatus`);
     /// off, as the game's options start.
     pub auto_pause_combat: bool,
+    /// The player's "show tutorials" option: off, no tutorial popup is queued. On, as the
+    /// game's options start.
+    pub show_tutorials: bool,
     /// Objects whose scripts' engine calls are all traced (log channel -6), for debugging.
     pub watch_calls: std::collections::BTreeSet<ObjectId>,
     /// Followers whose front command is the move [`Sim::keep_party_together`] gave them.
@@ -494,6 +497,7 @@ impl Sim {
             cutscene_policy: CutscenePolicy::default(),
             party_picker_policy: PartyPickerPolicy::default(),
             auto_pause_combat: false,
+            show_tutorials: true,
             watch_calls: Default::default(),
             following: Default::default(),
             next_follow_ms: 0,
