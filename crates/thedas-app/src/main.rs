@@ -2131,8 +2131,8 @@ fn audio_state(
             let Some(o) = sim.world.get(*id) else {
                 continue;
             };
-            // INVENTORY_SLOT_MAIN 0, _OFFHAND 1, _CHEST 4.
-            let base = |slot: i32| {
+            let base = |slot: &str| {
+                let slot = thedas_sim::sim::constant(&sim.table, slot);
                 o.equipment
                     .get(&slot)
                     .and_then(|i| sim.world.get(*i))
@@ -2141,9 +2141,9 @@ fn audio_state(
             state.gear.insert(
                 *id,
                 audio::Gear {
-                    armour: base(4),
-                    main: base(0),
-                    off: base(1),
+                    armour: base("INVENTORY_SLOT_CHEST"),
+                    main: base("INVENTORY_SLOT_MAIN"),
+                    off: base("INVENTORY_SLOT_OFFHAND"),
                     combat: o.combat.in_combat,
                 },
             );
@@ -2236,6 +2236,27 @@ fn audio_state(
                 // PlayMusic names the music project (`music`, from the Music M2DA by
                 // module), which is always the one used here.
                 other => log::debug!("audio: not done yet: {other:?}"),
+            }
+        }
+    }
+    // The party picker, while open: who is picked (and the pool, for unpicked lines).
+    {
+        let sim = live.sim();
+        if let Some(p) = sim.world.party_picker.as_ref() {
+            let mut describe = |id: u32| {
+                let o = sim.world.get(id)?;
+                let set = o
+                    .text_fields
+                    .get(thedas_sim::sim::SOUND_SET)
+                    .cloned()
+                    .or_else(|| a.template_sound_set(&sim.vfs, &o.template));
+                Some((id, o.template.clone(), set, o.position))
+            };
+            state.picker = Some(p.selected.iter().filter_map(|&id| describe(id)).collect());
+            for id in sim.party_pool() {
+                if let Some(m) = describe(id) {
+                    state.picker_left.insert(id, m);
+                }
             }
         }
     }
