@@ -228,11 +228,19 @@ const QUICKBAR_SETTLE_FRAMES: u32 = 3;
 /// The engine value holding how far the quickbar is dragged open (see [`Stage::new`]).
 pub const QUICKBAR_EXPAND_VALUE: &str = "Party.QuickbarExpandValue";
 
+/// Where the mouse is taken to be before it first moves: nowhere near any clip.
+const OFF_STAGE: (f64, f64) = (-10_000.0, -10_000.0);
+
 /// The context the popup layer pushes while a dialog box is up.
 const POPUP_CONTEXT: &str = "GUIPopup";
 
 pub struct Stage {
     pub movies: Vec<UiMovie>,
+    /// Where the mouse is (stage pixels), which a movie is told as it opens: a player takes
+    /// the mouse to be at its origin until it moves, and a clip there (the portraits'
+    /// level-up mark, shown for its first frames) took that for a roll-over and left its
+    /// tooltip up. Far off the stage until the mouse first moves.
+    mouse: (f64, f64),
     /// The quickbar's width as the engine held it when quickbar.gfx opened, put back after
     /// the movie's first frame (see [`QUICKBAR_EXPAND_VALUE`]).
     quickbar_width: Option<(UiValue, u32)>,
@@ -278,6 +286,7 @@ impl Stage {
         let images = Arc::new(std::sync::Mutex::new(images));
         Self {
             movies: Vec::new(),
+            mouse: OFF_STAGE,
             quickbar_width: None,
             log: Vec::new(),
             bridge: {
@@ -378,6 +387,7 @@ impl Stage {
         )?;
         m.set_scale9(rep.scale9.clone());
         m.set_slots(rep.slots.clone());
+        m.mouse_move(self.mouse.0, self.mouse.1);
         for (name, url) in &self.engine_images {
             m.set_engine_image(name, Some(url));
         }
@@ -563,6 +573,7 @@ impl Stage {
     }
 
     pub fn mouse_move(&mut self, x: f64, y: f64) {
+        self.mouse = (x, y);
         for m in self.input_movies() {
             m.mouse_move(x, y);
         }
