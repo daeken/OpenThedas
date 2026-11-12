@@ -4,8 +4,8 @@ What is wrong or missing in OpenThedas compared with the original Dragon Age: Or
 detail as we can currently give. The [README](../README.md) says what works; this says what does
 not, so that people (and agents) can pick items up in parallel without stepping on each other.
 
-Last full pass: 2026-11-12, at main `f5ae46b`. Last refresh: 2026-11-12 17:50 UTC, at main
-`477f24e`, which added the counts measured against a real install. It is refreshed with the
+Last full pass: 2026-11-12, at main `f5ae46b`. Last refresh: 2026-11-12 19:00 UTC, at main
+`8a39900`. The counts measured against a real install were added at `477f24e`. It is refreshed with the
 README status.
 
 ## How to read it
@@ -36,10 +36,10 @@ so an untraced item starts with a trace, not with a guess.
 | --- | --- | --- |
 | Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 168 (`SIM-`), plus ability coverage by family |
 | Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 95 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
-| Rendering | [gaps/rendering.md](gaps/rendering.md) | 154 (`RND-`) |
-| Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 195 (`UI-`), plus the movies never opened and the values no screen gets answered |
-| Audio | [gaps/audio.md](gaps/audio.md) | 62 (`AUD-`) |
-| Cameras, cutscene presentation, startup | [gaps/cameras-cutscenes.md](gaps/cameras-cutscenes.md) | 47 (`CAM-`) |
+| Rendering | [gaps/rendering.md](gaps/rendering.md) | 151 (`RND-`) |
+| Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 189 (`UI-`), plus the movies never opened and the values no screen gets answered |
+| Audio | [gaps/audio.md](gaps/audio.md) | 56 (`AUD-`) |
+| Cameras, cutscene presentation, startup | [gaps/cameras-cutscenes.md](gaps/cameras-cutscenes.md) | 45 (`CAM-`) |
 | File formats and file system | [gaps/formats.md](gaps/formats.md) | 46 (`FMT-`), plus a table of every resource type and the tables and types nothing reads |
 | Tooling, platforms and project | [gaps/tooling.md](gaps/tooling.md) | 23 (`TOOL-`) |
 | What a player sees (QA) | [gaps/qa.md](gaps/qa.md) | open findings, accepted differences, content coverage |
@@ -61,10 +61,12 @@ these, so they are the places where one person or stream can take a large, separ
   are then only kept; the effect table's flags that should block movement, combat or talents
   block nothing (`SCR-045`). Movement-speed effects alone are built at 455 script sites and do
   nothing.
-- **Many events are never raised.** About 50 of the 111 named event types are raised by the
-  engine. Scripts have handlers for 34 others that never arrive, led by damaged (180 handler
-  scripts), trap-triggered and placeable-click (64 each), placeable-collision (56) and unlocked
-  (35). Which of them the original's engine raises is not traced (`SCR-063`).
+- **Some engine events are still not raised.** About 55 of the 111 named event types are raised
+  by the engine. Tracing every sender in the original showed that damaged, spell-cast-at,
+  combat-initiated, unlocked and five others come only from scripts, so nothing is owed there.
+  Still missing with an engine sender in the original: item on-hit, trap-triggered,
+  placeable-collision, placeable-click, gift-item and use-plot-action (`SCR-063`,
+  [gaps/scripting.md](gaps/scripting.md)).
 - **Missing engine functions fail silently.** A function with no implementation returns a
   default and the script carries on down the "nothing there" branch (`SCR-001`). Measured against
   a real install, 71 functions that game scripts call are unhandled, at 2,062 call sites; the
