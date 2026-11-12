@@ -17,8 +17,8 @@ use thedas_vfs::Vfs;
 
 use crate::camera::Camera;
 use crate::d3d::{
-    ConstantContext, D3dProgram, DrawLights, StageConstants, TextureSource, pick_lights,
-    sampler_texture,
+    ConstantContext, D3dProgram, DrawLights, LightClass, StageConstants, TextureSource, ambient_of,
+    pick_level_lights, pick_lights, pick_rig_lights, sampler_texture,
 };
 use crate::gpu::{DEPTH_FORMAT, GpuContext, TextureCache};
 
@@ -103,7 +103,7 @@ pub(crate) struct D3dPass {
     /// Each scene draw's skinning palette rows (empty: every bone at rest).
     bones: Vec<Vec<[f32; 4]>>,
     scene_probes: Vec<thedas_formats::probe::IrradianceProbe>,
-    /// Each scene draw's ambient light (its room's).
+    /// Each scene draw's ambient light node term (see [`ambient_of`]).
     ambients: Vec<Vec3>,
     /// The level's sun (direction, colour), if it has one.
     sun: Option<(Vec3, Vec3)>,
@@ -141,6 +141,12 @@ pub(crate) struct D3dPass {
     statics: std::sync::Mutex<Vec<Option<Box<StaticConstants>>>>,
     /// The scene's lights, for re-picking the lights of objects that move.
     scene_lights: Vec<SceneLight>,
+    /// The rooms' light reach ([`AreaScene::light_rooms`]) and boxes
+    /// ([`AreaScene::room_boxes`]), for re-picking a moved object's room and lights.
+    light_rooms: HashMap<i64, Vec<i64>>,
+    room_boxes: Vec<(i64, Vec3, Vec3)>,
+    /// Each draw's light class (by its material's render class).
+    classes: Vec<LightClass>,
     /// For each placed object ([`AreaScene::props`]), its draws (indices into `draws`),
     /// attachments included: they share one light selection, as the exe's render object's
     /// meshes share its light set.
@@ -567,6 +573,11 @@ struct RepickInput<'a> {
     objects: &'a [Vec<usize>],
     in_view: &'a [bool],
     lights: &'a [SceneLight],
+    light_rooms: &'a HashMap<i64, Vec<i64>>,
+    /// The room (id) at a position.
+    room_at: &'a dyn Fn(Vec3) -> Option<i64>,
+    /// A draw's light class.
+    class: &'a dyn Fn(usize) -> LightClass,
     position: &'a dyn Fn(usize) -> Vec3,
     sphere: &'a dyn Fn(usize) -> Option<(Vec3, f32)>,
     initial: &'a dyn Fn(usize) -> &'a DrawLights,
@@ -606,13 +617,30 @@ fn repick(
         else {
             continue;
         };
-        let lights = pick_lights(input.lights, bound, DOMAIN_CHARACTERS);
+        let room = (input.room_at)(here);
+        let mut picked: Vec<(LightClass, DrawLights)> = Vec::new();
         for &k in ks {
             if k >= draws {
                 continue;
             }
+            let class = (input.class)(k);
+            let lights = match picked.iter().find(|(c, _)| *c == class) {
+                Some((_, l)) => l.clone(),
+                None => {
+                    // Level-class draws of an object keep the old rule (see
+                    // `pick_level_lights`), as before: the characters' domain.
+                    let l = match class {
+                        LightClass::Level => {
+                            pick_level_lights(input.lights, bound, DOMAIN_CHARACTERS)
+                        }
+                        c => pick_lights(input.lights, input.light_rooms, bound, room, c),
+                    };
+                    picked.push((class, l.clone()));
+                    l
+                }
+            };
             if *relit[k].as_ref().unwrap_or_else(|| (input.initial)(k)) != lights {
-                relit[k] = Some(lights.clone());
+                relit[k] = Some(lights);
                 changed.push(k);
             }
         }
@@ -1108,12 +1136,6 @@ fn create_pipeline(
     })
 }
 
-/// The ambient light of each room: the sum of the ambient lights its light model holds. A
-/// draw in a room with none (or outside every room) takes the average over the rooms that
-/// have one. Provisional: the original sums the ambient light nodes its light manager picks
-/// for the object (see [`crate::d3d`]), filtered by a light visibility list not traced
-/// here; summing every room's ambient into one, as before, washed out levels of many rooms.
-/// A level with no ambient light nodes (Lothering) gets none, as in the original.
 /// A draw's texture and sampler bindings: each sampler its program reads, bound to the
 /// texture the material (or lightmap, or shadow partition) gives it.
 #[allow(clippy::too_many_arguments)]
@@ -1203,6 +1225,12 @@ fn particle_vertices(quads: &[crate::particles::ParticleVertex], inputs: &[IoSlo
     out
 }
 
+/// The ambient light of each room for level geometry: the sum of the ambient lights its
+/// light model holds. A draw in a room with none (or outside every room) takes the average
+/// over the rooms that have one. Provisional (see [`ambient_of`]): the original's per-object
+/// pass selects no ambient light node for level meshes, but drawing them with none leaves the
+/// Highever hall far darker than the original's. A level with no ambient light nodes
+/// (Lothering) gets none.
 fn room_ambients(scene: &AreaScene) -> impl Fn(&str) -> Vec3 {
     let mut by_room: HashMap<String, Vec3> = HashMap::new();
     for l in &scene.lights {
@@ -1250,6 +1278,21 @@ impl D3dPass {
         let mut by_name: HashMap<String, usize> = HashMap::new();
         let mut samplers: HashMap<String, wgpu::Sampler> = HashMap::new();
         let ambient = room_ambients(scene);
+        // The level's own meshes (placed props such as benches included) keep the old
+        // rule whatever their render class (see `pick_level_lights`); the placed objects'
+        // draws go by their render class.
+        let classes: Vec<LightClass> = scene
+            .draws
+            .iter()
+            .enumerate()
+            .map(|(di, d)| {
+                if di < scene.static_draws {
+                    LightClass::Level
+                } else {
+                    LightClass::of(scene.materials[d.material].render_class.as_deref())
+                }
+            })
+            .collect();
 
         let mut pending = Vec::new();
         for (di, d) in scene.draws.iter().enumerate() {
@@ -1338,17 +1381,22 @@ impl D3dPass {
                 textures: textures_group,
                 slot,
                 draw: di,
-                // The level's own meshes come first; the placed objects and creatures
-                // after them are lit as characters.
-                lights: pick_lights(
-                    &scene.lights,
-                    d.sphere,
-                    if di < scene.static_draws {
-                        DOMAIN_LEVEL
-                    } else {
-                        DOMAIN_CHARACTERS
-                    },
-                ),
+                // By its material's render class: characters from the characters' lights,
+                // placeables from the level's, among those whose room reaches the draw's.
+                // Level-class draws keep the old rule (`pick_level_lights`): the level's own
+                // meshes with the level's domain, an object's with the characters'.
+                lights: match classes[di] {
+                    LightClass::Level => pick_level_lights(
+                        &scene.lights,
+                        d.sphere,
+                        if di < scene.static_draws {
+                            DOMAIN_LEVEL
+                        } else {
+                            DOMAIN_CHARACTERS
+                        },
+                    ),
+                    c => pick_lights(&scene.lights, &scene.light_rooms, d.sphere, d.room_id, c),
+                },
                 multipass,
                 sphere: {
                     // The sky and its clouds follow the camera (`sky.vsh`, `clouds.vsh`):
@@ -1590,7 +1638,15 @@ impl D3dPass {
             probes: scene.draws.iter().map(|d| d.probe).collect(),
             bones: vec![Vec::new(); scene.draws.len()],
             scene_probes: scene.probes.iter().map(|p| p.probe.clone()).collect(),
-            ambients: scene.draws.iter().map(|d| ambient(&d.room)).collect(),
+            ambients: scene
+                .draws
+                .iter()
+                .zip(&classes)
+                .map(|(d, &c)| match c {
+                    LightClass::Level => ambient(&d.room),
+                    c => ambient_of(&scene.lights, c),
+                })
+                .collect(),
             sun: scene.sun,
             fog: crate::atmosphere::fog_params(scene.atmosphere.as_ref()),
             sky: celestial
@@ -1616,6 +1672,9 @@ impl D3dPass {
             particle_buffer,
             quad_indices,
             scene_lights: scene.lights.clone(),
+            light_rooms: scene.light_rooms.clone(),
+            room_boxes: scene.room_boxes.clone(),
+            classes,
             prop_draws,
             prop_at: std::sync::Mutex::new(Vec::new()),
             relit: std::sync::Mutex::new(Vec::new()),
@@ -1881,7 +1940,7 @@ impl D3dPass {
                 let bound = self
                     .world_sphere(d)
                     .unwrap_or((world.w_axis.truncate(), 1.0));
-                (r, pick_lights(&r.lights, bound, DOMAIN_CHARACTERS))
+                (r, pick_rig_lights(&r.lights, bound))
             });
             let cc = ConstantContext {
                 view,
@@ -1967,10 +2026,11 @@ impl D3dPass {
     /// their bounds; a draw whose lights change has its fixed constants refilled.
     ///
     /// DAOrigins.exe re-selects a moving object's lights every frame it is visible
-    /// (0x45bdb0 → 0x4654e0 → 0x464310 → 0x463e40) and keeps a static object's; one light
-    /// set serves all of the object's meshes. Provisional: the choice itself is still
-    /// [`pick_lights`] (the exe's influence function, light `vfunc+0x84`, is not traced),
-    /// and the object's ambient and probe stay those of the room it was placed in.
+    /// (0x45bdb0 → 0x4654e0 → 0x464310 → 0x463e40) and keeps a static object's. Its room is
+    /// found again from its position ([`crate::scene::room_id_at`]); its draws of one light
+    /// class share one selection. Provisional: one bound for all of an object's meshes (the
+    /// exe's light set is per render node), and the object's probe stays the one it was
+    /// placed with.
     fn repick_lights(
         &self,
         in_view: &[bool],
@@ -1983,6 +2043,14 @@ impl D3dPass {
                 objects: &self.prop_draws,
                 in_view,
                 lights: &self.scene_lights,
+                light_rooms: &self.light_rooms,
+                room_at: &|p| crate::scene::room_id_at(&self.room_boxes, p),
+                class: &|k| {
+                    self.classes
+                        .get(self.draws[k].draw)
+                        .copied()
+                        .unwrap_or(LightClass::Character)
+                },
                 position: &|k| self.worlds[self.draws[k].draw].0.w_axis.truncate(),
                 sphere: &|k| self.world_sphere(&self.draws[k]),
                 initial: &|k| &self.draws[k].lights,
@@ -2194,10 +2262,20 @@ mod tests {
             color: Vec3::ONE,
             radius: 3.0,
             name: name.into(),
-            domain: None,
+            domain: Some(crate::scene::DOMAIN_CHARACTERS),
+            is_static: true,
+            version: 0,
+            room: None,
         };
         let lights = vec![light(0.0, "a"), light(20.0, "b")];
-        let initial = pick_lights(&lights, (Vec3::ZERO, 0.5), DOMAIN_CHARACTERS);
+        let rooms = HashMap::new();
+        let initial = pick_lights(
+            &lights,
+            &rooms,
+            (Vec3::ZERO, 0.5),
+            None,
+            LightClass::Character,
+        );
         assert_eq!(initial.points[0].0, Vec3::ZERO);
         // Object 0 owns draws 0 and 1; draw 2 is the level's.
         let objects = vec![vec![0, 1]];
@@ -2209,6 +2287,9 @@ mod tests {
             objects: &objects,
             in_view: &[true, true, true],
             lights: &lights,
+            light_rooms: &rooms,
+            room_at: &|_| None,
+            class: &|_| LightClass::Character,
             position: &position,
             sphere: &sphere,
             initial: &init,

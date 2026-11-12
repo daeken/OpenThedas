@@ -7,17 +7,18 @@
 //! `mml_vTintMaskColours` (`Ch1ArmTnt.psh`; `character.mat.xml` describes the array): a
 //! diffuse and a specular opacity vector (14008, 14009; x, y, z, w weigh the tint mask's red,
 //! green, blue and alpha channels), then a diffuse/specular colour pair per channel: red
-//! 14000/14003, green 14001/14004, blue 14002/14005, and alpha, the skin channel, which the
-//! shader lerps the diffuse texture towards, 14006/14007.
+//! 14000/14003, green 14001/14004, blue 14002/14005, and alpha, the skin channel,
+//! 14006/14007: `Ch1ArmTnt.psh` multiplies the diffuse texture by `lerp(1, 14006, a)`, `a`
+//! the mask's alpha times 14008's `w`.
 //!
-//! Provisional. DAOrigins.exe's loader (0x7496b9) stores the fields in memory as 14008,
-//! 14009, then 14006, 14000, 14001, 14002 and 14007, 14003, 14004, 14005: read here as four
-//! diffuse colours (skin first) and four specular ones, which the engine interleaves into
-//! pairs; that step is not traced. The data agrees: item tints give zero skin opacity and
-//! white skin colours, and the mabari's body tint (`t3_dog_o00`) and skin tints
-//! (`t1_skn_*`) give white channel colours, their colour in 14006 and opacity on alpha only.
-//! Cousland's soldiers then wear the reference screenshot's dark steel and brown, not silver
-//! or cyan.
+//! DAOrigins.exe's loader (0x749600, from 0x7496b9) stores the fields at tint offsets 0x1c
+//! to 0xac in the order 14008, 14009, 14006, 14000, 14001, 14002, 14007, 14003, 14004,
+//! 14005. The function that sets a tint on a material (0xa604a0) builds the ten-entry
+//! `mml_vTintMaskColours` array from offsets 0x1c, 0x2c, 0x4c, 0x8c, 0x5c, 0x9c, 0x6c, 0xac,
+//! 0x3c and 0x7c (0xa604f3-0xa60579): exactly [`FIELD_ORDER`]. The data agrees: item tints
+//! give zero skin opacity and white skin colours, and the mabari's body tint (`t3_dog_o00`)
+//! and skin tints (`t1_skn_*`) give white channel colours, their colour in 14006 and opacity
+//! on alpha only.
 
 use crate::gff4::Gff4;
 use crate::typed::{Doc, TypedError, TypedResult};
