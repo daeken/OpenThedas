@@ -120,6 +120,18 @@ pub struct Tactic {
     pub condition: i32,
     pub command: i32,
     pub param: i32,
+    /// The party member a per-follower target type names (`GetTacticTargetObject`; the
+    /// tactics screen's `TargetID`).
+    #[serde(default)]
+    pub target_object: Option<ObjectId>,
+    /// The party member a per-follower condition names (`GetTacticConditionObject`; the
+    /// screen's `ConditionID`).
+    #[serde(default)]
+    pub condition_object: Option<ObjectId>,
+    /// The item a use-item command uses (`GetTacticCommandItemTag` gives its tag; the
+    /// screen's `CommandItem`).
+    #[serde(default)]
+    pub item: Option<ObjectId>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -920,6 +932,7 @@ impl Sim {
                             thedas_formats::gda::Cell::Int(v) => *v as i32,
                             _ => 0,
                         }),
+                    ..Default::default()
                 }
             }))
             .collect();

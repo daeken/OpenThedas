@@ -133,6 +133,7 @@ pub struct UiLayer {
     /// Frames since the minimap's creatures were last sent.
     minimap_frame: u32,
     portraits: PortraitClock,
+    paperdoll: PaperdollClock,
     /// Where the player's games are saved (none: the save and load screens list nothing).
     saves: Option<crate::saves::SaveStore>,
 }
@@ -173,6 +174,22 @@ impl PortraitClock {
     fn name(id: u32, drawn: u32) -> String {
         format!("thedas_portrait_{id}_{drawn}.png")
     }
+}
+
+/// The paperdoll's size: the render target DAOrigins.exe's `GUIPaperdoll` makes for the
+/// inventory and the character record (0x10e by 0x1cb, pushed at 0x7312ee and 0x73c310), the
+/// rectangle inventory.gfx and characterrecord.gfx fill with it.
+pub const PAPERDOLL_SIZE: (u32, u32) = (270, 459);
+
+/// When the paperdoll is drawn: when a screen showing it is up and what it shows (who, their
+/// appearance and equipment, how it is turned) changed, or the last drawing missed them a
+/// moment ago (their model was not built yet).
+#[derive(Default)]
+struct PaperdollClock {
+    key: Option<(u32, u64, i32)>,
+    missing: bool,
+    since_ms: f64,
+    drawn: u32,
 }
 
 /// How soon a member missing from the last portraits is tried again (milliseconds).
@@ -275,6 +292,7 @@ impl UiLayer {
             level: None,
             minimap_frame: 0,
             portraits: PortraitClock::default(),
+            paperdoll: PaperdollClock::default(),
             saves: None,
         }
     }
@@ -513,6 +531,9 @@ impl UiLayer {
                 sim.clone(),
                 self.shown.clone(),
             )));
+        self.stage
+            .bridge
+            .set_query_handler(Some(thedas_ui::input::query_for(sim.clone())));
     }
 
     /// One interface frame while playing: binds the simulation's values, brings the screens
@@ -550,8 +571,18 @@ impl UiLayer {
                 let key: LineKey = (d.dialog, d.line, d.replies.iter().map(|r| r.0).collect());
                 (key, waits)
             });
-            (crate::screens::wanted(&sim, screens.menu), line)
+            let want = crate::screens::wanted(&sim, screens.menu);
+            (
+                crate::screens::with_examine(want, shown.examine.is_some()),
+                line,
+            )
         };
+        // The examine screen goes with the screen it was opened from.
+        if !want.contains(&Screen::ItemExamine)
+            && let Ok(mut shown) = self.shown.lock()
+        {
+            shown.examine = None;
+        }
         let changes = screens.sync(want, &mut self.stage);
         // The store's close button: the simulation's store closes too.
         if changes.dismissed.contains(&Screen::Store) {
@@ -671,6 +702,62 @@ impl UiLayer {
     /// [`portrait_key`]'s. `dt_ms` is the time since the last call.
     pub fn wants_portraits(&mut self, key: Vec<(u32, u64)>, dt_ms: f64) -> bool {
         self.portraits.due(key, dt_ms)
+    }
+
+    /// The party member to draw into the paperdoll and how far it is turned (radians), when
+    /// it is due (see [`PaperdollClock`]): the one the inventory or character record shows
+    /// (the member the player controls). `dt_ms` is the time since the last call.
+    pub fn wants_paperdoll(
+        &mut self,
+        screens: &Screens,
+        sim: &Sim,
+        dt_ms: f64,
+    ) -> Option<(u32, f32)> {
+        let up = screens
+            .shown()
+            .iter()
+            .any(|s| matches!(s, Screen::Inventory | Screen::CharacterRecord));
+        let clock = &mut self.paperdoll;
+        clock.since_ms += dt_ms;
+        if !up {
+            clock.key = None;
+            return None;
+        }
+        let who = sim.world.controlled().or(sim.world.hero)?;
+        let yaw = self.shown.lock().map(|s| s.paperdoll_yaw).unwrap_or(0.0);
+        let look = portrait_key(sim)
+            .into_iter()
+            .find(|(id, _)| *id == who)
+            .map_or(0, |(_, h)| h);
+        let key = Some((who, look, (yaw.to_degrees() * 10.0).round() as i32));
+        if key != clock.key || (clock.missing && clock.since_ms >= PORTRAIT_RETRY_MS) {
+            clock.key = key;
+            clock.since_ms = 0.0;
+            return Some((who, yaw));
+        }
+        None
+    }
+
+    /// Hands the movies a fresh paperdoll drawing (straight RGBA8, [`PAPERDOLL_SIZE`]), or
+    /// notes that the member could not be drawn.
+    pub fn set_paperdoll(&mut self, shot: Option<Vec<u8>>) {
+        let clock = &mut self.paperdoll;
+        clock.missing = shot.is_none();
+        let Some(pixels) = shot else { return };
+        let old = format!("thedas_paperdoll_{}.png", clock.drawn);
+        clock.drawn += 1;
+        let name = format!("thedas_paperdoll_{}.png", clock.drawn);
+        let (width, height) = PAPERDOLL_SIZE;
+        self.stage.set_image(
+            &name,
+            Some(&Rgba {
+                width,
+                height,
+                pixels,
+            }),
+        );
+        self.stage.set_engine_image("paperdoll", Some(&name));
+        self.stage.set_image(&old, None);
     }
 
     /// Hands the movies freshly drawn portraits (RGBA8, [`PORTRAIT_SIZE`] square, by member).
@@ -938,6 +1025,12 @@ impl UiLayer {
     }
 
     /// A click the movies see as Scaleform mouse `button` (a right click, a double click).
+    /// A press or release the movies see as Scaleform `button` (see
+    /// [`thedas_ui::stage::Stage::button_as`]).
+    pub fn button_as(&mut self, button: f64, x: f64, y: f64, down: bool) {
+        self.stage.button_as(button, x, y, down);
+    }
+
     pub fn click_as(&mut self, button: f64, x: f64, y: f64) {
         self.stage.click_as(button, x, y);
     }

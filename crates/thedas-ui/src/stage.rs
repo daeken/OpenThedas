@@ -184,6 +184,8 @@ pub struct Stage {
     made: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
     images: Arc<std::sync::Mutex<ImageSource>>,
     size: (u32, u32),
+    /// The engine's current drawing of each engine image (see `UiMovie::set_engine_image`).
+    engine_images: std::collections::BTreeMap<String, String>,
 }
 
 impl Stage {
@@ -238,6 +240,7 @@ impl Stage {
             made,
             images,
             size,
+            engine_images: Default::default(),
         }
     }
 
@@ -247,6 +250,19 @@ impl Stage {
 
     /// Serves `rgba` (PNG-encoded) to the movies as image `name` (a `.png`); `None` stops
     /// serving it.
+    /// The engine's drawing of image `name` (see `crate::ENGINE_IMAGES`) is now the made
+    /// image `file` (see [`Stage::set_image`]): the movies' slots for it load it.
+    pub fn set_engine_image(&mut self, name: &str, file: Option<&str>) {
+        let url = file.map(|f| format!("img://{f}"));
+        match &url {
+            Some(u) => self.engine_images.insert(name.to_string(), u.clone()),
+            None => self.engine_images.remove(name),
+        };
+        for m in &mut self.movies {
+            m.set_engine_image(name, url.as_deref());
+        }
+    }
+
     pub fn set_image(&self, name: &str, rgba: Option<&Rgba>) {
         let bytes = rgba.and_then(encode_png);
         if let Ok(mut m) = self.made.lock() {
@@ -290,6 +306,11 @@ impl Stage {
             image_lookup(self.lookup.clone(), self.images.clone()),
             Some(self.bridge.responder()),
         )?;
+        m.set_scale9(rep.scale9.clone());
+        m.set_slots(rep.slots.clone());
+        for (name, url) in &self.engine_images {
+            m.set_engine_image(name, Some(url));
+        }
         // Run until the injected frame-one action has registered its callback (class
         // definitions and InitMovie run first), then start the movie as the game does.
         for _ in 0..5 {
@@ -487,6 +508,22 @@ impl Stage {
             release_text_focus(m);
             m.mouse_button(x, y, true);
             m.mouse_button(x, y, false);
+            m.set(crate::avm1::BUTTON_VAR, UiValue::Undefined);
+        }
+    }
+
+    /// A press (`down`) or release at (`x`, `y`) that the movies see as Scaleform `button`
+    /// ([`crate::avm1::MOUSE_RIGHT`]), delivered as the left button with the button set
+    /// aside (see [`crate::avm1::BUTTON_VAR`]): a right press opens an item's radial menu,
+    /// and its release picks the action under the mouse.
+    pub fn button_as(&mut self, button: f64, x: f64, y: f64, down: bool) {
+        for m in self.input_movies() {
+            m.set(crate::avm1::BUTTON_VAR, UiValue::Number(button));
+            m.mouse_move(x, y);
+            if down {
+                release_text_focus(m);
+            }
+            m.mouse_button(x, y, down);
             m.set(crate::avm1::BUTTON_VAR, UiValue::Undefined);
         }
     }

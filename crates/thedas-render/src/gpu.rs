@@ -434,6 +434,9 @@ pub struct AreaRenderer {
     blended: Vec<(usize, DrawRef)>,
     /// When set, only these scene draws are drawn (a portrait draws its member alone).
     pub only_draws: Option<std::collections::HashSet<usize>>,
+    /// What a frame drawn on its own starts as (black; a paperdoll draws over white too, to
+    /// find its coverage).
+    pub clear: wgpu::Color,
     depth: Option<(wgpu::TextureView, u32, u32)>,
     /// The level's frame buffer effects, for a renderer of the level's own meshes.
     effects: Option<crate::post::FrameEffects>,
@@ -836,6 +839,7 @@ impl AreaRenderer {
             opaque,
             blended,
             only_draws: None,
+            clear: wgpu::Color::BLACK,
             depth: None,
             // Only a renderer of the level's own meshes runs its effects; the objects' scene
             // draws over it.
@@ -1127,10 +1131,7 @@ impl AreaRenderer {
         };
         let (color_load, depth_load) = match over {
             Some(_) => (wgpu::LoadOp::Load, wgpu::LoadOp::Load),
-            None => (
-                wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                wgpu::LoadOp::Clear(1.0),
-            ),
+            None => (wgpu::LoadOp::Clear(self.clear), wgpu::LoadOp::Clear(1.0)),
         };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("area"),

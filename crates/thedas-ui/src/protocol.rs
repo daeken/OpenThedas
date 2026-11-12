@@ -59,6 +59,10 @@ pub fn replace_designer_tags(text: &str, hero: &str) -> String {
 pub type MessageHandler =
     Arc<dyn Fn(&str, &[String]) -> Option<Vec<(String, UiValue)>> + Send + Sync>;
 
+/// Answers a question a movie asks the game about its state (`DAExternalCommands`'
+/// returning fscommands: the name and its arguments); `None` when the game cannot answer now.
+pub type QueryHandler = Arc<dyn Fn(&str, &[String]) -> Option<UiValue> + Send + Sync>;
+
 /// Looks up a talk-table string.
 pub type StringLookup = Arc<dyn Fn(u32) -> Option<String> + Send + Sync>;
 
@@ -106,6 +110,7 @@ pub struct GameBridge {
     strings: StringLookup,
     handler: Arc<Mutex<Option<MessageHandler>>>,
     tables: Arc<Mutex<Option<TableLookup>>>,
+    query: Arc<Mutex<Option<QueryHandler>>>,
 }
 
 /// What a call means to the rest of the engine, once the bridge has handled its own part.
@@ -164,6 +169,7 @@ impl GameBridge {
             strings,
             handler: Arc::new(Mutex::new(None)),
             tables: Arc::new(Mutex::new(None)),
+            query: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -172,6 +178,13 @@ impl GameBridge {
     pub fn set_table_lookup(&self, tables: Option<TableLookup>) {
         if let Ok(mut t) = self.tables.lock() {
             *t = tables;
+        }
+    }
+
+    /// Who answers the movies' questions about the game's state (see [`QueryHandler`]).
+    pub fn set_query_handler(&self, query: Option<QueryHandler>) {
+        if let Ok(mut q) = self.query.lock() {
+            *q = query;
         }
     }
 
@@ -306,6 +319,14 @@ impl GameBridge {
                     }
                 }
                 UiValue::Undefined
+            }
+            name if call.kind == CallKind::FsCommand
+                && crate::avm1::DA_RETURNING_FSCOMMANDS.contains(&name) =>
+            {
+                let query = self.query.lock().ok().and_then(|q| q.clone());
+                query
+                    .and_then(|q| q(name, &args))
+                    .unwrap_or(UiValue::Undefined)
             }
             "GetValue" | "GetNumber" | "GetString" | "GetBool" => {
                 let name = arg(0);
@@ -487,6 +508,7 @@ impl GameBridge {
             call.name.as_str(),
             "GetValue" | "GetNumber" | "GetString" | "GetBool"
         ) || crate::avm1::RETURNING_FSCOMMANDS.contains(&call.name.as_str())
+            || crate::avm1::DA_RETURNING_FSCOMMANDS.contains(&call.name.as_str())
         {
             return None;
         }
@@ -842,6 +864,23 @@ mod tests {
             )),
             UiValue::Number(2.0)
         );
+    }
+
+    #[test]
+    fn the_games_answers_to_a_movies_questions_come_from_its_query_handler() {
+        let b = bridge();
+        let fs = CallKind::FsCommand;
+        let ask = call(fs, "ListTacticBaseConditions", &["3"]);
+        assert_eq!(b.respond(&ask), UiValue::Undefined, "no handler yet");
+        b.set_query_handler(Some(Arc::new(|name: &str, args: &[String]| {
+            (name == "ListTacticBaseConditions" && args == ["3"])
+                .then(|| UiValue::List(vec![UiValue::Number(2.0), UiValue::Number(4.0)]))
+        })));
+        assert_eq!(
+            b.respond(&ask),
+            UiValue::List(vec![UiValue::Number(2.0), UiValue::Number(4.0)])
+        );
+        assert_eq!(b.handle(ask), None, "nothing for the rest of the engine");
     }
 
     #[test]

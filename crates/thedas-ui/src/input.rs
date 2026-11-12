@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use thedas_sim::Sim;
 
+use crate::UiValue;
 use crate::binding::Presentation;
 use crate::protocol::{GameMessage, MessageHandler};
 
@@ -139,6 +140,24 @@ pub fn apply_all(sim: &mut Sim, messages: &[GameMessage]) -> Vec<(String, Vec<St
 /// inventory.gfx's category tab: the engine lists only that category's items.
 pub const SET_ITEM_FILTER: &str = "GUIInventory.SetItemListFilter";
 
+/// A screen's inspect action (inventory.gfx's `ItemUtils.ExamineItem`): the item's token,
+/// which side to show on and whether to check the requirements.
+pub const SHOW_ITEM_EXAMINE: &str = "GUIItemExamine.ShowItemExamine";
+/// A movie closing a screen of its own by name (itemexamine.gfx: `ItemExamine`).
+pub const HIDE_GUI_SCREEN: &str = "GUI.HideGUIScreen";
+pub const ITEM_EXAMINE_SCREEN: &str = "ItemExamine";
+/// The inventory's and character record's paperdoll turn buttons (DAOrigins.exe's
+/// `RotatePaperdollLeftMessage` and `RotatePaperdollRightMessage`, handled by `GUIPaperdoll`).
+pub const PAPERDOLL_LEFT: &str = "Paperdoll.RotatePaperdollLeft";
+pub const PAPERDOLL_RIGHT: &str = "Paperdoll.RotatePaperdollRight";
+/// The paperdoll dragged with the mouse: inventory.gfx sends the drag's horizontal and
+/// vertical movement times -0.8 (`RotatePaperdollCameraMessage`). Provisional: taken as
+/// degrees about the member; the vertical part (the camera's pitch) is not used.
+pub const PAPERDOLL_DRAG: &str = "Paperdoll.RotatePaperdollCamera";
+/// How far one press turns the paperdoll (radians). Provisional: the game's step is not
+/// traced.
+pub const PAPERDOLL_TURN: f32 = std::f32::consts::PI / 8.0;
+
 /// Takes the interface's own messages (not simulation input) into `shown`; returns whether
 /// `name` was one.
 pub fn present(shown: &mut Presentation, name: &str, args: &[String]) -> bool {
@@ -146,6 +165,46 @@ pub fn present(shown: &mut Presentation, name: &str, args: &[String]) -> bool {
         return true;
     }
     match name {
+        SHOW_ITEM_EXAMINE => {
+            let int = |i: usize| {
+                args.get(i)
+                    .and_then(|a| a.trim().parse::<f64>().ok())
+                    .map_or(0, |v| v as i32)
+            };
+            shown.examine = args
+                .first()
+                .map(|t| t.trim())
+                .filter(|t| !t.is_empty())
+                .map(|t| crate::binding::Examine {
+                    token: t.to_string(),
+                    right_side: int(1),
+                    check_requirements: int(2),
+                });
+            true
+        }
+        HIDE_GUI_SCREEN if args.first().map(|a| a.trim()) == Some(ITEM_EXAMINE_SCREEN) => {
+            shown.examine = None;
+            true
+        }
+        PAPERDOLL_LEFT | PAPERDOLL_RIGHT => {
+            let turn = if name == PAPERDOLL_LEFT {
+                -PAPERDOLL_TURN
+            } else {
+                PAPERDOLL_TURN
+            };
+            shown.paperdoll_yaw = (shown.paperdoll_yaw + turn) % std::f32::consts::TAU;
+            true
+        }
+        PAPERDOLL_DRAG => {
+            let degrees = args
+                .first()
+                .and_then(|a| a.trim().parse::<f32>().ok())
+                .filter(|d| d.is_finite())
+                .unwrap_or(0.0);
+            shown.paperdoll_yaw =
+                (shown.paperdoll_yaw + degrees.to_radians()) % std::f32::consts::TAU;
+            true
+        }
         SET_ITEM_FILTER => {
             shown.item_filter = args
                 .first()
@@ -154,6 +213,62 @@ pub fn present(shown: &mut Presentation, name: &str, args: &[String]) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+/// Answers the movies' questions about `sim` (see [`crate::protocol::QueryHandler`]):
+/// tactics.gfx's pickers (`DAExternalCommands.ListTactic*`, from
+/// [`Sim::tactic_targets`] and its neighbours) and the names it shows for party members
+/// (`GetObjectNameByID`). Unanswered while the simulation is busy elsewhere.
+pub fn query_for(sim: Arc<Mutex<Sim>>) -> crate::protocol::QueryHandler {
+    Arc::new(move |name: &str, args: &[String]| {
+        let sim = sim.try_lock().ok()?;
+        let answer = query(&sim, name, args);
+        log::debug!("query {name} {args:?}: {answer:?}");
+        Some(answer)
+    })
+}
+
+/// [`query_for`]'s answers.
+pub fn query(sim: &Sim, name: &str, args: &[String]) -> UiValue {
+    let int = |i: usize| {
+        args.get(i)
+            .and_then(|a| a.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map_or(0, |v| v as i64)
+    };
+    let list =
+        |v: Vec<i64>| UiValue::List(v.into_iter().map(|x| UiValue::Number(x as f64)).collect());
+    let ints = |v: Vec<i32>| list(v.into_iter().map(i64::from).collect());
+    let who = u32::try_from(int(0)).unwrap_or(0);
+    let pair = |a: &str, x: Vec<i32>, ids: Vec<i64>| {
+        UiValue::Object(
+            [(a.to_string(), ints(x)), ("IDs".to_string(), list(ids))]
+                .into_iter()
+                .collect(),
+        )
+    };
+    match name {
+        "ListTacticTargets" => {
+            let (t, ids) = sim.tactic_targets(who);
+            pair("Targets", t, ids)
+        }
+        "ListTacticBaseConditions" => ints(sim.tactic_base_conditions(int(0) as i32)),
+        "ListTacticConditions" => {
+            let (c, ids) = sim.tactic_conditions(int(0) as i32, int(1) as i32);
+            pair("Conditions", c, ids)
+        }
+        "ListTacticActions" => ints(sim.tactic_actions(who, int(1) as i32, int(2) as i32)),
+        "ListTacticAbilities" => ints(sim.tactic_abilities(who, int(1) as i32, int(2) as i32)),
+        "ListTacticModalAbilities" => ints(sim.tactic_modal_abilities(who)),
+        "ListTacticItems" => list(
+            sim.tactic_items(int(0) as i32)
+                .into_iter()
+                .map(i64::from)
+                .collect(),
+        ),
+        "GetObjectNameByID" => UiValue::String(sim.display_name(who)),
+        _ => UiValue::Undefined,
     }
 }
 
@@ -204,6 +319,37 @@ pub fn handler_for(sim: Arc<Mutex<Sim>>, shown: Arc<Mutex<Presentation>>) -> Mes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_examine_screen_opens_on_an_item_and_closes_itself() {
+        let mut p = Presentation::default();
+        let a = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let token = "GUIInventory.PartyBackpackView.2.Item";
+        assert!(present(&mut p, SHOW_ITEM_EXAMINE, &a(&[token, "1", "0"])));
+        assert_eq!(
+            p.examine,
+            Some(crate::binding::Examine {
+                token: token.into(),
+                right_side: 1,
+                check_requirements: 0,
+            })
+        );
+        assert!(!present(&mut p, HIDE_GUI_SCREEN, &a(&["Journal"])));
+        assert!(p.examine.is_some());
+        assert!(present(&mut p, HIDE_GUI_SCREEN, &a(&["ItemExamine"])));
+        assert!(p.examine.is_none());
+    }
+
+    #[test]
+    fn the_paperdoll_turns_with_its_buttons_and_drags() {
+        let mut p = Presentation::default();
+        let a = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(present(&mut p, PAPERDOLL_RIGHT, &[]));
+        assert_eq!(p.paperdoll_yaw, PAPERDOLL_TURN);
+        assert!(present(&mut p, PAPERDOLL_LEFT, &[]));
+        assert!(present(&mut p, PAPERDOLL_DRAG, &a(&["-8", "4"])));
+        assert!((p.paperdoll_yaw + 8f32.to_radians()).abs() < 1e-6);
+    }
 
     fn sim() -> Sim {
         Sim::new(

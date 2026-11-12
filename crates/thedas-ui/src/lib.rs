@@ -362,11 +362,12 @@ pub fn load_movie(
     let data = lookup(name).ok_or_else(|| UiError::NotFound(name.to_string()))?;
     let inject = avm1::register_invoke();
     let fonts = font_library(lookup);
-    let (mut swf, report) = gfx::rewrite(
+    let (mut swf, report) = gfx::rewrite_with_slots(
         &data,
         &mut |e| images.image(&e.file),
         fonts.as_ref(),
         Some(&inject),
+        ENGINE_IMAGES,
     )?;
     if name.eq_ignore_ascii_case(stage::POPUP_LAYER) {
         allow_spaces_in_typed_names(&mut swf);
@@ -397,6 +398,10 @@ fn allow_spaces_in_typed_names(swf: &mut [u8]) {
         swf[i..i + POPUP_RESTRICT.len()].copy_from_slice(POPUP_RESTRICT_ALLOWED);
     }
 }
+
+/// Images the engine draws into the movies while they run (Scaleform render targets): the
+/// paperdoll (DAOrigins.exe's `GUIPaperdoll` names its target `paperdoll`, 0x7bc659).
+pub const ENGINE_IMAGES: &[&str] = &["paperdoll"];
 
 /// The font library the game installs for Scaleform (see [`gfx::FontLibrary`]).
 pub const FONT_LIBRARY: &str = "fonts_en-us.gfx";
@@ -460,6 +465,15 @@ pub struct UiMovie {
     observers: Vec<(String, String)>,
     /// The value last pushed to each observer.
     sent: std::collections::HashMap<String, UiValue>,
+    /// The movie's scaling-grid sprites (see `gfx::Scale9`), by sprite id, and the scale each
+    /// registered one was last laid out for.
+    scale9: BTreeMap<u16, gfx::Scale9>,
+    scale9_laid: Vec<(f64, f64)>,
+    /// The movie's engine-image slots (see `gfx::Slot`), by image name; the engine's current
+    /// drawing of each image (its URL); the URL each registered slot last loaded.
+    slots: BTreeMap<String, gfx::Slot>,
+    engine_images: BTreeMap<String, String>,
+    slots_loaded: Vec<String>,
 }
 
 /// Turns a callback id from the movie (a number) into its `cm_mapCallbacks` key.
@@ -530,6 +544,11 @@ impl UiMovie {
             authored,
             observers: Default::default(),
             sent: Default::default(),
+            scale9: BTreeMap::new(),
+            scale9_laid: Vec::new(),
+            slots: BTreeMap::new(),
+            engine_images: BTreeMap::new(),
+            slots_loaded: Vec::new(),
         })
     }
 
@@ -555,10 +574,108 @@ impl UiMovie {
         self.player.lock().ok().map(|mut p| f(&mut p))
     }
 
+    /// The movie's scaling-grid sprites, from its rewrite (`RewriteReport::scale9`).
+    pub fn set_scale9(&mut self, scale9: BTreeMap<u16, gfx::Scale9>) {
+        self.scale9 = scale9;
+    }
+
+    /// Lays out the pieces of the scaling-grid sprites whose scale changed since they were
+    /// last laid out (see `gfx::scale9_layout`): Ruffle draws a grid sprite scaled as a whole.
+    fn layout_scale9(&mut self) {
+        if self.scale9.is_empty() {
+            return;
+        }
+        let UiValue::List(v) = self.call(avm1::SCALE9_SCALES, &[]) else {
+            return;
+        };
+        let num = |x: Option<&UiValue>| match x {
+            Some(UiValue::Number(n)) => Some(*n),
+            _ => None,
+        };
+        for (i, t) in v.chunks(3).enumerate() {
+            let (Some(id), Some(xs), Some(ys)) = (num(t.first()), num(t.get(1)), num(t.get(2)))
+            else {
+                continue;
+            };
+            if self.scale9_laid.len() <= i {
+                self.scale9_laid.resize(i + 1, (f64::NAN, f64::NAN));
+            }
+            if self.scale9_laid[i] == (xs, ys) {
+                continue;
+            }
+            self.scale9_laid[i] = (xs, ys);
+            let Some(grid) = self.scale9.get(&(id as u16)).copied() else {
+                continue;
+            };
+            for (k, [x, y, a, b]) in gfx::scale9_layout(&grid, xs / 100.0, ys / 100.0)
+                .into_iter()
+                .enumerate()
+            {
+                let args = [i as f64, k as f64, x, y, a, b].map(UiValue::Number);
+                self.call(avm1::SCALE9_SET, &args);
+            }
+        }
+    }
+
+    /// The movie's engine-image slots, from its rewrite (`RewriteReport::slots`).
+    pub fn set_slots(&mut self, slots: BTreeMap<String, gfx::Slot>) {
+        self.slots = slots;
+    }
+
+    /// The engine's drawing of image `name` (`paperdoll`) is now at `url`
+    /// (`img://thedas_paperdoll_3.png`), or there is none.
+    pub fn set_engine_image(&mut self, name: &str, url: Option<&str>) {
+        match url {
+            Some(u) => self.engine_images.insert(name.to_string(), u.to_string()),
+            None => self.engine_images.remove(name),
+        };
+    }
+
+    /// Loads the engine's drawings into the slots showing an older one (or none).
+    fn fill_slots(&mut self) {
+        if self.slots.is_empty() {
+            return;
+        }
+        let UiValue::List(names) = self.call(avm1::SLOT_NAMES, &[]) else {
+            return;
+        };
+        for (i, n) in names.iter().enumerate() {
+            let UiValue::String(name) = n else { continue };
+            let (Some(url), Some(slot)) = (self.engine_images.get(name), self.slots.get(name))
+            else {
+                continue;
+            };
+            if self.slots_loaded.len() <= i {
+                self.slots_loaded.resize(i + 1, String::new());
+            }
+            if self.slots_loaded[i] == *url {
+                continue;
+            }
+            self.slots_loaded[i] = url.clone();
+            let [x, y, _, _] = slot.rect;
+            let args = [
+                UiValue::Number(i as f64),
+                UiValue::String(url.clone()),
+                UiValue::Number(x),
+                UiValue::Number(y),
+            ];
+            self.call(avm1::SLOT_LOAD, &args);
+        }
+    }
+
+    /// Runs what the movies put off past the host's last step: post-load functions, then
+    /// the scaling-grid layout and the engine's images.
+    fn after_step(&mut self) {
+        self.call(avm1::POST_LOAD_RUN, &[]);
+        self.layout_scale9();
+        self.fill_slots();
+    }
+
     /// Advances the movie by `dt_ms` of wall time and runs pending loads.
     pub fn tick(&mut self, dt_ms: f64) {
         self.executor.run();
         self.with_player(|p| p.tick(FloatDuration::from_millis(dt_ms)));
+        self.after_step();
         self.executor.run();
     }
 
@@ -566,6 +683,7 @@ impl UiMovie {
     pub fn run_frame(&mut self) {
         self.executor.run();
         self.with_player(|p| p.run_frame());
+        self.after_step();
         self.executor.run();
     }
 
@@ -638,6 +756,7 @@ impl UiMovie {
                 index: None,
             };
             self.with_player(|p| p.handle_event(ev));
+            self.after_step();
             return;
         }
         // The button under the mouse is released before the movies' mouse-up handlers hide
@@ -645,6 +764,7 @@ impl UiMovie {
         self.set(avm1::HIDE_LATER, UiValue::List(Vec::new()));
         self.with_player(|p| p.handle_event(PlayerEvent::MouseUp { x, y, button }));
         self.call(avm1::HIDE_FLUSH, &[]);
+        self.after_step();
     }
 
     /// The engine side of the movies' `TokenManager`: collects observers registered with

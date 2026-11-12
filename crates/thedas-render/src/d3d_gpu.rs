@@ -130,6 +130,14 @@ pub(crate) struct D3dPass {
     /// This frame's draws (by index into `draws`) in the camera's view (see
     /// [`D3dPass::update`]): only they get constants and are drawn.
     in_view: std::sync::Mutex<Vec<bool>>,
+    /// Each draw's constants that stay as it was made, once it was first in view, and which
+    /// of its stages' constants change each frame (see [`ConstantContext::per_frame`]).
+    /// Sound while a draw's material, lightmap, lights, ambient, probe and the pass's sun,
+    /// fog, sky and clouds are fixed when the pass is made: only [`D3dPass::set_world`] and
+    /// [`D3dPass::set_bones`] change a draw afterwards, and both feed per-frame constants
+    /// (anything else that changes an object's look rebuilds its pass). A setter for any of
+    /// the fixed inputs must clear the draw's entry here.
+    statics: std::sync::Mutex<Vec<Option<Box<StaticConstants>>>>,
     caster_programs: Vec<Arc<D3dProgram>>,
     /// The (empty) texture bindings of the casters' programs.
     empty_group: wgpu::BindGroup,
@@ -138,6 +146,10 @@ pub(crate) struct D3dPass {
 /// The format of the shadow partitions: `PSSMStatic.psh` writes depth and its square into
 /// red and green (the state masks the rest).
 pub const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// A draw's vertex and pixel constants that stay as it was made, each with which of its
+/// table's constants are refilled every frame.
+type StaticConstants = [(crate::d3d::StageConstants, Vec<bool>); 2];
 
 /// A frame's partitions and the `g_vShadowData` they give.
 type PlacedPartitions = ([crate::shadow::Partition; 2], [[f32; 4]; 9]);
@@ -528,6 +540,32 @@ fn mesh_sphere(mesh: &SceneMesh) -> (Vec3, f32) {
         return (Vec3::ZERO, 0.0);
     }
     ((lo + hi) * 0.5, (hi - lo).length() * 0.5)
+}
+
+/// A skinned draw's bounding sphere in its own space, posed: every vertex is a weighted
+/// blend of its rest position carried by each of its bones, so it lies within a sphere
+/// around the rest sphere carried by every palette matrix (`rows`: three rows per bone).
+/// The original culls its creatures as it does the rest: every object gets an Umbra object
+/// (`Object::create`, 0x467a4b and the other cases of 0x4678f0) with a box model
+/// (`OBBModel::create`, 0x466efb, 0x467bcd); this sphere is ours (provisional).
+fn skinned_sphere(rest: (Vec3, f32), rows: &[[f32; 4]]) -> (Vec3, f32) {
+    let carried: Vec<(Vec3, f32)> = rows
+        .chunks_exact(3)
+        .map(|r| {
+            let m = glam::Mat4::from_cols_array_2d(&[r[0], r[1], r[2], [0.0, 0.0, 0.0, 1.0]])
+                .transpose();
+            (m.transform_point3(rest.0), rest.1 * max_scale(&m))
+        })
+        .collect();
+    if carried.is_empty() {
+        return rest;
+    }
+    let centre = carried.iter().map(|c| c.0).sum::<Vec3>() / carried.len() as f32;
+    let radius = carried
+        .iter()
+        .map(|(c, r)| c.distance(centre) + r)
+        .fold(0.0, f32::max);
+    (centre, radius)
 }
 
 /// How far (in metres) a draw's bounding sphere is widened for the view culling: room for
@@ -1311,6 +1349,7 @@ impl D3dPass {
             caster_visible: std::sync::Mutex::new(Vec::new()),
             casters_filled: std::sync::Mutex::new(None),
             in_view: std::sync::Mutex::new(Vec::new()),
+            statics: std::sync::Mutex::new(Vec::new()),
             casters,
             caster_buffer,
             caster_programs: caster_programs_used,
@@ -1416,23 +1455,26 @@ impl D3dPass {
         }
         let Some(buffer) = &self.buffer else { return };
         let (view, projection) = (camera.view(), camera.projection(aspect));
-        // Only the draws in view get constants (and are drawn); skinned ones always do, as
-        // their bones may carry them beyond their bounds.
+        // Only the draws in view get constants (and are drawn); a skinned draw's bounds
+        // follow its bones (see [`skinned_sphere`]).
         let view_proj = projection * view;
         let in_view: Vec<bool> = self
             .draws
             .iter()
             .map(|d| {
                 let (world, _, _) = &self.worlds[d.draw];
-                let Some((centre, radius)) = d.sphere else {
+                let Some(sphere) = d.sphere else {
                     return true;
                 };
-                !self.bones.get(d.draw).is_none_or(|b| b.is_empty())
-                    || in_view(
-                        &view_proj,
-                        world.transform_point3(centre),
-                        radius * max_scale(world),
-                    )
+                let (centre, radius) = match self.bones.get(d.draw) {
+                    Some(rows) if !rows.is_empty() => skinned_sphere(sphere, rows),
+                    _ => sphere,
+                };
+                in_view(
+                    &view_proj,
+                    world.transform_point3(centre),
+                    radius * max_scale(world),
+                )
             })
             .collect();
         let slot_size = SLOT[7] as usize;
@@ -1447,7 +1489,15 @@ impl D3dPass {
             data[SLOT[base + 1] as usize..][..i.len()].copy_from_slice(i);
             data[SLOT[base + 2] as usize..][..b.len()].copy_from_slice(b);
         };
-        for (d, _) in self.draws.iter().zip(&in_view).filter(|(_, v)| **v) {
+        let mut statics = self.statics.lock().unwrap_or_else(|e| e.into_inner());
+        statics.resize_with(self.draws.len(), || None);
+        for (i, (d, _)) in self
+            .draws
+            .iter()
+            .zip(&in_view)
+            .enumerate()
+            .filter(|(_, (_, v))| **v)
+        {
             if run_start + run.len() as u64 != d.slot {
                 if !run.is_empty() {
                     ctx.queue.write_buffer(buffer, run_start, &run);
@@ -1484,8 +1534,26 @@ impl D3dPass {
                 shadow,
                 partition: None,
             };
-            put(data, &cc.fill(program.vs.ctab.as_ref()), 0);
-            put(data, &cc.fill(program.ps.ctab.as_ref()), 3);
+            // The constants that stay as the draw was made are filled once (see
+            // [`ConstantContext::per_frame`]); each frame refills the rest over them.
+            let tables = [program.vs.ctab.as_ref(), program.ps.ctab.as_ref()];
+            let fixed = statics[i].take().unwrap_or_else(|| {
+                Box::new(tables.map(|t| {
+                    let per_frame: Vec<bool> = t
+                        .map(|t| t.constants.iter().map(|c| cc.per_frame(c)).collect())
+                        .unwrap_or_default();
+                    let mut st = crate::d3d::StageConstants::default();
+                    cc.fill_into(t, &mut st, |k| per_frame.get(k) != Some(&true));
+                    (st, per_frame)
+                }))
+            });
+            for (stage, (table, base)) in tables.into_iter().zip([0, 3]).enumerate() {
+                let (st, per_frame) = &fixed[stage];
+                let mut c = st.clone();
+                cc.fill_into(table, &mut c, |k| per_frame.get(k) == Some(&true));
+                put(data, &c, base);
+            }
+            statics[i] = Some(fixed);
             let fix = [
                 1.0 / width.max(1) as f32,
                 1.0 / height.max(1) as f32,
@@ -1704,6 +1772,26 @@ mod tests {
             camera.position + camera.forward() * (camera.far + 50.0),
             1.0
         ));
+    }
+
+    #[test]
+    fn a_skinned_draws_bounds_follow_its_bones() {
+        // Two bones: one at rest, one carrying its vertices 5 m along x.
+        let rows = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0, 5.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ];
+        let (c, r) = skinned_sphere((Vec3::ZERO, 1.0), &rows);
+        // Both carried spheres lie within it.
+        for at in [Vec3::ZERO, Vec3::new(5.0, 0.0, 0.0)] {
+            assert!(c.distance(at) + 1.0 <= r + 1e-4);
+        }
+        // No bones: the rest sphere.
+        assert_eq!(skinned_sphere((Vec3::ONE, 2.0), &[]), (Vec3::ONE, 2.0));
     }
 
     #[test]
