@@ -419,6 +419,32 @@ impl Sim {
     /// 0xe24b074d, 0x79663c: 28 and 30). So a rate is an amount per pass, not per second,
     /// and outside combat only the creature's own combat state counts, not the game mode.
     /// The current value stays within 0 and the property's maximum.
+    /// A creature's current mana or stamina (`PROPERTY_DEPLETABLE_MANA_STAMINA`).
+    pub(crate) fn mana_now(&self, id: ObjectId) -> f32 {
+        self.world
+            .get(id)
+            .and_then(|o| o.properties.get(&8))
+            .map_or(0.0, |v| v.1)
+    }
+
+    /// After a change to `id`'s mana or stamina: when it went from above 0 to 0 or below,
+    /// the creature hears `EVENT_TYPE_MANA_STAM_DEPLETED` (64) from itself, with no other
+    /// payload, as DAOrigins.exe sends it (0x6afb90, from every change of property 8 that
+    /// goes through 0x719a00: regeneration and the property setters). Provisional: the
+    /// exe's per-creature enable check for the event (0x698490) is not modelled.
+    pub(crate) fn note_mana_change(&mut self, id: ObjectId, before: f32) {
+        if before > 0.0
+            && self.mana_now(id) <= 0.0
+            && self
+                .world
+                .get(id)
+                .is_some_and(|o| o.kind == ObjectKind::Creature)
+        {
+            let ev = self.new_event("MANA_STAM_DEPLETED", Some(id));
+            self.world.queue_event(0, id, ev, None);
+        }
+    }
+
     pub fn regenerate(&mut self, ms: u64) {
         if ms == 0 {
             return;
@@ -483,6 +509,7 @@ impl Sim {
                         continue;
                     }
                     let max = self.depletable_max(id, p);
+                    let before = self.mana_now(id);
                     if let Some(v) = self
                         .world
                         .get_mut(id)
@@ -491,6 +518,9 @@ impl Sim {
                         if v.1 < max || rate < 0.0 {
                             v.1 = (v.1 + rate).clamp(0.0, max);
                         }
+                    }
+                    if p == mana {
+                        self.note_mana_change(id, before);
                     }
                 }
             }
@@ -1873,6 +1903,7 @@ mod tests {
     use super::*;
 
     const LDF: &str = "int EVENT_TYPE_PERCEPTION_APPEAR = 25;\n\
+        int EVENT_TYPE_MANA_STAM_DEPLETED = 64;\n\
         int EVENT_TYPE_PERCEPTION_DISAPPEAR = 26;\n\
         int EVENT_TYPE_DEATH = 4;\n\
         int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
@@ -2161,6 +2192,36 @@ mod tests {
         assert!(s.world.get(c).unwrap().commands.is_empty());
         assert_eq!(impacts(&s), 1);
         assert_eq!(s.world.time_ms, t0 + 1567);
+    }
+
+    #[test]
+    fn mana_running_out_tells_the_creature_once() {
+        let mut s = sim();
+        let c = s.world.spawn(ObjectKind::Creature, "mage");
+        s.world
+            .get_mut(c)
+            .unwrap()
+            .properties
+            .insert(8, (10.0, 3.0));
+        let depleted = |s: &Sim| {
+            s.world
+                .queue
+                .values()
+                .filter(|q| q.target == c && q.event.ty == 64)
+                .count()
+        };
+        s.note_mana_change(c, 5.0);
+        assert_eq!(depleted(&s), 0, "still above 0");
+        s.world
+            .get_mut(c)
+            .unwrap()
+            .properties
+            .insert(8, (10.0, 0.0));
+        s.note_mana_change(c, 3.0);
+        assert_eq!(depleted(&s), 1);
+        // Already at 0: nothing more.
+        s.note_mana_change(c, 0.0);
+        assert_eq!(depleted(&s), 1);
     }
 
     #[test]
