@@ -177,6 +177,7 @@ pub const BOOK_SCREENS: &[&str] = &[
     "tactics.gfx",
     "store.gfx",
     "levelup.gfx",
+    "abilities.gfx",
 ];
 
 /// The book bookback.gfx draws under the book screens (`GUIBookback`, the exe's `BookBack`

@@ -559,6 +559,11 @@ impl UiLayer {
                 shown.journal_focus = None;
             }
             shown.journal = journal;
+            shown.ability_scene = match screens.menu {
+                Some(Screen::Skills) => 3,
+                Some(Screen::SpellsTalents) => 1,
+                _ => 0,
+            };
         }
         let (want, line) = {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());

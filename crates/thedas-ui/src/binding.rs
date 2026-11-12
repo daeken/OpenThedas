@@ -99,6 +99,9 @@ pub struct Presentation {
     pub paperdoll_yaw: f32,
     /// The item being examined (see [`Examine`]), while the examine screen is up.
     pub examine: Option<Examine>,
+    /// While the skills or spells/talents screen is up, which it shows (abilities.gfx's
+    /// `AbilityScene.TALENTS` 1, `SPELLS` 2, `SKILLS` 3); 0 otherwise.
+    pub ability_scene: i32,
 }
 
 /// An item shown on the examine screen (itemexamine.gfx), as the screen that opened it asked
@@ -317,7 +320,28 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             }
         }
         v.insert("CharGenCreature.Stats.AutoLevelUp".into(), num(0));
-        crate::chains::bind(sim, c, "CharGenCreature.Stats", &mut v);
+        crate::chains::bind(
+            sim,
+            c,
+            "CharGenCreature.Stats",
+            crate::chains::DISPLAYMODE_LEVELUP,
+            &mut v,
+        );
+    }
+    // The skills or spells/talents screen (abilities.gfx): which it shows, and the member's
+    // abilities listed as the spellbook lists them.
+    if let Some(c) = controlled.or(hero).filter(|_| shown.ability_scene != 0) {
+        v.insert(
+            "GUI.AbilityScene".into(),
+            num(f64::from(shown.ability_scene)),
+        );
+        crate::chains::bind(
+            sim,
+            c,
+            "GUI.SelectedChar.Stats",
+            crate::chains::DISPLAYMODE_SPELLBOOK,
+            &mut v,
+        );
     }
     // The portrait the engine drew of each member's head (portraits.gfx loads it).
     for (i, id) in members.iter().enumerate() {

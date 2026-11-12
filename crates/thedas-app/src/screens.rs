@@ -36,6 +36,10 @@ pub enum Screen {
     Journal,
     Options,
     ItemExamine,
+    /// The skills screen (K) and the spells/talents screen (P): one movie, abilities.gfx,
+    /// told which by `GUI.AbilityScene`.
+    Skills,
+    SpellsTalents,
 }
 
 impl Screen {
@@ -65,6 +69,7 @@ impl Screen {
             // Quick Play and finishing ask for confirmation on the popup layer.
             Screen::CharGen => &["chargen.gfx", "popuplayer.gfx"],
             Screen::Journal => &["journal.gfx"],
+            Screen::Skills | Screen::SpellsTalents => &["abilities.gfx"],
             // Settings that need confirming (a new resolution) ask on the popup layer.
             Screen::Options => &["optionsmenu.gfx", "popuplayer.gfx"],
             // Over the screen it was opened from (see `with_examine`).

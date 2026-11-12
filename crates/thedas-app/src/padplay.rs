@@ -61,9 +61,11 @@ pub const TARGET_NEAR: f32 = 2.0;
 pub const POINTER_STEP: f64 = 40.0;
 
 /// The player's screens LB and RB move between, in order (Back opens the first).
-const PAGES: [Page; 8] = [
+const PAGES: [Page; 10] = [
     Page::Menu(Screen::Inventory),
     Page::Menu(Screen::CharacterRecord),
+    Page::Menu(Screen::Skills),
+    Page::Menu(Screen::SpellsTalents),
     Page::Menu(Screen::Journal),
     Page::Menu(Screen::AreaMap),
     Page::Menu(Screen::Tactics),
