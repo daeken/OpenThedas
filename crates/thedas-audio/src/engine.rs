@@ -305,6 +305,24 @@ impl AudioEngine {
             None
         })?;
         let event = resolve(&project, &index)?;
+        // The event's playback limit (FMOD Designer's max playbacks and what happens past it:
+        // 1 steals the oldest, 2 the newest, 3 the quietest (taken as the oldest), 4 and 5
+        // fail).
+        let playing: Vec<EventHandle> = self
+            .instances
+            .iter()
+            .filter(|i| !i.stopping && Arc::ptr_eq(&i.project, &project) && i.event == index)
+            .map(|i| i.handle)
+            .collect();
+        if playing.len() >= event.max_playbacks.max(1) as usize {
+            let steal = match event.max_playbacks_behavior {
+                1 | 3 => playing.first().copied(),
+                2 => playing.last().copied(),
+                _ => None,
+            };
+            let h = steal?;
+            self.stop(h, true);
+        }
         let handle = EventHandle(self.next);
         self.next += 1;
         let category = event.categories.first().cloned().unwrap_or_default();
@@ -1066,6 +1084,15 @@ mod tests {
         run(&mut e, &m, 0.2);
         assert!(!e.is_playing(h));
         assert_eq!(m.lock().unwrap().active(), 0);
+    }
+
+    #[test]
+    fn max_playbacks_steal_the_oldest() {
+        let (mut e, m) = engine("maxpb");
+        let a = e.play("test/grp/loop", PlayOptions::default()).unwrap();
+        let b = e.play("test/grp/loop", PlayOptions::default()).unwrap();
+        run(&mut e, &m, 0.3);
+        assert!(!e.is_playing(a) && e.is_playing(b));
     }
 
     #[test]
