@@ -374,11 +374,42 @@ pub fn template_look(sim: &Sim, o: &Object, template: &str) -> Option<ObjectMode
     })
 }
 
+/// A body bag the decaying corpse handed off to (the simulation sets [`CORPSE_APPEARANCE`]
+/// on it then): it draws its corpse's appearance's `CorpseModel` (apr_base.gda; a bone pile,
+/// a coin pouch for golems and rats), as DAOrigins.exe turns the hidden bag into that model
+/// 1.5 s before the corpse is gone (0x6b98e0). Before that the bag is an invisible container.
+fn corpse_model(sim: &Sim, o: &Object) -> Option<String> {
+    let app = *o.fields.get(CORPSE_APPEARANCE)?;
+    if app <= 0 {
+        return None;
+    }
+    let model = sim
+        .world
+        .tables()
+        .get(0, "apr_base")
+        .and_then(|t| text(t.cell("CorpseModel", app as i64)))
+        .unwrap_or_else(|| DEFAULT_CORPSE_MODEL.to_string());
+    Some(model.to_ascii_lowercase())
+}
+
+/// The field the simulation sets on a body bag at the corpse's hand-off: the corpse's
+/// appearance.
+pub const CORPSE_APPEARANCE: &str = thedas_sim::decay::CORPSE_APPEARANCE;
+/// apr_base.gda's most common `CorpseModel`, for an appearance that names none.
+/// Provisional: the exe's fallback is not traced.
+pub const DEFAULT_CORPSE_MODEL: &str = "plc_bonepile_01_0";
+
 /// [`object_models`] with the creature's items found in `gear`.
 fn object_models_in(sim: &Sim, o: &Object, gear: Gear) -> Drawn {
     let tables = sim.world.tables();
     match o.kind {
         ObjectKind::Placeable => {
+            if let Some(model) = corpse_model(sim, o) {
+                return Drawn {
+                    models: vec![model],
+                    ..Default::default()
+                };
+            }
             let Some(t) = tables.get(0, "placeable_types") else {
                 return Drawn::default();
             };
@@ -909,6 +940,8 @@ struct DrawnKey {
     /// Weapons are drawn in combat and sheathed out of it (their attachment nodes).
     in_combat: bool,
     equipment: Vec<(i32, ObjectId, Option<i32>, Option<i32>)>,
+    /// A body bag's corpse, once handed off (see [`corpse_model`]).
+    corpse: Option<i32>,
 }
 
 impl DrawnKey {
@@ -916,6 +949,7 @@ impl DrawnKey {
         let field =
             |id: ObjectId, f: &str| sim.world.get(id).and_then(|i| i.fields.get(f).copied());
         DrawnKey {
+            corpse: o.fields.get(CORPSE_APPEARANCE).copied(),
             template: o.template.clone(),
             appearance: o.appearance,
             gender: o.fields.get("Gender").copied(),
@@ -1164,6 +1198,37 @@ mod tests {
         assert_eq!(m.actions, vec!["door_opentoclose2"]);
         assert!(!m.looping);
         assert!((m.time - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_handed_off_body_bag_draws_its_corpses_model() {
+        use std::sync::Arc;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        s.world.tables().insert(
+            "apr_base",
+            &["CorpseModel"],
+            vec![
+                (7, vec![Cell::String("plc_bagcoin03_0\0".into())]),
+                (8, vec![Cell::String(String::new())]),
+            ],
+        );
+        let bag = s.world.spawn(ObjectKind::Placeable, "gen_ip_bodybag");
+        let model = |s: &Sim| corpse_model(s, s.world.get(bag).unwrap());
+        assert_eq!(model(&s), None, "hidden until the hand-off");
+        s.world
+            .get_mut(bag)
+            .unwrap()
+            .fields
+            .insert(CORPSE_APPEARANCE.into(), 7);
+        assert_eq!(model(&s).as_deref(), Some("plc_bagcoin03_0"));
+        s.world
+            .get_mut(bag)
+            .unwrap()
+            .fields
+            .insert(CORPSE_APPEARANCE.into(), 8);
+        assert_eq!(model(&s).as_deref(), Some(DEFAULT_CORPSE_MODEL));
     }
 
     #[test]
