@@ -1322,12 +1322,20 @@ impl Sim {
                     .and_then(|h| self.world.get(h))
                     .map(|h| (h.position, h.facing));
                 for (k, id) in party.iter().skip(1).enumerate() {
+                    self.following.remove(id);
                     if let Some(o) = self.world.get_mut(*id) {
                         o.area = Some(new);
                         if let Some((p, facing)) = at {
                             o.position = behind(p, facing, k);
                             o.facing = facing;
                         }
+                        // What a member was doing in the old area ends with it: a move under
+                        // way would otherwise carry on from where it began there, putting
+                        // the member back at its old coordinates in the new area (Daveth
+                        // and Jory left at their Ostagar spots in the Korcari Wilds).
+                        // Provisional: the exe's clearing of action queues on a transition
+                        // is not traced.
+                        o.commands.clear();
                         // Followers enter after the hero (whose ENTER `enter_area` sent).
                         let mut ev = self.new_event("ENTER", Some(*id));
                         ev.objects = vec![*id];
