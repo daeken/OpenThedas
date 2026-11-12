@@ -1081,8 +1081,9 @@ impl App {
             });
         let stopped = self.screens.as_ref().is_some_and(|s| s.world_stopped());
         if let Some(live) = self.live.as_mut() {
-            // A pending transition runs on behind the loading screen, which stops the world.
-            if !stopped || live.transition_pending() {
+            // A pending transition, or a world map journey, runs on behind its loading screen
+            // (which stops the world otherwise).
+            if !stopped || live.transition_pending() || live.travel_load() {
                 live.step(dt);
             }
             // While a level loads the world holds still: its presentation too.
@@ -1225,8 +1226,9 @@ impl App {
         };
         let stopped = self.screens.as_ref().is_some_and(|s| s.world_stopped());
         if let Some(live) = self.live.as_mut() {
-            // A pending transition runs on behind the loading screen, which stops the world.
-            if !stopped || live.transition_pending() {
+            // A pending transition, or a world map journey, runs on behind its loading screen
+            // (which stops the world otherwise).
+            if !stopped || live.transition_pending() || live.travel_load() {
                 live.step(dt);
             }
             // While a level loads the world holds still: its presentation too.
@@ -2935,15 +2937,12 @@ fn travel_to_pin(sim: &mut thedas_sim::Sim, tag: &str) -> bool {
 }
 
 fn loading_screen(live: &live::Live, ui: &mut ui::UiLayer, up: &mut bool) {
-    // Travelling on the world map: the map stays up as the loading screen (the simulation
-    // closes it to input when travel starts), but not during a random encounter's stop.
-    // Provisional: until the app's own travel-load state says when (it also covers the
-    // arrival's load).
-    {
-        let sim = live.sim();
-        let wm = &sim.world.world_map;
-        ui.hold_world_map((wm.travelling_to.is_some() || wm.arriving) && !wm.encounter);
-    }
+    // Travelling on the world map: the map stays up as that load's screen (GUI 16 in the
+    // exe, 0x6c6060; the simulation closes it to input when travel starts), from the pin
+    // clicked until the new area's world is up, but not during a random encounter's stop
+    // (see `Live::travel_load`).
+    let travelling = live.travel_load();
+    ui.hold_world_map(travelling);
     // THEDAS_NO_LOAD_MOVIE: no loading movie; a load shows the interface over black.
     if std::env::var_os("THEDAS_NO_LOAD_MOVIE").is_some() {
         return;
@@ -2952,22 +2951,14 @@ fn loading_screen(live: &live::Live, ui: &mut ui::UiLayer, up: &mut bool) {
     match (live.loading() || pending.is_some(), *up) {
         (true, false) => {
             let sim = live.sim();
-            if sim.world.world_map.open {
+            // The world map is the journey's loading screen: no loading movie over it.
+            if sim.world.world_map.open || travelling {
                 return;
             }
             let hint = thedas_ui::binding::load_hint(&sim);
             drop(sim);
             let kind = live.load_screen().unwrap_or(ui::LoadScreen::Town);
-            // A world map journey's load keeps the map up in the exe (GUI 16); until the
-            // interface does that, the loading movie shows as for any other load.
-            log::info!(
-                "loading screen: {kind:?}{}",
-                if live.travel_load() {
-                    " (a world map journey)"
-                } else {
-                    ""
-                }
-            );
+            log::info!("loading screen: {kind:?}");
             ui.loading_begin(kind, hint);
             *up = true;
         }
@@ -3593,6 +3584,7 @@ fn main() -> Result<()> {
                             }
                             if !played.as_ref().is_some_and(|(_, s)| s.world_stopped())
                                 || l.transition_pending()
+                                || l.travel_load()
                             {
                                 l.step(dt);
                             }
