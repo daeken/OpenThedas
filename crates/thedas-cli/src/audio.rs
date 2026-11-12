@@ -265,7 +265,7 @@ pub fn fev(path: &Path, filter: Option<&str>, check: bool) -> Result<()> {
             continue;
         }
         println!(
-            "{}/{p}: {} vol {:.3} pitch {:.2} rnd p{:.3} v{:.3} {} dist {}..{} fade {}/{} ms reverb {}/{} cat {:?}",
+            "{}/{p}: {} vol {:.3} pitch {:.2} rnd p{:.3} v{:.3} flags {:#x} mode {:#x} {} dist {}..{} fade {}/{} ms reverb {}/{} cat {:?}",
             fev.name,
             if e.kind_flags == 0x10 {
                 "simple"
@@ -276,6 +276,8 @@ pub fn fev(path: &Path, filter: Option<&str>, check: bool) -> Result<()> {
             e.pitch,
             e.pitch_randomization,
             e.volume_randomization,
+            e.flags,
+            e.mode,
             if e.is_3d() { "3D" } else { "2D" },
             e.min_distance,
             e.max_distance,
