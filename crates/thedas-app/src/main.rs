@@ -2311,6 +2311,7 @@ fn audio_state(
     // listener balance position": 0.17 of the way to the camera).
     let cam = camera.position;
     let feet = live.leader_feet().unwrap_or(cam);
+    state.leader = live.leader_feet().map(|f| f.to_array());
     let p = feet + (cam - feet) * 0.17;
     let right = [camera.yaw.sin(), -camera.yaw.cos(), 0.0];
     state.listener = Some((p.to_array(), right));

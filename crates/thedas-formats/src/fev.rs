@@ -407,8 +407,133 @@ pub enum WaveformKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReverbDef {
     pub name: String,
-    /// The I3DL2-style properties, unread for now.
+    /// The 33 words as stored; [`ReverbDef::properties`] names them.
     pub raw: Vec<u32>,
+}
+
+/// FMOD Ex's reverb properties (`FMOD_REVERB_PROPERTIES`, I3DL2 style). Levels are
+/// millibels; times seconds; `diffusion` and `density` percent; references Hz.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReverbProperties {
+    pub instance: i32,
+    /// The preset's environment number (FMOD's preset list index; DA:O's own presets 0).
+    pub environment: i32,
+    pub env_size: f32,
+    pub env_diffusion: f32,
+    pub room: i32,
+    pub room_hf: i32,
+    pub room_lf: i32,
+    pub decay_time: f32,
+    pub decay_hf_ratio: f32,
+    pub decay_lf_ratio: f32,
+    pub reflections: i32,
+    pub reflections_delay: f32,
+    pub reflections_pan: [f32; 3],
+    pub reverb: i32,
+    pub reverb_delay: f32,
+    pub reverb_pan: [f32; 3],
+    pub echo_time: f32,
+    pub echo_depth: f32,
+    pub modulation_time: f32,
+    pub modulation_depth: f32,
+    pub air_absorption_hf: f32,
+    pub hf_reference: f32,
+    pub lf_reference: f32,
+    pub room_rolloff_factor: f32,
+    pub diffusion: f32,
+    pub density: f32,
+    pub flags: u32,
+}
+
+impl ReverbProperties {
+    /// No reverb (FMOD's `FMOD_PRESET_OFF`, as DAOrigins.exe 0x5c2440 builds it for an
+    /// empty preset name).
+    pub const OFF: ReverbProperties = ReverbProperties {
+        instance: 0,
+        environment: -1,
+        env_size: 7.5,
+        env_diffusion: 1.0,
+        room: -10000,
+        room_hf: -10000,
+        room_lf: 0,
+        decay_time: 1.0,
+        decay_hf_ratio: 1.0,
+        decay_lf_ratio: 1.0,
+        reflections: -2602,
+        reflections_delay: 0.007,
+        reflections_pan: [0.0; 3],
+        reverb: 200,
+        reverb_delay: 0.011,
+        reverb_pan: [0.0; 3],
+        echo_time: 0.25,
+        echo_depth: 0.0,
+        modulation_time: 0.25,
+        modulation_depth: 0.0,
+        air_absorption_hf: -5.0,
+        hf_reference: 5000.0,
+        lf_reference: 250.0,
+        room_rolloff_factor: 0.0,
+        diffusion: 0.0,
+        density: 0.0,
+        flags: 0x33f,
+    };
+
+    /// FMOD's `FMOD_PRESET_GENERIC`, which DAOrigins.exe (0x5c252b) uses for the preset
+    /// name `force_generic`.
+    pub const GENERIC: ReverbProperties = ReverbProperties {
+        environment: 0,
+        room: -1000,
+        room_hf: -100,
+        decay_time: 1.49,
+        decay_hf_ratio: 0.83,
+        diffusion: 100.0,
+        density: 100.0,
+        flags: 0x3f,
+        ..ReverbProperties::OFF
+    };
+}
+
+impl ReverbDef {
+    /// The properties, in the order `fmod_event.dll` reads them (0x10026f80..0x100272ef):
+    /// room, room HF, room rolloff, decay time, decay HF ratio, reflections and delay,
+    /// reverb and delay, diffusion, density, HF reference, room LF, LF reference, instance,
+    /// environment, environment size and diffusion, room LF again, decay LF ratio, the
+    /// reflections and reverb pans, echo time and depth, modulation time and depth, air
+    /// absorption, LF reference again, flags. `None` if the definition is short.
+    pub fn properties(&self) -> Option<ReverbProperties> {
+        let w = |i: usize| self.raw.get(i).copied();
+        let i = |n: usize| w(n).map(|v| v as i32);
+        let f = |n: usize| w(n).map(f32::from_bits);
+        Some(ReverbProperties {
+            room: i(0)?,
+            room_hf: i(1)?,
+            room_rolloff_factor: f(2)?,
+            decay_time: f(3)?,
+            decay_hf_ratio: f(4)?,
+            reflections: i(5)?,
+            reflections_delay: f(6)?,
+            reverb: i(7)?,
+            reverb_delay: f(8)?,
+            diffusion: f(9)?,
+            density: f(10)?,
+            hf_reference: f(11)?,
+            instance: i(14)?,
+            environment: i(15)?,
+            env_size: f(16)?,
+            env_diffusion: f(17)?,
+            room_lf: i(18)?,
+            decay_lf_ratio: f(19)?,
+            reflections_pan: [f(20)?, f(21)?, f(22)?],
+            reverb_pan: [f(23)?, f(24)?, f(25)?],
+            echo_time: f(26)?,
+            echo_depth: f(27)?,
+            modulation_time: f(28)?,
+            modulation_depth: f(29)?,
+            air_absorption_hf: f(30)?,
+            lf_reference: f(31)?,
+            flags: w(32)?,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
