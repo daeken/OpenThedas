@@ -520,6 +520,24 @@ fn color_curve(vfs: &Vfs) -> Vec<u8> {
     decoded.unwrap_or_else(crate::post::identity_curve)
 }
 
+/// The textures `da_fade` reads, `FadeSaturateMask` and `FadeEffectMask` (the materials'
+/// defaults for its passes' `s2` and `s1`), or `None` when either does not load.
+fn fade_masks(vfs: &Vfs) -> Option<crate::post::FadeMasks> {
+    let load = |name: &str| {
+        let (d, _) = vfs.read(name).ok()?;
+        let dds = thedas_formats::dds::Dds::parse(&d).ok()?;
+        Some(crate::post::Image {
+            width: dds.width,
+            height: dds.height,
+            rgba: dds.decode_rgba8(0, 0).ok()?,
+        })
+    };
+    Some(crate::post::FadeMasks {
+        saturate: load("fadesaturatemask.dds")?,
+        effect: load("fadeeffectmask.dds")?,
+    })
+}
+
 impl AreaRenderer {
     pub fn new(
         ctx: &GpuContext,
@@ -910,6 +928,9 @@ impl AreaRenderer {
                         scene.detail,
                         color_format,
                         &color_curve(vfs),
+                        crate::post::Fade::from_effects(&scene.effects)
+                            .and_then(|_| fade_masks(vfs))
+                            .as_ref(),
                     )
                 })
                 .flatten(),
@@ -1296,7 +1317,15 @@ impl AreaRenderer {
             return;
         }
         if let Some(e) = self.effects.as_mut() {
-            e.apply(&ctx.device, &ctx.queue, encoder, target, width, height);
+            e.apply(
+                &ctx.device,
+                &ctx.queue,
+                encoder,
+                target,
+                width,
+                height,
+                self.time as f32,
+            );
         }
     }
 

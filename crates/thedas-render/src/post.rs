@@ -3,10 +3,18 @@
 //!
 //! A level's layout lists its effects ([`thedas_formats::level::FrameEffect`]); each names a
 //! `.ffx.xml` effect and gives values for its exposed parameters. `da_bloom` (on all but five
-//! of the 216 layouts) and `da_hsvmatrix` (204 layouts, identity on all but about sixteen)
-//! are drawn here, in their layers' order (bloom's 10, then the matrix's 20; each reads the
-//! frame the one before left, as their `Finish` copies keep it). `da_fade` and `da_dof` are on
-//! fourteen layouts between them and not drawn.
+//! of the 216 layouts), `da_hsvmatrix` (204 layouts, identity on all but about sixteen) and
+//! `da_fade` (the Fade's layouts) are drawn here; `da_dof` is not.
+//!
+//! Order: the effects run by their `.ffx.xml` `layer` (`da_dof` 5, `da_bloom` 10, `da_fade`
+//! 10, `da_hsvmatrix` 20), effects of one layer in the order the layout lists them (see
+//! [`order`]). Each reads the frame the one before left, as their `Finish` copies keep it
+//! (`copy BACKBUFFER to BackBufferCopy`); here each effect takes that copy as it starts,
+//! which is the same frame. So on `oth000d`, which lists bloom, hsvmatrix, fade: bloom,
+//! then fade, then the matrix. Provisional: the order within a layer (a stable sort on the
+//! layer, keeping the list's order) is the one the effects' data implies, not traced in
+//! the executable's effect manager; no layout seen puts bloom after fade, so the tie only
+//! ever orders bloom before fade.
 //!
 //! `da_hsvmatrix` (`hslmatrix.mat.xml`) runs `HSLMatrix.vsh`/`HSLMatrix.psh` over the frame:
 //! the vertex shader turns the effect's Hue, Saturation, Brightness and Contrast into three
@@ -34,6 +42,18 @@
 //! linear filtering (`BloomBlend.sta`). Every pass maps target pixel `(i, j)` to texture
 //! coordinate `(i, j) / target size`, as D3D9 does a full-screen quad with no half-texel
 //! correction. All in the frame's stored (gamma) values, as D3D9 had them.
+//!
+//! `da_fade` (`da_fade.ffx.xml`, layer 10, `minlod` 1; `gaussianblur.mat.xml`) runs two
+//! filters over the frame, each mirrored from its shader (see [`Fade`]):
+//!
+//! 1. "Radial Blur" (semantic `RadialBlur`: `RadialBlur.vsh`/`RadialBlur.psh`,
+//!    `GaussianBlur.sta`): seven taps of the frame copy along the line to the screen's
+//!    centre, weighted 0.3 (the pixel's own), 0.25, 0.15, 0.12, 0.08, 0.06, 0.04, then mixed
+//!    towards their luminance `(0.3, 0.59, 0.11)` by one minus `FadeSaturateMask`'s alpha.
+//! 2. "Distortion" (semantic `FadeDistortion`: `PassThrough.vsh`/`FadeDistortion.psh`,
+//!    `FadeDistortionBlend.sta`, no blending), over a fresh copy: the average of the pixel
+//!    and the pixel at an offset waving with `ApplicationTime`, the offset scaled by one
+//!    minus `FadeEffectMask`'s alpha.
 //!
 //! No gamma pass follows: DAOrigins.exe applies its Gamma option only as the device's gamma
 //! ramp (0x53ab10 → `SetGammaRamp` at 0x869c30), `clamp((x^(1/g) − 0.5) · tan(π/4) + 0.5)`
@@ -156,6 +176,197 @@ impl HsvMatrix {
         ]
     }
 }
+
+/// `da_fade`'s parameters, as the level gives them (or `da_fade.ffx.xml`'s default:
+/// BlurStrength −3.5; the Fade's layouts give 5).
+///
+/// The radial blur (`RadialBlur.vsh`) takes `fBlurSize = BlurStrength` and steps
+/// `o = d · BlurStrength / (back buffer width, height)` in texture coordinates, its taps at
+/// `uv − k·o` for `k` 0 to 6, where `d` is `normalize(uv − 0.5)` *at the full-screen quad's
+/// corners*: the vertex shader works it there and the pixels get it interpolated, so across
+/// the screen `d = √2 · (uv − 0.5)` — no step at the centre, the longest at the corners (a
+/// zoom blur), towards the centre for a positive strength. The mask is read at `uv`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fade {
+    pub blur_strength: f32,
+}
+
+impl Fade {
+    /// The level's `da_fade`, when it lists one.
+    pub fn from_effects(effects: &[FrameEffect]) -> Option<Fade> {
+        let e = effects
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case("da_fade"))?;
+        Some(Fade {
+            blur_strength: e
+                .parameter("BlurStrength")
+                .filter(|v| v.is_finite())
+                .unwrap_or(-3.5),
+        })
+    }
+
+    /// Whether `da_fade` runs at `detail`: its `minlod` is 1, the others' 0. Provisional:
+    /// `minlod` read as the Graphics Detail option counted from Low (0), not traced in the
+    /// executable.
+    pub fn runs_at(detail: crate::scene::Detail) -> bool {
+        detail != crate::scene::Detail::Low
+    }
+}
+
+/// One of the effects drawn here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Effect {
+    Bloom,
+    Fade,
+    HsvMatrix,
+}
+
+impl Effect {
+    /// The effect `name` (a `.ffx.xml` id) names, when it is drawn here.
+    pub fn named(name: &str) -> Option<Effect> {
+        [
+            ("da_bloom", Effect::Bloom),
+            ("da_fade", Effect::Fade),
+            ("da_hsvmatrix", Effect::HsvMatrix),
+        ]
+        .into_iter()
+        .find(|(n, _)| name.eq_ignore_ascii_case(n))
+        .map(|(_, e)| e)
+    }
+
+    /// The `layer` its `.ffx.xml` gives.
+    pub fn layer(self) -> u32 {
+        match self {
+            Effect::Bloom | Effect::Fade => 10,
+            Effect::HsvMatrix => 20,
+        }
+    }
+}
+
+/// The effects `effects` lists that are drawn here, in the order they run: by layer, then
+/// in the list's order (see the module docs); each once, where it is first listed.
+pub fn order(effects: &[FrameEffect]) -> Vec<Effect> {
+    let mut out: Vec<Effect> = Vec::new();
+    for e in effects.iter().filter_map(|e| Effect::named(&e.name)) {
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    out.sort_by_key(|e| e.layer());
+    out
+}
+
+/// An RGBA8 image: a mask texture the effects read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Image {
+    pub width: u32,
+    pub height: u32,
+    /// `width · height` RGBA texels, rows top down.
+    pub rgba: Vec<u8>,
+}
+
+impl Image {
+    /// A 1×1 white image, for a mask that does not load. Provisional: the material's
+    /// fallback is `Default_Missing`, not reproduced; an opaque mask leaves the frame as it
+    /// is but for the radial blur.
+    pub fn white() -> Image {
+        Image {
+            width: 1,
+            height: 1,
+            rgba: vec![255; 4],
+        }
+    }
+}
+
+/// The textures `da_fade` reads: `FadeSaturateMask` (the radial blur's `s2`) and
+/// `FadeEffectMask` (the distortion's `s1`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FadeMasks {
+    pub saturate: Image,
+    pub effect: Image,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct FadeParams {
+    /// The back buffer's size (`fWindowWidth`, `fWindowHeight`), which is the frame's.
+    window: [f32; 2],
+    /// `fBlurSize`.
+    blur: f32,
+    /// `g_fApplicationTime`, in seconds.
+    time: f32,
+}
+
+const FADE_SHADER: &str = r#"
+struct FadeParams {
+    window: vec2<f32>,
+    blur: f32,
+    time: f32,
+};
+
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var mask: texture_2d<f32>;
+@group(0) @binding(2) var smp: sampler;
+@group(0) @binding(3) var<uniform> p: FadeParams;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let t = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(t * 2.0 - 1.0, 0.0, 1.0);
+}
+
+// D3D9 samples a full-screen quad's pixel (i, j) at texture coordinate (i, j) / size.
+fn d3d_uv(pos: vec4<f32>) -> vec2<f32> {
+    return (pos.xy - vec2<f32>(0.5)) / p.window;
+}
+
+// The frame copy, linearly filtered and clamped (GaussianBlur.sta, FadeDistortionBlend.sta
+// stage 0).
+fn frame(uv: vec2<f32>) -> vec3<f32> {
+    return textureSample(src, smp, uv).rgb;
+}
+
+// RadialBlur.vsh + RadialBlur.psh. The vertex shader's normalize(uv - 0.5) is taken at the
+// quad's corners, where it is (±1, ±1) / √2, and interpolated: √2 (uv - 0.5) here. Stage 2
+// (the mask) has no state in GaussianBlur.sta: D3D9's defaults, point filtered and wrapped.
+@fragment
+fn radial(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let uv = d3d_uv(pos);
+    let d = (uv - vec2<f32>(0.5)) * 1.4142135;
+    let o = d * p.blur / p.window;
+    var rgb = frame(uv - o) * 0.25;
+    rgb += frame(uv) * 0.3;
+    rgb += frame(uv - 2.0 * o) * 0.15;
+    rgb += frame(uv - 3.0 * o) * 0.12;
+    rgb += frame(uv - 4.0 * o) * 0.08;
+    rgb += frame(uv - 5.0 * o) * 0.06;
+    rgb += frame(uv - 6.0 * o) * 0.04;
+    let lum = dot(rgb, vec3<f32>(0.3, 0.59, 0.11));
+    let size = vec2<i32>(textureDimensions(mask));
+    let t = vec2<i32>(floor(uv * vec2<f32>(size) + vec2<f32>(1e-3)));
+    let m = textureLoad(mask, ((t % size) + size) % size, 0).a;
+    return vec4<f32>(mix(vec3<f32>(lum), rgb, m), 1.0);
+}
+
+// FadeDistortion.psh's angle reduction: frc, then to [-π, π).
+fn wrap(v: f32) -> f32 {
+    return fract(v) * 6.28319 - 3.14159;
+}
+
+// PassThrough.vsh + FadeDistortion.psh (sincos's .x is the cosine, .y the sine).
+@fragment
+fn distort(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let uv = d3d_uv(pos);
+    let k = 1.0 - textureSample(mask, smp, uv).a;
+    let fy = fract(p.time * 0.042 + uv.y);
+    let fx = fract(p.time * 0.048 + uv.x);
+    let off = vec2<f32>(
+        cos(wrap(fy * 0.999811 + 0.5)) * 0.003 + sin(wrap(fy * 39.9925 + 0.5)) * 0.002,
+        cos(wrap(fx * 31.994 + 0.5)) * 0.002 + sin(wrap(fx * 0.999811 + 0.5)) * 0.003,
+    ) * k;
+    return vec4<f32>(0.5 * frame(uv) + 0.5 * frame(uv + off), 1.0);
+}
+"#;
 
 /// An identity colour curve, for an install without `da_defaultcc`: 256 RGBA texels.
 /// Provisional (the engine would bind no texture).
@@ -314,11 +525,28 @@ struct HsvPass {
     group: Option<((u32, u32), wgpu::BindGroup)>,
 }
 
+/// `da_fade`'s GPU state: its two pipelines, layout, uniforms and masks.
+struct FadePass {
+    fade: Fade,
+    layout: wgpu::BindGroupLayout,
+    radial: wgpu::RenderPipeline,
+    distort: wgpu::RenderPipeline,
+    params: wgpu::Buffer,
+    saturate: wgpu::TextureView,
+    effect: wgpu::TextureView,
+    /// Read the frame copy: the radial blur's, then the distortion's; rebuilt with the
+    /// targets.
+    groups: Option<((u32, u32), [wgpu::BindGroup; 2])>,
+}
+
 /// The frame buffer effects of one level, drawn over frames of `color_format`.
 pub struct FrameEffects {
     /// `da_bloom`'s parameters; with no bloom the bloom passes are skipped.
     pub bloom: Option<Bloom>,
     hsv: Option<HsvPass>,
+    fade: Option<FadePass>,
+    /// The effects drawn, in the order they run.
+    order: Vec<Effect>,
     /// Taps each side of the blur's centre: three (`TwoPassBlurBloom7`) above Low detail, two
     /// (`TwoPassBlurBloom5`) at Low, as `gaussianblur.mat.xml`'s logic tests choose.
     pub blur_taps: u32,
@@ -337,7 +565,8 @@ pub struct FrameEffects {
 impl FrameEffects {
     /// The effects `effects` lists that are drawn here, or `None` when there are none.
     /// `curve` is the colour curve `da_hsvmatrix` reads: RGBA texels of its first row
-    /// (`da_defaultcc`, or [`identity_curve`]).
+    /// (`da_defaultcc`, or [`identity_curve`]). `fade_masks` are the textures `da_fade`
+    /// reads (white when not given).
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -345,12 +574,18 @@ impl FrameEffects {
         detail: crate::scene::Detail,
         color_format: wgpu::TextureFormat,
         curve: &[u8],
+        fade_masks: Option<&FadeMasks>,
     ) -> Option<Self> {
-        let bloom = Bloom::from_effects(effects);
-        let matrix = HsvMatrix::from_effects(effects);
-        if bloom.is_none() && matrix.is_none() {
+        let mut order = order(effects);
+        if !Fade::runs_at(detail) {
+            order.retain(|e| *e != Effect::Fade);
+        }
+        if order.is_empty() {
             return None;
         }
+        let bloom = Bloom::from_effects(effects);
+        let matrix = HsvMatrix::from_effects(effects);
+        let fade = Fade::from_effects(effects).filter(|_| order.contains(&Effect::Fade));
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("frame effects"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -453,9 +688,18 @@ impl FrameEffects {
             })
         });
         let hsv = matrix.map(|m| hsv_pass(device, queue, m, color_format, curve));
+        let fade = fade.map(|f| {
+            let white = FadeMasks {
+                saturate: Image::white(),
+                effect: Image::white(),
+            };
+            fade_pass(device, queue, f, color_format, fade_masks.unwrap_or(&white))
+        });
         Some(FrameEffects {
             bloom,
             hsv,
+            fade,
+            order,
             blur_taps: if detail == crate::scene::Detail::Low {
                 2
             } else {
@@ -542,7 +786,9 @@ impl FrameEffects {
     }
 
     /// Records the effects over `target` (a frame of this effect set's colour format, with
-    /// `COPY_SRC` usage) of the given size.
+    /// `COPY_SRC` usage) of the given size, in their order (see [`order`]). `time` is the
+    /// shaders' clock (`ApplicationTime`), in seconds.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &mut self,
         device: &wgpu::Device,
@@ -551,16 +797,100 @@ impl FrameEffects {
         target: &wgpu::Texture,
         width: u32,
         height: u32,
+        time: f32,
     ) {
         if width < 2 || height < 2 {
             return;
         }
         self.make_targets(device, width, height);
-        if let Some(b) = self.bloom {
-            self.apply_bloom(queue, encoder, target, b, width, height);
+        for e in self.order.clone() {
+            match e {
+                Effect::Bloom => {
+                    if let Some(b) = self.bloom {
+                        self.apply_bloom(queue, encoder, target, b, width, height);
+                    }
+                }
+                Effect::HsvMatrix => self.apply_hsv(device, queue, encoder, target, width, height),
+                Effect::Fade => {
+                    self.apply_fade(device, queue, encoder, target, width, height, time)
+                }
+            }
         }
-        if self.hsv.is_some() {
-            self.apply_hsv(device, queue, encoder, target, width, height);
+    }
+
+    /// `da_fade` over the frame as the effects before it left it: the radial blur, a fresh
+    /// copy (`CopyBackBuffer`), the distortion.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_fade(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+        width: u32,
+        height: u32,
+        time: f32,
+    ) {
+        let Some(f) = self.fade.as_mut() else { return };
+        let t = self.targets.as_ref().expect("targets made");
+        let p = FadeParams {
+            window: [width as f32, height as f32],
+            blur: f.fade.blur_strength,
+            time,
+        };
+        queue.write_buffer(&f.params, 0, bytemuck::bytes_of(&p));
+        if f.groups.as_ref().map(|(s, _)| *s) != Some(t.size) {
+            let copy = t.copy.create_view(&wgpu::TextureViewDescriptor::default());
+            let group = |mask: &wgpu::TextureView| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("fade"),
+                    layout: &f.layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&copy),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(mask),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&self.linear),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: f.params.as_entire_binding(),
+                        },
+                    ],
+                })
+            };
+            f.groups = Some((t.size, [group(&f.saturate), group(&f.effect)]));
+        }
+        let frame = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let Some(f) = self.fade.as_ref() else { return };
+        let groups = &f.groups.as_ref().expect("groups just made").1;
+        for (pipeline, group) in [(&f.radial, &groups[0]), (&f.distort, &groups[1])] {
+            self.copy_frame(encoder, target);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("fade"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &frame,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, group, &[]);
+            pass.draw(0..3, 0..1);
         }
     }
 
@@ -842,6 +1172,144 @@ fn hsv_pass(
     }
 }
 
+/// Uploads `image` as an RGBA8 texture (a white texel when it is empty or short).
+fn mask_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    image: &Image,
+    label: &str,
+) -> wgpu::TextureView {
+    let fallback;
+    let len = image.width as usize * image.height as usize * 4;
+    let image = if image.width > 0 && image.height > 0 && image.rgba.len() >= len {
+        image
+    } else {
+        fallback = Image::white();
+        &fallback
+    };
+    let size = wgpu::Extent3d {
+        width: image.width,
+        height: image.height,
+        depth_or_array_layers: 1,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        texture.as_image_copy(),
+        &image.rgba[..image.width as usize * image.height as usize * 4],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(image.width * 4),
+            rows_per_image: Some(image.height),
+        },
+        size,
+    );
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Builds `da_fade`'s pipelines over frames of `color_format`, reading `masks`.
+fn fade_pass(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    fade: Fade,
+    color_format: wgpu::TextureFormat,
+    masks: &FadeMasks,
+) -> FadePass {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("fade"),
+        source: wgpu::ShaderSource::Wgsl(FADE_SHADER.into()),
+    });
+    let tex = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("fade"),
+        entries: &[
+            tex(0),
+            tex(1),
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("fade"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = |entry: &str| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(entry),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    let params = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("fade"),
+        size: std::mem::size_of::<FadeParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    FadePass {
+        fade,
+        radial: pipeline("radial"),
+        distort: pipeline("distort"),
+        layout,
+        params,
+        saturate: mask_texture(device, queue, &masks.saturate, "fade saturate mask"),
+        effect: mask_texture(device, queue, &masks.effect, "fade effect mask"),
+        groups: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,6 +1323,60 @@ mod tests {
         )
         .validate(&module)
         .expect("validates");
+    }
+
+    #[test]
+    fn fade_shader_validates() {
+        let module = naga::front::wgsl::parse_str(FADE_SHADER).expect("parses");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("validates");
+    }
+
+    fn effect(name: &str, parameters: &[(&str, f32)]) -> FrameEffect {
+        FrameEffect {
+            name: name.into(),
+            parameters: parameters
+                .iter()
+                .map(|(n, v)| (n.to_string(), *v))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn fade_takes_the_levels_strength() {
+        let f = Fade::from_effects(&[effect("DA_Fade", &[("BlurStrength", 5.0)])]).unwrap();
+        assert_eq!(f.blur_strength, 5.0);
+        let f = Fade::from_effects(&[effect("da_fade", &[("BlurStrength", f32::NAN)])]).unwrap();
+        assert_eq!(f.blur_strength, -3.5);
+        assert_eq!(Fade::from_effects(&[effect("da_bloom", &[])]), None);
+        assert!(!Fade::runs_at(crate::scene::Detail::Low));
+        assert!(Fade::runs_at(crate::scene::Detail::Medium));
+    }
+
+    #[test]
+    fn effects_run_by_layer_then_list_order() {
+        let list =
+            |names: &[&str]| -> Vec<FrameEffect> { names.iter().map(|n| effect(n, &[])).collect() };
+        // oth000d's list: bloom and fade share layer 10, the matrix is 20.
+        assert_eq!(
+            order(&list(&["da_bloom", "da_hsvmatrix", "da_fade"])),
+            [Effect::Bloom, Effect::Fade, Effect::HsvMatrix]
+        );
+        assert_eq!(
+            order(&list(&[
+                "da_hsvmatrix",
+                "da_fade",
+                "da_dof",
+                "da_bloom",
+                "da_fade"
+            ])),
+            [Effect::Fade, Effect::Bloom, Effect::HsvMatrix]
+        );
+        assert_eq!(order(&list(&["da_dof"])), []);
     }
 
     #[test]
