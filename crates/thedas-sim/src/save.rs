@@ -29,7 +29,9 @@ pub const SAVE_FORMAT: u32 = 1;
 /// - 4: the module hears followers join and leave the party (`EVENT_TYPE_PARTYMEMBER_ADDED`
 ///   / `_DROPPED`), on which module_core keeps the party plot's `GEN_<name>_IN_PARTY` flags.
 ///   Loading an earlier save tells it of the party as it stands.
-pub const SAVE_REVISION: u32 = 4;
+/// - 5: creatures placed dead (`CREATURE_SPAWN_DEAD`, see [`Sim::spawns_dead`]) are dead from
+///   their creation; earlier saves hold them alive, and loading one lays them out.
+pub const SAVE_REVISION: u32 = 5;
 
 /// The trace channel loading reports save damage on.
 pub const SAVE_CHANNEL: i32 = -7;
@@ -248,6 +250,12 @@ impl Sim {
                 self.party_membership_changed(m, true);
             }
         }
+        if save_revision < 5 {
+            let ids: Vec<ObjectId> = self.world.objects.values().map(|o| o.id).collect();
+            for id in ids {
+                self.lay_out_if_spawned_dead(id);
+            }
+        }
         self.save_issues = if save_revision < 3 {
             self.check_property_damage()
         } else {
@@ -420,6 +428,32 @@ mod tests {
         let mut u = mk();
         u.load_game(s.save_game()).unwrap();
         assert!(u.world.queue.values().all(|q| q.target != module));
+    }
+
+    #[test]
+    fn older_saves_lay_out_creatures_placed_dead() {
+        let mut s = sim();
+        let corpse = s.world.spawn(ObjectKind::Creature, "genlock_mace");
+        let alive = s.world.spawn(ObjectKind::Creature, "genlock_mace");
+        for (id, v) in [(corpse, 1), (alive, 0)] {
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .locals
+                .ints
+                .insert("CREATURE_SPAWN_DEAD".into(), v);
+        }
+        let mut save = s.save_game();
+        save.revision = 4;
+        let data = serde_json::to_vec(&save).unwrap();
+        let mut t = sim();
+        t.load_json(&data).unwrap();
+        assert!(t.world.get(corpse).unwrap().dead);
+        assert!(!t.world.get(alive).unwrap().dead);
+        // A save from this build is taken as it is.
+        let mut u = sim();
+        u.load_json(&s.save_json().unwrap()).unwrap();
+        assert!(!u.world.get(corpse).unwrap().dead);
     }
 
     #[test]

@@ -795,6 +795,44 @@ impl Sim {
             .collect()
     }
 
+    /// Whether creature `id` is a corpse from its creation: designers place one with the
+    /// local `CREATURE_SPAWN_DEAD` at 1, creature_core's `SPAWN` handler then leaves it
+    /// uninitialised (it only sets its gore), and it has no health.
+    ///
+    /// In DAOrigins.exe a creature is dead when its health is 0 or less (`IsDead`, 0x65a3a0
+    /// -> 0x695300, through the creature's current-health getter 0x6ab4b0), and a creature
+    /// without health counts 0 (0x6ab4b0 returns 0.0 when it has no stats or no property 7).
+    /// The engine treats these creatures as corpses: its corpse predicate (0x6a3ad0, reading
+    /// the local at 0x6a3b47) and a nearby-creature query (0x73f1cd) single them out, and
+    /// its health-change handler (0x6bc4b0) clears the local only when health rises from 0
+    /// or less to above 0 (0x6bc5fb-0x6bc631), that is when one is brought back.
+    ///
+    /// Provisional: the simulation has no property table for creatures the scripts never
+    /// set up, so it cannot derive death from missing health in general (non-combatants
+    /// have none either, and stay alive here); the local stands in for it for the creatures
+    /// placed dead.
+    pub fn spawns_dead(&self, id: ObjectId) -> bool {
+        let health = constant_of(self, "PROPERTY_DEPLETABLE_HEALTH");
+        self.world.get(id).is_some_and(|o| {
+            o.kind == ObjectKind::Creature
+                && o.locals.ints.get("CREATURE_SPAWN_DEAD") == Some(&1)
+                && o.properties
+                    .get(&health)
+                    .is_none_or(|&(_, current)| current <= 0.0)
+        })
+    }
+
+    /// Lays a creature that [`Sim::spawns_dead`] down dead, without a death: no event and no
+    /// time of death (it shows the end of its death animation).
+    pub fn lay_out_if_spawned_dead(&mut self, id: ObjectId) {
+        if self.spawns_dead(id)
+            && let Some(o) = self.world.get_mut(id)
+        {
+            o.dead = true;
+            o.died_at = None;
+        }
+    }
+
     /// Kills a creature whose health ran out.
     pub fn check_death(&mut self, id: ObjectId, killer: ObjectId) {
         let health = constant_of(self, "PROPERTY_DEPLETABLE_HEALTH");
@@ -1545,6 +1583,52 @@ mod tests {
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         Sim::new(Arc::new(Vfs::new()), table, 3)
+    }
+
+    #[test]
+    fn creatures_placed_dead_lie_dead_without_dying() {
+        let mut s = sim();
+        let put = |s: &mut Sim, spawn_dead: Option<i32>, health: Option<f32>| {
+            let id = s.world.spawn(ObjectKind::Creature, "genlock");
+            let o = s.world.get_mut(id).unwrap();
+            if let Some(v) = spawn_dead {
+                o.locals.ints.insert("CREATURE_SPAWN_DEAD".into(), v);
+            }
+            if let Some(h) = health {
+                o.properties.insert(7, (100.0, h));
+            }
+            s.lay_out_if_spawned_dead(id);
+            s.world.get(id).unwrap().dead
+        };
+        // Placed dead, never given health: a corpse (the original's health is 0).
+        assert!(put(&mut s, Some(1), None));
+        assert!(put(&mut s, Some(1), Some(0.0)));
+        // Healthy, or not placed dead: alive. Neither are those without the local and
+        // without health (non-combatants), which the simulation keeps alive.
+        assert!(!put(&mut s, Some(1), Some(50.0)));
+        assert!(!put(&mut s, Some(0), None));
+        assert!(!put(&mut s, None, None));
+        // Laying one out is no death: no event, no time of death.
+        assert!(s.world.queue.is_empty());
+        let id = s.world.spawn(ObjectKind::Creature, "genlock");
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .locals
+            .ints
+            .insert("CREATURE_SPAWN_DEAD".into(), 1);
+        s.lay_out_if_spawned_dead(id);
+        assert_eq!(s.world.get(id).unwrap().died_at, None);
+        // Placeables with the local are not creatures.
+        let p = s.world.spawn(ObjectKind::Placeable, "crate");
+        s.world
+            .get_mut(p)
+            .unwrap()
+            .locals
+            .ints
+            .insert("CREATURE_SPAWN_DEAD".into(), 1);
+        s.lay_out_if_spawned_dead(p);
+        assert!(!s.world.get(p).unwrap().dead);
     }
 
     #[test]

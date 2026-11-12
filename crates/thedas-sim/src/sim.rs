@@ -2315,6 +2315,7 @@ impl Sim {
     }
 
     fn created(&mut self, id: ObjectId) {
+        self.lay_out_if_spawned_dead(id);
         if let Some(o) = self.world.get(id) {
             let e = TraceEntry::ObjectCreated {
                 t: self.world.time_ms,

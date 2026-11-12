@@ -1384,6 +1384,13 @@ pub fn call(
                 {
                     o.dead = false;
                     o.died_at = None;
+                    // One placed dead is no longer (DAOrigins.exe 0x6bc5fb-0x6bc631: health
+                    // rising above 0 sets a CREATURE_SPAWN_DEAD of 1 to 0).
+                    if let Some(v) = o.locals.ints.get_mut("CREATURE_SPAWN_DEAD")
+                        && *v == 1
+                    {
+                        *v = 0;
+                    }
                 }
             }
             if let Some(before) = health_before {
@@ -5420,6 +5427,7 @@ mod tests {
         o.dead = true;
         o.died_at = Some(10);
         o.properties.insert(7, (100.0, 0.0));
+        o.locals.ints.insert("CREATURE_SPAWN_DEAD".into(), 1);
         let set = |s: &mut Sim, v: f32, t: i32| {
             let a = [
                 Value::Object(hero),
@@ -5439,6 +5447,10 @@ mod tests {
         assert!(!o.dead);
         assert_eq!(o.died_at, None);
         assert_eq!(o.properties[&7], (120.0, 25.0));
+        assert_eq!(
+            o.locals.ints["CREATURE_SPAWN_DEAD"], 0,
+            "one placed dead is no longer"
+        );
     }
 
     #[test]
