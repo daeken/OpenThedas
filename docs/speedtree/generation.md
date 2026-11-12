@@ -861,8 +861,37 @@ Level k (k ≥ 1) is made from level k − 1:
   mean the floor is disabled, a missing Lod section means one level at 100%, and a frond LOD
   count of 0 means no fronds. Fuzzy sorts (3.7, 4.3, 5.4) are stable: ties keep list order.
   None of these occur in game files.
-- **F. Billboard bounds (7.5)** cover every branch tube and frond vertex of every LOD level
-  and every leaf position, not the cards' extents.
+- **F. The tree's bounding box** (used for the billboard, 7.5; the game's LOD radius, 7.4;
+  and self-shadow coordinates, 7.9) is corrected in 5.7 F.
+
+### 5.7 Clarifications (round 5)
+
+- **A. Leaf normals use `color_variance`.** 5.3 step 7 is right: the stored per-texture
+  `color_variance` is also the weight of the normal toward ν (the perturbed direction), as
+  the original computes it. `hang` then applies for mesh textures. (The original applies
+  `hang` only under its dynamic leaf lighting, which is what DA:O uses.)
+- **B. Leaf rock and rustle scalars** (7.2) are the file's `speedwind_rock_scalar` and
+  `speedwind_rustle_scalar` as stored, the same for every leaf LOD; 1.0 when absent.
+- **C. A missing frond profile curve** (4.5) takes the original's built-in default, not the
+  flat curve of 2.4 and not the empty curve: `min` 0, `max` 1, variance 0, three points
+  (x, y, tangent x, tangent y, length): (0, 0.00138887, 0.337009, 0.941501, 0.132767),
+  (0.493215, 0.998903, 1, 0.00102074, 0.23702), (1, −6.24607e−8, 0.307222, −0.951638,
+  0.126974). A rounded arch, highest in the middle.
+- **D. More undefined cases** (add to 5.6 D): a bud step of length / `segments` with
+  `segments` 0 at level L + 1 (5.2 step 1). Infinity is acceptable; no game file reaches it.
+- **E. Angle offsets are degrees in the table**; the game's vertex data carries them in
+  radians (× π/180). Renderers convert.
+- **F. The tree's bounding box** is the union of:
+  - the branch vertices referenced by **LOD level 0's** strips (3.6), and the same for
+    fronds (4.x level 0);
+  - for every leaf of **leaf LOD level 0** only (merged leaves of later levels do not count):
+    the six points Q ± d along x, y and z, where Q is the leaf's position and d its texture's
+    *longest reach*: for a mesh texture, max over the mesh's vertices of |p| · max(w, h); for a
+    card texture, the largest distance from the scaled pivot (ox·w, oy·h) to the card's four
+    corners (0, 0), (w, 0), (w, h), (0, h). Here w, h are the texture's card size of 7.2
+    without the LOD multiplier and (ox, oy) its `origin`, unmirrored.
+  This replaces 5.6 F. With a placement's scale, half its diagonal is the game's LOD radius
+  r (7.4).
 
 ## Stage 6 — Bushes, grass and cattails
 
@@ -1000,9 +1029,14 @@ The game ignores the file's `near` and `far` and computes its own per placement:
   `_bsh_` or `_gra_`, so they simply stop drawing beyond their far distance.
 - Other trees draw, beyond their last level, a camera-facing quad textured with their image
   from `<level>_diffuse_billboards.dds` (one image per tree in DA:O even when the file says
-  360° billboards). Its size comes from the computed tree's bounding box (5.6 F): the
-  horizontal extent is twice the largest horizontal distance from the origin to a corner of
-  the box (in x and y), the height the box's height.
+  360° billboards). Its size comes from the computed tree's bounding box (5.7 F): the
+  width is twice the largest horizontal distance from the origin to a corner of the box (in
+  x and y), the height is the box's **top** (its largest z, measured from the tree's origin,
+  not the box's own height).
+- Its corners are, in card space as in 7.2 (y right, z up, the quad standing on the
+  origin): corner 0 = (+½·width, height), 1 = (−½·width, height), 2 = (−½·width, 0),
+  3 = (+½·width, 0). The billboard image's four stored corners (format.md) pair with these in
+  order, the same convention as the leaf images and P1…P4.
 - The game batches all billboards of a level into one buffer, four vertices per placement,
   each with the placement position and corner index, the billboard's width and height and a
   per-frame fade alpha, the image's atlas entry and the placement's yaw, scale and colour.
@@ -1027,3 +1061,86 @@ The game ignores the file's `near` and `far` and computes its own per placement:
   the shapes are unchanged. The wind weights and matrix indices the computation assigns to
   vertices and leaves are not yet specified here.
 
+### 7.7 Wind weights and matrix indices (the computation)
+
+Every branch and frond vertex and every leaf carries two wind pairs, (weight 1, matrix index
+1) and (weight 2, matrix index 2). 7.6 and 7.2–7.3 say how the game uses them.
+
+- **Inputs.** The weighting level W = `wind_level` (1 when absent) and the propagate flag
+  = `propagate_flexibility` (false when absent).
+- **Groups (round robin).** A counter starts at the tree seed (the value 2.3 step 1 seeds
+  with). The trunk is grown with groups (g₁, g₂) = (tree seed, `flare_seed`) and weights
+  (w₁, w₂) = (1, 1). When a branch starts growing (2.4), right after its frond test (a pruned
+  branch takes nothing): if its level L equals W, g₁ ← counter and the counter goes up by
+  one; if L equals W + 1, g₂ ← counter and it goes up by one. The counter is shared by the
+  whole tree and only increases, in growth order. Roots go through the same rule at their
+  level.
+- **Weights per skeleton vertex.** For skeleton vertex i of the branch, with t its progress
+  (0 for the first vertex, else the segment-packed progress of 2.4) and f its vertex
+  flexibility (2.4: `flexibility` · `flexibility_scale` at t), start from the weights the
+  branch was grown with and set:
+  - L < W: w₁ = 1, w₂ = 1;
+  - L = W: w₁ = 1 − t·f, w₂ = 1;
+  - L = W + 1: w₂ = 1 − t·f (w₁ as received);
+  - L > W + 1 with the propagate flag: w₂ = lerp(w₂, 0, f) (from the received w₂, not the
+    previous vertex's);
+  - otherwise both as received.
+- **Inheritance.** A child branch or bud (2.5) receives the weights interpolated between the
+  parent's skeleton vertices j and j + 1 at s (2.5 step 6), and the parent's groups as
+  assigned above.
+- **Where they land.** Every tube vertex of a cross section takes its skeleton vertex's
+  values. Every frond vertex takes the values of the guide vertex it is built from (4.1
+  records them on the guide). A leaf takes its bud's values, its weights clamped to [0, 1];
+  a merged leaf of a later LOD level (5.4) copies leaf i's.
+- **Output.** weight = clamp(1 − w, 0, 1) (0 rigid, 1 free); matrix index = (g as an
+  unsigned byte, that is g mod 256) mod N, with N the number of wind matrices, 6 in DA:O
+  (7.1). Leaves from the file's own leaf LODs (stage 5) carry weight 1 as a byte /255 and
+  group 1 as stored; weight 2 and group 2 are 0.
+
+### 7.8 LOD value to levels and alphas (the computation)
+
+Given the LOD value ℓ of 7.4, the computation returns, for branches, fronds, two leaf slots
+and the billboard, a level (−1 = draw nothing) and an alpha-test value on a 0–255 scale.
+The game uses them as 7.4 describes.
+
+- **Constants.** Target T = 84; clear C = 255. Leaf transition method = `Lod::leaf_transition`
+  (0 pop, 1 smooth, 3 none; 2 is read as smooth with transition factor 0.5); radius ρ =
+  `leaf_transition_radius` (0.07 when absent); exponent e = `leaf_curve_exponent` (0.7);
+  transition factor φ = the file's `leaf_transition_factor` (0). With N_b, N_f, N_l the
+  branch, frond and leaf level counts: width τ = 2ρ; shortened width τ′ = τ·(1 − φ);
+  transitions k = N_l − 1; crest c = 1 if k = 0 else (1 − (k + 1)·τ)/k; cycle λ = c + τ.
+  (These are the billboard forms; DA:O always drops to billboards, 7.1.)
+- **Curve.** rise(a, b, p) = lerp(b, a, (1 − p)^e); fall(a, b, p) = lerp(a, b, p^e).
+- **Branches and fronds.**
+  - ℓ ≤ 0: levels −1, billboard alpha 1.
+  - ℓ ≥ 1: levels 0, alpha T.
+  - Otherwise: level = (int)((1 − ℓ)·N) for each; if ℓ < τ′: alpha = rise(C, T, ℓ/τ′) and
+    billboard alpha = min(1.5·(1 − ℓ/τ′), 1); else alpha = T (billboard alpha left at 0).
+- **Leaves** (slot 1 defaults to level −1, alpha C).
+  - ℓ ≤ 0: slot 0 level −1, alpha C.
+  - ℓ ≥ 1: slot 0 level 0, alpha T.
+  - Smooth, ℓ < τ′: slot 0 alpha = rise(C, T, ℓ/τ′), level −1 if that equals C exactly,
+    else N_l − 1.
+  - Smooth, otherwise: ℓ′ = ℓ − τ; u = ℓ′ mod λ (C-style floating remainder: it keeps the
+    sign of ℓ′, which can be negative when φ > 0); region =
+    max(N_l − (int)(ℓ′/λ) − 1, 0) (truncating toward zero); slot 0 level = region. If u < c: slot 0 alpha = T.
+    Otherwise p = (u − c)/τ; slot 1 alpha = fall(T, C, (p − φ)/(1 − φ)) if p > φ, else T;
+    slot 0 alpha = rise(C, T, p/(1 − φ)) if p < 1 − φ, else T; slot 0 level = region − 1,
+    slot 1 level = region.
+  - None: slot 0 level 0, alpha T. Pop: slot 0 level (int)((1 − ℓ)·N_l), alpha T.
+- **Fade hints** (3.7, 4.6) are not used here; they are for renderers that fade per vertex.
+  `billboard_transition` affects only 360° billboard images, which DA:O does not use.
+
+### 7.9 Self-shadow coordinates
+
+Only when the file has a shadow projection section (right, up and out vectors, and the
+self-shadow map). DA:O's shaders never sample this layer (7.6), so it can be left out.
+
+- From the bounding box (5.7 F): centre c, radius R = half its diagonal. With r the stored
+  right vector and u the stored up vector (not normalised for the end points): for each
+  branch and frond vertex v (all of them, in order), s = |(v − (c − r·R)) · r̂| / 2R and
+  t = |(v − (c − u·R)) · û| / 2R, with r̂, û the normalised vectors.
+- If the file has a texture-coordinate section, map through its `shadow` entry
+  (corners k[0..7]): s ← lerp(k[2], k[0], s), t ← lerp(k[5], k[1], t). A section without a
+  shadow entry uses k = (1, 1, 0, 1, 0, 0, 1, 0).
+- With texture flip on (7.1), t is negated, as for the other layers.
