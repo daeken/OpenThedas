@@ -1586,6 +1586,9 @@ impl Sim {
         self.world.transition_hint = self.world.load_hint.take();
         // A loot panel open on something in the area left behind closes.
         self.world.container = None;
+        // So do a store and a Chanter's Board (see the container above).
+        self.world.store = None;
+        self.world.chanter_board = None;
         let old = self.world.area;
         let party: Vec<ObjectId> = self
             .world

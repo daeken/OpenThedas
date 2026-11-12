@@ -317,6 +317,9 @@ impl Sim {
         // panel closed, and an open one from a scripted save would point at a container that
         // may be in another area. Provisional: the exe's save holds no open GUI.
         self.world.container = None;
+        // So do a store and a Chanter's Board (see the container above).
+        self.world.store = None;
+        self.world.chanter_board = None;
         // Saves made before the ability functions checked their ids may hold ones the exe
         // never would (0 from player_core's hire handler; see `Sim::ability_known`).
         let bad: Vec<(ObjectId, Vec<i32>)> = self
