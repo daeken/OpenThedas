@@ -291,7 +291,8 @@ To compare frame cost between builds, set `THEDAS_BENCH_FRAMES=n` on a headless 
 capture's final frame is then drawn `n` more times first, and the time of each draw, including
 its read back to memory, is printed as `bench: n frames, avg … ms, worst … ms`. Use the same
 save, steps and size on both builds; the read back makes the numbers an upper bound, so compare
-ratios, not absolutes. Unset, nothing changes.
+ratios, not absolutes. Unset, nothing changes. `THEDAS_BENCH_DUMP=1` also prints every frame's
+time in order, to tell a first-frame cost from a recurring one.
 
 ```sh
 THEDAS_BENCH_FRAMES=30 thedas-app --save wilds.json --size 1280x720 --capture x.png --steps "run 2000"
