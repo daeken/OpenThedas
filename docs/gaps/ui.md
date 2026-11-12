@@ -8,7 +8,7 @@ The original Scaleform interface on Ruffle, its binding to the simulation, mouse
 
 Written by the stream that works on this area. Entries marked traced were read from the original executable; trace notes live outside the repository with the test data.
 
-Kept current in place by the Input/UI thread. Last pass: 2026-11-12 16:10Z, main at #315.
+Kept current in place by the Input/UI thread. Last pass: 2026-11-12 16:30Z, main at #324.
 
 Sizes: S = under a day, M = a few days, L = a week or more.
 
@@ -43,9 +43,6 @@ How the list was built:
 | Item | Original | Ours | Evidence | Size | Depends on |
 |---|---|---|---|---|---|
 | Quickslots 11–20 key labels | `InputMappings…ActivateQuickslot11..20` (expanded bar). | Unanswered (keys 1–0 are fed from defaults, not keymap). | Unanswered list | S | — |
-| Party portraits: current and pending action icons | Icon of what each member is doing or about to do (`CurrentActionIcon`, `PendingActionIcon`). | Unanswered. | Unanswered list | S | Sim command queue (exists) |
-| Portrait level-up marker | `PortraitLevelUp` shows the "+" level-up badge. | Unanswered (the class-rank "+" may come from elsewhere). | Unanswered list | S | — |
-| Portrait tint | `PortraitProperties.PortraitTint` (dead or paralysed tint). | Unanswered. | Unanswered list | S | — |
 | Status effects | `GUI.SelectedChar.EffectList` shows buff and debuff icons on portraits and the record. | Unanswered: no effect icons. | Unanswered list | M | Sim effect list with icons and durations |
 | Party approval | `Party.Approval` (approval meter in record and party). | Unanswered. | Unanswered list | S | Sim approval values (exist as plot/props?) |
 | Hold position | H toggles hold; `Party.HoldPositions` shows it. | No key, value unanswered. | keymap.gda ToggleHoldParty | S | Sim: hold order |
@@ -64,7 +61,7 @@ How the list was built:
 | Inventory | Equipment/backpack fully works by mouse. | `Equipment.N.StackSize`, `CanChangeEquipment`, `CanSwitchWeaponSets` and `Party.BackpackSort` are unanswered. Backpack items' `AbilityInstance` (usable items) too. | Unanswered list | S | — |
 | Journal | Quest givers and destinations on the map (`Journal.PlotGivers`, `PlotDestinations`), offers (`PlotList.N.OfferId`), remembers the last codex entry. | Unanswered. `undefined.QuestCompleted` is a path bug on our side. | Unanswered list | S–M | Sim plot data |
 | Journal text for Dwarf/City Elf openings | — | Empty because the sim has no flag text yet. Correct as far as it goes. | Earlier QA | — | Sim |
-| Character record | Class name (`Stats.ClassName`), attributes current vs total for party slots. | ClassName unanswered on the party list. | Unanswered list | S | — |
+| Character record | Attributes current vs total for party slots. | Not checked since the class name was fed (#323). | Unanswered list | S | — |
 | Area map quest markers | Plot givers and destinations drawn on the map. | Only map notes (#2xx). | — | S | Journal item above |
 | Save thumbnails | Each save stores a screenshot shown in the list. | No thumbnail. | — | M | Render: offscreen capture into the save |
 | Options | Applies resolution, graphics, audio, gameplay settings and writes the settings file. | The screen works, but settings change nothing and nothing is saved, and Cancel is untraced (see `options.rs`). | options.rs doc | M | Render/audio hooks per setting |
@@ -149,7 +146,7 @@ voice previews, `LoadModule`, `QuitGame`. Anything else is logged once as not ha
 - **UI-011** **Designer tags only partly replaced.** Original: `ReplaceDesignerTags` (0x51d620, 0x51f110) replaces dialog tags, key tags and more (comment). Ours: dialog tags, key tags and `<FirstName/>` are replaced; gendered text and other tags are left as written. Evidence: `crates/thedas-ui/src/protocol.rs:51`. Size: M. Depends: none. Kind: missing.
 - **UI-012** **Key tag sources assumed.** Original: not traced. Ours: key tags use the first of `keymap.gda`'s binding columns and assume unswapped mouse buttons. Evidence: `crates/thedas-ui/src/keys.rs:12`. Size: S. Depends: UI-059. Kind: provisional.
 - **UI-013** **Engine value names and meanings inferred.** Original: not traced. Ours: key names come from the movies' bytecode and their meanings from how the movies use them. Evidence: `crates/thedas-ui/src/binding.rs:4`. Size: M. Depends: none. Kind: provisional.
-- **UI-014** **Creature status flags constant.** Original: not traced. Ours: `Poisoned`, `Paralyzed`, `AbilityUpkeepCost`, `CurrentAction` and `PendingAction` are 0 for every creature ("no combat or status simulation yet"), so portraits never show a status or a current action. Evidence: `crates/thedas-ui/src/binding.rs:286`. Size: M. Depends: none. Kind: missing.
+- **UI-014** **Creature status flags constant.** Original: not traced. Ours: `Poisoned`, `Paralyzed` and `AbilityUpkeepCost` are 0 for every creature ("no status simulation yet"), so portraits never show a status. (The current and pending actions are fed since #321.) Evidence: `crates/thedas-ui/src/binding.rs`, the `creature` closure in `sim_values`. Size: M. Depends: none. Kind: missing.
 - **UI-015** **Mana or stamina chosen by class.** Original: not traced. Ours: `Stats.ClassHasMana` is set for the mage class only. Evidence: `crates/thedas-ui/src/binding.rs:303`. Size: S. Depends: none. Kind: provisional.
 - **UI-016** **Character record property range assumed.** Original: not traced. Ours: properties 1 to 60 are bound for every creature as the record's rows. Evidence: `crates/thedas-ui/src/binding.rs:340`. Size: S. Depends: none. Kind: provisional.
 - **UI-017** **Summons never shown.** Original: not traced. Ours: `Party.Summons.0..3` are always null ("no summoning yet"). Evidence: `crates/thedas-ui/src/binding.rs:477`. Size: M. Depends: none. Kind: missing.
