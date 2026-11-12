@@ -1451,7 +1451,22 @@ impl UiLayer {
                     f |= MAP_PLAYER;
                 }
                 if hero.is_some_and(|h| sim.hostile(h, o.id)) {
+                    // A hostile shows once the party perceives it. Provisional: the
+                    // exe's own filter is not traced.
+                    let seen = party.iter().any(|&m| {
+                        sim.world
+                            .get(m)
+                            .is_some_and(|p| p.combat.perceived.contains(&o.id))
+                    });
+                    if !seen {
+                        continue;
+                    }
                     f |= MAP_HOSTILE;
+                } else if f & MAP_IN_PARTY == 0 {
+                    // Neither the party's nor an enemy: the legend has no mark for the
+                    // neutral townsfolk (they drew as a field of identical dots).
+                    // Provisional: allies (`FLAG_SHOW_AS_ALLY`) are not told apart yet.
+                    continue;
                 }
                 ids.push(num(o.id as f64));
                 let at = info.to_map(o.position[0], o.position[1]);

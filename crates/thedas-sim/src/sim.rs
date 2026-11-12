@@ -1979,7 +1979,10 @@ impl Sim {
                         && (c.name == "CommandAttack" || c.name == "CommandUseAbility")
                 })
             })
-            .then_some(self.world.time_ms + APPROACH_CHECK_MS)
+            // On a fixed grid of world time, so that ticks shorter than the period (the app's
+            // 30 fps steps of 33 ms) still reach a check: one counted from "now" would always
+            // fall past the end of a short tick, and walkers would never look again.
+            .then_some((self.world.time_ms / APPROACH_CHECK_MS + 1) * APPROACH_CHECK_MS)
     }
 
     /// Stops a walker whose target has come within reach (its attack or ability starts
@@ -2923,6 +2926,10 @@ impl Sim {
             }
         }
         read_text_fields(o, inst);
+        // A waypoint's map note text (a talk-table id), which the area map shows.
+        if let Some(s) = strref(inst, "MapNote") {
+            o.fields.insert("MapNote".into(), s as i32);
+        }
         read_vars(are, inst, &mut o.locals);
         if kind == ObjectKind::Trigger {
             for &p in list_of(inst, "Geometry") {
@@ -4475,6 +4482,35 @@ mod tests {
         assert!(o.position[0] < 10.0, "{:?}", o.position);
         assert_eq!(
             o.commands.first().map(|c| (c.name.as_str(), c.approach)),
+            Some(("CommandAttack", None)),
+            "the swing is under way"
+        );
+    }
+
+    #[test]
+    fn walkers_closing_in_look_again_in_short_ticks() {
+        // The same meeting as above, stepped as the app steps the world (33 ms frames): the
+        // attacker must still stop where they meet, not walk on through the target.
+        let (mut s, a, t) = chase([0.0; 3], [20.0, 0.0, 0.0], [0.0; 3]);
+        for _ in 0..61 {
+            s.tick(33);
+        }
+        let (pa, pt) = (
+            s.world.get(a).unwrap().position,
+            s.world.get(t).unwrap().position,
+        );
+        assert!(pa[0] < 10.0, "{pa:?}");
+        assert!(
+            pt[0] > pa[0],
+            "they did not pass through each other: {pa:?} {pt:?}"
+        );
+        assert_eq!(
+            s.world
+                .get(a)
+                .unwrap()
+                .commands
+                .first()
+                .map(|c| (c.name.as_str(), c.approach)),
             Some(("CommandAttack", None)),
             "the swing is under way"
         );

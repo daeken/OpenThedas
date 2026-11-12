@@ -2141,6 +2141,8 @@ fn audio_state(
     if !live.front_end {
         state.animations = live.animation_clocks();
         let sim = live.sim();
+        let grid = sim.world.area.and_then(|a| sim.loaded_nav_grid(a));
+        let appearances = sim.world.tables().get(0, "apr_base");
         for (id, ..) in &state.animations {
             let Some(o) = sim.world.get(*id) else {
                 continue;
@@ -2159,6 +2161,10 @@ fn audio_state(
                     main: base("INVENTORY_SLOT_MAIN"),
                     off: base("INVENTORY_SLOT_OFFHAND"),
                     combat: o.combat.in_combat,
+                    footstep: Some(audio::footstep_column(appearances.as_ref().and_then(|t| {
+                        t.cell_by_hash(audio::APR_FOOTSTEP, o.appearance as i64)
+                    }))),
+                    surface: grid.as_ref().map_or(0, |g| g.surface(o.position)),
                 },
             );
         }
@@ -2359,7 +2365,7 @@ fn nearest_tagged(
     let me = sim.world.get(who)?;
     sim.world
         .by_tag(tag)
-        .filter(|o| o.area.is_some() && o.area == me.area && o.id != who)
+        .filter(|o| o.area.is_some() && o.area == me.area && o.id != who && o.active)
         .min_by(|a, b| {
             let d =
                 |o: &thedas_sim::world::Object| thedas_sim::engine::dist(o.position, me.position);
