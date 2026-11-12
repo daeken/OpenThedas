@@ -204,6 +204,7 @@ mod tests {
             mesh: None,
             light: None,
             emitter: None,
+            irradiance: None,
             bone,
             children,
         }
