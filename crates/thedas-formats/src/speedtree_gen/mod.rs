@@ -4,7 +4,15 @@
 //! that document only. Everything here is provisional until checked against the executable,
 //! except where a doc comment says otherwise.
 //!
-//! Stage 1 (this module so far): the single random stream and the curve parameters.
+//! Stage 1 (this file): the single random stream and the curve parameters. Stage 2
+//! ([`skeleton`]): tree set-up and the branch skeleton, on the rotation frames of [`frame`].
+//! Stage 3 ([`geometry`]): branch tubes and branch LOD.
+
+pub mod frame;
+pub mod geometry;
+pub mod skeleton;
+
+pub use skeleton::{Branch, Bud, Flare, Skeleton, Vertex, grow};
 
 use crate::speedtree::{BezierSpline, BranchLevel, SpeedTree};
 
@@ -32,6 +40,8 @@ pub struct Random {
     /// Always integral and in `1..MODULUS` after a step.
     seed: i64,
     table: [f32; SHUFFLE],
+    /// Values drawn since the stream was made (for tests and diagnostics).
+    draws: u64,
 }
 
 impl Random {
@@ -40,6 +50,7 @@ impl Random {
         let mut random = Random {
             seed: 1,
             table: [0.0; SHUFFLE],
+            draws: 0,
         };
         random.reseed(seed);
         random
@@ -74,12 +85,18 @@ impl Random {
         let i = ((self.raw_step() * SHUFFLE as f32) as usize).min(SHUFFLE - 1);
         let value = self.table[i];
         self.table[i] = self.raw_step();
+        self.draws += 1;
         value
     }
 
     /// A uniform draw in `[a, b]`: `a + (b − a) · draw()`.
     pub fn uniform(&mut self, a: f32, b: f32) -> f32 {
         a + (b - a) * self.draw()
+    }
+
+    /// How many values have been drawn (reseeding does not reset it).
+    pub fn draws(&self) -> u64 {
+        self.draws
     }
 
     /// The generator's integer state, for tests and diagnostics.
@@ -322,12 +339,40 @@ pub fn curves(tree: &SpeedTree) -> Vec<(String, &BezierSpline)> {
     out
 }
 
-/// Builds every curve of a tree and checks its table is finite (a corpus check).
-pub fn check_curves(tree: &SpeedTree) -> Result<(), String> {
+/// Builds every curve of a tree and grows its skeleton, checking every value is finite (a
+/// corpus check).
+pub fn check(tree: &SpeedTree) -> Result<(), String> {
     for (name, spline) in curves(tree) {
         let curve = Curve::new(spline);
         if let Some(i) = curve.table().iter().position(|y| !y.is_finite()) {
             return Err(format!("{name}: table entry {i} is {}", curve.table()[i]));
+        }
+    }
+    let (skeleton, mut random) = grow(tree);
+    for (i, branch) in skeleton.branches.iter().enumerate() {
+        let finite = branch.vertices.iter().all(|v| {
+            v.position.iter().all(|x| x.is_finite()) && v.radius.is_finite() && v.length.is_finite()
+        });
+        if !finite {
+            return Err(format!("branch {i} (level {}) is not finite", branch.level));
+        }
+    }
+    let geometry = geometry::build(tree, &skeleton, &mut random);
+    let finite = |v: &[f32; 3]| v.iter().all(|x| x.is_finite());
+    if let Some(i) = geometry.vertices.iter().position(|v| {
+        !(finite(&v.position)
+            && finite(&v.normal)
+            && v.texcoords.iter().flatten().all(|x| x.is_finite()))
+    }) {
+        return Err(format!("branch vertex {i} is not finite"));
+    }
+    let count = geometry.vertices.len() as u32;
+    for tube in geometry.tubes.iter().flatten() {
+        if tube.strip.iter().any(|&i| i >= count) {
+            return Err(format!(
+                "branch strip at {} indexes past the vertices",
+                tube.start
+            ));
         }
     }
     Ok(())
@@ -356,6 +401,7 @@ mod tests {
         let mut random = Random {
             seed: 1,
             table: [0.0; SHUFFLE],
+            draws: 0,
         };
         assert_eq!(random.raw_step(), 16807.0 * SCALE);
         for _ in 1..10_000 {
@@ -370,6 +416,7 @@ mod tests {
             let mut random = Random {
                 seed,
                 table: [0.0; SHUFFLE],
+                draws: 0,
             };
             random.raw_step();
             assert_eq!(random.state(), lehmer(seed), "seed {seed}");

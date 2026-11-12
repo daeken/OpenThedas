@@ -529,6 +529,9 @@ pub struct World {
     /// Whether a tutorial paused the game: it stays paused until the queue is empty.
     #[serde(default)]
     pub tutorial_paused: bool,
+    /// The training tutorial under way, if any (see [`crate::training`]).
+    #[serde(default)]
+    pub training: crate::training::Training,
     /// The HUD's notifications not yet dismissed (see [`crate::journal::Alert`]).
     #[serde(default)]
     pub alerts: Vec<crate::journal::Alert>,
@@ -735,6 +738,7 @@ impl World {
             active_quest: None,
             tutorials: Vec::new(),
             tutorial_paused: false,
+            training: Default::default(),
             alerts: Vec::new(),
             game_mode: 0,
             mode_before_talk: None,

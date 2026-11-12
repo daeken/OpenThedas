@@ -180,6 +180,9 @@ pub struct UiLayer {
     /// it has waited for its values to reach the popup layer (see
     /// [`UiLayer::show_script_popup`]).
     script_popup: Option<((i32, i32, u32), u8)>,
+    /// The screens up last frame, for the training events of opening one (see
+    /// [`UiLayer::training_screens`]).
+    screens_up: std::collections::BTreeSet<Screen>,
     /// The floating messages up over creatures (see [`UiLayer::update_floaties`]).
     floaties: Vec<Floaty>,
     /// The stats floaties up (name and health bar over a creature): creature → floaty id.
@@ -437,6 +440,7 @@ impl UiLayer {
             tooltip_text: None,
             tooltip_relayout: 0,
             script_popup: None,
+            screens_up: Default::default(),
             floaties: Vec::new(),
             stat_floaties: Default::default(),
             continue_pending: false,
@@ -576,6 +580,27 @@ impl UiLayer {
         true
     }
 
+    /// A training step waiting for the player to open the tactics, level-up or inventory
+    /// screen hears of it (`EVENT_TYPE_TRAINING_GUI_*_OPENED`, see `thedas_sim::training`).
+    fn training_screens(&mut self, screens: &Screens, sim: &Arc<Mutex<Sim>>) {
+        let up = screens.shown().clone();
+        let opened: Vec<Screen> = up.difference(&self.screens_up).copied().collect();
+        self.screens_up = up;
+        if opened.is_empty() {
+            return;
+        }
+        let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+        for s in opened {
+            let name = match s {
+                Screen::Tactics => "GUI_TACTICS_OPENED",
+                Screen::LevelUp => "GUI_LEVLUP_OPENED",
+                Screen::Inventory => "GUI_INVENTORY_OPENED",
+                _ => continue,
+            };
+            sim.training_event(name, 0);
+        }
+    }
+
     /// Shows a script's message box (`ShowPopup`, `World::popup`) on the popup layer, as the
     /// game's own dialog boxes show (`PopupLayer.ShowDialogBoxFromGame`), once its values
     /// (`thedas_ui::binding`'s `GUIPopupLayer.*`) have reached the movie: two frames after
@@ -712,6 +737,11 @@ impl UiLayer {
                 // The list's new save (slot -1) goes in the open slot.
                 let slot = if slot > 0 { slot } else { store.open_slot() };
                 let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+                // No saving during a training tutorial (script.ldf's SetTrainingMode).
+                if sim.training_paused() {
+                    log::warn!("ui: no saving during a training tutorial");
+                    return true;
+                }
                 // The module hears the save coming first (EVENT_TYPE_MODULE_PRESAVE).
                 sim.presave();
                 let area = sim
@@ -816,6 +846,7 @@ impl UiLayer {
             self.saves_listed = true;
             self.refresh_saves();
         }
+        self.training_screens(screens, sim);
         // The journal, while its screen is up (built from the plots: it needs the simulation
         // mutably, which the bindings do not have).
         let journal = (screens.menu == Some(Screen::Journal))

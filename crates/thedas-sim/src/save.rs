@@ -336,6 +336,12 @@ impl Sim {
         if self.world.tutorials.is_empty() {
             self.world.tutorial_paused = false;
         }
+        // Likewise a training mode with no step shown: nothing would end it. Provisional:
+        // whether the original saves a training mode at all is not traced (it forbids saving
+        // during one).
+        if self.world.training.step == 0 {
+            self.world.training = Default::default();
+        }
         self.save_issues = if save_revision < 3 {
             self.check_property_damage()
         } else {

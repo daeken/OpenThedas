@@ -93,6 +93,9 @@ pub struct Sim {
     /// The player's "show tutorials" option: off, no tutorial popup is queued. On, as the
     /// game's options start.
     pub show_tutorials: bool,
+    /// The training modes done (bit `mode - 1`), which do not start again (see
+    /// [`crate::training`]). The player's, not the game's: not saved.
+    pub training_done: u32,
     /// Objects whose scripts' engine calls are all traced (log channel -6), for debugging.
     pub watch_calls: std::collections::BTreeSet<ObjectId>,
     /// Followers whose front command is the move [`Sim::keep_party_together`] gave them.
@@ -498,6 +501,7 @@ impl Sim {
             party_picker_policy: PartyPickerPolicy::default(),
             auto_pause_combat: false,
             show_tutorials: true,
+            training_done: 0,
             watch_calls: Default::default(),
             following: Default::default(),
             next_follow_ms: 0,
@@ -1797,11 +1801,12 @@ impl Sim {
         true
     }
 
-    /// Keeps the hero's followers with it: each living follower in the same area that
-    /// follows the leader (`SetFollowPartyLeader`, on unless turned off) and is not fighting
-    /// or busy with anything but waiting or its own follow move stands a metre behind, one
-    /// more metre per follower. Provisional: real
-    /// followers path after the leader.
+    /// Keeps the hero's followers with it as [`Sim::walk`] steps it along: each living
+    /// follower in the same area that follows the leader (`SetFollowPartyLeader`, on unless
+    /// turned off) and is not fighting or busy with anything but waiting or its own follow
+    /// move is put on its formation slot behind the leader ([`behind`], the exe's table at
+    /// 0xc0d240). Provisional: followers are placed rather than walked (this serves the
+    /// stepped walk of the tools; in play `Sim::keep_party_together` runs them there).
     pub fn follow_leader(&mut self, leader: ObjectId) {
         let Some((pos, area, facing, followers)) = self.world.get(leader).map(|o| {
             let mut all = o.followers.clone();
@@ -1810,7 +1815,6 @@ impl Sim {
         }) else {
             return;
         };
-        let (s, c) = crate::world::heading_of(facing).to_radians().sin_cos();
         for (i, f) in followers.into_iter().enumerate() {
             let ok = self.world.get(f).is_some_and(|o| {
                 !o.dead
@@ -1822,9 +1826,7 @@ impl Sim {
                     && o.fields.get("FollowPartyLeader").copied().unwrap_or(1) != 0
             });
             if ok {
-                let back = 1.0 + i as f32;
-                let p = [pos[0] - c * back, pos[1] - s * back, pos[2]];
-                self.move_object(f, p, None);
+                self.move_object(f, behind(pos, facing, i), None);
             }
         }
     }
