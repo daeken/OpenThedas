@@ -1167,6 +1167,9 @@ impl AreaRenderer {
             let d = match *r {
                 DrawRef::StandIn(i) => &self.stand_in[i],
                 DrawRef::D3d(i) => {
+                    if !self.d3d.in_view(i) {
+                        continue;
+                    }
                     let d = &self.d3d.draws[i];
                     let mesh = &self.meshes[d.mesh];
                     self.d3d.draw(&mut pass, d, &mesh.indices, mesh.count);
