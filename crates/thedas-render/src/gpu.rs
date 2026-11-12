@@ -1029,6 +1029,15 @@ impl AreaRenderer {
     /// Draws every draw of `scene`'s prop `prop` at `opacity` (see
     /// [`crate::d3d_gpu::D3dPass::set_opacity`]): 1 as its materials say, below 1 faded,
     /// blended over what lies behind it.
+    /// Does the first-use work of every draw now (its fixed constants and whole constant
+    /// slot) and waits for the GPU to take this renderer's buffers, so the first frames
+    /// after a load do not pay for it. `width` and `height` are the frame size expected.
+    pub fn warm(&mut self, ctx: &GpuContext, width: u32, height: u32) {
+        self.d3d.warm(ctx, width, height);
+        ctx.queue.submit([]);
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+
     /// Fades the scene's `CutAway` meshes (ceilings, roofs) to `value`: 1 draws them as
     /// made, between 0 and 1 translucent with that opacity multiplier, 0 not at all
     /// (DAOrigins.exe 0x4670c0 → 0x466930).

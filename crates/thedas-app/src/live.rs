@@ -1055,6 +1055,9 @@ impl Live {
         let mut renderer =
             AreaRenderer::new_cached(ctx, &vfs, &scene, &programs, format, &mut self.cache);
         renderer.frame_effects = self.frame_effects;
+        // First-use work at load, not on the first frames (the frame size is not known
+        // here; a different size only rewrites the slots).
+        renderer.warm(ctx, 1280, 720);
         log::info!(
             "{layout}: level of {} draws built in {:.2}s",
             scene.draws.len(),
@@ -1089,8 +1092,9 @@ impl Live {
         let props: Vec<Prop> = models.iter().map(prop).collect();
         let scene = AreaScene::load_objects_at(&vfs, layout, &props, self.detail)?;
         let programs = crate::programs_cached(&vfs, &scene, &self.shaders, &mut self.cache)?;
-        let renderer =
+        let mut renderer =
             AreaRenderer::new_cached(ctx, &vfs, &scene, &programs, format, &mut self.cache);
+        renderer.warm(ctx, 1280, 720);
         log::info!(
             "{layout}: {} objects, {} draws, built in {:.2}s",
             models.len(),
