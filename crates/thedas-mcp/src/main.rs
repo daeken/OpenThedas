@@ -2044,6 +2044,13 @@ impl Server {
     )]
     async fn save_state(&self, Parameters(a): Parameters<SlotArgs>) -> String {
         self.with_sim(|st| {
+            // The module hears the save coming first (EVENT_TYPE_MODULE_PRESAVE), as a save
+            // in the game does.
+            if a.path.is_some() {
+                if let Some(sim) = st.sim.as_mut() {
+                    sim.presave();
+                }
+            }
             let sim = st.sim.as_ref().ok_or("no sim")?;
             let snap = sim.snapshot();
             let mut out = json!({});

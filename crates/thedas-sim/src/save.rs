@@ -356,7 +356,35 @@ impl Sim {
         {
             self.load_world_maps();
         }
+        // The area hears it was loaded from a save: DAOrigins.exe runs its area-load
+        // sequence with the save flag set, which turns SPECIAL, PRELOADEXIT and POSTLOADEXIT
+        // into their AREALOADSAVE_ forms (41, 42, 43: 0x67f1c0, 0x6c90ab, 0x6c92b9), from the
+        // controlled creature, with no payload. Provisional: what sets the flag is inferred
+        // from the names.
+        if let Some(area) = self.world.area {
+            let creator = self.world.controlled().or(self.world.hero);
+            for name in [
+                "AREALOADSAVE_SPECIAL",
+                "AREALOADSAVE_PRELOADEXIT",
+                "AREALOADSAVE_POSTLOADEXIT",
+            ] {
+                let ev = self.new_event(name, creator);
+                self.world.queue_event(0, area, ev, None);
+            }
+        }
         Ok(())
+    }
+
+    /// Before the game is saved: the module hears `EVENT_TYPE_MODULE_PRESAVE` (62) from the
+    /// player's creature, with no payload, and handles it before the save is taken
+    /// (DAOrigins.exe 0x5d6c40, called by the save routine 0x5d7fc0).
+    pub fn presave(&mut self) {
+        let Some(module) = self.world.module else {
+            return;
+        };
+        let creator = self.world.controlled().or(self.world.hero);
+        let ev = self.new_event("MODULE_PRESAVE", creator);
+        self.deliver(module, ev, None);
     }
 
     pub fn load_json(&mut self, data: &[u8]) -> Result<(), SimError> {

@@ -736,12 +736,14 @@ impl UiLayer {
                 };
                 // The list's new save (slot -1) goes in the open slot.
                 let slot = if slot > 0 { slot } else { store.open_slot() };
-                let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+                let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
                 // No saving during a training tutorial (script.ldf's SetTrainingMode).
                 if sim.training_paused() {
                     log::warn!("ui: no saving during a training tutorial");
                     return true;
                 }
+                // The module hears the save coming first (EVENT_TYPE_MODULE_PRESAVE).
+                sim.presave();
                 let area = sim
                     .world
                     .area
