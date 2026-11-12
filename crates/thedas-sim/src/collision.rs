@@ -9,8 +9,9 @@
 //! placement is room × placement (with its scale) × the `.mmh` node the shape hangs under ×
 //! the shape's own pose.
 //!
-//! Provisional: only the layout's own models are loaded, not the area's placeables (doors keep
-//! their own test in [`crate::sim::Sim::closed_doors`]); triangles are two-sided (whether the
+//! An area's placeables are added with [`load_placeables`], all but doors, which keep their own
+//! test ([`crate::sim::Sim::closed_doors`]). Provisional: whether the exe changes a placeable's
+//! mask at runtime (opened, destroyed) is not traced; triangles are two-sided (whether the
 //! exe's mesh raycast culls back faces is not traced).
 
 use std::sync::Arc;
@@ -511,6 +512,35 @@ pub fn load_layout(level: &Vfs, global: &Vfs, arl: &thedas_formats::Arl) -> Coll
             let at = room_xf.then(&Xf::from_transform(&p.transform, scale));
             add_model(&phy, mmh.as_deref(), &at, &mut prims);
         }
+    }
+    Collision::build(prims)
+}
+
+/// Builds the collision of an area's placeables: each one's model (`placeable_types.gda`
+/// `ModelName`) `.phy`, placed at the object's position and turned by its facing (degrees
+/// about +Z, as the renderer places it).
+pub fn load_placeables(global: &Vfs, placed: &[(String, V, f32)]) -> Collision {
+    let mut models: std::collections::HashMap<String, Option<LoadedModel>> =
+        std::collections::HashMap::new();
+    let mut prims = Vec::new();
+    for (model, position, facing) in placed {
+        let stem = model.to_ascii_lowercase();
+        let entry = models.entry(stem.clone()).or_insert_with(|| {
+            let read = |n: &str| global.read(n).ok().map(|(d, _)| d);
+            let phy = read(&format!("{stem}.phy")).and_then(|d| Phy::parse(&d).ok())?;
+            let mmh = read(&format!("{stem}.mmh")).and_then(|d| Mmh::parse(&d).ok());
+            Some((Arc::new(phy), mmh.map(Arc::new)))
+        });
+        let Some((phy, mmh)) = entry.clone() else {
+            continue;
+        };
+        let half = facing.to_radians() * 0.5;
+        let at = Xf {
+            t: *position,
+            q: [0.0, 0.0, half.sin(), half.cos()],
+            s: 1.0,
+        };
+        add_model(&phy, mmh.as_deref(), &at, &mut prims);
     }
     Collision::build(prims)
 }
