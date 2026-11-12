@@ -1464,14 +1464,6 @@ impl D3dPass {
             let Some(program) = material_programs.get(e.material).and_then(|p| p.first()) else {
                 continue;
             };
-            // Volume textures (the smoke's `VolTex` semantics) do not load yet: such draws
-            // would sample black.
-            if texture_entries(program)
-                .iter()
-                .any(|(_, _, ty)| *ty == TextureType::Volume)
-            {
-                continue;
-            }
             let pi = *by_name.entry(program.name.clone()).or_insert_with(|| {
                 let (pipeline, tl) = cache
                     .pipelines
