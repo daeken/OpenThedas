@@ -181,18 +181,28 @@ fn value(sim: &Sim, id: ObjectId, s: &Slider, min: f32, max: f32) -> f32 {
             .position(|n| *n == name)
             .map(|i| i as f32)
     };
-    let preset_model = |slot: usize| {
+    let preset = || {
         let h = head.as_ref()?;
         let (d, _) = sim.vfs.read(&format!("{h}.mop")).ok()?;
-        let p = thedas_formats::morph::MorphPreset::parse(&d).ok()?;
+        thedas_formats::morph::MorphPreset::parse(&d).ok()
+    };
+    let preset_model = |slot: usize| {
+        let p = preset()?;
         Some(p.models.get(slot).cloned().flatten().unwrap_or_default())
+    };
+    // A face-shape slider stands where the preset's morph targets put it.
+    let row =
+        thedas_sim::appearance::race_gender_row(&sim.face_race_gender(id).unwrap_or_default());
+    let shape = || {
+        let p = preset()?;
+        thedas_sim::appearance::feature_value(s.id, &p.targets, row)
     };
     use thedas_formats::morph::slot;
     let known = match s.id {
         PRESET => index_of("heads", head.clone()),
         HAIR => index_of("hairs", preset_model(slot::HAIR)),
         BEARD => index_of("beards", preset_model(slot::BEARD)),
-        _ => None,
+        _ => shape().map(|v| v.clamp(min, max)),
     };
     known.unwrap_or_else(|| 0.0f32.clamp(min, max))
 }
