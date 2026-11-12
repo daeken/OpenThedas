@@ -159,6 +159,88 @@ PrintFloat, PrintToLogWindow, tan, acos, asin, atan, log, GetLocalLocation, SetL
 GetStoreMoney, SetStoreMoney, GetStoreMaxBuyPrice, SetStoreMaxBuyPrice, GetAreaFromLocation, CanUseConditionedAbility,
 GetCommandFloat, SetWorldMapLocationLocName.
 
+## Events, commands and effects measured against a real install
+
+Gathered 2026-11-12 at main `1eb844a` by disassembling all 4,158 distinct compiled scripts and
+following the values returned by `GetEventType`, `GetCommandType` and `GetEffectType` to the
+constants they are compared with. The counts are static and may be slightly low: the tracking
+gives up after calls to ids that `script.ldf` does not declare. They put numbers on `SCR-063`,
+`SCR-055` and `SCR-045`.
+
+### Event types scripts handle that the engine never raises
+
+`script.ldf` names 111 event types; the engine raises or names 50. Scripts also define 73 event
+values of their own (5,978 construction sites), which the simulation delivers generically.
+
+| Event | Handler scripts comparing it | Scripts constructing it themselves |
+| --- | --- | --- |
+| `EVENT_TYPE_DAMAGED` | 180 | 149 |
+| `EVENT_TYPE_TRAP_TRIGGERED` | 64 | 0 |
+| `EVENT_TYPE_PLACEABLE_ONCLICK` | 64 | 0 |
+| `EVENT_TYPE_PLACEABLE_COLLISION` | 56 | 0 |
+| `EVENT_TYPE_UNLOCKED` | 35 | 0 |
+| `EVENT_TYPE_AREALOADSAVE_PRELOADEXIT` | 10 | 0 |
+| `EVENT_TYPE_AREALOADSAVE_POSTLOADEXIT` | 7 | 0 |
+| `EVENT_TYPE_ITEM_ONHIT` | 6 | 1 |
+| `EVENT_TYPE_USE_PLOTACTION` | 5 | 6 |
+| `EVENT_TYPE_MODULE_PRESAVE` | 4 | 0 |
+| `EVENT_TYPE_SPELLCASTAT` | 3 | 0 |
+| `EVENT_TYPE_GIFT_ITEM` | 3 | 0 |
+| `EVENT_TYPE_GUI_OPENED` | 2 | 0 |
+
+One handler script each: `COMBAT_INITIATED`, `AREALOADSAVE_SPECIAL`, `CHARGEN_IMPORT_HERO`,
+`MANA_STAM_DEPLETED`, `ITEM_ONTEST_USABLE`, `WORLD_MAP_CLOSED`, `LOAD_TACTICS_PRESET`,
+`RUBBER_BAND`, `GIVE_UP`, `ON_SELECT`, `ON_ORDER_RECEIVED`, `PLAYER_COMMAND_ADDED`,
+`USE_ABILITY_IMMEDIATE`, `TRAINING_BEGIN` and seven other `TRAINING_*` events.
+
+Another 27 are named in `script.ldf`, never raised by the engine, and have no comparison the
+analysis found (it may have lost them in a helper function): `MELEE_ATTACK_START`, `BLOCKED`,
+`FAILTOOPEN`, `CLICK`, `TRAP_DISARMED`, `LISTENER`, `LOCKED`, `MODULE_GETCHARSTAGE`,
+`GAMEOBJECTSLOADED`, `CHARGEN_SCREEN_ENTERED`, `CHARGEN_SELECT_LEVELUP_CLASS`,
+`CHANTERS_DONATION`, `LEVEL_OF_THE_WEEK`, `ABILITY_ACQUIRED`, `REACHED_WAYPOINT`,
+`AREALIST_POSTLOAD`, `INVENTORY_FULL`, `CREATURE_ENTERS_DIALOGUE`, `CHAR_RECORD_OPENED`,
+`OPTIONS_CHANGED`, `PLOT_COMPLETED`, `PARTY_MONEY_CHANGED`, `CODEX_CHANGED`, `CRAFT_ITEM` and
+three `TRAINING_*` events.
+
+Which of these the original's engine raises is not traced. `EVENT_TYPE_DAMAGED` is the one to
+start with.
+
+### Commands that do nothing, by how often scripts build them
+
+| Constructor | Call sites (scripts) | Note |
+| --- | --- | --- |
+| `CommandMoveAwayFromObject` | 1,010 (169) | type number invented (`SCR-057`) |
+| `CommandPlayAnimation` | 829 (386) | |
+| `CommandFly` | 353 (176) | DLC scripts pass a second integer |
+| `CommandMoveToMultiLocations` | 323 (295) | type number invented; the location list is dropped |
+| `CommandTurn` | 221 (214) | type number invented |
+| `CommandSheatheWeapons` | 14 (14) | type number invented |
+| `CommandDeathBlow` | 3 (3) | |
+| `CommandUnsheatheWeapons` | 2 (1) | type number invented |
+
+`CommandEquipItem` and `CommandUnequipItem` are declared and never called. Scripts compare
+`GetCommandType` almost only with INVALID (5,042 sites), ATTACK (195) and WAIT (194).
+`COMMAND_TYPE_DO_FUNCTION`, `DO_EVENT`, `INTERACT`, `DRIVE` and `RECOVER` have no constructor.
+
+### Engine-native effects that are only stored
+
+| Effect (id) | Construction sites |
+| --- | --- |
+| `EffectMovementSpeed` (9) | 236 |
+| `EffectMovementSpeedDebuff` (11) | 219 |
+| `EffectTransparency` (10) | 98 |
+| `EffectScreenShake` (6) | 80 |
+| `EffectParalyze` (8) | 48 |
+| `EffectGeneric` (1) | 1 |
+
+The engine gives behaviour of its own to area-of-effect (5), death (7), resurrection (1005),
+upkeep (1016), damage over time (1017), modify-property (1012), damage (1013) and impact (1024),
+and passes visual effects (4) to the presentation. The script-side types used most are
+resurrection, recently-stunned, stun, death, modify mana and stamina, knockdown and damage over
+time; the scripts handle those through APPLY_EFFECT and REMOVE_EFFECT. Scripts also construct
+effect ids 20000 to 20002 and compare against 10000 and 2001, none of which is a row of the
+effects table.
+
 ## Code inventory
 
 Found by reading the code at main on 2026-11-12: provisional markers, stubs, ignored inputs and features with no code. "Original: not traced" means nobody has yet checked what the original does. Line numbers drift; search for the quoted names if a line has moved.
@@ -207,17 +289,15 @@ Dispatch summary: `engine::call` (`crates/thedas-sim/src/engine.rs:483`) matches
 - **SCR-027** **GetTeam only sees the loaded area.** Original: not traced. Ours: filters objects to `world.area`. Evidence: `crates/thedas-sim/src/engine.rs:3101-3116`. Size: S. Depends: none. Kind: provisional.
 - **SCR-028** **GetOrientation / location orientation is a z-rotation guess.** Original: not traced. Ours: returns `[0, 0, facing]`; `SetOrientation` takes only z. Evidence: `crates/thedas-sim/src/engine.rs:995-996`, `engine.rs:2787-2798`. Size: S. Depends: none. Kind: provisional.
 - **SCR-029** **SetName with an empty name and SetAppearanceType -1 are guessed.** Original: not traced. Ours: empty name restores the template's; -1 restores the template's appearance. Evidence: `crates/thedas-sim/src/engine.rs:734-741`, `engine.rs:2936-2965`. Size: S. Depends: none. Kind: provisional.
-- **SCR-030** **String helpers mix byte and character indices.** Original: not traced. Ours: `SubString`, `StringLeft`, `StringRight` count characters; `FindSubString` works in bytes and returns -1 if the start is not on a char boundary. Evidence: `crates/thedas-sim/src/engine.rs:566-594`. Size: S. Depends: none. Kind: bug.
 - **SCR-031** **Number parsing and formatting are not matched to the exe.** Original: not traced. Ours: `StringToInt`/`StringToFloat` return 0 unless the whole trimmed string parses (no leading-digit parse); `ToString` on a float is assumed `%f` six decimals (provisional); objects print in decimal for `ToString`/`ObjectToString`; engine values print a Rust debug form. Evidence: `crates/thedas-sim/src/engine.rs:540-557`, `engine.rs:169-175`, `engine.rs:4037`. Size: S. Depends: none. Kind: unverified.
 - **SCR-032** **Timers are simulation-time approximations.** Original: not traced. Ours: `GetTime` = whole simulation seconds; `GetLowResTimer` = simulation milliseconds truncated to i32 (wraps after about 24.8 days of play time). Evidence: `crates/thedas-sim/src/engine.rs:1566`, `engine.rs:3015`. Size: S. Depends: none. Kind: unverified.
 - **SCR-033** **Random number generator is not the exe's.** Original: not traced. Ours: xorshift64* seeded per `Sim`; `Random(n)` is `next % n` (modulo bias), `RandomFloat` 24-bit. Deterministic and saved, but sequences cannot match the original. Evidence: `crates/thedas-sim/src/world.rs:426-453`, `crates/thedas-sim/src/engine.rs:607-608`. Size: S. Depends: none. Kind: unverified.
-- **SCR-034** **GetM2DAColumns ignores the table-name argument.** Original: not traced. Ours: looks the table up by id with an empty name, unlike `GetM2DARows`. Evidence: `crates/thedas-sim/src/engine.rs:1304-1310`. Size: S. Depends: none. Kind: bug.
 - **SCR-035** **Talk-table strings: English only, no tokens.** Original: not traced. Ours: `GetStringByStringId` reads only `*en-us.tlk` and returns the raw text; designer tokens such as `<FirstName/>` are filled only by the UI (`thedas-ui/src/protocol.rs:86`), and no female/alternate string variant is chosen. Evidence: `crates/thedas-sim/src/sim.rs:423-443`, `crates/thedas-sim/src/engine.rs:1581`. Size: M. Depends: none. Kind: missing.
 - **SCR-036** **ActivateSoundByTag compares tags ignoring case.** Original: 0x65d0c0, 0x67c230, 0x7c2190. Ours: case-insensitive compare (provisional); only the active flag is kept. Evidence: `crates/thedas-sim/src/engine.rs:3559-3575`. Size: S. Depends: none. Kind: provisional.
 
 ### Items and inventory functions
 
-- **SCR-037** **RemoveItemsByTag, MoveItem and RemoveItem bypass unequip.** Original: not traced. Ours: they drop the item from `equipment`/`other_set` maps directly instead of calling `Sim::unequip`, so a worn item's effects and UNEQUIP event do not happen, and no INVENTORY_REMOVED/ADDED is raised. `MoveItem` also does not merge stacks. Compare `DestroyObject` and `SetItemStackSize`, which do unequip. Evidence: `crates/thedas-sim/src/engine.rs:1711-1733`, `engine.rs:2388-2402`, `engine.rs:4169-4196`. Size: S. Depends: none. Kind: bug.
+- **SCR-098** **Script item moves raise no inventory events and MoveItem does not merge stacks.** Original: not traced. Ours: `RemoveItemsByTag`, `MoveItem` and `RemoveItem` take worn items off properly (UNEQUIP, effects end), but send no INVENTORY_REMOVED/INVENTORY_ADDED, and `MoveItem` appends the item without merging it into a matching stack. Evidence: `crates/thedas-sim/src/engine.rs` (the three handlers). Size: S. Depends: none. Kind: unverified.
 - **SCR-038** **GetItemsInInventory ignores its option and base-type arguments.** Original: not traced. Ours: only the tag filter (argument 3) is applied; arguments 1 and 2 are not read. Evidence: `crates/thedas-sim/src/engine.rs:2799-2813`. Size: S. Depends: none. Kind: missing.
 - **SCR-039** **Tag item counts and lookups ignore stacks and other sets.** Original: not traced. Ours: `CountItemsByTag` counts item objects, not stack sizes; `GetItemEquipSlot` looks only at the active `equipment` map, not the inactive weapon set. Evidence: `crates/thedas-sim/src/engine.rs:3615-3628`, `engine.rs:3979-3990`. Size: S. Depends: none. Kind: unverified.
 - **SCR-040** **Weapon sets partly modelled.** Original: not traced. Ours: `EquipItem` comment says weapon sets are not modelled though code now routes inactive-set items; only the in-hand set takes effect; `SwitchWeaponSet` sends no equip events (provisional). Evidence: `crates/thedas-sim/src/engine.rs:1655-1705`, `engine.rs:3024-3034`. Size: S. Depends: none. Kind: provisional.
@@ -330,5 +410,5 @@ Dispatch summary: `engine::call` (`crates/thedas-sim/src/engine.rs:483`) matches
 - Location visual effects kept for rendering until expiry or removal.
 - Body bags and corpse decay functions.
 - DLC/addin check via the inferred IsPackageLoaded.
-- String and math helpers (length, case, left/right/sub, sqrt, trig, log, pow, abs, conversions), apart from SCR-030 and SCR-031.
+- String and math helpers (length, case, left/right/sub, sqrt, trig, log, pow, abs, conversions), apart from SCR-031.
 - NCS parsing: all opcodes, DA:O resource and array type codes, bounds-checked jumps.
