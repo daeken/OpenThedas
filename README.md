@@ -10,7 +10,7 @@ repository.
 
 ## Status
 
-Last updated 2026-11-12 14:35 UTC, main 1a85a84
+Last updated 2026-11-12 15:45 UTC, main 3d44de7
 
 Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–20, with fixes merged since then noted.
 
@@ -27,7 +27,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
     - cutscenes named by conversation lines (the Human Noble, Dalish and Dwarf Noble intros);
     - the original's default speaker framing for unstaged lines;
     - cutscene and conversation actors posed and animated by their tracks, and conversation lines leaving creatures on their stage marks in the sim, as the exe does (Oskias sits; the Dalish hunters face the hero);
-    - conversations start as the exe starts them: dialog game mode for the talk, and talk commands go through the dialogue event to the target's script.
+    - conversations start as the exe starts them: dialog game mode for the talk, and talk commands go through the dialogue event to the target's script. A first line that plays before its screen is up no longer stalls the conversation.
   - Open:
     - cameras placed by JumpToCamera or LinkToActor (most per-line cinematics);
     - City Elf: Vaughan's scene plays on the gameplay camera instead of a staged shot (in progress).
@@ -36,7 +36,8 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - The area map shows map notes and only perceived enemies.
   - The follow camera uses the exe's 0.25 m sphere sweep, pull-in and ease-out, and its starting shot (3 m behind, at the leader's height). QA confirmed it at all six origin starts.
   - Doors are posed by their state (open, Open_2, swinging, fallen), and their camera and click shapes follow the pose.
-  - Open: at close range the camera can end up inside the hero; the Valendrian start (City Elf) has the wrong pitch.
+  - With a pad, walking aims at a point ahead and the route goes round obstacles; it no longer stops dead at the first one.
+  - Open: at close range the camera can end up inside the hero; the exe's fade of creatures the camera is inside is in progress. The Valendrian start (City Elf) has the wrong pitch.
 - 🟡 **Combat and simulation**:
   - NWScript VM with a large share of the engine functions; melee and ability timing; threat; AI-driven party; tactics; loot.
   - Containers hold their template's items and open on USE with the original loot panel (Take All, Close).
@@ -46,7 +47,8 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Melee attackers take slots on the target's 40-slot melee ring at the bodies' reach, as the exe places them, and step into place before swinging. The default body radius is the exe's 0.6 m.
   - Per-hand attack results are exposed read-only for the presentation (swing and impact sounds).
   - All six origins play past their openings in the simulation (QA).
-  - Visual effects applied at places (the Proving crowd) are exposed to rendering.
+  - Corpses decay as the exe does them.
+  - Visual effects applied at places (the Proving crowd) are exposed to rendering and drawn.
   - Not every script engine function is implemented.
 - 🟡 **Party, inventory, journal and other UI screens**:
   - Wired to the simulation: inventory (with paperdoll and item examine), character record, level-up, store, tactics, journal and codex, options, area map, HUD notifications and the screen tab bar.
@@ -56,15 +58,17 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - New saves are named New Save, the save-name dialog takes typed names, and the save shows the class icon.
   - With a pad: the D-pad types letters into a focused text field, and focus reaches empty equipment slots.
   - Items with no icon of their own show their base type's.
+  - Save screens show the hero's name, level and class. The character record lists Heroic Accomplishments.
   - Open: screens have not all been audited against the original.
 - 🟡 **Rendering**:
   - Working: areas, terrain, sky, fog, clouds, bloom, colour grading, dynamic sun shadows (Low to High detail) and the original shaders.
   - Characters have hair, sampled with its mips and noise. Bare hands and arms take the head's skin tint.
   - Characters and props pick their lights by the exe's rules (room reach, light class, influence).
-  - Lava draws with its own shaders.
+  - Lava draws with its own shaders. Level-wide layouts draw (horizons, water, tents), with probe cubemaps as the environment map. Missing material textures fall back to the parameter's default, not black.
+  - Per-object opacity, for the camera fade and corpse decay.
   - Open:
-    - water is not drawn (the Fade's black areas);
-    - SpeedTree `.spt` files parse but are not drawn.
+    - SpeedTree `.spt` files parse but are not drawn;
+    - QA: the hero's equipped helm does not draw in the Proving duel save.
   - The backend stays on wgpu, and its types are kept inside `thedas-render`.
 - 🟡 **Audio**:
   - Merged:
@@ -72,7 +76,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
     - music: menu and area music, SetMusicIntensity driving `music_state` (kept in saves);
     - world: world reverb (area presets and reverb triggers as traced, levels per I3DL2 with room LF), placed 3D sounds;
     - movement: footsteps by walkmesh surface, foley and vegetation rustles, as traced;
-    - effects: UI sounds, boot movie sound, script PlaySound, animation sound events (swings, armour foley, weapon hits) and bodyfalls;
+    - effects: UI sounds, boot movie sound, script PlaySound, animation sound events (swings, armour foley) and bodyfalls; blows sound at the hit frame with the weapon's action;
     - voices: conversation and cutscene voice-over, sound-set and engine barks with the exe's sound-set player (counts, shuffle bag, gender), creature sound-set events, party picker lines, the chargen voice preview.
   - Not yet: PlayMusic, voice-over positioning, and the master and secondary reverb chain.
   - Sound is off with `--control` (unless `--audio`) and in headless captures.
@@ -93,7 +97,7 @@ None open. The Proving armour chest was fixed by #253 and #254.
   - Oskias sits and the duel can be finished with the pad.
 - 🟡 **City Elf**: explorable from inside the room. Cyrion waiting in the next room matches the data. Vaughan's scene camera is in progress.
 - 🟡 **Dalish Elf**: intro cutscene plays and the journal lists the origin quest. After the opening talk the three hunters stay on their marks facing the hero.
-- 🟡 **Mage**: explorable. The Fade's water is not drawn.
+- 🟡 **Mage**: explorable.
 
 ### Planned modernization
 
