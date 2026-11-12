@@ -59,6 +59,8 @@ pub struct AudioState {
     pub sound_sets: Vec<(String, i32, f32, Option<[f32; 3]>)>,
     /// Events scripts played (`PlaySound`), with where the object stands (none: 2D).
     pub script_sounds: Vec<(String, Option<[f32; 3]>)>,
+    /// The character the player controls: its id, sound set and position.
+    pub controlled: Option<(u32, Option<String>, [f32; 3])>,
     /// Scripts' `SetMusicIntensity`, the latest this frame.
     pub music_intensity: Option<i32>,
     /// A boot movie playing (its file) and how far it has played (milliseconds): its own
@@ -164,6 +166,8 @@ pub struct GameAudio {
     /// Weapon impacts: each base item's sound material (`BITM_base.gda`), and each weapon
     /// material's impact events (`sound_weapon_hits.gda`).
     impacts: Impacts,
+    /// Who the player controlled last frame (a change is a selection: it barks).
+    controlled: Option<u32>,
     /// The music's `music_state` (scripts' `SetMusicIntensity`; 1 until one sets it).
     music_state: f32,
     /// `ss_types.gda`: each sound set type's first entry row and default probability.
@@ -416,6 +420,7 @@ impl GameAudio {
             footsteps: footstep_events(vfs),
             impacts: Impacts::read(vfs),
             music_state: 1.0,
+            controlled: None,
             ss_types: ss_types(vfs),
             sound_set_entries: Default::default(),
             rng: 0x2545_f491_4f6c_dd1d,
@@ -942,6 +947,18 @@ impl GameAudio {
                         ..Default::default()
                     },
                 );
+            }
+        }
+        // Selecting another party member: it answers (`ss_types.gda` 32 COMBAT SELECT
+        // NEUTRAL in a fight, else 36 EXPLORE SELECT NEUTRAL). Provisional: the approval
+        // variants (37-39 friendly/hate/love) and when the engine says them are not traced.
+        if let Some((id, set, at)) = state.controlled.take() {
+            let before = self.controlled.replace(id);
+            if before.is_some_and(|b| b != id)
+                && let Some(set) = set
+            {
+                let entry = if state.combat { 32 } else { 36 };
+                state.sound_sets.push((set, entry, 0.0, Some(at)));
             }
         }
         for (set, entry, probability, at) in std::mem::take(&mut state.sound_sets) {
