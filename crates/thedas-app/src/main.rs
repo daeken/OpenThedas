@@ -1549,6 +1549,19 @@ impl App {
                 }
                 log.push(format!("floaty {text:?}"));
             }
+            Step::Use(tag) => {
+                if let Some(l) = self.live.as_ref() {
+                    let mut sim = l.sim();
+                    let who = sim.world.controlled();
+                    match (who, who.and_then(|w| nearest_tagged(&sim, w, tag))) {
+                        (Some(w), Some(t)) => {
+                            sim.order_use(w, t);
+                            log.push(format!("use {tag}"));
+                        }
+                        _ => log.push(format!("use {tag}: nothing")),
+                    }
+                }
+            }
             Step::Plot(plot, flag) => {
                 if let Some(l) = self.live.as_ref() {
                     l.sim().set_plot_flag(
@@ -2616,6 +2629,8 @@ enum Step {
     /// Sets a plot flag as a script would (`plot plt_tut_explore 0`), running the plot's
     /// script, for trying journal entries and tutorial popups headless.
     Plot(String, i32),
+    /// Uses the nearest object with a tag, as clicking it would (`use bdc140ip_everds_chest`).
+    Use(String),
 }
 
 /// A `pad` step: a button by name (pressed and let go), `press`/`release` and a button, or
@@ -2789,6 +2804,7 @@ fn parse_step(s: &str) -> Result<Step> {
             }
         }
         "talk" if !arg.is_empty() => Step::Talk(arg.to_string()),
+        "use" if !arg.is_empty() => Step::Use(arg.to_string()),
         "rebuild" => Step::Rebuild,
         "picker" => Step::Picker,
         "wipe" => Step::Wipe,
@@ -3163,6 +3179,17 @@ fn main() -> Result<()> {
                     Step::Floaty(text) => {
                         test_floaty(&mut l.sim(), text);
                         println!("floaty {text:?}");
+                    }
+                    Step::Use(tag) => {
+                        let mut sim = l.sim();
+                        let who = sim.world.controlled();
+                        match (who, who.and_then(|w| nearest_tagged(&sim, w, tag))) {
+                            (Some(w), Some(t)) => {
+                                sim.order_use(w, t);
+                                println!("use {tag}");
+                            }
+                            _ => println!("use {tag}: nothing"),
+                        }
                     }
                     Step::Plot(plot, flag) => {
                         l.sim().set_plot_flag(

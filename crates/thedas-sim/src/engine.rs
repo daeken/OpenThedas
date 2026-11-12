@@ -3270,6 +3270,11 @@ pub fn call(
             h.sim.world.store = h.object(st).map(|_| st);
             void()
         }
+        // A container's inventory opens for looting (see container.rs).
+        "OpenInventory" => {
+            h.sim.open_container(obj(a, 0));
+            void()
+        }
         "GetItemValue" => ok(Value::Int(h.sim.item_value(obj(a, 0)))),
         // A quickbar slot: an ability and the tag of the item it comes from; no ability
         // empties it.

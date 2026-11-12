@@ -800,6 +800,16 @@ impl UiLayer {
         if changes.dismissed.contains(&Screen::Store) {
             sim.lock().unwrap_or_else(|p| p.into_inner()).close_store();
         }
+        // The inventory closed (its close button or Escape) while a container was open:
+        // the container closes too.
+        if changes.dismissed.contains(&Screen::Inventory)
+            || changes.closed.contains(&Screen::Inventory)
+        {
+            let mut s = sim.lock().unwrap_or_else(|p| p.into_inner());
+            if s.world.container.is_some() {
+                s.close_container();
+            }
+        }
         // A picker that closed itself without its Accept keeps the members picked so far.
         // Provisional: partypicker.gfx has no other way out.
         if changes.dismissed.contains(&Screen::PartyPicker) {

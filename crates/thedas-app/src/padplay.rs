@@ -280,6 +280,18 @@ impl PadPlay {
     }
 
     fn act(&mut self, a: Action, host: &mut dyn Host) -> Option<String> {
+        // A tutorial popup on screen takes A, as its Next (or, on the last, Close) button:
+        // each press shows the next until none is left. A deliberate addition: the PC popup
+        // has no pad controls.
+        if a == Action::Interact
+            && let Some(live) = host.live()
+        {
+            let mut sim = live.sim();
+            if !sim.world.tutorials.is_empty() {
+                sim.consume_tutorial(false);
+                return Some("tutorial dismissed".into());
+            }
+        }
         Some(match a {
             Action::Interact => self.interact(host),
             Action::Quickslot(n) => self.quickslot(host, n),
