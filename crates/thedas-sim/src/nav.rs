@@ -571,6 +571,72 @@ mod tests {
     }
 
     #[test]
+    fn a_mover_goes_by_a_door_it_can_open_rather_than_a_locked_one() {
+        use crate::world::ObjectKind;
+        use thedas_formats::gda::Cell;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let t = crate::m2da::Tables::empty();
+        t.insert(
+            "placeable_types",
+            &["ID", "Label", "#9a320a51"],
+            vec![(
+                93,
+                vec![
+                    Cell::Int(93),
+                    Cell::String("Door".into()),
+                    Cell::String("StateCnt_Door".into()),
+                ],
+            )],
+        );
+        s.world.tables = Arc::new(t);
+        // A wall down x = 2 with a gap at each end: the near one locked, the far one not.
+        let (w, h) = (5u32, 7u32);
+        let mut data = vec![1u8; (w * h) as usize];
+        for y in 1..h - 1 {
+            data[(y * w + 2) as usize] = 10;
+        }
+        let g = NavGrid {
+            columns: w,
+            rows: h,
+            cell_size: 1.0,
+            clearance: 2.0,
+            base: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            data,
+            heights: vec![0.0; (w * h) as usize],
+        };
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        s.area_layouts.insert(area, "two_doors".into());
+        s.nav_grids.insert("two_doors".into(), Some(Arc::new(g)));
+        let locked = s.world.spawn(ObjectKind::Placeable, "locked");
+        let unlocked = s.world.spawn(ObjectKind::Placeable, "unlocked");
+        for (id, y, state) in [(locked, 0.5, 1), (unlocked, 6.5, 0)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.appearance = 93;
+            o.position = [2.5, y, 0.0];
+            o.fields.insert("State".into(), state);
+        }
+        let walker = s.world.spawn(ObjectKind::Creature, "walker");
+        {
+            let o = s.world.get_mut(walker).unwrap();
+            o.area = Some(area);
+            o.position = [0.5, 1.5, 0.0];
+        }
+        assert_eq!(s.closed_doors(area).len(), 2);
+        assert_eq!(s.route_to(walker, [4.5, 1.5, 0.0]), Routed::Door(unlocked));
+        // With both locked, the shortest way is still the one tried.
+        s.world
+            .get_mut(unlocked)
+            .unwrap()
+            .fields
+            .insert("State".into(), 1);
+        assert_eq!(s.route_to(walker, [4.5, 1.5, 0.0]), Routed::Door(locked));
+    }
+
+    #[test]
     fn closed_doors_block_their_doorways_until_opened() {
         use crate::world::ObjectKind;
         use thedas_formats::gda::Cell;

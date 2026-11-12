@@ -1688,7 +1688,29 @@ impl Sim {
         if let Some(p) = crate::nav::route_avoiding(&g, from, to, &blocked) {
             return Routed::Path(p);
         }
-        let Some(p) = crate::nav::route(&g, from, to) else {
+        // Through closed doors that can be opened rather than locked ones, when such a route
+        // exists (provisional: the original's pathfinder is not traced; this keeps a mover from
+        // walking up to a locked door when another way is open to it).
+        let locked: std::collections::HashSet<usize> = doors
+            .iter()
+            .filter(|d| {
+                self.world.get(d.0).is_some_and(|o| {
+                    o.fields
+                        .get("State")
+                        .or_else(|| o.fields.get("AnimContState"))
+                        .copied()
+                        .unwrap_or(0)
+                        == 1
+                })
+            })
+            .flat_map(|d| d.1.iter().copied())
+            .collect();
+        let unlocked_route = if locked.is_empty() {
+            None
+        } else {
+            crate::nav::route_avoiding(&g, from, to, &locked)
+        };
+        let Some(p) = unlocked_route.or_else(|| crate::nav::route(&g, from, to)) else {
             return Routed::Straight;
         };
         if blocked.is_empty() {
