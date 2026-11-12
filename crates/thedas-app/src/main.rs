@@ -48,6 +48,7 @@
 mod audio;
 mod chargen_stage;
 mod control;
+mod cutactors;
 mod cutcam;
 mod focusnav;
 mod follow;

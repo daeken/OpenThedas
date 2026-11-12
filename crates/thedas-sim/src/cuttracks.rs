@@ -1,7 +1,8 @@
 //! What a cutscene does to its actors over time: the curves that move and turn them, the
-//! camera actors and which of them is the view. Nothing in the simulation reads these; they
-//! are for the presentation, which plays them on the cutscene's clock
-//! ([`crate::cutscene::Cutscene::elapsed_ms`]).
+//! places they jump to, their animations, the camera actors and which of them is the view.
+//! The presentation plays these on the cutscene's clock
+//! ([`crate::cutscene::Cutscene::elapsed_ms`]); the simulation reads only which objects
+//! play the actors and where the actors end ([`crate::cutactors`]).
 //!
 //! Traced in the executable (`EC::Cutscene`):
 //!
@@ -31,7 +32,10 @@
 //!   (field 5201) is its field 5610 is the cutscene's camera (cutscene +0x1d8). Each tick the
 //!   cutscene hands the camera that actor's position, rotation and field of view (0x7dd6b8).
 //! - Kind 4, `ActionPlayAnimation` (vtable 0xb23240): the animation (field 5400) names a node
-//!   of the cutscene's `.cub` animation tree (5401), whose node names the `.ani` file.
+//!   of the cutscene's `.cub` animation tree (5401), whose node names the `.ani` file; see
+//!   [`AnimationTrack`].
+//! - Kind 25, `ActionJumpToPlace`: see [`PlaceTrack`]. Kind 38, `ActionSnapToWalkmesh`
+//!   (vtable 0xb23584): the actor keeps to the ground.
 //!
 //! An actor's world placement goes through the cutscene's own placement (0x7d0660, 0x7cf6b0:
 //! cutscene +0xa0 and +0xb0), which only a cutscene played at another object sets
@@ -57,6 +61,14 @@ const FIELD_ACTOR_TRACKS: u32 = 5206;
 const FIELD_ACTOR_CREATURE: u32 = 5208;
 const FIELD_ACTOR_POSITION: u32 = 5214;
 const FIELD_ACTOR_ROTATION: u32 = 5215;
+const FIELD_ACTOR_TAG: u32 = 5216;
+const FIELD_ACTOR_END_POSITION: u32 = 5221;
+const FIELD_ACTOR_END_ROTATION: u32 = 5222;
+const FIELD_CUT_TREE: u32 = 5007;
+const FIELD_CUT_STAGE: u32 = 5017;
+const FIELD_CUT_SECONDS: u32 = 5000;
+const FIELD_PLACE_NAME: u32 = 1;
+const FIELD_PLACE_LOOK_AT: u32 = 5580;
 const FIELD_TRACK_KIND: u32 = 5300;
 const FIELD_TRACK_START: u32 = 5301;
 const FIELD_TRACK_END: u32 = 5302;
@@ -64,6 +76,8 @@ const FIELD_TRACK_CURVES: u32 = 5303;
 const FIELD_CAMERA_ACTOR: u32 = 5610;
 const FIELD_ANIMATION: u32 = 5400;
 const FIELD_ANIMATION_TREE: u32 = 5401;
+const FIELD_ANIMATION_SPEED: u32 = 5402;
+const FIELD_ANIMATION_OFFSET: u32 = 5403;
 const FIELD_CURVE_DEFAULT: u32 = 5350;
 const FIELD_CURVE_KEYS: u32 = 5351;
 const FIELD_CURVE_TRANSITIONS: u32 = 5352;
@@ -81,6 +95,8 @@ pub const TRACK_MOVE_SPLINE: u64 = 17;
 pub const TRACK_ROTATE: u64 = 18;
 pub const TRACK_LINK_TO_ACTOR: u64 = 27;
 pub const TRACK_JUMP_TO_CAMERA: u64 = 24;
+pub const TRACK_JUMP_TO_PLACE: u64 = 25;
+pub const TRACK_SNAP_TO_WALKMESH: u64 = 38;
 
 /// The field of view of a camera actor without a field-of-view track (degrees).
 /// Provisional: the actor's initial +0x64 is not traced.
@@ -254,16 +270,47 @@ impl CurveTrack {
     }
 }
 
-/// An animation an actor plays (an `AANI` track).
+/// An animation an actor plays (an `AANI` track, `ActionPlayAnimation`; its fields are read
+/// by 0x7dad20 and it updates at 0x7db400).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnimationTrack {
     pub start: f32,
     pub end: f32,
     /// The node of the animation tree that names the animation (`mh.dg_f_r_5p_en_v2__1`).
     pub node: String,
-    /// The animation tree (`bdccs_intro.cub`).
+    /// The animation tree (`bdccs_intro.cub`, an `ANBT` like the `.anb` trees); the
+    /// cutscene's own (5007) when the track names none.
     pub tree: String,
+    /// Field 5402 (+0x60): how fast the animation runs.
+    pub speed: f32,
+    /// Field 5403 (+0x64): seconds into the animation it starts at.
+    pub offset: f32,
 }
+
+impl AnimationTrack {
+    /// Seconds into the animation `t` seconds into the cutscene (0x7db400): the time since
+    /// the track's start, held to its span, times its speed, plus its offset. 0x7db400
+    /// stops a hair (0xae7118) short of the span's end; that is not followed.
+    pub fn time_at(&self, t: f32) -> f32 {
+        let since = (t - self.start).clamp(0.0, (self.end - self.start).max(0.0));
+        self.speed * since + self.offset
+    }
+}
+
+/// An `ActionJumpToPlace` track (kind 25, `AJSP`; update 0x7dc720): while it plays, the
+/// actor stands at a place of the cutscene's stage (field 1), turned towards another place
+/// (5580) when it names one, else as the place is turned. The place is looked up once
+/// (+0x60), and the actor is set there on every update.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlaceTrack {
+    pub start: f32,
+    pub end: f32,
+    pub place: String,
+    pub look_at: Option<String>,
+}
+
+/// A stage place's position and rotation by name (see [`Actor::stage_pose_at`]).
+pub type PlaceLookup<'a> = dyn Fn(&str) -> Option<([f32; 3], [f32; 4])> + 'a;
 
 /// A cutscene actor (`ACTR`) and what moves it.
 #[derive(Clone, Debug, PartialEq)]
@@ -271,8 +318,21 @@ pub struct Actor {
     /// Field 5201, which camera cuts name.
     pub id: i64,
     pub name: String,
-    /// The creature it stands for (field 5208), when it is one.
+    /// The creature template it stands for (field 5208), when it is one: a creature the
+    /// cutscene shows by itself when no object of the world stands in for the actor.
     pub creature: Option<String>,
+    /// Field 5216 (actor +0x44): the object of the world that plays the actor, found by
+    /// this name when the cutscene starts (0x7e36b0): `OWNER`, `PLAYER`, `HENCH...` or a
+    /// tag.
+    pub tag: Option<String>,
+    /// Fields 5221 and 5222 (actor +0x100, +0x110): where the actor ends the cutscene
+    /// (position, rotation x y z w) in the cutscene's space, as the toolset worked it out
+    /// from its tracks. A creature that plays the actor is put there when a
+    /// conversation's cutscene ends (see [`crate::cutactors`]).
+    pub end_position: [f32; 3],
+    pub end_rotation: [f32; 4],
+    /// The actor has an `ActionSnapToWalkmesh` track (kind 38): it is kept on the ground.
+    pub snaps: bool,
     /// Field 5214: the base the motion curves are placed from.
     pub position: [f32; 3],
     /// Field 5215: the base rotation (x, y, z, w).
@@ -285,6 +345,8 @@ pub struct Actor {
     pub fov: Vec<CurveTrack>,
     /// Kind-4 tracks, in the file's order.
     pub animations: Vec<AnimationTrack>,
+    /// Kind-25 tracks, in the file's order.
+    pub places: Vec<PlaceTrack>,
     /// Spans (start, end) of tracks that place the actor by other means, which are not
     /// followed: `ActionJumpToCamera` (kind 24, onto a camera of the cutscene's stage;
     /// update 0x7df2f0, which sets the actor's world placement and field of view each tick
@@ -304,6 +366,74 @@ pub struct Pose {
 }
 
 impl Actor {
+    /// The animations the actor plays `t` seconds into a cutscene `length` seconds long,
+    /// in the file's order, each with seconds into it: those whose span holds `t`, and the
+    /// last one started if it is a pose (no span) or runs past the cutscene's end, which
+    /// holds its last frame. Provisional: the executable's blending out of a track at its
+    /// end (0x7d9450, 0x7d92e0 under fields 5405 and 5411) is not followed.
+    pub fn animations_at(&self, t: f32, length: f32) -> Vec<(&AnimationTrack, f32)> {
+        let latest = self
+            .animations
+            .iter()
+            .filter(|a| a.start <= t)
+            .max_by(|a, b| a.start.total_cmp(&b.start));
+        self.animations
+            .iter()
+            .filter(|a| {
+                a.start <= t
+                    && (t <= a.end
+                        || latest.is_some_and(|l| {
+                            std::ptr::eq(l, *a) && (a.end <= a.start || a.end >= length)
+                        }))
+            })
+            .map(|a| (a, a.time_at(t)))
+            .collect()
+    }
+
+    /// Where the actor stands `t` seconds into the cutscene, in the cutscene's space, with
+    /// its stage's places (`place` gives a place's position and rotation by name). An
+    /// `ActionJumpToPlace` playing puts it on its place; otherwise its motion tracks do
+    /// ([`Actor::pose_at`]). Provisional: the jump is taken to win over the motion tracks
+    /// while it plays (as the actors' end poses, 5221, say: they are the places), and an
+    /// actor whose motion tracks have no keys is taken to stay on the last place it jumped
+    /// to.
+    pub fn stage_pose_at(&self, t: f32, place: &PlaceLookup) -> Pose {
+        let keyed = self
+            .motion
+            .iter()
+            .chain(&self.turn)
+            .any(|tr| tr.curves.iter().any(|c| !c.keys.is_empty()));
+        let jump = self
+            .places
+            .iter()
+            .rev()
+            .find(|p| p.start <= t && t <= p.end)
+            .or_else(|| {
+                (!keyed)
+                    .then(|| {
+                        self.places
+                            .iter()
+                            .filter(|p| p.start <= t)
+                            .max_by(|a, b| a.end.total_cmp(&b.end))
+                    })
+                    .flatten()
+            });
+        let mut pose = self.pose_at(t);
+        if let Some(j) = jump
+            && let Some((at, rot)) = place(&j.place)
+        {
+            pose.position = at;
+            pose.rotation = match j.look_at.as_deref().and_then(place) {
+                Some((to, _)) if (to[0] - at[0]).hypot(to[1] - at[1]) > 1e-6 => {
+                    let f = crate::world::facing_toward(to[0] - at[0], to[1] - at[1]);
+                    Placement::facing([0.0; 3], f).rotation
+                }
+                _ => normalize(rot),
+            };
+        }
+        pose
+    }
+
     /// Where the actor is `t` seconds into the cutscene: the last of each kind of track
     /// that has started wins, as the actions update in the file's order.
     pub fn pose_at(&self, t: f32) -> Pose {
@@ -339,10 +469,77 @@ impl Actor {
     }
 }
 
+/// Where a cutscene plays: its space's origin and turn in the world (cutscene +0xa0 and
+/// +0xb0). A cutscene a script loads plays where it was made (no placement); a
+/// conversation's plays on its stage (0x7d2aa0).
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Placement {
+    pub position: [f32; 3],
+    /// x, y, z, w.
+    pub rotation: [f32; 4],
+}
+
+impl Placement {
+    pub const NONE: Placement = Placement {
+        position: [0.0; 3],
+        rotation: [0.0, 0.0, 0.0, 1.0],
+    };
+
+    /// Placed at `position`, turned `facing` degrees about Z (0x4cbc40's quaternion of the
+    /// angle 0x4ee570 takes from a direction).
+    pub fn facing(position: [f32; 3], facing: f32) -> Placement {
+        let (s, w) = (facing.to_radians() * 0.5).sin_cos();
+        Placement {
+            position,
+            rotation: [0.0, 0.0, s, w],
+        }
+    }
+
+    /// A point of the cutscene's space in the world.
+    pub fn point(&self, p: [f32; 3]) -> [f32; 3] {
+        let r = rotate(normalize(self.rotation), p);
+        [
+            self.position[0] + r[0],
+            self.position[1] + r[1],
+            self.position[2] + r[2],
+        ]
+    }
+
+    /// A rotation of the cutscene's space in the world.
+    pub fn turn(&self, q: [f32; 4]) -> [f32; 4] {
+        mul(normalize(self.rotation), normalize(q))
+    }
+
+    /// A pose in the cutscene's space in the world.
+    pub fn pose(&self, p: Pose) -> Pose {
+        Pose {
+            position: self.point(p.position),
+            rotation: self.turn(p.rotation),
+            fov: p.fov,
+        }
+    }
+}
+
+/// The facing (degrees about Z, as objects face; see [`crate::world::heading_of`]) of a
+/// rotation: where it turns +Y, flattened (0x7e1485 then 0x451a30, which the end of a
+/// cutscene hands an object as its orientation). `None` when it looks straight up or down.
+pub fn facing_of(q: [f32; 4]) -> Option<f32> {
+    let f = rotate(normalize(q), [0.0, 1.0, 0.0]);
+    let len = (f[0] * f[0] + f[1] * f[1]).sqrt();
+    (len > 1e-6 && len.is_finite()).then(|| crate::world::facing_toward(f[0], f[1]))
+}
+
 /// What a cutscene does to its actors.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Tracks {
     pub actors: Vec<Actor>,
+    /// The cutscene's animation tree (5007, `bdccs_intro.cub`).
+    pub tree: Option<String>,
+    /// The stage file it was made on (5017, cutscene +0x48): only a cutscene with one is
+    /// placed on a conversation's stage (0x7d2adf, 0x7cdc46).
+    pub stage_file: Option<String>,
+    /// Its length (5000, seconds; 0 when the file gives none).
+    pub seconds: f32,
     /// Camera cuts (kind-11 tracks): from this time (seconds), the actor with this id is the
     /// camera. By time; on a tie, the file's order.
     pub cuts: Vec<(f32, i64)>,
@@ -360,8 +557,28 @@ impl Tracks {
         if g.file_type.0 != *b"CUT " {
             return Self::default();
         }
-        let mut out = Self::default();
-        for a in structs(g, g.root, FIELD_ACTORS) {
+        Self::from_cut(g, g.root)
+    }
+
+    /// The tracks of a cutscene struct (`CUT `): a `.cut` file's root, or a conversation
+    /// line's own cutscene (12211).
+    pub fn from_cut(g: &Gff4, root: StructId) -> Self {
+        let text = |l| {
+            g.field(root, l)
+                .and_then(Value::as_str)
+                .map(|s| s.trim_end_matches('\0').trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let mut out = Self {
+            tree: text(FIELD_CUT_TREE),
+            stage_file: text(FIELD_CUT_STAGE),
+            seconds: f32_field(g, root, FIELD_CUT_SECONDS)
+                .filter(|s| *s >= 0.0)
+                .unwrap_or(0.0)
+                .min(crate::cutscene::MAX_SECONDS),
+            ..Self::default()
+        };
+        for a in structs(g, root, FIELD_ACTORS) {
             let text = |l| {
                 g.field(a, l)
                     .and_then(Value::as_str)
@@ -383,10 +600,21 @@ impl Tracks {
                     Some(Value::Quat(q) | Value::Vec4(q)) if q.iter().all(|x| x.is_finite()) => *q,
                     _ => [0.0, 0.0, 0.0, 1.0],
                 },
+                tag: text(FIELD_ACTOR_TAG),
+                end_position: match g.field(a, FIELD_ACTOR_END_POSITION) {
+                    Some(Value::Vec3(v)) if v.iter().all(|x| x.is_finite()) => *v,
+                    _ => [0.0; 3],
+                },
+                end_rotation: match g.field(a, FIELD_ACTOR_END_ROTATION) {
+                    Some(Value::Quat(q) | Value::Vec4(q)) if q.iter().all(|x| x.is_finite()) => *q,
+                    _ => [0.0, 0.0, 0.0, 1.0],
+                },
+                snaps: false,
                 motion: Vec::new(),
                 turn: Vec::new(),
                 fov: Vec::new(),
                 animations: Vec::new(),
+                places: Vec::new(),
                 placed_elsewhere: Vec::new(),
             };
             for tr in structs(g, a, FIELD_ACTOR_TRACKS) {
@@ -421,6 +649,23 @@ impl Tracks {
                     TRACK_JUMP_TO_CAMERA | TRACK_LINK_TO_ACTOR => {
                         actor.placed_elsewhere.push((start, end))
                     }
+                    TRACK_SNAP_TO_WALKMESH => actor.snaps = true,
+                    TRACK_JUMP_TO_PLACE => {
+                        let text = |l| {
+                            g.field(tr, l)
+                                .and_then(Value::as_str)
+                                .map(|s| s.trim_end_matches('\0').trim().to_string())
+                                .filter(|s| !s.is_empty())
+                        };
+                        if let Some(place) = text(FIELD_PLACE_NAME) {
+                            actor.places.push(PlaceTrack {
+                                start,
+                                end,
+                                place,
+                                look_at: text(FIELD_PLACE_LOOK_AT),
+                            });
+                        }
+                    }
                     TRACK_PLAY_ANIMATION => {
                         let text = |l| {
                             g.field(tr, l)
@@ -429,12 +674,18 @@ impl Tracks {
                                 .unwrap_or_default()
                         };
                         let node = text(FIELD_ANIMATION);
+                        let tree = Some(text(FIELD_ANIMATION_TREE))
+                            .filter(|t| !t.is_empty())
+                            .or_else(|| out.tree.clone())
+                            .unwrap_or_default();
                         if !node.is_empty() {
                             actor.animations.push(AnimationTrack {
                                 start,
                                 end,
                                 node,
-                                tree: text(FIELD_ANIMATION_TREE),
+                                tree,
+                                speed: f32_field(g, tr, FIELD_ANIMATION_SPEED).unwrap_or(1.0),
+                                offset: f32_field(g, tr, FIELD_ANIMATION_OFFSET).unwrap_or(0.0),
                             });
                         }
                     }
@@ -782,5 +1033,59 @@ mod tests {
         other.file_type = FourCC::new(b"CONV");
         assert_eq!(Tracks::from_gff4(&other), Tracks::default());
         assert_eq!(Tracks::parse(b"junk"), Tracks::default());
+    }
+
+    #[test]
+    fn plays_jumps_and_animations_as_the_tracks_say() {
+        let t = Tracks::from_gff4(&cut());
+        let mut a = t.actors[0].clone();
+        // No motion keys but x's: a jump wins while it plays.
+        a.places.push(PlaceTrack {
+            start: 0.0,
+            end: 1.0,
+            place: "spot".into(),
+            look_at: Some("there".into()),
+        });
+        let place = |n: &str| match n {
+            "spot" => Some(([1.0, 2.0, 0.0], [0.0, 0.0, 0.0, 1.0])),
+            "there" => Some(([1.0, 5.0, 0.0], [0.0, 0.0, 0.0, 1.0])),
+            _ => None,
+        };
+        let p = a.stage_pose_at(0.5, &place);
+        assert_eq!(p.position, [1.0, 2.0, 0.0]);
+        // Turned towards the other place: +Y, facing 0.
+        assert!(facing_of(p.rotation).unwrap().abs() < 1e-3);
+        // After it the motion tracks (keyed) place it again.
+        assert!((a.stage_pose_at(1.5, &place).position[0] - 100.0).abs() < 1e-3);
+        // Placed on a stage turned a quarter: +Y is world -X.
+        let at = Placement::facing([10.0, 0.0, 0.0], 90.0).point([0.0, 2.0, 0.0]);
+        assert!((at[0] - 8.0).abs() < 1e-4 && at[1].abs() < 1e-4);
+        // Animations: a pose holds until the next starts; one running past the end holds.
+        let anim = |node: &str, start: f32, end: f32| AnimationTrack {
+            start,
+            end,
+            node: node.into(),
+            tree: "x.cub".into(),
+            speed: 2.0,
+            offset: 1.0,
+        };
+        a.animations = vec![
+            anim("pose", 0.0, 0.0),
+            anim("walk", 2.0, 3.0),
+            anim("sit", 4.0, 9.0),
+        ];
+        let names = |t: f32| -> Vec<&str> {
+            a.animations_at(t, 5.0)
+                .iter()
+                .map(|(l, _)| l.node.as_str())
+                .collect()
+        };
+        assert_eq!(names(1.0), ["pose"]);
+        assert_eq!(names(2.5), ["walk"]);
+        assert!(names(3.5).is_empty());
+        assert_eq!(names(6.0), ["sit"]);
+        // Speed and offset; held to the span.
+        assert_eq!(a.animations[1].time_at(2.5), 2.0);
+        assert_eq!(a.animations[1].time_at(9.0), 3.0);
     }
 }
