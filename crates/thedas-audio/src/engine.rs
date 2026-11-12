@@ -32,7 +32,7 @@ use crate::mixer::{Bus, Mixer, VoiceId, VoiceParams};
 pub struct EventHandle(pub u64);
 
 /// What to play and how.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct PlayOptions {
     /// The sample (by name, e.g. `179996_m`) a programmer-selected sound definition plays: a
     /// conversation line's voice-over.
@@ -41,6 +41,23 @@ pub struct PlayOptions {
     pub position: Option<[f32; 3]>,
     /// Parameter values to start with.
     pub parameters: Vec<(String, f32)>,
+    /// A gain on top of the event's own (a placed sound's `Volume`).
+    pub volume: f32,
+    /// Scales the event's distances (a placed sound's `MaxDistanceMult`): the source is
+    /// heard as though it were this much closer (below 1: farther).
+    pub distance_scale: f32,
+}
+
+impl Default for PlayOptions {
+    fn default() -> Self {
+        PlayOptions {
+            programmer_sound: None,
+            position: None,
+            parameters: Vec::new(),
+            volume: 1.0,
+            distance_scale: 1.0,
+        }
+    }
 }
 
 /// The player's volume settings (the options screen's 0..=10 sliders, as 0..=1).
@@ -105,6 +122,16 @@ struct Instance {
 impl Instance {
     fn event(&self) -> &Event {
         resolve(&self.project, &self.event).expect("event located at play")
+    }
+}
+
+/// A parameter's value in its range, 0..=1 (sound instances and envelopes are placed on it).
+fn normalized(p: &thedas_formats::fev::Parameter, params: &HashMap<String, f32>) -> f32 {
+    let v = *params.get(&p.name.to_ascii_lowercase()).unwrap_or(&p.min);
+    if p.max > p.min {
+        ((v - p.min) / (p.max - p.min)).clamp(0.0, 1.0)
+    } else {
+        0.0
     }
 }
 
@@ -575,6 +602,7 @@ impl AudioEngine {
     pub fn update(&mut self, dt: f32) {
         self.receive();
         let mut spawns = Vec::new();
+        let mut stops = Vec::new();
         let mut rng = self.rng;
         let rate = self.mixer.lock().map(|m| m.rate()).unwrap_or(48000) as f32;
         for ii in 0..self.instances.len() {
@@ -609,6 +637,24 @@ impl AudioEngine {
                 let t = fev.template(def);
                 let spawn_max = t.map(|t| t.spawn_time_max_ms).unwrap_or(0);
                 let max_spawned = t.map(|t| t.max_spawned.max(1)).unwrap_or(1) as usize;
+                // A sound instance plays while its layer's control parameter is within it.
+                if let EventBody::Complex {
+                    layers, parameters, ..
+                } = &ev.body
+                {
+                    let p = parameters.get(layers[s.layer].control_parameter as usize);
+                    let x = p.map(|p| normalized(p, &inst.params)).unwrap_or(0.0);
+                    let covered = x >= sound.start - 1e-4 && x <= sound.start + sound.length + 1e-4;
+                    if !covered {
+                        if s.started {
+                            stops.append(&mut s.voices);
+                            s.started = false;
+                            s.finished = false;
+                            s.next_spawn = None;
+                        }
+                        continue;
+                    }
+                }
                 if s.finished {
                     continue;
                 }
@@ -644,6 +690,11 @@ impl AudioEngine {
             }
         }
         self.rng = rng;
+        if let Ok(mut m) = self.mixer.lock() {
+            for v in stops {
+                m.fade(v, 0.0, 0.05, true);
+            }
+        }
         for (ii, si) in spawns {
             self.spawn(ii, si);
         }
@@ -724,7 +775,7 @@ impl AudioEngine {
                 if len > 1e-3 {
                     pan = (dot(d, listener.right) / len).clamp(-1.0, 1.0) * ev.pan_level_3d;
                 }
-                len
+                len / inst.options.distance_scale.max(1e-3)
             });
             if let Some(d) = distance {
                 inst.params.insert(PARAM_DISTANCE.to_string(), d);
@@ -776,6 +827,7 @@ impl AudioEngine {
                     .map(|t| t.volume)
                     .unwrap_or(1.0);
                 let g = ev.volume
+                    * inst.options.volume
                     * tvol
                     * inst.category_gain
                     * duck_gain

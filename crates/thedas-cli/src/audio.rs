@@ -9,6 +9,7 @@ use thedas_audio::{decode, wav};
 use thedas_formats::fev::{EventBody, Fev, WaveformKind};
 use thedas_formats::fsb::Fsb;
 
+#[allow(clippy::too_many_arguments)]
 pub fn play(
     install: &Path,
     events: &[String],
@@ -17,7 +18,15 @@ pub fn play(
     stop_at: Option<f32>,
     language: &str,
     rate: u32,
+    params: &[String],
 ) -> Result<()> {
+    let parameters: Vec<(String, f32)> = params
+        .iter()
+        .filter_map(|p| {
+            let (k, v) = p.split_once('=')?;
+            Some((k.to_string(), v.parse().ok()?))
+        })
+        .collect();
     use std::sync::{Arc, Mutex};
     use thedas_audio::{AudioEngine, Library, Mixer, PlayOptions};
     let lib = Arc::new(Library::new(Library::install_dirs(
@@ -58,6 +67,7 @@ pub fn play(
                 &path,
                 PlayOptions {
                     programmer_sound: prog,
+                    parameters: parameters.clone(),
                     ..Default::default()
                 },
             ) {
@@ -123,7 +133,35 @@ pub fn check(install: &Path, language: &str) -> Result<()> {
         "{cuts} cutscenes, {tracks} sound tracks, {} unresolved",
         missing.len()
     );
-    for m in missing.iter().take(40) {
+    let cut_missing = missing.len();
+    let (mut areas, mut themes, mut placed) = (0usize, 0usize, 0usize);
+    for name in vfs.names() {
+        if !name.to_ascii_lowercase().ends_with(".are") {
+            continue;
+        }
+        let Ok((data, _)) = vfs.read(&name) else {
+            continue;
+        };
+        areas += 1;
+        let (theme, sounds) = thedas_audio::area::area_audio(&data);
+        if let Some(t) = theme {
+            themes += 1;
+            if !resolves(&format!("{t}/main")) {
+                missing.push(format!("{name}: music {t}/main"));
+            }
+        }
+        for s in sounds {
+            placed += 1;
+            if !resolves(&s.event) {
+                missing.push(format!("{name}: {}", s.event));
+            }
+        }
+    }
+    println!(
+        "{areas} areas, {themes} with music, {placed} placed sounds, {} unresolved",
+        missing.len() - cut_missing
+    );
+    for m in missing.iter() {
         println!("  {m}");
     }
     Ok(())

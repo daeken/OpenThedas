@@ -9,6 +9,7 @@
 //!
 //! Audio is presentation only: it reads simulation state and never writes it.
 
+pub mod area;
 pub mod decode;
 #[cfg(feature = "device")]
 pub mod device;

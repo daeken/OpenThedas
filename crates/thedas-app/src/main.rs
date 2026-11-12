@@ -1173,6 +1173,46 @@ impl App {
                 }
             }
         }
+        // The area: its music and placed sounds.
+        if self.intro.is_none()
+            && let Some(live) = self.live.as_ref()
+            && !live.front_end
+        {
+            let sim = live.sim();
+            let area = sim
+                .world
+                .area
+                .and_then(|a| sim.world.get(a))
+                .map(|a| (a.id, a.template.clone()));
+            if let Some((area_id, resref)) = area.filter(|a| !a.1.is_empty()) {
+                if a.wants_area(&resref) {
+                    let data = sim
+                        .vfs
+                        .read(&format!("{resref}.are"))
+                        .map(|(d, _)| d)
+                        .unwrap_or_default();
+                    a.set_area(&resref, &data);
+                }
+                state.area = Some(resref);
+                state.combat = sim.world.party_fighting;
+                state.dead = sim.world.game_over;
+                state.inactive_sounds = sim
+                    .world
+                    .objects
+                    .values()
+                    .filter(|o| o.kind == thedas_sim::world::ObjectKind::Sound)
+                    .filter(|o| o.area == Some(area_id) && !o.active)
+                    .map(|o| o.tag.to_ascii_lowercase())
+                    .collect();
+            }
+            // Between the party leader and the camera (`sound_settings.gda` "Camera /
+            // player listener balance position": 0.17 of the way to the camera).
+            let cam = self.camera.position;
+            let feet = drop_sim_then(sim, || live.leader_feet()).unwrap_or(cam);
+            let p = feet + (cam - feet) * 0.17;
+            let right = [self.camera.yaw.sin(), -self.camera.yaw.cos(), 0.0];
+            state.listener = Some((p.to_array(), right));
+        }
         a.frame(state);
         let voice = a.voice_ms();
         if let Some(g) = self.gfx.as_mut() {
@@ -2126,6 +2166,12 @@ impl ApplicationHandler for App {
             g.window.request_redraw();
         }
     }
+}
+
+/// Runs `f` once the simulation's lock is released (`f` takes it again).
+fn drop_sim_then<T, G>(guard: G, f: impl FnOnce() -> T) -> T {
+    drop(guard);
+    f()
 }
 
 /// The party leader uses quickbar slot `slot`; an ability that needs aiming waits for its
