@@ -1000,6 +1000,24 @@ impl AreaRenderer {
     /// take their skeleton's pose (`poses[skeleton]`: the rest and posed model-space matrices
     /// per node; a skeleton missing from it stays at rest) through their skinning palette, or, on the stand-in (which does
     /// not skin), follow their first palette bone rigidly; attachments follow their node.
+    /// Draws every draw of `scene`'s prop `prop` at `opacity` (see
+    /// [`crate::d3d_gpu::D3dPass::set_opacity`]): 1 as its materials say, below 1 faded,
+    /// blended over what lies behind it.
+    pub fn set_prop_opacity(
+        &mut self,
+        ctx: &GpuContext,
+        scene: &AreaScene,
+        prop: usize,
+        opacity: f32,
+    ) {
+        let Some(p) = scene.props.get(prop) else {
+            return;
+        };
+        for d in p.draws.clone() {
+            self.d3d.set_opacity(ctx, d, opacity);
+        }
+    }
+
     pub fn pose_prop(
         &mut self,
         ctx: &GpuContext,
@@ -1273,7 +1291,13 @@ impl AreaRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        for (di, r) in self.opaque.iter().chain(&self.blended) {
+        // Faded objects' opaque draws go after the other opaque ones, so what lies behind
+        // them is there to show through.
+        let faded =
+            |r: &DrawRef| matches!(*r, DrawRef::D3d(i) if self.d3d.is_faded(&self.d3d.draws[i]));
+        let opaque = self.opaque.iter().filter(|(_, r)| !faded(r));
+        let faded_opaque = self.opaque.iter().filter(|(_, r)| faded(r));
+        for (di, r) in opaque.chain(faded_opaque).chain(&self.blended) {
             if self
                 .only_draws
                 .as_ref()
