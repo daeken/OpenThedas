@@ -10,7 +10,7 @@ repository.
 
 ## Status
 
-Last updated 2026-11-12 20:15 UTC, main 14e8c8b
+Last updated 2026-11-12 21:55 UTC, main 1262f72
 
 For everything that is wrong or missing, in detail and split into items that can be picked up in
 parallel, see [docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md).
@@ -33,7 +33,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
     - conversations start as the exe starts them: dialog game mode for the talk, and talk commands go through the dialogue event to the target's script. A first line that plays before its screen is up no longer stalls the conversation;
     - line cutscene cameras are placed with their cutscene's stage, and ActionJumpToCamera puts the camera on stage cameras: the City Elf Vaughan scene plays as staged shots.
   - Open:
-    - cameras placed by LinkToActor;
+    - cameras and actors linked with LinkToActor are placed (provisional: links use the target's root frame);
     - City Elf: Vaughan faces away from the camera in one shot (provisional; waiting on reference frames from the original).
 - 🟡 **Exploration and camera**:
   - Walking, click-to-pick, doors and companions following. Followers come along on area changes, and they stand in the exe's formation slots and follow by its rules.
@@ -44,7 +44,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Creatures the camera is inside fade out as the exe does (0.25 m sphere against the models' creature-group physics shapes, head included; opacity 0.05; not in dialog or cutscenes). Provisional: the shapes are placed by rest pose, not the animated skeleton.
   - With a pad, A walks through open doors instead of using them.
   - The follow camera resets behind the leader after a load and at the end of a cutscene, as the exe does, and keeps its zoom across loads.
-  - A new area's level and objects are built on a worker thread while the window keeps presenting a loading frame (black for now; the original's loading movies are next). The world holds still and its sounds duck meanwhile, and the camera resets as the world comes up. The simulation's own load on an area transition is unchanged and still takes one frame (0.1 to 0.4 s into the Commons). A new game or a save loaded from the start menu also opens on a worker, the running game held behind it. Headless captures load within the frame as before; `THEDAS_ASYNC_LOADS=1` uses the worker there too, and `THEDAS_HIDDEN_WINDOW=1` runs the window unseen (no Dock icon or focus on macOS) for driving it with `--control` (a test hook). `THEDAS_NO_LOAD_MOVIE=1` leaves the loading movie out (black with the interface).
+  - Loading screens: a new area, a save load and a new game build on a worker thread while the window keeps presenting the original's loading movie (load_town for a save load, a new game or a change of area list, with the script's hint; load_light for a change within one area list). The screen goes up before the old area goes, as in the exe: a scripted transition is held one update (33 ms, provisional length), the world holds still, its sounds duck and the camera resets as the world comes up. load_town plays its outro in about 1.6 s at 60 fps. Not yet: the world map staying up while travelling. Headless captures load within the frame as before; `THEDAS_ASYNC_LOADS=1` uses the worker there too (frames wait for the load), `THEDAS_HIDDEN_WINDOW=1` runs the window unseen for driving it with `--control` (a test hook), and `THEDAS_NO_LOAD_MOVIE=1` leaves the movie out.
   - The field of view narrows from 60° to 42.5° toward the far, tactical end of zoom, as the exe does. Page Up and Page Down zoom.
   - Creatures placed by an area stand on its floor, as the exe projects them (this was the "see-through guard" in the Dust Town opening).
 - 🟡 **Combat and simulation**:
@@ -109,7 +109,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
 
 ### Known blockers
 
-None open. Loading screens are in progress: today the window freezes while an area loads, with nothing shown. The Proving armour chest was fixed by #253 and #254.
+None open. The Proving armour chest was fixed by #253 and #254.
 
 ### Origin openings
 
