@@ -356,6 +356,20 @@ impl Live {
             sim.world.cutscene.is_some() || sim.conversation_line().is_some()
         };
         let eye = eye.filter(|_| !blocked);
+        // Each creature's body: its appearance's `PERSPACE` radius and height (see
+        // `crate::camfade::body_capsule`), for models with no creature shapes of their own.
+        let bodies: std::collections::HashMap<ObjectId, (f32, f32)> = match eye {
+            Some(_) => {
+                let sim = self.sim();
+                sim.world
+                    .objects
+                    .values()
+                    .filter(|o| o.kind == thedas_sim::world::ObjectKind::Creature)
+                    .map(|o| (o.id, (sim.body_radius(o.id), appearance_height(&sim, o.id))))
+                    .collect()
+            }
+            None => Default::default(),
+        };
         let mut touching = Vec::new();
         if let (Some(eye), Some(level), Some(objects)) =
             (eye, self.level.as_ref(), self.objects.as_ref())
@@ -368,6 +382,10 @@ impl Live {
                 if placement.w_axis.truncate().distance(eye) > 4.0 {
                     continue;
                 }
+                let Some(&(radius, height)) = bodies.get(id) else {
+                    continue;
+                };
+                let mut own_shapes = false;
                 let touches = models.iter().any(|m| {
                     let key = m.to_ascii_lowercase();
                     let shapes = self.creature_shapes.entry(key.clone()).or_insert_with(|| {
@@ -381,10 +399,18 @@ impl Live {
                                 .unwrap_or_default(),
                         )
                     });
+                    own_shapes |= !shapes.is_empty();
                     shapes
                         .iter()
                         .any(|s| s.touches(placement, eye, crate::camfade::FADE_RADIUS))
                 });
+                let touches = touches
+                    || (!own_shapes
+                        && crate::camfade::body_capsule(radius, height).touches(
+                            placement,
+                            eye,
+                            crate::camfade::FADE_RADIUS,
+                        ));
                 if touches {
                     touching.push(*id);
                 }
@@ -411,9 +437,25 @@ impl Live {
     /// gender 2), else [`crate::follow::DEFAULT_LOOK_HEIGHT`] (0x6a1a30 hands the camera
     /// the appearance's height).
     pub fn leader_look_height(&self) -> f32 {
-        let sim = self.sim();
+        let leader = self.sim().world.controlled();
+        leader.map_or(crate::follow::DEFAULT_LOOK_HEIGHT, |id| {
+            self.creature_height(id)
+        })
+    }
+
+    /// A creature's height: its appearance's `apr_base.gda` `HEIGHT`, or `HEIGHT_F` for a
+    /// female, else [`crate::follow::DEFAULT_LOOK_HEIGHT`].
+    pub fn creature_height(&self, id: ObjectId) -> f32 {
+        appearance_height(&self.sim(), id)
+    }
+}
+
+/// A creature's height from its appearance (see [`Live::creature_height`]), with the
+/// simulation already in hand.
+fn appearance_height(sim: &Sim, id: ObjectId) -> f32 {
+    {
         let w = &sim.world;
-        let height = w.controlled().and_then(|id| w.get(id)).and_then(|o| {
+        let height = w.get(id).and_then(|o| {
             let t = w.tables().get(0, "apr_base")?;
             let column = if o.fields.get("Gender").copied() == Some(2) {
                 "HEIGHT_F"
@@ -430,7 +472,9 @@ impl Live {
             .filter(|h| h.is_finite() && *h > 0.0)
             .unwrap_or(crate::follow::DEFAULT_LOOK_HEIGHT)
     }
+}
 
+impl Live {
     /// Advances what runs while the world may be stopped (the conversation camera's clock).
     pub fn advance_presentation(&mut self, dt_ms: f64) {
         self.talk_camera.advance(dt_ms);

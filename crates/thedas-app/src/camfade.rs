@@ -91,6 +91,20 @@ impl Shape {
     }
 }
 
+/// The body of a creature whose models have no creature shapes (humanoids: their `.phy`
+/// files are their equipment's, with none in the creatures group): an upright capsule from
+/// its feet to its `height`, of its appearance's `PERSPACE` `radius`, in its model's space.
+/// Provisional: the executable's creatures-group shape for such a creature (taken to be its
+/// character controller's capsule) is not traced.
+pub fn body_capsule(radius: f32, height: f32) -> Shape {
+    let r = radius.max(0.0);
+    Shape::Capsule {
+        a: Vec3::new(0.0, 0.0, r),
+        b: Vec3::new(0.0, 0.0, (height - r).max(r)),
+        radius: r,
+    }
+}
+
 fn matrix(t: &Transform) -> Mat4 {
     let [x, y, z, w] = t.rotation;
     let q = Quat::from_xyzw(x, y, z, w);
@@ -202,6 +216,16 @@ mod tests {
         // No time passing changes nothing.
         f.update([3], 0.0);
         assert_eq!(f.alpha(3), 1.0);
+    }
+
+    #[test]
+    fn a_camera_half_a_metre_from_a_humans_axis_touches_his_body() {
+        let body = body_capsule(0.35, 1.75);
+        let at = Mat4::from_translation(Vec3::new(5.0, 0.0, 0.0));
+        // 0.5 m from the axis at head height: within 0.35 + 0.25.
+        assert!(body.touches(&at, Vec3::new(5.5, 0.0, 1.6), FADE_RADIUS));
+        // A normal 3 m camera does not.
+        assert!(!body.touches(&at, Vec3::new(8.0, 0.0, 1.8), FADE_RADIUS));
     }
 
     #[test]
