@@ -89,7 +89,8 @@ pub const SCRIPT_DIALOG_RESULT: &str = "GUIPopupLayer.ScriptDialogResult";
 /// handlers. Returns whether the simulation acted on it.
 pub fn apply(sim: &mut Sim, name: &str, args: &[String]) -> bool {
     // A script's message box answered: its button's callback (`ScriptDialogResult <popup
-    // type> <button, from 1> <owner>`, see `binding::script_popup`).
+    // type> <button, from 1> <owner>`, see `binding::script_popup`), to which the app adds
+    // the text typed into the box (argument 3).
     if name == SCRIPT_DIALOG_RESULT {
         let button = args
             .get(1)

@@ -812,6 +812,27 @@ made from level k − 1:
    (no multiplication by φ); otherwise C + ν · ρr · φ, computed as ((ν · ρr) · φ) per
    component.
 
+### 5.5 Clarifications (round 3)
+
+- **A. Pruning, confirmed literal.** Pruning uses the level being grown (L), its
+  `pruning_percent` and `pruning_depth`; with depth 0 the test percent is q, the child's
+  position along this branch (2.5 step 2). With level L = 2 of a grass file having
+  `first_branch` 0.01, `last_branch` 0.02 and `pruning_percent` 0.019, q ∈ [0.01, 0.02] and only
+  children with q ≥ 0.019 survive, about one in ten. That is the computation as specified; the
+  sparse result (a few blades per clump) is expected from it, not a misreading. If the game's
+  clumps look much denser in the reference shots, raise it as an (exe) item rather than
+  changing the rule.
+- **B.** Yes: in 4.4 "pos" are the guide's skeleton vertex positions (the frond branch's
+  vertices from 2.4).
+- **C.** Yes: the angle offset range is the chosen frond texture's `min_angle_offset` and
+  `max_angle_offset`.
+- **D.** Yes: Rz is the about-Z matrix of 2.2, its angle in degrees, applied on the left
+  (M ← Rz · M).
+- **E.** The midpoint is (a + b) · 0.5, per component.
+- **F.** Atlas mapping is applied only to frond textures that have an entry in the
+  texture-coordinate section; a frond texture without one keeps its unmapped (s, t) (0–1
+  across the frond, as built in 4.4/4.5). The same holds for leaf textures without an entry.
+
 ## Stage 6 — Bushes, grass and cattails
 
 There is no separate engine: `bsh_*`, `gra_*` and cattail files (`*_catgras`, `*_catflwr`) are

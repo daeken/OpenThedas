@@ -8,6 +8,7 @@ use super::frame::{
     Frame, Vec3, add, angle_between, cross, degrees, dot, fast_sqrt, lerp, lerp3, normalize, scale,
     sub,
 };
+use super::leaves::{Leaf, LeafContext, about_y, make_leaf};
 use super::{Curve, Random};
 use crate::speedtree::{BezierSpline, BranchLevel, SpeedTree, SplinePoint};
 use std::rc::Rc;
@@ -34,6 +35,8 @@ pub struct Skeleton {
     pub buds: Vec<Bud>,
     /// Frond guides, in the order frond branches grew (4.1).
     pub guides: Vec<Guide>,
+    /// Leaves in creation order (stage 5).
+    pub leaves: Vec<Leaf>,
 }
 
 /// A frond branch's record for stage 4 (4.1), made when its vertices are done.
@@ -245,6 +248,9 @@ struct Grower<'t> {
     branches: Vec<Branch>,
     buds: Vec<Bud>,
     guides: Vec<Guide>,
+    leaves: Vec<Leaf>,
+    /// Per branch, its leaf-mesh rotation counter (5.3 step 8).
+    mesh_counters: Vec<usize>,
 }
 
 /// Grows a tree's skeleton (stage 2). The stream is returned in its final state so later
@@ -281,6 +287,8 @@ pub fn grow(tree: &SpeedTree) -> (Skeleton, Random) {
         branches: Vec::new(),
         buds: Vec::new(),
         guides: Vec::new(),
+        leaves: Vec::new(),
+        mesh_counters: Vec::new(),
     };
     // Step 7: the trunk.
     if !tree.branch_levels.is_empty() {
@@ -303,6 +311,7 @@ pub fn grow(tree: &SpeedTree) -> (Skeleton, Random) {
         branches: grower.branches,
         buds: grower.buds,
         guides: grower.guides,
+        leaves: grower.leaves,
     };
     (skeleton, grower.random)
 }
@@ -637,6 +646,74 @@ impl<'t> Grower<'t> {
         Some(index)
     }
 
+    /// A bud on branch `index` (5.2): its own two draws, then a leaf (5.3).
+    fn bud(
+        &mut self,
+        index: usize,
+        level: i32,
+        base: Vec3,
+        frame0: Frame,
+        direction: Vec3,
+        percent: f32,
+    ) {
+        let tree = self.tree;
+        let (Some(info), Some(c)) = (self.info(level, false), self.curves(level, false)) else {
+            return;
+        };
+        let length = c.length.value_with_variance(percent, &mut self.random) * self.size;
+        let step = length / info.segments as f32;
+        let azimuth = self.random.uniform(-180.0, 180.0);
+        let axis = frame0.apply(direction);
+        let mut frame = Frame::about_axis(axis, azimuth).then(&frame0);
+        frame = about_y(60.0).then(&frame);
+        let position = add(base, scale(frame.direction(), step));
+        let nu = normalize(sub(position, base));
+        // Step 5: the parent direction.
+        let branch = &self.branches[index];
+        let depth = tree.leaves.dimming_depth;
+        let delta = if branch.vertices.is_empty() {
+            nu
+        } else if depth == 0 {
+            let n = branch.vertices.len();
+            let k = ((f64::from(percent) * (n - 1) as f64) as usize).min(n - 1);
+            normalize(branch.vertices[k].direction)
+        } else {
+            let mut current = Some(index);
+            let mut count = 0;
+            while let Some(c) = current {
+                if count >= depth - 1 {
+                    break;
+                }
+                current = self.branches[c].parent;
+                count += 1;
+            }
+            let base = current
+                .and_then(|c| self.branches[c].vertices.first())
+                .or(branch.vertices.first())
+                .map(|v| v.position)
+                .unwrap_or(base);
+            normalize(sub(position, base))
+        };
+        if self.mesh_counters.len() <= index {
+            self.mesh_counters.resize(index + 1, 0);
+        }
+        make_leaf(
+            LeafContext {
+                tree,
+                branches: &self.branches,
+                bank: &self.bank,
+                random: &mut self.random,
+                leaves: &mut self.leaves,
+                mesh_counter: &mut self.mesh_counters[index],
+            },
+            position,
+            percent,
+            index,
+            nu,
+            delta,
+        );
+    }
+
     /// Records frond branch `index` as a guide (4.1), drawing the texture choice and angle
     /// offset when the fronds have textures.
     fn guide(&mut self, index: usize) {
@@ -831,6 +908,7 @@ impl<'t> Grower<'t> {
                     along: q,
                     percent,
                 });
+                self.bud(index, child_level, position, a.frame, a.direction, percent);
                 continue;
             }
             let (frame, azimuth_axis) = if child_level == self.first_level {
