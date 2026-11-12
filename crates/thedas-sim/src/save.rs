@@ -31,7 +31,11 @@ pub const SAVE_FORMAT: u32 = 1;
 ///   Loading an earlier save tells it of the party as it stands.
 /// - 5: creatures placed dead (`CREATURE_SPAWN_DEAD`, see [`Sim::spawns_dead`]) are dead from
 ///   their creation; earlier saves hold them alive, and loading one lays them out.
-pub const SAVE_REVISION: u32 = 5;
+/// - 6: stackable items merge into the stacks already held, and creatures hear
+///   `EVENT_TYPE_EQUIP` for their starting gear (rules_core works out the main-hand damage,
+///   property 50, from it). Loading an earlier save merges each creature's carried stacks
+///   and tells the party's members of what they wear (no effects are applied again).
+pub const SAVE_REVISION: u32 = 6;
 
 /// The trace channel loading reports save damage on.
 pub const SAVE_CHANNEL: i32 = -7;
@@ -233,6 +237,7 @@ impl Sim {
         // Caches keyed by object id belong to the world just replaced.
         self.area_layouts.clear();
         self.door_cells.clear();
+        self.placeable_collisions.clear();
         if save_revision < 1 {
             self.apply_worn_properties();
         }
@@ -254,6 +259,29 @@ impl Sim {
             let ids: Vec<ObjectId> = self.world.objects.values().map(|o| o.id).collect();
             for id in ids {
                 self.lay_out_if_spawned_dead(id);
+            }
+        }
+        if save_revision < 6 {
+            let owners: Vec<ObjectId> = self
+                .world
+                .objects
+                .values()
+                .filter(|o| !o.inventory.is_empty())
+                .map(|o| o.id)
+                .collect();
+            for owner in owners {
+                self.restack(owner);
+            }
+            let party = crate::engine::party_of(self);
+            for m in party {
+                let worn: Vec<(i32, ObjectId)> = self
+                    .world
+                    .get(m)
+                    .map(|o| o.equipment.iter().map(|(s, i)| (*s, *i)).collect())
+                    .unwrap_or_default();
+                for (slot, item) in worn {
+                    self.equip_event("EQUIP", m, item, slot, false);
+                }
             }
         }
         self.learn_held_recipes();
