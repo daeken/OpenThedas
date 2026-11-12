@@ -1027,6 +1027,11 @@ impl ConstantContext<'_> {
 pub enum TextureSource {
     /// A texture resource, e.g. `fca_master_d.dds`.
     Resource(String),
+    /// A material's texture, else (when it does not load) its parameter's default: the
+    /// terrain palette's `DirtRocks` names `ter_dirtrock_d.dds`, which the game does not
+    /// ship, and draws `Default_Missing` (mid grey) rather than black. Provisional: the
+    /// exe's fallback for a texture that fails to load is not traced.
+    ResourceOr(String, String),
     /// Opaque white (shadow maps: every texel "lit").
     White,
     /// Opaque black.
@@ -1071,8 +1076,19 @@ pub fn sampler_texture(
             },
         );
     }
+    let default = param
+        .default
+        .as_deref()
+        .filter(|d| !d.is_empty())
+        .map(|d| format!("{}.dds", d.to_ascii_lowercase()));
     if let Some(t) = material.texture(&param.name) {
-        return (Some(sampler), TextureSource::Resource(t));
+        return (
+            Some(sampler),
+            match default {
+                Some(d) => TextureSource::ResourceOr(t, d),
+                None => TextureSource::Resource(t),
+            },
+        );
     }
     let _ = ty;
     match param.default.as_deref() {
@@ -1274,7 +1290,11 @@ mod tests {
             sampler("smpUnknown", 2),
         ]);
         let tex = |r| sampler_texture(Some(&t), r, TextureType::Tex2D, &material, None).1;
-        assert_eq!(tex(0), TextureSource::Resource("w_d.dds".into()));
+        // The material's own texture, else (missing) the parameter's default.
+        assert_eq!(
+            tex(0),
+            TextureSource::ResourceOr("w_d.dds".into(), "default_missing.dds".into())
+        );
         assert_eq!(tex(1), TextureSource::Resource("default_black.dds".into()));
         assert_eq!(tex(2), TextureSource::Black);
         let lights = DrawLights::default();
