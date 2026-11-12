@@ -54,7 +54,14 @@ pub trait Host {
     fn highlight_reply(&mut self, n: usize) -> bool;
     /// The buttons on screen the focus can land on (see [`crate::focusnav`]).
     fn focus_targets(&mut self) -> Vec<thedas_ui::FocusTarget>;
+    /// Whether a text field has the keyboard focus (a name being typed).
+    fn text_focused(&mut self) -> bool;
+    /// A key into the focused text field; false when none has focus.
+    fn text_key(&mut self, key: thedas_ui::UiKey) -> bool;
 }
+
+/// The letters the D-pad steps through when typing on the pad, in order.
+const PAD_LETTERS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz '-";
 
 /// How far ahead of the leader a walk order aims (metres): far enough that it never
 /// arrives before the next order.
@@ -114,6 +121,8 @@ pub struct PadPlay {
     /// The pointer rests on a focused button (the D-pad or stick moved it there): its own
     /// highlight shows the focus, and the arrow is not drawn.
     pub snapped: bool,
+    /// Typing on the pad: the letter (in [`PAD_LETTERS`]) the D-pad last put in the field.
+    letter: Option<usize>,
     /// The button focused (its path and window rectangle), marked on screen, and how long
     /// since it was last looked for (it moves or goes with its screen).
     focused: Option<(String, [f64; 4])>,
@@ -421,6 +430,39 @@ impl PadPlay {
                 host.double_click();
                 let (x, y) = host.cursor();
                 format!("double click {x:.0},{y:.0}")
+            }
+            // A text field has the focus (the hero's name): the D-pad types, as a console's
+            // name entry does: up and down step the last letter through the alphabet,
+            // right starts the next letter, left rubs one out. A deliberate addition: the PC
+            // field takes only the keyboard.
+            Action::Focus(dx, dy) if host.text_focused() => {
+                let letters: Vec<char> = PAD_LETTERS.chars().collect();
+                match (dx, dy) {
+                    (0, dy) => {
+                        let at = self.letter.map_or(0, |i| {
+                            (i as i32 + i32::from(dy)).rem_euclid(letters.len() as i32) as usize
+                        });
+                        if self.letter.is_some() {
+                            host.text_key(thedas_ui::UiKey::Backspace);
+                        }
+                        host.text_key(thedas_ui::UiKey::Char(letters[at]));
+                        self.letter = Some(at);
+                        format!("typing {}", letters[at])
+                    }
+                    (1, _) => {
+                        // The next letter starts as the one before it, lower case after
+                        // the first.
+                        let at = self.letter.map_or(0, |i| if i < 26 { i + 26 } else { i });
+                        host.text_key(thedas_ui::UiKey::Char(letters[at]));
+                        self.letter = Some(at);
+                        format!("typing {}", letters[at])
+                    }
+                    _ => {
+                        host.text_key(thedas_ui::UiKey::Backspace);
+                        self.letter = None;
+                        "rubbed out a letter".into()
+                    }
+                }
             }
             Action::Focus(dx, dy) => return self.focus(host, dx, dy),
             Action::TogglePointer => {
