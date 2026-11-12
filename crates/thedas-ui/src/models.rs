@@ -249,6 +249,103 @@ pub struct Drawn {
 
 /// What draws one creature or placeable; no models when it has nothing to draw.
 pub fn object_models(sim: &Sim, o: &Object) -> Drawn {
+    object_models_in(sim, o, Gear::World)
+}
+
+/// Where a creature's equipped items are found: in the world (its equipment names world
+/// objects), or among items standing in for them (by inventory slot), for a look built from
+/// a template rather than from a creature of the world (see [`template_look`]).
+#[derive(Clone, Copy)]
+enum Gear<'a> {
+    World,
+    Scratch(&'a [(i32, Object)]),
+}
+
+/// Creature `o` drawn as creature template `template` (`.utc`, without extension) makes it:
+/// the template's appearance (`Appearance Data` / `Appearance_Type`), race and gender where
+/// `o` has none of its own, its head morph and body tint, and the items its
+/// `Equip_ItemList` wears (each entry's struct id is the `INVENTORY_SLOT_*`, as the
+/// simulation reads it). The creature's own gender, appearance and kept face win; it stands
+/// where `o` stands. `None` when the template cannot be read or draws nothing.
+pub fn template_look(sim: &Sim, o: &Object, template: &str) -> Option<ObjectModel> {
+    use thedas_formats::gff3::{Gff3, Struct, Value};
+    fn field<'a>(s: &'a Struct, label: &str) -> Option<&'a Value> {
+        s.fields.iter().find(|f| f.label == label).map(|f| &f.value)
+    }
+    fn int(v: Option<&Value>) -> Option<i32> {
+        Some(match v? {
+            Value::Byte(v) => *v as i32,
+            Value::Char(v) => *v as i32,
+            Value::Word(v) => *v as i32,
+            Value::Short(v) => *v as i32,
+            Value::Dword(v) => *v as i32,
+            Value::Int(v) => *v,
+            _ => return None,
+        })
+    }
+    let read = |name: &str| -> Option<Gff3> {
+        let (data, _) = sim.vfs.read(name).ok()?;
+        Gff3::parse(&data).ok()
+    };
+    let g = read(&format!("{template}.utc"))?;
+    let root = g.structs.first()?;
+    let app = match field(root, "Appearance Data") {
+        Some(Value::Struct(i)) => g.structs.get(*i as usize),
+        _ => None,
+    };
+    let mut look = o.clone();
+    look.template = template.to_string();
+    if look.appearance == 0 {
+        look.appearance = app.and_then(|a| int(field(a, "Appearance_Type")))?;
+    }
+    if !look.fields.contains_key("Race")
+        && let Some(r) = int(field(root, "Race"))
+    {
+        look.fields.insert("Race".into(), r);
+    }
+    look.equipment.clear();
+    let mut items = Vec::new();
+    if let Some(Value::List(entries)) = field(root, "Equip_ItemList") {
+        for e in entries.iter().filter_map(|&i| g.structs.get(i as usize)) {
+            let resref = match field(e, "TemplateResRef") {
+                Some(Value::ResRef(b) | Value::ExoString(b)) => String::from_utf8_lossy(b)
+                    .trim_end_matches('\0')
+                    .trim()
+                    .to_ascii_lowercase(),
+                _ => continue,
+            };
+            let Some(t) = read(&format!("{resref}.uti")) else {
+                continue;
+            };
+            let Some(r) = t.structs.first() else { continue };
+            let mut item = Object::new(0, ObjectKind::Item, &resref);
+            item.template = resref;
+            for f in &r.fields {
+                if let Some(v) = int(Some(&f.value)) {
+                    item.fields.insert(f.label.clone(), v);
+                }
+            }
+            items.push((e.id as i32, item));
+        }
+    }
+    let d = object_models_in(sim, &look, Gear::Scratch(&items));
+    (!d.models.is_empty()).then(|| ObjectModel {
+        id: o.id,
+        tag: o.tag.clone(),
+        kind: o.kind,
+        models: d.models,
+        attached: d.attached,
+        tints: d.tints,
+        morph: d.morph,
+        hide_hair: d.hide_hair,
+        motion: motion(sim, &look),
+        position: o.position,
+        facing: o.facing,
+    })
+}
+
+/// [`object_models`] with the creature's items found in `gear`.
+fn object_models_in(sim: &Sim, o: &Object, gear: Gear) -> Drawn {
     let tables = sim.world.tables();
     match o.kind {
         ObjectKind::Placeable => {
@@ -276,7 +373,7 @@ pub fn object_models(sim: &Sim, o: &Object) -> Drawn {
                 let gender = creature_gender(sim, o);
                 match part_prefix(&race, gender) {
                     Some(p) => {
-                        let (mut parts, helmet) = worn_parts(sim, o, &p);
+                        let (mut parts, helmet) = worn_parts(sim, o, &p, gear);
                         hide_hair = helmet;
                         prefix = Some(p.clone());
                         if morph.is_none() {
@@ -294,7 +391,7 @@ pub fn object_models(sim: &Sim, o: &Object) -> Drawn {
             if models.is_empty() {
                 return Drawn::default();
             }
-            let mut tints = equipment_tints(sim, o, prefix.as_deref());
+            let mut tints = equipment_tints(sim, o, prefix.as_deref(), gear);
             if prefix.is_none()
                 && let Some(t) = body_tint(sim, o)
             {
@@ -302,7 +399,7 @@ pub fn object_models(sim: &Sim, o: &Object) -> Drawn {
             }
             Drawn {
                 models,
-                attached: weapons(sim, o),
+                attached: weapons(sim, o, gear),
                 tints,
                 morph,
                 hide_hair,
@@ -317,20 +414,34 @@ fn slot(sim: &Sim, name: &str) -> i32 {
 }
 
 fn equipped<'a>(sim: &'a Sim, o: &Object, slot_name: &str) -> Option<&'a Object> {
-    sim.world.get(*o.equipment.get(&slot(sim, slot_name))?)
+    equipped_in(sim, o, slot_name, Gear::World)
+}
+
+/// The item creature `o` wears in a slot, found in `gear`.
+fn equipped_in<'a>(
+    sim: &'a Sim,
+    o: &Object,
+    slot_name: &str,
+    gear: Gear<'a>,
+) -> Option<&'a Object> {
+    let slot = slot(sim, slot_name);
+    match gear {
+        Gear::World => sim.world.get(*o.equipment.get(&slot)?),
+        Gear::Scratch(items) => items.iter().find(|(s, _)| *s == slot).map(|(_, i)| i),
+    }
 }
 
 /// A part-based creature's body: each body part from the item in its slot (chest, boots,
 /// gloves), or the unclothed part, plus a helmet when one is worn (and whether one is). A
 /// worn item whose model this race lacks leaves the unclothed part.
-fn worn_parts(sim: &Sim, o: &Object, prefix: &str) -> (Vec<String>, bool) {
+fn worn_parts(sim: &Sim, o: &Object, prefix: &str, gear: Gear) -> (Vec<String>, bool) {
     let slots = [
         "INVENTORY_SLOT_CHEST",
         "INVENTORY_SLOT_BOOTS",
         "INVENTORY_SLOT_GLOVES",
     ];
     let worn = |slot_name: &str| {
-        let (ty, v) = item_variation(sim, equipped(sim, o, slot_name)?)?;
+        let (ty, v) = item_variation(sim, equipped_in(sim, o, slot_name, gear)?)?;
         let model = format!("{prefix}_{ty}_{v}{LOD0}");
         has_model(sim, &model).then_some(model)
     };
@@ -359,10 +470,15 @@ pub fn item_tint(sim: &Sim, item: &Object) -> Option<String> {
 
 /// The tints of a creature's equipment by the model each item draws: worn parts under
 /// `prefix` (part-based creatures) and weapons.
-fn equipment_tints(sim: &Sim, o: &Object, prefix: Option<&str>) -> Vec<(String, String)> {
+fn equipment_tints(
+    sim: &Sim,
+    o: &Object,
+    prefix: Option<&str>,
+    gear: Gear,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut add = |slot_name: &str, model: &dyn Fn(&str, &str) -> String| {
-        let Some(item) = equipped(sim, o, slot_name) else {
+        let Some(item) = equipped_in(sim, o, slot_name, gear) else {
             return;
         };
         let (Some((ty, v)), Some(tint)) = (item_variation(sim, item), item_tint(sim, item)) else {
@@ -387,14 +503,14 @@ fn equipment_tints(sim: &Sim, o: &Object, prefix: Option<&str>) -> Vec<(String, 
 }
 
 /// The creature's weapons in its hands.
-fn weapons(sim: &Sim, o: &Object) -> Vec<Attached> {
+fn weapons(sim: &Sim, o: &Object, gear: Gear) -> Vec<Attached> {
     [
         ("INVENTORY_SLOT_MAIN", MAIN_HAND_NODE),
         ("INVENTORY_SLOT_OFFHAND", OFF_HAND_NODE),
     ]
     .into_iter()
     .filter_map(|(slot_name, node)| {
-        let (ty, v) = item_variation(sim, equipped(sim, o, slot_name)?)?;
+        let (ty, v) = item_variation(sim, equipped_in(sim, o, slot_name, gear)?)?;
         let model = format!("w_{ty}_{v}{LOD0}");
         has_model(sim, &model).then(|| Attached {
             model,

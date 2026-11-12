@@ -191,6 +191,8 @@ pub struct UiLayer {
 #[derive(Default)]
 struct PortraitClock {
     key: Vec<(u32, u64)>,
+    /// The movies' requests to draw them again (`Paperdoll.UpdatePortrait`) seen so far.
+    requests: u32,
     missing: bool,
     since_ms: f64,
     drawn: u32,
@@ -253,7 +255,10 @@ pub fn portrait_key(sim: &thedas_sim::Sim) -> Vec<(u32, u64)> {
                 o.head_morph.hash(&mut h);
                 o.equipment.hash(&mut h);
                 o.area.hash(&mut h);
+                o.fields.get("Gender").hash(&mut h);
             }
+            // Drawn on character creation's stage, or in the world.
+            (sim.world.chargen == Some(id) && sim.world.chargen_mode == 0).hash(&mut h);
             (id, h.finish())
         })
         .collect()
@@ -942,7 +947,20 @@ impl UiLayer {
     /// Whether the party's portraits are due to be drawn (see [`PortraitClock`]): `key` is
     /// [`portrait_key`]'s. `dt_ms` is the time since the last call.
     pub fn wants_portraits(&mut self, key: Vec<(u32, u64)>, dt_ms: f64) -> bool {
-        self.portraits.due(key, dt_ms)
+        let asked = self.shown.lock().map(|s| s.portrait_requests).unwrap_or(0);
+        let due = self.portraits.due(key, dt_ms);
+        if asked != self.portraits.requests {
+            self.portraits.requests = asked;
+            self.portraits.since_ms = 0.0;
+            return true;
+        }
+        due
+    }
+
+    /// The paperdoll's camera preset the movies chose (`Paperdoll.SetCameraPreset`; 0 the
+    /// body, 1 the face), which frames character creation's stage.
+    pub fn paperdoll_preset(&self) -> i32 {
+        self.shown.lock().map(|s| s.paperdoll_preset).unwrap_or(0)
     }
 
     /// The party member to draw into the paperdoll and how far it is turned (radians), when

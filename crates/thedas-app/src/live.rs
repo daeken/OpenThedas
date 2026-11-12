@@ -80,6 +80,14 @@ pub struct Live {
     /// The shaders' clock (`ApplicationTime`), in seconds: real time, running while the
     /// world is stopped too.
     pub shader_time: f64,
+    /// Character creation's stage (see [`crate::chargen_stage`]), once read; `Some(None)`
+    /// when it could not be.
+    stage: Option<Option<crate::chargen_stage::Stage>>,
+    /// The creature drawn on the stage at the last sync, where it stands and its facing.
+    staged: Option<(ObjectId, [f32; 3], f32)>,
+    /// The stage camera framed for a preset, kept until the preset or the drawn creature
+    /// changes (the executable frames a preset once, when it is set).
+    stage_camera: Option<(i32, thedas_render::Camera)>,
 }
 
 /// How to start the game.
@@ -180,6 +188,9 @@ impl Live {
             detail: Default::default(),
             talk_camera: Default::default(),
             shader_time: 0.0,
+            stage: None,
+            staged: None,
+            stage_camera: None,
         })
     }
 
@@ -249,6 +260,49 @@ impl Live {
         self.talk_camera.camera(&sim, base)
     }
 
+    /// The camera character creation's stage is seen through, while it is up (see
+    /// [`crate::chargen_stage::camera`]): camera preset `preset` framing the creature at
+    /// its mark. `base` gives the clip planes. `None` leaves the game camera as it is.
+    pub fn chargen_camera(
+        &mut self,
+        base: &thedas_render::Camera,
+        preset: i32,
+    ) -> Option<thedas_render::Camera> {
+        let (id, mark, _) = self.staged?;
+        if let Some((p, c)) = self.stage_camera
+            && p == preset
+        {
+            return Some(c);
+        }
+        let head = self.head_now(id);
+        let c = crate::chargen_stage::camera(preset, glam::Vec3::from_array(mark), head, base);
+        // Kept only once the creature is drawn (its head found).
+        if head.is_some() || preset == crate::chargen_stage::PRESET_BODY {
+            self.stage_camera = Some((preset, c));
+        }
+        Some(c)
+    }
+
+    /// Where drawn object `id`'s head bone is now (in the world), when it has one.
+    fn head_now(&mut self, id: ObjectId) -> Option<glam::Vec3> {
+        let objects = self.objects.as_ref()?;
+        let level = self.level.as_ref()?;
+        let i = self.posed.iter().position(|p| p.0 == id)?;
+        let (_, transform, clip) = &self.posed[i];
+        let animator = &mut self.animator;
+        objects.scene.prop_skeletons(i).into_iter().find_map(|s| {
+            let skeleton = objects.scene.skeletons.get(s)?;
+            let node = skeleton.node("head")?;
+            let rest = skeleton.rest().get(node)?.w_axis.truncate();
+            let now = clip
+                .as_ref()
+                .and_then(|c| animator.pose(&level.vfs, &objects.scene, s, c))
+                .and_then(|(_, pose)| pose.get(node).map(|m| m.w_axis.truncate()))
+                .unwrap_or(rest);
+            Some(transform.transform_point3(now))
+        })
+    }
+
     /// Where the party leader stands, when it is in the current area.
     pub fn leader_feet(&self) -> Option<glam::Vec3> {
         let sim = self.sim();
@@ -271,9 +325,36 @@ impl Live {
     pub fn sync(&mut self, ctx: &GpuContext, format: wgpu::TextureFormat) -> Result<()> {
         let shared = self.sim.clone();
         let mut sim = shared.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(layout) = sim.world.area.and_then(|a| sim.area_layout(a)) else {
+        // Character creation shows its creature on its own stage, not in the area.
+        let staged = match crate::chargen_stage::subject(&sim) {
+            Some(id) => {
+                let vfs = sim.vfs.clone();
+                self.stage
+                    .get_or_insert_with(|| {
+                        let s = crate::chargen_stage::Stage::load(&vfs);
+                        if s.is_none() {
+                            log::warn!(
+                                "{}.are or its {} waypoint not found: character creation \
+                                 shows the area",
+                                crate::chargen_stage::STAGE_AREA,
+                                crate::chargen_stage::MARK
+                            );
+                        }
+                        s
+                    })
+                    .clone()
+                    .map(|s| (id, s))
+            }
+            None => None,
+        };
+        let layout = match &staged {
+            Some((_, s)) => Some(s.layout.clone()),
+            None => sim.world.area.and_then(|a| sim.area_layout(a)),
+        };
+        let Some(layout) = layout else {
             self.level = None;
             self.objects = None;
+            self.staged = None;
             return Ok(());
         };
         let area = sim.world.area.unwrap_or_default();
@@ -281,7 +362,15 @@ impl Live {
             self.objects = None;
             self.level = Some(self.build_level(ctx, format, &layout)?);
         }
-        let models = thedas_ui::models::area_models_cached(&sim, area, &mut self.models);
+        let models = match &staged {
+            Some((id, stage)) => stage_models(&sim, *id, stage, &mut self.models),
+            None => thedas_ui::models::area_models_cached(&sim, area, &mut self.models),
+        };
+        let was = self.staged;
+        self.staged = staged.map(|(id, s)| (id, s.mark, s.facing));
+        if self.staged.map(|s| s.0) != was.map(|s| s.0) {
+            self.stage_camera = None;
+        }
         // A staged conversation line draws its actors at their stage marks.
         let base = thedas_render::Camera::new(glam::Vec3::ZERO, 0.0, 0.0);
         let marks = self
@@ -293,6 +382,8 @@ impl Live {
         let key = objects_key(&models);
         if self.objects.as_ref().map(|o| &o.key) != Some(&key) {
             self.objects = Some(self.build_objects(ctx, format, &layout, &models, key)?);
+            // A new look is framed afresh.
+            self.stage_camera = None;
         }
         let (Some(level), Some(objects)) = (self.level.as_ref(), self.objects.as_mut()) else {
             return Ok(());
@@ -756,6 +847,7 @@ impl Live {
     /// mesh, else 0.25 m below the top of the member's drawn bounds; other columns are
     /// unused.
     pub fn portraits(&mut self, ctx: &GpuContext, size: u32) -> Vec<(ObjectId, Vec<u8>)> {
+        let staged = self.staged;
         let (Some(objects), Some(level)) = (self.objects.as_mut(), self.level.as_ref()) else {
             return Vec::new();
         };
@@ -814,7 +906,10 @@ impl Live {
             let rotation = num(r, "CameraRotation", 0.0).to_radians();
             let pitch = num(r, "CameraPitch", 0.0).to_radians();
             let distance = num(r, "CameraDistance", 0.7).max(0.2);
-            let feet = glam::Vec3::from_array(o.position);
+            // On character creation's stage the creature stands at the stage's mark.
+            let on_stage = staged.filter(|s| s.0 == id);
+            let (position, facing) = on_stage.map_or((o.position, o.facing), |s| (s.1, s.2));
+            let feet = glam::Vec3::from_array(position);
             let rest_face = match face {
                 Some(f) => feet + f,
                 None => feet + glam::Vec3::Z * (offset.z + radius - 0.25).max(0.3),
@@ -827,7 +922,7 @@ impl Live {
                 (None, Some((now, _))) => now,
                 (_, None) => rest_face,
             };
-            let heading = thedas_sim::world::heading_of(o.facing).to_radians() + rotation;
+            let heading = thedas_sim::world::heading_of(facing).to_radians() + rotation;
             // From in front of the face, looking back at it.
             let eye = head
                 + glam::Vec3::new(
@@ -852,17 +947,34 @@ impl Live {
                 .map(|p| p.draws.clone().collect())
                 .unwrap_or_default();
             objects.renderer.only_draws = Some(own);
+            // The creature on character creation's stage is lit by the portrait rig
+            // (`portrait_lightrig` el_lr_new_day2 and `portrait_lightprobe`
+            // el_lp_outside_day, 0x7f4037-0x7f40c0), turned to face the camera as the
+            // paperdoll's is. Provisional: placed at the feet.
+            if on_stage.is_some() {
+                let rig = thedas_render::scene::LightRig::load(
+                    &level.vfs,
+                    PAPERDOLL_LIGHT_RIG,
+                    PAPERDOLL_LIGHT_PROBE,
+                    glam::Mat4::from_translation(feet)
+                        * glam::Mat4::from_rotation_z(heading + std::f32::consts::FRAC_PI_2),
+                );
+                objects.renderer.set_light_rig(Some(rig));
+            }
             // Captures come back RGBA whatever the renderer draws in.
             let shot = objects.renderer.capture(ctx, &camera, size, size);
             objects.renderer.only_draws = None;
+            objects.renderer.set_light_rig(None);
             let Ok(mut pixels) = shot else {
                 continue;
             };
             // The game lights portraits with a rig of their own (portraits.gda's light
-            // columns); the scene's light is brightened instead. Provisional.
-            for p in pixels.chunks_exact_mut(4) {
-                for c in &mut p[..3] {
-                    *c = (*c as f32 * PORTRAIT_GAIN).min(255.0) as u8;
+            // columns); elsewhere the scene's light is brightened instead. Provisional.
+            if on_stage.is_none() {
+                for p in pixels.chunks_exact_mut(4) {
+                    for c in &mut p[..3] {
+                        *c = (*c as f32 * PORTRAIT_GAIN).min(255.0) as u8;
+                    }
                 }
             }
             out.push((id, pixels));
@@ -986,6 +1098,36 @@ fn objects_key(models: &[ObjectModel]) -> ObjectsKey {
             (m.id, v)
         })
         .collect()
+}
+
+/// What the character creation stage draws: creature `id` alone, standing at the stage's
+/// mark with its facing (0x7bb9d6-0x7bba2d). A creature that draws nothing yet (the
+/// simulation's hero has no appearance until a race is chosen) is drawn as the game builds
+/// the player, from [`crate::chargen_stage::PLAYER_TEMPLATE`] (0x69d953): the original's
+/// creature is human from the start. Provisional: that stand-in is presentation only; the
+/// simulation does not build its hero from the template.
+fn stage_models(
+    sim: &Sim,
+    id: ObjectId,
+    stage: &crate::chargen_stage::Stage,
+    cache: &mut ModelCache,
+) -> Vec<ObjectModel> {
+    let Some(o) = sim.world.get(id) else {
+        return Vec::new();
+    };
+    let drawn = o.area.and_then(|area| {
+        thedas_ui::models::area_models_cached(sim, area, cache)
+            .into_iter()
+            .find(|m| m.id == id)
+    });
+    let Some(mut m) = drawn.or_else(|| {
+        thedas_ui::models::template_look(sim, o, crate::chargen_stage::PLAYER_TEMPLATE)
+    }) else {
+        return Vec::new();
+    };
+    m.position = stage.mark;
+    m.facing = stage.facing;
+    vec![m]
 }
 
 /// An object's models as a scene prop.

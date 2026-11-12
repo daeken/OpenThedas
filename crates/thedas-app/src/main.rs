@@ -43,6 +43,7 @@
 //! running game: the same steps as `--steps`, screenshots and the simulation's state (see
 //! [`control`]).
 
+mod chargen_stage;
 mod control;
 mod follow;
 mod intro;
@@ -840,6 +841,15 @@ impl App {
                 .live
                 .as_mut()
                 .and_then(|l| l.conversation_camera(&self.camera))
+            {
+                self.camera = c;
+            }
+            // Character creation frames its stage (see `chargen_stage`).
+            let preset = self.gfx.as_ref().map_or(0, |g| g.ui.paperdoll_preset());
+            if let Some(c) = self
+                .live
+                .as_mut()
+                .and_then(|l| l.chargen_camera(&self.camera, preset))
             {
                 self.camera = c;
             }
@@ -2947,6 +2957,15 @@ fn main() -> Result<()> {
             }
             if follow.is_some()
                 && let Some(c) = l.conversation_camera(&camera)
+            {
+                camera = c;
+            }
+            // Character creation frames its stage (see `chargen_stage`).
+            let preset = played
+                .as_ref()
+                .map_or(0, |(layer, _)| layer.paperdoll_preset());
+            if follow.is_some()
+                && let Some(c) = l.chargen_camera(&camera, preset)
             {
                 camera = c;
             }
