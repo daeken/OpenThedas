@@ -130,7 +130,10 @@ struct CutsceneSounds {
 
 pub struct GameAudio {
     engine: AudioEngine,
-    _output: thedas_audio::device::Output,
+    /// The system output (none when recording: the mix is rendered on demand).
+    _output: Option<thedas_audio::device::Output>,
+    /// What a recording renders (see [`GameAudio::recording`]).
+    pub recorded: Vec<f32>,
     gui: Vec<Option<String>>,
     music: Option<(&'static str, EventHandle)>,
     voice: Option<(VoiceLine, Option<EventHandle>, Option<f64>)>,
@@ -207,13 +210,49 @@ impl GameAudio {
     /// The game's sound on the default output; `None` (logged) with no output device.
     pub fn open(install: &Path, module: &str, vfs: &Arc<Vfs>, language: &str) -> Option<GameAudio> {
         let output = thedas_audio::device::Output::open()?;
+        let mixer = output.mixer.clone();
+        Some(Self::with_mixer(
+            install,
+            module,
+            vfs,
+            language,
+            mixer,
+            Some(output),
+        ))
+    }
+
+    /// The game's sound mixed into [`GameAudio::recorded`] (stereo at `rate`) instead of the
+    /// speakers, `frame_dt`'s worth a frame: for unattended runs (`--audio-wav`). Decoding is
+    /// done in step, so the recording does not depend on timing.
+    pub fn recording(
+        install: &Path,
+        module: &str,
+        vfs: &Arc<Vfs>,
+        language: &str,
+        rate: u32,
+    ) -> GameAudio {
+        let mixer = Arc::new(std::sync::Mutex::new(thedas_audio::Mixer::new(rate)));
+        let mut a = Self::with_mixer(install, module, vfs, language, mixer, None);
+        a.engine.synchronous = true;
+        a
+    }
+
+    fn with_mixer(
+        install: &Path,
+        module: &str,
+        vfs: &Arc<Vfs>,
+        language: &str,
+        mixer: Arc<std::sync::Mutex<thedas_audio::Mixer>>,
+        output: Option<thedas_audio::device::Output>,
+    ) -> GameAudio {
         let library = Arc::new(Library::new(Library::install_dirs(
             install, module, language,
         )));
-        let engine = AudioEngine::new(library, output.mixer.clone());
-        Some(GameAudio {
+        let engine = AudioEngine::new(library, mixer);
+        GameAudio {
             engine,
             _output: output,
+            recorded: Vec::new(),
             gui: gui_table(vfs),
             music: None,
             voice: None,
@@ -225,7 +264,7 @@ impl GameAudio {
             anim_clocks: Default::default(),
             footsteps: footstep_events(vfs),
             last: Instant::now(),
-        })
+        }
     }
 
     /// Animations' sound events: as a creature's animation passes an event, kind 20 plays the
@@ -269,7 +308,8 @@ impl GameAudio {
                         e > *p && e <= length || e <= t
                     }
                 }
-                _ => e <= t && t - e < 0.25,
+                // A new animation: the events at its start, if it has just started.
+                _ => e <= t && t < 0.25,
             };
             for ev in events.iter().filter(|e| crossed(e.time)) {
                 let event = match (ev.kind, &ev.text) {
@@ -286,6 +326,11 @@ impl GameAudio {
                     _ => None,
                 };
                 if let Some(event) = event {
+                    log::trace!(
+                        "audio: {key} {:?} -> {t:.3} (len {length:.3}): event at {:.3}",
+                        prev.as_ref().map(|p| p.1),
+                        ev.time
+                    );
                     self.engine.play(
                         &event,
                         PlayOptions {
@@ -569,10 +614,27 @@ impl GameAudio {
         self.voice.as_ref().and_then(|v| v.2)
     }
 
-    pub fn frame(&mut self, mut state: AudioState) {
+    /// The game's sound this frame, on the system output's clock.
+    pub fn frame(&mut self, state: AudioState) {
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32().min(0.25);
         self.last = now;
+        self.frame_dt(state, dt);
+    }
+
+    /// A recording's frame: `dt` seconds of the game, mixed into [`GameAudio::recorded`].
+    pub fn record(&mut self, state: AudioState, dt: f32) {
+        self.frame_dt(state, dt);
+        let Ok(mut m) = self.engine.mixer.lock() else {
+            return;
+        };
+        let n = (dt * m.rate() as f32).round() as usize;
+        let mut buf = vec![0.0; n * 2];
+        m.render(&mut buf);
+        self.recorded.extend(buf);
+    }
+
+    fn frame_dt(&mut self, mut state: AudioState, dt: f32) {
         self.engine.volumes = state.volumes;
         if let Some((pos, right)) = state.listener {
             self.engine.set_listener(pos, right);
