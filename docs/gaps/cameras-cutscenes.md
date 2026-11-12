@@ -43,8 +43,6 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 - **CAM-022** **Far-end (overhead) collision not traced.** Original: checks only that the camera is not inside something (0x6c3180). Ours: no check at the far end. Evidence: `crates/thedas-app/src/follow.rs:85`. Size: S. Depends: none. Kind: provisional.
 - **CAM-023** **Far-half pitch blends from the current pitch.** Original: blends from the pitch on entering the far half (+0x98, 0x76fc41). Ours: from the player's current pitch. Evidence: `crates/thedas-app/src/follow.rs:176`. Size: S. Depends: none. Kind: provisional.
 - **CAM-024** **Pull-in facing test uses this frame's facing.** Original: the game camera's own facing (+0x90). Ours: this frame's. Evidence: `crates/thedas-app/src/follow.rs:268`. Size: S. Depends: none. Kind: provisional.
-- **CAM-025** **Camera can end inside the hero; creature fade shapes guessed.** Original: fades creatures the camera is inside (sphere query 0x648c00). Ours: fade in progress; which `.phy` shapes count is not traced. Evidence: `README.md:40`, `crates/thedas-app/src/camfade.rs:24`, `crates/thedas-app/src/camfade.rs:96`. Size: M. Depends: none. Kind: provisional.
-- **CAM-026** **City Elf (Valendrian) start pitch is wrong.** Original: not traced. Ours: wrong pitch per QA. Evidence: `README.md:40`. Size: S. Depends: none. Kind: bug.
 - **CAM-027** **Screen-edge pan.** Original: screen-edge pan. Ours: no code found. Evidence: `crates/thedas-app/src/follow.rs:1`. Size: S. Depends: none. Kind: missing.
 - **CAM-028** **Free look.** Original: free look. Ours: no in-game free-look mode found; F toggles a developer free-flying camera. Evidence: `crates/thedas-app/src/main.rs:17`. Size: S. Depends: none. Kind: missing.
 
