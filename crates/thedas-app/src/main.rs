@@ -2192,6 +2192,11 @@ fn audio_state(
         let sim = live.sim();
         state.front_end = live.front_end;
         state.chargen = sim.world.chargen.is_some();
+        state.hero_female = sim
+            .world
+            .hero
+            .and_then(|h| sim.world.get(h))
+            .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
         state.line = sim.conversation_line().and_then(|l| {
             let female = sim
                 .world
