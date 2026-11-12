@@ -10,6 +10,26 @@ repository.
 
 ## Status
 
+Last updated 2026-11-12 07:26 UTC, main 2b363b1
+
+Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA run 1 (taken at main d24cb05), so some of its findings may already be fixed.
+
+- ✅ **Boot flow**: EA logo and intro movies play (decoded via ffmpeg, silent), then the start menu.
+- ✅ **Start menu**: New Game, Load, Options and Quit are wired; QA graded it near pixel-identical to the original.
+- 🟡 **Character creation**: full flow with the original's stage, camera and portrait; appearance menu (preset, hair, beard), colour sliders, difficulty and name. Partial: face-shape sliders, hair-colour details. QA also flagged dim skill/talent icons after spending points and attribute arrows that never show a disabled state.
+- 🟡 **Conversations and cutscenes**: reply list, subtitles and movie tracks work (the New Game intro). Camera and animation tracks are not played yet (in progress), so story cutscenes show the gameplay chase camera. Framing for unstaged conversation lines also falls back to the chase camera (in progress).
+- ✅ **Exploration and camera**: walking, click-to-pick, doors, follow camera with wall collision, area map, companions following.
+- 🟡 **Combat and simulation**: NWScript VM with a large share of the engine functions, melee and ability timing, threat, AI-driven party, tactics, loot and containers. Weapons are sheathed on the back out of combat and drawn in combat; draw/sheathe animation timing is not traced. Not every script engine function is implemented.
+- 🟡 **Party, inventory, journal and other UI screens**: inventory (with paperdoll and item examine), character record, level-up, store, tactics, journal and codex, options, area map and HUD notifications are wired to the simulation. Screens have not all been audited against the original.
+- 🟡 **Rendering**: areas, terrain, sky, fog, clouds, bloom, colour grading, dynamic sun shadows (Low to High detail) and the original shaders all work. Characters have hair. Known off: some NPC hair tint and some hand rendering (the rendering stream is on it).
+- ⬜ **Audio**: not started. No audio output at all; movies play silent. A separate stream is starting on it.
+- 🟡 **Controller**: Xbox 360-style layout; menus use focus navigation. The PC right-click radial menu doesn't exist as a movie in the game data, so LT opens a quickbar picker instead.
+- ✅ **Saves**: F5/F9 quick save and load, save/load screens, typed names.
+- ✅ **Performance**: frustum culling, shadow caching and skinned-draw culling (Lothering about 8 ms, the chapel about 1.5 ms offscreen).
+- ⬜ **DA2**: not started. There is no Dragon Age II work in the git log.
+
+### Milestones
+
 Milestone M0, "read everything", is done: archive readers, layered resource lookup, and
 GFF3/GFF4/GDA/TLK parsers, checked against every file in a DA:O install by the corpus tool.
 
