@@ -890,15 +890,20 @@ pub fn call(
         "GetPosition" => ok(Value::Vector(
             h.object(obj(a, 0)).map_or([0.0; 3], |o| o.position),
         )),
+        // Triggers where the object now is see it: DAOrigins.exe's triggers are physics
+        // shapes that report what is inside them (0x7e96b0), however it got there.
+        // Provisional: told at once rather than at the next physics step.
         "SetPosition" => {
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+            let id = obj(a, 0);
+            if let Some(o) = h.sim.world.get_mut(id) {
                 o.position = vector(a, 1);
             }
+            h.sim.update_triggers(id);
             void()
         }
         // DAOrigins.exe (0x65b3b0) puts the object in the location's area if it is in
-        // another and that area exists, then sets its position and orientation. Provisional:
-        // like SetPosition, no trigger is told of the move.
+        // another and that area exists, then sets its position and orientation; triggers
+        // there see it, as with SetPosition.
         "SetLocation" => {
             let l = match h.sim.world.handle(handle(a, 1)) {
                 Some(EngineData::Location(l)) => *l,
@@ -912,6 +917,7 @@ pub fn call(
                 o.position = l.position;
                 o.facing = l.facing;
             }
+            h.sim.update_triggers(obj(a, 0));
             void()
         }
         "GetFacing" => ok(Value::Float(h.object(obj(a, 0)).map_or(0.0, |o| o.facing))),

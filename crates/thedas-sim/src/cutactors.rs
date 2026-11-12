@@ -35,8 +35,7 @@
 //! would place the cutscene at the world's origin); a creature put at its end pose is set
 //! on the pathing grid's floor there when its actor snaps to the walkmesh (kind 38) - the
 //! end placement (0x695540) does not itself snap, and what the creature's own position
-//! handler (vtable +0x7c) does is not traced. Like `SetPosition` here, the move tells no
-//! trigger (a creature put inside or outside one is noticed when it next moves).
+//! handler (vtable +0x7c) does is not traced. Triggers at the place see the creature at once.
 
 use std::sync::Arc;
 
@@ -294,6 +293,11 @@ impl Sim {
                         b.object, at[0], at[1], at[2], facing
                     ),
                 });
+            }
+            // Triggers where it now stands see it (the exe's triggers are physics shapes
+            // that report whatever is inside them, moved there or put there).
+            if moved {
+                self.update_triggers(b.object);
             }
         }
     }
