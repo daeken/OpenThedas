@@ -32,9 +32,6 @@ pub struct VoiceLine {
     pub ambient: bool,
 }
 
-/// An attack's blow: where the target stands, the `COMBAT_RESULT_*`, and the base items of
-/// the attacker's weapon and the target's armour and shield.
-
 /// A creature's body armour, main-hand and off-hand base items (`BaseItem`), and whether
 /// it is fighting.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
