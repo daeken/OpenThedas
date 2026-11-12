@@ -8,6 +8,10 @@
 //! - `device` (feature `device`): the system output through cpal.
 //!
 //! Audio is presentation only: it reads simulation state and never writes it.
+//!
+//! Dependencies: MP3 decoding is Symphonia's (`symphonia-bundle-mp3`, MPL-2.0: a
+//! file-level licence, fine to depend on from this MIT crate; nothing of it is copied here);
+//! the output is cpal (Apache-2.0). FMOD itself is not used: its formats are read here.
 
 pub mod area;
 pub mod decode;

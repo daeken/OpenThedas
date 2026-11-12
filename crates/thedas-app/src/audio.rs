@@ -32,6 +32,10 @@ pub struct VoiceLine {
     pub ambient: bool,
 }
 
+/// An attack's blow: where the target stands, the `COMBAT_RESULT_*`, and the base items of
+/// the attacker's weapon and the target's armour and shield.
+pub type Impact = ([f32; 3], i32, Option<i32>, Option<i32>, Option<i32>);
+
 /// What the game is doing, as the sound follows it.
 #[derive(Clone, Debug, Default)]
 pub struct AudioState {
@@ -49,7 +53,7 @@ pub struct AudioState {
     pub animations: Vec<(u32, String, f32, f32, [f32; 3])>,
     /// Attacks' blows: (target position, result, attacker's weapon, target's armour and
     /// shield base items).
-    pub impacts: Vec<([f32; 3], i32, Option<i32>, Option<i32>, Option<i32>)>,
+    pub impacts: Vec<Impact>,
     /// Events scripts played (`PlaySound`), with where the object stands (none: 2D).
     pub script_sounds: Vec<(String, Option<[f32; 3]>)>,
     /// A boot movie playing (its file) and how far it has played (milliseconds): its own
