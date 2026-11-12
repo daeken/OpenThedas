@@ -683,6 +683,175 @@ impl<'a> Loader<'a> {
         loaded
     }
 
+    /// The level's SpeedTrees as their billboards: each placement draws two crossed quads
+    /// textured with its tree's billboard image from the level's billboard atlas
+    /// (`<level>_diffuse_billboards.dds`; the tree's `.spt` gives the image's corners,
+    /// `t` upward), as tall as the tree's size (`.spt` 2000s) times the placement's scale
+    /// (RML 3356), as wide as the image's aspect makes it, drawn with `prop.mat`'s `Punch`
+    /// semantic. Provisional and an interim: the original builds the trees' branches,
+    /// fronds and leaves at run time (SpeedTreeRT) and shows billboards only far away;
+    /// trees without a billboard image (grass, bushes) are left out.
+    fn place_tree_billboards(
+        &mut self,
+        level: &str,
+        trees: &[String],
+        spots: &[(usize, Mat4, f32)],
+    ) {
+        let atlas = format!("{}_diffuse_billboards.dds", level.to_ascii_lowercase());
+        let Some((aw, ah)) = self
+            .read(&atlas)
+            .ok()
+            .and_then(|d| thedas_formats::dds::Dds::parse(&d).ok())
+            .map(|d| (d.width as f32, d.height as f32))
+        else {
+            return;
+        };
+        let key = format!("{atlas}:billboards.mao");
+        let xml = format!(
+            r#"<MaterialObject Name="tree_billboards"><Material Name="prop.mat"/><DefaultSemantic Name="Punch"/><Texture Name="mml_tDiffuse" ResName="{atlas}"/></MaterialObject>"#
+        );
+        let Some(material) = self.build_material(&key, xml.as_bytes()).map(|m| {
+            self.scene.materials.push(m);
+            self.scene.materials.len() - 1
+        }) else {
+            return;
+        };
+        let probe = self.room_probe(level, "");
+        // Per tree: its billboard mesh and height, once.
+        let mut meshes: HashMap<usize, Option<(usize, f32)>> = HashMap::new();
+        for &(tree, placement, scale) in spots {
+            let built = *meshes.entry(tree).or_insert_with(|| {
+                let name = format!("{}.spt", trees.get(tree)?.to_ascii_lowercase());
+                let spt = thedas_formats::speedtree::parse(&self.read(&name).ok()?).ok()?;
+                let corners = spt.texcoords.as_ref()?.billboards.first().copied()?;
+                let (s, t): (Vec<f32>, Vec<f32>) = corners.chunks(2).map(|c| (c[0], c[1])).unzip();
+                let fold =
+                    |v: &[f32], f: fn(f32, f32) -> f32, init| v.iter().copied().fold(init, f);
+                let (s0, s1) = (fold(&s, f32::min, f32::MAX), fold(&s, f32::max, f32::MIN));
+                let (t0, t1) = (fold(&t, f32::min, f32::MAX), fold(&t, f32::max, f32::MIN));
+                let height = spt.tree.size;
+                if !(s1 > s0 && t1 > t0 && height > 0.0) {
+                    return None;
+                }
+                let half = 0.5 * height * ((s1 - s0) * aw) / ((t1 - t0) * ah);
+                Some((
+                    self.billboard_mesh(&name, half, height, [s0, s1, 1.0 - t1, 1.0 - t0]),
+                    height,
+                ))
+            });
+            let Some((mesh, height)) = built else {
+                continue;
+            };
+            let transform = placement * Mat4::from_scale(Vec3::splat(scale));
+            let centre = transform.transform_point3(Vec3::Z * height * 0.5);
+            self.scene.draws.push(DrawItem {
+                mesh,
+                material,
+                transform,
+                lightmap: None,
+                sphere: (centre, height * scale * 0.5),
+                model: name_of_tree(trees, tree),
+                room: String::new(),
+                room_id: None,
+                probe,
+                skin: None,
+                cast_shadow: Some(false),
+            });
+        }
+    }
+
+    /// Two crossed upright quads `2·half` wide and `height` tall, standing on the origin,
+    /// textured with the atlas rectangle `[u0, u1, v_top, v_bottom]`.
+    fn billboard_mesh(&mut self, name: &str, half: f32, height: f32, uv: [f32; 4]) -> usize {
+        let [u0, u1, vt, vb] = uv;
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        for (axis, normal) in [(Vec3::X, Vec3::Y), (Vec3::Y, -Vec3::X)] {
+            let base = vertices.len() as u32;
+            for (x, z, u, v) in [
+                (-half, 0.0, u0, vb),
+                (half, 0.0, u1, vb),
+                (half, height, u1, vt),
+                (-half, height, u0, vt),
+            ] {
+                vertices.push(Vertex {
+                    position: (axis * x + Vec3::Z * z).to_array(),
+                    normal: normal.to_array(),
+                    uv0: [u, v],
+                    uv1: [0.0, 0.0],
+                });
+            }
+            // Both faces: the quads are seen from either side.
+            indices.extend([0, 1, 2, 0, 2, 3, 0, 2, 1, 0, 3, 2].map(|i| base + i));
+        }
+        self.scene.meshes.push(SceneMesh {
+            key: format!("{name}:billboard"),
+            chunk: MeshChunk {
+                name: format!("{name}:billboard"),
+                vertex_size: 0,
+                vertex_count: vertices.len() as u32,
+                index_count: indices.len() as u32,
+                primitive: 0,
+                index_format: thedas_formats::mesh::IndexFormat::U32,
+                base_vertex: 0,
+                vertex_offset: 0,
+                start_index: 0,
+                elements: Vec::new(),
+                bounds: None,
+            },
+            vertices,
+            indices,
+            raw_vertices: Vec::new(),
+            positions: None,
+        });
+        self.scene.meshes.len() - 1
+    }
+
+    /// A material object's resolution down to its definition (see [`Self::material`]).
+    fn build_material(&mut self, key: &str, d: &[u8]) -> Option<SceneMaterial> {
+        match MaterialObject::parse(d) {
+            Ok(object) => {
+                let mut semantic = object.semantic().to_string();
+                let definition = self.material_def(&object.material_resource());
+                // An object whose semantic its material lacks (no semantic named, of a
+                // material without `Default`: the sky's cloud layer, `Clouds`; or a name
+                // the material does not have: the lava's `Diffuse`, `Lava.mat` having
+                // only `Opaque` and `OpaqueVolume`) takes the material's first.
+                // Provisional: the exe's lookup on a missing semantic is not traced.
+                if let Some(d) = definition.as_ref()
+                    && d.semantic(&semantic).is_none()
+                    && let Some(first) = d.semantics.first()
+                {
+                    semantic = first.name.clone();
+                }
+                let sem = definition.as_ref().and_then(|d| d.semantic(&semantic));
+                if definition.is_some() && sem.is_none() {
+                    self.warn(format!(
+                        "{key}: {} has no semantic {semantic}",
+                        object.material
+                    ));
+                }
+                let render_class = sem.and_then(|s| s.render_class.clone());
+                let technique = definition
+                    .as_ref()
+                    .and_then(|d| d.select(&semantic, 3, self.scene.detail.name()))
+                    .cloned();
+                Some(SceneMaterial {
+                    mao: key.to_string(),
+                    object,
+                    definition,
+                    semantic,
+                    render_class,
+                    technique,
+                })
+            }
+            Err(e) => {
+                self.warn(format!("{key}: {e}"));
+                None
+            }
+        }
+    }
+
     fn material(&mut self, mao_stem: &str) -> Option<usize> {
         // Terrain chunks name their material with the extension, other meshes without.
         let stem = mao_stem.to_ascii_lowercase();
@@ -691,47 +860,7 @@ impl<'a> Loader<'a> {
             return *i;
         }
         let built = match self.read(&key) {
-            Ok(d) => match MaterialObject::parse(&d) {
-                Ok(object) => {
-                    let mut semantic = object.semantic().to_string();
-                    let definition = self.material_def(&object.material_resource());
-                    // An object whose semantic its material lacks (no semantic named, of a
-                    // material without `Default`: the sky's cloud layer, `Clouds`; or a name
-                    // the material does not have: the lava's `Diffuse`, `Lava.mat` having
-                    // only `Opaque` and `OpaqueVolume`) takes the material's first.
-                    // Provisional: the exe's lookup on a missing semantic is not traced.
-                    if let Some(d) = definition.as_ref()
-                        && d.semantic(&semantic).is_none()
-                        && let Some(first) = d.semantics.first()
-                    {
-                        semantic = first.name.clone();
-                    }
-                    let sem = definition.as_ref().and_then(|d| d.semantic(&semantic));
-                    if definition.is_some() && sem.is_none() {
-                        self.warn(format!(
-                            "{key}: {} has no semantic {semantic}",
-                            object.material
-                        ));
-                    }
-                    let render_class = sem.and_then(|s| s.render_class.clone());
-                    let technique = definition
-                        .as_ref()
-                        .and_then(|d| d.select(&semantic, 3, self.scene.detail.name()))
-                        .cloned();
-                    Some(SceneMaterial {
-                        mao: key.clone(),
-                        object,
-                        definition,
-                        semantic,
-                        render_class,
-                        technique,
-                    })
-                }
-                Err(e) => {
-                    self.warn(format!("{key}: {e}"));
-                    None
-                }
-            },
+            Ok(d) => self.build_material(&key, &d),
             Err(e) => {
                 self.warn(e.to_string());
                 None
@@ -1577,6 +1706,8 @@ impl AreaScene {
                 )
             })
             .collect();
+        // SpeedTree placements (rooms' and the level's): tree, world placement, scale.
+        let mut tree_spots: Vec<(usize, Mat4, f32)> = Vec::new();
         for room in &arl.rooms {
             l.scene.rooms.push(room.name.clone());
             let room_probe = l.room_probe(level, &room.name);
@@ -1602,6 +1733,11 @@ impl AreaScene {
             };
             l.scene.light_rooms.insert(room.id, rml.light_rooms.clone());
             let room_m = transform_matrix(&rml.transform);
+            tree_spots.extend(
+                rml.trees
+                    .iter()
+                    .map(|t| (t.tree, room_m * transform_matrix(&t.transform), t.scale)),
+            );
             for p in &rml.placements {
                 let placement = room_m
                     * transform_matrix(&p.transform)
@@ -1637,6 +1773,11 @@ impl AreaScene {
                 Ok(Ok(rml)) => {
                     let probe = l.room_probe(level, "");
                     let level_m = transform_matrix(&rml.transform);
+                    tree_spots.extend(
+                        rml.trees
+                            .iter()
+                            .map(|t| (t.tree, level_m * transform_matrix(&t.transform), t.scale)),
+                    );
                     for p in &rml.placements {
                         let placement = level_m
                             * transform_matrix(&p.transform)
@@ -1665,6 +1806,9 @@ impl AreaScene {
                 Ok(Err(e)) => l.warn(format!("{level_rml}: {e}")),
                 Err(e) => l.warn(e.to_string()),
             }
+        }
+        if level_meshes && !tree_spots.is_empty() {
+            l.place_tree_billboards(level, &arl.trees, &tree_spots);
         }
         // The sky, around the camera (its vertex shader centres it there): its dome and its
         // cloud layer.
@@ -2001,4 +2145,15 @@ mod tests {
         });
         assert_eq!(z, Mat4::IDENTITY);
     }
+}
+
+/// A SpeedTree's name for diagnostics (`spt:<name>`).
+fn name_of_tree(trees: &[String], tree: usize) -> String {
+    format!(
+        "spt:{}",
+        trees
+            .get(tree)
+            .map_or("?", |t| t.as_str())
+            .to_ascii_lowercase()
+    )
 }
