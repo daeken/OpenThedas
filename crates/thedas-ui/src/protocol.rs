@@ -403,6 +403,21 @@ impl GameBridge {
                     Some(UiValue::String(n)) => n,
                     _ => String::new(),
                 };
+                // Key tags name the keys bound to actions (see `crate::keys`).
+                let text = crate::keys::replace_key_tags(
+                    &text,
+                    |action| {
+                        let s = self.state.lock().ok()?;
+                        match s
+                            .values
+                            .get(&format!("InputMappings.Mappings.{action}.PrimaryMappedKey"))
+                        {
+                            Some(UiValue::String(k)) if !k.is_empty() => Some(k.clone()),
+                            _ => None,
+                        }
+                    },
+                    |id| (self.strings)(id),
+                );
                 UiValue::String(replace_designer_tags(&text, &hero))
             }
             // The movies' `ExternalCommands.FormatFloat(a_nPrecision, a_nValue)` sends the
