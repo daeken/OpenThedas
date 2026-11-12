@@ -66,9 +66,12 @@ impl Screen {
                 "minimap.gfx",
                 "notifications.gfx",
                 "navbar.gfx",
-                "tooltips.gfx",
-                // Its tutorial popups (`Tutorials.TutorialList`).
+                // Its tutorial popups (`Tutorials.TutorialList`), under the tooltips: the
+                // tutorial panel shares the fixed tooltip's corner and fades back while a
+                // tooltip shows (its `GUI.TooltipText` observer), so the tooltip draws over
+                // it. Provisional: the exe's layer order is not traced.
                 "popuplayer.gfx",
+                "tooltips.gfx",
             ],
             Screen::Cutscene => &["cutscene.gfx"],
             Screen::Conversation => &["conversation.gfx"],
