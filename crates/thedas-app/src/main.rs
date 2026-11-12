@@ -1426,7 +1426,12 @@ impl App {
                     None => Some(follow::Follow::behind(self.camera.yaw)),
                 };
             }
-            KeyCode::Space => {
+            // Not during character creation or before a game: there is nothing to pause.
+            KeyCode::Space
+                if self.screens.as_ref().is_none_or(|s| {
+                    !s.front_end && !s.shown().contains(&screens::Screen::CharGen)
+                }) =>
+            {
                 if let Some(live) = self.live.as_mut() {
                     live.toggle_pause();
                     println!("{}", if live.paused { "paused" } else { "running" });
