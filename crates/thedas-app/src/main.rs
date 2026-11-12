@@ -2919,7 +2919,9 @@ fn loading_screen(live: &live::Live, ui: &mut ui::UiLayer, up: &mut bool) {
             }
             let hint = thedas_ui::binding::load_hint(&sim);
             drop(sim);
-            ui.loading_begin(pending.unwrap_or(ui::LoadScreen::Town), hint);
+            let kind = live.load_screen().unwrap_or(ui::LoadScreen::Town);
+            log::info!("loading screen: {kind:?}");
+            ui.loading_begin(kind, hint);
             *up = true;
         }
         (false, true) => {
