@@ -187,7 +187,6 @@ const PRESENTATION: &[&str] = &[
     "SetLoadHint",
     "LinkAreaMiniMaps",
     "SendGameEventRunDatabase",
-    "SetTrainingMode",
     "SetPlaceableHealth",
     "SetMapPinState",
     "SetCameraTarget",
@@ -3322,6 +3321,15 @@ pub fn call(
         }
         // A message box: it waits for the player's answer (EVENT_TYPE_POPUP_RESULT to its
         // owner, see Sim::answer_popup).
+        // The training tutorials (see training.rs).
+        "SetTrainingMode" => {
+            h.sim.set_training_mode(int(a, 0));
+            void()
+        }
+        "BeginTrainingStep" => {
+            h.sim.begin_training_step(int(a, 0), int(a, 1), int(a, 2));
+            void()
+        }
         "ShowPopup" => {
             h.sim.world.popup = Some(crate::world::Popup {
                 strref: int(a, 0),
