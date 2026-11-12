@@ -119,6 +119,8 @@ pub struct AudioState {
     /// The container whose inventory is open for looting: its id and placeable type (its
     /// `placeable_types.gda` row).
     pub container: Option<(u32, i64)>,
+    /// The game is paused (the player's pause).
+    pub paused: bool,
     /// An area is loading (the load screen is up): the game mode is `GM_LOADING` for the
     /// sound, whatever the simulation's says.
     pub loading: bool,
@@ -264,6 +266,8 @@ pub struct GameAudio {
     mode_duck: Option<(&'static str, Option<EventHandle>)>,
     /// The container open last frame (see [`AudioState::container`]).
     container: Option<u32>,
+    /// The pause's ducking event playing (see [`pause_duck`]).
+    pause_duck: Option<Option<EventHandle>>,
     /// The music track's ambience ducking event playing (see [`music_duck`]).
     music_duck: Option<(&'static str, Option<EventHandle>)>,
     /// The simulation's music intensity last seen (scripts' `SetMusicIntensity`).
@@ -382,6 +386,18 @@ fn music_duck(track: Option<&str>, music_volume: f32) -> Option<&'static str> {
 /// `placeable_types.gda`'s column of the sound a container makes as its inventory opens
 /// (DAOrigins.exe 0x74c2f7).
 const COL_CONTAINER_OPEN: u32 = 0x9809_4859;
+
+const PAUSE_DUCK: &str = "audio_categories/ducking/OnGamePause";
+
+/// Whether the pause plays `OnGamePause` (DAOrigins.exe's pause toggle 0x5d6742: pausing
+/// in explore, combat, dead, dialog or cutscene mode plays it, 0x5d67fc..0x5d683c;
+/// unpausing stops it, 0x5d68fb). It lowers music, ambience and placeables 6 to 9 dB and
+/// pauses movement, footsteps, effects and ambient voices. Provisional: the exe pauses
+/// the `VOambient`, `VOconversation` and `VOnarration` categories when pausing in
+/// `GM_GUI` (0x5d684e) instead, which is not modelled, nor is pausing (see `Duck`).
+fn pause_duck(paused: bool, mode: i32) -> bool {
+    paused && matches!(mode, 0 | 1 | GM_DEAD | GM_DIALOG | GM_CUTSCENE)
+}
 
 const GM_DEAD: i32 = 2;
 const GM_DIALOG: i32 = 4;
@@ -687,6 +703,7 @@ impl GameAudio {
             mode_duck: None,
             script_intensity: None,
             music_duck: None,
+            pause_duck: None,
             container: None,
             ss_types: ss_types(vfs),
             sound_set_entries: Default::default(),
@@ -1738,6 +1755,17 @@ impl GameAudio {
         self.follow_mode(&state);
         self.follow_area(&state, dt);
         self.follow_music_duck(&state);
+        let pause = pause_duck(state.paused, state.game_mode);
+        if pause != self.pause_duck.is_some() {
+            if let Some(Some(h)) = self.pause_duck.take() {
+                log::debug!("audio: pause duck ends");
+                self.engine.stop(h, false);
+            }
+            if pause {
+                log::debug!("audio: paused: duck {PAUSE_DUCK}");
+                self.pause_duck = Some(self.engine.play(PAUSE_DUCK, PlayOptions::default()));
+            }
+        }
         // A container's inventory opening (DAOrigins.exe 0x7314ee -> 0x74c2b0) plays its
         // placeable type's container column (`placeable_types.gda` 0x98094859, the wooden
         // chest's `glo_gui/gui/gui_chest1`) in 2D (0x5bc7f0 with no position).
@@ -1911,6 +1939,17 @@ mod tests {
         assert_eq!(music_duck(None, 1.0), None);
         // Music turned off: no ducking.
         assert_eq!(music_duck(Some("main"), 0.0), None);
+    }
+
+    #[test]
+    fn the_pause_ducks_outside_menus() {
+        assert!(pause_duck(true, 0));
+        assert!(pause_duck(true, 1));
+        assert!(pause_duck(true, GM_DIALOG));
+        assert!(!pause_duck(false, 0));
+        // GM_GUI (3) and loading: not this event.
+        assert!(!pause_duck(true, 3));
+        assert!(!pause_duck(true, GM_LOADING));
     }
 
     #[test]

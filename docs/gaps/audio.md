@@ -124,7 +124,7 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
     - `PlayGUISound` comes from the interface movies. Rows with no event (for example 55, "open tutorial") are correctly silent.
     - Coverage of the movies' sound calls isn't checked.
     - Small.
-38. **Pause.** The exe plays `audio_categories/ducking/OnGamePause` (0x5d6814, 0x5d68fb; callers not traced), which pauses movement, footsteps and voice categories (`#pause:`, AUD-027) and ducks the rest; and `OnMovie` for movies (0x6dc0ba, 0x7ce7cb). Neither is played. Small.
+38. **Pause.** Done: pausing in explore, combat, dialog or cutscene mode plays `OnGamePause` (0x5d6742), whose ducks apply. Not done: its `#pause:` categories are only ducked, not paused (AUD-027); pausing in `GM_GUI` pauses the `VOambient`, `VOconversation` and `VOnarration` categories instead (0x5d684e); `OnMovie` (0x6dc0ba, 0x7ce7cb) ducks nothing. Small.
 
 ### Loading and system
 
@@ -168,7 +168,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 - **AUD-024** **Event-group user properties are unused.** Original: not traced. Ours: `EventGroup::properties` parsed, no reader. Evidence: `crates/thedas-formats/src/fev.rs:133`. Size: S. Depends: none. Kind: unverified.
 - **AUD-025** **FEV music-system chunk is kept unparsed.** Original: the module doc says DA:O's chunk is empty (music is ordinary events). Ours: `music_data` raw bytes. Evidence: `crates/thedas-formats/src/fev.rs:10`, `crates/thedas-formats/src/fev.rs:592`. Size: S. Depends: none. Kind: unverified.
 - **AUD-026** **No streaming: every sample is decoded whole.** Original: wave-bank load flags (0x80 stream from disk, 0x200 decompress into memory) and max streams. Ours: flags and `max_streams` unused; each sample (streamed music included) is read and decoded fully on a fresh thread, held in a 768 MB cache. Evidence: `crates/thedas-formats/src/fev.rs:96`, `crates/thedas-audio/src/library.rs:25`, `crates/thedas-audio/src/library.rs:176`, `crates/thedas-audio/src/engine.rs:624`. Size: M. Depends: none. Kind: missing.
-- **AUD-027** **`#pause:` event parameters are not done; duck details guessed.** Original: not traced. Ours: `#duck:` works; its third number, the dB ramp (linear in dB) are guesses; `#pause:` is ignored. Evidence: `crates/thedas-audio/src/engine.rs:219`. Size: S. Depends: none. Kind: provisional.
+- **AUD-027** **`#pause:` parameters only duck; duck details guessed.** Original: not traced. Ours: `#duck:` works, and `#pause:` with numbers ducks the same way but does not pause; the third number and the dB ramp (linear in dB) are guesses. Evidence: `crates/thedas-audio/src/engine.rs:236`. Size: S. Depends: none. Kind: provisional.
 - **AUD-028** **Snapshots / mixer states.** Original: snapshots/ducking. Ours: no code found beyond per-event `#duck:` parameters. Evidence: `crates/thedas-audio/src/engine.rs:219`. Size: M. Depends: AUD-027. Kind: missing.
 - **AUD-029** **Event fade and category routing to buses is by name.** Original: not traced. Ours: buses are chosen by category name (`music`/`stinger`, `vo*`, `gui`, `*ambient*`), and the Ambient and Ui buses take the SFX slider. Evidence: `crates/thedas-audio/src/engine.rs:202`, `crates/thedas-audio/src/engine.rs:822`. Size: S. Depends: none. Kind: unverified.
 
@@ -197,7 +197,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 - **AUD-046** **Pan law is unchecked.** Original: `fmodex.dll` pan law. Ours: linear balance. Evidence: `crates/thedas-audio/src/mixer.rs:5`, `crates/thedas-audio/src/mixer.rs:298`. Size: S. Depends: none. Kind: provisional.
 - **AUD-047** **Output limiter (deliberate difference).** Original: FMOD's mixer clips (per comment; whether the exe adds a limiter is not traced). Ours: a -0.3 dBFS limiter with 0.2 s release. Evidence: `crates/thedas-audio/src/mixer.rs:207`. Size: S. Depends: none. Kind: provisional.
 - **AUD-048** **Volume options are not persisted.** Original: volume options persisted. Ours: the options screen's slider values feed `volumes()` but nothing writes the player's settings file. Evidence: `crates/thedas-ui/src/options.rs:11`, `crates/thedas-app/src/audio.rs:1527`. Size: S. Depends: CAM-044. Kind: missing.
-- **AUD-049** **Pause does not pause audio.** Original: pause behaviour. Ours: no code found; `Mixer::set_paused` has no caller and the game's pause does not reach `GameAudio`. Evidence: `crates/thedas-audio/src/mixer.rs:150`. Size: S. Depends: none. Kind: missing.
+- **AUD-049** **Pause only ducks.** Original: the pause toggle (0x5d6742) plays `OnGamePause`, which pauses some categories and ducks others, or pauses the VO categories in `GM_GUI`. Ours: the ducks apply (`AudioState::paused`); nothing is paused, and `Mixer::set_paused` has no caller. Evidence: `crates/thedas-app/src/audio.rs:398`. Size: S. Depends: AUD-027. Kind: provisional.
 
 ### Voice-over
 

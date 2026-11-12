@@ -227,8 +227,9 @@ fn bus_for(category: &str) -> Bus {
 
 /// A `#duck:<category>,<fade in ms>,<?>,<fade out ms>,<dB>` parameter: while its event plays,
 /// the category (and those under it) is turned down by dB, ramping in and out over the fade
-/// times. DA:O's events name them (the intro: `#duck:music,3000,0,5000,-60`). Provisional:
-/// the third number's meaning, the dB ramp (linear in dB), and `#pause:` (not done).
+/// times. DA:O's events name them (the intro: `#duck:music,3000,0,5000,-60`). A `#pause:`
+/// parameter with the same numbers ducks too. Provisional: the third number's meaning, the
+/// dB ramp (linear in dB), and pausing (`#pause:` categories are only ducked).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Duck {
     pub category: String,
@@ -239,7 +240,12 @@ pub struct Duck {
 
 impl Duck {
     pub fn parse(name: &str) -> Option<Duck> {
-        let rest = name.trim().strip_prefix("#duck:")?;
+        // `#pause:` takes the same numbers (`OnGamePause`: `#pause:movement,33,0,33,-6`);
+        // its ducking is applied, the pausing is not.
+        let t = name.trim();
+        let rest = t
+            .strip_prefix("#duck:")
+            .or_else(|| t.strip_prefix("#pause:"))?;
         let parts: Vec<&str> = rest.split(',').map(str::trim).collect();
         let num = |i: usize| parts.get(i).and_then(|p| p.parse::<f32>().ok());
         Some(Duck {
@@ -1294,6 +1300,11 @@ mod tests {
             })
         );
         assert!(Duck::parse("param00").is_none());
+        assert_eq!(
+            Duck::parse("#pause:footsteps,33,0,33,-6").map(|d| d.db),
+            Some(-6.0)
+        );
+        assert!(Duck::parse("#pause:footsteps").is_none());
         let (mut e, m) = engine("duck");
         e.play("test/grp/loop", PlayOptions::default()).unwrap();
         let full = run(&mut e, &m, 0.5);
