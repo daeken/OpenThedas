@@ -234,22 +234,62 @@ impl Live {
         }
     }
 
-    /// Where a segment first meets a solid surface (share of the way), if it does: the
-    /// level's, or a placeable's as drawn (a door shut across a doorway). Provisional: the
-    /// game's own camera collision (its physics shapes) is not traced.
-    pub fn first_hit(&self, from: glam::Vec3, to: glam::Vec3) -> Option<f32> {
+    /// Where a sphere of `radius` metres (0: a segment) moving from `from` to `to` first
+    /// touches a solid surface (share of the way), if it does: the level's, or a
+    /// placeable's as drawn (a door shut across a doorway). DAOrigins.exe's camera sweeps
+    /// its static geometry and placeables (group mask 0x1024, 0x6c3758); provisional: these
+    /// are their drawn triangles rather than their physics shapes.
+    pub fn sweep(&self, from: glam::Vec3, to: glam::Vec3, radius: f32) -> Option<f32> {
         let level = self
             .level
             .as_ref()
-            .and_then(|l| l.collider.first_hit(from, to));
+            .and_then(|l| l.collider.sweep(from, to, radius));
         let objects = self
             .objects
             .as_ref()
-            .and_then(|o| o.solid.first_hit(from, to));
+            .and_then(|o| o.solid.sweep(from, to, radius));
         match (level, objects) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
+    }
+
+    /// The game camera this frame following the party leader (see [`crate::follow`]), when
+    /// the leader is in the current area.
+    pub fn follow_camera(
+        &self,
+        follow: &mut crate::follow::Follow,
+        dt: f32,
+        base: &thedas_render::Camera,
+    ) -> Option<thedas_render::Camera> {
+        let feet = self.leader_feet()?;
+        let height = self.leader_look_height();
+        Some(follow.camera_clear(feet, height, dt, base, &|a, b, r| self.sweep(a, b, r)))
+    }
+
+    /// How high above its feet the camera looks at the party leader: its appearance's
+    /// `apr_base.gda` `HEIGHT`, or `HEIGHT_F` for a female (`CAppearance` 0x748a40 picks by
+    /// gender 2), else [`crate::follow::DEFAULT_LOOK_HEIGHT`] (0x6a1a30 hands the camera
+    /// the appearance's height).
+    pub fn leader_look_height(&self) -> f32 {
+        let sim = self.sim();
+        let w = &sim.world;
+        let height = w.controlled().and_then(|id| w.get(id)).and_then(|o| {
+            let t = w.tables().get(0, "apr_base")?;
+            let column = if o.fields.get("Gender").copied() == Some(2) {
+                "HEIGHT_F"
+            } else {
+                "HEIGHT"
+            };
+            match t.cell(column, o.appearance as i64)? {
+                thedas_formats::gda::Cell::Float(v) => Some(*v as f32),
+                thedas_formats::gda::Cell::Int(v) => Some(*v as f32),
+                _ => None,
+            }
+        });
+        height
+            .filter(|h| h.is_finite() && *h > 0.0)
+            .unwrap_or(crate::follow::DEFAULT_LOOK_HEIGHT)
     }
 
     /// Advances what runs while the world may be stopped (the conversation camera's clock).

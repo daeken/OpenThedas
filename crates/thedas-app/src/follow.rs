@@ -1,65 +1,143 @@
-//! The game camera: it follows the party leader from behind and above, orbiting with the
-//! right mouse button and zooming with the wheel. A wall or anything solid between it and
-//! the leader brings it in to the near side, quickly; once clear it backs out again, slowly.
-//! Provisional: distances and speeds are chosen to look right, not read from the game.
+//! The game camera: it follows the party leader from behind, orbiting with the right mouse
+//! button and zooming with the wheel, as DAOrigins.exe's explore camera does
+//! (`CameraControllerExplore::Update` 0x7714b0 sets up the shot; the game camera's update
+//! 0x6c4c60 places it).
+//!
+//! The shot is a point on a sphere round the look point: `distance` from it, at a yaw and a
+//! pitch. Zoom runs from -1 (far, 20 m) to 1 (near, 3 m); the game starts at the near end.
+//! In the near half (zoom >= 0.5) the camera sweeps a 0.25 m sphere from the look point to
+//! where it wants to be; whatever it meets pulls it in towards the look point at once, or at
+//! 15 m/s while the line behind the new spot is clear. With nothing in the way it eases
+//! back out, speeding up as it goes and holding wherever easing out would touch something.
 
 use glam::Vec3;
 use thedas_render::Camera;
 
-/// Where the camera looks: this far above the leader's feet (metres).
-pub const LOOK_HEIGHT: f32 = 1.5;
-pub const MIN_DISTANCE: f32 = 1.5;
-pub const MAX_DISTANCE: f32 = 25.0;
-/// Pitch limits (radians; negative looks down).
-pub const MIN_PITCH: f32 = -1.4;
-pub const MAX_PITCH: f32 = 0.3;
-/// How fast the camera catches up with the leader (per second; higher is snappier).
-pub const CATCH_UP: f32 = 8.0;
-/// How far short of a surface in the way the camera stops (metres): its near plane stays
-/// clear of the surface.
-pub const CLEARANCE: f32 = 0.4;
-/// The closest the camera comes to the look point when something is in the way (metres).
-pub const MIN_CLEAR: f32 = 0.5;
-/// How fast the camera comes in when something is in the way, and goes back out when it
-/// clears (per second).
-pub const PULL_IN: f32 = 25.0;
-pub const LET_OUT: f32 = 3.0;
+/// The zoom's range (`CameraControllerBase` +0x64 and +0x68, set in its constructor
+/// 0x7ee9b0 at 0x7eea24 and 0x7eea2d): -1 is the far end, 1 the near.
+pub const ZOOM_MIN: f32 = -1.0;
+pub const ZOOM_MAX: f32 = 1.0;
+/// The zoom a new explore camera starts at: the near end (`CameraControllerExplore`'s
+/// constructor 0x76f890 at 0x76f9f3).
+pub const ZOOM_START: f32 = 1.0;
+/// Zoom per wheel notch. Provisional: the exe scales its zoom input by an option times
+/// 0.05 (0x7714c4, 0x7edbe7); the option's value and the wheel's input size are not traced.
+pub const ZOOM_STEP: f32 = 0.1;
+/// Where the zoom splits the near half (sweep collision, free pitch) from the far half
+/// (0xc0dffc; 0x76f0b0, 0x76f1b0, 0x76f640).
+pub const ZOOM_SPLIT: f32 = 0.5;
+/// The camera's distance from the look point at the far and near ends of the zoom (metres):
+/// `CameraControllerExplore::Update` sets them every frame (0x7714d0, 0x7714d9) and the
+/// game camera takes `far + (near - far) * (zoom + 1) / 2` (0x6c2360, 0x7ee770).
+pub const FAR_DISTANCE: f32 = 20.0;
+pub const NEAR_DISTANCE: f32 = 3.0;
+/// The camera's angle down from straight overhead at the near end, as it starts (degrees;
+/// 85 is 5 degrees above the look point): `+0x94` set at 0x76f9f8 and applied on
+/// activation (0x770ffd -> 0x76f550, which takes `45 + (85 - 45) * (zoom + 1) / 2`).
+pub const NEAR_POLAR_DEG: f32 = 85.0;
+/// The angle the far half of the zoom brings the camera to at the far end (0xc0e014; 0x76f221).
+pub const FAR_POLAR_DEG: f32 = 45.0;
+/// How far the player can turn the camera over or under the look point in the near half
+/// (degrees from overhead; 0x76f1d7 sets the game camera's limits from 0xc0e050, 0xc0e054).
+pub const MIN_POLAR_DEG: f32 = 30.0;
+pub const MAX_POLAR_DEG: f32 = 150.0;
+/// Pitch limits (radians; negative looks down): [`MIN_POLAR_DEG`] and [`MAX_POLAR_DEG`].
+pub const MIN_PITCH: f32 = (MIN_POLAR_DEG - 90.0) * std::f32::consts::PI / 180.0;
+pub const MAX_PITCH: f32 = (MAX_POLAR_DEG - 90.0) * std::f32::consts::PI / 180.0;
+/// The look point's height above the leader's feet when its appearance gives none
+/// (`CAppearance`'s default height, 0x748a51), and the height the far half of the zoom
+/// brings it to (0xc0e028; 0x76f6c6). The leader's own is `apr_base.gda`'s `HEIGHT`
+/// (`HEIGHT_F` for a female; 0x748a40), which the creature hands the camera (0x6a1a6b).
+pub const DEFAULT_LOOK_HEIGHT: f32 = 1.8;
+/// The look height follows a change in the leader's at `difference / 0.15` metres a
+/// second (0xc11c30; 0x7eea70).
+pub const LOOK_HEIGHT_EASE: f32 = 0.15;
+/// The radius of the sphere swept from the look point to the camera (metres; 0xaff3e8, at
+/// 0x6c3750 and 0x6c368b).
+pub const SWEEP_RADIUS: f32 = 0.25;
+/// The nearest the camera is pulled to the look point (metres; 0xae7fe8, at 0x6c336c).
+pub const PIVOT_CLEARANCE: f32 = 0.25;
+/// How fast the camera comes in when the line behind it is clear (m/s; 0xc038e4, 0x6c34f4).
+pub const PULL_IN_SPEED: f32 = 15.0;
+/// Easing out: the fastest it goes (m/s; 0xc038e0, 0x6c35ce), and how fast it speeds up
+/// (m/s²; 0xc038d8, 0x6c36cf), thirty times faster in the far half (0xc038dc, 0x6c36db).
+pub const EASE_OUT_MAX: f32 = 15.0;
+pub const EASE_OUT_ACCEL: f32 = 10.0;
+pub const EASE_OUT_FAST: f32 = 30.0;
+/// Differences the camera ignores (0xb107fc).
+const EPSILON: f32 = 1e-6;
+/// A look point jump at least this long (metres) is a cut (a transition, a teleport): the
+/// camera stands where it can at once. Provisional.
+const CUT: f32 = 10.0;
 
-/// What a segment meets first: the share of the way from its start, as
-/// [`thedas_render::collide::Collider::first_hit`] says.
-pub type FirstHit<'a> = &'a dyn Fn(Vec3, Vec3) -> Option<f32>;
+/// What a sphere of the given radius (0: a segment) meets first moving from the first point
+/// to the second: the share of the way its centre has come, as
+/// [`thedas_render::collide::Collider::sweep`] says.
+pub type Sweep<'a> = &'a dyn Fn(Vec3, Vec3, f32) -> Option<f32>;
 
-/// The distance shown after `dt` seconds, going from `shown` toward `clear` (quickly when
-/// coming in, slowly going out).
-pub fn settle_distance(shown: f32, clear: f32, dt: f32) -> f32 {
-    let rate = if clear < shown { PULL_IN } else { LET_OUT };
-    shown + (clear - shown) * (1.0 - (-rate * dt.max(0.0)).exp())
+/// How the camera keeps clear of what is between it and the leader, by zoom (0x76f0b0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Collision {
+    /// Near half: sweep, pull in, ease out holding on what easing out would touch.
+    Sweep,
+    /// Far half: no sweep; whatever pull is left eases out fast.
+    Free,
+    /// The far end. Provisional: the exe only checks the camera is not inside something
+    /// (0x6c3180), which is not traced.
+    Overhead,
+}
+
+impl Collision {
+    fn of(zoom: f32) -> Self {
+        if zoom <= ZOOM_MIN {
+            Self::Overhead
+        } else if zoom >= ZOOM_SPLIT {
+            Self::Sweep
+        } else {
+            Self::Free
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Follow {
     /// The direction the camera looks, radians anticlockwise from +X.
     pub yaw: f32,
+    /// The pitch the player has set (radians; negative looks down). The far half of the
+    /// zoom blends it towards [`FAR_POLAR_DEG`].
     pub pitch: f32,
-    /// From the look point, metres.
-    pub distance: f32,
-    /// The look point the camera has caught up to.
-    focus: Option<Vec3>,
-    /// How far from the look point it stands now (short of `distance` while something is
-    /// in the way).
-    shown: Option<f32>,
+    /// From [`ZOOM_MIN`] (far) to [`ZOOM_MAX`] (near).
+    pub zoom: f32,
+    /// The look point last frame.
+    pivot: Option<Vec3>,
+    /// The look point's height above the leader's feet, as it has caught up.
+    height: Option<f32>,
+    /// How far the camera is pulled in from where it wants to be, towards the look point
+    /// (metres; the game camera's +0x34).
+    pull: f32,
+    /// How fast it is easing back out (m/s; +0x38).
+    ease: f32,
+    /// Where it stood last frame (+0x70).
+    eye: Option<Vec3>,
 }
 
 impl Follow {
-    /// Behind a leader looking along `heading` (radians from +X).
+    /// Behind a leader looking along `heading` (radians from +X), as the explore camera
+    /// starts: at [`ZOOM_START`], [`NEAR_POLAR_DEG`] from overhead.
     pub fn behind(heading: f32) -> Self {
-        Self {
+        let mut f = Self {
             yaw: heading,
-            pitch: -0.45,
-            distance: 7.0,
-            focus: None,
-            shown: None,
-        }
+            pitch: 0.0,
+            zoom: ZOOM_START,
+            pivot: None,
+            height: None,
+            pull: 0.0,
+            ease: 0.0,
+            eye: None,
+        };
+        let t = f.zoom_t();
+        f.pitch = (FAR_POLAR_DEG + (NEAR_POLAR_DEG - FAR_POLAR_DEG) * t - 90.0).to_radians();
+        f
     }
 
     pub fn orbit(&mut self, d_yaw: f32, d_pitch: f32) {
@@ -67,57 +145,178 @@ impl Follow {
         self.pitch = (self.pitch + d_pitch).clamp(MIN_PITCH, MAX_PITCH);
     }
 
-    /// Zooms in for positive `steps`, out for negative.
+    /// Zooms in for positive `steps` (wheel notches), out for negative.
     pub fn zoom(&mut self, steps: f32) {
-        self.distance = (self.distance * 0.88f32.powf(steps)).clamp(MIN_DISTANCE, MAX_DISTANCE);
+        if steps.is_finite() {
+            self.zoom = (self.zoom + steps * ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX);
+        }
     }
 
-    /// The camera this frame, following a leader standing at `feet`, `dt` seconds after the
-    /// last, with nothing in the way.
+    /// The zoom as a share of the way from the far end to the near (0x7ee770).
+    fn zoom_t(&self) -> f32 {
+        ((self.zoom - ZOOM_MIN) / (ZOOM_MAX - ZOOM_MIN)).clamp(0.0, 1.0)
+    }
+
+    /// How far into the far half the zoom is: 0 at [`ZOOM_SPLIT`] and above, 1 at the far
+    /// end (0x76eab0 with its argument set).
+    fn far_t(&self) -> f32 {
+        if self.zoom >= ZOOM_SPLIT {
+            0.0
+        } else {
+            (1.0 - (self.zoom - ZOOM_MIN) / (ZOOM_SPLIT - ZOOM_MIN)).clamp(0.0, 1.0)
+        }
+    }
+
+    /// From the look point to where the camera wants to be (metres).
+    pub fn distance(&self) -> f32 {
+        FAR_DISTANCE + (NEAR_DISTANCE - FAR_DISTANCE) * self.zoom_t()
+    }
+
+    /// The pitch the camera takes: the player's, blended towards [`FAR_POLAR_DEG`] in the
+    /// far half (0x76f221). Provisional: the exe blends from the pitch it had on entering
+    /// the far half (+0x98, 0x76fc41) rather than the player's current one.
+    fn shot_pitch(&self) -> f32 {
+        let far = (FAR_POLAR_DEG - 90.0).to_radians();
+        self.pitch + (far - self.pitch) * self.far_t()
+    }
+
+    /// The camera this frame, following a leader of the default height standing at `feet`,
+    /// `dt` seconds after the last, with nothing in the way.
     #[cfg(test)]
     pub fn camera(&mut self, feet: Vec3, dt: f32, base: &Camera) -> Camera {
-        self.camera_clear(feet, dt, base, &|_, _| None)
+        self.camera_clear(feet, DEFAULT_LOOK_HEIGHT, dt, base, &|_, _, _| None)
     }
 
-    /// [`Follow::camera`] kept on the leader's side of whatever `hit` finds between them.
-    pub fn camera_clear(&mut self, feet: Vec3, dt: f32, base: &Camera, hit: FirstHit) -> Camera {
-        let target = feet + Vec3::Z * LOOK_HEIGHT;
-        let cut = !matches!(self.focus, Some(f) if f.distance(target) < 10.0);
-        let focus = match self.focus {
-            // A long jump (a transition, a teleport) cuts rather than glides.
-            Some(f) if f.distance(target) < 10.0 => {
-                f.lerp(target, (CATCH_UP * dt.max(0.0)).min(1.0))
-            }
-            _ => target,
+    /// The camera this frame, following a leader standing at `feet` whose appearance's
+    /// height is `height` (see [`DEFAULT_LOOK_HEIGHT`]), `dt` seconds after the last, kept on
+    /// the leader's side of what `sweep` meets between them. With no time passed (a still
+    /// capture) or after a cut, it stands where it would settle at once.
+    pub fn camera_clear(
+        &mut self,
+        feet: Vec3,
+        height: f32,
+        dt: f32,
+        base: &Camera,
+        sweep: Sweep,
+    ) -> Camera {
+        let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+        let height = if height.is_finite() {
+            height
+        } else {
+            DEFAULT_LOOK_HEIGHT
         };
-        self.focus = Some(focus);
-        let mut c = Camera::new(focus, self.yaw, self.pitch);
+        // The far half brings the look point to the default height (0x76f6c6).
+        let height = height + (DEFAULT_LOOK_HEIGHT - height) * self.far_t();
+        let h = match self.height {
+            Some(h) if dt > 0.0 => {
+                let gap = height - h;
+                h + gap.signum() * (gap.abs() * dt / LOOK_HEIGHT_EASE).min(gap.abs())
+            }
+            _ => height,
+        };
+        self.height = Some(h);
+        let pivot = feet + Vec3::Z * h;
+        let cut = !matches!(self.pivot, Some(p) if p.distance(pivot) < CUT);
+        self.pivot = Some(pivot);
+        if cut {
+            self.pull = 0.0;
+            self.ease = 0.0;
+            self.eye = None;
+        }
+        let settle = cut || dt <= 0.0;
+
+        let mut c = Camera::new(pivot, self.yaw, self.shot_pitch());
         c.fov_y = base.fov_y;
         c.near = base.near;
         c.far = base.far;
-        let reach = self.distance + CLEARANCE;
-        // The line of sight, and lines to either side of and above and below the camera:
-        // a wall beside the camera (not between it and the leader) also brings it in.
-        // Provisional: the game's own camera collision is not traced.
-        let forward = c.forward();
-        let right = forward.cross(Vec3::Z).normalize_or(Vec3::X);
-        let up = right.cross(forward);
-        let clear = [Vec3::ZERO, right, -right, up, -up]
-            .iter()
-            .filter_map(|side| {
-                let to = focus - forward * reach + *side * CLEARANCE;
-                hit(focus, to).map(|t| t * (to - focus).length())
-            })
-            .fold(None, |a: Option<f32>, d| Some(a.map_or(d, |a| a.min(d))))
-            .map_or(self.distance, |d| (d - CLEARANCE).max(MIN_CLEAR));
-        // After a cut (a transition), or with no time to glide in, it stands where it can.
-        let shown = match self.shown {
-            Some(s) if !cut && dt > 0.0 => settle_distance(s, clear, dt),
-            _ => clear,
-        };
-        self.shown = Some(shown);
-        c.position = focus - c.forward() * shown;
+        let toward = c.forward();
+        let wanted = pivot - toward * self.distance();
+        let mode = Collision::of(self.zoom);
+        if mode == Collision::Sweep
+            && let Some(t) = sweep(pivot, wanted, SWEEP_RADIUS)
+        {
+            let centre = pivot + (wanted - pivot) * t.clamp(0.0, 1.0);
+            let need = centre
+                .distance(wanted)
+                .min(pivot.distance(wanted) - PIVOT_CLEARANCE)
+                .max(0.0);
+            self.pull_in(need, wanted, toward, pivot, dt, settle, sweep);
+        }
+        let eye = wanted + toward * self.pull;
+        self.eye = Some(eye);
+        // Easing out moves the camera next frame (0x6c4e7c runs after 0x6c4e6a).
+        self.ease_out(mode, wanted, toward, eye, dt, sweep);
+        c.position = eye;
         c
+    }
+
+    /// Brings the camera in to `need` metres short of `wanted` (towards the look point
+    /// along `toward`) when that spot is in front of where it stands (0x6c32c0): at once
+    /// when it is already as far in or `settle` is set, else at [`PULL_IN_SPEED`] while the
+    /// line from the new spot to the look point is clear, at once when it is not.
+    #[allow(clippy::too_many_arguments)]
+    fn pull_in(
+        &mut self,
+        need: f32,
+        wanted: Vec3,
+        toward: Vec3,
+        pivot: Vec3,
+        dt: f32,
+        settle: bool,
+        sweep: Sweep,
+    ) {
+        // Provisional: the exe tests against the game camera's own facing (+0x90); this
+        // frame's is used.
+        if let Some(eye) = self.eye {
+            let step = wanted + toward * need - eye;
+            if step.length_squared() > EPSILON && step.normalize().dot(toward) < 0.0 {
+                return;
+            }
+        }
+        if (need - self.pull).abs() <= EPSILON || self.pull >= need || settle {
+            self.pull = need;
+        } else {
+            let closer = (self.pull + PULL_IN_SPEED * dt).min(need);
+            self.pull = if sweep(wanted + toward * closer, pivot, 0.0).is_none() {
+                closer
+            } else {
+                need
+            };
+        }
+        self.ease = 0.0;
+    }
+
+    /// Lets the camera back out towards where it wants to be (0x6c35a0), speeding up as it
+    /// goes; in the near half it holds (and stops speeding) where the move from `eye` would
+    /// touch something.
+    fn ease_out(
+        &mut self,
+        mode: Collision,
+        wanted: Vec3,
+        toward: Vec3,
+        eye: Vec3,
+        dt: f32,
+        sweep: Sweep,
+    ) {
+        if self.pull <= EPSILON {
+            self.pull = 0.0;
+            self.ease = 0.0;
+            return;
+        }
+        let pull = (self.pull - self.ease.min(EASE_OUT_MAX) * dt).max(0.0);
+        if mode == Collision::Sweep
+            && (pull - self.pull).abs() > EPSILON
+            && sweep(eye, wanted + toward * pull, SWEEP_RADIUS).is_some()
+        {
+            self.ease = 0.0;
+            return;
+        }
+        self.pull = pull;
+        let accel = match mode {
+            Collision::Free => EASE_OUT_ACCEL * EASE_OUT_FAST,
+            _ => EASE_OUT_ACCEL,
+        };
+        self.ease += accel * dt;
     }
 }
 
@@ -125,95 +324,159 @@ impl Follow {
 mod tests {
     use super::*;
 
-    #[test]
-    fn sits_behind_and_above_the_leader_looking_at_it() {
-        let mut f = Follow::behind(0.0);
-        let base = Camera::new(Vec3::ZERO, 0.0, 0.0);
-        let c = f.camera(Vec3::new(10.0, 0.0, 0.0), 0.016, &base);
-        // Looking along +X from behind (smaller x) and above.
-        assert!(c.position.x < 10.0 && c.position.z > LOOK_HEIGHT);
-        let look = Vec3::new(10.0, 0.0, LOOK_HEIGHT);
-        assert!((c.position + c.forward() * f.distance - look).length() < 1e-4);
+    const FEET: Vec3 = Vec3::ZERO;
+
+    fn look() -> Vec3 {
+        FEET + Vec3::Z * DEFAULT_LOOK_HEIGHT
     }
 
-    #[test]
-    fn glides_after_small_moves_and_cuts_after_big_ones() {
-        let mut f = Follow::behind(0.0);
-        let base = Camera::new(Vec3::ZERO, 0.0, 0.0);
-        f.camera(Vec3::ZERO, 0.016, &base);
-        let c1 = f.camera(Vec3::new(1.0, 0.0, 0.0), 0.016, &base);
-        let moved = c1.position.x + c1.forward().x * f.distance;
-        assert!(moved > 0.0 && moved < 1.0, "{moved}");
-        let c2 = f.camera(Vec3::new(100.0, 0.0, 0.0), 0.016, &base);
-        assert!((c2.position.x + c2.forward().x * f.distance - 100.0).abs() < 1e-3);
+    fn base() -> Camera {
+        Camera::new(Vec3::ZERO, 0.0, 0.0)
     }
 
-    #[test]
-    fn comes_in_before_a_wall_and_backs_out_slowly() {
-        let mut f = Follow::behind(0.0);
-        let base = Camera::new(Vec3::ZERO, 0.0, 0.0);
-        // A wall 3 m behind the look point (the camera wants 7 m): anything past it is hit.
-        let wall = |a: Vec3, b: Vec3| {
-            let (da, db) = (
-                (a - Vec3::new(0.0, 0.0, LOOK_HEIGHT)).length(),
-                (b - a).length(),
-            );
-            (db > 3.0 - da).then(|| (3.0 - da) / db)
-        };
-        let dist = |c: &Camera| (c.position - Vec3::new(0.0, 0.0, LOOK_HEIGHT)).length();
-        let c = f.camera_clear(Vec3::ZERO, 0.0, &base, &wall);
-        assert!((dist(&c) - (3.0 - CLEARANCE)).abs() < 1e-3, "{}", dist(&c));
-        // Clear again, it backs out over time rather than at once.
-        let c1 = f.camera_clear(Vec3::ZERO, 0.1, &base, &|_, _| None);
-        assert!(
-            dist(&c1) > 3.0 - CLEARANCE && dist(&c1) < 4.0,
-            "{}",
-            dist(&c1)
-        );
-        for _ in 0..100 {
-            f.camera_clear(Vec3::ZERO, 0.1, &base, &|_, _| None);
+    /// A wall `at` metres behind the look point (the plane x = -at; the camera looks along
+    /// +X) as a sweep of any radius meets it.
+    fn wall(at: f32) -> impl Fn(Vec3, Vec3, f32) -> Option<f32> {
+        move |a: Vec3, b: Vec3, r: f32| {
+            let touch = -at + r;
+            if a.x <= touch {
+                Some(0.0)
+            } else {
+                (b.x < touch).then(|| (a.x - touch) / (a.x - b.x))
+            }
         }
-        let c2 = f.camera_clear(Vec3::ZERO, 0.1, &base, &|_, _| None);
-        assert!((dist(&c2) - 7.0).abs() < 1e-2);
-        // Into the wall again: quickly in.
-        let c3 = f.camera_clear(Vec3::ZERO, 0.2, &base, &wall);
-        assert!(dist(&c3) < 3.0, "{}", dist(&c3));
-        // Never nearer than the minimum, however close the wall.
-        let c4 = f.camera_clear(Vec3::ZERO, 0.0, &base, &|_, _| Some(0.0));
-        assert!((dist(&c4) - MIN_CLEAR).abs() < 1e-3);
-        assert!((settle_distance(2.0, 6.0, 0.0) - 2.0).abs() < 1e-6);
+    }
+
+    fn dist(c: &Camera) -> f32 {
+        (c.position - look()).length()
     }
 
     #[test]
-    fn a_wall_beside_the_camera_brings_it_in_too() {
+    fn starts_near_and_low_behind_the_leader() {
         let mut f = Follow::behind(0.0);
-        let base = Camera::new(Vec3::ZERO, 0.0, 0.0);
-        let free = f.camera_clear(Vec3::ZERO, 0.0, &base, &|_, _| None);
-        // A wall on the camera's left (+Y when it looks along +X), behind the leader: the
-        // line of sight is clear, a line to the camera's left side is not.
-        let wall = |a: Vec3, b: Vec3| -> Option<f32> {
-            let (ya, yb) = (a.y, b.y);
-            (yb > 0.2 && ya < 0.2).then(|| (0.2 - ya) / (yb - ya))
-        };
-        let mut g = Follow::behind(0.0);
-        let near = g.camera_clear(Vec3::ZERO, 0.0, &base, &wall);
-        let look = Vec3::new(0.0, 0.0, LOOK_HEIGHT);
-        assert!(
-            (near.position - look).length() < (free.position - look).length() - 1.0,
-            "{:?} {:?}",
-            near.position,
-            free.position
-        );
+        assert_eq!(f.zoom, ZOOM_START);
+        assert!((f.distance() - NEAR_DISTANCE).abs() < 1e-5);
+        assert!((f.pitch.to_degrees() + 5.0).abs() < 1e-4, "{}", f.pitch);
+        let c = f.camera(Vec3::new(10.0, 0.0, 0.0), 0.016, &base());
+        let look = Vec3::new(10.0, 0.0, DEFAULT_LOOK_HEIGHT);
+        // Behind (smaller x), a little above, 3 m off, looking at the look point.
+        assert!(c.position.x < 10.0 && c.position.z > DEFAULT_LOOK_HEIGHT);
+        assert!(((c.position - look).length() - 3.0).abs() < 1e-4);
+        assert!((c.position + c.forward() * 3.0 - look).length() < 1e-4);
     }
 
     #[test]
-    fn orbit_and_zoom_stay_in_bounds() {
+    fn zoom_spans_the_near_and_far_distances() {
+        let mut f = Follow::behind(0.0);
+        f.zoom(-100.0);
+        assert_eq!(f.zoom, ZOOM_MIN);
+        assert!((f.distance() - FAR_DISTANCE).abs() < 1e-5);
+        // The far end looks down at 45 degrees and from the default height.
+        assert!((f.shot_pitch().to_degrees() + 45.0).abs() < 1e-3);
+        f.zoom(100.0);
+        assert_eq!(f.zoom, ZOOM_MAX);
+        f.zoom = 0.0;
+        assert!((f.distance() - 11.5).abs() < 1e-5);
+        f.zoom(f32::NAN);
+        assert_eq!(f.zoom, 0.0);
+    }
+
+    #[test]
+    fn looks_at_the_leaders_height_and_follows_changes_to_it() {
+        let mut f = Follow::behind(0.0);
+        let c = f.camera_clear(FEET, 1.43, 0.0, &base(), &|_, _, _| None);
+        let at = c.position + c.forward() * f.distance();
+        assert!((at.z - 1.43).abs() < 1e-4, "{at}");
+        // A change eases over about 0.15 s.
+        let c = f.camera_clear(FEET, 1.73, 0.05, &base(), &|_, _, _| None);
+        let at = c.position + c.forward() * f.distance();
+        assert!((at.z - 1.53).abs() < 1e-3, "{at}");
+    }
+
+    #[test]
+    fn a_wall_brings_it_in_at_once_and_it_eases_back_out() {
+        let mut f = Follow::behind(0.0);
+        // The wall 2 m behind the look point (the camera wants 3 m): the sphere's centre
+        // stops 0.25 m short of it.
+        let w = wall(2.0);
+        let c = f.camera_clear(FEET, DEFAULT_LOOK_HEIGHT, 0.0, &base(), &w);
+        let want = 1.75 / (-5f32).to_radians().cos();
+        assert!((dist(&c) - want).abs() < 1e-3, "{} {want}", dist(&c));
+        // Held there while the wall stands.
+        let c = f.camera_clear(FEET, DEFAULT_LOOK_HEIGHT, 0.1, &base(), &w);
+        assert!((dist(&c) - want).abs() < 1e-3, "{}", dist(&c));
+        // Clear: it eases out, slowly at first (10 m/s², at most 15 m/s).
+        let mut last = dist(&c);
+        let mut frames = 0;
+        while last < NEAR_DISTANCE - 1e-4 && frames < 100 {
+            let c = f.camera_clear(FEET, DEFAULT_LOOK_HEIGHT, 0.05, &base(), &|_, _, _| None);
+            assert!(dist(&c) >= last - 1e-5);
+            last = dist(&c);
+            frames += 1;
+        }
+        // 1.25 m at 10 m/s² from rest: about half a second.
+        assert!((8..=14).contains(&frames), "{frames}");
+        assert!((last - NEAR_DISTANCE).abs() < 1e-4);
+    }
+
+    #[test]
+    fn it_comes_in_at_pull_in_speed_while_the_line_behind_is_clear() {
+        let mut f = Follow::behind(0.0);
+        f.camera_clear(FEET, DEFAULT_LOOK_HEIGHT, 0.0, &base(), &|_, _, _| None);
+        // A post the sphere grazes but a line misses (a sweep hit, a clear ray): it comes in
+        // at 15 m/s, 0.15 m in 0.01 s.
+        let post = |a: Vec3, b: Vec3, r: f32| {
+            (r > 0.0 && a.x > b.x && b.x < -2.0 && a.x > -2.0).then(|| (a.x + 2.0) / (a.x - b.x))
+        };
+        let c = f.camera_clear(FEET, DEFAULT_LOOK_HEIGHT, 0.01, &base(), &post);
+        assert!(
+            (NEAR_DISTANCE - dist(&c) - 0.15).abs() < 1e-3,
+            "{}",
+            dist(&c)
+        );
+        // Something on the line too: it is at the sphere's stop at once.
+        let mut g = Follow::behind(0.0);
+        g.camera_clear(FEET, DEFAULT_LOOK_HEIGHT, 0.0, &base(), &|_, _, _| None);
+        let c = g.camera_clear(FEET, DEFAULT_LOOK_HEIGHT, 0.01, &base(), &wall(2.0));
+        let want = 1.75 / (-5f32).to_radians().cos();
+        assert!((dist(&c) - want).abs() < 1e-3, "{}", dist(&c));
+    }
+
+    #[test]
+    fn never_nearer_than_the_clearance_and_no_sweep_in_the_far_half() {
+        let mut f = Follow::behind(0.0);
+        let c = f.camera_clear(FEET, DEFAULT_LOOK_HEIGHT, 0.0, &base(), &|_, _, _| {
+            Some(0.0)
+        });
+        assert!((dist(&c) - PIVOT_CLEARANCE).abs() < 1e-4, "{}", dist(&c));
+        // Zoomed out past the split, nothing pulls it in.
+        let mut g = Follow::behind(0.0);
+        g.zoom = 0.0;
+        let c = g.camera_clear(FEET, DEFAULT_LOOK_HEIGHT, 0.0, &base(), &|_, _, _| {
+            Some(0.0)
+        });
+        assert!((dist(&c) - g.distance()).abs() < 1e-3, "{}", dist(&c));
+    }
+
+    #[test]
+    fn a_big_jump_cuts() {
+        let mut f = Follow::behind(0.0);
+        f.camera_clear(FEET, DEFAULT_LOOK_HEIGHT, 0.0, &base(), &|_, _, _| {
+            Some(0.0)
+        });
+        let far = Vec3::new(100.0, 0.0, 0.0);
+        let c = f.camera_clear(far, DEFAULT_LOOK_HEIGHT, 0.016, &base(), &|_, _, _| None);
+        let look = far + Vec3::Z * DEFAULT_LOOK_HEIGHT;
+        assert!(((c.position - look).length() - NEAR_DISTANCE).abs() < 1e-4);
+    }
+
+    #[test]
+    fn orbit_stays_in_bounds() {
         let mut f = Follow::behind(0.0);
         f.orbit(0.5, -10.0);
         assert_eq!(f.pitch, MIN_PITCH);
-        f.zoom(100.0);
-        assert_eq!(f.distance, MIN_DISTANCE);
-        f.zoom(-100.0);
-        assert_eq!(f.distance, MAX_DISTANCE);
+        assert!((MIN_PITCH.to_degrees() + 60.0).abs() < 1e-4);
+        f.orbit(0.0, 10.0);
+        assert_eq!(f.pitch, MAX_PITCH);
     }
 }
