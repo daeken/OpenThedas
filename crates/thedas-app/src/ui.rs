@@ -760,6 +760,7 @@ impl UiLayer {
             }
             shown.journal = journal;
             shown.book_page = screens.menu.and_then(Screen::book_page);
+            shown.menu_up = screens.menu.is_some();
             shown.ability_scene = match screens.menu {
                 Some(Screen::Skills) => 3,
                 Some(Screen::SpellsTalents) => 1,
@@ -799,6 +800,16 @@ impl UiLayer {
         // The store's close button: the simulation's store closes too.
         if changes.dismissed.contains(&Screen::Store) {
             sim.lock().unwrap_or_else(|p| p.into_inner()).close_store();
+        }
+        // The inventory closed (its close button or Escape) while a container was open:
+        // the container closes too.
+        if changes.dismissed.contains(&Screen::Inventory)
+            || changes.closed.contains(&Screen::Inventory)
+        {
+            let mut s = sim.lock().unwrap_or_else(|p| p.into_inner());
+            if s.world.container.is_some() {
+                s.close_container();
+            }
         }
         // A picker that closed itself without its Accept keeps the members picked so far.
         // Provisional: partypicker.gfx has no other way out.

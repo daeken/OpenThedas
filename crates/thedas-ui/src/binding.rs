@@ -119,6 +119,9 @@ pub struct Presentation {
     pub ability_scene: i32,
     /// The book page up (navbar.gfx's selected tab, `GUI.SelectedBookPage`), if any.
     pub book_page: Option<i32>,
+    /// A full-screen menu (options, save and load, the game menu) is up: tutorial popups
+    /// wait under it (the popup layer those screens load does not show them).
+    pub menu_up: bool,
 }
 
 /// An item shown on the examine screen (itemexamine.gfx), as the screen that opened it asked
@@ -673,18 +676,25 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     // tutorials on (`Tutorials.Enabled`). An empty list hides the panel.
     let tutorial_text =
         |s: Option<u32>| UiValue::String(s.and_then(|s| sim.string(s)).unwrap_or_default());
+    // Provisional: the original's rule for a tutorial waiting while a menu is up is not
+    // traced; QA saw the panel over the options, save and game menus, where it does not
+    // belong.
+    let tutorials: &[thedas_sim::journal::Tutorial] = if shown.menu_up {
+        &[]
+    } else {
+        &sim.world.tutorials
+    };
     v.insert(
         "Tutorials.TutorialList".into(),
         UiValue::String(
-            sim.world
-                .tutorials
+            tutorials
                 .iter()
                 .map(|t| t.resref.as_str())
                 .collect::<Vec<_>>()
                 .join(","),
         ),
     );
-    for (i, t) in sim.world.tutorials.iter().enumerate() {
+    for (i, t) in tutorials.iter().enumerate() {
         let k = format!("Tutorials.TutorialList.{i}");
         v.insert(k.clone(), UiValue::String(t.resref.clone()));
         v.insert(format!("{k}.Title"), tutorial_text(t.title));
@@ -1403,10 +1413,46 @@ fn inventory(sim: &Sim, who: Option<u32>, filter: i32, v: &mut BTreeMap<String, 
             item(sim, &format!("{k}.Item"), *id, v);
         }
     }
-    // No container is open (looting goes through the simulation's own commands for now).
-    v.insert("GUIInventory.ShowContainer".into(), num(0));
-    v.insert("GUIInventory.ContainerHasPlotItems".into(), num(0));
+    // The container being looted (`OpenInventory`): inventory.gfx's container panel shows
+    // its name (`Container.Name`, else its tag) and items (`GUIInventory.ContainerView.N.
+    // Item`, also `Container.Inventory`, which Take All counts). Provisional: the party
+    // cannot put items into a container.
+    let container = sim
+        .world
+        .container
+        .and_then(|c| sim.world.get(c).map(|o| (c, o)));
+    v.insert(
+        "GUIInventory.ShowContainer".into(),
+        num(container.is_some() as u8),
+    );
     v.insert("GUIInventory.CanAddItemsToContainer".into(), num(0));
+    let loot: Vec<u32> = container
+        .map(|(_, o)| o.inventory.clone())
+        .unwrap_or_default();
+    v.insert(
+        "GUIInventory.ContainerHasPlotItems".into(),
+        num(loot
+            .iter()
+            .any(|&i| sim.world.get(i).is_some_and(|o| o.plot)) as u8),
+    );
+    if let Some((c, o)) = container {
+        v.insert("Container.ID".into(), num(c));
+        v.insert("Container.Name".into(), UiValue::String(name(sim, c)));
+        v.insert("Container.Tag".into(), UiValue::String(o.tag.clone()));
+    }
+    let ids: Vec<String> = loot.iter().map(|i| i.to_string()).collect();
+    v.insert(
+        "GUIInventory.ContainerView".into(),
+        UiValue::String(ids.join(",")),
+    );
+    v.insert("Container.Inventory".into(), UiValue::String(ids.join(",")));
+    for (i, id) in loot.iter().enumerate() {
+        let k = format!("GUIInventory.ContainerView.{i}");
+        v.insert(k.clone(), num(*id));
+        v.insert(format!("{k}.GroupSize"), num(1));
+        item(sim, &format!("{k}.Item"), *id, v);
+        v.insert(format!("Container.Inventory.{i}"), num(*id));
+    }
     v.insert("Party.BackpackSize".into(), num(gear.len() as f64));
     let hero = sim.world.hero.and_then(|h| sim.world.get(h));
     v.insert(

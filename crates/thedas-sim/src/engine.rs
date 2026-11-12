@@ -3270,6 +3270,11 @@ pub fn call(
             h.sim.world.store = h.object(st).map(|_| st);
             void()
         }
+        // A container's inventory opens for looting (see container.rs).
+        "OpenInventory" => {
+            h.sim.open_container(obj(a, 0));
+            void()
+        }
         "GetItemValue" => ok(Value::Int(h.sim.item_value(obj(a, 0)))),
         // A quickbar slot: an ability and the tag of the item it comes from; no ability
         // empties it.
@@ -3534,14 +3539,23 @@ pub fn call(
                 .count();
             ok(Value::Int(n as i32))
         }
-        "SetCanLevelUp" | "SetAILevel" => {
-            let field = if name == "SetCanLevelUp" {
-                "CanLevelUp"
-            } else {
-                "AILevel"
-            };
+        // DAOrigins.exe's SetCanLevelUp (0x662ea0 -> 0x6aca10) ignores its value: whether a
+        // creature can level up is whether it has points to spend (attribute, skill and
+        // talent points, properties 34-36).
+        "SetCanLevelUp" => {
+            let who = obj(a, 0);
+            let points: f32 = [34, 35, 36]
+                .iter()
+                .map(|&p| h.sim.property_total(who, p))
+                .sum();
+            if let Some(o) = h.sim.world.get_mut(who) {
+                o.fields.insert("CanLevelUp".into(), (points > 0.0) as i32);
+            }
+            void()
+        }
+        "SetAILevel" => {
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.fields.insert(field.to_string(), int(a, 1));
+                o.fields.insert("AILevel".into(), int(a, 1));
             }
             void()
         }

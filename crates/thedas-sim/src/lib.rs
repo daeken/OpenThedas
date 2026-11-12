@@ -18,6 +18,7 @@ pub mod chanters;
 pub mod chargen;
 pub mod collision;
 pub mod combat;
+pub mod container;
 pub mod cutscene;
 pub mod cuttracks;
 pub mod derived;
