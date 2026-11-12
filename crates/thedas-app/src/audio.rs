@@ -732,14 +732,23 @@ impl GameAudio {
                 (Some(t), Some(col)) => table_event(t, veg, col),
                 _ => None,
             };
-            if let Some(event) = event {
-                self.engine.play(
-                    &event,
-                    PlayOptions {
-                        position: Some(*pos),
-                        ..Default::default()
-                    },
-                );
+            match &event {
+                Some(event) => {
+                    log::debug!(
+                        "audio: vegetation rustle {event} (creature {id}, vegetation {veg})"
+                    );
+                    self.engine.play(
+                        event,
+                        PlayOptions {
+                            position: Some(*pos),
+                            ..Default::default()
+                        },
+                    );
+                }
+                None => log::debug!(
+                    "audio: vegetation {veg} under creature {id} has no rustle (size {:?})",
+                    g.size
+                ),
             }
             let reach = (self.random() % 100) as f32 * 0.004 + 0.8;
             rustled.insert(*id, (*pos, reach));
