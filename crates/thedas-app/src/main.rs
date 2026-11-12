@@ -2358,7 +2358,7 @@ fn nearest_tagged(
     let me = sim.world.get(who)?;
     sim.world
         .by_tag(tag)
-        .filter(|o| o.area.is_some() && o.area == me.area && o.id != who)
+        .filter(|o| o.area.is_some() && o.area == me.area && o.id != who && o.active)
         .min_by(|a, b| {
             let d =
                 |o: &thedas_sim::world::Object| thedas_sim::engine::dist(o.position, me.position);
