@@ -10,23 +10,58 @@ repository.
 
 ## Status
 
-Last updated 2026-11-12 07:26 UTC, main 2b363b1
+Last updated 2026-11-12 08:50 UTC, main dc61171
 
-Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA run 1 (taken at main d24cb05), so some of its findings may already be fixed.
+Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA run 8 (taken at main 2e7b804), so some of its findings may already be fixed.
 
-- ✅ **Boot flow**: EA logo and intro movies play (decoded via ffmpeg, silent), then the start menu.
+- ✅ **Boot flow**: EA logo and intro movies play with their sound (decoded via ffmpeg), then the start menu.
 - ✅ **Start menu**: New Game, Load, Options and Quit are wired; QA graded it near pixel-identical to the original.
-- 🟡 **Character creation**: full flow with the original's stage, camera and portrait; appearance menu (preset, hair, beard), colour sliders, difficulty and name. Partial: face-shape sliders, hair-colour details. QA also flagged dim skill/talent icons after spending points and attribute arrows that never show a disabled state.
-- 🟡 **Conversations and cutscenes**: reply list, subtitles and movie tracks work (the New Game intro). Camera and animation tracks are not played yet (in progress), so story cutscenes show the gameplay chase camera. Framing for unstaged conversation lines also falls back to the chase camera (in progress).
-- ✅ **Exploration and camera**: walking, click-to-pick, doors, follow camera with wall collision, area map, companions following.
-- 🟡 **Combat and simulation**: NWScript VM with a large share of the engine functions, melee and ability timing, threat, AI-driven party, tactics, loot and containers. Weapons are sheathed on the back out of combat and drawn in combat; draw/sheathe animation timing is not traced. Not every script engine function is implemented.
-- 🟡 **Party, inventory, journal and other UI screens**: inventory (with paperdoll and item examine), character record, level-up, store, tactics, journal and codex, options, area map and HUD notifications are wired to the simulation. Screens have not all been audited against the original.
-- 🟡 **Rendering**: areas, terrain, sky, fog, clouds, bloom, colour grading, dynamic sun shadows (Low to High detail) and the original shaders all work. Characters have hair. Known off: some NPC hair tint and some hand rendering (the rendering stream is on it).
-- ⬜ **Audio**: not started. No audio output at all; movies play silent. A separate stream is starting on it.
-- 🟡 **Controller**: Xbox 360-style layout; menus use focus navigation. The PC right-click radial menu doesn't exist as a movie in the game data, so LT opens a quickbar picker instead.
+- 🟡 **Character creation**: full flow with the original's stage, blended camera presets and portrait. The appearance menu has preset, hair, beard, the exe's per-race eye and nose shapes, and makeup and complexion. Also colour sliders, difficulty and name. Partial: remaining face-shape sliders and hair-colour details. QA also flagged dim skill/talent icons after spending points, and attribute arrows that never show a disabled state.
+- 🟡 **Conversations and cutscenes**:
+  - Working: the reply list, subtitles and voice-over; movie tracks; cutscene camera tracks (spline moves, rotation, FOV, active camera).
+  - Cutscenes named by conversation lines play, such as the Human Noble, Dalish and Dwarf Noble intros. Unstaged lines use the original's default speaker framing.
+  - Not yet: cameras placed by JumpToCamera or LinkToActor (most per-line cinematics), and moving, posing and animating actors in cutscenes and on conversation stage marks. That work is in progress.
+- 🟡 **Exploration and camera**: walking, click-to-pick, doors, area map, companions following. The follow camera collides with level geometry and placeables using rays. The original sweeps a 0.25 m sphere and starts closer to the hero; matching it is in progress (QA: the camera clips a bunk bed in the City Elf start and sits behind the door frame in the Dwarf Commoner start).
+- 🟡 **Combat and simulation**:
+  - NWScript VM with a large share of the engine functions; melee and ability timing; threat; AI-driven party; tactics; loot and containers.
+  - Perception and combat mode work as the exe does them: only hostiles need sight, and scripts own the game mode.
+  - Template gear is equipped with EVENT_TYPE_EQUIP. Triggers fire along moves. Destroyed items leave the inventory.
+  - Weapons are sheathed on the back out of combat and drawn in combat; draw and sheathe animation timing is not traced.
+  - Not every script engine function is implemented.
+- 🟡 **Party, inventory, journal and other UI screens**:
+  - Wired to the simulation: inventory (with paperdoll and item examine), character record, level-up, store, tactics, journal and codex, options, area map, HUD notifications, and the HUD's screen tab bar.
+  - The journal opens on the active quest. The quickbar keeps its 14-slot width and leaves hidden class abilities off.
+  - QA run 8 also flagged that recipes are listed as inventory items and stackable items are not stacked.
+  - Screens have not all been audited against the original.
+- 🟡 **Rendering**:
+  - Working: areas, terrain, sky, fog, clouds, bloom, colour grading, dynamic sun shadows (Low to High detail) and the original shaders.
+  - Characters have hair, sampled with its mips and noise (no more "steel wool"). Bare hands and arms take the head's skin tint.
+  - Not yet: SpeedTree `.spt` files parse but are not drawn.
+  - The backend stays on wgpu, and its types are kept inside `thedas-render`.
+- 🟡 **Audio**:
+  - Merged: FMOD event (`.fev`) and bank (`.fsb`) playback, mixer, menu music, UI sounds, conversation and cutscene voice-over, area music, placed 3D sounds, boot movie sound, script PlaySound, animation sound events, and weapon hits.
+  - Not yet: sound sets, PlayMusic and SetMusicIntensity, voice-over positioning, and footstep surfaces.
+  - Sound is off with `--control` (unless `--audio`) and in headless captures.
+- 🟡 **Controller**: Xbox 360-style layout; menus and in-game screens use focus navigation. The PC right-click radial menu doesn't exist as a movie in the game data, so LT opens a quickbar picker instead.
 - ✅ **Saves**: F5/F9 quick save and load, save/load screens, typed names.
 - ✅ **Performance**: frustum culling, shadow caching and skinned-draw culling (Lothering about 8 ms, the chapel about 1.5 ms offscreen).
 - ⬜ **DA2**: not started. There is no Dragon Age II work in the git log.
+
+### Origin openings
+
+- 🟡 **Human Noble**: intro movie and cutscene with narration play. The opening plays through the siege to Ostagar and on to Lothering in the regression sweep.
+- 🟡 **Dwarf Noble**: intro cutscene plays and the opening is explorable. Cutscene actors are not animated yet.
+- 🟡 **Dwarf Commoner**: intro cutscene cameras play. The exploration camera starts behind the door frame (in progress).
+- 🟡 **City Elf**: explorable. The camera clips the bunk bed at the start (in progress).
+- 🟡 **Dalish Elf**: intro cutscene plays. After the opening talk the three humans stand with their backs to the hero, because stage marks aren't applied (queued).
+- 🟡 **Mage**: explorable. QA run 8 found the journal showing only a category banner.
+
+### Planned modernization
+
+- ⬜ **Background area preloading**, so area transitions don't stop play.
+- Deliberate differences from the original:
+  - controller support (the PC release has none);
+  - spaces allowed in typed save names.
 
 ### Milestones
 
