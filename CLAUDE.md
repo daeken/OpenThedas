@@ -12,5 +12,9 @@
 - Before pushing: `cargo fmt --all`, `cargo clippy --all-targets`, `cargo test`. When a change
   touches parsing, also run `thedas corpus <install>` against a real install and report the result
   and the host it ran on.
+- Before merging: merge the latest `main` into the branch and run `cargo fmt --all`,
+  `cargo clippy --all-targets` and `cargo test` on that exact result. Several streams merge in
+  parallel, and two PRs that each pass alone can break `main` together. If `main` moved while
+  the checks ran, do it again.
 - Mark anything taken from xoreos or guesswork, rather than verified against the original
   executable, as provisional in its doc comment.
