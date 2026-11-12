@@ -79,6 +79,8 @@ pub struct Mixer {
     next_id: u64,
     bus_gain: [f32; 5],
     pub master_gain: f32,
+    /// The output limiter's gain now (see [`Mixer::render`]).
+    limiter: f32,
 }
 
 impl Mixer {
@@ -90,6 +92,7 @@ impl Mixer {
             next_id: 1,
             bus_gain: [1.0; 5],
             master_gain: 1.0,
+            limiter: 1.0,
         }
     }
 
@@ -183,6 +186,30 @@ impl Mixer {
 
     /// Mix the next `out.len() / 2` stereo frames into `out` (overwriting it).
     pub fn render(&mut self, out: &mut [f32]) {
+        self.mix(out);
+        self.limit(out);
+    }
+
+    /// Keeps the mix under full scale: where it would pass the ceiling (-0.3 dBFS) the gain
+    /// drops at once to fit, then recovers over about 0.2 s. Below the ceiling the mix is
+    /// untouched. Provisional: whether DAOrigins.exe puts a limiter or compressor on FMOD's
+    /// master is not traced; FMOD Ex's software mixer itself only clips, which is worse than
+    /// this (many blows, a bark and the music sum past 1.0 in a fight).
+    fn limit(&mut self, out: &mut [f32]) {
+        const CEILING: f32 = 0.966;
+        let release = 1.0 / (0.2 * self.rate as f32);
+        for f in out.chunks_exact_mut(2) {
+            let peak = f[0].abs().max(f[1].abs());
+            self.limiter = (self.limiter + release).min(1.0);
+            if peak * self.limiter > CEILING {
+                self.limiter = CEILING / peak;
+            }
+            f[0] *= self.limiter;
+            f[1] *= self.limiter;
+        }
+    }
+
+    fn mix(&mut self, out: &mut [f32]) {
         out.iter_mut().for_each(|s| *s = 0.0);
         let rate = self.rate as f64;
         let master = self.master_gain;
@@ -308,9 +335,26 @@ mod tests {
         let ramp: Vec<f32> = (0..10).map(|i| i as f32).collect();
         let id = m.play_from(pcm(10, 1, ramp), VoiceParams::default(), 7);
         let mut out = vec![0.0; 2 * 4];
-        m.render(&mut out);
+        m.mix(&mut out);
         assert_eq!(out, vec![7.0, 7.0, 8.0, 8.0, 9.0, 9.0, 0.0, 0.0]);
         assert!(!m.is_playing(id));
+    }
+
+    #[test]
+    fn the_limiter_keeps_loud_mixes_under_full_scale() {
+        let mut m = Mixer::new(1000);
+        for _ in 0..4 {
+            m.play(pcm(1000, 1, vec![0.6; 400]), VoiceParams::default());
+        }
+        let mut out = vec![0.0; 2 * 300];
+        m.render(&mut out);
+        assert!(out.iter().all(|s| s.abs() <= 0.97), "{:?}", &out[..4]);
+        assert!(out[0] > 0.9);
+        // Quiet again: the gain recovers.
+        let mut m = Mixer::new(1000);
+        m.play(pcm(1000, 1, vec![0.5; 100]), VoiceParams::default());
+        m.render(&mut out[..20]);
+        assert_eq!(out[0], 0.5);
     }
 
     #[test]
@@ -324,7 +368,7 @@ mod tests {
             },
         );
         let mut out = vec![0.0; 2 * 6];
-        m.render(&mut out);
+        m.mix(&mut out);
         assert_eq!(
             out,
             vec![
@@ -332,7 +376,7 @@ mod tests {
             ]
         );
         m.fade(id, 0.0, 0.5, true);
-        m.render(&mut out);
+        m.mix(&mut out);
         assert!(!m.is_playing(id));
         assert!(out[8].abs() < out[0].abs());
     }

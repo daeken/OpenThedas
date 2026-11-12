@@ -2099,6 +2099,10 @@ fn audio_state(
     };
     if let Some(ui) = ui {
         state.gui_sounds = ui.stage.bridge.drain_sounds();
+        // Character creation's voice previews: always said, by nobody in particular.
+        for (set, entry) in ui.drain_sound_set_previews() {
+            state.sound_sets.push((set, entry, 1.0, None));
+        }
         state.volumes = audio::volumes(|n| ui.client_option(n));
     }
     let Some(live) = live else {
@@ -2154,12 +2158,54 @@ fn audio_state(
             }
         }
     }
+    // Sounds the simulation asked for (scripts, blows, character creation's voice preview).
+    {
+        let mut sim = live.sim();
+        for req in std::mem::take(&mut sim.world.sounds) {
+            match req {
+                thedas_sim::world::SoundRequest::Event { target, event } => {
+                    let at = sim.world.get(target).map(|o| o.position);
+                    state.script_sounds.push((event, at));
+                }
+                thedas_sim::world::SoundRequest::SoundSet {
+                    target,
+                    entry,
+                    probability,
+                } => {
+                    let o = sim.world.get(target);
+                    let set = o.and_then(|o| {
+                        o.text_fields
+                            .get(thedas_sim::sim::SOUND_SET)
+                            .cloned()
+                            .or_else(|| a.template_sound_set(&sim.vfs, &o.template))
+                    });
+                    if let Some(set) = set {
+                        let at = o.map(|o| o.position);
+                        state.sound_sets.push((set, entry, probability, at));
+                    }
+                }
+                thedas_sim::world::SoundRequest::Impact {
+                    target,
+                    result,
+                    weapon,
+                    armour,
+                    shield,
+                    ..
+                } => {
+                    if let Some(at) = sim.world.get(target).map(|o| o.position) {
+                        state.impacts.push((at, result, weapon, armour, shield));
+                    }
+                }
+                other => log::debug!("audio: not done yet: {other:?}"),
+            }
+        }
+    }
     if live.front_end {
         return state;
     }
     // The area: its music and placed sounds.
     {
-        let mut sim = live.sim();
+        let sim = live.sim();
         let area = sim
             .world
             .area
@@ -2176,29 +2222,6 @@ fn audio_state(
             }
             state.area = Some(resref);
             state.combat = sim.world.party_fighting;
-            // Sounds scripts asked for. Sound sets, PlayMusic and SetMusicIntensity are not
-            // done yet (logged).
-            for req in std::mem::take(&mut sim.world.sounds) {
-                match req {
-                    thedas_sim::world::SoundRequest::Event { target, event } => {
-                        let at = sim.world.get(target).map(|o| o.position);
-                        state.script_sounds.push((event, at));
-                    }
-                    thedas_sim::world::SoundRequest::Impact {
-                        target,
-                        result,
-                        weapon,
-                        armour,
-                        shield,
-                        ..
-                    } => {
-                        if let Some(at) = sim.world.get(target).map(|o| o.position) {
-                            state.impacts.push((at, result, weapon, armour, shield));
-                        }
-                    }
-                    other => log::debug!("audio: not done yet: {other:?}"),
-                }
-            }
             state.dead = sim.world.game_over;
             state.inactive_sounds = sim
                 .world
