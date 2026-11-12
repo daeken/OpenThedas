@@ -334,7 +334,7 @@ mod tests {
             animations: Vec::new(),
             places: Vec::new(),
             camera_jumps: Vec::new(),
-            placed_elsewhere: Vec::new(),
+            links: Vec::new(),
         }
     }
 
