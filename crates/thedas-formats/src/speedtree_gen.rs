@@ -15,7 +15,8 @@ const MULTIPLIER: i64 = 16_807;
 /// Schrage's decomposition of the modulus: `MODULUS = MULTIPLIER · Q + R`.
 const Q: i64 = 127_773;
 const R: i64 = 2_836;
-/// Scale from a seed to a float in (0, 1).
+/// Scale from a seed to a float in (0, 1), as the spec writes it (it rounds to 2⁻³¹).
+#[allow(clippy::excessive_precision)]
 const SCALE: f32 = 4.656_612_875e-10;
 /// Entries of the shuffle table.
 const SHUFFLE: usize = 128;
@@ -66,7 +67,7 @@ impl Random {
 
     /// The next value of the stream (what every uniform draw uses): picks a table entry with
     /// a raw step, returns it, and refills it with another raw step.
-    pub fn next(&mut self) -> f32 {
+    pub fn draw(&mut self) -> f32 {
         // A seed within 64 of the modulus rounds to 2³¹ as a float, giving exactly 1.0 and an
         // index of 128. The spec states 0 ≤ i < 128; clamp until the executable's behaviour
         // in that case is known (provisional).
@@ -76,9 +77,9 @@ impl Random {
         value
     }
 
-    /// A uniform draw in `[a, b]`: `a + (b − a) · next()`.
+    /// A uniform draw in `[a, b]`: `a + (b − a) · draw()`.
     pub fn uniform(&mut self, a: f32, b: f32) -> f32 {
-        a + (b - a) * self.next()
+        a + (b - a) * self.draw()
     }
 
     /// The generator's integer state, for tests and diagnostics.
@@ -389,7 +390,7 @@ mod tests {
     fn next_returns_the_picked_entry_and_refills_it() {
         let mut random = Random::new(1200);
         let before = random.clone();
-        let value = random.next();
+        let value = random.draw();
         // Replay by hand: one step picks the index, one step refills it.
         let mut replay = before.clone();
         let i = (replay.raw_step() * 128.0) as usize;
@@ -413,7 +414,7 @@ mod tests {
         }
         let mut a = Random::new(42);
         let mut b = Random::new(42);
-        assert_eq!(a.uniform(2.0, 4.0), 2.0 + 2.0 * b.next());
+        assert_eq!(a.uniform(2.0, 4.0), 2.0 + 2.0 * b.draw());
     }
 
     #[test]
@@ -424,7 +425,7 @@ mod tests {
         probe.seed = 411_174_057; // 16807 · 411174057 ≡ 2147483600 (mod 2³¹ − 1)
         assert_eq!(probe.raw_step(), 1.0);
         random.seed = 411_174_057;
-        random.next();
+        random.draw();
     }
 
     fn point(x: f32, y: f32, tangent: [f32; 2], tangent_length: f32) -> SplinePoint {
@@ -583,6 +584,6 @@ mod tests {
 
         // No draw without variance.
         curve.value(0.3);
-        assert_eq!(random.next(), shadow.next());
+        assert_eq!(random.draw(), shadow.draw());
     }
 }
