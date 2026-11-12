@@ -2162,11 +2162,20 @@ fn audio_state(
                     armour: base("INVENTORY_SLOT_CHEST"),
                     main: base("INVENTORY_SLOT_MAIN"),
                     off: base("INVENTORY_SLOT_OFFHAND"),
-                    combat: o.combat.in_combat,
                     footstep: Some(audio::footstep_column(appearances.as_ref().and_then(|t| {
                         t.cell_by_hash(audio::APR_FOOTSTEP, o.appearance as i64)
                     }))),
                     surface: grid.as_ref().map_or(0, |g| g.surface(o.position)),
+                    size: appearances
+                        .as_ref()
+                        .and_then(|t| t.cell_by_hash(audio::APR_SIZE, o.appearance as i64))
+                        .and_then(|c| match c {
+                            thedas_formats::gda::Cell::String(s) => {
+                                let s = s.trim_matches(|c| c == '\0' || c == ' ' || c == '\t');
+                                Some(thedas_formats::gda::column_hash(s))
+                            }
+                            _ => None,
+                        }),
                 },
             );
         }
