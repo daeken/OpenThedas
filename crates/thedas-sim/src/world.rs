@@ -143,6 +143,10 @@ pub struct Object {
     /// template's `Appearance Data`. Saved.
     #[serde(default)]
     pub head_morph: Option<String>,
+    /// Character creation's appearance sliders as the player left them (slider id, see
+    /// [`crate::appearance`], to value). Saved, as the face they make is the player's.
+    #[serde(default)]
+    pub face_choices: BTreeMap<u32, f32>,
     pub immortal: bool,
     pub plot: bool,
     pub team: i32,
@@ -220,6 +224,7 @@ impl Object {
             dead: false,
             died_at: None,
             head_morph: None,
+            face_choices: BTreeMap::new(),
             immortal: false,
             plot: false,
             team: -1,

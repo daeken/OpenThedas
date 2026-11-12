@@ -559,10 +559,9 @@ impl Sim {
             .then_some(name)
     }
 
-    /// The face character creation's face screen starts on for a creature: the first head
-    /// `chargenmorphcfg.xml` lists for its race and gender (`hm_cps_p01`, a `.mop` preset:
-    /// face shape, hair and colours), when that preset exists.
-    pub fn face_screen_default(&self, id: ObjectId) -> Option<String> {
+    /// A creature's race and gender as `chargenmorphcfg.xml` names its lists (`human_male`,
+    /// `elf_female`); `None` for a race the face screen does not offer.
+    pub fn face_race_gender(&self, id: ObjectId) -> Option<String> {
         let o = self.world.get(id)?;
         let t = self.world.tables().get(0, "apr_base")?;
         let race = match t.cell("ModelRace", o.appearance as i64)? {
@@ -582,13 +581,66 @@ impl Sim {
         } else {
             "male"
         };
-        let (xml, _) = self.vfs.read("chargenmorphcfg.xml").ok()?;
-        let heads =
-            thedas_formats::morph::face_screen_heads(&xml, &format!("{race}_{gender}")).ok()?;
-        heads
+        Some(format!("{race}_{gender}"))
+    }
+
+    /// One of the face screen's lists (`heads`, `hairs`, `hair_colors`, ...) for a
+    /// creature's race and gender (see [`thedas_formats::morph::face_config_list`]).
+    pub fn face_list(&self, id: ObjectId, list: &str) -> Vec<String> {
+        let Some(rg) = self.face_race_gender(id) else {
+            return Vec::new();
+        };
+        self.vfs
+            .read("chargenmorphcfg.xml")
+            .ok()
+            .and_then(|(xml, _)| thedas_formats::morph::face_config_list(&xml, list, &rg).ok())
+            .unwrap_or_default()
+    }
+
+    /// The face character creation's face screen starts on for a creature: the first head
+    /// `chargenmorphcfg.xml` lists for its race and gender (`hm_cps_p01`, a `.mop` preset:
+    /// face shape, hair and colours), when that preset exists.
+    pub fn face_screen_default(&self, id: ObjectId) -> Option<String> {
+        self.face_list(id, "heads")
             .into_iter()
             .next()
             .filter(|h| self.vfs.lookup(&format!("{h}.mop")).is_some())
+    }
+
+    /// Sets one of character creation's appearance sliders on a creature (see
+    /// [`crate::appearance`]). The preset puts that head on (`head_morph`) and drops the
+    /// choices made over the last one; a creature with no face yet starts on the face
+    /// screen's first.
+    pub fn set_face_choice(&mut self, id: ObjectId, slider: u32, value: f32) {
+        if !value.is_finite() {
+            return;
+        }
+        if self.world.get(id).is_some_and(|o| o.head_morph.is_none()) {
+            let first = self.face_screen_default(id);
+            if let Some(o) = self.world.get_mut(id) {
+                o.head_morph = first;
+            }
+        }
+        let head = (slider == crate::appearance::PRESET)
+            .then(|| self.face_list(id, "heads"))
+            .and_then(|heads| heads.get(value.max(0.0) as usize).cloned());
+        let Some(o) = self.world.get_mut(id) else {
+            return;
+        };
+        if let Some(h) = head {
+            o.head_morph = Some(h);
+            o.face_choices.clear();
+        }
+        o.face_choices.insert(slider, value);
+    }
+
+    /// The face a creature shows: its head morph with the choices made over it (see
+    /// [`crate::appearance::overlay`]), as one morph name for the renderer.
+    pub fn face_name(&self, id: ObjectId) -> Option<String> {
+        let o = self.world.get(id)?;
+        let base = o.head_morph.clone()?;
+        let overlay = crate::appearance::overlay(self, id);
+        Some(overlay.name(&base))
     }
 
     /// Keeps a face on a creature that leaves character creation without one: the face the

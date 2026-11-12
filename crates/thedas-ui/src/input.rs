@@ -116,6 +116,25 @@ pub fn apply(sim: &mut Sim, name: &str, args: &[String]) -> bool {
         sim.tick(0);
         return true;
     }
+    // An appearance slider moved (`GUICharGen.AppearanceSliders.N.Value`, value): the
+    // face of the creature being created.
+    if name == thedas_sim::appearance::MSG_SET_SLIDER {
+        let index = args.first().and_then(|k| {
+            k.strip_prefix("GUICharGen.AppearanceSliders.")?
+                .strip_suffix(".Value")?
+                .parse::<usize>()
+                .ok()
+        });
+        let value = args.get(1).and_then(|v| v.trim().parse::<f32>().ok());
+        let (Some(index), Some(value), Some(who)) = (index, value, sim.world.chargen) else {
+            return false;
+        };
+        let Some(slider) = crate::appearance::slider_at(sim, index) else {
+            return false;
+        };
+        sim.set_face_choice(who, slider, value);
+        return true;
+    }
     if sim.gui_message(name, args) {
         sim.tick(0);
         return true;

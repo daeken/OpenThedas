@@ -130,7 +130,8 @@ pub fn head_morph(sim: &Sim, o: &Object) -> Option<String> {
         sim.vfs.lookup(&format!("{m}.mor")).is_some()
             || sim.vfs.lookup(&format!("{m}.mop")).is_some()
     }) {
-        return Some(m.clone());
+        // With the choices character creation made over it (hair, beard).
+        return Some(sim.face_name(o.id).unwrap_or_else(|| m.clone()));
     }
     use thedas_formats::gff3::Value;
     let name = match appearance_data(sim, o, "HeadMorph")? {

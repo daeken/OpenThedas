@@ -117,6 +117,20 @@ impl Sim {
         }
         // The screen announces itself (its creature may not have reached it yet: it learns
         // it from `CharGenCreature.ID`), and its presentation messages change nothing here.
+        // The face screen opens on its first head for the creature's race and gender when it
+        // has no face yet, so the preview shows what its sliders say. Provisional: the
+        // exe's own choice of starting head is not traced.
+        if name == "GUICharGen.CharGenStartAppearanceScene" {
+            if let Some(c) = self.world.chargen {
+                if self.world.get(c).is_some_and(|o| o.head_morph.is_none()) {
+                    let first = self.face_screen_default(c);
+                    if let Some(o) = self.world.get_mut(c) {
+                        o.head_morph = first;
+                    }
+                }
+            }
+            return true;
+        }
         if name == MSG_START || PRESENTATION.contains(&name) {
             return true;
         }
@@ -150,6 +164,14 @@ impl Sim {
             }
             _ => return false,
         };
+        // A new race or gender takes the face made for the old one off (its presets and
+        // hairs are the old one's): the face screen starts over.
+        if matches!(name, MSG_GENDER | MSG_RACE) {
+            if let Some(o) = who.and_then(|w| self.world.get_mut(w)) {
+                o.head_morph = None;
+                o.face_choices.clear();
+            }
+        }
         match int(2) {
             Some(new) => self.chargen_event(choice, vec![new, int(3).unwrap_or(1)], Vec::new()),
             None => false,

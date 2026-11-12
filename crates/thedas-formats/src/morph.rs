@@ -423,6 +423,111 @@ pub fn face_screen_heads(xml: &[u8], race_gender: &str) -> TypedResult<Vec<Strin
         .collect())
 }
 
+/// One of `chargenmorphcfg.xml`'s lists (`hairs`, `hair_colors`, `tattoos`, ...), in order:
+/// for a list kept per race and gender (`heads`, `hairs`, `beards`) the `race_gender` one
+/// (`human_male`), else the list itself. Entries are resource names, lowercase, without
+/// `.mop`; an empty name (the "none" choice, as `beards` starts with) is kept as "".
+pub fn face_config_list(xml: &[u8], list: &str, race_gender: &str) -> TypedResult<Vec<String>> {
+    let text = std::str::from_utf8(xml)
+        .map_err(|e| TypedError::Invalid(format!("chargenmorphcfg: {e}")))?;
+    let text = text.trim_start_matches('\u{feff}');
+    let doc = roxmltree::Document::parse(text)
+        .map_err(|e| TypedError::Invalid(format!("chargenmorphcfg: {e}")))?;
+    let Some(node) = doc.root_element().children().find(|n| n.has_tag_name(list)) else {
+        return Ok(Vec::new());
+    };
+    let node = node
+        .children()
+        .find(|n| n.has_tag_name(race_gender))
+        .unwrap_or(node);
+    Ok(node
+        .children()
+        .filter(|n| n.has_tag_name("resource"))
+        .map(|n| {
+            let n = n
+                .attribute("name")
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            n.strip_suffix(".mop").map(str::to_string).unwrap_or(n)
+        })
+        .collect())
+}
+
+/// Choices made over a face (character creation's appearance sliders): model and tint
+/// slots replaced. Carried in a morph's name after its base (`hm_cps_p01|m2=hm_har_ha1a_0|
+/// t3=t3_har_bln`), so a creature's face stays one string from the game to the renderer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FaceOverlay {
+    /// (model [`slot`], model or `None` for none).
+    pub models: Vec<(usize, Option<String>)>,
+    /// (tint slot, tint or `None` for none).
+    pub tints: Vec<(usize, Option<String>)>,
+}
+
+/// Slots past this are ignored (a morph holds a dozen tints).
+const MAX_OVERLAY_SLOT: usize = 32;
+
+impl FaceOverlay {
+    pub fn is_empty(&self) -> bool {
+        self.models.is_empty() && self.tints.is_empty()
+    }
+
+    /// `base` with the overlay after it (just `base` when empty).
+    pub fn name(&self, base: &str) -> String {
+        let mut s = base.to_string();
+        for (k, list) in [('m', &self.models), ('t', &self.tints)] {
+            for (slot, v) in list {
+                s.push_str(&format!("|{k}{slot}={}", v.as_deref().unwrap_or("")));
+            }
+        }
+        s
+    }
+
+    /// Splits a morph name into its base and overlay; parts that do not read are skipped.
+    pub fn split(name: &str) -> (&str, FaceOverlay) {
+        let mut parts = name.split('|');
+        let base = parts.next().unwrap_or("");
+        let mut o = FaceOverlay::default();
+        for p in parts {
+            let Some((key, value)) = p.split_once('=') else {
+                continue;
+            };
+            let mut chars = key.chars();
+            let kind = chars.next();
+            let Ok(slot) = chars.as_str().parse::<usize>() else {
+                continue;
+            };
+            if slot >= MAX_OVERLAY_SLOT {
+                continue;
+            }
+            let v = Some(value.trim().to_ascii_lowercase()).filter(|v| !v.is_empty());
+            match kind {
+                Some('m') => o.models.push((slot, v)),
+                Some('t') => o.tints.push((slot, v)),
+                _ => {}
+            }
+        }
+        (base, o)
+    }
+}
+
+impl Morph {
+    /// `self` with an overlay's model and tint slots put in.
+    pub fn with_overlay(&self, o: &FaceOverlay) -> Morph {
+        let mut m = self.clone();
+        for (list, slots) in [(&mut m.models, &o.models), (&mut m.tints, &o.tints)] {
+            for (slot, v) in slots {
+                if list.len() <= *slot {
+                    list.resize(slot + 1, None);
+                }
+                list[*slot] = v.clone();
+            }
+        }
+        m
+    }
+}
+
 /// A list of strings; empty strings read as `None`.
 fn strings(d: &Doc, id: StructId, label: u32) -> TypedResult<Vec<Option<String>>> {
     match d.get(id, label) {
@@ -510,6 +615,67 @@ fn read_node(d: &Doc, n: StructId) -> TypedResult<MorphNode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_face_overlay_rides_in_the_morph_name() {
+        let o = FaceOverlay {
+            models: vec![(2, Some("hm_har_ha1a_0".into())), (3, None)],
+            tints: vec![(3, Some("t3_har_bln".into()))],
+        };
+        let name = o.name("hm_cps_p01");
+        assert_eq!(name, "hm_cps_p01|m2=hm_har_ha1a_0|m3=|t3=t3_har_bln");
+        let (base, back) = FaceOverlay::split(&name);
+        assert_eq!((base, &back), ("hm_cps_p01", &o));
+        assert_eq!(
+            FaceOverlay::split("hm_cps_p01"),
+            ("hm_cps_p01", FaceOverlay::default())
+        );
+        // Bad parts are skipped.
+        let (_, bad) = FaceOverlay::split("x|q1=a|m=b|m99=c|t1");
+        assert!(bad.is_empty());
+        let m = Morph {
+            models: vec![
+                Some("head".into()),
+                None,
+                Some("hair".into()),
+                Some("beard".into()),
+            ],
+            tints: vec![Some("skin".into())],
+            ..Default::default()
+        };
+        let m = m.with_overlay(&o);
+        assert_eq!(m.model(slot::HAIR), Some("hm_har_ha1a_0"));
+        assert_eq!(m.model(slot::BEARD), None);
+        assert_eq!(m.tints[3].as_deref(), Some("t3_har_bln"));
+        assert_eq!(m.tints[0].as_deref(), Some("skin"));
+    }
+
+    #[test]
+    fn the_face_config_lists_read_per_race_and_gender_or_whole() {
+        let xml = br#"<?xml version="1.0"?><morph_config>
+            <beards><human_male><resource name=""/><resource name="HM_BRD_B1A_0"/></human_male></beards>
+            <hair_colors><resource name ="t3_har_wht"/><resource name="t3_har_bln"/></hair_colors>
+            <heads><elf_female><resource name="EF_CPS_P01.mop"/></elf_female></heads>
+        </morph_config>"#;
+        assert_eq!(
+            face_config_list(xml, "beards", "human_male").unwrap(),
+            ["", "hm_brd_b1a_0"]
+        );
+        assert_eq!(
+            face_config_list(xml, "hair_colors", "human_male").unwrap(),
+            ["t3_har_wht", "t3_har_bln"]
+        );
+        assert_eq!(
+            face_config_list(xml, "heads", "elf_female").unwrap(),
+            ["ef_cps_p01"]
+        );
+        assert!(
+            face_config_list(xml, "tattoos", "elf_female")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(face_config_list(b"not xml", "heads", "x").is_err());
+    }
     use crate::gff4::Value;
     use crate::typed::testutil::{Builder, s, structs};
 
