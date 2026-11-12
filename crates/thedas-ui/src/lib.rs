@@ -506,7 +506,7 @@ pub struct UiMovie {
     observers: Vec<(String, String)>,
     /// The value last pushed to each observer.
     sent: std::collections::HashMap<String, UiValue>,
-    /// Observers registered since the last push, heard from at once and again on the next.
+    /// Observers registered since the last push, heard from on the next one.
     fresh: Vec<String>,
     /// The movie's scaling-grid sprites (see `gfx::Scale9`), by sprite id, and the scale each
     /// registered one was last laid out for.
@@ -1045,6 +1045,14 @@ impl UiMovie {
         let mut missing = Vec::new();
         let trace = std::env::var_os("THEDAS_TOKEN_LOG").is_some();
         for (id, token) in self.observers.clone() {
+            // Registered just now: heard from on the next push, once the clips placed with
+            // the registering one exist (inventory.gfx's equipment layout hid nothing when
+            // pushed at once). Pushing at once as well (#182) made conversation.gfx loop: its
+            // reply and subtitle callbacks place their clips anew, which register anew, so
+            // every push re-placed them and the replies never showed.
+            if self.fresh.contains(&id) {
+                continue;
+            }
             match value(&token) {
                 Some(v) => {
                     if self.sent.get(&id) != Some(&v) {
@@ -1055,13 +1063,7 @@ impl UiMovie {
                             &format!("{TM}.cm_mapCallbacks.{id}"),
                             std::slice::from_ref(&v),
                         );
-                        // Registered just now: heard from again on the next push too, once
-                        // the clips placed with the registering one exist (inventory.gfx's
-                        // equipment layout hid nothing when only pushed at once), but at
-                        // once as well, so a movie shows its values from its first frame.
-                        if !self.fresh.contains(&id) {
-                            self.sent.insert(id, v);
-                        }
+                        self.sent.insert(id, v);
                     }
                 }
                 None => missing.push(token),
