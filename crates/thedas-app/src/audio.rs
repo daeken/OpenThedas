@@ -1014,19 +1014,44 @@ fn is_humanoid(ani: &str) -> bool {
 }
 
 /// The options screen's volumes (`ClientOptions.AudioOptions.*`, 0..10, with their disable
-/// switches) as gains.
+/// switches) as gains, as DAOrigins.exe turns them into category volumes: a slider at `x`
+/// is `-3 * (10 - x)` dB (0x5b61b0: 10 and above full, below 0.01 or disabled -60 dB), then
+/// `10^(dB / 20)` with anything under 0.001 silent (0x5b6110). So 5 is -15 dB, not half.
 pub fn volumes(option: impl Fn(&str) -> Option<f64>) -> Volumes {
     let v = |vol: &str, off: &str| {
-        if option(off).unwrap_or(0.0) != 0.0 {
-            0.0
+        let x = option(vol).unwrap_or(10.0) as f32;
+        let db = if option(off).unwrap_or(0.0) != 0.0 {
+            -60.0
         } else {
-            (option(vol).unwrap_or(10.0) / 10.0).clamp(0.0, 1.0) as f32
-        }
+            slider_db(x)
+        };
+        db_gain(db)
     };
     Volumes {
         music: v("AudioOptions.MusicVolume", "AudioOptions.MusicDisabled"),
         sfx: v("AudioOptions.SoundFXVolume", "AudioOptions.SFXDisabled"),
         dialog: v("AudioOptions.DialogVolume", "AudioOptions.DialogDisabled"),
+    }
+}
+
+/// A volume slider's 0..10 as dB (DAOrigins.exe 0x5b61b0).
+fn slider_db(x: f32) -> f32 {
+    if x > 9.99 {
+        0.0
+    } else if x < 0.01 {
+        -60.0
+    } else {
+        -3.0 * (10.0 - x)
+    }
+}
+
+/// dB as a gain, silent at 0.001 (-60 dB) and below (DAOrigins.exe 0x5b6110).
+fn db_gain(db: f32) -> f32 {
+    let g = 10f32.powf(db / 20.0);
+    if db <= -60.0 || g <= 0.001 {
+        0.0
+    } else {
+        g.min(1.0)
     }
 }
 
@@ -1050,7 +1075,15 @@ mod tests {
             _ => None,
         };
         let v = volumes(opts);
-        assert_eq!((v.music, v.sfx, v.dialog), (0.5, 0.0, 1.0));
+        // 5 is -15 dB; disabled is silent; the default 10 is full.
+        assert!(
+            (v.music - 10f32.powf(-15.0 / 20.0)).abs() < 1e-6,
+            "{}",
+            v.music
+        );
+        assert_eq!((v.sfx, v.dialog), (0.0, 1.0));
+        assert_eq!(slider_db(0.0), -60.0);
+        assert_eq!(db_gain(-60.0), 0.0);
     }
 }
 

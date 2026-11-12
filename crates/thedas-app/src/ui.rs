@@ -335,8 +335,22 @@ impl UiLayer {
             .map(|a| a.trim().to_ascii_lowercase());
         let number = args.iter().find_map(|a| a.trim().parse::<i32>().ok());
         match (name, set) {
-            ("GUI.TestSoundSet", Some(set)) => {
-                previews.push((set, number.unwrap_or(0)));
+            ("GUI.TestSoundSet", set) => {
+                // The movie may send only the type; the set is then the one chosen (the
+                // creature being made has it from GUI.SetSoundSet).
+                let set = set.or_else(|| {
+                    let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+                    let c = sim.world.chargen?;
+                    sim.world
+                        .get(c)?
+                        .text_fields
+                        .get(thedas_sim::sim::SOUND_SET)
+                        .cloned()
+                });
+                match set {
+                    Some(set) => previews.push((set, number.unwrap_or(0))),
+                    None => log::debug!("ui: voice preview {args:?} without a chosen set"),
+                }
                 true
             }
             ("GUI.SetSoundSet", Some(set)) => {
