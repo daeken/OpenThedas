@@ -119,6 +119,40 @@ pub struct DrawItem {
     /// Whether its model says the mesh casts run-time shadows (6176), when it says (see
     /// [`crate::shadow`]).
     pub cast_shadow: Option<bool>,
+    /// For a SpeedTree part: the camera distances it is drawn at (see [`DrawLod`]).
+    pub lod: Option<DrawLod>,
+}
+
+/// The distances a SpeedTree instance's part is drawn at, by DAOrigins.exe's per-instance LOD
+/// (0x52e260, 0x536085): with `d²` the squared distance from the camera to `anchor` (the
+/// placement point, not the box centre), the geometry draws while `d² < far²` and the
+/// billboard from there out.
+///
+/// Provisional: the exe fades between them with alpha tests over `near²..far²` (the
+/// library's alphas); here they switch at `far`, and the detail option and zoom factor `G`
+/// are taken as 1.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrawLod {
+    pub anchor: Vec3,
+    pub far_sq: f32,
+    /// Drawn beyond `far` (the billboard) rather than inside it (the geometry).
+    pub beyond: bool,
+}
+
+impl DrawLod {
+    /// The exe's far distance for an instance whose bounding radius (half the diagonal of its
+    /// box, times its placement scale) is `radius`, of LOD distance class `class` (RML 3379):
+    /// `t = (clamp(r, 2, 30) − 2) / 28`, `far = (35 + 85·t) · M[class]`, `M = {1, 1.5, 2}`.
+    pub fn far(radius: f32, class: i32) -> f32 {
+        let t = (radius.clamp(2.0, 30.0) - 2.0) / 28.0;
+        let m = [1.0, 1.5, 2.0][class.clamp(0, 2) as usize];
+        (35.0 + 85.0 * t) * m
+    }
+
+    /// Whether the part draws with the camera at `eye`.
+    pub fn shown(&self, eye: Vec3) -> bool {
+        (eye.distance_squared(self.anchor) < self.far_sq) != self.beyond
+    }
 }
 
 /// A skinned draw's bones.
@@ -719,8 +753,9 @@ impl<'a> Loader<'a> {
         };
         let atlas = format!("{level}_diffuse.dds");
         let billboards = format!("{level}_diffuse_billboards.dds");
-        // Per tree: its meshes with their materials, and its bounds, once.
-        type Built = (Vec<(usize, usize)>, Vec3, f32);
+        // Per tree: its meshes with their materials (and whether each is the billboard,
+        // drawn beyond the far distance), and its bounds, once.
+        type Built = (Vec<(usize, usize, bool)>, Vec3, f32);
         let mut built_trees: HashMap<usize, Option<Built>> = HashMap::new();
         for &(tree, placement, scale) in spots {
             let built = built_trees.entry(tree).or_insert_with(|| {
@@ -737,6 +772,7 @@ impl<'a> Loader<'a> {
                     parts.push((
                         self.tree_mesh(&name, "branches", &mesh.branches.vertices, indices),
                         m,
+                        false,
                     ));
                 }
                 if let Some(m) = material(self, &atlas, "Punch") {
@@ -747,16 +783,26 @@ impl<'a> Loader<'a> {
                         parts.push((
                             self.tree_mesh(&name, "fronds", &mesh.fronds.vertices, indices),
                             m,
+                            false,
                         ));
                     }
                     if let Some(cards) = mesh.leaves.first()
                         && !cards.is_empty()
                     {
                         let (vertices, indices) = leaf_cards(cards);
-                        parts.push((self.tree_mesh(&name, "leaves", &vertices, indices), m));
+                        parts.push((
+                            self.tree_mesh(&name, "leaves", &vertices, indices),
+                            m,
+                            false,
+                        ));
                     }
                 }
-                if parts.is_empty()
+                // Bushes and grass get no billboard: the exe leaves models named `_bsh_` or
+                // `_gra_` out of every billboard batch (0x533f18).
+                let bush = ["bsh_", "gra_"]
+                    .iter()
+                    .any(|k| name.starts_with(k) || name.contains(&format!("_{k}")));
+                if !bush
                     && let Some(b) = mesh.billboard
                     && b.height > 0.0
                     && let Some(m) = material(self, &billboards, "Punch")
@@ -770,8 +816,8 @@ impl<'a> Loader<'a> {
                         fold(vs, f32::min, f32::MAX),
                         fold(vs, f32::max, f32::MIN),
                     ];
-                    let mesh = self.billboard_mesh(&name, 0.5 * b.width, b.height, uv);
-                    return Some((vec![(mesh, m)], Vec3::Z * b.height * 0.5, b.height * 0.5));
+                    let billboard = self.billboard_mesh(&name, 0.5 * b.width, b.height, uv);
+                    parts.push((billboard, m, true));
                 }
                 if parts.is_empty() {
                     return None;
@@ -784,7 +830,16 @@ impl<'a> Loader<'a> {
             };
             let transform = placement * Mat4::from_scale(Vec3::splat(scale));
             let centre = transform.transform_point3(centre);
-            for (mesh, material) in parts {
+            // Provisional: the LOD class (RML 3379) is taken as 0, as in every ost100d
+            // placement.
+            let far = DrawLod::far(radius * scale, 0);
+            let anchor = placement.transform_point3(Vec3::ZERO);
+            for (mesh, material, beyond) in parts {
+                let lod = Some(DrawLod {
+                    anchor,
+                    far_sq: far * far,
+                    beyond,
+                });
                 self.scene.draws.push(DrawItem {
                     mesh,
                     material,
@@ -797,6 +852,7 @@ impl<'a> Loader<'a> {
                     probe,
                     skin: None,
                     cast_shadow: Some(false),
+                    lod,
                 });
             }
         }
@@ -1475,6 +1531,7 @@ impl<'a> Loader<'a> {
                 probe,
                 skin,
                 cast_shadow: piece.mesh.cast_runtime_shadow,
+                lod: None,
             });
         }
         rigid
