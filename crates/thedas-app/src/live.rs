@@ -122,6 +122,9 @@ pub struct Live {
     models: ModelCache,
     /// Placeables' state changes, for their swings (a door opening).
     swings: thedas_ui::models::PlaceableSwings,
+    /// Objects drawn faded, by id: their opacity (0..1; missing is 1). The camera fades a
+    /// creature it is inside (DAOrigins.exe 0x6c4130 eases it to 0.05).
+    pub opacity: std::collections::HashMap<ObjectId, f32>,
     /// Textures, meshes, pipelines and shader translations of the current level, kept while
     /// its objects are rebuilt.
     cache: RenderCache,
@@ -255,6 +258,7 @@ impl Live {
             posed: Vec::new(),
             models: ModelCache::default(),
             swings: Default::default(),
+            opacity: Default::default(),
             cache: RenderCache::default(),
             owed_ms: 0.0,
             frame_effects: true,
@@ -682,6 +686,10 @@ impl Live {
             0.0,
         );
         objects.follow_poses();
+        for (i, m) in models.iter().enumerate() {
+            let o = self.opacity.get(&m.id).copied().unwrap_or(1.0);
+            objects.renderer.set_prop_opacity(ctx, &objects.scene, i, o);
+        }
         self.posed = models
             .iter()
             .zip(posed)
