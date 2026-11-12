@@ -14,6 +14,10 @@ use crate::UiValue;
 
 /// The creature's class (`properties.gda` row 27, `PROPERTY_SIMPLE_CURRENT_CLASS`).
 const PROPERTY_CLASS: i32 = 27;
+/// `properties.gda`'s Level.
+const PROPERTY_LEVEL: i32 = 15;
+/// "New Save" (talk table).
+const NEW_SAVE: u32 = 336_242;
 /// The mage class (`CLASS_WIZARD`, `cla_base.gda` row 2; the scripts' constant, not the
 /// engine's).
 const CLASS_WIZARD: i32 = 2;
@@ -1278,11 +1282,25 @@ fn saves(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
             UiValue::String(last.map(|s| s.area.clone()).unwrap_or_default()),
         );
         v.insert(format!("{k}.Screenshot"), UiValue::String(String::new()));
+        // The details pane's level and class icon: the hero's.
+        if let Some(h) = sim.world.hero {
+            v.insert(
+                format!("{k}.Level"),
+                num(sim.property_total(h, PROPERTY_LEVEL)),
+            );
+            v.insert(
+                format!("{k}.ClassID"),
+                num(sim.property_total(h, PROPERTY_CLASS)),
+            );
+        }
     }
     // Saving lists a new save first (slot -1: the movie names it after the area and saves it
     // to the open slot), then the saves it may overwrite.
+    // Its row reads "New Save" (talk-table 336242). Provisional: where the exe names it is
+    // not traced.
     let new_save = SaveListing {
         slot: -1,
+        name: sim.string(NEW_SAVE).unwrap_or_default(),
         area: sim.world.area.map(|a| name(sim, a)).unwrap_or_default(),
         time_played_s: sim.world.time_ms / 1000,
         ..Default::default()
@@ -1322,7 +1340,11 @@ fn saves(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
         );
         v.insert(format!("{k}.Story"), UiValue::String(String::new()));
         v.insert(format!("{k}.Screenshot"), UiValue::String(String::new()));
-        v.insert(format!("{k}.ClassID"), num(0));
+        let class = sim
+            .world
+            .hero
+            .map_or(0.0, |h| sim.property_total(h, PROPERTY_CLASS));
+        v.insert(format!("{k}.ClassID"), num(class));
     }
     v.insert("Party.CapturedOnDeath".into(), num(0));
     v.insert("GUIDeath.DeathHint".into(), UiValue::String(String::new()));
