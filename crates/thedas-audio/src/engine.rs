@@ -20,8 +20,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use thedas_formats::fev::{
-    Category, Event, EventBody, Fev, PARAM_DISTANCE, SoundDef, WaveformKind, envelope, mode,
-    play_mode,
+    Category, Event, EventBody, Fev, PARAM_DISTANCE, SoundDef, SoundDefTemplate, WaveformKind,
+    envelope, mode, play_mode,
 };
 
 use crate::decode::Pcm;
@@ -97,6 +97,8 @@ struct Slot {
     started: bool,
     /// The sample it last picked (bank, index).
     sample: Option<(String, usize)>,
+    /// Each voice's own gain factor (its sound definition's random volume).
+    gains: HashMap<VoiceId, f32>,
 }
 
 struct Instance {
@@ -180,6 +182,9 @@ struct Loaded {
     slot: usize,
     pcm: Option<Arc<Pcm>>,
     looping: bool,
+    /// This play's sound-definition rate and gain factors (see [`template_variation`]).
+    rate: f32,
+    gain: f32,
 }
 
 pub struct AudioEngine {
@@ -413,6 +418,7 @@ impl AudioEngine {
                     finished: false,
                     started: false,
                     sample: None,
+                    gains: HashMap::new(),
                 })
                 .collect(),
             fade: if fade_in > 0.0 { 0.0 } else { 1.0 },
@@ -618,6 +624,10 @@ impl AudioEngine {
 
     /// Start one waveform in a slot (decoded here or on a loader thread).
     fn spawn(&mut self, ii: usize, si: usize) {
+        let draws = (
+            (self.random() % 32768) as f32 / 32767.0,
+            (self.random() % 32768) as f32 / 32767.0,
+        );
         let inst = &self.instances[ii];
         let fev = inst.project.clone();
         let Some(ev) = inst.event() else {
@@ -635,6 +645,10 @@ impl AudioEngine {
         let loops = sound.loop_mode != 1;
         let single = def.waveforms.len() <= 1;
         let spawning = fev.template(def).is_some_and(|t| t.spawn_time_max_ms > 0);
+        let (rate, gain) = match fev.template(def) {
+            Some(t) => template_variation(t, draws),
+            None => (1.0, 1.0),
+        };
         let programmer = inst.options.programmer_sound.clone();
         let cursor = slot.cursor;
         let handle = inst.handle;
@@ -659,6 +673,8 @@ impl AudioEngine {
                 slot: si,
                 pcm,
                 looping,
+                rate,
+                gain,
             });
             self.receive();
         } else {
@@ -670,6 +686,8 @@ impl AudioEngine {
                     slot: si,
                     pcm,
                     looping,
+                    rate,
+                    gain,
                 });
             });
         }
@@ -697,13 +715,14 @@ impl AudioEngine {
                         looping: l.looping.then_some((0, frames)),
                         bus: inst.bus,
                         reverb_send: inst.reverb_send,
-                        pitch: inst.rate,
+                        pitch: inst.rate * l.rate,
                         ..Default::default()
                     },
                 )
             });
             if let Ok(id) = id {
                 slot.voices.push(id);
+                slot.gains.insert(id, l.gain);
             }
         }
     }
@@ -946,7 +965,8 @@ impl AudioEngine {
                     * gain3d
                     * inst.fade;
                 for v in &s.voices {
-                    mixer.fade(*v, g, ramp, false);
+                    let own = s.gains.get(v).copied().unwrap_or(1.0);
+                    mixer.fade(*v, g * own, ramp, false);
                     mixer.set_pan(*v, pan);
                 }
             }
@@ -968,6 +988,30 @@ impl AudioEngine {
             !(silent || done)
         });
     }
+}
+
+/// A sound definition's playback-rate and gain factors for one play of it, from two uniform
+/// draws in 0..=1 (`fmod_event.dll` 0x1002eb00 and 0x1002e9f0, run as a sound starts):
+/// - pitch: `2^(4 * pitch + (2 * u1 - 1) * 4 * r)` for the template's raw pitch (+0x20) and
+///   pitch randomization `r` (+0x2c, our `f2c`), when its pitch method bit is set;
+/// - volume: `m + u2 * (1 - m)` for its minimum gain `m` (+0x1c, our `f1c`), when its volume
+///   method bit is set.
+///
+/// Provisional: DA:O's templates all use those methods (`pitch_randomization_method` and
+/// `volume_randomization_method` 1); the other method (a range, `f14`..`f18` and
+/// `f24`..`f28`, in 1/10000 steps) is not modelled. The template's fixed volume is applied
+/// with the event's.
+fn template_variation(t: &SoundDefTemplate, (u1, u2): (f32, f32)) -> (f32, f32) {
+    let mut octaves = 4.0 * t.pitch;
+    if t.pitch_randomization_method == 1 && t.f2c != 0.0 {
+        octaves += (2.0 * u1 - 1.0) * 4.0 * t.f2c;
+    }
+    let gain = if t.volume_randomization_method == 1 && t.f1c != 1.0 {
+        t.f1c + u2 * (1.0 - t.f1c)
+    } else {
+        1.0
+    };
+    (2f32.powf(octaves), gain)
 }
 
 /// An event's playback-rate factor and gain factor for one play (its raw pitch `pitch`, pitch
@@ -1284,5 +1328,43 @@ mod tests {
         assert!(close(event_variation(0.0, 0.0, 0.5, 0, (0.0, 0.0)).1, 0.5));
         assert!(close(event_variation(0.0, 0.0, 0.5, 0, (0.0, 1.0)).1, 1.0));
         assert!(close(event_variation(0.0, 0.0, 0.0, 0, (0.0, 0.3)).1, 1.0));
+    }
+
+    #[test]
+    fn sound_definitions_vary_pitch_and_volume_per_play() {
+        let t = SoundDefTemplate {
+            play_mode: 0,
+            spawn_time_min_ms: 0,
+            spawn_time_max_ms: 0,
+            max_spawned: 0,
+            volume: 1.0,
+            volume_randomization_method: 1,
+            f14: 1.0,
+            f18: 1.0,
+            f1c: 0.5,
+            pitch: -0.125,
+            pitch_randomization_method: 1,
+            f24: 0.0,
+            f28: 0.0,
+            f2c: 0.0625,
+            position_randomization: 0.0,
+        };
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        // Raw pitch -0.125 is half an octave down; randomization 0.0625 is +-0.25 octave.
+        let (mid, _) = template_variation(&t, (0.5, 0.0));
+        assert!(close(mid, 2f32.powf(-0.5)));
+        let (lo, quiet) = template_variation(&t, (0.0, 0.0));
+        let (hi, loud) = template_variation(&t, (1.0, 1.0));
+        assert!(close(lo, 2f32.powf(-0.75)) && close(hi, 2f32.powf(-0.25)));
+        // Minimum gain 0.5: from 0.5 to 1.
+        assert!(close(quiet, 0.5) && close(loud, 1.0));
+        // No randomization: fixed.
+        let still = SoundDefTemplate {
+            f1c: 1.0,
+            f2c: 0.0,
+            pitch: 0.0,
+            ..t
+        };
+        assert_eq!(template_variation(&still, (0.9, 0.1)), (1.0, 1.0));
     }
 }

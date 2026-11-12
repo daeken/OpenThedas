@@ -245,6 +245,36 @@ pub fn fev(path: &Path, filter: Option<&str>, check: bool) -> Result<()> {
         fev.name,
         fev.wave_banks.iter().map(|b| &b.name).collect::<Vec<_>>()
     );
+    fn categories(c: &thedas_formats::fev::Category, depth: usize) {
+        println!(
+            "category {}{} vol {:.3} pitch {:.3} unknown {:?}",
+            "  ".repeat(depth),
+            c.name,
+            c.volume,
+            c.pitch,
+            c.unknown
+        );
+        for k in &c.children {
+            categories(k, depth + 1);
+        }
+    }
+    categories(&fev.category, 0);
+    for (i, t) in fev.templates.iter().enumerate() {
+        println!(
+            "template {i}: vol {} vmeth {} f14 {} f18 {} f1c {} pitch {} pmeth {} f24 {} f28 {} f2c {} posrand {}",
+            t.volume,
+            t.volume_randomization_method,
+            t.f14,
+            t.f18,
+            t.f1c,
+            t.pitch,
+            t.pitch_randomization_method,
+            t.f24,
+            t.f28,
+            t.f2c,
+            t.position_randomization
+        );
+    }
     for r in &fev.reverbs {
         let words: Vec<String> = r
             .raw
