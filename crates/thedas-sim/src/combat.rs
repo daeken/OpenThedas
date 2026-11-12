@@ -245,8 +245,14 @@ impl Sim {
         // pathing grid's walls stand in.
         let grid = self.nav_grid(area);
         let solid = self.collision(area).filter(|c| !c.is_empty());
+        let props = solid
+            .as_ref()
+            .and_then(|_| self.placeable_collision(area))
+            .filter(|c| !c.is_empty());
         let wall = |a: [f32; 3], b: [f32; 3]| match &solid {
-            Some(c) => c.sight_blocked(a, b),
+            Some(c) => {
+                c.sight_blocked(a, b) || props.as_ref().is_some_and(|p| p.sight_blocked(a, b))
+            }
             None => grid
                 .as_ref()
                 .is_some_and(|g| crate::nav::wall_between(g, a, b)),

@@ -117,6 +117,8 @@ pub struct Sim {
     /// Each layout's collision for sight lines (see `crate::collision`), loaded when first
     /// needed; `None` when the layout's files cannot be found.
     pub(crate) collisions: HashMap<String, Option<Arc<crate::collision::Collision>>>,
+    /// Each area's placeables' collision and the key of the placeables it was built from.
+    pub(crate) placeable_collisions: HashMap<ObjectId, (u64, Arc<crate::collision::Collision>)>,
     /// The effect an `APPLY_EFFECT` handler is looking at, and whether it is still valid.
     pub(crate) current_effect: Option<(crate::world::Effect, bool)>,
     /// Who the effect in `current_effect` is being applied to.
@@ -352,6 +354,7 @@ impl Sim {
             area_layouts: HashMap::new(),
             nav_grids: HashMap::new(),
             collisions: HashMap::new(),
+            placeable_collisions: HashMap::new(),
             fire_lengths: HashMap::new(),
             attack_lengths: HashMap::new(),
             ability_anims: HashMap::new(),
