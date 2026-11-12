@@ -115,6 +115,8 @@ pub(crate) struct D3dPass {
     scene_probes: Vec<thedas_formats::probe::IrradianceProbe>,
     /// Each scene draw's ambient light node term (see [`ambient_of`]).
     ambients: Vec<Vec3>,
+    /// Each scene draw's SpeedTree placement constants, for the `spt_*` shaders.
+    trees: Vec<Option<crate::d3d::TreeConstants>>,
     /// The level's sun (direction, colour), if it has one.
     sun: Option<(Vec3, Vec3)>,
     fog: [[f32; 4]; 2],
@@ -1705,6 +1707,9 @@ impl D3dPass {
             probes: scene.draws.iter().map(|d| d.probe).collect(),
             bones: vec![Vec::new(); scene.draws.len()],
             scene_probes: scene.probes.iter().map(|p| p.probe.clone()).collect(),
+            trees: (0..scene.draws.len())
+                .map(|i| scene.tree_constants.get(&i).copied())
+                .collect(),
             ambients: scene
                 .draws
                 .iter()
@@ -1818,6 +1823,7 @@ impl D3dPass {
                 time,
                 shadow: crate::d3d::NO_SHADOW_DATA,
                 partition: None,
+                tree: None,
             };
             let mut data = vec![0u8; slot_size];
             for (table, base) in [(program.vs.ctab.as_ref(), 0), (program.ps.ctab.as_ref(), 3)] {
@@ -2135,18 +2141,29 @@ impl D3dPass {
                 time,
                 shadow,
                 partition: None,
+                tree: self.trees.get(d.draw).and_then(|t| t.as_ref()),
             };
             // The constants that stay as the draw was made are filled once (see
             // [`ConstantContext::per_frame`]); each frame refills the rest over them.
             let tables = [program.vs.ctab.as_ref(), program.ps.ctab.as_ref()];
             let fresh = statics[i].is_none();
+            let interfaces = [&program.vs.interface, &program.ps.interface];
             let mut fixed = statics[i].take().unwrap_or_else(|| {
+                let mut stage = 0;
                 Box::new(tables.map(|t| {
                     let per_frame: Vec<bool> = t
                         .map(|t| t.constants.iter().map(|c| cc.per_frame(c)).collect())
                         .unwrap_or_default();
                     let mut st = crate::d3d::StageConstants::default();
                     cc.fill_into(t, &mut st, |k| per_frame.get(k) != Some(&true));
+                    // A `def` constant holds its register, so a relatively addressed read
+                    // (`c60[a0.x]`, the leaf-card corners) finds it there as in D3D9.
+                    for &(r, v) in &interfaces[stage].float_defs {
+                        if let Some(slot) = st.floats.get_mut(r as usize) {
+                            *slot = v;
+                        }
+                    }
+                    stage += 1;
                     (st, per_frame)
                 }))
             });
@@ -2369,6 +2386,7 @@ impl D3dPass {
                     time: 0.0,
                     shadow: crate::d3d::NO_SHADOW_DATA,
                     partition: Some(partitions[k].view_proj),
+                    tree: None,
                 };
                 for (table, base) in [(program.vs.ctab.as_ref(), 0), (program.ps.ctab.as_ref(), 3)]
                 {
