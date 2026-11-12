@@ -2335,16 +2335,14 @@ impl Sim {
         }
         self.world.module = Some(module);
         self.load_world_maps();
-        // The hero, with a default identity until character creation is simulated.
+        // The hero. DAOrigins.exe builds the new game's player creature from the
+        // `default_player` template (the string 0xb0f21c pushed at 0x69d953, a 0xd20-byte
+        // creature made at 0x69d9b8-0x69d9e6): tag `player`, `player_core`, rank 100, a human
+        // male (appearance 15) in common clothes. Character creation's scripts change it from
+        // there. The template's `Gold` (75) is not read: the exe has no `Gold` label, only
+        // `StoreGold` (0xb244c4), so the hero starts with no money, as before.
         let party = self.world.spawn(ObjectKind::Party, "party");
-        let hero = self.world.spawn(ObjectKind::Creature, "player");
-        {
-            let h = self.world.get_mut(hero).expect("just spawned");
-            h.script = Some("player_core".into());
-            h.template = "player".into();
-            h.rank = constant(&self.table, "CREATURE_RANK_PLAYER");
-        }
-        self.created(hero);
+        let hero = self.new_game_hero();
         self.world.hero = Some(hero);
         self.world.party = Some(party);
         self.module_info = info;
@@ -2354,6 +2352,36 @@ impl Sim {
             self.world.queue_event(0, module, ev, None);
         }
         Ok(())
+    }
+
+    /// The template a new game's player creature is built from (0xb0f21c, 0x69d953).
+    pub const PLAYER_TEMPLATE: &'static str = "default_player";
+
+    /// The new game's player creature: built from [`Self::PLAYER_TEMPLATE`] as the executable
+    /// does. Without that template (a stripped install, synthetic tests) it is a bare creature
+    /// tagged `player` with `player_core` and the player rank (provisional fallback).
+    fn new_game_hero(&mut self) -> ObjectId {
+        if self
+            .read_gff3(&format!("{}.utc", Self::PLAYER_TEMPLATE))
+            .is_ok()
+        {
+            return self.create_from_template(
+                ObjectKind::Creature,
+                Self::PLAYER_TEMPLATE,
+                None,
+                [0.0; 3],
+                0.0,
+            );
+        }
+        let hero = self.world.spawn(ObjectKind::Creature, "player");
+        {
+            let h = self.world.get_mut(hero).expect("just spawned");
+            h.script = Some("player_core".into());
+            h.template = "player".into();
+            h.rank = constant(&self.table, "CREATURE_RANK_PLAYER");
+        }
+        self.created(hero);
+        hero
     }
 
     fn created(&mut self, id: ObjectId) {
