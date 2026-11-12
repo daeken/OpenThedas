@@ -1188,6 +1188,7 @@ fn texture_group(
     program: &D3dProgram,
     material: &SceneMaterial,
     lightmap: Option<&crate::scene::LightmapRef>,
+    probe: Option<&str>,
 ) -> wgpu::BindGroup {
     let device = &ctx.device;
     let mut views: Vec<(u32, wgpu::TextureView, String)> = Vec::new();
@@ -1197,7 +1198,7 @@ fn texture_group(
         } else {
             program.ps.ctab.as_ref()
         };
-        let (sampler_name, source) = sampler_texture(table, s, ty, material, lightmap);
+        let (sampler_name, source) = sampler_texture(table, s, ty, material, lightmap, probe);
         let view = match &source {
             TextureSource::Resource(name) => textures.view(ctx, vfs, name, ty),
             TextureSource::ResourceOr(name, default) => textures
@@ -1414,6 +1415,9 @@ impl D3dPass {
                 &program,
                 &scene.materials[d.material],
                 d.lightmap.as_ref(),
+                d.probe
+                    .and_then(|p| scene.probes.get(p))
+                    .map(|p| p.name.as_str()),
             );
             draws.push(D3dDraw {
                 pipeline: pi,
@@ -1626,6 +1630,7 @@ impl D3dPass {
                 &layouts[pi],
                 &program,
                 &scene.materials[e.material],
+                None,
                 None,
             );
             particles.push(ParticleDraw {
