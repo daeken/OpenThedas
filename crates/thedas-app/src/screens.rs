@@ -45,6 +45,11 @@ pub enum Screen {
     /// The game menu over a running game (mainmenu.gfx, Escape or Start): save, load,
     /// options, back to the start menu.
     GameMenu,
+    /// The loading screens (see [`crate::ui::LoadScreen`]): load_town.gfx (art and a hint),
+    /// load_light.gfx (plain) and load_fade.gfx (a fade to black).
+    LoadTown,
+    LoadLight,
+    LoadFade,
 }
 
 impl Screen {
@@ -92,6 +97,9 @@ impl Screen {
             // Its confirmations (quitting) are dialog boxes on the popup layer.
             Screen::StartMenu => &["startmenu2.gfx", "popuplayer.gfx"],
             Screen::GameMenu => &["mainmenu.gfx", "popuplayer.gfx"],
+            Screen::LoadTown => &["load_town.gfx"],
+            Screen::LoadLight => &["load_light.gfx"],
+            Screen::LoadFade => &["load_fade.gfx"],
         }
     }
 

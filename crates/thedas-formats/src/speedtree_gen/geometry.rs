@@ -6,7 +6,7 @@
 
 use super::frame::{Vec3, add, cos, cross, lerp, lerp3, normalize, scale, sin, sub};
 use super::limits::{GenerateError, MAX_SURFACE_VERTICES};
-use super::skeleton::{BANK, Branch, Flare};
+use super::skeleton::{BANK, Branch, Flare, Wind};
 use super::{Curve, Random, Skeleton};
 use crate::speedtree::{BezierSpline, BranchLevel, SpeedTree, TEXTURE_LAYERS, TexLayer};
 
@@ -29,6 +29,8 @@ pub struct BranchVertex {
     pub texcoords: [[f32; 2]; TEXTURE_LAYERS],
     /// LOD fade hint (3.7 step 6); 0 until a LOD level sets it.
     pub fade: f32,
+    /// The skeleton vertex's wind values (7.7).
+    pub wind: Wind,
 }
 
 /// One branch's tube in the shared vertex list.
@@ -258,6 +260,7 @@ fn tube(
                 binormal,
                 texcoords,
                 fade: 0.0,
+                wind: v.wind,
             });
             f += step;
         }
