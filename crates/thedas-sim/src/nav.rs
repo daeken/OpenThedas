@@ -399,6 +399,35 @@ impl Sim {
         Some(name)
     }
 
+    /// An area's collision for sight lines: its layout's models' `.phy` shapes (see
+    /// [`crate::collision`]). `None` without an install to read the level from, or when
+    /// the layout is missing.
+    pub fn collision(
+        &mut self,
+        area: thedas_script::vm::ObjectId,
+    ) -> Option<Arc<crate::collision::Collision>> {
+        let name = self.area_layout(area)?;
+        if let Some(c) = self.collisions.get(&name) {
+            return c.clone();
+        }
+        let c = self.load_collision(&name).map(Arc::new);
+        self.collisions.insert(name, c.clone());
+        c
+    }
+
+    fn load_collision(&self, layout: &str) -> Option<crate::collision::Collision> {
+        let root = self.install_root.as_ref()?;
+        let install = thedas_vfs::DaoInstall::open(root).ok()?;
+        let mut level = thedas_vfs::Vfs::new();
+        install.mount_level(&mut level, layout).ok()?;
+        let (data, _) = level
+            .read(&format!("{layout}.arl"))
+            .or_else(|_| self.vfs.read(&format!("{layout}.arl")))
+            .ok()?;
+        let arl = thedas_formats::Arl::parse(&data).ok()?;
+        Some(crate::collision::load_layout(&level, &self.vfs, &arl))
+    }
+
     fn load_nav_grid(&self, layout: &str) -> Option<NavGrid> {
         let file = format!("{layout}.arl");
         let data = match self.vfs.read(&file) {

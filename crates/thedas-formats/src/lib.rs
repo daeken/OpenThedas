@@ -22,6 +22,7 @@
 //! - [`probe`]: irradiance probes (`.mtx`), the diffuse light characters and props receive.
 //! - [`stage`]: conversation stages (`.stg`) and the shot each conversation line takes.
 //! - [`anim`]: animation trees (`.anb`), animation lengths (`.gad`) and events (`.evt`).
+//! - [`phy`]: collision models (`.phy`): the shapes rays and perception test against.
 //! - [`speedtree`]: SpeedTree 4 tree descriptions (`.spt`) for level vegetation.
 //!
 //! Audio:
@@ -48,6 +49,7 @@ pub mod material;
 pub mod mesh;
 pub mod model;
 pub mod morph;
+pub mod phy;
 pub mod probe;
 pub mod speedtree;
 pub mod stage;
