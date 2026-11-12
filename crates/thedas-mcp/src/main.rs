@@ -379,6 +379,12 @@ struct ScriptArgs {
     /// Run it as the handler of this event type (EVENT_TYPE_* name without the prefix, e.g.
     /// "SPAWN", or a number).
     event: Option<String>,
+    /// The event's objects (ids or tags), e.g. the item of a GIFT_ITEM.
+    #[serde(default)]
+    objects: Vec<String>,
+    /// The event's integers.
+    #[serde(default)]
+    ints: Vec<i32>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1150,6 +1156,12 @@ impl Server {
                     ty,
                     creator: sim.world.hero,
                     target: Some(caller),
+                    objects: a
+                        .objects
+                        .iter()
+                        .map(|o| resolve(sim, o).unwrap_or(OBJECT_INVALID))
+                        .collect(),
+                    ints: a.ints.clone(),
                     ..Default::default()
                 }
             });
