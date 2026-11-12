@@ -37,6 +37,11 @@ pub const HAND_OFF_MS: u64 = 1_500;
 /// Corpses allowed to lie waiting at the highest graphics detail (0x7c4bd0: 5, 10, 15, 20).
 pub const CORPSE_CAP: usize = 20;
 
+/// The field a body bag gets when it takes its corpse's place: the creature's appearance
+/// (`apr_base.gda` row), whose `CorpseModel` the bag shows from then on. 0 or missing: the
+/// bag is still hidden.
+pub const CORPSE_APPEARANCE: &str = "CorpseAppearance";
+
 pub fn default_max_ms() -> u64 {
     DEFAULT_MAX_MS
 }
@@ -133,6 +138,24 @@ impl Sim {
             .map(|o| o.id)
     }
 
+    /// The body bag takes the corpse's place (DAOrigins.exe 0x7526f0): it stands where the
+    /// creature lies, facing as it did, and turns from hidden to the appearance's
+    /// `CorpseModel` (apr_base.gda). [`CORPSE_APPEARANCE`] on the bag keeps the appearance
+    /// for the presentation, as the creature is gone 1.5 s later.
+    fn hand_off_to_bag(&mut self, id: ObjectId) {
+        let Some((bag, pos, facing, app)) = self.world.get(id).and_then(|o| {
+            let bag = *o.fields.get(crate::inventory::BODY_BAG_FIELD)? as ObjectId;
+            Some((bag, o.position, o.facing, o.appearance))
+        }) else {
+            return;
+        };
+        if let Some(b) = self.world.get_mut(bag) {
+            b.position = pos;
+            b.facing = facing;
+            b.fields.insert(CORPSE_APPEARANCE.into(), app.max(0));
+        }
+    }
+
     /// Runs the corpses' decay clocks `ms` on (DAOrigins.exe 0x6bc670, per creature update).
     pub(crate) fn decay_corpses(&mut self, ms: u64) {
         let max = self.world.corpse_decay_max_ms;
@@ -211,6 +234,7 @@ impl Sim {
             } else if has_bag && after >= hand_off {
                 // The bag takes the corpse's place; the creature goes 1.5 s on.
                 self.world.queue_destroy(HAND_OFF_MS, id);
+                self.hand_off_to_bag(id);
             }
         }
     }
@@ -294,10 +318,20 @@ mod tests {
         let c = corpse(&mut s);
         s.world.get_mut(c).unwrap().money = 5;
         let bag = s.spawn_body_bag(c, false).unwrap();
+        s.world.get_mut(c).unwrap().appearance = 7;
+        s.world.get_mut(c).unwrap().position = [3.0, 4.0, 0.0];
         s.set_bodybag_decay_delay(bag, 3_000);
         // Fade in 3 s, then the 0.5 s to the hand-off and 1.5 s to the destruction.
         s.tick(3_400);
         assert!(s.world.get(c).is_some());
+        assert_eq!(
+            s.world.get(bag).unwrap().fields.get(CORPSE_APPEARANCE),
+            None
+        );
+        s.tick(200);
+        let b = s.world.get(bag).unwrap();
+        assert_eq!(b.fields.get(CORPSE_APPEARANCE), Some(&7));
+        assert_eq!(b.position, [3.0, 4.0, 0.0]);
         s.tick(1_700);
         assert!(s.world.get(c).is_none());
     }
