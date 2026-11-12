@@ -111,7 +111,8 @@ struct Activity {
     fight_ms: u64,
     party: Side,
     foes: Side,
-    /// Health taken, by side ("party" or "others": foes and allies alike), the source's tag
+    /// Health taken, by side ("party", "hostiles" or "allies": anyone else, such as militia
+    /// or a follower not yet in the party), the source's tag
     /// and the ability (0 for weapon attacks).
     sources: std::collections::BTreeMap<(&'static str, String, i32), f64>,
 }
@@ -806,10 +807,13 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
                 side.damage += a.damage as f64;
             }
             for ((src, ability), amount) in &sim.world.trace.damage {
+                // Hostile: in one of the party's fights, or hostile to the hero at the end.
                 let side = if party_ids.contains(src) || Some(*src) == sim.world.hero {
                     "party"
+                } else if foe_ids.contains(src) || sim.hostile(hero, *src) {
+                    "hostiles"
                 } else {
-                    "others"
+                    "allies"
                 };
                 let tag = sim
                     .world
@@ -943,10 +947,11 @@ pub fn run(o: &Options) -> Result<()> {
             }
         }
         println!("health taken per run, by source (ability 0: weapon attacks):");
-        for side in ["others", "party"] {
+        for side in ["hostiles", "allies", "party"] {
             let mut rows: Vec<_> = sources.iter().filter(|(k, _)| k.0 == side).collect();
             rows.sort_by(|a, b| b.1.total_cmp(a.1));
-            let total: f64 = rows.iter().map(|r| r.1).sum();
+            // (An empty sum is -0.0; adding 0.0 prints it as 0.)
+            let total: f64 = rows.iter().map(|r| r.1).sum::<f64>() + 0.0;
             println!("  by {side}: {:.0}", total / n);
             for ((_, tag, ability), v) in rows.iter().take(8) {
                 println!("    {tag:<28} ability {ability:<6} {:>6.0}", *v / n);
