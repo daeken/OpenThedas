@@ -884,6 +884,7 @@ impl Sim {
         self.world.time_ms = until;
         self.advance_movers();
         self.regenerate(elapsed);
+        self.decay_corpses(elapsed);
         self.update_threat(elapsed);
         self.expire_effects();
         self.update_aoes();

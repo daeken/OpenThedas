@@ -138,6 +138,14 @@ pub struct Object {
     /// presentation (the death animation plays from it) and saves.
     #[serde(default)]
     pub died_at: Option<u64>,
+    /// A corpse's decay clock: milliseconds it has lain dead where it could decay (see
+    /// [`crate::decay`]). Saved (DAOrigins.exe GFF field 0x4061).
+    #[serde(default)]
+    pub decay_ms: u64,
+    /// The corpse decays whatever its appearance says (`SetBodybagDecayDelay`; the exe's
+    /// creature +0xc8c).
+    #[serde(default)]
+    pub decay_forced: bool,
     /// A head morph kept on the creature itself (`.mor` resource, no extension), as
     /// character creation leaves the player's face; others take theirs from their
     /// template's `Appearance Data`. Saved.
@@ -223,6 +231,8 @@ impl Object {
             quick_placed: Default::default(),
             dead: false,
             died_at: None,
+            decay_ms: 0,
+            decay_forced: false,
             head_morph: None,
             face_choices: BTreeMap::new(),
             immortal: false,
@@ -585,6 +595,10 @@ pub struct World {
     /// Objects to remove at a time (projectiles when they land).
     #[serde(default)]
     pub destroy_at: Vec<(u64, ObjectId)>,
+    /// How long a corpse lies before it is gone (`SetCreaturesGlobalMaxTimeBeforeDecay`;
+    /// see [`crate::decay`]).
+    #[serde(default = "crate::decay::default_max_ms")]
+    pub corpse_decay_max_ms: u64,
     /// Events for objects in an unloaded area, waiting for the party to come back.
     #[serde(default)]
     pub held: Vec<QueuedEvent>,
@@ -751,6 +765,7 @@ impl World {
             autopilot: false,
             pool_xp: false,
             destroy_at: Vec::new(),
+            corpse_decay_max_ms: crate::decay::DEFAULT_MAX_MS,
             held: Vec::new(),
             dialog_shown: Default::default(),
             story_events: Vec::new(),
