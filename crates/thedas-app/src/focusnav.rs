@@ -36,6 +36,22 @@ pub fn last(targets: &[FocusTarget]) -> Option<usize> {
     })
 }
 
+/// The movie of the screens' tab bar (navbar.gfx), which LB and RB already work.
+pub const TAB_BAR: &str = "navbar.gfx";
+
+/// Where a screen's focus starts: its first button ([`first`]) outside the tab bar and other
+/// than its Close or Back (B's), or the first of all when it has nothing else.
+pub fn first_content(targets: &[FocusTarget]) -> Option<usize> {
+    let content: Vec<usize> = (0..targets.len())
+        .filter(|&i| targets[i].movie != TAB_BAR && !is_back(&targets[i]))
+        .collect();
+    let picked: Vec<FocusTarget> = content.iter().map(|&i| targets[i].clone()).collect();
+    match first(&picked) {
+        Some(j) => Some(content[j]),
+        None => first(targets),
+    }
+}
+
 /// How far `[a0, a1]` and `[b0, b1]` are apart (0 when they overlap).
 fn gap(a0: f64, a1: f64, b0: f64, b1: f64) -> f64 {
     (b0 - a1).max(a0 - b1).max(0.0)
@@ -183,6 +199,20 @@ mod tests {
         // From the row's end, right reaches the far one only when nothing is in line.
         assert_eq!(step(&g, 2, (1, 0)), 6);
         assert_eq!(first(&g), Some(0));
+    }
+
+    #[test]
+    fn a_screens_focus_starts_below_its_tab_bar() {
+        let mut tab = t("tab", 400.0, 0.0, 30.0, 30.0);
+        tab.movie = TAB_BAR.into();
+        let ts = vec![
+            tab.clone(),
+            t("_level0.CloseButton", 900.0, 60.0, 20.0, 20.0),
+            t("slot", 200.0, 200.0, 50.0, 50.0),
+        ];
+        assert_eq!(first(&ts), Some(0));
+        assert_eq!(first_content(&ts), Some(2));
+        assert_eq!(first_content(&[tab]), Some(0));
     }
 
     #[test]
