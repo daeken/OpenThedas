@@ -503,6 +503,17 @@ impl PadPlay {
                 );
                 return None;
             }
+            Action::CloseOwnScreen => {
+                let own = !host.popup()
+                    && host
+                        .screens()
+                        .is_some_and(|s| s.menu.is_some_and(|m| s.shown().contains(&m)));
+                if !own {
+                    return None;
+                }
+                let m = host.screens()?.menu.take()?;
+                format!("{m:?} closed")
+            }
             Action::CloseScreen => {
                 // An open picker's list first: B closes the list alone (a click on its
                 // overlay, outside the entries, as the mouse closes it), not the screen under

@@ -276,6 +276,10 @@ pub enum Action {
     TogglePointer,
     /// Close the screen (as its key again, or Escape).
     CloseScreen,
+    /// Start and Back on a screen: the player's own screen closes (the one Start or Back
+    /// opened); on any other (character creation, the start menu, a dialog box) nothing, so
+    /// it cannot be left by accident.
+    CloseOwnScreen,
     /// The previous or next of the player's screens.
     PrevPage,
     NextPage,
@@ -414,8 +418,8 @@ pub const BINDINGS: &[Binding] = &[
     bind(Screen, Y, Do::RightDown, "GUIRightCursorButton"),
     release(Screen, Y, Do::RightUp, "GUIRightCursorButton"),
     bind(Screen, B, Do::CloseScreen, "ToggleMainMenu"),
-    bind(Screen, Start, Do::CloseScreen, "ToggleMainMenu"),
-    bind(Screen, Back, Do::CloseScreen, "ToggleInventory"),
+    bind(Screen, Start, Do::CloseOwnScreen, "ToggleMainMenu"),
+    bind(Screen, Back, Do::CloseOwnScreen, "ToggleInventory"),
     bind(Screen, LB, Do::PrevPage, ""),
     bind(Screen, RB, Do::NextPage, ""),
     bind(Screen, LS, Do::TogglePointer, ""),
