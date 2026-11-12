@@ -1472,6 +1472,26 @@ fn invoke_body() -> Vec<u8> {
     function(&["p", "m", "a"], &body)
 }
 
+/// `if (!_global.ExternalCommands[f].thedas_w) { _global.ExternalCommands[f] =
+/// _global.thedas_wrap(_global.ExternalCommands[f]); _global.ExternalCommands[f].thedas_w =
+/// true; }`: wraps a [`RETURNING_FSCOMMANDS`] function once.
+fn wrap_returning(out: &mut Vec<u8>, f: &str) {
+    let mut then = Vec::new();
+    get_path(&mut then, &["_global", "ExternalCommands"]);
+    push(&mut then, &[Push::Str(f)]);
+    get_path(&mut then, &["_global", "ExternalCommands", f]);
+    push(&mut then, &[Push::Int(1)]);
+    get_path(&mut then, &["_global"]);
+    push(&mut then, &[Push::Str("thedas_wrap")]);
+    then.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
+    get_path(&mut then, &["_global", "ExternalCommands", f]);
+    push(&mut then, &[Push::Str("thedas_w"), Push::Bool(true)]);
+    then.push(SET_MEMBER);
+    get_path(out, &["_global", "ExternalCommands", f, "thedas_w"]);
+    branch(out, IF, then.len(), false);
+    out.extend(then);
+}
+
 /// The body of a `DoAction` tag registering [`INVOKE_CALLBACK`]
 /// (`flash.external.ExternalInterface.addCallback("thedas_invoke", null, function ...)`) and
 /// wrapping [`RETURNING_FSCOMMANDS`].
@@ -1500,14 +1520,7 @@ pub fn register_invoke() -> Vec<u8> {
         out.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
     }
     for f in RETURNING_FSCOMMANDS {
-        // _global.ExternalCommands[f] = _global.thedas_wrap(_global.ExternalCommands[f])
-        get_path(&mut out, &["_global", "ExternalCommands"]);
-        push(&mut out, &[Push::Str(f)]);
-        get_path(&mut out, &["_global", "ExternalCommands", f]);
-        push(&mut out, &[Push::Int(1)]);
-        get_path(&mut out, &["_global"]);
-        push(&mut out, &[Push::Str("thedas_wrap")]);
-        out.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
+        wrap_returning(&mut out, f);
     }
     get_path(&mut out, &["_global"]);
     push(&mut out, &[Push::Str("thedas_tip_wrap")]);
@@ -1524,6 +1537,12 @@ pub fn register_invoke() -> Vec<u8> {
     out.extend(prewrap_maker());
     out.push(SET_MEMBER);
     let mut install = Vec::new();
+    // A movie whose own classes load after this tag (saveload.gfx) defines
+    // `ExternalCommands` afresh, unwrapped: its answers then came back undefined (the save
+    // name prompt read "undefined"). The install wraps whatever is not wrapped yet.
+    for f in RETURNING_FSCOMMANDS {
+        wrap_returning(&mut install, f);
+    }
     for f in DA_RETURNING_FSCOMMANDS {
         // _global.DAExternalCommands[f] = _global.thedas_wrap(_global.DAExternalCommands[f])
         get_path(&mut install, &["_global", "DAExternalCommands"]);
