@@ -824,7 +824,10 @@ impl ConstantContext<'_> {
         }
         Some(match (usage, c.name.as_str()) {
             ("CameraPosition", _) | (_, "g_vCameraPosition") => {
-                Value::Vectors(vec![[self.camera.x, self.camera.y, self.camera.z, 1.0]])
+                // `w` is the camera's +0x138 (DAOrigins.exe): 0 for the exploration camera
+                // (area modes 4 and 5, and the default); Terrain1 blends its lightmap with the
+                // shadow term by 0.35·w + 0.15.
+                Value::Vectors(vec![[self.camera.x, self.camera.y, self.camera.z, 0.0]])
             }
             ("FocalPlane", _) => Value::Vectors(vec![[1.0, 0.0, 0.0, 0.0]]),
             ("LightsArray", _) | (_, "g_vLightParams") => Value::Vectors(self.light_params()),

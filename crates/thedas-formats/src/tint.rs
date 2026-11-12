@@ -49,7 +49,11 @@ impl Tint {
                 found: gff.file_type,
             });
         }
+        // A missing field reads as white, except the two opacity vectors (14008, 14009, the
+        // first two slots), which read as zero (DAOrigins.exe 0x55f340).
         let mut colours = [[1.0; 4]; COLOURS];
+        colours[0] = [0.0; 4];
+        colours[1] = [0.0; 4];
         for (slot, &label) in colours.iter_mut().zip(FIELD_ORDER.iter()) {
             if let Some(v) = d.opt_vec4(gff.root, label, 1.0)? {
                 *slot = v;
