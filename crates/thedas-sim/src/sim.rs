@@ -2490,7 +2490,7 @@ impl Sim {
     // -----------------------------------------------------------------------------------------
     // Loading
 
-    fn read_gff3(&self, name: &str) -> Result<Gff3, SimError> {
+    pub(crate) fn read_gff3(&self, name: &str) -> Result<Gff3, SimError> {
         let (data, _) = self
             .vfs
             .read(name)
@@ -2669,7 +2669,7 @@ impl Sim {
         }
         if let Some(t) = &tmpl {
             match kind {
-                ObjectKind::Creature => self.load_template_items(id, t),
+                ObjectKind::Creature | ObjectKind::Placeable => self.load_template_items(id, t),
                 ObjectKind::Store => self.load_store_items(id, t),
                 _ => {}
             }
@@ -2878,7 +2878,10 @@ impl Sim {
         }
         if let Some(t) = &tmpl {
             match kind {
-                ObjectKind::Creature => self.load_template_items(id, t),
+                // A container's contents are its template's `ItemList` (an area's placed
+                // instance carries none of its own): Everd's armour chest at the Proving
+                // holds the armour and helmet the Dwarf Commoner needs.
+                ObjectKind::Creature | ObjectKind::Placeable => self.load_template_items(id, t),
                 ObjectKind::Store => self.load_store_items(id, t),
                 _ => {}
             }
