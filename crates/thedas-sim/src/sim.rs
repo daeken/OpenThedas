@@ -1245,9 +1245,15 @@ impl Sim {
 
     /// The player answers the open message box: `EVENT_TYPE_POPUP_RESULT` to its owner (the
     /// module when it has none), object 0 the owner, integers the popup's kind and the
-    /// button pressed (1 for the first). Provisional layout, read from the scripts that
-    /// handle it. Returns false when no popup is open.
+    /// button pressed (1 for the first). Returns false when no popup is open.
     pub fn answer_popup(&mut self, button: i32) -> bool {
+        self.answer_popup_with_text(button, "")
+    }
+
+    /// [`Sim::answer_popup`] with the text typed into the box: DAOrigins.exe's
+    /// `POPUP_RESULT` (built at 0x709950) carries it as string 0 (0x709971), empty when the
+    /// box has no input field.
+    pub fn answer_popup_with_text(&mut self, button: i32, text: &str) -> bool {
         let Some(p) = self.world.popup.take() else {
             return false;
         };
@@ -1262,8 +1268,23 @@ impl Sim {
         let mut ev = self.new_event("POPUP_RESULT", self.world.hero);
         ev.objects = vec![p.owner];
         ev.ints = vec![p.kind, button];
+        ev.strings = vec![text.to_string()];
         self.world.queue_event(0, target, ev, None);
         true
+    }
+
+    /// A screen opened that was not up already: the module hears `EVENT_TYPE_GUI_OPENED`
+    /// (84) with integer 0 the screen's `GUI_*` id (the inventory opened as a container
+    /// passes `GUI_CONTAINER_INVENTORY`, 2), as DAOrigins.exe's screen-showing routine
+    /// sends it (0x60afa3-0x60b065). Provisional: target and creator are taken to be the
+    /// module (0x5d4fc0 is not fully traced).
+    pub fn gui_opened(&mut self, gui: i32) {
+        let Some(module) = self.world.module else {
+            return;
+        };
+        let mut ev = self.new_event("GUI_OPENED", Some(module));
+        ev.ints = vec![gui];
+        self.world.queue_event(0, module, ev, None);
     }
 
     /// Tells the module a creature joined or left the active party

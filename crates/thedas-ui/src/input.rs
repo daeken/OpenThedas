@@ -96,7 +96,8 @@ pub fn apply(sim: &mut Sim, name: &str, args: &[String]) -> bool {
             .get(1)
             .and_then(|a| a.trim().parse::<f64>().ok())
             .map_or(1, |b| b as i32);
-        let answered = sim.answer_popup(button);
+        let text = args.get(3).map(String::as_str).unwrap_or("");
+        let answered = sim.answer_popup_with_text(button, text);
         sim.tick(0);
         return answered;
     }
