@@ -705,8 +705,17 @@ impl Sim {
             // One cutscene at a time: the next waits for the one playing.
             if !self.world.cutscenes.is_empty() && self.world.cutscene.is_none() {
                 let name = self.world.cutscenes.remove(0);
+                let res = crate::cutscene::Cutscene::resource(&name);
+                let from_dialog = match self.world.dialog_cutscenes.iter().position(|n| *n == res) {
+                    Some(i) => {
+                        self.world.dialog_cutscenes.remove(i);
+                        true
+                    }
+                    None => false,
+                };
                 if self.cutscene_policy == CutscenePolicy::Play {
-                    if let Some(c) = self.read_cutscene(&name) {
+                    if let Some(mut c) = self.read_cutscene(&name) {
+                        c.from_dialog = from_dialog;
                         let t = self.world.time_ms;
                         self.world.trace.push(TraceEntry::Log {
                             t,
@@ -725,7 +734,11 @@ impl Sim {
                         break;
                     }
                 }
-                self.end_cutscene(&name);
+                if from_dialog {
+                    self.close_dialog_cutscene(&name, false);
+                } else {
+                    self.end_cutscene(&name);
+                }
                 continue;
             }
             // Then the earliest of the next event and the next finishing command; events
@@ -843,15 +856,102 @@ impl Sim {
     /// [`Sim::end_cutscene`] says, and the next one loaded may start.
     fn finish_cutscene(&mut self) {
         if let Some(c) = self.world.cutscene.take() {
-            self.close_cutscene(&c.name, true);
+            if c.from_dialog {
+                self.close_dialog_cutscene(&c.name, true);
+            } else {
+                self.close_cutscene(&c.name, true);
+            }
         }
     }
 
-    /// A loaded cutscene's file (its length and lines), if it can be read.
+    /// A conversation line's cutscene ends: the conversation goes on (it waited, as the
+    /// world does, while it played). Provisional: the scripts' cutscene-ending locals are
+    /// for the cutscenes they load and are left alone.
+    fn close_dialog_cutscene(&mut self, name: &str, played: bool) {
+        let t = self.world.time_ms;
+        self.world.trace.push(TraceEntry::Log {
+            t,
+            channel: -1,
+            text: format!(
+                "conversation cutscene {name} ends{}",
+                if played { "" } else { " (not played)" }
+            ),
+        });
+    }
+
+    /// A loaded cutscene's file (its length and lines), if it can be read. Lines that say
+    /// a conversation's lines take their text from it (see
+    /// [`crate::cutscene::dialog_refs`]).
     fn read_cutscene(&self, name: &str) -> Option<crate::cutscene::Cutscene> {
         let res = crate::cutscene::Cutscene::resource(name);
         let (data, _) = self.vfs.read(&res).ok()?;
-        crate::cutscene::Cutscene::parse(&data, &res)
+        let g = thedas_formats::Gff4::parse(&data).ok()?;
+        let mut c = crate::cutscene::Cutscene::from_gff4(&g, &res)?;
+        let refs = crate::cutscene::dialog_refs(&g);
+        let mut walked: std::collections::HashMap<String, (Vec<u32>, usize)> = Default::default();
+        for r in refs {
+            let key = r.dialog.to_ascii_lowercase();
+            let (said, next) = walked
+                .entry(key.clone())
+                .or_insert_with(|| (self.walk_dialog_lines(&key), 0));
+            if let Some(&strref) = said.get(*next) {
+                c.lines.push(crate::cutscene::CutsceneLine {
+                    start: r.start.clamp(0.0, c.seconds),
+                    end: r.end.clamp(0.0, c.seconds),
+                    strref,
+                    actor: r.actor,
+                    conversation: Some(r.dialog),
+                    vo_mode: r.vo_mode,
+                });
+            }
+            *next += 1;
+        }
+        c.lines.sort_by(|a, b| a.start.total_cmp(&b.start));
+        Some(c)
+    }
+
+    /// The lines (talk-table references) conversation `dlg` says as it is walked from the
+    /// line whose cutscene was queued (the open conversation's, when it is this one) or
+    /// from its first start: each line, then its first reply's first line, and so on.
+    /// Provisional (see [`crate::cutscene::dialog_refs`]).
+    fn walk_dialog_lines(&self, dlg: &str) -> Vec<u32> {
+        let open = self
+            .talk
+            .as_ref()
+            .filter(|c| c.dlg.name.eq_ignore_ascii_case(dlg));
+        let owned;
+        let (d, from) = match open {
+            Some(c) => (&c.dlg, c.cut_from.or(c.line)),
+            None => {
+                let Some(d) = self
+                    .vfs
+                    .read(&format!("{dlg}.dlg"))
+                    .ok()
+                    .and_then(|(data, _)| crate::dialog::Dlg::parse(&data, dlg))
+                else {
+                    return Vec::new();
+                };
+                owned = d;
+                (&owned, owned.starts.first().copied())
+            }
+        };
+        let mut out = Vec::new();
+        let mut seen = Vec::new();
+        let mut at = from;
+        while let Some(i) = at {
+            if seen.contains(&i) || seen.len() > 256 {
+                break;
+            }
+            seen.push(i);
+            let Some(n) = d.nodes.get(i) else { break };
+            if !n.reply
+                && let Some(s) = n.strref
+            {
+                out.push(s);
+            }
+            at = n.children.first().copied();
+        }
+        out
     }
 
     fn close_cutscene(&mut self, name: &str, played: bool) {
@@ -3540,6 +3640,7 @@ mod tests {
                 vo_mode: 0,
             }],
             elapsed_ms: 0,
+            from_dialog: false,
         };
         // While one plays the world stands still; what it sets waits for its end, and so
         // does the next one loaded.

@@ -317,6 +317,8 @@ mod tests {
             ended,
             shown: Vec::new(),
             chain: Vec::new(),
+            cut_from: None,
+            cut_lines_left: 0,
         };
         s.talk = Some(talk(true));
         let save = s.save_game();

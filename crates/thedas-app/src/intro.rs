@@ -588,6 +588,13 @@ impl CutsceneMovies {
             log::info!("cutscene {name}: movie {} ended", p.name());
             *slot = None;
         }
+        // The last movie has ended before its track does (one played "to the end" of a
+        // cutscene that goes on, `bhn100cs_intro`): the world shows again, as the
+        // cutscene's cameras cut to it. Provisional: ActionPlayMovie's update (0x7ce740)
+        // is not traced for a movie shorter than its track.
+        if i + 1 == self.tracks.len() && matches!(self.playing, Some((j, None)) if j == i) {
+            return MovieState::None;
+        }
         MovieState::Showing
     }
 

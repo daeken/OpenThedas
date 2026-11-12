@@ -501,6 +501,10 @@ pub struct World {
     /// once the scripts that loaded it have run (see [`crate::sim::CutscenePolicy`]).
     #[serde(default)]
     pub cutscenes: Vec<String>,
+    /// Those of [`World::cutscenes`] a conversation line queued (resource names): they end
+    /// without the scripts' cutscene-ending locals (see [`crate::sim::Sim::end_cutscene`]).
+    #[serde(default)]
+    pub dialog_cutscenes: Vec<String>,
     /// The cutscene playing, while a presentation shows it ([`crate::sim::CutscenePolicy::Play`]).
     #[serde(default)]
     pub cutscene: Option<crate::cutscene::Cutscene>,
@@ -667,6 +671,7 @@ impl World {
             alerts: Vec::new(),
             game_mode: 0,
             cutscenes: Vec::new(),
+            dialog_cutscenes: Vec::new(),
             cutscene: None,
             chargen: None,
             chargen_mode: 0,

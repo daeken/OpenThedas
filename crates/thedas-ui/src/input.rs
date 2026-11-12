@@ -435,6 +435,8 @@ mod tests {
             ended,
             shown: Vec::new(),
             chain: Vec::new(),
+            cut_from: None,
+            cut_lines_left: 0,
         };
         // Still going with nothing to pick: a reply leaves it be.
         let world = s.world.clone();

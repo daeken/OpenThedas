@@ -6,7 +6,11 @@
 //! field 5200 lists the actors (`ACTR`, name in field 2), each with a generic list of tracks
 //! (field 5206). A spoken line is an `ASLN` track: its text (field 22, a talk-table
 //! reference), when it starts and ends (fields 5301 and 5302, seconds into the cutscene) and
-//! the conversation it comes from (field 5562).
+//! the conversation it comes from (field 5562). A line without its own text says a line of
+//! that conversation ([`dialog_refs`]): provisional, the k-th such line (by start time)
+//! says the k-th line the conversation walks, from the line that played the cutscene (or
+//! from the conversation's start when another conversation's line played it; e.g.
+//! `bhn100cs_intro` speaks `bhn100dg_introduction`'s six lines in this order).
 //!
 //! A movie played full screen is an `APBM` track (track type 42 in field 5300), the
 //! executable's `EC::Cutscene::Actor::ActionPlayMovie` (vtable 0xb23608): the Bink movie's
@@ -68,6 +72,9 @@ pub struct Cutscene {
     /// Milliseconds it has played.
     #[serde(default)]
     pub elapsed_ms: u64,
+    /// A conversation line played it (see [`crate::dialog::Node::cutscene`]).
+    #[serde(default)]
+    pub from_dialog: bool,
 }
 
 impl Cutscene {
@@ -147,6 +154,7 @@ impl Cutscene {
             seconds,
             lines,
             elapsed_ms: 0,
+            from_dialog: false,
         })
     }
 
@@ -162,6 +170,74 @@ impl Cutscene {
             .rev()
             .find(|l| l.start <= seconds && seconds < l.end)
     }
+}
+
+/// A spoken line of a cutscene that says a conversation's line rather than its own text:
+/// an `ASLN` track without a talk-table reference (22) naming a conversation (5562).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DialogRef {
+    pub start: f32,
+    pub end: f32,
+    pub actor: String,
+    /// The conversation (resource name without `.dlg`).
+    pub dialog: String,
+    /// The track's field 5564 (see [`CutsceneLine::vo_mode`]).
+    pub vo_mode: u8,
+}
+
+/// A cutscene's lines that say a conversation's lines, by start time.
+pub fn dialog_refs(g: &Gff4) -> Vec<DialogRef> {
+    if g.file_type.0 != *b"CUT " {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for actor in structs(g, g.root, FIELD_ACTORS) {
+        let name = g
+            .field(actor, FIELD_ACTOR_NAME)
+            .and_then(Value::as_str)
+            .map(|s| s.trim_end_matches('\0').to_string())
+            .unwrap_or_default();
+        for track in structs(g, actor, FIELD_TRACKS) {
+            if g.template_of(track).label.0 != *b"ASLN"
+                || matches!(g.field(track, FIELD_LINE_TEXT), Some(Value::Tlk(t)) if t.id != u32::MAX)
+            {
+                continue;
+            }
+            let Some(dialog) = g
+                .field(track, FIELD_LINE_CONVERSATION)
+                .and_then(Value::as_str)
+                .map(|s| s.trim_end_matches('\0').trim().to_string())
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let time = |l| {
+                g.field(track, l)
+                    .and_then(Value::as_f64)
+                    .map(|s| s as f32)
+                    .filter(|s| s.is_finite())
+            };
+            let (Some(start), Some(end)) = (time(FIELD_LINE_START), time(FIELD_LINE_END)) else {
+                continue;
+            };
+            if end < start {
+                continue;
+            }
+            let vo_mode = g
+                .field(track, FIELD_LINE_VO)
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0) as u8;
+            out.push(DialogRef {
+                start,
+                end,
+                actor: name.clone(),
+                dialog,
+                vo_mode,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.start.total_cmp(&b.start));
+    out
 }
 
 /// A movie a cutscene plays full screen (an `APBM` track).
