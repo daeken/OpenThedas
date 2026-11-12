@@ -125,8 +125,8 @@ mod tests {
     fn queued(s: &Sim) -> Vec<(i32, Vec<i32>)> {
         s.world
             .queue
-            .iter()
-            .map(|(_, q)| (q.event.ty, q.event.ints.clone()))
+            .values()
+            .map(|q| (q.event.ty, q.event.ints.clone()))
             .collect()
     }
 
