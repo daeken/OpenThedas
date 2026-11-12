@@ -39,6 +39,9 @@ pub struct Part {
     pub vertices: Vec<MeshVertex>,
     /// Per vertex (parallel to `vertices`), its wind pairs (7.7).
     pub wind: Vec<VertexWind>,
+    /// Per vertex, self-shadow coordinates (7.9), `v = 1 − t`; empty when the file has no
+    /// shadow projection. Branches and fronds only.
+    pub uv_shadow: Vec<[f32; 2]>,
     /// Per LOD level, a triangle list (three indices per triangle, degenerate triangles
     /// removed, strip winding kept).
     pub lods: Vec<Vec<u32>>,
@@ -232,7 +235,7 @@ impl TreeMesh {
         let generated = generate(tree)?;
         let g = &generated;
 
-        let branches = Part {
+        let mut branches = Part {
             vertices: g
                 .branches
                 .vertices
@@ -248,6 +251,7 @@ impl TreeMesh {
                 })
                 .collect(),
             wind: g.branches.vertices.iter().map(|v| v.wind.into()).collect(),
+            uv_shadow: Vec::new(),
             lods: (0..g.branches.lods.len())
                 .map(|k| {
                     let mut list = Vec::new();
@@ -259,7 +263,7 @@ impl TreeMesh {
                 .collect(),
         };
 
-        let fronds = Part {
+        let mut fronds = Part {
             vertices: g
                 .fronds
                 .vertices
@@ -275,6 +279,7 @@ impl TreeMesh {
                 })
                 .collect(),
             wind: g.fronds.vertices.iter().map(|v| v.wind.into()).collect(),
+            uv_shadow: Vec::new(),
             lods: g
                 .fronds
                 .strips
@@ -388,6 +393,13 @@ impl TreeMesh {
             (lo, hi) = ([0.0; 3], [0.0; 3]);
         }
 
+        let shadow = shadow_mapper(tree, (lo, hi));
+        if let Some(map) = &shadow {
+            for part in [&mut branches, &mut fronds] {
+                part.uv_shadow = part.vertices.iter().map(|v| map(v.position)).collect();
+            }
+        }
+
         let billboard = tree
             .texcoords
             .as_ref()
@@ -453,6 +465,7 @@ impl TreeMesh {
                 }
                 h.float(v.fade);
             }
+            part.uv_shadow.iter().flatten().for_each(|&x| h.float(x));
             for w in &part.wind {
                 w.weights.iter().for_each(|&x| h.float(x));
                 w.matrices.iter().for_each(|&m| h.word(m.into()));
@@ -775,6 +788,38 @@ fn leaf_card(
     }
 }
 
+/// The self-shadow coordinate of a position (7.9), when the file has a shadow projection.
+fn shadow_mapper(tree: &SpeedTree, (lo, hi): (Vec3, Vec3)) -> Option<impl Fn(Vec3) -> [f32; 2]> {
+    use super::frame::{dot, normalize, sub};
+    let projection = tree.shadow_projection.as_ref()?;
+    let (right, up) = (projection.right?, projection.up?);
+    let centre = scale(add(lo, hi), 0.5);
+    let d = sub(hi, lo);
+    let radius = 0.5 * dot(d, d).sqrt();
+    let (r_hat, u_hat) = (normalize(right), normalize(up));
+    let k = tree
+        .texcoords
+        .as_ref()
+        .map(|t| t.shadow.unwrap_or([1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0]));
+    // An empty box has no extent to project into; put everything at 0 (provisional).
+    let span = 2.0 * radius;
+    Some(move |v: Vec3| {
+        let (mut s, mut t) = if span > 0.0 {
+            (
+                dot(sub(v, sub(centre, scale(right, radius))), r_hat).abs() / span,
+                dot(sub(v, sub(centre, scale(up, radius))), u_hat).abs() / span,
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        if let Some(k) = k {
+            s = super::frame::lerp(k[2], k[0], s);
+            t = super::frame::lerp(k[5], k[1], t);
+        }
+        flip([s, t])
+    })
+}
+
 /// A level-0 leaf's longest reach from its position (5.7 F): a mesh's farthest vertex, or a
 /// card's farthest corner from its (unmirrored) pivot.
 fn leaf_reach(
@@ -952,6 +997,33 @@ mod tests {
         assert_eq!(b.corners[0], [0.5 * b.width, b.height]);
         assert_eq!(b.corners[2], [-0.5 * b.width, 0.0]);
         assert_eq!(b.uv[0], [1.0, 0.0]);
+    }
+
+    #[test]
+    fn self_shadow_coordinates_project_onto_the_box() {
+        use crate::speedtree::ShadowProjection;
+        let mut t = leafy_trunk();
+        assert!(TreeMesh::try_new(&t).unwrap().branches.uv_shadow.is_empty());
+        t.shadow_projection = Some(ShadowProjection {
+            right: Some([1.0, 0.0, 0.0]),
+            up: Some([0.0, 0.0, 1.0]),
+            out: Some([0.0, 1.0, 0.0]),
+            map: Some("shadow.dds".into()),
+        });
+        let mesh = TreeMesh::try_new(&t).unwrap();
+        let part = &mesh.branches;
+        assert_eq!(part.uv_shadow.len(), part.vertices.len());
+        // No shadow entry in the section: the default corners map s and t straight through.
+        let (lo, hi) = mesh.bounds;
+        let centre = scale(add(lo, hi), 0.5);
+        let d = super::super::frame::sub(hi, lo);
+        let r = 0.5 * super::super::frame::dot(d, d).sqrt();
+        for (v, uv) in part.vertices.iter().zip(&part.uv_shadow) {
+            let s = (v.position[0] - (centre[0] - r)).abs() / (2.0 * r);
+            let t = (v.position[2] - (centre[2] - r)).abs() / (2.0 * r);
+            assert!((uv[0] - s).abs() < 1e-5 && (uv[1] - (1.0 - t)).abs() < 1e-5);
+            assert!((0.0..=1.0).contains(&s) && (0.0..=1.0).contains(&t));
+        }
     }
 
     #[test]
