@@ -626,7 +626,9 @@ impl UiLayer {
     }
 
     /// Puts up a loading screen of `kind`; `hint` is the tip load_town.gfx shows
-    /// (`GUILoading.LoadingText`; see [`thedas_ui::binding::load_hint`]). It stays up,
+    /// (`GUILoading.LoadingText`; see [`thedas_ui::binding::load_hint`]). DAOrigins.exe shows
+    /// load_town.gfx for a save load, a new game and a change of area list, load_light.gfx
+    /// for an area change within one (the load mode's setter, 0x6c63f0). It stays up,
     /// alone, until [`UiLayer::loading_end`] and its movie has played out.
     pub fn loading_begin(&mut self, kind: LoadScreen, hint: Option<String>) {
         self.stage.bridge.set_value(
@@ -1995,7 +1997,8 @@ pub enum LoadScreen {
     /// load_light.gfx (scene `LightLoading`): black with "Loading".
     Light,
     /// load_fade.gfx (scene `FadeToBlackLoading`): fades to black first
-    /// (`GUIFadeToBlackLoading.FadeComplete`).
+    /// (`GUIFadeToBlackLoading.FadeComplete`). Not an area load's: the exe shows it for the
+    /// party picker only.
     Fade,
 }
 
