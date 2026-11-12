@@ -431,9 +431,10 @@ impl PadPlay {
         };
         self.picker = Some(live.paused);
         live.paused = true;
-        // The quickbar sits along the bottom middle of the HUD.
+        // On the quickbar's first slot (it runs along the bottom of the HUD). Provisional:
+        // placed by eye at 1280x720.
         let (w, h) = host.size();
-        pointer_to(host, w as f64 / 2.0, h as f64 * 0.92);
+        pointer_to(host, w as f64 * 0.065, h as f64 * 0.965);
         "quickbar picker: paused; point at a slot and press A (B or LT closes)".into()
     }
 
@@ -461,14 +462,13 @@ impl PadPlay {
         self.used && matches!(ctx, Context::Screen | Context::Picker)
     }
 
-    /// The pad's overlay on a `size` view: a ring round the target, and the pointer when
-    /// the pad drives it. Pixel line segments, drawn as the aiming reticle is.
+    /// The pad's overlay in the world on a `size` view: a ring round the target. Pixel line
+    /// segments, drawn under the interface as the aiming reticle is.
     pub fn overlay(
         &self,
         live: Option<&Live>,
         camera: &Camera,
         size: (u32, u32),
-        cursor: (f64, f64),
         ctx: Context,
     ) -> Vec<[Vec2; 2]> {
         let mut lines = Vec::new();
@@ -486,10 +486,16 @@ impl PadPlay {
                 lines.extend(crate::reticle::project(camera, size, &ring));
             }
         }
-        if self.pointer_shown(ctx) {
-            lines.extend(pointer_arrow(cursor));
-        }
         lines
+    }
+
+    /// The pointer, when the pad drives it: drawn over the interface.
+    pub fn pointer(&self, cursor: (f64, f64), ctx: Context) -> Vec<[Vec2; 2]> {
+        if self.pointer_shown(ctx) {
+            pointer_arrow(cursor)
+        } else {
+            Vec::new()
+        }
     }
 }
 

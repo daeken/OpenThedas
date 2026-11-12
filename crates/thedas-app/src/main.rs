@@ -386,7 +386,7 @@ fn capture(
     played: Option<&mut ui::UiLayer>,
     cursor: (f64, f64),
     shader_time: f64,
-    overlay: Vec<[glam::Vec2; 2]>,
+    (overlay, pointer): (Vec<[glam::Vec2; 2]>, Vec<[glam::Vec2; 2]>),
 ) -> Result<()> {
     let mut reticle = overlay;
     let pixels = if let Some(live) = live {
@@ -434,6 +434,8 @@ fn capture(
         layer.log_gaps();
         layer.capture_over(&mut frame)?;
     }
+    // The pad's pointer goes over the interface.
+    reticle::draw_rgba(&mut frame.pixels, (w, h), &pointer);
     write_png(out, w, h, &frame.pixels)?;
     println!(
         "wrote {} ({w}x{h}, camera {})",
@@ -944,14 +946,18 @@ impl App {
             let ctx = self
                 .pad
                 .context_for(self.screens.as_ref(), g.ui.stage.dialog_up());
-            lines.extend(
-                self.pad
-                    .overlay(Some(&*live), &self.camera, size, self.cursor, ctx),
-            );
+            lines.extend(self.pad.overlay(Some(&*live), &self.camera, size, ctx));
             g.reticle
                 .draw(&g.ctx.device, &mut encoder, &view, size, &lines);
         }
         g.ui.composite(&mut encoder, &view, g.config.format);
+        // The pad's pointer goes over the interface.
+        let ctx = self
+            .pad
+            .context_for(self.screens.as_ref(), g.ui.stage.dialog_up());
+        let pointer = self.pad.pointer(self.cursor, ctx);
+        g.reticle
+            .draw(&g.ctx.device, &mut encoder, &view, size, &pointer);
         let readback = (!self.frame_requests.is_empty())
             .then(|| read_frame(&g.ctx, &mut encoder, &frame.texture));
         g.ctx.queue.submit([encoder.finish()]);
@@ -1565,13 +1571,7 @@ impl App {
                 let ctx = self
                     .pad
                     .context_for(self.screens.as_ref(), g.ui.stage.dialog_up());
-                reticle.extend(self.pad.overlay(
-                    Some(&*live),
-                    &self.camera,
-                    (w, h),
-                    self.cursor,
-                    ctx,
-                ));
+                reticle.extend(self.pad.overlay(Some(&*live), &self.camera, (w, h), ctx));
                 live.capture(&g.ctx, &self.camera, (w, h))?
             }
             (None, Some(r)) => Some(r.capture(&g.ctx, &self.camera, w, h)?),
@@ -1584,6 +1584,14 @@ impl App {
         };
         reticle::draw_rgba(&mut frame.pixels, (w, h), &reticle);
         g.ui.capture_over(&mut frame)?;
+        let ctx = self
+            .pad
+            .context_for(self.screens.as_ref(), g.ui.stage.dialog_up());
+        reticle::draw_rgba(
+            &mut frame.pixels,
+            (w, h),
+            &self.pad.pointer(self.cursor, ctx),
+        );
         Ok(frame)
     }
 
@@ -2303,7 +2311,7 @@ fn main() -> Result<()> {
         // The game controller as `pad` steps hold it, and its part of the game.
         let mut pad_state = pad::PadState::default();
         let mut pad_play = padplay::PadPlay::default();
-        let mut pad_lines = Vec::new();
+        let mut pad_lines = (Vec::new(), Vec::new());
         if let Some(l) = live.as_mut() {
             l.shader_time = args.time;
             if ui.is_empty() {
@@ -2605,7 +2613,10 @@ fn main() -> Result<()> {
                 .as_ref()
                 .is_some_and(|(layer, _)| layer.stage.dialog_up());
             let ctx = pad_play.context_for(played.as_ref().map(|(_, s)| s), popup);
-            pad_lines = pad_play.overlay(Some(&*l), &camera, size, cursor, ctx);
+            pad_lines = (
+                pad_play.overlay(Some(&*l), &camera, size, ctx),
+                pad_play.pointer(cursor, ctx),
+            );
         }
         return capture(
             &ctx,
