@@ -132,6 +132,10 @@ pub struct UiLayer {
     level: Option<String>,
     /// Frames since the minimap's creatures were last sent.
     minimap_frame: u32,
+    /// tooltips.gfx's tooltip texts (fixed and floating) last frame, and the frames left to lay
+    /// the last tooltip out again after they changed (see `thedas_ui::avm1::TOOLTIP_RELAYOUT`).
+    tooltip_text: Option<thedas_ui::UiValue>,
+    tooltip_relayout: u8,
     portraits: PortraitClock,
     paperdoll: PaperdollClock,
     /// Where the player's games are saved (none: the save and load screens list nothing).
@@ -291,6 +295,8 @@ impl UiLayer {
             line: None,
             level: None,
             minimap_frame: 0,
+            tooltip_text: None,
+            tooltip_relayout: 0,
             portraits: PortraitClock::default(),
             paperdoll: PaperdollClock::default(),
             saves: None,
@@ -621,6 +627,28 @@ impl UiLayer {
         }
         self.show_cutscene_line(sim);
         let messages = self.stage.tick(dt_ms);
+        let tip = Some(thedas_ui::UiValue::List(
+            ["GUI.TooltipText", "GUITooltips.TooltipText"]
+                .map(|k| {
+                    self.stage
+                        .bridge
+                        .value(k)
+                        .unwrap_or(thedas_ui::UiValue::Undefined)
+                })
+                .to_vec(),
+        ));
+        if tip != self.tooltip_text {
+            self.tooltip_relayout = 6;
+            self.tooltip_text = tip;
+        }
+        // The fixed tooltip whose text changed is laid out again over the next few frames,
+        // once the movie has shown it and its text has been laid out (the value reaches the
+        // movie a frame or two after it is set; see `thedas_ui::avm1::TOOLTIP_RELAYOUT`).
+        if self.tooltip_relayout > 0 {
+            self.tooltip_relayout -= 1;
+            self.stage
+                .call_in("tooltips.gfx", thedas_ui::avm1::TOOLTIP_RELAYOUT, &[]);
+        }
         let ignored = {
             let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             thedas_ui::input::apply_all(&mut sim, &messages)
@@ -719,6 +747,34 @@ impl UiLayer {
             );
         }
         true
+    }
+
+    /// Calls a function in an open movie by path (the `call` step, for probing the movies
+    /// headless); arguments that parse as numbers are passed as numbers.
+    pub fn probe_call(
+        &mut self,
+        movie: &str,
+        path: &str,
+        args: &[String],
+    ) -> Option<thedas_ui::UiValue> {
+        let args: Vec<_> = args
+            .iter()
+            .map(|a| match a.parse::<f64>() {
+                Ok(n) => thedas_ui::UiValue::Number(n),
+                Err(_) => thedas_ui::UiValue::String(a.clone()),
+            })
+            .collect();
+        self.stage.call_in(movie, path, &args)
+    }
+
+    /// Sets an engine value the movies read (the `setvalue` step): a number when it parses
+    /// as one, else a string.
+    pub fn probe_set_value(&mut self, name: &str, value: &str) {
+        let v = value
+            .parse::<f64>()
+            .map(thedas_ui::UiValue::Number)
+            .unwrap_or_else(|_| thedas_ui::UiValue::String(value.to_string()));
+        self.stage.bridge.set_value(name, v);
     }
 
     /// conversation.gfx's continue action (it sends `Conversation.SelectResponse 0` when the

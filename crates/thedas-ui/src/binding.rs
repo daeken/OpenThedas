@@ -151,6 +151,37 @@ pub enum ItemCategory {
     Plot = 6,
 }
 
+/// The inventory's equipment layout for a creature (inventory.gfx's `EQUIPMENT_LAYOUT_*`: 0 the
+/// default slots, 1 Shale's, 2 the dog's) and whether it can switch weapon sets, as
+/// DAOrigins.exe fills `GUI.SelectedChar.EquipmentLayout` and `CanSwitchWeaponSets`
+/// (0x6a3f16): from `equipmentlayout.gda`, whose row 0 applies to everyone and a later row
+/// whose `Tag` (column 0x88578372) is the creature's tag overrides it, taking `Layout`
+/// (0x35a753c0) and column 0xaf79ba5c as the weapon-set switch.
+fn equipment_layout(sim: &Sim, tag: &str) -> (f64, bool) {
+    const COL_TAG: u32 = 0x8857_8372;
+    const COL_LAYOUT: u32 = 0x35a7_53c0;
+    const COL_SWITCH: u32 = 0xaf79_ba5c;
+    let Some(t) = sim.world.tables().get(0, "equipmentlayout") else {
+        return (0.0, true);
+    };
+    let int = |c: u32, r: i64| match t.cell_by_hash(c, r) {
+        Some(thedas_formats::gda::Cell::Int(v)) => *v as f64,
+        Some(thedas_formats::gda::Cell::Float(v)) => *v,
+        _ => 0.0,
+    };
+    let row = |r: i64| (int(COL_LAYOUT, r), int(COL_SWITCH, r) != 0.0);
+    let mut out = (0.0, true);
+    for (i, &r) in t.order.iter().enumerate() {
+        let tagged = matches!(t.cell_by_hash(COL_TAG, r),
+            Some(thedas_formats::gda::Cell::String(s))
+                if s.trim_end_matches('\0').trim().eq_ignore_ascii_case(tag));
+        if i == 0 || tagged {
+            out = row(r);
+        }
+    }
+    out
+}
+
 /// The inventory tab an item falls under, from its base type's `Type` in `bitm_base` (2
 /// melee, 5 staff, 6 ranged, 7 ammunition: weapons; 3 shield, 4 armour: armour; 1 other: an
 /// accessory when it can be worn) and, for crafting materials and recipes, the base type's
@@ -516,6 +547,10 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             num(e.check_requirements),
         );
     }
+    // How far right the quickbar reaches (tooltips.gfx lifts its fixed tooltip 48 pixels
+    // when the quickbar runs under it). Provisional: the HUD's quickbar spans the screen, so
+    // it is given as reaching past any tooltip.
+    v.insert("GUI.QuickbarXMax".into(), num(100_000));
     // The difficulty, as character creation's difficulty prompt starts from it.
     v.insert(
         "ClientOptions.GameOptions.DifficultyLevel".into(),
@@ -1158,7 +1193,12 @@ fn inventory(sim: &Sim, who: Option<u32>, filter: i32, v: &mut BTreeMap<String, 
         return;
     };
     v.insert("GUI.SelectedChar.CanChangeEquipment".into(), num(1));
-    v.insert("GUI.SelectedChar.CanSwitchWeaponSets".into(), num(1));
+    let (layout, can_switch) = equipment_layout(sim, &o.tag);
+    v.insert("GUI.SelectedChar.EquipmentLayout".into(), num(layout));
+    v.insert(
+        "GUI.SelectedChar.CanSwitchWeaponSets".into(),
+        num(can_switch as u8),
+    );
     v.insert(
         "GUI.SelectedChar.ActiveWeaponSet".into(),
         num(o.fields.get("ActiveWeaponSet").copied().unwrap_or(0)),
@@ -1581,6 +1621,35 @@ mod tests {
             UiValue::Number(0.0),
             "not in combat"
         );
+    }
+
+    #[test]
+    fn the_inventory_takes_its_equipment_layout_from_the_creature_tag() {
+        use thedas_formats::gda::Cell;
+        let sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let row = |tag: &str, layout: i64, switch: i64| {
+            vec![
+                Cell::String(tag.into()),
+                Cell::Int(layout),
+                Cell::Int(switch),
+            ]
+        };
+        sim.world.tables().insert(
+            "equipmentlayout",
+            &["#88578372", "#35a753c0", "#af79ba5c"],
+            vec![
+                (0, row("DEFAULT ", 0, 1)),
+                (1, row("gen00fl_shale ", 1, 0)),
+                (2, row("gen00fl_dog ", 2, 0)),
+            ],
+        );
+        assert_eq!(equipment_layout(&sim, "player"), (0.0, true));
+        assert_eq!(equipment_layout(&sim, "gen00fl_dog"), (2.0, false));
+        assert_eq!(equipment_layout(&sim, "GEN00FL_SHALE"), (1.0, false));
     }
 
     #[test]

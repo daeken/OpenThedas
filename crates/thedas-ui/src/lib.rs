@@ -465,6 +465,8 @@ pub struct UiMovie {
     observers: Vec<(String, String)>,
     /// The value last pushed to each observer.
     sent: std::collections::HashMap<String, UiValue>,
+    /// Observers registered since the last push, heard from on the next one.
+    fresh: Vec<String>,
     /// The movie's scaling-grid sprites (see `gfx::Scale9`), by sprite id, and the scale each
     /// registered one was last laid out for.
     scale9: BTreeMap<u16, gfx::Scale9>,
@@ -606,6 +608,7 @@ impl UiMovie {
             authored,
             observers: Default::default(),
             sent: Default::default(),
+            fresh: Vec::new(),
             scale9: BTreeMap::new(),
             scale9_laid: Vec::new(),
             slots: BTreeMap::new(),
@@ -960,6 +963,7 @@ impl UiMovie {
     /// answered. Provisional, from the movies' bytecode.
     pub fn sync_tokens(&mut self, value: &dyn Fn(&str) -> Option<UiValue>) -> Vec<String> {
         const TM: &str = "_global.TokenManager";
+        self.fresh.clear();
         let take = |m: &mut Self, list: &str| match m
             .call(&format!("{TM}.{list}.splice"), &[UiValue::Number(0.0)])
         {
@@ -971,7 +975,11 @@ impl UiMovie {
             if let (Some(id), Some(UiValue::String(token))) =
                 (t.first().and_then(callback_key), t.get(1))
             {
+                // A new observer hears the value at once, as from the game, even when the id
+                // was fed before (a screen's clips placed again register their ids anew).
                 self.observers.retain(|(i, _)| *i != id);
+                self.sent.remove(&id);
+                self.fresh.push(id.clone());
                 self.observers.push((id, token.clone()));
             }
         }
@@ -983,6 +991,8 @@ impl UiMovie {
             .unwrap_or_default();
         for (id, token) in called {
             self.observers.retain(|(i, _)| *i != id);
+            self.sent.remove(&id);
+            self.fresh.push(id.clone());
             self.observers.push((id, token));
         }
         for r in take(self, "RemoveTokenObserverBatchData") {
@@ -992,10 +1002,20 @@ impl UiMovie {
             }
         }
         let mut missing = Vec::new();
+        let trace = std::env::var_os("THEDAS_TOKEN_LOG").is_some();
         for (id, token) in self.observers.clone() {
+            // Registered just now: heard from on the next push, once the clips placed with
+            // the registering one exist (inventory.gfx's equipment layout hid nothing when
+            // pushed at once).
+            if self.fresh.contains(&id) {
+                continue;
+            }
             match value(&token) {
                 Some(v) => {
                     if self.sent.get(&id) != Some(&v) {
+                        if trace {
+                            log::info!("{}: token {token} ({id}) = {v:?}", self.name);
+                        }
                         self.call(
                             &format!("{TM}.cm_mapCallbacks.{id}"),
                             std::slice::from_ref(&v),
