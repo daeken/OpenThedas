@@ -310,6 +310,23 @@ pub fn query(sim: &Sim, name: &str, args: &[String]) -> UiValue {
                 .collect(),
         ),
         "GetObjectNameByID" => UiValue::String(sim.display_name(who)),
+        // `GetGender(creature)`: its gender (`Gender`, a `gender.gda` row); the character
+        // record picks the race icon's column by it.
+        "GetGender" => UiValue::Number(
+            sim.world
+                .get(who)
+                .and_then(|o| o.fields.get("Gender").copied())
+                .unwrap_or(0)
+                .into(),
+        ),
+        // `HasAbility(creature, ability)`: whether the creature has learned the ability
+        // (characterrecord.gfx shows a class's rank icon when the creature has the class's
+        // starting ability).
+        "HasAbility" => UiValue::Bool(
+            sim.world
+                .get(who)
+                .is_some_and(|o| o.abilities.contains(&(int(1) as i32))),
+        ),
         // `CreatureCanUseItem(item, creature)`: whether the creature may use the item;
         // inventory.gfx dims the rows of items it cannot (`ItemEquippable_mc`). The exe's
         // test (0x6ae8b0) checks the item's requirements against the creature. Provisional:
