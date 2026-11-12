@@ -59,6 +59,9 @@ pub struct Gear {
     /// Its hands' sound material when they hold no weapon (`apr_base.gda` column
     /// 0x7d86f95a: 19 bare hands, 20 claws, 27 large claws; 0x6a0b05..0x6a0b53).
     pub unarmed: Option<i64>,
+    /// For a placeable: its type, the row of `placeable_types.gda` (worksheet 93, the
+    /// placeable's +0x4f0) that names its sounds.
+    pub placeable: Option<i64>,
 }
 
 /// A sound set's lines (`sse_<set>.gda`: row -> strref) and each type's number of them
@@ -228,6 +231,9 @@ pub struct GameAudio {
     /// material by label).
     weapon_hits: Option<thedas_formats::Gda>,
     bodyfall_foley: Option<thedas_formats::Gda>,
+    /// `placeable_types.gda`: each placeable type's sounds, by column (`ClosedToOpened`,
+    /// `OpenedToClosed`, `Destroyed`, `Used`, `Locked`, `Hit` and others).
+    placeable_types: Option<thedas_formats::Gda>,
     item_material_labels: std::collections::HashMap<i64, u32>,
     /// `sound_vegetation_type.gda`, worksheet 155 "Sound Movement Vegetation" (rows:
     /// vegetation; columns: size `small`/`medium`/`large`).
@@ -337,6 +343,12 @@ fn blow_event(
     struck: i64,
 ) -> Option<String> {
     table_event(hits, weapon?, *labels.get(&struck)?)
+}
+
+/// The `placeable_types.gda` column a placeable sound event (kind 27) names: its text
+/// trimmed of spaces, tabs and the string's terminator, hashed as a column name.
+fn placeable_sound_column(label: &str) -> u32 {
+    thedas_formats::gda::column_hash(label.trim_matches(|c| matches!(c, ' ' | '\t' | '\0')))
 }
 
 /// The event in row `row`, column `col` (by hash) of a sound table, if any.
@@ -606,6 +618,7 @@ impl GameAudio {
             bodyfalls: read_gda(vfs, "sound_bodyfall_creat_size.gda"),
             weapon_hits: read_gda(vfs, "sound_weapon_hits.gda"),
             bodyfall_foley: read_gda(vfs, "sound_bodyfall_foley.gda"),
+            placeable_types: read_gda(vfs, "placeable_types.gda"),
             item_material_labels: item_material_labels(vfs),
             rustles: Default::default(),
             impacts: Impacts::read(vfs),
@@ -929,6 +942,22 @@ impl GameAudio {
                     // Armour foley (0x69e7f0): `sound_movement_foley.gda`'s column the event
                     // names (`Small`, `Medium`, `Large`) for the armour's sound material
                     // (none: row 0).
+                    // A placeable's sound (kind 27, the placeable's handler 0x74c360): the
+                    // event's text, trimmed of spaces and tabs (0x4c3310), names a column of
+                    // `placeable_types.gda` (worksheet 93), read in the row of the
+                    // placeable's type; door animations name `ClosedToOpened` and
+                    // `OpenedToClosed`. Creatures ignore the kind (0x6b62fb).
+                    // Provisional: the exe plays it at the centre of the model's bounds
+                    // (0x74c4e2..0x74c686); we play it where the placeable stands.
+                    (27, Some(label)) => gear.get(&id).and_then(|g| g.placeable).and_then(|row| {
+                        let col = placeable_sound_column(label);
+                        let e = self
+                            .placeable_types
+                            .as_ref()
+                            .and_then(|t| table_event(t, row, col));
+                        log::debug!("audio: placeable {id} {label:?}: {e:?}");
+                        e
+                    }),
                     (17, Some(size)) => {
                         let g = gear.get(&id).copied().unwrap_or_default();
                         let col = thedas_formats::gda::column_hash(size.trim());
@@ -1725,6 +1754,34 @@ mod tests {
         assert_eq!(blow_event(&hits, &labels, Some(19), 12), None);
         assert_eq!(blow_event(&hits, &labels, Some(1), 99), None);
         assert_eq!(blow_event(&hits, &labels, None, 16), None);
+    }
+
+    #[test]
+    fn placeable_sounds_name_a_column_of_their_type() {
+        use thedas_formats::gda::{Cell, Column, Gda, column_hash};
+        let col = |name: &str| Column {
+            hash: column_hash(name),
+            kind: None,
+        };
+        let types = Gda {
+            version: thedas_formats::FourCC(*b"V0.2"),
+            columns: vec![col("ID"), col("ClosedToOpened"), col("Used")],
+            rows: vec![vec![
+                Cell::Int(1),
+                Cell::String("plc/doors/small_open ".into()),
+                Cell::Empty,
+            ]],
+        };
+        // The event's text, as `.evt` files store it (with its terminator), or padded.
+        let open = placeable_sound_column("ClosedToOpened\0");
+        assert_eq!(open, placeable_sound_column(" \tClosedToOpened "));
+        assert_eq!(
+            table_event(&types, 1, open).as_deref(),
+            Some("plc/doors/small_open")
+        );
+        // An empty cell or another type: nothing.
+        assert_eq!(table_event(&types, 1, placeable_sound_column("Used")), None);
+        assert_eq!(table_event(&types, 2, open), None);
     }
 
     #[test]

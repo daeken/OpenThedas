@@ -42,7 +42,10 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
     - Not handled: their `SoundList` (sounds that play only inside the volume, 0x79a000) and `ObjectId`.
     - Medium.
 12. **Ambient one-shots** (`amb_oneshots`, `glo_amb_creat`). Played only where the data places them; any engine-driven ambient spawning isn't checked. Small to medium.
-13. **Placeable sounds** (doors, chests and so on): `.evt` kind 27 (`ClosedToOpened`, `OpenedToClosed`, `Destroyed`, `Used`) and `sound_plc_column_names.gda`. Not done. Medium.
+13. **Placeable sounds** (doors, chests and so on).
+    - Done: animation events of kind 27 (`ClosedToOpened`, `OpenedToClosed`, `Destroyed`, `Used`) play the `placeable_types.gda` column they name for the placeable's type (0x74c360).
+    - Not done: sounds the exe plays from code rather than animations. These are `sound_plc_column_names.gda`'s rows through 0x74c110 (`Locked`, `Hit`; callers not traced), the unlock and lock-pick-failure columns, and the container-opening column (0x98094859, played at 0x74c2b0 when a container's inventory opens). They need the sim's lock and container events.
+    - Small to medium.
 
 ### Voice-over and conversations
 
@@ -182,6 +185,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 - **AUD-035** **Secondary reverb instances are not modelled.** Original: loads the next two most-used presets into secondary reverb instances for events that name a preset (per comment). Ours: one world reverb. Evidence: `crates/thedas-audio/src/area.rs:136`. Size: M. Depends: AUD-036. Kind: missing.
 - **AUD-036** **The reverb is our own algorithm.** Original: FMOD Ex software I3DL2 reverb. Ours: four taps, two diffusers, 8-line FDN; decay LF ratio, modulation, echo, environment and room rolloff are unused. Evidence: `crates/thedas-audio/src/reverb.rs:27`. Size: M. Depends: none. Kind: provisional.
 - **AUD-037** **Reverb trigger entry rule is guessed.** Original: enter handler 0x79b3d0 (caller not traced). Ours: the party leader's entering counts; of several entered in one step, the last listed wins. Evidence: `crates/thedas-audio/src/area.rs:166`. Size: S. Depends: none. Kind: provisional.
+- **AUD-064** **Placeable sounds play where the placeable stands.** Original: kind-27 sounds play at the centre of the model's bounds, transformed by its placement (0x74c4e2..0x74c686). Ours: at the placeable's position. Evidence: `crates/thedas-app/src/audio.rs:952`. Size: S. Depends: none. Kind: provisional.
 - **AUD-063** **Music volume entry rule and pause are guessed.** Original: the enter handler 0x799380 stores the volume's state and delay on the music director, whose update (0x5bb630) counts the delay down except in game mode 9 (0x5bb669, not identified). Ours: the party leader's entering counts, the last listed of several wins, and the countdown never pauses. Evidence: `crates/thedas-audio/src/area.rs:222`, `crates/thedas-app/src/audio.rs:1579`. Size: S. Depends: none. Kind: provisional.
 - **AUD-038** **Audio-volume triggers act only as reverb triggers.** Original: `CCTriggerAudioVolume` (type 4, loader 0x79a5d0) subclasses the reverb trigger. Ours: type 4 sets reverb and weighs 0.15 in the starting preset; any other behaviour of the subclass is not traced. Evidence: `crates/thedas-audio/src/area.rs:74`. Size: M. Depends: none. Kind: unverified.
 - **AUD-039** **Occlusion and obstruction.** Original: occlusion. Ours: no code found. Evidence: `crates/thedas-audio/src/engine.rs:837`. Size: L. Depends: AUD-004. Kind: missing.
