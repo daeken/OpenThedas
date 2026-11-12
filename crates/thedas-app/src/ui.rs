@@ -1884,6 +1884,34 @@ impl UiLayer {
     }
 }
 
+/// A screen's `GUI_*` id (script.ldf's `EVENT_TYPE_GUI_OPENED` constants), the inventory on a
+/// container as `GUI_CONTAINER_INVENTORY`. None for screens script.ldf names no id for.
+fn gui_id(s: Screen, container: bool) -> Option<i32> {
+    Some(match s {
+        Screen::CharacterRecord => 0,
+        Screen::CharGen => 1,
+        Screen::Inventory if container => 2,
+        Screen::Conversation => 4,
+        Screen::Cutscene => 5,
+        Screen::Hud => 7,
+        Screen::Inventory => 8,
+        Screen::Journal => 9,
+        Screen::SpellsTalents => 10,
+        Screen::Skills => 13,
+        Screen::AreaMap => 15,
+        Screen::WorldMap => 16,
+        Screen::Options => 17,
+        Screen::StartMenu => 18,
+        Screen::Death => 19,
+        Screen::GameMenu => 20,
+        Screen::SaveLoad => 21,
+        Screen::Chanters => 22,
+        Screen::Tactics => 23,
+        Screen::PartyPicker => 27,
+        Screen::Store | Screen::LevelUp | Screen::ItemExamine => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1915,32 +1943,4 @@ mod tests {
         assert!(clock.due(vec![(1, 8), (2, 9)], 1.0));
         assert_ne!(PortraitClock::name(1, 1), PortraitClock::name(1, 2));
     }
-}
-
-/// A screen's `GUI_*` id (script.ldf's `EVENT_TYPE_GUI_OPENED` constants), the inventory on a
-/// container as `GUI_CONTAINER_INVENTORY`. None for screens script.ldf names no id for.
-fn gui_id(s: Screen, container: bool) -> Option<i32> {
-    Some(match s {
-        Screen::CharacterRecord => 0,
-        Screen::CharGen => 1,
-        Screen::Inventory if container => 2,
-        Screen::Conversation => 4,
-        Screen::Cutscene => 5,
-        Screen::Hud => 7,
-        Screen::Inventory => 8,
-        Screen::Journal => 9,
-        Screen::SpellsTalents => 10,
-        Screen::Skills => 13,
-        Screen::AreaMap => 15,
-        Screen::WorldMap => 16,
-        Screen::Options => 17,
-        Screen::StartMenu => 18,
-        Screen::Death => 19,
-        Screen::GameMenu => 20,
-        Screen::SaveLoad => 21,
-        Screen::Chanters => 22,
-        Screen::Tactics => 23,
-        Screen::PartyPicker => 27,
-        Screen::Store | Screen::LevelUp | Screen::ItemExamine => return None,
-    })
 }
