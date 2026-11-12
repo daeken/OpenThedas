@@ -1936,10 +1936,22 @@ pub fn call(
         }
         "GetEffects" => {
             let f = EffectFilter::new(int(a, 1), int(a, 2), obj(a, 3), int(a, 4));
-            let list: Vec<Effect> = h
-                .object(obj(a, 0))
+            let target = obj(a, 0);
+            let mut list: Vec<Effect> = h
+                .object(target)
                 .map(|o| o.effects.iter().filter(|e| f.matches(e)).cloned().collect())
                 .unwrap_or_default();
+            // An area's effects include the visual effects applied at its places.
+            if h.object(target).is_some_and(|o| o.kind == ObjectKind::Area) {
+                list.extend(
+                    h.sim
+                        .world
+                        .location_vfx
+                        .iter()
+                        .filter(|v| v.area == target && f.matches(&v.effect))
+                        .map(|v| v.effect.clone()),
+                );
+            }
             let items = list
                 .into_iter()
                 .map(|e| Value::Engine {
@@ -1954,7 +1966,12 @@ pub fn call(
         }
         "RemoveEffect" => {
             if let Some(EngineData::Effect(e)) = h.sim.world.handle(handle(a, 1)).cloned() {
-                h.sim.remove_effect(obj(a, 0), &e);
+                let target = obj(a, 0);
+                h.sim
+                    .world
+                    .location_vfx
+                    .retain(|v| !(v.area == target && v.effect.id == e.id && e.id != 0));
+                h.sim.remove_effect(target, &e);
             }
             void()
         }
@@ -2407,6 +2424,37 @@ pub fn call(
             // A visual effect at a location (EffectVisualEffect, type 4 in effects.gda) is
             // presentation; anything else there (an area of effect, which the simulation
             // does not hold yet) is a placeholder, counted for coverage.
+            // A visual effect is kept for rendering to draw (`World::location_vfx`).
+            if name == "Engine_ApplyEffectAtLocation" && effect == Some(4) {
+                let at = match h.sim.world.handle(handle(a, 2)) {
+                    Some(EngineData::Location(l)) => Some(*l),
+                    _ => None,
+                };
+                let applied =
+                    applied_effect(h, handle(a, 1), int(a, 0), float(a, 3), obj(a, 4), None);
+                if let (Some(l), Some(mut e)) = (at, applied) {
+                    let instant = constant(&h.sim.table, "EFFECT_DURATION_TYPE_INSTANT");
+                    if e.duration_type != instant {
+                        h.sim.world.next_vfx += 1;
+                        let handle = h.sim.world.next_vfx;
+                        if e.id == 0 {
+                            e.id = (handle as i32).saturating_add(1_000_000);
+                        }
+                        let now = h.sim.world.time_ms;
+                        let entry = crate::world::LocationVfx {
+                            handle,
+                            vfx: e.ints.first().copied().unwrap_or(0),
+                            area: l.area,
+                            position: l.position,
+                            facing: l.facing,
+                            started_ms: now,
+                            duration_ms: e.expires.map(|x| x.saturating_sub(now)),
+                            effect: e,
+                        };
+                        h.sim.world.location_vfx.push(entry);
+                    }
+                }
+            }
             if name == "Engine_ApplyEffectAtLocation" {
                 let tally = if effect == Some(4) {
                     &mut h.sim.world.trace.presentation
@@ -5813,7 +5861,10 @@ mod coverage_tests {
         void PlayMusic(string s) = 107;\n\
         void DestroyObject(object o, int n = 0) = 108;\n\
         void SetSoundSet(object o, string s) = 109;\n\
-        void SetMusicIntensity(int n) = 110;\n";
+        void SetMusicIntensity(int n) = 110;\n\
+        void Engine_ApplyEffectAtLocation(int d, effect e, location l, float f = 0.0, object c = OBJECT_INVALID, int n = 0) = 111;\n\
+        effect[] GetEffects(object o, int t = 0, int a = 0, object c = OBJECT_INVALID, int d = 0, int i = -1) = 112;\n\
+        void RemoveEffect(object o, effect e) = 113;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -5837,6 +5888,72 @@ mod coverage_tests {
             ty: s.types.effect,
             handle: Some(hd),
         }
+    }
+
+    #[test]
+    fn visual_effects_at_places_are_kept_until_they_end_or_are_removed() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.get_mut(hero).unwrap().area = Some(area);
+        let vfx = |s: &mut Sim, row: i32| {
+            effect_value(
+                s,
+                Effect {
+                    ty: 4,
+                    ints: vec![row],
+                    ..Default::default()
+                },
+            )
+        };
+        let place = |s: &mut Sim, x: f32| {
+            let hd = s.world.store(EngineData::Location(crate::world::Location {
+                area,
+                position: [x, 0.0, 0.0],
+                facing: 90.0,
+            }));
+            Value::Engine {
+                ty: s.types.location,
+                handle: Some(hd),
+            }
+        };
+        let (crowd, flash) = (vfx(&mut s, 1234), vfx(&mut s, 77));
+        let (here, there) = (place(&mut s, 1.0), place(&mut s, 2.0));
+        // A permanent crowd and a two-second flash.
+        run(
+            &mut s,
+            hero,
+            "Engine_ApplyEffectAtLocation",
+            &[Value::Int(3), crowd, here, Value::Float(0.0)],
+        );
+        run(
+            &mut s,
+            hero,
+            "Engine_ApplyEffectAtLocation",
+            &[Value::Int(2), flash, there, Value::Float(2.0)],
+        );
+        let v = &s.world.location_vfx;
+        assert_eq!(v.len(), 2);
+        assert_eq!(
+            (v[0].vfx, v[0].position, v[0].facing, v[0].duration_ms),
+            (1234, [1.0, 0.0, 0.0], 90.0, None)
+        );
+        assert_eq!((v[1].vfx, v[1].duration_ms), (77, Some(2000)));
+        s.tick(2500);
+        assert_eq!(s.world.location_vfx.len(), 1, "the flash has run out");
+        // The area's effects list it, and removing it from the area takes it away.
+        let found = match run(&mut s, hero, "GetEffects", &[Value::Object(area)]) {
+            Some(Value::Array { items, .. }) => items,
+            v => panic!("{v:?}"),
+        };
+        assert_eq!(found.len(), 1);
+        run(
+            &mut s,
+            hero,
+            "RemoveEffect",
+            &[Value::Object(area), found[0].clone()],
+        );
+        assert!(s.world.location_vfx.is_empty());
     }
 
     #[test]

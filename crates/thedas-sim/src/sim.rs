@@ -700,6 +700,11 @@ impl Sim {
         };
         let start = self.world.time_ms;
         let mut until = start + ms;
+        // Visual effects at places that run their time out during this tick go.
+        let end = until;
+        self.world
+            .location_vfx
+            .retain(|v| v.duration_ms.is_none_or(|d| v.started_ms + d > end));
         self.update_perception();
         self.keep_party_together();
         let mut held = 0;
