@@ -346,16 +346,24 @@ impl Sim {
         if !self.party_backpack().contains(&item) && self.wearer(item).is_none() {
             return false;
         }
-        // Whoever wore it takes it off, and what `who` wore in the slot comes off.
+        // Whoever wore it takes it off, and what `who` wore in the slot comes off. Each is
+        // an unequip like any other: DAOrigins.exe's equip routine (0x6bc7f0) calls its
+        // unequip routine (0x6b7690) for them, which is where a party member's
+        // `EVENT_TYPE_TRAINING_ITEM_UNEQUIPPED` (1070) is raised (0x6b7886), so a swap ends
+        // the inventory lesson's unequip step too.
         if let Some(m) = self.wearer(item) {
-            self.unequip(m, item);
+            if party.contains(&m) {
+                self.unequip_item(m, item);
+            } else {
+                self.unequip(m, item);
+            }
         }
         if let Some(old) = self
             .world
             .get(who)
             .and_then(|o| o.equipment.get(&slot).copied())
         {
-            self.unequip(who, old);
+            self.unequip_item(who, old);
         }
         for m in party {
             if m != who {
@@ -1173,7 +1181,10 @@ mod screen_tests {
     /// A hero and a follower, a sword and a spare sword (base type 2, main hand: slot 0),
     /// and a pelt that fits no slot.
     fn party() -> (Sim, ObjectId, ObjectId, [ObjectId; 3]) {
-        let table = EngineTable::parse(b"int INVENTORY_SLOT_INVALID = 255;\n").unwrap();
+        let table = EngineTable::parse(
+            b"int INVENTORY_SLOT_INVALID = 255;\nint EVENT_TYPE_TRAINING_ITEM_UNEQUIPPED = 1070;\n",
+        )
+        .unwrap();
         let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
         s.world.tables().insert(
             "bitm_base",
@@ -1239,8 +1250,17 @@ mod screen_tests {
         let (mut s, hero, ally, [sword, spare, pelt]) = party();
         // Not a slot the pelt fits.
         assert!(!s.equip_item(hero, pelt, 0));
-        // Into the occupied main hand: the sword goes to the backpack.
+        // Into the occupied main hand: the sword goes to the backpack. The item displaced
+        // counts as unequipped for the inventory lesson (slot 0 here).
+        let m = s.world.spawn(ObjectKind::Module, "module");
+        s.world.module = Some(m);
+        s.world.training.mode = 5;
+        s.world.training.expected = 1070;
+        s.world.training.arg = 0;
         assert!(s.equip_item(hero, spare, 0));
+        assert!(s.world.queue.values().any(|q| q.event.ty == 1070));
+        assert_eq!(s.world.training.expected, 0);
+        s.world.training = Default::default();
         assert_eq!(s.world.get(hero).unwrap().equipment.get(&0), Some(&spare));
         assert!(s.party_backpack().contains(&sword));
         // Onto the ally, wherever it fits (slot 0 is free there).
