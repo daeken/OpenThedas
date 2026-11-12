@@ -45,6 +45,7 @@
 //! running game: the same steps as `--steps`, screenshots and the simulation's state (see
 //! [`control`]).
 
+mod audio;
 mod chargen_stage;
 mod control;
 mod cutcam;
@@ -201,6 +202,16 @@ struct Args {
     /// Booting to the start menu: skip the logo and intro movies the game plays first.
     #[arg(long)]
     no_intro: bool,
+    /// No sound. Sound is also off with `--control` (clients driving the game headless or
+    /// unattended) unless `--audio` asks for it, and when THEDAS_NO_AUDIO is set.
+    #[arg(long)]
+    no_audio: bool,
+    /// Sound even with `--control`.
+    #[arg(long)]
+    audio: bool,
+    /// The voice-over language folder (`audio/vo/<language>`).
+    #[arg(long, default_value = "en-us")]
+    language: String,
 }
 
 /// Behind and above a hero at `pos` with the game's `facing`, looking the same way (as the
@@ -528,6 +539,8 @@ struct App {
     requests: Vec<ui::FrontEnd>,
     /// The boot movies, while they play (before the start menu takes input).
     intro: Option<intro::Intro>,
+    /// Music, interface sounds and voice-over (none with `--no-audio` or no output device).
+    audio: Option<audio::GameAudio>,
     /// The pad's skip buttons were held last frame (a skip is a fresh press).
     intro_pad_held: bool,
 }
@@ -945,6 +958,7 @@ impl App {
     }
 
     fn redraw(&mut self) -> Result<()> {
+        self.audio_frame();
         if self.intro.is_some() {
             return self.intro_frame();
         }
@@ -1093,6 +1107,43 @@ impl App {
         g.window.pre_present_notify();
         g.ctx.queue.present(frame);
         Ok(())
+    }
+
+    /// The sound follows the game: the menus' music, the interface's sounds, the open
+    /// conversation line's voice (see [`audio`]).
+    fn audio_frame(&mut self) {
+        let Some(a) = self.audio.as_mut() else {
+            return;
+        };
+        let mut state = audio::AudioState::default();
+        if let Some(g) = self.gfx.as_mut() {
+            state.gui_sounds = g.ui.stage.bridge.drain_sounds();
+            state.volumes = audio::volumes(|n| g.ui.client_option(n));
+        }
+        if self.intro.is_none()
+            && let Some(live) = self.live.as_ref()
+        {
+            let sim = live.sim();
+            state.front_end = live.front_end;
+            state.chargen = sim.world.chargen.is_some();
+            state.line = sim.conversation_line().and_then(|l| {
+                let female = sim
+                    .world
+                    .get(l.player)
+                    .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
+                Some(audio::VoiceLine {
+                    dialog: l.dialog.to_string(),
+                    strref: l.strref?,
+                    female,
+                    ambient: l.ambient,
+                })
+            });
+        }
+        a.frame(state);
+        let voice = a.voice_ms();
+        if let Some(g) = self.gfx.as_mut() {
+            g.ui.set_line_voice_ms(voice);
+        }
     }
 
     /// A frame with nothing to draw into: the simulation, its presentation and the interface
@@ -3056,6 +3107,7 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::new()?;
     let screens = (live.is_some() && ui.is_empty())
         .then(|| screens::Screens::new(live.as_ref().is_some_and(|l| l.front_end)));
+    let loaded_vfs = loaded.vfs.clone();
     let mut app = App {
         loaded,
         live,
@@ -3091,6 +3143,17 @@ fn main() -> Result<()> {
             .then(|| intro::Intro::boot(&install))
             .flatten(),
         intro_pad_held: false,
+        audio: {
+            let off = args.no_audio
+                || std::env::var_os("THEDAS_NO_AUDIO").is_some()
+                || (args.control.is_some() && !args.audio);
+            if off {
+                log::info!("audio: off");
+                None
+            } else {
+                audio::GameAudio::open(&install, &loaded_vfs, &args.language)
+            }
+        },
     };
     for line in pad::describe() {
         log::debug!("pad binding: {line}");

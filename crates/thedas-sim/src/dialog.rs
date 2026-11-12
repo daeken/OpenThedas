@@ -188,6 +188,10 @@ pub struct OpenLine<'a> {
     pub player: ObjectId,
     /// Whether the player has replies to choose among (not only an unspoken continue).
     pub choosing: bool,
+    /// The shown line's talk-table reference: its voice-over is the sample named after it.
+    pub strref: Option<u32>,
+    /// The shown line is ambient (said in passing).
+    pub ambient: bool,
 }
 
 /// What a conversation looks like to a player: the current line and the choices.
@@ -435,9 +439,12 @@ impl Sim {
     /// The open conversation, for presentation.
     pub fn conversation_line(&self) -> Option<OpenLine<'_>> {
         let c = self.talk.as_ref().filter(|c| !c.ended)?;
+        let node = c.line.and_then(|l| c.dlg.nodes.get(l));
         Some(OpenLine {
             dialog: c.dlg.name.as_str(),
             line: c.line,
+            strref: node.and_then(|n| n.strref),
+            ambient: node.is_some_and(|n| n.ambient),
             owner: c.owner,
             player: c.player,
             choosing: c

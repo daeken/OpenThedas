@@ -24,6 +24,11 @@
 //! - [`anim`]: animation trees (`.anb`), animation lengths (`.gad`) and events (`.evt`).
 //! - [`speedtree`]: SpeedTree 4 tree descriptions (`.spt`) for level vegetation.
 //!
+//! Audio:
+//!
+//! - [`fev`]: FMOD Designer event files: the events the game plays and what they play.
+//! - [`fsb`]: FMOD sound banks (FSB4), the waveforms behind the game's sound events.
+//!
 //! Interface:
 //!
 //! - [`gfx`]: Scaleform GFx movies (SWF with Scaleform tags), with a rewriter to plain SWF.
@@ -32,6 +37,8 @@ pub mod anim;
 pub mod area;
 pub mod dds;
 pub mod emitter;
+pub mod fev;
+pub mod fsb;
 pub mod gda;
 pub mod gff3;
 pub mod gff4;

@@ -1,0 +1,21 @@
+[package]
+name = "thedas-audio"
+description = "OpenThedas audio: FMOD bank decoding, the mixer and the output device"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["device"]
+# Play through the system's audio output (cpal). Without it the mixer only renders to buffers.
+device = ["dep:cpal"]
+
+[dependencies]
+thedas-formats.workspace = true
+thiserror.workspace = true
+log.workspace = true
+symphonia-core = "0.5"
+symphonia-bundle-mp3 = { version = "0.5", default-features = false, features = ["mp3"] }
+cpal = { version = "0.16", optional = true }

@@ -1,5 +1,6 @@
 //! `thedas`: command-line tools for inspecting and validating Dragon Age: Origins data.
 
+mod audio;
 mod autoplay;
 mod corpus;
 mod dump;
@@ -184,6 +185,50 @@ enum Command {
         #[arg(long)]
         route: Option<String>,
     },
+    /// List an FMOD sound bank (`.fsb`), decode its samples to WAV, or check that every
+    /// sample of the banks under a folder decodes.
+    Fsb {
+        /// A bank, or (with --check) a folder searched for banks.
+        path: PathBuf,
+        /// Decode samples to WAV files in this folder.
+        #[arg(long)]
+        wav: Option<PathBuf>,
+        /// Only these samples (by name, with or without `.wav`).
+        #[arg(long)]
+        sample: Vec<String>,
+        /// Decode every sample of every bank and report failures and length mismatches.
+        #[arg(long)]
+        check: bool,
+    },
+    /// List an FMOD event file's (`.fev`) events and what they play, or (with --check) parse
+    /// every event file under a folder.
+    Fev {
+        /// An event file, or (with --check) a folder searched for them.
+        path: PathBuf,
+        /// Only events whose path contains this.
+        #[arg(long)]
+        filter: Option<String>,
+        #[arg(long)]
+        check: bool,
+    },
+    /// Play FMOD events offline, as the game would, and write the mix to a WAV file. Each
+    /// event is `path` or `path@seconds` (start time) with optional `:programmer_sound`.
+    Play {
+        install: PathBuf,
+        events: Vec<String>,
+        #[arg(long, default_value_t = 10.0)]
+        seconds: f32,
+        #[arg(long, default_value = "play.wav")]
+        out: PathBuf,
+        /// Stop every event (with its fade-out) at this time.
+        #[arg(long)]
+        stop_at: Option<f32>,
+        #[arg(long, default_value = "en-us")]
+        language: String,
+        /// Mix rate.
+        #[arg(long, default_value_t = 48000)]
+        rate: u32,
+    },
     /// Open every archive in an install and parse every GFF4-family resource.
     Corpus {
         /// Install roots or individual archives.
@@ -246,6 +291,26 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Ls { archive } => ls(&archive),
+        Command::Play {
+            install,
+            events,
+            seconds,
+            out,
+            stop_at,
+            language,
+            rate,
+        } => audio::play(&install, &events, seconds, &out, stop_at, &language, rate),
+        Command::Fev {
+            path,
+            filter,
+            check,
+        } => audio::fev(&path, filter.as_deref(), check),
+        Command::Fsb {
+            path,
+            wav,
+            sample,
+            check,
+        } => audio::fsb(&path, wav.as_deref(), &sample, check),
         Command::Extract {
             archive,
             names,
