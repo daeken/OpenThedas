@@ -22,6 +22,14 @@ pub struct SaveMeta {
     /// When the file was written (seconds since the Unix epoch), for the list's order and
     /// its "last played".
     pub written: u64,
+    /// The hero's name, level and class (`properties.gda` CurrentClass), which the load
+    /// screen shows before a game is running.
+    #[serde(default)]
+    pub hero: String,
+    #[serde(default)]
+    pub level: i32,
+    #[serde(default)]
+    pub class: i32,
 }
 
 pub struct SaveStore {
@@ -71,6 +79,9 @@ impl SaveStore {
                         area: meta.area,
                         time_played_s: meta.time_ms / 1000,
                         last_played: format_time(meta.written),
+                        hero: meta.hero,
+                        level: meta.level,
+                        class: meta.class,
                     },
                 ))
             })
@@ -152,6 +163,7 @@ mod tests {
             area: "Lothering".into(),
             time_ms: 125_000,
             written,
+            ..Default::default()
         };
         store.write(1, b"one", &meta("first", 100)).unwrap();
         store.write(2, b"two", &meta("second", 200)).unwrap();
