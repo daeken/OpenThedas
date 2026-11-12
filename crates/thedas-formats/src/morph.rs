@@ -466,6 +466,11 @@ pub struct FaceOverlay {
     /// Morph target weights replacing the face preset's (the face-shape sliders):
     /// (target, weight).
     pub targets: Vec<(String, f32)>,
+    /// Material scalars set on a node, as a preset's are (node, parameter, component index,
+    /// value): the makeup intensities.
+    pub scalars: Vec<(String, String, i64, f32)>,
+    /// Material textures set on a node (node, parameter, texture): the complexion.
+    pub textures: Vec<(String, String, String)>,
 }
 
 /// The material parameter tints fill.
@@ -476,7 +481,11 @@ const MAX_OVERLAY_SLOT: usize = 32;
 
 impl FaceOverlay {
     pub fn is_empty(&self) -> bool {
-        self.models.is_empty() && self.tints.is_empty() && self.targets.is_empty()
+        self.models.is_empty()
+            && self.tints.is_empty()
+            && self.targets.is_empty()
+            && self.scalars.is_empty()
+            && self.textures.is_empty()
     }
 
     /// `base` with the overlay after it (just `base` when empty).
@@ -490,6 +499,12 @@ impl FaceOverlay {
         for (t, w) in &self.targets {
             s.push_str(&format!("|w{t}={w}"));
         }
+        for (n, p, i, v) in &self.scalars {
+            s.push_str(&format!("|s{n}:{p}:{i}={v}"));
+        }
+        for (n, p, t) in &self.textures {
+            s.push_str(&format!("|x{n}:{p}={t}"));
+        }
         s
     }
 
@@ -502,6 +517,28 @@ impl FaceOverlay {
             let Some((key, value)) = p.split_once('=') else {
                 continue;
             };
+            if let Some(rest) = key.strip_prefix('s') {
+                let mut f = rest.split(':');
+                if let (Some(n), Some(p), Some(i), Ok(v)) =
+                    (f.next(), f.next(), f.next(), value.trim().parse::<f32>())
+                {
+                    if let Ok(i) = i.parse::<i64>() {
+                        if v.is_finite() && (0..MAX_PARAM_INDEX * 4).contains(&i) {
+                            o.scalars.push((n.to_string(), p.to_string(), i, v));
+                        }
+                    }
+                }
+                continue;
+            }
+            if let Some(rest) = key.strip_prefix('x') {
+                if let Some((n, p)) = rest.split_once(':') {
+                    let t = value.trim().to_ascii_lowercase();
+                    if !n.is_empty() && !p.is_empty() && !t.is_empty() {
+                        o.textures.push((n.to_string(), p.to_string(), t));
+                    }
+                }
+                continue;
+            }
             if let Some(target) = key.strip_prefix('w') {
                 if let Ok(w) = value.trim().parse::<f32>() {
                     if w.is_finite() && !target.is_empty() {
@@ -604,9 +641,15 @@ impl Morph {
         m
     }
 
-    /// `self` with an overlay's model and tint slots put in.
+    /// `self` with an overlay's model and tint slots put in, and its material scalars and
+    /// textures set as a preset's are.
     pub fn with_overlay(&self, o: &FaceOverlay) -> Morph {
-        let mut m = self.clone();
+        let params = MorphPreset {
+            scalars: o.scalars.clone(),
+            textures: o.textures.clone(),
+            ..Default::default()
+        };
+        let mut m = self.with_preset(&params);
         for (list, slots) in [(&mut m.models, &o.models), (&mut m.tints, &o.tints)] {
             for (slot, v) in slots {
                 if list.len() <= *slot {
@@ -713,11 +756,18 @@ mod tests {
             models: vec![(2, Some("hm_har_ha1a_0".into())), (3, None)],
             tints: vec![(3, Some("t3_har_bln".into()))],
             targets: vec![("UH_NOS_07a_0".into(), 0.5)],
+            scalars: vec![("FaceM1".into(), "mml_vTintMaskColours".into(), 2, 0.25)],
+            textures: vec![(
+                "FaceM1".into(),
+                "mml_tDiffuse".into(),
+                "uh_hed_elfa_0d".into(),
+            )],
         };
         let name = o.name("hm_cps_p01");
         assert_eq!(
             name,
-            "hm_cps_p01|m2=hm_har_ha1a_0|m3=|t3=t3_har_bln|wUH_NOS_07a_0=0.5"
+            "hm_cps_p01|m2=hm_har_ha1a_0|m3=|t3=t3_har_bln|wUH_NOS_07a_0=0.5\
+             |sFaceM1:mml_vTintMaskColours:2=0.25|xFaceM1:mml_tDiffuse=uh_hed_elfa_0d"
         );
         let (base, back) = FaceOverlay::split(&name);
         assert_eq!((base, &back), ("hm_cps_p01", &o));
@@ -726,7 +776,7 @@ mod tests {
             ("hm_cps_p01", FaceOverlay::default())
         );
         // Bad parts are skipped.
-        let (_, bad) = FaceOverlay::split("x|q1=a|m=b|m99=c|t1|wX=nan|w=1");
+        let (_, bad) = FaceOverlay::split("x|q1=a|m=b|m99=c|t1|wX=nan|w=1|sA:b=1|sA:b:z=1|xA=b");
         assert!(bad.is_empty());
         let m = Morph {
             models: vec![
@@ -743,6 +793,9 @@ mod tests {
         assert_eq!(m.model(slot::BEARD), None);
         assert_eq!(m.tints[3].as_deref(), Some("t3_har_bln"));
         assert_eq!(m.tints[0].as_deref(), Some("skin"));
+        let face = m.node("FaceM1").unwrap();
+        assert_eq!(face.vectors[0].1[0][2], 0.25);
+        assert_eq!(face.textures[0].1, "uh_hed_elfa_0d");
     }
 
     #[test]

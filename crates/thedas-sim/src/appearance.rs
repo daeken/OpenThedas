@@ -4,10 +4,11 @@
 //! groups and ranges are the interface's (`thedas_ui`).
 //!
 //! What a choice does to the face: the preset puts that head on; hair and beard put their
-//! models in the morph's slots; the colours put their tints in its tint slots. Provisional:
-//! the face-shape sliders weigh their morph targets (the exe's pairs, read back at 0x805f40,
-//! and its per-race scales at 0x7fdd00). Provisional: the makeup intensities, tattoos,
-//! complexion and the eye and nose shape lists are kept but not yet put on the face.
+//! models in the morph's slots; the colours put their tints in its tint slots; the
+//! face-shape sliders weigh their morph targets (the exe's pairs, read back at 0x805f40,
+//! and its per-race scales at 0x7fdd00); the makeup intensities set the face's tint
+//! opacities and the complexion its diffuse texture. Provisional: tattoos are kept but not
+//! yet put on the face.
 
 use thedas_formats::morph::{FaceOverlay, slot};
 use thedas_script::vm::ObjectId;
@@ -33,6 +34,11 @@ pub const LIP_COLOR: u32 = 48;
 pub const EYE_SHADOW_COLOR: u32 = 8;
 pub const EYE_COLOR: u32 = 7;
 pub const BROW_COLOR: u32 = 39;
+/// The makeup intensity sliders and the complexion.
+pub const LIP_INTENSITY: u32 = 49;
+pub const EYE_SHADOW_INTENSITY: u32 = 9;
+pub const BLUSH_INTENSITY: u32 = 47;
+pub const COMPLEXION: u32 = 44;
 
 /// The face-shape sliders' morph targets (slider id, the target its negative side
 /// weighs, the one its positive side weighs; one target: the slider weighs it alone).
@@ -290,6 +296,161 @@ pub const FACE_SCALES: [[(f32, f32); 34]; 6] = [
     ],
 ];
 
+/// Eye Shape's choices per race and gender (rows as [`FACE_SCALES`]): the head's and the
+/// lashes' target and its weight (the exe's table at 0x7fe330). The slider's 0 is none, 1 to
+/// 4 these (its apply at 0x808cc7 clears all four, then weighs the one chosen).
+pub const EYE_SHAPES: [[(&str, &str, f32); 4]; 6] = [
+    [
+        ("UHM_CHM_09a_0", "ULM_CHM_09a_0", 1.0),
+        ("UHM_CHM_10a_0", "ULM_CHM_10a_0", 1.0),
+        ("UHM_CHM_11a_0", "ULM_CHM_11a_0", 1.0),
+        ("UHM_CHM_12a_0", "ULM_CHM_12a_0", 0.8),
+    ],
+    [
+        ("UHM_CHF_07a_0", "ULM_CHF_07a_0", 0.7),
+        ("UHM_CHF_08a_0", "ULM_CHF_08a_0", 1.0),
+        ("UHM_CHF_09a_0", "ULM_CHF_09a_0", 0.7),
+        ("UHM_CHF_10a_0", "ULM_CHF_10a_0", 0.8),
+    ],
+    [
+        ("UHM_CDM_02a_0", "ULM_CDM_02a_0", 0.6),
+        ("UHM_CDM_03a_0", "ULM_CDM_03a_0", 0.8),
+        ("UHM_CDM_04a_0", "ULM_CDM_04a_0", 0.8),
+        ("UHM_CDM_05a_0", "ULM_CDM_05a_0", 0.6),
+    ],
+    [
+        ("UHM_CDF_02a_0", "ULM_CDF_02a_0", 0.6),
+        ("UHM_CDF_03a_0", "ULM_CDF_03a_0", 0.7),
+        ("UHM_CDF_04a_0", "ULM_CDF_04a_0", 0.6),
+        ("UHM_CDF_05a_0", "ULM_CDF_05a_0", 0.7),
+    ],
+    [
+        ("UHM_CEM_03a_0", "ULM_CEM_03a_0", 0.7),
+        ("UHM_CEM_04a_0", "ULM_CEM_04a_0", 0.7),
+        ("UHM_CEM_05a_0", "ULM_CEM_05a_0", 0.8),
+        ("UHM_CEM_06a_0", "ULM_CEM_06a_0", 0.7),
+    ],
+    [
+        ("UHM_CEF_02a_0", "ULM_CEF_02a_0", 0.7),
+        ("UHM_CEF_03a_0", "ULM_CEF_03a_0", 0.8),
+        ("UHM_CEF_04a_0", "ULM_CEF_04a_0", 0.8),
+        ("UHM_CEF_05a_0", "ULM_CEF_05a_0", 0.6),
+    ],
+];
+
+/// Nose Shape's choices per race and gender (the exe's table at 0x7fe650, its counts at
+/// 0x7fe610): the target and its weight. The slider's 0 is none, 1 on these (its apply at
+/// 0x809734). Provisional: some weights were read through an emulated x87 stack.
+pub const NOSE_SHAPES: [&[(&str, f32)]; 6] = [
+    &[
+        ("UH_CHM_04a_0", 0.8),
+        ("UH_CHM_02a_0", 0.8),
+        ("UH_CHM_01a_0", 0.8),
+        ("UH_CHM_03a_0", 0.8),
+        ("UH_CHM_05a_0", 1.0),
+        ("UH_CHM_06a_0", 1.0),
+    ],
+    &[
+        ("UH_CHF_02a_0", 0.9),
+        ("UH_CHF_04a_0", 0.7),
+        ("UH_CHF_01a_0", 0.8),
+        ("UH_CHF_03a_0", 0.7),
+    ],
+    &[
+        ("UH_CDM_04a_0", 0.6),
+        ("UH_CDM_03a_0", 0.8),
+        ("UH_CDM_08a_0", 0.6),
+        ("UH_CDM_09a_0", 0.7),
+        ("UH_CDM_01a_0", 1.0),
+        ("UH_CDM_02a_0", 0.7),
+    ],
+    &[
+        ("UH_CDF_06a_0", 0.1),
+        ("UH_CDF_03a_0", 0.6),
+        ("UH_CDF_05a_0", 0.5),
+        ("UH_CDF_01a_0", 0.7),
+        ("UH_CDF_01a_0", 0.5),
+        ("UH_CDF_04a_0", 0.6),
+    ],
+    &[
+        ("UH_CEM_04a_0", 0.7),
+        ("UH_CEM_03a_0", 0.8),
+        ("UH_CEM_05a_0", 0.8),
+        ("UH_CEM_02a_0", 0.8),
+        ("UH_CEM_01a_0", 0.6),
+    ],
+    &[
+        ("UH_CEF_03a_0", 0.6),
+        ("UH_CEF_02a_0", 0.7),
+        ("UH_CEF_06a_0", 0.7),
+        ("UH_CEF_01a_0", 0.8),
+        ("UH_CEF_04a_0", 0.8),
+        ("UH_CEF_05a_0", 0.8),
+    ],
+];
+
+/// Eye Shape's and Nose Shape's slider ids.
+pub const EYE_SHAPE: u32 = 10;
+pub const NOSE_SHAPE: u32 = 30;
+
+/// A shape list's choices for a race and gender row: each choice's targets and weight.
+fn shape_choices(slider: u32, row: usize) -> Vec<(Vec<&'static str>, f32)> {
+    match slider {
+        EYE_SHAPE => EYE_SHAPES
+            .get(row)
+            .map(|r| r.iter().map(|(h, l, w)| (vec![*h, *l], *w)).collect())
+            .unwrap_or_default(),
+        NOSE_SHAPE => NOSE_SHAPES
+            .get(row)
+            .map(|r| r.iter().map(|(t, w)| (vec![*t], *w)).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// How many choices a shape slider has past its 0 (none) for a race and gender row.
+pub fn shape_count(slider: u32, row: usize) -> usize {
+    shape_choices(slider, row).len()
+}
+
+/// The weights a shape slider at `v` gives: every choice's targets at 0, then the chosen
+/// one's (`v` from 1) at its weight.
+pub fn shape_weights(slider: u32, v: f32, row: usize) -> Vec<(String, f32)> {
+    let choices = shape_choices(slider, row);
+    let chosen = (v.round() as i64 - 1).max(-1);
+    let mut out = Vec::new();
+    for (i, (names, w)) in choices.iter().enumerate() {
+        for n in names {
+            let weight = if i as i64 == chosen { *w } else { 0.0 };
+            match out.iter_mut().find(|(t, _): &&mut (String, f32)| t == n) {
+                Some(e) => e.1 = e.1.max(weight),
+                None => out.push((n.to_string(), weight)),
+            }
+        }
+    }
+    out
+}
+
+/// Where a shape slider stands on a face weighing `weights`: the first choice whose
+/// target is weighed (from 1), else 0.
+pub fn shape_value(slider: u32, weights: &[(String, f32)], row: usize) -> Option<f32> {
+    let choices = shape_choices(slider, row);
+    if choices.is_empty() {
+        return None;
+    }
+    let weighed = |t: &str| {
+        weights
+            .iter()
+            .any(|(n, w)| n.eq_ignore_ascii_case(t) && *w > 0.01)
+    };
+    Some(
+        choices
+            .iter()
+            .position(|(names, _)| weighed(names[0]))
+            .map_or(0.0, |i| (i + 1) as f32),
+    )
+}
+
 /// [`FACE_SCALES`]' row for a race and gender as `chargenmorphcfg.xml` names it (the exe's
 /// 0x7fdca0: human 0 and 1, dwarf 2 and 3, elf 4 and 5, men first).
 pub fn race_gender_row(race_gender: &str) -> usize {
@@ -385,6 +546,45 @@ pub fn overlay(sim: &Sim, id: ObjectId) -> FaceOverlay {
     let row = race_gender_row(&sim.face_race_gender(id).unwrap_or_default());
     for (&slider, &v) in &obj.face_choices {
         o.targets.extend(feature_weights(slider, v, row));
+        o.targets.extend(shape_weights(slider, v, row));
+    }
+    // Makeup intensities: the face's tint opacity for that channel (the exe's setters
+    // 0x8041d0 lips, 0x803450 eye shadow, 0x8040d0 blush write FaceM1's
+    // mml_vTintMaskColours components 0, 1 and 2).
+    for (slider, index) in [
+        (LIP_INTENSITY, 0),
+        (EYE_SHADOW_INTENSITY, 1),
+        (BLUSH_INTENSITY, 2),
+    ] {
+        if let Some(&v) = obj.face_choices.get(&slider) {
+            o.scalars.push((
+                "FaceM1".into(),
+                "mml_vTintMaskColours".into(),
+                index,
+                v.clamp(0.0, 1.0),
+            ));
+        }
+    }
+    // Complexion: the face's diffuse texture (0x805800 writes FaceM1's mml_tDiffuse).
+    if let Some(&v) = obj.face_choices.get(&COMPLEXION) {
+        if let Some(t) = sim
+            .face_list(id, "skins")
+            .get(v.max(0.0).round() as usize)
+            .filter(|t| !t.is_empty())
+        {
+            o.textures
+                .push(("FaceM1".into(), "mml_tDiffuse".into(), t.clone()));
+            // Its normal map goes with it, as the presets pair them (`uh_hed_fema_0d`,
+            // `uh_hed_fema_0n.dds`). Provisional: the exe's setter's second write is not
+            // traced.
+            if let Some(stem) = t.strip_suffix("_0d") {
+                o.textures.push((
+                    "FaceM1".into(),
+                    "mml_tNormalMap".into(),
+                    format!("{stem}_0n.dds"),
+                ));
+            }
+        }
     }
     // Colours: the tint each colour slider picks, in the morph's tint slot the exe's
     // setter writes (lips 1, eyes 2, hair 3, eye shadow 4, blush 5, skin 0, brows and
@@ -440,5 +640,18 @@ mod tests {
         assert!(feature_weights(PRESET, 1.0, 0).is_empty());
         assert_eq!(race_gender_row("elf_female"), 5);
         assert_eq!(race_gender_row("human_male"), 0);
+        // Shapes: 0 is none; a choice weighs its targets and zeroes the rest.
+        let n = shape_weights(NOSE_SHAPE, 2.0, 0);
+        assert_eq!(n.len(), 6);
+        assert!(n.iter().any(|(t, w)| t == "UH_CHM_02a_0" && *w == 0.8));
+        assert!(n.iter().filter(|(_, w)| *w > 0.0).count() == 1);
+        assert_eq!(shape_value(NOSE_SHAPE, &n, 0), Some(2.0));
+        assert!(
+            shape_weights(EYE_SHAPE, 0.0, 1)
+                .iter()
+                .all(|(_, w)| *w == 0.0)
+        );
+        assert_eq!(shape_weights(EYE_SHAPE, 1.0, 1).len(), 8);
+        assert_eq!(shape_count(NOSE_SHAPE, 4), 5);
     }
 }

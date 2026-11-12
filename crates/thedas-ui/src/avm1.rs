@@ -984,6 +984,20 @@ pub const FOCUS_LIST: &str = "_global.thedas_focus_list";
 /// Provisional: Scaleform's own focus search is not traced (this is the host's stand-in for
 /// the console focus the PC movies leave half-built).
 fn focus_function() -> Vec<u8> {
+    walk_function("thedas_focus", false)
+}
+
+/// `function (c, o)`: as [`focus_function`], but every visible clip below `c` is listed
+/// (with its `_alpha` after its bounds) and searched: a debugging view of a movie's
+/// display tree (`_global.thedas_tree_list`, for the headless `call` step).
+fn tree_function() -> Vec<u8> {
+    walk_function("thedas_tree", true)
+}
+
+/// The walk behind [`focus_function`] and [`tree_function`]: `name` is the function's own
+/// `_global` name (it recurses through it); `all` lists every visible clip, not only those
+/// taking a click.
+fn walk_function(name: &str, all: bool) -> Vec<u8> {
     let mut a = Asm::default();
     get_path(&mut a.code, &["c"]);
     a.code.push(ENUMERATE2);
@@ -1012,24 +1026,18 @@ fn focus_function() -> Vec<u8> {
     get_path(&mut a.code, &["m", "_visible"]);
     a.code.push(NOT);
     a.branch(IF, "next");
-    let c = &mut a.code;
-    get_path(c, &["m", "enabled"]);
-    push(c, &[Push::Bool(false)]);
-    c.push(STRICT_EQUALS);
-    a.branch(IF, "next");
-    for h in ["onRelease", "onPress"] {
-        get_path(&mut a.code, &["m", h]);
-        a.branch(IF, "button");
+    if !all {
+        let c = &mut a.code;
+        get_path(c, &["m", "enabled"]);
+        push(c, &[Push::Bool(false)]);
+        c.push(STRICT_EQUALS);
+        a.branch(IF, "next");
+        for h in ["onRelease", "onPress"] {
+            get_path(&mut a.code, &["m", h]);
+            a.branch(IF, "button");
+        }
+        a.branch(JUMP, "recurse");
     }
-    // _global.thedas_focus(m, o);
-    let c = &mut a.code;
-    get_path(c, &["o"]);
-    get_path(c, &["m"]);
-    push(c, &[Push::Int(2)]);
-    get_path(c, &["_global"]);
-    push(c, &[Push::Str("thedas_focus")]);
-    c.extend_from_slice(&[CALL_METHOD, POP]);
-    a.branch(JUMP, "next");
     a.label("button");
     // var b = m.getBounds(_root); o.push(m + "|" + b.xMin + "|" + ... + b.yMax);
     let c = &mut a.code;
@@ -1048,9 +1056,28 @@ fn focus_function() -> Vec<u8> {
         get_path(c, &["b", f]);
         c.push(ADD2);
     }
+    if all {
+        push(c, &[Push::Str("|")]);
+        c.push(ADD2);
+        get_path(c, &["m", "_alpha"]);
+        c.push(ADD2);
+    }
     push(c, &[Push::Int(1)]);
     get_path(c, &["o"]);
     push(c, &[Push::Str("push")]);
+    c.extend_from_slice(&[CALL_METHOD, POP]);
+    if !all {
+        // A clip that takes the click is not searched further.
+        a.branch(JUMP, "next");
+    }
+    a.label("recurse");
+    // _global[name](m, o);
+    let c = &mut a.code;
+    get_path(c, &["o"]);
+    get_path(c, &["m"]);
+    push(c, &[Push::Int(2)]);
+    get_path(c, &["_global"]);
+    push(c, &[Push::Str(name)]);
     c.extend_from_slice(&[CALL_METHOD, POP]);
     a.branch(JUMP, "next");
     a.label("done");
@@ -1061,6 +1088,11 @@ fn focus_function() -> Vec<u8> {
 
 /// `function () { var o = new Array(); _global.thedas_focus(_root, o); return o.join(";"); }`
 fn focus_list_function() -> Vec<u8> {
+    list_function("thedas_focus")
+}
+
+/// The list function of a walk named `walk` (see [`walk_function`]).
+fn list_function(walk: &str) -> Vec<u8> {
     let mut c = Vec::new();
     push(&mut c, &[Push::Str("o"), Push::Int(0), Push::Str("Array")]);
     c.extend_from_slice(&[NEW_OBJECT, DEFINE_LOCAL]);
@@ -1068,7 +1100,7 @@ fn focus_list_function() -> Vec<u8> {
     get_path(&mut c, &["_root"]);
     push(&mut c, &[Push::Int(2)]);
     get_path(&mut c, &["_global"]);
-    push(&mut c, &[Push::Str("thedas_focus")]);
+    push(&mut c, &[Push::Str(walk)]);
     c.extend_from_slice(&[CALL_METHOD, POP]);
     push(&mut c, &[Push::Str(";"), Push::Int(1)]);
     get_path(&mut c, &["o"]);
@@ -1590,6 +1622,8 @@ pub fn register_invoke() -> Vec<u8> {
     for (name, f) in [
         ("thedas_focus", focus_function()),
         ("thedas_focus_list", focus_list_function()),
+        ("thedas_tree", tree_function()),
+        ("thedas_tree_list", list_function("thedas_tree")),
     ] {
         get_path(&mut out, &["_global"]);
         push(&mut out, &[Push::Str(name)]);

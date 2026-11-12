@@ -249,9 +249,15 @@ impl Sim {
             let alive = self.alive(id);
             // A creature notices others within its perception range (see
             // `Sim::perception_range`) and keeps track of those it has noticed out to the
-            // visual radius. Closed doors block sight, and a wall of the pathing grid blocks
-            // noticing. Provisional: the grid, the only geometry the simulation has, marks
-            // large furniture and rubble the same way as walls, so those block too.
+            // visual radius. DAOrigins.exe's perception update (0x6b89b0, from each
+            // creature's tick at 0x6be7a4) notices a creature that is not hostile on range
+            // alone (0x6b8873); only a hostile one needs a clear line of sight, a ray through
+            // the level's collision from 1.8 m above each one's feet (0xb004d8; 0x67c530).
+            // Keeping track (0x6a8d60) tests no sight, out to 60 m (0xadef18).
+            // Provisional: closed doors stand in for the exe's room visibility for everyone,
+            // and a wall of the pathing grid for the collision ray; the grid, the only geometry
+            // the simulation has, marks large furniture and rubble the same way as walls, so
+            // those block hostiles too.
             let ring = self.perception_range(id);
             let seen = self
                 .world
@@ -270,7 +276,7 @@ impl Sim {
                         if tracked {
                             d <= VISUAL_RANGE && !blocked(pos, p)
                         } else {
-                            d <= ring && !blocked(pos, p) && !wall(pos, p)
+                            d <= ring && !blocked(pos, p) && (!self.hostile(id, o) || !wall(pos, p))
                         }
                     })
                     .map(|&(o, _)| o)
@@ -337,15 +343,18 @@ impl Sim {
         self.update_game_mode();
     }
 
-    /// Switches between `GM_EXPLORE` and `GM_COMBAT` as the party starts or stops seeing
-    /// living hostiles, telling the module (`GAMEMODE_CHANGE`: new mode, old mode). Other
-    /// modes (conversation, cutscene) are left alone. Provisional.
+    /// Keeps the harness's view of the fight (`World::party_fighting`: a standing party
+    /// member perceives a living hostile) and its game-over flag. It does not change the game
+    /// mode: in DAOrigins.exe the scripts do. rules_core asks the module for `GM_COMBAT`
+    /// (event 1021, module_core calls `SetGameMode`) when a follower perceives a hostile or
+    /// is attacked; player_core's perception-disappear handler starts the module's end-of-
+    /// fight check (event 2000, after 3 s), which gets fallen members up and returns to
+    /// `GM_EXPLORE`; player_core's death handler asks for `GM_DEAD` when the whole party has
+    /// fallen. The engine only applies the change (`SetGameMode`, 0x65e4e0 -> 0x6414a0, the
+    /// module told with `GAMEMODE_CHANGE` at 0x641e72-0x641f77) and sends
+    /// `EVENT_TYPE_DEATH_RES_PARTY` only from the death screen (0x76e400). See
+    /// OpenThedas-testdata/notes/combat-mode-trace.md.
     pub fn update_game_mode(&mut self) {
-        let (explore, combat) = (
-            constant_of(self, "GM_EXPLORE"),
-            constant_of(self, "GM_COMBAT"),
-        );
-        let mode = self.world.game_mode;
         let party = crate::engine::party_of(self);
         let fighting = party.iter().any(|&m| {
             self.alive(m)
@@ -356,10 +365,6 @@ impl Sim {
                         .any(|&p| self.alive(p) && self.hostile(m, p))
                 })
         });
-        // A fight that ended with fallen party members gets them up
-        // (EVENT_TYPE_DEATH_RES_PARTY to the module), whatever the game mode is, as long as
-        // someone was left standing. When the whole party falls the game is over: the engine
-        // shows the death screen itself (no script calls ShowDeathScreen).
         // The party AI holds followers back until the party is "clear to attack" (the
         // module's AI_PARTY_CLEAR_TO_ATTACK), which rules_core sets when the controlled
         // character attacks or uses an ability on a hostile. On autopilot nobody is controlled,
@@ -369,9 +374,16 @@ impl Sim {
                 m.locals.ints.insert("AI_PARTY_CLEAR_TO_ATTACK".into(), 1);
             }
         }
-        let was = std::mem::replace(&mut self.world.party_fighting, fighting);
+        self.world.party_fighting = fighting;
+        // The whole party down is the end of the game: the scripts set `GM_DEAD` (the death
+        // screen); the flag lets callers stop there.
         let standing = party.iter().any(|&m| self.alive(m));
-        if !party.is_empty() && !standing && !self.world.game_over {
+        let dead_mode = self.table.constant("GM_DEAD").and_then(|c| match &c.value {
+            thedas_script::ldf::ConstValue::Int(v) => Some(*v as i32),
+            _ => None,
+        });
+        let over = (!party.is_empty() && !standing) || Some(self.world.game_mode) == dead_mode;
+        if over && !self.world.game_over {
             self.world.game_over = true;
             let t = self.world.time_ms;
             self.world.trace.push(crate::trace::TraceEntry::Log {
@@ -379,31 +391,6 @@ impl Sim {
                 channel: -1,
                 text: "the whole party has fallen: game over".into(),
             });
-        }
-        if was
-            && !fighting
-            && standing
-            && party
-                .iter()
-                .any(|&m| self.world.get(m).is_some_and(|o| o.dead))
-        {
-            if let Some(m) = self.world.module {
-                let ev = self.new_event("DEATH_RES_PARTY", Some(m));
-                self.world.queue_event(0, m, ev, None);
-            }
-        }
-        if mode != explore && mode != combat {
-            return;
-        }
-        let new = if fighting { combat } else { explore };
-        if new == mode || explore == combat {
-            return;
-        }
-        self.world.game_mode = new;
-        if let Some(m) = self.world.module {
-            let mut ev = self.new_event("GAMEMODE_CHANGE", Some(m));
-            ev.ints = vec![new, mode];
-            self.world.queue_event(0, m, ev, None);
         }
     }
 
@@ -2303,7 +2290,7 @@ mod tests {
     }
 
     #[test]
-    fn seeing_hostiles_starts_combat_and_losing_them_ends_it() {
+    fn the_engine_tracks_the_fight_and_leaves_the_game_mode_to_the_scripts() {
         let mut s = sim();
         let area = s.world.spawn(ObjectKind::Area, "a");
         let module = s.world.spawn(ObjectKind::Module, "m");
@@ -2319,18 +2306,19 @@ mod tests {
         }
         s.world.hostility.insert((0, 2), true);
         s.update_perception();
-        assert_eq!(s.world.game_mode, 1);
-        let modes: Vec<_> = s
-            .world
-            .queue
-            .values()
-            .filter(|q| q.target == module)
-            .map(|q| q.event.ints.clone())
-            .collect();
-        assert_eq!(modes, vec![vec![1, 0]]);
+        assert!(s.world.party_fighting);
+        // The mode is the scripts' to change (rules_core asks the module for GM_COMBAT).
+        assert_eq!(s.world.game_mode, 0);
+        assert!(
+            !s.world
+                .queue
+                .values()
+                .any(|q| q.target == module && q.event.ints.len() == 2)
+        );
         s.world.get_mut(foe).unwrap().dead = true;
         s.update_perception();
-        assert_eq!(s.world.game_mode, 0);
+        assert!(!s.world.party_fighting);
+        assert!(!s.world.game_over);
         // A resurrection effect brings the dead back.
         s.world.get_mut(hero).unwrap().dead = true;
         s.apply_effect(
@@ -2449,6 +2437,48 @@ mod tests {
         s.world.get_mut(hero).unwrap().effects = vec![burn(hero, 1)];
         s.record_health_loss(hero, hero, 4.0);
         assert_eq!(s.world.trace.damage.get(&(hero, 0)), Some(&4.0));
+    }
+
+    #[test]
+    fn only_hostiles_need_a_clear_line_to_be_noticed() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        // A wall (9) across x = 5 on a 10 x 3 grid of 1 m cells.
+        let (w, h) = (10u32, 3u32);
+        let mut data = vec![1u8; (w * h) as usize];
+        for y in 0..h {
+            data[(y * w + 5) as usize] = 9;
+        }
+        s.area_layouts.insert(area, "walled".into());
+        s.nav_grids.insert(
+            "walled".into(),
+            Some(std::sync::Arc::new(thedas_formats::level::NavGrid {
+                columns: w,
+                rows: h,
+                cell_size: 1.0,
+                clearance: 2.0,
+                base: [0.0, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                data,
+                heights: vec![0.0; (w * h) as usize],
+            })),
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let friend = s.world.spawn(ObjectKind::Creature, "friend");
+        let foe = s.world.spawn(ObjectKind::Creature, "foe");
+        s.world.hero = Some(hero);
+        for (id, y, group) in [(hero, 1.5, 0), (friend, 0.5, 0), (foe, 2.5, 1)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = [1.5, y, 0.0];
+            o.group = group;
+        }
+        for id in [friend, foe] {
+            s.world.get_mut(id).unwrap().position[0] = 8.5;
+        }
+        s.world.hostility.insert((0, 1), true);
+        s.update_perception();
+        assert_eq!(s.world.get(hero).unwrap().combat.perceived, vec![friend]);
     }
 
     #[test]

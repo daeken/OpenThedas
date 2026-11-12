@@ -6,7 +6,8 @@
 //! as a `SetValue` of its `Value`, which goes to the game ([`thedas_sim::appearance`]).
 //!
 //! Provisional: the ranges the exe takes from a list's length use `chargenmorphcfg.xml`'s
-//! lists; Nose Shape's and Expression's lists are not traced (fixed ranges here); a slider
+//! lists (Eye and Nose Shape the exe's shape tables); Expression's list is not traced (a
+//! fixed range here); a slider
 //! with no list for the race and gender (Beard, for women and elves) is left out.
 
 use std::collections::BTreeMap;
@@ -37,6 +38,8 @@ pub const GROUPS: [u32; 10] = [
 pub enum Range {
     Fixed(f32, f32),
     List(&'static str),
+    /// A shape list's choices for the race and gender, past its 0 (none).
+    Shapes,
 }
 
 /// One slider of the exe's table.
@@ -97,7 +100,7 @@ pub const SLIDERS: &[Slider] = &[
         ..list(39, 2, 0, "brow_stubble_colors")
     },
     // Eyes.
-    s(10, 3, 374713, Range::Fixed(0.0, 4.0), true),
+    s(10, 3, 374713, Range::Shapes, true),
     f(6, 3, 374714),
     f(4, 3, 374716),
     f(5, 3, 374717),
@@ -105,7 +108,7 @@ pub const SLIDERS: &[Slider] = &[
     f(16, 3, 374719),
     f(17, 3, 374720),
     // Nose.
-    s(30, 4, 374722, Range::Fixed(0.0, 4.0), true),
+    s(30, 4, 374722, Range::Shapes, true),
     f(27, 4, 374723),
     f(25, 4, 374724),
     f(24, 4, 374725),
@@ -150,6 +153,12 @@ pub fn shown(sim: &Sim, id: ObjectId) -> Vec<(Slider, f32, f32)> {
         .filter_map(|s| {
             let (min, max) = match s.range {
                 Range::Fixed(a, b) => (a, b),
+                Range::Shapes => {
+                    let row = thedas_sim::appearance::race_gender_row(
+                        &sim.face_race_gender(id).unwrap_or_default(),
+                    );
+                    (0.0, thedas_sim::appearance::shape_count(s.id, row) as f32)
+                }
                 Range::List(l) => {
                     let n = sim.face_list(id, l).len();
                     if n == 0 {
@@ -196,6 +205,7 @@ fn value(sim: &Sim, id: ObjectId, s: &Slider, min: f32, max: f32) -> f32 {
     let shape = || {
         let p = preset()?;
         thedas_sim::appearance::feature_value(s.id, &p.targets, row)
+            .or_else(|| thedas_sim::appearance::shape_value(s.id, &p.targets, row))
     };
     use thedas_formats::morph::slot;
     let known = match s.id {
