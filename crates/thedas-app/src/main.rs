@@ -1082,8 +1082,10 @@ impl App {
         let stopped = self.screens.as_ref().is_some_and(|s| s.world_stopped());
         if let Some(live) = self.live.as_mut() {
             // A pending transition, or a world map journey, runs on behind its loading screen
-            // (which stops the world otherwise).
-            if !stopped || live.transition_pending() || live.travel_load() {
+            // (which stops the world otherwise); a training lesson's events are delivered
+            // with a screen up too (its steps go on inside the inventory, the tactics), no
+            // time passing (see `Live::step`).
+            if !stopped || live.transition_pending() || live.travel_load() || live.training() {
                 live.step(dt);
             }
             // While a level loads the world holds still: its presentation too.
@@ -1227,8 +1229,10 @@ impl App {
         let stopped = self.screens.as_ref().is_some_and(|s| s.world_stopped());
         if let Some(live) = self.live.as_mut() {
             // A pending transition, or a world map journey, runs on behind its loading screen
-            // (which stops the world otherwise).
-            if !stopped || live.transition_pending() || live.travel_load() {
+            // (which stops the world otherwise); a training lesson's events are delivered
+            // with a screen up too (its steps go on inside the inventory, the tactics), no
+            // time passing (see `Live::step`).
+            if !stopped || live.transition_pending() || live.travel_load() || live.training() {
                 live.step(dt);
             }
             // While a level loads the world holds still: its presentation too.
@@ -1703,6 +1707,12 @@ impl App {
                     }
                 }
                 log.push(format!("loading {kind:?}"));
+            }
+            &Step::TrainingMode(mode) => {
+                if let Some(l) = self.live.as_ref() {
+                    l.sim().set_training_mode(mode);
+                }
+                log.push(format!("training mode {mode}"));
             }
             Step::Training(name) => {
                 let heard = self
@@ -3059,6 +3069,9 @@ enum Step {
     /// The player does a training action (`training MAXIMUM_ZOOM_IN`): the training step
     /// waiting for it hears of it (`EVENT_TYPE_TRAINING_<name>`, see `thedas_sim::training`).
     Training(String),
+    /// `trainingmode N`: a training lesson starts as a script's `SetTrainingMode(N)` starts it
+    /// (0 ends the one under way), for stepping through the lessons.
+    TrainingMode(i32),
     /// A loading screen goes up (`loading town|light|fade`, with the hint the simulation
     /// would show) or plays out (`loading end`): for trying the loading movies headless.
     Loading(Option<ui::LoadScreen>),
@@ -3253,6 +3266,9 @@ fn parse_step(s: &str) -> Result<Step> {
         }
         "floaty" => Step::Floaty(arg.to_string()),
         "training" => Step::Training(arg.trim().to_ascii_uppercase()),
+        "trainingmode" => {
+            Step::TrainingMode(arg.trim().parse().context("trainingmode takes a number")?)
+        }
         "loading" => Step::Loading(match arg.trim() {
             "town" => Some(ui::LoadScreen::Town),
             "light" => Some(ui::LoadScreen::Light),
@@ -3590,6 +3606,7 @@ fn main() -> Result<()> {
                             if !played.as_ref().is_some_and(|(_, s)| s.world_stopped())
                                 || l.transition_pending()
                                 || l.travel_load()
+                                || l.training()
                             {
                                 l.step(dt);
                             }
@@ -3775,6 +3792,10 @@ fn main() -> Result<()> {
                             .as_ref()
                             .map(|(layer, _)| (layer.loading(), layer.loading_fade_done()));
                         println!("loading {kind:?}: hint {hint:?}, up and faded {state:?}");
+                    }
+                    &Step::TrainingMode(mode) => {
+                        l.sim().set_training_mode(mode);
+                        println!("training mode {mode}");
                     }
                     Step::Training(name) => {
                         let heard = l.sim().training_event(name, 0);

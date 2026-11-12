@@ -541,6 +541,12 @@ impl Live {
         self.loading.is_some() || self.held
     }
 
+    /// Whether a training lesson is under way: the game holds still for it, but its events
+    /// are delivered even with a screen up (see [`Live::step`]).
+    pub fn training(&self) -> bool {
+        self.sim().training_paused()
+    }
+
     /// Whether a script's area transition is waiting for the simulation to perform it
     /// (`World::transition`, due at `World::transition_at`): the loading screen goes up and
     /// the world is no longer drawn, as the exe's loading mode takes over before the old
