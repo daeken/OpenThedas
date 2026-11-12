@@ -4,7 +4,13 @@
 //! that document only. Everything here is provisional until checked against the executable,
 //! except where a doc comment says otherwise.
 //!
-//! Stage 1 (this module so far): the single random stream and the curve parameters.
+//! Stage 1 (this file): the single random stream and the curve parameters. Stage 2
+//! ([`skeleton`]): tree set-up and the branch skeleton, on the rotation frames of [`frame`].
+
+pub mod frame;
+pub mod skeleton;
+
+pub use skeleton::{grow, Branch, Bud, Flare, Skeleton, Vertex};
 
 use crate::speedtree::{BezierSpline, BranchLevel, SpeedTree};
 
@@ -32,6 +38,8 @@ pub struct Random {
     /// Always integral and in `1..MODULUS` after a step.
     seed: i64,
     table: [f32; SHUFFLE],
+    /// Values drawn since the stream was made (for tests and diagnostics).
+    draws: u64,
 }
 
 impl Random {
@@ -40,6 +48,7 @@ impl Random {
         let mut random = Random {
             seed: 1,
             table: [0.0; SHUFFLE],
+            draws: 0,
         };
         random.reseed(seed);
         random
@@ -74,12 +83,18 @@ impl Random {
         let i = ((self.raw_step() * SHUFFLE as f32) as usize).min(SHUFFLE - 1);
         let value = self.table[i];
         self.table[i] = self.raw_step();
+        self.draws += 1;
         value
     }
 
     /// A uniform draw in `[a, b]`: `a + (b − a) · draw()`.
     pub fn uniform(&mut self, a: f32, b: f32) -> f32 {
         a + (b - a) * self.draw()
+    }
+
+    /// How many values have been drawn (reseeding does not reset it).
+    pub fn draws(&self) -> u64 {
+        self.draws
     }
 
     /// The generator's integer state, for tests and diagnostics.
@@ -356,6 +371,7 @@ mod tests {
         let mut random = Random {
             seed: 1,
             table: [0.0; SHUFFLE],
+            draws: 0,
         };
         assert_eq!(random.raw_step(), 16807.0 * SCALE);
         for _ in 1..10_000 {
@@ -370,6 +386,7 @@ mod tests {
             let mut random = Random {
                 seed,
                 table: [0.0; SHUFFLE],
+                draws: 0,
             };
             random.raw_step();
             assert_eq!(random.state(), lehmer(seed), "seed {seed}");
