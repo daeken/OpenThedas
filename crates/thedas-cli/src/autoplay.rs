@@ -69,6 +69,8 @@ pub struct Options<'a> {
     pub activity: bool,
     /// Followers waiting in the party pool get the hero's experience (provisional).
     pub pool_xp: bool,
+    /// Ready the party before each run (see [`prepare`]).
+    pub prepare: bool,
     /// End a run ("won") once this many fights are won: every hostile the party saw in the
     /// fight is down (0: no such end).
     pub fights: u32,
@@ -111,7 +113,8 @@ struct Activity {
     fight_ms: u64,
     party: Side,
     foes: Side,
-    /// Health taken, by side ("party" or "others": foes and allies alike), the source's tag
+    /// Health taken, by side ("party", "hostiles" or "allies": anyone else, such as militia
+    /// or a follower not yet in the party), the source's tag
     /// and the ability (0 for weapon attacks).
     sources: std::collections::BTreeMap<(&'static str, String, i32), f64>,
 }
@@ -296,6 +299,73 @@ fn level_party(sim: &mut Sim, hero: ObjectId) {
         sim.level_up_auto(m);
     }
 }
+
+/// Readies the party for a fight as a player would, through the game's own developer
+/// scripts (designerscripts.rim, run as the console's `runscript` runs them: arguments in the
+/// module's `RUNSCRIPT_VAR`), so that a scenario save taken mid-play measures the fight rather
+/// than the state the party arrived in:
+/// - `injury remparty` removes the party's injuries;
+/// - `addxp <n>` (sys_reward's `RewardXPParty`) pays the party experience until every member
+///   reaches the area's minimum level (`areadata.gda` `MinLevel` for the area's `AREA_ID`,
+///   the level creature_core's area balance scales foes to at least), each member then
+///   spending its points from its auto-level table ([`level_party`]);
+/// - `healplayer` restores the party's health and mana/stamina.
+///
+/// Harness only: nothing in the game runs these on its own.
+fn prepare(sim: &mut Sim, hero: ObjectId) {
+    let run = |sim: &mut Sim, script: &str, args: String| {
+        if let Some(m) = sim.world.module {
+            if let Some(o) = sim.world.get_mut(m) {
+                o.locals.strings.insert("RUNSCRIPT_VAR".into(), args);
+            }
+        }
+        sim.run_script(script, hero, None);
+        sim.tick(0);
+    };
+    run(sim, "injury", "remparty".into());
+    let area = sim.world.get(hero).and_then(|h| h.area);
+    let area_id = area
+        .and_then(|a| sim.world.get(a))
+        .and_then(|a| a.locals.ints.get("AREA_ID").copied())
+        .unwrap_or(0);
+    let int = |sim: &Sim, table: i32, column: &str, row: i64| match sim
+        .world
+        .tables()
+        .get(table, "")
+        .and_then(|t| t.cell(column, row).cloned())
+    {
+        Some(thedas_formats::gda::Cell::Int(v)) => Some(v),
+        Some(thedas_formats::gda::Cell::Float(v)) => Some(v as i64),
+        _ => None,
+    };
+    // areadata (M2DA 225) and the experience table (M2DA 164), as creature_core and
+    // player_core read them.
+    let min_level = int(sim, 225, "MinLevel", area_id as i64).unwrap_or(0);
+    if min_level > 0 {
+        let needed = int(sim, 164, "XP", min_level).unwrap_or(0) as f32;
+        for _ in 0..8 {
+            let lowest = members(sim, hero)
+                .iter()
+                .filter_map(|&m| sim.world.get(m))
+                .map(|o| o.properties.get(&XP).map_or(0.0, |v| v.0))
+                .fold(f32::MAX, f32::min);
+            if lowest >= needed || lowest == f32::MAX {
+                break;
+            }
+            // addxp reads the amount up to the first space.
+            run(
+                sim,
+                "addxp",
+                format!("{} ", (needed - lowest).ceil() as i64),
+            );
+            level_party(sim, hero);
+        }
+    }
+    run(sim, "healplayer", String::new());
+}
+
+/// `PROPERTY_SIMPLE_EXPERIENCE`.
+const XP: i32 = 19;
 
 /// The hero and its followers.
 fn members(sim: &Sim, hero: ObjectId) -> Vec<ObjectId> {
@@ -506,6 +576,9 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
     let mut target: Option<ObjectId> = None;
     let mut deaths = 0;
     let mut was_dead = sim.world.get(hero).is_some_and(|h| h.dead);
+    if o.prepare {
+        prepare(sim, hero);
+    }
     level_party(sim, hero);
     if o.player {
         player_gear(sim, hero);
@@ -806,10 +879,13 @@ fn play(sim: &mut Sim, save: &[u8], seed: u64, o: &Options) -> Result<RunResult>
                 side.damage += a.damage as f64;
             }
             for ((src, ability), amount) in &sim.world.trace.damage {
+                // Hostile: in one of the party's fights, or hostile to the hero at the end.
                 let side = if party_ids.contains(src) || Some(*src) == sim.world.hero {
                     "party"
+                } else if foe_ids.contains(src) || sim.hostile(hero, *src) {
+                    "hostiles"
                 } else {
-                    "others"
+                    "allies"
                 };
                 let tag = sim
                     .world
@@ -943,10 +1019,11 @@ pub fn run(o: &Options) -> Result<()> {
             }
         }
         println!("health taken per run, by source (ability 0: weapon attacks):");
-        for side in ["others", "party"] {
+        for side in ["hostiles", "allies", "party"] {
             let mut rows: Vec<_> = sources.iter().filter(|(k, _)| k.0 == side).collect();
             rows.sort_by(|a, b| b.1.total_cmp(a.1));
-            let total: f64 = rows.iter().map(|r| r.1).sum();
+            // (An empty sum is -0.0; adding 0.0 prints it as 0.)
+            let total: f64 = rows.iter().map(|r| r.1).sum::<f64>() + 0.0;
             println!("  by {side}: {:.0}", total / n);
             for ((_, tag, ability), v) in rows.iter().take(8) {
                 println!("    {tag:<28} ability {ability:<6} {:>6.0}", *v / n);

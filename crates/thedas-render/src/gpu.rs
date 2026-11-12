@@ -528,14 +528,21 @@ impl AreaRenderer {
         } else {
             Vec::new()
         };
+        // The partitions' size follows the detail (0x455580); a change of size makes them
+        // afresh, as the exe's quality setter does (0x4556e0 → 0x453ab0, 0x455580).
+        let shadow_size = crate::shadow::partition_size(scene.detail);
         let shadows = scene.sun.is_some().then(|| {
+            if render_cache
+                .shadows
+                .as_ref()
+                .is_some_and(|t| t.size() != shadow_size)
+            {
+                render_cache.shadows = None;
+            }
             render_cache
                 .shadows
                 .get_or_insert_with(|| {
-                    std::sync::Arc::new(crate::d3d_gpu::ShadowTargets::new(
-                        device,
-                        crate::shadow::PARTITION_SIZE,
-                    ))
+                    std::sync::Arc::new(crate::d3d_gpu::ShadowTargets::new(device, shadow_size))
                 })
                 .clone()
         });
