@@ -6,7 +6,7 @@
 
 use super::Random;
 use super::frame::{Frame, Vec3, cross, dot, fast_sqrt, lerp, lerp3, normalize, scale, sub};
-use super::skeleton::{BANK, Branch};
+use super::skeleton::{BANK, Branch, Wind};
 use crate::speedtree::SpeedTree;
 
 const UP: Vec3 = [0.0, 0.0, 1.0];
@@ -34,6 +34,8 @@ pub struct Leaf {
     /// Rocking group, 0–2.
     pub group: i32,
     pub corners: [Corner; 4],
+    /// Wind values from the bud (7.7), weights clamped to [0, 1].
+    pub wind: Wind,
 }
 
 impl Leaf {
@@ -67,6 +69,7 @@ pub struct LeafContext<'a> {
 }
 
 /// Makes a leaf at `position` (5.3), or nothing when it has no texture or is crowded out.
+#[allow(clippy::too_many_arguments)]
 pub fn make_leaf(
     cx: LeafContext<'_>,
     position: Vec3,
@@ -74,6 +77,7 @@ pub fn make_leaf(
     branch: usize,
     nu: Vec3,
     delta: Vec3,
+    wind: Wind,
 ) {
     let tree = cx.tree;
     let info = &tree.leaves;
@@ -225,6 +229,7 @@ pub fn make_leaf(
         color_scale,
         group,
         corners,
+        wind,
     });
 }
 

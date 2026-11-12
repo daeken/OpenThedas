@@ -118,7 +118,7 @@ these, so they are the places where one person or stream can take a large, separ
 
 ### Interface and input
 
-- **Loading screens** are in progress: an area change still freezes the last frame.
+- **Loading screens** show for area changes (load_town with the script's hint); the same-list light screen and the save-load path are still to do (`UI-078`).
 - **Screens never built**: crafting, item upgrade, the slideshow, the army
   screen, the party camp gift screen, store buyback, credits, and the online,
   downloadable-content and achievement screens (`UI-052`, `UI-077`, `UI-124`, `UI-126`,

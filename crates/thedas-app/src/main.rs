@@ -526,6 +526,8 @@ struct Gfx {
 }
 
 struct App {
+    /// A loading screen is up for the level being built (see `Live::loading`).
+    load_screen_up: bool,
     loaded: Loaded,
     /// The running game, when playing.
     live: Option<live::Live>,
@@ -1088,6 +1090,9 @@ impl App {
             }
             live.frame_size = (g.config.width, g.config.height);
             live.sync(&g.ctx, g.config.format)?;
+            if self.screens.is_some() {
+                loading_screen(live, &mut g.ui, &mut self.load_screen_up);
+            }
             // Portraits are drawn by the objects' renderers, whose constants this frame's
             // draws use too: they are drawn (and submitted) before the frame is encoded, so
             // the frame is not drawn from the portrait camera.
@@ -1228,6 +1233,9 @@ impl App {
             }
             live.frame_size = (g.config.width, g.config.height);
             live.sync(&g.ctx, g.config.format)?;
+            if self.screens.is_some() {
+                loading_screen(live, &mut g.ui, &mut self.load_screen_up);
+            }
         }
         if self.live.is_none() {
             if let Some(r) = g.renderer.as_mut() {
@@ -1659,6 +1667,19 @@ impl App {
                         _ => log.push(format!("use {tag}: nothing")),
                     }
                 }
+            }
+            Step::Loading(kind) => {
+                let hint = self
+                    .live
+                    .as_ref()
+                    .and_then(|l| thedas_ui::binding::load_hint(&l.sim()));
+                if let Some(g) = self.gfx.as_mut() {
+                    match kind {
+                        Some(k) => g.ui.loading_begin(*k, hint),
+                        None => g.ui.loading_end(),
+                    }
+                }
+                log.push(format!("loading {kind:?}"));
             }
             Step::Training(name) => {
                 let heard = self
@@ -2872,6 +2893,31 @@ impl padplay::Host for HeadlessHost<'_> {
     }
 }
 
+/// The loading screen, while a new level builds (`Live::loading`): up when the build starts,
+/// with the hint a script set for the transition, played out when the world is ready. While
+/// the world map is open (travelling) the map itself stays up instead, as in the exe.
+/// Provisional: load_town.gfx for every load; the exe shows load_light.gfx for an area
+/// change within the same area list, which the app does not tell apart yet.
+fn loading_screen(live: &live::Live, ui: &mut ui::UiLayer, up: &mut bool) {
+    match (live.loading(), *up) {
+        (true, false) => {
+            let sim = live.sim();
+            if sim.world.world_map.open {
+                return;
+            }
+            let hint = thedas_ui::binding::load_hint(&sim);
+            drop(sim);
+            ui.loading_begin(ui::LoadScreen::Town, hint);
+            *up = true;
+        }
+        (false, true) => {
+            ui.loading_end();
+            *up = false;
+        }
+        _ => {}
+    }
+}
+
 /// One step of `--steps`.
 #[derive(Clone, Debug, PartialEq)]
 enum Step {
@@ -2953,6 +2999,9 @@ enum Step {
     /// The player does a training action (`training MAXIMUM_ZOOM_IN`): the training step
     /// waiting for it hears of it (`EVENT_TYPE_TRAINING_<name>`, see `thedas_sim::training`).
     Training(String),
+    /// A loading screen goes up (`loading town|light|fade`, with the hint the simulation
+    /// would show) or plays out (`loading end`): for trying the loading movies headless.
+    Loading(Option<ui::LoadScreen>),
     /// Uses the nearest object with a tag, as clicking it would (`use bdc140ip_everds_chest`).
     Use(String),
 }
@@ -3142,6 +3191,13 @@ fn parse_step(s: &str) -> Result<Step> {
         }
         "floaty" => Step::Floaty(arg.to_string()),
         "training" => Step::Training(arg.trim().to_ascii_uppercase()),
+        "loading" => Step::Loading(match arg.trim() {
+            "town" => Some(ui::LoadScreen::Town),
+            "light" => Some(ui::LoadScreen::Light),
+            "fade" => Some(ui::LoadScreen::Fade),
+            "end" => None,
+            _ => anyhow::bail!("loading takes town, light, fade or end"),
+        }),
         "plot" => {
             let (plot, flag) = arg
                 .rsplit_once(' ')
@@ -3362,6 +3418,7 @@ fn main() -> Result<()> {
                 }
             }
             l.sim().tick(args.run_ms);
+            let mut load_screen_up = false;
             for step in &steps {
                 let l = live.as_mut().expect("a game or the start menu");
                 match step {
@@ -3475,6 +3532,9 @@ fn main() -> Result<()> {
                             // As the window does: the drawn scenes follow the world (objects
                             // that come and go are rebuilt).
                             l.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
+                            if let Some((layer, _)) = played.as_mut() {
+                                loading_screen(l, layer, &mut load_screen_up);
+                            }
                             if let Some((layer, s)) = played.as_mut() {
                                 let t = Instant::now();
                                 let level = l.level.as_ref();
@@ -3608,6 +3668,19 @@ fn main() -> Result<()> {
                             }
                             _ => println!("use {tag}: nothing"),
                         }
+                    }
+                    Step::Loading(kind) => {
+                        let hint = thedas_ui::binding::load_hint(&l.sim());
+                        if let Some((layer, _)) = played.as_mut() {
+                            match kind {
+                                Some(k) => layer.loading_begin(*k, hint.clone()),
+                                None => layer.loading_end(),
+                            }
+                        }
+                        let state = played
+                            .as_ref()
+                            .map(|(layer, _)| (layer.loading(), layer.loading_fade_done()));
+                        println!("loading {kind:?}: hint {hint:?}, up and faded {state:?}");
                     }
                     Step::Training(name) => {
                         let heard = l.sim().training_event(name, 0);
@@ -3862,6 +3935,7 @@ fn main() -> Result<()> {
         .then(|| screens::Screens::new(live.as_ref().is_some_and(|l| l.front_end)));
     let loaded_vfs = loaded.vfs.clone();
     let mut app = App {
+        load_screen_up: false,
         loaded,
         live,
         follow,

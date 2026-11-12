@@ -37,9 +37,26 @@ pub struct MeshVertex {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Part {
     pub vertices: Vec<MeshVertex>,
+    /// Per vertex (parallel to `vertices`), its wind pairs (7.7).
+    pub wind: Vec<VertexWind>,
     /// Per LOD level, a triangle list (three indices per triangle, degenerate triangles
     /// removed, strip winding kept).
     pub lods: Vec<Vec<u32>>,
+}
+
+/// Two wind pairs in the output form of 7.7: weights 0 (rigid) to 1 (free) and indices into
+/// the six wind matrices.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VertexWind {
+    pub weights: [f32; 2],
+    pub matrices: [u8; 2],
+}
+
+impl From<super::Wind> for VertexWind {
+    fn from(w: super::Wind) -> Self {
+        let (weights, matrices) = w.output();
+        VertexWind { weights, matrices }
+    }
 }
 
 /// One leaf card (7.2). Its corners are offsets in card space, `[right, up]`, to be turned to
@@ -67,6 +84,7 @@ pub struct LeafCard {
     pub angle_offsets: [f32; 2],
     /// Leaf-angle index (7.2): the leaf's position in its LOD level's list, mod 8.
     pub angle_index: u32,
+    pub wind: VertexWind,
 }
 
 /// A leaf drawn as a mesh (7.3): the mesh template of its choice, placed at `position` in the
@@ -82,6 +100,7 @@ pub struct MeshLeaf {
     pub normal: Vec3,
     pub color_scale: f32,
     pub angle_index: u32,
+    pub wind: VertexWind,
 }
 
 impl MeshLeaf {
@@ -117,6 +136,9 @@ pub struct Billboard {
     /// Full width and height of the camera-facing quad, standing on the tree's origin.
     pub width: f32,
     pub height: f32,
+    /// The quad's corners in card space as `[y, z]` (right, up; 7.5): (+w/2, h), (−w/2, h),
+    /// (−w/2, 0), (+w/2, 0). They pair with `uv` in order.
+    pub corners: [[f32; 2]; 4],
     /// The billboard image's four atlas corners as stored, `v = 1 − t`, in
     /// `<level>_diffuse_billboards.dds`.
     pub uv: [[f32; 2]; 4],
@@ -138,8 +160,14 @@ pub struct TreeMesh {
     /// The billboard size and image; whether a placement draws it depends on its model name
     /// ([`draws_billboard`]).
     pub billboard: Option<Billboard>,
-    /// Bounding box of every branch and frond vertex and every leaf position (5.6 F).
+    /// The tree's bounding box (5.7 F): level-0 branch and frond geometry and the reach of
+    /// every level-0 leaf. Half its diagonal times a placement's scale is that placement's LOD
+    /// radius (7.4).
     pub bounds: (Vec3, Vec3),
+    /// `g_vLeafAngleScalars`: the file's leaf rock and rustle scalars (5.7 B).
+    pub leaf_angle_scalars: [f32; 2],
+    /// Leaf transition settings for [`TreeMesh::lod_alphas`] (7.8).
+    pub transition: Transition,
     /// The three rocking groups' time offsets (7.1).
     pub rocking_offsets: [f32; 3],
     /// The full computation, for anything not flattened here.
@@ -191,6 +219,8 @@ impl TreeMesh {
             leaf_meshes: Part::default(),
             billboard: None,
             bounds: ([0.0; 3], [0.0; 3]),
+            leaf_angle_scalars: [1.0, 1.0],
+            transition: Transition::default(),
             rocking_offsets: [0.0; 3],
             generated: GeneratedTree::default(),
         }
@@ -217,6 +247,7 @@ impl TreeMesh {
                     fade: v.fade,
                 })
                 .collect(),
+            wind: g.branches.vertices.iter().map(|v| v.wind.into()).collect(),
             lods: (0..g.branches.lods.len())
                 .map(|k| {
                     let mut list = Vec::new();
@@ -243,6 +274,7 @@ impl TreeMesh {
                     fade: v.fade,
                 })
                 .collect(),
+            wind: g.fronds.vertices.iter().map(|v| v.wind.into()).collect(),
             lods: g
                 .fronds
                 .strips
@@ -295,6 +327,7 @@ impl TreeMesh {
                             normal: leaf.corners[0].normal,
                             color_scale: f32::from(leaf.color_scale) / 255.0,
                             angle_index,
+                            wind: leaf.wind.into(),
                         };
                         let base = leaf_meshes.vertices.len() as u32;
                         for v in &template.vertices {
@@ -305,6 +338,7 @@ impl TreeMesh {
                                 binormal: m.turn(v.binormal),
                                 ..*v
                             });
+                            leaf_meshes.wind.push(m.wind);
                         }
                         list.extend(template.indices.iter().map(|&i| base + i));
                         meshes.push(m);
@@ -319,20 +353,35 @@ impl TreeMesh {
             leaf_meshes.lods.push(list);
         }
 
+        // 5.7 F: level-0 branch and frond geometry, and each level-0 leaf's reach.
         let mut lo = [f32::MAX; 3];
         let mut hi = [f32::MIN; 3];
-        let points = branches
-            .vertices
-            .iter()
-            .map(|v| v.position)
-            .chain(fronds.vertices.iter().map(|v| v.position))
-            .chain(g.skeleton.leaves.iter().map(|l| l.position));
         let mut any = false;
-        for p in points {
+        let mut include = |p: Vec3| {
             any = true;
             for i in 0..3 {
                 lo[i] = lo[i].min(p[i]);
                 hi[i] = hi[i].max(p[i]);
+            }
+        };
+        for strip in g.branches.lod_strips(0) {
+            strip
+                .iter()
+                .for_each(|&i| include(g.branches.vertices[i as usize].position));
+        }
+        for strip in g.fronds.strips.first().into_iter().flatten() {
+            strip
+                .iter()
+                .for_each(|&i| include(g.fronds.vertices[i as usize].position));
+        }
+        for leaf in &g.skeleton.leaves {
+            let d = leaf_reach(tree, leaf, &templates);
+            for axis in 0..3 {
+                for sign in [-1.0, 1.0] {
+                    let mut p = leaf.position;
+                    p[axis] += sign * d;
+                    include(p);
+                }
             }
         }
         if !any {
@@ -348,9 +397,16 @@ impl TreeMesh {
                     .iter()
                     .flat_map(|&x| [lo[1], hi[1]].map(|y| (x * x + y * y).sqrt()))
                     .fold(0.0f32, f32::max);
+                let (width, height) = (2.0 * reach, hi[2]);
                 Billboard {
-                    width: 2.0 * reach,
-                    height: hi[2] - lo[2],
+                    width,
+                    height,
+                    corners: [
+                        [0.5 * width, height],
+                        [-0.5 * width, height],
+                        [-0.5 * width, 0.0],
+                        [0.5 * width, 0.0],
+                    ],
                     uv: [0, 1, 2, 3].map(|i| flip([c[2 * i], c[2 * i + 1]])),
                 }
             });
@@ -364,6 +420,11 @@ impl TreeMesh {
             leaf_meshes,
             billboard,
             bounds: (lo, hi),
+            leaf_angle_scalars: [
+                tree.speedwind_rock_scalar.unwrap_or(1.0),
+                tree.speedwind_rustle_scalar.unwrap_or(1.0),
+            ],
+            transition: Transition::of(tree),
             rocking_offsets: g.rocking_offsets,
             generated,
         })
@@ -392,6 +453,10 @@ impl TreeMesh {
                 }
                 h.float(v.fade);
             }
+            for w in &part.wind {
+                w.weights.iter().for_each(|&x| h.float(x));
+                w.matrices.iter().for_each(|&m| h.word(m.into()));
+            }
             for list in &part.lods {
                 h.word(list.len() as u32);
                 list.iter().for_each(|&i| h.word(i));
@@ -410,6 +475,8 @@ impl TreeMesh {
                 h.float(c.color_scale);
                 c.angle_offsets.iter().for_each(|&x| h.float(x));
                 h.word(c.angle_index);
+                c.wind.weights.iter().for_each(|&x| h.float(x));
+                c.wind.matrices.iter().for_each(|&m| h.word(m.into()));
             }
         }
         for level in &self.mesh_leaves {
@@ -423,9 +490,15 @@ impl TreeMesh {
         if let Some(b) = self.billboard {
             h.float(b.width);
             h.float(b.height);
+            b.corners.iter().flatten().for_each(|&x| h.float(x));
             b.uv.iter().flatten().for_each(|&x| h.float(x));
         }
         self.rocking_offsets.iter().for_each(|&x| h.float(x));
+        self.bounds
+            .0
+            .iter()
+            .chain(&self.bounds.1)
+            .for_each(|&x| h.float(x));
         h.0
     }
 
@@ -445,6 +518,160 @@ impl TreeMesh {
         };
         ((15.0 + 5.0 * t) * m, (35.0 + 85.0 * t) * m)
     }
+}
+
+/// Leaf transition settings (7.8).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Transition {
+    /// 0 pop, 1 smooth, 3 none (2 is read as smooth with factor 0.5).
+    pub method: i32,
+    pub radius: f32,
+    pub exponent: f32,
+    pub factor: f32,
+}
+
+impl Default for Transition {
+    fn default() -> Self {
+        Transition {
+            method: 1,
+            radius: 0.07,
+            exponent: 0.7,
+            factor: 0.0,
+        }
+    }
+}
+
+impl Transition {
+    fn of(tree: &SpeedTree) -> Self {
+        let lod = tree.lod.unwrap_or_default();
+        let d = Transition::default();
+        let mut t = Transition {
+            // Absent: smooth (provisional; every game file sets it).
+            method: lod.leaf_transition.unwrap_or(d.method),
+            radius: lod.leaf_transition_radius.unwrap_or(d.radius),
+            exponent: lod.leaf_curve_exponent.unwrap_or(d.exponent),
+            factor: tree.leaf_transition_factor.unwrap_or(d.factor),
+        };
+        if t.method == 2 {
+            t.method = 1;
+            t.factor = 0.5;
+        }
+        t
+    }
+}
+
+/// What to draw at a LOD value (7.8): a level per part (−1 draws nothing) and alpha-test
+/// values on a 0–255 scale.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LodAlphas {
+    pub branch_level: i32,
+    pub frond_level: i32,
+    /// The alpha-test value of branches and fronds.
+    pub alpha: f32,
+    /// Two leaf slots, each (level, alpha); leaves cross-fade between them.
+    pub leaves: [(i32, f32); 2],
+    /// The billboard's fade, 0–1.
+    pub billboard_alpha: f32,
+}
+
+/// Target and clear alpha-test values (7.8).
+const TARGET: f32 = 84.0;
+const CLEAR: f32 = 255.0;
+
+impl TreeMesh {
+    /// Levels and alpha-test values at LOD value `lod` (7.8), from this tree's level counts
+    /// and its leaf transition settings.
+    pub fn lod_alphas(&self, lod: f32) -> LodAlphas {
+        lod_alphas(
+            lod,
+            [
+                self.branches.lods.len(),
+                self.fronds.lods.len(),
+                self.leaves.len().max(self.mesh_leaves.len()),
+            ],
+            self.transition,
+        )
+    }
+}
+
+/// 7.8 for level counts `[branches, fronds, leaves]`.
+pub fn lod_alphas(l: f32, counts: [usize; 3], tr: Transition) -> LodAlphas {
+    let [nb, nf, nl] = counts.map(|n| n as f32);
+    let e = tr.exponent;
+    let rise = |a: f32, b: f32, p: f32| super::frame::lerp(b, a, (1.0 - p).powf(e));
+    let fall = |a: f32, b: f32, p: f32| super::frame::lerp(a, b, p.powf(e));
+    let tau = 2.0 * tr.radius;
+    let phi = tr.factor;
+    let short = tau * (1.0 - phi);
+    let k = nl - 1.0;
+    let crest = if k == 0.0 {
+        1.0
+    } else {
+        (1.0 - (k + 1.0) * tau) / k
+    };
+    let cycle = crest + tau;
+
+    let mut out = LodAlphas {
+        branch_level: -1,
+        frond_level: -1,
+        alpha: TARGET,
+        leaves: [(-1, CLEAR), (-1, CLEAR)],
+        billboard_alpha: 0.0,
+    };
+    // Branches and fronds.
+    if l <= 0.0 {
+        out.billboard_alpha = 1.0;
+    } else if l >= 1.0 {
+        out.branch_level = 0;
+        out.frond_level = 0;
+    } else {
+        out.branch_level = ((1.0 - l) * nb) as i32;
+        out.frond_level = ((1.0 - l) * nf) as i32;
+        if l < short {
+            out.alpha = rise(CLEAR, TARGET, l / short);
+            out.billboard_alpha = (1.5 * (1.0 - l / short)).min(1.0);
+        }
+    }
+    // Leaves.
+    if l <= 0.0 {
+        out.leaves[0] = (-1, CLEAR);
+    } else if l >= 1.0 {
+        out.leaves[0] = (0, TARGET);
+    } else {
+        match tr.method {
+            3 => out.leaves[0] = (0, TARGET),
+            0 => out.leaves[0] = (((1.0 - l) * nl) as i32, TARGET),
+            _ if l < short => {
+                let a = rise(CLEAR, TARGET, l / short);
+                let level = if a == CLEAR { -1 } else { nl as i32 - 1 };
+                out.leaves[0] = (level, a);
+            }
+            _ => {
+                let lp = l - tau;
+                // C-style remainder: keeps the sign of `lp`.
+                let u = lp % cycle;
+                let region = (nl as i32 - (lp / cycle) as i32 - 1).max(0);
+                if u < crest {
+                    out.leaves[0] = (region, TARGET);
+                } else {
+                    let p = (u - crest) / tau;
+                    let a1 = if p > phi {
+                        fall(TARGET, CLEAR, (p - phi) / (1.0 - phi))
+                    } else {
+                        TARGET
+                    };
+                    let a0 = if p < 1.0 - phi {
+                        rise(CLEAR, TARGET, p / (1.0 - phi))
+                    } else {
+                        TARGET
+                    };
+                    out.leaves[0] = (region - 1, a0);
+                    out.leaves[1] = (region, a1);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 64-bit FNV-1a.
@@ -544,7 +771,37 @@ fn leaf_card(
         group: leaf.group,
         angle_offsets: [ANGLE_OFFSETS[t], ANGLE_OFFSETS[29 - t]],
         angle_index,
+        wind: leaf.wind.into(),
     }
+}
+
+/// A level-0 leaf's longest reach from its position (5.7 F): a mesh's farthest vertex, or a
+/// card's farthest corner from its (unmirrored) pivot.
+fn leaf_reach(
+    tree: &SpeedTree,
+    leaf: &super::leaves::Leaf,
+    templates: &[Option<LeafMeshTemplate>],
+) -> f32 {
+    let texture = leaf.texture();
+    let [w, h] = card_size(tree, texture);
+    if templates[leaf.choice].is_some() {
+        let mesh = tree.leaves.textures[texture]
+            .mesh
+            .and_then(|m| usize::try_from(m.mesh).ok())
+            .and_then(|i| tree.meshes.get(i));
+        let longest = mesh
+            .into_iter()
+            .flat_map(|m| &m.vertices)
+            .map(|v| super::frame::dot(v.position, v.position).sqrt())
+            .fold(0.0, f32::max);
+        return longest * w.max(h);
+    }
+    let origin = tree.leaves.textures[texture].origin;
+    let (px, py) = (origin[0] * w, origin[1] * h);
+    [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]
+        .iter()
+        .map(|&(x, y)| ((x - px) * (x - px) + (y - py) * (y - py)).sqrt())
+        .fold(0.0, f32::max)
 }
 
 /// Image corners in P1…P4 order for a texture without an atlas entry: top right, top left,
@@ -689,9 +946,62 @@ mod tests {
         let mesh = TreeMesh::try_new(&leafy_trunk()).unwrap();
         let b = mesh.billboard.unwrap();
         let (lo, hi) = mesh.bounds;
-        assert!((b.height - (hi[2] - lo[2])).abs() < 1e-6);
+        // 7.5: the height is the box's top, the corners stand on the origin.
+        assert_eq!(b.height, hi[2]);
         assert!(b.width >= hi[0] - lo[0] && b.width > 0.0);
+        assert_eq!(b.corners[0], [0.5 * b.width, b.height]);
+        assert_eq!(b.corners[2], [-0.5 * b.width, 0.0]);
         assert_eq!(b.uv[0], [1.0, 0.0]);
+    }
+
+    #[test]
+    fn bounds_cover_each_leafs_reach() {
+        let t = leafy_trunk();
+        let mesh = TreeMesh::try_new(&t).unwrap();
+        // Card 1 by 2 with its pivot at (0.25, 0.5) of it: the far corner (1, 2) is
+        // sqrt(0.75² + 1²) = 1.25 away.
+        let (lo, hi) = mesh.bounds;
+        for leaf in &mesh.generated.skeleton.leaves {
+            for k in 0..3 {
+                assert!(leaf.position[k] - 1.25 >= lo[k] - 1e-5);
+                assert!(leaf.position[k] + 1.25 <= hi[k] + 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    fn lod_alphas_follow_the_transition() {
+        let tr = Transition::default();
+        let near = lod_alphas(1.0, [3, 3, 3], tr);
+        assert_eq!(
+            (near.branch_level, near.frond_level, near.alpha),
+            (0, 0, TARGET)
+        );
+        assert_eq!(near.leaves[0], (0, TARGET));
+        let far = lod_alphas(0.0, [3, 3, 3], tr);
+        assert_eq!((far.branch_level, far.billboard_alpha), (-1, 1.0));
+        assert_eq!(far.leaves[0], (-1, CLEAR));
+        // Mid-range: discrete levels, alpha at the target.
+        let mid = lod_alphas(0.5, [3, 2, 3], tr);
+        assert_eq!((mid.branch_level, mid.frond_level), (1, 1));
+        assert_eq!(mid.alpha, TARGET);
+        // Inside the transition width the branches fade towards clear and the billboard in.
+        let edge = lod_alphas(0.07, [3, 3, 3], tr);
+        assert!(edge.alpha > TARGET && edge.alpha <= CLEAR);
+        assert!(edge.billboard_alpha > 0.0 && edge.billboard_alpha <= 1.0);
+        // Leaves walk down the levels and cross-fade with valid alphas everywhere.
+        for i in 1..100 {
+            let a = lod_alphas(i as f32 / 100.0, [3, 3, 3], tr);
+            for (level, alpha) in a.leaves {
+                assert!((-1..3).contains(&level), "{i}: {a:?}");
+                assert!((TARGET..=CLEAR).contains(&alpha), "{i}: {a:?}");
+            }
+        }
+        // Pop and none.
+        let pop = Transition { method: 0, ..tr };
+        assert_eq!(lod_alphas(0.5, [3, 3, 4], pop).leaves[0], (2, TARGET));
+        let none = Transition { method: 3, ..tr };
+        assert_eq!(lod_alphas(0.5, [3, 3, 4], none).leaves[0], (0, TARGET));
     }
 
     #[test]
@@ -727,13 +1037,13 @@ mod tests {
     }
 
     const PINNED: &[(&str, u64)] = &[
-        ("brc999d_tre_c_oak.spt", 0xd66e2cc22fb3a446),
-        ("ost000c_tre_m_pinesm.spt", 0xb6ed20f6f8130431),
-        ("brc000d_bsh_f_fern.spt", 0x1f8f493b7a9e2717),
-        ("lgt600d_bsh_c_boxwd.spt", 0xd5ec4621e2656640),
-        ("lgt602d_gra_c_gtall1.spt", 0xf5293f359a263450),
-        ("brc504d_bsh_f_catgras.spt", 0xbc630cd8660a525f),
-        ("brc100d_bsh_f_catflwr.spt", 0x5b9f51243c93b528),
+        ("brc999d_tre_c_oak.spt", 0xa370ae38ae7a5ea3),
+        ("ost000c_tre_m_pinesm.spt", 0x5eb3fdf78a477596),
+        ("brc000d_bsh_f_fern.spt", 0x6c32861dbd461683),
+        ("lgt600d_bsh_c_boxwd.spt", 0xfc7cd1ea82991653),
+        ("lgt602d_gra_c_gtall1.spt", 0x480382b3a30b80cd),
+        ("brc504d_bsh_f_catgras.spt", 0x9ac995fdef52b9ff),
+        ("brc100d_bsh_f_catflwr.spt", 0xa345a9cb4f16c17e),
     ];
 
     #[test]
