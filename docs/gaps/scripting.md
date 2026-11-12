@@ -224,11 +224,11 @@ call to the exe's event constructor 0x69bac0):
 
 | Constructor | Call sites (scripts) | Note |
 | --- | --- | --- |
-| `CommandMoveAwayFromObject` | 1,010 (169) | type number invented (`SCR-057`) |
+| `CommandMoveAwayFromObject` | 1,010 (169) | now walks (provisional); type number invented (`SCR-057`) |
 | `CommandPlayAnimation` | 829 (386) | |
 | `CommandFly` | 353 (176) | DLC scripts pass a second integer |
-| `CommandMoveToMultiLocations` | 323 (295) | type number invented; the location list is dropped |
-| `CommandTurn` | 221 (214) | type number invented |
+| `CommandMoveToMultiLocations` | 323 (295) | now walks its list (provisional); type number invented |
+| `CommandTurn` | 221 (214) | now turns (provisional); type number invented |
 | `CommandSheatheWeapons` | 14 (14) | type number invented |
 | `CommandDeathBlow` | 3 (3) | |
 | `CommandUnsheatheWeapons` | 2 (1) | type number invented |
@@ -339,7 +339,7 @@ Dispatch summary: `engine::call` (`crates/thedas-sim/src/engine.rs:483`) matches
 
 ### Commands
 
-- **SCR-055** **Commands accepted but not executed.** Original: not traced. Ours: only Attack, UseAbility, MoveToLocation, MoveToObject, JumpToLocation, JumpToObject, Wait, SwitchWeaponSet, StartConversation and UseObject do anything. `CommandPlayAnimation`, `CommandTurn`, `CommandSheatheWeapons`, `CommandUnsheatheWeapons`, `CommandMoveAwayFromObject`, `CommandDeathBlow`, `CommandFly` and any other constructor sit 500 ms in the queue and complete with success; `CommandMoveToMultiLocations` has no destination (its location array is dropped) and completes after 1 ms. Evidence: `crates/thedas-sim/src/sim.rs:1526-1560`, `sim.rs:2572-2663`, `crates/thedas-sim/src/world.rs:280-281`. Size: L. Depends: SCR-056. Kind: missing.
+- **SCR-055** **Commands accepted but not executed.** Original: not traced. Ours: only Attack, UseAbility, MoveToLocation, MoveToObject, MoveToMultiLocations, MoveAwayFromObject, JumpToLocation, JumpToObject, Turn, Wait, SwitchWeaponSet, StartConversation and UseObject do anything (MoveAway, MultiLocations and Turn are provisional: no line-of-sight search, straight legs and one pass for a loop, no turn rate). `CommandPlayAnimation`, `CommandSheatheWeapons`, `CommandUnsheatheWeapons`, `CommandDeathBlow`, `CommandFly` and any other constructor sit 500 ms in the queue and complete with success. Evidence: `crates/thedas-sim/src/sim.rs:1526-1560`, `sim.rs:2572-2663`, `crates/thedas-sim/src/world.rs:280-281`. Size: L. Depends: SCR-056. Kind: missing.
 - **SCR-056** **Command constructors drop arguments.** Original: not traced. Ours: the generic constructor keeps the first object, the first float, all ints and strings, a location, and a non-zero vector only if no location; second objects, later floats and arrays (location lists) are discarded. Evidence: `crates/thedas-sim/src/engine.rs:2089-2139`. Size: M. Depends: none. Kind: provisional.
 - **SCR-057** **Unnamed command types get invented numbers.** Original: not recovered. Ours: five constructors with no COMMAND_TYPE constant get 1000+index. Evidence: `crates/thedas-sim/src/engine.rs:461-479`. Size: S. Depends: none. Kind: provisional.
 - **SCR-058** **Command accessors read only index 0.** Original: not traced. Ours: `SetCommandFloat`/`GetCommandFloat` and `GetCommandObject` handle only index 0; other indices are dropped or answer the default. Evidence: `crates/thedas-sim/src/engine.rs:2140-2192`. Size: S. Depends: SCR-056. Kind: provisional.

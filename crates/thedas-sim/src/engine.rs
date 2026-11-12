@@ -2118,6 +2118,18 @@ pub fn call(
                             c.location = Some(*l);
                         }
                     }
+                    // CommandMoveToMultiLocations' list: kept as the walk's points, the last
+                    // one as where it ends.
+                    (Type::Array(_), Value::Array { items, .. }) => {
+                        for v in items {
+                            if let Value::Engine { handle, .. } = v
+                                && let Some(EngineData::Location(l)) = h.sim.world.handle(*handle)
+                            {
+                                c.path.push(l.position);
+                                c.location = Some(*l);
+                            }
+                        }
+                    }
                     // A place in the caller's area (CommandUseAbility's vTarget); the
                     // default [0, 0, 0] is none. Provisional.
                     (Type::Vector, Value::Vector(v)) if *v != [0.0; 3] && c.location.is_none() => {
@@ -2130,6 +2142,13 @@ pub fn call(
                         }
                     }
                     _ => {}
+                }
+            }
+            // The list's walk starts at nStartingWP (integer 1).
+            if n == "CommandMoveToMultiLocations" {
+                let start = c.ints.get(1).copied().unwrap_or(0).max(0) as usize;
+                if start < c.path.len() {
+                    c.path.drain(..start);
                 }
             }
             let hd = h.sim.world.store(EngineData::Command(c));
