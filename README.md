@@ -10,7 +10,7 @@ repository.
 
 ## Status
 
-Last updated 2026-11-12 10:50 UTC, main cc2eb93
+Last updated 2026-11-12 14:35 UTC, main 1a85a84
 
 Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–20, with fixes merged since then noted.
 
@@ -26,7 +26,8 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
     - movie tracks and cutscene camera tracks;
     - cutscenes named by conversation lines (the Human Noble, Dalish and Dwarf Noble intros);
     - the original's default speaker framing for unstaged lines;
-    - cutscene and conversation actors posed and animated by their tracks, and conversation lines leaving creatures on their stage marks in the sim, as the exe does (Oskias sits; the Dalish hunters face the hero).
+    - cutscene and conversation actors posed and animated by their tracks, and conversation lines leaving creatures on their stage marks in the sim, as the exe does (Oskias sits; the Dalish hunters face the hero);
+    - conversations start as the exe starts them: dialog game mode for the talk, and talk commands go through the dialogue event to the target's script.
   - Open:
     - cameras placed by JumpToCamera or LinkToActor (most per-line cinematics);
     - City Elf: Vaughan's scene plays on the gameplay camera instead of a staged shot (in progress).
@@ -34,12 +35,17 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Walking, click-to-pick, doors and companions following. Followers come along on area changes, and they stand in the exe's formation slots and follow by its rules.
   - The area map shows map notes and only perceived enemies.
   - The follow camera uses the exe's 0.25 m sphere sweep, pull-in and ease-out, and its starting shot (3 m behind, at the leader's height). QA confirmed it at all six origin starts.
+  - Doors are posed by their state (open, Open_2, swinging, fallen), and their camera and click shapes follow the pose.
+  - Open: at close range the camera can end up inside the hero; the Valendrian start (City Elf) has the wrong pitch.
 - 🟡 **Combat and simulation**:
   - NWScript VM with a large share of the engine functions; melee and ability timing; threat; AI-driven party; tactics; loot.
   - Containers hold their template's items and open on USE with the original loot panel (Take All, Close).
   - Perception and combat mode work as the exe does them. Sight lines are cast through the level's collision (`.phy`) and placeables. SetCanLevelUp follows unspent points.
   - Weapons are sheathed out of combat and drawn in combat; draw and sheathe animation timing is not traced.
   - Melee approach works in the live app (#269), and the Proving duel can be finished with the pad.
+  - Melee attackers take slots on the target's 40-slot melee ring at the bodies' reach, as the exe places them, and step into place before swinging. The default body radius is the exe's 0.6 m.
+  - Per-hand attack results are exposed read-only for the presentation (swing and impact sounds).
+  - All six origins play past their openings in the simulation (QA).
   - Visual effects applied at places (the Proving crowd) are exposed to rendering.
   - Not every script engine function is implemented.
 - 🟡 **Party, inventory, journal and other UI screens**:
@@ -47,8 +53,10 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Enemy health bars and the target's name show in fights.
   - Tutorial popups show with their key names. They wait under full-screen menus, and the game stays paused, as in the original, until every queued popup is dismissed (pad A or the panel's Next/Close). The "Paused" banner shows meanwhile, and with a pad the popup title adds "(A: Next)" or "(A: Close)".
   - Fixed since QA run 8: recipes are learned, stacks merge, inventory rows are no longer dimmed, and the Level Up button follows unspent points.
-  - New saves are named New Save, and the character record shows the race icon.
-  - Open: doors in their second open state can be chosen for use rather than walked through; screens have not all been audited against the original.
+  - New saves are named New Save, the save-name dialog takes typed names, and the save shows the class icon.
+  - With a pad: the D-pad types letters into a focused text field, and focus reaches empty equipment slots.
+  - Items with no icon of their own show their base type's.
+  - Open: screens have not all been audited against the original.
 - 🟡 **Rendering**:
   - Working: areas, terrain, sky, fog, clouds, bloom, colour grading, dynamic sun shadows (Low to High detail) and the original shaders.
   - Characters have hair, sampled with its mips and noise. Bare hands and arms take the head's skin tint.
@@ -56,22 +64,21 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Lava draws with its own shaders.
   - Open:
     - water is not drawn (the Fade's black areas);
-    - door poses for open states 3–5;
     - SpeedTree `.spt` files parse but are not drawn.
   - The backend stays on wgpu, and its types are kept inside `thedas-render`.
 - 🟡 **Audio**:
   - Merged:
     - playback: FMOD event (`.fev`) and bank (`.fsb`) playback, mixer, the exe's slider-to-dB volume mapping;
     - music: menu and area music, SetMusicIntensity driving `music_state` (kept in saves);
-    - world: world reverb (area presets and reverb triggers as traced), placed 3D sounds;
+    - world: world reverb (area presets and reverb triggers as traced, levels per I3DL2 with room LF), placed 3D sounds;
     - movement: footsteps by walkmesh surface, foley and vegetation rustles, as traced;
-    - effects: UI sounds, boot movie sound, script PlaySound, and animation sound events (swings, armour foley, weapon hits);
-    - voices: conversation and cutscene voice-over, sound-set and engine barks (traced from the exe), party picker lines, the chargen voice preview.
+    - effects: UI sounds, boot movie sound, script PlaySound, animation sound events (swings, armour foley, weapon hits) and bodyfalls;
+    - voices: conversation and cutscene voice-over, sound-set and engine barks with the exe's sound-set player (counts, shuffle bag, gender), creature sound-set events, party picker lines, the chargen voice preview.
   - Not yet: PlayMusic, voice-over positioning, and the master and secondary reverb chain.
   - Sound is off with `--control` (unless `--audio`) and in headless captures.
 - 🟡 **Controller**: Xbox 360-style layout; menus and in-game screens use focus navigation, and A dismisses tutorial popups. The PC right-click radial menu doesn't exist as a movie in the game data, so LT opens a quickbar picker instead.
 - ✅ **Saves**: F5/F9 quick save and load, save/load screens, typed names. Revision 7 fills older saves' empty containers.
-- ✅ **Performance**: frustum culling, shadow caching and skinned-draw culling (Lothering about 8 ms, the chapel about 1.5 ms offscreen).
+- ✅ **Performance**: frustum culling, shadow caching and skinned-draw culling (Lothering about 8 ms, the chapel about 1.5 ms offscreen). Model node trees are read with a heap stack, so small worker-thread stacks are safe.
 - ⬜ **DA2**: not started. There is no Dragon Age II work in the git log.
 
 ### Known blockers
