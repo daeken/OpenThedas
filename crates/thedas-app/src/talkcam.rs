@@ -1,8 +1,9 @@
 //! The conversation camera and stage marks: while a conversation line with staged
 //! cinematics is up, the view is that line's stage camera (see [`thedas_formats::stage`]),
 //! placed where the area puts the line's stage, and the line's actors are drawn standing at
-//! their stage places. Lines without a shot (replies, unstaged lines) keep the last one; a
-//! conversation without any leaves the game camera and the creatures alone.
+//! their stage places. A line without a shot gets the executable's default framing of its
+//! speaker (see [`default_framing`]); the creatures stay where the last staged line put
+//! them.
 //!
 //! Presentation only: reads the simulation and the dialog and stage resources. The
 //! creatures are drawn at their marks; the simulation keeps them where they were, and they
@@ -102,11 +103,27 @@ impl TalkCamera {
     /// once a line with its own cinematics has run its length and the player has replies
     /// to choose. Provisional: the original's line length is its voice-over's; the cut's
     /// length (5000) is taken instead, and lines without one keep their shot.
-    pub fn camera(&mut self, sim: &Sim, base: &Camera) -> Option<Camera> {
-        let choosing = sim.conversation_line().is_some_and(|o| o.choosing);
+    ///
+    /// A line without a shot of its own is framed as the executable frames a line that
+    /// plays no cinematics (see [`default_framing`]); `face` gives a creature's eyes as
+    /// drawn, offset from where it stands.
+    pub fn camera(
+        &mut self,
+        sim: &Sim,
+        base: &Camera,
+        face: &dyn Fn(ObjectId) -> Option<Vec3>,
+    ) -> Option<Camera> {
+        let open = sim.conversation_line()?;
+        let choosing = open.choosing;
+        let line: LineKey = ((open.dialog.to_ascii_lowercase(), open.owner), open.line);
         let now = self.clock_ms;
+        let staging = self.staging(sim, base).cloned();
         let shown = self.shown.clone();
-        let staged = self.staging(sim, base)?.clone();
+        let held_here = self.held.as_ref().is_some_and(|(held, _)| *held == line);
+        if !held_here && line.1.is_some() {
+            return self.unstaged(sim, base, face);
+        }
+        let staged = staging?;
         let line_done = match (&self.held, shown) {
             (Some((held, _)), Some((line, since))) if *held == line => {
                 staged.line_ms.is_some_and(|ms| now - since >= ms)
@@ -117,6 +134,63 @@ impl TalkCamera {
             Some(d) if choosing && line_done => d,
             _ => staged.camera,
         })
+    }
+
+    /// The default framing of the open conversation's current line (its speaker, seen from
+    /// its listener's side).
+    fn unstaged(
+        &mut self,
+        sim: &Sim,
+        base: &Camera,
+        face: &dyn Fn(ObjectId) -> Option<Vec3>,
+    ) -> Option<Camera> {
+        let open = sim.conversation_line()?;
+        let said = sim.dialog_state()?.speaker;
+        let said = said.trim_end_matches('\0');
+        let Some(speaker) = (if said.is_empty() {
+            Some(open.owner)
+        } else {
+            actor_object(sim, said, &open)
+        }) else {
+            log::debug!("unstaged line: no speaker {said:?}");
+            return None;
+        };
+        // Provisional: the listener is the party's leader (0x68d270 asks for the player's
+        // creature), or the conversation's owner when the leader speaks.
+        let leader = sim.world.controlled().unwrap_or(open.player);
+        let listener = if speaker == leader {
+            open.owner
+        } else {
+            leader
+        };
+        let area = sim.world.area;
+        let here = |id: ObjectId| {
+            sim.world
+                .get(id)
+                .filter(|o| o.area.is_some() && o.area == area)
+        };
+        let Some(s) = here(speaker) else {
+            log::debug!("unstaged line: speaker {said:?} is not in the area");
+            return None;
+        };
+        let listener = here(listener)
+            .filter(|o| o.id != speaker)
+            .map(|o| Vec3::from_array(o.position));
+        log::debug!(
+            "unstaged line: speaker {} ({said}) at {:?} facing {}, eyes {:?}, listener at {:?}",
+            s.tag,
+            s.position,
+            s.facing,
+            face(speaker),
+            listener
+        );
+        Some(default_framing(
+            Vec3::from_array(s.position),
+            s.facing,
+            face(speaker),
+            listener,
+            base,
+        ))
     }
 
     fn shots(&mut self, sim: &Sim, dlg: &str) -> Option<Arc<Vec<Option<LineShot>>>> {
@@ -219,6 +293,79 @@ impl TalkCamera {
     }
 }
 
+/// How far from the speaker's eyes the default framing's camera stands (metres;
+/// 0x68d4b0's 0.9).
+const FRAMING_DISTANCE: f32 = 0.9;
+/// How far the camera stands off the line from the speaker to the listener (degrees,
+/// counter-clockwise; 0x68d4b0's cos/sin of 15°).
+const FRAMING_TURN: f32 = 15.0;
+/// How far below the eyes the camera and its aim are (metres; 0x68d4b0's 0.06).
+const FRAMING_DROP: f32 = 0.06;
+/// The default framing's field of view (degrees): 0x68d4b0 sets 40 divided by a value
+/// the renderer gives (untraced), taken as 1.
+const FRAMING_FOV: f32 = 40.0;
+
+/// The executable's framing of a conversation line that plays no cinematics
+/// (`GameModeDialog` 0x68d4b0, called as each such line comes up, 0x68e0d1 and 0x68e700):
+/// the speaker standing at `at` (facing `facing` degrees, as objects face), with eyes at
+/// `eyes` from there (the `eye_Left` bone in the original; (0, 0, 1) without a model),
+/// seen from 0.9 m in front of its eyes towards the listener at `listener` (along its
+/// facing without one), turned 15° counter-clockwise off that line and 6 cm below the
+/// eyes, looking back at them (0x6c45f0 places the camera, 0x6c4a00 aims it at the
+/// speaker with an offset), with a field of view of 40°. The camera cuts there (blend
+/// time 0).
+///
+/// Provisional: the eyes are the drawn eye meshes' centre rather than the left eye bone;
+/// the field of view's divisor is taken as 1 and the field of view as vertical; the
+/// listener (see [`TalkCamera::camera`]).
+pub fn default_framing(
+    at: Vec3,
+    facing: f32,
+    eyes: Option<Vec3>,
+    listener: Option<Vec3>,
+    base: &Camera,
+) -> Camera {
+    let heading = thedas_sim::world::heading_of(facing).to_radians();
+    let forward = Vec3::new(heading.cos(), heading.sin(), 0.0);
+    let eyes = eyes.unwrap_or(Vec3::Z);
+    // Towards the listener on the ground plane, from the speaker's eyes (0x451a30
+    // normalises; a vanishing direction is +X).
+    let toward = match listener {
+        Some(l) => {
+            let d = Vec3::new(l.x - at.x - eyes.x, l.y - at.y - eyes.y, 0.0);
+            if d.length_squared() > 1e-12 {
+                d.normalize()
+            } else {
+                Vec3::X
+            }
+        }
+        None => forward,
+    } * FRAMING_DISTANCE;
+    let (s, c) = FRAMING_TURN.to_radians().sin_cos();
+    let offset = Vec3::new(
+        c * toward.x - s * toward.y,
+        s * toward.x + c * toward.y,
+        toward.z,
+    );
+    let look = at + eyes - Vec3::Z * FRAMING_DROP;
+    let eye = look + offset;
+    // The aim: 0x68d4b0's tiny shift along and across the offset (0.00061 and 0.0349).
+    let aim = look
+        + Vec3::new(
+            0.000_609_159_5 * offset.x + 0.034_899_496 * offset.y,
+            0.000_609_159_5 * offset.y - 0.034_899_496 * offset.x,
+            0.0,
+        );
+    let dir = (aim - eye).normalize_or(-offset.normalize_or(Vec3::X));
+    Camera {
+        position: eye,
+        yaw: dir.y.atan2(dir.x),
+        pitch: dir.z.clamp(-1.0, 1.0).asin(),
+        fov_y: FRAMING_FOV.to_radians(),
+        ..*base
+    }
+}
+
 /// The creature a cutscene actor names: `OWNER` (the conversation's owner), `PLAYER`
 /// (its player character), `HENCH:<tag>` or a tag (a creature in the current area).
 fn actor_object(sim: &Sim, actor: &str, open: &OpenLine) -> Option<ObjectId> {
@@ -300,6 +447,30 @@ mod tests {
         assert!((c.forward() - Vec3::X).length() < 1e-4, "{:?}", c.forward());
         assert!((c.fov_y - 30f32.to_radians()).abs() < 1e-6);
         assert_eq!(c.far, base.far);
+    }
+
+    #[test]
+    fn frames_an_unstaged_speaker_from_the_listener_side() {
+        let base = Camera::new(Vec3::ZERO, 0.0, 0.0);
+        // The speaker at the origin, eyes 1.6 m up; the listener 3 m along +X.
+        let c = default_framing(
+            Vec3::ZERO,
+            0.0,
+            Some(Vec3::new(0.0, 0.0, 1.6)),
+            Some(Vec3::new(3.0, 0.0, 0.0)),
+            &base,
+        );
+        let t = 15f32.to_radians();
+        let want = Vec3::new(0.9 * t.cos(), 0.9 * t.sin(), 1.6 - 0.06);
+        assert!((c.position - want).length() < 1e-4, "{:?}", c.position);
+        // It looks back at the eyes.
+        let back = (Vec3::new(0.0, 0.0, 1.54) - c.position).normalize();
+        assert!(c.forward().dot(back) > 0.999, "{:?}", c.forward());
+        assert!((c.fov_y - 40f32.to_radians()).abs() < 1e-6);
+        // Without a listener, along the speaker's facing (facing 0 looks along +Y).
+        let c = default_framing(Vec3::ZERO, 0.0, None, None, &base);
+        let want = Vec3::new(-0.9 * t.sin(), 0.9 * t.cos(), 1.0 - 0.06);
+        assert!((c.position - want).length() < 1e-4, "{:?}", c.position);
     }
 
     #[test]
