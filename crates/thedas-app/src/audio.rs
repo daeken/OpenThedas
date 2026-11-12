@@ -116,6 +116,9 @@ pub struct AudioState {
     /// The simulation's game mode (`GM_*` in `script.ldf`: 0 explore, 1 combat, 2 dead,
     /// 4 dialog, 5 cutscene, 9 loading, ...).
     pub game_mode: i32,
+    /// The container whose inventory is open for looting: its id and placeable type (its
+    /// `placeable_types.gda` row).
+    pub container: Option<(u32, i64)>,
     /// An area is loading (the load screen is up): the game mode is `GM_LOADING` for the
     /// sound, whatever the simulation's says.
     pub loading: bool,
@@ -259,6 +262,8 @@ pub struct GameAudio {
     music_request: Option<(i32, f32)>,
     /// The game mode's ducking event playing (see [`mode_duck`]): its path and handle.
     mode_duck: Option<(&'static str, Option<EventHandle>)>,
+    /// The container open last frame (see [`AudioState::container`]).
+    container: Option<u32>,
     /// The music track's ambience ducking event playing (see [`music_duck`]).
     music_duck: Option<(&'static str, Option<EventHandle>)>,
     /// The simulation's music intensity last seen (scripts' `SetMusicIntensity`).
@@ -373,6 +378,10 @@ fn music_duck(track: Option<&str>, music_volume: f32) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// `placeable_types.gda`'s column of the sound a container makes as its inventory opens
+/// (DAOrigins.exe 0x74c2f7).
+const COL_CONTAINER_OPEN: u32 = 0x9809_4859;
 
 const GM_DEAD: i32 = 2;
 const GM_DIALOG: i32 = 4;
@@ -678,6 +687,7 @@ impl GameAudio {
             mode_duck: None,
             script_intensity: None,
             music_duck: None,
+            container: None,
             ss_types: ss_types(vfs),
             sound_set_entries: Default::default(),
             sound_set_bags: Default::default(),
@@ -1728,6 +1738,23 @@ impl GameAudio {
         self.follow_mode(&state);
         self.follow_area(&state, dt);
         self.follow_music_duck(&state);
+        // A container's inventory opening (DAOrigins.exe 0x7314ee -> 0x74c2b0) plays its
+        // placeable type's container column (`placeable_types.gda` 0x98094859, the wooden
+        // chest's `glo_gui/gui/gui_chest1`) in 2D (0x5bc7f0 with no position).
+        let opened = state.container.map(|c| c.0);
+        if opened != self.container
+            && let Some((id, row)) = state.container
+        {
+            let e = self
+                .placeable_types
+                .as_ref()
+                .and_then(|t| table_event(t, row, COL_CONTAINER_OPEN));
+            log::debug!("audio: container {id} opens: {e:?}");
+            if let Some(e) = e {
+                self.engine.play(&e, PlayOptions::default());
+            }
+        }
+        self.container = opened;
         self.follow_cutscene(state.cutscene.clone());
         // Voice-over.
         if self.voice.as_ref().map(|v| &v.0) != state.line.as_ref() {

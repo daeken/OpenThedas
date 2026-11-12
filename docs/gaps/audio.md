@@ -42,7 +42,7 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
 12. **Ambient one-shots** (`amb_oneshots`, `glo_amb_creat`). Played only where the data places them; any engine-driven ambient spawning isn't checked. Small to medium.
 13. **Placeable sounds** (doors, chests and so on).
     - Done: animation events of kind 27 (`ClosedToOpened`, `OpenedToClosed`, `Destroyed`, `Used`) play the `placeable_types.gda` column they name for the placeable's type (0x74c360).
-    - Not done: sounds the exe plays from code rather than animations. These are `sound_plc_column_names.gda`'s rows through 0x74c110 (`Locked`, `Hit`; callers not traced), the unlock and lock-pick-failure columns, and the container-opening column (0x98094859, played at 0x74c2b0 when a container's inventory opens). They need the sim's lock and container events.
+    - Not done: sounds the exe plays from code rather than animations. These are `sound_plc_column_names.gda`'s rows through 0x74c110 (`Locked`, `Hit`; callers not traced), the unlock and lock-pick-failure columns, (the container-opening column, 0x98094859, now plays as a container's inventory opens). They need the sim's lock and container events.
     - Small to medium.
 
 ### Voice-over and conversations
