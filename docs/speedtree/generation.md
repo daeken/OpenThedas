@@ -799,4 +799,97 @@ made from level k − 1:
    (origin y − 0.5) · ((1 + g · k) · size used y · 0.5) of leaf i's texture, and each corner
    colour the average of the two leaves'. Leaves that were not paired do not carry over.
 
-Stages 6 and later: in progress.
+## Stage 6 — Bushes, grass and cattails
+
+There is no separate engine: `bsh_*`, `gra_*` and cattail files (`*_catgras`, `*_catflwr`) are
+ordinary `.spt` trees grown by stages 1–5 with their own parameters. Facts from all 552 game
+files:
+
+- None stores precomputed leaf LODs, so leaves are always grown (5.2–5.4).
+- Fronds of both kinds occur (`kind` 0 blades in about 380 files, 1 extrusions in about 150),
+  usually with 1–4 frond images; 47 files have fronds disabled.
+- Bushes and grass have one leaf image and one frond image in the texture-coordinate section
+  and **no billboard image**, so at any distance they are drawn from their geometry (or not at
+  all, stage 7).
+- Placement scales are the same 0.28–0.34 as trees (format.md).
+
+Expect most of a grass clump's visible surface to come from fronds and leaf cards rather than
+branch tubes; a quick check that the generator is right is that a grass clump comes out at a
+plausible size (well under a metre or two after the placement scale) without special cases.
+
+## Stage 7 — Rendering
+
+This stage lists what the runtime does with the computed geometry, as far as it is known
+without the game's own vertex packing. Items marked **(exe)** must be confirmed in
+DAOrigins.exe's tree vertex builder and draw code before relying on them.
+
+### 7.1 After generation
+
+- After fronds, three more stream draws give the three rocking groups' time offsets:
+  uniform(0, 10000) each, in group order.
+- If the game passes a transform to the computation it is applied to all geometry; levels
+  place each instance with the RML transform instead (format.md). **(exe)** whether the
+  game's call passes a seed override: an override of 0 picks a random seed, 1 keeps the file's
+  seed, anything else replaces it. Keeping the file's seed is the expected behaviour.
+- One tree description is computed once and instanced at every placement.
+
+### 7.2 Leaf cards
+
+Each leaf choice c (2 per texture, 5.3) and rocking group g (3) has a card template:
+
+- Width w = size used x, height h = size used y of texture c / 2, times the LOD size
+  multiplier 1 + `leaf_size_increase` · k for leaf LOD k > 0.
+- Pivot (ox, oy) = the texture's `origin`; for the mirrored choice ox becomes 1 − ox. (Two
+  places in the original disagree on which choice is mirrored for the pivot: the per-frame
+  corner builder mirrors odd choices, the card-description table even ones. Use odd for
+  corners; **(exe)** to confirm.)
+- Corners in card space (x is the facing axis, y right, z up), before billboarding:
+  P1 = (0, (1 − ox)·w, (1 − oy)·h), P2 = (0, −ox·w, (1 − oy)·h), P3 = (0, −ox·w,
+  −oy·h), P4 = (0, (1 − ox)·w, −oy·h).
+- Texture corners: choice 2i uses the leaf image's four atlas corners as stored (format.md),
+  choice 2i + 1 the same with the s values of corners 0↔1 and 2↔3 swapped (mirrored).
+  Corner order matches P1…P4.
+- Angle offsets per card: a 30-entry table of degree values, in order
+  6, −10, 16, −8, 2, −18, −14, 0, −4, 10, −6, 8, 4, −2, 14, −12, 14, −16, 4, −18, 13, 9,
+  17, −9, 3, −7, −15, 7, −5, 15; with t = (c · 3) mod 30, a card's offsets are entry t and
+  entry 29 − t.
+- Every frame the corners are rotated to face the camera (by the camera's azimuth and pitch)
+  combined with the group's rocking, then each leaf draws its card at its position. In DA:O
+  this is done in `spt_leafcards.vsh` from `g_vCameraAngles`, `g_vLeafAngles` and
+  `g_vLeafAngleScalars`; **(exe)** the per-vertex data the game packs for that shader.
+- Leaves with mesh leaves (`mesh.use_meshes`) draw the mesh from the file's mesh section,
+  scaled by max(w, h), instead of a card. **(exe)** whether DA:O uses them.
+
+### 7.3 LOD
+
+- LOD value = clamp(1 − (distance − `near`)/(`far` − `near`), 0, 1), with the distance from
+  the camera to the instance and `TreeInfo::near`/`far`. **(exe)** whether the game overrides
+  near/far.
+- Discrete level for branches, fronds or leaves with N levels: (int)((1 − LOD) · N), minus one
+  if it equals N. When a billboard image exists, leaves have N + 1 levels and the extra one
+  means "billboard".
+- Fade hints (3.7, 4.6) let a level's draws fade as the LOD value moves; the leaf transition
+  settings (`Lod::leaf_transition`, `leaf_transition_radius`, `billboard_transition`) control
+  cross-fading. **(exe)** how DA:O uses them (alpha test vs blend).
+
+### 7.4 Billboards
+
+A tree with a billboard image draws, beyond its last level, a camera-facing quad textured with
+that image from `<level>_diffuse_billboards.dds` (DA:O stores one image per tree even when the
+file says 360° billboards). Its size comes from the computed tree's bounding box: the
+horizontal extent is twice the largest horizontal distance from the origin to a corner of the
+box (in x and y), the height the box's height. **(exe)** the billboard vertex layout and
+`spt_billboards0` shader inputs.
+
+### 7.5 Shaders and vertex data (to trace)
+
+`shaders.erf` has `spt_branch`, `spt_fronds`, `spt_leafcards`, `spt_leafmesh` and
+`spt_billboards0` materials. Their vertex shaders read, for example (constant tables):
+`spt_branch.vsh`: POSITION, NORMAL, TANGENT, TEXCOORD0, TEXCOORD1, TEXCOORD4 with
+`g_amWindMatrices`, `g_fTreeScale`, `g_fWindMatrixOffset`, `g_mViewProjection`,
+`g_vCameraPosition`, `g_vRotationTrigValues`, `g_vSelfShadowMotion`, `g_vTreePos`;
+`spt_leafcards.vsh`: POSITION, NORMAL, TEXCOORD0–3 with `g_vCameraAngles`,
+`g_vLeafAngleScalars`, `g_vLeafAngles`. **(exe)** what the game puts in each attribute (which of
+the generated values: wind weights and groups, fade hints, corner indices, pivots) and in each
+constant, and the wind matrices' animation. Until then, wind can be held still (matrices
+identity) without affecting shape.
