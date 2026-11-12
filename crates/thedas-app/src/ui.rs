@@ -182,6 +182,8 @@ pub struct UiLayer {
     script_popup: Option<((i32, i32, u32), u8)>,
     /// The loading screen up, if any (see [`UiLayer::loading_begin`]).
     loading: Option<Loading>,
+    /// The world map is held up as the loading screen (see [`UiLayer::hold_world_map`]).
+    travel_map: bool,
     /// The screens up last frame, for the events of opening one (see
     /// [`UiLayer::screens_opened`]).
     screens_up: std::collections::BTreeSet<Screen>,
@@ -456,6 +458,7 @@ impl UiLayer {
             tooltip_relayout: 0,
             script_popup: None,
             loading: None,
+            travel_map: false,
             screens_up: Default::default(),
             floaties: Vec::new(),
             stat_floaties: Default::default(),
@@ -642,6 +645,14 @@ impl UiLayer {
             frame: 0,
             outro_ms: 0.0,
         });
+    }
+
+    /// Holds the world map screen up, or lets it go: while the party travels and the area it
+    /// arrives in loads, the map stays up as the loading screen though the simulation has
+    /// closed it, as DAOrigins.exe keeps its world map GUI up until the load ends
+    /// (0x6c6060).
+    pub fn hold_world_map(&mut self, hold: bool) {
+        self.travel_map = hold;
     }
 
     /// Whether load_fade.gfx has faded to black (`GUIFadeToBlackLoading.FadeComplete`);
@@ -1001,6 +1012,10 @@ impl UiLayer {
             let want = match (self.loading, screens.front_end, screens.menu) {
                 // A loading screen stands alone until it has played out.
                 (Some(l), _, _) => std::collections::BTreeSet::from([l.kind.screen()]),
+                // Travelling: the world map stays up as the loading screen.
+                (None, false, _) if self.travel_map => {
+                    std::collections::BTreeSet::from([Screen::WorldMap])
+                }
                 (None, true, None) => std::collections::BTreeSet::from([Screen::StartMenu]),
                 (None, true, Some(m)) => std::collections::BTreeSet::from([m]),
                 (None, false, _) => crate::screens::wanted(&sim, screens.menu),

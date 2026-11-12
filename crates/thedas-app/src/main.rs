@@ -2935,6 +2935,15 @@ fn travel_to_pin(sim: &mut thedas_sim::Sim, tag: &str) -> bool {
 }
 
 fn loading_screen(live: &live::Live, ui: &mut ui::UiLayer, up: &mut bool) {
+    // Travelling on the world map: the map stays up as the loading screen (the simulation
+    // closes it to input when travel starts), but not during a random encounter's stop.
+    // Provisional: until the app's own travel-load state says when (it also covers the
+    // arrival's load).
+    {
+        let sim = live.sim();
+        let wm = &sim.world.world_map;
+        ui.hold_world_map((wm.travelling_to.is_some() || wm.arriving) && !wm.encounter);
+    }
     // THEDAS_NO_LOAD_MOVIE: no loading movie; a load shows the interface over black.
     if std::env::var_os("THEDAS_NO_LOAD_MOVIE").is_some() {
         return;

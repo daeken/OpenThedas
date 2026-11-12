@@ -4,8 +4,8 @@ What is wrong or missing in OpenThedas compared with the original Dragon Age: Or
 detail as we can currently give. The [README](../README.md) says what works; this says what does
 not, so that people (and agents) can pick items up in parallel without stepping on each other.
 
-Last full pass: 2026-11-12, at main `f5ae46b`. Last refresh: 2026-11-12 21:55 UTC, at main
-`1262f72`. The counts measured against a real install were added at `477f24e`. It is refreshed with the
+Last full pass: 2026-11-12, at main `f5ae46b`. Last refresh: 2026-11-12 22:15 UTC, at main
+`99232ea`. The counts measured against a real install were added at `477f24e`. It is refreshed with the
 README status.
 
 ## How to read it
@@ -97,7 +97,7 @@ these, so they are the places where one person or stream can take a large, separ
 - **Shader families outside the default set** fall back to a hand-written stand-in or are
   skipped (`RND-112`, `RND-113`).
 - **SpeedTree.** Trees draw as real geometry with distance levels and billboards far away, but
-  leaf cards do not turn to the camera, nothing sways in the wind, and grass and bushes are
+  only leaf cards use the game's own shader, nothing sways in the wind, and grass and bushes are
   absent (`RND-075` to `RND-078`).
 - **Effects on creatures and items.** Spell effects, crust effects and weapon glows are not
   drawn; only effects placed at a location are (`RND-094`).
