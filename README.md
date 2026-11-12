@@ -41,9 +41,9 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - The follow camera uses the exe's 0.25 m sphere sweep, pull-in and ease-out, and its starting shot (3 m behind, at the leader's height). QA confirmed it at all six origin starts.
   - Doors are posed by their state (open, Open_2, swinging, fallen), and their camera and click shapes follow the pose.
   - With a pad, walking aims at a point ahead and the route goes round obstacles; it no longer stops dead at the first one.
-  - Creatures the camera is inside fade out as the exe does (0.25 m sphere, opacity 0.05, not in dialog or cutscenes). Provisional: the creature shape tested; the exe tests the models' own physics shapes, and the switch to those is in progress.
+  - Creatures the camera is inside fade out as the exe does (0.25 m sphere against the models' creature-group physics shapes, head included; opacity 0.05; not in dialog or cutscenes). Provisional: the shapes are placed by rest pose, not the animated skeleton.
   - With a pad, A walks through open doors instead of using them.
-  - Open: the exe resets the follow camera at the end of loading, a cutscene and a movie, and keeps the zoom across loads; ours does neither yet (in progress).
+  - The follow camera resets behind the leader after a load and at the end of a cutscene, as the exe does, and keeps its zoom across loads.
 - 🟡 **Combat and simulation**:
   - NWScript VM with a large share of the engine functions; melee and ability timing; threat; AI-driven party; tactics; loot.
   - Containers hold their template's items and open on USE with the original loot panel (Take All, Close).
