@@ -51,6 +51,40 @@ pub const FIELD_ENABLED: &str = "TacticsEnabled";
 /// [`PRESET_PREDEFINED`]); unset is predefined when it has a preset.
 pub const FIELD_PRESET_TYPE: &str = "TacticPresetType";
 
+/// The tactics tables (M2DA ids, as DAOrigins.exe loads them) and their columns (by hash:
+/// the names are not all known).
+pub const TABLE_ABILITIES: i32 = 1;
+pub const TABLE_CONDITIONS: i32 = 137;
+pub const TABLE_BASE_CONDITIONS: i32 = 139;
+pub const TABLE_TARGET_TYPES: i32 = 140;
+pub const TABLE_COMMAND_TYPES: i32 = 141;
+const HASH_SHOW: u32 = 0x2a1af533;
+const HASH_PER_FOLLOWER: u32 = 0x1f36ea4e;
+const HASH_TARGET_MASK: u32 = 0x12a02374;
+const HASH_MASK: u32 = 0x77485db5;
+const HASH_CONDITION_BASE: u32 = 0x56bb2ec7;
+const HASH_SELF_ALLOWED: u32 = 0x0a7453a1;
+const HASH_LIMITS_ABILITIES: u32 = 0x8a2e61df;
+const HASH_USE_TYPE: u32 = 0xacefc4c2;
+const HASH_USES_ITEM: u32 = 0x58d1de43;
+const HASH_TARGETS: u32 = 0x0f642429;
+const HASH_BASE_ALLOWED: u32 = 0x2eb7565c;
+const HASH_FOR_TACTICS: u32 = 0x50a30845;
+/// TacticsTargetTypes' Self and Hero rows.
+const TARGET_SELF: i32 = 1;
+const TARGET_HERO: i32 = 5;
+
+/// A table cell as a number (0 when missing or not a number).
+fn int(t: &crate::m2da::Table, hash: u32, row: i64) -> i64 {
+    use thedas_formats::gda::Cell;
+    match t.cell_by_hash(hash, row) {
+        Some(Cell::Int(v)) => *v,
+        Some(Cell::Float(v)) => *v as i64,
+        Some(Cell::String(s)) => s.trim().parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
 impl Sim {
     /// Whether a creature's tactics run: the screen's AI on/off and "Off" preset (PartyTactics'
     /// `Enabled`, which `GetNumTactics` checks, 0x66d580).
@@ -59,6 +93,216 @@ impl Sim {
             .get(who)
             .and_then(|o| o.fields.get(FIELD_ENABLED))
             .is_none_or(|&e| e != 0)
+    }
+
+    /// The target types the tactics screen offers `who` (`ListTacticTargets`): each shown
+    /// row of TacticsTargetTypes (140) that some action can be aimed at, with -1, and for a
+    /// per-follower type, the type once for each follower other than the hero and `who`,
+    /// with the follower. The hero's own type (5) is not offered to the hero. As
+    /// DAOrigins.exe's 0x7b0a80.
+    pub fn tactic_targets(&self, who: ObjectId) -> (Vec<i32>, Vec<i64>) {
+        let (mut types, mut ids) = (Vec::new(), Vec::new());
+        let Some(t) = self.world.tables().get(TABLE_TARGET_TYPES, "") else {
+            return (types, ids);
+        };
+        let hero = self.world.hero;
+        for &row in &t.order {
+            if int(&t, HASH_SHOW, row) == 0 {
+                continue;
+            }
+            let ty = row as i32;
+            if int(&t, HASH_PER_FOLLOWER, row) != 0 {
+                for m in crate::engine::party_of(self) {
+                    if Some(m) == hero || m == who {
+                        continue;
+                    }
+                    if !self.tactic_actions(who, ty, 0).is_empty() {
+                        types.push(ty);
+                        ids.push(m as i64);
+                    }
+                }
+            } else {
+                if Some(who) == hero && ty == TARGET_HERO {
+                    continue;
+                }
+                if !self.tactic_actions(who, ty, 0).is_empty() {
+                    types.push(ty);
+                    ids.push(-1);
+                }
+            }
+        }
+        (types, ids)
+    }
+
+    /// The condition groups (TacticsBaseConditions, 139) offered for a target type
+    /// (`ListTacticBaseConditions`): shown rows whose target mask meets the type's and that
+    /// hold some condition for it. As DAOrigins.exe's 0x7af570.
+    pub fn tactic_base_conditions(&self, target_type: i32) -> Vec<i32> {
+        let tables = self.world.tables();
+        let (Some(base), Some(types)) = (
+            tables.get(TABLE_BASE_CONDITIONS, ""),
+            tables.get(TABLE_TARGET_TYPES, ""),
+        ) else {
+            return Vec::new();
+        };
+        let mask = int(&types, HASH_TARGET_MASK, target_type as i64);
+        if mask == 0 {
+            return Vec::new();
+        }
+        base.order
+            .iter()
+            .filter(|&&row| {
+                int(&base, HASH_SHOW, row) != 0
+                    && int(&base, HASH_MASK, row) & mask != 0
+                    && !self.tactic_conditions(row as i32, target_type).0.is_empty()
+            })
+            .map(|&row| row as i32)
+            .collect()
+    }
+
+    /// The conditions of a group (`ListTacticConditions`): shown rows of TacticsConditions
+    /// (137) in the group, those not allowed for Self (target type 1) left out there, a
+    /// per-follower condition once for each party member but the hero, with the member (else
+    /// -1). As DAOrigins.exe's 0x7aeb50.
+    pub fn tactic_conditions(&self, base: i32, target_type: i32) -> (Vec<i32>, Vec<i64>) {
+        let (mut conds, mut ids) = (Vec::new(), Vec::new());
+        let Some(t) = self.world.tables().get(TABLE_CONDITIONS, "") else {
+            return (conds, ids);
+        };
+        let hero = self.world.hero;
+        for &row in &t.order {
+            if int(&t, HASH_SHOW, row) == 0 || int(&t, HASH_CONDITION_BASE, row) != base as i64 {
+                continue;
+            }
+            if int(&t, HASH_SELF_ALLOWED, row) == 0 && target_type == TARGET_SELF {
+                continue;
+            }
+            if int(&t, HASH_PER_FOLLOWER, row) != 0 {
+                for m in crate::engine::party_of(self) {
+                    if Some(m) != hero {
+                        conds.push(row as i32);
+                        ids.push(m as i64);
+                    }
+                }
+            } else {
+                conds.push(row as i32);
+                ids.push(-1);
+            }
+        }
+        (conds, ids)
+    }
+
+    /// The actions (CommandTypes, 141) `who` can take on a target type
+    /// (`ListTacticActions`): shown rows whose target mask meets the type's, of use type 0, or
+    /// 4 when `who` has an ability for it (or the party an item, for the use-item row), or 2
+    /// when `who` has a mode to switch. As DAOrigins.exe's 0x7afe80.
+    pub fn tactic_actions(&self, who: ObjectId, target_type: i32, base: i32) -> Vec<i32> {
+        let tables = self.world.tables();
+        let (Some(cmds), Some(types)) = (
+            tables.get(TABLE_COMMAND_TYPES, ""),
+            tables.get(TABLE_TARGET_TYPES, ""),
+        ) else {
+            return Vec::new();
+        };
+        let mask = int(&types, HASH_TARGET_MASK, target_type as i64);
+        if mask == 0 {
+            return Vec::new();
+        }
+        cmds.order
+            .iter()
+            .filter(|&&row| {
+                if int(&cmds, HASH_SHOW, row) == 0 || int(&cmds, HASH_MASK, row) & mask == 0 {
+                    return false;
+                }
+                match int(&cmds, HASH_USE_TYPE, row) {
+                    0 => true,
+                    4 if int(&cmds, HASH_USES_ITEM, row) != 0 => {
+                        !self.tactic_items(target_type).is_empty()
+                    }
+                    4 => !self.tactic_abilities(who, target_type, base).is_empty(),
+                    2 => !self.tactic_modal_abilities(who).is_empty(),
+                    _ => false,
+                }
+            })
+            .map(|&row| row as i32)
+            .collect()
+    }
+
+    /// The abilities `who` knows that tactics can use (`ListTacticAbilities`): ABI_base rows
+    /// of use type 4 marked for tactics, and with a condition group that limits them, only
+    /// those it allows. As DAOrigins.exe's 0x7aed50. Provisional: the executable tests the
+    /// target type's bits against 7 (always set), so the target type limits nothing; kept.
+    pub fn tactic_abilities(&self, who: ObjectId, _target_type: i32, base: i32) -> Vec<i32> {
+        let tables = self.world.tables();
+        let Some(abi) = tables.get(TABLE_ABILITIES, "") else {
+            return Vec::new();
+        };
+        let limited = base != 0
+            && tables
+                .get(TABLE_BASE_CONDITIONS, "")
+                .is_some_and(|b| int(&b, HASH_LIMITS_ABILITIES, base as i64) != 0);
+        self.known_abilities(who)
+            .into_iter()
+            .filter(|&id| {
+                let row = id as i64;
+                int(&abi, HASH_USE_TYPE, row) == 4
+                    && int(&abi, HASH_FOR_TACTICS, row) != 0
+                    && (!limited || int(&abi, HASH_BASE_ALLOWED, row) != 0)
+            })
+            .collect()
+    }
+
+    /// The modes `who` can switch (`ListTacticModalAbilities`): known abilities of use type 2
+    /// marked for tactics. As DAOrigins.exe's 0x7aef50.
+    pub fn tactic_modal_abilities(&self, who: ObjectId) -> Vec<i32> {
+        let Some(abi) = self.world.tables().get(TABLE_ABILITIES, "") else {
+            return Vec::new();
+        };
+        self.known_abilities(who)
+            .into_iter()
+            .filter(|&id| {
+                int(&abi, HASH_USE_TYPE, id as i64) == 2
+                    && int(&abi, HASH_FOR_TACTICS, id as i64) != 0
+            })
+            .collect()
+    }
+
+    /// The party's items a use-item command can use on a target type (`ListTacticItems`):
+    /// those whose ability is marked for tactics and aims at the type (Self 1, Enemy 4, others
+    /// 2, against the ability's target bits). As DAOrigins.exe's 0x7af6c0. Items of one tag
+    /// are listed once (the executable keeps them as one stack; here each is its own object).
+    pub fn tactic_items(&self, target_type: i32) -> Vec<ObjectId> {
+        let Some(abi) = self.world.tables().get(TABLE_ABILITIES, "") else {
+            return Vec::new();
+        };
+        let bit = match target_type {
+            1 => 1,
+            3 => 4,
+            _ => 2,
+        };
+        let mut tags = std::collections::BTreeSet::new();
+        self.party_backpack()
+            .into_iter()
+            .filter(|&item| {
+                let Some(a) = self.world.get(item).and_then(|o| o.fields.get("AbilityID")) else {
+                    return false;
+                };
+                let row = *a as i64;
+                int(&abi, HASH_TARGETS, row) & bit != 0
+                    && int(&abi, HASH_FOR_TACTICS, row) != 0
+                    && self
+                        .world
+                        .get(item)
+                        .is_some_and(|o| tags.insert(o.tag.clone()))
+            })
+            .collect()
+    }
+
+    fn known_abilities(&self, who: ObjectId) -> Vec<i32> {
+        self.world
+            .get(who)
+            .map(|o| o.abilities.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// The party member the tactics screen shows.
@@ -114,10 +358,15 @@ impl Sim {
                 let Some(rest) = key.strip_prefix(PREFIX) else {
                     return false;
                 };
-                let Some(value) = int(1) else {
-                    return true;
-                };
+                // An empty value clears an object (`CommandItem` "" for a command that uses
+                // no item); others need a number.
+                let object = int(1)
+                    .and_then(|v| u32::try_from(v).ok())
+                    .filter(|&o| o > 0);
                 if rest == "Enabled" {
+                    let Some(value) = int(1) else {
+                        return true;
+                    };
                     if let Some(o) = self.world.get_mut(who) {
                         o.fields.insert(FIELD_ENABLED.into(), (value != 0) as i32);
                     }
@@ -130,6 +379,11 @@ impl Sim {
                 let Some(slot) = row.parse::<usize>().ok().map(|r| r + 1).filter(|&s| s < 64)
                 else {
                     return true;
+                };
+                let value = match int(1) {
+                    Some(v) => v,
+                    None if *field == "CommandItem" => 0,
+                    None => return true,
                 };
                 // The slots as they stand (a preset not yet applied is applied first).
                 self.tactics_of(who);
@@ -146,8 +400,11 @@ impl Sim {
                     "Condition" => t.condition = value,
                     "Command" => t.command = value,
                     "CommandParam" => t.param = value,
-                    // `TargetID` (a particular party member), `ConditionID` and `CommandItem`
-                    // are not kept. Provisional.
+                    // The party member a per-follower target or condition names (-1 none),
+                    // and the item a use-item command uses ("" none).
+                    "TargetID" => t.target_object = object,
+                    "ConditionID" => t.condition_object = object,
+                    "CommandItem" => t.item = object,
                     _ => {}
                 }
                 true
@@ -323,5 +580,140 @@ mod tests {
         assert!(o.combat.tactics[1].enabled);
         assert_eq!(o.fields.get(FIELD_PRESET_TYPE), Some(&PRESET_PREDEFINED));
         assert!(!s.tactics_message("GUI.Other", &[]));
+    }
+
+    #[test]
+    fn the_pickers_list_what_the_tables_and_the_party_allow() {
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let dog = s.world.spawn(ObjectKind::Creature, "dog");
+        let ali = s.world.spawn(ObjectKind::Creature, "alistair");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().followers = vec![dog, ali];
+        let t = s.world.tables();
+        let c = |v: &[i64]| v.iter().map(|&x| Cell::Int(x)).collect::<Vec<_>>();
+        let h = |x: u32| format!("#{x:08x}");
+        // Target types: Self, Enemy, Hero, a per-follower type, and a hidden one.
+        let (show, tmask, per) = (h(HASH_SHOW), h(HASH_TARGET_MASK), h(HASH_PER_FOLLOWER));
+        t.insert(
+            "#140",
+            &[&show, &tmask, &per],
+            vec![
+                (1, c(&[1, 1, 0])),
+                (3, c(&[1, 4, 0])),
+                (4, c(&[0, 8, 0])),
+                (5, c(&[1, 16, 0])),
+                (6, c(&[1, 32, 1])),
+            ],
+        );
+        // Commands: Attack (enemies only), use ability (4), activate mode (2), use item.
+        let (mask, use_type, item) = (h(HASH_MASK), h(HASH_USE_TYPE), h(HASH_USES_ITEM));
+        t.insert(
+            "#141",
+            &[&show, &mask, &use_type, &item],
+            vec![
+                (2, c(&[1, 4, 0, 0])),
+                (4, c(&[1, 63, 4, 0])),
+                (5, c(&[1, 63, 2, 0])),
+                (7, c(&[1, 63, 4, 1])),
+            ],
+        );
+        // Condition groups: HP (all types), Clustered (enemies, limits abilities).
+        let limits = h(HASH_LIMITS_ABILITIES);
+        t.insert(
+            "#139",
+            &[&show, &mask, &limits],
+            vec![(2, c(&[1, 63, 0])), (4, c(&[1, 4, 1])), (9, c(&[1, 63, 0]))],
+        );
+        // Conditions: two HP ones (one not for Self), a clustered one, a per-follower one.
+        let (base, self_ok) = (h(HASH_CONDITION_BASE), h(HASH_SELF_ALLOWED));
+        t.insert(
+            "#137",
+            &[&show, &base, &self_ok, &per],
+            vec![
+                (1, c(&[1, 2, 1, 0])),
+                (2, c(&[1, 2, 0, 0])),
+                (25, c(&[1, 4, 1, 0])),
+                (30, c(&[1, 9, 1, 1])),
+            ],
+        );
+        // Abilities: a talent (allowed when clustered), a talent, a mode, a potion's ability.
+        let (targets, allowed, tactics) =
+            (h(HASH_TARGETS), h(HASH_BASE_ALLOWED), h(HASH_FOR_TACTICS));
+        t.insert(
+            "#1",
+            &[&use_type, &targets, &allowed, &tactics],
+            vec![
+                (617, c(&[4, 4, 0, 1])),
+                (700, c(&[4, 4, 1, 1])),
+                (19, c(&[2, 1, 0, 1])),
+                (90, c(&[4, 1, 0, 1])),
+            ],
+        );
+        s.world.get_mut(hero).unwrap().abilities = [617, 700].into();
+        // Two potions of one kind in the dog's pack.
+        for _ in 0..2 {
+            let p = s.world.spawn(ObjectKind::Item, "potion");
+            s.world
+                .get_mut(p)
+                .unwrap()
+                .fields
+                .insert("AbilityID".into(), 90);
+            s.world.get_mut(dog).unwrap().inventory.push(p);
+        }
+
+        // Self can be used (an item), not the hero's own type; the follower type once for
+        // each follower but the hero and the one asking.
+        let (types, ids) = s.tactic_targets(hero);
+        assert_eq!(types, vec![1, 3, 6, 6]);
+        assert_eq!(ids, vec![-1, -1, dog as i64, ali as i64]);
+        // The dog has no ability: nothing to do to the hero or a follower.
+        let (types, ids) = s.tactic_targets(dog);
+        assert_eq!((types, ids), (vec![1, 3], vec![-1, -1]));
+        s.world.get_mut(dog).unwrap().abilities.insert(617);
+        let (types, ids) = s.tactic_targets(dog);
+        assert_eq!(
+            (types, ids),
+            (vec![1, 3, 5, 6], vec![-1, -1, -1, ali as i64])
+        );
+        assert_eq!(s.tactic_actions(hero, 3, 0), vec![2, 4]);
+        // Abilities are offered whatever the target type (see `tactic_abilities`).
+        assert_eq!(s.tactic_actions(hero, 1, 0), vec![4, 7]);
+        s.world.get_mut(hero).unwrap().abilities.insert(19);
+        assert_eq!(s.tactic_actions(hero, 1, 0), vec![4, 5, 7]);
+        assert_eq!(s.tactic_modal_abilities(hero), vec![19]);
+        // Groups with conditions for the type; clustered limits the abilities.
+        assert_eq!(s.tactic_base_conditions(3), vec![2, 4, 9]);
+        assert_eq!(s.tactic_base_conditions(1), vec![2, 9]);
+        assert_eq!(s.tactic_conditions(2, 1).0, vec![1], "not for Self");
+        assert_eq!(s.tactic_conditions(2, 3).0, vec![1, 2]);
+        let (conds, ids) = s.tactic_conditions(9, 3);
+        assert_eq!((conds, ids), (vec![30, 30], vec![dog as i64, ali as i64]));
+        assert_eq!(s.tactic_abilities(hero, 3, 0), vec![617, 700]);
+        assert_eq!(s.tactic_abilities(hero, 3, 4), vec![700]);
+        assert_eq!(s.tactic_items(1).len(), 1, "one stack");
+        assert!(s.tactic_items(3).is_empty());
+
+        // The screen's per-follower picks and items reach the slot.
+        let a = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let set = |s: &mut Sim, k: &str, v: &str| {
+            s.tactics_message(
+                MSG_SET_ATTRIBUTE,
+                &a(&[&format!("GUI.SelectedChar.Tactics.TacticsList.0.{k}"), v]),
+            )
+        };
+        let potion = s.tactic_items(1)[0];
+        set(&mut s, "TargetID", &dog.to_string());
+        set(&mut s, "ConditionID", &ali.to_string());
+        set(&mut s, "CommandItem", &potion.to_string());
+        let slot = s.world.get(hero).unwrap().combat.tactics[1].clone();
+        assert_eq!(
+            (slot.target_object, slot.condition_object, slot.item),
+            (Some(dog), Some(ali), Some(potion))
+        );
+        set(&mut s, "TargetID", "-1");
+        set(&mut s, "CommandItem", "");
+        let slot = s.world.get(hero).unwrap().combat.tactics[1].clone();
+        assert_eq!((slot.target_object, slot.item), (None, None));
     }
 }

@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use thedas_sim::Sim;
 
+use crate::UiValue;
 use crate::binding::Presentation;
 use crate::protocol::{GameMessage, MessageHandler};
 
@@ -154,6 +155,62 @@ pub fn present(shown: &mut Presentation, name: &str, args: &[String]) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+/// Answers the movies' questions about `sim` (see [`crate::protocol::QueryHandler`]):
+/// tactics.gfx's pickers (`DAExternalCommands.ListTactic*`, from
+/// [`Sim::tactic_targets`] and its neighbours) and the names it shows for party members
+/// (`GetObjectNameByID`). Unanswered while the simulation is busy elsewhere.
+pub fn query_for(sim: Arc<Mutex<Sim>>) -> crate::protocol::QueryHandler {
+    Arc::new(move |name: &str, args: &[String]| {
+        let sim = sim.try_lock().ok()?;
+        let answer = query(&sim, name, args);
+        log::debug!("query {name} {args:?}: {answer:?}");
+        Some(answer)
+    })
+}
+
+/// [`query_for`]'s answers.
+pub fn query(sim: &Sim, name: &str, args: &[String]) -> UiValue {
+    let int = |i: usize| {
+        args.get(i)
+            .and_then(|a| a.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map_or(0, |v| v as i64)
+    };
+    let list =
+        |v: Vec<i64>| UiValue::List(v.into_iter().map(|x| UiValue::Number(x as f64)).collect());
+    let ints = |v: Vec<i32>| list(v.into_iter().map(i64::from).collect());
+    let who = u32::try_from(int(0)).unwrap_or(0);
+    let pair = |a: &str, x: Vec<i32>, ids: Vec<i64>| {
+        UiValue::Object(
+            [(a.to_string(), ints(x)), ("IDs".to_string(), list(ids))]
+                .into_iter()
+                .collect(),
+        )
+    };
+    match name {
+        "ListTacticTargets" => {
+            let (t, ids) = sim.tactic_targets(who);
+            pair("Targets", t, ids)
+        }
+        "ListTacticBaseConditions" => ints(sim.tactic_base_conditions(int(0) as i32)),
+        "ListTacticConditions" => {
+            let (c, ids) = sim.tactic_conditions(int(0) as i32, int(1) as i32);
+            pair("Conditions", c, ids)
+        }
+        "ListTacticActions" => ints(sim.tactic_actions(who, int(1) as i32, int(2) as i32)),
+        "ListTacticAbilities" => ints(sim.tactic_abilities(who, int(1) as i32, int(2) as i32)),
+        "ListTacticModalAbilities" => ints(sim.tactic_modal_abilities(who)),
+        "ListTacticItems" => list(
+            sim.tactic_items(int(0) as i32)
+                .into_iter()
+                .map(i64::from)
+                .collect(),
+        ),
+        "GetObjectNameByID" => UiValue::String(sim.display_name(who)),
+        _ => UiValue::Undefined,
     }
 }
 

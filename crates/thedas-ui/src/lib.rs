@@ -460,6 +460,10 @@ pub struct UiMovie {
     observers: Vec<(String, String)>,
     /// The value last pushed to each observer.
     sent: std::collections::HashMap<String, UiValue>,
+    /// The movie's scaling-grid sprites (see `gfx::Scale9`), by sprite id, and the scale each
+    /// registered one was last laid out for.
+    scale9: BTreeMap<u16, gfx::Scale9>,
+    scale9_laid: Vec<(f64, f64)>,
 }
 
 /// Turns a callback id from the movie (a number) into its `cm_mapCallbacks` key.
@@ -530,6 +534,8 @@ impl UiMovie {
             authored,
             observers: Default::default(),
             sent: Default::default(),
+            scale9: BTreeMap::new(),
+            scale9_laid: Vec::new(),
         })
     }
 
@@ -555,10 +561,61 @@ impl UiMovie {
         self.player.lock().ok().map(|mut p| f(&mut p))
     }
 
+    /// The movie's scaling-grid sprites, from its rewrite (`RewriteReport::scale9`).
+    pub fn set_scale9(&mut self, scale9: BTreeMap<u16, gfx::Scale9>) {
+        self.scale9 = scale9;
+    }
+
+    /// Lays out the pieces of the scaling-grid sprites whose scale changed since they were
+    /// last laid out (see `gfx::scale9_layout`): Ruffle draws a grid sprite scaled as a whole.
+    fn layout_scale9(&mut self) {
+        if self.scale9.is_empty() {
+            return;
+        }
+        let UiValue::List(v) = self.call(avm1::SCALE9_SCALES, &[]) else {
+            return;
+        };
+        let num = |x: Option<&UiValue>| match x {
+            Some(UiValue::Number(n)) => Some(*n),
+            _ => None,
+        };
+        for (i, t) in v.chunks(3).enumerate() {
+            let (Some(id), Some(xs), Some(ys)) = (num(t.first()), num(t.get(1)), num(t.get(2)))
+            else {
+                continue;
+            };
+            if self.scale9_laid.len() <= i {
+                self.scale9_laid.resize(i + 1, (f64::NAN, f64::NAN));
+            }
+            if self.scale9_laid[i] == (xs, ys) {
+                continue;
+            }
+            self.scale9_laid[i] = (xs, ys);
+            let Some(grid) = self.scale9.get(&(id as u16)).copied() else {
+                continue;
+            };
+            for (k, [x, y, a, b]) in gfx::scale9_layout(&grid, xs / 100.0, ys / 100.0)
+                .into_iter()
+                .enumerate()
+            {
+                let args = [i as f64, k as f64, x, y, a, b].map(UiValue::Number);
+                self.call(avm1::SCALE9_SET, &args);
+            }
+        }
+    }
+
+    /// Runs what the movies put off past the host's last step: post-load functions, then
+    /// the scaling-grid layout.
+    fn after_step(&mut self) {
+        self.call(avm1::POST_LOAD_RUN, &[]);
+        self.layout_scale9();
+    }
+
     /// Advances the movie by `dt_ms` of wall time and runs pending loads.
     pub fn tick(&mut self, dt_ms: f64) {
         self.executor.run();
         self.with_player(|p| p.tick(FloatDuration::from_millis(dt_ms)));
+        self.after_step();
         self.executor.run();
     }
 
@@ -566,6 +623,7 @@ impl UiMovie {
     pub fn run_frame(&mut self) {
         self.executor.run();
         self.with_player(|p| p.run_frame());
+        self.after_step();
         self.executor.run();
     }
 
@@ -638,6 +696,7 @@ impl UiMovie {
                 index: None,
             };
             self.with_player(|p| p.handle_event(ev));
+            self.after_step();
             return;
         }
         // The button under the mouse is released before the movies' mouse-up handlers hide
@@ -645,6 +704,7 @@ impl UiMovie {
         self.set(avm1::HIDE_LATER, UiValue::List(Vec::new()));
         self.with_player(|p| p.handle_event(PlayerEvent::MouseUp { x, y, button }));
         self.call(avm1::HIDE_FLUSH, &[]);
+        self.after_step();
     }
 
     /// The engine side of the movies' `TokenManager`: collects observers registered with

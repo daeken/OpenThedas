@@ -290,6 +290,7 @@ impl Stage {
             image_lookup(self.lookup.clone(), self.images.clone()),
             Some(self.bridge.responder()),
         )?;
+        m.set_scale9(rep.scale9.clone());
         // Run until the injected frame-one action has registered its callback (class
         // definitions and InitMovie run first), then start the movie as the game does.
         for _ in 0..5 {

@@ -2591,6 +2591,7 @@ pub fn call(
                 condition: int(a, 4),
                 command: int(a, 5),
                 param: int(a, 6),
+                ..Default::default()
             };
             if let Some(o) = h.sim.world.get_mut(who) {
                 if o.combat.tactics.len() <= i {
@@ -4034,9 +4035,33 @@ pub fn call(
         // DAOrigins.exe (0x6614f0) returns the item tag string kept in the tactic entry
         // (index - 1, entry + 0x128). SetTacticEntry (0x6615f0) takes no tag and the preset
         // tables (tacticsuserpresets.gda's TacticsTable worksheets) have no item column, so
-        // only the player's tactics screen (and a save holding its rows) gives one; the
-        // simulation has neither, so every entry's tag is empty.
-        "GetTacticCommandItemTag" => ok(Value::String(String::new())),
+        // only the player's tactics screen gives one (`CommandItem`): the item's tag, or
+        // empty.
+        "GetTacticCommandItemTag" => {
+            let (who, i) = (obj(a, 0), int(a, 1));
+            let item = usize::try_from(i)
+                .ok()
+                .and_then(|i| h.sim.tactics_of(who).get(i).and_then(|t| t.item));
+            ok(Value::String(
+                item.and_then(|it| h.object(it))
+                    .map(|o| o.tag.clone())
+                    .unwrap_or_default(),
+            ))
+        }
+        // The party member a slot's per-follower target or condition names (the tactics
+        // screen's `TargetID` and `ConditionID`), else OBJECT_INVALID. Provisional: read
+        // from the screen's writes, not traced in the executable.
+        "GetTacticTargetObject" | "GetTacticConditionObject" => {
+            let (who, i) = (obj(a, 0), int(a, 1));
+            let slot = usize::try_from(i)
+                .ok()
+                .and_then(|i| h.sim.tactics_of(who).get(i).cloned());
+            let o = slot.and_then(|t| match name {
+                "GetTacticTargetObject" => t.target_object,
+                _ => t.condition_object,
+            });
+            ok(Value::Object(o.unwrap_or(OBJECT_INVALID)))
+        }
         // The player's "auto-pause when combat starts" option: DAOrigins.exe (0x65e520)
         // reads it from the game options, where it starts off (0x5e8d57) until the player's
         // settings (`AutoPauseCombat`) say otherwise.
@@ -4283,6 +4308,9 @@ mod tests {
         void UnlockAchievement(string s) = 62;\n\
         int GetNumTactics(object o) = 63;\n\
         void AddTacticPresetID(object o, int n) = 64;\n\
+        object GetTacticTargetObject(object o, int i) = 68;\n\
+        object GetTacticConditionObject(object o, int i) = 69;\n\
+        string GetTacticCommandItemTag(object o, int i) = 70;\n\
         int EVENT_TYPE_PARTYMEMBER_ADDED = 66;\n\
         int EVENT_TYPE_PARTYMEMBER_DROPPED = 67;\n\
         #define ENGINE_STRUCTURE_1 location\n\
@@ -5331,6 +5359,31 @@ mod tests {
             );
         }
         assert_eq!(s.tactic_presets(c), vec![4, 6]);
+        // The tactics screen's per-follower target and item.
+        let dog = s.world.spawn(ObjectKind::Creature, "dog");
+        let potion = s.world.spawn(ObjectKind::Item, "gen_im_qck_health_101");
+        {
+            let t = &mut s.world.get_mut(c).unwrap().combat.tactics[2];
+            t.target_object = Some(dog);
+            t.item = Some(potion);
+        }
+        let slot = |n| [Value::Object(c), Value::Int(n)];
+        assert_eq!(
+            run(&mut s, c, "GetTacticTargetObject", &slot(2)),
+            Some(Value::Object(dog))
+        );
+        assert_eq!(
+            run(&mut s, c, "GetTacticConditionObject", &slot(2)),
+            Some(Value::Object(OBJECT_INVALID))
+        );
+        assert_eq!(
+            run(&mut s, c, "GetTacticCommandItemTag", &slot(2)),
+            Some(Value::String("gen_im_qck_health_101".into()))
+        );
+        assert_eq!(
+            run(&mut s, c, "GetTacticCommandItemTag", &slot(1)),
+            Some(Value::String(String::new()))
+        );
     }
 
     #[test]
