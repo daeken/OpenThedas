@@ -364,6 +364,8 @@ pub struct AreaScene {
     /// The layout's cutaway height ([`thedas_formats::level::Arl::cutaway_height`]), when
     /// the scene has a layout.
     pub cutaway_height: Option<f32>,
+    /// SpeedTree placements' constants by draw, for draws with the game's `spt_*` shaders.
+    pub tree_constants: HashMap<usize, crate::d3d::TreeConstants>,
 }
 
 /// A model (or several, drawn together) the simulation places in the level: a creature or a
@@ -739,7 +741,7 @@ impl<'a> Loader<'a> {
         &mut self,
         level: &str,
         trees: &[String],
-        spots: &[(usize, Mat4, f32)],
+        spots: &[(usize, Mat4, f32, [f32; 4])],
     ) {
         let level = level.to_ascii_lowercase();
         let probe = self.room_probe(&level, "");
@@ -752,9 +754,16 @@ impl<'a> Loader<'a> {
                 .or_insert_with(|| {
                     l.read(texture).ok()?;
                     let key = format!("{texture}:spt_{semantic}.mao");
-                    let xml = format!(
-                        r#"<MaterialObject Name="spt"><Material Name="prop.mat"/><DefaultSemantic Name="{semantic}"/><Texture Name="mml_tDiffuse" ResName="{texture}"/></MaterialObject>"#
-                    );
+                    // The game's own leaf-card material, else a `prop.mat` stand-in.
+                    let xml = if semantic == "spt_leafcards" {
+                        format!(
+                            r#"<MaterialObject Name="spt_leafcards"><Material Name="SPT_LeafCards.mat"/><DefaultSemantic Name="default"/><Texture Name="smpDiffuseMap" ResName="{texture}"/></MaterialObject>"#
+                        )
+                    } else {
+                        format!(
+                            r#"<MaterialObject Name="spt"><Material Name="prop.mat"/><DefaultSemantic Name="{semantic}"/><Texture Name="mml_tDiffuse" ResName="{texture}"/></MaterialObject>"#
+                        )
+                    };
                     let m = l.build_material(&key, xml.as_bytes())?;
                     l.scene.materials.push(m);
                     Some(l.scene.materials.len() - 1)
@@ -771,7 +780,11 @@ impl<'a> Loader<'a> {
         type Batch = Vec<(Mat4, Vec3, f32)>;
         type BatchKey = ((i64, i64), usize, usize, usize, bool);
         let mut batches: BTreeMap<BatchKey, Batch> = BTreeMap::new();
-        for &(tree, placement, scale) in spots {
+        // Per tree: its leaf cards for the game's `SPT_LeafCards` shader (one draw per
+        // placement, placed by constants), and its leaf rock and rustle scalars.
+        let mut card_parts: HashMap<usize, (usize, usize, [f32; 2])> = HashMap::new();
+        let leaf_material = material(self, &atlas, "spt_leafcards");
+        for &(tree, placement, scale, color) in spots {
             let built = built_trees.entry(tree).or_insert_with(|| {
                 let name = format!("{}.spt", trees.get(tree)?.to_ascii_lowercase());
                 let spt = thedas_formats::speedtree::parse(&self.read(&name).ok()?).ok()?;
@@ -809,12 +822,17 @@ impl<'a> Loader<'a> {
                     if let Some(cards) = mesh.leaves.first()
                         && !cards.is_empty()
                     {
-                        let (vertices, indices) = leaf_cards(cards);
-                        parts.push((
-                            self.tree_mesh(&name, "leaves", &vertices, indices),
-                            m,
-                            false,
-                        ));
+                        if let Some(lm) = leaf_material {
+                            let cards_mesh = self.spt_leaf_cards(&name, cards);
+                            card_parts.insert(tree, (cards_mesh, lm, mesh.leaf_angle_scalars));
+                        } else {
+                            let (vertices, indices) = leaf_cards(cards);
+                            parts.push((
+                                self.tree_mesh(&name, "leaves", &vertices, indices),
+                                m,
+                                false,
+                            ));
+                        }
                     }
                     // Mesh leaves (7.3), already placed in tree space; drawn from both sides
                     // like the cards.
@@ -870,6 +888,40 @@ impl<'a> Loader<'a> {
                 (anchor.x / TREE_CELL).floor() as i64,
                 (anchor.y / TREE_CELL).floor() as i64,
             );
+            if let Some(&(cards, lm, scalars)) = card_parts.get(&tree) {
+                let yaw = {
+                    let x = placement.x_axis;
+                    x.y.atan2(x.x)
+                };
+                self.scene.tree_constants.insert(
+                    self.scene.draws.len(),
+                    crate::d3d::TreeConstants {
+                        position: [anchor.x, anchor.y, anchor.z, yaw],
+                        scale,
+                        color,
+                        leaf_angle_scalars: scalars,
+                        wind_offset: 0.0,
+                    },
+                );
+                self.scene.draws.push(DrawItem {
+                    mesh: cards,
+                    material: lm,
+                    transform,
+                    lightmap: None,
+                    sphere: (transform.transform_point3(Vec3::ZERO), radius * scale),
+                    model: name_of_tree(trees, tree),
+                    room: String::new(),
+                    room_id: None,
+                    probe,
+                    skin: None,
+                    cast_shadow: Some(false),
+                    lod: Some(DrawLod {
+                        anchor,
+                        far_sq: far * far,
+                        beyond: false,
+                    }),
+                });
+            }
             for (mesh, material, beyond) in parts {
                 batches
                     .entry((cell, tree, mesh, material, beyond))
@@ -943,6 +995,100 @@ impl<'a> Loader<'a> {
                 }),
             });
         }
+    }
+
+    /// A tree's leaf cards as the game packs them for `SPT_LeafCards` (speedtree-exe-trace
+    /// §3; docs/speedtree 7.2), six vertices (two triangles) per card in tree space:
+    /// POSITION the leaf, NORMAL the corner's normal, TEXCOORD0 (u, v, corner, 1),
+    /// TEXCOORD1 (w, h, pivot x − ½, pivot y − ½), TEXCOORD2 (angle offsets in radians,
+    /// leaf-angle index, colour scale), TEXCOORD3 the wind (index, weight, index, weight).
+    /// The game stores halves; floats here.
+    fn spt_leaf_cards(&mut self, name: &str, cards: &[LeafCard]) -> usize {
+        use thedas_formats::mesh::{DeclType, VertexElement};
+        const STRIDE: u32 = 96;
+        let mut raw: Vec<u8> = Vec::with_capacity(cards.len() * 6 * STRIDE as usize);
+        let mut vertices = Vec::with_capacity(cards.len() * 6);
+        for card in cards {
+            // The card's size and pivot from its corners: corner 0 is (P8·w, P12·h),
+            // corner 2 ((P8 − 1)·w, (P12 − 1)·h).
+            let [c0, _, c2, _] = card.corners;
+            let (w, h) = (c0[0] - c2[0], c0[1] - c2[1]);
+            let (px, py) = (
+                if w != 0.0 { c0[0] / w } else { 0.5 },
+                if h != 0.0 { c0[1] / h } else { 0.5 },
+            );
+            let rad = std::f32::consts::PI / 180.0;
+            for corner in [0usize, 1, 2, 0, 2, 3] {
+                let p = card.position;
+                let n = card.normals[corner];
+                let uv = card.uv[corner];
+                let wind = card.wind;
+                let attrs: [[f32; 4]; 6] = [
+                    [p[0], p[1], p[2], 1.0],
+                    [n[0], n[1], n[2], 1.0],
+                    [uv[0], uv[1], corner as f32, 1.0],
+                    [w, h, px - 0.5, py - 0.5],
+                    [
+                        card.angle_offsets[0] * rad,
+                        card.angle_offsets[1] * rad,
+                        card.angle_index as f32,
+                        card.color_scale,
+                    ],
+                    [
+                        wind.matrices[0] as f32,
+                        wind.weights[0],
+                        wind.matrices[1] as f32,
+                        wind.weights[1],
+                    ],
+                ];
+                for a in attrs {
+                    raw.extend_from_slice(bytemuck::cast_slice(&a));
+                }
+                vertices.push(Vertex {
+                    position: p,
+                    normal: n,
+                    uv0: uv,
+                    uv1: [0.0, 0.0],
+                });
+            }
+        }
+        let element = |offset: u32, usage: DeclUsage, usage_index: u32| VertexElement {
+            stream: 0,
+            offset,
+            ty: DeclType::Float4,
+            usage,
+            usage_index,
+        };
+        let key = format!("{name}:spt_leafcards");
+        let count = vertices.len() as u32;
+        self.scene.meshes.push(SceneMesh {
+            key: key.clone(),
+            chunk: MeshChunk {
+                name: key,
+                vertex_size: STRIDE,
+                vertex_count: count,
+                index_count: count,
+                primitive: 0,
+                index_format: thedas_formats::mesh::IndexFormat::U32,
+                base_vertex: 0,
+                vertex_offset: 0,
+                start_index: 0,
+                elements: vec![
+                    element(0, DeclUsage::Position, 0),
+                    element(16, DeclUsage::Normal, 0),
+                    element(32, DeclUsage::TexCoord, 0),
+                    element(48, DeclUsage::TexCoord, 1),
+                    element(64, DeclUsage::TexCoord, 2),
+                    element(80, DeclUsage::TexCoord, 3),
+                ],
+                bounds: None,
+            },
+            vertices,
+            indices: (0..count).collect(),
+            raw_vertices: raw,
+            positions: None,
+        });
+        self.scene.meshes.len() - 1
     }
 
     /// A SpeedTree surface as a scene mesh.
@@ -1925,7 +2071,7 @@ impl AreaScene {
             })
             .collect();
         // SpeedTree placements (rooms' and the level's): tree, world placement, scale.
-        let mut tree_spots: Vec<(usize, Mat4, f32)> = Vec::new();
+        let mut tree_spots: Vec<(usize, Mat4, f32, [f32; 4])> = Vec::new();
         for room in &arl.rooms {
             l.scene.rooms.push(room.name.clone());
             let room_probe = l.room_probe(level, &room.name);
@@ -1951,11 +2097,14 @@ impl AreaScene {
             };
             l.scene.light_rooms.insert(room.id, rml.light_rooms.clone());
             let room_m = transform_matrix(&rml.transform);
-            tree_spots.extend(
-                rml.trees
-                    .iter()
-                    .map(|t| (t.tree, room_m * transform_matrix(&t.transform), t.scale)),
-            );
+            tree_spots.extend(rml.trees.iter().map(|t| {
+                (
+                    t.tree,
+                    room_m * transform_matrix(&t.transform),
+                    t.scale,
+                    t.color,
+                )
+            }));
             for p in &rml.placements {
                 let placement = room_m
                     * transform_matrix(&p.transform)
@@ -1991,11 +2140,14 @@ impl AreaScene {
                 Ok(Ok(rml)) => {
                     let probe = l.room_probe(level, "");
                     let level_m = transform_matrix(&rml.transform);
-                    tree_spots.extend(
-                        rml.trees
-                            .iter()
-                            .map(|t| (t.tree, level_m * transform_matrix(&t.transform), t.scale)),
-                    );
+                    tree_spots.extend(rml.trees.iter().map(|t| {
+                        (
+                            t.tree,
+                            level_m * transform_matrix(&t.transform),
+                            t.scale,
+                            t.color,
+                        )
+                    }));
                     for p in &rml.placements {
                         let placement = level_m
                             * transform_matrix(&p.transform)

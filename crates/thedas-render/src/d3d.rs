@@ -135,9 +135,18 @@ fn build(vfs: &Vfs, vs_name: &str, ps_name: &str, state_name: &str) -> Result<D3
     if vs.stage != Stage::Vertex || ps.stage != Stage::Pixel {
         return Err(format!("{vs_name}/{ps_name}: wrong shader stages"));
     }
-    let alpha_test = pass
-        .alpha_test
-        .and_then(|(f, r)| comparison(f).map(|c| (c, r as f32 / 255.0)));
+    // The SpeedTree leaf and frond states turn the alpha test on without naming its
+    // function; the engine's default is not traced, and only a cut-out (greater) gives the
+    // game's leaves (provisional; speedtree-exe-trace 11.5).
+    let spt = state_res.to_ascii_lowercase().starts_with("spt_");
+    let alpha_test = pass.alpha_test.and_then(|(f, r)| {
+        let f = if spt && f == CompareFunc::Always {
+            CompareFunc::Greater
+        } else {
+            f
+        };
+        comparison(f).map(|c| (c, r as f32 / 255.0))
+    });
     let ps_t = translate::translate(
         &ps,
         &Options {
@@ -346,7 +355,7 @@ pub const VFX_VERTEX_SHADERS: [&str; 8] = [
 ];
 
 /// See [`object_filter`].
-pub const OBJECT_VERTEX_SHADERS: [&str; 14] = [
+pub const OBJECT_VERTEX_SHADERS: [&str; 15] = [
     "Char1.vsh",
     "Hair0_Pass1.vsh",
     "Hair0.vsh",
@@ -361,6 +370,7 @@ pub const OBJECT_VERTEX_SHADERS: [&str; 14] = [
     "Clouds.vsh",
     "Lava0.vsh",
     "Water0.vsh",
+    "SPT_LeafCards.vsh",
 ];
 
 /// Point lights chosen for one draw.
@@ -616,6 +626,79 @@ pub fn ambient_of(lights: &[SceneLight], class: LightClass) -> Vec3 {
 }
 
 /// Everything needed to fill one draw's constants.
+/// One SpeedTree placement's constants for the game's `spt_*` shaders (DAOrigins.exe's
+/// per-instance set-up 0x52dfa0; speedtree-exe-trace §8.3): the shaders place the tree from
+/// these, not from a world matrix.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TreeConstants {
+    /// `g_vTreePos`: the placement's position, `w` its yaw (radians).
+    pub position: [f32; 4],
+    /// `g_fTreeScale`: RML 3356.
+    pub scale: f32,
+    /// `g_vColorMultiplier`: RML 3375, the trees' ambient term.
+    pub color: [f32; 4],
+    /// `g_vLeafAngleScalars`: the tree's leaf rock and rustle scalars.
+    pub leaf_angle_scalars: [f32; 2],
+    /// `g_fWindMatrixOffset`: which of the six wind matrices index 0 means.
+    pub wind_offset: f32,
+}
+
+impl TreeConstants {
+    /// A constant of the `spt_*` shaders, when `name` is one: the per-placement ones,
+    /// `g_vCameraAngles` from the camera looking along `forward`, the sun (`g_vLightDir`
+    /// towards it, `g_vLightDiffuse`), and the wind held still (identity matrices, no leaf
+    /// rocking). Provisional: the wind is not animated.
+    pub fn value(
+        &self,
+        name: &str,
+        forward: Vec3,
+        sun: Option<(Vec3, Vec3)>,
+    ) -> Option<Vec<[f32; 4]>> {
+        let yaw = self.position[3];
+        Some(match name {
+            "g_vTreePos" => vec![self.position],
+            "g_fTreeScale" => vec![[self.scale, 0.0, 0.0, 0.0]],
+            "g_vRotationTrigValues" => vec![[yaw.sin(), yaw.cos(), -yaw.sin(), 0.0]],
+            "g_vColorMultiplier" => vec![self.color],
+            "g_vLeafAngleScalars" => {
+                vec![[
+                    self.leaf_angle_scalars[0],
+                    self.leaf_angle_scalars[1],
+                    0.0,
+                    0.0,
+                ]]
+            }
+            "g_fWindMatrixOffset" => vec![[self.wind_offset, 0.0, 0.0, 0.0]],
+            "g_fAlphaMultiplier" => vec![[1.0, 0.0, 0.0, 0.0]],
+            "g_amWindMatrices" => (0..28)
+                .map(|i| {
+                    let mut r = [0.0; 4];
+                    r[i % 4] = 1.0;
+                    r
+                })
+                .collect(),
+            "g_vLeafAngles" => vec![[0.0; 4]; 20],
+            "g_vCameraAngles" => {
+                // The tree library's camera angles (azimuth = atan2(y, x) of the view
+                // direction, pitch = −asin(z)), the azimuth wrapped into [0, 2π) (0x52d810).
+                let f = forward.normalize_or_zero();
+                let azimuth = f.y.atan2(f.x).rem_euclid(std::f32::consts::TAU);
+                let pitch = -f.z.clamp(-1.0, 1.0).asin();
+                vec![[azimuth, pitch, 0.0, 0.0]]
+            }
+            "g_vLightDir" => {
+                let d = sun.map_or(Vec3::Z, |(dir, _)| -dir.normalize_or_zero());
+                vec![[d.x, d.y, d.z, 0.0]]
+            }
+            "g_vLightDiffuse" => {
+                let c = sun.map_or(Vec3::ZERO, |(_, c)| c);
+                vec![[c.x, c.y, c.z, 1.0]]
+            }
+            _ => return None,
+        })
+    }
+}
+
 pub struct ConstantContext<'a> {
     pub view: Mat4,
     pub projection: Mat4,
@@ -645,6 +728,8 @@ pub struct ConstantContext<'a> {
     /// The shadow partition being drawn into (`ShadowPartitionMatrix`, world to the
     /// partition's clip space), for the casters' `PSSM` programs.
     pub partition: Option<Mat4>,
+    /// For a SpeedTree draw with the game's shaders: its placement's constants.
+    pub tree: Option<&'a TreeConstants>,
 }
 
 /// The ambient term's base (see the module docs): zero at every Graphics Detail setting
@@ -822,6 +907,12 @@ impl ConstantContext<'_> {
             let plain = !usage.is_empty() && !usage.ends_with("Trans");
             return Some(Value::Matrix(if plain { m.transpose() } else { m }));
         }
+        if let Some(t) = self.tree {
+            let forward = -self.view.inverse().z_axis.truncate();
+            if let Some(v) = t.value(&c.name, forward, self.sun) {
+                return Some(Value::Vectors(v));
+            }
+        }
         Some(match (usage, c.name.as_str()) {
             ("CameraPosition", _) | (_, "g_vCameraPosition") => {
                 // `w` is the camera's +0x138 (DAOrigins.exe): 0 for the exploration camera
@@ -959,6 +1050,7 @@ impl ConstantContext<'_> {
                 | "aur_mWorld"
                 | "aur_mModelView"
                 | "g_vCameraPosition"
+                | "g_vCameraAngles"
                 | "bsm_bones"
         )
     }
@@ -1205,6 +1297,7 @@ mod tests {
             time: 0.0,
             shadow: NO_SHADOW_DATA,
             partition: None,
+            tree: None,
         };
         let t = table(vec![
             constant(
@@ -1338,6 +1431,7 @@ mod tests {
             time: 0.0,
             shadow: NO_SHADOW_DATA,
             partition: None,
+            tree: None,
         };
         let c = cc.fill(Some(&table(vec![constant(
             "mml_vTintColor",
@@ -1426,6 +1520,7 @@ mod tests {
                 time: 0.0,
                 shadow: NO_SHADOW_DATA,
                 partition: None,
+                tree: None,
             };
             let c = cc.fill(Some(&table(vec![constant(
                 "aur_mWorld",
