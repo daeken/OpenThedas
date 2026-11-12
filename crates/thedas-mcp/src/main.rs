@@ -1688,6 +1688,11 @@ impl Server {
             let from = resolve(sim, &a.object).ok_or("no such object")?;
             let money = sim.world.get(hero).map_or(0, |h| h.money);
             let items = sim.loot(from, hero);
+            // A loot panel an earlier interact opened on this container is closed, as taking
+            // everything and closing it would leave things; saves made next do not carry it.
+            if sim.world.container == Some(from) {
+                sim.close_container();
+            }
             let money = sim.world.get(hero).map_or(0, |h| h.money) - money;
             // Put on whatever fits a free slot, as a player picking their gear back up would.
             let equipped = sim.equip_free_slots(hero);
