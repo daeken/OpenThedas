@@ -937,7 +937,9 @@ Each leaf choice c (2 per texture, 5.3) has a card:
 
 ### 7.3 Mesh leaves
 
-DA:O uses them: 446 of 552 tree files have at least one leaf texture with `use_meshes` set.
+DA:O uses them, though less than the flag suggests: 446 of 552 tree files set `use_meshes` on
+at least one leaf texture, but only 164 files grow any leaves and 90 grow mesh leaves (the
+grass files, for example, set the flag and grow no leaves).
 
 - A leaf is a **mesh leaf** when its texture has `use_meshes`, its mesh index names a mesh in
   the file's mesh section (`SpeedTree::meshes`), and that mesh has more than 2 vertices.
@@ -968,8 +970,10 @@ The game ignores the file's `near` and `far` and computes its own per placement:
 
 - r = half the diagonal of the computed tree's bounding box × the placement scale;
   t = (clamp(r, 2, 30) − 2) / 28; near = (15 + 5·t) · M, far = (35 + 85·t) · M, with
-  M = 1, 1.5 or 2 by the placement's LOD class (RML field 3379; 0 in every Korcari Wilds
-  placement).
+  M from a three-entry table indexed by the placement's LOD class (RML field 3379, a signed
+  byte): class 0 → 1, class 1 → 1.5, class 2 → 2. Every Korcari Wilds placement has class 0.
+  Other values were not seen; the game does not range-check the index, so clamping to 0–2 is
+  an acceptable choice.
 - Each frame, with d² the squared distance from the camera to the placement point (not the
   box centre) and G = (detail scale × zoom)² (detail scale 0.5, 1.0, 1.2 or 1.5 by the
   graphics detail option; zoom = min(60° / field of view, 3) in the game's zoomable camera
