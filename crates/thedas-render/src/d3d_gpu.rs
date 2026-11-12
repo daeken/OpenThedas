@@ -132,6 +132,11 @@ pub(crate) struct D3dPass {
     in_view: std::sync::Mutex<Vec<bool>>,
     /// Each draw's constants that stay as it was made, once it was first in view, and which
     /// of its stages' constants change each frame (see [`ConstantContext::per_frame`]).
+    /// Sound while a draw's material, lightmap, lights, ambient, probe and the pass's sun,
+    /// fog, sky and clouds are fixed when the pass is made: only [`D3dPass::set_world`] and
+    /// [`D3dPass::set_bones`] change a draw afterwards, and both feed per-frame constants
+    /// (anything else that changes an object's look rebuilds its pass). A setter for any of
+    /// the fixed inputs must clear the draw's entry here.
     statics: std::sync::Mutex<Vec<Option<Box<StaticConstants>>>>,
     caster_programs: Vec<Arc<D3dProgram>>,
     /// The (empty) texture bindings of the casters' programs.
