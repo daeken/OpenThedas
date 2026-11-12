@@ -974,6 +974,109 @@ fn top_function() -> Vec<u8> {
     function(&["c", "t"], &a.finish())
 }
 
+/// The host's list of what a pad's focus can land on (see [`FOCUS_LIST`]).
+pub const FOCUS_LIST: &str = "_global.thedas_focus_list";
+
+/// `function (c, o)`: pushes onto `o` each clip below `c` that takes a click (`onRelease` or
+/// `onPress`), visible all the way up and not disabled (`enabled === false`), as
+/// `"path|xMin|yMin|xMax|yMax"` with its bounds in `_root`'s space; a clip that takes the
+/// click is not searched further (its children's handlers never see the mouse).
+/// Provisional: Scaleform's own focus search is not traced (this is the host's stand-in for
+/// the console focus the PC movies leave half-built).
+fn focus_function() -> Vec<u8> {
+    let mut a = Asm::default();
+    get_path(&mut a.code, &["c"]);
+    a.code.push(ENUMERATE2);
+    a.label("next");
+    let c = &mut a.code;
+    record(c, STORE_REGISTER, &[0]);
+    c.push(POP);
+    push(c, &[Push::Register(0), Push::Null]);
+    c.push(EQUALS2);
+    a.branch(IF, "done");
+    let c = &mut a.code;
+    push(c, &[Push::Str("m")]);
+    get_path(c, &["c"]);
+    push(c, &[Push::Register(0)]);
+    c.extend_from_slice(&[GET_MEMBER, DEFINE_LOCAL]);
+    get_path(c, &["m"]);
+    c.push(TYPEOF);
+    push(c, &[Push::Str("movieclip")]);
+    c.extend_from_slice(&[STRICT_EQUALS, NOT]);
+    a.branch(IF, "next");
+    let c = &mut a.code;
+    get_path(c, &["m", "_parent"]);
+    get_path(c, &["c"]);
+    c.extend_from_slice(&[EQUALS2, NOT]);
+    a.branch(IF, "next");
+    get_path(&mut a.code, &["m", "_visible"]);
+    a.code.push(NOT);
+    a.branch(IF, "next");
+    let c = &mut a.code;
+    get_path(c, &["m", "enabled"]);
+    push(c, &[Push::Bool(false)]);
+    c.push(STRICT_EQUALS);
+    a.branch(IF, "next");
+    for h in ["onRelease", "onPress"] {
+        get_path(&mut a.code, &["m", h]);
+        a.branch(IF, "button");
+    }
+    // _global.thedas_focus(m, o);
+    let c = &mut a.code;
+    get_path(c, &["o"]);
+    get_path(c, &["m"]);
+    push(c, &[Push::Int(2)]);
+    get_path(c, &["_global"]);
+    push(c, &[Push::Str("thedas_focus")]);
+    c.extend_from_slice(&[CALL_METHOD, POP]);
+    a.branch(JUMP, "next");
+    a.label("button");
+    // var b = m.getBounds(_root); o.push(m + "|" + b.xMin + "|" + ... + b.yMax);
+    let c = &mut a.code;
+    push(c, &[Push::Str("b")]);
+    get_path(c, &["_root"]);
+    push(c, &[Push::Int(1)]);
+    get_path(c, &["m"]);
+    push(c, &[Push::Str("getBounds")]);
+    c.extend_from_slice(&[CALL_METHOD, DEFINE_LOCAL]);
+    push(c, &[Push::Str("")]);
+    get_path(c, &["m"]);
+    c.push(ADD2);
+    for f in ["xMin", "yMin", "xMax", "yMax"] {
+        push(c, &[Push::Str("|")]);
+        c.push(ADD2);
+        get_path(c, &["b", f]);
+        c.push(ADD2);
+    }
+    push(c, &[Push::Int(1)]);
+    get_path(c, &["o"]);
+    push(c, &[Push::Str("push")]);
+    c.extend_from_slice(&[CALL_METHOD, POP]);
+    a.branch(JUMP, "next");
+    a.label("done");
+    push(&mut a.code, &[Push::Undefined]);
+    a.code.push(RETURN);
+    function(&["c", "o"], &a.finish())
+}
+
+/// `function () { var o = new Array(); _global.thedas_focus(_root, o); return o.join(";"); }`
+fn focus_list_function() -> Vec<u8> {
+    let mut c = Vec::new();
+    push(&mut c, &[Push::Str("o"), Push::Int(0), Push::Str("Array")]);
+    c.extend_from_slice(&[NEW_OBJECT, DEFINE_LOCAL]);
+    get_path(&mut c, &["o"]);
+    get_path(&mut c, &["_root"]);
+    push(&mut c, &[Push::Int(2)]);
+    get_path(&mut c, &["_global"]);
+    push(&mut c, &[Push::Str("thedas_focus")]);
+    c.extend_from_slice(&[CALL_METHOD, POP]);
+    push(&mut c, &[Push::Str(";"), Push::Int(1)]);
+    get_path(&mut c, &["o"]);
+    push(&mut c, &[Push::Str("join")]);
+    c.extend_from_slice(&[CALL_METHOD, RETURN]);
+    function(&[], &c)
+}
+
 /// `function (l) { if (l.thedas_proxy == undefined && !l.thedas_is_proxy) { var p = new
 /// Object(); p.thedas_is_proxy = 1; p.l = l; p.onMouseDown = function () {
 /// this.l.onMouseDown(1, Mouse.getTopMostEntity(false)); }; (onMouseUp likewise);
@@ -1483,6 +1586,16 @@ pub fn register_invoke() -> Vec<u8> {
     push(&mut out, &[Push::Str("getTopMostEntity")]);
     out.extend(top_most_entity_function());
     out.push(SET_MEMBER);
+    // The pad's focus targets (see `focus_function`).
+    for (name, f) in [
+        ("thedas_focus", focus_function()),
+        ("thedas_focus_list", focus_list_function()),
+    ] {
+        get_path(&mut out, &["_global"]);
+        push(&mut out, &[Push::Str(name)]);
+        out.extend(f);
+        out.push(SET_MEMBER);
+    }
     // Mouse listeners called as Scaleform called them (see `listener_proxy_function`):
     // those added from now on, and (here and again at INSTALL) those added before.
     for (name, f) in [

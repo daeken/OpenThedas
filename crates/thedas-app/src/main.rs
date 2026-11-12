@@ -45,6 +45,7 @@
 
 mod chargen_stage;
 mod control;
+mod focusnav;
 mod follow;
 mod intro;
 mod live;
@@ -1871,6 +1872,13 @@ impl padplay::Host for App {
         self.gfx.as_ref().is_some_and(|g| g.ui.stage.dialog_up())
     }
 
+    fn focus_targets(&mut self) -> Vec<thedas_ui::FocusTarget> {
+        self.gfx
+            .as_mut()
+            .map(|g| g.ui.stage.focus_targets())
+            .unwrap_or_default()
+    }
+
     fn open_saves(&mut self, mode: i32) {
         if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_mut()) {
             g.ui.open_saves(s, mode);
@@ -2210,6 +2218,16 @@ impl padplay::Host for HeadlessHost<'_> {
         self.played
             .as_deref()
             .is_some_and(|(layer, _)| layer.stage.dialog_up())
+    }
+
+    fn focus_targets(&mut self) -> Vec<thedas_ui::FocusTarget> {
+        self.played
+            .as_deref_mut()
+            .map(|(layer, _)| {
+                layer.render_movies();
+                layer.stage.focus_targets()
+            })
+            .unwrap_or_default()
     }
 
     fn open_saves(&mut self, mode: i32) {

@@ -2,8 +2,9 @@
 //! keyboard already use: [`Live::click`] for anything clicked in the world (attack, talk,
 //! use, aim an ability), the simulation's own walk order for the left stick (the order a
 //! click on the ground gives), [`crate::use_quickslot`] for the shortcuts, the conversation
-//! screen's reply and continue, and the interface's mouse for screens (a pointer the stick
-//! moves). Nothing here changes what the simulation does with an order.
+//! screen's reply and continue, and the interface's mouse for screens (the pointer rests on
+//! the button the focus moved to, see [`crate::focusnav`]). Nothing here changes what the
+//! simulation does with an order.
 //!
 //! A deliberate addition (see [`crate::pad`]): the PC original has no controller support.
 //! The target the D-pad picks and A acts on stands in for the 360 version's auto-targeting;
@@ -51,6 +52,8 @@ pub trait Host {
     /// Highlights conversation reply `n` (from 0) as the reply buttons' own focus does;
     /// false when the conversation screen is not up.
     fn highlight_reply(&mut self, n: usize) -> bool;
+    /// The buttons on screen the focus can land on (see [`crate::focusnav`]).
+    fn focus_targets(&mut self) -> Vec<thedas_ui::FocusTarget>;
 }
 
 /// How far ahead of the leader a walk order aims (metres): far enough that it never
@@ -108,7 +111,19 @@ pub struct PadPlay {
     highlighted: Option<Highlighted>,
     /// The whole party is selected (LB+RB): A's attack and walking order everyone.
     pub group: bool,
+    /// The pointer rests on a focused button (the D-pad or stick moved it there): its own
+    /// highlight shows the focus, and the arrow is not drawn.
+    pub snapped: bool,
+    /// The button focused (its path and window rectangle), marked on screen, and how long
+    /// since it was last looked for (it moves or goes with its screen).
+    focused: Option<(String, [f64; 4])>,
+    focus_check_ms: f64,
+    /// The view's size when the focus last moved (its marker stays inside it).
+    view: (u32, u32),
 }
+
+/// How often the focused button is looked for again (milliseconds).
+const FOCUS_CHECK_MS: f64 = 250.0;
 
 /// Where the pad's input goes, from the screens up.
 pub fn context(screens: Option<&Screens>, popup: bool, picker: bool) -> Context {
@@ -152,6 +167,7 @@ impl PadPlay {
         }
         self.keep_target(host);
         self.follow_line(host);
+        self.keep_focus(host, ctx, dt_ms);
         if ctx == Context::Conversation && self.used {
             self.show_reply(host);
         }
@@ -162,6 +178,33 @@ impl PadPlay {
             }
         }
         log
+    }
+
+    /// Keeps the focus marker on its button: looked for again every [`FOCUS_CHECK_MS`],
+    /// dropped when it is gone, the pointer left it, or the screens are not up.
+    fn keep_focus(&mut self, host: &mut dyn Host, ctx: Context, dt_ms: f64) {
+        if self.focused.is_none() {
+            return;
+        }
+        if ctx != Context::Screen || !self.snapped {
+            self.focused = None;
+            return;
+        }
+        self.focus_check_ms += dt_ms;
+        if self.focus_check_ms < FOCUS_CHECK_MS {
+            return;
+        }
+        self.focus_check_ms = 0.0;
+        let targets = host.focus_targets();
+        let path = self.focused.as_ref().map(|f| f.0.clone());
+        let found = targets.into_iter().find(|t| Some(&t.path) == path.as_ref());
+        let cursor = host.cursor();
+        self.focused = found
+            .filter(|t| {
+                let r = t.rect;
+                cursor.0 >= r[0] && cursor.0 <= r[2] && cursor.1 >= r[1] && cursor.1 <= r[3]
+            })
+            .map(|t| (t.path, t.rect));
     }
 
     /// Drops the target when it is gone (dead, left, another area).
@@ -225,6 +268,8 @@ impl PadPlay {
                 None
             }
             Order::Pointer(d) => {
+                self.snapped = false;
+                self.focused = None;
                 let (x, y) = host.cursor();
                 pointer_to(host, x + d.x as f64, y + d.y as f64);
                 None
@@ -345,7 +390,19 @@ impl PadPlay {
                 let (x, y) = host.cursor();
                 format!("double click {x:.0},{y:.0}")
             }
+            Action::Focus(dx, dy) => return self.focus(host, dx, dy),
+            Action::TogglePointer => {
+                self.controller.free_pointer = !self.controller.free_pointer;
+                self.snapped = false;
+                (if self.controller.free_pointer {
+                    "left stick: free pointer"
+                } else {
+                    "left stick: focus"
+                })
+                .into()
+            }
             Action::PointerStep(dx, dy) => {
+                self.snapped = false;
                 let (x, y) = host.cursor();
                 pointer_to(
                     host,
@@ -355,14 +412,28 @@ impl PadPlay {
                 return None;
             }
             Action::CloseScreen => {
-                if host.popup() {
-                    return Some("a dialog box: point at its buttons and press A".into());
+                let menu = !host.popup() && host.screens().is_some_and(|s| s.menu.is_some());
+                if !menu {
+                    // A dialog box, the start menu, character creation: its own Back,
+                    // Previous, Cancel, Close or No button; in a dialog box whose buttons
+                    // are not named so, its last (Cancel, after OK; or its only one).
+                    // Provisional: the 360 version's B is not traced.
+                    let popup = host.popup();
+                    let targets = host.focus_targets();
+                    let named = targets.iter().rev().find(|t| crate::focusnav::is_back(t));
+                    let last = || crate::focusnav::last(&targets).map(|i| &targets[i]);
+                    let Some(t) = named.or_else(|| if popup { last() } else { None }) else {
+                        return Some("no back button on this screen".into());
+                    };
+                    let (x, y) = crate::focusnav::rest(t);
+                    pointer_to(host, x, y);
+                    host.left_button(true);
+                    host.left_button(false);
+                    self.snapped = true;
+                    return Some(format!("back: {}", t.path));
                 }
-                let s = host.screens()?;
-                match s.menu.take() {
-                    Some(m) => format!("{m:?} closed"),
-                    None => "this screen closes from its own button".into(),
-                }
+                let m = host.screens()?.menu.take()?;
+                format!("{m:?} closed")
             }
             Action::PrevPage | Action::NextPage => {
                 let menu = host.screens()?.menu?;
@@ -528,7 +599,48 @@ impl PadPlay {
 
     /// Whether the pointer is drawn: the pad drives it (on a screen or in the picker).
     pub fn pointer_shown(&self, ctx: Context) -> bool {
-        self.used && matches!(ctx, Context::Screen | Context::Picker)
+        self.used
+            && match ctx {
+                Context::Picker => true,
+                Context::Screen => !self.snapped,
+                _ => false,
+            }
+    }
+
+    /// The focus moves a step `(dx, dy)` among the screen's buttons (to the first one, when
+    /// the pointer is on none), and the pointer rests on it so its highlight shows. A screen
+    /// with no buttons found nudges the pointer instead.
+    fn focus(&mut self, host: &mut dyn Host, dx: i8, dy: i8) -> Option<String> {
+        use crate::focusnav;
+        let targets = host.focus_targets();
+        if targets.is_empty() {
+            self.snapped = false;
+            let (x, y) = host.cursor();
+            pointer_to(
+                host,
+                x + dx as f64 * POINTER_STEP,
+                y + dy as f64 * POINTER_STEP,
+            );
+            return Some("focus: no buttons found; the pointer moves".into());
+        }
+        // From the button focused; a new screen (or a pointer the mouse or stick left
+        // elsewhere) starts at its first button.
+        let from = match self.focused {
+            Some(_) => focusnav::under(&targets, host.cursor()),
+            None => None,
+        };
+        let at = match from {
+            Some(i) => focusnav::step(&targets, i, (dx, dy)),
+            None => focusnav::first(&targets)?,
+        };
+        let t = &targets[at];
+        let (x, y) = focusnav::rest(t);
+        pointer_to(host, x, y);
+        self.snapped = true;
+        self.focused = Some((t.path.clone(), t.rect));
+        self.focus_check_ms = 0.0;
+        self.view = host.size();
+        Some(format!("focus {}: {}", t.movie, t.path))
     }
 
     /// The pad's overlay in the world on a `size` view: a ring round the target. Pixel line
@@ -562,10 +674,38 @@ impl PadPlay {
     pub fn pointer(&self, cursor: (f64, f64), ctx: Context) -> Vec<[Vec2; 2]> {
         if self.pointer_shown(ctx) {
             pointer_arrow(cursor)
+        } else if let (Context::Screen, Some((_, r))) = (ctx, &self.focused) {
+            let (w, h) = (self.view.0 as f64, self.view.1 as f64);
+            // Outside the button by a little, but inside the view.
+            focus_brackets([
+                (r[0] - 3.0).max(2.0),
+                (r[1] - 3.0).max(2.0),
+                (r[2] + 3.0).min(w - 2.0),
+                (r[3] + 3.0).min(h - 2.0),
+            ])
         } else {
             Vec::new()
         }
     }
+}
+
+/// Corner brackets at a focused button's rectangle (`x0, y0, x1, y1`, pixels): the menus'
+/// own rollover highlight is faint or missing, so the host marks the focus.
+pub fn focus_brackets(r: [f64; 4]) -> Vec<[Vec2; 2]> {
+    let (x0, y0, x1, y1) = (r[0] as f32, r[1] as f32, r[2] as f32, r[3] as f32);
+    let arm = ((x1 - x0).min(y1 - y0) * 0.4).clamp(4.0, 14.0);
+    let mut out = Vec::new();
+    for (cx, cy, sx, sy) in [
+        (x0, y0, 1.0, 1.0),
+        (x1, y0, -1.0, 1.0),
+        (x0, y1, 1.0, -1.0),
+        (x1, y1, -1.0, -1.0),
+    ] {
+        let c = Vec2::new(cx, cy);
+        out.push([c, c + Vec2::new(sx * arm, 0.0)]);
+        out.push([c, c + Vec2::new(0.0, sy * arm)]);
+    }
+    out
 }
 
 /// An arrow pointer with its tip at `cursor` (pixels).

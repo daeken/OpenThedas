@@ -510,6 +510,14 @@ impl Stage {
             .filter(move |m| !popup || m.name == POPUP_LAYER)
     }
 
+    /// What a pad's focus can land on: the clips taking a click in the movies that take the
+    /// mouse, in their drawing order.
+    pub fn focus_targets(&mut self) -> Vec<crate::FocusTarget> {
+        self.input_movies()
+            .flat_map(|m| m.focus_targets())
+            .collect()
+    }
+
     pub fn mouse_move(&mut self, x: f64, y: f64) {
         for m in self.input_movies() {
             m.mouse_move(x, y);
