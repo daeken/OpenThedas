@@ -196,7 +196,8 @@ pub struct GameAudio {
     /// `sound_movement_scuffing.gda` (rows: ground material).
     footsteps: Option<thedas_formats::Gda>,
     scuffs: Option<thedas_formats::Gda>,
-    /// `sound_movement_vegetation.gda` (rows: vegetation; columns: size).
+    /// `sound_vegetation_type.gda`, worksheet 155 "Sound Movement Vegetation" (rows:
+    /// vegetation; columns: size `small`/`medium`/`large`).
     vegetation: Option<thedas_formats::Gda>,
     /// Per creature: where it last rustled through vegetation and the squared distance it
     /// must move from there to rustle again.
@@ -713,7 +714,8 @@ impl GameAudio {
         // Vegetation (DAOrigins.exe 0x6a5510, run as a creature moves): once it is a
         // random 0.89..1.09 m (squared: `rand() % 100 * 0.004 + 0.8`) from where it last
         // rustled, standing in vegetation (the ground's high nibble) plays
-        // `sound_movement_vegetation.gda`'s event for that vegetation in its size column.
+        // `sound_vegetation_type.gda`'s (worksheet 155) event for that vegetation in its size
+        // column.
         // Provisional: a creature first seen here starts from where it stands (the exe
         // starts every creature from the origin with 1.0, 0x6b42f2).
         let mut rustled = std::collections::HashMap::new();
