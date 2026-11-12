@@ -86,7 +86,7 @@ in float precision. Matching that reader matters only in the last bit; using a s
 parse is acceptable unless a mismatch shows.
 
 **Building the curve.** Control points are in a unit square (x from 0 to 1 along the
-parameter, y the normalized value). Tangent directions are normalized on input. Consecutive
+parameter, y the normalized value). Tangent directions are normalized on input: each component is divided by `sqrtf(tx·tx + ty·ty)` (a true square root), and a zero tangent is left as it is. Consecutive
 control points P₍k₎ and P₍k+1₎ form one cubic Bézier segment with inner handles
 `P₍k₎ + t̂₍k₎ · len₍k₎` and `P₍k+1₎ − t̂₍k+1₎ · len₍k+1₎`. A Bézier point at fraction u is
 evaluated by repeated linear interpolation (de Casteljau), separately in x and y.
@@ -377,9 +377,52 @@ fronds disabled the result is always "disabled".
 
 ### 2.8 Edge cases to match
 
-- Normalizing a zero vector: return it unchanged (zero) and let the axis rotation degenerate
-  to a scale by cos; this happens only for a direction exactly along down. Flag it in tests.
+- 3D normalize (every "normalize" in stages 2 and later): sum of squares s = x·x + y·y + z·z
+  (left to right); if s > 100 · FLT_EPSILON (FLT_EPSILON = 2⁻²³) the inverse length is
+  1 / sqrtf(s), otherwise 1 / 0.01 = 100; multiply each component by that inverse (one
+  division, three multiplications). A zero vector stays zero; a tiny one is scaled by 100.
 - `(int)` of a negative azimuth truncates toward zero before the parity test.
 - All arithmetic in 32-bit float; accumulate running lengths in float.
+
+### 2.9 Clarifications (round 1)
+
+Answers to the implementer's questions on stages 1 and 2.
+
+1. **Raw step reaching 1.0.** For seeds from 2147483584 to 2147483646, `(float)seed ·
+   4.656612875e-10` rounds to exactly 1.0, the table index becomes 128, and the original reads
+   one element past its 128-entry table (whatever value lies next in memory) and then writes a
+   new raw value there. It is undefined, not traced in the exe, and reachable only from 63 of
+   2³¹ − 1 states. Clamping to 127 is acceptable; note it as provisional.
+2. **Interpolation form.** Every interpolation (de Casteljau steps, table interpolation, all
+   later `lerp`s) is `a + (b − a) · u`, never `a·(1 − u) + b·u`.
+3. **σ is passed by value.** A child receives the parent's current σ; the child's own
+   increments do not come back. The parent continues from its own count.
+4. **Which level's parameters drive the children.** The parent's: everything in 2.5
+   (`frequency` in step 1, `first_branch`, `last_branch`, `frequency_profile`, `fork_*`,
+   `pruning_*`) comes from the level being grown, L, not L + 1. Root candidates use
+   `RootSupport::first`/`last`/`frequency` for placement as stated.
+5. **Plain "evaluate (one draw)"** means *with variance, unscaled* everywhere it is written
+   without "scaled": length, start angle, gravity, radius, flexibility, `radius_scale(0)` for the
+   first radius, `flexibility_scale`, `angle_profile`. Only the per-vertex radius uses the
+   scaled form.
+6. **Locating q·length beyond the last vertex.** Literally 0: when no running length exceeds
+   q·length, j = 0 and s = (q·length − run[0]) / (run[1] − run[0]), which may exceed 1 (the
+   child is extrapolated along the first segment). Same in 2.5.1.
+7. **Normalize** — see 2.8 (three multiplications by one inverse; the small-length rule). The
+   squared sum is accumulated x, then y, then z. One exception: the **distance** used for a
+   branch's volume (2.4 step 12) uses a fast approximate square root, reinterpreting the float's
+   bits as an int i, computing `(i >> 1) + 0x1FC00000` (arithmetic shift) and reinterpreting back;
+   nothing else in stages 1–2 uses it.
+8. **Flares.** Yes: each flare's angle is initial + i · rand_float(`balance` · (2π/count),
+   2π/count), with "minus 2π" applied once if above 2π (2π here is the float constant
+   6.283185). A C runtime float is `a + (rand() / 32767.0f) · (b − a)` in float. Flares are drawn
+   for every branch that is not a frond, **including** levels below the first branch level
+   (skeleton-only levels draw flares too).
+9. **Frond branches in stage 2.** Besides "no flares": they build no cross sections and read
+   no bank values (2.4 end), and stage 4 may change their vertex count. Their vertices, draws
+   and children are otherwise identical.
+10. Noted: literal handling of a first branch level of −1 and a root level of 0 is correct.
+11. **Gravity units.** Yes: the rotation angle profile · gravity · g · facing is in degrees with
+    g in degrees, exactly as written.
 
 Stages 3 and later: in progress.
