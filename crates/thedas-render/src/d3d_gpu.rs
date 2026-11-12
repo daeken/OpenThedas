@@ -797,8 +797,8 @@ fn expand_vertices(mesh: &SceneMesh, inputs: &[IoSlot]) -> Vec<f32> {
                     Some(e.ty.decode(bytes))
                 })
                 .or_else(|| {
-                    // Meshes built in code (tests) have no raw streams; fall back to the
-                    // stand-in vertex.
+                    // Meshes built in code (tests, tree billboards) have no raw streams;
+                    // fall back to the stand-in vertex.
                     (stride == 0).then(|| {
                         let sv = &mesh.vertices[v];
                         match (usage, slot.semantic.index) {
@@ -810,6 +810,14 @@ fn expand_vertices(mesh: &SceneMesh, inputs: &[IoSlot]) -> Vec<f32> {
                             }
                             (DeclUsage::TexCoord, 0) => [sv.uv0[0], sv.uv0[1], 0.0, 1.0],
                             (DeclUsage::TexCoord, 1) => [sv.uv1[0], sv.uv1[1], 0.0, 1.0],
+                            // Built meshes (tree billboards) stand upright: binormal up,
+                            // tangent along the surface.
+                            (DeclUsage::Binormal, _) => [0.0, 0.0, 1.0, 1.0],
+                            (DeclUsage::Tangent, _) => {
+                                let n = Vec3::from_array(sv.normal);
+                                let t = n.cross(Vec3::Z).normalize_or_zero();
+                                [t.x, t.y, t.z, 1.0]
+                            }
                             _ => [0.0, 0.0, 0.0, 1.0],
                         }
                     })
