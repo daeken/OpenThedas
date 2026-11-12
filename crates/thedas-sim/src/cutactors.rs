@@ -333,6 +333,7 @@ mod tests {
             fov: Vec::new(),
             animations: Vec::new(),
             places: Vec::new(),
+            camera_jumps: Vec::new(),
             placed_elsewhere: Vec::new(),
         }
     }

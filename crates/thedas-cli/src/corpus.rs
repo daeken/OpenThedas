@@ -594,7 +594,11 @@ fn check_data(
             // Every cutscene's tracks read, and the camera placed at each cut.
             let tracks = thedas_sim::cuttracks::Tracks::from_gff4(&doc);
             for &(at, _) in &tracks.cuts {
-                let _ = tracks.camera_at(at);
+                let _ = tracks.camera_at(
+                    at,
+                    thedas_sim::cuttracks::Placement::NONE,
+                    &|_: &str, _: bool| None,
+                );
             }
             thedas_sim::cutscene::Cutscene::from_gff4(&doc, "")
                 .map(|_| ())
