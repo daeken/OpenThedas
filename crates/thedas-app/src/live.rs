@@ -28,6 +28,11 @@ pub struct LiveLevel {
     pub renderer: AreaRenderer,
     /// The `AREA_ID` whose colour grading the renderer has (several areas share a layout).
     pub area_id: Option<i64>,
+    /// How high above the leader's feet the game camera's eye cuts roofs away
+    /// ([`thedas_formats::level::Arl::cutaway_height`]).
+    pub cutaway_height: f32,
+    /// The cutaway value its renderer last got ([`Cutaway`]).
+    cutaway_shown: f32,
     /// Its solid surfaces, which the game camera keeps on the party's side of.
     pub collider: thedas_render::collide::Collider,
 }
@@ -55,6 +60,8 @@ pub struct LiveObjects {
     bodies: Vec<(ObjectId, Vec<String>)>,
     pub scene: AreaScene,
     pub renderer: AreaRenderer,
+    /// The cutaway value its renderer last got ([`Cutaway`]).
+    cutaway_shown: f32,
 }
 
 /// An animating placeable's surfaces as last posed.
@@ -121,6 +128,8 @@ pub struct Live {
     /// The creatures the game camera has faded (see [`crate::camfade`]) and the models'
     /// creature shapes read so far.
     camera_fade: crate::camfade::CameraFade,
+    /// The roof cutaway's fade, and the layout it was last placed for.
+    cutaway: (Cutaway, String),
     /// The area and whether a cutscene played, as the explore camera last saw them (see
     /// [`Live::camera_reset_due`]).
     camera_seen: Option<(Option<ObjectId>, bool)>,
@@ -269,6 +278,7 @@ impl Live {
             objects: None,
             animator: Animator::default(),
             camera_fade: Default::default(),
+            cutaway: Default::default(),
             camera_seen: None,
             zoom_seen: None,
             creature_shapes: Default::default(),
@@ -425,6 +435,36 @@ impl Live {
         }
         self.camera_fade.update(touching, dt);
         self.combine_opacity();
+        // Roofs: cut away while the eye is high above the leader's feet.
+        let high = match (eye, self.leader_feet(), self.level.as_ref()) {
+            (Some(eye), Some(feet), Some(level)) => {
+                if self.cutaway.1 != level.layout {
+                    // A new area starts at its state at once (the explore camera's
+                    // activation forces it, 0x771019).
+                    self.cutaway = (Cutaway::default(), level.layout.clone());
+                }
+                Some(eye.z - feet.z > level.cutaway_height)
+            }
+            _ => None,
+        };
+        self.cutaway.0.update(high, dt);
+    }
+
+    /// Hands the roof cutaway's value to the renderers that have not got it yet.
+    fn apply_cutaway(&mut self, ctx: &GpuContext) {
+        let v = self.cutaway.0.shown();
+        if let Some(l) = self.level.as_mut()
+            && l.cutaway_shown != v
+        {
+            l.renderer.set_cutaway(ctx, v);
+            l.cutaway_shown = v;
+        }
+        if let Some(o) = self.objects.as_mut()
+            && o.cutaway_shown != v
+        {
+            o.renderer.set_cutaway(ctx, v);
+            o.cutaway_shown = v;
+        }
     }
 
     /// The leader's heading (radians) when the explore camera should reset behind it
@@ -923,6 +963,7 @@ impl Live {
             return true;
         }
         self.set_shader_time();
+        self.apply_cutaway(ctx);
         let Some(level) = self.level.as_mut() else {
             return false;
         };
@@ -977,6 +1018,7 @@ impl Live {
             return Ok(Some(self.cutscene_movies.rgba((width, height))));
         }
         self.set_shader_time();
+        self.apply_cutaway(ctx);
         let Some(level) = self.level.as_mut() else {
             return Ok(None);
         };
@@ -1017,6 +1059,8 @@ impl Live {
         Ok(LiveLevel {
             layout: layout.to_string(),
             vfs: Arc::new(vfs),
+            cutaway_height: scene.cutaway_height.unwrap_or(5.5),
+            cutaway_shown: 1.0,
             renderer,
             area_id: None,
             collider,
@@ -1129,6 +1173,7 @@ impl Live {
                 .collect(),
             scene,
             renderer,
+            cutaway_shown: 1.0,
         })
     }
 }
@@ -1714,5 +1759,100 @@ pub fn clip(m: &thedas_ui::models::Motion) -> Clip {
         looping: m.looping,
         layers: Vec::new(),
         absolute: false,
+    }
+}
+
+/// The roof cutaway (DAOrigins.exe 0x76f5a0, 0x640250, 0x641f90): meshes flagged `CutAway`
+/// fade out over 0.2 s on a cosine ease while the game camera's eye is more than the
+/// layout's cutaway height above the leader's feet, and back in when it is not.
+/// Conversations and cutscenes show them at once and restore the value afterwards
+/// (0x6403f0). A new area takes its state at once.
+#[derive(Clone, Copy, Debug)]
+pub struct Cutaway {
+    value: f32,
+    from: f32,
+    target: f32,
+    elapsed: f32,
+    /// Whether the camera was high when last checked; `None` before the first check.
+    high: Option<bool>,
+    /// A conversation or cutscene frames the shot: shown at 1.
+    held: bool,
+}
+
+impl Default for Cutaway {
+    fn default() -> Self {
+        Cutaway {
+            value: 1.0,
+            from: 1.0,
+            target: 1.0,
+            elapsed: 0.0,
+            high: None,
+            held: false,
+        }
+    }
+}
+
+impl Cutaway {
+    const DURATION: f32 = 0.2;
+
+    /// Advances by `dt` seconds; `high` is whether the eye is high, `None` while the game
+    /// camera is not the view.
+    pub fn update(&mut self, high: Option<bool>, dt: f32) {
+        let Some(high) = high else {
+            self.held = true;
+            return;
+        };
+        self.held = false;
+        let target = if high { 0.0 } else { 1.0 };
+        match self.high {
+            None => {
+                self.value = target;
+                self.from = target;
+                self.target = target;
+                self.elapsed = Self::DURATION;
+            }
+            Some(was) if was != high => {
+                self.from = self.value;
+                self.target = target;
+                self.elapsed = 0.0;
+            }
+            _ => {}
+        }
+        self.high = Some(high);
+        self.elapsed = (self.elapsed + dt.max(0.0)).min(Self::DURATION);
+        let t = self.elapsed / Self::DURATION;
+        let ease = (1.0 - (std::f32::consts::PI * t).cos()) * 0.5;
+        self.value = self.from + (self.target - self.from) * ease;
+    }
+
+    /// The value the cut-away meshes draw with: 1 as made, 0 not drawn.
+    pub fn shown(&self) -> f32 {
+        if self.held { 1.0 } else { self.value }
+    }
+}
+
+#[cfg(test)]
+mod cutaway_tests {
+    use super::Cutaway;
+
+    #[test]
+    fn a_new_area_takes_its_state_at_once_then_fades_over_a_fifth_of_a_second() {
+        let mut c = Cutaway::default();
+        c.update(Some(true), 0.0);
+        assert_eq!(c.shown(), 0.0);
+        c.update(Some(false), 0.1);
+        assert!((c.shown() - 0.5).abs() < 1e-5);
+        c.update(Some(false), 0.1);
+        assert_eq!(c.shown(), 1.0);
+    }
+
+    #[test]
+    fn conversations_show_roofs_and_restore_the_cut() {
+        let mut c = Cutaway::default();
+        c.update(Some(true), 0.0);
+        c.update(None, 0.5);
+        assert_eq!(c.shown(), 1.0);
+        c.update(Some(true), 0.0);
+        assert_eq!(c.shown(), 0.0);
     }
 }
