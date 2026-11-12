@@ -9,6 +9,7 @@
 //! act on, and an optional responder answers `ExternalInterface.call` return values. The
 //! messages a movie sends reach the simulation only as player input ([`input`]).
 
+pub mod appearance;
 pub mod atlas;
 pub mod avm1;
 pub mod binding;

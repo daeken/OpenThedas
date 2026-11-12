@@ -1027,6 +1027,7 @@ fn chargen_screen(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
     }
     v.insert("GUICharGen.CharCreatorRunning".into(), num(0));
     v.insert("GUICharGen.ImportEnabled".into(), num(0));
+    crate::appearance::values(sim, v);
 }
 
 /// The saved games, as saveload.gfx and deathscreen.gfx read them: the screen's mode, the

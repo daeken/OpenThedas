@@ -13,6 +13,7 @@
 //! [`Sim::tick`], and randomness comes from a seeded generator.
 
 pub mod aoe;
+pub mod appearance;
 pub mod chanters;
 pub mod chargen;
 pub mod combat;

@@ -526,6 +526,9 @@ impl GameBridge {
                 // or switch: the creature's tactics).
                 let to = if k.starts_with("Journal.") {
                     Some(thedas_sim::journal::MSG_SET_ATTRIBUTE)
+                } else if k.starts_with("GUICharGen.AppearanceSliders.") && k.ends_with(".Value") {
+                    // Character creation's appearance sliders (see `crate::appearance`).
+                    Some(thedas_sim::appearance::MSG_SET_SLIDER)
                 } else if k.starts_with(thedas_sim::tactics::PREFIX) {
                     Some(thedas_sim::tactics::MSG_SET_ATTRIBUTE)
                 } else {

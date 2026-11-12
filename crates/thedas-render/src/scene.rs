@@ -12,7 +12,7 @@ use thedas_formats::material::{MaterialDef, MaterialObject, Technique, TextureBi
 use thedas_formats::mesh::{DeclUsage, MeshChunk, Msh};
 pub use thedas_formats::model::{DOMAIN_CHARACTERS, DOMAIN_LEVEL};
 use thedas_formats::morph::{
-    Morph, MorphNode, MorphPreset, TargetMesh, blend_targets, slot as morph_slot,
+    FaceOverlay, Morph, MorphNode, MorphPreset, TargetMesh, blend_targets, slot as morph_slot,
 };
 use thedas_formats::probe::IrradianceProbe;
 use thedas_formats::tint::Tint;
@@ -690,6 +690,13 @@ impl<'a> Loader<'a> {
         let key = format!("{}.mor", name.to_ascii_lowercase());
         if let Some(m) = self.morphs.get(&key) {
             return m.clone();
+        }
+        // Choices made over a face (character creation's sliders) ride after its name.
+        let (base, overlay) = FaceOverlay::split(name);
+        if !overlay.is_empty() {
+            let loaded = self.morph(base).map(|m| Arc::new(m.with_overlay(&overlay)));
+            self.morphs.insert(key, loaded.clone());
+            return loaded;
         }
         // A face-screen preset (`hm_cps_p01.mop`) on its race and gender's base face
         // (`hm_pcc_b01.mor`, the face screen's last preset). Provisional: the base is named
