@@ -985,7 +985,9 @@ impl GameAudio {
         // it as "music state= %2.1f"): the tracks' sounds sit around 1, so 0 silences the
         // music (pre100pt_light_beacon) and cutscene endings (gen00cs_cs_end_music_int_*)
         // set 0 to 4. Provisional: read from the data and the scripts, not traced.
-        if let Some(i) = state.music_intensity.take() {
+        if let Some(i) = state.music_intensity.take()
+            && i as f32 != self.music_state
+        {
             self.music_state = i as f32;
             if let Some((_, h)) = self.area.as_ref().and_then(|a| a.track) {
                 self.engine

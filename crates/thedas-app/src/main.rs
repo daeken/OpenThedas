@@ -2225,9 +2225,6 @@ fn audio_state(
                         bark(target, PAIN_GRUNT);
                     }
                 }
-                thedas_sim::world::SoundRequest::MusicIntensity { intensity } => {
-                    state.music_intensity = Some(intensity);
-                }
                 // PlayMusic names the music project (`music`, from the Music M2DA by
                 // module), which is always the one used here.
                 other => log::debug!("audio: not done yet: {other:?}"),
@@ -2256,6 +2253,7 @@ fn audio_state(
             }
             state.area = Some(resref);
             state.combat = sim.world.party_fighting;
+            state.music_intensity = Some(sim.world.music_intensity);
             // The character the player controls, with its sound set (selection barks).
             if let Some(c) = sim.world.controlled()
                 && let Some(o) = sim.world.get(c)

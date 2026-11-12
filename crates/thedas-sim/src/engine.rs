@@ -501,12 +501,12 @@ pub fn call(
         }),
         "PlaySoundObject" => Some(crate::world::SoundRequest::Object { sound: obj(a, 0) }),
         "PlayMusic" => Some(crate::world::SoundRequest::Music { name: string(a, 0) }),
-        "SetMusicIntensity" => Some(crate::world::SoundRequest::MusicIntensity {
-            intensity: int(a, 0),
-        }),
         _ => None,
     };
     // `SetSoundSet(oTarget, sSoundSet)`: the creature's barks come from that set.
+    if name == "SetMusicIntensity" {
+        h.sim.world.music_intensity = int(a, 0);
+    }
     if name == "SetSoundSet" {
         h.sim.set_sound_set(obj(a, 0), &string(a, 1));
     }
@@ -5798,7 +5798,8 @@ mod coverage_tests {
         void PlaySound(object o, string s) = 106;\n\
         void PlayMusic(string s) = 107;\n\
         void DestroyObject(object o, int n = 0) = 108;\n\
-        void SetSoundSet(object o, string s) = 109;\n";
+        void SetSoundSet(object o, string s) = 109;\n\
+        void SetMusicIntensity(int n) = 110;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -6576,6 +6577,9 @@ mod coverage_tests {
                 .get(crate::sim::SOUND_SET),
             Some(&"ss_pc_fhuman_wise".to_string())
         );
+        assert_eq!(s.world.music_intensity, 1);
+        run(&mut s, 1, "SetMusicIntensity", &[Value::Int(0)]);
+        assert_eq!(s.world.music_intensity, 0);
         // Character creation's choice goes to the creature being made.
         assert!(!s.chargen_sound_set("ss_pc_mhuman_cocky"));
         s.world.chargen = Some(o);
