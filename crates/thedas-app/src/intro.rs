@@ -81,6 +81,19 @@ pub fn letterbox(w: u32, h: u32, size: (u32, u32)) -> (f32, f32, f32, f32) {
     ((sw - dw) / 2.0, (sh - dh) / 2.0, dw, dh)
 }
 
+/// Where movie `name` (`bhmcs_intro.bik`) is: the loose file the resource stack resolves it
+/// to (modules, packages, addins and overrides, highest layer first, as every other resource),
+/// else `packages/core/data/movies`. Origin openings keep their movies in the module
+/// (`modules/single player/data/movies`), so a fixed core folder missed them and their
+/// cutscenes ended at once. Provisional: the exe's own movie path resolution is not traced; the
+/// resource stack is the order the rest of the game's data follows.
+pub fn movie_path(vfs: &thedas_vfs::Vfs, install: &Path, name: &str) -> PathBuf {
+    match vfs.lookup(name) {
+        Some(p) if p.entry.is_none() => p.file,
+        _ => install.join(MOVIES_DIR).join(name),
+    }
+}
+
 /// The `ffmpeg` that decodes the movies, if there is one.
 pub fn find_ffmpeg() -> Option<PathBuf> {
     let candidates = std::env::var_os("PATH")
@@ -533,7 +546,7 @@ impl CutsceneMovies {
         };
         if self.playing.as_ref().map(|p| p.0) != Some(i) {
             let track = &self.tracks[i];
-            let path = install.join(MOVIES_DIR).join(format!("{}.bik", track.name));
+            let path = movie_path(vfs, install, &format!("{}.bik", track.name));
             let Some(p) = find_ffmpeg().and_then(|f| Playing::start(&f, &path)) else {
                 log::warn!(
                     "cutscene {name}: movie {} cannot play (no ffmpeg, or the movie is \
