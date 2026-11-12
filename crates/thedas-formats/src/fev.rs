@@ -493,6 +493,43 @@ impl ReverbProperties {
     };
 }
 
+impl ReverbProperties {
+    /// These properties with any non-finite value (a damaged or modded project's) replaced
+    /// by [`ReverbProperties::OFF`]'s.
+    pub fn finite(mut self) -> ReverbProperties {
+        let d = ReverbProperties::OFF;
+        let fix = |v: &mut f32, d: f32| {
+            if !v.is_finite() {
+                *v = d;
+            }
+        };
+        fix(&mut self.env_size, d.env_size);
+        fix(&mut self.env_diffusion, d.env_diffusion);
+        fix(&mut self.decay_time, d.decay_time);
+        fix(&mut self.decay_hf_ratio, d.decay_hf_ratio);
+        fix(&mut self.decay_lf_ratio, d.decay_lf_ratio);
+        fix(&mut self.reflections_delay, d.reflections_delay);
+        fix(&mut self.reverb_delay, d.reverb_delay);
+        for (v, d) in self.reflections_pan.iter_mut().zip(d.reflections_pan) {
+            fix(v, d);
+        }
+        for (v, d) in self.reverb_pan.iter_mut().zip(d.reverb_pan) {
+            fix(v, d);
+        }
+        fix(&mut self.echo_time, d.echo_time);
+        fix(&mut self.echo_depth, d.echo_depth);
+        fix(&mut self.modulation_time, d.modulation_time);
+        fix(&mut self.modulation_depth, d.modulation_depth);
+        fix(&mut self.air_absorption_hf, d.air_absorption_hf);
+        fix(&mut self.hf_reference, d.hf_reference);
+        fix(&mut self.lf_reference, d.lf_reference);
+        fix(&mut self.room_rolloff_factor, d.room_rolloff_factor);
+        fix(&mut self.diffusion, d.diffusion);
+        fix(&mut self.density, d.density);
+        self
+    }
+}
+
 impl ReverbDef {
     /// The properties, in the order `fmod_event.dll` reads them (0x10026f80..0x100272ef):
     /// room, room HF, room rolloff, decay time, decay HF ratio, reflections and delay,
@@ -504,35 +541,38 @@ impl ReverbDef {
         let w = |i: usize| self.raw.get(i).copied();
         let i = |n: usize| w(n).map(|v| v as i32);
         let f = |n: usize| w(n).map(f32::from_bits);
-        Some(ReverbProperties {
-            room: i(0)?,
-            room_hf: i(1)?,
-            room_rolloff_factor: f(2)?,
-            decay_time: f(3)?,
-            decay_hf_ratio: f(4)?,
-            reflections: i(5)?,
-            reflections_delay: f(6)?,
-            reverb: i(7)?,
-            reverb_delay: f(8)?,
-            diffusion: f(9)?,
-            density: f(10)?,
-            hf_reference: f(11)?,
-            instance: i(14)?,
-            environment: i(15)?,
-            env_size: f(16)?,
-            env_diffusion: f(17)?,
-            room_lf: i(18)?,
-            decay_lf_ratio: f(19)?,
-            reflections_pan: [f(20)?, f(21)?, f(22)?],
-            reverb_pan: [f(23)?, f(24)?, f(25)?],
-            echo_time: f(26)?,
-            echo_depth: f(27)?,
-            modulation_time: f(28)?,
-            modulation_depth: f(29)?,
-            air_absorption_hf: f(30)?,
-            lf_reference: f(31)?,
-            flags: w(32)?,
-        })
+        Some(
+            ReverbProperties {
+                room: i(0)?,
+                room_hf: i(1)?,
+                room_rolloff_factor: f(2)?,
+                decay_time: f(3)?,
+                decay_hf_ratio: f(4)?,
+                reflections: i(5)?,
+                reflections_delay: f(6)?,
+                reverb: i(7)?,
+                reverb_delay: f(8)?,
+                diffusion: f(9)?,
+                density: f(10)?,
+                hf_reference: f(11)?,
+                instance: i(14)?,
+                environment: i(15)?,
+                env_size: f(16)?,
+                env_diffusion: f(17)?,
+                room_lf: i(18)?,
+                decay_lf_ratio: f(19)?,
+                reflections_pan: [f(20)?, f(21)?, f(22)?],
+                reverb_pan: [f(23)?, f(24)?, f(25)?],
+                echo_time: f(26)?,
+                echo_depth: f(27)?,
+                modulation_time: f(28)?,
+                modulation_depth: f(29)?,
+                air_absorption_hf: f(30)?,
+                lf_reference: f(31)?,
+                flags: w(32)?,
+            }
+            .finite(),
+        )
     }
 }
 
@@ -1144,5 +1184,52 @@ mod tests {
         let at = 4 + 4 + 8 + 4 + 6;
         huge[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(Fev::parse(&huge).is_err());
+    }
+
+    #[test]
+    fn reverb_words_name_the_properties_in_the_dlls_order() {
+        // "Generic" as master_reverb.fev stores it.
+        let words: [f32; 33] = [
+            -1000.0, -100.0, 0.0, 1.49, 0.83, -2602.0, 0.007, 200.0, 0.011, 100.0, 100.0, 5000.0,
+            0.0, 250.0, 0.0, 0.0, 7.5, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.25, 0.0,
+            0.25, 0.0, -5.0, 250.0, 63.0,
+        ];
+        let ints = [0, 1, 5, 7, 12, 14, 15, 18, 32];
+        let raw: Vec<u32> = words
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                if ints.contains(&i) {
+                    v as i32 as u32
+                } else {
+                    v.to_bits()
+                }
+            })
+            .collect();
+        let mut def = ReverbDef {
+            name: "Generic".into(),
+            raw,
+        };
+        let p = def.properties().unwrap();
+        assert_eq!(
+            (p.room, p.room_hf, p.reflections, p.reverb),
+            (-1000, -100, -2602, 200)
+        );
+        assert_eq!(
+            (p.decay_time, p.decay_hf_ratio, p.hf_reference),
+            (1.49, 0.83, 5000.0)
+        );
+        assert_eq!(
+            (p.lf_reference, p.air_absorption_hf, p.flags),
+            (250.0, -5.0, 63)
+        );
+        // A damaged value falls back; a short definition is none.
+        def.raw[3] = f32::NAN.to_bits();
+        assert_eq!(
+            def.properties().unwrap().decay_time,
+            ReverbProperties::OFF.decay_time
+        );
+        def.raw.truncate(20);
+        assert_eq!(def.properties(), None);
     }
 }

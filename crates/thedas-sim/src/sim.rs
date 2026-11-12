@@ -2878,6 +2878,10 @@ impl Sim {
             }
         }
         read_text_fields(o, inst);
+        // A waypoint's map note text (a talk-table id), which the area map shows.
+        if let Some(s) = strref(inst, "MapNote") {
+            o.fields.insert("MapNote".into(), s as i32);
+        }
         read_vars(are, inst, &mut o.locals);
         if kind == ObjectKind::Trigger {
             for &p in list_of(inst, "Geometry") {
