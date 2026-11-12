@@ -650,6 +650,9 @@ pub const DEFAULT_ATTACK_MS: u64 = 1500;
 /// a different point per creature so a crowd does not move in step. Provisional: the
 /// original picks among variants (`attk_v1`..`v6`, weapon styles) that are not modelled.
 pub fn motion(sim: &Sim, o: &Object) -> Option<Motion> {
+    if o.kind == ObjectKind::Placeable {
+        return placeable_motion(sim, o);
+    }
     if o.kind != ObjectKind::Creature {
         return None;
     }
@@ -727,6 +730,99 @@ pub fn motion(sim: &Sim, o: &Object) -> Option<Motion> {
         time: secs(now) + phase,
         looping: true,
     })
+}
+
+/// `placeable_types.gda`'s animation tree (`PRB_door.anb`) and state controller
+/// (`StateCnt_Door`) columns; their names are not known.
+pub const COL_PLACEABLE_TREE: u32 = 0x70f4_63fa;
+pub const COL_STATE_CONTROLLER: u32 = 0x9a32_0a51;
+
+/// A placeable's state: `State` (set by `SetPlaceableState` or an action's result), else
+/// its template's `AnimContState`.
+pub fn placeable_state(o: &Object) -> i32 {
+    o.fields
+        .get("State")
+        .or_else(|| o.fields.get("AnimContState"))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// The animation tree of a placeable's type and the action that takes it from state `from`
+/// to state `to`. Its state controller (`statecnt_door.gda`) has a column per state, named
+/// by that state's `Label`: row `from`'s cell in `to`'s column is the `anim_placeables.gda`
+/// animation (Closed_Unlocked to Open: 1013 `door_closetoopen`), and row `s` in its own
+/// column is the pose held in `s` (Open: 1010 `door_open`; Open_2: 1073; Dead: 1012;
+/// Dead_2: 1085). `None` where the cell is 0.
+fn placeable_action(sim: &Sim, o: &Object, from: i32, to: i32) -> Option<(String, String)> {
+    let tables = sim.world.tables();
+    let types = tables.get(0, "placeable_types")?;
+    let app = o.appearance as i64;
+    let tree = text(types.cell_by_hash(COL_PLACEABLE_TREE, app))?.to_ascii_lowercase();
+    let controller = text(types.cell_by_hash(COL_STATE_CONTROLLER, app))?.to_ascii_lowercase();
+    let t = tables.get(0, &controller)?;
+    let label = text(t.cell("Label", to as i64))?;
+    let anim = match t.cell(&label, from as i64)? {
+        Cell::Int(v) if *v > 0 => *v as i64,
+        _ => return None,
+    };
+    let action = text(
+        tables
+            .get(0, "anim_placeables")?
+            .cell_by_hash(COL_ANIM_ACTION, anim),
+    )?;
+    Some((tree, action.to_ascii_lowercase()))
+}
+
+/// A placeable's pose in its state (see [`placeable_action`]), looping in its type's tree.
+fn placeable_motion(sim: &Sim, o: &Object) -> Option<Motion> {
+    let state = placeable_state(o);
+    let (tree, action) = placeable_action(sim, o, state, state)?;
+    Some(Motion {
+        trees: vec![tree],
+        actions: vec![action],
+        time: sim.world.time_ms as f32 / 1000.0 + (o.id % 97) as f32 * 0.37,
+        looping: true,
+    })
+}
+
+/// Placeables' state changes as the renderer saw them, so a door that opens swings open
+/// rather than showing its open pose at once. Presentation only: the simulation keeps no
+/// history of states. Provisional: the executable's state controller playback is not
+/// traced; a change seen on an object's first sighting (a save loaded) shows the new pose.
+#[derive(Debug, Default)]
+pub struct PlaceableSwings {
+    /// Per placeable: its state when last seen, and the change into it (from, when).
+    seen: std::collections::HashMap<ObjectId, (i32, Option<(i32, u64)>)>,
+}
+
+impl PlaceableSwings {
+    /// Notes each placeable's state and gives one that changed the animation from its old
+    /// state to its new one, held at its end.
+    pub fn apply(&mut self, sim: &Sim, models: &mut [ObjectModel]) {
+        let now = sim.world.time_ms;
+        for m in models.iter_mut() {
+            if m.kind != ObjectKind::Placeable {
+                continue;
+            }
+            let Some(o) = sim.world.get(m.id) else {
+                continue;
+            };
+            let state = placeable_state(o);
+            let entry = self.seen.entry(m.id).or_insert((state, None));
+            if entry.0 != state {
+                *entry = (state, Some((entry.0, now)));
+            }
+            let Some((from, at)) = entry.1 else { continue };
+            if let Some((tree, action)) = placeable_action(sim, o, from, state) {
+                m.motion = Some(Motion {
+                    trees: vec![tree],
+                    actions: vec![action],
+                    time: now.saturating_sub(at) as f32 / 1000.0,
+                    looping: false,
+                });
+            }
+        }
+    }
 }
 
 /// `anim_base.gda`'s column naming the action an animation id plays in a creature's
@@ -930,6 +1026,109 @@ mod tests {
         assert_eq!(var(sword), Some(("lsw".into(), "ls01a".into())));
         assert_eq!(var(claw), None, "no variation table");
         assert_eq!(var(unknown), None, "no such variation");
+    }
+
+    #[test]
+    fn doors_hold_their_state_pose_and_swing_when_it_changes() {
+        use std::sync::Arc;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let st = |v: &str| Cell::String(format!("{v}\0"));
+        let t = s.world.tables();
+        t.insert(
+            "placeable_types",
+            &["#70f463fa", "#9a320a51"],
+            vec![(86, vec![st("PRB_door.anb"), st("StateCnt_Door")])],
+        );
+        // Columns named by the states' labels: row = from, column = to.
+        let labels = ["Closed_Unlocked", "Open", "Open_2"];
+        let mut cols = vec!["Label"];
+        cols.extend(labels);
+        t.insert(
+            "statecnt_door",
+            &cols,
+            vec![
+                (
+                    0,
+                    vec![
+                        st("Closed_Unlocked"),
+                        Cell::Int(1011),
+                        Cell::Int(1013),
+                        Cell::Int(1075),
+                    ],
+                ),
+                (
+                    1,
+                    vec![st("Open"), Cell::Int(1014), Cell::Int(1010), Cell::Int(0)],
+                ),
+                (
+                    2,
+                    vec![st("Open_2"), Cell::Int(1074), Cell::Int(0), Cell::Int(1073)],
+                ),
+            ],
+        );
+        t.insert(
+            "anim_placeables",
+            &["#7a398af9"],
+            [
+                (1010, "door_open"),
+                (1011, "door_close"),
+                (1013, "door_closetoopen"),
+                (1014, "door_opentoclose"),
+                (1073, "door_open2"),
+                (1074, "door_opentoclose2"),
+                (1075, "door_closetoopen2"),
+            ]
+            .into_iter()
+            .map(|(id, a)| (id, vec![st(a)]))
+            .collect(),
+        );
+        let id = s.world.spawn(ObjectKind::Placeable, "door");
+        {
+            let o = s.world.get_mut(id).unwrap();
+            o.appearance = 86;
+            o.fields.insert("State".into(), 2);
+        }
+        let pose = |s: &Sim| motion(s, s.world.get(id).unwrap()).unwrap();
+        assert_eq!(pose(&s).trees, vec!["prb_door.anb"]);
+        assert_eq!(pose(&s).actions, vec!["door_open2"]);
+        assert!(pose(&s).looping);
+
+        let model = |s: &Sim| ObjectModel {
+            id,
+            tag: "door".into(),
+            kind: ObjectKind::Placeable,
+            models: vec![],
+            attached: vec![],
+            tints: vec![],
+            morph: None,
+            hide_hair: false,
+            motion: motion(s, s.world.get(id).unwrap()),
+            position: [0.0; 3],
+            facing: 0.0,
+        };
+        let mut swings = PlaceableSwings::default();
+        let mut seen = vec![model(&s)];
+        swings.apply(&s, &mut seen);
+        assert_eq!(seen[0].motion.as_ref().unwrap().actions, vec!["door_open2"]);
+
+        // Closed at 1 s: it swings shut from then, and stays shut.
+        s.world.time_ms = 1_000;
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .fields
+            .insert("State".into(), 0);
+        let mut seen = vec![model(&s)];
+        swings.apply(&s, &mut seen);
+        s.world.time_ms = 1_400;
+        let mut later = vec![model(&s)];
+        swings.apply(&s, &mut later);
+        let m = later[0].motion.as_ref().unwrap();
+        assert_eq!(m.actions, vec!["door_opentoclose2"]);
+        assert!(!m.looping);
+        assert!((m.time - 0.4).abs() < 1e-6);
     }
 
     #[test]
