@@ -533,6 +533,20 @@ fn find_param<'a>(m: &'a SceneMaterial, name: &str) -> Option<&'a Parameter> {
     parameters(m).find(|p| p.name.eq_ignore_ascii_case(name))
 }
 
+/// A parameter's default (its material definition's `Default`) as four-float vectors.
+pub(crate) fn default_vectors(m: &SceneMaterial, name: &str) -> Option<Vec<[f32; 4]>> {
+    let f = parse_floats(find_param(m, name)?.default.as_deref()?);
+    (!f.is_empty()).then(|| {
+        f.chunks(4)
+            .map(|q| {
+                let mut o = [0.0; 4];
+                o[..q.len()].copy_from_slice(q);
+                o
+            })
+            .collect()
+    })
+}
+
 impl ConstantContext<'_> {
     fn light_params(&self) -> Vec<[f32; 4]> {
         let mut r = vec![[0.0f32; 4]; 12];
