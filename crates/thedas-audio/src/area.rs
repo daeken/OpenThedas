@@ -79,6 +79,8 @@ pub fn area_audio(data: &[u8]) -> (Option<String>, Vec<AreaSound>) {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReverbTrigger {
     pub preset: String,
+    /// An audio volume (`Type` 4) rather than a plain reverb trigger (3).
+    pub volume: bool,
     pub priority: i32,
     pub position: [f32; 3],
     /// Rotation about Z, radians.
@@ -124,19 +126,21 @@ impl AreaReverb {
     /// byte order for these ASCII names; triggers with no preset are not counted, 0x6867b6),
     /// else none.
     ///
-    /// Provisional: the exe counts a trigger for which a virtual (+0x1d8) holds as 0.15
-    /// instead of 1; that check is not traced, so every trigger counts 1. It also loads the
-    /// next two most-used presets into secondary reverb instances, which only events that
-    /// name a preset use; those are not modelled.
+    /// A reverb trigger counts 1 and an audio volume 0.15 (0x6867d1..0x6867e7: the
+    /// trigger's +0x1d8 virtual, its cast to an audio volume, 0x79af30 for type 4 and null,
+    /// 0x4137b0, for type 3).
+    ///
+    /// Provisional: the exe also loads the next two most-used presets into secondary reverb
+    /// instances, which only events that name a preset use; those are not modelled.
     pub fn initial(&self) -> &str {
         if !self.preset.is_empty() {
             return &self.preset;
         }
-        let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+        let mut counts: std::collections::BTreeMap<&str, f32> = Default::default();
         for t in self.triggers.iter().filter(|t| !t.preset.is_empty()) {
-            *counts.entry(t.preset.as_str()).or_default() += 1;
+            *counts.entry(t.preset.as_str()).or_default() += if t.volume { 0.15 } else { 1.0 };
         }
-        let mut best: Option<(&str, usize)> = None;
+        let mut best: Option<(&str, f32)> = None;
         for (name, n) in counts {
             if best.is_none_or(|b| n > b.1) {
                 best = Some((name, n));
@@ -220,6 +224,7 @@ pub fn area_reverb(data: &[u8]) -> AreaReverb {
             }
             out.triggers.push(ReverbTrigger {
                 preset,
+                volume: kind == 4.0,
                 priority: num(t, "Priority") as i32,
                 position: [
                     num(t, "XPosition"),
@@ -366,6 +371,13 @@ mod tests {
         assert_eq!(r2.initial(), "Hallway");
         r2.triggers.pop();
         assert_eq!(r2.initial(), "Cave");
+        // Audio volumes count 0.15 each: six of them (0.9) lose to one reverb trigger.
+        for _ in 0..5 {
+            r2.triggers.push(r.triggers[1].clone());
+        }
+        assert_eq!(r2.initial(), "Cave");
+        r2.triggers.push(r.triggers[1].clone());
+        assert_eq!(r2.initial(), "Hallway");
         assert_eq!(area_reverb(b"junk"), AreaReverb::default());
     }
 }

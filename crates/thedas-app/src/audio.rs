@@ -51,6 +51,9 @@ pub struct Gear {
     /// Its size column (`Small`, `Medium`, `Large` as a column hash: its appearance's
     /// `apr_base.gda` column 0xc7cb6561, 0x6a0a1f).
     pub size: Option<u32>,
+    /// Its hands' sound material when they hold no weapon (`apr_base.gda` column
+    /// 0x7d86f95a: 19 bare hands, 20 claws, 27 large claws; 0x6a0b05..0x6a0b53).
+    pub unarmed: Option<i64>,
 }
 
 /// A sound set's lines (`sse_<set>.gda`: row -> strref) and each type's number of them
@@ -252,6 +255,8 @@ pub struct GameAudio {
 pub const APR_FOOTSTEP: u32 = 0xda48_e219;
 /// `apr_base.gda`'s sound size column (0x6a0a1f): `Small`, `Medium`, `Large`.
 pub const APR_SIZE: u32 = 0xc7cb_6561;
+/// `apr_base.gda`'s unarmed hands' sound material column (0x6a0b12).
+pub const APR_UNARMED: u32 = 0x7d86_f95a;
 /// `sound_movement_scuffing.gda`'s event column (0x5b8d5f).
 const COL_SCUFF: u32 = 0xb449_8545;
 
@@ -344,6 +349,8 @@ struct Foley {
 }
 
 const COL_SWISH: u32 = 0xa334_7e2b;
+const COL_SHEATH: u32 = 0xf8eb_75ab;
+const COL_UNSHEATH: u32 = 0x8dfc_4c37;
 /// `sound_movement_footsteps.gda`'s `HUMANOID_SMALL` column.
 const COL_HUMANOID_SMALL: u32 = 0x787a_7bc5;
 
@@ -913,12 +920,30 @@ impl GameAudio {
                     // A swing (DAOrigins.exe 0x69e940): `sound_weapon_actions.gda`'s Swish
                     // for the weapon's sound material, the off hand's when the event says
                     // `Left`.
-                    (19, text) => {
+                    // Weapon actions (0x69e8e0..0x69e9a0, request type 3):
+                    // `sound_weapon_actions.gda`'s column for the event kind, in the row of
+                    // the hand's sound material (+0x938 main, +0x93c off: its weapon's, the
+                    // appearance's unarmed material without one). Kinds 3 and 4 take the
+                    // `Sheath` column (its events are the unsheathing sounds), 5 and 6
+                    // `Unsheath` (sheathing), for the main and the off hand; 9, 10 and 19
+                    // (`Swish`) the hand the event's text names (`|Left`: off, 0x69e690).
+                    (3..=6 | 9 | 10 | 19, text) => {
                         let g = gear.get(&id).copied().unwrap_or_default();
-                        let left = text.as_deref().is_some_and(|t| t.contains("Left"));
+                        let left = match ev.kind {
+                            3 | 5 => false,
+                            4 | 6 => true,
+                            _ => text.as_deref().is_some_and(|t| t.contains("|Left")),
+                        };
+                        let column = match ev.kind {
+                            3 | 4 => COL_SHEATH,
+                            5 | 6 => COL_UNSHEATH,
+                            9 => 0x5ff7_e447,
+                            10 => 0x85e1_df32,
+                            _ => COL_SWISH,
+                        };
                         let w = if left { g.off } else { g.main };
-                        let m = self.impacts.material(w);
-                        self.foley.cell("weapon", m, COL_SWISH)
+                        let m = self.impacts.material(w).or(g.unarmed);
+                        self.foley.cell("weapon", m, column)
                     }
                     // Armour foley (0x69e7f0): `sound_movement_foley.gda`'s column the event
                     // names (`Small`, `Medium`, `Large`) for the armour's sound material

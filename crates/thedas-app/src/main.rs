@@ -2174,6 +2174,13 @@ fn audio_state(
                         t.cell_by_hash(audio::APR_FOOTSTEP, o.appearance as i64)
                     }))),
                     surface: grid.as_ref().map_or(0, |g| g.surface(o.position)),
+                    unarmed: appearances
+                        .as_ref()
+                        .and_then(|t| t.cell_by_hash(audio::APR_UNARMED, o.appearance as i64))
+                        .and_then(|c| match c {
+                            thedas_formats::gda::Cell::Int(v) => Some(*v),
+                            _ => None,
+                        }),
                     size: appearances
                         .as_ref()
                         .and_then(|t| t.cell_by_hash(audio::APR_SIZE, o.appearance as i64))
