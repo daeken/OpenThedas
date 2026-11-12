@@ -106,6 +106,8 @@ pub struct Sim {
     pub(crate) fire_lengths: HashMap<String, Option<u64>>,
     /// Attack animation lengths by combat animation tree (see `Sim::melee_attack_ms`).
     pub(crate) attack_lengths: HashMap<String, Vec<u64>>,
+    /// Ability animations by `tree|action` (see `Sim::ability_timing`).
+    pub(crate) ability_anims: HashMap<String, Option<crate::combat::AbilityAnimLen>>,
     /// Each area's doors and their doorways' grid cells (doors do not move; see
     /// `Sim::closed_doors`).
     pub(crate) door_cells: HashMap<ObjectId, Arc<Vec<crate::nav::Doorway>>>,
@@ -346,6 +348,7 @@ impl Sim {
             nav_grids: HashMap::new(),
             fire_lengths: HashMap::new(),
             attack_lengths: HashMap::new(),
+            ability_anims: HashMap::new(),
             save_issues: Vec::new(),
             door_cells: HashMap::new(),
             walk_blocked_by: None,
@@ -715,10 +718,26 @@ impl Sim {
                             c.from = None;
                             Some(at)
                         });
-                    match approached {
+                    // An ability whose impact comes before its animation ends deals the
+                    // impact now and ends later (see `Sim::ability_timing`).
+                    let impact = match approached {
+                        Some(_) => None,
+                        None => self
+                            .world
+                            .get_mut(id)
+                            .and_then(|o| o.commands.first_mut())
+                            .and_then(|c| {
+                                let rest = c.after_impact_ms.take()?;
+                                c.impacted = true;
+                                c.due = Some(due + rest.max(1));
+                                Some(c.clone())
+                            }),
+                    };
+                    match (approached, impact) {
                         // In reach now: the attack itself starts next.
-                        Some(at) => self.move_object(id, at, None),
-                        None => self.finish_command(id),
+                        (Some(at), _) => self.move_object(id, at, None),
+                        (None, Some(cmd)) => self.finish_ability(id, &cmd),
+                        (None, None) => self.finish_command(id),
                     }
                 }
                 _ => break,
@@ -1518,6 +1537,8 @@ impl Sim {
                 from: None,
                 approach: None,
                 ring_wait: false,
+                after_impact_ms: None,
+                impacted: false,
                 path: Vec::new(),
             };
             // A follow move already under way goes on from where it has got to.
@@ -2071,8 +2092,12 @@ impl Sim {
                         if cmd.name == "CommandAttack" {
                             self.start_attack(id, cmd.target.unwrap_or(OBJECT_INVALID), cmd.ty);
                         } else {
+                            // The aim loop (`SetAimLoopDuration`) belongs to a ranged attack's
+                            // executor (DAOrigins.exe 0x7a244b); one left from the last shot
+                            // does not lengthen an ability.
                             if let Some(o) = self.world.get_mut(id) {
                                 o.combat.attack_ms = None;
+                                o.combat.aim_ms = None;
                             }
                             self.start_ability(id, &cmd);
                         }
@@ -2097,6 +2122,23 @@ impl Sim {
                         } else {
                             None
                         };
+                        // An ability's impact comes at its cast animation's impact event, and
+                        // the command runs on to the animation's end (see
+                        // `Sim::ability_timing`); without the animations it keeps the default.
+                        let timing = if set.is_none() && cmd.name == "CommandUseAbility" {
+                            let ability = cmd.ints.first().copied().unwrap_or(0);
+                            self.ability_timing(id, ability)
+                        } else {
+                            None
+                        };
+                        if let Some(t) = timing {
+                            if let Some(c) =
+                                self.world.get_mut(id).and_then(|o| o.commands.first_mut())
+                            {
+                                c.after_impact_ms = Some(t.end_ms.saturating_sub(t.impact_ms));
+                            }
+                        }
+                        let unset = unset.or(timing.map(|t| t.impact_ms));
                         Some(
                             self.world
                                 .get(id)
@@ -2203,7 +2245,7 @@ impl Sim {
         self.update_triggers(id);
         if cmd.name == "CommandAttack" {
             self.finish_attack(id, cmd.target.unwrap_or(OBJECT_INVALID));
-        } else if cmd.name == "CommandUseAbility" {
+        } else if cmd.name == "CommandUseAbility" && !cmd.impacted {
             self.finish_ability(id, &cmd);
         } else if cmd.name == "CommandStartConversation" {
             // A conversation ordered by the player (see `Sim::order_talk`).
@@ -3316,6 +3358,8 @@ mod tests {
             from: None,
             approach: None,
             ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
             path: Vec::new(),
         });
         let t0 = s.world.time_ms;
@@ -3721,6 +3765,8 @@ mod tests {
             from: None,
             approach: None,
             ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
             path: Vec::new(),
         };
         let o = s.world.get_mut(id).unwrap();
@@ -3758,6 +3804,8 @@ mod tests {
             from: None,
             approach: None,
             ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
             path: Vec::new(),
         });
         s.tick(1);
@@ -3790,6 +3838,8 @@ mod tests {
             from: None,
             approach: None,
             ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
             path: Vec::new(),
         });
         s.tick(1);
@@ -3822,6 +3872,8 @@ mod tests {
             from: None,
             approach: None,
             ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
             path: Vec::new(),
         };
         s.world.get_mut(id).unwrap().commands.push(walk());
@@ -3958,6 +4010,8 @@ mod tests {
             from: None,
             approach: None,
             ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
             path: Vec::new(),
         });
         // At 5 m/s: five metres after a second.
@@ -4007,6 +4061,8 @@ mod tests {
             from: None,
             approach: None,
             ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
             path: Vec::new(),
         };
         let walk = cmd(
@@ -4109,6 +4165,8 @@ mod tests {
             from: None,
             approach: None,
             ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
             path: Vec::new(),
         });
         // It walks to just outside the crowd and waits; the ring is still full, so the
@@ -4178,6 +4236,8 @@ mod tests {
             from: None,
             approach: None,
             ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
             path: Vec::new(),
         };
         assert_eq!(
