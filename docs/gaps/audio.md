@@ -12,9 +12,9 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
 
 ### Music
 
-1. **Music changes: stinger timing and loading.**
-   - Done: a change waits for the playing track's next marker (first sync point 0.4–15 s ahead, else 0.4 s on), then the new track starts and the old fades out (0x5c4b10 states 4–6).
-   - Not done: the stinger's timing (the exe waits for it in state 7; we play it at the change), the 12 s load timeout ("Music failed to start"), and delayed theme changes (state 9, counted in frames).
+1. **Music changes.**
+   - Done: a change waits for the playing track's next marker (first sync point 0.4–15 s ahead, else 0.4 s on); the stinger, started paused, and the new track start together there, and the old track fades out (0x5c4b10 states 3–7). An area with the same theme as the last keeps its music playing (SetTheme ignores the theme already playing, 0x5c0ec9).
+   - Not done: the 12 s load timeout ("Music failed to start") and delayed theme changes (state 9, counted in frames); both come with `PlayMusic` (item 2).
    - Size: small.
 2. **Script `PlayMusic` and `SetMusicIntensity`.**
    - Original: `PlayMusic` names a project; `SetMusicIntensity` sets the `music_state` parameter.
