@@ -448,11 +448,7 @@ mod tests {
         let name = words.next().unwrap();
         assert!(apply(&mut sim, &name, &words.collect::<Vec<_>>()));
         assert!(sim.world.popup.is_none());
-        assert!(
-            crate::binding::sim_values(&sim)
-                .get("GUIPopupLayer.NumButtons")
-                .is_none()
-        );
+        assert!(!crate::binding::sim_values(&sim).contains_key("GUIPopupLayer.NumButtons"));
     }
 
     #[test]
