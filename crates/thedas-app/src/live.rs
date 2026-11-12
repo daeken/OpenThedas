@@ -186,6 +186,116 @@ pub struct Live {
     pub movies_wait: bool,
     /// The format frames are drawn in, as the last sync gave it.
     format: Option<wgpu::TextureFormat>,
+    /// Whether a new level and its objects are built on a worker thread while the window
+    /// keeps presenting (a loading frame), rather than within one frame. The window sets it;
+    /// a headless capture loads within the frame, as before.
+    pub async_loads: bool,
+    /// The frame size renderers are warmed for when they are built.
+    pub frame_size: (u32, u32),
+    /// The load under way while [`Live::async_loads`] is set (see [`Loading`]).
+    loading: Option<Loading>,
+    /// A layout whose build failed: not tried again until the area changes.
+    failed_layout: Option<String>,
+}
+
+/// A level, or a level's objects, being built on a worker thread. While one is under way
+/// the world does not run ([`Live::step`]) and the window shows a loading frame instead of
+/// the world; the simulation's own load is unchanged (it happened in its tick).
+struct Loading {
+    started: std::time::Instant,
+    layout: String,
+    building: Building,
+    /// How long the level's and the objects' builds took (seconds).
+    level_s: f64,
+}
+
+enum Building {
+    Level(std::sync::mpsc::Receiver<Result<(LiveLevel, RenderCache)>>),
+    Objects {
+        key: ObjectsKey,
+        models: Vec<ObjectModel>,
+        rx: std::sync::mpsc::Receiver<Result<(AreaScene, AreaRenderer, RenderCache)>>,
+    },
+}
+
+/// What a build needs from [`Live`], to run on another thread.
+#[derive(Clone)]
+struct BuildSpec {
+    install: PathBuf,
+    shaders: String,
+    detail: thedas_render::scene::Detail,
+    frame_effects: bool,
+    format: wgpu::TextureFormat,
+    size: (u32, u32),
+}
+
+/// A handle on the same device and queue, for a worker thread.
+fn share(ctx: &GpuContext) -> GpuContext {
+    GpuContext {
+        instance: ctx.instance.clone(),
+        adapter: ctx.adapter.clone(),
+        device: ctx.device.clone(),
+        queue: ctx.queue.clone(),
+        bc: ctx.bc,
+    }
+}
+
+/// Builds a level's renderer and collider (see [`Live::sync`]).
+fn build_level_with(
+    ctx: &GpuContext,
+    spec: &BuildSpec,
+    layout: &str,
+    cache: &mut RenderCache,
+) -> Result<LiveLevel> {
+    let started = std::time::Instant::now();
+    let install = DaoInstall::open(&spec.install)?;
+    let mut vfs = install.global_vfs(TextureQuality::High)?;
+    install.mount_level(&mut vfs, layout)?;
+    let scene = AreaScene::load_with_props_at(&vfs, layout, &[], spec.detail)?;
+    let programs = crate::programs_cached(&vfs, &scene, &spec.shaders, cache)?;
+    let mut renderer = AreaRenderer::new_cached(ctx, &vfs, &scene, &programs, spec.format, cache);
+    renderer.frame_effects = spec.frame_effects;
+    // First-use work at load, not on the first frames.
+    renderer.warm(ctx, spec.size.0, spec.size.1);
+    log::info!(
+        "{layout}: level of {} draws built in {:.2}s",
+        scene.draws.len(),
+        started.elapsed().as_secs_f64()
+    );
+    let collider = thedas_render::collide::Collider::from_scene(&scene);
+    Ok(LiveLevel {
+        layout: layout.to_string(),
+        vfs: Arc::new(vfs),
+        cutaway_height: scene.cutaway_height.unwrap_or(5.5),
+        cutaway_shown: 1.0,
+        renderer,
+        area_id: None,
+        collider,
+    })
+}
+
+/// Builds the renderer for a level's objects (see [`Live::finish_objects`]).
+fn build_objects_with(
+    ctx: &GpuContext,
+    spec: &BuildSpec,
+    vfs: &Vfs,
+    layout: &str,
+    models: &[ObjectModel],
+    cache: &mut RenderCache,
+) -> Result<(AreaScene, AreaRenderer)> {
+    let started = std::time::Instant::now();
+    let props: Vec<Prop> = models.iter().map(prop).collect();
+    let scene = AreaScene::load_objects_at(vfs, layout, &props, spec.detail)?;
+    let programs = crate::programs_cached(vfs, &scene, &spec.shaders, cache)?;
+    let mut renderer = AreaRenderer::new_cached(ctx, vfs, &scene, &programs, spec.format, cache);
+    renderer.warm(ctx, spec.size.0, spec.size.1);
+    log::info!(
+        "{layout}: {} objects, {} draws, built in {:.2}s",
+        models.len(),
+        scene.draws.len(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok((scene, renderer))
 }
 
 /// How to start the game.
@@ -288,6 +398,10 @@ impl Live {
             swings: Default::default(),
             opacity: Default::default(),
             cache: RenderCache::default(),
+            async_loads: false,
+            frame_size: (1280, 720),
+            loading: None,
+            failed_layout: None,
             owed_ms: 0.0,
             frame_effects: true,
             detail: Default::default(),
@@ -315,7 +429,7 @@ impl Live {
     /// Advances the simulation by `dt_ms` of real time (at most [`MAX_STEP_MS`]), unless
     /// paused.
     pub fn step(&mut self, dt_ms: f64) {
-        if self.paused || self.front_end {
+        if self.paused || self.front_end || self.loading() {
             return;
         }
         // A tutorial that pauses the game holds it until its popup is dismissed.
@@ -334,8 +448,175 @@ impl Live {
         let whole = self.owed_ms.floor();
         if whole >= 1.0 {
             self.owed_ms -= whole;
-            self.sim().tick(whole as u64);
+            let started = std::time::Instant::now();
+            let mut sim = self.sim();
+            let area = sim.world.area;
+            sim.tick(whole as u64);
+            if sim.world.area != area {
+                // The frame the window stands still for: the simulation's own load.
+                log::info!(
+                    "area change: the simulation's step took {:.0} ms",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         }
+    }
+
+    /// Whether a new level is being built (see [`Live::async_loads`]): the world does not
+    /// run, and the window shows a loading frame.
+    pub fn loading(&self) -> bool {
+        self.loading.is_some()
+    }
+
+    /// The new level, once its worker has built it; starts the worker first if it is not
+    /// building this layout. `None` while it builds, or when the build failed (logged; the
+    /// world then shows nothing until the area changes, and the game stays usable).
+    fn poll_level(
+        &mut self,
+        ctx: &GpuContext,
+        format: wgpu::TextureFormat,
+        layout: &str,
+    ) -> Option<LiveLevel> {
+        if self.failed_layout.as_deref() == Some(layout) {
+            return None;
+        }
+        self.failed_layout = None;
+        let building = matches!(&self.loading, Some(l) if l.layout == layout
+            && matches!(l.building, Building::Level(_)));
+        if !building {
+            // Drop the old level now: its world is gone.
+            self.level = None;
+            self.cache = RenderCache::default();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (ctx, spec, name) = (share(ctx), self.spec(format), layout.to_string());
+            let spawned = std::thread::Builder::new()
+                .name("level-build".into())
+                .spawn(move || {
+                    let mut cache = RenderCache::default();
+                    let built = build_level_with(&ctx, &spec, &name, &mut cache);
+                    let _ = tx.send(built.map(|l| (l, cache)));
+                });
+            if let Err(e) = spawned {
+                log::error!("{layout}: the level could not be built: {e}");
+                self.failed_layout = Some(layout.to_string());
+                self.loading = None;
+                return None;
+            }
+            log::info!("{layout}: loading");
+            self.loading = Some(Loading {
+                started: std::time::Instant::now(),
+                layout: layout.to_string(),
+                building: Building::Level(rx),
+                level_s: 0.0,
+            });
+            return None;
+        }
+        let l = self.loading.as_mut()?;
+        let Building::Level(rx) = &l.building else {
+            return None;
+        };
+        match rx.try_recv() {
+            Ok(Ok((level, cache))) => {
+                self.cache = cache;
+                l.level_s = l.started.elapsed().as_secs_f64();
+                Some(level)
+            }
+            Ok(Err(e)) => {
+                self.load_failed(layout, &format!("{e:#}"));
+                None
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.load_failed(layout, "the build stopped");
+                None
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        }
+    }
+
+    /// The new level's objects, once the worker has built them (see [`Live::poll_level`]).
+    fn poll_objects(
+        &mut self,
+        ctx: &GpuContext,
+        format: wgpu::TextureFormat,
+        layout: &str,
+        models: &[ObjectModel],
+        key: ObjectsKey,
+    ) -> Option<LiveObjects> {
+        let vfs = self.level.as_ref()?.vfs.clone();
+        if !matches!(&self.loading, Some(l) if matches!(l.building, Building::Objects { .. })) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (ctx, spec, name) = (share(ctx), self.spec(format), layout.to_string());
+            let mut cache = std::mem::take(&mut self.cache);
+            let owned = models.to_vec();
+            let spawned = std::thread::Builder::new()
+                .name("objects-build".into())
+                .spawn(move || {
+                    let built = build_objects_with(&ctx, &spec, &vfs, &name, &owned, &mut cache);
+                    let _ = tx.send(built.map(|(scene, r)| (scene, r, cache)));
+                });
+            if let Err(e) = spawned {
+                self.load_failed(layout, &e.to_string());
+                return None;
+            }
+            let building = Building::Objects {
+                key,
+                models: models.to_vec(),
+                rx,
+            };
+            match self.loading.as_mut() {
+                Some(l) => l.building = building,
+                // Objects alone (the level was already there): a load all the same.
+                None => {
+                    self.loading = Some(Loading {
+                        started: std::time::Instant::now(),
+                        layout: layout.to_string(),
+                        building,
+                        level_s: 0.0,
+                    })
+                }
+            }
+            return None;
+        }
+        let l = self.loading.as_ref()?;
+        let Building::Objects { rx, .. } = &l.building else {
+            return None;
+        };
+        match rx.try_recv() {
+            Ok(Ok((scene, renderer, cache))) => {
+                self.cache = cache;
+                let l = self.loading.take()?;
+                let Building::Objects { key, models, .. } = l.building else {
+                    return None;
+                };
+                let objects = self.finish_objects(&models, key, scene, renderer);
+                let total = l.started.elapsed().as_secs_f64();
+                log::info!(
+                    "{layout}: loaded in {total:.2}s (level {:.2}s, objects {:.2}s)",
+                    l.level_s,
+                    total - l.level_s
+                );
+                Some(objects)
+            }
+            Ok(Err(e)) => {
+                self.load_failed(layout, &format!("{e:#}"));
+                None
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.load_failed(layout, "the build stopped");
+                None
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        }
+    }
+
+    /// A worker's build failed: say so and leave the loading state, the world empty, rather
+    /// than hold the loading frame.
+    fn load_failed(&mut self, layout: &str, why: &str) {
+        log::error!("{layout}: loading failed: {why}");
+        self.loading = None;
+        self.level = None;
+        self.objects = None;
+        self.failed_layout = Some(layout.to_string());
     }
 
     /// Where a sphere of `radius` metres (0: a segment) moving from `from` to `to` first
@@ -819,7 +1100,16 @@ impl Live {
         let area = sim.world.area.unwrap_or_default();
         if self.level.as_ref().map(|l| l.layout.as_str()) != Some(layout.as_str()) {
             self.objects = None;
-            self.level = Some(self.build_level(ctx, format, &layout)?);
+            if self.async_loads {
+                drop(sim);
+                match self.poll_level(ctx, format, &layout) {
+                    Some(level) => self.level = Some(level),
+                    None => return Ok(()),
+                }
+                sim = shared.lock().unwrap_or_else(|p| p.into_inner());
+            } else {
+                self.level = Some(self.build_level(ctx, format, &layout)?);
+            }
         }
         // The area's colour grading (areadata.gda by its AREA_ID), swapped as areas change.
         let area_id = sim
@@ -864,7 +1154,16 @@ impl Live {
         let kept = shown.kept;
         drop(sim);
         let key = objects_key(&models);
-        if self.objects.as_ref().map(|o| &o.key) != Some(&key) {
+        if self.async_loads && self.objects.is_none() {
+            // A new level's objects are built on the worker too, before the world shows.
+            match self.poll_objects(ctx, format, &layout, &models, key) {
+                Some(o) => {
+                    self.objects = Some(o);
+                    self.stage_camera = None;
+                }
+                None => return Ok(()),
+            }
+        } else if self.objects.as_ref().map(|o| &o.key) != Some(&key) {
             self.objects = Some(self.build_objects(ctx, format, &layout, &models, key)?);
             // A new look is framed afresh.
             self.stage_camera = None;
@@ -1038,41 +1337,26 @@ impl Live {
         )?))
     }
 
+    fn spec(&self, format: wgpu::TextureFormat) -> BuildSpec {
+        BuildSpec {
+            install: self.install.clone(),
+            shaders: self.shaders.clone(),
+            detail: self.detail,
+            frame_effects: self.frame_effects,
+            format,
+            size: self.frame_size,
+        }
+    }
+
     fn build_level(
         &mut self,
         ctx: &GpuContext,
         format: wgpu::TextureFormat,
         layout: &str,
     ) -> Result<LiveLevel> {
-        let started = std::time::Instant::now();
-        let install = DaoInstall::open(&self.install)?;
-        let mut vfs = install.global_vfs(TextureQuality::High)?;
-        install.mount_level(&mut vfs, layout)?;
-        let scene = AreaScene::load_with_props_at(&vfs, layout, &[], self.detail)?;
         // A new resource stack: nothing cached carries over.
         self.cache = RenderCache::default();
-        let programs = crate::programs_cached(&vfs, &scene, &self.shaders, &mut self.cache)?;
-        let mut renderer =
-            AreaRenderer::new_cached(ctx, &vfs, &scene, &programs, format, &mut self.cache);
-        renderer.frame_effects = self.frame_effects;
-        // First-use work at load, not on the first frames (the frame size is not known
-        // here; a different size only rewrites the slots).
-        renderer.warm(ctx, 1280, 720);
-        log::info!(
-            "{layout}: level of {} draws built in {:.2}s",
-            scene.draws.len(),
-            started.elapsed().as_secs_f64()
-        );
-        let collider = thedas_render::collide::Collider::from_scene(&scene);
-        Ok(LiveLevel {
-            layout: layout.to_string(),
-            vfs: Arc::new(vfs),
-            cutaway_height: scene.cutaway_height.unwrap_or(5.5),
-            cutaway_shown: 1.0,
-            renderer,
-            area_id: None,
-            collider,
-        })
+        build_level_with(ctx, &self.spec(format), layout, &mut self.cache)
     }
 
     fn build_objects(
@@ -1083,24 +1367,25 @@ impl Live {
         models: &[ObjectModel],
         key: ObjectsKey,
     ) -> Result<LiveObjects> {
-        let started = std::time::Instant::now();
         let vfs = self
             .level
             .as_ref()
             .map(|l| l.vfs.clone())
             .context("objects before their level")?;
-        let props: Vec<Prop> = models.iter().map(prop).collect();
-        let scene = AreaScene::load_objects_at(&vfs, layout, &props, self.detail)?;
-        let programs = crate::programs_cached(&vfs, &scene, &self.shaders, &mut self.cache)?;
-        let mut renderer =
-            AreaRenderer::new_cached(ctx, &vfs, &scene, &programs, format, &mut self.cache);
-        renderer.warm(ctx, 1280, 720);
-        log::info!(
-            "{layout}: {} objects, {} draws, built in {:.2}s",
-            models.len(),
-            scene.draws.len(),
-            started.elapsed().as_secs_f64()
-        );
+        let spec = self.spec(format);
+        let (scene, renderer) =
+            build_objects_with(ctx, &spec, &vfs, layout, models, &mut self.cache)?;
+        Ok(self.finish_objects(models, key, scene, renderer))
+    }
+
+    /// The objects' picking, camera and portrait data, from their built scene.
+    fn finish_objects(
+        &mut self,
+        models: &[ObjectModel],
+        key: ObjectsKey,
+        scene: AreaScene,
+        renderer: AreaRenderer,
+    ) -> LiveObjects {
         // A new scene means new skeleton indices.
         self.animator = Animator::default();
         let mut bounds = std::collections::HashMap::new();
@@ -1168,7 +1453,7 @@ impl Live {
             bounds.insert(m.id, (centre - glam::Vec3::from_array(m.position), radius));
         }
         let solid = thedas_render::collide::Collider::from_draws(&scene, placeable_draws, true);
-        Ok(LiveObjects {
+        LiveObjects {
             key,
             bounds,
             shapes,
@@ -1183,7 +1468,7 @@ impl Live {
             scene,
             renderer,
             cutaway_shown: 1.0,
-        })
+        }
     }
 }
 
