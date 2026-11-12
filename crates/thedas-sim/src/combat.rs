@@ -249,9 +249,15 @@ impl Sim {
             let alive = self.alive(id);
             // A creature notices others within its perception range (see
             // `Sim::perception_range`) and keeps track of those it has noticed out to the
-            // visual radius. Closed doors block sight, and a wall of the pathing grid blocks
-            // noticing. Provisional: the grid, the only geometry the simulation has, marks
-            // large furniture and rubble the same way as walls, so those block too.
+            // visual radius. DAOrigins.exe's perception update (0x6b89b0, from each
+            // creature's tick at 0x6be7a4) notices a creature that is not hostile on range
+            // alone (0x6b8873); only a hostile one needs a clear line of sight, a ray through
+            // the level's collision from 1.8 m above each one's feet (0xb004d8; 0x67c530).
+            // Keeping track (0x6a8d60) tests no sight, out to 60 m (0xadef18).
+            // Provisional: closed doors stand in for the exe's room visibility for everyone,
+            // and a wall of the pathing grid for the collision ray; the grid, the only geometry
+            // the simulation has, marks large furniture and rubble the same way as walls, so
+            // those block hostiles too.
             let ring = self.perception_range(id);
             let seen = self
                 .world
@@ -270,7 +276,7 @@ impl Sim {
                         if tracked {
                             d <= VISUAL_RANGE && !blocked(pos, p)
                         } else {
-                            d <= ring && !blocked(pos, p) && !wall(pos, p)
+                            d <= ring && !blocked(pos, p) && (!self.hostile(id, o) || !wall(pos, p))
                         }
                     })
                     .map(|&(o, _)| o)
@@ -2449,6 +2455,48 @@ mod tests {
         s.world.get_mut(hero).unwrap().effects = vec![burn(hero, 1)];
         s.record_health_loss(hero, hero, 4.0);
         assert_eq!(s.world.trace.damage.get(&(hero, 0)), Some(&4.0));
+    }
+
+    #[test]
+    fn only_hostiles_need_a_clear_line_to_be_noticed() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        // A wall (9) across x = 5 on a 10 x 3 grid of 1 m cells.
+        let (w, h) = (10u32, 3u32);
+        let mut data = vec![1u8; (w * h) as usize];
+        for y in 0..h {
+            data[(y * w + 5) as usize] = 9;
+        }
+        s.area_layouts.insert(area, "walled".into());
+        s.nav_grids.insert(
+            "walled".into(),
+            Some(std::sync::Arc::new(thedas_formats::level::NavGrid {
+                columns: w,
+                rows: h,
+                cell_size: 1.0,
+                clearance: 2.0,
+                base: [0.0, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                data,
+                heights: vec![0.0; (w * h) as usize],
+            })),
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let friend = s.world.spawn(ObjectKind::Creature, "friend");
+        let foe = s.world.spawn(ObjectKind::Creature, "foe");
+        s.world.hero = Some(hero);
+        for (id, y, group) in [(hero, 1.5, 0), (friend, 0.5, 0), (foe, 2.5, 1)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = [1.5, y, 0.0];
+            o.group = group;
+        }
+        for id in [friend, foe] {
+            s.world.get_mut(id).unwrap().position[0] = 8.5;
+        }
+        s.world.hostility.insert((0, 1), true);
+        s.update_perception();
+        assert_eq!(s.world.get(hero).unwrap().combat.perceived, vec![friend]);
     }
 
     #[test]

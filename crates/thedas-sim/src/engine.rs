@@ -3366,11 +3366,24 @@ pub fn call(
             ok(objects(list))
         }
         "TriggerPerception" => {
+            // DAOrigins.exe (0x65a7b0 -> 0x6b32a0 -> 0x6a2bb0) adds the creature only when both
+            // are alive and in the same area, within 60 m (0xb03bf8), with no sight test.
+            // Provisional: the room-visibility check is not modelled.
             let (who, seen) = (obj(a, 0), obj(a, 1));
-            let new = h
-                .object(who)
-                .is_some_and(|o| !o.combat.perceived.contains(&seen));
-            if new && h.object(seen).is_some() {
+            let reach = match (h.object(who), h.object(seen)) {
+                (Some(x), Some(y)) => {
+                    x.area.is_some()
+                        && x.area == y.area
+                        && dist(x.position, y.position) <= crate::combat::VISUAL_RANGE
+                }
+                _ => false,
+            };
+            let new = reach
+                && h.sim.alive(who)
+                && h.sim.alive(seen)
+                && h.object(who)
+                    .is_some_and(|o| !o.combat.perceived.contains(&seen));
+            if new {
                 if let Some(o) = h.sim.world.get_mut(who) {
                     o.combat.perceived.push(seen);
                 }
