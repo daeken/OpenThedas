@@ -19,12 +19,11 @@ in each run folder's `.log` files).
 |---|---|---|---|---|
 | R1 | Characters lit by their room's lights (warm hall light in Highever); NPC hair takes its tint colour; hands match the face | Characters pick up every room's character-rig sun: NPC hair silver-grey (Bryce should be blond-brown, Howe dark), hands paler than faces, orange rim glow on armour (Dwarf Noble), dark Dalish hunters against the sky | run10/hn_o30.png vs wine shots cg7/d3; run5/dnoble_*; run11/dalish_o45.png | confirmed; rendering tracing per-object light selection |
 | R2 | Human Noble starting shield: wooden planks, gold rim | Dark teal disc with silver boss | run10/hn_o30.png vs cg7 | confirmed (likely part of R1) |
-| R3 | Bright wedding-morning alienage; daylight Ostagar on arrival | Alienage reads as dusk (olive sky, near-black shadows); Ostagar ground dark | run22/alienage.png, run33/ostagar.png | suspected; first reference captures of the original now exist (King's camp, alienage, Commons); comparison pending |
+| R3 | Bright wedding-morning alienage; daylight Ostagar on arrival | Alienage brightness matches the original's capture since the per-area colour curve (#365); Ostagar ground still to compare | run22/alienage.png, run33/ostagar.png | alienage fixed; Ostagar pending |
 | R4 | Fade has haze, the Black City, no void | A flat black region at screen right in the Fade (undrawn water) | run14/mage_walk.png | confirmed (water not drawn) |
 | R5 | Water surfaces everywhere | No water rendering | general | confirmed |
-| R6 | Orzammar guard solid | One guard semi-transparent in the Dust Town opening pan | run9/dc_cut.png | suspected; queued in rendering |
 | R7 | Selection/target rings sit on the ground; hostile ring red | Rings ignore depth, float at chest or hip height, draw through characters; hostile ring yellow | run19/duel_late.png, cell.png | suspected |
-| R8 | Grass and bushes | Trees now draw as billboards (#311); grass and bushes are missing | run34/wilds_trees.png | confirmed |
+| R8 | Trees sway, leaves face the camera; grass and bushes | Trees draw as geometry with distance levels (#362 to #381), but with no wind and fixed leaf cards; grass and bushes are missing | run34/wilds_trees.png | confirmed |
 | R9 | A head close-up does not fade: the fade tests the models' own physics shapes and a camera 0.5 m behind at eye level does not touch them (traced) | The fade tests the models' creature-group shapes, head included | sim-work/ruins/after_bear.json | parity |
 | R10 | Green placeholder-like emissives absent | Green dashes on Tapster's pillars, a green glyph by the bar | run17/tavern.png | suspected |
 | R11 | Shianni's bodice solid | Flat or see-through triangle on her bodice | run5/celf_o30.png | suspected |
