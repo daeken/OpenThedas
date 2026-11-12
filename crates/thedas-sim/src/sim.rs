@@ -94,6 +94,8 @@ pub struct Sim {
     pub watch_calls: std::collections::BTreeSet<ObjectId>,
     /// Followers whose front command is the move [`Sim::keep_party_together`] gave them.
     following: std::collections::BTreeSet<ObjectId>,
+    /// When followers are next looked at (see [`FOLLOW_PERIOD_MS`]).
+    next_follow_ms: u64,
     /// Tags (lowercase) whose objects' engine calls are traced too, including objects
     /// created later (an area not yet entered).
     pub watch_tags: std::collections::BTreeSet<String>,
@@ -176,19 +178,33 @@ fn along(from: [f32; 3], points: &[[f32; 3]], f: f32) -> [f32; 3] {
     last
 }
 
-/// Where the `k`th follower (from 0) arrives with a leader at `p` facing `facing`: a
-/// little behind it, alternating to either side, so the party does not stand in one spot.
-/// Provisional: the game's own arrival formation is not traced.
-fn behind(p: [f32; 3], facing: f32, k: usize) -> [f32; 3] {
+/// The party formation (DAOrigins.exe's default table at 0xc0d240, chosen in 0x7605b0): each
+/// follower slot's place as (to the leader's right, forward), in metres. Slot 0 stands 1.8 m
+/// behind-left, slot 1 behind-right, slot 2 2.5 m straight behind.
+pub const FORMATION: [[f32; 2]; 11] = [
+    [-1.5, -1.0],
+    [1.5, -1.0],
+    [0.0, -2.5],
+    [-1.5, -4.0],
+    [1.5, -4.0],
+    [-3.0, -2.0],
+    [3.0, -2.0],
+    [-1.0, -3.0],
+    [1.0, -3.0],
+    [-3.5, -1.0],
+    [3.5, -1.0],
+];
+
+/// Where follower slot `k` (from 0) stands with a leader at `p` heading `facing` (DAOrigins.exe
+/// 0x760810 -> 0x7605b0 -> 0xa38a40): the [`FORMATION`] entry turned by the leader's heading.
+/// Provisional: slots past the table (the exe picks a random point within 4 m) take its last.
+pub fn behind(p: [f32; 3], facing: f32, k: usize) -> [f32; 3] {
     let heading = crate::world::heading_of(facing).to_radians();
     let (fx, fy) = (heading.cos(), heading.sin());
-    let back = 1.2 + 0.6 * (k / 2) as f32;
-    let side = if k % 2 == 0 { 0.8 } else { -0.8 };
-    [
-        p[0] - fx * back - fy * side,
-        p[1] - fy * back + fx * side,
-        p[2],
-    ]
+    // The leader's right: forward turned a quarter turn clockwise.
+    let (rx, ry) = (fy, -fx);
+    let [x, y] = FORMATION[k.min(FORMATION.len() - 1)];
+    [p[0] + x * rx + y * fx, p[1] + x * ry + y * fy, p[2]]
 }
 
 /// The horizontal direction of the leg of the route from `from` through `points` that a
@@ -251,12 +267,16 @@ pub(crate) const MELEE_RING_INSET: f32 = 0.05;
 /// re-pathing rule is not traced.
 const APPROACH_REPLAN: f32 = 1.0;
 
-/// How far a follower may fall from its place behind the leader before it runs after it
-/// (metres; see [`Sim::keep_party_together`]). Provisional.
+/// The slack beyond a follower's body and its slot's distance before it starts after a walking
+/// leader (0xc0d230), and the extra slack while the leader stands (0xae7108), in metres
+/// (DAOrigins.exe's start test 0x760980).
 pub const FOLLOW_START: f32 = 2.0;
-/// How far its place may move from where a following follower is heading before it is sent
-/// on again (metres). Provisional.
+pub const FOLLOW_STANDING_EXTRA: f32 = 2.0;
+/// A follower is only sent when its place is more than this far from it (0xaddc94).
 pub const FOLLOW_RETARGET: f32 = 1.0;
+/// How often followers are looked at, in milliseconds (the follow update, 0x630f60 calling
+/// 0x760dc0 every 0.5 s).
+pub const FOLLOW_PERIOD_MS: u64 = 500;
 
 /// What the simulation does when a script starts character generation, since there is no
 /// player at the character-creation screens.
@@ -348,6 +368,7 @@ impl Sim {
             auto_pause_combat: false,
             watch_calls: Default::default(),
             following: Default::default(),
+            next_follow_ms: 0,
             watch_tags: Default::default(),
             current_effect: None,
             current_effect_target: None,
@@ -1712,6 +1733,16 @@ impl Sim {
         if combat != 0 && self.world.game_mode == combat {
             return;
         }
+        // The exe looks every half second, not every frame.
+        if self.world.time_ms < self.next_follow_ms {
+            return;
+        }
+        self.next_follow_ms = (self.world.time_ms / FOLLOW_PERIOD_MS + 1) * FOLLOW_PERIOD_MS;
+        let leader_walking = self.world.get(leader).is_some_and(|o| {
+            o.commands
+                .first()
+                .is_some_and(|c| c.name.starts_with("CommandMoveTo") && c.from.is_some())
+        });
         let followers: Vec<ObjectId> = crate::engine::party_of(self)
             .into_iter()
             .filter(|&f| f != leader)
@@ -1727,7 +1758,17 @@ impl Sim {
             if !free {
                 continue;
             }
+            // DAOrigins.exe's start test (0x760980): the follower must be at least its body,
+            // its slot's distance and 2 m from the leader (2 m more while the leader stands),
+            // then its place more than 1 m from it (0xaddc94).
             let place = behind(pos, facing, i);
+            let [x, y] = FORMATION[i.min(FORMATION.len() - 1)];
+            let mut start = self.body_radius(f) + (x * x + y * y).sqrt() + FOLLOW_START;
+            if !leader_walking {
+                start += FOLLOW_STANDING_EXTRA;
+            }
+            let ground =
+                |a: [f32; 3], b: [f32; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt();
             let heading = o
                 .commands
                 .first()
@@ -1735,8 +1776,11 @@ impl Sim {
                 .and_then(|c| c.location)
                 .map(|l| l.position);
             let due = match heading {
-                Some(h) => crate::engine::dist(h, place) > FOLLOW_RETARGET,
-                None => crate::engine::dist(o.position, place) > FOLLOW_START,
+                // A follow move under way is re-aimed at the new place (in place in the exe).
+                Some(h) => ground(h, place) > FOLLOW_RETARGET,
+                None => {
+                    ground(o.position, pos) >= start && ground(o.position, place) > FOLLOW_RETARGET
+                }
             };
             if !due {
                 continue;
@@ -4106,6 +4150,29 @@ mod tests {
             (dog_pos[0] - 9.0).abs() < 1e-4,
             "dog follows a metre behind: {dog_pos:?}"
         );
+    }
+
+    #[test]
+    fn followers_take_the_formation_slots_behind_the_leader() {
+        // A leader at the origin facing 0 (toward +Y): its right is +X.
+        let near =
+            |a: [f32; 3], b: [f32; 3]| (a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4;
+        assert!(
+            near(behind([0.0; 3], 0.0, 0), [-1.5, -1.0, 0.0]),
+            "behind-left"
+        );
+        assert!(
+            near(behind([0.0; 3], 0.0, 1), [1.5, -1.0, 0.0]),
+            "behind-right"
+        );
+        assert!(
+            near(behind([0.0; 3], 0.0, 2), [0.0, -2.5, 0.0]),
+            "straight behind"
+        );
+        // Turned to face +X (facing 270): behind is -X, its left is +Y.
+        assert!(near(behind([10.0, 0.0, 1.0], 270.0, 0), [9.0, 1.5, 1.0]));
+        // Past the table, the last slot.
+        assert_eq!(behind([0.0; 3], 0.0, 30), behind([0.0; 3], 0.0, 10));
     }
 
     #[test]

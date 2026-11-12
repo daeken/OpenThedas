@@ -2486,19 +2486,13 @@ pub fn call(
             let who = obj(a, 0);
             let hero = h.sim.world.hero.and_then(|x| h.object(x));
             let l = match (hero, h.object(who)) {
+                // DAOrigins.exe's handler (0x666650) gives the follower's slot of the default
+                // formation table around the leader (see `crate::sim::behind`).
                 (Some(leader), Some(me)) => {
                     let i = leader.followers.iter().position(|&f| f == who).unwrap_or(0);
-                    let (s, c) = crate::world::heading_of(leader.facing)
-                        .to_radians()
-                        .sin_cos();
-                    let back = 1.0 + i as f32;
                     Location {
                         area: leader.area.or(me.area).unwrap_or(OBJECT_INVALID),
-                        position: [
-                            leader.position[0] - c * back,
-                            leader.position[1] - s * back,
-                            leader.position[2],
-                        ],
+                        position: crate::sim::behind(leader.position, leader.facing, i),
                         facing: leader.facing,
                     }
                 }
