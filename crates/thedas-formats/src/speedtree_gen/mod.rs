@@ -6,13 +6,16 @@
 //!
 //! Stage 1 (this file): the single random stream and the curve parameters. Stage 2
 //! ([`skeleton`]): tree set-up and the branch skeleton, on the rotation frames of [`frame`].
-//! Stage 3 ([`geometry`]): branch tubes and branch LOD.
+//! Stage 3 ([`geometry`]): branch tubes and branch LOD. Stage 4 ([`fronds`]): fronds. Stage 5
+//! ([`leaves`]): leaves. [`generate`] runs them all in the order of 5.1.
 
 pub mod frame;
+pub mod fronds;
 pub mod geometry;
+pub mod leaves;
 pub mod skeleton;
 
-pub use skeleton::{Branch, Bud, Flare, Skeleton, Vertex, grow};
+pub use skeleton::{Branch, Bud, Flare, Guide, Skeleton, Vertex, grow};
 
 use crate::speedtree::{BezierSpline, BranchLevel, SpeedTree};
 
@@ -300,6 +303,40 @@ fn bezier(a: f32, b: f32, c: f32, d: f32, u: f32) -> f32 {
     lerp(abc, bcd, u)
 }
 
+/// A fully computed tree (stages 2–5 and the post-generation draws of 7.1).
+#[derive(Clone, Debug)]
+pub struct GeneratedTree {
+    pub skeleton: Skeleton,
+    pub branches: geometry::BranchGeometry,
+    /// Leaf LOD levels (5.4); level 0 is `skeleton.leaves`.
+    pub leaf_lods: Vec<Vec<leaves::Leaf>>,
+    pub fronds: fronds::FrondGeometry,
+    /// The three rocking groups' time offsets (7.1).
+    pub rocking_offsets: [f32; 3],
+}
+
+/// Computes a tree from its description, keeping the order of random draws of 5.1: growth
+/// (branches, guides, buds and leaves), branch LOD, leaf LOD, fronds, then the rocking
+/// groups' offsets.
+pub fn generate(tree: &SpeedTree) -> GeneratedTree {
+    let (skeleton, mut random) = grow(tree);
+    let branches = geometry::build(tree, &skeleton, &mut random);
+    let leaf_lods = leaves::lods(tree, &skeleton.leaves, &mut random);
+    let fronds = fronds::build(tree, &skeleton, &mut random);
+    let rocking_offsets = [
+        random.uniform(0.0, 10_000.0),
+        random.uniform(0.0, 10_000.0),
+        random.uniform(0.0, 10_000.0),
+    ];
+    GeneratedTree {
+        skeleton,
+        branches,
+        leaf_lods,
+        fronds,
+        rocking_offsets,
+    }
+}
+
 /// Every curve of a tree with where it sits, for checks over the game's files.
 pub fn curves(tree: &SpeedTree) -> Vec<(String, &BezierSpline)> {
     fn level<'t>(out: &mut Vec<(String, &'t BezierSpline)>, name: &str, level: &'t BranchLevel) {
@@ -339,8 +376,8 @@ pub fn curves(tree: &SpeedTree) -> Vec<(String, &BezierSpline)> {
     out
 }
 
-/// Builds every curve of a tree and grows its skeleton, checking every value is finite (a
-/// corpus check).
+/// Builds every curve of a tree and computes the whole tree, checking every value is finite
+/// and every strip indexes real vertices (a corpus check).
 pub fn check(tree: &SpeedTree) -> Result<(), String> {
     for (name, spline) in curves(tree) {
         let curve = Curve::new(spline);
@@ -348,7 +385,8 @@ pub fn check(tree: &SpeedTree) -> Result<(), String> {
             return Err(format!("{name}: table entry {i} is {}", curve.table()[i]));
         }
     }
-    let (skeleton, mut random) = grow(tree);
+    let generated = generate(tree);
+    let skeleton = &generated.skeleton;
     for (i, branch) in skeleton.branches.iter().enumerate() {
         let finite = branch.vertices.iter().all(|v| {
             v.position.iter().all(|x| x.is_finite()) && v.radius.is_finite() && v.length.is_finite()
@@ -357,7 +395,7 @@ pub fn check(tree: &SpeedTree) -> Result<(), String> {
             return Err(format!("branch {i} (level {}) is not finite", branch.level));
         }
     }
-    let geometry = geometry::build(tree, &skeleton, &mut random);
+    let geometry = &generated.branches;
     let finite = |v: &[f32; 3]| v.iter().all(|x| x.is_finite());
     if let Some(i) = geometry.vertices.iter().position(|v| {
         !(finite(&v.position)
@@ -365,6 +403,30 @@ pub fn check(tree: &SpeedTree) -> Result<(), String> {
             && v.texcoords.iter().flatten().all(|x| x.is_finite()))
     }) {
         return Err(format!("branch vertex {i} is not finite"));
+    }
+    if let Some(i) = skeleton.leaves.iter().position(|l| {
+        !(finite(&l.position)
+            && l.corners
+                .iter()
+                .all(|c| finite(&c.normal) && finite(&c.color)))
+    }) {
+        return Err(format!("leaf {i} is not finite"));
+    }
+    let fronds = &generated.fronds;
+    if let Some(i) = fronds.vertices.iter().position(|v| {
+        !(finite(&v.position) && finite(&v.normal) && v.texcoord.iter().all(|x| x.is_finite()))
+    }) {
+        return Err(format!("frond vertex {i} is not finite"));
+    }
+    let frond_count = fronds.vertices.len() as u32;
+    if fronds
+        .strips
+        .iter()
+        .flatten()
+        .flatten()
+        .any(|&i| i >= frond_count)
+    {
+        return Err("a frond strip indexes past the vertices".into());
     }
     let count = geometry.vertices.len() as u32;
     for tube in geometry.tubes.iter().flatten() {
