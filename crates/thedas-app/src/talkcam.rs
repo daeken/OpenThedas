@@ -1,21 +1,17 @@
-//! The conversation camera and stage marks: while a conversation line with staged
-//! cinematics is up, the view is that line's stage camera (see [`thedas_formats::stage`]),
-//! placed where the area puts the line's stage, and the line's actors are drawn standing at
-//! their stage places. A line without a shot gets the executable's default framing of its
-//! speaker (see [`default_framing`]); the creatures stay where the last staged line put
-//! them.
+//! The conversation camera: while a conversation line with staged cinematics is up, the
+//! view is that line's stage camera (see [`thedas_formats::stage`]), placed where the area
+//! puts the line's stage. A line without a shot gets the executable's default framing of its
+//! speaker (see [`default_framing`]). The line's actors are drawn by its own cutscene (see
+//! [`crate::cutactors`]), and the simulation leaves them on their marks when the line ends
+//! (see [`thedas_sim::cutactors`]).
 //!
-//! Presentation only: reads the simulation and the dialog and stage resources. The
-//! creatures are drawn at their marks; the simulation keeps them where they were, and they
-//! are drawn there again when the conversation ends.
+//! Presentation only: reads the simulation and the dialog and stage resources.
 //!
 //! Once a line with its own cinematics has run its length (the cut's, 5000) and the player
 //! has replies to choose, the view moves to the stage's `decision` camera.
 //!
-//! Provisional: the stage is the area stage with the line's tag nearest the conversation's
-//! owner (a tag can be placed more than once); the camera's field of view is taken as
-//! vertical; whether the original moves the creatures themselves (so that they stay on
-//! their marks afterwards) is not traced; the original's camera moves between and within
+//! Provisional: the camera's field of view is taken as
+//! vertical; the original's camera moves between and within
 //! lines and lines staged at the speaker's
 //! current location (`StageAtCurrentLocation`) are not followed.
 
@@ -38,8 +34,6 @@ pub struct Staged {
     pub decision: Option<Camera>,
     /// How long the line's cinematics run (milliseconds), when it has its own.
     pub line_ms: Option<f64>,
-    /// Each actor drawn at its mark: world position and facing (degrees, as objects').
-    pub marks: HashMap<ObjectId, ([f32; 3], f32)>,
 }
 
 /// Which conversation line: the conversation (dialog name, owner) and the node shown.
@@ -233,18 +227,23 @@ impl TalkCamera {
             );
             return None;
         };
+        // The stage nearest the player's creature, on the ground plane (0x7d2aa0 ->
+        // 0x67cdd0), as the line's cutscene is placed.
         let near = sim
             .world
-            .get(open.owner)
-            .map(|o| Vec3::from_array(o.position));
+            .get(open.player)
+            .map(|o| Vec3::new(o.position[0], o.position[1], 0.0));
         let area = sim.world.area;
         let placed = sim
             .world
             .by_tag(&shot.stage)
             .filter(|o| o.kind == ObjectKind::Stage && o.area == area)
             .min_by(|a, b| {
-                let d =
-                    |o: &&Object| near.map_or(0.0, |n| n.distance(Vec3::from_array(o.position)));
+                let d = |o: &&Object| {
+                    near.map_or(0.0, |n| {
+                        n.distance(Vec3::new(o.position[0], o.position[1], 0.0))
+                    })
+                };
                 d(a).total_cmp(&d(b))
             });
         let Some(placed) = placed else {
@@ -266,29 +265,12 @@ impl TalkCamera {
             cam.position,
             cam.rotation
         );
-        let mut marks = HashMap::new();
-        for (actor, place) in &shot.actors {
-            let (Some(id), Some(p)) = (
-                actor_object(sim, actor, open),
-                stage
-                    .places
-                    .iter()
-                    .find(|p| p.name.eq_ignore_ascii_case(place)),
-            ) else {
-                continue;
-            };
-            marks.insert(
-                id,
-                place_mark(placed.position, placed.facing, p.position, p.rotation),
-            );
-        }
         Some(Staged {
             camera: place_camera(placed.position, placed.facing, cam, base),
             decision: stage
                 .camera("decision")
                 .map(|d| place_camera(placed.position, placed.facing, d, base)),
             line_ms: shot.seconds.map(|s| s as f64 * 1000.0),
-            marks,
         })
     }
 }
@@ -387,22 +369,6 @@ fn actor_object(sim: &Sim, actor: &str, open: &OpenLine) -> Option<ObjectId> {
         .map(|o| o.id)
 }
 
-/// A stage place (`position`, rotation quaternion `rotation`, in the stage's space) in the
-/// world, on a stage the area places at `stage_at` turned `stage_facing` degrees: a
-/// position and an object facing (degrees about Z).
-pub fn place_mark(
-    stage_at: [f32; 3],
-    stage_facing: f32,
-    position: [f32; 3],
-    rotation: [f32; 4],
-) -> ([f32; 3], f32) {
-    let stage = thedas_render::Prop::placement(stage_at, stage_facing);
-    let at = stage.transform_point3(Vec3::from_array(position));
-    // About Z, as objects' quaternions are read (see the simulation's area loading).
-    let turn = (2.0 * rotation[2].atan2(rotation[3])).to_degrees();
-    (at.to_array(), (stage_facing + turn).rem_euclid(360.0))
-}
-
 /// Stage camera `cam` on a stage the area places at `position`, turned `facing` degrees
 /// about Z (as objects are placed: [`thedas_render::Prop::placement`]).
 pub fn place_camera(position: [f32; 3], facing: f32, cam: &StageCamera, base: &Camera) -> Camera {
@@ -471,21 +437,5 @@ mod tests {
         let c = default_framing(Vec3::ZERO, 0.0, None, None, &base);
         let want = Vec3::new(-0.9 * t.sin(), 0.9 * t.cos(), 1.0 - 0.06);
         assert!((c.position - want).length() < 1e-4, "{:?}", c.position);
-    }
-
-    #[test]
-    fn puts_actors_on_their_marks() {
-        // A quarter-turned stage: stage +Y is world -X; the place turns a further half turn.
-        let (at, facing) = place_mark(
-            [10.0, 20.0, 3.0],
-            90.0,
-            [0.0, 2.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-        );
-        assert!(
-            (Vec3::from_array(at) - Vec3::new(8.0, 20.0, 3.0)).length() < 1e-4,
-            "{at:?}"
-        );
-        assert!((facing - 270.0).abs() < 1e-3, "{facing}");
     }
 }

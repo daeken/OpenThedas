@@ -79,6 +79,8 @@ pub struct Live {
     talk_camera: crate::talkcam::TalkCamera,
     /// The playing cutscene's camera tracks.
     cutscene_camera: crate::cutcam::CutsceneCamera,
+    /// The creatures cutscenes and conversation lines pose (see [`crate::cutactors`]).
+    cut_actors: crate::cutactors::CutsceneActors,
     /// The shaders' clock (`ApplicationTime`), in seconds: real time, running while the
     /// world is stopped too.
     pub shader_time: f64,
@@ -202,6 +204,7 @@ impl Live {
             detail: Default::default(),
             talk_camera: Default::default(),
             cutscene_camera: Default::default(),
+            cut_actors: Default::default(),
             shader_time: 0.0,
             stage: None,
             staged: None,
@@ -295,6 +298,7 @@ impl Live {
     /// Advances what runs while the world may be stopped (the conversation camera's clock).
     pub fn advance_presentation(&mut self, dt_ms: f64) {
         self.talk_camera.advance(dt_ms);
+        self.cut_actors.advance(dt_ms);
         if dt_ms.is_finite() && dt_ms > 0.0 {
             self.shader_time += dt_ms / 1000.0;
             self.stage_clock_ms += dt_ms;
@@ -518,7 +522,7 @@ impl Live {
             self.objects = None;
             self.level = Some(self.build_level(ctx, format, &layout)?);
         }
-        let models = match &staged {
+        let mut models = match &staged {
             Some((id, stage)) => stage_models(&sim, *id, stage, &mut self.models),
             None => thedas_ui::models::area_models_cached(&sim, area, &mut self.models),
         };
@@ -529,13 +533,16 @@ impl Live {
             self.stage_shown = None;
             self.stage_blend = None;
         }
-        // A staged conversation line draws its actors at their stage marks.
-        let base = thedas_render::Camera::new(glam::Vec3::ZERO, 0.0, 0.0);
-        let marks = self
-            .talk_camera
-            .staging(&sim, &base)
-            .map(|s| s.marks.clone())
-            .unwrap_or_default();
+        // A cutscene playing, or a conversation line's own, poses its actors' creatures
+        // and shows its own.
+        let tracks = self.cutscene_camera.tracks(&sim);
+        let shown = self.cut_actors.shown(&sim, tracks);
+        let mut posing = shown.actors;
+        for (m, show) in shown.own {
+            posing.insert(m.id, show);
+            models.push(m);
+        }
+        let kept = shown.kept;
         drop(sim);
         let key = objects_key(&models);
         if self.objects.as_ref().map(|o| &o.key) != Some(&key) {
@@ -546,13 +553,58 @@ impl Live {
         let (Some(level), Some(objects)) = (self.level.as_ref(), self.objects.as_mut()) else {
             return Ok(());
         };
-        let posed: Vec<(Mat4, Option<Clip>)> = models
-            .iter()
-            .map(|m| {
-                let (at, facing) = marks.get(&m.id).copied().unwrap_or((m.position, m.facing));
-                (Prop::placement(at, facing), m.motion.as_ref().map(clip))
-            })
-            .collect();
+        let mut posed: Vec<(Mat4, Option<Clip>)> = Vec::with_capacity(models.len());
+        for m in &models {
+            let mut c = m.motion.as_ref().map(clip);
+            let none = Vec::new();
+            let held = kept.get(&m.id).unwrap_or(&none);
+            let (at, facing) = match posing.get(&m.id) {
+                _ if !posing.contains_key(&m.id) && !held.is_empty() => {
+                    let base_trees = c.as_ref().map(|c| c.trees.clone()).unwrap_or_default();
+                    for a in held {
+                        let layer = cut_layer(&mut self.animator, &level.vfs, a, &base_trees);
+                        match c.as_mut() {
+                            Some(c) => c.layers.push(layer),
+                            None => c = Some(layer),
+                        }
+                    }
+                    (m.position, m.facing)
+                }
+                Some(show) => {
+                    let mut at = show.position;
+                    if show.snaps {
+                        let p = glam::Vec3::from_array(at);
+                        let (from, to) = (p + glam::Vec3::Z * 1.5, p - glam::Vec3::Z * 3.0);
+                        if let Some(f) = level.collider.first_hit(from, to) {
+                            at[2] = from.lerp(to, f).z;
+                        }
+                    }
+                    log::trace!(
+                        "cutscene actor {} {}: at {:?} (pose z {}) facing {}, {:?}",
+                        m.id,
+                        m.tag,
+                        at,
+                        show.position[2],
+                        show.facing,
+                        show.animations
+                            .iter()
+                            .map(|a| format!("{}@{:.2}", a.node, a.time))
+                            .collect::<Vec<_>>()
+                    );
+                    let base_trees = c.as_ref().map(|c| c.trees.clone()).unwrap_or_default();
+                    for a in held.iter().chain(&show.animations) {
+                        let layer = cut_layer(&mut self.animator, &level.vfs, a, &base_trees);
+                        match c.as_mut() {
+                            Some(c) => c.layers.push(layer),
+                            None => c = Some(layer),
+                        }
+                    }
+                    (at, show.facing)
+                }
+                None => (m.position, m.facing),
+            };
+            posed.push((Prop::placement(at, facing), c));
+        }
         self.animator.pose_props(
             &level.vfs,
             &objects.scene,
@@ -1320,11 +1372,35 @@ pub fn prop(m: &ObjectModel) -> Prop {
 }
 
 /// A creature's motion as an animation clip.
+/// A cutscene animation as a layer over a creature's own motion (whose trees are `trees`):
+/// it loops when those trees loop its animation, else when its track spans the whole
+/// cutscene (see [`crate::cutactors`]).
+fn cut_layer(
+    animator: &mut Animator,
+    vfs: &Vfs,
+    a: &crate::cutactors::CutAnimation,
+    trees: &[String],
+) -> Clip {
+    let once = animator
+        .action_animation(vfs, &a.tree, &a.node)
+        .and_then(|ani| animator.plays_once(vfs, trees, &ani));
+    Clip {
+        trees: vec![a.tree.clone()],
+        actions: vec![a.node.clone()],
+        time: a.time,
+        looping: once.map_or(a.unbounded, |o| !o),
+        layers: Vec::new(),
+        absolute: true,
+    }
+}
+
 pub fn clip(m: &thedas_ui::models::Motion) -> Clip {
     Clip {
         trees: m.trees.clone(),
         actions: m.actions.clone(),
         time: m.time,
         looping: m.looping,
+        layers: Vec::new(),
+        absolute: false,
     }
 }

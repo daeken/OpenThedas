@@ -19,6 +19,22 @@ pub struct Clip {
     pub actions: Vec<String>,
     pub time: f32,
     pub looping: bool,
+    /// Clips laid over this one, in order: each sets only the bones it animates (see
+    /// [`crate::skeleton::Skeleton::pose_layers`]).
+    pub layers: Vec<Clip>,
+    /// As a layer, its translations are measured against the first layer's first keys (a
+    /// cutscene's animations; see [`crate::skeleton::Skeleton::pose_layers`]).
+    pub absolute: bool,
+}
+
+/// A tree's resource: a name with an extension (`bdccs_intro.cub`, a cutscene's tree) as
+/// it is, else an `.anb`.
+fn tree_resource(tree: &str) -> String {
+    if tree.contains('.') {
+        tree.to_string()
+    } else {
+        format!("{tree}.anb")
+    }
 }
 
 #[derive(Default)]
@@ -60,11 +76,7 @@ impl Animator {
         clip: &Clip,
     ) -> Option<(String, Arc<Animation>)> {
         for tree in &clip.trees {
-            let name = if tree.ends_with(".anb") {
-                tree.clone()
-            } else {
-                format!("{tree}.anb")
-            };
+            let name = tree_resource(tree);
             let Some(t) = load(&mut self.trees, vfs, &name, |d| AnimTree::parse(d).ok()) else {
                 continue;
             };
@@ -83,14 +95,30 @@ impl Animator {
         None
     }
 
+    /// The `.ani` resource action `action` names in tree `tree` (a name with an extension,
+    /// or an `.anb`).
+    pub fn action_animation(&mut self, vfs: &Vfs, tree: &str, action: &str) -> Option<String> {
+        let t = load(&mut self.trees, vfs, &tree_resource(tree), |d| {
+            AnimTree::parse(d).ok()
+        })?;
+        t.action(action)?.animation.clone()
+    }
+
+    /// Whether animation `ani` plays once in the first of `trees` that has it (field 4027),
+    /// if one does.
+    pub fn plays_once(&mut self, vfs: &Vfs, trees: &[String], ani: &str) -> Option<bool> {
+        trees.iter().find_map(|tree| {
+            let t = load(&mut self.trees, vfs, &tree_resource(tree), |d| {
+                AnimTree::parse(d).ok()
+            })?;
+            t.playing(ani).map(|n| n.once)
+        })
+    }
+
     /// The animation a clip names, if a tree has the action and its keyframes load.
     pub fn animation(&mut self, vfs: &Vfs, clip: &Clip) -> Option<Arc<Animation>> {
         for tree in &clip.trees {
-            let name = if tree.ends_with(".anb") {
-                tree.clone()
-            } else {
-                format!("{tree}.anb")
-            };
+            let name = tree_resource(tree);
             let Some(t) = load(&mut self.trees, vfs, &name, |d| AnimTree::parse(d).ok()) else {
                 continue;
             };
@@ -118,18 +146,37 @@ impl Animator {
         clip: &Clip,
     ) -> Option<(Arc<Vec<Mat4>>, Vec<Mat4>)> {
         let s = scene.skeletons.get(skeleton)?.clone();
-        let anim = self.animation(vfs, clip)?;
+        let time = |c: &Clip, a: &Animation| {
+            if c.looping && a.length > 0.0 {
+                c.time.rem_euclid(a.length)
+            } else {
+                c.time.min(a.length)
+            }
+        };
+        let mut layers: Vec<(Arc<Animation>, f32, bool)> = Vec::new();
+        if let Some(anim) = self.animation(vfs, clip) {
+            let t = time(clip, &anim);
+            layers.push((anim, t, clip.absolute));
+        }
+        for l in &clip.layers {
+            if let Some(anim) = self.animation(vfs, l) {
+                let t = time(l, &anim);
+                layers.push((anim, t, l.absolute));
+            }
+        }
+        if layers.is_empty() {
+            return None;
+        }
         let rest = self
             .rests
             .entry(skeleton)
             .or_insert_with(|| Arc::new(s.rest()))
             .clone();
-        let t = if clip.looping && anim.length > 0.0 {
-            clip.time.rem_euclid(anim.length)
-        } else {
-            clip.time.min(anim.length)
-        };
-        Some((rest, s.pose(&anim, t)))
+        let refs: Vec<(&Animation, f32, bool)> = layers
+            .iter()
+            .map(|(a, t, b)| (a.as_ref(), *t, *b))
+            .collect();
+        Some((rest, s.pose_layers(&refs)))
     }
 }
 
