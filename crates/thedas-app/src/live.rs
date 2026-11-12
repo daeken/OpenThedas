@@ -849,6 +849,88 @@ impl Live {
         out
     }
 
+    /// Party member `who` drawn whole for the inventory's and character record's paperdoll,
+    /// `width` by `height` pixels, straight RGBA8 with a clear background, turned `yaw`
+    /// radians from facing the viewer. DAOrigins.exe draws it into the render target its
+    /// `GUIPaperdoll` makes for those screens (270 by 459, 0x7312ee / 0x73c310; the target is
+    /// named `paperdoll`, 0x7bc659), in a scene of its own lit by `paperdoll_lightrig`
+    /// (el_lr_new_day2) and `paperdoll_lightprobe` (el_lp_outside_day) (0x7bbb30-0x7bbbb1).
+    /// Provisional: the member is drawn where it stands, alone, with the scene's light
+    /// brightened as the portraits' is, from a level camera framing its height; the game's
+    /// camera presets and light rig are not used. The coverage comes from drawing over black and
+    /// over white.
+    pub fn paperdoll(
+        &mut self,
+        ctx: &GpuContext,
+        who: ObjectId,
+        yaw: f32,
+        width: u32,
+        height: u32,
+    ) -> Option<Vec<u8>> {
+        let objects = self.objects.as_mut()?;
+        let (feet, facing) = {
+            let sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
+            let o = sim.world.get(who)?;
+            if o.area.is_none() || o.area != sim.world.area {
+                return None;
+            }
+            (
+                glam::Vec3::from_array(o.position),
+                thedas_sim::world::heading_of(o.facing).to_radians(),
+            )
+        };
+        let &(offset, radius) = objects.bounds.get(&who)?;
+        // The member stands in the picture from head to foot: its height is about twice its
+        // bounds' centre above its feet (the sphere's radius takes in what it holds out).
+        let tall = (offset.z * 2.0).clamp(0.5, radius * 2.0);
+        let centre = feet + glam::Vec3::Z * (tall * 0.5);
+        let fov = 30f32.to_radians();
+        let distance = (tall * 0.56 / (fov * 0.5).tan()).max(0.5);
+        let heading = facing + yaw;
+        let eye = centre + glam::Vec3::new(heading.cos(), heading.sin(), 0.0) * distance;
+        let to = centre - eye;
+        let mut camera =
+            thedas_render::Camera::new(eye, to.y.atan2(to.x), to.z.atan2(to.truncate().length()));
+        camera.fov_y = fov;
+        camera.near = 0.05;
+        let own: std::collections::HashSet<usize> = self
+            .posed
+            .iter()
+            .position(|p| p.0 == who)
+            .and_then(|i| objects.scene.props.get(i))
+            .map(|p| p.draws.clone().collect())
+            .unwrap_or_default();
+        objects.renderer.only_draws = Some(own);
+        let black = objects.renderer.capture(ctx, &camera, width, height);
+        objects.renderer.clear = wgpu::Color::WHITE;
+        let white = objects.renderer.capture(ctx, &camera, width, height);
+        objects.renderer.clear = wgpu::Color::BLACK;
+        objects.renderer.only_draws = None;
+        let (black, white) = (black.ok()?, white.ok()?);
+        let mut out = vec![0u8; black.len()];
+        for ((o, b), w) in out
+            .chunks_exact_mut(4)
+            .zip(black.chunks_exact(4))
+            .zip(white.chunks_exact(4))
+        {
+            // Over black a pixel is c·a; over white c·a + (1 - a).
+            let a = 1.0
+                - (0..3)
+                    .map(|i| (w[i] as f32 - b[i] as f32) / 255.0)
+                    .sum::<f32>()
+                    / 3.0;
+            let a = a.clamp(0.0, 1.0);
+            if a <= 0.0 {
+                continue;
+            }
+            for i in 0..3 {
+                o[i] = (b[i] as f32 / a * PORTRAIT_GAIN).min(255.0) as u8;
+            }
+            o[3] = (a * 255.0).round() as u8;
+        }
+        Some(out)
+    }
+
     /// Makes party member `n` (0 is the hero) the leader the player controls.
     pub fn choose_leader(&mut self, n: usize) -> Option<String> {
         let mut sim = self.sim();

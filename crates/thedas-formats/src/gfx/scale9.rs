@@ -31,7 +31,7 @@ const TAG_DEFINE_SCALING_GRID: u16 = 78;
 const TAG_DEFINE_SHAPE4: u16 = 83;
 
 /// A rectangle in twips: x0, y0, x1, y1.
-type Rect = [i32; 4];
+pub(super) type Rect = [i32; 4];
 
 /// A grid sprite's content bounds and grid, in pixels (x0, y0, x1, y1), for [`layout`].
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -100,7 +100,7 @@ impl Bits<'_> {
     }
 }
 
-fn read_rect(d: &[u8]) -> Option<(Rect, usize)> {
+pub(super) fn read_rect(d: &[u8]) -> Option<(Rect, usize)> {
     let mut b = Bits { d, pos: 0 };
     let n = b.u(5)? as usize;
     let (x0, x1, y0, y1) = (b.s(n)?, b.s(n)?, b.s(n)?, b.s(n)?);
@@ -109,7 +109,7 @@ fn read_rect(d: &[u8]) -> Option<(Rect, usize)> {
 
 /// A placement matrix without rotation: scale x, scale y, translate x, y (twips). `None` for a
 /// rotated or skewed one.
-fn read_matrix(d: &[u8]) -> Option<(Option<[f64; 4]>, usize)> {
+pub(super) fn read_matrix(d: &[u8]) -> Option<(Option<[f64; 4]>, usize)> {
     let mut b = Bits { d, pos: 0 };
     let (mut sx, mut sy) = (1.0, 1.0);
     if b.u(1)? == 1 {
@@ -230,17 +230,29 @@ fn place(depth: u16, ch: u16, name: Option<&str>, clip: Option<u16>) -> Vec<u8> 
     out
 }
 
-fn tag(code: u16, body: &[u8]) -> Vec<u8> {
+pub(super) fn tag(code: u16, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     tag_header(code, body.len(), &mut out);
     out.extend_from_slice(body);
     out
 }
 
-/// The frame action registering a grid sprite (`this`) with the host:
-/// `if (_global.thedas_s9 == undefined) _global.thedas_s9 = new Array();
-/// this.thedas_s9id = id; _global.thedas_s9.push(this);`
+/// A value a registering frame action stores on its sprite.
+pub(super) enum Member<'a> {
+    Int(i32),
+    Str(&'a str),
+}
+
+/// The frame action registering a grid sprite (`this`) with the host (see
+/// [`register_action_in`]): `_global.thedas_s9`, its id as `thedas_s9id`.
 fn register_action(id: u16) -> Vec<u8> {
+    register_action_in("thedas_s9", "thedas_s9id", Member::Int(id as i32))
+}
+
+/// A frame action registering its sprite (`this`) with the host:
+/// `if (_global[list] == undefined) _global[list] = new Array();
+/// this[member] = value; _global[list].push(this);`
+pub(super) fn register_action_in(list: &str, member: &str, value: Member) -> Vec<u8> {
     fn push_str(out: &mut Vec<u8>, ss: &[&str]) {
         let mut b = Vec::new();
         for s in ss {
@@ -264,14 +276,14 @@ fn register_action(id: u16) -> Vec<u8> {
     let mut init = Vec::new();
     push_str(&mut init, &["_global"]);
     init.push(GET_VARIABLE);
-    push_str(&mut init, &["thedas_s9"]);
+    push_str(&mut init, &[list]);
     push_int(&mut init, 0);
     push_str(&mut init, &["Array"]);
     init.extend_from_slice(&[0x40, SET_MEMBER]);
     let mut a = Vec::new();
     push_str(&mut a, &["_global"]);
     a.push(GET_VARIABLE);
-    push_str(&mut a, &["thedas_s9"]);
+    push_str(&mut a, &[list]);
     a.push(GET_MEMBER);
     // undefined
     a.extend_from_slice(&[0x96, 1, 0, 3]);
@@ -283,15 +295,18 @@ fn register_action(id: u16) -> Vec<u8> {
     a.extend(init);
     push_str(&mut a, &["this"]);
     a.push(GET_VARIABLE);
-    push_str(&mut a, &["thedas_s9id"]);
-    push_int(&mut a, id as i32);
+    push_str(&mut a, &[member]);
+    match value {
+        Member::Int(v) => push_int(&mut a, v),
+        Member::Str(v) => push_str(&mut a, &[v]),
+    }
     a.push(SET_MEMBER);
     push_str(&mut a, &["this"]);
     a.push(GET_VARIABLE);
     push_int(&mut a, 1);
     push_str(&mut a, &["_global"]);
     a.push(GET_VARIABLE);
-    push_str(&mut a, &["thedas_s9"]);
+    push_str(&mut a, &[list]);
     a.push(GET_MEMBER);
     push_str(&mut a, &["push"]);
     a.extend_from_slice(&[0x52, 0x17, 0]);

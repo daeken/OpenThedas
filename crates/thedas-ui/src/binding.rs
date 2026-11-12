@@ -94,6 +94,9 @@ pub struct Presentation {
     pub options: BTreeMap<String, f64>,
     /// The size the game draws at, the options screen's resolution.
     pub resolution: (u32, u32),
+    /// How far the player has turned the paperdoll from facing them (radians; the
+    /// inventory's and character record's rotate buttons, see `crate::input::PAPERDOLL_TURN`).
+    pub paperdoll_yaw: f32,
 }
 
 /// The journal entry a notification opens the journal on, as journal.gfx reads it
