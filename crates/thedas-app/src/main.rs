@@ -852,10 +852,12 @@ impl App {
         if let Some(f) = self.follow.as_mut() {
             let turn = (k(KeyCode::KeyQ) as i32 - k(KeyCode::KeyE) as i32) as f32;
             f.orbit(turn * 1.8 * dt, 0.0);
-            if let Some(feet) = self.live.as_ref().and_then(|l| l.leader_feet()) {
-                let live = self.live.as_ref();
-                let hit = |a, b| live.and_then(|l| l.first_hit(a, b));
-                self.camera = f.camera_clear(feet, dt, &self.camera, &hit);
+            if let Some(c) = self
+                .live
+                .as_ref()
+                .and_then(|l| l.follow_camera(f, dt, &self.camera))
+            {
+                self.camera = c;
             }
             // A staged conversation line frames itself.
             if let Some(c) = self
@@ -2838,8 +2840,11 @@ fn main() -> Result<()> {
                 l.aiming = layer.play(&mut s, &l.sim, 0.0).pop();
                 played = Some((layer, s));
             }
-            if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
-                camera = f.camera_clear(feet, 0.0, &camera, &|a, b| l.first_hit(a, b));
+            if let Some(c) = follow
+                .as_mut()
+                .and_then(|f| l.follow_camera(f, 0.0, &camera))
+            {
+                camera = c;
             }
             for c in &args.click {
                 let (x, y) = c
@@ -3005,11 +3010,11 @@ fn main() -> Result<()> {
                                 }
                             }
                             frames += 1;
-                            if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
-                                camera =
-                                    f.camera_clear(feet, dt as f32 / 1000.0, &camera, &|a, b| {
-                                        l.first_hit(a, b)
-                                    });
+                            if let Some(c) = follow
+                                .as_mut()
+                                .and_then(|f| l.follow_camera(f, dt as f32 / 1000.0, &camera))
+                            {
+                                camera = c;
                             }
                         }
                         if let Some((_, s)) = played.as_ref() {
@@ -3110,8 +3115,11 @@ fn main() -> Result<()> {
                     }
                     &Step::Orbit(dyaw, dpitch) => {
                         orbit_camera(follow.as_mut(), &mut camera, dyaw, dpitch);
-                        if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
-                            camera = f.camera_clear(feet, 0.0, &camera, &|a, b| l.first_hit(a, b));
+                        if let Some(c) = follow
+                            .as_mut()
+                            .and_then(|f| l.follow_camera(f, 0.0, &camera))
+                        {
+                            camera = c;
                         }
                         println!("orbit {dyaw},{dpitch}");
                     }
@@ -3187,8 +3195,11 @@ fn main() -> Result<()> {
                 .collect();
             log::info!("party: {party:?}");
             drop(sim);
-            if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
-                camera = f.camera_clear(feet, 0.0, &camera, &|a, b| l.first_hit(a, b));
+            if let Some(c) = follow
+                .as_mut()
+                .and_then(|f| l.follow_camera(f, 0.0, &camera))
+            {
+                camera = c;
             }
             if follow.is_some()
                 && let Some(c) = l.conversation_camera(&camera)
