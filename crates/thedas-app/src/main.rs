@@ -566,6 +566,8 @@ struct App {
     audio: Option<audio::GameAudio>,
     /// The pad's skip buttons were held last frame (a skip is a fresh press).
     intro_pad_held: bool,
+    /// A zoom key a step holds down (`key pagedown MS`): +1 in, -1 out, 0 none.
+    zoom_key: f32,
 }
 
 /// What the window's surface gave a redraw.
@@ -882,7 +884,8 @@ impl App {
             // Page Down zooms in and Page Up out while held, the original's second zoom
             // bindings (KeyBindings.ini: ZoomIn_1=Keyboard::Button_Next,
             // ZoomOut_1=Keyboard::Button_Prior). Provisional: the rate (the pad's).
-            let zoom = (k(KeyCode::PageDown) as i32 - k(KeyCode::PageUp) as i32) as f32;
+            let zoom =
+                (k(KeyCode::PageDown) as i32 - k(KeyCode::PageUp) as i32) as f32 + self.zoom_key;
             if zoom != 0.0
                 && f.zoom(zoom * pad::ZOOM_SPEED * dt)
                 && let Some(l) = self.live.as_ref()
@@ -1594,6 +1597,15 @@ impl App {
                 }
                 log.push(format!("setvalue {k} = {v}"));
             }
+            Step::ClientOption(k, v) => {
+                if let Some(g) = self.gfx.as_ref() {
+                    set_client_option(Some(&g.ui), self.live.as_ref(), k, v);
+                }
+                log.push(format!("option {k} = {v}"));
+            }
+            &Step::ZoomKey(dir) => {
+                self.zoom_key = dir;
+            }
             Step::Floaty(text) => {
                 if let Some(l) = self.live.as_ref() {
                     test_floaty(&mut l.sim(), text);
@@ -1933,6 +1945,7 @@ impl App {
                         l.frame_effects = self.loaded.frame_effects;
                         g.ui.close_all();
                         g.ui.attach(&l.sim);
+                        seed_client_options(&l, &g.ui);
                     }
                     // One explore camera for the whole process: a load turns it behind the
                     // hero again but keeps its zoom (see `Follow::reset`).
@@ -2800,6 +2813,11 @@ enum Step {
     Call(String, String, Vec<String>),
     /// An engine value the movies read with `GetValue` (`setvalue DebugOptions.EnableController 1`).
     SetValue(String, String),
+    /// `option GameOptions.ShowTutorials 0`: a player setting, as the options screen sets it
+    /// (the interface keeps it, the simulation hears it).
+    ClientOption(String, String),
+    /// `key pagedown MS` / `key pageup MS`: the zoom keys held (+1 in, -1 out, 0 let go).
+    ZoomKey(f32),
     /// A floating message over the controlled creature, as a script's
     /// `DisplayFloatyMessage` makes one (`floaty 12`), for trying the floaty layer headless.
     Floaty(String),
@@ -2845,6 +2863,34 @@ fn pad_steps(arg: &str) -> Result<Vec<Step>> {
             "pad takes a button, press/release and a button, or stick-left/stick-right x,y ms"
         ),
     })
+}
+
+/// The player settings the simulation reads, from the interface's, for a game just started
+/// or loaded: a new game's simulation starts with the defaults, so a setting changed in the
+/// options screen before New Game reaches it here (the tutorials, auto-pause in combat).
+fn seed_client_options(l: &live::Live, ui: &ui::UiLayer) {
+    let mut sim = l.sim();
+    for name in ["GameOptions.ShowTutorials", "GameOptions.AutoPauseCombat"] {
+        if let Some(v) = ui.client_option(name) {
+            sim.client_option_message(
+                thedas_sim::chargen::MSG_CLIENT_OPTION,
+                &[name.to_string(), v.to_string()],
+            );
+        }
+    }
+}
+
+/// An `option` step: a player setting changed as the options screen changes it.
+fn set_client_option(ui: Option<&ui::UiLayer>, live: Option<&live::Live>, name: &str, value: &str) {
+    if let Some(ui) = ui {
+        ui.set_client_option(name, value);
+    }
+    if let Some(l) = live {
+        l.sim().client_option_message(
+            thedas_sim::chargen::MSG_CLIENT_OPTION,
+            &[name.to_string(), value.to_string()],
+        );
+    }
 }
 
 /// A `key` step's text-field key, by name.
@@ -2907,8 +2953,30 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
     let mut out = Vec::new();
     for s in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
         let (verb, arg) = s.split_once(' ').unwrap_or((s, ""));
+        let key_hold = arg
+            .trim()
+            .split_once(' ')
+            .filter(|(k, _)| matches!(k.to_ascii_lowercase().as_str(), "pagedown" | "pageup"));
         if verb == "pad" {
             out.extend(pad_steps(arg.trim())?);
+        } else if let (true, Some((k, ms))) = (verb == "key", key_hold) {
+            // Page Down zooms in, Page Up out, held for `ms`.
+            let dir = if k.eq_ignore_ascii_case("pagedown") {
+                1.0
+            } else {
+                -1.0
+            };
+            out.push(Step::ZoomKey(dir));
+            out.push(Step::Run(
+                ms.trim().parse().context("a held key takes milliseconds")?,
+            ));
+            out.push(Step::ZoomKey(0.0));
+        } else if verb == "option" {
+            let (k, v) = arg
+                .trim()
+                .split_once(' ')
+                .context("option takes a name and a value")?;
+            out.push(Step::ClientOption(k.to_string(), v.trim().to_string()));
         } else {
             out.push(parse_step(s)?);
         }
@@ -3101,6 +3169,8 @@ fn main() -> Result<()> {
         .unwrap_or_default();
 
     // Playing, the camera follows the party leader from behind.
+    // A zoom key a step holds down (`key pagedown MS`).
+    let mut zoom_key = 0.0f32;
     let mut follow = match (&live, hero) {
         (Some(_), Some((_, facing))) if args.camera.is_none() => Some(follow::Follow::behind(
             thedas_sim::world::heading_of(facing).to_radians(),
@@ -3302,6 +3372,12 @@ fn main() -> Result<()> {
                                 }
                             }
                             frames += 1;
+                            if zoom_key != 0.0
+                                && let Some(f) = follow.as_mut()
+                                && f.zoom(zoom_key * pad::ZOOM_SPEED * dt as f32 / 1000.0)
+                            {
+                                l.sim().player_zoomed_in();
+                            }
                             if let (Some(f), Some(heading)) =
                                 (follow.as_mut(), l.camera_reset_due())
                             {
@@ -3368,6 +3444,11 @@ fn main() -> Result<()> {
                         }
                         println!("setvalue {k} = {v}");
                     }
+                    Step::ClientOption(k, v) => {
+                        set_client_option(played.as_ref().map(|(layer, _)| layer), Some(l), k, v);
+                        println!("option {k} = {v}");
+                    }
+                    &Step::ZoomKey(dir) => zoom_key = dir,
                     Step::Floaty(text) => {
                         test_floaty(&mut l.sim(), text);
                         println!("floaty {text:?}");
@@ -3479,6 +3560,7 @@ fn main() -> Result<()> {
                         n.movies_wait = true;
                         layer.close_all();
                         layer.attach(&n.sim);
+                        seed_client_options(&n, layer);
                         *s = screens::Screens::new(n.front_end);
                         follow = n.hero().map(|(_, facing)| {
                             let heading = thedas_sim::world::heading_of(facing).to_radians();
@@ -3649,6 +3731,7 @@ fn main() -> Result<()> {
             .then(|| intro::Intro::boot(&install))
             .flatten(),
         intro_pad_held: false,
+        zoom_key: 0.0,
         audio: {
             let off = args.no_audio
                 || std::env::var_os("THEDAS_NO_AUDIO").is_some()

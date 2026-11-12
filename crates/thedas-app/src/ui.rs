@@ -398,6 +398,19 @@ impl UiLayer {
         }
     }
 
+    /// Sets a player setting as the options screen does (`ClientOptions.SetClientOptionMessage`
+    /// `name` `value`); false when it is not one the screen keeps.
+    pub fn set_client_option(&self, name: &str, value: &str) -> bool {
+        let Ok(mut shown) = self.shown.lock() else {
+            return false;
+        };
+        thedas_ui::options::option_message(
+            &mut shown.options,
+            thedas_ui::options::MSG_SET,
+            &[name.to_string(), value.to_string()],
+        )
+    }
+
     /// A player setting (`AudioOptions.MusicVolume`) as the options screen keeps it.
     pub fn client_option(&self, name: &str) -> Option<f64> {
         self.shown.lock().ok()?.options.get(name).copied()
