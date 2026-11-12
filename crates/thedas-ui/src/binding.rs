@@ -433,6 +433,20 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             v.insert(format!("{k}.PortraitProperties.PortraitTint"), num(0));
         }
     }
+    // Levelling up (chargen mode 1): levelup.gfx's portrait is the member's
+    // (`CharGenCreature.Portrait`); it showed an empty grey disc.
+    if let Some(c) = sim.world.chargen.filter(|_| sim.world.chargen_mode != 0) {
+        if let Some(p) = shown.portraits.get(&c) {
+            v.insert(
+                "CharGenCreature.Portrait".into(),
+                UiValue::String(p.clone()),
+            );
+        }
+        v.insert(
+            "CharGenCreature.PortraitProperties.PortraitTint".into(),
+            num(0),
+        );
+    }
     // Who may level up now (the character record's button): a party member out of combat
     // the game marked (`SetCanLevelUp`, or experience reaching the next level), or with
     // points to spend: DAOrigins.exe's test (0x6acbc0) sums the attribute, skill,
@@ -774,6 +788,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     }
     if let Some(who) = controlled.or(hero) {
         quickbar(sim, who, &mut v);
+        heroic_stats(sim, who, hero.unwrap_or(who), &mut v);
     }
     v
 }
@@ -828,6 +843,31 @@ fn map_notes(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
 /// `Localization.Strings`).
 pub const LOC_NEXT: u32 = 330708;
 pub const LOC_CLOSE: u32 = 371224;
+
+/// The character record's Heroic Accomplishments page: each row of the HeroicStats table
+/// (M2DA 269; the selected member's) and the HeroicPartyStats table (270; the party's, kept
+/// on the hero) as `GUI.SelectedChar.HeroicStats.<row index>.Total` and
+/// `HeroicPartyStats.<row index>.Total`: the properties the rows are (kills 1001, damage
+/// dealt 1002, ...; creatures slain 2001, ...). Unset, the page read NaN everywhere.
+/// Provisional: the game-wide completion figure is 0.
+fn heroic_stats(sim: &Sim, who: u32, hero: u32, v: &mut BTreeMap<String, UiValue>) {
+    let tables = sim.world.tables();
+    for (table, key, of) in [
+        (269, "GUI.SelectedChar.HeroicStats", who),
+        (270, "GUI.SelectedChar.HeroicPartyStats", hero),
+    ] {
+        let Some(t) = tables.get(table, "") else {
+            continue;
+        };
+        for (i, &row) in t.order.iter().enumerate() {
+            v.insert(
+                format!("{key}.{i}.Total"),
+                num(sim.property_total(of, row as i32)),
+            );
+        }
+    }
+    v.insert("GUICharacterRecord.GameCompletionPercentage".into(), num(0));
+}
 
 /// The keys bound to the game's actions, as the movies (and the designer tags in text, see
 /// [`crate::keys`]) read them: `InputMappings.Mappings.<action>.PrimaryMappedKey` and
