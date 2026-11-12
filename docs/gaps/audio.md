@@ -18,7 +18,8 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
    - Size: small.
 4. **Music during cutscenes and conversations.**
    - Done: the game mode's ducking (0x5bd220): dialog and cutscenes play `OnCutscene` (music −3 dB, ambience and effects lower), death `OnDeath`, loading `OnGameLoading` (world sounds −60 dB; music and voice untouched).
-   - Not done: the music director's own mode changes (0x5bb630: cues per mode, `chargen`), and `OnExploreMusic` / `OnCombatMusic`, which the exe swaps as the music changes between explore and combat (0x5bc761..0x5bce5b, under a volume check not traced).
+   - Also done: `OnExploreMusic` while `main` plays and `OnCombatMusic` while `combat` does, while the music volume is above 0 (0x5bccd0, 0x5bc6f6); and a theme change during a load waits for the load to end, the old music playing on (0x5bfdf0, 0x5b7070 -> 0x5c4060).
+   - Not done: the music director's own mode changes (0x5bb630: cues per mode, `chargen`).
    - Medium.
 5. **Death and party-wipe music.** The `Death` track plays when the game is over; exactly when the original switches isn't traced. Small.
 6. **Other main-menu music** (after the credits, DLC menus). Only `music/_menu` is wired. Small.
