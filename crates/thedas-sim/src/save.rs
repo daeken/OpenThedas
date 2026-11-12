@@ -348,6 +348,9 @@ mod tests {
             chain: Vec::new(),
             cut_from: None,
             cut_lines_left: 0,
+            staged: Vec::new(),
+            staged_at: None,
+            ambient_run: false,
         };
         s.talk = Some(talk(true));
         let save = s.save_game();
