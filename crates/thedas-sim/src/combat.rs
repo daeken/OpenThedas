@@ -1351,8 +1351,39 @@ impl Sim {
             ev.objects = vec![id, target];
             ev.ints = vec![hit, hand as i32];
             let script = self.world.get(id).and_then(|o| o.script.clone());
-            if let Some(script) = script {
+            if let Some(script) = script.clone() {
                 self.run_script(&script, id, Some(ev));
+            }
+            // A ranged shot's ammunition then hits with its on-hit properties: DAOrigins.exe
+            // stores one `EVENT_TYPE_ITEM_ONHIT` (65) per on-hit property of the
+            // `INVENTORY_SLOT_RANGEDAMMO` item at launch (0x6b6f60) and sends them to the
+            // shooter after the impact unless the result is a miss or blocked (0x7e87c0):
+            // creator the shooter, target the victim, integers the property and its power,
+            // objects the shooter and the ammunition; rules_core rolls the property's
+            // `ProcChance`. A melee hit's on-hit events go to the item itself, whose script
+            // is empty in every template, so they do nothing and are not sent here.
+            let missed = [
+                "COMBAT_RESULT_INVALID",
+                "COMBAT_RESULT_MISS",
+                "COMBAT_RESULT_BLOCKED",
+            ]
+            .iter()
+            .any(|c| constant_of(self, c) == hit);
+            if !missed && self.attack_reach(id) > MELEE_REACH {
+                let ammo_slot = constant_of(self, "INVENTORY_SLOT_RANGEDAMMO");
+                let ammo = self
+                    .world
+                    .get(id)
+                    .and_then(|o| o.equipment.get(&ammo_slot).copied());
+                if let (Some(ammo), Some(script)) = (ammo, script) {
+                    for (property, power) in self.on_hit_properties(ammo) {
+                        let mut ev = self.new_event("ITEM_ONHIT", Some(id));
+                        ev.target = Some(target);
+                        ev.ints = vec![property, power];
+                        ev.objects = vec![id, ammo];
+                        self.run_script(&script, id, Some(ev));
+                    }
+                }
             }
         }
         if let Some(o) = self.world.get_mut(id) {
