@@ -24,6 +24,14 @@
 //! `--ui menu`, `--ui hud` or `--ui movie1,movie2` plays Scaleform movies over the scene;
 //! `--area none` shows them alone.
 //!
+//! A game controller (an Xbox pad; see [`pad`] for the whole map) plays too: the left stick
+//! walks the leader, the right stick turns and zooms the camera, A acts on the target in
+//! front, X/Y/B (RT for a second set) use the quickbar, LB/RB change the leader, LT opens a
+//! quickbar picker, the D-pad changes the target, Back opens the player's screens and Start
+//! pauses. On screens the stick moves a pointer that A clicks and B closes; in conversations
+//! the D-pad or stick picks a reply and A chooses it. The PC original has no controller
+//! support: this is a deliberate addition, following the Xbox 360 version's controls.
+//!
 //! `--control 127.0.0.1:7878` lets a local client (`thedas-mcp`'s `attach`) drive the
 //! running game: the same steps as `--steps`, screenshots and the simulation's state (see
 //! [`control`]).
@@ -31,6 +39,9 @@
 mod control;
 mod follow;
 mod live;
+mod pad;
+mod paddev;
+mod padplay;
 mod reticle;
 mod saves;
 mod screens;
@@ -135,7 +146,9 @@ struct Args {
     /// screens), `rclick X,Y` and `dclick X,Y` (a right or double click
     /// for the interface), `rpress X,Y` and `rrelease X,Y` (the right button down and up,
     /// for an item's radial menu), `hover X,Y` (the mouse rests there, for the aiming
-    /// reticle).
+    /// reticle), `pad a` (a game controller's button pressed and let go; `pad press rt`
+    /// and `pad release rt` hold and let go), `pad stick-left X,Y MS` and
+    /// `pad stick-right X,Y MS` (a stick held there while the game runs MS, then let go).
     #[arg(long, default_value = "")]
     steps: String,
     /// Module for `--save` and `--objects`.
@@ -162,6 +175,10 @@ struct Args {
     /// screen, the death screen's load). Defaults to `$HOME/.openthedas/saves`.
     #[arg(long)]
     saves: Option<PathBuf>,
+    /// List the game controllers gilrs sees (names, ids, mapping, which inputs it maps) and
+    /// print their events for this many seconds, then exit. No window, no install needed.
+    #[arg(long)]
+    pad_probe: Option<f64>,
 }
 
 /// Behind and above a hero at `pos` with the game's `facing`, looking the same way (as the
@@ -369,14 +386,15 @@ fn capture(
     played: Option<&mut ui::UiLayer>,
     cursor: (f64, f64),
     shader_time: f64,
+    overlay: Vec<[glam::Vec2; 2]>,
 ) -> Result<()> {
-    let mut reticle = Vec::new();
+    let mut reticle = overlay;
     let pixels = if let Some(live) = live {
         live.sync(ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
         if let Some(l) = live.level.as_ref() {
             log_stats(&l.renderer);
         }
-        reticle = live.reticle(&camera, (w, h), cursor);
+        reticle.extend(live.reticle(&camera, (w, h), cursor));
         live.capture(ctx, &camera, (w, h))?
             .unwrap_or_else(|| [0, 0, 0, 255].repeat(w as usize * h as usize))
     } else {
@@ -468,6 +486,12 @@ struct App {
     remote: VecDeque<Remote>,
     /// Clients waiting for the next presented frame, and how much smaller they want it.
     frame_requests: Vec<(std::sync::mpsc::Sender<J>, u32)>,
+    /// Game controllers (none headless, or where the platform has no support).
+    pads: Option<paddev::Pads>,
+    /// The pad's part of the game: its mapping's state, the target, the reply picked.
+    pad: padplay::PadPlay,
+    /// The pad as clients' `pad` steps hold it (merged with the device's).
+    remote_pad: pad::PadState,
 }
 
 /// What the window's surface gave a redraw.
@@ -805,6 +829,7 @@ impl App {
     fn redraw(&mut self) -> Result<()> {
         let dt = self.last.elapsed().as_secs_f64() * 1000.0;
         self.serve_control(dt);
+        self.pad_frame(dt);
         self.update();
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
@@ -915,7 +940,14 @@ impl App {
         );
         // An ability aimed at a place shows where it would land, under the interface.
         if let Some(live) = self.live.as_mut() {
-            let lines = live.reticle(&self.camera, size, self.cursor);
+            let mut lines = live.reticle(&self.camera, size, self.cursor);
+            let ctx = self
+                .pad
+                .context_for(self.screens.as_ref(), g.ui.stage.dialog_up());
+            lines.extend(
+                self.pad
+                    .overlay(Some(&*live), &self.camera, size, self.cursor, ctx),
+            );
             g.reticle
                 .draw(&g.ctx.device, &mut encoder, &view, size, &lines);
         }
@@ -1369,6 +1401,16 @@ impl App {
                 }
                 log.push(format!("zoom {n}"));
             }
+            &Step::PadButton(b, down) => {
+                self.remote_pad.set(b, down);
+                self.pad_frame(0.0);
+                log.push(format!("pad {b:?} {}", if down { "down" } else { "up" }));
+            }
+            &Step::PadStick(stick, x, y) => {
+                self.remote_pad.set_stick(stick, glam::Vec2::new(x, y));
+                self.pad_frame(0.0);
+                log.push(format!("pad stick {stick:?} {x},{y}"));
+            }
             Step::Rebuild => log.push("rebuild: headless only".into()),
             Step::Run(_) => {}
         }
@@ -1520,6 +1562,16 @@ impl App {
         let pixels = match (self.live.as_mut(), g.renderer.as_mut()) {
             (Some(live), _) => {
                 reticle = live.reticle(&self.camera, (w, h), self.cursor);
+                let ctx = self
+                    .pad
+                    .context_for(self.screens.as_ref(), g.ui.stage.dialog_up());
+                reticle.extend(self.pad.overlay(
+                    Some(&*live),
+                    &self.camera,
+                    (w, h),
+                    self.cursor,
+                    ctx,
+                ));
                 live.capture(&g.ctx, &self.camera, (w, h))?
             }
             (None, Some(r)) => Some(r.capture(&g.ctx, &self.camera, w, h)?),
@@ -1535,9 +1587,96 @@ impl App {
         Ok(frame)
     }
 
+    /// One frame of the game controller: the device's state (and clients' `pad` steps)
+    /// through the mapping, carried out as the mouse and keyboard would.
+    fn pad_frame(&mut self, dt_ms: f64) {
+        let device = self.pads.as_mut().map(|p| p.poll()).unwrap_or_default();
+        let state = device.merged(&self.remote_pad);
+        let mut pad = std::mem::take(&mut self.pad);
+        for m in pad.frame(&state, self, dt_ms) {
+            log::info!("pad: {m}");
+        }
+        self.pad = pad;
+    }
+
     fn fail(&mut self, event_loop: &ActiveEventLoop, e: anyhow::Error) {
         self.error = Some(e);
         event_loop.exit();
+    }
+}
+
+impl padplay::Host for App {
+    fn live(&mut self) -> Option<&mut live::Live> {
+        self.live.as_mut()
+    }
+
+    fn camera(&self) -> Camera {
+        self.camera
+    }
+
+    fn follow(&mut self) -> Option<&mut follow::Follow> {
+        self.follow.as_mut()
+    }
+
+    fn look(&mut self, yaw: f32, pitch: f32) {
+        self.camera.look(yaw, pitch);
+    }
+
+    fn size(&self) -> (u32, u32) {
+        self.gfx
+            .as_ref()
+            .map_or(self.size, |g| (g.config.width, g.config.height))
+    }
+
+    fn cursor(&self) -> (f64, f64) {
+        self.cursor
+    }
+
+    fn pointer_to(&mut self, x: f64, y: f64) {
+        self.cursor_to(x, y);
+    }
+
+    fn left_button(&mut self, down: bool) {
+        App::left_button(self, down);
+    }
+
+    fn right_button(&mut self, down: bool) {
+        App::right_button(self, down);
+    }
+
+    fn double_click(&mut self) {
+        let (x, y) = self.cursor;
+        if let Some(g) = self.gfx.as_mut() {
+            g.ui.click_as(
+                thedas_ui::avm1::MOUSE_LEFT + thedas_ui::avm1::DOUBLE_CLICK,
+                x,
+                y,
+            );
+        }
+    }
+
+    fn screens(&mut self) -> Option<&mut screens::Screens> {
+        self.screens.as_mut()
+    }
+
+    fn popup(&mut self) -> bool {
+        self.gfx.as_ref().is_some_and(|g| g.ui.stage.dialog_up())
+    }
+
+    fn open_saves(&mut self, mode: i32) {
+        if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_mut()) {
+            g.ui.open_saves(s, mode);
+        }
+    }
+
+    fn line(&self) -> Option<(bool, bool)> {
+        self.gfx.as_ref().and_then(|g| g.ui.line_state())
+    }
+
+    fn interface_clicked(&mut self) {
+        if let Some(g) = self.gfx.as_mut() {
+            g.ui.clicked();
+        }
     }
 }
 
@@ -1719,6 +1858,145 @@ fn world_takes_click(layer: &ui::UiLayer, screens: &screens::Screens, x: f64, y:
     (screens.exploring() || screens.picking_party()) && !layer.covers(x, y)
 }
 
+/// The headless capture's game, for the pad (see [`padplay::Host`]): the same steps a
+/// `click` takes for the pointer's button.
+struct HeadlessHost<'a> {
+    live: &'a mut live::Live,
+    played: Option<&'a mut (ui::UiLayer, screens::Screens)>,
+    follow: Option<&'a mut follow::Follow>,
+    camera: &'a mut Camera,
+    cursor: &'a mut (f64, f64),
+    size: (u32, u32),
+}
+
+impl padplay::Host for HeadlessHost<'_> {
+    fn live(&mut self) -> Option<&mut live::Live> {
+        Some(self.live)
+    }
+
+    fn camera(&self) -> Camera {
+        *self.camera
+    }
+
+    fn follow(&mut self) -> Option<&mut follow::Follow> {
+        self.follow.as_deref_mut()
+    }
+
+    fn look(&mut self, yaw: f32, pitch: f32) {
+        self.camera.look(yaw, pitch);
+    }
+
+    fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    fn cursor(&self) -> (f64, f64) {
+        *self.cursor
+    }
+
+    fn pointer_to(&mut self, x: f64, y: f64) {
+        *self.cursor = (x, y);
+        if let Some((layer, _)) = self.played.as_deref_mut() {
+            layer.mouse_move(x, y);
+        }
+    }
+
+    fn left_button(&mut self, down: bool) {
+        let (x, y) = *self.cursor;
+        if down && self.played.as_deref().is_some_and(|(_, s)| s.in_cutscene()) {
+            self.live.sim().skip_cutscene();
+            println!("pad click {x:.0},{y:.0}: skips the cutscene");
+            return;
+        }
+        let to_world = match self.played.as_deref_mut() {
+            Some((layer, s)) => {
+                layer.render_movies();
+                let w = world_takes_click(layer, s, x, y);
+                layer.mouse_move(x, y);
+                layer.mouse_button(x, y, down);
+                if down && !w {
+                    layer.clicked();
+                }
+                w
+            }
+            None => true,
+        };
+        if !down {
+            return;
+        }
+        if !to_world {
+            println!("pad click {x:.0},{y:.0}: interface");
+            return;
+        }
+        let (w, h) = (self.size.0 as f32, self.size.1 as f32);
+        let (o, d) = self.camera.ray(x as f32, y as f32, w, h);
+        match self.live.pick(o, d).and_then(|p| self.live.click(p)) {
+            Some(order) => println!("pad click {x:.0},{y:.0}: {order}"),
+            None => println!("pad click {x:.0},{y:.0}: nothing"),
+        }
+    }
+
+    fn right_button(&mut self, down: bool) {
+        let (x, y) = *self.cursor;
+        match self.played.as_deref_mut() {
+            Some((layer, s)) if !s.exploring() || layer.covers(x, y) => {
+                layer.render_movies();
+                layer.button_as(thedas_ui::avm1::MOUSE_RIGHT, x, y, down);
+                println!(
+                    "pad right {} {x:.0},{y:.0}: interface",
+                    if down { "press" } else { "release" }
+                );
+            }
+            _ if down => {
+                if let Some(aim) = self.live.aiming.take() {
+                    println!("pad right click: ability {} not aimed", aim.ability);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn double_click(&mut self) {
+        let (x, y) = *self.cursor;
+        if let Some((layer, _)) = self.played.as_deref_mut() {
+            layer.render_movies();
+            layer.click_as(
+                thedas_ui::avm1::MOUSE_LEFT + thedas_ui::avm1::DOUBLE_CLICK,
+                x,
+                y,
+            );
+        }
+    }
+
+    fn screens(&mut self) -> Option<&mut screens::Screens> {
+        self.played.as_deref_mut().map(|(_, s)| s)
+    }
+
+    fn popup(&mut self) -> bool {
+        self.played
+            .as_deref()
+            .is_some_and(|(layer, _)| layer.stage.dialog_up())
+    }
+
+    fn open_saves(&mut self, mode: i32) {
+        if let Some((layer, s)) = self.played.as_deref_mut() {
+            layer.open_saves(s, mode);
+        }
+    }
+
+    fn line(&self) -> Option<(bool, bool)> {
+        self.played
+            .as_deref()
+            .and_then(|(layer, _)| layer.line_state())
+    }
+
+    fn interface_clicked(&mut self) {
+        if let Some((layer, _)) = self.played.as_deref_mut() {
+            layer.clicked();
+        }
+    }
+}
+
 /// One step of `--steps`.
 #[derive(Clone, Debug, PartialEq)]
 enum Step {
@@ -1769,6 +2047,46 @@ enum Step {
     /// `rrelease`).
     RightAt(f64, f64, bool),
     Release(f64, f64),
+    /// A game controller's button goes down (true) or up: `pad a` presses and lets go,
+    /// `pad press rt` and `pad release rt` hold and let go.
+    PadButton(pad::Button, bool),
+    /// A game controller's stick is pushed (x, y; +y up): `pad stick-left 0,1 500` holds it
+    /// there for a `run` of 500 ms, then lets go.
+    PadStick(pad::Stick, f32, f32),
+}
+
+/// A `pad` step: a button by name (pressed and let go), `press`/`release` and a button, or
+/// `stick-left`/`stick-right` with `x,y` and milliseconds (held while the game runs that
+/// long, then let go).
+fn pad_steps(arg: &str) -> Result<Vec<Step>> {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    let button =
+        |name: &str| pad::Button::parse(name).with_context(|| format!("no pad button {name:?}"));
+    Ok(match parts.as_slice() {
+        [b] => {
+            let b = button(b)?;
+            vec![Step::PadButton(b, true), Step::PadButton(b, false)]
+        }
+        ["press", b] => vec![Step::PadButton(button(b)?, true)],
+        ["release", b] => vec![Step::PadButton(button(b)?, false)],
+        [stick @ ("stick-left" | "stick-right"), xy, ms] => {
+            let stick = if *stick == "stick-left" {
+                pad::Stick::Left
+            } else {
+                pad::Stick::Right
+            };
+            let (x, y) = xy.split_once(',').context("a stick takes x,y")?;
+            let (x, y): (f32, f32) = (x.trim().parse()?, y.trim().parse()?);
+            vec![
+                Step::PadStick(stick, x.clamp(-1.0, 1.0), y.clamp(-1.0, 1.0)),
+                Step::Run(ms.parse().context("a stick takes milliseconds")?),
+                Step::PadStick(stick, 0.0, 0.0),
+            ]
+        }
+        _ => bail!(
+            "pad takes a button, press/release and a button, or stick-left/stick-right x,y ms"
+        ),
+    })
 }
 
 /// A `key` step's text-field key, by name.
@@ -1811,83 +2129,88 @@ fn wipe(sim: &mut thedas_sim::Sim) {
 }
 
 fn parse_steps(spec: &str) -> Result<Vec<Step>> {
-    spec.split(';')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            let (verb, arg) = s.split_once(' ').unwrap_or((s, ""));
-            let arg = arg.trim();
-            Ok(match verb {
-                "click" => {
-                    let (x, y) = arg.split_once(',').context("click takes x,y")?;
-                    Step::Click(x.trim().parse()?, y.trim().parse()?)
-                }
-                "run" => Step::Run(arg.parse().context("run takes milliseconds")?),
-                "key" if arg.eq_ignore_ascii_case("i") => Step::Menu(screens::Screen::Inventory),
-                "key" if arg.eq_ignore_ascii_case("c") => {
-                    Step::Menu(screens::Screen::CharacterRecord)
-                }
-                "key" if arg.eq_ignore_ascii_case("t") => Step::Menu(screens::Screen::Tactics),
-                "key" if arg.eq_ignore_ascii_case("m") => Step::Menu(screens::Screen::AreaMap),
-                "key" if arg.eq_ignore_ascii_case("j") => Step::Menu(screens::Screen::Journal),
-                "key" if arg.eq_ignore_ascii_case("o") => Step::Menu(screens::Screen::Options),
-                "key" if matches!(arg.to_ascii_lowercase().as_str(), "f1" | "f2" | "f3" | "f4") => {
-                    Step::Leader(arg[1..].parse::<usize>()? - 1)
-                }
-                "key" if arg.eq_ignore_ascii_case("space") => Step::Pause,
-                "key" if arg.len() == 1 && arg.as_bytes()[0].is_ascii_digit() => {
-                    // 1 is the first slot, 0 the tenth.
-                    Step::Quickslot((arg.as_bytes()[0] - b'0' + 9) as i32 % 10)
-                }
-                "reply" => Step::Reply(arg.parse().context("reply takes a number")?),
-                "orbit" => {
-                    let (x, y) = arg.split_once(',').unwrap_or((arg, "0"));
-                    Step::Orbit(x.trim().parse()?, y.trim().parse()?)
-                }
-                "zoom" => Step::Zoom(arg.parse().context("zoom takes a number of steps")?),
-                // Q and E turn the camera; a step turns it an eighth of the way round.
-                "key" if arg.eq_ignore_ascii_case("q") => Step::Orbit(45.0, 0.0),
-                "key" if arg.eq_ignore_ascii_case("e") => Step::Orbit(-45.0, 0.0),
-                "press" | "release" => {
-                    let (x, y) = arg.split_once(',').context("press takes x,y")?;
-                    let (x, y) = (x.trim().parse()?, y.trim().parse()?);
-                    if verb == "press" {
-                        Step::Press(x, y)
-                    } else {
-                        Step::Release(x, y)
-                    }
-                }
-                "talk" if !arg.is_empty() => Step::Talk(arg.to_string()),
-                "rebuild" => Step::Rebuild,
-                "picker" => Step::Picker,
-                "wipe" => Step::Wipe,
-                "type" => Step::Type(arg.to_string()),
-                "key" if text_key(arg).is_some() => {
-                    Step::TextKey(text_key(arg).unwrap_or(thedas_ui::UiKey::Enter))
-                }
-                "key" if arg.eq_ignore_ascii_case("f5") => Step::Saves(1),
-                "key" if arg.eq_ignore_ascii_case("f9") => Step::Saves(2),
-                "hover" => {
-                    let (x, y) = arg.split_once(',').context("hover takes x,y")?;
-                    Step::Hover(x.trim().parse()?, y.trim().parse()?)
-                }
-                "rpress" | "rrelease" => {
-                    let (x, y) = arg.split_once(',').context("rpress takes x,y")?;
-                    Step::RightAt(x.trim().parse()?, y.trim().parse()?, verb == "rpress")
-                }
-                "rclick" | "dclick" => {
-                    let (x, y) = arg.split_once(',').context("click takes x,y")?;
-                    let button = if verb == "rclick" {
-                        thedas_ui::avm1::MOUSE_RIGHT
-                    } else {
-                        thedas_ui::avm1::MOUSE_LEFT + thedas_ui::avm1::DOUBLE_CLICK
-                    };
-                    Step::ClickAs(button, x.trim().parse()?, y.trim().parse()?)
-                }
-                _ => bail!("unknown step {s:?}"),
-            })
-        })
-        .collect()
+    let mut out = Vec::new();
+    for s in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let (verb, arg) = s.split_once(' ').unwrap_or((s, ""));
+        if verb == "pad" {
+            out.extend(pad_steps(arg.trim())?);
+        } else {
+            out.push(parse_step(s)?);
+        }
+    }
+    Ok(out)
+}
+
+fn parse_step(s: &str) -> Result<Step> {
+    let (verb, arg) = s.split_once(' ').unwrap_or((s, ""));
+    let arg = arg.trim();
+    Ok(match verb {
+        "click" => {
+            let (x, y) = arg.split_once(',').context("click takes x,y")?;
+            Step::Click(x.trim().parse()?, y.trim().parse()?)
+        }
+        "run" => Step::Run(arg.parse().context("run takes milliseconds")?),
+        "key" if arg.eq_ignore_ascii_case("i") => Step::Menu(screens::Screen::Inventory),
+        "key" if arg.eq_ignore_ascii_case("c") => Step::Menu(screens::Screen::CharacterRecord),
+        "key" if arg.eq_ignore_ascii_case("t") => Step::Menu(screens::Screen::Tactics),
+        "key" if arg.eq_ignore_ascii_case("m") => Step::Menu(screens::Screen::AreaMap),
+        "key" if arg.eq_ignore_ascii_case("j") => Step::Menu(screens::Screen::Journal),
+        "key" if arg.eq_ignore_ascii_case("o") => Step::Menu(screens::Screen::Options),
+        "key" if matches!(arg.to_ascii_lowercase().as_str(), "f1" | "f2" | "f3" | "f4") => {
+            Step::Leader(arg[1..].parse::<usize>()? - 1)
+        }
+        "key" if arg.eq_ignore_ascii_case("space") => Step::Pause,
+        "key" if arg.len() == 1 && arg.as_bytes()[0].is_ascii_digit() => {
+            // 1 is the first slot, 0 the tenth.
+            Step::Quickslot((arg.as_bytes()[0] - b'0' + 9) as i32 % 10)
+        }
+        "reply" => Step::Reply(arg.parse().context("reply takes a number")?),
+        "orbit" => {
+            let (x, y) = arg.split_once(',').unwrap_or((arg, "0"));
+            Step::Orbit(x.trim().parse()?, y.trim().parse()?)
+        }
+        "zoom" => Step::Zoom(arg.parse().context("zoom takes a number of steps")?),
+        // Q and E turn the camera; a step turns it an eighth of the way round.
+        "key" if arg.eq_ignore_ascii_case("q") => Step::Orbit(45.0, 0.0),
+        "key" if arg.eq_ignore_ascii_case("e") => Step::Orbit(-45.0, 0.0),
+        "press" | "release" => {
+            let (x, y) = arg.split_once(',').context("press takes x,y")?;
+            let (x, y) = (x.trim().parse()?, y.trim().parse()?);
+            if verb == "press" {
+                Step::Press(x, y)
+            } else {
+                Step::Release(x, y)
+            }
+        }
+        "talk" if !arg.is_empty() => Step::Talk(arg.to_string()),
+        "rebuild" => Step::Rebuild,
+        "picker" => Step::Picker,
+        "wipe" => Step::Wipe,
+        "type" => Step::Type(arg.to_string()),
+        "key" if text_key(arg).is_some() => {
+            Step::TextKey(text_key(arg).unwrap_or(thedas_ui::UiKey::Enter))
+        }
+        "key" if arg.eq_ignore_ascii_case("f5") => Step::Saves(1),
+        "key" if arg.eq_ignore_ascii_case("f9") => Step::Saves(2),
+        "hover" => {
+            let (x, y) = arg.split_once(',').context("hover takes x,y")?;
+            Step::Hover(x.trim().parse()?, y.trim().parse()?)
+        }
+        "rpress" | "rrelease" => {
+            let (x, y) = arg.split_once(',').context("rpress takes x,y")?;
+            Step::RightAt(x.trim().parse()?, y.trim().parse()?, verb == "rpress")
+        }
+        "rclick" | "dclick" => {
+            let (x, y) = arg.split_once(',').context("click takes x,y")?;
+            let button = if verb == "rclick" {
+                thedas_ui::avm1::MOUSE_RIGHT
+            } else {
+                thedas_ui::avm1::MOUSE_LEFT + thedas_ui::avm1::DOUBLE_CLICK
+            };
+            Step::ClickAs(button, x.trim().parse()?, y.trim().parse()?)
+        }
+        _ => bail!("unknown step {s:?}"),
+    })
 }
 
 fn main() -> Result<()> {
@@ -1896,6 +2219,10 @@ fn main() -> Result<()> {
     )
     .init();
     let args = Args::parse();
+    if let Some(secs) = args.pad_probe {
+        paddev::probe(secs);
+        return Ok(());
+    }
     let install = args
         .install
         .or_else(|| std::env::var_os("THEDAS_INSTALL").map(PathBuf::from))
@@ -1973,6 +2300,10 @@ fn main() -> Result<()> {
         let ctx = GpuContext::headless()?;
         let mut played: Option<(ui::UiLayer, screens::Screens)> = None;
         let mut cursor = (size.0 as f64 / 2.0, size.1 as f64 / 2.0);
+        // The game controller as `pad` steps hold it, and its part of the game.
+        let mut pad_state = pad::PadState::default();
+        let mut pad_play = padplay::PadPlay::default();
+        let mut pad_lines = Vec::new();
         if let Some(l) = live.as_mut() {
             l.shader_time = args.time;
             if ui.is_empty() {
@@ -2094,6 +2425,17 @@ fn main() -> Result<()> {
                         while left > 0.0 {
                             let dt = left.min(FRAME);
                             left -= dt;
+                            let mut host = HeadlessHost {
+                                live: &mut *l,
+                                played: played.as_mut(),
+                                follow: follow.as_mut(),
+                                camera: &mut camera,
+                                cursor: &mut cursor,
+                                size,
+                            };
+                            for m in pad_play.frame(&pad_state, &mut host, dt) {
+                                println!("pad: {m}");
+                            }
                             if !played.as_ref().is_some_and(|(_, s)| s.world_stopped()) {
                                 l.step(dt);
                             }
@@ -2188,6 +2530,32 @@ fn main() -> Result<()> {
                         println!("{}", if l.paused { "paused" } else { "running" });
                     }
                     &Step::Reply(n) => println!("{}", reply(l, n)),
+                    &Step::PadButton(_, _) | &Step::PadStick(..) => {
+                        match *step {
+                            Step::PadButton(b, down) => pad_state.set(b, down),
+                            Step::PadStick(stick, x, y) => {
+                                pad_state.set_stick(stick, glam::Vec2::new(x, y))
+                            }
+                            _ => {}
+                        }
+                        let mut host = HeadlessHost {
+                            live: &mut *l,
+                            played: played.as_mut(),
+                            follow: follow.as_mut(),
+                            camera: &mut camera,
+                            cursor: &mut cursor,
+                            size,
+                        };
+                        for m in pad_play.frame(&pad_state, &mut host, 0.0) {
+                            println!("pad: {m}");
+                        }
+                        // A layer's frame shows what the pad's clicks did.
+                        if let Some((layer, s)) = played.as_mut() {
+                            if let Some(aim) = layer.play(s, &l.sim, 0.0).pop() {
+                                l.aiming = Some(aim);
+                            }
+                        }
+                    }
                     &Step::Orbit(dyaw, dpitch) => {
                         orbit_camera(follow.as_mut(), &mut camera, dyaw, dpitch);
                         if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
@@ -2233,6 +2601,11 @@ fn main() -> Result<()> {
             {
                 camera = c;
             }
+            let popup = played
+                .as_ref()
+                .is_some_and(|(layer, _)| layer.stage.dialog_up());
+            let ctx = pad_play.context_for(played.as_ref().map(|(_, s)| s), popup);
+            pad_lines = pad_play.overlay(Some(&*l), &camera, size, cursor, ctx);
         }
         return capture(
             &ctx,
@@ -2246,6 +2619,7 @@ fn main() -> Result<()> {
             played.as_mut().map(|(layer, _)| layer),
             cursor,
             args.time,
+            pad_lines,
         );
     }
 
@@ -2281,7 +2655,13 @@ fn main() -> Result<()> {
         control,
         remote: VecDeque::new(),
         frame_requests: Vec::new(),
+        pads: paddev::Pads::new(),
+        pad: padplay::PadPlay::default(),
+        remote_pad: pad::PadState::default(),
     };
+    for line in pad::describe() {
+        log::debug!("pad binding: {line}");
+    }
     event_loop.run_app(&mut app)?;
     match app.error {
         Some(e) => Err(e),
@@ -2385,6 +2765,21 @@ mod tests {
             parse_steps("press 1,2; release 3,4").unwrap(),
             vec![Step::Press(1.0, 2.0), Step::Release(3.0, 4.0)]
         );
+        assert_eq!(
+            parse_steps("pad a; pad press RT; pad release rt; pad stick-left 0,1.5 500").unwrap(),
+            vec![
+                Step::PadButton(pad::Button::A, true),
+                Step::PadButton(pad::Button::A, false),
+                Step::PadButton(pad::Button::RT, true),
+                Step::PadButton(pad::Button::RT, false),
+                Step::PadStick(pad::Stick::Left, 0.0, 1.0),
+                Step::Run(500),
+                Step::PadStick(pad::Stick::Left, 0.0, 0.0),
+            ]
+        );
+        assert!(parse_steps("pad q").is_err());
+        assert!(parse_steps("pad stick-left 0,1").is_err());
+        assert!(parse_steps("pad").is_err());
         assert!(parse_steps("reply x").is_err());
         assert!(parse_steps("dance").is_err());
         assert!(parse_steps("click 10").is_err());
