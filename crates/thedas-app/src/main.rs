@@ -1550,6 +1550,31 @@ impl App {
                 }
                 log.push(format!("floaty {text:?}"));
             }
+            Step::Use(tag) => {
+                if let Some(l) = self.live.as_ref() {
+                    let mut sim = l.sim();
+                    let who = sim.world.controlled();
+                    match (who, who.and_then(|w| nearest_tagged(&sim, w, tag))) {
+                        (Some(w), Some(t)) => {
+                            sim.order_use(w, t);
+                            log.push(format!("use {tag}"));
+                        }
+                        _ => log.push(format!("use {tag}: nothing")),
+                    }
+                }
+            }
+            Step::Plot(plot, flag) => {
+                if let Some(l) = self.live.as_ref() {
+                    l.sim().set_plot_flag(
+                        plot,
+                        *flag,
+                        true,
+                        true,
+                        thedas_script::vm::OBJECT_INVALID,
+                    );
+                }
+                log.push(format!("plot {plot} {flag}"));
+            }
             &Step::Menu(m) => {
                 self.key_down(match m {
                     screens::Screen::CharacterRecord => KeyCode::KeyC,
@@ -2111,9 +2136,32 @@ fn audio_state(
     let Some(live) = live else {
         return state;
     };
-    // Animations' sound events (see `Live::animation_clocks`).
+    // Animations' sound events (see `Live::animation_clocks`), with what each creature
+    // wears and wields.
     if !live.front_end {
         state.animations = live.animation_clocks();
+        let sim = live.sim();
+        for (id, ..) in &state.animations {
+            let Some(o) = sim.world.get(*id) else {
+                continue;
+            };
+            let base = |slot: &str| {
+                let slot = thedas_sim::sim::constant(&sim.table, slot);
+                o.equipment
+                    .get(&slot)
+                    .and_then(|i| sim.world.get(*i))
+                    .and_then(|i| i.fields.get("BaseItem").copied())
+            };
+            state.gear.insert(
+                *id,
+                audio::Gear {
+                    armour: base("INVENTORY_SLOT_CHEST"),
+                    main: base("INVENTORY_SLOT_MAIN"),
+                    off: base("INVENTORY_SLOT_OFFHAND"),
+                    combat: o.combat.in_combat,
+                },
+            );
+        }
     }
     {
         let sim = live.sim();
@@ -2188,49 +2236,41 @@ fn audio_state(
                     }
                 }
                 thedas_sim::world::SoundRequest::Impact {
-                    attacker,
                     target,
                     result,
                     weapon,
                     armour,
                     shield,
+                    ..
                 } => {
                     if let Some(at) = sim.world.get(target).map(|o| o.position) {
                         state.impacts.push((at, result, weapon, armour, shield));
-                    }
-                    // The engine's own barks around a blow (`ss_types.gda` types the scripts
-                    // never play): the attacker grunts (15), a struck target cries out in
-                    // pain (16), or dies (18). Provisional: read from the table (their
-                    // probabilities, no script caller), not traced in DAOrigins.exe.
-                    const ATTACK_GRUNT: i32 = 15;
-                    const PAIN_GRUNT: i32 = 16;
-                    const DEATH: i32 = 18;
-                    let landed = matches!(result, 1 | 2 | 4 | 9);
-                    let dead = sim.world.get(target).is_some_and(|o| o.dead);
-                    let mut bark = |id: u32, entry: i32| {
-                        let o = sim.world.get(id);
-                        let set = o.and_then(|o| {
-                            o.text_fields
-                                .get(thedas_sim::sim::SOUND_SET)
-                                .cloned()
-                                .or_else(|| a.template_sound_set(&sim.vfs, &o.template))
-                        });
-                        if let Some(set) = set {
-                            state
-                                .sound_sets
-                                .push((set, entry, 0.0, o.map(|o| o.position)));
-                        }
-                    };
-                    bark(attacker, ATTACK_GRUNT);
-                    if dead {
-                        bark(target, DEATH);
-                    } else if landed {
-                        bark(target, PAIN_GRUNT);
                     }
                 }
                 // PlayMusic names the music project (`music`, from the Music M2DA by
                 // module), which is always the one used here.
                 other => log::debug!("audio: not done yet: {other:?}"),
+            }
+        }
+    }
+    // The party picker, while open: who is picked (and the pool, for unpicked lines).
+    {
+        let sim = live.sim();
+        if let Some(p) = sim.world.party_picker.as_ref() {
+            let mut describe = |id: u32| {
+                let o = sim.world.get(id)?;
+                let set = o
+                    .text_fields
+                    .get(thedas_sim::sim::SOUND_SET)
+                    .cloned()
+                    .or_else(|| a.template_sound_set(&sim.vfs, &o.template));
+                Some((id, o.template.clone(), set, o.position))
+            };
+            state.picker = Some(p.selected.iter().filter_map(|&id| describe(id)).collect());
+            for id in sim.party_pool() {
+                if let Some(m) = describe(id) {
+                    state.picker_left.insert(id, m);
+                }
             }
         }
     }
@@ -2257,17 +2297,6 @@ fn audio_state(
             state.area = Some(resref);
             state.combat = sim.world.party_fighting;
             state.music_intensity = Some(sim.world.music_intensity);
-            // The character the player controls, with its sound set (selection barks).
-            if let Some(c) = sim.world.controlled()
-                && let Some(o) = sim.world.get(c)
-            {
-                let set = o
-                    .text_fields
-                    .get(thedas_sim::sim::SOUND_SET)
-                    .cloned()
-                    .or_else(|| a.template_sound_set(&sim.vfs, &o.template));
-                state.controlled = Some((c, set, o.position));
-            }
             state.dead = sim.world.game_over;
             state.inactive_sounds = sim
                 .world
@@ -2283,6 +2312,7 @@ fn audio_state(
     // listener balance position": 0.17 of the way to the camera).
     let cam = camera.position;
     let feet = live.leader_feet().unwrap_or(cam);
+    state.leader = live.leader_feet().map(|f| f.to_array());
     let p = feet + (cam - feet) * 0.17;
     let right = [camera.yaw.sin(), -camera.yaw.cos(), 0.0];
     state.listener = Some((p.to_array(), right));
@@ -2598,6 +2628,11 @@ enum Step {
     /// A floating message over the controlled creature, as a script's
     /// `DisplayFloatyMessage` makes one (`floaty 12`), for trying the floaty layer headless.
     Floaty(String),
+    /// Sets a plot flag as a script would (`plot plt_tut_explore 0`), running the plot's
+    /// script, for trying journal entries and tutorial popups headless.
+    Plot(String, i32),
+    /// Uses the nearest object with a tag, as clicking it would (`use bdc140ip_everds_chest`).
+    Use(String),
 }
 
 /// A `pad` step: a button by name (pressed and let go), `press`/`release` and a button, or
@@ -2725,6 +2760,15 @@ fn parse_step(s: &str) -> Result<Step> {
             Step::SetValue(k.to_string(), v.trim().to_string())
         }
         "floaty" => Step::Floaty(arg.to_string()),
+        "plot" => {
+            let (plot, flag) = arg
+                .rsplit_once(' ')
+                .context("plot takes a plot and a flag")?;
+            Step::Plot(
+                plot.trim().to_string(),
+                flag.trim().parse().context("plot's flag is a number")?,
+            )
+        }
         // The game menu (Escape while playing).
         "gamemenu" => Step::Menu(screens::Screen::GameMenu),
         "key" if arg.eq_ignore_ascii_case("i") => Step::Menu(screens::Screen::Inventory),
@@ -2762,6 +2806,7 @@ fn parse_step(s: &str) -> Result<Step> {
             }
         }
         "talk" if !arg.is_empty() => Step::Talk(arg.to_string()),
+        "use" if !arg.is_empty() => Step::Use(arg.to_string()),
         "rebuild" => Step::Rebuild,
         "picker" => Step::Picker,
         "wipe" => Step::Wipe,
@@ -3136,6 +3181,27 @@ fn main() -> Result<()> {
                     Step::Floaty(text) => {
                         test_floaty(&mut l.sim(), text);
                         println!("floaty {text:?}");
+                    }
+                    Step::Use(tag) => {
+                        let mut sim = l.sim();
+                        let who = sim.world.controlled();
+                        match (who, who.and_then(|w| nearest_tagged(&sim, w, tag))) {
+                            (Some(w), Some(t)) => {
+                                sim.order_use(w, t);
+                                println!("use {tag}");
+                            }
+                            _ => println!("use {tag}: nothing"),
+                        }
+                    }
+                    Step::Plot(plot, flag) => {
+                        l.sim().set_plot_flag(
+                            plot,
+                            *flag,
+                            true,
+                            true,
+                            thedas_script::vm::OBJECT_INVALID,
+                        );
+                        println!("plot {plot} {flag}");
                     }
                     &Step::Menu(m) => {
                         if let Some((layer, s)) = played.as_mut() {

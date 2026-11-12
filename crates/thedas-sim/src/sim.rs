@@ -1370,12 +1370,20 @@ impl Sim {
                     .and_then(|h| self.world.get(h))
                     .map(|h| (h.position, h.facing));
                 for (k, id) in party.iter().skip(1).enumerate() {
+                    self.following.remove(id);
                     if let Some(o) = self.world.get_mut(*id) {
                         o.area = Some(new);
                         if let Some((p, facing)) = at {
                             o.position = behind(p, facing, k);
                             o.facing = facing;
                         }
+                        // What a member was doing in the old area ends with it: a move under
+                        // way would otherwise carry on from where it began there, putting
+                        // the member back at its old coordinates in the new area (Daveth
+                        // and Jory left at their Ostagar spots in the Korcari Wilds).
+                        // Provisional: the exe's clearing of action queues on a transition
+                        // is not traced.
+                        o.commands.clear();
                         // Followers enter after the hero (whose ENTER `enter_area` sent).
                         let mut ev = self.new_event("ENTER", Some(*id));
                         ev.objects = vec![*id];
@@ -2538,7 +2546,7 @@ impl Sim {
     // -----------------------------------------------------------------------------------------
     // Loading
 
-    fn read_gff3(&self, name: &str) -> Result<Gff3, SimError> {
+    pub(crate) fn read_gff3(&self, name: &str) -> Result<Gff3, SimError> {
         let (data, _) = self
             .vfs
             .read(name)
@@ -2717,7 +2725,7 @@ impl Sim {
         }
         if let Some(t) = &tmpl {
             match kind {
-                ObjectKind::Creature => self.load_template_items(id, t),
+                ObjectKind::Creature | ObjectKind::Placeable => self.load_template_items(id, t),
                 ObjectKind::Store => self.load_store_items(id, t),
                 _ => {}
             }
@@ -2926,7 +2934,10 @@ impl Sim {
         }
         if let Some(t) = &tmpl {
             match kind {
-                ObjectKind::Creature => self.load_template_items(id, t),
+                // A container's contents are its template's `ItemList` (an area's placed
+                // instance carries none of its own): Everd's armour chest at the Proving
+                // holds the armour and helmet the Dwarf Commoner needs.
+                ObjectKind::Creature | ObjectKind::Placeable => self.load_template_items(id, t),
                 ObjectKind::Store => self.load_store_items(id, t),
                 _ => {}
             }

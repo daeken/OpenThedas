@@ -62,6 +62,8 @@ impl Screen {
                 "notifications.gfx",
                 "navbar.gfx",
                 "tooltips.gfx",
+                // Its tutorial popups (`Tutorials.TutorialList`).
+                "popuplayer.gfx",
             ],
             Screen::Cutscene => &["cutscene.gfx"],
             Screen::Conversation => &["conversation.gfx"],
@@ -143,6 +145,9 @@ pub fn wanted(sim: &Sim, menu: Option<Screen>) -> BTreeSet<Screen> {
         }
     } else if w.store.is_some() {
         Screen::Store
+    } else if w.container.is_some() {
+        // A container being looted shows on the inventory screen (its container panel).
+        Screen::Inventory
     } else if w.chanter_board.is_some() {
         Screen::Chanters
     } else if w.world_map.open {

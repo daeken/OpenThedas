@@ -231,6 +231,9 @@ enum Command {
         /// Event parameters to start with (`music_state=1`), for every event.
         #[arg(long = "param")]
         params: Vec<String>,
+        /// A reverb preset from `master_reverb.fev` (`Stone room`, `force_generic`).
+        #[arg(long, default_value = "")]
+        reverb: String,
     },
     /// Check that the sound events the game names resolve: every cutscene's sound tracks
     /// and `sound_gui.gda`'s events.
@@ -310,8 +313,9 @@ fn run() -> Result<()> {
             language,
             rate,
             params,
+            reverb,
         } => audio::play(
-            &install, &events, seconds, &out, stop_at, &language, rate, &params,
+            &install, &events, seconds, &out, stop_at, &language, rate, &params, &reverb,
         ),
         Command::AudioCheck { install, language } => audio::check(&install, &language),
         Command::Fev {

@@ -49,6 +49,39 @@ pub const HERO_NAME: &str = "Party.Hero.Name";
 
 /// Text with the game's designer tags filled in: `<FirstName/>` is the hero's name.
 /// Provisional: other tags (gendered text and the like) are left as written.
+/// The Dialog Tags table (M2DA 143) and its columns: the tag and the HTML it becomes.
+const TABLE_DIALOG_TAGS: i32 = 143;
+const HASH_DIALOG_TAG: u32 = 0x909f_c81a;
+const HASH_DIALOG_HTML: u32 = 0x3336_9693;
+
+/// Replaces the dialog tags in `text` from the Dialog Tags table (`<emp>` becomes `<b>`,
+/// `<desc>` `<i>(`, ...), row by row.
+pub fn replace_dialog_tags(text: &str, tables: &dyn Fn(TableQuery) -> Option<UiValue>) -> String {
+    let rows = match tables(TableQuery::Rows {
+        table: TABLE_DIALOG_TAGS,
+    }) {
+        Some(UiValue::Number(n)) if n > 0.0 => n as usize,
+        _ => return text.to_string(),
+    };
+    let cell = |index: usize, column: u32| match tables(TableQuery::CellAt {
+        table: TABLE_DIALOG_TAGS,
+        index,
+        column,
+    }) {
+        Some(UiValue::String(s)) => Some(s.trim_end_matches('\0').trim().to_string()),
+        _ => None,
+    };
+    let mut out = text.to_string();
+    for i in 0..rows {
+        if let (Some(tag), Some(html)) = (cell(i, HASH_DIALOG_TAG), cell(i, HASH_DIALOG_HTML)) {
+            if !tag.is_empty() && out.contains(&tag) {
+                out = out.replace(&tag, &html);
+            }
+        }
+    }
+    out
+}
+
 pub fn replace_designer_tags(text: &str, hero: &str) -> String {
     text.replace("<FirstName/>", hero)
 }
@@ -403,6 +436,29 @@ impl GameBridge {
                     Some(UiValue::String(n)) => n,
                     _ => String::new(),
                 };
+                // Dialog tags (`<emp>`, `<desc>`, ...) become their HTML from the Dialog Tags
+                // table (M2DA 143: the tag and its replacement), as DAOrigins.exe's
+                // ReplaceDesignerTags does first (0x51f110).
+                let lookup = self.tables.lock().ok().and_then(|t| t.clone());
+                let text = match lookup {
+                    Some(l) if text.contains('<') => replace_dialog_tags(&text, &*l),
+                    _ => text,
+                };
+                // Key tags name the keys bound to actions (see `crate::keys`).
+                let text = crate::keys::replace_key_tags(
+                    &text,
+                    |action| {
+                        let s = self.state.lock().ok()?;
+                        match s
+                            .values
+                            .get(&format!("InputMappings.Mappings.{action}.PrimaryMappedKey"))
+                        {
+                            Some(UiValue::String(k)) if !k.is_empty() => Some(k.clone()),
+                            _ => None,
+                        }
+                    },
+                    |id| (self.strings)(id),
+                );
                 UiValue::String(replace_designer_tags(&text, &hero))
             }
             // The movies' `ExternalCommands.FormatFloat(a_nPrecision, a_nValue)` sends the
@@ -572,6 +628,31 @@ impl GameBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dialog_tags_become_their_html() {
+        let rows = [
+            ("<emp>", "<b>"),
+            ("</emp>", "</b>"),
+            ("<desc>", "<i>("),
+            ("</desc>", ")</i>"),
+        ];
+        let tables = |q: TableQuery| match q {
+            TableQuery::Rows { table: 143 } => Some(UiValue::Number(rows.len() as f64)),
+            TableQuery::CellAt {
+                table: 143,
+                index,
+                column,
+            } => rows.get(index).map(|(t, h)| {
+                UiValue::String(if column == HASH_DIALOG_TAG { t } else { h }.to_string())
+            }),
+            _ => None,
+        };
+        assert_eq!(
+            replace_dialog_tags("<desc>Snorts and grunts</desc> <emp>Go</emp>", &tables),
+            "<i>(Snorts and grunts)</i> <b>Go</b>"
+        );
+    }
 
     fn call(kind: CallKind, name: &str, args: &[&str]) -> UiCall {
         UiCall {

@@ -496,6 +496,13 @@ pub struct World {
     /// The quest the player marked active in the journal (its plot resource).
     #[serde(default)]
     pub active_quest: Option<String>,
+    /// The tutorial popups waiting to show, the first on screen (see
+    /// [`crate::journal::Tutorial`]).
+    #[serde(default)]
+    pub tutorials: Vec<crate::journal::Tutorial>,
+    /// Whether a tutorial paused the game: it stays paused until the queue is empty.
+    #[serde(default)]
+    pub tutorial_paused: bool,
     /// The HUD's notifications not yet dismissed (see [`crate::journal::Alert`]).
     #[serde(default)]
     pub alerts: Vec<crate::journal::Alert>,
@@ -570,6 +577,9 @@ pub struct World {
     /// The job board on screen (`ShowChantersGUI`).
     #[serde(default)]
     pub chanter_board: Option<crate::chanters::ChanterBoard>,
+    /// The container being looted (`OpenInventory`, see [`crate::container`]).
+    #[serde(default)]
+    pub container: Option<ObjectId>,
     /// The store whose screen is open (`OpenStore`).
     #[serde(default)]
     pub store: Option<ObjectId>,
@@ -681,6 +691,8 @@ impl World {
             journal_seq: 0,
             recipes: BTreeSet::new(),
             active_quest: None,
+            tutorials: Vec::new(),
+            tutorial_paused: false,
             alerts: Vec::new(),
             game_mode: 0,
             cutscenes: Vec::new(),
@@ -702,6 +714,7 @@ impl World {
             dialog_shown: Default::default(),
             story_events: Vec::new(),
             popup: None,
+            container: None,
             store: None,
             chanter_board: None,
             plot_actions: PlotActions::default(),

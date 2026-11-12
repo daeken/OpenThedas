@@ -119,6 +119,9 @@ pub struct Presentation {
     pub ability_scene: i32,
     /// The book page up (navbar.gfx's selected tab, `GUI.SelectedBookPage`), if any.
     pub book_page: Option<i32>,
+    /// A full-screen menu (options, save and load, the game menu) is up: tutorial popups
+    /// wait under it (the popup layer those screens load does not show them).
+    pub menu_up: bool,
 }
 
 /// An item shown on the examine screen (itemexamine.gfx), as the screen that opened it asked
@@ -420,11 +423,20 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             v.insert(format!("{k}.PortraitProperties.PortraitTint"), num(0));
         }
     }
-    // Who may level up now (the character record's button): a party member the game marked
-    // (`SetCanLevelUp`, or experience reaching the next level) out of combat.
+    // Who may level up now (the character record's button): a party member out of combat
+    // the game marked (`SetCanLevelUp`, or experience reaching the next level), or with
+    // points to spend: DAOrigins.exe's test (0x6acbc0) sums the attribute, skill,
+    // talent/spell and specialization points (properties 34, 35, 36 and 38). Provisional:
+    // the class checks that follow the sum are not traced.
     for id in &members {
         let can = sim.world.get(*id).is_some_and(|o| {
-            o.fields.get("CanLevelUp").copied().unwrap_or(0) != 0 && !o.combat.in_combat
+            let points: f32 = [34, 35, 36, 38]
+                .iter()
+                .filter_map(|p| o.properties.get(p))
+                .map(|p| p.0)
+                .sum();
+            (o.fields.get("CanLevelUp").copied().unwrap_or(0) != 0 || points > 0.0)
+                && !o.combat.in_combat
         });
         v.insert(
             format!("{}.{id}", crate::protocol::CAN_LEVEL_UP),
@@ -636,6 +648,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             UiValue::String(key.into()),
         );
     }
+    key_mappings(sim, &mut v);
     // The start menu (startmenu2.gfx): its buttons show (`GameMode.ShowStartMenuContents`),
     // no other campaigns are installed (`Client.ModuleInfoList`), and there is no online
     // account or welcome message about one. Provisional: the version string is this port's.
@@ -667,14 +680,40 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         num(sim.world.difficulty),
     );
     chargen_screen(sim, &mut v);
-    // No tutorials are queued: popuplayer.gfx hides its tutorial panel when it sees the empty
-    // list (`Tutorials.TutorialList`, observed). Provisional: the game's tutorial queue is
-    // not modelled.
+    // The tutorial popups waiting (popuplayer.gfx shows the first: its `Title`, `Text` and
+    // the `CodexResRef` its Codex button opens; Next when more wait, else Close), with
+    // tutorials on (`Tutorials.Enabled`). An empty list hides the panel.
+    let tutorial_text =
+        |s: Option<u32>| UiValue::String(s.and_then(|s| sim.string(s)).unwrap_or_default());
+    // Provisional: the original's rule for a tutorial waiting while a menu is up is not
+    // traced; QA saw the panel over the options, save and game menus, where it does not
+    // belong.
+    let tutorials: &[thedas_sim::journal::Tutorial] = if shown.menu_up {
+        &[]
+    } else {
+        &sim.world.tutorials
+    };
     v.insert(
         "Tutorials.TutorialList".into(),
-        UiValue::String(String::new()),
+        UiValue::String(
+            tutorials
+                .iter()
+                .map(|t| t.resref.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
     );
-    v.insert("Tutorials.Enabled".into(), num(0));
+    for (i, t) in tutorials.iter().enumerate() {
+        let k = format!("Tutorials.TutorialList.{i}");
+        v.insert(k.clone(), UiValue::String(t.resref.clone()));
+        v.insert(format!("{k}.Title"), tutorial_text(t.title));
+        v.insert(format!("{k}.Text"), tutorial_text(t.text));
+        v.insert(
+            format!("{k}.CodexResRef"),
+            UiValue::String(t.resref.clone()),
+        );
+    }
+    v.insert("Tutorials.Enabled".into(), num(1));
     v.insert("Tutorials.TrainingStep".into(), num(0));
     // The tutorials' screen highlights (DAConstants `GUI_HIGHLIGHT_*`: 0 follower, 1
     // tactics, 2 inventory, 3 health poultice, 4 empty quickbar, 5 tactic preset, 6
@@ -708,6 +747,52 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         quickbar(sim, who, &mut v);
     }
     v
+}
+
+/// The keys bound to the game's actions, as the movies (and the designer tags in text, see
+/// [`crate::keys`]) read them: `InputMappings.Mappings.<action>.PrimaryMappedKey` and
+/// `SecondaryMappedKey`, from `keymap.gda`'s default bindings.
+fn key_mappings(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
+    /// `keymap.gda`'s first binding column.
+    const HASH_BINDING: u32 = 0xf2e4_79b8;
+    let tables = sim.world.tables();
+    let (Some(keymap), Some(inputmap)) = (tables.get(0, "keymap"), tables.get(0, "inputmap"))
+    else {
+        return;
+    };
+    let name = |row: i64| match inputmap.order.iter().position(|&r| r == row) {
+        Some(_) => match inputmap.rows.get(&row).and_then(|c| c.get(1)) {
+            Some(thedas_formats::gda::Cell::Int(s)) => sim.string(*s as u32),
+            _ => None,
+        },
+        None => None,
+    };
+    for &row in &keymap.order {
+        let label = match keymap.cell("Label", row) {
+            Some(thedas_formats::gda::Cell::String(s)) => {
+                s.trim().trim_end_matches('\0').to_string()
+            }
+            _ => continue,
+        };
+        let Some((action, which)) = label.rsplit_once('_') else {
+            continue;
+        };
+        let slot = match which {
+            "0" => "PrimaryMappedKey",
+            "1" => "SecondaryMappedKey",
+            _ => continue,
+        };
+        let binding = match keymap.cell_by_hash(HASH_BINDING, row) {
+            Some(thedas_formats::gda::Cell::String(s)) => s.clone(),
+            _ => String::new(),
+        };
+        if let Some(n) = crate::keys::binding_name(&binding, name) {
+            v.insert(
+                format!("InputMappings.Mappings.{action}.{slot}"),
+                UiValue::String(n),
+            );
+        }
+    }
 }
 
 /// The quickbar of the party member the player controls (`GUI.SelectedChar.Stats.
@@ -1337,10 +1422,46 @@ fn inventory(sim: &Sim, who: Option<u32>, filter: i32, v: &mut BTreeMap<String, 
             item(sim, &format!("{k}.Item"), *id, v);
         }
     }
-    // No container is open (looting goes through the simulation's own commands for now).
-    v.insert("GUIInventory.ShowContainer".into(), num(0));
-    v.insert("GUIInventory.ContainerHasPlotItems".into(), num(0));
+    // The container being looted (`OpenInventory`): inventory.gfx's container panel shows
+    // its name (`Container.Name`, else its tag) and items (`GUIInventory.ContainerView.N.
+    // Item`, also `Container.Inventory`, which Take All counts). Provisional: the party
+    // cannot put items into a container.
+    let container = sim
+        .world
+        .container
+        .and_then(|c| sim.world.get(c).map(|o| (c, o)));
+    v.insert(
+        "GUIInventory.ShowContainer".into(),
+        num(container.is_some() as u8),
+    );
     v.insert("GUIInventory.CanAddItemsToContainer".into(), num(0));
+    let loot: Vec<u32> = container
+        .map(|(_, o)| o.inventory.clone())
+        .unwrap_or_default();
+    v.insert(
+        "GUIInventory.ContainerHasPlotItems".into(),
+        num(loot
+            .iter()
+            .any(|&i| sim.world.get(i).is_some_and(|o| o.plot)) as u8),
+    );
+    if let Some((c, o)) = container {
+        v.insert("Container.ID".into(), num(c));
+        v.insert("Container.Name".into(), UiValue::String(name(sim, c)));
+        v.insert("Container.Tag".into(), UiValue::String(o.tag.clone()));
+    }
+    let ids: Vec<String> = loot.iter().map(|i| i.to_string()).collect();
+    v.insert(
+        "GUIInventory.ContainerView".into(),
+        UiValue::String(ids.join(",")),
+    );
+    v.insert("Container.Inventory".into(), UiValue::String(ids.join(",")));
+    for (i, id) in loot.iter().enumerate() {
+        let k = format!("GUIInventory.ContainerView.{i}");
+        v.insert(k.clone(), num(*id));
+        v.insert(format!("{k}.GroupSize"), num(1));
+        item(sim, &format!("{k}.Item"), *id, v);
+        v.insert(format!("Container.Inventory.{i}"), num(*id));
+    }
     v.insert("Party.BackpackSize".into(), num(gear.len() as f64));
     let hero = sim.world.hero.and_then(|h| sim.world.get(h));
     v.insert(

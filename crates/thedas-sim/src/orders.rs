@@ -41,12 +41,20 @@ impl Sim {
 
     /// Walks `who` to `to` (in its area), dropping what it was doing.
     pub fn order_move(&mut self, who: ObjectId, to: [f32; 3]) {
-        let Some((area, from)) = self
+        let Some((area, from, facing)) = self
             .world
             .get(who)
-            .and_then(|o| Some((o.area?, o.position)))
+            .and_then(|o| Some((o.area?, o.position, o.facing)))
         else {
             return;
+        };
+        // A walk to where it already stands (the pad's stop) keeps the way it faces: the
+        // direction of a zero step is undefined (atan2(0, 0) would turn it to face +X).
+        let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
+        let facing = if dx * dx + dy * dy > 1e-6 {
+            facing_toward(dx, dy)
+        } else {
+            facing
         };
         let mut c = command(
             self,
@@ -56,7 +64,7 @@ impl Sim {
         c.location = Some(Location {
             area,
             position: to,
-            facing: facing_toward(to[0] - from[0], to[1] - from[1]),
+            facing,
         });
         if let Some(o) = self.world.get_mut(who) {
             o.commands.clear();
@@ -211,6 +219,22 @@ mod tests {
             o.position = [x, 0.0, 0.0];
         }
         (s, hero, npc)
+    }
+
+    #[test]
+    fn a_walk_to_its_own_feet_keeps_its_facing() {
+        let (mut s, hero, _) = sim();
+        s.world.get_mut(hero).unwrap().facing = 90.0;
+        s.order_move(hero, [0.0, 0.0, 0.0]);
+        let q = &s.world.get(hero).unwrap().commands;
+        assert_eq!(q[0].location.unwrap().facing, 90.0);
+        // A real step faces along it: +Y is facing 0.
+        s.order_move(hero, [0.0, 3.0, 0.0]);
+        let f = s.world.get(hero).unwrap().commands[0]
+            .location
+            .unwrap()
+            .facing;
+        assert!(f.abs() < 1e-3 || (f - 360.0).abs() < 1e-3, "{f}");
     }
 
     #[test]
