@@ -1085,7 +1085,7 @@ impl App {
             // (which stops the world otherwise); a training lesson's events are delivered
             // with a screen up too (its steps go on inside the inventory, the tactics), no
             // time passing (see `Live::step`).
-            if !stopped || live.transition_pending() || live.travel_load() || live.training() {
+            if !stopped || live.transition_pending() || live.journey() || live.training() {
                 live.step(dt);
             }
             // While a level loads the world holds still: its presentation too.
@@ -1232,7 +1232,7 @@ impl App {
             // (which stops the world otherwise); a training lesson's events are delivered
             // with a screen up too (its steps go on inside the inventory, the tactics), no
             // time passing (see `Live::step`).
-            if !stopped || live.transition_pending() || live.travel_load() || live.training() {
+            if !stopped || live.transition_pending() || live.journey() || live.training() {
                 live.step(dt);
             }
             // While a level loads the world holds still: its presentation too.
@@ -3606,7 +3606,7 @@ fn main() -> Result<()> {
                             }
                             if !played.as_ref().is_some_and(|(_, s)| s.world_stopped())
                                 || l.transition_pending()
-                                || l.travel_load()
+                                || l.journey()
                                 || l.training()
                             {
                                 l.step(dt);

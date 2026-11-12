@@ -597,6 +597,13 @@ impl Live {
         self.async_loads && self.travel
     }
 
+    /// Whether a world map journey is under way in the simulation (see `journey`), whatever
+    /// the load mode: the world runs on behind the map for it, which otherwise stops the
+    /// world, so the travel scripts carry the party on (headless captures too).
+    pub fn journey(&self) -> bool {
+        journey(&self.sim())
+    }
+
     /// Latches [`Live::travel_load`]: set while the simulation says a journey is under way;
     /// it holds through the load that ends it, until the new area's world is shown.
     fn note_travel(&mut self, sim: &Sim) {
