@@ -117,6 +117,10 @@ pub struct Options {
     pub color_targets: Option<u32>,
     /// Pixel shaders: D3D9 alpha test (`ALPHAFUNC`, `ALPHAREF / 255`).
     pub alpha_test: Option<(Comparison, f32)>,
+    /// Pixel shaders: take the alpha test's reference (0–255) from the fix-up vector's `z`
+    /// instead of the constant in [`Options::alpha_test`], for draws whose reference changes
+    /// (D3D9's `ALPHAREF` render state set per draw).
+    pub alpha_ref_uniform: bool,
 }
 
 pub struct Translation {
@@ -1067,7 +1071,7 @@ fn assemble(g: &mut Gen) -> Result<String> {
         binding_int(stage),
         binding_bool(stage)
     );
-    if stage == Stage::Vertex {
+    if stage == Stage::Vertex || (g.opts.alpha_ref_uniform && g.opts.alpha_test.is_some()) {
         let _ = writeln!(
             w,
             "@group({GROUP_CONSTANTS}) @binding({BINDING_FIXUP}) var<uniform> d3d_fixup: vec4<f32>;"
@@ -1329,11 +1333,12 @@ fn pixel_interface(g: &mut Gen) -> Result<(String, String, String, String)> {
         } else {
             "0.0"
         };
-        let _ = writeln!(
-            epi,
-            "    if (!({a} {o} {})) {{ discard; }}",
+        let reference = if g.opts.alpha_ref_uniform {
+            "d3d_fixup.z".to_string()
+        } else {
             flit((reference * 255.0).round())
-        );
+        };
+        let _ = writeln!(epi, "    if (!({a} {o} {reference})) {{ discard; }}");
     }
     epi.push_str("    var out: StageOut;\n");
     for c in &locations {
