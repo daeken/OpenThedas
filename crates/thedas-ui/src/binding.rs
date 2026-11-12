@@ -101,6 +101,11 @@ pub struct Presentation {
     pub examine: Option<Examine>,
     /// Whether the player paused the game (floatylayer.gfx's pause border).
     pub paused: bool,
+    /// While the skills or spells/talents screen is up, which it shows (abilities.gfx's
+    /// `AbilityScene.TALENTS` 1, `SPELLS` 2, `SKILLS` 3); 0 otherwise.
+    pub ability_scene: i32,
+    /// The book page up (navbar.gfx's selected tab, `GUI.SelectedBookPage`), if any.
+    pub book_page: Option<i32>,
 }
 
 /// An item shown on the examine screen (itemexamine.gfx), as the screen that opened it asked
@@ -350,7 +355,28 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             }
         }
         v.insert("CharGenCreature.Stats.AutoLevelUp".into(), num(0));
-        crate::chains::bind(sim, c, "CharGenCreature.Stats", &mut v);
+        crate::chains::bind(
+            sim,
+            c,
+            "CharGenCreature.Stats",
+            crate::chains::DISPLAYMODE_LEVELUP,
+            &mut v,
+        );
+    }
+    // The skills or spells/talents screen (abilities.gfx): which it shows, and the member's
+    // abilities listed as the spellbook lists them.
+    if let Some(c) = controlled.or(hero).filter(|_| shown.ability_scene != 0) {
+        v.insert(
+            "GUI.AbilityScene".into(),
+            num(f64::from(shown.ability_scene)),
+        );
+        crate::chains::bind(
+            sim,
+            c,
+            "GUI.SelectedChar.Stats",
+            crate::chains::DISPLAYMODE_SPELLBOOK,
+            &mut v,
+        );
     }
     // The portrait the engine drew of each member's head (portraits.gfx loads it).
     for (i, id) in members.iter().enumerate() {
@@ -558,6 +584,25 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     // Provisional: every pause here is the player's own (the game also pauses for menus).
     v.insert("Client.Paused".into(), num(u8::from(shown.paused)));
     v.insert("Client.UserPaused".into(), num(u8::from(shown.paused)));
+    if let Some(p) = shown.book_page {
+        v.insert("GUI.SelectedBookPage".into(), num(p));
+    }
+    // The keys navbar.gfx shows on its page tabs: the game's default KeyBindings.ini
+    // (`ToggleInventory_0=Keyboard::Button_I`, ..., `ToggleTactics_0=Keyboard::Button_Backslash`).
+    for (scene, key) in [
+        ("CharacterRecord", "C"),
+        ("Inventory", "I"),
+        ("Journal", "J"),
+        ("Skills", "K"),
+        ("SpellsTalents", "P"),
+        ("Map", "M"),
+        ("Tactics", "\\"),
+    ] {
+        v.insert(
+            format!("InputMappings.Mappings.Toggle{scene}.PrimaryMappedKey"),
+            UiValue::String(key.into()),
+        );
+    }
     // The difficulty, as character creation's difficulty prompt starts from it.
     v.insert(
         "ClientOptions.GameOptions.DifficultyLevel".into(),

@@ -38,6 +38,8 @@ const CLASSES: i32 = 3;
 
 /// The level-up screen's display mode (`SharedLibrary.Ability.DISPLAYMODE_LEVELUP`).
 pub const DISPLAYMODE_LEVELUP: i64 = 2;
+/// The skills and spells/talents screen's (abilities.gfx, `DISPLAYMODE_SPELLBOOK`).
+pub const DISPLAYMODE_SPELLBOOK: i64 = 4;
 
 pub const DISPLAYSTATE_HAVE: i64 = 1;
 pub const DISPLAYSTATE_AVAILABLE: i64 = 2;
@@ -174,14 +176,15 @@ pub fn chains(sim: &Sim, who: u32, ability_type: i64, mode: i64) -> Vec<Entry> {
 }
 
 /// The values the screens read for each listed ability, under `prefix`
-/// (`CharGenCreature.Stats`).
-pub fn bind(sim: &Sim, who: u32, prefix: &str, v: &mut BTreeMap<String, UiValue>) {
+/// (`CharGenCreature.Stats`, or `GUI.SelectedChar.Stats` for the skills and spells/talents
+/// screen), listing the abilities shown in display `mode` (`DISPLAYMODE_*`).
+pub fn bind(sim: &Sim, who: u32, prefix: &str, mode: i64, v: &mut BTreeMap<String, UiValue>) {
     let tables = sim.world.tables();
     let Some(abi) = tables.get(ABILITIES, "") else {
         return;
     };
     for (list, ty) in LISTS {
-        for (i, e) in chains(sim, who, ty, DISPLAYMODE_LEVELUP).iter().enumerate() {
+        for (i, e) in chains(sim, who, ty, mode).iter().enumerate() {
             ability(
                 sim,
                 &abi,
@@ -392,7 +395,7 @@ mod tests {
     fn bound_tokens_answer_get_ability_attributes() {
         let (s, c) = sim(1.0, &[4022]);
         let mut v = BTreeMap::new();
-        bind(&s, c, "CharGenCreature.Stats", &mut v);
+        bind(&s, c, "CharGenCreature.Stats", DISPLAYMODE_LEVELUP, &mut v);
         let k = "CharGenCreature.Stats.TalentChains.1";
         assert_eq!(
             v[&format!("{k}.AbilityTemplate.AbilityType")],

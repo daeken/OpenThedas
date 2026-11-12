@@ -1,7 +1,8 @@
 //! `thedas-app`: walk through a Dragon Age: Origins area, or play.
 //!
 //! Interactive: WASD to move, Q/E (or C) down/up, Shift to move faster, hold the right
-//! mouse button (or use the arrow keys) to look around, P to print the camera, F12 to save a
+//! mouse button (or use the arrow keys) to look around, P to print the camera (when not
+//! playing), F12 to save a
 //! capture, Esc to quit.
 //!
 //! Playing: `--save <file>` (a save from the MCP's save_state) or `--new-game` (through the
@@ -1114,7 +1115,8 @@ impl App {
     fn key_down(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::Escape => return true,
-            KeyCode::KeyP => println!("camera {}", self.camera.spec()),
+            // While playing, P opens the spells/talents screen instead.
+            KeyCode::KeyP if self.screens.is_none() => println!("camera {}", self.camera.spec()),
             // F5 the save screen, F9 the load screen. Provisional: the game's own bindings
             // (quick save and quick load) are not traced.
             KeyCode::F5 | KeyCode::F9 if self.screens.is_some() => {
@@ -1141,14 +1143,18 @@ impl App {
                 }
             }
             // The player's screens: I the inventory, C the character record, T tactics, M the
-            // area map, J the journal (the executable's `ToggleJournal` action), O the options.
-            // Provisional: the game's own key bindings are not traced (it opens its options
-            // from the game menu).
+            // area map, J the journal (the executable's `ToggleJournal` action), K the skills
+            // and P the spells/talents (`ToggleSkills`, `ToggleSpellsTalents`; I, C, J, K and P
+            // are the game's default KeyBindings.ini), O the options. Provisional: the
+            // others' bindings are not traced (the game opens its options from the game menu).
             KeyCode::KeyI
             | KeyCode::KeyC
             | KeyCode::KeyT
             | KeyCode::KeyM
             | KeyCode::KeyJ
+            | KeyCode::KeyK
+            | KeyCode::KeyP
+            | KeyCode::Backslash
             | KeyCode::KeyO
                 if self.screens.is_some() =>
             {
@@ -1383,6 +1389,8 @@ impl App {
                     screens::Screen::Tactics => KeyCode::KeyT,
                     screens::Screen::AreaMap => KeyCode::KeyM,
                     screens::Screen::Journal => KeyCode::KeyJ,
+                    screens::Screen::Skills => KeyCode::KeyK,
+                    screens::Screen::SpellsTalents => KeyCode::KeyP,
                     screens::Screen::Options => KeyCode::KeyO,
                     _ => KeyCode::KeyI,
                 });
@@ -2183,14 +2191,17 @@ fn text_key(name: &str) -> Option<thedas_ui::UiKey> {
     })
 }
 
-/// The player's screen a key opens (I, C, T, M, J, O).
+/// The player's screen a key opens (I, C, T, M, J, K, P, O).
 fn menu_key(code: KeyCode) -> Option<screens::Screen> {
     match code {
         KeyCode::KeyI => Some(screens::Screen::Inventory),
         KeyCode::KeyC => Some(screens::Screen::CharacterRecord),
-        KeyCode::KeyT => Some(screens::Screen::Tactics),
+        // T, and Backslash as the game binds it (`ToggleTactics_0`).
+        KeyCode::KeyT | KeyCode::Backslash => Some(screens::Screen::Tactics),
         KeyCode::KeyM => Some(screens::Screen::AreaMap),
         KeyCode::KeyJ => Some(screens::Screen::Journal),
+        KeyCode::KeyK => Some(screens::Screen::Skills),
+        KeyCode::KeyP => Some(screens::Screen::SpellsTalents),
         KeyCode::KeyO => Some(screens::Screen::Options),
         _ => None,
     }
@@ -2258,6 +2269,8 @@ fn parse_step(s: &str) -> Result<Step> {
         "key" if arg.eq_ignore_ascii_case("t") => Step::Menu(screens::Screen::Tactics),
         "key" if arg.eq_ignore_ascii_case("m") => Step::Menu(screens::Screen::AreaMap),
         "key" if arg.eq_ignore_ascii_case("j") => Step::Menu(screens::Screen::Journal),
+        "key" if arg.eq_ignore_ascii_case("k") => Step::Menu(screens::Screen::Skills),
+        "key" if arg.eq_ignore_ascii_case("p") => Step::Menu(screens::Screen::SpellsTalents),
         "key" if arg.eq_ignore_ascii_case("o") => Step::Menu(screens::Screen::Options),
         "key" if matches!(arg.to_ascii_lowercase().as_str(), "f1" | "f2" | "f3" | "f4") => {
             Step::Leader(arg[1..].parse::<usize>()? - 1)

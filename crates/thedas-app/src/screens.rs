@@ -36,6 +36,10 @@ pub enum Screen {
     Journal,
     Options,
     ItemExamine,
+    /// The skills screen (K) and the spells/talents screen (P): one movie, abilities.gfx,
+    /// told which by `GUI.AbilityScene`.
+    Skills,
+    SpellsTalents,
 }
 
 impl Screen {
@@ -58,22 +62,40 @@ impl Screen {
             Screen::Store => &["store.gfx", "tooltips.gfx"],
             Screen::Chanters => &["chanters.gfx", "tooltips.gfx"],
             Screen::LevelUp => &["levelup.gfx", "tooltips.gfx"],
-            Screen::Inventory => &["inventory.gfx", "tooltips.gfx"],
-            Screen::CharacterRecord => &["characterrecord.gfx", "tooltips.gfx"],
-            Screen::Tactics => &["tactics.gfx", "tooltips.gfx"],
-            Screen::AreaMap => &["map.gfx", "tooltips.gfx"],
+            Screen::Inventory => &["inventory.gfx", "navbar.gfx", "tooltips.gfx"],
+            Screen::CharacterRecord => &["characterrecord.gfx", "navbar.gfx", "tooltips.gfx"],
+            Screen::Tactics => &["tactics.gfx", "navbar.gfx", "tooltips.gfx"],
+            Screen::AreaMap => &["map.gfx", "navbar.gfx", "tooltips.gfx"],
             Screen::PartyPicker => &["partypicker.gfx"],
             Screen::Death => &["deathscreen.gfx"],
             // Its save names and confirmations are dialog boxes on the popup layer.
             Screen::SaveLoad => &["saveload.gfx", "popuplayer.gfx"],
             // Quick Play and finishing ask for confirmation on the popup layer.
             Screen::CharGen => &["chargen.gfx", "popuplayer.gfx"],
-            Screen::Journal => &["journal.gfx", "tooltips.gfx"],
+            Screen::Journal => &["journal.gfx", "navbar.gfx", "tooltips.gfx"],
+            Screen::Skills | Screen::SpellsTalents => {
+                &["abilities.gfx", "navbar.gfx", "tooltips.gfx"]
+            }
             // Settings that need confirming (a new resolution) ask on the popup layer.
             Screen::Options => &["optionsmenu.gfx", "popuplayer.gfx"],
             // Over the screen it was opened from (see `with_examine`).
             Screen::ItemExamine => &["itemexamine.gfx"],
         }
+    }
+
+    /// The book page navbar.gfx shows selected for this screen (`GUI.SelectedBookPage`, the
+    /// screens' `GUISystem.GUI_*` ids), for the screens drawn in the book with its page tabs.
+    pub fn book_page(self) -> Option<i32> {
+        Some(match self {
+            Screen::CharacterRecord => 0,
+            Screen::Inventory => 8,
+            Screen::Journal => 9,
+            Screen::SpellsTalents => 10,
+            Screen::Skills => 13,
+            Screen::AreaMap => 15,
+            Screen::Tactics => 23,
+            _ => return None,
+        })
     }
 
     /// A menu the world waits behind (everything but the HUD, conversations and cutscenes:
