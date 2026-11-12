@@ -2220,6 +2220,10 @@ impl padplay::Host for App {
         self.gfx.as_mut().is_some_and(|g| g.ui.stage.key(key))
     }
 
+    fn movie_value(&mut self, movie: &str, path: &str) -> Option<thedas_ui::UiValue> {
+        self.gfx.as_mut()?.ui.probe_call(movie, path, &[])
+    }
+
     fn open_saves(&mut self, mode: i32) {
         if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_mut()) {
             g.ui.open_saves(s, mode);
@@ -2899,6 +2903,10 @@ impl padplay::Host for HeadlessHost<'_> {
         self.played
             .as_deref_mut()
             .is_some_and(|(layer, _)| layer.stage.key(key))
+    }
+
+    fn movie_value(&mut self, movie: &str, path: &str) -> Option<thedas_ui::UiValue> {
+        self.played.as_deref_mut()?.0.probe_call(movie, path, &[])
     }
 
     fn open_saves(&mut self, mode: i32) {

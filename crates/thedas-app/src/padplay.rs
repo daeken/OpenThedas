@@ -58,6 +58,8 @@ pub trait Host {
     fn text_focused(&mut self) -> bool;
     /// A key into the focused text field; false when none has focus.
     fn text_key(&mut self, key: thedas_ui::UiKey) -> bool;
+    /// A value read from a movie (a call of `path`, as the headless `call` step makes).
+    fn movie_value(&mut self, movie: &str, path: &str) -> Option<thedas_ui::UiValue>;
 }
 
 /// The letters the D-pad steps through when typing on the pad, in order.
@@ -131,6 +133,8 @@ pub struct PadPlay {
     view: (u32, u32),
     /// A's release after a press that only focused a button (it clicks nothing).
     swallow_release: bool,
+    /// The same for Y, when its press put an item on the quickbar.
+    swallow_right: bool,
 }
 
 /// How often the focused button is looked for again (milliseconds).
@@ -440,6 +444,18 @@ impl PadPlay {
                 host.left_button(a == Action::PointerDown);
                 return None;
             }
+            // Y on a usable item in the inventory's list puts it on the quickbar, in the
+            // first free slot: the mouse drags it there, which a pad cannot. A deliberate
+            // addition (the 360 version maps items from its radial menu).
+            Action::RightDown if !self.controller.free_pointer => {
+                if let Some(m) = self.item_to_quickbar(host) {
+                    self.swallow_right = true;
+                    return Some(m);
+                }
+                host.right_button(true);
+                return None;
+            }
+            Action::RightUp if std::mem::take(&mut self.swallow_right) => return None,
             Action::RightDown | Action::RightUp => {
                 host.right_button(a == Action::RightDown);
                 return None;
@@ -733,6 +749,47 @@ impl PadPlay {
                 Context::Screen => !self.snapped,
                 _ => false,
             }
+    }
+
+    /// The usable item under the pointer in the inventory's list goes on the controlled
+    /// member's quickbar (the movie's own `.SetQuickslot` message, slot -1: the first free
+    /// one). None when the pointer is on no such item.
+    fn item_to_quickbar(&mut self, host: &mut dyn Host) -> Option<String> {
+        let targets = host.focus_targets();
+        let i = crate::focusnav::under(&targets, host.cursor())?;
+        let t = &targets[i];
+        if t.movie != "inventory.gfx" || !t.path.contains(".ItemEntry") {
+            return None;
+        }
+        // The entry's clip (the target is its hit area) knows its item.
+        let entry = t.path.rsplit_once('.').map_or(t.path.as_str(), |(e, _)| e);
+        let id = match host.movie_value("inventory.gfx", &format!("{entry}.ObjectID.toString")) {
+            Some(thedas_ui::UiValue::String(s)) => s.parse::<u32>().ok()?,
+            _ => return None,
+        };
+        let live = host.live()?;
+        let mut sim = live.sim();
+        let who = sim.world.controlled().or(sim.world.hero)?;
+        let (ability, tag) = {
+            let o = sim.world.get(id)?;
+            (
+                o.fields.get("AbilityID").copied().unwrap_or(0),
+                o.tag.clone(),
+            )
+        };
+        if ability <= 0 {
+            return Some("that item cannot go on the quickbar".into());
+        }
+        sim.gui_message(
+            "GUI.SelectedChar.SetQuickslot",
+            &[
+                who.to_string(),
+                "-1".into(),
+                ability.to_string(),
+                tag.clone(),
+            ],
+        );
+        Some(format!("{tag} put on the quickbar"))
     }
 
     /// Whether the pointer is on an item of the inventory screen: an entry of its list or an
