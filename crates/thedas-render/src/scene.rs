@@ -1627,6 +1627,45 @@ impl AreaScene {
                 );
             }
         }
+        // The level's own layout (`<level>.rml`, beside the rooms' in the level archive):
+        // what stands outside the rooms, such as water (`oth000d_water_1442`), the horizon
+        // (`vst_frostbacks01_1`, `hro_fie_bkcitye`), tree lines, Ostagar's tents and its
+        // SpeedTrees. It names no room id; its models belong to no room.
+        let level_rml = format!("{level}.rml");
+        if l.vfs.lookup(&level_rml).is_some() {
+            match l.read(&level_rml).map(|d| Rml::parse(&d)) {
+                Ok(Ok(rml)) => {
+                    let probe = l.room_probe(level, "");
+                    let level_m = transform_matrix(&rml.transform);
+                    for p in &rml.placements {
+                        let placement = level_m
+                            * transform_matrix(&p.transform)
+                            * Mat4::from_scale(Vec3::splat(p.scale));
+                        let sphere = p.sphere.map(|(c, r)| (Vec3::from_array(c), r));
+                        l.place(
+                            &p.model,
+                            placement,
+                            Placing {
+                                scale: p.scale,
+                                sphere,
+                                lightmaps: &p.lightmaps,
+                                room: "",
+                                room_id: None,
+                                layout_room: None,
+                                probe,
+                                morph: None,
+                                tint: None,
+                                lights_only: !level_meshes,
+                                user_params: &p.user_params,
+                                skin: None,
+                            },
+                        );
+                    }
+                }
+                Ok(Err(e)) => l.warn(format!("{level_rml}: {e}")),
+                Err(e) => l.warn(e.to_string()),
+            }
+        }
         // The sky, around the camera (its vertex shader centres it there): its dome and its
         // cloud layer.
         if level_meshes && let Some(sky) = arl.sky_model.as_deref() {
