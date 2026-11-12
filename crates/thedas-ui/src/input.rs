@@ -80,6 +80,39 @@ pub fn reply(sim: &mut Sim, n: usize) -> bool {
     false
 }
 
+/// The inventory's and the character record's gift action (the item's radial menu): the
+/// item and the party member it goes to.
+pub const GIFT_ITEM: &str = "GameModeController.GiftItem";
+
+/// An item given to a follower (`GameModeController.GiftItem`): the follower hears
+/// `EVENT_TYPE_GIFT_ITEM`, object 0 the item, from the member the player controls, as
+/// DAOrigins.exe's GiftItemMessage handler sends it (0x718210: target the message's first
+/// object, object 0 its second). The follower's scripts take the item and change the
+/// approval. Provisional: the arguments are told apart by kind (the creature and the item),
+/// since the movie's argument order is not traced.
+fn gift_item(sim: &mut Sim, args: &[String]) -> bool {
+    use thedas_sim::world::ObjectKind;
+    let ids: Vec<u32> = args
+        .iter()
+        .filter_map(|a| a.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .map(|v| v as u32)
+        .collect();
+    let of = |kind: ObjectKind| {
+        ids.iter()
+            .copied()
+            .find(|&id| sim.world.get(id).is_some_and(|o| o.kind == kind))
+    };
+    let (Some(to), Some(item)) = (of(ObjectKind::Creature), of(ObjectKind::Item)) else {
+        return false;
+    };
+    let from = sim.world.controlled().or(sim.world.hero);
+    let mut ev = sim.new_event("GIFT_ITEM", from);
+    ev.objects = vec![item];
+    sim.world.queue_event(0, to, ev, None);
+    true
+}
+
 /// The message a script message box's buttons send (DAOrigins.exe's callback format at
 /// 0xb07fd8, `GUIPopupLayer.ScriptDialogResult %d %d %d`).
 pub const SCRIPT_DIALOG_RESULT: &str = "GUIPopupLayer.ScriptDialogResult";
@@ -100,6 +133,9 @@ pub fn apply(sim: &mut Sim, name: &str, args: &[String]) -> bool {
         let answered = sim.answer_popup_with_text(button, text);
         sim.tick(0);
         return answered;
+    }
+    if name == GIFT_ITEM {
+        return gift_item(sim, args);
     }
     if name == SELECT_RESPONSE {
         let n = args
@@ -411,6 +447,34 @@ pub fn handler_for(sim: Arc<Mutex<Sim>>, shown: Arc<Mutex<Presentation>>) -> Mes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gift_goes_to_the_follower_as_gift_item() {
+        use thedas_sim::world::ObjectKind;
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        sim.world.hero = Some(hero);
+        let alistair = sim.world.spawn(ObjectKind::Creature, "alistair");
+        let item = sim.world.spawn(ObjectKind::Item, "gift");
+        // The order the movie sends them in does not matter.
+        assert!(apply(
+            &mut sim,
+            GIFT_ITEM,
+            &[item.to_string(), alistair.to_string()]
+        ));
+        let queued: Vec<_> = sim
+            .world
+            .queue
+            .values()
+            .map(|q| (q.target, q.event.objects.clone(), q.event.creator))
+            .collect();
+        assert!(queued.contains(&(alistair, vec![item], Some(hero))));
+        assert!(!apply(&mut sim, GIFT_ITEM, &[item.to_string()]));
+    }
 
     #[test]
     fn a_script_message_box_shows_and_its_button_answers_it() {
