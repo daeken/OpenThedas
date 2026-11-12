@@ -122,8 +122,22 @@ fn has_model(sim: &Sim, model: &str) -> bool {
 
 /// A creature's head morph, if the resource exists: the one it keeps (the player's face
 /// from character creation), else the one its template names (`Appearance Data` /
-/// `HeadMorph`).
+/// `HeadMorph`). Character creation's creature, before the face screen gives it a face,
+/// wears the face screen's first head for its race and gender (`hm_cps_p01`: its hair,
+/// beard and colours too); its templates (`default_player.utc`, the backgrounds'
+/// `default_hm_noble.utc` and the rest) name none. `chargen.rim` carries exactly those
+/// presets (`hm_cps_p01.mop` and the rest) and their hair and beard models for the first
+/// pages, and the original's first page shows the hero with hair. Provisional: the
+/// executable's choice of head there is not traced.
 pub fn head_morph(sim: &Sim, o: &Object) -> Option<String> {
+    let found = kept_or_template_morph(sim, o);
+    if found.is_some() || sim.world.chargen != Some(o.id) {
+        return found;
+    }
+    sim.face_screen_default(o.id)
+}
+
+fn kept_or_template_morph(sim: &Sim, o: &Object) -> Option<String> {
     // A kept face is a finished morph, or a face-screen preset (`.mop`) the renderer puts
     // on its race and gender's base face.
     if let Some(m) = o.head_morph.as_ref().filter(|m| {
@@ -698,6 +712,8 @@ struct DrawnKey {
     appearance: i32,
     gender: Option<i32>,
     head_morph: Option<String>,
+    /// Character creation's creature wears a face of its own (see [`head_morph`]).
+    in_chargen: bool,
     equipment: Vec<(i32, ObjectId, Option<i32>, Option<i32>)>,
 }
 
@@ -711,6 +727,7 @@ impl DrawnKey {
             gender: o.fields.get("Gender").copied(),
             // With the choices made over it (character creation's hair, beard, colours).
             head_morph: sim.face_name(o.id).or_else(|| o.head_morph.clone()),
+            in_chargen: sim.world.chargen == Some(o.id),
             equipment: o
                 .equipment
                 .iter()
