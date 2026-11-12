@@ -35,7 +35,7 @@ so an untraced item starts with a trace, not with a guess.
 | Area | File | Inventory items |
 | --- | --- | --- |
 | Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 169 (`SIM-`), plus ability coverage by family |
-| Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 97 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
+| Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 95 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
 | Rendering | [gaps/rendering.md](gaps/rendering.md) | 154 (`RND-`) |
 | Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 195 (`UI-`), plus the movies never opened and the values no screen gets answered |
 | Audio | [gaps/audio.md](gaps/audio.md) | 62 (`AUD-`) |
@@ -122,7 +122,6 @@ these, so they are the places where one person or stream can take a large, separ
 - **Screens ask for values nothing answers**: 220 on the HUD (quickslot cooldowns, current and
   pending actions, summons), 170 on spells and talents, 98 on skills, 42 in the inventory
   ([gaps/ui.md](gaps/ui.md)).
-- **Script message boxes are never shown**, so a scripted prompt waits forever (`UI-115`).
 - **Options are not saved**, and most video, control and game options change nothing
   (`UI-053` to `UI-066`).
 - **Keys cannot be rebound.** The key map is hard-coded (`UI-059`), and there is no WASD
@@ -165,11 +164,8 @@ Concrete defects found during the code read. Each is small and independent.
 
 | ID | What |
 | --- | --- |
-| `SCR-037` | Removing or moving a worn item skips the unequip, so its effects stay on the wearer |
 | `SCR-059` | A command pushed to the front leaves the displaced command with its old timer |
 | `SCR-074` | Comparing two effects, locations or events compares handles, so equal values differ |
-| `SCR-034` | `GetM2DAColumns` ignores the table name |
-| `SCR-030` | `FindSubString` counts bytes where the other string functions count characters |
 | `SIM-148` | The module's start position is parsed and never used |
 | `SIM-092` | Equipped-item stat modifiers ignore material while `GetItemStat` scales by it |
 | `SIM-022` | `follow_leader` lines followers up behind the hero instead of using the formation |
@@ -177,7 +173,6 @@ Concrete defects found during the code read. Each is small and independent.
 | `RND-095` | Location effects with an instant duration are discarded and never drawn |
 | `RND-139` | Compressed textures lose their smallest mip levels |
 | `UI-003` | Three interface queries are never answered |
-| `UI-006` | Unknown interface commands are dropped without a log line |
 | `UI-156` | With the free camera on, C both lowers the camera and opens the character record |
 | `FMT-009` | The `Offers/` folder is not mounted for resources, though audio reads it |
 | `FMT-008` | Every enabled DLC's module folder is mounted for every campaign |
