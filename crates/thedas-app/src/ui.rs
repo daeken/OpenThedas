@@ -180,6 +180,8 @@ pub struct UiLayer {
     /// it has waited for its values to reach the popup layer (see
     /// [`UiLayer::show_script_popup`]).
     script_popup: Option<((i32, i32, u32), u8)>,
+    /// A party portrait was clicked (see [`UiLayer::mouse_button`]).
+    portrait_clicked: Option<u32>,
     /// The large notification whose splash has been dealt with (see
     /// [`UiLayer::uber_alert_splash`]).
     uber_splash: Option<String>,
@@ -462,6 +464,7 @@ impl UiLayer {
             tooltip_text: None,
             tooltip_relayout: 0,
             script_popup: None,
+            portrait_clicked: None,
             uber_splash: None,
             loading: None,
             travel_map: false,
@@ -1175,6 +1178,7 @@ impl UiLayer {
         }
         self.show_cutscene_line(sim);
         self.show_script_popup(sim);
+        self.select_clicked_portrait(sim);
         self.uber_alert_splash(sim);
         self.loading_frame(dt_ms);
         self.travel_map_frame();
@@ -2035,6 +2039,31 @@ impl UiLayer {
 
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
         self.stage.mouse_button(x, y, down);
+        // A click on a party portrait: portraits.gfx only says which member the mouse is
+        // over (`GameModeExplore.GUITargetedPlayer`, set on roll-over and cleared on
+        // roll-out; its own click handler is empty), and the game selects them.
+        if !down
+            && let Some(thedas_ui::UiValue::Number(id)) =
+                self.stage.bridge.value("GameModeExplore.GUITargetedPlayer")
+            && id > 0.0
+        {
+            self.portrait_clicked = Some(id as u32);
+        }
+    }
+
+    /// The party member whose portrait was clicked becomes the one the player controls, as
+    /// a click on them in the world does. Provisional: the exe's handling of
+    /// `GUITargetedPlayer` is not traced (it may also take the portrait as an ability's
+    /// target).
+    fn select_clicked_portrait(&mut self, sim: &Arc<Mutex<Sim>>) {
+        let Some(id) = self.portrait_clicked.take() else {
+            return;
+        };
+        let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+        if thedas_sim::engine::party_of(&sim).contains(&id) {
+            sim.set_controlled(Some(id));
+            sim.training_event("FOLLOWER_SELECTED", 0);
+        }
     }
 
     /// A click the movies see as Scaleform mouse `button` (a right click, a double click).
