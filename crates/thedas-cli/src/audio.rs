@@ -142,7 +142,12 @@ pub fn check(install: &Path, language: &str) -> Result<()> {
     let (mut areas, mut themes, mut placed) = (0usize, 0usize, 0usize);
     let presets: Vec<String> = lib
         .project("master_reverb")
-        .map(|p| p.reverbs.iter().map(|r| r.name.to_ascii_lowercase()).collect())
+        .map(|p| {
+            p.reverbs
+                .iter()
+                .map(|r| r.name.to_ascii_lowercase())
+                .collect()
+        })
         .unwrap_or_default();
     let preset_ok = |n: &str| {
         let n = n.trim().to_ascii_lowercase();
