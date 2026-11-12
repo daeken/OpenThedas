@@ -257,6 +257,57 @@ impl TreeMesh {
         }
     }
 
+    /// A 64-bit FNV-1a hash of every output value (vertices, triangle lists, leaf cards,
+    /// billboard), bit for bit, to pin generator output in regression checks. Float functions
+    /// (`sin`, `cos`, `acos`, `powf`) come from the platform's math library, so a hash is only
+    /// comparable on the same platform.
+    pub fn fingerprint(&self) -> u64 {
+        let mut h = Fnv::new();
+        for part in [&self.branches, &self.fronds] {
+            h.word(part.vertices.len() as u32);
+            for v in &part.vertices {
+                for x in v
+                    .position
+                    .iter()
+                    .chain(&v.normal)
+                    .chain(&v.tangent)
+                    .chain(&v.binormal)
+                {
+                    h.float(*x);
+                }
+                for x in v.uv.iter().chain(&v.uv_detail) {
+                    h.float(*x);
+                }
+                h.float(v.fade);
+            }
+            for list in &part.lods {
+                h.word(list.len() as u32);
+                list.iter().for_each(|&i| h.word(i));
+            }
+        }
+        for level in &self.leaves {
+            h.word(level.len() as u32);
+            for c in level {
+                c.position.iter().for_each(|&x| h.float(x));
+                h.word(c.choice as u32);
+                h.word(c.group as u32);
+                c.corners.iter().flatten().for_each(|&x| h.float(x));
+                c.uv.iter().flatten().for_each(|&x| h.float(x));
+                c.normals.iter().flatten().for_each(|&x| h.float(x));
+                c.colors.iter().flatten().for_each(|&x| h.float(x));
+                h.float(c.color_scale);
+                c.angle_offsets.iter().for_each(|&x| h.float(x));
+            }
+        }
+        if let Some(b) = self.billboard {
+            h.float(b.width);
+            h.float(b.height);
+            b.uv.iter().flatten().for_each(|&x| h.float(x));
+        }
+        self.rocking_offsets.iter().for_each(|&x| h.float(x));
+        h.0
+    }
+
     /// The LOD value at a camera distance (7.3): 1 near, 0 far.
     pub fn lod_value(&self, distance: f32) -> f32 {
         let span = self.far - self.near;
@@ -264,6 +315,26 @@ impl TreeMesh {
             return if distance <= self.near { 1.0 } else { 0.0 };
         }
         (1.0 - (distance - self.near) / span).clamp(0.0, 1.0)
+    }
+}
+
+/// 64-bit FNV-1a.
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Self {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn word(&mut self, w: u32) {
+        for byte in w.to_le_bytes() {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn float(&mut self, x: f32) {
+        self.word(x.to_bits());
     }
 }
 
@@ -414,6 +485,48 @@ mod tests {
         assert!(b.width >= hi[0] - lo[0] && b.width > 0.0);
         assert_eq!(b.uv[0], [1.0, 0.0]);
     }
+
+    #[test]
+    fn the_fingerprint_is_stable_and_sensitive() {
+        let t = leafy_trunk();
+        let a = TreeMesh::new(&t).fingerprint();
+        assert_eq!(a, TreeMesh::new(&t).fingerprint());
+        let mut other = t.clone();
+        other.tree.seed += 1;
+        assert_ne!(a, TreeMesh::new(&other).fingerprint());
+    }
+
+    /// Pinned output of representative game files (tree, pine, fern, bushes, grass,
+    /// cattail), so changes to the generator are deliberate. Needs the game's `.spt` files
+    /// extracted into `$THEDAS_SPT_DIR`; hashes are for macOS on Apple silicon (the platform
+    /// math library feeds them). Update a hash only for an intended change, and say why in
+    /// the commit.
+    #[test]
+    #[ignore = "needs game files: set THEDAS_SPT_DIR and run with --ignored"]
+    fn game_trees_match_their_pinned_output() {
+        let dir = std::env::var("THEDAS_SPT_DIR").expect("THEDAS_SPT_DIR");
+        let mut failures = Vec::new();
+        for (name, pinned) in PINNED {
+            let path = std::path::Path::new(&dir).join(name);
+            let data = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let tree = crate::speedtree::parse(&data).expect(name);
+            let hash = TreeMesh::new(&tree).fingerprint();
+            if hash != *pinned {
+                failures.push(format!("(\"{name}\", 0x{hash:016x}),"));
+            }
+        }
+        assert!(failures.is_empty(), "changed:\n{}", failures.join("\n"));
+    }
+
+    const PINNED: &[(&str, u64)] = &[
+        ("brc999d_tre_c_oak.spt", 0x5c0235946e508d4a),
+        ("ost000c_tre_m_pinesm.spt", 0x2231750e348ef4ae),
+        ("brc000d_bsh_f_fern.spt", 0xccb4645f1b8da987),
+        ("lgt600d_bsh_c_boxwd.spt", 0x09ba63d253f5da55),
+        ("lgt602d_gra_c_gtall1.spt", 0x6a82465580d53140),
+        ("brc504d_bsh_f_catgras.spt", 0x77ac710c8dada21f),
+        ("brc100d_bsh_f_catflwr.spt", 0x7f04d9ad8d30f8d8),
+    ];
 
     #[test]
     fn lod_levels_follow_distance() {

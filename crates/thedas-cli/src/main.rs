@@ -6,6 +6,7 @@ mod corpus;
 mod dump;
 mod script;
 mod sim;
+mod tree;
 
 use std::path::{Path, PathBuf};
 
@@ -170,6 +171,25 @@ enum Command {
         save_to: Option<PathBuf>,
     },
     /// Summarise a layout's pathing grid and optionally write it as a PGM image.
+    /// Compute a SpeedTree (`.spt`, a file or `archive.rim:entry.spt`) with the clean-room
+    /// generator: print its statistics, and optionally export it as OBJ or render side and top
+    /// views to PNG (flat-shaded, untextured).
+    Tree {
+        target: String,
+        /// LOD level to export or render (0 is the fullest).
+        #[arg(long, default_value_t = 0)]
+        lod: usize,
+        #[arg(long)]
+        obj: Option<PathBuf>,
+        #[arg(long)]
+        png: Option<PathBuf>,
+        /// Height of each view in the PNG, in pixels.
+        #[arg(long, default_value_t = 512)]
+        size: u32,
+        /// Placement scale for the reported height in metres (RML 3356 is about 0.28-0.34).
+        #[arg(long, default_value_t = 0.31)]
+        scale: f32,
+    },
     Navgrid {
         install: PathBuf,
         /// Layout name (`hrt201n`) or area resource (`bhn200ar_castle_after_siege`).
@@ -438,6 +458,14 @@ fn run() -> Result<()> {
             coverage_to: coverage.as_deref(),
             save_to: save_to.as_deref(),
         }),
+        Command::Tree {
+            target,
+            lod,
+            obj,
+            png,
+            size,
+            scale,
+        } => tree::run(&target, lod, obj.as_deref(), png.as_deref(), size, scale),
         Command::Navgrid {
             install,
             layout,
