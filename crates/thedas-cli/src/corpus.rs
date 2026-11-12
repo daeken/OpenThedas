@@ -597,7 +597,7 @@ fn check_data(
                 let _ = tracks.camera_at(
                     at,
                     thedas_sim::cuttracks::Placement::NONE,
-                    &|_: &str, _: bool| None,
+                    &thedas_sim::cuttracks::Finders::NONE,
                 );
             }
             thedas_sim::cutscene::Cutscene::from_gff4(&doc, "")

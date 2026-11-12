@@ -18,6 +18,18 @@ use thedas_vfs::{DaoInstall, Vfs};
 /// (a level loading) does not leap the world ahead.
 pub const MAX_STEP_MS: f64 = 100.0;
 
+/// Where drawn object `id` is in the world as last placed (see
+/// [`crate::cutactors::DrawnRoots`]): its placement's position and rotation.
+fn drawn_root(
+    posed: &[(ObjectId, Mat4, Option<Clip>)],
+    id: ObjectId,
+) -> Option<([f32; 3], [f32; 4])> {
+    let (_, transform, _) = posed.iter().find(|p| p.0 == id)?;
+    let (_, r, t) = transform.to_scale_rotation_translation();
+    let r = r.normalize();
+    (t.is_finite() && r.is_finite()).then(|| (t.to_array(), r.to_array()))
+}
+
 /// What the objects' scene was built for: each object's models. A change rebuilds it.
 type ObjectsKey = Vec<(u32, Vec<String>)>;
 
@@ -939,7 +951,9 @@ impl Live {
         base: &thedas_render::Camera,
     ) -> Option<thedas_render::Camera> {
         let sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
-        self.cutscene_camera.camera(&sim, base)
+        let posed = &self.posed;
+        self.cutscene_camera
+            .camera(&sim, base, &|id| drawn_root(posed, id))
     }
 
     /// The camera character creation's stage is seen through, while it is up (see
@@ -1145,7 +1159,11 @@ impl Live {
         // A cutscene playing, or a conversation line's own, poses its actors' creatures
         // and shows its own.
         let tracks = self.cutscene_camera.tracks(&sim);
-        let shown = self.cut_actors.shown(&sim, tracks);
+        // Linked actors follow the objects as last placed.
+        let posed = &self.posed;
+        let shown = self
+            .cut_actors
+            .shown(&sim, tracks, &|id| drawn_root(posed, id));
         let mut posing = shown.actors;
         for (m, show) in shown.own {
             posing.insert(m.id, show);
