@@ -679,6 +679,23 @@ impl GameAudio {
             return;
         }
         let strref = lines[(self.random() % lines.len() as u64) as usize];
+        // Creature sets (`ss_wolf`) have an event per line, `<set>/VO/<strref>_m` (in
+        // `CRambient_ss`), that picks among the line's variants; voiced sets only have the
+        // samples, played through `VOambient_ss`.
+        for g in ["m", "f"] {
+            let event = format!("{key}/VO/{strref}_{g}");
+            let project = self.engine.library.project(&key);
+            if project.is_some_and(|p| p.event(&event).is_some()) {
+                self.engine.play(
+                    &event,
+                    PlayOptions {
+                        position: at,
+                        ..Default::default()
+                    },
+                );
+                return;
+            }
+        }
         let lib = self.engine.library.clone();
         let sample = [format!("{strref}_m"), format!("{strref}_f")]
             .into_iter()
