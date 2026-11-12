@@ -138,8 +138,7 @@ these, so they are the places where one person or stream can take a large, separ
 - **Event detail.** Only volume envelopes are applied; pitch, pan and reverb-level envelopes,
   layer effects and random pitch and volume are ignored, so repeated sounds are identical
   (`AUD-001` to `AUD-004`).
-- **Music.** No streaming, and music changes at once where the original waits for a marker;
-  `PlayMusic` is dropped (`AUD-026`, `AUD-030` to `AUD-032`).
+- **Music.** No streaming, and `PlayMusic` is dropped (`AUD-026`, `AUD-032`).
 - **Reverb.** The secondary reverb instances are not modelled.
 
 ### Platform, formats and project
@@ -178,7 +177,7 @@ Concrete defects found during the code read. Each is small and independent.
 | `CAM-045` | The default save folder falls back to the working directory when `HOME` is unset |
 
 Several stale comments and README sections were also found; they are listed in the area files
-(`SIM-004`, `SIM-029`, `SIM-147`, `UI-068`, `UI-145`, `CAM-036`, `AUD-061`, `TOOL-001` to
+(`SIM-004`, `SIM-029`, `SIM-147`, `UI-068`, `UI-145`, `CAM-036`, `TOOL-001` to
 `TOOL-003`).
 
 ## What this list cannot see yet

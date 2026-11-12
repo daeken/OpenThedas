@@ -95,6 +95,8 @@ struct Slot {
     /// Played its one shot (oneshot instances) or cannot play.
     finished: bool,
     started: bool,
+    /// The sample it last picked (bank, index).
+    sample: Option<(String, usize)>,
 }
 
 struct Instance {
@@ -396,6 +398,7 @@ impl AudioEngine {
                     next_spawn: None,
                     finished: false,
                     started: false,
+                    sample: None,
                 })
                 .collect(),
             fade: if fade_in > 0.0 { 0.0 } else { 1.0 },
@@ -441,6 +444,26 @@ impl AudioEngine {
             .iter()
             .find(|r| r.name.eq_ignore_ascii_case(name))
             .and_then(|r| r.properties())
+    }
+
+    /// Where a playing event is in its (first playing) sample, and that sample's sync points
+    /// (music markers), in seconds; `None` until a voice plays.
+    pub fn position(&self, handle: EventHandle) -> Option<(f64, Vec<f64>)> {
+        let inst = self.instances.iter().find(|i| i.handle == handle)?;
+        let mixer = self.mixer.lock().ok()?;
+        for slot in &inst.slots {
+            for v in &slot.voices {
+                if let Some(at) = mixer.position(*v) {
+                    let markers = slot
+                        .sample
+                        .as_ref()
+                        .map(|(b, i)| self.library.sync_points(b, *i))
+                        .unwrap_or_default();
+                    return Some((at, markers));
+                }
+            }
+        }
+        None
     }
 
     /// Stop an event: faded over its fade-out time, or at once.
@@ -606,6 +629,7 @@ impl AudioEngine {
             slot.finished = true;
             return;
         };
+        slot.sample = Some((bank.clone(), index));
         // A lone looping waveform loops in the mixer; several play one after another.
         let looping = loops && single && !spawning;
         slot.pending += 1;
