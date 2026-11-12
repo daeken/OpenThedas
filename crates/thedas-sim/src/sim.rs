@@ -361,6 +361,11 @@ const MELEE_TALENT_TOLERANCE: f32 = 1.0;
 /// start step (0x7a87c0) tests the two creatures' current positions (0x6a3dc0); the
 /// simulation has no frames, so it looks this often. Provisional.
 const APPROACH_CHECK_MS: u64 = 100;
+/// How long after a script asks for an area transition it happens (milliseconds): one
+/// 30 fps update, as DAOrigins.exe switches modes at the start of the next client update
+/// (0x641d30). Provisional: the update length is the app's frame, not traced.
+pub const TRANSITION_DELAY_MS: u64 = 33;
+
 /// How far above or below the pathing grid's floor a creature placed in an area may stand
 /// and still be put on it (metres; see `Sim::spawn_instance`). Provisional.
 const SPAWN_SNAP_RANGE: f32 = 2.0;
@@ -875,8 +880,19 @@ impl Sim {
         let mut held = 0;
         loop {
             // Engine work that waits for the current scripts: transitions, then cutscenes.
-            if let Some((area, waypoint)) = self.world.transition.take() {
-                self.area_transition(&area, &waypoint);
+            // A script's transition happens at the start of the next update, as
+            // DAOrigins.exe queues the mode switch for the next client update (0x641d30), so
+            // the loading screen is up before the old area goes (see `TRANSITION_DELAY_MS`).
+            if self.world.transition.is_some()
+                && self
+                    .world
+                    .transition_at
+                    .is_none_or(|at| at <= self.world.time_ms)
+            {
+                if let Some((area, waypoint)) = self.world.transition.take() {
+                    self.world.transition_at = None;
+                    self.area_transition(&area, &waypoint);
+                }
                 continue;
             }
             // One cutscene at a time: the next waits for the one playing.
@@ -926,6 +942,15 @@ impl Sim {
             // first on a tie. Both run at their own time, so delays chain correctly.
             let event = self.world.queue.keys().next().map(|k| k.0);
             let command = self.next_command();
+            // A pending transition comes before anything else due at or after its time.
+            if let (Some(_), Some(at)) = (&self.world.transition, self.world.transition_at) {
+                let first = event.into_iter().chain(command.map(|c| c.0)).min();
+                if at <= until && first.is_none_or(|f| at <= f) {
+                    self.world.time_ms = self.world.time_ms.max(at);
+                    self.advance_movers();
+                    continue;
+                }
+            }
             // Walkers closing in on a creature look again every so often: the target may
             // have come into reach, or moved away from where they are heading.
             if let Some(w) = self.approach_check_due() {
@@ -1271,6 +1296,22 @@ impl Sim {
         };
         ev.ints = vec![front as i32];
         ev
+    }
+
+    /// Runs the world on until a script's pending area transition has happened (at most a
+    /// few updates): for tools that act and then read the world at once, where the game
+    /// would have drawn a frame or two in between.
+    pub fn settle_transition(&mut self) {
+        for _ in 0..4 {
+            if self.world.transition.is_none() {
+                return;
+            }
+            let wait = self
+                .world
+                .transition_at
+                .map_or(0, |at| at.saturating_sub(self.world.time_ms));
+            self.tick(wait.max(1));
+        }
     }
 
     pub fn answer_popup(&mut self, button: i32) -> bool {
@@ -4450,6 +4491,19 @@ mod tests {
         assert_eq!(s.world.area, Some(area));
         assert!(s.world.get(thing).unwrap().active);
         assert!(s.world.transition.is_none());
+    }
+
+    #[test]
+    fn a_scripted_transition_waits_for_the_next_update() {
+        let mut s = sim();
+        let t0 = s.world.time_ms;
+        s.world.transition = Some(("nowhere".into(), "".into()));
+        s.world.transition_at = Some(t0 + TRANSITION_DELAY_MS);
+        s.tick(TRANSITION_DELAY_MS - 1);
+        assert!(s.world.transition.is_some(), "still pending this update");
+        s.tick(1);
+        assert!(s.world.transition.is_none());
+        assert!(s.world.transition_at.is_none());
     }
 
     #[test]
