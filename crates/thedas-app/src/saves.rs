@@ -163,6 +163,7 @@ mod tests {
             area: "Lothering".into(),
             time_ms: 125_000,
             written,
+            ..Default::default()
         };
         store.write(1, b"one", &meta("first", 100)).unwrap();
         store.write(2, b"two", &meta("second", 200)).unwrap();

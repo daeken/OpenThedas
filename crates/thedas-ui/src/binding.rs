@@ -2130,6 +2130,7 @@ mod tests {
                 area: "Ostagar".into(),
                 time_played_s: 3725,
                 last_played: "2026-11-11 10:00".into(),
+                ..Default::default()
             }],
             save_mode: 2,
             open_slot: 4,
