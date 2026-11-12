@@ -729,6 +729,7 @@ impl Sim {
         self.world
             .location_vfx
             .retain(|v| v.duration_ms.is_none_or(|d| v.started_ms + d > end));
+        self.leave_conversation_mode();
         self.update_perception();
         self.keep_party_together();
         let mut held = 0;
@@ -2564,9 +2565,17 @@ impl Sim {
         } else if cmd.name == "CommandUseAbility" && !cmd.impacted {
             self.finish_ability(id, &cmd);
         } else if cmd.name == "CommandStartConversation" {
-            // A conversation ordered by the player (see `Sim::order_talk`).
-            if let Some(t) = cmd.target.filter(|&t| self.world.get(t).is_some()) {
-                self.start_conversation(id, t, "");
+            // DAOrigins.exe's executor (0x7a3700) sends the target EVENT_TYPE_DIALOGUE (18),
+            // its creator the one talking and its resource the conversation, unless the target
+            // is dead; rules_core answers it with UT_Talk, which begins the conversation.
+            let target = cmd
+                .target
+                .filter(|&t| self.world.get(t).is_some_and(|o| !o.dead));
+            if let Some(t) = target {
+                let mut ev = self.new_event("DIALOGUE", Some(id));
+                ev.resources = vec![cmd.strings.first().cloned().unwrap_or_default()];
+                ev.objects = vec![id];
+                self.world.queue_event(0, t, ev, None);
             }
         } else if cmd.name == "CommandSwitchWeaponSet" {
             // The command's executor (DAOrigins.exe 0x7a1ed0) switches the set (0x6a8fa0)

@@ -544,8 +544,61 @@ impl Sim {
         if let Some(mut old) = self.talk.take() {
             self.end_line_staging(&mut old);
         }
+        let live = !c.ended;
         self.talk = Some(c);
+        if live {
+            self.enter_conversation_mode();
+        }
         true
+    }
+
+    /// The conversation takes the game (DAOrigins.exe 0x697765: `SetGameMode(4)`, which the
+    /// mode controller grants at once even over combat, 0x640c60): the module hears
+    /// GAMEMODE_CHANGE (GM_CONVERSATION, the old mode), on which module_core takes the party out
+    /// of combat. Provisional: the mode the game returns to afterwards (the one replaced, or
+    /// one a script asked for meanwhile) is not traced.
+    fn enter_conversation_mode(&mut self) {
+        let Some(talk_mode) = self
+            .table
+            .constant("GM_CONVERSATION")
+            .and_then(|c| match &c.value {
+                thedas_script::ldf::ConstValue::Int(v) => Some(*v as i32),
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let old = self.world.game_mode;
+        if old == talk_mode {
+            return;
+        }
+        self.world.mode_before_talk = Some(old);
+        self.world.game_mode = talk_mode;
+        if let Some(m) = self.world.module {
+            let mut ev = self.new_event("GAMEMODE_CHANGE", Some(m));
+            ev.ints = vec![talk_mode, old];
+            self.world.queue_event(0, m, ev, None);
+        }
+    }
+
+    /// Once no conversation is going on, the game goes back to the mode the conversation
+    /// replaced (or one a script asked for meanwhile), and the module hears it.
+    pub(crate) fn leave_conversation_mode(&mut self) {
+        let Some(before) = self.world.mode_before_talk else {
+            return;
+        };
+        if self.talk.as_ref().is_some_and(|c| !c.ended) {
+            return;
+        }
+        let next = self.world.mode_after_talk.take().unwrap_or(before);
+        self.world.mode_before_talk = None;
+        let old = self.world.game_mode;
+        self.world.game_mode = next;
+        if let Some(m) = self.world.module {
+            let mut ev = self.new_event("GAMEMODE_CHANGE", Some(m));
+            ev.ints = vec![next, old];
+            self.world.queue_event(0, m, ev, None);
+        }
     }
 
     /// Plays an ambient conversation to its end, taking the first reply each time and

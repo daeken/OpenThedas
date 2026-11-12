@@ -1528,6 +1528,12 @@ pub fn call(
         // --- Game state -------------------------------------------------------------------
         "GetGameMode" => ok(Value::Int(h.sim.world.game_mode)),
         "SetGameMode" => {
+            // While a conversation holds the game, other modes wait for it to end
+            // (DAOrigins.exe's mode controller keeps them pending, 0x640c60).
+            if h.sim.world.mode_before_talk.is_some() && int(a, 0) != h.sim.world.game_mode {
+                h.sim.world.mode_after_talk = Some(int(a, 0));
+                return void();
+            }
             let old = h.sim.world.game_mode;
             h.sim.world.game_mode = int(a, 0);
             if let Some(m) = h.sim.world.module {
@@ -2184,11 +2190,6 @@ pub fn call(
                 command: c.name.clone(),
                 status: "queued".into(),
             });
-            if c.name == "CommandStartConversation" {
-                let other = c.target.unwrap_or(OBJECT_INVALID);
-                let dlg = c.strings.first().cloned().unwrap_or_default();
-                h.sim.start_conversation(target, other, &dlg);
-            }
             match h.sim.world.get_mut(target) {
                 Some(o) => {
                     if front {
@@ -2824,10 +2825,20 @@ pub fn call(
             h.sim.start_chargen(obj(a, 0), int(a, 1), int(a, 2));
             void()
         }
+        // DAOrigins.exe (0x65d9a0 -> 0x6976b0): a target that is the owner itself means the
+        // hero; the owner must be an active, living creature. Nothing here looks at the game
+        // mode: a conversation may start in combat (and replaces it, see
+        // `Sim::start_conversation`).
         "BeginConversation" => {
-            let ok_ = h
-                .sim
-                .start_conversation(obj(a, 0), obj(a, 1), &string(a, 2));
+            let owner = obj(a, 1);
+            let mut target = obj(a, 0);
+            if target == owner {
+                target = h.sim.world.hero.unwrap_or(target);
+            }
+            let can = h
+                .object(owner)
+                .is_some_and(|o| o.kind == ObjectKind::Creature && o.active && !o.dead);
+            let ok_ = can && h.sim.start_conversation(target, owner, &string(a, 2));
             ok(b(ok_))
         }
 
@@ -5858,7 +5869,8 @@ mod coverage_tests {
         void SetMusicIntensity(int n) = 110;\n\
         void Engine_ApplyEffectAtLocation(int d, effect e, location l, float f = 0.0, object c = OBJECT_INVALID, int n = 0) = 111;\n\
         effect[] GetEffects(object o, int t = 0, int a = 0, object c = OBJECT_INVALID, int d = 0, int i = -1) = 112;\n\
-        void RemoveEffect(object o, effect e) = 113;\n";
+        void RemoveEffect(object o, effect e) = 113;\n\
+        void SetGameMode(int n) = 114;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -5948,6 +5960,35 @@ mod coverage_tests {
             &[Value::Object(area), found[0].clone()],
         );
         assert!(s.world.location_vfx.is_empty());
+    }
+
+    #[test]
+    fn a_mode_asked_for_during_a_conversation_waits_for_its_end() {
+        let mut s = sim();
+        let module = s.world.spawn(ObjectKind::Module, "m");
+        s.world.module = Some(module);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        // A conversation holds the game (mode 4), having replaced exploring (0).
+        s.world.game_mode = 4;
+        s.world.mode_before_talk = Some(0);
+        run(&mut s, hero, "SetGameMode", &[Value::Int(1)]);
+        assert_eq!(s.world.game_mode, 4, "combat waits");
+        assert_eq!(s.world.mode_after_talk, Some(1));
+        // No conversation is going on any more: the waiting mode comes in.
+        s.tick(10);
+        assert_eq!(s.world.game_mode, 1);
+        assert_eq!(s.world.mode_before_talk, None);
+        let changes: Vec<Vec<i32>> = s
+            .world
+            .queue
+            .values()
+            .filter(|q| q.target == module)
+            .map(|q| q.event.ints.clone())
+            .collect();
+        assert!(
+            changes.is_empty() || changes.contains(&vec![1, 4]),
+            "{changes:?}"
+        );
     }
 
     #[test]
