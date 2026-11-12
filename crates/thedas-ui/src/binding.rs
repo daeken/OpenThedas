@@ -1196,6 +1196,12 @@ fn quickbar(sim: &Sim, who: u32, v: &mut BTreeMap<String, UiValue>) {
         };
         v.insert(format!("{k}.ItemIcon"), UiValue::String(icon));
         v.insert(format!("{k}.SourceItem.ID"), num(item.unwrap_or(0)));
+        // An item's slot is named after the item in its tooltip (`SourceItemName`, which the
+        // ability icon reads when the slot has a source item; unanswered, it read "null").
+        v.insert(
+            format!("{k}.SourceItemName"),
+            UiValue::String(item.map(|i| sim.display_name(i)).unwrap_or_default()),
+        );
         v.insert(
             format!("{k}.SourceItemTag"),
             UiValue::String(q.item.clone()),
