@@ -35,7 +35,8 @@
 //! would place the cutscene at the world's origin); a creature put at its end pose is set
 //! on the pathing grid's floor there when its actor snaps to the walkmesh (kind 38) - the
 //! end placement (0x695540) does not itself snap, and what the creature's own position
-//! handler (vtable +0x7c) does is not traced.
+//! handler (vtable +0x7c) does is not traced. Like `SetPosition` here, the move tells no
+//! trigger (a creature put inside or outside one is noticed when it next moves).
 
 use std::sync::Arc;
 
@@ -277,9 +278,22 @@ impl Sim {
                     at[2] = z;
                 }
             }
-            if let Some(o) = self.world.get_mut(b.object) {
+            let moved = self.world.get_mut(b.object).is_some_and(|o| {
+                let moved = o.position != at || o.facing != facing;
                 o.position = at;
                 o.facing = facing;
+                moved
+            });
+            if moved {
+                let t = self.world.time_ms;
+                self.world.trace.push(crate::trace::TraceEntry::Log {
+                    t,
+                    channel: -1,
+                    text: format!(
+                        "cutscene leaves {} at [{:.2}, {:.2}, {:.2}] facing {:.1}",
+                        b.object, at[0], at[1], at[2], facing
+                    ),
+                });
             }
         }
     }
