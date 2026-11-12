@@ -542,6 +542,16 @@ fn check_data(
                 .map(|_| ())
                 .ok_or_else(|| format!("not a conversation (file type {})", doc.file_type)),
         ),
+        (_, "cut") => Some({
+            // Every cutscene's tracks read, and the camera placed at each cut.
+            let tracks = thedas_sim::cuttracks::Tracks::from_gff4(&doc);
+            for &(at, _) in &tracks.cuts {
+                let _ = tracks.camera_at(at);
+            }
+            thedas_sim::cutscene::Cutscene::from_gff4(&doc, "")
+                .map(|_| ())
+                .ok_or_else(|| format!("not a cutscene (file type {})", doc.file_type))
+        }),
         (_, "plo") => Some(if &doc.file_type.0 == b"PLTS" {
             let _ = thedas_sim::plot::plots_from_gff4(&doc, "");
             Ok(())
