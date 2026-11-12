@@ -976,6 +976,32 @@ fn journal(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
             Err(_) => s(""),
         },
     );
+    // The quest the journal opens on when no notification picked one: the active quest, else
+    // the one with the latest entry (`active` is latest first), its group expanded.
+    // Provisional: the exe keeps the player's last selection here (GUIJournal.LastSelected*);
+    // it is not kept yet, and the latest entry stands in for it.
+    let opened = j
+        .active_quest
+        .as_deref()
+        .and_then(|r| j.active.iter().find(|q| q.resref == r))
+        .or_else(|| j.active.first());
+    v.insert(
+        "GUIJournal.LastSelectedQuest".into(),
+        s(opened.map_or("", |q| q.resref.as_str())),
+    );
+    v.insert(
+        "GUIJournal.LastSelectedQuestGroup".into(),
+        s(opened.map_or("", |q| q.group.as_str())),
+    );
+    let done = j.completed.first();
+    v.insert(
+        "GUIJournal.LastSelectedCompletedQuest".into(),
+        s(done.map_or("", |q| q.resref.as_str())),
+    );
+    v.insert(
+        "GUIJournal.LastSelectedCompletedQuestGroup".into(),
+        s(done.map_or("", |q| q.group.as_str())),
+    );
     v.insert("GUIJournal.NotificationContentID".into(), s(""));
     v.insert("GUIJournal.NotificationOpenPRCTab".into(), num(0));
     v.insert("Journal.CodexUpdated".into(), num(j.codex_updated as u8));
