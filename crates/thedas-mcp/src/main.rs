@@ -1262,6 +1262,28 @@ impl Server {
     }
 
     #[tool(
+        description = "Spend the unspent attribute, skill and talent points of the creature in character generation (after load with chargen=manual, before CHARGEN_END) as the level-up's auto option does: through CHARGEN_ASSIGN_ATTRIBUTES and CHARGEN_ASSIGN_ABILITIES events, by its class's level-up table. Provisional: stands in for the creation screens' own choices. Returns the points left (34 attribute, 35 skill, 36 talent)."
+    )]
+    async fn chargen_auto(&self) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            let who = sim
+                .world
+                .chargen
+                .ok_or("no character generation in progress")?;
+            sim.auto_level(who);
+            sim.tick(0);
+            let o = sim.world.get(who).ok_or("gone")?;
+            let prop = |p: i32| o.properties.get(&p).map(|v| v.0.max(v.1)).unwrap_or(0.0);
+            Ok(json!({
+                "object": who,
+                "points": { "attribute": prop(34), "skill": prop(35), "talent": prop(36) },
+                "abilities": o.abilities,
+            }))
+        })
+    }
+
+    #[tool(
         description = "Choose a face, as character creation's face screen does: a head preset 1-4 for the creature's race and gender, or a head morph resource. The creature keeps it (and saves it); the hero when no object is given."
     )]
     async fn set_head_morph(&self, Parameters(a): Parameters<HeadMorphArgs>) -> String {
