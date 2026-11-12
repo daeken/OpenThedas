@@ -665,6 +665,14 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     );
     v.insert("Tutorials.Enabled".into(), num(0));
     v.insert("Tutorials.TrainingStep".into(), num(0));
+    // The tutorials' screen highlights (DAConstants `GUI_HIGHLIGHT_*`: 0 follower, 1
+    // tactics, 2 inventory, 3 health poultice, 4 empty quickbar, 5 tactic preset, 6
+    // equipment slot, 7 unequipped item) are all off: no tutorial asks for one. A movie
+    // hearing nothing leaves its glow on (the portraits' halo, the quickbar's).
+    for i in 0..8 {
+        v.insert(format!("GUI.GuiHighlights.{i}"), num(i));
+        v.insert(format!("GUI.GuiHighlights.{i}.Highlight"), num(0));
+    }
     if let Some(who) = controlled.or(hero) {
         tactics(sim, who, &mut v);
     }
