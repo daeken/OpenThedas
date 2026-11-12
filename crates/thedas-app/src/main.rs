@@ -1115,7 +1115,14 @@ impl App {
         let Some(a) = self.audio.as_mut() else {
             return;
         };
-        let mut state = audio::AudioState::default();
+        let mut state = audio::AudioState {
+            movie: self
+                .intro
+                .as_ref()
+                .and_then(|i| i.now_playing())
+                .map(|(p, ms)| (p.to_path_buf(), ms)),
+            ..Default::default()
+        };
         if let Some(g) = self.gfx.as_mut() {
             state.gui_sounds = g.ui.stage.bridge.drain_sounds();
             state.volumes = audio::volumes(|n| g.ui.client_option(n));
