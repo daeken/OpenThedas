@@ -36,6 +36,8 @@ pub const BODY_BAG_FIELD: &str = "BodyBag";
 
 /// `BITM_base.gda`'s `Money - Copper`.
 const BASE_ITEM_COPPER: i32 = 17;
+/// `Crafting Recipe` in `bitm_base`.
+const BASE_ITEM_RECIPE: i32 = 108;
 /// `BITM_base.gda`'s `StackSize` column (its hash).
 const BITM_STACK_SIZE: u32 = 0x3997_4122;
 /// The item fields two stacks must agree on (0x755a70; MaterialType, AbilityID, Damaged,
@@ -620,6 +622,12 @@ impl Sim {
         landed
     }
 
+    /// A recipe (base item 108, `Crafting Recipe`) the party receives is learned, its
+    /// `CraftingRecipeID` added to the known recipes, and the item is gone, as the exe's
+    /// inventory add does (0x740a58: an item of base type 0x6c adds its recipe id, item
+    /// +0x670, to the inventory's recipe list (0x7408b0, the console's `AddRecipe`) and
+    /// deletes the item). Provisional: "the party" is taken to be the hero and followers.
+    ///
     /// Coin (base item 17, `Money - Copper`) the hero receives is counted into the hero's
     /// money and the item is gone, as DAOrigins.exe's inventory add does (0x7409fa: an item
     /// of base type 0x11 added to the player's inventory adds its stack size to the money
@@ -635,6 +643,9 @@ impl Sim {
         let coin = (it.fields.get("BaseItem") == Some(&BASE_ITEM_COPPER)
             && Some(to) == self.world.hero)
             .then(|| it.fields.get("StackSize").copied().unwrap_or(1).max(1));
+        let recipe = (it.fields.get("BaseItem") == Some(&BASE_ITEM_RECIPE))
+            .then(|| it.fields.get("CraftingRecipeID").copied().unwrap_or(0))
+            .filter(|_| self.in_party(to));
         let from = self
             .world
             .objects
@@ -645,6 +656,14 @@ impl Sim {
             f.inventory.retain(|&i| i != item);
             f.equipment.retain(|_, i| *i != item);
             f.other_set.retain(|_, i| *i != item);
+        }
+        if let Some(r) = recipe {
+            if let Some(t) = self.world.get_mut(to) {
+                t.inventory.retain(|&i| i != item);
+            }
+            self.world.recipes.insert(r);
+            self.world.objects.remove(&item);
+            return true;
         }
         if let Some(coppers) = coin {
             if let Some(t) = self.world.get_mut(to) {
@@ -666,6 +685,47 @@ impl Sim {
             self.world.queue_event(0, f, removed, None);
         }
         true
+    }
+
+    /// Whether `id` is the hero or one of the hero's followers.
+    fn in_party(&self, id: ObjectId) -> bool {
+        let Some(hero) = self.world.hero else {
+            return false;
+        };
+        id == hero
+            || self
+                .world
+                .get(hero)
+                .is_some_and(|h| h.followers.contains(&id))
+    }
+
+    /// Learns the recipe items the party holds and drops them (see [`Self::give_item`]):
+    /// saves made before recipes were learned keep them as items.
+    pub fn learn_held_recipes(&mut self) {
+        let held: Vec<(ObjectId, ObjectId, i32)> = self
+            .world
+            .objects
+            .values()
+            .filter(|o| self.in_party(o.id))
+            .flat_map(|o| o.inventory.iter().map(move |&i| (o.id, i)))
+            .filter_map(|(owner, i)| {
+                let it = self.world.get(i)?;
+                (it.fields.get("BaseItem") == Some(&BASE_ITEM_RECIPE)).then(|| {
+                    (
+                        owner,
+                        i,
+                        it.fields.get("CraftingRecipeID").copied().unwrap_or(0),
+                    )
+                })
+            })
+            .collect();
+        for (owner, item, r) in held {
+            if let Some(o) = self.world.get_mut(owner) {
+                o.inventory.retain(|&i| i != item);
+            }
+            self.world.recipes.insert(r);
+            self.world.objects.remove(&item);
+        }
     }
 
     /// What a creature's equipped items add to a property: for each item stat that
@@ -1068,6 +1128,33 @@ mod screen_tests {
         h.inventory = items.to_vec();
         h.equipment.insert(0, items[0]);
         (s, hero, ally, items)
+    }
+
+    #[test]
+    fn recipes_the_party_receives_are_learned_not_kept() {
+        let (mut s, hero, ally, _) = party();
+        let recipe = |s: &mut Sim, id: i32| {
+            let r = s.world.spawn(ObjectKind::Item, "gen_im_cft_hrb_101");
+            let f = &mut s.world.get_mut(r).unwrap().fields;
+            f.insert("BaseItem".into(), BASE_ITEM_RECIPE);
+            f.insert("CraftingRecipeID".into(), id);
+            r
+        };
+        let a = recipe(&mut s, 1);
+        assert!(s.give_item(a, ally));
+        assert!(s.world.get(a).is_none());
+        assert!(!s.world.get(ally).unwrap().inventory.contains(&a));
+        // Someone outside the party (a merchant) keeps it as an item.
+        let merchant = s.world.spawn(ObjectKind::Creature, "merchant");
+        let b = recipe(&mut s, 2);
+        assert!(s.give_item(b, merchant));
+        assert!(s.world.get(merchant).unwrap().inventory.contains(&b));
+        // One already held (an older save) is learned on load.
+        let c = recipe(&mut s, 3);
+        s.world.get_mut(hero).unwrap().inventory.push(c);
+        s.learn_held_recipes();
+        assert!(s.world.get(c).is_none());
+        assert_eq!(s.world.recipes.iter().copied().collect::<Vec<_>>(), [1, 3]);
     }
 
     #[test]

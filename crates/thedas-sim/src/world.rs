@@ -5,7 +5,7 @@
 //! number), object ids are handed out sequentially, and randomness comes from a seeded
 //! generator.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -490,6 +490,10 @@ pub struct World {
     /// How many journal entries have been made (orders them).
     #[serde(default)]
     pub journal_seq: u64,
+    /// The crafting recipes the party knows (`CraftingRecipeID`s): a recipe item the party
+    /// receives is learned and gone (see [`crate::sim::Sim::give_item`]).
+    #[serde(default)]
+    pub recipes: BTreeSet<i32>,
     /// The quest the player marked active in the journal (its plot resource).
     #[serde(default)]
     pub active_quest: Option<String>,
@@ -667,6 +671,7 @@ impl World {
             plots: BTreeMap::new(),
             journal: BTreeMap::new(),
             journal_seq: 0,
+            recipes: BTreeSet::new(),
             active_quest: None,
             alerts: Vec::new(),
             game_mode: 0,
