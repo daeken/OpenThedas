@@ -1637,6 +1637,19 @@ impl App {
                     }
                 }
             }
+            Step::Loading(kind) => {
+                let hint = self
+                    .live
+                    .as_ref()
+                    .and_then(|l| thedas_ui::binding::load_hint(&l.sim(), 0));
+                if let Some(g) = self.gfx.as_mut() {
+                    match kind {
+                        Some(k) => g.ui.loading_begin(*k, hint),
+                        None => g.ui.loading_end(),
+                    }
+                }
+                log.push(format!("loading {kind:?}"));
+            }
             Step::Training(name) => {
                 let heard = self
                     .live
@@ -2844,6 +2857,9 @@ enum Step {
     /// The player does a training action (`training MAXIMUM_ZOOM_IN`): the training step
     /// waiting for it hears of it (`EVENT_TYPE_TRAINING_<name>`, see `thedas_sim::training`).
     Training(String),
+    /// A loading screen goes up (`loading town|light|fade`, with the hint the simulation
+    /// would show) or plays out (`loading end`): for trying the loading movies headless.
+    Loading(Option<ui::LoadScreen>),
     /// Uses the nearest object with a tag, as clicking it would (`use bdc140ip_everds_chest`).
     Use(String),
 }
@@ -3033,6 +3049,13 @@ fn parse_step(s: &str) -> Result<Step> {
         }
         "floaty" => Step::Floaty(arg.to_string()),
         "training" => Step::Training(arg.trim().to_ascii_uppercase()),
+        "loading" => Step::Loading(match arg.trim() {
+            "town" => Some(ui::LoadScreen::Town),
+            "light" => Some(ui::LoadScreen::Light),
+            "fade" => Some(ui::LoadScreen::Fade),
+            "end" => None,
+            _ => anyhow::bail!("loading takes town, light, fade or end"),
+        }),
         "plot" => {
             let (plot, flag) = arg
                 .rsplit_once(' ')
@@ -3493,6 +3516,19 @@ fn main() -> Result<()> {
                             }
                             _ => println!("use {tag}: nothing"),
                         }
+                    }
+                    Step::Loading(kind) => {
+                        let hint = thedas_ui::binding::load_hint(&l.sim(), 0);
+                        if let Some((layer, _)) = played.as_mut() {
+                            match kind {
+                                Some(k) => layer.loading_begin(*k, hint.clone()),
+                                None => layer.loading_end(),
+                            }
+                        }
+                        let state = played
+                            .as_ref()
+                            .map(|(layer, _)| (layer.loading(), layer.loading_fade_done()));
+                        println!("loading {kind:?}: hint {hint:?}, up and faded {state:?}");
                     }
                     Step::Training(name) => {
                         let heard = l.sim().training_event(name, 0);

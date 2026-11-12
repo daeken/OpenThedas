@@ -180,6 +180,8 @@ pub struct UiLayer {
     /// it has waited for its values to reach the popup layer (see
     /// [`UiLayer::show_script_popup`]).
     script_popup: Option<((i32, i32, u32), u8)>,
+    /// The loading screen up, if any (see [`UiLayer::loading_begin`]).
+    loading: Option<Loading>,
     /// The screens up last frame, for the events of opening one (see
     /// [`UiLayer::screens_opened`]).
     screens_up: std::collections::BTreeSet<Screen>,
@@ -453,6 +455,7 @@ impl UiLayer {
             tooltip_text: None,
             tooltip_relayout: 0,
             script_popup: None,
+            loading: None,
             screens_up: Default::default(),
             floaties: Vec::new(),
             stat_floaties: Default::default(),
@@ -619,6 +622,84 @@ impl UiLayer {
                 _ => continue,
             };
             sim.training_event(name, 0);
+        }
+    }
+
+    /// Puts up a loading screen of `kind`; `hint` is the tip load_town.gfx shows
+    /// (`GUILoading.LoadingText`; see [`thedas_ui::binding::load_hint`]). It stays up,
+    /// alone, until [`UiLayer::loading_end`] and its movie has played out.
+    pub fn loading_begin(&mut self, kind: LoadScreen, hint: Option<String>) {
+        self.stage.bridge.set_value(
+            "GUILoading.LoadingText",
+            thedas_ui::UiValue::String(hint.unwrap_or_default()),
+        );
+        self.loading = Some(Loading {
+            kind,
+            faded: false,
+            ending: false,
+            frame: 0,
+        });
+    }
+
+    /// Whether load_fade.gfx has faded to black (`GUIFadeToBlackLoading.FadeComplete`);
+    /// the other loading screens are up at once.
+    pub fn loading_fade_done(&self) -> bool {
+        self.loading
+            .is_some_and(|l| l.kind != LoadScreen::Fade || l.faded)
+    }
+
+    /// Whether a loading screen is up (or still playing out).
+    pub fn loading(&self) -> bool {
+        self.loading.is_some()
+    }
+
+    /// The load is done: the loading screen plays on past the `Stop` frame it holds on, through
+    /// its `Outro`, to its end, where it hides itself (see [`UiLayer::loading_frame`]).
+    pub fn loading_end(&mut self) {
+        let Some(l) = self.loading.as_mut() else {
+            return;
+        };
+        if l.ending {
+            return;
+        }
+        l.ending = true;
+        let movie = l.kind.screen().movies()[0];
+        if !self.stage.movies.iter().any(|m| m.name == movie) {
+            // No movie to play out: nothing will hide it.
+            self.loading = None;
+        }
+    }
+
+    /// A loading screen playing out: it is played on (it may still be in its intro, short of
+    /// the `Stop` frame it holds on) until it reaches its last frame, where it hides itself
+    /// (`ExternalCommands.HideGuiScene(scene)`), and closes.
+    fn loading_frame(&mut self) {
+        let Some(l) = self.loading.filter(|l| l.ending) else {
+            return;
+        };
+        let movie = l.kind.screen().movies()[0];
+        let frame = |stage: &mut thedas_ui::stage::Stage, p: &str| match stage.call_in(
+            movie,
+            &format!("_root.{p}.toString"),
+            &[],
+        ) {
+            Some(thedas_ui::UiValue::String(s)) => s.parse::<u32>().ok(),
+            _ => None,
+        };
+        // Done at its last frame, or once it has wrapped past it (a frame of the app can
+        // span two of the movie's).
+        let seen = l.frame;
+        match (
+            frame(&mut self.stage, "_currentframe"),
+            frame(&mut self.stage, "_totalframes"),
+        ) {
+            (Some(at), Some(last)) if at < last && at >= seen => {
+                self.stage.call_in(movie, "_root.play", &[]);
+                if let Some(l) = self.loading.as_mut() {
+                    l.frame = at;
+                }
+            }
+            _ => self.loading = None,
         }
     }
 
@@ -898,10 +979,12 @@ impl UiLayer {
             });
             // Before a game, the start menu, or the screen it opened (options, the load
             // screen).
-            let want = match (screens.front_end, screens.menu) {
-                (true, None) => std::collections::BTreeSet::from([Screen::StartMenu]),
-                (true, Some(m)) => std::collections::BTreeSet::from([m]),
-                (false, _) => crate::screens::wanted(&sim, screens.menu),
+            let want = match (self.loading, screens.front_end, screens.menu) {
+                // A loading screen stands alone until it has played out.
+                (Some(l), _, _) => std::collections::BTreeSet::from([l.kind.screen()]),
+                (None, true, None) => std::collections::BTreeSet::from([Screen::StartMenu]),
+                (None, true, Some(m)) => std::collections::BTreeSet::from([m]),
+                (None, false, _) => crate::screens::wanted(&sim, screens.menu),
             };
             (
                 crate::screens::with_examine(want, shown.examine.is_some()),
@@ -969,6 +1052,7 @@ impl UiLayer {
         }
         self.show_cutscene_line(sim);
         self.show_script_popup(sim);
+        self.loading_frame();
         let mut messages = self.stage.tick(dt_ms);
         // A script message box's answer carries the text typed into it, which the box set
         // as `GUIPopupLayer.InputText` just before (popuplayer.gfx's `OnButtonAction`); the
@@ -1029,6 +1113,12 @@ impl UiLayer {
         for m in &messages {
             if let GameMessage::Handled(name, args) | GameMessage::Send(name, args) = m {
                 log::info!("ui: {name} {args:?}");
+                // load_fade.gfx's fade to black is done.
+                if name == "GUIFadeToBlackLoading.FadeComplete"
+                    && let Some(l) = self.loading.as_mut()
+                {
+                    l.faded = true;
+                }
             }
             // The start menu's own fscommands: New Game loads the single-player module
             // (`getURL("FSCommand:LoadModule", "single player")`), Exit quits.
@@ -1039,6 +1129,7 @@ impl UiLayer {
                         self.requests.push(FrontEnd::NewGame);
                     }
                     "QuitGame" => self.requests.push(FrontEnd::Quit),
+
                     other => {
                         if self.ignored.insert(other.to_string()) {
                             log::warn!("ui: fscommand {other} {:?} is not handled", call.args);
@@ -1073,6 +1164,7 @@ impl UiLayer {
             // The stage closes a movie that asks for this itself; an ability to aim is the
             // app's to finish.
             if name != "GUI.HideFullScreenGUI"
+                && name != "GUIFadeToBlackLoading.FadeComplete"
                 && name != thedas_ui::input::PERFORM_ABILITY
                 && self.ignored.insert(name.clone())
             {
@@ -1893,6 +1985,40 @@ impl UiLayer {
     }
 }
 
+/// The loading screens: their movies hold on a frame while the game loads, then play on to
+/// their end and hide themselves (`HideGuiScene <scene>`), as read from their code; the app
+/// closes them at their last frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadScreen {
+    /// load_town.gfx (scene `Loading`): parchment art, "Loading ..." and a hint.
+    Town,
+    /// load_light.gfx (scene `LightLoading`): black with "Loading".
+    Light,
+    /// load_fade.gfx (scene `FadeToBlackLoading`): fades to black first
+    /// (`GUIFadeToBlackLoading.FadeComplete`).
+    Fade,
+}
+
+impl LoadScreen {
+    fn screen(self) -> Screen {
+        match self {
+            LoadScreen::Town => Screen::LoadTown,
+            LoadScreen::Light => Screen::LoadLight,
+            LoadScreen::Fade => Screen::LoadFade,
+        }
+    }
+}
+
+/// A loading screen up: whether its fade is done, and whether it is playing out.
+#[derive(Clone, Copy, Debug)]
+struct Loading {
+    kind: LoadScreen,
+    faded: bool,
+    ending: bool,
+    /// The movie's frame when last seen playing out.
+    frame: u32,
+}
+
 /// A screen's `GUI_*` id (script.ldf's `EVENT_TYPE_GUI_OPENED` constants), the inventory on a
 /// container as `GUI_CONTAINER_INVENTORY`. None for screens script.ldf names no id for.
 fn gui_id(s: Screen, container: bool) -> Option<i32> {
@@ -1917,6 +2043,7 @@ fn gui_id(s: Screen, container: bool) -> Option<i32> {
         Screen::Chanters => 22,
         Screen::Tactics => 23,
         Screen::PartyPicker => 27,
+        Screen::LoadTown | Screen::LoadLight | Screen::LoadFade => 14,
         Screen::Store | Screen::LevelUp | Screen::ItemExamine => return None,
     })
 }

@@ -957,6 +957,47 @@ fn key_mappings(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
     }
 }
 
+/// The load hint tables (M2DA ids): the scripted ones (`SetLoadHint`'s 206 and 271) and the
+/// random ones by the hero's level, lowest band first.
+const LOAD_HINT_BANDS: [(i32, i32); 4] = [(4, 284), (9, 277), (15, 276), (i32::MAX, 275)];
+/// Load hint tables' text (a talk-table string).
+const HASH_LOAD_HINT_TEXT: u32 = 0x4063_41be;
+
+/// The hint a loading screen shows (load_town.gfx's `GUILoading.LoadingText`): the one a
+/// script set for this transition (`World::transition_hint`, `SetLoadHint`), else one picked
+/// by `pick` (an index into the table's rows) from the random hints for the hero's level.
+/// Provisional: the level bands (VLow to 4, Low to 9, Mid to 15, High above) and the random
+/// pick are guesses until the exe's choice is traced.
+pub fn load_hint(sim: &Sim, pick: usize) -> Option<String> {
+    use thedas_formats::gda::Cell;
+    let tables = sim.world.tables();
+    let text = |table: i32, row: i64| match tables
+        .get(table, "")?
+        .cell_by_hash(HASH_LOAD_HINT_TEXT, row)
+    {
+        Some(Cell::Int(s)) if *s > 0 => sim.string(*s as u32).filter(|s| !s.is_empty()),
+        _ => None,
+    };
+    if let Some((row, table)) = sim.world.transition_hint {
+        return text(table, i64::from(row));
+    }
+    let level = sim
+        .world
+        .hero
+        .map(|h| sim.property_total(h, PROPERTY_LEVEL) as i32)
+        .unwrap_or(1);
+    let table = LOAD_HINT_BANDS
+        .iter()
+        .find(|(top, _)| level <= *top)
+        .map_or(275, |b| b.1);
+    let t = tables.get(table, "")?;
+    let rows: Vec<i64> = t.order.iter().copied().filter(|&r| r > 0).collect();
+    if rows.is_empty() {
+        return None;
+    }
+    text(table, rows[pick % rows.len()])
+}
+
 /// The `Popups` M2DA (`popups.gda`): DAOrigins.exe reads it by id 0xcf.
 const M2DA_POPUPS: i32 = 207;
 /// `popups.gda`'s four button labels (talk-table strings, 0 for no button).
