@@ -37,7 +37,7 @@
 //! walks the leader, the right stick turns and zooms the camera, A acts on the target in
 //! front, X/Y/B (RT for a second set) use the quickbar, LB/RB change the leader, LT opens a
 //! quickbar picker, the D-pad changes the target, Back opens the player's screens and Start
-//! pauses. On screens the stick moves a pointer that A clicks and B closes; in conversations
+//! the game menu (pausing is in the quickbar picker). On screens the stick moves a pointer that A clicks and B closes; in conversations
 //! the D-pad or stick picks a reply and A chooses it. The PC original has no controller
 //! support: this is a deliberate addition, following the Xbox 360 version's controls.
 //!

@@ -9,8 +9,9 @@
 //! takes effect when it is set), `ClientOptions.CommitOptions` from OK and
 //! `ClientOptions.RestoreDefaults` from its button. The defaults are those DAOrigins.exe's
 //! ClientOptions sets up (0x5e8735-0x5ec18d). Provisional: Cancel keeps what was set (the
-//! executable's handlers, registered at 0x7946c0, are not traced), nothing is written to the
-//! player's settings file, and the settings change nothing yet but what the screen shows.
+//! executable's handlers, registered at 0x7946c0, are not traced) and nothing is written to the
+//! player's settings file. The audio volumes and mutes, auto-pause in combat and the
+//! tutorials take effect; the other settings change nothing yet but what the screen shows.
 
 use std::collections::BTreeMap;
 
@@ -58,7 +59,9 @@ pub const DEFAULTS: &[(&str, f64)] = &[
     ("VideoOptions.EnableFrameBufferEffects", 1.0),
     ("VideoOptions.GraphicsDetailLevel", 3.0),
     ("VideoOptions.ForceLowSettings", 0.0),
-    ("OnlineOptions.EnableOnlineFeatures", 1.0),
+    // Off: there are no online features here (the bridge seeds it 0 and nobody is logged
+    // in). A deliberate change from the exe's default.
+    ("OnlineOptions.EnableOnlineFeatures", 0.0),
     ("OnlineOptions.EnableOnlineTelemetry", 1.0),
     ("OnlineOptions.AutoDownloadOldEntitlements", 0.0),
     ("OnlineOptions.AutoScreenshots", 1.0),

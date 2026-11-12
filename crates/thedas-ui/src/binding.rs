@@ -1748,7 +1748,7 @@ fn tactics(sim: &Sim, who: u32, v: &mut BTreeMap<String, UiValue>) {
     }
 }
 
-/// The inventory screen: the party's backpack/// The inventory screen: the party's backpack (`GUIInventory.PartyBackpackView.N.Item`, the
+/// The inventory screen: the party's backpack (`GUIInventory.PartyBackpackView.N.Item`, the
 /// items of the chosen category tab, `filter`) with plot items listed apart
 /// (`PartyPlotItemsView`), the money, and what the selected party member (`who`) wears
 /// (`GUI.SelectedChar.Equipment.<INVENTORY_SLOT_*>`, 0 for an empty slot).

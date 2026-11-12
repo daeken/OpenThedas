@@ -177,7 +177,7 @@ Concrete defects found during the code read. Each is small and independent.
 | `CAM-045` | The default save folder falls back to the working directory when `HOME` is unset |
 
 Several stale comments and README sections were also found; they are listed in the area files
-(`SIM-004`, `SIM-029`, `SIM-147`, `UI-068`, `UI-145`, `CAM-036`, `TOOL-001` to
+(`SIM-004`, `SIM-029`, `SIM-147`, `UI-145`, `CAM-036`, `TOOL-001` to
 `TOOL-003`).
 
 ## What this list cannot see yet
