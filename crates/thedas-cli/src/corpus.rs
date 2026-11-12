@@ -318,7 +318,7 @@ fn typed_result(
     }
 }
 
-/// Typed checks for formats that are not GFF: XML materials and DDS textures.
+/// Typed checks for formats that are not GFF: XML materials, DDS textures, SpeedTree files, ...
 fn check_other(
     data: &[u8],
     name: &str,
@@ -352,6 +352,10 @@ fn check_other(
         return check_shader(data, location, stats, keep);
     } else if ext == "ncs" {
         return check_script(data, location, stats, keep);
+    } else if ext == "spt" {
+        thedas_formats::speedtree::parse(data)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     } else if ext == "ldf" {
         EngineTable::parse(data)
             .map(|_| ())

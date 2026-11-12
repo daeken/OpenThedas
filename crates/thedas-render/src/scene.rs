@@ -427,6 +427,43 @@ struct Placing<'a> {
     user_params: &'a [(String, [f32; 4])],
 }
 
+/// Face morph target families' neutral targets: the head's, the eyes' and the lashes'
+/// (their targets start `UH_`/`UHM_`, `UEM_` and `ULM_`).
+const NEUTRALS: [(&str, &str); 3] = [
+    ("UEM_", "UH_UEM_BASa_0"),
+    ("ULM_", "UH_ULM_BASa_0"),
+    ("", "UH_UHM_BASa_0"),
+];
+
+/// Sets each family's neutral target weight to minus the sum of its other targets' (the
+/// presets' rule, see [`blend_targets`]), adding the neutral where it is missing.
+fn rebalance_neutrals(weights: &mut Vec<(String, f32)>) {
+    let family = |t: &str| {
+        let up = t.to_ascii_uppercase();
+        NEUTRALS
+            .iter()
+            .position(|(p, _)| up.starts_with(p))
+            .unwrap_or(2)
+    };
+    let is_neutral = |t: &str| NEUTRALS.iter().any(|(_, n)| t.eq_ignore_ascii_case(n));
+    let mut sums = [0.0f32; 3];
+    for (t, w) in weights.iter() {
+        if !is_neutral(t) {
+            sums[family(t)] += *w;
+        }
+    }
+    for (i, (_, neutral)) in NEUTRALS.iter().enumerate() {
+        match weights
+            .iter_mut()
+            .find(|(t, _)| t.eq_ignore_ascii_case(neutral))
+        {
+            Some(e) => e.1 = -sums[i],
+            None if sums[i] != 0.0 => weights.push((neutral.to_string(), -sums[i])),
+            None => {}
+        }
+    }
+}
+
 /// The material parameter an item tint fills.
 pub const TINT_PARAMETER: &str = "mml_vTintMaskColours";
 
@@ -694,7 +731,17 @@ impl<'a> Loader<'a> {
         // Choices made over a face (character creation's sliders) ride after its name.
         let (base, overlay) = FaceOverlay::split(name);
         if !overlay.is_empty() {
-            let loaded = self.morph(base).map(|m| {
+            // Face-shape sliders reshape a preset face: its targets with theirs in place.
+            let base_morph = if !overlay.targets.is_empty()
+                && self
+                    .read(&format!("{}.mop", base.to_ascii_lowercase()))
+                    .is_ok()
+            {
+                self.preset_morph(base, &overlay.targets)
+            } else {
+                self.morph(base)
+            };
+            let loaded = base_morph.map(|m| {
                 let mut m = m.with_overlay(&overlay);
                 // A tint chosen for a slot colours that slot's meshes.
                 for (slot, name) in &overlay.tints {
@@ -713,7 +760,7 @@ impl<'a> Loader<'a> {
         let preset = format!("{}.mop", name.to_ascii_lowercase());
         let is_base = name.to_ascii_lowercase().ends_with("_pcc_b01");
         if !is_base && self.read(&key).is_err() && self.read(&preset).is_ok() {
-            let loaded = self.preset_morph(name);
+            let loaded = self.preset_morph(name, &[]);
             self.morphs.insert(key, loaded.clone());
             return loaded;
         }
@@ -734,8 +781,9 @@ impl<'a> Loader<'a> {
         loaded
     }
 
-    /// A preset face: the race and gender's base face with the preset's choices on it.
-    fn preset_morph(&mut self, name: &str) -> Option<Arc<Morph>> {
+    /// A preset face: the race and gender's base face with the preset's choices on it, and
+    /// `targets` (the face-shape sliders' weights) in place of the preset's same targets.
+    fn preset_morph(&mut self, name: &str, targets: &[(String, f32)]) -> Option<Arc<Morph>> {
         let file = format!("{}.mop", name.to_ascii_lowercase());
         let preset = match self.read(&file).map(|d| MorphPreset::parse(&d)) {
             Ok(Ok(p)) => p,
@@ -754,8 +802,20 @@ impl<'a> Loader<'a> {
         // The preset's morph targets reshape the head's meshes (see
         // `thedas_formats::morph::blend_targets`).
         let models: Vec<String> = morph.models.iter().flatten().cloned().collect();
-        let targets: Vec<(f32, Vec<FacePiece>)> = preset
-            .targets
+        let mut weights = preset.targets.clone();
+        for (t, w) in targets {
+            match weights.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(t)) {
+                Some(e) => e.1 = *w,
+                None => weights.push((t.clone(), *w)),
+            }
+        }
+        // Each family's neutral target carries minus the sum of the others (see
+        // `blend_targets`), so the sliders' new weights move it too.
+        if !targets.is_empty() {
+            rebalance_neutrals(&mut weights);
+        }
+        weights.retain(|(_, w)| *w != 0.0);
+        let targets: Vec<(f32, Vec<FacePiece>)> = weights
             .iter()
             .map(|(t, w)| (*w, self.face_pieces(t)))
             .collect();
@@ -1478,6 +1538,21 @@ struct FacePiece {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_face_target_family_stays_balanced() {
+        let mut w = vec![
+            ("UH_UHM_BASa_0".to_string(), -0.5),
+            ("UH_NOS_07a_0".to_string(), 0.5),
+            ("UH_NOS_08a_0".to_string(), 0.25),
+            ("UEM_EYE_03a_0".to_string(), 0.3),
+        ];
+        rebalance_neutrals(&mut w);
+        let get = |n: &str| w.iter().find(|(t, _)| t == n).map(|(_, v)| *v);
+        assert_eq!(get("UH_UHM_BASa_0"), Some(-0.75));
+        assert_eq!(get("UH_UEM_BASa_0"), Some(-0.3));
+        assert_eq!(get("UH_ULM_BASa_0"), None);
+    }
 
     #[test]
     fn head_morphs_reshape_meshes_and_override_materials() {
