@@ -23,17 +23,34 @@
 //!   (`c16`-`c19`, its `w` replaced by the first partition's reach less the second's) and
 //!   the plane `c20` that is positive inside the first partition (0x452d40).
 //!
+//! - At Medium and High the first partition is blurred (`BlurShadowTargets` → 0x4518e0,
+//!   `[0xbf22c8] >= 2`; see `d3d_gpu::ShadowBlur`); at High both partitions and the blur's
+//!   targets are 1024 texels a side ([`partition_size`]).
+//!
 //! Provisional: the boxes' limits towards the sun ([`SUN_REACH`]); the second partition
-//! starts where the first ends; the engine's elevation clamp of the light (0x452ac2) and
-//! its variance blur (`BlurShadowTargets`, which 0x4518e0 runs on the first partition only
-//! at Medium and High, `[0xbf22c8] >= 2`; Low has none) are not applied; the bias drops
+//! starts where the first ends; the engine's elevation clamp of the light (0x452ac2) is
+//! not applied; the bias drops
 //! D3D9's half-texel offset (wgpu samples texel centres at half-texel coordinates); the
 //! level's pass fits the partitions to the objects' casters a frame late.
 
 use glam::{Mat4, Vec3, Vec4};
 
-/// Texels on a side of each partition at Low (and Medium) detail (0x45569e).
+/// Texels on a side of each partition at Low and Medium detail (0x45569e).
 pub const PARTITION_SIZE: u32 = 512;
+
+/// Texels on a side of each partition at High detail (0x4555ae).
+pub const PARTITION_SIZE_HIGH: u32 = 1024;
+
+/// Texels on a side of each partition at each Graphics Detail setting: 0x455580 picks the
+/// size through the jump table at 0x4556cc from the shadow quality `[0xbf20e0]` (Low and
+/// Medium 512 at 0x45569e, High 1024 at 0x4555ae) before it makes the targets (0x455420),
+/// and the variance blur's chain takes the same size (0x454572).
+pub fn partition_size(detail: crate::scene::Detail) -> u32 {
+    match detail {
+        crate::scene::Detail::Low | crate::scene::Detail::Medium => PARTITION_SIZE,
+        crate::scene::Detail::High => PARTITION_SIZE_HIGH,
+    }
+}
 
 /// How far each partition reaches from the camera at each Graphics Detail setting
 /// (0x455731: Low, Medium, High).
@@ -257,6 +274,14 @@ mod tests {
     fn low_detail_reaches_5_and_15_metres() {
         assert_eq!(partition_reach(crate::scene::Detail::Low), [5.0, 15.0]);
         assert_eq!(partition_reach(crate::scene::Detail::High), [10.0, 30.0]);
+    }
+
+    #[test]
+    fn only_high_detail_doubles_the_partitions() {
+        use crate::scene::Detail;
+        assert_eq!(partition_size(Detail::Low), 512);
+        assert_eq!(partition_size(Detail::Medium), 512);
+        assert_eq!(partition_size(Detail::High), 1024);
     }
 
     #[test]
