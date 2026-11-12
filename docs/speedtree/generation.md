@@ -230,8 +230,8 @@ light-seam profile, roughness profile, frequency profile, light-seam bias and gn
    (`cluster_first_branch_level`, default 0), R_parent > 0 and 0.85 · R_parent is smaller
    than that maximum, the maximum becomes 0.85 · R_parent. Clamp the radius to the maximum.
    **First radius** = radius · radius_scale.evaluate(0) (one draw; used by fronds only).
-7. **Vertex count** n = `segments` + 1, then (for real branches; fronds may override it, stage
-   4):
+7. **Vertex count** n = `segments` + 1. For a frond branch with `Fronds::use_segment_override`,
+   n = `segment_override` + 1 and the two adjustments below are skipped. Otherwise:
    - if `min_length_percent` ≠ 1 and length.min < length.max: f = clamp((length −
      length.min·S) / (length.max·S − length.min·S), 0, 1); n = (int)lerp(n ·
      min_length_percent, n, f); at least 2.
@@ -286,6 +286,10 @@ light-seam profile, roughness profile, frequency profile, light-seam bias and gn
       bias).
    10. Fork count 0; running length += segment length (stored on the vertex).
 10. Wind weights for each vertex are computed alongside (stage 7); they draw nothing.
+10a. **Frond guide end** (frond branches only, after the vertices and before the children):
+    the frond records this branch as a *guide* (4.1), which draws two numbers when the frond
+    has at least one frond texture: a texture choice uniform(0, 100000) and an angle offset
+    uniform(min, max). With no frond textures it draws nothing.
 11. **Children** — see 2.5.
 12. **Volume** of the branch (stage 3 LOD uses it): Σ over consecutive vertex pairs of
     distance · (radius₁ + radius₂).
@@ -425,4 +429,269 @@ Answers to the implementer's questions on stages 1 and 2.
 11. **Gravity units.** Yes: the rotation angle profile · gravity · g · facing is in degrees with
     g in degrees, exactly as written.
 
-Stages 3 and later: in progress.
+## Stage 3 — Branch geometry
+
+Every branch that is not a frond and whose level is at or above the first branch level gets a
+tube of vertices around its skeleton. A tree's branch vertices go into one shared vertex list,
+branch after branch in the order branches are grown (2.4 is depth-first: a branch's own
+vertices are emitted while its skeleton is grown, before any of its children). Each branch
+remembers the index of its first vertex (its *start*).
+
+### 3.1 Per-branch values
+
+- **Tile offset** = (azimuth + 180) / 360 + p (azimuth from 2.4 step 4, p the percent of parent).
+- **Base radius** = the first vertex's radius (2.4 step 8.3).
+- **Maximum radius** as clamped in 2.4 step 6.
+- **Relative length** = branch length / S.
+- Whether the gnarl was negated (2.4 step 8.5) also negates twist (3.3).
+
+### 3.2 One cross section (built at each skeleton vertex as it is made)
+
+For the vertex with frame F (rows r₀, r₁, r₂), position C, radius r, branch progress t (0 for
+the first vertex, the packed progress for the others), and its cross-section count m (2.4 steps
+8.7 and 9.2):
+
+- Roughness factor ρ = roughness_profile.evaluate_without_variance(t).
+- A running angle fraction f starts at 0 and **is increased by the float 1/m after each point**
+  (accumulated, not recomputed as i/m).
+- For i = 0 … m (m + 1 points):
+  1. angle α = 2π · f (2π = 6.283185 as a float).
+  2. **Texture coordinates** for each of the seven layers except the shadow layer (`layers[0..6]`
+     in our parser's order: diffuse, detail, normal, height, specular, user 1, user 2), see 3.3,
+     using f as the radial progress.
+  3. **Radial direction** ν = cos α · r₁ + sin α · r₂.
+     **Tangent** τ = cos(α + π/2) · r₁ + sin(α + π/2) · r₂ (π/2 = 1.570796).
+     **Binormal** = ν × τ.
+  4. If i < m (a real point):
+     - radius ρr = r; k = r / maximum radius;
+     - ρr += k · `roughness` · S · ρ · sin(`roughness_vertical_frequency` · t) ·
+       sin(`roughness_horizontal_frequency` · t) · cos(`roughness_horizontal_frequency` · α);
+     - clamp ρr to the maximum radius;
+     - ρr += (B[roughness index mod 1000] − 0.5) · 2 · `random_roughness` · S · k · ρ, then
+       increase the shared roughness index (2.3) by one;
+     - flare factor φ = 1 + Σ over the branch's flares of flare_distance(α, t) (3.4);
+     - position = C + ν · ρr · φ.
+     If i == 0 remember this position.
+  5. If i == m: position = the remembered first position (the seam repeats the first point;
+     its texture coordinates, tangent and binormal are those computed at f ≈ 1).
+  6. Wind attributes: stage 7.
+
+Normals are not taken from ν; they are computed once the whole branch exists (3.5).
+
+### 3.3 Texture coordinates of one layer
+
+Inputs: the layer's controls (`TexLayer`), radial progress f, branch progress t, the tile
+offset, base radius, relative length, negated flag. If a layer other than the diffuse one has
+`sync` set, it uses the diffuse layer's controls instead of its own.
+
+- S tile = `s_tile` if `s_tile_absolute`, else `s_tile` · base radius · 2π.
+  T tile = `t_tile` if `t_tile_absolute`, else `t_tile` · relative length.
+  Twist = `twist`, negated if the branch's gnarl was negated.
+- **s:**
+  - with `clamp_s`: left/right = `clamp[0]`/`clamp[1]`. Start angle = `s_offset` · 90, then 0
+    if negative, then wrapped into [0, 360] by subtracting/adding 360 while above 360/below 0.
+    Sweep = 0 if S tile is 0, else 360 / S tile. End = start + sweep; if end > 360 then
+    end = 360 and start = 360 − sweep. This angle = f · 360, clamped into [start, end].
+    s = lerp(left, right, (this − start) / sweep).
+  - otherwise s = f · S tile + `s_offset` + twist · t.
+- **t** = (t + (tile offset if `random_t_offset` else 0)) · T tile − `t_offset`.
+  With `clamp_t`: clamp to [0, 1], then t = lerp(`clamp[2]`, `clamp[3]`, t) (bottom, top).
+
+### 3.4 Flare distance
+
+For one flare (2.6: angle a_f, radial influence ri in radians, radial exponent re, length
+influence li, length exponent le, distance d) at angle α and branch progress t:
+
+- difference = |α − a_f|; if it exceeds π (3.141593), add 2π to whichever of α and a_f is
+  smaller, and recompute the difference.
+- If difference < ri and li − t > 0: radial = (1 − difference/ri) ^ re, vertical =
+  ((li − t)/li) ^ le (both powers computed in double precision, then converted to float);
+  result = d · radial · vertical. Otherwise 0.
+
+### 3.5 Normals (per branch, after its vertices exist)
+
+Let the branch have n skeleton vertices, vertex i having mᵢ + 1 tube points starting at offset
+oᵢ (o₀ = the branch start, oᵢ₊₁ = oᵢ + mᵢ + 1). For each i and each j = 0 … mᵢ:
+
+- **Around:** prev = oᵢ + (mᵢ − 1 if j == 0 else j − 1); next = oᵢ + (1 if j == mᵢ else
+  j + 1). h = normalize(position[next] − position[prev]).
+- **Along:** fraction g = j / mᵢ. prev = oᵢ + j if i == 0, else oᵢ − ((mᵢ₋₁ + 1) −
+  (int)(mᵢ₋₁ · g)); next = oᵢ + j if i == n − 1, else oᵢ + (mᵢ + 1) + (int)(mᵢ₊₁ · g).
+  w = normalize(position[next] − position[prev]).
+- Normal = h × w; if exactly zero, use the skeleton vertex's direction D.
+- **Light-seam reduction:** e = light_seam_profile.evaluate_without_variance(i / (n − 1));
+  b = light_seam_bias.evaluate_without_variance(p) (p the branch's percent of parent);
+  normal = normalize(lerp(D, normal, e · lerp(b, 1, (i/(n − 1)) ^ 0.5))).
+
+### 3.6 Triangles
+
+A branch's surface is one triangle strip over its tube points, with degenerate joins (the
+same index lists serve every LOD, 3.7). For each consecutive pair of skeleton vertices
+(i, i + 1), with a = mᵢ + 1 and b = mᵢ₊₁ + 1 points and M = max(a, b):
+
+- for j = 0 … M − 1: g = j / (M − 1); x = (int)((a − 1) · g + 0.5); y = (int)((b − 1) · g +
+  0.5); emit (start + run + a + y) then (start + run + x), where run is the number of points
+  in skeleton vertices before i;
+- then emit the second-to-last emitted index twice more;
+- run += a.
+
+Read the list as a triangle strip (each index forms a triangle with the two before it,
+alternating winding; triangles with a repeated index are degenerate and drawn as nothing).
+
+### 3.7 Branch LOD
+
+Parameters: `Lod::branch_lod_count` (L_n), `branch_max_volume_percent`,
+`branch_min_volume_percent`, `branch_reduction_fuzziness`, `large_branch_percent`.
+
+After the whole tree has been grown (after stage 2's recursion and everything drawn during
+it), and before leaves are reduced:
+
+1. List the branches in growth order: the trunk, then recursively each branch followed by its
+   kept children in the order they were made. Fronds and pruned branches are not in the list
+   (but skeleton-only branches below the first branch level are).
+2. Total = Σ max(volume, 0); largest = the largest volume.
+3. In list order, a branch whose volume > largest · (1 − `large_branch_percent`) is *kept*
+   (moved, in order, to a separate kept list). For every other branch draw f =
+   uniform(0, `branch_reduction_fuzziness`) from the stream (one draw each, in order) and set
+   its fuzzy volume to max((1 − f) · volume + f · largest, 0).
+4. Sort the others by fuzzy volume, descending. Then insert the kept branches one by one at
+   the front of that list, in kept-list order (so the last kept branch ends first).
+   (The kept branches' fuzzy volume is 0; the original also "sorts" the kept list by it, which
+   leaves an unspecified order for ties: keep kept-list order.)
+5. For each LOD level k = 0 … L_n − 1: fraction = 1 if L_n < 2, else lerp(max percent, min
+   percent, k / (L_n − 1)); target = fraction · total. Walk the list adding each branch's
+   (real) volume while the running sum < target; every branch walked contributes its strip
+   (3.6) to LOD k (branches with no geometry contribute nothing). If no branch is walked at
+   LOD 0, LOD 0 is empty.
+6. **Fade hints**: every index in a branch's strip for LOD k sets that vertex's fade hint to
+   −1 if k is the last level, else 1 − (k + 1)/L_n; later levels overwrite earlier ones.
+
+## Stage 4 — Fronds
+
+Fronds are flat or profiled strips grown along the skeletons of frond branches instead of
+tubes (`Fronds::enabled`, at levels ≥ `Fronds::level`, subject to the frond rules in 2.7).
+Their vertex lists are separate from the branches'.
+
+### 4.1 Guides (recorded while the tree grows)
+
+A frond branch's skeleton vertices (position, frame, wind weights) become a **guide**, in the
+order frond branches are grown. When the branch's vertices are done (2.4 step 10a):
+
+- guide length = Σ distances between consecutive vertex positions, using the **fast square
+  root** of §2.9 item 7;
+- if there are frond textures (`Fronds::textures`): texture index =
+  (unsigned)uniform(0, 100000) mod (number of textures) (one draw); radius = length ·
+  `aspect_ratio` · 0.5 · `size_scale` of that texture; angle offset = uniform(`min_angle_offset`,
+  `max_angle_offset`) (one draw), negated if the number of guides recorded so far (counting
+  this one) is odd;
+- with no textures: index 0, radius = length · 0.5, offset 0;
+- surface area = length · the branch's first radius (2.4 step 6).
+
+### 4.2 When fronds are built
+
+After the whole tree, its branch LOD (3.7) and its leaves (stage 5) are computed, fronds are
+built in one pass: first the guide LOD selection (4.3, draws), then, for extrusion fronds, each
+guide's profile (4.5, draws), in the order given there.
+
+### 4.3 Frond LOD selection
+
+Parameters: `lod_count` (F_n), `max_surface_percent`, `min_surface_percent`,
+`reduction_fuzziness`, `large_frond_percent`.
+
+1. Total = Σ surface areas; largest = the largest area; L² = largest · largest.
+2. In guide order: a guide whose area > largest · (1 − `large_frond_percent`) is kept (moved,
+   in order, to a kept list); every other guide draws f = uniform(0, `reduction_fuzziness`)
+   (one draw each) and gets fuzzy area (1 − f) · area + f · L² (note: the *square* of the
+   largest area).
+3. Sort the others by fuzzy area, descending; insert the kept guides one by one at the front
+   (the last kept ends first; kept guides compare equal, keep kept-list order).
+4. For level i: fraction = `max_surface_percent` if F_n == 1, else lerp(max, min,
+   i/(F_n − 1)); target = fraction · total. If target > 0, the level uses the first guides of
+   the sorted list, taking guides while the count is below the number of guides **and** the
+   running area ≤ target (note ≤, unlike branches), adding each guide's real area. If target
+   ≤ 0 the level has no fronds.
+5. Only guides in level 0's list get vertices, built in **level-0 list order**. Lower levels
+   reuse those vertices (each level's list is a prefix of level 0's).
+
+### 4.4 Blade fronds (`kind` = 0)
+
+With B = `blades` and N guide vertices, each guide gets B blades, each a ribbon of 2N
+vertices (right, left per guide vertex), blades one after another:
+
+- spacing angle = 180 / B degrees.
+- For blade b and guide vertex i: frame G = the frame of vertex i, or of vertex i − 1 when i
+  is the last; rotate it about X by (spacing · b + angle offset) degrees (on the left:
+  G ← Rx · G, with Rx = `[[1, 0, 0], [0, c, s], [0, −s, c]]`).
+  Right direction ρᵢ = (0, 1, 0) · G (G's second row).
+- Normal = normalize(pos[1] − pos[0]) for i = 0, else normalize(pos[i] − pos[0]).
+- Positions, with radius R and Pᵢ the guide vertex position:
+  - last vertex (i = N − 1): right = Pᵢ + ρᵢ₋₁ · R, left = Pᵢ − ρᵢ₋₁ · R;
+  - middle vertices: right = ((Pᵢ + ρᵢ · R) + (Pᵢ + ρᵢ₋₁ · R)) · 0.5, left likewise with −;
+  - first vertex: right = Pᵢ + ρᵢ · R, left = Pᵢ − ρᵢ · R.
+- Texture coordinates before atlas mapping: right (1, i/(N − 1)), left (0, i/(N − 1)).
+- Tangent = ρᵢ; binormal = −normalize(normal × ρᵢ), or −normal when |normal × ρᵢ| < 0.1
+  (that length uses the fast square root).
+- **Unpinching** of t, per blade, after its 2N vertices exist: compute cumulative side
+  lengths along the right vertices and along the left vertices, but **always measured on the
+  guide's first blade** (the first 2N vertices of the guide), with the fast square root. For
+  1 ≤ i ≤ N − 2, set t = 0.999 · (cumulative length to vertex i) / (total length) for that
+  side. Vertex 0 keeps 0 and vertex N − 1 keeps 1.
+- Strip per blade: its 2N vertex indices in order (right₀, left₀, right₁, left₁, …), one strip
+  per blade, for every LOD level the guide belongs to.
+
+### 4.5 Extrusion fronds (`kind` = 1)
+
+Profile, with P = `profile_segments` and the guide radius R (all evaluations with variance,
+unscaled, one draw each, in this order): first a = profile.evaluate(0) · R; then for i = 0 …
+P − 1, f = 1 − i/(P − 1) and point i = (0, −f · R, profile.evaluate(f) · R − a). Then mirror:
+for j = P − 2 down to 0 append point j with its y negated. That gives V = 2P − 1 points, the
+centre point at index P − 1.
+
+Profile normals and tangents, for each point i, with the angle of a neighbour pair being
+`atan2(z₂ − z₁, y₂ − y₁)` (float):
+
+- i = P − 1 (centre): angle = π/2;
+- i = 0: angle = (angle from point 0 to 1) + π/2;
+- i = V − 1: angle = (angle from point V − 2 to V − 1) + π/2;
+- otherwise: angle = 0.5 · (previous pair's angle + next pair's angle) + π/2.
+
+Normal = normalize(0, cos angle, sin angle); tangent = normalize(0, −cos(angle + π/2),
+−sin(angle + π/2)).
+
+Vertices, for each guide vertex i (N of them) and profile point j (V of them):
+
+- T = vertex i's frame, T′ = vertex i − 1's frame (T′ = T for i = 0); rotate both about X by
+  the angle offset (on the left, as in 4.4).
+- position = Pᵢ + 0.5 · (pointⱼ · T + pointⱼ · T′) (row vector times matrix);
+- normal = normalize(0.5 · (nⱼ · T + nⱼ · T′)); tangent = normalize(0.5 · (tⱼ · T + tⱼ ·
+  T′)); binormal = normalize(tangent × normal), or the normal when |tangent × normal| < 0.1
+  (fast square root);
+- texture coordinates before atlas mapping (j/(V − 1), i/(N − 1)).
+
+Unpinching: for each column j, cumulative length along that column's vertices (fast square
+root); for every i ≥ 1 (including the last), t = 0.999 · cumulative / total.
+
+Strips per LOD level l (levels as in 4.3, F_n levels): fraction = 1 if F_n == 1, else
+1 − l/(F_n − 1). Length vertices Nl = (int)lerp(`min_length_segments` + 1, N, fraction);
+cross vertices Vl = (int)lerp(2 · `min_cross_segments` + 1, V, fraction). If
+`Lod::fade_extrusions` is set, Nl = N and Vl = V. Steps: length step = N / (Nl − 1), cross
+step = V / (Vl − 1). For each i = 0 … Nl − 2:
+
+- this = (int)(i · length step); next = (int)((i + 1) · length step); if i == Nl − 2 or
+  next > N − 1, next = N − 1. skip = next − this; base = this · V.
+- For even i walk j = 0 … Vl − 1, for odd i walk j = Vl − 1 down to 0; for each j the
+  column c = (int)(j · cross step), but V − 1 when j == Vl − 1, and at most V − 1; emit
+  (start + base + c) then (start + base + c + skip · V).
+- If i < Nl − 2, repeat the last emitted index once.
+
+### 4.6 Fade hints and atlas coordinates
+
+- Each index of a frond's strip at LOD level l sets that vertex's fade hint to −1 if l is
+  the last level, else 1 − (l + 1)/F_n; later levels overwrite.
+- A vertex's texture coordinate (s, t) is mapped into the frond atlas rectangle of its
+  texture (the texture-coordinate section's frond entry: corners c[0..7] = (s₀, t₀, s₁, t₁,
+  s₂, t₂, s₃, t₃)): u = lerp(c[2], c[0], s), v = lerp(c[5], c[1], t). (The original's optional
+  flip negates t twice on this path, so it has no effect.) These are in the file's
+  convention, t upward; see format.md for sampling.
+
+Stages 5 and later: in progress.

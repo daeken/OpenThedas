@@ -172,10 +172,6 @@ Concrete defects found during the code read. Each is small and independent.
 | `RND-043` | Alpha-tested casters are skipped, so foliage, fences and hair cast no sun shadow |
 | `RND-095` | Location effects with an instant duration are discarded and never drawn |
 | `RND-139` | Compressed textures lose their smallest mip levels |
-| `UI-060` | The auto-pause option never reaches the simulation |
-| `UI-058` | Tutorials stay on whatever the setting says |
-| `UI-003` | Three interface queries are never answered |
-| `UI-156` | With the free camera on, C both lowers the camera and opens the character record |
 | `FMT-009` | The `Offers/` folder is not mounted for resources, though audio reads it |
 | `FMT-008` | Every enabled DLC's module folder is mounted for every campaign |
 | `CAM-030` | `ffmpeg` is looked up without `.exe`, so Windows never plays movies |

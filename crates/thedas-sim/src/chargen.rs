@@ -76,8 +76,10 @@ impl Sim {
     }
 
     /// The client options the game keeps in its world: the difficulty (0 casual to 3
-    /// nightmare), which `GetGameDifficulty` reads. Other options are the player's settings,
-    /// not the game's, and are not taken. Provisional: the executable keeps the difficulty
+    /// nightmare), which `GetGameDifficulty` reads. The player's auto-pause and tutorial
+    /// settings are read by the simulation too ([`Sim::auto_pause_combat`],
+    /// [`Sim::show_tutorials`]) but left for the interface to keep. Other options are not
+    /// taken. Provisional: the executable keeps the difficulty
     /// with the client options; the save does not record it there (here the world does).
     pub(crate) fn client_option_message(&mut self, name: &str, args: &[String]) -> bool {
         match name {
@@ -95,6 +97,26 @@ impl Sim {
                     }
                     None => false,
                 }
+            }
+            // The player's settings the simulation reads; the interface keeps them too (so
+            // the message is not taken).
+            MSG_CLIENT_OPTION => {
+                let on = args
+                    .get(1)
+                    .and_then(|a| a.trim().parse::<f64>().ok())
+                    .map(|v| v != 0.0);
+                match (args.first().map(|a| a.trim()), on) {
+                    (Some("GameOptions.AutoPauseCombat"), Some(on)) => self.auto_pause_combat = on,
+                    (Some("GameOptions.ShowTutorials"), Some(on)) => self.show_tutorials = on,
+                    _ => {}
+                }
+                false
+            }
+            // The options screen's Restore Defaults: both back to how the game's options start.
+            "ClientOptions.RestoreDefaults" => {
+                self.auto_pause_combat = false;
+                self.show_tutorials = true;
+                false
             }
             MSG_COMMIT_OPTIONS => true,
             _ => false,
@@ -257,6 +279,17 @@ mod tests {
             &a(&["GameOptions.DifficultyLevel", "NaN"])
         ));
         assert_eq!(s.world.difficulty, 2);
+        // The player's settings the simulation reads are left for the interface to keep.
+        assert!(
+            !s.client_option_message(MSG_CLIENT_OPTION, &a(&["GameOptions.AutoPauseCombat", "1"]))
+        );
+        assert!(s.auto_pause_combat);
+        assert!(
+            !s.client_option_message(MSG_CLIENT_OPTION, &a(&["GameOptions.ShowTutorials", "0"]))
+        );
+        assert!(!s.show_tutorials);
+        assert!(!s.client_option_message("ClientOptions.RestoreDefaults", &[]));
+        assert!(!s.auto_pause_combat && s.show_tutorials);
         assert_eq!(queued(&s).last(), Some(&(59, vec![0, 1], vec![])));
         assert_eq!(s.world.chargen, None);
     }
