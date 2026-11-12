@@ -49,6 +49,8 @@ pub struct LiveObjects {
     /// as they move. DAOrigins.exe's door collision is a shape under the leaf's mesh node
     /// (`plc_doorlgdwf_05_0.phy`: `DoorLow` > `cobj` > `shap`), so it swings with the leaf.
     moving: std::collections::HashMap<ObjectId, Moving>,
+    /// Each prop's object and its own models (not what it holds), in the scene's order.
+    bodies: Vec<(ObjectId, Vec<String>)>,
     pub scene: AreaScene,
     pub renderer: AreaRenderer,
 }
@@ -114,6 +116,10 @@ pub struct Live {
     pub level: Option<LiveLevel>,
     pub objects: Option<LiveObjects>,
     animator: Animator,
+    /// The creatures the game camera has faded (see [`crate::camfade`]) and the models'
+    /// creature shapes read so far.
+    camera_fade: crate::camfade::CameraFade,
+    creature_shapes: std::collections::HashMap<String, Arc<Vec<crate::camfade::Shape>>>,
     /// A quickbar ability waiting for the player to click its target.
     pub aiming: Option<thedas_ui::input::Aim>,
     /// Each drawn object's id, placement and motion at the last sync (in the objects' scene
@@ -254,6 +260,8 @@ impl Live {
             level: None,
             objects: None,
             animator: Animator::default(),
+            camera_fade: Default::default(),
+            creature_shapes: Default::default(),
             aiming: None,
             posed: Vec::new(),
             models: ModelCache::default(),
@@ -337,14 +345,114 @@ impl Live {
         Some(follow.camera_clear(feet, height, dt, base, &|a, b, r| self.sweep(a, b, r)))
     }
 
+    /// The game camera's fade of the creatures it is inside (see [`crate::camfade`]), `dt`
+    /// seconds after the last: `eye` is where the game camera stands, or `None` while it is
+    /// not the view (a conversation or cutscene frames the shot: no creature starts fading
+    /// then, as in the executable's `GM_DIALOG` and `GM_CUTSCENE`). Creatures faded out are
+    /// drawn at their opacity ([`Live::opacity`]).
+    pub fn fade_near_camera(&mut self, eye: Option<glam::Vec3>, dt: f32) {
+        let blocked = {
+            let sim = self.sim();
+            sim.world.cutscene.is_some() || sim.conversation_line().is_some()
+        };
+        let eye = eye.filter(|_| !blocked);
+        // Each creature's body: its appearance's `PERSPACE` radius and height (see
+        // `crate::camfade::body_capsule`), tested as well as its models' own shapes.
+        let bodies: std::collections::HashMap<ObjectId, (f32, f32)> = match eye {
+            Some(_) => {
+                let sim = self.sim();
+                sim.world
+                    .objects
+                    .values()
+                    .filter(|o| o.kind == thedas_sim::world::ObjectKind::Creature)
+                    .map(|o| (o.id, (sim.body_radius(o.id), appearance_height(&sim, o.id))))
+                    .collect()
+            }
+            None => Default::default(),
+        };
+        let mut touching = Vec::new();
+        if let (Some(eye), Some(level), Some(objects)) =
+            (eye, self.level.as_ref(), self.objects.as_ref())
+        {
+            for (i, (id, models)) in objects.bodies.iter().enumerate() {
+                let Some((_, placement, _)) = self.posed.get(i).filter(|p| p.0 == *id) else {
+                    continue;
+                };
+                // Cheap reject: creatures stand within a few metres of their origin.
+                if placement.w_axis.truncate().distance(eye) > 4.0 {
+                    continue;
+                }
+                let Some(&(radius, height)) = bodies.get(id) else {
+                    continue;
+                };
+                let touches = models.iter().any(|m| {
+                    let key = m.to_ascii_lowercase();
+                    let shapes = self.creature_shapes.entry(key.clone()).or_insert_with(|| {
+                        let read = |n: &str| level.vfs.read(n).ok().map(|(d, _)| d);
+                        let phy = read(&format!("{key}.phy"))
+                            .and_then(|d| thedas_formats::phy::Phy::parse(&d).ok());
+                        let mmh = read(&format!("{key}.mmh"))
+                            .and_then(|d| thedas_formats::model::Mmh::parse(&d).ok());
+                        Arc::new(
+                            phy.map(|p| crate::camfade::model_shapes(&p, mmh.as_ref()))
+                                .unwrap_or_default(),
+                        )
+                    });
+                    shapes
+                        .iter()
+                        .any(|s| s.touches(placement, eye, crate::camfade::FADE_RADIUS))
+                });
+                let touches = touches
+                    || (crate::camfade::body_capsule(radius, height).touches(
+                        placement,
+                        eye,
+                        crate::camfade::FADE_RADIUS,
+                    ));
+                if touches {
+                    touching.push(*id);
+                }
+            }
+        }
+        self.camera_fade.update(touching, dt);
+        self.combine_opacity();
+    }
+
+    /// Rebuilds [`Live::opacity`] from every fade that sets one, multiplied together (a
+    /// missing entry is opaque). Each source keeps its own values; add another fade (a
+    /// corpse's decay) here rather than writing `opacity` directly. Sources: the game
+    /// camera's fade ([`crate::camfade`]).
+    fn combine_opacity(&mut self) {
+        self.opacity.clear();
+        for (id, alpha) in self.camera_fade.faded() {
+            *self.opacity.entry(id).or_insert(1.0) *= alpha;
+        }
+        self.opacity.retain(|_, a| *a < 1.0);
+    }
+
     /// How high above its feet the camera looks at the party leader: its appearance's
     /// `apr_base.gda` `HEIGHT`, or `HEIGHT_F` for a female (`CAppearance` 0x748a40 picks by
     /// gender 2), else [`crate::follow::DEFAULT_LOOK_HEIGHT`] (0x6a1a30 hands the camera
     /// the appearance's height).
     pub fn leader_look_height(&self) -> f32 {
-        let sim = self.sim();
+        let leader = self.sim().world.controlled();
+        leader.map_or(crate::follow::DEFAULT_LOOK_HEIGHT, |id| {
+            self.creature_height(id)
+        })
+    }
+
+    /// A creature's height: its appearance's `apr_base.gda` `HEIGHT`, or `HEIGHT_F` for a
+    /// female, else [`crate::follow::DEFAULT_LOOK_HEIGHT`].
+    pub fn creature_height(&self, id: ObjectId) -> f32 {
+        appearance_height(&self.sim(), id)
+    }
+}
+
+/// A creature's height from its appearance (see [`Live::creature_height`]), with the
+/// simulation already in hand.
+fn appearance_height(sim: &Sim, id: ObjectId) -> f32 {
+    {
         let w = &sim.world;
-        let height = w.controlled().and_then(|id| w.get(id)).and_then(|o| {
+        let height = w.get(id).and_then(|o| {
             let t = w.tables().get(0, "apr_base")?;
             let column = if o.fields.get("Gender").copied() == Some(2) {
                 "HEIGHT_F"
@@ -361,7 +469,9 @@ impl Live {
             .filter(|h| h.is_finite() && *h > 0.0)
             .unwrap_or(crate::follow::DEFAULT_LOOK_HEIGHT)
     }
+}
 
+impl Live {
     /// Advances what runs while the world may be stopped (the conversation camera's clock).
     pub fn advance_presentation(&mut self, dt_ms: f64) {
         self.talk_camera.advance(dt_ms);
@@ -919,6 +1029,7 @@ impl Live {
             faces,
             solid,
             moving,
+            bodies: models.iter().map(|m| (m.id, m.models.clone())).collect(),
             scene,
             renderer,
         })
