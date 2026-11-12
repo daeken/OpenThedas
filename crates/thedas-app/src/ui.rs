@@ -1205,6 +1205,19 @@ impl UiLayer {
                 vec!["0".into()],
             ));
         }
+        // A tooltip made for an equipment slot just emptied under the mouse is built from an
+        // item that is no longer there ("undefined", "Cannot be unequipped",
+        // "Indestructible"): it is cleared. Provisional: the original's own handling of an
+        // emptied slot's tooltip is not traced.
+        for k in ["GUI.TooltipText", "GUITooltips.TooltipText"] {
+            if let Some(thedas_ui::UiValue::String(t)) = self.stage.bridge.value(k)
+                && t.starts_with("<header>undefined</header>")
+            {
+                self.stage
+                    .bridge
+                    .set_value(k, thedas_ui::UiValue::String(String::new()));
+            }
+        }
         let tip = Some(thedas_ui::UiValue::List(
             ["GUI.TooltipText", "GUITooltips.TooltipText"]
                 .map(|k| {

@@ -189,6 +189,11 @@ pub fn apply(sim: &mut Sim, name: &str, args: &[String]) -> bool {
         return true;
     }
     if sim.gui_message(name, args) {
+        // Choosing a tactics preset is a training action (the party lesson's last step
+        // waits for it, `EVENT_TYPE_TRAINING_TACTIC_PRESET_SELECTED`).
+        if name == thedas_sim::tactics::MSG_LOAD_PRESET {
+            sim.training_event("TACTIC_PRESET_SELECTED", 0);
+        }
         sim.tick(0);
         return true;
     }
