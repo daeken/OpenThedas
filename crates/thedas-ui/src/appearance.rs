@@ -17,8 +17,9 @@ use thedas_sim::sim::Sim;
 
 use crate::UiValue;
 
-/// The groups, in order: their labels (talk table strrefs).
-pub const GROUPS: [u32; 9] = [
+/// The groups, in order: their labels (talk table strrefs). The last, Voice, has no sliders:
+/// chargen.gfx shows its sound set list instead (its `SOUNDSET_GROUP`, 9).
+pub const GROUPS: [u32; 10] = [
     374691, // Preset
     374692, // Skin
     374704, // Hair
@@ -28,6 +29,7 @@ pub const GROUPS: [u32; 9] = [
     374736, // Jaw / Cheeks
     374746, // Neck / Ears
     374750, // Portrait
+    374758, // Voice
 ];
 
 /// A slider's range: fixed, or a face-screen list's indices.
@@ -179,18 +181,28 @@ fn value(sim: &Sim, id: ObjectId, s: &Slider, min: f32, max: f32) -> f32 {
             .position(|n| *n == name)
             .map(|i| i as f32)
     };
-    let preset_model = |slot: usize| {
+    let preset = || {
         let h = head.as_ref()?;
         let (d, _) = sim.vfs.read(&format!("{h}.mop")).ok()?;
-        let p = thedas_formats::morph::MorphPreset::parse(&d).ok()?;
+        thedas_formats::morph::MorphPreset::parse(&d).ok()
+    };
+    let preset_model = |slot: usize| {
+        let p = preset()?;
         Some(p.models.get(slot).cloned().flatten().unwrap_or_default())
+    };
+    // A face-shape slider stands where the preset's morph targets put it.
+    let row =
+        thedas_sim::appearance::race_gender_row(&sim.face_race_gender(id).unwrap_or_default());
+    let shape = || {
+        let p = preset()?;
+        thedas_sim::appearance::feature_value(s.id, &p.targets, row)
     };
     use thedas_formats::morph::slot;
     let known = match s.id {
         PRESET => index_of("heads", head.clone()),
         HAIR => index_of("hairs", preset_model(slot::HAIR)),
         BEARD => index_of("beards", preset_model(slot::BEARD)),
-        _ => None,
+        _ => shape().map(|v| v.clamp(min, max)),
     };
     known.unwrap_or_else(|| 0.0f32.clamp(min, max))
 }
@@ -220,10 +232,21 @@ pub fn values(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
             43 => !beards,
             _ => female,
         };
-        let label = if second { s.label.1 } else { s.label.0 };
+        // The preset's slider has no label (the original shows only the group's name).
+        let label = match s.id {
+            PRESET => 0,
+            _ if second => s.label.1,
+            _ => s.label.0,
+        };
         v.insert(k.clone(), UiValue::Number(s.id as f64));
         v.insert(format!("{k}.Group"), UiValue::Number(s.group as f64));
-        v.insert(format!("{k}.Name"), text(label));
+        v.insert(
+            format!("{k}.Name"),
+            match label {
+                0 => UiValue::String(String::new()),
+                l => text(l),
+            },
+        );
         v.insert(
             format!("{k}.Value"),
             UiValue::Number(value(sim, id, &s, min, max) as f64),

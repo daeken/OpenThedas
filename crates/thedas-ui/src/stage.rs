@@ -455,6 +455,16 @@ impl Stage {
                 .into_iter()
                 .filter_map(|c| self.bridge.handle(c))
                 .collect();
+            // A screen asking for its ability lists again (it does after each point spent) is
+            // answered with every list entry pushed again, as the game rebuilds the lists:
+            // an entry's value (the ability) is unchanged, but its state (learned, available)
+            // is not, and the screen reloads an entry only when it hears it.
+            if messages.iter().any(|g| {
+                matches!(g, GameMessage::Send(n, _) | GameMessage::Handled(n, _)
+                    if n == "GameModeController.FindAbilityChains")
+            }) {
+                m.resend_observers(|t| t.contains("Chains."));
+            }
             if messages.iter().any(is_hide_request) {
                 m.call(FINISH_SCENE, &[]);
                 out.extend(messages);

@@ -84,6 +84,17 @@ pub mod field {
     pub const MDL_SPHERE_CENTER: u32 = 3321;
     pub const MDL_SPHERE_RADIUS: u32 = 3322;
     pub const MDL_LIGHTMAPS: u32 = 3326;
+    /// The layout's SpeedTree list (`SPT ` structs naming a tree, 3353); rooms' trees index
+    /// it.
+    pub const ARL_TREES: u32 = 3355;
+    pub const ARL_TREE_NAME: u32 = 3353;
+    /// A room's placed trees (`SPT ` structs: 4 position, 5 rotation, 3356 scale, 3357 index
+    /// into the layout's list, 3375 colour, 3379 a flag).
+    pub const RML_TREES: u32 = 3354;
+    pub const TREE_SCALE: u32 = 3356;
+    pub const TREE_INDEX: u32 = 3357;
+    pub const TREE_COLOR: u32 = 3375;
+    pub const TREE_FLAG: u32 = 3379;
     /// A placed model's user parameters (`UPAR` structs: 3507 name, 3508 value), which its
     /// emitters naming that parameter take.
     pub const MDL_USER_PARAMS: u32 = 3506;
@@ -143,6 +154,9 @@ pub struct Arl {
     pub atmosphere: Option<Atmosphere>,
     /// The level's clouds (22600), when it has them.
     pub clouds: Option<Clouds>,
+    /// The SpeedTrees the rooms place (`.spt` stems, 3355), indexed by
+    /// [`TreePlacement::tree`].
+    pub trees: Vec<String>,
 }
 
 /// A level's clouds (`CLDS`, 22600), which the sky's cloud layer reads.
@@ -486,6 +500,11 @@ impl Arl {
                 .filter(|m| !m.is_empty()),
             atmosphere,
             clouds,
+            trees: d
+                .structs(root, field::ARL_TREES)?
+                .into_iter()
+                .map(|t| Ok(d.opt_str(t, field::ARL_TREE_NAME)?.unwrap_or_default()))
+                .collect::<TypedResult<_>>()?,
         })
     }
 
@@ -544,6 +563,23 @@ pub struct Rml {
     /// Where the room sits in the level; placements are relative to it.
     pub transform: Transform,
     pub placements: Vec<Placement>,
+    /// The trees, bushes and grass the room places.
+    pub trees: Vec<TreePlacement>,
+}
+
+/// A SpeedTree placed in a room (`SPT `, 3354). Provisional: field meanings are read from
+/// the data (3356 values near 0.3–1 per instance, 3357 small indices into the layout's tree
+/// list), not traced in DAOrigins.exe.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TreePlacement {
+    /// Index into [`Arl::trees`].
+    pub tree: usize,
+    /// Relative to the room.
+    pub transform: Transform,
+    pub scale: f32,
+    /// A per-instance colour (rgba), e.g. a tint.
+    pub color: [f32; 4],
+    pub flag: i64,
 }
 
 impl Rml {
@@ -560,9 +596,24 @@ impl Rml {
         for m in d.structs(root, field::RML_MODELS)? {
             placements.push(read_placement(gff, m)?);
         }
+        let mut trees = Vec::new();
+        for t in d.structs(root, field::RML_TREES)? {
+            let index = d.opt_i64(t, field::TREE_INDEX)?.unwrap_or(0);
+            let tree = usize::try_from(index).map_err(|_| {
+                crate::typed::TypedError::Invalid(format!("rml tree: index {index}"))
+            })?;
+            trees.push(TreePlacement {
+                tree,
+                transform: read_transform(&d, t)?,
+                scale: d.opt_f32(t, field::TREE_SCALE)?.unwrap_or(1.0),
+                color: d.opt_vec4(t, field::TREE_COLOR, 1.0)?.unwrap_or([1.0; 4]),
+                flag: d.opt_i64(t, field::TREE_FLAG)?.unwrap_or(0),
+            });
+        }
         Ok(Rml {
             transform,
             placements,
+            trees,
         })
     }
 }
@@ -667,6 +718,41 @@ mod tests {
         assert_eq!(arl.bounds(), Some(([-1.0, -2.0, -3.0], [5.0, 2.0, 3.0])));
         assert_eq!(arl.sun, None);
         assert!(arl.effects.is_empty());
+        assert!(arl.trees.is_empty());
+    }
+
+    #[test]
+    fn reads_trees() {
+        let mut b = Builder::new(b"ARL ");
+        let t0 = b.add(b"SPT ", vec![(field::ARL_TREE_NAME, s("lvl_tre_pine"))]);
+        let t1 = b.add(b"SPT ", vec![(field::ARL_TREE_NAME, s("lvl_gra_short"))]);
+        let root = b.add(b"AREA", vec![(field::ARL_TREES, structs(&[t0, t1]))]);
+        let arl = Arl::from_gff4(&b.finish(root)).unwrap();
+        assert_eq!(arl.trees, vec!["lvl_tre_pine", "lvl_gra_short"]);
+
+        let mut b = Builder::new(b"RML ");
+        let p = b.add(
+            b"SPT ",
+            vec![
+                (field::POSITION, Value::Vec3([1.0, 2.0, 3.0])),
+                (field::ROTATION, Value::Quat([0.0, 0.0, 0.6, 0.8])),
+                (field::TREE_SCALE, Value::F32(0.35)),
+                (field::TREE_INDEX, Value::I32(1)),
+                (field::TREE_COLOR, Value::Color([0.1, 0.2, 0.3, 1.0])),
+            ],
+        );
+        let root = b.add(b"ROOM", vec![(field::RML_TREES, structs(&[p]))]);
+        let rml = Rml::from_gff4(&b.finish(root)).unwrap();
+        assert_eq!(rml.trees.len(), 1);
+        let t = &rml.trees[0];
+        assert_eq!((t.tree, t.scale, t.flag), (1, 0.35, 0));
+        assert_eq!(t.transform.position, [1.0, 2.0, 3.0]);
+        assert_eq!(t.color, [0.1, 0.2, 0.3, 1.0]);
+
+        let mut b = Builder::new(b"RML ");
+        let p = b.add(b"SPT ", vec![(field::TREE_INDEX, Value::I32(-1))]);
+        let root = b.add(b"ROOM", vec![(field::RML_TREES, structs(&[p]))]);
+        assert!(Rml::from_gff4(&b.finish(root)).is_err());
     }
 
     #[test]
