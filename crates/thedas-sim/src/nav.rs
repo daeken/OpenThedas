@@ -274,6 +274,26 @@ impl Sim {
             .collect()
     }
 
+    /// Whether a placeable is a door: its appearance's state controller (`placeable_types`)
+    /// is `StateCnt_Door`.
+    pub fn is_door(&self, id: thedas_script::vm::ObjectId) -> bool {
+        let Some(o) = self.world.get(id) else {
+            return false;
+        };
+        if o.kind != crate::world::ObjectKind::Placeable {
+            return false;
+        }
+        let tables = self.world.tables();
+        let Some(types) = tables.get(0, "placeable_types") else {
+            return false;
+        };
+        matches!(
+            types.cell_by_hash(COL_STATE_CONTROLLER, o.appearance as i64),
+            Some(thedas_formats::gda::Cell::String(s))
+                if crate::engine::clean(s).eq_ignore_ascii_case("StateCnt_Door")
+        )
+    }
+
     /// Every door of an area with its doorway's grid cells, open or not.
     fn doorways(
         &mut self,
