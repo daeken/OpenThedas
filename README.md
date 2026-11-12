@@ -10,7 +10,7 @@ repository.
 
 ## Status
 
-Last updated 2026-11-12 22:15 UTC, main 99232ea
+Last updated 2026-11-12 23:25 UTC, main 4f84bcf
 
 For everything that is wrong or missing, in detail and split into items that can be picked up in
 parallel, see [docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md).
@@ -34,7 +34,8 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
     - line cutscene cameras are placed with their cutscene's stage, and ActionJumpToCamera puts the camera on stage cameras: the City Elf Vaughan scene plays as staged shots.
   - Open:
     - cameras and actors linked with LinkToActor are placed (provisional: links use the target's root frame);
-    - City Elf: Vaughan faces away from the camera in one shot (provisional; waiting on reference frames from the original).
+    - a cutscene's last view is held for the rest of the conversation line it plays over (provisional), which frames the City Elf opening as the original does;
+    - City Elf: Vaughan faces away from the camera in one shot (reference frames from the original now exist; comparison pending).
 - 🟡 **Exploration and camera**:
   - Walking, click-to-pick, doors and companions following. Followers come along on area changes, and they stand in the exe's formation slots and follow by its rules.
   - The area map shows map notes and only perceived enemies.
@@ -44,7 +45,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Creatures the camera is inside fade out as the exe does (0.25 m sphere against the models' creature-group physics shapes, head included; opacity 0.05; not in dialog or cutscenes). Provisional: the shapes are placed by rest pose, not the animated skeleton.
   - With a pad, A walks through open doors instead of using them.
   - The follow camera resets behind the leader after a load and at the end of a cutscene, as the exe does, and keeps its zoom across loads.
-  - Loading screens: a new area, a save load and a new game build on a worker thread while the window keeps presenting the original's loading movie (load_town for a save load, a new game or a change of area list, with the script's hint; load_light for a change within one area list). The screen goes up before the old area goes, as in the exe: a scripted transition is held one update (33 ms, provisional length), the world holds still, its sounds duck and the camera resets as the world comes up. load_town plays its outro in about 1.6 s at 60 fps. Not yet: the world map staying up while travelling. Headless captures load within the frame as before; `THEDAS_ASYNC_LOADS=1` uses the worker there too (frames wait for the load), `THEDAS_HIDDEN_WINDOW=1` runs the window unseen for driving it with `--control` (a test hook), and `THEDAS_NO_LOAD_MOVIE=1` leaves the movie out.
+  - Loading screens: a new area, a save load and a new game build on a worker thread while the window keeps presenting the original's loading movie (load_town for a save load, a new game or a change of area list, with the script's hint; load_light for a change within one area list). The screen goes up before the old area goes, as in the exe: a scripted transition is held one update (33 ms, provisional length), the world holds still, its sounds duck and the camera resets as the world comes up. load_town plays its outro in about 1.6 s at 60 fps. A world map journey keeps the map up as its loading screen. Headless captures load within the frame as before; `THEDAS_ASYNC_LOADS=1` uses the worker there too (frames wait for the load), `THEDAS_HIDDEN_WINDOW=1` runs the window unseen for driving it with `--control` (a test hook), and `THEDAS_NO_LOAD_MOVIE=1` leaves the movie out.
   - The field of view narrows from 60° to 42.5° toward the far, tactical end of zoom, as the exe does. Page Up and Page Down zoom.
   - Creatures placed by an area stand on its floor, as the exe projects them (this was the "see-through guard" in the Dust Town opening).
 - 🟡 **Combat and simulation**:
@@ -59,7 +60,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Corpses decay and fade as the exe does them; a body bag takes the corpse's place and draws its corpse model.
   - Live creatures block each other as the exe's capsules do (slide, no push, no re-path; the dead do not block), and a blocked walker keeps its own speed. QA graded it in the live app.
   - Ability functions ignore unknown ability ids as the exe does, and saves drop invalid ones on load.
-  - Training tutorials (the original's step-by-step first-play lessons) run from the scripts: SetTrainingMode, BeginTrainingStep, the completed-steps gate and the events that end each step. The camera half of the first step is in progress.
+  - Training tutorials (the original's step-by-step first-play lessons) run from the scripts: SetTrainingMode, BeginTrainingStep, the completed-steps gate and the events that end each step. Every lesson can be finished: each step's ending event has a sender, including while a screen or a tutorial popup holds the game. As in the exe, saving is refused while a lesson is active, and a load clears it.
   - The engine raises the mana-or-stamina-depleted, area-load-from-save and module pre-save events. Opening a screen tells the module. The damaged event and eight others were confirmed to come from scripts only.
   - Followers walking with the leader take their formation slots.
   - Visual effects applied at places (the Proving crowd) are exposed to rendering and drawn.
