@@ -1,0 +1,47 @@
+# Known gaps: tooling, platforms and project
+
+[Back to the index](../KNOWN_GAPS.md)
+
+Building and running on each platform, tests, CI, the command-line tool and the MCP server.
+
+## Code inventory
+
+Found by reading the code at main on 2026-11-12: provisional markers, stubs, ignored inputs and features with no code. "Original: not traced" means nobody has yet checked what the original does. Line numbers drift; search for the quoted names if a line has moved.
+
+### Documentation
+
+- **TOOL-001** **README lists `thedas-audio` as planned.** Original: n/a. Ours: the crate exists and is in use. Evidence: `README.md:146`. Size: S. Depends: none. Kind: bug.
+- **TOOL-002** **README layout table is out of date.** Original: n/a. Ours: no `thedas-audio` row; the `thedas-cli` row lists `ls`, `extract`, `dump`, `resolve`, `corpus` but not `script`, `sim`, `autoplay`, `navgrid`, `fsb`, `fev`, `play`, `audio-check`; `thedas-app` described as a free-fly viewer. Evidence: `README.md:131`, `README.md:144`, `crates/thedas-cli/src/main.rs:29`. Size: S. Depends: none. Kind: bug.
+- **TOOL-003** **README MCP tool table is incomplete.** Original: n/a. Ours: the server also has `screenshot`, `coverage`, `set_head_morph`, `world_map`, `travel`, `store`, `choose_party`, `job_board`, `popup`, `autopilot`, `level_up`, `loot`, `watch_object`, `use_ability`, `attach`, `detach`, `live_status`, `live_input`, `live_screenshot`, `live_sync`, none in the table. Evidence: `README.md:249`, `crates/thedas-mcp/src/main.rs:763`. Size: S. Depends: none. Kind: bug.
+- **TOOL-004** **No contributor documentation.** Original: n/a. Ours: no CONTRIBUTING file and no `docs/` folder; README refers to an "architecture doc" not in the repository. Evidence: `README.md:146`. Size: S. Depends: none. Kind: missing.
+
+### Build, platforms, packaging
+
+- **TOOL-005** **CI does not install Linux audio/input dev packages.** Original: n/a. Ours: `thedas-app` pulls cpal (ALSA) and gilrs (udev); `ci.yml` installs only Java and Rust. Whether ubuntu-latest builds is not known from the repository. Evidence: `.github/workflows/ci.yml:17`, `crates/thedas-app/Cargo.toml`. Size: S. Depends: none. Kind: unverified.
+- **TOOL-006** **CI checks only fmt, clippy and debug tests.** Original: n/a. Ours: no release build, no artifacts, no MSRV (1.85) job, no corpus run (needs game data). Evidence: `.github/workflows/ci.yml:24`, `Cargo.toml:10`. Size: S. Depends: none. Kind: missing.
+- **TOOL-007** **Packaging and installers.** Original: packaging/installers. Ours: no code found. Evidence: `.github/workflows/ci.yml:1`. Size: M. Depends: TOOL-006. Kind: missing.
+- **TOOL-008** **iOS and Android.** Original: iOS and Android targets. Ours: no code found; no `cfg(target_os)` anywhere in the workspace. Evidence: `Cargo.toml:1`. Size: L. Depends: none. Kind: missing.
+- **TOOL-009** **Platform path assumptions.** Original: n/a. Ours: Homebrew paths hard-coded for ffmpeg; Windows `ffmpeg.exe` and `HOME` problems (CAM-030, CAM-045). Evidence: `crates/thedas-app/src/intro.rs:103`. Size: S. Depends: CAM-030, CAM-045. Kind: bug.
+- **TOOL-010** **Build needs Java and a git dependency.** Original: n/a. Ours: Ruffle is pinned by git revision and compiles its globals with `asc.jar`, so builds need Java 17 and network access to GitHub. Evidence: `crates/thedas-ui/Cargo.toml`, `.github/workflows/ci.yml:17`. Size: S. Depends: none. Kind: unverified.
+- **TOOL-011** **No third-party licence notices.** Original: n/a. Ours: dependency licences (Symphonia MPL-2.0, Ruffle, cpal, wgpu) are noted only in a doc comment; no NOTICE file or `cargo-deny`. Evidence: `crates/thedas-audio/src/lib.rs:13`. Size: S. Depends: TOOL-007. Kind: missing.
+
+### Tests, benchmarks, fuzzing
+
+- **TOOL-012** **Thin test coverage in several crates.** Original: n/a. Ours: `#[test]` counts per crate: thedas-sim 199, thedas-formats 81, thedas-ui 71, thedas-app 66, thedas-render 65, thedas-audio 21, thedas-vfs 12, thedas-script 8, thedas-shader 6, thedas-mcp 2, thedas-cli 1. Files with none: `thedas-audio/src/library.rs`, `device.rs`; `thedas-app/src/cutactors.rs`, `live.rs`; `thedas-cli/src/{corpus,autoplay,audio,script,sim,main}.rs`; `thedas-mcp/src/{main,ui}.rs`; `thedas-formats/src/typed.rs`. Evidence: `crates/thedas-cli/src/dump.rs`, `crates/thedas-mcp/src/live.rs`. Size: M. Depends: none. Kind: missing.
+- **TOOL-013** **Tests needing an install are ignored.** Original: n/a. Ours: three `#[ignore]` tests need `THEDAS_INSTALL`; nothing runs them. Evidence: `crates/thedas-app/src/main.rs:3575`, `crates/thedas-app/src/intro.rs:682`, `crates/thedas-ui/src/atlas.rs:207`. Size: S. Depends: TOOL-006. Kind: missing.
+- **TOOL-014** **Benchmarks.** Original: benchmarks. Ours: no code found. Evidence: `Cargo.toml:1`. Size: S. Depends: none. Kind: missing.
+- **TOOL-015** **Fuzzing of parsers.** Original: fuzzing of parsers. Ours: no code found, though CLAUDE.md requires parsers never to panic. Evidence: `CLAUDE.md:11`. Size: M. Depends: none. Kind: missing.
+- **TOOL-016** **Corpus does not type-check every reader.** Original: n/a. Ours: corpus typed checks cover GDA, TLK, ARE, ARL, RML, MMH, MSH, MAO, MAT, STA, DDS, MTX, GFX, FXO, NCS, SPT, LDF, ANB, ANI, CUT, DLG, EVT, GAD, MOP, MOR, PLO, TNT, FEV, FSB; not `.phy`, `.stg`, emitters or Bink headers. Evidence: `crates/thedas-cli/src/corpus.rs:369`, `crates/thedas-cli/src/corpus.rs:585`. Size: S. Depends: none. Kind: missing.
+
+### Mod and MCP tooling
+
+- **TOOL-017** **Mod tooling is read-only.** Original: mod tooling. Ours: `ls`, `extract`, `dump` (one way, to JSON), `resolve` with provenance; no archive packer, no JSON-to-GFF, no DAZIP, no script compiler. Evidence: `crates/thedas-cli/src/main.rs:29`. Size: M. Depends: FMT-005, FMT-012, FMT-043. Kind: missing.
+- **TOOL-018** **MCP cannot drive several player actions directly.** Original: what a player can do. Ours: no dedicated tool found for equipping or unequipping from inventory, editing tactics, setting the quickbar, switching the leader, pausing, reading the journal or codex, saving to the player's save folder (`save_state` writes simulation JSON), changing options or inspecting audio; `call_engine_function`, `run_script` and `live_input` (attached game) are the fallbacks. Evidence: `crates/thedas-mcp/src/main.rs:903`. Size: M. Depends: none. Kind: missing.
+
+### Checked and looks complete
+
+- Workspace builds the CLI without the audio device feature; only the app enables cpal.
+- CI matrix runs fmt, clippy with `-D warnings` and tests on macOS, Linux and Windows on push to main and on pull requests.
+- `.gitignore` excludes game-data extensions and report folders.
+- CLI: archive listing/extraction, dump, resolve with provenance, script disasm/run/stats, headless sim, autoplay, navgrid, FSB/FEV listing and checks, offline event playback, audio-name check, corpus.
+- MCP: load, step, trace, objects, dialog, movement, travel, store, party picker, level-up, abilities, attack, loot, plots and locals, save/load state, UI movies with input and screenshots, attach to a running game.
