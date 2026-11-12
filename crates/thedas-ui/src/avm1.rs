@@ -129,7 +129,12 @@ pub const DA_RETURNING_FSCOMMANDS: &[&str] = &[
     "ListTacticItems",
     "GetObjectNameByID",
     "CreatureCanUseItem",
+    "HasAbility",
 ];
+
+/// `DAExternalCommands` functions that ask through `ExternalInterface.call` and use what it
+/// returns (answered by the game's query handler, as [`DA_RETURNING_FSCOMMANDS`]).
+pub const DA_EXTERNAL_QUERIES: &[&str] = &["GetGender"];
 
 /// Functions the game answers by setting a movie variable while the function runs (Scaleform's
 /// `GFxMovie::SetVariable` from inside an `ExternalInterface` handler, which Ruffle's handlers

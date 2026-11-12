@@ -28,6 +28,10 @@ pub mod field {
     pub const LIGHT_RADIUS: u32 = 6008;
     pub const AMBIENT_COLOR: u32 = 6010;
     pub const LIGHT_AFFECT_DOMAIN: u32 = 6296;
+    /// A point light's `IsStatic` (DAOrigins.exe reads it into the blueprint at 0x59490b).
+    pub const LIGHT_IS_STATIC: u32 = 6009;
+    /// A point light's `Version` (0x5949ec), which picks its influence formula.
+    pub const LIGHT_VERSION: u32 = 6345;
     /// A skeleton node's bone index.
     pub const BONE_INDEX: u32 = 6254;
     /// A skinned mesh's palette: the bone index each of its vertices' blend indices names.
@@ -49,27 +53,34 @@ pub const KIND_IRRADIANCE: FourCC = FourCC::new(b"nirr");
 pub const KIND_EMITTER: FourCC = FourCC::new(b"nemt");
 pub const KIND_AMBIENT_LIGHT: FourCC = FourCC::new(b"nalt");
 
-/// [`Light::Point`]'s affect domain bit for characters and objects.
+/// [`Light::Point`]'s affect domain for characters: the one value that puts a light in the
+/// character lists (DAOrigins.exe 0x464ea8).
 pub const DOMAIN_CHARACTERS: i64 = 1;
-/// [`Light::Point`]'s affect domain bit for level geometry.
+/// [`Light::Point`]'s affect domain the level light models give: any value other than
+/// [`DOMAIN_CHARACTERS`] (0, 2, absent) puts a light in the level's lists.
 pub const DOMAIN_LEVEL: i64 = 2;
 
 /// A light node, as found in a level's `<room>_ll` and `<room>_lc` models.
 ///
-/// Provisional: `6007` is the colour and `6008` the radius of point lights (`nplt`), `6010`
-/// the colour of ambient lights (`nalt`), and `6296` what the light affects (xoreos names it
-/// `LightAffectDomain`). The rooms' level light models (`<room>_ll`) give 2 on every light
-/// (lamps, bounces, window light); their character light models (`<room>_lc`) give 1 on the
-/// `Char_sun`/`Char_bounce`/`Char_ambient` lights, which reach 600 units. Read as a mask: 1
-/// characters and objects, 2 level geometry.
+/// `6007` is the colour and `6008` the radius of point lights (`nplt`), `6010` the colour of
+/// ambient lights (`nalt`). The point light blueprint loader (DAOrigins.exe 0x594700-0x594a81)
+/// also reads `6009` `IsStatic`, `6345` `Version` and `6296` `AffectsDomain`: 0, 1 or 2
+/// (anything else reads as 0). The light manager (0x464e30) puts a light of domain 1 in the
+/// characters' lists and any other in the level's (see `thedas_render::d3d::pick_lights`).
+/// The rooms' level light models (`<room>_ll`) give 2 on every light; their character light
+/// models (`<room>_lc`) give 1 on the `Char_sun`/`Char_bounce`/`Char_ambient` lights.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Light {
     Point {
         color: [f32; 4],
         radius: f32,
-        /// What the light affects (see [`Light`]): [`DOMAIN_CHARACTERS`], [`DOMAIN_LEVEL`],
-        /// or both; `None` when the node does not say.
+        /// What the light affects (see [`Light`]): [`DOMAIN_CHARACTERS`] or the level;
+        /// `None` when the node does not say.
         affect_domain: Option<i64>,
+        /// `IsStatic` (6009); `None` when the node does not say.
+        is_static: Option<bool>,
+        /// `Version` (6345); `None` when the node does not say.
+        version: Option<i64>,
     },
     Ambient {
         color: [f32; 4],
@@ -196,6 +207,31 @@ impl Mmh {
         out
     }
 
+    /// Every irradiance node (`nirr`) naming a probe file, with the chain of local transforms
+    /// from the model root down to it, depth first in file order.
+    pub fn irradiance_pieces(&self) -> Vec<(&str, Vec<Transform>)> {
+        fn walk<'a>(
+            n: &'a Node,
+            chain: &mut Vec<Transform>,
+            out: &mut Vec<(&'a str, Vec<Transform>)>,
+        ) {
+            chain.push(n.transform);
+            if let Some(f) = &n.irradiance {
+                out.push((f.as_str(), chain.clone()));
+            }
+            for c in &n.children {
+                walk(c, chain, out);
+            }
+            chain.pop();
+        }
+        let mut out = Vec::new();
+        let mut chain = Vec::new();
+        for n in &self.nodes {
+            walk(n, &mut chain, &mut out);
+        }
+        out
+    }
+
     /// The irradiance probe file the first `nirr` node names (a light probe model, such as
     /// the paperdoll's `el_lp_outside_day`).
     pub fn irradiance_file(&self) -> Option<&str> {
@@ -307,6 +343,21 @@ fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>
             children.push(n);
         }
     }
+    finish_node(gff, id, kind, transform, children).map(Some)
+}
+
+/// A node's own fields, once its children are read. Kept out of line so that the recursion
+/// in [`read_node`] carries only the child walk: a deep (or cyclic, until [`MAX_DEPTH`])
+/// tree would otherwise overflow the stack in debug builds.
+#[inline(never)]
+fn finish_node(
+    gff: &Gff4,
+    id: StructId,
+    kind: FourCC,
+    transform: Transform,
+    children: Vec<Node>,
+) -> TypedResult<Node> {
+    let d = Doc::new(gff, "mmh node");
     // A mesh node without a chunk name (such as the `GOB` root of many props) only groups
     // its children.
     let mesh = if kind == KIND_MESH {
@@ -346,6 +397,8 @@ fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>
             color: d.opt_vec4(id, field::LIGHT_COLOR, 1.0)?.unwrap_or([1.0; 4]),
             radius: d.opt_f32(id, field::LIGHT_RADIUS)?.unwrap_or(0.0),
             affect_domain: d.opt_i64(id, field::LIGHT_AFFECT_DOMAIN)?,
+            is_static: d.opt_i64(id, field::LIGHT_IS_STATIC)?.map(|v| v != 0),
+            version: d.opt_i64(id, field::LIGHT_VERSION)?,
         })
     } else if kind == KIND_AMBIENT_LIGHT {
         Some(Light::Ambient {
@@ -361,7 +414,7 @@ fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>
     } else {
         None
     };
-    Ok(Some(Node {
+    Ok(Node {
         kind,
         name: d.opt_str(id, field::NAME)?,
         transform,
@@ -382,7 +435,7 @@ fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>
             None => None,
         },
         children,
-    }))
+    })
 }
 
 /// Kept out of line: the emitter's fields would otherwise sit in every frame of the
@@ -483,6 +536,7 @@ mod tests {
                 (field::LIGHT_COLOR, Value::Color([0.5, 0.25, 0.0, 1.0])),
                 (field::LIGHT_RADIUS, Value::F32(12.0)),
                 (field::LIGHT_AFFECT_DOMAIN, Value::I32(2)),
+                (field::LIGHT_IS_STATIC, Value::U8(1)),
                 (field::CHILDREN, generic(&[t])),
             ],
         );
@@ -500,7 +554,9 @@ mod tests {
             &Light::Point {
                 color: [0.5, 0.25, 0.0, 1.0],
                 radius: 12.0,
-                affect_domain: Some(2)
+                affect_domain: Some(2),
+                is_static: Some(true),
+                version: None,
             }
         );
         assert_eq!(lights[0].chain[1].position, [1.0, 2.0, 3.0]);
