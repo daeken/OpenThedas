@@ -651,7 +651,7 @@ impl PadPlay {
         };
         let at = match from {
             Some(i) => focusnav::step(&targets, i, (dx, dy)),
-            None => focusnav::first(&targets)?,
+            None => focusnav::first_content(&targets)?,
         };
         let t = &targets[at];
         let (x, y) = focusnav::rest(t);
