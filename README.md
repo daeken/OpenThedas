@@ -10,7 +10,10 @@ repository.
 
 ## Status
 
-Last updated 2026-11-12 15:45 UTC, main 3d44de7
+Last updated 2026-11-12 16:45 UTC, main f5ae46b
+
+For everything that is wrong or missing, in detail and split into items that can be picked up in
+parallel, see [docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md).
 
 Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–20, with fixes merged since then noted.
 
@@ -27,17 +30,20 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
     - cutscenes named by conversation lines (the Human Noble, Dalish and Dwarf Noble intros);
     - the original's default speaker framing for unstaged lines;
     - cutscene and conversation actors posed and animated by their tracks, and conversation lines leaving creatures on their stage marks in the sim, as the exe does (Oskias sits; the Dalish hunters face the hero);
-    - conversations start as the exe starts them: dialog game mode for the talk, and talk commands go through the dialogue event to the target's script. A first line that plays before its screen is up no longer stalls the conversation.
+    - conversations start as the exe starts them: dialog game mode for the talk, and talk commands go through the dialogue event to the target's script. A first line that plays before its screen is up no longer stalls the conversation;
+    - line cutscene cameras are placed with their cutscene's stage, and ActionJumpToCamera puts the camera on stage cameras: the City Elf Vaughan scene plays as staged shots.
   - Open:
-    - cameras placed by JumpToCamera or LinkToActor (most per-line cinematics);
-    - City Elf: Vaughan's scene plays on the gameplay camera instead of a staged shot (in progress).
+    - cameras placed by LinkToActor;
+    - City Elf: Vaughan faces away from the camera in one shot (provisional; waiting on reference frames from the original).
 - 🟡 **Exploration and camera**:
   - Walking, click-to-pick, doors and companions following. Followers come along on area changes, and they stand in the exe's formation slots and follow by its rules.
   - The area map shows map notes and only perceived enemies.
   - The follow camera uses the exe's 0.25 m sphere sweep, pull-in and ease-out, and its starting shot (3 m behind, at the leader's height). QA confirmed it at all six origin starts.
   - Doors are posed by their state (open, Open_2, swinging, fallen), and their camera and click shapes follow the pose.
   - With a pad, walking aims at a point ahead and the route goes round obstacles; it no longer stops dead at the first one.
-  - Open: at close range the camera can end up inside the hero; the exe's fade of creatures the camera is inside is in progress. The Valendrian start (City Elf) has the wrong pitch.
+  - Creatures the camera is inside fade out as the exe does (0.25 m sphere, opacity 0.05, not in dialog or cutscenes). Provisional: the creature shape tested; the exe tests the models' own physics shapes, and the switch to those is in progress.
+  - With a pad, A walks through open doors instead of using them.
+  - Open: the exe resets the follow camera at the end of loading, a cutscene and a movie, and keeps the zoom across loads; ours does neither yet (in progress).
 - 🟡 **Combat and simulation**:
   - NWScript VM with a large share of the engine functions; melee and ability timing; threat; AI-driven party; tactics; loot.
   - Containers hold their template's items and open on USE with the original loot panel (Take All, Close).
@@ -47,7 +53,9 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Melee attackers take slots on the target's 40-slot melee ring at the bodies' reach, as the exe places them, and step into place before swinging. The default body radius is the exe's 0.6 m.
   - Per-hand attack results are exposed read-only for the presentation (swing and impact sounds).
   - All six origins play past their openings in the simulation (QA).
-  - Corpses decay as the exe does them.
+  - Corpses decay and fade as the exe does them; a body bag takes the corpse's place and draws its corpse model.
+  - Live creatures block each other as the exe's capsules do (slide, no push, no re-path; the dead do not block). Merged and still being graded.
+  - Ability functions ignore unknown ability ids as the exe does, and saves drop invalid ones on load.
   - Visual effects applied at places (the Proving crowd) are exposed to rendering and drawn.
   - Not every script engine function is implemented.
 - 🟡 **Party, inventory, journal and other UI screens**:
@@ -59,6 +67,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - With a pad: the D-pad types letters into a focused text field, and focus reaches empty equipment slots.
   - Items with no icon of their own show their base type's.
   - Save screens show the hero's name, level and class. The character record lists Heroic Accomplishments.
+  - Level Up shows the member's portrait. In combat each party portrait shows what that member is doing, and hovering a portrait shows the class.
   - Open: screens have not all been audited against the original.
 - 🟡 **Rendering**:
   - Working: areas, terrain, sky, fog, clouds, bloom, colour grading, dynamic sun shadows (Low to High detail) and the original shaders.
@@ -67,8 +76,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Lava draws with its own shaders. Level-wide layouts draw (horizons, water, tents), with probe cubemaps as the environment map. Missing material textures fall back to the parameter's default, not black.
   - Per-object opacity, for the camera fade and corpse decay.
   - Open:
-    - SpeedTree `.spt` files parse but are not drawn;
-    - QA: the hero's equipped helm does not draw in the Proving duel save.
+    - SpeedTrees draw as billboards from the level's billboard atlas (interim); full SpeedTree geometry, grass and bushes are not drawn.
   - The backend stays on wgpu, and its types are kept inside `thedas-render`.
 - 🟡 **Audio**:
   - Merged:
@@ -95,7 +103,7 @@ None open. The Proving armour chest was fixed by #253 and #254.
 - 🟡 **Dwarf Noble**: intro cutscene plays and the opening is explorable. Cutscene actors are not animated yet.
 - 🟡 **Dwarf Commoner**: intro cutscene cameras play and the camera starts inside the house. The path plays forward through the tavern and the Proving.
   - Oskias sits and the duel can be finished with the pad.
-- 🟡 **City Elf**: explorable from inside the room. Cyrion waiting in the next room matches the data. Vaughan's scene camera is in progress.
+- 🟡 **City Elf**: explorable from inside the room. Cyrion waiting in the next room matches the data. Vaughan's scene plays as staged shots.
 - 🟡 **Dalish Elf**: intro cutscene plays and the journal lists the origin quest. After the opening talk the three hunters stay on their marks facing the hero.
 - 🟡 **Mage**: explorable.
 
@@ -143,7 +151,7 @@ simulation.
 | `thedas-mcp` | An MCP server over the simulation, so an AI assistant (or any MCP client) can play and test the game |
 | `thedas-cli` | The `thedas` tool: `ls`, `extract`, `dump`, `resolve`, `corpus` |
 
-Planned crates follow the architecture doc: `thedas-audio`, `thedas-video`.
+Planned crates follow the architecture doc: `thedas-video` (movies currently go through an external `ffmpeg`).
 
 ## Playing
 
