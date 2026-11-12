@@ -232,6 +232,8 @@ const MELEE_TALENT_TOLERANCE: f32 = 1.0;
 /// start step (0x7a87c0) tests the two creatures' current positions (0x6a3dc0); the
 /// simulation has no frames, so it looks this often. Provisional.
 const APPROACH_CHECK_MS: u64 = 100;
+/// How far apart a moving creature's position is tested against triggers as it walks, in metres.
+const TRIGGER_STEP: f32 = 0.5;
 
 /// How far inside its reach a melee attacker's place on the target's ring is (metres).
 /// Provisional.
@@ -1665,8 +1667,7 @@ impl Sim {
     /// Puts every creature that is moving (a started `CommandMoveTo*` at the front of its
     /// queue) where it has got to by now, on a straight line at the command's pace. A move
     /// that is replaced before it finishes so starts the next one from there, as continuous
-    /// movement does. Provisional: the path is straight and triggers on the way are crossed
-    /// only when the move finishes.
+    /// movement does, crossing the triggers on the way.
     /// The route a mover takes from where it is to `to` in its area: the area's pathing
     /// grid's route (see `nav::route`), as waypoints ending at `to`; empty (a straight line)
     /// when there is no grid, either end is off it or no route exists.
@@ -1768,11 +1769,35 @@ impl Sim {
             let p = along(from, &points, f);
             // A mover faces the way it goes, leg by leg.
             let dir = direction_along(from, &points, f);
+            let Some(was) = self.world.get(id).map(|o| o.position) else {
+                continue;
+            };
+            // Triggers are crossed on the way, not only where a move ends: a move replaced
+            // before it finishes (a held stick re-aiming the hero ahead, a new click) still
+            // enters and leaves what it walked through. Sampled every half metre between
+            // where the mover was and where it is now. Provisional: DAOrigins.exe's trigger
+            // test during locomotion is not traced.
+            let steps = (crate::engine::dist(was, p) / TRIGGER_STEP).ceil() as usize;
+            for i in 1..steps {
+                let t = i as f32 / steps as f32;
+                let at = [
+                    was[0] + (p[0] - was[0]) * t,
+                    was[1] + (p[1] - was[1]) * t,
+                    was[2] + (p[2] - was[2]) * t,
+                ];
+                if let Some(o) = self.world.get_mut(id) {
+                    o.position = at;
+                }
+                self.update_triggers(id);
+            }
             if let Some(o) = self.world.get_mut(id) {
                 o.position = p;
                 if let Some((dx, dy)) = dir {
                     o.facing = crate::world::facing_toward(dx, dy);
                 }
+            }
+            if was != p {
+                self.update_triggers(id);
             }
         }
     }
@@ -2298,8 +2323,10 @@ impl Sim {
             // its route, or a straight line).
             let here = self.world.get(id).map(|o| (o.position, o.area));
             if let Some((now_at, Some(a))) = here.filter(|f| f.1 == Some(l.area)) {
-                let from = cmd.from.map_or(now_at, |f| f.0);
-                let points = if cmd.path.is_empty() {
+                // A move that was under way has crossed what it walked through already
+                // (`advance_movers`); only the rest, to its end, is left.
+                let from = now_at;
+                let points = if cmd.path.is_empty() || cmd.from.is_some() {
                     vec![l.position]
                 } else {
                     cmd.path.clone()
@@ -3850,6 +3877,44 @@ mod tests {
         assert!(
             (dog_pos[0] - 9.0).abs() < 1e-4,
             "dog follows a metre behind: {dog_pos:?}"
+        );
+    }
+
+    #[test]
+    fn a_move_replaced_before_it_ends_still_crosses_triggers() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let tr = s.world.spawn(ObjectKind::Trigger, "t");
+        s.world.hero = Some(hero);
+        for id in [hero, tr] {
+            s.world.get_mut(id).unwrap().area = Some(area);
+        }
+        {
+            let t = s.world.get_mut(tr).unwrap();
+            t.position = [2.0, 0.0, 0.0];
+            t.geometry = vec![
+                [-0.5, -1.0, 0.0],
+                [0.5, -1.0, 0.0],
+                [0.5, 1.0, 0.0],
+                [-0.5, 1.0, 0.0],
+            ];
+        }
+        // As a held stick does: aim 3 m ahead, and re-aim every 250 ms before arriving.
+        for _ in 0..8 {
+            let x = s.world.get(hero).unwrap().position[0];
+            s.order_move(hero, [x + 3.0, 0.0, 0.0]);
+            s.tick(250);
+        }
+        let x = s.world.get(hero).unwrap().position[0];
+        assert!(x > 3.0, "the hero got past the trigger: {x}");
+        let entered = s.world.trace.entries.iter().any(
+            |e| matches!(e, crate::trace::TraceEntry::EventQueued { target, .. } if *target == tr),
+        );
+        assert!(entered, "the trigger heard the hero");
+        assert!(
+            !s.world.in_triggers.contains_key(&hero),
+            "and the hero left it"
         );
     }
 
