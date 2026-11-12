@@ -709,7 +709,8 @@ impl DrawnKey {
             template: o.template.clone(),
             appearance: o.appearance,
             gender: o.fields.get("Gender").copied(),
-            head_morph: o.head_morph.clone(),
+            // With the choices made over it (character creation's hair, beard, colours).
+            head_morph: sim.face_name(o.id).or_else(|| o.head_morph.clone()),
             equipment: o
                 .equipment
                 .iter()
