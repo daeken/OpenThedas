@@ -763,6 +763,11 @@ impl<'a> Loader<'a> {
         // drawn beyond the far distance), and its bounds, once.
         type Built = (Vec<(usize, usize, bool)>, Vec3, f32);
         let mut built_trees: HashMap<usize, Option<Built>> = HashMap::new();
+        // By ground cell, tree, part mesh, material and whether it is the billboard: the
+        // placements' transforms, points and far distances.
+        type Batch = Vec<(Mat4, Vec3, f32)>;
+        type BatchKey = ((i64, i64), usize, usize, usize, bool);
+        let mut batches: BTreeMap<BatchKey, Batch> = BTreeMap::new();
         for &(tree, placement, scale) in spots {
             let built = built_trees.entry(tree).or_insert_with(|| {
                 let name = format!("{}.spt", trees.get(tree)?.to_ascii_lowercase());
@@ -831,36 +836,90 @@ impl<'a> Loader<'a> {
                 let (lo, hi) = (Vec3::from(mesh.bounds.0), Vec3::from(mesh.bounds.1));
                 Some((parts, (lo + hi) * 0.5, (hi - lo).length() * 0.5))
             });
-            let Some((parts, centre, radius)) = built.clone() else {
+            let Some((parts, _, radius)) = built.clone() else {
                 continue;
             };
             let transform = placement * Mat4::from_scale(Vec3::splat(scale));
-            let centre = transform.transform_point3(centre);
             // Provisional: the LOD class (RML 3379) is taken as 0, as in every ost100d
             // placement.
             let far = DrawLod::far(radius * scale, 0);
             let anchor = placement.transform_point3(Vec3::ZERO);
+            let cell = (
+                (anchor.x / TREE_CELL).floor() as i64,
+                (anchor.y / TREE_CELL).floor() as i64,
+            );
             for (mesh, material, beyond) in parts {
-                let lod = Some(DrawLod {
+                batches
+                    .entry((cell, tree, mesh, material, beyond))
+                    .or_default()
+                    .push((transform, anchor, far));
+            }
+        }
+        // Each tree type's part, per cell of the ground, is one draw: its placements' copies
+        // merged in world space. Interim batching (the game instances each placement with
+        // shader constants); the LOD switch is per cell, at the mean far distance from the
+        // placements' mean point, so a tree switches up to about a cell's width early or
+        // late (provisional).
+        for ((cell, tree, mesh, material, beyond), placed) in batches {
+            let Some(source) = self.scene.meshes.get(mesh) else {
+                continue;
+            };
+            let mut vertices = Vec::with_capacity(source.vertices.len() * placed.len());
+            let mut indices = Vec::with_capacity(source.indices.len() * placed.len());
+            for (transform, _, _) in &placed {
+                let base = vertices.len() as u32;
+                let turn = glam::Mat3::from_mat4(*transform);
+                vertices.extend(source.vertices.iter().map(|v| {
+                    Vertex {
+                        position: transform
+                            .transform_point3(Vec3::from(v.position))
+                            .to_array(),
+                        normal: (turn * Vec3::from(v.normal)).normalize_or_zero().to_array(),
+                        uv0: v.uv0,
+                        uv1: v.uv1,
+                    }
+                }));
+                indices.extend(source.indices.iter().map(|i| base + i));
+            }
+            let (lo, hi) = vertices.iter().fold(
+                (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+                |(lo, hi), v| {
+                    let p = Vec3::from(v.position);
+                    (lo.min(p), hi.max(p))
+                },
+            );
+            if vertices.is_empty() {
+                continue;
+            }
+            let n = placed.len() as f32;
+            let anchor = placed.iter().map(|p| p.1).sum::<Vec3>() / n;
+            let far = placed.iter().map(|p| p.2).sum::<f32>() / n;
+            let key = format!(
+                "{}:cell{}_{}{}",
+                self.scene.meshes[mesh].key,
+                cell.0,
+                cell.1,
+                if beyond { ":far" } else { "" }
+            );
+            let merged = self.push_mesh(key, vertices, indices);
+            self.scene.draws.push(DrawItem {
+                mesh: merged,
+                material,
+                transform: Mat4::IDENTITY,
+                lightmap: None,
+                sphere: ((lo + hi) * 0.5, (hi - lo).length() * 0.5),
+                model: name_of_tree(trees, tree),
+                room: String::new(),
+                room_id: None,
+                probe,
+                skin: None,
+                cast_shadow: Some(false),
+                lod: Some(DrawLod {
                     anchor,
                     far_sq: far * far,
                     beyond,
-                });
-                self.scene.draws.push(DrawItem {
-                    mesh,
-                    material,
-                    transform,
-                    lightmap: None,
-                    sphere: (centre, radius * scale),
-                    model: name_of_tree(trees, tree),
-                    room: String::new(),
-                    room_id: None,
-                    probe,
-                    skin: None,
-                    cast_shadow: Some(false),
-                    lod,
-                });
-            }
+                }),
+            });
         }
     }
 
@@ -2183,6 +2242,9 @@ fn leaf_cards(cards: &[LeafCard]) -> (Vec<MeshVertex>, Vec<u32>) {
     }
     (vertices, indices)
 }
+
+/// The side of the ground cells SpeedTree placements are batched by, in metres.
+const TREE_CELL: f32 = 24.0;
 
 /// A SpeedTree's name for diagnostics (`spt:<name>`).
 fn name_of_tree(trees: &[String], tree: usize) -> String {
