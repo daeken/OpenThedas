@@ -307,6 +307,12 @@ impl Sim {
             }
         }
         self.learn_held_recipes();
+        // A tutorial pause holds until the queue is empty (0x693630); a save that holds it
+        // with no tutorial left to dismiss would never resume. Provisional: whether the
+        // original saves the tutorial queue at all is not traced.
+        if self.world.tutorials.is_empty() {
+            self.world.tutorial_paused = false;
+        }
         self.save_issues = if save_revision < 3 {
             self.check_property_damage()
         } else {
@@ -380,6 +386,25 @@ mod tests {
         s.talk = Some(talk(false));
         s.load_game(s.save_game()).unwrap();
         assert!(s.talk.as_ref().is_some_and(|c| !c.ended));
+    }
+
+    #[test]
+    fn a_tutorial_pause_with_nothing_left_to_dismiss_does_not_survive_a_load() {
+        let mut s = sim();
+        s.world.tutorial_paused = true;
+        s.load_game(s.save_game()).unwrap();
+        assert!(!s.world.tutorial_paused);
+        // With tutorials still queued it holds, as the original's does until they are all
+        // dismissed.
+        s.world.tutorials.push(crate::journal::Tutorial {
+            resref: "tut_explore".into(),
+            title: None,
+            text: Some(1),
+            pauses: false,
+        });
+        s.world.tutorial_paused = true;
+        s.load_game(s.save_game()).unwrap();
+        assert!(s.world.tutorial_paused);
     }
 
     #[test]
