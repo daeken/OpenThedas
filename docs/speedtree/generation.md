@@ -799,6 +799,19 @@ made from level k − 1:
    (origin y − 0.5) · ((1 + g · k) · size used y · 0.5) of leaf i's texture, and each corner
    colour the average of the two leaves'. Leaves that were not paired do not carry over.
 
+### 3.8 Clarifications (round 2)
+
+1. **Zero maximum radius.** When a level's maximum radius is exactly 0, k = r / maximum is 0/0,
+   which the original computes as NaN and carries into the position (NaN never compares
+   greater than the maximum, so the clamp does not catch it). With a zero maximum the radius r
+   is 0 too, so the intended surface is a tube of zero radius on the skeleton: use k = 0 and
+   place every point at the centre C (the tube collapses), and note it as a deliberate
+   deviation from the NaN.
+2. **Flare factor order.** The flare distances are summed first, from 0, in flare order:
+   D = ((0 + d₁) + d₂) + …; then φ = 1 + D. When φ is exactly 1 the position is C + ν · ρr
+   (no multiplication by φ); otherwise C + ν · ρr · φ, computed as ((ν · ρr) · φ) per
+   component.
+
 ## Stage 6 — Bushes, grass and cattails
 
 There is no separate engine: `bsh_*`, `gra_*` and cattail files (`*_catgras`, `*_catflwr`) are
