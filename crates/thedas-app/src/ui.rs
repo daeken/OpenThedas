@@ -640,6 +640,7 @@ impl UiLayer {
             faded: false,
             ending: false,
             frame: 0,
+            outro_ms: 0.0,
         });
     }
 
@@ -655,8 +656,8 @@ impl UiLayer {
         self.loading.is_some()
     }
 
-    /// The load is done: the loading screen plays on past the `Stop` frame it holds on, through
-    /// its `Outro`, to its end, where it hides itself (see [`UiLayer::loading_frame`]).
+    /// The load is done: the loading screen plays its `Outro` scene (`_root.PlayScene`, as
+    /// the exe does) to its end, where it hides itself (see [`UiLayer::loading_frame`]).
     pub fn loading_end(&mut self) {
         let Some(l) = self.loading.as_mut() else {
             return;
@@ -666,19 +667,36 @@ impl UiLayer {
         }
         l.ending = true;
         let movie = l.kind.screen().movies()[0];
-        if !self.stage.movies.iter().any(|m| m.name == movie) {
+        // Its outro, as the exe plays it (`_root.PlayScene("Outro")`).
+        let outro = self.stage.call_in(
+            movie,
+            "_root.PlayScene",
+            &[thedas_ui::UiValue::String("Outro".into())],
+        );
+        if outro.is_none() {
             // No movie to play out: nothing will hide it.
             self.loading = None;
         }
     }
 
-    /// A loading screen playing out: it is played on (it may still be in its intro, short of
-    /// the `Stop` frame it holds on) until it reaches its last frame, where it hides itself
-    /// (`ExternalCommands.HideGuiScene(scene)`), and closes.
-    fn loading_frame(&mut self) {
+    /// A loading screen playing out its outro: it closes at its last frame, where it hides
+    /// itself (`ExternalCommands.HideGuiScene(scene)`), or after at most
+    /// [`LOADING_OUTRO_MAX_MS`].
+    fn loading_frame(&mut self, dt_ms: f64) {
         let Some(l) = self.loading.filter(|l| l.ending) else {
             return;
         };
+        // However the movie advances, the screen goes at most this long after the load is
+        // done, so a load can never leave the player waiting on it.
+        let left = l.outro_ms + dt_ms;
+        if left >= LOADING_OUTRO_MAX_MS {
+            log::info!("ui: the loading screen's outro ran over; closed");
+            self.loading = None;
+            return;
+        }
+        if let Some(l) = self.loading.as_mut() {
+            l.outro_ms = left;
+        }
         let movie = l.kind.screen().movies()[0];
         let frame = |stage: &mut thedas_ui::stage::Stage, p: &str| match stage.call_in(
             movie,
@@ -696,7 +714,6 @@ impl UiLayer {
             frame(&mut self.stage, "_totalframes"),
         ) {
             (Some(at), Some(last)) if at < last && at >= seen => {
-                self.stage.call_in(movie, "_root.play", &[]);
                 if let Some(l) = self.loading.as_mut() {
                     l.frame = at;
                 }
@@ -1054,7 +1071,7 @@ impl UiLayer {
         }
         self.show_cutscene_line(sim);
         self.show_script_popup(sim);
-        self.loading_frame();
+        self.loading_frame(dt_ms);
         let mut messages = self.stage.tick(dt_ms);
         // A script message box's answer carries the text typed into it, which the box set
         // as `GUIPopupLayer.InputText` just before (popuplayer.gfx's `OnButtonAction`); the
@@ -2020,7 +2037,13 @@ struct Loading {
     ending: bool,
     /// The movie's frame when last seen playing out.
     frame: u32,
+    /// How long it has been playing out.
+    outro_ms: f64,
 }
+
+/// The longest a loading screen plays out after its load (load_town's Outro is 38 frames,
+/// about 1.3 s at its 30 fps).
+const LOADING_OUTRO_MAX_MS: f64 = 2000.0;
 
 /// A screen's `GUI_*` id (script.ldf's `EVENT_TYPE_GUI_OPENED` constants), the inventory on a
 /// container as `GUI_CONTAINER_INVENTORY`. None for screens script.ldf names no id for.
