@@ -807,6 +807,19 @@ impl<'a> Loader<'a> {
                             false,
                         ));
                     }
+                    // Mesh leaves (7.3), already placed in tree space; drawn from both sides
+                    // like the cards.
+                    if let Some(lod) = mesh.leaf_meshes.lods.first()
+                        && !lod.is_empty()
+                    {
+                        let indices = both_sides(lod);
+                        let vertices = &mesh.leaf_meshes.vertices;
+                        parts.push((
+                            self.tree_mesh(&name, "leaf_meshes", vertices, indices),
+                            m,
+                            false,
+                        ));
+                    }
                 }
                 // Bushes and grass get no billboard: the exe leaves models named `_bsh_` or
                 // `_gra_` out of every billboard batch (0x533f18).
