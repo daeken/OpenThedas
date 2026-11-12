@@ -403,6 +403,19 @@ impl Rng {
     }
 }
 
+/// A floating message over a creature (`DisplayFloatyMessage(oCreature, sMessage, nStyle,
+/// nColor, fDuration)`), as DAOrigins.exe hands it to floatylayer.gfx.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FloatyMessage {
+    pub target: ObjectId,
+    pub text: String,
+    pub style: i32,
+    /// 0xRRGGBB.
+    pub colour: i32,
+    /// Seconds.
+    pub duration: f32,
+}
+
 /// Everything a save holds. The trace and the tables are not saved: the trace starts afresh
 /// and the tables come from the resources of the simulation that loads the save.
 #[derive(Clone, Serialize, Deserialize)]
@@ -519,6 +532,11 @@ pub struct World {
     pub rng: Rng,
     #[serde(skip)]
     pub trace: Trace,
+    /// The floating messages scripts showed over creatures (`DisplayFloatyMessage`: damage,
+    /// "Immune", "Miss", ...) that the interface has not taken yet. Output only: nothing in
+    /// the simulation reads it.
+    #[serde(skip)]
+    pub floaties: Vec<FloatyMessage>,
     #[serde(skip, default = "no_tables")]
     pub(crate) tables: Arc<crate::m2da::Tables>,
 }
@@ -625,6 +643,7 @@ impl World {
             world_map: Default::default(),
             rng: Rng::new(seed),
             trace: Trace::default(),
+            floaties: Vec::new(),
             tables,
         }
     }

@@ -42,7 +42,10 @@ impl Screen {
     pub fn movies(self) -> &'static [&'static str] {
         match self {
             // notifications.gfx: the journal's and codex's notifications (`Party.Alerts`).
+            // floatylayer.gfx: the pause border and the text and bars over creatures,
+            // under the panels.
             Screen::Hud => &[
+                "floatylayer.gfx",
                 "portraits.gfx",
                 "quickbar.gfx",
                 "minimap.gfx",

@@ -116,6 +116,14 @@ impl Composite {
     }
 }
 
+/// A message floaty up over a creature.
+struct Floaty {
+    id: u32,
+    target: thedas_script::vm::ObjectId,
+    /// Seconds until it goes.
+    left_s: f64,
+}
+
 pub struct UiLayer {
     pub stage: Stage,
     composite: Option<Composite>,
@@ -136,6 +144,9 @@ pub struct UiLayer {
     /// the last tooltip out again after they changed (see `thedas_ui::avm1::TOOLTIP_RELAYOUT`).
     tooltip_text: Option<thedas_ui::UiValue>,
     tooltip_relayout: u8,
+    /// The floating messages up over creatures (see [`UiLayer::update_floaties`]).
+    floaties: Vec<Floaty>,
+    next_floaty: u32,
     portraits: PortraitClock,
     paperdoll: PaperdollClock,
     /// Where the player's games are saved (none: the save and load screens list nothing).
@@ -297,6 +308,8 @@ impl UiLayer {
             minimap_frame: 0,
             tooltip_text: None,
             tooltip_relayout: 0,
+            floaties: Vec::new(),
+            next_floaty: 1,
             portraits: PortraitClock::default(),
             paperdoll: PaperdollClock::default(),
             saves: None,
@@ -402,6 +415,9 @@ impl UiLayer {
                     log::warn!("ui: a dialog box was asked for with no popup layer up");
                 }
             }
+            // floatylayer.gfx tells the game its visible size; the floaties are placed from
+            // the stage's own size here (see `update_floaties`).
+            "GUI.UpdateFloatyLayerStageSize" => {}
             "GUI.InvokeCallback" => {
                 let (Some(movie), Some(function)) = (args.first(), args.get(1)) else {
                     return true;
@@ -777,6 +793,14 @@ impl UiLayer {
         self.stage.bridge.set_value(name, v);
     }
 
+    /// Whether the player has paused the game (Space): the floaty layer's pause border and
+    /// "Paused" text (`Client.Paused`, `Client.UserPaused`).
+    pub fn set_paused(&self, paused: bool) {
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.paused = paused;
+        }
+    }
+
     /// conversation.gfx's continue action (it sends `Conversation.SelectResponse 0` when the
     /// line has nothing to choose).
     fn continue_conversation(&mut self) {
@@ -922,6 +946,130 @@ impl UiLayer {
     /// then has them redraw: the HUD's minimap (minimap.gfx) and the area map screen
     /// (map.gfx), which share the picture (`Area.Minimap`) and the arrays. Provisional: every
     /// living creature in the area is shown, all within the map's radius.
+    /// floatylayer.gfx's messages over creatures: each `DisplayFloatyMessage` a script made
+    /// (damage, "Miss", "Immune", ...) becomes a message floaty (`FLOATY_SYMBOL_MESSAGE`)
+    /// that follows its creature's head on screen until its time is up, fed as
+    /// DAOrigins.exe feeds the movie: the `FloatyLayer.Batch*` arrays, then
+    /// `FloatyLayer.ProcessBatchUpdates`. Positions are in the visible area's stage units
+    /// (`SetFloatyPosition` adds the area's offset itself). Provisional: the head height, the
+    /// time a floaty stays after its duration, and stacking several on one creature by
+    /// `BatchUpdateOffsets` are inferred from the movie, not traced.
+    pub fn update_floaties(
+        &mut self,
+        sim: &Arc<Mutex<Sim>>,
+        camera: &thedas_render::Camera,
+        dt_ms: f64,
+    ) {
+        use thedas_ui::UiValue;
+        const LAYER: &str = "_global.FloatyLayer";
+        const SYMBOL_MESSAGE: f64 = 1.0;
+        /// Seconds a floaty stays past its duration (its own fade).
+        const LINGER_S: f64 = 1.0;
+        /// Metres above a creature's feet.
+        const HEAD: f32 = 2.0;
+        let Some(movie) = self
+            .stage
+            .movies
+            .iter()
+            .position(|m| m.name == "floatylayer.gfx")
+        else {
+            // No layer up: what scripts showed meanwhile is dropped.
+            sim.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .world
+                .floaties
+                .clear();
+            self.floaties.clear();
+            return;
+        };
+        let num = UiValue::Number;
+        let (mut create, mut symbols, mut show) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut msg_ids, mut texts, mut styles, mut colours, mut durations) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut ids, mut offsets, mut places, mut destroy) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let size = self.stage.size();
+        let scale = thedas_ui::stage_scale(size, (1024.0, 768.0));
+        let (w, h) = (size.0 as f32, size.1 as f32);
+        let vp = camera.view_proj(w / h.max(1.0));
+        {
+            let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+            for f in std::mem::take(&mut sim.world.floaties) {
+                let id = self.next_floaty;
+                self.next_floaty += 1;
+                create.push(num(f64::from(id)));
+                symbols.push(num(SYMBOL_MESSAGE));
+                show.push(num(f64::from(id)));
+                msg_ids.push(num(f64::from(id)));
+                texts.push(UiValue::String(f.text));
+                styles.push(num(f64::from(f.style)));
+                colours.push(num(f64::from(f.colour)));
+                durations.push(num(f64::from(f.duration)));
+                self.floaties.push(Floaty {
+                    id,
+                    target: f.target,
+                    left_s: f64::from(f.duration.max(0.0)) + LINGER_S,
+                });
+            }
+            let mut per_target: std::collections::BTreeMap<u32, u32> = Default::default();
+            self.floaties.retain_mut(|f| {
+                f.left_s -= dt_ms / 1000.0;
+                let o = sim
+                    .world
+                    .get(f.target)
+                    .filter(|o| o.active && o.area == sim.world.area);
+                if f.left_s <= 0.0 || o.is_none() {
+                    destroy.push(num(f64::from(f.id)));
+                    return false;
+                }
+                let o = o.expect("checked");
+                let p = glam::Vec3::new(o.position[0], o.position[1], o.position[2] + HEAD);
+                let c = vp * p.extend(1.0);
+                let (x, y, alpha) = if c.w > 1e-4 {
+                    let n = c.truncate() / c.w;
+                    ((n.x + 1.0) * 0.5 * w, (1.0 - n.y) * 0.5 * h, 1.0)
+                } else {
+                    (0.0, 0.0, 0.0)
+                };
+                let stack = per_target.entry(f.target).or_default();
+                *stack += 1;
+                ids.push(num(f64::from(f.id)));
+                offsets.push(num(f64::from(*stack)));
+                places.extend([
+                    num(f64::from(x) / scale),
+                    num(f64::from(y) / scale),
+                    num(1.0),
+                    num(alpha),
+                    num(f64::from(f.id)),
+                ]);
+                true
+            });
+        }
+        let m = &mut self.stage.movies[movie];
+        let list = |v: Vec<UiValue>| UiValue::List(v);
+        for (k, v) in [
+            ("BatchCreateIDs", create),
+            ("BatchCreateSymbolIDs", symbols),
+            ("BatchShowIDs", show),
+            ("BatchHideIDs", Vec::new()),
+            ("BatchDestroyIDs", destroy),
+            ("BatchUpdateIDs", ids),
+            ("BatchUpdateOffsets", offsets),
+            ("BatchUpdatePositionsScalesAlphas", places),
+            ("BatchUpdateMessageIDs", msg_ids),
+            ("BatchUpdateMessageStrings", texts),
+            ("BatchUpdateMessageStyles", styles),
+            ("BatchUpdateMessageColours", colours),
+            ("BatchUpdateMessageDurations", durations),
+            ("BatchUpdateStatsIDs", Vec::new()),
+            ("BatchUpdateIconIDs", Vec::new()),
+            ("BatchUpdateOffscreenIDs", Vec::new()),
+        ] {
+            m.set(&format!("{LAYER}.{k}"), list(v));
+        }
+        m.call(&format!("{LAYER}.ProcessBatchUpdates"), &[]);
+    }
+
     pub fn update_minimap(&mut self, sim: &Arc<Mutex<Sim>>, camera: &thedas_render::Camera) {
         self.minimap_frame += 1;
         if self.minimap_frame < MINIMAP_EVERY {
