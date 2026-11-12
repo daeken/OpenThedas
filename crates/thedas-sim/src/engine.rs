@@ -488,6 +488,31 @@ pub fn call(
     a: &[Value],
 ) -> Option<VmResult<Option<Value>>> {
     let name = f.name.as_str();
+    // Sounds go to the presentation (see `crate::world::SoundRequest`).
+    let sound = match name {
+        "PlaySound" => Some(crate::world::SoundRequest::Event {
+            target: obj(a, 0),
+            event: string(a, 1),
+        }),
+        "PlaySoundSet" => Some(crate::world::SoundRequest::SoundSet {
+            target: obj(a, 0),
+            entry: int(a, 1),
+            probability: float(a, 2),
+        }),
+        "PlaySoundObject" => Some(crate::world::SoundRequest::Object { sound: obj(a, 0) }),
+        "PlayMusic" => Some(crate::world::SoundRequest::Music { name: string(a, 0) }),
+        "SetMusicIntensity" => Some(crate::world::SoundRequest::MusicIntensity {
+            intensity: int(a, 0),
+        }),
+        _ => None,
+    };
+    if let Some(req) = sound {
+        // Kept short when nothing takes them (a headless run).
+        if h.sim.world.sounds.len() >= 64 {
+            h.sim.world.sounds.remove(0);
+        }
+        h.sim.world.sounds.push(req);
+    }
     if PRESENTATION.contains(&name) {
         *h.sim
             .world
@@ -5697,7 +5722,9 @@ mod coverage_tests {
         void ActivateSoundByTag(string s, int b) = 102;\n\
         void AddItemProperty(object o, int p, int n) = 103;\n\
         void RemoveItemProperty(object o, int p) = 104;\n\
-        int[] GetItemProperties(object o, int s = FALSE) = 105;\n";
+        int[] GetItemProperties(object o, int s = FALSE) = 105;\n\
+        void PlaySound(object o, string s) = 106;\n\
+        void PlayMusic(string s) = 107;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -6421,6 +6448,31 @@ mod coverage_tests {
             &[Value::String("SND_BELLS".into()), Value::Int(1)],
         );
         assert!(active(&s, bells));
+    }
+
+    #[test]
+    fn script_sounds_go_to_the_presentation() {
+        let mut s = sim();
+        let o = s.world.spawn(ObjectKind::Placeable, "bell");
+        run(
+            &mut s,
+            1,
+            "PlaySound",
+            &[Value::Object(o), Value::String("glo/bell/ring".into())],
+        );
+        run(&mut s, 1, "PlayMusic", &[Value::String("theme".into())]);
+        assert_eq!(
+            std::mem::take(&mut s.world.sounds),
+            [
+                crate::world::SoundRequest::Event {
+                    target: o,
+                    event: "glo/bell/ring".into()
+                },
+                crate::world::SoundRequest::Music {
+                    name: "theme".into()
+                }
+            ]
+        );
     }
 
     #[test]

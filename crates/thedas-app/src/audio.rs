@@ -43,6 +43,8 @@ pub struct AudioState {
     pub line: Option<VoiceLine>,
     /// The cutscene playing (resource name) and how far it has played (seconds).
     pub cutscene: Option<(String, f32)>,
+    /// Events scripts played (`PlaySound`), with where the object stands (none: 2D).
+    pub script_sounds: Vec<(String, Option<[f32; 3]>)>,
     /// A boot movie playing (its file) and how far it has played (milliseconds): its own
     /// sound track plays with it.
     pub movie: Option<(std::path::PathBuf, f64)>,
@@ -491,6 +493,21 @@ impl GameAudio {
                     self.engine.play(&event, PlayOptions::default());
                 }
                 None => log::debug!("audio: GUI sound {s:?} has no event"),
+            }
+        }
+        for (event, position) in std::mem::take(&mut state.script_sounds) {
+            if self
+                .engine
+                .play(
+                    &event,
+                    PlayOptions {
+                        position,
+                        ..Default::default()
+                    },
+                )
+                .is_none()
+            {
+                log::debug!("audio: script sound {event} has no event");
             }
         }
         self.follow_movie(state.movie.take());
