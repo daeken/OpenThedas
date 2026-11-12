@@ -489,7 +489,9 @@ pub const POINTER_SPEED: f32 = 1100.0;
 pub const SCROLL_SPEED: f32 = 8.0;
 /// The camera's turn at full deflection (radians a second) and zoom (wheel steps a second).
 pub const TURN_SPEED: f32 = 2.4;
-pub const ZOOM_SPEED: f32 = 6.0;
+/// Provisional for zoom (the PC original has no pad): the whole range (far to near, 20 wheel
+/// steps) in about 2 s; Page Up and Page Down held use it too.
+pub const ZOOM_SPEED: f32 = 10.0;
 
 /// What the app is to do.
 #[derive(Clone, Copy, Debug, PartialEq)]
