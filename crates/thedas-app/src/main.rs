@@ -2085,6 +2085,9 @@ impl App {
             g.ui.close_all();
             g.ui.attach(&l.sim);
             seed_client_options(&l, &g.ui);
+            // Closing everything took the loading screen down too: it comes up again for
+            // the new game's own build (see `loading_screen`).
+            self.load_screen_up = false;
         }
         // One explore camera for the whole process: a load turns it behind the hero again
         // but keeps its zoom (see `Follow::reset`).
