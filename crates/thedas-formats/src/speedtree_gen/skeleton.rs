@@ -539,7 +539,14 @@ impl<'t> Grower<'t> {
             return Some(self.branches.len() - 1);
         }
 
-        let floor = tree.floor.as_ref().filter(|f| f.enabled == Some(true));
+        // Absent floor values mean the floor is disabled (5.6 E).
+        let floor = tree.floor.as_ref().filter(|f| {
+            f.enabled == Some(true)
+                && f.value.is_some()
+                && f.level.is_some()
+                && f.exponent.is_some()
+                && f.bias.is_some()
+        });
         let floor_value = floor.and_then(|f| f.value).unwrap_or(0.0);
         let floor_applies = floor.is_some_and(|f| level >= f.level.unwrap_or(0));
         let floor_exponent = floor.and_then(|f| f.exponent).unwrap_or(1.0);

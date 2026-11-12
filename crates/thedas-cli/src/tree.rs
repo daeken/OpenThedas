@@ -38,10 +38,11 @@ pub fn run(
     let g = &mesh.generated;
     let (lo, hi) = mesh.bounds;
     println!(
-        "{target}: {} branches ({} with tubes), {} leaves, {} frond guides; {} branch / {} frond / {} leaf LOD levels",
+        "{target}: {} branches ({} with tubes), {} leaves ({} meshes), {} frond guides; {} branch / {} frond / {} leaf LOD levels",
         g.skeleton.branches.len(),
         g.branches.tubes.iter().flatten().count(),
         g.skeleton.leaves.len(),
+        mesh.mesh_leaves.first().map_or(0, Vec::len),
         g.skeleton.guides.len(),
         mesh.branches.lods.len(),
         mesh.fronds.lods.len(),
@@ -77,7 +78,11 @@ pub fn run(
 /// upright quads facing −Y (the side view's camera).
 fn triangles(mesh: &TreeMesh, lod: usize) -> Vec<Tri> {
     let mut out = Vec::new();
-    for (part, color) in [(&mesh.branches, BARK), (&mesh.fronds, FROND)] {
+    for (part, color) in [
+        (&mesh.branches, BARK),
+        (&mesh.fronds, FROND),
+        (&mesh.leaf_meshes, LEAF),
+    ] {
         let Some(list) = part.lods.get(lod.min(part.lods.len().saturating_sub(1))) else {
             continue;
         };
