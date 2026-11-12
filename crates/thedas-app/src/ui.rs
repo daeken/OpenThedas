@@ -679,6 +679,19 @@ impl UiLayer {
                     area,
                     time_ms: sim.world.time_ms,
                     written: crate::saves::now_secs(),
+                    hero: sim
+                        .world
+                        .hero
+                        .map(|h| sim.display_name(h))
+                        .unwrap_or_default(),
+                    level: sim
+                        .world
+                        .hero
+                        .map_or(0, |h| sim.property_total(h, 15) as i32),
+                    class: sim
+                        .world
+                        .hero
+                        .map_or(0, |h| sim.property_total(h, 27) as i32),
                 };
                 match sim.save_json() {
                     Ok(b) => match store.write(slot, &b, &meta) {
