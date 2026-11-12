@@ -877,6 +877,9 @@ pub struct Candidate {
     pub id: ObjectId,
     pub at: Vec2,
     pub hostile: bool,
+    /// An open door: A on it shuts it, so A with nothing targeted passes it by (the
+    /// D-pad can still pick it).
+    pub open_door: bool,
 }
 
 /// What A could sensibly act on in the leader's area: living hostiles, creatures with
@@ -900,10 +903,20 @@ pub fn candidates(sim: &thedas_sim::Sim) -> Vec<Candidate> {
                 ObjectKind::Placeable => o.interactive,
                 _ => false,
             };
+            // Open: `statecnt_door.gda`'s Open_1 and Open_2 (2, 4), as the walk grid
+            // takes them.
+            let open_door = sim.is_door(o.id)
+                && matches!(
+                    o.fields
+                        .get("State")
+                        .or_else(|| o.fields.get("AnimContState")),
+                    Some(2 | 4)
+                );
             sensible.then(|| Candidate {
                 id: o.id,
                 at: Vec2::new(o.position[0], o.position[1]),
                 hostile,
+                open_door,
             })
         })
         .collect()
@@ -982,8 +995,12 @@ fn viewpoint(host: &mut dyn Host) -> Option<(Vec2, Vec2, Vec<Candidate>)> {
     Some((from, Vec2::new(yaw.cos(), yaw.sin()), candidates(&sim)))
 }
 
+/// The best thing in front for A with nothing targeted. A deliberate addition: an open
+/// door is passed by, so A while walking through a doorway (to talk to someone, to attack)
+/// does not shut the door instead.
 fn best_in_front(host: &mut dyn Host, hostile: bool) -> Option<ObjectId> {
     let (from, facing, cands) = viewpoint(host)?;
+    let cands: Vec<Candidate> = cands.into_iter().filter(|c| !c.open_door).collect();
     choose_in_front(&cands, from, facing, hostile)
 }
 
@@ -1001,6 +1018,7 @@ mod tests {
             id,
             at: Vec2::new(x, y),
             hostile,
+            open_door: false,
         }
     }
 
