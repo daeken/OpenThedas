@@ -394,7 +394,7 @@ fn corpse_model(sim: &Sim, o: &Object) -> Option<String> {
 
 /// The field the simulation sets on a body bag at the corpse's hand-off: the corpse's
 /// appearance.
-pub const CORPSE_APPEARANCE: &str = "CorpseAppearance";
+pub const CORPSE_APPEARANCE: &str = thedas_sim::decay::CORPSE_APPEARANCE;
 /// apr_base.gda's most common `CorpseModel`, for an appearance that names none.
 /// Provisional: the exe's fallback is not traced.
 pub const DEFAULT_CORPSE_MODEL: &str = "plc_bonepile_01_0";
