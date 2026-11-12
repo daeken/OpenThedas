@@ -43,6 +43,9 @@ pub struct AudioState {
     pub line: Option<VoiceLine>,
     /// The cutscene playing (resource name) and how far it has played (seconds).
     pub cutscene: Option<(String, f32)>,
+    /// A boot movie playing (its file) and how far it has played (milliseconds): its own
+    /// sound track plays with it.
+    pub movie: Option<(std::path::PathBuf, f64)>,
     /// The area the party is in (its resource), in play.
     pub area: Option<String>,
     /// The party is fighting / has fallen.
@@ -54,6 +57,50 @@ pub struct AudioState {
     /// tag (lowercase).
     pub inactive_sounds: Vec<String>,
     pub volumes: Volumes,
+}
+
+/// A movie's sound track: decoded by ffmpeg on a thread, then played from where the
+/// movie is.
+struct MovieSound {
+    path: std::path::PathBuf,
+    decoding: Option<std::sync::mpsc::Receiver<Option<thedas_audio::Pcm>>>,
+    voice: Option<thedas_audio::VoiceId>,
+}
+
+/// Decodes a movie's audio to interleaved stereo `f32` at `rate` with `ffmpeg`.
+fn decode_movie_audio(path: &Path, rate: u32) -> Option<thedas_audio::Pcm> {
+    use std::io::Read;
+    let ffmpeg = crate::intro::find_ffmpeg()?;
+    let mut child = std::process::Command::new(ffmpeg)
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(path)
+        .args([
+            "-vn",
+            "-f",
+            "f32le",
+            "-ac",
+            "2",
+            "-ar",
+            &rate.to_string(),
+            "-",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut bytes = Vec::new();
+    child.stdout.take()?.read_to_end(&mut bytes).ok()?;
+    let _ = child.wait();
+    let samples: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    (!samples.is_empty()).then_some(thedas_audio::Pcm {
+        rate,
+        channels: 2,
+        samples,
+    })
 }
 
 /// An area's sound, playing.
@@ -83,6 +130,7 @@ pub struct GameAudio {
     voice: Option<(VoiceLine, Option<EventHandle>, Option<f64>)>,
     cutscene: Option<CutsceneSounds>,
     area: Option<AreaPlay>,
+    movie: Option<MovieSound>,
     last: Instant,
 }
 
@@ -130,8 +178,58 @@ impl GameAudio {
             voice: None,
             cutscene: None,
             area: None,
+            movie: None,
             last: Instant::now(),
         })
+    }
+
+    /// A boot movie's own sound track plays along with it (DA:O's logos carry theirs in the
+    /// Bink file; the cutscenes' movies are silent and their sound is the cutscene's).
+    /// Provisional: played at full volume, outside the categories.
+    fn follow_movie(&mut self, movie: Option<(std::path::PathBuf, f64)>) {
+        let same = matches!((&self.movie, &movie), (Some(m), Some((p, _))) if &m.path == p);
+        if !same {
+            if let Some(v) = self.movie.take().and_then(|m| m.voice)
+                && let Ok(mut mx) = self.engine.mixer.lock()
+            {
+                mx.fade(v, 0.0, 0.05, true);
+            }
+            if let Some((path, _)) = &movie {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let p = path.clone();
+                let rate = self.engine.mixer.lock().map(|m| m.rate()).unwrap_or(48000);
+                std::thread::spawn(move || {
+                    let _ = tx.send(decode_movie_audio(&p, rate));
+                });
+                self.movie = Some(MovieSound {
+                    path: path.clone(),
+                    decoding: Some(rx),
+                    voice: None,
+                });
+            }
+        }
+        let (Some(m), Some((_, ms))) = (self.movie.as_mut(), movie) else {
+            return;
+        };
+        if let Some(rx) = &m.decoding
+            && let Ok(pcm) = rx.try_recv()
+        {
+            m.decoding = None;
+            if let (Some(pcm), Ok(mut mx)) = (pcm, self.engine.mixer.lock()) {
+                let start = (ms / 1000.0 * pcm.rate as f64) as usize;
+                if start < pcm.frames() {
+                    let gain = self.engine.volumes.sfx;
+                    m.voice = Some(mx.play_from(
+                        Arc::new(pcm),
+                        thedas_audio::VoiceParams {
+                            gain,
+                            ..Default::default()
+                        },
+                        start,
+                    ));
+                }
+            }
+        }
     }
 
     /// Whether area `resref`'s sound (its `.are`) is needed (the party has just arrived).
@@ -395,6 +493,7 @@ impl GameAudio {
                 None => log::debug!("audio: GUI sound {s:?} has no event"),
             }
         }
+        self.follow_movie(state.movie.take());
         self.follow_area(&state);
         self.follow_cutscene(state.cutscene.clone());
         // Voice-over.

@@ -94,6 +94,8 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
 /// A movie decoding as it plays.
 pub(crate) struct Playing {
     name: String,
+    /// The movie file (its sound is decoded separately; see [`crate::audio`]).
+    path: PathBuf,
     header: BinkHeader,
     child: Child,
     frames: Receiver<Vec<u8>>,
@@ -156,6 +158,7 @@ impl Playing {
         );
         Some(Self {
             name,
+            path: path.to_path_buf(),
             header,
             child,
             frames,
@@ -218,6 +221,11 @@ impl Playing {
 
     pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The movie file and how far it has played (milliseconds).
+    pub(crate) fn position(&self) -> (&Path, f64) {
+        (&self.path, self.ms)
     }
 
     /// Draws the frame showing into `pass`, letterboxed in `size` (nothing before the first).
@@ -409,6 +417,11 @@ impl Intro {
             };
             self.playing = Playing::start(&self.ffmpeg, &next);
         }
+    }
+
+    /// The boot movie playing and how far it has played (milliseconds).
+    pub fn now_playing(&self) -> Option<(&Path, f64)> {
+        self.playing.as_ref().map(Playing::position)
     }
 
     /// Skips the movie playing (the next one starts at the next frame).

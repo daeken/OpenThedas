@@ -98,13 +98,18 @@ impl Mixer {
     }
 
     pub fn play(&mut self, pcm: Arc<Pcm>, params: VoiceParams) -> VoiceId {
+        self.play_from(pcm, params, 0)
+    }
+
+    /// Play from source frame `start` (joining a sound already under way: a movie's).
+    pub fn play_from(&mut self, pcm: Arc<Pcm>, params: VoiceParams, start: usize) -> VoiceId {
         let id = VoiceId(self.next_id);
         self.next_id += 1;
         self.voices.push(Voice {
             id,
             pcm,
             params,
-            pos: 0.0,
+            pos: start as f64,
             fade: None,
             paused: false,
         });
@@ -295,6 +300,17 @@ mod tests {
         for (got, want) in right.iter().zip([0.0, 0.025, 0.05, 0.075]) {
             assert!((got - want).abs() < 1e-6, "{got} vs {want}");
         }
+    }
+
+    #[test]
+    fn play_from_joins_part_way() {
+        let mut m = Mixer::new(10);
+        let ramp: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        let id = m.play_from(pcm(10, 1, ramp), VoiceParams::default(), 7);
+        let mut out = vec![0.0; 2 * 4];
+        m.render(&mut out);
+        assert_eq!(out, vec![7.0, 7.0, 8.0, 8.0, 9.0, 9.0, 0.0, 0.0]);
+        assert!(!m.is_playing(id));
     }
 
     #[test]
