@@ -44,6 +44,11 @@ pub struct Gear {
     pub main: Option<i32>,
     pub off: Option<i32>,
     pub combat: bool,
+    /// The creature's footstep column in `sound_movement_footsteps.gda` (a column hash:
+    /// its appearance's footstep type).
+    pub footstep: Option<u32>,
+    /// The ground under it: sound material (low nibble), vegetation (high nibble).
+    pub surface: u8,
 }
 
 /// A party-picker member: id, template, sound set, position.
@@ -185,9 +190,10 @@ pub struct GameAudio {
     anim_events: std::collections::HashMap<String, Arc<Vec<AnimEventText>>>,
     /// Each creature's animation and time last frame.
     anim_clocks: std::collections::HashMap<u32, (String, f32)>,
-    /// `sound_movement_footsteps.gda` row 0 (no surface known): the humanoid and dog
-    /// footstep events.
-    footsteps: (Option<String>, Option<String>),
+    /// `sound_movement_footsteps.gda` (rows: ground material; columns: footstep type) and
+    /// `sound_movement_scuffing.gda` (rows: ground material).
+    footsteps: Option<thedas_formats::Gda>,
+    scuffs: Option<thedas_formats::Gda>,
     /// Weapon impacts: each base item's sound material (`BITM_base.gda`), and each weapon
     /// material's impact events (`sound_weapon_hits.gda`).
     impacts: Impacts,
@@ -213,30 +219,40 @@ pub struct GameAudio {
     last: Instant,
 }
 
-/// `sound_movement_footsteps.gda`'s first row (surface unknown): the small humanoid's and the
-/// dog's footstep events. Provisional: the walkmesh's surface and the creature's footstep
-/// type (the other rows and columns) are not chosen yet.
-fn footstep_events(vfs: &Vfs) -> (Option<String>, Option<String>) {
-    let Ok((data, _)) = vfs.read("sound_movement_footsteps.gda") else {
-        return (None, None);
+/// `apr_base.gda`'s footstep type column (DAOrigins.exe 0x6a098a).
+pub const APR_FOOTSTEP: u32 = 0xda48_e219;
+/// `sound_movement_scuffing.gda`'s event column (0x5b8d5f).
+const COL_SCUFF: u32 = 0xb449_8545;
+
+/// A creature's footstep column: its appearance's footstep type (`HUMANOID_SMALL`, `DOG`,
+/// ...), trimmed, `Unknown` when the row has none, as a column hash (DAOrigins.exe
+/// 0x6a096e..0x6a09dc).
+pub fn footstep_column(cell: Option<&thedas_formats::gda::Cell>) -> u32 {
+    let name = match cell {
+        Some(thedas_formats::gda::Cell::String(s)) => {
+            s.trim_matches(|c| c == '\0' || c == ' ' || c == '\t')
+        }
+        _ => "Unknown",
     };
-    let Ok(gda) = thedas_formats::Gda::parse(&data) else {
-        return (None, None);
-    };
-    let Some(row) = gda.row_by_id(0) else {
-        return (None, None);
-    };
-    let events: Vec<String> = row
-        .iter()
-        .filter_map(|c| match c {
-            thedas_formats::gda::Cell::String(s) if s.contains('/') => {
-                Some(s.trim_end_matches('\0').trim().to_string())
-            }
-            _ => None,
-        })
-        .collect();
-    let find = |part: &str| events.iter().find(|e| e.contains(part)).cloned();
-    (find("/humanoid/small/"), find("/dog/"))
+    thedas_formats::gda::column_hash(name)
+}
+
+fn read_gda(vfs: &Vfs, name: &str) -> Option<thedas_formats::Gda> {
+    vfs.read(name)
+        .ok()
+        .and_then(|(d, _)| thedas_formats::Gda::parse(&d).ok())
+}
+
+/// The event in row `row`, column `col` (by hash) of a sound table, if any.
+fn table_event(t: &thedas_formats::Gda, row: i64, col: u32) -> Option<String> {
+    let c = t.columns.iter().position(|c| c.hash == col)?;
+    match t.row_by_id(row)?.get(c)? {
+        thedas_formats::gda::Cell::String(s) => {
+            let s = s.trim_end_matches('\0').trim();
+            (!s.is_empty()).then(|| s.to_string())
+        }
+        _ => None,
+    }
 }
 
 /// `ss_types.gda`: each sound set type (1 COMBAT ATTACK, 2 COMBAT BATTLE CRY, ...) with the
@@ -276,6 +292,8 @@ struct Foley {
 }
 
 const COL_SWISH: u32 = 0xa334_7e2b;
+/// `sound_movement_footsteps.gda`'s `HUMANOID_SMALL` column.
+const COL_HUMANOID_SMALL: u32 = 0x787a_7bc5;
 const COL_SMALL: u32 = 0xce0a_5368;
 const COL_MEDIUM: u32 = 0x0d0e_d12a;
 
@@ -546,7 +564,8 @@ impl GameAudio {
             vfs: vfs.clone(),
             anim_events: Default::default(),
             anim_clocks: Default::default(),
-            footsteps: footstep_events(vfs),
+            footsteps: read_gda(vfs, "sound_movement_footsteps.gda"),
+            scuffs: read_gda(vfs, "sound_movement_scuffing.gda"),
             impacts: Impacts::read(vfs),
             foley: Foley::read(vfs),
             music_state: 1.0,
@@ -668,9 +687,10 @@ impl GameAudio {
 
     /// Animations' sound events: as a creature's animation passes an event, kind 20 plays the
     /// event it names (weapon swings, creature noises: `glo_fly_wep/...`) and kind 14 a
-    /// footstep (see [`footstep_events`]) where the creature stands. Provisional: events on
-    /// the frame an animation starts are those at its time 0 onward; footsteps sound for
-    /// humanoids and dogs only.
+    /// footstep for the ground under the creature where it stands. Provisional: events on
+    /// the frame an animation starts are those at its time 0 onward; DAOrigins.exe's
+    /// footstep gate (0x7c4a80: small and medium creatures in some state) is not applied,
+    /// and vegetation rustles (the surface's high nibble) are not played.
     fn follow_animations(
         &mut self,
         clocks: Vec<(u32, String, f32, f32, [f32; 3])>,
@@ -744,20 +764,29 @@ impl GameAudio {
                             self.foley.cell("movement", Some(m), col)
                         }
                     }
-                    (14, Some(tags)) if tags.contains("Left") => {
-                        if key.starts_with("c_dog") {
-                            self.footsteps.1.clone()
-                        } else if is_humanoid(&key) {
-                            self.footsteps.0.clone()
+                    // A footstep (0x6aaaa0 -> 0x5b8d51): the ground's material under the
+                    // creature picks the row; an event marked `|Scuff` plays the scuffing
+                    // table's event, any other the footstep table's in the creature's
+                    // footstep column.
+                    (14, text) => {
+                        let g = gear.get(&id).copied().unwrap_or_default();
+                        let row = (g.surface & 0xf) as i64;
+                        if text.as_deref().is_some_and(|t| t.contains("|Scuff")) {
+                            self.scuffs
+                                .as_ref()
+                                .and_then(|t| table_event(t, row, COL_SCUFF))
                         } else {
-                            None
+                            let col = g.footstep.unwrap_or(COL_HUMANOID_SMALL);
+                            self.footsteps
+                                .as_ref()
+                                .and_then(|t| table_event(t, row, col))
                         }
                     }
                     _ => None,
                 };
                 if let Some(event) = event {
                     log::trace!(
-                        "audio: {key} {:?} -> {t:.3} (len {length:.3}): event at {:.3}",
+                        "audio: {key} {:?} -> {t:.3} (len {length:.3}): {event} at {:.3}",
                         prev.as_ref().map(|p| p.1),
                         ev.time
                     );
@@ -1258,15 +1287,6 @@ impl GameAudio {
     }
 }
 
-/// Whether an animation resource is a humanoid's: the shared humanoid animations are
-/// `mh.*` / `fh.*` (male, female) and their variants `mh_*`, `fh_*`, and cutscene actors
-/// `cs_*`. Provisional (from the resource names).
-fn is_humanoid(ani: &str) -> bool {
-    ["mh.", "mh_", "fh.", "fh_", "cs_", "csmale"]
-        .iter()
-        .any(|p| ani.starts_with(p))
-}
-
 /// The options screen's volumes (`ClientOptions.AudioOptions.*`, 0..10, with their disable
 /// switches) as gains, as DAOrigins.exe turns them into category volumes: a slider at `x`
 /// is `-3 * (10 - x)` dB (0x5b61b0: 10 and above full, below 0.01 or disabled -60 dB), then
@@ -1314,11 +1334,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn humanoid_animations_by_name() {
-        assert!(is_humanoid("mh.walk.ani"));
-        assert!(is_humanoid("fh_c.attk_v1.ani"));
-        assert!(!is_humanoid("c_dog.cwalkf.ani"));
-        assert!(!is_humanoid("ip_dbldoor.open.ani"));
+    fn footstep_columns_come_from_the_appearance_type() {
+        use thedas_formats::gda::Cell;
+        let col = |v: &str| footstep_column(Some(&Cell::String(v.into())));
+        assert_eq!(col("HUMANOID_SMALL\t "), COL_HUMANOID_SMALL);
+        assert_eq!(col("DOG"), thedas_formats::gda::column_hash("dog"));
+        assert_eq!(
+            footstep_column(None),
+            thedas_formats::gda::column_hash("Unknown")
+        );
     }
 
     #[test]
