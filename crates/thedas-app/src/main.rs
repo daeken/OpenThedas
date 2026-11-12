@@ -2108,9 +2108,32 @@ fn audio_state(
     let Some(live) = live else {
         return state;
     };
-    // Animations' sound events (see `Live::animation_clocks`).
+    // Animations' sound events (see `Live::animation_clocks`), with what each creature
+    // wears and wields.
     if !live.front_end {
         state.animations = live.animation_clocks();
+        let sim = live.sim();
+        for (id, ..) in &state.animations {
+            let Some(o) = sim.world.get(*id) else {
+                continue;
+            };
+            // INVENTORY_SLOT_MAIN 0, _OFFHAND 1, _CHEST 4.
+            let base = |slot: i32| {
+                o.equipment
+                    .get(&slot)
+                    .and_then(|i| sim.world.get(*i))
+                    .and_then(|i| i.fields.get("BaseItem").copied())
+            };
+            state.gear.insert(
+                *id,
+                audio::Gear {
+                    armour: base(4),
+                    main: base(0),
+                    off: base(1),
+                    combat: o.combat.in_combat,
+                },
+            );
+        }
     }
     {
         let sim = live.sim();
@@ -2185,44 +2208,15 @@ fn audio_state(
                     }
                 }
                 thedas_sim::world::SoundRequest::Impact {
-                    attacker,
                     target,
                     result,
                     weapon,
                     armour,
                     shield,
+                    ..
                 } => {
                     if let Some(at) = sim.world.get(target).map(|o| o.position) {
                         state.impacts.push((at, result, weapon, armour, shield));
-                    }
-                    // The engine's own barks around a blow (`ss_types.gda` types the scripts
-                    // never play): the attacker grunts (15), a struck target cries out in
-                    // pain (16), or dies (18). Provisional: read from the table (their
-                    // probabilities, no script caller), not traced in DAOrigins.exe.
-                    const ATTACK_GRUNT: i32 = 15;
-                    const PAIN_GRUNT: i32 = 16;
-                    const DEATH: i32 = 18;
-                    let landed = matches!(result, 1 | 2 | 4 | 9);
-                    let dead = sim.world.get(target).is_some_and(|o| o.dead);
-                    let mut bark = |id: u32, entry: i32| {
-                        let o = sim.world.get(id);
-                        let set = o.and_then(|o| {
-                            o.text_fields
-                                .get(thedas_sim::sim::SOUND_SET)
-                                .cloned()
-                                .or_else(|| a.template_sound_set(&sim.vfs, &o.template))
-                        });
-                        if let Some(set) = set {
-                            state
-                                .sound_sets
-                                .push((set, entry, 0.0, o.map(|o| o.position)));
-                        }
-                    };
-                    bark(attacker, ATTACK_GRUNT);
-                    if dead {
-                        bark(target, DEATH);
-                    } else if landed {
-                        bark(target, PAIN_GRUNT);
                     }
                 }
                 // PlayMusic names the music project (`music`, from the Music M2DA by
@@ -2254,17 +2248,6 @@ fn audio_state(
             state.area = Some(resref);
             state.combat = sim.world.party_fighting;
             state.music_intensity = Some(sim.world.music_intensity);
-            // The character the player controls, with its sound set (selection barks).
-            if let Some(c) = sim.world.controlled()
-                && let Some(o) = sim.world.get(c)
-            {
-                let set = o
-                    .text_fields
-                    .get(thedas_sim::sim::SOUND_SET)
-                    .cloned()
-                    .or_else(|| a.template_sound_set(&sim.vfs, &o.template));
-                state.controlled = Some((c, set, o.position));
-            }
             state.dead = sim.world.game_over;
             state.inactive_sounds = sim
                 .world
