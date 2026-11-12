@@ -8,6 +8,7 @@ use super::frame::{
     Frame, Vec3, add, cos, cos_deg, cross, dot, fast_sqrt, lerp, normalize, scale, sin, sin_deg,
     sub,
 };
+use super::limits::{GenerateError, MAX_SURFACE_VERTICES};
 use super::{Curve, Random, Skeleton};
 use crate::speedtree::{Fronds, SpeedTree};
 
@@ -63,9 +64,13 @@ fn fast_length(v: Vec3) -> f32 {
 
 /// Builds the fronds (4.2): guide LOD selection, then each guide's vertices in level-0 order
 /// (extrusion profiles draw as they are built), then strips and fade hints.
-pub fn build(tree: &SpeedTree, skeleton: &Skeleton, random: &mut Random) -> FrondGeometry {
+pub fn build(
+    tree: &SpeedTree,
+    skeleton: &Skeleton,
+    random: &mut Random,
+) -> Result<FrondGeometry, GenerateError> {
     let Some(fronds) = tree.fronds.as_ref().filter(|f| f.enabled) else {
-        return FrondGeometry::default();
+        return Ok(FrondGeometry::default());
     };
     let guides = &skeleton.guides;
     let lods = select(fronds, skeleton, random);
@@ -76,8 +81,24 @@ pub fn build(tree: &SpeedTree, skeleton: &Skeleton, random: &mut Random) -> Fron
         lods,
     };
     let Some(level0) = out.lods.first().cloned() else {
-        return out;
+        return Ok(out);
     };
+    // The vertices about to be built, against the limit.
+    let per_vertex = if fronds.kind == 0 {
+        2 * fronds.blades.max(0) as usize
+    } else {
+        2 * fronds.profile_segments.max(2) as usize - 1
+    };
+    let total: usize = level0
+        .iter()
+        .map(|&g| skeleton.branches[guides[g].branch].vertices.len() * per_vertex)
+        .sum();
+    if total > MAX_SURFACE_VERTICES {
+        return Err(GenerateError::TooLarge {
+            what: "frond vertices",
+            max: MAX_SURFACE_VERTICES,
+        });
+    }
     let profile = Curve::new(&fronds.profile.clone().unwrap_or_default());
     let fade_extrusions = tree.lod.and_then(|l| l.fade_extrusions).unwrap_or(false);
     let atlas = tree.texcoords.as_ref().map(|t| t.fronds.as_slice());
@@ -144,7 +165,7 @@ pub fn build(tree: &SpeedTree, skeleton: &Skeleton, random: &mut Random) -> Fron
             out.strips[l].extend(level_strips);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Maps a frond texture coordinate into its atlas rectangle (4.6).
@@ -499,7 +520,7 @@ mod tests {
     #[test]
     fn blade_fronds_make_ribbons() {
         let t = frondy(0);
-        let g = generate(&t);
+        let g = generate(&t).unwrap();
         assert_eq!(g.skeleton.guides.len(), 2);
         assert_eq!(g.fronds.lods[0].len(), 2);
         // Two guides × two blades × 2 · 5 vertices.
@@ -523,7 +544,7 @@ mod tests {
     #[test]
     fn extrusion_fronds_make_a_grid() {
         let t = frondy(1);
-        let g = generate(&t);
+        let g = generate(&t).unwrap();
         // Profile of 3 points mirrored to 5; 5 guide vertices per guide.
         assert_eq!(g.fronds.vertices.len(), 2 * 5 * 5);
         let strip = &g.fronds.strips[0][0];
@@ -543,7 +564,7 @@ mod tests {
     fn disabled_fronds_build_nothing() {
         let mut t = frondy(0);
         t.fronds.as_mut().unwrap().enabled = false;
-        let g = generate(&t);
+        let g = generate(&t).unwrap();
         assert!(g.fronds.vertices.is_empty());
     }
 }
