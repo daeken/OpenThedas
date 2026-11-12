@@ -762,7 +762,7 @@ fn placeable_action(sim: &Sim, o: &Object, from: i32, to: i32) -> Option<(String
     let t = tables.get(0, &controller)?;
     let label = text(t.cell("Label", to as i64))?;
     let anim = match t.cell(&label, from as i64)? {
-        Cell::Int(v) if *v > 0 => *v as i64,
+        Cell::Int(v) if *v > 0 => *v,
         _ => return None,
     };
     let action = text(
