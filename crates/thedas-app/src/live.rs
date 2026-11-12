@@ -26,6 +26,8 @@ pub struct LiveLevel {
     pub layout: String,
     pub vfs: Arc<Vfs>,
     pub renderer: AreaRenderer,
+    /// The `AREA_ID` whose colour grading the renderer has (several areas share a layout).
+    pub area_id: Option<i64>,
     /// Its solid surfaces, which the game camera keeps on the party's side of.
     pub collider: thedas_render::collide::Collider,
 }
@@ -774,6 +776,21 @@ impl Live {
             self.objects = None;
             self.level = Some(self.build_level(ctx, format, &layout)?);
         }
+        // The area's colour grading (areadata.gda by its AREA_ID), swapped as areas change.
+        let area_id = sim
+            .world
+            .get(area)
+            .and_then(|a| a.locals.ints.get("AREA_ID").map(|&v| v as i64));
+        if let Some(level) = self.level.as_mut()
+            && level.area_id != area_id
+        {
+            let grade = area_id
+                .map(|id| thedas_render::gpu::area_grade(&level.vfs, id))
+                .unwrap_or_default();
+            log::debug!("area {area_id:?}: colour grading {grade:?}");
+            level.renderer.set_area_grade(ctx, &level.vfs, &grade);
+            level.area_id = area_id;
+        }
         let mut models = match &staged {
             Some((id, stage)) => stage_models(&sim, *id, stage, &mut self.models),
             None => {
@@ -1001,6 +1018,7 @@ impl Live {
             layout: layout.to_string(),
             vfs: Arc::new(vfs),
             renderer,
+            area_id: None,
             collider,
         })
     }
