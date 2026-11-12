@@ -372,6 +372,10 @@ impl Sim {
         }
         o.equipment.insert(slot, item);
         self.wear_as(who, item, slot, true);
+        // The inventory tutorial waits for an item put on in its slot (`genev_tutorial` mode
+        // 5). Provisional: the event's argument is taken to be the equip slot (the script
+        // waits on slot 4, which it read with GetItemInEquipSlot).
+        self.training_event("ITEM_EQUIPPED", slot);
         true
     }
 
@@ -404,7 +408,19 @@ impl Sim {
         if !crate::engine::party_of(self).contains(&who) {
             return false;
         }
-        self.unequip(who, item)
+        let slot = self.world.get(who).and_then(|o| {
+            o.equipment
+                .iter()
+                .find(|(_, i)| **i == item)
+                .map(|(s, _)| *s)
+        });
+        let off = self.unequip(who, item);
+        // The inventory tutorial waits for an item taken off its slot (`genev_tutorial` mode
+        // 5, step 7, slot 4). Provisional: the argument is taken to be the equip slot.
+        if let (true, Some(slot)) = (off, slot) {
+            self.training_event("ITEM_UNEQUIPPED", slot);
+        }
+        off
     }
 
     /// The inventory screen's messages ([`MSG_EQUIP`], [`MSG_UNEQUIP`]), for the party member

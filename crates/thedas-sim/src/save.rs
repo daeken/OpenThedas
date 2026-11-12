@@ -232,6 +232,12 @@ impl Sim {
         world.tables = self.world.tables.clone();
         world.trace = std::mem::take(&mut self.world.trace);
         world.trace.entries.clear();
+        // No training step survives a load: the exe disables saving while training mode is on
+        // (script.ldf, SetTrainingMode: "Unpausing, Saving, Item Destruction" are disabled),
+        // so no save of the original holds one, and a step waiting for a party member who is
+        // not there could never end. Saves written mid-training by tools would otherwise load
+        // paused under it.
+        world.training = Default::default();
         self.world = world;
         // A conversation whose last line was already shown does not come back: the game
         // cannot be saved during a conversation, so a loaded game never resumes one at its
@@ -336,12 +342,6 @@ impl Sim {
         if self.world.tutorials.is_empty() {
             self.world.tutorial_paused = false;
         }
-        // Likewise a training mode with no step shown: nothing would end it. Provisional:
-        // whether the original saves a training mode at all is not traced (it forbids saving
-        // during one).
-        if self.world.training.step == 0 {
-            self.world.training = Default::default();
-        }
         self.save_issues = if save_revision < 3 {
             self.check_property_damage()
         } else {
@@ -410,6 +410,19 @@ mod tests {
         let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 7);
         s.module_info.name = "test".into();
         s
+    }
+
+    #[test]
+    fn a_load_clears_training() {
+        let mut s = sim();
+        s.world.training.mode = 3;
+        s.world.training.step = 3;
+        s.world.training.expected = 1060;
+        let bytes = s.save_json().unwrap();
+        let mut t = sim();
+        t.load_json(&bytes).unwrap();
+        assert_eq!(t.world.training.mode, 0);
+        assert!(!t.training_paused());
     }
 
     #[test]

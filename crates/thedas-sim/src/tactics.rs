@@ -430,6 +430,9 @@ impl Sim {
                                     o.fields.insert(FIELD_ENABLED.into(), 1);
                                     o.fields.insert(FIELD_PRESET_TYPE.into(), PRESET_PREDEFINED);
                                 }
+                                // The party tutorial's last step waits for this
+                                // (`genev_tutorial` mode 3, step 11).
+                                self.training_event("TACTIC_PRESET_SELECTED", 0);
                             }
                         }
                     }
