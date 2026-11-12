@@ -435,6 +435,7 @@ pub const BINDINGS: &[Binding] = &[
     bind(Conversation, X, Do::Skip, ""),
     // Cutscenes.
     bind(Cutscene, A, Do::Skip, ""),
+    bind(Cutscene, B, Do::Skip, ""),
     bind(Cutscene, X, Do::Skip, ""),
     bind(Cutscene, Start, Do::Skip, ""),
 ];

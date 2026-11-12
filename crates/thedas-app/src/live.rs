@@ -88,6 +88,13 @@ pub struct Live {
     /// The stage camera framed for a preset, kept until the preset or the drawn creature
     /// changes (the executable frames a preset once, when it is set).
     stage_camera: Option<(i32, thedas_render::Camera)>,
+    /// The playing cutscene's movies (see [`crate::intro::CutsceneMovies`]).
+    cutscene_movies: crate::intro::CutsceneMovies,
+    /// Whether a cutscene's movie waits for its decoder (a capture, whose frames must show
+    /// what is due) rather than dropping frames it is late with (the window).
+    pub movies_wait: bool,
+    /// The format frames are drawn in, as the last sync gave it.
+    format: Option<wgpu::TextureFormat>,
 }
 
 /// How to start the game.
@@ -191,6 +198,9 @@ impl Live {
             stage: None,
             staged: None,
             stage_camera: None,
+            cutscene_movies: Default::default(),
+            movies_wait: false,
+            format: None,
         })
     }
 
@@ -236,6 +246,30 @@ impl Live {
         self.talk_camera.advance(dt_ms);
         if dt_ms.is_finite() && dt_ms > 0.0 {
             self.shader_time += dt_ms / 1000.0;
+        }
+        self.follow_cutscene_movies();
+    }
+
+    /// Keeps the playing cutscene's movies in step with its clock. A cutscene whose movie
+    /// cannot play ends now, as though the player skipped it, rather than standing on the
+    /// world until they do (chargen, after the intro, then comes up on its own).
+    fn follow_cutscene_movies(&mut self) {
+        let mut sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
+        let cutscene = sim
+            .world
+            .cutscene
+            .as_ref()
+            .map(|c| (c.name.clone(), c.elapsed_ms));
+        let state = self.cutscene_movies.follow(
+            cutscene.as_ref().map(|(n, ms)| (n.as_str(), *ms)),
+            &sim.vfs,
+            &self.install,
+            self.movies_wait,
+        );
+        if state == crate::intro::MovieState::CannotPlay {
+            sim.skip_cutscene();
+            self.cutscene_movies
+                .follow(None, &sim.vfs, &self.install, false);
         }
     }
 
@@ -323,6 +357,7 @@ impl Live {
     /// changes, the objects when the set of objects (or what they wear) changes; then places
     /// and poses every object.
     pub fn sync(&mut self, ctx: &GpuContext, format: wgpu::TextureFormat) -> Result<()> {
+        self.format = Some(format);
         let shared = self.sim.clone();
         let mut sim = shared.lock().unwrap_or_else(|p| p.into_inner());
         // Character creation shows its creature on its own stage, not in the area.
@@ -420,6 +455,19 @@ impl Live {
         (width, height): (u32, u32),
         camera: &thedas_render::Camera,
     ) -> bool {
+        // A cutscene's movie is all that is drawn of the world while it is due.
+        if self.cutscene_movies.showing() {
+            let format = self.format.unwrap_or(thedas_render::gpu::CAPTURE_FORMAT);
+            self.cutscene_movies.draw(
+                &ctx.device,
+                &ctx.queue,
+                encoder,
+                target,
+                format,
+                (width, height),
+            );
+            return true;
+        }
         self.set_shader_time();
         let Some(level) = self.level.as_mut() else {
             return false;
@@ -454,6 +502,9 @@ impl Live {
         target: &wgpu::Texture,
         (width, height): (u32, u32),
     ) {
+        if self.cutscene_movies.showing() {
+            return;
+        }
         if let Some(level) = self.level.as_mut() {
             level
                 .renderer
@@ -468,6 +519,9 @@ impl Live {
         camera: &thedas_render::Camera,
         (width, height): (u32, u32),
     ) -> Result<Option<Vec<u8>>> {
+        if self.cutscene_movies.showing() {
+            return Ok(Some(self.cutscene_movies.rgba((width, height))));
+        }
         self.set_shader_time();
         let Some(level) = self.level.as_mut() else {
             return Ok(None);

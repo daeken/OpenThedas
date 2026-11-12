@@ -22,6 +22,8 @@
 //! The game's own interface plays over the world: the HUD while exploring, the conversation
 //! screen (click a reply), and the screens scripts open (world map, store, job board,
 //! level-up); I opens the inventory. A click the interface draws under is the interface's.
+//! A cutscene that plays a movie (New Game's intro, `game_intro.cut`) shows the movie full
+//! screen for its span, silent; a key, a click or the pad's A, B or Start skips the cutscene.
 //!
 //! Headless: `--capture out.png --camera x,y,z,yaw,pitch` renders one frame with no window.
 //! Playing headless, `--steps "click 640,400; run 3000; click 300,650; key i"` plays input
@@ -1944,6 +1946,20 @@ impl ApplicationHandler for App {
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
                 };
+                // A key skips a cutscene (and the movie it plays), as a click does.
+                // Provisional: the game's own skip key is not traced.
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && self
+                        .screens
+                        .as_ref()
+                        .is_some_and(screens::Screens::in_cutscene)
+                {
+                    if let Some(live) = self.live.as_ref() {
+                        live.sim().skip_cutscene();
+                    }
+                    return;
+                }
                 // While a movie's text field has focus, keys type into it (repeats too).
                 if event.state == ElementState::Pressed
                     && self.text_key(code, event.text.as_deref())
@@ -2623,6 +2639,7 @@ fn main() -> Result<()> {
         let mut pad_lines = (Vec::new(), Vec::new());
         if let Some(l) = live.as_mut() {
             l.shader_time = args.time;
+            l.movies_wait = true;
             if ui.is_empty() {
                 let mut layer = ui::UiLayer::new(&ctx, &loaded.vfs, &[], size);
                 layer.attach(&l.sim);
@@ -2922,6 +2939,7 @@ fn main() -> Result<()> {
                         };
                         let mut n = live::Live::open(&install, &args.module, start, &args.shaders)?;
                         n.shader_time = args.time;
+                        n.movies_wait = true;
                         layer.close_all();
                         layer.attach(&n.sim);
                         *s = screens::Screens::new(n.front_end);

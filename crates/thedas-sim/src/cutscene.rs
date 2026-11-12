@@ -7,6 +7,16 @@
 //! (field 5206). A spoken line is an `ASLN` track: its text (field 22, a talk-table
 //! reference), when it starts and ends (fields 5301 and 5302, seconds into the cutscene) and
 //! the conversation it comes from (field 5562).
+//!
+//! A movie played full screen is an `APBM` track (track type 42 in field 5300), the
+//! executable's `EC::Cutscene::Actor::ActionPlayMovie` (vtable 0xb23608): the Bink movie's
+//! name is field 5740 (no extension; `packages/core/data/movies`), and it plays from the
+//! track's start (field 5301) until the track's end (5302, 1e10 for "to the end").
+//! Its update (0x7ce740) starts the movie once the cutscene's clock reaches the start
+//! (the renderer's movie player at `[0xc31650]`+0xc0, its `Play` 0x469390, which stops any
+//! movie playing first), ducks the audio (`audio_categories/ducking/OnMovie`) and hands the
+//! player the cutscene's time every tick; its exit (0x7ce880) stops it. Nothing in the
+//! simulation reads the movies: [`movies`] is for the presentation.
 
 use thedas_formats::Gff4;
 use thedas_formats::gff4::{List, StructId, Value};
@@ -18,6 +28,7 @@ const FIELD_TRACKS: u32 = 5206;
 const FIELD_LINE_TEXT: u32 = 22;
 const FIELD_LINE_START: u32 = 5301;
 const FIELD_LINE_END: u32 = 5302;
+const FIELD_MOVIE: u32 = 5740;
 
 /// The longest a cutscene is taken to run (seconds), whatever its file says.
 pub const MAX_SECONDS: f32 = 600.0;
@@ -129,6 +140,70 @@ impl Cutscene {
     }
 }
 
+/// A movie a cutscene plays full screen (an `APBM` track).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CutsceneMovie {
+    /// Seconds into the cutscene it starts, and stops (at most the cutscene's length).
+    pub start: f32,
+    pub end: f32,
+    /// The Bink movie's name, without its extension (`game_introduction`).
+    pub name: String,
+}
+
+/// The movies a cutscene's file plays, by start time (none when it is not a cutscene).
+pub fn movies(data: &[u8]) -> Vec<CutsceneMovie> {
+    match Gff4::parse(data) {
+        Ok(g) => movies_of(&g),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The movies a parsed cutscene plays, by start time.
+pub fn movies_of(g: &Gff4) -> Vec<CutsceneMovie> {
+    if g.file_type.0 != *b"CUT " {
+        return Vec::new();
+    }
+    let seconds = g
+        .field(g.root, FIELD_SECONDS)
+        .and_then(Value::as_f64)
+        .map(|s| s as f32)
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .unwrap_or(0.0)
+        .min(MAX_SECONDS);
+    let mut out = Vec::new();
+    for actor in structs(g, g.root, FIELD_ACTORS) {
+        for track in structs(g, actor, FIELD_TRACKS) {
+            if g.template_of(track).label.0 != *b"APBM" {
+                continue;
+            }
+            let name = g
+                .field(track, FIELD_MOVIE)
+                .and_then(Value::as_str)
+                .map(|s| s.trim_end_matches('\0').trim().to_string())
+                .unwrap_or_default();
+            let time = |l| {
+                g.field(track, l)
+                    .and_then(Value::as_f64)
+                    .map(|s| s as f32)
+                    .filter(|s| !s.is_nan())
+            };
+            let (Some(start), Some(end)) = (time(FIELD_LINE_START), time(FIELD_LINE_END)) else {
+                continue;
+            };
+            if name.is_empty() || end <= start {
+                continue;
+            }
+            out.push(CutsceneMovie {
+                start: start.clamp(0.0, seconds),
+                end: end.clamp(0.0, seconds),
+                name,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.start.total_cmp(&b.start));
+    out
+}
+
 /// The structs of a list field, whether a struct list or a generic one.
 fn structs(g: &Gff4, id: StructId, label: u32) -> Vec<StructId> {
     match g.field(id, label) {
@@ -190,6 +265,17 @@ mod tests {
         }
     }
 
+    fn movie(name: &str, start: f32, end: f32) -> StructData {
+        StructData {
+            template: 4,
+            values: vec![
+                Value::String(Some(name.into())),
+                Value::F32(start),
+                Value::F32(end),
+            ],
+        }
+    }
+
     /// A cutscene of `seconds` whose one actor says two lines (the later one listed first)
     /// and has a track that is not a line.
     fn cut(file_type: &[u8; 4], seconds: f32) -> Gff4 {
@@ -206,6 +292,7 @@ mod tests {
                     &[FIELD_LINE_TEXT, FIELD_LINE_START, FIELD_LINE_END],
                 ),
                 template(b"TRAK", &[]),
+                template(b"APBM", &[FIELD_MOVIE, FIELD_LINE_START, FIELD_LINE_END]),
             ],
             structs: vec![
                 StructData {
@@ -219,7 +306,13 @@ mod tests {
                     template: 1,
                     values: vec![
                         Value::String(Some("duncan\0".into())),
-                        Value::List(Some(List::Generic(vec![slot(2), slot(3), slot(4)]))),
+                        Value::List(Some(List::Generic(vec![
+                            slot(2),
+                            slot(3),
+                            slot(4),
+                            slot(5),
+                            slot(6),
+                        ]))),
                     ],
                 },
                 line(200, 4.0, 6.0),
@@ -228,6 +321,8 @@ mod tests {
                     values: vec![],
                 },
                 line(100, 0.5, 3.5),
+                movie("later\0", 2.0, 1e10),
+                movie("first\0", 0.0, 2.0),
             ],
             root: StructId(0),
             shared_strings: None,
@@ -259,5 +354,18 @@ mod tests {
         assert!(Cutscene::from_gff4(&cut(b"CUT ", f32::NAN), "x").is_none());
         assert!(Cutscene::parse(b"junk", "x").is_none());
         assert_eq!(Cutscene::resource(" A.CUT "), "a.cut");
+    }
+
+    #[test]
+    fn reads_the_movies_played() {
+        let m = movies_of(&cut(b"CUT ", 10.0));
+        let got: Vec<(&str, f32, f32)> = m
+            .iter()
+            .map(|m| (m.name.as_str(), m.start, m.end))
+            .collect();
+        // By start; "to the end" is held to the cutscene's length.
+        assert_eq!(got, [("first", 0.0, 2.0), ("later", 2.0, 10.0)]);
+        assert!(movies_of(&cut(b"CONV", 10.0)).is_empty());
+        assert!(movies(b"junk").is_empty());
     }
 }
