@@ -74,6 +74,9 @@ pub mod field {
     pub const ROOM_BOUNDS_MAX: u32 = 3141;
 
     pub const RML_MODELS: u32 = 3050;
+    /// The rooms a room's lights also reach (DAOrigins.exe's room loader reads it into the
+    /// room at `+0xc0`, 0x5d3c73; the lights' room test 0x53d210 searches it).
+    pub const RML_LIGHT_ROOMS: u32 = 3164;
     pub const POSITION: u32 = 4;
     pub const ROTATION: u32 = 5;
     pub const MDL_SCALE: u32 = 3059;
@@ -565,6 +568,9 @@ pub struct Rml {
     pub placements: Vec<Placement>,
     /// The trees, bushes and grass the room places.
     pub trees: Vec<TreePlacement>,
+    /// The other rooms (by [`ArlRoom::id`]) this room's lights and light probes reach
+    /// (3164); a single -1 means every room. Its lights always reach the room itself.
+    pub light_rooms: Vec<i64>,
 }
 
 /// A SpeedTree placed in a room (`SPT `, 3354). Provisional: field meanings are read from
@@ -610,10 +616,16 @@ impl Rml {
                 flag: d.opt_i64(t, field::TREE_FLAG)?.unwrap_or(0),
             });
         }
+        let light_rooms = d
+            .numbers(root, field::RML_LIGHT_ROOMS)?
+            .into_iter()
+            .map(|v| v as i64)
+            .collect();
         Ok(Rml {
             transform,
             placements,
             trees,
+            light_rooms,
         })
     }
 }
@@ -834,9 +846,14 @@ mod tests {
             vec![
                 (field::POSITION, Value::Vec3([10.0, 0.0, 0.0])),
                 (field::RML_MODELS, structs(&[m, m2])),
+                (
+                    field::RML_LIGHT_ROOMS,
+                    Value::List(Some(crate::gff4::List::I32(vec![47, 12848]))),
+                ),
             ],
         );
         let rml = Rml::from_gff4(&b.finish(root)).unwrap();
+        assert_eq!(rml.light_rooms, vec![47, 12848]);
         assert_eq!(rml.transform.position, [10.0, 0.0, 0.0]);
         assert_eq!(rml.transform.rotation, IDENTITY_QUAT);
         let p = &rml.placements[0];

@@ -18,15 +18,16 @@
 //! `g_vLightParams` (usage `LightsArray`) is what DAOrigins.exe's per-object light packer
 //! (0x46b260, reached through the usage dispatch 0x4f8a10 and 0x46baf0) writes: point
 //! lights A, B, C at positions (radius in `w`) `c0`, `c5`, `c7` and colours `c1`, `c6`, `c8`
-//! (slot tables at 0xae7fb0 and 0xae7fbc), light D at `c9`/`c11` (0xae7fc8, 0xae7fd4),
-//! unused slots zero; `c2`/`c3` the directional light (below); and the ambient term
-//! `c4 = (base + Σ ambient lights, 1)`: the colours of the ambient light nodes the light
-//! manager picked for the object (0x4644f8 → 0x463e40 over its ambient list, ranked by
-//! `(|r| + |g| + |b|) / 3`, 0x53d040), plus the base the render parameters carry at `+0xc0`
-//! (0x46baf0's last argument). That base is written only by the graphics detail setter
-//! (0x458eb0): `(0.2, 0.2, 0.2)` in its fallback mode 0 and zero at every Graphics Detail
-//! setting (Low, Medium, High: modes 1-3), so an exterior with no ambient light nodes (such
-//! as Lothering) gets no ambient term at all: its lightmaps carry it ([`BASE_AMBIENT`]).
+//! (slot tables at 0xae7fb0 and 0xae7fbc), lights D, E at `c9`/`c10` and `c11`/`c12`
+//! (0xae7fc8, 0xae7fd4), unused slots zero; `c2`/`c3` the directional light (below); and the
+//! ambient term `c4 = (base + Σ ambient lights, 1)`. Which lights fill them is
+//! [`pick_lights`] and [`ambient_of`] (the light manager's lists, its room test and
+//! influence functions; notes in `OpenThedas-testdata/notes/character-lights.md`): A-C the
+//! static point lights, D-E the others; the ambient light nodes only for placeables. The
+//! base is what the render parameters carry at `+0xc0` (0x46baf0's last argument), written
+//! only by the graphics detail setter (0x458eb0): `(0.2, 0.2, 0.2)` in its fallback mode 0
+//! and zero at every Graphics Detail setting (Low, Medium, High: modes 1-3)
+//! ([`BASE_AMBIENT`]).
 //! `g_bShaderControlBooleans` `b0`-`b2` say lights D, B and C are present and `b3` that the
 //! directional light is (0x46be70).
 //!
@@ -45,8 +46,7 @@
 //! - Matrices of class `MatrixRows` occupy one register per column of our column-major
 //!   matrices (the shader computes `x*c[n] + y*c[n+1] + z*c[n+2] + c[n+3]`); `MatrixColumns`
 //!   one register per row.
-//! - Which ambient lights reach a draw: those of its room (the engine's pick also filters
-//!   by the object's light visibility list, not traced). The sun's visibility is taken as 1
+//! - The sun's visibility is taken as 1
 //!   (the occlusion test that lowers it is not traced). Light A is always evaluated; lights
 //!   A-C and the directional light are multiplied by the lightmap alpha; D is not.
 //! - Fog and the sky's scattering come from the level's atmosphere ([`crate::atmosphere`]).
@@ -67,7 +67,7 @@ use thedas_shader::{Shader, Stage};
 use thedas_vfs::Vfs;
 
 use crate::material::{Program, ProgramSource};
-use crate::scene::{AreaScene, LightmapRef, SceneLight, SceneMaterial};
+use crate::scene::{AreaScene, DOMAIN_CHARACTERS, LightmapRef, SceneLight, SceneMaterial};
 
 /// A material drawn with its original shaders.
 pub struct D3dProgram {
@@ -360,51 +360,204 @@ pub const OBJECT_VERTEX_SHADERS: [&str; 12] = [
     "Clouds.vsh",
 ];
 
-/// Point lights chosen for one draw, in slot order A, B, C.
+/// Point lights chosen for one draw.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DrawLights {
+    /// The static lights, in slot order A, B, C: (position, radius, colour).
     pub points: Vec<(Vec3, f32, Vec3)>,
+    /// The other lights (not `IsStatic`), in slot order D, E.
+    pub dynamic: Vec<(Vec3, f32, Vec3)>,
 }
 
-/// Picks up to three point lights whose radius reaches the draw's bounding sphere and whose
-/// affect domain includes `domain` (level geometry or characters), strongest first by colour
-/// brightness times the shader's own attenuation at the sphere centre. The domain keeps the
-/// rooms' character lights (`Char_sun`, `Char_bounce`, reaching 600 units) off the
-/// lightmapped level. Provisional: the original's light selection is unknown beyond that.
-pub fn pick_lights(lights: &[SceneLight], sphere: (Vec3, f32), domain: i64) -> DrawLights {
-    let mut cands: Vec<(f32, Vec3, f32, Vec3)> = lights
+/// Which of the light manager's lists a draw reads, by its material's `RenderClass`
+/// (DAOrigins.exe tags a mesh node 0x4000 for `character` and its model 0x10000 for `prop`,
+/// 0x55a0a0-0x55a2da; the per-object pass 0x4654e0 sends 0x4000 nodes to 0x464560 and the
+/// rest to 0x464310).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LightClass {
+    /// Level geometry (and anything else neither character nor prop): the level's point
+    /// lists, no ambient light nodes.
+    Level,
+    /// Placeables (`Prop`): the level's point lists, and the brightest ambient light node.
+    Prop,
+    /// Characters, their hair, faces, eyes and weapons (`Character`): the characters' point
+    /// lists, no ambient light nodes.
+    Character,
+}
+
+impl LightClass {
+    /// The class a `RenderClass` (comma-separated, any case) puts a draw in.
+    pub fn of(render_class: Option<&str>) -> LightClass {
+        let has = |tag: &str| {
+            render_class.is_some_and(|c| c.split(',').any(|k| k.trim().eq_ignore_ascii_case(tag)))
+        };
+        if has("character") {
+            LightClass::Character
+        } else if has("prop") {
+            LightClass::Prop
+        } else {
+            LightClass::Level
+        }
+    }
+
+    /// Whether a point light of this affect domain is in the lists this class reads: the
+    /// light manager files domain 1 under the characters' lists and anything else under the
+    /// level's (0x464e30).
+    fn takes(self, domain: Option<i64>) -> bool {
+        (domain == Some(DOMAIN_CHARACTERS)) == (self == LightClass::Character)
+    }
+}
+
+/// Whether a light (or probe) of room `light_room` reaches an object in room `room`
+/// (DAOrigins.exe 0x53d210): yes when the object has no room, the light has none, they are
+/// the same room, or the light's room's reach list ([`AreaScene::light_rooms`], RML 3164)
+/// is the single entry -1 or holds the object's room. A room whose list is empty (or
+/// missing) reaches only itself.
+pub fn reaches(
+    light_room: Option<i64>,
+    light_rooms: &HashMap<i64, Vec<i64>>,
+    room: Option<i64>,
+) -> bool {
+    let (Some(l), Some(r)) = (light_room, room) else {
+        return true;
+    };
+    if l == r {
+        return true;
+    }
+    match light_rooms.get(&l).map(Vec::as_slice) {
+        Some([-1]) => true,
+        Some(list) => list.contains(&r),
+        None => false,
+    }
+}
+
+/// A point light's influence on an object (DAOrigins.exe 0x53d280, `ObjectNodePointLight`'s
+/// `vfunc+0x84`): with `R` its radius plus the object's bound radius and `d` the distance
+/// between their centres, 0 beyond `R`; else `R - d` for `Version` 0 and
+/// `B · (1 - d / R)` for `Version` 1, `B` the colour's brightness `(|r| + |g| + |b|) / 3`
+/// (0x53ce60). Both scale by the light's intensity, 1 for a light that does not animate.
+/// Provisional: other versions (none seen) take version 0's formula; the exe leaves the
+/// last value.
+pub fn influence(
+    position: Vec3,
+    radius: f32,
+    color: Vec3,
+    version: i64,
+    sphere: (Vec3, f32),
+) -> f32 {
+    let reach = radius + sphere.1;
+    let d2 = position.distance_squared(sphere.0);
+    if reach * reach < d2 {
+        return 0.0;
+    }
+    let d = d2.max(0.0).sqrt();
+    if version == 1 {
+        let brightness = (color.x.abs() + color.y.abs() + color.z.abs()) / 3.0;
+        brightness * (1.0 - d / reach)
+    } else {
+        reach - d
+    }
+}
+
+/// Picks a draw's point lights as DAOrigins.exe's light manager does (0x463e40 over the
+/// lists 0x464e30 fills): from the point lights of the draw's class ([`LightClass::takes`])
+/// whose room reaches the draw's room ([`reaches`]), ranked by [`influence`] on the draw's
+/// bounding sphere, those above zero; up to three static lights (A, B, C) and two others
+/// (D, E). Ties keep the scene's order (the exe's sort is not stable).
+///
+/// Not mirrored (provisional): the light groups (a `CanBeOccluded` light reaches only the
+/// objects whose group set, ARL 3800, holds its id), the hidden-owner test of the D/E
+/// lists, and an object's second room.
+pub fn pick_lights(
+    lights: &[SceneLight],
+    light_rooms: &HashMap<i64, Vec<i64>>,
+    sphere: (Vec3, f32),
+    room: Option<i64>,
+    class: LightClass,
+) -> DrawLights {
+    pick_where(lights, sphere, |domain, light_room| {
+        class.takes(domain) && reaches(light_room, light_rooms, room)
+    })
+}
+
+/// [`pick_lights`] for a light rig (the paperdoll's): every light whose domain is unset or
+/// the characters', whatever its room.
+pub fn pick_rig_lights(lights: &[SceneLight], sphere: (Vec3, f32)) -> DrawLights {
+    pick_where(lights, sphere, |domain, _| {
+        domain.is_none_or(|d| d == DOMAIN_CHARACTERS)
+    })
+}
+
+fn pick_where(
+    lights: &[SceneLight],
+    sphere: (Vec3, f32),
+    keep: impl Fn(Option<i64>, Option<i64>) -> bool,
+) -> DrawLights {
+    let mut points: Vec<(f32, (Vec3, f32, Vec3))> = Vec::new();
+    let mut dynamic: Vec<(f32, (Vec3, f32, Vec3))> = Vec::new();
+    for l in lights {
+        let SceneLight::Point {
+            position,
+            color,
+            radius,
+            domain,
+            is_static,
+            version,
+            room,
+            ..
+        } = l
+        else {
+            continue;
+        };
+        if !keep(*domain, *room) {
+            continue;
+        }
+        let w = influence(*position, *radius, *color, *version, sphere);
+        if w > 0.0 {
+            let list = if *is_static {
+                &mut points
+            } else {
+                &mut dynamic
+            };
+            list.push((w, (*position, *radius, *color)));
+        }
+    }
+    let best = |mut v: Vec<(f32, (Vec3, f32, Vec3))>, n: usize| {
+        v.sort_by(|a, b| b.0.total_cmp(&a.0));
+        v.into_iter().take(n).map(|(_, l)| l).collect()
+    };
+    DrawLights {
+        points: best(points, 3),
+        dynamic: best(dynamic, 2),
+    }
+}
+
+/// The ambient light node term of a draw (`c4` beside the base): DAOrigins.exe selects the
+/// ambient list only for placeables (0x464310's 4th argument, set for models tagged `prop`,
+/// 0x465527), with one slot and an influence of the colour's brightness
+/// `(|r| + |g| + |b|) / 3` whatever the distance or room (0x53d040): the brightest ambient
+/// light of the level. Characters (0x465570 passes 0) get none.
+///
+/// Level geometry gets none from this path either (0x464310 without the `prop` flag skips
+/// the ambient list at 0x4644eb), but the Highever hall drawn so is far darker than the
+/// original's, so whether level meshes reach that path, or get their ambient elsewhere, is
+/// open: `D3dPass` keeps their room's ambient (provisional) and this returns zero for them.
+pub fn ambient_of(lights: &[SceneLight], class: LightClass) -> Vec3 {
+    if class != LightClass::Prop {
+        return Vec3::ZERO;
+    }
+    let brightness = |c: &Vec3| (c.x.abs() + c.y.abs() + c.z.abs()) / 3.0;
+    lights
         .iter()
         .filter_map(|l| match l {
-            SceneLight::Point {
-                position,
-                color,
-                radius,
-                domain: lit,
-                ..
-            } => {
-                if lit.is_some_and(|m| m & domain == 0) {
-                    return None;
-                }
-                let d = position.distance(sphere.0);
-                if d > radius + sphere.1 || *radius <= 0.0 {
-                    return None;
-                }
-                let t = (d / radius).clamp(0.0, 1.0);
-                let att = (t * std::f32::consts::FRAC_PI_2).cos().powi(2);
-                let weight = (color.x + color.y + color.z) * att.max(1e-3);
-                Some((weight, *position, *radius, *color))
-            }
-            SceneLight::Ambient { .. } => None,
+            SceneLight::Ambient { color, .. } => Some(*color),
+            _ => None,
         })
-        .collect();
-    cands.sort_by(|a, b| b.0.total_cmp(&a.0));
-    DrawLights {
-        points: cands
-            .into_iter()
-            .take(3)
-            .map(|(_, p, r, c)| (p, r, c))
-            .collect(),
-    }
+        .fold(None, |best: Option<Vec3>, c| match best {
+            Some(b) if brightness(&b) >= brightness(&c) => Some(b),
+            _ => Some(c),
+        })
+        .unwrap_or(Vec3::ZERO)
 }
 
 /// Everything needed to fill one draw's constants.
@@ -549,12 +702,17 @@ pub(crate) fn default_vectors(m: &SceneMaterial, name: &str) -> Option<Vec<[f32;
 
 impl ConstantContext<'_> {
     fn light_params(&self) -> Vec<[f32; 4]> {
-        let mut r = vec![[0.0f32; 4]; 12];
+        let mut r = vec![[0.0f32; 4]; 13];
         let slots = [0usize, 5, 7];
-        for (i, (p, radius, c)) in self.lights.points.iter().enumerate() {
+        for (i, (p, radius, c)) in self.lights.points.iter().take(3).enumerate() {
             let at = slots[i];
             r[at] = [p.x, p.y, p.z, *radius];
             r[at + 1] = [c.x, c.y, c.z, 1.0];
+        }
+        // D and E: positions in 9 and 10, colours in 11 and 12 (0xae7fc8, 0xae7fd4).
+        for (i, (p, radius, c)) in self.lights.dynamic.iter().take(2).enumerate() {
+            r[9 + i] = [p.x, p.y, p.z, *radius];
+            r[11 + i] = [c.x, c.y, c.z, 1.0];
         }
         let base = Vec3::from_array(BASE_AMBIENT);
         let ambient = base + self.ambient;
@@ -616,8 +774,14 @@ impl ConstantContext<'_> {
             ("FocalPlane", _) => Value::Vectors(vec![[1.0, 0.0, 0.0, 0.0]]),
             ("LightsArray", _) | (_, "g_vLightParams") => Value::Vectors(self.light_params()),
             ("ShaderControlBooleans", _) | (_, "g_bShaderControlBooleans") => {
+                // b0: the D/E list's first entry; b1, b2: lights B and C (0x46be70).
                 let n = self.lights.points.len();
-                Value::Bools(vec![false, n > 1, n > 2, self.sun.is_some()])
+                Value::Bools(vec![
+                    !self.lights.dynamic.is_empty(),
+                    n > 1,
+                    n > 2,
+                    self.sun.is_some(),
+                ])
             }
             // Three 4x4 matrices, red, green and blue: the vertex shaders light a normal n
             // with n^T M n (see `thedas_formats::probe`).
@@ -923,6 +1087,7 @@ mod tests {
         };
         let lights = DrawLights {
             points: vec![(Vec3::new(1.0, 2.0, 3.0), 12.0, Vec3::new(0.5, 0.25, 0.0)); 2],
+            dynamic: Vec::new(),
         };
         let lm = LightmapRef {
             texture: "lm.dds".into(),
@@ -1183,56 +1348,150 @@ mod tests {
         assert_eq!(plain[3], [0.0, 0.0, 0.0, 1.0]);
     }
 
-    #[test]
-    fn picks_the_strongest_lights_in_range() {
-        let light = |x: f32, r: f32, c: f32| SceneLight::Point {
+    /// A static point light of version 0 at (x, 0, 0).
+    fn point(x: f32, radius: f32, domain: Option<i64>, room: Option<i64>) -> SceneLight {
+        SceneLight::Point {
             position: Vec3::new(x, 0.0, 0.0),
-            color: Vec3::splat(c),
-            radius: r,
+            color: Vec3::ONE,
+            radius,
             name: String::new(),
-            domain: None,
-        };
+            domain,
+            is_static: true,
+            version: 0,
+            room,
+        }
+    }
+
+    fn xs(l: &[(Vec3, f32, Vec3)]) -> Vec<f32> {
+        l.iter().map(|p| p.0.x).collect()
+    }
+
+    #[test]
+    fn ranks_by_overlap_not_colour() {
+        let mut bright = point(1.0, 5.0, None, None);
+        if let SceneLight::Point { color, .. } = &mut bright {
+            *color = Vec3::splat(10.0);
+        }
         let lights = vec![
-            light(1.0, 5.0, 1.0),
-            light(100.0, 5.0, 10.0), // out of range
-            light(2.0, 5.0, 0.1),
-            light(0.5, 5.0, 0.5),
-            light(3.0, 5.0, 0.9),
+            bright,                        // R - d = 6 - 1 = 5
+            point(100.0, 5.0, None, None), // out of reach
+            point(2.0, 20.0, None, None),  // 21 - 2 = 19
+            point(0.5, 5.0, None, None),   // 5.5
+            point(3.0, 5.0, None, None),   // 3
             SceneLight::Ambient {
                 color: Vec3::ONE,
                 name: String::new(),
                 room: String::new(),
             },
         ];
-        let picked = pick_lights(&lights, (Vec3::ZERO, 1.0), DOMAIN_LEVEL);
-        assert_eq!(picked.points.len(), 3);
-        assert_eq!(picked.points[0].0.x, 1.0);
-        assert!(picked.points.iter().all(|p| p.0.x < 50.0));
+        let picked = pick_lights(
+            &lights,
+            &HashMap::new(),
+            (Vec3::ZERO, 1.0),
+            None,
+            LightClass::Level,
+        );
+        assert_eq!(xs(&picked.points), [2.0, 0.5, 1.0]);
+        assert!(picked.dynamic.is_empty());
     }
 
     #[test]
-    fn lights_only_their_domain() {
-        let light = |x: f32, c: f32, domain| SceneLight::Point {
-            position: Vec3::new(x, 0.0, 0.0),
-            color: Vec3::splat(c),
-            radius: 600.0,
-            name: String::new(),
-            domain,
-        };
+    fn version_one_weighs_brightness_and_dynamic_lights_fill_d_and_e() {
+        assert_eq!(
+            influence(Vec3::X * 2.0, 3.0, Vec3::splat(3.0), 1, (Vec3::ZERO, 1.0)),
+            1.5
+        );
+        assert_eq!(
+            influence(Vec3::X * 2.0, 3.0, Vec3::splat(3.0), 0, (Vec3::ZERO, 1.0)),
+            2.0
+        );
+        assert_eq!(
+            influence(Vec3::X * 5.0, 3.0, Vec3::ONE, 0, (Vec3::ZERO, 1.0)),
+            0.0
+        );
+        let mut lights: Vec<SceneLight> =
+            (0..4).map(|i| point(i as f32, 10.0, None, None)).collect();
+        for l in &mut lights[1..] {
+            if let SceneLight::Point { is_static, .. } = l {
+                *is_static = false;
+            }
+        }
+        let picked = pick_lights(
+            &lights,
+            &HashMap::new(),
+            (Vec3::ZERO, 1.0),
+            None,
+            LightClass::Prop,
+        );
+        assert_eq!(xs(&picked.points), [0.0]);
+        assert_eq!(xs(&picked.dynamic), [1.0, 2.0]);
+    }
+
+    #[test]
+    fn characters_take_domain_one_and_the_rest_take_the_others() {
         let lights = vec![
-            light(1.0, 9.0, Some(DOMAIN_CHARACTERS)),
-            light(2.0, 1.0, Some(DOMAIN_LEVEL)),
-            light(3.0, 0.5, Some(DOMAIN_LEVEL | DOMAIN_CHARACTERS)),
-            light(4.0, 0.1, None),
+            point(1.0, 600.0, Some(DOMAIN_CHARACTERS), None),
+            point(2.0, 600.0, Some(DOMAIN_LEVEL), None),
+            point(3.0, 600.0, Some(0), None),
+            point(4.0, 600.0, None, None),
         ];
-        let at = |domain| {
-            pick_lights(&lights, (Vec3::ZERO, 1.0), domain)
-                .points
-                .iter()
-                .map(|p| p.0.x)
-                .collect::<Vec<_>>()
+        let at = |class| {
+            xs(&pick_lights(&lights, &HashMap::new(), (Vec3::ZERO, 1.0), None, class).points)
         };
-        assert_eq!(at(DOMAIN_LEVEL), [2.0, 3.0, 4.0]);
-        assert_eq!(at(DOMAIN_CHARACTERS), [1.0, 3.0, 4.0]);
+        assert_eq!(at(LightClass::Character), [1.0]);
+        assert_eq!(at(LightClass::Level), [2.0, 3.0, 4.0]);
+        assert_eq!(at(LightClass::Prop), [2.0, 3.0, 4.0]);
+        assert_eq!(
+            LightClass::of(Some("Opaque,Weapon,Character")),
+            LightClass::Character
+        );
+        assert_eq!(
+            LightClass::of(Some("Opaque,Prop,PunchThrough")),
+            LightClass::Prop
+        );
+        assert_eq!(LightClass::of(Some("Opaque,Static1")), LightClass::Level);
+        assert_eq!(LightClass::of(None), LightClass::Level);
+    }
+
+    #[test]
+    fn a_rooms_lights_reach_the_rooms_it_lists() {
+        let rooms: HashMap<i64, Vec<i64>> = [(10, vec![47, 48]), (20, vec![]), (30, vec![-1])]
+            .into_iter()
+            .collect();
+        let lights = vec![
+            point(1.0, 600.0, Some(1), Some(10)),
+            point(2.0, 600.0, Some(1), Some(20)),
+            point(3.0, 600.0, Some(1), Some(30)),
+            point(4.0, 600.0, Some(1), Some(99)),
+            point(5.0, 600.0, Some(1), None),
+        ];
+        let at = |room| {
+            xs(&pick_lights(
+                &lights,
+                &rooms,
+                (Vec3::ZERO, 1.0),
+                room,
+                LightClass::Character,
+            )
+            .points)
+        };
+        assert_eq!(at(Some(47)), [1.0, 3.0, 5.0]);
+        assert_eq!(at(Some(20)), [2.0, 3.0, 5.0]);
+        assert_eq!(at(None), [1.0, 2.0, 3.0]);
+        assert!(!reaches(Some(20), &rooms, Some(47)));
+        assert!(reaches(Some(99), &rooms, Some(99)));
+    }
+
+    #[test]
+    fn only_props_take_the_brightest_ambient() {
+        let amb = |c: f32| SceneLight::Ambient {
+            color: Vec3::splat(c),
+            name: String::new(),
+            room: String::new(),
+        };
+        let lights = vec![amb(0.2), amb(0.5), amb(0.3)];
+        assert_eq!(ambient_of(&lights, LightClass::Prop), Vec3::splat(0.5));
+        assert_eq!(ambient_of(&lights, LightClass::Character), Vec3::ZERO);
+        assert_eq!(ambient_of(&lights, LightClass::Level), Vec3::ZERO);
     }
 }

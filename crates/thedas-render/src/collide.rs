@@ -301,6 +301,7 @@ mod tests {
             sphere: (Vec3::new(x, 0.0, 1.0), 1.5),
             model: "quad".into(),
             room: String::new(),
+            room_id: None,
             probe: None,
             skin: None,
             cast_shadow: None,

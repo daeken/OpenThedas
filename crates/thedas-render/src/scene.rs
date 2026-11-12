@@ -108,6 +108,9 @@ pub struct DrawItem {
     /// The placed model and room, for diagnostics.
     pub model: String,
     pub room: String,
+    /// The id of the room it stands in ([`thedas_formats::level::ArlRoom::id`]), for the
+    /// lights' room test (see [`crate::d3d::pick_lights`]); `None` outside every room.
+    pub room_id: Option<i64>,
     /// The irradiance probe lighting it ([`AreaScene::probes`]).
     pub probe: Option<usize>,
     /// For a skinned mesh: how its vertices follow its model's skeleton.
@@ -158,6 +161,8 @@ impl LightRig {
                     color,
                     radius,
                     affect_domain,
+                    is_static,
+                    version,
                 } = lp.light
                 {
                     out.lights.push(SceneLight::Point {
@@ -166,6 +171,9 @@ impl LightRig {
                         radius: *radius,
                         name: lp.name.unwrap_or("").to_string(),
                         domain: *affect_domain,
+                        is_static: is_static.unwrap_or(false),
+                        version: version.unwrap_or(0),
+                        room: None,
                     });
                 }
             }
@@ -213,9 +221,18 @@ pub enum SceneLight {
         color: Vec3,
         radius: f32,
         name: String,
-        /// What it lights, as a mask of [`DOMAIN_LEVEL`] and [`DOMAIN_CHARACTERS`]; `None`
-        /// when its node does not say (it then lights everything).
+        /// What it lights: [`DOMAIN_CHARACTERS`] (characters only) or anything else (the
+        /// level and placeables); `None` when its node does not say (the level).
         domain: Option<i64>,
+        /// `IsStatic`: a static light joins the three-slot lists (A, B, C), any other the
+        /// two-slot ones (D, E). Absent reads as false (the blueprint's default, 0x55f3bc).
+        is_static: bool,
+        /// `Version`: 0 or 1, the influence formula (see [`crate::d3d::pick_lights`]).
+        version: i64,
+        /// The room (id) whose layout placed it: it reaches that room and the rooms the
+        /// room's [`AreaScene::light_rooms`] lists. `None` for a light a placed object
+        /// carries (provisional: it reaches every room).
+        room: Option<i64>,
     },
     Ambient {
         color: Vec3,
@@ -276,6 +293,11 @@ pub struct AreaScene {
     pub warnings: Vec<String>,
     /// The level's irradiance probes.
     pub probes: Vec<SceneProbe>,
+    /// Each room's light reach (RML 3164, by room id): the other rooms its lights and probes
+    /// reach (see [`crate::d3d::reaches`]).
+    pub light_rooms: HashMap<i64, Vec<i64>>,
+    /// The layout's rooms' boxes (id, min, max), to find the room an object stands in.
+    pub room_boxes: Vec<(i64, Vec3, Vec3)>,
     /// The skeletons of the skinned models, one per model.
     pub skeletons: Vec<Arc<Skeleton>>,
     /// Each skeleton's model (without `.mmh`).
@@ -340,6 +362,10 @@ pub struct SceneProbe {
     /// The archive's stem: a room (`hrt001d_0`) or the level (`ost000t`).
     pub archive: String,
     pub probe: IrradianceProbe,
+    /// Where its light probe node stands, when a room's light model places it.
+    pub position: Option<Vec3>,
+    /// The room (id) whose light model places it (see [`SceneLight::Point::room`]).
+    pub room: Option<i64>,
 }
 
 /// One prop's draws in [`AreaScene::draws`].
@@ -416,6 +442,10 @@ struct Placing<'a> {
     lightmaps: &'a [LightmapBinding],
     /// The room, or the prop's label.
     room: &'a str,
+    /// The id of the room the draws stand in.
+    room_id: Option<i64>,
+    /// The room whose layout places the model (its lights then belong to that room).
+    layout_room: Option<i64>,
     probe: Option<usize>,
     /// A head morph shaping and colouring the model's face meshes: (name, morph).
     morph: Option<(&'a str, &'a Morph)>,
@@ -1017,6 +1047,8 @@ impl<'a> Loader<'a> {
                 name: name.to_ascii_lowercase(),
                 archive,
                 probe,
+                position: None,
+                room: None,
             });
         }
     }
@@ -1034,6 +1066,24 @@ impl<'a> Loader<'a> {
             .or_else(|| (!self.scene.probes.is_empty()).then_some(0))
     }
 
+    /// Gives each draw the probe the original's light manager would pick for it, when the
+    /// rooms' light models place their probes: among the probes whose room reaches the
+    /// draw's ([`crate::d3d::reaches`]), the nearest to its bounds' centre (DAOrigins.exe's
+    /// probe influence is `1 / d`, 0x53d3e0, one slot). Draws no placed probe reaches keep
+    /// the room's (provisional).
+    fn assign_probes(&mut self) {
+        let scene = &mut self.scene;
+        if scene.probes.iter().all(|p| p.position.is_none()) {
+            return;
+        }
+        for d in &mut scene.draws {
+            if let Some(p) = nearest_probe(&scene.probes, &scene.light_rooms, d.sphere.0, d.room_id)
+            {
+                d.probe = Some(p);
+            }
+        }
+    }
+
     /// Adds the draws (and lights) of one placed model: `placement` is model to world.
     fn place(&mut self, model_name: &str, placement: Mat4, at: Placing<'_>) {
         let Placing {
@@ -1041,6 +1091,8 @@ impl<'a> Loader<'a> {
             sphere,
             lightmaps,
             room,
+            room_id,
+            layout_room,
             probe,
             morph,
             tint,
@@ -1062,12 +1114,17 @@ impl<'a> Loader<'a> {
                     color,
                     radius,
                     affect_domain,
+                    is_static,
+                    version,
                 } => SceneLight::Point {
                     position: m.transform_point3(Vec3::ZERO),
                     color: Vec3::new(color[0], color[1], color[2]),
                     radius: *radius,
                     name,
                     domain: *affect_domain,
+                    is_static: is_static.unwrap_or(false),
+                    version: version.unwrap_or(0),
+                    room: layout_room,
                 },
                 thedas_formats::model::Light::Ambient { color } => SceneLight::Ambient {
                     color: Vec3::new(color[0], color[1], color[2]),
@@ -1075,6 +1132,26 @@ impl<'a> Loader<'a> {
                     room: room.to_string(),
                 },
             });
+        }
+        // The light probes a room's light model places: where they stand, and their room.
+        if let Some(room) = layout_room {
+            for (file, chain) in model.irradiance_pieces() {
+                let at = chain
+                    .iter()
+                    .fold(placement, |m, t| m * transform_matrix(t))
+                    .transform_point3(Vec3::ZERO);
+                let stem = file.to_ascii_lowercase();
+                let stem = stem.trim_end_matches(".mtx");
+                if let Some(p) = self
+                    .scene
+                    .probes
+                    .iter_mut()
+                    .find(|p| p.position.is_none() && p.name.trim_end_matches(".mtx") == stem)
+                {
+                    p.position = Some(at);
+                    p.room = Some(room);
+                }
+            }
         }
         if lights_only {
             return;
@@ -1175,6 +1252,7 @@ impl<'a> Loader<'a> {
                 sphere,
                 model: model_name.to_string(),
                 room: room.to_string(),
+                room_id,
                 probe,
                 skin,
                 cast_shadow: piece.mesh.cast_runtime_shadow,
@@ -1323,6 +1401,39 @@ impl<'a> Loader<'a> {
     }
 }
 
+/// The probe (index into `probes`) DAOrigins.exe's light manager picks for an object at
+/// `at` in room `room`: the nearest placed probe whose room reaches it (see
+/// `Loader::assign_probes`).
+pub fn nearest_probe(
+    probes: &[SceneProbe],
+    light_rooms: &HashMap<i64, Vec<i64>>,
+    at: Vec3,
+    room: Option<i64>,
+) -> Option<usize> {
+    probes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let pos = p.position?;
+            crate::d3d::reaches(p.room, light_rooms, room).then(|| (i, pos.distance(at)))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
+}
+
+/// The id of the smallest room box (see [`AreaScene::room_boxes`]) holding `p`.
+/// Provisional: the original's object room (its `vfunc+0x6c`) is not traced.
+pub fn room_id_at(boxes: &[(i64, Vec3, Vec3)], p: Vec3) -> Option<i64> {
+    boxes
+        .iter()
+        .filter(|(_, lo, hi)| p.cmpge(*lo).all() && p.cmple(*hi).all())
+        .min_by(|a, b| {
+            let vol = |(_, lo, hi): &&(i64, Vec3, Vec3)| (*hi - *lo).element_product();
+            vol(a).total_cmp(&vol(b))
+        })
+        .map(|(id, _, _)| *id)
+}
+
 /// The smallest room whose bounds hold `p`.
 fn room_at(rooms: &[ArlRoom], p: Vec3) -> Option<&ArlRoom> {
     rooms
@@ -1431,6 +1542,17 @@ impl AreaScene {
             .bounds()
             .map(|(lo, hi)| (Vec3::from_array(lo), Vec3::from_array(hi)));
         l.load_probes(level);
+        l.scene.room_boxes = arl
+            .rooms
+            .iter()
+            .map(|r| {
+                (
+                    r.id,
+                    Vec3::from_array(r.bounds_min),
+                    Vec3::from_array(r.bounds_max),
+                )
+            })
+            .collect();
         for room in &arl.rooms {
             l.scene.rooms.push(room.name.clone());
             let room_probe = l.room_probe(level, &room.name);
@@ -1454,6 +1576,7 @@ impl AreaScene {
                     continue;
                 }
             };
+            l.scene.light_rooms.insert(room.id, rml.light_rooms.clone());
             let room_m = transform_matrix(&rml.transform);
             for p in &rml.placements {
                 let placement = room_m
@@ -1468,6 +1591,8 @@ impl AreaScene {
                         sphere,
                         lightmaps: &p.lightmaps,
                         room: &room.name,
+                        room_id: Some(room.id),
+                        layout_room: Some(room.id),
                         probe: room_probe,
                         morph: None,
                         tint: None,
@@ -1490,6 +1615,8 @@ impl AreaScene {
                     sphere: None,
                     lightmaps: &[],
                     room: "",
+                    room_id: None,
+                    layout_room: None,
                     probe: None,
                     morph: None,
                     tint: None,
@@ -1520,11 +1647,14 @@ impl AreaScene {
             };
             // Objects are lit as part of the room they stand in.
             let room_name = in_room.map_or(prop.label.as_str(), |r| r.name.as_str());
+            let room_id = in_room.map(|r| r.id);
             let placing = |room| Placing {
                 scale: 1.0,
                 sphere: None,
                 lightmaps: &[],
                 room,
+                room_id,
+                layout_room: None,
                 probe,
                 morph: None,
                 tint: None,
@@ -1612,6 +1742,7 @@ impl AreaScene {
                 attachments,
             });
         }
+        l.assign_probes();
         Ok(l.scene)
     }
 }
@@ -1627,6 +1758,31 @@ struct FacePiece {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_object_takes_the_nearest_probe_its_room_sees() {
+        let probe = |x: f32, room| SceneProbe {
+            name: String::new(),
+            archive: String::new(),
+            probe: IrradianceProbe::uniform([0.5; 3]),
+            position: Some(Vec3::new(x, 0.0, 0.0)),
+            room,
+        };
+        let probes = vec![probe(1.0, Some(5)), probe(10.0, Some(6)), probe(50.0, None)];
+        let rooms: HashMap<i64, Vec<i64>> = [(6, vec![7])].into_iter().collect();
+        // Room 7 sees room 6's probe and the roomless one, not room 5's (nearer).
+        assert_eq!(nearest_probe(&probes, &rooms, Vec3::ZERO, Some(7)), Some(1));
+        assert_eq!(nearest_probe(&probes, &rooms, Vec3::ZERO, Some(5)), Some(0));
+        assert_eq!(nearest_probe(&probes, &rooms, Vec3::ZERO, Some(8)), Some(2));
+        assert_eq!(nearest_probe(&probes, &rooms, Vec3::ZERO, None), Some(0));
+        let boxes = vec![
+            (1, Vec3::splat(-10.0), Vec3::splat(10.0)),
+            (2, Vec3::splat(-1.0), Vec3::splat(1.0)),
+        ];
+        assert_eq!(room_id_at(&boxes, Vec3::ZERO), Some(2));
+        assert_eq!(room_id_at(&boxes, Vec3::splat(5.0)), Some(1));
+        assert_eq!(room_id_at(&boxes, Vec3::splat(50.0)), None);
+    }
 
     #[test]
     fn a_face_target_family_stays_balanced() {
