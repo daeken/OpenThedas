@@ -52,6 +52,8 @@ pub struct LiveObjects {
 pub struct Live {
     /// Shared with the interface, whose movies act on it as they send messages.
     pub sim: Arc<Mutex<Sim>>,
+    /// The start menu's, before a game is chosen: nothing is loaded and nothing runs.
+    pub front_end: bool,
     pub paused: bool,
     install: PathBuf,
     shaders: String,
@@ -91,6 +93,10 @@ pub enum Start<'a> {
     NewGameQuick,
     /// An area of the module, its objects as placed.
     Area(&'a str),
+    /// No game: the start menu, before one is chosen (a simulation with no module loaded).
+    Menu,
+    /// A saved game's bytes (`Sim::save_json`), as the load screen picked it.
+    SaveBytes(&'a [u8]),
 }
 
 /// Who gets a portrait drawn: the party, and the followers picked in an open party picker
@@ -127,19 +133,28 @@ impl Live {
                 _ => thedas_sim::sim::ChargenPolicy::QuickStart,
             },
         };
-        let mut sim = thedas_sim::session::open(&opts)?;
-        if let Start::Save(path) = start {
-            let bytes =
-                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut sim = if matches!(start, Start::Menu) {
+            thedas_sim::session::open_bare(&opts)?
+        } else {
+            thedas_sim::session::open(&opts)?
+        };
+        let save = match start {
+            Start::Save(path) => Some((
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
+                path.display().to_string(),
+            )),
+            Start::SaveBytes(b) => Some((b.to_vec(), "picked on the load screen".to_string())),
+            _ => None,
+        };
+        if let Some((bytes, path)) = save {
             sim.load_json(&bytes)?;
             for issue in &sim.save_issues {
-                log::warn!("save {}: {issue}", path.display());
+                log::warn!("save {path}: {issue}");
             }
             if sim.save_issues.iter().any(|i| !i.repaired) {
                 log::warn!(
-                    "save {}: made by an older build that damaged character properties; \
-                     starting a new game is advised",
-                    path.display()
+                    "save {path}: made by an older build that damaged character properties; \
+                     starting a new game is advised"
                 );
             }
         }
@@ -149,6 +164,7 @@ impl Live {
         sim.party_picker_policy = thedas_sim::sim::PartyPickerPolicy::Player;
         Ok(Self {
             sim: Arc::new(Mutex::new(sim)),
+            front_end: matches!(start, Start::Menu),
             paused: false,
             install: install.to_path_buf(),
             shaders: shaders.to_string(),
@@ -175,7 +191,7 @@ impl Live {
     /// Advances the simulation by `dt_ms` of real time (at most [`MAX_STEP_MS`]), unless
     /// paused.
     pub fn step(&mut self, dt_ms: f64) {
-        if self.paused {
+        if self.paused || self.front_end {
             return;
         }
         self.owed_ms += dt_ms.clamp(0.0, MAX_STEP_MS);

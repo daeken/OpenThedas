@@ -60,6 +60,20 @@ pub fn open(o: &SessionOptions) -> Result<Sim, SimError> {
     Ok(sim)
 }
 
+/// Opens the install with no module loaded: the start menu's simulation, which has the
+/// game's resources (strings, tables) and nothing running.
+pub fn open_bare(o: &SessionOptions) -> Result<Sim, SimError> {
+    let install = DaoInstall::open(&o.install)?;
+    let vfs = install.global_vfs(TextureQuality::High)?;
+    let (data, _) = vfs
+        .read("script.ldf")
+        .map_err(|_| SimError::NotFound("script.ldf".into()))?;
+    let table = EngineTable::parse(&data)
+        .map_err(|e| SimError::Parse("script.ldf".into(), e.to_string()))?
+        .with_inferred();
+    Ok(Sim::new(Arc::new(vfs), Arc::new(table), o.seed))
+}
+
 /// The install root from `THEDAS_INSTALL`, if set.
 pub fn install_from_env() -> Option<std::path::PathBuf> {
     std::env::var_os("THEDAS_INSTALL").map(std::path::PathBuf::from)
