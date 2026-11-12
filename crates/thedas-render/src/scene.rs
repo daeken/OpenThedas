@@ -246,6 +246,9 @@ pub struct SceneEmitter {
     /// The placed model and node, for diagnostics.
     pub model: String,
     pub node: String,
+    /// Whether its model has a `CutAway` mesh: its particles fade with the cutaway
+    /// (DAOrigins.exe 0x466f40).
+    pub cut_away: bool,
 }
 
 /// A light placed in the level (from the room's `_ll` light model).
@@ -1510,7 +1513,8 @@ impl<'a> Loader<'a> {
         if lights_only {
             return rigid;
         }
-        self.place_emitters(model_name, &model, placement, user_params);
+        let cut_away = model.mesh_pieces().iter().any(|p| p.mesh.cut_away);
+        self.place_emitters(model_name, &model, placement, user_params, cut_away);
         let pieces = model.mesh_pieces();
         if pieces.is_empty() {
             return rigid;
@@ -1632,6 +1636,7 @@ impl<'a> Loader<'a> {
         model: &Mmh,
         placement: Mat4,
         user_params: &[(String, [f32; 4])],
+        cut_away: bool,
     ) {
         for piece in model.emitters() {
             let e = piece.emitter;
@@ -1683,6 +1688,7 @@ impl<'a> Loader<'a> {
                 material,
                 model: model_name.to_string(),
                 node: piece.name.unwrap_or("").to_string(),
+                cut_away,
             });
         }
     }

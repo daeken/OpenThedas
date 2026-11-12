@@ -508,6 +508,8 @@ pub struct AreaRenderer {
     pub emitters: Vec<crate::particles::EmitterState>,
     /// The draws of `CutAway` meshes ([`AreaScene::cut_away`]).
     cut_away: Vec<usize>,
+    /// The emitters of models with a `CutAway` mesh ([`SceneEmitter::cut_away`]).
+    cut_away_emitters: Vec<usize>,
 }
 
 /// The colour curve `da_hsvmatrix` reads: `name` (an area's curve, `<name>.dds`) or by
@@ -971,6 +973,13 @@ impl AreaRenderer {
             light: StandInLight::default(),
             stats,
             cut_away: scene.cut_away.clone(),
+            cut_away_emitters: scene
+                .emitters
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.cut_away)
+                .map(|(i, _)| i)
+                .collect(),
         }
     }
 
@@ -1044,6 +1053,11 @@ impl AreaRenderer {
     pub fn set_cutaway(&mut self, ctx: &GpuContext, value: f32) {
         for d in self.cut_away.clone() {
             self.d3d.set_opacity(ctx, d, value);
+        }
+        for (e, state) in self.emitters.iter_mut().enumerate() {
+            if self.cut_away_emitters.contains(&e) {
+                state.opacity = value;
+            }
         }
     }
 

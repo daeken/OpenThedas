@@ -1699,17 +1699,30 @@ impl UiLayer {
             return;
         };
         let num = |x: f64| thedas_ui::UiValue::Number(x);
-        // The camera's facing, as creatures' (degrees, 0 looking along +Y).
+        // The camera's icon (entry 0): its view cone, which the minimap centres on, at the
+        // camera's pivot, the party member it follows (the original's cone starts at the
+        // player, not at the eye up behind them; the eye, far out in the tactical view, put
+        // the cone off the minimap), turned with the camera's facing (degrees, 0 looking
+        // along +Y). Provisional: the exe's own camera entry is not traced.
         let mut ids = vec![num(0.0)];
-        let at = info.to_map(camera.position.x, camera.position.y);
-        let mut places = vec![
-            num(at[0] as f64),
-            num(at[1] as f64),
-            num(camera.yaw.to_degrees() as f64 - 90.0),
-        ];
+        let mut places = Vec::new();
         let mut flags = vec![num(0.0)];
         {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+            let pivot = sim
+                .world
+                .controlled()
+                .or(sim.world.hero)
+                .and_then(|id| sim.world.get(id))
+                .map_or((camera.position.x, camera.position.y), |o| {
+                    (o.position[0], o.position[1])
+                });
+            let at = info.to_map(pivot.0, pivot.1);
+            places.extend([
+                num(at[0] as f64),
+                num(at[1] as f64),
+                num(camera.yaw.to_degrees() as f64 - 90.0),
+            ]);
             let area = sim.world.area;
             let party = thedas_sim::engine::party_of(&sim);
             let (hero, controlled) = (sim.world.hero, sim.world.controlled());
