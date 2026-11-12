@@ -248,7 +248,7 @@ impl Sim {
         self.equip_event("UNEQUIP", who, item, slot, false);
     }
 
-    fn equip_event(
+    pub(crate) fn equip_event(
         &mut self,
         name: &str,
         who: ObjectId,
@@ -628,6 +628,32 @@ impl Sim {
     /// +0x670, to the inventory's recipe list (0x7408b0, the console's `AddRecipe`) and
     /// deletes the item). Provisional: "the party" is taken to be the hero and followers.
     ///
+    /// Merges the stackable items `owner` carries (not wears) into stacks, in inventory
+    /// order, as adding them one by one would have (see [`Sim::stack_into`]).
+    pub(crate) fn restack(&mut self, owner: ObjectId) {
+        let Some(o) = self.world.get(owner) else {
+            return;
+        };
+        let worn: Vec<ObjectId> = o
+            .equipment
+            .values()
+            .chain(o.other_set.values())
+            .copied()
+            .collect();
+        let carried: Vec<ObjectId> = o
+            .inventory
+            .iter()
+            .copied()
+            .filter(|i| !worn.contains(i) && self.max_stack(*i) > 1)
+            .collect();
+        for item in carried {
+            if let Some(o) = self.world.get_mut(owner) {
+                o.inventory.retain(|&i| i != item);
+            }
+            self.stack_into(owner, item);
+        }
+    }
+
     /// Coin (base item 17, `Money - Copper`) the hero receives is counted into the hero's
     /// money and the item is gone, as DAOrigins.exe's inventory add does (0x7409fa: an item
     /// of base type 0x11 added to the player's inventory adds its stack size to the money
