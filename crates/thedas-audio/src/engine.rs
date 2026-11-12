@@ -721,6 +721,12 @@ impl AudioEngine {
                 )
             });
             if let Ok(id) = id {
+                log::debug!(
+                    "audio: voice of {} (sound pitch x{:.3}, sound gain x{:.3})",
+                    inst.path,
+                    l.rate,
+                    l.gain
+                );
                 slot.voices.push(id);
                 slot.gains.insert(id, l.gain);
             }

@@ -361,6 +361,9 @@ const MELEE_TALENT_TOLERANCE: f32 = 1.0;
 /// start step (0x7a87c0) tests the two creatures' current positions (0x6a3dc0); the
 /// simulation has no frames, so it looks this often. Provisional.
 const APPROACH_CHECK_MS: u64 = 100;
+/// How far above or below the pathing grid's floor a creature placed in an area may stand
+/// and still be put on it (metres; see `Sim::spawn_instance`). Provisional.
+const SPAWN_SNAP_RANGE: f32 = 2.0;
 /// How far apart a moving creature's position is tested against triggers as it walks, in metres.
 const TRIGGER_STEP: f32 = 0.5;
 
@@ -1246,6 +1249,30 @@ impl Sim {
     /// The player answers the open message box: `EVENT_TYPE_POPUP_RESULT` to its owner (the
     /// module when it has none), object 0 the owner, integers the popup's kind and the
     /// button pressed (1 for the first). Returns false when no popup is open.
+    /// `EVENT_TYPE_USE` from `user` for `placeable`: integer 0 says whether the user stands
+    /// in front of it, as DAOrigins.exe's use handler sets it (0x7a7a96: the placeable's
+    /// forward vector against the direction to the user, >= 0; +X when they stand at the
+    /// same spot).
+    pub fn use_event(&self, user: ObjectId, placeable: ObjectId) -> Event {
+        let mut ev = self.new_event("USE", Some(user));
+        let front = match (self.world.get(placeable), self.world.get(user)) {
+            (Some(p), Some(u)) => {
+                let h = crate::world::heading_of(p.facing).to_radians();
+                let (dx, dy) = (u.position[0] - p.position[0], u.position[1] - p.position[1]);
+                let len = (dx * dx + dy * dy).sqrt();
+                let (dx, dy) = if len > 1e-6 {
+                    (dx / len, dy / len)
+                } else {
+                    (1.0, 0.0)
+                };
+                h.cos() * dx + h.sin() * dy >= 0.0
+            }
+            _ => false,
+        };
+        ev.ints = vec![front as i32];
+        ev
+    }
+
     pub fn answer_popup(&mut self, button: i32) -> bool {
         self.answer_popup_with_text(button, "")
     }
@@ -2875,7 +2902,7 @@ impl Sim {
         } else if cmd.name == "CommandUseObject" {
             // Using a placeable (a door, a lever) sends it EVENT_TYPE_USE, as clicking it does.
             if let Some(t) = cmd.target.filter(|&t| self.world.get(t).is_some()) {
-                let ev = self.new_event("USE", Some(id));
+                let ev = self.use_event(id, t);
                 self.deliver(t, ev, None);
             }
         }
@@ -3286,6 +3313,30 @@ impl Sim {
                         .push([float(s, "XPoint"), float(s, "YPoint"), float(s, "ZPoint")]);
                 }
             }
+        }
+        // A creature stands on the ground: DAOrigins.exe sets a loaded creature's position
+        // again through its physics controller (0x695540 -> 0x6b5ef0 -> 0x6b1790), which
+        // projects it onto the walkable surface (0x73e370, 0x73e7f0), so one placed a little
+        // above or below the floor lands on it (Dust Town's slum guard is placed 1.3 m up).
+        // Provisional: the pathing grid's floor stands in for the walk surface; only a floor
+        // within [`SPAWN_SNAP_RANGE`] with no level geometry in between is used, so
+        // creatures placed on a level the grid does not hold keep their height.
+        if kind == ObjectKind::Creature
+            && let Some(p) = self.world.get(id).map(|o| o.position)
+            && let Some(floor) = self.floor_at(area, p)
+            && (p[2] - floor).abs() > 0.05
+            && (p[2] - floor).abs() <= SPAWN_SNAP_RANGE
+            // A creature on a ledge, balcony or bridge the grid does not hold has the
+            // level's geometry between it and the grid's floor: it keeps its height.
+            && !self.collision(area).is_some_and(|c| {
+                c.blocked(
+                    [p[0], p[1], p[2] + 0.05],
+                    [p[0], p[1], floor + 0.05 * (p[2] - floor).signum()],
+                )
+            })
+            && let Some(o) = self.world.get_mut(id)
+        {
+            o.position[2] = floor;
         }
         if let Some(t) = &tmpl {
             match kind {

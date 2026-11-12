@@ -76,6 +76,8 @@ pub(crate) struct D3dDraw {
     /// The draw's bounding sphere in its own space (centre, radius), for the view culling
     /// (see [`in_view`]); `None` for draws that are never culled.
     sphere: Option<(Vec3, f32)>,
+    /// A SpeedTree part's draw distances ([`crate::scene::DrawLod`]).
+    lod: Option<crate::scene::DrawLod>,
 }
 
 /// Pipelines and vertex buffers kept between passes (see [`crate::gpu::RenderCache`]).
@@ -147,6 +149,10 @@ pub(crate) struct D3dPass {
     /// is a moved object's lights, re-picked by [`D3dPass::repick_lights`], which clears
     /// the entry. A setter for any of the fixed inputs must clear the draw's entry here.
     statics: std::sync::Mutex<Vec<Option<Box<StaticConstants>>>>,
+    /// Per draw, what its whole constant slot was last written with (target size and
+    /// opacity), or `None` when it must be written whole: a draw whose slot is current
+    /// gets only its per-frame registers rewritten (the slot keeps the rest between frames).
+    written: std::sync::Mutex<Vec<Option<(u32, u32, f32)>>>,
     /// The scene's lights, for re-picking the lights of objects that move.
     scene_lights: Vec<SceneLight>,
     /// The rooms' light reach ([`AreaScene::light_rooms`]) and boxes
@@ -1452,6 +1458,7 @@ impl D3dPass {
                     c => pick_lights(&scene.lights, &scene.light_rooms, d.sphere, d.room_id, c),
                 },
                 multipass,
+                lod: d.lod,
                 sphere: {
                     // The sky and its clouds follow the camera (`sky.vsh`, `clouds.vsh`):
                     // drawn whatever their bounds (the original draws them through their own
@@ -1735,6 +1742,7 @@ impl D3dPass {
             casters_filled: std::sync::Mutex::new(None),
             in_view: std::sync::Mutex::new(Vec::new()),
             statics: std::sync::Mutex::new(Vec::new()),
+            written: std::sync::Mutex::new(Vec::new()),
             casters,
             caster_buffer,
             caster_programs: caster_programs_used,
@@ -2027,12 +2035,16 @@ impl D3dPass {
             .draws
             .iter()
             .map(|d| {
-                self.world_sphere(d)
-                    .is_none_or(|(centre, radius)| in_view(&view_proj, centre, radius))
+                // A draw faded all the way out is not drawn (a cut-away ceiling).
+                self.opacity.get(d.draw).is_none_or(|&o| o > 0.0)
+                    && d.lod.is_none_or(|l| l.shown(camera.position))
+                    && self
+                        .world_sphere(d)
+                        .is_none_or(|(centre, radius)| in_view(&view_proj, centre, radius))
             })
             .collect();
         let slot_size = SLOT[7] as usize;
-        // The constants of consecutive slots in view, written in one go.
+        // The constants of consecutive slots written whole, in one go.
         let mut run: Vec<u8> = Vec::new();
         let mut run_start = 0u64;
         let put = |data: &mut [u8], c: &StageConstants, base: usize| {
@@ -2045,8 +2057,13 @@ impl D3dPass {
         };
         let mut statics = self.statics.lock().unwrap_or_else(|e| e.into_inner());
         statics.resize_with(self.draws.len(), || None);
+        let mut written = self.written.lock().unwrap_or_else(|e| e.into_inner());
+        written.resize(self.draws.len(), None);
         let mut relit = self.relit.lock().unwrap_or_else(|e| e.into_inner());
         self.repick_lights(&in_view, &mut statics, &mut relit);
+        // The per-frame registers of slots that are otherwise current: (offset, bytes).
+        let mut partial: Vec<u8> = Vec::new();
+        let mut partial_spans: Vec<(u64, std::ops::Range<usize>)> = Vec::new();
         for (i, (d, _)) in self
             .draws
             .iter()
@@ -2054,16 +2071,6 @@ impl D3dPass {
             .enumerate()
             .filter(|(_, (_, v))| **v)
         {
-            if run_start + run.len() as u64 != d.slot {
-                if !run.is_empty() {
-                    ctx.queue.write_buffer(buffer, run_start, &run);
-                }
-                run.clear();
-                run_start = d.slot;
-            }
-            let at = run.len();
-            run.resize(at + slot_size, 0);
-            let data = &mut run[at..];
             let (world, lightmap, material) = &self.worlds[d.draw];
             let program = &self.pipelines[d.pipeline].program;
             let rigged = self.rig.as_ref().map(|r| {
@@ -2108,7 +2115,8 @@ impl D3dPass {
             // The constants that stay as the draw was made are filled once (see
             // [`ConstantContext::per_frame`]); each frame refills the rest over them.
             let tables = [program.vs.ctab.as_ref(), program.ps.ctab.as_ref()];
-            let fixed = statics[i].take().unwrap_or_else(|| {
+            let fresh = statics[i].is_none();
+            let mut fixed = statics[i].take().unwrap_or_else(|| {
                 Box::new(tables.map(|t| {
                     let per_frame: Vec<bool> = t
                         .map(|t| t.constants.iter().map(|c| cc.per_frame(c)).collect())
@@ -2119,16 +2127,78 @@ impl D3dPass {
                 }))
             });
             let opacity = self.opacity.get(d.draw).copied().unwrap_or(1.0);
-            for (stage, (table, base)) in tables.into_iter().zip([0, 3]).enumerate() {
-                let (st, per_frame) = &fixed[stage];
-                let mut c = st.clone();
-                cc.fill_into(table, &mut c, |k| per_frame.get(k) == Some(&true));
-                if opacity < 1.0 {
-                    fade_constants(table, &mut c, opacity);
+            let state = (width, height, opacity);
+            if !fresh && opacity >= 1.0 && written[i] == Some(state) {
+                // Only the per-frame registers: filled over the kept constants (the fixed
+                // ones are untouched) and written as one span per register file.
+                for (stage, (table, base)) in tables.into_iter().zip([0, 3]).enumerate() {
+                    let (st, per_frame) = &mut fixed[stage];
+                    cc.fill_into(table, st, |k| per_frame.get(k) == Some(&true));
+                    let Some(t) = table else { continue };
+                    for (set, regs, offset) in [
+                        (
+                            thedas_shader::ctab::RegisterSet::Float4,
+                            bytemuck::cast_slice::<_, u8>(&st.floats),
+                            SLOT[base],
+                        ),
+                        (
+                            thedas_shader::ctab::RegisterSet::Int4,
+                            bytemuck::cast_slice::<_, u8>(&st.ints),
+                            SLOT[base + 1],
+                        ),
+                        (
+                            thedas_shader::ctab::RegisterSet::Bool,
+                            bytemuck::cast_slice::<_, u8>(&st.bools),
+                            SLOT[base + 2],
+                        ),
+                    ] {
+                        let span = t
+                            .constants
+                            .iter()
+                            .zip(per_frame.iter())
+                            .filter(|(c, pf)| **pf && c.set == set)
+                            .map(|(c, _)| {
+                                let lo = c.register as usize;
+                                lo..lo + c.count.max(1) as usize
+                            })
+                            .reduce(|a, b| a.start.min(b.start)..a.end.max(b.end));
+                        let Some(span) = span else { continue };
+                        let (lo, hi) = (span.start * 16, (span.end * 16).min(regs.len()));
+                        if lo >= hi {
+                            continue;
+                        }
+                        let at = partial.len();
+                        partial.extend_from_slice(&regs[lo..hi]);
+                        partial_spans.push((d.slot + offset + lo as u64, at..partial.len()));
+                    }
                 }
-                put(data, &c, base);
+                statics[i] = Some(fixed);
+                continue;
+            }
+            if run_start + run.len() as u64 != d.slot {
+                if !run.is_empty() {
+                    ctx.queue.write_buffer(buffer, run_start, &run);
+                }
+                run.clear();
+                run_start = d.slot;
+            }
+            let at = run.len();
+            run.resize(at + slot_size, 0);
+            let data = &mut run[at..];
+            for (stage, (table, base)) in tables.into_iter().zip([0, 3]).enumerate() {
+                let (st, per_frame) = &mut fixed[stage];
+                if opacity < 1.0 {
+                    let mut c = st.clone();
+                    cc.fill_into(table, &mut c, |k| per_frame.get(k) == Some(&true));
+                    fade_constants(table, &mut c, opacity);
+                    put(data, &c, base);
+                } else {
+                    cc.fill_into(table, st, |k| per_frame.get(k) == Some(&true));
+                    put(data, st, base);
+                }
             }
             statics[i] = Some(fixed);
+            written[i] = Some(state);
             let fix = [
                 1.0 / width.max(1) as f32,
                 1.0 / height.max(1) as f32,
@@ -2139,6 +2209,33 @@ impl D3dPass {
         }
         if !run.is_empty() {
             ctx.queue.write_buffer(buffer, run_start, &run);
+        }
+        // One staging upload, then a buffer copy per span: far cheaper than a queue write
+        // per span.
+        if !partial_spans.is_empty() {
+            use wgpu::util::DeviceExt;
+            let staging = ctx
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("per-frame constants"),
+                    contents: &partial,
+                    usage: wgpu::BufferUsages::COPY_SRC,
+                });
+            let mut encoder = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("per-frame constants"),
+                });
+            for (offset, range) in partial_spans {
+                encoder.copy_buffer_to_buffer(
+                    &staging,
+                    range.start as u64,
+                    buffer,
+                    offset,
+                    range.len() as u64,
+                );
+            }
+            ctx.queue.submit([encoder.finish()]);
         }
         *self.in_view.lock().unwrap_or_else(|e| e.into_inner()) = in_view;
     }

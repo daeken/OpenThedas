@@ -506,18 +506,37 @@ pub struct AreaRenderer {
     updated: bool,
     /// The scene's particle emitters, as [`AreaScene::emitters`] orders them.
     pub emitters: Vec<crate::particles::EmitterState>,
+    /// The draws of `CutAway` meshes ([`AreaScene::cut_away`]).
+    cut_away: Vec<usize>,
 }
 
-/// The colour curve `da_hsvmatrix` reads by default: `da_defaultcc` (DAOrigins.exe loads it
-/// at 0x458cda), its first row as RGBA texels, or an identity ramp when it does not load.
-fn color_curve(vfs: &Vfs) -> Vec<u8> {
-    let decoded = vfs.read("da_defaultcc.dds").ok().and_then(|(d, _)| {
+/// The colour curve `da_hsvmatrix` reads: `name` (an area's curve, `<name>.dds`) or by
+/// default `da_defaultcc` (DAOrigins.exe loads it at 0x458cda, and binds it when no area curve
+/// is set, 0x4560d0), its first row as RGBA texels. A curve that does not load falls back to
+/// the default (provisional: the exe's failure path is not traced), and that to an identity
+/// ramp.
+fn color_curve(vfs: &Vfs, name: Option<&str>) -> Vec<u8> {
+    let load = |name: &str| {
+        let (d, _) = vfs
+            .read(&format!("{}.dds", name.to_ascii_lowercase()))
+            .ok()?;
         let dds = thedas_formats::dds::Dds::parse(&d).ok()?;
         let px = dds.decode_rgba8(0, 0).ok()?;
         let row = dds.width as usize * 4;
         (row > 0 && px.len() >= row).then(|| px[..row].to_vec())
-    });
-    decoded.unwrap_or_else(crate::post::identity_curve)
+    };
+    name.and_then(load)
+        .or_else(|| load("da_defaultcc"))
+        .unwrap_or_else(crate::post::identity_curve)
+}
+
+/// The colour grading of the area whose `AREA_ID` is `area_id`, from `areadata.gda`.
+pub fn area_grade(vfs: &Vfs, area_id: i64) -> crate::post::AreaGrade {
+    vfs.read("areadata.gda")
+        .ok()
+        .and_then(|(d, _)| thedas_formats::gda::Gda::parse(&d).ok())
+        .map(|t| crate::post::AreaGrade::from_areadata(&t, area_id))
+        .unwrap_or_default()
 }
 
 /// The textures `da_fade` reads, `FadeSaturateMask` and `FadeEffectMask` (the materials'
@@ -927,7 +946,7 @@ impl AreaRenderer {
                         &scene.effects,
                         scene.detail,
                         color_format,
-                        &color_curve(vfs),
+                        &color_curve(vfs, None),
                         crate::post::Fade::from_effects(&scene.effects)
                             .and_then(|_| fade_masks(vfs))
                             .as_ref(),
@@ -951,6 +970,16 @@ impl AreaRenderer {
                 .collect(),
             light: StandInLight::default(),
             stats,
+            cut_away: scene.cut_away.clone(),
+        }
+    }
+
+    /// Grades the frame as area `grade` says: its colour curve and `da_hsvmatrix` values
+    /// (DAOrigins.exe swaps them when an area becomes active, 0x67b1b0).
+    pub fn set_area_grade(&mut self, ctx: &GpuContext, vfs: &Vfs, grade: &crate::post::AreaGrade) {
+        if let Some(effects) = self.effects.as_mut() {
+            let curve = color_curve(vfs, grade.curve.as_deref());
+            effects.set_grade(&ctx.device, &ctx.queue, &curve, grade);
         }
     }
 
@@ -1000,6 +1029,15 @@ impl AreaRenderer {
     /// Draws every draw of `scene`'s prop `prop` at `opacity` (see
     /// [`crate::d3d_gpu::D3dPass::set_opacity`]): 1 as its materials say, below 1 faded,
     /// blended over what lies behind it.
+    /// Fades the scene's `CutAway` meshes (ceilings, roofs) to `value`: 1 draws them as
+    /// made, between 0 and 1 translucent with that opacity multiplier, 0 not at all
+    /// (DAOrigins.exe 0x4670c0 → 0x466930).
+    pub fn set_cutaway(&mut self, ctx: &GpuContext, value: f32) {
+        for d in self.cut_away.clone() {
+            self.d3d.set_opacity(ctx, d, value);
+        }
+    }
+
     pub fn set_prop_opacity(
         &mut self,
         ctx: &GpuContext,
@@ -1610,6 +1648,7 @@ mod tests {
                 probe: None,
                 skin: None,
                 cast_shadow: None,
+                lod: None,
             }],
             ..Default::default()
         };

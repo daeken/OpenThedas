@@ -210,13 +210,15 @@ call to the exe's event constructor 0x69bac0):
 - **Now raised:** `MANA_STAM_DEPLETED` (0x6afb90), the `AREALOADSAVE_*` trio on loading a save
   (0x67f1c0, 0x6c90ab, 0x6c92b9), `MODULE_PRESAVE` before a save (0x5d6c40) and `GUI_OPENED` when a
   screen opens (0x60aeb0).
-- **Engine-raised, still missing here:** `ITEM_ONHIT` (0x757fc0, one per on-hit item property on a
-  hit, to the item; the ranged path stores them on the projectile), `TRAP_TRIGGERED` (physics touch
+- **`ITEM_ONHIT`:** raised for a ranged hit's ammunition, to the shooter (0x6b6f60, 0x7e87c0). The
+  melee ones go to the item, whose script is empty in every template, so they do nothing.
+- **Engine-raised, still missing here:** `TRAP_TRIGGERED` (physics touch
   0x74f900, and a trapped placeable's use 0x7a7a96 instead of `USE`), `PLACEABLE_COLLISION`
   (0x74daa0, the controlled creature touching a placeable, once per placeable),
   `PLACEABLE_ONCLICK` (0x7f6550, with `ON_ORDER_RECEIVED`), `GIFT_ITEM` (0x718210),
-  and `USE_PLOTACTION` (0x6fc480). `USE` also carries int 0 = 1 when the
-  user stands on the placeable's front side.
+  and `USE_PLOTACTION` (0x6fc480). The trapped-use path never fires with shipped data (no template
+  sets `TrapFlag`), and which placeables get physics trigger shapes for the touch events is not
+  traced yet. `USE` now carries int 0 = 1 when the user stands in front of the placeable.
 
 ### Commands that do nothing, by how often scripts build them
 
@@ -348,7 +350,7 @@ Dispatch summary: `engine::call` (`crates/thedas-sim/src/engine.rs:483`) matches
 
 ### Events
 
-- **SCR-063** **Engine-raised events still missing.** Original: traced (see "Event types scripts handle that the engine never raises" above). Ours: `ITEM_ONHIT`, `TRAP_TRIGGERED`, `PLACEABLE_COLLISION`, `PLACEABLE_ONCLICK` (with `ON_ORDER_RECEIVED`), `GIFT_ITEM`, `USE_PLOTACTION` and the front-side int on `USE` are not raised. Evidence: testdata notes `combat-events-trace.md`, `placeable-area-events-trace.md`. Size: M. Depends: placeable physics shapes for the touch events. Kind: missing.
+- **SCR-063** **Engine-raised events still missing.** Original: traced (see "Event types scripts handle that the engine never raises" above). Ours: `TRAP_TRIGGERED`, `PLACEABLE_COLLISION`, `PLACEABLE_ONCLICK` (with `ON_ORDER_RECEIVED`), `GIFT_ITEM`, and `USE_PLOTACTION` are not raised. Evidence: testdata notes `combat-events-trace.md`, `placeable-area-events-trace.md`. Size: M. Depends: placeable physics shapes for the touch events. Kind: missing.
 - **SCR-064** **Load and new-game event order is provisional.** Original: not traced. Ours: MODULE_LOAD then MODULE_START on a new game; SPAWN for each spawned creature/placeable, AREALOAD_SPECIAL, AREALOAD_PRELOADEXIT, ENTER for the hero, AREALOAD_POSTLOADEXIT on area load, all at delay 0. Evidence: `crates/thedas-sim/src/sim.rs:2732-2736`, `sim.rs:2956-2976`. Size: S. Depends: none. Kind: provisional.
 - **SCR-065** **Event delivery to objects without a script is silent.** Original: not traced. Ours: `deliver` returns without a trace when the target has no script and none was given. Evidence: `crates/thedas-sim/src/sim.rs:566-568`. Size: S. Depends: SCR-011. Kind: unverified.
 - **SCR-066** **Events and commands tie order is a guess.** Original: not traced. Ours: on a tie an event runs before a finishing command; events at the same time run in queue order. Evidence: `crates/thedas-sim/src/sim.rs:813-828`. Size: S. Depends: none. Kind: unverified.

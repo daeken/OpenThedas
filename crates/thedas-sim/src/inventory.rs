@@ -139,6 +139,24 @@ impl Sim {
         true
     }
 
+    /// An item's on-hit properties (`itemprps.gda` kind 2, column 0x4fe5e973) with their
+    /// powers, in the item's order.
+    pub(crate) fn on_hit_properties(&self, item: ObjectId) -> Vec<(i32, i32)> {
+        let tables = self.world.tables();
+        let Some(t) = tables.get(0, "itemprps") else {
+            return Vec::new();
+        };
+        self.item_properties(item)
+            .into_iter()
+            .filter(|&(row, _)| {
+                matches!(
+                    t.cell_by_hash(ITEMPRPS_KIND, row as i64),
+                    Some(thedas_formats::gda::Cell::Int(2))
+                )
+            })
+            .collect()
+    }
+
     /// The effects the worn-kind properties `props` of `item` put on its wearer.
     fn effects_of_properties(
         &self,

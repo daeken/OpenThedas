@@ -111,6 +111,49 @@ pub struct HsvMatrix {
     pub contrast: f32,
 }
 
+/// An area's colour grading from `areadata.gda` (the row of the area's `AREA_ID`): its colour
+/// curve's name (column hash 0xb3cba486) and the `da_hsvmatrix` values it overrides.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AreaGrade {
+    pub curve: Option<String>,
+    pub brightness: Option<f32>,
+    pub contrast: Option<f32>,
+    pub hue: Option<f32>,
+    pub saturation: Option<f32>,
+}
+
+impl AreaGrade {
+    /// Row `area_id` of `areadata` (DAOrigins.exe 0x67afd0). A missing or empty cell leaves
+    /// that value unset.
+    pub fn from_areadata(areadata: &thedas_formats::gda::Gda, area_id: i64) -> AreaGrade {
+        use thedas_formats::gda::Cell;
+        let Some(row) = areadata.row_by_id(area_id) else {
+            return AreaGrade::default();
+        };
+        let cell = |hash: u32| {
+            let c = areadata.columns.iter().position(|c| c.hash == hash)?;
+            row.get(c)
+        };
+        let float = |hash| match cell(hash)? {
+            Cell::Float(v) => Some(*v as f32),
+            Cell::Int(v) => Some(*v as f32),
+            _ => None,
+        };
+        AreaGrade {
+            curve: match cell(0xb3cb_a486) {
+                Some(Cell::String(s)) if !s.trim_matches(['\0', ' ']).is_empty() => {
+                    Some(s.trim_matches(['\0', ' ']).to_string())
+                }
+                _ => None,
+            },
+            brightness: float(0xc202_deda),
+            contrast: float(0x1fc1_7917),
+            hue: float(0x8206_386e),
+            saturation: float(0xb385_6d57),
+        }
+    }
+}
+
 impl HsvMatrix {
     /// The level's `da_hsvmatrix`, when it lists one.
     pub fn from_effects(effects: &[FrameEffect]) -> Option<HsvMatrix> {
@@ -517,6 +560,8 @@ struct Targets {
 /// `da_hsvmatrix`'s GPU state: its pipeline, layout, uniforms and colour curve.
 struct HsvPass {
     matrix: HsvMatrix,
+    /// The layout's own parameters, before an area's overrides.
+    layout_matrix: HsvMatrix,
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     params: wgpu::Buffer,
@@ -908,6 +953,29 @@ impl FrameEffects {
         );
     }
 
+    /// Gives `da_hsvmatrix` an area's colour grading: its colour curve (RGBA texels of the
+    /// first row) and its `Brightness`, `Contrast`, `Hue` and `Saturation` where the area
+    /// sets them, over the layout's values (DAOrigins.exe 0x67afd0, 0x67b1b0). Nothing
+    /// changes when the layout lists no `da_hsvmatrix`.
+    pub fn set_grade(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        curve: &[u8],
+        grade: &AreaGrade,
+    ) {
+        let Some(h) = self.hsv.as_mut() else { return };
+        let base = h.layout_matrix;
+        h.matrix = HsvMatrix {
+            hue: grade.hue.unwrap_or(base.hue),
+            saturation: grade.saturation.unwrap_or(base.saturation),
+            brightness: grade.brightness.unwrap_or(base.brightness),
+            contrast: grade.contrast.unwrap_or(base.contrast),
+        };
+        h.curve = curve_view(device, queue, curve);
+        h.group = None;
+    }
+
     /// `da_hsvmatrix` over the frame as the bloom left it.
     fn apply_hsv(
         &mut self,
@@ -1043,15 +1111,8 @@ impl FrameEffects {
     }
 }
 
-/// Builds `da_hsvmatrix`'s pipeline over frames of `color_format`, with `curve` (RGBA
-/// texels) as its colour curve.
-fn hsv_pass(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    matrix: HsvMatrix,
-    color_format: wgpu::TextureFormat,
-    curve: &[u8],
-) -> HsvPass {
+/// A colour curve's texture: its RGBA texels as one row (an identity ramp when empty).
+fn curve_view(device: &wgpu::Device, queue: &wgpu::Queue, curve: &[u8]) -> wgpu::TextureView {
     let texels = (curve.len() / 4).max(1) as u32;
     let identity;
     let curve = if curve.len() >= 4 {
@@ -1089,6 +1150,19 @@ fn hsv_pass(
             depth_or_array_layers: 1,
         },
     );
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Builds `da_hsvmatrix`'s pipeline over frames of `color_format`, with `curve` (RGBA
+/// texels) as its colour curve.
+fn hsv_pass(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    matrix: HsvMatrix,
+    color_format: wgpu::TextureFormat,
+    curve: &[u8],
+) -> HsvPass {
+    let curve = curve_view(device, queue, curve);
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("hsv matrix"),
         source: wgpu::ShaderSource::Wgsl(HSV_SHADER.into()),
@@ -1164,10 +1238,11 @@ fn hsv_pass(
     });
     HsvPass {
         matrix,
+        layout_matrix: matrix,
         layout,
         pipeline,
         params,
-        curve: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+        curve,
         group: None,
     }
 }
