@@ -1785,12 +1785,9 @@ impl App {
                 log.push(format!("orbit {dyaw},{dpitch}"));
             }
             &Step::Zoom(n) => {
-                if let Some(f) = self.follow.as_mut()
-                    && f.zoom(n)
-                    && let Some(l) = self.live.as_ref()
-                {
-                    l.sim().player_zoomed_in();
-                }
+                // As the wheel turns (`WindowEvent::MouseWheel` after its delta's conversion):
+                // over the interface it scrolls, elsewhere the camera zooms.
+                self.wheel(n as f64);
                 log.push(format!("zoom {n}"));
             }
             &Step::PadButton(b, down) => {
