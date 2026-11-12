@@ -32,6 +32,14 @@ pub fn modal(targets: Vec<FocusTarget>) -> Vec<FocusTarget> {
     let targets: Vec<FocusTarget> = targets
         .into_iter()
         .filter(|t| !t.path.contains("DropArea") && !t.path.contains("DropTarget"))
+        // Nor is the inventory's paperdoll (an unnamed clip of the stage, dragged to turn
+        // the figure): it sat between the two columns of equipment slots and took the
+        // step from one to the other.
+        .filter(|t| {
+            t.path
+                .strip_prefix("_level0.instance")
+                .is_none_or(|n| !n.chars().all(|c| c.is_ascii_digit()))
+        })
         .collect();
     if targets.iter().any(|t| t.path.contains(LIST)) {
         targets
