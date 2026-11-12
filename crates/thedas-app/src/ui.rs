@@ -1793,6 +1793,20 @@ impl UiLayer {
                     "_global.MiniMap.Instance.m_mcMapImage._alpha",
                     thedas_ui::UiValue::Number(100.0),
                 );
+                // The camera icon's view cone is two shapes placed with the `overlay` blend
+                // mode (CameraIcon, sprite 33: instance7 the wedge, instance8 its edges).
+                // Over the minimap's near-black surround an overlay stays black, so only the
+                // part over the map picture showed; the original shows the whole wedge, as
+                // if drawn normally (like map.gfx's blend modes below). Provisional:
+                // inferred from the original's minimap.
+                for part in ["instance7", "instance8"] {
+                    m.set(
+                        &format!(
+                            "_global.MiniMap.Instance.m_SharedMap.CameraIcon.{part}.blendMode"
+                        ),
+                        thedas_ui::UiValue::String("normal".into()),
+                    );
+                }
                 m.call("_global.MiniMap.Instance.UpdateMinimap", &[]);
             } else {
                 // map.gfx draws its picture and its explored-area mask with the `alpha` and

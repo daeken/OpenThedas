@@ -18,7 +18,8 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
    - Size: small.
 4. **Music during cutscenes and conversations.**
    - Done: the game mode's ducking (0x5bd220): dialog and cutscenes play `OnCutscene` (music −3 dB, ambience and effects lower), death `OnDeath`, loading `OnGameLoading` (world sounds −60 dB; music and voice untouched).
-   - Not done: the music director's own mode changes (0x5bb630: cues per mode, `chargen`), and `OnExploreMusic` / `OnCombatMusic`, which the exe swaps as the music changes between explore and combat (0x5bc761..0x5bce5b, under a volume check not traced).
+   - Also done: `OnExploreMusic` while `main` plays and `OnCombatMusic` while `combat` does, while the music volume is above 0 (0x5bccd0, 0x5bc6f6); and a theme change during a load waits for the load to end, the old music playing on (0x5bfdf0, 0x5b7070 -> 0x5c4060).
+   - Not done: the music director's own mode changes (0x5bb630: cues per mode, `chargen`).
    - Medium.
 5. **Death and party-wipe music.** The `Death` track plays when the game is over; exactly when the original switches isn't traced. Small.
 6. **Other main-menu music** (after the credits, DLC menus). Only `music/_menu` is wired. Small.
@@ -41,7 +42,7 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
 12. **Ambient one-shots** (`amb_oneshots`, `glo_amb_creat`). Played only where the data places them; any engine-driven ambient spawning isn't checked. Small to medium.
 13. **Placeable sounds** (doors, chests and so on).
     - Done: animation events of kind 27 (`ClosedToOpened`, `OpenedToClosed`, `Destroyed`, `Used`) play the `placeable_types.gda` column they name for the placeable's type (0x74c360).
-    - Not done: sounds the exe plays from code rather than animations. These are `sound_plc_column_names.gda`'s rows through 0x74c110 (`Locked`, `Hit`; callers not traced), the unlock and lock-pick-failure columns, and the container-opening column (0x98094859, played at 0x74c2b0 when a container's inventory opens). They need the sim's lock and container events.
+    - Not done: sounds the exe plays from code rather than animations. These are `sound_plc_column_names.gda`'s rows through 0x74c110 (`Locked`, `Hit`; callers not traced), the unlock and lock-pick-failure columns, (the container-opening column, 0x98094859, now plays as a container's inventory opens). They need the sim's lock and container events.
     - Small to medium.
 
 ### Voice-over and conversations
@@ -197,7 +198,6 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 - **AUD-047** **Output limiter (deliberate difference).** Original: FMOD's mixer clips (per comment; whether the exe adds a limiter is not traced). Ours: a -0.3 dBFS limiter with 0.2 s release. Evidence: `crates/thedas-audio/src/mixer.rs:207`. Size: S. Depends: none. Kind: provisional.
 - **AUD-048** **Volume options are not persisted.** Original: volume options persisted. Ours: the options screen's slider values feed `volumes()` but nothing writes the player's settings file. Evidence: `crates/thedas-ui/src/options.rs:11`, `crates/thedas-app/src/audio.rs:1527`. Size: S. Depends: CAM-044. Kind: missing.
 - **AUD-049** **Pause does not pause audio.** Original: pause behaviour. Ours: no code found; `Mixer::set_paused` has no caller and the game's pause does not reach `GameAudio`. Evidence: `crates/thedas-audio/src/mixer.rs:150`. Size: S. Depends: none. Kind: missing.
-- **AUD-050** **Audio during loading waits on the load state.** Original: `GM_LOADING` plays `OnGameLoading` (world sounds down 60 dB; music and voice carry on) and pauses music-volume delays (0x5bd220, 0x5bb669). Ours: done when `AudioState::loading` is set, which nothing sets until the app has a load state. Evidence: `crates/thedas-app/src/audio.rs:1243`. Size: S. Depends: CAM-037. Kind: missing.
 
 ### Voice-over
 
