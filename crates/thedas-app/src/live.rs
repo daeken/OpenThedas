@@ -208,6 +208,8 @@ pub struct Live {
     loading: Option<Loading>,
     /// A layout whose build failed: not tried again until the area changes.
     failed_layout: Option<String>,
+    /// Held while the game that replaces it opens on a worker (see [`Live::hold`]).
+    held: bool,
 }
 
 /// A level, or a level's objects, being built on a worker thread. While one is under way
@@ -414,6 +416,7 @@ impl Live {
             frame_size: (1280, 720),
             loading: None,
             failed_layout: None,
+            held: false,
             owed_ms: 0.0,
             frame_effects: true,
             detail: Default::default(),
@@ -477,7 +480,19 @@ impl Live {
     /// Whether a new level is being built (see [`Live::async_loads`]): the world does not
     /// run, and the window shows a loading frame.
     pub fn loading(&self) -> bool {
-        self.loading.is_some()
+        self.loading.is_some() || self.held
+    }
+
+    /// Holds this game while another opens to replace it (a save loading, a new game): it
+    /// stops running and its world is no longer drawn, as behind a loading screen. Released
+    /// (`false`) when the other failed to open, it carries on, rebuilding its world.
+    pub fn hold(&mut self, held: bool) {
+        self.held = held;
+        if held {
+            self.loading = None;
+            self.level = None;
+            self.objects = None;
+        }
     }
 
     /// The new level, once its worker has built it; starts the worker first if it is not
@@ -1284,6 +1299,11 @@ impl Live {
             );
             return true;
         }
+        // Nothing of the world until its load is done: the level alone, before its objects,
+        // is not shown.
+        if self.loading() {
+            return false;
+        }
         self.set_shader_time();
         self.apply_cutaway(ctx);
         let Some(level) = self.level.as_mut() else {
@@ -1338,6 +1358,10 @@ impl Live {
     ) -> Result<Option<Vec<u8>>> {
         if self.cutscene_movies.showing() {
             return Ok(Some(self.cutscene_movies.rgba((width, height))));
+        }
+        // As the window shows it: nothing of the world while it loads.
+        if self.loading() {
+            return Ok(None);
         }
         self.set_shader_time();
         self.apply_cutaway(ctx);
