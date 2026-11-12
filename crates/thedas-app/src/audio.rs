@@ -59,6 +59,8 @@ pub struct AudioState {
     pub sound_sets: Vec<(String, i32, f32, Option<[f32; 3]>)>,
     /// Events scripts played (`PlaySound`), with where the object stands (none: 2D).
     pub script_sounds: Vec<(String, Option<[f32; 3]>)>,
+    /// Scripts' `SetMusicIntensity`, the latest this frame.
+    pub music_intensity: Option<i32>,
     /// A boot movie playing (its file) and how far it has played (milliseconds): its own
     /// sound track plays with it.
     pub movie: Option<(std::path::PathBuf, f64)>,
@@ -162,6 +164,8 @@ pub struct GameAudio {
     /// Weapon impacts: each base item's sound material (`BITM_base.gda`), and each weapon
     /// material's impact events (`sound_weapon_hits.gda`).
     impacts: Impacts,
+    /// The music's `music_state` (scripts' `SetMusicIntensity`; 1 until one sets it).
+    music_state: f32,
     /// `ss_types.gda`: each sound set type's first entry row and default probability.
     ss_types: std::collections::HashMap<i32, (i64, f32)>,
     /// Each sound set's entries (`sse_<set>.gda`: entry row -> line strref), read once.
@@ -411,6 +415,7 @@ impl GameAudio {
             anim_clocks: Default::default(),
             footsteps: footstep_events(vfs),
             impacts: Impacts::read(vfs),
+            music_state: 1.0,
             ss_types: ss_types(vfs),
             sound_set_entries: Default::default(),
             rng: 0x2545_f491_4f6c_dd1d,
@@ -732,7 +737,7 @@ impl GameAudio {
                 let h = self.engine.play(
                     &format!("{theme}/{want}"),
                     PlayOptions {
-                        parameters: vec![("music_state".into(), 1.0)],
+                        parameters: vec![("music_state".into(), self.music_state)],
                         ..Default::default()
                     },
                 );
@@ -959,6 +964,17 @@ impl GameAudio {
         }
         self.follow_animations(std::mem::take(&mut state.animations));
         self.follow_movie(state.movie.take());
+        // Scripts' SetMusicIntensity sets the area music's `music_state` (DAOrigins.exe logs
+        // it as "music state= %2.1f"): the tracks' sounds sit around 1, so 0 silences the
+        // music (pre100pt_light_beacon) and cutscene endings (gen00cs_cs_end_music_int_*)
+        // set 0 to 4. Provisional: read from the data and the scripts, not traced.
+        if let Some(i) = state.music_intensity.take() {
+            self.music_state = i as f32;
+            if let Some((_, h)) = self.area.as_ref().and_then(|a| a.track) {
+                self.engine
+                    .set_parameter(h, "music_state", self.music_state);
+            }
+        }
         self.follow_area(&state);
         self.follow_cutscene(state.cutscene.clone());
         // Voice-over.

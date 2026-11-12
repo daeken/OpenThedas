@@ -2196,6 +2196,11 @@ fn audio_state(
                         state.impacts.push((at, result, weapon, armour, shield));
                     }
                 }
+                thedas_sim::world::SoundRequest::MusicIntensity { intensity } => {
+                    state.music_intensity = Some(intensity);
+                }
+                // PlayMusic names the music project (`music`, from the Music M2DA by
+                // module), which is always the one used here.
                 other => log::debug!("audio: not done yet: {other:?}"),
             }
         }
