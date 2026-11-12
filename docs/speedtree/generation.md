@@ -589,7 +589,7 @@ order frond branches are grown. When the branch's vertices are done (2.4 step 10
 
 ### 4.2 When fronds are built
 
-After the whole tree, its branch LOD (3.7) and its leaves (stage 5) are computed, fronds are
+After the whole tree, its branch LOD (3.7) and its leaf LOD (5.4) are computed, fronds are
 built in one pass: first the guide LOD selection (4.3, draws), then, for extrusion fronds, each
 guide's profile (4.5, draws), in the order given there.
 
@@ -694,4 +694,215 @@ step = V / (Vl − 1). For each i = 0 … Nl − 2:
   flip negates t twice on this path, so it has no effect.) These are in the file's
   convention, t upward; see format.md for sampling.
 
-Stages 5 and later: in progress.
+## Stage 5 — Leaves
+
+Leaves are points with orientation, colour and a texture choice; their card shapes are drawn
+at render time (stage 7). They are made at **buds**, the children of the last branch level
+(2.5 step 3), while the tree grows, so their random draws are interleaved with the branches'
+in growth order.
+
+### 5.1 Order of the whole computation (for the random stream)
+
+1. Set-up (2.3) and the trunk's recursive growth (2.4, 2.5): branch draws, frond guide draws
+   (2.4 step 10a) and bud/leaf draws (5.2, 5.3) in growth order.
+2. Branch LOD fuzziness (3.7).
+3. Leaf LOD pairing dice (5.4).
+4. Frond LOD fuzziness (4.3), then extrusion profiles (4.5).
+
+### 5.2 A bud
+
+A bud is made where 2.5 would have grown a child of the last level, at child level L + 1 =
+(number of levels − 1), with that level's parameters (`branch_levels[L + 1]`), from parent
+vertex j's frame F₀ and direction a, at base position P, with profile percent p (2.5 step 8):
+
+1. Bud length = length.evaluate(p) · S (with variance, unscaled: one draw); step = bud length
+   / `segments`.
+2. Azimuth = uniform(−180, 180) (one draw).
+3. Frame F = F₀; rotate F by the axis rotation (azimuth, F₀ · a) (on the left), then by a
+   rotation about Y of 60 degrees (on the left), with Y-rotation matrix
+   `[[c, 0, −s], [0, 1, 0], [s, 0, c]]`.
+4. Leaf position Q = P + (first row of F) · step. Normal ν = normalize(Q − P).
+5. **Parent direction** δ: if the spawning branch has no vertices, δ = ν. Otherwise, if
+   `dimming_depth` is 0: the direction of the spawning branch's vertex at index
+   (int)(p · (n − 1)) (computed in double precision; n its vertex count). Otherwise walk up:
+   start at the spawning branch with a count of 0, and while there is a branch and count <
+   `dimming_depth` − 1 move to its parent and count one; take that branch's first vertex
+   position as the base (the spawning branch's first vertex if the walk ran off the trunk);
+   δ = Q − base. Then δ = normalize(δ).
+6. Make a leaf (5.3) at Q with p, the spawning branch, ν and δ.
+
+### 5.3 Making a leaf
+
+Each leaf texture i offers two choices, 2i and 2i + 1 (the odd one is the texture's mirrored
+variant; stage 7). The choices of textures flagged `blossom` form the *blossom list*, the
+others the *plain list*, in texture order.
+
+1. No leaf textures: no leaf, no draws.
+2. **Blossom?** Only if the blossom list is not empty. Test percent: p if `blossom_level` is 0;
+   otherwise walk up from the spawning branch, counting from 1, while the branch has a parent
+   and count < `blossom_level`, moving up and counting; use that branch's percent of parent.
+   If `blossom_distance` < 0: blossom when test < −distance **and** a draw uniform(0, 1) ≤
+   `blossom_weighting`; otherwise when test > distance and the draw ≤ weighting. The draw is
+   made only when the percent condition holds.
+3. **Choice:** a blossom picks, if the blossom list has more than one entry,
+   (unsigned)uniform(0, 100000) mod its size (one draw), else its only entry. A plain leaf: if
+   the plain list has more than one entry, (unsigned)uniform(0, 1000000) mod its size (one
+   draw); if it is empty, no leaf; if it has one entry, that one.
+4. **Crowding** (`collision`): 0 never crowded; 1 tested against the leaves made at this same
+   spawning branch so far; 2 against every leaf made so far. With side = max(size used x,
+   size used y) of the chosen texture (sizes as in 2.3 step 5) · `spacing_tolerance`, the leaf
+   is rejected if any earlier leaf (scanned from the newest back) lies strictly within ±side on
+   all three axes. A rejected leaf makes no further draws.
+5. **Colour scale:** 1, or with `dimming`: d = p; if `dimming_depth` ≠ 0, walk from the
+   spawning branch with a count from 0 while there is a branch and count < depth, multiplying
+   d by that branch's percent of parent and moving up. Scale = lerp(d, 1, 1 −
+   `dimming_scalar`); stored as the integer (short)(255 · scale).
+6. **Rocking group** = (int)uniform(0, 10000) mod 3 (one draw). (The group count is always 3.)
+7. **Orientation.** n = δ if |ν| < 0.0001 (fast square root length), else lerp(δ, ν,
+   `color_variance` of the texture); n = normalize(n). Keep n₀ = n.
+   If the texture uses meshes (`mesh.use_meshes`): n = normalize(lerp(n, (0, 0, 1), `hang`)).
+   Tangent τ = normalize(n × (0, 0, 1)); binormal β = normalize(τ × n). If |τ| < 0.5 (fast
+   square root): β = −n₀ with its z set to 0, normalized; τ = normalize(n × β).
+8. **Mesh rotation** (meshes with `rotate` ≠ 0): matrix M with rows τ, β, n; M ← Rz(angle) ·
+   M with angle = B[k] · 2 · rotate − rotate, k being the spawning branch's own mesh counter
+   (starts at 0 when that branch begins growing, +1 per use); read τ, β, n back from the rows.
+9. **Corner normals.** With `smoothing_enabled` and no meshes: let M have rows τ, β, n and a =
+   `smoothing_angle`, t = a / 100. For the four corners, with Ry(x) the Y rotation of 5.2
+   applied on the left of M and "third row" its Z row:
+   - corner 0: third row of Ry(−a)·M, lerped toward up (0, 0, 1) by t;
+   - corner 1: third row of Ry(+a)·M, toward up by t;
+   - corner 2: third row of Ry(+a)·M, toward down (0, 0, −1) by t;
+   - corner 3: third row of Ry(−a)·M, toward down by t;
+   each normalized; each corner's tangent = normalize(normal × (0, 0, 1)) and binormal =
+   normalize(tangent × normal). Otherwise all four corners take n, τ, β.
+10. **Colour:** offset = uniform(−color_variance, +color_variance) (one draw); every corner's
+    colour = the texture's `color` + offset on each channel.
+11. Store the leaf: position Q, choice index, colour scale, rocking group, corner frames and
+    colours, wind weights and groups (stage 7).
+
+The leaf list of the tree is in creation order.
+
+### 5.4 Leaf LOD
+
+Parameters: `Lod::leaf_lod_count` (levels), `leaf_reduction` (r), `leaf_size_increase` (g).
+Level 0 is the full list. Pairing distance = 10 · (largest over textures of max(size used x,
+size used y) · `spacing_tolerance`), or 10 · 10 if there are no textures. Level k (k ≥ 1) is
+made from level k − 1:
+
+1. **Pairing**, a "paired" flag per leaf of level k − 1, all false. For each leaf i in order
+   (whether or not it has been paired already): scan leaves j = i + 1, i + 2, …, **stopping the
+   scan at the first leaf already flagged** (without considering it). Among scanned leaves
+   take the one with distance (fast square root) < pairing distance and < the best so far
+   (strict). If one was found, flag it and record the pair (i, match).
+2. **Merging:** for each pair in order draw u = uniform(0, 1) (one draw); if u > r the pair
+   becomes one leaf: a copy of leaf i, at the midpoint of the two positions, with z increased by
+   (origin y − 0.5) · ((1 + g · k) · size used y · 0.5) of leaf i's texture, and each corner
+   colour the average of the two leaves'. Leaves that were not paired do not carry over.
+
+### 3.8 Clarifications (round 2)
+
+1. **Zero maximum radius.** When a level's maximum radius is exactly 0, k = r / maximum is 0/0,
+   which the original computes as NaN and carries into the position (NaN never compares
+   greater than the maximum, so the clamp does not catch it). With a zero maximum the radius r
+   is 0 too, so the intended surface is a tube of zero radius on the skeleton: use k = 0 and
+   place every point at the centre C (the tube collapses), and note it as a deliberate
+   deviation from the NaN.
+2. **Flare factor order.** The flare distances are summed first, from 0, in flare order:
+   D = ((0 + d₁) + d₂) + …; then φ = 1 + D. When φ is exactly 1 the position is C + ν · ρr
+   (no multiplication by φ); otherwise C + ν · ρr · φ, computed as ((ν · ρr) · φ) per
+   component.
+
+## Stage 6 — Bushes, grass and cattails
+
+There is no separate engine: `bsh_*`, `gra_*` and cattail files (`*_catgras`, `*_catflwr`) are
+ordinary `.spt` trees grown by stages 1–5 with their own parameters. Facts from all 552 game
+files:
+
+- None stores precomputed leaf LODs, so leaves are always grown (5.2–5.4).
+- Fronds of both kinds occur (`kind` 0 blades in about 380 files, 1 extrusions in about 150),
+  usually with 1–4 frond images; 47 files have fronds disabled.
+- Bushes and grass have one leaf image and one frond image in the texture-coordinate section
+  and **no billboard image**, so at any distance they are drawn from their geometry (or not at
+  all, stage 7).
+- Placement scales are the same 0.28–0.34 as trees (format.md).
+
+Expect most of a grass clump's visible surface to come from fronds and leaf cards rather than
+branch tubes; a quick check that the generator is right is that a grass clump comes out at a
+plausible size (well under a metre or two after the placement scale) without special cases.
+
+## Stage 7 — Rendering
+
+This stage lists what the runtime does with the computed geometry, as far as it is known
+without the game's own vertex packing. Items marked **(exe)** must be confirmed in
+DAOrigins.exe's tree vertex builder and draw code before relying on them.
+
+### 7.1 After generation
+
+- After fronds, three more stream draws give the three rocking groups' time offsets:
+  uniform(0, 10000) each, in group order.
+- If the game passes a transform to the computation it is applied to all geometry; levels
+  place each instance with the RML transform instead (format.md). **(exe)** whether the
+  game's call passes a seed override: an override of 0 picks a random seed, 1 keeps the file's
+  seed, anything else replaces it. Keeping the file's seed is the expected behaviour.
+- One tree description is computed once and instanced at every placement.
+
+### 7.2 Leaf cards
+
+Each leaf choice c (2 per texture, 5.3) and rocking group g (3) has a card template:
+
+- Width w = size used x, height h = size used y of texture c / 2, times the LOD size
+  multiplier 1 + `leaf_size_increase` · k for leaf LOD k > 0.
+- Pivot (ox, oy) = the texture's `origin`; for the mirrored choice ox becomes 1 − ox. (Two
+  places in the original disagree on which choice is mirrored for the pivot: the per-frame
+  corner builder mirrors odd choices, the card-description table even ones. Use odd for
+  corners; **(exe)** to confirm.)
+- Corners in card space (x is the facing axis, y right, z up), before billboarding:
+  P1 = (0, (1 − ox)·w, (1 − oy)·h), P2 = (0, −ox·w, (1 − oy)·h), P3 = (0, −ox·w,
+  −oy·h), P4 = (0, (1 − ox)·w, −oy·h).
+- Texture corners: choice 2i uses the leaf image's four atlas corners as stored (format.md),
+  choice 2i + 1 the same with the s values of corners 0↔1 and 2↔3 swapped (mirrored).
+  Corner order matches P1…P4.
+- Angle offsets per card: a 30-entry table of degree values, in order
+  6, −10, 16, −8, 2, −18, −14, 0, −4, 10, −6, 8, 4, −2, 14, −12, 14, −16, 4, −18, 13, 9,
+  17, −9, 3, −7, −15, 7, −5, 15; with t = (c · 3) mod 30, a card's offsets are entry t and
+  entry 29 − t.
+- Every frame the corners are rotated to face the camera (by the camera's azimuth and pitch)
+  combined with the group's rocking, then each leaf draws its card at its position. In DA:O
+  this is done in `spt_leafcards.vsh` from `g_vCameraAngles`, `g_vLeafAngles` and
+  `g_vLeafAngleScalars`; **(exe)** the per-vertex data the game packs for that shader.
+- Leaves with mesh leaves (`mesh.use_meshes`) draw the mesh from the file's mesh section,
+  scaled by max(w, h), instead of a card. **(exe)** whether DA:O uses them.
+
+### 7.3 LOD
+
+- LOD value = clamp(1 − (distance − `near`)/(`far` − `near`), 0, 1), with the distance from
+  the camera to the instance and `TreeInfo::near`/`far`. **(exe)** whether the game overrides
+  near/far.
+- Discrete level for branches, fronds or leaves with N levels: (int)((1 − LOD) · N), minus one
+  if it equals N. When a billboard image exists, leaves have N + 1 levels and the extra one
+  means "billboard".
+- Fade hints (3.7, 4.6) let a level's draws fade as the LOD value moves; the leaf transition
+  settings (`Lod::leaf_transition`, `leaf_transition_radius`, `billboard_transition`) control
+  cross-fading. **(exe)** how DA:O uses them (alpha test vs blend).
+
+### 7.4 Billboards
+
+A tree with a billboard image draws, beyond its last level, a camera-facing quad textured with
+that image from `<level>_diffuse_billboards.dds` (DA:O stores one image per tree even when the
+file says 360° billboards). Its size comes from the computed tree's bounding box: the
+horizontal extent is twice the largest horizontal distance from the origin to a corner of the
+box (in x and y), the height the box's height. **(exe)** the billboard vertex layout and
+`spt_billboards0` shader inputs.
+
+### 7.5 Shaders and vertex data (to trace)
+
+`shaders.erf` has `spt_branch`, `spt_fronds`, `spt_leafcards`, `spt_leafmesh` and
+`spt_billboards0` materials. Their vertex shaders read, for example (constant tables):
+`spt_branch.vsh`: POSITION, NORMAL, TANGENT, TEXCOORD0, TEXCOORD1, TEXCOORD4 with
+`g_amWindMatrices`, `g_fTreeScale`, `g_fWindMatrixOffset`, `g_mViewProjection`,
+`g_vCameraPosition`, `g_vRotationTrigValues`, `g_vSelfShadowMotion`, `g_vTreePos`;
+`spt_leafcards.vsh`: POSITION, NORMAL, TEXCOORD0–3 with `g_vCameraAngles`,
+`g_vLeafAngleScalars`, `g_vLeafAngles`. **(exe)** what the game puts in each attribute (which of
+the generated values: wind weights and groups, fade hints, corner indices, pivots) and in each
+constant, and the wind matrices' animation. Until then, wind can be held still (matrices
+identity) without affecting shape.

@@ -12,18 +12,14 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
 
 ### Music
 
-1. **Switching between explore and combat music is not marker-timed.**
-   - Original: a theme's `main` and `combat` events are both loaded at area entry (0x5c2aaf..0x5c2c3e), with callbacks that are probably music-marker sync points. Switches wait for a marker and crossfade (the exe's debug dump at 0x5c13a0 shows "sw to theme" and "combat fdin"), and the stingers are cached (`_stingerprecache`).
-   - Ours: we stop one event and start the other at once, playing `stingers/from_main`, `to_main` or `to_death` immediately.
-   - Evidence: the exe strings and the loader trace; the per-frame logic isn't traced yet.
-   - Size: large. Dependencies: none, though marker callbacks need FEV sync-point data.
+1. **Music changes: stinger timing and loading.**
+   - Done: a change waits for the playing track's next marker (first sync point 0.4–15 s ahead, else 0.4 s on), then the new track starts and the old fades out (0x5c4b10 states 4–6).
+   - Not done: the stinger's timing (the exe waits for it in state 7; we play it at the change), the 12 s load timeout ("Music failed to start"), and delayed theme changes (state 9, counted in frames).
+   - Size: small.
 2. **Script `PlayMusic` and `SetMusicIntensity`.**
    - Original: `PlayMusic` names a project; `SetMusicIntensity` sets the `music_state` parameter.
    - Ours: `SetMusicIntensity` is stored in the World and applied; `PlayMusic` is only logged.
    - Size: small to medium. Depends on item 1.
-3. **Music level.**
-   - The data says −20 dB, confirmed in fmod_event.dll at 0x1002e9f0. QA hears ours as quiet.
-   - Needs the original's main-menu recording, which QA is capturing with Wine. Small once measured.
 4. **Music during cutscenes and conversations.**
    - Whether the area music ducks, stops or keeps playing isn't traced.
    - Ours: left alone apart from the `#duck` categories. Medium.
@@ -140,117 +136,6 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
 
 ### Verification
 
-42. **No recording of the original yet.**
-    - Music level and reverb character are waiting on QA's Wine capture.
-    - A one-byte patch to a *copy* of the exe makes FMOD write its mix to `fmodoutput.wav`: file offset 0x1c582e, `6a 06` becomes `6a 03`.
-
-## Part 2: code inventory
-
-Found by reading the code at main on 2026-11-12: provisional markers, stubs, ignored inputs and features with no code. "Original: not traced" means nobody has yet checked what the original does. Line numbers drift; search for the quoted names if a line has moved.
-
-### FMOD event playback (thedas-audio engine)
-
-- **AUD-001** **Event and category pitch are ignored.** Original: not traced. Ours: `Event::pitch` (octaves) and `Category::pitch` are parsed and never read; every voice plays at pitch 1.0 (`Mixer::set_pitch` has no caller). Evidence: `crates/thedas-formats/src/fev.rs:158`, `crates/thedas-formats/src/fev.rs:108`, `crates/thedas-audio/src/mixer.rs:169`. Size: S. Depends: none. Kind: missing.
-- **AUD-002** **Random pitch and volume variation are ignored.** Original: random pitch/volume (FMOD Designer randomization). Ours: `Event::pitch_randomization`, `Event::volume_randomization` and the sound-definition template's `pitch`, `pitch_randomization_method`, `volume_randomization_method` (and its unnamed `f14`..`f2c`) have no reader outside the parser; repeated sounds (footsteps, blows) play identically. Evidence: `crates/thedas-formats/src/fev.rs:159`, `crates/thedas-formats/src/fev.rs:361`, `crates/thedas-formats/src/fev.rs:366`. Size: S. Depends: AUD-001. Kind: missing.
-- **AUD-003** **Only volume envelopes are applied.** Original: not traced. Ours: layer envelopes are applied only when they have no effect name and the `VOLUME` flag; pitch, pan, surround pan, 3D speaker spread, reverb level, 3D pan level, reverb balance, spawn intensity and time-offset envelopes are parsed and ignored. Evidence: `crates/thedas-audio/src/engine.rs:884`, `crates/thedas-formats/src/fev.rs:262`. Size: M. Depends: AUD-001. Kind: missing.
-- **AUD-004** **Layer DSP effects are not run.** Original: envelopes that name a DSP effect (`FMOD Lowpass Simple` and others) drive that effect's parameter. Ours: no DSP chain exists; effect envelopes are skipped. Evidence: `crates/thedas-formats/src/fev.rs:280`, `crates/thedas-audio/src/engine.rs:884`. Size: L. Depends: AUD-003. Kind: missing.
-- **AUD-005** **Parameter automation is not modelled.** Original: parameter velocity (self-advancing parameters), seek speed and sustain points / key-off. Ours: `Parameter::velocity`, `seek_speed`, `f2c` and `sustain_points` are parsed and unused; parameters only change when the game sets them. Evidence: `crates/thedas-formats/src/fev.rs:330`. Size: M. Depends: none. Kind: missing.
-- **AUD-006** **Built-in angle parameters are never set.** Original: `(listener angle)` and `(event angle)`. Ours: only `(distance)` is written into an instance's parameters; the two angle constants have no user. Evidence: `crates/thedas-formats/src/fev.rs:326`, `crates/thedas-audio/src/engine.rs:847`. Size: S. Depends: AUD-007. Kind: missing.
-- **AUD-007** **Sound cones are ignored.** Original: cone inside/outside angle and outside volume. Ours: parsed (`cone_inside_angle`, `cone_outside_angle`, `cone_outside_volume`), unused; placed sounds carry no orientation (`AreaSound` has none). Evidence: `crates/thedas-formats/src/fev.rs:171`, `crates/thedas-audio/src/area.rs:8`. Size: M. Depends: none. Kind: missing.
-- **AUD-008** **Doppler is ignored.** Original: doppler. Ours: `Event::doppler` parsed, unused; sources have no velocity. Evidence: `crates/thedas-formats/src/fev.rs:175`. Size: S. Depends: none. Kind: missing.
-- **AUD-009** **No priority, voice limit or voice stealing across events.** Original: priority and voice stealing. Ours: `priority` and `steal_priority` unused; the mixer plays any number of voices (no global cap, no virtual voices). Evidence: `crates/thedas-formats/src/fev.rs:161`, `crates/thedas-audio/src/mixer.rs:111`. Size: M. Depends: none. Kind: missing.
-- **AUD-010** **Max-playbacks behaviour 3 is approximated.** Original: FMOD Designer's "steal quietest". Ours: per-event max playbacks is honoured; behaviour 3 steals the oldest. Evidence: `crates/thedas-audio/src/engine.rs:322`. Size: S. Depends: none. Kind: provisional.
-- **AUD-011** **2D speaker levels and speaker spread are ignored.** Original: per-speaker 2D levels (L, R, C, LFE, back, side) and 3D speaker spread. Ours: parsed, unused. Evidence: `crates/thedas-formats/src/fev.rs:170`, `crates/thedas-formats/src/fev.rs:178`. Size: S. Depends: AUD-044. Kind: missing.
-- **AUD-012** **Spawn intensity and position randomization are ignored.** Original: not traced. Ours: `spawn_intensity`, `spawn_intensity_randomization`, event and template `position_randomization` parsed, unused. Evidence: `crates/thedas-formats/src/fev.rs:181`, `crates/thedas-formats/src/fev.rs:371`. Size: S. Depends: none. Kind: missing.
-- **AUD-013** **Loop modes and loop count are guessed.** Original: not traced in `fmod_event.dll` playback. Ours: loop mode 0 and 2 loop, 1 plays once; `loop_count` is never read. Evidence: `crates/thedas-audio/src/engine.rs:14`, `crates/thedas-audio/src/engine.rs:594`, `crates/thedas-formats/src/fev.rs:245`. Size: S. Depends: none. Kind: provisional.
-- **AUD-014** **No-repeat and shuffle play modes repeat.** Original: random-no-repeat, sequential-no-repeat, shuffle. Ours: random-no-repeat and shuffle are plain weighted random (a repeat is possible), sequential-no-repeat is sequential. Evidence: `crates/thedas-audio/src/engine.rs:551`. Size: S. Depends: none. Kind: missing.
-- **AUD-015** **Oscillator waveforms are silent.** Original: oscillator waveforms (shape, frequency). Ours: `WaveformKind::Oscillator` picks nothing. Evidence: `crates/thedas-formats/src/fev.rs:399`, `crates/thedas-audio/src/engine.rs:574`. Size: S. Depends: none. Kind: missing.
-- **AUD-016** **Envelope curves are linear only.** Original: not traced. Ours: every envelope interpolates linearly; point curve-shape flags (only 1 = linear is named) are ignored. Evidence: `crates/thedas-formats/src/fev.rs:297`, `crates/thedas-formats/src/fev.rs:304`. Size: S. Depends: none. Kind: provisional.
-- **AUD-017** **Spawn timing is guessed.** Original: not traced. Ours: a spawning definition fires first after `spawn_time_min_ms` (at least 1 ms), then at uniform random times in min..max, capped by `max_spawned`. Evidence: `crates/thedas-audio/src/engine.rs:14`, `crates/thedas-audio/src/engine.rs:740`. Size: S. Depends: none. Kind: provisional.
-- **AUD-018** **Unnamed sound-instance fields are unused.** Original: not traced. Ours: `unknown0`, `unknown1`, `f1c`..`f30`, `flags_a`, `flags_b` (possibly per-instance fades or offsets) are stored and never read. Evidence: `crates/thedas-formats/src/fev.rs:244`. Size: S. Depends: none. Kind: unverified.
-- **AUD-019** **Only an event's first category counts.** Original: not traced. Ours: `event.categories.first()` sets the volume, bus and ducking; other categories are dropped. Evidence: `crates/thedas-audio/src/engine.rs:331`. Size: S. Depends: none. Kind: unverified.
-- **AUD-020** **Custom rolloff on simple events never attenuates.** Original: not traced. Ours: with `CUSTOM_ROLLOFF` set, distance gain comes only from layer `(distance)` volume envelopes; a simple event (no layers) with that bit plays at full volume at any distance. Evidence: `crates/thedas-audio/src/engine.rs:849`. Size: S. Depends: none. Kind: unverified.
-- **AUD-021** **3D distance model is not checked against FMOD.** Original: FMOD Ex log/linear rolloff. Ours: `LINEAR_ROLLOFF` is linear between min and max; anything else is `min / d` clamped at max; the `LOG_ROLLOFF` bit is not consulted. Evidence: `crates/thedas-audio/src/engine.rs:849`. Size: S. Depends: none. Kind: unverified.
-- **AUD-022** **3D panning is left/right only.** Original: not traced. Ours: the pan is the source direction's dot product with the listener's right vector times `pan_level_3d`; no front/back or height cue, the listener's forward and up are never passed in. Evidence: `crates/thedas-audio/src/engine.rs:14`, `crates/thedas-audio/src/engine.rs:496`, `crates/thedas-audio/src/engine.rs:843`. Size: M. Depends: AUD-044. Kind: provisional.
-- **AUD-023** **Head-relative and world-relative modes are ignored.** Original: `FMOD_3D_HEADRELATIVE` / `WORLDRELATIVE`. Ours: the bits are named, never tested. Evidence: `crates/thedas-formats/src/fev.rs:142`. Size: S. Depends: none. Kind: missing.
-- **AUD-024** **Event-group user properties are unused.** Original: not traced. Ours: `EventGroup::properties` parsed, no reader. Evidence: `crates/thedas-formats/src/fev.rs:133`. Size: S. Depends: none. Kind: unverified.
-- **AUD-025** **FEV music-system chunk is kept unparsed.** Original: the module doc says DA:O's chunk is empty (music is ordinary events). Ours: `music_data` raw bytes. Evidence: `crates/thedas-formats/src/fev.rs:10`, `crates/thedas-formats/src/fev.rs:592`. Size: S. Depends: none. Kind: unverified.
-- **AUD-026** **No streaming: every sample is decoded whole.** Original: wave-bank load flags (0x80 stream from disk, 0x200 decompress into memory) and max streams. Ours: flags and `max_streams` unused; each sample (streamed music included) is read and decoded fully on a fresh thread, held in a 768 MB cache. Evidence: `crates/thedas-formats/src/fev.rs:96`, `crates/thedas-audio/src/library.rs:25`, `crates/thedas-audio/src/library.rs:176`, `crates/thedas-audio/src/engine.rs:624`. Size: M. Depends: none. Kind: missing.
-- **AUD-027** **`#pause:` event parameters are not done; duck details guessed.** Original: not traced. Ours: `#duck:` works; its third number, the dB ramp (linear in dB) are guesses; `#pause:` is ignored. Evidence: `crates/thedas-audio/src/engine.rs:219`. Size: S. Depends: none. Kind: provisional.
-- **AUD-028** **Snapshots / mixer states.** Original: snapshots/ducking. Ours: no code found beyond per-event `#duck:` parameters. Evidence: `crates/thedas-audio/src/engine.rs:219`. Size: M. Depends: AUD-027. Kind: missing.
-- **AUD-029** **Event fade and category routing to buses is by name.** Original: not traced. Ours: buses are chosen by category name (`music`/`stinger`, `vo*`, `gui`, `*ambient*`), and the Ambient and Ui buses take the SFX slider. Evidence: `crates/thedas-audio/src/engine.rs:202`, `crates/thedas-audio/src/engine.rs:822`. Size: S. Depends: none. Kind: unverified.
-
-### Music
-
-- **AUD-030** **Music changes ignore markers.** Original: waits for markers (`sound_settings.gda` "max time between markers", per the comment). Ours: the track switches at once on combat/death change; stinger choice is guessed. Evidence: `crates/thedas-app/src/audio.rs:1141`, `crates/thedas-app/src/audio.rs:1166`. Size: M. Depends: AUD-031. Kind: provisional.
-- **AUD-031** **FSB SYNC points are unused.** Original: cue points the music system cuts at. Ours: `sync_points` parsed and only printed by the CLI. Evidence: `crates/thedas-formats/src/fsb.rs:98`, `crates/thedas-cli/src/audio.rs:416`. Size: M. Depends: none. Kind: missing.
-- **AUD-032** **`PlayMusic` is dropped.** Original: not traced. Ours: the sim queues `SoundRequest::Music`; the app logs "not done yet" and discards it. Evidence: `crates/thedas-sim/src/engine.rs:502`, `crates/thedas-app/src/main.rs:2335`. Size: S. Depends: none. Kind: missing.
-- **AUD-033** **`SetMusicIntensity` mapping is inferred.** Original: logs "music state= %2.1f" (per comment). Ours: sets `music_state` on the area track to the integer given; read from data and scripts, not traced. Evidence: `crates/thedas-app/src/audio.rs:1468`. Size: S. Depends: none. Kind: provisional.
-- **AUD-034** **Music during cutscenes and conversations is left alone.** Original: not traced. Ours: the area track keeps playing through cutscenes and conversations. Evidence: `crates/thedas-app/src/audio.rs:1141`. Size: S. Depends: none. Kind: provisional.
-
-### World sound, reverb, occlusion
-
-- **AUD-035** **Secondary reverb instances are not modelled.** Original: loads the next two most-used presets into secondary reverb instances for events that name a preset (per comment). Ours: one world reverb. Evidence: `crates/thedas-audio/src/area.rs:136`. Size: M. Depends: AUD-036. Kind: missing.
-- **AUD-036** **The reverb is our own algorithm.** Original: FMOD Ex software I3DL2 reverb. Ours: four taps, two diffusers, 8-line FDN; decay LF ratio, modulation, echo, environment and room rolloff are unused. Evidence: `crates/thedas-audio/src/reverb.rs:27`. Size: M. Depends: none. Kind: provisional.
-- **AUD-037** **Reverb trigger entry rule is guessed.** Original: enter handler 0x79b3d0 (caller not traced). Ours: the party leader's entering counts; of several entered in one step, the last listed wins. Evidence: `crates/thedas-audio/src/area.rs:166`. Size: S. Depends: none. Kind: provisional.
-- **AUD-038** **Audio-volume triggers act only as reverb triggers.** Original: `CCTriggerAudioVolume` (type 4, loader 0x79a5d0) subclasses the reverb trigger. Ours: type 4 sets reverb and weighs 0.15 in the starting preset; any other behaviour of the subclass is not traced. Evidence: `crates/thedas-audio/src/area.rs:74`. Size: M. Depends: none. Kind: unverified.
-- **AUD-039** **Occlusion and obstruction.** Original: occlusion. Ours: no code found. Evidence: `crates/thedas-audio/src/engine.rs:837`. Size: L. Depends: AUD-004. Kind: missing.
-- **AUD-040** **Placed sounds' reach and replay are guessed.** Original: not traced. Ours: a placed sound starts within 1.1 x its event's max distance times `MaxDistanceMult` and stops outside; a one-shot that finished plays again only after the listener leaves and returns. Orientation fields are not read. Evidence: `crates/thedas-app/src/audio.rs:1231`, `crates/thedas-audio/src/area.rs:66`. Size: S. Depends: none. Kind: unverified.
-- **AUD-041** **Placeable hit targets are silent; hits sound at the target.** Original: table 93 for placeables (per comment). Ours: not sounded; creature hits play where the target stands. Evidence: `crates/thedas-app/src/audio.rs:917`. Size: S. Depends: none. Kind: provisional.
-- **AUD-042** **Bodyfall armour material taken from the chest item.** Original: creature +0x930. Ours: chest item's material. Evidence: `crates/thedas-app/src/audio.rs:960`. Size: S. Depends: none. Kind: provisional.
-- **AUD-043** **Animation sound-event edge cases.** Original: every creature starts its rustle check from the origin with 1.0 (0x6b42f2). Ours: events on an animation's first frame are those at time 0 onward; a creature first seen starts its rustle check where it stands. Evidence: `crates/thedas-app/src/audio.rs:782`, `crates/thedas-app/src/audio.rs:795`. Size: S. Depends: none. Kind: provisional.
-
-### Output and mixing
-
-- **AUD-044** **Stereo only; surround is not produced.** Original: surround output (5.1/7.1). Ours: the mixer renders stereo; a device with more channels gets zeros past the first two. Evidence: `crates/thedas-audio/src/device.rs:55`, `crates/thedas-audio/src/mixer.rs:2`. Size: M. Depends: AUD-022. Kind: missing.
-- **AUD-045** **Default device only, f32 only, no hot-plug.** Original: output device selection and hot-plug. Ours: cpal default device at its default config; a non-f32 default format runs silent; no device choice, no reopen on device change. Evidence: `crates/thedas-audio/src/device.rs:22`, `crates/thedas-audio/src/device.rs:30`. Size: M. Depends: none. Kind: missing.
-- **AUD-046** **Pan law is unchecked.** Original: `fmodex.dll` pan law. Ours: linear balance. Evidence: `crates/thedas-audio/src/mixer.rs:5`, `crates/thedas-audio/src/mixer.rs:298`. Size: S. Depends: none. Kind: provisional.
-- **AUD-047** **Output limiter (deliberate difference).** Original: FMOD's mixer clips (per comment; whether the exe adds a limiter is not traced). Ours: a -0.3 dBFS limiter with 0.2 s release. Evidence: `crates/thedas-audio/src/mixer.rs:207`. Size: S. Depends: none. Kind: provisional.
-- **AUD-048** **Volume options are not persisted.** Original: volume options persisted. Ours: the options screen's slider values feed `volumes()` but nothing writes the player's settings file. Evidence: `crates/thedas-ui/src/options.rs:11`, `crates/thedas-app/src/audio.rs:1527`. Size: S. Depends: CAM-044. Kind: missing.
-- **AUD-049** **Pause does not pause audio.** Original: pause behaviour. Ours: no code found; `Mixer::set_paused` has no caller and the game's pause does not reach `GameAudio`. Evidence: `crates/thedas-audio/src/mixer.rs:150`. Size: S. Depends: none. Kind: missing.
-- **AUD-050** **Audio during loading.** Original: audio during loading. Ours: no code found for an explicit loading-time policy. Evidence: `crates/thedas-app/src/audio.rs:1344`. Size: S. Depends: CAM-037. Kind: missing.
-
-### Voice-over
-
-- **AUD-051** **Voice-over is not positioned.** Original: voice-over positioning. Ours: conversation and ambient lines play 2D (`speak` sets no position). Evidence: `crates/thedas-app/src/audio.rs:14`, `crates/thedas-app/src/audio.rs:1513`. Size: M. Depends: none. Kind: missing.
-- **AUD-052** **Lip sync.** Original: lip sync data. Ours: no code found (no FaceFX or lip reader). Evidence: `crates/thedas-formats/src/lib.rs:1`. Size: L. Depends: FMT-027. Kind: missing.
-- **AUD-053** **VO language is a flag, not the game's locale.** Original: localisation of VO. Ours: `--language` (default `en-us`) picks `audio/vo/<language>/vo`; the options' `Locale` is not consulted; talk tables stay English (FMT-017). Evidence: `crates/thedas-app/src/main.rs:219`, `crates/thedas-audio/src/library.rs:95`. Size: S. Depends: FMT-017. Kind: missing.
-- **AUD-054** **Sound-set details guessed.** Original: per-creature probability multiplier (table 0x119) and creature flag +0x969 (per comment). Ours: bag draw order random; the multiplier and flag are not modelled; event-vs-sample choice inferred from data. Evidence: `crates/thedas-app/src/audio.rs:653`. Size: S. Depends: none. Kind: provisional.
-
-### Cutscene and movie sound
-
-- **AUD-055** **Cutscene sound tracks joined late are skipped.** Original: not traced. Ours: an `ACSP` track whose start was missed does not play. Evidence: `crates/thedas-app/src/audio.rs:1304`. Size: S. Depends: none. Kind: provisional.
-- **AUD-056** **Movie sound bypasses categories and needs ffmpeg.** Original: not traced. Ours: only boot movies' sound plays, decoded by an external `ffmpeg` at full volume outside the categories (the dialog/music sliders do not apply). Evidence: `crates/thedas-app/src/audio.rs:130`, `crates/thedas-app/src/audio.rs:1039`. Size: M. Depends: CAM-029. Kind: provisional.
-
-### Codecs
-
-- **AUD-057** **IMA ADPCM layout from community docs.** Original: `fmodex.dll` decoder. Ours: frame layout per community description, lengths agree with all banks. Evidence: `crates/thedas-audio/src/decode.rs:153`. Size: S. Depends: none. Kind: provisional.
-- **AUD-058** **FSB header field names unverified.** Original: `fmodex.dll`. Ours: names from community (vgmstream, fsbext). Evidence: `crates/thedas-formats/src/fsb.rs:14`. Size: S. Depends: none. Kind: provisional.
-- **AUD-059** **Console codecs unsupported.** Original: XMA, VAG, GameCube ADPCM, Vorbis. Ours: `Codec::Other` is refused; PC data ships only IMA ADPCM and MP3. Evidence: `crates/thedas-formats/src/fsb.rs:72`, `crates/thedas-audio/src/decode.rs:71`. Size: L. Depends: FMT-045. Kind: missing.
-- **AUD-060** **More than two channels refused.** Original: not traced. Ours: samples with channels outside 1..=2 error. Evidence: `crates/thedas-audio/src/decode.rs:55`. Size: S. Depends: none. Kind: missing.
-
-### Documentation inside the code
-
-- **AUD-061** **`audio.rs` module doc is stale.** Original: n/a. Ours: says in-game music is not done and volumes map linearly; the same file does area/combat music and the exe's -3 dB per step mapping. Evidence: `crates/thedas-app/src/audio.rs:6`, `crates/thedas-app/src/audio.rs:14`, `crates/thedas-app/src/audio.rs:1526`. Size: S. Depends: none. Kind: bug.
-- **AUD-062** **`Bus` doc is stale.** Original: n/a. Ours: says `audio_categories.fev` is not read yet; the engine reads it. Evidence: `crates/thedas-audio/src/mixer.rs:12`, `crates/thedas-audio/src/engine.rs:270`. Size: S. Depends: none. Kind: bug.
-
-### Checked and looks complete
-
-- Event lookup by path, case-insensitive, with groups (`engine.rs` `locate`).
-- Per-event max playbacks with steal-oldest / steal-newest / fail.
-- Category volume hierarchy from `audio_categories.fev`, own-project fallback.
-- `#duck:` ducking of a category and its children with fade in/out.
-- Event fade in/out, event volume, template volume, reverb dry/wet per event.
-- Layers placed on a control parameter; sounds start/stop as the parameter moves.
-- Programmer-selected sounds (voice-over samples by strref, `_f`/`_m`).
-- Reverb preset lookup by name (`force_generic`, empty = off) and 0.33 s blended fades, as traced.
-- Area starting reverb preset by weighted trigger count, as traced.
-- Options sliders to dB (-3 dB per step, -60 dB floor), as traced (0x5b61b0, 0x5b6110).
-- Area music themes: main/combat/Death with stingers (timing provisional, see AUD-030).
-- Placed area sounds with `ActivateSoundByTag`.
-- UI sounds through `sound_gui.gda`.
-- Script `PlaySound` and `PlaySoundSet`.
-- Footsteps, scuffs, vegetation rustles, armour foley, swings, weapon (un)sheathe, blows, bodyfalls, as traced.
-- Sound-set player (counts, bag, probability, gender), party-picker lines, chargen voice preview.
-- Cutscene `ACSP` sound tracks; boot-movie sound.
-- FSB4 parse, IMA ADPCM, MP3 (Symphonia), PCM8/16 decode; WAV recording for headless runs.
+42. **Reference recordings of the original.**
+    - Done: the main-menu music (`reference/original/audio/main_menu_20s.wav`, recorded under Wine with `scripts/audio/syscapture`). Ours matches it to within 0.1 dB in level, channel balance, stereo width and brightness over the aligned 22 s (envelope correlation 0.97 at 48.65 s into the track), so music decoding, volume and categories are right.
+    - Not done: a reverb recording (Beraht's Hideout), to compare the reverb's character.

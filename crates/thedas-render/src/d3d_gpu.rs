@@ -1702,9 +1702,20 @@ impl D3dPass {
                 .draws
                 .iter()
                 .zip(&classes)
-                .map(|(d, &c)| match c {
-                    LightClass::Level => ambient(&d.room),
-                    c => ambient_of(&scene.lights, c),
+                .enumerate()
+                .map(|(di, (d, &c))| {
+                    // The level's own draws: the ambient light nodes reach only models flagged
+                    // prop (DAOrigins.exe 0x464310's 4th argument, set for 0x10000), so terrain
+                    // and static meshes get none, a placed prop the brightest.
+                    if di < scene.static_draws {
+                        let own =
+                            LightClass::of(scene.materials[d.material].render_class.as_deref());
+                        return ambient_of(&scene.lights, own);
+                    }
+                    match c {
+                        LightClass::Level => ambient(&d.room),
+                        c => ambient_of(&scene.lights, c),
+                    }
                 })
                 .collect(),
             sun: scene.sun,
@@ -1975,7 +1986,11 @@ impl D3dPass {
                     let (world, _, _) = &self.worlds[c.draw];
                     let centre = world.transform_point3(c.sphere.0);
                     let radius = c.sphere.1 * max_scale(world);
-                    [0, 1].map(|k| in_partition(&p[k], centre, radius))
+                    // A faded object casts no shadow (DAOrigins.exe 0xa61280: below opacity 1
+                    // its render nodes carry the fadeoutobject bit, which no shadow group
+                    // draws).
+                    let faded = self.opacity.get(c.draw).is_some_and(|&o| o < 1.0);
+                    [0, 1].map(|k| !faded && in_partition(&p[k], centre, radius))
                 })
                 .collect();
             let key = shadow_key(&p, &self.casters, &visible, &self.worlds, &self.bones);
