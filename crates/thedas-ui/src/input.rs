@@ -80,10 +80,25 @@ pub fn reply(sim: &mut Sim, n: usize) -> bool {
     false
 }
 
+/// The message a script message box's buttons send (DAOrigins.exe's callback format at
+/// 0xb07fd8, `GUIPopupLayer.ScriptDialogResult %d %d %d`).
+pub const SCRIPT_DIALOG_RESULT: &str = "GUIPopupLayer.ScriptDialogResult";
+
 /// Acts on a message a movie sent: a conversation reply is picked (continuing past the last
 /// line of one that ended closes it), anything else goes to the simulation's interface
 /// handlers. Returns whether the simulation acted on it.
 pub fn apply(sim: &mut Sim, name: &str, args: &[String]) -> bool {
+    // A script's message box answered: its button's callback (`ScriptDialogResult <popup
+    // type> <button, from 1> <owner>`, see `binding::script_popup`).
+    if name == SCRIPT_DIALOG_RESULT {
+        let button = args
+            .get(1)
+            .and_then(|a| a.trim().parse::<f64>().ok())
+            .map_or(1, |b| b as i32);
+        let answered = sim.answer_popup(button);
+        sim.tick(0);
+        return answered;
+    }
     if name == SELECT_RESPONSE {
         let n = args
             .first()
@@ -394,6 +409,51 @@ pub fn handler_for(sim: Arc<Mutex<Sim>>, shown: Arc<Mutex<Presentation>>) -> Mes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_script_message_box_shows_and_its_button_answers_it() {
+        use thedas_formats::gda::Cell;
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        sim.world.tables().insert(
+            "#207",
+            &["#335f4422", "#187217e1", "#016926a0", "#4e28b067"],
+            vec![(
+                1,
+                vec![Cell::Int(10), Cell::Int(11), Cell::Int(0), Cell::Int(0)],
+            )],
+        );
+        let owner = sim
+            .world
+            .spawn(thedas_sim::world::ObjectKind::Creature, "asker");
+        sim.world.popup = Some(thedas_sim::world::Popup {
+            strref: 5,
+            kind: 1,
+            owner,
+            input: false,
+        });
+        // Two labels (no talk table here, so they read as nothing to show): the buttons
+        // follow the labels the table names.
+        let v = crate::binding::sim_values(&sim);
+        assert_eq!(
+            v["GUIPopupLayer.PickerList"],
+            UiValue::String(String::new())
+        );
+        assert!(v.contains_key("GUIPopupLayer.NumButtons"));
+        let callback = format!("{SCRIPT_DIALOG_RESULT} 1 2 {owner}");
+        let mut words = callback.split(' ').map(str::to_string);
+        let name = words.next().unwrap();
+        assert!(apply(&mut sim, &name, &words.collect::<Vec<_>>()));
+        assert!(sim.world.popup.is_none());
+        assert!(
+            crate::binding::sim_values(&sim)
+                .get("GUIPopupLayer.NumButtons")
+                .is_none()
+        );
+    }
 
     #[test]
     fn the_examine_screen_opens_on_an_item_and_closes_itself() {

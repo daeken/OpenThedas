@@ -176,6 +176,10 @@ pub struct UiLayer {
     /// the last tooltip out again after they changed (see `thedas_ui::avm1::TOOLTIP_RELAYOUT`).
     tooltip_text: Option<thedas_ui::UiValue>,
     tooltip_relayout: u8,
+    /// The script message box shown (`World::popup`: its text, type and owner), and the frames
+    /// it has waited for its values to reach the popup layer (see
+    /// [`UiLayer::show_script_popup`]).
+    script_popup: Option<((i32, i32, u32), u8)>,
     /// The floating messages up over creatures (see [`UiLayer::update_floaties`]).
     floaties: Vec<Floaty>,
     /// The stats floaties up (name and health bar over a creature): creature → floaty id.
@@ -432,6 +436,7 @@ impl UiLayer {
             saves_listed: false,
             tooltip_text: None,
             tooltip_relayout: 0,
+            script_popup: None,
             floaties: Vec::new(),
             stat_floaties: Default::default(),
             continue_pending: false,
@@ -569,6 +574,39 @@ impl UiLayer {
         }
         screens.menu = Some(Screen::Journal);
         true
+    }
+
+    /// Shows a script's message box (`ShowPopup`, `World::popup`) on the popup layer, as the
+    /// game's own dialog boxes show (`PopupLayer.ShowDialogBoxFromGame`), once its values
+    /// (`thedas_ui::binding`'s `GUIPopupLayer.*`) have reached the movie: two frames after
+    /// it opened. Its buttons answer it (`thedas_ui::input::SCRIPT_DIALOG_RESULT`).
+    fn show_script_popup(&mut self, sim: &Arc<Mutex<Sim>>) {
+        let open = {
+            let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+            sim.world
+                .popup
+                .as_ref()
+                .map(|p| (p.strref, p.kind, p.owner))
+        };
+        match (open, self.script_popup.as_mut()) {
+            (None, _) => self.script_popup = None,
+            (Some(k), Some((shown, frames))) if *shown == k => {
+                if *frames < 2 {
+                    *frames += 1;
+                    if *frames == 2 {
+                        let up = self.stage.call_in(
+                            thedas_ui::stage::POPUP_LAYER,
+                            "_global.PopupLayer.ShowDialogBoxFromGame",
+                            &[],
+                        );
+                        if up.is_none() {
+                            log::warn!("ui: a script message box with no popup layer up");
+                        }
+                    }
+                }
+            }
+            (Some(k), _) => self.script_popup = Some((k, 0)),
+        }
     }
 
     /// The popup layer's messages: a movie's `GUI.ShowDialogBox` (after it set the dialog's
@@ -880,6 +918,7 @@ impl UiLayer {
             }
         }
         self.show_cutscene_line(sim);
+        self.show_script_popup(sim);
         let mut messages = self.stage.tick(dt_ms);
         if std::mem::take(&mut self.continue_pending) {
             messages.push(GameMessage::Send(
@@ -934,7 +973,11 @@ impl UiLayer {
                         self.requests.push(FrontEnd::NewGame);
                     }
                     "QuitGame" => self.requests.push(FrontEnd::Quit),
-                    _ => {}
+                    other => {
+                        if self.ignored.insert(other.to_string()) {
+                            log::warn!("ui: fscommand {other} {:?} is not handled", call.args);
+                        }
+                    }
                 }
             }
         }

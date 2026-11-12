@@ -110,7 +110,6 @@ these, so they are the places where one person or stream can take a large, separ
 - **Screens never built**: loading screens, crafting, the party camp gift screen, store
   buyback, credits, and the online, downloadable-content and achievement screens (`UI-052`,
   `UI-077`, `UI-124`, `UI-126`, `UI-127`, and the stream's list).
-- **Script message boxes are never shown**, so a scripted prompt waits forever (`UI-115`).
 - **Options are not saved**, and most video, control and game options change nothing
   (`UI-053` to `UI-066`).
 - **Keys cannot be rebound.** The key map is hard-coded (`UI-059`), and there is no WASD
@@ -161,7 +160,6 @@ Concrete defects found during the code read. Each is small and independent.
 | `UI-060` | The auto-pause option never reaches the simulation |
 | `UI-058` | Tutorials stay on whatever the setting says |
 | `UI-003` | Three interface queries are never answered |
-| `UI-006` | Unknown interface commands are dropped without a log line |
 | `UI-156` | With the free camera on, C both lowers the camera and opens the character record |
 | `FMT-009` | The `Offers/` folder is not mounted for resources, though audio reads it |
 | `FMT-008` | Every enabled DLC's module folder is mounted for every campaign |
