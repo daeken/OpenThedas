@@ -21,9 +21,14 @@
 //! The opacity reaches the renderer through [`crate::live::Live::opacity`], combined with any
 //! other fade in `Live::combine_opacity`.
 //!
-//! Provisional: the creatures' shapes (their models' `.phy` capsules, spheres and boxes in
-//! the creatures group) are placed at the creature's current placement by their bones' rest
-//! pose, not the animated skeleton the physics scene follows.
+//! The query meets only shapes whose groups mask has the creatures bit (0x648c00 ->
+//! 0x82e980: `overlapSphereShapes` with groups mask {2, 0, 0, 0}): the creatures' models'
+//! `.phy` shapes in that group (the shape loader 0x589db0 sets it from field 6066; armour
+//! carries small per-bone capsules, heads a neck and a head capsule). A creature's movement
+//! controller capsule is not among them (its groups mask is 0x10, 0x6b218f).
+//!
+//! Provisional: the shapes are placed at the creature's current placement by their bones'
+//! rest pose, not the animated skeleton the physics scene follows.
 
 use std::collections::BTreeMap;
 
@@ -88,21 +93,6 @@ impl Shape {
                 q.clamp(-half, half).distance(q) <= radius
             }
         }
-    }
-}
-
-/// A creature's body: an upright capsule from its feet to its `height`, of its
-/// appearance's `PERSPACE` `radius`, in its model's space, tested along with its models'
-/// own creature shapes. Provisional: which creatures-group shapes the executable's sphere
-/// query (0x648c00) meets for a creature is not traced. Humanoids' equipment `.phy` files
-/// carry only small per-bone capsules in that group (torso, shoulders, hips; none on the
-/// head), so this capsule stands in for the character controller's, taken to be there too.
-pub fn body_capsule(radius: f32, height: f32) -> Shape {
-    let r = radius.max(0.0);
-    Shape::Capsule {
-        a: Vec3::new(0.0, 0.0, r),
-        b: Vec3::new(0.0, 0.0, (height - r).max(r)),
-        radius: r,
     }
 }
 
@@ -217,16 +207,6 @@ mod tests {
         // No time passing changes nothing.
         f.update([3], 0.0);
         assert_eq!(f.alpha(3), 1.0);
-    }
-
-    #[test]
-    fn a_camera_half_a_metre_from_a_humans_axis_touches_his_body() {
-        let body = body_capsule(0.35, 1.75);
-        let at = Mat4::from_translation(Vec3::new(5.0, 0.0, 0.0));
-        // 0.5 m from the axis at head height: within 0.35 + 0.25.
-        assert!(body.touches(&at, Vec3::new(5.5, 0.0, 1.6), FADE_RADIUS));
-        // A normal 3 m camera does not.
-        assert!(!body.touches(&at, Vec3::new(8.0, 0.0, 1.8), FADE_RADIUS));
     }
 
     #[test]

@@ -140,6 +140,20 @@ impl Follow {
         f
     }
 
+    /// The explore camera's activation (0x770ff0), run after an area has loaded, a cutscene
+    /// has ended or a movie has played (0x6949c0's callers 0x6c8fa7, 0x69269d, 0x6dbe46;
+    /// conversations do not reset it): the camera turns behind the leader (`heading`, its
+    /// facing's direction; 0x7ee880), takes the starting pitch blended by zoom (0x76f550),
+    /// and drops its pull-in and ease-out (0x6c2890 -> 0x6c2350). Zoom is kept: the one
+    /// controller lives for the whole process (built at 0x641918).
+    pub fn reset(&mut self, heading: f32) {
+        let zoom = self.zoom;
+        *self = Self::behind(heading);
+        self.zoom = zoom;
+        let t = self.zoom_t();
+        self.pitch = (FAR_POLAR_DEG + (NEAR_POLAR_DEG - FAR_POLAR_DEG) * t - 90.0).to_radians();
+    }
+
     pub fn orbit(&mut self, d_yaw: f32, d_pitch: f32) {
         self.yaw += d_yaw;
         self.pitch = (self.pitch + d_pitch).clamp(MIN_PITCH, MAX_PITCH);
@@ -349,6 +363,24 @@ mod tests {
 
     fn dist(c: &Camera) -> f32 {
         (c.position - look()).length()
+    }
+
+    #[test]
+    fn a_reset_turns_behind_the_leader_and_keeps_the_zoom() {
+        let mut f = Follow::behind(0.0);
+        f.zoom(-3.0);
+        f.orbit(1.0, 0.3);
+        f.pull = 1.5;
+        let zoom = f.zoom;
+        f.reset(2.0);
+        assert_eq!(f.yaw, 2.0);
+        assert_eq!(f.zoom, zoom);
+        assert_eq!(f.pull, 0.0);
+        let mut fresh = Follow::behind(2.0);
+        fresh.zoom = zoom;
+        let t = fresh.zoom_t();
+        let pitch = (FAR_POLAR_DEG + (NEAR_POLAR_DEG - FAR_POLAR_DEG) * t - 90.0).to_radians();
+        assert!((f.pitch - pitch).abs() < 1e-6);
     }
 
     #[test]

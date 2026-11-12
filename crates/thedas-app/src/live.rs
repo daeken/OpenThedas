@@ -119,6 +119,9 @@ pub struct Live {
     /// The creatures the game camera has faded (see [`crate::camfade`]) and the models'
     /// creature shapes read so far.
     camera_fade: crate::camfade::CameraFade,
+    /// The area and whether a cutscene played, as the explore camera last saw them (see
+    /// [`Live::camera_reset_due`]).
+    camera_seen: Option<(Option<ObjectId>, bool)>,
     creature_shapes: std::collections::HashMap<String, Arc<Vec<crate::camfade::Shape>>>,
     /// A quickbar ability waiting for the player to click its target.
     pub aiming: Option<thedas_ui::input::Aim>,
@@ -261,6 +264,7 @@ impl Live {
             objects: None,
             animator: Animator::default(),
             camera_fade: Default::default(),
+            camera_seen: None,
             creature_shapes: Default::default(),
             aiming: None,
             posed: Vec::new(),
@@ -356,18 +360,16 @@ impl Live {
             sim.world.cutscene.is_some() || sim.conversation_line().is_some()
         };
         let eye = eye.filter(|_| !blocked);
-        // Each creature's body: its appearance's `PERSPACE` radius and height (see
-        // `crate::camfade::body_capsule`), tested as well as its models' own shapes.
-        let bodies: std::collections::HashMap<ObjectId, (f32, f32)> = match eye {
-            Some(_) => {
-                let sim = self.sim();
-                sim.world
-                    .objects
-                    .values()
-                    .filter(|o| o.kind == thedas_sim::world::ObjectKind::Creature)
-                    .map(|o| (o.id, (sim.body_radius(o.id), appearance_height(&sim, o.id))))
-                    .collect()
-            }
+        // Only creatures fade (the creatures group); their models' shapes are tested.
+        let creatures: std::collections::HashSet<ObjectId> = match eye {
+            Some(_) => self
+                .sim()
+                .world
+                .objects
+                .values()
+                .filter(|o| o.kind == thedas_sim::world::ObjectKind::Creature)
+                .map(|o| o.id)
+                .collect(),
             None => Default::default(),
         };
         let mut touching = Vec::new();
@@ -382,9 +384,9 @@ impl Live {
                 if placement.w_axis.truncate().distance(eye) > 4.0 {
                     continue;
                 }
-                let Some(&(radius, height)) = bodies.get(id) else {
+                if !creatures.contains(id) {
                     continue;
-                };
+                }
                 let touches = models.iter().any(|m| {
                     let key = m.to_ascii_lowercase();
                     let shapes = self.creature_shapes.entry(key.clone()).or_insert_with(|| {
@@ -402,12 +404,6 @@ impl Live {
                         .iter()
                         .any(|s| s.touches(placement, eye, crate::camfade::FADE_RADIUS))
                 });
-                let touches = touches
-                    || (crate::camfade::body_capsule(radius, height).touches(
-                        placement,
-                        eye,
-                        crate::camfade::FADE_RADIUS,
-                    ));
                 if touches {
                     touching.push(*id);
                 }
@@ -415,6 +411,26 @@ impl Live {
         }
         self.camera_fade.update(touching, dt);
         self.combine_opacity();
+    }
+
+    /// The leader's heading (radians) when the explore camera should reset behind it
+    /// ([`crate::follow::Follow::reset`]): after a new area has loaded or a cutscene has
+    /// ended, as the executable resets it at the end of loading and on leaving its cutscene
+    /// and movie modes (0x6949c0's callers). Not after conversations.
+    pub fn camera_reset_due(&mut self) -> Option<f32> {
+        let (now, heading) = {
+            let sim = self.sim();
+            let w = &sim.world;
+            let heading = w
+                .controlled()
+                .and_then(|id| w.get(id))
+                .map(|o| thedas_sim::world::heading_of(o.facing).to_radians());
+            ((w.area, w.cutscene.is_some()), heading)
+        };
+        let before = self.camera_seen.replace(now);
+        let (area, cut) = before?;
+        let due = area != now.0 || (cut && !now.1);
+        heading.filter(|_| due)
     }
 
     /// Rebuilds [`Live::opacity`] from every fade that sets one, multiplied together (a
@@ -450,6 +466,35 @@ impl Live {
     pub fn creature_height(&self, id: ObjectId) -> f32 {
         appearance_height(&self.sim(), id)
     }
+}
+
+/// The models a drawn object is made of, for their `.phy` shapes: its own model list and
+/// every model its draws come from (a creature's head and eyes are drawn from models not in
+/// its list), lowercased without an extension.
+fn body_models(scene: &AreaScene, prop: usize, own: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = own.iter().map(|m| m.to_ascii_lowercase()).collect();
+    let Some(p) = scene.props.get(prop) else {
+        return out;
+    };
+    let draws = p
+        .draws
+        .clone()
+        .chain(p.attachments.iter().flat_map(|a| a.draws.clone()));
+    for d in draws {
+        let Some(d) = scene.draws.get(d) else {
+            continue;
+        };
+        let name = d.model.to_ascii_lowercase();
+        let name = name
+            .strip_suffix(".mmh")
+            .or_else(|| name.strip_suffix(".msh"))
+            .unwrap_or(&name)
+            .to_string();
+        if !name.is_empty() && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
 }
 
 /// A creature's height from its appearance (see [`Live::creature_height`]), with the
@@ -1034,7 +1079,11 @@ impl Live {
             faces,
             solid,
             moving,
-            bodies: models.iter().map(|m| (m.id, m.models.clone())).collect(),
+            bodies: models
+                .iter()
+                .enumerate()
+                .map(|(i, m)| (m.id, body_models(&scene, i, &m.models)))
+                .collect(),
             scene,
             renderer,
         })
