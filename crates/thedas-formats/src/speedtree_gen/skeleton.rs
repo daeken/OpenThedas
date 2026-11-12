@@ -302,6 +302,11 @@ struct Grower<'t> {
     propagate_flexibility: bool,
 }
 
+/// The flare seed, 444 when the file has none (7.10 items 5 and 10).
+fn flare_seed(tree: &SpeedTree) -> i32 {
+    tree.flare_seed.unwrap_or(444)
+}
+
 /// Grows a tree's skeleton (stage 2). The stream is returned in its final state so later
 /// stages continue the same sequence.
 pub fn grow(tree: &SpeedTree) -> Result<(Skeleton, Random), GenerateError> {
@@ -318,7 +323,7 @@ pub fn grow(tree: &SpeedTree) -> Result<(Skeleton, Random), GenerateError> {
         info.size + info.size_variance,
     );
     // Step 4: the flare generator. Step 5 (leaf card sizes) belongs to stage 5.
-    let crt = CRandom(tree.flare_seed.unwrap_or(0) as u32);
+    let crt = CRandom(flare_seed(tree) as u32);
     // Step 6.
     random.reseed(seed);
     let mut grower = Grower {
@@ -342,7 +347,8 @@ pub fn grow(tree: &SpeedTree) -> Result<(Skeleton, Random), GenerateError> {
         vertex_count: 0,
         candidates: 0,
         exceeded: None,
-        wind_counter: seed.max(1),
+        // 7.7 / 7.10 item 5: the stored seed, without the ≤ 1 rule.
+        wind_counter: seed,
         wind_level: tree.wind_level.unwrap_or(1),
         propagate_flexibility: tree.propagate_flexibility.unwrap_or(false),
     };
@@ -360,7 +366,7 @@ pub fn grow(tree: &SpeedTree) -> Result<(Skeleton, Random), GenerateError> {
             parent: None,
             wind: Wind {
                 weights: [1.0, 1.0],
-                groups: [seed.max(1), tree.flare_seed.unwrap_or(0)],
+                groups: [seed, flare_seed(tree)],
             },
         });
     }
@@ -1317,5 +1323,16 @@ pub(super) mod tests {
             assert!((v.wind.weights[0] - (1.0 - v.progress * 0.5)).abs() < 1e-6);
             assert_eq!(v.wind.weights[1], 1.0);
         }
+    }
+
+    #[test]
+    fn wind_groups_use_the_stored_seed_and_the_default_flare_seed() {
+        // 7.10 item 5: seed 0 stays 0 for the groups (the stream still seeds with 1), and an
+        // absent flare seed is 444.
+        let mut t = tree(vec![level(-90.0, 0.0), level(0.0, 0.0), level(0.0, 0.0)]);
+        t.tree.seed = 0;
+        t.flare_seed = None;
+        let (skeleton, _) = grow(&t).unwrap();
+        assert_eq!(skeleton.branches[0].wind.groups, [0, 444]);
     }
 }

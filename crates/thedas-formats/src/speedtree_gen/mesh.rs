@@ -559,7 +559,7 @@ impl Transition {
         let lod = tree.lod.unwrap_or_default();
         let d = Transition::default();
         let mut t = Transition {
-            // Absent: smooth (provisional; every game file sets it).
+            // Absent: smooth (7.10 item 4).
             method: lod.leaf_transition.unwrap_or(d.method),
             radius: lod.leaf_transition_radius.unwrap_or(d.radius),
             exponent: lod.leaf_curve_exponent.unwrap_or(d.exponent),
