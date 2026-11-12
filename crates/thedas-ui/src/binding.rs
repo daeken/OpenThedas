@@ -283,15 +283,16 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         let Some(o) = sim.world.get(id) else { return };
         v.insert(prefix.to_string(), num(id));
         v.insert(format!("{prefix}.ID"), num(id));
-        // No combat or status simulation yet: nothing is poisoned, paralysed or busy.
-        for k in [
-            "Poisoned",
-            "Paralyzed",
-            "AbilityUpkeepCost",
-            "CurrentAction",
-            "PendingAction",
-        ] {
+        // No status simulation yet: nothing is poisoned or paralysed.
+        for k in ["Poisoned", "Paralyzed", "AbilityUpkeepCost"] {
             v.insert(format!("{prefix}.{k}"), num(0));
+        }
+        // What the member is doing and will do next, beside its portrait.
+        let mut queue = o.commands.iter();
+        for (k, c) in [("Current", queue.next()), ("Pending", queue.next())] {
+            let (text, icon) = c.map(|c| command_display(sim, id, c)).unwrap_or_default();
+            v.insert(format!("{prefix}.{k}Action"), UiValue::String(text));
+            v.insert(format!("{prefix}.{k}ActionIcon"), UiValue::String(icon));
         }
         v.insert(
             format!("{prefix}.UserSelected"),
@@ -508,6 +509,9 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         "GameModeController.CurrentGameMode".into(),
         num(game_mode(sim)),
     );
+    // A debug switch that hides the members' actions beside their portraits (portraits.gfx
+    // shows them in combat when it reads 0). Provisional: off, as a debug option would be.
+    set("DebugOptions.SuppressPartyActionDisplay".into(), num(0));
     // The conversation in progress, as conversation.gfx reads it: the NPC line, the
     // responses (`Responses.N.Text`, counted with GetNumMembers) and a ready flag. The movie
     // shows the responses when the flag turns 1; here the line has always played (a player
@@ -913,6 +917,77 @@ fn key_mappings(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
             );
         }
     }
+}
+
+/// The `Commands` M2DA (`commands.gda`): DAOrigins.exe reads it by id 0x5e.
+const M2DA_COMMANDS: i32 = 94;
+/// `commands.gda`: whether a command shows beside the portrait, its name (a talk-table
+/// string) and its icon.
+const HASH_COMMAND_SHOWN: u32 = 0x749a_882a;
+const HASH_COMMAND_NAME: u32 = 0x4063_41be;
+const HASH_ICON: u32 = 0xbcdd_b871;
+/// `ABI_base`'s name (a talk-table string).
+const HASH_ABILITY_NAME: u32 = 0x3273_f70d;
+/// `COMMAND_TYPE_USE_ABILITY`.
+const COMMAND_USE_ABILITY: i32 = 25;
+
+/// A command's name and icon as portraits.gfx shows them beside a party member's portrait
+/// (`CurrentAction`/`CurrentActionIcon`, `PendingAction`/`PendingActionIcon`), as
+/// DAOrigins.exe makes them (0x744a80 the name, 0x743b20 the icon; fed at 0x6ae550): empty
+/// for a command `commands.gda` does not show; for using an ability the ability's name and
+/// icon, or the item's icon when it is an item's; else the command's own. Provisional: the
+/// front of our queue is taken as the current command and the next as the pending one (the
+/// exe keeps the running command apart from its queue).
+fn command_display(sim: &Sim, who: u32, c: &thedas_sim::world::Command) -> (String, String) {
+    use thedas_formats::gda::Cell;
+    let tables = sim.world.tables();
+    let Some(commands) = tables.get(M2DA_COMMANDS, "") else {
+        return Default::default();
+    };
+    let int = |t: &thedas_sim::m2da::Table, h: u32, row: i64| match t.cell_by_hash(h, row) {
+        Some(Cell::Int(n)) => *n,
+        _ => 0,
+    };
+    let text = |t: &thedas_sim::m2da::Table, h: u32, row: i64| match t.cell_by_hash(h, row) {
+        Some(Cell::String(s)) => s.trim_end_matches('\0').trim().to_string(),
+        _ => String::new(),
+    };
+    let ty = i64::from(c.ty);
+    if int(&commands, HASH_COMMAND_SHOWN, ty) == 0 {
+        return Default::default();
+    }
+    let name = |strref: i64| {
+        u32::try_from(strref)
+            .ok()
+            .filter(|s| *s != 0)
+            .and_then(|s| sim.string(s))
+            .unwrap_or_default()
+    };
+    let ability = c.ints.first().copied().filter(|a| *a > 0);
+    if let (COMMAND_USE_ABILITY, Some(a)) = (c.ty, ability) {
+        let abi = tables.get(0, "ABI_base");
+        let item = c
+            .strings
+            .first()
+            .filter(|t| !t.is_empty())
+            .and_then(|t| sim.party_item(who, t));
+        let icon = match item {
+            Some(i) => sim.item_look(i).icon,
+            None => abi
+                .as_ref()
+                .map(|t| text(t, HASH_ICON, i64::from(a)))
+                .unwrap_or_default(),
+        };
+        let n = abi
+            .as_ref()
+            .map(|t| name(int(t, HASH_ABILITY_NAME, i64::from(a))))
+            .unwrap_or_default();
+        return (n, icon);
+    }
+    (
+        name(int(&commands, HASH_COMMAND_NAME, ty)),
+        text(&commands, HASH_ICON, ty),
+    )
 }
 
 /// The quickbar of the party member the player controls (`GUI.SelectedChar.Stats.
@@ -1885,6 +1960,55 @@ mod tests {
             v["InputMappings.Mappings.ActivateQuickslot10.PrimaryMappedKey"],
             UiValue::String("0".into())
         );
+    }
+
+    #[test]
+    fn portraits_show_what_members_do_next() {
+        use thedas_formats::gda::Cell;
+        use thedas_sim::world::Command;
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let t = sim.world.tables();
+        let s = |v: &str| Cell::String(v.into());
+        t.insert(
+            "#94",
+            &["#749a882a", "#406341be", "#bcddb871"],
+            vec![
+                (1, vec![Cell::Int(1), Cell::Int(0), s("ic_attack")]),
+                (13, vec![Cell::Int(0), Cell::Int(0), s("")]),
+                (25, vec![Cell::Int(1), Cell::Int(0), s("")]),
+            ],
+        );
+        t.insert(
+            "ABI_base",
+            &["Icon"],
+            vec![(3024, vec![s("tlt_ico_overrun")])],
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        sim.world.hero = Some(hero);
+        let cmd = |ty: i32, ints: Vec<i32>| Command {
+            ty,
+            ints,
+            ..Default::default()
+        };
+        let icons = |sim: &Sim| {
+            let v = sim_values(sim);
+            let k = "Party.Members.0";
+            (
+                v[&format!("{k}.CurrentActionIcon")].clone(),
+                v[&format!("{k}.PendingActionIcon")].clone(),
+            )
+        };
+        let str = |v: &str| UiValue::String(v.into());
+        assert_eq!(icons(&sim), (str(""), str("")));
+        sim.world.get_mut(hero).unwrap().commands = vec![cmd(1, vec![]), cmd(25, vec![3024])];
+        assert_eq!(icons(&sim), (str("ic_attack"), str("tlt_ico_overrun")));
+        // A command the table does not show (waiting) shows nothing.
+        sim.world.get_mut(hero).unwrap().commands = vec![cmd(13, vec![])];
+        assert_eq!(icons(&sim), (str(""), str("")));
     }
 
     #[test]
