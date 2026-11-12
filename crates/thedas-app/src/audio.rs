@@ -171,6 +171,9 @@ struct AreaPlay {
     resref: String,
     theme: Option<String>,
     track: Option<(&'static str, EventHandle)>,
+    /// A change of track waiting for its moment: the track wanted, when to change (seconds
+    /// into the playing track), where that track was last frame, and seconds waited.
+    switch: Option<(&'static str, f64, f64, f32)>,
     sounds: Vec<AreaSound>,
     /// Per sound: playing (`Some(Some)`), played through while in reach (`Some(None)`: it
     /// plays again once the listener has left and come back), or not started.
@@ -1108,6 +1111,7 @@ impl GameAudio {
             resref: resref.to_string(),
             theme,
             track: None,
+            switch: None,
             sounds,
             playing: vec![None; n],
             reverb,
@@ -1146,7 +1150,7 @@ impl GameAudio {
     /// markers in the original; `sound_settings.gda` "max time between markers"), the
     /// stinger choice, cutscenes and conversations leaving the music alone, and scripts'
     /// `PlayMusic`/`SetMusicIntensity` (ignored).
-    fn follow_area(&mut self, state: &AudioState) {
+    fn follow_area(&mut self, state: &AudioState, dt: f32) {
         if state.area.is_none() {
             self.end_area();
             return;
@@ -1162,7 +1166,37 @@ impl GameAudio {
             } else {
                 "main"
             };
-            if a.track.map(|t| t.0) != Some(want) {
+            // A change waits for the playing track's next marker (DAOrigins.exe 0x5c4b10, states
+            // 4 and 5): the first sync point more than 0.4 s ahead (0x190 ms) and less than
+            // 15 s ahead (0x3a98 ms), else 0.4 s on. The first track of an area starts at once.
+            let mut now = a.track.is_none();
+            match a.track {
+                Some((playing, _)) if playing == want => a.switch = None,
+                Some((_, h)) => match (a.switch, self.engine.position(h)) {
+                    (Some((w, at, last, waited)), Some((pos, _))) if w == want => {
+                        // Due, past the end of a loop, or waited past the longest wait.
+                        if pos >= at || pos + 0.001 < last || waited > 15.5 {
+                            now = true;
+                        } else {
+                            a.switch = Some((w, at, pos, waited + dt));
+                        }
+                    }
+                    (_, Some((pos, markers))) => {
+                        let at = markers
+                            .iter()
+                            .copied()
+                            .find(|m| *m > pos + 0.4 && *m - pos < 15.0)
+                            .unwrap_or(pos + 0.4);
+                        log::debug!("audio: music to {want} at {at:.2} s (now {pos:.2} s)");
+                        a.switch = Some((want, at, pos, 0.0));
+                    }
+                    // Not playing a sample yet: change at once.
+                    (_, None) => now = true,
+                },
+                None => {}
+            }
+            if now && a.track.map(|t| t.0) != Some(want) {
+                a.switch = None;
                 let from = a.track.map(|t| t.0);
                 if let Some((_, h)) = a.track.take() {
                     self.engine.stop(h, false);
@@ -1479,7 +1513,7 @@ impl GameAudio {
                     .set_parameter(h, "music_state", self.music_state);
             }
         }
-        self.follow_area(&state);
+        self.follow_area(&state, dt);
         self.follow_cutscene(state.cutscene.clone());
         // Voice-over.
         if self.voice.as_ref().map(|v| &v.0) != state.line.as_ref() {

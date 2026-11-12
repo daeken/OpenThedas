@@ -172,6 +172,19 @@ impl Library {
         (s.frequency > 0).then(|| s.length as f64 / s.frequency as f64)
     }
 
+    /// Sample `index` of bank `bank`'s sync points (music markers) in seconds, from its
+    /// header.
+    pub fn sync_points(&self, bank: &str, index: usize) -> Vec<f64> {
+        let Some(b) = self.bank(bank) else {
+            return Vec::new();
+        };
+        let Some(s) = b.fsb.samples.get(index) else {
+            return Vec::new();
+        };
+        let rate = s.frequency.max(1) as f64;
+        s.sync_points.iter().map(|&f| f as f64 / rate).collect()
+    }
+
     /// Sample `index` of bank `bank`, decoded (cached).
     pub fn sample(&self, bank: &str, index: usize) -> Option<Arc<Pcm>> {
         let ck = (key(bank), index);

@@ -136,6 +136,12 @@ impl Mixer {
         self.voices.iter().any(|v| v.id == id)
     }
 
+    /// How far into its sample a voice is, in seconds.
+    pub fn position(&self, id: VoiceId) -> Option<f64> {
+        let v = self.voices.iter().find(|v| v.id == id)?;
+        Some(v.pos / v.pcm.rate.max(1) as f64)
+    }
+
     pub fn active(&self) -> usize {
         self.voices.len()
     }

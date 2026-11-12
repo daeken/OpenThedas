@@ -418,7 +418,7 @@ pub fn fsb(path: &Path, wav_dir: Option<&Path>, only: &[String], check: bool) ->
             if s.sync_points.is_empty() {
                 String::new()
             } else {
-                format!(" sync {}", s.sync_points.len())
+                format!(" sync {} {:?}", s.sync_points.len(), s.sync_points)
             }
         );
         if let Some(dir) = wav_dir {
