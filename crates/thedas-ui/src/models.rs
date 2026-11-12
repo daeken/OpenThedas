@@ -714,6 +714,8 @@ struct DrawnKey {
     head_morph: Option<String>,
     /// Character creation's creature wears a face of its own (see [`head_morph`]).
     in_chargen: bool,
+    /// Weapons are drawn in combat and sheathed out of it (their attachment nodes).
+    in_combat: bool,
     equipment: Vec<(i32, ObjectId, Option<i32>, Option<i32>)>,
 }
 
@@ -728,6 +730,7 @@ impl DrawnKey {
             // With the choices made over it (character creation's hair, beard, colours).
             head_morph: sim.face_name(o.id).or_else(|| o.head_morph.clone()),
             in_chargen: sim.world.chargen == Some(o.id),
+            in_combat: o.combat.in_combat,
             equipment: o
                 .equipment
                 .iter()
@@ -928,6 +931,23 @@ mod tests {
         assert_eq!(style(Some(great), None), Some("tw"));
         assert_eq!(style(Some(bow), None), Some("bow"));
         assert_eq!(style(None, None), None);
+    }
+
+    #[test]
+    fn a_creatures_look_is_redrawn_as_combat_and_character_creation_change_it() {
+        use std::sync::Arc;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let table = Arc::new(EngineTable::parse(b"int X = 0;\n".as_slice()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let key = |s: &Sim| DrawnKey::of(s, s.world.get(c).unwrap());
+        let calm = key(&s);
+        s.world.get_mut(c).unwrap().combat.in_combat = true;
+        let fighting = key(&s);
+        assert!(calm != fighting);
+        s.world.chargen = Some(c);
+        assert!(key(&s) != fighting);
     }
 
     #[test]
