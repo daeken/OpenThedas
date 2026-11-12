@@ -1,9 +1,10 @@
 //! `thedas-app`: play Dragon Age: Origins, or walk through an area.
 //!
-//! With only `--install`, the game boots to its start menu (startmenu2.gfx: New Game, Load,
+//! With only `--install`, the game boots as the original does: the EA logo and intro movies
+//! (decoded by `ffmpeg`, silent for now; a key, a click or the pad's A, B or Start skips
+//! one; `--no-intro` skips them), then its start menu (startmenu2.gfx: New Game, Load,
 //! Options, Quit); in a game Escape (or the pad's Start) opens the game menu (mainmenu.gfx),
-//! whose Exit Game returns to the start menu. Provisional: the logo and intro movies the
-//! original plays first are skipped (no Bink playback yet).
+//! whose Exit Game returns to the start menu.
 //!
 //! The viewer (`--viewer`, or `--area`/`--camera`): WASD to move, Q/E (or C) down/up, Shift to move faster, hold the right
 //! mouse button (or use the arrow keys) to look around, P to print the camera (when not
@@ -44,6 +45,7 @@
 
 mod control;
 mod follow;
+mod intro;
 mod live;
 mod pad;
 mod paddev;
@@ -191,6 +193,9 @@ struct Args {
     /// print their events for this many seconds, then exit. No window, no install needed.
     #[arg(long)]
     pad_probe: Option<f64>,
+    /// Booting to the start menu: skip the logo and intro movies the game plays first.
+    #[arg(long)]
+    no_intro: bool,
 }
 
 /// Behind and above a hero at `pos` with the game's `facing`, looking the same way (as the
@@ -516,6 +521,10 @@ struct App {
     quit: bool,
     /// What the menus asked this frame, acted on once it is done.
     requests: Vec<ui::FrontEnd>,
+    /// The boot movies, while they play (before the start menu takes input).
+    intro: Option<intro::Intro>,
+    /// The pad's skip buttons were held last frame (a skip is a fresh press).
+    intro_pad_held: bool,
 }
 
 /// What the window's surface gave a redraw.
@@ -852,7 +861,71 @@ impl App {
         self.camera.look(yaw * turn, pitch * turn);
     }
 
+    /// A frame of the boot movies: only the movie is drawn, and only a key, a click or the
+    /// pad's A, B or Start does anything (it skips the movie playing). The start menu waits
+    /// behind them.
+    fn intro_frame(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let dt = (now - self.last).as_secs_f64() * 1000.0;
+        self.last = now;
+        let state = self.pads.as_mut().map(|p| p.poll()).unwrap_or_default();
+        let held = [pad::Button::A, pad::Button::B, pad::Button::Start]
+            .iter()
+            .any(|&b| state.held(b));
+        let pressed = held && !self.intro_pad_held;
+        self.intro_pad_held = held;
+        let Some(intro) = self.intro.as_mut() else {
+            return Ok(());
+        };
+        if pressed {
+            intro.skip();
+        }
+        if !intro.advance(dt) {
+            self.intro = None;
+            // The start menu's clock starts now, not at boot.
+            self.last = Instant::now();
+            return Ok(());
+        }
+        let Some(g) = self.gfx.as_mut() else {
+            return Ok(());
+        };
+        let frame = match g.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                g.surface.configure(&g.ctx.device, &g.config);
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = g
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("intro"),
+            });
+        let size = (g.config.width, g.config.height);
+        intro.draw(
+            &g.ctx.device,
+            &g.ctx.queue,
+            &mut encoder,
+            &view,
+            g.config.format,
+            size,
+        );
+        g.ctx.queue.submit([encoder.finish()]);
+        g.window.pre_present_notify();
+        g.ctx.queue.present(frame);
+        Ok(())
+    }
+
     fn redraw(&mut self) -> Result<()> {
+        if self.intro.is_some() {
+            return self.intro_frame();
+        }
         let dt = self.last.elapsed().as_secs_f64() * 1000.0;
         self.serve_control(dt);
         self.pad_frame(dt);
@@ -1835,6 +1908,20 @@ impl ApplicationHandler for App {
                     }
                 }
             }
+            WindowEvent::KeyboardInput { event, .. } if self.intro.is_some() => {
+                if event.state == ElementState::Pressed && !event.repeat {
+                    if let Some(i) = self.intro.as_mut() {
+                        i.skip();
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, .. } if self.intro.is_some() => {
+                if state == ElementState::Pressed {
+                    if let Some(i) = self.intro.as_mut() {
+                        i.skip();
+                    }
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
@@ -2441,10 +2528,10 @@ fn main() -> Result<()> {
     } else if args.viewer || args.ui.is_some() || args.area.is_some() || args.camera.is_some() {
         None
     } else {
-        // As the game boots: the start menu. Provisional: the logo and intro movies that
-        // play before it are not shown yet (no Bink playback).
+        // As the game boots: the logo and intro movies (below), then the start menu.
         Some(live::Start::Menu)
     };
+    let boot = matches!(start, Some(live::Start::Menu));
     let mut live = match start {
         Some(start) => Some(live::Live::open(
             &install,
@@ -2929,6 +3016,11 @@ fn main() -> Result<()> {
         shaders: args.shaders.clone(),
         quit: false,
         requests: Vec::new(),
+        // Clients driving the window (`--control`) get the start menu at once.
+        intro: (boot && !args.no_intro && args.control.is_none())
+            .then(|| intro::Intro::boot(&install))
+            .flatten(),
+        intro_pad_held: false,
     };
     for line in pad::describe() {
         log::debug!("pad binding: {line}");
@@ -2942,6 +3034,58 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Against a real install (`THEDAS_INSTALL`) and `ffmpeg`, offscreen: the EA logo's frame
+    /// two seconds in is drawn letterboxed in a taller window (written to `$INTRO_PNG` when
+    /// set, to look at).
+    #[test]
+    #[ignore]
+    fn the_intro_draws_its_frame_letterboxed() {
+        let install = PathBuf::from(std::env::var_os("THEDAS_INSTALL").expect("THEDAS_INSTALL"));
+        let mut intro = intro::Intro::boot(&install).expect("ffmpeg and the movies");
+        let ctx = GpuContext::headless().unwrap();
+        let (w, h) = (1280, 960);
+        let format = wgpu::TextureFormat::Bgra8Unorm;
+        let tex = ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+        let mut ms = 0.0;
+        while ms < 2000.0 {
+            assert!(intro.advance(1000.0 / 30.0));
+            ms += 1000.0 / 30.0;
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut encoder = ctx.device.create_command_encoder(&Default::default());
+        intro.draw(&ctx.device, &ctx.queue, &mut encoder, &view, format, (w, h));
+        let readback = read_frame(&ctx, &mut encoder, &tex);
+        ctx.queue.submit([encoder.finish()]);
+        let frame = finish_read_frame(&ctx, readback, format).unwrap();
+        if let Some(out) = std::env::var_os("INTRO_PNG") {
+            write_png(Path::new(&out), w, h, &frame.pixels).unwrap();
+        }
+        let px = |x: u32, y: u32| &frame.pixels[((y * w + x) * 4) as usize..][..3];
+        // 1280x720 in 1280x960: black bars of 120 above and below.
+        assert_eq!(px(640, 10), [0, 0, 0]);
+        assert_eq!(px(640, 950), [0, 0, 0]);
+        let lit = (120..840)
+            .step_by(8)
+            .flat_map(|y| (0..w).step_by(8).map(move |x| (x, y)))
+            .filter(|&(x, y)| px(x, y).iter().any(|&c| c > 16))
+            .count();
+        assert!(lit > 0, "the movie's frame is all black");
+    }
+
     #[test]
     fn a_frame_without_a_surface_still_runs_the_game() {
         // Drawn and presented only with a frame; never reconfigured unless stale.
