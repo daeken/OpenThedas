@@ -148,6 +148,12 @@ enum Command {
         /// no script does it).
         #[arg(long)]
         pool_xp: bool,
+        /// Before each run, ready the party as a player would before a fight, through the
+        /// game's own developer scripts: remove injuries (`injury remparty`), bring every
+        /// member up to the area's minimum level (`areadata.gda` MinLevel; `addxp`, then the
+        /// auto-level tables) and heal (`healplayer`). Harness only.
+        #[arg(long)]
+        prepare: bool,
         /// End a run ("won") once this many fights are won (every hostile seen in it is down).
         #[arg(long, default_value_t = 0)]
         fights: u32,
@@ -318,6 +324,7 @@ fn run() -> Result<()> {
             approach,
             activity,
             pool_xp,
+            prepare,
             fights,
             trace,
             coverage,
@@ -342,6 +349,7 @@ fn run() -> Result<()> {
             approach: approach.as_deref(),
             activity,
             pool_xp,
+            prepare,
             fights,
             trace_to: trace.as_deref(),
             coverage_to: coverage.as_deref(),
