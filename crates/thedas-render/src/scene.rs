@@ -15,7 +15,9 @@ use thedas_formats::morph::{
     FaceOverlay, Morph, MorphNode, MorphPreset, TargetMesh, blend_targets, slot as morph_slot,
 };
 use thedas_formats::probe::IrradianceProbe;
-use thedas_formats::speedtree_gen::mesh::{LeafCard, MeshVertex, Part, TreeMesh};
+use thedas_formats::speedtree_gen::mesh::{
+    LeafCard, LeafMeshTemplate, MeshLeaf, MeshVertex, Part, TreeMesh,
+};
 use thedas_formats::tint::Tint;
 use thedas_formats::{Arl, Mmh, Rml};
 
@@ -759,6 +761,10 @@ impl<'a> Loader<'a> {
                         format!(
                             r#"<MaterialObject Name="spt_leafcards"><Material Name="SPT_LeafCards.mat"/><DefaultSemantic Name="default"/><Texture Name="smpDiffuseMap" ResName="{texture}"/></MaterialObject>"#
                         )
+                    } else if semantic == "spt_leafmesh" {
+                        format!(
+                            r#"<MaterialObject Name="spt_leafmesh"><Material Name="SPT_LeafMesh.mat"/><DefaultSemantic Name="default"/><Texture Name="smpDiffuseMap" ResName="{texture}"/></MaterialObject>"#
+                        )
                     } else if semantic == "spt_fronds" {
                         format!(
                             r#"<MaterialObject Name="spt_fronds"><Material Name="SPT_Fronds.mat"/><DefaultSemantic Name="default"/><Texture Name="smpDiffuseMap" ResName="{texture}"/></MaterialObject>"#
@@ -801,6 +807,7 @@ impl<'a> Loader<'a> {
         let mut spt_parts: HashMap<usize, SptParts> = HashMap::new();
         let leaf_material = material(self, &atlas, "spt_leafcards");
         let frond_material = material(self, &atlas, "spt_fronds");
+        let leaf_mesh_material = material(self, &atlas, "spt_leafmesh");
         for &(tree, placement, scale, color) in spots {
             let built = built_trees.entry(tree).or_insert_with(|| {
                 let name = format!("{}.spt", trees.get(tree)?.to_ascii_lowercase());
@@ -851,6 +858,15 @@ impl<'a> Loader<'a> {
                 {
                     spt.push((self.spt_leaf_cards(&name, cards), m));
                 }
+                if let Some(leaves) = mesh.mesh_leaves.first()
+                    && !leaves.is_empty()
+                    && let Some(m) = leaf_mesh_material
+                {
+                    spt.push((
+                        self.spt_leaf_meshes(&name, leaves, &mesh.leaf_mesh_templates),
+                        m,
+                    ));
+                }
                 if !spt.is_empty() {
                     spt_parts.insert(tree, (spt, mesh.leaf_angle_scalars));
                 }
@@ -879,7 +895,8 @@ impl<'a> Loader<'a> {
                     }
                     // Mesh leaves (7.3), already placed in tree space; drawn from both sides
                     // like the cards.
-                    if let Some(lod) = mesh.leaf_meshes.lods.first()
+                    if leaf_mesh_material.is_none()
+                        && let Some(lod) = mesh.leaf_meshes.lods.first()
                         && !lod.is_empty()
                     {
                         let indices = both_sides(lod);
@@ -1203,6 +1220,98 @@ impl<'a> Loader<'a> {
             },
             vertices,
             indices: indices.to_vec(),
+            raw_vertices: raw,
+            positions: None,
+        });
+        self.scene.meshes.len() - 1
+    }
+
+    /// A tree's mesh leaves as the game packs them for `SPT_LeafMeshes`
+    /// (speedtree-exe-trace §4; docs/speedtree 7.3): each leaf's copy of its choice's mesh,
+    /// with POSITION and NORMAL the mesh vertex's, TEXCOORD0–2 the leaf's tangent, binormal
+    /// and normal as three rows, TEXCOORD3 the leaf's position, TEXCOORD4 (u, v, leaf-angle
+    /// index, colour scale) and TEXCOORD5 the wind. The shader rocks, turns and places it.
+    fn spt_leaf_meshes(
+        &mut self,
+        name: &str,
+        leaves: &[MeshLeaf],
+        templates: &[Option<LeafMeshTemplate>],
+    ) -> usize {
+        use thedas_formats::mesh::{DeclType, VertexElement};
+        const STRIDE: u32 = 128;
+        let mut raw: Vec<u8> = Vec::new();
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        for leaf in leaves {
+            let Some(template) = templates.get(leaf.choice).and_then(|t| t.as_ref()) else {
+                continue;
+            };
+            let base = vertices.len() as u32;
+            let (a, b, c) = (leaf.tangent, leaf.binormal, leaf.normal);
+            let p = leaf.position;
+            for v in &template.vertices {
+                let attrs: [[f32; 4]; 8] = [
+                    [v.position[0], v.position[1], v.position[2], 1.0],
+                    [v.normal[0], v.normal[1], v.normal[2], 1.0],
+                    [a[0], b[0], c[0], 1.0],
+                    [a[1], b[1], c[1], 1.0],
+                    [a[2], b[2], c[2], 1.0],
+                    [p[0], p[1], p[2], 1.0],
+                    [v.uv[0], v.uv[1], leaf.angle_index as f32, leaf.color_scale],
+                    [
+                        leaf.wind.matrices[0] as f32,
+                        leaf.wind.weights[0],
+                        leaf.wind.matrices[1] as f32,
+                        leaf.wind.weights[1],
+                    ],
+                ];
+                for attr in attrs {
+                    raw.extend_from_slice(bytemuck::cast_slice(&attr));
+                }
+                // For the bounds: the leaf's position stands in for the placed vertex.
+                vertices.push(Vertex {
+                    position: p,
+                    normal: c,
+                    uv0: v.uv,
+                    uv1: [0.0, 0.0],
+                });
+            }
+            indices.extend(template.indices.iter().map(|i| base + i));
+        }
+        let element = |offset: u32, usage: DeclUsage, usage_index: u32| VertexElement {
+            stream: 0,
+            offset,
+            ty: DeclType::Float4,
+            usage,
+            usage_index,
+        };
+        let key = format!("{name}:spt_leafmeshes");
+        self.scene.meshes.push(SceneMesh {
+            key: key.clone(),
+            chunk: MeshChunk {
+                name: key,
+                vertex_size: STRIDE,
+                vertex_count: vertices.len() as u32,
+                index_count: indices.len() as u32,
+                primitive: 0,
+                index_format: thedas_formats::mesh::IndexFormat::U32,
+                base_vertex: 0,
+                vertex_offset: 0,
+                start_index: 0,
+                elements: vec![
+                    element(0, DeclUsage::Position, 0),
+                    element(16, DeclUsage::Normal, 0),
+                    element(32, DeclUsage::TexCoord, 0),
+                    element(48, DeclUsage::TexCoord, 1),
+                    element(64, DeclUsage::TexCoord, 2),
+                    element(80, DeclUsage::TexCoord, 3),
+                    element(96, DeclUsage::TexCoord, 4),
+                    element(112, DeclUsage::TexCoord, 5),
+                ],
+                bounds: None,
+            },
+            vertices,
+            indices,
             raw_vertices: raw,
             positions: None,
         });
