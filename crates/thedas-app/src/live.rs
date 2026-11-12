@@ -213,6 +213,9 @@ pub struct Live {
     /// The area (its resource) whose world was last shown, for the loading screen a change
     /// of area gets (see [`Live::area_change_screen`]).
     shown_area: Option<String>,
+    /// A journey on the world map is under way, latched until its area has loaded (see
+    /// [`Live::travel_load`]).
+    travel: bool,
 }
 
 /// A level, or a level's objects, being built on a worker thread. While one is under way
@@ -257,6 +260,13 @@ fn share(ctx: &GpuContext) -> GpuContext {
         queue: ctx.queue.clone(),
         bc: ctx.bc,
     }
+}
+
+/// Whether a world map journey is under way (see [`Live::travel_load`]): from the pin
+/// clicked until arrival, but not while stopped at a random encounter.
+fn journey(sim: &Sim) -> bool {
+    let wm = &sim.world.world_map;
+    (wm.travelling_to.is_some() || wm.arriving) && !wm.encounter
 }
 
 /// The area the party is in (its resource).
@@ -449,6 +459,7 @@ impl Live {
             failed_layout: None,
             held: false,
             shown_area: None,
+            travel: false,
             owed_ms: 0.0,
             frame_effects: true,
             detail: Default::default(),
@@ -554,6 +565,23 @@ impl Live {
         let from = self.shown_area.as_deref().and_then(|a| area_list(&sim, a));
         let to = now.as_deref().and_then(|a| area_list(&sim, a));
         load_screen_for(from.as_deref(), to.as_deref())
+    }
+
+    /// Whether the load under way (or about to start) is a world map journey's: from the pin
+    /// clicked (`WorldMapState::travelling_to`) or the travel transition asked for
+    /// (`arriving`) until the new area's world is up, not while stopped at a random
+    /// encounter. The exe keeps the world map up as that load's screen (GUI 16, 0x6c6060)
+    /// rather than load_town or load_light. Only with [`Live::async_loads`].
+    pub fn travel_load(&self) -> bool {
+        self.async_loads && self.travel
+    }
+
+    /// Latches [`Live::travel_load`]: set while the simulation says a journey is under way;
+    /// it holds through the load that ends it, until the new area's world is shown.
+    fn note_travel(&mut self, sim: &Sim) {
+        if journey(sim) {
+            self.travel = true;
+        }
     }
 
     /// The loading screen up now: a pending transition's, else the load under way's.
@@ -1181,6 +1209,7 @@ impl Live {
         self.format = Some(format);
         let shared = self.sim.clone();
         let mut sim = shared.lock().unwrap_or_else(|p| p.into_inner());
+        self.note_travel(&sim);
         // Character creation shows its creature on its own stage, not in the area.
         let staged = match crate::chargen_stage::subject(&sim) {
             Some(id) => {
@@ -1290,8 +1319,15 @@ impl Live {
         }
         // The world shown now is this area's (see `Live::area_change_screen`).
         if !self.loading() && self.level.is_some() && self.objects.is_some() {
-            let shown = current_area(&self.sim());
+            let (shown, travelling) = {
+                let sim = self.sim();
+                (current_area(&sim), journey(&sim))
+            };
             self.shown_area = shown;
+            // The journey's area is up: the world map's part as its loading screen is over.
+            if !travelling {
+                self.travel = false;
+            }
         }
         let (Some(level), Some(objects)) = (self.level.as_ref(), self.objects.as_mut()) else {
             return Ok(());

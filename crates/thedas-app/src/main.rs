@@ -1081,8 +1081,9 @@ impl App {
             });
         let stopped = self.screens.as_ref().is_some_and(|s| s.world_stopped());
         if let Some(live) = self.live.as_mut() {
-            // A pending transition runs on behind the loading screen, which stops the world.
-            if !stopped || live.transition_pending() {
+            // A pending transition, or a world map journey, runs on behind its loading screen
+            // (which stops the world otherwise).
+            if !stopped || live.transition_pending() || live.travel_load() {
                 live.step(dt);
             }
             // While a level loads the world holds still: its presentation too.
@@ -1225,8 +1226,9 @@ impl App {
         };
         let stopped = self.screens.as_ref().is_some_and(|s| s.world_stopped());
         if let Some(live) = self.live.as_mut() {
-            // A pending transition runs on behind the loading screen, which stops the world.
-            if !stopped || live.transition_pending() {
+            // A pending transition, or a world map journey, runs on behind its loading screen
+            // (which stops the world otherwise).
+            if !stopped || live.transition_pending() || live.travel_load() {
                 live.step(dt);
             }
             // While a level loads the world holds still: its presentation too.
@@ -1644,6 +1646,15 @@ impl App {
             }
             &Step::ZoomKey(dir) => {
                 self.zoom_key = dir;
+            }
+            Step::Travel(tag) => {
+                if let Some(l) = self.live.as_ref() {
+                    let ok = travel_to_pin(&mut l.sim(), tag);
+                    log.push(format!(
+                        "travel {tag}: {}",
+                        if ok { "set out" } else { "no such active pin" }
+                    ));
+                }
             }
             Step::Transition(area, waypoint) => {
                 if let Some(l) = self.live.as_ref() {
@@ -2912,16 +2923,26 @@ impl padplay::Host for HeadlessHost<'_> {
 /// the world map is open (travelling) the map itself stays up instead, as in the exe.
 /// Provisional: load_town.gfx for every load; the exe shows load_light.gfx for an area
 /// change within the same area list, which the app does not tell apart yet.
+/// Sets out on the world map to the map pin tagged `tag` (see [`Step::Travel`]).
+fn travel_to_pin(sim: &mut thedas_sim::Sim, tag: &str) -> bool {
+    let pin = sim
+        .world
+        .objects
+        .values()
+        .find(|o| {
+            o.kind == thedas_sim::world::ObjectKind::MapPin && o.tag.eq_ignore_ascii_case(tag)
+        })
+        .map(|o| o.id);
+    pin.is_some_and(|p| sim.begin_travel(p))
+}
+
 fn loading_screen(live: &live::Live, ui: &mut ui::UiLayer, up: &mut bool) {
-    // Travelling on the world map: the map stays up as the loading screen (the simulation
-    // closes it to input when travel starts), but not during a random encounter's stop.
-    // Provisional: until the app's own travel-load state says when (it also covers the
-    // arrival's load).
-    {
-        let sim = live.sim();
-        let wm = &sim.world.world_map;
-        ui.hold_world_map((wm.travelling_to.is_some() || wm.arriving) && !wm.encounter);
-    }
+    // Travelling on the world map: the map stays up as that load's screen (GUI 16 in the
+    // exe, 0x6c6060; the simulation closes it to input when travel starts), from the pin
+    // clicked until the new area's world is up, but not during a random encounter's stop
+    // (see `Live::travel_load`).
+    let travelling = live.travel_load();
+    ui.hold_world_map(travelling);
     // THEDAS_NO_LOAD_MOVIE: no loading movie; a load shows the interface over black.
     if std::env::var_os("THEDAS_NO_LOAD_MOVIE").is_some() {
         return;
@@ -2930,7 +2951,8 @@ fn loading_screen(live: &live::Live, ui: &mut ui::UiLayer, up: &mut bool) {
     match (live.loading() || pending.is_some(), *up) {
         (true, false) => {
             let sim = live.sim();
-            if sim.world.world_map.open {
+            // The world map is the journey's loading screen: no loading movie over it.
+            if sim.world.world_map.open || travelling {
                 return;
             }
             let hint = thedas_ui::binding::load_hint(&sim);
@@ -3015,6 +3037,9 @@ enum Step {
     /// `transition AREA WAYPOINT`: the party moves to another area as a script's
     /// `DoAreaTransition` moves it (taken when the current scripts finish).
     Transition(String, String),
+    /// `travel PIN`: the party sets out on the world map to the pin with that tag, as
+    /// clicking it does (`Sim::begin_travel`).
+    Travel(String),
     /// `key pagedown MS` / `key pageup MS`: the zoom keys held (+1 in, -1 out, 0 let go).
     ZoomKey(f32),
     /// A floating message over the controlled creature, as a script's
@@ -3176,6 +3201,8 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
                 ms.trim().parse().context("a held key takes milliseconds")?,
             ));
             out.push(Step::ZoomKey(0.0));
+        } else if verb == "travel" && !arg.trim().is_empty() {
+            out.push(Step::Travel(arg.trim().to_string()));
         } else if verb == "transition" {
             let (area, waypoint) = arg
                 .trim()
@@ -3557,6 +3584,7 @@ fn main() -> Result<()> {
                             }
                             if !played.as_ref().is_some_and(|(_, s)| s.world_stopped())
                                 || l.transition_pending()
+                                || l.travel_load()
                             {
                                 l.step(dt);
                             }
@@ -3694,6 +3722,13 @@ fn main() -> Result<()> {
                         println!("option {k} = {v}");
                     }
                     &Step::ZoomKey(dir) => zoom_key = dir,
+                    Step::Travel(tag) => {
+                        let ok = travel_to_pin(&mut l.sim(), tag);
+                        println!(
+                            "travel {tag}: {}",
+                            if ok { "set out" } else { "no such active pin" }
+                        );
+                    }
                     Step::Transition(area, waypoint) => {
                         // As a script's DoAreaTransition does: performed at the start of the next
                         // update (`TRANSITION_DELAY_MS`).
