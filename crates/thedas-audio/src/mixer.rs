@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use crate::decode::Pcm;
 
-/// The volume groups the options screen controls. DA:O's `audio_categories.fev` nests finer
-/// categories under these; until it is read, a voice names the group directly.
+/// The volume groups the options screen controls. An event's category (from
+/// `audio_categories.fev`, which the engine reads for category volumes and ducking) picks its
+/// group by name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Bus {
     Music,
@@ -133,6 +134,12 @@ impl Mixer {
 
     pub fn is_playing(&self, id: VoiceId) -> bool {
         self.voices.iter().any(|v| v.id == id)
+    }
+
+    /// How far into its sample a voice is, in seconds.
+    pub fn position(&self, id: VoiceId) -> Option<f64> {
+        let v = self.voices.iter().find(|v| v.id == id)?;
+        Some(v.pos / v.pcm.rate.max(1) as f64)
     }
 
     pub fn active(&self) -> usize {
@@ -310,6 +317,17 @@ mod tests {
             channels: ch,
             samples,
         })
+    }
+
+    #[test]
+    fn voices_report_their_position() {
+        let mut m = Mixer::new(100);
+        let id = m.play(pcm(100, 1, vec![0.1; 50]), VoiceParams::default());
+        assert_eq!(m.position(id), Some(0.0));
+        let mut out = vec![0.0; 2 * 25];
+        m.render(&mut out);
+        assert_eq!(m.position(id), Some(0.25));
+        assert_eq!(m.position(VoiceId(999)), None);
     }
 
     #[test]
