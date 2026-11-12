@@ -153,7 +153,7 @@ pub fn check(install: &Path, language: &str) -> Result<()> {
         let n = n.trim().to_ascii_lowercase();
         n.is_empty() || n == "force_generic" || presets.contains(&n)
     };
-    let (mut reverbs, mut triggers) = (0usize, 0usize);
+    let (mut reverbs, mut triggers, mut music_volumes) = (0usize, 0usize, 0usize);
     for name in vfs.names() {
         if !name.to_ascii_lowercase().ends_with(".are") {
             continue;
@@ -180,6 +180,7 @@ pub fn check(install: &Path, language: &str) -> Result<()> {
             reverbs += 1;
         }
         triggers += r.triggers.len();
+        music_volumes += r.music.len();
         for p in std::iter::once(&r.preset).chain(r.triggers.iter().map(|t| &t.preset)) {
             if !preset_ok(p) {
                 missing.push(format!("{name}: reverb preset {p:?}"));
@@ -188,7 +189,7 @@ pub fn check(install: &Path, language: &str) -> Result<()> {
     }
     println!(
         "{areas} areas, {themes} with music, {placed} placed sounds, {reverbs} with a reverb \
-         preset, {triggers} reverb triggers, {} unresolved",
+         preset, {triggers} reverb triggers, {music_volumes} music volumes, {} unresolved",
         missing.len() - cut_missing
     );
     for m in missing.iter() {

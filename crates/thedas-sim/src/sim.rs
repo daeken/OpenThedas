@@ -1249,6 +1249,30 @@ impl Sim {
     /// The player answers the open message box: `EVENT_TYPE_POPUP_RESULT` to its owner (the
     /// module when it has none), object 0 the owner, integers the popup's kind and the
     /// button pressed (1 for the first). Returns false when no popup is open.
+    /// `EVENT_TYPE_USE` from `user` for `placeable`: integer 0 says whether the user stands
+    /// in front of it, as DAOrigins.exe's use handler sets it (0x7a7a96: the placeable's
+    /// forward vector against the direction to the user, >= 0; +X when they stand at the
+    /// same spot).
+    pub fn use_event(&self, user: ObjectId, placeable: ObjectId) -> Event {
+        let mut ev = self.new_event("USE", Some(user));
+        let front = match (self.world.get(placeable), self.world.get(user)) {
+            (Some(p), Some(u)) => {
+                let h = crate::world::heading_of(p.facing).to_radians();
+                let (dx, dy) = (u.position[0] - p.position[0], u.position[1] - p.position[1]);
+                let len = (dx * dx + dy * dy).sqrt();
+                let (dx, dy) = if len > 1e-6 {
+                    (dx / len, dy / len)
+                } else {
+                    (1.0, 0.0)
+                };
+                h.cos() * dx + h.sin() * dy >= 0.0
+            }
+            _ => false,
+        };
+        ev.ints = vec![front as i32];
+        ev
+    }
+
     pub fn answer_popup(&mut self, button: i32) -> bool {
         self.answer_popup_with_text(button, "")
     }
@@ -2878,7 +2902,7 @@ impl Sim {
         } else if cmd.name == "CommandUseObject" {
             // Using a placeable (a door, a lever) sends it EVENT_TYPE_USE, as clicking it does.
             if let Some(t) = cmd.target.filter(|&t| self.world.get(t).is_some()) {
-                let ev = self.new_event("USE", Some(id));
+                let ev = self.use_event(id, t);
                 self.deliver(t, ev, None);
             }
         }
