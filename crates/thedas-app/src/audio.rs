@@ -47,6 +47,9 @@ pub struct AudioState {
     /// Each drawn creature's animation now: id, `.ani` resource, seconds into it, its
     /// length, position (see `Live::animation_clocks`).
     pub animations: Vec<(u32, String, f32, f32, [f32; 3])>,
+    /// Attacks' blows: (target position, result, attacker's weapon, target's armour and
+    /// shield base items).
+    pub impacts: Vec<([f32; 3], i32, Option<i32>, Option<i32>, Option<i32>)>,
     /// Events scripts played (`PlaySound`), with where the object stands (none: 2D).
     pub script_sounds: Vec<(String, Option<[f32; 3]>)>,
     /// A boot movie playing (its file) and how far it has played (milliseconds): its own
@@ -149,6 +152,9 @@ pub struct GameAudio {
     /// `sound_movement_footsteps.gda` row 0 (no surface known): the humanoid and dog
     /// footstep events.
     footsteps: (Option<String>, Option<String>),
+    /// Weapon impacts: each base item's sound material (`BITM_base.gda`), and each weapon
+    /// material's impact events (`sound_weapon_hits.gda`).
+    impacts: Impacts,
     last: Instant,
 }
 
@@ -176,6 +182,102 @@ fn footstep_events(vfs: &Vfs) -> (Option<String>, Option<String>) {
         .collect();
     let find = |part: &str| events.iter().find(|e| e.contains(part)).cloned();
     (find("/humanoid/small/"), find("/dog/"))
+}
+
+/// What an attack's blow sounds like.
+///
+/// `BITM_base.gda`'s column 0x7e0505a1 gives each base item a sound material
+/// (`sound_item_materials.gda`: 1 sword, 2 axe, 3 blunt, 4 dagger, 5/6 wood/steel shield,
+/// 7 staff, 8 bow, 9 crossbow, 10-13 leather/cloth/chain/metal armour, ...); found by its
+/// values (every weapon kind matches), the column's name is not known. A blow plays
+/// `sound_weapon_hits.gda`'s event for the weapon's material (bare hands without one) and
+/// what it struck: the target's armour (flesh without), its shield when blocked (wood or
+/// metal). Misses play nothing here: the swing's whoosh is the animation's own event.
+/// Provisional: creatures' hides (fur, scale, bone, stone) are taken as flesh.
+#[derive(Default)]
+struct Impacts {
+    materials: std::collections::HashMap<i64, i64>,
+    hits: std::collections::HashMap<i64, Vec<String>>,
+}
+
+const COL_SOUND_MATERIAL: u32 = 0x7e05_05a1;
+const BARE_HANDS: i64 = 19;
+
+impl Impacts {
+    fn read(vfs: &Vfs) -> Impacts {
+        let table = |name: &str| {
+            vfs.read(name)
+                .ok()
+                .and_then(|(d, _)| thedas_formats::Gda::parse(&d).ok())
+        };
+        let mut out = Impacts::default();
+        if let Some(t) = table("BITM_base.gda")
+            && let Some(col) = t.columns.iter().position(|c| c.hash == COL_SOUND_MATERIAL)
+        {
+            for row in &t.rows {
+                let id = match row.first() {
+                    Some(thedas_formats::gda::Cell::Int(i)) => *i,
+                    _ => continue,
+                };
+                if let Some(thedas_formats::gda::Cell::Int(m)) = row.get(col) {
+                    out.materials.insert(id, *m);
+                }
+            }
+        }
+        if let Some(t) = table("sound_weapon_hits.gda") {
+            for row in &t.rows {
+                let id = match row.first() {
+                    Some(thedas_formats::gda::Cell::Int(i)) => *i,
+                    _ => continue,
+                };
+                let events = row
+                    .iter()
+                    .filter_map(|c| match c {
+                        thedas_formats::gda::Cell::String(s) if s.contains('/') => {
+                            Some(s.trim_end_matches('\0').trim().to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                out.hits.insert(id, events);
+            }
+        }
+        out
+    }
+
+    /// The event a blow plays, if any.
+    fn event(
+        &self,
+        result: i32,
+        weapon: Option<i32>,
+        armour: Option<i32>,
+        shield: Option<i32>,
+    ) -> Option<String> {
+        const HIT: i32 = 1;
+        const CRITICAL: i32 = 2;
+        const DEATHBLOW: i32 = 4;
+        const BLOCKED: i32 = 5;
+        const BACKSTAB: i32 = 9;
+        let material = |b: Option<i32>| b.and_then(|b| self.materials.get(&(b as i64)).copied());
+        let w = material(weapon).filter(|m| self.hits.get(m).is_some_and(|e| !e.is_empty()));
+        let events = self.hits.get(&w.unwrap_or(BARE_HANDS))?;
+        let ending = match result {
+            BLOCKED => match material(shield) {
+                Some(6) => "/impact_materials/metal",
+                Some(_) => "/impact_materials/wood",
+                None => return None,
+            },
+            HIT | CRITICAL | DEATHBLOW | BACKSTAB => match material(armour) {
+                Some(10) => "/impact_armor/leather_arm",
+                Some(11) => "/impact_armor/cloth_arm",
+                Some(12) => "/impact_armor/chain_arm",
+                Some(13) => "/impact_armor/metal_arm",
+                _ => "/impact_armor/flesh",
+            },
+            _ => return None,
+        };
+        events.iter().find(|e| e.ends_with(ending)).cloned()
+    }
 }
 
 /// `sound_gui.gda`: the interface sound ids' events.
@@ -263,6 +365,7 @@ impl GameAudio {
             anim_events: Default::default(),
             anim_clocks: Default::default(),
             footsteps: footstep_events(vfs),
+            impacts: Impacts::read(vfs),
             last: Instant::now(),
         }
     }
@@ -671,6 +774,17 @@ impl GameAudio {
                 None => log::debug!("audio: GUI sound {s:?} has no event"),
             }
         }
+        for (at, result, weapon, armour, shield) in std::mem::take(&mut state.impacts) {
+            if let Some(event) = self.impacts.event(result, weapon, armour, shield) {
+                self.engine.play(
+                    &event,
+                    PlayOptions {
+                        position: Some(at),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
         for (event, position) in std::mem::take(&mut state.script_sounds) {
             if self
                 .engine
@@ -780,5 +894,52 @@ mod tests {
         };
         let v = volumes(opts);
         assert_eq!((v.music, v.sfx, v.dialog), (0.5, 0.0, 1.0));
+    }
+}
+
+#[cfg(test)]
+mod impact_tests {
+    use super::*;
+
+    #[test]
+    fn blows_sound_by_weapon_and_what_they_strike() {
+        let ev = |w: &str, t: &str| format!("glo_fly_wep/weapon_impacts/{w}/{t}");
+        let mut i = Impacts::default();
+        i.materials
+            .extend([(2, 1), (3, 4), (60, 13), (61, 11), (70, 6)]);
+        i.hits.insert(
+            1,
+            vec![
+                ev("sword", "impact_materials/wood"),
+                ev("sword", "impact_materials/metal"),
+                ev("sword", "impact_armor/metal_arm"),
+                ev("sword", "impact_armor/cloth_arm"),
+                ev("sword", "impact_armor/flesh"),
+            ],
+        );
+        i.hits
+            .insert(19, vec![ev("barehand", "impact_armor/flesh")]);
+        assert_eq!(
+            i.event(1, Some(2), Some(60), None),
+            Some(ev("sword", "impact_armor/metal_arm"))
+        );
+        assert_eq!(
+            i.event(2, Some(2), Some(61), None),
+            Some(ev("sword", "impact_armor/cloth_arm"))
+        );
+        assert_eq!(
+            i.event(5, Some(2), None, Some(70)),
+            Some(ev("sword", "impact_materials/metal"))
+        );
+        // No weapon (or one without impacts): bare hands; a miss sounds nothing here.
+        assert_eq!(
+            i.event(1, None, None, None),
+            Some(ev("barehand", "impact_armor/flesh"))
+        );
+        assert_eq!(
+            i.event(1, Some(3), None, None),
+            Some(ev("barehand", "impact_armor/flesh"))
+        );
+        assert_eq!(i.event(3, Some(2), None, None), None);
     }
 }

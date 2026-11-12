@@ -447,6 +447,17 @@ pub enum SoundRequest {
     Music { name: String },
     /// `SetMusicIntensity(nIntensity)`.
     MusicIntensity { intensity: i32 },
+    /// An attack's blow landed or missed (one hand's impact): the attacker, the target,
+    /// the `COMBAT_RESULT_*`, and the base items (`BaseItem`) of the attacker's weapon in
+    /// that hand and of the target's armour (body slot) and off-hand item (a shield).
+    Impact {
+        attacker: ObjectId,
+        target: ObjectId,
+        result: i32,
+        weapon: Option<i32>,
+        armour: Option<i32>,
+        shield: Option<i32>,
+    },
 }
 
 /// Everything a save holds. The trace and the tables are not saved: the trace starts afresh
