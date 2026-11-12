@@ -170,6 +170,7 @@ const PUSH: u8 = 0x96;
 const DEFINE_FUNCTION: u8 = 0x9b;
 const NEW_OBJECT: u8 = 0x40;
 const ADD2: u8 = 0x47;
+const INIT_ARRAY: u8 = 0x42;
 
 enum Push<'a> {
     Str(&'a str),
@@ -482,6 +483,307 @@ fn scale9_set_function() -> Vec<u8> {
         body.push(SET_MEMBER);
     }
     function(&["i", "k", "x", "y", "a", "b"], &body)
+}
+
+/// Text fields showing inline images (`<img src='ico_gold' .../>` in HTML text, which
+/// Scaleform drew and Ruffle leaves out): the coins in money values, rune slots, the
+/// character record's line breaks. `SharedLibrary.TextField.prototype.ProcessText`, which
+/// every `SetText` passes its text through, is wrapped to note a field whose text has one
+/// (its text as `thedas_html`); the host takes them ([`IMG_TAKE`]), lays the images out
+/// over the field and leaves room for them in its text (see `UiMovie::layout_inline_images`).
+pub const IMG_TAKE: &str = "_global.thedas_img_take";
+/// Measures HTML in a field's format: (field, html, wrap) to `[width, height]`.
+pub const IMG_MEASURE: &str = "_global.thedas_img_measure";
+/// Sets a field's HTML text: (field, html).
+pub const IMG_SET: &str = "_global.thedas_img_set";
+/// Places image `n` of a field: (field, n, linkage name or "" to clear, x, y) to the
+/// image's `[width, height]`.
+pub const IMG_PUT: &str = "_global.thedas_img_put";
+
+/// `function (o) { return function (t) { var h = o.apply(this, arguments);
+/// if (h.indexOf("<img") != -1) { this.thedas_html = h; if (_global.thedas_imgtf ==
+/// undefined) _global.thedas_imgtf = new Array(); _global.thedas_imgtf.push(this); }
+/// return h; }; }`: `SharedLibrary.TextField.prototype.ProcessText`'s wrapper (see
+/// [`IMG_TAKE`]).
+fn process_text_wrap_maker() -> Vec<u8> {
+    let mut a = Asm::default();
+    let c = &mut a.code;
+    push(c, &[Push::Str("h")]);
+    get_path(c, &["arguments"]);
+    get_path(c, &["this"]);
+    push(c, &[Push::Int(2)]);
+    get_path(c, &["o"]);
+    push(c, &[Push::Str("apply")]);
+    c.extend_from_slice(&[CALL_METHOD, DEFINE_LOCAL]);
+    push(c, &[Push::Str("<img"), Push::Int(1)]);
+    get_path(c, &["h"]);
+    push(c, &[Push::Str("indexOf")]);
+    c.push(CALL_METHOD);
+    push(c, &[Push::Int(-1)]);
+    c.push(EQUALS2);
+    a.branch(IF, "done");
+    let c = &mut a.code;
+    get_path(c, &["this"]);
+    push(c, &[Push::Str("thedas_html")]);
+    get_path(c, &["h"]);
+    c.push(SET_MEMBER);
+    get_path(c, &["_global", "thedas_imgtf"]);
+    push(c, &[Push::Undefined]);
+    c.extend_from_slice(&[EQUALS2, NOT]);
+    a.branch(IF, "have");
+    let c = &mut a.code;
+    get_path(c, &["_global"]);
+    push(
+        c,
+        &[Push::Str("thedas_imgtf"), Push::Int(0), Push::Str("Array")],
+    );
+    c.extend_from_slice(&[NEW_OBJECT, SET_MEMBER]);
+    a.label("have");
+    let c = &mut a.code;
+    get_path(c, &["this"]);
+    push(c, &[Push::Int(1)]);
+    get_path(c, &["_global", "thedas_imgtf"]);
+    push(c, &[Push::Str("push")]);
+    c.extend_from_slice(&[CALL_METHOD, POP]);
+    a.label("done");
+    get_path(&mut a.code, &["h"]);
+    a.code.push(RETURN);
+    let mut outer = function(&["t"], &a.finish());
+    outer.push(RETURN);
+    function(&["o"], &outer)
+}
+
+/// `function () { var a = _global.thedas_imgtf; _global.thedas_imgtf = new Array();
+/// if (_global.thedas_imgall == undefined) _global.thedas_imgall = new Array();
+/// var o = new Array(); for (var i = 0; i < a.length; i++) { var c = a[i];
+/// if (c.thedas_imgk == undefined) { c.thedas_imgk = _global.thedas_imgall.length;
+/// _global.thedas_imgall.push(c); } o.push(c.thedas_imgk); o.push(c.thedas_html); }
+/// return o; }` (see [`IMG_TAKE`]).
+fn img_take_function() -> Vec<u8> {
+    let mut a = Asm::default();
+    let c = &mut a.code;
+    push(c, &[Push::Str("a")]);
+    get_path(c, &["_global", "thedas_imgtf"]);
+    c.push(DEFINE_LOCAL);
+    get_path(c, &["_global"]);
+    push(
+        c,
+        &[Push::Str("thedas_imgtf"), Push::Int(0), Push::Str("Array")],
+    );
+    c.extend_from_slice(&[NEW_OBJECT, SET_MEMBER]);
+    get_path(c, &["_global", "thedas_imgall"]);
+    push(c, &[Push::Undefined]);
+    c.extend_from_slice(&[EQUALS2, NOT]);
+    a.branch(IF, "all");
+    let c = &mut a.code;
+    get_path(c, &["_global"]);
+    push(
+        c,
+        &[Push::Str("thedas_imgall"), Push::Int(0), Push::Str("Array")],
+    );
+    c.extend_from_slice(&[NEW_OBJECT, SET_MEMBER]);
+    a.label("all");
+    let c = &mut a.code;
+    push(c, &[Push::Str("o"), Push::Int(0), Push::Str("Array")]);
+    c.extend_from_slice(&[NEW_OBJECT, DEFINE_LOCAL]);
+    push(c, &[Push::Str("i"), Push::Int(0)]);
+    c.push(DEFINE_LOCAL);
+    a.label("loop");
+    let c = &mut a.code;
+    get_path(c, &["i"]);
+    get_path(c, &["a", "length"]);
+    c.extend_from_slice(&[LESS2, NOT]);
+    a.branch(IF, "end");
+    let c = &mut a.code;
+    push(c, &[Push::Str("c")]);
+    get_path(c, &["a"]);
+    get_path(c, &["i"]);
+    c.extend_from_slice(&[GET_MEMBER, DEFINE_LOCAL]);
+    get_path(c, &["c", "thedas_imgk"]);
+    push(c, &[Push::Undefined]);
+    c.extend_from_slice(&[EQUALS2, NOT]);
+    a.branch(IF, "known");
+    let c = &mut a.code;
+    get_path(c, &["c"]);
+    push(c, &[Push::Str("thedas_imgk")]);
+    get_path(c, &["_global", "thedas_imgall", "length"]);
+    c.push(SET_MEMBER);
+    get_path(c, &["c"]);
+    push(c, &[Push::Int(1)]);
+    get_path(c, &["_global", "thedas_imgall"]);
+    push(c, &[Push::Str("push")]);
+    c.extend_from_slice(&[CALL_METHOD, POP]);
+    a.label("known");
+    let c = &mut a.code;
+    for m in ["thedas_imgk", "thedas_html"] {
+        get_path(c, &["c", m]);
+        push(c, &[Push::Int(1)]);
+        get_path(c, &["o"]);
+        push(c, &[Push::Str("push")]);
+        c.extend_from_slice(&[CALL_METHOD, POP]);
+    }
+    push(c, &[Push::Str("i")]);
+    get_path(c, &["i"]);
+    c.extend_from_slice(&[INCREMENT, SET_VARIABLE]);
+    a.branch(JUMP, "loop");
+    a.label("end");
+    get_path(&mut a.code, &["o"]);
+    a.code.push(RETURN);
+    function(&[], &a.finish())
+}
+
+/// `function (k, h, w) { var t = _global.thedas_imgall[k].TextField; var m =
+/// _root.thedas_meas; if (m == undefined) { _root.createTextField("thedas_meas", 1048000,
+/// -10000, -10000, 100, 100); m = _root.thedas_meas; m._visible = false; }
+/// m.autoSize = "left"; m.embedFonts = t.embedFonts; m.multiline = t.multiline;
+/// m.wordWrap = w && t.wordWrap; m._width = t._width; m.html = true;
+/// m.setNewTextFormat(t.getNewTextFormat()); m.htmlText = h;
+/// return [m.textWidth, m.textHeight]; }` (see [`IMG_MEASURE`]).
+fn img_measure_function() -> Vec<u8> {
+    let mut a = Asm::default();
+    let c = &mut a.code;
+    push(c, &[Push::Str("t")]);
+    get_path(c, &["_global", "thedas_imgall"]);
+    get_path(c, &["k"]);
+    c.push(GET_MEMBER);
+    push(c, &[Push::Str("TextField")]);
+    c.extend_from_slice(&[GET_MEMBER, DEFINE_LOCAL]);
+    push(c, &[Push::Str("m")]);
+    get_path(c, &["_root", "thedas_meas"]);
+    c.push(DEFINE_LOCAL);
+    get_path(c, &["m"]);
+    push(c, &[Push::Undefined]);
+    c.extend_from_slice(&[EQUALS2, NOT]);
+    a.branch(IF, "have");
+    let c = &mut a.code;
+    push(
+        c,
+        &[
+            Push::Int(100),
+            Push::Int(100),
+            Push::Int(-10000),
+            Push::Int(-10000),
+            Push::Int(1048000),
+            Push::Str("thedas_meas"),
+            Push::Int(6),
+        ],
+    );
+    get_path(c, &["_root"]);
+    push(c, &[Push::Str("createTextField")]);
+    c.extend_from_slice(&[CALL_METHOD, POP]);
+    push(c, &[Push::Str("m")]);
+    get_path(c, &["_root", "thedas_meas"]);
+    c.push(SET_VARIABLE);
+    get_path(c, &["m"]);
+    push(c, &[Push::Str("_visible"), Push::Bool(false)]);
+    c.push(SET_MEMBER);
+    a.label("have");
+    let c = &mut a.code;
+    get_path(c, &["m"]);
+    push(c, &[Push::Str("autoSize"), Push::Str("left")]);
+    c.push(SET_MEMBER);
+    for m in ["embedFonts", "multiline", "_width"] {
+        get_path(c, &["m"]);
+        push(c, &[Push::Str(m)]);
+        get_path(c, &["t", m]);
+        c.push(SET_MEMBER);
+    }
+    get_path(c, &["m"]);
+    push(c, &[Push::Str("wordWrap")]);
+    get_path(c, &["w"]);
+    get_path(c, &["t", "wordWrap"]);
+    c.push(0x10); // And
+    c.push(SET_MEMBER);
+    get_path(c, &["m"]);
+    push(c, &[Push::Str("html"), Push::Bool(true)]);
+    c.push(SET_MEMBER);
+    push(c, &[Push::Int(0)]);
+    get_path(c, &["t"]);
+    push(c, &[Push::Str("getNewTextFormat")]);
+    c.push(CALL_METHOD);
+    push(c, &[Push::Int(1)]);
+    get_path(c, &["m"]);
+    push(c, &[Push::Str("setNewTextFormat")]);
+    c.extend_from_slice(&[CALL_METHOD, POP]);
+    get_path(c, &["m"]);
+    push(c, &[Push::Str("htmlText")]);
+    get_path(c, &["h"]);
+    c.push(SET_MEMBER);
+    get_path(c, &["m", "textHeight"]);
+    get_path(c, &["m", "textWidth"]);
+    push(c, &[Push::Int(2)]);
+    c.extend_from_slice(&[INIT_ARRAY, RETURN]);
+    function(&["k", "h", "w"], &a.finish())
+}
+
+/// `function (k, h) { _global.thedas_imgall[k].TextField.htmlText = h; }`
+fn img_set_function() -> Vec<u8> {
+    let mut c = Vec::new();
+    get_path(&mut c, &["_global", "thedas_imgall"]);
+    get_path(&mut c, &["k"]);
+    c.push(GET_MEMBER);
+    push(&mut c, &[Push::Str("TextField")]);
+    c.push(GET_MEMBER);
+    push(&mut c, &[Push::Str("htmlText")]);
+    get_path(&mut c, &["h"]);
+    c.push(SET_MEMBER);
+    function(&["k", "h"], &c)
+}
+
+/// `function (k, n, s, x, y) { var c = _global.thedas_imgall[k]; var t = c.TextField;
+/// var m = c.createEmptyMovieClip("thedas_img" + n, 10000 + n); if (s != "")
+/// m.attachBitmap(flash.display.BitmapData.loadBitmap(s), 1); m._x = t._x + x;
+/// m._y = t._y + y; return [m._width, m._height]; }` (see [`IMG_PUT`]).
+fn img_put_function() -> Vec<u8> {
+    let mut a = Asm::default();
+    let c = &mut a.code;
+    push(c, &[Push::Str("c")]);
+    get_path(c, &["_global", "thedas_imgall"]);
+    get_path(c, &["k"]);
+    c.extend_from_slice(&[GET_MEMBER, DEFINE_LOCAL]);
+    push(c, &[Push::Str("t")]);
+    get_path(c, &["c", "TextField"]);
+    c.push(DEFINE_LOCAL);
+    push(c, &[Push::Str("m"), Push::Int(10000)]);
+    get_path(c, &["n"]);
+    c.push(ADD2);
+    push(c, &[Push::Str("thedas_img")]);
+    get_path(c, &["n"]);
+    c.push(ADD2);
+    push(c, &[Push::Int(2)]);
+    get_path(c, &["c"]);
+    push(c, &[Push::Str("createEmptyMovieClip")]);
+    c.extend_from_slice(&[CALL_METHOD, DEFINE_LOCAL]);
+    get_path(c, &["s"]);
+    push(c, &[Push::Str("")]);
+    c.push(EQUALS2);
+    a.branch(IF, "place");
+    let c = &mut a.code;
+    push(c, &[Push::Int(1)]);
+    get_path(c, &["s"]);
+    push(c, &[Push::Int(1)]);
+    get_path(c, &["flash", "display", "BitmapData"]);
+    push(c, &[Push::Str("loadBitmap")]);
+    c.push(CALL_METHOD);
+    push(c, &[Push::Int(2)]);
+    get_path(c, &["m"]);
+    push(c, &[Push::Str("attachBitmap")]);
+    c.extend_from_slice(&[CALL_METHOD, POP]);
+    a.label("place");
+    let c = &mut a.code;
+    for (m, v) in [("_x", "x"), ("_y", "y")] {
+        get_path(c, &["m"]);
+        push(c, &[Push::Str(m)]);
+        get_path(c, &["t", m]);
+        get_path(c, &[v]);
+        c.push(ADD2);
+        c.push(SET_MEMBER);
+    }
+    get_path(c, &["m", "_height"]);
+    get_path(c, &["m", "_width"]);
+    push(c, &[Push::Int(2)]);
+    c.extend_from_slice(&[INIT_ARRAY, RETURN]);
+    function(&["k", "n", "s", "x", "y"], &a.finish())
 }
 
 /// Code with forward and backward branches by label.
@@ -1158,6 +1460,36 @@ pub fn register_invoke() -> Vec<u8> {
     push(&mut out, &[Push::Str("thedas_run_after")]);
     out.extend(run_after_function());
     out.push(SET_MEMBER);
+    // Inline images in HTML text (see IMG_TAKE).
+    for (name, f) in [
+        ("thedas_text_wrap", process_text_wrap_maker()),
+        ("thedas_img_take", img_take_function()),
+        ("thedas_img_measure", img_measure_function()),
+        ("thedas_img_set", img_set_function()),
+        ("thedas_img_put", img_put_function()),
+    ] {
+        get_path(&mut out, &["_global"]);
+        push(&mut out, &[Push::Str(name)]);
+        out.extend(f);
+        out.push(SET_MEMBER);
+    }
+    let text = ["_global", "SharedLibrary", "TextField", "prototype"];
+    get_path(&mut install, &text);
+    push(&mut install, &[Push::Str("ProcessText")]);
+    get_path(
+        &mut install,
+        &[
+            "_global",
+            "SharedLibrary",
+            "TextField",
+            "prototype",
+            "ProcessText",
+        ],
+    );
+    push(&mut install, &[Push::Int(1)]);
+    get_path(&mut install, &["_global"]);
+    push(&mut install, &[Push::Str("thedas_text_wrap")]);
+    install.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
     get_path(&mut out, &["_global"]);
     push(&mut out, &[Push::Str("thedas_post_load_wrap")]);
     out.extend(post_load_wrap_maker());
