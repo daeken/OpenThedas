@@ -2560,6 +2560,7 @@ pub fn call(
                 return ok(Value::Int(0));
             }
             h.sim.world.transition = Some((area, string(a, 1)));
+            h.sim.world.transition_at = Some(h.sim.world.time_ms + crate::sim::TRANSITION_DELAY_MS);
             ok(Value::Int(1))
         }
         "GetPackageAI" => ok(Value::Int(
@@ -3183,6 +3184,8 @@ pub fn call(
             } else {
                 h.sim.world.world_map.encounter = true;
                 h.sim.world.transition = Some((area, string(a, 1)));
+                h.sim.world.transition_at =
+                    Some(h.sim.world.time_ms + crate::sim::TRANSITION_DELAY_MS);
             }
             void()
         }
