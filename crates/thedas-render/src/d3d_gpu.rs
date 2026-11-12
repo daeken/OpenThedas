@@ -73,6 +73,9 @@ pub(crate) struct D3dDraw {
     /// One pass of a multi-pass technique: drawn in pass order with the material's other
     /// passes, after the opaque draws.
     pub multipass: bool,
+    /// The draw's bounding sphere in its own space (centre, radius), for the view culling
+    /// (see [`in_view`]); `None` for draws that are never culled.
+    sphere: Option<(Vec3, f32)>,
 }
 
 /// Pipelines and vertex buffers kept between passes (see [`crate::gpu::RenderCache`]).
@@ -124,6 +127,9 @@ pub(crate) struct D3dPass {
     caster_visible: std::sync::Mutex<Vec<[bool; 2]>>,
     /// What the casters' constants were last filled for (see [`shadow_key`]).
     casters_filled: std::sync::Mutex<Option<u64>>,
+    /// This frame's draws (by index into `draws`) in the camera's view (see
+    /// [`D3dPass::update`]): only they get constants and are drawn.
+    in_view: std::sync::Mutex<Vec<bool>>,
     caster_programs: Vec<Arc<D3dProgram>>,
     /// The (empty) texture bindings of the casters' programs.
     empty_group: wgpu::BindGroup,
@@ -484,6 +490,49 @@ fn in_partition(p: &crate::shadow::Partition, centre: Vec3, radius: f32) -> bool
     let (rx, ry, rz) = (reach(0), reach(1), reach(2));
     c.x.abs() <= 1.0 + rx && c.y.abs() <= 1.0 + ry && c.z >= -rz && c.z <= 1.0 + rz
 }
+
+/// Whether a draw's world bounding sphere reaches into the camera's view: what the
+/// original asks Umbra each frame (0x467050, from 0x537e61: 0x466a20 sets the Umbra
+/// camera's frustum, `Camera::setFrustum` at 0x466e61, then `Camera::resolveVisibility` at
+/// 0x467095 gathers what it sees). Here only its view-frustum test: Umbra's occlusion
+/// culling is not mirrored (provisional; it only drops what would be hidden anyway). Conservative: the near plane is taken
+/// as OpenGL's (behind D3D's and wgpu's), and the sphere is widened by [`VIEW_MARGIN`].
+fn in_view(view_proj: &glam::Mat4, centre: Vec3, radius: f32) -> bool {
+    let (r0, r1, r2, r3) = (
+        view_proj.row(0),
+        view_proj.row(1),
+        view_proj.row(2),
+        view_proj.row(3),
+    );
+    let p = centre.extend(1.0);
+    let r = radius + VIEW_MARGIN;
+    [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r3 + r2, r3 - r2]
+        .into_iter()
+        .all(|plane| {
+            let n = plane.truncate().length();
+            n <= f32::EPSILON || plane.dot(p) >= -r * n
+        })
+}
+
+/// A mesh's bounding sphere in its own space (centre, radius): around its vertices' box.
+fn mesh_sphere(mesh: &SceneMesh) -> (Vec3, f32) {
+    let points: Box<dyn Iterator<Item = Vec3>> = match &mesh.positions {
+        Some(p) => Box::new(p.iter().map(|p| Vec3::new(p[0], p[1], p[2]))),
+        None => Box::new(mesh.vertices.iter().map(|v| Vec3::from_array(v.position))),
+    };
+    let (lo, hi) = points.fold(
+        (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+        |(lo, hi), p| (lo.min(p), hi.max(p)),
+    );
+    if lo.x > hi.x {
+        return (Vec3::ZERO, 0.0);
+    }
+    ((lo + hi) * 0.5, (hi - lo).length() * 0.5)
+}
+
+/// How far (in metres) a draw's bounding sphere is widened for the view culling: room for
+/// vertex shaders that move vertices a little (wind, waves).
+const VIEW_MARGIN: f32 = 1.0;
 
 /// What a pass's shadow draws depend on: the partitions, which casters each draws, and
 /// those casters' transforms and bones. The same key, the same partitions drawn.
@@ -1006,6 +1055,7 @@ impl D3dPass {
         });
 
         let mut draws = Vec::new();
+        let mut mesh_spheres: HashMap<usize, (Vec3, f32)> = HashMap::new();
         for (k, (di, pi, multipass)) in pending.into_iter().enumerate() {
             let d = &scene.draws[di];
             let program = pipelines[pi].program.clone();
@@ -1108,6 +1158,21 @@ impl D3dPass {
                     },
                 ),
                 multipass,
+                sphere: {
+                    // The sky and its clouds follow the camera (`sky.vsh`, `clouds.vsh`):
+                    // drawn whatever their bounds (the original draws them through their own
+                    // submission queue, `sky.sub.xml`, not Umbra's visibility).
+                    let sem = &scene.materials[d.material].semantic;
+                    if sem.eq_ignore_ascii_case("Sky") || sem.eq_ignore_ascii_case("Clouds") {
+                        None
+                    } else {
+                        Some(
+                            *mesh_spheres
+                                .entry(d.mesh)
+                                .or_insert_with(|| mesh_sphere(mesh)),
+                        )
+                    }
+                },
             });
         }
         // Shadow casters: the level's meshes whose model says they cast run-time shadows
@@ -1245,6 +1310,7 @@ impl D3dPass {
             caster_pipelines,
             caster_visible: std::sync::Mutex::new(Vec::new()),
             casters_filled: std::sync::Mutex::new(None),
+            in_view: std::sync::Mutex::new(Vec::new()),
             casters,
             caster_buffer,
             caster_programs: caster_programs_used,
@@ -1270,8 +1336,8 @@ impl D3dPass {
         self.pipelines[d.pipeline].blended
     }
 
-    /// Fills every draw's constants for this frame; `time` is the shaders' `ApplicationTime`
-    /// in seconds.
+    /// Fills this frame's constants of the draws in the camera's view (see [`in_view`]; the
+    /// rest are not drawn); `time` is the shaders' `ApplicationTime` in seconds.
     pub fn update(&self, ctx: &GpuContext, camera: &Camera, width: u32, height: u32, time: f32) {
         let aspect = width as f32 / height.max(1) as f32;
         // The level's pass places this frame's partitions; the objects' pass reads them.
@@ -1350,17 +1416,48 @@ impl D3dPass {
         }
         let Some(buffer) = &self.buffer else { return };
         let (view, projection) = (camera.view(), camera.projection(aspect));
-        let mut data = vec![0u8; buffer.size() as usize];
-        let put = |data: &mut [u8], at: u64, c: &StageConstants, base: usize| {
+        // Only the draws in view get constants (and are drawn); skinned ones always do, as
+        // their bones may carry them beyond their bounds.
+        let view_proj = projection * view;
+        let in_view: Vec<bool> = self
+            .draws
+            .iter()
+            .map(|d| {
+                let (world, _, _) = &self.worlds[d.draw];
+                let Some((centre, radius)) = d.sphere else {
+                    return true;
+                };
+                !self.bones.get(d.draw).is_none_or(|b| b.is_empty())
+                    || in_view(
+                        &view_proj,
+                        world.transform_point3(centre),
+                        radius * max_scale(world),
+                    )
+            })
+            .collect();
+        let slot_size = SLOT[7] as usize;
+        // The constants of consecutive slots in view, written in one go.
+        let mut run: Vec<u8> = Vec::new();
+        let mut run_start = 0u64;
+        let put = |data: &mut [u8], c: &StageConstants, base: usize| {
             let f: &[u8] = bytemuck::cast_slice(&c.floats);
             let i: &[u8] = bytemuck::cast_slice(&c.ints);
             let b: &[u8] = bytemuck::cast_slice(&c.bools);
-            let o = at as usize;
-            data[o + SLOT[base] as usize..][..f.len()].copy_from_slice(f);
-            data[o + SLOT[base + 1] as usize..][..i.len()].copy_from_slice(i);
-            data[o + SLOT[base + 2] as usize..][..b.len()].copy_from_slice(b);
+            data[SLOT[base] as usize..][..f.len()].copy_from_slice(f);
+            data[SLOT[base + 1] as usize..][..i.len()].copy_from_slice(i);
+            data[SLOT[base + 2] as usize..][..b.len()].copy_from_slice(b);
         };
-        for d in &self.draws {
+        for (d, _) in self.draws.iter().zip(&in_view).filter(|(_, v)| **v) {
+            if run_start + run.len() as u64 != d.slot {
+                if !run.is_empty() {
+                    ctx.queue.write_buffer(buffer, run_start, &run);
+                }
+                run.clear();
+                run_start = d.slot;
+            }
+            let at = run.len();
+            run.resize(at + slot_size, 0);
+            let data = &mut run[at..];
             let (world, lightmap, material) = &self.worlds[d.draw];
             let program = &self.pipelines[d.pipeline].program;
             let cc = ConstantContext {
@@ -1387,17 +1484,20 @@ impl D3dPass {
                 shadow,
                 partition: None,
             };
-            put(&mut data, d.slot, &cc.fill(program.vs.ctab.as_ref()), 0);
-            put(&mut data, d.slot, &cc.fill(program.ps.ctab.as_ref()), 3);
+            put(data, &cc.fill(program.vs.ctab.as_ref()), 0);
+            put(data, &cc.fill(program.ps.ctab.as_ref()), 3);
             let fix = [
                 1.0 / width.max(1) as f32,
                 1.0 / height.max(1) as f32,
                 0.0,
                 0.0,
             ];
-            data[(d.slot + SLOT[6]) as usize..][..16].copy_from_slice(bytemuck::cast_slice(&fix));
+            data[SLOT[6] as usize..][..16].copy_from_slice(bytemuck::cast_slice(&fix));
         }
-        ctx.queue.write_buffer(buffer, 0, &data);
+        if !run.is_empty() {
+            ctx.queue.write_buffer(buffer, run_start, &run);
+        }
+        *self.in_view.lock().unwrap_or_else(|e| e.into_inner()) = in_view;
     }
 
     /// The casters' constants: their world and each partition's matrix.
@@ -1555,6 +1655,13 @@ impl D3dPass {
         }
     }
 
+    /// Whether draw `i` (an index into `draws`) is in this frame's view (see
+    /// [`D3dPass::update`]); before any update, every draw is.
+    pub fn in_view(&self, i: usize) -> bool {
+        let v = self.in_view.lock().unwrap_or_else(|e| e.into_inner());
+        v.get(i).copied().unwrap_or(v.is_empty())
+    }
+
     pub fn draw(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -1574,6 +1681,30 @@ impl D3dPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draws_count_as_in_view_only_within_the_frustum() {
+        let camera = Camera::new(Vec3::new(10.0, 20.0, 2.0), 0.3, -0.1);
+        let vp = camera.view_proj(16.0 / 9.0);
+        let ahead = camera.position + camera.forward() * 10.0;
+        assert!(in_view(&vp, ahead, 0.5));
+        // Behind the camera, or far off to the side: out.
+        assert!(!in_view(
+            &vp,
+            camera.position - camera.forward() * 10.0,
+            0.5
+        ));
+        let side = camera.forward().cross(Vec3::Z).normalize();
+        assert!(!in_view(&vp, ahead + side * 100.0, 0.5));
+        // A sphere whose centre lies outside but which reaches into the view: in.
+        assert!(in_view(&vp, ahead + side * 100.0, 95.0));
+        // Beyond the far plane: out.
+        assert!(!in_view(
+            &vp,
+            camera.position + camera.forward() * (camera.far + 50.0),
+            1.0
+        ));
+    }
 
     #[test]
     fn casters_count_for_a_partition_only_within_its_box() {
