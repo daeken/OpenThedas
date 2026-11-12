@@ -97,6 +97,52 @@ How the list was built:
 - The level's `Quest updated` and `Codex updated` notifications show but were not checked for timing against the original.
 - `GUI.SelectedBookPage`, `GUIBookback.ShowContents`, `GUI.TooltipText`/`GUITooltips.TooltipText` are logged unanswered on first read; check whether they matter.
 
+## Interface movies measured against a real install
+
+Gathered 2026-11-12 at main `1eb844a` from every archive in the install, a search of
+`thedas-ui` and `thedas-app`, and headless runs with the interface log on. The install has 68
+distinct `.gfx` movies: 28 are opened as screens, 2 are font libraries, `bookback` is drawn as
+an image instead of run, and 37 are never opened.
+
+### Never opened (37)
+
+- **Gameplay**: `armycontrol`, `crafting`, `itemupgrade`, `slideshow`, `credits`,
+  `dialoguepop`, `fademap`, `bookfront`, `newgame`, `savescreen`. The matching engine functions
+  (`ShowCraftingGUI`, `OpenItemUpgradeGUI`, `BeginSlideshow`) are unimplemented too.
+- **Loading screens**: `load_fade`, `load_light`, `load_town`.
+- **Online and downloadable content**: `login`, `loginconnected`, `loginconnecting`,
+  `loginnewaccount`, `loginviewtos`, `prccontentmanager`, `purchaseconfirm`,
+  `purchasingcontent`, `contentinstalling`, `guicommunityfeatures`, `guiachievementunlocked`,
+  `guiscreenshots`.
+- **Debug**: `debug`, `debugoptions`, `fonttest`.
+- **Other languages' fonts**: `fonts_cs-cz`, `de-de`, `es-es`, `fr-fr`, `hu-hu`, `it-it`,
+  `pl-pl`, `pseudo`, `ru-ru`.
+
+### Engine values a screen asks for and nothing answers
+
+Counted per screen as the keys a run adds over the HUD on the same save. The counts depend on
+the save and on party size. No external command went unanswered in any run.
+
+| Screen (movie) | Unanswered | What |
+| --- | --- | --- |
+| HUD (`floatylayer`, `portraits`, `quickbar`, `minimap`, `notifications`, `navbar`, `tooltips`, `popuplayer`) | 220 | quickslot cooldown, pending, status, item icon and stack size (16 slots); key names for quickslots 11 to 28 and the party picker; per-member current and pending action, portrait tint, paralysed, upkeep cost; the same fields for summons; hold positions; the effect list |
+| Spells and talents (`abilities`) | 170 | cooldown, pending and status per ability in the chains |
+| Skills (`abilities`) | 98 | the same per skill |
+| Inventory | 42 | ability cooldown and pending per backpack row, equipment stack size, backpack sort, approval, can-change-equipment, can-switch-weapon-sets |
+| Area map | 14 | tooltip layout keys, plot destinations, plot givers |
+| Journal | 5 | last selected codex entry and group, plot offer id, DLC enabled |
+| Store | 4 | tooltip text, pending target |
+| Party picker | 3 | selected member portraits |
+| Character record | 2 | approval |
+| Start menu | 2 | tooltip text, hero list |
+| Tactics | 1 | |
+| Options, save and load, death, conversation, cutscene | 0 | |
+
+`GUIBookback.ShowContents` is unanswered on every book screen because the `bookback` movie
+never runs. Not measured, because no headless step opens them: character creation, level up,
+the Chanter's Board, the world map, item examine and the game menu. Some HUD keys may be probes
+of empty slots; that is not checked against the original.
+
 ## Part 2: code inventory
 
 Found by reading the code at main on 2026-11-12: provisional markers, stubs, ignored inputs and features with no code. "Original: not traced" means nobody has yet checked what the original does. Line numbers drift; search for the quoted names if a line has moved.
@@ -138,7 +184,6 @@ voice previews, `LoadModule`, `QuitGame`. Anything else is logged once as not ha
 - **UI-003** **Three returning fscommands never answered.** Original: not traced. Ours: `ListMemberNames`, `Get2DAValueByIndex` and `GetM2DAValueByIndex` are wrapped as returning commands but `respond` has no arm for them; they count as unanswered and return undefined. Evidence: `crates/thedas-ui/src/avm1.rs:99`, `crates/thedas-ui/src/protocol.rs:545`. Size: S. Depends: none. Kind: missing.
 - **UI-004** **Input contexts not modelled.** Original: the game's context system decides which input reaches which movie (comment). Ours: `CreateContext` is ignored; the pushed and popped stack is consulted only for the popup layer's `GUIPopup` context. Evidence: `crates/thedas-ui/src/protocol.rs:601`, `crates/thedas-ui/src/stage.rs:548`. Size: M. Depends: none. Kind: provisional.
 - **UI-005** **Game message blocking ignored.** Original: not traced. Ours: `BlockGameMessage` and `UnblockGameMessage` are accepted and do nothing. Evidence: `crates/thedas-ui/src/protocol.rs:614`. Size: S. Depends: UI-004. Kind: missing.
-- **UI-006** **Unknown fscommands dropped silently.** Original: not traced. Ours: a `GameMessage::Other` other than `LoadModule` and `QuitGame` is neither handled nor logged. Evidence: `crates/thedas-app/src/ui.rs:930`. Size: S. Depends: none. Kind: bug.
 - **UI-007** **No inventory of unhandled movie messages.** Original: not traced. Ours: a message nothing takes is logged once at run time ("the simulation does not handle ... yet"); there is no list of the messages the shipped movies send against those handled. Evidence: `crates/thedas-app/src/ui.rs:963`. Size: M. Depends: none. Kind: missing.
 - **UI-008** **Unanswered engine values reported only headless.** Original: not traced. Ours: `log_gaps` (failed loads, unanswered `GetValue` names) is called from the headless capture path only, not from the window's loop. Evidence: `crates/thedas-app/src/ui.rs:1767`, `crates/thedas-app/src/main.rs:466`. Size: S. Depends: none. Kind: missing.
 - **UI-009** **Movie queries fail while the simulation is locked.** Original: not traced. Ours: tactics pickers, `GetObjectNameByID`, `GetGender`, `HasAbility` and `CreatureCanUseItem` use `try_lock` and return undefined to the movie when the simulation is busy. Evidence: `crates/thedas-ui/src/input.rs:264`. Size: S. Depends: none. Kind: provisional.
@@ -193,9 +238,7 @@ voice previews, `LoadModule`, `QuitGame`. Anything else is logged once as not ha
 - **UI-055** **Video options not applied.** Original: not traced. Ours: `FullScreen`, `UseVSync`, `Gamma`, `TexturePack`, `EnableFrameBufferEffects`, `GraphicsDetailLevel` and `ForceLowSettings` change only what the screen shows; the swap chain is always `AutoVsync`. Evidence: `crates/thedas-ui/src/options.rs:54`, `crates/thedas-app/src/main.rs:804`. Size: M. Depends: UI-053. Kind: missing.
 - **UI-056** **Resolution list holds one entry.** Original: not traced. Ours: `ClientOptions.ScreenResList` lists only the current size; the display's other modes are not listed and picking one changes nothing. Evidence: `crates/thedas-ui/src/options.rs:105`. Size: M. Depends: UI-055. Kind: missing.
 - **UI-057** **Control options not applied.** Original: not traced. Ours: `InvertXAxis`, `InvertYAxis`, `SwapMouseButtons`, `MouseSensitivity` and `MouseZoomSensitivity` are ignored; mouse look uses a fixed 0.003 rad per pixel and zoom a fixed step. Evidence: `crates/thedas-ui/src/options.rs:42`, `crates/thedas-app/src/main.rs:2106`. Size: S. Depends: UI-053. Kind: missing.
-- **UI-058** **Tutorial option not applied.** Original: not traced. Ours: `Tutorials.Enabled` is always 1 whatever `GameOptions.ShowTutorials` says. Evidence: `crates/thedas-ui/src/binding.rs:758`. Size: S. Depends: none. Kind: bug.
 - **UI-059** **Key rebinding.** Original: key bindings actually applied and persisted. Ours: no code found; the game's keys are hard-coded in the app (`key_down`, `menu_key`, `quickslot_key`) and `keymap.gda` is read only to name keys in text and tabs. Evidence: `crates/thedas-app/src/main.rs:1282`, `crates/thedas-ui/src/binding.rs:875`. Size: L. Depends: UI-053. Kind: missing.
-- **UI-060** **Auto-pause option not passed on.** Original: not traced. Ours: `GameOptions.AutoPauseCombat` is kept by the interface, but the simulation's `auto_pause_combat` (read by `GetAutoPauseCombatStatus`) is never set from it. Evidence: `crates/thedas-ui/src/options.rs:34`, `crates/thedas-sim/src/sim.rs:92`. Size: S. Depends: none. Kind: bug.
 - **UI-061** **Subtitle option not applied.** Original: not traced. Ours: `GameOptions.SubtitlesLevel` is ignored; conversation and cutscene text always shows. Evidence: `crates/thedas-ui/src/options.rs:30`. Size: S. Depends: none. Kind: missing.
 - **UI-062** **Damage number options not applied.** Original: not traced. Ours: `ShowPartyDamageNumbers`, `ShowHostileDamageNumbers` and `ShowSpecialMoveFloaties` are ignored; every scripted floaty shows. Evidence: `crates/thedas-ui/src/options.rs:36`, `crates/thedas-app/src/ui.rs:1313`. Size: S. Depends: none. Kind: missing.
 - **UI-063** **Gore option not applied.** Original: not traced. Ours: `GameOptions.ShowGore` is ignored, and `SetCreatureGoreLevel` is a no-op. Evidence: `crates/thedas-ui/src/options.rs:31`, `crates/thedas-sim/src/engine.rs:2823`. Size: S. Depends: none. Kind: missing.
@@ -256,7 +299,6 @@ voice previews, `LoadModule`, `QuitGame`. Anything else is logged once as not ha
 
 ### In-game screens
 
-- **UI-115** **Script message boxes never shown.** Original: not traced. Ours: `ShowPopup` stores `world.popup` and the simulation waits for `EVENT_TYPE_POPUP_RESULT`, but nothing in the interface shows it or answers it. Evidence: `crates/thedas-sim/src/engine.rs:3323`. Size: M. Depends: none. Kind: missing.
 - **UI-116** **Destroying and dropping items.** Original: destroy. Ours: no code found; the simulation takes only equip, unequip and next/previous character from the inventory. Evidence: `crates/thedas-sim/src/chanters.rs:159`. Size: M. Depends: none. Kind: missing.
 - **UI-117** **Splitting stacks.** Original: split stacks. Ours: no code found. Evidence: `crates/thedas-sim/src/chanters.rs:159`. Size: M. Depends: UI-028. Kind: missing.
 - **UI-118** **Sorting and junk.** Original: sorting/filter tabs and junk. Ours: filter tabs work; sorting has no code (`Party.BackpackSort` 0) and junk has no code found. Evidence: `crates/thedas-ui/src/binding.rs:1080`. Size: M. Depends: none. Kind: missing.

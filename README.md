@@ -10,7 +10,7 @@ repository.
 
 ## Status
 
-Last updated 2026-11-12 16:45 UTC, main f5ae46b
+Last updated 2026-11-12 17:50 UTC, main 477f24e
 
 For everything that is wrong or missing, in detail and split into items that can be picked up in
 parallel, see [docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md).
@@ -41,9 +41,9 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - The follow camera uses the exe's 0.25 m sphere sweep, pull-in and ease-out, and its starting shot (3 m behind, at the leader's height). QA confirmed it at all six origin starts.
   - Doors are posed by their state (open, Open_2, swinging, fallen), and their camera and click shapes follow the pose.
   - With a pad, walking aims at a point ahead and the route goes round obstacles; it no longer stops dead at the first one.
-  - Creatures the camera is inside fade out as the exe does (0.25 m sphere, opacity 0.05, not in dialog or cutscenes). Provisional: the creature shape tested; the exe tests the models' own physics shapes, and the switch to those is in progress.
+  - Creatures the camera is inside fade out as the exe does (0.25 m sphere against the models' creature-group physics shapes, head included; opacity 0.05; not in dialog or cutscenes). Provisional: the shapes are placed by rest pose, not the animated skeleton.
   - With a pad, A walks through open doors instead of using them.
-  - Open: the exe resets the follow camera at the end of loading, a cutscene and a movie, and keeps the zoom across loads; ours does neither yet (in progress).
+  - The follow camera resets behind the leader after a load and at the end of a cutscene, as the exe does, and keeps its zoom across loads.
 - 🟡 **Combat and simulation**:
   - NWScript VM with a large share of the engine functions; melee and ability timing; threat; AI-driven party; tactics; loot.
   - Containers hold their template's items and open on USE with the original loot panel (Take All, Close).
@@ -54,7 +54,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Per-hand attack results are exposed read-only for the presentation (swing and impact sounds).
   - All six origins play past their openings in the simulation (QA).
   - Corpses decay and fade as the exe does them; a body bag takes the corpse's place and draws its corpse model.
-  - Live creatures block each other as the exe's capsules do (slide, no push, no re-path; the dead do not block). Merged and still being graded.
+  - Live creatures block each other as the exe's capsules do (slide, no push, no re-path; the dead do not block), and a blocked walker keeps its own speed. QA graded it in the live app.
   - Ability functions ignore unknown ability ids as the exe does, and saves drop invalid ones on load.
   - Visual effects applied at places (the Proving crowd) are exposed to rendering and drawn.
   - Not every script engine function is implemented.
@@ -163,7 +163,7 @@ With nothing else, the game boots to its start menu (startmenu2.gfx): New Game g
 character creation, Load Game lists the saves in `~/.openthedas/saves` (`--saves` for another
 folder), Options and Quit work. In a game, Escape (Start on a pad) opens the game menu: save,
 load, options, and Exit Game back to the start menu. The logo and intro movies the original
-plays before the menu are not shown yet (no Bink playback). `--new-game` (with `--quick-start`)
+plays before the menu are shown when `ffmpeg` is installed (`--no-intro` skips them). `--new-game` (with `--quick-start`)
 and `--save <file>` still start a game directly.
 
 ## Walking through an area

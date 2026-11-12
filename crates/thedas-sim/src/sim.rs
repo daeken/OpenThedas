@@ -90,6 +90,9 @@ pub struct Sim {
     /// The player's "auto-pause when combat starts" option (`GetAutoPauseCombatStatus`);
     /// off, as the game's options start.
     pub auto_pause_combat: bool,
+    /// The player's "show tutorials" option: off, no tutorial popup is queued. On, as the
+    /// game's options start.
+    pub show_tutorials: bool,
     /// Objects whose scripts' engine calls are all traced (log channel -6), for debugging.
     pub watch_calls: std::collections::BTreeSet<ObjectId>,
     /// Followers whose front command is the move [`Sim::keep_party_together`] gave them.
@@ -494,6 +497,7 @@ impl Sim {
             cutscene_policy: CutscenePolicy::default(),
             party_picker_policy: PartyPickerPolicy::default(),
             auto_pause_combat: false,
+            show_tutorials: true,
             watch_calls: Default::default(),
             following: Default::default(),
             next_follow_ms: 0,
@@ -2208,7 +2212,8 @@ impl Sim {
                 // From where the walker was, not where it meant to get to: a waypoint the
                 // blocked step would have passed is still ahead of it.
                 let rest = remaining_points(from, &points, progress_of(from, &points, was));
-                let speed = self.move_speed(id).max(0.01);
+                // At the speed the move was set going at (a walk stays a walk).
+                let speed = (path_length(from, &points) * 1000.0 / (due - t0) as f32).max(0.01);
                 let left = path_length(p, &rest);
                 let progressed = crate::engine::dist(was, p) > 0.01;
                 if let Some(c) = self.world.get_mut(id).and_then(|o| o.commands.first_mut()) {
@@ -5006,6 +5011,52 @@ mod tests {
         // Past the corner, only the last leg is left.
         let f = progress_of(from, &points, [5.2, 2.0, 0.0]);
         assert_eq!(remaining_points(from, &points, f), vec![points[1]]);
+    }
+
+    #[test]
+    fn a_blocked_walk_keeps_its_own_speed() {
+        // A 10 m walk set going at 1 m/s (a scripted walk, slower than a run), with a body
+        // just off its line: being held up must never make it arrive sooner.
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let w = s.world.spawn(ObjectKind::Creature, "walker");
+        let post = s.world.spawn(ObjectKind::Creature, "post");
+        for (id, p) in [(w, [0.0, 0.0, 0.0]), (post, [5.0, 0.05, 0.0])] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = p;
+        }
+        let t0 = s.world.time_ms;
+        s.world.get_mut(w).unwrap().commands.push(Command {
+            ty: 0,
+            name: "CommandMoveToLocation".into(),
+            target: None,
+            location: Some(crate::world::Location {
+                area,
+                position: [10.0, 0.0, 0.0],
+                facing: 0.0,
+            }),
+            seconds: 0.0,
+            ints: Vec::new(),
+            strings: Vec::new(),
+            due: Some(t0 + 10_000),
+            from: Some(([0.0, 0.0, 0.0], t0)),
+            approach: None,
+            ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
+            arrived: false,
+            path: Vec::new(),
+        });
+        let mut arrived = None;
+        for k in 1..=400 {
+            s.tick(33);
+            if arrived.is_none() && s.world.get(w).unwrap().commands.is_empty() {
+                arrived = Some(k * 33);
+            }
+        }
+        let arrived = arrived.expect("it arrives");
+        assert!(arrived >= 10_000, "arrived after {arrived} ms");
     }
 
     #[test]

@@ -4,6 +4,88 @@
 
 Readers and writers for the game's resource types, archives, DLC, mods and saves.
 
+## Tables and resource types measured against a real install
+
+Gathered 2026-11-12 at main `1eb844a` from a listing of every archive (59,004 entries), a full
+`thedas corpus` run (pass; 563,593 entries read, 45,962 encrypted DLC entries unread) and a
+search of the code. Names and counts only.
+
+### Tables
+
+The install has 3,519 distinct `.gda` names, 1,787 of them in the core packages.
+
+| Core tables | Count |
+| --- | --- |
+| Named in our source | 50 |
+| Read by table id in the simulation's source | 12 |
+| Referenced by a constant table id in compiled scripts (served generically) | 42 |
+| A worksheet with no static reference | 324 |
+| Not a worksheet and no static reference | 1,359 |
+
+"No static reference" overstates what is unread. Scripts reach tables by computed id at 3,059
+call sites (ability tables, the `aip_*` AI packages, `ts_*` treasure, the approval tables), the
+interface movies ask for tables by id, and the sound-set tables (`sse_*`, `sst_*`, 686 of them),
+the `*_variation` tables and the `statecnt_*` tables are reached through names or ids stored in
+other tables.
+
+Tables with no known reader, static or dynamic (inferred, so each needs checking before work
+starts on it):
+
+- **Load hints**: `res_*` (351 per-area resource lists), `loadhints` and its four detail-level
+  variants, `chargen_preload`. `SetLoadHint` does nothing. These are the natural input to area
+  preloading.
+- **Gestures and ambient animation**: `gst_*` (22), `gestures_core_settings`, `poses`,
+  `pose_transitions`, `placeable_interactions`.
+- **Synchronised animation**: `synccreatureanimations`, `syncdeathanimations`,
+  `unsyncdeathanimations`, `synccombatanims`, `nosynccombatanims`, `syncplaceableanimations`,
+  `syncabilityanimations`, `synclargecreatures1` to `5`, `halfroundcombatanims`.
+- **Melee rings**: `meleering1` to `9`.
+- **Crafting**: `crafting_recipes`, `crafting_recipe_types`.
+- **Items**: `iprp_*` (15), `itempropdef`, `itemprops`, `armordata`.
+- **Approval and party**: `gift_values`, `motivations`, `heroicpartystats`, `party_picker`.
+- **World map**: `rand_*` (7 random-encounter tables), `enc_trips_sp`, `location_states`.
+- **Sound**: `sound_settings`, `internal_soundsettings`, `sound_projects_to_load`,
+  `playersoundsets`, `ss_probabilitymodif`, `sound_geometry_mat_types`.
+- **Appearance and character creation**: the `*_heads`, `*_hair`, `*_tints` and
+  `*_tint_masks` tables, `human_beard`, `raceicons`, `background_*` (the chargen movie may ask
+  for these by id; unverified).
+- **Interface, tutorials, plots**: `trainingsteps`, `tutorials`, `camera_selection`,
+  `dialog_tokens`, `stringtokens`, `main_plot_screenshots`, `plotactionsets`,
+  `plotactionstates`.
+- **Rules**: `autobalance`, `diffsettings`, `resistances`, `creaturetypes`, `simplecreature`,
+  `lock_difficulty`, `trap_difficulty`, `starting_points`, `var_*` (12), `ai_movetypes`,
+  `personality`, `abilityusetype`, `crusts`.
+- **Army battle**: `cli_army_*` (8).
+
+### Resource types with no reader or no consumer
+
+Counts are corpus entries, with each archive copy counted.
+
+| Type | Entries | Reader | Consumer |
+| --- | --- | --- | --- |
+| `.fxe` | 308,332 | none | none (facial animation and lip sync, inferred) |
+| `.fxa` | 37 | none | none (face actors, inferred) |
+| `.met` | 2,364 | none (almost all encrypted) | none |
+| `.pwk` | 774 | generic GFF only | none (placeable walk shapes, inferred) |
+| `.dlb` | 731 | generic GFF only | none |
+| `.mal` | 347 | none | named only as the emitters' default material library |
+| `.lst` | 320 | generic GFF3 only | none |
+| `.cre` | 135 | none | none |
+| `.wnd` | 116 | generic GFF only | none found |
+| `.cur` | 70 | none | none (the original's mouse cursors) |
+| `.cns`, `.ncc`, `.nsc`, `.nss` | 26, 24, 19, 30 | none | none (console and script debug files) |
+| `.tbi` | 11 | generic GFF only | none |
+| `.fxs`, `.fxr` | 7, 7 | none (encrypted) | none |
+| `.fdl` | 4 | generic GFF | none |
+| `.bic` | 3 | generic GFF3 only | none (character files) |
+| `.ttf` | 2 | none | none |
+| `.spt` | 688 | typed | parsed, not drawn; billboards stand in |
+| `.bik` | 85 loose | header only | decoded by an external `ffmpeg` |
+
+The corpus run's only failures are 5,058 non-fatal "undeclared action" reports in scripts, all
+from four function ids missing from `script.ldf` or the two-argument `CommandFly` in DLC and
+Awakening scripts.
+
 ## Code inventory
 
 Found by reading the code at main on 2026-11-12: provisional markers, stubs, ignored inputs and features with no code. "Original: not traced" means nobody has yet checked what the original does. Line numbers drift; search for the quoted names if a line has moved.

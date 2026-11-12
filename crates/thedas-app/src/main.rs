@@ -851,6 +851,11 @@ impl App {
         let dt = (now - self.last).as_secs_f32().min(0.1);
         self.last = now;
         let k = |c| self.keys.contains(&c);
+        if let (Some(f), Some(l)) = (self.follow.as_mut(), self.live.as_mut())
+            && let Some(heading) = l.camera_reset_due()
+        {
+            f.reset(heading);
+        }
         if let Some(f) = self.follow.as_mut() {
             let turn = (k(KeyCode::KeyQ) as i32 - k(KeyCode::KeyE) as i32) as f32;
             f.orbit(turn * 1.8 * dt, 0.0);
@@ -1877,8 +1882,17 @@ impl App {
                         g.ui.close_all();
                         g.ui.attach(&l.sim);
                     }
+                    // One explore camera for the whole process: a load turns it behind the
+                    // hero again but keeps its zoom (see `Follow::reset`).
                     self.follow = l.hero().map(|(_, facing)| {
-                        follow::Follow::behind(thedas_sim::world::heading_of(facing).to_radians())
+                        let heading = thedas_sim::world::heading_of(facing).to_radians();
+                        match self.follow.take() {
+                            Some(mut f) => {
+                                f.reset(heading);
+                                f
+                            }
+                            None => follow::Follow::behind(heading),
+                        }
                     });
                     if let Some((pos, facing)) = l.hero() {
                         let fov = self.camera.fov_y;
@@ -3218,6 +3232,11 @@ fn main() -> Result<()> {
                                 }
                             }
                             frames += 1;
+                            if let (Some(f), Some(heading)) =
+                                (follow.as_mut(), l.camera_reset_due())
+                            {
+                                f.reset(heading);
+                            }
                             let eye = follow
                                 .as_mut()
                                 .and_then(|f| l.follow_camera(f, dt as f32 / 1000.0, &camera));
@@ -3381,9 +3400,14 @@ fn main() -> Result<()> {
                         layer.attach(&n.sim);
                         *s = screens::Screens::new(n.front_end);
                         follow = n.hero().map(|(_, facing)| {
-                            follow::Follow::behind(
-                                thedas_sim::world::heading_of(facing).to_radians(),
-                            )
+                            let heading = thedas_sim::world::heading_of(facing).to_radians();
+                            match follow.take() {
+                                Some(mut f) => {
+                                    f.reset(heading);
+                                    f
+                                }
+                                None => follow::Follow::behind(heading),
+                            }
                         });
                         if let Some((pos, facing)) = n.hero() {
                             let fov = camera.fov_y;

@@ -25,7 +25,7 @@ in each run folder's `.log` files).
 | R6 | Orzammar guard solid | One guard semi-transparent in the Dust Town opening pan | run9/dc_cut.png | suspected; queued in rendering |
 | R7 | Selection/target rings sit on the ground; hostile ring red | Rings ignore depth, float at chest or hip height, draw through characters; hostile ring yellow | run19/duel_late.png, cell.png | suspected |
 | R8 | Grass and bushes | Trees now draw as billboards (#311); grass and bushes are missing | run34/wilds_trees.png | confirmed |
-| R9 | A head close-up does not fade: the fade tests the models' own physics shapes and a camera 0.5 m behind at eye level does not touch them (traced) | Torso fade works (#314); the provisional body capsule is being replaced by the models' shapes | sim-work/ruins/after_bear.json | parity for the close-up; shape fix in progress |
+| R9 | A head close-up does not fade: the fade tests the models' own physics shapes and a camera 0.5 m behind at eye level does not touch them (traced) | The fade tests the models' creature-group shapes, head included | sim-work/ruins/after_bear.json | parity |
 | R10 | Green placeholder-like emissives absent | Green dashes on Tapster's pillars, a green glyph by the bar | run17/tavern.png | suspected |
 | R11 | Shianni's bodice solid | Flat or see-through triangle on her bodice | run5/celf_o30.png | suspected |
 
@@ -33,7 +33,7 @@ in each run folder's `.log` files).
 | # | Original | Ours | Evidence | Status |
 |---|---|---|---|---|
 | C1 | Vaughan faces the camera on his line | He faces away in the shot at about 15 s (scene otherwise staged since #319) | run35/vaughan_15000.png | provisional (held for the original's frames) |
-| C2 | The follow camera resets only at the end of loading, a cutscene end and a movie end (yaw behind the hero, pitch from the zoom, zoom kept); conversations do not reset it (traced) | The starting pitch matches; the reset after cutscenes, movies and loads and the zoom carrying across loads are missing | run22/valendrian.png (ce_06_valendrian.json) | pitch is parity; reset in progress |
+| C2 | The follow camera resets only at the end of loading, a cutscene end and a movie end (yaw behind the hero, pitch from the zoom, zoom kept); conversations do not reset it (traced) | The camera resets after loads and cutscene ends and keeps its zoom across loads | run22/valendrian.png (ce_06_valendrian.json) | parity |
 | C3 | Camera roll and cut blending in cutscenes | None | #209 known gaps | confirmed (known) |
 | C4 | Cutscene creature actors animate and walk | Partly (#273); some shots lack actors or poses | various | partial |
 
@@ -80,3 +80,15 @@ Letterbox absent at 16:9; `<emp>` shown plain; the Fade's radial blur; 3 m camer
 | Dwarf Noble: palace → Gorim joins → feast conversations | plays to the feast (dn_*); the Proving/Trian/Bhelen plot **untested** |
 | Stores (Olinda), looting containers, level-up, save/load round trip, pause/options/game menu, area map, journal | work (minor items above) |
 | World map travel, party camp, companions beyond the prelude | covered only by the Human Noble chain; not QA-graded |
+
+Measured 2026-11-12 at main `1eb844a`, from the sweep chain and gate logs:
+
+- **The Human Noble chain needs a survival aid.** It passes all 16 steps to the first party camp
+  only because the developer heal script runs whenever a member drops under 35% health, 63 times
+  in all (32 in the Tower). Without it the party wipes in the Wilds. Part of that is the harness
+  (it does not kite or focus fire) and part is combat balance not yet matching the original;
+  nobody has separated the two.
+- **Past the first camp nothing plays end to end.** The Redcliffe night and Orzammar ambush
+  scenarios are lost with and without preparation.
+- **The regression gate covers the Human Noble chain only.** The other five origins have saves
+  but no gate chain.

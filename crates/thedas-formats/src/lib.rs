@@ -24,6 +24,7 @@
 //! - [`anim`]: animation trees (`.anb`), animation lengths (`.gad`) and events (`.evt`).
 //! - [`phy`]: collision models (`.phy`): the shapes rays and perception test against.
 //! - [`speedtree`]: SpeedTree 4 tree descriptions (`.spt`) for level vegetation.
+//! - [`speedtree_gen`]: growing SpeedTree trees from their descriptions (in progress).
 //!
 //! Audio:
 //!
@@ -52,6 +53,7 @@ pub mod morph;
 pub mod phy;
 pub mod probe;
 pub mod speedtree;
+pub mod speedtree_gen;
 pub mod stage;
 pub mod state;
 pub mod tint;

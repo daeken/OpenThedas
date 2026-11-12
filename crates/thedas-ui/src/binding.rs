@@ -789,7 +789,10 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             UiValue::String(t.resref.clone()),
         );
     }
-    v.insert("Tutorials.Enabled".into(), num(1));
+    v.insert(
+        "Tutorials.Enabled".into(),
+        num(u8::from(sim.show_tutorials)),
+    );
     v.insert("Tutorials.TrainingStep".into(), num(0));
     // The tutorials' screen highlights (DAConstants `GUI_HIGHLIGHT_*`: 0 follower, 1
     // tactics, 2 inventory, 3 health poultice, 4 empty quickbar, 5 tactic preset, 6
@@ -824,6 +827,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         quickbar(sim, who, &mut v);
         heroic_stats(sim, who, hero.unwrap_or(who), &mut v);
     }
+    script_popup(sim, &mut v);
     v
 }
 
@@ -946,6 +950,77 @@ fn key_mappings(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
                 UiValue::String(n),
             );
         }
+    }
+}
+
+/// The `Popups` M2DA (`popups.gda`): DAOrigins.exe reads it by id 0xcf.
+const M2DA_POPUPS: i32 = 207;
+/// `popups.gda`'s four button labels (talk-table strings, 0 for no button).
+const HASH_POPUP_LABELS: [u32; 4] = [0x335f_4422, 0x1872_17e1, 0x0169_26a0, 0x4e28_b067];
+
+/// A script's message box (`ShowPopup`) as popuplayer.gfx's `ShowDialogBoxFromGame` reads
+/// it (`GUIPopupLayer.*`), as DAOrigins.exe sets it up (0x663820): the message, the popup
+/// type's button labels from `popups.gda`, and for each button the callback message
+/// `GUIPopupLayer.ScriptDialogResult <type> <button, from 1> <owner>` (format at
+/// 0xb07fd8). Provisional: a button shows for each label that is not 0 (the exe's
+/// `NumButtons` is not traced), and the typed text is not passed back.
+fn script_popup(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
+    use thedas_formats::gda::Cell;
+    let Some(p) = &sim.world.popup else {
+        return;
+    };
+    let tables = sim.world.tables();
+    let popups = tables.get(M2DA_POPUPS, "");
+    let string = |strref: i64| {
+        u32::try_from(strref)
+            .ok()
+            .filter(|s| *s != 0)
+            .and_then(|s| sim.string(s))
+    };
+    let labels: Vec<String> = HASH_POPUP_LABELS
+        .iter()
+        .filter_map(|h| {
+            match popups
+                .as_ref()
+                .and_then(|t| t.cell_by_hash(*h, i64::from(p.kind)))
+            {
+                Some(Cell::Int(s)) => string(*s),
+                _ => None,
+            }
+        })
+        .collect();
+    let k = "GUIPopupLayer";
+    v.insert(
+        format!("{k}.DialogBoxText"),
+        UiValue::String(string(i64::from(p.strref)).unwrap_or_default()),
+    );
+    v.insert(format!("{k}.NumButtons"), num(labels.len() as f64));
+    v.insert(format!("{k}.InputBox"), num(p.input as u8));
+    v.insert(format!("{k}.InputText"), UiValue::String(String::new()));
+    // No checkbox and no picker (an empty list hides it).
+    v.insert(format!("{k}.Checkbox"), num(0));
+    for e in [
+        "CheckboxText",
+        "CheckboxControlledAttribute",
+        "PickerList",
+        "PickerDescriptions",
+    ] {
+        v.insert(format!("{k}.{e}"), UiValue::String(String::new()));
+    }
+    v.insert(format!("{k}.PickerDefault"), num(0));
+    v.insert(format!("{k}.Filter"), num(0));
+    for (i, label) in labels.into_iter().enumerate() {
+        v.insert(format!("{k}.Label{i}"), UiValue::String(label));
+        v.insert(
+            format!("{k}.Callback{i}"),
+            UiValue::String(format!(
+                "{} {} {} {}",
+                crate::input::SCRIPT_DIALOG_RESULT,
+                p.kind,
+                i + 1,
+                p.owner
+            )),
+        );
     }
 }
 
