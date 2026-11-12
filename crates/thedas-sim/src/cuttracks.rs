@@ -41,13 +41,16 @@
 //! cutscene +0xa0 and +0xb0), which only a cutscene played at another object sets
 //! (0x7cdc40); a cutscene loaded by name plays where it was made.
 //!
+//! - Kind 24, `ActionJumpToCamera` (`AJSC`; built by 0x7dc450, update 0x7df2f0): see
+//!   [`CameraJump`].
+//!
 //! Provisional: which way a camera actor looks (taken as its local +Y, as a stage camera's;
 //! up is +Z); whether a field of view is vertical; tracks outside their span (a track is
 //! taken to apply from its start and to hold its value at its end after it); an actor with
 //! no motion track stands at its base; a camera with no field-of-view track sees 45°; a
-//! missing transition is linear. Not followed yet: a camera actor that jumps to a camera of
-//! the cutscene's stage (`ActionJumpToCamera`, most conversation cutscenes) or is linked to
-//! another actor; while one is, [`Tracks::camera_at`] gives no camera.
+//! missing transition is linear. Not followed yet: a camera actor linked to another actor
+//! (`ActionLinkToActor`, kind 27: 14 camera tracks in the game's cutscenes); while one is,
+//! [`Tracks::camera_at`] gives no camera.
 
 use thedas_formats::Gff4;
 use thedas_formats::gff4::{StructId, Value};
@@ -74,6 +77,7 @@ const FIELD_TRACK_START: u32 = 5301;
 const FIELD_TRACK_END: u32 = 5302;
 const FIELD_TRACK_CURVES: u32 = 5303;
 const FIELD_CAMERA_ACTOR: u32 = 5610;
+const FIELD_JUMP_BY_PLACE: u32 = 5570;
 const FIELD_ANIMATION: u32 = 5400;
 const FIELD_ANIMATION_TREE: u32 = 5401;
 const FIELD_ANIMATION_SPEED: u32 = 5402;
@@ -309,6 +313,39 @@ pub struct PlaceTrack {
     pub look_at: Option<String>,
 }
 
+/// An `ActionJumpToCamera` track (kind 24, `AJSC`): while it plays, the actor (a camera)
+/// is a camera of the cutscene's stage file (cutscene +0xc4), placed as the cutscene is.
+///
+/// Traced: the constructor 0x7dc450 reads the name (field 1, +0x28) and two flags, 5570
+/// (+0x44) and 5571 (+0x45). The first update (0x7df2f0, once: +0x46) resolves the camera:
+/// with 5570 the name is a place's and the camera is that place's default camera
+/// (0x7d1e10); with neither flag it is the camera of that name. 0x7deaf0 then reads the
+/// stage camera (0x7d1ea0: found by exact name among the stage's cameras, 11001, by
+/// 0x7d1bf0; position 4, rotation 5, field of view 11003) and places it as the cutscene is
+/// (0x4cb6d0 turns the position by the cutscene's rotation +0xb0 and adds its position
+/// +0xa0; 0x4cb640 multiplies the rotations). Every update sets the actor's world position
+/// (0x7cf450), rotation (0x7cdde0) and field of view (+0x64) to it; it runs after the
+/// actor's curve tracks, so it overrides them.
+///
+/// Provisional: 5571 (a camera named after the place of a jump-to-place track of another
+/// actor, 0x7df369) is not followed: no cutscene or conversation line of the game sets it.
+/// Stage camera kinds 1 to 3 (11009; 0x7de060 and 0x7de220 aim them) are taken as plain
+/// cameras. A camera the stage does not have gives no pose here (the executable leaves the
+/// actor at the world's origin).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CameraJump {
+    pub start: f32,
+    pub end: f32,
+    /// The stage camera's name, or with [`CameraJump::by_place`] the place's.
+    pub camera: String,
+    /// Field 5570: `camera` names a place, whose default camera this is.
+    pub by_place: bool,
+}
+
+/// A stage camera's pose in the cutscene's space, by its name (or, when the flag is set,
+/// by the name of the place whose default camera it is); see [`CameraJump`].
+pub type StageCameraLookup<'a> = dyn Fn(&str, bool) -> Option<Pose> + 'a;
+
 /// A stage place's position and rotation by name (see [`Actor::stage_pose_at`]).
 pub type PlaceLookup<'a> = dyn Fn(&str) -> Option<([f32; 3], [f32; 4])> + 'a;
 
@@ -347,10 +384,10 @@ pub struct Actor {
     pub animations: Vec<AnimationTrack>,
     /// Kind-25 tracks, in the file's order.
     pub places: Vec<PlaceTrack>,
+    /// Kind-24 tracks, in the file's order.
+    pub camera_jumps: Vec<CameraJump>,
     /// Spans (start, end) of tracks that place the actor by other means, which are not
-    /// followed: `ActionJumpToCamera` (kind 24, onto a camera of the cutscene's stage;
-    /// update 0x7df2f0, which sets the actor's world placement and field of view each tick
-    /// and so overrides the curves) and `ActionLinkToActor` (kind 27).
+    /// followed: `ActionLinkToActor` (kind 27).
     pub placed_elsewhere: Vec<(f32, f32)>,
 }
 
@@ -615,6 +652,7 @@ impl Tracks {
                 fov: Vec::new(),
                 animations: Vec::new(),
                 places: Vec::new(),
+                camera_jumps: Vec::new(),
                 placed_elsewhere: Vec::new(),
             };
             for tr in structs(g, a, FIELD_ACTOR_TRACKS) {
@@ -646,9 +684,24 @@ impl Tracks {
                             out.cuts.push((start, id));
                         }
                     }
-                    TRACK_JUMP_TO_CAMERA | TRACK_LINK_TO_ACTOR => {
-                        actor.placed_elsewhere.push((start, end))
+                    TRACK_JUMP_TO_CAMERA => {
+                        let camera = g
+                            .field(tr, FIELD_PLACE_NAME)
+                            .and_then(Value::as_str)
+                            .map(|s| s.trim_end_matches('\0').to_string())
+                            .unwrap_or_default();
+                        let by_place = g
+                            .field(tr, FIELD_JUMP_BY_PLACE)
+                            .and_then(Value::as_u64)
+                            .is_some_and(|v| v != 0);
+                        actor.camera_jumps.push(CameraJump {
+                            start,
+                            end,
+                            camera,
+                            by_place,
+                        });
                     }
+                    TRACK_LINK_TO_ACTOR => actor.placed_elsewhere.push((start, end)),
                     TRACK_SNAP_TO_WALKMESH => actor.snaps = true,
                     TRACK_JUMP_TO_PLACE => {
                         let text = |l| {
@@ -705,11 +758,28 @@ impl Tracks {
         self.actors.iter().find(|a| a.id == id)
     }
 
-    /// The camera's pose `t` seconds into the cutscene, once a cut has made one; `None`
+    /// The camera's world pose `t` seconds into the cutscene, once a cut has made one: the
+    /// camera actor's pose placed as the cutscene is (the camera reads the actor's world
+    /// position and rotation, 0x7dd6b8 -> 0x7cdd30 and 0x7cdea0, which its tracks set
+    /// through the cutscene's placement, 0x7d0660 and 0x7cf6b0), or the stage camera a
+    /// jump puts it on (see [`CameraJump`]; `camera` finds the stage's cameras). `None`
     /// while the camera actor is placed by a track not followed (see
-    /// [`Actor::placed_elsewhere`]).
-    pub fn camera_at(&self, t: f32) -> Option<Pose> {
+    /// [`Actor::placed_elsewhere`]) or jumps to a camera the stage does not have.
+    pub fn camera_at(
+        &self,
+        t: f32,
+        placement: Placement,
+        camera: &StageCameraLookup,
+    ) -> Option<Pose> {
         let actor = self.camera_actor(t)?;
+        if let Some(j) = actor
+            .camera_jumps
+            .iter()
+            .rev()
+            .find(|j| j.start <= t && t <= j.end)
+        {
+            return camera(&j.camera, j.by_place).map(|p| placement.pose(p));
+        }
         if actor
             .placed_elsewhere
             .iter()
@@ -717,7 +787,7 @@ impl Tracks {
         {
             return None;
         }
-        Some(actor.pose_at(t))
+        Some(placement.pose(actor.pose_at(t)))
     }
 }
 
@@ -1009,8 +1079,9 @@ mod tests {
         let t = Tracks::from_gff4(&cut());
         assert_eq!(t.cuts, [(0.5, 7)]);
         assert_eq!(t.actors.len(), 1);
-        assert!(t.camera_at(0.25).is_none());
-        let p = t.camera_at(1.0).unwrap();
+        let none = |_: &str, _: bool| None;
+        assert!(t.camera_at(0.25, Placement::NONE, &none).is_none());
+        let p = t.camera_at(1.0, Placement::NONE, &none).unwrap();
         // x 5 turned a quarter about Z is y 5, from the base at x 100.
         assert!(
             (p.position[0] - 100.0).abs() < 1e-4
@@ -1023,11 +1094,55 @@ mod tests {
         let f = rotate(p.rotation, [0.0, 1.0, 0.0]);
         assert!((f[1] + 1.0).abs() < 1e-4, "{f:?}");
         assert_eq!(p.fov, 30.0);
-        // A camera a stage places is not followed while it is.
-        let mut staged = t.clone();
-        staged.actors[0].placed_elsewhere.push((0.75, 1.5));
-        assert!(staged.camera_at(1.0).is_none());
-        assert!(staged.camera_at(1.6).is_some());
+        // Placed as the cutscene is: half a turn about Z, then moved.
+        let half = Placement {
+            position: [1.0, 2.0, 3.0],
+            rotation: [0.0, 0.0, 1.0, 0.0],
+        };
+        let q = t.camera_at(1.0, half, &none).unwrap();
+        assert!(
+            (q.position[0] + 99.0).abs() < 1e-3
+                && (q.position[1] + 3.0).abs() < 1e-3
+                && (q.position[2] - 5.0).abs() < 1e-3,
+            "{:?}",
+            q.position
+        );
+        // A camera linked to another actor is not followed while it is.
+        let mut linked = t.clone();
+        linked.actors[0].placed_elsewhere.push((0.75, 1.5));
+        assert!(linked.camera_at(1.0, Placement::NONE, &none).is_none());
+        assert!(linked.camera_at(1.6, Placement::NONE, &none).is_some());
+        // A jump to a stage camera wins over the curves while it plays, placed as the
+        // cutscene is; a camera the stage lacks gives none.
+        let mut jumps = t.clone();
+        jumps.actors[0].camera_jumps.push(CameraJump {
+            start: 0.75,
+            end: 1.5,
+            camera: "wide".into(),
+            by_place: false,
+        });
+        let stage = |name: &str, by_place: bool| {
+            (name == "wide" && !by_place).then_some(Pose {
+                position: [0.0, 1.0, 10.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                fov: 45.0,
+            })
+        };
+        let j = jumps.camera_at(1.0, half, &stage).unwrap();
+        assert!(
+            (j.position[0] - 1.0).abs() < 1e-4
+                && (j.position[1] - 1.0).abs() < 1e-4
+                && (j.position[2] - 13.0).abs() < 1e-4,
+            "{:?}",
+            j.position
+        );
+        assert_eq!(j.rotation, half.rotation);
+        assert_eq!(j.fov, 45.0);
+        assert!(jumps.camera_at(1.0, half, &none).is_none());
+        assert_eq!(
+            jumps.camera_at(1.6, half, &stage),
+            t.camera_at(1.6, half, &none)
+        );
         // Other files have none.
         let mut other = cut();
         other.file_type = FourCC::new(b"CONV");

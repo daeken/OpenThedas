@@ -219,7 +219,7 @@ impl TalkCamera {
             log::debug!("staged line: no stage file {}", shot.stage_file);
             return None;
         };
-        let Some(cam) = stage.camera_for(&shot.place) else {
+        let Some(cam) = stage.jump_camera(&shot.place, shot.by_place) else {
             log::debug!(
                 "staged line: stage {} has no camera for {}",
                 shot.stage_file,

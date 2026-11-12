@@ -297,11 +297,21 @@ struct Line {
     /// Nothing to choose: it continues by itself once played.
     waits: bool,
     continued: bool,
+    /// A cutscene played while it was up (a line its cutscene speaks), and whether that
+    /// cutscene has ended.
+    cut_seen: bool,
+    cut_done: bool,
 }
 
 impl Line {
+    /// Whether it has played: its voice-over's (or reading) time has passed, or the
+    /// cutscene that spoke it has ended. The executable gives a line that plays its own
+    /// cutscene the cutscene's length (`GameModeDialog` 0x68e5be-0x68e5ff: the line's
+    /// timer +0x2c4 is the cutscene's 5000, +0x8). Provisional: a line whose cutscene is
+    /// played by the cutscene mode (a `CUTR` reference) is taken to end with it the same
+    /// way.
     fn played(&self) -> bool {
-        self.t >= self.voice_ms.unwrap_or_else(|| line_ms(&self.key.1))
+        self.cut_done || self.t >= self.voice_ms.unwrap_or_else(|| line_ms(&self.key.1))
     }
 }
 
@@ -777,9 +787,10 @@ impl UiLayer {
                 .bridge
                 .bind(thedas_ui::binding::sim_values_for(&sim, &shown));
             let waits = thedas_ui::binding::awaits_continue(&sim);
+            let cutscene = sim.world.cutscene.is_some();
             let line = thedas_ui::binding::conversation(&sim).map(|d| {
                 let key: LineKey = (d.dialog, d.line, d.replies.iter().map(|r| r.0).collect());
-                (key, waits)
+                (key, waits, cutscene)
             });
             // Before a game, the start menu, or the screen it opened (options, the load
             // screen).
@@ -822,16 +833,20 @@ impl UiLayer {
                 .party_picker_submit();
         }
         self.line = match (line, self.line.take()) {
-            (Some((key, _)), Some(mut l)) if l.key == key => {
+            (Some((key, _, cutscene)), Some(mut l)) if l.key == key => {
                 l.t += dt_ms;
+                l.cut_done |= l.cut_seen && !cutscene;
+                l.cut_seen |= cutscene;
                 Some(l)
             }
-            (Some((key, waits)), _) => Some(Line {
+            (Some((key, waits, cutscene)), _) => Some(Line {
                 key,
                 t: 0.0,
                 voice_ms: None,
                 waits,
                 continued: false,
+                cut_seen: cutscene,
+                cut_done: false,
             }),
             (None, _) => None,
         };
@@ -841,9 +856,10 @@ impl UiLayer {
                 "Conversation.ResponsesReady",
                 thedas_ui::UiValue::Number(played as u8 as f64),
             );
+            // The conversation screen is not up while a cutscene plays: the line goes on
+            // once it is.
             if played && l.waits && !l.continued {
-                l.continued = true;
-                self.continue_conversation();
+                l.continued = Self::continue_in(&mut self.stage);
             }
         }
         self.show_cutscene_line(sim);
@@ -946,8 +962,7 @@ impl UiLayer {
             // Skip to the end of the line: its replies show (or it goes on) next frame.
             l.t = f64::INFINITY;
         } else if l.waits && !l.continued {
-            l.continued = true;
-            self.continue_conversation();
+            l.continued = Self::continue_in(&mut self.stage);
         }
     }
 
@@ -1032,14 +1047,19 @@ impl UiLayer {
 
     /// conversation.gfx's continue action (it sends `Conversation.SelectResponse 0` when the
     /// line has nothing to choose).
-    fn continue_conversation(&mut self) {
-        if let Some(m) = self
-            .stage
+    /// Continues the conversation on screen (conversation.gfx's `ContinueButtonAction`);
+    /// false when the conversation screen is not up.
+    fn continue_in(stage: &mut Stage) -> bool {
+        match stage
             .movies
             .iter_mut()
             .find(|m| m.name == "conversation.gfx")
         {
-            m.call("_global.Conversation.ContinueButtonAction", &[]);
+            Some(m) => {
+                m.call("_global.Conversation.ContinueButtonAction", &[]);
+                true
+            }
+            None => false,
         }
     }
 

@@ -45,6 +45,7 @@ pub mod field {
     pub const CUT_ACTORS: u32 = 5200;
     pub const ACTOR_NAME: u32 = 2;
     pub const ACTOR_TRACKS: u32 = 5206;
+    pub const JUMP_BY_PLACE: u32 = 5570;
 }
 
 /// The cutscene track that puts a camera at a stage place's camera.
@@ -136,17 +137,35 @@ impl Stage {
             None => self.camera(name),
         }
     }
+
+    /// The camera an `ActionJumpToCamera` track (`AJSC`) puts its actor on (0x7d1ea0 ->
+    /// 0x7d1bf0): the camera of exactly that name, or, when the track's 5570 is set
+    /// (`by_place`), the default camera of the place of exactly that name (0x7d1e10).
+    pub fn jump_camera(&self, name: &str, by_place: bool) -> Option<&StageCamera> {
+        let name = if by_place {
+            self.places
+                .iter()
+                .find(|p| p.name == name)?
+                .default_camera
+                .as_deref()?
+        } else {
+            name
+        };
+        self.cameras.iter().find(|c| c.name == name)
+    }
 }
 
 /// The shot a conversation line takes: the stage (an area stage's tag), the stage file
-/// its cinematics were made with (without `.stg`), the place whose camera frames it and
-/// the place each actor stands at (actor as the cutscene names it: `OWNER`, `PLAYER`,
-/// `HENCH:<tag>` or a creature's tag; place).
+/// its cinematics were made with (without `.stg`), the camera that frames it (see
+/// [`Stage::jump_camera`]: `place` names the camera, or with `by_place` the place whose
+/// default camera it is) and the place each actor stands at (actor as the cutscene names
+/// it: `OWNER`, `PLAYER`, `HENCH:<tag>` or a creature's tag; place).
 #[derive(Clone, Debug, PartialEq)]
 pub struct LineShot {
     pub stage: String,
     pub stage_file: String,
     pub place: String,
+    pub by_place: bool,
     pub actors: Vec<(String, String)>,
     /// How long the line's cinematics run (seconds, 5000), when the line has its own.
     pub seconds: Option<f32>,
@@ -166,11 +185,12 @@ pub fn line_shots(g: &Gff4) -> TypedResult<Vec<Option<LineShot>>> {
             out.push(None);
             continue;
         };
-        if let (Some(file), Some(place)) = (&s.stage_file, &s.camera) {
+        if let (Some(file), Some((place, by_place))) = (&s.stage_file, &s.camera) {
             out.push(Some(LineShot {
                 stage: s.stage.clone(),
                 stage_file: file.clone(),
                 place: place.clone(),
+                by_place: *by_place,
                 actors: s.places.clone(),
                 seconds: s.seconds,
             }));
@@ -192,6 +212,7 @@ pub fn line_shots(g: &Gff4) -> TypedResult<Vec<Option<LineShot>>> {
                 stage: s.stage.clone(),
                 stage_file: o.stage_file.clone()?,
                 place: place.clone(),
+                by_place: true,
                 actors: o.places.clone(),
                 seconds: s.seconds,
             })
@@ -206,8 +227,8 @@ struct Staging {
     stage: String,
     speaker: String,
     stage_file: Option<String>,
-    /// The place whose camera frames the line.
-    camera: Option<String>,
+    /// The camera that frames the line: the `AJSC` track's name and its 5570.
+    camera: Option<(String, bool)>,
     /// Each actor's place (actor name, place).
     places: Vec<(String, String)>,
     seconds: Option<f32>,
@@ -250,7 +271,10 @@ fn staging(d: &Doc, line: StructId) -> TypedResult<Option<Staging>> {
                 continue;
             };
             if is_camera && label == SET_CAMERA && s.camera.is_none() {
-                s.camera = Some(place);
+                let by_place = d
+                    .opt_i64(track, field::JUMP_BY_PLACE)?
+                    .is_some_and(|v| v != 0);
+                s.camera = Some((place, by_place));
             } else if label == SET_PLACE {
                 s.places.push((name.clone(), place));
             }
@@ -302,12 +326,23 @@ mod tests {
         assert!(st.camera_for("nobody").is_none());
         // A name that is no place's is a camera's.
         assert_eq!(st.camera_for("Group").unwrap().name, "group");
+        // A jump finds a camera by its exact name, or a place's default camera.
+        assert_eq!(st.jump_camera("group", false).unwrap().name, "group");
+        assert!(st.jump_camera("Group", false).is_none());
+        assert_eq!(st.jump_camera("node1_mother", true).unwrap().name, "cam1");
+        assert!(st.jump_camera("node1_mother", false).is_none());
     }
 
     #[test]
     fn finds_each_lines_shot() {
         let mut b = Builder::new(b"CONV");
-        let set = b.add(b"AJSC", vec![(field::NAME, s("node1_mother"))]);
+        let set = b.add(
+            b"AJSC",
+            vec![
+                (field::NAME, s("node1_mother")),
+                (field::JUMP_BY_PLACE, Value::U8(255)),
+            ],
+        );
         let track = b.add(b"TRAK", vec![]);
         let camera = b.add(
             b"ACTR",
@@ -376,6 +411,7 @@ mod tests {
                     stage: "bhn_stage".into(),
                     stage_file: "bhn_stage_1".into(),
                     place: "node1_mother".into(),
+                    by_place: true,
                     actors: vec![("PLAYER".into(), "node2_player".into())],
                     seconds: Some(2.5),
                 }),
@@ -384,6 +420,7 @@ mod tests {
                     stage: "bhn_stage".into(),
                     stage_file: "bhn_stage_1".into(),
                     place: "node2_player".into(),
+                    by_place: true,
                     actors: vec![("PLAYER".into(), "node2_player".into())],
                     seconds: None,
                 }),
