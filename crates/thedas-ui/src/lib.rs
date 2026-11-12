@@ -450,6 +450,16 @@ pub fn stage_scale(size: (u32, u32), authored: (f64, f64)) -> f64 {
     (w / authored.0).min(h / authored.1)
 }
 
+/// RGBA8 `pixels` with each colour multiplied by its alpha.
+pub fn premultiply(pixels: &mut [u8]) {
+    for p in pixels.chunks_exact_mut(4) {
+        let a = u32::from(p[3]);
+        for c in &mut p[..3] {
+            *c = ((u32::from(*c) * a + 127) / 255) as u8;
+        }
+    }
+}
+
 /// A clip a pad's focus can land on: the movie, its path, and its bounds in window pixels
 /// (`x0, y0, x1, y1`).
 #[derive(Clone, Debug, PartialEq)]
@@ -919,16 +929,26 @@ impl UiMovie {
         .flatten()
     }
 
-    /// Reads the last rendered frame back to the CPU.
+    /// Reads the last rendered frame back to the CPU (RGBA8, premultiplied alpha).
     pub fn capture(&mut self) -> Option<Rgba> {
         self.with_player(|p| {
             let r: &mut dyn std::any::Any = p.renderer_mut();
             r.downcast_mut::<WgpuRenderBackend<TextureTarget>>()
                 .and_then(|b| b.capture_frame())
-                .map(|img| Rgba {
-                    width: img.width(),
-                    height: img.height(),
-                    pixels: img.into_raw(),
+                .map(|img| {
+                    let (width, height) = (img.width(), img.height());
+                    // Ruffle hands the frame back unmultiplied (it divides by alpha for
+                    // export); blending wants it premultiplied, as the GPU texture is.
+                    // Blended unmultiplied, a nearly clear pixel's full colour was added:
+                    // the minimap lens's orange rim and the headers' smoke glowed in
+                    // captures (the window's GPU composite was right).
+                    let mut pixels = img.into_raw();
+                    premultiply(&mut pixels);
+                    Rgba {
+                        width,
+                        height,
+                        pixels,
+                    }
                 })
         })
         .flatten()

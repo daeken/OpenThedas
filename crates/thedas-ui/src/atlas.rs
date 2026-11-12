@@ -196,3 +196,44 @@ mod tests {
         assert!(crop(&img, u32::MAX, 0, 2, 1).is_none());
     }
 }
+
+#[cfg(test)]
+mod install_tests {
+    use super::*;
+
+    /// Against a real install (`THEDAS_INSTALL`): an atlas image's pixels, written to
+    /// `$ATLAS_PNG` when set, for comparing with the original's.
+    #[test]
+    #[ignore]
+    fn dump_an_atlas_image() {
+        use std::sync::Arc;
+        let install = std::env::var_os("THEDAS_INSTALL").expect("THEDAS_INSTALL");
+        let install = thedas_vfs::DaoInstall::open(std::path::Path::new(&install)).unwrap();
+        let vfs = Arc::new(
+            install
+                .global_vfs(thedas_vfs::install::TextureQuality::High)
+                .unwrap(),
+        );
+        let lookup = crate::stage::vfs_lookup(&vfs);
+        let names: Vec<String> = vfs
+            .names()
+            .into_iter()
+            .filter(|n| n.starts_with("atl_") && n.ends_with("_dat.xml"))
+            .collect();
+        let mut src = ImageSource::new(lookup, names);
+        let name = std::env::var("ATLAS_IMAGE").unwrap_or("minimap_i4e.dds".into());
+        let img = src.image(&name).expect("the image");
+        let a: Vec<u8> = img.pixels.chunks(4).map(|p| p[3]).collect();
+        eprintln!(
+            "{name}: {}x{}, alpha min {} max {} mean {}",
+            img.width,
+            img.height,
+            a.iter().min().unwrap(),
+            a.iter().max().unwrap(),
+            a.iter().map(|&x| x as u64).sum::<u64>() / a.len() as u64
+        );
+        if let Some(out) = std::env::var_os("ATLAS_PNG") {
+            std::fs::write(out, crate::stage::encode_png(&img).unwrap()).unwrap();
+        }
+    }
+}
