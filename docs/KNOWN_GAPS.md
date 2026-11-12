@@ -136,7 +136,7 @@ these, so they are the places where one person or stream can take a large, separ
 ### Audio
 
 - **Event detail.** Only volume envelopes are applied; pitch, pan and reverb-level envelopes,
-  layer effects and random pitch and volume are ignored, so repeated sounds are identical
+  layer effects, category pitch and the sound definitions' own randomization are ignored
   (`AUD-001` to `AUD-004`).
 - **Music.** No streaming, and `PlayMusic` is dropped (`AUD-026`, `AUD-032`).
 - **Reverb.** The secondary reverb instances are not modelled.

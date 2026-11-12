@@ -154,9 +154,13 @@ pub struct Event {
     pub guid: [u8; 16],
     /// Linear gain (FMOD Designer stores the dB slider as a factor: 0.501 is -6 dB).
     pub volume: f32,
-    /// Octaves.
+    /// Pitch, raw: 1.0 is 4 octaves (`fmod_event.dll` `EventI::getPitch`, 0x100103e0:
+    /// octaves = raw x 4, semitones x 48, tones x 24).
     pub pitch: f32,
+    /// Random pitch, raw like `pitch`: each play is offset uniformly within plus or minus
+    /// this (0x1000f790).
     pub pitch_randomization: f32,
+    /// Random volume, linear: each play's gain is scaled by 1 - v .. 1 (0x10010184).
     pub volume_randomization: f32,
     pub priority: u32,
     pub max_playbacks: u32,
