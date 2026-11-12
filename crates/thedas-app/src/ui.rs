@@ -803,10 +803,6 @@ impl UiLayer {
                 }
                 self.refresh_saves();
             }
-            // Provisional: there is no start menu to go back to yet.
-            "GameModeController.ShutDownToStartMenuMessage" => {
-                log::warn!("ui: quitting to the start menu is not available yet");
-            }
             _ => return false,
         }
         true
