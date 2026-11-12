@@ -343,6 +343,21 @@ fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>
             children.push(n);
         }
     }
+    finish_node(gff, id, kind, transform, children).map(Some)
+}
+
+/// A node's own fields, once its children are read. Kept out of line so that the recursion
+/// in [`read_node`] carries only the child walk: a deep (or cyclic, until [`MAX_DEPTH`])
+/// tree would otherwise overflow the stack in debug builds.
+#[inline(never)]
+fn finish_node(
+    gff: &Gff4,
+    id: StructId,
+    kind: FourCC,
+    transform: Transform,
+    children: Vec<Node>,
+) -> TypedResult<Node> {
+    let d = Doc::new(gff, "mmh node");
     // A mesh node without a chunk name (such as the `GOB` root of many props) only groups
     // its children.
     let mesh = if kind == KIND_MESH {
@@ -399,7 +414,7 @@ fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>
     } else {
         None
     };
-    Ok(Some(Node {
+    Ok(Node {
         kind,
         name: d.opt_str(id, field::NAME)?,
         transform,
@@ -420,7 +435,7 @@ fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>
             None => None,
         },
         children,
-    }))
+    })
 }
 
 /// Kept out of line: the emitter's fields would otherwise sit in every frame of the
