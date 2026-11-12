@@ -636,6 +636,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             UiValue::String(key.into()),
         );
     }
+    key_mappings(sim, &mut v);
     // The start menu (startmenu2.gfx): its buttons show (`GameMode.ShowStartMenuContents`),
     // no other campaigns are installed (`Client.ModuleInfoList`), and there is no online
     // account or welcome message about one. Provisional: the version string is this port's.
@@ -727,6 +728,52 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         quickbar(sim, who, &mut v);
     }
     v
+}
+
+/// The keys bound to the game's actions, as the movies (and the designer tags in text, see
+/// [`crate::keys`]) read them: `InputMappings.Mappings.<action>.PrimaryMappedKey` and
+/// `SecondaryMappedKey`, from `keymap.gda`'s default bindings.
+fn key_mappings(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
+    /// `keymap.gda`'s first binding column.
+    const HASH_BINDING: u32 = 0xf2e4_79b8;
+    let tables = sim.world.tables();
+    let (Some(keymap), Some(inputmap)) = (tables.get(0, "keymap"), tables.get(0, "inputmap"))
+    else {
+        return;
+    };
+    let name = |row: i64| match inputmap.order.iter().position(|&r| r == row) {
+        Some(_) => match inputmap.rows.get(&row).and_then(|c| c.get(1)) {
+            Some(thedas_formats::gda::Cell::Int(s)) => sim.string(*s as u32),
+            _ => None,
+        },
+        None => None,
+    };
+    for &row in &keymap.order {
+        let label = match keymap.cell("Label", row) {
+            Some(thedas_formats::gda::Cell::String(s)) => {
+                s.trim().trim_end_matches('\0').to_string()
+            }
+            _ => continue,
+        };
+        let Some((action, which)) = label.rsplit_once('_') else {
+            continue;
+        };
+        let slot = match which {
+            "0" => "PrimaryMappedKey",
+            "1" => "SecondaryMappedKey",
+            _ => continue,
+        };
+        let binding = match keymap.cell_by_hash(HASH_BINDING, row) {
+            Some(thedas_formats::gda::Cell::String(s)) => s.clone(),
+            _ => String::new(),
+        };
+        if let Some(n) = crate::keys::binding_name(&binding, name) {
+            v.insert(
+                format!("InputMappings.Mappings.{action}.{slot}"),
+                UiValue::String(n),
+            );
+        }
+    }
 }
 
 /// The quickbar of the party member the player controls (`GUI.SelectedChar.Stats.
