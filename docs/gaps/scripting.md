@@ -209,13 +209,14 @@ call to the exe's event constructor 0x69bac0):
   `LOCKED`, `FAILTOOPEN`, `BLOCKED`, `CLICK`, `TRAP_DISARMED` have no engine sender. The health
   change handler (0x6bc4b0) builds no event.
 - **Now raised:** `MANA_STAM_DEPLETED` (0x6afb90), the `AREALOADSAVE_*` trio on loading a save
-  (0x67f1c0, 0x6c90ab, 0x6c92b9) and `MODULE_PRESAVE` before a save (0x5d6c40).
+  (0x67f1c0, 0x6c90ab, 0x6c92b9), `MODULE_PRESAVE` before a save (0x5d6c40) and `GUI_OPENED` when a
+  screen opens (0x60aeb0).
 - **Engine-raised, still missing here:** `ITEM_ONHIT` (0x757fc0, one per on-hit item property on a
   hit, to the item; the ranged path stores them on the projectile), `TRAP_TRIGGERED` (physics touch
   0x74f900, and a trapped placeable's use 0x7a7a96 instead of `USE`), `PLACEABLE_COLLISION`
   (0x74daa0, the controlled creature touching a placeable, once per placeable),
   `PLACEABLE_ONCLICK` (0x7f6550, with `ON_ORDER_RECEIVED`), `GIFT_ITEM` (0x718210),
-  `USE_PLOTACTION` (0x6fc480) and `GUI_OPENED` (0x60aeb0). `USE` also carries int 0 = 1 when the
+  and `USE_PLOTACTION` (0x6fc480). `USE` also carries int 0 = 1 when the
   user stands on the placeable's front side.
 
 ### Commands that do nothing, by how often scripts build them
