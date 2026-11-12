@@ -69,29 +69,25 @@ impl Library {
         }
     }
 
-    /// The audio folders of an install, lowest priority first: the core package, the
-    /// single-player campaign, then each DLC folder present (`Addins/*/core` and `module`,
-    /// `Offers/*/...`), each with `audio/sound` then `audio/vo/<language>/vo`.
-    pub fn install_dirs(root: &Path, language: &str) -> Vec<PathBuf> {
-        let mut packages = vec![
-            root.join("packages/core"),
-            root.join("packages/core_ep1"),
-            root.join("modules/single player"),
-        ];
+    /// The audio folders a campaign uses, lowest priority first: the core package, each
+    /// DLC's `core` folder (`Addins/*/core`, `Offers/*/core`), then the campaign's module
+    /// (`modules/<module>`), each with `audio/sound` then `audio/vo/<language>/vo`. Other
+    /// modules' folders (`packages/core_ep1`, DLC `module` folders) are not: they carry their
+    /// own projects under the same names (`music`), which the campaign must not pick up.
+    pub fn install_dirs(root: &Path, module: &str, language: &str) -> Vec<PathBuf> {
+        let mut packages = vec![root.join("packages/core")];
         for top in ["Addins", "Offers"] {
             let mut dlc: Vec<PathBuf> = std::fs::read_dir(root.join(top))
                 .into_iter()
                 .flatten()
                 .flatten()
-                .map(|e| e.path())
+                .map(|e| e.path().join("core"))
                 .filter(|p| p.is_dir())
                 .collect();
             dlc.sort();
-            for d in dlc {
-                packages.push(d.join("core"));
-                packages.push(d.join("module"));
-            }
+            packages.extend(dlc);
         }
+        packages.push(root.join("modules").join(module));
         let mut out = Vec::new();
         for p in packages {
             for sub in [

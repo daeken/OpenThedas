@@ -94,6 +94,10 @@ struct Instance {
     stopping: bool,
     params: HashMap<String, f32>,
     category_gain: f32,
+    /// The event's category, lowercase.
+    category: String,
+    /// What the event ducks while it plays (its `#duck:` parameters).
+    ducks: Vec<Duck>,
     bus: Bus,
     age: f32,
 }
@@ -151,6 +155,11 @@ pub struct AudioEngine {
     next: u64,
     /// Category volumes (with their parents' applied), by lowercase name.
     categories: HashMap<String, f32>,
+    /// Each category's parent (lowercase), for ducking a category and those under it.
+    parents: HashMap<String, String>,
+    /// Ducking now applied per category: dB now, the fade-out it releases over (ms) and the
+    /// duck's depth (dB, positive), which the ramps cover in their fade times.
+    ducking: HashMap<String, (f32, f32, f32)>,
     pub volumes: Volumes,
     listener: Listener,
     rng: u64,
@@ -175,6 +184,39 @@ fn bus_for(category: &str) -> Bus {
     }
 }
 
+/// A `#duck:<category>,<fade in ms>,<?>,<fade out ms>,<dB>` parameter: while its event plays,
+/// the category (and those under it) is turned down by dB, ramping in and out over the fade
+/// times. DA:O's events name them (the intro: `#duck:music,3000,0,5000,-60`). Provisional:
+/// the third number's meaning, the dB ramp (linear in dB), and `#pause:` (not done).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Duck {
+    pub category: String,
+    pub fade_in_ms: f32,
+    pub fade_out_ms: f32,
+    pub db: f32,
+}
+
+impl Duck {
+    pub fn parse(name: &str) -> Option<Duck> {
+        let rest = name.trim().strip_prefix("#duck:")?;
+        let parts: Vec<&str> = rest.split(',').map(str::trim).collect();
+        let num = |i: usize| parts.get(i).and_then(|p| p.parse::<f32>().ok());
+        Some(Duck {
+            category: parts.first()?.to_ascii_lowercase(),
+            fade_in_ms: num(1).unwrap_or(0.0),
+            fade_out_ms: num(3).unwrap_or(0.0),
+            db: num(4)?,
+        })
+    }
+}
+
+fn parent_map(c: &Category, out: &mut HashMap<String, String>) {
+    for k in &c.children {
+        out.insert(k.name.to_ascii_lowercase(), c.name.to_ascii_lowercase());
+        parent_map(k, out);
+    }
+}
+
 fn flatten(c: &Category, parent: f32, out: &mut HashMap<String, f32>) {
     let v = parent * c.volume;
     out.insert(c.name.to_ascii_lowercase(), v);
@@ -193,8 +235,10 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
 impl AudioEngine {
     pub fn new(library: Arc<Library>, mixer: Arc<Mutex<Mixer>>) -> AudioEngine {
         let mut categories = HashMap::new();
+        let mut parents = HashMap::new();
         if let Some(cats) = library.project("audio_categories") {
             flatten(&cats.category, 1.0, &mut categories);
+            parent_map(&cats.category, &mut parents);
         }
         let (tx, rx) = channel();
         AudioEngine {
@@ -203,6 +247,8 @@ impl AudioEngine {
             instances: Vec::new(),
             next: 1,
             categories,
+            parents,
+            ducking: HashMap::new(),
             volumes: Volumes::default(),
             listener: Listener {
                 position: [0.0; 3],
@@ -257,7 +303,12 @@ impl AudioEngine {
             }
         }
         let mut params: HashMap<String, f32> = HashMap::new();
+        let mut ducks = Vec::new();
         if let EventBody::Complex { parameters, .. } = &event.body {
+            ducks = parameters
+                .iter()
+                .filter_map(|p| Duck::parse(&p.name))
+                .collect();
             for p in parameters {
                 params.insert(p.name.to_ascii_lowercase(), p.min);
             }
@@ -290,6 +341,8 @@ impl AudioEngine {
             stopping: false,
             params,
             category_gain,
+            category: category.to_ascii_lowercase(),
+            ducks,
             bus: bus_for(&category),
             age: 0.0,
         };
@@ -594,6 +647,47 @@ impl AudioEngine {
         for (ii, si) in spawns {
             self.spawn(ii, si);
         }
+        // Ducking: each category moves towards the deepest duck its playing events ask for,
+        // over the duck's fade-in, and back over its fade-out once they stop.
+        let mut targets: HashMap<String, (f32, f32, f32)> = HashMap::new();
+        for inst in &self.instances {
+            if inst.stopping {
+                continue;
+            }
+            for d in &inst.ducks {
+                let e =
+                    targets
+                        .entry(d.category.clone())
+                        .or_insert((0.0, d.fade_in_ms, d.fade_out_ms));
+                if d.db < e.0 {
+                    *e = (d.db, d.fade_in_ms, d.fade_out_ms);
+                }
+            }
+        }
+        for (k, (db, _, fout)) in &targets {
+            let e = self.ducking.entry(k.clone()).or_insert((0.0, 0.0, 0.0));
+            e.1 = *fout;
+            e.2 = db.abs().max(e.2);
+        }
+        for (k, e) in self.ducking.iter_mut() {
+            let (target, fade_ms) = match targets.get(k) {
+                Some((db, fin, _)) => (*db, *fin),
+                None => (0.0, e.1),
+            };
+            let span = e.2.max(1.0);
+            let step = if fade_ms > 0.0 {
+                span * dt * 1000.0 / fade_ms
+            } else {
+                f32::INFINITY
+            };
+            e.0 = if target < e.0 {
+                (e.0 - step).max(target)
+            } else {
+                (e.0 + step).min(target)
+            };
+        }
+        self.ducking
+            .retain(|k, d| d.0 < -1e-3 || targets.contains_key(k));
         // Gains and pans.
         let listener = &self.listener;
         let mut mixer = match self.mixer.lock() {
@@ -611,6 +705,17 @@ impl AudioEngine {
                 Bus::Dialog => self.volumes.dialog,
                 _ => self.volumes.sfx,
             };
+            // The category's and its parents' ducking.
+            let mut duck_db = 0.0;
+            let mut c = Some(inst.category.clone());
+            for _ in 0..32 {
+                let Some(name) = c else {
+                    break;
+                };
+                duck_db += self.ducking.get(&name).map(|d| d.0).unwrap_or(0.0);
+                c = self.parents.get(&name).cloned();
+            }
+            let duck_gain = 10f32.powf(duck_db / 20.0);
             let mut gain3d = 1.0;
             let mut pan = 0.0;
             let distance = inst.options.position.filter(|_| ev.is_3d()).map(|p| {
@@ -670,8 +775,14 @@ impl AudioEngine {
                     .and_then(|d| fev.template(d))
                     .map(|t| t.volume)
                     .unwrap_or(1.0);
-                let g =
-                    ev.volume * tvol * inst.category_gain * user * env_gain * gain3d * inst.fade;
+                let g = ev.volume
+                    * tvol
+                    * inst.category_gain
+                    * duck_gain
+                    * user
+                    * env_gain
+                    * gain3d
+                    * inst.fade;
                 for v in &s.voices {
                     mixer.fade(*v, g, ramp, false);
                     mixer.set_pan(*v, pan);
@@ -732,6 +843,26 @@ mod tests {
         def: u16,
         loop_mode: u32,
     ) {
+        event_with(
+            w,
+            name,
+            volume,
+            (fade_in, fade_out),
+            def,
+            loop_mode,
+            "param00",
+        );
+    }
+
+    fn event_with(
+        w: &mut W,
+        name: &str,
+        volume: f32,
+        (fade_in, fade_out): (u32, u32),
+        def: u16,
+        loop_mode: u32,
+        param: &str,
+    ) {
         w.u32(8).s(name);
         w.0.extend_from_slice(&[0; 16]);
         w.f(volume)
@@ -765,7 +896,7 @@ mod tests {
             .u32(0);
         w.f(0.0).f(0.0).f(0.0).f(1.0).f(-1.0).f(-1.0).u32(2).u32(2);
         w.u32(1)
-            .s("param00")
+            .s(param)
             .f(0.0)
             .f(0.0)
             .f(1.0)
@@ -783,10 +914,11 @@ mod tests {
         w.u32(1).u32(0x200).u32(1).s("test");
         w.s("master").f(1.0).f(0.0).u32(0).u32(0).u32(1);
         w.s("sfx").f(0.5).f(0.0).u32(0).u32(0).u32(0);
-        w.u32(1).s("grp").u32(0).u32(0).u32(3);
+        w.u32(1).s("grp").u32(0).u32(0).u32(4);
         event(&mut w, "loop", 1.0, 100, 100, 0, 0);
         event(&mut w, "once", 0.5, 0, 0, 0, 1);
         event(&mut w, "vo", 1.0, 0, 0, 1, 1);
+        event_with(&mut w, "duck", 0.0, (0, 0), 0, 0, "#duck:sfx,100,0,200,-20");
         // Templates: sequential, programmer-selected.
         w.u32(2);
         for mode in [0u32, 5] {
@@ -882,6 +1014,29 @@ mod tests {
         run(&mut e, &m, 0.2);
         assert!(!e.is_playing(h));
         assert_eq!(m.lock().unwrap().active(), 0);
+    }
+
+    #[test]
+    fn duck_parameters_turn_their_category_down_while_playing() {
+        assert_eq!(
+            Duck::parse("#duck:music,3000,0,5000,-60"),
+            Some(Duck {
+                category: "music".into(),
+                fade_in_ms: 3000.0,
+                fade_out_ms: 5000.0,
+                db: -60.0
+            })
+        );
+        assert!(Duck::parse("param00").is_none());
+        let (mut e, m) = engine("duck");
+        e.play("test/grp/loop", PlayOptions::default()).unwrap();
+        let full = run(&mut e, &m, 0.5);
+        let d = e.play("test/grp/duck", PlayOptions::default()).unwrap();
+        let ducked = run(&mut e, &m, 0.5);
+        assert!((ducked - full * 0.1).abs() < 1e-3, "{full} -> {ducked}");
+        e.stop(d, true);
+        let back = run(&mut e, &m, 0.5);
+        assert!((back - full).abs() < 1e-3, "{back}");
     }
 
     #[test]
