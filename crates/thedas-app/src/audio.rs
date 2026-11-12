@@ -164,6 +164,8 @@ struct AreaPlay {
     reverb: AreaReverb,
     /// The reverb preset applied (`None` until the first).
     preset: Option<String>,
+    /// Which reverb triggers the party leader was inside last frame.
+    inside: Vec<bool>,
 }
 
 /// A cutscene's sound tracks and which of them are playing.
@@ -928,6 +930,7 @@ impl GameAudio {
             playing: vec![None; n],
             reverb,
             preset: None,
+            inside: Vec::new(),
         });
     }
 
@@ -1006,10 +1009,21 @@ impl GameAudio {
                 }
             }
         }
-        // The reverb: the area's preset, or a reverb trigger's while the party leader is in
-        // it, faded over 0.33 s (DAOrigins.exe 0xaff1c8; set at once on arrival).
-        let at = state.leader.or(state.listener.map(|l| l.0));
-        let want = at.map_or(a.reverb.preset.as_str(), |p| a.reverb.preset_at(p));
+        // The reverb (see `AreaReverb`): the area's starting preset at once on arrival,
+        // then each reverb trigger the party leader enters sets its own, faded over 0.33 s
+        // (DAOrigins.exe 0xaff1c8).
+        let mut want = a
+            .preset
+            .clone()
+            .unwrap_or_else(|| a.reverb.initial().to_string());
+        if let Some(p) = state.leader.or(state.listener.map(|l| l.0)) {
+            let (now, entered) = a.reverb.entered(&a.inside, p);
+            if let Some(e) = entered {
+                want = e.to_string();
+            }
+            a.inside = now;
+        }
+        let want = want.as_str();
         if a.preset.as_deref() != Some(want) {
             let props = self.engine.reverb_preset(want).unwrap_or_else(|| {
                 log::debug!("audio: no reverb preset {want:?}");

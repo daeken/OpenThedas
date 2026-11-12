@@ -10,7 +10,7 @@ repository.
 
 ## Status
 
-Last updated 2026-11-12 10:20 UTC, main c2472c0
+Last updated 2026-11-12 10:50 UTC, main cc2eb93
 
 Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–20, with fixes merged since then noted.
 
@@ -25,37 +25,46 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
     - the reply list, subtitles and voice-over, with dialog tags (`<emp>` and the rest) from the Dialog Tags table;
     - movie tracks and cutscene camera tracks;
     - cutscenes named by conversation lines (the Human Noble, Dalish and Dwarf Noble intros);
-    - the original's default speaker framing for unstaged lines.
-  - In progress: actor motion and animation in cutscenes, and moving creatures to conversation stage marks. This covers the Dalish hunters with their backs turned and Oskias standing inside his chair; it's held for a regression-gate difference.
-  - Open: cameras placed by JumpToCamera or LinkToActor (most per-line cinematics).
+    - the original's default speaker framing for unstaged lines;
+    - cutscene and conversation actors posed and animated by their tracks, and conversation lines leaving creatures on their stage marks in the sim, as the exe does (Oskias sits; the Dalish hunters face the hero).
+  - Open:
+    - cameras placed by JumpToCamera or LinkToActor (most per-line cinematics);
+    - City Elf: Vaughan's scene plays on the gameplay camera instead of a staged shot (in progress).
 - 🟡 **Exploration and camera**:
-  - Walking, click-to-pick, doors, the area map and companions following. Followers come along on area changes.
+  - Walking, click-to-pick, doors and companions following. Followers come along on area changes, and they stand in the exe's formation slots and follow by its rules.
+  - The area map shows map notes and only perceived enemies.
   - The follow camera uses the exe's 0.25 m sphere sweep, pull-in and ease-out, and its starting shot (3 m behind, at the leader's height). QA confirmed it at all six origin starts.
 - 🟡 **Combat and simulation**:
   - NWScript VM with a large share of the engine functions; melee and ability timing; threat; AI-driven party; tactics; loot.
   - Containers hold their template's items and open on USE with the original loot panel (Take All, Close).
   - Perception and combat mode work as the exe does them. Sight lines are cast through the level's collision (`.phy`) and placeables. SetCanLevelUp follows unspent points.
   - Weapons are sheathed out of combat and drawn in combat; draw and sheathe animation timing is not traced.
-  - Open: the Proving duel's melee in the app (the hero and Mainar overlap and no swing lands). Not every script engine function is implemented.
+  - Melee approach works in the live app (#269), and the Proving duel can be finished with the pad.
+  - Visual effects applied at places (the Proving crowd) are exposed to rendering.
+  - Not every script engine function is implemented.
 - 🟡 **Party, inventory, journal and other UI screens**:
   - Wired to the simulation: inventory (with paperdoll and item examine), character record, level-up, store, tactics, journal and codex, options, area map, HUD notifications and the screen tab bar.
   - Enemy health bars and the target's name show in fights.
-  - Tutorial popups show with their key names. They wait under full-screen menus, and the game stays paused, as in the original, until every queued popup is dismissed (pad A or the panel's Next/Close).
+  - Tutorial popups show with their key names. They wait under full-screen menus, and the game stays paused, as in the original, until every queued popup is dismissed (pad A or the panel's Next/Close). The "Paused" banner shows meanwhile, and with a pad the popup title adds "(A: Next)" or "(A: Close)".
   - Fixed since QA run 8: recipes are learned, stacks merge, inventory rows are no longer dimmed, and the Level Up button follows unspent points.
-  - Open: the tutorial pause shows no "Paused" border (whether the original shows one is not traced), and screens have not all been audited against the original.
+  - New saves are named New Save, and the character record shows the race icon.
+  - Open: doors in their second open state can be chosen for use rather than walked through; screens have not all been audited against the original.
 - 🟡 **Rendering**:
   - Working: areas, terrain, sky, fog, clouds, bloom, colour grading, dynamic sun shadows (Low to High detail) and the original shaders.
   - Characters have hair, sampled with its mips and noise. Bare hands and arms take the head's skin tint.
+  - Characters and props pick their lights by the exe's rules (room reach, light class, influence).
+  - Lava draws with its own shaders.
   - Open:
-    - characters receive every room's character lights rather than their own selection, which causes grey NPC hair, pale hands and dark Dalish hunters;
     - water is not drawn (the Fade's black areas);
+    - door poses for open states 3–5;
     - SpeedTree `.spt` files parse but are not drawn.
   - The backend stays on wgpu, and its types are kept inside `thedas-render`.
 - 🟡 **Audio**:
   - Merged:
     - playback: FMOD event (`.fev`) and bank (`.fsb`) playback, mixer, the exe's slider-to-dB volume mapping;
     - music: menu and area music, SetMusicIntensity driving `music_state` (kept in saves);
-    - world: world reverb (area and trigger presets), surface footsteps from the walkmesh, placed 3D sounds;
+    - world: world reverb (area presets and reverb triggers as traced), placed 3D sounds;
+    - movement: footsteps by walkmesh surface, foley and vegetation rustles, as traced;
     - effects: UI sounds, boot movie sound, script PlaySound, and animation sound events (swings, armour foley, weapon hits);
     - voices: conversation and cutscene voice-over, sound-set and engine barks (traced from the exe), party picker lines, the chargen voice preview.
   - Not yet: PlayMusic, voice-over positioning, and the master and secondary reverb chain.
@@ -74,9 +83,9 @@ None open. The Proving armour chest was fixed by #253 and #254.
 - 🟡 **Human Noble**: intro movie and cutscene with narration play. The opening plays through the siege to Ostagar and on to Lothering in the regression sweep.
 - 🟡 **Dwarf Noble**: intro cutscene plays and the opening is explorable. Cutscene actors are not animated yet.
 - 🟡 **Dwarf Commoner**: intro cutscene cameras play and the camera starts inside the house. The path plays forward through the tavern and the Proving.
-  - Open: Oskias stands in his chair (in progress) and the duel's melee.
-- 🟡 **City Elf**: explorable from inside the room. Cyrion waiting in the next room matches the data.
-- 🟡 **Dalish Elf**: intro cutscene plays and the journal lists the origin quest. After the opening talk the three hunters keep their backs to the hero until the stage-marks work lands (in progress).
+  - Oskias sits and the duel can be finished with the pad.
+- 🟡 **City Elf**: explorable from inside the room. Cyrion waiting in the next room matches the data. Vaughan's scene camera is in progress.
+- 🟡 **Dalish Elf**: intro cutscene plays and the journal lists the origin quest. After the opening talk the three hunters stay on their marks facing the hero.
 - 🟡 **Mage**: explorable. The Fade's water is not drawn.
 
 ### Planned modernization

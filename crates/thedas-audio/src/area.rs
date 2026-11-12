@@ -71,9 +71,11 @@ pub fn area_audio(data: &[u8]) -> (Option<String>, Vec<AreaSound>) {
     (music, sounds)
 }
 
-/// A reverb trigger (`TriggerList` entry with a `ReverbPreset`, `Type` 3; DAOrigins.exe's
-/// CCTriggerAudioReverb reads `ReverbPreset` and `Priority`, 0x7999f8..0x799a5f): inside
-/// its outline the reverb is its preset.
+/// A reverb trigger: a `TriggerList` entry of `Type` 3 (DAOrigins.exe's
+/// CCTriggerAudioReverb, which reads `ReverbPreset` and `Priority`, 0x7999f8..0x799a5f) or 4
+/// (CCTriggerAudioVolume, a subclass: its loader 0x79a5d0 runs the reverb one first, and
+/// both share the enter handler 0x79b3d0; the trigger factory 0x67a6b4 maps the types).
+/// Entering its outline sets its preset, an empty one turning the reverb off.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReverbTrigger {
     pub preset: String,
@@ -116,17 +118,50 @@ pub struct AreaReverb {
 }
 
 impl AreaReverb {
-    /// The preset at `p`: the highest-priority trigger containing it (the first listed on a
-    /// tie), else the area's. Provisional: how DAOrigins.exe weighs overlapping triggers
-    /// (it sets the preset on entering one, 0x5c35f0) is not traced.
-    pub fn preset_at(&self, p: [f32; 3]) -> &str {
-        let mut best: Option<&ReverbTrigger> = None;
-        for t in &self.triggers {
-            if t.contains(p) && best.is_none_or(|b| t.priority > b.priority) {
-                best = Some(t);
+    /// The preset the area starts with (DAOrigins.exe 0x6866f8..0x686a32): its own if it
+    /// has one, else the preset the most reverb triggers use (ties: the first by name, the
+    /// exe's map order; triggers with no preset are not counted, 0x6867b6), else none.
+    ///
+    /// Provisional: the exe counts a trigger for which a virtual (+0x1d8) holds as 0.15
+    /// instead of 1; that check is not traced, so every trigger counts 1. It also loads the
+    /// next two most-used presets into secondary reverb instances, which only events that
+    /// name a preset use; those are not modelled.
+    pub fn initial(&self) -> &str {
+        if !self.preset.is_empty() {
+            return &self.preset;
+        }
+        let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+        for t in self.triggers.iter().filter(|t| !t.preset.is_empty()) {
+            *counts.entry(t.preset.as_str()).or_default() += 1;
+        }
+        let mut best: Option<(&str, usize)> = None;
+        for (name, n) in counts {
+            if best.is_none_or(|b| n > b.1) {
+                best = Some((name, n));
             }
         }
-        best.map_or(self.preset.as_str(), |t| t.preset.as_str())
+        best.map_or("", |b| b.0)
+    }
+
+    /// The triggers `p` is inside, by index.
+    pub fn inside(&self, p: [f32; 3]) -> Vec<bool> {
+        self.triggers.iter().map(|t| t.contains(p)).collect()
+    }
+
+    /// The preset to switch to as the party leader moves from where `was` says it was to
+    /// `p`: the preset of a trigger it has just entered (the last listed, if several), as
+    /// entering a reverb trigger sets its preset (0x79b3d0 -> 0x5b7790 -> 0x5c35f0, with the
+    /// default fade). Leaving a trigger changes nothing: the reverb stays until another is
+    /// entered. `Priority` is read (0x799a5f) but nothing uses it.
+    pub fn entered(&self, was: &[bool], p: [f32; 3]) -> (Vec<bool>, Option<&str>) {
+        let now = self.inside(p);
+        let mut preset = None;
+        for (i, t) in self.triggers.iter().enumerate() {
+            if now[i] && !was.get(i).copied().unwrap_or(false) {
+                preset = Some(t.preset.as_str());
+            }
+        }
+        (now, preset)
     }
 }
 
@@ -165,7 +200,8 @@ pub fn area_reverb(data: &[u8]) -> AreaReverb {
                 continue;
             };
             let preset = text(t, "ReverbPreset");
-            if get(t, "ReverbPreset").is_none() || num(t, "Type") != 3.0 {
+            let kind = num(t, "Type");
+            if get(t, "ReverbPreset").is_none() || (kind != 3.0 && kind != 4.0) {
                 continue;
             }
             let mut outline = Vec::new();
@@ -261,13 +297,13 @@ mod tests {
                 f("ZPoint", Value::Float(0.0)),
             ],
         };
-        let trigger = |preset: &str, priority: u8, x: f32, points: Vec<u32>| Struct {
+        let trigger = |preset: &str, kind: u8, x: f32, points: Vec<u32>| Struct {
             id: 1,
             fields: vec![
                 f("Geometry", Value::List(points)),
-                f("Priority", Value::Byte(priority)),
+                f("Priority", Value::Byte(128)),
                 f("ReverbPreset", Value::ExoString(preset.as_bytes().to_vec())),
-                f("Type", Value::Byte(3)),
+                f("Type", Value::Byte(kind)),
                 f("XPosition", Value::Float(x)),
                 f("YPosition", Value::Float(0.0)),
                 f("ZPosition", Value::Float(0.0)),
@@ -283,24 +319,47 @@ mod tests {
                     id: u32::MAX,
                     fields: vec![
                         f("ReverbPreset", Value::ExoString(b"Forest".to_vec())),
-                        f("TriggerList", Value::List(vec![1, 2])),
+                        f("TriggerList", Value::List(vec![1, 2, 7, 8])),
                     ],
                 },
-                trigger("Cave", 128, 10.0, vec![3, 4, 5, 6]),
-                trigger("Hallway", 200, 12.0, vec![3, 4, 5, 6]),
+                trigger("Cave", 3, 10.0, vec![3, 4, 5, 6]),
+                // An audio volume (type 4) is a reverb trigger too.
+                trigger("Hallway", 4, 12.0, vec![3, 4, 5, 6]),
                 point(-2.0, -2.0),
                 point(2.0, -2.0),
                 point(2.0, 2.0),
                 point(-2.0, 2.0),
+                // A music volume (type 5) is not; an empty preset is kept (it turns the
+                // reverb off) but not counted for the starting preset.
+                trigger("Arena", 5, 40.0, vec![3, 4, 5, 6]),
+                trigger("", 4, 50.0, vec![3, 4, 5, 6]),
             ],
         };
         let r = area_reverb(&g.write().unwrap());
         assert_eq!(r.preset, "Forest");
-        assert_eq!(r.triggers.len(), 2);
-        assert_eq!(r.preset_at([0.0, 0.0, 0.0]), "Forest");
-        assert_eq!(r.preset_at([9.0, 1.0, 0.0]), "Cave");
-        // Where both cover, the higher priority wins.
-        assert_eq!(r.preset_at([11.0, 0.0, 0.0]), "Hallway");
+        assert_eq!(r.triggers.len(), 3);
+        let (_, set) = r.entered(&[], [50.0, 0.0, 0.0]);
+        assert_eq!(set, Some(""));
+        assert_eq!(r.initial(), "Forest");
+        // Entering a trigger sets its preset; where two cover, the last listed entered.
+        let (was, set) = r.entered(&[], [9.0, 1.0, 0.0]);
+        assert_eq!(set, Some("Cave"));
+        let (was, set) = r.entered(&was, [11.0, 0.0, 0.0]);
+        assert_eq!(set, Some("Hallway"));
+        // Leaving changes nothing.
+        let (_, set) = r.entered(&was, [0.0, 0.0, 0.0]);
+        assert_eq!(set, None);
+        // Without its own preset an area starts with its triggers' most used.
+        let mut r2 = r.clone();
+        r2.preset.clear();
+        r2.triggers.pop();
+        r2.triggers.push(ReverbTrigger {
+            preset: "Hallway".into(),
+            ..r.triggers[0].clone()
+        });
+        assert_eq!(r2.initial(), "Hallway");
+        r2.triggers.pop();
+        assert_eq!(r2.initial(), "Cave");
         assert_eq!(area_reverb(b"junk"), AreaReverb::default());
     }
 }
