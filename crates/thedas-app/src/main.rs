@@ -1,6 +1,11 @@
-//! `thedas-app`: walk through a Dragon Age: Origins area, or play.
+//! `thedas-app`: play Dragon Age: Origins, or walk through an area.
 //!
-//! Interactive: WASD to move, Q/E (or C) down/up, Shift to move faster, hold the right
+//! With only `--install`, the game boots to its start menu (startmenu2.gfx: New Game, Load,
+//! Options, Quit); in a game Escape (or the pad's Start) opens the game menu (mainmenu.gfx),
+//! whose Exit Game returns to the start menu. Provisional: the logo and intro movies the
+//! original plays first are skipped (no Bink playback yet).
+//!
+//! The viewer (`--viewer`, or `--area`/`--camera`): WASD to move, Q/E (or C) down/up, Shift to move faster, hold the right
 //! mouse button (or use the arrow keys) to look around, P to print the camera (when not
 //! playing), F12 to save a
 //! capture, Esc to quit.
@@ -79,9 +84,10 @@ struct Args {
     /// Install root (the folder holding packages/ and modules/). Defaults to $THEDAS_INSTALL.
     #[arg(long)]
     install: Option<PathBuf>,
-    /// Environment level (e.g. lgt101d), area resource (e.g. cir110ar_inn), or `none`.
-    #[arg(long, default_value = "lgt101d")]
-    area: String,
+    /// Environment level (e.g. lgt101d), area resource (e.g. cir110ar_inn), or `none`, for
+    /// the viewer (lgt101d when not given). Giving it opens the viewer.
+    #[arg(long)]
+    area: Option<String>,
     /// Render one frame to this PNG with no window, then exit.
     #[arg(long)]
     capture: Option<PathBuf>,
@@ -118,6 +124,11 @@ struct Args {
     /// Start a new game: the module's start, through the character creation screens.
     #[arg(long)]
     new_game: bool,
+    /// The area viewer (a free camera over `--area`) instead of the game. With none of
+    /// `--save`, `--new-game`, `--objects`, `--ui`, `--area` or `--camera`, the game starts at
+    /// its start menu.
+    #[arg(long)]
+    viewer: bool,
     /// With `--new-game`: skip the character creation screens (the chargen script's quick
     /// start: a pre-made character and origin).
     #[arg(long)]
@@ -497,6 +508,14 @@ struct App {
     pad: padplay::PadPlay,
     /// The pad as clients' `pad` steps hold it (merged with the device's).
     remote_pad: pad::PadState,
+    /// The install, module and shaders a game the start menu starts is opened with.
+    install: PathBuf,
+    module: String,
+    shaders: String,
+    /// Exit was chosen on the start menu.
+    quit: bool,
+    /// What the menus asked this frame, acted on once it is done.
+    requests: Vec<ui::FrontEnd>,
 }
 
 /// What the window's surface gave a redraw.
@@ -945,6 +964,7 @@ impl App {
             &self.camera,
             dt,
         );
+        self.requests.append(&mut g.ui.requests);
         // An ability aimed at a place shows where it would land, under the interface.
         if let Some(live) = self.live.as_mut() {
             let mut lines = live.reticle(&self.camera, size, self.cursor);
@@ -1006,6 +1026,7 @@ impl App {
             &self.camera,
             dt,
         );
+        self.requests.append(&mut g.ui.requests);
         Ok(())
     }
 
@@ -1116,12 +1137,19 @@ impl App {
     /// A key pressed (not a repeat). Returns whether the game should close.
     fn key_down(&mut self, code: KeyCode) -> bool {
         match code {
-            KeyCode::Escape => return true,
+            // Escape closes the screen up, else opens the game menu over a game; the viewer
+            // closes. The start menu stays (its Exit quits).
+            KeyCode::Escape => match self.screens.as_mut() {
+                None => return true,
+                Some(s) if s.menu.is_some() => s.menu = None,
+                Some(s) if !s.front_end => s.menu = Some(screens::Screen::GameMenu),
+                Some(_) => {}
+            },
             // While playing, P opens the spells/talents screen instead.
             KeyCode::KeyP if self.screens.is_none() => println!("camera {}", self.camera.spec()),
             // F5 the save screen, F9 the load screen. Provisional: the game's own bindings
             // (quick save and quick load) are not traced.
-            KeyCode::F5 | KeyCode::F9 if self.screens.is_some() => {
+            KeyCode::F5 | KeyCode::F9 if self.screens.as_ref().is_some_and(|s| !s.front_end) => {
                 if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_mut()) {
                     g.ui.open_saves(s, if code == KeyCode::F5 { 1 } else { 2 });
                 }
@@ -1394,6 +1422,7 @@ impl App {
                     screens::Screen::Skills => KeyCode::KeyK,
                     screens::Screen::SpellsTalents => KeyCode::KeyP,
                     screens::Screen::Options => KeyCode::KeyO,
+                    screens::Screen::GameMenu => KeyCode::Escape,
                     _ => KeyCode::KeyI,
                 });
                 log.push(format!("{m:?}"));
@@ -1657,6 +1686,44 @@ impl App {
         self.pad = pad;
     }
 
+    /// Acts on what the start menu and the game menu asked (see [`ui::FrontEnd`]): a new game
+    /// or a loaded one replaces the running one (or the start menu's), leaving a game goes
+    /// back to the start menu, Exit quits.
+    fn front_end(&mut self, requests: Vec<ui::FrontEnd>) {
+        for r in requests {
+            log::info!("front end: {r:?}");
+            let start = match &r {
+                ui::FrontEnd::Quit => {
+                    self.quit = true;
+                    continue;
+                }
+                ui::FrontEnd::NewGame => live::Start::NewGame,
+                ui::FrontEnd::Load(b) => live::Start::SaveBytes(b),
+                ui::FrontEnd::StartMenu => live::Start::Menu,
+            };
+            match live::Live::open(&self.install, &self.module, start, &self.shaders) {
+                Ok(mut l) => {
+                    if let Some(g) = self.gfx.as_mut() {
+                        l.frame_effects = self.loaded.frame_effects;
+                        g.ui.close_all();
+                        g.ui.attach(&l.sim);
+                    }
+                    self.follow = l.hero().map(|(_, facing)| {
+                        follow::Follow::behind(thedas_sim::world::heading_of(facing).to_radians())
+                    });
+                    if let Some((pos, facing)) = l.hero() {
+                        let fov = self.camera.fov_y;
+                        self.camera = hero_camera(pos, facing);
+                        self.camera.fov_y = fov;
+                    }
+                    self.screens = Some(screens::Screens::new(l.front_end));
+                    self.live = Some(l);
+                }
+                Err(e) => log::warn!("front end: {r:?} failed: {e:#}"),
+            }
+        }
+    }
+
     fn fail(&mut self, event_loop: &ActiveEventLoop, e: anyhow::Error) {
         self.error = Some(e);
         event_loop.exit();
@@ -1833,7 +1900,13 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let requests = std::mem::take(&mut self.requests);
+        self.front_end(requests);
+        if self.quit {
+            event_loop.exit();
+            return;
+        }
         if let Some(g) = &self.gfx {
             g.window.request_redraw();
         }
@@ -2266,6 +2339,8 @@ fn parse_step(s: &str) -> Result<Step> {
             Step::SetValue(k.to_string(), v.trim().to_string())
         }
         "floaty" => Step::Floaty(arg.to_string()),
+        // The game menu (Escape while playing).
+        "gamemenu" => Step::Menu(screens::Screen::GameMenu),
         "key" if arg.eq_ignore_ascii_case("i") => Step::Menu(screens::Screen::Inventory),
         "key" if arg.eq_ignore_ascii_case("c") => Step::Menu(screens::Screen::CharacterRecord),
         "key" if arg.eq_ignore_ascii_case("t") => Step::Menu(screens::Screen::Tactics),
@@ -2331,6 +2406,9 @@ fn parse_step(s: &str) -> Result<Step> {
     })
 }
 
+/// The viewer's level when `--area` is not given.
+const DEFAULT_AREA: &str = "lgt101d";
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
@@ -2357,9 +2435,15 @@ fn main() -> Result<()> {
     } else if args.new_game {
         Some(live::Start::NewGame)
     } else if args.objects {
-        Some(live::Start::Area(&args.area))
-    } else {
+        Some(live::Start::Area(
+            args.area.as_deref().unwrap_or(DEFAULT_AREA),
+        ))
+    } else if args.viewer || args.ui.is_some() || args.area.is_some() || args.camera.is_some() {
         None
+    } else {
+        // As the game boots: the start menu. Provisional: the logo and intro movies that
+        // play before it are not shown yet (no Bink playback).
+        Some(live::Start::Menu)
     };
     let mut live = match start {
         Some(start) => Some(live::Live::open(
@@ -2383,7 +2467,7 @@ fn main() -> Result<()> {
     let area = if live.is_some() {
         "none"
     } else {
-        args.area.as_str()
+        args.area.as_deref().unwrap_or(DEFAULT_AREA)
     };
     let detail = thedas_render::scene::Detail::parse(&args.detail).unwrap_or_default();
     let mut loaded = load(&install, area, &args.shaders, &[], detail)?;
@@ -2428,7 +2512,7 @@ fn main() -> Result<()> {
                 let mut layer = ui::UiLayer::new(&ctx, &loaded.vfs, &[], size);
                 layer.attach(&l.sim);
                 layer.set_saves(saves::SaveStore::new(saves_dir.clone()));
-                let mut s = screens::Screens::default();
+                let mut s = screens::Screens::new(l.front_end);
                 l.aiming = layer.play(&mut s, &l.sim, 0.0).pop();
                 played = Some((layer, s));
             }
@@ -2450,6 +2534,7 @@ fn main() -> Result<()> {
             }
             l.sim().tick(args.run_ms);
             for step in &steps {
+                let l = live.as_mut().expect("a game or the start menu");
                 match step {
                     &Step::Hover(x, y) => {
                         cursor = (x, y);
@@ -2710,7 +2795,36 @@ fn main() -> Result<()> {
                 if follow.is_some() {
                     let _ = l.conversation_camera(&camera);
                 }
+                // What the menus asked: a game started or loaded, or back to the start menu.
+                if let Some((layer, s)) = played.as_mut() {
+                    for r in std::mem::take(&mut layer.requests) {
+                        println!("front end: {r:?}");
+                        let start = match &r {
+                            ui::FrontEnd::Quit => continue,
+                            ui::FrontEnd::NewGame => live::Start::NewGame,
+                            ui::FrontEnd::Load(b) => live::Start::SaveBytes(b),
+                            ui::FrontEnd::StartMenu => live::Start::Menu,
+                        };
+                        let mut n = live::Live::open(&install, &args.module, start, &args.shaders)?;
+                        n.shader_time = args.time;
+                        layer.close_all();
+                        layer.attach(&n.sim);
+                        *s = screens::Screens::new(n.front_end);
+                        follow = n.hero().map(|(_, facing)| {
+                            follow::Follow::behind(
+                                thedas_sim::world::heading_of(facing).to_radians(),
+                            )
+                        });
+                        if let Some((pos, facing)) = n.hero() {
+                            let fov = camera.fov_y;
+                            camera = hero_camera(pos, facing);
+                            camera.fov_y = fov;
+                        }
+                        live = Some(n);
+                    }
+                }
             }
+            let l = live.as_mut().expect("a game or the start menu");
             let sim = l.sim();
             if let Some(h) = sim.world.controlled().and_then(|h| sim.world.get(h)) {
                 log::info!(
@@ -2783,7 +2897,8 @@ fn main() -> Result<()> {
         None => None,
     };
     let event_loop = EventLoop::new()?;
-    let screens = (live.is_some() && ui.is_empty()).then(screens::Screens::default);
+    let screens = (live.is_some() && ui.is_empty())
+        .then(|| screens::Screens::new(live.as_ref().is_some_and(|l| l.front_end)));
     let mut app = App {
         loaded,
         live,
@@ -2809,6 +2924,11 @@ fn main() -> Result<()> {
         pads: paddev::Pads::new(),
         pad: padplay::PadPlay::default(),
         remote_pad: pad::PadState::default(),
+        install: install.clone(),
+        module: args.module.clone(),
+        shaders: args.shaders.clone(),
+        quit: false,
+        requests: Vec::new(),
     };
     for line in pad::describe() {
         log::debug!("pad binding: {line}");

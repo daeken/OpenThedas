@@ -603,6 +603,31 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             UiValue::String(key.into()),
         );
     }
+    // The start menu (startmenu2.gfx): its buttons show (`GameMode.ShowStartMenuContents`),
+    // no other campaigns are installed (`Client.ModuleInfoList`), and there is no online
+    // account or welcome message about one. Provisional: the version string is this port's.
+    v.insert("GameMode.ShowStartMenuContents".into(), num(1));
+    v.insert(
+        "Client.ModuleInfoList".into(),
+        UiValue::String(String::new()),
+    );
+    v.insert(
+        "Client.VersionString".into(),
+        UiValue::String(format!("OpenThedas {}", env!("CARGO_PKG_VERSION"))),
+    );
+    v.insert("OnlineFeatures.LoggedIn".into(), num(0));
+    v.insert(
+        "OnlineFeatures.AccountName".into(),
+        UiValue::String(String::new()),
+    );
+    v.insert(
+        "ClientOptions.GameOptions.SkipWelcomeMessage".into(),
+        num(1),
+    );
+    v.insert(
+        "ClientOptions.GameOptions.Locale".into(),
+        UiValue::String("en-us".into()),
+    );
     // The difficulty, as character creation's difficulty prompt starts from it.
     v.insert(
         "ClientOptions.GameOptions.DifficultyLevel".into(),
@@ -992,10 +1017,26 @@ fn saves(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
     v.insert("SaveLoad.Mode".into(), num(shown.save_mode));
     v.insert("SaveLoad.OpenSlot".into(), num(shown.open_slot));
     v.insert("SaveLoad.CurrentHero".into(), num(0));
-    if let Some(h) = sim.world.hero {
+    // The game menu offers saving in a game. Provisional: when the game forbids it (in
+    // combat, in cutscenes) is not traced.
+    v.insert(
+        "SaveLoad.SavingEnabled".into(),
+        num(u8::from(sim.world.hero.is_some())),
+    );
+    // Before a game (the start menu, its load screen) there is no hero: the saves stand for
+    // one, so the start menu offers loading when there are any. Provisional: the saves do
+    // not record their hero, so it is one hero with no name.
+    let hero = sim
+        .world
+        .hero
+        .or_else(|| (!shown.saves.is_empty()).then_some(1));
+    if let Some(h) = hero {
         let k = "SaveLoad.HeroList.0";
         v.insert(k.into(), num(h));
-        v.insert(format!("{k}.Name"), UiValue::String(name(sim, h)));
+        v.insert(
+            format!("{k}.Name"),
+            UiValue::String(sim.world.hero.map(|h| name(sim, h)).unwrap_or_default()),
+        );
         let last = shown.saves.first();
         v.insert(
             format!("{k}.TimePlayed"),
@@ -1036,7 +1077,7 @@ fn saves(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
                 .join(","),
         ),
     );
-    if let Some(h) = sim.world.hero {
+    if let Some(h) = hero {
         v.insert("SaveLoad.HeroList".into(), UiValue::String(h.to_string()));
     }
     for (i, s) in rows.into_iter().enumerate() {

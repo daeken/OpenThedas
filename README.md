@@ -45,10 +45,23 @@ simulation.
 
 Planned crates follow the architecture doc: `thedas-audio`, `thedas-video`.
 
+## Playing
+
+```sh
+./target/release/thedas-app --install "$GAME"
+```
+
+With nothing else, the game boots to its start menu (startmenu2.gfx): New Game goes through
+character creation, Load Game lists the saves in `~/.openthedas/saves` (`--saves` for another
+folder), Options and Quit work. In a game, Escape (Start on a pad) opens the game menu: save,
+load, options, and Exit Game back to the start menu. The logo and intro movies the original
+plays before the menu are not shown yet (no Bink playback). `--new-game` (with `--quick-start`)
+and `--save <file>` still start a game directly.
+
 ## Walking through an area
 
 ```sh
-./target/release/thedas-app --install "$GAME"                      # the Spoiled Princess
+./target/release/thedas-app --install "$GAME" --viewer                # the Spoiled Princess
 ./target/release/thedas-app --install "$GAME" --area lot120ar_danes_refuge
 ```
 

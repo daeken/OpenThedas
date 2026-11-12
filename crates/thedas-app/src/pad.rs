@@ -257,6 +257,8 @@ pub enum Action {
     Hub,
     /// Pause or carry on (as Space).
     Pause,
+    /// The game menu (as Escape): Start, the 360's "Pause Menu".
+    GameMenu,
     /// The pointer's left button goes down or up (a click, or a drag while held).
     PointerDown,
     PointerUp,
@@ -386,7 +388,7 @@ pub const BINDINGS: &[Binding] = &[
     bind(Field, Up, Do::NearestHostile, "SelectionFilterHostile"),
     bind(Field, Down, Do::ClearTarget, ""),
     bind(Field, Back, Do::Hub, "ToggleInventory"),
-    bind(Field, Start, Do::Pause, "TogglePause"),
+    bind(Field, Start, Do::GameMenu, "ToggleMainMenu"),
     // The quickbar picker: a pointer over the paused game.
     bind(Picker, A, Do::PointerDown, "GUILeftCursorButton"),
     release(Picker, A, Do::PointerUp, "GUILeftCursorButton"),

@@ -40,6 +40,11 @@ pub enum Screen {
     /// told which by `GUI.AbilityScene`.
     Skills,
     SpellsTalents,
+    /// The start menu (startmenu2.gfx), before a game: New Game, Load, Options, Exit.
+    StartMenu,
+    /// The game menu over a running game (mainmenu.gfx, Escape or Start): save, load,
+    /// options, back to the start menu.
+    GameMenu,
 }
 
 impl Screen {
@@ -80,6 +85,9 @@ impl Screen {
             Screen::Options => &["optionsmenu.gfx", "popuplayer.gfx"],
             // Over the screen it was opened from (see `with_examine`).
             Screen::ItemExamine => &["itemexamine.gfx"],
+            // Its confirmations (quitting) are dialog boxes on the popup layer.
+            Screen::StartMenu => &["startmenu2.gfx", "popuplayer.gfx"],
+            Screen::GameMenu => &["mainmenu.gfx", "popuplayer.gfx"],
         }
     }
 
@@ -173,6 +181,8 @@ pub struct Screens {
     pub menu: Option<Screen>,
     /// Screens whose movies closed themselves since the last [`Screens::sync`].
     closed_by_player: Vec<Screen>,
+    /// No game is running yet: the start menu shows when no other screen is up.
+    pub front_end: bool,
 }
 
 /// What [`Screens::update`] changed.
@@ -186,8 +196,20 @@ pub struct Changes {
 }
 
 impl Screens {
-    /// The player opens or closes one of their screens (a key).
+    /// No screen up yet; `front_end` before a game (the start menu shows).
+    pub fn new(front_end: bool) -> Self {
+        Self {
+            front_end,
+            ..Default::default()
+        }
+    }
+
+    /// The player opens or closes one of their screens (a key). Not before a game: the
+    /// start menu opens its own.
     pub fn toggle(&mut self, s: Screen) {
+        if self.front_end {
+            return;
+        }
         self.menu = if self.menu == Some(s) { None } else { Some(s) };
     }
 }

@@ -96,58 +96,9 @@ pub(crate) struct GpuTexture {
 }
 
 /// Uploads a 2D or cube DDS (all mips), compressed when the device allows it.
-/// A volume texture (the smoke's `smpDecalVolume`), expanded to RGBA8 with its whole mip
-/// chain.
-fn upload_volume(ctx: &GpuContext, name: &str, dds: &Dds) -> Option<GpuTexture> {
-    let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(name),
-        size: wgpu::Extent3d {
-            width: dds.width,
-            height: dds.height,
-            depth_or_array_layers: dds.depth,
-        },
-        mip_level_count: dds.mip_count.max(1),
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D3,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    for mip in 0..dds.mip_count.max(1) {
-        let (w, h, d) = dds.mip_size(mip);
-        let data = dds.decode_rgba8(0, mip).ok()?;
-        ctx.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: mip,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w * 4),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: d,
-            },
-        );
-    }
-    Some(GpuTexture {
-        view: texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D3),
-            ..Default::default()
-        }),
-        kind: dds.kind,
-    })
-}
-
 fn upload_dds(ctx: &GpuContext, name: &str, dds: &Dds) -> Option<GpuTexture> {
     if dds.kind == DdsKind::Volume {
-        return upload_volume(ctx, name, dds);
+        return None;
     }
     let faces = dds.faces();
     let compressed =
@@ -287,9 +238,7 @@ impl TextureCache {
         let t = self.get(ctx, vfs, name)?;
         let ok = matches!(
             (ty, t.kind),
-            (T::Tex2D | T::Unknown, DdsKind::Texture2D)
-                | (T::Cube, DdsKind::Cube)
-                | (T::Volume, DdsKind::Volume)
+            (T::Tex2D | T::Unknown, DdsKind::Texture2D) | (T::Cube, DdsKind::Cube)
         );
         ok.then(|| t.view.clone())
     }

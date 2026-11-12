@@ -116,6 +116,29 @@ impl Composite {
     }
 }
 
+/// What the start menu and the game menu ask of the app, which owns the game.
+pub enum FrontEnd {
+    /// New Game: character creation in the single-player module.
+    NewGame,
+    /// A save the load screen picked before a game was running.
+    Load(Vec<u8>),
+    /// Back to the start menu (the game menu's Exit, the death screen's).
+    StartMenu,
+    /// Exit the game.
+    Quit,
+}
+
+impl std::fmt::Debug for FrontEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrontEnd::NewGame => write!(f, "NewGame"),
+            FrontEnd::Load(b) => write!(f, "Load({} bytes)", b.len()),
+            FrontEnd::StartMenu => write!(f, "StartMenu"),
+            FrontEnd::Quit => write!(f, "Quit"),
+        }
+    }
+}
+
 /// A message floaty up over a creature.
 struct Floaty {
     id: u32,
@@ -140,6 +163,10 @@ pub struct UiLayer {
     level: Option<String>,
     /// Frames since the minimap's creatures were last sent.
     minimap_frame: u32,
+    /// What the menus asked of the app since it last looked (see [`FrontEnd`]).
+    pub requests: Vec<FrontEnd>,
+    /// The saves were listed for the start menu.
+    saves_listed: bool,
     /// tooltips.gfx's tooltip texts (fixed and floating) last frame, and the frames left to lay
     /// the last tooltip out again after they changed (see `thedas_ui::avm1::TOOLTIP_RELAYOUT`).
     tooltip_text: Option<thedas_ui::UiValue>,
@@ -306,6 +333,8 @@ impl UiLayer {
             line: None,
             level: None,
             minimap_frame: 0,
+            requests: Vec::new(),
+            saves_listed: false,
             tooltip_text: None,
             tooltip_relayout: 0,
             floaties: Vec::new(),
@@ -341,6 +370,31 @@ impl UiLayer {
         }
         self.refresh_saves();
         screens.menu = Some(Screen::SaveLoad);
+    }
+
+    /// The start menu's and the game menu's messages: options (`GameModeController.
+    /// PushGUIScreen Options`), the game menu closing itself (`HideGUIScreen MainMenu`), and
+    /// back to the start menu (`ExitToStartMenuMessage`, from the game menu;
+    /// `ShutDownToStartMenuMessage`, from the death screen). Provisional: what the exe does
+    /// between leaving a game and showing the start menu again is not traced.
+    fn front_end_message(&mut self, screens: &mut Screens, name: &str, args: &[String]) -> bool {
+        let first = args.first().map(|a| a.trim());
+        match name {
+            "GameModeController.PushGUIScreen" if first == Some("Options") => {
+                screens.menu = Some(Screen::Options);
+            }
+            "GameModeController.HideGUIScreen" if first == Some("MainMenu") => {
+                if screens.menu == Some(Screen::GameMenu) {
+                    screens.menu = None;
+                }
+            }
+            "GameModeController.ExitToStartMenuMessage"
+            | "GameModeController.ShutDownToStartMenuMessage" => {
+                self.requests.push(FrontEnd::StartMenu);
+            }
+            _ => return false,
+        }
+        true
     }
 
     /// A HUD notification clicked: notifications.gfx's `GUI.GoToQuest` (the quest's plot
@@ -501,6 +555,9 @@ impl UiLayer {
                 };
                 let bytes = slot.and_then(|slot| self.saves.as_ref().map(|s| s.read(slot)));
                 match bytes {
+                    // Before a game there is no module to load it into: the game starts
+                    // from it.
+                    Some(Ok(b)) if screens.front_end => self.requests.push(FrontEnd::Load(b)),
                     Some(Ok(b)) => {
                         let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
                         match sim.load_json(&b) {
@@ -570,6 +627,8 @@ impl UiLayer {
     /// Plays the game's screens over a running game: the movies act on `sim` as they send
     /// messages (see [`thedas_ui::input`]).
     pub fn attach(&mut self, sim: &Arc<Mutex<Sim>>) {
+        // A new game or the start menu again: the saves are listed afresh for it.
+        self.saves_listed = false;
         self.stage
             .bridge
             .set_message_handler(Some(thedas_ui::input::handler_for(
@@ -579,6 +638,16 @@ impl UiLayer {
         self.stage
             .bridge
             .set_query_handler(Some(thedas_ui::input::query_for(sim.clone())));
+    }
+
+    /// Every movie closes and what the screens were showing is forgotten: a game starts or
+    /// ends (the screens start over with it).
+    pub fn close_all(&mut self) {
+        self.stage.movies.clear();
+        self.line = None;
+        self.floaties.clear();
+        self.tooltip_text = None;
+        self.tooltip_relayout = 0;
     }
 
     /// One interface frame while playing: binds the simulation's values, brings the screens
@@ -592,6 +661,11 @@ impl UiLayer {
         sim: &Arc<Mutex<Sim>>,
         dt_ms: f64,
     ) -> Vec<thedas_ui::input::Aim> {
+        // The start menu offers loading when there are saves: they are listed from the start.
+        if screens.front_end && !self.saves_listed {
+            self.saves_listed = true;
+            self.refresh_saves();
+        }
         // The journal, while its screen is up (built from the plots: it needs the simulation
         // mutably, which the bindings do not have).
         let journal = (screens.menu == Some(Screen::Journal))
@@ -622,7 +696,13 @@ impl UiLayer {
                 let key: LineKey = (d.dialog, d.line, d.replies.iter().map(|r| r.0).collect());
                 (key, waits)
             });
-            let want = crate::screens::wanted(&sim, screens.menu);
+            // Before a game, the start menu, or the screen it opened (options, the load
+            // screen).
+            let want = match (screens.front_end, screens.menu) {
+                (true, None) => std::collections::BTreeSet::from([Screen::StartMenu]),
+                (true, Some(m)) => std::collections::BTreeSet::from([m]),
+                (false, _) => crate::screens::wanted(&sim, screens.menu),
+            };
             (
                 crate::screens::with_examine(want, shown.examine.is_some()),
                 line,
@@ -710,11 +790,24 @@ impl UiLayer {
             if let GameMessage::Handled(name, args) | GameMessage::Send(name, args) = m {
                 log::info!("ui: {name} {args:?}");
             }
+            // The start menu's own fscommands: New Game loads the single-player module
+            // (`getURL("FSCommand:LoadModule", "single player")`), Exit quits.
+            if let GameMessage::Other(call) = m {
+                match call.name.as_str() {
+                    "LoadModule" => {
+                        log::info!("ui: LoadModule {:?}", call.args);
+                        self.requests.push(FrontEnd::NewGame);
+                    }
+                    "QuitGame" => self.requests.push(FrontEnd::Quit),
+                    _ => {}
+                }
+            }
         }
         let ignored: Vec<(String, Vec<String>)> = ignored
             .into_iter()
             .filter(|(n, a)| {
                 !self.popup_message(n, a)
+                    && !self.front_end_message(screens, n, a)
                     && !self.save_message(screens, sim, n, a)
                     && !self.go_to_journal(screens, sim, n, a)
                     && !Self::book_page(screens, n, a)

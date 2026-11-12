@@ -305,12 +305,23 @@ impl PadPlay {
             }
             Action::Hub => {
                 let s = host.screens()?;
+                if s.front_end {
+                    return None;
+                }
                 s.menu = match s.menu {
                     Some(_) => None,
                     None => Some(Screen::Inventory),
                 };
                 self.page = 0;
                 format!("screens: {:?}", s.menu)
+            }
+            Action::GameMenu => {
+                let s = host.screens()?;
+                if s.front_end {
+                    return None;
+                }
+                s.menu = Some(Screen::GameMenu);
+                "game menu".into()
             }
             Action::Pause => {
                 let live = host.live()?;
