@@ -3509,6 +3509,8 @@ mod tests {
                 end: 2.0,
                 strref: 7,
                 actor: "duncan".into(),
+                conversation: None,
+                vo_mode: 0,
             }],
             elapsed_ms: 0,
         };

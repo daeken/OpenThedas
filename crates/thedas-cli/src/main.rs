@@ -229,6 +229,13 @@ enum Command {
         #[arg(long, default_value_t = 48000)]
         rate: u32,
     },
+    /// Check that the sound events the game names resolve: every cutscene's sound tracks
+    /// and `sound_gui.gda`'s events.
+    AudioCheck {
+        install: PathBuf,
+        #[arg(long, default_value = "en-us")]
+        language: String,
+    },
     /// Open every archive in an install and parse every GFF4-family resource.
     Corpus {
         /// Install roots or individual archives.
@@ -300,6 +307,7 @@ fn run() -> Result<()> {
             language,
             rate,
         } => audio::play(&install, &events, seconds, &out, stop_at, &language, rate),
+        Command::AudioCheck { install, language } => audio::check(&install, &language),
         Command::Fev {
             path,
             filter,

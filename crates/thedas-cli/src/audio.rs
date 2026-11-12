@@ -20,7 +20,11 @@ pub fn play(
 ) -> Result<()> {
     use std::sync::{Arc, Mutex};
     use thedas_audio::{AudioEngine, Library, Mixer, PlayOptions};
-    let lib = Arc::new(Library::new(Library::install_dirs(install, language)));
+    let lib = Arc::new(Library::new(Library::install_dirs(
+        install,
+        "single player",
+        language,
+    )));
     let mixer = Arc::new(Mutex::new(Mixer::new(rate)));
     let mut engine = AudioEngine::new(lib, mixer.clone());
     engine.synchronous = true;
@@ -86,6 +90,42 @@ pub fn play(
         engine.active_events()
     );
     wav::write_wav(BufWriter::new(File::create(out)?), rate, 2, &samples)?;
+    Ok(())
+}
+
+pub fn check(install: &Path, language: &str) -> Result<()> {
+    use thedas_audio::Library;
+    let lib = Library::new(Library::install_dirs(install, "single player", language));
+    let vfs = thedas_vfs::DaoInstall::open(install)?
+        .global_vfs(thedas_vfs::install::TextureQuality::High)?;
+    let resolves = |path: &str| {
+        let project = path.split('/').next().unwrap_or("");
+        lib.project(project)
+            .is_some_and(|f| f.event(path).is_some())
+    };
+    let (mut cuts, mut tracks, mut missing) = (0usize, 0usize, Vec::new());
+    for name in vfs.names() {
+        if !name.to_ascii_lowercase().ends_with(".cut") {
+            continue;
+        }
+        let Ok((data, _)) = vfs.read(&name) else {
+            continue;
+        };
+        cuts += 1;
+        for s in thedas_sim::cutscene::sounds(&data) {
+            tracks += 1;
+            if !resolves(&s.event) {
+                missing.push(format!("{name}: {}", s.event));
+            }
+        }
+    }
+    println!(
+        "{cuts} cutscenes, {tracks} sound tracks, {} unresolved",
+        missing.len()
+    );
+    for m in missing.iter().take(40) {
+        println!("  {m}");
+    }
     Ok(())
 }
 

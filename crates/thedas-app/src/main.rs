@@ -1130,6 +1130,40 @@ impl App {
                 })
             });
         }
+        // A cutscene's sound tracks, and its line's voice when the line has its own.
+        if self.intro.is_none()
+            && let Some(live) = self.live.as_ref()
+        {
+            let sim = live.sim();
+            if let Some(c) = sim.world.cutscene.as_ref() {
+                if a.wants_cutscene(&c.name) {
+                    let tracks = sim
+                        .vfs
+                        .read(&c.name)
+                        .map(|(data, _)| thedas_sim::cutscene::sounds(&data))
+                        .unwrap_or_default();
+                    a.set_cutscene(&c.name, tracks);
+                }
+                state.cutscene = Some((c.name.clone(), c.elapsed_ms as f32 / 1000.0));
+                if state.line.is_none()
+                    && let Some(l) = c.line_now()
+                    && l.vo_mode == 0
+                    && let Some(conv) = l.conversation.as_ref()
+                {
+                    let female = sim
+                        .world
+                        .hero
+                        .and_then(|h| sim.world.get(h))
+                        .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
+                    state.line = Some(audio::VoiceLine {
+                        dialog: conv.clone(),
+                        strref: l.strref,
+                        female,
+                        ambient: false,
+                    });
+                }
+            }
+        }
         a.frame(state);
         let voice = a.voice_ms();
         if let Some(g) = self.gfx.as_mut() {
@@ -3136,7 +3170,7 @@ fn main() -> Result<()> {
                 log::info!("audio: off");
                 None
             } else {
-                audio::GameAudio::open(&install, &loaded_vfs, &args.language)
+                audio::GameAudio::open(&install, &args.module, &loaded_vfs, &args.language)
             }
         },
     };

@@ -40,7 +40,17 @@ pub struct AudioState {
     /// The interface's sound requests since the last frame (`PlayGUISound` arguments).
     pub gui_sounds: Vec<String>,
     pub line: Option<VoiceLine>,
+    /// The cutscene playing (resource name) and how far it has played (seconds).
+    pub cutscene: Option<(String, f32)>,
     pub volumes: Volumes,
+}
+
+/// A cutscene's sound tracks and which of them are playing.
+struct CutsceneSounds {
+    name: String,
+    tracks: Vec<thedas_sim::cutscene::CutsceneSound>,
+    playing: Vec<Option<EventHandle>>,
+    done: Vec<bool>,
 }
 
 pub struct GameAudio {
@@ -49,6 +59,7 @@ pub struct GameAudio {
     gui: Vec<Option<String>>,
     music: Option<(&'static str, EventHandle)>,
     voice: Option<(VoiceLine, Option<EventHandle>, Option<f64>)>,
+    cutscene: Option<CutsceneSounds>,
     last: Instant,
 }
 
@@ -82,9 +93,11 @@ fn gui_table(vfs: &Vfs) -> Vec<Option<String>> {
 
 impl GameAudio {
     /// The game's sound on the default output; `None` (logged) with no output device.
-    pub fn open(install: &Path, vfs: &Vfs, language: &str) -> Option<GameAudio> {
+    pub fn open(install: &Path, module: &str, vfs: &Vfs, language: &str) -> Option<GameAudio> {
         let output = thedas_audio::device::Output::open()?;
-        let library = Arc::new(Library::new(Library::install_dirs(install, language)));
+        let library = Arc::new(Library::new(Library::install_dirs(
+            install, module, language,
+        )));
         let engine = AudioEngine::new(library, output.mixer.clone());
         Some(GameAudio {
             engine,
@@ -92,8 +105,79 @@ impl GameAudio {
             gui: gui_table(vfs),
             music: None,
             voice: None,
+            cutscene: None,
             last: Instant::now(),
         })
+    }
+
+    /// Whether the sound tracks of cutscene `name` are needed (it has just started).
+    pub fn wants_cutscene(&self, name: &str) -> bool {
+        self.cutscene.as_ref().is_none_or(|c| c.name != name)
+    }
+
+    /// The sound tracks (`ACSP`) of cutscene `name`, read when it starts.
+    pub fn set_cutscene(&mut self, name: &str, tracks: Vec<thedas_sim::cutscene::CutsceneSound>) {
+        self.end_cutscene();
+        if !tracks.is_empty() {
+            log::info!(
+                "cutscene {name}: sounds {:?}",
+                tracks
+                    .iter()
+                    .map(|t| format!("{} at {:.2}s", t.event, t.start))
+                    .collect::<Vec<_>>()
+            );
+        }
+        let n = tracks.len();
+        self.cutscene = Some(CutsceneSounds {
+            name: name.to_string(),
+            tracks,
+            playing: vec![None; n],
+            done: vec![false; n],
+        });
+    }
+
+    fn end_cutscene(&mut self) {
+        if let Some(c) = self.cutscene.take() {
+            for h in c.playing.into_iter().flatten() {
+                self.engine.stop(h, false);
+            }
+        }
+    }
+
+    /// Starts and stops the cutscene's sound tracks at their times: an `ACSP` track plays
+    /// its event from its start until its end, or until the cutscene ends (or is skipped).
+    /// Provisional: a track whose start was missed (a cutscene joined late) does not play.
+    fn follow_cutscene(&mut self, cutscene: Option<(String, f32)>) {
+        let Some((name, t)) = cutscene else {
+            self.end_cutscene();
+            return;
+        };
+        let Some(c) = self.cutscene.as_mut().filter(|c| c.name == name) else {
+            return;
+        };
+        for i in 0..c.tracks.len() {
+            let tr = &c.tracks[i];
+            if c.done[i] {
+                continue;
+            }
+            if c.playing[i].is_none() && t >= tr.start {
+                if t > tr.start + 1.0 {
+                    c.done[i] = true;
+                    continue;
+                }
+                c.playing[i] = self.engine.play(&tr.event, PlayOptions::default());
+                if c.playing[i].is_none() {
+                    log::warn!("cutscene {name}: no sound event {}", tr.event);
+                    c.done[i] = true;
+                }
+            } else if let Some(h) = c.playing[i]
+                && t >= tr.end
+            {
+                self.engine.stop(h, false);
+                c.playing[i] = None;
+                c.done[i] = true;
+            }
+        }
     }
 
     /// How long the current conversation line's voice-over runs (milliseconds), once known.
@@ -138,6 +222,7 @@ impl GameAudio {
                 None => log::debug!("audio: GUI sound {s:?} has no event"),
             }
         }
+        self.follow_cutscene(state.cutscene);
         // Voice-over.
         if self.voice.as_ref().map(|v| &v.0) != state.line.as_ref() {
             if let Some((_, Some(h), _)) = self.voice.take() {
