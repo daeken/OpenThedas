@@ -75,6 +75,12 @@ pub const SCALE9_SCALES: &str = "_global.thedas_s9_scales";
 /// Lays out one piece of a scaling-grid sprite: (sprite index, piece, x, y, x scale, y scale).
 pub const SCALE9_SET: &str = "_global.thedas_s9_set";
 
+/// The engine-image slots the movie made (`_global.thedas_slots`, see
+/// `thedas_formats::gfx::Slot`): each one's image name.
+pub const SLOT_NAMES: &str = "_global.thedas_slot_names";
+/// Loads an image into a slot: (slot index, URL, x, y).
+pub const SLOT_LOAD: &str = "_global.thedas_slot_load";
+
 /// The callback name for setting a movie variable (`object path`, `member`, `value`).
 pub const SET_CALLBACK: &str = "thedas_set";
 
@@ -376,9 +382,16 @@ fn run_after_function() -> Vec<u8> {
 /// while (i < a.length) { var c = a[i]; o.push(c.thedas_s9id); o.push(c._xscale);
 /// o.push(c._yscale); i++; } return o; }` (see [`SCALE9_SCALES`]).
 fn scale9_scales_function() -> Vec<u8> {
+    members_function("thedas_s9", &["thedas_s9id", "_xscale", "_yscale"])
+}
+
+/// `function () { var a = _global[list]; var o = new Array(); var i = 0;
+/// while (i < a.length) { var c = a[i]; o.push(c[m]) for each member m; i++; } return o; }`:
+/// the members of each sprite registered in `_global[list]`, flattened.
+fn members_function(list: &str, members: &[&str]) -> Vec<u8> {
     let mut body = Vec::new();
     push(&mut body, &[Push::Str("a")]);
-    get_path(&mut body, &["_global", "thedas_s9"]);
+    get_path(&mut body, &["_global", list]);
     body.push(DEFINE_LOCAL);
     push(
         &mut body,
@@ -396,7 +409,7 @@ fn scale9_scales_function() -> Vec<u8> {
     get_path(&mut step, &["a"]);
     get_path(&mut step, &["i"]);
     step.extend_from_slice(&[GET_MEMBER, DEFINE_LOCAL]);
-    for m in ["thedas_s9id", "_xscale", "_yscale"] {
+    for m in members {
         get_path(&mut step, &["c", m]);
         push(&mut step, &[Push::Int(1)]);
         get_path(&mut step, &["o"]);
@@ -415,6 +428,38 @@ fn scale9_scales_function() -> Vec<u8> {
     get_path(&mut body, &["o"]);
     body.push(RETURN);
     function(&[], &body)
+}
+
+/// `function (i, u, x, y) { var c = _global.thedas_slots[i].createEmptyMovieClip(
+/// "thedas_img", 1); c._x = x; c._y = y; c.loadMovie(u); }` (see [`SLOT_LOAD`]).
+fn slot_load_function() -> Vec<u8> {
+    let mut body = Vec::new();
+    push(
+        &mut body,
+        &[
+            Push::Str("c"),
+            Push::Int(1),
+            Push::Str("thedas_img"),
+            Push::Int(2),
+        ],
+    );
+    get_path(&mut body, &["_global", "thedas_slots"]);
+    get_path(&mut body, &["i"]);
+    body.push(GET_MEMBER);
+    push(&mut body, &[Push::Str("createEmptyMovieClip")]);
+    body.extend_from_slice(&[CALL_METHOD, DEFINE_LOCAL]);
+    for (m, v) in [("_x", "x"), ("_y", "y")] {
+        get_path(&mut body, &["c"]);
+        push(&mut body, &[Push::Str(m)]);
+        get_path(&mut body, &[v]);
+        body.push(SET_MEMBER);
+    }
+    get_path(&mut body, &["u"]);
+    push(&mut body, &[Push::Int(1)]);
+    get_path(&mut body, &["c"]);
+    push(&mut body, &[Push::Str("loadMovie")]);
+    body.extend_from_slice(&[CALL_METHOD, POP]);
+    function(&["i", "u", "x", "y"], &body)
 }
 
 /// `function (i, k, x, y, a, b) { var p = _global.thedas_s9[i]["thedas_s9_" + k];
@@ -739,6 +784,11 @@ pub fn register_invoke() -> Vec<u8> {
     for (name, f) in [
         ("thedas_s9_scales", scale9_scales_function()),
         ("thedas_s9_set", scale9_set_function()),
+        (
+            "thedas_slot_names",
+            members_function("thedas_slots", &["thedas_image"]),
+        ),
+        ("thedas_slot_load", slot_load_function()),
     ] {
         get_path(&mut out, &["_global"]);
         push(&mut out, &[Push::Str(name)]);

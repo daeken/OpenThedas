@@ -852,6 +852,15 @@ impl App {
                     let shots = live.portraits(&g.ctx, ui::PORTRAIT_SIZE);
                     g.ui.set_portraits(shots);
                 }
+                let due = self
+                    .screens
+                    .as_ref()
+                    .and_then(|s| g.ui.wants_paperdoll(s, &live.sim(), dt));
+                if let Some((who, yaw)) = due {
+                    let (w, h) = ui::PAPERDOLL_SIZE;
+                    let shot = live.paperdoll(&g.ctx, who, yaw, w, h);
+                    g.ui.set_paperdoll(shot);
+                }
             }
         }
         let size = (g.config.width, g.config.height);
@@ -2067,6 +2076,12 @@ fn main() -> Result<()> {
                                 if layer.wants_portraits(key, dt) {
                                     let shots = l.portraits(&ctx, ui::PORTRAIT_SIZE);
                                     layer.set_portraits(shots);
+                                }
+                                let due = layer.wants_paperdoll(s, &l.sim(), dt);
+                                if let Some((who, yaw)) = due {
+                                    let (w, h) = ui::PAPERDOLL_SIZE;
+                                    let shot = l.paperdoll(&ctx, who, yaw, w, h);
+                                    layer.set_paperdoll(shot);
                                 }
                                 if let Some(aim) = layer.play(s, &l.sim, dt).pop() {
                                     println!("aiming ability {}", aim.ability);

@@ -362,13 +362,18 @@ pub fn load_movie(
     let data = lookup(name).ok_or_else(|| UiError::NotFound(name.to_string()))?;
     let inject = avm1::register_invoke();
     let fonts = font_library(lookup);
-    Ok(gfx::rewrite(
+    Ok(gfx::rewrite_with_slots(
         &data,
         &mut |e| images.image(&e.file),
         fonts.as_ref(),
         Some(&inject),
+        ENGINE_IMAGES,
     )?)
 }
+
+/// Images the engine draws into the movies while they run (Scaleform render targets): the
+/// paperdoll (DAOrigins.exe's `GUIPaperdoll` names its target `paperdoll`, 0x7bc659).
+pub const ENGINE_IMAGES: &[&str] = &["paperdoll"];
 
 /// The font library the game installs for Scaleform (see [`gfx::FontLibrary`]).
 pub const FONT_LIBRARY: &str = "fonts_en-us.gfx";
@@ -436,6 +441,11 @@ pub struct UiMovie {
     /// registered one was last laid out for.
     scale9: BTreeMap<u16, gfx::Scale9>,
     scale9_laid: Vec<(f64, f64)>,
+    /// The movie's engine-image slots (see `gfx::Slot`), by image name; the engine's current
+    /// drawing of each image (its URL); the URL each registered slot last loaded.
+    slots: BTreeMap<String, gfx::Slot>,
+    engine_images: BTreeMap<String, String>,
+    slots_loaded: Vec<String>,
 }
 
 /// Turns a callback id from the movie (a number) into its `cm_mapCallbacks` key.
@@ -508,6 +518,9 @@ impl UiMovie {
             sent: Default::default(),
             scale9: BTreeMap::new(),
             scale9_laid: Vec::new(),
+            slots: BTreeMap::new(),
+            engine_images: BTreeMap::new(),
+            slots_loaded: Vec::new(),
         })
     }
 
@@ -576,11 +589,58 @@ impl UiMovie {
         }
     }
 
+    /// The movie's engine-image slots, from its rewrite (`RewriteReport::slots`).
+    pub fn set_slots(&mut self, slots: BTreeMap<String, gfx::Slot>) {
+        self.slots = slots;
+    }
+
+    /// The engine's drawing of image `name` (`paperdoll`) is now at `url`
+    /// (`img://thedas_paperdoll_3.png`), or there is none.
+    pub fn set_engine_image(&mut self, name: &str, url: Option<&str>) {
+        match url {
+            Some(u) => self.engine_images.insert(name.to_string(), u.to_string()),
+            None => self.engine_images.remove(name),
+        };
+    }
+
+    /// Loads the engine's drawings into the slots showing an older one (or none).
+    fn fill_slots(&mut self) {
+        if self.slots.is_empty() {
+            return;
+        }
+        let UiValue::List(names) = self.call(avm1::SLOT_NAMES, &[]) else {
+            return;
+        };
+        for (i, n) in names.iter().enumerate() {
+            let UiValue::String(name) = n else { continue };
+            let (Some(url), Some(slot)) = (self.engine_images.get(name), self.slots.get(name))
+            else {
+                continue;
+            };
+            if self.slots_loaded.len() <= i {
+                self.slots_loaded.resize(i + 1, String::new());
+            }
+            if self.slots_loaded[i] == *url {
+                continue;
+            }
+            self.slots_loaded[i] = url.clone();
+            let [x, y, _, _] = slot.rect;
+            let args = [
+                UiValue::Number(i as f64),
+                UiValue::String(url.clone()),
+                UiValue::Number(x),
+                UiValue::Number(y),
+            ];
+            self.call(avm1::SLOT_LOAD, &args);
+        }
+    }
+
     /// Runs what the movies put off past the host's last step: post-load functions, then
-    /// the scaling-grid layout.
+    /// the scaling-grid layout and the engine's images.
     fn after_step(&mut self) {
         self.call(avm1::POST_LOAD_RUN, &[]);
         self.layout_scale9();
+        self.fill_slots();
     }
 
     /// Advances the movie by `dt_ms` of wall time and runs pending loads.

@@ -140,6 +140,18 @@ pub fn apply_all(sim: &mut Sim, messages: &[GameMessage]) -> Vec<(String, Vec<St
 /// inventory.gfx's category tab: the engine lists only that category's items.
 pub const SET_ITEM_FILTER: &str = "GUIInventory.SetItemListFilter";
 
+/// The inventory's and character record's paperdoll turn buttons (DAOrigins.exe's
+/// `RotatePaperdollLeftMessage` and `RotatePaperdollRightMessage`, handled by `GUIPaperdoll`).
+pub const PAPERDOLL_LEFT: &str = "Paperdoll.RotatePaperdollLeft";
+pub const PAPERDOLL_RIGHT: &str = "Paperdoll.RotatePaperdollRight";
+/// The paperdoll dragged with the mouse: inventory.gfx sends the drag's horizontal and
+/// vertical movement times -0.8 (`RotatePaperdollCameraMessage`). Provisional: taken as
+/// degrees about the member; the vertical part (the camera's pitch) is not used.
+pub const PAPERDOLL_DRAG: &str = "Paperdoll.RotatePaperdollCamera";
+/// How far one press turns the paperdoll (radians). Provisional: the game's step is not
+/// traced.
+pub const PAPERDOLL_TURN: f32 = std::f32::consts::PI / 8.0;
+
 /// Takes the interface's own messages (not simulation input) into `shown`; returns whether
 /// `name` was one.
 pub fn present(shown: &mut Presentation, name: &str, args: &[String]) -> bool {
@@ -147,6 +159,25 @@ pub fn present(shown: &mut Presentation, name: &str, args: &[String]) -> bool {
         return true;
     }
     match name {
+        PAPERDOLL_LEFT | PAPERDOLL_RIGHT => {
+            let turn = if name == PAPERDOLL_LEFT {
+                -PAPERDOLL_TURN
+            } else {
+                PAPERDOLL_TURN
+            };
+            shown.paperdoll_yaw = (shown.paperdoll_yaw + turn) % std::f32::consts::TAU;
+            true
+        }
+        PAPERDOLL_DRAG => {
+            let degrees = args
+                .first()
+                .and_then(|a| a.trim().parse::<f32>().ok())
+                .filter(|d| d.is_finite())
+                .unwrap_or(0.0);
+            shown.paperdoll_yaw =
+                (shown.paperdoll_yaw + degrees.to_radians()) % std::f32::consts::TAU;
+            true
+        }
         SET_ITEM_FILTER => {
             shown.item_filter = args
                 .first()
@@ -261,6 +292,17 @@ pub fn handler_for(sim: Arc<Mutex<Sim>>, shown: Arc<Mutex<Presentation>>) -> Mes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_paperdoll_turns_with_its_buttons_and_drags() {
+        let mut p = Presentation::default();
+        let a = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(present(&mut p, PAPERDOLL_RIGHT, &[]));
+        assert_eq!(p.paperdoll_yaw, PAPERDOLL_TURN);
+        assert!(present(&mut p, PAPERDOLL_LEFT, &[]));
+        assert!(present(&mut p, PAPERDOLL_DRAG, &a(&["-8", "4"])));
+        assert!((p.paperdoll_yaw + 8f32.to_radians()).abs() < 1e-6);
+    }
 
     fn sim() -> Sim {
         Sim::new(
