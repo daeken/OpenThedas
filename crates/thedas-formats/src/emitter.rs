@@ -85,6 +85,8 @@ pub mod field {
     pub const INITIAL_ROTATION: u32 = 6299;
     pub const INITIAL_ROTATION_RANGE: u32 = 6300;
     pub const SPLAT_EMITTER: u32 = 6321;
+    /// The name of the placement's user parameter (`UPAR`) the emitter takes.
+    pub const USER_PARAM_NAME: u32 = 6325;
     pub const CHILDREN: u32 = 6999;
 }
 
@@ -199,6 +201,8 @@ pub struct Emitter {
     pub age_scale_multiplier: [f32; 2],
     pub age_map: Vec<AgeKey>,
     pub volume: SpawnVolume,
+    /// The placement's user parameter it takes (`UserParamName`).
+    pub user_param: Option<String>,
 }
 
 fn flag(d: &Doc<'_>, id: StructId, label: u32) -> TypedResult<bool> {
@@ -278,6 +282,7 @@ impl Emitter {
             ],
             age_map: Vec::new(),
             volume: SpawnVolume::default(),
+            user_param: nonempty(d.opt_str(id, USER_PARAM_NAME)?),
         };
         for c in d.structs(id, CHILDREN)? {
             let kind = d.label(c);
@@ -402,6 +407,7 @@ mod tests {
                 (field::FRAMES_PER_SECOND, Value::F32(24.0)),
                 (field::ORIENTATION, Value::I32(3)),
                 (field::TARGET_NAME, s("")),
+                (field::USER_PARAM_NAME, s("fog")),
                 (field::CHILDREN, generic(&[t, spnv, amap])),
             ],
         );
@@ -419,6 +425,7 @@ mod tests {
         assert!(e.flipbook);
         assert_eq!((e.flipbook_columns, e.flipbook_rows), (8, 4));
         assert_eq!(e.target, None);
+        assert_eq!(e.user_param.as_deref(), Some("fog"));
         assert_eq!(e.age_scale_multiplier, [1.0, 1.0]);
         assert_eq!(
             e.volume.shape,
