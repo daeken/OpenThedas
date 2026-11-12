@@ -957,6 +957,27 @@ fn key_mappings(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
     }
 }
 
+/// Load hint tables' text column (a talk-table string).
+const HASH_LOAD_HINT_TEXT: u32 = 0x4063_41be;
+
+/// The hint a loading screen shows (load_town.gfx's `GUILoading.LoadingText`): the one a
+/// script set for this transition (`SetLoadHint`, `World::transition_hint`), resolved to its
+/// text as DAOrigins.exe does at once (0x660ee0). None when no script set one: the random
+/// hints are the scripts' own picks (`SetLoadHint` from their random tables), not the exe's.
+pub fn load_hint(sim: &Sim) -> Option<String> {
+    use thedas_formats::gda::Cell;
+    let (row, table) = sim.world.transition_hint?;
+    match sim
+        .world
+        .tables()
+        .get(table, "")?
+        .cell_by_hash(HASH_LOAD_HINT_TEXT, i64::from(row))
+    {
+        Some(Cell::Int(s)) if *s > 0 => sim.string(*s as u32).filter(|s| !s.is_empty()),
+        _ => None,
+    }
+}
+
 /// The `Popups` M2DA (`popups.gda`): DAOrigins.exe reads it by id 0xcf.
 const M2DA_POPUPS: i32 = 207;
 /// `popups.gda`'s four button labels (talk-table strings, 0 for no button).
