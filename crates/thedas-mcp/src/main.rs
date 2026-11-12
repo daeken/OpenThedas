@@ -270,6 +270,13 @@ struct PopupArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct TrainingArgs {
+    /// The training action the player does, as EVENT_TYPE_TRAINING_<event> names it (e.g.
+    /// MAXIMUM_ZOOM_IN, MOVEMENT_COMMAND_ISSUED); omit to just read the training state.
+    event: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct AutopilotArgs {
     /// On: the party AI (tactics) fights for every party member, the hero included.
     on: bool,
@@ -1470,6 +1477,28 @@ impl Server {
                 sim.gui_message(thedas_sim::chanters::MSG_CLEAR, &[]);
             }
             Ok(json!({ "accepted": taken, "board": board, "closed": a.close == Some(true) }))
+        })
+    }
+
+    #[tool(
+        description = "The training tutorial under way (SetTrainingMode / BeginTrainingStep): its mode, the trainingsteps.gda step shown and the event it waits for. With event, the player does that training action (e.g. MAXIMUM_ZOOM_IN for the tactical-camera step) and what it causes runs."
+    )]
+    async fn training(&self, Parameters(a): Parameters<TrainingArgs>) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            let heard = a.event.map(|e| {
+                let heard = sim.training_event(&e.trim().to_ascii_uppercase(), 0);
+                sim.tick(0);
+                heard
+            });
+            let t = sim.world.training;
+            Ok(json!({
+                "heard": heard,
+                "mode": t.mode,
+                "step": t.step,
+                "expected_event": t.expected,
+                "paused": sim.training_paused(),
+            }))
         })
     }
 

@@ -41,6 +41,7 @@ pub mod store;
 pub mod tactics;
 pub mod threat;
 pub mod trace;
+pub mod training;
 pub mod world;
 pub mod worldmap;
 
