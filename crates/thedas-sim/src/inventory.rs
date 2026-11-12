@@ -193,19 +193,29 @@ impl Sim {
 
     /// The engine's side of `who` putting on `item` (already in `slot`): the item's
     /// properties take effect through the creature's `APPLY_EFFECT` handler, and its script
-    /// hears `EVENT_TYPE_EQUIP` (object 0 the item, integer 0 the slot, integer 1 the active
-    /// weapon set). Provisional: the event's integers are read from how player_core uses
-    /// them (integer 0 compared with the main- and off-hand slots); the second is a guess.
+    /// hears `EVENT_TYPE_EQUIP`. DAOrigins.exe sends that from one routine (0x6c16e0, type
+    /// 0xb set at 0x6c190f), the equipment container's item-added hook, so every way of
+    /// equipping reaches it: `EquipItem`, `LoadItemsFromTemplate` and a creature's template
+    /// gear when it is created. Object 0 is the item, integer 0 the slot, integer 1 whether
+    /// the player equipped it on the inventory screen (bit 0x80 of the flag word 0xc371b4,
+    /// set only by the screen's handler 0x6be330). rules_core works out the main-hand
+    /// damage (property 50) the record shows from it.
     pub(crate) fn wear(&mut self, who: ObjectId, item: ObjectId, slot: i32) {
+        self.wear_as(who, item, slot, false);
+    }
+
+    /// [`Sim::wear`], saying whether the player did it on the inventory screen.
+    pub(crate) fn wear_as(&mut self, who: ObjectId, item: ObjectId, slot: i32, by_player: bool) {
         for e in self.property_effects(item) {
             self.apply_effect(who, e);
         }
-        self.equip_event("EQUIP", who, item, slot);
+        self.equip_event("EQUIP", who, item, slot, by_player);
     }
 
     /// The engine's side of `who` taking off `item` (from `slot`): the effects it created on
     /// `who` go through the `REMOVE_EFFECT` handler, and the script hears
-    /// `EVENT_TYPE_UNEQUIP`, laid out as [`Sim::wear`]'s event.
+    /// `EVENT_TYPE_UNEQUIP` (type 0xc, 0x6c1b2d), laid out as [`Sim::wear`]'s event.
+    /// Provisional: its integer 1 is taken to mean the same as the equip event's.
     pub(crate) fn take_off(&mut self, who: ObjectId, item: ObjectId, slot: i32) {
         let mine: Vec<crate::world::Effect> = self
             .world
@@ -221,18 +231,20 @@ impl Sim {
         for e in mine {
             self.remove_effect(who, &e);
         }
-        self.equip_event("UNEQUIP", who, item, slot);
+        self.equip_event("UNEQUIP", who, item, slot, false);
     }
 
-    fn equip_event(&mut self, name: &str, who: ObjectId, item: ObjectId, slot: i32) {
-        let set = self
-            .world
-            .get(who)
-            .and_then(|o| o.fields.get("ActiveWeaponSet").copied())
-            .unwrap_or(0);
+    fn equip_event(
+        &mut self,
+        name: &str,
+        who: ObjectId,
+        item: ObjectId,
+        slot: i32,
+        by_player: bool,
+    ) {
         let mut ev = self.new_event(name, Some(who));
         ev.objects = vec![item];
-        ev.ints = vec![slot, set];
+        ev.ints = vec![slot, by_player as i32];
         self.world.queue_event(0, who, ev, None);
     }
 
@@ -327,7 +339,7 @@ impl Sim {
             o.inventory.push(item);
         }
         o.equipment.insert(slot, item);
-        self.wear(who, item, slot);
+        self.wear_as(who, item, slot, true);
         true
     }
 
@@ -954,7 +966,8 @@ mod screen_tests {
                 .map(|q| (q.event.ty, q.event.objects.clone(), q.event.ints.clone()))
                 .collect()
         };
-        assert_eq!(events(&s), vec![(11, vec![amulet], vec![11, 0])]);
+        // Put on from the inventory screen: integer 1 says the player did it.
+        assert_eq!(events(&s), vec![(11, vec![amulet], vec![11, 1])]);
         // Changing a worn item's properties changes what it gives its wearer.
         assert!(s.remove_item_property(amulet, 1005));
         assert!(s.world.get(hero).unwrap().effects.is_empty());
