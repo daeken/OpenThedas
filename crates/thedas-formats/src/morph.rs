@@ -457,12 +457,15 @@ pub fn face_config_list(xml: &[u8], list: &str, race_gender: &str) -> TypedResul
 /// Choices made over a face (character creation's appearance sliders): model and tint
 /// slots replaced. Carried in a morph's name after its base (`hm_cps_p01|m2=hm_har_ha1a_0|
 /// t3=t3_har_bln`), so a creature's face stays one string from the game to the renderer.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct FaceOverlay {
     /// (model [`slot`], model or `None` for none).
     pub models: Vec<(usize, Option<String>)>,
     /// (tint slot, tint or `None` for none).
     pub tints: Vec<(usize, Option<String>)>,
+    /// Morph target weights replacing the face preset's (the face-shape sliders):
+    /// (target, weight).
+    pub targets: Vec<(String, f32)>,
 }
 
 /// The material parameter tints fill.
@@ -473,7 +476,7 @@ const MAX_OVERLAY_SLOT: usize = 32;
 
 impl FaceOverlay {
     pub fn is_empty(&self) -> bool {
-        self.models.is_empty() && self.tints.is_empty()
+        self.models.is_empty() && self.tints.is_empty() && self.targets.is_empty()
     }
 
     /// `base` with the overlay after it (just `base` when empty).
@@ -483,6 +486,9 @@ impl FaceOverlay {
             for (slot, v) in list {
                 s.push_str(&format!("|{k}{slot}={}", v.as_deref().unwrap_or("")));
             }
+        }
+        for (t, w) in &self.targets {
+            s.push_str(&format!("|w{t}={w}"));
         }
         s
     }
@@ -496,6 +502,14 @@ impl FaceOverlay {
             let Some((key, value)) = p.split_once('=') else {
                 continue;
             };
+            if let Some(target) = key.strip_prefix('w') {
+                if let Ok(w) = value.trim().parse::<f32>() {
+                    if w.is_finite() && !target.is_empty() {
+                        o.targets.push((target.to_string(), w));
+                    }
+                }
+                continue;
+            }
             let mut chars = key.chars();
             let kind = chars.next();
             let Ok(slot) = chars.as_str().parse::<usize>() else {
@@ -698,9 +712,13 @@ mod tests {
         let o = FaceOverlay {
             models: vec![(2, Some("hm_har_ha1a_0".into())), (3, None)],
             tints: vec![(3, Some("t3_har_bln".into()))],
+            targets: vec![("UH_NOS_07a_0".into(), 0.5)],
         };
         let name = o.name("hm_cps_p01");
-        assert_eq!(name, "hm_cps_p01|m2=hm_har_ha1a_0|m3=|t3=t3_har_bln");
+        assert_eq!(
+            name,
+            "hm_cps_p01|m2=hm_har_ha1a_0|m3=|t3=t3_har_bln|wUH_NOS_07a_0=0.5"
+        );
         let (base, back) = FaceOverlay::split(&name);
         assert_eq!((base, &back), ("hm_cps_p01", &o));
         assert_eq!(
@@ -708,7 +726,7 @@ mod tests {
             ("hm_cps_p01", FaceOverlay::default())
         );
         // Bad parts are skipped.
-        let (_, bad) = FaceOverlay::split("x|q1=a|m=b|m99=c|t1");
+        let (_, bad) = FaceOverlay::split("x|q1=a|m=b|m99=c|t1|wX=nan|w=1");
         assert!(bad.is_empty());
         let m = Morph {
             models: vec![
