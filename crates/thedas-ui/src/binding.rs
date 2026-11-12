@@ -423,11 +423,20 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             v.insert(format!("{k}.PortraitProperties.PortraitTint"), num(0));
         }
     }
-    // Who may level up now (the character record's button): a party member the game marked
-    // (`SetCanLevelUp`, or experience reaching the next level) out of combat.
+    // Who may level up now (the character record's button): a party member out of combat
+    // the game marked (`SetCanLevelUp`, or experience reaching the next level), or with
+    // points to spend: DAOrigins.exe's test (0x6acbc0) sums the attribute, skill,
+    // talent/spell and specialization points (properties 34, 35, 36 and 38). Provisional:
+    // the class checks that follow the sum are not traced.
     for id in &members {
         let can = sim.world.get(*id).is_some_and(|o| {
-            o.fields.get("CanLevelUp").copied().unwrap_or(0) != 0 && !o.combat.in_combat
+            let points: f32 = [34, 35, 36, 38]
+                .iter()
+                .filter_map(|p| o.properties.get(p))
+                .map(|p| p.0)
+                .sum();
+            (o.fields.get("CanLevelUp").copied().unwrap_or(0) != 0 || points > 0.0)
+                && !o.combat.in_combat
         });
         v.insert(
             format!("{}.{id}", crate::protocol::CAN_LEVEL_UP),
