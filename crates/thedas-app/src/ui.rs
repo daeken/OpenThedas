@@ -571,8 +571,18 @@ impl UiLayer {
                 let key: LineKey = (d.dialog, d.line, d.replies.iter().map(|r| r.0).collect());
                 (key, waits)
             });
-            (crate::screens::wanted(&sim, screens.menu), line)
+            let want = crate::screens::wanted(&sim, screens.menu);
+            (
+                crate::screens::with_examine(want, shown.examine.is_some()),
+                line,
+            )
         };
+        // The examine screen goes with the screen it was opened from.
+        if !want.contains(&Screen::ItemExamine)
+            && let Ok(mut shown) = self.shown.lock()
+        {
+            shown.examine = None;
+        }
         let changes = screens.sync(want, &mut self.stage);
         // The store's close button: the simulation's store closes too.
         if changes.dismissed.contains(&Screen::Store) {
@@ -1015,6 +1025,12 @@ impl UiLayer {
     }
 
     /// A click the movies see as Scaleform mouse `button` (a right click, a double click).
+    /// A press or release the movies see as Scaleform `button` (see
+    /// [`thedas_ui::stage::Stage::button_as`]).
+    pub fn button_as(&mut self, button: f64, x: f64, y: f64, down: bool) {
+        self.stage.button_as(button, x, y, down);
+    }
+
     pub fn click_as(&mut self, button: f64, x: f64, y: f64) {
         self.stage.click_as(button, x, y);
     }

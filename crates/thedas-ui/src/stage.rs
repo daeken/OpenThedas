@@ -512,6 +512,22 @@ impl Stage {
         }
     }
 
+    /// A press (`down`) or release at (`x`, `y`) that the movies see as Scaleform `button`
+    /// ([`crate::avm1::MOUSE_RIGHT`]), delivered as the left button with the button set
+    /// aside (see [`crate::avm1::BUTTON_VAR`]): a right press opens an item's radial menu,
+    /// and its release picks the action under the mouse.
+    pub fn button_as(&mut self, button: f64, x: f64, y: f64, down: bool) {
+        for m in self.input_movies() {
+            m.set(crate::avm1::BUTTON_VAR, UiValue::Number(button));
+            m.mouse_move(x, y);
+            if down {
+                release_text_focus(m);
+            }
+            m.mouse_button(x, y, down);
+            m.set(crate::avm1::BUTTON_VAR, UiValue::Undefined);
+        }
+    }
+
     /// Loads that failed, by movie.
     pub fn failed_loads(&self) -> Vec<(String, String)> {
         self.movies

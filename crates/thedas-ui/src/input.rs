@@ -140,6 +140,12 @@ pub fn apply_all(sim: &mut Sim, messages: &[GameMessage]) -> Vec<(String, Vec<St
 /// inventory.gfx's category tab: the engine lists only that category's items.
 pub const SET_ITEM_FILTER: &str = "GUIInventory.SetItemListFilter";
 
+/// A screen's inspect action (inventory.gfx's `ItemUtils.ExamineItem`): the item's token,
+/// which side to show on and whether to check the requirements.
+pub const SHOW_ITEM_EXAMINE: &str = "GUIItemExamine.ShowItemExamine";
+/// A movie closing a screen of its own by name (itemexamine.gfx: `ItemExamine`).
+pub const HIDE_GUI_SCREEN: &str = "GUI.HideGUIScreen";
+pub const ITEM_EXAMINE_SCREEN: &str = "ItemExamine";
 /// The inventory's and character record's paperdoll turn buttons (DAOrigins.exe's
 /// `RotatePaperdollLeftMessage` and `RotatePaperdollRightMessage`, handled by `GUIPaperdoll`).
 pub const PAPERDOLL_LEFT: &str = "Paperdoll.RotatePaperdollLeft";
@@ -159,6 +165,27 @@ pub fn present(shown: &mut Presentation, name: &str, args: &[String]) -> bool {
         return true;
     }
     match name {
+        SHOW_ITEM_EXAMINE => {
+            let int = |i: usize| {
+                args.get(i)
+                    .and_then(|a| a.trim().parse::<f64>().ok())
+                    .map_or(0, |v| v as i32)
+            };
+            shown.examine = args
+                .first()
+                .map(|t| t.trim())
+                .filter(|t| !t.is_empty())
+                .map(|t| crate::binding::Examine {
+                    token: t.to_string(),
+                    right_side: int(1),
+                    check_requirements: int(2),
+                });
+            true
+        }
+        HIDE_GUI_SCREEN if args.first().map(|a| a.trim()) == Some(ITEM_EXAMINE_SCREEN) => {
+            shown.examine = None;
+            true
+        }
         PAPERDOLL_LEFT | PAPERDOLL_RIGHT => {
             let turn = if name == PAPERDOLL_LEFT {
                 -PAPERDOLL_TURN
@@ -292,6 +319,26 @@ pub fn handler_for(sim: Arc<Mutex<Sim>>, shown: Arc<Mutex<Presentation>>) -> Mes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_examine_screen_opens_on_an_item_and_closes_itself() {
+        let mut p = Presentation::default();
+        let a = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let token = "GUIInventory.PartyBackpackView.2.Item";
+        assert!(present(&mut p, SHOW_ITEM_EXAMINE, &a(&[token, "1", "0"])));
+        assert_eq!(
+            p.examine,
+            Some(crate::binding::Examine {
+                token: token.into(),
+                right_side: 1,
+                check_requirements: 0,
+            })
+        );
+        assert!(!present(&mut p, HIDE_GUI_SCREEN, &a(&["Journal"])));
+        assert!(p.examine.is_some());
+        assert!(present(&mut p, HIDE_GUI_SCREEN, &a(&["ItemExamine"])));
+        assert!(p.examine.is_none());
+    }
 
     #[test]
     fn the_paperdoll_turns_with_its_buttons_and_drags() {

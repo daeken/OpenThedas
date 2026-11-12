@@ -133,7 +133,9 @@ struct Args {
     /// spawn rebuilds them, timed), `picker` (the party picker opens as a script would open
     /// it), `wipe` (the whole party falls), `key f5` and `key f9` (the save and load
     /// screens), `rclick X,Y` and `dclick X,Y` (a right or double click
-    /// for the interface), `hover X,Y` (the mouse rests there, for the aiming reticle).
+    /// for the interface), `rpress X,Y` and `rrelease X,Y` (the right button down and up,
+    /// for an item's radial menu), `hover X,Y` (the mouse rests there, for the aiming
+    /// reticle).
     #[arg(long, default_value = "")]
     steps: String,
     /// Module for `--save` and `--objects`.
@@ -450,6 +452,9 @@ struct App {
     gfx: Option<Gfx>,
     keys: HashSet<KeyCode>,
     looking: bool,
+    /// The right button went down over the interface: its release is the interface's too (an
+    /// item's radial menu opens on the press and acts on the release).
+    ui_right: bool,
     last: Instant,
     error: Option<anyhow::Error>,
     captures: u32,
@@ -1209,10 +1214,16 @@ impl App {
         if pressed {
             if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_ref()) {
                 if !s.exploring() || g.ui.covers(x, y) {
-                    g.ui.click_as(thedas_ui::avm1::MOUSE_RIGHT, x, y);
+                    g.ui.button_as(thedas_ui::avm1::MOUSE_RIGHT, x, y, true);
+                    self.ui_right = true;
                     return;
                 }
             }
+        } else if std::mem::take(&mut self.ui_right) {
+            if let Some(g) = self.gfx.as_mut() {
+                g.ui.button_as(thedas_ui::avm1::MOUSE_RIGHT, x, y, false);
+            }
+            return;
         }
         // A right click drops an ability waiting for its target.
         if pressed {
@@ -1243,6 +1254,16 @@ impl App {
                     g.ui.click_as(button, x, y);
                 }
                 log.push(format!("click {x},{y} as button {button}"));
+            }
+            &Step::RightAt(x, y, down) => {
+                self.cursor_to(x, y);
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.button_as(thedas_ui::avm1::MOUSE_RIGHT, x, y, down);
+                }
+                log.push(format!(
+                    "right {} {x},{y}",
+                    if down { "press" } else { "release" }
+                ));
             }
             &Step::Hover(x, y) => {
                 self.cursor_to(x, y);
@@ -1744,6 +1765,9 @@ enum Step {
     /// The left button goes down, or up, at a pixel: with `hover` and `run` between, a drag
     /// (the quickbar's icons, the inventory's items).
     Press(f64, f64),
+    /// The right button down (true) or up at a pixel, for the interface (`rpress`,
+    /// `rrelease`).
+    RightAt(f64, f64, bool),
     Release(f64, f64),
 }
 
@@ -1846,6 +1870,10 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
                 "hover" => {
                     let (x, y) = arg.split_once(',').context("hover takes x,y")?;
                     Step::Hover(x.trim().parse()?, y.trim().parse()?)
+                }
+                "rpress" | "rrelease" => {
+                    let (x, y) = arg.split_once(',').context("rpress takes x,y")?;
+                    Step::RightAt(x.trim().parse()?, y.trim().parse()?, verb == "rpress")
                 }
                 "rclick" | "dclick" => {
                     let (x, y) = arg.split_once(',').context("click takes x,y")?;
@@ -1999,6 +2027,14 @@ fn main() -> Result<()> {
                             layer.click_as(button, x, y);
                             println!("click {x},{y} as button {button}: interface");
                         }
+                    }
+                    &Step::RightAt(x, y, down) => {
+                        if let Some((layer, _)) = played.as_mut() {
+                            layer.render_movies();
+                            layer.button_as(thedas_ui::avm1::MOUSE_RIGHT, x, y, down);
+                        }
+                        cursor = (x, y);
+                        println!("right {} {x},{y}", if down { "press" } else { "release" });
                     }
                     Step::Rebuild => {
                         l.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
@@ -2236,6 +2272,7 @@ fn main() -> Result<()> {
         gfx: None,
         keys: HashSet::new(),
         looking: false,
+        ui_right: false,
         last: Instant::now(),
         error: None,
         captures: 0,

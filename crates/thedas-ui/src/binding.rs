@@ -97,6 +97,20 @@ pub struct Presentation {
     /// How far the player has turned the paperdoll from facing them (radians; the
     /// inventory's and character record's rotate buttons, see `crate::input::PAPERDOLL_TURN`).
     pub paperdoll_yaw: f32,
+    /// The item being examined (see [`Examine`]), while the examine screen is up.
+    pub examine: Option<Examine>,
+}
+
+/// An item shown on the examine screen (itemexamine.gfx), as the screen that opened it asked
+/// (`GUIItemExamine.ShowItemExamine`: the item's token, which side of the screen, whether to
+/// check the requirements) and itemexamine.gfx reads it back (`GUIItemExamine.ItemToken`,
+/// `.RightSide`, `.CheckRequirements`). The item's own values are the opening screen's,
+/// under the token.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Examine {
+    pub token: String,
+    pub right_side: i32,
+    pub check_requirements: i32,
 }
 
 /// The journal entry a notification opens the journal on, as journal.gfx reads it
@@ -491,6 +505,17 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     journal(sim, shown, &mut v);
     alerts(sim, &mut v);
     crate::options::values(&shown.options, shown.resolution, &mut v);
+    if let Some(e) = &shown.examine {
+        v.insert(
+            "GUIItemExamine.ItemToken".into(),
+            UiValue::String(e.token.clone()),
+        );
+        v.insert("GUIItemExamine.RightSide".into(), num(e.right_side));
+        v.insert(
+            "GUIItemExamine.CheckRequirements".into(),
+            num(e.check_requirements),
+        );
+    }
     // The difficulty, as character creation's difficulty prompt starts from it.
     v.insert(
         "ClientOptions.GameOptions.DifficultyLevel".into(),

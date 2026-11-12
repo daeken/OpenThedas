@@ -176,6 +176,8 @@ enum Push<'a> {
     Int(i32),
     Null,
     Undefined,
+    Bool(bool),
+    Register(u8),
 }
 
 fn get_path(out: &mut Vec<u8>, path: &[&str]) {
@@ -482,6 +484,318 @@ fn scale9_set_function() -> Vec<u8> {
     function(&["i", "k", "x", "y", "a", "b"], &body)
 }
 
+/// Code with forward and backward branches by label.
+#[derive(Default)]
+struct Asm {
+    code: Vec<u8>,
+    labels: std::collections::HashMap<&'static str, usize>,
+    fixups: Vec<(usize, &'static str)>,
+}
+
+impl Asm {
+    fn label(&mut self, l: &'static str) {
+        self.labels.insert(l, self.code.len());
+    }
+
+    /// An `If` or `Jump` to `l`.
+    fn branch(&mut self, op: u8, l: &'static str) {
+        record(&mut self.code, op, &[0, 0]);
+        self.fixups.push((self.code.len(), l));
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        for (end, l) in std::mem::take(&mut self.fixups) {
+            let target = self.labels.get(l).copied().unwrap_or(end);
+            let off = (target as i64 - end as i64) as i16;
+            self.code[end - 2..end].copy_from_slice(&off.to_le_bytes());
+        }
+        self.code
+    }
+}
+
+const ENUMERATE2: u8 = 0x55;
+const TYPEOF: u8 = 0x44;
+const GREATER: u8 = 0x67;
+const STORE_REGISTER: u8 = 0x87;
+
+/// Scaleform's `Mouse.getTopMostEntity(testAll)`, which Ruffle lacks (it returned undefined,
+/// so a radial menu's release never found the button under the mouse and every inventory
+/// right-click menu cancelled itself at once): `function (t) { return
+/// _global.thedas_top(_root, t); }`.
+fn top_most_entity_function() -> Vec<u8> {
+    let mut body = Vec::new();
+    get_path(&mut body, &["t"]);
+    get_path(&mut body, &["_root"]);
+    push(&mut body, &[Push::Int(2)]);
+    get_path(&mut body, &["_global"]);
+    push(&mut body, &[Push::Str("thedas_top")]);
+    body.extend_from_slice(&[CALL_METHOD, RETURN]);
+    function(&["t"], &body)
+}
+
+/// `function (c, t)`: the deepest clip under the mouse below `c`, trying the visible
+/// children the mouse is over from the topmost (highest depth) down, depth first; with `t`
+/// false,
+/// only a clip with a mouse handler (`onPress`, `onRelease`, `onRollOver`, `onDragOver`,
+/// `onReleaseOutside`) counts, as Scaleform's `testAll` false. Provisional: Scaleform's
+/// own search is not traced; text fields and buttons are not considered.
+fn top_function() -> Vec<u8> {
+    let mut a = Asm::default();
+    let c = &mut a.code;
+    push(c, &[Push::Str("lim"), Push::Int(i32::MAX)]);
+    c.push(DEFINE_LOCAL);
+    push(c, &[Push::Str("x")]);
+    get_path(c, &["_root", "_xmouse"]);
+    c.push(DEFINE_LOCAL);
+    push(c, &[Push::Str("y")]);
+    get_path(c, &["_root", "_ymouse"]);
+    c.push(DEFINE_LOCAL);
+    // Each pass takes the topmost child under the mouse below the last one tried.
+    a.label("pass");
+    let c = &mut a.code;
+    push(c, &[Push::Str("b"), Push::Undefined]);
+    c.push(DEFINE_LOCAL);
+    push(c, &[Push::Str("d"), Push::Int(i32::MIN)]);
+    c.push(DEFINE_LOCAL);
+    get_path(c, &["c"]);
+    c.push(ENUMERATE2);
+    a.label("next");
+    // var k = the next name (null after the last).
+    record(&mut a.code, STORE_REGISTER, &[0]);
+    a.code.push(POP);
+    push(&mut a.code, &[Push::Register(0), Push::Null]);
+    a.code.push(EQUALS2);
+    a.branch(IF, "done");
+    let c = &mut a.code;
+    push(c, &[Push::Str("o")]);
+    get_path(c, &["c"]);
+    push(c, &[Push::Register(0)]);
+    c.extend_from_slice(&[GET_MEMBER, DEFINE_LOCAL]);
+    get_path(c, &["o"]);
+    c.push(TYPEOF);
+    push(c, &[Push::Str("movieclip")]);
+    c.extend_from_slice(&[STRICT_EQUALS, NOT]);
+    a.branch(IF, "next");
+    let c = &mut a.code;
+    get_path(c, &["o", "_parent"]);
+    get_path(c, &["c"]);
+    c.extend_from_slice(&[EQUALS2, NOT]);
+    a.branch(IF, "next");
+    let c = &mut a.code;
+    get_path(c, &["o", "_visible"]);
+    c.push(NOT);
+    a.branch(IF, "next");
+    let c = &mut a.code;
+    push(c, &[Push::Bool(true)]);
+    get_path(c, &["y"]);
+    get_path(c, &["x"]);
+    push(c, &[Push::Int(3)]);
+    get_path(c, &["o"]);
+    push(c, &[Push::Str("hitTest")]);
+    c.extend_from_slice(&[CALL_METHOD, NOT]);
+    a.branch(IF, "next");
+    let c = &mut a.code;
+    push(c, &[Push::Str("g"), Push::Int(0)]);
+    get_path(c, &["o"]);
+    push(c, &[Push::Str("getDepth")]);
+    c.extend_from_slice(&[CALL_METHOD, DEFINE_LOCAL]);
+    get_path(c, &["g"]);
+    get_path(c, &["d"]);
+    c.extend_from_slice(&[GREATER, NOT]);
+    a.branch(IF, "next");
+    let c = &mut a.code;
+    get_path(c, &["g"]);
+    get_path(c, &["lim"]);
+    c.extend_from_slice(&[LESS2, NOT]);
+    a.branch(IF, "next");
+    let c = &mut a.code;
+    push(c, &[Push::Str("d")]);
+    get_path(c, &["g"]);
+    c.push(SET_VARIABLE);
+    push(c, &[Push::Str("b")]);
+    get_path(c, &["o"]);
+    c.push(SET_VARIABLE);
+    a.branch(JUMP, "next");
+    a.label("done");
+    let c = &mut a.code;
+    get_path(c, &["b"]);
+    push(c, &[Push::Undefined]);
+    c.push(EQUALS2);
+    a.branch(IF, "none");
+    // var e = _global.thedas_top(b, t); if (e != undefined) return e;
+    let c = &mut a.code;
+    push(c, &[Push::Str("e")]);
+    get_path(c, &["t"]);
+    get_path(c, &["b"]);
+    push(c, &[Push::Int(2)]);
+    get_path(c, &["_global"]);
+    push(c, &[Push::Str("thedas_top")]);
+    c.extend_from_slice(&[CALL_METHOD, DEFINE_LOCAL]);
+    get_path(c, &["e"]);
+    push(c, &[Push::Undefined]);
+    c.push(EQUALS2);
+    a.branch(IF, "self");
+    get_path(&mut a.code, &["e"]);
+    a.code.push(RETURN);
+    a.label("self");
+    get_path(&mut a.code, &["t"]);
+    a.branch(IF, "found");
+    for h in [
+        "onPress",
+        "onRelease",
+        "onRollOver",
+        "onDragOver",
+        "onReleaseOutside",
+    ] {
+        get_path(&mut a.code, &["b", h]);
+        a.branch(IF, "found");
+    }
+    // Nothing in it takes the mouse: the next child down.
+    push(&mut a.code, &[Push::Str("lim")]);
+    get_path(&mut a.code, &["d"]);
+    a.code.push(SET_VARIABLE);
+    a.branch(JUMP, "pass");
+    a.label("found");
+    get_path(&mut a.code, &["b"]);
+    a.code.push(RETURN);
+    a.label("none");
+    push(&mut a.code, &[Push::Undefined]);
+    a.code.push(RETURN);
+    function(&["c", "t"], &a.finish())
+}
+
+/// `function (l) { if (l.thedas_proxy == undefined && !l.thedas_is_proxy) { var p = new
+/// Object(); p.thedas_is_proxy = 1; p.l = l; p.onMouseDown = function () {
+/// this.l.onMouseDown(1, Mouse.getTopMostEntity(false)); }; (onMouseUp likewise);
+/// p.onMouseMove = function () { this.l.onMouseMove(); }; p.onMouseWheel = function (d, t)
+/// { this.l.onMouseWheel(d, t); }; l.thedas_proxy = p; } return l.thedas_is_proxy ? l :
+/// l.thedas_proxy; }`: a mouse listener as Scaleform called it. Scaleform passed the
+/// button and the entity under the mouse to `onMouseDown`/`onMouseUp`; Ruffle passes
+/// nothing, and `GUI.Element`'s listener takes a missing button for a right or middle one
+/// and presses the entity under the mouse itself, twice over Ruffle's own press. The host
+/// delivers every button as the left one (see [`BUTTON_VAR`]), so the left (1) is passed.
+fn listener_proxy_function() -> Vec<u8> {
+    let forward = |m: &str, top: bool| {
+        let mut b = Vec::new();
+        if top {
+            push(&mut b, &[Push::Bool(false), Push::Int(1)]);
+            get_path(&mut b, &["Mouse"]);
+            push(&mut b, &[Push::Str("getTopMostEntity")]);
+            b.push(CALL_METHOD);
+            push(&mut b, &[Push::Int(1), Push::Int(2)]);
+        } else {
+            push(&mut b, &[Push::Int(0)]);
+        }
+        get_path(&mut b, &["this", "l"]);
+        push(&mut b, &[Push::Str(m)]);
+        b.extend_from_slice(&[CALL_METHOD, POP]);
+        function(&[], &b)
+    };
+    let mut wheel = Vec::new();
+    get_path(&mut wheel, &["t"]);
+    get_path(&mut wheel, &["d"]);
+    push(&mut wheel, &[Push::Int(2)]);
+    get_path(&mut wheel, &["this", "l"]);
+    push(&mut wheel, &[Push::Str("onMouseWheel")]);
+    wheel.extend_from_slice(&[CALL_METHOD, POP]);
+    let mut a = Asm::default();
+    get_path(&mut a.code, &["l", "thedas_is_proxy"]);
+    a.branch(IF, "proxy");
+    get_path(&mut a.code, &["l", "thedas_proxy"]);
+    push(&mut a.code, &[Push::Undefined]);
+    a.code.extend_from_slice(&[EQUALS2, NOT]);
+    a.branch(IF, "made");
+    let c = &mut a.code;
+    push(c, &[Push::Str("p"), Push::Int(0), Push::Str("Object")]);
+    c.extend_from_slice(&[NEW_OBJECT, DEFINE_LOCAL]);
+    get_path(c, &["p"]);
+    push(c, &[Push::Str("thedas_is_proxy"), Push::Int(1)]);
+    c.push(SET_MEMBER);
+    get_path(c, &["p"]);
+    push(c, &[Push::Str("l")]);
+    get_path(c, &["l"]);
+    c.push(SET_MEMBER);
+    for (m, top) in [
+        ("onMouseDown", true),
+        ("onMouseUp", true),
+        ("onMouseMove", false),
+    ] {
+        get_path(c, &["p"]);
+        push(c, &[Push::Str(m)]);
+        c.extend(forward(m, top));
+        c.push(SET_MEMBER);
+    }
+    get_path(c, &["p"]);
+    push(c, &[Push::Str("onMouseWheel")]);
+    c.extend(function(&["d", "t"], &wheel));
+    c.push(SET_MEMBER);
+    get_path(c, &["l"]);
+    push(c, &[Push::Str("thedas_proxy")]);
+    get_path(c, &["p"]);
+    c.push(SET_MEMBER);
+    a.label("made");
+    get_path(&mut a.code, &["l", "thedas_proxy"]);
+    a.code.push(RETURN);
+    a.label("proxy");
+    get_path(&mut a.code, &["l"]);
+    a.code.push(RETURN);
+    function(&["l"], &a.finish())
+}
+
+/// `function (o) { return function (l) { return o.call(Mouse,
+/// _global.thedas_listener(l)); }; }`: `Mouse.addListener`'s and `Mouse.removeListener`'s
+/// wrapper (see [`listener_proxy_function`]).
+fn listener_wrap_maker() -> Vec<u8> {
+    let mut inner = Vec::new();
+    get_path(&mut inner, &["l"]);
+    push(&mut inner, &[Push::Int(1)]);
+    get_path(&mut inner, &["_global"]);
+    push(&mut inner, &[Push::Str("thedas_listener")]);
+    inner.push(CALL_METHOD);
+    get_path(&mut inner, &["Mouse"]);
+    push(&mut inner, &[Push::Int(2)]);
+    get_path(&mut inner, &["o"]);
+    push(&mut inner, &[Push::Str("call")]);
+    inner.extend_from_slice(&[CALL_METHOD, RETURN]);
+    let mut outer = function(&["l"], &inner);
+    outer.push(RETURN);
+    function(&["o"], &outer)
+}
+
+/// `function () { var a = Mouse._listeners; for (var i = 0; i < a.length; i++) a[i] =
+/// _global.thedas_listener(a[i]); }`: the listeners added before the wrappers, as proxies.
+fn proxy_listeners_function() -> Vec<u8> {
+    let mut a = Asm::default();
+    let c = &mut a.code;
+    push(c, &[Push::Str("a")]);
+    get_path(c, &["Mouse", "_listeners"]);
+    c.push(DEFINE_LOCAL);
+    push(c, &[Push::Str("i"), Push::Int(0)]);
+    c.push(DEFINE_LOCAL);
+    a.label("loop");
+    let c = &mut a.code;
+    get_path(c, &["i"]);
+    get_path(c, &["a", "length"]);
+    c.extend_from_slice(&[LESS2, NOT]);
+    a.branch(IF, "end");
+    let c = &mut a.code;
+    get_path(c, &["a"]);
+    get_path(c, &["i"]);
+    get_path(c, &["a"]);
+    get_path(c, &["i"]);
+    c.push(GET_MEMBER);
+    push(c, &[Push::Int(1)]);
+    get_path(c, &["_global"]);
+    push(c, &[Push::Str("thedas_listener")]);
+    c.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
+    push(c, &[Push::Str("i")]);
+    get_path(c, &["i"]);
+    c.extend_from_slice(&[INCREMENT, SET_VARIABLE]);
+    a.branch(JUMP, "loop");
+    a.label("end");
+    function(&[], &a.finish())
+}
+
 /// The member marking a clip whose hiding is put off (cleared by a `ShowMovie` meanwhile).
 const PENDING: &str = "thedas_hide_pending";
 
@@ -610,6 +924,14 @@ fn push(out: &mut Vec<u8>, values: &[Push]) {
             }
             Push::Null => b.push(2),
             Push::Undefined => b.push(3),
+            Push::Bool(v) => {
+                b.push(5);
+                b.push(*v as u8);
+            }
+            Push::Register(r) => {
+                b.push(4);
+                b.push(*r);
+            }
         }
     }
     record(out, PUSH, &b);
@@ -781,6 +1103,43 @@ pub fn register_invoke() -> Vec<u8> {
         &[Push::Str("thedas_after"), Push::Int(0), Push::Str("Array")],
     );
     out.extend_from_slice(&[NEW_OBJECT, SET_MEMBER]);
+    // Mouse.getTopMostEntity, which the movies use as Scaleform's (see
+    // `top_most_entity_function`).
+    get_path(&mut out, &["_global"]);
+    push(&mut out, &[Push::Str("thedas_top")]);
+    out.extend(top_function());
+    out.push(SET_MEMBER);
+    get_path(&mut out, &["Mouse"]);
+    push(&mut out, &[Push::Str("getTopMostEntity")]);
+    out.extend(top_most_entity_function());
+    out.push(SET_MEMBER);
+    // Mouse listeners called as Scaleform called them (see `listener_proxy_function`):
+    // those added from now on, and (here and again at INSTALL) those added before.
+    for (name, f) in [
+        ("thedas_listener", listener_proxy_function()),
+        ("thedas_listener_wrap", listener_wrap_maker()),
+        ("thedas_proxy_listeners", proxy_listeners_function()),
+    ] {
+        get_path(&mut out, &["_global"]);
+        push(&mut out, &[Push::Str(name)]);
+        out.extend(f);
+        out.push(SET_MEMBER);
+    }
+    for m in ["addListener", "removeListener"] {
+        get_path(&mut out, &["Mouse"]);
+        push(&mut out, &[Push::Str(m)]);
+        get_path(&mut out, &["Mouse", m]);
+        push(&mut out, &[Push::Int(1)]);
+        get_path(&mut out, &["_global"]);
+        push(&mut out, &[Push::Str("thedas_listener_wrap")]);
+        out.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
+    }
+    for code in [&mut out, &mut install] {
+        push(code, &[Push::Int(0)]);
+        get_path(code, &["_global"]);
+        push(code, &[Push::Str("thedas_proxy_listeners")]);
+        code.extend_from_slice(&[CALL_METHOD, POP]);
+    }
     for (name, f) in [
         ("thedas_s9_scales", scale9_scales_function()),
         ("thedas_s9_set", scale9_set_function()),
