@@ -34,7 +34,7 @@ so an untraced item starts with a trace, not with a guess.
 
 | Area | File | Inventory items |
 | --- | --- | --- |
-| Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 168 (`SIM-`), plus ability coverage by family |
+| Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 167 (`SIM-`), plus ability coverage by family |
 | Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 96 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
 | Rendering | [gaps/rendering.md](gaps/rendering.md) | 152 (`RND-`) |
 | Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 183 (`UI-`), plus the movies never opened and the values no screen gets answered |
@@ -51,11 +51,11 @@ these, so they are the places where one person or stream can take a large, separ
 
 ### Simulation and scripting
 
-- **Most commands do nothing.** Only attack, ability, the moves, jumps, wait, weapon switch,
-  conversation and use actually run. Play-animation, turn, sheathe, move-away, death blow, fly
-  and the rest sit in the queue for half a second and report success (`SIM-001`, `SIM-002`,
-  `SCR-055`). Scripts build the idle ones at about 2,750 call sites, led by move-away (1,010),
-  play-animation (829) and fly (353).
+- **Many commands do nothing.** Attack, ability, the moves (including move-away and multi-point
+  walks), jumps, turn, wait, weapon switch, conversation and use run. Play-animation, sheathe,
+  death blow, fly and the rest sit in the queue for half a second and report success
+  (`SIM-001`, `SIM-002`, `SCR-055`). Scripts build the idle ones at about 1,200 call sites, led
+  by play-animation (829) and fly (353).
 - **Effects are mostly stored, not enforced.** The engine acts on death, resurrection,
   area-of-effect, upkeep and damage over time. Other effect types go to the target's script and
   are then only kept; the effect table's flags that should block movement, combat or talents
