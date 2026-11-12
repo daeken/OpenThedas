@@ -279,6 +279,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             num((controlled.is_some() && members.get(i).copied() == controlled) as u8),
         );
     }
+    let tables = sim.world.tables();
     let mut creature = |prefix: &str, id: u32| {
         let Some(o) = sim.world.get(id) else { return };
         v.insert(prefix.to_string(), num(id));
@@ -305,6 +306,35 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         let class = sim.property_total(id, PROPERTY_CLASS) as i32;
         let mana = o.properties.contains_key(&8) && class == CLASS_WIZARD;
         v.insert(format!("{prefix}.Stats.ClassHasMana"), num(mana as u8));
+        // The class's name (`cla_data`'s name string), which the portrait's tooltip shows
+        // under the level.
+        let class_name = tables
+            .get(0, "cla_data")
+            .and_then(|t| match t.cell_by_hash(HASH_NAME, i64::from(class)) {
+                Some(thedas_formats::gda::Cell::Int(s)) => u32::try_from(*s).ok(),
+                _ => None,
+            })
+            .filter(|s| *s != 0)
+            .and_then(|s| sim.string(s))
+            .unwrap_or_default();
+        v.insert(
+            format!("{prefix}.Stats.ClassName"),
+            UiValue::String(class_name),
+        );
+        // The level-up mark on the portrait: points to spend, as DAOrigins.exe tests it
+        // (0x6aca10: attribute, skill and talent/spell points, properties 34 to 36, above 0).
+        let points: f32 = [34, 35, 36]
+            .iter()
+            .filter_map(|p| o.properties.get(p))
+            .map(|p| p.0)
+            .sum();
+        v.insert(
+            format!("{prefix}.PortraitLevelUp"),
+            num((points > 0.0) as u8),
+        );
+        // The portrait's tint (portraits.gfx shows frame tint + 1). Provisional: always the
+        // plain one; what sets the others is not traced.
+        v.insert(format!("{prefix}.PortraitProperties.PortraitTint"), num(0));
         v.insert(format!("{prefix}.Name"), UiValue::String(name(sim, id)));
         v.insert(format!("{prefix}.Dead"), num(o.dead as u8));
         // The simulation keeps (base, current); for depletable properties (health, mana)
@@ -926,8 +956,8 @@ const M2DA_COMMANDS: i32 = 94;
 const HASH_COMMAND_SHOWN: u32 = 0x749a_882a;
 const HASH_COMMAND_NAME: u32 = 0x4063_41be;
 const HASH_ICON: u32 = 0xbcdd_b871;
-/// `ABI_base`'s name (a talk-table string).
-const HASH_ABILITY_NAME: u32 = 0x3273_f70d;
+/// The name column of `ABI_base` and `cla_data` (a talk-table string).
+const HASH_NAME: u32 = 0x3273_f70d;
 /// `COMMAND_TYPE_USE_ABILITY`.
 const COMMAND_USE_ABILITY: i32 = 25;
 
@@ -980,7 +1010,7 @@ fn command_display(sim: &Sim, who: u32, c: &thedas_sim::world::Command) -> (Stri
         };
         let n = abi
             .as_ref()
-            .map(|t| name(int(t, HASH_ABILITY_NAME, i64::from(a))))
+            .map(|t| name(int(t, HASH_NAME, i64::from(a))))
             .unwrap_or_default();
         return (n, icon);
     }
