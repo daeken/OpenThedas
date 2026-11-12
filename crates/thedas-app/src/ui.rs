@@ -314,6 +314,36 @@ pub fn line_ms(text: &str) -> f64 {
 }
 
 impl UiLayer {
+    /// Character creation's voice choice (chargen.gfx's `AppearanceSoundSetScene`):
+    /// `GUI.TestSoundSet <set> <type>` previews a line of the set (`ss_types.gda` types with
+    /// `bUseInChargen`, starting with HELLO), `GUI.SetSoundSet <set>` gives the hero being
+    /// made that set. Provisional: the argument order is read from the movie's strings.
+    fn sound_set_message(sim: &Arc<Mutex<Sim>>, name: &str, args: &[String]) -> bool {
+        let set = args
+            .iter()
+            .find(|a| a.chars().any(|c| c.is_ascii_alphabetic()))
+            .map(|a| a.trim().to_ascii_lowercase());
+        let number = args.iter().find_map(|a| a.trim().parse::<i32>().ok());
+        let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+        match (name, set) {
+            ("GUI.TestSoundSet", Some(set)) => {
+                sim.request_sound(thedas_sim::world::SoundRequest::Preview {
+                    set,
+                    entry: number.unwrap_or(0),
+                });
+                true
+            }
+            ("GUI.SetSoundSet", Some(set)) => {
+                if let Some(o) = sim.world.chargen.and_then(|c| sim.world.get_mut(c)) {
+                    o.text_fields
+                        .insert(thedas_sim::sim::SOUND_SET.to_string(), set);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The conversation line on screen speaks for this long (milliseconds; see
     /// [`crate::audio`]), or has no voice-over.
     pub fn set_line_voice_ms(&mut self, ms: Option<f64>) {
@@ -837,6 +867,7 @@ impl UiLayer {
                     && !self.save_message(screens, sim, n, a)
                     && !self.go_to_journal(screens, sim, n, a)
                     && !Self::book_page(screens, n, a)
+                    && !Self::sound_set_message(sim, n, a)
             })
             .collect();
         let mut aims = Vec::new();

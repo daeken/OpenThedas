@@ -506,6 +506,18 @@ pub fn call(
         }),
         _ => None,
     };
+    // `SetSoundSet(oTarget, sSoundSet)`: the creature's barks come from that set.
+    if name == "SetSoundSet"
+        && let Some(o) = h.sim.world.get_mut(obj(a, 0))
+    {
+        let ss = string(a, 1);
+        if ss.is_empty() {
+            o.text_fields.remove(crate::sim::SOUND_SET);
+        } else {
+            o.text_fields
+                .insert(crate::sim::SOUND_SET.to_string(), ss.to_ascii_lowercase());
+        }
+    }
     if let Some(req) = sound {
         // Kept short when nothing takes them (a headless run).
         if h.sim.world.sounds.len() >= 64 {
@@ -5756,7 +5768,8 @@ mod coverage_tests {
         int[] GetItemProperties(object o, int s = FALSE) = 105;\n\
         void PlaySound(object o, string s) = 106;\n\
         void PlayMusic(string s) = 107;\n\
-        void DestroyObject(object o, int n = 0) = 108;\n";
+        void DestroyObject(object o, int n = 0) = 108;\n\
+        void SetSoundSet(object o, string s) = 109;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -6520,6 +6533,20 @@ mod coverage_tests {
             &[Value::Object(o), Value::String("glo/bell/ring".into())],
         );
         run(&mut s, 1, "PlayMusic", &[Value::String("theme".into())]);
+        run(
+            &mut s,
+            1,
+            "SetSoundSet",
+            &[Value::Object(o), Value::String("SS_PC_FHUMAN_WISE".into())],
+        );
+        assert_eq!(
+            s.world
+                .get(o)
+                .unwrap()
+                .text_fields
+                .get(crate::sim::SOUND_SET),
+            Some(&"ss_pc_fhuman_wise".to_string())
+        );
         assert_eq!(
             std::mem::take(&mut s.world.sounds),
             [

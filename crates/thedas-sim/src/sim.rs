@@ -2823,6 +2823,10 @@ fn apply_template(o: &mut crate::world::Object, t: &Gff3) {
     o.rank = int(r, "Rank").unwrap_or(0);
     o.appearance = template_appearance(t).unwrap_or(0);
     read_vars(t, r, &mut o.locals);
+    // The creature's sound set (`ss_alistair`): its barks, for the presentation.
+    if let Some(ss) = resref_field(r, "SoundSet").filter(|s| !s.is_empty()) {
+        o.text_fields.insert(SOUND_SET.to_string(), ss);
+    }
     for fl in &r.fields {
         if let Some(v) = int(r, &fl.label) {
             o.fields.insert(fl.label.clone(), v);
@@ -2845,6 +2849,21 @@ fn apply_template(o: &mut crate::world::Object, t: &Gff3) {
 
 /// The string fields engine functions read, as [`crate::world::Object::text_fields`].
 const TEXT_FIELDS: [&str; 1] = ["KeyName"];
+
+impl Sim {
+    /// A sound for the presentation (see [`crate::world::SoundRequest`]); kept to the last 64
+    /// when nothing takes them.
+    pub fn request_sound(&mut self, req: crate::world::SoundRequest) {
+        if self.world.sounds.len() >= 64 {
+            self.world.sounds.remove(0);
+        }
+        self.world.sounds.push(req);
+    }
+}
+
+/// The [`crate::world::Object::text_fields`] key of a creature's sound set: its template's
+/// `SoundSet`, or what `SetSoundSet` gave it (character creation's voice choice).
+pub const SOUND_SET: &str = "SoundSet";
 
 fn read_text_fields(o: &mut crate::world::Object, s: &Struct) {
     for label in TEXT_FIELDS {
