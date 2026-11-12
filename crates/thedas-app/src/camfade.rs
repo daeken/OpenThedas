@@ -18,10 +18,12 @@
 //!
 //! Presentation only: reads where the creatures stand and their models' collision shapes.
 //!
+//! The opacity reaches the renderer through [`crate::live::Live::opacity`], combined with any
+//! other fade in `Live::combine_opacity`.
+//!
 //! Provisional: the creatures' shapes (their models' `.phy` capsules, spheres and boxes in
-//! the creatures group) are placed by their bones' rest pose, not the animated skeleton the
-//! physics scene follows; the renderer has no per-object opacity yet, so a creature is not
-//! drawn while its opacity is below [`DRAWN_FROM`].
+//! the creatures group) are placed at the creature's current placement by their bones' rest
+//! pose, not the animated skeleton the physics scene follows.
 
 use std::collections::BTreeMap;
 
@@ -41,9 +43,6 @@ pub const FADE_RATE: f32 = 5.0;
 /// The shapes the sphere looks for (the query's mask, 0x6c41b2; the shape loader's
 /// creatures bit, 6066).
 pub const MASK_CREATURES: u32 = mask::CREATURES;
-/// A creature is drawn while its opacity is at least this. Provisional (see the module
-/// docs).
-pub const DRAWN_FROM: f32 = 0.5;
 
 /// A creature collision shape in its model's space.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -171,13 +170,14 @@ impl CameraFade {
     }
 
     /// Creature `id`'s opacity.
+    #[cfg(test)]
     pub fn alpha(&self, id: ObjectId) -> f32 {
         self.fading.get(&id).map_or(1.0, |(a, _)| *a)
     }
 
-    /// Whether creature `id` is drawn (see [`DRAWN_FROM`]).
-    pub fn drawn(&self, id: ObjectId) -> bool {
-        self.alpha(id) >= DRAWN_FROM
+    /// The creatures not fully opaque, and their opacity.
+    pub fn faded(&self) -> impl Iterator<Item = (ObjectId, f32)> + '_ {
+        self.fading.iter().map(|(id, (a, _))| (*id, *a))
     }
 }
 
@@ -190,10 +190,9 @@ mod tests {
         let mut f = CameraFade::default();
         f.update([7], 0.1);
         assert!((f.alpha(7) - 0.5).abs() < 1e-6);
-        assert!(f.drawn(7));
         f.update([7], 0.1);
         assert!((f.alpha(7) - FADED).abs() < 1e-6, "{}", f.alpha(7));
-        assert!(!f.drawn(7));
+        assert_eq!(f.faded().collect::<Vec<_>>(), [(7, FADED)]);
         // Out of the sphere: back to opaque, and off the list.
         f.update([], 0.1);
         assert!((f.alpha(7) - 0.55).abs() < 1e-5);

@@ -391,12 +391,19 @@ impl Live {
             }
         }
         self.camera_fade.update(touching, dt);
-        // The renderer draws each creature at its opacity (a missing entry is opaque).
-        self.opacity
-            .retain(|id, _| self.camera_fade.alpha(*id) < 1.0);
+        self.combine_opacity();
+    }
+
+    /// Rebuilds [`Live::opacity`] from every fade that sets one, multiplied together (a
+    /// missing entry is opaque). Each source keeps its own values; add another fade (a
+    /// corpse's decay) here rather than writing `opacity` directly. Sources: the game
+    /// camera's fade ([`crate::camfade`]).
+    fn combine_opacity(&mut self) {
+        self.opacity.clear();
         for (id, alpha) in self.camera_fade.faded() {
-            self.opacity.insert(id, alpha);
+            *self.opacity.entry(id).or_insert(1.0) *= alpha;
         }
+        self.opacity.retain(|_, a| *a < 1.0);
     }
 
     /// How high above its feet the camera looks at the party leader: its appearance's
