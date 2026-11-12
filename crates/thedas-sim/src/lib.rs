@@ -22,6 +22,7 @@ pub mod container;
 pub mod cutactors;
 pub mod cutscene;
 pub mod cuttracks;
+pub mod decay;
 pub mod derived;
 pub mod dialog;
 pub mod engine;

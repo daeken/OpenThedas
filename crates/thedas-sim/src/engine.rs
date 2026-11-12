@@ -197,7 +197,6 @@ const PRESENTATION: &[&str] = &[
     "PlayMusic",
     "SetMusicIntensity",
     "SendToRunDatabase",
-    "SetCreaturesGlobalMaxTimeBeforeDecay",
     "SetCreatureGoreLevel",
     // Only the indicator on the quickbar; the modal effect itself is the scripts'.
     "Engine_SetModalAbilityGUI",
@@ -3563,7 +3562,29 @@ pub fn call(
             void()
         }
         "SpawnBodyBag" => {
-            h.sim.spawn_body_bag(obj(a, 0), int(a, 1) != 0);
+            let c = obj(a, 0);
+            h.sim.spawn_body_bag(c, int(a, 1) != 0);
+            // A creature whose appearance decays at once (DecayBehaviour 3: shades, rage
+            // demons) starts fading a second later (DAOrigins.exe 0x6a90d0).
+            if h.sim
+                .world
+                .get(c)
+                .is_some_and(|o| o.kind == ObjectKind::Creature)
+                && h.sim.decay_behaviour(c) == 3
+            {
+                h.sim.force_decay(c, 1_000);
+            }
+            void()
+        }
+        // DAOrigins.exe 0x66be50 -> 0x69f360: the bag's creature fades after that long.
+        "SetBodybagDecayDelay" => {
+            h.sim
+                .set_bodybag_decay_delay(obj(a, 0), int(a, 1).max(0) as u64);
+            void()
+        }
+        // DAOrigins.exe 0x665630: the global time before a corpse is gone.
+        "SetCreaturesGlobalMaxTimeBeforeDecay" => {
+            h.sim.world.corpse_decay_max_ms = int(a, 0).max(0) as u64;
             void()
         }
         // No occlusion is simulated: two objects in the same area can see each other.
