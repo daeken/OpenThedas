@@ -228,6 +228,9 @@ enum Command {
         /// Mix rate.
         #[arg(long, default_value_t = 48000)]
         rate: u32,
+        /// Event parameters to start with (`music_state=1`), for every event.
+        #[arg(long = "param")]
+        params: Vec<String>,
     },
     /// Check that the sound events the game names resolve: every cutscene's sound tracks
     /// and `sound_gui.gda`'s events.
@@ -306,7 +309,10 @@ fn run() -> Result<()> {
             stop_at,
             language,
             rate,
-        } => audio::play(&install, &events, seconds, &out, stop_at, &language, rate),
+            params,
+        } => audio::play(
+            &install, &events, seconds, &out, stop_at, &language, rate, &params,
+        ),
         Command::AudioCheck { install, language } => audio::check(&install, &language),
         Command::Fev {
             path,
