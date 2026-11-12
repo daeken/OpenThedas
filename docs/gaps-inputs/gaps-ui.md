@@ -1,6 +1,6 @@
 # Gaps: UI, HUD, input and controller (Input/UI stream)
 
-Kept current in place by the Input/UI thread. Last pass: 2026-11-12 16:10Z, main at #315.
+Kept current in place by the Input/UI thread. Last pass: 2026-11-12 16:30Z. Done since: portrait current/pending action icons (#321); portrait class name, level-up mark, tint (#323).
 
 Sizes: S = under a day, M = a few days, L = a week or more.
 
@@ -35,9 +35,6 @@ How the list was built:
 | Item | Original | Ours | Evidence | Size | Depends on |
 |---|---|---|---|---|---|
 | Quickslots 11–20 key labels | `InputMappings…ActivateQuickslot11..20` (expanded bar). | Unanswered (keys 1–0 are fed from defaults, not keymap). | Unanswered list | S | — |
-| Party portraits: current and pending action icons | Icon of what each member is doing or about to do (`CurrentActionIcon`, `PendingActionIcon`). | Unanswered. | Unanswered list | S | Sim command queue (exists) |
-| Portrait level-up marker | `PortraitLevelUp` shows the "+" level-up badge. | Unanswered (the class-rank "+" may come from elsewhere). | Unanswered list | S | — |
-| Portrait tint | `PortraitProperties.PortraitTint` (dead or paralysed tint). | Unanswered. | Unanswered list | S | — |
 | Status effects | `GUI.SelectedChar.EffectList` shows buff and debuff icons on portraits and the record. | Unanswered: no effect icons. | Unanswered list | M | Sim effect list with icons and durations |
 | Party approval | `Party.Approval` (approval meter in record and party). | Unanswered. | Unanswered list | S | Sim approval values (exist as plot/props?) |
 | Hold position | H toggles hold; `Party.HoldPositions` shows it. | No key, value unanswered. | keymap.gda ToggleHoldParty | S | Sim: hold order |
@@ -45,7 +42,7 @@ How the list was built:
 | Combat target tooltip | tooltips.gfx `UpdateCreatureTarget`: name, health and mana bars, rank for the hovered or targeted creature. | Not fed. | handoff-ui.md | S–M | — |
 | Floaty stats show/hide rule | Exe 0x764820: on screen + LOS + game mode; alpha and fade rule untraced. | Partly: #2xx stat floaties shown by our own rule. | handoff-ui.md RE notes | S | Trace the alpha/hover rule |
 | Hide interface | HideMainInterface key hides the HUD. | Not handled. | keymap.gda | S | — |
-| Combat/explore HUD mode | `GameModeExplore.PendingTargetID`, `DebugOptions.SuppressPartyActionDisplay`. | Unanswered. | Unanswered list | S | — |
+| Combat/explore HUD mode | `GameModeExplore.PendingTargetID`. | Unanswered. | Unanswered list | S | — |
 
 ### Book screens
 
@@ -56,9 +53,9 @@ How the list was built:
 | Inventory | Equipment/backpack fully works by mouse. | `Equipment.N.StackSize`, `CanChangeEquipment`, `CanSwitchWeaponSets` and `Party.BackpackSort` are unanswered. Backpack items' `AbilityInstance` (usable items) too. | Unanswered list | S | — |
 | Journal | Quest givers and destinations on the map (`Journal.PlotGivers`, `PlotDestinations`), offers (`PlotList.N.OfferId`), remembers the last codex entry. | Unanswered. `undefined.QuestCompleted` is a path bug on our side. | Unanswered list | S–M | Sim plot data |
 | Journal text for Dwarf/City Elf openings | — | Empty because the sim has no flag text yet. Correct as far as it goes. | Earlier QA | — | Sim |
-| Character record | Class name (`Stats.ClassName`), attributes current vs total for party slots. | ClassName unanswered on the party list. | Unanswered list | S | — |
+| Character record | Attributes current vs total for party slots. | Check after #323 (ClassName now fed). | Unanswered list | S | — |
 | Area map quest markers | Plot givers and destinations drawn on the map. | Only map notes (#2xx). | — | S | Journal item above |
-| Save thumbnails | Each save stores a screenshot shown in the list. | No thumbnail. | — | M | Render: offscreen capture into the save |
+| Save thumbnails | Each save stores a screenshot shown in the list. A save without one shows the sunburst placeholder (QA, reference/original/load_game_screen.png), so the placeholder itself is parity. | No thumbnail is written or shown. | — | M | Render: offscreen capture into the save |
 | Options | Applies resolution, graphics, audio, gameplay settings and writes the settings file. | The screen works, but settings change nothing and nothing is saved, and Cancel is untraced (see `options.rs`). | options.rs doc | M | Render/audio hooks per setting |
 | Key rebinding | Controls tab rebinds keymap.gda actions. | Keys are hard-coded in `main.rs`; keymap is only used for key names in text. | main.rs | M | Input action layer |
 | Chargen | Full chargen. | Open items: tattoos (0x8039b0), the title swirl too bright, the Dual Weapon header bar, the Expression list (57). | handoff-ui.md | S each | — |
