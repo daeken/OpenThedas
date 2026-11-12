@@ -231,6 +231,9 @@ pub fn ability(
     for (key, value) in [
         ("ID", num(id)),
         ("AbilityType", num(ty)),
+        // The quickbar's tooltip names the use type (passive, activated, sustained) from
+        // here.
+        ("UseType", num(int(abi, "UseType", id))),
         ("Name", UiValue::String(name)),
         ("NameStrRef", num(name_strref)),
         ("DescStrRef", num(int(abi, "DescStrRef", id))),

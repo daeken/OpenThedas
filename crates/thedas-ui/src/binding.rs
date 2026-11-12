@@ -547,6 +547,10 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             num(e.check_requirements),
         );
     }
+    // How far right the quickbar reaches (tooltips.gfx lifts its fixed tooltip 48 pixels
+    // when the quickbar runs under it). Provisional: the HUD's quickbar spans the screen, so
+    // it is given as reaching past any tooltip.
+    v.insert("GUI.QuickbarXMax".into(), num(100_000));
     // The difficulty, as character creation's difficulty prompt starts from it.
     v.insert(
         "ClientOptions.GameOptions.DifficultyLevel".into(),
