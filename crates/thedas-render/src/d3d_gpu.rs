@@ -1947,9 +1947,30 @@ impl D3dPass {
     /// Fills this frame's constants of the draws in the camera's view (see [`in_view`]; the
     /// rest are not drawn); `time` is the shaders' `ApplicationTime` in seconds.
     pub fn update(&self, ctx: &GpuContext, camera: &Camera, width: u32, height: u32, time: f32) {
+        self.update_with(ctx, camera, width, height, time, false);
+    }
+
+    /// Fills every draw's constants as if all were in view, without placing the shadow
+    /// partitions or changing what the next frame draws: the first-use work (each draw's
+    /// fixed constants, its whole slot) done once at load instead of on the first frames.
+    pub fn warm(&self, ctx: &GpuContext, width: u32, height: u32) {
+        let camera = Camera::new(Vec3::ZERO, 0.0, 0.0);
+        self.update_with(ctx, &camera, width, height, 0.0, true);
+    }
+
+    fn update_with(
+        &self,
+        ctx: &GpuContext,
+        camera: &Camera,
+        width: u32,
+        height: u32,
+        time: f32,
+        warm: bool,
+    ) {
         let aspect = width as f32 / height.max(1) as f32;
         // The level's pass places this frame's partitions; the objects' pass reads them.
         let partitions = match (&self.shadows, self.sun) {
+            _ if warm => None,
             (Some(t), Some((dir, _))) => {
                 let mine: Vec<(Vec3, f32)> = self
                     .casters
@@ -2035,6 +2056,9 @@ impl D3dPass {
             .draws
             .iter()
             .map(|d| {
+                if warm {
+                    return true;
+                }
                 // A draw faded all the way out is not drawn (a cut-away ceiling).
                 self.opacity.get(d.draw).is_none_or(|&o| o > 0.0)
                     && d.lod.is_none_or(|l| l.shown(camera.position))
@@ -2237,7 +2261,9 @@ impl D3dPass {
             }
             ctx.queue.submit([encoder.finish()]);
         }
-        *self.in_view.lock().unwrap_or_else(|e| e.into_inner()) = in_view;
+        if !warm {
+            *self.in_view.lock().unwrap_or_else(|e| e.into_inner()) = in_view;
+        }
     }
 
     /// A draw's world-space bounds this frame (its bones' pose for a skinned draw); `None`
