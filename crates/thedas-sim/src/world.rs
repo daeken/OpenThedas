@@ -583,6 +583,10 @@ pub struct World {
     /// The store whose screen is open (`OpenStore`).
     #[serde(default)]
     pub store: Option<ObjectId>,
+    /// The container whose inventory screen is open (`OpenInventory`, which placeable_core
+    /// calls when a chest, body bag or other container is used), and who opened it.
+    #[serde(default)]
+    pub container: Option<(ObjectId, ObjectId)>,
     /// The world map (see `worldmap`).
     #[serde(default)]
     pub world_map: crate::worldmap::WorldMapState,
@@ -716,6 +720,7 @@ impl World {
             popup: None,
             container: None,
             store: None,
+            container: None,
             chanter_board: None,
             plot_actions: PlotActions::default(),
             party_choice: None,

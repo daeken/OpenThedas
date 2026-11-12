@@ -3265,6 +3265,14 @@ pub fn call(
             void()
         }
         // --- Stores (see store.rs) ----------------------------------------------------------
+        // placeable_core opens a used container's inventory screen with it (container, the
+        // creature using it, a flag): the screen shows the container beside the party's
+        // backpack until it is closed (`Sim::close_container`).
+        "OpenInventory" => {
+            let (c, user) = (obj(a, 0), obj(a, 1));
+            h.sim.world.container = h.object(c).map(|_| (c, user));
+            void()
+        }
         "OpenStore" => {
             let st = obj(a, 0);
             h.sim.world.store = h.object(st).map(|_| st);
