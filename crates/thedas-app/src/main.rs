@@ -905,7 +905,12 @@ impl App {
         let axis = |pos: bool, neg: bool| (pos as i32 - neg as i32) as f32;
         let fwd = axis(k(KeyCode::KeyW), k(KeyCode::KeyS));
         let right = axis(k(KeyCode::KeyD), k(KeyCode::KeyA));
-        let up = axis(k(KeyCode::KeyE), k(KeyCode::KeyQ) || k(KeyCode::KeyC));
+        // E up, Q down. C, which also lowered it, opens the character record while playing.
+        let c_lowers = self.screens.is_none();
+        let up = axis(
+            k(KeyCode::KeyE),
+            k(KeyCode::KeyQ) || (c_lowers && k(KeyCode::KeyC)),
+        );
         self.camera.fly(fwd * speed, right * speed, up * speed);
         let turn = 1.5 * dt;
         let yaw = axis(k(KeyCode::ArrowLeft), k(KeyCode::ArrowRight));
