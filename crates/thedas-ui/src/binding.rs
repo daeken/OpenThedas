@@ -1403,10 +1403,46 @@ fn inventory(sim: &Sim, who: Option<u32>, filter: i32, v: &mut BTreeMap<String, 
             item(sim, &format!("{k}.Item"), *id, v);
         }
     }
-    // No container is open (looting goes through the simulation's own commands for now).
-    v.insert("GUIInventory.ShowContainer".into(), num(0));
-    v.insert("GUIInventory.ContainerHasPlotItems".into(), num(0));
+    // The container being looted (`OpenInventory`): inventory.gfx's container panel shows
+    // its name (`Container.Name`, else its tag) and items (`GUIInventory.ContainerView.N.
+    // Item`, also `Container.Inventory`, which Take All counts). Provisional: the party
+    // cannot put items into a container.
+    let container = sim
+        .world
+        .container
+        .and_then(|c| sim.world.get(c).map(|o| (c, o)));
+    v.insert(
+        "GUIInventory.ShowContainer".into(),
+        num(container.is_some() as u8),
+    );
     v.insert("GUIInventory.CanAddItemsToContainer".into(), num(0));
+    let loot: Vec<u32> = container
+        .map(|(_, o)| o.inventory.clone())
+        .unwrap_or_default();
+    v.insert(
+        "GUIInventory.ContainerHasPlotItems".into(),
+        num(loot
+            .iter()
+            .any(|&i| sim.world.get(i).is_some_and(|o| o.plot)) as u8),
+    );
+    if let Some((c, o)) = container {
+        v.insert("Container.ID".into(), num(c));
+        v.insert("Container.Name".into(), UiValue::String(name(sim, c)));
+        v.insert("Container.Tag".into(), UiValue::String(o.tag.clone()));
+    }
+    let ids: Vec<String> = loot.iter().map(|i| i.to_string()).collect();
+    v.insert(
+        "GUIInventory.ContainerView".into(),
+        UiValue::String(ids.join(",")),
+    );
+    v.insert("Container.Inventory".into(), UiValue::String(ids.join(",")));
+    for (i, id) in loot.iter().enumerate() {
+        let k = format!("GUIInventory.ContainerView.{i}");
+        v.insert(k.clone(), num(*id));
+        v.insert(format!("{k}.GroupSize"), num(1));
+        item(sim, &format!("{k}.Item"), *id, v);
+        v.insert(format!("Container.Inventory.{i}"), num(*id));
+    }
     v.insert("Party.BackpackSize".into(), num(gear.len() as f64));
     let hero = sim.world.hero.and_then(|h| sim.world.get(h));
     v.insert(

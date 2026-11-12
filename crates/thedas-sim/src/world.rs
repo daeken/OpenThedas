@@ -577,6 +577,9 @@ pub struct World {
     /// The job board on screen (`ShowChantersGUI`).
     #[serde(default)]
     pub chanter_board: Option<crate::chanters::ChanterBoard>,
+    /// The container being looted (`OpenInventory`, see [`crate::container`]).
+    #[serde(default)]
+    pub container: Option<ObjectId>,
     /// The store whose screen is open (`OpenStore`).
     #[serde(default)]
     pub store: Option<ObjectId>,
@@ -711,6 +714,7 @@ impl World {
             dialog_shown: Default::default(),
             story_events: Vec::new(),
             popup: None,
+            container: None,
             store: None,
             chanter_board: None,
             plot_actions: PlotActions::default(),
