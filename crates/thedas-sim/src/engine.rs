@@ -1851,7 +1851,7 @@ pub fn call(
             let i = int(a, 1).max(0) as usize;
             // Engine floats are kept apart from script floats (provisional layout).
             let (name, i) = if name == "SetEffectEngineFloat" {
-                ("SetEffectFloat", i + 32)
+                ("SetEffectFloat", i + crate::sim::ENGINE_FLOAT_BASE)
             } else {
                 (name, i)
             };
