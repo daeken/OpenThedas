@@ -54,8 +54,15 @@ pub struct AudioState {
     /// Attacks' blows: (target position, result, attacker's weapon, target's armour and
     /// shield base items).
     pub impacts: Vec<Impact>,
+    /// Sound set lines to say: (set, `ss_types.gda` type, probability override (0: the
+    /// type's own), where the speaker stands (none: 2D)).
+    pub sound_sets: Vec<(String, i32, f32, Option<[f32; 3]>)>,
     /// Events scripts played (`PlaySound`), with where the object stands (none: 2D).
     pub script_sounds: Vec<(String, Option<[f32; 3]>)>,
+    /// The character the player controls: its id, sound set and position.
+    pub controlled: Option<(u32, Option<String>, [f32; 3])>,
+    /// Scripts' `SetMusicIntensity`, the latest this frame.
+    pub music_intensity: Option<i32>,
     /// A boot movie playing (its file) and how far it has played (milliseconds): its own
     /// sound track plays with it.
     pub movie: Option<(std::path::PathBuf, f64)>,
@@ -159,6 +166,18 @@ pub struct GameAudio {
     /// Weapon impacts: each base item's sound material (`BITM_base.gda`), and each weapon
     /// material's impact events (`sound_weapon_hits.gda`).
     impacts: Impacts,
+    /// Who the player controlled last frame (a change is a selection: it barks).
+    controlled: Option<u32>,
+    /// The music's `music_state` (scripts' `SetMusicIntensity`; 1 until one sets it).
+    music_state: f32,
+    /// `ss_types.gda`: each sound set type's first entry row and default probability.
+    ss_types: std::collections::HashMap<i32, (i64, f32)>,
+    /// Each sound set's entries (`sse_<set>.gda`: entry row -> line strref), read once.
+    sound_set_entries: std::collections::HashMap<String, Arc<Vec<(i64, i64)>>>,
+    rng: u64,
+    /// Creature templates' sound sets (`.utc` `SoundSet`), for creatures that do not carry
+    /// theirs (from a save made before the simulation kept it).
+    template_sets: std::collections::HashMap<String, Option<String>>,
     last: Instant,
 }
 
@@ -186,6 +205,36 @@ fn footstep_events(vfs: &Vfs) -> (Option<String>, Option<String>) {
         .collect();
     let find = |part: &str| events.iter().find(|e| e.contains(part)).cloned();
     (find("/humanoid/small/"), find("/dog/"))
+}
+
+/// `ss_types.gda`: each sound set type (1 COMBAT ATTACK, 2 COMBAT BATTLE CRY, ...) with the
+/// row its entries start at in a set's `sse_<set>.gda` (100, 200, ...) and the chance a
+/// line of it is said.
+fn ss_types(vfs: &Vfs) -> std::collections::HashMap<i32, (i64, f32)> {
+    use thedas_formats::gda::Cell;
+    let mut out = std::collections::HashMap::new();
+    let Some(t) = vfs
+        .read("ss_types.gda")
+        .ok()
+        .and_then(|(d, _)| thedas_formats::Gda::parse(&d).ok())
+    else {
+        return out;
+    };
+    for row in &t.rows {
+        let nums: Vec<f64> = row
+            .iter()
+            .filter_map(|c| match c {
+                Cell::Int(i) => Some(*i as f64),
+                Cell::Float(f) => Some(*f),
+                _ => None,
+            })
+            .collect();
+        // ID, first entry row, probability, ...
+        if let [id, base, p, ..] = nums[..] {
+            out.insert(id as i32, (base as i64, p as f32));
+        }
+    }
+    out
 }
 
 /// What an attack's blow sounds like.
@@ -370,8 +419,119 @@ impl GameAudio {
             anim_clocks: Default::default(),
             footsteps: footstep_events(vfs),
             impacts: Impacts::read(vfs),
+            music_state: 1.0,
+            controlled: None,
+            ss_types: ss_types(vfs),
+            sound_set_entries: Default::default(),
+            rng: 0x2545_f491_4f6c_dd1d,
+            template_sets: Default::default(),
             last: Instant::now(),
         }
+    }
+
+    /// A creature template's sound set (its `.utc`'s `SoundSet`), read once.
+    pub fn template_sound_set(&mut self, vfs: &Vfs, template: &str) -> Option<String> {
+        use thedas_formats::gff3::{Gff3, Value};
+        let key = template.to_ascii_lowercase();
+        if let Some(s) = self.template_sets.get(&key) {
+            return s.clone();
+        }
+        let set = vfs
+            .read(&format!("{key}.utc"))
+            .ok()
+            .and_then(|(d, _)| Gff3::parse(&d).ok())
+            .and_then(|g| {
+                g.root()
+                    .fields
+                    .iter()
+                    .find(|f| f.label == "SoundSet")
+                    .and_then(|f| match &f.value {
+                        Value::ResRef(b) | Value::ExoString(b) => {
+                            let s = String::from_utf8_lossy(b)
+                                .trim_end_matches('\0')
+                                .trim()
+                                .to_ascii_lowercase();
+                            (!s.is_empty()).then_some(s)
+                        }
+                        _ => None,
+                    })
+            });
+        self.template_sets.insert(key, set.clone());
+        set
+    }
+
+    fn random(&mut self) -> u64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        self.rng
+    }
+
+    /// A line of sound set `set` of type `entry` (`ss_types.gda`): one of the set's entries
+    /// for that type (`sse_<set>.gda` rows from the type's first row on, below the next
+    /// type's) at random, said with the type's probability (or the override). It plays the
+    /// set's `VO/VOambient_ss` event with the line's sample (`<strref>_m`, else `_f`).
+    /// Provisional: which event a set's lines use, and engine-side throttling (the
+    /// `sound_settings.gda` playback limits) beyond the event's own max playbacks.
+    fn say_sound_set(&mut self, set: &str, entry: i32, probability: f32, at: Option<[f32; 3]>) {
+        let Some(&(base, p)) = self.ss_types.get(&entry) else {
+            log::debug!("audio: no sound set type {entry}");
+            return;
+        };
+        let chance = if probability > 0.0 { probability } else { p };
+        if (self.random() % 10_000) as f32 / 10_000.0 >= chance {
+            return;
+        }
+        let key = set.to_ascii_lowercase();
+        let entries = match self.sound_set_entries.get(&key) {
+            Some(e) => e.clone(),
+            None => {
+                use thedas_formats::gda::Cell;
+                let rows: Vec<(i64, i64)> = self
+                    .vfs
+                    .read(&format!("sse_{key}.gda"))
+                    .ok()
+                    .and_then(|(d, _)| thedas_formats::Gda::parse(&d).ok())
+                    .map(|t| {
+                        t.rows
+                            .iter()
+                            .filter_map(|r| match (r.first(), r.get(1)) {
+                                (Some(Cell::Int(id)), Some(Cell::Int(s))) => Some((*id, *s)),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let rows = Arc::new(rows);
+                self.sound_set_entries.insert(key.clone(), rows.clone());
+                rows
+            }
+        };
+        let lines: Vec<i64> = entries
+            .iter()
+            .filter(|(id, s)| *id >= base && *id < base + 100 && *s > 0)
+            .map(|(_, s)| *s)
+            .collect();
+        if lines.is_empty() {
+            return;
+        }
+        let strref = lines[(self.random() % lines.len() as u64) as usize];
+        let lib = self.engine.library.clone();
+        let sample = [format!("{strref}_m"), format!("{strref}_f")]
+            .into_iter()
+            .find(|s| lib.find_sample(&key, s).is_some());
+        let Some(sample) = sample else {
+            log::debug!("audio: sound set {key} has no sample for {strref}");
+            return;
+        };
+        self.engine.play(
+            &format!("{key}/VO/VOambient_ss"),
+            PlayOptions {
+                programmer_sound: Some(sample),
+                position: at,
+                ..Default::default()
+            },
+        );
     }
 
     /// Animations' sound events: as a creature's animation passes an event, kind 20 plays the
@@ -582,7 +742,7 @@ impl GameAudio {
                 let h = self.engine.play(
                     &format!("{theme}/{want}"),
                     PlayOptions {
-                        parameters: vec![("music_state".into(), 1.0)],
+                        parameters: vec![("music_state".into(), self.music_state)],
                         ..Default::default()
                     },
                 );
@@ -789,6 +949,21 @@ impl GameAudio {
                 );
             }
         }
+        // Selecting another party member: it answers (`ss_types.gda` 32 COMBAT SELECT
+        // NEUTRAL in a fight, else 36 EXPLORE SELECT NEUTRAL). Provisional: the approval
+        // variants (37-39 friendly/hate/love) and when the engine says them are not traced.
+        if let Some((id, set, at)) = state.controlled.take() {
+            let before = self.controlled.replace(id);
+            if before.is_some_and(|b| b != id)
+                && let Some(set) = set
+            {
+                let entry = if state.combat { 32 } else { 36 };
+                state.sound_sets.push((set, entry, 0.0, Some(at)));
+            }
+        }
+        for (set, entry, probability, at) in std::mem::take(&mut state.sound_sets) {
+            self.say_sound_set(&set, entry, probability, at);
+        }
         for (event, position) in std::mem::take(&mut state.script_sounds) {
             if self
                 .engine
@@ -806,6 +981,19 @@ impl GameAudio {
         }
         self.follow_animations(std::mem::take(&mut state.animations));
         self.follow_movie(state.movie.take());
+        // Scripts' SetMusicIntensity sets the area music's `music_state` (DAOrigins.exe logs
+        // it as "music state= %2.1f"): the tracks' sounds sit around 1, so 0 silences the
+        // music (pre100pt_light_beacon) and cutscene endings (gen00cs_cs_end_music_int_*)
+        // set 0 to 4. Provisional: read from the data and the scripts, not traced.
+        if let Some(i) = state.music_intensity.take()
+            && i as f32 != self.music_state
+        {
+            self.music_state = i as f32;
+            if let Some((_, h)) = self.area.as_ref().and_then(|a| a.track) {
+                self.engine
+                    .set_parameter(h, "music_state", self.music_state);
+            }
+        }
         self.follow_area(&state);
         self.follow_cutscene(state.cutscene.clone());
         // Voice-over.
@@ -861,19 +1049,44 @@ fn is_humanoid(ani: &str) -> bool {
 }
 
 /// The options screen's volumes (`ClientOptions.AudioOptions.*`, 0..10, with their disable
-/// switches) as gains.
+/// switches) as gains, as DAOrigins.exe turns them into category volumes: a slider at `x`
+/// is `-3 * (10 - x)` dB (0x5b61b0: 10 and above full, below 0.01 or disabled -60 dB), then
+/// `10^(dB / 20)` with anything under 0.001 silent (0x5b6110). So 5 is -15 dB, not half.
 pub fn volumes(option: impl Fn(&str) -> Option<f64>) -> Volumes {
     let v = |vol: &str, off: &str| {
-        if option(off).unwrap_or(0.0) != 0.0 {
-            0.0
+        let x = option(vol).unwrap_or(10.0) as f32;
+        let db = if option(off).unwrap_or(0.0) != 0.0 {
+            -60.0
         } else {
-            (option(vol).unwrap_or(10.0) / 10.0).clamp(0.0, 1.0) as f32
-        }
+            slider_db(x)
+        };
+        db_gain(db)
     };
     Volumes {
         music: v("AudioOptions.MusicVolume", "AudioOptions.MusicDisabled"),
         sfx: v("AudioOptions.SoundFXVolume", "AudioOptions.SFXDisabled"),
         dialog: v("AudioOptions.DialogVolume", "AudioOptions.DialogDisabled"),
+    }
+}
+
+/// A volume slider's 0..10 as dB (DAOrigins.exe 0x5b61b0).
+fn slider_db(x: f32) -> f32 {
+    if x > 9.99 {
+        0.0
+    } else if x < 0.01 {
+        -60.0
+    } else {
+        -3.0 * (10.0 - x)
+    }
+}
+
+/// dB as a gain, silent at 0.001 (-60 dB) and below (DAOrigins.exe 0x5b6110).
+fn db_gain(db: f32) -> f32 {
+    let g = 10f32.powf(db / 20.0);
+    if db <= -60.0 || g <= 0.001 {
+        0.0
+    } else {
+        g.min(1.0)
     }
 }
 
@@ -897,7 +1110,15 @@ mod tests {
             _ => None,
         };
         let v = volumes(opts);
-        assert_eq!((v.music, v.sfx, v.dialog), (0.5, 0.0, 1.0));
+        // 5 is -15 dB; disabled is silent; the default 10 is full.
+        assert!(
+            (v.music - 10f32.powf(-15.0 / 20.0)).abs() < 1e-6,
+            "{}",
+            v.music
+        );
+        assert_eq!((v.sfx, v.dialog), (0.0, 1.0));
+        assert_eq!(slider_db(0.0), -60.0);
+        assert_eq!(db_gain(-60.0), 0.0);
     }
 }
 

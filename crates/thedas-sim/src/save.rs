@@ -256,6 +256,7 @@ impl Sim {
                 self.lay_out_if_spawned_dead(id);
             }
         }
+        self.learn_held_recipes();
         self.save_issues = if save_revision < 3 {
             self.check_property_damage()
         } else {

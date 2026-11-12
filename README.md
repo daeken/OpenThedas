@@ -10,28 +10,28 @@ repository.
 
 ## Status
 
-Last updated 2026-11-12 08:50 UTC, main dc61171
+Last updated 2026-11-12 09:15 UTC, main 256b6ee
 
-Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA run 8 (taken at main 2e7b804), so some of its findings may already be fixed.
+Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA run 8 (taken at main 2e7b804), with fixes merged since then noted.
 
 - ✅ **Boot flow**: EA logo and intro movies play with their sound (decoded via ffmpeg), then the start menu.
 - ✅ **Start menu**: New Game, Load, Options and Quit are wired; QA graded it near pixel-identical to the original.
 - 🟡 **Character creation**: full flow with the original's stage, blended camera presets and portrait. The appearance menu has preset, hair, beard, the exe's per-race eye and nose shapes, and makeup and complexion. Also colour sliders, difficulty and name. Partial: remaining face-shape sliders and hair-colour details. QA also flagged dim skill/talent icons after spending points, and attribute arrows that never show a disabled state.
 - 🟡 **Conversations and cutscenes**:
-  - Working: the reply list, subtitles and voice-over; movie tracks; cutscene camera tracks (spline moves, rotation, FOV, active camera).
-  - Cutscenes named by conversation lines play, such as the Human Noble, Dalish and Dwarf Noble intros. Unstaged lines use the original's default speaker framing.
-  - Not yet: cameras placed by JumpToCamera or LinkToActor (most per-line cinematics), and moving, posing and animating actors in cutscenes and on conversation stage marks. That work is in progress.
-- 🟡 **Exploration and camera**: walking, click-to-pick, doors, area map, companions following. The follow camera collides with level geometry and placeables using rays. The original sweeps a 0.25 m sphere and starts closer to the hero; matching it is in progress (QA: the camera clips a bunk bed in the City Elf start and sits behind the door frame in the Dwarf Commoner start).
+  - Done: the reply list, subtitles and voice-over; movie tracks; cutscene camera tracks (spline moves, rotation, FOV, active camera); and cutscenes named by conversation lines (the Human Noble, Dalish and Dwarf Noble intros). Unstaged lines use the original's default speaker framing.
+  - Open: cameras placed by JumpToCamera or LinkToActor (most per-line cinematics), actor motion and animation in cutscenes, and moving creatures to conversation stage marks.
+- 🟡 **Exploration and camera**: walking, click-to-pick, doors, area map, companions following. The follow camera collides with level geometry and placeables using rays. The original sweeps a 0.25 m sphere and starts closer to the hero; camera occlusion matching it is in progress (QA: the camera clips a bunk bed in the City Elf start and sits behind the door frame in the Dwarf Commoner start).
 - 🟡 **Combat and simulation**:
   - NWScript VM with a large share of the engine functions; melee and ability timing; threat; AI-driven party; tactics; loot and containers.
   - Perception and combat mode work as the exe does them: only hostiles need sight, and scripts own the game mode.
+  - Sight lines are cast through the level's collision (`.phy`) and placeables, as the exe casts them.
   - Template gear is equipped with EVENT_TYPE_EQUIP. Triggers fire along moves. Destroyed items leave the inventory.
   - Weapons are sheathed on the back out of combat and drawn in combat; draw and sheathe animation timing is not traced.
   - Not every script engine function is implemented.
 - 🟡 **Party, inventory, journal and other UI screens**:
   - Wired to the simulation: inventory (with paperdoll and item examine), character record, level-up, store, tactics, journal and codex, options, area map, HUD notifications, and the HUD's screen tab bar.
-  - The journal opens on the active quest. The quickbar keeps its 14-slot width and leaves hidden class abilities off.
-  - QA run 8 also flagged that recipes are listed as inventory items and stackable items are not stacked.
+  - The journal opens on the active quest and lists a sub-quest's parent as its heading. The quickbar keeps its 14-slot width and leaves hidden class abilities off.
+  - Fixed since QA run 8: recipe items are learned instead of kept in the inventory, and stackable items merge into held stacks.
   - Screens have not all been audited against the original.
 - 🟡 **Rendering**:
   - Working: areas, terrain, sky, fog, clouds, bloom, colour grading, dynamic sun shadows (Low to High detail) and the original shaders.
@@ -39,8 +39,13 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA run 8 (ta
   - Not yet: SpeedTree `.spt` files parse but are not drawn.
   - The backend stays on wgpu, and its types are kept inside `thedas-render`.
 - 🟡 **Audio**:
-  - Merged: FMOD event (`.fev`) and bank (`.fsb`) playback, mixer, menu music, UI sounds, conversation and cutscene voice-over, area music, placed 3D sounds, boot movie sound, script PlaySound, animation sound events, and weapon hits.
-  - Not yet: sound sets, PlayMusic and SetMusicIntensity, voice-over positioning, and footstep surfaces.
+  - Merged:
+    - playback: FMOD event (`.fev`) and bank (`.fsb`) playback, mixer, the exe's slider-to-dB volume mapping;
+    - music: menu and area music, SetMusicIntensity driving `music_state` (kept in saves);
+    - effects: UI sounds, placed 3D sounds, boot movie sound, script PlaySound, animation sound events, weapon hits;
+    - voices: conversation and cutscene voice-over, sound-set barks, the chargen voice preview.
+  - Provisional: engine barks (attack and pain grunts, death cries, selection answers), inferred from the tables.
+  - Not yet: PlayMusic, voice-over positioning, footstep surfaces (one default footstep for now).
   - Sound is off with `--control` (unless `--audio`) and in headless captures.
 - 🟡 **Controller**: Xbox 360-style layout; menus and in-game screens use focus navigation. The PC right-click radial menu doesn't exist as a movie in the game data, so LT opens a quickbar picker instead.
 - ✅ **Saves**: F5/F9 quick save and load, save/load screens, typed names.
@@ -53,15 +58,17 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA run 8 (ta
 - 🟡 **Dwarf Noble**: intro cutscene plays and the opening is explorable. Cutscene actors are not animated yet.
 - 🟡 **Dwarf Commoner**: intro cutscene cameras play. The exploration camera starts behind the door frame (in progress).
 - 🟡 **City Elf**: explorable. The camera clips the bunk bed at the start (in progress).
-- 🟡 **Dalish Elf**: intro cutscene plays. After the opening talk the three humans stand with their backs to the hero, because stage marks aren't applied (queued).
+- 🟡 **Dalish Elf**: intro cutscene plays and the journal lists the origin quest. After the opening talk the three humans stand with their backs to the hero, because stage marks aren't applied (queued).
 - 🟡 **Mage**: explorable. QA run 8 found the journal showing only a category banner.
 
 ### Planned modernization
 
-- ⬜ **Background area preloading**, so area transitions don't stop play.
-- Deliberate differences from the original:
-  - controller support (the PC release has none);
-  - spaces allowed in typed save names.
+- ⬜ **Background area preloading**: start loading the next area's assets as the player heads toward an exit. Presentation-only; sim behaviour and parity are unchanged. Planned for the rendering stream.
+
+Deliberate differences from the original:
+- **Controller support**: Xbox 360 layout. The PC original removed it.
+- **Spaces allowed in save names.**
+- **Audio output limiter at −0.3 dBFS**, so fights don't clip. Provisional: FMOD Ex clips, and the exe's master chain isn't traced yet.
 
 ### Milestones
 

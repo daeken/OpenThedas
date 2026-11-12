@@ -399,6 +399,95 @@ impl Sim {
         Some(name)
     }
 
+    /// An area's collision for sight lines: its layout's models' `.phy` shapes (see
+    /// [`crate::collision`]). `None` without an install to read the level from, or when
+    /// the layout is missing.
+    pub fn collision(
+        &mut self,
+        area: thedas_script::vm::ObjectId,
+    ) -> Option<Arc<crate::collision::Collision>> {
+        let name = self.area_layout(area)?;
+        if let Some(c) = self.collisions.get(&name) {
+            return c.clone();
+        }
+        let c = self.load_collision(&name).map(Arc::new);
+        self.collisions.insert(name, c.clone());
+        c
+    }
+
+    /// An area's placeables' collision for sight lines (doors excluded: closed doors keep
+    /// their own test), rebuilt when the area's active placeables change.
+    pub fn placeable_collision(
+        &mut self,
+        area: thedas_script::vm::ObjectId,
+    ) -> Option<Arc<crate::collision::Collision>> {
+        use std::hash::{Hash, Hasher};
+        let tables = self.world.tables();
+        let types = tables.get(0, "placeable_types")?;
+        let mut placed: Vec<(thedas_script::vm::ObjectId, String, [f32; 3], f32)> = Vec::new();
+        for o in self.world.objects.values() {
+            if o.kind != crate::world::ObjectKind::Placeable || o.area != Some(area) || !o.active {
+                continue;
+            }
+            let door = matches!(
+                types.cell_by_hash(COL_STATE_CONTROLLER, o.appearance as i64),
+                Some(thedas_formats::gda::Cell::String(s))
+                    if crate::engine::clean(s).eq_ignore_ascii_case("StateCnt_Door")
+            );
+            if door {
+                continue;
+            }
+            let Some(thedas_formats::gda::Cell::String(m)) =
+                types.cell("ModelName", o.appearance as i64)
+            else {
+                continue;
+            };
+            let m = crate::engine::clean(m);
+            if m.is_empty() {
+                continue;
+            }
+            placed.push((o.id, m.to_string(), o.position, o.facing));
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for (id, m, p, f) in &placed {
+            (id, m, p.map(f32::to_bits), f.to_bits()).hash(&mut h);
+        }
+        let key = h.finish();
+        if let Some((k, c)) = self.placeable_collisions.get(&area) {
+            if *k == key {
+                return Some(c.clone());
+            }
+        }
+        let list: Vec<(String, [f32; 3], f32)> =
+            placed.into_iter().map(|(_, m, p, f)| (m, p, f)).collect();
+        let c = Arc::new(crate::collision::load_placeables(&self.vfs, &list));
+        let t = self.world.time_ms;
+        self.world.trace.push(crate::trace::TraceEntry::Log {
+            t,
+            channel: -2,
+            text: format!(
+                "sight collision: {} placeables, {} shapes",
+                list.len(),
+                c.len()
+            ),
+        });
+        self.placeable_collisions.insert(area, (key, c.clone()));
+        Some(c)
+    }
+
+    fn load_collision(&self, layout: &str) -> Option<crate::collision::Collision> {
+        let root = self.install_root.as_ref()?;
+        let install = thedas_vfs::DaoInstall::open(root).ok()?;
+        let mut level = thedas_vfs::Vfs::new();
+        install.mount_level(&mut level, layout).ok()?;
+        let (data, _) = level
+            .read(&format!("{layout}.arl"))
+            .or_else(|_| self.vfs.read(&format!("{layout}.arl")))
+            .ok()?;
+        let arl = thedas_formats::Arl::parse(&data).ok()?;
+        Some(crate::collision::load_layout(&level, &self.vfs, &arl))
+    }
+
     fn load_nav_grid(&self, layout: &str) -> Option<NavGrid> {
         let file = format!("{layout}.arl");
         let data = match self.vfs.read(&file) {
