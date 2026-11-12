@@ -303,7 +303,9 @@ impl Live {
         base: &thedas_render::Camera,
     ) -> Option<thedas_render::Camera> {
         let sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
-        self.talk_camera.camera(&sim, base)
+        let faces = self.objects.as_ref().map(|o| &o.faces);
+        let face = |id| faces.and_then(|f| f.get(&id).copied());
+        self.talk_camera.camera(&sim, base, &face)
     }
 
     /// The playing cutscene's camera (see [`crate::cutcam`]); `base` gives the clip planes.
