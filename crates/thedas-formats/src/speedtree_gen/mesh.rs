@@ -393,16 +393,17 @@ impl TreeMesh {
 
     /// The game's near and far distances for one placement (7.4): from half the bounding
     /// box's diagonal times the placement `scale` (RML 3356), and the placement's LOD class
-    /// (RML 3379: 0, 1 or 2 multiply by 1, 1.5 or 2; provisional mapping).
+    /// (RML 3379: 0, 1 or 2 multiply by 1, 1.5 or 2).
     pub fn lod_range(&self, scale: f32, lod_class: i32) -> (f32, f32) {
         let (lo, hi) = self.bounds;
         let d = super::frame::sub(hi, lo);
         let r = 0.5 * super::frame::dot(d, d).sqrt() * scale;
         let t = (r.clamp(2.0, 30.0) - 2.0) / 28.0;
-        let m = match lod_class {
+        // Classes outside 0–2 are not traced; clamp them (7.4, provisional).
+        let m = match lod_class.clamp(0, 2) {
+            0 => 1.0,
             1 => 1.5,
-            2 => 2.0,
-            _ => 1.0,
+            _ => 2.0,
         };
         ((15.0 + 5.0 * t) * m, (35.0 + 85.0 * t) * m)
     }
@@ -703,6 +704,8 @@ mod tests {
         // A small tree (half diagonal · scale under 2): near 15, far 35; class 2 doubles them.
         assert_eq!(mesh.lod_range(0.01, 0), (15.0, 35.0));
         assert_eq!(mesh.lod_range(0.01, 2), (30.0, 70.0));
+        assert_eq!(mesh.lod_range(0.01, 7), (30.0, 70.0));
+        assert_eq!(mesh.lod_range(0.01, -3), (15.0, 35.0));
         // A huge one: near 20, far 120.
         assert_eq!(mesh.lod_range(1000.0, 0), (20.0, 120.0));
         assert_eq!(lod_value(0.0, 15.0, 35.0, 1.0), 1.0);
