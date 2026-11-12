@@ -328,6 +328,29 @@ impl UiLayer {
     /// resource and whether it is done, in either order) and `GUI.GoToCodex` (the entry's
     /// resource) open the journal on that entry (its `GUIJournal.Notification*` values).
     /// Returns whether the message was one of these.
+    /// navbar.gfx's page buttons (`GUI.ToggleFullScreenGUI <scene>`): the book turns to that
+    /// screen, or closes when it is the one up, as the screen's key does. The main menu's
+    /// button is left to the game menu. Provisional: the exe's handling of the message is not
+    /// traced; the toggle follows the keys.
+    fn book_page(screens: &mut Screens, name: &str, args: &[String]) -> bool {
+        if name != "GUI.ToggleFullScreenGUI" {
+            return false;
+        }
+        let page = match args.first().map(|a| a.trim()) {
+            Some("CharacterRecord") => Screen::CharacterRecord,
+            Some("Inventory") => Screen::Inventory,
+            Some("Journal") => Screen::Journal,
+            Some("Map") => Screen::AreaMap,
+            Some("Tactics") => Screen::Tactics,
+            Some("Skills") => Screen::Skills,
+            Some("SpellsTalents") => Screen::SpellsTalents,
+            Some("Options") => Screen::Options,
+            _ => return true,
+        };
+        screens.toggle(page);
+        true
+    }
+
     fn go_to_journal(
         &mut self,
         screens: &mut Screens,
@@ -559,6 +582,7 @@ impl UiLayer {
                 shown.journal_focus = None;
             }
             shown.journal = journal;
+            shown.book_page = screens.menu.and_then(Screen::book_page);
             shown.ability_scene = match screens.menu {
                 Some(Screen::Skills) => 3,
                 Some(Screen::SpellsTalents) => 1,
@@ -649,6 +673,7 @@ impl UiLayer {
                 !self.popup_message(n, a)
                     && !self.save_message(screens, sim, n, a)
                     && !self.go_to_journal(screens, sim, n, a)
+                    && !Self::book_page(screens, n, a)
             })
             .collect();
         let mut aims = Vec::new();

@@ -1152,6 +1152,7 @@ impl App {
             | KeyCode::KeyJ
             | KeyCode::KeyK
             | KeyCode::KeyP
+            | KeyCode::Backslash
             | KeyCode::KeyO
                 if self.screens.is_some() =>
             {
@@ -2127,7 +2128,8 @@ fn menu_key(code: KeyCode) -> Option<screens::Screen> {
     match code {
         KeyCode::KeyI => Some(screens::Screen::Inventory),
         KeyCode::KeyC => Some(screens::Screen::CharacterRecord),
-        KeyCode::KeyT => Some(screens::Screen::Tactics),
+        // T, and Backslash as the game binds it (`ToggleTactics_0`).
+        KeyCode::KeyT | KeyCode::Backslash => Some(screens::Screen::Tactics),
         KeyCode::KeyM => Some(screens::Screen::AreaMap),
         KeyCode::KeyJ => Some(screens::Screen::Journal),
         KeyCode::KeyK => Some(screens::Screen::Skills),

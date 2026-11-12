@@ -102,6 +102,8 @@ pub struct Presentation {
     /// While the skills or spells/talents screen is up, which it shows (abilities.gfx's
     /// `AbilityScene.TALENTS` 1, `SPELLS` 2, `SKILLS` 3); 0 otherwise.
     pub ability_scene: i32,
+    /// The book page up (navbar.gfx's selected tab, `GUI.SelectedBookPage`), if any.
+    pub book_page: Option<i32>,
 }
 
 /// An item shown on the examine screen (itemexamine.gfx), as the screen that opened it asked
@@ -538,6 +540,25 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         v.insert(
             "GUIItemExamine.CheckRequirements".into(),
             num(e.check_requirements),
+        );
+    }
+    if let Some(p) = shown.book_page {
+        v.insert("GUI.SelectedBookPage".into(), num(p));
+    }
+    // The keys navbar.gfx shows on its page tabs: the game's default KeyBindings.ini
+    // (`ToggleInventory_0=Keyboard::Button_I`, ..., `ToggleTactics_0=Keyboard::Button_Backslash`).
+    for (scene, key) in [
+        ("CharacterRecord", "C"),
+        ("Inventory", "I"),
+        ("Journal", "J"),
+        ("Skills", "K"),
+        ("SpellsTalents", "P"),
+        ("Map", "M"),
+        ("Tactics", "\\"),
+    ] {
+        v.insert(
+            format!("InputMappings.Mappings.Toggle{scene}.PrimaryMappedKey"),
+            UiValue::String(key.into()),
         );
     }
     // The difficulty, as character creation's difficulty prompt starts from it.
