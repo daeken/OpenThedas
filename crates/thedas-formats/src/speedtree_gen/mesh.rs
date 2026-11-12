@@ -13,6 +13,7 @@
 //! (hold the wind still), and how the LOD value becomes per-part alphas (7.4).
 
 use super::frame::{Vec3, add, scale};
+use super::limits::{GenerateError, MAX_SURFACE_VERTICES};
 use super::{GeneratedTree, generate, leaves::card_size};
 use crate::speedtree::SpeedTree;
 
@@ -173,8 +174,32 @@ fn flip([s, t]: [f32; 2]) -> [f32; 2] {
 
 impl TreeMesh {
     /// Computes the tree and flattens it.
+    /// Computes the tree and flattens it, or an empty tree when the file is outside the
+    /// generator's limits (see [`TreeMesh::try_new`] to get the error).
     pub fn new(tree: &SpeedTree) -> Self {
-        let generated = generate(tree);
+        Self::try_new(tree).unwrap_or_else(|_| Self::empty())
+    }
+
+    /// A tree with nothing to draw.
+    pub fn empty() -> Self {
+        TreeMesh {
+            branches: Part::default(),
+            fronds: Part::default(),
+            leaves: Vec::new(),
+            mesh_leaves: Vec::new(),
+            leaf_mesh_templates: Vec::new(),
+            leaf_meshes: Part::default(),
+            billboard: None,
+            bounds: ([0.0; 3], [0.0; 3]),
+            rocking_offsets: [0.0; 3],
+            generated: GeneratedTree::default(),
+        }
+    }
+
+    /// Computes the tree and flattens it; files outside the generator's limits
+    /// ([`super::limits`]) are an error.
+    pub fn try_new(tree: &SpeedTree) -> Result<Self, GenerateError> {
+        let generated = generate(tree)?;
         let g = &generated;
 
         let branches = Part {
@@ -239,6 +264,19 @@ impl TreeMesh {
             .collect();
         let mut leaves = Vec::with_capacity(g.leaf_lods.len());
         let mut mesh_leaves = Vec::with_capacity(g.leaf_lods.len());
+        let mesh_vertices: usize = g
+            .leaf_lods
+            .iter()
+            .flatten()
+            .filter_map(|leaf| templates[leaf.choice].as_ref())
+            .map(|t| t.vertices.len())
+            .sum();
+        if mesh_vertices > MAX_SURFACE_VERTICES {
+            return Err(GenerateError::TooLarge {
+                what: "leaf mesh vertices",
+                max: MAX_SURFACE_VERTICES,
+            });
+        }
         let mut leaf_meshes = Part::default();
         for (k, level) in g.leaf_lods.iter().enumerate() {
             let mut cards = Vec::new();
@@ -317,7 +355,7 @@ impl TreeMesh {
                 }
             });
 
-        TreeMesh {
+        Ok(TreeMesh {
             branches,
             fronds,
             leaves,
@@ -328,7 +366,7 @@ impl TreeMesh {
             bounds: (lo, hi),
             rocking_offsets: g.rocking_offsets,
             generated,
-        }
+        })
     }
 
     /// A 64-bit FNV-1a hash of every output value (vertices, triangle lists, leaf cards,
@@ -599,7 +637,7 @@ mod tests {
 
     #[test]
     fn branches_flatten_to_triangle_lists() {
-        let mesh = TreeMesh::new(&leafy_trunk());
+        let mesh = TreeMesh::try_new(&leafy_trunk()).unwrap();
         assert_eq!(mesh.branches.lods.len(), 2);
         let n = mesh.branches.vertices.len() as u32;
         for list in &mesh.branches.lods {
@@ -622,7 +660,7 @@ mod tests {
 
     #[test]
     fn leaf_cards_use_the_pivot_and_atlas() {
-        let mesh = TreeMesh::new(&leafy_trunk());
+        let mesh = TreeMesh::try_new(&leafy_trunk()).unwrap();
         let cards = &mesh.leaves[0];
         assert!(!cards.is_empty());
         for card in cards {
@@ -648,7 +686,7 @@ mod tests {
 
     #[test]
     fn the_billboard_spans_the_bounds() {
-        let mesh = TreeMesh::new(&leafy_trunk());
+        let mesh = TreeMesh::try_new(&leafy_trunk()).unwrap();
         let b = mesh.billboard.unwrap();
         let (lo, hi) = mesh.bounds;
         assert!((b.height - (hi[2] - lo[2])).abs() < 1e-6);
@@ -659,11 +697,11 @@ mod tests {
     #[test]
     fn the_fingerprint_is_stable_and_sensitive() {
         let t = leafy_trunk();
-        let a = TreeMesh::new(&t).fingerprint();
-        assert_eq!(a, TreeMesh::new(&t).fingerprint());
+        let a = TreeMesh::try_new(&t).unwrap().fingerprint();
+        assert_eq!(a, TreeMesh::try_new(&t).unwrap().fingerprint());
         let mut other = t.clone();
         other.tree.seed += 1;
-        assert_ne!(a, TreeMesh::new(&other).fingerprint());
+        assert_ne!(a, TreeMesh::try_new(&other).unwrap().fingerprint());
     }
 
     /// Pinned output of representative game files (tree, pine, fern, bushes, grass,
@@ -680,7 +718,7 @@ mod tests {
             let path = std::path::Path::new(&dir).join(name);
             let data = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             let tree = crate::speedtree::parse(&data).expect(name);
-            let hash = TreeMesh::new(&tree).fingerprint();
+            let hash = TreeMesh::try_new(&tree).unwrap().fingerprint();
             if hash != *pinned {
                 failures.push(format!("(\"{name}\", 0x{hash:016x}),"));
             }
@@ -700,7 +738,7 @@ mod tests {
 
     #[test]
     fn lod_follows_the_games_distances() {
-        let mesh = TreeMesh::new(&leafy_trunk());
+        let mesh = TreeMesh::try_new(&leafy_trunk()).unwrap();
         // A small tree (half diagonal · scale under 2): near 15, far 35; class 2 doubles them.
         assert_eq!(mesh.lod_range(0.01, 0), (15.0, 35.0));
         assert_eq!(mesh.lod_range(0.01, 2), (30.0, 70.0));
@@ -747,7 +785,7 @@ mod tests {
             ],
             indices: vec![0, 1, 2, 0, 2, 7],
         }];
-        let mesh = TreeMesh::new(&t);
+        let mesh = TreeMesh::try_new(&t).unwrap();
         assert!(mesh.leaves.iter().all(|l| l.is_empty()));
         let leaves = &mesh.mesh_leaves[0];
         assert_eq!(leaves.len(), mesh.generated.skeleton.leaves.len());

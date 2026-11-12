@@ -317,14 +317,14 @@ mod tests {
     #[test]
     fn every_bud_makes_a_leaf_with_its_draws() {
         let t = leafy();
-        let (skeleton, random) = grow(&t);
+        let (skeleton, random) = grow(&t).unwrap();
         assert_eq!(skeleton.buds.len(), 6);
         assert_eq!(skeleton.leaves.len(), 6);
         // Without leaf textures the same tree draws 3 fewer per bud: bud length and azimuth
         // stay, the choice (two choices), group and colour go.
         let mut bare = t.clone();
         bare.leaves.textures.clear();
-        let (_, bare_random) = grow(&bare);
+        let (_, bare_random) = grow(&bare).unwrap();
         assert_eq!(random.draws() - bare_random.draws(), 6 * 3);
         for (leaf, bud) in skeleton.leaves.iter().zip(&skeleton.buds) {
             assert!(leaf.choice < 2);
@@ -345,7 +345,7 @@ mod tests {
         let mut t = leafy();
         t.leaves.collision = 2;
         t.leaves.spacing_tolerance = 1000.0;
-        let (skeleton, _) = grow(&t);
+        let (skeleton, _) = grow(&t).unwrap();
         assert_eq!(skeleton.leaves.len(), 1);
     }
 
@@ -359,7 +359,7 @@ mod tests {
             ..Lod::default()
         });
         t.leaves.spacing_tolerance = 1000.0;
-        let generated = generate(&t);
+        let generated = generate(&t).unwrap();
         let lods = &generated.leaf_lods;
         assert_eq!(lods.len(), 3);
         assert_eq!(lods[0].len(), 6);
