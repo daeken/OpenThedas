@@ -149,6 +149,9 @@ pub(crate) struct D3dPass {
     prop_at: std::sync::Mutex<Vec<Option<Vec3>>>,
     /// Each draw's lights as last re-picked for its object (`None`: as the pass was made).
     relit: std::sync::Mutex<Vec<Option<DrawLights>>>,
+    /// A light rig lighting every draw in place of the scene's lights (see
+    /// [`crate::scene::LightRig`]).
+    rig: Option<crate::scene::LightRig>,
     caster_programs: Vec<Arc<D3dProgram>>,
     /// The (empty) texture bindings of the casters' programs.
     empty_group: wgpu::BindGroup,
@@ -1613,6 +1616,7 @@ impl D3dPass {
             prop_draws,
             prop_at: std::sync::Mutex::new(Vec::new()),
             relit: std::sync::Mutex::new(Vec::new()),
+            rig: None,
         }
     }
 
@@ -1727,6 +1731,17 @@ impl D3dPass {
         if let Some(w) = self.worlds.get_mut(draw) {
             w.0 = world;
         }
+    }
+
+    /// Lights every draw with `rig` instead of the scene's lights, ambient, probe and sun
+    /// (`None` goes back to them). The draws' fixed constants are refilled.
+    pub fn set_rig(&mut self, rig: Option<crate::scene::LightRig>) {
+        self.rig = rig;
+        self.statics
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+            .for_each(|s| *s = None);
     }
 
     pub fn is_blended(&self, d: &D3dDraw) -> bool {
@@ -1859,6 +1874,12 @@ impl D3dPass {
             let data = &mut run[at..];
             let (world, lightmap, material) = &self.worlds[d.draw];
             let program = &self.pipelines[d.pipeline].program;
+            let rigged = self.rig.as_ref().map(|r| {
+                let bound = self
+                    .world_sphere(d)
+                    .unwrap_or((world.w_axis.truncate(), 1.0));
+                (r, pick_lights(&r.lights, bound, DOMAIN_CHARACTERS))
+            });
             let cc = ConstantContext {
                 view,
                 projection,
@@ -1866,16 +1887,25 @@ impl D3dPass {
                 camera: camera.position,
                 material: &self.materials[*material],
                 lightmap: lightmap.as_ref(),
-                lights: relit[i].as_ref().unwrap_or(&d.lights),
-                ambient: self.ambients.get(d.draw).copied().unwrap_or(Vec3::ZERO),
+                lights: match &rigged {
+                    Some((_, l)) => l,
+                    None => relit[i].as_ref().unwrap_or(&d.lights),
+                },
+                ambient: match &rigged {
+                    Some((r, _)) => r.ambient,
+                    None => self.ambients.get(d.draw).copied().unwrap_or(Vec3::ZERO),
+                },
                 bones: self.bones.get(d.draw).map_or(&[][..], |b| b.as_slice()),
-                irradiance: self
-                    .probes
-                    .get(d.draw)
-                    .copied()
-                    .flatten()
-                    .and_then(|p| self.scene_probes.get(p)),
-                sun: self.sun,
+                irradiance: match &rigged {
+                    Some((r, _)) => r.probe.as_ref(),
+                    None => self
+                        .probes
+                        .get(d.draw)
+                        .copied()
+                        .flatten()
+                        .and_then(|p| self.scene_probes.get(p)),
+                },
+                sun: if rigged.is_some() { None } else { self.sun },
                 fog: self.fog,
                 sky: self.sky.as_ref(),
                 clouds: self.clouds,

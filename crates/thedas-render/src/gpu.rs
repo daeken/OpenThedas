@@ -1053,6 +1053,11 @@ impl AreaRenderer {
         }
     }
 
+    /// Lights every draw with `rig` instead of the scene's lights (`None` restores them).
+    pub fn set_light_rig(&mut self, rig: Option<crate::scene::LightRig>) {
+        self.d3d.set_rig(rig);
+    }
+
     /// Sets the shaders' clock (`ApplicationTime`), in seconds. The particle emitters run
     /// on by the time it moved forward.
     pub fn set_time(&mut self, seconds: f64) {

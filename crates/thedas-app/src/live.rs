@@ -516,6 +516,11 @@ impl Live {
     }
 }
 
+/// The light model and light probe model lighting the paperdoll (DAOrigins.exe's
+/// `paperdoll_lightrig` and `paperdoll_lightprobe`, 0x7bbb30-0x7bbbb1).
+const PAPERDOLL_LIGHT_RIG: &str = "el_lr_new_day2";
+const PAPERDOLL_LIGHT_PROBE: &str = "el_lp_outside_day";
+
 /// How much brighter portraits are than the scene they are drawn in. Provisional.
 const PORTRAIT_GAIN: f32 = 1.8;
 
@@ -871,10 +876,10 @@ impl Live {
     /// `GUIPaperdoll` makes for those screens (270 by 459, 0x7312ee / 0x73c310; the target is
     /// named `paperdoll`, 0x7bc659), in a scene of its own lit by `paperdoll_lightrig`
     /// (el_lr_new_day2) and `paperdoll_lightprobe` (el_lp_outside_day) (0x7bbb30-0x7bbbb1).
-    /// Provisional: the member is drawn where it stands, alone, with the scene's light
-    /// brightened as the portraits' is, from a level camera framing its height; the game's
-    /// camera presets and light rig are not used. The coverage comes from drawing over black and
-    /// over white.
+    /// The member is drawn where it stands, alone, lit by that rig and probe (in place of the
+    /// level's lights), from a level camera framing its height. Provisional: the game's
+    /// camera presets are not used, and the rig is placed at the member's feet turned to face
+    /// the viewer. The coverage comes from drawing over black and over white.
     pub fn paperdoll(
         &mut self,
         ctx: &GpuContext,
@@ -883,6 +888,7 @@ impl Live {
         width: u32,
         height: u32,
     ) -> Option<Vec<u8>> {
+        let vfs = self.level.as_ref()?.vfs.clone();
         let objects = self.objects.as_mut()?;
         let (feet, facing) = {
             let sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
@@ -917,11 +923,22 @@ impl Live {
             .map(|p| p.draws.clone().collect())
             .unwrap_or_default();
         objects.renderer.only_draws = Some(own);
+        // The rig faces its subject along its −Y (its key light in front, its rim behind);
+        // here it turns with the viewer, so the light stays on the side facing the picture.
+        let rig = thedas_render::scene::LightRig::load(
+            &vfs,
+            PAPERDOLL_LIGHT_RIG,
+            PAPERDOLL_LIGHT_PROBE,
+            glam::Mat4::from_translation(feet)
+                * glam::Mat4::from_rotation_z(heading + std::f32::consts::FRAC_PI_2),
+        );
+        objects.renderer.set_light_rig(Some(rig));
         let black = objects.renderer.capture(ctx, &camera, width, height);
         objects.renderer.clear = wgpu::Color::WHITE;
         let white = objects.renderer.capture(ctx, &camera, width, height);
         objects.renderer.clear = wgpu::Color::BLACK;
         objects.renderer.only_draws = None;
+        objects.renderer.set_light_rig(None);
         let (black, white) = (black.ok()?, white.ok()?);
         let mut out = vec![0u8; black.len()];
         for ((o, b), w) in out
@@ -940,7 +957,7 @@ impl Live {
                 continue;
             }
             for i in 0..3 {
-                o[i] = (b[i] as f32 / a * PORTRAIT_GAIN).min(255.0) as u8;
+                o[i] = (b[i] as f32 / a).min(255.0) as u8;
             }
             o[3] = (a * 255.0).round() as u8;
         }

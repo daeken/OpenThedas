@@ -35,12 +35,16 @@ pub mod field {
     /// Whether a mesh casts the engine's run-time (shadow partition) shadows; xoreos's
     /// `MMHMeshCastRuntimeShadow`.
     pub const MESH_CAST_RUNTIME_SHADOW: u32 = 6176;
+    /// An irradiance node's probe file (`.mtx`).
+    pub const IRRADIANCE_FILE: u32 = 6253;
 }
 
 pub const KIND_TRANSLATION: FourCC = FourCC::new(b"trsl");
 pub const KIND_ROTATION: FourCC = FourCC::new(b"rota");
 pub const KIND_MESH: FourCC = FourCC::new(b"mshh");
 pub const KIND_POINT_LIGHT: FourCC = FourCC::new(b"nplt");
+/// A light probe's irradiance node (under a `nlpr` light probe node).
+pub const KIND_IRRADIANCE: FourCC = FourCC::new(b"nirr");
 /// A particle emitter node.
 pub const KIND_EMITTER: FourCC = FourCC::new(b"nemt");
 pub const KIND_AMBIENT_LIGHT: FourCC = FourCC::new(b"nalt");
@@ -103,6 +107,8 @@ pub struct Node {
     pub light: Option<Light>,
     /// For a particle emitter node (`nemt`), its settings.
     pub emitter: Option<Box<crate::emitter::Emitter>>,
+    /// For an irradiance node (`nirr`), the probe file it names.
+    pub irradiance: Option<String>,
     /// The node's bone index, for skeleton nodes.
     pub bone: Option<u32>,
     pub children: Vec<Node>,
@@ -188,6 +194,17 @@ impl Mmh {
             walk(n, &mut chain, &mut out);
         }
         out
+    }
+
+    /// The irradiance probe file the first `nirr` node names (a light probe model, such as
+    /// the paperdoll's `el_lp_outside_day`).
+    pub fn irradiance_file(&self) -> Option<&str> {
+        fn walk(n: &Node) -> Option<&str> {
+            n.irradiance
+                .as_deref()
+                .or_else(|| n.children.iter().find_map(walk))
+        }
+        self.nodes.iter().find_map(walk)
     }
 
     pub fn parse(data: &[u8]) -> TypedResult<Self> {
@@ -351,6 +368,12 @@ fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>
         mesh,
         light,
         emitter,
+        irradiance: if kind == KIND_IRRADIANCE {
+            d.opt_str(id, field::IRRADIANCE_FILE)?
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        },
         // Negative (-1) marks a node that is not a bone.
         bone: match d.opt_i64(id, field::BONE_INDEX)? {
             Some(b) if (0..=u16::MAX as i64).contains(&b) => Some(b as u32),
@@ -482,6 +505,17 @@ mod tests {
         );
         assert_eq!(lights[0].chain[1].position, [1.0, 2.0, 3.0]);
         assert!(matches!(lights[1].light, Light::Ambient { .. }));
+        assert_eq!(mmh.irradiance_file(), None);
+    }
+
+    #[test]
+    fn reads_a_light_probes_file() {
+        let mut b = Builder::new(b"MMH ");
+        let irr = b.add(b"nirr", vec![(field::IRRADIANCE_FILE, s("probe_1.mtx"))]);
+        let probe = b.add(b"nlpr", vec![(field::CHILDREN, generic(&[irr]))]);
+        let root = b.add(b"mdlh", vec![(field::CHILDREN, generic(&[probe]))]);
+        let mmh = Mmh::from_gff4(&b.finish(root)).unwrap();
+        assert_eq!(mmh.irradiance_file(), Some("probe_1.mtx"));
     }
 
     #[test]

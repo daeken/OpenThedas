@@ -128,6 +128,56 @@ pub struct DrawSkin {
     pub mesh_node: Mat4,
 }
 
+/// Lights that replace a scene's for a picture of its own: the inventory's paperdoll is lit
+/// by `paperdoll_lightrig` and `paperdoll_lightprobe` (DAOrigins.exe 0x7bbb30-0x7bbbb1).
+#[derive(Clone, Debug, Default)]
+pub struct LightRig {
+    /// Point lights, placed in the world.
+    pub lights: Vec<SceneLight>,
+    pub probe: Option<IrradianceProbe>,
+    pub ambient: Vec3,
+}
+
+impl LightRig {
+    /// The point lights of light model `rig` placed by `placement` (model to world), and
+    /// the irradiance probe light probe model `probe` names (its `nirr` node's `.mtx`).
+    /// Missing or unreadable resources leave their part out.
+    pub fn load(vfs: &Vfs, rig: &str, probe: &str, placement: Mat4) -> LightRig {
+        let model = |name: &str| {
+            let (d, _) = vfs.read(&format!("{name}.mmh")).ok()?;
+            Mmh::parse(&d).ok()
+        };
+        let mut out = LightRig::default();
+        if let Some(m) = model(rig) {
+            for lp in m.lights() {
+                let at = lp
+                    .chain
+                    .iter()
+                    .fold(placement, |m, t| m * transform_matrix(t));
+                if let thedas_formats::model::Light::Point {
+                    color,
+                    radius,
+                    affect_domain,
+                } = lp.light
+                {
+                    out.lights.push(SceneLight::Point {
+                        position: at.transform_point3(Vec3::ZERO),
+                        color: Vec3::new(color[0], color[1], color[2]),
+                        radius: *radius,
+                        name: lp.name.unwrap_or("").to_string(),
+                        domain: *affect_domain,
+                    });
+                }
+            }
+        }
+        out.probe = model(probe)
+            .and_then(|m| m.irradiance_file().map(str::to_string))
+            .and_then(|f| vfs.read(&f).ok())
+            .and_then(|(d, _)| IrradianceProbe::parse(&d).ok());
+        out
+    }
+}
+
 /// The VFX contact-sheet shaders' frame grid (`VFX0_CS_*.vsh` read it as columns, rows and
 /// frame count). Provisional: who fills it in the original (the emitter's flipbook columns
 /// and rows, as here, or the material) is not traced.
