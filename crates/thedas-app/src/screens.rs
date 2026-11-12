@@ -199,7 +199,9 @@ impl Screens {
             .shown
             .iter()
             .copied()
-            .filter(|s| !s.movies().iter().any(|m| open(m)))
+            // A screen's own movie is its first; those after it (the popup layer, the book's
+            // page tabs, tooltips) stay when it closes itself.
+            .filter(|s| s.movies().first().is_some_and(|m| !open(m)))
             .collect();
         for s in gone {
             self.shown.remove(&s);
