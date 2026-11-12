@@ -68,12 +68,20 @@ pub mod field {
     pub const GRID_NORMAL: u32 = 3091;
     pub const GRID_DATA: u32 = 3092;
     pub const GRID_HEIGHT: u32 = 3093;
+    /// Per cell, the ground's sound material (low nibble, a `sound_geometry_mat_types.gda`
+    /// row) and vegetation (high nibble, a `sound_vegetation_type.gda` row): DAOrigins.exe
+    /// reads a creature's cell (0xa46870 -> 0xa49290) and splits the byte (0x6a0590,
+    /// 0x6a05a0). Identified by those reads and the data's values.
+    pub const GRID_SURFACE: u32 = 3114;
     pub const ROOM_ID: u32 = 3031;
     pub const ROOM_NAME: u32 = 3033;
     pub const ROOM_BOUNDS_MIN: u32 = 3140;
     pub const ROOM_BOUNDS_MAX: u32 = 3141;
 
     pub const RML_MODELS: u32 = 3050;
+    /// The rooms a room's lights also reach (DAOrigins.exe's room loader reads it into the
+    /// room at `+0xc0`, 0x5d3c73; the lights' room test 0x53d210 searches it).
+    pub const RML_LIGHT_ROOMS: u32 = 3164;
     pub const POSITION: u32 = 4;
     pub const ROTATION: u32 = 5;
     pub const MDL_SCALE: u32 = 3059;
@@ -277,6 +285,9 @@ pub struct NavGrid {
     pub normal: [f32; 3],
     pub data: Vec<u8>,
     pub heights: Vec<f32>,
+    /// Per cell, the ground's sound material and vegetation (see
+    /// [`field::GRID_SURFACE`]); empty when the layout has none.
+    pub surfaces: Vec<u8>,
 }
 
 impl NavGrid {
@@ -300,6 +311,17 @@ impl NavGrid {
             self.base[1] + (y as f32 + 0.5) * self.cell_size,
             z,
         ]
+    }
+
+    /// The surface byte (sound material in the low nibble, vegetation in the high) at a
+    /// world position: 0 (unknown, none) outside the grid or without surfaces. The cell is
+    /// DAOrigins.exe's (0xa49410, 0xa49440: `(p - base - half a cell) / cell + 0.5`,
+    /// truncated), the same as [`NavGrid::cell`].
+    pub fn surface(&self, p: [f32; 3]) -> u8 {
+        self.cell(p)
+            .and_then(|(x, y)| self.surfaces.get((y * self.columns + x) as usize))
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn value(&self, (x, y): (u32, u32)) -> u8 {
@@ -337,6 +359,12 @@ impl Arl {
                     let data = d.bytes(g, field::GRID_DATA)?.to_vec();
                     let cells = columns as usize * rows as usize;
                     let heights = d.numbers(g, field::GRID_HEIGHT)?;
+                    let surfaces: Vec<u8> = d
+                        .numbers(g, field::GRID_SURFACE)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|v: f32| v as i32 as u8)
+                        .collect();
                     (data.len() == cells && cells > 0).then(|| NavGrid {
                         columns,
                         rows,
@@ -363,6 +391,11 @@ impl Arl {
                         data,
                         heights: if heights.len() == cells {
                             heights
+                        } else {
+                            Vec::new()
+                        },
+                        surfaces: if surfaces.len() == cells {
+                            surfaces
                         } else {
                             Vec::new()
                         },
@@ -565,6 +598,9 @@ pub struct Rml {
     pub placements: Vec<Placement>,
     /// The trees, bushes and grass the room places.
     pub trees: Vec<TreePlacement>,
+    /// The other rooms (by [`ArlRoom::id`]) this room's lights and light probes reach
+    /// (3164); a single -1 means every room. Its lights always reach the room itself.
+    pub light_rooms: Vec<i64>,
 }
 
 /// A SpeedTree placed in a room (`SPT `, 3354). Provisional: field meanings are read from
@@ -610,10 +646,16 @@ impl Rml {
                 flag: d.opt_i64(t, field::TREE_FLAG)?.unwrap_or(0),
             });
         }
+        let light_rooms = d
+            .numbers(root, field::RML_LIGHT_ROOMS)?
+            .into_iter()
+            .map(|v| v as i64)
+            .collect();
         Ok(Rml {
             transform,
             placements,
             trees,
+            light_rooms,
         })
     }
 }
@@ -834,9 +876,14 @@ mod tests {
             vec![
                 (field::POSITION, Value::Vec3([10.0, 0.0, 0.0])),
                 (field::RML_MODELS, structs(&[m, m2])),
+                (
+                    field::RML_LIGHT_ROOMS,
+                    Value::List(Some(crate::gff4::List::I32(vec![47, 12848]))),
+                ),
             ],
         );
         let rml = Rml::from_gff4(&b.finish(root)).unwrap();
+        assert_eq!(rml.light_rooms, vec![47, 12848]);
         assert_eq!(rml.transform.position, [10.0, 0.0, 0.0]);
         assert_eq!(rml.transform.rotation, IDENTITY_QUAT);
         let p = &rml.placements[0];
@@ -1021,5 +1068,30 @@ mod tests {
             [0.5, 0.4, 0.3],
         );
         assert_eq!(own.atmosphere.unwrap().sun_color, [0.2, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn surface_under_a_position() {
+        let g = NavGrid {
+            columns: 2,
+            rows: 2,
+            cell_size: 0.5,
+            clearance: 2.0,
+            base: [10.0, 20.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            data: vec![1; 4],
+            heights: Vec::new(),
+            // Row-major: (0,0) grass, (1,0) stone, (0,1) dirt with high grass, (1,1) none.
+            surfaces: vec![4, 5, 0x26, 0],
+        };
+        assert_eq!(g.surface([10.1, 20.1, 0.0]), 4);
+        assert_eq!(g.surface([10.6, 20.4, 0.0]), 5);
+        assert_eq!(g.surface([10.2, 20.7, 0.0]), 0x26);
+        assert_eq!(g.surface([9.0, 20.0, 0.0]), 0);
+        let none = NavGrid {
+            surfaces: Vec::new(),
+            ..g
+        };
+        assert_eq!(none.surface([10.1, 20.1, 0.0]), 0);
     }
 }

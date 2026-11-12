@@ -48,6 +48,7 @@
 mod audio;
 mod chargen_stage;
 mod control;
+mod cutactors;
 mod cutcam;
 mod focusnav;
 mod follow;
@@ -1072,6 +1073,7 @@ impl App {
                 });
             }
         }
+        g.ui.set_pad_active(self.pad.used);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -1155,6 +1157,7 @@ impl App {
                 r.advance_time(dt / 1000.0);
             }
         }
+        g.ui.set_pad_active(self.pad.used);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -1548,6 +1551,19 @@ impl App {
                     test_floaty(&mut l.sim(), text);
                 }
                 log.push(format!("floaty {text:?}"));
+            }
+            Step::Use(tag) => {
+                if let Some(l) = self.live.as_ref() {
+                    let mut sim = l.sim();
+                    let who = sim.world.controlled();
+                    match (who, who.and_then(|w| nearest_tagged(&sim, w, tag))) {
+                        (Some(w), Some(t)) => {
+                            sim.order_use(w, t);
+                            log.push(format!("use {tag}"));
+                        }
+                        _ => log.push(format!("use {tag}: nothing")),
+                    }
+                }
             }
             Step::Plot(plot, flag) => {
                 if let Some(l) = self.live.as_ref() {
@@ -2127,6 +2143,8 @@ fn audio_state(
     if !live.front_end {
         state.animations = live.animation_clocks();
         let sim = live.sim();
+        let grid = sim.world.area.and_then(|a| sim.loaded_nav_grid(a));
+        let appearances = sim.world.tables().get(0, "apr_base");
         for (id, ..) in &state.animations {
             let Some(o) = sim.world.get(*id) else {
                 continue;
@@ -2144,7 +2162,20 @@ fn audio_state(
                     armour: base("INVENTORY_SLOT_CHEST"),
                     main: base("INVENTORY_SLOT_MAIN"),
                     off: base("INVENTORY_SLOT_OFFHAND"),
-                    combat: o.combat.in_combat,
+                    footstep: Some(audio::footstep_column(appearances.as_ref().and_then(|t| {
+                        t.cell_by_hash(audio::APR_FOOTSTEP, o.appearance as i64)
+                    }))),
+                    surface: grid.as_ref().map_or(0, |g| g.surface(o.position)),
+                    size: appearances
+                        .as_ref()
+                        .and_then(|t| t.cell_by_hash(audio::APR_SIZE, o.appearance as i64))
+                        .and_then(|c| match c {
+                            thedas_formats::gda::Cell::String(s) => {
+                                let s = s.trim_matches(|c| c == '\0' || c == ' ' || c == '\t');
+                                Some(thedas_formats::gda::column_hash(s))
+                            }
+                            _ => None,
+                        }),
                 },
             );
         }
@@ -2298,6 +2329,7 @@ fn audio_state(
     // listener balance position": 0.17 of the way to the camera).
     let cam = camera.position;
     let feet = live.leader_feet().unwrap_or(cam);
+    state.leader = live.leader_feet().map(|f| f.to_array());
     let p = feet + (cam - feet) * 0.17;
     let right = [camera.yaw.sin(), -camera.yaw.cos(), 0.0];
     state.listener = Some((p.to_array(), right));
@@ -2344,7 +2376,7 @@ fn nearest_tagged(
     let me = sim.world.get(who)?;
     sim.world
         .by_tag(tag)
-        .filter(|o| o.area.is_some() && o.area == me.area && o.id != who)
+        .filter(|o| o.area.is_some() && o.area == me.area && o.id != who && o.active)
         .min_by(|a, b| {
             let d =
                 |o: &thedas_sim::world::Object| thedas_sim::engine::dist(o.position, me.position);
@@ -2616,6 +2648,8 @@ enum Step {
     /// Sets a plot flag as a script would (`plot plt_tut_explore 0`), running the plot's
     /// script, for trying journal entries and tutorial popups headless.
     Plot(String, i32),
+    /// Uses the nearest object with a tag, as clicking it would (`use bdc140ip_everds_chest`).
+    Use(String),
 }
 
 /// A `pad` step: a button by name (pressed and let go), `press`/`release` and a button, or
@@ -2789,6 +2823,7 @@ fn parse_step(s: &str) -> Result<Step> {
             }
         }
         "talk" if !arg.is_empty() => Step::Talk(arg.to_string()),
+        "use" if !arg.is_empty() => Step::Use(arg.to_string()),
         "rebuild" => Step::Rebuild,
         "picker" => Step::Picker,
         "wipe" => Step::Wipe,
@@ -3086,6 +3121,7 @@ fn main() -> Result<()> {
                                     layer.set_paperdoll(shot);
                                 }
                                 layer.set_paused(l.paused);
+                                layer.set_pad_active(pad_play.used);
                                 if let Some(aim) = layer.play(s, &l.sim, dt).pop() {
                                     println!("aiming ability {}", aim.ability);
                                     l.aiming = Some(aim);
@@ -3163,6 +3199,17 @@ fn main() -> Result<()> {
                     Step::Floaty(text) => {
                         test_floaty(&mut l.sim(), text);
                         println!("floaty {text:?}");
+                    }
+                    Step::Use(tag) => {
+                        let mut sim = l.sim();
+                        let who = sim.world.controlled();
+                        match (who, who.and_then(|w| nearest_tagged(&sim, w, tag))) {
+                            (Some(w), Some(t)) => {
+                                sim.order_use(w, t);
+                                println!("use {tag}");
+                            }
+                            _ => println!("use {tag}: nothing"),
+                        }
                     }
                     Step::Plot(plot, flag) => {
                         l.sim().set_plot_flag(

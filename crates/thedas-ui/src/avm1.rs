@@ -128,6 +128,7 @@ pub const DA_RETURNING_FSCOMMANDS: &[&str] = &[
     "ListTacticModalAbilities",
     "ListTacticItems",
     "GetObjectNameByID",
+    "CreatureCanUseItem",
 ];
 
 /// Functions the game answers by setting a movie variable while the function runs (Scaleform's

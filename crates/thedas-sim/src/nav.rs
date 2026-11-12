@@ -383,6 +383,13 @@ impl Sim {
         grid
     }
 
+    /// The pathing grid of an area if the simulation has already loaded it (read-only:
+    /// for presentation, which must not load it through [`Sim::nav_grid`]).
+    pub fn loaded_nav_grid(&self, area: thedas_script::vm::ObjectId) -> Option<Arc<NavGrid>> {
+        let name = self.area_layouts.get(&area)?;
+        self.nav_grids.get(name)?.clone()
+    }
+
     /// The layout (environment level) an area is built on, from its `.are`.
     pub fn area_layout(&mut self, area: thedas_script::vm::ObjectId) -> Option<String> {
         let name = match self.area_layouts.get(&area) {
@@ -527,6 +534,7 @@ mod tests {
             normal: [0.0, 0.0, 1.0],
             data,
             heights: vec![0.0; (w * h) as usize],
+            surfaces: Vec::new(),
         }
     }
 
@@ -548,6 +556,7 @@ mod tests {
             normal: [0.0, 0.0, 1.0],
             data,
             heights: vec![0.0; (w * h) as usize],
+            surfaces: Vec::new(),
         };
         let at = |x: f32| [x, 1.5, 0.0];
         assert!(wall_between(&g, at(1.5), at(8.5)), "through the wall");
@@ -695,6 +704,7 @@ mod tests {
             normal: [0.0, 0.0, 1.0],
             data,
             heights: vec![0.0; (w * h) as usize],
+            surfaces: Vec::new(),
         };
         let area = s.world.spawn(ObjectKind::Area, "a");
         s.area_layouts.insert(area, "two_doors".into());

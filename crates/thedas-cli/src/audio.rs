@@ -19,6 +19,7 @@ pub fn play(
     language: &str,
     rate: u32,
     params: &[String],
+    reverb: &str,
 ) -> Result<()> {
     let parameters: Vec<(String, f32)> = params
         .iter()
@@ -37,6 +38,10 @@ pub fn play(
     let mixer = Arc::new(Mutex::new(Mixer::new(rate)));
     let mut engine = AudioEngine::new(lib, mixer.clone());
     engine.synchronous = true;
+    match engine.reverb_preset(reverb) {
+        Some(p) => engine.set_reverb(p, 0.0),
+        None => anyhow::bail!("no reverb preset {reverb:?} in master_reverb.fev"),
+    }
     // (start time, path, programmer sound)
     let mut queue: Vec<(f32, String, Option<String>)> = events
         .iter()
@@ -135,6 +140,20 @@ pub fn check(install: &Path, language: &str) -> Result<()> {
     );
     let cut_missing = missing.len();
     let (mut areas, mut themes, mut placed) = (0usize, 0usize, 0usize);
+    let presets: Vec<String> = lib
+        .project("master_reverb")
+        .map(|p| {
+            p.reverbs
+                .iter()
+                .map(|r| r.name.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    let preset_ok = |n: &str| {
+        let n = n.trim().to_ascii_lowercase();
+        n.is_empty() || n == "force_generic" || presets.contains(&n)
+    };
+    let (mut reverbs, mut triggers) = (0usize, 0usize);
     for name in vfs.names() {
         if !name.to_ascii_lowercase().ends_with(".are") {
             continue;
@@ -156,9 +175,20 @@ pub fn check(install: &Path, language: &str) -> Result<()> {
                 missing.push(format!("{name}: {}", s.event));
             }
         }
+        let r = thedas_audio::area::area_reverb(&data);
+        if !r.preset.is_empty() {
+            reverbs += 1;
+        }
+        triggers += r.triggers.len();
+        for p in std::iter::once(&r.preset).chain(r.triggers.iter().map(|t| &t.preset)) {
+            if !preset_ok(p) {
+                missing.push(format!("{name}: reverb preset {p:?}"));
+            }
+        }
     }
     println!(
-        "{areas} areas, {themes} with music, {placed} placed sounds, {} unresolved",
+        "{areas} areas, {themes} with music, {placed} placed sounds, {reverbs} with a reverb \
+         preset, {triggers} reverb triggers, {} unresolved",
         missing.len() - cut_missing
     );
     for m in missing.iter() {
@@ -215,12 +245,27 @@ pub fn fev(path: &Path, filter: Option<&str>, check: bool) -> Result<()> {
         fev.name,
         fev.wave_banks.iter().map(|b| &b.name).collect::<Vec<_>>()
     );
+    for r in &fev.reverbs {
+        let words: Vec<String> = r
+            .raw
+            .iter()
+            .map(|&w| {
+                let f = f32::from_bits(w);
+                if (w as i32).abs() < 0x10000 {
+                    format!("{}", w as i32)
+                } else {
+                    format!("{f}")
+                }
+            })
+            .collect();
+        println!("reverb {}: {}", r.name, words.join(" "));
+    }
     for (p, e) in fev.events() {
         if filter.is_some_and(|f| !p.to_lowercase().contains(&f.to_lowercase())) {
             continue;
         }
         println!(
-            "{}/{p}: {} vol {:.3} pitch {:.2} {} dist {}..{} fade {}/{} ms cat {:?}",
+            "{}/{p}: {} vol {:.3} pitch {:.2} {} dist {}..{} fade {}/{} ms reverb {}/{} cat {:?}",
             fev.name,
             if e.kind_flags == 0x10 {
                 "simple"
@@ -234,6 +279,8 @@ pub fn fev(path: &Path, filter: Option<&str>, check: bool) -> Result<()> {
             e.max_distance,
             e.fade_in_ms,
             e.fade_out_ms,
+            e.reverb_dry,
+            e.reverb_wet,
             e.categories
         );
         if let EventBody::Complex { parameters, .. } = &e.body {

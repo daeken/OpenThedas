@@ -161,6 +161,9 @@ impl Sim {
             | crate::inventory::MSG_NEXT_CHARACTER
             | crate::inventory::MSG_PREVIOUS_CHARACTER => self.inventory_message(name, args),
             crate::store::MSG_BUY | crate::store::MSG_SELL => self.store_message(name, args),
+            crate::container::MSG_ACQUIRE
+            | crate::container::MSG_ACQUIRE_ALL
+            | crate::container::MSG_CLOSED => self.container_message(name, args),
             MSG_PICKER_SUBMIT => self.party_picker_submit(),
             MSG_PICKER_CLEAR => self.party_picker_clear(),
             MSG_PICKER_UNSELECT => args

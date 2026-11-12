@@ -201,6 +201,17 @@ pub struct Conversation {
     /// it: the conversation walks on through them (single unspoken replies) as it speaks.
     #[serde(default)]
     pub cut_lines_left: u32,
+    /// The creatures the shown line's own cutscene took, and where it leaves them when the
+    /// line ends (see [`crate::cutactors`]).
+    #[serde(default)]
+    pub staged: Vec<crate::cutactors::Bound>,
+    /// Where the shown line's own cutscene plays.
+    #[serde(default)]
+    pub staged_at: Option<crate::cuttracks::Placement>,
+    /// Played out around the player without the dialog screen (see
+    /// [`Sim::start_conversation`]): its lines stage nobody.
+    #[serde(default)]
+    pub ambient_run: bool,
 }
 
 /// An open conversation as presentation sees it: its dialog (resource name without
@@ -303,9 +314,14 @@ impl Sim {
 
     /// Speaks a line: runs its action and collects the replies.
     fn speak(&mut self, mut c: Conversation, line: usize) -> Conversation {
+        // The line shown before ends, and its cutscene with it.
+        self.end_line_staging(&mut c);
         let node = c.dlg.nodes[line].clone();
         self.mark_shown(&mut c, line);
         self.node_action(&node, c.owner);
+        if !c.ambient_run && !node.ambient {
+            self.begin_line_staging(&mut c, line);
+        }
         if let Some(cut) = node.cutscene.as_ref().filter(|_| !node.ambient) {
             // The line's cutscene plays (GameModeDialog 0x7f1d46 -> 0x690b70); the lines it
             // says of this conversation are walked as it is spoken.
@@ -371,6 +387,59 @@ impl Sim {
         c.ended = replies.is_empty();
         c.replies = replies;
         c
+    }
+
+    /// Where conversation `c`'s line `line` plays its cutscene `tracks` (see
+    /// [`crate::cutactors`]): on the line's stage when the cutscene was made on one, else
+    /// where it was made. `None` when the stage is not in the area.
+    pub fn line_context(
+        &mut self,
+        c: &Conversation,
+        line: usize,
+        tracks: &crate::cuttracks::Tracks,
+    ) -> Option<crate::cutactors::LineContext> {
+        let cuts = self.conversation_line_cuts(&c.dlg.name);
+        let lc = cuts.get(line)?;
+        let speaker = c
+            .dlg
+            .nodes
+            .get(line)
+            .map(|n| n.speaker.trim_end_matches('\0').to_string())
+            .filter(|s| !s.is_empty())
+            .and_then(|s| self.cutscene_actor_object(&s, Some(c.owner), Some(c.player)))
+            .unwrap_or(c.owner);
+        let placement = match tracks.stage_file {
+            Some(_) => {
+                self.conversation_placement(lc.stage.as_deref(), lc.unstaged, speaker, c.player)?
+            }
+            None => crate::cuttracks::Placement::NONE,
+        };
+        Some(crate::cutactors::LineContext {
+            owner: c.owner,
+            player: c.player,
+            unstaged: lc.unstaged,
+            placement,
+        })
+    }
+
+    /// Line `line`'s own cutscene starts: the creatures it stages are taken.
+    fn begin_line_staging(&mut self, c: &mut Conversation, line: usize) {
+        let cuts = self.conversation_line_cuts(&c.dlg.name);
+        let Some(tracks) = cuts.get(line).and_then(|l| l.tracks.clone()) else {
+            return;
+        };
+        let Some(ctx) = self.line_context(c, line, &tracks) else {
+            return;
+        };
+        c.staged = self.bind_cutscene_actors(&tracks, Some(ctx));
+        c.staged_at = Some(ctx.placement);
+    }
+
+    /// The shown line's own cutscene ends: the creatures it took stay on their marks.
+    fn end_line_staging(&mut self, c: &mut Conversation) {
+        let staged = std::mem::take(&mut c.staged);
+        c.staged_at = None;
+        self.release_cutscene_actors(staged);
     }
 
     /// How many lines of conversation `dlg` cutscene `cut` says (its `ASLN` tracks naming
@@ -441,19 +510,39 @@ impl Sim {
             chain: Vec::new(),
             cut_from: None,
             cut_lines_left: 0,
+            staged: Vec::new(),
+            staged_at: None,
+            ambient_run: false,
         };
         let start = d.starts.iter().copied().find(|&s| self.usable(&c, s));
+        // Between creatures outside the party it is an ambient conversation: it plays out
+        // around the player without waiting for them. Provisional: all at once.
+        let ambient_start = start.is_some_and(|s| d.nodes[s].ambient);
+        let ambient = |sim: &Self| {
+            let party = crate::engine::party_of(sim);
+            ambient_start || (!party.contains(&initiator) && !party.contains(&target))
+        };
+        let c = Conversation {
+            ambient_run: ambient(self),
+            ..c
+        };
         let c = match start {
             Some(s) => self.speak(c, s),
             None => Conversation { ended: true, ..c },
         };
-        // Between creatures outside the party it is an ambient conversation: it plays out
-        // around the player without waiting for them. Provisional: all at once.
-        let party = crate::engine::party_of(self);
-        let ambient_start = start.is_some_and(|s| d.nodes[s].ambient);
-        if ambient_start || (!party.contains(&initiator) && !party.contains(&target)) {
+        if ambient(self) {
+            let c = Conversation {
+                ambient_run: true,
+                staged: Vec::new(),
+                staged_at: None,
+                ..c
+            };
             self.run_ambient(c);
             return true;
+        }
+        // A conversation begun over another ends the other's line.
+        if let Some(mut old) = self.talk.take() {
+            self.end_line_staging(&mut old);
         }
         self.talk = Some(c);
         true
@@ -492,6 +581,8 @@ impl Sim {
             self.talk = Some(c);
             return self.dialog_state();
         };
+        // The line answered ends. Provisional: before the reply's action runs.
+        self.end_line_staging(&mut c);
         let node = c.dlg.nodes[reply].clone();
         self.mark_shown(&mut c, reply);
         self.node_action(&node, c.owner);
@@ -513,6 +604,20 @@ impl Sim {
             self.talk = Some(c);
         }
         self.dialog_state()
+    }
+
+    /// The shown line's own cutscene, for presentation: the conversation (resource name
+    /// without `.dlg`), the line, where its cutscene plays and the creatures it took.
+    pub fn line_staging(
+        &self,
+    ) -> Option<(
+        &str,
+        usize,
+        crate::cuttracks::Placement,
+        &[crate::cutactors::Bound],
+    )> {
+        let c = self.talk.as_ref()?;
+        Some((c.dlg.name.as_str(), c.line?, c.staged_at?, &c.staged))
     }
 
     /// The open conversation, for presentation.
@@ -561,7 +666,9 @@ impl Sim {
     }
 
     pub fn end_conversation(&mut self) {
-        self.talk = None;
+        if let Some(mut c) = self.talk.take() {
+            self.end_line_staging(&mut c);
+        }
     }
 }
 
@@ -661,6 +768,9 @@ mod tests {
             chain: vec![],
             cut_from: None,
             cut_lines_left: 0,
+            staged: Vec::new(),
+            staged_at: None,
+            ambient_run: false,
         });
         let c = sim.talk.take().unwrap();
         let c = sim.speak(c, 0);
@@ -715,6 +825,9 @@ mod tests {
                 chain: vec![],
                 cut_from: None,
                 cut_lines_left: 0,
+                staged: Vec::new(),
+                staged_at: None,
+                ambient_run: false,
             };
             let c = sim.speak(c, 0);
             sim.talk = Some(c);
@@ -759,6 +872,9 @@ mod tests {
             chain: vec![],
             cut_from: None,
             cut_lines_left: 0,
+            staged: Vec::new(),
+            staged_at: None,
+            ambient_run: false,
         };
         assert!(sim.usable(&c, 0) && sim.dialog_ambient);
         assert!(sim.usable(&c, 1) && !sim.dialog_ambient);
@@ -803,6 +919,9 @@ mod tests {
             chain: vec![],
             cut_from: None,
             cut_lines_left: 0,
+            staged: Vec::new(),
+            staged_at: None,
+            ambient_run: false,
         };
         let c = sim.speak(c, 0);
         assert_eq!(c.cut_from, Some(0));

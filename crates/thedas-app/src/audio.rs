@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use thedas_audio::area::{AreaSound, area_audio};
+use thedas_audio::area::{AreaReverb, AreaSound, area_audio, area_reverb};
 use thedas_audio::{AudioEngine, EventHandle, Library, PlayOptions, Volumes};
 use thedas_formats::anim::AnimEventText;
 use thedas_vfs::Vfs;
@@ -43,7 +43,14 @@ pub struct Gear {
     pub armour: Option<i32>,
     pub main: Option<i32>,
     pub off: Option<i32>,
-    pub combat: bool,
+    /// The creature's footstep column in `sound_movement_footsteps.gda` (a column hash:
+    /// its appearance's footstep type).
+    pub footstep: Option<u32>,
+    /// The ground under it: sound material (low nibble), vegetation (high nibble).
+    pub surface: u8,
+    /// Its size column (`Small`, `Medium`, `Large` as a column hash: its appearance's
+    /// `apr_base.gda` column 0xc7cb6561, 0x6a0a1f).
+    pub size: Option<u32>,
 }
 
 /// A party-picker member: id, template, sound set, position.
@@ -65,7 +72,7 @@ pub struct AudioState {
     /// length, position (see `Live::animation_clocks`).
     pub animations: Vec<(u32, String, f32, f32, [f32; 3])>,
     /// What the animated creatures wear and wield, for their animations' foley and swings:
-    /// id -> (body armour, main-hand, off-hand base items, in combat).
+    /// id -> (body armour, main-hand, off-hand base items, footstep column, ground).
     pub gear: std::collections::HashMap<u32, Gear>,
     /// Attacks' blows: (target position, result, attacker's weapon, target's armour and
     /// shield base items).
@@ -93,6 +100,8 @@ pub struct AudioState {
     pub dead: bool,
     /// Where the listener is (between the party leader and the camera) and its right.
     pub listener: Option<([f32; 3], [f32; 3])>,
+    /// Where the party leader stands (reverb triggers follow it).
+    pub leader: Option<[f32; 3]>,
     /// The area's sound objects the simulation has switched off (`ActivateSoundByTag`), by
     /// tag (lowercase).
     pub inactive_sounds: Vec<String>,
@@ -152,6 +161,9 @@ struct AreaPlay {
     /// Per sound: playing (`Some(Some)`), played through while in reach (`Some(None)`: it
     /// plays again once the listener has left and come back), or not started.
     playing: Vec<Option<Option<EventHandle>>>,
+    reverb: AreaReverb,
+    /// The reverb preset applied (`None` until the first).
+    preset: Option<String>,
 }
 
 /// A cutscene's sound tracks and which of them are playing.
@@ -180,9 +192,16 @@ pub struct GameAudio {
     anim_events: std::collections::HashMap<String, Arc<Vec<AnimEventText>>>,
     /// Each creature's animation and time last frame.
     anim_clocks: std::collections::HashMap<u32, (String, f32)>,
-    /// `sound_movement_footsteps.gda` row 0 (no surface known): the humanoid and dog
-    /// footstep events.
-    footsteps: (Option<String>, Option<String>),
+    /// `sound_movement_footsteps.gda` (rows: ground material; columns: footstep type) and
+    /// `sound_movement_scuffing.gda` (rows: ground material).
+    footsteps: Option<thedas_formats::Gda>,
+    scuffs: Option<thedas_formats::Gda>,
+    /// `sound_vegetation_type.gda`, worksheet 155 "Sound Movement Vegetation" (rows:
+    /// vegetation; columns: size `small`/`medium`/`large`).
+    vegetation: Option<thedas_formats::Gda>,
+    /// Per creature: where it last rustled through vegetation and the squared distance it
+    /// must move from there to rustle again.
+    rustles: std::collections::HashMap<u32, ([f32; 3], f32)>,
     /// Weapon impacts: each base item's sound material (`BITM_base.gda`), and each weapon
     /// material's impact events (`sound_weapon_hits.gda`).
     impacts: Impacts,
@@ -200,37 +219,50 @@ pub struct GameAudio {
     picker_lines: std::collections::HashMap<String, (i32, i32)>,
     /// Who the open party picker had picked last frame, and when it last spoke.
     picked: Option<Vec<u32>>,
-    picker_spoke: Instant,
+    /// Seconds of frame time since the picker last spoke.
+    picker_spoke: f32,
     /// Creature templates' sound sets (`.utc` `SoundSet`), for creatures that do not carry
     /// theirs (from a save made before the simulation kept it).
     template_sets: std::collections::HashMap<String, Option<String>>,
     last: Instant,
 }
 
-/// `sound_movement_footsteps.gda`'s first row (surface unknown): the small humanoid's and the
-/// dog's footstep events. Provisional: the walkmesh's surface and the creature's footstep
-/// type (the other rows and columns) are not chosen yet.
-fn footstep_events(vfs: &Vfs) -> (Option<String>, Option<String>) {
-    let Ok((data, _)) = vfs.read("sound_movement_footsteps.gda") else {
-        return (None, None);
+/// `apr_base.gda`'s footstep type column (DAOrigins.exe 0x6a098a).
+pub const APR_FOOTSTEP: u32 = 0xda48_e219;
+/// `apr_base.gda`'s sound size column (0x6a0a1f): `Small`, `Medium`, `Large`.
+pub const APR_SIZE: u32 = 0xc7cb_6561;
+/// `sound_movement_scuffing.gda`'s event column (0x5b8d5f).
+const COL_SCUFF: u32 = 0xb449_8545;
+
+/// A creature's footstep column: its appearance's footstep type (`HUMANOID_SMALL`, `DOG`,
+/// ...), trimmed, `Unknown` when the row has none, as a column hash (DAOrigins.exe
+/// 0x6a096e..0x6a09dc).
+pub fn footstep_column(cell: Option<&thedas_formats::gda::Cell>) -> u32 {
+    let name = match cell {
+        Some(thedas_formats::gda::Cell::String(s)) => {
+            s.trim_matches(|c| c == '\0' || c == ' ' || c == '\t')
+        }
+        _ => "Unknown",
     };
-    let Ok(gda) = thedas_formats::Gda::parse(&data) else {
-        return (None, None);
-    };
-    let Some(row) = gda.row_by_id(0) else {
-        return (None, None);
-    };
-    let events: Vec<String> = row
-        .iter()
-        .filter_map(|c| match c {
-            thedas_formats::gda::Cell::String(s) if s.contains('/') => {
-                Some(s.trim_end_matches('\0').trim().to_string())
-            }
-            _ => None,
-        })
-        .collect();
-    let find = |part: &str| events.iter().find(|e| e.contains(part)).cloned();
-    (find("/humanoid/small/"), find("/dog/"))
+    thedas_formats::gda::column_hash(name)
+}
+
+fn read_gda(vfs: &Vfs, name: &str) -> Option<thedas_formats::Gda> {
+    vfs.read(name)
+        .ok()
+        .and_then(|(d, _)| thedas_formats::Gda::parse(&d).ok())
+}
+
+/// The event in row `row`, column `col` (by hash) of a sound table, if any.
+fn table_event(t: &thedas_formats::Gda, row: i64, col: u32) -> Option<String> {
+    let c = t.columns.iter().position(|c| c.hash == col)?;
+    match t.row_by_id(row)?.get(c)? {
+        thedas_formats::gda::Cell::String(s) => {
+            let s = s.trim_end_matches('\0').trim();
+            (!s.is_empty()).then(|| s.to_string())
+        }
+        _ => None,
+    }
 }
 
 /// `ss_types.gda`: each sound set type (1 COMBAT ATTACK, 2 COMBAT BATTLE CRY, ...) with the
@@ -270,8 +302,8 @@ struct Foley {
 }
 
 const COL_SWISH: u32 = 0xa334_7e2b;
-const COL_SMALL: u32 = 0xce0a_5368;
-const COL_MEDIUM: u32 = 0x0d0e_d12a;
+/// `sound_movement_footsteps.gda`'s `HUMANOID_SMALL` column.
+const COL_HUMANOID_SMALL: u32 = 0x787a_7bc5;
 
 impl Foley {
     fn read(vfs: &Vfs) -> Foley {
@@ -540,7 +572,10 @@ impl GameAudio {
             vfs: vfs.clone(),
             anim_events: Default::default(),
             anim_clocks: Default::default(),
-            footsteps: footstep_events(vfs),
+            footsteps: read_gda(vfs, "sound_movement_footsteps.gda"),
+            scuffs: read_gda(vfs, "sound_movement_scuffing.gda"),
+            vegetation: read_gda(vfs, "sound_vegetation_type.gda"),
+            rustles: Default::default(),
             impacts: Impacts::read(vfs),
             foley: Foley::read(vfs),
             music_state: 1.0,
@@ -550,7 +585,7 @@ impl GameAudio {
             template_sets: Default::default(),
             picker_lines: picker_lines(vfs),
             picked: None,
-            picker_spoke: Instant::now(),
+            picker_spoke: f32::INFINITY,
             last: Instant::now(),
         }
     }
@@ -662,15 +697,54 @@ impl GameAudio {
 
     /// Animations' sound events: as a creature's animation passes an event, kind 20 plays the
     /// event it names (weapon swings, creature noises: `glo_fly_wep/...`) and kind 14 a
-    /// footstep (see [`footstep_events`]) where the creature stands. Provisional: events on
-    /// the frame an animation starts are those at its time 0 onward; footsteps sound for
-    /// humanoids and dogs only.
+    /// footstep for the ground under the creature where it stands.
+    ///
+    /// DAOrigins.exe gates footsteps and armour foley (0x7c4a80): a small or medium
+    /// creature (+0x934 `Small`/`Medium`) whose model is at its lowest level of detail
+    /// (AnimBase +0x150 == 3: four levels, 0x617020 falls back between them) makes neither,
+    /// except in dialog or a cutscene (game modes 4, 5). Only drawn creatures' animations
+    /// reach here, which stands for that. Provisional: events on the frame an animation
+    /// starts are those at its time 0 onward.
     fn follow_animations(
         &mut self,
         clocks: Vec<(u32, String, f32, f32, [f32; 3])>,
         gear: &std::collections::HashMap<u32, Gear>,
     ) {
         let mut seen = std::collections::HashMap::new();
+        // Vegetation (DAOrigins.exe 0x6a5510, run as a creature moves): once it is a
+        // random 0.89..1.09 m (squared: `rand() % 100 * 0.004 + 0.8`) from where it last
+        // rustled, standing in vegetation (the ground's high nibble) plays
+        // `sound_vegetation_type.gda`'s (worksheet 155) event for that vegetation in its size
+        // column.
+        // Provisional: a creature first seen here starts from where it stands (the exe
+        // starts every creature from the origin with 1.0, 0x6b42f2).
+        let mut rustled = std::collections::HashMap::new();
+        for (id, _, _, _, pos) in &clocks {
+            let g = gear.get(id).copied().unwrap_or_default();
+            let (last, reach) = self.rustles.get(id).copied().unwrap_or((*pos, 1.0));
+            let d2: f32 = (0..3).map(|i| (pos[i] - last[i]).powi(2)).sum();
+            let veg = (g.surface >> 4) as i64;
+            if d2 < reach || veg == 0 {
+                rustled.insert(*id, (last, reach));
+                continue;
+            }
+            let event = match (&self.vegetation, g.size) {
+                (Some(t), Some(col)) => table_event(t, veg, col),
+                _ => None,
+            };
+            if let Some(event) = event {
+                self.engine.play(
+                    &event,
+                    PlayOptions {
+                        position: Some(*pos),
+                        ..Default::default()
+                    },
+                );
+            }
+            let reach = (self.random() % 100) as f32 * 0.004 + 0.8;
+            rustled.insert(*id, (*pos, reach));
+        }
+        self.rustles = rustled;
         for (id, ani, t, length, pos) in clocks {
             let key = ani.to_ascii_lowercase();
             let prev = self.anim_clocks.get(&id).cloned();
@@ -723,35 +797,38 @@ impl GameAudio {
                     }
                     // Armour foley (0x69e7f0): `sound_movement_foley.gda`'s column the event
                     // names (`Small`, `Medium`, `Large`) for the armour's sound material
-                    // (none: row 0). Gated as 0x7c4a80 gates it: a small or medium creature
-                    // sounds it only in combat. Provisional: the creature's own size class
-                    // (+0x934) is taken from the column, and "in combat" stands for its
-                    // state 3.
+                    // (none: row 0).
                     (17, Some(size)) => {
                         let g = gear.get(&id).copied().unwrap_or_default();
                         let col = thedas_formats::gda::column_hash(size.trim());
-                        let small_or_medium = col == COL_SMALL || col == COL_MEDIUM;
-                        if small_or_medium && !g.combat {
-                            None
-                        } else {
-                            let m = self.impacts.material(g.armour).unwrap_or(0);
-                            self.foley.cell("movement", Some(m), col)
-                        }
+                        let m = self.impacts.material(g.armour).unwrap_or(0);
+                        self.foley.cell("movement", Some(m), col)
                     }
-                    (14, Some(tags)) if tags.contains("Left") => {
-                        if key.starts_with("c_dog") {
-                            self.footsteps.1.clone()
-                        } else if is_humanoid(&key) {
-                            self.footsteps.0.clone()
+                    // A footstep (0x6aaaa0 -> 0x5b8d51): the ground's material under the
+                    // creature picks the row; an event marked `|Scuff` plays the scuffing
+                    // table's event, any other the footstep table's in the creature's
+                    // footstep column.
+                    // A material the table has no row for (13, Metal) plays nothing, as
+                    // the exe's lookup fails (0x5b8d92).
+                    (14, text) => {
+                        let g = gear.get(&id).copied().unwrap_or_default();
+                        let row = (g.surface & 0xf) as i64;
+                        if text.as_deref().is_some_and(|t| t.contains("|Scuff")) {
+                            self.scuffs
+                                .as_ref()
+                                .and_then(|t| table_event(t, row, COL_SCUFF))
                         } else {
-                            None
+                            let col = g.footstep.unwrap_or(COL_HUMANOID_SMALL);
+                            self.footsteps
+                                .as_ref()
+                                .and_then(|t| table_event(t, row, col))
                         }
                     }
                     _ => None,
                 };
                 if let Some(event) = event {
                     log::trace!(
-                        "audio: {key} {:?} -> {t:.3} (len {length:.3}): event at {:.3}",
+                        "audio: {key} {:?} -> {t:.3} (len {length:.3}): {event} at {:.3}",
                         prev.as_ref().map(|p| p.1),
                         ev.time
                     );
@@ -825,9 +902,13 @@ impl GameAudio {
     pub fn set_area(&mut self, resref: &str, data: &[u8]) {
         self.end_area();
         let (theme, sounds) = area_audio(data);
+        let reverb = area_reverb(data);
         log::info!(
-            "audio: area {resref}: music {theme:?}, {} placed sounds",
-            sounds.len()
+            "audio: area {resref}: music {theme:?}, {} placed sounds, reverb {:?} and {} \
+             reverb triggers",
+            sounds.len(),
+            reverb.preset,
+            reverb.triggers.len()
         );
         let n = sounds.len();
         self.area = Some(AreaPlay {
@@ -836,11 +917,17 @@ impl GameAudio {
             track: None,
             sounds,
             playing: vec![None; n],
+            reverb,
+            preset: None,
         });
     }
 
     fn end_area(&mut self) {
         if let Some(a) = self.area.take() {
+            if a.preset.is_some() {
+                self.engine
+                    .set_reverb(thedas_formats::fev::ReverbProperties::OFF, 0.0);
+            }
             for h in a
                 .playing
                 .into_iter()
@@ -909,6 +996,20 @@ impl GameAudio {
                     log::debug!("audio: no music {theme}/{want}");
                 }
             }
+        }
+        // The reverb: the area's preset, or a reverb trigger's while the party leader is in
+        // it, faded over 0.33 s (DAOrigins.exe 0xaff1c8; set at once on arrival).
+        let at = state.leader.or(state.listener.map(|l| l.0));
+        let want = at.map_or(a.reverb.preset.as_str(), |p| a.reverb.preset_at(p));
+        if a.preset.as_deref() != Some(want) {
+            let props = self.engine.reverb_preset(want).unwrap_or_else(|| {
+                log::debug!("audio: no reverb preset {want:?}");
+                thedas_formats::fev::ReverbProperties::OFF
+            });
+            let fade = if a.preset.is_some() { 0.33 } else { 0.0 };
+            log::debug!("audio: reverb {want:?} over {fade} s");
+            self.engine.set_reverb(props, fade);
+            a.preset = Some(want.to_string());
         }
         let Some((listener, _)) = state.listener else {
             return;
@@ -1114,6 +1215,7 @@ impl GameAudio {
         // The party picker (DAOrigins.exe 0x766040, 0x7661b0): picking a follower has it say
         // its picked line, unpicking its unpicked line, at most one every 0.1 s
         // (0xc0d718), always (probability 1).
+        self.picker_spoke += dt;
         match state.picker.take() {
             Some(members) => {
                 let ids: Vec<u32> = members.iter().map(|m| m.0).collect();
@@ -1130,7 +1232,7 @@ impl GameAudio {
                         )
                         .next();
                     if let Some(((_, template, set, at), picked)) = changed
-                        && self.picker_spoke.elapsed().as_secs_f32() > 0.1
+                        && self.picker_spoke > 0.1
                         && let Some(set) = set
                     {
                         let lines = self
@@ -1141,7 +1243,7 @@ impl GameAudio {
                         if let Some((yes, no)) = lines {
                             let entry = if picked { yes } else { no };
                             state.sound_sets.push((set.clone(), entry, 1.0, Some(*at)));
-                            self.picker_spoke = Instant::now();
+                            self.picker_spoke = 0.0;
                         }
                     }
                 }
@@ -1227,15 +1329,6 @@ impl GameAudio {
     }
 }
 
-/// Whether an animation resource is a humanoid's: the shared humanoid animations are
-/// `mh.*` / `fh.*` (male, female) and their variants `mh_*`, `fh_*`, and cutscene actors
-/// `cs_*`. Provisional (from the resource names).
-fn is_humanoid(ani: &str) -> bool {
-    ["mh.", "mh_", "fh.", "fh_", "cs_", "csmale"]
-        .iter()
-        .any(|p| ani.starts_with(p))
-}
-
 /// The options screen's volumes (`ClientOptions.AudioOptions.*`, 0..10, with their disable
 /// switches) as gains, as DAOrigins.exe turns them into category volumes: a slider at `x`
 /// is `-3 * (10 - x)` dB (0x5b61b0: 10 and above full, below 0.01 or disabled -60 dB), then
@@ -1283,11 +1376,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn humanoid_animations_by_name() {
-        assert!(is_humanoid("mh.walk.ani"));
-        assert!(is_humanoid("fh_c.attk_v1.ani"));
-        assert!(!is_humanoid("c_dog.cwalkf.ani"));
-        assert!(!is_humanoid("ip_dbldoor.open.ani"));
+    fn footstep_columns_come_from_the_appearance_type() {
+        use thedas_formats::gda::Cell;
+        let col = |v: &str| footstep_column(Some(&Cell::String(v.into())));
+        assert_eq!(col("HUMANOID_SMALL\t "), COL_HUMANOID_SMALL);
+        assert_eq!(col("DOG"), thedas_formats::gda::column_hash("dog"));
+        assert_eq!(
+            footstep_column(None),
+            thedas_formats::gda::column_hash("Unknown")
+        );
     }
 
     #[test]

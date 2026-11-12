@@ -333,6 +333,29 @@ pub struct Effect {
     pub engine_vectors: Vec<(i32, [f32; 3])>,
 }
 
+/// A visual effect applied at a place (`Engine_ApplyEffectAtLocation` with an
+/// `EffectVisualEffect`, type 4): what rendering draws, such as the Proving's crowd. The
+/// simulation only keeps it: it adds the entry when a script applies the effect and drops it
+/// when it runs out or a script removes it from the area.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LocationVfx {
+    /// A stable id, to tell entries apart from frame to frame.
+    pub handle: u64,
+    /// The effect's `VFX_base` row (its integer 0), as the script passed it.
+    pub vfx: i32,
+    pub area: ObjectId,
+    pub position: [f32; 3],
+    /// Degrees, as objects use.
+    pub facing: f32,
+    /// World time it was applied.
+    pub started_ms: u64,
+    /// `None` while it lasts until removed.
+    pub duration_ms: Option<u64>,
+    /// The effect as the script made it, so `GetEffects` on the area finds it and
+    /// `RemoveEffect` can take it away.
+    pub effect: Effect,
+}
+
 /// The open party picker: the followers picked so far (at most three), in order.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PartyPicker {
@@ -577,9 +600,18 @@ pub struct World {
     /// The job board on screen (`ShowChantersGUI`).
     #[serde(default)]
     pub chanter_board: Option<crate::chanters::ChanterBoard>,
+    /// The container being looted (`OpenInventory`, see [`crate::container`]).
+    #[serde(default)]
+    pub container: Option<ObjectId>,
     /// The store whose screen is open (`OpenStore`).
     #[serde(default)]
     pub store: Option<ObjectId>,
+    /// Visual effects applied at places (see [`LocationVfx`]).
+    #[serde(default)]
+    pub location_vfx: Vec<LocationVfx>,
+    /// The next [`LocationVfx::handle`].
+    #[serde(default)]
+    pub next_vfx: u64,
     /// The world map (see `worldmap`).
     #[serde(default)]
     pub world_map: crate::worldmap::WorldMapState,
@@ -711,7 +743,10 @@ impl World {
             dialog_shown: Default::default(),
             story_events: Vec::new(),
             popup: None,
+            container: None,
             store: None,
+            location_vfx: Vec::new(),
+            next_vfx: 0,
             chanter_board: None,
             plot_actions: PlotActions::default(),
             party_choice: None,

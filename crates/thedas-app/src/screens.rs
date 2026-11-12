@@ -145,6 +145,9 @@ pub fn wanted(sim: &Sim, menu: Option<Screen>) -> BTreeSet<Screen> {
         }
     } else if w.store.is_some() {
         Screen::Store
+    } else if w.container.is_some() {
+        // A container being looted shows on the inventory screen (its container panel).
+        Screen::Inventory
     } else if w.chanter_board.is_some() {
         Screen::Chanters
     } else if w.world_map.open {
@@ -386,6 +389,8 @@ mod tests {
             lines: Vec::new(),
             elapsed_ms: 0,
             from_dialog: false,
+            bound: Vec::new(),
+            placement: None,
         });
         assert_eq!(
             wanted(&sim, Some(Screen::Inventory)),
