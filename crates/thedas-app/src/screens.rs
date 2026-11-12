@@ -35,6 +35,7 @@ pub enum Screen {
     CharGen,
     Journal,
     Options,
+    ItemExamine,
 }
 
 impl Screen {
@@ -66,6 +67,8 @@ impl Screen {
             Screen::Journal => &["journal.gfx"],
             // Settings that need confirming (a new resolution) ask on the popup layer.
             Screen::Options => &["optionsmenu.gfx", "popuplayer.gfx"],
+            // Over the screen it was opened from (see `with_examine`).
+            Screen::ItemExamine => &["itemexamine.gfx"],
         }
     }
 
@@ -114,6 +117,23 @@ pub fn wanted(sim: &Sim, menu: Option<Screen>) -> BTreeSet<Screen> {
         Screen::Hud
     };
     BTreeSet::from([screen])
+}
+
+/// `want` with the examine screen over it, while an item is being examined from a screen
+/// that shows items (the inventory, the character record, a store). DAOrigins.exe opens it
+/// over the screen as the game's `GUI_ITEM_EXAMINE` (58) screen. Provisional: which screens
+/// it may stand over is taken from where the movies offer an inspect action.
+pub fn with_examine(mut want: BTreeSet<Screen>, examining: bool) -> BTreeSet<Screen> {
+    let from = want.iter().any(|s| {
+        matches!(
+            s,
+            Screen::Inventory | Screen::CharacterRecord | Screen::Store
+        )
+    });
+    if examining && from {
+        want.insert(Screen::ItemExamine);
+    }
+    want
 }
 
 #[derive(Default)]
