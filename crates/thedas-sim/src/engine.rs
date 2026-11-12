@@ -624,6 +624,19 @@ pub fn call(
                 "DisplayFloatyMessage" | "DisplayPortraitMessage" => (-1, string(a, 1)),
                 _ => (0, string(a, 0)),
             };
+            if name == "DisplayFloatyMessage" {
+                // Kept short when nothing takes them (a headless run).
+                if h.sim.world.floaties.len() >= 64 {
+                    h.sim.world.floaties.remove(0);
+                }
+                h.sim.world.floaties.push(crate::world::FloatyMessage {
+                    target: obj(a, 0),
+                    text: text.clone(),
+                    style: int(a, 2),
+                    colour: int(a, 3),
+                    duration: float(a, 4),
+                });
+            }
             if name == "Warning" {
                 let key: String = text.chars().take(160).collect();
                 *h.sim.world.trace.warnings.entry(key).or_default() += 1;

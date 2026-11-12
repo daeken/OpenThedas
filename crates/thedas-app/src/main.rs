@@ -542,11 +542,13 @@ fn play_interface(
         (Some(screens), Some(live)) => {
             let level = live.level.as_ref();
             ui.set_level(level.map(|l| l.layout.as_str()), level.map(|l| &l.vfs));
+            ui.set_paused(live.paused);
             for aim in ui.play(screens, &live.sim, dt.min(100.0)) {
                 log::info!("aiming ability {} (click a target)", aim.ability);
                 live.aiming = Some(aim);
             }
             ui.update_minimap(&live.sim, camera);
+            ui.update_floaties(&live.sim, camera, dt.min(100.0));
         }
         _ => {
             for call in ui.tick(dt.min(100.0)) {
@@ -1337,6 +1339,12 @@ impl App {
                 }
                 log.push("the party falls".into());
             }
+            Step::Floaty(text) => {
+                if let Some(l) = self.live.as_ref() {
+                    test_floaty(&mut l.sim(), text);
+                }
+                log.push(format!("floaty {text:?}"));
+            }
             &Step::Menu(m) => {
                 self.key_down(match m {
                     screens::Screen::CharacterRecord => KeyCode::KeyC,
@@ -2061,6 +2069,9 @@ enum Step {
     /// A game controller's stick is pushed (x, y; +y up): `pad stick-left 0,1 500` holds it
     /// there for a `run` of 500 ms, then lets go.
     PadStick(pad::Stick, f32, f32),
+    /// A floating message over the controlled creature, as a script's
+    /// `DisplayFloatyMessage` makes one (`floaty 12`), for trying the floaty layer headless.
+    Floaty(String),
 }
 
 /// A `pad` step: a button by name (pressed and let go), `press`/`release` and a button, or
@@ -2128,6 +2139,20 @@ fn menu_key(code: KeyCode) -> Option<screens::Screen> {
     }
 }
 
+/// A floating message over the controlled creature (the `floaty` step): white, the default
+/// style, two seconds.
+fn test_floaty(sim: &mut thedas_sim::Sim, text: &str) {
+    if let Some(target) = sim.world.controlled() {
+        sim.world.floaties.push(thedas_sim::world::FloatyMessage {
+            target,
+            text: text.to_string(),
+            style: 0,
+            colour: 0xffffff,
+            duration: 2.0,
+        });
+    }
+}
+
 /// Every party member falls (the `wipe` step): what a lost fight leaves, for the death screen.
 fn wipe(sim: &mut thedas_sim::Sim) {
     for m in thedas_sim::engine::party_of(sim) {
@@ -2158,6 +2183,7 @@ fn parse_step(s: &str) -> Result<Step> {
             Step::Click(x.trim().parse()?, y.trim().parse()?)
         }
         "run" => Step::Run(arg.parse().context("run takes milliseconds")?),
+        "floaty" => Step::Floaty(arg.to_string()),
         "key" if arg.eq_ignore_ascii_case("i") => Step::Menu(screens::Screen::Inventory),
         "key" if arg.eq_ignore_ascii_case("c") => Step::Menu(screens::Screen::CharacterRecord),
         "key" if arg.eq_ignore_ascii_case("t") => Step::Menu(screens::Screen::Tactics),
@@ -2469,11 +2495,13 @@ fn main() -> Result<()> {
                                     let shot = l.paperdoll(&ctx, who, yaw, w, h);
                                     layer.set_paperdoll(shot);
                                 }
+                                layer.set_paused(l.paused);
                                 if let Some(aim) = layer.play(s, &l.sim, dt).pop() {
                                     println!("aiming ability {}", aim.ability);
                                     l.aiming = Some(aim);
                                 }
                                 layer.update_minimap(&l.sim, &camera);
+                                layer.update_floaties(&l.sim, &camera, dt);
                                 ui_time += t.elapsed();
                             }
                             frames += 1;
@@ -2520,6 +2548,10 @@ fn main() -> Result<()> {
                     Step::Wipe => {
                         wipe(&mut l.sim());
                         println!("the party falls");
+                    }
+                    Step::Floaty(text) => {
+                        test_floaty(&mut l.sim(), text);
+                        println!("floaty {text:?}");
                     }
                     &Step::Menu(m) => {
                         if let Some((layer, s)) = played.as_mut() {

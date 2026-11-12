@@ -99,6 +99,8 @@ pub struct Presentation {
     pub paperdoll_yaw: f32,
     /// The item being examined (see [`Examine`]), while the examine screen is up.
     pub examine: Option<Examine>,
+    /// Whether the player paused the game (floatylayer.gfx's pause border).
+    pub paused: bool,
 }
 
 /// An item shown on the examine screen (itemexamine.gfx), as the screen that opened it asked
@@ -516,6 +518,11 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             num(e.check_requirements),
         );
     }
+    // The player's pause (Space): floatylayer.gfx plays its pause border while
+    // `Client.Paused` is on and its outro when it goes off with `Client.UserPaused` set.
+    // Provisional: every pause here is the player's own (the game also pauses for menus).
+    v.insert("Client.Paused".into(), num(u8::from(shown.paused)));
+    v.insert("Client.UserPaused".into(), num(u8::from(shown.paused)));
     // The difficulty, as character creation's difficulty prompt starts from it.
     v.insert(
         "ClientOptions.GameOptions.DifficultyLevel".into(),
