@@ -1645,6 +1645,15 @@ impl App {
             &Step::ZoomKey(dir) => {
                 self.zoom_key = dir;
             }
+            Step::Travel(tag) => {
+                if let Some(l) = self.live.as_ref() {
+                    let ok = travel_to_pin(&mut l.sim(), tag);
+                    log.push(format!(
+                        "travel {tag}: {}",
+                        if ok { "set out" } else { "no such active pin" }
+                    ));
+                }
+            }
             Step::Transition(area, waypoint) => {
                 if let Some(l) = self.live.as_ref() {
                     // As a script's DoAreaTransition does: performed at the start of the next
@@ -2912,6 +2921,19 @@ impl padplay::Host for HeadlessHost<'_> {
 /// the world map is open (travelling) the map itself stays up instead, as in the exe.
 /// Provisional: load_town.gfx for every load; the exe shows load_light.gfx for an area
 /// change within the same area list, which the app does not tell apart yet.
+/// Sets out on the world map to the map pin tagged `tag` (see [`Step::Travel`]).
+fn travel_to_pin(sim: &mut thedas_sim::Sim, tag: &str) -> bool {
+    let pin = sim
+        .world
+        .objects
+        .values()
+        .find(|o| {
+            o.kind == thedas_sim::world::ObjectKind::MapPin && o.tag.eq_ignore_ascii_case(tag)
+        })
+        .map(|o| o.id);
+    pin.is_some_and(|p| sim.begin_travel(p))
+}
+
 fn loading_screen(live: &live::Live, ui: &mut ui::UiLayer, up: &mut bool) {
     // THEDAS_NO_LOAD_MOVIE: no loading movie; a load shows the interface over black.
     if std::env::var_os("THEDAS_NO_LOAD_MOVIE").is_some() {
@@ -2927,7 +2949,16 @@ fn loading_screen(live: &live::Live, ui: &mut ui::UiLayer, up: &mut bool) {
             let hint = thedas_ui::binding::load_hint(&sim);
             drop(sim);
             let kind = live.load_screen().unwrap_or(ui::LoadScreen::Town);
-            log::info!("loading screen: {kind:?}");
+            // A world map journey's load keeps the map up in the exe (GUI 16); until the
+            // interface does that, the loading movie shows as for any other load.
+            log::info!(
+                "loading screen: {kind:?}{}",
+                if live.travel_load() {
+                    " (a world map journey)"
+                } else {
+                    ""
+                }
+            );
             ui.loading_begin(kind, hint);
             *up = true;
         }
@@ -3006,6 +3037,9 @@ enum Step {
     /// `transition AREA WAYPOINT`: the party moves to another area as a script's
     /// `DoAreaTransition` moves it (taken when the current scripts finish).
     Transition(String, String),
+    /// `travel PIN`: the party sets out on the world map to the pin with that tag, as
+    /// clicking it does (`Sim::begin_travel`).
+    Travel(String),
     /// `key pagedown MS` / `key pageup MS`: the zoom keys held (+1 in, -1 out, 0 let go).
     ZoomKey(f32),
     /// A floating message over the controlled creature, as a script's
@@ -3167,6 +3201,8 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
                 ms.trim().parse().context("a held key takes milliseconds")?,
             ));
             out.push(Step::ZoomKey(0.0));
+        } else if verb == "travel" && !arg.trim().is_empty() {
+            out.push(Step::Travel(arg.trim().to_string()));
         } else if verb == "transition" {
             let (area, waypoint) = arg
                 .trim()
@@ -3685,6 +3721,13 @@ fn main() -> Result<()> {
                         println!("option {k} = {v}");
                     }
                     &Step::ZoomKey(dir) => zoom_key = dir,
+                    Step::Travel(tag) => {
+                        let ok = travel_to_pin(&mut l.sim(), tag);
+                        println!(
+                            "travel {tag}: {}",
+                            if ok { "set out" } else { "no such active pin" }
+                        );
+                    }
                     Step::Transition(area, waypoint) => {
                         // As a script's DoAreaTransition does: performed at the start of the next
                         // update (`TRANSITION_DELAY_MS`).
