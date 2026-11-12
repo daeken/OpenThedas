@@ -46,6 +46,9 @@ pub struct Gear {
     pub combat: bool,
 }
 
+/// A party-picker member: id, template, sound set, position.
+pub type PickerMember = (u32, String, Option<String>, [f32; 3]);
+
 /// What the game is doing, as the sound follows it.
 #[derive(Clone, Debug, Default)]
 pub struct AudioState {
@@ -70,6 +73,12 @@ pub struct AudioState {
     /// Sound set lines to say: (set, `ss_types.gda` type, probability override (0: the
     /// type's own), where the speaker stands (none: 2D)).
     pub sound_sets: Vec<(String, i32, f32, Option<[f32; 3]>)>,
+    /// The party picker while it is open: each member picked (id, template, sound set,
+    /// position).
+    pub picker: Option<Vec<PickerMember>>,
+    /// The pool's followers (to say an unpicked one's line): id -> (id, template, sound set,
+    /// position).
+    pub picker_left: std::collections::HashMap<u32, PickerMember>,
     /// Events scripts played (`PlaySound`), with where the object stands (none: 2D).
     pub script_sounds: Vec<(String, Option<[f32; 3]>)>,
     /// Scripts' `SetMusicIntensity`, the latest this frame.
@@ -186,6 +195,12 @@ pub struct GameAudio {
     /// Each sound set's entries (`sse_<set>.gda`: entry row -> line strref), read once.
     sound_set_entries: std::collections::HashMap<String, Arc<Vec<(i64, i64)>>>,
     rng: u64,
+    /// `partypicker.gda`: each follower template's picked and unpicked sound set entries
+    /// ("default" for any other).
+    picker_lines: std::collections::HashMap<String, (i32, i32)>,
+    /// Who the open party picker had picked last frame, and when it last spoke.
+    picked: Option<Vec<u32>>,
+    picker_spoke: Instant,
     /// Creature templates' sound sets (`.utc` `SoundSet`), for creatures that do not carry
     /// theirs (from a save made before the simulation kept it).
     template_sets: std::collections::HashMap<String, Option<String>>,
@@ -295,6 +310,49 @@ impl Foley {
     fn cell(&self, table: &str, row: Option<i64>, column: u32) -> Option<String> {
         self.tables.get(table)?.get(&(row?, column)).cloned()
     }
+}
+
+/// `partypicker.gda`: per follower template (column 0x88578372), the sound set entries said
+/// when picked (0x50853e6b: 47 YES) and unpicked (0xfd7493a7: 54 CUSS), as the picker's
+/// code reads them (DAOrigins.exe 0x767a2a, 0x767a45); the `Default` row serves the rest.
+fn picker_lines(vfs: &Vfs) -> std::collections::HashMap<String, (i32, i32)> {
+    use thedas_formats::gda::Cell;
+    let mut out = std::collections::HashMap::new();
+    let Some(t) = vfs
+        .read("partypicker.gda")
+        .ok()
+        .and_then(|(d, _)| thedas_formats::Gda::parse(&d).ok())
+    else {
+        return out;
+    };
+    let col = |h: u32| t.columns.iter().position(|c| c.hash == h);
+    let (Some(tc), Some(lc), Some(sc), Some(uc)) = (
+        col(0x8857_8372),
+        col(0xb49c_a166),
+        col(0x5085_3e6b),
+        col(0xfd74_93a7),
+    ) else {
+        return out;
+    };
+    for row in &t.rows {
+        let text = |i: usize| match row.get(i) {
+            Some(Cell::String(s)) => s.trim_end_matches('\0').trim().to_ascii_lowercase(),
+            _ => String::new(),
+        };
+        let num = |i: usize| match row.get(i) {
+            Some(Cell::Int(v)) => *v as i32,
+            _ => 0,
+        };
+        let key = if text(lc) == "default" {
+            "default".to_string()
+        } else {
+            text(tc)
+        };
+        if !key.is_empty() && num(sc) > 0 {
+            out.insert(key, (num(sc), num(uc)));
+        }
+    }
+    out
 }
 
 /// What an attack's blow sounds like.
@@ -490,6 +548,9 @@ impl GameAudio {
             sound_set_entries: Default::default(),
             rng: 0x2545_f491_4f6c_dd1d,
             template_sets: Default::default(),
+            picker_lines: picker_lines(vfs),
+            picked: None,
+            picker_spoke: Instant::now(),
             last: Instant::now(),
         }
     }
@@ -1050,6 +1111,43 @@ impl GameAudio {
         // calls its sound set player (0x6b5740) only from the script command (0x6625c6), two
         // message handlers (0x60ba68, 0x6b75a0) and one timed system (0x7660f2, 0x766242);
         // nothing adds barks around each blow or on selection.
+        // The party picker (DAOrigins.exe 0x766040, 0x7661b0): picking a follower has it say
+        // its picked line, unpicking its unpicked line, at most one every 0.1 s
+        // (0xc0d718), always (probability 1).
+        match state.picker.take() {
+            Some(members) => {
+                let ids: Vec<u32> = members.iter().map(|m| m.0).collect();
+                if let Some(before) = self.picked.replace(ids.clone()) {
+                    let changed = members
+                        .iter()
+                        .filter(|m| !before.contains(&m.0))
+                        .map(|m| (m, true))
+                        .chain(
+                            before
+                                .iter()
+                                .filter(|b| !ids.contains(b))
+                                .filter_map(|b| state.picker_left.get(b).map(|m| (m, false))),
+                        )
+                        .next();
+                    if let Some(((_, template, set, at), picked)) = changed
+                        && self.picker_spoke.elapsed().as_secs_f32() > 0.1
+                        && let Some(set) = set
+                    {
+                        let lines = self
+                            .picker_lines
+                            .get(&template.to_ascii_lowercase())
+                            .or_else(|| self.picker_lines.get("default"))
+                            .copied();
+                        if let Some((yes, no)) = lines {
+                            let entry = if picked { yes } else { no };
+                            state.sound_sets.push((set.clone(), entry, 1.0, Some(*at)));
+                            self.picker_spoke = Instant::now();
+                        }
+                    }
+                }
+            }
+            None => self.picked = None,
+        }
         for (set, entry, probability, at) in std::mem::take(&mut state.sound_sets) {
             self.say_sound_set(&set, entry, probability, at);
         }
