@@ -2830,8 +2830,52 @@ impl Sim {
                     // long as its route at the mover's speed.
                     let pos = self.world.get(id).map(|o| o.position);
                     let mut path = Vec::new();
+                    let mut cmd = cmd;
+                    // Moving away from an object: to the point at the asked distance from it,
+                    // on the line from it through the mover (closer in when the mover is
+                    // farther off), as script.ldf describes the command. Provisional: the
+                    // exe's search round the target for a clear line of sight is not traced.
+                    if cmd.name == "CommandMoveAwayFromObject" {
+                        let away = cmd.seconds.max(0.0);
+                        let here = self.world.get(id).map(|o| (o.position, o.area, o.facing));
+                        let there = cmd
+                            .target
+                            .and_then(|t| self.world.get(t))
+                            .map(|o| o.position);
+                        if let (Some((p, Some(area), facing)), Some(t)) = (here, there) {
+                            let (dx, dy) = (p[0] - t[0], p[1] - t[1]);
+                            let len = (dx * dx + dy * dy).sqrt();
+                            let (dx, dy) = if len > 1e-3 {
+                                (dx / len, dy / len)
+                            } else {
+                                let h = crate::world::heading_of(facing).to_radians();
+                                (-h.cos(), -h.sin())
+                            };
+                            let to = [t[0] + dx * away, t[1] + dy * away, p[2]];
+                            cmd.location = Some(crate::world::Location {
+                                area,
+                                position: to,
+                                facing,
+                            });
+                            if let Some(c) =
+                                self.world.get_mut(id).and_then(|o| o.commands.first_mut())
+                            {
+                                c.location = cmd.location;
+                            }
+                        }
+                    }
                     let mut ms = attack_ms.unwrap_or_else(|| self.command_duration(id, &cmd));
-                    if cmd.name.starts_with("CommandMoveTo") {
+                    let walks = cmd.name.starts_with("CommandMoveTo")
+                        || cmd.name == "CommandMoveAwayFromObject";
+                    if cmd.name == "CommandMoveToMultiLocations" && !cmd.path.is_empty() {
+                        // Through the listed points in turn. Provisional: straight legs
+                        // between them, and a looping walk goes round once.
+                        path = cmd.path.clone();
+                        if let Some(p) = pos {
+                            ms = (path_length(p, &path) / self.command_speed(id, &cmd) * 1000.0)
+                                as u64;
+                        }
+                    } else if walks {
                         let to = cmd.location.map(|l| l.position).or_else(|| {
                             cmd.target
                                 .and_then(|t| self.world.get(t))
@@ -2855,7 +2899,9 @@ impl Sim {
                     let d = now + ms.max(1);
                     if let Some(c) = self.world.get_mut(id).and_then(|o| o.commands.first_mut()) {
                         c.due = Some(d);
-                        if c.name.starts_with("CommandMoveTo") {
+                        if c.name.starts_with("CommandMoveTo")
+                            || c.name == "CommandMoveAwayFromObject"
+                        {
                             c.from = pos.map(|p| (p, now));
                             c.path = path;
                         }
@@ -2936,6 +2982,12 @@ impl Sim {
                 ev.resources = vec![cmd.strings.first().cloned().unwrap_or_default()];
                 ev.objects = vec![id];
                 self.world.queue_event(0, t, ev, None);
+            }
+        } else if cmd.name == "CommandTurn" {
+            // Turns the object to the angle asked (script.ldf's CommandTurn). Provisional:
+            // the turn is done when the command is, with no turn rate.
+            if let Some(o) = self.world.get_mut(id) {
+                o.facing = cmd.seconds.rem_euclid(360.0);
             }
         } else if cmd.name == "CommandSwitchWeaponSet" {
             // The command's executor (DAOrigins.exe 0x7a1ed0) switches the set (0x6a8fa0)
@@ -5159,6 +5211,61 @@ mod tests {
         // Past the corner, only the last leg is left.
         let f = progress_of(from, &points, [5.2, 2.0, 0.0]);
         assert_eq!(remaining_points(from, &points, f), vec![points[1]]);
+    }
+
+    #[test]
+    fn move_away_turn_and_multi_location_commands_run() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let w = s.world.spawn(ObjectKind::Creature, "w");
+        let t = s.world.spawn(ObjectKind::Creature, "t");
+        for (id, p) in [(w, [2.0, 0.0, 0.0]), (t, [0.0, 0.0, 0.0])] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = p;
+        }
+        let cmd = |name: &str| Command {
+            ty: 1000,
+            name: name.into(),
+            target: None,
+            location: None,
+            seconds: 0.0,
+            ints: Vec::new(),
+            strings: Vec::new(),
+            due: None,
+            from: None,
+            approach: None,
+            ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
+            arrived: false,
+            path: Vec::new(),
+        };
+        // Away to 5 m from the target, on the line through the mover.
+        let mut c = cmd("CommandMoveAwayFromObject");
+        c.target = Some(t);
+        c.seconds = 5.0;
+        s.world.get_mut(w).unwrap().commands.push(c);
+        s.tick(5_000);
+        let p = s.world.get(w).unwrap().position;
+        assert!((p[0] - 5.0).abs() < 0.01 && p[1].abs() < 0.01, "{p:?}");
+        // A turn ends facing the angle asked.
+        let mut c = cmd("CommandTurn");
+        c.seconds = 270.0;
+        s.world.get_mut(w).unwrap().commands.push(c);
+        s.tick(1_000);
+        assert_eq!(s.world.get(w).unwrap().facing, 270.0);
+        // Through each listed point to the last.
+        let mut c = cmd("CommandMoveToMultiLocations");
+        c.path = vec![[5.0, 4.0, 0.0], [9.0, 4.0, 0.0]];
+        c.location = Some(crate::world::Location {
+            area,
+            position: [9.0, 4.0, 0.0],
+            facing: 0.0,
+        });
+        s.world.get_mut(w).unwrap().commands.push(c);
+        s.tick(10_000);
+        assert_eq!(s.world.get(w).unwrap().position, [9.0, 4.0, 0.0]);
     }
 
     #[test]

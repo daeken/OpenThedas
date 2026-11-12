@@ -1061,6 +1061,35 @@ The game ignores the file's `near` and `far` and computes its own per placement:
   the shapes are unchanged. The wind weights and matrix indices the computation assigns to
   vertices and leaves are not yet specified here.
 
+### 7.10 Clarifications (round 6)
+
+1. **N_l in 7.8 is the leaf LOD count** of 5.4 (the file's `leaf_lod_count`), without an extra
+   billboard level. (7.4's "N + 1 levels" describes the billboard as a further step beyond
+   the last level; the computation's constants use N_l itself.)
+2. **ℓ′ = ℓ − τ uses the full width τ**, not τ′. The asymmetry is the original's.
+3. **Billboard alpha** is 0 wherever 7.8 does not set it (ℓ ≥ 1, and the middle range
+   outside the shortened width).
+4. **`leaf_transition` absent** means smooth (1).
+5. **Defaults when absent:** `TreeInfo::seed` 1200, `flare_seed` 444. The trunk's groups and
+   the round-robin counter use the stored values (7.7), not the ≤ 1 rule.
+6. **Extrusion fronds:** a vertex built at guide vertex i takes guide vertex i's wind values,
+   even though its frame also uses i − 1.
+7. **Self-shadow coordinates (7.9):** c = (min + max)/2 per component, R = half the
+   Euclidean diagonal. A zero-size box divides 0 by 0 in the original (undefined); 0 is an
+   acceptable choice. A texture-coordinate section without a shadow entry maps through the
+   default k of 7.9; a projection without a texture-coordinate section gives unmapped
+   coordinates; no projection, no coordinates.
+8. **An empty branch LOD 0** (`branch_max_volume_percent` 0) contributes nothing to the
+   bounding box; the original reads only level 0's strips and does not fall back to other
+   branch geometry. The box then comes from fronds and leaves.
+9. **Mesh-leaf reach (5.7 F)** uses the mesh named by the texture's own mesh entry
+   (`LeafMeshUse::mesh` of texture choice / 2), the same mesh 7.3 draws.
+10. **`flare_seed` absent** seeds the flare generator with 444 (item 5).
+11. **The two atlas mappings differ in the original too.** Fronds read corners 0 and 2 for s
+    (lerp(c[2], c[0], s)) and t from corners 2 and 0; mesh leaves read the choice's card
+    corners as 7.3 gives them. Keep both as written; they agree for axis-aligned atlas
+    entries, which is every game file's.
+
 ### 7.7 Wind weights and matrix indices (the computation)
 
 Every branch and frond vertex and every leaf carries two wind pairs, (weight 1, matrix index
@@ -1068,8 +1097,9 @@ Every branch and frond vertex and every leaf carries two wind pairs, (weight 1, 
 
 - **Inputs.** The weighting level W = `wind_level` (1 when absent) and the propagate flag
   = `propagate_flexibility` (false when absent).
-- **Groups (round robin).** A counter starts at the tree seed (the value 2.3 step 1 seeds
-  with). The trunk is grown with groups (g₁, g₂) = (tree seed, `flare_seed`) and weights
+- **Groups (round robin).** A counter starts at the tree seed **as stored** (`TreeInfo::seed`;
+  the "≤ 1 becomes 1" rule of 2.3 step 1 applies only inside the random stream, not here).
+  The trunk is grown with groups (g₁, g₂) = (that seed, `flare_seed` as stored) and weights
   (w₁, w₂) = (1, 1). When a branch starts growing (2.4), right after its frond test (a pruned
   branch takes nothing): if its level L equals W, g₁ ← counter and the counter goes up by
   one; if L equals W + 1, g₂ ← counter and it goes up by one. The counter is shared by the
