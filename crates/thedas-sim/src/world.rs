@@ -434,9 +434,6 @@ pub struct FloatyMessage {
 pub enum SoundRequest {
     /// `PlaySound(oTarget, sSoundEventName)`: an FMOD event at the object.
     Event { target: ObjectId, event: String },
-    /// Character creation's voice preview (`GUI.TestSoundSet <set> <type>`): a line of
-    /// sound set `set` of `ss_types.gda` type `entry`, said by nobody in particular.
-    Preview { set: String, entry: i32 },
     /// `PlaySoundSet(oTarget, nSoundSetEntry, fProbabilityOverride)`: an entry of the
     /// creature's sound set.
     SoundSet {

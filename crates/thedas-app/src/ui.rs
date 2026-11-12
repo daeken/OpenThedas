@@ -167,6 +167,9 @@ pub struct UiLayer {
     minimap_frame: u32,
     /// What the menus asked of the app since it last looked (see [`FrontEnd`]).
     pub requests: Vec<FrontEnd>,
+    /// Character creation's voice previews not yet played (see
+    /// [`UiLayer::drain_sound_set_previews`]).
+    sound_set_previews: Vec<(String, i32)>,
     /// The saves were listed for the start menu.
     saves_listed: bool,
     /// tooltips.gfx's tooltip texts (fixed and floating) last frame, and the frames left to lay
@@ -316,32 +319,40 @@ pub fn line_ms(text: &str) -> f64 {
 impl UiLayer {
     /// Character creation's voice choice (chargen.gfx's `AppearanceSoundSetScene`):
     /// `GUI.TestSoundSet <set> <type>` previews a line of the set (`ss_types.gda` types with
-    /// `bUseInChargen`, starting with HELLO), `GUI.SetSoundSet <set>` gives the hero being
-    /// made that set. Provisional: the argument order is read from the movie's strings.
-    fn sound_set_message(sim: &Arc<Mutex<Sim>>, name: &str, args: &[String]) -> bool {
+    /// `bUseInChargen`, starting with HELLO) for the sound to take (see
+    /// [`UiLayer::drain_sound_set_previews`]); `GUI.SetSoundSet <set>` gives the hero being
+    /// made that set (`Sim::chargen_sound_set`). Provisional: the argument order is read from
+    /// the movie's strings.
+    fn sound_set_message(
+        previews: &mut Vec<(String, i32)>,
+        sim: &Arc<Mutex<Sim>>,
+        name: &str,
+        args: &[String],
+    ) -> bool {
         let set = args
             .iter()
             .find(|a| a.chars().any(|c| c.is_ascii_alphabetic()))
             .map(|a| a.trim().to_ascii_lowercase());
         let number = args.iter().find_map(|a| a.trim().parse::<i32>().ok());
-        let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
         match (name, set) {
             ("GUI.TestSoundSet", Some(set)) => {
-                sim.request_sound(thedas_sim::world::SoundRequest::Preview {
-                    set,
-                    entry: number.unwrap_or(0),
-                });
+                previews.push((set, number.unwrap_or(0)));
                 true
             }
             ("GUI.SetSoundSet", Some(set)) => {
-                if let Some(o) = sim.world.chargen.and_then(|c| sim.world.get_mut(c)) {
-                    o.text_fields
-                        .insert(thedas_sim::sim::SOUND_SET.to_string(), set);
-                }
+                sim.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .chargen_sound_set(&set);
                 true
             }
             _ => false,
         }
+    }
+
+    /// The voice previews character creation asked for since the last call: (sound set,
+    /// `ss_types.gda` type).
+    pub fn drain_sound_set_previews(&mut self) -> Vec<(String, i32)> {
+        std::mem::take(&mut self.sound_set_previews)
     }
 
     /// The conversation line on screen speaks for this long (milliseconds; see
@@ -389,6 +400,7 @@ impl UiLayer {
             level: None,
             minimap_frame: 0,
             requests: Vec::new(),
+            sound_set_previews: Vec::new(),
             saves_listed: false,
             tooltip_text: None,
             tooltip_relayout: 0,
@@ -859,6 +871,7 @@ impl UiLayer {
                 }
             }
         }
+        let mut previews = Vec::new();
         let ignored: Vec<(String, Vec<String>)> = ignored
             .into_iter()
             .filter(|(n, a)| {
@@ -867,9 +880,10 @@ impl UiLayer {
                     && !self.save_message(screens, sim, n, a)
                     && !self.go_to_journal(screens, sim, n, a)
                     && !Self::book_page(screens, n, a)
-                    && !Self::sound_set_message(sim, n, a)
+                    && !Self::sound_set_message(&mut previews, sim, n, a)
             })
             .collect();
+        self.sound_set_previews.extend(previews);
         let mut aims = Vec::new();
         {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());

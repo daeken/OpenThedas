@@ -2851,13 +2851,30 @@ fn apply_template(o: &mut crate::world::Object, t: &Gff3) {
 const TEXT_FIELDS: [&str; 1] = ["KeyName"];
 
 impl Sim {
-    /// A sound for the presentation (see [`crate::world::SoundRequest`]); kept to the last 64
-    /// when nothing takes them.
-    pub fn request_sound(&mut self, req: crate::world::SoundRequest) {
-        if self.world.sounds.len() >= 64 {
-            self.world.sounds.remove(0);
+    /// Gives creature `id` sound set `set` (its barks; `SetSoundSet`), or none for an empty
+    /// name.
+    pub fn set_sound_set(&mut self, id: ObjectId, set: &str) {
+        let Some(o) = self.world.get_mut(id) else {
+            return;
+        };
+        let set = set.trim().to_ascii_lowercase();
+        if set.is_empty() {
+            o.text_fields.remove(SOUND_SET);
+        } else {
+            o.text_fields.insert(SOUND_SET.to_string(), set);
         }
-        self.world.sounds.push(req);
+    }
+
+    /// Character creation's voice choice (`GUI.SetSoundSet <set>`): the creature being made
+    /// gets the set. False when no character is being made.
+    pub fn chargen_sound_set(&mut self, set: &str) -> bool {
+        match self.world.chargen {
+            Some(c) => {
+                self.set_sound_set(c, set);
+                true
+            }
+            None => false,
+        }
     }
 }
 

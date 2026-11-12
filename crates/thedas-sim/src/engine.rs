@@ -507,16 +507,8 @@ pub fn call(
         _ => None,
     };
     // `SetSoundSet(oTarget, sSoundSet)`: the creature's barks come from that set.
-    if name == "SetSoundSet"
-        && let Some(o) = h.sim.world.get_mut(obj(a, 0))
-    {
-        let ss = string(a, 1);
-        if ss.is_empty() {
-            o.text_fields.remove(crate::sim::SOUND_SET);
-        } else {
-            o.text_fields
-                .insert(crate::sim::SOUND_SET.to_string(), ss.to_ascii_lowercase());
-        }
+    if name == "SetSoundSet" {
+        h.sim.set_sound_set(obj(a, 0), &string(a, 1));
     }
     if let Some(req) = sound {
         // Kept short when nothing takes them (a headless run).
@@ -6546,6 +6538,18 @@ mod coverage_tests {
                 .text_fields
                 .get(crate::sim::SOUND_SET),
             Some(&"ss_pc_fhuman_wise".to_string())
+        );
+        // Character creation's choice goes to the creature being made.
+        assert!(!s.chargen_sound_set("ss_pc_mhuman_cocky"));
+        s.world.chargen = Some(o);
+        assert!(s.chargen_sound_set("SS_PC_MHUMAN_COCKY"));
+        assert_eq!(
+            s.world
+                .get(o)
+                .unwrap()
+                .text_fields
+                .get(crate::sim::SOUND_SET),
+            Some(&"ss_pc_mhuman_cocky".to_string())
         );
         assert_eq!(
             std::mem::take(&mut s.world.sounds),

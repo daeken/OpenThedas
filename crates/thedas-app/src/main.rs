@@ -2099,6 +2099,10 @@ fn audio_state(
     };
     if let Some(ui) = ui {
         state.gui_sounds = ui.stage.bridge.drain_sounds();
+        // Character creation's voice previews: always said, by nobody in particular.
+        for (set, entry) in ui.drain_sound_set_previews() {
+            state.sound_sets.push((set, entry, 1.0, None));
+        }
         state.volumes = audio::volumes(|n| ui.client_option(n));
     }
     let Some(live) = live else {
@@ -2179,9 +2183,6 @@ fn audio_state(
                         let at = o.map(|o| o.position);
                         state.sound_sets.push((set, entry, probability, at));
                     }
-                }
-                thedas_sim::world::SoundRequest::Preview { set, entry } => {
-                    state.sound_sets.push((set, entry, 1.0, None));
                 }
                 thedas_sim::world::SoundRequest::Impact {
                     target,
