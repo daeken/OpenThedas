@@ -167,6 +167,10 @@ pub struct SaveListing {
     pub time_played_s: u64,
     /// When it was written, as text.
     pub last_played: String,
+    /// The hero's name, level and class when it was saved.
+    pub hero: String,
+    pub level: i32,
+    pub class: i32,
 }
 
 /// The inventory screen's item category tabs (inventory.gfx's `CATEGORY_*`).
@@ -1264,7 +1268,20 @@ fn chargen_screen(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
 fn saves(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
     v.insert("SaveLoad.Mode".into(), num(shown.save_mode));
     v.insert("SaveLoad.OpenSlot".into(), num(shown.open_slot));
-    v.insert("SaveLoad.CurrentHero".into(), num(0));
+    // The save details' player name (saveload.gfx's `PlayerName_mc` reads it as text; it
+    // showed the 0 this used to be).
+    // Before a game, the newest save's hero.
+    let newest = shown.saves.first();
+    v.insert(
+        "SaveLoad.CurrentHero".into(),
+        UiValue::String(
+            sim.world
+                .hero
+                .map(|h| name(sim, h))
+                .or_else(|| newest.map(|s| s.hero.clone()))
+                .unwrap_or_default(),
+        ),
+    );
     // The game menu offers saving in a game. Provisional: when the game forbids it (in
     // combat, in cutscenes) is not traced.
     v.insert(
@@ -1301,17 +1318,17 @@ fn saves(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
             UiValue::String(last.map(|s| s.area.clone()).unwrap_or_default()),
         );
         v.insert(format!("{k}.Screenshot"), UiValue::String(String::new()));
-        // The details pane's level and class icon: the hero's.
-        if let Some(h) = sim.world.hero {
-            v.insert(
-                format!("{k}.Level"),
-                num(sim.property_total(h, PROPERTY_LEVEL)),
-            );
-            v.insert(
-                format!("{k}.ClassID"),
-                num(sim.property_total(h, PROPERTY_CLASS)),
-            );
-        }
+        // The details pane's level and class icon: the hero's (before a game, the newest
+        // save's).
+        let (level, class) = match sim.world.hero {
+            Some(h) => (
+                sim.property_total(h, PROPERTY_LEVEL),
+                sim.property_total(h, PROPERTY_CLASS),
+            ),
+            None => newest.map_or((0.0, 0.0), |s| (s.level as f32, s.class as f32)),
+        };
+        v.insert(format!("{k}.Level"), num(level));
+        v.insert(format!("{k}.ClassID"), num(class));
     }
     // Saving lists a new save first (slot -1: the movie names it after the area and saves it
     // to the open slot), then the saves it may overwrite.
@@ -1359,10 +1376,11 @@ fn saves(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
         );
         v.insert(format!("{k}.Story"), UiValue::String(String::new()));
         v.insert(format!("{k}.Screenshot"), UiValue::String(String::new()));
-        let class = sim
-            .world
-            .hero
-            .map_or(0.0, |h| sim.property_total(h, PROPERTY_CLASS));
+        // The save's own class (the new save's is the hero's).
+        let class = match (s.slot, sim.world.hero) {
+            (-1, Some(h)) => sim.property_total(h, PROPERTY_CLASS),
+            _ => s.class as f32,
+        };
         v.insert(format!("{k}.ClassID"), num(class));
     }
     v.insert("Party.CapturedOnDeath".into(), num(0));
@@ -2112,6 +2130,7 @@ mod tests {
                 area: "Ostagar".into(),
                 time_played_s: 3725,
                 last_played: "2026-11-11 10:00".into(),
+                ..Default::default()
             }],
             save_mode: 2,
             open_slot: 4,

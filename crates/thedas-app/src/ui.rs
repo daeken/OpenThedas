@@ -180,6 +180,8 @@ pub struct UiLayer {
     floaties: Vec<Floaty>,
     /// The stats floaties up (name and health bar over a creature): creature → floaty id.
     stat_floaties: std::collections::BTreeMap<thedas_script::vm::ObjectId, u32>,
+    /// A conversation line's continue the movie could not send (see `continue_conversation`).
+    continue_pending: bool,
     next_floaty: u32,
     portraits: PortraitClock,
     paperdoll: PaperdollClock,
@@ -422,6 +424,7 @@ impl UiLayer {
             tooltip_relayout: 0,
             floaties: Vec::new(),
             stat_floaties: Default::default(),
+            continue_pending: false,
             next_floaty: 1,
             portraits: PortraitClock::default(),
             paperdoll: PaperdollClock::default(),
@@ -679,6 +682,19 @@ impl UiLayer {
                     area,
                     time_ms: sim.world.time_ms,
                     written: crate::saves::now_secs(),
+                    hero: sim
+                        .world
+                        .hero
+                        .map(|h| sim.display_name(h))
+                        .unwrap_or_default(),
+                    level: sim
+                        .world
+                        .hero
+                        .map_or(0, |h| sim.property_total(h, 15) as i32),
+                    class: sim
+                        .world
+                        .hero
+                        .map_or(0, |h| sim.property_total(h, 27) as i32),
                 };
                 match sim.save_json() {
                     Ok(b) => match store.write(slot, &b, &meta) {
@@ -847,7 +863,13 @@ impl UiLayer {
             }
         }
         self.show_cutscene_line(sim);
-        let messages = self.stage.tick(dt_ms);
+        let mut messages = self.stage.tick(dt_ms);
+        if std::mem::take(&mut self.continue_pending) {
+            messages.push(GameMessage::Send(
+                "Conversation.SelectResponse".into(),
+                vec!["0".into()],
+            ));
+        }
         let tip = Some(thedas_ui::UiValue::List(
             ["GUI.TooltipText", "GUITooltips.TooltipText"]
                 .map(|k| {
@@ -1033,12 +1055,25 @@ impl UiLayer {
     /// conversation.gfx's continue action (it sends `Conversation.SelectResponse 0` when the
     /// line has nothing to choose).
     fn continue_conversation(&mut self) {
-        if let Some(m) = self
+        let Some(m) = self
             .stage
             .movies
             .iter_mut()
             .find(|m| m.name == "conversation.gfx")
-        {
+        else {
+            // The screen is not up yet (a conversation's first line, empty, plays out
+            // before its movie has loaded): the game's continue is sent for it, else the
+            // conversation waited for ever.
+            self.continue_pending = true;
+            return;
+        };
+        // The movie's continue does nothing while it believes the line has replies to pick
+        // (one it has not read yet): the game's continue is sent for it then too.
+        let stale =
+            m.call("_global.Conversation.HasResponses", &[]) == thedas_ui::UiValue::Bool(true);
+        if stale {
+            self.continue_pending = true;
+        } else {
             m.call("_global.Conversation.ContinueButtonAction", &[]);
         }
     }

@@ -1200,6 +1200,9 @@ fn texture_group(
         let (sampler_name, source) = sampler_texture(table, s, ty, material, lightmap);
         let view = match &source {
             TextureSource::Resource(name) => textures.view(ctx, vfs, name, ty),
+            TextureSource::ResourceOr(name, default) => textures
+                .view(ctx, vfs, name, ty)
+                .or_else(|| textures.view(ctx, vfs, default, ty)),
             TextureSource::Shadow(i) => shadows.and_then(|t| t.views.get(*i as usize).cloned()),
             TextureSource::White => None,
             TextureSource::Black => None,
