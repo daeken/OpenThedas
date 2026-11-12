@@ -685,6 +685,12 @@ impl UiLayer {
         }
     }
 
+    /// The conversation line on screen: whether it has played (its replies show), and
+    /// whether it has nothing to choose (it continues).
+    pub fn line_state(&self) -> Option<(bool, bool)> {
+        self.line.as_ref().map(|l| (l.played(), l.waits))
+    }
+
     /// conversation.gfx's continue action (it sends `Conversation.SelectResponse 0` when the
     /// line has nothing to choose).
     fn continue_conversation(&mut self) {
