@@ -116,6 +116,14 @@ impl Composite {
     }
 }
 
+/// A message floaty up over a creature.
+struct Floaty {
+    id: u32,
+    target: thedas_script::vm::ObjectId,
+    /// Seconds until it goes.
+    left_s: f64,
+}
+
 pub struct UiLayer {
     pub stage: Stage,
     composite: Option<Composite>,
@@ -132,6 +140,13 @@ pub struct UiLayer {
     level: Option<String>,
     /// Frames since the minimap's creatures were last sent.
     minimap_frame: u32,
+    /// tooltips.gfx's tooltip texts (fixed and floating) last frame, and the frames left to lay
+    /// the last tooltip out again after they changed (see `thedas_ui::avm1::TOOLTIP_RELAYOUT`).
+    tooltip_text: Option<thedas_ui::UiValue>,
+    tooltip_relayout: u8,
+    /// The floating messages up over creatures (see [`UiLayer::update_floaties`]).
+    floaties: Vec<Floaty>,
+    next_floaty: u32,
     portraits: PortraitClock,
     paperdoll: PaperdollClock,
     /// Where the player's games are saved (none: the save and load screens list nothing).
@@ -291,6 +306,10 @@ impl UiLayer {
             line: None,
             level: None,
             minimap_frame: 0,
+            tooltip_text: None,
+            tooltip_relayout: 0,
+            floaties: Vec::new(),
+            next_floaty: 1,
             portraits: PortraitClock::default(),
             paperdoll: PaperdollClock::default(),
             saves: None,
@@ -328,6 +347,29 @@ impl UiLayer {
     /// resource and whether it is done, in either order) and `GUI.GoToCodex` (the entry's
     /// resource) open the journal on that entry (its `GUIJournal.Notification*` values).
     /// Returns whether the message was one of these.
+    /// navbar.gfx's page buttons (`GUI.ToggleFullScreenGUI <scene>`): the book turns to that
+    /// screen, or closes when it is the one up, as the screen's key does. The main menu's
+    /// button is left to the game menu. Provisional: the exe's handling of the message is not
+    /// traced; the toggle follows the keys.
+    fn book_page(screens: &mut Screens, name: &str, args: &[String]) -> bool {
+        if name != "GUI.ToggleFullScreenGUI" {
+            return false;
+        }
+        let page = match args.first().map(|a| a.trim()) {
+            Some("CharacterRecord") => Screen::CharacterRecord,
+            Some("Inventory") => Screen::Inventory,
+            Some("Journal") => Screen::Journal,
+            Some("Map") => Screen::AreaMap,
+            Some("Tactics") => Screen::Tactics,
+            Some("Skills") => Screen::Skills,
+            Some("SpellsTalents") => Screen::SpellsTalents,
+            Some("Options") => Screen::Options,
+            _ => return true,
+        };
+        screens.toggle(page);
+        true
+    }
+
     fn go_to_journal(
         &mut self,
         screens: &mut Screens,
@@ -396,6 +438,9 @@ impl UiLayer {
                     log::warn!("ui: a dialog box was asked for with no popup layer up");
                 }
             }
+            // floatylayer.gfx tells the game its visible size; the floaties are placed from
+            // the stage's own size here (see `update_floaties`).
+            "GUI.UpdateFloatyLayerStageSize" => {}
             "GUI.InvokeCallback" => {
                 let (Some(movie), Some(function)) = (args.first(), args.get(1)) else {
                     return true;
@@ -559,6 +604,12 @@ impl UiLayer {
                 shown.journal_focus = None;
             }
             shown.journal = journal;
+            shown.book_page = screens.menu.and_then(Screen::book_page);
+            shown.ability_scene = match screens.menu {
+                Some(Screen::Skills) => 3,
+                Some(Screen::SpellsTalents) => 1,
+                _ => 0,
+            };
         }
         let (want, line) = {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
@@ -621,6 +672,28 @@ impl UiLayer {
         }
         self.show_cutscene_line(sim);
         let messages = self.stage.tick(dt_ms);
+        let tip = Some(thedas_ui::UiValue::List(
+            ["GUI.TooltipText", "GUITooltips.TooltipText"]
+                .map(|k| {
+                    self.stage
+                        .bridge
+                        .value(k)
+                        .unwrap_or(thedas_ui::UiValue::Undefined)
+                })
+                .to_vec(),
+        ));
+        if tip != self.tooltip_text {
+            self.tooltip_relayout = 6;
+            self.tooltip_text = tip;
+        }
+        // The fixed tooltip whose text changed is laid out again over the next few frames,
+        // once the movie has shown it and its text has been laid out (the value reaches the
+        // movie a frame or two after it is set; see `thedas_ui::avm1::TOOLTIP_RELAYOUT`).
+        if self.tooltip_relayout > 0 {
+            self.tooltip_relayout -= 1;
+            self.stage
+                .call_in("tooltips.gfx", thedas_ui::avm1::TOOLTIP_RELAYOUT, &[]);
+        }
         let ignored = {
             let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             thedas_ui::input::apply_all(&mut sim, &messages)
@@ -644,6 +717,7 @@ impl UiLayer {
                 !self.popup_message(n, a)
                     && !self.save_message(screens, sim, n, a)
                     && !self.go_to_journal(screens, sim, n, a)
+                    && !Self::book_page(screens, n, a)
             })
             .collect();
         let mut aims = Vec::new();
@@ -689,6 +763,72 @@ impl UiLayer {
     /// whether it has nothing to choose (it continues).
     pub fn line_state(&self) -> Option<(bool, bool)> {
         self.line.as_ref().map(|l| (l.played(), l.waits))
+    }
+
+    /// Highlights conversation reply `n` (from 0) the way the reply buttons highlight
+    /// themselves when the console's focus lands on them (`NavigateOn` and `NavigateOff` on
+    /// `_root.ButtonContainer_mc.Buttons_mc.Response1_mc`-`Response6_mc`, looked up afresh
+    /// each time as the screen re-places them). False when the conversation screen is not
+    /// up. The PC game has no such highlight (the mouse's hover is its own): a deliberate
+    /// addition for the pad. Provisional: reply n is taken to be button n + 1, as the screen
+    /// numbers them.
+    pub fn highlight_reply(&mut self, n: usize) -> bool {
+        let Some(m) = self
+            .stage
+            .movies
+            .iter_mut()
+            .find(|m| m.name == "conversation.gfx")
+        else {
+            return false;
+        };
+        for k in 1..=6 {
+            let f = if k == n + 1 {
+                "NavigateOn"
+            } else {
+                "NavigateOff"
+            };
+            m.call(
+                &format!("_root.ButtonContainer_mc.Buttons_mc.Response{k}_mc.{f}"),
+                &[],
+            );
+        }
+        true
+    }
+
+    /// Calls a function in an open movie by path (the `call` step, for probing the movies
+    /// headless); arguments that parse as numbers are passed as numbers.
+    pub fn probe_call(
+        &mut self,
+        movie: &str,
+        path: &str,
+        args: &[String],
+    ) -> Option<thedas_ui::UiValue> {
+        let args: Vec<_> = args
+            .iter()
+            .map(|a| match a.parse::<f64>() {
+                Ok(n) => thedas_ui::UiValue::Number(n),
+                Err(_) => thedas_ui::UiValue::String(a.clone()),
+            })
+            .collect();
+        self.stage.call_in(movie, path, &args)
+    }
+
+    /// Sets an engine value the movies read (the `setvalue` step): a number when it parses
+    /// as one, else a string.
+    pub fn probe_set_value(&mut self, name: &str, value: &str) {
+        let v = value
+            .parse::<f64>()
+            .map(thedas_ui::UiValue::Number)
+            .unwrap_or_else(|_| thedas_ui::UiValue::String(value.to_string()));
+        self.stage.bridge.set_value(name, v);
+    }
+
+    /// Whether the player has paused the game (Space): the floaty layer's pause border and
+    /// "Paused" text (`Client.Paused`, `Client.UserPaused`).
+    pub fn set_paused(&self, paused: bool) {
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.paused = paused;
+        }
     }
 
     /// conversation.gfx's continue action (it sends `Conversation.SelectResponse 0` when the
@@ -836,6 +976,130 @@ impl UiLayer {
     /// then has them redraw: the HUD's minimap (minimap.gfx) and the area map screen
     /// (map.gfx), which share the picture (`Area.Minimap`) and the arrays. Provisional: every
     /// living creature in the area is shown, all within the map's radius.
+    /// floatylayer.gfx's messages over creatures: each `DisplayFloatyMessage` a script made
+    /// (damage, "Miss", "Immune", ...) becomes a message floaty (`FLOATY_SYMBOL_MESSAGE`)
+    /// that follows its creature's head on screen until its time is up, fed as
+    /// DAOrigins.exe feeds the movie: the `FloatyLayer.Batch*` arrays, then
+    /// `FloatyLayer.ProcessBatchUpdates`. Positions are in the visible area's stage units
+    /// (`SetFloatyPosition` adds the area's offset itself). Provisional: the head height, the
+    /// time a floaty stays after its duration, and stacking several on one creature by
+    /// `BatchUpdateOffsets` are inferred from the movie, not traced.
+    pub fn update_floaties(
+        &mut self,
+        sim: &Arc<Mutex<Sim>>,
+        camera: &thedas_render::Camera,
+        dt_ms: f64,
+    ) {
+        use thedas_ui::UiValue;
+        const LAYER: &str = "_global.FloatyLayer";
+        const SYMBOL_MESSAGE: f64 = 1.0;
+        /// Seconds a floaty stays past its duration (its own fade).
+        const LINGER_S: f64 = 1.0;
+        /// Metres above a creature's feet.
+        const HEAD: f32 = 2.0;
+        let Some(movie) = self
+            .stage
+            .movies
+            .iter()
+            .position(|m| m.name == "floatylayer.gfx")
+        else {
+            // No layer up: what scripts showed meanwhile is dropped.
+            sim.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .world
+                .floaties
+                .clear();
+            self.floaties.clear();
+            return;
+        };
+        let num = UiValue::Number;
+        let (mut create, mut symbols, mut show) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut msg_ids, mut texts, mut styles, mut colours, mut durations) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut ids, mut offsets, mut places, mut destroy) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let size = self.stage.size();
+        let scale = thedas_ui::stage_scale(size, (1024.0, 768.0));
+        let (w, h) = (size.0 as f32, size.1 as f32);
+        let vp = camera.view_proj(w / h.max(1.0));
+        {
+            let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+            for f in std::mem::take(&mut sim.world.floaties) {
+                let id = self.next_floaty;
+                self.next_floaty += 1;
+                create.push(num(f64::from(id)));
+                symbols.push(num(SYMBOL_MESSAGE));
+                show.push(num(f64::from(id)));
+                msg_ids.push(num(f64::from(id)));
+                texts.push(UiValue::String(f.text));
+                styles.push(num(f64::from(f.style)));
+                colours.push(num(f64::from(f.colour)));
+                durations.push(num(f64::from(f.duration)));
+                self.floaties.push(Floaty {
+                    id,
+                    target: f.target,
+                    left_s: f64::from(f.duration.max(0.0)) + LINGER_S,
+                });
+            }
+            let mut per_target: std::collections::BTreeMap<u32, u32> = Default::default();
+            self.floaties.retain_mut(|f| {
+                f.left_s -= dt_ms / 1000.0;
+                let o = sim
+                    .world
+                    .get(f.target)
+                    .filter(|o| o.active && o.area == sim.world.area);
+                if f.left_s <= 0.0 || o.is_none() {
+                    destroy.push(num(f64::from(f.id)));
+                    return false;
+                }
+                let o = o.expect("checked");
+                let p = glam::Vec3::new(o.position[0], o.position[1], o.position[2] + HEAD);
+                let c = vp * p.extend(1.0);
+                let (x, y, alpha) = if c.w > 1e-4 {
+                    let n = c.truncate() / c.w;
+                    ((n.x + 1.0) * 0.5 * w, (1.0 - n.y) * 0.5 * h, 1.0)
+                } else {
+                    (0.0, 0.0, 0.0)
+                };
+                let stack = per_target.entry(f.target).or_default();
+                *stack += 1;
+                ids.push(num(f64::from(f.id)));
+                offsets.push(num(f64::from(*stack)));
+                places.extend([
+                    num(f64::from(x) / scale),
+                    num(f64::from(y) / scale),
+                    num(1.0),
+                    num(alpha),
+                    num(f64::from(f.id)),
+                ]);
+                true
+            });
+        }
+        let m = &mut self.stage.movies[movie];
+        let list = |v: Vec<UiValue>| UiValue::List(v);
+        for (k, v) in [
+            ("BatchCreateIDs", create),
+            ("BatchCreateSymbolIDs", symbols),
+            ("BatchShowIDs", show),
+            ("BatchHideIDs", Vec::new()),
+            ("BatchDestroyIDs", destroy),
+            ("BatchUpdateIDs", ids),
+            ("BatchUpdateOffsets", offsets),
+            ("BatchUpdatePositionsScalesAlphas", places),
+            ("BatchUpdateMessageIDs", msg_ids),
+            ("BatchUpdateMessageStrings", texts),
+            ("BatchUpdateMessageStyles", styles),
+            ("BatchUpdateMessageColours", colours),
+            ("BatchUpdateMessageDurations", durations),
+            ("BatchUpdateStatsIDs", Vec::new()),
+            ("BatchUpdateIconIDs", Vec::new()),
+            ("BatchUpdateOffscreenIDs", Vec::new()),
+        ] {
+            m.set(&format!("{LAYER}.{k}"), list(v));
+        }
+        m.call(&format!("{LAYER}.ProcessBatchUpdates"), &[]);
+    }
+
     pub fn update_minimap(&mut self, sim: &Arc<Mutex<Sim>>, camera: &thedas_render::Camera) {
         self.minimap_frame += 1;
         if self.minimap_frame < MINIMAP_EVERY {
@@ -1024,6 +1288,12 @@ impl UiLayer {
 
     pub fn mouse_move(&mut self, x: f64, y: f64) {
         self.stage.mouse_move(x, y);
+    }
+
+    /// The mouse wheel turned `lines` (up positive) at (`x`, `y`): lists and text under the
+    /// mouse scroll.
+    pub fn mouse_wheel(&mut self, x: f64, y: f64, lines: f64) {
+        self.stage.mouse_wheel(x, y, lines);
     }
 
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {

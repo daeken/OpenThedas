@@ -39,6 +39,14 @@ pub const EMPTY: &str = "\u{200B}";
 /// `ExternalInterface.call`; wrapped to turn [`EMPTY`] back into `""`.
 pub const VALUE_GETTERS: &[&str] = &["GetValue", "GetString"];
 
+/// Lays the tooltip tooltips.gfx showed last out again: `ResizeTooltip()`, then
+/// `PositionTooltip` with the rectangle it was last placed by (`SharedLibrary.FloatingTooltip`'s
+/// `PositionTooltip` is wrapped at install to remember it). The movie sizes the box from its
+/// text clip's height straight after setting the text wrapped; Ruffle reports the unwrapped
+/// height until a frame has run, so the box came out short and its text ran past it. The host
+/// calls this for a few frames after a tooltip's text changes.
+pub const TOOLTIP_RELAYOUT: &str = "_global.thedas_tooltip_relayout";
+
 /// The function the host calls once, after starting a movie, to wrap [`PRE_CALLS`] (the
 /// movies define those classes after the first frame's actions run).
 pub const INSTALL: &str = "_global.thedas_install";
@@ -1239,6 +1247,46 @@ fn push(out: &mut Vec<u8>, values: &[Push]) {
     record(out, PUSH, &b);
 }
 
+/// `function () { var t = _global.thedas_last_tip; t.ResizeTooltip();
+/// t.PositionTooltip(t.thedas_rect); }` (see [`TOOLTIP_RELAYOUT`]).
+fn tooltip_relayout_function() -> Vec<u8> {
+    let mut body = Vec::new();
+    push(&mut body, &[Push::Int(0)]);
+    get_path(&mut body, &["_global", "thedas_last_tip"]);
+    push(&mut body, &[Push::Str("ResizeTooltip")]);
+    body.extend_from_slice(&[CALL_METHOD, POP]);
+    get_path(&mut body, &["_global", "thedas_last_tip", "thedas_rect"]);
+    push(&mut body, &[Push::Int(1)]);
+    get_path(&mut body, &["_global", "thedas_last_tip"]);
+    push(&mut body, &[Push::Str("PositionTooltip")]);
+    body.extend_from_slice(&[CALL_METHOD, POP]);
+    function(&[], &body)
+}
+
+/// `function (o) { return function (r) { this.thedas_rect = r; _global.thedas_last_tip =
+/// this; return o.apply(this, arguments); }; }`: `SharedLibrary.FloatingTooltip`'s
+/// `PositionTooltip` remembering where it put the tooltip, for [`TOOLTIP_RELAYOUT`].
+fn tooltip_position_wrap_maker() -> Vec<u8> {
+    let mut inner = Vec::new();
+    get_path(&mut inner, &["this"]);
+    push(&mut inner, &[Push::Str("thedas_rect")]);
+    get_path(&mut inner, &["r"]);
+    inner.push(SET_MEMBER);
+    get_path(&mut inner, &["_global"]);
+    push(&mut inner, &[Push::Str("thedas_last_tip")]);
+    get_path(&mut inner, &["this"]);
+    inner.push(SET_MEMBER);
+    get_path(&mut inner, &["arguments"]);
+    get_path(&mut inner, &["this"]);
+    push(&mut inner, &[Push::Int(2)]);
+    get_path(&mut inner, &["o"]);
+    push(&mut inner, &[Push::Str("apply")]);
+    inner.extend_from_slice(&[CALL_METHOD, RETURN]);
+    let mut outer = function(&["r"], &inner);
+    outer.push(RETURN);
+    function(&["o"], &outer)
+}
+
 /// `function (p, m, a) { for (var i = 0; i < a.length; i++) a[i] = _global.thedas_unempty(a[i]);
 /// var o = eval(p); return o[m].apply(o, a); }`
 fn invoke_function() -> Vec<u8> {
@@ -1320,6 +1368,14 @@ pub fn register_invoke() -> Vec<u8> {
         push(&mut out, &[Push::Str("thedas_wrap")]);
         out.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
     }
+    get_path(&mut out, &["_global"]);
+    push(&mut out, &[Push::Str("thedas_tip_wrap")]);
+    out.extend(tooltip_position_wrap_maker());
+    out.push(SET_MEMBER);
+    get_path(&mut out, &["_global"]);
+    push(&mut out, &[Push::Str("thedas_tooltip_relayout")]);
+    out.extend(tooltip_relayout_function());
+    out.push(SET_MEMBER);
     // _global.thedas_prewrap = prewrap_maker; _global.thedas_install wraps the PRE_CALLS
     // functions (the host calls it once the movie's classes exist, see `INSTALL`).
     get_path(&mut out, &["_global"]);
@@ -1356,6 +1412,18 @@ pub fn register_invoke() -> Vec<u8> {
         push(&mut install, &[Push::Str("thedas_prewrap")]);
         install.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
     }
+    // SharedLibrary.FloatingTooltip.prototype.PositionTooltip remembers its rectangle (see
+    // TOOLTIP_RELAYOUT); a no-op in movies without tooltips.
+    let tip = ["_global", "SharedLibrary", "FloatingTooltip", "prototype"];
+    get_path(&mut install, &tip);
+    push(&mut install, &[Push::Str("PositionTooltip")]);
+    let mut position = tip.to_vec();
+    position.push("PositionTooltip");
+    get_path(&mut install, &position);
+    push(&mut install, &[Push::Int(1)]);
+    get_path(&mut install, &["_global"]);
+    push(&mut install, &[Push::Str("thedas_tip_wrap")]);
+    install.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
     // GUI.Element.prototype.fnEventHandler = thedas_button_wrap(...), for elements set up
     // from now on (see BUTTON_VAR).
     let element = ["_global", "GUI", "Element", "prototype"];

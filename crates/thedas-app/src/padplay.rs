@@ -46,6 +46,11 @@ pub trait Host {
     fn line(&self) -> Option<(bool, bool)>;
     /// A click reached the interface (skips or continues a conversation line).
     fn interface_clicked(&mut self);
+    /// The mouse wheel turns `lines` (up positive) at the cursor.
+    fn scroll(&mut self, lines: f64);
+    /// Highlights conversation reply `n` (from 0) as the reply buttons' own focus does;
+    /// false when the conversation screen is not up.
+    fn highlight_reply(&mut self, n: usize) -> bool;
 }
 
 /// How far ahead of the leader a walk order aims (metres): far enough that it never
@@ -61,9 +66,11 @@ pub const TARGET_NEAR: f32 = 2.0;
 pub const POINTER_STEP: f64 = 40.0;
 
 /// The player's screens LB and RB move between, in order (Back opens the first).
-const PAGES: [Page; 8] = [
+const PAGES: [Page; 10] = [
     Page::Menu(Screen::Inventory),
     Page::Menu(Screen::CharacterRecord),
+    Page::Menu(Screen::Skills),
+    Page::Menu(Screen::SpellsTalents),
     Page::Menu(Screen::Journal),
     Page::Menu(Screen::AreaMap),
     Page::Menu(Screen::Tactics),
@@ -77,6 +84,10 @@ enum Page {
     Menu(Screen),
     Saves(i32),
 }
+
+/// A conversation line (dialog, line), the reply highlighted on it, and whether the
+/// replies showed.
+type Highlighted = (Option<(String, String)>, usize, bool);
 
 /// The pad's part of the game: its controller, the target, the reply picked.
 #[derive(Default)]
@@ -93,6 +104,10 @@ pub struct PadPlay {
     page: usize,
     /// The pad has been used (the pointer is drawn on screens).
     pub used: bool,
+    /// The reply highlighted last: the line, the reply, and whether the replies showed.
+    highlighted: Option<Highlighted>,
+    /// The whole party is selected (LB+RB): A's attack and walking order everyone.
+    pub group: bool,
 }
 
 /// Where the pad's input goes, from the screens up.
@@ -137,6 +152,9 @@ impl PadPlay {
         }
         self.keep_target(host);
         self.follow_line(host);
+        if ctx == Context::Conversation && self.used {
+            self.show_reply(host);
+        }
         let mut log = Vec::new();
         for order in self.controller.update(state, ctx, dt_ms) {
             if let Some(m) = self.apply(order, host) {
@@ -165,6 +183,16 @@ impl PadPlay {
         }
     }
 
+    /// Highlights the reply picked, again whenever the line, the reply or whether the
+    /// replies show changes (the screen redraws its buttons as they come up).
+    fn show_reply(&mut self, host: &mut dyn Host) {
+        let shown = host.line().is_some_and(|(played, _)| played);
+        let now = (self.reply_line.clone(), self.reply, shown);
+        if self.highlighted.as_ref() != Some(&now) && host.highlight_reply(self.reply) {
+            self.highlighted = Some(now);
+        }
+    }
+
     /// A new conversation line starts with the first reply picked.
     fn follow_line(&mut self, host: &mut dyn Host) {
         let line = host.live().and_then(|l| {
@@ -181,7 +209,7 @@ impl PadPlay {
     fn apply(&mut self, order: Order, host: &mut dyn Host) -> Option<String> {
         match order {
             Order::Act(a) => self.act(a, host),
-            Order::Walk(v) => walk(host, v),
+            Order::Walk(v) => walk(host, v, self.group),
             Order::Camera { yaw, zoom } => {
                 match host.follow() {
                     Some(f) => {
@@ -190,6 +218,10 @@ impl PadPlay {
                     }
                     None => host.look(yaw, 0.0),
                 }
+                None
+            }
+            Order::Scroll(lines) => {
+                host.scroll(lines as f64);
                 None
             }
             Order::Pointer(d) => {
@@ -205,6 +237,7 @@ impl PadPlay {
             Action::Interact => self.interact(host),
             Action::Quickslot(n) => self.quickslot(host, n),
             Action::PrevMember | Action::NextMember => {
+                self.group = false;
                 let live = host.live()?;
                 let (party, now) = {
                     let sim = live.sim();
@@ -226,7 +259,13 @@ impl PadPlay {
                 format!("leading with {}", live.choose_leader(n)?)
             }
             Action::WholeParty => {
-                "select the whole party: not modelled yet (the party follows the leader)".into()
+                self.group = !self.group;
+                (if self.group {
+                    "whole party selected (A and walking order everyone)"
+                } else {
+                    "leader only"
+                })
+                .into()
             }
             Action::Picker => self.open_picker(host),
             Action::ClosePicker => {
@@ -399,9 +438,28 @@ impl PadPlay {
         if let Pick::Object(t) = pick {
             self.target = Some(t);
         }
-        host.live()
+        let order = host
+            .live()
             .and_then(|l| l.click(pick))
-            .unwrap_or_else(|| "nothing to do there".into())
+            .unwrap_or_else(|| "nothing to do there".into());
+        // The whole party selected: the rest attack the leader's target too, as the same
+        // order given to each.
+        if let (true, None, Pick::Object(t)) = (self.group, aiming, pick) {
+            if let Some(live) = host.live() {
+                let mut sim = live.sim();
+                let leader = sim.world.controlled();
+                let hostile = leader.is_some_and(|l| sim.hostile(l, t));
+                if hostile {
+                    for m in party_with(&sim) {
+                        if Some(m) != leader {
+                            sim.order_attack(m, t);
+                        }
+                    }
+                    return format!("{order} (with the whole party)");
+                }
+            }
+        }
+        order
     }
 
     /// X, Y, B (RT for the second set): the quickbar's slot, aimed at once at the target (or
@@ -522,29 +580,53 @@ fn pointer_to(host: &mut dyn Host, x: f64, y: f64) {
 /// The left stick: the leader walks toward a point a little ahead in the stick's direction
 /// (relative to the camera), as a click on the ground there would order; let go, it stops
 /// where it stands (a walk to its own feet).
-fn walk(host: &mut dyn Host, v: Vec2) -> Option<String> {
+fn walk(host: &mut dyn Host, v: Vec2, group: bool) -> Option<String> {
     let yaw = host.camera().yaw;
     let live = host.live()?;
     let mut sim = live.sim();
     let leader = sim.world.controlled()?;
-    let (area, at) = {
-        let me = sim.world.get(leader)?;
-        (me.area?, Vec3::from_array(me.position))
-    };
-    if v == Vec2::ZERO {
-        sim.order_move(leader, at.to_array());
-        return None;
+    let area = sim.world.get(leader)?.area?;
+    // The whole party selected: the others walk the same way, each from where it stands.
+    let mut walkers = vec![leader];
+    if group {
+        walkers.extend(party_with(&sim).into_iter().filter(|&m| m != leader));
     }
     let dir = crate::pad::world_direction(v, yaw).normalize_or_zero();
-    for ahead in WALK_AHEAD {
-        let p = at + (dir * ahead).extend(0.0);
-        let from = [p.x, p.y, p.z + 2.5];
-        if let Some(g) = sim.ground_hit(area, from, [0.0, 0.0, -1.0], 6.0) {
-            sim.order_move(leader, g);
-            return None;
+    for who in walkers {
+        let Some(at) = sim.world.get(who).map(|o| Vec3::from_array(o.position)) else {
+            continue;
+        };
+        if v == Vec2::ZERO {
+            sim.order_move(who, at.to_array());
+            continue;
+        }
+        for ahead in WALK_AHEAD {
+            let p = at + (dir * ahead).extend(0.0);
+            let from = [p.x, p.y, p.z + 2.5];
+            if let Some(g) = sim.ground_hit(area, from, [0.0, 0.0, -1.0], 6.0) {
+                sim.order_move(who, g);
+                break;
+            }
         }
     }
     None
+}
+
+/// The living party members in the leader's area (the leader too).
+fn party_with(sim: &thedas_sim::Sim) -> Vec<ObjectId> {
+    let area = sim
+        .world
+        .controlled()
+        .and_then(|c| sim.world.get(c))
+        .and_then(|o| o.area);
+    thedas_sim::engine::party_of(sim)
+        .into_iter()
+        .filter(|&m| {
+            sim.world
+                .get(m)
+                .is_some_and(|o| !o.dead && o.area.is_some() && o.area == area)
+        })
+        .collect()
 }
 
 /// The ground a few metres ahead of the leader (camera-forward), for an ability aimed at a

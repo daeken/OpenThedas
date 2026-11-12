@@ -1,7 +1,8 @@
 //! `thedas-app`: walk through a Dragon Age: Origins area, or play.
 //!
 //! Interactive: WASD to move, Q/E (or C) down/up, Shift to move faster, hold the right
-//! mouse button (or use the arrow keys) to look around, P to print the camera, F12 to save a
+//! mouse button (or use the arrow keys) to look around, P to print the camera (when not
+//! playing), F12 to save a
 //! capture, Esc to quit.
 //!
 //! Playing: `--save <file>` (a save from the MCP's save_state) or `--new-game` (through the
@@ -542,11 +543,13 @@ fn play_interface(
         (Some(screens), Some(live)) => {
             let level = live.level.as_ref();
             ui.set_level(level.map(|l| l.layout.as_str()), level.map(|l| &l.vfs));
+            ui.set_paused(live.paused);
             for aim in ui.play(screens, &live.sim, dt.min(100.0)) {
                 log::info!("aiming ability {} (click a target)", aim.ability);
                 live.aiming = Some(aim);
             }
             ui.update_minimap(&live.sim, camera);
+            ui.update_floaties(&live.sim, camera, dt.min(100.0));
         }
         _ => {
             for call in ui.tick(dt.min(100.0)) {
@@ -1112,7 +1115,8 @@ impl App {
     fn key_down(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::Escape => return true,
-            KeyCode::KeyP => println!("camera {}", self.camera.spec()),
+            // While playing, P opens the spells/talents screen instead.
+            KeyCode::KeyP if self.screens.is_none() => println!("camera {}", self.camera.spec()),
             // F5 the save screen, F9 the load screen. Provisional: the game's own bindings
             // (quick save and quick load) are not traced.
             KeyCode::F5 | KeyCode::F9 if self.screens.is_some() => {
@@ -1139,14 +1143,18 @@ impl App {
                 }
             }
             // The player's screens: I the inventory, C the character record, T tactics, M the
-            // area map, J the journal (the executable's `ToggleJournal` action), O the options.
-            // Provisional: the game's own key bindings are not traced (it opens its options
-            // from the game menu).
+            // area map, J the journal (the executable's `ToggleJournal` action), K the skills
+            // and P the spells/talents (`ToggleSkills`, `ToggleSpellsTalents`; I, C, J, K and P
+            // are the game's default KeyBindings.ini), O the options. Provisional: the
+            // others' bindings are not traced (the game opens its options from the game menu).
             KeyCode::KeyI
             | KeyCode::KeyC
             | KeyCode::KeyT
             | KeyCode::KeyM
             | KeyCode::KeyJ
+            | KeyCode::KeyK
+            | KeyCode::KeyP
+            | KeyCode::Backslash
             | KeyCode::KeyO
                 if self.screens.is_some() =>
             {
@@ -1174,6 +1182,25 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    /// The mouse wheel turns `steps` (up positive): over the interface, or with a screen up,
+    /// the list or text under the mouse scrolls; elsewhere the game camera zooms.
+    fn wheel(&mut self, steps: f64) {
+        let (x, y) = self.cursor;
+        if let Some(g) = self.gfx.as_mut() {
+            let on_ui = self
+                .screens
+                .as_ref()
+                .is_some_and(|s| !s.exploring() || g.ui.covers(x, y));
+            if on_ui {
+                g.ui.mouse_wheel(x, y, steps);
+                return;
+            }
+        }
+        if let Some(f) = self.follow.as_mut() {
+            f.zoom(steps as f32);
+        }
     }
 
     /// The mouse moves to window pixel (`x`, `y`).
@@ -1337,12 +1364,33 @@ impl App {
                 }
                 log.push("the party falls".into());
             }
+            Step::Call(movie, path, args) => {
+                let r = self
+                    .gfx
+                    .as_mut()
+                    .and_then(|g| g.ui.probe_call(movie, path, args));
+                log.push(format!("call {movie} {path}{args:?}: {r:?}"));
+            }
+            Step::SetValue(k, v) => {
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.probe_set_value(k, v);
+                }
+                log.push(format!("setvalue {k} = {v}"));
+            }
+            Step::Floaty(text) => {
+                if let Some(l) = self.live.as_ref() {
+                    test_floaty(&mut l.sim(), text);
+                }
+                log.push(format!("floaty {text:?}"));
+            }
             &Step::Menu(m) => {
                 self.key_down(match m {
                     screens::Screen::CharacterRecord => KeyCode::KeyC,
                     screens::Screen::Tactics => KeyCode::KeyT,
                     screens::Screen::AreaMap => KeyCode::KeyM,
                     screens::Screen::Journal => KeyCode::KeyJ,
+                    screens::Screen::Skills => KeyCode::KeyK,
+                    screens::Screen::SpellsTalents => KeyCode::KeyP,
                     screens::Screen::Options => KeyCode::KeyO,
                     _ => KeyCode::KeyI,
                 });
@@ -1686,6 +1734,14 @@ impl padplay::Host for App {
             g.ui.clicked();
         }
     }
+
+    fn scroll(&mut self, lines: f64) {
+        App::wheel(self, lines);
+    }
+
+    fn highlight_reply(&mut self, n: usize) -> bool {
+        self.gfx.as_mut().is_some_and(|g| g.ui.highlight_reply(n))
+    }
 }
 
 impl ApplicationHandler for App {
@@ -1748,9 +1804,7 @@ impl ApplicationHandler for App {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y,
                     winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
                 };
-                if let Some(f) = self.follow.as_mut() {
-                    f.zoom(steps);
-                }
+                self.wheel(steps as f64);
             }
             WindowEvent::Focused(false) => {
                 self.keys.clear();
@@ -2003,6 +2057,20 @@ impl padplay::Host for HeadlessHost<'_> {
             layer.clicked();
         }
     }
+
+    fn scroll(&mut self, lines: f64) {
+        let (x, y) = *self.cursor;
+        if let Some((layer, _)) = self.played.as_deref_mut() {
+            layer.mouse_wheel(x, y, lines);
+            println!("pad scroll {lines} at {x:.0},{y:.0}");
+        }
+    }
+
+    fn highlight_reply(&mut self, n: usize) -> bool {
+        self.played
+            .as_deref_mut()
+            .is_some_and(|(layer, _)| layer.highlight_reply(n))
+    }
 }
 
 /// One step of `--steps`.
@@ -2061,6 +2129,14 @@ enum Step {
     /// A game controller's stick is pushed (x, y; +y up): `pad stick-left 0,1 500` holds it
     /// there for a `run` of 500 ms, then lets go.
     PadStick(pad::Stick, f32, f32),
+    /// A movie function called by path, its answer printed, for probing the movies headless:
+    /// `call inventory.gfx _global.GUISystem.InConsoleMode [arg ...]` (numbers, else strings).
+    Call(String, String, Vec<String>),
+    /// An engine value the movies read with `GetValue` (`setvalue DebugOptions.EnableController 1`).
+    SetValue(String, String),
+    /// A floating message over the controlled creature, as a script's
+    /// `DisplayFloatyMessage` makes one (`floaty 12`), for trying the floaty layer headless.
+    Floaty(String),
 }
 
 /// A `pad` step: a button by name (pressed and let go), `press`/`release` and a button, or
@@ -2115,16 +2191,33 @@ fn text_key(name: &str) -> Option<thedas_ui::UiKey> {
     })
 }
 
-/// The player's screen a key opens (I, C, T, M, J, O).
+/// The player's screen a key opens (I, C, T, M, J, K, P, O).
 fn menu_key(code: KeyCode) -> Option<screens::Screen> {
     match code {
         KeyCode::KeyI => Some(screens::Screen::Inventory),
         KeyCode::KeyC => Some(screens::Screen::CharacterRecord),
-        KeyCode::KeyT => Some(screens::Screen::Tactics),
+        // T, and Backslash as the game binds it (`ToggleTactics_0`).
+        KeyCode::KeyT | KeyCode::Backslash => Some(screens::Screen::Tactics),
         KeyCode::KeyM => Some(screens::Screen::AreaMap),
         KeyCode::KeyJ => Some(screens::Screen::Journal),
+        KeyCode::KeyK => Some(screens::Screen::Skills),
+        KeyCode::KeyP => Some(screens::Screen::SpellsTalents),
         KeyCode::KeyO => Some(screens::Screen::Options),
         _ => None,
+    }
+}
+
+/// A floating message over the controlled creature (the `floaty` step): white, the default
+/// style, two seconds.
+fn test_floaty(sim: &mut thedas_sim::Sim, text: &str) {
+    if let Some(target) = sim.world.controlled() {
+        sim.world.floaties.push(thedas_sim::world::FloatyMessage {
+            target,
+            text: text.to_string(),
+            style: 0,
+            colour: 0xffffff,
+            duration: 2.0,
+        });
     }
 }
 
@@ -2158,11 +2251,26 @@ fn parse_step(s: &str) -> Result<Step> {
             Step::Click(x.trim().parse()?, y.trim().parse()?)
         }
         "run" => Step::Run(arg.parse().context("run takes milliseconds")?),
+        "call" => {
+            let mut w = arg.split_whitespace().map(str::to_string);
+            let movie = w.next().context("call takes a movie and a path")?;
+            let path = w.next().context("call takes a movie and a path")?;
+            Step::Call(movie, path, w.collect())
+        }
+        "setvalue" => {
+            let (k, v) = arg
+                .split_once(' ')
+                .context("setvalue takes a name and a value")?;
+            Step::SetValue(k.to_string(), v.trim().to_string())
+        }
+        "floaty" => Step::Floaty(arg.to_string()),
         "key" if arg.eq_ignore_ascii_case("i") => Step::Menu(screens::Screen::Inventory),
         "key" if arg.eq_ignore_ascii_case("c") => Step::Menu(screens::Screen::CharacterRecord),
         "key" if arg.eq_ignore_ascii_case("t") => Step::Menu(screens::Screen::Tactics),
         "key" if arg.eq_ignore_ascii_case("m") => Step::Menu(screens::Screen::AreaMap),
         "key" if arg.eq_ignore_ascii_case("j") => Step::Menu(screens::Screen::Journal),
+        "key" if arg.eq_ignore_ascii_case("k") => Step::Menu(screens::Screen::Skills),
+        "key" if arg.eq_ignore_ascii_case("p") => Step::Menu(screens::Screen::SpellsTalents),
         "key" if arg.eq_ignore_ascii_case("o") => Step::Menu(screens::Screen::Options),
         "key" if matches!(arg.to_ascii_lowercase().as_str(), "f1" | "f2" | "f3" | "f4") => {
             Step::Leader(arg[1..].parse::<usize>()? - 1)
@@ -2469,11 +2577,13 @@ fn main() -> Result<()> {
                                     let shot = l.paperdoll(&ctx, who, yaw, w, h);
                                     layer.set_paperdoll(shot);
                                 }
+                                layer.set_paused(l.paused);
                                 if let Some(aim) = layer.play(s, &l.sim, dt).pop() {
                                     println!("aiming ability {}", aim.ability);
                                     l.aiming = Some(aim);
                                 }
                                 layer.update_minimap(&l.sim, &camera);
+                                layer.update_floaties(&l.sim, &camera, dt);
                                 ui_time += t.elapsed();
                             }
                             frames += 1;
@@ -2520,6 +2630,22 @@ fn main() -> Result<()> {
                     Step::Wipe => {
                         wipe(&mut l.sim());
                         println!("the party falls");
+                    }
+                    Step::Call(movie, path, args) => {
+                        let r = played
+                            .as_mut()
+                            .and_then(|(layer, _)| layer.probe_call(movie, path, args));
+                        println!("call {movie} {path}{args:?}: {r:?}");
+                    }
+                    Step::SetValue(k, v) => {
+                        if let Some((layer, _)) = played.as_mut() {
+                            layer.probe_set_value(k, v);
+                        }
+                        println!("setvalue {k} = {v}");
+                    }
+                    Step::Floaty(text) => {
+                        test_floaty(&mut l.sim(), text);
+                        println!("floaty {text:?}");
                     }
                     &Step::Menu(m) => {
                         if let Some((layer, s)) = played.as_mut() {
@@ -2600,6 +2726,18 @@ fn main() -> Result<()> {
                     sim.dialog_state().map(|d| (d.line, d.replies, d.ended))
                 );
             }
+            let party: Vec<_> = thedas_sim::engine::party_of(&sim)
+                .into_iter()
+                .filter_map(|m| sim.world.get(m))
+                .map(|o| {
+                    (
+                        o.tag.clone(),
+                        o.position,
+                        o.commands.first().map(|c| c.name.clone()),
+                    )
+                })
+                .collect();
+            log::info!("party: {party:?}");
             drop(sim);
             if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
                 camera = f.camera_clear(feet, 0.0, &camera, &|a, b| l.first_hit(a, b));
