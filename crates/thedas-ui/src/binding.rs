@@ -667,14 +667,33 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         num(sim.world.difficulty),
     );
     chargen_screen(sim, &mut v);
-    // No tutorials are queued: popuplayer.gfx hides its tutorial panel when it sees the empty
-    // list (`Tutorials.TutorialList`, observed). Provisional: the game's tutorial queue is
-    // not modelled.
+    // The tutorial popups waiting (popuplayer.gfx shows the first: its `Title`, `Text` and
+    // the `CodexResRef` its Codex button opens; Next when more wait, else Close), with
+    // tutorials on (`Tutorials.Enabled`). An empty list hides the panel.
+    let tutorial_text =
+        |s: Option<u32>| UiValue::String(s.and_then(|s| sim.string(s)).unwrap_or_default());
     v.insert(
         "Tutorials.TutorialList".into(),
-        UiValue::String(String::new()),
+        UiValue::String(
+            sim.world
+                .tutorials
+                .iter()
+                .map(|t| t.resref.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
     );
-    v.insert("Tutorials.Enabled".into(), num(0));
+    for (i, t) in sim.world.tutorials.iter().enumerate() {
+        let k = format!("Tutorials.TutorialList.{i}");
+        v.insert(k.clone(), UiValue::String(t.resref.clone()));
+        v.insert(format!("{k}.Title"), tutorial_text(t.title));
+        v.insert(format!("{k}.Text"), tutorial_text(t.text));
+        v.insert(
+            format!("{k}.CodexResRef"),
+            UiValue::String(t.resref.clone()),
+        );
+    }
+    v.insert("Tutorials.Enabled".into(), num(1));
     v.insert("Tutorials.TrainingStep".into(), num(0));
     // The tutorials' screen highlights (DAConstants `GUI_HIGHLIGHT_*`: 0 follower, 1
     // tactics, 2 inventory, 3 health poultice, 4 empty quickbar, 5 tactic preset, 6

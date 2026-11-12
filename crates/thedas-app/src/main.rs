@@ -1549,6 +1549,18 @@ impl App {
                 }
                 log.push(format!("floaty {text:?}"));
             }
+            Step::Plot(plot, flag) => {
+                if let Some(l) = self.live.as_ref() {
+                    l.sim().set_plot_flag(
+                        plot,
+                        *flag,
+                        true,
+                        true,
+                        thedas_script::vm::OBJECT_INVALID,
+                    );
+                }
+                log.push(format!("plot {plot} {flag}"));
+            }
             &Step::Menu(m) => {
                 self.key_down(match m {
                     screens::Screen::CharacterRecord => KeyCode::KeyC,
@@ -2597,6 +2609,9 @@ enum Step {
     /// A floating message over the controlled creature, as a script's
     /// `DisplayFloatyMessage` makes one (`floaty 12`), for trying the floaty layer headless.
     Floaty(String),
+    /// Sets a plot flag as a script would (`plot plt_tut_explore 0`), running the plot's
+    /// script, for trying journal entries and tutorial popups headless.
+    Plot(String, i32),
 }
 
 /// A `pad` step: a button by name (pressed and let go), `press`/`release` and a button, or
@@ -2724,6 +2739,15 @@ fn parse_step(s: &str) -> Result<Step> {
             Step::SetValue(k.to_string(), v.trim().to_string())
         }
         "floaty" => Step::Floaty(arg.to_string()),
+        "plot" => {
+            let (plot, flag) = arg
+                .rsplit_once(' ')
+                .context("plot takes a plot and a flag")?;
+            Step::Plot(
+                plot.trim().to_string(),
+                flag.trim().parse().context("plot's flag is a number")?,
+            )
+        }
         // The game menu (Escape while playing).
         "gamemenu" => Step::Menu(screens::Screen::GameMenu),
         "key" if arg.eq_ignore_ascii_case("i") => Step::Menu(screens::Screen::Inventory),
@@ -3135,6 +3159,16 @@ fn main() -> Result<()> {
                     Step::Floaty(text) => {
                         test_floaty(&mut l.sim(), text);
                         println!("floaty {text:?}");
+                    }
+                    Step::Plot(plot, flag) => {
+                        l.sim().set_plot_flag(
+                            plot,
+                            *flag,
+                            true,
+                            true,
+                            thedas_script::vm::OBJECT_INVALID,
+                        );
+                        println!("plot {plot} {flag}");
                     }
                     &Step::Menu(m) => {
                         if let Some((layer, s)) = played.as_mut() {
