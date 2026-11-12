@@ -255,8 +255,56 @@ fn check_archive(path: &Path, label: &str, stats: &mut Stats, keep: usize) {
     }
 }
 
+/// FMOD event files parse whole; sound banks' headers parse and their samples' data lie
+/// within the file (decoding every sample is `thedas fsb --check`'s job).
+fn check_audio(path: &Path, ext: &str, label: &str, stats: &mut Stats, keep: usize) {
+    use std::io::Read;
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let result = if ext == "fev" {
+        std::fs::read(path)
+            .map_err(|e| e.to_string())
+            .and_then(|d| {
+                thedas_formats::fev::Fev::parse(&d)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            })
+    } else {
+        let read = || -> std::result::Result<(), String> {
+            let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+            let mut head = vec![0u8; 48];
+            f.read_exact(&mut head).map_err(|e| e.to_string())?;
+            let len = thedas_formats::fsb::Fsb::header_len(&head).map_err(|e| e.to_string())?;
+            if len as u64 > size {
+                return Err(format!(
+                    "headers end at {len}, past the file's {size} bytes"
+                ));
+            }
+            head.resize(len, 0);
+            f.read_exact(&mut head[48..]).map_err(|e| e.to_string())?;
+            let fsb = thedas_formats::fsb::Fsb::parse(&head).map_err(|e| e.to_string())?;
+            match fsb.samples.iter().find(|s| s.data.end as u64 > size) {
+                Some(s) => Err(format!("{}: data past the end of the file", s.name)),
+                None => Ok(()),
+            }
+        };
+        read()
+    };
+    let es = stats.by_ext.entry(ext.to_string()).or_default();
+    es.entries += 1;
+    es.bytes += size;
+    typed_result(stats, ext, label.to_string(), result, keep);
+}
+
 fn check_loose(path: &Path, label: &str, stats: &mut Stats, keep: usize) {
     use std::io::Read;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if ext == "fev" || ext == "fsb" {
+        return check_audio(path, &ext, label, stats, keep);
+    }
     let mut head = [0u8; 16];
     let n = match std::fs::File::open(path).and_then(|mut f| f.read(&mut head)) {
         Ok(n) => n,

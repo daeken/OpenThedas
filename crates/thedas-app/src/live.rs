@@ -79,6 +79,8 @@ pub struct Live {
     talk_camera: crate::talkcam::TalkCamera,
     /// The playing cutscene's camera tracks.
     cutscene_camera: crate::cutcam::CutsceneCamera,
+    /// The creatures cutscenes and conversation lines pose (see [`crate::cutactors`]).
+    cut_actors: crate::cutactors::CutsceneActors,
     /// The shaders' clock (`ApplicationTime`), in seconds: real time, running while the
     /// world is stopped too.
     pub shader_time: f64,
@@ -202,6 +204,7 @@ impl Live {
             detail: Default::default(),
             talk_camera: Default::default(),
             cutscene_camera: Default::default(),
+            cut_actors: Default::default(),
             shader_time: 0.0,
             stage: None,
             staged: None,
@@ -226,6 +229,10 @@ impl Live {
         if self.paused || self.front_end {
             return;
         }
+        // A tutorial that pauses the game holds it until its popup is dismissed.
+        if self.sim().world.tutorial_paused {
+            return;
+        }
         self.owed_ms += dt_ms.clamp(0.0, MAX_STEP_MS);
         let whole = self.owed_ms.floor();
         if whole >= 1.0 {
@@ -234,27 +241,68 @@ impl Live {
         }
     }
 
-    /// Where a segment first meets a solid surface (share of the way), if it does: the
-    /// level's, or a placeable's as drawn (a door shut across a doorway). Provisional: the
-    /// game's own camera collision (its physics shapes) is not traced.
-    pub fn first_hit(&self, from: glam::Vec3, to: glam::Vec3) -> Option<f32> {
+    /// Where a sphere of `radius` metres (0: a segment) moving from `from` to `to` first
+    /// touches a solid surface (share of the way), if it does: the level's, or a
+    /// placeable's as drawn (a door shut across a doorway). DAOrigins.exe's camera sweeps
+    /// its static geometry and placeables (group mask 0x1024, 0x6c3758); provisional: these
+    /// are their drawn triangles rather than their physics shapes.
+    pub fn sweep(&self, from: glam::Vec3, to: glam::Vec3, radius: f32) -> Option<f32> {
         let level = self
             .level
             .as_ref()
-            .and_then(|l| l.collider.first_hit(from, to));
+            .and_then(|l| l.collider.sweep(from, to, radius));
         let objects = self
             .objects
             .as_ref()
-            .and_then(|o| o.solid.first_hit(from, to));
+            .and_then(|o| o.solid.sweep(from, to, radius));
         match (level, objects) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
     }
 
+    /// The game camera this frame following the party leader (see [`crate::follow`]), when
+    /// the leader is in the current area.
+    pub fn follow_camera(
+        &self,
+        follow: &mut crate::follow::Follow,
+        dt: f32,
+        base: &thedas_render::Camera,
+    ) -> Option<thedas_render::Camera> {
+        let feet = self.leader_feet()?;
+        let height = self.leader_look_height();
+        Some(follow.camera_clear(feet, height, dt, base, &|a, b, r| self.sweep(a, b, r)))
+    }
+
+    /// How high above its feet the camera looks at the party leader: its appearance's
+    /// `apr_base.gda` `HEIGHT`, or `HEIGHT_F` for a female (`CAppearance` 0x748a40 picks by
+    /// gender 2), else [`crate::follow::DEFAULT_LOOK_HEIGHT`] (0x6a1a30 hands the camera
+    /// the appearance's height).
+    pub fn leader_look_height(&self) -> f32 {
+        let sim = self.sim();
+        let w = &sim.world;
+        let height = w.controlled().and_then(|id| w.get(id)).and_then(|o| {
+            let t = w.tables().get(0, "apr_base")?;
+            let column = if o.fields.get("Gender").copied() == Some(2) {
+                "HEIGHT_F"
+            } else {
+                "HEIGHT"
+            };
+            match t.cell(column, o.appearance as i64)? {
+                thedas_formats::gda::Cell::Float(v) => Some(*v as f32),
+                thedas_formats::gda::Cell::Int(v) => Some(*v as f32),
+                _ => None,
+            }
+        });
+        height
+            .filter(|h| h.is_finite() && *h > 0.0)
+            .unwrap_or(crate::follow::DEFAULT_LOOK_HEIGHT)
+    }
+
     /// Advances what runs while the world may be stopped (the conversation camera's clock).
     pub fn advance_presentation(&mut self, dt_ms: f64) {
         self.talk_camera.advance(dt_ms);
+        self.cut_actors.advance(dt_ms);
         if dt_ms.is_finite() && dt_ms > 0.0 {
             self.shader_time += dt_ms / 1000.0;
             self.stage_clock_ms += dt_ms;
@@ -478,7 +526,7 @@ impl Live {
             self.objects = None;
             self.level = Some(self.build_level(ctx, format, &layout)?);
         }
-        let models = match &staged {
+        let mut models = match &staged {
             Some((id, stage)) => stage_models(&sim, *id, stage, &mut self.models),
             None => thedas_ui::models::area_models_cached(&sim, area, &mut self.models),
         };
@@ -489,13 +537,16 @@ impl Live {
             self.stage_shown = None;
             self.stage_blend = None;
         }
-        // A staged conversation line draws its actors at their stage marks.
-        let base = thedas_render::Camera::new(glam::Vec3::ZERO, 0.0, 0.0);
-        let marks = self
-            .talk_camera
-            .staging(&sim, &base)
-            .map(|s| s.marks.clone())
-            .unwrap_or_default();
+        // A cutscene playing, or a conversation line's own, poses its actors' creatures
+        // and shows its own.
+        let tracks = self.cutscene_camera.tracks(&sim);
+        let shown = self.cut_actors.shown(&sim, tracks);
+        let mut posing = shown.actors;
+        for (m, show) in shown.own {
+            posing.insert(m.id, show);
+            models.push(m);
+        }
+        let kept = shown.kept;
         drop(sim);
         let key = objects_key(&models);
         if self.objects.as_ref().map(|o| &o.key) != Some(&key) {
@@ -506,13 +557,58 @@ impl Live {
         let (Some(level), Some(objects)) = (self.level.as_ref(), self.objects.as_mut()) else {
             return Ok(());
         };
-        let posed: Vec<(Mat4, Option<Clip>)> = models
-            .iter()
-            .map(|m| {
-                let (at, facing) = marks.get(&m.id).copied().unwrap_or((m.position, m.facing));
-                (Prop::placement(at, facing), m.motion.as_ref().map(clip))
-            })
-            .collect();
+        let mut posed: Vec<(Mat4, Option<Clip>)> = Vec::with_capacity(models.len());
+        for m in &models {
+            let mut c = m.motion.as_ref().map(clip);
+            let none = Vec::new();
+            let held = kept.get(&m.id).unwrap_or(&none);
+            let (at, facing) = match posing.get(&m.id) {
+                _ if !posing.contains_key(&m.id) && !held.is_empty() => {
+                    let base_trees = c.as_ref().map(|c| c.trees.clone()).unwrap_or_default();
+                    for a in held {
+                        let layer = cut_layer(&mut self.animator, &level.vfs, a, &base_trees);
+                        match c.as_mut() {
+                            Some(c) => c.layers.push(layer),
+                            None => c = Some(layer),
+                        }
+                    }
+                    (m.position, m.facing)
+                }
+                Some(show) => {
+                    let mut at = show.position;
+                    if show.snaps {
+                        let p = glam::Vec3::from_array(at);
+                        let (from, to) = (p + glam::Vec3::Z * 1.5, p - glam::Vec3::Z * 3.0);
+                        if let Some(f) = level.collider.first_hit(from, to) {
+                            at[2] = from.lerp(to, f).z;
+                        }
+                    }
+                    log::trace!(
+                        "cutscene actor {} {}: at {:?} (pose z {}) facing {}, {:?}",
+                        m.id,
+                        m.tag,
+                        at,
+                        show.position[2],
+                        show.facing,
+                        show.animations
+                            .iter()
+                            .map(|a| format!("{}@{:.2}", a.node, a.time))
+                            .collect::<Vec<_>>()
+                    );
+                    let base_trees = c.as_ref().map(|c| c.trees.clone()).unwrap_or_default();
+                    for a in held.iter().chain(&show.animations) {
+                        let layer = cut_layer(&mut self.animator, &level.vfs, a, &base_trees);
+                        match c.as_mut() {
+                            Some(c) => c.layers.push(layer),
+                            None => c = Some(layer),
+                        }
+                    }
+                    (at, show.facing)
+                }
+                None => (m.position, m.facing),
+            };
+            posed.push((Prop::placement(at, facing), c));
+        }
         self.animator.pose_props(
             &level.vfs,
             &objects.scene,
@@ -1280,11 +1376,35 @@ pub fn prop(m: &ObjectModel) -> Prop {
 }
 
 /// A creature's motion as an animation clip.
+/// A cutscene animation as a layer over a creature's own motion (whose trees are `trees`):
+/// it loops when those trees loop its animation, else when its track spans the whole
+/// cutscene (see [`crate::cutactors`]).
+fn cut_layer(
+    animator: &mut Animator,
+    vfs: &Vfs,
+    a: &crate::cutactors::CutAnimation,
+    trees: &[String],
+) -> Clip {
+    let once = animator
+        .action_animation(vfs, &a.tree, &a.node)
+        .and_then(|ani| animator.plays_once(vfs, trees, &ani));
+    Clip {
+        trees: vec![a.tree.clone()],
+        actions: vec![a.node.clone()],
+        time: a.time,
+        looping: once.map_or(a.unbounded, |o| !o),
+        layers: Vec::new(),
+        absolute: true,
+    }
+}
+
 pub fn clip(m: &thedas_ui::models::Motion) -> Clip {
     Clip {
         trees: m.trees.clone(),
         actions: m.actions.clone(),
         time: m.time,
         looping: m.looping,
+        layers: Vec::new(),
+        absolute: false,
     }
 }

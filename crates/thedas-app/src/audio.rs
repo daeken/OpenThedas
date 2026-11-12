@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use thedas_audio::area::{AreaSound, area_audio};
+use thedas_audio::area::{AreaReverb, AreaSound, area_audio, area_reverb};
 use thedas_audio::{AudioEngine, EventHandle, Library, PlayOptions, Volumes};
 use thedas_formats::anim::AnimEventText;
 use thedas_vfs::Vfs;
@@ -31,6 +31,28 @@ pub struct VoiceLine {
     pub female: bool,
     pub ambient: bool,
 }
+
+/// An attack's blow: where the target stands, the `COMBAT_RESULT_*`, and the base items of
+/// the attacker's weapon and the target's armour and shield.
+pub type Impact = ([f32; 3], i32, Option<i32>, Option<i32>, Option<i32>);
+
+/// A creature's body armour, main-hand and off-hand base items (`BaseItem`), and whether
+/// it is fighting.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Gear {
+    pub armour: Option<i32>,
+    pub main: Option<i32>,
+    pub off: Option<i32>,
+    pub combat: bool,
+    /// The creature's footstep column in `sound_movement_footsteps.gda` (a column hash:
+    /// its appearance's footstep type).
+    pub footstep: Option<u32>,
+    /// The ground under it: sound material (low nibble), vegetation (high nibble).
+    pub surface: u8,
+}
+
+/// A party-picker member: id, template, sound set, position.
+pub type PickerMember = (u32, String, Option<String>, [f32; 3]);
 
 /// What the game is doing, as the sound follows it.
 #[derive(Clone, Debug, Default)]
@@ -47,8 +69,25 @@ pub struct AudioState {
     /// Each drawn creature's animation now: id, `.ani` resource, seconds into it, its
     /// length, position (see `Live::animation_clocks`).
     pub animations: Vec<(u32, String, f32, f32, [f32; 3])>,
+    /// What the animated creatures wear and wield, for their animations' foley and swings:
+    /// id -> (body armour, main-hand, off-hand base items, in combat).
+    pub gear: std::collections::HashMap<u32, Gear>,
+    /// Attacks' blows: (target position, result, attacker's weapon, target's armour and
+    /// shield base items).
+    pub impacts: Vec<Impact>,
+    /// Sound set lines to say: (set, `ss_types.gda` type, probability override (0: the
+    /// type's own), where the speaker stands (none: 2D)).
+    pub sound_sets: Vec<(String, i32, f32, Option<[f32; 3]>)>,
+    /// The party picker while it is open: each member picked (id, template, sound set,
+    /// position).
+    pub picker: Option<Vec<PickerMember>>,
+    /// The pool's followers (to say an unpicked one's line): id -> (id, template, sound set,
+    /// position).
+    pub picker_left: std::collections::HashMap<u32, PickerMember>,
     /// Events scripts played (`PlaySound`), with where the object stands (none: 2D).
     pub script_sounds: Vec<(String, Option<[f32; 3]>)>,
+    /// Scripts' `SetMusicIntensity`, the latest this frame.
+    pub music_intensity: Option<i32>,
     /// A boot movie playing (its file) and how far it has played (milliseconds): its own
     /// sound track plays with it.
     pub movie: Option<(std::path::PathBuf, f64)>,
@@ -59,6 +98,8 @@ pub struct AudioState {
     pub dead: bool,
     /// Where the listener is (between the party leader and the camera) and its right.
     pub listener: Option<([f32; 3], [f32; 3])>,
+    /// Where the party leader stands (reverb triggers follow it).
+    pub leader: Option<[f32; 3]>,
     /// The area's sound objects the simulation has switched off (`ActivateSoundByTag`), by
     /// tag (lowercase).
     pub inactive_sounds: Vec<String>,
@@ -118,6 +159,9 @@ struct AreaPlay {
     /// Per sound: playing (`Some(Some)`), played through while in reach (`Some(None)`: it
     /// plays again once the listener has left and come back), or not started.
     playing: Vec<Option<Option<EventHandle>>>,
+    reverb: AreaReverb,
+    /// The reverb preset applied (`None` until the first).
+    preset: Option<String>,
 }
 
 /// A cutscene's sound tracks and which of them are playing.
@@ -146,36 +190,294 @@ pub struct GameAudio {
     anim_events: std::collections::HashMap<String, Arc<Vec<AnimEventText>>>,
     /// Each creature's animation and time last frame.
     anim_clocks: std::collections::HashMap<u32, (String, f32)>,
-    /// `sound_movement_footsteps.gda` row 0 (no surface known): the humanoid and dog
-    /// footstep events.
-    footsteps: (Option<String>, Option<String>),
+    /// `sound_movement_footsteps.gda` (rows: ground material; columns: footstep type) and
+    /// `sound_movement_scuffing.gda` (rows: ground material).
+    footsteps: Option<thedas_formats::Gda>,
+    scuffs: Option<thedas_formats::Gda>,
+    /// Weapon impacts: each base item's sound material (`BITM_base.gda`), and each weapon
+    /// material's impact events (`sound_weapon_hits.gda`).
+    impacts: Impacts,
+    /// Swing and armour-foley events (animation event kinds 19 and 17).
+    foley: Foley,
+    /// The music's `music_state` (scripts' `SetMusicIntensity`; 1 until one sets it).
+    music_state: f32,
+    /// `ss_types.gda`: each sound set type's first entry row and default probability.
+    ss_types: std::collections::HashMap<i32, (i64, f32)>,
+    /// Each sound set's entries (`sse_<set>.gda`: entry row -> line strref), read once.
+    sound_set_entries: std::collections::HashMap<String, Arc<Vec<(i64, i64)>>>,
+    rng: u64,
+    /// `partypicker.gda`: each follower template's picked and unpicked sound set entries
+    /// ("default" for any other).
+    picker_lines: std::collections::HashMap<String, (i32, i32)>,
+    /// Who the open party picker had picked last frame, and when it last spoke.
+    picked: Option<Vec<u32>>,
+    /// Seconds of frame time since the picker last spoke.
+    picker_spoke: f32,
+    /// Creature templates' sound sets (`.utc` `SoundSet`), for creatures that do not carry
+    /// theirs (from a save made before the simulation kept it).
+    template_sets: std::collections::HashMap<String, Option<String>>,
     last: Instant,
 }
 
-/// `sound_movement_footsteps.gda`'s first row (surface unknown): the small humanoid's and the
-/// dog's footstep events. Provisional: the walkmesh's surface and the creature's footstep
-/// type (the other rows and columns) are not chosen yet.
-fn footstep_events(vfs: &Vfs) -> (Option<String>, Option<String>) {
-    let Ok((data, _)) = vfs.read("sound_movement_footsteps.gda") else {
-        return (None, None);
+/// `apr_base.gda`'s footstep type column (DAOrigins.exe 0x6a098a).
+pub const APR_FOOTSTEP: u32 = 0xda48_e219;
+/// `sound_movement_scuffing.gda`'s event column (0x5b8d5f).
+const COL_SCUFF: u32 = 0xb449_8545;
+
+/// A creature's footstep column: its appearance's footstep type (`HUMANOID_SMALL`, `DOG`,
+/// ...), trimmed, `Unknown` when the row has none, as a column hash (DAOrigins.exe
+/// 0x6a096e..0x6a09dc).
+pub fn footstep_column(cell: Option<&thedas_formats::gda::Cell>) -> u32 {
+    let name = match cell {
+        Some(thedas_formats::gda::Cell::String(s)) => {
+            s.trim_matches(|c| c == '\0' || c == ' ' || c == '\t')
+        }
+        _ => "Unknown",
     };
-    let Ok(gda) = thedas_formats::Gda::parse(&data) else {
-        return (None, None);
+    thedas_formats::gda::column_hash(name)
+}
+
+fn read_gda(vfs: &Vfs, name: &str) -> Option<thedas_formats::Gda> {
+    vfs.read(name)
+        .ok()
+        .and_then(|(d, _)| thedas_formats::Gda::parse(&d).ok())
+}
+
+/// The event in row `row`, column `col` (by hash) of a sound table, if any.
+fn table_event(t: &thedas_formats::Gda, row: i64, col: u32) -> Option<String> {
+    let c = t.columns.iter().position(|c| c.hash == col)?;
+    match t.row_by_id(row)?.get(c)? {
+        thedas_formats::gda::Cell::String(s) => {
+            let s = s.trim_end_matches('\0').trim();
+            (!s.is_empty()).then(|| s.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// `ss_types.gda`: each sound set type (1 COMBAT ATTACK, 2 COMBAT BATTLE CRY, ...) with the
+/// row its entries start at in a set's `sse_<set>.gda` (100, 200, ...) and the chance a
+/// line of it is said.
+fn ss_types(vfs: &Vfs) -> std::collections::HashMap<i32, (i64, f32)> {
+    use thedas_formats::gda::Cell;
+    let mut out = std::collections::HashMap::new();
+    let Some(t) = vfs
+        .read("ss_types.gda")
+        .ok()
+        .and_then(|(d, _)| thedas_formats::Gda::parse(&d).ok())
+    else {
+        return out;
     };
-    let Some(row) = gda.row_by_id(0) else {
-        return (None, None);
-    };
-    let events: Vec<String> = row
-        .iter()
-        .filter_map(|c| match c {
-            thedas_formats::gda::Cell::String(s) if s.contains('/') => {
-                Some(s.trim_end_matches('\0').trim().to_string())
+    for row in &t.rows {
+        let nums: Vec<f64> = row
+            .iter()
+            .filter_map(|c| match c {
+                Cell::Int(i) => Some(*i as f64),
+                Cell::Float(f) => Some(*f),
+                _ => None,
+            })
+            .collect();
+        // ID, first entry row, probability, ...
+        if let [id, base, p, ..] = nums[..] {
+            out.insert(id as i32, (base as i64, p as f32));
+        }
+    }
+    out
+}
+
+/// `sound_weapon_actions.gda` and `sound_movement_foley.gda`: events by (row, column hash).
+#[derive(Default)]
+struct Foley {
+    tables: std::collections::HashMap<&'static str, std::collections::HashMap<(i64, u32), String>>,
+}
+
+const COL_SWISH: u32 = 0xa334_7e2b;
+/// `sound_movement_footsteps.gda`'s `HUMANOID_SMALL` column.
+const COL_HUMANOID_SMALL: u32 = 0x787a_7bc5;
+const COL_SMALL: u32 = 0xce0a_5368;
+const COL_MEDIUM: u32 = 0x0d0e_d12a;
+
+impl Foley {
+    fn read(vfs: &Vfs) -> Foley {
+        use thedas_formats::gda::Cell;
+        let mut out = Foley::default();
+        for (key, name) in [
+            ("weapon", "sound_weapon_actions.gda"),
+            ("movement", "sound_movement_foley.gda"),
+        ] {
+            let Some(t) = vfs
+                .read(name)
+                .ok()
+                .and_then(|(d, _)| thedas_formats::Gda::parse(&d).ok())
+            else {
+                continue;
+            };
+            let mut cells = std::collections::HashMap::new();
+            for row in &t.rows {
+                let Some(Cell::Int(id)) = row.first() else {
+                    continue;
+                };
+                for (c, cell) in t.columns.iter().zip(row) {
+                    if let Cell::String(s) = cell {
+                        let s = s.trim_end_matches('\0').trim();
+                        if s.contains('/') {
+                            cells.insert((*id, c.hash), s.to_string());
+                        }
+                    }
+                }
             }
-            _ => None,
-        })
-        .collect();
-    let find = |part: &str| events.iter().find(|e| e.contains(part)).cloned();
-    (find("/humanoid/small/"), find("/dog/"))
+            out.tables.insert(key, cells);
+        }
+        out
+    }
+
+    fn cell(&self, table: &str, row: Option<i64>, column: u32) -> Option<String> {
+        self.tables.get(table)?.get(&(row?, column)).cloned()
+    }
+}
+
+/// `partypicker.gda`: per follower template (column 0x88578372), the sound set entries said
+/// when picked (0x50853e6b: 47 YES) and unpicked (0xfd7493a7: 54 CUSS), as the picker's
+/// code reads them (DAOrigins.exe 0x767a2a, 0x767a45); the `Default` row serves the rest.
+fn picker_lines(vfs: &Vfs) -> std::collections::HashMap<String, (i32, i32)> {
+    use thedas_formats::gda::Cell;
+    let mut out = std::collections::HashMap::new();
+    let Some(t) = vfs
+        .read("partypicker.gda")
+        .ok()
+        .and_then(|(d, _)| thedas_formats::Gda::parse(&d).ok())
+    else {
+        return out;
+    };
+    let col = |h: u32| t.columns.iter().position(|c| c.hash == h);
+    let (Some(tc), Some(lc), Some(sc), Some(uc)) = (
+        col(0x8857_8372),
+        col(0xb49c_a166),
+        col(0x5085_3e6b),
+        col(0xfd74_93a7),
+    ) else {
+        return out;
+    };
+    for row in &t.rows {
+        let text = |i: usize| match row.get(i) {
+            Some(Cell::String(s)) => s.trim_end_matches('\0').trim().to_ascii_lowercase(),
+            _ => String::new(),
+        };
+        let num = |i: usize| match row.get(i) {
+            Some(Cell::Int(v)) => *v as i32,
+            _ => 0,
+        };
+        let key = if text(lc) == "default" {
+            "default".to_string()
+        } else {
+            text(tc)
+        };
+        if !key.is_empty() && num(sc) > 0 {
+            out.insert(key, (num(sc), num(uc)));
+        }
+    }
+    out
+}
+
+/// What an attack's blow sounds like.
+///
+/// `BITM_base.gda`'s column 0x7e0505a1 gives each base item a sound material
+/// (`sound_item_materials.gda`: 1 sword, 2 axe, 3 blunt, 4 dagger, 5/6 wood/steel shield,
+/// 7 staff, 8 bow, 9 crossbow, 10-13 leather/cloth/chain/metal armour, ...); found by its
+/// values (every weapon kind matches), the column's name is not known. A blow plays
+/// `sound_weapon_hits.gda`'s event for the weapon's material (bare hands without one) and
+/// what it struck: the target's armour (flesh without), its shield when blocked (wood or
+/// metal). Misses play nothing here: the swing's whoosh is the animation's own event.
+/// Provisional: creatures' hides (fur, scale, bone, stone) are taken as flesh.
+#[derive(Default)]
+struct Impacts {
+    materials: std::collections::HashMap<i64, i64>,
+    hits: std::collections::HashMap<i64, Vec<String>>,
+}
+
+const COL_SOUND_MATERIAL: u32 = 0x7e05_05a1;
+const BARE_HANDS: i64 = 19;
+
+impl Impacts {
+    fn read(vfs: &Vfs) -> Impacts {
+        let table = |name: &str| {
+            vfs.read(name)
+                .ok()
+                .and_then(|(d, _)| thedas_formats::Gda::parse(&d).ok())
+        };
+        let mut out = Impacts::default();
+        if let Some(t) = table("BITM_base.gda")
+            && let Some(col) = t.columns.iter().position(|c| c.hash == COL_SOUND_MATERIAL)
+        {
+            for row in &t.rows {
+                let id = match row.first() {
+                    Some(thedas_formats::gda::Cell::Int(i)) => *i,
+                    _ => continue,
+                };
+                if let Some(thedas_formats::gda::Cell::Int(m)) = row.get(col) {
+                    out.materials.insert(id, *m);
+                }
+            }
+        }
+        if let Some(t) = table("sound_weapon_hits.gda") {
+            for row in &t.rows {
+                let id = match row.first() {
+                    Some(thedas_formats::gda::Cell::Int(i)) => *i,
+                    _ => continue,
+                };
+                let events = row
+                    .iter()
+                    .filter_map(|c| match c {
+                        thedas_formats::gda::Cell::String(s) if s.contains('/') => {
+                            Some(s.trim_end_matches('\0').trim().to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                out.hits.insert(id, events);
+            }
+        }
+        out
+    }
+
+    /// A base item's sound material.
+    fn material(&self, base: Option<i32>) -> Option<i64> {
+        base.and_then(|b| self.materials.get(&(b as i64)).copied())
+    }
+
+    /// The event a blow plays, if any.
+    fn event(
+        &self,
+        result: i32,
+        weapon: Option<i32>,
+        armour: Option<i32>,
+        shield: Option<i32>,
+    ) -> Option<String> {
+        const HIT: i32 = 1;
+        const CRITICAL: i32 = 2;
+        const DEATHBLOW: i32 = 4;
+        const BLOCKED: i32 = 5;
+        const BACKSTAB: i32 = 9;
+        let material = |b: Option<i32>| b.and_then(|b| self.materials.get(&(b as i64)).copied());
+        let w = material(weapon).filter(|m| self.hits.get(m).is_some_and(|e| !e.is_empty()));
+        let events = self.hits.get(&w.unwrap_or(BARE_HANDS))?;
+        let ending = match result {
+            BLOCKED => match material(shield) {
+                Some(6) => "/impact_materials/metal",
+                Some(_) => "/impact_materials/wood",
+                None => return None,
+            },
+            HIT | CRITICAL | DEATHBLOW | BACKSTAB => match material(armour) {
+                Some(10) => "/impact_armor/leather_arm",
+                Some(11) => "/impact_armor/cloth_arm",
+                Some(12) => "/impact_armor/chain_arm",
+                Some(13) => "/impact_armor/metal_arm",
+                _ => "/impact_armor/flesh",
+            },
+            _ => return None,
+        };
+        events.iter().find(|e| e.ends_with(ending)).cloned()
+    }
 }
 
 /// `sound_gui.gda`: the interface sound ids' events.
@@ -262,17 +564,138 @@ impl GameAudio {
             vfs: vfs.clone(),
             anim_events: Default::default(),
             anim_clocks: Default::default(),
-            footsteps: footstep_events(vfs),
+            footsteps: read_gda(vfs, "sound_movement_footsteps.gda"),
+            scuffs: read_gda(vfs, "sound_movement_scuffing.gda"),
+            impacts: Impacts::read(vfs),
+            foley: Foley::read(vfs),
+            music_state: 1.0,
+            ss_types: ss_types(vfs),
+            sound_set_entries: Default::default(),
+            rng: 0x2545_f491_4f6c_dd1d,
+            template_sets: Default::default(),
+            picker_lines: picker_lines(vfs),
+            picked: None,
+            picker_spoke: f32::INFINITY,
             last: Instant::now(),
         }
     }
 
+    /// A creature template's sound set (its `.utc`'s `SoundSet`), read once.
+    pub fn template_sound_set(&mut self, vfs: &Vfs, template: &str) -> Option<String> {
+        use thedas_formats::gff3::{Gff3, Value};
+        let key = template.to_ascii_lowercase();
+        if let Some(s) = self.template_sets.get(&key) {
+            return s.clone();
+        }
+        let set = vfs
+            .read(&format!("{key}.utc"))
+            .ok()
+            .and_then(|(d, _)| Gff3::parse(&d).ok())
+            .and_then(|g| {
+                g.root()
+                    .fields
+                    .iter()
+                    .find(|f| f.label == "SoundSet")
+                    .and_then(|f| match &f.value {
+                        Value::ResRef(b) | Value::ExoString(b) => {
+                            let s = String::from_utf8_lossy(b)
+                                .trim_end_matches('\0')
+                                .trim()
+                                .to_ascii_lowercase();
+                            (!s.is_empty()).then_some(s)
+                        }
+                        _ => None,
+                    })
+            });
+        self.template_sets.insert(key, set.clone());
+        set
+    }
+
+    fn random(&mut self) -> u64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        self.rng
+    }
+
+    /// A line of sound set `set` of type `entry` (`ss_types.gda`): one of the set's entries
+    /// for that type (`sse_<set>.gda` rows from the type's first row on, below the next
+    /// type's) at random, said with the type's probability (or the override). It plays the
+    /// set's `VO/VOambient_ss` event with the line's sample (`<strref>_m`, else `_f`).
+    /// Provisional: which event a set's lines use, and engine-side throttling (the
+    /// `sound_settings.gda` playback limits) beyond the event's own max playbacks.
+    fn say_sound_set(&mut self, set: &str, entry: i32, probability: f32, at: Option<[f32; 3]>) {
+        let Some(&(base, p)) = self.ss_types.get(&entry) else {
+            log::debug!("audio: no sound set type {entry}");
+            return;
+        };
+        let chance = if probability > 0.0 { probability } else { p };
+        if (self.random() % 10_000) as f32 / 10_000.0 >= chance {
+            return;
+        }
+        let key = set.to_ascii_lowercase();
+        let entries = match self.sound_set_entries.get(&key) {
+            Some(e) => e.clone(),
+            None => {
+                use thedas_formats::gda::Cell;
+                let rows: Vec<(i64, i64)> = self
+                    .vfs
+                    .read(&format!("sse_{key}.gda"))
+                    .ok()
+                    .and_then(|(d, _)| thedas_formats::Gda::parse(&d).ok())
+                    .map(|t| {
+                        t.rows
+                            .iter()
+                            .filter_map(|r| match (r.first(), r.get(1)) {
+                                (Some(Cell::Int(id)), Some(Cell::Int(s))) => Some((*id, *s)),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let rows = Arc::new(rows);
+                self.sound_set_entries.insert(key.clone(), rows.clone());
+                rows
+            }
+        };
+        let lines: Vec<i64> = entries
+            .iter()
+            .filter(|(id, s)| *id >= base && *id < base + 100 && *s > 0)
+            .map(|(_, s)| *s)
+            .collect();
+        if lines.is_empty() {
+            return;
+        }
+        let strref = lines[(self.random() % lines.len() as u64) as usize];
+        let lib = self.engine.library.clone();
+        let sample = [format!("{strref}_m"), format!("{strref}_f")]
+            .into_iter()
+            .find(|s| lib.find_sample(&key, s).is_some());
+        let Some(sample) = sample else {
+            log::debug!("audio: sound set {key} has no sample for {strref}");
+            return;
+        };
+        self.engine.play(
+            &format!("{key}/VO/VOambient_ss"),
+            PlayOptions {
+                programmer_sound: Some(sample),
+                position: at,
+                ..Default::default()
+            },
+        );
+    }
+
     /// Animations' sound events: as a creature's animation passes an event, kind 20 plays the
     /// event it names (weapon swings, creature noises: `glo_fly_wep/...`) and kind 14 a
-    /// footstep (see [`footstep_events`]) where the creature stands. Provisional: events on
-    /// the frame an animation starts are those at its time 0 onward; footsteps sound for
-    /// humanoids and dogs only.
-    fn follow_animations(&mut self, clocks: Vec<(u32, String, f32, f32, [f32; 3])>) {
+    /// footstep for the ground under the creature where it stands. Provisional: events on
+    /// the frame an animation starts are those at its time 0 onward; DAOrigins.exe's
+    /// footstep gate (0x7c4a80: small and medium creatures in some state) is not applied,
+    /// and vegetation rustles (the surface's high nibble) are not played.
+    fn follow_animations(
+        &mut self,
+        clocks: Vec<(u32, String, f32, f32, [f32; 3])>,
+        gear: &std::collections::HashMap<u32, Gear>,
+    ) {
         let mut seen = std::collections::HashMap::new();
         for (id, ani, t, length, pos) in clocks {
             let key = ani.to_ascii_lowercase();
@@ -314,20 +737,56 @@ impl GameAudio {
             for ev in events.iter().filter(|e| crossed(e.time)) {
                 let event = match (ev.kind, &ev.text) {
                     (20, Some(path)) => Some(path.clone()),
-                    (14, Some(tags)) if tags.contains("Left") => {
-                        if key.starts_with("c_dog") {
-                            self.footsteps.1.clone()
-                        } else if is_humanoid(&key) {
-                            self.footsteps.0.clone()
-                        } else {
+                    // A swing (DAOrigins.exe 0x69e940): `sound_weapon_actions.gda`'s Swish
+                    // for the weapon's sound material, the off hand's when the event says
+                    // `Left`.
+                    (19, text) => {
+                        let g = gear.get(&id).copied().unwrap_or_default();
+                        let left = text.as_deref().is_some_and(|t| t.contains("Left"));
+                        let w = if left { g.off } else { g.main };
+                        let m = self.impacts.material(w);
+                        self.foley.cell("weapon", m, COL_SWISH)
+                    }
+                    // Armour foley (0x69e7f0): `sound_movement_foley.gda`'s column the event
+                    // names (`Small`, `Medium`, `Large`) for the armour's sound material
+                    // (none: row 0). Gated as 0x7c4a80 gates it: a small or medium creature
+                    // sounds it only in combat. Provisional: the creature's own size class
+                    // (+0x934) is taken from the column, and "in combat" stands for its
+                    // state 3.
+                    (17, Some(size)) => {
+                        let g = gear.get(&id).copied().unwrap_or_default();
+                        let col = thedas_formats::gda::column_hash(size.trim());
+                        let small_or_medium = col == COL_SMALL || col == COL_MEDIUM;
+                        if small_or_medium && !g.combat {
                             None
+                        } else {
+                            let m = self.impacts.material(g.armour).unwrap_or(0);
+                            self.foley.cell("movement", Some(m), col)
+                        }
+                    }
+                    // A footstep (0x6aaaa0 -> 0x5b8d51): the ground's material under the
+                    // creature picks the row; an event marked `|Scuff` plays the scuffing
+                    // table's event, any other the footstep table's in the creature's
+                    // footstep column.
+                    (14, text) => {
+                        let g = gear.get(&id).copied().unwrap_or_default();
+                        let row = (g.surface & 0xf) as i64;
+                        if text.as_deref().is_some_and(|t| t.contains("|Scuff")) {
+                            self.scuffs
+                                .as_ref()
+                                .and_then(|t| table_event(t, row, COL_SCUFF))
+                        } else {
+                            let col = g.footstep.unwrap_or(COL_HUMANOID_SMALL);
+                            self.footsteps
+                                .as_ref()
+                                .and_then(|t| table_event(t, row, col))
                         }
                     }
                     _ => None,
                 };
                 if let Some(event) = event {
                     log::trace!(
-                        "audio: {key} {:?} -> {t:.3} (len {length:.3}): event at {:.3}",
+                        "audio: {key} {:?} -> {t:.3} (len {length:.3}): {event} at {:.3}",
                         prev.as_ref().map(|p| p.1),
                         ev.time
                     );
@@ -401,9 +860,13 @@ impl GameAudio {
     pub fn set_area(&mut self, resref: &str, data: &[u8]) {
         self.end_area();
         let (theme, sounds) = area_audio(data);
+        let reverb = area_reverb(data);
         log::info!(
-            "audio: area {resref}: music {theme:?}, {} placed sounds",
-            sounds.len()
+            "audio: area {resref}: music {theme:?}, {} placed sounds, reverb {:?} and {} \
+             reverb triggers",
+            sounds.len(),
+            reverb.preset,
+            reverb.triggers.len()
         );
         let n = sounds.len();
         self.area = Some(AreaPlay {
@@ -412,11 +875,17 @@ impl GameAudio {
             track: None,
             sounds,
             playing: vec![None; n],
+            reverb,
+            preset: None,
         });
     }
 
     fn end_area(&mut self) {
         if let Some(a) = self.area.take() {
+            if a.preset.is_some() {
+                self.engine
+                    .set_reverb(thedas_formats::fev::ReverbProperties::OFF, 0.0);
+            }
             for h in a
                 .playing
                 .into_iter()
@@ -475,7 +944,7 @@ impl GameAudio {
                 let h = self.engine.play(
                     &format!("{theme}/{want}"),
                     PlayOptions {
-                        parameters: vec![("music_state".into(), 1.0)],
+                        parameters: vec![("music_state".into(), self.music_state)],
                         ..Default::default()
                     },
                 );
@@ -485,6 +954,20 @@ impl GameAudio {
                     log::debug!("audio: no music {theme}/{want}");
                 }
             }
+        }
+        // The reverb: the area's preset, or a reverb trigger's while the party leader is in
+        // it, faded over 0.33 s (DAOrigins.exe 0xaff1c8; set at once on arrival).
+        let at = state.leader.or(state.listener.map(|l| l.0));
+        let want = at.map_or(a.reverb.preset.as_str(), |p| a.reverb.preset_at(p));
+        if a.preset.as_deref() != Some(want) {
+            let props = self.engine.reverb_preset(want).unwrap_or_else(|| {
+                log::debug!("audio: no reverb preset {want:?}");
+                thedas_formats::fev::ReverbProperties::OFF
+            });
+            let fade = if a.preset.is_some() { 0.33 } else { 0.0 };
+            log::debug!("audio: reverb {want:?} over {fade} s");
+            self.engine.set_reverb(props, fade);
+            a.preset = Some(want.to_string());
         }
         let Some((listener, _)) = state.listener else {
             return;
@@ -671,6 +1154,63 @@ impl GameAudio {
                 None => log::debug!("audio: GUI sound {s:?} has no event"),
             }
         }
+        for (at, result, weapon, armour, shield) in std::mem::take(&mut state.impacts) {
+            if let Some(event) = self.impacts.event(result, weapon, armour, shield) {
+                self.engine.play(
+                    &event,
+                    PlayOptions {
+                        position: Some(at),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        // Sound set lines come from scripts (`PlaySoundSet`; rules and AI scripts pass the
+        // grunt and pain types themselves) and character creation's preview. DAOrigins.exe
+        // calls its sound set player (0x6b5740) only from the script command (0x6625c6), two
+        // message handlers (0x60ba68, 0x6b75a0) and one timed system (0x7660f2, 0x766242);
+        // nothing adds barks around each blow or on selection.
+        // The party picker (DAOrigins.exe 0x766040, 0x7661b0): picking a follower has it say
+        // its picked line, unpicking its unpicked line, at most one every 0.1 s
+        // (0xc0d718), always (probability 1).
+        self.picker_spoke += dt;
+        match state.picker.take() {
+            Some(members) => {
+                let ids: Vec<u32> = members.iter().map(|m| m.0).collect();
+                if let Some(before) = self.picked.replace(ids.clone()) {
+                    let changed = members
+                        .iter()
+                        .filter(|m| !before.contains(&m.0))
+                        .map(|m| (m, true))
+                        .chain(
+                            before
+                                .iter()
+                                .filter(|b| !ids.contains(b))
+                                .filter_map(|b| state.picker_left.get(b).map(|m| (m, false))),
+                        )
+                        .next();
+                    if let Some(((_, template, set, at), picked)) = changed
+                        && self.picker_spoke > 0.1
+                        && let Some(set) = set
+                    {
+                        let lines = self
+                            .picker_lines
+                            .get(&template.to_ascii_lowercase())
+                            .or_else(|| self.picker_lines.get("default"))
+                            .copied();
+                        if let Some((yes, no)) = lines {
+                            let entry = if picked { yes } else { no };
+                            state.sound_sets.push((set.clone(), entry, 1.0, Some(*at)));
+                            self.picker_spoke = 0.0;
+                        }
+                    }
+                }
+            }
+            None => self.picked = None,
+        }
+        for (set, entry, probability, at) in std::mem::take(&mut state.sound_sets) {
+            self.say_sound_set(&set, entry, probability, at);
+        }
         for (event, position) in std::mem::take(&mut state.script_sounds) {
             if self
                 .engine
@@ -686,8 +1226,22 @@ impl GameAudio {
                 log::debug!("audio: script sound {event} has no event");
             }
         }
-        self.follow_animations(std::mem::take(&mut state.animations));
+        let gear = std::mem::take(&mut state.gear);
+        self.follow_animations(std::mem::take(&mut state.animations), &gear);
         self.follow_movie(state.movie.take());
+        // Scripts' SetMusicIntensity sets the area music's `music_state` (DAOrigins.exe logs
+        // it as "music state= %2.1f"): the tracks' sounds sit around 1, so 0 silences the
+        // music (pre100pt_light_beacon) and cutscene endings (gen00cs_cs_end_music_int_*)
+        // set 0 to 4. Provisional: read from the data and the scripts, not traced.
+        if let Some(i) = state.music_intensity.take()
+            && i as f32 != self.music_state
+        {
+            self.music_state = i as f32;
+            if let Some((_, h)) = self.area.as_ref().and_then(|a| a.track) {
+                self.engine
+                    .set_parameter(h, "music_state", self.music_state);
+            }
+        }
         self.follow_area(&state);
         self.follow_cutscene(state.cutscene.clone());
         // Voice-over.
@@ -733,24 +1287,19 @@ impl GameAudio {
     }
 }
 
-/// Whether an animation resource is a humanoid's: the shared humanoid animations are
-/// `mh.*` / `fh.*` (male, female) and their variants `mh_*`, `fh_*`, and cutscene actors
-/// `cs_*`. Provisional (from the resource names).
-fn is_humanoid(ani: &str) -> bool {
-    ["mh.", "mh_", "fh.", "fh_", "cs_", "csmale"]
-        .iter()
-        .any(|p| ani.starts_with(p))
-}
-
 /// The options screen's volumes (`ClientOptions.AudioOptions.*`, 0..10, with their disable
-/// switches) as gains.
+/// switches) as gains, as DAOrigins.exe turns them into category volumes: a slider at `x`
+/// is `-3 * (10 - x)` dB (0x5b61b0: 10 and above full, below 0.01 or disabled -60 dB), then
+/// `10^(dB / 20)` with anything under 0.001 silent (0x5b6110). So 5 is -15 dB, not half.
 pub fn volumes(option: impl Fn(&str) -> Option<f64>) -> Volumes {
     let v = |vol: &str, off: &str| {
-        if option(off).unwrap_or(0.0) != 0.0 {
-            0.0
+        let x = option(vol).unwrap_or(10.0) as f32;
+        let db = if option(off).unwrap_or(0.0) != 0.0 {
+            -60.0
         } else {
-            (option(vol).unwrap_or(10.0) / 10.0).clamp(0.0, 1.0) as f32
-        }
+            slider_db(x)
+        };
+        db_gain(db)
     };
     Volumes {
         music: v("AudioOptions.MusicVolume", "AudioOptions.MusicDisabled"),
@@ -759,16 +1308,41 @@ pub fn volumes(option: impl Fn(&str) -> Option<f64>) -> Volumes {
     }
 }
 
+/// A volume slider's 0..10 as dB (DAOrigins.exe 0x5b61b0).
+fn slider_db(x: f32) -> f32 {
+    if x > 9.99 {
+        0.0
+    } else if x < 0.01 {
+        -60.0
+    } else {
+        -3.0 * (10.0 - x)
+    }
+}
+
+/// dB as a gain, silent at 0.001 (-60 dB) and below (DAOrigins.exe 0x5b6110).
+fn db_gain(db: f32) -> f32 {
+    let g = 10f32.powf(db / 20.0);
+    if db <= -60.0 || g <= 0.001 {
+        0.0
+    } else {
+        g.min(1.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn humanoid_animations_by_name() {
-        assert!(is_humanoid("mh.walk.ani"));
-        assert!(is_humanoid("fh_c.attk_v1.ani"));
-        assert!(!is_humanoid("c_dog.cwalkf.ani"));
-        assert!(!is_humanoid("ip_dbldoor.open.ani"));
+    fn footstep_columns_come_from_the_appearance_type() {
+        use thedas_formats::gda::Cell;
+        let col = |v: &str| footstep_column(Some(&Cell::String(v.into())));
+        assert_eq!(col("HUMANOID_SMALL\t "), COL_HUMANOID_SMALL);
+        assert_eq!(col("DOG"), thedas_formats::gda::column_hash("dog"));
+        assert_eq!(
+            footstep_column(None),
+            thedas_formats::gda::column_hash("Unknown")
+        );
     }
 
     #[test]
@@ -779,6 +1353,61 @@ mod tests {
             _ => None,
         };
         let v = volumes(opts);
-        assert_eq!((v.music, v.sfx, v.dialog), (0.5, 0.0, 1.0));
+        // 5 is -15 dB; disabled is silent; the default 10 is full.
+        assert!(
+            (v.music - 10f32.powf(-15.0 / 20.0)).abs() < 1e-6,
+            "{}",
+            v.music
+        );
+        assert_eq!((v.sfx, v.dialog), (0.0, 1.0));
+        assert_eq!(slider_db(0.0), -60.0);
+        assert_eq!(db_gain(-60.0), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod impact_tests {
+    use super::*;
+
+    #[test]
+    fn blows_sound_by_weapon_and_what_they_strike() {
+        let ev = |w: &str, t: &str| format!("glo_fly_wep/weapon_impacts/{w}/{t}");
+        let mut i = Impacts::default();
+        i.materials
+            .extend([(2, 1), (3, 4), (60, 13), (61, 11), (70, 6)]);
+        i.hits.insert(
+            1,
+            vec![
+                ev("sword", "impact_materials/wood"),
+                ev("sword", "impact_materials/metal"),
+                ev("sword", "impact_armor/metal_arm"),
+                ev("sword", "impact_armor/cloth_arm"),
+                ev("sword", "impact_armor/flesh"),
+            ],
+        );
+        i.hits
+            .insert(19, vec![ev("barehand", "impact_armor/flesh")]);
+        assert_eq!(
+            i.event(1, Some(2), Some(60), None),
+            Some(ev("sword", "impact_armor/metal_arm"))
+        );
+        assert_eq!(
+            i.event(2, Some(2), Some(61), None),
+            Some(ev("sword", "impact_armor/cloth_arm"))
+        );
+        assert_eq!(
+            i.event(5, Some(2), None, Some(70)),
+            Some(ev("sword", "impact_materials/metal"))
+        );
+        // No weapon (or one without impacts): bare hands; a miss sounds nothing here.
+        assert_eq!(
+            i.event(1, None, None, None),
+            Some(ev("barehand", "impact_armor/flesh"))
+        );
+        assert_eq!(
+            i.event(1, Some(3), None, None),
+            Some(ev("barehand", "impact_armor/flesh"))
+        );
+        assert_eq!(i.event(3, Some(2), None, None), None);
     }
 }

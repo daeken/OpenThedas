@@ -240,10 +240,22 @@ impl Sim {
         let blocked = |a: [f32; 3], b: [f32; 3]| Sim::door_between(&doors, a, b);
         // Walls block noticing (`nav::wall_between`); once noticed, a creature is kept
         // track of round corners out to the visual radius.
+        // A hostile's sight line is a ray through the level's collision from 1.8 m above
+        // each one's feet (see `crate::collision`); without the level's collision files, the
+        // pathing grid's walls stand in.
         let grid = self.nav_grid(area);
-        let wall = |a: [f32; 3], b: [f32; 3]| {
-            grid.as_ref()
-                .is_some_and(|g| crate::nav::wall_between(g, a, b))
+        let solid = self.collision(area).filter(|c| !c.is_empty());
+        let props = solid
+            .as_ref()
+            .and_then(|_| self.placeable_collision(area))
+            .filter(|c| !c.is_empty());
+        let wall = |a: [f32; 3], b: [f32; 3]| match &solid {
+            Some(c) => {
+                c.sight_blocked(a, b) || props.as_ref().is_some_and(|p| p.sight_blocked(a, b))
+            }
+            None => grid
+                .as_ref()
+                .is_some_and(|g| crate::nav::wall_between(g, a, b)),
         };
         for &(id, pos) in &creatures {
             let alive = self.alive(id);
@@ -1275,6 +1287,35 @@ impl Sim {
                 result: hit,
                 damage,
             });
+            // The impact's sound, for the presentation (output only).
+            let base = |who: ObjectId, slot: &str| {
+                let slot = constant_of(self, slot);
+                self.world
+                    .get(who)?
+                    .equipment
+                    .get(&slot)
+                    .and_then(|i| self.world.get(*i))
+                    .and_then(|i| i.fields.get("BaseItem").copied())
+            };
+            let impact = crate::world::SoundRequest::Impact {
+                attacker: id,
+                target,
+                result: hit,
+                weapon: base(
+                    id,
+                    if hand == 0 {
+                        "INVENTORY_SLOT_MAIN"
+                    } else {
+                        "INVENTORY_SLOT_OFFHAND"
+                    },
+                ),
+                armour: base(target, "INVENTORY_SLOT_CHEST"),
+                shield: base(target, "INVENTORY_SLOT_OFFHAND"),
+            };
+            if self.world.sounds.len() >= 64 {
+                self.world.sounds.remove(0);
+            }
+            self.world.sounds.push(impact);
             let mut ev = self.new_event("ATTACK_IMPACT", Some(id));
             ev.objects = vec![id, target];
             ev.ints = vec![hit, hand as i32];
@@ -2461,6 +2502,7 @@ mod tests {
                 normal: [0.0, 0.0, 1.0],
                 data,
                 heights: vec![0.0; (w * h) as usize],
+                surfaces: Vec::new(),
             })),
         );
         let hero = s.world.spawn(ObjectKind::Creature, "hero");

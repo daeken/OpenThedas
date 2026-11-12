@@ -167,6 +167,9 @@ pub struct UiLayer {
     minimap_frame: u32,
     /// What the menus asked of the app since it last looked (see [`FrontEnd`]).
     pub requests: Vec<FrontEnd>,
+    /// Character creation's voice previews not yet played (see
+    /// [`UiLayer::drain_sound_set_previews`]).
+    sound_set_previews: Vec<(String, i32)>,
     /// The saves were listed for the start menu.
     saves_listed: bool,
     /// tooltips.gfx's tooltip texts (fixed and floating) last frame, and the frames left to lay
@@ -175,6 +178,8 @@ pub struct UiLayer {
     tooltip_relayout: u8,
     /// The floating messages up over creatures (see [`UiLayer::update_floaties`]).
     floaties: Vec<Floaty>,
+    /// The stats floaties up (name and health bar over a creature): creature → floaty id.
+    stat_floaties: std::collections::BTreeMap<thedas_script::vm::ObjectId, u32>,
     next_floaty: u32,
     portraits: PortraitClock,
     paperdoll: PaperdollClock,
@@ -314,6 +319,58 @@ pub fn line_ms(text: &str) -> f64 {
 }
 
 impl UiLayer {
+    /// Character creation's voice choice (chargen.gfx's `AppearanceSoundSetScene`):
+    /// `GUI.TestSoundSet <set> <type>` previews a line of the set (`ss_types.gda` types with
+    /// `bUseInChargen`, starting with HELLO) for the sound to take (see
+    /// [`UiLayer::drain_sound_set_previews`]); `GUI.SetSoundSet <set>` gives the hero being
+    /// made that set (`Sim::chargen_sound_set`). Provisional: the argument order is read from
+    /// the movie's strings.
+    fn sound_set_message(
+        previews: &mut Vec<(String, i32)>,
+        sim: &Arc<Mutex<Sim>>,
+        name: &str,
+        args: &[String],
+    ) -> bool {
+        let set = args
+            .iter()
+            .find(|a| a.chars().any(|c| c.is_ascii_alphabetic()))
+            .map(|a| a.trim().to_ascii_lowercase());
+        let number = args.iter().find_map(|a| a.trim().parse::<i32>().ok());
+        match (name, set) {
+            ("GUI.TestSoundSet", set) => {
+                // The movie may send only the type; the set is then the one chosen (the
+                // creature being made has it from GUI.SetSoundSet).
+                let set = set.or_else(|| {
+                    let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+                    let c = sim.world.chargen?;
+                    sim.world
+                        .get(c)?
+                        .text_fields
+                        .get(thedas_sim::sim::SOUND_SET)
+                        .cloned()
+                });
+                match set {
+                    Some(set) => previews.push((set, number.unwrap_or(0))),
+                    None => log::debug!("ui: voice preview {args:?} without a chosen set"),
+                }
+                true
+            }
+            ("GUI.SetSoundSet", Some(set)) => {
+                sim.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .chargen_sound_set(&set);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The voice previews character creation asked for since the last call: (sound set,
+    /// `ss_types.gda` type).
+    pub fn drain_sound_set_previews(&mut self) -> Vec<(String, i32)> {
+        std::mem::take(&mut self.sound_set_previews)
+    }
+
     /// The conversation line on screen speaks for this long (milliseconds; see
     /// [`crate::audio`]), or has no voice-over.
     pub fn set_line_voice_ms(&mut self, ms: Option<f64>) {
@@ -359,10 +416,12 @@ impl UiLayer {
             level: None,
             minimap_frame: 0,
             requests: Vec::new(),
+            sound_set_previews: Vec::new(),
             saves_listed: false,
             tooltip_text: None,
             tooltip_relayout: 0,
             floaties: Vec::new(),
+            stat_floaties: Default::default(),
             next_floaty: 1,
             portraits: PortraitClock::default(),
             paperdoll: PaperdollClock::default(),
@@ -704,6 +763,7 @@ impl UiLayer {
             }
             shown.journal = journal;
             shown.book_page = screens.menu.and_then(Screen::book_page);
+            shown.menu_up = screens.menu.is_some();
             shown.ability_scene = match screens.menu {
                 Some(Screen::Skills) => 3,
                 Some(Screen::SpellsTalents) => 1,
@@ -743,6 +803,16 @@ impl UiLayer {
         // The store's close button: the simulation's store closes too.
         if changes.dismissed.contains(&Screen::Store) {
             sim.lock().unwrap_or_else(|p| p.into_inner()).close_store();
+        }
+        // The inventory closed (its close button or Escape) while a container was open:
+        // the container closes too.
+        if changes.dismissed.contains(&Screen::Inventory)
+            || changes.closed.contains(&Screen::Inventory)
+        {
+            let mut s = sim.lock().unwrap_or_else(|p| p.into_inner());
+            if s.world.container.is_some() {
+                s.close_container();
+            }
         }
         // A picker that closed itself without its Accept keeps the members picked so far.
         // Provisional: partypicker.gfx has no other way out.
@@ -829,6 +899,7 @@ impl UiLayer {
                 }
             }
         }
+        let mut previews = Vec::new();
         let ignored: Vec<(String, Vec<String>)> = ignored
             .into_iter()
             .filter(|(n, a)| {
@@ -837,8 +908,10 @@ impl UiLayer {
                     && !self.save_message(screens, sim, n, a)
                     && !self.go_to_journal(screens, sim, n, a)
                     && !Self::book_page(screens, n, a)
+                    && !Self::sound_set_message(&mut previews, sim, n, a)
             })
             .collect();
+        self.sound_set_previews.extend(previews);
         let mut aims = Vec::new();
         {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
@@ -947,6 +1020,13 @@ impl UiLayer {
     pub fn set_paused(&self, paused: bool) {
         if let Ok(mut shown) = self.shown.lock() {
             shown.paused = paused;
+        }
+    }
+
+    /// Whether the player is using a pad (the tutorial popup shows its pad hint).
+    pub fn set_pad_active(&self, pad: bool) {
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.pad_active = pad;
         }
     }
 
@@ -1125,6 +1205,12 @@ impl UiLayer {
         use thedas_ui::UiValue;
         const LAYER: &str = "_global.FloatyLayer";
         const SYMBOL_MESSAGE: f64 = 1.0;
+        const SYMBOL_STATS: f64 = 0.0;
+        // floatylayer.gfx's `FLOATY_STATS_*` flags.
+        const SHOW_NAME: f64 = 1.0;
+        const SHOW_HEALTH_BAR: f64 = 2.0;
+        const SHOW_TARGET: f64 = 4.0;
+        const IS_HOSTILE: f64 = 32.0;
         /// Seconds a floaty stays past its duration (its own fade).
         const LINGER_S: f64 = 1.0;
         /// Metres above a creature's feet.
@@ -1142,6 +1228,7 @@ impl UiLayer {
                 .floaties
                 .clear();
             self.floaties.clear();
+            self.stat_floaties.clear();
             return;
         };
         let num = UiValue::Number;
@@ -1150,6 +1237,21 @@ impl UiLayer {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut ids, mut offsets, mut places, mut destroy) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (
+            mut stat_ids,
+            mut stat_flags,
+            mut stat_names,
+            mut stat_hp,
+            mut stat_max,
+            mut stat_ranks,
+        ) = (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         let size = self.stage.size();
         let scale = thedas_ui::stage_scale(size, (1024.0, 768.0));
         let (w, h) = (size.0 as f32, size.1 as f32);
@@ -1206,6 +1308,84 @@ impl UiLayer {
                 ]);
                 true
             });
+            // The stats floaties (name and health bar over a creature): the hostiles in a
+            // fight with the party, the leader's attack target named. Provisional: the
+            // exe's choice of creatures and flags is not traced; this follows what the
+            // original shows in a fight (a health bar over each enemy, the target's name).
+            let leader = sim.world.controlled();
+            let target = leader
+                .and_then(|l| sim.world.get(l))
+                .and_then(|o| o.commands.first())
+                .filter(|c| c.name == "CommandAttack")
+                .and_then(|c| c.target);
+            let party = thedas_sim::engine::party_of(&sim);
+            let health = thedas_sim::sim::constant(&sim.table, "PROPERTY_DEPLETABLE_HEALTH");
+            let wanted: Vec<thedas_script::vm::ObjectId> = sim
+                .world
+                .objects
+                .values()
+                .filter(|o| {
+                    o.kind == thedas_sim::world::ObjectKind::Creature
+                        && o.active
+                        && !o.dead
+                        && o.area == sim.world.area
+                        && (Some(o.id) == target
+                            || (o.combat.in_combat && party.iter().any(|&m| sim.hostile(m, o.id))))
+                })
+                .map(|o| o.id)
+                .collect();
+            for (&c, &id) in &self.stat_floaties {
+                if !wanted.contains(&c) {
+                    destroy.push(num(f64::from(id)));
+                }
+            }
+            self.stat_floaties.retain(|c, _| wanted.contains(c));
+            for c in wanted {
+                let id = match self.stat_floaties.get(&c) {
+                    Some(&id) => id,
+                    None => {
+                        let id = self.next_floaty;
+                        self.next_floaty += 1;
+                        create.push(num(f64::from(id)));
+                        symbols.push(num(SYMBOL_STATS));
+                        show.push(num(f64::from(id)));
+                        self.stat_floaties.insert(c, id);
+                        id
+                    }
+                };
+                let Some(o) = sim.world.get(c) else { continue };
+                let p = glam::Vec3::new(o.position[0], o.position[1], o.position[2] + HEAD);
+                let cl = vp * p.extend(1.0);
+                let (x, y, alpha) = if cl.w > 1e-4 {
+                    let n = cl.truncate() / cl.w;
+                    ((n.x + 1.0) * 0.5 * w, (1.0 - n.y) * 0.5 * h, 1.0)
+                } else {
+                    (0.0, 0.0, 0.0)
+                };
+                ids.push(num(f64::from(id)));
+                offsets.push(num(0.0));
+                places.extend([
+                    num(f64::from(x) / scale),
+                    num(f64::from(y) / scale),
+                    num(1.0),
+                    num(alpha),
+                    num(f64::from(id)),
+                ]);
+                let mut flags = SHOW_HEALTH_BAR + IS_HOSTILE;
+                if Some(c) == target {
+                    flags += SHOW_NAME + SHOW_TARGET;
+                }
+                let (cur, max) = (
+                    o.properties.get(&health).map_or(0.0, |p| f64::from(p.1)),
+                    sim.depletable_max(c, health),
+                );
+                stat_ids.push(num(f64::from(id)));
+                stat_flags.push(num(flags));
+                stat_names.push(UiValue::String(sim.display_name(c)));
+                stat_hp.push(num(cur));
+                stat_max.push(num(f64::from(max)));
+                stat_ranks.push(num(f64::from(o.rank)));
+            }
         }
         let m = &mut self.stage.movies[movie];
         let list = |v: Vec<UiValue>| UiValue::List(v);
@@ -1223,7 +1403,12 @@ impl UiLayer {
             ("BatchUpdateMessageStyles", styles),
             ("BatchUpdateMessageColours", colours),
             ("BatchUpdateMessageDurations", durations),
-            ("BatchUpdateStatsIDs", Vec::new()),
+            ("BatchUpdateStatsIDs", stat_ids),
+            ("BatchUpdateStatsFlags", stat_flags),
+            ("BatchUpdateStatsNames", stat_names),
+            ("BatchUpdateStatsCurrentHealths", stat_hp),
+            ("BatchUpdateStatsTotalHealths", stat_max),
+            ("BatchUpdateStatsRanks", stat_ranks),
             ("BatchUpdateIconIDs", Vec::new()),
             ("BatchUpdateOffscreenIDs", Vec::new()),
         ] {
@@ -1273,7 +1458,22 @@ impl UiLayer {
                     f |= MAP_PLAYER;
                 }
                 if hero.is_some_and(|h| sim.hostile(h, o.id)) {
+                    // A hostile shows once the party perceives it. Provisional: the
+                    // exe's own filter is not traced.
+                    let seen = party.iter().any(|&m| {
+                        sim.world
+                            .get(m)
+                            .is_some_and(|p| p.combat.perceived.contains(&o.id))
+                    });
+                    if !seen {
+                        continue;
+                    }
                     f |= MAP_HOSTILE;
+                } else if f & MAP_IN_PARTY == 0 {
+                    // Neither the party's nor an enemy: the legend has no mark for the
+                    // neutral townsfolk (they drew as a field of identical dots).
+                    // Provisional: allies (`FLAG_SHOW_AS_ALLY`) are not told apart yet.
+                    continue;
                 }
                 ids.push(num(o.id as f64));
                 let at = info.to_map(o.position[0], o.position[1]);

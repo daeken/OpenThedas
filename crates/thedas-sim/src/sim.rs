@@ -114,6 +114,13 @@ pub struct Sim {
     /// The closed door that stopped the last `walk`, if one did.
     pub walk_blocked_by: Option<ObjectId>,
     pub(crate) nav_grids: HashMap<String, Option<Arc<thedas_formats::level::NavGrid>>>,
+    /// Conversations' line staging, read once (see [`crate::cutactors::LineCut`]).
+    pub(crate) line_cuts: HashMap<String, Arc<Vec<crate::cutactors::LineCut>>>,
+    /// Each layout's collision for sight lines (see `crate::collision`), loaded when first
+    /// needed; `None` when the layout's files cannot be found.
+    pub(crate) collisions: HashMap<String, Option<Arc<crate::collision::Collision>>>,
+    /// Each area's placeables' collision and the key of the placeables it was built from.
+    pub(crate) placeable_collisions: HashMap<ObjectId, (u64, Arc<crate::collision::Collision>)>,
     /// The effect an `APPLY_EFFECT` handler is looking at, and whether it is still valid.
     pub(crate) current_effect: Option<(crate::world::Effect, bool)>,
     /// Who the effect in `current_effect` is being applied to.
@@ -348,6 +355,9 @@ impl Sim {
             install_root: None,
             area_layouts: HashMap::new(),
             nav_grids: HashMap::new(),
+            line_cuts: HashMap::new(),
+            collisions: HashMap::new(),
+            placeable_collisions: HashMap::new(),
             fire_lengths: HashMap::new(),
             attack_lengths: HashMap::new(),
             ability_anims: HashMap::new(),
@@ -693,6 +703,11 @@ impl Sim {
         };
         let start = self.world.time_ms;
         let mut until = start + ms;
+        // Visual effects at places that run their time out during this tick go.
+        let end = until;
+        self.world
+            .location_vfx
+            .retain(|v| v.duration_ms.is_none_or(|d| v.started_ms + d > end));
         self.update_perception();
         self.keep_party_together();
         let mut held = 0;
@@ -705,8 +720,18 @@ impl Sim {
             // One cutscene at a time: the next waits for the one playing.
             if !self.world.cutscenes.is_empty() && self.world.cutscene.is_none() {
                 let name = self.world.cutscenes.remove(0);
+                let res = crate::cutscene::Cutscene::resource(&name);
+                let from_dialog = match self.world.dialog_cutscenes.iter().position(|n| *n == res) {
+                    Some(i) => {
+                        self.world.dialog_cutscenes.remove(i);
+                        true
+                    }
+                    None => false,
+                };
                 if self.cutscene_policy == CutscenePolicy::Play {
-                    if let Some(c) = self.read_cutscene(&name) {
+                    if let Some(mut c) = self.read_cutscene(&name) {
+                        c.from_dialog = from_dialog;
+                        (c.bound, c.placement) = self.bind_cutscene_file(&res, from_dialog);
                         let t = self.world.time_ms;
                         self.world.trace.push(TraceEntry::Log {
                             t,
@@ -725,7 +750,14 @@ impl Sim {
                         break;
                     }
                 }
-                self.end_cutscene(&name);
+                if from_dialog {
+                    // Not played, but begun and ended all the same.
+                    let (bound, _) = self.bind_cutscene_file(&res, true);
+                    self.release_cutscene_actors(bound);
+                    self.close_dialog_cutscene(&name, false);
+                } else {
+                    self.end_cutscene(&name);
+                }
                 continue;
             }
             // Then the earliest of the next event and the next finishing command; events
@@ -842,16 +874,144 @@ impl Sim {
     /// The cutscene playing has run (or the player skipped it): it ends as
     /// [`Sim::end_cutscene`] says, and the next one loaded may start.
     fn finish_cutscene(&mut self) {
-        if let Some(c) = self.world.cutscene.take() {
-            self.close_cutscene(&c.name, true);
+        if let Some(mut c) = self.world.cutscene.take() {
+            let bound = std::mem::take(&mut c.bound);
+            self.release_cutscene_actors(bound);
+            if c.from_dialog {
+                self.close_dialog_cutscene(&c.name, true);
+            } else {
+                self.close_cutscene(&c.name, true);
+            }
         }
     }
 
-    /// A loaded cutscene's file (its length and lines), if it can be read.
+    /// A conversation line's cutscene ends: the conversation goes on (it waited, as the
+    /// world does, while it played). Provisional: the scripts' cutscene-ending locals are
+    /// for the cutscenes they load and are left alone.
+    fn close_dialog_cutscene(&mut self, name: &str, played: bool) {
+        let t = self.world.time_ms;
+        self.world.trace.push(TraceEntry::Log {
+            t,
+            channel: -1,
+            text: format!(
+                "conversation cutscene {name} ends{}",
+                if played { "" } else { " (not played)" }
+            ),
+        });
+    }
+
+    /// The objects cutscene file `res`'s actors take as it starts (see
+    /// [`crate::cutactors`]); for a conversation line's cutscene, as the line that queued it
+    /// plays it.
+    fn bind_cutscene_file(
+        &mut self,
+        res: &str,
+        from_dialog: bool,
+    ) -> (
+        Vec<crate::cutactors::Bound>,
+        Option<crate::cuttracks::Placement>,
+    ) {
+        let Some(tracks) = self
+            .vfs
+            .read(res)
+            .ok()
+            .map(|(data, _)| crate::cuttracks::Tracks::parse(&data))
+        else {
+            return (Vec::new(), None);
+        };
+        let line = if from_dialog {
+            let Some(c) = self.talk.take() else {
+                return (Vec::new(), None);
+            };
+            let ctx = c.cut_from.and_then(|l| self.line_context(&c, l, &tracks));
+            self.talk = Some(c);
+            // Its stage is not in the area: nobody is moved.
+            let Some(ctx) = ctx else {
+                return (Vec::new(), None);
+            };
+            Some(ctx)
+        } else {
+            None
+        };
+        (
+            self.bind_cutscene_actors(&tracks, line),
+            line.map(|l| l.placement),
+        )
+    }
+
+    /// A loaded cutscene's file (its length and lines), if it can be read. Lines that say
+    /// a conversation's lines take their text from it (see
+    /// [`crate::cutscene::dialog_refs`]).
     fn read_cutscene(&self, name: &str) -> Option<crate::cutscene::Cutscene> {
         let res = crate::cutscene::Cutscene::resource(name);
         let (data, _) = self.vfs.read(&res).ok()?;
-        crate::cutscene::Cutscene::parse(&data, &res)
+        let g = thedas_formats::Gff4::parse(&data).ok()?;
+        let mut c = crate::cutscene::Cutscene::from_gff4(&g, &res)?;
+        let refs = crate::cutscene::dialog_refs(&g);
+        let mut walked: std::collections::HashMap<String, (Vec<u32>, usize)> = Default::default();
+        for r in refs {
+            let key = r.dialog.to_ascii_lowercase();
+            let (said, next) = walked
+                .entry(key.clone())
+                .or_insert_with(|| (self.walk_dialog_lines(&key), 0));
+            if let Some(&strref) = said.get(*next) {
+                c.lines.push(crate::cutscene::CutsceneLine {
+                    start: r.start.clamp(0.0, c.seconds),
+                    end: r.end.clamp(0.0, c.seconds),
+                    strref,
+                    actor: r.actor,
+                    conversation: Some(r.dialog),
+                    vo_mode: r.vo_mode,
+                });
+            }
+            *next += 1;
+        }
+        c.lines.sort_by(|a, b| a.start.total_cmp(&b.start));
+        Some(c)
+    }
+
+    /// The lines (talk-table references) conversation `dlg` says as it is walked from the
+    /// line whose cutscene was queued (the open conversation's, when it is this one) or
+    /// from its first start: each line, then its first reply's first line, and so on.
+    /// Provisional (see [`crate::cutscene::dialog_refs`]).
+    fn walk_dialog_lines(&self, dlg: &str) -> Vec<u32> {
+        let open = self
+            .talk
+            .as_ref()
+            .filter(|c| c.dlg.name.eq_ignore_ascii_case(dlg));
+        let owned;
+        let (d, from) = match open {
+            Some(c) => (&c.dlg, c.cut_from.or(c.line)),
+            None => {
+                let Some(d) = self
+                    .vfs
+                    .read(&format!("{dlg}.dlg"))
+                    .ok()
+                    .and_then(|(data, _)| crate::dialog::Dlg::parse(&data, dlg))
+                else {
+                    return Vec::new();
+                };
+                owned = d;
+                (&owned, owned.starts.first().copied())
+            }
+        };
+        let mut out = Vec::new();
+        let mut seen = Vec::new();
+        let mut at = from;
+        while let Some(i) = at {
+            if seen.contains(&i) || seen.len() > 256 {
+                break;
+            }
+            seen.push(i);
+            let Some(n) = d.nodes.get(i) else { break };
+            if !n.reply
+                && let Some(s) = n.strref
+            {
+                out.push(s);
+            }
+            at = n.children.first().copied();
+        }
+        out
     }
 
     fn close_cutscene(&mut self, name: &str, played: bool) {
@@ -1215,12 +1375,20 @@ impl Sim {
                     .and_then(|h| self.world.get(h))
                     .map(|h| (h.position, h.facing));
                 for (k, id) in party.iter().skip(1).enumerate() {
+                    self.following.remove(id);
                     if let Some(o) = self.world.get_mut(*id) {
                         o.area = Some(new);
                         if let Some((p, facing)) = at {
                             o.position = behind(p, facing, k);
                             o.facing = facing;
                         }
+                        // What a member was doing in the old area ends with it: a move under
+                        // way would otherwise carry on from where it began there, putting
+                        // the member back at its old coordinates in the new area (Daveth
+                        // and Jory left at their Ostagar spots in the Korcari Wilds).
+                        // Provisional: the exe's clearing of action queues on a transition
+                        // is not traced.
+                        o.commands.clear();
                         // Followers enter after the hero (whose ENTER `enter_area` sent).
                         let mut ev = self.new_event("ENTER", Some(*id));
                         ev.objects = vec![*id];
@@ -1816,7 +1984,10 @@ impl Sim {
                         && (c.name == "CommandAttack" || c.name == "CommandUseAbility")
                 })
             })
-            .then_some(self.world.time_ms + APPROACH_CHECK_MS)
+            // On a fixed grid of world time, so that ticks shorter than the period (the app's
+            // 30 fps steps of 33 ms) still reach a check: one counted from "now" would always
+            // fall past the end of a short tick, and walkers would never look again.
+            .then_some((self.world.time_ms / APPROACH_CHECK_MS + 1) * APPROACH_CHECK_MS)
     }
 
     /// Stops a walker whose target has come within reach (its attack or ability starts
@@ -2383,7 +2554,7 @@ impl Sim {
     // -----------------------------------------------------------------------------------------
     // Loading
 
-    fn read_gff3(&self, name: &str) -> Result<Gff3, SimError> {
+    pub(crate) fn read_gff3(&self, name: &str) -> Result<Gff3, SimError> {
         let (data, _) = self
             .vfs
             .read(name)
@@ -2562,7 +2733,7 @@ impl Sim {
         }
         if let Some(t) = &tmpl {
             match kind {
-                ObjectKind::Creature => self.load_template_items(id, t),
+                ObjectKind::Creature | ObjectKind::Placeable => self.load_template_items(id, t),
                 ObjectKind::Store => self.load_store_items(id, t),
                 _ => {}
             }
@@ -2760,6 +2931,10 @@ impl Sim {
             }
         }
         read_text_fields(o, inst);
+        // A waypoint's map note text (a talk-table id), which the area map shows.
+        if let Some(s) = strref(inst, "MapNote") {
+            o.fields.insert("MapNote".into(), s as i32);
+        }
         read_vars(are, inst, &mut o.locals);
         if kind == ObjectKind::Trigger {
             for &p in list_of(inst, "Geometry") {
@@ -2771,7 +2946,10 @@ impl Sim {
         }
         if let Some(t) = &tmpl {
             match kind {
-                ObjectKind::Creature => self.load_template_items(id, t),
+                // A container's contents are its template's `ItemList` (an area's placed
+                // instance carries none of its own): Everd's armour chest at the Proving
+                // holds the armour and helmet the Dwarf Commoner needs.
+                ObjectKind::Creature | ObjectKind::Placeable => self.load_template_items(id, t),
                 ObjectKind::Store => self.load_store_items(id, t),
                 _ => {}
             }
@@ -2823,6 +3001,10 @@ fn apply_template(o: &mut crate::world::Object, t: &Gff3) {
     o.rank = int(r, "Rank").unwrap_or(0);
     o.appearance = template_appearance(t).unwrap_or(0);
     read_vars(t, r, &mut o.locals);
+    // The creature's sound set (`ss_alistair`): its barks, for the presentation.
+    if let Some(ss) = resref_field(r, "SoundSet").filter(|s| !s.is_empty()) {
+        o.text_fields.insert(SOUND_SET.to_string(), ss);
+    }
     for fl in &r.fields {
         if let Some(v) = int(r, &fl.label) {
             o.fields.insert(fl.label.clone(), v);
@@ -2845,6 +3027,38 @@ fn apply_template(o: &mut crate::world::Object, t: &Gff3) {
 
 /// The string fields engine functions read, as [`crate::world::Object::text_fields`].
 const TEXT_FIELDS: [&str; 1] = ["KeyName"];
+
+impl Sim {
+    /// Gives creature `id` sound set `set` (its barks; `SetSoundSet`), or none for an empty
+    /// name.
+    pub fn set_sound_set(&mut self, id: ObjectId, set: &str) {
+        let Some(o) = self.world.get_mut(id) else {
+            return;
+        };
+        let set = set.trim().to_ascii_lowercase();
+        if set.is_empty() {
+            o.text_fields.remove(SOUND_SET);
+        } else {
+            o.text_fields.insert(SOUND_SET.to_string(), set);
+        }
+    }
+
+    /// Character creation's voice choice (`GUI.SetSoundSet <set>`): the creature being made
+    /// gets the set. False when no character is being made.
+    pub fn chargen_sound_set(&mut self, set: &str) -> bool {
+        match self.world.chargen {
+            Some(c) => {
+                self.set_sound_set(c, set);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// The [`crate::world::Object::text_fields`] key of a creature's sound set: its template's
+/// `SoundSet`, or what `SetSoundSet` gave it (character creation's voice choice).
+pub const SOUND_SET: &str = "SoundSet";
 
 fn read_text_fields(o: &mut crate::world::Object, s: &Struct) {
     for label in TEXT_FIELDS {
@@ -2933,6 +3147,17 @@ impl Sim {
                 let item = self.create_item(&resref);
                 if let (Some(d), Some(o)) = (droppable, self.world.get_mut(item)) {
                     o.fields.insert("Droppable".into(), d);
+                }
+                // Carried items are added as any item is, merging into the stacks already
+                // held (see `Sim::stack_into`); stackable ones start as stacks of one.
+                if !equip {
+                    if self.max_stack(item) > 1 {
+                        if let Some(o) = self.world.get_mut(item) {
+                            o.fields.entry("StackSize".into()).or_insert(1);
+                        }
+                    }
+                    self.stack_into(id, item);
+                    continue;
                 }
                 let mut worn = false;
                 if let Some(o) = self.world.get_mut(id) {
@@ -3540,6 +3765,9 @@ mod tests {
                 vo_mode: 0,
             }],
             elapsed_ms: 0,
+            from_dialog: false,
+            bound: Vec::new(),
+            placement: None,
         };
         // While one plays the world stands still; what it sets waits for its end, and so
         // does the next one loaded.
@@ -4259,6 +4487,35 @@ mod tests {
         assert!(o.position[0] < 10.0, "{:?}", o.position);
         assert_eq!(
             o.commands.first().map(|c| (c.name.as_str(), c.approach)),
+            Some(("CommandAttack", None)),
+            "the swing is under way"
+        );
+    }
+
+    #[test]
+    fn walkers_closing_in_look_again_in_short_ticks() {
+        // The same meeting as above, stepped as the app steps the world (33 ms frames): the
+        // attacker must still stop where they meet, not walk on through the target.
+        let (mut s, a, t) = chase([0.0; 3], [20.0, 0.0, 0.0], [0.0; 3]);
+        for _ in 0..61 {
+            s.tick(33);
+        }
+        let (pa, pt) = (
+            s.world.get(a).unwrap().position,
+            s.world.get(t).unwrap().position,
+        );
+        assert!(pa[0] < 10.0, "{pa:?}");
+        assert!(
+            pt[0] > pa[0],
+            "they did not pass through each other: {pa:?} {pt:?}"
+        );
+        assert_eq!(
+            s.world
+                .get(a)
+                .unwrap()
+                .commands
+                .first()
+                .map(|c| (c.name.as_str(), c.approach)),
             Some(("CommandAttack", None)),
             "the swing is under way"
         );

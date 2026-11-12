@@ -501,11 +501,15 @@ pub fn call(
         }),
         "PlaySoundObject" => Some(crate::world::SoundRequest::Object { sound: obj(a, 0) }),
         "PlayMusic" => Some(crate::world::SoundRequest::Music { name: string(a, 0) }),
-        "SetMusicIntensity" => Some(crate::world::SoundRequest::MusicIntensity {
-            intensity: int(a, 0),
-        }),
         _ => None,
     };
+    // `SetSoundSet(oTarget, sSoundSet)`: the creature's barks come from that set.
+    if name == "SetMusicIntensity" {
+        h.sim.world.music_intensity = int(a, 0);
+    }
+    if name == "SetSoundSet" {
+        h.sim.set_sound_set(obj(a, 0), &string(a, 1));
+    }
     if let Some(req) = sound {
         // Kept short when nothing takes them (a headless run).
         if h.sim.world.sounds.len() >= 64 {
@@ -1726,23 +1730,36 @@ pub fn call(
                 .unwrap_or(false)))
         }
         "CreateItemOnObject" => {
-            let template = string(a, 0);
-            let id = h.sim.create_item(&template);
             // (resource, target, stack size, tag, suppress notification, droppable)
-            let stack = if a.len() > 2 { int(a, 2) } else { 1 };
+            // DAOrigins.exe splits the count before adding (0x7595a0): full stacks and a
+            // remainder of a stackable item, or that many separate items of one that does not
+            // stack; each is then added (and may merge into a stack already held). The first
+            // created item is returned.
+            let template = string(a, 0);
+            let stack = if a.len() > 2 { int(a, 2).max(1) } else { 1 };
             let droppable = a.len() <= 5 || int(a, 5) != 0;
-            if let Some(o) = h.sim.world.get_mut(id) {
-                let tag = string(a, 3);
-                if !tag.is_empty() {
-                    o.tag = tag;
+            let tag = string(a, 3);
+            let to = obj(a, 1);
+            let mut first = None;
+            let mut left = stack;
+            while left > 0 {
+                let id = h.sim.create_item(&template);
+                let max = h.sim.max_stack(id);
+                let count = if max > 1 { left.min(max) } else { 1 };
+                if let Some(o) = h.sim.world.get_mut(id) {
+                    if !tag.is_empty() {
+                        o.tag = tag.clone();
+                    }
+                    if max > 1 {
+                        o.fields.insert("StackSize".into(), count);
+                    }
+                    o.fields.insert("Droppable".into(), droppable as i32);
                 }
-                if stack > 1 {
-                    o.fields.insert("StackSize".into(), stack);
-                }
-                o.fields.insert("Droppable".into(), droppable as i32);
+                h.sim.give_item(id, to);
+                first.get_or_insert(id);
+                left -= count;
             }
-            h.sim.give_item(id, obj(a, 1));
-            ok(Value::Object(id))
+            ok(Value::Object(first.unwrap_or(OBJECT_INVALID)))
         }
 
         // --- Effects ----------------------------------------------------------------------
@@ -1919,10 +1936,22 @@ pub fn call(
         }
         "GetEffects" => {
             let f = EffectFilter::new(int(a, 1), int(a, 2), obj(a, 3), int(a, 4));
-            let list: Vec<Effect> = h
-                .object(obj(a, 0))
+            let target = obj(a, 0);
+            let mut list: Vec<Effect> = h
+                .object(target)
                 .map(|o| o.effects.iter().filter(|e| f.matches(e)).cloned().collect())
                 .unwrap_or_default();
+            // An area's effects include the visual effects applied at its places.
+            if h.object(target).is_some_and(|o| o.kind == ObjectKind::Area) {
+                list.extend(
+                    h.sim
+                        .world
+                        .location_vfx
+                        .iter()
+                        .filter(|v| v.area == target && f.matches(&v.effect))
+                        .map(|v| v.effect.clone()),
+                );
+            }
             let items = list
                 .into_iter()
                 .map(|e| Value::Engine {
@@ -1937,7 +1966,12 @@ pub fn call(
         }
         "RemoveEffect" => {
             if let Some(EngineData::Effect(e)) = h.sim.world.handle(handle(a, 1)).cloned() {
-                h.sim.remove_effect(obj(a, 0), &e);
+                let target = obj(a, 0);
+                h.sim
+                    .world
+                    .location_vfx
+                    .retain(|v| !(v.area == target && v.effect.id == e.id && e.id != 0));
+                h.sim.remove_effect(target, &e);
             }
             void()
         }
@@ -2390,6 +2424,37 @@ pub fn call(
             // A visual effect at a location (EffectVisualEffect, type 4 in effects.gda) is
             // presentation; anything else there (an area of effect, which the simulation
             // does not hold yet) is a placeholder, counted for coverage.
+            // A visual effect is kept for rendering to draw (`World::location_vfx`).
+            if name == "Engine_ApplyEffectAtLocation" && effect == Some(4) {
+                let at = match h.sim.world.handle(handle(a, 2)) {
+                    Some(EngineData::Location(l)) => Some(*l),
+                    _ => None,
+                };
+                let applied =
+                    applied_effect(h, handle(a, 1), int(a, 0), float(a, 3), obj(a, 4), None);
+                if let (Some(l), Some(mut e)) = (at, applied) {
+                    let instant = constant(&h.sim.table, "EFFECT_DURATION_TYPE_INSTANT");
+                    if e.duration_type != instant {
+                        h.sim.world.next_vfx += 1;
+                        let handle = h.sim.world.next_vfx;
+                        if e.id == 0 {
+                            e.id = (handle as i32).saturating_add(1_000_000);
+                        }
+                        let now = h.sim.world.time_ms;
+                        let entry = crate::world::LocationVfx {
+                            handle,
+                            vfx: e.ints.first().copied().unwrap_or(0),
+                            area: l.area,
+                            position: l.position,
+                            facing: l.facing,
+                            started_ms: now,
+                            duration_ms: e.expires.map(|x| x.saturating_sub(now)),
+                            effect: e,
+                        };
+                        h.sim.world.location_vfx.push(entry);
+                    }
+                }
+            }
             if name == "Engine_ApplyEffectAtLocation" {
                 let tally = if effect == Some(4) {
                     &mut h.sim.world.trace.presentation
@@ -3253,6 +3318,11 @@ pub fn call(
             h.sim.world.store = h.object(st).map(|_| st);
             void()
         }
+        // A container's inventory opens for looting (see container.rs).
+        "OpenInventory" => {
+            h.sim.open_container(obj(a, 0));
+            void()
+        }
         "GetItemValue" => ok(Value::Int(h.sim.item_value(obj(a, 0)))),
         // A quickbar slot: an ability and the tag of the item it comes from; no ability
         // empties it.
@@ -3517,14 +3587,23 @@ pub fn call(
                 .count();
             ok(Value::Int(n as i32))
         }
-        "SetCanLevelUp" | "SetAILevel" => {
-            let field = if name == "SetCanLevelUp" {
-                "CanLevelUp"
-            } else {
-                "AILevel"
-            };
+        // DAOrigins.exe's SetCanLevelUp (0x662ea0 -> 0x6aca10) ignores its value: whether a
+        // creature can level up is whether it has points to spend (attribute, skill and
+        // talent points, properties 34-36).
+        "SetCanLevelUp" => {
+            let who = obj(a, 0);
+            let points: f32 = [34, 35, 36]
+                .iter()
+                .map(|&p| h.sim.property_total(who, p))
+                .sum();
+            if let Some(o) = h.sim.world.get_mut(who) {
+                o.fields.insert("CanLevelUp".into(), (points > 0.0) as i32);
+            }
+            void()
+        }
+        "SetAILevel" => {
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.fields.insert(field.to_string(), int(a, 1));
+                o.fields.insert("AILevel".into(), int(a, 1));
             }
             void()
         }
@@ -3745,9 +3824,32 @@ pub fn call(
                 .unwrap_or(1)
                 .max(1),
         )),
+        // Ignored for an item that does not stack; clamped to the stack's maximum; an item
+        // set to 0 is destroyed (0x66a8a0).
         "SetItemStackSize" => {
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.fields.insert("StackSize".into(), int(a, 1).max(1));
+            let item = obj(a, 0);
+            let max = h.sim.max_stack(item);
+            if max > 1 && h.object(item).is_some() {
+                let n = int(a, 1).clamp(0, max);
+                if n == 0 {
+                    let holders: Vec<ObjectId> = h
+                        .sim
+                        .world
+                        .objects
+                        .values()
+                        .filter(|o| o.inventory.contains(&item))
+                        .map(|o| o.id)
+                        .collect();
+                    for holder in holders {
+                        h.sim.unequip(holder, item);
+                        if let Some(o) = h.sim.world.get_mut(holder) {
+                            o.inventory.retain(|&i| i != item);
+                        }
+                    }
+                    h.sim.world.objects.remove(&item);
+                } else if let Some(o) = h.sim.world.get_mut(item) {
+                    o.fields.insert("StackSize".into(), n);
+                }
             }
             void()
         }
@@ -5599,13 +5701,14 @@ mod tests {
             }
         };
         let (kept, dropped) = (make(&mut s, 0), make(&mut s, 1));
-        assert_eq!(
-            s.world.get(dropped).unwrap().fields.get("StackSize"),
-            Some(&2)
-        );
+        // An item that does not stack (no base item here) comes as two separate items.
+        assert_eq!(s.world.get(dropped).unwrap().fields.get("StackSize"), None);
         let bag = s.spawn_body_bag(foe, false).unwrap();
-        assert_eq!(s.world.get(bag).unwrap().inventory, vec![dropped]);
-        assert_eq!(s.world.get(foe).unwrap().inventory, vec![kept]);
+        assert_eq!(
+            s.world.get(bag).unwrap().inventory,
+            vec![dropped, dropped + 1]
+        );
+        assert_eq!(s.world.get(foe).unwrap().inventory, vec![kept, kept + 1]);
     }
 
     #[test]
@@ -5756,7 +5859,12 @@ mod coverage_tests {
         int[] GetItemProperties(object o, int s = FALSE) = 105;\n\
         void PlaySound(object o, string s) = 106;\n\
         void PlayMusic(string s) = 107;\n\
-        void DestroyObject(object o, int n = 0) = 108;\n";
+        void DestroyObject(object o, int n = 0) = 108;\n\
+        void SetSoundSet(object o, string s) = 109;\n\
+        void SetMusicIntensity(int n) = 110;\n\
+        void Engine_ApplyEffectAtLocation(int d, effect e, location l, float f = 0.0, object c = OBJECT_INVALID, int n = 0) = 111;\n\
+        effect[] GetEffects(object o, int t = 0, int a = 0, object c = OBJECT_INVALID, int d = 0, int i = -1) = 112;\n\
+        void RemoveEffect(object o, effect e) = 113;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -5780,6 +5888,72 @@ mod coverage_tests {
             ty: s.types.effect,
             handle: Some(hd),
         }
+    }
+
+    #[test]
+    fn visual_effects_at_places_are_kept_until_they_end_or_are_removed() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.get_mut(hero).unwrap().area = Some(area);
+        let vfx = |s: &mut Sim, row: i32| {
+            effect_value(
+                s,
+                Effect {
+                    ty: 4,
+                    ints: vec![row],
+                    ..Default::default()
+                },
+            )
+        };
+        let place = |s: &mut Sim, x: f32| {
+            let hd = s.world.store(EngineData::Location(crate::world::Location {
+                area,
+                position: [x, 0.0, 0.0],
+                facing: 90.0,
+            }));
+            Value::Engine {
+                ty: s.types.location,
+                handle: Some(hd),
+            }
+        };
+        let (crowd, flash) = (vfx(&mut s, 1234), vfx(&mut s, 77));
+        let (here, there) = (place(&mut s, 1.0), place(&mut s, 2.0));
+        // A permanent crowd and a two-second flash.
+        run(
+            &mut s,
+            hero,
+            "Engine_ApplyEffectAtLocation",
+            &[Value::Int(3), crowd, here, Value::Float(0.0)],
+        );
+        run(
+            &mut s,
+            hero,
+            "Engine_ApplyEffectAtLocation",
+            &[Value::Int(2), flash, there, Value::Float(2.0)],
+        );
+        let v = &s.world.location_vfx;
+        assert_eq!(v.len(), 2);
+        assert_eq!(
+            (v[0].vfx, v[0].position, v[0].facing, v[0].duration_ms),
+            (1234, [1.0, 0.0, 0.0], 90.0, None)
+        );
+        assert_eq!((v[1].vfx, v[1].duration_ms), (77, Some(2000)));
+        s.tick(2500);
+        assert_eq!(s.world.location_vfx.len(), 1, "the flash has run out");
+        // The area's effects list it, and removing it from the area takes it away.
+        let found = match run(&mut s, hero, "GetEffects", &[Value::Object(area)]) {
+            Some(Value::Array { items, .. }) => items,
+            v => panic!("{v:?}"),
+        };
+        assert_eq!(found.len(), 1);
+        run(
+            &mut s,
+            hero,
+            "RemoveEffect",
+            &[Value::Object(area), found[0].clone()],
+        );
+        assert!(s.world.location_vfx.is_empty());
     }
 
     #[test]
@@ -6520,6 +6694,35 @@ mod coverage_tests {
             &[Value::Object(o), Value::String("glo/bell/ring".into())],
         );
         run(&mut s, 1, "PlayMusic", &[Value::String("theme".into())]);
+        run(
+            &mut s,
+            1,
+            "SetSoundSet",
+            &[Value::Object(o), Value::String("SS_PC_FHUMAN_WISE".into())],
+        );
+        assert_eq!(
+            s.world
+                .get(o)
+                .unwrap()
+                .text_fields
+                .get(crate::sim::SOUND_SET),
+            Some(&"ss_pc_fhuman_wise".to_string())
+        );
+        assert_eq!(s.world.music_intensity, 1);
+        run(&mut s, 1, "SetMusicIntensity", &[Value::Int(0)]);
+        assert_eq!(s.world.music_intensity, 0);
+        // Character creation's choice goes to the creature being made.
+        assert!(!s.chargen_sound_set("ss_pc_mhuman_cocky"));
+        s.world.chargen = Some(o);
+        assert!(s.chargen_sound_set("SS_PC_MHUMAN_COCKY"));
+        assert_eq!(
+            s.world
+                .get(o)
+                .unwrap()
+                .text_fields
+                .get(crate::sim::SOUND_SET),
+            Some(&"ss_pc_mhuman_cocky".to_string())
+        );
         assert_eq!(
             std::mem::take(&mut s.world.sounds),
             [

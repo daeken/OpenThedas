@@ -48,6 +48,7 @@
 mod audio;
 mod chargen_stage;
 mod control;
+mod cutactors;
 mod cutcam;
 mod focusnav;
 mod follow;
@@ -852,10 +853,12 @@ impl App {
         if let Some(f) = self.follow.as_mut() {
             let turn = (k(KeyCode::KeyQ) as i32 - k(KeyCode::KeyE) as i32) as f32;
             f.orbit(turn * 1.8 * dt, 0.0);
-            if let Some(feet) = self.live.as_ref().and_then(|l| l.leader_feet()) {
-                let live = self.live.as_ref();
-                let hit = |a, b| live.and_then(|l| l.first_hit(a, b));
-                self.camera = f.camera_clear(feet, dt, &self.camera, &hit);
+            if let Some(c) = self
+                .live
+                .as_ref()
+                .and_then(|l| l.follow_camera(f, dt, &self.camera))
+            {
+                self.camera = c;
             }
             // A staged conversation line frames itself.
             if let Some(c) = self
@@ -1070,6 +1073,7 @@ impl App {
                 });
             }
         }
+        g.ui.set_pad_active(self.pad.used);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -1153,6 +1157,7 @@ impl App {
                 r.advance_time(dt / 1000.0);
             }
         }
+        g.ui.set_pad_active(self.pad.used);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -1546,6 +1551,31 @@ impl App {
                     test_floaty(&mut l.sim(), text);
                 }
                 log.push(format!("floaty {text:?}"));
+            }
+            Step::Use(tag) => {
+                if let Some(l) = self.live.as_ref() {
+                    let mut sim = l.sim();
+                    let who = sim.world.controlled();
+                    match (who, who.and_then(|w| nearest_tagged(&sim, w, tag))) {
+                        (Some(w), Some(t)) => {
+                            sim.order_use(w, t);
+                            log.push(format!("use {tag}"));
+                        }
+                        _ => log.push(format!("use {tag}: nothing")),
+                    }
+                }
+            }
+            Step::Plot(plot, flag) => {
+                if let Some(l) = self.live.as_ref() {
+                    l.sim().set_plot_flag(
+                        plot,
+                        *flag,
+                        true,
+                        true,
+                        thedas_script::vm::OBJECT_INVALID,
+                    );
+                }
+                log.push(format!("plot {plot} {flag}"));
             }
             &Step::Menu(m) => {
                 self.key_down(match m {
@@ -2099,14 +2129,47 @@ fn audio_state(
     };
     if let Some(ui) = ui {
         state.gui_sounds = ui.stage.bridge.drain_sounds();
+        // Character creation's voice previews: always said, by nobody in particular.
+        for (set, entry) in ui.drain_sound_set_previews() {
+            state.sound_sets.push((set, entry, 1.0, None));
+        }
         state.volumes = audio::volumes(|n| ui.client_option(n));
     }
     let Some(live) = live else {
         return state;
     };
-    // Animations' sound events (see `Live::animation_clocks`).
+    // Animations' sound events (see `Live::animation_clocks`), with what each creature
+    // wears and wields.
     if !live.front_end {
         state.animations = live.animation_clocks();
+        let sim = live.sim();
+        let grid = sim.world.area.and_then(|a| sim.loaded_nav_grid(a));
+        let appearances = sim.world.tables().get(0, "apr_base");
+        for (id, ..) in &state.animations {
+            let Some(o) = sim.world.get(*id) else {
+                continue;
+            };
+            let base = |slot: &str| {
+                let slot = thedas_sim::sim::constant(&sim.table, slot);
+                o.equipment
+                    .get(&slot)
+                    .and_then(|i| sim.world.get(*i))
+                    .and_then(|i| i.fields.get("BaseItem").copied())
+            };
+            state.gear.insert(
+                *id,
+                audio::Gear {
+                    armour: base("INVENTORY_SLOT_CHEST"),
+                    main: base("INVENTORY_SLOT_MAIN"),
+                    off: base("INVENTORY_SLOT_OFFHAND"),
+                    combat: o.combat.in_combat,
+                    footstep: Some(audio::footstep_column(appearances.as_ref().and_then(|t| {
+                        t.cell_by_hash(audio::APR_FOOTSTEP, o.appearance as i64)
+                    }))),
+                    surface: grid.as_ref().map_or(0, |g| g.surface(o.position)),
+                },
+            );
+        }
     }
     {
         let sim = live.sim();
@@ -2154,12 +2217,77 @@ fn audio_state(
             }
         }
     }
+    // Sounds the simulation asked for (scripts, blows, character creation's voice preview).
+    {
+        let mut sim = live.sim();
+        for req in std::mem::take(&mut sim.world.sounds) {
+            match req {
+                thedas_sim::world::SoundRequest::Event { target, event } => {
+                    let at = sim.world.get(target).map(|o| o.position);
+                    state.script_sounds.push((event, at));
+                }
+                thedas_sim::world::SoundRequest::SoundSet {
+                    target,
+                    entry,
+                    probability,
+                } => {
+                    let o = sim.world.get(target);
+                    let set = o.and_then(|o| {
+                        o.text_fields
+                            .get(thedas_sim::sim::SOUND_SET)
+                            .cloned()
+                            .or_else(|| a.template_sound_set(&sim.vfs, &o.template))
+                    });
+                    if let Some(set) = set {
+                        let at = o.map(|o| o.position);
+                        state.sound_sets.push((set, entry, probability, at));
+                    }
+                }
+                thedas_sim::world::SoundRequest::Impact {
+                    target,
+                    result,
+                    weapon,
+                    armour,
+                    shield,
+                    ..
+                } => {
+                    if let Some(at) = sim.world.get(target).map(|o| o.position) {
+                        state.impacts.push((at, result, weapon, armour, shield));
+                    }
+                }
+                // PlayMusic names the music project (`music`, from the Music M2DA by
+                // module), which is always the one used here.
+                other => log::debug!("audio: not done yet: {other:?}"),
+            }
+        }
+    }
+    // The party picker, while open: who is picked (and the pool, for unpicked lines).
+    {
+        let sim = live.sim();
+        if let Some(p) = sim.world.party_picker.as_ref() {
+            let mut describe = |id: u32| {
+                let o = sim.world.get(id)?;
+                let set = o
+                    .text_fields
+                    .get(thedas_sim::sim::SOUND_SET)
+                    .cloned()
+                    .or_else(|| a.template_sound_set(&sim.vfs, &o.template));
+                Some((id, o.template.clone(), set, o.position))
+            };
+            state.picker = Some(p.selected.iter().filter_map(|&id| describe(id)).collect());
+            for id in sim.party_pool() {
+                if let Some(m) = describe(id) {
+                    state.picker_left.insert(id, m);
+                }
+            }
+        }
+    }
     if live.front_end {
         return state;
     }
     // The area: its music and placed sounds.
     {
-        let mut sim = live.sim();
+        let sim = live.sim();
         let area = sim
             .world
             .area
@@ -2176,17 +2304,7 @@ fn audio_state(
             }
             state.area = Some(resref);
             state.combat = sim.world.party_fighting;
-            // Sounds scripts asked for. Sound sets, PlayMusic and SetMusicIntensity are not
-            // done yet (logged).
-            for req in std::mem::take(&mut sim.world.sounds) {
-                match req {
-                    thedas_sim::world::SoundRequest::Event { target, event } => {
-                        let at = sim.world.get(target).map(|o| o.position);
-                        state.script_sounds.push((event, at));
-                    }
-                    other => log::debug!("audio: not done yet: {other:?}"),
-                }
-            }
+            state.music_intensity = Some(sim.world.music_intensity);
             state.dead = sim.world.game_over;
             state.inactive_sounds = sim
                 .world
@@ -2202,6 +2320,7 @@ fn audio_state(
     // listener balance position": 0.17 of the way to the camera).
     let cam = camera.position;
     let feet = live.leader_feet().unwrap_or(cam);
+    state.leader = live.leader_feet().map(|f| f.to_array());
     let p = feet + (cam - feet) * 0.17;
     let right = [camera.yaw.sin(), -camera.yaw.cos(), 0.0];
     state.listener = Some((p.to_array(), right));
@@ -2248,7 +2367,7 @@ fn nearest_tagged(
     let me = sim.world.get(who)?;
     sim.world
         .by_tag(tag)
-        .filter(|o| o.area.is_some() && o.area == me.area && o.id != who)
+        .filter(|o| o.area.is_some() && o.area == me.area && o.id != who && o.active)
         .min_by(|a, b| {
             let d =
                 |o: &thedas_sim::world::Object| thedas_sim::engine::dist(o.position, me.position);
@@ -2517,6 +2636,11 @@ enum Step {
     /// A floating message over the controlled creature, as a script's
     /// `DisplayFloatyMessage` makes one (`floaty 12`), for trying the floaty layer headless.
     Floaty(String),
+    /// Sets a plot flag as a script would (`plot plt_tut_explore 0`), running the plot's
+    /// script, for trying journal entries and tutorial popups headless.
+    Plot(String, i32),
+    /// Uses the nearest object with a tag, as clicking it would (`use bdc140ip_everds_chest`).
+    Use(String),
 }
 
 /// A `pad` step: a button by name (pressed and let go), `press`/`release` and a button, or
@@ -2644,6 +2768,15 @@ fn parse_step(s: &str) -> Result<Step> {
             Step::SetValue(k.to_string(), v.trim().to_string())
         }
         "floaty" => Step::Floaty(arg.to_string()),
+        "plot" => {
+            let (plot, flag) = arg
+                .rsplit_once(' ')
+                .context("plot takes a plot and a flag")?;
+            Step::Plot(
+                plot.trim().to_string(),
+                flag.trim().parse().context("plot's flag is a number")?,
+            )
+        }
         // The game menu (Escape while playing).
         "gamemenu" => Step::Menu(screens::Screen::GameMenu),
         "key" if arg.eq_ignore_ascii_case("i") => Step::Menu(screens::Screen::Inventory),
@@ -2681,6 +2814,7 @@ fn parse_step(s: &str) -> Result<Step> {
             }
         }
         "talk" if !arg.is_empty() => Step::Talk(arg.to_string()),
+        "use" if !arg.is_empty() => Step::Use(arg.to_string()),
         "rebuild" => Step::Rebuild,
         "picker" => Step::Picker,
         "wipe" => Step::Wipe,
@@ -2826,8 +2960,11 @@ fn main() -> Result<()> {
                 l.aiming = layer.play(&mut s, &l.sim, 0.0).pop();
                 played = Some((layer, s));
             }
-            if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
-                camera = f.camera_clear(feet, 0.0, &camera, &|a, b| l.first_hit(a, b));
+            if let Some(c) = follow
+                .as_mut()
+                .and_then(|f| l.follow_camera(f, 0.0, &camera))
+            {
+                camera = c;
             }
             for c in &args.click {
                 let (x, y) = c
@@ -2975,6 +3112,7 @@ fn main() -> Result<()> {
                                     layer.set_paperdoll(shot);
                                 }
                                 layer.set_paused(l.paused);
+                                layer.set_pad_active(pad_play.used);
                                 if let Some(aim) = layer.play(s, &l.sim, dt).pop() {
                                     println!("aiming ability {}", aim.ability);
                                     l.aiming = Some(aim);
@@ -2993,11 +3131,11 @@ fn main() -> Result<()> {
                                 }
                             }
                             frames += 1;
-                            if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
-                                camera =
-                                    f.camera_clear(feet, dt as f32 / 1000.0, &camera, &|a, b| {
-                                        l.first_hit(a, b)
-                                    });
+                            if let Some(c) = follow
+                                .as_mut()
+                                .and_then(|f| l.follow_camera(f, dt as f32 / 1000.0, &camera))
+                            {
+                                camera = c;
                             }
                         }
                         if let Some((_, s)) = played.as_ref() {
@@ -3053,6 +3191,27 @@ fn main() -> Result<()> {
                         test_floaty(&mut l.sim(), text);
                         println!("floaty {text:?}");
                     }
+                    Step::Use(tag) => {
+                        let mut sim = l.sim();
+                        let who = sim.world.controlled();
+                        match (who, who.and_then(|w| nearest_tagged(&sim, w, tag))) {
+                            (Some(w), Some(t)) => {
+                                sim.order_use(w, t);
+                                println!("use {tag}");
+                            }
+                            _ => println!("use {tag}: nothing"),
+                        }
+                    }
+                    Step::Plot(plot, flag) => {
+                        l.sim().set_plot_flag(
+                            plot,
+                            *flag,
+                            true,
+                            true,
+                            thedas_script::vm::OBJECT_INVALID,
+                        );
+                        println!("plot {plot} {flag}");
+                    }
                     &Step::Menu(m) => {
                         if let Some((layer, s)) = played.as_mut() {
                             s.toggle(m);
@@ -3098,8 +3257,11 @@ fn main() -> Result<()> {
                     }
                     &Step::Orbit(dyaw, dpitch) => {
                         orbit_camera(follow.as_mut(), &mut camera, dyaw, dpitch);
-                        if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
-                            camera = f.camera_clear(feet, 0.0, &camera, &|a, b| l.first_hit(a, b));
+                        if let Some(c) = follow
+                            .as_mut()
+                            .and_then(|f| l.follow_camera(f, 0.0, &camera))
+                        {
+                            camera = c;
                         }
                         println!("orbit {dyaw},{dpitch}");
                     }
@@ -3175,8 +3337,11 @@ fn main() -> Result<()> {
                 .collect();
             log::info!("party: {party:?}");
             drop(sim);
-            if let (Some(f), Some(feet)) = (follow.as_mut(), l.leader_feet()) {
-                camera = f.camera_clear(feet, 0.0, &camera, &|a, b| l.first_hit(a, b));
+            if let Some(c) = follow
+                .as_mut()
+                .and_then(|f| l.follow_camera(f, 0.0, &camera))
+            {
+                camera = c;
             }
             if follow.is_some()
                 && let Some(c) = l.conversation_camera(&camera)

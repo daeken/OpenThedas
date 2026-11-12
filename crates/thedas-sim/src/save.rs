@@ -31,7 +31,15 @@ pub const SAVE_FORMAT: u32 = 1;
 ///   Loading an earlier save tells it of the party as it stands.
 /// - 5: creatures placed dead (`CREATURE_SPAWN_DEAD`, see [`Sim::spawns_dead`]) are dead from
 ///   their creation; earlier saves hold them alive, and loading one lays them out.
-pub const SAVE_REVISION: u32 = 5;
+/// - 6: stackable items merge into the stacks already held, and creatures hear
+///   `EVENT_TYPE_EQUIP` for their starting gear (rules_core works out the main-hand damage,
+///   property 50, from it). Loading an earlier save merges each creature's carried stacks
+///   and tells the party's members of what they wear (no effects are applied again).
+/// - 7: placeables hold their template's items (`ItemList`) from the area's loading, as
+///   containers do in the original. Loading an earlier save fills each empty container with
+///   its template's items (one that was emptied by looting is filled again: earlier saves
+///   cannot tell the two apart).
+pub const SAVE_REVISION: u32 = 7;
 
 /// The trace channel loading reports save damage on.
 pub const SAVE_CHANNEL: i32 = -7;
@@ -233,6 +241,7 @@ impl Sim {
         // Caches keyed by object id belong to the world just replaced.
         self.area_layouts.clear();
         self.door_cells.clear();
+        self.placeable_collisions.clear();
         if save_revision < 1 {
             self.apply_worn_properties();
         }
@@ -255,6 +264,54 @@ impl Sim {
             for id in ids {
                 self.lay_out_if_spawned_dead(id);
             }
+        }
+        if save_revision < 6 {
+            let owners: Vec<ObjectId> = self
+                .world
+                .objects
+                .values()
+                .filter(|o| !o.inventory.is_empty())
+                .map(|o| o.id)
+                .collect();
+            for owner in owners {
+                self.restack(owner);
+            }
+            let party = crate::engine::party_of(self);
+            for m in party {
+                let worn: Vec<(i32, ObjectId)> = self
+                    .world
+                    .get(m)
+                    .map(|o| o.equipment.iter().map(|(s, i)| (*s, *i)).collect())
+                    .unwrap_or_default();
+                for (slot, item) in worn {
+                    self.equip_event("EQUIP", m, item, slot, false);
+                }
+            }
+        }
+        if save_revision < 7 {
+            let empty: Vec<(ObjectId, String)> = self
+                .world
+                .objects
+                .values()
+                .filter(|o| {
+                    o.kind == crate::world::ObjectKind::Placeable
+                        && o.inventory.is_empty()
+                        && !o.template.is_empty()
+                })
+                .map(|o| (o.id, o.template.clone()))
+                .collect();
+            for (id, template) in empty {
+                if let Ok(t) = self.read_gff3(&format!("{}.utp", template.to_ascii_lowercase())) {
+                    self.load_template_items(id, &t);
+                }
+            }
+        }
+        self.learn_held_recipes();
+        // A tutorial pause holds until the queue is empty (0x693630); a save that holds it
+        // with no tutorial left to dismiss would never resume. Provisional: whether the
+        // original saves the tutorial queue at all is not traced.
+        if self.world.tutorials.is_empty() {
+            self.world.tutorial_paused = false;
         }
         self.save_issues = if save_revision < 3 {
             self.check_property_damage()
@@ -317,6 +374,11 @@ mod tests {
             ended,
             shown: Vec::new(),
             chain: Vec::new(),
+            cut_from: None,
+            cut_lines_left: 0,
+            staged: Vec::new(),
+            staged_at: None,
+            ambient_run: false,
         };
         s.talk = Some(talk(true));
         let save = s.save_game();
@@ -327,6 +389,25 @@ mod tests {
         s.talk = Some(talk(false));
         s.load_game(s.save_game()).unwrap();
         assert!(s.talk.as_ref().is_some_and(|c| !c.ended));
+    }
+
+    #[test]
+    fn a_tutorial_pause_with_nothing_left_to_dismiss_does_not_survive_a_load() {
+        let mut s = sim();
+        s.world.tutorial_paused = true;
+        s.load_game(s.save_game()).unwrap();
+        assert!(!s.world.tutorial_paused);
+        // With tutorials still queued it holds, as the original's does until they are all
+        // dismissed.
+        s.world.tutorials.push(crate::journal::Tutorial {
+            resref: "tut_explore".into(),
+            title: None,
+            text: Some(1),
+            pauses: false,
+        });
+        s.world.tutorial_paused = true;
+        s.load_game(s.save_game()).unwrap();
+        assert!(s.world.tutorial_paused);
     }
 
     #[test]

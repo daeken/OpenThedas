@@ -21,7 +21,14 @@ pub enum DecodeError {
     Channels(String, u16),
     #[error("sample {0}: MP3 decoder: {1}")]
     Mp3(String, String),
+    #[error("sample {0}: {1} frames is longer than any sound the game has")]
+    Length(String, u32),
 }
+
+/// The longest sample decoded (frames): 30 minutes at 48 kHz. The game's longest (the
+/// streamed music) runs under 4; a header claiming more is malformed (or not DA:O's), and
+/// decoding it is refused rather than allocating gigabytes.
+pub const MAX_FRAMES: u32 = 48_000 * 60 * 30;
 
 /// Decoded audio: interleaved `f32` frames in -1..=1.
 #[derive(Clone, Debug, PartialEq)]
@@ -48,6 +55,9 @@ pub fn decode(sample: &FsbSample, data: &[u8]) -> Result<Pcm, DecodeError> {
     if !(1..=2).contains(&ch) {
         return Err(DecodeError::Channels(sample.name.clone(), ch));
     }
+    if sample.length > MAX_FRAMES {
+        return Err(DecodeError::Length(sample.name.clone(), sample.length));
+    }
     let mut samples = match sample.codec() {
         Codec::ImaAdpcm => decode_ima(data, ch as usize),
         Codec::Mpeg => {
@@ -60,7 +70,10 @@ pub fn decode(sample: &FsbSample, data: &[u8]) -> Result<Pcm, DecodeError> {
         Codec::Pcm8 => data.iter().map(|&b| (b as i8) as f32 / 128.0).collect(),
         c => return Err(DecodeError::Codec(sample.name.clone(), c)),
     };
-    let want = sample.length as usize * ch as usize;
+    // The header's length, held to what the data decoded to (encoders pad by at most a
+    // frame or block): a malformed header cannot ask for more than its data gives.
+    let slack = 4096 * ch as usize;
+    let want = (sample.length as usize * ch as usize).min(samples.len() + slack);
     if samples.len() > want {
         samples.truncate(want);
     } else {
@@ -322,6 +335,29 @@ mod tests {
         for (a, b) in out.iter().zip(&pcm).skip(16) {
             assert!((a * 32768.0 - *b as f32).abs() < 600.0, "{a} vs {b}");
         }
+    }
+
+    #[test]
+    fn a_header_cannot_ask_for_more_than_its_data() {
+        let s = thedas_formats::fsb::FsbSample {
+            name: "x.wav".into(),
+            length: 10_000_000,
+            compressed_size: 36,
+            loop_start: 0,
+            loop_end: 0,
+            mode: thedas_formats::fsb::MODE_IMAADPCM | thedas_formats::fsb::MODE_MONO,
+            frequency: 22050,
+            volume: 255,
+            pan: 128,
+            priority: 128,
+            channels: 1,
+            min_distance: 1.0,
+            max_distance: 1.0,
+            sync_points: Vec::new(),
+            data: 0..36,
+        };
+        let pcm = decode(&s, &[0u8; 36]).unwrap();
+        assert_eq!(pcm.frames(), 64 + 4096);
     }
 
     #[test]

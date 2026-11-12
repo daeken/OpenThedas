@@ -29,10 +29,12 @@ impl Sim {
     /// With [`World::pool_xp`](crate::world::World::pool_xp) on, the experience the hero
     /// just gained goes to the followers waiting in the pool (not in the active party) as
     /// well, up to the level cap's experience; one that reaches its next level may level up
-    /// (`SetCanLevelUp`), as `RewardXP` marks the active party. Provisional and off by
-    /// default: in the original, companions left in camp are said to keep pace with the
-    /// hero, but no script gives them experience (`RewardXPParty` pays `GetPartyList`, the
-    /// active party), so if it happens the executable does it, by a rule not recovered.
+    /// (`SetCanLevelUp`), as `RewardXP` marks the active party. A harness option, off by
+    /// default, and NOT the original's rule: there, companions left in camp get nothing as
+    /// the party fights (`RewardXPParty` pays `GetPartyList`, the active party); each time the
+    /// party picker opens (`EVENT_TYPE_PARTYPICKER_INIT`, sent by `GameModePartyPicker` at
+    /// 0x76c807), module_core tops every pool member up to the experience of one level below
+    /// the hero's, which the simulation runs as the scripts do.
     pub fn share_pool_xp(&mut self, gained: f32) {
         if !self.world.pool_xp || gained <= 0.0 {
             return;

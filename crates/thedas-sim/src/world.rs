@@ -5,7 +5,7 @@
 //! number), object ids are handed out sequentially, and randomness comes from a seeded
 //! generator.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -333,6 +333,29 @@ pub struct Effect {
     pub engine_vectors: Vec<(i32, [f32; 3])>,
 }
 
+/// A visual effect applied at a place (`Engine_ApplyEffectAtLocation` with an
+/// `EffectVisualEffect`, type 4): what rendering draws, such as the Proving's crowd. The
+/// simulation only keeps it: it adds the entry when a script applies the effect and drops it
+/// when it runs out or a script removes it from the area.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LocationVfx {
+    /// A stable id, to tell entries apart from frame to frame.
+    pub handle: u64,
+    /// The effect's `VFX_base` row (its integer 0), as the script passed it.
+    pub vfx: i32,
+    pub area: ObjectId,
+    pub position: [f32; 3],
+    /// Degrees, as objects use.
+    pub facing: f32,
+    /// World time it was applied.
+    pub started_ms: u64,
+    /// `None` while it lasts until removed.
+    pub duration_ms: Option<u64>,
+    /// The effect as the script made it, so `GetEffects` on the area finds it and
+    /// `RemoveEffect` can take it away.
+    pub effect: Effect,
+}
+
 /// The open party picker: the followers picked so far (at most three), in order.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PartyPicker {
@@ -428,8 +451,9 @@ pub struct FloatyMessage {
     pub duration: f32,
 }
 
-/// A sound a script asked for (`PlaySound`, `PlaySoundSet`, `PlaySoundObject`, `PlayMusic`,
-/// `SetMusicIntensity`), for the presentation to play. Output only.
+/// A sound a script asked for (`PlaySound`, `PlaySoundSet`, `PlaySoundObject`, `PlayMusic`)
+/// or a blow made, for the presentation to play. Output only. (`SetMusicIntensity` is kept
+/// in [`World::music_intensity`].)
 #[derive(Clone, Debug, PartialEq)]
 pub enum SoundRequest {
     /// `PlaySound(oTarget, sSoundEventName)`: an FMOD event at the object.
@@ -445,8 +469,17 @@ pub enum SoundRequest {
     Object { sound: ObjectId },
     /// `PlayMusic(sMusicName)`.
     Music { name: String },
-    /// `SetMusicIntensity(nIntensity)`.
-    MusicIntensity { intensity: i32 },
+    /// An attack's blow landed or missed (one hand's impact): the attacker, the target,
+    /// the `COMBAT_RESULT_*`, and the base items (`BaseItem`) of the attacker's weapon in
+    /// that hand and of the target's armour (body slot) and off-hand item (a shield).
+    Impact {
+        attacker: ObjectId,
+        target: ObjectId,
+        result: i32,
+        weapon: Option<i32>,
+        armour: Option<i32>,
+        shield: Option<i32>,
+    },
 }
 
 /// Everything a save holds. The trace and the tables are not saved: the trace starts afresh
@@ -479,9 +512,20 @@ pub struct World {
     /// How many journal entries have been made (orders them).
     #[serde(default)]
     pub journal_seq: u64,
+    /// The crafting recipes the party knows (`CraftingRecipeID`s): a recipe item the party
+    /// receives is learned and gone (see [`crate::sim::Sim::give_item`]).
+    #[serde(default)]
+    pub recipes: BTreeSet<i32>,
     /// The quest the player marked active in the journal (its plot resource).
     #[serde(default)]
     pub active_quest: Option<String>,
+    /// The tutorial popups waiting to show, the first on screen (see
+    /// [`crate::journal::Tutorial`]).
+    #[serde(default)]
+    pub tutorials: Vec<crate::journal::Tutorial>,
+    /// Whether a tutorial paused the game: it stays paused until the queue is empty.
+    #[serde(default)]
+    pub tutorial_paused: bool,
     /// The HUD's notifications not yet dismissed (see [`crate::journal::Alert`]).
     #[serde(default)]
     pub alerts: Vec<crate::journal::Alert>,
@@ -490,6 +534,10 @@ pub struct World {
     /// once the scripts that loaded it have run (see [`crate::sim::CutscenePolicy`]).
     #[serde(default)]
     pub cutscenes: Vec<String>,
+    /// Those of [`World::cutscenes`] a conversation line queued (resource names): they end
+    /// without the scripts' cutscene-ending locals (see [`crate::sim::Sim::end_cutscene`]).
+    #[serde(default)]
+    pub dialog_cutscenes: Vec<String>,
     /// The cutscene playing, while a presentation shows it ([`crate::sim::CutscenePolicy::Play`]).
     #[serde(default)]
     pub cutscene: Option<crate::cutscene::Cutscene>,
@@ -506,6 +554,11 @@ pub struct World {
     /// The whole party fell: the original shows its death screen and the game ends there.
     #[serde(default)]
     pub game_over: bool,
+    /// The music's intensity, as scripts last set it (`SetMusicIntensity`; 1 until then).
+    /// Only the presentation reads it; it is saved so a loaded game sounds as it did.
+    /// Provisional: whether the original keeps it in its saves is not traced.
+    #[serde(default = "music_intensity_default")]
+    pub music_intensity: i32,
     /// The game difficulty (`difficulty.gda`'s rows: 0 casual, 1 normal, 2 hard, 3
     /// nightmare), as the difficulty option sets it and `GetGameDifficulty` reads it.
     #[serde(default = "normal_difficulty")]
@@ -547,9 +600,18 @@ pub struct World {
     /// The job board on screen (`ShowChantersGUI`).
     #[serde(default)]
     pub chanter_board: Option<crate::chanters::ChanterBoard>,
+    /// The container being looted (`OpenInventory`, see [`crate::container`]).
+    #[serde(default)]
+    pub container: Option<ObjectId>,
     /// The store whose screen is open (`OpenStore`).
     #[serde(default)]
     pub store: Option<ObjectId>,
+    /// Visual effects applied at places (see [`LocationVfx`]).
+    #[serde(default)]
+    pub location_vfx: Vec<LocationVfx>,
+    /// The next [`LocationVfx::handle`].
+    #[serde(default)]
+    pub next_vfx: u64,
     /// The world map (see `worldmap`).
     #[serde(default)]
     pub world_map: crate::worldmap::WorldMapState,
@@ -576,6 +638,10 @@ pub struct World {
     pub sounds: Vec<SoundRequest>,
     #[serde(skip, default = "no_tables")]
     pub(crate) tables: Arc<crate::m2da::Tables>,
+}
+
+fn music_intensity_default() -> i32 {
+    1
 }
 
 fn no_tables() -> Arc<crate::m2da::Tables> {
@@ -652,10 +718,14 @@ impl World {
             plots: BTreeMap::new(),
             journal: BTreeMap::new(),
             journal_seq: 0,
+            recipes: BTreeSet::new(),
             active_quest: None,
+            tutorials: Vec::new(),
+            tutorial_paused: false,
             alerts: Vec::new(),
             game_mode: 0,
             cutscenes: Vec::new(),
+            dialog_cutscenes: Vec::new(),
             cutscene: None,
             chargen: None,
             chargen_mode: 0,
@@ -664,6 +734,7 @@ impl World {
             hostility: BTreeMap::new(),
             party_fighting: false,
             game_over: false,
+            music_intensity: 1,
             difficulty: normal_difficulty(),
             autopilot: false,
             pool_xp: false,
@@ -672,7 +743,10 @@ impl World {
             dialog_shown: Default::default(),
             story_events: Vec::new(),
             popup: None,
+            container: None,
             store: None,
+            location_vfx: Vec::new(),
+            next_vfx: 0,
             chanter_board: None,
             plot_actions: PlotActions::default(),
             party_choice: None,

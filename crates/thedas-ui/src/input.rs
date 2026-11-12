@@ -310,6 +310,17 @@ pub fn query(sim: &Sim, name: &str, args: &[String]) -> UiValue {
                 .collect(),
         ),
         "GetObjectNameByID" => UiValue::String(sim.display_name(who)),
+        // `CreatureCanUseItem(item, creature)`: whether the creature may use the item;
+        // inventory.gfx dims the rows of items it cannot (`ItemEquippable_mc`). The exe's
+        // test (0x6ae8b0) checks the item's requirements against the creature. Provisional:
+        // requirements are not modelled yet, so any item and creature that exist pass.
+        "CreatureCanUseItem" => UiValue::Bool(
+            sim.world.get(who).is_some()
+                && u32::try_from(int(1))
+                    .ok()
+                    .and_then(|c| sim.world.get(c))
+                    .is_some(),
+        ),
         _ => UiValue::Undefined,
     }
 }
@@ -435,6 +446,11 @@ mod tests {
             ended,
             shown: Vec::new(),
             chain: Vec::new(),
+            cut_from: None,
+            cut_lines_left: 0,
+            staged: Vec::new(),
+            staged_at: None,
+            ambient_run: false,
         };
         // Still going with nothing to pick: a reply leaves it be.
         let world = s.world.clone();
