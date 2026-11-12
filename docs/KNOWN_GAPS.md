@@ -34,7 +34,7 @@ so an untraced item starts with a trace, not with a guess.
 
 | Area | File | Inventory items |
 | --- | --- | --- |
-| Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 169 (`SIM-`), plus ability coverage by family |
+| Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 168 (`SIM-`), plus ability coverage by family |
 | Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 95 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
 | Rendering | [gaps/rendering.md](gaps/rendering.md) | 154 (`RND-`) |
 | Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 195 (`UI-`), plus the movies never opened and the values no screen gets answered |
@@ -168,7 +168,6 @@ Concrete defects found during the code read. Each is small and independent.
 | `SCR-074` | Comparing two effects, locations or events compares handles, so equal values differ |
 | `SIM-148` | The module's start position is parsed and never used |
 | `SIM-092` | Equipped-item stat modifiers ignore material while `GetItemStat` scales by it |
-| `SIM-022` | `follow_leader` lines followers up behind the hero instead of using the formation |
 | `RND-043` | Alpha-tested casters are skipped, so foliage, fences and hair cast no sun shadow |
 | `RND-095` | Location effects with an instant duration are discarded and never drawn |
 | `RND-139` | Compressed textures lose their smallest mip levels |
