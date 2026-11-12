@@ -978,7 +978,26 @@ fn item(sim: &Sim, prefix: &str, id: u32, v: &mut BTreeMap<String, UiValue>) {
     set("Tag", UiValue::String(o.tag.clone()));
     set("Name", UiValue::String(name(sim, id)));
     set("Description", text(look.description));
-    set("Icon", UiValue::String(look.icon));
+    // An item whose template names no icon shows its base type's (`bitm_base`'s icon column,
+    // 0xa980657e: `ico_potion` for a quick item): Orzammar's "Wine" has none of its own.
+    // Provisional: the exe's fallback is not traced.
+    let icon = if look.icon.trim().is_empty() {
+        let base = o.fields.get("BaseItem").copied().unwrap_or(0) as i64;
+        match sim
+            .world
+            .tables()
+            .get(0, "bitm_base")
+            .and_then(|t| t.cell_by_hash(0xa980_657e, base).cloned())
+        {
+            Some(thedas_formats::gda::Cell::String(s)) => {
+                s.trim_end_matches('\0').trim().to_string()
+            }
+            _ => look.icon,
+        }
+    } else {
+        look.icon
+    };
+    set("Icon", UiValue::String(icon));
     set("BaseItemID", field("BaseItem", 0));
     // A row of the material types table; the movie names it from the tables itself.
     set("MaterialType", field("Material", 0));

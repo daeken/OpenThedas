@@ -608,6 +608,12 @@ impl Stage {
         false
     }
 
+    /// Whether a text field has the keyboard focus.
+    pub fn text_focused(&mut self) -> bool {
+        self.input_movies()
+            .any(|m| focused_input_field(m).is_some())
+    }
+
     /// Types each character of `text` into the focused text field; false when none has
     /// focus.
     pub fn type_text(&mut self, text: &str) -> bool {

@@ -1959,6 +1959,14 @@ impl padplay::Host for App {
             .unwrap_or_default()
     }
 
+    fn text_focused(&mut self) -> bool {
+        self.gfx.as_mut().is_some_and(|g| g.ui.stage.text_focused())
+    }
+
+    fn text_key(&mut self, key: thedas_ui::UiKey) -> bool {
+        self.gfx.as_mut().is_some_and(|g| g.ui.stage.key(key))
+    }
+
     fn open_saves(&mut self, mode: i32) {
         if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_mut()) {
             g.ui.open_saves(s, mode);
@@ -2546,6 +2554,18 @@ impl padplay::Host for HeadlessHost<'_> {
                 layer.stage.focus_targets()
             })
             .unwrap_or_default()
+    }
+
+    fn text_focused(&mut self) -> bool {
+        self.played
+            .as_deref_mut()
+            .is_some_and(|(layer, _)| layer.stage.text_focused())
+    }
+
+    fn text_key(&mut self, key: thedas_ui::UiKey) -> bool {
+        self.played
+            .as_deref_mut()
+            .is_some_and(|(layer, _)| layer.stage.key(key))
     }
 
     fn open_saves(&mut self, mode: i32) {
