@@ -178,6 +178,8 @@ pub struct UiLayer {
     tooltip_relayout: u8,
     /// The floating messages up over creatures (see [`UiLayer::update_floaties`]).
     floaties: Vec<Floaty>,
+    /// The stats floaties up (name and health bar over a creature): creature → floaty id.
+    stat_floaties: std::collections::BTreeMap<thedas_script::vm::ObjectId, u32>,
     next_floaty: u32,
     portraits: PortraitClock,
     paperdoll: PaperdollClock,
@@ -419,6 +421,7 @@ impl UiLayer {
             tooltip_text: None,
             tooltip_relayout: 0,
             floaties: Vec::new(),
+            stat_floaties: Default::default(),
             next_floaty: 1,
             portraits: PortraitClock::default(),
             paperdoll: PaperdollClock::default(),
@@ -1195,6 +1198,12 @@ impl UiLayer {
         use thedas_ui::UiValue;
         const LAYER: &str = "_global.FloatyLayer";
         const SYMBOL_MESSAGE: f64 = 1.0;
+        const SYMBOL_STATS: f64 = 0.0;
+        // floatylayer.gfx's `FLOATY_STATS_*` flags.
+        const SHOW_NAME: f64 = 1.0;
+        const SHOW_HEALTH_BAR: f64 = 2.0;
+        const SHOW_TARGET: f64 = 4.0;
+        const IS_HOSTILE: f64 = 32.0;
         /// Seconds a floaty stays past its duration (its own fade).
         const LINGER_S: f64 = 1.0;
         /// Metres above a creature's feet.
@@ -1212,6 +1221,7 @@ impl UiLayer {
                 .floaties
                 .clear();
             self.floaties.clear();
+            self.stat_floaties.clear();
             return;
         };
         let num = UiValue::Number;
@@ -1220,6 +1230,21 @@ impl UiLayer {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut ids, mut offsets, mut places, mut destroy) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (
+            mut stat_ids,
+            mut stat_flags,
+            mut stat_names,
+            mut stat_hp,
+            mut stat_max,
+            mut stat_ranks,
+        ) = (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         let size = self.stage.size();
         let scale = thedas_ui::stage_scale(size, (1024.0, 768.0));
         let (w, h) = (size.0 as f32, size.1 as f32);
@@ -1276,6 +1301,84 @@ impl UiLayer {
                 ]);
                 true
             });
+            // The stats floaties (name and health bar over a creature): the hostiles in a
+            // fight with the party, the leader's attack target named. Provisional: the
+            // exe's choice of creatures and flags is not traced; this follows what the
+            // original shows in a fight (a health bar over each enemy, the target's name).
+            let leader = sim.world.controlled();
+            let target = leader
+                .and_then(|l| sim.world.get(l))
+                .and_then(|o| o.commands.first())
+                .filter(|c| c.name == "CommandAttack")
+                .and_then(|c| c.target);
+            let party = thedas_sim::engine::party_of(&sim);
+            let health = thedas_sim::sim::constant(&sim.table, "PROPERTY_DEPLETABLE_HEALTH");
+            let wanted: Vec<thedas_script::vm::ObjectId> = sim
+                .world
+                .objects
+                .values()
+                .filter(|o| {
+                    o.kind == thedas_sim::world::ObjectKind::Creature
+                        && o.active
+                        && !o.dead
+                        && o.area == sim.world.area
+                        && (Some(o.id) == target
+                            || (o.combat.in_combat && party.iter().any(|&m| sim.hostile(m, o.id))))
+                })
+                .map(|o| o.id)
+                .collect();
+            for (&c, &id) in &self.stat_floaties {
+                if !wanted.contains(&c) {
+                    destroy.push(num(f64::from(id)));
+                }
+            }
+            self.stat_floaties.retain(|c, _| wanted.contains(c));
+            for c in wanted {
+                let id = match self.stat_floaties.get(&c) {
+                    Some(&id) => id,
+                    None => {
+                        let id = self.next_floaty;
+                        self.next_floaty += 1;
+                        create.push(num(f64::from(id)));
+                        symbols.push(num(SYMBOL_STATS));
+                        show.push(num(f64::from(id)));
+                        self.stat_floaties.insert(c, id);
+                        id
+                    }
+                };
+                let Some(o) = sim.world.get(c) else { continue };
+                let p = glam::Vec3::new(o.position[0], o.position[1], o.position[2] + HEAD);
+                let cl = vp * p.extend(1.0);
+                let (x, y, alpha) = if cl.w > 1e-4 {
+                    let n = cl.truncate() / cl.w;
+                    ((n.x + 1.0) * 0.5 * w, (1.0 - n.y) * 0.5 * h, 1.0)
+                } else {
+                    (0.0, 0.0, 0.0)
+                };
+                ids.push(num(f64::from(id)));
+                offsets.push(num(0.0));
+                places.extend([
+                    num(f64::from(x) / scale),
+                    num(f64::from(y) / scale),
+                    num(1.0),
+                    num(alpha),
+                    num(f64::from(id)),
+                ]);
+                let mut flags = SHOW_HEALTH_BAR + IS_HOSTILE;
+                if Some(c) == target {
+                    flags += SHOW_NAME + SHOW_TARGET;
+                }
+                let (cur, max) = (
+                    o.properties.get(&health).map_or(0.0, |p| f64::from(p.1)),
+                    sim.depletable_max(c, health),
+                );
+                stat_ids.push(num(f64::from(id)));
+                stat_flags.push(num(flags));
+                stat_names.push(UiValue::String(sim.display_name(c)));
+                stat_hp.push(num(cur));
+                stat_max.push(num(f64::from(max)));
+                stat_ranks.push(num(f64::from(o.rank)));
+            }
         }
         let m = &mut self.stage.movies[movie];
         let list = |v: Vec<UiValue>| UiValue::List(v);
@@ -1293,7 +1396,12 @@ impl UiLayer {
             ("BatchUpdateMessageStyles", styles),
             ("BatchUpdateMessageColours", colours),
             ("BatchUpdateMessageDurations", durations),
-            ("BatchUpdateStatsIDs", Vec::new()),
+            ("BatchUpdateStatsIDs", stat_ids),
+            ("BatchUpdateStatsFlags", stat_flags),
+            ("BatchUpdateStatsNames", stat_names),
+            ("BatchUpdateStatsCurrentHealths", stat_hp),
+            ("BatchUpdateStatsTotalHealths", stat_max),
+            ("BatchUpdateStatsRanks", stat_ranks),
             ("BatchUpdateIconIDs", Vec::new()),
             ("BatchUpdateOffscreenIDs", Vec::new()),
         ] {
