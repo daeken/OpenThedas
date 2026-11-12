@@ -122,6 +122,9 @@ pub struct Live {
     /// The area and whether a cutscene played, as the explore camera last saw them (see
     /// [`Live::camera_reset_due`]).
     camera_seen: Option<(Option<ObjectId>, bool)>,
+    /// The last script zoom request the explore camera has taken (see
+    /// [`Live::zoom_request_due`]).
+    zoom_seen: Option<u32>,
     creature_shapes: std::collections::HashMap<String, Arc<Vec<crate::camfade::Shape>>>,
     /// A quickbar ability waiting for the player to click its target.
     pub aiming: Option<thedas_ui::input::Aim>,
@@ -265,6 +268,7 @@ impl Live {
             animator: Animator::default(),
             camera_fade: Default::default(),
             camera_seen: None,
+            zoom_seen: None,
             creature_shapes: Default::default(),
             aiming: None,
             posed: Vec::new(),
@@ -431,6 +435,19 @@ impl Live {
         let (area, cut) = before?;
         let due = area != now.0 || (cut && !now.1);
         heading.filter(|_| due)
+    }
+
+    /// A script's new zoom request for the explore camera (`SetZoomLevel`'s level), once
+    /// each. The request the world holds when it is first looked at (a loaded save's) is
+    /// taken as already applied.
+    pub fn zoom_request_due(&mut self) -> Option<f32> {
+        let request = self.sim().world.zoom_request;
+        let seq = request.map(|r| r.1);
+        let before = self.zoom_seen.replace(seq.unwrap_or(0));
+        match (before, request) {
+            (Some(b), Some((level, s))) if s != b => Some(level),
+            _ => None,
+        }
     }
 
     /// Rebuilds [`Live::opacity`] from every fade that sets one, multiplied together (a

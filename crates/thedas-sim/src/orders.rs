@@ -40,6 +40,20 @@ impl Sim {
         self.world.controlled = who.filter(|&w| crate::engine::party_of(self).contains(&w));
     }
 
+    /// The player has zoomed the camera fully in (wheel, keys or pad; a script's zoom never
+    /// counts): the exe's zoom setter sends the training event for it then (0x7ee680 sends
+    /// 1065, `MAXIMUM_ZOOM_IN`, at 0x7ee72e). Returns whether a training step heard it.
+    /// Provisional: the training steps themselves are not hooked up yet, so this only logs.
+    pub fn player_zoomed_in(&mut self) -> bool {
+        let t = self.world.time_ms;
+        self.world.trace.push(crate::trace::TraceEntry::Log {
+            t,
+            channel: -1,
+            text: "player zoomed fully in".into(),
+        });
+        false
+    }
+
     /// Walks `who` to `to` (in its area), dropping what it was doing.
     pub fn order_move(&mut self, who: ObjectId, to: [f32; 3]) {
         let Some((area, from, facing)) = self

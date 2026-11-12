@@ -568,6 +568,13 @@ pub struct World {
     /// Provisional: whether the original keeps it in its saves is not traced.
     #[serde(default = "music_intensity_default")]
     pub music_intensity: i32,
+    /// A script's request for the explore camera's zoom (`SetZoomLevel`, engine function 849
+    /// -> 0x666790): the level asked for (0 fully out, the tactical view; 1 fully in) and a
+    /// count that goes up with each request, so the presentation applies each one once.
+    /// The simulation only keeps it; the camera reads it. Provisional: whether the original
+    /// saves anything camera-related is not traced (the explore controller is not saved).
+    #[serde(default)]
+    pub zoom_request: Option<(f32, u32)>,
     /// The game difficulty (`difficulty.gda`'s rows: 0 casual, 1 normal, 2 hard, 3
     /// nightmare), as the difficulty option sets it and `GetGameDifficulty` reads it.
     #[serde(default = "normal_difficulty")]
@@ -750,6 +757,7 @@ impl World {
             party_fighting: false,
             game_over: false,
             music_intensity: 1,
+            zoom_request: None,
             difficulty: normal_difficulty(),
             autopilot: false,
             pool_xp: false,

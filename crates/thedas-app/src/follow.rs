@@ -23,6 +23,11 @@ pub const ZOOM_START: f32 = 1.0;
 /// Zoom per wheel notch. Provisional: the exe scales its zoom input by an option times
 /// 0.05 (0x7714c4, 0x7edbe7); the option's value and the wheel's input size are not traced.
 pub const ZOOM_STEP: f32 = 0.1;
+/// How fast the zoom eases to a script's target (`SetZoomLevel`), in zoom units a second.
+/// Provisional: the exe's update steps the zoom (+0x48) towards the target (+0x50; -9999
+/// is none) at 0x7eec23-0x7eec99 by an amount its zoom input works out (0x7edc60), which
+/// is not traced.
+pub const ZOOM_EASE: f32 = 2.0;
 /// Where the zoom splits the near half (sweep collision, free pitch) from the far half
 /// (0xc0dffc; 0x76f0b0, 0x76f1b0, 0x76f640).
 pub const ZOOM_SPLIT: f32 = 0.5;
@@ -119,6 +124,8 @@ pub struct Follow {
     ease: f32,
     /// Where it stood last frame (+0x70).
     eye: Option<Vec3>,
+    /// A script's zoom target (+0x50), eased to by the update; none once reached.
+    zoom_target: Option<f32>,
 }
 
 impl Follow {
@@ -134,6 +141,7 @@ impl Follow {
             pull: 0.0,
             ease: 0.0,
             eye: None,
+            zoom_target: None,
         };
         let t = f.zoom_t();
         f.pitch = (FAR_POLAR_DEG + (NEAR_POLAR_DEG - FAR_POLAR_DEG) * t - 90.0).to_radians();
@@ -159,10 +167,45 @@ impl Follow {
         self.pitch = (self.pitch + d_pitch).clamp(MIN_PITCH, MAX_PITCH);
     }
 
-    /// Zooms in for positive `steps` (wheel notches), out for negative.
-    pub fn zoom(&mut self, steps: f32) {
-        if steps.is_finite() {
-            self.zoom = (self.zoom + steps * ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX);
+    /// The player zooms in for positive `steps` (wheel notches, keys, the pad), out for
+    /// negative. True when this brings the zoom to the near end from below: the exe's zoom
+    /// setter sends the training event for it then (0x7ee680 sends 1065 at 0x7ee72e, only
+    /// from the player's zoom input, 0x76faed / 0x76fb51). A script's target is dropped.
+    pub fn zoom(&mut self, steps: f32) -> bool {
+        if !steps.is_finite() {
+            return false;
+        }
+        let before = self.zoom;
+        self.zoom = (self.zoom + steps * ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX);
+        self.zoom_target = None;
+        before < ZOOM_MAX && self.zoom >= ZOOM_MAX
+    }
+
+    /// A script's zoom request (`SetZoomLevel`, 0x666790): `level` 0 is fully out, 1 fully
+    /// in; the target is 2 * level - 1, which the update eases the zoom to. It never counts
+    /// as the player reaching the near end.
+    pub fn set_zoom_level(&mut self, level: f32) {
+        if level.is_finite() {
+            self.zoom_target = Some((2.0 * level.clamp(0.0, 1.0) - 1.0).clamp(ZOOM_MIN, ZOOM_MAX));
+        }
+    }
+
+    /// Eases the zoom towards a script's target, `dt` seconds on (at once when `dt` is 0).
+    fn ease_zoom(&mut self, dt: f32) {
+        let Some(target) = self.zoom_target else {
+            return;
+        };
+        let step = if dt > 0.0 {
+            ZOOM_EASE * dt
+        } else {
+            f32::INFINITY
+        };
+        let gap = target - self.zoom;
+        if gap.abs() <= step {
+            self.zoom = target;
+            self.zoom_target = None;
+        } else {
+            self.zoom += step.copysign(gap);
         }
     }
 
@@ -238,6 +281,7 @@ impl Follow {
             self.eye = None;
         }
         let settle = cut || dt <= 0.0;
+        self.ease_zoom(dt);
 
         let mut c = Camera::new(pivot, self.yaw, self.shot_pitch());
         c.fov_y = base.fov_y;

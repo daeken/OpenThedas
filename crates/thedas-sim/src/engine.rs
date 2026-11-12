@@ -3631,6 +3631,19 @@ pub fn call(
         // DAOrigins.exe's SetCanLevelUp (0x662ea0 -> 0x6aca10) ignores its value: whether a
         // creature can level up is whether it has points to spend (attribute, skill and
         // talent points, properties 34-36).
+        // The explore camera's zoom (0x666790 sets its target to 2z - 1, which its update
+        // eases the zoom to): kept for the presentation, which applies each request once.
+        "SetZoomLevel" => {
+            let level = float(a, 0);
+            let level = if level.is_finite() {
+                level.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let seq = h.sim.world.zoom_request.map_or(0, |r| r.1).wrapping_add(1);
+            h.sim.world.zoom_request = Some((level, seq));
+            void()
+        }
         "SetCanLevelUp" => {
             let who = obj(a, 0);
             let points: f32 = [34, 35, 36]
