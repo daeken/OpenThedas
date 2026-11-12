@@ -10,56 +10,74 @@ repository.
 
 ## Status
 
-Last updated 2026-11-12 09:15 UTC, main 256b6ee
+Last updated 2026-11-12 10:20 UTC, main c2472c0
 
-Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA run 8 (taken at main 2e7b804), with fixes merged since then noted.
+Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–20, with fixes merged since then noted.
 
 - ✅ **Boot flow**: EA logo and intro movies play with their sound (decoded via ffmpeg), then the start menu.
 - ✅ **Start menu**: New Game, Load, Options and Quit are wired; QA graded it near pixel-identical to the original.
-- 🟡 **Character creation**: full flow with the original's stage, blended camera presets and portrait. The appearance menu has preset, hair, beard, the exe's per-race eye and nose shapes, and makeup and complexion. Also colour sliders, difficulty and name. Partial: remaining face-shape sliders and hair-colour details. QA also flagged dim skill/talent icons after spending points, and attribute arrows that never show a disabled state.
+- 🟡 **Character creation**: full flow with the original's stage, blended camera presets and portrait.
+  - Appearance menu: preset, hair, beard, the exe's per-race eye and nose shapes, makeup and complexion. Also colour sliders, difficulty and name.
+  - Partial: the remaining face-shape sliders and hair-colour details.
+  - QA flagged attribute arrows that never show a disabled state.
 - 🟡 **Conversations and cutscenes**:
-  - Done: the reply list, subtitles and voice-over; movie tracks; cutscene camera tracks (spline moves, rotation, FOV, active camera); and cutscenes named by conversation lines (the Human Noble, Dalish and Dwarf Noble intros). Unstaged lines use the original's default speaker framing.
-  - Open: cameras placed by JumpToCamera or LinkToActor (most per-line cinematics), actor motion and animation in cutscenes, and moving creatures to conversation stage marks.
-- 🟡 **Exploration and camera**: walking, click-to-pick, doors, area map, companions following. The follow camera collides with level geometry and placeables using rays. The original sweeps a 0.25 m sphere and starts closer to the hero; camera occlusion matching it is in progress (QA: the camera clips a bunk bed in the City Elf start and sits behind the door frame in the Dwarf Commoner start).
+  - Done:
+    - the reply list, subtitles and voice-over, with dialog tags (`<emp>` and the rest) from the Dialog Tags table;
+    - movie tracks and cutscene camera tracks;
+    - cutscenes named by conversation lines (the Human Noble, Dalish and Dwarf Noble intros);
+    - the original's default speaker framing for unstaged lines.
+  - In progress: actor motion and animation in cutscenes, and moving creatures to conversation stage marks. This covers the Dalish hunters with their backs turned and Oskias standing inside his chair; it's held for a regression-gate difference.
+  - Open: cameras placed by JumpToCamera or LinkToActor (most per-line cinematics).
+- 🟡 **Exploration and camera**:
+  - Walking, click-to-pick, doors, the area map and companions following. Followers come along on area changes.
+  - The follow camera uses the exe's 0.25 m sphere sweep, pull-in and ease-out, and its starting shot (3 m behind, at the leader's height). QA confirmed it at all six origin starts.
 - 🟡 **Combat and simulation**:
-  - NWScript VM with a large share of the engine functions; melee and ability timing; threat; AI-driven party; tactics; loot and containers.
-  - Perception and combat mode work as the exe does them: only hostiles need sight, and scripts own the game mode.
-  - Sight lines are cast through the level's collision (`.phy`) and placeables, as the exe casts them.
-  - Template gear is equipped with EVENT_TYPE_EQUIP. Triggers fire along moves. Destroyed items leave the inventory.
-  - Weapons are sheathed on the back out of combat and drawn in combat; draw and sheathe animation timing is not traced.
-  - Not every script engine function is implemented.
+  - NWScript VM with a large share of the engine functions; melee and ability timing; threat; AI-driven party; tactics; loot.
+  - Containers hold their template's items and open on USE with the original loot panel (Take All, Close).
+  - Perception and combat mode work as the exe does them. Sight lines are cast through the level's collision (`.phy`) and placeables. SetCanLevelUp follows unspent points.
+  - Weapons are sheathed out of combat and drawn in combat; draw and sheathe animation timing is not traced.
+  - Open: the Proving duel's melee in the app (the hero and Mainar overlap and no swing lands). Not every script engine function is implemented.
 - 🟡 **Party, inventory, journal and other UI screens**:
-  - Wired to the simulation: inventory (with paperdoll and item examine), character record, level-up, store, tactics, journal and codex, options, area map, HUD notifications, and the HUD's screen tab bar.
-  - The journal opens on the active quest and lists a sub-quest's parent as its heading. The quickbar keeps its 14-slot width and leaves hidden class abilities off.
-  - Fixed since QA run 8: recipe items are learned instead of kept in the inventory, and stackable items merge into held stacks.
-  - Screens have not all been audited against the original.
+  - Wired to the simulation: inventory (with paperdoll and item examine), character record, level-up, store, tactics, journal and codex, options, area map, HUD notifications and the screen tab bar.
+  - Enemy health bars and the target's name show in fights.
+  - Tutorial popups show with their key names. They wait under full-screen menus, and the game stays paused, as in the original, until every queued popup is dismissed (pad A or the panel's Next/Close).
+  - Fixed since QA run 8: recipes are learned, stacks merge, inventory rows are no longer dimmed, and the Level Up button follows unspent points.
+  - Open: the tutorial pause shows no "Paused" border (whether the original shows one is not traced), and screens have not all been audited against the original.
 - 🟡 **Rendering**:
   - Working: areas, terrain, sky, fog, clouds, bloom, colour grading, dynamic sun shadows (Low to High detail) and the original shaders.
-  - Characters have hair, sampled with its mips and noise (no more "steel wool"). Bare hands and arms take the head's skin tint.
-  - Not yet: SpeedTree `.spt` files parse but are not drawn.
+  - Characters have hair, sampled with its mips and noise. Bare hands and arms take the head's skin tint.
+  - Open:
+    - characters receive every room's character lights rather than their own selection, which causes grey NPC hair, pale hands and dark Dalish hunters;
+    - water is not drawn (the Fade's black areas);
+    - SpeedTree `.spt` files parse but are not drawn.
   - The backend stays on wgpu, and its types are kept inside `thedas-render`.
 - 🟡 **Audio**:
   - Merged:
     - playback: FMOD event (`.fev`) and bank (`.fsb`) playback, mixer, the exe's slider-to-dB volume mapping;
     - music: menu and area music, SetMusicIntensity driving `music_state` (kept in saves);
-    - effects: UI sounds, placed 3D sounds, boot movie sound, script PlaySound, animation sound events, weapon hits;
-    - voices: conversation and cutscene voice-over, sound-set barks, the chargen voice preview.
-  - Provisional: engine barks (attack and pain grunts, death cries, selection answers), inferred from the tables.
-  - Not yet: PlayMusic, voice-over positioning, footstep surfaces (one default footstep for now).
+    - world: world reverb (area and trigger presets), surface footsteps from the walkmesh, placed 3D sounds;
+    - effects: UI sounds, boot movie sound, script PlaySound, and animation sound events (swings, armour foley, weapon hits);
+    - voices: conversation and cutscene voice-over, sound-set and engine barks (traced from the exe), party picker lines, the chargen voice preview.
+  - Not yet: PlayMusic, voice-over positioning, and the master and secondary reverb chain.
   - Sound is off with `--control` (unless `--audio`) and in headless captures.
-- 🟡 **Controller**: Xbox 360-style layout; menus and in-game screens use focus navigation. The PC right-click radial menu doesn't exist as a movie in the game data, so LT opens a quickbar picker instead.
-- ✅ **Saves**: F5/F9 quick save and load, save/load screens, typed names.
+- 🟡 **Controller**: Xbox 360-style layout; menus and in-game screens use focus navigation, and A dismisses tutorial popups. The PC right-click radial menu doesn't exist as a movie in the game data, so LT opens a quickbar picker instead.
+- ✅ **Saves**: F5/F9 quick save and load, save/load screens, typed names. Revision 7 fills older saves' empty containers.
 - ✅ **Performance**: frustum culling, shadow caching and skinned-draw culling (Lothering about 8 ms, the chapel about 1.5 ms offscreen).
 - ⬜ **DA2**: not started. There is no Dragon Age II work in the git log.
+
+### Known blockers
+
+None open. The Proving armour chest was fixed by #253 and #254.
 
 ### Origin openings
 
 - 🟡 **Human Noble**: intro movie and cutscene with narration play. The opening plays through the siege to Ostagar and on to Lothering in the regression sweep.
 - 🟡 **Dwarf Noble**: intro cutscene plays and the opening is explorable. Cutscene actors are not animated yet.
-- 🟡 **Dwarf Commoner**: intro cutscene cameras play. The exploration camera starts behind the door frame (in progress).
-- 🟡 **City Elf**: explorable. The camera clips the bunk bed at the start (in progress).
-- 🟡 **Dalish Elf**: intro cutscene plays and the journal lists the origin quest. After the opening talk the three humans stand with their backs to the hero, because stage marks aren't applied (queued).
-- 🟡 **Mage**: explorable. QA run 8 found the journal showing only a category banner.
+- 🟡 **Dwarf Commoner**: intro cutscene cameras play and the camera starts inside the house. The path plays forward through the tavern and the Proving.
+  - Open: Oskias stands in his chair (in progress) and the duel's melee.
+- 🟡 **City Elf**: explorable from inside the room. Cyrion waiting in the next room matches the data.
+- 🟡 **Dalish Elf**: intro cutscene plays and the journal lists the origin quest. After the opening talk the three hunters keep their backs to the hero until the stage-marks work lands (in progress).
+- 🟡 **Mage**: explorable. The Fade's water is not drawn.
 
 ### Planned modernization
 
@@ -68,7 +86,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA run 8 (ta
 Deliberate differences from the original:
 - **Controller support**: Xbox 360 layout. The PC original removed it.
 - **Spaces allowed in save names.**
-- **Audio output limiter at −0.3 dBFS**, so fights don't clip. Provisional: FMOD Ex clips, and the exe's master chain isn't traced yet.
+- **Audio output limiter at −0.3 dBFS**: an improvement. The original creates only reverb DSPs and simply clips when a fight sums past full scale.
 
 ### Milestones
 
