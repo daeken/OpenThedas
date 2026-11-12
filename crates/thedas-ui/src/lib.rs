@@ -1072,6 +1072,16 @@ impl UiMovie {
         missing
     }
 
+    /// Has the token observers whose engine value name `pick` accepts hear their value
+    /// again at the next push, changed or not.
+    pub fn resend_observers(&mut self, pick: impl Fn(&str) -> bool) {
+        for (id, token) in &self.observers {
+            if pick(token) {
+                self.sent.remove(id);
+            }
+        }
+    }
+
     /// Calls a movie function by path, as Scaleform's `Invoke` does
     /// (`_global.GUISystem.StartSceneFromGame`). Needs a movie from [`load_movie`].
     pub fn call(&mut self, path: &str, args: &[UiValue]) -> UiValue {

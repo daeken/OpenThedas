@@ -120,6 +120,8 @@ pub struct PadPlay {
     focus_check_ms: f64,
     /// The view's size when the focus last moved (its marker stays inside it).
     view: (u32, u32),
+    /// A's release after a press that only focused a button (it clicks nothing).
+    swallow_release: bool,
 }
 
 /// How often the focused button is looked for again (milliseconds).
@@ -377,6 +379,24 @@ impl PadPlay {
                 }
                 (if live.paused { "paused" } else { "running" }).into()
             }
+            // A on a screen with nothing focused (the pointer left by the mouse, or a screen
+            // just opened) focuses its first button instead of clicking empty space; the
+            // press's release is swallowed with it.
+            Action::PointerDown
+                if self.focused.is_none()
+                    && !self.controller.free_pointer
+                    && host.screens().is_some() =>
+            {
+                let targets = host.focus_targets();
+                if !targets.is_empty() && crate::focusnav::under(&targets, host.cursor()).is_none()
+                {
+                    self.swallow_release = true;
+                    return self.focus(host, 0, 1);
+                }
+                host.left_button(true);
+                return None;
+            }
+            Action::PointerUp if std::mem::take(&mut self.swallow_release) => return None,
             Action::PointerDown | Action::PointerUp => {
                 host.left_button(a == Action::PointerDown);
                 return None;
