@@ -2437,8 +2437,8 @@ fn audio_state(
                         state.sound_sets.push((set, entry, probability, at));
                     }
                 }
-                // PlayMusic names the music project (`music`, from the Music M2DA by
-                // module), which is always the one used here.
+                // PlayMusic and StopMusic do nothing in DAOrigins.exe: their shared handler
+                // (0x65cfd0, commands 484 and 485) reads the name and drops it.
                 other => log::debug!("audio: not done yet: {other:?}"),
             }
         }
