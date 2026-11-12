@@ -12,11 +12,10 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
 
 ### Music
 
-1. **Switching between explore and combat music is not marker-timed.**
-   - Original: a theme's `main` and `combat` events are both loaded at area entry (0x5c2aaf..0x5c2c3e), with callbacks that are probably music-marker sync points. Switches wait for a marker and crossfade (the exe's debug dump at 0x5c13a0 shows "sw to theme" and "combat fdin"), and the stingers are cached (`_stingerprecache`).
-   - Ours: we stop one event and start the other at once, playing `stingers/from_main`, `to_main` or `to_death` immediately.
-   - Evidence: the exe strings and the loader trace; the per-frame logic isn't traced yet.
-   - Size: large. Dependencies: none, though marker callbacks need FEV sync-point data.
+1. **Music changes: stinger timing and loading.**
+   - Done: a change waits for the playing track's next marker (first sync point 0.4–15 s ahead, else 0.4 s on), then the new track starts and the old fades out (0x5c4b10 states 4–6).
+   - Not done: the stinger's timing (the exe waits for it in state 7; we play it at the change), the 12 s load timeout ("Music failed to start"), and delayed theme changes (state 9, counted in frames).
+   - Size: small.
 2. **Script `PlayMusic` and `SetMusicIntensity`.**
    - Original: `PlayMusic` names a project; `SetMusicIntensity` sets the `music_state` parameter.
    - Ours: `SetMusicIntensity` is stored in the World and applied; `PlayMusic` is only logged.
@@ -182,8 +181,6 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 
 ### Music
 
-- **AUD-030** **Music changes ignore markers.** Original: waits for markers (`sound_settings.gda` "max time between markers", per the comment). Ours: the track switches at once on combat/death change; stinger choice is guessed. Evidence: `crates/thedas-app/src/audio.rs:1141`, `crates/thedas-app/src/audio.rs:1166`. Size: M. Depends: AUD-031. Kind: provisional.
-- **AUD-031** **FSB SYNC points are unused.** Original: cue points the music system cuts at. Ours: `sync_points` parsed and only printed by the CLI. Evidence: `crates/thedas-formats/src/fsb.rs:98`, `crates/thedas-cli/src/audio.rs:416`. Size: M. Depends: none. Kind: missing.
 - **AUD-032** **`PlayMusic` is dropped.** Original: not traced. Ours: the sim queues `SoundRequest::Music`; the app logs "not done yet" and discards it. Evidence: `crates/thedas-sim/src/engine.rs:502`, `crates/thedas-app/src/main.rs:2335`. Size: S. Depends: none. Kind: missing.
 - **AUD-033** **`SetMusicIntensity` mapping is inferred.** Original: logs "music state= %2.1f" (per comment). Ours: sets `music_state` on the area track to the integer given; read from data and scripts, not traced. Evidence: `crates/thedas-app/src/audio.rs:1468`. Size: S. Depends: none. Kind: provisional.
 - **AUD-034** **Music during cutscenes and conversations is left alone.** Original: not traced. Ours: the area track keeps playing through cutscenes and conversations. Evidence: `crates/thedas-app/src/audio.rs:1141`. Size: S. Depends: none. Kind: provisional.
@@ -231,8 +228,6 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 
 ### Documentation inside the code
 
-- **AUD-061** **`audio.rs` module doc is stale.** Original: n/a. Ours: says in-game music is not done and volumes map linearly; the same file does area/combat music and the exe's -3 dB per step mapping. Evidence: `crates/thedas-app/src/audio.rs:6`, `crates/thedas-app/src/audio.rs:14`, `crates/thedas-app/src/audio.rs:1526`. Size: S. Depends: none. Kind: bug.
-- **AUD-062** **`Bus` doc is stale.** Original: n/a. Ours: says `audio_categories.fev` is not read yet; the engine reads it. Evidence: `crates/thedas-audio/src/mixer.rs:12`, `crates/thedas-audio/src/engine.rs:270`. Size: S. Depends: none. Kind: bug.
 
 ### Checked and looks complete
 
@@ -246,7 +241,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 - Reverb preset lookup by name (`force_generic`, empty = off) and 0.33 s blended fades, as traced.
 - Area starting reverb preset by weighted trigger count, as traced.
 - Options sliders to dB (-3 dB per step, -60 dB floor), as traced (0x5b61b0, 0x5b6110).
-- Area music themes: main/combat/Death with stingers (timing provisional, see AUD-030).
+- Area music themes: main/combat/Death with stingers; changes wait for the playing track's next marker, as traced (0x5c4b10).
 - Placed area sounds with `ActivateSoundByTag`.
 - UI sounds through `sound_gui.gda`.
 - Script `PlaySound` and `PlaySoundSet`.

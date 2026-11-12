@@ -320,6 +320,17 @@ mod tests {
     }
 
     #[test]
+    fn voices_report_their_position() {
+        let mut m = Mixer::new(100);
+        let id = m.play(pcm(100, 1, vec![0.1; 50]), VoiceParams::default());
+        assert_eq!(m.position(id), Some(0.0));
+        let mut out = vec![0.0; 2 * 25];
+        m.render(&mut out);
+        assert_eq!(m.position(id), Some(0.25));
+        assert_eq!(m.position(VoiceId(999)), None);
+    }
+
+    #[test]
     fn mono_voice_plays_to_both_sides_then_ends() {
         let mut m = Mixer::new(100);
         let id = m.play(pcm(100, 1, vec![0.5; 10]), VoiceParams::default());

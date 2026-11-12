@@ -259,6 +259,17 @@ pub struct GameAudio {
     last: Instant,
 }
 
+/// When a music change takes effect, in seconds into the playing track at `pos` with markers
+/// (sync points) `markers`: the first marker more than 0.4 s ahead and less than 15 s ahead,
+/// else 0.4 s on (DAOrigins.exe 0x5c4b10 state 4: 0x190 ms, 0x3a98 ms).
+fn music_switch_at(pos: f64, markers: &[f64]) -> f64 {
+    markers
+        .iter()
+        .copied()
+        .find(|m| *m > pos + 0.4 && *m - pos < 15.0)
+        .unwrap_or(pos + 0.4)
+}
+
 /// `apr_base.gda`'s footstep type column (DAOrigins.exe 0x6a098a).
 pub const APR_FOOTSTEP: u32 = 0xda48_e219;
 /// `apr_base.gda`'s sound size column (0x6a0a1f): `Small`, `Medium`, `Large`.
@@ -1146,10 +1157,13 @@ impl GameAudio {
     /// `to_main` or `to_death` marks the change. Placed sounds play their events where they
     /// stand while the listener is within their reach and the simulation has them on.
     ///
-    /// Provisional, not traced in DAOrigins.exe: when the music changes (it waits for
-    /// markers in the original; `sound_settings.gda` "max time between markers"), the
-    /// stinger choice, cutscenes and conversations leaving the music alone, and scripts'
-    /// `PlayMusic`/`SetMusicIntensity` (ignored).
+    /// A change of track waits for the playing track's next marker, as DAOrigins.exe's music
+    /// update does (0x5c4b10, states 4 to 6; see [`music_switch_at`]); then the new track
+    /// starts and the old one stops over its event's fade-out.
+    ///
+    /// Provisional: when the stinger plays (taken as at the change; the exe waits for it in
+    /// state 7), cutscenes and conversations leaving the music alone, and `PlayMusic`
+    /// (dropped).
     fn follow_area(&mut self, state: &AudioState, dt: f32) {
         if state.area.is_none() {
             self.end_area();
@@ -1182,11 +1196,7 @@ impl GameAudio {
                         }
                     }
                     (_, Some((pos, markers))) => {
-                        let at = markers
-                            .iter()
-                            .copied()
-                            .find(|m| *m > pos + 0.4 && *m - pos < 15.0)
-                            .unwrap_or(pos + 0.4);
+                        let at = music_switch_at(pos, &markers);
                         log::debug!("audio: music to {want} at {at:.2} s (now {pos:.2} s)");
                         a.switch = Some((want, at, pos, 0.0));
                     }
@@ -1603,6 +1613,17 @@ fn db_gain(db: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn music_changes_wait_for_the_next_marker() {
+        let bars = [0.0, 4.0, 8.0, 12.0, 16.0, 40.0];
+        // The next marker more than 0.4 s ahead.
+        assert_eq!(music_switch_at(1.0, &bars), 4.0);
+        assert_eq!(music_switch_at(3.7, &bars), 8.0);
+        // None within 15 s (or none at all): 0.4 s on.
+        assert!((music_switch_at(17.0, &bars) - 17.4).abs() < 1e-9);
+        assert!((music_switch_at(2.0, &[]) - 2.4).abs() < 1e-9);
+    }
 
     #[test]
     fn blows_look_up_weapon_by_struck_material() {
