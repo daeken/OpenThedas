@@ -8,8 +8,10 @@
 //! builds from its template (5208, 0x7e390f -> 0x6a4f00) that only it shows; a jump to a
 //! place (`AJSP`, 0x7dc720) puts the actor on a place of the cutscene's stage file each
 //! update; animations (`AANI`, 0x7db400) run at their speed from their offset (see
-//! [`thedas_sim::cuttracks::AnimationTrack::time_at`]). Where the simulation leaves the
-//! creatures afterwards is its own business ([`thedas_sim::cutactors`]).
+//! [`thedas_sim::cuttracks::AnimationTrack::time_at`]); an actor linked to another
+//! (`ActionLinkToActor`, 0x7d3cf0) is carried by that actor as drawn (see
+//! [`thedas_sim::cuttracks::ActorLink`]). Where the simulation leaves the creatures
+//! afterwards is its own business ([`thedas_sim::cutactors`]).
 //!
 //! Presentation only: reads the simulation, the cutscene and stage files.
 //!
@@ -27,12 +29,39 @@ use thedas_formats::stage::Stage;
 use thedas_script::vm::ObjectId;
 use thedas_sim::Sim;
 use thedas_sim::cutactors::{Bound, LineCut};
-use thedas_sim::cuttracks::{Actor, Placement, Tracks, facing_of};
+use thedas_sim::cuttracks::{Finders, Placement, Tracks, facing_of};
 use thedas_sim::world::ObjectKind;
 use thedas_ui::models::ObjectModel;
 
 /// The first id given to a cutscene's own creatures (far above the world's).
 pub const OWN_CREATURE_IDS: ObjectId = 0x6000_0000;
+
+/// Where a drawn object's root is in the world (position, rotation x y z w), by the
+/// object's id. `None` when it is not drawn.
+pub type DrawnRoots<'a> = dyn Fn(ObjectId) -> Option<([f32; 3], [f32; 4])> + 'a;
+
+/// The object drawn for actor `i` of a cutscene: the world's object that plays it, else the
+/// cutscene's own creature when the actor names a template (see [`own_creatures`]).
+pub fn drawn_object(tracks: &Tracks, bound: &[Bound], i: usize) -> Option<ObjectId> {
+    match bound.iter().find(|b| b.actor == i) {
+        Some(b) => Some(b.object),
+        None => tracks
+            .actors
+            .get(i)?
+            .creature
+            .is_some()
+            .then_some(OWN_CREATURE_IDS + i as ObjectId),
+    }
+}
+
+/// The places of `stage` by name, as the tracks find them.
+pub fn stage_place(stage: Option<&Stage>, name: &str) -> Option<([f32; 3], [f32; 4])> {
+    stage?
+        .places
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case(name))
+        .map(|p| (p.position, p.rotation))
+}
 
 /// An animation of the cutscene an actor plays.
 #[derive(Clone, Debug, PartialEq)]
@@ -110,7 +139,9 @@ impl CutsceneActors {
     /// cutscene shows now. Provisional: a creature keeps the animations a cutscene or line
     /// of the open conversation left running at its end (the executable leaves the model's
     /// animation as the cutscene set it) until the conversation closes.
-    pub fn shown(&mut self, sim: &Sim, tracks: Option<Arc<Tracks>>) -> Shown {
+    ///
+    /// `roots` gives where the drawn objects are, which actors linked to them follow.
+    pub fn shown(&mut self, sim: &Sim, tracks: Option<Arc<Tracks>>, roots: &DrawnRoots) -> Shown {
         let open = sim.conversation_line().is_some();
         let mut out = Shown::default();
         if let (Some(c), Some(tracks)) = (sim.world.cutscene.as_ref(), tracks) {
@@ -118,7 +149,14 @@ impl CutsceneActors {
             let t = c.elapsed_ms as f32 / 1000.0;
             let placement = c.placement.unwrap_or(Placement::NONE);
             let stage = self.stage(sim, tracks.stage_file.as_deref());
-            self.pose_bound(&tracks, &c.bound, t, placement, stage.as_deref(), &mut out);
+            let at = Moment {
+                t,
+                placement,
+                stage: stage.as_deref(),
+                bound: &c.bound,
+                roots,
+            };
+            self.pose_bound(&tracks, &at, &mut out);
             // Actors no object plays: the cutscene's own creatures.
             let name = c.name.clone();
             if self.own.as_ref().is_none_or(|(n, _)| *n != name) {
@@ -126,8 +164,7 @@ impl CutsceneActors {
             }
             if let Some((_, own)) = &self.own {
                 for (i, model) in own {
-                    if let Some(a) = tracks.actors.get(*i) {
-                        let show = show(a, t, tracks.seconds, placement, stage.as_deref());
+                    if let Some(show) = show(&tracks, *i, &at) {
                         out.own.push((model.clone(), show));
                     }
                 }
@@ -145,7 +182,14 @@ impl CutsceneActors {
                         .and_then(|l| l.get(line).and_then(|c| c.tracks.clone()))
                     {
                         let stage = self.stage(sim, tracks.stage_file.as_deref());
-                        self.pose_bound(&tracks, bound, t, placement, stage.as_deref(), &mut out);
+                        let at = Moment {
+                            t,
+                            placement,
+                            stage: stage.as_deref(),
+                            bound,
+                            roots,
+                        };
+                        self.pose_bound(&tracks, &at, &mut out);
                     }
                 }
                 None => self.switch(None, open),
@@ -155,21 +199,15 @@ impl CutsceneActors {
         out
     }
 
-    fn pose_bound(
-        &mut self,
-        tracks: &Tracks,
-        bound: &[Bound],
-        t: f32,
-        placement: Placement,
-        stage: Option<&Stage>,
-        out: &mut Shown,
-    ) {
-        for b in bound {
+    fn pose_bound(&mut self, tracks: &Tracks, at: &Moment, out: &mut Shown) {
+        for b in at.bound {
             let Some(a) = tracks.actors.get(b.actor) else {
                 continue;
             };
-            out.actors
-                .insert(b.object, show(a, t, tracks.seconds, placement, stage));
+            let Some(show) = show(tracks, b.actor, at) else {
+                continue;
+            };
+            out.actors.insert(b.object, show);
             // What it will be left playing when this ends.
             let end = tracks.seconds;
             let left: Vec<CutAnimation> = a
@@ -219,17 +257,31 @@ impl CutsceneActors {
     }
 }
 
-/// An actor `t` seconds into its cutscene (`length` seconds long), placed as the cutscene
-/// is.
-fn show(a: &Actor, t: f32, length: f32, placement: Placement, stage: Option<&Stage>) -> ActorShow {
-    let place = |name: &str| {
-        stage?
-            .places
-            .iter()
-            .find(|p| p.name.eq_ignore_ascii_case(name))
-            .map(|p| (p.position, p.rotation))
+/// A moment of a playing cutscene (or conversation line): seconds into it, where it is
+/// placed, its stage, the objects that play its actors and where drawn objects are.
+struct Moment<'a> {
+    t: f32,
+    placement: Placement,
+    stage: Option<&'a Stage>,
+    bound: &'a [Bound],
+    roots: &'a DrawnRoots<'a>,
+}
+
+/// Actor `i` of `tracks` at moment `at`: where it is in the world (see
+/// [`Tracks::world_pose`]) and what it plays.
+fn show(tracks: &Tracks, i: usize, at: &Moment) -> Option<ActorShow> {
+    let a = tracks.actors.get(i)?;
+    let (t, length) = (at.t, tracks.seconds);
+    let place = |name: &str| stage_place(at.stage, name);
+    let root = |j: usize| (at.roots)(drawn_object(tracks, at.bound, j)?);
+    let find = Finders {
+        place: &place,
+        root: &root,
+        ..Finders::NONE
     };
-    let pose = placement.pose(a.stage_pose_at(t, &place));
+    let pose = tracks
+        .world_pose(i, t, at.placement, &find)
+        .unwrap_or_else(|| at.placement.pose(a.stage_pose_at(t, &place)));
     let animations = a
         .animations_at(t, length)
         .into_iter()
@@ -240,12 +292,12 @@ fn show(a: &Actor, t: f32, length: f32, placement: Placement, stage: Option<&Sta
             unbounded: l.end >= 1e9,
         })
         .collect();
-    ActorShow {
+    Some(ActorShow {
         position: pose.position,
         facing: facing_of(pose.rotation).unwrap_or(0.0),
         snaps: a.snaps,
         animations,
-    }
+    })
 }
 
 /// The cutscene's own creatures: each actor no object took that names a creature template,

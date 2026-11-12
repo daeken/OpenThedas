@@ -4,11 +4,14 @@
 //! and field of view every tick (0x7dd6b8). The actor's world pose is its tracks' placed as
 //! the cutscene is (a conversation line's cutscene plays on the line's area stage), or the
 //! camera of the cutscene's stage file a jump puts it on (`ActionJumpToCamera`, see
-//! [`thedas_sim::cuttracks::CameraJump`]). A cutscene without camera cuts (a movie's)
-//! leaves the game camera alone.
+//! [`thedas_sim::cuttracks::CameraJump`]), or carried by the actor it is linked to
+//! (`ActionLinkToActor`, see [`thedas_sim::cuttracks::ActorLink`]: a creature as drawn, or
+//! another camera). A cutscene without camera cuts (a movie's) leaves the game camera
+//! alone.
 //!
-//! Presentation only: reads the playing cutscene's name, clock and placement, its `.cut`
-//! file and its stage file.
+//! Presentation only: reads the playing cutscene's name, clock, placement and the objects
+//! that play its actors, its `.cut` file and its stage file, and where the drawn creatures
+//! are.
 //!
 //! Provisional: the camera looks along the actor's local +Y with +Z up and its field of
 //! view is taken as vertical; the camera's roll (the rotation track's third curve turns
@@ -22,7 +25,9 @@ use glam::{Quat, Vec3};
 use thedas_formats::stage::Stage;
 use thedas_render::Camera;
 use thedas_sim::Sim;
-use thedas_sim::cuttracks::{Placement, Pose, Tracks};
+use thedas_sim::cuttracks::{Finders, Placement, Pose, Tracks};
+
+use crate::cutactors::{DrawnRoots, drawn_object, stage_place};
 
 /// Cutscenes' tracks and stage files read so far, by resource name.
 #[derive(Default)]
@@ -65,15 +70,22 @@ impl CutsceneCamera {
     }
 
     /// The view of the cutscene `sim` is playing, once one of its cuts has made a camera;
-    /// `base` supplies the clip planes.
-    pub fn camera(&mut self, sim: &Sim, base: &Camera) -> Option<Camera> {
+    /// `base` supplies the clip planes, `roots` where the drawn objects are.
+    pub fn camera(&mut self, sim: &Sim, base: &Camera, roots: &DrawnRoots) -> Option<Camera> {
         let c = sim.world.cutscene.as_ref()?;
         let t = c.elapsed_ms as f32 / 1000.0;
         let placement = c.placement.unwrap_or(Placement::NONE);
         let tracks = self.tracks(sim)?;
         let stage = self.stage(sim, tracks.stage_file.as_deref());
-        let lookup = |name: &str, by_place: bool| stage_camera(stage.as_deref()?, name, by_place);
-        let pose = tracks.camera_at(t, placement, &lookup)?;
+        let camera = |name: &str, by_place: bool| stage_camera(stage.as_deref()?, name, by_place);
+        let place = |name: &str| stage_place(stage.as_deref(), name);
+        let root = |i: usize| roots(drawn_object(&tracks, &c.bound, i)?);
+        let find = Finders {
+            camera: &camera,
+            place: &place,
+            root: &root,
+        };
+        let pose = tracks.camera_at(t, placement, &find)?;
         Some(pose_camera(&pose, base))
     }
 
