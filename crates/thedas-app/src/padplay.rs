@@ -393,7 +393,7 @@ impl PadPlay {
             }
             Action::Pause => {
                 let live = host.live()?;
-                live.paused = !live.paused;
+                live.toggle_pause();
                 if self.picker.is_some() {
                     // Pausing by hand while the picker is up: it stays as set when it closes.
                     self.picker = Some(live.paused);
@@ -835,6 +835,7 @@ fn walk(host: &mut dyn Host, v: Vec2, group: bool) -> Option<String> {
             .ground_hit(area, [p.x, p.y, p.z + 4.0], [0.0, 0.0, -1.0], 8.0)
             .unwrap_or(p.to_array());
         sim.order_move(who, to);
+        sim.training_event("MOVEMENT_COMMAND_ISSUED", 0);
     }
     None
 }
