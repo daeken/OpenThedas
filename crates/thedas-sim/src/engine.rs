@@ -1010,6 +1010,24 @@ pub fn call(
                 return void();
             }
             if Some(id) != h.sim.world.hero {
+                // An item leaves whoever holds it: taken off if worn (its effects end and the
+                // wearer hears UNEQUIP), then out of the inventory, so no dangling ids stay
+                // behind (the City Elf house script destroys the hero's starting clothes).
+                // Provisional: the exe's container removal on destruction is not traced.
+                let holders: Vec<ObjectId> = h
+                    .sim
+                    .world
+                    .objects
+                    .values()
+                    .filter(|o| o.inventory.contains(&id))
+                    .map(|o| o.id)
+                    .collect();
+                for holder in holders {
+                    h.sim.unequip(holder, id);
+                    if let Some(o) = h.sim.world.get_mut(holder) {
+                        o.inventory.retain(|&i| i != id);
+                    }
+                }
                 h.sim.world.objects.remove(&id);
             }
             void()
@@ -5737,7 +5755,8 @@ mod coverage_tests {
         void RemoveItemProperty(object o, int p) = 104;\n\
         int[] GetItemProperties(object o, int s = FALSE) = 105;\n\
         void PlaySound(object o, string s) = 106;\n\
-        void PlayMusic(string s) = 107;\n";
+        void PlayMusic(string s) = 107;\n\
+        void DestroyObject(object o, int n = 0) = 108;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -5761,6 +5780,33 @@ mod coverage_tests {
             ty: s.types.effect,
             handle: Some(hd),
         }
+    }
+
+    #[test]
+    fn a_destroyed_item_leaves_its_holder() {
+        let mut s = sim();
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let (worn, carried) = (
+            s.world.spawn(ObjectKind::Item, "clothes"),
+            s.world.spawn(ObjectKind::Item, "ring"),
+        );
+        {
+            let o = s.world.get_mut(hero).unwrap();
+            o.inventory = vec![worn, carried];
+            o.equipment.insert(4, worn);
+        }
+        for i in [worn, carried] {
+            run(
+                &mut s,
+                hero,
+                "DestroyObject",
+                &[Value::Object(i), Value::Int(0)],
+            );
+        }
+        let o = s.world.get(hero).unwrap();
+        assert!(o.inventory.is_empty());
+        assert!(o.equipment.is_empty());
+        assert!(s.world.get(worn).is_none() && s.world.get(carried).is_none());
     }
 
     #[test]
