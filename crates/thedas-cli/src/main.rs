@@ -200,6 +200,17 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// List an FMOD event file's (`.fev`) events and what they play, or (with --check) parse
+    /// every event file under a folder.
+    Fev {
+        /// An event file, or (with --check) a folder searched for them.
+        path: PathBuf,
+        /// Only events whose path contains this.
+        #[arg(long)]
+        filter: Option<String>,
+        #[arg(long)]
+        check: bool,
+    },
     /// Open every archive in an install and parse every GFF4-family resource.
     Corpus {
         /// Install roots or individual archives.
@@ -262,6 +273,11 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Ls { archive } => ls(&archive),
+        Command::Fev {
+            path,
+            filter,
+            check,
+        } => audio::fev(&path, filter.as_deref(), check),
         Command::Fsb {
             path,
             wav,

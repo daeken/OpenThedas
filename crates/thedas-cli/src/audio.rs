@@ -6,7 +6,113 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use thedas_audio::{decode, wav};
+use thedas_formats::fev::{EventBody, Fev, WaveformKind};
 use thedas_formats::fsb::Fsb;
+
+fn files_under(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            files_under(&p, ext, out);
+        } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case(ext)) {
+            out.push(p);
+        }
+    }
+}
+
+pub fn fev(path: &Path, filter: Option<&str>, check: bool) -> Result<()> {
+    if check {
+        let mut files = Vec::new();
+        if path.is_dir() {
+            files_under(path, "fev", &mut files);
+        } else {
+            files.push(path.to_path_buf());
+        }
+        files.sort();
+        let (mut ok, mut events, mut bad) = (0usize, 0usize, 0usize);
+        for f in &files {
+            match Fev::parse(&std::fs::read(f)?) {
+                Ok(fev) => {
+                    ok += 1;
+                    events += fev.events().len();
+                }
+                Err(e) => {
+                    bad += 1;
+                    println!("{}: {e}", f.display());
+                }
+            }
+        }
+        println!(
+            "{} event files: {ok} parse ({events} events), {bad} fail",
+            files.len()
+        );
+        return Ok(());
+    }
+    let fev = Fev::parse(&std::fs::read(path)?).with_context(|| path.display().to_string())?;
+    println!(
+        "project {} banks {:?}",
+        fev.name,
+        fev.wave_banks.iter().map(|b| &b.name).collect::<Vec<_>>()
+    );
+    for (p, e) in fev.events() {
+        if filter.is_some_and(|f| !p.to_lowercase().contains(&f.to_lowercase())) {
+            continue;
+        }
+        println!(
+            "{}/{p}: {} vol {:.3} pitch {:.2} {} dist {}..{} fade {}/{} ms cat {:?}",
+            fev.name,
+            if e.kind_flags == 0x10 {
+                "simple"
+            } else {
+                "complex"
+            },
+            e.volume,
+            e.pitch,
+            if e.is_3d() { "3D" } else { "2D" },
+            e.min_distance,
+            e.max_distance,
+            e.fade_in_ms,
+            e.fade_out_ms,
+            e.categories
+        );
+        if let EventBody::Complex { parameters, .. } = &e.body {
+            for prm in parameters {
+                println!("    param {} {}..{}", prm.name, prm.min, prm.max);
+            }
+        }
+        for s in e.sounds() {
+            let Some(def) = fev.sound_def(s) else {
+                continue;
+            };
+            let t = fev.template(def);
+            println!(
+                "    sound {} @{}+{} loop {} play {:?} vol {:?}: {}",
+                def.name,
+                s.start,
+                s.length,
+                s.loop_mode,
+                t.map(|t| t.play_mode),
+                t.map(|t| t.volume),
+                def.waveforms
+                    .iter()
+                    .map(|w| match &w.kind {
+                        WaveformKind::Wave {
+                            bank, index, file, ..
+                        } => {
+                            format!("{bank}#{index} ({file})")
+                        }
+                        k => format!("{k:?}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    Ok(())
+}
 
 fn banks_under(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {

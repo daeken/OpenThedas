@@ -25,6 +25,7 @@
 //!
 //! Audio:
 //!
+//! - [`fev`]: FMOD Designer event files: the events the game plays and what they play.
 //! - [`fsb`]: FMOD sound banks (FSB4), the waveforms behind the game's sound events.
 //!
 //! Interface:
@@ -35,6 +36,7 @@ pub mod anim;
 pub mod area;
 pub mod dds;
 pub mod emitter;
+pub mod fev;
 pub mod fsb;
 pub mod gda;
 pub mod gff3;
