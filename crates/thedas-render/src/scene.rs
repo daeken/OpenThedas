@@ -15,6 +15,7 @@ use thedas_formats::morph::{
     FaceOverlay, Morph, MorphNode, MorphPreset, TargetMesh, blend_targets, slot as morph_slot,
 };
 use thedas_formats::probe::IrradianceProbe;
+use thedas_formats::speedtree_gen::mesh::{LeafCard, MeshVertex, TreeMesh};
 use thedas_formats::tint::Tint;
 use thedas_formats::{Arl, Mmh, Rml};
 
@@ -118,6 +119,40 @@ pub struct DrawItem {
     /// Whether its model says the mesh casts run-time shadows (6176), when it says (see
     /// [`crate::shadow`]).
     pub cast_shadow: Option<bool>,
+    /// For a SpeedTree part: the camera distances it is drawn at (see [`DrawLod`]).
+    pub lod: Option<DrawLod>,
+}
+
+/// The distances a SpeedTree instance's part is drawn at, by DAOrigins.exe's per-instance LOD
+/// (0x52e260, 0x536085): with `d²` the squared distance from the camera to `anchor` (the
+/// placement point, not the box centre), the geometry draws while `d² < far²` and the
+/// billboard from there out.
+///
+/// Provisional: the exe fades between them with alpha tests over `near²..far²` (the
+/// library's alphas); here they switch at `far`, and the detail option and zoom factor `G`
+/// are taken as 1.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrawLod {
+    pub anchor: Vec3,
+    pub far_sq: f32,
+    /// Drawn beyond `far` (the billboard) rather than inside it (the geometry).
+    pub beyond: bool,
+}
+
+impl DrawLod {
+    /// The exe's far distance for an instance whose bounding radius (half the diagonal of its
+    /// box, times its placement scale) is `radius`, of LOD distance class `class` (RML 3379):
+    /// `t = (clamp(r, 2, 30) − 2) / 28`, `far = (35 + 85·t) · M[class]`, `M = {1, 1.5, 2}`.
+    pub fn far(radius: f32, class: i32) -> f32 {
+        let t = (radius.clamp(2.0, 30.0) - 2.0) / 28.0;
+        let m = [1.0, 1.5, 2.0][class.clamp(0, 2) as usize];
+        (35.0 + 85.0 * t) * m
+    }
+
+    /// Whether the part draws with the camera at `eye`.
+    pub fn shown(&self, eye: Vec3) -> bool {
+        (eye.distance_squared(self.anchor) < self.far_sq) != self.beyond
+    }
 }
 
 /// A skinned draw's bones.
@@ -697,67 +732,150 @@ impl<'a> Loader<'a> {
         trees: &[String],
         spots: &[(usize, Mat4, f32)],
     ) {
-        let atlas = format!("{}_diffuse_billboards.dds", level.to_ascii_lowercase());
-        let Some((aw, ah)) = self
-            .read(&atlas)
-            .ok()
-            .and_then(|d| thedas_formats::dds::Dds::parse(&d).ok())
-            .map(|d| (d.width as f32, d.height as f32))
-        else {
-            return;
+        let level = level.to_ascii_lowercase();
+        let probe = self.room_probe(&level, "");
+        // Materials by texture, once: bark per tree, the level's leaf/frond atlas, and the
+        // billboard atlas for trees without geometry.
+        let mut materials: HashMap<String, Option<usize>> = HashMap::new();
+        let mut material = |l: &mut Self, texture: &str, semantic: &str| -> Option<usize> {
+            *materials
+                .entry(format!("{texture}:{semantic}"))
+                .or_insert_with(|| {
+                    l.read(texture).ok()?;
+                    let key = format!("{texture}:spt_{semantic}.mao");
+                    let xml = format!(
+                        r#"<MaterialObject Name="spt"><Material Name="prop.mat"/><DefaultSemantic Name="{semantic}"/><Texture Name="mml_tDiffuse" ResName="{texture}"/></MaterialObject>"#
+                    );
+                    let m = l.build_material(&key, xml.as_bytes())?;
+                    l.scene.materials.push(m);
+                    Some(l.scene.materials.len() - 1)
+                })
         };
-        let key = format!("{atlas}:billboards.mao");
-        let xml = format!(
-            r#"<MaterialObject Name="tree_billboards"><Material Name="prop.mat"/><DefaultSemantic Name="Punch"/><Texture Name="mml_tDiffuse" ResName="{atlas}"/></MaterialObject>"#
-        );
-        let Some(material) = self.build_material(&key, xml.as_bytes()).map(|m| {
-            self.scene.materials.push(m);
-            self.scene.materials.len() - 1
-        }) else {
-            return;
-        };
-        let probe = self.room_probe(level, "");
-        // Per tree: its billboard mesh and height, once.
-        let mut meshes: HashMap<usize, Option<(usize, f32)>> = HashMap::new();
+        let atlas = format!("{level}_diffuse.dds");
+        let billboards = format!("{level}_diffuse_billboards.dds");
+        // Per tree: its meshes with their materials (and whether each is the billboard,
+        // drawn beyond the far distance), and its bounds, once.
+        type Built = (Vec<(usize, usize, bool)>, Vec3, f32);
+        let mut built_trees: HashMap<usize, Option<Built>> = HashMap::new();
         for &(tree, placement, scale) in spots {
-            let built = *meshes.entry(tree).or_insert_with(|| {
+            let built = built_trees.entry(tree).or_insert_with(|| {
                 let name = format!("{}.spt", trees.get(tree)?.to_ascii_lowercase());
                 let spt = thedas_formats::speedtree::parse(&self.read(&name).ok()?).ok()?;
-                let corners = spt.texcoords.as_ref()?.billboards.first().copied()?;
-                let (s, t): (Vec<f32>, Vec<f32>) = corners.chunks(2).map(|c| (c[0], c[1])).unzip();
-                let fold =
-                    |v: &[f32], f: fn(f32, f32) -> f32, init| v.iter().copied().fold(init, f);
-                let (s0, s1) = (fold(&s, f32::min, f32::MAX), fold(&s, f32::max, f32::MIN));
-                let (t0, t1) = (fold(&t, f32::min, f32::MAX), fold(&t, f32::max, f32::MIN));
-                let height = spt.tree.size;
-                if !(s1 > s0 && t1 > t0 && height > 0.0) {
+                let mesh = TreeMesh::new(&spt);
+                let mut parts = Vec::new();
+                let bark = bark_texture(&spt.tree.branch_texture);
+                if let Some(lod) = mesh.branches.lods.first()
+                    && !lod.is_empty()
+                    && let Some(m) = material(self, &bark, "Default")
+                {
+                    let indices = facing_front(&mesh.branches.vertices, lod);
+                    parts.push((
+                        self.tree_mesh(&name, "branches", &mesh.branches.vertices, indices),
+                        m,
+                        false,
+                    ));
+                }
+                if let Some(m) = material(self, &atlas, "Punch") {
+                    if let Some(lod) = mesh.fronds.lods.first()
+                        && !lod.is_empty()
+                    {
+                        let indices = both_sides(lod);
+                        parts.push((
+                            self.tree_mesh(&name, "fronds", &mesh.fronds.vertices, indices),
+                            m,
+                            false,
+                        ));
+                    }
+                    if let Some(cards) = mesh.leaves.first()
+                        && !cards.is_empty()
+                    {
+                        let (vertices, indices) = leaf_cards(cards);
+                        parts.push((
+                            self.tree_mesh(&name, "leaves", &vertices, indices),
+                            m,
+                            false,
+                        ));
+                    }
+                }
+                // Bushes and grass get no billboard: the exe leaves models named `_bsh_` or
+                // `_gra_` out of every billboard batch (0x533f18).
+                let bush = ["bsh_", "gra_"]
+                    .iter()
+                    .any(|k| name.starts_with(k) || name.contains(&format!("_{k}")));
+                if !bush
+                    && let Some(b) = mesh.billboard
+                    && b.height > 0.0
+                    && let Some(m) = material(self, &billboards, "Punch")
+                {
+                    let us = b.uv.map(|c| c[0]);
+                    let vs = b.uv.map(|c| c[1]);
+                    let fold = |v: [f32; 4], f: fn(f32, f32) -> f32, i| v.into_iter().fold(i, f);
+                    let uv = [
+                        fold(us, f32::min, f32::MAX),
+                        fold(us, f32::max, f32::MIN),
+                        fold(vs, f32::min, f32::MAX),
+                        fold(vs, f32::max, f32::MIN),
+                    ];
+                    let billboard = self.billboard_mesh(&name, 0.5 * b.width, b.height, uv);
+                    parts.push((billboard, m, true));
+                }
+                if parts.is_empty() {
                     return None;
                 }
-                let half = 0.5 * height * ((s1 - s0) * aw) / ((t1 - t0) * ah);
-                Some((
-                    self.billboard_mesh(&name, half, height, [s0, s1, 1.0 - t1, 1.0 - t0]),
-                    height,
-                ))
+                let (lo, hi) = (Vec3::from(mesh.bounds.0), Vec3::from(mesh.bounds.1));
+                Some((parts, (lo + hi) * 0.5, (hi - lo).length() * 0.5))
             });
-            let Some((mesh, height)) = built else {
+            let Some((parts, centre, radius)) = built.clone() else {
                 continue;
             };
             let transform = placement * Mat4::from_scale(Vec3::splat(scale));
-            let centre = transform.transform_point3(Vec3::Z * height * 0.5);
-            self.scene.draws.push(DrawItem {
-                mesh,
-                material,
-                transform,
-                lightmap: None,
-                sphere: (centre, height * scale * 0.5),
-                model: name_of_tree(trees, tree),
-                room: String::new(),
-                room_id: None,
-                probe,
-                skin: None,
-                cast_shadow: Some(false),
-            });
+            let centre = transform.transform_point3(centre);
+            // Provisional: the LOD class (RML 3379) is taken as 0, as in every ost100d
+            // placement.
+            let far = DrawLod::far(radius * scale, 0);
+            let anchor = placement.transform_point3(Vec3::ZERO);
+            for (mesh, material, beyond) in parts {
+                let lod = Some(DrawLod {
+                    anchor,
+                    far_sq: far * far,
+                    beyond,
+                });
+                self.scene.draws.push(DrawItem {
+                    mesh,
+                    material,
+                    transform,
+                    lightmap: None,
+                    sphere: (centre, radius * scale),
+                    model: name_of_tree(trees, tree),
+                    room: String::new(),
+                    room_id: None,
+                    probe,
+                    skin: None,
+                    cast_shadow: Some(false),
+                    lod,
+                });
+            }
         }
+    }
+
+    /// A SpeedTree surface as a scene mesh.
+    fn tree_mesh(
+        &mut self,
+        name: &str,
+        part: &str,
+        vertices: &[MeshVertex],
+        indices: Vec<u32>,
+    ) -> usize {
+        let vertices = vertices
+            .iter()
+            .map(|v| Vertex {
+                position: v.position,
+                normal: v.normal,
+                uv0: v.uv,
+                uv1: [0.0, 0.0],
+            })
+            .collect();
+        self.push_mesh(format!("{name}:{part}"), vertices, indices)
     }
 
     /// Two crossed upright quads `2·half` wide and `height` tall, standing on the origin,
@@ -784,10 +902,15 @@ impl<'a> Loader<'a> {
             // Both faces: the quads are seen from either side.
             indices.extend([0, 1, 2, 0, 2, 3, 0, 2, 1, 0, 3, 2].map(|i| base + i));
         }
+        self.push_mesh(format!("{name}:billboard"), vertices, indices)
+    }
+
+    /// A generated mesh (plain vertices, a triangle list) added to the scene.
+    fn push_mesh(&mut self, key: String, vertices: Vec<Vertex>, indices: Vec<u32>) -> usize {
         self.scene.meshes.push(SceneMesh {
-            key: format!("{name}:billboard"),
+            key: key.clone(),
             chunk: MeshChunk {
-                name: format!("{name}:billboard"),
+                name: key,
                 vertex_size: 0,
                 vertex_count: vertices.len() as u32,
                 index_count: indices.len() as u32,
@@ -1408,6 +1531,7 @@ impl<'a> Loader<'a> {
                 probe,
                 skin,
                 cast_shadow: piece.mesh.cast_runtime_shadow,
+                lod: None,
             });
         }
         rigid
@@ -1980,6 +2104,74 @@ struct FacePiece {
     positions: Vec<[f32; 4]>,
     indices: Vec<u32>,
     uvs: Vec<[f32; 4]>,
+}
+
+/// A tree's bark texture as the resource it loads: the file names a `.tga`, the game ships
+/// the `.dds` (`newbarkL.tga` → `newbarkl.dds`).
+fn bark_texture(name: &str) -> String {
+    let name = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    match name.rsplit_once('.') {
+        Some((stem, _)) => format!("{stem}.dds"),
+        None => format!("{name}.dds"),
+    }
+}
+
+/// A closed surface's triangles turned to face out (the renderer's front face is clockwise
+/// seen from the outside, where the vertex normals point). The generator keeps the strips'
+/// winding, which this does not rely on.
+fn facing_front(vertices: &[MeshVertex], indices: &[u32]) -> Vec<u32> {
+    let at = |i: u32| vertices.get(i as usize);
+    let mut out = Vec::with_capacity(indices.len());
+    for t in indices.chunks_exact(3) {
+        let (Some(a), Some(b), Some(c)) = (at(t[0]), at(t[1]), at(t[2])) else {
+            continue;
+        };
+        let p = |v: &MeshVertex| Vec3::from(v.position);
+        let n = Vec3::from(a.normal) + Vec3::from(b.normal) + Vec3::from(c.normal);
+        let face = (p(b) - p(a)).cross(p(c) - p(a));
+        if face.dot(n) <= 0.0 {
+            out.extend([t[0], t[1], t[2]]);
+        } else {
+            out.extend([t[0], t[2], t[1]]);
+        }
+    }
+    out
+}
+
+/// A triangle list drawn from both sides (fronds are thin sheets).
+fn both_sides(indices: &[u32]) -> Vec<u32> {
+    let mut out = indices.to_vec();
+    out.extend(indices.chunks_exact(3).flat_map(|t| [t[0], t[2], t[1]]));
+    out
+}
+
+/// Leaf cards as two fixed upright crossed quads each, both sides. Interim: the original
+/// turns each card to the camera in its vertex shader (7.2 "(exe)"); the scene is static.
+fn leaf_cards(cards: &[LeafCard]) -> (Vec<MeshVertex>, Vec<u32>) {
+    let mut vertices = Vec::with_capacity(cards.len() * 8);
+    let mut indices = Vec::with_capacity(cards.len() * 24);
+    for card in cards {
+        for right in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            let base = vertices.len() as u32;
+            for i in 0..4 {
+                vertices.push(MeshVertex {
+                    position: card.corner(i, right, [0.0, 0.0, 1.0]),
+                    normal: card.normals[i],
+                    tangent: right,
+                    binormal: [0.0, 0.0, 1.0],
+                    uv: card.uv[i],
+                    uv_detail: card.uv[i],
+                    fade: 1.0,
+                });
+            }
+            indices.extend([0, 1, 2, 0, 2, 3, 0, 2, 1, 0, 3, 2].map(|i| base + i));
+        }
+    }
+    (vertices, indices)
 }
 
 /// A SpeedTree's name for diagnostics (`spt:<name>`).

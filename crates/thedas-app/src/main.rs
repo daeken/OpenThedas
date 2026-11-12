@@ -37,7 +37,7 @@
 //! walks the leader, the right stick turns and zooms the camera, A acts on the target in
 //! front, X/Y/B (RT for a second set) use the quickbar, LB/RB change the leader, LT opens a
 //! quickbar picker, the D-pad changes the target, Back opens the player's screens and Start
-//! pauses. On screens the stick moves a pointer that A clicks and B closes; in conversations
+//! the game menu (pausing is in the quickbar picker). On screens the stick moves a pointer that A clicks and B closes; in conversations
 //! the D-pad or stick picks a reply and A chooses it. The PC original has no controller
 //! support: this is a deliberate addition, following the Xbox 360 version's controls.
 //!
@@ -436,6 +436,23 @@ fn capture(
             log_stats(&l.renderer);
         }
         reticle.extend(live.reticle(&camera, (w, h), cursor));
+        // THEDAS_BENCH_FRAMES=n: draws the frame n more times first and reports how long
+        // each took (with its read back to memory), for comparing builds.
+        if let Some(n) = std::env::var("THEDAS_BENCH_FRAMES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|n| *n > 0)
+        {
+            let mut ms = Vec::new();
+            for _ in 0..n {
+                let t = Instant::now();
+                live.capture(ctx, &camera, (w, h))?;
+                ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            let avg = ms.iter().sum::<f64>() / ms.len() as f64;
+            let worst = ms.iter().cloned().fold(0.0, f64::max);
+            println!("bench: {n} frames, avg {avg:.1} ms, worst {worst:.1} ms");
+        }
         live.capture(ctx, &camera, (w, h))?
             .unwrap_or_else(|| [0, 0, 0, 255].repeat(w as usize * h as usize))
     } else {
@@ -851,14 +868,27 @@ impl App {
         let dt = (now - self.last).as_secs_f32().min(0.1);
         self.last = now;
         let k = |c| self.keys.contains(&c);
-        if let (Some(f), Some(l)) = (self.follow.as_mut(), self.live.as_mut())
-            && let Some(heading) = l.camera_reset_due()
-        {
-            f.reset(heading);
+        if let (Some(f), Some(l)) = (self.follow.as_mut(), self.live.as_mut()) {
+            if let Some(heading) = l.camera_reset_due() {
+                f.reset(heading);
+            }
+            if let Some(level) = l.zoom_request_due() {
+                f.set_zoom_level(level);
+            }
         }
         if let Some(f) = self.follow.as_mut() {
             let turn = (k(KeyCode::KeyQ) as i32 - k(KeyCode::KeyE) as i32) as f32;
             f.orbit(turn * 1.8 * dt, 0.0);
+            // Page Down zooms in and Page Up out while held, the original's second zoom
+            // bindings (KeyBindings.ini: ZoomIn_1=Keyboard::Button_Next,
+            // ZoomOut_1=Keyboard::Button_Prior). Provisional: the rate (the pad's).
+            let zoom = (k(KeyCode::PageDown) as i32 - k(KeyCode::PageUp) as i32) as f32;
+            if zoom != 0.0
+                && f.zoom(zoom * pad::ZOOM_SPEED * dt)
+                && let Some(l) = self.live.as_ref()
+            {
+                l.sim().player_zoomed_in();
+            }
             let eye = self
                 .live
                 .as_ref()
@@ -1382,8 +1412,11 @@ impl App {
                 return;
             }
         }
-        if let Some(f) = self.follow.as_mut() {
-            f.zoom(steps as f32);
+        if let Some(f) = self.follow.as_mut()
+            && f.zoom(steps as f32)
+            && let Some(l) = self.live.as_ref()
+        {
+            l.sim().player_zoomed_in();
         }
     }
 
@@ -1631,8 +1664,9 @@ impl App {
                 });
             }
             Step::Pause => {
+                // As the Space key does (a training tutorial takes it as its unpause).
                 if let Some(live) = self.live.as_mut() {
-                    live.paused = !live.paused;
+                    live.toggle_pause();
                     log.push(if live.paused { "paused" } else { "running" }.into());
                 }
             }
@@ -1670,8 +1704,11 @@ impl App {
                 log.push(format!("orbit {dyaw},{dpitch}"));
             }
             &Step::Zoom(n) => {
-                if let Some(f) = self.follow.as_mut() {
-                    f.zoom(n);
+                if let Some(f) = self.follow.as_mut()
+                    && f.zoom(n)
+                    && let Some(l) = self.live.as_ref()
+                {
+                    l.sim().player_zoomed_in();
                 }
                 log.push(format!("zoom {n}"));
             }
@@ -2132,10 +2169,24 @@ impl ApplicationHandler for App {
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta } = event {
             if self.looking {
-                let s = 0.003;
+                // The player's control options: mouse sensitivity scales the turn (1, the
+                // default, is the old fixed 0.003 radians a pixel) and the axes may be
+                // inverted. Provisional: the exe's sensitivity curve is not traced.
+                let opt = |name: &str, default: f64| {
+                    self.gfx
+                        .as_ref()
+                        .and_then(|g| g.ui.client_option(name))
+                        .unwrap_or(default) as f32
+                };
+                let s = 0.003 * opt("ControlOptions.MouseSensitivity", 1.0).clamp(0.05, 4.0);
+                let sign = |name: &str| if opt(name, 0.0) != 0.0 { -1.0 } else { 1.0 };
+                let (dx, dy) = (
+                    -delta.0 as f32 * s * sign("ControlOptions.InvertXAxis"),
+                    -delta.1 as f32 * s * sign("ControlOptions.InvertYAxis"),
+                );
                 match self.follow.as_mut() {
-                    Some(f) => f.orbit(-delta.0 as f32 * s, -delta.1 as f32 * s),
-                    None => self.camera.look(-delta.0 as f32 * s, -delta.1 as f32 * s),
+                    Some(f) => f.orbit(dx, dy),
+                    None => self.camera.look(dx, dy),
                 }
             }
         }
@@ -3256,6 +3307,10 @@ fn main() -> Result<()> {
                             {
                                 f.reset(heading);
                             }
+                            if let (Some(f), Some(level)) = (follow.as_mut(), l.zoom_request_due())
+                            {
+                                f.set_zoom_level(level);
+                            }
                             let eye = follow
                                 .as_mut()
                                 .and_then(|f| l.follow_camera(f, dt as f32 / 1000.0, &camera));
@@ -3355,7 +3410,8 @@ fn main() -> Result<()> {
                         None => println!("quickslot {}", slot + 1),
                     },
                     Step::Pause => {
-                        l.paused = !l.paused;
+                        // As the Space key does (a training tutorial takes it as its unpause).
+                        l.toggle_pause();
                         println!("{}", if l.paused { "paused" } else { "running" });
                     }
                     &Step::Reply(n) => println!("{}", reply(l, n)),
@@ -3396,8 +3452,10 @@ fn main() -> Result<()> {
                         println!("orbit {dyaw},{dpitch}");
                     }
                     &Step::Zoom(n) => {
-                        if let Some(f) = follow.as_mut() {
-                            f.zoom(n);
+                        if let Some(f) = follow.as_mut()
+                            && f.zoom(n)
+                        {
+                            l.sim().player_zoomed_in();
                         }
                         println!("zoom {n}");
                     }

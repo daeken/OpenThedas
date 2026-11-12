@@ -13,14 +13,28 @@ const DEGREES_PER_RADIAN: f32 = 57.29578;
 #[allow(clippy::excessive_precision)]
 const RADIANS_TO_DEGREES: f32 = 57.29577951308232;
 
+/// `sin` of radians, always as its own library call.
+///
+/// An optimized build would otherwise merge a `sin` and a `cos` of the same value into one
+/// `sincos` call, whose results differ from the separate calls in the last bit on some
+/// platforms; keeping them apart makes debug and release builds compute the same trees.
+pub fn sin(x: f32) -> f32 {
+    std::hint::black_box(x).sin()
+}
+
+/// `cos` of radians, always as its own library call (see [`sin`]).
+pub fn cos(x: f32) -> f32 {
+    std::hint::black_box(x).cos()
+}
+
 /// `sin` of an angle in degrees.
 pub fn sin_deg(a: f32) -> f32 {
-    (a / DEGREES_PER_RADIAN).sin()
+    sin(a / DEGREES_PER_RADIAN)
 }
 
 /// `cos` of an angle in degrees.
 pub fn cos_deg(a: f32) -> f32 {
-    (a / DEGREES_PER_RADIAN).cos()
+    cos(a / DEGREES_PER_RADIAN)
 }
 
 /// Radians to degrees.

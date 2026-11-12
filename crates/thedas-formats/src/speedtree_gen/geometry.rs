@@ -4,7 +4,7 @@
 //! and triangle strips, and the volume-based selection of branches for each LOD level.
 //! Provisional until checked against the executable.
 
-use super::frame::{Vec3, add, cross, lerp, lerp3, normalize, scale, sub};
+use super::frame::{Vec3, add, cos, cross, lerp, lerp3, normalize, scale, sin, sub};
 use super::skeleton::{BANK, Branch, Flare};
 use super::{Curve, Random, Skeleton};
 use crate::speedtree::{BezierSpline, BranchLevel, SpeedTree, TEXTURE_LAYERS, TexLayer};
@@ -179,9 +179,9 @@ fn tube(
                 };
                 *tc = texcoord(controls, f, t, &values);
             }
-            let (ca, sa) = (alpha.cos(), alpha.sin());
+            let (ca, sa) = (cos(alpha), sin(alpha));
             let radial = add(scale(rows[1], ca), scale(rows[2], sa));
-            let (ct, st) = ((alpha + HALF_PI).cos(), (alpha + HALF_PI).sin());
+            let (ct, st) = (cos(alpha + HALF_PI), sin(alpha + HALF_PI));
             let tangent = add(scale(rows[1], ct), scale(rows[2], st));
             let binormal = cross(radial, tangent);
             let position = if i < m {
@@ -197,9 +197,9 @@ fn tube(
                     * info.roughness
                     * size
                     * roughness
-                    * (info.roughness_vertical_frequency * t).sin()
-                    * (info.roughness_horizontal_frequency * t).sin()
-                    * (info.roughness_horizontal_frequency * alpha).cos();
+                    * sin(info.roughness_vertical_frequency * t)
+                    * sin(info.roughness_horizontal_frequency * t)
+                    * cos(info.roughness_horizontal_frequency * alpha);
                 if r > branch.max_radius {
                     r = branch.max_radius;
                 }

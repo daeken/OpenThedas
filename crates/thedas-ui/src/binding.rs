@@ -1150,7 +1150,15 @@ fn quickbar(sim: &Sim, who: u32, v: &mut BTreeMap<String, UiValue>) {
             format!("{k}.CooldownPercentage"),
             num(sim.cooldown_left(who, q.ability, &q.item)),
         );
-        v.insert(format!("{k}.PendingActivation"), num(0));
+        // A queued use of the slot's ability (the member walking into range, or waiting its
+        // turn) lights its pending highlight (the ability icon's `UpdatePendingHighlight`).
+        // Provisional: the exe's rule for the flag is not traced.
+        let pending = sim.world.get(who).is_some_and(|o| {
+            o.commands.iter().any(|c| {
+                c.ty == COMMAND_USE_ABILITY && c.ints.first() == Some(&q.ability) && !c.impacted
+            })
+        });
+        v.insert(format!("{k}.PendingActivation"), num(pending as u8));
         // The slot's picture (quickbar.gfx draws only this): the item's icon for an
         // item's slot, else the ability's. Provisional: inferred from the movie.
         let icon = match item {
@@ -1748,7 +1756,7 @@ fn tactics(sim: &Sim, who: u32, v: &mut BTreeMap<String, UiValue>) {
     }
 }
 
-/// The inventory screen: the party's backpack/// The inventory screen: the party's backpack (`GUIInventory.PartyBackpackView.N.Item`, the
+/// The inventory screen: the party's backpack (`GUIInventory.PartyBackpackView.N.Item`, the
 /// items of the chosen category tab, `filter`) with plot items listed apart
 /// (`PartyPlotItemsView`), the money, and what the selected party member (`who`) wears
 /// (`GUI.SelectedChar.Equipment.<INVENTORY_SLOT_*>`, 0 for an empty slot).
@@ -2065,6 +2073,17 @@ mod tests {
             UiValue::Number(0.0)
         );
         assert_eq!(v[&format!("{k}.1")], UiValue::Number(0.0));
+        assert_eq!(v[&format!("{k}.0.PendingActivation")], UiValue::Number(0.0));
+        // Queued, it shows as pending.
+        sim.world.get_mut(hero).unwrap().commands = vec![thedas_sim::world::Command {
+            ty: 25,
+            ints: vec![3024],
+            ..Default::default()
+        }];
+        assert_eq!(
+            sim_values(&sim)[&format!("{k}.0.PendingActivation")],
+            UiValue::Number(1.0)
+        );
         assert_eq!(
             v["InputMappings.Mappings.ActivateQuickslot10.PrimaryMappedKey"],
             UiValue::String("0".into())

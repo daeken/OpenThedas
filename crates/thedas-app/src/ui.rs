@@ -180,8 +180,8 @@ pub struct UiLayer {
     /// it has waited for its values to reach the popup layer (see
     /// [`UiLayer::show_script_popup`]).
     script_popup: Option<((i32, i32, u32), u8)>,
-    /// The screens up last frame, for the training events of opening one (see
-    /// [`UiLayer::training_screens`]).
+    /// The screens up last frame, for the events of opening one (see
+    /// [`UiLayer::screens_opened`]).
     screens_up: std::collections::BTreeSet<Screen>,
     /// The floating messages up over creatures (see [`UiLayer::update_floaties`]).
     floaties: Vec<Floaty>,
@@ -580,9 +580,14 @@ impl UiLayer {
         true
     }
 
-    /// A training step waiting for the player to open the tactics, level-up or inventory
-    /// screen hears of it (`EVENT_TYPE_TRAINING_GUI_*_OPENED`, see `thedas_sim::training`).
-    fn training_screens(&mut self, screens: &Screens, sim: &Arc<Mutex<Sim>>) {
+    /// The screens that opened since last frame: the module hears of each
+    /// (`EVENT_TYPE_GUI_OPENED` with its `GUI_*` id, `Sim::gui_opened`, as DAOrigins.exe's
+    /// screen-showing routine sends it, 0x60afa3; the inventory opened on a container is
+    /// `GUI_CONTAINER_INVENTORY`), and a training step waiting for the tactics, level-up or
+    /// inventory screen hears of that (`EVENT_TYPE_TRAINING_GUI_*_OPENED`, see
+    /// `thedas_sim::training`). Provisional: the store, level-up and item examine screens'
+    /// ids are not traced (script.ldf names none), so they send no GUI_OPENED.
+    fn screens_opened(&mut self, screens: &Screens, sim: &Arc<Mutex<Sim>>) {
         let up = screens.shown().clone();
         let opened: Vec<Screen> = up.difference(&self.screens_up).copied().collect();
         self.screens_up = up;
@@ -591,6 +596,9 @@ impl UiLayer {
         }
         let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
         for s in opened {
+            if let Some(id) = gui_id(s, sim.world.container.is_some()) {
+                sim.gui_opened(id);
+            }
             let name = match s {
                 Screen::Tactics => "GUI_TACTICS_OPENED",
                 Screen::LevelUp => "GUI_LEVLUP_OPENED",
@@ -795,10 +803,6 @@ impl UiLayer {
                 }
                 self.refresh_saves();
             }
-            // Provisional: there is no start menu to go back to yet.
-            "GameModeController.ShutDownToStartMenuMessage" => {
-                log::warn!("ui: quitting to the start menu is not available yet");
-            }
             _ => return false,
         }
         true
@@ -846,7 +850,7 @@ impl UiLayer {
             self.saves_listed = true;
             self.refresh_saves();
         }
-        self.training_screens(screens, sim);
+        self.screens_opened(screens, sim);
         // The journal, while its screen is up (built from the plots: it needs the simulation
         // mutably, which the bindings do not have).
         let journal = (screens.menu == Some(Screen::Journal))
@@ -1874,6 +1878,34 @@ impl UiLayer {
     pub fn capture_over(&mut self, base: &mut Rgba) -> Result<()> {
         Ok(self.stage.capture_over(base)?)
     }
+}
+
+/// A screen's `GUI_*` id (script.ldf's `EVENT_TYPE_GUI_OPENED` constants), the inventory on a
+/// container as `GUI_CONTAINER_INVENTORY`. None for screens script.ldf names no id for.
+fn gui_id(s: Screen, container: bool) -> Option<i32> {
+    Some(match s {
+        Screen::CharacterRecord => 0,
+        Screen::CharGen => 1,
+        Screen::Inventory if container => 2,
+        Screen::Conversation => 4,
+        Screen::Cutscene => 5,
+        Screen::Hud => 7,
+        Screen::Inventory => 8,
+        Screen::Journal => 9,
+        Screen::SpellsTalents => 10,
+        Screen::Skills => 13,
+        Screen::AreaMap => 15,
+        Screen::WorldMap => 16,
+        Screen::Options => 17,
+        Screen::StartMenu => 18,
+        Screen::Death => 19,
+        Screen::GameMenu => 20,
+        Screen::SaveLoad => 21,
+        Screen::Chanters => 22,
+        Screen::Tactics => 23,
+        Screen::PartyPicker => 27,
+        Screen::Store | Screen::LevelUp | Screen::ItemExamine => return None,
+    })
 }
 
 #[cfg(test)]

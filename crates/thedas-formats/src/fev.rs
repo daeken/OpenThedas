@@ -360,17 +360,21 @@ pub struct SoundDefTemplate {
     pub spawn_time_min_ms: u32,
     pub spawn_time_max_ms: u32,
     pub max_spawned: u32,
-    /// Linear gain (provisional).
+    /// Linear gain (`fmod_event.dll` reads it at +0x10, 0x1002e9f9).
     pub volume: f32,
+    /// 1: random volume from `f1c` up to 1; otherwise a range `f14`..`f18` (0x1002ea00).
     pub volume_randomization_method: u32,
     pub f14: f32,
     pub f18: f32,
+    /// The lowest random gain, linear (+0x1c, 0x1002ea0e): each play is `f1c` .. 1.
     pub f1c: f32,
-    /// Pitch (provisional).
+    /// Pitch, raw like the event's: 1 is 4 octaves (+0x20, 0x1002eb1e).
     pub pitch: f32,
+    /// 1: random pitch within plus or minus `f2c`; otherwise a range `f24`..`f28`.
     pub pitch_randomization_method: u32,
     pub f24: f32,
     pub f28: f32,
+    /// Random pitch, raw: each play is offset within plus or minus this (+0x2c, 0x1002eb2b).
     pub f2c: f32,
     pub position_randomization: f32,
 }

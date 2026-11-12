@@ -265,12 +265,18 @@ impl PadPlay {
             Order::Act(a) => self.act(a, host),
             Order::Walk(v) => walk(host, v, self.group),
             Order::Camera { yaw, zoom } => {
-                match host.follow() {
+                let near = match host.follow() {
                     Some(f) => {
                         f.orbit(yaw, 0.0);
-                        f.zoom(zoom);
+                        f.zoom(zoom)
                     }
-                    None => host.look(yaw, 0.0),
+                    None => {
+                        host.look(yaw, 0.0);
+                        false
+                    }
+                };
+                if near && let Some(l) = host.live() {
+                    l.sim().player_zoomed_in();
                 }
                 None
             }
