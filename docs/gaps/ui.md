@@ -109,7 +109,7 @@ an image instead of run, and 37 are never opened.
 - **Gameplay**: `armycontrol`, `crafting`, `itemupgrade`, `slideshow`, `credits`,
   `dialoguepop`, `fademap`, `bookfront`, `newgame`, `savescreen`. The matching engine functions
   (`ShowCraftingGUI`, `OpenItemUpgradeGUI`, `BeginSlideshow`) are unimplemented too.
-- **Loading screens**: `load_fade`, `load_light`, `load_town`.
+- **Loading screens**: `load_light` and `load_fade` (load_town shows since the loading-screen PR; see UI-078).
 - **Online and downloadable content**: `login`, `loginconnected`, `loginconnecting`,
   `loginnewaccount`, `loginviewtos`, `prccontentmanager`, `purchaseconfirm`,
   `purchasingcontent`, `contentinstalling`, `guicommunityfeatures`, `guiachievementunlocked`,
