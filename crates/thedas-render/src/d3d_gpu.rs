@@ -2035,7 +2035,9 @@ impl D3dPass {
             .draws
             .iter()
             .map(|d| {
-                d.lod.is_none_or(|l| l.shown(camera.position))
+                // A draw faded all the way out is not drawn (a cut-away ceiling).
+                self.opacity.get(d.draw).is_none_or(|&o| o > 0.0)
+                    && d.lod.is_none_or(|l| l.shown(camera.position))
                     && self
                         .world_sphere(d)
                         .is_none_or(|(centre, radius)| in_view(&view_proj, centre, radius))

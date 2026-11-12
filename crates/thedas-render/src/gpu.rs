@@ -506,6 +506,8 @@ pub struct AreaRenderer {
     updated: bool,
     /// The scene's particle emitters, as [`AreaScene::emitters`] orders them.
     pub emitters: Vec<crate::particles::EmitterState>,
+    /// The draws of `CutAway` meshes ([`AreaScene::cut_away`]).
+    cut_away: Vec<usize>,
 }
 
 /// The colour curve `da_hsvmatrix` reads: `name` (an area's curve, `<name>.dds`) or by
@@ -968,6 +970,7 @@ impl AreaRenderer {
                 .collect(),
             light: StandInLight::default(),
             stats,
+            cut_away: scene.cut_away.clone(),
         }
     }
 
@@ -1026,6 +1029,15 @@ impl AreaRenderer {
     /// Draws every draw of `scene`'s prop `prop` at `opacity` (see
     /// [`crate::d3d_gpu::D3dPass::set_opacity`]): 1 as its materials say, below 1 faded,
     /// blended over what lies behind it.
+    /// Fades the scene's `CutAway` meshes (ceilings, roofs) to `value`: 1 draws them as
+    /// made, between 0 and 1 translucent with that opacity multiplier, 0 not at all
+    /// (DAOrigins.exe 0x4670c0 → 0x466930).
+    pub fn set_cutaway(&mut self, ctx: &GpuContext, value: f32) {
+        for d in self.cut_away.clone() {
+            self.d3d.set_opacity(ctx, d, value);
+        }
+    }
+
     pub fn set_prop_opacity(
         &mut self,
         ctx: &GpuContext,
