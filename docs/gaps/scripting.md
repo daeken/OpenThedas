@@ -241,8 +241,8 @@ call to the exe's event constructor 0x69bac0):
 
 | Effect (id) | Construction sites |
 | --- | --- |
-| `EffectMovementSpeed` (9) | 236 |
-| `EffectMovementSpeedDebuff` (11) | 219 |
+| `EffectMovementSpeed` (9) | 236 (now applied) |
+| `EffectMovementSpeedDebuff` (11) | 219 (now applied) |
 | `EffectTransparency` (10) | 98 |
 | `EffectScreenShake` (6) | 80 |
 | `EffectParalyze` (8) | 48 |
@@ -326,7 +326,7 @@ Dispatch summary: `engine::call` (`crates/thedas-sim/src/engine.rs:483`) matches
 
 ### Effects
 
-- **SCR-045** **Most effect types have no engine behaviour.** Original: not traced per type. Ours: the engine itself acts only on EFFECT_TYPE_DEATH (7, kills), RESURRECTION (1005, revives), AOE (5, creates an AoE object), visual effect (4, kept at locations for rendering only), UPKEEP (1016, read for modal state) and DOT (1017, damage attribution only). Every other type is passed to the target's APPLY_EFFECT script and then stored until it expires or is removed; the effects.gda `Flags` (disable movement, combat, talents) are only reported by `GetEffectsFlags` and never stop commands or movement. Evidence: `crates/thedas-sim/src/combat.rs:538-612`, `combat.rs:717-746`, `crates/thedas-sim/src/engine.rs:2072-2086`. Size: L. Depends: none. Kind: missing.
+- **SCR-045** **Most effect types have no engine behaviour.** Original: not traced per type. Ours: the engine itself acts only on EFFECT_TYPE_DEATH (7, kills), RESURRECTION (1005, revives), AOE (5, creates an AoE object), visual effect (4, kept at locations for rendering only), UPKEEP (1016, read for modal state), DOT (1017, damage attribution only) and the movement-speed pair (9, 11: their potencies multiply the creature's speed, as 0x7a0610/0x79f910 do). Every other type is passed to the target's APPLY_EFFECT script and then stored until it expires or is removed; the effects.gda `Flags` (disable movement, combat, talents) are only reported by `GetEffectsFlags` and never stop commands or movement. Evidence: `crates/thedas-sim/src/combat.rs:538-612`, `combat.rs:717-746`, `crates/thedas-sim/src/engine.rs:2072-2086`. Size: L. Depends: none. Kind: missing.
 - **SCR-046** **Engine_ApplyEffectAtLocation of other types is a placeholder.** Original: 0x65c830 applies to the location's area. Ours: only types 4 and 5 do anything; anything else is counted in `Trace::stubbed` and logged "no effect in the simulation". Evidence: `crates/thedas-sim/src/engine.rs:2403-2486`. Size: M. Depends: SCR-045. Kind: missing.
 - **SCR-047** **Visual effects on objects are dropped.** Original: not traced. Ours: `ApplyEffectVisualEffect` is a no-op; effects of type 4 applied to creatures go through APPLY_EFFECT like others but nothing exposes them for rendering (only location VFX and `AddItemVisualEffect` are kept). Evidence: `crates/thedas-sim/src/engine.rs:179`, `engine.rs:2016-2033`, `crates/thedas-sim/src/world.rs:350-371`. Size: M. Depends: none. Kind: missing.
 - **SCR-048** **Effects have no ids.** Original: not traced. Ours: effects carry `id` 0 (only location VFX get one), `GetEffects`' effect-id filter is not applied, and `RemoveEffect` matches by full structural equality, so two identical effects cannot be told apart. Evidence: `crates/thedas-sim/src/engine.rs:49-56`, `crates/thedas-sim/src/combat.rs:669-676`. Size: M. Depends: none. Kind: provisional.

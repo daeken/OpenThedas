@@ -366,6 +366,9 @@ const APPROACH_CHECK_MS: u64 = 100;
 /// (0x641d30). Provisional: the update length is the app's frame, not traced.
 pub const TRANSITION_DELAY_MS: u64 = 33;
 
+/// Where an effect's engine floats (`SetEffectEngineFloat`) are kept in its float list.
+pub(crate) const ENGINE_FLOAT_BASE: usize = 32;
+
 /// How far above or below the pathing grid's floor a creature placed in an area may stand
 /// and still be put on it (metres; see `Sim::spawn_instance`). Provisional.
 const SPAWN_SNAP_RANGE: f32 = 2.0;
@@ -1789,6 +1792,22 @@ impl Sim {
         self.appearance_speed(id, if combat { COL_COMBAT_RUN } else { COL_RUN })
             .or_else(|| self.appearance_speed(id, COL_RUN))
             .unwrap_or(DEFAULT_SPEED)
+            * self.speed_multiplier(id)
+    }
+
+    /// What movement-speed effects make of a creature's speed: the product of the
+    /// potencies (engine float 1) of its `EffectMovementSpeed` (9) and
+    /// `EffectMovementSpeedDebuff` (11) effects, as DAOrigins.exe recomputes it on each
+    /// apply and removal (0x7a0610, 0x7a0690, 0x79f910) into the locomotion's multiplier
+    /// (creature +0xb04, read by 0xa63120 for walk, run and combat run alike). No clamp.
+    pub fn speed_multiplier(&self, id: ObjectId) -> f32 {
+        self.world.get(id).map_or(1.0, |o| {
+            o.effects
+                .iter()
+                .filter(|e| matches!(e.ty, 9 | 11))
+                .map(|e| e.floats.get(ENGINE_FLOAT_BASE + 1).copied().unwrap_or(1.0))
+                .product()
+        })
     }
 
     /// How fast a command moves its owner: a move ordered not to run
@@ -1799,7 +1818,7 @@ impl Sim {
         let walks = cmd.name.starts_with("CommandMoveTo") && cmd.ints.first() == Some(&0);
         if walks {
             if let Some(v) = self.appearance_speed(id, COL_WALK) {
-                return v;
+                return v * self.speed_multiplier(id);
             }
         }
         self.move_speed(id)
@@ -5211,6 +5230,26 @@ mod tests {
         // Past the corner, only the last leg is left.
         let f = progress_of(from, &points, [5.2, 2.0, 0.0]);
         assert_eq!(remaining_points(from, &points, f), vec![points[1]]);
+    }
+
+    #[test]
+    fn movement_speed_effects_multiply_the_speed() {
+        let mut s = sim();
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let base = s.move_speed(c);
+        let effect = |ty: i32, potency: f32| {
+            let mut floats = vec![0.0; ENGINE_FLOAT_BASE + 2];
+            floats[ENGINE_FLOAT_BASE + 1] = potency;
+            crate::world::Effect {
+                ty,
+                floats,
+                ..Default::default()
+            }
+        };
+        let o = s.world.get_mut(c).unwrap();
+        o.effects.push(effect(9, 0.5));
+        o.effects.push(effect(11, 0.8));
+        assert!((s.move_speed(c) - base * 0.4).abs() < 1e-4);
     }
 
     #[test]

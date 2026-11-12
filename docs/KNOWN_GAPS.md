@@ -59,8 +59,7 @@ these, so they are the places where one person or stream can take a large, separ
 - **Effects are mostly stored, not enforced.** The engine acts on death, resurrection,
   area-of-effect, upkeep and damage over time. Other effect types go to the target's script and
   are then only kept; the effect table's flags that should block movement, combat or talents
-  block nothing (`SCR-045`). Movement-speed effects alone are built at 455 script sites and do
-  nothing.
+  block nothing (`SCR-045`). Movement-speed effects (built at 455 script sites) now change speed.
 - **Some engine events are still not raised.** About 55 of the 111 named event types are raised
   by the engine. Tracing every sender in the original showed that damaged, spell-cast-at,
   combat-initiated, unlocked and five others come only from scripts, so nothing is owed there.
