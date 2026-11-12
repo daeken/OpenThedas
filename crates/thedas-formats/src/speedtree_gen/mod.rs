@@ -14,6 +14,7 @@ pub mod frame;
 pub mod fronds;
 pub mod geometry;
 pub mod leaves;
+pub mod limits;
 pub mod mesh;
 pub mod skeleton;
 
@@ -306,7 +307,7 @@ fn bezier(a: f32, b: f32, c: f32, d: f32, u: f32) -> f32 {
 }
 
 /// A fully computed tree (stages 2–5 and the post-generation draws of 7.1).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct GeneratedTree {
     pub skeleton: Skeleton,
     pub branches: geometry::BranchGeometry,
@@ -320,23 +321,25 @@ pub struct GeneratedTree {
 /// Computes a tree from its description, keeping the order of random draws of 5.1: growth
 /// (branches, guides, buds and leaves), branch LOD, leaf LOD, fronds, then the rocking
 /// groups' offsets.
-pub fn generate(tree: &SpeedTree) -> GeneratedTree {
-    let (skeleton, mut random) = grow(tree);
-    let branches = geometry::build(tree, &skeleton, &mut random);
+///
+/// Files outside the generator's [`limits`] are rejected with an error rather than grown.
+pub fn generate(tree: &SpeedTree) -> Result<GeneratedTree, limits::GenerateError> {
+    let (skeleton, mut random) = grow(tree)?;
+    let branches = geometry::build(tree, &skeleton, &mut random)?;
     let leaf_lods = leaves::lods(tree, &skeleton.leaves, &mut random);
-    let fronds = fronds::build(tree, &skeleton, &mut random);
+    let fronds = fronds::build(tree, &skeleton, &mut random)?;
     let rocking_offsets = [
         random.uniform(0.0, 10_000.0),
         random.uniform(0.0, 10_000.0),
         random.uniform(0.0, 10_000.0),
     ];
-    GeneratedTree {
+    Ok(GeneratedTree {
         skeleton,
         branches,
         leaf_lods,
         fronds,
         rocking_offsets,
-    }
+    })
 }
 
 /// Every curve of a tree with where it sits, for checks over the game's files.
@@ -387,7 +390,7 @@ pub fn check(tree: &SpeedTree) -> Result<(), String> {
             return Err(format!("{name}: table entry {i} is {}", curve.table()[i]));
         }
     }
-    let mesh = mesh::TreeMesh::new(tree);
+    let mesh = mesh::TreeMesh::try_new(tree).map_err(|e| e.to_string())?;
     for (name, part) in [("branch", &mesh.branches), ("frond", &mesh.fronds)] {
         let count = part.vertices.len() as u32;
         if part.lods.iter().flatten().any(|&i| i >= count) {

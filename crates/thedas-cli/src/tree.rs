@@ -34,7 +34,7 @@ pub fn run(
     let data = crate::load_target(target)?;
     let spt =
         thedas_formats::speedtree::parse(&data).with_context(|| format!("parsing {target}"))?;
-    let mesh = TreeMesh::new(&spt);
+    let mesh = TreeMesh::try_new(&spt).with_context(|| format!("generating {target}"))?;
     let g = &mesh.generated;
     let (lo, hi) = mesh.bounds;
     println!(
