@@ -7,12 +7,14 @@
 //! Stage 1 (this file): the single random stream and the curve parameters. Stage 2
 //! ([`skeleton`]): tree set-up and the branch skeleton, on the rotation frames of [`frame`].
 //! Stage 3 ([`geometry`]): branch tubes and branch LOD. Stage 4 ([`fronds`]): fronds. Stage 5
-//! ([`leaves`]): leaves. [`generate`] runs them all in the order of 5.1.
+//! ([`leaves`]): leaves. [`generate`] runs them all in the order of 5.1; [`mesh::TreeMesh`]
+//! flattens the result for drawing (stage 7).
 
 pub mod frame;
 pub mod fronds;
 pub mod geometry;
 pub mod leaves;
+pub mod mesh;
 pub mod skeleton;
 
 pub use skeleton::{Branch, Bud, Flare, Guide, Skeleton, Vertex, grow};
@@ -385,7 +387,19 @@ pub fn check(tree: &SpeedTree) -> Result<(), String> {
             return Err(format!("{name}: table entry {i} is {}", curve.table()[i]));
         }
     }
-    let generated = generate(tree);
+    let mesh = mesh::TreeMesh::new(tree);
+    for (name, part) in [("branch", &mesh.branches), ("frond", &mesh.fronds)] {
+        let count = part.vertices.len() as u32;
+        if part.lods.iter().flatten().any(|&i| i >= count) {
+            return Err(format!("a {name} triangle list indexes past the vertices"));
+        }
+    }
+    if let Some(b) = mesh.billboard
+        && !(b.width.is_finite() && b.height.is_finite())
+    {
+        return Err("the billboard size is not finite".into());
+    }
+    let generated = &mesh.generated;
     let skeleton = &generated.skeleton;
     for (i, branch) in skeleton.branches.iter().enumerate() {
         let finite = branch.vertices.iter().all(|v| {
