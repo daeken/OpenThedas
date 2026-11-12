@@ -458,6 +458,13 @@ impl Stage {
         }
     }
 
+    /// The mouse wheel turned `lines` (up positive) at (`x`, `y`).
+    pub fn mouse_wheel(&mut self, x: f64, y: f64, lines: f64) {
+        for m in self.input_movies() {
+            m.mouse_wheel(x, y, lines);
+        }
+    }
+
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
         for m in self.input_movies() {
             if down {
