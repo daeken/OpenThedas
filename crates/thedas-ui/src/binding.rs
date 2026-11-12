@@ -726,6 +726,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     if let Some(who) = controlled.or(hero) {
         tactics(sim, who, &mut v);
     }
+    map_notes(sim, &mut v);
     // The minimap, as minimap.gfx reads it: the picture, the world corners it spans
     // (`Left`/`Bottom` the lower, `Right`/`Top` the upper) and the share of the picture
     // they cover. Provisional: north is taken to be up (0).
@@ -747,6 +748,52 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         quickbar(sim, who, &mut v);
     }
     v
+}
+
+/// The area's map notes, as map.gfx and minimap.gfx read them (`MapNoteList.MapNotes.N`: the
+/// note's text, its icon's symbol, where it is and whether it shows): the waypoints of the
+/// current area with an enabled map note. The icon follows the note's type: 2 an exit
+/// (`ico_mm_exit`), 3 a store (`ico_mm_store`), else a pin (`ico_mm_mapPin`).
+/// Provisional: the types are read from the data (the Ostagar camp's exits are type 2, its
+/// quartermaster 3, the Dust Town shops and houses 1); the explored-area rule for showing a
+/// note is not modelled, so every enabled note shows.
+fn map_notes(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
+    let notes: Vec<&thedas_sim::world::Object> = sim
+        .world
+        .objects
+        .values()
+        .filter(|o| {
+            o.kind == thedas_sim::world::ObjectKind::Waypoint
+                && o.area.is_some()
+                && o.area == sim.world.area
+                && o.fields.get("HasMapNote").copied().unwrap_or(0) != 0
+                && o.fields.get("MapNoteEnabled").copied().unwrap_or(0) != 0
+        })
+        .collect();
+    let ids: Vec<String> = notes.iter().map(|o| o.id.to_string()).collect();
+    v.insert(
+        "MapNoteList.MapNotes".into(),
+        UiValue::String(ids.join(",")),
+    );
+    for (i, o) in notes.iter().enumerate() {
+        let k = format!("MapNoteList.MapNotes.{i}");
+        let icon = match o.fields.get("MapNoteType").copied().unwrap_or(0) {
+            2 => "ico_mm_exit",
+            3 => "ico_mm_store",
+            _ => "ico_mm_mapPin",
+        };
+        let text = o
+            .fields
+            .get("MapNote")
+            .and_then(|&s| sim.string(s as u32))
+            .unwrap_or_default();
+        v.insert(k.clone(), num(o.id));
+        v.insert(format!("{k}.MapNote"), UiValue::String(text));
+        v.insert(format!("{k}.Icon"), UiValue::String(icon.into()));
+        v.insert(format!("{k}.WorldPositionX"), num(o.position[0]));
+        v.insert(format!("{k}.WorldPositionY"), num(o.position[1]));
+        v.insert(format!("{k}.MapNoteVisible"), num(1));
+    }
 }
 
 /// The keys bound to the game's actions, as the movies (and the designer tags in text, see
