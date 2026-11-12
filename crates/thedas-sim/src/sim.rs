@@ -3462,7 +3462,7 @@ mod tests {
     #[test]
     fn a_new_character_keeps_the_face_screens_first_face() {
         use thedas_formats::gda::Cell;
-        let dir = std::env::temp_dir().join(format!("thedas-face-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("thedas-chargen-face-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let xml = dir.join("chargenmorphcfg.xml");
         std::fs::write(
