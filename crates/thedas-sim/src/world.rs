@@ -279,7 +279,7 @@ pub struct Event {
 
 /// A queued command (`AddCommand`). Provisional: commands complete as soon as the executor
 /// reaches them, except `Wait`, which lasts its duration.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Command {
     /// `COMMAND_TYPE_*`.
     pub ty: i32,
