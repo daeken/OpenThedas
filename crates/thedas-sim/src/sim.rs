@@ -1584,6 +1584,8 @@ impl Sim {
         });
         // The loading screen shows the hint a script set for this transition, once.
         self.world.transition_hint = self.world.load_hint.take();
+        // A loot panel open on something in the area left behind closes.
+        self.world.container = None;
         let old = self.world.area;
         let party: Vec<ObjectId> = self
             .world
