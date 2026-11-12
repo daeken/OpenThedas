@@ -1982,6 +1982,17 @@ struct FacePiece {
     uvs: Vec<[f32; 4]>,
 }
 
+/// A SpeedTree's name for diagnostics (`spt:<name>`).
+fn name_of_tree(trees: &[String], tree: usize) -> String {
+    format!(
+        "spt:{}",
+        trees
+            .get(tree)
+            .map_or("?", |t| t.as_str())
+            .to_ascii_lowercase()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2145,15 +2156,4 @@ mod tests {
         });
         assert_eq!(z, Mat4::IDENTITY);
     }
-}
-
-/// A SpeedTree's name for diagnostics (`spt:<name>`).
-fn name_of_tree(trees: &[String], tree: usize) -> String {
-    format!(
-        "spt:{}",
-        trees
-            .get(tree)
-            .map_or("?", |t| t.as_str())
-            .to_ascii_lowercase()
-    )
 }
