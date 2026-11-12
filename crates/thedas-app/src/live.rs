@@ -483,6 +483,49 @@ impl Live {
         self.loading.is_some() || self.held
     }
 
+    /// Whether a script's area transition is waiting for the simulation to perform it
+    /// (`World::transition`, due at `World::transition_at`): the loading screen goes up and
+    /// the world is no longer drawn, as the exe's loading mode takes over before the old
+    /// area goes (0x641d30); the simulation runs on to perform it. Only with
+    /// [`Live::async_loads`]: a headless capture runs as before.
+    pub fn transition_pending(&self) -> bool {
+        self.async_loads && self.sim().world.transition.is_some()
+    }
+
+    /// The loading screen for the pending transition: load_light for an area of the same
+    /// area list as this one, else load_town (the exe's loading sub-modes 5 and 4, picked at
+    /// 0x6c7080 by comparing area lists). `None` when no transition is pending.
+    pub fn pending_load_screen(&self) -> Option<crate::ui::LoadScreen> {
+        if !self.async_loads {
+            return None;
+        }
+        let sim = self.sim();
+        let (to, _) = sim.world.transition.as_ref()?;
+        let list = |resref: &str| {
+            sim.module_info
+                .areas
+                .iter()
+                .find(|a| a.resref.eq_ignore_ascii_case(resref))
+                .and_then(|a| a.area_list.clone())
+        };
+        let here = sim
+            .world
+            .area
+            .and_then(|a| sim.world.get(a))
+            .map(|a| a.template.clone());
+        let (from_list, to_list) = (here.as_deref().and_then(list), list(to));
+        let same = match (&from_list, &to_list) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            _ => false,
+        };
+        log::debug!("transition {here:?} ({from_list:?}) -> {to} ({to_list:?}): same list {same}");
+        Some(if same {
+            crate::ui::LoadScreen::Light
+        } else {
+            crate::ui::LoadScreen::Town
+        })
+    }
+
     /// Holds this game while another opens to replace it (a save loading, a new game): it
     /// stops running and its world is no longer drawn, as behind a loading screen. Released
     /// (`false`) when the other failed to open, it carries on, rebuilding its world.
@@ -1299,9 +1342,9 @@ impl Live {
             );
             return true;
         }
-        // Nothing of the world until its load is done: the level alone, before its objects,
-        // is not shown.
-        if self.loading() {
+        // Nothing of the world until its load is done (the level alone, before its objects,
+        // is not shown), nor once a transition is on its way.
+        if self.loading() || self.transition_pending() {
             return false;
         }
         self.set_shader_time();
@@ -1360,7 +1403,7 @@ impl Live {
             return Ok(Some(self.cutscene_movies.rgba((width, height))));
         }
         // As the window shows it: nothing of the world while it loads.
-        if self.loading() {
+        if self.loading() || self.transition_pending() {
             return Ok(None);
         }
         self.set_shader_time();

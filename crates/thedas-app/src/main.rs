@@ -1081,7 +1081,8 @@ impl App {
             });
         let stopped = self.screens.as_ref().is_some_and(|s| s.world_stopped());
         if let Some(live) = self.live.as_mut() {
-            if !stopped {
+            // A pending transition runs on behind the loading screen, which stops the world.
+            if !stopped || live.transition_pending() {
                 live.step(dt);
             }
             // While a level loads the world holds still: its presentation too.
@@ -1224,7 +1225,8 @@ impl App {
         };
         let stopped = self.screens.as_ref().is_some_and(|s| s.world_stopped());
         if let Some(live) = self.live.as_mut() {
-            if !stopped {
+            // A pending transition runs on behind the loading screen, which stops the world.
+            if !stopped || live.transition_pending() {
                 live.step(dt);
             }
             // While a level loads the world holds still: its presentation too.
@@ -1645,7 +1647,12 @@ impl App {
             }
             Step::Transition(area, waypoint) => {
                 if let Some(l) = self.live.as_ref() {
-                    l.sim().world.transition = Some((area.clone(), waypoint.clone()));
+                    // As a script's DoAreaTransition does: performed at the start of the next
+                    // update (`TRANSITION_DELAY_MS`).
+                    let mut sim = l.sim();
+                    sim.world.transition = Some((area.clone(), waypoint.clone()));
+                    sim.world.transition_at =
+                        Some(sim.world.time_ms + thedas_sim::sim::TRANSITION_DELAY_MS);
                 }
                 log.push(format!("transition {area} {waypoint}"));
             }
@@ -2906,7 +2913,8 @@ fn loading_screen(live: &live::Live, ui: &mut ui::UiLayer, up: &mut bool) {
     if std::env::var_os("THEDAS_NO_LOAD_MOVIE").is_some() {
         return;
     }
-    match (live.loading(), *up) {
+    let pending = live.pending_load_screen();
+    match (live.loading() || pending.is_some(), *up) {
         (true, false) => {
             let sim = live.sim();
             if sim.world.world_map.open {
@@ -2914,7 +2922,7 @@ fn loading_screen(live: &live::Live, ui: &mut ui::UiLayer, up: &mut bool) {
             }
             let hint = thedas_ui::binding::load_hint(&sim);
             drop(sim);
-            ui.loading_begin(ui::LoadScreen::Town, hint);
+            ui.loading_begin(pending.unwrap_or(ui::LoadScreen::Town), hint);
             *up = true;
         }
         (false, true) => {
@@ -3532,13 +3540,27 @@ fn main() -> Result<()> {
                             for m in pad_play.frame(&pad_state, &mut host, dt) {
                                 println!("pad: {m}");
                             }
-                            if !played.as_ref().is_some_and(|(_, s)| s.world_stopped()) {
+                            if !played.as_ref().is_some_and(|(_, s)| s.world_stopped())
+                                || l.transition_pending()
+                            {
                                 l.step(dt);
                             }
                             l.advance_presentation(dt);
                             // As the window does: the drawn scenes follow the world (objects
                             // that come and go are rebuilt).
                             l.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
+                            // A level building on its worker (THEDAS_ASYNC_LOADS) is waited
+                            // for here, so the next frame, capture or input finds the world
+                            // up: headless frames run far faster than a load.
+                            if l.loading() {
+                                if let Some((layer, _)) = played.as_mut() {
+                                    loading_screen(l, layer, &mut load_screen_up);
+                                }
+                                while l.loading() {
+                                    std::thread::sleep(std::time::Duration::from_millis(5));
+                                    l.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
+                                }
+                            }
                             if let Some((layer, _)) = played.as_mut() {
                                 loading_screen(l, layer, &mut load_screen_up);
                             }
@@ -3658,7 +3680,12 @@ fn main() -> Result<()> {
                     }
                     &Step::ZoomKey(dir) => zoom_key = dir,
                     Step::Transition(area, waypoint) => {
-                        l.sim().world.transition = Some((area.clone(), waypoint.clone()));
+                        // As a script's DoAreaTransition does: performed at the start of the next
+                        // update (`TRANSITION_DELAY_MS`).
+                        let mut sim = l.sim();
+                        sim.world.transition = Some((area.clone(), waypoint.clone()));
+                        sim.world.transition_at =
+                            Some(sim.world.time_ms + thedas_sim::sim::TRANSITION_DELAY_MS);
                         println!("transition {area} {waypoint}");
                     }
                     Step::Floaty(text) => {
