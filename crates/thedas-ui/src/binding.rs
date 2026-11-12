@@ -119,6 +119,9 @@ pub struct Presentation {
     pub ability_scene: i32,
     /// The book page up (navbar.gfx's selected tab, `GUI.SelectedBookPage`), if any.
     pub book_page: Option<i32>,
+    /// A full-screen menu (options, save and load, the game menu) is up: tutorial popups
+    /// wait under it (the popup layer those screens load does not show them).
+    pub menu_up: bool,
 }
 
 /// An item shown on the examine screen (itemexamine.gfx), as the screen that opened it asked
@@ -673,18 +676,25 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     // tutorials on (`Tutorials.Enabled`). An empty list hides the panel.
     let tutorial_text =
         |s: Option<u32>| UiValue::String(s.and_then(|s| sim.string(s)).unwrap_or_default());
+    // Provisional: the original's rule for a tutorial waiting while a menu is up is not
+    // traced; QA saw the panel over the options, save and game menus, where it does not
+    // belong.
+    let tutorials: &[thedas_sim::journal::Tutorial] = if shown.menu_up {
+        &[]
+    } else {
+        &sim.world.tutorials
+    };
     v.insert(
         "Tutorials.TutorialList".into(),
         UiValue::String(
-            sim.world
-                .tutorials
+            tutorials
                 .iter()
                 .map(|t| t.resref.as_str())
                 .collect::<Vec<_>>()
                 .join(","),
         ),
     );
-    for (i, t) in sim.world.tutorials.iter().enumerate() {
+    for (i, t) in tutorials.iter().enumerate() {
         let k = format!("Tutorials.TutorialList.{i}");
         v.insert(k.clone(), UiValue::String(t.resref.clone()));
         v.insert(format!("{k}.Title"), tutorial_text(t.title));
