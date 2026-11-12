@@ -2505,6 +2505,7 @@ fn audio_state(
             state.combat = sim.world.party_fighting;
             state.music_intensity = Some(sim.world.music_intensity);
             state.dead = sim.world.game_over;
+            state.game_mode = sim.world.game_mode;
             state.inactive_sounds = sim
                 .world
                 .objects
