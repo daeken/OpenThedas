@@ -41,9 +41,6 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
     - Their reverb is applied (#279).
     - Not handled: their `SoundList` (sounds that play only inside the volume, 0x79a000) and `ObjectId`.
     - Medium.
-11. **Music volume triggers (Type 5, CCTriggerAudioMusicVolume).**
-    - Original: `EnterState`, `ExitState`, `EnterStateDelay` and `ExitStateDelay` (0x799ad0) change the music state on entering and leaving.
-    - Not done. Medium; ties in with item 1.
 12. **Ambient one-shots** (`amb_oneshots`, `glo_amb_creat`). Played only where the data places them; any engine-driven ambient spawning isn't checked. Small to medium.
 13. **Placeable sounds** (doors, chests and so on): `.evt` kind 27 (`ClosedToOpened`, `OpenedToClosed`, `Destroyed`, `Used`) and `sound_plc_column_names.gda`. Not done. Medium.
 
@@ -177,7 +174,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 ### Music
 
 - **AUD-032** **`PlayMusic` is dropped.** Original: not traced. Ours: the sim queues `SoundRequest::Music`; the app logs "not done yet" and discards it. Evidence: `crates/thedas-sim/src/engine.rs:502`, `crates/thedas-app/src/main.rs:2335`. Size: S. Depends: none. Kind: missing.
-- **AUD-033** **`SetMusicIntensity` mapping is inferred.** Original: logs "music state= %2.1f" (per comment). Ours: sets `music_state` on the area track to the integer given; read from data and scripts, not traced. Evidence: `crates/thedas-app/src/audio.rs:1468`. Size: S. Depends: none. Kind: provisional.
+- **AUD-033** **The script path of `SetMusicIntensity` is inferred.** Original: the music object's SetMusicIntensity (0x5c0150) sets `music_state` on the theme's main, combat and third events; how the script command reaches it is not traced. Ours: sets `music_state` on the area track to the integer given. Evidence: `crates/thedas-app/src/audio.rs:1570`. Size: S. Depends: none. Kind: provisional.
 - **AUD-034** **Music during cutscenes and conversations is left alone.** Original: not traced. Ours: the area track keeps playing through cutscenes and conversations. Evidence: `crates/thedas-app/src/audio.rs:1141`. Size: S. Depends: none. Kind: provisional.
 
 ### World sound, reverb, occlusion
@@ -185,6 +182,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 - **AUD-035** **Secondary reverb instances are not modelled.** Original: loads the next two most-used presets into secondary reverb instances for events that name a preset (per comment). Ours: one world reverb. Evidence: `crates/thedas-audio/src/area.rs:136`. Size: M. Depends: AUD-036. Kind: missing.
 - **AUD-036** **The reverb is our own algorithm.** Original: FMOD Ex software I3DL2 reverb. Ours: four taps, two diffusers, 8-line FDN; decay LF ratio, modulation, echo, environment and room rolloff are unused. Evidence: `crates/thedas-audio/src/reverb.rs:27`. Size: M. Depends: none. Kind: provisional.
 - **AUD-037** **Reverb trigger entry rule is guessed.** Original: enter handler 0x79b3d0 (caller not traced). Ours: the party leader's entering counts; of several entered in one step, the last listed wins. Evidence: `crates/thedas-audio/src/area.rs:166`. Size: S. Depends: none. Kind: provisional.
+- **AUD-063** **Music volume entry rule and pause are guessed.** Original: the enter handler 0x799380 stores the volume's state and delay on the music director, whose update (0x5bb630) counts the delay down except in game mode 9 (0x5bb669, not identified). Ours: the party leader's entering counts, the last listed of several wins, and the countdown never pauses. Evidence: `crates/thedas-audio/src/area.rs:222`, `crates/thedas-app/src/audio.rs:1579`. Size: S. Depends: none. Kind: provisional.
 - **AUD-038** **Audio-volume triggers act only as reverb triggers.** Original: `CCTriggerAudioVolume` (type 4, loader 0x79a5d0) subclasses the reverb trigger. Ours: type 4 sets reverb and weighs 0.15 in the starting preset; any other behaviour of the subclass is not traced. Evidence: `crates/thedas-audio/src/area.rs:74`. Size: M. Depends: none. Kind: unverified.
 - **AUD-039** **Occlusion and obstruction.** Original: occlusion. Ours: no code found. Evidence: `crates/thedas-audio/src/engine.rs:837`. Size: L. Depends: AUD-004. Kind: missing.
 - **AUD-040** **Placed sounds' reach and replay are guessed.** Original: not traced. Ours: a placed sound starts within 1.1 x its event's max distance times `MaxDistanceMult` and stops outside; a one-shot that finished plays again only after the listener leaves and returns. Orientation fields are not read. Evidence: `crates/thedas-app/src/audio.rs:1231`, `crates/thedas-audio/src/area.rs:66`. Size: S. Depends: none. Kind: unverified.

@@ -496,6 +496,11 @@ impl Live {
         let before = self.camera_seen.replace(now);
         let (area, cut) = before?;
         let due = area != now.0 || (cut && !now.1);
+        if due {
+            // The roof cutaway takes its state at once on the camera's reset too (the
+            // activation forces it, 0x771019), not only in a new area.
+            self.cutaway.0.high = None;
+        }
         heading.filter(|_| due)
     }
 

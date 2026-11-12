@@ -258,6 +258,7 @@ Scope: `crates/thedas-render`, `crates/thedas-shader`, the rendering-facing read
 - **RND-152** **No GPU timing instrumentation.** Original: not traced. Ours: CPU-side counts in `RenderStats` only. Every pass sets `timestamp_writes: None`, and no frame-time profiler was found. Evidence: `crates/thedas-render/src/gpu.rs:1287`, `crates/thedas-render/src/gpu.rs:465`. Size: S. Depends: none. Kind: missing.
 - **RND-153** **Constants are rebuilt per draw.** Original: not traced. Ours: one constant slot per draw, with per-frame constants refilled for every draw in view. There is no instancing for repeated meshes. Evidence: `crates/thedas-render/src/d3d_gpu.rs:2008`. Size: M. Depends: none. Kind: unverified.
 - **RND-154** **DA2 rendering formats are not supported.** Original: DA2 rendering formats. Ours: no code found in the renderer. Only the ERF V3.0 container is recognised in `thedas-vfs`. Evidence: `crates/thedas-vfs/src/erf.rs:8`. Size: L. Depends: none. Kind: missing.
+- **RND-155** **Emitters in a cut-away model do not fade with it.** Original: emitters of a model that has a `CutAway` mesh take the cutaway value (tactical-cutaway trace, 0x466930). Ours: `AreaRenderer::set_cutaway` sets only the cut-away mesh draws' opacity; emitter draws have no opacity path. Evidence: `crates/thedas-render/src/gpu.rs` (`set_cutaway`), `OpenThedas-testdata/notes/tactical-cutaway-trace.md`. Size: S. Depends: none. Kind: gap.
 
 ### Checked and looks complete
 

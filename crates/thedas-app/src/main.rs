@@ -452,6 +452,12 @@ fn capture(
             let avg = ms.iter().sum::<f64>() / ms.len() as f64;
             let worst = ms.iter().cloned().fold(0.0, f64::max);
             println!("bench: {n} frames, avg {avg:.1} ms, worst {worst:.1} ms");
+            // THEDAS_BENCH_DUMP: every frame's time too, in order (to tell a first-frame
+            // cost from a recurring one).
+            if std::env::var_os("THEDAS_BENCH_DUMP").is_some() {
+                let all: Vec<String> = ms.iter().map(|m| format!("{m:.1}")).collect();
+                println!("bench frames: {}", all.join(" "));
+            }
         }
         live.capture(ctx, &camera, (w, h))?
             .unwrap_or_else(|| [0, 0, 0, 255].repeat(w as usize * h as usize))
@@ -1605,6 +1611,12 @@ impl App {
             }
             &Step::ZoomKey(dir) => {
                 self.zoom_key = dir;
+            }
+            Step::Transition(area, waypoint) => {
+                if let Some(l) = self.live.as_ref() {
+                    l.sim().world.transition = Some((area.clone(), waypoint.clone()));
+                }
+                log.push(format!("transition {area} {waypoint}"));
             }
             Step::Floaty(text) => {
                 if let Some(l) = self.live.as_ref() {
@@ -2822,6 +2834,9 @@ enum Step {
     /// `option GameOptions.ShowTutorials 0`: a player setting, as the options screen sets it
     /// (the interface keeps it, the simulation hears it).
     ClientOption(String, String),
+    /// `transition AREA WAYPOINT`: the party moves to another area as a script's
+    /// `DoAreaTransition` moves it (taken when the current scripts finish).
+    Transition(String, String),
     /// `key pagedown MS` / `key pageup MS`: the zoom keys held (+1 in, -1 out, 0 let go).
     ZoomKey(f32),
     /// A floating message over the controlled creature, as a script's
@@ -2980,6 +2995,15 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
                 ms.trim().parse().context("a held key takes milliseconds")?,
             ));
             out.push(Step::ZoomKey(0.0));
+        } else if verb == "transition" {
+            let (area, waypoint) = arg
+                .trim()
+                .split_once(' ')
+                .context("transition takes an area and a waypoint")?;
+            out.push(Step::Transition(
+                area.trim().to_string(),
+                waypoint.trim().to_string(),
+            ));
         } else if verb == "option" {
             let (k, v) = arg
                 .trim()
@@ -3459,6 +3483,10 @@ fn main() -> Result<()> {
                         println!("option {k} = {v}");
                     }
                     &Step::ZoomKey(dir) => zoom_key = dir,
+                    Step::Transition(area, waypoint) => {
+                        l.sim().world.transition = Some((area.clone(), waypoint.clone()));
+                        println!("transition {area} {waypoint}");
+                    }
                     Step::Floaty(text) => {
                         test_floaty(&mut l.sim(), text);
                         println!("floaty {text:?}");
