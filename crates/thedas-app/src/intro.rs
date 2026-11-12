@@ -7,6 +7,8 @@
 //! play silent (there is no audio yet). A key, a click or the pad's A, B or Start skips the
 //! movie playing (the exe's skip input is not traced). The options' `DisableIntroMovies`
 //! (and the exe's `FirstRun` gate) are not read; `--no-intro` skips them.
+//!
+//! The same player shows the movies cutscenes play ([`CutsceneMovies`]).
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -90,7 +92,7 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
 }
 
 /// A movie decoding as it plays.
-struct Playing {
+pub(crate) struct Playing {
     name: String,
     header: BinkHeader,
     child: Child,
@@ -99,13 +101,17 @@ struct Playing {
     ms: f64,
     /// Frames taken from the decoder so far.
     taken: u64,
-    /// The frame on screen, until it is uploaded.
-    pending: Option<Vec<u8>>,
+    /// The frame on screen, and whether it has changed since it was last uploaded.
+    frame: Option<Vec<u8>>,
+    fresh: bool,
     texture: Option<(wgpu::Texture, wgpu::BindGroup)>,
 }
 
+/// How long a decoder that has to keep up (a capture) is waited for, for one frame.
+const DECODE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl Playing {
-    fn start(ffmpeg: &Path, path: &Path) -> Option<Self> {
+    pub(crate) fn start(ffmpeg: &Path, path: &Path) -> Option<Self> {
         let name = path.file_name()?.to_string_lossy().into_owned();
         let mut head = [0u8; 64];
         let header = std::fs::File::open(path)
@@ -113,7 +119,7 @@ impl Playing {
             .ok()
             .and_then(|()| BinkHeader::parse(&head));
         let Some(header) = header else {
-            log::warn!("intro: {} is missing or not a Bink movie", path.display());
+            log::warn!("movie: {} is missing or not a Bink movie", path.display());
             return None;
         };
         let mut child = Command::new(ffmpeg)
@@ -124,14 +130,14 @@ impl Playing {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|e| log::warn!("intro: {} could not start: {e}", ffmpeg.display()))
+            .map_err(|e| log::warn!("movie: {} could not start: {e}", ffmpeg.display()))
             .ok()?;
         let mut out = child.stdout.take()?;
         let bytes = header.frame_bytes();
         // A few frames ahead; the decoder waits when the player falls behind.
         let (tx, frames) = sync_channel(6);
         std::thread::Builder::new()
-            .name(format!("intro {name}"))
+            .name(format!("movie {name}"))
             .spawn(move || {
                 loop {
                     let mut f = vec![0u8; bytes];
@@ -142,7 +148,7 @@ impl Playing {
             })
             .ok()?;
         log::info!(
-            "intro: {name} {}x{} {} frames at {:.2} fps",
+            "movie: {name} {}x{} {} frames at {:.2} fps",
             header.width,
             header.height,
             header.frames,
@@ -155,30 +161,171 @@ impl Playing {
             frames,
             ms: 0.0,
             taken: 0,
-            pending: None,
+            frame: None,
+            fresh: false,
             texture: None,
         })
     }
 
-    /// Runs `dt` milliseconds on; false once the movie has ended.
-    fn advance(&mut self, dt: f64) -> bool {
+    /// Takes every frame due by now (the latest is the one shown); `wait` waits for a
+    /// decoder that has fallen behind. False once the decoder has ended.
+    fn take_due(&mut self, wait: bool) -> bool {
         let due = self.header.frame_at(self.ms);
-        // Every frame due is taken; the latest is the one shown.
         while self.taken <= due {
-            match self.frames.try_recv() {
+            let got = match wait {
+                true => self.frames.recv_timeout(DECODE_WAIT).map_err(|e| match e {
+                    std::sync::mpsc::RecvTimeoutError::Timeout => TryRecvError::Empty,
+                    std::sync::mpsc::RecvTimeoutError::Disconnected => TryRecvError::Disconnected,
+                }),
+                false => self.frames.try_recv(),
+            };
+            match got {
                 Ok(f) => {
-                    self.pending = Some(f);
+                    self.frame = Some(f);
+                    self.fresh = true;
                     self.taken += 1;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return false,
             }
         }
+        true
+    }
+
+    /// Runs `dt` milliseconds on; false once the movie has ended.
+    fn advance(&mut self, dt: f64) -> bool {
+        if !self.take_due(false) {
+            return false;
+        }
         // The clock waits for a decoder that has fallen behind (and for the first frame).
-        if self.taken > due {
+        if self.taken > self.header.frame_at(self.ms) {
             self.ms += dt;
         }
         true
+    }
+
+    /// Plays on to `ms` into the movie, a clock kept by someone else (a cutscene's); false
+    /// once the movie has ended.
+    pub(crate) fn advance_to(&mut self, ms: f64, wait: bool) -> bool {
+        self.ms = self.ms.max(ms);
+        self.take_due(wait)
+    }
+
+    /// Frames shown so far.
+    pub(crate) fn taken(&self) -> u64 {
+        self.taken
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Draws the frame showing into `pass`, letterboxed in `size` (nothing before the first).
+    fn draw(
+        &mut self,
+        comp: &Composite,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'_>,
+        size: (u32, u32),
+    ) {
+        let (w, h) = (self.header.width, self.header.height);
+        let (tex, group) = self.texture.get_or_insert_with(|| {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("movie frame"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                // The frames are sRGB-encoded, as the (non-sRGB) surface is: they pass through.
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&Default::default());
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("movie frame"),
+                layout: &comp.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&comp.sampler),
+                    },
+                ],
+            });
+            (tex, group)
+        });
+        let Some(f) = self.frame.as_ref() else {
+            // Nothing decoded yet: black.
+            return;
+        };
+        if std::mem::take(&mut self.fresh) {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                f,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        let (x, y, dw, dh) = letterbox(w, h, size);
+        pass.set_viewport(x, y, dw, dh, 0.0, 1.0);
+        pass.set_pipeline(&comp.pipeline);
+        pass.set_bind_group(0, &*group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// The frame showing letterboxed into a black `size` RGBA8 image (black before the
+    /// first frame).
+    pub(crate) fn rgba(&self, size: (u32, u32)) -> Vec<u8> {
+        let mut out = [0, 0, 0, 255].repeat(size.0 as usize * size.1 as usize);
+        if let Some(f) = self.frame.as_ref() {
+            blit_letterboxed(f, (self.header.width, self.header.height), &mut out, size);
+        }
+        out
+    }
+}
+
+/// Scales an RGBA8 `frame` of `fsize` into `out` (`size`), letterboxed (nearest texel).
+fn blit_letterboxed(frame: &[u8], fsize: (u32, u32), out: &mut [u8], size: (u32, u32)) {
+    let (fw, fh) = (fsize.0 as usize, fsize.1 as usize);
+    if fw == 0 || fh == 0 || frame.len() < fw * fh * 4 || out.len() < (size.0 * size.1 * 4) as usize
+    {
+        return;
+    }
+    let (x0, y0, dw, dh) = letterbox(fsize.0, fsize.1, size);
+    let (x0, y0) = (x0.round() as usize, y0.round() as usize);
+    let (dw, dh) = (dw.round() as usize, dh.round() as usize);
+    let sw = size.0 as usize;
+    for y in 0..dh.min(size.1 as usize - y0.min(size.1 as usize)) {
+        let sy = (y * fh / dh.max(1)).min(fh - 1);
+        for x in 0..dw.min(sw - x0.min(sw)) {
+            let sx = (x * fw / dw.max(1)).min(fw - 1);
+            let s = (sy * fw + sx) * 4;
+            let o = ((y0 + y) * sw + x0 + x) * 4;
+            out[o..o + 3].copy_from_slice(&frame[s..s + 3]);
+            out[o + 3] = 255;
+        }
     }
 }
 
@@ -187,6 +334,27 @@ impl Drop for Playing {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// A render pass over `target` cleared to black.
+fn black_pass<'e>(
+    encoder: &'e mut wgpu::CommandEncoder,
+    target: &wgpu::TextureView,
+    label: &'static str,
+) -> wgpu::RenderPass<'e> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        ..Default::default()
+    })
 }
 
 /// The boot movies, played in turn.
@@ -263,86 +431,171 @@ impl Intro {
         let comp = self
             .composite
             .get_or_insert_with(|| Composite::new(device, format));
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("intro"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..Default::default()
-        });
-        let Some(p) = self.playing.as_mut() else {
-            return;
+        let mut pass = black_pass(encoder, target, "intro");
+        if let Some(p) = self.playing.as_mut() {
+            p.draw(comp, device, queue, &mut pass, size);
+        }
+    }
+}
+
+/// The movies a cutscene plays full screen (its `APBM` tracks; see
+/// [`thedas_sim::cutscene::movies`]), kept in step with the cutscene's clock as the
+/// executable's `ActionPlayMovie` does (0x7ce740 hands the movie player the cutscene's time
+/// every tick).
+///
+/// While one of its movies is due the movie is all that is drawn of the world (the
+/// cutscene's own interface, its subtitles, goes over it). Provisional, not traced: what
+/// shows after a movie ends and before the cutscene does (black here), and how the movie
+/// player catches up with a clock that ran ahead (frames are dropped). The movies play
+/// silent: there is no audio yet (nor the cutscene's own sound track).
+#[derive(Default)]
+pub struct CutsceneMovies {
+    /// The cutscene followed (its resource name), and its movies.
+    cutscene: Option<String>,
+    tracks: Vec<thedas_sim::cutscene::CutsceneMovie>,
+    /// The track playing, and its movie (None once it has ended).
+    playing: Option<(usize, Option<Playing>)>,
+    /// Whether the last [`CutsceneMovies::follow`] found a movie due.
+    shown: bool,
+    composite: Option<Composite>,
+}
+
+/// What [`CutsceneMovies::follow`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MovieState {
+    /// No movie is due: the world is drawn.
+    None,
+    /// A movie is due: it is drawn instead of the world.
+    Showing,
+    /// A movie is due that cannot play (no `ffmpeg`, the movie missing or undecodable):
+    /// the cutscene should end now rather than show the world standing still.
+    CannotPlay,
+}
+
+impl CutsceneMovies {
+    /// Follows the cutscene playing (`(resource, ms played)`), reading its movies from
+    /// `vfs` when it starts; `wait` waits for the decoder (a capture, which must show the
+    /// frame due).
+    pub fn follow(
+        &mut self,
+        cutscene: Option<(&str, u64)>,
+        vfs: &thedas_vfs::Vfs,
+        install: &Path,
+        wait: bool,
+    ) -> MovieState {
+        let state = self.follow_inner(cutscene, vfs, install, wait);
+        self.shown = state == MovieState::Showing;
+        state
+    }
+
+    fn follow_inner(
+        &mut self,
+        cutscene: Option<(&str, u64)>,
+        vfs: &thedas_vfs::Vfs,
+        install: &Path,
+        wait: bool,
+    ) -> MovieState {
+        let Some((name, elapsed_ms)) = cutscene else {
+            if let Some(c) = self.cutscene.take() {
+                log::debug!("cutscene {c}: its movies stop");
+            }
+            self.tracks.clear();
+            self.playing = None;
+            return MovieState::None;
         };
-        let (w, h) = (p.header.width, p.header.height);
-        let (tex, group) = p.texture.get_or_insert_with(|| {
-            let tex = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("intro frame"),
-                size: wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                // The frames are sRGB-encoded, as the (non-sRGB) surface is: they pass through.
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            let view = tex.create_view(&Default::default());
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("intro frame"),
-                layout: &comp.layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&comp.sampler),
-                    },
-                ],
-            });
-            (tex, group)
-        });
-        if let Some(f) = p.pending.take() {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &f,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(w * 4),
-                    rows_per_image: Some(h),
-                },
-                wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-            );
+        if self.cutscene.as_deref() != Some(name) {
+            self.tracks = vfs
+                .read(name)
+                .map(|(data, _)| thedas_sim::cutscene::movies(&data))
+                .unwrap_or_default();
+            self.playing = None;
+            self.cutscene = Some(name.to_string());
+            if !self.tracks.is_empty() {
+                log::info!(
+                    "cutscene {name}: movies {:?}",
+                    self.tracks
+                        .iter()
+                        .map(|t| format!("{} at {:.2}s", t.name, t.start))
+                        .collect::<Vec<_>>()
+                );
+            }
         }
-        // Nothing decoded yet: black.
-        if p.taken == 0 {
-            return;
+        let t = elapsed_ms as f32 / 1000.0;
+        let Some(i) = self.tracks.iter().rposition(|m| m.start <= t && t < m.end) else {
+            // Between movies (or after the last): black once the first has started.
+            return match self.tracks.first() {
+                Some(m) if m.start <= t => {
+                    self.playing = None;
+                    MovieState::Showing
+                }
+                _ => MovieState::None,
+            };
+        };
+        if self.playing.as_ref().map(|p| p.0) != Some(i) {
+            let track = &self.tracks[i];
+            let path = install.join(MOVIES_DIR).join(format!("{}.bik", track.name));
+            let Some(p) = find_ffmpeg().and_then(|f| Playing::start(&f, &path)) else {
+                log::warn!(
+                    "cutscene {name}: movie {} cannot play (no ffmpeg, or the movie is \
+                     missing), so the cutscene ends",
+                    path.display()
+                );
+                self.playing = None;
+                return MovieState::CannotPlay;
+            };
+            log::info!("cutscene {name}: movie {} plays", p.name());
+            self.playing = Some((i, Some(p)));
         }
-        let (x, y, dw, dh) = letterbox(w, h, size);
-        pass.set_viewport(x, y, dw, dh, 0.0, 1.0);
-        pass.set_pipeline(&comp.pipeline);
-        pass.set_bind_group(0, &*group, &[]);
-        pass.draw(0..3, 0..1);
+        let start = self.tracks[i].start as f64;
+        if let Some((_, slot)) = self.playing.as_mut()
+            && let Some(p) = slot.as_mut()
+            && !p.advance_to(elapsed_ms as f64 - start * 1000.0, wait)
+        {
+            if p.taken() == 0 {
+                log::warn!(
+                    "cutscene {name}: movie {} gave no frames, so the cutscene ends",
+                    p.name()
+                );
+                *slot = None;
+                return MovieState::CannotPlay;
+            }
+            log::info!("cutscene {name}: movie {} ended", p.name());
+            *slot = None;
+        }
+        MovieState::Showing
+    }
+
+    /// Whether a movie is due (drawn instead of the world), as the last
+    /// [`CutsceneMovies::follow`] found.
+    pub fn showing(&self) -> bool {
+        self.shown
+    }
+
+    /// Draws the movie due over `target`, black around it (all black between movies).
+    pub fn draw(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        format: wgpu::TextureFormat,
+        size: (u32, u32),
+    ) {
+        let comp = self
+            .composite
+            .get_or_insert_with(|| Composite::new(device, format));
+        let mut pass = black_pass(encoder, target, "cutscene movie");
+        if let Some((_, Some(p))) = self.playing.as_mut() {
+            p.draw(comp, device, queue, &mut pass, size);
+        }
+    }
+
+    /// The movie due as RGBA8 pixels of `size`, letterboxed (black between movies).
+    pub fn rgba(&self, size: (u32, u32)) -> Vec<u8> {
+        match &self.playing {
+            Some((_, Some(p))) => p.rgba(size),
+            _ => [0, 0, 0, 255].repeat(size.0 as usize * size.1 as usize),
+        }
     }
 }
 
@@ -415,6 +668,24 @@ mod tests {
         for (name, frames, taken) in &seen {
             assert_eq!(u64::from(*frames), *taken, "{name}");
         }
+    }
+
+    #[test]
+    fn a_frame_is_scaled_into_the_letterbox() {
+        // A 2x1 frame (red, green) into a 4x4 image: two rows of bars, red then green.
+        let frame = [255, 0, 0, 255, 0, 255, 0, 255];
+        let mut out = [0, 0, 0, 255].repeat(16);
+        blit_letterboxed(&frame, (2, 1), &mut out, (4, 4));
+        let px = |x: usize, y: usize| &out[(y * 4 + x) * 4..(y * 4 + x) * 4 + 3];
+        assert_eq!(px(0, 0), [0, 0, 0]);
+        assert_eq!(px(0, 1), [255, 0, 0]);
+        assert_eq!(px(1, 2), [255, 0, 0]);
+        assert_eq!(px(3, 2), [0, 255, 0]);
+        assert_eq!(px(3, 3), [0, 0, 0]);
+        // A short frame buffer draws nothing.
+        let mut out2 = [0, 0, 0, 255].repeat(16);
+        blit_letterboxed(&frame[..4], (2, 1), &mut out2, (4, 4));
+        assert!(out2.chunks(4).all(|p| p == [0, 0, 0, 255]));
     }
 
     #[test]
