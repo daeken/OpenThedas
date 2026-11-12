@@ -280,6 +280,56 @@ impl Sim {
                 view.active.push(quest);
             }
         }
+        // A sub-quest's parent quest is listed too, as the heading it sits under, though it
+        // has no entry of its own yet: journal.gfx places a sub-quest under its parent's
+        // line and drops it (and an empty group) when the parent is not listed. The Dalish
+        // opening's "Humans Near the Camp" sits under plt_bed000pt_main, which writes no
+        // entry. Provisional: the exe's own listing rule is not traced.
+        for completed in [false, true] {
+            let mut i = 0;
+            loop {
+                let list = if completed {
+                    &view.completed
+                } else {
+                    &view.active
+                };
+                let Some(q) = list.get(i) else { break };
+                i += 1;
+                let Some(parent) = q.parent.clone() else {
+                    continue;
+                };
+                let listed = view
+                    .active
+                    .iter()
+                    .chain(view.completed.iter())
+                    .any(|x| x.resref == parent);
+                if listed {
+                    continue;
+                }
+                let Some(info) = find(&parent) else { continue };
+                let grand = info
+                    .parent
+                    .as_deref()
+                    .and_then(find)
+                    .filter(|g| g.kind != KIND_GROUP)
+                    .map(|g| g.resref.clone());
+                let heading = QuestView {
+                    resref: info.resref.clone(),
+                    name: info.name_strref,
+                    description: None,
+                    completed,
+                    group: q.group.clone(),
+                    parent: grand,
+                    seq: q.seq,
+                    updated: false,
+                };
+                if completed {
+                    view.completed.push(heading);
+                } else {
+                    view.active.push(heading);
+                }
+            }
+        }
         for list in [&mut view.active, &mut view.completed] {
             list.sort_by(|a, b| b.seq.cmp(&a.seq).then(a.resref.cmp(&b.resref)));
         }
@@ -472,6 +522,28 @@ mod tests {
         assert_eq!(s.journal().active, Vec::new());
 
         let o = OBJECT_INVALID;
+        // A sub-quest's entry alone lists its parent too, as its heading (no entry of its own).
+        s.set_plot_flag("lot100pt_bears_sub", 0, true, false, o);
+        let j = s.journal();
+        let names: Vec<(&str, Option<u32>, Option<&str>)> = j
+            .active
+            .iter()
+            .map(|q| (q.resref.as_str(), q.description, q.parent.as_deref()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("plt_lot100pt_bears", None, None),
+                (
+                    "plt_lot100pt_bears_sub",
+                    Some(600),
+                    Some("plt_lot100pt_bears")
+                ),
+            ]
+        );
+        assert_eq!(j.active[0].group, "plt_lot_plot_group");
+        assert_eq!(j.groups.len(), 1);
+        s.set_plot_flag("lot100pt_bears_sub", 0, false, false, o);
         s.set_plot_flag("lot100pt_bears", 1, true, false, o);
         s.set_plot_flag("lot100pt_bears", 0, true, false, o);
         s.set_plot_flag("lot100pt_bears_sub", 0, true, false, o);
