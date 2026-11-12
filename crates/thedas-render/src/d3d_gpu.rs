@@ -92,6 +92,14 @@ pub(crate) struct D3dCache {
 
 pub(crate) struct D3dPass {
     pipelines: Vec<D3dPipeline>,
+    /// Per pipeline, its faded variant (see [`Self::set_opacity`]), made when first needed.
+    faded: Vec<Option<wgpu::RenderPipeline>>,
+    /// Per pipeline, its texture bindings' layout (for the faded variants).
+    layouts: Vec<wgpu::BindGroupLayout>,
+    fade_consts: wgpu::BindGroupLayout,
+    color_format: wgpu::TextureFormat,
+    /// Per scene draw, the opacity its object is drawn at (1: as its material says).
+    opacity: Vec<f32>,
     pub draws: Vec<D3dDraw>,
     buffer: Option<wgpu::Buffer>,
     materials: Vec<SceneMaterial>,
@@ -1019,12 +1027,42 @@ fn const_group(
     })
 }
 
+/// Multiplies a stage's engine fade (`mml_fOpacityMultiplier`) by `opacity`.
+fn fade_constants(
+    table: Option<&thedas_shader::ctab::ConstantTable>,
+    c: &mut crate::d3d::StageConstants,
+    opacity: f32,
+) {
+    let Some(t) = table else { return };
+    for k in &t.constants {
+        if k.name == "mml_fOpacityMultiplier"
+            && k.set == thedas_shader::ctab::RegisterSet::Float4
+            && let Some(r) = c.floats.get_mut(k.register as usize)
+        {
+            r[0] *= opacity;
+        }
+    }
+}
+
 fn create_pipeline(
     device: &wgpu::Device,
     program: &D3dProgram,
     consts: &wgpu::BindGroupLayout,
     textures: &wgpu::BindGroupLayout,
     color_format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    create_pipeline_faded(device, program, consts, textures, color_format, false)
+}
+
+/// [`create_pipeline`]; `faded` blends an opaque pass by its output alpha
+/// (`SrcAlpha`, `InvSrcAlpha`), for an object drawn at an opacity below 1.
+fn create_pipeline_faded(
+    device: &wgpu::Device,
+    program: &D3dProgram,
+    consts: &wgpu::BindGroupLayout,
+    textures: &wgpu::BindGroupLayout,
+    color_format: wgpu::TextureFormat,
+    faded: bool,
 ) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(&program.name),
@@ -1072,6 +1110,7 @@ fn create_pipeline(
         };
         wgpu::BlendState { color: c, alpha: c }
     });
+    let blend = blend.or(faded.then_some(wgpu::BlendState::ALPHA_BLENDING));
     let mut write = wgpu::ColorWrites::empty();
     for (bit, w) in [
         (1, wgpu::ColorWrites::RED),
@@ -1622,7 +1661,12 @@ impl D3dPass {
             .as_ref()
             .map(|a| crate::atmosphere::celestial(a, scene.sunlight_direction));
         D3dPass {
+            faded: pipelines.iter().map(|_| None).collect(),
             pipelines,
+            layouts,
+            fade_consts: consts_layout,
+            color_format,
+            opacity: vec![1.0; scene.draws.len()],
             draws,
             buffer,
             materials: scene.materials.clone(),
@@ -1811,6 +1855,56 @@ impl D3dPass {
             .for_each(|s| *s = None);
     }
 
+    /// Draws scene draw `draw` at `opacity` (0..1) of its material's: its shaders' engine
+    /// fade (`mml_fOpacityMultiplier`, which the character pixel shaders write as their
+    /// alpha, `Ch1.psh`: `mov oC0.w, c27.x`) is multiplied by it, and below 1 its opaque
+    /// passes blend by that alpha. DAOrigins.exe fades a creature the camera is inside to
+    /// 0.05 (0x6c4130, the object's `+0x190`); provisional: how the exe blends a faded
+    /// opaque pass is not traced.
+    pub fn set_opacity(&mut self, ctx: &GpuContext, draw: usize, opacity: f32) {
+        let opacity = if opacity.is_finite() {
+            opacity.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let Some(o) = self.opacity.get_mut(draw) else {
+            return;
+        };
+        *o = opacity;
+        if opacity >= 1.0 {
+            return;
+        }
+        for k in 0..self.draws.len() {
+            let d = &self.draws[k];
+            if d.draw != draw || self.pipelines[d.pipeline].blended {
+                continue;
+            }
+            let pi = d.pipeline;
+            if self.faded[pi].is_none() {
+                self.faded[pi] = Some(create_pipeline_faded(
+                    &ctx.device,
+                    &self.pipelines[pi].program,
+                    &self.fade_consts,
+                    &self.layouts[pi],
+                    self.color_format,
+                    true,
+                ));
+            }
+        }
+    }
+
+    /// Whether `d` draws faded this frame (see [`Self::set_opacity`]).
+    pub fn is_faded(&self, d: &D3dDraw) -> bool {
+        self.opacity.get(d.draw).is_some_and(|&o| o < 1.0)
+    }
+
+    fn faded_pipeline(&self, d: &D3dDraw) -> Option<&wgpu::RenderPipeline> {
+        if !self.is_faded(d) {
+            return None;
+        }
+        self.faded.get(d.pipeline)?.as_ref()
+    }
+
     pub fn is_blended(&self, d: &D3dDraw) -> bool {
         self.pipelines[d.pipeline].blended
     }
@@ -1993,10 +2087,14 @@ impl D3dPass {
                     (st, per_frame)
                 }))
             });
+            let opacity = self.opacity.get(d.draw).copied().unwrap_or(1.0);
             for (stage, (table, base)) in tables.into_iter().zip([0, 3]).enumerate() {
                 let (st, per_frame) = &fixed[stage];
                 let mut c = st.clone();
                 cc.fill_into(table, &mut c, |k| per_frame.get(k) == Some(&true));
+                if opacity < 1.0 {
+                    fade_constants(table, &mut c, opacity);
+                }
                 put(data, &c, base);
             }
             statics[i] = Some(fixed);
@@ -2239,7 +2337,10 @@ impl D3dPass {
         indices: &wgpu::Buffer,
         count: u32,
     ) {
-        pass.set_pipeline(&self.pipelines[d.pipeline].pipeline);
+        let faded = self
+            .faded_pipeline(d)
+            .unwrap_or(&self.pipelines[d.pipeline].pipeline);
+        pass.set_pipeline(faded);
         pass.set_bind_group(0, &d.consts, &[]);
         pass.set_bind_group(1, &d.textures, &[]);
         pass.set_vertex_buffer(0, d.vertices.slice(..));
@@ -2251,6 +2352,34 @@ impl D3dPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fading_scales_only_the_engine_fade() {
+        use thedas_shader::ctab::{Constant, ConstantTable, ParamClass, RegisterSet};
+        let k = |name: &str, register| Constant {
+            name: name.into(),
+            set: RegisterSet::Float4,
+            register,
+            count: 1,
+            class: ParamClass::Scalar,
+            ty: 3,
+            rows: 1,
+            columns: 1,
+            elements: 1,
+            default: None,
+        };
+        let table = ConstantTable {
+            creator: String::new(),
+            target: String::new(),
+            constants: vec![k("mml_fOpacityMultiplier", 27), k("mml_fSpecularPower", 3)],
+        };
+        let mut c = crate::d3d::StageConstants::default();
+        c.floats[27] = [1.0, 0.0, 0.0, 0.0];
+        c.floats[3] = [8.0, 0.0, 0.0, 0.0];
+        fade_constants(Some(&table), &mut c, 0.05);
+        assert_eq!(c.floats[27][0], 0.05);
+        assert_eq!(c.floats[3][0], 8.0);
+    }
 
     #[test]
     fn merged_spheres_hold_both() {
