@@ -4,10 +4,11 @@
 //! groups and ranges are the interface's (`thedas_ui`).
 //!
 //! What a choice does to the face: the preset puts that head on; hair and beard put their
-//! models in the morph's slots; the colours put their tints in its tint slots. Provisional:
-//! the face-shape sliders weigh their morph targets (the exe's pairs, read back at 0x805f40,
-//! and its per-race scales at 0x7fdd00). Provisional: the makeup intensities, tattoos,
-//! complexion and the eye and nose shape lists are kept but not yet put on the face.
+//! models in the morph's slots; the colours put their tints in its tint slots; the
+//! face-shape sliders weigh their morph targets (the exe's pairs, read back at 0x805f40,
+//! and its per-race scales at 0x7fdd00); the makeup intensities set the face's tint
+//! opacities and the complexion its diffuse texture. Provisional: tattoos are kept but not
+//! yet put on the face.
 
 use thedas_formats::morph::{FaceOverlay, slot};
 use thedas_script::vm::ObjectId;
@@ -33,6 +34,11 @@ pub const LIP_COLOR: u32 = 48;
 pub const EYE_SHADOW_COLOR: u32 = 8;
 pub const EYE_COLOR: u32 = 7;
 pub const BROW_COLOR: u32 = 39;
+/// The makeup intensity sliders and the complexion.
+pub const LIP_INTENSITY: u32 = 49;
+pub const EYE_SHADOW_INTENSITY: u32 = 9;
+pub const BLUSH_INTENSITY: u32 = 47;
+pub const COMPLEXION: u32 = 44;
 
 /// The face-shape sliders' morph targets (slider id, the target its negative side
 /// weighs, the one its positive side weighs; one target: the slider weighs it alone).
@@ -541,6 +547,44 @@ pub fn overlay(sim: &Sim, id: ObjectId) -> FaceOverlay {
     for (&slider, &v) in &obj.face_choices {
         o.targets.extend(feature_weights(slider, v, row));
         o.targets.extend(shape_weights(slider, v, row));
+    }
+    // Makeup intensities: the face's tint opacity for that channel (the exe's setters
+    // 0x8041d0 lips, 0x803450 eye shadow, 0x8040d0 blush write FaceM1's
+    // mml_vTintMaskColours components 0, 1 and 2).
+    for (slider, index) in [
+        (LIP_INTENSITY, 0),
+        (EYE_SHADOW_INTENSITY, 1),
+        (BLUSH_INTENSITY, 2),
+    ] {
+        if let Some(&v) = obj.face_choices.get(&slider) {
+            o.scalars.push((
+                "FaceM1".into(),
+                "mml_vTintMaskColours".into(),
+                index,
+                v.clamp(0.0, 1.0),
+            ));
+        }
+    }
+    // Complexion: the face's diffuse texture (0x805800 writes FaceM1's mml_tDiffuse).
+    if let Some(&v) = obj.face_choices.get(&COMPLEXION) {
+        if let Some(t) = sim
+            .face_list(id, "skins")
+            .get(v.max(0.0).round() as usize)
+            .filter(|t| !t.is_empty())
+        {
+            o.textures
+                .push(("FaceM1".into(), "mml_tDiffuse".into(), t.clone()));
+            // Its normal map goes with it, as the presets pair them (`uh_hed_fema_0d`,
+            // `uh_hed_fema_0n.dds`). Provisional: the exe's setter's second write is not
+            // traced.
+            if let Some(stem) = t.strip_suffix("_0d") {
+                o.textures.push((
+                    "FaceM1".into(),
+                    "mml_tNormalMap".into(),
+                    format!("{stem}_0n.dds"),
+                ));
+            }
+        }
     }
     // Colours: the tint each colour slider picks, in the morph's tint slot the exe's
     // setter writes (lips 1, eyes 2, hair 3, eye shadow 4, blush 5, skin 0, brows and
