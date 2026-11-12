@@ -583,14 +583,14 @@ pub fn call(
             let n = (int(a, 2).max(0) as usize).min(s.len() - start);
             ok(Value::String(s[start..start + n].iter().collect()))
         }
+        // Counted in characters, as SubString, StringLeft and StringRight are.
         "FindSubString" => {
-            let s = string(a, 0);
+            let s: Vec<char> = string(a, 0).chars().collect();
+            let sub: Vec<char> = string(a, 1).chars().collect();
             let start = int(a, 2).max(0) as usize;
-            ok(Value::Int(
-                s.get(start..)
-                    .and_then(|r| r.find(&string(a, 1)))
-                    .map_or(-1, |i| (i + start) as i32),
-            ))
+            let found = (start..=s.len().saturating_sub(sub.len()))
+                .find(|&i| i + sub.len() <= s.len() && s[i..i + sub.len()] == sub[..]);
+            ok(Value::Int(found.map_or(-1, |i| i as i32)))
         }
         "abs" => ok(Value::Int(int(a, 0).wrapping_abs())),
         "fabs" => ok(Value::Float(float(a, 0).abs())),
@@ -1721,10 +1721,13 @@ pub fn call(
                 })
                 .take(if n < 0 { usize::MAX } else { n as usize })
                 .collect();
+            // A worn item is taken off first (its effects end, the wearer hears UNEQUIP),
+            // as DestroyObject does.
+            for &i in &items {
+                h.sim.unequip(who, i);
+            }
             if let Some(o) = h.sim.world.get_mut(who) {
                 o.inventory.retain(|i| !items.contains(i));
-                o.equipment.retain(|_, i| !items.contains(i));
-                o.other_set.retain(|_, i| !items.contains(i));
             }
             for i in items {
                 h.sim.world.objects.remove(&i);
@@ -2389,10 +2392,9 @@ pub fn call(
             let (from, to, item) = (obj(a, 0), obj(a, 1), obj(a, 2));
             let had = h.object(from).is_some_and(|o| o.inventory.contains(&item));
             if had && h.object(to).is_some() {
+                h.sim.unequip(from, item);
                 if let Some(o) = h.sim.world.get_mut(from) {
                     o.inventory.retain(|&i| i != item);
-                    o.equipment.retain(|_, i| *i != item);
-                    o.other_set.retain(|_, i| *i != item);
                 }
                 if let Some(o) = h.sim.world.get_mut(to) {
                     o.inventory.push(item);
@@ -4185,10 +4187,19 @@ pub fn call(
                     o.fields.insert("StackSize".into(), left);
                 }
             } else {
-                for o in h.sim.world.objects.values_mut() {
-                    o.inventory.retain(|&i| i != item);
-                    o.equipment.retain(|_, i| *i != item);
-                    o.other_set.retain(|_, i| *i != item);
+                let holders: Vec<ObjectId> = h
+                    .sim
+                    .world
+                    .objects
+                    .values()
+                    .filter(|o| o.inventory.contains(&item))
+                    .map(|o| o.id)
+                    .collect();
+                for holder in holders {
+                    h.sim.unequip(holder, item);
+                    if let Some(o) = h.sim.world.get_mut(holder) {
+                        o.inventory.retain(|&i| i != item);
+                    }
                 }
                 h.sim.world.objects.remove(&item);
             }
@@ -5317,6 +5328,21 @@ mod tests {
         s.world.get_mut(hero).unwrap().inventory.push(potion);
         run(&mut s, hero, "RemoveItem", &[o(potion), i(-1)]);
         assert!(s.world.get(potion).is_none());
+        // A worn item is taken off as it goes, not left in the equipment map.
+        let sword = s.world.spawn(ObjectKind::Item, "sword");
+        let h = s.world.get_mut(hero).unwrap();
+        h.inventory.push(sword);
+        h.equipment.insert(1, sword);
+        run(&mut s, hero, "RemoveItem", &[o(sword), i(-1)]);
+        assert!(s.world.get(sword).is_none());
+        assert!(
+            !s.world
+                .get(hero)
+                .unwrap()
+                .equipment
+                .values()
+                .any(|&x| x == sword)
+        );
         assert!(s.world.get(hero).unwrap().inventory.is_empty());
     }
 

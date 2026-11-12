@@ -33,7 +33,7 @@ so an untraced item starts with a trace, not with a guess.
 | Area | File | Inventory items |
 | --- | --- | --- |
 | Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 169 (`SIM-`) |
-| Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 97 (`SCR-`), plus the measured list of unimplemented functions |
+| Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 95 (`SCR-`), plus the measured list of unimplemented functions |
 | Rendering | [gaps/rendering.md](gaps/rendering.md) | 154 (`RND-`) |
 | Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 195 (`UI-`) |
 | Audio | [gaps/audio.md](gaps/audio.md) | 62 (`AUD-`) |
@@ -147,11 +147,8 @@ Concrete defects found during the code read. Each is small and independent.
 
 | ID | What |
 | --- | --- |
-| `SCR-037` | Removing or moving a worn item skips the unequip, so its effects stay on the wearer |
 | `SCR-059` | A command pushed to the front leaves the displaced command with its old timer |
 | `SCR-074` | Comparing two effects, locations or events compares handles, so equal values differ |
-| `SCR-034` | `GetM2DAColumns` ignores the table name |
-| `SCR-030` | `FindSubString` counts bytes where the other string functions count characters |
 | `SIM-148` | The module's start position is parsed and never used |
 | `SIM-092` | Equipped-item stat modifiers ignore material while `GetItemStat` scales by it |
 | `SIM-022` | `follow_leader` lines followers up behind the hero instead of using the formation |
