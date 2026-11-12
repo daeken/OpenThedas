@@ -711,7 +711,9 @@ impl UiLayer {
                 };
                 // The list's new save (slot -1) goes in the open slot.
                 let slot = if slot > 0 { slot } else { store.open_slot() };
-                let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+                let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+                // The module hears the save coming first (EVENT_TYPE_MODULE_PRESAVE).
+                sim.presave();
                 let area = sim
                     .world
                     .area

@@ -1903,6 +1903,7 @@ mod tests {
     use super::*;
 
     const LDF: &str = "int EVENT_TYPE_PERCEPTION_APPEAR = 25;\n\
+        int EVENT_TYPE_MANA_STAM_DEPLETED = 64;\n\
         int EVENT_TYPE_PERCEPTION_DISAPPEAR = 26;\n\
         int EVENT_TYPE_DEATH = 4;\n\
         int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
@@ -2191,6 +2192,36 @@ mod tests {
         assert!(s.world.get(c).unwrap().commands.is_empty());
         assert_eq!(impacts(&s), 1);
         assert_eq!(s.world.time_ms, t0 + 1567);
+    }
+
+    #[test]
+    fn mana_running_out_tells_the_creature_once() {
+        let mut s = sim();
+        let c = s.world.spawn(ObjectKind::Creature, "mage");
+        s.world
+            .get_mut(c)
+            .unwrap()
+            .properties
+            .insert(8, (10.0, 3.0));
+        let depleted = |s: &Sim| {
+            s.world
+                .queue
+                .values()
+                .filter(|q| q.target == c && q.event.ty == 64)
+                .count()
+        };
+        s.note_mana_change(c, 5.0);
+        assert_eq!(depleted(&s), 0, "still above 0");
+        s.world
+            .get_mut(c)
+            .unwrap()
+            .properties
+            .insert(8, (10.0, 0.0));
+        s.note_mana_change(c, 3.0);
+        assert_eq!(depleted(&s), 1);
+        // Already at 0: nothing more.
+        s.note_mana_change(c, 0.0);
+        assert_eq!(depleted(&s), 1);
     }
 
     #[test]
