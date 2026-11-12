@@ -3183,25 +3183,6 @@ fn main() -> Result<()> {
                             if !played.as_ref().is_some_and(|(_, s)| s.world_stopped()) {
                                 l.step(dt);
                             }
-                            if std::env::var("DBG_WALK").is_ok() {
-                                let sim = l.sim();
-                                if let Some(o) =
-                                    sim.world.controlled().and_then(|c| sim.world.get(c))
-                                {
-                                    eprintln!(
-                                        "DBGW t {} pos {:?} cmds {:?}",
-                                        sim.world.time_ms,
-                                        o.position,
-                                        o.commands
-                                            .iter()
-                                            .map(|c| (
-                                                c.name.clone(),
-                                                c.location.as_ref().map(|l| l.position)
-                                            ))
-                                            .collect::<Vec<_>>()
-                                    );
-                                }
-                            }
                             l.advance_presentation(dt);
                             // As the window does: the drawn scenes follow the world (objects
                             // that come and go are rebuilt).
