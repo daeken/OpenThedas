@@ -1590,21 +1590,33 @@ pub fn call(
             void()
         }
         "GetCreatureMoney" => ok(Value::Int(h.object(obj(a, 0)).map_or(0, |o| o.money))),
+        // DAOrigins.exe's shared handler (0x669ab0, commands 252-254) looks the ability up in
+        // the Abilities M2DA (column 0xe1a8f4ea, 0x669b4c) and does nothing for an id of 0 or
+        // below or one with no row; HasAbility answers false for it.
         "AddAbility" => {
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.abilities.insert(int(a, 1));
+            let id = int(a, 1);
+            if h.sim.ability_known(id)
+                && let Some(o) = h.sim.world.get_mut(obj(a, 0))
+            {
+                o.abilities.insert(id);
             }
             void()
         }
         "RemoveAbility" => {
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.abilities.remove(&int(a, 1));
+            let id = int(a, 1);
+            if h.sim.ability_known(id)
+                && let Some(o) = h.sim.world.get_mut(obj(a, 0))
+            {
+                o.abilities.remove(&id);
             }
             void()
         }
-        "HasAbility" => ok(b(h
-            .object(obj(a, 0))
-            .is_some_and(|o| o.abilities.contains(&int(a, 1))))),
+        "HasAbility" => {
+            let id = int(a, 1);
+            ok(b(h.sim.ability_known(id)
+                && h.object(obj(a, 0))
+                    .is_some_and(|o| o.abilities.contains(&id))))
+        }
         "IsModalAbilityActive" => ok(b(h.sim.modal_active(obj(a, 0), int(a, 1)))),
         "GetConditionedAbilities" => ok(Value::Array {
             elem: Type::Int,
