@@ -24,13 +24,16 @@ struct Bank {
 /// Decoded samples kept around, up to a byte budget.
 const CACHE_BYTES: usize = 768 << 20;
 
+/// Decoded samples by (lowercase bank, index), and their total bytes.
+type Cache = (HashMap<(String, usize), Arc<Pcm>>, usize);
+
 pub struct Library {
     /// Folders searched for `.fev`/`.fsb`, lowest priority first.
     pub dirs: Vec<PathBuf>,
     files: HashMap<String, PathBuf>,
     projects: Mutex<HashMap<String, Option<Arc<Fev>>>>,
     banks: Mutex<HashMap<String, Option<Arc<Bank>>>>,
-    cache: Mutex<(HashMap<(String, usize), Arc<Pcm>>, usize)>,
+    cache: Mutex<Cache>,
 }
 
 fn key(name: &str) -> String {
@@ -164,6 +167,13 @@ impl Library {
     /// The index of the sample named `sample` (with or without `.wav`) in bank `bank`.
     pub fn find_sample(&self, bank: &str, sample: &str) -> Option<usize> {
         self.bank(bank)?.fsb.find(sample).map(|(i, _)| i)
+    }
+
+    /// The length in seconds of the sample named `sample` in bank `bank` (from its header).
+    pub fn sample_seconds(&self, bank: &str, sample: &str) -> Option<f64> {
+        let b = self.bank(bank)?;
+        let (_, s) = b.fsb.find(sample)?;
+        (s.frequency > 0).then(|| s.length as f64 / s.frequency as f64)
     }
 
     /// Sample `index` of bank `bank`, decoded (cached).

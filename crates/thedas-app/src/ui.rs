@@ -286,6 +286,9 @@ struct Line {
     key: LineKey,
     /// Milliseconds it has been up.
     t: f64,
+    /// How long its voice-over runs (milliseconds), when it has one: it plays that long
+    /// instead of a reading time.
+    voice_ms: Option<f64>,
     /// Nothing to choose: it continues by itself once played.
     waits: bool,
     continued: bool,
@@ -293,7 +296,7 @@ struct Line {
 
 impl Line {
     fn played(&self) -> bool {
-        self.t >= line_ms(&self.key.1)
+        self.t >= self.voice_ms.unwrap_or_else(|| line_ms(&self.key.1))
     }
 }
 
@@ -311,6 +314,19 @@ pub fn line_ms(text: &str) -> f64 {
 }
 
 impl UiLayer {
+    /// The conversation line on screen speaks for this long (milliseconds; see
+    /// [`crate::audio`]), or has no voice-over.
+    pub fn set_line_voice_ms(&mut self, ms: Option<f64>) {
+        if let Some(l) = self.line.as_mut() {
+            l.voice_ms = ms;
+        }
+    }
+
+    /// A player setting (`AudioOptions.MusicVolume`) as the options screen keeps it.
+    pub fn client_option(&self, name: &str) -> Option<f64> {
+        self.shown.lock().ok()?.options.get(name).copied()
+    }
+
     /// Loads the movies at `size`; failures are logged and the movie is skipped.
     pub fn new(ctx: &GpuContext, vfs: &Arc<Vfs>, names: &[String], size: (u32, u32)) -> Self {
         let gpu = Gpu {
@@ -743,6 +759,7 @@ impl UiLayer {
             (Some((key, waits)), _) => Some(Line {
                 key,
                 t: 0.0,
+                voice_ms: None,
                 waits,
                 continued: false,
             }),
