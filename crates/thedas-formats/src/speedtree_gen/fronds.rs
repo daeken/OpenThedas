@@ -5,7 +5,8 @@
 //! Provisional until checked against the executable.
 
 use super::frame::{
-    Frame, Vec3, add, cos_deg, cross, dot, fast_sqrt, lerp, normalize, scale, sin_deg, sub,
+    Frame, Vec3, add, cos, cos_deg, cross, dot, fast_sqrt, lerp, normalize, scale, sin, sin_deg,
+    sub,
 };
 use super::{Curve, Random, Skeleton};
 use crate::speedtree::{Fronds, SpeedTree};
@@ -349,11 +350,11 @@ fn extrusion(
         } else {
             0.5 * (pair(i - 1, i) + pair(i, i + 1)) + HALF_PI
         };
-        normals.push(normalize([0.0, angle.cos(), angle.sin()]));
+        normals.push(normalize([0.0, cos(angle), sin(angle)]));
         tangents.push(normalize([
             0.0,
-            -(angle + HALF_PI).cos(),
-            -(angle + HALF_PI).sin(),
+            -cos(angle + HALF_PI),
+            -sin(angle + HALF_PI),
         ]));
     }
     let verts = &branch.vertices;
