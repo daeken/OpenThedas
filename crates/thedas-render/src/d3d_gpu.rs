@@ -135,9 +135,20 @@ pub(crate) struct D3dPass {
     /// Sound while a draw's material, lightmap, lights, ambient, probe and the pass's sun,
     /// fog, sky and clouds are fixed when the pass is made: only [`D3dPass::set_world`] and
     /// [`D3dPass::set_bones`] change a draw afterwards, and both feed per-frame constants
-    /// (anything else that changes an object's look rebuilds its pass). A setter for any of
-    /// the fixed inputs must clear the draw's entry here.
+    /// (anything else that changes an object's look rebuilds its pass); the one exception
+    /// is a moved object's lights, re-picked by [`D3dPass::repick_lights`], which clears
+    /// the entry. A setter for any of the fixed inputs must clear the draw's entry here.
     statics: std::sync::Mutex<Vec<Option<Box<StaticConstants>>>>,
+    /// The scene's lights, for re-picking the lights of objects that move.
+    scene_lights: Vec<SceneLight>,
+    /// For each placed object ([`AreaScene::props`]), its draws (indices into `draws`),
+    /// attachments included: they share one light selection, as the exe's render object's
+    /// meshes share its light set.
+    prop_draws: Vec<Vec<usize>>,
+    /// Where each object stood when its lights were last picked.
+    prop_at: std::sync::Mutex<Vec<Option<Vec3>>>,
+    /// Each draw's lights as last re-picked for its object (`None`: as the pass was made).
+    relit: std::sync::Mutex<Vec<Option<DrawLights>>>,
     caster_programs: Vec<Arc<D3dProgram>>,
     /// The (empty) texture bindings of the casters' programs.
     empty_group: wgpu::BindGroup,
@@ -547,6 +558,81 @@ fn in_view(view_proj: &glam::Mat4, centre: Vec3, radius: f32) -> bool {
 }
 
 /// A mesh's bounding sphere in its own space (centre, radius): around its vertices' box.
+/// What [`repick`] reads: each object's draws, which draws are in view, the scene's lights,
+/// and by draw its position, bounds and the lights it was made with.
+struct RepickInput<'a> {
+    objects: &'a [Vec<usize>],
+    in_view: &'a [bool],
+    lights: &'a [SceneLight],
+    position: &'a dyn Fn(usize) -> Vec3,
+    sphere: &'a dyn Fn(usize) -> Option<(Vec3, f32)>,
+    initial: &'a dyn Fn(usize) -> &'a DrawLights,
+}
+
+/// The light re-selection of [`D3dPass::repick_lights`]: for each object in view whose first
+/// draw moved since `at` recorded it, picks lights for the union of its draws' bounds and
+/// stores them in `relit` for each draw whose lights change. Returns those draws. An object
+/// seen for the first time only records where it stands.
+fn repick(
+    input: &RepickInput<'_>,
+    at: &mut Vec<Option<Vec3>>,
+    relit: &mut Vec<Option<DrawLights>>,
+) -> Vec<usize> {
+    let mut changed = Vec::new();
+    let draws = input.in_view.len();
+    relit.resize(draws, None);
+    at.resize(input.objects.len(), None);
+    for (p, ks) in input.objects.iter().enumerate() {
+        if !ks.iter().any(|&k| input.in_view.get(k) == Some(&true)) {
+            continue;
+        }
+        let Some(&first) = ks.first() else { continue };
+        let here = (input.position)(first);
+        match at[p] {
+            None => {
+                at[p] = Some(here);
+                continue;
+            }
+            Some(was) if was.distance_squared(here) < 1e-6 => continue,
+            Some(_) => at[p] = Some(here),
+        }
+        let Some(bound) = ks
+            .iter()
+            .filter_map(|&k| (input.sphere)(k))
+            .reduce(merge_spheres)
+        else {
+            continue;
+        };
+        let lights = pick_lights(input.lights, bound, DOMAIN_CHARACTERS);
+        for &k in ks {
+            if k >= draws {
+                continue;
+            }
+            if *relit[k].as_ref().unwrap_or_else(|| (input.initial)(k)) != lights {
+                relit[k] = Some(lights.clone());
+                changed.push(k);
+            }
+        }
+    }
+    changed
+}
+
+/// The smallest sphere holding two spheres.
+fn merge_spheres(a: (Vec3, f32), b: (Vec3, f32)) -> (Vec3, f32) {
+    let (d, len) = {
+        let v = b.0 - a.0;
+        (v, v.length())
+    };
+    if len + b.1 <= a.1 {
+        return a;
+    }
+    if len + a.1 <= b.1 {
+        return b;
+    }
+    let radius = (len + a.1 + b.1) * 0.5;
+    (a.0 + d * ((radius - a.1) / len), radius)
+}
+
 fn mesh_sphere(mesh: &SceneMesh) -> (Vec3, f32) {
     let points: Box<dyn Iterator<Item = Vec3>> = match &mesh.positions {
         Some(p) => Box::new(p.iter().map(|p| Vec3::new(p[0], p[1], p[2]))),
@@ -1466,6 +1552,24 @@ impl D3dPass {
             });
         }
 
+        // Each object's draws, its attachments' included.
+        let mut prop_of: Vec<Option<usize>> = vec![None; scene.draws.len()];
+        for (pi, p) in scene.props.iter().enumerate() {
+            for range in std::iter::once(&p.draws).chain(p.attachments.iter().map(|a| &a.draws)) {
+                for di in range.clone() {
+                    if let Some(slot) = prop_of.get_mut(di) {
+                        *slot = Some(pi);
+                    }
+                }
+            }
+        }
+        let mut prop_draws = vec![Vec::new(); scene.props.len()];
+        for (k, d) in draws.iter().enumerate() {
+            if let Some(Some(p)) = prop_of.get(d.draw) {
+                prop_draws[*p].push(k);
+            }
+        }
+
         let programs = pipelines.iter().map(|p| p.program.name.clone()).collect();
         let celestial = scene
             .atmosphere
@@ -1513,6 +1617,10 @@ impl D3dPass {
             particles,
             particle_buffer,
             quad_indices,
+            scene_lights: scene.lights.clone(),
+            prop_draws,
+            prop_at: std::sync::Mutex::new(Vec::new()),
+            relit: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1720,19 +1828,8 @@ impl D3dPass {
             .draws
             .iter()
             .map(|d| {
-                let (world, _, _) = &self.worlds[d.draw];
-                let Some(sphere) = d.sphere else {
-                    return true;
-                };
-                let (centre, radius) = match self.bones.get(d.draw) {
-                    Some(rows) if !rows.is_empty() => skinned_sphere(sphere, rows),
-                    _ => sphere,
-                };
-                in_view(
-                    &view_proj,
-                    world.transform_point3(centre),
-                    radius * max_scale(world),
-                )
+                self.world_sphere(d)
+                    .is_none_or(|(centre, radius)| in_view(&view_proj, centre, radius))
             })
             .collect();
         let slot_size = SLOT[7] as usize;
@@ -1749,6 +1846,8 @@ impl D3dPass {
         };
         let mut statics = self.statics.lock().unwrap_or_else(|e| e.into_inner());
         statics.resize_with(self.draws.len(), || None);
+        let mut relit = self.relit.lock().unwrap_or_else(|e| e.into_inner());
+        self.repick_lights(&in_view, &mut statics, &mut relit);
         for (i, (d, _)) in self
             .draws
             .iter()
@@ -1775,7 +1874,7 @@ impl D3dPass {
                 camera: camera.position,
                 material: &self.materials[*material],
                 lightmap: lightmap.as_ref(),
-                lights: &d.lights,
+                lights: relit[i].as_ref().unwrap_or(&d.lights),
                 ambient: self.ambients.get(d.draw).copied().unwrap_or(Vec3::ZERO),
                 bones: self.bones.get(d.draw).map_or(&[][..], |b| b.as_slice()),
                 irradiance: self
@@ -1824,6 +1923,53 @@ impl D3dPass {
             ctx.queue.write_buffer(buffer, run_start, &run);
         }
         *self.in_view.lock().unwrap_or_else(|e| e.into_inner()) = in_view;
+    }
+
+    /// A draw's world-space bounds this frame (its bones' pose for a skinned draw); `None`
+    /// for draws never culled.
+    fn world_sphere(&self, d: &D3dDraw) -> Option<(Vec3, f32)> {
+        let (world, _, _) = &self.worlds[d.draw];
+        let sphere = d.sphere?;
+        let (centre, radius) = match self.bones.get(d.draw) {
+            Some(rows) if !rows.is_empty() => skinned_sphere(sphere, rows),
+            _ => sphere,
+        };
+        Some((world.transform_point3(centre), radius * max_scale(world)))
+    }
+
+    /// Re-picks the point lights of the placed objects in view that moved since their
+    /// lights were last picked, for all of an object's draws at once from the union of
+    /// their bounds; a draw whose lights change has its fixed constants refilled.
+    ///
+    /// DAOrigins.exe re-selects a moving object's lights every frame it is visible
+    /// (0x45bdb0 → 0x4654e0 → 0x464310 → 0x463e40) and keeps a static object's; one light
+    /// set serves all of the object's meshes. Provisional: the choice itself is still
+    /// [`pick_lights`] (the exe's influence function, light `vfunc+0x84`, is not traced),
+    /// and the object's ambient and probe stay those of the room it was placed in.
+    fn repick_lights(
+        &self,
+        in_view: &[bool],
+        statics: &mut [Option<Box<StaticConstants>>],
+        relit: &mut Vec<Option<DrawLights>>,
+    ) {
+        let mut at = self.prop_at.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = repick(
+            &RepickInput {
+                objects: &self.prop_draws,
+                in_view,
+                lights: &self.scene_lights,
+                position: &|k| self.worlds[self.draws[k].draw].0.w_axis.truncate(),
+                sphere: &|k| self.world_sphere(&self.draws[k]),
+                initial: &|k| &self.draws[k].lights,
+            },
+            &mut at,
+            relit,
+        );
+        for k in changed {
+            if let Some(s) = statics.get_mut(k) {
+                *s = None;
+            }
+        }
     }
 
     /// The casters' constants: their world and each partition's matrix.
@@ -2007,6 +2153,64 @@ impl D3dPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merged_spheres_hold_both() {
+        let a = (Vec3::ZERO, 1.0);
+        assert_eq!(merge_spheres(a, (Vec3::X * 0.5, 0.25)), a);
+        let (c, r) = merge_spheres(a, (Vec3::X * 4.0, 1.0));
+        assert!((c - Vec3::X * 2.0).length() < 1e-6 && (r - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_moved_object_repicks_its_lights_and_a_still_one_does_not() {
+        let light = |x: f32, name: &str| SceneLight::Point {
+            position: Vec3::new(x, 0.0, 0.0),
+            color: Vec3::ONE,
+            radius: 3.0,
+            name: name.into(),
+            domain: None,
+        };
+        let lights = vec![light(0.0, "a"), light(20.0, "b")];
+        let initial = pick_lights(&lights, (Vec3::ZERO, 0.5), DOMAIN_CHARACTERS);
+        assert_eq!(initial.points[0].0, Vec3::ZERO);
+        // Object 0 owns draws 0 and 1; draw 2 is the level's.
+        let objects = vec![vec![0, 1]];
+        let pos = std::cell::Cell::new(Vec3::ZERO);
+        let position = |_k: usize| pos.get();
+        let sphere = |_k: usize| Some((pos.get(), 0.5));
+        let init = |_k: usize| &initial;
+        let input = RepickInput {
+            objects: &objects,
+            in_view: &[true, true, true],
+            lights: &lights,
+            position: &position,
+            sphere: &sphere,
+            initial: &init,
+        };
+        let (mut at, mut relit) = (Vec::new(), Vec::new());
+        // First sight: nothing changes; standing still: nothing either.
+        assert!(repick(&input, &mut at, &mut relit).is_empty());
+        assert!(repick(&input, &mut at, &mut relit).is_empty());
+        // Walks next to light B: both its draws take B, the level's draw does not.
+        pos.set(Vec3::new(19.0, 0.0, 0.0));
+        assert_eq!(repick(&input, &mut at, &mut relit), vec![0, 1]);
+        assert_eq!(
+            relit[0].as_ref().unwrap().points[0].0,
+            Vec3::new(20.0, 0.0, 0.0)
+        );
+        assert!(relit[2].is_none());
+        // A small step that keeps B changes nothing.
+        pos.set(Vec3::new(19.5, 0.0, 0.0));
+        assert!(repick(&input, &mut at, &mut relit).is_empty());
+        // Out of view, it is not re-picked.
+        pos.set(Vec3::ZERO);
+        let hidden = RepickInput {
+            in_view: &[false, false, true],
+            ..input
+        };
+        assert!(repick(&hidden, &mut at, &mut relit).is_empty());
+    }
 
     #[test]
     fn draws_count_as_in_view_only_within_the_frustum() {
