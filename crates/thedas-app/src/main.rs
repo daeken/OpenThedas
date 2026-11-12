@@ -48,6 +48,7 @@
 mod audio;
 mod chargen_stage;
 mod control;
+mod cutactors;
 mod cutcam;
 mod focusnav;
 mod follow;
@@ -1072,6 +1073,7 @@ impl App {
                 });
             }
         }
+        g.ui.set_pad_active(self.pad.used);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -1155,6 +1157,7 @@ impl App {
                 r.advance_time(dt / 1000.0);
             }
         }
+        g.ui.set_pad_active(self.pad.used);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -3118,6 +3121,7 @@ fn main() -> Result<()> {
                                     layer.set_paperdoll(shot);
                                 }
                                 layer.set_paused(l.paused);
+                                layer.set_pad_active(pad_play.used);
                                 if let Some(aim) = layer.play(s, &l.sim, dt).pop() {
                                     println!("aiming ability {}", aim.ability);
                                     l.aiming = Some(aim);

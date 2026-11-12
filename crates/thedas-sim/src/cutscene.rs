@@ -75,6 +75,13 @@ pub struct Cutscene {
     /// A conversation line played it (see [`crate::dialog::Node::cutscene`]).
     #[serde(default)]
     pub from_dialog: bool,
+    /// The objects its actors took, put back or left at their end poses when it ends (see
+    /// [`crate::cutactors`]).
+    #[serde(default)]
+    pub bound: Vec<crate::cutactors::Bound>,
+    /// Where it plays, when a conversation placed it (see [`crate::cuttracks::Placement`]).
+    #[serde(default)]
+    pub placement: Option<crate::cuttracks::Placement>,
 }
 
 impl Cutscene {
@@ -155,6 +162,8 @@ impl Cutscene {
             lines,
             elapsed_ms: 0,
             from_dialog: false,
+            bound: Vec::new(),
+            placement: None,
         })
     }
 

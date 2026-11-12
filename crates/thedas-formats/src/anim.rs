@@ -5,9 +5,11 @@
 //! Field labels, read from the files:
 //! - Tree: 4021 the nodes, 4022 the tree's name (`Staff`, `Bow`, `humanoid`, ...).
 //! - Node: 4024 the action (`fire`, `aim`, `attk_v1`, ...), 4025 the animation (`.ani`
-//!   resource, absent for a node naming the tree itself), 4026 its playback speed; 4027 to
-//!   4030 are not interpreted (provisional: 4027 looks like "plays once" and 4029/4030 like
-//!   tree links).
+//!   resource, absent for a node naming the tree itself), 4026 its playback speed, 4027
+//!   whether it plays once (provisional, from the data: 1 on `humanoid.anb`'s enters,
+//!   exits, twitches and deaths, 0 on its loops, pauses and the movement cycles; a
+//!   cutscene's `.cub` trees have 0 throughout); 4028 to 4030 are not interpreted
+//!   (provisional: 4029/4030 look like tree links).
 //! - General data: 4007 the animation's name, 4009 its length in seconds, 4010 its speed.
 //! - Events: 4020 the list; each 4016 its time in seconds and 4017 its kind (provisional:
 //!   kind 10 sits where a ranged weapon lets go, kind 1 near a melee hit).
@@ -22,6 +24,8 @@ pub struct AnimNode {
     /// The `.ani` resource, if the node plays one.
     pub animation: Option<String>,
     pub speed: f32,
+    /// Field 4027: the animation plays once (provisional; see the module docs).
+    pub once: bool,
 }
 
 /// An animation tree (`.anb`): which animation each action plays.
@@ -47,9 +51,19 @@ impl AnimTree {
                 action: d.opt_str(n, 4024)?.unwrap_or_default(),
                 animation: d.opt_str(n, 4025)?.filter(|s| !s.is_empty()),
                 speed: d.opt_f32(n, 4026)?.unwrap_or(1.0),
+                once: d.opt_i64(n, 4027)?.is_some_and(|v| v != 0),
             });
         }
         Ok(Self { name, nodes })
+    }
+
+    /// The first node playing animation `ani` (`.ani` resource; names compare without case).
+    pub fn playing(&self, ani: &str) -> Option<&AnimNode> {
+        self.nodes.iter().find(|n| {
+            n.animation
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(ani))
+        })
     }
 
     /// The node for an action (names compare without case).

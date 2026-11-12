@@ -1023,6 +1023,13 @@ impl UiLayer {
         }
     }
 
+    /// Whether the player is using a pad (the tutorial popup shows its pad hint).
+    pub fn set_pad_active(&self, pad: bool) {
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.pad_active = pad;
+        }
+    }
+
     /// conversation.gfx's continue action (it sends `Conversation.SelectResponse 0` when the
     /// line has nothing to choose).
     fn continue_conversation(&mut self) {

@@ -122,6 +122,8 @@ pub struct Presentation {
     /// A full-screen menu (options, save and load, the game menu) is up: tutorial popups
     /// wait under it (the popup layer those screens load does not show them).
     pub menu_up: bool,
+    /// The player is using a pad: the tutorial popup's title carries its pad control.
+    pub pad_active: bool,
 }
 
 /// An item shown on the examine screen (itemexamine.gfx), as the screen that opened it asked
@@ -624,10 +626,13 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     // when the quickbar runs under it). Provisional: the HUD's quickbar spans the screen, so
     // it is given as reaching past any tooltip.
     v.insert("GUI.QuickbarXMax".into(), num(100_000));
-    // The player's pause (Space): floatylayer.gfx plays its pause border while
-    // `Client.Paused` is on and its outro when it goes off with `Client.UserPaused` set.
-    // Provisional: every pause here is the player's own (the game also pauses for menus).
-    v.insert("Client.Paused".into(), num(u8::from(shown.paused)));
+    // The pause: floatylayer.gfx plays its pause border while `Client.Paused` is on and its
+    // outro when it goes off with `Client.UserPaused` set. The player's own pause (Space)
+    // sets both; a tutorial that pauses the game sets only `Client.Paused`, as
+    // DAOrigins.exe's TutorialControl does (0x6940ec: the client pause, 0x5d6740, with
+    // its user flag off), so the border shows then too.
+    let paused = shown.paused || sim.world.tutorial_paused;
+    v.insert("Client.Paused".into(), num(u8::from(paused)));
     v.insert("Client.UserPaused".into(), num(u8::from(shown.paused)));
     if let Some(p) = shown.book_page {
         v.insert("GUI.SelectedBookPage".into(), num(p));
@@ -699,6 +704,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             tutorials
                 .iter()
                 .map(|t| t.resref.as_str())
+                .chain(shown.pad_active.then_some("pad"))
                 .collect::<Vec<_>>()
                 .join(","),
         ),
@@ -706,7 +712,21 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     for (i, t) in tutorials.iter().enumerate() {
         let k = format!("Tutorials.TutorialList.{i}");
         v.insert(k.clone(), UiValue::String(t.resref.clone()));
-        v.insert(format!("{k}.Title"), tutorial_text(t.title));
+        // With a pad, the title names the pad's control for the popup's button (A: Next, or
+        // Close on the last), which the PC movie has none of. A deliberate addition.
+        let title = match tutorial_text(t.title) {
+            UiValue::String(s) if shown.pad_active => {
+                let next = if i + 1 < tutorials.len() {
+                    sim.string(crate::binding::LOC_NEXT)
+                } else {
+                    sim.string(crate::binding::LOC_CLOSE)
+                }
+                .unwrap_or_default();
+                UiValue::String(format!("{s}   (A: {next})"))
+            }
+            other => other,
+        };
+        v.insert(format!("{k}.Title"), title);
         v.insert(format!("{k}.Text"), tutorial_text(t.text));
         v.insert(
             format!("{k}.CodexResRef"),
@@ -795,6 +815,11 @@ fn map_notes(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
         v.insert(format!("{k}.MapNoteVisible"), num(1));
     }
 }
+
+/// The movies' `LOC_NEXT` and `LOC_CLOSE` strings (talk-table ids, from their
+/// `Localization.Strings`).
+pub const LOC_NEXT: u32 = 330708;
+pub const LOC_CLOSE: u32 = 371224;
 
 /// The keys bound to the game's actions, as the movies (and the designer tags in text, see
 /// [`crate::keys`]) read them: `InputMappings.Mappings.<action>.PrimaryMappedKey` and
