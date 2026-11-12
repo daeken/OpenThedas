@@ -3074,6 +3074,17 @@ impl Sim {
                 if let (Some(d), Some(o)) = (droppable, self.world.get_mut(item)) {
                     o.fields.insert("Droppable".into(), d);
                 }
+                // Carried items are added as any item is, merging into the stacks already
+                // held (see `Sim::stack_into`); stackable ones start as stacks of one.
+                if !equip {
+                    if self.max_stack(item) > 1 {
+                        if let Some(o) = self.world.get_mut(item) {
+                            o.fields.entry("StackSize".into()).or_insert(1);
+                        }
+                    }
+                    self.stack_into(id, item);
+                    continue;
+                }
                 let mut worn = false;
                 if let Some(o) = self.world.get_mut(id) {
                     o.inventory.push(item);

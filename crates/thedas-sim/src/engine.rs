@@ -1730,23 +1730,36 @@ pub fn call(
                 .unwrap_or(false)))
         }
         "CreateItemOnObject" => {
-            let template = string(a, 0);
-            let id = h.sim.create_item(&template);
             // (resource, target, stack size, tag, suppress notification, droppable)
-            let stack = if a.len() > 2 { int(a, 2) } else { 1 };
+            // DAOrigins.exe splits the count before adding (0x7595a0): full stacks and a
+            // remainder of a stackable item, or that many separate items of one that does not
+            // stack; each is then added (and may merge into a stack already held). The first
+            // created item is returned.
+            let template = string(a, 0);
+            let stack = if a.len() > 2 { int(a, 2).max(1) } else { 1 };
             let droppable = a.len() <= 5 || int(a, 5) != 0;
-            if let Some(o) = h.sim.world.get_mut(id) {
-                let tag = string(a, 3);
-                if !tag.is_empty() {
-                    o.tag = tag;
+            let tag = string(a, 3);
+            let to = obj(a, 1);
+            let mut first = None;
+            let mut left = stack;
+            while left > 0 {
+                let id = h.sim.create_item(&template);
+                let max = h.sim.max_stack(id);
+                let count = if max > 1 { left.min(max) } else { 1 };
+                if let Some(o) = h.sim.world.get_mut(id) {
+                    if !tag.is_empty() {
+                        o.tag = tag.clone();
+                    }
+                    if max > 1 {
+                        o.fields.insert("StackSize".into(), count);
+                    }
+                    o.fields.insert("Droppable".into(), droppable as i32);
                 }
-                if stack > 1 {
-                    o.fields.insert("StackSize".into(), stack);
-                }
-                o.fields.insert("Droppable".into(), droppable as i32);
+                h.sim.give_item(id, to);
+                first.get_or_insert(id);
+                left -= count;
             }
-            h.sim.give_item(id, obj(a, 1));
-            ok(Value::Object(id))
+            ok(Value::Object(first.unwrap_or(OBJECT_INVALID)))
         }
 
         // --- Effects ----------------------------------------------------------------------
@@ -3749,9 +3762,32 @@ pub fn call(
                 .unwrap_or(1)
                 .max(1),
         )),
+        // Ignored for an item that does not stack; clamped to the stack's maximum; an item
+        // set to 0 is destroyed (0x66a8a0).
         "SetItemStackSize" => {
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.fields.insert("StackSize".into(), int(a, 1).max(1));
+            let item = obj(a, 0);
+            let max = h.sim.max_stack(item);
+            if max > 1 && h.object(item).is_some() {
+                let n = int(a, 1).clamp(0, max);
+                if n == 0 {
+                    let holders: Vec<ObjectId> = h
+                        .sim
+                        .world
+                        .objects
+                        .values()
+                        .filter(|o| o.inventory.contains(&item))
+                        .map(|o| o.id)
+                        .collect();
+                    for holder in holders {
+                        h.sim.unequip(holder, item);
+                        if let Some(o) = h.sim.world.get_mut(holder) {
+                            o.inventory.retain(|&i| i != item);
+                        }
+                    }
+                    h.sim.world.objects.remove(&item);
+                } else if let Some(o) = h.sim.world.get_mut(item) {
+                    o.fields.insert("StackSize".into(), n);
+                }
             }
             void()
         }
@@ -5603,13 +5639,14 @@ mod tests {
             }
         };
         let (kept, dropped) = (make(&mut s, 0), make(&mut s, 1));
-        assert_eq!(
-            s.world.get(dropped).unwrap().fields.get("StackSize"),
-            Some(&2)
-        );
+        // An item that does not stack (no base item here) comes as two separate items.
+        assert_eq!(s.world.get(dropped).unwrap().fields.get("StackSize"), None);
         let bag = s.spawn_body_bag(foe, false).unwrap();
-        assert_eq!(s.world.get(bag).unwrap().inventory, vec![dropped]);
-        assert_eq!(s.world.get(foe).unwrap().inventory, vec![kept]);
+        assert_eq!(
+            s.world.get(bag).unwrap().inventory,
+            vec![dropped, dropped + 1]
+        );
+        assert_eq!(s.world.get(foe).unwrap().inventory, vec![kept, kept + 1]);
     }
 
     #[test]
