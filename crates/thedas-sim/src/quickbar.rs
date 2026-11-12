@@ -71,6 +71,20 @@ impl Sim {
         )
     }
 
+    /// Whether the engine's ability functions accept `ability`: above 0 and with a row in
+    /// `ABI_base` (DAOrigins.exe 0x669b4c). Provisional: with no Abilities table loaded
+    /// (tests), any id above 0 is accepted.
+    pub(crate) fn ability_known(&self, ability: i32) -> bool {
+        if ability <= 0 {
+            return false;
+        }
+        // The Abilities M2DA (id 1): ABI_base and every other `ABI_` worksheet.
+        match self.world.tables().get(1, "") {
+            Some(t) if !t.is_empty() => t.has_row(ability as i64),
+            _ => true,
+        }
+    }
+
     pub(crate) fn abi_int(&self, ability: i32, column: &str) -> i32 {
         match self
             .world

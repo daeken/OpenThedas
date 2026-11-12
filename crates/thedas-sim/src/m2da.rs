@@ -53,6 +53,16 @@ impl Table {
         }
     }
 
+    /// Whether the table has no rows.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Whether the table has a row with this id.
+    pub fn has_row(&self, row: i64) -> bool {
+        self.rows.contains_key(&row)
+    }
+
     pub fn cell(&self, column: &str, row: i64) -> Option<&Cell> {
         let c = *self
             .columns
