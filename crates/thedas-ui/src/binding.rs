@@ -12,6 +12,12 @@ use thedas_sim::world::ObjectKind;
 
 use crate::UiValue;
 
+/// The creature's class (`properties.gda` row 27, `PROPERTY_SIMPLE_CURRENT_CLASS`).
+const PROPERTY_CLASS: i32 = 27;
+/// The mage class (`CLASS_WIZARD`, `cla_base.gda` row 2; the scripts' constant, not the
+/// engine's).
+const CLASS_WIZARD: i32 = 2;
+
 fn num(v: impl Into<f64>) -> UiValue {
     UiValue::Number(v.into())
 }
@@ -278,7 +284,12 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             format!("{prefix}.UserSelected"),
             num((Some(id) == controlled) as u8),
         );
-        let mana = o.properties.contains_key(&8);
+        // Mana for mages, stamina for the rest: every creature has the one energy property
+        // (8, mana or stamina), so its presence told nothing and every warrior read as a
+        // caster (a blue portrait ring; the record showed spellpower where attack goes).
+        // Provisional: the exe's own test is not traced; the class decides.
+        let class = sim.property_total(id, PROPERTY_CLASS) as i32;
+        let mana = o.properties.contains_key(&8) && class == CLASS_WIZARD;
         v.insert(format!("{prefix}.Stats.ClassHasMana"), num(mana as u8));
         v.insert(format!("{prefix}.Name"), UiValue::String(name(sim, id)));
         v.insert(format!("{prefix}.Dead"), num(o.dead as u8));
