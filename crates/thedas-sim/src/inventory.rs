@@ -242,6 +242,13 @@ impl Sim {
             self.apply_effect(who, e);
         }
         self.equip_event("EQUIP", who, item, slot, by_player);
+        // A party member's equip is what the inventory lesson waits for: DAOrigins.exe raises
+        // `EVENT_TYPE_TRAINING_ITEM_EQUIPPED` (1071) from its equip routine (0x6bc7f0, at
+        // 0x6bcb9d), whoever asked for the equip. Provisional: the argument is taken to be
+        // the slot (the script waits on slot 4, read with GetItemInEquipSlot).
+        if self.world.training.mode != 0 && crate::engine::party_of(self).contains(&who) {
+            self.training_event("ITEM_EQUIPPED", slot);
+        }
     }
 
     /// The engine's side of `who` taking off `item` (from `slot`): the effects it created on
@@ -264,6 +271,13 @@ impl Sim {
             self.remove_effect(who, &e);
         }
         self.equip_event("UNEQUIP", who, item, slot, false);
+        // A party member's unequip is what the inventory lesson waits for: DAOrigins.exe
+        // raises `EVENT_TYPE_TRAINING_ITEM_UNEQUIPPED` (1070) from its unequip routine
+        // (0x6b7690, at 0x6b7886), which its equip routine also calls for what it displaces
+        // (0x6bc943). Provisional: the argument is taken to be the slot.
+        if self.world.training.mode != 0 && crate::engine::party_of(self).contains(&who) {
+            self.training_event("ITEM_UNEQUIPPED", slot);
+        }
     }
 
     pub(crate) fn equip_event(
@@ -346,24 +360,18 @@ impl Sim {
         if !self.party_backpack().contains(&item) && self.wearer(item).is_none() {
             return false;
         }
-        // Whoever wore it takes it off, and what `who` wore in the slot comes off. Each is
-        // an unequip like any other: DAOrigins.exe's equip routine (0x6bc7f0) calls its
-        // unequip routine (0x6b7690) for them, which is where a party member's
-        // `EVENT_TYPE_TRAINING_ITEM_UNEQUIPPED` (1070) is raised (0x6b7886), so a swap ends
-        // the inventory lesson's unequip step too.
+        // Whoever wore it takes it off, and what `who` wore in the slot comes off (each an
+        // unequip like any other, so a swap ends the inventory lesson's unequip step too:
+        // see `Sim::take_off`).
         if let Some(m) = self.wearer(item) {
-            if party.contains(&m) {
-                self.unequip_item(m, item);
-            } else {
-                self.unequip(m, item);
-            }
+            self.unequip(m, item);
         }
         if let Some(old) = self
             .world
             .get(who)
             .and_then(|o| o.equipment.get(&slot).copied())
         {
-            self.unequip_item(who, old);
+            self.unequip(who, old);
         }
         for m in party {
             if m != who {
@@ -380,10 +388,6 @@ impl Sim {
         }
         o.equipment.insert(slot, item);
         self.wear_as(who, item, slot, true);
-        // The inventory tutorial waits for an item put on in its slot (`genev_tutorial` mode
-        // 5). Provisional: the event's argument is taken to be the equip slot (the script
-        // waits on slot 4, which it read with GetItemInEquipSlot).
-        self.training_event("ITEM_EQUIPPED", slot);
         true
     }
 
@@ -416,19 +420,7 @@ impl Sim {
         if !crate::engine::party_of(self).contains(&who) {
             return false;
         }
-        let slot = self.world.get(who).and_then(|o| {
-            o.equipment
-                .iter()
-                .find(|(_, i)| **i == item)
-                .map(|(s, _)| *s)
-        });
-        let off = self.unequip(who, item);
-        // The inventory tutorial waits for an item taken off its slot (`genev_tutorial` mode
-        // 5, step 7, slot 4). Provisional: the argument is taken to be the equip slot.
-        if let (true, Some(slot)) = (off, slot) {
-            self.training_event("ITEM_UNEQUIPPED", slot);
-        }
-        off
+        self.unequip(who, item)
     }
 
     /// The inventory screen's messages ([`MSG_EQUIP`], [`MSG_UNEQUIP`]), for the party member
