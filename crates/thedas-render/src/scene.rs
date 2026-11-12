@@ -867,9 +867,10 @@ impl<'a> Loader<'a> {
         let mut batches: BTreeMap<BatchKey, Batch> = BTreeMap::new();
         // Per tree: its leaf cards for the game's `SPT_LeafCards` shader (one draw per
         // placement, placed by constants), and its leaf rock and rustle scalars.
+        type SptPart = (usize, usize, TreePart, Vec<(u32, u32)>);
         struct SptTree {
             /// Mesh, material, part and the part's level ranges.
-            parts: Vec<(usize, usize, TreePart, Vec<(u32, u32)>)>,
+            parts: Vec<SptPart>,
             leaf_angle_scalars: [f32; 2],
             counts: [usize; 3],
             transition: thedas_formats::speedtree_gen::mesh::Transition,
@@ -2782,6 +2783,40 @@ fn name_of_tree(trees: &[String], tree: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_tree_part_draws_its_level_inside_the_far_distance_only() {
+        let lod = |part| TreeLod {
+            anchor: Vec3::ZERO,
+            near: 15.0,
+            far: 35.0,
+            counts: [3, 3, 3],
+            transition: Default::default(),
+            part,
+            levels: vec![(0, 30), (30, 18), (48, 6)],
+        };
+        // Inside near: the full level, at the target alpha reference.
+        let eye = Vec3::new(5.0, 0.0, 0.0);
+        assert_eq!(lod(TreePart::Branches).frame(eye), Some((0, 30, 0.0)));
+        assert_eq!(lod(TreePart::Fronds).frame(eye), Some((0, 30, 84.0)));
+        assert_eq!(lod(TreePart::Leaves(0)).frame(eye), Some((0, 30, 84.0)));
+        assert_eq!(lod(TreePart::Leaves(1)).frame(eye), None);
+        // Beyond far: nothing (the billboard's range).
+        let eye = Vec3::new(40.0, 0.0, 0.0);
+        assert_eq!(lod(TreePart::Branches).frame(eye), None);
+        assert_eq!(lod(TreePart::Fronds).frame(eye), None);
+        // Part way: a lower branch level.
+        let eye = Vec3::new(30.0, 0.0, 0.0);
+        let (first, _, _) = lod(TreePart::Branches).frame(eye).unwrap();
+        assert!(first > 0);
+    }
+
+    #[test]
+    fn the_lod_distances_follow_the_radius() {
+        assert_eq!(TreeLod::range(1.0, 0), (15.0, 35.0));
+        assert_eq!(TreeLod::range(30.0, 0), (20.0, 120.0));
+        assert_eq!(TreeLod::range(30.0, 2), (40.0, 240.0));
+    }
     use super::*;
 
     #[test]
