@@ -1038,7 +1038,9 @@ fn walk_function(name: &str, all: bool) -> Vec<u8> {
         push(c, &[Push::Bool(false)]);
         c.push(STRICT_EQUALS);
         a.branch(IF, "next");
-        for h in ["onRelease", "onPress"] {
+        // A drop target (an empty equipment slot: it takes a dragged item and has no press
+        // of its own) counts too, so the pad's focus reaches it.
+        for h in ["onRelease", "onPress", "AcceptDrop"] {
             get_path(&mut a.code, &["m", h]);
             a.branch(IF, "button");
         }
