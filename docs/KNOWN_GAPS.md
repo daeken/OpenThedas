@@ -38,7 +38,7 @@ so an untraced item starts with a trace, not with a guess.
 | Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 96 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
 | Rendering | [gaps/rendering.md](gaps/rendering.md) | 152 (`RND-`) |
 | Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 183 (`UI-`), plus the movies never opened and the values no screen gets answered |
-| Audio | [gaps/audio.md](gaps/audio.md) | 57 (`AUD-`) |
+| Audio | [gaps/audio.md](gaps/audio.md) | 58 (`AUD-`) |
 | Cameras, cutscene presentation, startup | [gaps/cameras-cutscenes.md](gaps/cameras-cutscenes.md) | 45 (`CAM-`) |
 | File formats and file system | [gaps/formats.md](gaps/formats.md) | 46 (`FMT-`), plus a table of every resource type and the tables and types nothing reads |
 | Tooling, platforms and project | [gaps/tooling.md](gaps/tooling.md) | 23 (`TOOL-`) |
@@ -141,7 +141,7 @@ these, so they are the places where one person or stream can take a large, separ
 
 - **Event detail.** Only volume envelopes are applied; pitch, pan and reverb-level envelopes
   and layer effects are ignored (`AUD-003`, `AUD-004`).
-- **Music.** No streaming: every sample is decoded whole (`AUD-026`).
+- **Music.** No streaming, and `PlayMusic` is dropped (`AUD-026`, `AUD-032`).
 - **Reverb.** The secondary reverb instances are not modelled.
 
 ### Platform, formats and project
