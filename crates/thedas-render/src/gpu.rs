@@ -413,6 +413,9 @@ pub struct RenderStats {
     pub draws: usize,
     pub draws_skipped: usize,
     pub programs: Vec<String>,
+    /// The scene's particle emitters, and how many of them have a program to draw with.
+    pub emitters: usize,
+    pub particle_draws: usize,
 }
 
 pub struct AreaRenderer {
@@ -450,6 +453,8 @@ pub struct AreaRenderer {
     time: f64,
     /// Whether [`AreaRenderer::encode_shadows`] already filled this frame's constants.
     updated: bool,
+    /// The scene's particle emitters, as [`AreaScene::emitters`] orders them.
+    pub emitters: Vec<crate::particles::EmitterState>,
 }
 
 /// The colour curve `da_hsvmatrix` reads by default: `da_defaultcc` (DAOrigins.exe loads it
@@ -798,6 +803,8 @@ impl AreaRenderer {
             DrawRef::D3d(i) => (1, d3d.draws[*i].pipeline, 0),
         });
         stats.draws = opaque.len() + blended.len();
+        stats.emitters = scene.emitters.len();
+        stats.particle_draws = d3d.particles.len();
         stats.programs.extend(d3d.programs.iter().cloned());
         stats.textures_loaded = cache.loaded - loaded0;
         stats.textures_compressed = cache.compressed - compressed0;
@@ -858,6 +865,18 @@ impl AreaRenderer {
             frame_effects: true,
             time: 0.0,
             updated: false,
+            emitters: scene
+                .emitters
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    crate::particles::EmitterState::new(
+                        e.emitter.clone(),
+                        e.transform,
+                        crate::particles::seed(i, e.transform),
+                    )
+                })
+                .collect(),
             light: StandInLight::default(),
             stats,
         }
@@ -972,16 +991,27 @@ impl AreaRenderer {
         }
     }
 
-    /// Advances the shaders' clock (`ApplicationTime`) by a frame's time, in seconds.
+    /// Advances the shaders' clock (`ApplicationTime`) and the particle emitters by a
+    /// frame's time, in seconds.
     pub fn advance_time(&mut self, seconds: f64) {
         if seconds.is_finite() && seconds > 0.0 {
             self.time += seconds;
+            for e in &mut self.emitters {
+                e.advance(seconds as f32);
+            }
         }
     }
 
-    /// Sets the shaders' clock (`ApplicationTime`), in seconds.
+    /// Sets the shaders' clock (`ApplicationTime`), in seconds. The particle emitters run
+    /// on by the time it moved forward.
     pub fn set_time(&mut self, seconds: f64) {
-        self.time = if seconds.is_finite() { seconds } else { 0.0 };
+        let t = if seconds.is_finite() { seconds } else { 0.0 };
+        if t > self.time {
+            for e in &mut self.emitters {
+                e.advance((t - self.time) as f32);
+            }
+        }
+        self.time = t;
     }
 
     /// The shaders' clock, in seconds.
@@ -1125,6 +1155,8 @@ impl AreaRenderer {
             self.d3d
                 .update(ctx, camera, width, height, self.time as f32);
         }
+        self.d3d
+            .update_particles(ctx, camera, width, height, self.time as f32, &self.emitters);
         let depth = match over {
             Some(d) => d.clone(),
             None => self.depth_view(&ctx.device, width, height).clone(),
@@ -1185,6 +1217,11 @@ impl AreaRenderer {
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.count, 0, 0..1);
+        }
+        // Particles last, over everything else (the emitters' render classes are
+        // transparent).
+        if self.only_draws.is_none() {
+            self.d3d.draw_particles(&mut pass);
         }
     }
 

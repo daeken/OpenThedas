@@ -30,6 +30,7 @@
 pub mod anim;
 pub mod area;
 pub mod dds;
+pub mod emitter;
 pub mod gda;
 pub mod gff3;
 pub mod gff4;

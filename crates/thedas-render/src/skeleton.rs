@@ -203,6 +203,7 @@ mod tests {
             },
             mesh: None,
             light: None,
+            emitter: None,
             bone,
             children,
         }

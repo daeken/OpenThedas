@@ -41,6 +41,8 @@ pub const KIND_TRANSLATION: FourCC = FourCC::new(b"trsl");
 pub const KIND_ROTATION: FourCC = FourCC::new(b"rota");
 pub const KIND_MESH: FourCC = FourCC::new(b"mshh");
 pub const KIND_POINT_LIGHT: FourCC = FourCC::new(b"nplt");
+/// A particle emitter node.
+pub const KIND_EMITTER: FourCC = FourCC::new(b"nemt");
 pub const KIND_AMBIENT_LIGHT: FourCC = FourCC::new(b"nalt");
 
 /// [`Light::Point`]'s affect domain bit for characters and objects.
@@ -99,6 +101,8 @@ pub struct Node {
     pub transform: Transform,
     pub mesh: Option<MeshRef>,
     pub light: Option<Light>,
+    /// For a particle emitter node (`nemt`), its settings.
+    pub emitter: Option<Box<crate::emitter::Emitter>>,
     /// The node's bone index, for skeleton nodes.
     pub bone: Option<u32>,
     pub children: Vec<Node>,
@@ -121,6 +125,14 @@ pub struct Mmh {
     pub nodes: Vec<Node>,
 }
 
+/// An emitter node with the chain of local transforms from the model root down to it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EmitterPiece<'a> {
+    pub emitter: &'a crate::emitter::Emitter,
+    pub name: Option<&'a str>,
+    pub chain: Vec<Transform>,
+}
+
 /// A light node with the chain of local transforms from the model root down to it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LightPiece<'a> {
@@ -137,6 +149,30 @@ impl Mmh {
             if let Some(l) = &n.light {
                 out.push(LightPiece {
                     light: l,
+                    name: n.name.as_deref(),
+                    chain: chain.clone(),
+                });
+            }
+            for c in &n.children {
+                walk(c, chain, out);
+            }
+            chain.pop();
+        }
+        let mut out = Vec::new();
+        let mut chain = Vec::new();
+        for n in &self.nodes {
+            walk(n, &mut chain, &mut out);
+        }
+        out
+    }
+
+    /// Every particle emitter node, depth first in file order.
+    pub fn emitters(&self) -> Vec<EmitterPiece<'_>> {
+        fn walk<'a>(n: &'a Node, chain: &mut Vec<Transform>, out: &mut Vec<EmitterPiece<'a>>) {
+            chain.push(n.transform);
+            if let Some(e) = &n.emitter {
+                out.push(EmitterPiece {
+                    emitter: e,
                     name: n.name.as_deref(),
                     chain: chain.clone(),
                 });
@@ -303,12 +339,18 @@ fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>
     } else {
         None
     };
+    let emitter = if kind == KIND_EMITTER {
+        Some(read_emitter(gff, id)?)
+    } else {
+        None
+    };
     Ok(Some(Node {
         kind,
         name: d.opt_str(id, field::NAME)?,
         transform,
         mesh,
         light,
+        emitter,
         // Negative (-1) marks a node that is not a bone.
         bone: match d.opt_i64(id, field::BONE_INDEX)? {
             Some(b) if (0..=u16::MAX as i64).contains(&b) => Some(b as u32),
@@ -318,6 +360,13 @@ fn read_node(gff: &Gff4, id: StructId, depth: usize) -> TypedResult<Option<Node>
         },
         children,
     }))
+}
+
+/// Kept out of line: the emitter's fields would otherwise sit in every frame of the
+/// recursive [`read_node`].
+#[inline(never)]
+fn read_emitter(gff: &Gff4, id: StructId) -> TypedResult<Box<crate::emitter::Emitter>> {
+    crate::emitter::Emitter::read(gff, id).map(Box::new)
 }
 
 #[cfg(test)]

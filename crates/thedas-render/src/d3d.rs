@@ -316,18 +316,33 @@ pub fn static1_filter() -> ShaderFilter {
     Some(v)
 }
 
-/// [`static1_filter`] plus the vertex shaders that draw creatures and placeables:
+/// [`static1_filter`] plus the vertex shaders that draw creatures and placeables, and the
+/// effects' sprites ([`VFX_VERTEX_SHADERS`]):
 /// characters (`Char1`), hair (`Hair0_Pass1`, `Hair0`: four passes), faces (`Face1`), eyes
 /// and lashes (`Eye0`), cloth (`Cloth1`), props (`Prop1`) and weapons (`Weapon1`), with any
 /// pixel shader; and exterior terrain (`Terrain2`, terrain.mat's pass above Low detail, and
 /// `Terrain3`, its Low detail pass); and the sky's dome and clouds (`Sky`, `Clouds`).
 pub fn object_filter() -> ShaderFilter {
     let mut v = static1_filter().unwrap_or_default();
-    for vs in OBJECT_VERTEX_SHADERS {
+    for vs in OBJECT_VERTEX_SHADERS.iter().chain(&VFX_VERTEX_SHADERS) {
         v.push((vs.to_string(), "*".to_string()));
     }
     Some(v)
 }
+
+/// The vertex shaders of `VFX.mat`'s sprite semantics (particles and effect cards, read as
+/// `POSITION`, `COLOR0`, `TEXCOORD0`), part of [`object_filter`]. The `Chunky` and `VolTex`
+/// ones are not drawn yet.
+pub const VFX_VERTEX_SHADERS: [&str; 8] = [
+    "VFX0.vsh",
+    "VFX0_Addv.vsh",
+    "VFX0_ContactSheet.vsh",
+    "VFX0_CS_Addv.vsh",
+    "VFX0_CS_Addv_Alt.vsh",
+    "VFX0_CS_Alt.vsh",
+    "VFX0_DBA.vsh",
+    "VFX0_CS_DBA.vsh",
+];
 
 /// See [`object_filter`].
 pub const OBJECT_VERTEX_SHADERS: [&str; 12] = [
