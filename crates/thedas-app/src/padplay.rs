@@ -423,6 +423,18 @@ impl PadPlay {
                 host.left_button(true);
                 return None;
             }
+            // A on an item in the inventory's list equips it, and on a worn item takes it
+            // off: the screen does both on a double click (a single click only picks the
+            // item up to drag), so A is one there. A deliberate addition, as the rest of
+            // the pad.
+            Action::PointerDown
+                if !self.controller.free_pointer && self.on_inventory_item(host) =>
+            {
+                self.swallow_release = true;
+                host.double_click();
+                let (x, y) = host.cursor();
+                return Some(format!("equip or unequip at {x:.0},{y:.0}"));
+            }
             Action::PointerUp if std::mem::take(&mut self.swallow_release) => return None,
             Action::PointerDown | Action::PointerUp => {
                 host.left_button(a == Action::PointerDown);
@@ -710,6 +722,17 @@ impl PadPlay {
                 Context::Screen => !self.snapped,
                 _ => false,
             }
+    }
+
+    /// Whether the pointer is on an item of the inventory screen: an entry of its list or an
+    /// equipment slot (inventory.gfx's `ItemEntry<n>` and `InventorySlots_mc.Slot*`).
+    fn on_inventory_item(&self, host: &mut dyn Host) -> bool {
+        let targets = host.focus_targets();
+        crate::focusnav::under(&targets, host.cursor()).is_some_and(|i| {
+            let t = &targets[i];
+            t.movie == "inventory.gfx"
+                && (t.path.contains(".ItemEntry") || t.path.contains(".InventorySlots_mc.Slot"))
+        })
     }
 
     /// The focus moves a step `(dx, dy)` among the screen's buttons (to the first one, when
