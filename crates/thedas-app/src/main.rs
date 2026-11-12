@@ -1185,7 +1185,7 @@ impl App {
             && let Some(live) = self.live.as_ref()
             && !live.front_end
         {
-            let sim = live.sim();
+            let mut sim = live.sim();
             let area = sim
                 .world
                 .area
@@ -1202,6 +1202,17 @@ impl App {
                 }
                 state.area = Some(resref);
                 state.combat = sim.world.party_fighting;
+                // Sounds scripts asked for. Sound sets, PlayMusic and SetMusicIntensity are
+                // not done yet (logged).
+                for req in std::mem::take(&mut sim.world.sounds) {
+                    match req {
+                        thedas_sim::world::SoundRequest::Event { target, event } => {
+                            let at = sim.world.get(target).map(|o| o.position);
+                            state.script_sounds.push((event, at));
+                        }
+                        other => log::debug!("audio: not done yet: {other:?}"),
+                    }
+                }
                 state.dead = sim.world.game_over;
                 state.inactive_sounds = sim
                     .world
