@@ -157,6 +157,68 @@ impl DrawLod {
     }
 }
 
+/// Which part of a SpeedTree a draw is, for its level of detail ([`TreeLod`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TreePart {
+    Branches,
+    Fronds,
+    /// One of the two leaf slots, which cross-fade between leaf LOD levels.
+    Leaves(usize),
+}
+
+/// A SpeedTree draw's level of detail, as DAOrigins.exe works it out each frame
+/// (0x536085–0x5361d4, speedtree-exe-trace §5, §11; docs/speedtree 7.4, 7.8): the LOD value
+/// from the squared distance between the camera and the placement point, then the part's
+/// level and alpha-test reference.
+///
+/// Provisional: the detail option and zoom factor `G` are taken as 1.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TreeLod {
+    pub anchor: Vec3,
+    pub near: f32,
+    pub far: f32,
+    /// The tree's branch, frond and leaf level counts.
+    pub counts: [usize; 3],
+    pub transition: thedas_formats::speedtree_gen::mesh::Transition,
+    pub part: TreePart,
+    /// Per level of this part, its (first index, index count) in the draw's mesh.
+    pub levels: Vec<(u32, u32)>,
+}
+
+impl TreeLod {
+    /// The exe's near and far distances for an instance of bounding radius `radius` (half
+    /// the diagonal of its box times its placement scale) and LOD class `class` (RML 3379).
+    pub fn range(radius: f32, class: i32) -> (f32, f32) {
+        let t = (radius.clamp(2.0, 30.0) - 2.0) / 28.0;
+        let m = [1.0, 1.5, 2.0][class.clamp(0, 2) as usize];
+        ((15.0 + 5.0 * t) * m, (35.0 + 85.0 * t) * m)
+    }
+
+    /// What the part draws with the camera at `eye`: its index range and alpha-test
+    /// reference (0–255), or `None` when it is not drawn.
+    pub fn frame(&self, eye: Vec3) -> Option<(u32, u32, f32)> {
+        use thedas_formats::speedtree_gen::mesh::{lod_alphas, lod_value};
+        let lod = lod_value(eye.distance_squared(self.anchor), self.near, self.far, 1.0);
+        // The geometry list takes instances with |LOD| ≥ 0.001.
+        if lod.abs() < 0.001 {
+            return None;
+        }
+        let a = lod_alphas(lod, self.counts, self.transition);
+        let (level, alpha) = match self.part {
+            TreePart::Branches => (a.branch_level, 0.0),
+            // The game draws the frond level before the one the library names, never below
+            // the first (0x52cdbc).
+            TreePart::Fronds => ((a.frond_level - 1).max(0), a.alpha),
+            TreePart::Leaves(slot) => a.leaves.get(slot).copied().unwrap_or((-1, 255.0)),
+        };
+        if level < 0 || self.levels.is_empty() {
+            return None;
+        }
+        let (first, count) = self.levels[(level as usize).min(self.levels.len() - 1)];
+        (count > 0).then_some((first, count, alpha.floor()))
+    }
+}
+
 /// A skinned draw's bones.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DrawSkin {
@@ -368,6 +430,8 @@ pub struct AreaScene {
     pub cutaway_height: Option<f32>,
     /// SpeedTree placements' constants by draw, for draws with the game's `spt_*` shaders.
     pub tree_constants: HashMap<usize, crate::d3d::TreeConstants>,
+    /// SpeedTree draws' levels of detail by draw.
+    pub tree_lods: HashMap<usize, TreeLod>,
 }
 
 /// A model (or several, drawn together) the simulation places in the level: a creature or a
@@ -803,8 +867,15 @@ impl<'a> Loader<'a> {
         let mut batches: BTreeMap<BatchKey, Batch> = BTreeMap::new();
         // Per tree: its leaf cards for the game's `SPT_LeafCards` shader (one draw per
         // placement, placed by constants), and its leaf rock and rustle scalars.
-        type SptParts = (Vec<(usize, usize)>, [f32; 2]);
-        let mut spt_parts: HashMap<usize, SptParts> = HashMap::new();
+        type SptPart = (usize, usize, TreePart, Vec<(u32, u32)>);
+        struct SptTree {
+            /// Mesh, material, part and the part's level ranges.
+            parts: Vec<SptPart>,
+            leaf_angle_scalars: [f32; 2],
+            counts: [usize; 3],
+            transition: thedas_formats::speedtree_gen::mesh::Transition,
+        }
+        let mut spt_parts: HashMap<usize, SptTree> = HashMap::new();
         let leaf_material = material(self, &atlas, "spt_leafcards");
         let frond_material = material(self, &atlas, "spt_fronds");
         let leaf_mesh_material = material(self, &atlas, "spt_leafmesh");
@@ -836,7 +907,8 @@ impl<'a> Loader<'a> {
                         .filter(|n| n != ".dds")
                         .unwrap_or_else(|| bark.replace(".dds", "_n.dds"));
                     if let Some(m) = material(self, &bark, &format!("spt_branch:{normal}")) {
-                        spt.push((self.spt_surface(&name, "branches", &mesh.branches, lod), m));
+                        let (sm, levels) = self.spt_surface(&name, "branches", &mesh.branches);
+                        spt.push((sm, m, TreePart::Branches, levels));
                     } else if let Some(m) = material(self, &bark, "Default") {
                         let indices = facing_front(&mesh.branches.vertices, lod);
                         parts.push((
@@ -850,25 +922,42 @@ impl<'a> Loader<'a> {
                     && !lod.is_empty()
                     && let Some(m) = frond_material
                 {
-                    spt.push((self.spt_surface(&name, "fronds", &mesh.fronds, lod), m));
+                    let _ = lod;
+                    let (sm, levels) = self.spt_surface(&name, "fronds", &mesh.fronds);
+                    spt.push((sm, m, TreePart::Fronds, levels));
                 }
-                if let Some(cards) = mesh.leaves.first()
-                    && !cards.is_empty()
+                // Leaves draw in two slots, which cross-fade between leaf LOD levels.
+                if mesh.leaves.first().is_some_and(|c| !c.is_empty())
                     && let Some(m) = leaf_material
                 {
-                    spt.push((self.spt_leaf_cards(&name, cards), m));
+                    let (sm, levels) = self.spt_leaf_cards(&name, &mesh.leaves);
+                    for slot in 0..2 {
+                        spt.push((sm, m, TreePart::Leaves(slot), levels.clone()));
+                    }
                 }
-                if let Some(leaves) = mesh.mesh_leaves.first()
-                    && !leaves.is_empty()
+                if mesh.mesh_leaves.first().is_some_and(|l| !l.is_empty())
                     && let Some(m) = leaf_mesh_material
                 {
-                    spt.push((
-                        self.spt_leaf_meshes(&name, leaves, &mesh.leaf_mesh_templates),
-                        m,
-                    ));
+                    let (sm, levels) =
+                        self.spt_leaf_meshes(&name, &mesh.mesh_leaves, &mesh.leaf_mesh_templates);
+                    for slot in 0..2 {
+                        spt.push((sm, m, TreePart::Leaves(slot), levels.clone()));
+                    }
                 }
                 if !spt.is_empty() {
-                    spt_parts.insert(tree, (spt, mesh.leaf_angle_scalars));
+                    spt_parts.insert(
+                        tree,
+                        SptTree {
+                            parts: spt,
+                            leaf_angle_scalars: mesh.leaf_angle_scalars,
+                            counts: [
+                                mesh.branches.lods.len(),
+                                mesh.fronds.lods.len(),
+                                mesh.leaves.len().max(mesh.mesh_leaves.len()),
+                            ],
+                            transition: mesh.transition,
+                        },
+                    );
                 }
                 if let Some(m) = material(self, &atlas, "Punch") {
                     if frond_material.is_none()
@@ -948,7 +1037,7 @@ impl<'a> Loader<'a> {
                 (anchor.x / TREE_CELL).floor() as i64,
                 (anchor.y / TREE_CELL).floor() as i64,
             );
-            if let Some((spt, scalars)) = spt_parts.get(&tree) {
+            if let Some(spt) = spt_parts.get(&tree) {
                 let yaw = {
                     let x = placement.x_axis;
                     x.y.atan2(x.x)
@@ -957,16 +1046,28 @@ impl<'a> Loader<'a> {
                     position: [anchor.x, anchor.y, anchor.z, yaw],
                     scale,
                     color,
-                    leaf_angle_scalars: *scalars,
+                    leaf_angle_scalars: spt.leaf_angle_scalars,
                     wind_offset: 0.0,
                 };
-                for &(mesh, material) in spt {
-                    self.scene
-                        .tree_constants
-                        .insert(self.scene.draws.len(), constants);
+                let (near, far) = TreeLod::range(radius * scale, 0);
+                for (mesh, material, part, levels) in &spt.parts {
+                    let draw = self.scene.draws.len();
+                    self.scene.tree_constants.insert(draw, constants);
+                    self.scene.tree_lods.insert(
+                        draw,
+                        TreeLod {
+                            anchor,
+                            near,
+                            far,
+                            counts: spt.counts,
+                            transition: spt.transition,
+                            part: *part,
+                            levels: levels.clone(),
+                        },
+                    );
                     self.scene.draws.push(DrawItem {
-                        mesh,
-                        material,
+                        mesh: *mesh,
+                        material: *material,
                         transform,
                         lightmap: None,
                         sphere: (transform.transform_point3(Vec3::ZERO), radius * scale),
@@ -976,11 +1077,7 @@ impl<'a> Loader<'a> {
                         probe,
                         skin: None,
                         cast_shadow: Some(false),
-                        lod: Some(DrawLod {
-                            anchor,
-                            far_sq: far * far,
-                            beyond: false,
-                        }),
+                        lod: None,
                     });
                 }
             }
@@ -1065,11 +1162,59 @@ impl<'a> Loader<'a> {
     /// TEXCOORD1 (w, h, pivot x − ½, pivot y − ½), TEXCOORD2 (angle offsets in radians,
     /// leaf-angle index, colour scale), TEXCOORD3 the wind (index, weight, index, weight).
     /// The game stores halves; floats here.
-    fn spt_leaf_cards(&mut self, name: &str, cards: &[LeafCard]) -> usize {
+    /// Every leaf LOD level goes into the one mesh, each with its (first index, count).
+    fn spt_leaf_cards(&mut self, name: &str, levels: &[Vec<LeafCard>]) -> (usize, Vec<(u32, u32)>) {
         use thedas_formats::mesh::{DeclType, VertexElement};
         const STRIDE: u32 = 96;
-        let mut raw: Vec<u8> = Vec::with_capacity(cards.len() * 6 * STRIDE as usize);
-        let mut vertices = Vec::with_capacity(cards.len() * 6);
+        let mut raw: Vec<u8> = Vec::new();
+        let mut vertices = Vec::new();
+        let mut ranges = Vec::with_capacity(levels.len());
+        for cards in levels {
+            let first = vertices.len() as u32;
+            self.pack_leaf_cards(cards, &mut raw, &mut vertices);
+            ranges.push((first, vertices.len() as u32 - first));
+        }
+        let element = |offset: u32, usage: DeclUsage, usage_index: u32| VertexElement {
+            stream: 0,
+            offset,
+            ty: DeclType::Float4,
+            usage,
+            usage_index,
+        };
+        let key = format!("{name}:spt_leafcards");
+        let count = vertices.len() as u32;
+        self.scene.meshes.push(SceneMesh {
+            key: key.clone(),
+            chunk: MeshChunk {
+                name: key,
+                vertex_size: STRIDE,
+                vertex_count: count,
+                index_count: count,
+                primitive: 0,
+                index_format: thedas_formats::mesh::IndexFormat::U32,
+                base_vertex: 0,
+                vertex_offset: 0,
+                start_index: 0,
+                elements: vec![
+                    element(0, DeclUsage::Position, 0),
+                    element(16, DeclUsage::Normal, 0),
+                    element(32, DeclUsage::TexCoord, 0),
+                    element(48, DeclUsage::TexCoord, 1),
+                    element(64, DeclUsage::TexCoord, 2),
+                    element(80, DeclUsage::TexCoord, 3),
+                ],
+                bounds: None,
+            },
+            vertices,
+            indices: (0..count).collect(),
+            raw_vertices: raw,
+            positions: None,
+        });
+        (self.scene.meshes.len() - 1, ranges)
+    }
+
+    /// One level's leaf cards, appended to a leaf-card mesh (see [`Self::spt_leaf_cards`]).
+    fn pack_leaf_cards(&self, cards: &[LeafCard], raw: &mut Vec<u8>, vertices: &mut Vec<Vertex>) {
         for card in cards {
             // The card's size and pivot from its corners: corner 0 is (P8·w, P12·h),
             // corner 2 ((P8 − 1)·w, (P12 − 1)·h).
@@ -1114,43 +1259,6 @@ impl<'a> Loader<'a> {
                 });
             }
         }
-        let element = |offset: u32, usage: DeclUsage, usage_index: u32| VertexElement {
-            stream: 0,
-            offset,
-            ty: DeclType::Float4,
-            usage,
-            usage_index,
-        };
-        let key = format!("{name}:spt_leafcards");
-        let count = vertices.len() as u32;
-        self.scene.meshes.push(SceneMesh {
-            key: key.clone(),
-            chunk: MeshChunk {
-                name: key,
-                vertex_size: STRIDE,
-                vertex_count: count,
-                index_count: count,
-                primitive: 0,
-                index_format: thedas_formats::mesh::IndexFormat::U32,
-                base_vertex: 0,
-                vertex_offset: 0,
-                start_index: 0,
-                elements: vec![
-                    element(0, DeclUsage::Position, 0),
-                    element(16, DeclUsage::Normal, 0),
-                    element(32, DeclUsage::TexCoord, 0),
-                    element(48, DeclUsage::TexCoord, 1),
-                    element(64, DeclUsage::TexCoord, 2),
-                    element(80, DeclUsage::TexCoord, 3),
-                ],
-                bounds: None,
-            },
-            vertices,
-            indices: (0..count).collect(),
-            raw_vertices: raw,
-            positions: None,
-        });
-        self.scene.meshes.len() - 1
     }
 
     /// A tree's branches or fronds as the game packs them for `SPT_Branch` / `SPT_Fronds`
@@ -1158,7 +1266,14 @@ impl<'a> Loader<'a> {
     /// TEXCOORD0 the wind (index, weight, index, weight), TEXCOORD1 the diffuse coordinate.
     /// `indices` is the level's triangle list with the strips' winding, which the branch
     /// state culls by. The game stores halves for the first four; floats here.
-    fn spt_surface(&mut self, name: &str, part: &str, surface: &Part, indices: &[u32]) -> usize {
+    fn spt_surface(&mut self, name: &str, part: &str, surface: &Part) -> (usize, Vec<(u32, u32)>) {
+        // Every LOD level's triangles, one after another, each with its range.
+        let mut indices: Vec<u32> = Vec::new();
+        let mut ranges = Vec::with_capacity(surface.lods.len());
+        for lod in &surface.lods {
+            ranges.push((indices.len() as u32, lod.len() as u32));
+            indices.extend_from_slice(lod);
+        }
         use thedas_formats::mesh::{DeclType, VertexElement};
         const STRIDE: u32 = 96;
         let mut raw: Vec<u8> = Vec::with_capacity(surface.vertices.len() * STRIDE as usize);
@@ -1219,11 +1334,11 @@ impl<'a> Loader<'a> {
                 bounds: None,
             },
             vertices,
-            indices: indices.to_vec(),
+            indices,
             raw_vertices: raw,
             positions: None,
         });
-        self.scene.meshes.len() - 1
+        (self.scene.meshes.len() - 1, ranges)
     }
 
     /// A tree's mesh leaves as the game packs them for `SPT_LeafMeshes`
@@ -1234,49 +1349,54 @@ impl<'a> Loader<'a> {
     fn spt_leaf_meshes(
         &mut self,
         name: &str,
-        leaves: &[MeshLeaf],
+        levels: &[Vec<MeshLeaf>],
         templates: &[Option<LeafMeshTemplate>],
-    ) -> usize {
+    ) -> (usize, Vec<(u32, u32)>) {
         use thedas_formats::mesh::{DeclType, VertexElement};
         const STRIDE: u32 = 128;
         let mut raw: Vec<u8> = Vec::new();
         let mut vertices = Vec::new();
-        let mut indices = Vec::new();
-        for leaf in leaves {
-            let Some(template) = templates.get(leaf.choice).and_then(|t| t.as_ref()) else {
-                continue;
-            };
-            let base = vertices.len() as u32;
-            let (a, b, c) = (leaf.tangent, leaf.binormal, leaf.normal);
-            let p = leaf.position;
-            for v in &template.vertices {
-                let attrs: [[f32; 4]; 8] = [
-                    [v.position[0], v.position[1], v.position[2], 1.0],
-                    [v.normal[0], v.normal[1], v.normal[2], 1.0],
-                    [a[0], b[0], c[0], 1.0],
-                    [a[1], b[1], c[1], 1.0],
-                    [a[2], b[2], c[2], 1.0],
-                    [p[0], p[1], p[2], 1.0],
-                    [v.uv[0], v.uv[1], leaf.angle_index as f32, leaf.color_scale],
-                    [
-                        leaf.wind.matrices[0] as f32,
-                        leaf.wind.weights[0],
-                        leaf.wind.matrices[1] as f32,
-                        leaf.wind.weights[1],
-                    ],
-                ];
-                for attr in attrs {
-                    raw.extend_from_slice(bytemuck::cast_slice(&attr));
+        let mut indices: Vec<u32> = Vec::new();
+        let mut ranges = Vec::with_capacity(levels.len());
+        for leaves in levels {
+            let first = indices.len() as u32;
+            for leaf in leaves {
+                let Some(template) = templates.get(leaf.choice).and_then(|t| t.as_ref()) else {
+                    continue;
+                };
+                let base = vertices.len() as u32;
+                let (a, b, c) = (leaf.tangent, leaf.binormal, leaf.normal);
+                let p = leaf.position;
+                for v in &template.vertices {
+                    let attrs: [[f32; 4]; 8] = [
+                        [v.position[0], v.position[1], v.position[2], 1.0],
+                        [v.normal[0], v.normal[1], v.normal[2], 1.0],
+                        [a[0], b[0], c[0], 1.0],
+                        [a[1], b[1], c[1], 1.0],
+                        [a[2], b[2], c[2], 1.0],
+                        [p[0], p[1], p[2], 1.0],
+                        [v.uv[0], v.uv[1], leaf.angle_index as f32, leaf.color_scale],
+                        [
+                            leaf.wind.matrices[0] as f32,
+                            leaf.wind.weights[0],
+                            leaf.wind.matrices[1] as f32,
+                            leaf.wind.weights[1],
+                        ],
+                    ];
+                    for attr in attrs {
+                        raw.extend_from_slice(bytemuck::cast_slice(&attr));
+                    }
+                    // For the bounds: the leaf's position stands in for the placed vertex.
+                    vertices.push(Vertex {
+                        position: p,
+                        normal: c,
+                        uv0: v.uv,
+                        uv1: [0.0, 0.0],
+                    });
                 }
-                // For the bounds: the leaf's position stands in for the placed vertex.
-                vertices.push(Vertex {
-                    position: p,
-                    normal: c,
-                    uv0: v.uv,
-                    uv1: [0.0, 0.0],
-                });
+                indices.extend(template.indices.iter().map(|i| base + i));
             }
-            indices.extend(template.indices.iter().map(|i| base + i));
+            ranges.push((first, indices.len() as u32 - first));
         }
         let element = |offset: u32, usage: DeclUsage, usage_index: u32| VertexElement {
             stream: 0,
@@ -1315,7 +1435,7 @@ impl<'a> Loader<'a> {
             raw_vertices: raw,
             positions: None,
         });
-        self.scene.meshes.len() - 1
+        (self.scene.meshes.len() - 1, ranges)
     }
 
     /// A SpeedTree surface as a scene mesh.
@@ -2663,6 +2783,40 @@ fn name_of_tree(trees: &[String], tree: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_tree_part_draws_its_level_inside_the_far_distance_only() {
+        let lod = |part| TreeLod {
+            anchor: Vec3::ZERO,
+            near: 15.0,
+            far: 35.0,
+            counts: [3, 3, 3],
+            transition: Default::default(),
+            part,
+            levels: vec![(0, 30), (30, 18), (48, 6)],
+        };
+        // Inside near: the full level, at the target alpha reference.
+        let eye = Vec3::new(5.0, 0.0, 0.0);
+        assert_eq!(lod(TreePart::Branches).frame(eye), Some((0, 30, 0.0)));
+        assert_eq!(lod(TreePart::Fronds).frame(eye), Some((0, 30, 84.0)));
+        assert_eq!(lod(TreePart::Leaves(0)).frame(eye), Some((0, 30, 84.0)));
+        assert_eq!(lod(TreePart::Leaves(1)).frame(eye), None);
+        // Beyond far: nothing (the billboard's range).
+        let eye = Vec3::new(40.0, 0.0, 0.0);
+        assert_eq!(lod(TreePart::Branches).frame(eye), None);
+        assert_eq!(lod(TreePart::Fronds).frame(eye), None);
+        // Part way: a lower branch level.
+        let eye = Vec3::new(30.0, 0.0, 0.0);
+        let (first, _, _) = lod(TreePart::Branches).frame(eye).unwrap();
+        assert!(first > 0);
+    }
+
+    #[test]
+    fn the_lod_distances_follow_the_radius() {
+        assert_eq!(TreeLod::range(1.0, 0), (15.0, 35.0));
+        assert_eq!(TreeLod::range(30.0, 0), (20.0, 120.0));
+        assert_eq!(TreeLod::range(30.0, 2), (40.0, 240.0));
+    }
     use super::*;
 
     #[test]
