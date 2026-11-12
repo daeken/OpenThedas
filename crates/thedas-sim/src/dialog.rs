@@ -554,13 +554,13 @@ impl Sim {
 
     /// The conversation takes the game (DAOrigins.exe 0x697765: `SetGameMode(4)`, which the
     /// mode controller grants at once even over combat, 0x640c60): the module hears
-    /// GAMEMODE_CHANGE (GM_CONVERSATION, the old mode), on which module_core takes the party out
+    /// GAMEMODE_CHANGE (GM_DIALOG, the old mode), on which module_core takes the party out
     /// of combat. Provisional: the mode the game returns to afterwards (the one replaced, or
     /// one a script asked for meanwhile) is not traced.
     fn enter_conversation_mode(&mut self) {
         let Some(talk_mode) = self
             .table
-            .constant("GM_CONVERSATION")
+            .constant("GM_DIALOG")
             .and_then(|c| match &c.value {
                 thedas_script::ldf::ConstValue::Int(v) => Some(*v as i32),
                 _ => None,

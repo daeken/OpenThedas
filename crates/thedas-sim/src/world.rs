@@ -530,7 +530,7 @@ pub struct World {
     #[serde(default)]
     pub alerts: Vec<crate::journal::Alert>,
     pub game_mode: i32,
-    /// While a conversation holds the game (`GM_CONVERSATION`): the mode it replaced, and a
+    /// While a conversation holds the game (`GM_DIALOG`, 4): the mode it replaced, and a
     /// mode a script asked for meanwhile, which waits until the conversation ends.
     #[serde(default)]
     pub mode_before_talk: Option<i32>,
