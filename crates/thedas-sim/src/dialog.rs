@@ -52,6 +52,11 @@ pub struct Node {
     /// answers `DialogIsAmbient` from it (0x7f049a).
     #[serde(default)]
     pub ambient: bool,
+    /// The cutscene the line plays (field 12211 when it is a `CUTR` reference: its 12210,
+    /// a `.cut` resource). An inline `CUT` (the line's own staging) is not one: the
+    /// presentation stages those (`thedas_formats::stage`).
+    #[serde(default)]
+    pub cutscene: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -144,6 +149,19 @@ impl Dlg {
                     .unwrap_or(0)
                     .clamp(0, 2) as u8,
                 ambient: g.field(*id, 12207).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+                cutscene: match g.field(*id, 12211) {
+                    Some(Value::Struct(s)) => *s,
+                    Some(Value::Generic(slot)) => match &slot.value {
+                        Some(Value::Struct(s)) => *s,
+                        _ => None,
+                    },
+                    _ => None,
+                }
+                .filter(|&c| g.template_of(c).label.0 == *b"CUTR")
+                .and_then(|c| g.field(c, 12210))
+                .and_then(|v| v.as_str())
+                .map(|x| x.trim_end_matches('\0').trim().to_string())
+                .filter(|x| !x.is_empty()),
             });
         }
         let n = nodes.len();
@@ -175,6 +193,14 @@ pub struct Conversation {
     /// NPC lines just spoken one after another (guards against looping chains).
     #[serde(default)]
     pub chain: Vec<usize>,
+    /// The line whose cutscene was queued last, which the cutscene's spoken lines are
+    /// counted from (see [`Sim::dialog_cutscene_lines`]).
+    #[serde(default)]
+    pub cut_from: Option<usize>,
+    /// Lines of the conversation the queued cutscene still says after the one that queued
+    /// it: the conversation walks on through them (single unspoken replies) as it speaks.
+    #[serde(default)]
+    pub cut_lines_left: u32,
 }
 
 /// An open conversation as presentation sees it: its dialog (resource name without
@@ -276,6 +302,22 @@ impl Sim {
         let node = c.dlg.nodes[line].clone();
         self.mark_shown(&mut c, line);
         self.node_action(&node, c.owner);
+        if let Some(cut) = node.cutscene.as_ref().filter(|_| !node.ambient) {
+            // The line's cutscene plays (GameModeDialog 0x7f1d46 -> 0x690b70); the lines it
+            // says of this conversation are walked as it is spoken.
+            let says = self.dialog_cutscene_lines(cut, &c.dlg.name);
+            c.cut_from = Some(line);
+            c.cut_lines_left = says.saturating_sub(1);
+            // Once: a conversation begun again at the same line (scripts begin it more
+            // than once) does not queue it twice.
+            let res = crate::cutscene::Cutscene::resource(cut);
+            let queued = self.world.dialog_cutscenes.contains(&res)
+                || self.world.cutscene.as_ref().is_some_and(|p| p.name == res);
+            if !queued {
+                self.world.cutscenes.push(cut.clone());
+                self.world.dialog_cutscenes.push(res);
+            }
+        }
         let text = self.node_text(&node);
         let speaker = match node.speaker.as_str() {
             "OWNER" | "" => c.owner,
@@ -306,9 +348,44 @@ impl Sim {
             }
         }
         c.chain.clear();
+        // A line its cutscene says goes by on its own: a single unspoken reply is taken.
+        if c.cut_lines_left > 0
+            && let [r] = replies[..]
+            && c.dlg.nodes[r].reply
+            && self.node_text(&c.dlg.nodes[r]).trim().is_empty()
+        {
+            c.cut_lines_left -= 1;
+            let reply = c.dlg.nodes[r].clone();
+            self.mark_shown(&mut c, r);
+            self.node_action(&reply, c.owner);
+            let next = reply.children.iter().copied().find(|&n| self.usable(&c, n));
+            if let Some(next) = next.filter(|&n| !c.dlg.nodes[n].reply && n != line) {
+                return self.speak(c, next);
+            }
+        }
+        c.cut_lines_left = 0;
         c.ended = replies.is_empty();
         c.replies = replies;
         c
+    }
+
+    /// How many lines of conversation `dlg` cutscene `cut` says (its `ASLN` tracks naming
+    /// that conversation, 5562). Provisional: a cutscene's spoken lines are taken to be
+    /// the conversation's lines in the order it walks them, from the line that plays it.
+    pub fn dialog_cutscene_lines(&self, cut: &str, dlg: &str) -> u32 {
+        let res = crate::cutscene::Cutscene::resource(cut);
+        let Some(g) = self
+            .vfs
+            .read(&res)
+            .ok()
+            .and_then(|(data, _)| Gff4::parse(&data).ok())
+        else {
+            return 0;
+        };
+        crate::cutscene::dialog_refs(&g)
+            .iter()
+            .filter(|r| r.dialog.eq_ignore_ascii_case(dlg))
+            .count() as u32
     }
 
     /// Starts a conversation between `initiator` and `target` (the owner); an empty `dlg`
@@ -358,6 +435,8 @@ impl Sim {
             ended: false,
             shown: Vec::new(),
             chain: Vec::new(),
+            cut_from: None,
+            cut_lines_left: 0,
         };
         let start = d.starts.iter().copied().find(|&s| self.usable(&c, s));
         let c = match start {
@@ -573,6 +652,8 @@ mod tests {
             ended: false,
             shown: vec![],
             chain: vec![],
+            cut_from: None,
+            cut_lines_left: 0,
         });
         let c = sim.talk.take().unwrap();
         let c = sim.speak(c, 0);
@@ -598,6 +679,7 @@ mod tests {
             children,
             show_once,
             ambient: false,
+            cutscene: None,
         };
         let d = Dlg {
             name: "cage".into(),
@@ -624,6 +706,8 @@ mod tests {
                 ended: false,
                 shown: vec![],
                 chain: vec![],
+                cut_from: None,
+                cut_lines_left: 0,
             };
             let c = sim.speak(c, 0);
             sim.talk = Some(c);
@@ -646,6 +730,7 @@ mod tests {
             children: vec![],
             show_once: 0,
             ambient,
+            cutscene: None,
         };
         let mut sim = Sim::new(
             std::sync::Arc::new(thedas_vfs::Vfs::new()),
@@ -665,6 +750,8 @@ mod tests {
             ended: false,
             shown: vec![],
             chain: vec![],
+            cut_from: None,
+            cut_lines_left: 0,
         };
         assert!(sim.usable(&c, 0) && sim.dialog_ambient);
         assert!(sim.usable(&c, 1) && !sim.dialog_ambient);
@@ -672,5 +759,50 @@ mod tests {
         assert!(sim.dialog_ambient, "the ambient line's action ran");
         sim.speak(c, 1);
         assert!(!sim.dialog_ambient);
+    }
+
+    #[test]
+    fn a_line_that_plays_a_cutscene_queues_it_once() {
+        let node = |cutscene: Option<&str>, ambient: bool| Node {
+            reply: false,
+            strref: None,
+            text: Some("...".into()),
+            speaker: String::new(),
+            listener: String::new(),
+            condition: PlotRef::default(),
+            action: PlotRef::default(),
+            children: vec![],
+            show_once: 0,
+            ambient,
+            cutscene: cutscene.map(Into::into),
+        };
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let c = Conversation {
+            dlg: Dlg {
+                name: "father".into(),
+                starts: vec![0],
+                nodes: vec![node(Some("intro"), false), node(Some("bark_cut"), true)],
+            },
+            owner: 1,
+            player: 2,
+            line: None,
+            replies: vec![],
+            ended: false,
+            shown: vec![],
+            chain: vec![],
+            cut_from: None,
+            cut_lines_left: 0,
+        };
+        let c = sim.speak(c, 0);
+        assert_eq!(c.cut_from, Some(0));
+        // Begun again at the same line, it is not queued twice; an ambient line plays none.
+        let c = sim.speak(c, 0);
+        sim.speak(c, 1);
+        assert_eq!(sim.world.cutscenes, ["intro"]);
+        assert_eq!(sim.world.dialog_cutscenes, ["intro.cut"]);
     }
 }

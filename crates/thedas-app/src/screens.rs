@@ -381,6 +381,7 @@ mod tests {
             seconds: 1.0,
             lines: Vec::new(),
             elapsed_ms: 0,
+            from_dialog: false,
         });
         assert_eq!(
             wanted(&sim, Some(Screen::Inventory)),
