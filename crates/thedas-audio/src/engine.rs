@@ -427,7 +427,10 @@ impl AudioEngine {
             rate,
             age: 0.0,
         };
-        log::debug!("audio: play {path}");
+        log::debug!(
+            "audio: play {path} (pitch x{rate:.3} = {:+.2} semitones, random gain x{random_gain:.3})",
+            12.0 * rate.log2()
+        );
         self.instances.push(inst);
         self.update(0.0);
         Some(handle)

@@ -201,8 +201,21 @@ analysis found (it may have lost them in a helper function): `MELEE_ATTACK_START
 `OPTIONS_CHANGED`, `PLOT_COMPLETED`, `PARTY_MONEY_CHANGED`, `CODEX_CHANGED`, `CRAFT_ITEM` and
 three `TRAINING_*` events.
 
-Which of these the original's engine raises is not traced. `EVENT_TYPE_DAMAGED` is the one to
-start with.
+Traced since (testdata notes `combat-events-trace.md`, `placeable-area-events-trace.md`, from every
+call to the exe's event constructor 0x69bac0):
+
+- **Script-raised only, nothing to do:** `DAMAGED`, `SPELLCASTAT`, `COMBAT_INITIATED`, `UNLOCKED`,
+  `LOCKED`, `FAILTOOPEN`, `BLOCKED`, `CLICK`, `TRAP_DISARMED` have no engine sender. The health
+  change handler (0x6bc4b0) builds no event.
+- **Now raised:** `MANA_STAM_DEPLETED` (0x6afb90), the `AREALOADSAVE_*` trio on loading a save
+  (0x67f1c0, 0x6c90ab, 0x6c92b9) and `MODULE_PRESAVE` before a save (0x5d6c40).
+- **Engine-raised, still missing here:** `ITEM_ONHIT` (0x757fc0, one per on-hit item property on a
+  hit, to the item; the ranged path stores them on the projectile), `TRAP_TRIGGERED` (physics touch
+  0x74f900, and a trapped placeable's use 0x7a7a96 instead of `USE`), `PLACEABLE_COLLISION`
+  (0x74daa0, the controlled creature touching a placeable, once per placeable),
+  `PLACEABLE_ONCLICK` (0x7f6550, with `ON_ORDER_RECEIVED`), `GIFT_ITEM` (0x718210),
+  `USE_PLOTACTION` (0x6fc480) and `GUI_OPENED` (0x60aeb0). `USE` also carries int 0 = 1 when the
+  user stands on the placeable's front side.
 
 ### Commands that do nothing, by how often scripts build them
 
@@ -334,7 +347,7 @@ Dispatch summary: `engine::call` (`crates/thedas-sim/src/engine.rs:483`) matches
 
 ### Events
 
-- **SCR-063** **Event types the engine never raises.** Original: not traced. Ours: engine code raises only SPAWN, ENTER, EXIT, AREALOAD_SPECIAL, AREALOAD_PRELOADEXIT, AREALOAD_POSTLOADEXIT, MODULE_LOAD, MODULE_START, HEARTBEAT2, AOE_HEARTBEAT, PERCEPTION_APPEAR, PERCEPTION_DISAPPEAR, APPLY_EFFECT, REMOVE_EFFECT, DEATH, COMMAND_PENDING, COMMAND_COMPLETE, ATTACK_IMPACT, ABILITY_CAST_START, ABILITY_CAST_IMPACT, ABILITY_PROJECTILE_LAUNCHED, EQUIP, UNEQUIP, INVENTORY_ADDED, INVENTORY_REMOVED, GET_PLOT, SET_PLOT, GAMEMODE_CHANGE, POPUP_RESULT, PARTYMEMBER_ADDED, PARTYMEMBER_DROPPED, PARTYPICKER_INIT, PARTYPICKER_CLOSED, PLAYERLEVELUP, the CHARGEN_* family, DIALOGUE, USE, BEGIN_TRAVEL, WORLDMAP_PRETRANSITION, WORLDMAP_POSTTRANSITION and event 1066 (individual AoE impact). Any other EVENT_TYPE_* constant in script.ldf reaches scripts only if a script signals it. Candidates to check against script.ldf and the exe include a periodic HEARTBEAT, DAMAGED, ATTACKED, DYING, CAST_AT, COMBAT_END, door/placeable OPENED/CLOSED/UNLOCKED, trap events and a module pre-save/load event; none appears anywhere in the code. Evidence: `crates/thedas-sim/src/sim.rs:734-740` (all raised events go through `new_event`), `crates/thedas-sim/src/engine.rs:4076`. Size: L. Depends: none. Kind: unverified.
+- **SCR-063** **Engine-raised events still missing.** Original: traced (see "Event types scripts handle that the engine never raises" above). Ours: `ITEM_ONHIT`, `TRAP_TRIGGERED`, `PLACEABLE_COLLISION`, `PLACEABLE_ONCLICK` (with `ON_ORDER_RECEIVED`), `GIFT_ITEM`, `USE_PLOTACTION` and the front-side int on `USE` are not raised. Evidence: testdata notes `combat-events-trace.md`, `placeable-area-events-trace.md`. Size: M. Depends: placeable physics shapes for the touch events. Kind: missing.
 - **SCR-064** **Load and new-game event order is provisional.** Original: not traced. Ours: MODULE_LOAD then MODULE_START on a new game; SPAWN for each spawned creature/placeable, AREALOAD_SPECIAL, AREALOAD_PRELOADEXIT, ENTER for the hero, AREALOAD_POSTLOADEXIT on area load, all at delay 0. Evidence: `crates/thedas-sim/src/sim.rs:2732-2736`, `sim.rs:2956-2976`. Size: S. Depends: none. Kind: provisional.
 - **SCR-065** **Event delivery to objects without a script is silent.** Original: not traced. Ours: `deliver` returns without a trace when the target has no script and none was given. Evidence: `crates/thedas-sim/src/sim.rs:566-568`. Size: S. Depends: SCR-011. Kind: unverified.
 - **SCR-066** **Events and commands tie order is a guess.** Original: not traced. Ours: on a tie an event runs before a finishing command; events at the same time run in queue order. Evidence: `crates/thedas-sim/src/sim.rs:813-828`. Size: S. Depends: none. Kind: unverified.

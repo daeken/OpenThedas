@@ -403,7 +403,7 @@ fn check_other(
     } else if ext == "spt" {
         thedas_formats::speedtree::parse(data)
             .map_err(|e| e.to_string())
-            .and_then(|tree| thedas_formats::speedtree_gen::check_curves(&tree))
+            .and_then(|tree| thedas_formats::speedtree_gen::check(&tree))
     } else if ext == "ldf" {
         EngineTable::parse(data)
             .map(|_| ())
