@@ -183,6 +183,8 @@ struct AreaPlay {
     preset: Option<String>,
     /// Which reverb triggers the party leader was inside last frame.
     inside: Vec<bool>,
+    /// Which music volumes the party leader was inside last frame.
+    music_inside: Vec<bool>,
 }
 
 /// A cutscene's sound tracks and which of them are playing.
@@ -240,6 +242,9 @@ pub struct GameAudio {
     foley: Foley,
     /// The music's `music_state` (scripts' `SetMusicIntensity`; 1 until one sets it).
     music_state: f32,
+    /// A music volume's request waiting for its delay: the intensity and the seconds left
+    /// (see `AreaReverb::music_entered`).
+    music_request: Option<(i32, f32)>,
     /// `ss_types.gda`: each sound set type's first entry row and default probability.
     ss_types: std::collections::HashMap<i32, (i64, f32)>,
     /// Each sound set's entries (`sse_<set>.gda`: entry row -> line strref), read once.
@@ -606,6 +611,7 @@ impl GameAudio {
             impacts: Impacts::read(vfs),
             foley: Foley::read(vfs),
             music_state: 1.0,
+            music_request: None,
             ss_types: ss_types(vfs),
             sound_set_entries: Default::default(),
             sound_set_bags: Default::default(),
@@ -1145,6 +1151,7 @@ impl GameAudio {
             reverb,
             preset: None,
             inside: Vec::new(),
+            music_inside: Vec::new(),
         });
     }
 
@@ -1165,6 +1172,19 @@ impl GameAudio {
                 (_, Some((_, h))) => self.engine.stop(h, false),
                 _ => {}
             }
+        }
+    }
+
+    /// Sets the music's intensity, `music_state` on the area track (DAOrigins.exe's
+    /// SetMusicIntensity, 0x5c0150, sets it on the theme's main, combat and third events).
+    fn set_music_state(&mut self, s: f32) {
+        if s == self.music_state {
+            return;
+        }
+        log::debug!("audio: music state {s}");
+        self.music_state = s;
+        if let Some((_, h)) = self.area.as_ref().and_then(|a| a.track) {
+            self.engine.set_parameter(h, "music_state", s);
         }
     }
 
@@ -1267,6 +1287,13 @@ impl GameAudio {
                 want = e.to_string();
             }
             a.inside = now;
+            // A music volume entered replaces any request still waiting.
+            let (now, request) = a.reverb.music_entered(&a.music_inside, p);
+            if let Some((s, delay)) = request {
+                log::debug!("audio: music volume asks for music state {s} after {delay} s");
+                self.music_request = Some((s, delay));
+            }
+            a.music_inside = now;
         }
         let want = want.as_str();
         if a.preset.as_deref() != Some(want) {
@@ -1538,14 +1565,23 @@ impl GameAudio {
         // Scripts' SetMusicIntensity sets the area music's `music_state` (DAOrigins.exe logs
         // it as "music state= %2.1f"): the tracks' sounds sit around 1, so 0 silences the
         // music (pre100pt_light_beacon) and cutscene endings (gen00cs_cs_end_music_int_*)
-        // set 0 to 4. Provisional: read from the data and the scripts, not traced.
-        if let Some(i) = state.music_intensity.take()
-            && i as f32 != self.music_state
-        {
-            self.music_state = i as f32;
-            if let Some((_, h)) = self.area.as_ref().and_then(|a| a.track) {
-                self.engine
-                    .set_parameter(h, "music_state", self.music_state);
+        // set 0 to 4. Provisional: that scripts reach the music object's SetMusicIntensity
+        // (0x5c0150) directly is not traced.
+        if let Some(i) = state.music_intensity.take() {
+            self.set_music_state(i as f32);
+        }
+        // A music volume's request (see `AreaReverb::music_entered`) counts down on the
+        // music director's update (0x5bb630, given the frame's seconds as the music update
+        // is) and then sets the intensity (0x5b6df0 -> the music object's SetMusicIntensity,
+        // vtable slot 0x1c). A delay of 0 applies on the next update.
+        // Provisional: the director skips the countdown in game mode 9 (0x5bb669), which is
+        // not identified, so it is not modelled.
+        if let Some((s, left)) = self.music_request.as_mut() {
+            *left -= dt;
+            if *left <= 0.0 {
+                let s = *s as f32;
+                self.music_request = None;
+                self.set_music_state(s);
             }
         }
         self.follow_area(&state, dt);

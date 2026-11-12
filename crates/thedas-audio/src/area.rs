@@ -1,7 +1,8 @@
 //! What an area's `.are` says about its sound: the music theme (`MusicPreset`), the
 //! sounds placed in it (`SoundList`: an FMOD event at a position, its volume in dB, a
 //! multiplier on its reach and whether it starts on), and its reverb (`ReverbPreset`, and
-//! reverb triggers: regions with their own preset).
+//! reverb triggers: regions with their own preset), and its music volumes (regions that
+//! set the music's intensity).
 
 /// A sound placed in an area (`SoundList`): an FMOD event at a position.
 #[derive(Clone, Debug, PartialEq)]
@@ -92,31 +93,66 @@ pub struct ReverbTrigger {
 impl ReverbTrigger {
     /// Whether `p` is inside the outline (on the ground plane).
     pub fn contains(&self, p: [f32; 3]) -> bool {
-        if self.outline.len() < 3 {
-            return false;
+        outline_contains(self.position, self.yaw, &self.outline, p)
+    }
+}
+
+/// Whether `p` is inside a trigger's `outline` (relative to `position`, rotated by `yaw`
+/// about Z), on the ground plane.
+fn outline_contains(position: [f32; 3], yaw: f32, outline: &[[f32; 2]], p: [f32; 3]) -> bool {
+    if outline.len() < 3 {
+        return false;
+    }
+    let (dx, dy) = (p[0] - position[0], p[1] - position[1]);
+    let (s, c) = (-yaw).sin_cos();
+    let (x, y) = (dx * c - dy * s, dx * s + dy * c);
+    let mut inside = false;
+    let n = outline.len();
+    for i in 0..n {
+        let [xi, yi] = outline[i];
+        let [xj, yj] = outline[(i + n - 1) % n];
+        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+            inside = !inside;
         }
-        let (dx, dy) = (p[0] - self.position[0], p[1] - self.position[1]);
-        let (s, c) = (-self.yaw).sin_cos();
-        let (x, y) = (dx * c - dy * s, dx * s + dy * c);
-        let mut inside = false;
-        let n = self.outline.len();
-        for i in 0..n {
-            let [xi, yi] = self.outline[i];
-            let [xj, yj] = self.outline[(i + n - 1) % n];
-            if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
-                inside = !inside;
-            }
-        }
-        inside
+    }
+    inside
+}
+
+/// A music volume: a `TriggerList` entry of `Type` 5 (DAOrigins.exe's
+/// CCTriggerAudioMusicVolume; its loader 0x799ad0 reads `EnterState`, `ExitState`,
+/// `EnterStateDelay` and `ExitStateDelay`, the delays in milliseconds scaled by 0.001 to
+/// seconds).
+///
+/// Entering it asks for the music intensity `state` after `delay` seconds (the enter
+/// handler 0x799380 -> 0x5b6e80 -> 0x5b6cd0 stores both on the music director, replacing
+/// any request still waiting). Leaving does nothing: the handler ignores it, so
+/// `ExitState` and `ExitStateDelay` are read but unused.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MusicTrigger {
+    pub state: i32,
+    /// Seconds.
+    pub delay: f32,
+    pub position: [f32; 3],
+    /// Rotation about Z, radians.
+    pub yaw: f32,
+    /// The outline, relative to `position` before rotation.
+    pub outline: Vec<[f32; 2]>,
+}
+
+impl MusicTrigger {
+    /// Whether `p` is inside the outline (on the ground plane).
+    pub fn contains(&self, p: [f32; 3]) -> bool {
+        outline_contains(self.position, self.yaw, &self.outline, p)
     }
 }
 
 /// An area's reverb: its own preset (`ReverbPreset`, empty for none) and its reverb
-/// triggers.
+/// triggers; and its music volumes, which are triggers of the same kind.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AreaReverb {
     pub preset: String,
     pub triggers: Vec<ReverbTrigger>,
+    pub music: Vec<MusicTrigger>,
 }
 
 impl AreaReverb {
@@ -176,6 +212,23 @@ impl AreaReverb {
         }
         (now, preset)
     }
+
+    /// The music request as the party leader moves from where `was` says it was to `p`:
+    /// the intensity and delay of a music volume it has just entered (see
+    /// [`MusicTrigger`]), and which volumes it is inside.
+    ///
+    /// Provisional, as for [`AreaReverb::entered`]: that the party leader's entering is
+    /// what counts, and that of several entered in one step the last listed wins.
+    pub fn music_entered(&self, was: &[bool], p: [f32; 3]) -> (Vec<bool>, Option<(i32, f32)>) {
+        let now: Vec<bool> = self.music.iter().map(|t| t.contains(p)).collect();
+        let mut request = None;
+        for (i, t) in self.music.iter().enumerate() {
+            if now[i] && !was.get(i).copied().unwrap_or(false) {
+                request = Some((t.state, t.delay));
+            }
+        }
+        (now, request)
+    }
 }
 
 /// The area's reverb, from its `.are`.
@@ -206,17 +259,14 @@ pub fn area_reverb(data: &[u8]) -> AreaReverb {
     let mut out = AreaReverb {
         preset: text(root, "ReverbPreset"),
         triggers: Vec::new(),
+        music: Vec::new(),
     };
     if let Some(Value::List(items)) = get(root, "TriggerList") {
         for &i in items {
             let Some(t) = g.structs.get(i as usize) else {
                 continue;
             };
-            let preset = text(t, "ReverbPreset");
             let kind = num(t, "Type");
-            if get(t, "ReverbPreset").is_none() || (kind != 3.0 && kind != 4.0) {
-                continue;
-            }
             let mut outline = Vec::new();
             if let Some(Value::List(points)) = get(t, "Geometry") {
                 for &p in points {
@@ -225,16 +275,33 @@ pub fn area_reverb(data: &[u8]) -> AreaReverb {
                     }
                 }
             }
+            let position = [
+                num(t, "XPosition"),
+                num(t, "YPosition"),
+                num(t, "ZPosition"),
+            ];
+            let yaw = 2.0 * num(t, "ZOrientation").atan2(num(t, "WOrientation"));
+            if kind == 5.0 {
+                out.music.push(MusicTrigger {
+                    state: num(t, "EnterState") as i32,
+                    // The loader's `fild` and `fmul` by the double 0.001 (0xae7118), stored as a
+                    // float.
+                    delay: (num(t, "EnterStateDelay") as f64 * 0.0010000000474974513) as f32,
+                    position,
+                    yaw,
+                    outline,
+                });
+                continue;
+            }
+            if get(t, "ReverbPreset").is_none() || (kind != 3.0 && kind != 4.0) {
+                continue;
+            }
             out.triggers.push(ReverbTrigger {
-                preset,
+                preset: text(t, "ReverbPreset"),
                 volume: kind == 4.0,
                 priority: num(t, "Priority") as i32,
-                position: [
-                    num(t, "XPosition"),
-                    num(t, "YPosition"),
-                    num(t, "ZPosition"),
-                ],
-                yaw: 2.0 * num(t, "ZOrientation").atan2(num(t, "WOrientation")),
+                position,
+                yaw,
                 outline,
             });
         }
@@ -349,7 +416,23 @@ mod tests {
                 trigger("", 4, 50.0, vec![3, 4, 5, 6]),
             ],
         };
+        let mut g = g;
+        g.structs[7].fields.push(f("EnterState", Value::Int(4)));
+        g.structs[7]
+            .fields
+            .push(f("EnterStateDelay", Value::Int(2000)));
+        g.structs[7].fields.push(f("ExitState", Value::Int(1)));
         let r = area_reverb(&g.write().unwrap());
+        // The music volume asks for its state on entering, after its delay in seconds;
+        // leaving asks for nothing.
+        assert_eq!(r.music.len(), 1);
+        assert_eq!((r.music[0].state, r.music[0].delay), (4, 2.0));
+        let (was, req) = r.music_entered(&[], [39.0, 1.0, 0.0]);
+        assert_eq!(req, Some((4, 2.0)));
+        let (was, req) = r.music_entered(&was, [40.0, 0.0, 0.0]);
+        assert_eq!(req, None);
+        let (was, req) = r.music_entered(&was, [0.0, 0.0, 0.0]);
+        assert_eq!((was, req), (vec![false], None));
         assert_eq!(r.preset, "Forest");
         assert_eq!(r.triggers.len(), 3);
         let (_, set) = r.entered(&[], [50.0, 0.0, 0.0]);
