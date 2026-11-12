@@ -132,6 +132,10 @@ pub struct UiLayer {
     level: Option<String>,
     /// Frames since the minimap's creatures were last sent.
     minimap_frame: u32,
+    /// tooltips.gfx's fixed tooltip text last frame, and whether it changed then: the box is
+    /// laid out again a frame after (see `thedas_ui::avm1::TOOLTIP_RELAYOUT`).
+    tooltip_text: Option<thedas_ui::UiValue>,
+    tooltip_relayout: u8,
     portraits: PortraitClock,
     paperdoll: PaperdollClock,
     /// Where the player's games are saved (none: the save and load screens list nothing).
@@ -291,6 +295,8 @@ impl UiLayer {
             line: None,
             level: None,
             minimap_frame: 0,
+            tooltip_text: None,
+            tooltip_relayout: 0,
             portraits: PortraitClock::default(),
             paperdoll: PaperdollClock::default(),
             saves: None,
@@ -621,6 +627,19 @@ impl UiLayer {
         }
         self.show_cutscene_line(sim);
         let messages = self.stage.tick(dt_ms);
+        let tip = self.stage.bridge.value("GUI.TooltipText");
+        if tip != self.tooltip_text {
+            self.tooltip_relayout = 6;
+            self.tooltip_text = tip;
+        }
+        // The fixed tooltip whose text changed is laid out again over the next few frames,
+        // once the movie has shown it and its text has been laid out (the value reaches the
+        // movie a frame or two after it is set; see `thedas_ui::avm1::TOOLTIP_RELAYOUT`).
+        if self.tooltip_relayout > 0 {
+            self.tooltip_relayout -= 1;
+            self.stage
+                .call_in("tooltips.gfx", thedas_ui::avm1::TOOLTIP_RELAYOUT, &[]);
+        }
         let ignored = {
             let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             thedas_ui::input::apply_all(&mut sim, &messages)

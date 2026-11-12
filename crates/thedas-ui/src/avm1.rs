@@ -39,6 +39,14 @@ pub const EMPTY: &str = "\u{200B}";
 /// `ExternalInterface.call`; wrapped to turn [`EMPTY`] back into `""`.
 pub const VALUE_GETTERS: &[&str] = &["GetValue", "GetString"];
 
+/// Lays tooltips.gfx's fixed tooltip out again (`_root.FixedTooltip_mc.ResizeTooltip()`, then
+/// `PositionTooltip` at `_root.FixedTooltipAnchor_mc`, as `Tooltips.UpdateFixedTooltip` places
+/// it). The movie sizes the box from its text clip's height straight after setting the text
+/// wrapped; Ruffle reports the unwrapped height until the frame has run, so the box came out
+/// short and its text ran off the screen. The host calls this a frame after the tooltip's text
+/// changes. Provisional: `GUI.QuickbarXMax`'s 48-pixel lift is not applied (nothing sets it).
+pub const TOOLTIP_RELAYOUT: &str = "_global.thedas_tooltip_relayout";
+
 /// The function the host calls once, after starting a movie, to wrap [`PRE_CALLS`] (the
 /// movies define those classes after the first frame's actions run).
 pub const INSTALL: &str = "_global.thedas_install";
@@ -171,6 +179,7 @@ const DEFINE_FUNCTION: u8 = 0x9b;
 const NEW_OBJECT: u8 = 0x40;
 const ADD2: u8 = 0x47;
 const INIT_ARRAY: u8 = 0x42;
+const INIT_OBJECT: u8 = 0x43;
 
 enum Push<'a> {
     Str(&'a str),
@@ -1239,6 +1248,37 @@ fn push(out: &mut Vec<u8>, values: &[Push]) {
     record(out, PUSH, &b);
 }
 
+/// `function () { var t = _root.FixedTooltip_mc; t.ResizeTooltip(); t.PositionTooltip({x:
+/// _root.FixedTooltipAnchor_mc._x, y: _root.FixedTooltipAnchor_mc._y, width: 0, height: 0}); }`
+/// (see [`TOOLTIP_RELAYOUT`]).
+fn tooltip_relayout_function() -> Vec<u8> {
+    let mut body = Vec::new();
+    push(&mut body, &[Push::Int(0)]);
+    get_path(&mut body, &["_root", "FixedTooltip_mc"]);
+    push(&mut body, &[Push::Str("ResizeTooltip")]);
+    body.extend_from_slice(&[CALL_METHOD, POP]);
+    push(&mut body, &[Push::Str("x")]);
+    get_path(&mut body, &["_root", "FixedTooltipAnchor_mc", "_x"]);
+    push(&mut body, &[Push::Str("y")]);
+    get_path(&mut body, &["_root", "FixedTooltipAnchor_mc", "_y"]);
+    push(
+        &mut body,
+        &[
+            Push::Str("width"),
+            Push::Int(0),
+            Push::Str("height"),
+            Push::Int(0),
+            Push::Int(4),
+        ],
+    );
+    body.push(INIT_OBJECT);
+    push(&mut body, &[Push::Int(1)]);
+    get_path(&mut body, &["_root", "FixedTooltip_mc"]);
+    push(&mut body, &[Push::Str("PositionTooltip")]);
+    body.extend_from_slice(&[CALL_METHOD, POP]);
+    function(&[], &body)
+}
+
 /// `function (p, m, a) { for (var i = 0; i < a.length; i++) a[i] = _global.thedas_unempty(a[i]);
 /// var o = eval(p); return o[m].apply(o, a); }`
 fn invoke_function() -> Vec<u8> {
@@ -1320,6 +1360,10 @@ pub fn register_invoke() -> Vec<u8> {
         push(&mut out, &[Push::Str("thedas_wrap")]);
         out.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
     }
+    get_path(&mut out, &["_global"]);
+    push(&mut out, &[Push::Str("thedas_tooltip_relayout")]);
+    out.extend(tooltip_relayout_function());
+    out.push(SET_MEMBER);
     // _global.thedas_prewrap = prewrap_maker; _global.thedas_install wraps the PRE_CALLS
     // functions (the host calls it once the movie's classes exist, see `INSTALL`).
     get_path(&mut out, &["_global"]);
