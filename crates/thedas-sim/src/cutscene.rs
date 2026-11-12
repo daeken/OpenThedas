@@ -181,6 +181,8 @@ pub struct DialogRef {
     pub actor: String,
     /// The conversation (resource name without `.dlg`).
     pub dialog: String,
+    /// The track's field 5564 (see [`CutsceneLine::vo_mode`]).
+    pub vo_mode: u8,
 }
 
 /// A cutscene's lines that say a conversation's lines, by start time.
@@ -221,11 +223,16 @@ pub fn dialog_refs(g: &Gff4) -> Vec<DialogRef> {
             if end < start {
                 continue;
             }
+            let vo_mode = g
+                .field(track, FIELD_LINE_VO)
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0) as u8;
             out.push(DialogRef {
                 start,
                 end,
                 actor: name.clone(),
                 dialog,
+                vo_mode,
             });
         }
     }

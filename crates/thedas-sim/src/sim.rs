@@ -898,6 +898,8 @@ impl Sim {
                     end: r.end.clamp(0.0, c.seconds),
                     strref,
                     actor: r.actor,
+                    conversation: Some(r.dialog),
+                    vo_mode: r.vo_mode,
                 });
             }
             *next += 1;
