@@ -642,6 +642,7 @@ mod tests {
             ring_wait: false,
             after_impact_ms: None,
             impacted: false,
+            arrived: false,
             path: Vec::new(),
         });
         // Four metres in a straight line, but the wall sends it up through the gap: the

@@ -1061,6 +1061,7 @@ impl Sim {
             ring_wait: false,
             after_impact_ms: None,
             impacted: false,
+            arrived: false,
             path: Vec::new(),
         };
         if let Some(o) = self.world.get_mut(attacker) {
@@ -1101,6 +1102,7 @@ impl Sim {
             ring_wait: false,
             after_impact_ms: None,
             impacted: false,
+            arrived: false,
             path: Vec::new(),
         };
         if let Some(o) = self.world.get_mut(who).filter(|o| o.commands.is_empty()) {
@@ -1816,15 +1818,17 @@ pub const MELEE_REACH: f32 = 2.0;
 /// How far past the two bodies a melee attack reaches (metres): DAOrigins.exe's melee range
 /// test (0x6a3dc0, used by the attack command's start step 0x7a87c0) adds 1.2 (0xafebc0) to
 /// the two creatures' radii (0x695320, which adds nothing between them, 0xade210) and
-/// measures across the ground. The radii are taken to be `PERSPACE` (provisional).
+/// measures across the ground. The radii are `PERSPACE` (0x6a21a0 reads the appearance's
+/// copy of it, set by 0x748a40).
 pub const MELEE_GAP: f32 = 1.2;
 
 /// The slack the same test allows past that reach (metres, 0xade218): an attack may start
 /// with the target up to this much farther away.
 pub const MELEE_REACH_TOLERANCE: f32 = 1.0;
 
-/// A creature's body radius when its appearance gives none (metres). Provisional.
-pub const DEFAULT_RADIUS: f32 = 0.4;
+/// A creature's body radius when its appearance gives none (metres): DAOrigins.exe's
+/// `SetAppearanceType` (0x748a40) default for a missing `PERSPACE` (0xaf7618).
+pub const DEFAULT_RADIUS: f32 = 0.6;
 
 impl Sim {
     /// A creature's body radius: its appearance's personal space in `apr_base.gda`
@@ -2307,6 +2311,7 @@ mod tests {
                 ring_wait: false,
                 after_impact_ms: None,
                 impacted: false,
+                arrived: false,
                 path: Vec::new(),
             });
         s.world.get_mut(rogue).unwrap().combat.attack = Some(AttackResult {

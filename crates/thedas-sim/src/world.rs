@@ -305,6 +305,10 @@ pub struct Command {
     /// The ability's impact has been dealt; the command runs on to its end.
     #[serde(default)]
     pub impacted: bool,
+    /// For a melee attack: the walk to its place on the target's melee ring has just ended,
+    /// so the attack's start step tests the range with its slack (see `Sim::approach_point`).
+    #[serde(default)]
+    pub arrived: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
