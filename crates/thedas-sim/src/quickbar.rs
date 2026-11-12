@@ -298,6 +298,11 @@ impl Sim {
         let ability = int(2).unwrap_or(0).clamp(0, i32::MAX as i64) as i32;
         let item = args.get(3).map(|s| s.trim()).unwrap_or_default();
         self.set_quickslot(who as ObjectId, slot as i32, ability, item);
+        // The quickbar tutorial waits for an item put on the bar (`genev_tutorial` mode 6,
+        // step 8).
+        if !item.is_empty() {
+            self.training_event("QBAR_ITEM_EQUIPPED", 0);
+        }
         true
     }
 
