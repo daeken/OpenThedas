@@ -306,9 +306,16 @@ impl Live {
         if self.paused || self.front_end {
             return;
         }
-        // A tutorial that pauses the game holds it until its popup is dismissed; a training
-        // tutorial until its mode ends.
-        if self.sim().world.tutorial_paused || self.sim().training_paused() {
+        // A tutorial that pauses the game holds it until its popup is dismissed.
+        if self.sim().world.tutorial_paused {
+            return;
+        }
+        // A training tutorial holds the game's time until its mode ends, but its script
+        // still runs: the exe runs `genev_tutorial` for each training event while the game
+        // is paused (0x692e90 pauses the client and then posts the event), so the events
+        // that fall due now are delivered without time passing.
+        if self.sim().training_paused() {
+            self.sim().tick(0);
             return;
         }
         self.owed_ms += dt_ms.clamp(0.0, MAX_STEP_MS);

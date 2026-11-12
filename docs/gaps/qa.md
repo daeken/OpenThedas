@@ -66,7 +66,7 @@ in each run folder's `.log` files).
 - Fight saves with a won fight are needed to test corpse decay.
 
 ### 2. Accepted as parity or improvements (don't re-file)
-Letterbox absent at 16:9; `<emp>` shown plain; the Fade's radial blur; 3 m camera start and no minimum camera distance (the fade is the fix); pause-until-tutorial-queue-empty; money 0 at start; Cyrion in the next room; Duncan's weapons in inventory, unequipped; early empty journals (Dwarf Commoner/Noble, City Elf); pad A on a door closes it (and #312, which skips open doors, is a deliberate improvement); "2 0" prices; the output limiter (the original clips: an improvement); GUI sound 55 silent; hero-no-rustle where the ground has no vegetation; Leske's dialog hub loops on reply 0 (the original's structure).
+Letterbox absent at 16:9; `<emp>` shown plain; the Fade's radial blur; 3 m camera start (with tutorials on, a new game starts in the tactical view of training step 1, as the original does) and no minimum camera distance (the fade is the fix); pause-until-tutorial-queue-empty; money 0 at start; Cyrion in the next room; Duncan's weapons in inventory, unequipped; early empty journals (Dwarf Commoner/Noble, City Elf); pad A on a door closes it (and #312, which skips open doors, is a deliberate improvement); "2 0" prices; the output limiter (the original clips: an improvement); GUI sound 55 silent; hero-no-rustle where the ground has no vegetation; Leske's dialog hub loops on reply 0 (the original's structure).
 
 ### 3. Content coverage (from QA runs, sim plus app renders)
 | Content | Status |

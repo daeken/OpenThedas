@@ -5952,7 +5952,8 @@ mod coverage_tests {
         void Engine_ApplyEffectAtLocation(int d, effect e, location l, float f = 0.0, object c = OBJECT_INVALID, int n = 0) = 111;\n\
         effect[] GetEffects(object o, int t = 0, int a = 0, object c = OBJECT_INVALID, int d = 0, int i = -1) = 112;\n\
         void RemoveEffect(object o, effect e) = 113;\n\
-        void SetGameMode(int n) = 114;\n";
+        void SetGameMode(int n) = 114;\n\
+        void SetZoomLevel(float f) = 115;\n";
 
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -6798,6 +6799,18 @@ mod coverage_tests {
             &[Value::String("SND_BELLS".into()), Value::Int(1)],
         );
         assert!(active(&s, bells));
+    }
+
+    #[test]
+    fn zoom_requests_count_up_and_raise_no_training_event() {
+        let mut s = sim();
+        assert_eq!(s.world.zoom_request, None);
+        run(&mut s, 1, "SetZoomLevel", &[Value::Float(0.0)]);
+        assert_eq!(s.world.zoom_request, Some((0.0, 1)));
+        run(&mut s, 1, "SetZoomLevel", &[Value::Float(2.0)]);
+        assert_eq!(s.world.zoom_request, Some((1.0, 2)));
+        // A script's zoom never counts as the player's: nothing is queued for training.
+        assert!(s.world.queue.is_empty());
     }
 
     #[test]

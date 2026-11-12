@@ -862,6 +862,16 @@ impl App {
         if let Some(f) = self.follow.as_mut() {
             let turn = (k(KeyCode::KeyQ) as i32 - k(KeyCode::KeyE) as i32) as f32;
             f.orbit(turn * 1.8 * dt, 0.0);
+            // Page Down zooms in and Page Up out while held, the original's second zoom
+            // bindings (KeyBindings.ini: ZoomIn_1=Keyboard::Button_Next,
+            // ZoomOut_1=Keyboard::Button_Prior). Provisional: the rate (the pad's).
+            let zoom = (k(KeyCode::PageDown) as i32 - k(KeyCode::PageUp) as i32) as f32;
+            if zoom != 0.0
+                && f.zoom(zoom * pad::ZOOM_SPEED * dt)
+                && let Some(l) = self.live.as_ref()
+            {
+                l.sim().player_zoomed_in();
+            }
             let eye = self
                 .live
                 .as_ref()
@@ -1637,8 +1647,9 @@ impl App {
                 });
             }
             Step::Pause => {
+                // As the Space key does (a training tutorial takes it as its unpause).
                 if let Some(live) = self.live.as_mut() {
-                    live.paused = !live.paused;
+                    live.toggle_pause();
                     log.push(if live.paused { "paused" } else { "running" }.into());
                 }
             }
@@ -3368,7 +3379,8 @@ fn main() -> Result<()> {
                         None => println!("quickslot {}", slot + 1),
                     },
                     Step::Pause => {
-                        l.paused = !l.paused;
+                        // As the Space key does (a training tutorial takes it as its unpause).
+                        l.toggle_pause();
                         println!("{}", if l.paused { "paused" } else { "running" });
                     }
                     &Step::Reply(n) => println!("{}", reply(l, n)),

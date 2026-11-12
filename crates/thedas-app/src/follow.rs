@@ -410,6 +410,27 @@ mod tests {
     }
 
     #[test]
+    fn a_script_zoom_eases_out_and_only_the_player_reaching_the_near_end_counts() {
+        let mut f = Follow::behind(0.0);
+        assert_eq!(f.zoom, ZOOM_MAX);
+        f.set_zoom_level(0.0);
+        f.ease_zoom(0.25);
+        assert!((f.zoom - (ZOOM_MAX - ZOOM_EASE * 0.25)).abs() < 1e-5);
+        f.ease_zoom(0.0);
+        assert_eq!(f.zoom, ZOOM_MIN);
+        // A script easing back in never reports the near end.
+        f.set_zoom_level(1.0);
+        f.ease_zoom(0.0);
+        assert_eq!(f.zoom, ZOOM_MAX);
+        // The player's zoom reports it once, on reaching it from below.
+        f.set_zoom_level(0.0);
+        f.ease_zoom(0.0);
+        assert!(!f.zoom(5.0));
+        assert!(f.zoom(100.0));
+        assert!(!f.zoom(1.0));
+    }
+
+    #[test]
     fn a_reset_turns_behind_the_leader_and_keeps_the_zoom() {
         let mut f = Follow::behind(0.0);
         f.zoom(-3.0);
