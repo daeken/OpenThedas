@@ -36,6 +36,16 @@ pub struct VoiceLine {
 /// the attacker's weapon and the target's armour and shield.
 pub type Impact = ([f32; 3], i32, Option<i32>, Option<i32>, Option<i32>);
 
+/// A creature's body armour, main-hand and off-hand base items (`BaseItem`), and whether
+/// it is fighting.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Gear {
+    pub armour: Option<i32>,
+    pub main: Option<i32>,
+    pub off: Option<i32>,
+    pub combat: bool,
+}
+
 /// What the game is doing, as the sound follows it.
 #[derive(Clone, Debug, Default)]
 pub struct AudioState {
@@ -51,6 +61,9 @@ pub struct AudioState {
     /// Each drawn creature's animation now: id, `.ani` resource, seconds into it, its
     /// length, position (see `Live::animation_clocks`).
     pub animations: Vec<(u32, String, f32, f32, [f32; 3])>,
+    /// What the animated creatures wear and wield, for their animations' foley and swings:
+    /// id -> (body armour, main-hand, off-hand base items, in combat).
+    pub gear: std::collections::HashMap<u32, Gear>,
     /// Attacks' blows: (target position, result, attacker's weapon, target's armour and
     /// shield base items).
     pub impacts: Vec<Impact>,
@@ -59,8 +72,6 @@ pub struct AudioState {
     pub sound_sets: Vec<(String, i32, f32, Option<[f32; 3]>)>,
     /// Events scripts played (`PlaySound`), with where the object stands (none: 2D).
     pub script_sounds: Vec<(String, Option<[f32; 3]>)>,
-    /// The character the player controls: its id, sound set and position.
-    pub controlled: Option<(u32, Option<String>, [f32; 3])>,
     /// Scripts' `SetMusicIntensity`, the latest this frame.
     pub music_intensity: Option<i32>,
     /// A boot movie playing (its file) and how far it has played (milliseconds): its own
@@ -166,8 +177,8 @@ pub struct GameAudio {
     /// Weapon impacts: each base item's sound material (`BITM_base.gda`), and each weapon
     /// material's impact events (`sound_weapon_hits.gda`).
     impacts: Impacts,
-    /// Who the player controlled last frame (a change is a selection: it barks).
-    controlled: Option<u32>,
+    /// Swing and armour-foley events (animation event kinds 19 and 17).
+    foley: Foley,
     /// The music's `music_state` (scripts' `SetMusicIntensity`; 1 until one sets it).
     music_state: f32,
     /// `ss_types.gda`: each sound set type's first entry row and default probability.
@@ -237,6 +248,55 @@ fn ss_types(vfs: &Vfs) -> std::collections::HashMap<i32, (i64, f32)> {
     out
 }
 
+/// `sound_weapon_actions.gda` and `sound_movement_foley.gda`: events by (row, column hash).
+#[derive(Default)]
+struct Foley {
+    tables: std::collections::HashMap<&'static str, std::collections::HashMap<(i64, u32), String>>,
+}
+
+const COL_SWISH: u32 = 0xa334_7e2b;
+const COL_SMALL: u32 = 0xce0a_5368;
+const COL_MEDIUM: u32 = 0x0d0e_d12a;
+
+impl Foley {
+    fn read(vfs: &Vfs) -> Foley {
+        use thedas_formats::gda::Cell;
+        let mut out = Foley::default();
+        for (key, name) in [
+            ("weapon", "sound_weapon_actions.gda"),
+            ("movement", "sound_movement_foley.gda"),
+        ] {
+            let Some(t) = vfs
+                .read(name)
+                .ok()
+                .and_then(|(d, _)| thedas_formats::Gda::parse(&d).ok())
+            else {
+                continue;
+            };
+            let mut cells = std::collections::HashMap::new();
+            for row in &t.rows {
+                let Some(Cell::Int(id)) = row.first() else {
+                    continue;
+                };
+                for (c, cell) in t.columns.iter().zip(row) {
+                    if let Cell::String(s) = cell {
+                        let s = s.trim_end_matches('\0').trim();
+                        if s.contains('/') {
+                            cells.insert((*id, c.hash), s.to_string());
+                        }
+                    }
+                }
+            }
+            out.tables.insert(key, cells);
+        }
+        out
+    }
+
+    fn cell(&self, table: &str, row: Option<i64>, column: u32) -> Option<String> {
+        self.tables.get(table)?.get(&(row?, column)).cloned()
+    }
+}
+
 /// What an attack's blow sounds like.
 ///
 /// `BITM_base.gda`'s column 0x7e0505a1 gives each base item a sound material
@@ -296,6 +356,11 @@ impl Impacts {
             }
         }
         out
+    }
+
+    /// A base item's sound material.
+    fn material(&self, base: Option<i32>) -> Option<i64> {
+        base.and_then(|b| self.materials.get(&(b as i64)).copied())
     }
 
     /// The event a blow plays, if any.
@@ -419,8 +484,8 @@ impl GameAudio {
             anim_clocks: Default::default(),
             footsteps: footstep_events(vfs),
             impacts: Impacts::read(vfs),
+            foley: Foley::read(vfs),
             music_state: 1.0,
-            controlled: None,
             ss_types: ss_types(vfs),
             sound_set_entries: Default::default(),
             rng: 0x2545_f491_4f6c_dd1d,
@@ -539,7 +604,11 @@ impl GameAudio {
     /// footstep (see [`footstep_events`]) where the creature stands. Provisional: events on
     /// the frame an animation starts are those at its time 0 onward; footsteps sound for
     /// humanoids and dogs only.
-    fn follow_animations(&mut self, clocks: Vec<(u32, String, f32, f32, [f32; 3])>) {
+    fn follow_animations(
+        &mut self,
+        clocks: Vec<(u32, String, f32, f32, [f32; 3])>,
+        gear: &std::collections::HashMap<u32, Gear>,
+    ) {
         let mut seen = std::collections::HashMap::new();
         for (id, ani, t, length, pos) in clocks {
             let key = ani.to_ascii_lowercase();
@@ -581,6 +650,33 @@ impl GameAudio {
             for ev in events.iter().filter(|e| crossed(e.time)) {
                 let event = match (ev.kind, &ev.text) {
                     (20, Some(path)) => Some(path.clone()),
+                    // A swing (DAOrigins.exe 0x69e940): `sound_weapon_actions.gda`'s Swish
+                    // for the weapon's sound material, the off hand's when the event says
+                    // `Left`.
+                    (19, text) => {
+                        let g = gear.get(&id).copied().unwrap_or_default();
+                        let left = text.as_deref().is_some_and(|t| t.contains("Left"));
+                        let w = if left { g.off } else { g.main };
+                        let m = self.impacts.material(w);
+                        self.foley.cell("weapon", m, COL_SWISH)
+                    }
+                    // Armour foley (0x69e7f0): `sound_movement_foley.gda`'s column the event
+                    // names (`Small`, `Medium`, `Large`) for the armour's sound material
+                    // (none: row 0). Gated as 0x7c4a80 gates it: a small or medium creature
+                    // sounds it only in combat. Provisional: the creature's own size class
+                    // (+0x934) is taken from the column, and "in combat" stands for its
+                    // state 3.
+                    (17, Some(size)) => {
+                        let g = gear.get(&id).copied().unwrap_or_default();
+                        let col = thedas_formats::gda::column_hash(size.trim());
+                        let small_or_medium = col == COL_SMALL || col == COL_MEDIUM;
+                        if small_or_medium && !g.combat {
+                            None
+                        } else {
+                            let m = self.impacts.material(g.armour).unwrap_or(0);
+                            self.foley.cell("movement", Some(m), col)
+                        }
+                    }
                     (14, Some(tags)) if tags.contains("Left") => {
                         if key.starts_with("c_dog") {
                             self.footsteps.1.clone()
@@ -949,18 +1045,11 @@ impl GameAudio {
                 );
             }
         }
-        // Selecting another party member: it answers (`ss_types.gda` 32 COMBAT SELECT
-        // NEUTRAL in a fight, else 36 EXPLORE SELECT NEUTRAL). Provisional: the approval
-        // variants (37-39 friendly/hate/love) and when the engine says them are not traced.
-        if let Some((id, set, at)) = state.controlled.take() {
-            let before = self.controlled.replace(id);
-            if before.is_some_and(|b| b != id)
-                && let Some(set) = set
-            {
-                let entry = if state.combat { 32 } else { 36 };
-                state.sound_sets.push((set, entry, 0.0, Some(at)));
-            }
-        }
+        // Sound set lines come from scripts (`PlaySoundSet`; rules and AI scripts pass the
+        // grunt and pain types themselves) and character creation's preview. DAOrigins.exe
+        // calls its sound set player (0x6b5740) only from the script command (0x6625c6), two
+        // message handlers (0x60ba68, 0x6b75a0) and one timed system (0x7660f2, 0x766242);
+        // nothing adds barks around each blow or on selection.
         for (set, entry, probability, at) in std::mem::take(&mut state.sound_sets) {
             self.say_sound_set(&set, entry, probability, at);
         }
@@ -979,7 +1068,8 @@ impl GameAudio {
                 log::debug!("audio: script sound {event} has no event");
             }
         }
-        self.follow_animations(std::mem::take(&mut state.animations));
+        let gear = std::mem::take(&mut state.gear);
+        self.follow_animations(std::mem::take(&mut state.animations), &gear);
         self.follow_movie(state.movie.take());
         // Scripts' SetMusicIntensity sets the area music's `music_state` (DAOrigins.exe logs
         // it as "music state= %2.1f"): the tracks' sounds sit around 1, so 0 silences the
