@@ -165,6 +165,60 @@ fn release_text_focus(m: &mut UiMovie) {
 
 /// The movie that shows the game's dialog boxes (`PopupLayer.ShowDialogBoxFromGame`).
 pub const POPUP_LAYER: &str = "popuplayer.gfx";
+
+/// The full-screen screens the game draws on its open book: they set up their contents for it
+/// (`SharedLibrary.BookContents.SetupShowContents`) and their paper and stains are placed with
+/// the multiply blend, meant to darken the book's pages.
+pub const BOOK_SCREENS: &[&str] = &[
+    "inventory.gfx",
+    "characterrecord.gfx",
+    "journal.gfx",
+    "map.gfx",
+    "tactics.gfx",
+    "store.gfx",
+    "levelup.gfx",
+];
+
+/// The book bookback.gfx draws under the book screens (`GUIBookback`, the exe's `BookBack`
+/// movie): `BookBack_I3.dds` over a black screen (`BlackBack`, shown by
+/// `GUIBookback.ShowBlack`).
+pub const BOOK_IMAGE: &str = "BookBack_I3.dds";
+
+/// Puts the book under a book screen's own clips, inside its movie, so that its multiply
+/// images blend with the pages as they did over the game's book movie (Ruffle's multiply over
+/// a transparent target leaves them white). Both movies have a 1024x768 stage, so the image
+/// sits at the stage origin at its own size. Provisional: the black is drawn whenever the
+/// book is (the exe's `GUIBookback.ShowBlack` setter, 0x716a00, is not traced to its callers),
+/// and the book's opening and closing animations are not played.
+fn add_book_backdrop(m: &mut UiMovie) {
+    const ROOT: &str = "_root.thedas_book";
+    let n = UiValue::Number;
+    let s = |v: &str| UiValue::String(v.to_string());
+    // Timeline depth 0 (-16384) is below every placed clip.
+    m.call(
+        "_root.createEmptyMovieClip",
+        &[s("thedas_book"), n(-16384.0)],
+    );
+    m.call(
+        &format!("{ROOT}.createEmptyMovieClip"),
+        &[s("black"), n(0.0)],
+    );
+    let black = format!("{ROOT}.black");
+    m.call(&format!("{black}.beginFill"), &[n(0.0), n(100.0)]);
+    m.call(&format!("{black}.moveTo"), &[n(-4096.0), n(-4096.0)]);
+    for (x, y) in [(5120.0, -4096.0), (5120.0, 5120.0), (-4096.0, 5120.0)] {
+        m.call(&format!("{black}.lineTo"), &[n(x), n(y)]);
+    }
+    m.call(&format!("{black}.endFill"), &[]);
+    m.call(
+        &format!("{ROOT}.createEmptyMovieClip"),
+        &[s("page"), n(1.0)],
+    );
+    m.call(
+        &format!("{ROOT}.page.loadMovie"),
+        &[s(&format!("img://{BOOK_IMAGE}"))],
+    );
+}
 /// The engine value holding how far the quickbar is dragged open (see [`Stage::new`]).
 pub const QUICKBAR_EXPAND_VALUE: &str = "Party.QuickbarExpandValue";
 
@@ -358,6 +412,9 @@ impl Stage {
         m.call(crate::avm1::INSTALL, &[]);
         // Movies anchor their elements to the screen when the engine asks them to lay out.
         m.call(LAYOUT, &[]);
+        if BOOK_SCREENS.iter().any(|b| name.eq_ignore_ascii_case(b)) {
+            add_book_backdrop(&mut m);
+        }
         self.movies.push(m);
         Ok(())
     }
