@@ -23,8 +23,7 @@
 //!   (`c16`-`c19`, its `w` replaced by the first partition's reach less the second's) and
 //!   the plane `c20` that is positive inside the first partition (0x452d40).
 //!
-//! Provisional: the boxes' limits towards the sun ([`SUN_REACH`]) and the engine's
-//! smoothing of them over frames (0x453266, see [`partitions`]); the second partition
+//! Provisional: the boxes' limits towards the sun ([`SUN_REACH`]); the second partition
 //! starts where the first ends; the engine's elevation clamp of the light (0x452ac2) and
 //! its variance blur (`BlurShadowTargets`, which 0x4518e0 runs on the first partition only
 //! at Medium and High, `[0xbf22c8] >= 2`; Low has none) are not applied; the bias drops
@@ -136,7 +135,8 @@ fn bias() -> Mat4 {
 /// caster over its slice, a partition covers the slice.
 ///
 /// Provisional: the box's starting extent and the engine's own limit towards the sun (the
-/// slot's 0x6b0 term) are not traced, nor its smoothing of the box over frames (0x453266).
+/// slot's 0x6b0 term) are not traced. See [`partitions_smoothed`] for the boxes' smoothing
+/// over frames.
 pub fn partitions(
     camera: &crate::Camera,
     aspect: f32,
@@ -144,6 +144,31 @@ pub fn partitions(
     reach: [f32; 2],
     casters: &[(Vec3, f32)],
 ) -> [Partition; 2] {
+    partitions_smoothed(camera, aspect, sun_dir, reach, casters, &[None, None]).0
+}
+
+/// A partition's box in the light's view (minimum, maximum corners), as the next frame
+/// smooths towards it.
+pub type LightBox = (Vec3, Vec3);
+
+/// How far a partition's box moves each frame from the last frame's towards the one fitted
+/// now (`[0xbf2088]`, 0.35, never written).
+pub const BOX_SMOOTHING: f32 = 0.35;
+
+/// [`partitions`], smoothed over frames as DAOrigins.exe does (0x453266): when a partition
+/// had casters the frame before (its slot's flag at 0x678, set from the caster count by
+/// 0x4517d0), its box this frame is the last frame's moved [`BOX_SMOOTHING`] of the way to
+/// the box fitted now; the result is kept for the next frame (0x4533fa copies it to the
+/// slot's previous box). `previous` is what the last call returned: each partition's box
+/// when it had casters.
+pub fn partitions_smoothed(
+    camera: &crate::Camera,
+    aspect: f32,
+    sun_dir: Vec3,
+    reach: [f32; 2],
+    casters: &[(Vec3, f32)],
+    previous: &[Option<LightBox>; 2],
+) -> ([Partition; 2], [Option<LightBox>; 2]) {
     let view = light_view(sun_dir);
     let near = camera.near.max(0.01);
     let ranges = [(near, reach[0]), (reach[0], reach[1])];
@@ -152,7 +177,9 @@ pub fn partitions(
         .filter(|(c, r)| c.is_finite() && r.is_finite())
         .map(|(c, r)| (view.transform_point3(*c), r.max(0.0)))
         .collect();
-    ranges.map(|(n, f)| {
+    let mut kept = [None, None];
+    let parts = [0, 1].map(|k| {
+        let (n, f) = ranges[k];
         let corners = slice_corners(camera, aspect, n, f);
         let mut lo = Vec3::splat(f32::INFINITY);
         let mut hi = Vec3::splat(f32::NEG_INFINITY);
@@ -172,7 +199,8 @@ pub fn partitions(
             min = min.min(a);
             max = max.max(b);
         }
-        let (min, max) = if min.x.is_finite() {
+        let had_casters = min.x.is_finite();
+        let (min, max) = if had_casters {
             (
                 Vec3::new(
                     min.x.max(lo.x),
@@ -185,13 +213,24 @@ pub fn partitions(
             (Vec3::new(lo.x, lo.y, lo.z - SUN_REACH), hi)
         };
         let max = max.max(min + Vec3::ONE);
+        let (min, max) = match previous[k] {
+            Some((pmin, pmax)) => (
+                pmin + (min - pmin) * BOX_SMOOTHING,
+                pmax + (max - pmax) * BOX_SMOOTHING,
+            ),
+            None => (min, max),
+        };
+        if had_casters {
+            kept[k] = Some((min, max));
+        }
         let view_proj = ortho(min, max) * view;
         Partition {
             view_proj,
             texture: bias() * view_proj,
             reach: f,
         }
-    })
+    });
+    (parts, kept)
 }
 
 /// `g_vShadowData` for two partitions seen from `camera` (0x452d40).
@@ -303,5 +342,27 @@ mod tests {
         let far = (c.position + c.forward().cross(Vec3::Z) * 200.0, 1.0);
         let same = partitions(&c, 16.0 / 9.0, d, [5.0, 15.0], &[far]);
         assert_eq!(same, open);
+    }
+
+    #[test]
+    fn boxes_move_part_of_the_way_each_frame_after_a_frame_with_casters() {
+        let c = cam();
+        let d = Vec3::new(-0.48, -0.83, -0.3).normalize();
+        let caster = (c.position + c.forward() * 2.0 - d * 1.5, 0.5);
+        let (first, kept) =
+            partitions_smoothed(&c, 16.0 / 9.0, d, [5.0, 15.0], &[caster], &[None, None]);
+        assert_eq!(first, partitions(&c, 16.0 / 9.0, d, [5.0, 15.0], &[caster]));
+        let (lo, hi) = kept[0].unwrap();
+        // The caster moves a metre along the light: the box follows 0.35 of the way.
+        let moved = (caster.0 + d, caster.1);
+        let (_, next) = partitions_smoothed(&c, 16.0 / 9.0, d, [5.0, 15.0], &[moved], &kept);
+        let fresh = partitions_smoothed(&c, 16.0 / 9.0, d, [5.0, 15.0], &[moved], &[None, None]).1;
+        let (nlo, nhi) = next[0].unwrap();
+        let (flo, fhi) = fresh[0].unwrap();
+        assert!((nlo - (lo + (flo - lo) * BOX_SMOOTHING)).length() < 1e-4);
+        assert!((nhi - (hi + (fhi - hi) * BOX_SMOOTHING)).length() < 1e-4);
+        // No casters over a slice: nothing kept, so the next frame starts afresh.
+        let (_, none) = partitions_smoothed(&c, 16.0 / 9.0, d, [5.0, 15.0], &[], &kept);
+        assert_eq!(none, [None, None]);
     }
 }

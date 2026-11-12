@@ -16,6 +16,7 @@ pub mod chains;
 pub mod input;
 pub mod minimap;
 pub mod models;
+pub mod options;
 pub mod protocol;
 pub mod stage;
 
@@ -230,7 +231,16 @@ struct Shared {
     retval: Mutex<UiValue>,
     callbacks: Mutex<Vec<String>>,
     log: Mutex<Vec<String>>,
+    /// Observers registered through `ExternalInterface.call("AddTokenObserver", ...)`
+    /// (callback id, token), for [`UiMovie::sync_tokens`] to take up.
+    called_observers: Mutex<Vec<(String, String)>>,
+    /// The last id handed out for those.
+    observer_ids: std::sync::atomic::AtomicU64,
 }
+
+/// The first id handed to `AddTokenObserver` observers: past the ids the movies number their
+/// own observers with (`_OBSERVER_ID` constants and counters). Provisional.
+const CALLED_OBSERVER_IDS: u64 = 1_000_000;
 
 struct Bridge {
     movie: String,
@@ -268,6 +278,25 @@ impl FsCommandProvider for Bridge {
 
 impl ExternalInterfaceProvider for Bridge {
     fn call_method(&self, _: &mut UpdateContext<'_>, name: &str, args: &[RValue]) -> RValue {
+        // `TokenManager.AddTokenObserverFunc(label, token, callback)` asks the game for the
+        // observer's id (`AddTokenObserver(label, "", token)`) and files the callback under
+        // it: the observer is the game's to feed from then on, as for
+        // `AddTokenObserverWithID` (optionsmenu.gfx's checkboxes and sliders).
+        if name == "AddTokenObserver" {
+            let token: UiValue = args.get(2).map(Into::into).unwrap_or(UiValue::Undefined);
+            let UiValue::String(token) = token else {
+                return RValue::Undefined;
+            };
+            let id = CALLED_OBSERVER_IDS
+                + self
+                    .shared
+                    .observer_ids
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(mut o) = self.shared.called_observers.lock() {
+                o.push((id.to_string(), token));
+            }
+            return RValue::Number(id as f64);
+        }
         if name == avm1::RETVAL_CALL {
             let v = self
                 .shared
@@ -573,22 +602,27 @@ impl UiMovie {
 
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
         let button = MouseButton::Left;
-        let ev = if down {
-            PlayerEvent::MouseDown {
+        if down {
+            let ev = PlayerEvent::MouseDown {
                 x,
                 y,
                 button,
                 index: None,
-            }
-        } else {
-            PlayerEvent::MouseUp { x, y, button }
-        };
-        self.with_player(|p| p.handle_event(ev));
+            };
+            self.with_player(|p| p.handle_event(ev));
+            return;
+        }
+        // The button under the mouse is released before the movies' mouse-up handlers hide
+        // anything (see `avm1::HIDE_LATER`).
+        self.set(avm1::HIDE_LATER, UiValue::List(Vec::new()));
+        self.with_player(|p| p.handle_event(PlayerEvent::MouseUp { x, y, button }));
+        self.call(avm1::HIDE_FLUSH, &[]);
     }
 
     /// The engine side of the movies' `TokenManager`: collects observers registered with
     /// `AddTokenObserverWithID` (batched as `[id, token, flags]` triples in
-    /// `TokenManager.AddTokenObserverBatchData`) and removed ones, then pushes each observed
+    /// `TokenManager.AddTokenObserverBatchData`) or `AddTokenObserverFunc` (through
+    /// `ExternalInterface`) and removed ones, then pushes each observed
     /// value that changed to `TokenManager.cm_mapCallbacks[id](value)`. `value` answers a
     /// token or returns `None` (the observer is then left alone). Returns the tokens nothing
     /// answered. Provisional, from the movies' bytecode.
@@ -608,6 +642,16 @@ impl UiMovie {
                 self.observers.retain(|(i, _)| *i != id);
                 self.observers.push((id, token.clone()));
             }
+        }
+        let called = self
+            .shared
+            .called_observers
+            .lock()
+            .map(|mut o| std::mem::take(&mut *o))
+            .unwrap_or_default();
+        for (id, token) in called {
+            self.observers.retain(|(i, _)| *i != id);
+            self.observers.push((id, token));
         }
         for r in take(self, "RemoveTokenObserverBatchData") {
             if let Some(id) = callback_key(&r) {
