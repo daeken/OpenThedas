@@ -150,6 +150,10 @@ pub struct EmitterState {
     directions: Rand,
     accumulator: f32,
     burst_done: bool,
+    /// Multiplies the particles' alpha; at 0 none are drawn (a cut-away model's emitters,
+    /// DAOrigins.exe 0x466f40 setting emitter +0x360). Provisional: what +0x360 scales is
+    /// not traced.
+    pub opacity: f32,
 }
 
 impl EmitterState {
@@ -162,6 +166,7 @@ impl EmitterState {
             directions: Rand::new(seed ^ 0x5bd1_e995),
             accumulator: 0.0,
             burst_done: false,
+            opacity: 1.0,
         }
     }
 
@@ -326,6 +331,9 @@ impl EmitterState {
     /// The particles as quads, four [`ParticleVertex`]es each, for a camera with the given
     /// world-space right, up and viewing directions.
     pub fn quads(&self, right: Vec3, up: Vec3, forward: Vec3, out: &mut Vec<ParticleVertex>) {
+        if self.opacity <= 0.0 {
+            return;
+        }
         let e = &self.blueprint;
         let (scale, rotation, _) = self.world.to_scale_rotation_translation();
         let k2 = 0.5 * scale.max_element().powi(2);
@@ -358,7 +366,8 @@ impl EmitterState {
             // half-diagonal, which makes `k` 1/√2 for a quad as large as the key.
             let a = ax * (look.size[0] * k2);
             let b = ay * (look.size[1] * k2);
-            let color = look.color.clamp(Vec4::ZERO, Vec4::ONE).to_array();
+            let mut color = look.color.clamp(Vec4::ZERO, Vec4::ONE).to_array();
+            color[3] *= self.opacity.min(1.0);
             let c = p.position;
             for (corner, uv) in [
                 (c - b - a, [0.0, 0.0]),
@@ -552,6 +561,25 @@ mod tests {
         assert_eq!(v[3].position, [2.0, 2.0, 3.5]);
         assert_eq!(v[1].texcoord, [0.0, 1.0, 0.25, 0.0]);
         assert_eq!(v[0].color, [1.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_cut_away_emitter_draws_nothing() {
+        let mut s = EmitterState::new(Arc::new(fire()), Mat4::IDENTITY, 3);
+        s.particles.push(Particle {
+            position: Vec3::ZERO,
+            velocity: Vec3::Z,
+            age: 0.0,
+            inv_life: 1.0,
+            scale: 1.0,
+            spin: 0.0,
+            angle: 0.0,
+            phase: 0.0,
+        });
+        s.opacity = 0.0;
+        let mut v = Vec::new();
+        s.quads(Vec3::X, Vec3::Z, Vec3::Y, &mut v);
+        assert!(v.is_empty());
     }
 
     #[test]
