@@ -634,10 +634,16 @@ impl Server {
         if st.sim.is_none() {
             return err("no module loaded; call load first");
         }
-        match f(&mut st) {
+        let out = match f(&mut st) {
             Ok(v) => pretty(v),
             Err(e) => err(e),
+        };
+        // A transition a script asked for happens at the next update; let it, so the next
+        // call sees the new area (the game would have drawn a frame in between).
+        if let Some(sim) = st.sim.as_mut() {
+            sim.settle_transition();
         }
+        out
     }
 }
 
@@ -934,6 +940,7 @@ impl Server {
         match open(&opts) {
             Ok(mut sim) => {
                 sim.tick(0);
+                sim.settle_transition();
                 let area = sim.world.area;
                 let objects: Vec<J> = sim
                     .world

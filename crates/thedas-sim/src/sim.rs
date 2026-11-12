@@ -1298,6 +1298,22 @@ impl Sim {
         ev
     }
 
+    /// Runs the world on until a script's pending area transition has happened (at most a
+    /// few updates): for tools that act and then read the world at once, where the game
+    /// would have drawn a frame or two in between.
+    pub fn settle_transition(&mut self) {
+        for _ in 0..4 {
+            if self.world.transition.is_none() {
+                return;
+            }
+            let wait = self
+                .world
+                .transition_at
+                .map_or(0, |at| at.saturating_sub(self.world.time_ms));
+            self.tick(wait.max(1));
+        }
+    }
+
     pub fn answer_popup(&mut self, button: i32) -> bool {
         self.answer_popup_with_text(button, "")
     }
