@@ -80,3 +80,15 @@ Letterbox absent at 16:9; `<emp>` shown plain; the Fade's radial blur; 3 m camer
 | Dwarf Noble: palace → Gorim joins → feast conversations | plays to the feast (dn_*); the Proving/Trian/Bhelen plot **untested** |
 | Stores (Olinda), looting containers, level-up, save/load round trip, pause/options/game menu, area map, journal | work (minor items above) |
 | World map travel, party camp, companions beyond the prelude | covered only by the Human Noble chain; not QA-graded |
+
+Measured 2026-11-12 at main `1eb844a`, from the sweep chain and gate logs:
+
+- **The Human Noble chain needs a survival aid.** It passes all 16 steps to the first party camp
+  only because the developer heal script runs whenever a member drops under 35% health, 63 times
+  in all (32 in the Tower). Without it the party wipes in the Wilds. Part of that is the harness
+  (it does not kite or focus fire) and part is combat balance not yet matching the original;
+  nobody has separated the two.
+- **Past the first camp nothing plays end to end.** The Redcliffe night and Orzammar ambush
+  scenarios are lost with and without preparation.
+- **The regression gate covers the Human Noble chain only.** The other five origins have saves
+  but no gate chain.

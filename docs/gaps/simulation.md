@@ -104,6 +104,30 @@ Each entry gives what the original does, what we do, evidence, a rough size (S <
 2. **The gate covers the Human Noble chain only**, s01–s16. There are no gate chains for the other five origins past their openings. Size M (harness). Deps: QA saves.
 3. **Coverage counters** (autoplay --coverage) over 8 saves show only SetBodybagDecayDelay unimplemented (fixed in #303). Wider coverage needs more chains (G2).
 
+## Abilities measured against a real install
+
+Gathered 2026-11-12 at main `1eb844a` from the ability table as the game resolves it (551 rows;
+the DLC and Awakening worksheets are not counted). "Mentioned" means the ability's id appears
+next to an ability word in any test, gate log, QA log, note or source file. It is an upper bound
+on what has ever run, and no test asserts the outcome of a single ability.
+
+| Family | Rows | Mentioned anywhere |
+| --- | --- | --- |
+| Talents | 138 | 62 |
+| Spells | 93 | 22 |
+| Skills (30 follower-specific) | 70 | 16 |
+| Monster abilities | 147 | 9 |
+| Item abilities | 102 | 47 |
+| Total | 550 | 156 |
+
+The family split is partly inferred (monster abilities by id range and label). Abilities are
+exercised only incidentally, by the party AI in the sweep chain's fights. Families known to be
+broken or untested: monster abilities (138 of 147 never touched; the broodmother, archdemon,
+golem, dragon and werewolf rows are beyond any save the harness reaches), summoning,
+shapeshifting, projectile flight time, area-of-effect flags and shapes, control effects (the
+effect flags are not enforced, `SCR-045`), trap, stealing and crafting skills, runes and item
+upgrades, and injuries.
+
 ## Part 2: code inventory
 
 Found by reading the code at main on 2026-11-12: provisional markers, stubs, ignored inputs and features with no code. "Original: not traced" means nobody has yet checked what the original does. Line numbers drift; search for the quoted names if a line has moved.
