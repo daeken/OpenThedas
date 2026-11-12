@@ -29,12 +29,12 @@ Gathered 2026-11-12 on main 1eb844a, from the release `thedas` binary and source
 | declared functions that some script calls | 549 |
 | function ids called that `script.ldf` does not declare | 7 (#859, #860, #861, #862, #10, #396, #397) |
 | static call sites, all functions | 980,935 |
-| declared functions the sim handles | 496 of 676 (473 match arms + 23 presentation no-ops) |
-| called functions the sim handles | 478 of 549 |
-| called functions the sim does not handle | 71 (2,062 static call sites, 0.2% of all) |
+| declared functions the sim handles | 497 of 676 (474 match arms + 23 presentation no-ops) |
+| called functions the sim handles | 479 of 549 |
+| called functions the sim does not handle | 70 (2,061 static call sites, 0.2% of all) |
 | functions the sim handles that no script calls | 18 |
 
-So there are 71 unimplemented functions that scripts call, fewer than the 150 asked for. All are listed below, so there is no tail.
+So there are 70 unimplemented functions that scripts call, fewer than the 150 asked for. All are listed below, so there is no tail.
 
 ### Handled, but only as a no-op or a fixed value
 
@@ -149,7 +149,6 @@ SetPartyLeader, CloseQuestGroup, SetCanUseItem, the trap-difficulty getters and 
 | Screenshot | 820 | 1 | 1 |
 | GetPlayTime | 830 | 1 | 1 |
 | SetGameCompletionPercentage | 844 | 1 | 1 |
-| SetZoomLevel | 849 | 1 | 1 |
 | IsPRC | 857 | 1 | 1 |
 | SetPartyPickerStage | 858 | 1 | 1 |
 
