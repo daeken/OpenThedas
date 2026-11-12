@@ -232,6 +232,35 @@ fn slide_circle(at: [f32; 2], d: [f32; 2], c: [f32; 2], r: f32) -> Option<([f32;
     Some((q, slid))
 }
 
+/// How far along a path (as a fraction of its length) the point on it nearest `q` lies.
+fn progress_of(from: [f32; 3], points: &[[f32; 3]], q: [f32; 3]) -> f32 {
+    let total = path_length(from, points);
+    if total <= 0.0 {
+        return 1.0;
+    }
+    let (mut best, mut at, mut walked) = (f32::MAX, 0.0, 0.0);
+    let mut prev = from;
+    for &p in points {
+        let d = [p[0] - prev[0], p[1] - prev[1]];
+        let len2 = d[0] * d[0] + d[1] * d[1];
+        let len = crate::engine::dist(prev, p);
+        let t = if len2 > 0.0 {
+            (((q[0] - prev[0]) * d[0] + (q[1] - prev[1]) * d[1]) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let near = [prev[0] + d[0] * t, prev[1] + d[1] * t];
+        let off = (near[0] - q[0]).powi(2) + (near[1] - q[1]).powi(2);
+        if off < best - 1e-6 {
+            best = off;
+            at = walked + len * t;
+        }
+        walked += len;
+        prev = p;
+    }
+    (at / total).clamp(0.0, 1.0)
+}
+
 /// The points of a path still ahead at fraction `f` of it (the end of the leg under way
 /// and those after it).
 fn remaining_points(from: [f32; 3], points: &[[f32; 3]], f: f32) -> Vec<[f32; 3]> {
@@ -2176,7 +2205,9 @@ impl Sim {
             // from where it got to.
             if let Some(slid) = self.slide_past_bodies(id, was, p) {
                 p = slid;
-                let rest = remaining_points(from, &points, f);
+                // From where the walker was, not where it meant to get to: a waypoint the
+                // blocked step would have passed is still ahead of it.
+                let rest = remaining_points(from, &points, progress_of(from, &points, was));
                 let speed = self.move_speed(id).max(0.01);
                 let left = path_length(p, &rest);
                 let progressed = crate::engine::dist(was, p) > 0.01;
@@ -4962,6 +4993,19 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, TraceEntry::EventQueued { target, .. } if *target == late))
         );
+    }
+
+    #[test]
+    fn a_blocked_walker_keeps_the_corner_it_has_not_reached() {
+        // An L-shaped path; the walker is held at (4.5, 0.3) before the corner at (5, 0).
+        let from = [0.0, 0.0, 0.0];
+        let points = [[5.0, 0.0, 0.0], [5.0, 5.0, 0.0]];
+        let f = progress_of(from, &points, [4.5, 0.3, 0.0]);
+        assert!((f - 0.45).abs() < 1e-3, "{f}");
+        assert_eq!(remaining_points(from, &points, f), points.to_vec());
+        // Past the corner, only the last leg is left.
+        let f = progress_of(from, &points, [5.2, 2.0, 0.0]);
+        assert_eq!(remaining_points(from, &points, f), vec![points[1]]);
     }
 
     #[test]
