@@ -914,6 +914,12 @@ impl GameAudio {
                     (1 | 7, text) => {
                         let g = gear.get(&id).copied().unwrap_or_default();
                         let left = text.as_deref().is_some_and(|t| t.contains("|Left"));
+                        log::trace!(
+                            "audio: hit frame kind {} {key} creature {id}: hands {:?} target {:?}",
+                            ev.kind,
+                            g.hands,
+                            g.attack_target
+                        );
                         let target = if ev.kind == 1 {
                             g.hands[left as usize]
                                 .filter(|(r, ..)| !matches!(r, 0 | 3 | 8))
@@ -977,9 +983,14 @@ impl GameAudio {
                         let size = g
                             .size
                             .unwrap_or(thedas_formats::gda::column_hash("Unknown"));
-                        self.bodyfalls
+                        let body = self
+                            .bodyfalls
                             .as_ref()
-                            .and_then(|t| table_event(t, row, size))
+                            .and_then(|t| table_event(t, row, size));
+                        log::debug!(
+                            "audio: bodyfall {body:?} (creature {id}, ground {row}, armour {armour})"
+                        );
+                        body
                     }
                     // A footstep (0x6aaaa0 -> 0x5b8d51): the ground's material under the
                     // creature picks the row; an event marked `|Scuff` plays the scuffing
