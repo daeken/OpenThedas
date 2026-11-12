@@ -362,12 +362,40 @@ pub fn load_movie(
     let data = lookup(name).ok_or_else(|| UiError::NotFound(name.to_string()))?;
     let inject = avm1::register_invoke();
     let fonts = font_library(lookup);
-    Ok(gfx::rewrite(
+    let (mut swf, report) = gfx::rewrite(
         &data,
         &mut |e| images.image(&e.file),
         fonts.as_ref(),
         Some(&inject),
-    )?)
+    )?;
+    if name.eq_ignore_ascii_case(stage::POPUP_LAYER) {
+        allow_spaces_in_typed_names(&mut swf);
+    }
+    Ok((swf, report))
+}
+
+/// The restrict popuplayer.gfx's text input sets (`TextInput_mc_init`: `restrict = "^ /t"`,
+/// in its constant pool), as it appears there.
+const POPUP_RESTRICT: &[u8] = b"restrict\0^ /t\0";
+/// What it is replaced with: `/` alone excluded (the same length, so the pool is unchanged).
+const POPUP_RESTRICT_ALLOWED: &[u8] = b"restrict\0^///\0";
+
+/// Lets the save dialog's name field take spaces and a lowercase `t`.
+///
+/// A deliberate deviation, asked for by the project owner, not traced in DAOrigins.exe. The
+/// movie's own restrict excludes space, `/` and `t` in Flash's syntax, so Ruffle drops spaces
+/// and, as Flash does, types `t` as `T` ("Before the Tower" became "BeforeTheTower"). The
+/// engine adds no character filter of its own: `FilterKeyboardInput` (handler 0x51c760 →
+/// 0x5110f0) only enters or leaves the "GUITextInput" input context. How Scaleform read this
+/// restrict is not verified; the owner believes the original allows spaces, and wants them
+/// either way. `/` stays excluded, as the movie asks.
+fn allow_spaces_in_typed_names(swf: &mut [u8]) {
+    if let Some(i) = swf
+        .windows(POPUP_RESTRICT.len())
+        .position(|w| w == POPUP_RESTRICT)
+    {
+        swf[i..i + POPUP_RESTRICT.len()].copy_from_slice(POPUP_RESTRICT_ALLOWED);
+    }
 }
 
 /// The font library the game installs for Scaleform (see [`gfx::FontLibrary`]).
@@ -782,6 +810,22 @@ mod key_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_save_name_field_lets_spaces_through_and_keeps_its_length() {
+        let mut swf =
+            b"FWS\x08....\x88pool\0TextInput_mc_init\0restrict\0^ /t\0maxChars\0".to_vec();
+        let len = swf.len();
+        allow_spaces_in_typed_names(&mut swf);
+        assert_eq!(swf.len(), len, "the constant pool keeps its size");
+        let s = String::from_utf8_lossy(&swf);
+        assert!(s.contains("restrict\0^///\0maxChars"), "{s:?}");
+        // Anything else is left alone.
+        let mut other = b"FWS\x08restrict\0abc\0".to_vec();
+        let before = other.clone();
+        allow_spaces_in_typed_names(&mut other);
+        assert_eq!(other, before);
+    }
 
     #[test]
     fn the_stage_fits_the_authored_movie_whole_and_reports_the_visible_area() {
