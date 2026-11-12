@@ -44,6 +44,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Creatures the camera is inside fade out as the exe does (0.25 m sphere against the models' creature-group physics shapes, head included; opacity 0.05; not in dialog or cutscenes). Provisional: the shapes are placed by rest pose, not the animated skeleton.
   - With a pad, A walks through open doors instead of using them.
   - The follow camera resets behind the leader after a load and at the end of a cutscene, as the exe does, and keeps its zoom across loads.
+  - A new area's level and objects are built on a worker thread while the window keeps presenting a loading frame (black for now; the original's loading movies are next). The world holds still and its sounds duck meanwhile, and the camera resets as the world comes up. The simulation's own load is unchanged and still takes one frame (about 0.4 s into the Commons). Headless captures load within the frame as before; `THEDAS_ASYNC_LOADS=1` uses the worker there too.
 - 🟡 **Combat and simulation**:
   - NWScript VM with a large share of the engine functions; melee and ability timing; threat; AI-driven party; tactics; loot.
   - Containers hold their template's items and open on USE with the original loot panel (Take All, Close).

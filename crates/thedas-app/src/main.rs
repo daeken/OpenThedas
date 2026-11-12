@@ -2273,6 +2273,8 @@ fn audio_state(
     let Some(live) = live else {
         return state;
     };
+    // The loading frame is up: the world's sounds duck as in the exe's loading mode.
+    state.loading = live.loading();
     // Animations' sound events (see `Live::animation_clocks`), with what each creature
     // wears and wields.
     if !live.front_end {
