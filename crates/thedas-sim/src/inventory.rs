@@ -654,6 +654,30 @@ impl Sim {
         }
     }
 
+    /// Closes the open container's screen (see [`crate::world::World::container`]).
+    pub fn close_container(&mut self) {
+        self.world.container = None;
+    }
+
+    /// Takes `item` out of the open container into `to`'s inventory (or everything, with
+    /// `None`), as the container screen's take and take-all do. Returns the items taken.
+    pub fn take_from_container(&mut self, to: ObjectId, item: Option<ObjectId>) -> Vec<ObjectId> {
+        let Some((c, _)) = self.world.container else {
+            return Vec::new();
+        };
+        match item {
+            None => self.loot(c, to),
+            Some(i) => {
+                let held = self.world.get(c).is_some_and(|o| o.inventory.contains(&i));
+                if held && self.give_item(i, to) {
+                    vec![i]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    }
+
     /// Coin (base item 17, `Money - Copper`) the hero receives is counted into the hero's
     /// money and the item is gone, as DAOrigins.exe's inventory add does (0x7409fa: an item
     /// of base type 0x11 added to the player's inventory adds its stack size to the money
@@ -1073,6 +1097,31 @@ mod screen_tests {
     use thedas_vfs::Vfs;
 
     use super::*;
+
+    #[test]
+    fn the_open_container_gives_up_one_item_or_all() {
+        let mut s = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(EngineTable::parse(b"").unwrap()),
+            1,
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let chest = s.world.spawn(ObjectKind::Placeable, "chest");
+        let (a, b) = (
+            s.world.spawn(ObjectKind::Item, "armour"),
+            s.world.spawn(ObjectKind::Item, "helm"),
+        );
+        s.world.hero = Some(hero);
+        s.world.get_mut(chest).unwrap().inventory = vec![a, b];
+        assert!(s.take_from_container(hero, None).is_empty(), "nothing open");
+        s.world.container = Some((chest, hero));
+        assert_eq!(s.take_from_container(hero, Some(a)), vec![a]);
+        assert_eq!(s.world.get(chest).unwrap().inventory, vec![b]);
+        assert_eq!(s.take_from_container(hero, None), vec![b]);
+        assert_eq!(s.world.get(hero).unwrap().inventory, vec![a, b]);
+        s.close_container();
+        assert_eq!(s.world.container, None);
+    }
 
     #[test]
     fn stackable_items_fill_matching_stacks_up_to_their_maximum() {
