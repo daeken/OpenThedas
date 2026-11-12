@@ -349,7 +349,7 @@ impl Live {
     /// seconds after the last: `eye` is where the game camera stands, or `None` while it is
     /// not the view (a conversation or cutscene frames the shot: no creature starts fading
     /// then, as in the executable's `GM_DIALOG` and `GM_CUTSCENE`). Creatures faded out are
-    /// left out of the frame.
+    /// drawn at their opacity ([`Live::opacity`]).
     pub fn fade_near_camera(&mut self, eye: Option<glam::Vec3>, dt: f32) {
         let blocked = {
             let sim = self.sim();
@@ -391,20 +391,11 @@ impl Live {
             }
         }
         self.camera_fade.update(touching, dt);
-        if let Some(objects) = self.objects.as_mut() {
-            let mut hidden = std::collections::HashSet::new();
-            for (i, (id, _)) in objects.bodies.iter().enumerate() {
-                if self.camera_fade.drawn(*id) {
-                    continue;
-                }
-                if let Some(p) = objects.scene.props.get(i) {
-                    hidden.extend(p.draws.clone());
-                    for a in &p.attachments {
-                        hidden.extend(a.draws.clone());
-                    }
-                }
-            }
-            objects.renderer.hidden_draws = hidden;
+        // The renderer draws each creature at its opacity (a missing entry is opaque).
+        self.opacity
+            .retain(|id, _| self.camera_fade.alpha(*id) < 1.0);
+        for (id, alpha) in self.camera_fade.faded() {
+            self.opacity.insert(id, alpha);
         }
     }
 
