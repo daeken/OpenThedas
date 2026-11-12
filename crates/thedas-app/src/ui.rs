@@ -184,6 +184,8 @@ pub struct UiLayer {
     loading: Option<Loading>,
     /// The world map is held up as the loading screen (see [`UiLayer::hold_world_map`]).
     travel_map: bool,
+    /// How long the held world map has been playing out since its load ended.
+    travel_out_ms: Option<f64>,
     /// The screens up last frame, for the events of opening one (see
     /// [`UiLayer::screens_opened`]).
     screens_up: std::collections::BTreeSet<Screen>,
@@ -459,6 +461,7 @@ impl UiLayer {
             script_popup: None,
             loading: None,
             travel_map: false,
+            travel_out_ms: None,
             screens_up: Default::default(),
             floaties: Vec::new(),
             stat_floaties: Default::default(),
@@ -651,8 +654,36 @@ impl UiLayer {
     /// arrives in loads, the map stays up as the loading screen though the simulation has
     /// closed it, as DAOrigins.exe keeps its world map GUI up until the load ends
     /// (0x6c6060).
+    ///
+    /// When the hold ends the movie is told the area has loaded
+    /// (`WorldMap.AreaLoadedNotify`, which the exe invokes; its name is at 0xb19ed9): it
+    /// plays the journey's last leg and closes itself, and the screen stays up for that, at
+    /// most [`LOADING_OUTRO_MAX_MS`]. While it travels the movie takes no pin clicks itself
+    /// (its `m_bTravelling`).
     pub fn hold_world_map(&mut self, hold: bool) {
-        self.travel_map = hold;
+        if hold {
+            self.travel_map = true;
+            self.travel_out_ms = None;
+        } else if self.travel_map && self.travel_out_ms.is_none() {
+            self.stage
+                .call_in("worldmap.gfx", "_global.WorldMap.AreaLoadedNotify", &[]);
+            self.travel_out_ms = Some(0.0);
+        }
+    }
+
+    /// The held world map playing out after its load: it goes when its movie has closed
+    /// itself, or after [`LOADING_OUTRO_MAX_MS`].
+    fn travel_map_frame(&mut self, dt_ms: f64) {
+        let Some(ms) = self.travel_out_ms else {
+            return;
+        };
+        let open = self.stage.movies.iter().any(|m| m.name == "worldmap.gfx");
+        if !open || ms + dt_ms >= LOADING_OUTRO_MAX_MS {
+            self.travel_map = false;
+            self.travel_out_ms = None;
+        } else {
+            self.travel_out_ms = Some(ms + dt_ms);
+        }
     }
 
     /// Whether load_fade.gfx has faded to black (`GUIFadeToBlackLoading.FadeComplete`);
@@ -1087,6 +1118,7 @@ impl UiLayer {
         self.show_cutscene_line(sim);
         self.show_script_popup(sim);
         self.loading_frame(dt_ms);
+        self.travel_map_frame(dt_ms);
         let mut messages = self.stage.tick(dt_ms);
         // A script message box's answer carries the text typed into it, which the box set
         // as `GUIPopupLayer.InputText` just before (popuplayer.gfx's `OnButtonAction`); the
