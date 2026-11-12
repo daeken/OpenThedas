@@ -116,6 +116,8 @@ struct Instance {
     /// What the event ducks while it plays (its `#duck:` parameters).
     ducks: Vec<Duck>,
     bus: Bus,
+    /// Linear level sent to the world reverb.
+    reverb_send: f32,
     age: f32,
 }
 
@@ -362,6 +364,20 @@ impl AudioEngine {
         for (k, v) in &options.parameters {
             params.insert(k.to_ascii_lowercase(), *v);
         }
+        // The world reverb: events in the `gui`, `music` and `master` categories send
+        // nothing (DAOrigins.exe 0x5bf217..0x5bf255 names them; 0x5be6a0 mutes their
+        // sends), the rest send at the event's reverb wet level (dB).
+        let leaf = category
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let reverb_send = if matches!(leaf.as_str(), "gui" | "music" | "master") {
+            0.0
+        } else {
+            db(event.reverb_wet)
+        };
+        let category_gain = category_gain * db(event.reverb_dry);
         let fade_in = event.fade_in_ms as f32 / 1000.0;
         let inst = Instance {
             handle,
@@ -390,12 +406,41 @@ impl AudioEngine {
             category: category.to_ascii_lowercase(),
             ducks,
             bus: bus_for(&category),
+            reverb_send,
             age: 0.0,
         };
         log::debug!("audio: play {path}");
         self.instances.push(inst);
         self.update(0.0);
         Some(handle)
+    }
+
+    /// Fade the world reverb to `preset` over `seconds` (0: at once). The preset by
+    /// name comes from [`AudioEngine::reverb_preset`].
+    pub fn set_reverb(&mut self, preset: thedas_formats::fev::ReverbProperties, seconds: f32) {
+        if let Ok(mut m) = self.mixer.lock() {
+            m.reverb.set(preset, seconds);
+        }
+    }
+
+    /// The reverb preset named `name` in `master_reverb.fev`, as DAOrigins.exe looks it up
+    /// (0x5c23e0): an empty name is no reverb, `force_generic` FMOD's generic preset, any
+    /// other name the project's preset of that name (case-insensitively; `None` if none).
+    pub fn reverb_preset(&self, name: &str) -> Option<thedas_formats::fev::ReverbProperties> {
+        use thedas_formats::fev::ReverbProperties;
+        let name = name.trim();
+        if name.is_empty() {
+            return Some(ReverbProperties::OFF);
+        }
+        if name.eq_ignore_ascii_case("force_generic") {
+            return Some(ReverbProperties::GENERIC);
+        }
+        let project = self.library.project("master_reverb")?;
+        project
+            .reverbs
+            .iter()
+            .find(|r| r.name.eq_ignore_ascii_case(name))
+            .and_then(|r| r.properties())
     }
 
     /// Stop an event: faded over its fade-out time, or at once.
@@ -609,6 +654,7 @@ impl AudioEngine {
                         gain: 0.0,
                         looping: l.looping.then_some((0, frames)),
                         bus: inst.bus,
+                        reverb_send: inst.reverb_send,
                         ..Default::default()
                     },
                 )
@@ -879,6 +925,11 @@ impl AudioEngine {
             !(silent || done)
         });
     }
+}
+
+/// Decibels to linear gain.
+fn db(v: f32) -> f32 {
+    10f32.powf(v / 20.0)
 }
 
 #[cfg(test)]
