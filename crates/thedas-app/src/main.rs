@@ -1112,10 +1112,16 @@ impl App {
     /// The sound follows the game: the menus' music, the interface's sounds, the open
     /// conversation line's voice (see [`audio`]).
     fn audio_frame(&mut self) {
+        // Animations' sound events (see `Live::animation_clocks`).
+        let animations = match (&self.audio, &self.intro, self.live.as_mut()) {
+            (Some(_), None, Some(live)) if !live.front_end => live.animation_clocks(),
+            _ => Vec::new(),
+        };
         let Some(a) = self.audio.as_mut() else {
             return;
         };
         let mut state = audio::AudioState {
+            animations,
             movie: self
                 .intro
                 .as_ref()
