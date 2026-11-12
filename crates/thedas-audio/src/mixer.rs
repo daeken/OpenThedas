@@ -42,6 +42,8 @@ pub struct VoiceParams {
     /// Loop between these frames (end exclusive) instead of stopping at the end.
     pub looping: Option<(usize, usize)>,
     pub bus: Bus,
+    /// Linear level sent to the world reverb (on top of `gain`).
+    pub reverb_send: f32,
 }
 
 impl Default for VoiceParams {
@@ -52,6 +54,7 @@ impl Default for VoiceParams {
             pitch: 1.0,
             looping: None,
             bus: Bus::Sfx,
+            reverb_send: 0.0,
         }
     }
 }
@@ -81,6 +84,9 @@ pub struct Mixer {
     pub master_gain: f32,
     /// The output limiter's gain now (see [`Mixer::render`]).
     limiter: f32,
+    /// The world reverb and what voices send it this block.
+    pub reverb: crate::reverb::Reverb,
+    send: Vec<f32>,
 }
 
 impl Mixer {
@@ -93,6 +99,8 @@ impl Mixer {
             bus_gain: [1.0; 5],
             master_gain: 1.0,
             limiter: 1.0,
+            reverb: crate::reverb::Reverb::new(rate.max(1)),
+            send: Vec::new(),
         }
     }
 
@@ -187,6 +195,10 @@ impl Mixer {
     /// Mix the next `out.len() / 2` stereo frames into `out` (overwriting it).
     pub fn render(&mut self, out: &mut [f32]) {
         self.mix(out);
+        let mut send = std::mem::take(&mut self.send);
+        self.reverb.process(&send, out);
+        send.clear();
+        self.send = send;
         self.limit(out);
     }
 
@@ -209,8 +221,12 @@ impl Mixer {
         }
     }
 
+    /// Mix the voices into `out` (and what they send the reverb into `self.send`).
     fn mix(&mut self, out: &mut [f32]) {
         out.iter_mut().for_each(|s| *s = 0.0);
+        self.send.clear();
+        self.send.resize(out.len(), 0.0);
+        let send = &mut self.send;
         let rate = self.rate as f64;
         let master = self.master_gain;
         let buses = self.bus_gain;
@@ -227,7 +243,7 @@ impl Mixer {
             let step = pcm.rate as f64 / rate * v.params.pitch as f64;
             let bus = buses[v.params.bus.index()] * master;
             let (lp, rp) = pan_gains(v.params.pan);
-            for o in out.chunks_exact_mut(2) {
+            for (o, so) in out.chunks_exact_mut(2).zip(send.chunks_exact_mut(2)) {
                 if let Some((start, end)) = v.params.looping {
                     let end = end.min(frames);
                     if end > start && v.pos >= end as f64 {
@@ -249,6 +265,11 @@ impl Mixer {
                 let g = v.params.gain * bus;
                 o[0] += l * g * lp;
                 o[1] += r * g * rp;
+                if v.params.reverb_send > 0.0 {
+                    let gs = g * v.params.reverb_send;
+                    so[0] += l * gs * lp;
+                    so[1] += r * gs * rp;
+                }
                 v.pos += step;
                 if let Some(f) = &v.fade {
                     v.params.gain += f.step;

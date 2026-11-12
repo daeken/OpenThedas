@@ -4,6 +4,7 @@
 //! - [`library`]: finding the install's FMOD projects and banks; decoded-sample cache.
 //! - [`engine`]: playing FMOD events by path on the mixer.
 //! - [`mixer`]: voices with gain, pan, pitch, loops, fades and volume buses.
+//! - [`reverb`]: the world reverb FMOD presets drive.
 //! - [`wav`]: 16-bit WAV writing, for offline renders.
 //! - `device` (feature `device`): the system output through cpal.
 //!
@@ -20,6 +21,7 @@ pub mod device;
 pub mod engine;
 pub mod library;
 pub mod mixer;
+pub mod reverb;
 pub mod wav;
 
 pub use decode::{Pcm, decode};
