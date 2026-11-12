@@ -94,6 +94,15 @@ impl Sim {
         self.world.training.mode != 0
     }
 
+    /// Why the game cannot be saved now, if it cannot: training mode disables saving
+    /// (script.ldf, SetTrainingMode: "Unpausing, Saving, Item Destruction"), so no save
+    /// holds a training step. The player's save screen and the MCP's save tool refuse;
+    /// `Sim::save_json` itself still writes (a tool's state dump is not a save).
+    pub fn saving_blocked(&self) -> Option<&'static str> {
+        self.training_paused()
+            .then_some("a training tutorial is under way (it disables saving)")
+    }
+
     /// Queues training event `name` (`TRAINING_BEGIN`) to the module, its integer the mode.
     fn raise_training_event(&mut self, name: &str, mode: i32) {
         let Some(module) = self.world.module else {

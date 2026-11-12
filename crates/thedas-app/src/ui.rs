@@ -996,7 +996,11 @@ impl UiLayer {
                         .hero
                         .map_or(0, |h| sim.property_total(h, 27) as i32),
                 };
-                match sim.save_json() {
+                let saved = match sim.saving_blocked() {
+                    Some(why) => Err(why.to_string()),
+                    None => sim.save_json().map_err(|e| e.to_string()),
+                };
+                match saved {
                     Ok(b) => match store.write(slot, &b, &meta) {
                         Ok(()) => log::info!("ui: saved to slot {slot}"),
                         Err(e) => log::warn!("ui: saving to slot {slot}: {e}"),
@@ -2057,8 +2061,7 @@ impl UiLayer {
         };
         let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
         if thedas_sim::engine::party_of(&sim).contains(&id) {
-            sim.set_controlled(Some(id));
-            sim.training_event("FOLLOWER_SELECTED", 0);
+            sim.player_selects(id);
         }
     }
 

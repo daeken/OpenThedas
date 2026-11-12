@@ -40,6 +40,19 @@ impl Sim {
         self.world.controlled = who.filter(|&w| crate::engine::party_of(self).contains(&w));
     }
 
+    /// The player takes control of party member `who` (a portrait clicked, F1-F4, the pad's
+    /// LB/RB, the screens' previous/next character): it becomes the controlled member, and
+    /// when it is a follower a training step waiting for one hears of it
+    /// (`EVENT_TYPE_TRAINING_FOLLOWER_SELECTED`, the party tutorial's "Select Alistair").
+    /// Every way the player changes member goes through here. Provisional: the hero
+    /// selected is taken not to count.
+    pub fn player_selects(&mut self, who: ObjectId) {
+        self.set_controlled(Some(who));
+        if self.world.controlled == Some(who) && Some(who) != self.world.hero {
+            self.training_event("FOLLOWER_SELECTED", 0);
+        }
+    }
+
     /// The player has zoomed the camera fully in (wheel, keys or pad; a script's zoom never
     /// counts): the exe's zoom setter sends the training event for it then (0x7ee680 sends
     /// 1065, `MAXIMUM_ZOOM_IN`, at 0x7ee72e). Returns whether a training step heard it.

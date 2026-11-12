@@ -503,16 +503,18 @@ impl Live {
         if self.paused || self.front_end || self.loading() {
             return;
         }
-        // A tutorial that pauses the game holds it until its popup is dismissed.
-        if self.sim().world.tutorial_paused {
-            return;
-        }
         // A training tutorial holds the game's time until its mode ends, but its script
         // still runs: the exe runs `genev_tutorial` for each training event while the game
         // is paused (0x692e90 pauses the client and then posts the event), so the events
-        // that fall due now are delivered without time passing.
+        // that fall due now are delivered without time passing, a tutorial popup up or not
+        // (one left up would otherwise swallow the step's event: the Wilds' "Select
+        // Alistair").
         if self.sim().training_paused() {
             self.sim().tick(0);
+            return;
+        }
+        // A tutorial that pauses the game holds it until its popup is dismissed.
+        if self.sim().world.tutorial_paused {
             return;
         }
         self.owed_ms += dt_ms.clamp(0.0, MAX_STEP_MS);
@@ -2165,8 +2167,7 @@ impl Live {
         let party = thedas_sim::engine::party_of(&sim);
         let id = *party.get(n)?;
         // The simulation learns who the player controls, so that member's AI stands down.
-        sim.set_controlled(Some(id));
-        sim.training_event("FOLLOWER_SELECTED", 0);
+        sim.player_selects(id);
         sim.world.get(id).map(|o| o.tag.clone())
     }
 }
