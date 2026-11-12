@@ -159,6 +159,88 @@ PrintFloat, PrintToLogWindow, tan, acos, asin, atan, log, GetLocalLocation, SetL
 GetStoreMoney, SetStoreMoney, GetStoreMaxBuyPrice, SetStoreMaxBuyPrice, GetAreaFromLocation, CanUseConditionedAbility,
 GetCommandFloat, SetWorldMapLocationLocName.
 
+## Events, commands and effects measured against a real install
+
+Gathered 2026-11-12 at main `1eb844a` by disassembling all 4,158 distinct compiled scripts and
+following the values returned by `GetEventType`, `GetCommandType` and `GetEffectType` to the
+constants they are compared with. The counts are static and may be slightly low: the tracking
+gives up after calls to ids that `script.ldf` does not declare. They put numbers on `SCR-063`,
+`SCR-055` and `SCR-045`.
+
+### Event types scripts handle that the engine never raises
+
+`script.ldf` names 111 event types; the engine raises or names 50. Scripts also define 73 event
+values of their own (5,978 construction sites), which the simulation delivers generically.
+
+| Event | Handler scripts comparing it | Scripts constructing it themselves |
+| --- | --- | --- |
+| `EVENT_TYPE_DAMAGED` | 180 | 149 |
+| `EVENT_TYPE_TRAP_TRIGGERED` | 64 | 0 |
+| `EVENT_TYPE_PLACEABLE_ONCLICK` | 64 | 0 |
+| `EVENT_TYPE_PLACEABLE_COLLISION` | 56 | 0 |
+| `EVENT_TYPE_UNLOCKED` | 35 | 0 |
+| `EVENT_TYPE_AREALOADSAVE_PRELOADEXIT` | 10 | 0 |
+| `EVENT_TYPE_AREALOADSAVE_POSTLOADEXIT` | 7 | 0 |
+| `EVENT_TYPE_ITEM_ONHIT` | 6 | 1 |
+| `EVENT_TYPE_USE_PLOTACTION` | 5 | 6 |
+| `EVENT_TYPE_MODULE_PRESAVE` | 4 | 0 |
+| `EVENT_TYPE_SPELLCASTAT` | 3 | 0 |
+| `EVENT_TYPE_GIFT_ITEM` | 3 | 0 |
+| `EVENT_TYPE_GUI_OPENED` | 2 | 0 |
+
+One handler script each: `COMBAT_INITIATED`, `AREALOADSAVE_SPECIAL`, `CHARGEN_IMPORT_HERO`,
+`MANA_STAM_DEPLETED`, `ITEM_ONTEST_USABLE`, `WORLD_MAP_CLOSED`, `LOAD_TACTICS_PRESET`,
+`RUBBER_BAND`, `GIVE_UP`, `ON_SELECT`, `ON_ORDER_RECEIVED`, `PLAYER_COMMAND_ADDED`,
+`USE_ABILITY_IMMEDIATE`, `TRAINING_BEGIN` and seven other `TRAINING_*` events.
+
+Another 27 are named in `script.ldf`, never raised by the engine, and have no comparison the
+analysis found (it may have lost them in a helper function): `MELEE_ATTACK_START`, `BLOCKED`,
+`FAILTOOPEN`, `CLICK`, `TRAP_DISARMED`, `LISTENER`, `LOCKED`, `MODULE_GETCHARSTAGE`,
+`GAMEOBJECTSLOADED`, `CHARGEN_SCREEN_ENTERED`, `CHARGEN_SELECT_LEVELUP_CLASS`,
+`CHANTERS_DONATION`, `LEVEL_OF_THE_WEEK`, `ABILITY_ACQUIRED`, `REACHED_WAYPOINT`,
+`AREALIST_POSTLOAD`, `INVENTORY_FULL`, `CREATURE_ENTERS_DIALOGUE`, `CHAR_RECORD_OPENED`,
+`OPTIONS_CHANGED`, `PLOT_COMPLETED`, `PARTY_MONEY_CHANGED`, `CODEX_CHANGED`, `CRAFT_ITEM` and
+three `TRAINING_*` events.
+
+Which of these the original's engine raises is not traced. `EVENT_TYPE_DAMAGED` is the one to
+start with.
+
+### Commands that do nothing, by how often scripts build them
+
+| Constructor | Call sites (scripts) | Note |
+| --- | --- | --- |
+| `CommandMoveAwayFromObject` | 1,010 (169) | type number invented (`SCR-057`) |
+| `CommandPlayAnimation` | 829 (386) | |
+| `CommandFly` | 353 (176) | DLC scripts pass a second integer |
+| `CommandMoveToMultiLocations` | 323 (295) | type number invented; the location list is dropped |
+| `CommandTurn` | 221 (214) | type number invented |
+| `CommandSheatheWeapons` | 14 (14) | type number invented |
+| `CommandDeathBlow` | 3 (3) | |
+| `CommandUnsheatheWeapons` | 2 (1) | type number invented |
+
+`CommandEquipItem` and `CommandUnequipItem` are declared and never called. Scripts compare
+`GetCommandType` almost only with INVALID (5,042 sites), ATTACK (195) and WAIT (194).
+`COMMAND_TYPE_DO_FUNCTION`, `DO_EVENT`, `INTERACT`, `DRIVE` and `RECOVER` have no constructor.
+
+### Engine-native effects that are only stored
+
+| Effect (id) | Construction sites |
+| --- | --- |
+| `EffectMovementSpeed` (9) | 236 |
+| `EffectMovementSpeedDebuff` (11) | 219 |
+| `EffectTransparency` (10) | 98 |
+| `EffectScreenShake` (6) | 80 |
+| `EffectParalyze` (8) | 48 |
+| `EffectGeneric` (1) | 1 |
+
+The engine gives behaviour of its own to area-of-effect (5), death (7), resurrection (1005),
+upkeep (1016), damage over time (1017), modify-property (1012), damage (1013) and impact (1024),
+and passes visual effects (4) to the presentation. The script-side types used most are
+resurrection, recently-stunned, stun, death, modify mana and stamina, knockdown and damage over
+time; the scripts handle those through APPLY_EFFECT and REMOVE_EFFECT. Scripts also construct
+effect ids 20000 to 20002 and compare against 10000 and 2001, none of which is a row of the
+effects table.
+
 ## Code inventory
 
 Found by reading the code at main on 2026-11-12: provisional markers, stubs, ignored inputs and features with no code. "Original: not traced" means nobody has yet checked what the original does. Line numbers drift; search for the quoted names if a line has moved.
