@@ -298,17 +298,21 @@ fn da2_model(path: &str, folder: &str, model: &str) -> String {
 ///   exists. A chest of material group 5 (clothing) covers the hands and feet too.
 /// - A helmet (`HelmModelVariation`, else the item worn on the head) is added when its
 ///   model exists.
-/// - The head is the first row of the race's head table (`Head_Worksheet`, a table id).
+/// - The head comes from the creature's head morph when it has one (the caller passes
+///   `base_head` false: the morph names head, hair and beard); otherwise it is the first row
+///   of the race's head table (`Head_Worksheet`, a table id).
 ///
-/// Not done yet: head morphs (their node names are hashed), hair, tints and weapons.
+/// Also returns whether a helmet is worn (it hides the morph's hair and beard, as in DA:O).
+/// Not done yet: tints and weapons.
 fn da2_creature_models(
     sim: &Sim,
     apr: &thedas_sim::m2da::Table,
     variations: &thedas_sim::m2da::Table,
     app: i64,
+    base_head: bool,
     worn: &dyn Fn(&str) -> Option<i64>,
     exists: &dyn Fn(&str) -> bool,
-) -> Vec<String> {
+) -> (Vec<String>, bool) {
     let word = |column: &str| text(apr.cell(column, app)).unwrap_or_default();
     let folder = match format!("{}{}", word("ModelRace"), word("ModelGenderOverride")) {
         f if f.is_empty() => "shared".to_string(),
@@ -320,8 +324,9 @@ fn da2_creature_models(
         Some(da2_model(&path, &folder, &model)).filter(|m| exists(m))
     };
     let mut models = Vec::new();
+    let mut helmet = false;
     if !apr.rows.contains_key(&app) {
-        return models;
+        return (models, helmet);
     }
     let override_row = |column: &str| match apr.cell(column, app) {
         Some(Cell::Int(v)) if *v > 0 => Some(*v),
@@ -352,18 +357,20 @@ fn da2_creature_models(
                     models.extend(pick(column, slot, Some(row)).map(|(m, _)| m));
                 }
             }
-            models.extend(pick("HelmModelVariation", "INVENTORY_SLOT_HEAD", None).map(|(m, _)| m));
+            let helm = pick("HelmModelVariation", "INVENTORY_SLOT_HEAD", None).map(|(m, _)| m);
+            helmet = helm.is_some();
+            models.extend(helm);
         }
         None => {}
     }
     let heads = match apr.cell("Head_Worksheet", app) {
-        Some(Cell::Int(id)) if *id > 0 => sim.world.tables().get(*id as i32, ""),
+        Some(Cell::Int(id)) if *id > 0 && base_head => sim.world.tables().get(*id as i32, ""),
         _ => None,
     };
     if let Some(heads) = heads {
         models.extend(heads.order.first().and_then(|&row| part(&heads, row)));
     }
-    models
+    (models, helmet)
 }
 
 /// What draws one creature or placeable.
@@ -531,10 +538,17 @@ fn object_models_in(sim: &Sim, o: &Object, gear: Gear) -> Drawn {
                     let item = equipped_in(sim, o, slot, gear)?;
                     item.fields.get("ModelVariation").map(|v| *v as i64)
                 };
-                let models =
-                    da2_creature_models(sim, &t, &variations, app, &worn, &|m| has_model(sim, m));
+                // The head morph names the head, hair and beard (the race's base head is
+                // the fallback), as in DA:O.
+                let morph = head_morph(sim, o);
+                let (models, helmet) =
+                    da2_creature_models(sim, &t, &variations, app, morph.is_none(), &worn, &|m| {
+                        has_model(sim, m)
+                    });
                 return Drawn {
                     models,
+                    morph,
+                    hide_hair: helmet,
                     ..Default::default()
                 };
             }
@@ -1407,7 +1421,7 @@ mod tests {
         let hm = |m: &str| format!("{pc}\\humanmale\\{m}");
         let wearing = |app, gear: &'static [(&'static str, i64)]| {
             let worn = move |slot: &str| gear.iter().find(|(s, _)| *s == slot).map(|(_, v)| *v);
-            da2_creature_models(&s, &apr, &vars, app, &worn, &exists)
+            da2_creature_models(&s, &apr, &vars, app, true, &worn, &exists).0
         };
         // Part-based, wearing nothing: the unclothed chest, hands and feet, then the head.
         assert_eq!(
@@ -1479,6 +1493,22 @@ mod tests {
             ["art\\characters\\creatures\\mabari\\c_dog"]
         );
         assert!(wearing(999, &[]).is_empty(), "no such appearance");
+        // With a head morph the morph names the head, so the base head is left out; a
+        // helmet is reported, to hide the morph's hair.
+        let worn = |slot: &str| (slot == "INVENTORY_SLOT_HEAD").then_some(5013);
+        let (models, helmet) = da2_creature_models(&s, &apr, &vars, 15, false, &worn, &exists);
+        assert_eq!(
+            models,
+            [
+                hm("arm_nuda"),
+                hm("glv_nuda"),
+                hm("boo_nuda"),
+                hm("hlh_masa")
+            ]
+        );
+        assert!(helmet);
+        let (_, helmet) = da2_creature_models(&s, &apr, &vars, 15, false, &|_| None, &exists);
+        assert!(!helmet);
     }
 
     #[test]

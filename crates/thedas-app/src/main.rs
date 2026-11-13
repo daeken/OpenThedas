@@ -57,6 +57,7 @@ mod cutactors;
 mod cutcam;
 mod focusnav;
 mod follow;
+mod glb;
 mod intro;
 mod journal;
 mod live;
@@ -145,6 +146,10 @@ struct Args {
     /// and every input since it replayed), as it was when it stopped.
     #[arg(long)]
     resume: bool,
+    /// Keep the journal even in a run with `--capture`, `--steps` or `--control` (which
+    /// keep none otherwise, so tests never replace the player's journal).
+    #[arg(long)]
+    journal: bool,
     /// Draw the creatures and placeables an area starts with (runs the simulation for the
     /// area resource given as `--area`).
     #[arg(long)]
@@ -772,10 +777,24 @@ enum Marking {
 /// Smallest box (pixels a side) taken as a marked spot; smaller is a stray click.
 const MIN_MARK: f32 = 8.0;
 
-fn ask_mark_choice(ui: &mut ui::UiLayer) {
+/// What the question whether to mark spots says to a player on the pad.
+const MARK_PROMPT_PAD: &str = "Want to point at something? Choose Mark spots, then move the \
+     pointer with the left stick, press A at one corner of the thing that is wrong and A again \
+     at the other, and say what is wrong there. Press B or Start when done.";
+
+/// The question whether to mark spots, worded for the pad when it was used last.
+fn mark_prompt(pad: bool) -> &'static str {
+    if pad {
+        MARK_PROMPT_PAD
+    } else {
+        report::MARK_PROMPT
+    }
+}
+
+fn ask_mark_choice(ui: &mut ui::UiLayer, pad: bool) {
     ui.ask_choice(
         report::MARK_ID,
-        report::MARK_PROMPT,
+        mark_prompt(pad),
         "Mark spots",
         "Just a note",
     );
@@ -1784,6 +1803,12 @@ impl App {
                 modmode::Action::World(a) => self.mod_mode_world(a),
                 modmode::Action::Fly(on) => self.set_fly(on),
                 modmode::Action::FlyTo(id) => self.fly_to(id),
+                modmode::Action::Export(id) => {
+                    let note = self.export_glb(id);
+                    if let Some(m) = self.mod_mode.as_mut() {
+                        m.exported = Some(note);
+                    }
+                }
             }
         }
     }
@@ -1831,6 +1856,94 @@ impl App {
             return;
         }
         self.follow = (!on).then(|| follow::Follow::behind(self.camera.yaw));
+    }
+
+    /// Writes object `id`'s models for Blender into the player's folder,
+    /// `workspace/blender/<tag>/`: `<tag>.glb`, its textures as PNGs and `manifest.json`
+    /// (see [`glb`]). Says what it wrote, or why not.
+    fn export_glb(&mut self, id: thedas_script::vm::ObjectId) -> String {
+        let Some(live) = self.live.as_ref() else {
+            return "Export: not playing".into();
+        };
+        let (subject, drawn, vfs) = {
+            let sim = live.sim();
+            let Some(o) = sim.world.get(id) else {
+                return "Export: the object is gone".into();
+            };
+            let subject = glb::Subject {
+                id,
+                tag: o.tag.clone(),
+                area: o.area.and_then(|a| sim.world.get(a)).map(|a| a.tag.clone()),
+                template: o.template.clone(),
+                position: o.position,
+                facing: o.facing,
+            };
+            (
+                subject,
+                thedas_ui::models::object_models(&sim, o),
+                sim.vfs.clone(),
+            )
+        };
+        if drawn.models.is_empty() {
+            return format!("Export: {} draws no model", subject.tag);
+        }
+        let read = |name: &str| {
+            vfs.read(name).ok().map(|(data, p)| glb::Read {
+                data,
+                layer: p.layer_label,
+                entry: p.entry,
+            })
+        };
+        let mut e = glb::export(&read, &subject, &drawn.models);
+        e.manifest["left_out"] = serde_json::json!({
+            "attached": drawn.attached.iter().map(|a| [&a.model, &a.node]).collect::<Vec<_>>(),
+            "morph": drawn.morph,
+            "tints": drawn.tints,
+        });
+        let safe: String = subject
+            .tag
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let dir = saves::data_dir()
+            .join("workspace")
+            .join("blender")
+            .join(&safe);
+        let write = || -> std::io::Result<()> {
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join(format!("{safe}.glb")), &e.glb)?;
+            for (name, png) in &e.images {
+                std::fs::write(dir.join(name), png)?;
+            }
+            let manifest = serde_json::to_vec_pretty(&e.manifest).unwrap_or_default();
+            std::fs::write(dir.join("manifest.json"), manifest)
+        };
+        match write() {
+            Ok(()) => {
+                let meshes = glb::check(&e.glb).unwrap_or(0);
+                let note = format!(
+                    "Exported {} ({} models, {meshes} meshes, {} textures{}) to {}",
+                    subject.tag,
+                    drawn.models.len(),
+                    e.images.len(),
+                    if e.warnings.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {} warnings in the manifest", e.warnings.len())
+                    },
+                    dir.display()
+                );
+                log::info!("{note}");
+                note
+            }
+            Err(err) => format!("Export to {} failed: {err}", dir.display()),
+        }
     }
 
     /// The camera flies free and looks at object `id`.
@@ -1912,15 +2025,49 @@ impl App {
             (None, _, Some(s)) => format!(
                 "modworld: {} globals, area {} with {} variables and {} objects, {} plots with \
                  {} stored flags",
-                s.module.len(),
-                s.area.as_ref().map_or("none", |a| a.0.as_str()),
-                s.area.as_ref().map_or(0, |a| a.1.len()),
+                s.module.as_ref().map_or(0, |m| m.vars.len()),
+                s.area.as_ref().map_or("none", |a| a.tag.as_str()),
+                s.area.as_ref().map_or(0, |a| a.vars.len()),
                 s.things.len(),
                 s.plots.len(),
                 s.plots.iter().map(|p| p.flags.len()).sum::<usize>()
             ),
             _ => "modworld: nothing read".into(),
         }
+    }
+
+    /// The `modlocal` step: a variable set (or removed) as the world-state browser does.
+    fn mod_mode_local(&mut self, who: &str, name: &str, kind: &str, value: &str) -> String {
+        if self.mod_mode.is_none() {
+            return "mod mode is not open".into();
+        }
+        let target = self.live.as_ref().and_then(|l| {
+            let sim = l.sim();
+            match who {
+                "module" => sim.world.module,
+                "area" => sim.world.area,
+                tag => sim.world.find_tag(tag, 0),
+            }
+        });
+        let Some(target) = target else {
+            return format!("modlocal: no {who}");
+        };
+        let value = match kind {
+            "remove" => None,
+            k => match modworld::parse_value(k, value) {
+                Ok(v) => Some(v),
+                Err(e) => return format!("modlocal: {e}"),
+            },
+        };
+        self.mod_mode_world(modworld::WorldAction::SetLocal {
+            target,
+            name: name.to_string(),
+            value,
+        });
+        self.mod_mode
+            .as_ref()
+            .map(|m| m.convs.status.clone())
+            .unwrap_or_default()
     }
 
     /// The `modstart` and `modflag` steps: the conversation panel's Start, or a flag set
@@ -2066,26 +2213,21 @@ impl App {
         // before a game: the report is kept without one).
         let in_game = self.live.as_ref().is_some_and(|l| !l.front_end)
             && self.screens.as_ref().is_some_and(|s| !s.front_end);
-        let mut note_asked = None;
         let mut marking = Marking::Off;
         match (report::preset_note(note), self.gfx.as_mut()) {
             (Some(text), _) => self.recorder.note(Some(text)),
-            // With the mouse, the player may first mark spots on the screen; the pad
-            // cannot draw boxes yet, so it goes straight to the note.
-            (None, Some(g)) if in_game && !self.pad_last => {
-                ask_mark_choice(&mut g.ui);
-                marking = Marking::Offered(0, 0);
-            }
+            // The player may first mark spots on the screen: boxes dragged with the mouse,
+            // or drawn with the pad's pointer (see `PadPlay::mark`).
             (None, Some(g)) if in_game => {
-                ask_report_note(&mut g.ui, self.pad.used);
-                note_asked = Some((0, 0));
+                ask_mark_choice(&mut g.ui, self.pad_last);
+                marking = Marking::Offered(0, 0);
             }
             (None, _) => self.recorder.note(Some(String::new())),
         }
         self.report_wait = Some(ReportWait {
             shot,
             reply,
-            note_asked,
+            note_asked: None,
             send: true,
             pause,
             paused_it: false,
@@ -2165,6 +2307,7 @@ impl App {
     /// One frame of marking: the choice and a spot's note asked again when they do not
     /// show (as the report's note is), the choice given up after a few tries.
     fn marking_frame(&mut self) {
+        let pad = self.pad_last;
         let (Some(w), Some(g)) = (self.report_wait.as_mut(), self.gfx.as_mut()) else {
             return;
         };
@@ -2173,7 +2316,7 @@ impl App {
             Marking::Off => {}
             Marking::Offered(frames, tries) => {
                 *frames += 1;
-                if box_shows(&g.ui, report::MARK_PROMPT) {
+                if box_shows(&g.ui, report::MARK_PROMPT) || box_shows(&g.ui, MARK_PROMPT_PAD) {
                     *frames = 0;
                 } else if *frames > NOTE_REASK_FRAMES {
                     *frames = 0;
@@ -2181,7 +2324,7 @@ impl App {
                     if *tries > NOTE_TRIES {
                         self.end_marking();
                     } else if !up {
-                        ask_mark_choice(&mut g.ui);
+                        ask_mark_choice(&mut g.ui, pad);
                     }
                 }
             }
@@ -3355,6 +3498,13 @@ impl App {
             },
             Step::ModWorld => log.push(self.mod_mode_world_step(None)),
             Step::ModPlot(name) => log.push(self.mod_mode_world_step(Some(name))),
+            Step::ModExport => match self.mod_mode.as_ref().and_then(|m| m.selected) {
+                Some(id) => log.push(self.export_glb(id)),
+                None => log.push("modexport: nothing inspected".into()),
+            },
+            Step::ModLocal(who, name, kind, value) => {
+                log.push(self.mod_mode_local(who, name, kind, value))
+            }
             Step::Talk(tag) => {
                 let Some(live) = self.live.as_mut() else {
                     return;
@@ -3762,6 +3912,23 @@ impl App {
 }
 
 impl padplay::Host for App {
+    fn marking(&mut self) -> Option<bool> {
+        match self.report_wait.as_ref().map(|w| &w.marking) {
+            Some(Marking::On { drag, asking: None }) => Some(drag.is_some()),
+            _ => None,
+        }
+    }
+
+    fn end_marking(&mut self) {
+        App::end_marking(self);
+    }
+
+    fn drop_mark(&mut self) {
+        if let Some(Marking::On { drag, .. }) = self.report_wait.as_mut().map(|w| &mut w.marking) {
+            *drag = None;
+        }
+    }
+
     fn live(&mut self) -> Option<&mut live::Live> {
         self.live.as_mut()
     }
@@ -3891,7 +4058,12 @@ impl ApplicationHandler for App {
             }
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if let Some(l) = self.live.as_mut() {
+                    l.close_journal();
+                }
+                event_loop.exit()
+            }
             WindowEvent::Resized(size) => {
                 if let Some(g) = self.gfx.as_mut() {
                     if size.width > 0 && size.height > 0 {
@@ -4786,6 +4958,12 @@ enum Step {
     ModWorld,
     /// The world-state browser looks up a plot (`modplot NAME`).
     ModPlot(String),
+    /// The inspected object's models are exported for Blender (`modexport`).
+    ModExport,
+    /// A variable set from the world-state browser (`modlocal WHO NAME TYPE VALUE`, WHO
+    /// `module`, `area` or an object's tag; TYPE `int`, `float`, `string`, `object` or
+    /// `resource`, or `remove` with no value).
+    ModLocal(String, String, String, String),
     /// The conversation's reply n (from 0) is chosen.
     Reply(usize),
     /// The game camera turns (degrees of yaw, then pitch), as dragging with the right
@@ -5168,6 +5346,15 @@ fn parse_step(s: &str) -> Result<Step> {
         "modflyto" => Step::ModFlyTo,
         "modworld" => Step::ModWorld,
         "modplot" if !arg.is_empty() => Step::ModPlot(arg.to_string()),
+        "modexport" => Step::ModExport,
+        "modlocal" => {
+            let mut w = arg.splitn(4, ' ');
+            let (Some(who), Some(name), Some(kind)) = (w.next(), w.next(), w.next()) else {
+                bail!("modlocal takes WHO NAME TYPE VALUE");
+            };
+            let value = w.next().unwrap_or_default();
+            Step::ModLocal(who.into(), name.into(), kind.into(), value.into())
+        }
         "key" if arg.len() == 1 && arg.as_bytes()[0].is_ascii_digit() => {
             // 1 is the first slot, 0 the tenth.
             Step::Quickslot((arg.as_bytes()[0] - b'0' + 9) as i32 % 10)
@@ -5271,15 +5458,13 @@ fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(saves::SaveStore::default_dir);
     let journal_dir = journal::default_dir();
-    let checkpoint = if args.resume {
-        Some(journal::checkpoint(&journal_dir).ok_or_else(|| {
-            anyhow::anyhow!("--resume: no checkpoint in {}", journal_dir.display())
-        })?)
-    } else {
-        None
-    };
-    let start = if let Some(bytes) = &checkpoint {
-        Some(live::Start::SaveBytes(bytes))
+    journal::set_enabled(
+        args.journal
+            || args.resume
+            || (args.capture.is_none() && args.steps.is_empty() && args.control.is_none()),
+    );
+    let start = if args.resume {
+        Some(live::Start::Resume(&journal_dir))
     } else if let Some(save) = &args.save {
         Some(live::Start::Save(save))
     } else if args.new_game && args.quick_start {
@@ -5306,19 +5491,6 @@ fn main() -> Result<()> {
         )?),
         None => None,
     };
-    // --resume: the inputs since the checkpoint, replayed.
-    if let (Some(l), true) = (live.as_ref(), args.resume) {
-        let report = journal::replay(&mut l.sim(), &journal_dir);
-        match (&report.refused, report.mismatch) {
-            (Some(why), _) => log::warn!("resume: the log was not replayed: {why}"),
-            (None, Some((at, _, _))) => log::warn!(
-                "resume: the replay went its own way at input {at}; the game is as it was there ({} of {} inputs)",
-                report.applied,
-                report.inputs
-            ),
-            (None, None) => log::info!("resume: {} inputs replayed", report.applied),
-        }
-    }
     // THEDAS_ASYNC_LOADS: headless too, a new level builds on a worker while frames run on
     // (as the window does), for testing that path.
     if let Some(l) = live.as_mut() {
@@ -5480,7 +5652,9 @@ fn main() -> Result<()> {
                     | Step::ModFly
                     | Step::ModFlyTo
                     | Step::ModWorld
-                    | Step::ModPlot(_) => {
+                    | Step::ModPlot(_)
+                    | Step::ModExport
+                    | Step::ModLocal(..) => {
                         println!("mod mode: windowed only")
                     }
                     Step::Talk(tag) => {
@@ -6323,12 +6497,18 @@ mod tests {
         );
         assert!(parse_steps("modflag gen00pt_party 3").is_err());
         assert_eq!(
-            parse_steps("modfly; modflyto; modworld; modplot plt_a").unwrap(),
+            parse_steps(
+                "modfly; modflyto; modworld; modplot plt_a; modlocal module X string a b; \
+                 modlocal area Y remove"
+            )
+            .unwrap(),
             vec![
                 Step::ModFly,
                 Step::ModFlyTo,
                 Step::ModWorld,
-                Step::ModPlot("plt_a".into())
+                Step::ModPlot("plt_a".into()),
+                Step::ModLocal("module".into(), "X".into(), "string".into(), "a b".into()),
+                Step::ModLocal("area".into(), "Y".into(), "remove".into(), "".into()),
             ]
         );
         assert!(parse_steps("modflag gen00pt_party 3 yes").is_err());

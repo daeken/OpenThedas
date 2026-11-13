@@ -126,6 +126,8 @@ pub enum Action {
     Fly(bool),
     /// The free camera moved to look at this object.
     FlyTo(ObjectId),
+    /// This object's models written for Blender (see [`crate::glb`]).
+    Export(ObjectId),
 }
 
 /// Mod mode's state and its egui overlay.
@@ -155,6 +157,8 @@ pub struct ModMode {
     pub world: crate::modworld::WorldBrowser,
     /// Whether the camera flies free (the app keeps this up to date).
     pub fly: bool,
+    /// What the last export wrote, or why it failed.
+    pub exported: Option<String>,
     actions: Vec<Action>,
 }
 
@@ -186,6 +190,7 @@ impl ModMode {
             convs: Default::default(),
             world: Default::default(),
             fly: false,
+            exported: None,
             actions: Vec::new(),
         }
     }
@@ -357,12 +362,16 @@ impl ModMode {
                     }
                     Some(o) => self.inspector(ui, o),
                 }
+                if let Some(note) = &self.exported {
+                    ui.separator();
+                    ui.label(note);
+                }
             });
         let mut asked = Vec::new();
         self.convs.window(ctx, &mut asked);
         self.actions.extend(asked.into_iter().map(Action::Conv));
         let mut asked = Vec::new();
-        self.world.window(ctx, &mut asked);
+        self.world.window(ctx, &self.convs.history, &mut asked);
         self.actions.extend(asked.into_iter().map(Action::World));
     }
 
@@ -382,6 +391,13 @@ impl ModMode {
                     .clicked()
                 {
                     self.actions.push(Action::FlyTo(o.id));
+                }
+                if ui
+                    .small_button("Export to Blender")
+                    .on_hover_text("Its models as a .glb, textures as PNGs, and a manifest")
+                    .clicked()
+                {
+                    self.actions.push(Action::Export(o.id));
                 }
             });
             ui.end_row();
