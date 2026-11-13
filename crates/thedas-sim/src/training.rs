@@ -103,15 +103,24 @@ impl Sim {
             .then_some("a training tutorial is under way (it disables saving)")
     }
 
-    /// Queues training event `name` (`TRAINING_BEGIN`) to the module, its integer the mode.
+    /// Runs `genev_tutorial` on the module for training event `name` (`TRAINING_BEGIN`
+    /// included), its integer the mode, now, as DAOrigins.exe does: 0x693290 (at 0x693362)
+    /// and 0x692e90 call 0x6985f0, which runs the script in the same call through the
+    /// script VM (0xa31e70 -> 0xa31d00 -> the interpreter 0xa301b0, at 0x6986a0); nothing
+    /// is queued. So the script's `BeginTrainingStep` (0x663760 -> 0x693190, which writes
+    /// the next expected event at once) has armed the next step before the caller goes
+    /// on: an equip that displaces a worn item raises `ITEM_UNEQUIPPED`, then
+    /// `ITEM_EQUIPPED`, and the second finds the step the first armed. Reached from inside
+    /// a running script the run nests (the VM's depth at +0x64; it refuses a tenth level,
+    /// 0xa2dc53), as the simulation's other engine-raised events do. Not followed: the
+    /// module's set of disabled event types (module+0x28c) that 0x6985f0 checks first.
     fn raise_training_event(&mut self, name: &str, mode: i32) {
         let Some(module) = self.world.module else {
             return;
         };
         let mut ev = self.new_event(name, self.world.hero);
         ev.ints = vec![mode];
-        self.world
-            .queue_event(0, module, ev, Some(TRAINING_SCRIPT.to_string()));
+        self.deliver(module, ev, Some(TRAINING_SCRIPT.to_string()));
     }
 }
 
@@ -126,17 +135,30 @@ mod tests {
                    int EVENT_TYPE_TRAINING_MAXIMUM_ZOOM_IN = 1065;\n";
         let table = thedas_script::EngineTable::parse(ldf.as_bytes()).unwrap_or_default();
         let mut s = Sim::new(Arc::new(thedas_vfs::Vfs::new()), Arc::new(table), 1);
+        s.world.trace.keep = true;
         let m = s.world.spawn(crate::world::ObjectKind::Module, "module");
         s.world.module = Some(m);
         s
     }
 
-    fn queued(s: &Sim) -> Vec<(i32, Vec<i32>)> {
-        s.world
-            .queue
-            .values()
-            .map(|q| (q.event.ty, q.event.ints.clone()))
-            .collect()
+    /// The training events delivered so far (to `genev_tutorial`), and clears the record.
+    fn delivered(s: &mut Sim) -> Vec<i32> {
+        let out = s
+            .world
+            .trace
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                crate::trace::TraceEntry::EventDelivered { ty, script, .. }
+                    if script == TRAINING_SCRIPT =>
+                {
+                    Some(*ty)
+                }
+                _ => None,
+            })
+            .collect();
+        s.world.trace.entries.clear();
+        out
     }
 
     #[test]
@@ -144,14 +166,15 @@ mod tests {
         let mut s = sim();
         s.set_training_mode(1);
         assert!(s.training_paused());
-        assert_eq!(queued(&s), vec![(1059, vec![1])]);
-        s.world.queue.clear();
+        // Delivered at once, not queued (see `Sim::raise_training_event`).
+        assert_eq!(delivered(&mut s), vec![1059]);
+        assert!(s.world.queue.is_empty());
         s.begin_training_step(1, 1065, 0);
         assert_eq!(s.world.training.step, 1);
         // Only the event the step waits for goes to the module.
         assert!(!s.training_event("GUI_INVENTORY_OPENED", 0));
         assert!(s.training_event("MAXIMUM_ZOOM_IN", 0));
-        assert_eq!(queued(&s), vec![(1065, vec![1])]);
+        assert_eq!(delivered(&mut s), vec![1065]);
         s.set_training_mode(0);
         assert!(!s.training_paused());
         assert_eq!(s.world.training, Training::default());
@@ -169,9 +192,9 @@ mod tests {
         let mut s = sim();
         s.set_training_mode(1);
         s.begin_training_step(1, 1065, 0);
-        s.world.queue.clear();
+        delivered(&mut s);
         assert!(s.player_zoomed_in());
-        assert_eq!(queued(&s), vec![(1065, vec![1])]);
+        assert_eq!(delivered(&mut s), vec![1065]);
         // Heard once: zooming in again does nothing more.
         assert!(!s.player_zoomed_in());
     }
@@ -187,5 +210,45 @@ mod tests {
         s.set_training_mode(1);
         assert!(!s.training_paused());
         assert!(s.world.zoom_request.is_none());
+    }
+
+    /// `genev_tutorial` as the inventory lesson's step 7 handler: whatever it hears, it
+    /// arms step 10 waiting for `ITEM_EQUIPPED` (1071) in slot 4.
+    fn arms_equip_step() -> thedas_script::ncs::Ncs {
+        let mut b: Vec<u8> = Vec::new();
+        for v in [4i32, 1071, 10] {
+            b.extend([0x04, 0x03]);
+            b.extend(v.to_be_bytes());
+        }
+        // ACTION BeginTrainingStep (843), 3 arguments; RETN.
+        b.extend([0x05, 0x00]);
+        b.extend(843u16.to_be_bytes());
+        b.extend([0x03, 0x20, 0x00]);
+        let mut v = b"NCS V1.0B".to_vec();
+        v.extend(((13 + b.len()) as u32).to_be_bytes());
+        v.extend(b);
+        thedas_script::ncs::Ncs::parse(&v).unwrap()
+    }
+
+    #[test]
+    fn a_swap_ends_the_unequip_and_the_equip_steps() {
+        let ldf = "int EVENT_TYPE_TRAINING_BEGIN = 1059;\n\
+                   int EVENT_TYPE_TRAINING_ITEM_UNEQUIPPED = 1070;\n\
+                   int EVENT_TYPE_TRAINING_ITEM_EQUIPPED = 1071;\n\
+                   void BeginTrainingStep(int nStepID, int nExpectedTrainingEvent, int nTrainingEventArg = 0) = 843;\n";
+        let table = thedas_script::EngineTable::parse(ldf.as_bytes()).unwrap();
+        let mut s = Sim::new(Arc::new(thedas_vfs::Vfs::new()), Arc::new(table), 1);
+        s.world.trace.keep = true;
+        let m = s.world.spawn(crate::world::ObjectKind::Module, "module");
+        s.world.module = Some(m);
+        s.add_script(TRAINING_SCRIPT, arms_equip_step());
+        s.set_training_mode(5);
+        s.begin_training_step(7, 1070, 4);
+        // The equip's unequip of the worn chest piece, then the equip itself, with nothing
+        // run in between: the first arms the step the second ends.
+        assert!(s.training_event("ITEM_UNEQUIPPED", 4));
+        assert_eq!(s.world.training.step, 10);
+        assert_eq!(s.world.training.expected, 1071);
+        assert!(s.training_event("ITEM_EQUIPPED", 4));
     }
 }
