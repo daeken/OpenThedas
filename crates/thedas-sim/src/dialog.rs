@@ -601,7 +601,18 @@ impl Sim {
         // A conversation waiting for this one starts in its place, in the same mode.
         while self.talk.as_ref().is_none_or(|c| c.ended) && !self.world.pending_talks.is_empty() {
             let (initiator, target, d) = self.world.pending_talks.remove(0);
-            self.open_conversation(initiator, target, d);
+            // Its owner must still be there to talk: an active, living creature, as when it
+            // was asked for (DAOrigins.exe 0x6976b0). The City Elf's Valora, asked during
+            // Vaughan's scene, is sent off with the bridal party when it ends. Provisional:
+            // the exe makes these tests when the conversation is asked for; whether it makes
+            // them again when a waiting one starts is not traced.
+            let there = target == OBJECT_INVALID
+                || self.world.get(target).is_some_and(|o| {
+                    o.kind == crate::world::ObjectKind::Creature && o.active && !o.dead
+                });
+            if there {
+                self.open_conversation(initiator, target, d);
+            }
         }
         let Some(before) = self.world.mode_before_talk else {
             return;
@@ -891,6 +902,17 @@ mod tests {
         let talk = sim.talk.as_ref().unwrap();
         assert_eq!((talk.dlg.name.as_str(), talk.owner), ("valora", valora));
         assert!(!talk.ended);
+        assert!(sim.world.pending_talks.is_empty());
+        // One whose owner has gone by then (set inactive, as the bridal party is after the
+        // scene) does not start.
+        assert!(sim.choose_reply(0).unwrap().ended);
+        sim.tick(0);
+        assert!(sim.open_conversation(hero, vaughan, named("vaughan")));
+        assert!(sim.open_conversation(hero, valora, named("valora")));
+        sim.world.get_mut(valora).unwrap().active = false;
+        assert!(sim.choose_reply(0).unwrap().ended);
+        sim.tick(0);
+        assert!(sim.talk.as_ref().is_none_or(|t| t.ended), "nothing starts");
         assert!(sim.world.pending_talks.is_empty());
     }
 
