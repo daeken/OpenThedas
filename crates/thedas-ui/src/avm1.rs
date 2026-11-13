@@ -510,6 +510,8 @@ pub const IMG_TAKE: &str = "_global.thedas_img_take";
 pub const IMG_MEASURE: &str = "_global.thedas_img_measure";
 /// Sets a field's HTML text: (field, html).
 pub const IMG_SET: &str = "_global.thedas_img_set";
+/// A field's width and its text's alignment: (field) to `[width, align]`.
+pub const IMG_FIELD: &str = "_global.thedas_img_field";
 /// Places image `n` of a field: (field, n, linkage name or "" to clear, x, y) to the
 /// image's `[width, height]`.
 pub const IMG_PUT: &str = "_global.thedas_img_put";
@@ -798,6 +800,28 @@ fn img_put_function() -> Vec<u8> {
     push(c, &[Push::Int(2)]);
     c.extend_from_slice(&[INIT_ARRAY, RETURN]);
     function(&["k", "n", "s", "x", "y"], &a.finish())
+}
+
+/// `function (k) { var t = _global.thedas_imgall[k].TextField;
+/// return [t._width, t.getNewTextFormat().align]; }` (see [`IMG_FIELD`]).
+fn img_field_function() -> Vec<u8> {
+    let mut c = Vec::new();
+    push(&mut c, &[Push::Str("t")]);
+    get_path(&mut c, &["_global", "thedas_imgall"]);
+    get_path(&mut c, &["k"]);
+    c.push(GET_MEMBER);
+    push(&mut c, &[Push::Str("TextField")]);
+    c.extend_from_slice(&[GET_MEMBER, DEFINE_LOCAL]);
+    push(&mut c, &[Push::Int(0)]);
+    get_path(&mut c, &["t"]);
+    push(&mut c, &[Push::Str("getNewTextFormat")]);
+    c.push(CALL_METHOD);
+    push(&mut c, &[Push::Str("align")]);
+    c.push(GET_MEMBER);
+    get_path(&mut c, &["t", "_width"]);
+    push(&mut c, &[Push::Int(2)]);
+    c.extend_from_slice(&[INIT_ARRAY, RETURN]);
+    function(&["k"], &c)
 }
 
 /// Code with forward and backward branches by label.
@@ -1709,6 +1733,7 @@ pub fn register_invoke() -> Vec<u8> {
         ("thedas_img_measure", img_measure_function()),
         ("thedas_img_set", img_set_function()),
         ("thedas_img_put", img_put_function()),
+        ("thedas_img_field", img_field_function()),
     ] {
         get_path(&mut out, &["_global"]);
         push(&mut out, &[Push::Str(name)]);

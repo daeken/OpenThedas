@@ -293,6 +293,10 @@ pub struct UiLayer {
     /// A large notification was cut off: notifications.gfx went away (a full-screen screen
     /// opened) while it showed, so it is dismissed as the movie would at its end.
     uber_cut: bool,
+    /// notifications.gfx was up last frame, and the small notifications ("Quest updated")
+    /// were cut off by its going (dismissed as when they fade, `Party.HideAlert`).
+    notifications_up: bool,
+    alerts_cut: bool,
     /// The loading screen up, if any (see [`UiLayer::loading_begin`]).
     loading: Option<Loading>,
     /// The world map is held up as the loading screen (see [`UiLayer::hold_world_map`]).
@@ -631,6 +635,8 @@ impl UiLayer {
             portrait_clicked: None,
             uber_splash: None,
             uber_cut: false,
+            notifications_up: false,
+            alerts_cut: false,
             loading: None,
             travel_map: false,
             travel_out: None,
@@ -974,6 +980,12 @@ impl UiLayer {
             .movies
             .iter()
             .any(|m| m.name == "notifications.gfx");
+        // Likewise the small notifications up when it went: they are dismissed as when they
+        // fade, not shown again by the HUD that comes back.
+        if std::mem::replace(&mut self.notifications_up, notifications) && !notifications {
+            let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+            self.alerts_cut |= !sim.world.alerts.is_empty();
+        }
         if head.is_some() && self.uber_splash.is_some() && !notifications {
             self.uber_splash = None;
             self.uber_cut = true;
@@ -1580,6 +1592,12 @@ impl UiLayer {
                     args.push(typed);
                 }
             }
+        }
+        if std::mem::take(&mut self.alerts_cut) {
+            messages.push(GameMessage::Send(
+                thedas_sim::journal::MSG_HIDE_ALERT.into(),
+                Vec::new(),
+            ));
         }
         if std::mem::take(&mut self.uber_cut) {
             messages.push(GameMessage::Send(
