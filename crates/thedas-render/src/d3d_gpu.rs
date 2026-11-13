@@ -2925,8 +2925,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn its_shaders_translate_for_opengl() {
-        crate::gl_check::translates("shadow blur", SHADOW_BLUR_WGSL);
+    fn its_shaders_translate_for_every_backend() {
+        crate::backend_check::translates("shadow blur", SHADOW_BLUR_WGSL);
     }
 
     #[test]

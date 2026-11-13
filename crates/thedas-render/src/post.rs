@@ -1391,10 +1391,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn its_shaders_translate_for_opengl() {
-        crate::gl_check::translates("fade", FADE_SHADER);
-        crate::gl_check::translates("colour matrix", HSV_SHADER);
-        crate::gl_check::translates("bloom", SHADER);
+    fn its_shaders_translate_for_every_backend() {
+        crate::backend_check::translates("fade", FADE_SHADER);
+        crate::backend_check::translates("colour matrix", HSV_SHADER);
+        crate::backend_check::translates("bloom", SHADER);
     }
 
     #[test]
