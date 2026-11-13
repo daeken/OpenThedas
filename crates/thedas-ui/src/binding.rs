@@ -968,8 +968,14 @@ const HASH_LOAD_HINT_TEXT: u32 = 0x4063_41be;
 /// text as DAOrigins.exe does at once (0x660ee0). None when no script set one: the random
 /// hints are the scripts' own picks (`SetLoadHint` from their random tables), not the exe's.
 pub fn load_hint(sim: &Sim) -> Option<String> {
+    hint_text(sim, sim.world.transition_hint)
+}
+
+/// A hint's text: row `hint.0` of M2DA `hint.1` (the load and death hint tables share their
+/// text column).
+fn hint_text(sim: &Sim, hint: Option<(i32, i32)>) -> Option<String> {
     use thedas_formats::gda::Cell;
-    let (row, table) = sim.world.transition_hint?;
+    let (row, table) = hint?;
     match sim
         .world
         .tables()
@@ -1671,7 +1677,12 @@ fn saves(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
         v.insert(format!("{k}.ClassID"), num(class));
     }
     v.insert("Party.CapturedOnDeath".into(), num(0));
-    v.insert("GUIDeath.DeathHint".into(), UiValue::String(String::new()));
+    // The death screen's hint, when a script set one (`SetDeathHint`): its row's text in
+    // the hints table, as the load hints' (the same text column).
+    v.insert(
+        "GUIDeath.DeathHint".into(),
+        UiValue::String(hint_text(sim, sim.world.death_hint).unwrap_or_default()),
+    );
 }
 
 /// Time played as the screens show it, hours and minutes.
