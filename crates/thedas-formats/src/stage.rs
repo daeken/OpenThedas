@@ -13,7 +13,9 @@
 //! Its actors' `AJSP` tracks put each at a stage place. A line staged without cinematics of
 //! its own (an empty cut) takes the camera of the place its speaker stands at, and the
 //! actors' places, from the nearest line on the same stage with cinematics that places the
-//! speaker (actors move between places from line to line).
+//! speaker (actors move between places from line to line). Provisional: "nearest line" is
+//! a guess from the data, not traced; the executable frames a line that plays no cinematics
+//! with its default framing.
 //!
 //! A line's cut also gives how long its cinematics run (5000, seconds); a stage's `decision`
 //! camera frames the player choosing a reply.
@@ -196,7 +198,8 @@ pub fn line_shots(g: &Gff4) -> TypedResult<Vec<Option<LineShot>>> {
             }));
             continue;
         }
-        // The speaker's place on the nearest line of the same stage that places them.
+        // The speaker's place on the nearest line of the same stage that places them
+        // (provisional: a guess, see the module docs).
         let mut order: Vec<usize> = (0..staged.len()).filter(|&j| j != i).collect();
         order.sort_by_key(|&j| j.abs_diff(i));
         let found = order.into_iter().find_map(|j| {

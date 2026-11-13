@@ -1152,7 +1152,9 @@ impl Live {
         }
         let faces = self.objects.as_ref().map(|o| &o.faces);
         let face = |id| faces.and_then(|f| f.get(&id).copied());
-        self.talk_camera.camera(&sim, base, &face)
+        let posed = &self.posed;
+        self.talk_camera
+            .camera(&sim, base, &face, &|id| drawn_root(posed, id))
     }
 
     /// The playing cutscene's camera (see [`crate::cutcam`]); `base` gives the clip planes.

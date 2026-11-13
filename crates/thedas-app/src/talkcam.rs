@@ -7,13 +7,17 @@
 //!
 //! Presentation only: reads the simulation and the dialog and stage resources.
 //!
-//! Once a line with its own cinematics has run its length (the cut's, 5000) and the player
-//! has replies to choose, the view moves to the stage's `decision` camera.
+//! A line whose own cutscene cuts between camera actors is seen through that cutscene's
+//! camera as it plays (see [`line_cut_view`], traced).
 //!
-//! Provisional: the camera's field of view is taken as
-//! vertical; the original's camera moves between and within
-//! lines and lines staged at the speaker's
-//! current location (`StageAtCurrentLocation`) are not followed.
+//! Once a line with its own cinematics has run its length (the cut's, 5000) and the player
+//! has replies to choose, the view moves to the stage's `decision` camera. Provisional, and
+//! our own invention: the executable has no `decision` string and no such fallback was found
+//! in `GameModeDialog`; what the original shows while the player chooses is not traced.
+//!
+//! Provisional: the camera's field of view is taken as vertical; camera moves between
+//! lines, and within a line whose cutscene has no camera cuts, are not followed; nor are
+//! lines staged at the speaker's current location (`StageAtCurrentLocation`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,8 +27,12 @@ use thedas_formats::stage::{LineShot, Stage, StageCamera};
 use thedas_render::Camera;
 use thedas_script::vm::ObjectId;
 use thedas_sim::Sim;
+use thedas_sim::cutactors::{Bound, LineCut};
+use thedas_sim::cuttracks::{Finders, Placement, Tracks};
 use thedas_sim::dialog::OpenLine;
 use thedas_sim::world::{Object, ObjectKind};
+
+use crate::cutactors::{DrawnRoots, drawn_object, stage_place};
 
 /// Where a staged line puts its camera and actors.
 #[derive(Clone, Debug, PartialEq)]
@@ -43,6 +51,8 @@ type LineKey = ((String, ObjectId), Option<usize>);
 #[derive(Default)]
 pub struct TalkCamera {
     shots: HashMap<String, Option<Arc<Vec<Option<LineShot>>>>>,
+    /// Each conversation's lines' own cutscenes, by conversation.
+    cuts: HashMap<String, Option<Arc<Vec<LineCut>>>>,
     stages: HashMap<String, Option<Arc<Stage>>>,
     /// The line whose staging is held (the last staged line) and that staging.
     held: Option<(LineKey, Staged)>,
@@ -70,13 +80,22 @@ impl TalkCamera {
             self.held = None;
         }
         let line = (conversation, open.line);
-        if self.shown.as_ref().is_none_or(|(l, _)| *l != line) {
-            self.shown = Some((line.clone(), self.clock_ms));
-        }
         let shot = open.line.and_then(|l| {
             let shots = self.shots(sim, &line.0.0)?;
             shots.get(l).cloned().flatten()
         });
+        if self.shown.as_ref().is_none_or(|(l, _)| *l != line) {
+            self.shown = Some((line.clone(), self.clock_ms));
+            log::debug!(
+                "conversation {} line {:?} (speaker {:?}) at {:.0} ms: shot {:?}",
+                line.0.0,
+                open.line,
+                sim.dialog_state().map(|d| d.speaker),
+                self.clock_ms,
+                shot.as_ref()
+                    .map(|s| (&s.stage, &s.stage_file, &s.place, s.by_place, s.seconds))
+            );
+        }
         if shot.is_none() {
             log::debug!("line {:?} of {}: no shot", open.line, line.0.0);
         }
@@ -95,17 +114,23 @@ impl TalkCamera {
 
     /// The camera for the open conversation: the line's shot, or the stage's decision camera
     /// once a line with its own cinematics has run its length and the player has replies
-    /// to choose. Provisional: the original's line length is its voice-over's; the cut's
+    /// to choose. Provisional: the decision camera as a fallback is our own invention (see
+    /// the module docs); the original's line length is its voice-over's; the cut's
     /// length (5000) is taken instead, and lines without one keep their shot.
     ///
     /// A line without a shot of its own is framed as the executable frames a line that
     /// plays no cinematics (see [`default_framing`]); `face` gives a creature's eyes as
     /// drawn, offset from where it stands.
+    ///
+    /// A line that plays its own cutscene with camera cuts is seen through that cutscene's
+    /// camera as it plays (see [`line_cut_view`]); `roots` gives where the drawn objects
+    /// are, which cameras linked to them follow.
     pub fn camera(
         &mut self,
         sim: &Sim,
         base: &Camera,
         face: &dyn Fn(ObjectId) -> Option<Vec3>,
+        roots: &DrawnRoots,
     ) -> Option<Camera> {
         let open = sim.conversation_line()?;
         let choosing = open.choosing;
@@ -113,6 +138,9 @@ impl TalkCamera {
         let now = self.clock_ms;
         let staging = self.staging(sim, base).cloned();
         let shown = self.shown.clone();
+        if let Some(view) = self.line_cut_camera(sim, &line, now, base, roots) {
+            return Some(view);
+        }
         let held_here = self.held.as_ref().is_some_and(|(held, _)| *held == line);
         if !held_here && line.1.is_some() {
             return self.unstaged(sim, base, face);
@@ -185,6 +213,55 @@ impl TalkCamera {
             listener,
             base,
         ))
+    }
+
+    /// The view of the shown line's own cutscene (see [`line_cut_view`]), when it is the
+    /// line the simulation staged and its cutscene has camera cuts.
+    fn line_cut_camera(
+        &mut self,
+        sim: &Sim,
+        line: &LineKey,
+        now: f64,
+        base: &Camera,
+        roots: &DrawnRoots,
+    ) -> Option<Camera> {
+        let (dlg, at, placement, bound) = sim.line_staging()?;
+        if !dlg.eq_ignore_ascii_case(&line.0.0) || Some(at) != line.1 {
+            return None;
+        }
+        let tracks = self.line_cuts(sim, &line.0.0)?.get(at)?.tracks.clone()?;
+        if tracks.cuts.is_empty() {
+            return None;
+        }
+        let since = match &self.shown {
+            Some((l, since)) if l == line => *since,
+            _ => now,
+        };
+        let t = ((now - since) / 1000.0) as f32;
+        let stage = tracks.stage_file.as_deref().and_then(|f| {
+            let f = f.trim_end_matches('\0').to_ascii_lowercase();
+            let f = f.strip_suffix(".stg").unwrap_or(&f).to_string();
+            self.stage(sim, &f)
+        });
+        let view = line_cut_view(&tracks, t, placement, stage.as_deref(), bound, roots, base);
+        if view.is_none() {
+            log::debug!(
+                "line {at} of {dlg}: its cutscene gives no camera {t:.2}s in (stage {:?})",
+                tracks.stage_file
+            );
+        }
+        view
+    }
+
+    fn line_cuts(&mut self, sim: &Sim, dlg: &str) -> Option<Arc<Vec<LineCut>>> {
+        self.cuts
+            .entry(dlg.to_string())
+            .or_insert_with(|| {
+                let (data, _) = sim.vfs.read(&format!("{dlg}.dlg")).ok()?;
+                let g = thedas_formats::Gff4::parse(&data).ok()?;
+                Some(Arc::new(thedas_sim::cutactors::line_cuts(&g)))
+            })
+            .clone()
     }
 
     fn shots(&mut self, sim: &Sim, dlg: &str) -> Option<Arc<Vec<Option<LineShot>>>> {
@@ -348,6 +425,47 @@ pub fn default_framing(
     }
 }
 
+/// The view of a conversation line's own cutscene (`tracks`, its 12211 `CUT ` struct) `t`
+/// seconds after the line came up: its camera actor's world pose, as for any cutscene
+/// (see [`crate::cutcam`]). `None` when the cutscene has no camera cuts, or its camera
+/// jumps to a camera `stage` (the cutscene's stage file) does not have.
+///
+/// Traced in DAOrigins.exe: as a line comes up, `GameModeDialog` builds the line's
+/// cutscene (0x68e53c -> 0x7f0960: from the `CUTR` reference's resource, else from the
+/// inline `CUT ` struct, 0x7f0a4d -> 0x7e2a70) and places it on the line's stage
+/// (0x68e584 -> 0x7d2aa0); a line with neither gets the default framing (0x68e541 ->
+/// 0x68e700, see [`default_framing`]). Each update ticks that cutscene (0x68df79 ->
+/// 0x7e3d30), and its tick hands the camera the active camera actor's world pose (0x7e41b1
+/// .. 0x7e41ca, as `GameModeCutscene` does): so the camera cuts between camera actors
+/// (`ActionChangeActiveCamera`, kind 11, e.g. a "Primary Camera" at 0 s and a "Secondary
+/// Camera" at 2.5 s) and jumps from stage camera to stage camera within the line.
+///
+/// Provisional: once the cutscene has run its length the view holds its last pose (nothing
+/// else in `GameModeDialog` sets the camera that was found; not traced to the end).
+pub fn line_cut_view(
+    tracks: &Tracks,
+    t: f32,
+    placement: Placement,
+    stage: Option<&Stage>,
+    bound: &[Bound],
+    roots: &DrawnRoots,
+    base: &Camera,
+) -> Option<Camera> {
+    if tracks.cuts.is_empty() {
+        return None;
+    }
+    let camera = |name: &str, by_place: bool| crate::cutcam::stage_camera(stage?, name, by_place);
+    let place = |name: &str| stage_place(stage, name);
+    let root = |i: usize| roots(drawn_object(tracks, bound, i)?);
+    let find = Finders {
+        camera: &camera,
+        place: &place,
+        root: &root,
+    };
+    let pose = tracks.camera_at(t.max(0.0), placement, &find)?;
+    Some(crate::cutcam::pose_camera(&pose, base))
+}
+
 /// The creature a cutscene actor names: `OWNER` (the conversation's owner), `PLAYER`
 /// (its player character), `HENCH:<tag>` or a tag (a creature in the current area).
 fn actor_object(sim: &Sim, actor: &str, open: &OpenLine) -> Option<ObjectId> {
@@ -392,6 +510,8 @@ pub fn place_camera(position: [f32; 3], facing: f32, cam: &StageCamera, base: &C
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f32::consts::FRAC_1_SQRT_2;
+    use thedas_sim::cuttracks::{Actor, CameraJump};
 
     #[test]
     fn places_the_stage_camera_in_the_world() {
@@ -413,6 +533,111 @@ mod tests {
         assert!((c.forward() - Vec3::X).length() < 1e-4, "{:?}", c.forward());
         assert!((c.fov_y - 30f32.to_radians()).abs() < 1e-6);
         assert_eq!(c.far, base.far);
+    }
+
+    /// A camera actor of a line's cutscene that jumps to stage camera `camera` (or, with
+    /// `by_place`, to that place's default camera) for the whole line.
+    fn camera_actor(id: i64, name: &str, camera: &str, by_place: bool) -> Actor {
+        Actor {
+            id,
+            name: name.into(),
+            creature: None,
+            tag: None,
+            end_position: [0.0; 3],
+            end_rotation: [0.0, 0.0, 0.0, 1.0],
+            snaps: false,
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            motion: Vec::new(),
+            turn: Vec::new(),
+            fov: Vec::new(),
+            animations: Vec::new(),
+            places: Vec::new(),
+            camera_jumps: vec![CameraJump {
+                start: 0.0,
+                end: 1e10,
+                camera: camera.into(),
+                by_place,
+            }],
+            links: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_lines_own_cutscene_cuts_between_its_cameras() {
+        use thedas_formats::stage::Place;
+        // A line made like Irving's in the Harrowing: the "Primary Camera" (id 3) is on the
+        // speaker's place's default camera, the "Secondary Camera" (id 5) on a wide camera
+        // from 0.5 s.
+        let stage = Stage {
+            places: vec![Place {
+                name: "speaker".into(),
+                position: [0.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                default_camera: Some("close".into()),
+            }],
+            cameras: vec![
+                StageCamera {
+                    name: "close".into(),
+                    position: [0.0, -1.0, 1.6],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    fov: 30.0,
+                },
+                StageCamera {
+                    name: "wide".into(),
+                    position: [4.0, 0.0, 1.5],
+                    // A quarter turn about Z: it looks along stage -X.
+                    rotation: [0.0, 0.0, FRAC_1_SQRT_2, FRAC_1_SQRT_2],
+                    fov: 45.0,
+                },
+            ],
+        };
+        let tracks = Tracks {
+            actors: vec![
+                camera_actor(3, "Primary Camera", "speaker", true),
+                camera_actor(5, "Secondary Camera", "wide", false),
+            ],
+            stage_file: Some("line.stg".into()),
+            seconds: 7.7,
+            cuts: vec![(0.0, 3), (0.5, 5)],
+            ..Default::default()
+        };
+        // The cutscene plays on a stage the area puts at (10, 20, 0), a quarter turn round.
+        let placement = Placement::facing([10.0, 20.0, 0.0], 90.0);
+        let base = Camera::new(Vec3::ZERO, 0.0, 0.0);
+        let none: &DrawnRoots = &|_| None;
+        let view =
+            |t: f32| line_cut_view(&tracks, t, placement, Some(&stage), &[], none, &base).unwrap();
+        // First the speaker's close camera: stage (0, -1) is world (11, 20), looking along
+        // stage +Y = world -X.
+        let c = view(0.2);
+        assert!(
+            (c.position - Vec3::new(11.0, 20.0, 1.6)).length() < 1e-4,
+            "{:?}",
+            c.position
+        );
+        assert!((c.forward() - Vec3::NEG_X).length() < 1e-4);
+        assert!((c.fov_y - 30f32.to_radians()).abs() < 1e-6);
+        // From 0.5 s the wide camera: stage (4, 0) is world (10, 24), looking along stage
+        // -X = world -Y.
+        for t in [0.5, 3.0, 20.0] {
+            let c = view(t);
+            assert!(
+                (c.position - Vec3::new(10.0, 24.0, 1.5)).length() < 1e-4,
+                "{t}: {:?}",
+                c.position
+            );
+            assert!((c.forward() - Vec3::NEG_Y).length() < 1e-4, "{t}");
+            assert!((c.fov_y - 45f32.to_radians()).abs() < 1e-6);
+        }
+        // A cutscene without camera cuts frames nothing, nor does a jump to a camera the
+        // stage does not have.
+        let uncut = Tracks {
+            cuts: Vec::new(),
+            ..tracks.clone()
+        };
+        assert!(line_cut_view(&uncut, 1.0, placement, Some(&stage), &[], none, &base).is_none());
+        assert!(line_cut_view(&tracks, 1.0, placement, None, &[], none, &base).is_none());
     }
 
     #[test]
