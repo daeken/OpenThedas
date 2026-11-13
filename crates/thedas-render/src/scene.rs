@@ -541,6 +541,29 @@ pub struct PropEmitter {
     pub emitter: usize,
     pub in_model: Mat4,
     pub follows: Option<(usize, usize)>,
+    /// Its birthrate and birthrate range as its effect's looping animation sets them, and
+    /// that animation's length in seconds (see `Loader::place_effect`).
+    pub rate: Option<EffectRate>,
+}
+
+/// An effect emitter's birthrate over time: the `<emitter>_birthrate` and
+/// `<emitter>_birthraterange` float tracks of its effect's animation, which loops.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectRate {
+    pub length: f32,
+    pub birthrate: Option<thedas_formats::anim::ScalarTrack>,
+    pub range: Option<thedas_formats::anim::ScalarTrack>,
+}
+
+impl EffectRate {
+    /// (birthrate, range) at `t` seconds into the loop.
+    pub fn at(&self, t: f32) -> (f32, f32) {
+        let t = if self.length > 0.0 { t.rem_euclid(self.length) } else { 0.0 };
+        (
+            self.birthrate.as_ref().map_or(0.0, |k| k.at(t)),
+            self.range.as_ref().map_or(0.0, |k| k.at(t)),
+        )
+    }
 }
 
 /// An attached model's draws and the body node they hang from.
@@ -2393,9 +2416,13 @@ impl<'a> Loader<'a> {
     /// emitter under a crust node (`crst`, named after a body node: `CrustHook1` …) sits
     /// where the first of the prop's models with that node has it, by the transforms below
     /// the crust node, and follows that node as the body moves; the others follow the
-    /// prop's root by their place in the effect model. Provisional: the crust node's own
-    /// transform is not used, effect models' meshes are not drawn, and an effect on a body
-    /// without the named node is left out.
+    /// prop's root by their place in the effect model. Their birthrates come from the
+    /// effect's duration animation (`<effect>.dura.ani`, whose float tracks are named
+    /// `<emitter>_birthrate` and `<emitter>_birthraterange`), looped: the models themselves
+    /// carry 0. Provisional: the impact (`.impa`) and cessation (`.cess`) animations the
+    /// game plays around it are not played, the crust node's own transform is not used,
+    /// effect models' meshes and other animated parameters (`gob_remotematerialalpha`)
+    /// are not drawn, and an effect on a body without the named node is left out.
     fn place_effect(&mut self, effect: &str, prop: &Prop) -> Vec<PropEmitter> {
         use thedas_formats::emitter::Emitter;
         use thedas_formats::model::{KIND_CRUST, Node};
@@ -2423,6 +2450,10 @@ impl<'a> Loader<'a> {
         for n in &model.nodes {
             walk(n, Mat4::IDENTITY, None, &mut found);
         }
+        let looping = self
+            .read(&format!("{effect}.dura.ani"))
+            .ok()
+            .and_then(|d| thedas_formats::anim::Animation::parse(&d).ok());
         let mut out = Vec::new();
         for (e, name, hook, below) in found {
             let (in_model, follows) = match hook {
@@ -2444,6 +2475,21 @@ impl<'a> Loader<'a> {
                 }
                 None => (below, None),
             };
+            let rate = looping.as_ref().and_then(|a| {
+                let name = name?.to_ascii_lowercase();
+                let track = |suffix: &str| {
+                    a.scalars
+                        .iter()
+                        .find(|s| s.target == format!("{name}_{suffix}"))
+                        .cloned()
+                };
+                let (birthrate, range) = (track("birthrate"), track("birthraterange"));
+                (birthrate.is_some() || range.is_some()).then(|| EffectRate {
+                    length: a.length,
+                    birthrate,
+                    range,
+                })
+            });
             if let Some(emitter) =
                 self.push_emitter(effect, e, name, prop.transform * in_model, &[], false)
             {
@@ -2451,6 +2497,7 @@ impl<'a> Loader<'a> {
                     emitter,
                     in_model,
                     follows,
+                    rate,
                 });
             }
         }

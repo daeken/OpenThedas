@@ -1156,6 +1156,7 @@ impl AreaRenderer {
                 .unwrap_or(glam::Mat4::IDENTITY);
             if let Some(state) = self.emitters.get_mut(e.emitter) {
                 state.world = transform * follow * e.in_model;
+                state.rate = e.rate.as_ref().map(|r| r.at(self.time as f32));
             }
         }
     }
