@@ -494,6 +494,30 @@ pub fn line_cut_view(
     Some(crate::cutcam::pose_camera(&pose, base))
 }
 
+/// The open conversation's line's speaker and who it speaks to, when a line is up that is
+/// not said in passing. Provisional: the listener is the party's leader (0x68d270 asks for
+/// the player's creature), or the conversation's owner when the leader speaks.
+pub fn line_speaker_and_listener(sim: &Sim) -> Option<(ObjectId, ObjectId)> {
+    let open = sim.conversation_line()?;
+    if open.ambient {
+        return None;
+    }
+    let said = sim.dialog_state()?.speaker;
+    let said = said.trim_end_matches('\0');
+    let speaker = if said.is_empty() {
+        open.owner
+    } else {
+        actor_object(sim, said, &open)?
+    };
+    let leader = sim.world.controlled().unwrap_or(open.player);
+    let listener = if speaker == leader {
+        open.owner
+    } else {
+        leader
+    };
+    Some((speaker, listener))
+}
+
 /// The creature a cutscene actor names: `OWNER` (the conversation's owner), `PLAYER`
 /// (its player character), `HENCH:<tag>` or a tag (a creature in the current area).
 fn actor_object(sim: &Sim, actor: &str, open: &OpenLine) -> Option<ObjectId> {
@@ -589,6 +613,7 @@ mod tests {
                 by_place,
             }],
             links: Vec::new(),
+            head_tracks: Vec::new(),
         }
     }
 

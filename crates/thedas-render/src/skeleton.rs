@@ -125,14 +125,25 @@ impl Skeleton {
     /// the others, 0x8149d0, 0x544620): each rotation key turns its bone's pose (key × pose,
     /// 0x8111e0 → 0x4cb640) and each translation key is added to its bone's translation
     /// (0x8110f0), on the bones the clip has tracks for. They are taken at full weight
-    /// (provisional: the executable scales each by its instance's weight, which is not
-    /// followed), and the translation sum rests on the key convention above (provisional).
+    /// here ([`Skeleton::pose_weighted`] gives each its own), and the translation sum rests
+    /// on the key convention above (provisional).
     pub fn pose_layers(&self, layers: &[(&Animation, f32, bool)]) -> Vec<Mat4> {
+        let weighted: Vec<_> = layers.iter().map(|&(a, t, b)| (a, t, b, 1.0)).collect();
+        self.pose_weighted(&weighted)
+    }
+
+    /// [`Skeleton::pose_layers`] with a weight for each layer, which scales an additive
+    /// layer's turn and shift (the head tracking's pose animations; see [`crate::look`]):
+    /// its rotation key is taken that far from no turn at all, its translation key times
+    /// the weight. Provisional: the executable scales each additive clip by its instance's
+    /// weight (+0xc of its blend entry), but how is not traced. Other layers ignore it.
+    pub fn pose_weighted(&self, layers: &[(&Animation, f32, bool, f32)]) -> Vec<Mat4> {
         let mut rot: Vec<Option<Quat>> = vec![None; self.bones.len()];
         let mut pos: Vec<Option<Vec3>> = vec![None; self.bones.len()];
         let mut reference: Vec<Option<Vec3>> = vec![None; self.bones.len()];
-        let (additive, posed): (Vec<_>, Vec<_>) = layers.iter().partition(|(a, _, _)| a.additive);
-        if let Some((base, _, _)) = posed.first() {
+        let (additive, posed): (Vec<_>, Vec<_>) =
+            layers.iter().partition(|(a, _, _, _)| a.additive);
+        if let Some((base, _, _, _)) = posed.first() {
             for track in &base.tracks {
                 if track.channel == Channel::Translation
                     && let (Some(i), Some(k)) = (self.node(&track.bone), track.keys.first())
@@ -142,12 +153,12 @@ impl Skeleton {
                 }
             }
         }
-        for (n, (anim, time, against_base)) in posed.iter().enumerate() {
+        for (n, (anim, time, against_base, _)) in posed.iter().enumerate() {
             let r = (n > 0 && *against_base).then_some(reference.as_slice());
             self.sample_into(anim, *time, r, &mut rot, &mut pos);
         }
-        for (anim, time, _) in additive {
-            self.add_into(anim, time, &mut rot, &mut pos);
+        for (anim, time, _, weight) in additive {
+            self.add_into(anim, time, weight, &mut rot, &mut pos);
         }
         self.globals(|i| {
             let b = &self.bones[i];
@@ -158,12 +169,13 @@ impl Skeleton {
         })
     }
 
-    /// Lays additive animation `anim` at `time` over the local pose in `rot` and `pos`
-    /// (bones not set there are at rest): see [`Skeleton::pose_layers`].
+    /// Lays additive animation `anim` at `time` and `weight` over the local pose in `rot`
+    /// and `pos` (bones not set there are at rest): see [`Skeleton::pose_weighted`].
     fn add_into(
         &self,
         anim: &Animation,
         time: f32,
+        weight: f32,
         rot: &mut [Option<Quat>],
         pos: &mut [Option<Vec3>],
     ) {
@@ -177,6 +189,11 @@ impl Skeleton {
                 Channel::Rotation => {
                     if let (Some(d), Some(slot)) = (sample_rotation(&track.keys, t), rot.get_mut(i))
                     {
+                        let d = if weight == 1.0 {
+                            d
+                        } else {
+                            Quat::IDENTITY.slerp(d, weight)
+                        };
                         *slot = Some((d * slot.unwrap_or(rest.rest_rotation)).normalize());
                     }
                 }
@@ -184,7 +201,7 @@ impl Skeleton {
                     if let (Some(d), Some(slot)) =
                         (sample_translation(&track.keys, t), pos.get_mut(i))
                     {
-                        *slot = Some(slot.unwrap_or(rest.rest_translation) + d);
+                        *slot = Some(slot.unwrap_or(rest.rest_translation) + d * weight);
                     }
                 }
             }

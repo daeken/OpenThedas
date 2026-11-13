@@ -336,6 +336,7 @@ mod tests {
             places: Vec::new(),
             camera_jumps: Vec::new(),
             links: Vec::new(),
+            head_tracks: Vec::new(),
         }
     }
 
