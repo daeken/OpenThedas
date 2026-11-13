@@ -235,8 +235,17 @@ pub(crate) struct D3dPass {
     /// opacity), or `None` when it must be written whole: a draw whose slot is current
     /// gets only its per-frame registers rewritten (the slot keeps the rest between frames).
     written: std::sync::Mutex<Vec<Option<(u32, u32, f32)>>>,
-    /// The scene's lights, for re-picking the lights of objects that move.
+    /// The scene's lights, then the lights added since ([`D3dPass::set_extra_lights`]), for
+    /// re-picking the lights of objects that move.
     scene_lights: Vec<SceneLight>,
+    /// How many of `scene_lights` are the scene's own.
+    own_lights: usize,
+    /// Per scene draw, what its lights were picked by when the pass was made: its bounding
+    /// sphere and room as placed, and whether it is one of the level's own draws.
+    placed: Vec<((Vec3, f32), Option<i64>, bool)>,
+    /// Per draw, its lights picked again with the added lights, where they differ from
+    /// those the pass was made with; a moved object's re-picked lights (`relit`) come first.
+    extra_lit: Vec<Option<DrawLights>>,
     /// The rooms' light reach ([`AreaScene::light_rooms`]) and boxes
     /// ([`AreaScene::room_boxes`]), for re-picking a moved object's room and lights.
     light_rooms: HashMap<i64, Vec<i64>>,
@@ -745,6 +754,31 @@ fn repick(
         }
     }
     changed
+}
+
+/// A draw's lights as a pass picks them when it is made, from `lights`: by its material's
+/// light class, its bounding sphere and room as placed, and whether it is one of the
+/// level's own draws (see [`pick_level_lights`]).
+fn pick_as_built(
+    lights: &[SceneLight],
+    light_rooms: &HashMap<i64, Vec<i64>>,
+    class: LightClass,
+    sphere: (Vec3, f32),
+    room: Option<i64>,
+    level_own: bool,
+) -> DrawLights {
+    match class {
+        LightClass::Level => pick_level_lights(
+            lights,
+            sphere,
+            if level_own {
+                DOMAIN_LEVEL
+            } else {
+                DOMAIN_CHARACTERS
+            },
+        ),
+        c => pick_lights(lights, light_rooms, sphere, room, c),
+    }
 }
 
 /// The smallest sphere holding two spheres.
@@ -1669,18 +1703,14 @@ impl D3dPass {
                 // placeables from the level's, among those whose room reaches the draw's.
                 // Level-class draws keep the old rule (`pick_level_lights`): the level's own
                 // meshes with the level's domain, an object's with the characters'.
-                lights: match classes[di] {
-                    LightClass::Level => pick_level_lights(
-                        &scene.lights,
-                        d.sphere,
-                        if di < scene.static_draws {
-                            DOMAIN_LEVEL
-                        } else {
-                            DOMAIN_CHARACTERS
-                        },
-                    ),
-                    c => pick_lights(&scene.lights, &scene.light_rooms, d.sphere, d.room_id, c),
-                },
+                lights: pick_as_built(
+                    &scene.lights,
+                    &scene.light_rooms,
+                    classes[di],
+                    d.sphere,
+                    d.room_id,
+                    di < scene.static_draws,
+                ),
                 multipass,
                 lod: d.lod,
                 sphere: {
@@ -2000,6 +2030,14 @@ impl D3dPass {
             particle_buffer,
             quad_indices,
             scene_lights: scene.lights.clone(),
+            own_lights: scene.lights.len(),
+            placed: scene
+                .draws
+                .iter()
+                .enumerate()
+                .map(|(di, d)| (d.sphere, d.room_id, di < scene.static_draws))
+                .collect(),
+            extra_lit: Vec::new(),
             light_rooms: scene.light_rooms.clone(),
             room_boxes: scene.room_boxes.clone(),
             classes,
@@ -2136,6 +2174,69 @@ impl D3dPass {
     pub fn set_world(&mut self, draw: usize, world: glam::Mat4) {
         if let Some(w) = self.worlds.get_mut(draw) {
             w.0 = world;
+        }
+    }
+
+    /// Adds `extra` to the scene's lights (replacing what was added before; none takes
+    /// them away again): a cutscene's own lights, which come, change and go while the pass
+    /// stands. A draw's lights are picked again as they were when the pass was made, from
+    /// the scene's lights and these; an object that has moved since has its lights
+    /// re-picked on the next frame ([`D3dPass::repick_lights`]). The draws whose lights
+    /// change have their fixed constants refilled.
+    ///
+    /// DAOrigins.exe's light manager holds a cutscene's light nodes with the level's and
+    /// selects every visible object's lights from them all, keeping a still object's
+    /// selection until the manager's version changes (0x464429), which a light coming or
+    /// changing does [inferred: the stamps at manager +0xd0 and +0xd4 are not traced].
+    pub fn set_extra_lights(&mut self, extra: &[SceneLight]) {
+        if self.scene_lights[self.own_lights..] == *extra {
+            return;
+        }
+        self.scene_lights.truncate(self.own_lights);
+        self.scene_lights.extend_from_slice(extra);
+        let relit = self.relit.get_mut().unwrap_or_else(|e| e.into_inner());
+        relit.resize(self.draws.len(), None);
+        self.extra_lit.resize(self.draws.len(), None);
+        let statics = self.statics.get_mut().unwrap_or_else(|e| e.into_inner());
+        for (k, d) in self.draws.iter().enumerate() {
+            if relit[k].is_some() {
+                continue;
+            }
+            let Some(&(sphere, room, level_own)) = self.placed.get(d.draw) else {
+                continue;
+            };
+            let class = self
+                .classes
+                .get(d.draw)
+                .copied()
+                .unwrap_or(LightClass::Character);
+            let lights = pick_as_built(
+                &self.scene_lights,
+                &self.light_rooms,
+                class,
+                sphere,
+                room,
+                level_own,
+            );
+            let now = (lights != d.lights).then_some(lights);
+            if self.extra_lit[k] != now {
+                self.extra_lit[k] = now;
+                if let Some(s) = statics.get_mut(k) {
+                    *s = None;
+                }
+            }
+        }
+        // The objects that have moved: where they stood is forgotten, so that the next
+        // frame picks their lights again.
+        let at = self.prop_at.get_mut().unwrap_or_else(|e| e.into_inner());
+        for (p, ks) in self.prop_draws.iter().enumerate() {
+            if ks
+                .iter()
+                .any(|&k| relit.get(k).is_some_and(Option::is_some))
+                && let Some(here) = at.get_mut(p).and_then(Option::as_mut)
+            {
+                *here = Vec3::splat(f32::MAX);
+            }
         }
     }
 
@@ -2428,7 +2529,10 @@ impl D3dPass {
                 lightmap: lightmap.as_ref(),
                 lights: match &rigged {
                     Some((_, l)) => l,
-                    None => relit[i].as_ref().unwrap_or(&d.lights),
+                    None => relit[i]
+                        .as_ref()
+                        .or(self.extra_lit.get(i).and_then(Option::as_ref))
+                        .unwrap_or(&d.lights),
                 },
                 ambient: match &rigged {
                     Some((r, _)) => r.ambient,
@@ -2655,7 +2759,12 @@ impl D3dPass {
                 },
                 position: &|k| self.worlds[self.draws[k].draw].0.w_axis.truncate(),
                 sphere: &|k| self.world_sphere(&self.draws[k]),
-                initial: &|k| &self.draws[k].lights,
+                initial: &|k| {
+                    self.extra_lit
+                        .get(k)
+                        .and_then(Option::as_ref)
+                        .unwrap_or(&self.draws[k].lights)
+                },
             },
             &mut at,
             relit,
@@ -3052,6 +3161,7 @@ mod tests {
             domain: Some(crate::scene::DOMAIN_CHARACTERS),
             is_static: true,
             version: 0,
+            intensity: 1.0,
             room: None,
         };
         let lights = vec![light(0.0, "a"), light(20.0, "b")];

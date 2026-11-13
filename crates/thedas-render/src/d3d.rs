@@ -558,11 +558,13 @@ pub fn pick_level_lights(lights: &[SceneLight], sphere: (Vec3, f32), domain: i64
                 color,
                 radius,
                 domain: lit,
+                intensity,
                 ..
             } => {
                 if lit.is_some_and(|m| m & domain == 0) {
                     return None;
                 }
+                let color = &(*color * *intensity);
                 let d = position.distance(sphere.0);
                 if d > radius + sphere.1 || *radius <= 0.0 {
                     return None;
@@ -610,6 +612,7 @@ fn pick_where(
             is_static,
             version,
             room,
+            intensity,
             ..
         } = l
         else {
@@ -618,14 +621,16 @@ fn pick_where(
         if !keep(*domain, *room) {
             continue;
         }
-        let w = influence(*position, *radius, *color, *version, sphere);
+        // The light's intensity weighs its influence (0x53d35f, 0x53d3b2) and scales the
+        // colour its registers get (0x46b47e).
+        let w = influence(*position, *radius, *color, *version, sphere) * intensity.abs();
         if w > 0.0 {
             let list = if *is_static {
                 &mut points
             } else {
                 &mut dynamic
             };
-            list.push((w, (*position, *radius, *color)));
+            list.push((w, (*position, *radius, *color * *intensity)));
         }
     }
     let best = |mut v: Vec<(f32, (Vec3, f32, Vec3))>, n: usize| {
@@ -1842,12 +1847,40 @@ mod tests {
             domain,
             is_static: true,
             version: 0,
+            intensity: 1.0,
             room,
         }
     }
 
     fn xs(l: &[(Vec3, f32, Vec3)]) -> Vec<f32> {
         l.iter().map(|p| p.0.x).collect()
+    }
+
+    #[test]
+    fn a_lights_intensity_weighs_its_pick_and_scales_its_colour() {
+        let lit = |x: f32, i: f32| {
+            let mut l = point(x, 5.0, None, None);
+            if let SceneLight::Point { intensity, .. } = &mut l {
+                *intensity = i;
+            }
+            l
+        };
+        // R - d: 5, 4.5, 4 and 3.5 at intensity 1.
+        let lights = vec![lit(1.0, 0.5), lit(1.5, 1.0), lit(2.0, 0.0), lit(2.5, 2.0)];
+        let picked = pick_lights(
+            &lights,
+            &HashMap::new(),
+            (Vec3::ZERO, 1.0),
+            None,
+            LightClass::Level,
+        );
+        // Weighed 2.5, 4.5, 0 and 7: the light turned off is not picked at all.
+        assert_eq!(xs(&picked.points), [2.5, 1.5, 1.0]);
+        let colours: Vec<f32> = picked.points.iter().map(|p| p.2.x).collect();
+        assert_eq!(colours, [2.0, 1.0, 0.5]);
+        // The level's own rule scales the colour too.
+        let level = pick_level_lights(&lights[..1], (Vec3::ZERO, 1.0), DOMAIN_LEVEL);
+        assert_eq!(level.points[0].2, Vec3::splat(0.5));
     }
 
     #[test]

@@ -120,6 +120,19 @@ pub struct Shown {
     pub actors: HashMap<ObjectId, ActorShow>,
     pub own: Vec<(ObjectModel, ActorShow)>,
     pub kept: HashMap<ObjectId, Vec<CutAnimation>>,
+    /// The cutscene's light actors.
+    pub lights: Vec<CutLight>,
+}
+
+/// A cutscene's light actor now: where its model (`base_light`, see
+/// [`thedas_sim::cuttracks::LIGHT_MODEL`]) is, and what its tracks have set on the model's
+/// lights.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CutLight {
+    pub position: [f32; 3],
+    /// x, y, z, w.
+    pub rotation: [f32; 4],
+    pub show: thedas_sim::cuttracks::LightShow,
 }
 
 #[derive(Default)]
@@ -184,6 +197,7 @@ impl CutsceneActors {
                 roots,
             };
             self.pose_bound(&tracks, &at, &mut out);
+            out.lights = lights(&tracks, &at);
             // Actors no object plays: the cutscene's own creatures.
             let name = c.name.clone();
             if self.own.as_ref().is_none_or(|(n, _)| *n != name) {
@@ -217,6 +231,7 @@ impl CutsceneActors {
                             roots,
                         };
                         self.pose_bound(&tracks, &at, &mut out);
+                        out.lights = lights(&tracks, &at);
                     }
                 }
                 None => self.switch(None, open),
@@ -294,11 +309,9 @@ struct Moment<'a> {
     roots: &'a DrawnRoots<'a>,
 }
 
-/// Actor `i` of `tracks` at moment `at`: where it is in the world (see
-/// [`Tracks::world_pose`]) and what it plays.
-fn show(tracks: &Tracks, i: usize, at: &Moment) -> Option<ActorShow> {
+/// Where actor `i` of `tracks` is in the world at moment `at` (see [`Tracks::world_pose`]).
+fn world_pose(tracks: &Tracks, i: usize, at: &Moment) -> Option<thedas_sim::cuttracks::Pose> {
     let a = tracks.actors.get(i)?;
-    let (t, length) = (at.t, tracks.seconds);
     let place = |name: &str| stage_place(at.stage, name);
     let root = |j: usize| (at.roots)(drawn_object(tracks, at.bound, j)?);
     let find = Finders {
@@ -306,9 +319,37 @@ fn show(tracks: &Tracks, i: usize, at: &Moment) -> Option<ActorShow> {
         root: &root,
         ..Finders::NONE
     };
-    let pose = tracks
-        .world_pose(i, t, at.placement, &find)
-        .unwrap_or_else(|| at.placement.pose(a.stage_pose_at(t, &place)));
+    Some(
+        tracks
+            .world_pose(i, at.t, at.placement, &find)
+            .unwrap_or_else(|| at.placement.pose(a.stage_pose_at(at.t, &place))),
+    )
+}
+
+/// The light actors of `tracks` at moment `at`.
+fn lights(tracks: &Tracks, at: &Moment) -> Vec<CutLight> {
+    tracks
+        .actors
+        .iter()
+        .enumerate()
+        .filter_map(|(i, a)| {
+            let show = a.light_at(at.t)?;
+            let pose = world_pose(tracks, i, at)?;
+            Some(CutLight {
+                position: pose.position,
+                rotation: pose.rotation,
+                show,
+            })
+        })
+        .collect()
+}
+
+/// Actor `i` of `tracks` at moment `at`: where it is in the world (see
+/// [`Tracks::world_pose`]) and what it plays.
+fn show(tracks: &Tracks, i: usize, at: &Moment) -> Option<ActorShow> {
+    let a = tracks.actors.get(i)?;
+    let (t, length) = (at.t, tracks.seconds);
+    let pose = world_pose(tracks, i, at)?;
     // The actor's base pose, a node of the cutscene's own tree, under its animation tracks
     // (see [`thedas_sim::cuttracks::Actor::pose_node`]): it loops for the whole cutscene.
     let base = a
