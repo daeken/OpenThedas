@@ -77,6 +77,9 @@ pub struct D3dProgram {
     pub ps: Translation,
     pub pass: PassState,
     pub state: MaterialState,
+    /// Translated with per-instance constants ([`Options::instanced`]): the SpeedTree
+    /// programs, whose many placements go as instanced draws.
+    pub instanced: bool,
 }
 
 impl std::fmt::Debug for D3dProgram {
@@ -154,6 +157,7 @@ fn build(vfs: &Vfs, vs_name: &str, ps_name: &str, state_name: &str) -> Result<D3
             alpha_test,
             // The game sets the trees' alpha reference per draw (their LOD fades).
             alpha_ref_uniform: spt,
+            instanced: spt,
             ..Default::default()
         },
     )
@@ -163,6 +167,7 @@ fn build(vfs: &Vfs, vs_name: &str, ps_name: &str, state_name: &str) -> Result<D3
         &vs,
         &Options {
             extra_outputs: extra,
+            instanced: spt,
             ..Default::default()
         },
     )
@@ -178,6 +183,7 @@ fn build(vfs: &Vfs, vs_name: &str, ps_name: &str, state_name: &str) -> Result<D3
         ps: ps_t,
         pass,
         state,
+        instanced: spt,
     })
 }
 

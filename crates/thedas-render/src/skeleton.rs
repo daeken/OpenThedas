@@ -333,6 +333,7 @@ mod tests {
             name: "t".into(),
             length: 1.0,
             additive: false,
+            scalars: Vec::new(),
             tracks: vec![Track {
                 bone: "shoulder".into(),
                 channel: Channel::Rotation,
@@ -377,6 +378,7 @@ mod tests {
             name: "t".into(),
             length: 1.0,
             additive,
+            scalars: Vec::new(),
             tracks: vec![Track {
                 bone: bone.into(),
                 channel: Channel::Rotation,
@@ -462,6 +464,7 @@ mod tests {
             name: "t".into(),
             length: 1.0,
             additive: true,
+            scalars: Vec::new(),
             tracks: vec![Track {
                 bone: "elbow".into(),
                 channel: Channel::Translation,
