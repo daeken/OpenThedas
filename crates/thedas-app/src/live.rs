@@ -316,7 +316,7 @@ fn build_level_with(
 ) -> Result<LiveLevel> {
     let started = std::time::Instant::now();
     let install = DaoInstall::open(&spec.install)?;
-    let mut vfs = install.global_vfs(TextureQuality::High)?;
+    let mut vfs = install.play_vfs(TextureQuality::High)?;
     install.mount_level(&mut vfs, layout)?;
     let scene = AreaScene::load_with_props_at(&vfs, layout, &[], spec.detail)?;
     let programs = crate::programs_cached(&vfs, &scene, &spec.shaders, cache)?;

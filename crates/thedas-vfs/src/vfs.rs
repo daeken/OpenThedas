@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::crypto::DaoKey;
 use crate::erf::Erf;
-use crate::{Error, Result, normalize_name};
+use crate::{Error, Result, name_hash, normalize_name};
 
 #[derive(Debug)]
 pub enum LayerSource {
@@ -93,8 +93,12 @@ pub struct Vfs {
     layers: Vec<Layer>,
     /// Loose files per directory layer: (name, path).
     dir_files: Vec<Vec<(String, PathBuf)>>,
-    /// Normalized name -> hits, lowest layer first.
-    index: HashMap<String, Vec<(usize, Slot)>>,
+    /// Name hash ([`name_hash`]) -> hits, lowest layer first. Keyed by hash rather than name
+    /// because Dragon Age II archives store most entries only as hashes; a lookup hashes the
+    /// name it is given.
+    index: HashMap<u64, Vec<(usize, Slot)>>,
+    /// Name hash -> normalized name, for every hit whose name is known.
+    names: HashMap<u64, String>,
     /// Layers that beat every layer of this stack; see the module documentation.
     overlay: Option<Box<Vfs>>,
 }
@@ -149,12 +153,15 @@ impl Vfs {
     pub fn push_erf(&mut self, erf: Arc<Erf>, key: Option<DaoKey>, label: impl Into<String>) {
         let layer = self.layers.len();
         for (i, e) in erf.entries.iter().enumerate() {
-            if let Some(name) = &e.name {
-                self.index
-                    .entry(normalize_name(name))
-                    .or_default()
-                    .push((layer, Slot::Entry(i)));
-            }
+            let key = match (&e.name, e.name_hash) {
+                (Some(name), _) => self.key(name),
+                (None, Some(hash)) => hash,
+                (None, None) => continue,
+            };
+            self.index
+                .entry(key)
+                .or_default()
+                .push((layer, Slot::Entry(i)));
         }
         self.layers.push(Layer {
             label: label.into(),
@@ -183,7 +190,8 @@ impl Vfs {
         for path in files {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             let i = named.len();
-            let hits = self.index.entry(normalize_name(&name)).or_default();
+            let key = self.key(&name);
+            let hits = self.index.entry(key).or_default();
             // Within one recursive directory, a later path shadows an earlier one.
             if let Some(last) = hits.last() {
                 if last.0 == layer {
@@ -210,7 +218,8 @@ impl Vfs {
                 continue;
             };
             let i = named.len();
-            let hits = self.index.entry(normalize_name(&name)).or_default();
+            let key = self.key(&name);
+            let hits = self.index.entry(key).or_default();
             if let Some(last) = hits.last() {
                 if last.0 == layer {
                     hits.pop();
@@ -286,7 +295,10 @@ impl Vfs {
                 continue;
             }
             let i = named.len();
-            let hits = self.index.entry(normalize_name(&name)).or_default();
+            let hits = {
+                let key = self.key(&name);
+                self.index.entry(key).or_default()
+            };
             if let Some(last) = hits.last() {
                 if last.0 == layer {
                     hits.pop();
@@ -306,6 +318,15 @@ impl Vfs {
         Ok(skipped)
     }
 
+    /// The index key for a name, remembering the name so [`Vfs::names`] can list it.
+    fn key(&mut self, name: &str) -> u64 {
+        let hash = name_hash(name);
+        self.names
+            .entry(hash)
+            .or_insert_with(|| normalize_name(name));
+        hash
+    }
+
     /// The current top of the stack, for a later [`Vfs::truncate`].
     pub fn mark(&self) -> usize {
         self.layers.len()
@@ -323,6 +344,8 @@ impl Vfs {
             hits.retain(|&(layer, _)| layer < mark);
             !hits.is_empty()
         });
+        let index = &self.index;
+        self.names.retain(|key, _| index.contains_key(key));
     }
 
     fn provenance(&self, layer: usize, slot: Slot) -> Provenance {
@@ -332,7 +355,7 @@ impl Vfs {
                 layer,
                 layer_label: l.label.clone(),
                 file: erf.path().to_path_buf(),
-                entry: erf.entries[i].name.clone(),
+                entry: Some(erf.entries[i].display_name()),
             },
             (LayerSource::Directory { .. } | LayerSource::Files, Slot::File(i)) => Provenance {
                 layer,
@@ -361,7 +384,7 @@ impl Vfs {
         if let Some(p) = self.overlay.as_ref().and_then(|o| o.lookup(name)) {
             return Some(self.lifted(p));
         }
-        let hits = self.index.get(&normalize_name(name))?;
+        let hits = self.index.get(&name_hash(name))?;
         let &(layer, slot) = hits.last()?;
         Some(self.provenance(layer, slot))
     }
@@ -373,7 +396,7 @@ impl Vfs {
             .as_ref()
             .map(|o| o.hits(name).into_iter().map(|p| self.lifted(p)).collect())
             .unwrap_or_default();
-        if let Some(h) = self.index.get(&normalize_name(name)) {
+        if let Some(h) = self.index.get(&name_hash(name)) {
             out.extend(h.iter().rev().map(|&(l, s)| self.provenance(l, s)));
         }
         out
@@ -415,7 +438,7 @@ impl Vfs {
                 Err(e) => return Err(e),
             }
         }
-        let Some(hits) = self.index.get(&normalize_name(name)) else {
+        let Some(hits) = self.index.get(&name_hash(name)) else {
             return Err(first_err.unwrap_or_else(|| Error::NotFound(name.to_string())));
         };
         for &(layer, slot) in hits.iter().rev() {
@@ -430,15 +453,16 @@ impl Vfs {
         Err(first_err.unwrap_or_else(|| Error::NotFound(name.to_string())))
     }
 
-    /// All visible names, sorted.
+    /// All visible names whose names are known, sorted. Entries a Dragon Age II archive
+    /// stores only by hash can be looked up by name but are not listed here.
     pub fn names(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.index.keys().cloned().collect();
+        let mut v: Vec<String> = self.names.values().cloned().collect();
         if let Some(o) = &self.overlay {
             v.extend(
-                o.index
-                    .keys()
-                    .filter(|k| !self.index.contains_key(*k))
-                    .cloned(),
+                o.names
+                    .iter()
+                    .filter(|(k, _)| !self.names.contains_key(*k))
+                    .map(|(_, n)| n.clone()),
             );
         }
         v.sort();
@@ -472,7 +496,8 @@ fn read_zip_entry(zip: &ZipSource, inner: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Whether a path has an archive extension (`.erf` or `.rim`).
+/// Whether a path has an archive extension: `.erf` or `.rim`, or Dragon Age II's `.crf`
+/// (per-conversation archives) and `.rimp` (patch archives), which are ERF V3.0 as well.
 pub fn is_archive_path(path: &Path) -> bool {
     is_archive(path)
 }
@@ -483,7 +508,7 @@ pub(crate) fn is_archive(path: &Path) -> bool {
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
             .as_deref(),
-        Some("erf" | "rim")
+        Some("erf" | "rim" | "crf" | "rimp")
     )
 }
 
@@ -616,5 +641,83 @@ mod tests {
         assert_eq!(data, b"core");
         assert_eq!(prov.layer_label, "core");
         assert!(matches!(vfs.read("only.dds"), Err(Error::Encrypted { .. })));
+    }
+
+    /// An ERF V3.0 archive (Dragon Age II layout): entries are `(stored name, name, data)`,
+    /// and an entry without a stored name is identified only by its hashes.
+    fn erf_v30(entries: &[(bool, &str, &[u8])]) -> Vec<u8> {
+        let mut strings = Vec::new();
+        let mut offsets = Vec::new();
+        for (stored, name, _) in entries {
+            if *stored {
+                offsets.push(strings.len() as i32);
+                strings.extend(name.as_bytes());
+                strings.push(0);
+            } else {
+                offsets.push(-1);
+            }
+        }
+        let mut out: Vec<u8> = "ERF V3.0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        out.extend((strings.len() as u32).to_le_bytes());
+        out.extend((entries.len() as u32).to_le_bytes());
+        out.extend(0u32.to_le_bytes()); // flags: no encryption, no compression
+        out.extend(0u32.to_le_bytes()); // module id
+        out.extend([0u8; 16]); // digest
+        out.extend(&strings);
+        let mut offset = out.len() + 28 * entries.len();
+        for ((_, name, data), name_offset) in entries.iter().zip(offsets) {
+            let ext = crate::extension(name);
+            out.extend(name_offset.to_le_bytes());
+            out.extend(name_hash(name).to_le_bytes());
+            out.extend(crate::type_hash(&ext).to_le_bytes());
+            out.extend((offset as u32).to_le_bytes());
+            out.extend((data.len() as u32).to_le_bytes());
+            out.extend((data.len() as u32).to_le_bytes());
+            offset += data.len();
+        }
+        for (_, _, data) in entries {
+            out.extend_from_slice(data);
+        }
+        out
+    }
+
+    #[test]
+    fn hash_only_entries_are_found_by_name() {
+        let base = std::env::temp_dir().join(format!("thedas-vfs-v30-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let low = base.join("core.rim");
+        let high = base.join("patch.rimp");
+        std::fs::write(
+            &low,
+            erf_v30(&[
+                (true, "Named_Table.gda", b"named"),
+                (false, "hidden_model.mmh", b"low"),
+            ]),
+        )
+        .unwrap();
+        std::fs::write(&high, erf_v30(&[(false, "HIDDEN_MODEL.mmh", b"patched")])).unwrap();
+        assert!(is_archive_path(&high));
+
+        let mut vfs = Vfs::new();
+        vfs.push_archive(&low, "core").unwrap();
+        assert_eq!(vfs.read("named_table.GDA").unwrap().0, b"named");
+        assert_eq!(vfs.read("Hidden_Model.mmh").unwrap().0, b"low");
+        let mark = vfs.mark();
+        vfs.push_archive(&high, "patch").unwrap();
+        let (data, prov) = vfs.read("hidden_model.mmh").unwrap();
+        assert_eq!(data, b"patched");
+        assert_eq!(prov.layer_label, "patch");
+        let entry = prov.entry.unwrap();
+        assert!(entry.starts_with('#') && entry.ends_with(".mmh"), "{entry}");
+        assert_eq!(vfs.hits("hidden_model.mmh").len(), 2);
+        // Only stored names are listed.
+        assert_eq!(vfs.names(), vec!["named_table.gda".to_string()]);
+
+        vfs.truncate(mark);
+        assert_eq!(vfs.read("hidden_model.mmh").unwrap().0, b"low");
+        assert_eq!(vfs.len(), 2);
     }
 }

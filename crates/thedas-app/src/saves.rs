@@ -30,7 +30,16 @@ pub struct SaveMeta {
     pub level: i32,
     #[serde(default)]
     pub class: i32,
+    /// The kind of save ([`KIND_SLOT`], [`KIND_QUICK`]).
+    #[serde(default)]
+    pub kind: i32,
 }
+
+/// The kinds of save, as DAOrigins.exe names their folders (0x642c70): a save the player
+/// made on the save screen (`Slot_`), and the quick save (`QuickSave_`). (1 is `AutoSave_`,
+/// 3 `PostCampaign_`.)
+pub const KIND_SLOT: i32 = 0;
+pub const KIND_QUICK: i32 = 2;
 
 /// The player's own folder for the game's saves and settings. On Windows it is
 /// `OpenThedas` in the player's Documents (the known folder, which may be redirected, e.g. to
@@ -92,6 +101,7 @@ impl SaveStore {
                         hero: meta.hero,
                         level: meta.level,
                         class: meta.class,
+                        kind: meta.kind,
                     },
                 ))
             })
@@ -103,6 +113,15 @@ impl SaveStore {
     /// The slot a new save goes in: one past the highest used.
     pub fn open_slot(&self) -> i32 {
         self.list().iter().map(|s| s.slot).max().unwrap_or(0) + 1
+    }
+
+    /// The quick save's slot, when there is one. Provisional: one quick save is kept and
+    /// written over; how many the original keeps is not traced.
+    pub fn quick_slot(&self) -> Option<i32> {
+        self.list()
+            .iter()
+            .find(|s| s.kind == KIND_QUICK)
+            .map(|s| s.slot)
     }
 
     /// Writes a save (the simulation's bytes) to `slot` with its description.
@@ -186,6 +205,15 @@ mod tests {
         assert_eq!(store.read(1).unwrap(), b"one");
         store.delete(2).unwrap();
         assert_eq!(store.latest(), Some(1));
+        // The quick save is found by its kind.
+        assert_eq!(store.quick_slot(), None);
+        let quick = SaveMeta {
+            kind: KIND_QUICK,
+            ..meta("quick", 300)
+        };
+        store.write(5, b"q", &quick).unwrap();
+        assert_eq!(store.quick_slot(), Some(5));
+        assert_eq!(store.list()[0].kind, KIND_QUICK);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(format_time(1_700_000_000), "2023-11-14 22:13");
     }

@@ -332,7 +332,7 @@ fn load(
     detail: thedas_render::scene::Detail,
 ) -> Result<Loaded> {
     let install = DaoInstall::open(install)?;
-    let mut vfs = install.global_vfs(TextureQuality::High)?;
+    let mut vfs = install.play_vfs(TextureQuality::High)?;
     if area == "none" {
         return Ok(Loaded {
             vfs: Arc::new(vfs),
@@ -1868,6 +1868,7 @@ impl App {
                 .world
                 .hero
                 .map_or(0, |h| sim.property_total(h, 27) as i32),
+            kind: saves::KIND_SLOT,
         };
         drop(sim);
         let store = saves::SaveStore::new(self.saves_dir.clone());
@@ -1941,6 +1942,18 @@ impl App {
         };
         let line = voice_line(&live.sim());
         line.is_some_and(|l| a.line_voice(&l).is_some())
+    }
+
+    /// The quick save (`save`) or quick load key, while playing with no menu up.
+    fn quick(&mut self, save: bool) -> bool {
+        let (Some(g), Some(live)) = (self.gfx.as_mut(), self.live.as_ref()) else {
+            return false;
+        };
+        if save {
+            g.ui.quick_save(&live.sim)
+        } else {
+            g.ui.quick_load(&live.sim)
+        }
     }
 
     /// The creature the mouse is over, for its name over its head: none while the
@@ -2043,12 +2056,16 @@ impl App {
             },
             // While playing, P opens the spells/talents screen instead.
             KeyCode::KeyP if self.screens.is_none() => println!("camera {}", self.camera.spec()),
-            // F5 the save screen, F9 the load screen. Provisional: the game's own bindings
-            // (quick save and quick load) are not traced.
-            KeyCode::F5 | KeyCode::F9 if self.screens.as_ref().is_some_and(|s| !s.front_end) => {
-                if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_mut()) {
-                    g.ui.open_saves(s, if code == KeyCode::F5 { 1 } else { 2 });
-                }
+            // F5 quick save, F9 quick load: the exe's `QuickSave` and `QuickLoad` actions
+            // (0x51e4d0, 0x51e6f6). Provisional: that they are bound to F5 and F9 is the
+            // original's default as played, not read from keymap.gda here.
+            KeyCode::F5 | KeyCode::F9
+                if self
+                    .screens
+                    .as_ref()
+                    .is_some_and(|s| !s.front_end && s.menu.is_none()) =>
+            {
+                self.quick(code == KeyCode::F5);
             }
             KeyCode::F1 | KeyCode::F2 | KeyCode::F3 | KeyCode::F4 if self.live.is_some() => {
                 let n = match code {
@@ -2284,8 +2301,20 @@ impl App {
                 log.push("party picker".into());
             }
             &Step::Saves(mode) => {
-                self.key_down(if mode == 1 { KeyCode::F5 } else { KeyCode::F9 });
+                if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_mut()) {
+                    if !s.front_end {
+                        g.ui.open_saves(s, mode);
+                    }
+                }
                 log.push(format!("saves {mode}"));
+            }
+            &Step::Quick(save) => {
+                let done = self.quick(save);
+                log.push(format!(
+                    "quick {}: {}",
+                    if save { "save" } else { "load" },
+                    if done { "done" } else { "not done" }
+                ));
             }
             Step::Type(t) => {
                 let typed = self.gfx.as_mut().is_some_and(|g| g.ui.type_text(t));
@@ -3746,8 +3775,11 @@ enum Step {
     /// The party picker opens as a script's `ShowPartyPickerGUI` opens it (for trying the
     /// picker headless).
     Picker,
-    /// F5 or F9: the save screen (1) or the load screen (2) opens.
+    /// `key f5` or `key f9`: the save screen (1) or the load screen (2) opens (the keys
+    /// themselves quick save and quick load, see `Quick`).
     Saves(i32),
+    /// `quicksave` or `quickload`: what the F5 and F9 keys do.
+    Quick(bool),
     /// Text typed into the focused text field (`type <text>`).
     Type(String),
     /// A key for the focused text field (`key backspace`, `enter`, `delete`, `left`, `right`,
@@ -4093,6 +4125,8 @@ fn parse_step(s: &str) -> Result<Step> {
         "key" if text_key(arg).is_some() => {
             Step::TextKey(text_key(arg).unwrap_or(thedas_ui::UiKey::Enter))
         }
+        "quicksave" => Step::Quick(true),
+        "quickload" => Step::Quick(false),
         "key" if arg.eq_ignore_ascii_case("f5") => Step::Saves(1),
         "key" if arg.eq_ignore_ascii_case("f9") => Step::Saves(2),
         "hover" => {
@@ -4538,6 +4572,20 @@ fn main() -> Result<()> {
                             layer.open_saves(s, mode);
                         }
                         println!("{} screen", if mode == 1 { "save" } else { "load" });
+                    }
+                    &Step::Quick(save) => {
+                        let done = played.as_mut().is_some_and(|(layer, _)| {
+                            if save {
+                                layer.quick_save(&l.sim)
+                            } else {
+                                layer.quick_load(&l.sim)
+                            }
+                        });
+                        println!(
+                            "quick {}: {}",
+                            if save { "save" } else { "load" },
+                            if done { "done" } else { "not done" }
+                        );
                     }
                     Step::Wipe => {
                         wipe(&mut l.sim());

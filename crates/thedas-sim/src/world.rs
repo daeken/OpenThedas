@@ -370,6 +370,23 @@ pub struct LocationVfx {
     pub effect: Effect,
 }
 
+/// An instant visual effect played on an object (an `EffectVisualEffect` applied with
+/// `EFFECT_DURATION_TYPE_INSTANT`): DAOrigins.exe applies such an effect and keeps nothing,
+/// so this is only a note for presentation that the effect was played, kept for
+/// [`INSTANT_VFX_MS`]. Not saved.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstantVfx {
+    pub target: ObjectId,
+    /// The effect's `VFX_base` row (its integer 0).
+    pub vfx: i32,
+    /// World time it was played.
+    pub started_ms: u64,
+}
+
+/// How long an [`InstantVfx`] note is kept for presentation to pick up. Not the effect's
+/// length (the VFX resource has its own); provisional.
+pub const INSTANT_VFX_MS: u64 = 2_000;
+
 /// The open party picker: the followers picked so far (at most three), in order.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PartyPicker {
@@ -651,6 +668,9 @@ pub struct World {
     /// Visual effects applied at places (see [`LocationVfx`]).
     #[serde(default)]
     pub location_vfx: Vec<LocationVfx>,
+    /// Instant visual effects played on objects lately (see [`InstantVfx`]).
+    #[serde(skip)]
+    pub instant_vfx: Vec<InstantVfx>,
     /// The next [`LocationVfx::handle`].
     #[serde(default)]
     pub next_vfx: u64,
@@ -802,6 +822,7 @@ impl World {
             container: None,
             store: None,
             location_vfx: Vec::new(),
+            instant_vfx: Vec::new(),
             next_vfx: 0,
             chanter_board: None,
             plot_actions: PlotActions::default(),
