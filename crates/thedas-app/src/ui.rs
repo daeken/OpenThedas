@@ -1338,59 +1338,11 @@ impl UiLayer {
                 };
                 // The list's new save (slot -1) goes in the open slot.
                 let slot = if slot > 0 { slot } else { store.open_slot() };
-                let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
-                // No saving during a training tutorial (script.ldf's SetTrainingMode).
-                if sim.training_paused() {
-                    log::warn!("ui: no saving during a training tutorial");
-                    return true;
-                }
-                // The module hears the save coming first (EVENT_TYPE_MODULE_PRESAVE).
-                sim.presave();
-                let area = sim
-                    .world
-                    .area
-                    .map(|a| sim.display_name(a))
-                    .unwrap_or_default();
                 let typed = args
                     .get(1)
                     .map(|n| n.trim().to_string())
                     .unwrap_or_default();
-                let meta = crate::saves::SaveMeta {
-                    name: if typed.is_empty() {
-                        area.clone()
-                    } else {
-                        typed
-                    },
-                    area,
-                    time_ms: sim.world.time_ms,
-                    written: crate::saves::now_secs(),
-                    hero: sim
-                        .world
-                        .hero
-                        .map(|h| sim.display_name(h))
-                        .unwrap_or_default(),
-                    level: sim
-                        .world
-                        .hero
-                        .map_or(0, |h| sim.property_total(h, 15) as i32),
-                    class: sim
-                        .world
-                        .hero
-                        .map_or(0, |h| sim.property_total(h, 27) as i32),
-                };
-                let saved = match sim.saving_blocked() {
-                    Some(why) => Err(why.to_string()),
-                    None => sim.save_json().map_err(|e| e.to_string()),
-                };
-                match saved {
-                    Ok(b) => match store.write(slot, &b, &meta) {
-                        Ok(()) => log::info!("ui: saved to slot {slot}"),
-                        Err(e) => log::warn!("ui: saving to slot {slot}: {e}"),
-                    },
-                    Err(e) => log::warn!("ui: the game could not be saved: {e}"),
-                }
-                drop(sim);
-                self.refresh_saves();
+                self.write_save(sim, slot, typed, crate::saves::KIND_SLOT);
                 screens.menu = None;
             }
             "SaveLoad.DeleteSaveGame" => {
@@ -1404,6 +1356,112 @@ impl UiLayer {
             _ => return false,
         }
         true
+    }
+
+    /// Saves the game to `slot` as the save screen does: named `name` (the area's name
+    /// when empty), of `kind` (`crate::saves::KIND_*`). Returns whether it was written.
+    fn write_save(&mut self, sim: &Arc<Mutex<Sim>>, slot: i32, name: String, kind: i32) -> bool {
+        let Some(store) = self.saves.as_ref() else {
+            return false;
+        };
+        let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+        // No saving during a training tutorial (script.ldf's SetTrainingMode).
+        if sim.training_paused() {
+            log::warn!("ui: no saving during a training tutorial");
+            return false;
+        }
+        // The module hears the save coming first (EVENT_TYPE_MODULE_PRESAVE).
+        sim.presave();
+        let area = sim
+            .world
+            .area
+            .map(|a| sim.display_name(a))
+            .unwrap_or_default();
+        let meta = crate::saves::SaveMeta {
+            name: if name.is_empty() { area.clone() } else { name },
+            area,
+            time_ms: sim.world.time_ms,
+            written: crate::saves::now_secs(),
+            hero: sim
+                .world
+                .hero
+                .map(|h| sim.display_name(h))
+                .unwrap_or_default(),
+            level: sim
+                .world
+                .hero
+                .map_or(0, |h| sim.property_total(h, 15) as i32),
+            class: sim
+                .world
+                .hero
+                .map_or(0, |h| sim.property_total(h, 27) as i32),
+            kind,
+        };
+        let saved = match sim.saving_blocked() {
+            Some(why) => Err(why.to_string()),
+            None => sim.save_json().map_err(|e| e.to_string()),
+        };
+        let written = match saved {
+            Ok(b) => match store.write(slot, &b, &meta) {
+                Ok(()) => {
+                    log::info!("ui: saved to slot {slot}");
+                    true
+                }
+                Err(e) => {
+                    log::warn!("ui: saving to slot {slot}: {e}");
+                    false
+                }
+            },
+            Err(e) => {
+                log::warn!("ui: the game could not be saved: {e}");
+                false
+            }
+        };
+        drop(sim);
+        self.refresh_saves();
+        written
+    }
+
+    /// The quick save key (`QuickSave`, F5): the game is saved to the quick save's slot,
+    /// over the one before. Provisional: the original's name for it in the list and any
+    /// notice it shows are not traced; it is named "Quicksave".
+    pub fn quick_save(&mut self, sim: &Arc<Mutex<Sim>>) -> bool {
+        let Some(store) = self.saves.as_ref() else {
+            return false;
+        };
+        let slot = store.quick_slot().unwrap_or_else(|| store.open_slot());
+        self.write_save(sim, slot, "Quicksave".into(), crate::saves::KIND_QUICK)
+    }
+
+    /// The quick load key (`QuickLoad`, F9): the quick save is loaded into the running
+    /// game, as the load screen loads a save. Returns whether there was one to load.
+    pub fn quick_load(&mut self, sim: &Arc<Mutex<Sim>>) -> bool {
+        let Some(store) = self.saves.as_ref() else {
+            return false;
+        };
+        let Some(slot) = store.quick_slot() else {
+            log::info!("ui: no quick save to load");
+            return false;
+        };
+        match store.read(slot) {
+            Ok(b) => {
+                let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+                match sim.load_json(&b) {
+                    Ok(()) => {
+                        log::info!("ui: loaded the quick save (slot {slot})");
+                        true
+                    }
+                    Err(e) => {
+                        log::warn!("ui: the quick save did not load: {e}");
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("ui: the quick save: {e}");
+                false
+            }
+        }
     }
 
     /// Plays the game's screens over a running game: the movies act on `sim` as they send
