@@ -174,7 +174,6 @@ Concrete defects found during the code read. Each is small and independent.
 | `RND-095` | Location effects with an instant duration are discarded and never drawn |
 | `RND-139` | Compressed textures lose their smallest mip levels |
 | `FMT-009` | The `Offers/` folder is not mounted for resources, though audio reads it |
-| `FMT-008` | Every enabled DLC's module folder is mounted for every campaign |
 
 Several stale comments and README sections were also found; they are listed in the area files
 (`SIM-004`, `SIM-029`, `SIM-147`, `UI-145`, `CAM-036`, `TOOL-001` to
