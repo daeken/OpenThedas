@@ -100,17 +100,15 @@ impl Cutscene {
     }
 
     pub fn from_gff4(g: &Gff4, name: &str) -> Option<Self> {
-        if g.file_type.0 != *b"CUT " {
-            return None;
-        }
+        let root = cut_root(g)?;
         let seconds = g
-            .field(g.root, FIELD_SECONDS)
+            .field(root, FIELD_SECONDS)
             .and_then(Value::as_f64)
             .map(|s| s as f32)
             .filter(|s| s.is_finite() && *s >= 0.0)?
             .min(MAX_SECONDS);
         let mut lines = Vec::new();
-        for actor in structs(g, g.root, FIELD_ACTORS) {
+        for actor in structs(g, root, FIELD_ACTORS) {
             let name = g
                 .field(actor, FIELD_ACTOR_NAME)
                 .and_then(Value::as_str)
@@ -196,11 +194,11 @@ pub struct DialogRef {
 
 /// A cutscene's lines that say a conversation's lines, by start time.
 pub fn dialog_refs(g: &Gff4) -> Vec<DialogRef> {
-    if g.file_type.0 != *b"CUT " {
+    let Some(root) = cut_root(g) else {
         return Vec::new();
-    }
+    };
     let mut out = Vec::new();
-    for actor in structs(g, g.root, FIELD_ACTORS) {
+    for actor in structs(g, root, FIELD_ACTORS) {
         let name = g
             .field(actor, FIELD_ACTOR_NAME)
             .and_then(Value::as_str)
@@ -269,18 +267,18 @@ pub fn movies(data: &[u8]) -> Vec<CutsceneMovie> {
 
 /// The movies a parsed cutscene plays, by start time.
 pub fn movies_of(g: &Gff4) -> Vec<CutsceneMovie> {
-    if g.file_type.0 != *b"CUT " {
+    let Some(root) = cut_root(g) else {
         return Vec::new();
-    }
+    };
     let seconds = g
-        .field(g.root, FIELD_SECONDS)
+        .field(root, FIELD_SECONDS)
         .and_then(Value::as_f64)
         .map(|s| s as f32)
         .filter(|s| s.is_finite() && *s >= 0.0)
         .unwrap_or(0.0)
         .min(MAX_SECONDS);
     let mut out = Vec::new();
-    for actor in structs(g, g.root, FIELD_ACTORS) {
+    for actor in structs(g, root, FIELD_ACTORS) {
         for track in structs(g, actor, FIELD_TRACKS) {
             if g.template_of(track).label.0 != *b"APBM" {
                 continue;
@@ -337,18 +335,18 @@ pub fn sounds(data: &[u8]) -> Vec<CutsceneSound> {
 
 /// The sounds a parsed cutscene plays, by start time.
 pub fn sounds_of(g: &Gff4) -> Vec<CutsceneSound> {
-    if g.file_type.0 != *b"CUT " {
+    let Some(root) = cut_root(g) else {
         return Vec::new();
-    }
+    };
     let seconds = g
-        .field(g.root, FIELD_SECONDS)
+        .field(root, FIELD_SECONDS)
         .and_then(Value::as_f64)
         .map(|s| s as f32)
         .filter(|s| s.is_finite() && *s >= 0.0)
         .unwrap_or(0.0)
         .min(MAX_SECONDS);
     let mut out = Vec::new();
-    for actor in structs(g, g.root, FIELD_ACTORS) {
+    for actor in structs(g, root, FIELD_ACTORS) {
         let actor_name = g
             .field(actor, FIELD_ACTOR_NAME)
             .and_then(Value::as_str)
@@ -388,6 +386,33 @@ pub fn sounds_of(g: &Gff4) -> Vec<CutsceneSound> {
 }
 
 /// The structs of a list field, whether a struct list or a generic one.
+/// A Dragon Age II line file's cutscene: the root `LINE` struct's field 31100.
+const FIELD_LINE_CUT: u32 = 31100;
+
+/// The cutscene struct (`CUT `) a file holds, if it is a cutscene: the root of a `.cut` file
+/// (GFF4 type `CUT `), or, in Dragon Age II, the struct a `LINE` file wraps. DA2 stores both
+/// its cutscenes (`.cut`) and every conversation line (`.cl`) as a `LINE` file: a root that
+/// holds the same `CUT ` struct in field 31100, beside 31101 (a number), 31102 (the line's
+/// talk-table string, -1 for a cutscene) and 31103. Provisional for DA2: read from the
+/// shipped files, not traced in the executable.
+pub fn cut_root(g: &Gff4) -> Option<StructId> {
+    match &g.file_type.0 {
+        b"CUT " => Some(g.root),
+        b"LINE" => {
+            let cut = match g.field(g.root, FIELD_LINE_CUT)? {
+                Value::Struct(Some(id)) => *id,
+                Value::Generic(slot) => match slot.value.as_ref()? {
+                    Value::Struct(Some(id)) => *id,
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            (g.template_of(cut).label.0 == *b"CUT ").then_some(cut)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn structs(g: &Gff4, id: StructId, label: u32) -> Vec<StructId> {
     match g.field(id, label) {
         Some(Value::List(Some(List::Struct(v)))) => v.iter().flatten().copied().collect(),
@@ -579,5 +604,49 @@ mod tests {
         );
         assert!(sounds_of(&cut(b"CONV", 10.0)).is_empty());
         assert!(sounds(b"junk").is_empty());
+    }
+
+    /// The same cutscene as [`cut`], wrapped as Dragon Age II wraps one: a `LINE` file whose
+    /// root holds the `CUT ` struct in field 31100.
+    fn line_file(seconds: f32) -> Gff4 {
+        let mut g = cut(b"LINE", seconds);
+        g.templates.push(template(b"LINE", &[FIELD_LINE_CUT]));
+        g.structs.push(StructData {
+            template: (g.templates.len() - 1) as u32,
+            values: vec![Value::Struct(Some(StructId(0)))],
+        });
+        g.root = StructId(g.structs.len() - 1);
+        g
+    }
+
+    #[test]
+    fn a_dragon_age_2_line_file_reads_as_the_cutscene_it_wraps() {
+        let plain = cut(b"CUT ", 10.0);
+        let wrapped = line_file(10.0);
+        assert_eq!(cut_root(&plain), Some(StructId(0)));
+        assert_eq!(cut_root(&wrapped), Some(StructId(0)));
+        assert_eq!(
+            Cutscene::from_gff4(&wrapped, "x"),
+            Cutscene::from_gff4(&plain, "x")
+        );
+        assert!(Cutscene::from_gff4(&wrapped, "x").is_some());
+        assert_eq!(movies_of(&wrapped), movies_of(&plain));
+        assert_eq!(sounds_of(&wrapped), sounds_of(&plain));
+        assert_eq!(dialog_refs(&wrapped), dialog_refs(&plain));
+        assert!(!movies_of(&wrapped).is_empty());
+
+        // A LINE file without a cutscene struct in 31100 is not a cutscene.
+        let mut empty = line_file(10.0);
+        let root = empty.root.0;
+        empty.structs[root].values = vec![Value::Struct(None)];
+        assert_eq!(cut_root(&empty), None);
+        assert!(Cutscene::from_gff4(&empty, "x").is_none());
+        assert!(movies_of(&empty).is_empty());
+        // Nor is a LINE file whose 31100 points at some other struct.
+        let mut other = line_file(10.0);
+        other.structs[root].values = vec![Value::Struct(Some(StructId(1)))];
+        assert_eq!(cut_root(&other), None);
+        // Any other file type is not a cutscene, as before.
+        assert_eq!(cut_root(&cut(b"DLG ", 10.0)), None);
     }
 }
