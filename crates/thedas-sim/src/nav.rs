@@ -239,6 +239,25 @@ const COL_STATE_CONTROLLER: u32 = 0x9a32_0a51;
 /// the pathing grid leaves in walls where doors stand are about 2.5 m wide.
 pub const DOORWAY_RADIUS: f32 = 1.25;
 
+/// Reads a layout's collision from the install at `root` (its level archives, else the
+/// `global` resources): what [`Sim::collision`] loads, for presentation to read a copy of
+/// its own (on a thread) when the simulation has not loaded it.
+pub fn read_layout_collision(
+    root: &std::path::Path,
+    global: &thedas_vfs::Vfs,
+    layout: &str,
+) -> Option<crate::collision::Collision> {
+    let install = thedas_vfs::DaoInstall::open(root).ok()?;
+    let mut level = thedas_vfs::Vfs::new();
+    install.mount_level(&mut level, layout).ok()?;
+    let (data, _) = level
+        .read(&format!("{layout}.arl"))
+        .or_else(|_| global.read(&format!("{layout}.arl")))
+        .ok()?;
+    let arl = thedas_formats::Arl::parse(&data).ok()?;
+    Some(crate::collision::load_layout(&level, global, &arl))
+}
+
 /// An area's closed doors for sight lines (see [`Sim::door_sight`]).
 #[derive(Clone, Default)]
 pub struct DoorSight {
@@ -532,6 +551,78 @@ impl Sim {
         self.nav_grids.get(name)?.clone()
     }
 
+    /// An area's layout collision if the simulation has already loaded it (read-only: for
+    /// presentation, which must not load it through [`Sim::collision`]).
+    pub fn loaded_collision(
+        &self,
+        area: thedas_script::vm::ObjectId,
+    ) -> Option<Arc<crate::collision::Collision>> {
+        let name = self.area_layouts.get(&area)?;
+        self.collisions.get(name)?.clone()
+    }
+
+    /// The area's placeables that muffle sound behind them, for a collision of their own
+    /// ([`crate::collision::load_placeables`]): each one's model, position, facing and how
+    /// much it occludes. DAOrigins.exe's sound occlusion gives a placeable its type's
+    /// `placeable_types.gda` column 0x913e3094 (read at 0x752923 into the object's +0x674,
+    /// used at 0xa2c913): doors 0.4 to 0.7, a bricked doorway 0.8, tents 0.1; most types
+    /// have 0 and are left out. Read-only.
+    ///
+    /// Provisional: doors count only while closed (as for sight, see [`Sim::door_sight`]);
+    /// whether the exe drops an open door's shapes is not traced.
+    pub fn sound_occluders(
+        &self,
+        area: thedas_script::vm::ObjectId,
+    ) -> Vec<(String, [f32; 3], f32, f32)> {
+        const COL_OCCLUSION: u32 = 0x913e_3094;
+        let tables = self.world.tables();
+        let Some(types) = tables.get(0, "placeable_types") else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for o in self.world.objects.values() {
+            if o.kind != crate::world::ObjectKind::Placeable || o.area != Some(area) || !o.active {
+                continue;
+            }
+            let row = o.appearance as i64;
+            let value = match types.cell_by_hash(COL_OCCLUSION, row) {
+                Some(thedas_formats::gda::Cell::Float(f)) => *f as f32,
+                Some(thedas_formats::gda::Cell::Int(i)) => *i as f32,
+                _ => 0.0,
+            };
+            if value <= 0.0 {
+                continue;
+            }
+            let door = matches!(
+                types.cell_by_hash(COL_STATE_CONTROLLER, row),
+                Some(thedas_formats::gda::Cell::String(s))
+                    if crate::engine::clean(s).eq_ignore_ascii_case("StateCnt_Door")
+            );
+            if door {
+                let state = o
+                    .fields
+                    .get("State")
+                    .or_else(|| o.fields.get("AnimContState"))
+                    .copied()
+                    .unwrap_or(0);
+                if state != 0 && state != 1 {
+                    continue;
+                }
+            }
+            let Some(thedas_formats::gda::Cell::String(m)) = types.cell("ModelName", row) else {
+                continue;
+            };
+            let m = crate::engine::clean(m);
+            if m.is_empty() {
+                continue;
+            }
+            out.push((m.to_string(), o.position, o.facing, value));
+        }
+        // A fixed order, whatever the object map's.
+        out.sort_by(|a, b| (a.1.map(f32::to_bits), &a.0).cmp(&(b.1.map(f32::to_bits), &b.0)));
+        out
+    }
+
     /// The layout (environment level) an area is built on, from its `.are`.
     pub fn area_layout(&mut self, area: thedas_script::vm::ObjectId) -> Option<String> {
         let name = match self.area_layouts.get(&area) {
@@ -625,16 +716,7 @@ impl Sim {
     }
 
     fn load_collision(&self, layout: &str) -> Option<crate::collision::Collision> {
-        let root = self.install_root.as_ref()?;
-        let install = thedas_vfs::DaoInstall::open(root).ok()?;
-        let mut level = thedas_vfs::Vfs::new();
-        install.mount_level(&mut level, layout).ok()?;
-        let (data, _) = level
-            .read(&format!("{layout}.arl"))
-            .or_else(|_| self.vfs.read(&format!("{layout}.arl")))
-            .ok()?;
-        let arl = thedas_formats::Arl::parse(&data).ok()?;
-        Some(crate::collision::load_layout(&level, &self.vfs, &arl))
+        read_layout_collision(self.install_root.as_ref()?, &self.vfs, layout)
     }
 
     fn load_nav_grid(&self, layout: &str) -> Option<NavGrid> {
