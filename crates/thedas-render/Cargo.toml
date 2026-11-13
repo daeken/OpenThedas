@@ -18,3 +18,8 @@ bytemuck.workspace = true
 glam.workspace = true
 log.workspace = true
 pollster.workspace = true
+
+[dev-dependencies]
+# The OpenGL backend's shader translation, to check the hand-written shaders against it
+# (see `gl_check`).
+naga = { workspace = true, features = ["glsl-out"] }
