@@ -165,13 +165,16 @@ pub fn events_with_text_from_gff(doc: &Gff4) -> TypedResult<Vec<AnimEventText>> 
 }
 
 /// The labels of an animation (`.ani`): the root holds 4005 the tracks, 4006 the name and
-/// 4009 the length in seconds. A track holds 4000 its target (`<bone>_rotation`,
+/// 4009 the length in seconds; 4011 marks it additive (see [`Animation::additive`]). The
+/// loader (DAOrigins.exe 0x815fb0) also keeps 4012 (+0x2c) and 4040 (+0x2f) as flags and
+/// 4013 (+0x28) as a number; those are not interpreted here. A track holds 4000 its target (`<bone>_rotation`,
 /// `<bone>_translation`), 4001 its kind and 4004 a struct whose 4004 lists the keys; a key
 /// holds 4035 its time (0 to 65535 across the length) and 4036 (to 4038) its value.
 mod ani {
     pub const TRACKS: u32 = 4005;
     pub const NAME: u32 = 4006;
     pub const LENGTH: u32 = 4009;
+    pub const ADDITIVE: u32 = 4011;
     pub const TARGET: u32 = 4000;
     pub const KIND: u32 = 4001;
     pub const KEYS: u32 = 4004;
@@ -282,6 +285,14 @@ pub struct Animation {
     pub name: String,
     /// Seconds.
     pub length: f32,
+    /// Field 4011: the keys are offsets to lay over the pose beneath, not a pose. The
+    /// loader (DAOrigins.exe 0x815fb0) keeps it at +0x2d; the blend setup (0x8149d0) puts
+    /// such clips on a list of their own (the animation component's +0x228), which the
+    /// per-channel blends apply after the others: a rotation key turns the pose beneath
+    /// (key × pose, 0x544620 → 0x8111e0 → 0x4cb640), a translation key is added to it
+    /// (0x544090 → 0x8110f0). Their first keys are the identity (`mh.po_2arm_06.ani`,
+    /// `mh_o.eyejitter.ani`).
+    pub additive: bool,
     pub tracks: Vec<Track>,
 }
 
@@ -380,6 +391,7 @@ impl Animation {
         Ok(Self {
             name: d.opt_str(root, ani::NAME)?.unwrap_or_default(),
             length,
+            additive: d.opt_i64(root, ani::ADDITIVE)?.is_some_and(|v| v != 0),
             tracks,
         })
     }
@@ -607,6 +619,23 @@ mod tests {
         assert!(close(a.tracks[0].keys[0].value, [0.0, 0.0, 0.0, 1.0], 1e-6));
         assert_eq!(a.tracks[1].keys[0].value, [1.0, 2.0, 3.0, 0.0]);
         assert!((a.tracks[1].keys[0].time - 1.0).abs() < 1e-3);
+        assert!(!a.additive, "no 4011: a pose");
+    }
+
+    #[test]
+    fn field_4011_marks_an_additive_animation() {
+        let anim = |flag: Option<u8>| {
+            let mut b = Builder::new(b"ANI ");
+            let mut fields = vec![(4005, structs(&[])), (4009, Value::F32(1.0))];
+            if let Some(f) = flag {
+                fields.push((4011, Value::U8(f)));
+            }
+            let root = b.add(b"anim", fields);
+            Animation::from_gff(&b.finish(root)).unwrap()
+        };
+        assert!(anim(Some(1)).additive);
+        assert!(!anim(Some(0)).additive);
+        assert!(!anim(None).additive);
     }
 
     #[test]
