@@ -217,13 +217,7 @@ impl Recorder {
 
     /// Starts a report made now: everything but the screenshot and the note, which come
     /// later (`screenshot`, `note`). Writes what it has at once.
-    pub fn start(
-        &mut self,
-        now_save: Option<Vec<u8>>,
-        trace: Option<J>,
-        mut info: J,
-        paused_it: bool,
-    ) -> PathBuf {
+    pub fn start(&mut self, now_save: Option<Vec<u8>>, trace: Option<J>, mut info: J) -> PathBuf {
         let now = Instant::now();
         let written = crate::saves::now_secs();
         let area = info["game"]["area"].as_str().unwrap_or("none").to_string();
@@ -287,7 +281,6 @@ impl Recorder {
             dir: path.clone(),
             shot: None,
             note: None,
-            paused_it,
         });
         path
     }
@@ -313,9 +306,9 @@ impl Recorder {
         }
     }
 
-    /// Finishes the report once its screenshot and note are in. Returns its folder (or
-    /// `None`, cancelled) and whether the game was paused for it, once done.
-    pub fn finish(&mut self) -> Option<(Option<PathBuf>, bool)> {
+    /// Finishes the report once its screenshot and note are in. Returns its folder (`None`
+    /// when cancelled) once done.
+    pub fn finish(&mut self) -> Option<Option<PathBuf>> {
         let p = self.pending.as_ref()?;
         if p.shot.is_none() || p.note.is_none() {
             return None;
@@ -325,14 +318,14 @@ impl Recorder {
             None => {
                 let _ = std::fs::remove_dir_all(&p.dir);
                 log::info!("report: cancelled");
-                Some((None, p.paused_it))
+                Some(None)
             }
             Some(text) => {
                 if let Err(e) = std::fs::write(p.dir.join("note.txt"), text.as_bytes()) {
                     log::warn!("report: writing the note: {e}");
                 }
                 log::info!("report: written to {}", p.dir.display());
-                Some((Some(p.dir), p.paused_it))
+                Some(Some(p.dir))
             }
         }
     }
@@ -344,8 +337,6 @@ struct Pending {
     shot: Option<bool>,
     /// The note came: `Some(None)` cancelled.
     note: Option<Option<String>>,
-    /// The report paused the game (it carries on when the report is done).
-    paused_it: bool,
 }
 
 /// A report's files, but the screenshot and the note.
@@ -427,12 +418,12 @@ fn sanitize(s: &str) -> String {
     if out.is_empty() { "none".into() } else { out }
 }
 
-/// The build: version, the commit it was built from and whether that tree had changes.
+/// The build: its version and the commit it was built from (changes not committed then
+/// are not told).
 pub fn build_info() -> J {
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "commit": option_env!("THEDAS_GIT_COMMIT"),
-        "dirty": option_env!("THEDAS_GIT_DIRTY").map(|d| d == "1"),
         "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
@@ -558,7 +549,7 @@ mod tests {
         keep_line("a line for the report".into());
         let info = json!({ "game": { "area": "lot100ar/Lothering" } });
         let trace = json!([{ "kind": "log", "t": 5, "channel": 0, "text": "hello" }]);
-        let path = r.start(Some(b"{\"now\":1}".to_vec()), Some(trace), info, true);
+        let path = r.start(Some(b"{\"now\":1}".to_vec()), Some(trace), info);
         assert!(r.busy());
         assert!(
             path.file_name()
@@ -592,9 +583,8 @@ mod tests {
         r.note(Some("the door would not open".into()));
         assert!(r.finish().is_none());
         r.screenshot(Ok(b"png".to_vec()));
-        let (done, paused) = r.finish().unwrap();
+        let done = r.finish().unwrap();
         assert_eq!(done.as_deref(), Some(path.as_path()));
-        assert!(paused);
         assert!(!r.busy());
         assert_eq!(
             std::fs::read_to_string(path.join("note.txt")).unwrap(),
@@ -602,11 +592,11 @@ mod tests {
         );
         // A second report the same minute gets a folder of its own; cancelling deletes it.
         let info = json!({ "game": { "area": "lot100ar/Lothering" } });
-        let second = r.start(None, None, info, false);
+        let second = r.start(None, None, info);
         assert_ne!(second, path);
         r.screenshot(Err(anyhow::anyhow!("no frame")));
         r.note(None);
-        assert_eq!(r.finish(), Some((None, false)));
+        assert_eq!(r.finish(), Some(None));
         assert!(!second.exists());
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);

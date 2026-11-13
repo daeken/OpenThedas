@@ -612,8 +612,12 @@ struct App {
 /// What a report under way waits for.
 struct ReportWait {
     shot: Option<std::sync::mpsc::Receiver<J>>,
-    note: std::sync::mpsc::Receiver<Option<String>>,
+    note: Option<std::sync::mpsc::Receiver<Option<String>>>,
     reply: Option<std::sync::mpsc::Sender<J>>,
+    /// The game is to pause once the screenshot is in (so the frame shows no "Paused"),
+    /// and whether the report paused it (it carries on when the report is done).
+    pause: bool,
+    paused_it: bool,
 }
 
 /// What the window's surface gave a redraw.
@@ -1371,7 +1375,7 @@ impl App {
         }
         let mut now_save = None;
         let mut trace = None;
-        let mut paused_it = false;
+        let mut pause = false;
         if let Some(live) = self.live.as_mut() {
             if !live.front_end {
                 let sim = live.sim();
@@ -1385,13 +1389,10 @@ impl App {
                 }
                 trace = serde_json::to_value(&sim.world.trace.recent).ok();
                 drop(sim);
-                if !live.paused {
-                    live.paused = true;
-                    paused_it = true;
-                }
+                pause = !live.paused;
             }
         }
-        let dir = self.recorder.start(now_save, trace, info, paused_it);
+        let dir = self.recorder.start(now_save, trace, info);
         log::info!("report: started in {}", dir.display());
         // The frame as presented, read back as the next one is drawn; drawn again
         // offscreen where the surface cannot be read back.
@@ -1412,8 +1413,10 @@ impl App {
         };
         self.report_wait = Some(ReportWait {
             shot,
-            note: report::ask_note(note),
+            note: Some(report::ask_note(note)),
             reply,
+            pause,
+            paused_it: false,
         });
     }
 
@@ -1454,16 +1457,35 @@ impl App {
                 }
             }
         }
-        match w.note.try_recv() {
-            Ok(note) => self.recorder.note(note),
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.recorder.note(None),
+        // The frame is in: the game holds still while the player writes.
+        if w.pause && w.shot.is_none() {
+            w.pause = false;
+            if let Some(live) = self.live.as_mut().filter(|l| !l.paused) {
+                live.paused = true;
+                w.paused_it = true;
+            }
         }
-        let Some((dir, paused_it)) = self.recorder.finish() else {
+        if let Some(rx) = &w.note {
+            match rx.try_recv() {
+                Ok(note) => {
+                    w.note = None;
+                    self.recorder.note(note);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    w.note = None;
+                    self.recorder.note(None);
+                }
+            }
+        }
+        let Some(dir) = self.recorder.finish() else {
             return;
         };
-        let reply = self.report_wait.take().and_then(|w| w.reply);
-        if paused_it {
+        let Some(w) = self.report_wait.take() else {
+            return;
+        };
+        let reply = w.reply;
+        if w.paused_it {
             if let Some(live) = self.live.as_mut() {
                 live.paused = false;
             }

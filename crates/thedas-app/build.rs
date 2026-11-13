@@ -1,5 +1,5 @@
-//! Records the commit the app is built from (and whether the tree had changes), for issue
-//! reports (`report::build_info`). Without git, neither is set.
+//! Records the commit the app is built from, for issue reports (`report::build_info`).
+//! Without git it is not set.
 
 use std::process::Command;
 
@@ -13,10 +13,6 @@ fn git(args: &[&str]) -> Option<String> {
 fn main() {
     if let Some(commit) = git(&["rev-parse", "HEAD"]) {
         println!("cargo:rustc-env=THEDAS_GIT_COMMIT={commit}");
-    }
-    if let Some(status) = git(&["status", "--porcelain", "--untracked-files=no"]) {
-        let dirty = if status.is_empty() { "0" } else { "1" };
-        println!("cargo:rustc-env=THEDAS_GIT_DIRTY={dirty}");
     }
     // Built again when HEAD moves (a commit, a checkout, a merge); in a worktree the
     // reflog is the worktree's own.
