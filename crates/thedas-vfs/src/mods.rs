@@ -7,12 +7,14 @@
 //!
 //! The order, lowest first:
 //!
-//! 1. The original's user override folder, `Documents/BioWare/Dragon Age/packages/core/override`,
+//! 1. The install's own `packages/core/override`, which [`crate::DaoInstall::global_vfs`] puts
+//!    there.
+//! 2. The original's user override folder, `Documents/BioWare/Dragon Age/packages/core/override`,
 //!    when it exists. The original registers it at priority 0, above everything else it loads
 //!    (traced in the executable: the folder registrations around 0x40e33f and 0x40e385 give the
 //!    install's `packages/core/override` priority 1 and the user's priority 0, lowest number
 //!    winning).
-//! 2. The entries of the load-order list, top to bottom: a later line beats an earlier one.
+//! 3. The entries of the load-order list, top to bottom: a later line beats an earlier one.
 //!    The list is our own addition; the original has no ordering between mods beyond file names.
 //!
 //! The list is a text file, `mods.txt` in the player's data folder ([`user_data_dir`]), one mod
@@ -41,7 +43,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::vfs::{Vfs, collect_files, is_archive};
-use crate::{Result, join_ci};
+use crate::{Result, join_ci, resolve_ci};
 
 /// Names the list file in the player's data folder.
 pub const LIST_FILE: &str = "mods.txt";
@@ -98,16 +100,20 @@ fn home_dir() -> Option<PathBuf> {
         .or_else(dirs::home_dir)
 }
 
-/// The original's user override folder, if this player has one. Looked for under the Documents
-/// folder and, off Windows, under `HOME/Documents` (so a scratch `HOME` hides the real one).
-pub fn original_user_override() -> Option<PathBuf> {
+/// The original's folder in this player's documents (`BioWare/Dragon Age`, or
+/// `BioWare/Dragon Age 2`), if there is one. Looked for under the Documents folder and, off
+/// Windows, under `HOME/Documents` (so a scratch `HOME` hides the real one).
+pub fn original_user_dir(game: crate::install::Game) -> Option<PathBuf> {
     let docs = if cfg!(windows) {
         dirs::document_dir()
     } else {
         home_dir().map(|h| h.join("Documents"))
     }?;
-    let dir = join_ci(&docs, "BioWare/Dragon Age/packages/core/override");
-    dir.is_dir().then_some(dir)
+    let name = match game {
+        crate::install::Game::Origins => "BioWare/Dragon Age",
+        crate::install::Game::DragonAge2 => "BioWare/Dragon Age 2",
+    };
+    resolve_ci(&docs, name).filter(|d| d.is_dir())
 }
 
 impl ModList {
@@ -260,14 +266,19 @@ pub fn default_list_file() -> Option<PathBuf> {
     }
 }
 
-/// Builds the overlay for this player (the original's user override folder, then the list)
-/// and sets it on `vfs`. With no override folder and no list this does nothing at all.
-pub fn mount_default(vfs: &mut Vfs) -> Vec<Mounted> {
+/// Adds this player's mod layers to the stack's overlay, above whatever it already holds (the
+/// install's own override folder): the `packages/core/override` folder of `user` (the
+/// original's folder in the player's documents), then the load-order list. With neither, this
+/// does nothing at all.
+pub fn mount_default(vfs: &mut Vfs, user: Option<&Path>) -> Vec<Mounted> {
     let Some(list_file) = default_list_file() else {
         return Vec::new();
     };
-    let mut overlay = Vfs::new();
-    if let Some(dir) = original_user_override() {
+    let mut overlay = vfs.take_overlay().unwrap_or_default();
+    let user_override = user
+        .map(|u| join_ci(u, "packages/core/override"))
+        .filter(|d| d.is_dir());
+    if let Some(dir) = user_override {
         let entry = ModEntry {
             path: dir,
             inner: None,

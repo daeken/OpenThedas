@@ -1,9 +1,12 @@
 //! Discovery of a Dragon Age: Origins install and its default resource stack.
 //!
-//! The layer order below is provisional. It follows the order xoreos uses (core package, then
-//! the single-player campaign, each with data, abilities, textures, patches and override), plus
-//! DLC packages ordered by the `Priority` attribute in their manifests. It has not yet been
-//! checked against what the original executable does; that check belongs to the parity work.
+//! The order of the packages follows the priorities the original executable registers its
+//! folders with (lowest number wins there; traced, see `docs/gaps/formats.md` FMT-006):
+//! `packages/core/override` in the player's documents folder (0) and in the install (1), add-ins
+//! (9000 and below), the player's own copies of the campaign and core folders (20000 to
+//! 20007), the campaign (50000s), core (100000s). The order inside one package (loose files,
+//! archives, patch, override) is still xoreos's and provisional, as is the order between
+//! add-ins (by the `Priority` attribute in their manifests).
 
 use std::path::{Path, PathBuf};
 
@@ -139,82 +142,85 @@ impl DaoInstall {
 
     /// DLC packages, ordered by manifest priority (lowest first), then UID.
     pub fn addins(&self) -> Result<Vec<AddIn>> {
-        let dir = join_ci(&self.root, "Addins");
-        let mut out = Vec::new();
-        if !dir.is_dir() {
-            return Ok(out);
-        }
-        let rd = std::fs::read_dir(&dir).map_err(|e| Error::Io {
-            path: dir.clone(),
-            source: e,
-        })?;
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let manifest = resolve_ci(&path, "manifest.xml").filter(|p| p.is_file());
-            let Some(manifest) = manifest else { continue };
-            let text = std::fs::read(&manifest).map_err(|e| Error::Io {
-                path: manifest.clone(),
-                source: e,
-            })?;
-            let text = String::from_utf8_lossy(&text);
-            let uid = xml_attr(&text, "AddInItem", "UID")
-                .unwrap_or_else(|| path.file_name().unwrap().to_string_lossy().into_owned());
-            let priority = xml_attr(&text, "AddInItem", "Priority")
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(0);
-            let enabled = xml_attr(&text, "AddInItem", "Enabled").as_deref() != Some("0");
-            let extends = xml_attr(&text, "AddInItem", "ExtendedModuleUID");
-            out.push(AddIn {
-                uid,
-                priority,
-                enabled,
-                extends,
-                dir: path,
-            });
-        }
-        out.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.uid.cmp(&b.uid)));
-        Ok(out)
+        addins_in(&join_ci(&self.root, "Addins"))
     }
 
-    /// The global resource stack: core package, single-player campaign, then enabled DLC.
+    /// The install's own resource stack: core package, single-player campaign, then enabled
+    /// DLC, with the install's `packages/core/override` above them all as the stack's overlay
+    /// (the original's priority 1: it beats add-ins and a level's archives too).
     /// An enabled add-in's `core` and `module` folders are mounted only when the add-in
     /// extends the base campaign ([`AddIn::extends_base_campaign`], provisional); an add-in
     /// for another campaign contributes nothing, as in the original, so a stand-alone DLC
     /// campaign's own resources cannot replace the base game's.
     /// Area (`env`) and module archives are loaded per area at runtime, so they are not here.
     pub fn global_vfs(&self, quality: TextureQuality) -> Result<Vfs> {
+        self.stack(quality, None)
+    }
+
+    /// The stack a game session reads through: [`DaoInstall::global_vfs`] with the player's
+    /// own folders from the original's documents folder ([`crate::mods::original_user_dir`])
+    /// in their places, and the player's mods on top ([`crate::mods::mount_default`]). Tools
+    /// that measure the install itself (the corpus) use `global_vfs`. With mods switched off
+    /// (`THEDAS_MODS=none`) this is `global_vfs`.
+    pub fn play_vfs(&self, quality: TextureQuality) -> Result<Vfs> {
+        if crate::mods::default_list_file().is_none() {
+            return self.global_vfs(quality);
+        }
+        let user = crate::mods::original_user_dir(self.game());
+        let mut vfs = self.stack(quality, user.as_deref())?;
+        crate::mods::mount_default(&mut vfs, user.as_deref());
+        Ok(vfs)
+    }
+
+    /// Add-ins installed in the player's documents folder (`AddIns/` under `user`), in
+    /// [`DaoInstall::addins`]' order. The original installs `.dazip` packages there.
+    pub fn user_addins(&self, user: &Path) -> Result<Vec<AddIn>> {
+        addins_in(&join_ci(user, "AddIns"))
+    }
+
+    /// Builds the stack, lowest layer first. `user` is the original's folder in the player's
+    /// documents; its layers go where the original's priorities put them: the player's core
+    /// `patch` and `data` and campaign folders above the install's campaign and below every
+    /// add-in, and the player's add-ins among the install's.
+    fn stack(&self, quality: TextureQuality, user: Option<&Path>) -> Result<Vfs> {
+        let campaign = format!("modules/{}", self.game().campaign_module());
         let mut vfs = Vfs::new();
-        self.push_package(&mut vfs, &join_ci(&self.root, "packages/core"), quality)?;
-        self.push_package(
-            &mut vfs,
-            &join_ci(
-                &self.root,
-                &format!("modules/{}", self.game().campaign_module()),
-            ),
-            quality,
-        )?;
-        for addin in self.addins()?.into_iter().filter(|a| a.enabled) {
+        let core = join_ci(&self.root, "packages/core");
+        self.push_package(&mut vfs, &core, quality, false)?;
+        self.push_package(&mut vfs, &join_ci(&self.root, &campaign), quality, true)?;
+        if let Some(user) = user {
+            self.push_package(&mut vfs, &join_ci(user, "packages/core"), quality, false)?;
+            self.push_package(&mut vfs, &join_ci(user, &campaign), quality, true)?;
+        }
+        let mut addins = self.addins()?;
+        if let Some(user) = user {
+            addins.extend(self.user_addins(user)?);
+            sort_addins(&mut addins);
+        }
+        for addin in addins.into_iter().filter(|a| a.enabled) {
             if addin.extends_base_campaign() {
-                self.push_package(&mut vfs, &join_ci(&addin.dir, "core"), quality)?;
-                self.push_package(&mut vfs, &join_ci(&addin.dir, "module"), quality)?;
+                self.push_package(&mut vfs, &join_ci(&addin.dir, "core"), quality, true)?;
+                self.push_package(&mut vfs, &join_ci(&addin.dir, "module"), quality, true)?;
             }
+        }
+        let over = join_ci(&core, "override");
+        if over.is_dir() {
+            let mut overlay = Vfs::new();
+            overlay.push_directory(&over, true, self.relative(&over).into_owned())?;
+            vfs.set_overlay(overlay);
         }
         Ok(vfs)
     }
 
-    /// [`DaoInstall::global_vfs`] plus this player's mods as the stack's overlay
-    /// ([`crate::mods::mount_default`]): what a game session reads through. Tools that measure
-    /// the install itself (the corpus) use `global_vfs`.
-    pub fn play_vfs(&self, quality: TextureQuality) -> Result<Vfs> {
-        let mut vfs = self.global_vfs(quality)?;
-        crate::mods::mount_default(&mut vfs);
-        Ok(vfs)
-    }
-
-    fn push_package(&self, vfs: &mut Vfs, dir: &Path, quality: TextureQuality) -> Result<()> {
+    /// Pushes one package folder's layers. `with_override` also pushes its `override` folder
+    /// on top; the core package's is the stack's overlay instead.
+    fn push_package(
+        &self,
+        vfs: &mut Vfs,
+        dir: &Path,
+        quality: TextureQuality,
+        with_override: bool,
+    ) -> Result<()> {
         if !dir.is_dir() {
             return Ok(());
         }
@@ -247,11 +253,56 @@ impl DaoInstall {
             }
         }
         let over = join_ci(dir, "override");
-        if over.is_dir() {
+        if with_override && over.is_dir() {
             vfs.push_directory(&over, true, label(&over))?;
         }
         Ok(())
     }
+}
+
+fn sort_addins(addins: &mut [AddIn]) {
+    addins.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.uid.cmp(&b.uid)));
+}
+
+/// The add-ins in one `AddIns` folder, ordered by manifest priority (lowest first), then UID.
+fn addins_in(dir: &Path) -> Result<Vec<AddIn>> {
+    let mut out = Vec::new();
+    if !dir.is_dir() {
+        return Ok(out);
+    }
+    let rd = std::fs::read_dir(dir).map_err(|e| Error::Io {
+        path: dir.to_path_buf(),
+        source: e,
+    })?;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let manifest = resolve_ci(&path, "manifest.xml").filter(|p| p.is_file());
+        let Some(manifest) = manifest else { continue };
+        let text = std::fs::read(&manifest).map_err(|e| Error::Io {
+            path: manifest.clone(),
+            source: e,
+        })?;
+        let text = String::from_utf8_lossy(&text);
+        let uid = xml_attr(&text, "AddInItem", "UID")
+            .unwrap_or_else(|| path.file_name().unwrap().to_string_lossy().into_owned());
+        let priority = xml_attr(&text, "AddInItem", "Priority")
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+        let enabled = xml_attr(&text, "AddInItem", "Enabled").as_deref() != Some("0");
+        let extends = xml_attr(&text, "AddInItem", "ExtendedModuleUID");
+        out.push(AddIn {
+            uid,
+            priority,
+            enabled,
+            extends,
+            dir: path,
+        });
+    }
+    sort_addins(&mut out);
+    Ok(out)
 }
 
 /// A level's own resources, mounted on top of a stack while its area is loaded.
@@ -583,6 +634,82 @@ mod tests {
         assert_eq!(vfs.read("sword.uti").unwrap().0, b"dlc sword");
         assert!(vfs.lookup("sp_only.utc").is_some());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The original's priorities: core override beats add-ins, add-ins beat the player's own
+    /// campaign and core folders, those beat the install's campaign, which beats core.
+    #[test]
+    fn override_and_user_folders_sit_where_the_original_puts_them() {
+        let base = std::env::temp_dir().join(format!("thedas-userdirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, user) = (base.join("install"), base.join("docs"));
+        let write = |dir: &Path, rel: &str, bytes: &[u8]| {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        };
+        let manifest = |uid: &str| {
+            format!(
+                r#"<AddInItem UID="{uid}" ExtendedModuleUID="Single Player" Priority="5" Enabled="1">"#
+            )
+        };
+        let names = ["a", "b", "c", "d", "e", "f", "g"];
+        // The source ranked r (0 highest) provides the first r + 1 names, so the winner of
+        // each name is the source of that rank.
+        let erf = |rank: usize, tag: &str| {
+            let f: Vec<(String, &[u8])> = names[..=rank]
+                .iter()
+                .map(|n| (format!("{n}.txt"), tag.as_bytes()))
+                .collect();
+            let refs: Vec<(&str, &[u8])> = f.iter().map(|(n, d)| (n.as_str(), *d)).collect();
+            erf_v20(&refs)
+        };
+        write(&root, "packages/core/data/core.erf", &erf(6, "core"));
+        write(
+            &root,
+            "modules/single player/data/camp.erf",
+            &erf(5, "campaign"),
+        );
+        write(&user, "packages/core/data/ucore.erf", &erf(4, "user core"));
+        for n in &names[..=3] {
+            let rel = format!("modules/Single Player/override/{n}.txt");
+            write(&user, &rel, b"user campaign");
+        }
+        write(&root, "Addins/x/Manifest.xml", manifest("X").as_bytes());
+        write(&root, "Addins/x/core/data/x.erf", &erf(2, "addin"));
+        write(&user, "AddIns/y/Manifest.xml", manifest("Y").as_bytes());
+        write(&user, "AddIns/y/core/data/y.erf", &erf(1, "user addin"));
+        write(&root, "packages/core/override/sub/a.txt", b"core override");
+
+        let install = DaoInstall::open(&root).unwrap();
+        let read = |vfs: &Vfs, n: &str| String::from_utf8(vfs.read(n).unwrap().0).unwrap();
+        let vfs = install.stack(TextureQuality::High, Some(&user)).unwrap();
+        let got: Vec<String> = names
+            .iter()
+            .map(|n| read(&vfs, &format!("{n}.txt")))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "core override",
+                "user addin",
+                "addin",
+                "user campaign",
+                "user core",
+                "campaign",
+                "core"
+            ]
+        );
+        assert_eq!(vfs.hits("a.txt").len(), 7);
+        // Without the player's folders: the install alone, override still on top.
+        let vfs = install.global_vfs(TextureQuality::High).unwrap();
+        assert_eq!(read(&vfs, "a.txt"), "core override");
+        assert_eq!(read(&vfs, "b.txt"), "addin");
+        assert_eq!(read(&vfs, "d.txt"), "campaign");
+        assert_eq!(read(&vfs, "g.txt"), "core");
+        // A level mounted later does not hide the override folder.
+        assert_eq!(vfs.overlay().map(|o| o.layers().len()), Some(1));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
