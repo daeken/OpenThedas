@@ -671,7 +671,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     party_picker(sim, shown, &mut v);
     saves(sim, shown, &mut v);
     journal(sim, shown, &mut v);
-    alerts(sim, &mut v);
+    alerts(sim, shown, &mut v);
     crate::options::values(&shown.options, shown.resolution, &mut v);
     if let Some(e) = &shown.examine {
         v.insert(
@@ -1483,7 +1483,7 @@ fn journal(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
 /// name and whether the quest is done), with the list's own value listing them so the
 /// movie's observer fires, and the large ones (`Party.UberAlerts`). Provisional: every alert shows as new,
 /// and which events raise one is inferred (see [`thedas_sim::journal::Alert`]).
-fn alerts(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
+fn alerts(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
     let alerts = &sim.world.alerts;
     v.insert(
         "Party.Alerts".into(),
@@ -1521,7 +1521,14 @@ fn alerts(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
         "Party.UberAlerts".into(),
         UiValue::String(
             uber.iter()
-                .map(|a| format!("{}:{}", a.kind, a.resref))
+                .map(|a| {
+                    format!(
+                        "{}:{}:{}",
+                        a.kind,
+                        a.resref,
+                        a.text.as_deref().unwrap_or_default()
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(","),
         ),
@@ -1536,9 +1543,25 @@ fn alerts(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
             UiValue::String(a.name.and_then(|t| sim.string(t)).unwrap_or_default()),
         );
         v.insert(format!("{k}.IntegerArg"), num(0));
-        v.insert(format!("{k}.CustomText"), UiValue::String(String::new()));
-        v.insert(format!("{k}.CustomIcon"), UiValue::String(String::new()));
-        v.insert(format!("{k}.Portrait"), UiValue::String(String::new()));
+        // What notifications.gfx's large notification reads by kind: a new ability its name,
+        // its icon and the portrait of who got it; a specialization its name and icon; a
+        // map area its name (`CustomText`, `CustomIcon`, `Portrait`).
+        v.insert(
+            format!("{k}.CustomText"),
+            UiValue::String(a.text.clone().unwrap_or_default()),
+        );
+        v.insert(
+            format!("{k}.CustomIcon"),
+            UiValue::String(a.icon.clone().unwrap_or_default()),
+        );
+        v.insert(
+            format!("{k}.Portrait"),
+            UiValue::String(
+                a.creature
+                    .and_then(|c| shown.portraits.get(&c).cloned())
+                    .unwrap_or_default(),
+            ),
+        );
     }
 }
 

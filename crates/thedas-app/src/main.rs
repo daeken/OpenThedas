@@ -653,6 +653,9 @@ enum UpdateAsk {
     Where(update::Offer),
     /// The build started on a report: is it fixed? (The report's folder, the question.)
     Verdict(PathBuf, String),
+    /// Its answer given (fixed or not): anything to add? (A text box, whose first button
+    /// wants text; with none the second, "No note", sends the answer as it is.)
+    VerdictNote(PathBuf, bool),
     /// Something went wrong.
     Failed(String),
 }
@@ -673,6 +676,12 @@ impl UpdateAsk {
                 (UPDATE_ASK_ID + 2, prompt.clone(), "Fixed", "Not fixed")
             }
             UpdateAsk::Failed(why) => (UPDATE_ASK_ID + 3, why.clone(), "OK", "Close"),
+            UpdateAsk::VerdictNote(..) => (
+                UPDATE_ASK_ID + 4,
+                "Thanks. Anything to add for us? It goes with your answer.".to_string(),
+                "Send note",
+                "No note",
+            ),
         }
     }
 }
@@ -1340,7 +1349,7 @@ impl App {
         for a in g.ui.take_text_answers() {
             // OK sends (or saves) the report with the note; the other button keeps it on
             // this computer only, unsent.
-            if (UPDATE_ASK_ID..UPDATE_ASK_ID + 4).contains(&a.id) {
+            if (UPDATE_ASK_ID..UPDATE_ASK_ID + 5).contains(&a.id) {
                 self.update_answers.push(a);
                 continue;
             }
@@ -1491,7 +1500,7 @@ impl App {
         for a in g.ui.take_text_answers() {
             // OK sends (or saves) the report with the note; the other button keeps it on
             // this computer only, unsent.
-            if (UPDATE_ASK_ID..UPDATE_ASK_ID + 4).contains(&a.id) {
+            if (UPDATE_ASK_ID..UPDATE_ASK_ID + 5).contains(&a.id) {
                 self.update_answers.push(a);
                 continue;
             }
@@ -1797,7 +1806,7 @@ impl App {
                 let up = g.ui.stage.dialog_up();
                 match p.asked.as_mut() {
                     None if !up => {
-                        if matches!(p.kind, UpdateAsk::Verdict(..)) {
+                        if matches!(p.kind, UpdateAsk::VerdictNote(..)) {
                             g.ui.ask_text(id, &prompt, "", ok, other);
                         } else {
                             g.ui.ask_choice(id, &prompt, ok, other);
@@ -1821,7 +1830,7 @@ impl App {
                                 // Asked again later, once nothing else is up.
                                 p.asked = None;
                             } else {
-                                if matches!(p.kind, UpdateAsk::Verdict(..)) {
+                                if matches!(p.kind, UpdateAsk::VerdictNote(..)) {
                                     g.ui.ask_text(id, &prompt, "", ok, other);
                                 } else {
                                     g.ui.ask_choice(id, &prompt, ok, other);
@@ -1915,8 +1924,16 @@ impl App {
                     Err(e) => self.update_failed(format!("The game could not be saved: {e:#}")),
                 }
             }
+            // Fixed or not, then (a second box) anything to add.
             UpdateAsk::Verdict(dir, _) => {
-                update::send_verdict_in_background(dir, a.accepted, a.text);
+                self.returning = Returning::Asking(Box::new(UpdatePrompt {
+                    kind: UpdateAsk::VerdictNote(dir, a.accepted),
+                    asked: None,
+                }));
+            }
+            UpdateAsk::VerdictNote(dir, fixed) => {
+                let note = if a.accepted { a.text } else { String::new() };
+                update::send_verdict_in_background(dir, fixed, note);
             }
             UpdateAsk::Failed(_) => {}
         }
@@ -4099,6 +4116,22 @@ fn test_floaty(sim: &mut thedas_sim::Sim, text: &str) {
                 text: text.trim().to_string(),
                 colour: 0xffffff,
             });
+        return;
+    }
+    // `floaty banner: KIND ICON TEXT` is a large notification of notifications.gfx's kind
+    // (7 new ability, 10 map area, 11 specialization), with an icon resource (`-` for none)
+    // and its text, about the controlled creature.
+    if let Some(rest) = text.strip_prefix("banner:") {
+        let mut words = rest.split_whitespace();
+        let kind = words.next().and_then(|k| k.parse().ok()).unwrap_or(7);
+        let icon = words.next().filter(|i| *i != "-").map(str::to_string);
+        sim.world.uber_alerts.push(thedas_sim::journal::Alert {
+            kind,
+            text: Some(words.collect::<Vec<_>>().join(" ")),
+            icon,
+            creature: sim.world.controlled(),
+            ..Default::default()
+        });
         return;
     }
     // `floaty status: TEXT` is a status message (a script's `DisplayStatusMessage`).
