@@ -2055,12 +2055,16 @@ impl Sim {
             return;
         };
         for (i, f) in followers.into_iter().enumerate() {
+            // A move of its own (a script's order, such as Alistair's walk to the tent after
+            // Ostagar's war council) is left to finish: carried along meanwhile, it was
+            // resumed when the walk stopped, and the follower walked back across the camp.
+            let following = self.following.contains(&f);
             let ok = self.world.get(f).is_some_and(|o| {
                 !o.dead
                     && o.area == area
                     && !o.combat.in_combat
                     && o.commands.first().is_none_or(|c| {
-                        matches!(c.name.as_str(), "CommandWait" | "CommandMoveToLocation")
+                        c.name == "CommandWait" || (c.name == "CommandMoveToLocation" && following)
                     })
                     && o.fields.get("FollowPartyLeader").copied().unwrap_or(1) != 0
             });
@@ -4375,6 +4379,44 @@ impl Host for ScriptHost<'_> {
             }
         }
     }
+
+    /// Dragon Age II's by-reference functions (`void SetEventIntegerRef(ref event evEvent,
+    /// int nIndex, int nValue)` and 40 more) are the in-place twins of functions both games
+    /// have: `<Name>Ref` does on the referenced event or effect what `<Name>` does on a copy.
+    /// So each runs as its twin; a void setter's result (the changed event or effect, as
+    /// Dragon Age: Origins' setters return it) is written back into the referenced argument.
+    /// A function without a twin in the engine table is traced as unimplemented. Provisional:
+    /// the twins' equivalence is read from the names and signatures in DA2's `script.ldf`,
+    /// not traced in DragonAge2.exe, and so is the write-back of a setter's result into the
+    /// referenced variable.
+    fn action_ref(
+        &mut self,
+        caller: ObjectId,
+        f: &Function,
+        args: &mut Vec<Value>,
+    ) -> VmResult<Option<Value>> {
+        let twin = f
+            .name
+            .strip_suffix("Ref")
+            .and_then(|plain| self.sim.table.function_by_name(plain))
+            .cloned();
+        let Some(twin) = twin else {
+            return self.action(caller, f, args.clone());
+        };
+        let result = self.action(caller, &twin, args.clone())?;
+        if f.ret != thedas_script::ldf::Type::Void {
+            return Ok(result);
+        }
+        // A setter: the twin returns the changed value for the referenced argument.
+        if let Some(changed @ Value::Engine { .. }) = result {
+            if let Some(i) = f.params.iter().position(|p| p.by_ref) {
+                if let Some(slot) = args.get_mut(i) {
+                    *slot = changed;
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 impl ScriptHost<'_> {
@@ -4401,6 +4443,45 @@ impl ScriptHost<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dragon_age_2_reference_functions_run_as_their_twins() {
+        let ldf = "#define ENGINE_STRUCTURE_0 event\n\
+            event Event(int nType) = 0;\n\
+            event SetEventInteger(event ev, int nIndex, int nValue) = 1;\n\
+            int GetEventInteger(event ev, int nIndex) = 2;\n\
+            void SetEventIntegerRef(ref event ev, int nIndex, int nValue) = 3;\n\
+            int GetEventIntegerRef(ref event ev, int nIndex) = 4;\n\
+            void NoTwinRef(ref event ev) = 5;\n";
+        let table = Arc::new(EngineTable::parse(ldf.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table.clone(), 1);
+        let f = |name: &str| table.function_by_name(name).cloned().unwrap();
+        let mut h = ScriptHost {
+            sim: &mut s,
+            event: None,
+            script: "test".into(),
+        };
+        let ev = h
+            .action(1, &f("Event"), vec![Value::Int(7)])
+            .unwrap()
+            .unwrap();
+        // The setter changes the referenced event in place.
+        let mut args = vec![ev, Value::Int(2), Value::Int(42)];
+        let r = h
+            .action_ref(1, &f("SetEventIntegerRef"), &mut args)
+            .unwrap();
+        assert_eq!(r, None);
+        assert!(matches!(args[0], Value::Engine { .. }));
+        // The getter reads the changed event.
+        let mut read = vec![args[0].clone(), Value::Int(2)];
+        let got = h
+            .action_ref(1, &f("GetEventIntegerRef"), &mut read)
+            .unwrap();
+        assert_eq!(got, Some(Value::Int(42)));
+        // A by-reference function without a twin is unimplemented and changes nothing.
+        let mut none = vec![args[0].clone()];
+        assert_eq!(h.action_ref(1, &f("NoTwinRef"), &mut none).unwrap(), None);
+        assert_eq!(none[0], args[0]);
+    }
 
     #[test]
     fn creature_templates_give_their_appearance_datas_fields() {
@@ -5031,6 +5112,50 @@ mod tests {
         assert!(
             (dog_pos[0] - 9.0).abs() < 1e-4,
             "dog follows a metre behind: {dog_pos:?}"
+        );
+    }
+
+    #[test]
+    fn a_follower_with_an_order_of_its_own_is_not_carried_along() {
+        // After Ostagar's war council Alistair has a script's order to walk to the tent;
+        // the tools' walk carried him along with the hero meanwhile, and he resumed the
+        // order (walking back across the camp) when the walk stopped.
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let al = s.world.spawn(ObjectKind::Creature, "alistair");
+        s.world.hero = Some(hero);
+        for id in [hero, al] {
+            s.world.get_mut(id).unwrap().area = Some(area);
+        }
+        s.world.get_mut(hero).unwrap().followers = vec![al];
+        let tent = [0.0, 20.0, 0.0];
+        s.world.get_mut(al).unwrap().commands.push(Command {
+            ty: 0,
+            name: "CommandMoveToLocation".into(),
+            target: None,
+            location: Some(crate::world::Location {
+                area,
+                position: tent,
+                facing: 0.0,
+            }),
+            seconds: 0.0,
+            ints: Vec::new(),
+            strings: Vec::new(),
+            due: None,
+            from: None,
+            approach: None,
+            ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
+            arrived: false,
+            path: Vec::new(),
+        });
+        assert!(s.walk(hero, [10.0, 0.0, 0.0], None));
+        let p = s.world.get(al).unwrap().position;
+        assert!(
+            p[1] > 5.0 && p[0].abs() < 1.0,
+            "on his way to the tent: {p:?}"
         );
     }
 

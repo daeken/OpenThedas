@@ -63,6 +63,9 @@ pub struct Animator {
     trees: HashMap<String, Option<Arc<AnimTree>>>,
     animations: HashMap<String, Option<Arc<Animation>>>,
     rests: HashMap<usize, Arc<Vec<Mat4>>>,
+    /// Dragon Age II animations whose bones were named for a skeleton already (see
+    /// [`Animator::named_for`]): by animation and the skeleton's index.
+    named: std::collections::HashSet<(String, usize)>,
 }
 
 fn load<T>(
@@ -93,6 +96,7 @@ impl Animator {
     /// posing another scene's; the animations read stay.
     pub fn forget_skeletons(&mut self) {
         self.rests.clear();
+        self.named.clear();
     }
 
     /// The `.ani` resource a clip plays (the first tree with one of its actions), and the
@@ -144,23 +148,38 @@ impl Animator {
 
     /// The animation a clip names, if a tree has the action and its keyframes load.
     pub fn animation(&mut self, vfs: &Vfs, clip: &Clip) -> Option<Arc<Animation>> {
-        for tree in &clip.trees {
-            let name = tree_resource(tree);
-            let Some(t) = load(&mut self.trees, vfs, &name, |d| AnimTree::parse(d).ok()) else {
-                continue;
-            };
-            let Some(ani) = clip
-                .actions
+        self.animation_resource(vfs, clip).map(|(_, a)| a)
+    }
+
+    /// Animation `ani` with its tracks' bones named from skeleton `skeleton` of the scene
+    /// (`s`). A Dragon Age II animation stores only a hash of each track's bone (see
+    /// [`Animation::resolve_bones`]), which a skeleton's bone names are matched against;
+    /// the named copy replaces the cached one, so each animation is named once for each
+    /// skeleton it plays on (skeletons of one kind share their names). An animation with
+    /// named tracks (Dragon Age: Origins') is returned as it is.
+    fn named_for(
+        &mut self,
+        ani: &str,
+        anim: Arc<Animation>,
+        skeleton: usize,
+        s: &crate::skeleton::Skeleton,
+    ) -> Arc<Animation> {
+        let key = ani.to_ascii_lowercase();
+        let hashed = |a: &Animation| {
+            a.tracks
                 .iter()
-                .find_map(|a| t.action(a).and_then(|n| n.animation.clone()))
-            else {
-                continue;
-            };
-            return load(&mut self.animations, vfs, &ani, |d| {
-                Animation::parse(d).ok()
-            });
+                .any(|t| thedas_formats::hash_of_hashed_name(&t.bone).is_some())
+        };
+        if !hashed(&anim) || !self.named.insert((key.clone(), skeleton)) {
+            return anim;
         }
-        None
+        let mut named = (*anim).clone();
+        if named.resolve_bones(s.bones.iter().map(|b| b.name.as_str())) == 0 {
+            return anim;
+        }
+        let named = Arc::new(named);
+        self.animations.insert(key, Some(named.clone()));
+        named
     }
 
     /// The rest pose and the clip's pose for one of `scene`'s skeletons; `None` when the
@@ -184,14 +203,11 @@ impl Animator {
             }
         };
         let mut layers: Vec<(Arc<Animation>, f32, bool, f32)> = Vec::new();
-        if let Some(anim) = self.animation(vfs, clip) {
-            let t = time(clip, &anim);
-            layers.push((anim, t, clip.absolute, clip.weight));
-        }
-        for l in &clip.layers {
-            if let Some(anim) = self.animation(vfs, l) {
-                let t = time(l, &anim);
-                layers.push((anim, t, l.absolute, l.weight));
+        for c in std::iter::once(clip).chain(&clip.layers) {
+            if let Some((ani, anim)) = self.animation_resource(vfs, c) {
+                let anim = self.named_for(&ani, anim, skeleton, &s);
+                let t = time(c, &anim);
+                layers.push((anim, t, c.absolute, c.weight));
             }
         }
         if layers.is_empty() {
@@ -238,5 +254,81 @@ impl Animator {
             }
             renderer.pose_prop(ctx, scene, i, *transform, &poses);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thedas_formats::anim::{Channel, Key, Track};
+    use thedas_formats::level::Transform;
+    use thedas_formats::model::{Mmh, Node};
+
+    fn node(name: &str, bone: u32, children: Vec<Node>) -> Node {
+        Node {
+            kind: thedas_formats::FourCC::new(b"node"),
+            name: Some(name.into()),
+            transform: Transform {
+                position: [0.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
+            mesh: None,
+            light: None,
+            emitter: None,
+            irradiance: None,
+            bone: Some(bone),
+            children,
+        }
+    }
+
+    #[test]
+    fn dragon_age_ii_tracks_are_named_from_the_skeleton_they_play_on() {
+        let skeleton = crate::skeleton::Skeleton::from_mmh(&Mmh {
+            name: None,
+            mesh_file: None,
+            nodes: vec![node("Root", 0, vec![node("Elbow", 1, vec![])])],
+        });
+        let track = |bone: String, channel| Track {
+            bone,
+            channel,
+            keys: vec![Key {
+                time: 0.0,
+                value: [0.0, 0.0, 0.0, 1.0],
+            }],
+        };
+        let hashed =
+            |target: &str| thedas_formats::hashed_name(thedas_formats::name_hash32(target));
+        let anim = Arc::new(Animation {
+            name: "wave".into(),
+            length: 1.0,
+            additive: false,
+            scalars: Default::default(),
+            tracks: vec![
+                track(hashed("elbow_rotation"), Channel::Rotation),
+                // A bone this skeleton does not have stays hashed.
+                track(hashed("tail_rotation"), Channel::Rotation),
+            ],
+        });
+        let mut a = Animator::default();
+        a.animations.insert("wave.ani".into(), Some(anim.clone()));
+        let named = a.named_for("wave.ani", anim.clone(), 0, &skeleton);
+        assert_eq!(named.tracks[0].bone, "elbow");
+        assert_eq!(named.tracks[1].bone, hashed("tail_rotation"));
+        // The named copy is kept, and asked again for the same skeleton nothing is redone.
+        let cached = a.animations["wave.ani"].clone().unwrap();
+        assert!(Arc::ptr_eq(&cached, &named));
+        assert!(Arc::ptr_eq(
+            &a.named_for("wave.ani", cached.clone(), 0, &skeleton),
+            &cached
+        ));
+        // Named tracks (Dragon Age: Origins') are left as they are.
+        let plain = Arc::new(Animation {
+            tracks: vec![track("elbow".into(), Channel::Rotation)],
+            ..(*anim).clone()
+        });
+        assert!(Arc::ptr_eq(
+            &a.named_for("plain.ani", plain.clone(), 0, &skeleton),
+            &plain
+        ));
     }
 }
