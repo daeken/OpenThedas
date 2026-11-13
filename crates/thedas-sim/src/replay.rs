@@ -32,7 +32,11 @@ pub struct JournalHeader {
 pub enum JournalLine {
     Header(JournalHeader),
     Input(InputEntry),
-    /// The world's hash after the `index`th input (counting from 1).
+    /// The input before, `n` more times (a tick each frame, a held stick's orders).
+    Repeat {
+        n: u32,
+    },
+    /// The world's hash after the `index`th input (counting from 1, repeats counted).
     Check {
         index: u64,
         t: u64,
@@ -93,15 +97,25 @@ impl Fnv {
     }
 }
 
-/// Writes a log as the game is played: [`JournalWriter::take`] each frame (or after
-/// each input) appends what the simulation's input log gathered, with a world hash every
-/// [`JournalWriter::check_every`] inputs.
+/// Writes a log as the game is played: [`JournalWriter::take`] appends what the
+/// simulation's input log gathered since the last call (each frame, or after each input),
+/// an input given again and again as one [`JournalLine::Repeat`], and a world hash every
+/// [`JournalWriter::check_every`] inputs or so.
 pub struct JournalWriter<W: Write> {
     out: W,
+    /// Inputs written, repeats counted.
     written: u64,
+    /// Inputs at the last world hash.
+    checked: u64,
+    /// The last input written, and how often it came again since (not written yet).
+    last: Option<(crate::commands::CommandSource, crate::commands::SimCommand)>,
+    pending: u32,
     /// Inputs between world hashes.
     pub check_every: u64,
 }
+
+/// Repeats held back at most: a crash loses no more than this many repeated inputs.
+const MAX_PENDING: u32 = 300;
 
 impl<W: Write> JournalWriter<W> {
     /// Starts a log onto `out` for the checkpoint `sim` is at now, and turns the
@@ -117,44 +131,71 @@ impl<W: Write> JournalWriter<W> {
         Ok(JournalWriter {
             out,
             written: 0,
+            checked: 0,
+            last: None,
+            pending: 0,
             check_every: 600,
         })
     }
 
-    /// Appends the inputs the simulation has gathered since the last call, and the world's
-    /// hash when one is due. A hash is taken as the world is now, so it is due only right
-    /// after the input that completes the count: call this after every input to keep the
-    /// hashes exact (the app does, from its one door into the simulation).
-    pub fn take(&mut self, sim: &mut Sim) -> std::io::Result<()> {
-        let Some(log) = sim.input_log.as_mut() else {
-            return Ok(());
-        };
-        let entries = std::mem::take(log);
-        let n = entries.len();
-        for (i, e) in entries.into_iter().enumerate() {
-            writeln!(
-                self.out,
-                "{}",
-                serde_json::to_string(&JournalLine::Input(e))?
-            )?;
-            self.written += 1;
-            if self.written.is_multiple_of(self.check_every) && i + 1 == n {
-                let check = JournalLine::Check {
-                    index: self.written,
-                    t: sim.world.time_ms,
-                    hash: world_hash(sim),
-                };
-                writeln!(self.out, "{}", serde_json::to_string(&check)?)?;
-            }
+    fn line(&mut self, l: &JournalLine) -> std::io::Result<()> {
+        writeln!(self.out, "{}", serde_json::to_string(l)?)
+    }
+
+    fn write_pending(&mut self) -> std::io::Result<()> {
+        if self.pending > 0 {
+            let n = std::mem::take(&mut self.pending);
+            self.line(&JournalLine::Repeat { n })?;
         }
         Ok(())
     }
 
+    /// Appends the inputs the simulation has gathered since the last call, and the world's
+    /// hash when one is due (taken as the world is now, after all of them).
+    pub fn take(&mut self, sim: &mut Sim) -> std::io::Result<()> {
+        let Some(log) = sim.input_log.as_mut() else {
+            return Ok(());
+        };
+        for e in std::mem::take(log) {
+            self.written += 1;
+            let same = self
+                .last
+                .as_ref()
+                .is_some_and(|(s, c)| *s == e.source && *c == e.command);
+            if same && self.pending < MAX_PENDING {
+                self.pending += 1;
+                continue;
+            }
+            self.write_pending()?;
+            if same {
+                self.pending = 1;
+                continue;
+            }
+            self.last = Some((e.source, e.command.clone()));
+            self.line(&JournalLine::Input(e))?;
+        }
+        if self.written - self.checked >= self.check_every {
+            self.write_pending()?;
+            self.checked = self.written;
+            let check = JournalLine::Check {
+                index: self.written,
+                t: sim.world.time_ms,
+                hash: world_hash(sim),
+            };
+            self.line(&check)?;
+        }
+        Ok(())
+    }
+
+    /// Writes what is held back and flushes the output.
     pub fn flush(&mut self) -> std::io::Result<()> {
+        self.write_pending()?;
         self.out.flush()
     }
 
-    pub fn into_inner(self) -> W {
+    /// The output, after what is held back is written.
+    pub fn into_inner(mut self) -> W {
+        let _ = self.write_pending();
         self.out
     }
 }
@@ -207,16 +248,29 @@ pub fn replay(sim: &mut Sim, log: impl BufRead, build: &str, any_build: bool) ->
     }
     report.inputs = lines
         .iter()
-        .filter(|l| matches!(l, JournalLine::Input(_)))
-        .count() as u64;
+        .map(|l| match l {
+            JournalLine::Input(_) => 1,
+            JournalLine::Repeat { n } => u64::from(*n),
+            _ => 0,
+        })
+        .sum();
     let was_logging = sim.input_log.take();
     let mut good = (sim.world.clone(), 0u64);
     let mut applied = 0u64;
+    let mut last: Option<InputEntry> = None;
     for l in lines.into_iter().skip(1) {
         match l {
             JournalLine::Input(e) => {
-                sim.apply(e.source, e.command);
+                sim.apply(e.source, e.command.clone());
                 applied += 1;
+                last = Some(e);
+            }
+            JournalLine::Repeat { n } => {
+                let Some(e) = last.as_ref() else { break };
+                for _ in 0..n {
+                    sim.apply(e.source, e.command.clone());
+                    applied += 1;
+                }
             }
             JournalLine::Check { index, hash, .. } => {
                 let got = world_hash(sim);

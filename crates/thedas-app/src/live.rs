@@ -211,6 +211,10 @@ pub struct LiveRings {
 pub struct Live {
     /// Shared with the interface, whose movies act on it as they send messages.
     pub sim: Arc<Mutex<Sim>>,
+    /// The journal of the game being played (see [`crate::journal`]): started with the
+    /// first step of a game, off with `THEDAS_NO_JOURNAL` set or when it cannot be written.
+    pub journal: Option<crate::journal::GameJournal>,
+    journal_off: bool,
     /// The start menu's, before a game is chosen: nothing is loaded and nothing runs.
     pub front_end: bool,
     pub paused: bool,
@@ -666,7 +670,30 @@ impl Live {
             cutscene_movies: Default::default(),
             movies_wait: false,
             format: None,
+            journal: None,
+            journal_off: std::env::var_os("THEDAS_NO_JOURNAL").is_some(),
         })
+    }
+
+    /// Keeps the journal: starts it with the game's first step, then writes the inputs
+    /// given since the last call (see [`crate::journal`]).
+    fn keep_journal(&mut self) {
+        if self.journal_off || self.front_end {
+            return;
+        }
+        let sim = self.sim.clone();
+        let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+        let done = match self.journal.as_mut() {
+            Some(j) => j.after_frame(&mut sim),
+            None => crate::journal::GameJournal::start(&mut sim, &crate::journal::default_dir())
+                .map(|j| self.journal = Some(j)),
+        };
+        if let Err(e) = done {
+            log::warn!("journal: {e}; not kept from here");
+            self.journal = None;
+            self.journal_off = true;
+            sim.input_log = None;
+        }
     }
 
     /// The simulation, locked. Not held across the interface's tick, which locks it too.
@@ -677,7 +704,13 @@ impl Live {
     /// Advances the simulation by `dt_ms` of real time (at most [`MAX_STEP_MS`]), unless
     /// paused.
     pub fn step(&mut self, dt_ms: f64) {
-        if self.paused || self.front_end || self.loading() {
+        if self.front_end || self.loading() {
+            return;
+        }
+        // What the player and the interface gave since the last step goes to the journal
+        // first, in the order given.
+        self.keep_journal();
+        if self.paused {
             return;
         }
         // A training tutorial holds the game's time until its mode ends, but its script

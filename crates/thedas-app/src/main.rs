@@ -58,6 +58,7 @@ mod cutcam;
 mod focusnav;
 mod follow;
 mod intro;
+mod journal;
 mod live;
 mod looks;
 mod modconv;
@@ -140,6 +141,10 @@ struct Args {
     /// in its current area; `--area` is then ignored and the camera starts behind the hero.
     #[arg(long)]
     save: Option<PathBuf>,
+    /// Resume the game from the journal (the data folder's `journal/`: the last checkpoint,
+    /// and every input since it replayed), as it was when it stopped.
+    #[arg(long)]
+    resume: bool,
     /// Draw the creatures and placeables an area starts with (runs the simulation for the
     /// area resource given as `--area`).
     #[arg(long)]
@@ -5263,7 +5268,17 @@ fn main() -> Result<()> {
         .saves
         .clone()
         .unwrap_or_else(saves::SaveStore::default_dir);
-    let start = if let Some(save) = &args.save {
+    let journal_dir = journal::default_dir();
+    let checkpoint = if args.resume {
+        Some(journal::checkpoint(&journal_dir).ok_or_else(|| {
+            anyhow::anyhow!("--resume: no checkpoint in {}", journal_dir.display())
+        })?)
+    } else {
+        None
+    };
+    let start = if let Some(bytes) = &checkpoint {
+        Some(live::Start::SaveBytes(bytes))
+    } else if let Some(save) = &args.save {
         Some(live::Start::Save(save))
     } else if args.new_game && args.quick_start {
         Some(live::Start::NewGameQuick)
@@ -5289,6 +5304,19 @@ fn main() -> Result<()> {
         )?),
         None => None,
     };
+    // --resume: the inputs since the checkpoint, replayed.
+    if let (Some(l), true) = (live.as_ref(), args.resume) {
+        let report = journal::replay(&mut l.sim(), &journal_dir);
+        match (&report.refused, report.mismatch) {
+            (Some(why), _) => log::warn!("resume: the log was not replayed: {why}"),
+            (None, Some((at, _, _))) => log::warn!(
+                "resume: the replay went its own way at input {at}; the game is as it was there ({} of {} inputs)",
+                report.applied,
+                report.inputs
+            ),
+            (None, None) => log::info!("resume: {} inputs replayed", report.applied),
+        }
+    }
     // THEDAS_ASYNC_LOADS: headless too, a new level builds on a worker while frames run on
     // (as the window does), for testing that path.
     if let Some(l) = live.as_mut() {
