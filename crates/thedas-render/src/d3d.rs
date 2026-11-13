@@ -340,7 +340,7 @@ pub fn static1_filter() -> ShaderFilter {
 /// pixel shader; and exterior terrain (`Terrain2`, terrain.mat's pass above Low detail, and
 /// `Terrain3`, its Low detail pass); the sky's dome and clouds (`Sky`, `Clouds`); lava
 /// (`Lava0`); water (`Water0`); and SpeedTrees (`SPT_*`: leaf cards, branches, fronds,
-/// mesh leaves, and the far billboards' two passes).
+/// mesh leaves, and the far billboards' two passes); and the selection rings (`Reticle`).
 pub fn object_filter() -> ShaderFilter {
     let mut v = static1_filter().unwrap_or_default();
     for vs in OBJECT_VERTEX_SHADERS.iter().chain(&VFX_VERTEX_SHADERS) {
@@ -368,7 +368,7 @@ pub const VFX_VERTEX_SHADERS: [&str; 10] = [
 ];
 
 /// See [`object_filter`].
-pub const OBJECT_VERTEX_SHADERS: [&str; 20] = [
+pub const OBJECT_VERTEX_SHADERS: [&str; 21] = [
     "Char1.vsh",
     "Hair0_Pass1.vsh",
     "Hair0.vsh",
@@ -389,6 +389,8 @@ pub const OBJECT_VERTEX_SHADERS: [&str; 20] = [
     "SPT_LeafMeshes.vsh",
     "SPT_Billboards0.vsh",
     "SPT_Billboards1.vsh",
+    // `GeneralGui.mat`: the selection rings under creatures.
+    "Reticle.vsh",
 ];
 
 /// Point lights chosen for one draw.
