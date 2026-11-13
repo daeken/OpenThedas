@@ -184,6 +184,16 @@ fn post(url: &str, content: &str, files: &[(String, &str, Vec<u8>)]) -> Result<S
     Ok(reply["id"].as_str().unwrap_or("?").to_string())
 }
 
+/// Posts a plain message to the webhook.
+pub fn post_text(url: &str, content: &str) -> Result<()> {
+    let body = json!({ "content": content, "allowed_mentions": { "parse": [] } });
+    ureq::post(url)
+        .header("Content-Type", "application/json")
+        .send(body.to_string().as_bytes())
+        .map_err(|e| anyhow::anyhow!("posting to Discord: {e}"))?;
+    Ok(())
+}
+
 /// The player's home folder as text, for [`redact`].
 fn home() -> Option<String> {
     std::env::var_os("HOME")
@@ -247,7 +257,7 @@ fn half_size(png: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// A zip of `files` (deflated), as Windows, macOS and Linux open it.
-fn zip(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
+pub fn zip(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
     use flate2::Compression;
     use flate2::write::DeflateEncoder;
     let mut out = Vec::new();
