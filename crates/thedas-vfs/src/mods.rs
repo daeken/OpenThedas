@@ -36,12 +36,18 @@
 //! below that folder's loose files, and of two loose files with one name the later path wins.
 //! Those three rules are provisional: they are not traced in the original.
 //!
-//! A `.dazip` is mounted the same flat way, which is right for its `packages/core/override`
-//! part and only an approximation for a full add-in (its manifest, priority and module scope
-//! are ignored).
+//! A `.dazip` is the original's add-in package: a zip holding `Manifest.xml` and `Contents/`,
+//! with add-ins under `Contents/addins/<uid>/` and sometimes files for
+//! `Contents/packages/core/override/`. The original installs it into the player's documents.
+//! Ours unpacks it once into a cache folder of our own (`mod-cache` in the data folder, never
+//! the install or the original's folders; see [`unpack_dazip`]) because its add-ins hold
+//! archives that have to be files to be opened. Its add-ins then join the stack as installed
+//! add-ins do (their manifest's priority and campaign decide where and whether), and its
+//! override files are a mod layer at the list entry's place.
 
 use std::path::{Path, PathBuf};
 
+use crate::install::AddIn;
 use crate::vfs::{Vfs, collect_files, is_archive};
 use crate::{Result, join_ci, resolve_ci};
 
@@ -219,14 +225,20 @@ impl ModList {
     }
 
     /// Mounts every entry onto `overlay`, in order. A mod that is missing or unreadable is
-    /// reported and skipped; the rest still load.
+    /// reported and skipped; the rest still load. `.dazip` packages are unpacked into
+    /// [`cache_dir`].
     pub fn mount(&self, overlay: &mut Vfs) -> Vec<Mounted> {
+        self.mount_with_cache(overlay, &cache_dir())
+    }
+
+    /// [`ModList::mount`] with `.dazip` packages unpacked into `cache`.
+    pub fn mount_with_cache(&self, overlay: &mut Vfs, cache: &Path) -> Vec<Mounted> {
         self.entries
             .iter()
             .map(|entry| {
                 let before = overlay.layers().len();
                 let mut problems = Vec::new();
-                if let Err(e) = mount_entry(overlay, entry, &mut problems) {
+                if let Err(e) = mount_entry(overlay, entry, cache, &mut problems) {
                     overlay.truncate(before);
                     problems.push(e.to_string());
                 }
@@ -260,21 +272,34 @@ fn label(entry: &ModEntry, what: &Path) -> String {
     l
 }
 
-fn mount_entry(overlay: &mut Vfs, entry: &ModEntry, problems: &mut Vec<String>) -> Result<()> {
+/// Mounts a folder as a mod: the archives in it first (lowest), then its loose files.
+fn mount_folder(
+    overlay: &mut Vfs,
+    dir: &Path,
+    label: &dyn Fn(&Path) -> String,
+    problems: &mut Vec<String>,
+) -> Result<()> {
+    let mut files = Vec::new();
+    collect_files(dir, true, &mut files)?;
+    files.retain(|p| is_archive(p));
+    files.sort();
+    for archive in files {
+        if let Err(e) = overlay.push_archive(&archive, label(&archive)) {
+            problems.push(e.to_string());
+        }
+    }
+    overlay.push_directory(dir, true, label(dir))
+}
+
+fn mount_entry(
+    overlay: &mut Vfs,
+    entry: &ModEntry,
+    cache: &Path,
+    problems: &mut Vec<String>,
+) -> Result<()> {
     let path = &entry.path;
     if path.is_dir() {
-        // Archives first (lowest), then the folder's loose files.
-        let mut files = Vec::new();
-        collect_files(path, true, &mut files)?;
-        files.retain(|p| is_archive(p));
-        files.sort();
-        for archive in files {
-            let l = label(entry, &archive);
-            if let Err(e) = overlay.push_archive(&archive, l) {
-                problems.push(e.to_string());
-            }
-        }
-        return overlay.push_directory(path, true, label(entry, path));
+        return mount_folder(overlay, path, &|p| label(entry, p), problems);
     }
     if !path.is_file() {
         problems.push("no such file or folder".into());
@@ -288,7 +313,21 @@ fn mount_entry(overlay: &mut Vfs, entry: &ModEntry, problems: &mut Vec<String>) 
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
     match ext.as_str() {
-        "zip" | "dazip" | "override" => {
+        "dazip" => {
+            // The add-ins inside join the stack through `default_list_addins`; here only the
+            // package's override files, as a mod layer.
+            let package = unpack_dazip(path, cache)?;
+            problems.extend(package.problems);
+            let label = |p: &Path| label_under(cache, p);
+            match &package.override_dir {
+                Some(dir) => mount_folder(overlay, dir, &label, problems)?,
+                None if package.addins.is_empty() => {
+                    problems.push("no add-in and no override files found in the package".into())
+                }
+                None => {}
+            }
+        }
+        "zip" | "override" => {
             let skipped = overlay.push_zip(path, entry.inner.as_deref(), label(entry, path))?;
             if !skipped.is_empty() {
                 problems.push(format!(
@@ -304,6 +343,199 @@ fn mount_entry(overlay: &mut Vfs, entry: &ModEntry, problems: &mut Vec<String>) 
         ),
     }
     Ok(())
+}
+
+/// Where `.dazip` packages are unpacked: `mod-cache` in the player's data folder.
+pub fn cache_dir() -> PathBuf {
+    user_data_dir().join("mod-cache")
+}
+
+/// The label of a layer served from the cache: `mod:<package folder>/<path inside it>`.
+pub(crate) fn cache_label(path: &Path) -> String {
+    label_under(&cache_dir(), path)
+}
+
+fn label_under(cache: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(cache).unwrap_or(path);
+    let rel = rel
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    format!("{MOD_LABEL}{rel}")
+}
+
+/// An unpacked `.dazip`.
+#[derive(Clone, Debug)]
+pub struct Dazip {
+    /// The folder it was unpacked into.
+    pub root: PathBuf,
+    /// Its add-ins (`Contents/addins/*`), described by the package's manifest and enabled.
+    pub addins: Vec<AddIn>,
+    /// Its `Contents/packages/core/override` folder, when it has one.
+    pub override_dir: Option<PathBuf>,
+    /// Entries that were not unpacked, and why.
+    pub problems: Vec<String>,
+}
+
+/// The most a package may unpack to, and the most entries it may hold.
+const MAX_DAZIP_BYTES: u64 = 16 << 30;
+const MAX_DAZIP_ENTRIES: usize = 200_000;
+
+/// Unpacks a `.dazip` into its own folder under `cache` (named after the file, its size and
+/// its modification time, so a changed package is unpacked afresh and an unchanged one is
+/// reused), and describes what it holds. Nothing is written outside that folder: an entry
+/// whose path would leave it, a link, or anything past the size limits is skipped and
+/// reported. Nothing in the package is ever run.
+pub fn unpack_dazip(path: &Path, cache: &Path) -> Result<Dazip> {
+    let io = |at: &Path| {
+        let at = at.to_path_buf();
+        move |e: std::io::Error| crate::Error::Io {
+            path: at.clone(),
+            source: e,
+        }
+    };
+    let bad = |reason: String| crate::Error::Malformed {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let meta = std::fs::metadata(path).map_err(io(path))?;
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    let stem: String = path
+        .file_stem()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(48)
+        .collect();
+    let root = cache.join(format!("{stem}-{:x}-{modified:x}", meta.len()));
+    let mut problems = Vec::new();
+    if !root.is_dir() {
+        let file = std::fs::File::open(path).map_err(io(path))?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| bad(format!("not a zip: {e}")))?;
+        if archive.len() > MAX_DAZIP_ENTRIES {
+            return Err(bad(format!("{} entries", archive.len())));
+        }
+        let partial = cache.join(format!(".{stem}-{}.partial", std::process::id()));
+        let _ = std::fs::remove_dir_all(&partial);
+        std::fs::create_dir_all(&partial).map_err(io(&partial))?;
+        let mut left = MAX_DAZIP_BYTES;
+        for i in 0..archive.len() {
+            let mut entry = archive
+                .by_index(i)
+                .map_err(|e| bad(format!("entry {i}: {e}")))?;
+            let name = entry.name().to_string();
+            // A path that stays inside the folder, or nothing.
+            let Some(rel) = entry.enclosed_name() else {
+                problems.push(format!("{name}: path leaves the package, skipped"));
+                continue;
+            };
+            let link = entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000);
+            if link {
+                problems.push(format!("{name}: a link, skipped"));
+                continue;
+            }
+            let out = partial.join(rel);
+            if entry.is_dir() {
+                std::fs::create_dir_all(&out).map_err(io(&out))?;
+                continue;
+            }
+            if entry.size() > left {
+                let _ = std::fs::remove_dir_all(&partial);
+                return Err(bad("unpacks past the size limit".into()));
+            }
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent).map_err(io(parent))?;
+            }
+            let mut to = std::fs::File::create(&out).map_err(io(&out))?;
+            let copied = {
+                use std::io::Read;
+                std::io::copy(&mut (&mut entry).take(left + 1), &mut to)
+                    .map_err(|e| bad(format!("{name}: {e}")))?
+            };
+            if copied > left {
+                let _ = std::fs::remove_dir_all(&partial);
+                return Err(bad("unpacks past the size limit".into()));
+            }
+            left -= copied;
+        }
+        // Another session may have unpacked the same package meanwhile: keep theirs.
+        if std::fs::rename(&partial, &root).is_err() {
+            let _ = std::fs::remove_dir_all(&partial);
+            if !root.is_dir() {
+                return Err(bad(
+                    "could not move the unpacked package into the cache".into()
+                ));
+            }
+        }
+    }
+    let manifest = resolve_ci(&root, "manifest.xml")
+        .filter(|p| p.is_file())
+        .and_then(|p| std::fs::read(p).ok())
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    let mut addins = Vec::new();
+    let addins_dir = join_ci(&root, "Contents/addins");
+    if let Ok(rd) = std::fs::read_dir(&addins_dir) {
+        let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        dirs.retain(|p| p.is_dir());
+        dirs.sort();
+        for dir in dirs {
+            let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+            let mut addin = crate::install::addin_from_manifest(&manifest, dir, name.clone());
+            // A package with several add-ins has one manifest item each; ours reads the
+            // first, so the others go by their folder's name with the first one's settings.
+            if !addin.uid.eq_ignore_ascii_case(&name) && !addins.is_empty() {
+                addin.uid = name;
+            }
+            // Listing the package is the player's way of enabling it.
+            addin.enabled = true;
+            addins.push(addin);
+        }
+    }
+    let override_dir =
+        Some(join_ci(&root, "Contents/packages/core/override")).filter(|d| d.is_dir());
+    Ok(Dazip {
+        root,
+        addins,
+        override_dir,
+        problems,
+    })
+}
+
+/// The add-ins packaged in the `.dazip` files of the list in effect, unpacked on first use. A
+/// package that cannot be unpacked is skipped here and reported when the list is mounted.
+pub fn default_list_addins() -> Vec<AddIn> {
+    let Some(list_file) = default_list_file() else {
+        return Vec::new();
+    };
+    ModList::load(&list_file).dazip_addins(&cache_dir())
+}
+
+impl ModList {
+    /// The add-ins of every `.dazip` in the list, unpacked into `cache`.
+    pub fn dazip_addins(&self, cache: &Path) -> Vec<AddIn> {
+        self.entries
+            .iter()
+            .filter(|e| {
+                e.path.is_file()
+                    && e.path
+                        .extension()
+                        .is_some_and(|x| x.eq_ignore_ascii_case("dazip"))
+            })
+            .filter_map(|e| unpack_dazip(&e.path, cache).ok())
+            .flat_map(|d| d.addins)
+            .collect()
+    }
 }
 
 /// The list file in effect: `THEDAS_MODS` when set, else `mods.txt` in the data folder. `None`
@@ -338,7 +570,7 @@ pub fn mount_default(vfs: &mut Vfs, user: Option<&Path>) -> Vec<Mounted> {
             inner: None,
         };
         let mut problems = Vec::new();
-        if let Err(e) = mount_entry(&mut overlay, &entry, &mut problems) {
+        if let Err(e) = mount_entry(&mut overlay, &entry, &cache_dir(), &mut problems) {
             problems.push(e.to_string());
         }
         for p in problems {
@@ -523,6 +755,78 @@ mod tests {
         assert_eq!(report[0].layers, 0);
         assert_eq!(report[0].problems.len(), 1);
         assert!(overlay.is_empty());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_dazip_is_unpacked_once_into_the_cache_and_split_into_add_in_and_override() {
+        let base = scratch("dazip");
+        let cache = base.join("cache");
+        let package = base.join("My Mod (v1).dazip");
+        let manifest = br#"<Manifest Type="AddIn"><AddInsList><AddInItem UID="my_mod"
+            Name="My Mod" ExtendedModuleUID="Single Player" Priority="77" Enabled="0">"#;
+        zip_of(
+            &package,
+            &[
+                ("Manifest.xml", manifest),
+                ("Contents/addins/my_mod/core/data/my_item.uti", b"item"),
+                ("Contents/addins/my_mod/module/data/my_area.are", b"area"),
+                (
+                    "Contents/packages/core/override/sub/face.dds",
+                    b"dazip face",
+                ),
+                ("../escape.txt", b"no"),
+                ("Contents/../../escape2.txt", b"no"),
+            ],
+        );
+        let d = unpack_dazip(&package, &cache).unwrap();
+        assert!(d.root.starts_with(&cache));
+        assert_eq!(d.problems.len(), 2, "{:?}", d.problems);
+        assert!(!base.join("escape.txt").exists() && !cache.join("escape.txt").exists());
+        assert!(!base.join("escape2.txt").exists());
+        assert_eq!(d.addins.len(), 1);
+        let a = &d.addins[0];
+        assert_eq!(
+            (a.uid.as_str(), a.priority, a.enabled),
+            ("my_mod", 77, true)
+        );
+        assert!(a.extends_base_campaign());
+        assert_eq!(
+            std::fs::read(a.dir.join("core/data/my_item.uti")).unwrap(),
+            b"item"
+        );
+        assert!(d.override_dir.is_some());
+
+        // Unpacked once: a second call reuses the folder, even with the package gone bad.
+        let marker = d.root.join("marker");
+        std::fs::write(&marker, b"x").unwrap();
+        let again = unpack_dazip(&package, &cache).unwrap();
+        assert_eq!(again.root, d.root);
+        assert!(marker.exists() && again.problems.is_empty());
+
+        // In a list: its override files are a mod layer; its add-ins are handed out apart.
+        let list = ModList::parse("My Mod (v1).dazip\n", &base);
+        let mut overlay = Vfs::new();
+        let report = list.mount_with_cache(&mut overlay, &cache);
+        assert_eq!(report[0].layers, 1);
+        assert_eq!(overlay.read("face.dds").unwrap().0, b"dazip face");
+        assert!(overlay.lookup("my_item.uti").is_none());
+        let label = &overlay.layers()[0].label;
+        assert!(label.starts_with("mod:My_Mod__v1_-"), "{label}");
+        assert!(
+            label.ends_with("/Contents/packages/core/override"),
+            "{label}"
+        );
+        let addins = list.dazip_addins(&cache);
+        assert_eq!(addins.len(), 1);
+        assert_eq!(addins[0].dir, a.dir);
+
+        // Not a zip at all: reported, nothing mounted, nothing left in the cache.
+        write(&base, "broken.dazip", b"junk");
+        let mut overlay = Vfs::new();
+        let report = ModList::parse("broken.dazip\n", &base).mount_with_cache(&mut overlay, &cache);
+        assert_eq!((report[0].layers, report[0].problems.len()), (0, 1));
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
         std::fs::remove_dir_all(&base).unwrap();
     }
 }
