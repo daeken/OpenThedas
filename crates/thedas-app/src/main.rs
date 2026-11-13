@@ -4162,6 +4162,21 @@ fn main() -> Result<()> {
     if args.control.is_some() || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some() {
         upload::set_automated();
     }
+    // A newer build an update fetched takes over from the one the player started.
+    if args.capture.is_none() && args.check_report.is_none() {
+        if let Some(exe) = update::newest_build() {
+            match std::process::Command::new(&exe)
+                .args(std::env::args_os().skip(1))
+                .spawn()
+            {
+                Ok(_) => {
+                    log::info!("update: handing over to {}", exe.display());
+                    return Ok(());
+                }
+                Err(e) => log::warn!("update: {} did not start: {e}", exe.display()),
+            }
+        }
+    }
     if let Some(secs) = args.pad_probe {
         paddev::probe(secs);
         return Ok(());
