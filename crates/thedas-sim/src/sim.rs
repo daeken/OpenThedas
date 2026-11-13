@@ -10,6 +10,7 @@
 //! and the command executor, which completes commands as soon as it reaches them (waits last
 //! their duration) and then sends `COMMAND_COMPLETE`.
 
+use crate::fmath::DetMath;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -374,7 +375,7 @@ pub const FORMATION: [[f32; 2]; 11] = [
 /// Provisional: slots past the table (the exe picks a random point within 4 m) take its last.
 pub fn behind(p: [f32; 3], facing: f32, k: usize) -> [f32; 3] {
     let heading = crate::world::heading_of(facing).to_radians();
-    let (fx, fy) = (heading.cos(), heading.sin());
+    let (fx, fy) = (heading.dcos(), heading.dsin());
     // The leader's right: forward turned a quarter turn clockwise.
     let (rx, ry) = (fy, -fx);
     let [x, y] = FORMATION[k.min(FORMATION.len() - 1)];
@@ -454,7 +455,7 @@ const MELEE_GAP_AT_SLOT: f32 = 1.25;
 
 /// The ring slot nearest the bearing from `centre` to `p`.
 fn melee_slot_toward(centre: [f32; 3], p: [f32; 3]) -> i32 {
-    let deg = (p[1] - centre[1]).atan2(p[0] - centre[0]).to_degrees();
+    let deg = (p[1] - centre[1]).datan2(p[0] - centre[0]).to_degrees();
     (deg / MELEE_RING_STEP_DEG).round() as i32
 }
 
@@ -469,7 +470,7 @@ fn melee_slot_span(target: f32, attacker: f32) -> i32 {
     let w = attacker * ring / d;
     let half = (MELEE_RING_STEP_DEG / 2.0).to_radians();
     let mut k = 1;
-    while k < MELEE_RING_SLOTS / 2 && 2.0 * ring * (k as f32 * half).sin() < w {
+    while k < MELEE_RING_SLOTS / 2 && 2.0 * ring * (k as f32 * half).dsin() < w {
         k += 1;
     }
     k
@@ -1408,7 +1409,7 @@ impl Sim {
                 } else {
                     (1.0, 0.0)
                 };
-                h.cos() * dx + h.sin() * dy >= 0.0
+                h.dcos() * dx + h.dsin() * dy >= 0.0
             }
             _ => false,
         };
@@ -2324,7 +2325,7 @@ impl Sim {
                         let r = k as f32 * 0.05;
                         for a in 0..16 {
                             let t = a as f32 * std::f32::consts::TAU / 16.0;
-                            let q = [eye[0] + r * t.cos(), eye[1] + r * t.sin(), eye[2]];
+                            let q = [eye[0] + r * t.dcos(), eye[1] + r * t.dsin(), eye[2]];
                             if !inside(q) {
                                 eye = q;
                                 break 'out;
@@ -2790,7 +2791,7 @@ impl Sim {
         let ring = reach;
         let at = |slot: i32| {
             let ang = (slot as f32 * MELEE_RING_STEP_DEG).to_radians();
-            [b[0] + ring * ang.cos(), b[1] + ring * ang.sin(), b[2]]
+            [b[0] + ring * ang.dcos(), b[1] + ring * ang.dsin(), b[2]]
         };
         let slot = (0..=MELEE_RING_SLOTS / 2)
             .flat_map(|k| [k, -k])
@@ -2811,7 +2812,7 @@ impl Sim {
             None => {
                 let ang = (base as f32 * MELEE_RING_STEP_DEG).to_radians();
                 let r = ring + 2.0 * mine + 0.3;
-                let p = [b[0] + r * ang.cos(), b[1] + r * ang.sin(), b[2]];
+                let p = [b[0] + r * ang.dcos(), b[1] + r * ang.dsin(), b[2]];
                 let walk = crate::engine::dist(a, p);
                 if walk < 0.3 {
                     Approach::Wait(a)
@@ -3130,7 +3131,7 @@ impl Sim {
                                 (dx / len, dy / len)
                             } else {
                                 let h = crate::world::heading_of(facing).to_radians();
-                                (-h.cos(), -h.sin())
+                                (-h.dcos(), -h.dsin())
                             };
                             let to = [t[0] + dx * away, t[1] + dy * away, p[2]];
                             cmd.location = Some(crate::world::Location {
@@ -3686,7 +3687,7 @@ impl Sim {
             float(inst, "ZPosition"),
         ];
         // Rotation about Z from the quaternion, in degrees.
-        o.facing = (2.0 * q[2].atan2(q[3])).to_degrees().rem_euclid(360.0);
+        o.facing = (2.0 * q[2].datan2(q[3])).to_degrees().rem_euclid(360.0);
         if let Some(a) = int(inst, "Active") {
             o.active = a != 0;
         }
@@ -5370,8 +5371,8 @@ mod tests {
             let o = s.world.get(walker).unwrap();
             assert!(o.position[0] * dx >= 0.0 && o.position[1] * dy >= 0.0);
             let h = crate::world::heading_of(o.facing).to_radians();
-            let want = dy.atan2(dx);
-            let off = (h - want).sin().abs() + (1.0 - (h - want).cos());
+            let want = dy.datan2(dx);
+            let off = (h - want).dsin().abs() + (1.0 - (h - want).dcos());
             assert!(off < 1e-3, "walking ({dx}, {dy}): facing {}", o.facing);
         }
         // Along a route, the leg it is on: east, then north.
@@ -5661,7 +5662,7 @@ mod tests {
             let c = s.world.spawn(ObjectKind::Creature, "crowd");
             let o = s.world.get_mut(c).unwrap();
             o.area = Some(area);
-            o.position = [ring * ang.cos(), ring * ang.sin(), 0.0];
+            o.position = [ring * ang.dcos(), ring * ang.dsin(), 0.0];
             o.commands.push(Command {
                 ty: 7,
                 name: "CommandAttack".into(),

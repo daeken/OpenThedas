@@ -58,6 +58,7 @@
 //! no motion track stands at its base; a camera with no field-of-view track sees 45°; a
 //! missing transition is linear.
 
+use crate::fmath::DetMath;
 use thedas_formats::Gff4;
 use thedas_formats::gff4::{StructId, Value};
 
@@ -588,7 +589,7 @@ fn value_noise(
             };
             let along = (t - k as f32 * period) / period;
             // 0xa3c0c0: a cosine ease from one value to the next.
-            let f = (1.0 - (along * std::f32::consts::PI).cos()) * 0.5;
+            let f = (1.0 - (along * std::f32::consts::PI).dcos()) * 0.5;
             *sample += (a * (1.0 - f) + b * f) * amplitude;
         }
     }
@@ -603,7 +604,7 @@ fn blurred_noise(seed: i32, width: usize, count: usize) -> Vec<f32> {
             let sum: f32 = (0..2 * width)
                 .map(|j| {
                     let x = (width as f32 - j as f32) / width as f32;
-                    (-x * x).exp() * raw[i + j]
+                    (-x * x).dexp() * raw[i + j]
                 })
                 .sum();
             sum / (2 * width) as f32
@@ -662,7 +663,7 @@ impl ShakeTrack {
             1 => value_noise(seed, frequency, smooth, 0.0, 0, seconds, count),
             2 => {
                 let octaves =
-                    (((SHAKE_RATE / frequency).ln() / 2f32.ln()) as i32 + 1).clamp(3, 100);
+                    (((SHAKE_RATE / frequency).dln() / 2f32.dln()) as i32 + 1).clamp(3, 100);
                 value_noise(
                     seed,
                     frequency,
@@ -979,7 +980,7 @@ impl Actor {
         {
             pose.position = at;
             pose.rotation = match j.look_at.as_deref().and_then(place) {
-                Some((to, _)) if (to[0] - at[0]).hypot(to[1] - at[1]) > 1e-6 => {
+                Some((to, _)) if (to[0] - at[0]).dhypot(to[1] - at[1]) > 1e-6 => {
                     let f = crate::world::facing_toward(to[0] - at[0], to[1] - at[1]);
                     Placement::facing([0.0; 3], f).rotation
                 }
@@ -1068,7 +1069,7 @@ impl Placement {
     /// Placed at `position`, turned `facing` degrees about Z (0x4cbc40's quaternion of the
     /// angle 0x4ee570 takes from a direction).
     pub fn facing(position: [f32; 3], facing: f32) -> Placement {
-        let (s, w) = (facing.to_radians() * 0.5).sin_cos();
+        let (s, w) = (facing.to_radians() * 0.5).dsin_cos();
         Placement {
             position,
             rotation: [0.0, 0.0, s, w],
@@ -1733,7 +1734,7 @@ fn normalize(q: [f32; 4]) -> [f32; 4] {
 /// then X by `b`, then Y by `c`.
 pub fn euler_zxy(a: f32, b: f32, c: f32) -> [f32; 4] {
     let about = |axis: [f32; 3], degrees: f32| {
-        let (s, w) = (degrees.to_radians() * 0.5).sin_cos();
+        let (s, w) = (degrees.to_radians() * 0.5).dsin_cos();
         [axis[0] * s, axis[1] * s, axis[2] * s, w]
     };
     mul(
@@ -1820,7 +1821,7 @@ mod tests {
         let v = rotate(euler_zxy(90.0, 30.0, 0.0), [0.0, 1.0, 0.0]);
         let s = 30f32.to_radians();
         assert!(
-            (v[0] + s.cos()).abs() < 1e-5 && (v[2] - s.sin()).abs() < 1e-5,
+            (v[0] + s.dcos()).abs() < 1e-5 && (v[2] - s.dsin()).abs() < 1e-5,
             "{v:?}"
         );
     }

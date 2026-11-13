@@ -8,6 +8,7 @@
 //! are accepted as no-ops: the simulation is headless and presentation reads it, never the
 //! other way round.
 
+use crate::fmath::DetMath;
 use thedas_formats::gda::Cell;
 use thedas_script::ldf::{Function, Type};
 use thedas_script::vm::{OBJECT_INVALID, ObjectId, Value, VmResult};
@@ -232,7 +233,7 @@ fn in_shape(sim: &Sim, id: ObjectId, shape: i32, l: &Location, fa: f32, fb: f32)
             }
             let heading = (l.facing + 90.0).to_radians();
             let half = (fa * 0.5).to_radians();
-            let edge = |a: f32| [a.cos() * fb, a.sin() * fb];
+            let edge = |a: f32| [a.dcos() * fb, a.dsin() * fb];
             let (left, right) = (edge(heading + half), edge(heading - half));
             let cross = |e: [f32; 2]| e[0] * py - e[1] * px;
             if cross(right) >= 0.0 && cross(left) <= 0.0 {
@@ -606,14 +607,14 @@ pub fn call(
         "fabs" => ok(Value::Float(float(a, 0).abs())),
         "sqrt" => ok(Value::Float(float(a, 0).max(0.0).sqrt())),
         // Radians, per script.ldf; out-of-domain inputs are clamped rather than giving NaN.
-        "sin" => ok(Value::Float(float(a, 0).sin())),
-        "cos" => ok(Value::Float(float(a, 0).cos())),
-        "tan" => ok(Value::Float(float(a, 0).tan())),
-        "asin" => ok(Value::Float(float(a, 0).clamp(-1.0, 1.0).asin())),
-        "acos" => ok(Value::Float(float(a, 0).clamp(-1.0, 1.0).acos())),
-        "atan" => ok(Value::Float(float(a, 0).atan())),
-        "log" => ok(Value::Float(float(a, 0).max(f32::MIN_POSITIVE).ln())),
-        "pow" => ok(Value::Float(float(a, 0).powf(float(a, 1)))),
+        "sin" => ok(Value::Float(float(a, 0).dsin())),
+        "cos" => ok(Value::Float(float(a, 0).dcos())),
+        "tan" => ok(Value::Float(float(a, 0).dtan())),
+        "asin" => ok(Value::Float(float(a, 0).clamp(-1.0, 1.0).dasin())),
+        "acos" => ok(Value::Float(float(a, 0).clamp(-1.0, 1.0).dacos())),
+        "atan" => ok(Value::Float(float(a, 0).datan())),
+        "log" => ok(Value::Float(float(a, 0).max(f32::MIN_POSITIVE).dln())),
+        "pow" => ok(Value::Float(float(a, 0).dpowf(float(a, 1)))),
         "Random" => ok(Value::Int(h.sim.world.rng.below(int(a, 0)))),
         "RandomFloat" => ok(Value::Float(h.sim.world.rng.unit())),
         "Vector" => ok(Value::Vector([float(a, 0), float(a, 1), float(a, 2)])),
@@ -622,12 +623,12 @@ pub fn call(
         // atan2(-x, y) in degrees, -180 to 180 (0x4ee570).
         "AngleToVector" => {
             let r = -(float(a, 0) as f64) * DEG_TO_RAD;
-            ok(Value::Vector([r.sin() as f32, r.cos() as f32, 0.0]))
+            ok(Value::Vector([r.dsin() as f32, r.dcos() as f32, 0.0]))
         }
         "VectorToAngle" => {
             let v = vector(a, 0);
             let (x, y) = (-(v[0] as f64), v[1] as f64);
-            ok(Value::Float((x.atan2(y) * RAD_TO_DEG) as f32))
+            ok(Value::Float((x.datan2(y) * RAD_TO_DEG) as f32))
         }
         // "%f %f %f" (0x64f9d0).
         "VectorToString" => {
@@ -4508,7 +4509,7 @@ pub fn in_trigger(p: [f32; 3], trigger: &crate::world::Object) -> bool {
         return false;
     }
     let (dx, dy) = (p[0] - trigger.position[0], p[1] - trigger.position[1]);
-    let (s, c) = (-trigger.facing.to_radians()).sin_cos();
+    let (s, c) = (-trigger.facing.to_radians()).dsin_cos();
     let local = [dx * c - dy * s, dx * s + dy * c, p[2]];
     inside(local, &trigger.geometry)
 }
