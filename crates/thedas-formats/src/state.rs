@@ -485,6 +485,45 @@ mod tests {
     }
 
     #[test]
+    fn alpha_blends_on_its_own_when_the_state_separates_it() {
+        let xml = r#"<MaterialState Name="Mask">
+  <DeviceState State="DS_ALPHABLENDENABLE" Value="TRUE" />
+  <DeviceState State="DS_SRCBLEND" Value="BLEND_DESTALPHA" />
+  <DeviceState State="DS_DESTBLEND" Value="BLEND_INVDESTALPHA" />
+  <DeviceState State="DS_SEPARATEALPHABLENDENABLE" Value="TRUE" />
+  <DeviceState State="DS_SRCBLENDALPHA" Value="BLEND_DESTALPHA" />
+  <DeviceState State="DS_DESTBLENDALPHA" Value="BLEND_ZERO" />
+  <DeviceState State="DS_BLENDOPALPHA" Value="BLENDOP_ADD" />
+</MaterialState>"#;
+        let p = MaterialState::parse(xml.as_bytes())
+            .unwrap()
+            .pass()
+            .unwrap();
+        assert_eq!(
+            p.blend,
+            Some((
+                BlendFactor::DestAlpha,
+                BlendFactor::InvDestAlpha,
+                BlendOp::Add
+            ))
+        );
+        assert_eq!(
+            p.blend_alpha,
+            Some((BlendFactor::DestAlpha, BlendFactor::Zero, BlendOp::Add))
+        );
+        // Not separated: alpha goes as colour does.
+        let joined = xml.replace(
+            r#"<DeviceState State="DS_SEPARATEALPHABLENDENABLE" Value="TRUE" />"#,
+            "",
+        );
+        let p = MaterialState::parse(joined.as_bytes())
+            .unwrap()
+            .pass()
+            .unwrap();
+        assert_eq!(p.blend_alpha, None);
+    }
+
+    #[test]
     fn reads_pass_and_sampler_state() {
         let st = MaterialState::parse(PUNCH.as_bytes()).unwrap();
         let p = st.pass().unwrap();
