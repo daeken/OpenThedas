@@ -93,7 +93,7 @@ pub fn stats(install: &Path, report: Option<&Path>) -> Result<()> {
     let mut vm_fail: BTreeMap<String, (u64, String)> = BTreeMap::new();
     for path in inst.all_archives()? {
         let Ok(erf) = Erf::open(&path) else { continue };
-        if erf.is_encrypted() {
+        if erf.is_encrypted() && erf.installed_key().is_none() {
             continue;
         }
         for e in &erf.entries {

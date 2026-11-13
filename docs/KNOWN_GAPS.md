@@ -146,7 +146,8 @@ these, so they are the places where one person or stream can take a large, separ
 
 - **Movies need an external `ffmpeg`**, and on Windows it is never found (`CAM-029`,
   `CAM-030`).
-- **Encrypted downloadable content cannot be read**; no key is ever supplied (`FMT-001`).
+- **DLC key discovery covers the tested GOG Ultimate Edition layout.** Other executable layouts
+  and entitlement sources remain unverified (`FMT-001`, `FMT-002`).
 - **Only the base campaign can be played.** Awakening, DLC campaigns and toolset modules cannot
   be selected (`FMT-014`).
 - **Windows and Linux are untested**, continuous integration is switched off, there is no

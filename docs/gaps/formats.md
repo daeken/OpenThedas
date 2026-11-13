@@ -6,9 +6,10 @@ Readers and writers for the game's resource types, archives, DLC, mods and saves
 
 ## Tables and resource types measured against a real install
 
-Gathered 2026-11-12 at main `1eb844a` from a listing of every archive (59,004 entries), a full
-`thedas corpus` run (pass; 563,593 entries read, 45,962 encrypted DLC entries unread) and a
-search of the code. Names and counts only.
+The inventory below is from 2026-11-12 at main `1eb844a`. That run counted 563,593 entries,
+including 45,962 encrypted DLC entries it skipped. The later GOG key recovery check read
+all 563,593 entries with zero skips and zero read errors. The inventory counts still
+reflect the earlier run.
 
 ### Tables
 
@@ -94,7 +95,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 
 | Type | Reader | Writer | Consumer | Notes |
 | --- | --- | --- | --- | --- |
-| `.erf` V2.0/V2.1/V2.2/V3.0 | yes | no (test helper only) | yes (vfs) | XOR and DA2 Blowfish encryption, LZMA and LZX compression unsupported |
+| `.erf` V2.0/V2.1/V2.2/V3.0 | yes | no (test helper only) | yes (vfs) | GOG DLC passwords recovered locally. XOR and DA2 Blowfish accept explicit passwords. LZMA and LZX unsupported |
 | `.rim` | yes (ERF V2.0) | no | yes | |
 | GFF4 (generic) | yes (V4.0, V4.1) | yes | yes | PC platform only |
 | GFF3 (generic) | yes (V3.2) | yes | yes | strings raw bytes |
@@ -145,8 +146,24 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 
 ### Archives and encryption
 
-- **FMT-001** **DLC keys are never supplied.** Original: decrypts DLC ERF V2.2 (where it gets the password is open, per comment). Ours: `push_archive` always passes no key; encrypted DLC resources are unreadable and lookups fall through to lower layers. Evidence: `crates/thedas-vfs/src/crypto.rs:5`, `crates/thedas-vfs/src/vfs.rs:249`. Size: L. Depends: none. Kind: missing.
-- **FMT-002** **XOR and DA2 Blowfish encryption unsupported.** Original: ERF encryption types 1 and 3. Ours: returned as `Encrypted`. Evidence: `crates/thedas-vfs/src/erf.rs:40`, `crates/thedas-vfs/src/erf.rs:460`. Size: M. Depends: none. Kind: missing.
+- **FMT-001** **GOG DLC passwords recovered.** In the tested GOG Ultimate Edition executable
+  (SHA-256 `2346caee611002d4dff6ecef68eb315b63a37004dd98b39c11a9c26c0b45bfb3`), the
+  routine at RVA `0x87840` selects an encoded string by ERF module ID. The character
+  conversion at RVA `0x8843a` is `(character - 'A') / 2`. The reader uses the jump table
+  at RVA `0x884f8` in the user's local executable and accepts the password when its
+  digest matches the archive. All 377 encrypted archives in that install matched across
+  24 module IDs. The Rust reader matched original x86 Blowfish output on one shipped
+  resource per module. The full `thedas corpus` run on macOS arm64 opened 10,652 archives
+  and reported zero encrypted skips and zero read errors. Other executable layouts and
+  the original entitlement fallback remain unverified.
+- **FMT-002** **Type 1 XOR and type 3 Blowfish readers implemented.** Type 1 takes the
+  same decimal password as DA:O Blowfish. Its nine-byte XOR cycle was checked by
+  executing the original DA:O instructions at RVA `0xeefe0` with a synthetic key.
+  DA2 type 3 takes raw key bytes and verifies the MD5 of the Blowfish ECB encryption
+  of bytes 0 through 255. The type 3 implementation follows
+  [xoreos's format description](https://github.com/xoreos/xoreos/blob/master/src/aurora/erffile.cpp#L198)
+  and was checked against an independent synthetic vector. Shipped type 1 and type 3
+  archives and automatic DA2 key discovery remain open.
 - **FMT-003** **LZMA and Xbox LZX compression unsupported.** Original: compression codes 2 and 3. Ours: `UnsupportedCompression`. Evidence: `crates/thedas-vfs/src/erf.rs:490`. Size: M. Depends: none. Kind: missing.
 - **FMT-004** **ERF V3.0 hash-only entries cannot be looked up.** Original: DA2 archives index by FNV hash. Ours: entries without a stored name are left out of the index. Evidence: `crates/thedas-vfs/src/vfs.rs:96`. Size: M. Depends: none. Kind: missing.
 - **FMT-005** **No ERF/RIM writer.** Original: n/a (mod packing). Ours: archives are read-only; the only writer is a test fixture. Evidence: `crates/thedas-vfs/src/erf.rs:584`. Size: M. Depends: none. Kind: missing.
@@ -205,7 +222,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 ### Console and Dragon Age II
 
 - **FMT-045** **Console data rejected.** Original: console versions' data. Ours: GFF4 non-PC platforms error; LZX unsupported (FMT-003); FSB console codecs refused (AUD-059). Evidence: `crates/thedas-formats/src/gff4.rs:383`. Size: L. Depends: FMT-003, AUD-059. Kind: missing.
-- **FMT-046** **Dragon Age II formats.** Original: Dragon Age II archive and format differences. Ours: ERF V3.0 and GFF4 V4.1 read and write; DA2 encryption (FMT-002), hash-only names (FMT-004) and every DA2-specific typed format have no code. Evidence: `crates/thedas-vfs/src/erf.rs:8`, `crates/thedas-formats/src/gff4.rs:1`. Size: L. Depends: FMT-002, FMT-004. Kind: missing.
+- **FMT-046** **Dragon Age II formats.** Original: Dragon Age II archive and format differences. Ours: ERF V3.0 and GFF4 V4.1 read and write; DA2 encryption accepts an explicit key (FMT-002). Hash-only names (FMT-004) and DA2-specific typed formats remain unsupported. Evidence: `crates/thedas-vfs/src/erf.rs:8`, `crates/thedas-formats/src/gff4.rs:1`. Size: L. Depends: FMT-002, FMT-004. Kind: missing.
 
 ### Checked and looks complete
 
