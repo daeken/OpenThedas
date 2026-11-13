@@ -70,9 +70,15 @@ pub struct Semantic {
 
 /// The inter-stage location for a semantic. Texture coordinates 0..7 map to 0..7, colours to
 /// 8 and 9, fog to 10, and a few other usages vertex shaders pass through to 11..15.
+///
+/// There are no more locations than these (a device offers 16, or 15), so texture
+/// coordinates 8 to 11, which Dragon Age II's shaders pass, share the last usages' places
+/// from the top down (8 with a second position's, 9 with the binormal's, 10 with the
+/// tangent's, 11 with the normal's). A shader that passes both of a pair is refused.
 pub fn location_of(s: Semantic) -> Option<u32> {
     Some(match (s.usage, s.index) {
         (Usage::TexCoord, i) if i < 8 => i as u32,
+        (Usage::TexCoord, i) if i < 12 => 22 - i as u32,
         (Usage::Color, i) if i < 2 => 8 + i as u32,
         (Usage::Fog, 0) => 10,
         (Usage::Normal, 0) => 11,
@@ -1278,8 +1284,13 @@ fn vertex_interface(g: &mut Gen) -> Result<(String, String, String, String)> {
             continue;
         }
         let _ = writeln!(decls, "var<private> {name}: vec4<f32>;");
-        if let Some(l) = location_of(sem) {
-            outs.insert(l, (name, sem));
+        if let Some(l) = location_of(sem)
+            && let Some((_, other)) = outs.insert(l, (name, sem))
+            && other != sem
+        {
+            return Err(unsupported(format!(
+                "vertex outputs {other:?} and {sem:?} share location {l}"
+            )));
         }
     }
     if !have_pos {
@@ -1526,6 +1537,52 @@ mod tests {
         assert_eq!(tr.interface.samplers, vec![(0, TextureType::Tex2D)]);
         assert_eq!(tr.interface.inputs[0].location, 0);
         assert_eq!(tr.interface.color_outputs, vec![0]);
+    }
+
+    #[test]
+    fn texture_coordinates_past_the_eighth_share_the_last_locations() {
+        let pixel = |second: u32| {
+            let mut t = vec![0xFFFF_0300];
+            t.extend([ins(31, 2), 0x8000_0005 | (8 << 16), dst(1, 0, 0xf)]); // dcl_texcoord8 v0
+            t.extend([ins(31, 2), second, dst(1, 1, 0xf)]); // v1
+            // add oC0, v0, v1
+            t.extend([
+                ins(2, 3),
+                dst(8, 0, 0xf),
+                src(1, 0, XYZW, 0),
+                src(1, 1, XYZW, 0),
+            ]);
+            t.push(0xFFFF);
+            translate(&assemble_tokens(&t), &Options::default())
+        };
+        // Texture coordinates 8 and 9: the places of a second position and the binormal.
+        let tr = pixel(0x8000_0005 | (9 << 16)).unwrap_or_else(|e| panic!("{e}"));
+        let at: Vec<u32> = tr.interface.inputs.iter().map(|i| i.location).collect();
+        assert_eq!(at, [14, 13]);
+        assert!(tr.wgsl.contains("@location(14)"), "{}", tr.wgsl);
+        // Texture coordinate 8 with a second position: one place for two values.
+        let e = pixel(0x8000_0000 | (1 << 16)).err().expect("refused");
+        assert!(e.to_string().contains("share location 14"), "{e}");
+
+        // A vertex shader likewise.
+        let vertex = |second: u32| {
+            let mut t = vec![0xFFFE_0300];
+            t.extend([ins(31, 2), 0x8000_0000, dst(1, 0, 0xf)]); // dcl_position v0
+            t.extend([ins(31, 2), 0x8000_0000, dst(6, 0, 0xf)]); // dcl_position o0
+            t.extend([ins(31, 2), 0x8000_0005 | (9 << 16), dst(6, 1, 0xf)]); // dcl_texcoord9 o1
+            t.extend([ins(31, 2), second, dst(6, 2, 0xf)]); // o2
+            for o in 0..3 {
+                t.extend([ins(1, 2), dst(6, o, 0xf), src(1, 0, XYZW, 0)]); // mov o#, v0
+            }
+            t.push(0xFFFF);
+            translate(&assemble_tokens(&t), &Options::default())
+        };
+        let tr = vertex(0x8000_0005 | (8 << 16)).unwrap_or_else(|e| panic!("{e}"));
+        let mut at: Vec<u32> = tr.interface.outputs.iter().map(|o| o.location).collect();
+        at.sort_unstable();
+        assert_eq!(at, [13, 14]);
+        let e = vertex(0x8000_0007).err().expect("refused"); // dcl_binormal o2
+        assert!(e.to_string().contains("share location 13"), "{e}");
     }
 
     #[test]

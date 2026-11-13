@@ -880,6 +880,16 @@ fn expand_vertices(mesh: &SceneMesh, inputs: &[IoSlot]) -> Vec<f32> {
                 out.extend_from_slice(&p.get(v).copied().unwrap_or([0.0, 0.0, 0.0, 1.0]));
                 continue;
             }
+            // Dragon Age II's lighting baked per vertex: its three colours are texture
+            // coordinates 1, 2 and 3 (`static_static_p1.vsh`). Provisional: the bytes are
+            // taken in the order stored, as red, green, blue.
+            if let (DeclUsage::TexCoord, i @ 1..=3, Some(light)) =
+                (usage, slot.semantic.index, mesh.vertex_light.as_ref())
+            {
+                let c = light.get(v).map_or([0; 4], |l| l[i as usize - 1]);
+                out.extend_from_slice(&c.map(|b| f32::from(b) / 255.0));
+                continue;
+            }
             let value = c
                 .element(usage, slot.semantic.index as u32)
                 .and_then(|e| {

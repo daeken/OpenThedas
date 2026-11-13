@@ -60,6 +60,9 @@ pub struct SceneMesh {
     pub raw_vertices: Vec<u8>,
     /// Positions that replace the raw stream's (a head morph's face), one per vertex.
     pub positions: Option<Vec<[f32; 4]>>,
+    /// Dragon Age II's lighting baked per vertex, one entry per vertex: the three colours
+    /// its vertex shaders for such lighting read as texture coordinates 1, 2 and 3.
+    pub vertex_light: Option<Vec<[[u8; 4]; 3]>>,
 }
 
 /// A material object resolved down to its material definition.
@@ -693,34 +696,63 @@ impl AreaScene {
     }
 }
 
-/// The lightmap a room binds to a model's mesh piece: the piece's lightmap id (`_7u`), and
-/// its place among the model's mesh pieces.
+/// The baked lighting a room binds to a model's mesh piece.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PieceLight<'a> {
+    /// A region of a lightmap.
+    Map(&'a LightmapBinding),
+    /// Dragon Age II's lighting per vertex: the `.vlm` resource (named without the
+    /// extension) of three colours a vertex.
+    Vertices(&'a str),
+}
+
+/// The baked lighting a room binds to a model's mesh piece, found by the piece's lightmap
+/// id (`_7u`) and its place among the model's `count` mesh pieces.
 ///
 /// Dragon Age: Origins binds by the id. Dragon Age II's rooms give a number instead, and its
-/// props' pieces have no id: the number is taken as the piece's place (a prop of three
-/// pieces is bound 0, 1 and 2; a room's own model, of one piece with the id `_0`, is bound
-/// 0). Provisional, from the files.
+/// props' pieces have no id: the number counts the model's pieces from the last (of a
+/// prop's three pieces the first is bound 2 and the last 0; a room's own model, of one
+/// piece with the id `_0`, is bound 0). A Dragon Age II binding named `VX…`, without an
+/// extension, is not a lightmap but the piece's lighting per vertex.
 ///
-/// A Dragon Age II binding named `VX…` is not a lightmap: it names the piece's per-vertex
-/// lighting (a `.vlm` file of three colours a vertex), which is not read yet, so such a
-/// piece is drawn without a lightmap (its material's default, an even grey).
-fn lightmap_binding<'a>(
+/// Provisional, from the files: counted so, every per-vertex lighting file of
+/// `lt_backalley_g` has as many entries as its piece has vertices in use, and counted from
+/// the first they do not.
+fn piece_light<'a>(
     bindings: &'a [LightmapBinding],
     id: Option<&str>,
     place: usize,
-) -> Option<&'a LightmapBinding> {
-    let lightmaps = || {
-        bindings.iter().filter(|b| {
-            b.texture.contains('.')
-                || !b
-                    .texture
-                    .get(..2)
-                    .is_some_and(|p| p.eq_ignore_ascii_case("vx"))
-        })
-    };
-    lightmaps()
+    count: usize,
+) -> Option<PieceLight<'a>> {
+    let number = count.checked_sub(place + 1);
+    let b = bindings
+        .iter()
         .find(|b| id.is_some_and(|id| b.chunk.eq_ignore_ascii_case(id)))
-        .or_else(|| lightmaps().find(|b| b.chunk.parse() == Ok(place)))
+        .or_else(|| {
+            bindings
+                .iter()
+                .find(|b| number.is_some_and(|n| b.chunk.parse() == Ok(n)))
+        })?;
+    let per_vertex = !b.texture.contains('.')
+        && b.texture
+            .get(..2)
+            .is_some_and(|p| p.eq_ignore_ascii_case("vx"));
+    Some(if per_vertex {
+        PieceLight::Vertices(&b.texture)
+    } else {
+        PieceLight::Map(b)
+    })
+}
+
+/// A `.vlm` resource's colours: three (the light arriving along each of three directions,
+/// as a lightmap's three textures) of four bytes for each vertex, in the piece's vertex
+/// order, with no header.
+fn vertex_light(data: &[u8]) -> Option<Vec<[[u8; 4]; 3]>> {
+    (data.len() % 12 == 0).then(|| {
+        data.chunks_exact(12)
+            .map(|v| [0, 4, 8].map(|at| [v[at], v[at + 1], v[at + 2], v[at + 3]]))
+            .collect()
+    })
 }
 
 pub fn transform_matrix(t: &Transform) -> Mat4 {
@@ -984,6 +1016,7 @@ impl<'a> Loader<'a> {
             chunk: chunk.clone(),
             raw_vertices: raw,
             positions: None,
+            vertex_light: None,
         })
     }
 
@@ -1568,6 +1601,7 @@ impl<'a> Loader<'a> {
             indices,
             raw_vertices: raw,
             positions: None,
+            vertex_light: None,
         });
         let mesh = self.scene.meshes.len() - 1;
         let draw = self.scene.draws.len();
@@ -1654,6 +1688,7 @@ impl<'a> Loader<'a> {
             indices: (0..count).collect(),
             raw_vertices: raw,
             positions: None,
+            vertex_light: None,
         });
         (self.scene.meshes.len() - 1, ranges)
     }
@@ -1782,6 +1817,7 @@ impl<'a> Loader<'a> {
             indices,
             raw_vertices: raw,
             positions: None,
+            vertex_light: None,
         });
         (self.scene.meshes.len() - 1, ranges)
     }
@@ -1879,6 +1915,7 @@ impl<'a> Loader<'a> {
             indices,
             raw_vertices: raw,
             positions: None,
+            vertex_light: None,
         });
         (self.scene.meshes.len() - 1, ranges)
     }
@@ -1951,6 +1988,7 @@ impl<'a> Loader<'a> {
             indices,
             raw_vertices: Vec::new(),
             positions: None,
+            vertex_light: None,
         });
         self.scene.meshes.len() - 1
     }
@@ -2234,6 +2272,86 @@ impl<'a> Loader<'a> {
         i
     }
 
+    /// Mesh `mesh` and material `material` for a piece whose lighting is baked per vertex
+    /// in the resource `name` (Dragon Age II, see [`PieceLight::Vertices`]): the mesh with
+    /// the colours beside its vertices, and the material drawn with its definition's
+    /// technique for such lighting ([`thedas_formats::bmat::PER_VERTEX`]). Both as given
+    /// when the material has no such technique, the resource does not read, or it has more
+    /// entries than the mesh has vertices; the piece then draws without baked lighting.
+    fn vertex_lit(&mut self, mesh: usize, material: usize, name: &str) -> (usize, usize) {
+        let Some(lit) = self.per_vertex_material(material) else {
+            return (mesh, material);
+        };
+        let name = name.to_ascii_lowercase();
+        let key = format!("{}#{name}", self.scene.meshes[mesh].key);
+        if let Some(i) = self.mesh_index.get(&key) {
+            return i.map_or((mesh, material), |i| (i, lit));
+        }
+        let file = format!("{name}.vlm");
+        let colours = match self.read(&file) {
+            Ok(d) => {
+                // The file lights the vertices the piece's triangles use, which are the
+                // first of its vertices and now and then not all of them; the rest are
+                // never drawn.
+                let n = self.scene.meshes[mesh].vertices.len();
+                let colours = vertex_light(&d)
+                    .filter(|c| !c.is_empty() && c.len() <= n)
+                    .map(|mut c| {
+                        c.resize(n, [[0; 4]; 3]);
+                        c
+                    });
+                if colours.is_none() {
+                    self.warn(format!(
+                        "{file}: {} bytes do not light the {n} vertices of {}",
+                        d.len(),
+                        self.scene.meshes[mesh].key
+                    ));
+                }
+                colours
+            }
+            Err(e) => {
+                self.warn(e.to_string());
+                None
+            }
+        };
+        let index = colours.map(|c| {
+            let mut m = self.scene.meshes[mesh].clone();
+            m.vertex_light = Some(c);
+            m.key = key.clone();
+            self.scene.meshes.push(m);
+            self.scene.meshes.len() - 1
+        });
+        self.mesh_index.insert(key, index);
+        index.map_or((mesh, material), |i| (i, lit))
+    }
+
+    /// Material `base` drawn with the technique for lighting baked per vertex, if its
+    /// definition has one (a compiled material's second form of the semantic).
+    fn per_vertex_material(&mut self, base: usize) -> Option<usize> {
+        let key = format!("#{base}{}", thedas_formats::bmat::PER_VERTEX);
+        if let Some(i) = self.material_index.get(&key) {
+            return *i;
+        }
+        let m = &self.scene.materials[base];
+        let semantic = format!("{}{}", m.semantic, thedas_formats::bmat::PER_VERTEX);
+        let technique = m
+            .definition
+            .as_ref()
+            .and_then(|d| d.select(&semantic, 3, self.scene.detail.name()))
+            .cloned();
+        let lit = technique.map(|t| {
+            let mut m = m.clone();
+            m.technique = Some(t);
+            m
+        });
+        let index = lit.map(|m| {
+            self.scene.materials.push(m);
+            self.scene.materials.len() - 1
+        });
+        self.material_index.insert(key, index);
+        index
+    }
+
     /// A copy of material `base` with textures and vector parameters replaced (a head
     /// morph's, an item tint's), shared by every draw with the same `source`.
     fn overridden_material(
@@ -2461,6 +2579,7 @@ impl<'a> Loader<'a> {
             self.warn(format!("{model_name}.mmh: mesh nodes but no .msh"));
             return rigid;
         };
+        let piece_count = pieces.len();
         for (piece_index, piece) in pieces.into_iter().enumerate() {
             let Some(mut mesh) = self.mesh(&msh_name, &piece.mesh.chunk) else {
                 continue;
@@ -2503,14 +2622,23 @@ impl<'a> Loader<'a> {
                 .chain
                 .iter()
                 .fold(Mat4::IDENTITY, |m, t| m * transform_matrix(t));
-            let lightmap =
-                lightmap_binding(lightmaps, piece.mesh.lightmap_id.as_deref(), piece_index).map(
-                    |b| LightmapRef {
-                        texture: b.texture.to_ascii_lowercase(),
-                        offset: b.offset,
-                        scale: b.scale,
-                    },
-                );
+            let light = piece_light(
+                lightmaps,
+                piece.mesh.lightmap_id.as_deref(),
+                piece_index,
+                piece_count,
+            );
+            let lightmap = match light {
+                Some(PieceLight::Map(b)) => Some(LightmapRef {
+                    texture: b.texture.to_ascii_lowercase(),
+                    offset: b.offset,
+                    scale: b.scale,
+                }),
+                _ => None,
+            };
+            if let Some(PieceLight::Vertices(name)) = light {
+                (mesh, material) = self.vertex_lit(mesh, material, name);
+            }
             let transform = placement * node;
             let skin = (!piece.mesh.bones.is_empty()).then(|| {
                 let skeleton = self.skeleton(model_name, &model);
@@ -3486,8 +3614,9 @@ mod tests {
             binding("_7u", "lvl_room000.dds"),
             binding("_8k", "lvl_room001.dds"),
         ];
-        let texture = |b: &[LightmapBinding], id, place| {
-            lightmap_binding(b, id, place).map(|b| b.texture.clone())
+        let texture = |b: &[LightmapBinding], id, place| match piece_light(b, id, place, 3) {
+            Some(PieceLight::Map(b)) => Some(b.texture.clone()),
+            _ => None,
         };
         assert_eq!(
             texture(&dao, Some("_8K"), 0).as_deref(),
@@ -3495,19 +3624,34 @@ mod tests {
         );
         assert_eq!(texture(&dao, Some("_9z"), 0), None);
         assert_eq!(texture(&dao, None, 1), None);
-        // Dragon Age II: by the piece's place; a `VX` binding is per-vertex lighting.
+        // Dragon Age II: by the piece's place counted from the last; a `VX` binding is
+        // per-vertex lighting.
         let da2 = [
             binding("0", "HLAC_lt_room_1_5"),
             binding("1", "VXlt_room_1n1_0_1"),
             binding("2", "HLAC_lt_room_1_3"),
         ];
+        assert_eq!(texture(&da2, None, 2).as_deref(), Some("HLAC_lt_room_1_5"));
         assert_eq!(
-            texture(&da2, Some("_0"), 0).as_deref(),
-            Some("HLAC_lt_room_1_5")
+            piece_light(&da2, None, 1, 3),
+            Some(PieceLight::Vertices("VXlt_room_1n1_0_1"))
         );
-        assert_eq!(texture(&da2, None, 1), None);
-        assert_eq!(texture(&da2, None, 2).as_deref(), Some("HLAC_lt_room_1_3"));
-        assert_eq!(texture(&da2, None, 3), None);
+        assert_eq!(texture(&da2, None, 0).as_deref(), Some("HLAC_lt_room_1_3"));
+        assert_eq!(piece_light(&da2, None, 3, 3), None);
+        // A room's own model: one piece, with an id that is not the binding's.
+        assert_eq!(
+            piece_light(&da2[..1], Some("_0"), 0, 1),
+            Some(PieceLight::Map(&da2[0]))
+        );
+        // Three colours of four bytes a vertex, and nothing else.
+        let bytes: Vec<u8> = (0..24).collect();
+        let light = vertex_light(&bytes).unwrap();
+        assert_eq!(light.len(), 2);
+        assert_eq!(
+            light[1],
+            [[12, 13, 14, 15], [16, 17, 18, 19], [20, 21, 22, 23]]
+        );
+        assert_eq!(vertex_light(&bytes[..23]), None);
 
         let lightmap = |texture: &str| LightmapRef {
             texture: texture.into(),
@@ -3708,6 +3852,7 @@ mod tests {
             },
             raw_vertices: vec![],
             positions: None,
+            vertex_light: None,
         });
         let xml = br#"<MaterialObject Name="face"><Material Name="face.mat"/>
             <Texture Name="mml_tDiffuse" ResName="base_d.dds"/></MaterialObject>"#;

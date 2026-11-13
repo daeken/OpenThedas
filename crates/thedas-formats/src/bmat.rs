@@ -301,7 +301,21 @@ impl Semantic {
             .or_else(|| main().max_by_key(|(i, t)| (t.header[0], std::cmp::Reverse(*i))))
             .or_else(|| self.techniques.iter().enumerate().next())
     }
+
+    /// The main technique at high detail for a piece whose lighting is baked per vertex
+    /// (third header word 2: `BakedLightingPerVertexHighLOD…`), if the semantic has one.
+    /// Provisional, as [`Semantic::technique`].
+    pub fn per_vertex_technique(&self) -> Option<(usize, &Technique)> {
+        self.techniques
+            .iter()
+            .enumerate()
+            .find(|(_, t)| t.is_main() && t.header[0] == 1 && t.header[2] == 2)
+    }
 }
+
+/// What [`Bmat::definition`] appends to a semantic's name for its second form: the one drawn
+/// with [`Semantic::per_vertex_technique`].
+pub const PER_VERTEX: &str = "#PerVertex";
 
 /// Dragon Age II's numbers for render states and their values, as the names Dragon Age:
 /// Origins' state files use ([`crate::state`]). Provisional throughout: worked out from
@@ -488,24 +502,30 @@ impl Pass {
 ///
 /// Provisional: the numbers' meanings are taken from the constants' names across every
 /// material (source 7 is always `aur_mWorldViewProj` or the sky's, 16 always
-/// `g_vLightParams`, and so on), not from the executable. The matrix usages end in `Trans`
-/// because the shaders read these matrices the way Origins' read its `…Trans` ones.
+/// `g_vLightParams`, and so on), not from the executable. A matrix's usage ends in `Trans`
+/// where the shaders given that source read it by columns (`mad` by the vertex's
+/// components, as Origins' `…Trans` usages are read: sources 3 and 7, the static and
+/// character shaders' world matrices), and is plain where they read it by rows (`dp4`: 2
+/// and 6, the water's and effects' forms of the same two, and the view, projection and
+/// inverse matrices).
 pub fn engine_usage(source: u32) -> Option<&'static str> {
     Some(match source {
-        2 | 3 => "PartTrans",
-        6 | 7 => "ModelViewProjectionTrans",
-        8 => "ModelViewTrans",
-        10 => "ModelViewInvTrans",
+        2 => "Part",
+        3 => "PartTrans",
+        6 => "ModelViewProjection",
+        7 => "ModelViewProjectionTrans",
+        8 => "ModelView",
+        10 => "ModelViewInv",
         16 => "LightsArray",
         20 => "ShaderControlBooleans",
         21 => "ShadowPartitionMatrix",
         22 => "ShadowTexture_Primary",
         24 => "ShadowData",
         25 => "EnvironmentMap",
-        31 => "ProjectionTrans",
-        34 => "ViewTrans",
-        36 => "ViewInvTrans",
-        38 => "ViewProjectionTrans",
+        31 => "Projection",
+        34 => "View",
+        36 => "ViewInv",
+        38 => "ViewProjection",
         39 => "CameraPosition",
         41 => "ApplicationTime",
         46 => "FogParameters",
@@ -538,13 +558,9 @@ impl Bmat {
             let name = name.strip_suffix(".fxo").unwrap_or(name);
             (!name.is_empty()).then(|| name.to_string())
         };
-        let semantics = self
-            .semantics
-            .iter()
-            .enumerate()
-            .map(|(si, s)| {
-                let techniques = s
-                    .technique()
+        let semantic =
+            |si: usize, s: &Semantic, name: String, picked: Option<(usize, &Technique)>| {
+                let techniques = picked
                     .map(|(ti, t)| m::Technique {
                         name: Some(t.name.clone()),
                         passes: t
@@ -590,7 +606,7 @@ impl Bmat {
                     .into_iter()
                     .collect();
                 m::Semantic {
-                    name: s.name.clone(),
+                    name,
                     render_class: (!s.render_class.trim().is_empty())
                         .then(|| s.render_class.clone()),
                     logic: vec![m::Logic {
@@ -600,8 +616,22 @@ impl Bmat {
                         children: Vec::new(),
                     }],
                 }
-            })
-            .collect();
+            };
+        let mut semantics = Vec::new();
+        for (si, s) in self.semantics.iter().enumerate() {
+            semantics.push(semantic(si, s, s.name.clone(), s.technique()));
+        }
+        // After them, so that the first semantic stays the material's first.
+        for (si, s) in self.semantics.iter().enumerate() {
+            if let Some(picked) = s.per_vertex_technique() {
+                semantics.push(semantic(
+                    si,
+                    s,
+                    format!("{}{PER_VERTEX}", s.name),
+                    Some(picked),
+                ));
+            }
+        }
         m::MaterialDef {
             name: resource.to_string(),
             parameter_sets: Vec::new(),
