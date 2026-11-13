@@ -10,7 +10,7 @@ repository.
 
 ## Status
 
-Last updated 2026-11-13 00:10 UTC, main b4ed5e7
+Last updated 2026-11-13 02:10 UTC, main d893fa0
 
 For everything that is wrong or missing, in detail and split into items that can be picked up in
 parallel, see [docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md).
@@ -34,8 +34,8 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
     - line cutscene cameras are placed with their cutscene's stage, and ActionJumpToCamera puts the camera on stage cameras: the City Elf Vaughan scene plays as staged shots.
   - Open:
     - cameras and actors linked with LinkToActor are placed (provisional: links use the target's root frame);
-    - a cutscene's last view is held for the rest of the conversation line it plays over (provisional), which frames the City Elf opening as the original does;
-    - City Elf: Vaughan faces away from the camera in one shot (reference frames from the original now exist; comparison pending).
+    - a cutscene's last view is held only for the conversation line that queued it (provisional), which frames the City Elf opening as the original does and frees the next reply's shot;
+    - additive animation clips (the `.ani` additive flag, 196 of the 4,520 clips, most of them conversation gestures) are laid over the pose beneath them as the exe does, instead of replacing it; this fixes arms pointing straight up during gestures. Their weight is provisional (`RND-064`), and two other overlay kinds still overwrite (`RND-071`).
 - 🟡 **Exploration and camera**:
   - Walking, click-to-pick, doors and companions following. Followers come along on area changes, and they stand in the exe's formation slots and follow by its rules.
   - The area map shows map notes and only perceived enemies.
@@ -89,7 +89,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Looking down from high above the party cuts away ceilings marked for it in the models, with the exe's height threshold and 0.2 s fade.
   - Only per-frame shader constants are rewritten per draw, and first-use work is done at the end of a load, which took about a fifth off frame time and removed the stutter after arriving in an area.
   - Open:
-    - Trees, bushes and grass are real geometry from a clean-room SpeedTree generator written from our own spec (`docs/speedtree/`): trunks, branches, fronds, leaf cards and mesh leaves, with the game's distance rule for switching to billboards, batched per ground cell. Leaf cards face the camera through the game's own leaf-card shader, held still (#422). Wind, leaf rocking, fades between levels and the game's shaders for branches, fronds and mesh leaves are not done.
+    - Trees, bushes and grass are real geometry from a clean-room SpeedTree generator written from our own spec (`docs/speedtree/`): trunks, branches, fronds, leaf cards and mesh leaves, with the game's distance rule for switching to billboards, batched per ground cell. Branches, fronds, leaf cards and mesh leaves draw with the game's own shaders, with its fades between distance levels (#427, #431, #432), and sway by the game's wind simulation fed from the level's wind file (#462, #463, #470). The far billboards are a stand-in that does not fade in, and which wind copy a tree takes is provisional (`RND-075`, `RND-076`).
     - Emitters in a cut-away model do not fade with it.
   - The backend stays on wgpu, and its types are kept inside `thedas-render`.
 - 🟡 **Audio**:

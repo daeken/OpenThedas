@@ -3,8 +3,7 @@
 //! angles, step by step in time.
 //!
 //! [`Wind::dao`] sets it up the way the game drives it; the game runs five of them 0.2 s
-//! apart and placements take them in turn. Provisional until checked against the executable
-//! (which of the two branch oscillators is horizontal is marked provisional in the spec).
+//! apart and placements take them in turn. Provisional until checked against the executable.
 
 use super::frame::{Frame, Vec3, cos, lerp, sin};
 
@@ -73,10 +72,12 @@ impl Settings {
             gust_strength: [0.0, 0.0],
             gust_duration: [0.0, 0.0],
             gust_frequency: 0.0,
-            branch_horizontal: Oscillator::new(0.3, 3.0, 6.0, 3.0),
-            branch_vertical: Oscillator::new(0.1, 4.0, 8.0, 4.0),
+            // (low angle, high angle, low speed, high speed), as corrected in 7.11: the game's
+            // configuration text runs low angle, low speed, high angle, high speed.
+            branch_horizontal: Oscillator::new(0.3, 6.0, 3.0, 3.0),
+            branch_vertical: Oscillator::new(0.1, 8.0, 4.0, 4.0),
             leaf_rocking: Oscillator::new(1.0, 2.0, 2.0, 10.0),
-            leaf_rustling: Oscillator::new(3.0, 1.0, 2.0, 20.0),
+            leaf_rustling: Oscillator::new(3.0, 2.0, 1.0, 20.0),
         }
     }
 }
@@ -332,15 +333,16 @@ mod tests {
             }
             let dot: f32 = (0..3).map(|c| m[0][c] * m[1][c]).sum();
             assert!(dot.abs() < 1e-4);
-            // The bend is about 35° ± the 4° vertical sway: cos between 31° and 39°.
-            assert!(m[2][2] < 31f32.to_radians().cos() + 0.01);
-            assert!(m[2][2] > 39f32.to_radians().cos() - 0.02);
+            // The bend is about 35° ± the 8° vertical sway: cos between 27° and 43°.
+            assert!(m[2][2] < 27f32.to_radians().cos() + 0.01);
+            assert!(m[2][2] > 43f32.to_radians().cos() - 0.02);
             // The up axis leans along the wind's line (Y), not across it.
-            assert!(m[2][1].abs() > 0.4 && m[2][0].abs() < 0.1, "{m:?}");
+            // (the horizontal sway of up to 6° tips it sideways a little).
+            assert!(m[2][1].abs() > 0.4 && m[2][0].abs() < 0.12, "{m:?}");
         }
-        // Leaf rocking is within its high-wind angle of 2°, rustling within 1°.
+        // Leaf rocking and rustling are within their high-wind angles of 2°.
         for (rock, rustle) in wind.leaf_angles() {
-            assert!(rock.abs() <= 2.0 + 1e-3 && rustle.abs() <= 1.0 + 0.05);
+            assert!(rock.abs() <= 2.0 + 1e-3 && rustle.abs() <= 2.0 + 0.05);
         }
     }
 
@@ -378,5 +380,29 @@ mod tests {
             Settings::dao(f32::NAN.max(0.0), [f32::NAN, 0.0, 0.0]).direction,
             [0.0; 3]
         );
+    }
+
+    #[test]
+    fn dao_oscillators_match_the_spec() {
+        let s = Settings::dao(1.0, [0.0, 1.0, 0.0]);
+        assert_eq!(s.branch_horizontal, Oscillator::new(0.3, 6.0, 3.0, 3.0));
+        assert_eq!(s.branch_vertical, Oscillator::new(0.1, 8.0, 4.0, 4.0));
+        assert_eq!(s.leaf_rocking, Oscillator::new(1.0, 2.0, 2.0, 10.0));
+        assert_eq!(s.leaf_rustling, Oscillator::new(3.0, 2.0, 1.0, 20.0));
+        // At full wind the branches sway by the high angles: horizontal up to 6°, vertical
+        // up to 8° either side of the 35° bend, at 3 and 4 radians per second.
+        let mut wind = Wind::new(s);
+        run(&mut wind, 120.0);
+        assert!(wind.strength() > 0.999);
+        let (mut lowest, mut highest) = (f32::MAX, f32::MIN);
+        for f in 0..600 {
+            wind.advance(120.0 + (f + 1) as f32 / 60.0);
+            // m[2][2] ≈ cos(bend + vertical) · cos(horizontal).
+            let lean = wind.matrices()[0][2][2].acos().to_degrees();
+            lowest = lowest.min(lean);
+            highest = highest.max(lean);
+        }
+        assert!((lowest - 27.0).abs() < 1.0, "{lowest}");
+        assert!((highest - 43.0).abs() < 1.0, "{highest}");
     }
 }

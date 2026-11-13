@@ -14,6 +14,91 @@ pub struct AreaSound {
     pub volume: f32,
     pub max_distance_mult: f32,
     pub active: bool,
+    /// Added to the event's pitch (DAOrigins.exe's sound start 0x7c261d: +0x480, read from
+    /// `Pitch` at 0x7c22b1).
+    pub pitch: f32,
+    /// Fade-in and fade-out times (ms) that replace the event's (0x7c2623..0x7c2637: +0x484
+    /// `FadeIn`, +0x488 `FadeOut`). Most sounds fade out over 34 ms.
+    pub fade_in_ms: u32,
+    pub fade_out_ms: u32,
+    /// The audio volume it belongs to, for a sound of a volume's own `SoundList` (see
+    /// [`SoundRegion`]); `None` for the area's.
+    pub region: Option<SoundRegion>,
+}
+
+/// The outline of an audio volume (`TriggerList` `Type` 4, CCTriggerAudioVolume) whose
+/// own sounds follow the listener (DAOrigins.exe's sound update 0x7c2ee0 for a sound with
+/// an owning volume at +0x4b8).
+///
+/// The volume's loader (0x79a000) makes each `SoundList` entry an area sound placed at the
+/// volume's position (0x695540 with the volume's +0x120); adding the volume to the area
+/// adds them with the area's own (0x79b7d0 -> 0x7c3110). Each frame such a sound, when the
+/// listener is within the volume's radius (its farthest outline point plus 4 m, 0x79a490)
+/// of the event's reach, is put at the listener while the party is inside the volume, and
+/// otherwise at the point of the volume nearest the listener at the listener's height,
+/// re-placed every 0.06 s once the listener has moved 0.25 m (0x7c2ffc..0x7c30fc).
+///
+/// Provisional: the nearest point is taken on the outline (the exe's 0x798de0 is not
+/// traced past its bounds test), and inside is the party leader in the outline.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SoundRegion {
+    pub position: [f32; 3],
+    /// Rotation about Z, radians.
+    pub yaw: f32,
+    /// The outline, relative to `position` before rotation.
+    pub outline: Vec<[f32; 2]>,
+}
+
+impl SoundRegion {
+    /// Whether `p` is inside the outline (on the ground plane).
+    pub fn contains(&self, p: [f32; 3]) -> bool {
+        outline_contains(self.position, self.yaw, &self.outline, p)
+    }
+
+    /// The point of the outline nearest `p` on the ground plane, at `p`'s height.
+    pub fn nearest(&self, p: [f32; 3]) -> [f32; 3] {
+        if self.outline.is_empty() {
+            return [self.position[0], self.position[1], p[2]];
+        }
+        let (dx, dy) = (p[0] - self.position[0], p[1] - self.position[1]);
+        let (s, c) = (-self.yaw).sin_cos();
+        let (x, y) = (dx * c - dy * s, dx * s + dy * c);
+        let n = self.outline.len();
+        let mut best = (f32::MAX, self.outline[0]);
+        for i in 0..n {
+            let [ax, ay] = self.outline[i];
+            let [bx, by] = self.outline[(i + 1) % n];
+            let (ex, ey) = (bx - ax, by - ay);
+            let len2 = ex * ex + ey * ey;
+            let t = if len2 > 0.0 {
+                (((x - ax) * ex + (y - ay) * ey) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let q = [ax + ex * t, ay + ey * t];
+            let d2 = (q[0] - x).powi(2) + (q[1] - y).powi(2);
+            if d2 < best.0 {
+                best = (d2, q);
+            }
+        }
+        let [qx, qy] = best.1;
+        let (s, c) = self.yaw.sin_cos();
+        [
+            self.position[0] + qx * c - qy * s,
+            self.position[1] + qx * s + qy * c,
+            p[2],
+        ]
+    }
+
+    /// The volume's radius: its farthest outline point from its position, plus 4 m
+    /// (DAOrigins.exe 0x79a490, +0x534 = 4.0 at 0xadef1c).
+    pub fn radius(&self) -> f32 {
+        self.outline
+            .iter()
+            .map(|[x, y]| (x * x + y * y).sqrt())
+            .fold(0.0, f32::max)
+            + 4.0
+    }
 }
 
 /// An area's music theme (`MusicPreset`, `music\\Prelude_kwilds`, as an event group path
@@ -47,7 +132,17 @@ pub fn area_audio(data: &[u8]) -> (Option<String>, Vec<AreaSound>) {
     let root = g.root();
     let music = text(root, "MusicPreset").map(|m| m.replace('\\', "/"));
     let mut sounds = Vec::new();
-    if let Some(Value::List(items)) = get(root, "SoundList") {
+    let pos = |s: &Struct| {
+        [
+            num(s, "XPosition").unwrap_or(0.0),
+            num(s, "YPosition").unwrap_or(0.0),
+            num(s, "ZPosition").unwrap_or(0.0),
+        ]
+    };
+    let mut add = |list: Option<&Value>, region: Option<SoundRegion>| {
+        let Some(Value::List(items)) = list else {
+            return;
+        };
         for &i in items {
             let Some(s) = g.structs.get(i as usize) else {
                 continue;
@@ -58,15 +153,49 @@ pub fn area_audio(data: &[u8]) -> (Option<String>, Vec<AreaSound>) {
             sounds.push(AreaSound {
                 tag: text(s, "Tag").unwrap_or_default().to_ascii_lowercase(),
                 event,
-                position: [
-                    num(s, "XPosition").unwrap_or(0.0),
-                    num(s, "YPosition").unwrap_or(0.0),
-                    num(s, "ZPosition").unwrap_or(0.0),
-                ],
+                // A volume's sounds stand at the volume (0x79a114 -> 0x695540).
+                position: region.as_ref().map(|r| r.position).unwrap_or(pos(s)),
                 volume: num(s, "Volume").unwrap_or(0.0),
                 max_distance_mult: num(s, "MaxDistanceMult").unwrap_or(1.0),
                 active: num(s, "Active").unwrap_or(1.0) != 0.0,
+                pitch: num(s, "Pitch").unwrap_or(0.0),
+                fade_in_ms: num(s, "FadeIn").unwrap_or(0.0).max(0.0) as u32,
+                fade_out_ms: num(s, "FadeOut").unwrap_or(0.0).max(0.0) as u32,
+                region: region.clone(),
             });
+        }
+    };
+    add(get(root, "SoundList"), None);
+    // Audio volumes' own sounds (0x79a5d0 -> 0x79a000).
+    if let Some(Value::List(triggers)) = get(root, "TriggerList") {
+        for &t in triggers {
+            let Some(t) = g.structs.get(t as usize) else {
+                continue;
+            };
+            if num(t, "Type") != Some(4.0) {
+                continue;
+            }
+            let mut outline = Vec::new();
+            if let Some(Value::List(points)) = get(t, "Geometry") {
+                for &p in points {
+                    if let Some(p) = g.structs.get(p as usize) {
+                        outline.push([
+                            num(p, "XPoint").unwrap_or(0.0),
+                            num(p, "YPoint").unwrap_or(0.0),
+                        ]);
+                    }
+                }
+            }
+            let yaw = 2.0
+                * num(t, "ZOrientation")
+                    .unwrap_or(0.0)
+                    .atan2(num(t, "WOrientation").unwrap_or(1.0));
+            let region = SoundRegion {
+                position: pos(t),
+                yaw,
+                outline,
+            };
+            add(get(t, "SoundList"), Some(region));
         }
     }
     (music, sounds)
@@ -323,6 +452,10 @@ mod tests {
 
     #[test]
     fn reads_the_music_theme_and_placed_sounds() {
+        let pt = |x: f32, y: f32| Struct {
+            id: 3,
+            fields: vec![f("XPoint", Value::Float(x)), f("YPoint", Value::Float(y))],
+        };
         let g = Gff3 {
             file_type: *b"ARE ",
             file_version: *b"V3.2",
@@ -335,13 +468,16 @@ mod tests {
                             Value::ExoString(b"music\\Prelude_kwilds".to_vec()),
                         ),
                         f("SoundList", Value::List(vec![1])),
+                        f("TriggerList", Value::List(vec![2])),
                     ],
                 },
                 Struct {
                     id: 6,
                     fields: vec![
                         f("Active", Value::Byte(0)),
+                        f("FadeOut", Value::Dword(34)),
                         f("MaxDistanceMult", Value::Float(0.5)),
+                        f("Pitch", Value::Float(-0.05)),
                         f("Sound", Value::ExoString(b"kw/3D/amb_crow".to_vec())),
                         f("Tag", Value::ExoString(b"Amb_Crow".to_vec())),
                         f("Volume", Value::Float(-4.0)),
@@ -350,21 +486,74 @@ mod tests {
                         f("ZPosition", Value::Float(3.0)),
                     ],
                 },
+                // An audio volume: a 4 m square at (10, 0), turned 90 degrees, with a sound.
+                Struct {
+                    id: 1,
+                    fields: vec![
+                        f("Type", Value::Byte(4)),
+                        f("Geometry", Value::List(vec![3, 4, 5, 6])),
+                        f("SoundList", Value::List(vec![7])),
+                        f("XPosition", Value::Float(10.0)),
+                        f("YPosition", Value::Float(0.0)),
+                        f("ZPosition", Value::Float(1.0)),
+                        f(
+                            "ZOrientation",
+                            Value::Float(std::f32::consts::FRAC_1_SQRT_2),
+                        ),
+                        f(
+                            "WOrientation",
+                            Value::Float(std::f32::consts::FRAC_1_SQRT_2),
+                        ),
+                    ],
+                },
+                pt(-2.0, -2.0),
+                pt(2.0, -2.0),
+                pt(2.0, 2.0),
+                pt(-2.0, 2.0),
+                Struct {
+                    id: 6,
+                    fields: vec![
+                        f("Sound", Value::ExoString(b"t/int/amb_rumble_lp".to_vec())),
+                        f("Tag", Value::ExoString(b"rumble".to_vec())),
+                        f("Volume", Value::Float(-6.0)),
+                        f("XPosition", Value::Float(99.0)),
+                    ],
+                },
             ],
         };
         let (music, sounds) = area_audio(&g.write().unwrap());
         assert_eq!(music.as_deref(), Some("music/Prelude_kwilds"));
         assert_eq!(
-            sounds,
-            [AreaSound {
+            sounds[0],
+            AreaSound {
                 tag: "amb_crow".into(),
                 event: "kw/3D/amb_crow".into(),
                 position: [1.0, 2.0, 3.0],
                 volume: -4.0,
                 max_distance_mult: 0.5,
                 active: false,
-            }]
+                pitch: -0.05,
+                fade_in_ms: 0,
+                fade_out_ms: 34,
+                region: None,
+            }
         );
+        // The volume's sound stands at the volume and follows the listener.
+        assert_eq!(sounds.len(), 2);
+        let v = &sounds[1];
+        assert_eq!(
+            (v.tag.as_str(), v.position, v.volume),
+            ("rumble", [10.0, 0.0, 1.0], -6.0)
+        );
+        let r = v.region.as_ref().unwrap();
+        assert!(r.contains([11.0, 1.0, 0.0]));
+        assert!(!r.contains([13.0, 0.0, 0.0]));
+        let n = r.nearest([20.0, 1.0, 5.0]);
+        assert!(
+            (n[0] - 12.0).abs() < 1e-4 && (n[1] - 1.0).abs() < 1e-4 && n[2] == 5.0,
+            "{n:?}"
+        );
+        assert!((r.radius() - (8f32.sqrt() + 4.0)).abs() < 1e-4);
         assert_eq!(area_audio(b"junk"), (None, Vec::new()));
     }
 
