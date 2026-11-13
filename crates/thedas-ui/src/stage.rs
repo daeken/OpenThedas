@@ -380,6 +380,11 @@ impl Stage {
 
     /// Loads a movie (`mainmenu.gfx`) on top of the others and starts it.
     pub fn open(&mut self, name: &str) -> Result<(), UiError> {
+        // A popup layer loaded anew has no dialog box up, whatever the one before it left
+        // on the context stack.
+        if name == POPUP_LAYER {
+            self.bridge.drop_context(POPUP_CONTEXT);
+        }
         if name == QUICKBAR {
             self.quickbar_width = self
                 .bridge
@@ -579,7 +584,11 @@ impl Stage {
 
     /// Whether one of the popup layer's dialog boxes is up.
     pub fn dialog_up(&self) -> bool {
-        self.bridge.contexts().last().map(String::as_str) == Some(POPUP_CONTEXT)
+        // Anywhere on the stack: a movie that starts after the box showed (the HUD's, as a
+        // game loads) pushes its own context over the popup's, and the box still has the
+        // input. The popup layer pops its context when the box closes; a popup layer loaded
+        // anew starts without one (see `Stage::open`).
+        self.bridge.contexts().iter().any(|c| c == POPUP_CONTEXT)
             && self.movies.iter().any(|m| m.name == POPUP_LAYER)
     }
 
