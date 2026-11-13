@@ -100,7 +100,7 @@ these, so they are the places where one person or stream can take a large, separ
   billboards that fade in far away and wind sway. Some LOD and billboard details and the
   wind's per-tree details are provisional (`RND-075` to `RND-078`).
 - **Effects on creatures and items.** Spell effects and impact flashes draw their particles
-  on the body, but not their meshes, lights or heat shimmer, and weapon glows are not drawn
+  on the body, but not their meshes or lights, and weapon glows are not drawn
   (`RND-094`).
 - **Animation blending.** No blend weights, crossfades, inverse kinematics or root motion
   (`RND-064` to `RND-068`).
@@ -112,7 +112,8 @@ these, so they are the places where one person or stream can take a large, separ
   terrain detail levels (`RND-001` to `RND-003`).
 - **Video options.** Graphics detail, VSync, full screen, resolution and gamma have no effect
   from the options screen (`RND-108`, `RND-110`, `RND-150`, `RND-151`).
-- **Screen effects.** Depth of field, distortion, script-driven screen effects, anti-aliasing,
+- **Screen effects.** Depth of field, distortion other than heat haze from particles
+  (`RND-107`), script-driven screen effects, anti-aliasing,
   decals, trails, weather, selection circles and area-map fog are not drawn; transparent draws
   are not sorted.
 
