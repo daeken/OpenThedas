@@ -3669,7 +3669,10 @@ impl Sim {
 fn apply_template(o: &mut crate::world::Object, t: &Gff3) {
     let Some(r) = t.structs.first() else { return };
     o.script = resref_field(r, "EventScript").or_else(|| resref_field(r, "ScriptResRefID"));
-    o.dialog = resref_field(r, "DialogResRef").or_else(|| resref_field(r, "Conversation"));
+    // Dragon Age II's templates name it `ConversationResR` (a 16-character GFF3 label).
+    o.dialog = resref_field(r, "DialogResRef")
+        .or_else(|| resref_field(r, "Conversation"))
+        .or_else(|| resref_field(r, "ConversationResR"));
     o.name_strref = strref(r, "LocName");
     o.immortal = int(r, "Immortal").unwrap_or(0) != 0;
     o.plot = int(r, "Plot").unwrap_or(0) != 0;

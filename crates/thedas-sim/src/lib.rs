@@ -16,6 +16,7 @@ pub mod aoe;
 pub mod appearance;
 pub mod chanters;
 pub mod chargen;
+pub mod cnv;
 pub mod collision;
 pub mod combat;
 pub mod container;
