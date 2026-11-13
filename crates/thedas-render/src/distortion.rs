@@ -268,3 +268,13 @@ impl Distortion {
         pass.draw(0..3, 0..1);
     }
 }
+
+#[cfg(test)]
+mod gl_tests {
+    use super::*;
+
+    #[test]
+    fn its_shaders_translate_for_opengl() {
+        crate::gl_check::translates("distortion", SHADER);
+    }
+}

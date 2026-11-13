@@ -1391,6 +1391,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn its_shaders_translate_for_opengl() {
+        crate::gl_check::translates("fade", FADE_SHADER);
+        crate::gl_check::translates("colour matrix", HSV_SHADER);
+        crate::gl_check::translates("bloom", SHADER);
+    }
+
+    #[test]
     fn shader_validates() {
         let module = naga::front::wgsl::parse_str(SHADER).expect("parses");
         naga::valid::Validator::new(
