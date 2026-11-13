@@ -67,6 +67,8 @@ pub trait Host {
     }
     /// Marking is done: the report's note is asked.
     fn end_marking(&mut self) {}
+    /// The box being drawn is dropped (no note is asked for it).
+    fn drop_mark(&mut self) {}
 }
 
 /// The letters the D-pad steps through when typing on the pad, in order.
@@ -218,10 +220,18 @@ impl PadPlay {
         let mut log = Vec::new();
         // Marking spots for an issue report: the pad has a pointer of its own.
         let marking = if popup { None } else { host.marking() };
-        let was = std::mem::take(&mut self.mark_held);
+        // A, B and Start as held now and last frame, every frame: the A press that answers
+        // "Mark spots" is still held when marking starts, and must not start a box.
+        use crate::pad::Button;
+        let now = (
+            state.held(Button::A),
+            state.held(Button::B),
+            state.held(Button::Start),
+        );
+        let was = std::mem::replace(&mut self.mark_held, now);
         self.marking = false;
         if let Some(drawing) = marking {
-            self.mark(state, host, drawing, was, dt_ms, &mut log);
+            self.mark(state, host, drawing, (was, now), dt_ms, &mut log);
             return log;
         }
         for order in self.controller.update(state, ctx, dt_ms) {
@@ -241,7 +251,7 @@ impl PadPlay {
         state: &PadState,
         host: &mut dyn Host,
         drawing: bool,
-        was: (bool, bool, bool),
+        (was, now): ((bool, bool, bool), (bool, bool, bool)),
         dt_ms: f64,
         log: &mut Vec<String>,
     ) {
@@ -249,12 +259,6 @@ impl PadPlay {
         self.marking = true;
         self.snapped = false;
         self.focused = None;
-        let now = (
-            state.held(Button::A),
-            state.held(Button::B),
-            state.held(Button::Start),
-        );
-        self.mark_held = now;
         let (w, h) = host.size();
         let v = crate::pad::dead_zone(state.left);
         let mut step = Vec2::new(v.x, -v.y)
@@ -296,16 +300,16 @@ impl PadPlay {
             );
         } else if pressed(now.1, was.1) {
             if drawing {
-                // A press and release at the same spot: too small to keep.
-                host.left_button(false);
+                host.drop_mark();
                 log.push("mark: box dropped".into());
             } else {
                 host.end_marking();
                 log.push("mark: done".into());
             }
         } else if pressed(now.2, was.2) {
+            // A box half drawn is dropped, not kept without its note.
             if drawing {
-                host.left_button(false);
+                host.drop_mark();
             }
             host.end_marking();
             log.push("mark: done".into());

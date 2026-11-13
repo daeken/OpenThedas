@@ -2107,7 +2107,6 @@ impl App {
         // before a game: the report is kept without one).
         let in_game = self.live.as_ref().is_some_and(|l| !l.front_end)
             && self.screens.as_ref().is_some_and(|s| !s.front_end);
-        let note_asked = None;
         let mut marking = Marking::Off;
         match (report::preset_note(note), self.gfx.as_mut()) {
             (Some(text), _) => self.recorder.note(Some(text)),
@@ -2122,7 +2121,7 @@ impl App {
         self.report_wait = Some(ReportWait {
             shot,
             reply,
-            note_asked,
+            note_asked: None,
             send: true,
             pause,
             paused_it: false,
@@ -3812,6 +3811,12 @@ impl padplay::Host for App {
 
     fn end_marking(&mut self) {
         App::end_marking(self);
+    }
+
+    fn drop_mark(&mut self) {
+        if let Some(Marking::On { drag, .. }) = self.report_wait.as_mut().map(|w| &mut w.marking) {
+            *drag = None;
+        }
     }
 
     fn live(&mut self) -> Option<&mut live::Live> {
