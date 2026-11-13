@@ -149,7 +149,11 @@ impl Part {
         let near = self.rotation.dot(q).abs();
         let (slow_cos, fast_cos) = ((c.slow_angle * 0.5).cos(), (c.fast_angle * 0.5).cos());
         let t = 1.0 - (near - fast_cos) / (slow_cos - fast_cos);
-        let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 1.0 };
+        let t = if t.is_finite() {
+            t.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         let mut speed = self.slow + (self.fast - self.slow) * t;
         if let Some(last) = self.speed {
             speed = speed.max(last);
@@ -333,8 +337,7 @@ impl Tracker {
             }
             q = q * part.rotation.conjugate();
         }
-        if self.state == State::Returning
-            && self.parts.iter().all(|p| p.rotation.w.abs() > 0.9999)
+        if self.state == State::Returning && self.parts.iter().all(|p| p.rotation.w.abs() > 0.9999)
         {
             self.state = State::Off;
         }

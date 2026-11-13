@@ -202,6 +202,9 @@ pub struct Live {
     cutscene_camera: crate::cutcam::CutsceneCamera,
     /// The creatures cutscenes and conversation lines pose (see [`crate::cutactors`]).
     cut_actors: crate::cutactors::CutsceneActors,
+    /// The creatures' head trackers, and the shaders' clock when they were last advanced.
+    looks: crate::looks::Looks,
+    looks_clock: Option<f64>,
     /// The shaders' clock (`ApplicationTime`), in seconds: real time, running while the
     /// world is stopped too.
     pub shader_time: f64,
@@ -561,6 +564,8 @@ impl Live {
             talk_camera: Default::default(),
             cutscene_camera: Default::default(),
             cut_actors: Default::default(),
+            looks: Default::default(),
+            looks_clock: None,
             shader_time: 0.0,
             stage: None,
             staged: None,
@@ -1474,7 +1479,28 @@ impl Live {
             models.push(m);
         }
         let kept = shown.kept;
+        // Who looks at whom, from where the creatures were last drawn.
+        self.looks.prepare(&sim);
+        let pairs = crate::looks::pairs(&sim);
         drop(sim);
+        let look_dt = self
+            .looks_clock
+            .map_or(0.0, |was| (self.shader_time - was).clamp(0.0, 0.25) as f32);
+        self.looks_clock = Some(self.shader_time);
+        let sights: std::collections::HashMap<ObjectId, crate::looks::Sight> = pairs
+            .iter()
+            .filter_map(|&(from, to)| {
+                let place = |id| self.posed.iter().find(|p| p.0 == id).map(|p| p.1);
+                let head = |id, t: Mat4| t.w_axis.truncate() + glam::Vec3::Z * self.head_height(id);
+                let (a, b) = (place(from)?, place(to)?);
+                let sight = crate::looks::Sight {
+                    origin: head(from, a),
+                    base: glam::Quat::from_mat4(&a),
+                    target: head(to, b),
+                };
+                Some((from, sight))
+            })
+            .collect();
         let key = objects_key(&models);
         if self.async_loads && self.objects.is_none() {
             // A new level's objects are built on the worker too, before the world shows.
@@ -1555,6 +1581,25 @@ impl Live {
                 }
                 None => (m.position, m.facing),
             };
+            // Head tracking: the pose animations of a creature that looks at another, or is
+            // turning back from it. A cutscene's actors are left to its own head tracking
+            // actions, which are not followed.
+            let sight = sights
+                .get(&m.id)
+                .copied()
+                .filter(|_| !posing.contains_key(&m.id));
+            if (sight.is_some() || self.looks.has(m.id))
+                && let Some(c) = c.as_mut()
+                && crate::looks::humanoid(&c.trees)
+            {
+                let animator = &mut self.animator;
+                let layers = self.looks.step(m.id, sight, look_dt, |action| {
+                    animator
+                        .action_animation(&level.vfs, "humanoid_overlay", action)
+                        .is_some()
+                });
+                c.layers.extend(layers);
+            }
             posed.push((Prop::placement(at, facing), c));
         }
         self.animator.pose_props(
@@ -2698,6 +2743,7 @@ fn cut_layer(
         looping: once.map_or(a.unbounded, |o| !o),
         layers: Vec::new(),
         absolute: true,
+        ..Default::default()
     }
 }
 
@@ -2709,6 +2755,7 @@ pub fn clip(m: &thedas_ui::models::Motion) -> Clip {
         looping: m.looping,
         layers: Vec::new(),
         absolute: false,
+        ..Default::default()
     }
 }
 

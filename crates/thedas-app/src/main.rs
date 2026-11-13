@@ -58,6 +58,7 @@ mod focusnav;
 mod follow;
 mod intro;
 mod live;
+mod looks;
 mod pad;
 mod paddev;
 mod padplay;
