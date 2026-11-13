@@ -1603,13 +1603,24 @@ impl GameAudio {
                         &s.event,
                         PlayOptions {
                             position: Some(position),
-                            volume: 10f32.powf(s.volume / 20.0),
+                            // `Volume` above 0 dB is left out (0x7c25c0..0x7c25cd).
+                            volume: 10f32.powf(s.volume.min(0.0) / 20.0),
                             distance_scale: s.max_distance_mult.max(1e-3),
                             // The placed sound's own pitch offset and fade times
                             // (DAOrigins.exe 0x7c261d..0x7c2637).
                             pitch: s.pitch,
                             fade_in_ms: Some(s.fade_in_ms),
                             fade_out_ms: Some(s.fade_out_ms),
+                            // Its cone (see `AreaSound::forward`); a volume's sound faces
+                            // the listener, so has none.
+                            cone: (s.region.is_none() && s.cone_inside < 360.0).then_some(
+                                thedas_audio::engine::Cone {
+                                    forward: s.forward,
+                                    inside: s.cone_inside,
+                                    outside: s.cone_outside,
+                                    outside_gain: s.cone_outside_gain,
+                                },
+                            ),
                             ..Default::default()
                         },
                     ));
