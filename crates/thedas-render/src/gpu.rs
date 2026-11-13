@@ -37,6 +37,21 @@ pub struct GpuContext {
     pub bc: bool,
 }
 
+/// Makes something of the GPU's with `make`, unless the GPU's backend refuses it (a
+/// validation error, such as a shader the backend cannot express): then it is logged once
+/// and `None` comes back, for the caller to go without rather than stop the game.
+pub fn checked<T>(device: &wgpu::Device, what: &str, make: impl FnOnce() -> T) -> Option<T> {
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let made = make();
+    match pollster::block_on(scope.pop()) {
+        Some(e) => {
+            log::error!("{what} cannot be drawn on this GPU and is left out: {e}");
+            None
+        }
+        None => Some(made),
+    }
+}
+
 impl GpuContext {
     /// Creates a device; pass the surface a window will present to, or `None` for headless.
     pub async fn new(
@@ -73,6 +88,24 @@ impl GpuContext {
             adapter.get_info().name,
             adapter.get_info().backend
         );
+        // What else the machine offered, for when the choice is a surprise (OpenGL where
+        // Direct3D 12 or Vulkan was expected: a virtual machine without either).
+        let offered: Vec<String> = instance
+            .enumerate_adapters(wgpu::Backends::all())
+            .await
+            .iter()
+            .map(|a| {
+                let i = a.get_info();
+                format!("{} ({:?}, {:?})", i.name, i.backend, i.device_type)
+            })
+            .collect();
+        log::info!("GPU adapters offered: {offered:?}");
+        if adapter.get_info().backend == wgpu::Backend::Gl {
+            log::warn!(
+                "drawing with OpenGL: this machine offers no Direct3D 12, Vulkan or Metal \
+                 adapter for the window"
+            );
+        }
         Ok(Self {
             instance,
             adapter,
@@ -519,6 +552,10 @@ pub struct AreaRenderer {
     /// sets them each frame, and empties them when no cutscene plays.
     pub cut_effects: crate::cut_effects::CutEffects,
     cut_pass: Option<crate::cut_effects::CutEffectsPass>,
+    /// The GPU's backend refused the distortion's or the cutscene effects' passes
+    /// ([`checked`]): they are left out, and not tried again.
+    distortion_refused: bool,
+    cut_refused: bool,
     /// The projection the frame was last drawn with.
     frame_projection: Option<glam::Mat4>,
     /// The draws of `CutAway` meshes ([`AreaScene::cut_away`]).
@@ -995,6 +1032,8 @@ impl AreaRenderer {
             distortion: None,
             cut_effects: Default::default(),
             cut_pass: None,
+            distortion_refused: false,
+            cut_refused: false,
             frame_projection: None,
             light: StandInLight::default(),
             stats,
@@ -1471,17 +1510,22 @@ impl AreaRenderer {
         if !self.frame_effects {
             return;
         }
-        if self.d3d.has_distortion() || overlays.iter().any(|o| o.d3d.has_distortion()) {
+        if !self.distortion_refused
+            && (self.d3d.has_distortion() || overlays.iter().any(|o| o.d3d.has_distortion()))
+        {
             let fits = self
                 .distortion
                 .as_ref()
                 .is_some_and(|d| d.fits(target.format(), (width, height)));
             if !fits {
-                self.distortion = Some(crate::distortion::Distortion::new(
-                    &ctx.device,
-                    target.format(),
-                    (width, height),
-                ));
+                self.distortion = checked(&ctx.device, "heat haze (distortion)", || {
+                    crate::distortion::Distortion::new(
+                        &ctx.device,
+                        target.format(),
+                        (width, height),
+                    )
+                });
+                self.distortion_refused = self.distortion.is_none();
             }
             let depth = self.depth(&ctx.device, width, height);
             if let Some(d) = &self.distortion {
@@ -1495,17 +1539,24 @@ impl AreaRenderer {
         }
         // The cutscene's own effects: depth of field (layer 5) before the level's (bloom
         // 10, the Fade's 10, the colour matrix 20), the colour fades (40) after.
-        if !self.cut_effects.is_empty() {
+        if !self.cut_effects.is_empty() && !self.cut_refused {
             let fits = self
                 .cut_pass
                 .as_ref()
                 .is_some_and(|p| p.fits(target.format(), (width, height)));
             if !fits {
-                self.cut_pass = Some(crate::cut_effects::CutEffectsPass::new(
+                self.cut_pass = checked(
                     &ctx.device,
-                    target.format(),
-                    (width, height),
-                ));
+                    "cutscene effects (depth of field and fades)",
+                    || {
+                        crate::cut_effects::CutEffectsPass::new(
+                            &ctx.device,
+                            target.format(),
+                            (width, height),
+                        )
+                    },
+                );
+                self.cut_refused = self.cut_pass.is_none();
             }
         }
         let depth = self.depth(&ctx.device, width, height);
