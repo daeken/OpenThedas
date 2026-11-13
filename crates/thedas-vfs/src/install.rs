@@ -165,6 +165,15 @@ impl DaoInstall {
         Ok(vfs)
     }
 
+    /// [`DaoInstall::global_vfs`] plus this player's mods as the stack's overlay
+    /// ([`crate::mods::mount_default`]): what a game session reads through. Tools that measure
+    /// the install itself (the corpus) use `global_vfs`.
+    pub fn play_vfs(&self, quality: TextureQuality) -> Result<Vfs> {
+        let mut vfs = self.global_vfs(quality)?;
+        crate::mods::mount_default(&mut vfs);
+        Ok(vfs)
+    }
+
     fn push_package(&self, vfs: &mut Vfs, dir: &Path, quality: TextureQuality) -> Result<()> {
         if !dir.is_dir() {
             return Ok(());
