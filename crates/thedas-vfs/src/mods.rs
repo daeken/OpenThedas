@@ -367,8 +367,11 @@ fn mount_entry(
 
 /// Where `.dazip` packages are unpacked: `mod-cache` in the player's data folder.
 pub fn cache_dir() -> PathBuf {
-    user_data_dir().join("mod-cache")
+    user_data_dir().join(CACHE_DIR_NAME)
 }
+
+/// The cache folder's name inside the data folder.
+const CACHE_DIR_NAME: &str = "mod-cache";
 
 /// The label of a layer served from the cache: `mod:<package folder>/<path inside it>`.
 pub(crate) fn cache_label(path: &Path) -> String {
@@ -504,6 +507,102 @@ pub fn unpack_7z(path: &Path, cache: &Path) -> Result<(PathBuf, Vec<String>)> {
         }
     }
     Ok((root, problems))
+}
+
+/// One unpacked archive in the mod cache.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheEntry {
+    /// Its folder, directly inside the cache.
+    pub dir: PathBuf,
+    /// Bytes and files it holds.
+    pub bytes: u64,
+    pub files: usize,
+    /// Whether an archive in the list unpacks to this folder, as the archive is now.
+    pub in_use: bool,
+}
+
+/// Whether a name is one this module gives a folder in the cache: `<name>-<size>-<time>` with
+/// the last two in hexadecimal ([`cache_slot`]), or a leftover `.<name>-<pid>.partial`.
+fn is_cache_name(name: &str) -> bool {
+    let hex = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit());
+    let safe = |s: &str| {
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    if let Some(inner) = name
+        .strip_prefix('.')
+        .and_then(|n| n.strip_suffix(".partial"))
+    {
+        return safe(inner);
+    }
+    let mut parts = name.rsplitn(3, '-');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(time), Some(size), Some(stem)) => hex(time) && hex(size) && safe(stem),
+        _ => false,
+    }
+}
+
+/// What the mod cache holds: every folder directly inside `cache` that carries one of our
+/// names, with its size and whether `list` still uses it. Anything else found there is left
+/// out, and never touched.
+pub fn cache_report(cache: &Path, list: &ModList) -> Vec<CacheEntry> {
+    let used: Vec<PathBuf> = list
+        .entries
+        .iter()
+        .filter(|e| {
+            let ext = e.path.extension().map(|x| x.to_ascii_lowercase());
+            e.path.is_file()
+                && matches!(
+                    ext.as_deref().and_then(|x| x.to_str()),
+                    Some("7z" | "dazip")
+                )
+        })
+        .filter_map(|e| cache_slot(&e.path, cache).ok().map(|(dir, _)| dir))
+        .collect();
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(cache) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let dir = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // A real folder of ours: not a link, not a file, not a stranger.
+        let real_dir = std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_dir());
+        if !real_dir || !is_cache_name(&name) {
+            continue;
+        }
+        let mut files = Vec::new();
+        let _ = collect_files(&dir, true, &mut files);
+        let bytes = files
+            .iter()
+            .filter_map(|f| std::fs::symlink_metadata(f).ok())
+            .map(|m| m.len())
+            .sum();
+        out.push(CacheEntry {
+            in_use: used.contains(&dir),
+            dir,
+            bytes,
+            files: files.len(),
+        });
+    }
+    out.sort_by(|a, b| a.dir.cmp(&b.dir));
+    out
+}
+
+/// Deletes the cache folders `list` no longer uses and returns them. Only ever removes what
+/// [`cache_report`] lists (our own folders, directly inside `cache`), and only when `cache` is
+/// a folder named `mod-cache`: it cannot be pointed at a mod folder or anything else.
+pub fn prune_cache(cache: &Path, list: &ModList) -> Vec<CacheEntry> {
+    if cache.file_name().and_then(|n| n.to_str()) != Some(CACHE_DIR_NAME) {
+        return Vec::new();
+    }
+    let mut removed = Vec::new();
+    for entry in cache_report(cache, list) {
+        if !entry.in_use && std::fs::remove_dir_all(&entry.dir).is_ok() {
+            removed.push(entry);
+        }
+    }
+    removed
 }
 
 /// An unpacked `.dazip`.
@@ -1032,6 +1131,85 @@ mod tests {
             ".",
         ] {
             assert_eq!(contained(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_cache_is_reported_and_pruned_without_touching_anything_else() {
+        let base = scratch("cachereport");
+        let cache = base.join("mod-cache");
+        sevenz_of(&base.join("kept.7z"), &[("a/face.dds", b"kept face")]);
+        sevenz_of(
+            &base.join("dropped.7z"),
+            &[("b.dds", b"dropped"), ("c.dds", b"c")],
+        );
+        let both = ModList::parse("kept.7z\ndropped.7z\nloose\n", &base);
+        write(&base, "loose/face.dds", b"loose mod, not in the cache");
+        both.mount_with_cache(&mut Vfs::new(), &cache);
+        // Things that are not ours, inside the cache folder.
+        write(&cache, "notes.txt", b"mine");
+        write(&cache, "My Own Folder/keep.dds", b"mine");
+        write(&cache, ".dropped-123.partial/half.dds", b"stale");
+
+        let report = cache_report(&cache, &both);
+        let names = |r: &[CacheEntry]| -> Vec<(String, bool, usize)> {
+            r.iter()
+                .map(|e| {
+                    let n = e.dir.file_name().unwrap().to_string_lossy().into_owned();
+                    (n.split('-').next().unwrap().to_string(), e.in_use, e.files)
+                })
+                .collect()
+        };
+        assert_eq!(
+            names(&report),
+            [
+                (".dropped".to_string(), false, 1),
+                ("dropped".to_string(), true, 2),
+                ("kept".to_string(), true, 1)
+            ]
+        );
+        assert_eq!(report[2].bytes, 9);
+
+        // The list no longer names one archive: only its folder and the stale one go.
+        let only_kept = ModList::parse("kept.7z\nloose\n", &base);
+        let removed = prune_cache(&cache, &only_kept);
+        assert_eq!(removed.len(), 2);
+        assert!(removed.iter().all(|e| !e.in_use));
+        assert_eq!(
+            names(&cache_report(&cache, &only_kept)),
+            [("kept".to_string(), true, 1)]
+        );
+        assert!(cache.join("notes.txt").is_file());
+        assert!(cache.join("My Own Folder/keep.dds").is_file());
+        assert!(base.join("loose/face.dds").is_file() && base.join("dropped.7z").is_file());
+
+        // Pointed at a folder that is not the cache, it removes nothing at all.
+        std::fs::create_dir_all(base.join("mods/abc-1f-2e")).unwrap();
+        assert!(prune_cache(&base.join("mods"), &ModList::default()).is_empty());
+        assert!(base.join("mods/abc-1f-2e").is_dir());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn only_our_own_names_count_as_cache_folders() {
+        for ours in [
+            "Faces__v2_-13b-6af7542d",
+            "x-0-0",
+            ".Faces-4412.partial",
+            "a-b-c-1f-2e",
+        ] {
+            assert!(is_cache_name(ours), "{ours}");
+        }
+        for not in [
+            "My Own Folder",
+            "notes.txt",
+            "abc",
+            "abc-xyz-12",
+            "a b-1f-2e",
+            ".partial",
+            "x-1f-",
+        ] {
+            assert!(!is_cache_name(not), "{not}");
         }
     }
 }
