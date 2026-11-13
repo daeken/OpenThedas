@@ -239,6 +239,70 @@ const COL_STATE_CONTROLLER: u32 = 0x9a32_0a51;
 /// the pathing grid leaves in walls where doors stand are about 2.5 m wide.
 pub const DOORWAY_RADIUS: f32 = 1.25;
 
+/// How far from a door its shut leaf is looked for across the pathing grid, in metres (the
+/// widest doors are under 6 m).
+const LEAF_REACH: f32 = 6.0;
+
+/// The pathing-grid cells of a door's doorway: the walkable cells within
+/// [`DOORWAY_RADIUS`] of the door, and those its shut leaf lies across (`leaf`: the door
+/// model's collision at rest). A door stands at its hinge, so a wide one reaches further
+/// from it than the radius: the Dalish ruins' mirror room door (`bed110ip_mirror_door`, a
+/// 2.7 m leaf) left the far half of its doorway open, and a walker went through the shut
+/// door without using it (using it is what wakes the bereskarn). A cell is under the leaf
+/// when one of its edges crosses it, 0.5 or 1.5 m above the floor.
+pub(crate) fn doorway_cells(
+    g: &NavGrid,
+    door: [f32; 3],
+    leaf: Option<&crate::collision::Collision>,
+) -> Vec<usize> {
+    let Some((cx, cy)) = g.cell(door) else {
+        return Vec::new();
+    };
+    let reach = if leaf.is_some() {
+        LEAF_REACH
+    } else {
+        DOORWAY_RADIUS
+    };
+    let r = (reach / g.cell_size).ceil() as i32;
+    let h = g.cell_size / 2.0;
+    let mut cells = Vec::new();
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let (x, y) = (cx as i32 + dx, cy as i32 + dy);
+            if x < 0 || y < 0 || x as u32 >= g.columns || y as u32 >= g.rows {
+                continue;
+            }
+            let c = (x as u32, y as u32);
+            if !walkable(g, c) {
+                continue;
+            }
+            let m = g.center(c);
+            let near = crate::engine::dist(m, [door[0], door[1], m[2]]) <= DOORWAY_RADIUS;
+            let under = || {
+                leaf.is_some_and(|l| {
+                    let z = height(g, c);
+                    let corners = [
+                        [m[0] - h, m[1] - h],
+                        [m[0] + h, m[1] - h],
+                        [m[0] + h, m[1] + h],
+                        [m[0] - h, m[1] + h],
+                    ];
+                    [0.5, 1.5].iter().any(|up| {
+                        (0..4).any(|i| {
+                            let (a, b) = (corners[i], corners[(i + 1) % 4]);
+                            l.blocked([a[0], a[1], z + up], [b[0], b[1], z + up])
+                        })
+                    })
+                })
+            };
+            if near || under() {
+                cells.push((c.1 * g.columns + c.0) as usize);
+            }
+        }
+    }
+    cells
+}
+
 /// An area's closed doors for sight lines (see [`Sim::door_sight`]).
 #[derive(Clone, Default)]
 pub struct DoorSight {
@@ -382,28 +446,20 @@ impl Sim {
             {
                 continue;
             }
-            let r = (DOORWAY_RADIUS / g.cell_size).ceil() as i32;
-            let Some((cx, cy)) = g.cell(o.position) else {
-                continue;
-            };
-            let mut cells = Vec::new();
-            for dy in -r..=r {
-                for dx in -r..=r {
-                    let (x, y) = (cx as i32 + dx, cy as i32 + dy);
-                    if x < 0 || y < 0 || x as u32 >= g.columns || y as u32 >= g.rows {
-                        continue;
+            // The door's own leaf, shut (its model's collision at rest), where there is
+            // game data to read it from.
+            let leaf = types
+                .as_ref()
+                .and_then(|t| match t.cell("ModelName", o.appearance as i64)? {
+                    thedas_formats::gda::Cell::String(m) => {
+                        Some(crate::engine::clean(m).to_string())
                     }
-                    let c = (x as u32, y as u32);
-                    let m = g.center(c);
-                    if walkable(&g, c)
-                        && crate::engine::dist(m, [o.position[0], o.position[1], m[2]])
-                            <= DOORWAY_RADIUS
-                    {
-                        cells.push((c.1 * g.columns + c.0) as usize);
-                    }
-                }
-            }
-            out.push((o.id, cells));
+                    _ => None,
+                })
+                .filter(|m| !m.is_empty())
+                .map(|m| crate::collision::load_placeables(&self.vfs, &[(m, o.position, o.facing)]))
+                .filter(|c| !c.is_empty());
+            out.push((o.id, doorway_cells(&g, o.position, leaf.as_ref())));
         }
         out
     }
@@ -1072,6 +1128,49 @@ mod tests {
             .fields
             .insert("State".into(), 1);
         assert_eq!(s.route_to(walker, [4.5, 1.5, 0.0]), Routed::Door(locked));
+    }
+
+    #[test]
+    fn a_wide_doors_doorway_is_as_wide_as_its_leaf() {
+        // A wall down column 10 (x 5.0 to 5.5) with a gap 3 m wide, rows 4 to 9; the door
+        // stands at its hinge at the gap's top and its leaf, shut, reaches 2.7 m down it.
+        let (w, h) = (20u32, 14u32);
+        let mut data = vec![1u8; (w * h) as usize];
+        for y in (0..h).filter(|y| !(4..10).contains(y)) {
+            data[(y * w + 10) as usize] = 10;
+        }
+        let g = NavGrid {
+            columns: w,
+            rows: h,
+            cell_size: 0.5,
+            clearance: 2.0,
+            base: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            data,
+            heights: vec![0.0; (w * h) as usize],
+            surfaces: Vec::new(),
+        };
+        let door = [5.25, 4.75, 0.0];
+        let gap: Vec<usize> = (4..10).map(|y| (y * w + 10) as usize).collect();
+        // By the radius alone the far half of the gap is left open (rows 4 to 6).
+        let by_radius = doorway_cells(&g, door, None);
+        assert!(gap[3..].iter().all(|c| by_radius.contains(c)));
+        assert!(gap[..3].iter().all(|c| !by_radius.contains(c)));
+        // With the leaf (a wall 2.7 m wide and 3.9 m tall from the hinge) all of it shuts.
+        let (top, bottom) = (4.75, 4.75 - 2.7);
+        let leaf = crate::collision::Collision::from_triangles(&[
+            [[5.25, bottom, 0.0], [5.25, top, 0.0], [5.25, top, 3.9]],
+            [[5.25, bottom, 0.0], [5.25, top, 3.9], [5.25, bottom, 3.9]],
+        ]);
+        let with_leaf = doorway_cells(&g, door, Some(&leaf));
+        assert!(gap.iter().all(|c| with_leaf.contains(c)), "{with_leaf:?}");
+        // Nothing beyond the wall's line is taken that the radius did not take.
+        assert!(
+            with_leaf
+                .iter()
+                .all(|c| by_radius.contains(c) || (c % w as usize) == 10),
+            "{with_leaf:?}"
+        );
     }
 
     #[test]
