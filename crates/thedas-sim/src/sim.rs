@@ -4354,8 +4354,26 @@ impl Host for ScriptHost<'_> {
             _ => None,
         });
         let mana_before = mana_target.map(|id| (id, self.sim.mana_now(id)));
-        let result = crate::engine::call(self, caller, f, &args)
-            .map(|r| r.map(|v| v.map(|v| numeric_as_declared(v, &f.ret))));
+        let mut result = crate::engine::call(self, caller, f, &args);
+        if let Some(Ok(Some(v))) = &mut result {
+            let declared = numeric_as_declared(v.clone(), &f.ret);
+            if declared != *v {
+                // Traced, so an arm answering in the wrong type shows up: on Dragon Age:
+                // Origins there should be none (each would be an arm to fix); Dragon Age II's
+                // retyped functions are expected here.
+                let t = self.sim.world.time_ms;
+                self.sim.world.trace.push(TraceEntry::Missing {
+                    t,
+                    what: format!(
+                        "engine function {} answered {}, declared {}",
+                        f.name,
+                        v.kind(),
+                        f.ret
+                    ),
+                });
+                *v = declared;
+            }
+        }
         if let Some((id, before)) = mana_before {
             self.sim.note_mana_change(id, before);
         }
