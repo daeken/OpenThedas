@@ -283,23 +283,31 @@ fn da2_model(path: &str, folder: &str, model: &str) -> String {
 }
 
 /// The models of a Dragon Age II creature with appearance row `app` of `apr_base.gda`.
+/// `worn` gives the `item_variations.gda` row of the item worn in an inventory slot
+/// (`INVENTORY_SLOT_CHEST`), and `exists` says whether a model resource does.
 ///
 /// Read from the shipped tables and resources (provisional; not traced in DragonAge2.exe,
-/// and the table columns are the ones xoreos names):
+/// and the table columns and the order below are the ones xoreos uses):
 /// - `ModelRace` and `ModelGenderOverride` are words (`Human`, `Male`) that join into the
 ///   folder its models are in (`humanmale`); a row with neither uses `shared`.
 /// - A whole-body row's `ModelName` is the model's full art path.
-/// - A part-based row (`ModelType` `P`) has no `ModelName`: its body is the chest, hands
-///   and feet of `item_variations.gda` (`ModelPath` and `Model`; the unclothed ones for now).
+/// - A part-based row (`ModelType` `P`) has no `ModelName`. Its chest, hands and feet each
+///   come from a row of `item_variations.gda` (`ModelPath` and `Model`): the appearance's
+///   own override (`ChestModelVariation`, `GlovesModelVariation`, `BootsModelVariation`),
+///   else the item worn in that slot, else the unclothed part; the first whose model
+///   exists. A chest of material group 5 (clothing) covers the hands and feet too.
+/// - A helmet (`HelmModelVariation`, else the item worn on the head) is added when its
+///   model exists.
 /// - The head is the first row of the race's head table (`Head_Worksheet`, a table id).
 ///
-/// Not done yet: worn equipment, head morphs (their node names are hashed), hair, tints
-/// and weapons. The names are what the tables say; the caller keeps the ones that exist.
+/// Not done yet: head morphs (their node names are hashed), hair, tints and weapons.
 fn da2_creature_models(
     sim: &Sim,
     apr: &thedas_sim::m2da::Table,
     variations: &thedas_sim::m2da::Table,
     app: i64,
+    worn: &dyn Fn(&str) -> Option<i64>,
+    exists: &dyn Fn(&str) -> bool,
 ) -> Vec<String> {
     let word = |column: &str| text(apr.cell(column, app)).unwrap_or_default();
     let folder = match format!("{}{}", word("ModelRace"), word("ModelGenderOverride")) {
@@ -309,19 +317,43 @@ fn da2_creature_models(
     let part = |table: &thedas_sim::m2da::Table, row: i64| {
         let model = text(table.cell("Model", row))?;
         let path = text(table.cell("ModelPath", row)).unwrap_or_default();
-        Some(da2_model(&path, &folder, &model))
+        Some(da2_model(&path, &folder, &model)).filter(|m| exists(m))
     };
     let mut models = Vec::new();
     if !apr.rows.contains_key(&app) {
         return models;
     }
+    let override_row = |column: &str| match apr.cell(column, app) {
+        Some(Cell::Int(v)) if *v > 0 => Some(*v),
+        _ => None,
+    };
+    // The appearance's own variation, else the worn item's, else the fallback: the first
+    // whose model exists, with its row.
+    let pick = |column: &str, slot: &str, fallback: Option<i64>| {
+        [override_row(column), worn(slot), fallback]
+            .into_iter()
+            .flatten()
+            .find_map(|row| Some((part(variations, row)?, row)))
+    };
     match text(apr.cell("ModelName", app)) {
-        Some(name) => models.push(name.to_ascii_lowercase()),
-        None if word("ModelType").eq_ignore_ascii_case("P") => models.extend(
-            DA2_UNCLOTHED
-                .iter()
-                .filter_map(|&row| part(variations, row)),
-        ),
+        Some(name) => models.extend(Some(name.to_ascii_lowercase()).filter(|m| exists(m))),
+        None if word("ModelType").eq_ignore_ascii_case("P") => {
+            let [chest, gloves, boots] = DA2_UNCLOTHED;
+            let torso = pick("ChestModelVariation", "INVENTORY_SLOT_CHEST", Some(chest));
+            let clothing = torso.as_ref().is_some_and(|(_, row)| {
+                matches!(variations.cell("MaterialGroup", *row), Some(Cell::Int(5)))
+            });
+            models.extend(torso.map(|(m, _)| m));
+            if !clothing {
+                for (column, slot, row) in [
+                    ("GlovesModelVariation", "INVENTORY_SLOT_GLOVES", gloves),
+                    ("BootsModelVariation", "INVENTORY_SLOT_BOOTS", boots),
+                ] {
+                    models.extend(pick(column, slot, Some(row)).map(|(m, _)| m));
+                }
+            }
+            models.extend(pick("HelmModelVariation", "INVENTORY_SLOT_HEAD", None).map(|(m, _)| m));
+        }
         None => {}
     }
     let heads = match apr.cell("Head_Worksheet", app) {
@@ -495,8 +527,12 @@ fn object_models_in(sim: &Sim, o: &Object, gear: Gear) -> Drawn {
             };
             let app = o.appearance as i64;
             if let Some(variations) = tables.get(0, DA2_ITEM_VARIATIONS) {
-                let mut models = da2_creature_models(sim, &t, &variations, app);
-                models.retain(|m| has_model(sim, m));
+                let worn = |slot: &str| {
+                    let item = equipped_in(sim, o, slot, gear)?;
+                    item.fields.get("ModelVariation").map(|v| *v as i64)
+                };
+                let models =
+                    da2_creature_models(sim, &t, &variations, app, &worn, &|m| has_model(sim, m));
                 return Drawn {
                     models,
                     ..Default::default()
@@ -1292,6 +1328,7 @@ mod tests {
                 "ModelRace",
                 "ModelGenderOverride",
                 "Head_Worksheet",
+                "ChestModelVariation",
             ],
             vec![
                 (
@@ -1303,6 +1340,18 @@ mod tests {
                         st("Human "),
                         st("Male "),
                         Cell::Int(13000),
+                    ],
+                ),
+                (
+                    16,
+                    vec![
+                        st("Guard - Human, Male"),
+                        Cell::Empty,
+                        st("P"),
+                        st("Human"),
+                        st("Male"),
+                        Cell::Int(13000),
+                        Cell::Int(4000),
                     ],
                 ),
                 (
@@ -1329,72 +1378,107 @@ mod tests {
                 ),
             ],
         );
+        let pc = "art\\characters\\playercharacter";
+        let row = |label: &str, model: &str, group: i64| {
+            vec![st(label), st(pc), st(model), Cell::Int(group)]
+        };
         t.insert(
             DA2_ITEM_VARIATIONS,
-            &["Label", "ModelPath", "Model"],
+            &["Label", "ModelPath", "Model", "MaterialGroup"],
             vec![
-                (
-                    10,
-                    vec![
-                        st("Nude - Chest"),
-                        st("art\\characters\\playercharacter "),
-                        st("arm_nuda "),
-                    ],
-                ),
-                (
-                    11,
-                    vec![
-                        st("Nude - Hands"),
-                        st("art\\characters\\playercharacter"),
-                        st("glv_nuda"),
-                    ],
-                ),
-                (
-                    12,
-                    vec![
-                        st("Nude - Boots"),
-                        st("art\\characters\\playercharacter"),
-                        st("boo_nuda"),
-                    ],
-                ),
+                (10, row("Nude - Chest", "arm_nuda ", 0)),
+                (11, row("Nude - Hands", "glv_nuda", 0)),
+                (12, row("Nude - Boots", "boo_nuda", 0)),
+                (4000, row("Heavy - Chest A", "arm_masa", 3)),
+                (4001, row("Heavy - Chest B", "arm_missing", 3)),
+                (4100, row("Heavy - Gloves A", "glv_masa", 3)),
+                (5013, row("Heavy - Helm L", "hlh_masa", 3)),
+                (6000, row("Clothing A", "cth_coma", 5)),
             ],
         );
         t.insert(
             "#13000",
             &["Label", "ModelPath", "Model"],
-            vec![(
-                1,
-                vec![
-                    st("Default"),
-                    st("art\\characters\\playercharacter"),
-                    st("mt_bas_hm"),
-                ],
-            )],
+            vec![(1, vec![st("Default"), st(pc), st("mt_bas_hm")])],
         );
         let apr = t.get(0, "apr_base").unwrap();
         let vars = t.get(0, DA2_ITEM_VARIATIONS).unwrap();
-        let models = |app| da2_creature_models(&s, &apr, &vars, app);
-        // Part-based: the unclothed chest, hands and feet, then the race's base head.
+        let exists = |m: &str| !m.ends_with("arm_missing");
+        let hm = |m: &str| format!("{pc}\\humanmale\\{m}");
+        let wearing = |app, gear: &'static [(&'static str, i64)]| {
+            let worn = move |slot: &str| gear.iter().find(|(s, _)| *s == slot).map(|(_, v)| *v);
+            da2_creature_models(&s, &apr, &vars, app, &worn, &exists)
+        };
+        // Part-based, wearing nothing: the unclothed chest, hands and feet, then the head.
         assert_eq!(
-            models(15),
+            wearing(15, &[]),
             [
-                "art\\characters\\playercharacter\\humanmale\\arm_nuda",
-                "art\\characters\\playercharacter\\humanmale\\glv_nuda",
-                "art\\characters\\playercharacter\\humanmale\\boo_nuda",
-                "art\\characters\\playercharacter\\humanmale\\mt_bas_hm",
+                hm("arm_nuda"),
+                hm("glv_nuda"),
+                hm("boo_nuda"),
+                hm("mt_bas_hm")
+            ]
+        );
+        // Worn items replace their parts; a helmet is added.
+        assert_eq!(
+            wearing(
+                15,
+                &[
+                    ("INVENTORY_SLOT_CHEST", 4000),
+                    ("INVENTORY_SLOT_GLOVES", 4100),
+                    ("INVENTORY_SLOT_HEAD", 5013),
+                ]
+            ),
+            [
+                hm("arm_masa"),
+                hm("glv_masa"),
+                hm("boo_nuda"),
+                hm("hlh_masa"),
+                hm("mt_bas_hm")
+            ]
+        );
+        // An item whose model does not exist, or with no such row, leaves the unclothed part.
+        assert_eq!(
+            wearing(
+                15,
+                &[("INVENTORY_SLOT_CHEST", 4001), ("INVENTORY_SLOT_BOOTS", 77)]
+            ),
+            [
+                hm("arm_nuda"),
+                hm("glv_nuda"),
+                hm("boo_nuda"),
+                hm("mt_bas_hm")
+            ]
+        );
+        // Clothing covers the hands and feet.
+        assert_eq!(
+            wearing(
+                15,
+                &[
+                    ("INVENTORY_SLOT_CHEST", 6000),
+                    ("INVENTORY_SLOT_GLOVES", 4100)
+                ]
+            ),
+            [hm("cth_coma"), hm("mt_bas_hm")]
+        );
+        // The appearance's own chest wins over the worn one.
+        assert_eq!(
+            wearing(16, &[("INVENTORY_SLOT_CHEST", 6000)]),
+            [
+                hm("arm_masa"),
+                hm("glv_nuda"),
+                hm("boo_nuda"),
+                hm("mt_bas_hm")
             ]
         );
         // Whole body with a head: the row's own model, then the head.
-        assert_eq!(
-            models(17),
-            [
-                "art\\characters\\playercharacter\\humanmale\\cth_homa",
-                "art\\characters\\playercharacter\\humanmale\\mt_bas_hm",
-            ]
-        );
+        assert_eq!(wearing(17, &[]), [hm("cth_homa"), hm("mt_bas_hm")]);
         // A creature with neither race nor head table: just its model.
-        assert_eq!(models(90), ["art\\characters\\creatures\\mabari\\c_dog"]);
-        assert!(models(999).is_empty(), "no such appearance");
+        assert_eq!(
+            wearing(90, &[]),
+            ["art\\characters\\creatures\\mabari\\c_dog"]
+        );
+        assert!(wearing(999, &[]).is_empty(), "no such appearance");
     }
 
     #[test]
