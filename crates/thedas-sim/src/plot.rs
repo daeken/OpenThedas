@@ -178,8 +178,20 @@ pub struct Plots {
     /// While a report is being made (see [`Sim::conversation_conditions`]), every flag read,
     /// outermost first.
     pub(crate) reads: Option<Vec<FlagRead>>,
-    /// While a report is being made, every flag set: (plot GUID, flag, value).
-    pub(crate) sets: Option<Vec<(String, i32, bool)>>,
+    /// While a report is being made or a command applied, every flag set.
+    pub(crate) sets: Option<Vec<FlagChange>>,
+}
+
+/// A plot flag set, with what it replaced.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FlagChange {
+    /// The plot's GUID.
+    pub plot: String,
+    pub flag: i32,
+    pub value: bool,
+    /// The stored value it replaced (what to set back to undo it); `None` for a defined
+    /// flag ([`DEFINED_FLAGS`] and up), which stores nothing.
+    pub replaced: Option<bool>,
 }
 
 /// A plot flag read while a condition was evaluated.
@@ -541,12 +553,6 @@ impl Sim {
         }
     }
 
-    /// The value an ordinary flag holds now, as an undo puts it back.
-    pub(crate) fn stored_flag_for_undo(&mut self, plot: &str, flag: i32) -> bool {
-        let key = self.plot_key(plot);
-        self.stored_plot_flag(plot, key, flag)
-    }
-
     /// Whether a script has set an ordinary flag: the stored value only, not the value the
     /// plot file starts it with (the journal counts what happened; a Chanter's Board posting
     /// starts set). Defined flags are never stored and read false.
@@ -589,7 +595,12 @@ impl Sim {
             }
         }
         if let Some(sets) = self.plots.sets.as_mut() {
-            sets.push((key.clone(), flag, value));
+            sets.push(FlagChange {
+                plot: key.clone(),
+                flag,
+                value,
+                replaced: (!defined).then_some(old),
+            });
         }
         let t = self.world.time_ms;
         self.world.trace.push(TraceEntry::PlotFlag {

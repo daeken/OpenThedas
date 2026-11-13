@@ -252,9 +252,9 @@ pub struct NodeCondition {
     pub usable: bool,
     /// The plot flags its condition read, in order.
     pub reads: Vec<crate::plot::FlagRead>,
-    /// Plot flags its condition's scripts set while it was evaluated (a condition is not
-    /// meant to change anything, but scripts can): (plot, flag, value).
-    pub sets: Vec<(String, i32, bool)>,
+    /// Plot flags its condition's scripts would set (a condition is not meant to change
+    /// anything, but scripts can). The report itself changes nothing: they are undone.
+    pub sets: Vec<crate::plot::FlagChange>,
 }
 
 /// An open conversation as presentation sees it: its dialog (resource name without
@@ -528,8 +528,9 @@ impl Sim {
     /// Every line and reply of conversation `dialog` (empty: `owner`'s own) with the plot
     /// flags its condition reads and whether it could be used now, as the conversation would
     /// be opened by the hero with `owner`. The conditions run as they would when the
-    /// conversation is walked, so a condition script that sets flags sets them (reported
-    /// in `sets`). `None` when there is no such conversation.
+    /// conversation is walked, then the world is put back as it was: what a condition
+    /// script would set is reported in `sets` and not kept (the world, the random numbers,
+    /// the conversations going on). `None` when there is no such conversation.
     pub fn conversation_conditions(
         &mut self,
         owner: ObjectId,
@@ -566,6 +567,11 @@ impl Sim {
             staged_at: None,
             ambient_run: false,
         };
+        // Conditions' scripts can set flags, draw random numbers and change objects: all of
+        // it is undone when the report is made.
+        let world = self.world.clone();
+        let talk = self.talk.clone();
+        let ambient = self.ambient.clone();
         let ambient_before = self.dialog_ambient;
         let mut out = Vec::new();
         for (i, n) in d.nodes.iter().enumerate() {
@@ -584,6 +590,12 @@ impl Sim {
                 sets,
             });
         }
+        // The trace keeps what ran (it is not part of the world as saved).
+        let trace = std::mem::take(&mut self.world.trace);
+        self.world = world;
+        self.world.trace = trace;
+        self.talk = talk;
+        self.ambient = ambient;
         self.dialog_ambient = ambient_before;
         out
     }

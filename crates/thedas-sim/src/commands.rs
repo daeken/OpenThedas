@@ -49,15 +49,33 @@ pub enum CommandOutcome {
     /// The flag was set. `replaced` is the stored value it replaced (what to set back to
     /// undo it); `None` for a defined flag, which stores nothing (its plot script answers
     /// for it, so there is nothing to put back).
+    /// `changed` is every flag the command set, the plot scripts' own sets included, in
+    /// order, each with what it replaced: undo sets them back in reverse.
     PlotFlagSet {
         plot: String,
         replaced: Option<bool>,
+        changed: Vec<crate::plot::FlagChange>,
     },
-    /// The conversation started (`opened`: on the dialog screen; otherwise said in passing
-    /// or waiting for the open one to end).
+    /// The conversation started: `opened` on the dialog screen, else said in passing.
     ConversationStarted { dialog: String, opened: bool },
+    /// Another conversation is open: this one starts when it ends (if its owner is still
+    /// there to talk).
+    ConversationQueued { dialog: String },
     /// Nothing was done.
     Refused { reason: String },
+}
+
+/// An object named by a command, as it can be found again in another session: object
+/// ids change between sessions (add-ins shift them), so its tag, area and template are
+/// kept with the id the live call used.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ObjectRef {
+    pub id: ObjectId,
+    pub tag: String,
+    /// The tag of the area it was in.
+    pub area: Option<String>,
+    /// Its template (resource name).
+    pub template: String,
 }
 
 /// A command given, and what it did.
@@ -68,6 +86,9 @@ pub struct JournalEntry {
     pub source: CommandSource,
     pub command: SimCommand,
     pub outcome: CommandOutcome,
+    /// The objects the command named (a conversation's initiator, then its owner).
+    #[serde(default)]
+    pub objects: Vec<ObjectRef>,
 }
 
 impl Sim {
@@ -86,13 +107,22 @@ impl Sim {
                     }
                 } else {
                     let key = self.plot_key(plot);
-                    let replaced = (*flag < crate::plot::DEFINED_FLAGS)
-                        .then(|| self.stored_flag_for_undo(plot, *flag));
                     let owner = self.world.hero.unwrap_or(OBJECT_INVALID);
+                    let outer = self.plots.sets.replace(Vec::new());
                     self.set_plot_flag(plot, *flag, *value, *call_script, owner);
+                    let changed =
+                        std::mem::replace(&mut self.plots.sets, outer).unwrap_or_default();
+                    let replaced = changed
+                        .iter()
+                        .find(|c| c.plot == key && c.flag == *flag)
+                        .and_then(|c| c.replaced);
+                    if let Some(sets) = self.plots.sets.as_mut() {
+                        sets.extend(changed.iter().cloned());
+                    }
                     CommandOutcome::PlotFlagSet {
                         plot: key,
                         replaced,
+                        changed,
                     }
                 }
             }
@@ -102,11 +132,21 @@ impl Sim {
                 dialog,
             } => self.start_commanded_conversation(*initiator, *target, dialog),
         };
+        let objects = match &command {
+            SimCommand::StartConversation {
+                initiator, target, ..
+            } => [*initiator, *target]
+                .iter()
+                .filter_map(|&id| self.object_ref(id))
+                .collect(),
+            SimCommand::SetPlotFlag { .. } => Vec::new(),
+        };
         let entry = JournalEntry {
             t: self.world.time_ms,
             source,
             command,
             outcome: outcome.clone(),
+            objects,
         };
         let journal = &mut self.world.command_journal;
         journal.push(entry);
@@ -150,19 +190,45 @@ impl Sim {
             return refused("no such initiator");
         }
         let was_open = self.talk.as_ref().is_some_and(|c| !c.ended);
+        let waiting = self.world.pending_talks.len();
         if !self.start_conversation(initiator, target, dialog) {
             return refused("the conversation could not be read, or the owner has none");
         }
-        let name = self
-            .talk
-            .as_ref()
-            .map(|c| c.dlg.name.clone())
-            .unwrap_or_else(|| dialog.to_string());
+        if self.world.pending_talks.len() > waiting
+            && let Some((_, _, d)) = self.world.pending_talks.last()
+        {
+            return CommandOutcome::ConversationQueued {
+                dialog: d.name.clone(),
+            };
+        }
         let opened = !was_open && self.talk.as_ref().is_some_and(|c| !c.ended);
+        let name = if opened {
+            self.talk.as_ref().map(|c| c.dlg.name.clone())
+        } else {
+            self.ambient
+                .iter()
+                .find(|a| a.c.owner == target)
+                .map(|a| a.c.dlg.name.clone())
+        }
+        .unwrap_or_else(|| dialog.to_string());
         CommandOutcome::ConversationStarted {
             dialog: name,
             opened,
         }
+    }
+
+    /// How an object can be found again in another session.
+    fn object_ref(&self, id: ObjectId) -> Option<ObjectRef> {
+        let o = self.world.get(id)?;
+        Some(ObjectRef {
+            id,
+            tag: o.tag.clone(),
+            area: o
+                .area
+                .and_then(|a| self.world.get(a))
+                .map(|a| a.tag.clone()),
+            template: o.template.clone(),
+        })
     }
 }
 
@@ -210,7 +276,13 @@ mod tests {
             }
         );
         assert_eq!(s.world.command_journal.len(), 2);
-        assert_eq!(s.world.command_journal[1].source, CommandSource::ModMode);
+        let e = &s.world.command_journal[1];
+        assert_eq!(e.source, CommandSource::ModMode);
+        // The objects are kept as they can be found again.
+        assert_eq!(
+            e.objects.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>(),
+            ["player", "gone"]
+        );
     }
 
     #[test]
