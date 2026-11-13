@@ -25,6 +25,27 @@ pub struct Clip {
     /// As a layer, its translations are measured against the first layer's first keys (a
     /// cutscene's animations; see [`crate::skeleton::Skeleton::pose_layers`]).
     pub absolute: bool,
+    /// As an additive layer, how much of it is laid on
+    /// ([`crate::skeleton::Skeleton::pose_weighted`]); 1 otherwise.
+    pub weight: f32,
+    /// Set for a head tracking pose animation ([`crate::look`]): how far through its sweep
+    /// it stands, 0 to 1, in place of `time` (`phase × (length − 1/30) + 1/30` seconds).
+    pub phase: Option<f32>,
+}
+
+impl Default for Clip {
+    fn default() -> Self {
+        Clip {
+            trees: Vec::new(),
+            actions: Vec::new(),
+            time: 0.0,
+            looping: false,
+            layers: Vec::new(),
+            absolute: false,
+            weight: 1.0,
+            phase: None,
+        }
+    }
 }
 
 /// A tree's resource: a name with an extension (`bdccs_intro.cub`, a cutscene's tree) as
@@ -153,21 +174,24 @@ impl Animator {
     ) -> Option<(Arc<Vec<Mat4>>, Vec<Mat4>)> {
         let s = scene.skeletons.get(skeleton)?.clone();
         let time = |c: &Clip, a: &Animation| {
-            if c.looping && a.length > 0.0 {
+            if let Some(phase) = c.phase {
+                const FRAME: f32 = 1.0 / 30.0;
+                phase * (a.length - FRAME) + FRAME
+            } else if c.looping && a.length > 0.0 {
                 c.time.rem_euclid(a.length)
             } else {
                 c.time.min(a.length)
             }
         };
-        let mut layers: Vec<(Arc<Animation>, f32, bool)> = Vec::new();
+        let mut layers: Vec<(Arc<Animation>, f32, bool, f32)> = Vec::new();
         if let Some(anim) = self.animation(vfs, clip) {
             let t = time(clip, &anim);
-            layers.push((anim, t, clip.absolute));
+            layers.push((anim, t, clip.absolute, clip.weight));
         }
         for l in &clip.layers {
             if let Some(anim) = self.animation(vfs, l) {
                 let t = time(l, &anim);
-                layers.push((anim, t, l.absolute));
+                layers.push((anim, t, l.absolute, l.weight));
             }
         }
         if layers.is_empty() {
@@ -178,11 +202,11 @@ impl Animator {
             .entry(skeleton)
             .or_insert_with(|| Arc::new(s.rest()))
             .clone();
-        let refs: Vec<(&Animation, f32, bool)> = layers
+        let refs: Vec<(&Animation, f32, bool, f32)> = layers
             .iter()
-            .map(|(a, t, b)| (a.as_ref(), *t, *b))
+            .map(|(a, t, b, w)| (a.as_ref(), *t, *b, *w))
             .collect();
-        Some((rest, s.pose_layers(&refs)))
+        Some((rest, s.pose_weighted(&refs)))
     }
 }
 

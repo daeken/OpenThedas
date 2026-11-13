@@ -115,7 +115,7 @@ these, so they are the places where one person or stream can take a large, separ
 - **Screen effects.** Distortion other than heat haze from particles (`RND-107`), cutscene
   screen effects other than depth of field and fades (`RND-158`), script-driven screen effects,
   anti-aliasing,
-  decals, trails, weather, selection circles and area-map fog are not drawn; transparent draws
+  decals, trails, weather and area-map fog are not drawn; transparent draws
   are not sorted.
 
 ### Interface and input
