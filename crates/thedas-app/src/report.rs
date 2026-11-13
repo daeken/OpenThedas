@@ -8,7 +8,8 @@
 //!   kept in memory while playing ([`SNAPSHOT_EVERY`], [`SNAPSHOTS_KEPT`]);
 //! - `report.json`: the build (version, commit), the platform and GPU, the window and the
 //!   settings in force, where the game was (area, leader, party, conversation, cutscene,
-//!   screens), the frame times, and what the snapshots cover;
+//!   screens), the layers the player has over the install (`mods`: the original's override
+//!   and add-in folders, the mod list), the frame times, and what the snapshots cover;
 //! - `log.txt`: the last [`LOG_LINES`] log lines;
 //! - `trace.json`: the simulation's last [`TRACE_RECENT`] orders, script log lines,
 //!   conversation lines, plot flags, failed scripts and missing functions and resources

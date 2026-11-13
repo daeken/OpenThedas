@@ -169,7 +169,12 @@ fn message(dir: &Path, info: &J) -> String {
         .map_or("unknown", |c| &c[..c.len().min(9)]);
     let gpu = info["gpu"]["name"].as_str().unwrap_or("unknown GPU");
     let os = build["os"].as_str().unwrap_or("?");
-    let head = format!("**Issue report** in {place}\nBuild `{commit}`, {os}, {gpu}");
+    let mods = match info["mods"].as_array().map_or(0, Vec::len) {
+        0 => String::new(),
+        1 => ", 1 mod layer".to_string(),
+        n => format!(", {n} mod layers"),
+    };
+    let head = format!("**Issue report** in {place}\nBuild `{commit}`, {os}, {gpu}{mods}");
     let room = 1900usize.saturating_sub(head.len());
     let note = if note.is_empty() {
         "(no note)".to_string()
@@ -413,6 +418,11 @@ mod tests {
             m.starts_with("the door would not open\n\n**Issue report** in Lothering (lot100ar)")
         );
         assert!(m.contains("`012345678`, windows, Test GPU"));
+        assert!(!m.contains("mod layer"));
+        let mut modded = info.clone();
+        modded["mods"] =
+            json!([{ "layer": "mod:a", "files": 3 }, { "layer": "user:x", "files": 1 }]);
+        assert!(message(&dir, &modded).contains("Test GPU, 2 mod layers"));
         std::fs::write(dir.join("note.txt"), "x".repeat(5000)).unwrap();
         assert!(message(&dir, &info).chars().count() <= 2000);
         let _ = std::fs::remove_dir_all(&dir);
