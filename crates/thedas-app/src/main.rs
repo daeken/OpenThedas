@@ -183,8 +183,9 @@ struct Args {
     /// `pad stick-right X,Y MS` (a stick held there while the game runs MS, then let go).
     #[arg(long, default_value = "")]
     steps: String,
-    /// Module for `--save` and `--objects`.
-    #[arg(long, default_value = "single player")]
+    /// Module for `--save` and `--objects`; the install's base campaign when not given
+    /// (`single player`, or `campaign_base` for Dragon Age II).
+    #[arg(long, default_value = "")]
     module: String,
     /// Window, playing: take input from local clients on this loopback address
     /// (`127.0.0.1:7878`), as `thedas-mcp`'s `attach` sends it.
@@ -636,6 +637,11 @@ struct App {
     returning: Returning,
     /// Answers to its questions, taken from the interface, acted on next frame.
     update_answers: Vec<ui::TextAnswer>,
+    /// Answers about marking spots for a report, acted on next frame.
+    mark_answers: Vec<ui::TextAnswer>,
+    /// The last input came from a game controller (not the mouse or keyboard): a report
+    /// then skips marking spots, which needs the mouse.
+    pad_last: bool,
 }
 
 /// Where the way back from a report is (see [`update`]).
@@ -732,6 +738,56 @@ struct ReportWait {
     /// and whether the report paused it (it carries on when the report is done).
     pause: bool,
     paused_it: bool,
+    /// Marking spots on the screen before the note (see [`Marking`]).
+    marking: Marking,
+}
+
+/// Marking spots on the screen for a report: offered first (a choice), then boxes dragged
+/// with the mouse, each asked for its note, until F8, Enter or Escape; the note is asked
+/// after. Ours, not the original's.
+#[derive(Clone, Debug, Default, PartialEq)]
+enum Marking {
+    #[default]
+    Off,
+    /// The choice is asked: frames since asked (or seen up), and times it did not show.
+    Offered(u32, u32),
+    /// Boxes are being drawn: the one being dragged (from, to), and the one whose note
+    /// is being asked, with frames and tries as for the choice.
+    On {
+        drag: Option<(glam::Vec2, glam::Vec2)>,
+        asking: Option<([f32; 4], u32, u32)>,
+    },
+}
+
+/// Smallest box (pixels a side) taken as a marked spot; smaller is a stray click.
+const MIN_MARK: f32 = 8.0;
+
+fn ask_mark_choice(ui: &mut ui::UiLayer) {
+    ui.ask_choice(
+        report::MARK_ID,
+        report::MARK_PROMPT,
+        "Mark spots",
+        "Just a note",
+    );
+}
+
+fn ask_region_note(ui: &mut ui::UiLayer) {
+    ui.ask_text(
+        report::REGION_ID,
+        report::REGION_PROMPT,
+        "",
+        "Add note",
+        "Remove box",
+    );
+}
+
+/// Whether the game's message box shows `prompt` now.
+fn box_shows(ui: &ui::UiLayer, prompt: &str) -> bool {
+    ui.stage.dialog_up()
+        && matches!(
+            ui.stage.bridge.value("GUIPopupLayer.DialogBoxText"),
+            Some(thedas_ui::UiValue::String(t)) if t == prompt
+        )
 }
 
 /// What the window's surface gave a redraw.
@@ -1325,6 +1381,7 @@ impl App {
             live.set_hovered(hovered);
         }
         let voiced = self.line_voiced();
+        let marks = self.marking_lines();
         self.show_cursor();
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
@@ -1368,6 +1425,10 @@ impl App {
                 self.update_answers.push(a);
                 continue;
             }
+            if (a.id == report::MARK_ID || a.id == report::REGION_ID) && self.recorder.busy() {
+                self.mark_answers.push(a);
+                continue;
+            }
             if a.id == report::NOTE_ID && self.recorder.busy() {
                 if let Some(w) = self.report_wait.as_mut() {
                     w.note_asked = None;
@@ -1398,7 +1459,8 @@ impl App {
         let ctx = self
             .pad
             .context_for(self.screens.as_ref(), g.ui.stage.dialog_up());
-        let pointer = self.pad.pointer(self.cursor, ctx);
+        let mut pointer = self.pad.pointer(self.cursor, ctx);
+        pointer.extend(marks);
         g.reticle
             .draw(&g.ctx.device, &mut encoder, &view, size, &pointer);
         let readback = (!self.frame_requests.is_empty())
@@ -1521,6 +1583,10 @@ impl App {
             // this computer only, unsent.
             if (UPDATE_ASK_ID..UPDATE_ASK_ID + 5).contains(&a.id) {
                 self.update_answers.push(a);
+                continue;
+            }
+            if (a.id == report::MARK_ID || a.id == report::REGION_ID) && self.recorder.busy() {
+                self.mark_answers.push(a);
                 continue;
             }
             if a.id == report::NOTE_ID && self.recorder.busy() {
@@ -1669,8 +1735,15 @@ impl App {
         let in_game = self.live.as_ref().is_some_and(|l| !l.front_end)
             && self.screens.as_ref().is_some_and(|s| !s.front_end);
         let mut note_asked = None;
+        let mut marking = Marking::Off;
         match (report::preset_note(note), self.gfx.as_mut()) {
             (Some(text), _) => self.recorder.note(Some(text)),
+            // With the mouse, the player may first mark spots on the screen; the pad
+            // cannot draw boxes yet, so it goes straight to the note.
+            (None, Some(g)) if in_game && !self.pad_last => {
+                ask_mark_choice(&mut g.ui);
+                marking = Marking::Offered(0, 0);
+            }
             (None, Some(g)) if in_game => {
                 ask_report_note(&mut g.ui, self.pad.used);
                 note_asked = Some((0, 0));
@@ -1684,13 +1757,163 @@ impl App {
             send: true,
             pause,
             paused_it: false,
+            marking,
         });
+    }
+
+    /// Ends marking spots and asks the report's note.
+    fn end_marking(&mut self) {
+        let pad = self.pad.used;
+        if let (Some(w), Some(g)) = (self.report_wait.as_mut(), self.gfx.as_mut()) {
+            w.marking = Marking::Off;
+            ask_report_note(&mut g.ui, pad);
+            w.note_asked = Some((0, 0));
+        }
+    }
+
+    /// Whether boxes are being drawn for a report (the mouse and keys are its).
+    fn marking(&self) -> bool {
+        self.report_wait
+            .as_ref()
+            .is_some_and(|w| matches!(w.marking, Marking::On { .. }))
+    }
+
+    /// The marked spots and the box being dragged, as lines over the frame.
+    fn marking_lines(&self) -> Vec<[glam::Vec2; 2]> {
+        let Some(w) = self.report_wait.as_ref() else {
+            return Vec::new();
+        };
+        let Marking::On { drag, asking } = &w.marking else {
+            return Vec::new();
+        };
+        let height = self.gfx.as_ref().map_or(self.size.1, |g| g.config.height);
+        let h = report::digit_height(height);
+        let done = self.recorder.regions();
+        let mut out: Vec<_> = done
+            .iter()
+            .enumerate()
+            .flat_map(|(i, r)| report::region_lines(r.rect, Some(i + 1), h))
+            .collect();
+        if let Some((rect, ..)) = asking {
+            out.extend(report::region_lines(*rect, Some(done.len() + 1), h));
+        }
+        if let Some((a, b)) = drag {
+            out.extend(report::region_lines(report::rect_of(*a, *b), None, h));
+        }
+        out
+    }
+
+    /// An answer about marking: the choice, or a marked spot's note.
+    fn mark_answer(&mut self, a: ui::TextAnswer) {
+        let Some(w) = self.report_wait.as_mut() else {
+            return;
+        };
+        match (a.id, &mut w.marking) {
+            (report::MARK_ID, Marking::Offered(..)) if a.accepted => {
+                w.marking = Marking::On {
+                    drag: None,
+                    asking: None,
+                };
+            }
+            (report::MARK_ID, Marking::Offered(..)) => self.end_marking(),
+            (report::REGION_ID, Marking::On { asking, .. }) => {
+                if let Some((rect, ..)) = asking.take() {
+                    if a.accepted {
+                        self.recorder.add_region(report::Region {
+                            rect,
+                            note: a.text.trim().to_string(),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// One frame of marking: the choice and a spot's note asked again when they do not
+    /// show (as the report's note is), the choice given up after a few tries.
+    fn marking_frame(&mut self) {
+        let (Some(w), Some(g)) = (self.report_wait.as_mut(), self.gfx.as_mut()) else {
+            return;
+        };
+        let up = g.ui.stage.dialog_up();
+        match &mut w.marking {
+            Marking::Off => {}
+            Marking::Offered(frames, tries) => {
+                *frames += 1;
+                if box_shows(&g.ui, report::MARK_PROMPT) {
+                    *frames = 0;
+                } else if *frames > NOTE_REASK_FRAMES {
+                    *frames = 0;
+                    *tries += 1;
+                    if *tries > NOTE_TRIES {
+                        self.end_marking();
+                    } else if !up {
+                        ask_mark_choice(&mut g.ui);
+                    }
+                }
+            }
+            Marking::On { asking, .. } => {
+                if let Some((_, frames, tries)) = asking.as_mut() {
+                    *frames += 1;
+                    if box_shows(&g.ui, report::REGION_PROMPT) {
+                        *frames = 0;
+                    } else if *frames > NOTE_REASK_FRAMES {
+                        *frames = 0;
+                        *tries += 1;
+                        if *tries > NOTE_TRIES {
+                            *asking = None;
+                        } else if !up {
+                            ask_region_note(&mut g.ui);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The mouse while marking: a press starts a box, a release ends it and asks its note.
+    /// Returns whether marking took the press.
+    fn mark_button(&mut self, pressed: bool) -> bool {
+        if !self.marking() {
+            return false;
+        }
+        let at = glam::Vec2::new(self.cursor.0 as f32, self.cursor.1 as f32);
+        let Some(w) = self.report_wait.as_mut() else {
+            return false;
+        };
+        let Marking::On { drag, asking } = &mut w.marking else {
+            return false;
+        };
+        // While a spot's note is asked, the mouse is the text box's.
+        if asking.is_some() {
+            return false;
+        }
+        if pressed {
+            *drag = Some((at, at));
+            return true;
+        }
+        let Some((from, _)) = drag.take() else {
+            return true;
+        };
+        let rect = report::rect_of(from, at);
+        if rect[2] - rect[0] >= MIN_MARK && rect[3] - rect[1] >= MIN_MARK {
+            *asking = Some((rect, 0, 0));
+            if let Some(g) = self.gfx.as_mut() {
+                ask_region_note(&mut g.ui);
+            }
+        }
+        true
     }
 
     /// One frame of reports: a snapshot of the game when one is due, and a report under
     /// way finished once its screenshot and note are in.
     fn report_frame(&mut self, dt_ms: f64) {
         self.recorder.frame(dt_ms);
+        for a in std::mem::take(&mut self.mark_answers) {
+            self.mark_answer(a);
+        }
+        self.marking_frame();
         let now = Instant::now();
         if self.recorder.snapshot_due(now) {
             self.take_snapshot(now);
@@ -2220,7 +2443,14 @@ impl App {
     /// A key pressed (not a repeat). Returns whether the game should close.
     fn key_down(&mut self, code: KeyCode) -> bool {
         self.recorder.input(format!("key {code:?}"));
+        self.pad_last = false;
         match code {
+            // Marking spots for a report: F8, Enter or Escape is done.
+            KeyCode::F8 | KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Escape
+                if self.marking() =>
+            {
+                self.end_marking();
+            }
             // An issue report (see [`report`]): ours, not the original's.
             KeyCode::F8 => self.report(None, None),
             // Escape closes the screen up, else opens the game menu over a game; the viewer
@@ -2313,6 +2543,9 @@ impl App {
     /// the list or text under the mouse scrolls; elsewhere the game camera zooms.
     fn wheel(&mut self, steps: f64) {
         self.recorder.input(format!("wheel {steps:.2}"));
+        if self.marking() {
+            return;
+        }
         let (x, y) = self.cursor;
         if let Some(g) = self.gfx.as_mut() {
             let on_ui = self
@@ -2335,6 +2568,14 @@ impl App {
     /// The mouse moves to window pixel (`x`, `y`).
     fn cursor_to(&mut self, x: f64, y: f64) {
         self.cursor = (x, y);
+        self.pad_last = false;
+        if let Some(Marking::On {
+            drag: Some((_, to)),
+            ..
+        }) = self.report_wait.as_mut().map(|w| &mut w.marking)
+        {
+            *to = glam::Vec2::new(x as f32, y as f32);
+        }
         if let Some(g) = self.gfx.as_mut() {
             g.ui.mouse_move(x, y);
         }
@@ -2348,6 +2589,11 @@ impl App {
             "{} {x:.0},{y:.0}",
             if pressed { "press" } else { "release" }
         ));
+        // Marking spots for a report: the press draws a box, the world and interface do
+        // not see it.
+        if self.mark_button(pressed) {
+            return;
+        }
         // A click skips a cutscene. Provisional: the game's own skip key is not traced.
         if pressed
             && self
@@ -2407,6 +2653,10 @@ impl App {
 
     /// The right button goes down or up at the cursor.
     fn right_button(&mut self, pressed: bool) {
+        // Marking spots: the camera holds still, so the boxes stay on what they mark.
+        if self.marking() {
+            return;
+        }
         let (x, y) = self.cursor;
         self.recorder.input(format!(
             "{} {x:.0},{y:.0}",
@@ -2477,6 +2727,10 @@ impl App {
                     l.sim().party_picker();
                 }
                 log.push("party picker".into());
+            }
+            Step::Report => {
+                self.key_down(KeyCode::F8);
+                log.push("key f8".into());
             }
             &Step::Saves(mode) => {
                 if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_mut()) {
@@ -2914,11 +3168,9 @@ impl App {
         let ctx = self
             .pad
             .context_for(self.screens.as_ref(), g.ui.stage.dialog_up());
-        reticle::draw_rgba(
-            &mut frame.pixels,
-            (w, h),
-            &self.pad.pointer(self.cursor, ctx),
-        );
+        let mut over = self.pad.pointer(self.cursor, ctx);
+        over.extend(self.marking_lines());
+        reticle::draw_rgba(&mut frame.pixels, (w, h), &over);
         Ok(frame)
     }
 
@@ -2927,6 +3179,9 @@ impl App {
     fn pad_frame(&mut self, dt_ms: f64) {
         let device = self.pads.as_mut().map(|p| p.poll()).unwrap_or_default();
         let state = device.merged(&self.remote_pad);
+        if !state.is_idle() {
+            self.pad_last = true;
+        }
         let mut pad = std::mem::take(&mut self.pad);
         for m in pad.frame(&state, self, dt_ms) {
             log::info!("pad: {m}");
@@ -3388,6 +3643,7 @@ fn audio_state(
         movie,
         ..Default::default()
     };
+    let mut ambient = Vec::new();
     if let Some(ui) = ui {
         state.gui_sounds = ui.stage.bridge.drain_sounds();
         // Character creation's voice previews: always said, by nobody in particular.
@@ -3395,6 +3651,7 @@ fn audio_state(
             state.sound_sets.push((set, entry, 1.0, None));
         }
         state.volumes = audio::volumes(|n| ui.client_option(n));
+        ambient = ui.drain_ambient_lines();
     }
     let Some(live) = live else {
         return state;
@@ -3534,6 +3791,28 @@ fn audio_state(
                 a.set_cutscene(&c.name, tracks);
             }
             state.cutscene = Some((c.name.clone(), c.elapsed_ms as f32 / 1000.0));
+        }
+    }
+    // Lines said in passing, at their speakers' heads.
+    {
+        let sim = live.sim();
+        for l in ambient {
+            let Some(strref) = l.strref else {
+                continue;
+            };
+            let at = sim.world.get(l.speaker).map(|o| {
+                let p = o.position;
+                [p[0], p[1], p[2] + live.head_height(o.id)]
+            });
+            state.ambient_lines.push((
+                audio::VoiceLine {
+                    dialog: l.dialog,
+                    strref,
+                    female: l.female,
+                    ambient: true,
+                },
+                at,
+            ));
         }
     }
     // Sounds the simulation asked for (scripts, character creation's voice preview).
@@ -4000,6 +4279,8 @@ enum Step {
     Saves(i32),
     /// `quicksave` or `quickload`: what the F5 and F9 keys do.
     Quick(bool),
+    /// `key f8`: an issue report, or done marking spots for one (see [`report`]).
+    Report,
     /// Text typed into the focused text field (`type <text>`).
     Type(String),
     /// A key for the focused text field (`key backspace`, `enter`, `delete`, `left`, `right`,
@@ -4397,6 +4678,7 @@ fn parse_step(s: &str) -> Result<Step> {
         }
         "quicksave" => Step::Quick(true),
         "quickload" => Step::Quick(false),
+        "key" if arg.eq_ignore_ascii_case("f8") => Step::Report,
         "key" if arg.eq_ignore_ascii_case("f5") => Step::Saves(1),
         "key" if arg.eq_ignore_ascii_case("f9") => Step::Saves(2),
         "hover" => {
@@ -4427,7 +4709,7 @@ fn main() -> Result<()> {
     report::init_logging(env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
     ));
-    let args = Args::parse();
+    let mut args = Args::parse();
     // A client's or a test's run sends and fetches nothing (see `upload::online`).
     if args.control.is_some() || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some() {
         upload::set_automated();
@@ -4437,6 +4719,7 @@ fn main() -> Result<()> {
         if let Some(exe) = update::newest_build() {
             match std::process::Command::new(&exe)
                 .args(std::env::args_os().skip(1))
+                .envs(update::program_dir().map(|d| (update::PROGRAM_DIR, d)))
                 .spawn()
             {
                 Ok(_) => {
@@ -4455,6 +4738,9 @@ fn main() -> Result<()> {
         .install
         .or_else(|| std::env::var_os("THEDAS_INSTALL").map(PathBuf::from))
         .context("give --install or set THEDAS_INSTALL")?;
+    if args.module.is_empty() {
+        args.module = thedas_vfs::install::campaign_module(&install).to_string();
+    }
     let size = parse_size(&args.size)?;
     let saves_dir = args
         .saves
@@ -4842,6 +5128,7 @@ fn main() -> Result<()> {
                             if typed { "typed" } else { "no text field" }
                         );
                     }
+                    Step::Report => println!("key f8: reports need the window"),
                     &Step::Saves(mode) => {
                         if let Some((layer, s)) = played.as_mut() {
                             layer.open_saves(s, mode);
@@ -5260,6 +5547,8 @@ fn main() -> Result<()> {
                 .map_or(Returning::Idle, Returning::Checking),
         },
         update_answers: Vec::new(),
+        mark_answers: Vec::new(),
+        pad_last: false,
         started_with: json!({
             "size": args.size,
             "shaders": args.shaders,

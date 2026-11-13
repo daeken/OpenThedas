@@ -482,6 +482,28 @@ pub struct FloatyMessage {
     pub duration: f32,
 }
 
+/// A line said in passing (an ambient conversation's line: a commoner's remark, a guard's
+/// answer, banter between bystanders), for the presentation to voice at its speaker and to
+/// show over the speaker's head. DAOrigins.exe starts one at 0x6fe4a0: the speaker says the
+/// line's voice-over, and the text goes up as a floaty (0x63faf0 with style 3, white, no
+/// duration; taken down when the line ends) unless the line is voiced and the Subtitles
+/// option is below "Dialog and ambient" (0x6fe731 to 0x6fe74d). Output only.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AmbientLine {
+    pub speaker: ObjectId,
+    /// The conversation (resource name without `.dlg`): its voice bank's name.
+    pub dialog: String,
+    /// The line's talk-table reference: its voice-over is the sample named after it.
+    pub strref: Option<u32>,
+    pub text: String,
+    /// Whether the conversation's player character is female (her reading of the line).
+    pub female: bool,
+    /// Whether the install has a voice-over for the line.
+    pub voiced: bool,
+    /// How long the line lasts (see [`crate::dialog::AMBIENT_LINE_MS`]).
+    pub seconds: f32,
+}
+
 /// A message by a party member's portrait (`DisplayPortraitMessage(oPlayerCreature, sMessage,
 /// nColour)`), as DAOrigins.exe hands it to portraits.gfx (0x661f40). Output only.
 #[derive(Clone, Debug, PartialEq)]
@@ -717,6 +739,10 @@ pub struct World {
     /// it.
     #[serde(skip)]
     pub portrait_messages: Vec<PortraitMessage>,
+    /// The lines said in passing that the presentation has not taken yet (see
+    /// [`AmbientLine`]). Output only: nothing in the simulation reads it.
+    #[serde(skip)]
+    pub ambient_lines: Vec<AmbientLine>,
     /// The status messages scripts showed (`DisplayStatusMessage(sMessage, nColour)`: the
     /// text and its 0xRRGGBB colour) that the interface has not taken yet. Output only.
     #[serde(skip)]
@@ -857,6 +883,7 @@ impl World {
             trace: Trace::default(),
             floaties: Vec::new(),
             portrait_messages: Vec::new(),
+            ambient_lines: Vec::new(),
             status_messages: Vec::new(),
             sounds: Vec::new(),
             tables,

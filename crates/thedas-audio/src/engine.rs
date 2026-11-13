@@ -54,6 +54,12 @@ pub struct PlayOptions {
     pub fade_out_ms: Option<u32>,
     /// The source's sound cone (a placed sound's facing and `Cone*` fields).
     pub cone: Option<Cone>,
+    /// Whether geometry between a 3D source and the listener muffles it. DAOrigins.exe's
+    /// events are occludable unless their player says otherwise (the event object's +0xbd
+    /// is 1 from its constructor, 0x5ba2ed): a placed sound gives its `Occludable` field
+    /// (0x7c2537) and a creature's sounds are not when it is the controlled character
+    /// (0x6aa98c..0x6aa99c).
+    pub occludable: bool,
 }
 
 /// A 3D source's sound cone, as FMOD's: full level within the inside angle about
@@ -106,6 +112,7 @@ impl Default for PlayOptions {
             fade_in_ms: None,
             fade_out_ms: None,
             cone: None,
+            occludable: true,
         }
     }
 }
@@ -178,6 +185,8 @@ struct Instance {
     /// How much geometry between it and the listener muffles it, 0..=1 (see
     /// [`AudioEngine::set_occlusion`]).
     occlusion: f32,
+    /// What its occlusion is moving towards ([`AudioEngine::occlude`]); none yet given.
+    occlusion_target: Option<f32>,
     /// Its category (or one above it) is paused: its voices hold where they are and it
     /// neither ages nor starts sounds (see [`AudioEngine::set_category_paused`]).
     paused: bool,
@@ -501,6 +510,7 @@ impl AudioEngine {
             rate,
             age: 0.0,
             occlusion: 0.0,
+            occlusion_target: None,
             paused: false,
         };
         log::debug!(
@@ -645,13 +655,62 @@ impl AudioEngine {
     }
 
     /// Set a 3D event's direct occlusion, 0 (clear) to 1 (blocked), as FMOD's
-    /// `Event::set3DOcclusion`. Provisional: applied as a gain of `1 - occlusion` (FMOD's
-    /// volume occlusion); a low-pass, if the original's FMOD was set up for one, is not
-    /// modelled.
+    /// `Event::set3DOcclusion`. It low-passes the event's voices ([`occlusion_cutoff`]) and
+    /// leaves their level alone, as FMOD does when it is started for software occlusion,
+    /// which DAOrigins.exe does.
     pub fn set_occlusion(&mut self, handle: EventHandle, occlusion: f32) {
         if let Some(i) = self.instances.iter_mut().find(|i| i.handle == handle) {
             i.occlusion = occlusion.clamp(0.0, 1.0);
+            i.occlusion_target = Some(i.occlusion);
         }
+    }
+
+    /// The playing events geometry can muffle, with where they are: 3D events with a
+    /// position that are occludable ([`PlayOptions::occludable`]) and within 1.25 times
+    /// their reach of the listener (DAOrigins.exe leaves the others' occlusion as it is,
+    /// 0x5b72af, 0xafebd0).
+    pub fn occludable_sources(&self) -> Vec<(EventHandle, [f32; 3])> {
+        let listener = self.listener.position;
+        self.instances
+            .iter()
+            .filter(|i| !i.stopping && i.options.occludable)
+            .filter_map(|i| {
+                let p = i.options.position?;
+                let ev = i.event().filter(|e| e.is_3d())?;
+                let d = sub(p, listener);
+                let reach = ev.max_distance * i.options.distance_scale.max(1e-3) * 1.25;
+                (dot(d, d).sqrt() < reach).then_some((i.handle, p))
+            })
+            .collect()
+    }
+
+    /// Give an event the occlusion the geometry in its way makes (0 clear to 1 blocked).
+    /// The first is taken at once (the exe's forced update when a sound starts, 0x5b73c9);
+    /// after that the event's occlusion moves towards it at 1.2 per second (0x5b6eb0,
+    /// 0xafebc0).
+    pub fn occlude(&mut self, handle: EventHandle, target: f32) {
+        let Some(i) = self.instances.iter_mut().find(|i| i.handle == handle) else {
+            return;
+        };
+        let target = target.clamp(0.0, 1.0);
+        let before = i.occlusion_target;
+        if before.is_none() {
+            i.occlusion = target;
+        }
+        if before.is_none_or(|b| (b > 0.0) != (target > 0.0) || (b >= 1.0) != (target >= 1.0))
+            && (target > 0.0 || before.is_some())
+        {
+            log::debug!(
+                "audio: occlusion of {}: {} {target:.2}",
+                i.path,
+                if before.is_none() {
+                    "starts at"
+                } else {
+                    "towards"
+                }
+            );
+        }
+        i.occlusion_target = Some(target);
     }
 
     pub fn set_position(&mut self, handle: EventHandle, position: [f32; 3]) {
@@ -869,6 +928,14 @@ impl AudioEngine {
         for ii in 0..self.instances.len() {
             let paused = self.category_paused(&self.instances[ii].category);
             let inst = &mut self.instances[ii];
+            if let Some(target) = inst.occlusion_target {
+                let step = 1.2 * dt.max(0.0);
+                inst.occlusion = if inst.occlusion < target {
+                    (inst.occlusion + step).min(target)
+                } else {
+                    (inst.occlusion - step).max(target)
+                };
+            }
             if paused || inst.paused {
                 if let Ok(mut m) = self.mixer.lock() {
                     for v in inst.slots.iter().flat_map(|s| &s.voices) {
@@ -1074,7 +1141,7 @@ impl AudioEngine {
                         min / dd
                     };
                 }
-                gain3d *= cone_gain * (1.0 - inst.occlusion);
+                gain3d *= cone_gain;
             }
             for s in &inst.slots {
                 let (sound, env_gain) = match &ev.body {
@@ -1126,6 +1193,10 @@ impl AudioEngine {
                     let own = s.gains.get(v).copied().unwrap_or(1.0);
                     mixer.fade(*v, g * own, ramp, false);
                     mixer.set_pan(*v, pan);
+                    // Occlusion (see `AudioEngine::set_occlusion`): 3D events only, as
+                    // FMOD refuses it for the rest.
+                    let cutoff = occlusion_cutoff(inst.occlusion).filter(|_| ev.is_3d());
+                    mixer.set_lowpass(*v, cutoff);
                 }
             }
         }
@@ -1198,6 +1269,19 @@ fn event_variation(pitch: f32, r: f32, v: f32, flags: u32, (u1, u2): (f32, f32))
     let rate = 2f32.powf(4.0 * (pitch + offset));
     let gain = if v != 0.0 { 1.0 - v + u2 * v } else { 1.0 };
     (rate, gain)
+}
+
+/// The low-pass cutoff (Hz) of an event occluded by `occlusion`, none when it is clear.
+///
+/// DAOrigins.exe starts FMOD with `FMOD_INIT_SOFTWARE_OCCLUSION` (the event system's init
+/// flags are 0x88, 0x5c584b), so each software channel has a "Lowpass Simple" unit
+/// (fmodex.dll 0x100091be, DSP type 19), and the channel's volume update (0x10007130) sets
+/// its cutoff to `22050 * f * f` for `f = 1 - occlusion` (times the geometry and channel
+/// group factors, both 1 here) without touching the volume; at `f >= 1` the unit is
+/// bypassed. A door of 0.5 is a 5.5 kHz low-pass, 0.7 a 2 kHz one, and 1 the unit's floor.
+fn occlusion_cutoff(occlusion: f32) -> Option<f32> {
+    let f = 1.0 - occlusion.clamp(0.0, 1.0);
+    (f < 1.0).then_some(22050.0 * f * f)
 }
 
 /// Decibels to linear gain.
@@ -1490,7 +1574,13 @@ mod tests {
     }
 
     #[test]
-    fn occlusion_turns_a_3d_event_down() {
+    fn occlusion_low_passes_a_3d_event() {
+        assert_eq!(occlusion_cutoff(0.0), None);
+        assert_eq!(occlusion_cutoff(0.5), Some(5512.5));
+        assert_eq!(occlusion_cutoff(1.0), Some(0.0));
+        // The fixture's loop is a steady level (0 Hz), which a low-pass leaves alone, so
+        // only full occlusion (the unit's 10 Hz floor, settling slowly) and the plumbing
+        // are told here; the filter itself is tested in the mixer.
         let (mut e, m) = engine("occl");
         let at = PlayOptions {
             position: Some([0.0, 0.0, 0.0]),
@@ -1499,15 +1589,20 @@ mod tests {
         let h = e.play("test/grp/loop3d", at.clone()).unwrap();
         let full = run(&mut e, &m, 0.5);
         assert!(full > 0.0);
-        e.set_occlusion(h, 0.75);
-        let muffled = run(&mut e, &m, 0.5);
-        assert!((muffled - full * 0.25).abs() < 1e-3, "{full} -> {muffled}");
-        e.set_occlusion(h, 0.0);
-        assert!((run(&mut e, &m, 0.5) - full).abs() < 1e-3);
+        assert_eq!(e.occludable_sources().len(), 1);
+        // A target given by the geometry: the first at once, later ones at 1.2 a second.
+        e.occlude(h, 0.25);
+        assert_eq!(e.instances[0].occlusion, 0.25);
+        e.occlude(h, 1.0);
+        run(&mut e, &m, 0.25);
+        assert!((e.instances[0].occlusion - 0.55).abs() < 0.02);
+        run(&mut e, &m, 1.0);
+        assert_eq!(e.instances[0].occlusion, 1.0);
         // A 2D event has nothing in its way.
         let (mut e, m) = engine("occl2d");
         let h = e.play("test/grp/loop", at).unwrap();
         let full = run(&mut e, &m, 0.5);
+        assert!(e.occludable_sources().is_empty());
         e.set_occlusion(h, 1.0);
         assert!((run(&mut e, &m, 0.5) - full).abs() < 1e-3);
     }
