@@ -166,7 +166,7 @@ pub struct Live {
     pub objects: Option<LiveObjects>,
     effects: Option<LiveEffects>,
     rings: Option<LiveRings>,
-    /// The creature the mouse was last found over ([`Live::hovered_creature`]).
+    /// The creature the mouse is over ([`Live::set_hovered`]).
     hovered: Option<ObjectId>,
     /// When each lasting effect was first seen on its object (world milliseconds): the
     /// simulation does not keep when it was applied.
@@ -1494,6 +1494,20 @@ impl Live {
             models.push(m);
         }
         let kept = shown.kept;
+        // A cutscene's weapon draws and hidden actors.
+        let mut hidden = std::collections::HashSet::new();
+        for (id, show) in &posing {
+            if show.hidden {
+                hidden.insert(*id);
+            }
+            if let (Some((main, off)), Some(o), Some(m)) = (
+                show.weapons,
+                sim.world.get(*id),
+                models.iter_mut().find(|m| m.id == *id),
+            ) {
+                m.attached = thedas_ui::models::weapons_in_cutscene(&sim, o, main, off);
+            }
+        }
         // Who looks at whom, from where the creatures were last drawn.
         self.looks.prepare(&sim);
         let pairs = crate::looks::pairs(&sim);
@@ -1635,7 +1649,11 @@ impl Live {
         );
         objects.follow_poses();
         for (i, m) in models.iter().enumerate() {
-            let o = self.opacity.get(&m.id).copied().unwrap_or(1.0);
+            let o = if hidden.contains(&m.id) {
+                0.0
+            } else {
+                self.opacity.get(&m.id).copied().unwrap_or(1.0)
+            };
             objects.renderer.set_prop_opacity(ctx, &objects.scene, i, o);
         }
         self.posed = models
@@ -2404,13 +2422,62 @@ impl Live {
                 }
             }
         }
-        self.hovered = None;
         let (t, id) = best?;
-        self.hovered = match sim.ground_hit(area, origin.to_array(), dir.to_array(), 300.0) {
+        match sim.ground_hit(area, origin.to_array(), dir.to_array(), 300.0) {
             Some(g) if origin.distance(glam::Vec3::from_array(g)) < t => None,
             _ => Some(id),
+        }
+    }
+
+    /// Tells the world which creature the mouse is over, as the interface has it (none
+    /// while the interface covers the cursor): its ring shows it (see [`crate::rings`]).
+    pub fn set_hovered(&mut self, hovered: Option<ObjectId>) {
+        self.hovered = hovered;
+    }
+
+    /// What the mouse is over for its cursor (see [`crate::cursor`]), by what a click there
+    /// would do ([`Live::click`]): `None` over the ground, a body or nothing.
+    pub fn hover_over(
+        &mut self,
+        origin: glam::Vec3,
+        dir: glam::Vec3,
+    ) -> Option<crate::cursor::Over> {
+        use crate::cursor::Over;
+        let Some(Pick::Object(id)) = self.pick(origin, dir) else {
+            return None;
         };
-        self.hovered
+        let shared = self.sim.clone();
+        let sim = shared.lock().unwrap_or_else(|p| p.into_inner());
+        let o = sim.world.get(id)?;
+        match o.kind {
+            thedas_sim::world::ObjectKind::Creature if o.dead => None,
+            thedas_sim::world::ObjectKind::Creature => {
+                let leader = sim.world.controlled();
+                let party = thedas_sim::engine::party_of(&sim);
+                Some(if party.contains(&id) {
+                    Over::Creature
+                } else if leader.is_some_and(|l| sim.hostile(l, id)) {
+                    Over::Hostile
+                } else if o.dialog.is_some() {
+                    Over::Talker
+                } else {
+                    Over::Creature
+                })
+            }
+            thedas_sim::world::ObjectKind::Placeable => Some(Over::Placeable(
+                sim.placeable_cursor(id).unwrap_or_default(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Whether an ability waits for its target, and whether it is aimed at a place.
+    pub fn aim(&self) -> Option<crate::cursor::Aim> {
+        let aim = self.aiming.as_ref()?;
+        let sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
+        Some(crate::cursor::Aim {
+            place: sim.ability_targets_place(aim.ability),
+        })
     }
 
     /// Orders the party leader as a click on `pick` does: lead with a party member, attack a

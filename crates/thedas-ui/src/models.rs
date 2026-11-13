@@ -574,19 +574,33 @@ fn equipment_tints(
 /// they are drawn for as long as the creature's combat state (`GetCombatState`) is set.
 fn weapons(sim: &Sim, o: &Object, gear: Gear) -> Vec<Attached> {
     let drawn = o.combat.in_combat;
+    weapons_held(sim, o, gear, drawn, drawn)
+}
+
+/// [`weapons`] with each hand's weapon drawn or sheathed as given.
+fn weapons_held(sim: &Sim, o: &Object, gear: Gear, main: bool, off: bool) -> Vec<Attached> {
     [
         ("INVENTORY_SLOT_MAIN", true),
         ("INVENTORY_SLOT_OFFHAND", false),
     ]
     .into_iter()
-    .filter_map(|(slot_name, main)| {
+    .filter_map(|(slot_name, is_main)| {
         let item = equipped_in(sim, o, slot_name, gear)?;
         let (ty, v) = item_variation(sim, item)?;
         let model = format!("w_{ty}_{v}{LOD0}");
-        let node = weapon_node(sim, item, main, drawn)?;
+        let drawn = if is_main { main } else { off };
+        let node = weapon_node(sim, item, is_main, drawn)?;
         has_model(sim, &model).then_some(Attached { model, node })
     })
     .collect()
+}
+
+/// Where creature `o` of the world carries its weapons when a cutscene says so (its
+/// `ActionDrawWeapon`; see `thedas_sim::cuttracks::WeaponDraw`): the main hand's drawn or
+/// sheathed as `main` says, the off hand's as `off` says, or as the creature's combat state
+/// has it when the cutscene has not touched it.
+pub fn weapons_in_cutscene(sim: &Sim, o: &Object, main: bool, off: Option<bool>) -> Vec<Attached> {
+    weapons_held(sim, o, Gear::World, main, off.unwrap_or(o.combat.in_combat))
 }
 
 /// The node an item hangs from: `BITM_base.gda`'s part for its slot (main or off hand) and
