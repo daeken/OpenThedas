@@ -119,6 +119,9 @@ pub struct Sim {
     /// Each area's doors and their doorways' grid cells (doors do not move; see
     /// `Sim::closed_doors`).
     pub(crate) door_cells: HashMap<ObjectId, Arc<Vec<crate::nav::Doorway>>>,
+    /// The last route's waypoints as far as the closed door that blocked it (see
+    /// `Sim::route_and_approach`).
+    pub(crate) route_approach: Vec<[f32; 3]>,
     /// The closed door that stopped the last `walk`, if one did.
     pub walk_blocked_by: Option<ObjectId>,
     pub(crate) nav_grids: HashMap<String, Option<Arc<thedas_formats::level::NavGrid>>>,
@@ -602,6 +605,7 @@ impl Sim {
             ability_anims: HashMap::new(),
             save_issues: Vec::new(),
             door_cells: HashMap::new(),
+            route_approach: Vec::new(),
             walk_blocked_by: None,
             talk: None,
             plots: crate::plot::Plots::default(),
@@ -1960,8 +1964,10 @@ impl Sim {
     /// is one (see `nav`), otherwise a straight line in half-metre steps. Stops early when a
     /// conversation starts, the area changes, the walker dies or (for the hero) a fight
     /// breaks out; returns whether it arrived. A destination in another area is a teleport.
-    /// A closed door in the way stops it before it sets out (the door is left in
-    /// `walk_blocked_by`; the player opens doors by using them).
+    /// A closed door in the way stops it at the door: it walks as far as the doorway, as a
+    /// player would, and the door is left in `walk_blocked_by` (the player opens doors by
+    /// using them). What lies before the door so happens: at Highever the hall beyond the
+    /// family's rooms holds the soldiers whose deaths unlock its far door.
     pub fn walk(&mut self, id: ObjectId, to: [f32; 3], area: Option<ObjectId>) -> bool {
         self.walk_blocked_by = None;
         let Some((from, here)) = self.world.get(id).map(|o| (o.position, o.area)) else {
@@ -1972,12 +1978,17 @@ impl Sim {
             self.tick(0);
             return true;
         }
-        let routed = match self.route_to(id, to) {
-            crate::nav::Routed::Path(p) => Some(p),
-            crate::nav::Routed::Straight => None,
-            crate::nav::Routed::Door(d) => {
-                self.walk_blocked_by = Some(d);
-                return false;
+        let mut door = None;
+        let routed = match self.route_and_approach(id, to) {
+            (crate::nav::Routed::Path(p), _) => Some(p),
+            (crate::nav::Routed::Straight, _) => None,
+            (crate::nav::Routed::Door(d), up_to) => {
+                door = Some(d);
+                if up_to.is_empty() {
+                    self.walk_blocked_by = door;
+                    return false;
+                }
+                Some(up_to)
             }
         };
         let points: Vec<[f32; 3]> = match routed {
@@ -2021,10 +2032,12 @@ impl Sim {
                 || (!talking && self.talk.as_ref().is_some_and(|c| !c.ended))
                 || (hero_at_peace && self.world.game_mode == combat);
             if stopped {
-                return i + 1 == n;
+                return door.is_none() && i + 1 == n;
             }
         }
-        true
+        // At the door: it is still in the way if it is still shut.
+        self.walk_blocked_by = door;
+        door.is_none()
     }
 
     /// Keeps the hero's followers with it as [`Sim::walk`] steps it along: each living
@@ -2253,14 +2266,85 @@ impl Sim {
     /// through one, the result is that door (the original fails such a move with
     /// `COMMAND_FAILED_PATH_ACTION_REQUIRED`, and the AI opens the door and tries again).
     pub(crate) fn route_to(&mut self, id: ObjectId, to: [f32; 3]) -> crate::nav::Routed {
+        self.route_and_approach(id, to).0
+    }
+
+    /// [`Sim::route_to`], and with a closed door in the way the route as far as that door
+    /// (the waypoints before its doorway; empty otherwise).
+    pub(crate) fn route_and_approach(
+        &mut self,
+        id: ObjectId,
+        to: [f32; 3],
+    ) -> (crate::nav::Routed, Vec<[f32; 3]>) {
+        let routed = self.route_inner(id, to);
+        (routed, std::mem::take(&mut self.route_approach))
+    }
+
+    fn route_inner(&mut self, id: ObjectId, to: [f32; 3]) -> crate::nav::Routed {
         use crate::nav::Routed;
+        self.route_approach.clear();
         let Some((from, Some(area))) = self.world.get(id).map(|o| (o.position, o.area)) else {
             return Routed::Straight;
         };
         let Some(g) = self.nav_grid(area) else {
             return Routed::Straight;
         };
-        let doors = self.closed_doors(area);
+        let mut doors = self.closed_doors(area);
+        // A mover standing in a closed door's doorway (set down there by a jump, a save, a
+        // body's push, or the door shutting on it) can walk out: the cells of that doorway
+        // on its own side of the leaf, those it reaches without the line from where it
+        // stands crossing a closed door's collision, do not block it. The far side stays
+        // shut. Without the leaf's collision (no game data) the whole doorway is open to it.
+        if let Some(own) = g.cell(from).map(|c| (c.1 * g.columns + c.0) as usize) {
+            if doors.iter().any(|d| d.1.contains(&own)) {
+                // Out of the doorway, not about in it: an end that is itself in a closed
+                // doorway is not walked to from inside one (a cell on the mover's side can
+                // reach past the leaf, and two such steps would cross it).
+                let to_cell = g.cell(to).map(|c| (c.1 * g.columns + c.0) as usize);
+                if to_cell.is_some_and(|i| doors.iter().any(|d| d.1.contains(&i))) {
+                    return Routed::Path(vec![from]);
+                }
+                let leaves = self.door_sight(area);
+                let mut eye = [from[0], from[1], from[2] + 1.0];
+                // Standing inside the leaf itself (set down there before doorways were
+                // kept clear), its side is the one it is nearest: the lines are drawn
+                // from the nearest point outside the leaf.
+                let inside = |q: [f32; 3]| {
+                    leaves
+                        .solid
+                        .iter()
+                        .any(|l| l.blocked(q, [q[0], q[1], q[2] + 0.01]))
+                };
+                if inside(eye) {
+                    'out: for k in 1..=16 {
+                        let r = k as f32 * 0.05;
+                        for a in 0..16 {
+                            let t = a as f32 * std::f32::consts::TAU / 16.0;
+                            let q = [eye[0] + r * t.cos(), eye[1] + r * t.sin(), eye[2]];
+                            if !inside(q) {
+                                eye = q;
+                                break 'out;
+                            }
+                        }
+                    }
+                }
+                let near = |i: usize| {
+                    let c = ((i as u32) % g.columns, (i as u32) / g.columns);
+                    let m = g.center(c);
+                    let m = [m[0], m[1], crate::nav::height(&g, c) + 1.0];
+                    !leaves.solid.iter().any(|l| l.blocked(eye, m))
+                };
+                for d in doors.iter_mut().filter(|d| d.1.contains(&own)) {
+                    let far: Vec<usize> = d.1.iter().copied().filter(|&i| !near(i)).collect();
+                    // With every line cut (deep in a thick leaf) it is let out all the same.
+                    d.1 = if far.len() == d.1.len() {
+                        Vec::new()
+                    } else {
+                        far
+                    };
+                }
+            }
+        }
         let blocked: std::collections::HashSet<usize> =
             doors.iter().flat_map(|d| d.1.iter().copied()).collect();
         if let Some(p) = crate::nav::route_avoiding(&g, from, to, &blocked) {
@@ -2309,6 +2393,7 @@ impl Sim {
                         }
                         return Routed::Path(up_to);
                     }
+                    self.route_approach = p[..n].to_vec();
                     return Routed::Door(*door);
                 }
             }
@@ -2829,6 +2914,17 @@ impl Sim {
     /// Fails a move or approach whose way a closed door blocks
     /// (`COMMAND_FAILED_PATH_ACTION_REQUIRED`, the door as the event's object 2, where
     /// rules_core looks for it: its AI then uses the door and repeats the command).
+    ///
+    /// What opens a shut door a mover is pushed into is therefore the game's script, not
+    /// the engine: rules_core's handler (at 0x365d5 of the compiled script) reads the
+    /// blocker's `GetPlaceableState` and, for state 0 (closed, unlocked), gives the mover
+    /// `CommandUseObject(door, PLACEABLE_ACTION_OPEN)`; for state 1 (locked) it gives none.
+    /// So the hero steered at the Dalish ruins' mirror-room door uses it, which is what
+    /// wakes the bereskarn, and a locked door stays shut. Provisional: DAOrigins.exe's own
+    /// path-action code is not traced (whether the engine opens doors for a mover before
+    /// the script hears of it), and a held stick orders a new move about ten times a
+    /// second, each replacing the mover's commands, so the use command runs only when it
+    /// gets in before the next order: on some pushes the hero stands at the door instead.
     pub(crate) fn fail_blocked(&mut self, id: ObjectId, door: ObjectId) {
         self.fail_front_command_with(id, "COMMAND_FAILED_PATH_ACTION_REQUIRED", Some(door));
     }
@@ -3112,16 +3208,31 @@ impl Sim {
         // jump the hero to a waypoint this way). Provisional: the jumper keeps its facing.
         let to_object =
             cmd.name.starts_with("CommandMoveToObject") || cmd.name == "CommandJumpToObject";
+        // A walk whose end lies in a closed door's doorway stopped at the door (its route is
+        // cut short there, see `Sim::route_to`): the walker stays where the route left it
+        // and is not set down at the end asked for, inside the doorway or past the leaf. (A
+        // held stick aims three metres ahead, often into a doorway: the hero was put in a
+        // locked door's doorway, or through it.) Jumps go where they say.
+        let walked = cmd.name.starts_with("CommandMoveTo");
+        let at_door = |s: &mut Self, p: [f32; 3], area: Option<ObjectId>| {
+            walked && area.is_some_and(|a| s.in_closed_doorway(a, p))
+        };
         if let (Some(t), true) = (cmd.target, to_object) {
             if let Some(p) = self.world.get(t).map(|o| (o.position, o.area)) {
-                if let Some(obj) = self.world.get_mut(id) {
-                    obj.position = p.0;
-                    obj.area = p.1;
+                if !at_door(self, p.0, p.1) {
+                    if let Some(obj) = self.world.get_mut(id) {
+                        obj.position = p.0;
+                        obj.area = p.1;
+                    }
                 }
             }
         }
         // A command's location is where it goes, except an ability's, which is where it lands.
-        if let Some(l) = cmd.location.filter(|_| cmd.name != "CommandUseAbility") {
+        let location = cmd
+            .location
+            .filter(|_| cmd.name != "CommandUseAbility")
+            .filter(|l| !at_door(self, l.position, Some(l.area)));
+        if let Some(l) = location {
             // Cross the triggers between where the move began and its end on the way (along
             // its route, or a straight line).
             let here = self.world.get(id).map(|o| (o.position, o.area));
