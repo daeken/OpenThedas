@@ -115,11 +115,15 @@ pub struct ErfEntry {
 }
 
 impl ErfEntry {
-    /// A printable name: the stored name, or the hash for unnamed V3.0 entries.
+    /// A printable name: the stored name, or for unnamed V3.0 entries the name hash, with the
+    /// extension when the type hash is a known one (`#<hash>.<ext>`).
     pub fn display_name(&self) -> String {
         match (&self.name, self.name_hash) {
             (Some(n), _) => n.clone(),
-            (None, Some(h)) => format!("#{h:016x}"),
+            (None, Some(h)) => match self.type_hash.and_then(crate::extension_for_type_hash) {
+                Some(ext) => format!("#{h:016x}.{ext}"),
+                None => format!("#{h:016x}"),
+            },
             (None, None) => "<unnamed>".to_string(),
         }
     }
