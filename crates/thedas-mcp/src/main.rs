@@ -508,8 +508,50 @@ fn value_json(v: &Value) -> J {
     }
 }
 
-fn arg_value(sim: &Sim, ty: &Type, j: &J) -> Value {
+fn arg_value(sim: &mut Sim, ty: &Type, j: &J) -> Value {
     match ty {
+        // A location, for functions that take one (CreateObject): `{"near": object, "offset":
+        // [dx, dy]}` is a place beside an object, in its area and facing it; or `{"area":
+        // object, "position": [x, y, z], "facing": degrees}`.
+        Type::Engine(_)
+            if j.is_object() && (j.get("near").is_some() || j.get("area").is_some()) =>
+        {
+            let object = |sim: &Sim, k: &str| match j.get(k) {
+                Some(J::Number(n)) => n.as_u64().map(|n| n as u32),
+                Some(J::String(s)) => resolve(sim, s),
+                _ => None,
+            };
+            let floats = |k: &str| -> Vec<f32> {
+                j.get(k)
+                    .and_then(|a| a.as_array())
+                    .map(|a| a.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect())
+                    .unwrap_or_default()
+            };
+            let at = |v: &[f32], i: usize| v.get(i).copied().unwrap_or(0.0);
+            let near = object(sim, "near")
+                .and_then(|n| sim.world.get(n))
+                .map(|o| (o.area, o.position));
+            let (area, position, facing) = match near {
+                Some((area, p)) => {
+                    let off = floats("offset");
+                    let (dx, dy) = (at(&off, 0), at(&off, 1));
+                    (
+                        area.unwrap_or(OBJECT_INVALID),
+                        [p[0] + dx, p[1] + dy, p[2]],
+                        thedas_sim::world::facing_toward(-dx, -dy),
+                    )
+                }
+                None => {
+                    let p = floats("position");
+                    (
+                        object(sim, "area").unwrap_or(OBJECT_INVALID),
+                        [at(&p, 0), at(&p, 1), at(&p, 2)],
+                        j.get("facing").and_then(|f| f.as_f64()).unwrap_or(0.0) as f32,
+                    )
+                }
+            };
+            sim.location_value(area, position, facing)
+        }
         Type::Int => Value::Int(j.as_i64().unwrap_or(0) as i32),
         Type::Float => Value::Float(j.as_f64().unwrap_or(0.0) as f32),
         Type::String | Type::Any => Value::String(
