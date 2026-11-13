@@ -56,6 +56,15 @@ enum Command {
         #[arg(long)]
         level: Option<String>,
     },
+    /// Show the player's mods in load order (later wins): what each provides, how many game
+    /// files it replaces and how many of its files a later mod hides. Reads `mods.txt` in the
+    /// data folder, or `--list`.
+    Mods {
+        install: PathBuf,
+        /// A load-order list to use instead of the player's own.
+        #[arg(long)]
+        list: Option<PathBuf>,
+    },
     /// Compiled scripts: disassemble, run, or rank engine functions by use.
     Script {
         #[command(subcommand)]
@@ -370,6 +379,7 @@ fn run() -> Result<()> {
             };
             dump::dump(&data, raw, &mut std::io::stdout().lock())
         }
+        Command::Mods { install, list } => mods(&install, list.as_deref()),
         Command::Resolve {
             install,
             name,
@@ -556,9 +566,72 @@ fn load_target(target: &str) -> Result<Vec<u8>> {
     Ok(erf.read(e, None)?)
 }
 
-fn resolve(install: &Path, name: &str, level: Option<&str>) -> Result<()> {
+fn mods(install: &Path, list: Option<&Path>) -> Result<()> {
+    use thedas_vfs::mods;
     let install = DaoInstall::open(install)?;
     let mut vfs = install.global_vfs(TextureQuality::High)?;
+    let report = match list {
+        Some(file) => {
+            let mut overlay = thedas_vfs::Vfs::new();
+            let report = mods::ModList::load(file).mount(&mut overlay);
+            vfs.set_overlay(overlay);
+            report
+        }
+        None => {
+            match mods::default_list_file() {
+                Some(f) => println!("list: {}", f.display()),
+                None => println!("mods are switched off ({})", mods::ENV_VAR),
+            }
+            mods::mount_default(&mut vfs)
+        }
+    };
+    for m in &report {
+        for p in &m.problems {
+            println!("problem: {}: {p}", m.entry.path.display());
+        }
+    }
+    let Some(overlay) = vfs.overlay() else {
+        println!("no mods mounted");
+        return Ok(());
+    };
+    let base = vfs.layers().len();
+    // Per overlay layer: files provided, winning, replacing a game file, hidden by a later mod.
+    let mut stats = vec![[0usize; 4]; overlay.layers().len()];
+    for name in overlay.names() {
+        let hits = vfs.hits(&name);
+        let in_game = hits.iter().any(|h| h.layer < base);
+        for (i, h) in hits.iter().enumerate().filter(|(_, h)| h.layer >= base) {
+            let s = &mut stats[h.layer - base];
+            s[0] += 1;
+            if i == 0 {
+                s[1] += 1;
+                s[2] += usize::from(in_game);
+            } else {
+                s[3] += 1;
+            }
+        }
+    }
+    println!(
+        "{:>3}  {:>7} {:>7} {:>8} {:>7}  mod",
+        "#", "files", "winning", "replaces", "hidden"
+    );
+    for (i, (layer, s)) in overlay.layers().iter().zip(&stats).enumerate() {
+        println!(
+            "{:>3}  {:>7} {:>7} {:>8} {:>7}  {}",
+            i + 1,
+            s[0],
+            s[1],
+            s[2],
+            s[3],
+            layer.label
+        );
+    }
+    Ok(())
+}
+
+fn resolve(install: &Path, name: &str, level: Option<&str>) -> Result<()> {
+    let install = DaoInstall::open(install)?;
+    let mut vfs = install.play_vfs(TextureQuality::High)?;
     if let Some(level) = level {
         install.mount_level(&mut vfs, level)?;
     }

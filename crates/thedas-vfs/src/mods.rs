@@ -219,7 +219,7 @@ fn mount_entry(overlay: &mut Vfs, entry: &ModEntry, problems: &mut Vec<String>) 
         return overlay.push_directory(path, true, label(entry, path));
     }
     if !path.is_file() {
-        problems.push(format!("{}: no such file or folder", path.display()));
+        problems.push("no such file or folder".into());
         return Ok(());
     }
     if is_archive(path) {
@@ -240,10 +240,10 @@ fn mount_entry(overlay: &mut Vfs, entry: &ModEntry, problems: &mut Vec<String>) 
                 ));
             }
         }
-        _ => problems.push(format!(
-            "{}: not a folder, .zip, .dazip, .erf or .rim (unpack other archive types to a folder and list the folder)",
-            path.display()
-        )),
+        _ => problems.push(
+            "not a folder, .zip, .dazip, .erf or .rim (unpack other archive types to a folder and list the folder)"
+                .into(),
+        ),
     }
     Ok(())
 }
@@ -331,12 +331,21 @@ mod tests {
         );
         let e = &list.entries;
         assert_eq!(e.len(), 4);
-        assert_eq!((e[0].path.clone(), e[0].inner.clone()), (base.join("first"), None));
+        assert_eq!(
+            (e[0].path.clone(), e[0].inner.clone()),
+            (base.join("first"), None)
+        );
         assert_eq!(e[1].path, PathBuf::from("/abs/second.zip"));
         assert_eq!(e[1].inner.as_deref(), Some("Pearly White"));
-        assert_eq!((e[2].path.clone(), e[2].inner.clone()), (base.join("third.zip"), None));
+        assert_eq!(
+            (e[2].path.clone(), e[2].inner.clone()),
+            (base.join("third.zip"), None)
+        );
         // A real folder whose name holds `!/` is taken whole.
-        assert_eq!((e[3].path.clone(), e[3].inner.clone()), (base.join("odd!/name"), None));
+        assert_eq!(
+            (e[3].path.clone(), e[3].inner.clone()),
+            (base.join("odd!/name"), None)
+        );
         std::fs::remove_dir_all(&base).unwrap();
     }
 
@@ -364,7 +373,8 @@ mod tests {
         .unwrap();
 
         let mut vfs = Vfs::new();
-        vfs.push_directory(base.join("game"), false, "game").unwrap();
+        vfs.push_directory(base.join("game"), false, "game")
+            .unwrap();
         let mut overlay = Vfs::new();
         let report = ModList::load(&base.join("mods.txt")).mount(&mut overlay);
         assert_eq!(
@@ -384,14 +394,19 @@ mod tests {
         assert_eq!(vfs.read("teeth.dds").unwrap().0, b"pearly teeth");
         assert_eq!(vfs.read("only_game.dds").unwrap().0, b"g");
         assert!(vfs.lookup("readme.txt").is_none());
-        let labels: Vec<String> = vfs.hits("face.dds").into_iter().map(|p| p.layer_label).collect();
+        let labels: Vec<String> = vfs
+            .hits("face.dds")
+            .into_iter()
+            .map(|p| p.layer_label)
+            .collect();
         assert_eq!(labels, ["mod:b.zip!/b mod/pearly white", "mod:a", "game"]);
         assert_eq!(vfs.len(), 4);
         assert_eq!(vfs.names().len(), 4);
 
         // A level mounted later still loses to the mods, and unmounts cleanly.
         let mark = vfs.mark();
-        vfs.push_directory(base.join("level"), false, "level").unwrap();
+        vfs.push_directory(base.join("level"), false, "level")
+            .unwrap();
         assert_eq!(vfs.read("face.dds").unwrap().0, b"pearly");
         assert_eq!(vfs.hits("face.dds").len(), 4);
         vfs.truncate(mark);
@@ -410,7 +425,10 @@ mod tests {
         // Not an archive at all: reported, and the folder's loose files still load.
         write(&base, "m/broken.erf", b"not an erf");
         write(&base, "m/sub/item.uti", b"loose");
-        zip_of(&base.join("z.zip"), &[("inner.erf", b"x"), ("ok.dds", b"ok")]);
+        zip_of(
+            &base.join("z.zip"),
+            &[("inner.erf", b"x"), ("ok.dds", b"ok")],
+        );
         write(&base, "notes.7z", b"7z");
         let list = ModList::parse("m\nz.zip\nnotes.7z\n", &base);
         let mut overlay = Vfs::new();
