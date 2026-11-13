@@ -2190,6 +2190,7 @@ impl UiLayer {
             Vec::new(),
         );
         let portrait_messages;
+        let status_messages;
         let size = self.stage.size();
         let scale = thedas_ui::stage_scale(size, (1024.0, 768.0));
         let (w, h) = (size.0 as f32, size.1 as f32);
@@ -2240,6 +2241,7 @@ impl UiLayer {
                 });
             }
             portrait_messages = std::mem::take(&mut sim.world.portrait_messages);
+            status_messages = std::mem::take(&mut sim.world.status_messages);
             let mut per_target: std::collections::BTreeMap<u32, u32> = Default::default();
             self.floaties.retain_mut(|f| {
                 f.left_s -= dt_ms / 1000.0;
@@ -2389,6 +2391,16 @@ impl UiLayer {
                 &[UiValue::String(portrait_message_arg(
                     m.target, m.colour, &m.text,
                 ))],
+            );
+        }
+        // Status messages, as the exe hands them to the floaty layer (0x63c260):
+        // `FloatyLayer.DisplayStatusMessage` with the text and its colour. Provisional: that
+        // the script function reaches 0x63c260 (through the interface's virtual 0x5239d0) is
+        // inferred, not followed call by call.
+        for (text, colour) in status_messages {
+            self.stage.movies[movie].call(
+                &format!("{LAYER}.DisplayStatusMessage"),
+                &[UiValue::String(text), num(f64::from(colour))],
             );
         }
         let m = &mut self.stage.movies[movie];
