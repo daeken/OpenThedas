@@ -1607,7 +1607,9 @@ impl Live {
                 .context("effects before their level")?;
             let spec = self.spec(format);
             let scene = AreaScene::load_effects_at(&vfs, layout, &props, spec.detail)?;
+            let loaded = started.elapsed();
             let programs = crate::programs_cached(&vfs, &scene, &spec.shaders, &mut self.cache)?;
+            let translated = started.elapsed();
             let mut renderer = AreaRenderer::new_cached(
                 ctx,
                 &vfs,
@@ -1634,10 +1636,13 @@ impl Live {
             }
             self.effects_animator.forget_skeletons();
             log::debug!(
-                "{layout}: effects on {} objects, {} emitters, built in {:.1} ms",
+                "{layout}: effects on {} objects, {} emitters, built in {:.1} ms (scene {:.1}, \
+                 programs {:.1})",
                 props.len(),
                 scene.emitters.len(),
-                started.elapsed().as_secs_f64() * 1000.0
+                started.elapsed().as_secs_f64() * 1000.0,
+                loaded.as_secs_f64() * 1000.0,
+                (translated - loaded).as_secs_f64() * 1000.0
             );
             self.effects = Some(LiveEffects {
                 key,
