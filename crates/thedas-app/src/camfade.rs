@@ -96,6 +96,71 @@ impl Shape {
     }
 }
 
+impl Shape {
+    /// How far along a ray (world `origin`, unit `dir`) it meets the shape placed by
+    /// `placement` (model to world), if it does. A capsule's distance is where the ray comes
+    /// nearest its axis, which orders picks well enough.
+    pub fn ray(&self, placement: &Mat4, origin: Vec3, dir: Vec3) -> Option<f32> {
+        let to_model = placement.inverse();
+        let o = to_model.transform_point3(origin);
+        let d = to_model.transform_vector3(dir);
+        let len = d.length();
+        if len < 1e-9 {
+            return None;
+        }
+        let (d, scale) = (d / len, 1.0 / len);
+        let sphere = |c: Vec3, r: f32| -> Option<f32> {
+            let oc = o - c;
+            let b = oc.dot(d);
+            let disc = b * b - (oc.length_squared() - r * r);
+            (disc >= 0.0)
+                .then(|| [-b - disc.sqrt(), -b + disc.sqrt()])
+                .and_then(|ts| ts.into_iter().find(|&t| t >= 0.0))
+        };
+        let t = match *self {
+            Shape::Sphere { centre, radius } => sphere(centre, radius),
+            Shape::Capsule { a, b, radius } => {
+                // The nearest points of the ray and the axis segment.
+                let u = b - a;
+                let w = o - a;
+                let (uu, ud, uw, dw) = (u.dot(u), u.dot(d), u.dot(w), d.dot(w));
+                let den = uu - ud * ud;
+                let s = if uu < 1e-12 {
+                    0.0
+                } else if den.abs() < 1e-9 {
+                    (uw / uu).clamp(0.0, 1.0)
+                } else {
+                    ((uw - ud * dw) / den).clamp(0.0, 1.0)
+                };
+                let p = a + u * s;
+                sphere(p, radius).or_else(|| {
+                    // Re-check the cap the clamp moved off.
+                    let t = (p - o).dot(d).max(0.0);
+                    ((o + d * t).distance(p) <= radius).then_some(t)
+                })
+            }
+            Shape::Box { to_box, half } => {
+                let o = to_box.transform_point3(o);
+                let d = to_box.transform_vector3(d);
+                let (mut near, mut far) = (0.0f32, f32::INFINITY);
+                for k in 0..3 {
+                    if d[k].abs() < 1e-9 {
+                        if o[k].abs() > half[k] {
+                            return None;
+                        }
+                        continue;
+                    }
+                    let (t0, t1) = ((-half[k] - o[k]) / d[k], (half[k] - o[k]) / d[k]);
+                    near = near.max(t0.min(t1));
+                    far = far.min(t0.max(t1));
+                }
+                (near <= far).then_some(near)
+            }
+        };
+        t.map(|t| t * scale)
+    }
+}
+
 fn matrix(t: &Transform) -> Mat4 {
     let [x, y, z, w] = t.rotation;
     let q = Quat::from_xyzw(x, y, z, w);
@@ -189,6 +254,35 @@ impl CameraFade {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rays_meet_spheres_capsules_and_boxes_where_they_are_placed() {
+        let at = Mat4::from_translation(Vec3::new(10.0, 0.0, 0.0));
+        let (o, x) = (Vec3::ZERO, Vec3::X);
+        let sphere = Shape::Sphere {
+            centre: Vec3::ZERO,
+            radius: 1.0,
+        };
+        assert!((sphere.ray(&at, o, x).unwrap() - 9.0).abs() < 1e-4);
+        assert_eq!(sphere.ray(&at, o, -x), None);
+        assert_eq!(sphere.ray(&at, Vec3::new(0.0, 2.0, 0.0), x), None);
+        // An upright capsule: met at its side, missed over its top.
+        let capsule = Shape::Capsule {
+            a: Vec3::ZERO,
+            b: Vec3::new(0.0, 0.0, 1.5),
+            radius: 0.3,
+        };
+        assert!((capsule.ray(&at, Vec3::new(0.0, 0.0, 1.0), x).unwrap() - 9.7).abs() < 1e-3);
+        assert_eq!(capsule.ray(&at, Vec3::new(0.0, 0.0, 2.0), x), None);
+        let cube = Shape::Box {
+            to_box: Mat4::IDENTITY,
+            half: Vec3::splat(0.5),
+        };
+        assert!((cube.ray(&at, o, x).unwrap() - 9.5).abs() < 1e-4);
+        assert_eq!(cube.ray(&at, Vec3::new(0.0, 0.6, 0.0), x), None);
+        // From inside, at once.
+        assert_eq!(cube.ray(&at, Vec3::new(10.0, 0.0, 0.0), x), Some(0.0));
+    }
 
     #[test]
     fn fades_out_and_back_at_the_executables_rate() {
