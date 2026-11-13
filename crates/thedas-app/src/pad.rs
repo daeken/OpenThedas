@@ -292,6 +292,9 @@ pub enum Action {
     ChooseReply,
     /// Skip the line or the cutscene.
     Skip,
+    /// An issue report, as F8 makes one (see [`crate::report`]): both sticks clicked in.
+    /// Ours, not the original's.
+    Report,
 }
 
 /// One row of the mapping: in `context`, `button` (with `with` held, if given) does
@@ -442,6 +445,18 @@ pub const BINDINGS: &[Binding] = &[
     bind(Cutscene, B, Do::Skip, ""),
     bind(Cutscene, X, Do::Skip, ""),
     bind(Cutscene, Start, Do::Skip, ""),
+    // An issue report, anywhere: both sticks clicked in, either first (the right stick first
+    // does the least on its own: it only swings the camera behind the leader).
+    chord(Field, RS, LS, Do::Report, ""),
+    chord(Field, LS, RS, Do::Report, ""),
+    chord(Picker, RS, LS, Do::Report, ""),
+    chord(Picker, LS, RS, Do::Report, ""),
+    chord(Screen, RS, LS, Do::Report, ""),
+    chord(Screen, LS, RS, Do::Report, ""),
+    chord(Conversation, RS, LS, Do::Report, ""),
+    chord(Conversation, LS, RS, Do::Report, ""),
+    chord(Cutscene, RS, LS, Do::Report, ""),
+    chord(Cutscene, LS, RS, Do::Report, ""),
 ];
 
 /// What a stick does in a context.

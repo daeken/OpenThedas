@@ -55,6 +55,9 @@ pub const KIND_IRRADIANCE: FourCC = FourCC::new(b"nirr");
 /// A particle emitter node.
 pub const KIND_EMITTER: FourCC = FourCC::new(b"nemt");
 pub const KIND_AMBIENT_LIGHT: FourCC = FourCC::new(b"nalt");
+/// A crust node of a visual effect model: named after the body node it sits on
+/// (`CrustHook1` …), with the effect's emitters for that place under it.
+pub const KIND_CRUST: FourCC = FourCC::new(b"crst");
 
 /// [`Light::Point`]'s affect domain for characters: the one value that puts a light in the
 /// character lists (DAOrigins.exe 0x464ea8).
