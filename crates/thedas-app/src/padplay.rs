@@ -457,7 +457,8 @@ impl PadPlay {
                     && !self.controller.free_pointer
                     && host.screens().is_some() =>
             {
-                let targets = host.focus_targets();
+                // Among what the focus may be on (a dialog box's own buttons while it is up).
+                let targets = crate::focusnav::modal(host.focus_targets());
                 if !targets.is_empty() && crate::focusnav::under(&targets, host.cursor()).is_none()
                 {
                     // On a dialog box the press answers it at once (its first button); on a

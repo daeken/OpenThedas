@@ -97,6 +97,47 @@ pub fn route(g: &NavGrid, from: [f32; 3], to: [f32; 3]) -> Option<Vec<[f32; 3]>>
     route_avoiding(g, from, to, &std::collections::HashSet::new())
 }
 
+/// Whether a point is over a walkable cell of the grid.
+pub fn on_walkable(g: &NavGrid, p: [f32; 3]) -> bool {
+    g.cell(p).is_some_and(|c| walkable(g, c))
+}
+
+/// The middle of the walkable cell nearest a point (within six metres of it, as routes
+/// look for their ends), at the cell's floor height.
+pub fn nearest_walkable_point(g: &NavGrid, p: [f32; 3]) -> Option<[f32; 3]> {
+    let c = nearest_walkable(g, p)?;
+    let m = g.center(c);
+    Some([m[0], m[1], height(g, c)])
+}
+
+/// How far a straight walk from `from` towards `to` stays on the walkable area: the last
+/// point, sampled every half cell, before the line leaves the grid or meets an unwalkable
+/// cell (`to` itself when it never does). `None` when `from` is not on walkable ground.
+pub fn walkable_reach(g: &NavGrid, from: [f32; 3], to: [f32; 3]) -> Option<[f32; 3]> {
+    let on = |p: [f32; 3]| on_walkable(g, p);
+    if !on(from) {
+        return None;
+    }
+    let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
+    let len = (dx * dx + dy * dy).sqrt();
+    let step = (g.cell_size * 0.5).max(0.05);
+    let n = (len / step).ceil() as usize;
+    let mut last = from;
+    for i in 1..=n {
+        let t = (i as f32 * step / len).min(1.0);
+        let p = [
+            from[0] + dx * t,
+            from[1] + dy * t,
+            from[2] + (to[2] - from[2]) * t,
+        ];
+        if !on(p) {
+            return Some(last);
+        }
+        last = p;
+    }
+    Some(to)
+}
+
 /// [`route`], treating the cells in `blocked` (row-major indices) as unwalkable too.
 pub fn route_avoiding(
     g: &NavGrid,
@@ -840,6 +881,69 @@ mod tests {
         );
         assert!(o.commands.is_empty());
         assert_eq!(s.world.get(villager).unwrap().position, stands);
+    }
+
+    #[test]
+    fn a_players_move_with_no_route_stops_at_the_edge_of_the_walkable_area() {
+        // Lothering's highway: the stick held forward aimed the hero at points beyond the
+        // walkable area, which have no route, and the straight-line fallback ran him 290 m
+        // off the map.
+        use crate::world::ObjectKind;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        // Walkable for x under 5 m; beyond it the void.
+        let (w, h) = (40u32, 6u32);
+        let mut data = vec![10u8; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..10 {
+                data[(y * w + x) as usize] = 1;
+            }
+        }
+        s.area_layouts.insert(area, "edge".into());
+        s.nav_grids.insert(
+            "edge".into(),
+            Some(Arc::new(NavGrid {
+                columns: w,
+                rows: h,
+                cell_size: 0.5,
+                clearance: 2.0,
+                base: [0.0, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                data,
+                heights: vec![0.0; (w * h) as usize],
+                surfaces: Vec::new(),
+            })),
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        {
+            let o = s.world.get_mut(hero).unwrap();
+            o.area = Some(area);
+            o.position = [1.25, 1.25, 0.0];
+        }
+        // Just beyond the edge (a stick's aim point), far beyond it, and off the grid.
+        for to in [[7.0, 1.25, 0.0], [18.0, 1.25, 0.0], [60.0, 1.25, 0.0]] {
+            s.world.get_mut(hero).unwrap().position = [1.25, 1.25, 0.0];
+            s.order_move(hero, to);
+            for _ in 0..300 {
+                s.tick(33);
+            }
+            let o = s.world.get(hero).unwrap();
+            assert!(
+                o.position[0] > 4.0 && o.position[0] < 5.0,
+                "stops at the edge: {:?}",
+                o.position
+            );
+            assert!(o.commands.is_empty());
+        }
+        // A place it can walk to is not changed.
+        s.order_move(hero, [2.25, 2.25, 0.0]);
+        for _ in 0..100 {
+            s.tick(33);
+        }
+        let p = s.world.get(hero).unwrap().position;
+        assert!(crate::engine::dist(p, [2.25, 2.25, 0.0]) < 0.05, "{p:?}");
     }
 
     #[test]

@@ -44,18 +44,22 @@ pub struct AddIn {
 }
 
 impl AddIn {
-    /// Whether the add-in belongs to the base campaign, and so whether any of its folders
-    /// (`core` and `module`) join the base campaign's resources.
+    /// Whether the add-in belongs to the base campaign, and so whether its `module` folder
+    /// joins the base campaign's resources (its `core` folder always does).
     ///
-    /// The original registers add-in folders at the end of a campaign load (0x5ef460, traced
-    /// by the mods stream): an add-in record whose campaign match fails (the flag test at
-    /// 0x5ef6f0) is skipped whole (0x5f0269), registering no folder at all.
+    /// The original registers add-in folders in two places (traced by the mods stream):
+    /// - 0x5f4610, at start-up and when add-ins are enabled or disabled (it logs
+    ///   `Enabled AddIn: %s.`), registers every enabled add-in's `core` folders with no
+    ///   comparison against a campaign;
+    /// - 0x5ef460, at the end of a campaign load, registers `module` folders, and skips an
+    ///   add-in whose campaign match fails (the flag test at 0x5ef6f0, on to 0x5f0269).
     ///
     /// Provisional: that the string matched against the campaign is the manifest's
     /// `ExtendedModuleUID` is inferred from the shipped manifests (the stand-alone campaigns
-    /// leave it empty, and their folders reuse base names such as `default_player.utc`), not
-    /// read in the executable; a second registration function near 0x5f4b5a is unread. An
-    /// add-in with no such attribute counts as not extending the base campaign.
+    /// leave it empty, and their `module` folders reuse base names such as
+    /// `default_player.utc`), not read in the executable; and 0x5f4610 is gated by flag
+    /// bytes of which one (+0x16c) is not identified. An add-in with no such attribute
+    /// counts as not extending the base campaign.
     pub fn extends_base_campaign(&self) -> bool {
         self.extends
             .as_deref()
@@ -148,10 +152,11 @@ impl DaoInstall {
     /// The install's own resource stack: core package, single-player campaign, then enabled
     /// DLC, with the install's `packages/core/override` above them all as the stack's overlay
     /// (the original's priority 1: it beats add-ins and a level's archives too).
-    /// An enabled add-in's `core` and `module` folders are mounted only when the add-in
-    /// extends the base campaign ([`AddIn::extends_base_campaign`], provisional); an add-in
-    /// for another campaign contributes nothing, as in the original, so a stand-alone DLC
-    /// campaign's own resources cannot replace the base game's.
+    /// Every enabled add-in's `core` folder is mounted, as the original registers them
+    /// whatever campaign plays; its `module` folder only when the add-in extends the base
+    /// campaign ([`AddIn::extends_base_campaign`], provisional), so a stand-alone DLC
+    /// campaign's own module resources cannot replace the base game's. Add-ins in the
+    /// player's documents folder follow the same rule.
     /// Area (`env`) and module archives are loaded per area at runtime, so they are not here.
     pub fn global_vfs(&self, quality: TextureQuality) -> Result<Vfs> {
         self.stack(quality, None)
@@ -216,13 +221,13 @@ impl DaoInstall {
             sort_addins(&mut addins);
         }
         for addin in addins.into_iter().filter(|a| a.enabled) {
+            let label: &dyn Fn(&Path) -> String = if addin.dir.starts_with(&self.root) {
+                &install
+            } else {
+                &player
+            };
+            push_package(&mut vfs, &join_ci(&addin.dir, "core"), quality, true, label)?;
             if addin.extends_base_campaign() {
-                let label: &dyn Fn(&Path) -> String = if addin.dir.starts_with(&self.root) {
-                    &install
-                } else {
-                    &player
-                };
-                push_package(&mut vfs, &join_ci(&addin.dir, "core"), quality, true, label)?;
                 push_package(
                     &mut vfs,
                     &join_ci(&addin.dir, "module"),
@@ -579,10 +584,11 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// An add-in for another campaign mounts nothing, neither `core` nor `module`, so it
-    /// cannot replace base resources; an add-in that extends the base campaign mounts both.
+    /// Every enabled add-in mounts its `core` folder; only one that extends the base
+    /// campaign mounts its `module` folder, so another campaign's module cannot replace
+    /// base resources.
     #[test]
-    fn only_base_campaign_addins_mount_their_folders() {
+    fn only_base_campaign_addins_mount_their_module_folder() {
         let root = std::env::temp_dir().join(format!("thedas-addins-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let write = |rel: &str, bytes: &[u8]| {
@@ -600,7 +606,7 @@ mod tests {
             "packages/core/data/base.erf",
             &erf_v20(&[("hero.utc", b"base"), ("sword.uti", b"base")]),
         );
-        // Its own campaign, at the highest priority: `module` and `core` both stay out.
+        // Its own campaign, at the highest priority: `module` stays out, `core` is mounted.
         write(
             "Addins/own/Manifest.xml",
             manifest("OWN", Some(""), 900).as_bytes(),
@@ -611,7 +617,7 @@ mod tests {
         );
         write(
             "Addins/own/core/data/own_core.erf",
-            &erf_v20(&[("own_core.uti", b"own core"), ("hero.utc", b"own core")]),
+            &erf_v20(&[("own_core.uti", b"own core")]),
         );
         // Another campaign's add-in, and one whose manifest names none.
         write(
@@ -657,7 +663,7 @@ mod tests {
         let vfs = install.global_vfs(TextureQuality::High).unwrap();
         assert_eq!(vfs.read("hero.utc").unwrap().0, b"base");
         assert!(vfs.lookup("own_only.utc").is_none());
-        assert!(vfs.lookup("own_core.uti").is_none());
+        assert_eq!(vfs.read("own_core.uti").unwrap().0, b"own core");
         assert_eq!(vfs.read("sp_core.uti").unwrap().0, b"sp core");
         assert_eq!(vfs.read("sword.uti").unwrap().0, b"dlc sword");
         assert!(vfs.lookup("sp_only.utc").is_some());
