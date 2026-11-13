@@ -517,11 +517,14 @@ pub fn engine_usage(source: u32) -> Option<&'static str> {
         8 => "ModelView",
         10 => "ModelViewInv",
         16 => "LightsArray",
+        17 => "BonesWorld",
         20 => "ShaderControlBooleans",
         21 => "ShadowPartitionMatrix",
         22 => "ShadowTexture_Primary",
         24 => "ShadowData",
         25 => "EnvironmentMap",
+        28 => "RemoteMaterialSettings",
+        29 => "SHEnvironment",
         31 => "Projection",
         34 => "View",
         36 => "ViewInv",
@@ -530,6 +533,8 @@ pub fn engine_usage(source: u32) -> Option<&'static str> {
         41 => "ApplicationTime",
         46 => "FogParameters",
         51 => "DebugControlBooleans",
+        53 => "HSVLightingMultiplier",
+        55 => "RimLightParams",
         _ => return None,
     })
 }

@@ -879,6 +879,23 @@ pub const DEBUG_CONTROL: [[f32; 4]; 4] = [
     [0.0, 0.0, 0.0, 0.0],
 ];
 
+/// An irradiance probe's light on normal `n`: `n' M n'` for each channel's matrix, `n'`
+/// the normal with a `w` of 1 (see [`thedas_formats::probe`]).
+fn probe_at(probe: &IrradianceProbe, n: Vec3) -> Vec3 {
+    let v = n.extend(1.0).to_array();
+    let rows = probe.rows();
+    let channel = |m: &[[f32; 4]]| -> f32 {
+        (0..4)
+            .map(|i| (0..4).map(|j| v[i] * m[i][j] * v[j]).sum::<f32>())
+            .sum()
+    };
+    Vec3::new(
+        channel(&rows[0..4]),
+        channel(&rows[4..8]),
+        channel(&rows[8..12]),
+    )
+}
+
 /// Light from every direction for draws in a level with no irradiance probe. Provisional.
 pub const NO_PROBE_IRRADIANCE: [f32; 3] = [0.35, 0.35, 0.35];
 
@@ -986,6 +1003,74 @@ impl ConstantContext<'_> {
         r
     }
 
+    /// Dragon Age II's `mml_vSHEnvironment`: the light around a draw as nine spherical
+    /// harmonic coefficients a colour channel, which its character shaders light their
+    /// diffuse term by (they take no other diffuse light; their point lights give only
+    /// specular). Seven vectors holding 27 numbers, coefficient `k` of channel `c` at `3k +
+    /// c`, in the order the shaders evaluate them (`character_character_p0.psh`): the
+    /// constant, `y`, `z`, `x`, `xy`, `yz`, `3z² − 1`, `xz`, `x² − y²`, each times its basis
+    /// constant there.
+    ///
+    /// Made here from the draw's own lights, convolved with the cosine lobe so that the
+    /// shaders' sum is the irradiance: the sun, the draw's point lights (each by the same
+    /// fall-off [`pick_level_lights`] ranks by, from the draw's origin) and an even ambient
+    /// (the probe's average, else [`NO_PROBE_IRRADIANCE`]). Provisional: the engine's own
+    /// source for these coefficients is not traced (Dragon Age II ships no probes of the
+    /// kind Origins reads), nor whether the shaders expect irradiance or irradiance / π.
+    pub fn sh_environment(&self) -> [[f32; 4]; 7] {
+        let mut sh = [[0.0f32; 3]; 9];
+        let mut add = |dir: Vec3, color: Vec3| {
+            let Some(d) = dir.try_normalize() else { return };
+            let (x, y, z) = (d.x, d.y, d.z);
+            let pi = std::f32::consts::PI;
+            // The basis at the light's direction times the cosine lobe's band weights.
+            let basis = [
+                0.282_095 * pi,
+                0.488_603 * y * 2.0 * pi / 3.0,
+                0.488_603 * z * 2.0 * pi / 3.0,
+                0.488_603 * x * 2.0 * pi / 3.0,
+                1.092_548 * x * y * pi / 4.0,
+                1.092_548 * y * z * pi / 4.0,
+                0.315_392 * (3.0 * z * z - 1.0) * pi / 4.0,
+                1.092_548 * x * z * pi / 4.0,
+                0.546_274 * (x * x - y * y) * pi / 4.0,
+            ];
+            for (k, b) in basis.iter().enumerate() {
+                for c in 0..3 {
+                    sh[k][c] += color[c] * b;
+                }
+            }
+        };
+        if let Some((travel, color)) = self.sun {
+            add(-travel, color);
+        }
+        let at = self.world.w_axis.truncate();
+        for (p, radius, color) in self.lights.points.iter().chain(&self.lights.dynamic) {
+            if *radius <= 0.0 {
+                continue;
+            }
+            let d = p.distance(at);
+            let t = (d / radius).clamp(0.0, 1.0);
+            let falloff = (t * std::f32::consts::FRAC_PI_2).cos().powi(2);
+            add(*p - at, *color * falloff);
+        }
+        let ambient = match self.irradiance {
+            Some(probe) => {
+                let axes = [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
+                axes.iter().map(|n| probe_at(probe, *n)).sum::<Vec3>() / 6.0
+            }
+            None => Vec3::from_array(NO_PROBE_IRRADIANCE),
+        } + self.ambient;
+        for c in 0..3 {
+            sh[0][c] += ambient[c] / 0.282_095;
+        }
+        let mut out = [[0.0f32; 4]; 7];
+        for (i, v) in sh.iter().flatten().enumerate() {
+            out[i / 4][i % 4] = *v;
+        }
+        out
+    }
+
     /// Whether the material object or its definition gives `name` a value.
     fn material_value(&self, name: &str) -> Option<()> {
         let mao = &self.material.object;
@@ -1054,6 +1139,15 @@ impl ConstantContext<'_> {
                 ])
             }
             ("DebugControlBooleans", _) => Value::Vectors(DEBUG_CONTROL.to_vec()),
+            ("SHEnvironment", _) => Value::Vectors(self.sh_environment().to_vec()),
+            // Hue turn (radians), saturation and value the lighting is put through
+            // (`character_character_p0.psh`): none.
+            ("HSVLightingMultiplier", _) => Value::Vectors(vec![[0.0, 1.0, 1.0, 1.0]]),
+            // A rim light's colour and its direction with a power: none.
+            ("RimLightParams", _) => Value::Vectors(vec![[0.0; 4]; 2]),
+            // The remote material overlay (crusts): none, with a scale of 1 that the
+            // shaders divide by.
+            ("RemoteMaterialSettings", _) => Value::Vectors(vec![[0.0; 4], [0.0, 1.0, 0.0, 0.0]]),
             // Three 4x4 matrices, red, green and blue: the vertex shaders light a normal n
             // with n^T M n (see `thedas_formats::probe`).
             (_, "g_mLightParams") => Value::Vectors(
@@ -1063,6 +1157,29 @@ impl ConstantContext<'_> {
                     .rows()
                     .to_vec(),
             ),
+            // Dragon Age II's character vertex shaders take no world matrix: their bones
+            // carry the draw's placement too (`character_character_p0.vsh` reads
+            // `bsm_bones`, then `aur_mViewProjection`). Each bone's three rows, after the
+            // world matrix.
+            ("BonesWorld", _) => {
+                let n = c.count.max(1) as usize;
+                let mut v: Vec<[f32; 4]> = Vec::with_capacity(n);
+                for b in 0..n.div_ceil(3) {
+                    let row = |r: usize| {
+                        self.bones
+                            .get(3 * b + r)
+                            .copied()
+                            .unwrap_or(IDENTITY_BONE[r])
+                    };
+                    let bone =
+                        Mat4::from_cols_array_2d(&[row(0), row(1), row(2), [0.0, 0.0, 0.0, 1.0]])
+                            .transpose();
+                    let placed = (self.world * bone).transpose();
+                    v.extend([placed.x_axis, placed.y_axis, placed.z_axis].map(|r| r.to_array()));
+                }
+                v.truncate(n);
+                Value::Vectors(v)
+            }
             // Provisional: rows of 3x4 bone matrices, as the character vertex shaders read
             // them (three `dp4`s per bone).
             (_, "bsm_bones") => {
@@ -1167,6 +1284,7 @@ impl ConstantContext<'_> {
                 | "ApplicationTime"
                 | "ShadowData"
                 | "ShadowPartitionMatrix"
+                | "BonesWorld"
         ) || matches!(
             c.name.as_str(),
             "aur_mWorldViewProj"
