@@ -132,7 +132,10 @@ pub fn send(dir: &Path, url: &str) -> Result<String> {
     }
     let id = info["id"].as_str().unwrap_or("report").to_string();
     let zip = zip(&files)?;
-    let mut shot = std::fs::read(dir.join("screenshot.png")).ok();
+    // The marked copy, when the player marked spots: it shows what they pointed at.
+    let mut shot = std::fs::read(dir.join("screenshot_marked.png"))
+        .or_else(|_| std::fs::read(dir.join("screenshot.png")))
+        .ok();
     if let Some(png) = &shot {
         if zip.len() + png.len() > MAX_UPLOAD {
             shot = half_size(png)
@@ -183,7 +186,26 @@ fn message(dir: &Path, info: &J) -> String {
     } else {
         note.to_string()
     };
-    format!("{note}\n\n{head}")
+    let spots: Vec<String> = info["regions"]
+        .as_array()
+        .map(|r| {
+            r.iter()
+                .map(|r| {
+                    let n = r["n"].as_u64().unwrap_or(0);
+                    let t: String = r["note"].as_str().unwrap_or("").chars().take(200).collect();
+                    format!("{n}. {t}")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = format!("{note}\n\n{head}");
+    if !spots.is_empty() {
+        let list = format!("\nMarked on the screenshot:\n{}", spots.join("\n"));
+        if out.chars().count() + list.chars().count() <= 1990 {
+            out.push_str(&list);
+        }
+    }
+    out
 }
 
 /// Posts `content` with `files` to the webhook (multipart, as Discord takes attachments);
@@ -281,24 +303,7 @@ fn replace_all(hay: &[u8], pat: &[u8], with: &[u8]) -> Vec<u8> {
 
 /// The screenshot at half size.
 fn half_size(png: &[u8]) -> Result<Vec<u8>> {
-    let decoder = png::Decoder::new(std::io::Cursor::new(png));
-    let mut reader = decoder.read_info()?;
-    let mut buf = vec![
-        0;
-        reader
-            .output_buffer_size()
-            .context("screenshot too large")?
-    ];
-    let frame = reader.next_frame(&mut buf)?;
-    if frame.color_type != png::ColorType::Rgba || frame.bit_depth != png::BitDepth::Eight {
-        bail!("the screenshot is not 8-bit RGBA");
-    }
-    buf.truncate(frame.buffer_size());
-    let img = thedas_ui::Rgba {
-        width: frame.width,
-        height: frame.height,
-        pixels: buf,
-    };
+    let img = crate::report::decode_png(png)?;
     thedas_ui::stage::encode_png(&crate::shrink(&img, 2)).context("encoding the screenshot")
 }
 
@@ -423,6 +428,11 @@ mod tests {
         modded["mods"] =
             json!([{ "layer": "mod:a", "files": 3 }, { "layer": "user:x", "files": 1 }]);
         assert!(message(&dir, &modded).contains("Test GPU, 2 mod layers"));
+        let mut marked = info.clone();
+        marked["regions"] = json!([{ "n": 1, "note": "fire missing here" }]);
+        assert!(
+            message(&dir, &marked).ends_with("Marked on the screenshot:\n1. fire missing here")
+        );
         std::fs::write(dir.join("note.txt"), "x".repeat(5000)).unwrap();
         assert!(message(&dir, &info).chars().count() <= 2000);
         let _ = std::fs::remove_dir_all(&dir);
