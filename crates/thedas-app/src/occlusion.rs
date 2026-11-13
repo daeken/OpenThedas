@@ -13,6 +13,9 @@
 //!   grass 10, unknown 0). A triangle mesh has no outline, so the angle is 0.
 //! - A static hit within 0.5 m of an earlier static hit counts in full (0xa2c9b1..0xa2ca01).
 //!
+//! An occluded event is low-passed, not turned down (`thedas_audio`'s `occlusion_cutoff`):
+//! FMOD's software occlusion, which the exe turns on.
+//!
 //! The event's occlusion moves towards the result at 1.2 per second (0x5b6eb0, 0xafebc0;
 //! `thedas_audio::AudioEngine::occlude`). Every occludable 3D event is tested, not only placed
 //! sounds: the exe's events are occludable unless their player says otherwise.
