@@ -1,6 +1,7 @@
 //! The frame buffer effects cutscenes run (their kind-19 actions, `AFBE`): depth of field
 //! (`da_dof.ffx.xml`, about 2,900 actions across the game's cutscenes; no level lists it) and
-//! the fades from and to a colour (`da_colorfade.ffx.xml`, about 1,000).
+//! the fades from and to a colour (`da_colorfade.ffx.xml`, about 1,000). A conversation runs
+//! a `da_dof` of its own as well ([`conversation_depth_of_field`]).
 //!
 //! **`da_dof`** (layer 5, at the end of the frame), as its effect file chains it, with the
 //! shaders transcribed in [`SHADER`]:
@@ -21,8 +22,11 @@
 //!    `max(blurred near circle, (depth − FocusDistance − FocalRadius) / FarFade) · MaxBlur`.
 //!
 //! Every sampler is point filtered and clamped. The depth the shaders read is the scene's
-//! distance from the camera (the materials' second colour output, which is not drawn here);
-//! it is worked out from the depth buffer instead.
+//! depth along the view axis: the materials' second colour output, `|view z / view w|` over
+//! `FocalPlane` packed into three bytes (`Char1.vsh` and its pixel shaders), which the
+//! effect multiplies back by the scene's focal plane. That output is not drawn here; the
+//! depth is worked out from the depth buffer instead. Provisional: the focal plane's value
+//! is not traced, and a depth past it would read as the focal plane.
 //!
 //! **`da_colorfade`** (layer 40): `LinearFade.psh` gives
 //! `StartColour + (time / TimeToFade)·(EndColour − StartColour)`, blended over the frame by
@@ -104,17 +108,44 @@ impl ColourFade {
     }
 }
 
-/// The effects a cutscene has running at a moment.
+/// What a conversation's own `da_dof` runs with, from the game's tables.
+///
+/// Traced: the conversation game mode makes one `da_dof` as it is set up (0x68fa70) and
+/// turns it on when a conversation starts (0x68e6eb), off when it ends. Its parameters are
+/// the rows of `conversation_dof_parameters` (column `Parameter`: `FocalRadius`,
+/// `WeightBlur`, `ArtifactBlur`, `NearFade`, `FarFade`, `MaxBlur`, `RenderBlurRadius`), each
+/// given the value in the column of that name of the first row of
+/// `conversation_dof_values` whose `FocusDistance` is below zero (8, 0.5, 1.3, 1, 20, 1 and
+/// 0 in the game's table; the setter, 0x45ed90, does not hold a value to the effect file's
+/// range). The table's other rows, for focus distances of 0.5 to 20, are not read by the
+/// game. Each tick (0x68e0fb) the mode works out the camera's distance to the line's
+/// speaker and gives it to a parameter named `focus`, which `da_dof.ffx.xml` does not have
+/// (its lookup, 0x4602d0, is by the whole name), so `FocusDistance` keeps the effect
+/// file's 5: a conversation is sharp out to 13 m and fully blurred from 33 m.
+///
+/// `value(parameter)` gives a parameter's value from that row, if the tables have it.
+pub fn conversation_depth_of_field(value: impl Fn(&str) -> Option<f32>) -> DepthOfField {
+    DepthOfField::from_parameters(|name| match name {
+        // Not among the parameters the tables set.
+        "FocusDistance" => None,
+        _ => value(name),
+    })
+}
+
+/// The effects a cutscene or a conversation has running at a moment.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CutEffects {
-    pub depth_of_field: Option<DepthOfField>,
+    /// Each `da_dof` running, in the order they run: a conversation's own, then its line's
+    /// cutscene's. Provisional: that order (both are layer 5); no more than [`MAX_DOF`] are
+    /// drawn.
+    pub depth_of_field: Vec<DepthOfField>,
     /// In the cutscene's order.
     pub fades: Vec<ColourFade>,
 }
 
 impl CutEffects {
     pub fn is_empty(&self) -> bool {
-        self.depth_of_field.is_none() && self.fades.is_empty()
+        self.depth_of_field.is_empty() && self.fades.is_empty()
     }
 }
 
@@ -149,7 +180,7 @@ fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(t * 2.0 - 1.0, 0.0, 1.0);
 }
 
-// The scene's distance from the camera at a texture coordinate (what the game keeps in its
+// The scene's depth along the view axis at a texture coordinate (what the game keeps in its
 // scene depth texture), from the depth buffer.
 fn distance_at(uv: vec2<f32>) -> f32 {
     let size = vec2<f32>(textureDimensions(depth));
@@ -157,7 +188,7 @@ fn distance_at(uv: vec2<f32>) -> f32 {
     let z = textureLoad(depth, at, 0);
     let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, z, 1.0);
     let view = p.inv_projection * ndc;
-    return length(view.xyz / view.w);
+    return abs(view.z / view.w);
 }
 
 fn tap(t: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
@@ -275,6 +306,8 @@ pub struct CutEffectsPass {
 
 /// How many fades a frame draws at most (a cutscene has one or two running).
 const MAX_FADES: usize = 4;
+/// How many `da_dof` one frame can run (a conversation's and its line's cutscene's).
+pub const MAX_DOF: usize = 2;
 
 impl CutEffectsPass {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, u32)) -> Self {
@@ -397,7 +430,7 @@ impl CutEffectsPass {
                 ..over
             },
         };
-        let uniforms = (0..=MAX_FADES)
+        let uniforms = (0..MAX_FADES + MAX_DOF)
             .map(|_| {
                 device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("cut effects"),
@@ -495,7 +528,8 @@ impl CutEffectsPass {
     }
 
     /// Records `da_dof` over `target`, a frame drawn with `projection` whose depth buffer
-    /// is `depth` (which must allow sampling).
+    /// is `depth` (which must allow sampling). `nth` counts the frame's `da_dof`s from 0;
+    /// those past [`MAX_DOF`] are not drawn.
     #[allow(clippy::too_many_arguments)]
     pub fn depth_of_field(
         &self,
@@ -505,8 +539,12 @@ impl CutEffectsPass {
         target: &wgpu::Texture,
         depth: &wgpu::TextureView,
         projection: Mat4,
+        nth: usize,
         dof: &DepthOfField,
     ) {
+        if nth >= MAX_DOF {
+            return;
+        }
         let params = Params {
             window: [self.size.0.max(1) as f32, self.size.1.max(1) as f32],
             near_edge: dof.focus_distance - dof.focal_radius,
@@ -521,7 +559,7 @@ impl CutEffectsPass {
             inv_projection: projection.inverse().to_cols_array_2d(),
             fade: [0.0; 4],
         };
-        let uniform = &self.uniforms[MAX_FADES];
+        let uniform = &self.uniforms[MAX_FADES + nth];
         queue.write_buffer(uniform, 0, bytemuck::bytes_of(&params));
         encoder.copy_texture_to_texture(
             target.as_image_copy(),
@@ -605,5 +643,18 @@ mod tests {
         assert_eq!((d.focus_distance, d.focal_radius), (2.0, 8.0));
         assert_eq!((d.near_fade, d.far_fade, d.weight_blur), (1.0, 1.0, 2.0));
         assert_eq!((d.artifact_blur, d.max_blur), (1.3, 1.0));
+    }
+
+    #[test]
+    fn a_conversations_depth_of_field_takes_the_tables_values_but_not_a_focus_distance() {
+        let d = conversation_depth_of_field(|n| match n {
+            "FocusDistance" => Some(-1.0),
+            "FocalRadius" => Some(8.0),
+            "FarFade" => Some(20.0),
+            "WeightBlur" => Some(0.5),
+            _ => None,
+        });
+        assert_eq!((d.focus_distance, d.focal_radius), (5.0, 8.0));
+        assert_eq!((d.far_fade, d.weight_blur, d.near_fade), (20.0, 0.5, 1.0));
     }
 }
