@@ -1218,9 +1218,12 @@ sets the three direction followers' wanted values; it does not move their curren
    rustling oscillator's output i, in degrees.
 
 **How DA:O drives it** (traced): N = 6, K = 8; response 0.4, limit 0.01; maximum bend 35;
-both exponents 2; oscillators as (low angle, high angle, low speed, high speed): the two
-branch ones (0.3, 3, 6, 3) and (0.1, 4, 8, 4) (which is horizontal and which vertical is
-taken in that order, provisional), leaf rocking (1, 2, 2, 10), leaf rustling (3, 1, 2, 20).
+both exponents 2; oscillators as (low angle, high angle, low speed, high speed): branch
+horizontal (0.3, 6, 3, 3), branch vertical (0.1, 8, 4, 4), leaf rocking (1, 2, 2, 10), leaf
+rustling (3, 2, 1, 20). (The game hands these over as configuration text whose four numbers
+per oscillator run low angle, low speed, high angle, high speed, with the horizontal
+oscillator first; an earlier revision of this section read them in the wrong order, which
+made the branches sway about half as much.)
 Strength (clamped to [0, 1]) and direction come from the level's wind file; its gust
 frequency is 0 everywhere. Five copies of this simulation run with their times 0.2 s apart
 (t, t + 0.2, …, t + 0.8) and placements take them in turn; t accumulates the frame times
