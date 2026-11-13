@@ -652,6 +652,9 @@ struct App {
     update_answers: Vec<ui::TextAnswer>,
     /// Answers about marking spots for a report, acted on next frame.
     mark_answers: Vec<ui::TextAnswer>,
+    /// The start menu's offer to resume a session that ended unexpectedly (see
+    /// [`App::resume_frame`]).
+    resume_offer: ResumeOffer,
     /// Mod mode's panels over the game (see [`modmode`]), made the first time it opens.
     mod_mode: Option<modmode::ModMode>,
     /// The last input came from a game controller (not the mouse or keyboard): a report
@@ -772,6 +775,43 @@ enum Marking {
         drag: Option<(glam::Vec2, glam::Vec2)>,
         asking: Option<([f32; 4], u32, u32)>,
     },
+}
+
+/// The start menu's offer to resume a session that ended unexpectedly: made at most once a
+/// run, when the start menu first comes up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResumeOffer {
+    Unchecked,
+    Asked,
+    Done,
+}
+
+/// The ids of the offer to resume and of the box saying it failed.
+const RESUME_ID: u32 = 0x5245_5355;
+const RESUME_FAILED_ID: u32 = RESUME_ID + 1;
+
+/// When `written` was, said as how long ago from `now`.
+fn time_ago(written: std::time::SystemTime, now: std::time::SystemTime) -> String {
+    let s = now.duration_since(written).map_or(0, |d| d.as_secs());
+    match s {
+        0..60 => "moments ago".to_string(),
+        60..120 => "a minute ago".to_string(),
+        120..3600 => format!("{} minutes ago", s / 60),
+        3600..7200 => "an hour ago".to_string(),
+        7200..86_400 => format!("{} hours ago", s / 3600),
+        86_400..172_800 => "yesterday".to_string(),
+        _ => format!("{} days ago", s / 86_400),
+    }
+}
+
+/// The newest of the saves' files in `dir` (when it was written), if there are any.
+fn newest_save(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".meta.json"))
+        .filter_map(|e| e.metadata().ok()?.modified().ok())
+        .max()
 }
 
 /// Smallest box (pixels a side) taken as a marked spot; smaller is a stray click.
@@ -1364,6 +1404,7 @@ impl App {
         self.serve_control(dt);
         self.pad_frame(dt);
         self.report_frame(dt);
+        self.resume_frame();
         self.mod_mode_frame(dt);
         self.returning_frame();
         self.update();
@@ -1515,6 +1556,24 @@ impl App {
             }
             if (a.id == report::MARK_ID || a.id == report::REGION_ID) && self.recorder.busy() {
                 self.mark_answers.push(a);
+                continue;
+            }
+            // The offer to resume: Resume opens the kept game; Not now leaves the journal
+            // for next time.
+            if a.id == RESUME_ID {
+                self.resume_offer = ResumeOffer::Done;
+                if a.accepted {
+                    g.ui.requests.push(ui::FrontEnd::Resume);
+                }
+                continue;
+            }
+            // The resume failed: "Set it aside" moves the journal out of the way.
+            if a.id == RESUME_FAILED_ID {
+                if a.accepted {
+                    if let Err(e) = journal::discard(&journal::default_dir()) {
+                        log::warn!("resume: setting the journal aside: {e}");
+                    }
+                }
                 continue;
             }
             if a.id == report::NOTE_ID && self.recorder.busy() {
@@ -1685,6 +1744,24 @@ impl App {
             }
             if (a.id == report::MARK_ID || a.id == report::REGION_ID) && self.recorder.busy() {
                 self.mark_answers.push(a);
+                continue;
+            }
+            // The offer to resume: Resume opens the kept game; Not now leaves the journal
+            // for next time.
+            if a.id == RESUME_ID {
+                self.resume_offer = ResumeOffer::Done;
+                if a.accepted {
+                    g.ui.requests.push(ui::FrontEnd::Resume);
+                }
+                continue;
+            }
+            // The resume failed: "Set it aside" moves the journal out of the way.
+            if a.id == RESUME_FAILED_ID {
+                if a.accepted {
+                    if let Err(e) = journal::discard(&journal::default_dir()) {
+                        log::warn!("resume: setting the journal aside: {e}");
+                    }
+                }
                 continue;
             }
             if a.id == report::NOTE_ID && self.recorder.busy() {
@@ -3790,6 +3867,8 @@ impl App {
                 ui::FrontEnd::NewGame => live::Start::NewGame,
                 ui::FrontEnd::Load(b) => live::Start::SaveBytes(b),
                 ui::FrontEnd::StartMenu => live::Start::Menu,
+                // Opened on the worker below, from the journal (`Start::Resume`).
+                ui::FrontEnd::Resume => live::Start::NewGame,
             };
             // A game (new or loaded) opens on a worker while the window keeps presenting,
             // the running one held behind it (see `Live::hold`); the start menu opens at once.
@@ -3813,13 +3892,15 @@ impl App {
                 ui::FrontEnd::Load(b) => Some(b.clone()),
                 _ => None,
             };
+            let resume = matches!(r, ui::FrontEnd::Resume).then(journal::default_dir);
             let (tx, rx) = std::sync::mpsc::channel();
             let spawned = std::thread::Builder::new()
                 .name("game-open".into())
                 .spawn(move || {
-                    let start = match &save {
-                        Some(b) => live::Start::SaveBytes(b),
-                        None => live::Start::NewGame,
+                    let start = match (&save, &resume) {
+                        (Some(b), _) => live::Start::SaveBytes(b),
+                        (None, Some(dir)) => live::Start::Resume(dir),
+                        (None, None) => live::Start::NewGame,
                     };
                     let _ = tx.send(live::Live::open(&install, &module, start, &shaders));
                 });
@@ -3864,8 +3945,61 @@ impl App {
                 if let Some(l) = self.live.as_mut() {
                     l.hold(false);
                 }
+                // A resume that failed says so, and offers to set the journal aside.
+                if what == "Resume"
+                    && let Some(g) = self.gfx.as_mut()
+                {
+                    g.ui.ask_choice(
+                        RESUME_FAILED_ID,
+                        &format!("The last session could not be resumed: {e:#}"),
+                        "Set it aside",
+                        "Keep it",
+                    );
+                }
             }
         }
+    }
+
+    /// The start menu's offer to resume a session that ended unexpectedly, asked once, when
+    /// the start menu is up and no other box is: only for a journal this build wrote, of a
+    /// game not quit normally, newer than the newest save (see [`journal::resumable`]).
+    /// Ours: the original has no journal.
+    fn resume_frame(&mut self) {
+        if self.resume_offer != ResumeOffer::Unchecked || self.opening.is_some() {
+            return;
+        }
+        let at_menu = self.live.as_ref().is_some_and(|l| l.front_end)
+            && self.screens.as_ref().is_some_and(|s| {
+                s.front_end && s.menu.is_none() && s.shown().contains(&screens::Screen::StartMenu)
+            });
+        let Some(g) = self.gfx.as_mut() else {
+            return;
+        };
+        if !at_menu || g.ui.stage.dialog_up() {
+            return;
+        }
+        self.resume_offer = ResumeOffer::Done;
+        if !journal::enabled() {
+            return;
+        }
+        let Some(info) = journal::resumable(&journal::default_dir()) else {
+            return;
+        };
+        let newer = newest_save(&self.saves_dir).is_none_or(|s| info.written > s);
+        if info.closed || !info.this_build || !newer {
+            log::info!(
+                "resume: not offered (quit normally {}, this build {}, newer than the saves {newer})",
+                info.closed,
+                info.this_build
+            );
+            return;
+        }
+        let prompt = format!(
+            "Your last session ended unexpectedly ({}). Resume where you were?",
+            time_ago(info.written, std::time::SystemTime::now())
+        );
+        g.ui.ask_choice(RESUME_ID, &prompt, "Resume", "Not now");
+        self.resume_offer = ResumeOffer::Asked;
     }
 
     /// A newly opened game (or the start menu) becomes the running one.
@@ -6102,7 +6236,10 @@ fn main() -> Result<()> {
                     for r in std::mem::take(&mut layer.requests) {
                         println!("front end: {r:?}");
                         let start = match &r {
-                            ui::FrontEnd::Quit | ui::FrontEnd::Report | ui::FrontEnd::ModMode => {
+                            ui::FrontEnd::Quit
+                            | ui::FrontEnd::Report
+                            | ui::FrontEnd::ModMode
+                            | ui::FrontEnd::Resume => {
                                 continue;
                             }
                             ui::FrontEnd::NewGame => live::Start::NewGame,
@@ -6326,6 +6463,7 @@ fn main() -> Result<()> {
         },
         update_answers: Vec::new(),
         mark_answers: Vec::new(),
+        resume_offer: ResumeOffer::Unchecked,
         mod_mode: None,
         pad_last: false,
         started_with: json!({

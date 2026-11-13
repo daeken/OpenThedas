@@ -159,6 +159,9 @@ pub enum FrontEnd {
     /// The game menu's "Mod Mode" (a button the interface adds): mod mode's panels open or
     /// close, as F10 does.
     ModMode,
+    /// The start menu's offer to resume a session that ended unexpectedly, taken: the game
+    /// kept in the journal (see `crate::journal`).
+    Resume,
 }
 
 impl std::fmt::Debug for FrontEnd {
@@ -170,6 +173,7 @@ impl std::fmt::Debug for FrontEnd {
             FrontEnd::Quit => write!(f, "Quit"),
             FrontEnd::Report => write!(f, "Report"),
             FrontEnd::ModMode => write!(f, "ModMode"),
+            FrontEnd::Resume => write!(f, "Resume"),
         }
     }
 }
