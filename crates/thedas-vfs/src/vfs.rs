@@ -327,6 +327,24 @@ impl Vfs {
         hash
     }
 
+    /// For a name whose winning source is an archive: that archive's layer (counted as
+    /// [`Provenance::layer`] counts it) and how many entries its table of contents holds.
+    /// `None` when the name is unknown or its winner is a loose file or a zip.
+    pub fn winning_archive(&self, name: &str) -> Option<(usize, usize)> {
+        if let Some(o) = &self.overlay {
+            if o.index.contains_key(&name_hash(name)) {
+                return o
+                    .winning_archive(name)
+                    .map(|(layer, n)| (layer + self.layers.len(), n));
+            }
+        }
+        let &(layer, _) = self.index.get(&name_hash(name))?.last()?;
+        match &self.layers[layer].source {
+            LayerSource::Archive { erf, .. } => Some((layer, erf.entries.len())),
+            _ => None,
+        }
+    }
+
     /// Rewrites the labels of the layers at or above `from`.
     pub fn relabel(&mut self, from: usize, f: impl Fn(&str) -> String) {
         for l in self.layers.iter_mut().skip(from) {
