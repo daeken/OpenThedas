@@ -326,7 +326,10 @@ impl PadPlay {
                     }
                 };
                 if near && let Some(l) = host.live() {
-                    l.sim().player_zoomed_in();
+                    l.sim().input(
+                        thedas_sim::commands::CommandSource::Player,
+                        thedas_sim::commands::SimCommand::PlayerZoomedIn,
+                    );
                 }
                 None
             }
@@ -353,7 +356,10 @@ impl PadPlay {
         {
             let mut sim = live.sim();
             if !sim.world.tutorials.is_empty() {
-                sim.consume_tutorial(false);
+                sim.input(
+                    thedas_sim::commands::CommandSource::Player,
+                    thedas_sim::commands::SimCommand::ConsumeTutorial { all: false },
+                );
                 return Some("tutorial dismissed".into());
             }
         }
@@ -692,7 +698,10 @@ impl PadPlay {
             Action::Skip => {
                 let cutscene = host.screens().is_some_and(|s| s.in_cutscene());
                 if cutscene {
-                    host.live()?.sim().skip_cutscene();
+                    host.live()?.sim().input(
+                        thedas_sim::commands::CommandSource::Player,
+                        thedas_sim::commands::SimCommand::SkipCutscene,
+                    );
                     "cutscene skipped".into()
                 } else {
                     host.interface_clicked();
@@ -743,7 +752,10 @@ impl PadPlay {
                 if hostile {
                     for m in party_with(&sim) {
                         if Some(m) != leader {
-                            sim.order_attack(m, t);
+                            sim.input(
+                                thedas_sim::commands::CommandSource::Player,
+                                thedas_sim::commands::SimCommand::OrderAttack { who: m, target: t },
+                            );
                         }
                     }
                     return format!("{order} (with the whole party)");
@@ -772,8 +784,14 @@ impl PadPlay {
             };
             if waits(&sim, "GUI_LEVLUP_OPENED") {
                 let who = sim.world.controlled().or(sim.world.hero)?;
-                sim.request_level_up(who);
-                sim.tick(0);
+                sim.input(
+                    thedas_sim::commands::CommandSource::Player,
+                    thedas_sim::commands::SimCommand::RequestLevelUp { creature: who },
+                );
+                sim.input(
+                    thedas_sim::commands::CommandSource::App,
+                    thedas_sim::commands::SimCommand::Tick { ms: 0 },
+                );
                 return Some("level-up opened (the tutorial waits for it)".into());
             }
             if waits(&sim, "GUI_INVENTORY_OPENED") {
@@ -893,14 +911,18 @@ impl PadPlay {
         if ability <= 0 {
             return Some("that item cannot go on the quickbar".into());
         }
-        sim.gui_message(
-            "GUI.SelectedChar.SetQuickslot",
-            &[
-                who.to_string(),
-                "-1".into(),
-                ability.to_string(),
-                tag.clone(),
-            ],
+        sim.input(
+            thedas_sim::commands::CommandSource::Player,
+            thedas_sim::commands::SimCommand::GuiMessage {
+                name: "GUI.SelectedChar.SetQuickslot".to_string(),
+                args: [
+                    who.to_string(),
+                    "-1".into(),
+                    ability.to_string(),
+                    tag.clone(),
+                ]
+                .to_vec(),
+            },
         );
         Some(format!("{tag} put on the quickbar"))
     }
@@ -1070,7 +1092,13 @@ fn walk(host: &mut dyn Host, v: Vec2, group: bool) -> Option<String> {
             continue;
         };
         if v == Vec2::ZERO {
-            sim.order_move(who, at.to_array());
+            sim.input(
+                thedas_sim::commands::CommandSource::Player,
+                thedas_sim::commands::SimCommand::OrderMove {
+                    who,
+                    to: at.to_array(),
+                },
+            );
             continue;
         }
         // A point a little ahead, on the ground there when it can be found; else at the
@@ -1082,8 +1110,17 @@ fn walk(host: &mut dyn Host, v: Vec2, group: bool) -> Option<String> {
         let to = sim
             .ground_hit(area, [p.x, p.y, p.z + 4.0], [0.0, 0.0, -1.0], 8.0)
             .unwrap_or(p.to_array());
-        sim.order_move(who, to);
-        sim.training_event("MOVEMENT_COMMAND_ISSUED", 0);
+        sim.input(
+            thedas_sim::commands::CommandSource::Player,
+            thedas_sim::commands::SimCommand::OrderMove { who, to },
+        );
+        sim.input(
+            thedas_sim::commands::CommandSource::Player,
+            thedas_sim::commands::SimCommand::TrainingEvent {
+                name: "MOVEMENT_COMMAND_ISSUED".to_string(),
+                arg: 0,
+            },
+        );
     }
     None
 }

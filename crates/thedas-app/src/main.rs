@@ -62,6 +62,7 @@ mod live;
 mod looks;
 mod modconv;
 mod modmode;
+mod modworld;
 mod occlusion;
 mod pad;
 mod paddev;
@@ -1205,7 +1206,10 @@ impl App {
                 && f.zoom(zoom * pad::ZOOM_SPEED * dt)
                 && let Some(l) = self.live.as_ref()
             {
-                l.sim().player_zoomed_in();
+                l.sim().input(
+                    thedas_sim::commands::CommandSource::Player,
+                    thedas_sim::commands::SimCommand::PlayerZoomedIn,
+                );
             }
             let eye = self
                 .live
@@ -1751,9 +1755,11 @@ impl App {
     /// Mod mode's frame: its panels laid out from the picked object, the scrubber's hold
     /// passed to the game's drawing, and what the panels asked for done.
     fn mod_mode_frame(&mut self, dt_ms: f64) {
+        let flying = self.live.is_some() && self.follow.is_none();
         let Some(m) = self.mod_mode.as_mut() else {
             return;
         };
+        m.fly = flying;
         let inspected = match (m.open.then_some(m.selected).flatten(), self.live.as_mut()) {
             (Some(id), Some(l)) => l.inspect(id),
             _ => None,
@@ -1770,6 +1776,9 @@ impl App {
             match a {
                 modmode::Action::Report(note) => self.report(Some(note), None),
                 modmode::Action::Conv(a) => self.mod_mode_conv(a),
+                modmode::Action::World(a) => self.mod_mode_world(a),
+                modmode::Action::Fly(on) => self.set_fly(on),
+                modmode::Action::FlyTo(id) => self.fly_to(id),
             }
         }
     }
@@ -1792,6 +1801,44 @@ impl App {
                 m.scrub = None;
             }
         }
+    }
+
+    /// Carries out a world-state browser request on the simulation.
+    fn mod_mode_world(&mut self, a: modworld::WorldAction) {
+        let (Some(m), Some(live)) = (self.mod_mode.as_mut(), self.live.as_ref()) else {
+            return;
+        };
+        let picked = {
+            let mut sim = live.sim();
+            modworld::carry_out(&mut sim, &mut m.world, &mut m.convs, a, m.selected)
+        };
+        if let Some(id) = picked {
+            m.selected = Some(id);
+            if m.scrub.as_ref().is_some_and(|s| s.id != id) {
+                m.scrub = None;
+            }
+        }
+    }
+
+    /// The camera flies free (`on`) or follows the leader again, as F switches it.
+    fn set_fly(&mut self, on: bool) {
+        if self.live.is_none() || on == self.follow.is_none() {
+            return;
+        }
+        self.follow = (!on).then(|| follow::Follow::behind(self.camera.yaw));
+    }
+
+    /// The camera flies free and looks at object `id`.
+    fn fly_to(&mut self, id: thedas_script::vm::ObjectId) {
+        let Some(at) = self
+            .live
+            .as_ref()
+            .and_then(|l| l.sim().world.get(id).map(|o| o.position))
+        else {
+            return;
+        };
+        self.set_fly(true);
+        self.camera = modworld::fly_to(&self.camera, glam::Vec3::from(at));
     }
 
     /// Carries out a conversation-panel request on the simulation.
@@ -1830,6 +1877,44 @@ impl App {
                 lines.iter().filter(|l| l.usable).count(),
                 lines.iter().map(|l| l.reads.len()).sum::<usize>()
             ),
+        }
+    }
+
+    /// The `modworld` and `modplot` steps: the browser opens, reads the world (or looks up
+    /// plot `plot`), and says what it found.
+    fn mod_mode_world_step(&mut self, plot: Option<&str>) -> String {
+        if !self.mod_mode_up() {
+            self.toggle_mod_mode();
+        }
+        if let Some(m) = self.mod_mode.as_mut() {
+            m.world.open = true;
+        }
+        self.mod_mode_world(match plot {
+            Some(p) => modworld::WorldAction::Lookup(p.to_string()),
+            None => modworld::WorldAction::Refresh,
+        });
+        let Some(w) = self.mod_mode.as_ref().map(|m| &m.world) else {
+            return "modworld: no window".into();
+        };
+        match (plot, &w.looked, &w.snapshot) {
+            (Some(_), Some(Ok(p)), _) => format!(
+                "modplot {}: {} flags, {} stored set",
+                p.resref.as_deref().unwrap_or(&p.guid),
+                p.flags.len(),
+                p.flags.iter().filter(|f| f.value == Some(true)).count()
+            ),
+            (Some(_), Some(Err(e)), _) => format!("modplot: {e}"),
+            (None, _, Some(s)) => format!(
+                "modworld: {} globals, area {} with {} variables and {} objects, {} plots with \
+                 {} stored flags",
+                s.module.len(),
+                s.area.as_ref().map_or("none", |a| a.0.as_str()),
+                s.area.as_ref().map_or(0, |a| a.1.len()),
+                s.things.len(),
+                s.plots.len(),
+                s.plots.iter().map(|p| p.flags.len()).sum::<usize>()
+            ),
+            _ => "modworld: nothing read".into(),
         }
     }
 
@@ -2430,7 +2515,10 @@ impl App {
         if let Some(why) = sim.saving_blocked() {
             bail!("{why}");
         }
-        sim.presave();
+        sim.input(
+            thedas_sim::commands::CommandSource::App,
+            thedas_sim::commands::SimCommand::Presave,
+        );
         let bytes = sim.save_json()?;
         let area = sim
             .world
@@ -2803,7 +2891,10 @@ impl App {
             && f.zoom(steps as f32)
             && let Some(l) = self.live.as_ref()
         {
-            l.sim().player_zoomed_in();
+            l.sim().input(
+                thedas_sim::commands::CommandSource::Player,
+                thedas_sim::commands::SimCommand::PlayerZoomedIn,
+            );
         }
     }
 
@@ -2844,7 +2935,10 @@ impl App {
                 .is_some_and(screens::Screens::in_cutscene)
         {
             if let Some(live) = self.live.as_ref() {
-                live.sim().skip_cutscene();
+                live.sim().input(
+                    thedas_sim::commands::CommandSource::Player,
+                    thedas_sim::commands::SimCommand::SkipCutscene,
+                );
             }
             return;
         }
@@ -2966,7 +3060,10 @@ impl App {
             }
             Step::Picker => {
                 if let Some(l) = self.live.as_ref() {
-                    l.sim().party_picker();
+                    l.sim().input(
+                        thedas_sim::commands::CommandSource::Player,
+                        thedas_sim::commands::SimCommand::PartyPicker,
+                    );
                 }
                 log.push("party picker".into());
             }
@@ -3045,10 +3142,13 @@ impl App {
                 if let Some(l) = self.live.as_ref() {
                     // As a script's DoAreaTransition does: performed at the start of the next
                     // update (`TRANSITION_DELAY_MS`).
-                    let mut sim = l.sim();
-                    sim.world.transition = Some((area.clone(), waypoint.clone()));
-                    sim.world.transition_at =
-                        Some(sim.world.time_ms + thedas_sim::sim::TRANSITION_DELAY_MS);
+                    l.sim().input(
+                        thedas_sim::commands::CommandSource::App,
+                        thedas_sim::commands::SimCommand::Transition {
+                            area: area.clone(),
+                            waypoint: waypoint.clone(),
+                        },
+                    );
                 }
                 log.push(format!("transition {area} {waypoint}"));
             }
@@ -3088,7 +3188,10 @@ impl App {
                     let who = sim.world.controlled();
                     match (who, who.and_then(|w| nearest_tagged(&sim, w, tag))) {
                         (Some(w), Some(t)) => {
-                            sim.order_use(w, t);
+                            sim.input(
+                                thedas_sim::commands::CommandSource::Player,
+                                thedas_sim::commands::SimCommand::OrderUse { who: w, target: t },
+                            );
                             log.push(format!("use {tag}"));
                         }
                         _ => log.push(format!("use {tag}: nothing")),
@@ -3110,15 +3213,23 @@ impl App {
             }
             &Step::TrainingMode(mode) => {
                 if let Some(l) = self.live.as_ref() {
-                    l.sim().set_training_mode(mode);
+                    l.sim().input(
+                        thedas_sim::commands::CommandSource::Player,
+                        thedas_sim::commands::SimCommand::SetTrainingMode { mode },
+                    );
                 }
                 log.push(format!("training mode {mode}"));
             }
             Step::Training(name) => {
-                let heard = self
-                    .live
-                    .as_ref()
-                    .is_some_and(|l| l.sim().training_event(name, 0));
+                let heard = self.live.as_ref().is_some_and(|l| {
+                    l.sim().input(
+                        thedas_sim::commands::CommandSource::Player,
+                        thedas_sim::commands::SimCommand::TrainingEvent {
+                            name: name.to_string(),
+                            arg: 0,
+                        },
+                    )
+                });
                 log.push(format!(
                     "training {name}: {}",
                     if heard { "heard" } else { "not awaited" }
@@ -3126,19 +3237,24 @@ impl App {
             }
             Step::Plot(plot, flag) => {
                 if let Some(l) = self.live.as_ref() {
-                    l.sim().set_plot_flag(
-                        plot,
-                        *flag,
-                        true,
-                        true,
-                        thedas_script::vm::OBJECT_INVALID,
+                    l.sim().input(
+                        thedas_sim::commands::CommandSource::App,
+                        thedas_sim::commands::SimCommand::SetPlotFlag {
+                            plot: plot.clone(),
+                            flag: *flag,
+                            value: true,
+                            call_script: true,
+                        },
                     );
                 }
                 log.push(format!("plot {plot} {flag}"));
             }
             Step::Cutscene(name) => {
                 if let Some(l) = self.live.as_ref() {
-                    l.sim().world.cutscenes.push(name.clone());
+                    l.sim().input(
+                        thedas_sim::commands::CommandSource::App,
+                        thedas_sim::commands::SimCommand::QueueCutscene { name: name.clone() },
+                    );
                 }
                 log.push(format!("cutscene {name}"));
             }
@@ -3212,6 +3328,26 @@ impl App {
                 });
             }
             &Step::ModUndo(n) => log.push(self.mod_mode_command(modconv::ConvAction::Undo(n))),
+            Step::ModFly => {
+                self.set_fly(self.follow.is_some());
+                log.push(format!(
+                    "camera {}",
+                    if self.follow.is_none() {
+                        "flies free"
+                    } else {
+                        "follows"
+                    }
+                ));
+            }
+            Step::ModFlyTo => match self.mod_mode.as_ref().and_then(|m| m.selected) {
+                Some(id) => {
+                    self.fly_to(id);
+                    log.push(format!("camera at {}", self.camera.spec()));
+                }
+                None => log.push("modflyto: nothing inspected".into()),
+            },
+            Step::ModWorld => log.push(self.mod_mode_world_step(None)),
+            Step::ModPlot(name) => log.push(self.mod_mode_world_step(Some(name))),
             Step::Talk(tag) => {
                 let Some(live) = self.live.as_mut() else {
                     return;
@@ -3221,7 +3357,10 @@ impl App {
                 let target = who.and_then(|w| nearest_tagged(&sim, w, tag));
                 log.push(match (who, target) {
                     (Some(w), Some(t)) => {
-                        sim.order_talk(w, t);
+                        sim.input(
+                            thedas_sim::commands::CommandSource::Player,
+                            thedas_sim::commands::SimCommand::OrderTalk { who: w, target: t },
+                        );
                         format!("talk to {tag}")
                     }
                     _ => format!("talk to {tag}: nobody"),
@@ -3484,6 +3623,11 @@ impl App {
                     continue;
                 }
                 // The game menu's Report Issue: an issue report, as F8 makes one.
+                // The game menu's Mod Mode: mod mode's panels, as F10 opens them.
+                ui::FrontEnd::ModMode => {
+                    self.toggle_mod_mode();
+                    continue;
+                }
                 ui::FrontEnd::Report => {
                     self.report(None, None);
                     continue;
@@ -3779,7 +3923,10 @@ impl ApplicationHandler for App {
                         .is_some_and(screens::Screens::in_cutscene)
                 {
                     if let Some(live) = self.live.as_ref() {
-                        live.sim().skip_cutscene();
+                        live.sim().input(
+                            thedas_sim::commands::CommandSource::Player,
+                            thedas_sim::commands::SimCommand::SkipCutscene,
+                        );
                     }
                     return;
                 }
@@ -4347,7 +4494,10 @@ impl padplay::Host for HeadlessHost<'_> {
     fn left_button(&mut self, down: bool) {
         let (x, y) = *self.cursor;
         if down && self.played.as_deref().is_some_and(|(_, s)| s.in_cutscene()) {
-            self.live.sim().skip_cutscene();
+            self.live.sim().input(
+                thedas_sim::commands::CommandSource::Player,
+                thedas_sim::commands::SimCommand::SkipCutscene,
+            );
             println!("pad click {x:.0},{y:.0}: skips the cutscene");
             return;
         }
@@ -4495,7 +4645,12 @@ fn travel_to_pin(sim: &mut thedas_sim::Sim, tag: &str) -> bool {
             o.kind == thedas_sim::world::ObjectKind::MapPin && o.tag.eq_ignore_ascii_case(tag)
         })
         .map(|o| o.id);
-    pin.is_some_and(|p| sim.begin_travel(p))
+    pin.is_some_and(|p| {
+        sim.input(
+            thedas_sim::commands::CommandSource::Player,
+            thedas_sim::commands::SimCommand::BeginTravel { pin: p },
+        )
+    })
 }
 
 /// Draws the party's portraits and the paperdoll when they are due (see
@@ -4615,6 +4770,15 @@ enum Step {
     ModFlag(String, String, bool),
     /// The conversation panel's history entry n (from 0) is undone (`modundo`).
     ModUndo(usize),
+    /// Mod mode's Fly: the camera flies free, or follows again (`modfly`).
+    ModFly,
+    /// The free camera looks at the inspected object (`modflyto`).
+    ModFlyTo,
+    /// The world-state browser opens and reads the world; its log line counts what it
+    /// read (`modworld`).
+    ModWorld,
+    /// The world-state browser looks up a plot (`modplot NAME`).
+    ModPlot(String),
     /// The conversation's reply n (from 0) is chosen.
     Reply(usize),
     /// The game camera turns (degrees of yaw, then pitch), as dragging with the right
@@ -4726,9 +4890,12 @@ fn seed_client_options(l: &live::Live, ui: &ui::UiLayer) {
     let mut sim = l.sim();
     for name in ["GameOptions.ShowTutorials", "GameOptions.AutoPauseCombat"] {
         if let Some(v) = ui.client_option(name) {
-            sim.client_option_message(
-                thedas_sim::chargen::MSG_CLIENT_OPTION,
-                &[name.to_string(), v.to_string()],
+            sim.input(
+                thedas_sim::commands::CommandSource::Player,
+                thedas_sim::commands::SimCommand::ClientOptionMessage {
+                    name: thedas_sim::chargen::MSG_CLIENT_OPTION.to_string(),
+                    args: [name.to_string(), v.to_string()].to_vec(),
+                },
             );
         }
     }
@@ -4740,9 +4907,12 @@ fn set_client_option(ui: Option<&ui::UiLayer>, live: Option<&live::Live>, name: 
         ui.set_client_option(name, value);
     }
     if let Some(l) = live {
-        l.sim().client_option_message(
-            thedas_sim::chargen::MSG_CLIENT_OPTION,
-            &[name.to_string(), value.to_string()],
+        l.sim().input(
+            thedas_sim::commands::CommandSource::Player,
+            thedas_sim::commands::SimCommand::ClientOptionMessage {
+                name: thedas_sim::chargen::MSG_CLIENT_OPTION.to_string(),
+                args: [name.to_string(), value.to_string()].to_vec(),
+            },
         );
     }
 }
@@ -4833,9 +5003,18 @@ fn test_floaty(sim: &mut thedas_sim::Sim, text: &str) {
 /// Every party member falls (the `wipe` step): what a lost fight leaves, for the death screen.
 fn wipe(sim: &mut thedas_sim::Sim) {
     for m in thedas_sim::engine::party_of(sim) {
-        sim.kill(m, thedas_script::vm::OBJECT_INVALID);
+        sim.input(
+            thedas_sim::commands::CommandSource::App,
+            thedas_sim::commands::SimCommand::Kill {
+                id: m,
+                killer: thedas_script::vm::OBJECT_INVALID,
+            },
+        );
     }
-    sim.tick(0);
+    sim.input(
+        thedas_sim::commands::CommandSource::App,
+        thedas_sim::commands::SimCommand::Tick { ms: 0 },
+    );
 }
 
 fn parse_steps(spec: &str) -> Result<Vec<Step>> {
@@ -4978,6 +5157,10 @@ fn parse_step(s: &str) -> Result<Step> {
             )
         }
         "modundo" => Step::ModUndo(arg.parse().context("modundo takes a history entry")?),
+        "modfly" => Step::ModFly,
+        "modflyto" => Step::ModFlyTo,
+        "modworld" => Step::ModWorld,
+        "modplot" if !arg.is_empty() => Step::ModPlot(arg.to_string()),
         "key" if arg.len() == 1 && arg.as_bytes()[0].is_ascii_digit() => {
             // 1 is the first slot, 0 the tenth.
             Step::Quickslot((arg.as_bytes()[0] - b'0' + 9) as i32 % 10)
@@ -5207,7 +5390,10 @@ fn main() -> Result<()> {
                     None => println!("click {x},{y}: nothing"),
                 }
             }
-            l.sim().tick(args.run_ms);
+            l.sim().input(
+                thedas_sim::commands::CommandSource::App,
+                thedas_sim::commands::SimCommand::Tick { ms: args.run_ms },
+            );
             let mut load_screen_up = false;
             for step in &steps {
                 let l = live.as_mut().expect("a game or the start menu");
@@ -5260,7 +5446,11 @@ fn main() -> Result<()> {
                     | Step::ModConv(_)
                     | Step::ModStart
                     | Step::ModFlag(..)
-                    | Step::ModUndo(_) => {
+                    | Step::ModUndo(_)
+                    | Step::ModFly
+                    | Step::ModFlyTo
+                    | Step::ModWorld
+                    | Step::ModPlot(_) => {
                         println!("mod mode: windowed only")
                     }
                     Step::Talk(tag) => {
@@ -5269,7 +5459,13 @@ fn main() -> Result<()> {
                         let target = who.and_then(|w| nearest_tagged(&sim, w, tag));
                         match (who, target) {
                             (Some(w), Some(t)) => {
-                                sim.order_talk(w, t);
+                                sim.input(
+                                    thedas_sim::commands::CommandSource::Player,
+                                    thedas_sim::commands::SimCommand::OrderTalk {
+                                        who: w,
+                                        target: t,
+                                    },
+                                );
                                 println!("talk to {tag}");
                             }
                             _ => println!("talk to {tag}: nobody"),
@@ -5277,7 +5473,10 @@ fn main() -> Result<()> {
                     }
                     &Step::Click(x, y) => {
                         if played.as_ref().is_some_and(|(_, s)| s.in_cutscene()) {
-                            l.sim().skip_cutscene();
+                            l.sim().input(
+                                thedas_sim::commands::CommandSource::Player,
+                                thedas_sim::commands::SimCommand::SkipCutscene,
+                            );
                             println!("click {x},{y}: skips the cutscene");
                             continue;
                         }
@@ -5425,7 +5624,10 @@ fn main() -> Result<()> {
                                 && let Some(f) = follow.as_mut()
                                 && f.zoom(zoom_key * pad::ZOOM_SPEED * dt as f32 / 1000.0)
                             {
-                                l.sim().player_zoomed_in();
+                                l.sim().input(
+                                    thedas_sim::commands::CommandSource::Player,
+                                    thedas_sim::commands::SimCommand::PlayerZoomedIn,
+                                );
                             }
                             if let (Some(f), Some(heading)) =
                                 (follow.as_mut(), l.camera_reset_due())
@@ -5454,7 +5656,10 @@ fn main() -> Result<()> {
                         }
                     }
                     Step::Picker => {
-                        l.sim().party_picker();
+                        l.sim().input(
+                            thedas_sim::commands::CommandSource::Player,
+                            thedas_sim::commands::SimCommand::PartyPicker,
+                        );
                         println!("party picker");
                     }
                     Step::Type(t) => {
@@ -5523,10 +5728,13 @@ fn main() -> Result<()> {
                     Step::Transition(area, waypoint) => {
                         // As a script's DoAreaTransition does: performed at the start of the next
                         // update (`TRANSITION_DELAY_MS`).
-                        let mut sim = l.sim();
-                        sim.world.transition = Some((area.clone(), waypoint.clone()));
-                        sim.world.transition_at =
-                            Some(sim.world.time_ms + thedas_sim::sim::TRANSITION_DELAY_MS);
+                        l.sim().input(
+                            thedas_sim::commands::CommandSource::App,
+                            thedas_sim::commands::SimCommand::Transition {
+                                area: area.clone(),
+                                waypoint: waypoint.clone(),
+                            },
+                        );
                         println!("transition {area} {waypoint}");
                     }
                     Step::Floaty(text) => {
@@ -5556,7 +5764,13 @@ fn main() -> Result<()> {
                         let who = sim.world.controlled();
                         match (who, who.and_then(|w| nearest_tagged(&sim, w, tag))) {
                             (Some(w), Some(t)) => {
-                                sim.order_use(w, t);
+                                sim.input(
+                                    thedas_sim::commands::CommandSource::Player,
+                                    thedas_sim::commands::SimCommand::OrderUse {
+                                        who: w,
+                                        target: t,
+                                    },
+                                );
                                 println!("use {tag}");
                             }
                             _ => println!("use {tag}: nothing"),
@@ -5576,25 +5790,39 @@ fn main() -> Result<()> {
                         println!("loading {kind:?}: hint {hint:?}, up and faded {state:?}");
                     }
                     &Step::TrainingMode(mode) => {
-                        l.sim().set_training_mode(mode);
+                        l.sim().input(
+                            thedas_sim::commands::CommandSource::Player,
+                            thedas_sim::commands::SimCommand::SetTrainingMode { mode },
+                        );
                         println!("training mode {mode}");
                     }
                     Step::Training(name) => {
-                        let heard = l.sim().training_event(name, 0);
+                        let heard = l.sim().input(
+                            thedas_sim::commands::CommandSource::Player,
+                            thedas_sim::commands::SimCommand::TrainingEvent {
+                                name: name.to_string(),
+                                arg: 0,
+                            },
+                        );
                         println!("training {name}: {heard}");
                     }
                     Step::Plot(plot, flag) => {
-                        l.sim().set_plot_flag(
-                            plot,
-                            *flag,
-                            true,
-                            true,
-                            thedas_script::vm::OBJECT_INVALID,
+                        l.sim().input(
+                            thedas_sim::commands::CommandSource::App,
+                            thedas_sim::commands::SimCommand::SetPlotFlag {
+                                plot: plot.clone(),
+                                flag: *flag,
+                                value: true,
+                                call_script: true,
+                            },
                         );
                         println!("plot {plot} {flag}");
                     }
                     Step::Cutscene(name) => {
-                        l.sim().world.cutscenes.push(name.clone());
+                        l.sim().input(
+                            thedas_sim::commands::CommandSource::App,
+                            thedas_sim::commands::SimCommand::QueueCutscene { name: name.clone() },
+                        );
                         println!("cutscene {name}");
                     }
                     &Step::Menu(m) => {
@@ -5655,7 +5883,10 @@ fn main() -> Result<()> {
                         if let Some(f) = follow.as_mut()
                             && f.zoom(n)
                         {
-                            l.sim().player_zoomed_in();
+                            l.sim().input(
+                                thedas_sim::commands::CommandSource::Player,
+                                thedas_sim::commands::SimCommand::PlayerZoomedIn,
+                            );
                         }
                         println!("zoom {n}");
                     }
@@ -5669,7 +5900,9 @@ fn main() -> Result<()> {
                     for r in std::mem::take(&mut layer.requests) {
                         println!("front end: {r:?}");
                         let start = match &r {
-                            ui::FrontEnd::Quit | ui::FrontEnd::Report => continue,
+                            ui::FrontEnd::Quit | ui::FrontEnd::Report | ui::FrontEnd::ModMode => {
+                                continue;
+                            }
                             ui::FrontEnd::NewGame => live::Start::NewGame,
                             ui::FrontEnd::Load(b) => live::Start::SaveBytes(b),
                             ui::FrontEnd::StartMenu => live::Start::Menu,
@@ -6059,6 +6292,15 @@ mod tests {
             ]
         );
         assert!(parse_steps("modflag gen00pt_party 3").is_err());
+        assert_eq!(
+            parse_steps("modfly; modflyto; modworld; modplot plt_a").unwrap(),
+            vec![
+                Step::ModFly,
+                Step::ModFlyTo,
+                Step::ModWorld,
+                Step::ModPlot("plt_a".into())
+            ]
+        );
         assert!(parse_steps("modflag gen00pt_party 3 yes").is_err());
         assert_eq!(
             parse_steps("modflag plt_a SOME_FLAG 0").unwrap(),

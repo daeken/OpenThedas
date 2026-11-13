@@ -598,10 +598,19 @@ impl Live {
                 );
             }
         }
-        // The player is in control (saves made by test drivers may have the autopilot on).
-        sim.world.autopilot = false;
-        // The player chooses the party when the scripts show the picker.
-        sim.party_picker_policy = thedas_sim::sim::PartyPickerPolicy::Player;
+        // The player is in control (saves made by test drivers may have the autopilot on),
+        // and chooses the party when the scripts show the picker. Commands, so a replay of
+        // the game from here sets them up the same.
+        sim.input(
+            thedas_sim::commands::CommandSource::App,
+            thedas_sim::commands::SimCommand::SetAutopilot { on: false },
+        );
+        sim.input(
+            thedas_sim::commands::CommandSource::App,
+            thedas_sim::commands::SimCommand::SetPartyPickerPolicy {
+                policy: thedas_sim::sim::PartyPickerPolicy::Player,
+            },
+        );
         Ok(Self {
             sim: Arc::new(Mutex::new(sim)),
             front_end: matches!(start, Start::Menu),
@@ -678,7 +687,10 @@ impl Live {
         // (one left up would otherwise swallow the step's event: the Wilds' "Select
         // Alistair").
         if self.sim().training_paused() {
-            self.sim().tick(0);
+            self.sim().input(
+                thedas_sim::commands::CommandSource::App,
+                thedas_sim::commands::SimCommand::Tick { ms: 0 },
+            );
             return;
         }
         // A tutorial that pauses the game holds it until its popup is dismissed.
@@ -692,7 +704,10 @@ impl Live {
             let started = std::time::Instant::now();
             let mut sim = self.sim();
             let area = sim.world.area;
-            sim.tick(whole as u64);
+            sim.input(
+                thedas_sim::commands::CommandSource::App,
+                thedas_sim::commands::SimCommand::Tick { ms: whole as u64 },
+            );
             if sim.world.area != area {
                 // The frame the window stands still for: the simulation's own load.
                 log::info!(
@@ -1232,7 +1247,10 @@ impl Live {
             self.movies_wait,
         );
         if state == crate::intro::MovieState::CannotPlay {
-            sim.skip_cutscene();
+            sim.input(
+                thedas_sim::commands::CommandSource::App,
+                thedas_sim::commands::SimCommand::SkipCutscene,
+            );
             self.cutscene_movies
                 .follow(None, &sim.vfs, &self.install, false);
         }
@@ -2708,15 +2726,39 @@ impl Live {
             return Some(match (target, pick) {
                 // An ability only for places is cast at the creature's feet.
                 (Some((_, tag, at)), _) if only_place => {
-                    sim.order_ability_at(aim.caster, aim.ability, at, &aim.item);
+                    sim.input(
+                        thedas_sim::commands::CommandSource::Player,
+                        thedas_sim::commands::SimCommand::OrderAbilityAt {
+                            who: aim.caster,
+                            ability: aim.ability,
+                            at,
+                            item: aim.item.to_string(),
+                        },
+                    );
                     format!("use ability {} at {tag}", aim.ability)
                 }
                 (Some((id, tag, _)), _) => {
-                    sim.order_ability(aim.caster, aim.ability, id, &aim.item);
+                    sim.input(
+                        thedas_sim::commands::CommandSource::Player,
+                        thedas_sim::commands::SimCommand::OrderAbility {
+                            who: aim.caster,
+                            ability: aim.ability,
+                            target: id,
+                            item: aim.item.to_string(),
+                        },
+                    );
                     format!("use ability {} on {tag}", aim.ability)
                 }
                 (None, Pick::Ground(at)) if place => {
-                    sim.order_ability_at(aim.caster, aim.ability, at, &aim.item);
+                    sim.input(
+                        thedas_sim::commands::CommandSource::Player,
+                        thedas_sim::commands::SimCommand::OrderAbilityAt {
+                            who: aim.caster,
+                            ability: aim.ability,
+                            at,
+                            item: aim.item.to_string(),
+                        },
+                    );
                     format!("use ability {} at {:.1} {:.1}", aim.ability, at[0], at[1])
                 }
                 _ => format!("ability {} not aimed", aim.ability),
@@ -2725,7 +2767,12 @@ impl Live {
         // The party picker is open: a click on a follower picks or drops them.
         if sim.world.party_picker.is_some() {
             return Some(match pick {
-                Pick::Object(id) if sim.party_picker_toggle(id) => {
+                Pick::Object(id)
+                    if sim.input(
+                        thedas_sim::commands::CommandSource::Player,
+                        thedas_sim::commands::SimCommand::PartyPickerToggle { who: id },
+                    ) =>
+                {
                     let tag = sim.world.get(id).map(|o| o.tag.clone()).unwrap_or_default();
                     format!("party picker: {tag} picked or dropped")
                 }
@@ -2735,8 +2782,17 @@ impl Live {
         let leader = sim.world.controlled()?;
         match pick {
             Pick::Ground(p) => {
-                sim.order_move(leader, p);
-                sim.training_event("MOVEMENT_COMMAND_ISSUED", 0);
+                sim.input(
+                    thedas_sim::commands::CommandSource::Player,
+                    thedas_sim::commands::SimCommand::OrderMove { who: leader, to: p },
+                );
+                sim.input(
+                    thedas_sim::commands::CommandSource::Player,
+                    thedas_sim::commands::SimCommand::TrainingEvent {
+                        name: "MOVEMENT_COMMAND_ISSUED".to_string(),
+                        arg: 0,
+                    },
+                );
                 Some(format!("move to {:.1} {:.1}", p[0], p[1]))
             }
             Pick::Object(id) => {
@@ -2750,15 +2806,33 @@ impl Live {
                 let (kind, dead, tag, talks) = (o.kind, o.dead, o.tag.clone(), o.dialog.is_some());
                 match kind {
                     thedas_sim::world::ObjectKind::Creature if !dead && sim.hostile(leader, id) => {
-                        sim.order_attack(leader, id);
+                        sim.input(
+                            thedas_sim::commands::CommandSource::Player,
+                            thedas_sim::commands::SimCommand::OrderAttack {
+                                who: leader,
+                                target: id,
+                            },
+                        );
                         Some(format!("attack {tag}"))
                     }
                     thedas_sim::world::ObjectKind::Creature if !dead && talks => {
-                        sim.order_talk(leader, id);
+                        sim.input(
+                            thedas_sim::commands::CommandSource::Player,
+                            thedas_sim::commands::SimCommand::OrderTalk {
+                                who: leader,
+                                target: id,
+                            },
+                        );
                         Some(format!("talk to {tag}"))
                     }
                     thedas_sim::world::ObjectKind::Placeable => {
-                        sim.order_use(leader, id);
+                        sim.input(
+                            thedas_sim::commands::CommandSource::Player,
+                            thedas_sim::commands::SimCommand::OrderUse {
+                                who: leader,
+                                target: id,
+                            },
+                        );
                         Some(format!("use {tag}"))
                     }
                     _ => None,
@@ -3051,7 +3125,13 @@ impl Live {
     pub fn toggle_pause(&mut self) {
         let mut sim = self.sim();
         if sim.training_paused() {
-            sim.training_event("UNPAUSE", 0);
+            sim.input(
+                thedas_sim::commands::CommandSource::Player,
+                thedas_sim::commands::SimCommand::TrainingEvent {
+                    name: "UNPAUSE".to_string(),
+                    arg: 0,
+                },
+            );
             return;
         }
         drop(sim);
@@ -3064,7 +3144,10 @@ impl Live {
         let party = thedas_sim::engine::party_of(&sim);
         let id = *party.get(n)?;
         // The simulation learns who the player controls, so that member's AI stands down.
-        sim.player_selects(id);
+        sim.input(
+            thedas_sim::commands::CommandSource::Player,
+            thedas_sim::commands::SimCommand::PlayerSelects { who: id },
+        );
         sim.world.get(id).map(|o| o.tag.clone())
     }
 }
