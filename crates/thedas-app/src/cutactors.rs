@@ -282,15 +282,29 @@ fn show(tracks: &Tracks, i: usize, at: &Moment) -> Option<ActorShow> {
     let pose = tracks
         .world_pose(i, t, at.placement, &find)
         .unwrap_or_else(|| at.placement.pose(a.stage_pose_at(t, &place)));
-    let animations = a
-        .animations_at(t, length)
+    // The actor's base pose, a node of the cutscene's own tree, under its animation tracks
+    // (see [`thedas_sim::cuttracks::Actor::pose_node`]): it loops for the whole cutscene.
+    let base = a
+        .pose_node()
+        .zip(tracks.tree.clone())
+        .map(|(node, tree)| CutAnimation {
+            tree,
+            node,
+            time: t.max(0.0),
+            unbounded: true,
+        });
+    let animations = base
         .into_iter()
-        .map(|(l, time)| CutAnimation {
-            tree: l.tree.clone(),
-            node: l.node.clone(),
-            time,
-            unbounded: l.end >= 1e9,
-        })
+        .chain(
+            a.animations_at(t, length)
+                .into_iter()
+                .map(|(l, time)| CutAnimation {
+                    tree: l.tree.clone(),
+                    node: l.node.clone(),
+                    time,
+                    unbounded: l.end >= 1e9,
+                }),
+        )
         .collect();
     Some(ActorShow {
         position: pose.position,
