@@ -2,22 +2,9 @@
 //!
 //! `m2da_base.gda`, and any other GDA whose name starts with `m2da_`, lists each table id with
 //! a label and a worksheet prefix (`1, Abilities, ABI_`). A table is the union of every GDA resource whose name starts with the prefix
-//! (`abi_base.gda`, `abi_dlc.gda`, ...), indexed by the first column (`ID`). Scripts can also
-//! name a worksheet directly (the optional `s2DA` argument), which reads just that file.
-//!
-//! A row id belongs to the first worksheet that defines it: the original skips a row whose id
-//! the set already holds (`0x4ec910` returns -1 and `0x4eca10` moves on), within one worksheet
-//! and across worksheets alike.
-//!
-//! The order of the worksheets is the order of the original's resource listing (`0x4c56b0`):
-//! its resource locations from the lowest priority number up, so a worksheet in a
-//! higher-priority folder (an add-in's, a mod's) comes before the base game's. That much is
-//! traced and ours follows it by stack layer. Inside one location the original lists resources
-//! in the order of a hash container keyed by name (CRC-32 of the UTF-16 name, MSVC
-//! `hash_map` bucket order), which is not reproduced yet. Provisional: among worksheets served
-//! from the same layer the later name comes first, which keeps the result this loader gave
-//! before rows stopped overwriting each other (the shipped AI package tables, `aip_archer` and
-//! `aip_archer_*`, share row ids inside one archive, so this choice decides them).
+//! (`abi_base.gda`, `abi_dlc.gda`, ...), indexed by the first column (`ID`). Provisional: when
+//! two worksheets define the same row id, the one that sorts later by name wins; scripts can
+//! also name a worksheet directly (the optional `s2DA` argument), which reads just that file.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -56,11 +43,9 @@ impl Table {
                     cells[*at] = c.clone();
                 }
             }
-            // The first definition of a row id stands.
-            if self.rows.contains_key(&id) {
-                continue;
+            if !self.rows.contains_key(&id) {
+                self.order.push(id);
             }
-            self.order.push(id);
             self.rows.insert(id, cells);
         }
         for r in self.rows.values_mut() {
@@ -115,27 +100,14 @@ fn prefix_set<'a>(gdas: &'a [String], prefix: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// Orders the worksheets of a set as their rows take precedence: the one the resource stack
-/// serves from a higher layer first (traced), then the later name first (provisional; see the
-/// module documentation).
-fn in_set_order<'a>(vfs: &Vfs, mut names: Vec<&'a str>) -> Vec<&'a str> {
-    names.sort_by_cached_key(|n| {
-        let layer = vfs.lookup(n).map_or(0, |p| p.layer);
-        std::cmp::Reverse((layer, n.to_string()))
-    });
-    names
-}
-
-/// Adds one table-list worksheet's rows (table id, label, worksheet prefix) to `prefixes`. An
-/// id an earlier worksheet (or row) gave keeps its prefix, as rows do in any prefix set.
+/// Adds one table-list worksheet's rows (table id, label, worksheet prefix) to `prefixes`.
+/// Provisional: a later worksheet's row replaces an earlier one's for the same id.
 fn add_prefixes(prefixes: &mut HashMap<i32, String>, list: &Gda) {
     let ws = list.column("Worksheet").unwrap_or(2);
     for row in &list.rows {
         if let (Some(Cell::Int(id)), Some(Cell::String(p))) = (row.first(), row.get(ws)) {
             let p = p.trim_matches(|c: char| c == '\0' || c.is_whitespace());
-            prefixes
-                .entry(*id as i32)
-                .or_insert_with(|| p.to_ascii_lowercase());
+            prefixes.insert(*id as i32, p.to_ascii_lowercase());
         }
     }
 }
@@ -171,7 +143,7 @@ impl Tables {
         // starts with `M2DA_` (0x4e0cf8), so an add-in or mod adds tables with its own
         // `m2da_*.gda` beside `m2da_base.gda`.
         let mut prefixes = HashMap::new();
-        for name in in_set_order(&vfs, prefix_set(&gdas, TABLE_LIST_PREFIX)) {
+        for name in prefix_set(&gdas, TABLE_LIST_PREFIX) {
             if let Ok((data, _)) = vfs.read(name) {
                 if let Ok(g) = Gda::parse(&data) {
                     add_prefixes(&mut prefixes, &g);
@@ -186,16 +158,11 @@ impl Tables {
         }
     }
 
-    /// The names of every GDA in the stack whose name starts with `prefix` (any case): a
-    /// prefix set, as the original opens them (`0x4ec7a0`; `M2DA_` for the table list,
-    /// `PRCSCR_` for the add-ins' start-up scripts). In the order their rows take precedence
-    /// (see the module documentation): higher layer first, then the later name first.
+    /// The names of every GDA in the stack whose name starts with `prefix` (any case), sorted:
+    /// a prefix set, as the original opens them (`0x4ec7a0`; `M2DA_` for the table list,
+    /// `PRCSCR_` for the add-ins' start-up scripts).
     pub fn prefix_set(&self, prefix: &str) -> Vec<&str> {
-        let names = prefix_set(&self.gdas, prefix);
-        match &self.vfs {
-            Some(vfs) => in_set_order(vfs, names),
-            None => names,
-        }
+        prefix_set(&self.gdas, prefix)
     }
 
     /// Each worksheet of a prefix set as its own table, in [`Tables::prefix_set`] order, for
@@ -243,7 +210,7 @@ impl Tables {
         let mut table = Table::default();
         if worksheet.is_empty() {
             let prefix = self.prefixes.get(&id)?;
-            for name in in_set_order(vfs, prefix_set(&self.gdas, prefix)) {
+            for name in prefix_set(&self.gdas, prefix) {
                 if let Ok((data, _)) = vfs.read(name) {
                     if let Ok(g) = Gda::parse(&data) {
                         table.merge(&g);
@@ -320,62 +287,9 @@ mod tests {
         add_prefixes(&mut prefixes, &list(&[(1, "ABI_\0"), (2, " ITM_ ")]));
         add_prefixes(&mut prefixes, &list(&[(2, "ITX_"), (9000, "MYMOD_")]));
         assert_eq!(prefixes[&1], "abi_");
-        // The first worksheet to give an id keeps it, and new ids are added.
-        assert_eq!(prefixes[&2], "itm_");
+        // A later worksheet's row replaces an earlier one's, and new ids are added.
+        assert_eq!(prefixes[&2], "itx_");
         assert_eq!(prefixes[&9000], "mymod_");
         assert_eq!(prefixes.len(), 3);
-    }
-
-    #[test]
-    fn the_first_definition_of_a_row_stands() {
-        let mut t = Table::default();
-        // Twice in one worksheet, then again in a later one.
-        t.merge(&list(&[(5, "first"), (5, "same sheet"), (6, "six")]));
-        t.merge(&list(&[(5, "later sheet"), (7, "seven")]));
-        let text = |id: i64| match t.cell("Worksheet", id) {
-            Some(Cell::String(s)) => s.clone(),
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(text(5), "first");
-        assert_eq!(text(6), "six");
-        assert_eq!(text(7), "seven");
-        assert_eq!(t.order, [5, 6, 7]);
-    }
-
-    #[test]
-    fn worksheets_from_higher_layers_come_first() {
-        let base = std::env::temp_dir().join(format!("thedas-m2da-order-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let write = |rel: &str| {
-            let p = base.join(rel);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(p, b"x").unwrap();
-        };
-        write("core/aip_archer.gda");
-        write("core/aip_archer_fire.gda");
-        write("core/aip_archer_base.gda");
-        write("addin/aip_archer_dlc.gda");
-        write("mod/aip_archer_fire.gda");
-        let mut vfs = Vfs::new();
-        vfs.push_directory(base.join("core"), false, "core")
-            .unwrap();
-        vfs.push_directory(base.join("addin"), false, "addin")
-            .unwrap();
-        let mut overlay = Vfs::new();
-        overlay
-            .push_directory(base.join("mod"), false, "mod:m")
-            .unwrap();
-        vfs.set_overlay(overlay);
-        let tables = Tables::new(std::sync::Arc::new(vfs));
-        assert_eq!(
-            tables.prefix_set("AIP_ARCHER"),
-            [
-                "aip_archer_fire.gda",
-                "aip_archer_dlc.gda",
-                "aip_archer_base.gda",
-                "aip_archer.gda"
-            ]
-        );
-        std::fs::remove_dir_all(&base).unwrap();
     }
 }
