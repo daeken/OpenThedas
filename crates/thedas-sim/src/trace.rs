@@ -1,7 +1,7 @@
 //! What the simulation did, for parity diffs and debugging. Each entry carries the world time
 //! in milliseconds.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use serde::Serialize;
 use thedas_script::vm::ObjectId;
@@ -91,6 +91,22 @@ pub enum TraceEntry {
     },
 }
 
+impl TraceEntry {
+    /// Whether [`Trace::recent`] keeps entries of this kind.
+    fn is_recent_kind(&self) -> bool {
+        match self {
+            TraceEntry::Command { .. }
+            | TraceEntry::Log { .. }
+            | TraceEntry::Dialog { .. }
+            | TraceEntry::PlotFlag { .. }
+            | TraceEntry::Unimplemented { .. }
+            | TraceEntry::Missing { .. } => true,
+            TraceEntry::ScriptEnd { error, .. } => error.is_some(),
+            _ => false,
+        }
+    }
+}
+
 /// Health an effect took from a creature: its creator, the ability it came from (0 for a
 /// weapon attack) and the effect's type. A killing blow counts the health that was left.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -139,6 +155,13 @@ pub struct Trace {
     pub warnings: BTreeMap<String, u64>,
     /// Keep full entries (otherwise only the counters are updated).
     pub keep: bool,
+    /// The last entries of the kinds that explain what just happened, whatever `keep` is:
+    /// orders and their outcomes (`Command`), the scripts' log lines, conversation lines,
+    /// plot flags set, failed scripts, unimplemented functions and missing resources. At
+    /// most `keep_recent` (0, the default, keeps none). For issue reports; a debug read
+    /// only, which nothing in the simulation reads.
+    pub recent: VecDeque<TraceEntry>,
+    pub keep_recent: usize,
 }
 
 impl Trace {
@@ -172,6 +195,12 @@ impl Trace {
                 *self.script_errors.entry(key).or_default() += 1;
             }
             _ => {}
+        }
+        if self.keep_recent > 0 && e.is_recent_kind() {
+            while self.recent.len() >= self.keep_recent {
+                self.recent.pop_front();
+            }
+            self.recent.push_back(e.clone());
         }
         if self.keep {
             self.entries.push(e);
@@ -269,5 +298,45 @@ mod tests {
                 damage: 23.5
             })
         );
+    }
+
+    #[test]
+    fn the_recent_ring_keeps_the_last_entries_of_its_kinds_only() {
+        let mut t = Trace {
+            keep_recent: 3,
+            ..Default::default()
+        };
+        for i in 0..5 {
+            t.push(TraceEntry::Log {
+                t: i,
+                channel: 0,
+                text: format!("line {i}"),
+            });
+            // Not a kind the ring keeps.
+            t.push(TraceEntry::ScriptStart {
+                t: i,
+                script: "s".into(),
+                caller: 1,
+                depth: 0,
+            });
+        }
+        assert!(t.entries.is_empty());
+        let times: Vec<u64> = t
+            .recent
+            .iter()
+            .map(|e| match e {
+                TraceEntry::Log { t, .. } => *t,
+                _ => u64::MAX,
+            })
+            .collect();
+        assert_eq!(times, vec![2, 3, 4]);
+        // Off by default.
+        let mut off = Trace::default();
+        off.push(TraceEntry::Log {
+            t: 0,
+            channel: 0,
+            text: "x".into(),
+        });
+        assert!(off.recent.is_empty());
     }
 }
