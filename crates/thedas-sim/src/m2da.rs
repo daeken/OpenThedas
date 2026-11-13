@@ -39,7 +39,7 @@ pub struct Table {
     pub columns: HashMap<u32, usize>,
     /// Row id -> cells.
     pub rows: BTreeMap<i64, Vec<Cell>>,
-    /// Row ids in file order (for `GetM2DARowIdFromRowIndex`).
+    /// Row ids by position (for `GetM2DARowIdFromRowIndex`): ascending ([`Table::sort_rows`]).
     pub order: Vec<i64>,
 }
 
@@ -73,6 +73,19 @@ impl Table {
         for r in self.rows.values_mut() {
             r.resize(width, Cell::Empty);
         }
+    }
+
+    /// Puts the rows in the original's order: ascending by row id, whichever worksheet gave
+    /// each. The original's insert (`0x4ec910`) binary-searches the set's row list for the new
+    /// id and puts the row at the place found, so the list stays sorted and a row's position
+    /// (`GetM2DARowIdFromRowIndex`, the interface's `Get2DAValueByRowIndex...`) is its rank
+    /// by id. Character creation lists classes and backgrounds by position, and an add-in's
+    /// worksheet, which merges first, must not move the base game's rows. A worksheet read by
+    /// its own name is sorted the same way: a prefix set's worksheets handed out one by one
+    /// go through the same insert. Provisional for a script's `s2DA` argument, whose loader
+    /// is not traced apart from that.
+    fn sort_rows(&mut self) {
+        self.order.sort_unstable();
     }
 
     /// Whether the table has no rows.
@@ -303,6 +316,7 @@ impl Tables {
             let (data, _) = vfs.read(&name).ok()?;
             table.merge(&Gda::parse(&data).ok()?);
         }
+        table.sort_rows();
         let t = std::sync::Arc::new(table);
         self.loaded.lock().ok()?.insert(key, t.clone());
         Some(t)
@@ -384,6 +398,23 @@ mod tests {
         assert_eq!(text(6), "six");
         assert_eq!(text(7), "seven");
         assert_eq!(t.order, [5, 6, 7]);
+    }
+
+    #[test]
+    fn a_merged_set_lists_its_rows_by_id() {
+        let mut t = Table::default();
+        // An add-in's worksheet merges before the base game's and holds higher ids.
+        t.merge(&list(&[(20, "add-in"), (4, "add-in low")]));
+        t.merge(&list(&[
+            (0, "invalid"),
+            (1, "warrior"),
+            (2, "mage"),
+            (20, "base"),
+        ]));
+        t.sort_rows();
+        assert_eq!(t.order, [0, 1, 2, 4, 20]);
+        // The first definition still stands.
+        assert!(matches!(t.cell("Worksheet", 20), Some(Cell::String(s)) if s == "add-in"));
     }
 
     #[test]
