@@ -197,23 +197,48 @@ const SLIDE_PASSES: usize = 4;
 /// How long a walker held up by bodies may make no progress before it is reported.
 const BLOCKED_REPORT_MS: u64 = 3_000;
 
-/// How deep two bodies may overlap and still touch: a walker this far or less inside a
-/// body is on its surface (left there by a slide, give or take rounding) and is held by it;
-/// one further in started out overlapping it.
-const BODY_SKIN: f32 = 0.02;
+/// A move along a body's surface whose inward part is this little of it (rounding left by
+/// a slide) does not meet the body.
+const GRAZE: f32 = 1.0e-3;
+
+/// How little of a move may be left sliding along a body before the walker counts as pressed
+/// straight into it (see [`round_on_the_right`]): a tenth, within about 6° of head-on.
+const HEAD_ON: f32 = 0.1;
+
+/// What is left of a move (`rest`) after sliding along a body whose surface normal at the
+/// walker is `nrm` (towards the walker), given the plain slide `slid`. Pressed straight
+/// into the body nothing is left, and a walker whose way lies through a creature standing
+/// on its line, or two walkers meeting on one line of the pathing grid, would stand there
+/// for good; such a move goes round the body on the walker's right instead, at its own
+/// pace (not round the creature the walker is making for: it stops against that one). Provisional: DAOrigins.exe's creatures are PhysX capsules whose sweeps are never
+/// exactly head-on, and what its path follower does when one is held up is not traced.
+fn round_on_the_right(rest: [f32; 2], nrm: [f32; 2], slid: [f32; 2]) -> [f32; 2] {
+    let rr = rest[0] * rest[0] + rest[1] * rest[1];
+    let ss = slid[0] * slid[0] + slid[1] * slid[1];
+    if ss >= HEAD_ON * HEAD_ON * rr {
+        return slid;
+    }
+    let len = rr.sqrt();
+    [-nrm[1] * len, nrm[0] * len]
+}
 
 /// Moving from `at` by `d`, against a circle at `c` of radius `r`: how far along the move
 /// (0 to 1) it meets the circle, where it stops on the circle and what is left of the move
 /// slid along the circle's tangent, or `None` when the move does not run into it. A move
-/// out of a circle it is on is not stopped; one further in loses its inward part. A walker
-/// deeper inside than [`BODY_SKIN`] (placed overlapping: on a load, a jump or a spawn) is
-/// not held by the circle at all, so that bodies placed on one another can separate.
+/// out of a circle it is on or inside (placed overlapping: on a load, a jump or a spawn) is
+/// not stopped; one further in loses its inward part, so bodies placed on one another come
+/// apart and do not sink into each other (see also [`round_on_the_right`]).
 fn slide_circle(
     at: [f32; 2],
     d: [f32; 2],
     c: [f32; 2],
     r: f32,
+    round: bool,
 ) -> Option<(f32, [f32; 2], [f32; 2])> {
+    let turn = |rest: [f32; 2], nrm: [f32; 2], slid: [f32; 2]| match round {
+        true => round_on_the_right(rest, nrm, slid),
+        false => slid,
+    };
     let m = [at[0] - c[0], at[1] - c[1]];
     let dd = d[0] * d[0] + d[1] * d[1];
     if dd <= 1e-12 {
@@ -222,15 +247,18 @@ fn slide_circle(
     let mm = m[0] * m[0] + m[1] * m[1];
     let md = m[0] * d[0] + m[1] * d[1];
     if mm < r * r {
-        let inner = (r - BODY_SKIN).max(0.0);
-        if mm < inner * inner || md >= 0.0 || mm <= 1e-12 {
+        if md >= 0.0 || mm <= 1e-12 {
             return None;
         }
-        // On the surface: only the inward part of the move is lost.
+        // On the surface or inside: only the inward part of the move is lost.
         let n = mm.sqrt();
         let nrm = [m[0] / n, m[1] / n];
         let k = d[0] * nrm[0] + d[1] * nrm[1];
-        return Some((0.0, at, [d[0] - k * nrm[0], d[1] - k * nrm[1]]));
+        if k * k <= GRAZE * GRAZE * dd {
+            return None;
+        }
+        let slid = [d[0] - k * nrm[0], d[1] - k * nrm[1]];
+        return Some((0.0, at, turn(d, nrm, slid)));
     }
     if md >= 0.0 {
         return None;
@@ -250,8 +278,11 @@ fn slide_circle(
     let nrm = [qn[0] / ql, qn[1] / ql];
     let rest = [d[0] * (1.0 - t), d[1] * (1.0 - t)];
     let k = rest[0] * nrm[0] + rest[1] * nrm[1];
+    if t <= 0.0 && k * k <= GRAZE * GRAZE * dd {
+        return None;
+    }
     let slid = if k < 0.0 {
-        [rest[0] - k * nrm[0], rest[1] - k * nrm[1]]
+        turn(rest, nrm, [rest[0] - k * nrm[0], rest[1] - k * nrm[1]])
     } else {
         rest
     };
@@ -2265,15 +2296,18 @@ impl Sim {
     /// slides along it, nothing is pushed, and there is no steering round it. Dead creatures
     /// do not block (their controllers stop interacting: 0x6a0df0). Bodies are circles on
     /// the ground. Provisional: up to [`SLIDE_PASSES`] slides per move stand in for PhysX's
-    /// iterated sweep; a walker placed overlapping a body is not held by it (see
-    /// [`slide_circle`]; held, two bodies placed on one another and walking into each other
-    /// stood locked for good); the step offset (0.5 m) is not modelled.
+    /// iterated sweep; a walker pressed straight into a body goes round it on its right (see
+    /// [`round_on_the_right`]; otherwise two bodies placed on one another and walking into
+    /// each other, or two walkers meeting head-on, stood locked for good); the step offset
+    /// (0.5 m) is not modelled.
     fn slide_past_bodies(&self, id: ObjectId, a: [f32; 3], b: [f32; 3]) -> Option<[f32; 3]> {
         let me = self.world.get(id)?;
         let area = me.area?;
         let mine = self.capsule_radius(id);
         let reach = crate::engine::dist(a, b) + mine + 2.0;
-        let bodies: Vec<([f32; 2], f32)> = self
+        // The creature the walker is making for is not walked round: it stops against it.
+        let goal = me.commands.first().and_then(|c| c.target);
+        let bodies: Vec<([f32; 2], f32, bool)> = self
             .world
             .objects
             .values()
@@ -2291,6 +2325,7 @@ impl Sim {
                 (
                     [o.position[0], o.position[1]],
                     mine + self.capsule_radius(o.id),
+                    Some(o.id) != goal,
                 )
             })
             .collect();
@@ -2306,7 +2341,7 @@ impl Sim {
         for _ in 0..SLIDE_PASSES {
             let first = bodies
                 .iter()
-                .filter_map(|&(c, r)| slide_circle(at, d, c, r))
+                .filter_map(|&(c, r, round)| slide_circle(at, d, c, r, round))
                 .min_by(|x, y| x.0.total_cmp(&y.0));
             let Some((_, q, rest)) = first else {
                 return hit.then_some([at[0] + d[0], at[1] + d[1], b[2]]);
@@ -5468,12 +5503,74 @@ mod tests {
         }
         s.order_move(hero, [0.0, -6.0, 0.0]);
         s.order_move(follower, [0.0, 6.0, 0.0]);
+        let mut closest = f32::MAX;
         for _ in 0..150 {
             s.tick(33);
+            let (a, b) = (
+                s.world.get(hero).unwrap().position,
+                s.world.get(follower).unwrap().position,
+            );
+            closest = closest.min(((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt());
         }
+        assert!(
+            closest >= 0.41,
+            "they do not sink into each other: {closest}"
+        );
         let at = |id| s.world.get(id).unwrap().position;
         assert!((at(hero)[1] + 6.0).abs() < 0.05, "{:?}", at(hero));
         assert!((at(follower)[1] - 6.0).abs() < 0.05, "{:?}", at(follower));
+    }
+
+    #[test]
+    fn walkers_meeting_head_on_pass_each_other() {
+        // On one line of the pathing grid, each walking to where the other stands (the
+        // Wardens' cache again: the hero heading out, a follower heading for its place
+        // behind the hero), and a walker whose way lies through a creature standing on it.
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let ids: Vec<ObjectId> = ["a", "b", "walker", "post"]
+            .iter()
+            .map(|t| s.world.spawn(ObjectKind::Creature, t))
+            .collect();
+        let at = [
+            [0.0, 0.0, 0.0],
+            [0.0, 4.0, 0.0],
+            [20.0, 0.0, 0.0],
+            [24.0, 0.0, 0.0],
+        ];
+        for (&id, p) in ids.iter().zip(at) {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = p;
+        }
+        s.order_move(ids[0], [0.0, 4.0, 0.0]);
+        s.order_move(ids[1], [0.0, 0.0, 0.0]);
+        s.order_move(ids[2], [28.0, 0.0, 0.0]);
+        let r = 2.0 * s.capsule_radius(ids[0]);
+        for _ in 0..300 {
+            s.tick(33);
+            let p: Vec<[f32; 3]> = ids
+                .iter()
+                .map(|&i| s.world.get(i).unwrap().position)
+                .collect();
+            for (i, j) in [(0, 1), (2, 3)] {
+                let d = ((p[i][0] - p[j][0]).powi(2) + (p[i][1] - p[j][1]).powi(2)).sqrt();
+                assert!(d >= r - 0.02, "{d} < {r}");
+            }
+        }
+        let pos = |i: usize| s.world.get(ids[i]).unwrap().position;
+        assert!(
+            (pos(0)[1] - 4.0).abs() < 0.05 && pos(0)[0].abs() < 0.05,
+            "{:?}",
+            pos(0)
+        );
+        assert!(
+            pos(1)[1].abs() < 0.05 && pos(1)[0].abs() < 0.05,
+            "{:?}",
+            pos(1)
+        );
+        assert!((pos(2)[0] - 28.0).abs() < 0.05, "{:?}", pos(2));
+        assert_eq!(pos(3), [24.0, 0.0, 0.0], "nothing is pushed");
     }
 
     #[test]
@@ -5502,7 +5599,7 @@ mod tests {
             for b in [b1, b2] {
                 let q = s.world.get(b).unwrap().position;
                 let d = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt();
-                assert!(d >= r - BODY_SKIN - 0.001, "{d} < {r} at {p:?}");
+                assert!(d >= r - 0.02, "{d} < {r} at {p:?}");
             }
         }
     }
