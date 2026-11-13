@@ -421,6 +421,9 @@ impl Live {
         } else {
             thedas_sim::session::open(&opts)?
         };
+        // The last orders, script log lines and the like, for issue reports (a debug read
+        // only; see `crate::report`).
+        sim.world.trace.keep_recent = crate::report::TRACE_RECENT;
         let save = match start {
             Start::Save(path) => Some((
                 std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
@@ -2320,6 +2323,7 @@ fn objects_key(models: &[ObjectModel]) -> ObjectsKey {
             v.extend(m.attached.iter().map(|a| format!("{}@{}", a.model, a.node)));
             v.extend(m.morph.iter().map(|x| format!("{x}.mor{}", m.hide_hair)));
             v.extend(m.tints.iter().map(|(a, t)| format!("{a}:{t}")));
+            v.extend(m.effects.iter().map(|e| format!("fx:{e}")));
             (m.id, v)
         })
         .collect()
@@ -2363,6 +2367,7 @@ pub fn prop(m: &ObjectModel) -> Prop {
         morph: m.morph.clone(),
         hide_hair: m.hide_hair,
         tints: m.tints.clone(),
+        effects: m.effects.clone(),
         transform: Prop::placement(m.position, m.facing),
     }
 }
