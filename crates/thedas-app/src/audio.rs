@@ -1861,10 +1861,15 @@ impl GameAudio {
         }
         let mode = game_mode(&state);
         self.follow_mode(mode);
-        let before = self.director.track;
+        let (was, before) = (self.director.mode, self.director.track);
         let track = self.director.update(mode, dt);
-        if track != before {
-            log::debug!("audio: game mode {mode}: music cue {track}");
+        if mode != was || track != before {
+            let waiting = if self.director.delayed.is_some() {
+                " (combat cue in 6 s)"
+            } else {
+                ""
+            };
+            log::info!("audio: game mode {was} -> {mode}: music track {track}{waiting}");
         }
         self.follow_area(&state, dt);
         self.follow_music_duck(&state);
