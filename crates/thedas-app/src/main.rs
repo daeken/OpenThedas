@@ -332,7 +332,7 @@ fn load(
     detail: thedas_render::scene::Detail,
 ) -> Result<Loaded> {
     let install = DaoInstall::open(install)?;
-    let mut vfs = install.global_vfs(TextureQuality::High)?;
+    let mut vfs = install.play_vfs(TextureQuality::High)?;
     if area == "none" {
         return Ok(Loaded {
             vfs: Arc::new(vfs),
