@@ -4144,6 +4144,7 @@ version = "0.1.0"
 dependencies = [
  "blowfish",
  "flate2",
+ "log",
  "md-5",
  "thiserror 2.0.18",
 ]
