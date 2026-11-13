@@ -2906,6 +2906,17 @@ impl Sim {
     /// Fails a move or approach whose way a closed door blocks
     /// (`COMMAND_FAILED_PATH_ACTION_REQUIRED`, the door as the event's object 2, where
     /// rules_core looks for it: its AI then uses the door and repeats the command).
+    ///
+    /// What opens a shut door a mover is pushed into is therefore the game's script, not
+    /// the engine: rules_core's handler (at 0x365d5 of the compiled script) reads the
+    /// blocker's `GetPlaceableState` and, for state 0 (closed, unlocked), gives the mover
+    /// `CommandUseObject(door, PLACEABLE_ACTION_OPEN)`; for state 1 (locked) it gives none.
+    /// So the hero steered at the Dalish ruins' mirror-room door uses it, which is what
+    /// wakes the bereskarn, and a locked door stays shut. Provisional: DAOrigins.exe's own
+    /// path-action code is not traced (whether the engine opens doors for a mover before
+    /// the script hears of it), and a held stick orders a new move about ten times a
+    /// second, each replacing the mover's commands, so the use command runs only when it
+    /// gets in before the next order: on some pushes the hero stands at the door instead.
     pub(crate) fn fail_blocked(&mut self, id: ObjectId, door: ObjectId) {
         self.fail_front_command_with(id, "COMMAND_FAILED_PATH_ACTION_REQUIRED", Some(door));
     }
