@@ -4571,7 +4571,7 @@ fn placeable_transition(sim: &Sim, id: ObjectId, action: i32, variation: bool) -
 /// A placeable's default action in its current state, from its type's state controller:
 /// `placeable_types.gda` (the ninth column names the controller table) and the controller's
 /// action column (hash 0x52be3c5e) at the row of the placeable's state. Provisional.
-fn placeable_default_action(sim: &Sim, id: ObjectId) -> Option<i32> {
+pub(crate) fn placeable_default_action(sim: &Sim, id: ObjectId) -> Option<i32> {
     let o = sim.world.get(id)?;
     let appearance = *o.fields.get("Appearance")? as i64;
     let state = o

@@ -164,6 +164,28 @@ impl Sim {
         }
     }
 
+    /// The cursor a placeable shows under the mouse: its default action in its current state
+    /// is a row of `placeable_interactions.gda` (M2DA 100), whose column hashed 0x4f6f860f
+    /// names the cursor (`open`, `close`, `unlock`, `chest`, `area_transition`, ...), as
+    /// DAOrigins.exe's 0x70cda0 reads it. `None` without an action or a name. Provisional:
+    /// the exe shows the row's other cursor (0xd930276d, `disabled_unlock`) for a lock the
+    /// controlled creature cannot open; that is not told apart here.
+    pub fn placeable_cursor(&self, placeable: ObjectId) -> Option<String> {
+        let action = crate::engine::placeable_default_action(self, placeable)?;
+        match self
+            .world
+            .tables()
+            .get(100, "")?
+            .cell_by_hash(0x4f6f_860f, action as i64)?
+        {
+            thedas_formats::gda::Cell::String(s) => {
+                let s = s.trim_end_matches('\0').trim().to_ascii_lowercase();
+                (!s.is_empty()).then_some(s)
+            }
+            _ => None,
+        }
+    }
+
     /// Walks `who` up to `target` (a door, a container, a lever) and uses it.
     pub fn order_use(&mut self, who: ObjectId, target: ObjectId) {
         let mut then = command(self, "COMMAND_TYPE_USE_OBJECT", "CommandUseObject");

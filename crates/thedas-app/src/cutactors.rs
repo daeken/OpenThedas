@@ -41,17 +41,27 @@ pub const OWN_CREATURE_IDS: ObjectId = 0x6000_0000;
 pub type DrawnRoots<'a> = dyn Fn(ObjectId) -> Option<([f32; 3], [f32; 4])> + 'a;
 
 /// The object drawn for actor `i` of a cutscene: the world's object that plays it, else the
-/// cutscene's own creature when the actor names a template (see [`own_creatures`]).
+/// cutscene's own creature or prop when the actor names a template or a model (see
+/// [`own_creatures`]).
 pub fn drawn_object(tracks: &Tracks, bound: &[Bound], i: usize) -> Option<ObjectId> {
     match bound.iter().find(|b| b.actor == i) {
         Some(b) => Some(b.object),
-        None => tracks
-            .actors
-            .get(i)?
-            .creature
-            .is_some()
-            .then_some(OWN_CREATURE_IDS + i as ObjectId),
+        None => {
+            let a = tracks.actors.get(i)?;
+            (a.creature.is_some() || prop_model(a).is_some())
+                .then_some(OWN_CREATURE_IDS + i as ObjectId)
+        }
     }
+}
+
+/// The model a cutscene's prop actor is drawn as, when it is one drawn here: a mesh model
+/// (a placeable, a weapon). Provisional: an effect model (`fx…`: blood, fire, smoke; 40 or
+/// so kinds in the game's cutscenes) is left out, its emitters' rates being driven by its
+/// own animations, which only the effects on creatures play (see `Live::show_effects`).
+fn prop_model(a: &thedas_sim::cuttracks::Actor) -> Option<&str> {
+    a.model
+        .as_deref()
+        .filter(|m| !m.starts_with("fx") && !m.starts_with("vfx"))
 }
 
 /// The places of `stage` by name, as the tracks find them.
@@ -86,6 +96,11 @@ pub struct ActorShow {
     pub animations: Vec<CutAnimation>,
     /// What its head tracker is told, when a head tracking action has started for it.
     pub look: Option<ActorLook>,
+    /// The cutscene hides it (see [`thedas_sim::cuttracks::Actor::visible_at`]).
+    pub hidden: bool,
+    /// Where the cutscene has it carry its weapons, once a draw action has started
+    /// ([`thedas_sim::cuttracks::Actor::weapons_at`]).
+    pub weapons: Option<(bool, Option<bool>)>,
 }
 
 /// What a cutscene's head tracking action tells an actor's head tracker (see
@@ -332,6 +347,8 @@ fn show(tracks: &Tracks, i: usize, at: &Moment) -> Option<ActorShow> {
         snaps: a.snaps,
         animations,
         look,
+        hidden: a.visible_at(t) == Some(false),
+        weapons: a.weapons_at(t),
     })
 }
 
@@ -341,12 +358,32 @@ fn own_creatures(sim: &Sim, tracks: &Tracks, bound: &[Bound]) -> Vec<(usize, Obj
     let mut scratch: Option<Sim> = None;
     let mut out = Vec::new();
     for (i, a) in tracks.actors.iter().enumerate() {
-        let Some(template) = a.creature.as_deref() else {
-            continue;
-        };
         if bound.iter().any(|b| b.actor == i) {
             continue;
         }
+        let Some(template) = a.creature.as_deref() else {
+            // A prop of the cutscene: its model, where the tracks put it.
+            if let Some(model) = prop_model(a) {
+                out.push((
+                    i,
+                    ObjectModel {
+                        id: OWN_CREATURE_IDS + i as ObjectId,
+                        tag: a.name.clone(),
+                        kind: ObjectKind::Placeable,
+                        models: vec![model.to_string()],
+                        attached: Vec::new(),
+                        tints: Vec::new(),
+                        morph: None,
+                        hide_hair: false,
+                        effects: Vec::new(),
+                        motion: None,
+                        position: a.position,
+                        facing: 0.0,
+                    },
+                ));
+            }
+            continue;
+        };
         let s = scratch.get_or_insert_with(|| Sim::new(sim.vfs.clone(), sim.table.clone(), 0));
         let id = s.create_from_template(ObjectKind::Creature, template, None, a.position, 0.0);
         let Some(o) = s.world.get(id) else {
@@ -376,7 +413,7 @@ fn own_creatures(sim: &Sim, tracks: &Tracks, bound: &[Bound]) -> Vec<(usize, Obj
     }
     if !out.is_empty() {
         log::info!(
-            "cutscene's own creatures: {:?}",
+            "cutscene's own creatures and props: {:?}",
             out.iter().map(|(_, m)| m.tag.as_str()).collect::<Vec<_>>()
         );
     }
