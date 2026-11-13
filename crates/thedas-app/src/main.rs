@@ -3388,6 +3388,7 @@ fn audio_state(
         movie,
         ..Default::default()
     };
+    let mut ambient = Vec::new();
     if let Some(ui) = ui {
         state.gui_sounds = ui.stage.bridge.drain_sounds();
         // Character creation's voice previews: always said, by nobody in particular.
@@ -3395,6 +3396,7 @@ fn audio_state(
             state.sound_sets.push((set, entry, 1.0, None));
         }
         state.volumes = audio::volumes(|n| ui.client_option(n));
+        ambient = ui.drain_ambient_lines();
     }
     let Some(live) = live else {
         return state;
@@ -3534,6 +3536,28 @@ fn audio_state(
                 a.set_cutscene(&c.name, tracks);
             }
             state.cutscene = Some((c.name.clone(), c.elapsed_ms as f32 / 1000.0));
+        }
+    }
+    // Lines said in passing, at their speakers' heads.
+    {
+        let sim = live.sim();
+        for l in ambient {
+            let Some(strref) = l.strref else {
+                continue;
+            };
+            let at = sim.world.get(l.speaker).map(|o| {
+                let p = o.position;
+                [p[0], p[1], p[2] + live.head_height(o.id)]
+            });
+            state.ambient_lines.push((
+                audio::VoiceLine {
+                    dialog: l.dialog,
+                    strref,
+                    female: l.female,
+                    ambient: true,
+                },
+                at,
+            ));
         }
     }
     // Sounds the simulation asked for (scripts, character creation's voice preview).

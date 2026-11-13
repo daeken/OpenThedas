@@ -247,6 +247,17 @@ struct Floaty {
     left_s: f64,
 }
 
+/// The floaty style a line said in passing goes up in (DAOrigins.exe 0x6fe76a).
+const AMBIENT_LINE_STYLE: i32 = 3;
+
+/// Whether a line said in passing shows over its speaker: always without a voice, and with
+/// one only when the Subtitles option (`SubtitlesLevel`: 0 none, 1 dialog, 2 dialog and
+/// ambient) is "Dialog and ambient" (DAOrigins.exe 0x6fe73c: skipped when voiced and the
+/// level is 1 or less).
+fn ambient_line_shows(voiced: bool, subtitles: f64) -> bool {
+    !voiced || subtitles > 1.0
+}
+
 /// Whether a floaty of `style` over a creature shows (DAOrigins.exe 0x6a7414-0x6a749e):
 /// a damage number (`FLOATY_HIT` 1, `FLOATY_CRITICAL_HIT` 2) shows over a party member
 /// when the party's numbers are on (`ShowPartyDamageNumbers`), otherwise over a hostile
@@ -312,6 +323,9 @@ pub struct UiLayer {
     /// Character creation's voice previews not yet played (see
     /// [`UiLayer::drain_sound_set_previews`]).
     sound_set_previews: Vec<(String, i32)>,
+    /// The lines said in passing taken from the simulation, for the audio to voice (see
+    /// [`UiLayer::drain_ambient_lines`]).
+    ambient_lines: Vec<thedas_sim::world::AmbientLine>,
     /// The saves were listed for the start menu.
     saves_listed: bool,
     /// tooltips.gfx's tooltip texts (fixed and floating) last frame, and the frames left to lay
@@ -580,6 +594,12 @@ impl UiLayer {
         std::mem::take(&mut self.sound_set_previews)
     }
 
+    /// The lines said in passing since the last call (taken from the simulation in
+    /// [`UiLayer::update_floaties`]), for the audio to voice at their speakers.
+    pub fn drain_ambient_lines(&mut self) -> Vec<thedas_sim::world::AmbientLine> {
+        std::mem::take(&mut self.ambient_lines)
+    }
+
     /// Whether the line the game is on is voiced, as the audio knows it once the line is
     /// chosen (`audio::GameAudio::line_voice`), before it plays: set before
     /// [`UiLayer::play`], so the conversation screen hears `Conversation.HasVO` with the line.
@@ -727,6 +747,7 @@ impl UiLayer {
             minimap_frame: 0,
             requests: Vec::new(),
             sound_set_previews: Vec::new(),
+            ambient_lines: Vec::new(),
             saves_listed: false,
             tooltip_text: None,
             tooltip_relayout: 0,
@@ -2373,6 +2394,19 @@ impl UiLayer {
         const LINGER_S: f64 = 1.0;
         /// Metres over a creature's head (0xae7d70).
         const OVER_HEAD: f32 = 0.1;
+        // The lines said in passing: voiced by the audio (whether or not the layer is up),
+        // and shown over their speakers (below). Kept for at most a few frames' worth when
+        // nothing takes them (no audio).
+        let ambient = std::mem::take(
+            &mut sim
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .world
+                .ambient_lines,
+        );
+        self.ambient_lines.extend(ambient.iter().cloned());
+        let excess = self.ambient_lines.len().saturating_sub(64);
+        self.ambient_lines.drain(..excess);
         let Some(movie) = self
             .stage
             .movies
@@ -2459,6 +2493,39 @@ impl UiLayer {
                     id,
                     target: f.target,
                     left_s: f64::from(f.duration.max(0.0)) + LINGER_S,
+                });
+            }
+            // A line said in passing goes up over its speaker unless it is voiced and the
+            // Subtitles option is below "Dialog and ambient" (DAOrigins.exe 0x6fe731 to
+            // 0x6fe74d), in the style the exe gives it (3, white: 0x6fe75f to 0x6fe781).
+            // Provisional: the exe takes it down when the line ends; here it stays for the
+            // line's time.
+            let subtitles = match self
+                .stage
+                .bridge
+                .value("ClientOptions.GameOptions.SubtitlesLevel")
+            {
+                Some(UiValue::Number(n)) => n,
+                _ => 0.0,
+            };
+            for l in &ambient {
+                if !ambient_line_shows(l.voiced, subtitles) || l.text.trim().is_empty() {
+                    continue;
+                }
+                let id = self.next_floaty;
+                self.next_floaty += 1;
+                create.push(num(f64::from(id)));
+                symbols.push(num(SYMBOL_MESSAGE));
+                show.push(num(f64::from(id)));
+                msg_ids.push(num(f64::from(id)));
+                texts.push(UiValue::String(l.text.clone()));
+                styles.push(num(f64::from(AMBIENT_LINE_STYLE)));
+                colours.push(num(f64::from(0xffffff)));
+                durations.push(num(f64::from(l.seconds)));
+                self.floaties.push(Floaty {
+                    id,
+                    target: l.speaker,
+                    left_s: f64::from(l.seconds.max(0.0)),
                 });
             }
             portrait_messages = std::mem::take(&mut sim.world.portrait_messages);
@@ -3180,6 +3247,15 @@ mod tests {
             portrait_message_arg(124, 0xff0000, "Approval +5"),
             "124 16711680 Approval +5"
         );
+    }
+
+    #[test]
+    fn a_line_said_in_passing_shows_unless_heard_without_ambient_subtitles() {
+        // Unvoiced, always; voiced, only under "Dialog and ambient" (2).
+        assert!(ambient_line_shows(false, 0.0));
+        assert!(!ambient_line_shows(true, 0.0));
+        assert!(!ambient_line_shows(true, 1.0));
+        assert!(ambient_line_shows(true, 2.0));
     }
 
     #[test]
