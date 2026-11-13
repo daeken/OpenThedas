@@ -1168,7 +1168,10 @@ impl AreaRenderer {
                 state.world = transform * follow * e.in_model;
                 // Timed from the first posing, when the scene was built.
                 let epoch = *self.effects_epoch.get_or_insert(self.time);
-                state.rate = e.rate.as_ref().map(|r| r.at((self.time - epoch) as f32));
+                state.rate = e
+                    .rate
+                    .as_ref()
+                    .and_then(|r| r.at((self.time - epoch) as f32));
             }
         }
     }

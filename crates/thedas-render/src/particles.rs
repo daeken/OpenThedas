@@ -276,7 +276,8 @@ impl EmitterState {
                     }
                 }
             }
-            1 if !self.burst_done => {
+            // A burst waits for a birthrate (an effect's emitter before its timeline starts).
+            1 if !self.burst_done && birthrate + birthrate_range > 0.0 => {
                 self.burst_done = true;
                 (birthrate + self.births.signed() * birthrate_range).max(0.0) as u32
             }

@@ -560,16 +560,17 @@ pub struct PropEmitter {
     pub in_model: Mat4,
     pub follows: Option<(usize, usize)>,
     /// Its birthrate and birthrate range over the effect's life, as its effect's
-    /// animations set them (see `Loader::place_effect`); `None` leaves the emitter's own.
+    /// animations set them (see `Loader::place_effect`).
     pub rate: Option<EffectTimeline>,
 }
 
 /// An effect emitter's birthrate over its effect's life: the impact animation
 /// (`<effect>.impa.ani`) once from the start, then, for a lasting effect, the duration
-/// animation (`<effect>.dura.ani`) looped. An animation without tracks for the emitter
-/// gives it no particles while it plays, as does the time after an instant effect's
-/// impact. Provisional: the exe's playing of these animations is not traced, and the
-/// cessation animation (`.cess.ani`) is not played.
+/// animation (`<effect>.dura.ani`) looped. While an animation plays that has no tracks for
+/// the emitter, the emitter keeps its own birthrate (`fxa_heal_impact_c`'s emitters); an
+/// instant effect's emitters stop after its impact. Provisional: the exe's playing of these
+/// animations is not traced, the cessation animation (`.cess.ani`) is not played, and the
+/// animations' other tracks (nodes moving, lights) are not applied.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EffectTimeline {
     /// The effect's age in seconds when the scene was built ([`PropEffect::age`]).
@@ -580,14 +581,20 @@ pub struct EffectTimeline {
 }
 
 impl EffectTimeline {
-    /// (birthrate, range) `since_built` seconds after the scene was built.
-    pub fn at(&self, since_built: f32) -> (f32, f32) {
+    /// How long an instant effect whose model has no impact animation plays, in seconds.
+    pub const UNTIMED_FLASH: f32 = 2.0;
+
+    /// (birthrate, range) `since_built` seconds after the scene was built; `None` for the
+    /// emitter's own.
+    pub fn at(&self, since_built: f32) -> Option<(f32, f32)> {
         let t = self.age + since_built.max(0.0);
         let impact = self.impact.as_ref().map_or(0.0, |i| i.length);
         match (&self.impact, &self.duration) {
             (Some(i), _) if t < impact => i.at(t),
             (_, Some(d)) if self.lasting => d.at(t - impact),
-            _ => (0.0, 0.0),
+            _ if self.lasting => None,
+            (None, _) if t < Self::UNTIMED_FLASH => None,
+            _ => Some((0.0, 0.0)),
         }
     }
 }
@@ -602,17 +609,21 @@ pub struct EffectRate {
 }
 
 impl EffectRate {
-    /// (birthrate, range) at `t` seconds, the animation looping.
-    pub fn at(&self, t: f32) -> (f32, f32) {
+    /// (birthrate, range) at `t` seconds, the animation looping; `None` when it has no
+    /// tracks for the emitter.
+    pub fn at(&self, t: f32) -> Option<(f32, f32)> {
+        if self.birthrate.is_none() && self.range.is_none() {
+            return None;
+        }
         let t = if self.length > 0.0 {
             t.rem_euclid(self.length)
         } else {
             0.0
         };
-        (
+        Some((
             self.birthrate.as_ref().map_or(0.0, |k| k.at(t)),
             self.range.as_ref().map_or(0.0, |k| k.at(t)),
-        )
+        ))
     }
 }
 
@@ -2545,22 +2556,12 @@ impl<'a> Loader<'a> {
                     range: track("birthraterange"),
                 })
             };
-            let has_tracks = |r: &Option<EffectRate>| {
-                r.as_ref()
-                    .is_some_and(|r| r.birthrate.is_some() || r.range.is_some())
-            };
-            let (impact, duration) = (rate_in(&impact), rate_in(&looping));
-            // An emitter no animation drives keeps its own birthrate while a lasting
-            // effect is on.
-            let rate =
-                (has_tracks(&impact) || has_tracks(&duration) || !instance.lasting).then(|| {
-                    EffectTimeline {
-                        age: instance.age,
-                        lasting: instance.lasting,
-                        impact,
-                        duration,
-                    }
-                });
+            let rate = Some(EffectTimeline {
+                age: instance.age,
+                lasting: instance.lasting,
+                impact: rate_in(&impact),
+                duration: rate_in(&looping),
+            });
             if let Some(emitter) =
                 self.push_emitter(effect, e, name, prop.transform * in_model, &[], false)
             {
@@ -3370,9 +3371,43 @@ mod tests {
             }),
             range: None,
         };
-        assert_eq!(r.at(1.0), (7.5, 0.0));
+        assert_eq!(r.at(1.0), Some((7.5, 0.0)));
         // Looped: 3 s is 1 s into the second pass.
-        assert_eq!(r.at(3.0), (7.5, 0.0));
+        assert_eq!(r.at(3.0), Some((7.5, 0.0)));
+        // No tracks for the emitter: its own birthrate.
+        let own = EffectRate {
+            length: 2.0,
+            birthrate: None,
+            range: None,
+        };
+        assert_eq!(own.at(1.0), None);
+
+        // A lasting effect: the impact once, then the duration looped, from its age on.
+        let lasting = EffectTimeline {
+            age: 0.5,
+            lasting: true,
+            impact: Some(r.clone()),
+            duration: Some(EffectRate {
+                length: 1.0,
+                birthrate: Some(ScalarTrack {
+                    target: "flame_default_birthrate".into(),
+                    keys: vec![(0.0, 20.0), (1.0, 20.0)],
+                }),
+                range: None,
+            }),
+        };
+        assert_eq!(lasting.at(0.5), Some((7.5, 0.0)));
+        assert_eq!(lasting.at(5.0), Some((20.0, 0.0)));
+        // An instant one stops after its impact; untracked, it keeps its own rate until
+        // then.
+        let flash = EffectTimeline {
+            age: 0.0,
+            lasting: false,
+            impact: Some(own),
+            duration: None,
+        };
+        assert_eq!(flash.at(1.0), None);
+        assert_eq!(flash.at(2.5), Some((0.0, 0.0)));
     }
 
     #[test]

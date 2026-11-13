@@ -1650,6 +1650,8 @@ impl Live {
         let (Some(level), Some(effects)) = (self.level.as_ref(), self.effects.as_mut()) else {
             return Ok(());
         };
+        // The clock here, not only when a frame is drawn: the effects' timelines run on it.
+        effects.renderer.set_time(self.shader_time);
         let posed: Vec<(Mat4, Option<Clip>)> = effects
             .objects
             .iter()
