@@ -201,6 +201,28 @@ struct AreaPlay {
     inside: Vec<bool>,
     /// Which music volumes the party leader was inside last frame.
     music_inside: Vec<bool>,
+    /// Per sound: how occluded it is now (see [`crate::occlusion`]).
+    occlusion: Vec<f32>,
+    /// The layout (environment level) the area is built on, from its `.are`.
+    layout: Option<String>,
+}
+
+/// The area's sound occluders being kept up with the simulation (see
+/// [`GameAudio::set_occluders`]).
+#[derive(Default)]
+struct OccluderState {
+    area: String,
+    set: crate::occlusion::Occluders,
+    /// The placeables `set.placeables` was built from.
+    placed: Vec<(String, [f32; 3], f32, f32)>,
+    /// The layout's collision being read on a thread.
+    loading: Option<std::sync::mpsc::Receiver<Option<thedas_sim::collision::Collision>>>,
+    /// Whether the layout's collision was asked for (it may be missing).
+    asked: bool,
+    /// Seconds since the placeables were last looked at.
+    age: f32,
+    /// Whether the area's summary has been logged.
+    reported: bool,
 }
 
 /// A cutscene's sound tracks and which of them are playing.
@@ -268,6 +290,8 @@ pub struct GameAudio {
     mode_duck: Option<(&'static str, Option<EventHandle>)>,
     /// The container open last frame (see [`AudioState::container`]).
     container: Option<u32>,
+    /// The area's sound occluders (see [`GameAudio::set_occluders`]).
+    occluders: OccluderState,
     /// The pause's ducking event playing (see [`pause_duck`]).
     pause_duck: Option<Option<EventHandle>>,
     /// Paused last frame, and whether that pause holds the voice categories
@@ -875,6 +899,7 @@ impl GameAudio {
             mode_duck: None,
             script_intensity: None,
             music_duck: None,
+            occluders: OccluderState::default(),
             pause_duck: None,
             paused: None,
             director: MusicDirector::new(),
@@ -1398,6 +1423,99 @@ impl GameAudio {
         self.area.as_ref().is_none_or(|a| a.resref != resref)
     }
 
+    /// Whether the area's sound occluders want looking at again (twice a second, and at
+    /// once in a new area).
+    pub fn wants_occluders(&self, resref: &str) -> bool {
+        self.occluders.area != resref || self.occluders.age >= 0.5
+    }
+
+    /// The sound occluders of area `resref` follow the simulation (see
+    /// [`crate::occlusion`]): its layout's collision, `layout` when the simulation has it
+    /// loaded, else read once on a thread from the install at `install` (the layout its
+    /// `.are` names); and its placeables `placed` (`thedas_sim::Sim::sound_occluders`),
+    /// whose collision is rebuilt when they change (a door opens).
+    pub fn set_occluders(
+        &mut self,
+        resref: &str,
+        layout: Option<Arc<thedas_sim::collision::Collision>>,
+        install: Option<std::path::PathBuf>,
+        placed: Vec<(String, [f32; 3], f32, f32)>,
+    ) {
+        let install = install.zip(
+            self.area
+                .as_ref()
+                .filter(|a| a.resref == resref)
+                .and_then(|a| a.layout.clone()),
+        );
+        let o = &mut self.occluders;
+        if o.area != resref {
+            *o = OccluderState {
+                area: resref.to_string(),
+                ..Default::default()
+            };
+            // Each sound material's percentage (`sound_geometry_mat_types.gda`).
+            if let Some(t) = read_gda(&self.vfs, "sound_geometry_mat_types.gda") {
+                use thedas_formats::gda::Cell;
+                let col = t.columns.iter().position(|c| c.hash == 0xae2b_65f5);
+                for r in &t.rows {
+                    let (Some(Cell::Int(id)), Some(v)) = (r.first(), col.and_then(|c| r.get(c)))
+                    else {
+                        continue;
+                    };
+                    let v = match v {
+                        Cell::Int(i) => *i as f32,
+                        Cell::Float(f) => *f as f32,
+                        _ => continue,
+                    };
+                    o.set.percent.insert((*id).clamp(0, 255) as u8, v);
+                }
+            }
+        }
+        o.age = 0.0;
+        if o.set.layout.is_none() {
+            if let Some(c) = layout {
+                log::debug!(
+                    "audio: occlusion: the simulation's layout collision, {} shapes",
+                    c.len()
+                );
+                o.set.layout = Some(c);
+                o.loading = None;
+            } else if let Some(rx) = &o.loading {
+                if let Ok(c) = rx.try_recv() {
+                    log::debug!(
+                        "audio: occlusion: layout collision read, {} shapes",
+                        c.as_ref().map_or(0, |c| c.len())
+                    );
+                    o.set.layout = c.map(Arc::new);
+                    o.loading = None;
+                }
+            } else if !o.asked
+                && let Some((root, name)) = install
+            {
+                o.asked = true;
+                let (tx, rx) = std::sync::mpsc::channel();
+                let vfs = self.vfs.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(thedas_sim::nav::read_layout_collision(&root, &vfs, &name));
+                });
+                o.loading = Some(rx);
+            }
+        }
+        if placed != o.placed || (o.set.placeables.is_none() && !placed.is_empty()) {
+            let list: Vec<(String, [f32; 3], f32)> =
+                placed.iter().map(|p| (p.0.clone(), p.1, p.2)).collect();
+            let c = thedas_sim::collision::load_placeables(&self.vfs, &list);
+            log::debug!(
+                "audio: occlusion: {} placeables, {} shapes",
+                placed.len(),
+                c.len()
+            );
+            o.set.values = placed.iter().map(|p| p.3).collect();
+            o.set.placeables = Some(c);
+            o.placed = placed;
+        }
+    }
+
     pub fn set_area(&mut self, resref: &str, data: &[u8]) {
         self.end_area();
         let (theme, sounds) = area_audio(data);
@@ -1435,6 +1553,10 @@ impl GameAudio {
             preset: None,
             inside: Vec::new(),
             music_inside: Vec::new(),
+            occlusion: vec![0.0; n],
+            layout: thedas_formats::Area::parse(data)
+                .ok()
+                .and_then(|a| a.layout),
         });
     }
 
@@ -1638,6 +1760,29 @@ impl GameAudio {
         let Some((listener, _)) = state.listener else {
             return;
         };
+        // Once per area, for checking: how many of its occludable sounds are muffled from
+        // where the listener starts.
+        if !self.occluders.reported
+            && self.occluders.area == a.resref
+            && self.occluders.set.layout.is_some()
+        {
+            self.occluders.reported = true;
+            if log::log_enabled!(log::Level::Debug) {
+                let all: Vec<f32> = a
+                    .sounds
+                    .iter()
+                    .filter(|s| s.occludable && s.region.is_none())
+                    .map(|s| self.occluders.set.between(listener, s.position))
+                    .collect();
+                log::debug!(
+                    "audio: occlusion: from the listener, {} of {} occludable placed sounds are \
+                     muffled, {} fully",
+                    all.iter().filter(|o| **o > 0.0).count(),
+                    all.len(),
+                    all.iter().filter(|o| **o >= 1.0).count()
+                );
+            }
+        }
         for i in 0..a.sounds.len() {
             let s = &a.sounds[i];
             let on = s.active && !state.inactive_sounds.contains(&s.tag);
@@ -1671,8 +1816,20 @@ impl GameAudio {
                     * 1.1
             };
             let near = d <= reach.max(1.0);
+            // How much the geometry between muffles it (see `crate::occlusion`): at once
+            // when it starts (the exe's forced update, 0x5b73c9), then at 1.2 per second.
+            let target = (s.occludable && on && near && self.occluders.area == a.resref)
+                .then(|| self.occluders.set.between(listener, position));
             match (a.playing[i], on && near) {
                 (None, true) => {
+                    a.occlusion[i] = target.unwrap_or(0.0);
+                    if a.occlusion[i] > 0.0 {
+                        log::debug!(
+                            "audio: occlusion of {}: starts at {:.2}",
+                            s.event,
+                            a.occlusion[i]
+                        );
+                    }
                     a.playing[i] = Some(self.engine.play(
                         &s.event,
                         PlayOptions {
@@ -1712,6 +1869,18 @@ impl GameAudio {
                     self.engine.set_position(h, position);
                 }
                 _ => {}
+            }
+            if let (Some(Some(h)), Some(target)) = (a.playing[i], target) {
+                let now = crate::occlusion::approach(a.occlusion[i], target, dt);
+                if (now > 0.0) != (a.occlusion[i] > 0.0) || (now >= 1.0) != (a.occlusion[i] >= 1.0)
+                {
+                    log::debug!(
+                        "audio: occlusion of {}: {now:.2} (towards {target:.2})",
+                        s.event
+                    );
+                }
+                a.occlusion[i] = now;
+                self.engine.set_occlusion(h, now);
             }
         }
     }
@@ -1812,6 +1981,7 @@ impl GameAudio {
     }
 
     fn frame_dt(&mut self, mut state: AudioState, dt: f32) {
+        self.occluders.age += dt;
         self.engine.volumes = state.volumes;
         self.hero_female = state.hero_female;
         if let Some((pos, right)) = state.listener {
