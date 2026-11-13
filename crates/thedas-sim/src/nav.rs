@@ -97,11 +97,24 @@ pub fn route(g: &NavGrid, from: [f32; 3], to: [f32; 3]) -> Option<Vec<[f32; 3]>>
     route_avoiding(g, from, to, &std::collections::HashSet::new())
 }
 
+/// Whether a point is over a walkable cell of the grid.
+pub fn on_walkable(g: &NavGrid, p: [f32; 3]) -> bool {
+    g.cell(p).is_some_and(|c| walkable(g, c))
+}
+
+/// The middle of the walkable cell nearest a point (within six metres of it, as routes
+/// look for their ends), at the cell's floor height.
+pub fn nearest_walkable_point(g: &NavGrid, p: [f32; 3]) -> Option<[f32; 3]> {
+    let c = nearest_walkable(g, p)?;
+    let m = g.center(c);
+    Some([m[0], m[1], height(g, c)])
+}
+
 /// How far a straight walk from `from` towards `to` stays on the walkable area: the last
 /// point, sampled every half cell, before the line leaves the grid or meets an unwalkable
 /// cell (`to` itself when it never does). `None` when `from` is not on walkable ground.
 pub fn walkable_reach(g: &NavGrid, from: [f32; 3], to: [f32; 3]) -> Option<[f32; 3]> {
-    let on = |p: [f32; 3]| g.cell(p).is_some_and(|c| walkable(g, c));
+    let on = |p: [f32; 3]| on_walkable(g, p);
     if !on(from) {
         return None;
     }
@@ -909,8 +922,8 @@ mod tests {
             o.area = Some(area);
             o.position = [1.25, 1.25, 0.0];
         }
-        // Far beyond the edge (no walkable cell within reach of it), and off the grid.
-        for to in [[18.0, 1.25, 0.0], [60.0, 1.25, 0.0]] {
+        // Just beyond the edge (a stick's aim point), far beyond it, and off the grid.
+        for to in [[7.0, 1.25, 0.0], [18.0, 1.25, 0.0], [60.0, 1.25, 0.0]] {
             s.world.get_mut(hero).unwrap().position = [1.25, 1.25, 0.0];
             s.order_move(hero, to);
             for _ in 0..300 {
