@@ -253,7 +253,9 @@ GAME=~/path/to/Dragon\ Age\ Origins   # the folder holding packages/ and modules
 (including loose files such as talk tables), writes each one back out and checks that it reads
 back to the same document, and parses GDA, TLK, area, layout, model, mesh, material (XML) and DDS
 files into their typed forms. It exits non-zero
-on any failure. DLC archives encrypted with a key we do not have are counted, not failed.
+on fatal failures. The reader recovers DLC passwords from the local GOG Ultimate Edition
+`bin_ship/DAOrigins.exe` and checks them against the archive header. Encrypted entries
+whose passwords are unavailable are counted in the `encrypted` column.
 
 ## Driving the simulation over MCP
 

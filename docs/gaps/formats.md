@@ -6,9 +6,10 @@ Readers and writers for the game's resource types, archives, DLC, mods and saves
 
 ## Tables and resource types measured against a real install
 
-Gathered 2026-11-12 at main `1eb844a` from a listing of every archive (59,004 entries), a full
-`thedas corpus` run (pass; 563,593 entries read, 45,962 encrypted DLC entries unread) and a
-search of the code. Names and counts only.
+The inventory below is from 2026-11-12 at main `1eb844a`. That run counted 563,593 entries,
+including 45,962 encrypted DLC entries it skipped. The later GOG key recovery check read
+all 563,593 entries with zero skips and zero read errors. The inventory counts still
+reflect the earlier run.
 
 ### Tables
 
@@ -94,7 +95,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 
 | Type | Reader | Writer | Consumer | Notes |
 | --- | --- | --- | --- | --- |
-| `.erf` V2.0/V2.1/V2.2/V3.0 | yes | no (test helper only) | yes (vfs) | XOR and DA2 Blowfish encryption, LZMA and LZX compression unsupported |
+| `.erf` V2.0/V2.1/V2.2/V3.0 | yes | no (test helper only) | yes (vfs) | GOG DLC passwords recovered locally. XOR and DA2 Blowfish accept explicit passwords. LZMA and LZX unsupported |
 | `.rim` | yes (ERF V2.0) | no | yes | |
 | GFF4 (generic) | yes (V4.0, V4.1) | yes | yes | PC platform only |
 | GFF3 (generic) | yes (V3.2) | yes | yes | strings raw bytes |
@@ -145,8 +146,8 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 
 ### Archives and encryption
 
-- **FMT-001** **DLC keys are never supplied.** Original: decrypts DLC ERF V2.2 (where it gets the password is open, per comment). Ours: `push_archive` always passes no key; encrypted DLC resources are unreadable and lookups fall through to lower layers. Evidence: `crates/thedas-vfs/src/crypto.rs:5`, `crates/thedas-vfs/src/vfs.rs:249`. Size: L. Depends: none. Kind: missing.
-- **FMT-002** **XOR and DA2 Blowfish encryption unsupported.** Original: ERF encryption types 1 and 3. Ours: returned as `Encrypted`. Evidence: `crates/thedas-vfs/src/erf.rs:40`, `crates/thedas-vfs/src/erf.rs:460`. Size: M. Depends: none. Kind: missing.
+- **FMT-001** **DLC passwords only from the GOG Ultimate Edition executable.** Original: decrypts DLC ERF V2.2 with an offline password per ERF module ID, chosen by the routine at RVA `0x87840` (GOG build) and decoded as `(character - 'A') / 2` per digit. Ours: `gog_dlc` reads the encoded strings from the player's own `bin_ship/DAOrigins.exe` at run time (nothing is stored in the repository) and accepts a password only when its MD5 matches the archive's digest. Verified on the GOG Ultimate Edition build (SHA-256 `2346caee…bfb3`): all 377 encrypted archives, 24 module IDs, and `thedas corpus` read the 45,962 formerly skipped entries with no errors. The table is found at fixed file offsets (provisional), so other builds (Steam, EA, retail 1.04/1.05, other languages) are not recognised and their DLC stays unread, logged once; a pattern search for the routine would cover them. The online entitlement path is not traced. Evidence: `crates/thedas-vfs/src/gog_dlc.rs`. Size: M. Depends: none. Kind: unverified.
+- **FMT-002** **XOR (type 1) and DA2 Blowfish (type 3) checked only synthetically.** Original: ERF encryption types 1 and 3. Ours: both read. Type 1 takes the DA:O decimal password; its nine-byte XOR cycle matches the original DA:O instructions at RVA `0xeefe0` run with a synthetic key. Type 3 takes raw key bytes and checks the MD5 of the Blowfish ECB encryption of bytes 0–255, after xoreos's description (provisional), against a synthetic vector. No shipped type 1 or type 3 archive has been read, and DA2 keys are not discovered. Reported by the maintainer's outside agent and not re-checked here (unverified): the official DA2 demo (SHA-256 `46398e363fb105c481142d7b759253be96d04e3d8a7de9a1cd05df39de8a55fc`) requests the Blaze config `DA2_DATA` and reads `DLC_<n>_moduleId` and `DLC_<n>_key` from the response; entitlement processing supplies a key indexed by module ID; its ERF reader decodes 32 hex digits into 16 bytes; the demo's validator at RVA `0x4bfbe0` accepted the synthetic vector and matched our reader's plaintext; and the inspected PC install has 191 type 3 archives across 19 module IDs. Shipped DA2 passwords and resource decryption remain unverified. Evidence: `crates/thedas-vfs/src/erf.rs`, `crates/thedas-vfs/src/crypto.rs`. Size: S. Depends: none. Kind: unverified.
 - **FMT-003** **LZMA and Xbox LZX compression unsupported.** Original: compression codes 2 and 3. Ours: `UnsupportedCompression`. Evidence: `crates/thedas-vfs/src/erf.rs:490`. Size: M. Depends: none. Kind: missing.
 - **FMT-004** **ERF V3.0 hash-only entries cannot be looked up.** Original: DA2 archives index by FNV hash. Ours: entries without a stored name are left out of the index. Evidence: `crates/thedas-vfs/src/vfs.rs:96`. Size: M. Depends: none. Kind: missing.
 - **FMT-005** **No ERF/RIM writer.** Original: n/a (mod packing). Ours: archives are read-only; the only writer is a test fixture. Evidence: `crates/thedas-vfs/src/erf.rs:584`. Size: M. Depends: none. Kind: missing.
@@ -155,7 +156,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 
 - **FMT-006** **Global layer order is xoreos's.** Original: not checked. Ours: core, single player, then enabled DLC by manifest `Priority`; loose files under archives, override on top. Evidence: `crates/thedas-vfs/src/install.rs:3`, `crates/thedas-vfs/src/install.rs:128`. Size: M. Depends: none. Kind: provisional.
 - **FMT-007** **Level env-folder search order guessed.** Original: not traced. Ours: core env, then DLC by priority highest first. Evidence: `crates/thedas-vfs/src/install.rs:201`. Size: S. Depends: FMT-006. Kind: provisional.
-- **FMT-008** **Every enabled DLC's `module` folder is mounted globally.** Original: not traced. Ours: each enabled add-in's `module` package is pushed for every campaign; the audio library deliberately excludes DLC `module` folders because they reuse names. Evidence: `crates/thedas-vfs/src/install.rs:134`, `crates/thedas-audio/src/library.rs:75`. Size: M. Depends: FMT-014. Kind: unverified.
+- **FMT-008** **Which add-in `module` folders join the base campaign is read off the manifests.** Original: not traced. Ours: every enabled add-in's `core` folder is mounted; its `module` folder only when the manifest's `ExtendedModuleUID` is `Single Player`. The stand-alone campaigns' manifests leave it empty and their `module` folders reuse base names (Leliana's Song's `default_player.utc` replaced the new-game hero once DLC archives became readable), so they and Awakening's add-ins (`DAO_PRC_EP_1`) stay out. An add-in with no such attribute is left out too. Whether every add-in's `core` data should apply to the base campaign, and in what order, is still open; the audio library likewise excludes DLC `module` folders. Evidence: `crates/thedas-vfs/src/install.rs:49`, `crates/thedas-vfs/src/install.rs:161`, `crates/thedas-audio/src/library.rs:75`. Size: M. Depends: FMT-014. Kind: provisional.
 - **FMT-009** **`Offers/` is not mounted.** Original: not traced. Ours: `global_vfs` and `env_dirs` read only `Addins/`; audio reads both `Addins/` and `Offers/`. Evidence: `crates/thedas-vfs/src/install.rs:85`, `crates/thedas-audio/src/library.rs:79`. Size: S. Depends: none. Kind: bug.
 - **FMT-010** **Manifest.xml is scraped, not parsed.** Original: not traced. Ours: first `AddInItem`'s `UID`, `Priority`, `Enabled` attributes by text search; other items and elements ignored. Evidence: `crates/thedas-vfs/src/install.rs:275`. Size: S. Depends: none. Kind: provisional.
 - **FMT-011** **AddIns.xml and Offers.xml.** Original: AddIns.xml, Offers.xml (installed and enabled content lists). Ours: no code found; enablement comes from each manifest. Evidence: `crates/thedas-vfs/src/install.rs:83`. Size: M. Depends: none. Kind: missing.
@@ -205,7 +206,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 ### Console and Dragon Age II
 
 - **FMT-045** **Console data rejected.** Original: console versions' data. Ours: GFF4 non-PC platforms error; LZX unsupported (FMT-003); FSB console codecs refused (AUD-059). Evidence: `crates/thedas-formats/src/gff4.rs:383`. Size: L. Depends: FMT-003, AUD-059. Kind: missing.
-- **FMT-046** **Dragon Age II formats.** Original: Dragon Age II archive and format differences. Ours: ERF V3.0 and GFF4 V4.1 read and write; DA2 encryption (FMT-002), hash-only names (FMT-004) and every DA2-specific typed format have no code. Evidence: `crates/thedas-vfs/src/erf.rs:8`, `crates/thedas-formats/src/gff4.rs:1`. Size: L. Depends: FMT-002, FMT-004. Kind: missing.
+- **FMT-046** **Dragon Age II formats.** Original: Dragon Age II archive and format differences. Ours: ERF V3.0 and GFF4 V4.1 read and write; DA2 encryption accepts an explicit key (FMT-002). Hash-only names (FMT-004) and DA2-specific typed formats remain unsupported. Evidence: `crates/thedas-vfs/src/erf.rs:8`, `crates/thedas-formats/src/gff4.rs:1`. Size: L. Depends: FMT-002, FMT-004. Kind: missing.
 
 ### Checked and looks complete
 

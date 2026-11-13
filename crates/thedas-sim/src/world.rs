@@ -370,6 +370,23 @@ pub struct LocationVfx {
     pub effect: Effect,
 }
 
+/// An instant visual effect played on an object (an `EffectVisualEffect` applied with
+/// `EFFECT_DURATION_TYPE_INSTANT`): DAOrigins.exe applies such an effect and keeps nothing,
+/// so this is only a note for presentation that the effect was played, kept for
+/// [`INSTANT_VFX_MS`]. Not saved.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstantVfx {
+    pub target: ObjectId,
+    /// The effect's `VFX_base` row (its integer 0).
+    pub vfx: i32,
+    /// World time it was played.
+    pub started_ms: u64,
+}
+
+/// How long an [`InstantVfx`] note is kept for presentation to pick up. Not the effect's
+/// length (the VFX resource has its own); provisional.
+pub const INSTANT_VFX_MS: u64 = 2_000;
+
 /// The open party picker: the followers picked so far (at most three), in order.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PartyPicker {
@@ -532,12 +549,14 @@ pub struct World {
     /// The training tutorial under way, if any (see [`crate::training`]).
     #[serde(default)]
     pub training: crate::training::Training,
-    /// The HUD's notifications not yet dismissed (see [`crate::journal::Alert`]).
-    #[serde(default)]
+    /// The HUD's notifications not yet dismissed (see [`crate::journal::Alert`]). Not
+    /// saved: they belong to the HUD of the game they were raised in, and a loaded game
+    /// would show them again on every load (see `Sim::load_game`).
+    #[serde(skip)]
     pub alerts: Vec<crate::journal::Alert>,
     /// The HUD's large notifications waiting, the first on screen (notifications.gfx's
-    /// `Party.UberAlerts`: "New Quest: ..."), see [`crate::journal::Alert`].
-    #[serde(default)]
+    /// `Party.UberAlerts`: "New Quest: ..."), see [`crate::journal::Alert`]. Not saved.
+    #[serde(skip)]
     pub uber_alerts: Vec<crate::journal::Alert>,
     pub game_mode: i32,
     /// While a conversation holds the game (`GM_DIALOG`, 4): the mode it replaced, and a
@@ -546,6 +565,11 @@ pub struct World {
     pub mode_before_talk: Option<i32>,
     #[serde(default)]
     pub mode_after_talk: Option<i32>,
+    /// Conversations asked for while another was going on (initiator, owner, the
+    /// conversation), in order: each starts when the one before it ends (see
+    /// `Sim::start_conversation`).
+    #[serde(default)]
+    pub pending_talks: Vec<(ObjectId, ObjectId, crate::dialog::Dlg)>,
     /// Cutscenes loaded with `LoadCutscene` that have not played yet, in order. Each starts
     /// once the scripts that loaded it have run (see [`crate::sim::CutscenePolicy`]).
     #[serde(default)]
@@ -644,6 +668,9 @@ pub struct World {
     /// Visual effects applied at places (see [`LocationVfx`]).
     #[serde(default)]
     pub location_vfx: Vec<LocationVfx>,
+    /// Instant visual effects played on objects lately (see [`InstantVfx`]).
+    #[serde(skip)]
+    pub instant_vfx: Vec<InstantVfx>,
     /// The next [`LocationVfx::handle`].
     #[serde(default)]
     pub next_vfx: u64,
@@ -767,6 +794,7 @@ impl World {
             game_mode: 0,
             mode_before_talk: None,
             mode_after_talk: None,
+            pending_talks: Vec::new(),
             cutscenes: Vec::new(),
             dialog_cutscenes: Vec::new(),
             cutscene: None,
@@ -794,6 +822,7 @@ impl World {
             container: None,
             store: None,
             location_vfx: Vec::new(),
+            instant_vfx: Vec::new(),
             next_vfx: 0,
             chanter_board: None,
             plot_actions: PlotActions::default(),

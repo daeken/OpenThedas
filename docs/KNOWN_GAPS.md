@@ -37,11 +37,11 @@ so an untraced item starts with a trace, not with a guess.
 | Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 167 (`SIM-`), plus ability coverage by family |
 | Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 96 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
 | Rendering | [gaps/rendering.md](gaps/rendering.md) | 152 (`RND-`) |
-| Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 185 (`UI-`), plus the movies never opened and the values no screen gets answered |
+| Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 184 (`UI-`), plus the movies never opened and the values no screen gets answered |
 | Audio | [gaps/audio.md](gaps/audio.md) | 55 (`AUD-`) |
-| Cameras, cutscene presentation, startup | [gaps/cameras-cutscenes.md](gaps/cameras-cutscenes.md) | 44 (`CAM-`) |
+| Cameras, cutscene presentation, startup | [gaps/cameras-cutscenes.md](gaps/cameras-cutscenes.md) | 42 (`CAM-`) |
 | File formats and file system | [gaps/formats.md](gaps/formats.md) | 46 (`FMT-`), plus a table of every resource type and the tables and types nothing reads |
-| Tooling, platforms and project | [gaps/tooling.md](gaps/tooling.md) | 24 (`TOOL-`) |
+| Tooling, platforms and project | [gaps/tooling.md](gaps/tooling.md) | 23 (`TOOL-`) |
 | What a player sees (QA) | [gaps/qa.md](gaps/qa.md) | open findings, accepted differences, content coverage |
 
 ## The big pieces
@@ -145,9 +145,10 @@ these, so they are the places where one person or stream can take a large, separ
 
 ### Platform, formats and project
 
-- **Movies need an external `ffmpeg`**, and on Windows it is never found (`CAM-029`,
-  `CAM-030`).
-- **Encrypted downloadable content cannot be read**; no key is ever supplied (`FMT-001`).
+- **Movies need an external `ffmpeg`** beside the game or on the PATH (`CAM-029`).
+- **DLC passwords come only from the GOG Ultimate Edition executable.** Other editions' encrypted
+  DLC stays unread, and the DA2 and XOR readers are checked only synthetically (`FMT-001`,
+  `FMT-002`).
 - **Only the base campaign can be played.** Awakening, DLC campaigns and toolset modules cannot
   be selected (`FMT-014`).
 - **Windows and Linux are untested**, continuous integration is switched off, there is no
@@ -173,9 +174,6 @@ Concrete defects found during the code read. Each is small and independent.
 | `RND-095` | Location effects with an instant duration are discarded and never drawn |
 | `RND-139` | Compressed textures lose their smallest mip levels |
 | `FMT-009` | The `Offers/` folder is not mounted for resources, though audio reads it |
-| `FMT-008` | Every enabled DLC's module folder is mounted for every campaign |
-| `CAM-030` | `ffmpeg` is looked up without `.exe`, so Windows never plays movies |
-| `CAM-045` | The default save folder falls back to the working directory when `HOME` is unset |
 
 Several stale comments and README sections were also found; they are listed in the area files
 (`SIM-004`, `SIM-029`, `SIM-147`, `UI-145`, `CAM-036`, `TOOL-001` to

@@ -243,6 +243,25 @@ struct Floaty {
     left_s: f64,
 }
 
+/// Whether a floaty of `style` over a creature shows (DAOrigins.exe 0x6a7414-0x6a749e):
+/// a damage number (`FLOATY_HIT` 1, `FLOATY_CRITICAL_HIT` 2) shows over a party member
+/// when the party's numbers are on (`ShowPartyDamageNumbers`), otherwise over a hostile
+/// when the hostiles' are (`ShowHostileDamageNumbers`), and over no one else; any other
+/// floaty shows. Provisional: the exe's first test (0x631830 on the object from 0x5d57c0)
+/// is taken to be membership of the party.
+fn damage_number_shows(
+    style: i32,
+    in_party: bool,
+    hostile: bool,
+    party_numbers: bool,
+    hostile_numbers: bool,
+) -> bool {
+    if style != 1 && style != 2 {
+        return true;
+    }
+    (in_party && party_numbers) || (hostile && hostile_numbers)
+}
+
 /// A floaty's scale at `d` metres from the camera (DAOrigins.exe 0x63bfa0): full size up to
 /// 5 m, shrinking linearly to two thirds at 30 m and beyond. (Its alpha, 0x63c020, runs from
 /// 1 at 2 m to 1 at 7 m: always 1.)
@@ -320,6 +339,9 @@ pub struct UiLayer {
     /// Whether the conversation line the game is on has a voice-over, known as it is chosen
     /// (see [`UiLayer::set_line_voiced`]).
     line_voiced: bool,
+    /// The highlight key is held: every creature near shows its name (see
+    /// [`UiLayer::set_show_all_names`]).
+    show_all_names: bool,
     /// The creature the mouse is over (see [`UiLayer::set_hovered`]).
     hovered: Option<thedas_script::vm::ObjectId>,
     /// A conversation line's continue the movie could not send (see `continue_conversation`).
@@ -648,6 +670,7 @@ impl UiLayer {
             floaties: Vec::new(),
             stat_floaties: Default::default(),
             hovered: None,
+            show_all_names: false,
             line_voiced: false,
             settings_file: None,
             continue_pending: false,
@@ -1315,59 +1338,11 @@ impl UiLayer {
                 };
                 // The list's new save (slot -1) goes in the open slot.
                 let slot = if slot > 0 { slot } else { store.open_slot() };
-                let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
-                // No saving during a training tutorial (script.ldf's SetTrainingMode).
-                if sim.training_paused() {
-                    log::warn!("ui: no saving during a training tutorial");
-                    return true;
-                }
-                // The module hears the save coming first (EVENT_TYPE_MODULE_PRESAVE).
-                sim.presave();
-                let area = sim
-                    .world
-                    .area
-                    .map(|a| sim.display_name(a))
-                    .unwrap_or_default();
                 let typed = args
                     .get(1)
                     .map(|n| n.trim().to_string())
                     .unwrap_or_default();
-                let meta = crate::saves::SaveMeta {
-                    name: if typed.is_empty() {
-                        area.clone()
-                    } else {
-                        typed
-                    },
-                    area,
-                    time_ms: sim.world.time_ms,
-                    written: crate::saves::now_secs(),
-                    hero: sim
-                        .world
-                        .hero
-                        .map(|h| sim.display_name(h))
-                        .unwrap_or_default(),
-                    level: sim
-                        .world
-                        .hero
-                        .map_or(0, |h| sim.property_total(h, 15) as i32),
-                    class: sim
-                        .world
-                        .hero
-                        .map_or(0, |h| sim.property_total(h, 27) as i32),
-                };
-                let saved = match sim.saving_blocked() {
-                    Some(why) => Err(why.to_string()),
-                    None => sim.save_json().map_err(|e| e.to_string()),
-                };
-                match saved {
-                    Ok(b) => match store.write(slot, &b, &meta) {
-                        Ok(()) => log::info!("ui: saved to slot {slot}"),
-                        Err(e) => log::warn!("ui: saving to slot {slot}: {e}"),
-                    },
-                    Err(e) => log::warn!("ui: the game could not be saved: {e}"),
-                }
-                drop(sim);
-                self.refresh_saves();
+                self.write_save(sim, slot, typed, crate::saves::KIND_SLOT);
                 screens.menu = None;
             }
             "SaveLoad.DeleteSaveGame" => {
@@ -1381,6 +1356,112 @@ impl UiLayer {
             _ => return false,
         }
         true
+    }
+
+    /// Saves the game to `slot` as the save screen does: named `name` (the area's name
+    /// when empty), of `kind` (`crate::saves::KIND_*`). Returns whether it was written.
+    fn write_save(&mut self, sim: &Arc<Mutex<Sim>>, slot: i32, name: String, kind: i32) -> bool {
+        let Some(store) = self.saves.as_ref() else {
+            return false;
+        };
+        let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+        // No saving during a training tutorial (script.ldf's SetTrainingMode).
+        if sim.training_paused() {
+            log::warn!("ui: no saving during a training tutorial");
+            return false;
+        }
+        // The module hears the save coming first (EVENT_TYPE_MODULE_PRESAVE).
+        sim.presave();
+        let area = sim
+            .world
+            .area
+            .map(|a| sim.display_name(a))
+            .unwrap_or_default();
+        let meta = crate::saves::SaveMeta {
+            name: if name.is_empty() { area.clone() } else { name },
+            area,
+            time_ms: sim.world.time_ms,
+            written: crate::saves::now_secs(),
+            hero: sim
+                .world
+                .hero
+                .map(|h| sim.display_name(h))
+                .unwrap_or_default(),
+            level: sim
+                .world
+                .hero
+                .map_or(0, |h| sim.property_total(h, 15) as i32),
+            class: sim
+                .world
+                .hero
+                .map_or(0, |h| sim.property_total(h, 27) as i32),
+            kind,
+        };
+        let saved = match sim.saving_blocked() {
+            Some(why) => Err(why.to_string()),
+            None => sim.save_json().map_err(|e| e.to_string()),
+        };
+        let written = match saved {
+            Ok(b) => match store.write(slot, &b, &meta) {
+                Ok(()) => {
+                    log::info!("ui: saved to slot {slot}");
+                    true
+                }
+                Err(e) => {
+                    log::warn!("ui: saving to slot {slot}: {e}");
+                    false
+                }
+            },
+            Err(e) => {
+                log::warn!("ui: the game could not be saved: {e}");
+                false
+            }
+        };
+        drop(sim);
+        self.refresh_saves();
+        written
+    }
+
+    /// The quick save key (`QuickSave`, F5): the game is saved to the quick save's slot,
+    /// over the one before. Provisional: the original's name for it in the list and any
+    /// notice it shows are not traced; it is named "Quicksave".
+    pub fn quick_save(&mut self, sim: &Arc<Mutex<Sim>>) -> bool {
+        let Some(store) = self.saves.as_ref() else {
+            return false;
+        };
+        let slot = store.quick_slot().unwrap_or_else(|| store.open_slot());
+        self.write_save(sim, slot, "Quicksave".into(), crate::saves::KIND_QUICK)
+    }
+
+    /// The quick load key (`QuickLoad`, F9): the quick save is loaded into the running
+    /// game, as the load screen loads a save. Returns whether there was one to load.
+    pub fn quick_load(&mut self, sim: &Arc<Mutex<Sim>>) -> bool {
+        let Some(store) = self.saves.as_ref() else {
+            return false;
+        };
+        let Some(slot) = store.quick_slot() else {
+            log::info!("ui: no quick save to load");
+            return false;
+        };
+        match store.read(slot) {
+            Ok(b) => {
+                let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+                match sim.load_json(&b) {
+                    Ok(()) => {
+                        log::info!("ui: loaded the quick save (slot {slot})");
+                        true
+                    }
+                    Err(e) => {
+                        log::warn!("ui: the quick save did not load: {e}");
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("ui: the quick save: {e}");
+                false
+            }
+        }
     }
 
     /// Plays the game's screens over a running game: the movies act on `sim` as they send
@@ -1845,6 +1926,12 @@ impl UiLayer {
         self.hovered = creature;
     }
 
+    /// The highlight key (Tab) is held: every creature within 50 m of the leader shows its
+    /// name over its head, as the original shows them while its key is down.
+    pub fn set_show_all_names(&mut self, held: bool) {
+        self.show_all_names = held;
+    }
+
     pub fn set_paused(&self, paused: bool) {
         if let Ok(mut shown) = self.shown.lock() {
             shown.paused = paused;
@@ -2052,7 +2139,6 @@ impl UiLayer {
         // floatylayer.gfx's `FLOATY_STATS_*` flags.
         const SHOW_NAME: f64 = 1.0;
         const SHOW_HEALTH_BAR: f64 = 2.0;
-        const SHOW_TARGET: f64 = 4.0;
         const IS_HOSTILE: f64 = 32.0;
         const IS_IN_PARTY: f64 = 64.0;
         /// Seconds a floaty stays past its duration (its own fade).
@@ -2102,7 +2188,33 @@ impl UiLayer {
         let vp = camera.view_proj(w / h.max(1.0));
         {
             let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+            // Damage numbers (`FLOATY_HIT`, `FLOATY_CRITICAL_HIT`) follow the options, as the
+            // exe's floaty handler does (0x6a7414-0x6a749e): over a party member with "party
+            // damage numbers" on, else over a hostile with "hostile damage numbers" on, else
+            // not at all. Other floaties always show.
+            let option = |name: &str| {
+                self.shown
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.options.get(name).copied())
+                    .unwrap_or(1.0)
+                    != 0.0
+            };
+            let (party_numbers, hostile_numbers) = (
+                option("GameOptions.ShowPartyDamageNumbers"),
+                option("GameOptions.ShowHostileDamageNumbers"),
+            );
+            let members = thedas_sim::engine::party_of(&sim);
             for f in std::mem::take(&mut sim.world.floaties) {
+                if !damage_number_shows(
+                    f.style,
+                    members.contains(&f.target),
+                    members.iter().any(|&m| sim.hostile(m, f.target)),
+                    party_numbers,
+                    hostile_numbers,
+                ) {
+                    continue;
+                }
                 let id = self.next_floaty;
                 self.next_floaty += 1;
                 create.push(num(f64::from(id)));
@@ -2153,10 +2265,9 @@ impl UiLayer {
                 ]);
                 true
             });
-            // The stats floaties (name and health bar over a creature): the hostiles in a
-            // fight with the party, the leader's attack target named. Provisional: the
-            // exe's choice of creatures and flags is not traced; this follows what the
-            // original shows in a fight (a health bar over each enemy, the target's name).
+            // The stats floaties (name and health bar over a creature), for the creatures the
+            // exe gives one (see below). Provisional: which object the game mode marks as
+            // selected is not traced.
             let leader = sim.world.controlled();
             let target = leader
                 .and_then(|l| sim.world.get(l))
@@ -2171,34 +2282,29 @@ impl UiLayer {
             let leader_at = leader
                 .and_then(|l| sim.world.get(l))
                 .map(|o| glam::Vec3::from_array(o.position));
-            let hovered = self.hovered.filter(|&c| {
-                sim.world.get(c).is_some_and(|o| {
-                    o.kind == thedas_sim::world::ObjectKind::Creature
-                        && o.active
-                        && !o.dead
-                        && o.area == sim.world.area
-                        && leader_at.is_some_and(|l| {
-                            l.distance_squared(glam::Vec3::from_array(o.position)) < 2500.0
-                        })
-                })
-            });
-            let mut wanted: Vec<thedas_script::vm::ObjectId> = sim
+            let near = |o: &thedas_sim::world::Object| {
+                o.kind == thedas_sim::world::ObjectKind::Creature
+                    && o.active
+                    && !o.dead
+                    && o.area == sim.world.area
+                    && leader_at.is_some_and(|l| {
+                        l.distance_squared(glam::Vec3::from_array(o.position)) < 2500.0
+                    })
+            };
+            let hovered = self.hovered.filter(|&c| sim.world.get(c).is_some_and(near));
+            // A creature has its floaty while the mouse is over it, while it is the one
+            // selected (creature+0x42d, set by 0x70d6e0 for the game mode's object; the
+            // leader's attack target stands in), or while the highlight key is held
+            // (input action 0x2d, read at 0x69aa72 and 0x70d36b): 0x6a52c0.
+            let show_all = self.show_all_names;
+            let wanted: Vec<thedas_script::vm::ObjectId> = sim
                 .world
                 .objects
                 .values()
-                .filter(|o| {
-                    o.kind == thedas_sim::world::ObjectKind::Creature
-                        && o.active
-                        && !o.dead
-                        && o.area == sim.world.area
-                        && (Some(o.id) == target
-                            || (o.combat.in_combat && party.iter().any(|&m| sim.hostile(m, o.id))))
-                })
+                .filter(|o| near(o))
+                .filter(|o| show_all || Some(o.id) == target || Some(o.id) == hovered)
                 .map(|o| o.id)
                 .collect();
-            if let Some(h) = hovered.filter(|h| !wanted.contains(h)) {
-                wanted.push(h);
-            }
             for (&c, &id) in &self.stat_floaties {
                 if !wanted.contains(&c) {
                     destroy.push(num(f64::from(id)));
@@ -2237,29 +2343,20 @@ impl UiLayer {
                     num(alpha),
                     num(f64::from(id)),
                 ]);
-                let mut flags = if Some(c) == hovered {
-                    // The exe's flags (0x764e40): the name always; the health bar for a
-                    // hostile, a party member or a creature in combat; whether it is
-                    // hostile or in the party. Provisional: HAS_MANA (the class's mana,
-                    // 0x71a060) is not sent.
-                    let hostile = party.iter().any(|&m| sim.hostile(m, c));
-                    let in_party = party.contains(&c);
-                    let mut f = SHOW_NAME;
-                    if hostile || in_party || o.combat.in_combat {
-                        f += SHOW_HEALTH_BAR;
-                    }
-                    if hostile {
-                        f += IS_HOSTILE;
-                    }
-                    if in_party {
-                        f += IS_IN_PARTY;
-                    }
-                    f
-                } else {
-                    SHOW_HEALTH_BAR + IS_HOSTILE
-                };
-                if Some(c) == target {
-                    flags = SHOW_HEALTH_BAR + IS_HOSTILE + SHOW_NAME + SHOW_TARGET;
+                // The exe's flags (0x764e40): the name always; the health bar for a hostile,
+                // a party member or a creature in combat; whether it is hostile or in the
+                // party. Provisional: HAS_MANA (the class's mana, 0x71a060) is not sent.
+                let hostile = party.iter().any(|&m| sim.hostile(m, c));
+                let in_party = party.contains(&c);
+                let mut flags = SHOW_NAME;
+                if hostile || in_party || o.combat.in_combat {
+                    flags += SHOW_HEALTH_BAR;
+                }
+                if hostile {
+                    flags += IS_HOSTILE;
+                }
+                if in_party {
+                    flags += IS_IN_PARTY;
                 }
                 let (cur, max) = (
                     o.properties.get(&health).map_or(0.0, |p| f64::from(p.1)),
@@ -2757,6 +2854,19 @@ fn gui_id(s: Screen, container: bool) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn damage_numbers_follow_the_options_and_other_floaties_always_show() {
+        // A message shows whatever the options.
+        assert!(damage_number_shows(0, false, false, false, false));
+        // Over a party member: the party's option; over a hostile: the hostiles'.
+        assert!(damage_number_shows(1, true, false, true, false));
+        assert!(!damage_number_shows(1, true, false, false, true));
+        assert!(damage_number_shows(2, false, true, false, true));
+        assert!(!damage_number_shows(2, false, true, true, false));
+        // Over a bystander: never.
+        assert!(!damage_number_shows(1, false, false, true, true));
+    }
 
     #[test]
     fn a_splash_pass_hides_everything_beside_the_splash_branch() {
