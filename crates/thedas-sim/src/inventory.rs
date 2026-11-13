@@ -1249,8 +1249,16 @@ mod screen_tests {
         s.world.training.mode = 5;
         s.world.training.expected = 1070;
         s.world.training.arg = 0;
+        s.world.trace.keep = true;
         assert!(s.equip_item(hero, spare, 0));
-        assert!(s.world.queue.values().any(|q| q.event.ty == 1070));
+        // Heard, and delivered to genev_tutorial at once (see `Sim::raise_training_event`).
+        assert!(
+            s.world
+                .trace
+                .entries
+                .iter()
+                .any(|e| matches!(e, crate::trace::TraceEntry::EventDelivered { ty: 1070, .. }))
+        );
         assert_eq!(s.world.training.expected, 0);
         s.world.training = Default::default();
         assert_eq!(s.world.get(hero).unwrap().equipment.get(&0), Some(&spare));
