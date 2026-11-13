@@ -231,13 +231,9 @@ impl Sim {
             .filter(|o| o.kind == ObjectKind::Creature && o.area == Some(area))
             .map(|o| (o.id, o.position))
             .collect();
-        // Closed doors block sight (their doorways, see `Sim::closed_doors`).
-        let doors: Vec<[f32; 3]> = self
-            .closed_doors(area)
-            .into_iter()
-            .filter_map(|(d, _)| self.world.get(d).map(|o| o.position))
-            .collect();
-        let blocked = |a: [f32; 3], b: [f32; 3]| Sim::door_between(&doors, a, b);
+        // Closed doors block sight (see `Sim::door_sight`).
+        let doors = self.door_sight(area);
+        let blocked = |a: [f32; 3], b: [f32; 3]| doors.blocks(a, b);
         // Walls block noticing (`nav::wall_between`); once noticed, a creature is kept
         // track of round corners out to the visual radius.
         // A hostile's sight line is a ray through the level's collision from 1.8 m above
@@ -266,10 +262,10 @@ impl Sim {
             // alone (0x6b8873); only a hostile one needs a clear line of sight, a ray through
             // the level's collision from 1.8 m above each one's feet (0xb004d8; 0x67c530).
             // Keeping track (0x6a8d60) tests no sight, out to 60 m (0xadef18).
-            // Provisional: closed doors stand in for the exe's room visibility for everyone,
-            // and a wall of the pathing grid for the collision ray; the grid, the only geometry
-            // the simulation has, marks large furniture and rubble the same way as walls, so
-            // those block hostiles too.
+            // Provisional: closed doors (their own collision, `Sim::door_sight`) stand in for
+            // the exe's room visibility for everyone; without the level's collision files a
+            // wall of the pathing grid stands in for the ray, and the grid marks large
+            // furniture and rubble the same way as walls, so those block hostiles too.
             let ring = self.perception_range(id);
             let seen = self
                 .world
