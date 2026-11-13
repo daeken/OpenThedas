@@ -41,6 +41,9 @@
 //! the D-pad or stick picks a reply and A chooses it. The PC original has no controller
 //! support: this is a deliberate addition, following the Xbox 360 version's controls.
 //!
+//! F8 (or both sticks clicked in, or the game menu's Report Issue) makes an issue report
+//! (see [`report`]); a build that fixes one is offered at start (see [`update`]).
+//!
 //! `--control 127.0.0.1:7878` lets a local client (`thedas-mcp`'s `attach`) drive the
 //! running game: the same steps as `--steps`, screenshots and the simulation's state (see
 //! [`control`]).
