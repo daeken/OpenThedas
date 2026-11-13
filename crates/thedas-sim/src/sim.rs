@@ -160,6 +160,9 @@ pub struct Sim {
     /// Every command given through [`Sim::apply`] since it was turned on (`Some`), for
     /// journal-style saves to write out. Off (`None`) by default.
     pub input_log: Option<Vec<crate::commands::InputEntry>>,
+    /// How many games have been loaded into this simulation (journal-style saves start a
+    /// new checkpoint after each).
+    pub loads: u64,
     pub(crate) plots: crate::plot::Plots,
     /// The talk tables' strings, read once (tests set them).
     pub(crate) strings: std::sync::OnceLock<std::collections::BTreeMap<u32, String>>,
@@ -595,6 +598,7 @@ impl Sim {
             ambient: Vec::new(),
             voices: crate::voice::Voices::new(),
             input_log: None,
+            loads: 0,
             install_root: None,
             area_layouts: HashMap::new(),
             nav_grids: HashMap::new(),

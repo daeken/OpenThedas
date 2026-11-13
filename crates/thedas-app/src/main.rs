@@ -145,6 +145,10 @@ struct Args {
     /// and every input since it replayed), as it was when it stopped.
     #[arg(long)]
     resume: bool,
+    /// Keep the journal even in a run with `--capture`, `--steps` or `--control` (which
+    /// keep none otherwise, so tests never replace the player's journal).
+    #[arg(long)]
+    journal: bool,
     /// Draw the creatures and placeables an area starts with (runs the simulation for the
     /// area resource given as `--area`).
     #[arg(long)]
@@ -3889,7 +3893,12 @@ impl ApplicationHandler for App {
             }
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if let Some(l) = self.live.as_mut() {
+                    l.close_journal();
+                }
+                event_loop.exit()
+            }
             WindowEvent::Resized(size) => {
                 if let Some(g) = self.gfx.as_mut() {
                     if size.width > 0 && size.height > 0 {
@@ -5269,15 +5278,13 @@ fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(saves::SaveStore::default_dir);
     let journal_dir = journal::default_dir();
-    let checkpoint = if args.resume {
-        Some(journal::checkpoint(&journal_dir).ok_or_else(|| {
-            anyhow::anyhow!("--resume: no checkpoint in {}", journal_dir.display())
-        })?)
-    } else {
-        None
-    };
-    let start = if let Some(bytes) = &checkpoint {
-        Some(live::Start::SaveBytes(bytes))
+    journal::set_enabled(
+        args.journal
+            || args.resume
+            || (args.capture.is_none() && args.steps.is_empty() && args.control.is_none()),
+    );
+    let start = if args.resume {
+        Some(live::Start::Resume(&journal_dir))
     } else if let Some(save) = &args.save {
         Some(live::Start::Save(save))
     } else if args.new_game && args.quick_start {
@@ -5304,19 +5311,6 @@ fn main() -> Result<()> {
         )?),
         None => None,
     };
-    // --resume: the inputs since the checkpoint, replayed.
-    if let (Some(l), true) = (live.as_ref(), args.resume) {
-        let report = journal::replay(&mut l.sim(), &journal_dir);
-        match (&report.refused, report.mismatch) {
-            (Some(why), _) => log::warn!("resume: the log was not replayed: {why}"),
-            (None, Some((at, _, _))) => log::warn!(
-                "resume: the replay went its own way at input {at}; the game is as it was there ({} of {} inputs)",
-                report.applied,
-                report.inputs
-            ),
-            (None, None) => log::info!("resume: {} inputs replayed", report.applied),
-        }
-    }
     // THEDAS_ASYNC_LOADS: headless too, a new level builds on a worker while frames run on
     // (as the window does), for testing that path.
     if let Some(l) = live.as_mut() {
