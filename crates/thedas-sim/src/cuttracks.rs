@@ -136,6 +136,9 @@ pub const TRACK_SHAKE: u64 = 20;
 pub const TRACK_LINK_TO_ACTOR: u64 = 27;
 pub const TRACK_HEAD_TRACKING: u64 = 28;
 pub const TRACK_CHANGE_VISIBILITY: u64 = 32;
+pub const TRACK_LIGHT_RADIUS: u64 = 33;
+pub const TRACK_LIGHT_INTENSITY: u64 = 34;
+pub const TRACK_LIGHT_COLOR: u64 = 35;
 pub const TRACK_DRAW_WEAPON: u64 = 41;
 pub const TRACK_JUMP_TO_CAMERA: u64 = 24;
 pub const TRACK_JUMP_TO_PLACE: u64 = 25;
@@ -769,7 +772,7 @@ pub struct Actor {
     /// The model it is drawn as (field 5202), when it is a prop of the cutscene rather than
     /// a creature or a camera: a placeable (`plc_arrow_01`), a weapon (`w_arr_la01a_0`) or
     /// an effect (`fxa_bloodslice_c`). `tools_null`, which every other actor has, and
-    /// `base_light`, a light, are left out.
+    /// `base_light`, a light ([`Actor::light`]), are left out.
     pub model: Option<String>,
     /// Field 5216 (actor +0x44): the object of the world that plays the actor, found by
     /// this name when the cutscene starts (0x7e36b0): `OWNER`, `PLAYER`, `HENCH...` or a
@@ -813,6 +816,36 @@ pub struct Actor {
     pub visibility: Vec<(f32, bool)>,
     /// Kind-41 tracks, in the file's order.
     pub weapon_draws: Vec<WeaponDraw>,
+    /// For an actor that is a light (its model, field 5202, is [`LIGHT_MODEL`]): its light
+    /// tracks.
+    pub light: Option<LightTracks>,
+}
+
+/// The model of a cutscene's light actors: no mesh, two point lights (one for characters,
+/// one for the level).
+pub const LIGHT_MODEL: &str = "base_light";
+
+/// A light actor's tracks, each in the file's order: `ActionLightRadius` (kind 33, one
+/// curve), `ActionLightIntensity` (kind 34, one curve) and `ActionLightColor` (kind 35,
+/// three curves: red, green, blue). Each update sets its value on every point light of the
+/// actor's model alike (DAOrigins.exe 0x7d3520, 0x7d3550 and 0x7d3580, through the actor's
+/// 0x7d0b80, 0x7d0c80 and 0x7d0c00): the light's radius (+0x1b0), its intensity (+0x1b4,
+/// which multiplies the colour the shaders are given, 0x46b47e, and weighs the light when
+/// an object's lights are picked, 0x53d35f) and its colour (+0x1a0).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LightTracks {
+    pub radius: Vec<CurveTrack>,
+    pub intensity: Vec<CurveTrack>,
+    pub color: Vec<CurveTrack>,
+}
+
+/// What a light actor's tracks have set at a moment: `None` for a value no track has set
+/// yet, which is the model's own.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LightShow {
+    pub radius: Option<f32>,
+    pub intensity: Option<f32>,
+    pub color: Option<[f32; 3]>,
 }
 
 /// Where an actor is at a moment of the cutscene.
@@ -827,6 +860,24 @@ pub struct Pose {
 }
 
 impl Actor {
+    /// What the actor's light tracks have set `t` seconds in, when it is a light: of each
+    /// kind the last track that has started (the actions update in the file's order).
+    pub fn light_at(&self, t: f32) -> Option<LightShow> {
+        let light = self.light.as_ref()?;
+        let last = |tracks: &[CurveTrack], n: usize| {
+            tracks
+                .iter()
+                .rev()
+                .filter_map(|tr| tr.at(t))
+                .find(|v| v.len() >= n && v.iter().all(|x| x.is_finite()))
+        };
+        Some(LightShow {
+            radius: last(&light.radius, 1).map(|v| v[0]),
+            intensity: last(&light.intensity, 1).map(|v| v[0]),
+            color: last(&light.color, 3).map(|v| [v[0], v[1], v[2]]),
+        })
+    }
+
     /// Whether the cutscene shows or hides the actor `t` seconds in: what its last started
     /// visibility action says; `None` before the first (it is as the world has it).
     pub fn visible_at(&self, t: f32) -> Option<bool> {
@@ -1210,7 +1261,7 @@ impl Tracks {
                 creature: text(FIELD_ACTOR_CREATURE),
                 model: text(FIELD_ACTOR_MODEL)
                     .map(|m| m.to_ascii_lowercase())
-                    .filter(|m| m != "tools_null" && m != "base_light"),
+                    .filter(|m| m != "tools_null" && m != LIGHT_MODEL),
                 position: match g.field(a, FIELD_ACTOR_POSITION) {
                     Some(Value::Vec3(v)) if v.iter().all(|x| x.is_finite()) => *v,
                     _ => [0.0; 3],
@@ -1244,6 +1295,9 @@ impl Tracks {
                 head_tracks: Vec::new(),
                 visibility: Vec::new(),
                 weapon_draws: Vec::new(),
+                light: text(FIELD_ACTOR_MODEL)
+                    .is_some_and(|m| m.eq_ignore_ascii_case(LIGHT_MODEL))
+                    .then(LightTracks::default),
             };
             for tr in structs(g, a, FIELD_ACTOR_TRACKS) {
                 let Some(kind) = g.field(tr, FIELD_TRACK_KIND).and_then(Value::as_u64) else {
@@ -1266,6 +1320,16 @@ impl Tracks {
                         .collect(),
                 };
                 match kind {
+                    TRACK_LIGHT_RADIUS | TRACK_LIGHT_INTENSITY | TRACK_LIGHT_COLOR => {
+                        if let Some(light) = actor.light.as_mut() {
+                            match kind {
+                                TRACK_LIGHT_RADIUS => &mut light.radius,
+                                TRACK_LIGHT_INTENSITY => &mut light.intensity,
+                                _ => &mut light.color,
+                            }
+                            .push(curves());
+                        }
+                    }
                     TRACK_MOVE_SPLINE => actor.motion.push(curves()),
                     TRACK_ROTATE => actor.turn.push(curves()),
                     TRACK_CAMERA_FOV => actor.fov.push(curves()),
@@ -2367,6 +2431,7 @@ mod tests {
             head_tracks: Vec::new(),
             visibility: Vec::new(),
             weapon_draws: Vec::new(),
+            light: None,
         };
         assert_eq!(a.head_track_at(1.0), None);
         let track = |start: f32, end: f32, target: i64| HeadTrack {
@@ -2454,6 +2519,7 @@ mod tests {
             head_tracks: Vec::new(),
             visibility: vec![(32.2, true), (0.0, false)],
             weapon_draws: Vec::new(),
+            light: None,
         };
         assert_eq!(a.visible_at(1.0), Some(false));
         assert_eq!(a.visible_at(40.0), Some(true));
@@ -2466,6 +2532,66 @@ mod tests {
         assert_eq!(a.weapons_at(10.0), Some((false, Some(true))));
         a.visibility.clear();
         assert_eq!(a.visible_at(1.0), None);
+    }
+
+    #[test]
+    fn a_lights_tracks_set_its_radius_intensity_and_colour() {
+        let track = |start: f32, values: &[f32]| CurveTrack {
+            start,
+            end: 60.0,
+            curves: values.iter().map(|v| Curve::constant(*v)).collect(),
+        };
+        let mut a = Actor {
+            id: 1,
+            name: "light".into(),
+            creature: None,
+            model: None,
+            tag: None,
+            end_position: [0.0; 3],
+            end_rotation: [0.0, 0.0, 0.0, 1.0],
+            snaps: false,
+            pose: None,
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            motion: Vec::new(),
+            turn: Vec::new(),
+            fov: Vec::new(),
+            animations: Vec::new(),
+            places: Vec::new(),
+            camera_jumps: Vec::new(),
+            links: Vec::new(),
+            shakes: Vec::new(),
+            head_tracks: Vec::new(),
+            visibility: Vec::new(),
+            weapon_draws: Vec::new(),
+            light: None,
+        };
+        // Not a light.
+        assert_eq!(a.light_at(1.0), None);
+        a.light = Some(LightTracks {
+            radius: vec![track(0.0, &[100.0])],
+            intensity: vec![track(0.0, &[0.5]), track(10.0, &[0.0])],
+            // Two curves are not a colour.
+            color: vec![track(2.0, &[1.0, 0.8, 0.4]), track(3.0, &[1.0, 1.0])],
+        });
+        // Before a track starts, its value is the model's own.
+        assert_eq!(
+            a.light_at(1.0),
+            Some(LightShow {
+                radius: Some(100.0),
+                intensity: Some(0.5),
+                color: None,
+            })
+        );
+        // The last started track of a kind wins.
+        assert_eq!(
+            a.light_at(12.0),
+            Some(LightShow {
+                radius: Some(100.0),
+                intensity: Some(0.0),
+                color: Some([1.0, 0.8, 0.4]),
+            })
+        );
     }
 
     #[test]
@@ -2493,6 +2619,7 @@ mod tests {
             head_tracks: Vec::new(),
             visibility: Vec::new(),
             weapon_draws: Vec::new(),
+            light: None,
         };
         assert_eq!(a.pose_node().as_deref(), Some("pose_17"));
         a.pose = Some(0);
@@ -2564,6 +2691,7 @@ mod tests {
             head_tracks: Vec::new(),
             visibility: Vec::new(),
             weapon_draws: Vec::new(),
+            light: None,
         };
         let none: &PlaceLookup = &|_| None;
         let before = a.stage_pose_at(1.0, none);
