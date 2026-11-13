@@ -210,7 +210,7 @@ const HEAD_ON: f32 = 0.1;
 /// into the body nothing is left, and a walker whose way lies through a creature standing
 /// on its line, or two walkers meeting on one line of the pathing grid, would stand there
 /// for good; such a move goes round the body on the walker's right instead, at its own
-/// pace. Provisional: DAOrigins.exe's creatures are PhysX capsules whose sweeps are never
+/// pace (not round the creature the walker is making for: it stops against that one). Provisional: DAOrigins.exe's creatures are PhysX capsules whose sweeps are never
 /// exactly head-on, and what its path follower does when one is held up is not traced.
 fn round_on_the_right(rest: [f32; 2], nrm: [f32; 2], slid: [f32; 2]) -> [f32; 2] {
     let rr = rest[0] * rest[0] + rest[1] * rest[1];
@@ -233,7 +233,12 @@ fn slide_circle(
     d: [f32; 2],
     c: [f32; 2],
     r: f32,
+    round: bool,
 ) -> Option<(f32, [f32; 2], [f32; 2])> {
+    let turn = |rest: [f32; 2], nrm: [f32; 2], slid: [f32; 2]| match round {
+        true => round_on_the_right(rest, nrm, slid),
+        false => slid,
+    };
     let m = [at[0] - c[0], at[1] - c[1]];
     let dd = d[0] * d[0] + d[1] * d[1];
     if dd <= 1e-12 {
@@ -253,7 +258,7 @@ fn slide_circle(
             return None;
         }
         let slid = [d[0] - k * nrm[0], d[1] - k * nrm[1]];
-        return Some((0.0, at, round_on_the_right(d, nrm, slid)));
+        return Some((0.0, at, turn(d, nrm, slid)));
     }
     if md >= 0.0 {
         return None;
@@ -277,7 +282,7 @@ fn slide_circle(
         return None;
     }
     let slid = if k < 0.0 {
-        round_on_the_right(rest, nrm, [rest[0] - k * nrm[0], rest[1] - k * nrm[1]])
+        turn(rest, nrm, [rest[0] - k * nrm[0], rest[1] - k * nrm[1]])
     } else {
         rest
     };
@@ -2300,7 +2305,9 @@ impl Sim {
         let area = me.area?;
         let mine = self.capsule_radius(id);
         let reach = crate::engine::dist(a, b) + mine + 2.0;
-        let bodies: Vec<([f32; 2], f32)> = self
+        // The creature the walker is making for is not walked round: it stops against it.
+        let goal = me.commands.first().and_then(|c| c.target);
+        let bodies: Vec<([f32; 2], f32, bool)> = self
             .world
             .objects
             .values()
@@ -2318,6 +2325,7 @@ impl Sim {
                 (
                     [o.position[0], o.position[1]],
                     mine + self.capsule_radius(o.id),
+                    Some(o.id) != goal,
                 )
             })
             .collect();
@@ -2333,7 +2341,7 @@ impl Sim {
         for _ in 0..SLIDE_PASSES {
             let first = bodies
                 .iter()
-                .filter_map(|&(c, r)| slide_circle(at, d, c, r))
+                .filter_map(|&(c, r, round)| slide_circle(at, d, c, r, round))
                 .min_by(|x, y| x.0.total_cmp(&y.0));
             let Some((_, q, rest)) = first else {
                 return hit.then_some([at[0] + d[0], at[1] + d[1], b[2]]);
