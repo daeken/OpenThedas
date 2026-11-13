@@ -153,6 +153,9 @@ pub enum FrontEnd {
     StartMenu,
     /// Exit the game.
     Quit,
+    /// The game menu's "Report Issue" (its online-features button, relabelled; see
+    /// `UiLayer::front_end_message`): an issue report, as F8 makes one.
+    Report,
 }
 
 impl std::fmt::Debug for FrontEnd {
@@ -162,6 +165,7 @@ impl std::fmt::Debug for FrontEnd {
             FrontEnd::Load(b) => write!(f, "Load({} bytes)", b.len()),
             FrontEnd::StartMenu => write!(f, "StartMenu"),
             FrontEnd::Quit => write!(f, "Quit"),
+            FrontEnd::Report => write!(f, "Report"),
         }
     }
 }
@@ -212,6 +216,21 @@ fn splash_pass(
     }
 }
 
+/// The message the engine's own text box's buttons send: `<id> <button, from 1>`. The app
+/// adds the text typed (see [`UiLayer::ask_text`]).
+const TEXT_POPUP_RESULT: &str = "OpenThedas.TextPopupResult";
+
+/// The answer to the engine's own text box ([`UiLayer::ask_text`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextAnswer {
+    /// The id it was asked with.
+    pub id: u32,
+    /// OK (true) or Cancel.
+    pub accepted: bool,
+    /// What was typed.
+    pub text: String,
+}
+
 /// A message floaty up over a creature.
 struct Floaty {
     id: u32,
@@ -259,6 +278,10 @@ pub struct UiLayer {
     /// it has waited for its values to reach the popup layer (see
     /// [`UiLayer::show_script_popup`]).
     script_popup: Option<((i32, i32, u32), u8)>,
+    /// The engine's own text box up (see [`UiLayer::ask_text`]): its id and the frames
+    /// since its values were set, and the answers not yet taken.
+    text_popup: Option<(u32, u8)>,
+    text_answers: Vec<TextAnswer>,
     /// A party portrait was clicked (see [`UiLayer::mouse_button`]).
     portrait_clicked: Option<u32>,
     /// The large notification whose splash has been dealt with (see
@@ -596,6 +619,8 @@ impl UiLayer {
             tooltip_text: None,
             tooltip_relayout: 0,
             script_popup: None,
+            text_popup: None,
+            text_answers: Vec::new(),
             portrait_clicked: None,
             uber_splash: None,
             loading: None,
@@ -652,6 +677,16 @@ impl UiLayer {
         match name {
             "GameModeController.PushGUIScreen" if first == Some("Options") => {
                 screens.menu = Some(Screen::Options);
+            }
+            // The game menu's online-features button ("Player Profile", for the original's
+            // online service, which this game does not have) is the issue report's: the
+            // menu closes and the report is made of the game behind it.
+            "GameModeController.PushGUIScreen"
+                if first == Some("GUICommunityFeatures")
+                    && screens.menu == Some(Screen::GameMenu) =>
+            {
+                screens.menu = None;
+                self.requests.push(FrontEnd::Report);
             }
             "GameModeController.HideGUIScreen" if first == Some("MainMenu") => {
                 if screens.menu == Some(Screen::GameMenu) {
@@ -967,6 +1002,71 @@ impl UiLayer {
                 m.set_multiply_pass(Some(pass));
             }
             self.uber_splash = Some(head);
+        }
+    }
+
+    /// Asks the player for a line of text with the game's own message box (popuplayer.gfx,
+    /// as a script's `ShowPopup` with a text field shows it): `prompt` over a text field
+    /// holding `text`, and OK / Cancel buttons (`ok`, `cancel`; the pad's A and B press
+    /// them). Nothing goes through the simulation; the answer comes back from
+    /// [`UiLayer::take_text_answers`] with `id`. It shows once its values have reached the
+    /// movie, two frames on, and replaces one still up. Needs the popup layer (the HUD).
+    pub fn ask_text(&mut self, id: u32, prompt: &str, text: &str, ok: &str, cancel: &str) {
+        use thedas_ui::UiValue;
+        let k = "GUIPopupLayer";
+        let b = &self.stage.bridge;
+        b.set_value(
+            &format!("{k}.DialogBoxText"),
+            UiValue::String(prompt.into()),
+        );
+        b.set_value(&format!("{k}.NumButtons"), UiValue::Number(2.0));
+        b.set_value(&format!("{k}.InputBox"), UiValue::Number(1.0));
+        b.set_value(&format!("{k}.InputText"), UiValue::String(text.into()));
+        b.set_value(&format!("{k}.Checkbox"), UiValue::Number(0.0));
+        for e in [
+            "CheckboxText",
+            "CheckboxControlledAttribute",
+            "PickerList",
+            "PickerDescriptions",
+        ] {
+            b.set_value(&format!("{k}.{e}"), UiValue::String(String::new()));
+        }
+        b.set_value(&format!("{k}.PickerDefault"), UiValue::Number(0.0));
+        b.set_value(&format!("{k}.Filter"), UiValue::Number(0.0));
+        for (i, label) in [ok, cancel].into_iter().enumerate() {
+            b.set_value(&format!("{k}.Label{i}"), UiValue::String(label.into()));
+            b.set_value(
+                &format!("{k}.Callback{i}"),
+                UiValue::String(format!("{TEXT_POPUP_RESULT} {id} {}", i + 1)),
+            );
+        }
+        self.text_popup = Some((id, 0));
+    }
+
+    /// The answers to [`UiLayer::ask_text`] since last asked.
+    pub fn take_text_answers(&mut self) -> Vec<TextAnswer> {
+        std::mem::take(&mut self.text_answers)
+    }
+
+    /// Shows the engine's own text box once its values have reached the movie.
+    fn show_text_popup(&mut self) {
+        let Some((_, frames)) = self.text_popup.as_mut() else {
+            return;
+        };
+        if *frames >= 2 {
+            return;
+        }
+        *frames += 1;
+        if *frames == 2 {
+            let up = self.stage.call_in(
+                thedas_ui::stage::POPUP_LAYER,
+                "_global.PopupLayer.ShowDialogBoxFromGame",
+                &[],
+            );
+            if up.is_none() {
+                log::warn!("ui: a text box with no popup layer up");
+                self.text_popup = None;
+            }
         }
     }
 
@@ -1371,6 +1471,7 @@ impl UiLayer {
         self.write_settings();
         self.show_cutscene_line(sim);
         self.show_script_popup(sim);
+        self.show_text_popup();
         self.select_clicked_portrait(sim);
         self.uber_alert_splash(sim);
         self.loading_frame(dt_ms);
@@ -1379,6 +1480,28 @@ impl UiLayer {
         // A script message box's answer carries the text typed into it, which the box set
         // as `GUIPopupLayer.InputText` just before (popuplayer.gfx's `OnButtonAction`); the
         // exe passes it on as the result event's string 0 (0x709971).
+        // The engine's own text box answered: taken here, with what was typed.
+        messages.retain(|m| match m {
+            GameMessage::Send(name, args) if name == TEXT_POPUP_RESULT => {
+                let typed = match self.stage.bridge.value("GUIPopupLayer.InputText") {
+                    Some(thedas_ui::UiValue::String(s)) => s,
+                    _ => String::new(),
+                };
+                let num = |i: usize| args.get(i).and_then(|a| a.trim().parse::<u32>().ok());
+                if let (Some(id), Some(button)) = (num(0), num(1)) {
+                    self.text_answers.push(TextAnswer {
+                        id,
+                        accepted: button == 1,
+                        text: typed,
+                    });
+                }
+                if self.text_popup.is_some_and(|(up, _)| Some(up) == num(0)) {
+                    self.text_popup = None;
+                }
+                false
+            }
+            _ => true,
+        });
         for m in &mut messages {
             if let GameMessage::Send(name, args) = m {
                 if name == thedas_ui::input::SCRIPT_DIALOG_RESULT {

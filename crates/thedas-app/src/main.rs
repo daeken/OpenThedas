@@ -1170,6 +1170,14 @@ impl App {
             dt,
         );
         self.requests.append(&mut g.ui.requests);
+        for a in g.ui.take_text_answers() {
+            log::info!(
+                "text box {}: {} {:?}",
+                a.id,
+                if a.accepted { "OK" } else { "Cancel" },
+                a.text
+            );
+        }
         // An ability aimed at a place shows where it would land, under the interface.
         if let Some(live) = self.live.as_mut() {
             let mut lines = live.reticle(&self.camera, size, self.cursor);
@@ -1277,6 +1285,14 @@ impl App {
             dt,
         );
         self.requests.append(&mut g.ui.requests);
+        for a in g.ui.take_text_answers() {
+            log::info!(
+                "text box {}: {} {:?}",
+                a.id,
+                if a.accepted { "OK" } else { "Cancel" },
+                a.text
+            );
+        }
         Ok(())
     }
 
@@ -1733,6 +1749,12 @@ impl App {
                 }
                 log.push(format!("floaty {text:?}"));
             }
+            Step::AskText(prompt) => {
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.ask_text(0, prompt, "", "OK", "Cancel");
+                }
+                log.push(format!("asktext {prompt:?}"));
+            }
             Step::Use(tag) => {
                 if let Some(l) = self.live.as_ref() {
                     let mut sim = l.sim();
@@ -2078,6 +2100,8 @@ impl App {
                     self.quit = true;
                     continue;
                 }
+                // The issue report (the reporting stream makes it, as F8 does).
+                ui::FrontEnd::Report => continue,
                 ui::FrontEnd::NewGame => live::Start::NewGame,
                 ui::FrontEnd::Load(b) => live::Start::SaveBytes(b),
                 ui::FrontEnd::StartMenu => live::Start::Menu,
@@ -3153,6 +3177,9 @@ enum Step {
     /// A floating message over the controlled creature, as a script's
     /// `DisplayFloatyMessage` makes one (`floaty 12`), for trying the floaty layer headless.
     Floaty(String),
+    /// The engine's own text box (`asktext Describe the issue`), as
+    /// `ui::UiLayer::ask_text` shows it; its answer is logged.
+    AskText(String),
     /// Sets a plot flag as a script would (`plot plt_tut_explore 0`), running the plot's
     /// script, for trying journal entries and tutorial popups headless.
     Plot(String, i32),
@@ -3358,6 +3385,7 @@ fn parse_step(s: &str) -> Result<Step> {
             Step::SetValue(k.to_string(), v.trim().to_string())
         }
         "floaty" => Step::Floaty(arg.to_string()),
+        "asktext" => Step::AskText(arg.trim().to_string()),
         "training" => Step::Training(arg.trim().to_ascii_uppercase()),
         "trainingmode" => {
             Step::TrainingMode(arg.trim().parse().context("trainingmode takes a number")?)
@@ -3758,6 +3786,14 @@ fn main() -> Result<()> {
                                     println!("aiming ability {}", aim.ability);
                                     l.aiming = Some(aim);
                                 }
+                                for a in layer.take_text_answers() {
+                                    println!(
+                                        "text box {}: {} {:?}",
+                                        a.id,
+                                        if a.accepted { "OK" } else { "Cancel" },
+                                        a.text
+                                    );
+                                }
                                 layer.update_minimap(&l.sim, &camera);
                                 // Headless, the interface's cover of the cursor is not
                                 // checked (its movies are drawn only for the capture).
@@ -3880,6 +3916,12 @@ fn main() -> Result<()> {
                         test_floaty(&mut l.sim(), text);
                         println!("floaty {text:?}");
                     }
+                    Step::AskText(prompt) => {
+                        if let Some((layer, _)) = played.as_mut() {
+                            layer.ask_text(0, prompt, "", "OK", "Cancel");
+                        }
+                        println!("asktext {prompt:?}");
+                    }
                     Step::Use(tag) => {
                         let mut sim = l.sim();
                         let who = sim.world.controlled();
@@ -3998,7 +4040,7 @@ fn main() -> Result<()> {
                     for r in std::mem::take(&mut layer.requests) {
                         println!("front end: {r:?}");
                         let start = match &r {
-                            ui::FrontEnd::Quit => continue,
+                            ui::FrontEnd::Quit | ui::FrontEnd::Report => continue,
                             ui::FrontEnd::NewGame => live::Start::NewGame,
                             ui::FrontEnd::Load(b) => live::Start::SaveBytes(b),
                             ui::FrontEnd::StartMenu => live::Start::Menu,
