@@ -84,7 +84,7 @@ pub fn base_url() -> Option<String> {
     if !crate::upload::online() {
         return None;
     }
-    let text = std::fs::read_to_string(crate::saves::data_dir().join(URL_FILE)).ok()?;
+    let text = crate::upload::setup_file(URL_FILE)?;
     let url = text.trim();
     if !url.starts_with("https://") {
         log::warn!("update: {URL_FILE} does not hold an https address");
