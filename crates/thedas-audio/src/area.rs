@@ -21,6 +21,19 @@ pub struct AreaSound {
     /// `FadeIn`, +0x488 `FadeOut`). Most sounds fade out over 34 ms.
     pub fade_in_ms: u32,
     pub fade_out_ms: u32,
+    /// The sound's cone: its facing (the orientation turning +Y, the engine's facing vector
+    /// at object +0x130, whose angle is `atan2(-x, y)`, 0x4ee570), which the sound start
+    /// gives the event as its orientation (0x694ce0 -> 0x7c2040 -> the event's slot 0x68,
+    /// 0x5bf660), the inside and outside angles that replace the event's (`ConeInside`,
+    /// `ConeOutside`, 0x7c265b..0x7c266b), and the gain on the event's outside level
+    /// (`ConeVolume` dB when 0 or below, silent under 0.001; above 0 it is left alone,
+    /// 0x7c266f..0x7c26c8). 360 degrees is no cone.
+    ///
+    /// Provisional: that the loader turns the `.are` orientation into that facing vector.
+    pub forward: [f32; 3],
+    pub cone_inside: f32,
+    pub cone_outside: f32,
+    pub cone_outside_gain: f32,
     /// The audio volume it belongs to, for a sound of a volume's own `SoundList` (see
     /// [`SoundRegion`]); `None` for the area's.
     pub region: Option<SoundRegion>,
@@ -161,6 +174,35 @@ pub fn area_audio(data: &[u8]) -> (Option<String>, Vec<AreaSound>) {
                 pitch: num(s, "Pitch").unwrap_or(0.0),
                 fade_in_ms: num(s, "FadeIn").unwrap_or(0.0).max(0.0) as u32,
                 fade_out_ms: num(s, "FadeOut").unwrap_or(0.0).max(0.0) as u32,
+                forward: {
+                    // +Y turned by the orientation (x, y, z, w).
+                    let (x, y, z, w) = (
+                        num(s, "XOrientation").unwrap_or(0.0),
+                        num(s, "YOrientation").unwrap_or(0.0),
+                        num(s, "ZOrientation").unwrap_or(0.0),
+                        num(s, "WOrientation").unwrap_or(1.0),
+                    );
+                    let n = (x * x + y * y + z * z + w * w).sqrt();
+                    if n > 1e-6 {
+                        let (x, y, z, w) = (x / n, y / n, z / n, w / n);
+                        [
+                            2.0 * (x * y - w * z),
+                            1.0 - 2.0 * (x * x + z * z),
+                            2.0 * (y * z + w * x),
+                        ]
+                    } else {
+                        [0.0, 1.0, 0.0]
+                    }
+                },
+                cone_inside: num(s, "ConeInside").unwrap_or(360.0),
+                cone_outside: num(s, "ConeOutside").unwrap_or(360.0),
+                cone_outside_gain: match num(s, "ConeVolume").unwrap_or(1.0) {
+                    v if v > 0.0 => 1.0,
+                    v => {
+                        let g = 10f32.powf(v / 20.0);
+                        if g > 0.001 { g } else { 0.0 }
+                    }
+                },
                 region: region.clone(),
             });
         }
@@ -475,6 +517,11 @@ mod tests {
                     id: 6,
                     fields: vec![
                         f("Active", Value::Byte(0)),
+                        f("ConeInside", Value::Float(160.0)),
+                        f("ConeOutside", Value::Float(180.0)),
+                        f("ConeVolume", Value::Float(-60.0)),
+                        f("ZOrientation", Value::Float(-1.0)),
+                        f("WOrientation", Value::Float(0.0)),
                         f("FadeOut", Value::Dword(34)),
                         f("MaxDistanceMult", Value::Float(0.5)),
                         f("Pitch", Value::Float(-0.05)),
@@ -535,6 +582,11 @@ mod tests {
                 pitch: -0.05,
                 fade_in_ms: 0,
                 fade_out_ms: 34,
+                // Turned half way round: facing -Y; -60 dB outside is silent.
+                forward: [0.0, -1.0, 0.0],
+                cone_inside: 160.0,
+                cone_outside: 180.0,
+                cone_outside_gain: 0.0,
                 region: None,
             }
         );

@@ -144,6 +144,16 @@ pub struct LiveEffects {
     renderer: AreaRenderer,
 }
 
+/// The selection rings under creatures, as a scene of their own drawn after the level and
+/// before the creatures (see [`crate::rings`]).
+pub struct LiveRings {
+    /// Each ring's creature and model.
+    key: Vec<(ObjectId, String)>,
+    layout: String,
+    scene: AreaScene,
+    renderer: AreaRenderer,
+}
+
 pub struct Live {
     /// Shared with the interface, whose movies act on it as they send messages.
     pub sim: Arc<Mutex<Sim>>,
@@ -155,6 +165,9 @@ pub struct Live {
     pub level: Option<LiveLevel>,
     pub objects: Option<LiveObjects>,
     effects: Option<LiveEffects>,
+    rings: Option<LiveRings>,
+    /// The creature the mouse is over ([`Live::set_hovered`]).
+    hovered: Option<ObjectId>,
     /// When each lasting effect was first seen on its object (world milliseconds): the
     /// simulation does not keep when it was applied.
     effects_seen: std::collections::HashMap<(ObjectId, String), u64>,
@@ -537,6 +550,8 @@ impl Live {
             effects: None,
             effects_seen: Default::default(),
             effects_layout: None,
+            rings: None,
+            hovered: None,
             effects_animator: Animator::default(),
             animator: Animator::default(),
             camera_fade: Default::default(),
@@ -1479,6 +1494,20 @@ impl Live {
             models.push(m);
         }
         let kept = shown.kept;
+        // A cutscene's weapon draws and hidden actors.
+        let mut hidden = std::collections::HashSet::new();
+        for (id, show) in &posing {
+            if show.hidden {
+                hidden.insert(*id);
+            }
+            if let (Some((main, off)), Some(o), Some(m)) = (
+                show.weapons,
+                sim.world.get(*id),
+                models.iter_mut().find(|m| m.id == *id),
+            ) {
+                m.attached = thedas_ui::models::weapons_in_cutscene(&sim, o, main, off);
+            }
+        }
         // Who looks at whom, from where the creatures were last drawn.
         self.looks.prepare(&sim);
         let pairs = crate::looks::pairs(&sim);
@@ -1620,7 +1649,11 @@ impl Live {
         );
         objects.follow_poses();
         for (i, m) in models.iter().enumerate() {
-            let o = self.opacity.get(&m.id).copied().unwrap_or(1.0);
+            let o = if hidden.contains(&m.id) {
+                0.0
+            } else {
+                self.opacity.get(&m.id).copied().unwrap_or(1.0)
+            };
             objects.renderer.set_prop_opacity(ctx, &objects.scene, i, o);
         }
         self.posed = models
@@ -1628,7 +1661,107 @@ impl Live {
             .zip(posed)
             .map(|(m, (t, c))| (m.id, t, c))
             .collect();
-        self.show_effects(ctx, format, &layout, &models)
+        self.show_effects(ctx, format, &layout, &models)?;
+        self.show_rings(ctx, format, &layout, &models)
+    }
+
+    /// Shows the selection rings of the creatures drawn (see [`crate::rings`]): a scene of
+    /// the rings' models, rebuilt when a ring comes, goes or changes, each moved under its
+    /// creature every time.
+    fn show_rings(
+        &mut self,
+        ctx: &GpuContext,
+        format: wgpu::TextureFormat,
+        layout: &str,
+        models: &[ObjectModel],
+    ) -> Result<()> {
+        let hovered = self.hovered;
+        let wanted: Vec<(ObjectId, String)> = {
+            let sim = self.sim();
+            models
+                .iter()
+                .filter_map(|m| {
+                    let o = sim.world.get(m.id)?;
+                    let row = crate::rings::row(&sim, o, hovered)?;
+                    let model = crate::rings::model(&sim, row, sim.body_radius(m.id))?;
+                    Some((m.id, model))
+                })
+                .collect()
+        };
+        if wanted.is_empty() {
+            self.rings = None;
+            return Ok(());
+        }
+        let current = self
+            .rings
+            .as_ref()
+            .is_some_and(|r| r.key == wanted && r.layout == layout);
+        if !current {
+            let started = std::time::Instant::now();
+            let ring_models: Vec<ObjectModel> = wanted
+                .iter()
+                .enumerate()
+                .map(|(i, (id, model))| ObjectModel {
+                    id: crate::rings::RING_IDS + i as ObjectId,
+                    tag: format!("ring of {id}"),
+                    kind: thedas_sim::world::ObjectKind::Placeable,
+                    models: vec![model.clone()],
+                    attached: Vec::new(),
+                    tints: Vec::new(),
+                    morph: None,
+                    hide_hair: false,
+                    effects: Vec::new(),
+                    motion: None,
+                    position: [0.0; 3],
+                    facing: 0.0,
+                })
+                .collect();
+            let vfs = self
+                .level
+                .as_ref()
+                .map(|l| l.vfs.clone())
+                .context("rings before their level")?;
+            let spec = self.spec(format);
+            let props: Vec<Prop> = ring_models.iter().map(prop).collect();
+            let scene = AreaScene::load_objects_cached(
+                &vfs,
+                layout,
+                &props,
+                spec.detail,
+                &mut self.cache.scenes,
+            )?;
+            let programs = crate::programs_cached(&vfs, &scene, &spec.shaders, &mut self.cache)?;
+            let mut renderer = AreaRenderer::new_cached(
+                ctx,
+                &vfs,
+                &scene,
+                &programs,
+                spec.format,
+                &mut self.cache,
+            );
+            renderer.set_time(self.shader_time);
+            log::debug!(
+                "{layout}: {} rings, {} draws, built in {:.1} ms: {:?}",
+                wanted.len(),
+                scene.draws.len(),
+                started.elapsed().as_secs_f64() * 1000.0,
+                wanted
+            );
+            self.rings = Some(LiveRings {
+                key: wanted,
+                layout: layout.to_string(),
+                scene,
+                renderer,
+            });
+        }
+        if let Some(rings) = self.rings.as_mut() {
+            for (i, (id, _)) in rings.key.iter().enumerate() {
+                if let Some((_, transform, _)) = self.posed.iter().find(|p| p.0 == *id) {
+                    rings.renderer.move_prop(ctx, &rings.scene, i, *transform);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Builds the objects' visual effects' scene when the effects on them change, and places
@@ -1832,6 +1965,11 @@ impl Live {
         level
             .renderer
             .render_main(ctx, encoder, target, width, height, camera);
+        if let Some(r) = self.rings.as_mut() {
+            let depth = level.renderer.depth(&ctx.device, width, height);
+            r.renderer
+                .render_over(ctx, encoder, target, width, height, camera, &depth);
+        }
         if let Some(o) = self.objects.as_mut() {
             let depth = level.renderer.depth(&ctx.device, width, height);
             o.renderer
@@ -1935,9 +2073,10 @@ impl Live {
         };
         level.renderer.cut_effects = cut_effects;
         let mut overlays: Vec<&mut AreaRenderer> = self
-            .objects
+            .rings
             .iter_mut()
-            .map(|o| &mut o.renderer)
+            .map(|r| &mut r.renderer)
+            .chain(self.objects.iter_mut().map(|o| &mut o.renderer))
             .chain(self.effects.iter_mut().map(|e| &mut e.renderer))
             .collect();
         Ok(Some(level.renderer.capture_with(
@@ -2288,6 +2427,57 @@ impl Live {
             Some(g) if origin.distance(glam::Vec3::from_array(g)) < t => None,
             _ => Some(id),
         }
+    }
+
+    /// Tells the world which creature the mouse is over, as the interface has it (none
+    /// while the interface covers the cursor): its ring shows it (see [`crate::rings`]).
+    pub fn set_hovered(&mut self, hovered: Option<ObjectId>) {
+        self.hovered = hovered;
+    }
+
+    /// What the mouse is over for its cursor (see [`crate::cursor`]), by what a click there
+    /// would do ([`Live::click`]): `None` over the ground, a body or nothing.
+    pub fn hover_over(
+        &mut self,
+        origin: glam::Vec3,
+        dir: glam::Vec3,
+    ) -> Option<crate::cursor::Over> {
+        use crate::cursor::Over;
+        let Some(Pick::Object(id)) = self.pick(origin, dir) else {
+            return None;
+        };
+        let shared = self.sim.clone();
+        let sim = shared.lock().unwrap_or_else(|p| p.into_inner());
+        let o = sim.world.get(id)?;
+        match o.kind {
+            thedas_sim::world::ObjectKind::Creature if o.dead => None,
+            thedas_sim::world::ObjectKind::Creature => {
+                let leader = sim.world.controlled();
+                let party = thedas_sim::engine::party_of(&sim);
+                Some(if party.contains(&id) {
+                    Over::Creature
+                } else if leader.is_some_and(|l| sim.hostile(l, id)) {
+                    Over::Hostile
+                } else if o.dialog.is_some() {
+                    Over::Talker
+                } else {
+                    Over::Creature
+                })
+            }
+            thedas_sim::world::ObjectKind::Placeable => Some(Over::Placeable(
+                sim.placeable_cursor(id).unwrap_or_default(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Whether an ability waits for its target, and whether it is aimed at a place.
+    pub fn aim(&self) -> Option<crate::cursor::Aim> {
+        let aim = self.aiming.as_ref()?;
+        let sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
+        Some(crate::cursor::Aim {
+            place: sim.ability_targets_place(aim.ability),
+        })
     }
 
     /// Orders the party leader as a click on `pick` does: lead with a party member, attack a
