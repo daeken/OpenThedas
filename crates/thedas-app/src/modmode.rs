@@ -362,7 +362,7 @@ impl ModMode {
         self.convs.window(ctx, &mut asked);
         self.actions.extend(asked.into_iter().map(Action::Conv));
         let mut asked = Vec::new();
-        self.world.window(ctx, &mut asked);
+        self.world.window(ctx, &self.convs.history, &mut asked);
         self.actions.extend(asked.into_iter().map(Action::World));
     }
 
