@@ -23,7 +23,7 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
    - Also done: the music director's cues per game mode (0x5bb630): explore `main`, combat `combat` (6 s late when it follows the interface, dialog or a cutscene), dialog and cutscenes `main` (except one after the other), death `Death`, the interface and loading keep the track.
    - Provisional: our combat and interface modes come from the party's fighting and the menus up, not from game modes the simulation keeps.
    - Medium.
-5. **Death and party-wipe music.** The `Death` track plays when the game is over; exactly when the original switches isn't traced. Small.
+5. **Death and party-wipe music.** Done: the music director cues `Death` when the game mode becomes dead (0x5bb84e), and the change is immediate (0x5c4c69). Provisional: our dead mode is the simulation's game-over flag.
 6. **Other main-menu music** (after the credits, DLC menus). Only `music/_menu` is wired. Small.
 7. **Credits music** (exe string `credits_df`). Not wired. Small.
 
@@ -35,9 +35,12 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
    - Not applied: `Priority`, `Occludable`.
    - Medium.
 9. **Occlusion.**
-   - Original: imports `Event::set3DOcclusion`, and sounds have an `Occludable` flag, so they are muffled behind geometry.
-   - Ours: nothing.
-   - Large; needs collision geometry from the sim or render side.
+   - Done for placed sounds: each frame, for an event flagged `Occludable` within 1.25 times its reach, a physics ray is cast from the listener to the source through placeables, static geometry and a third shape group (mask 0x1024; 0x5b7220 -> 0xa2c700). Occlusion starts at 0 and each hit adds `(1 - occlusion) * a`.
+   - For a sphere, box or capsule, `a` is how far inside the shape's outline the ray passes, in degrees over 45 (0x828400), times the surface's percentage for static geometry (`sound_geometry_mat_types.gda` column 0xae2b65f5: stone and metal 100, wood 40, grass 10, unknown 0). The surface is the model's root node's sound material (`.phy` field 6330). A placeable gives its type's value (`placeable_types.gda` column 0x913e3094: doors 0.4 to 0.7). A triangle mesh adds nothing, except that a static hit within 0.5 m of an earlier one counts in full.
+   - The result moves at 1.2 per second into the event's occlusion (0x5b6eb0); the reverb's occlusion stays 0.
+   - Ours reads the `.phy` shapes the simulation already loads (`Collision::ray_hits`, read-only).
+   - Provisional: the box's angle (the exe picks a corner by a score not decoded; ours takes the corner nearest the hit); the third shape group (0x1000) is not identified; the 0.5 m rule's distance is measured from the listener; doors occlude only while closed; occlusion is applied as a gain of `1 - occlusion` with no low-pass; only placed sounds are tested (how other events get the flag is not traced).
+   - Not checked against a recording of the original.
 10. **Audio volume triggers (Type 4, CCTriggerAudioVolume).**
     - Their reverb is applied (#279).
     - Their `SoundList` plays (0x79a000; about 11,900 sounds in 2,829 volumes): each sound stands at the volume, and while the listener is near it follows the listener, at the listener while the party leader is inside and at the volume's nearest point otherwise (0x7c2ee0).
@@ -55,7 +58,7 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
 15. **VO timing and lip-sync.** Check that conversation timing follows the line lengths as the original does. Not audio-only.
 16. **The sound-set player** is traced (#290: `sst` counts, shuffle bag, the roll, gender via 0x7f2b70).
     - Applied: the type's chance is scaled by how many lines the set has of it (`ss_probabilitymodif.gda`, table 0x119: 1 line 0.2, 2 0.33, 3 0.5, 4 0.8, 5 and more 1), for types flagged in `ss_types.gda` column 0x6ddd6b8b (0x6b59fe..0x6b5a5f).
-    - Not applied: a creature flag (+0x969) that makes a line certain.
+    - Not applied, and not needed for the shipped data: a creature flag (+0x969) that makes a line certain. It is set when the set's project carries the user property `Disable2DAProbabilities` (0x6bd1ed), which no shipped `.fev` does.
     - Small.
 17. **Event or sample for a sound-set line.** Inferred from the data: the event if it exists, otherwise the sample on `VOambient_ss`. Small.
 
@@ -75,7 +78,7 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
     - Projectile, impact and area-effect sounds tied to the visual-effect system are not handled.
     - Large; depends on the effects work.
 21. **Projectile flight and impact sounds** (bows, crossbows). Not done. Medium; depends on projectiles in sim and render.
-22. **Creature vocalisations outside sound sets.** Scripts call `PlaySoundSet`; any engine-driven vocals aren't checked. Small.
+22. **Creature vocalisations outside sound sets.** Checked: the exe's sound-set player (0x6b5740) is called only for scripts' `PlaySoundSet` (0x6625d3), the interface's previews and the party picker, so attack and pain grunts and death cries come from the combat scripts, not from engine code. Nothing to add on the audio side.
 23. **The level-of-detail gate** (0x7c4a80, #272).
     - Original: small and medium creatures at their lowest model level of detail make no footsteps or foley, except in dialog or cutscenes.
     - Ours: we gate only on whether the creature is drawn.
