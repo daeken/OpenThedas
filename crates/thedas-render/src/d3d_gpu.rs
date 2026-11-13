@@ -3152,6 +3152,50 @@ mod tests {
     }
 
     #[test]
+    fn added_lights_join_a_draws_pick_by_its_class() {
+        let light = |x: f32, domain: i64, intensity: f32| SceneLight::Point {
+            position: Vec3::new(x, 0.0, 0.0),
+            color: Vec3::ONE,
+            radius: 10.0,
+            name: String::new(),
+            domain: Some(domain),
+            is_static: true,
+            version: 0,
+            intensity,
+            room: None,
+        };
+        let own = vec![
+            light(1.0, DOMAIN_LEVEL, 1.0),
+            light(2.0, DOMAIN_CHARACTERS, 1.0),
+        ];
+        // A cutscene's light model: one light for characters, one for the level.
+        let mut all = own.clone();
+        all.extend([
+            light(3.0, DOMAIN_CHARACTERS, 0.5),
+            light(3.0, DOMAIN_LEVEL, 0.5),
+        ]);
+        let rooms = HashMap::new();
+        let sphere = (Vec3::ZERO, 1.0);
+        let xs = |lights: &[SceneLight], class, level_own| -> Vec<(f32, f32)> {
+            pick_as_built(lights, &rooms, class, sphere, None, level_own)
+                .points
+                .iter()
+                .map(|p| (p.0.x, p.2.x))
+                .collect()
+        };
+        // The level's own draws and the placeables take the level's; characters theirs.
+        assert_eq!(xs(&own, LightClass::Level, true), [(1.0, 1.0)]);
+        assert_eq!(xs(&all, LightClass::Level, true), [(1.0, 1.0), (3.0, 0.5)]);
+        assert_eq!(xs(&all, LightClass::Prop, false), [(1.0, 1.0), (3.0, 0.5)]);
+        assert_eq!(
+            xs(&all, LightClass::Character, false),
+            [(2.0, 1.0), (3.0, 0.5)]
+        );
+        // Taken away again, the pick is as the pass was made.
+        assert_eq!(xs(&all[..2], LightClass::Character, false), [(2.0, 1.0)]);
+    }
+
+    #[test]
     fn a_moved_object_repicks_its_lights_and_a_still_one_does_not() {
         let light = |x: f32, name: &str| SceneLight::Point {
             position: Vec3::new(x, 0.0, 0.0),
