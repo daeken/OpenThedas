@@ -30,7 +30,7 @@ pub struct SessionOptions {
 /// Opens the install and loads the module and area.
 pub fn open(o: &SessionOptions) -> Result<Sim, SimError> {
     let install = DaoInstall::open(&o.install)?;
-    let mut vfs = install.global_vfs(TextureQuality::High)?;
+    let mut vfs = install.play_vfs(TextureQuality::High)?;
     let (data, _) = vfs
         .read("script.ldf")
         .map_err(|_| SimError::NotFound("script.ldf".into()))?;
@@ -64,7 +64,7 @@ pub fn open(o: &SessionOptions) -> Result<Sim, SimError> {
 /// game's resources (strings, tables) and nothing running.
 pub fn open_bare(o: &SessionOptions) -> Result<Sim, SimError> {
     let install = DaoInstall::open(&o.install)?;
-    let vfs = install.global_vfs(TextureQuality::High)?;
+    let vfs = install.play_vfs(TextureQuality::High)?;
     let (data, _) = vfs
         .read("script.ldf")
         .map_err(|_| SimError::NotFound("script.ldf".into()))?;

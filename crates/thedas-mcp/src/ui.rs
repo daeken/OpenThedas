@@ -115,7 +115,7 @@ impl UiWorld {
             self.scene = None;
             let inst = thedas_vfs::DaoInstall::open(install).map_err(|e| e.to_string())?;
             let mut vfs = inst
-                .global_vfs(thedas_vfs::install::TextureQuality::High)
+                .play_vfs(thedas_vfs::install::TextureQuality::High)
                 .map_err(|e| e.to_string())?;
             inst.mount_level(&mut vfs, layout)
                 .map_err(|e| e.to_string())?;
