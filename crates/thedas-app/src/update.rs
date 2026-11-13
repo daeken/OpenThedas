@@ -438,9 +438,7 @@ pub fn verdict_prompt(report: &Path) -> String {
             format!(" in {} (\"{note}\")", s.place)
         })
         .unwrap_or_default();
-    format!(
-        "Is the problem you reported{what} fixed? Anything you write here goes with your answer."
-    )
+    format!("Is the problem you reported{what} fixed?")
 }
 
 /// The words for an offer's question.
