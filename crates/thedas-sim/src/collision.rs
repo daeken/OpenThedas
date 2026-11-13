@@ -290,6 +290,12 @@ pub struct Collision {
 const LEAF: usize = 4;
 
 impl Collision {
+    /// Collision made of triangles (tests).
+    #[cfg(test)]
+    pub(crate) fn from_triangles(tris: &[[V; 3]]) -> Self {
+        Self::build(tris.iter().map(|t| Prim::Tri(*t)).collect())
+    }
+
     fn build(mut prims: Vec<Prim>) -> Self {
         let mut c = Collision {
             prims: Vec::new(),
