@@ -437,7 +437,8 @@ impl Erf {
         Ok(data)
     }
 
-    /// Password recovered from the adjacent GOG installation, when the header digest matches.
+    /// The password read from the player's own `DAOrigins.exe` when it matches the header's
+    /// digest (see [`crate::gog_dlc`]; GOG Ultimate Edition layout only, provisional).
     pub fn installed_key(&self) -> Option<&DaoKey> {
         self.installed_key
             .get_or_init(|| match self.encryption {

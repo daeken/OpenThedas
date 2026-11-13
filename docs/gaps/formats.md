@@ -146,24 +146,8 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 
 ### Archives and encryption
 
-- **FMT-001** **GOG DLC passwords recovered.** In the tested GOG Ultimate Edition executable
-  (SHA-256 `2346caee611002d4dff6ecef68eb315b63a37004dd98b39c11a9c26c0b45bfb3`), the
-  routine at RVA `0x87840` selects an encoded string by ERF module ID. The character
-  conversion at RVA `0x8843a` is `(character - 'A') / 2`. The reader uses the jump table
-  at RVA `0x884f8` in the user's local executable and accepts the password when its
-  digest matches the archive. All 377 encrypted archives in that install matched across
-  24 module IDs. The Rust reader matched original x86 Blowfish output on one shipped
-  resource per module. The full `thedas corpus` run on macOS arm64 opened 10,652 archives
-  and reported zero encrypted skips and zero read errors. Other executable layouts and
-  the original entitlement fallback remain unverified.
-- **FMT-002** **Type 1 XOR and type 3 Blowfish readers implemented.** Type 1 takes the
-  same decimal password as DA:O Blowfish. Its nine-byte XOR cycle was checked by
-  executing the original DA:O instructions at RVA `0xeefe0` with a synthetic key.
-  DA2 type 3 takes raw key bytes and verifies the MD5 of the Blowfish ECB encryption
-  of bytes 0 through 255. The type 3 implementation follows
-  [xoreos's format description](https://github.com/xoreos/xoreos/blob/master/src/aurora/erffile.cpp#L198)
-  and was checked against an independent synthetic vector. Shipped type 1 and type 3
-  archives and automatic DA2 key discovery remain open.
+- **FMT-001** **DLC passwords only from the GOG Ultimate Edition executable.** Original: decrypts DLC ERF V2.2 with an offline password per ERF module ID, chosen by the routine at RVA `0x87840` (GOG build) and decoded as `(character - 'A') / 2` per digit. Ours: `gog_dlc` reads the encoded strings from the player's own `bin_ship/DAOrigins.exe` at run time (nothing is stored in the repository) and accepts a password only when its MD5 matches the archive's digest. Verified on the GOG Ultimate Edition build (SHA-256 `2346caee…bfb3`): all 377 encrypted archives, 24 module IDs, and `thedas corpus` read the 45,962 formerly skipped entries with no errors. The table is found at fixed file offsets (provisional), so other builds (Steam, EA, retail 1.04/1.05, other languages) are not recognised and their DLC stays unread, logged once; a pattern search for the routine would cover them. The online entitlement path is not traced. Evidence: `crates/thedas-vfs/src/gog_dlc.rs`. Size: M. Depends: none. Kind: unverified.
+- **FMT-002** **XOR (type 1) and DA2 Blowfish (type 3) checked only synthetically.** Original: ERF encryption types 1 and 3. Ours: both read. Type 1 takes the DA:O decimal password; its nine-byte XOR cycle matches the original DA:O instructions at RVA `0xeefe0` run with a synthetic key. Type 3 takes raw key bytes and checks the MD5 of the Blowfish ECB encryption of bytes 0–255, after xoreos's description (provisional), against a synthetic vector. No shipped type 1 or type 3 archive has been read, and DA2 keys are not discovered. Evidence: `crates/thedas-vfs/src/erf.rs`, `crates/thedas-vfs/src/crypto.rs`. Size: S. Depends: none. Kind: unverified.
 - **FMT-003** **LZMA and Xbox LZX compression unsupported.** Original: compression codes 2 and 3. Ours: `UnsupportedCompression`. Evidence: `crates/thedas-vfs/src/erf.rs:490`. Size: M. Depends: none. Kind: missing.
 - **FMT-004** **ERF V3.0 hash-only entries cannot be looked up.** Original: DA2 archives index by FNV hash. Ours: entries without a stored name are left out of the index. Evidence: `crates/thedas-vfs/src/vfs.rs:96`. Size: M. Depends: none. Kind: missing.
 - **FMT-005** **No ERF/RIM writer.** Original: n/a (mod packing). Ours: archives are read-only; the only writer is a test fixture. Evidence: `crates/thedas-vfs/src/erf.rs:584`. Size: M. Depends: none. Kind: missing.

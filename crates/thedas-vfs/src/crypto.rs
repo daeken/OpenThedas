@@ -44,7 +44,8 @@ impl DaoKey {
     }
 
     /// DA2 type 3 verifies the MD5 of the encrypted byte sequence 0 through 255.
-    /// This format is documented by xoreos. Validation against a shipped DA2 archive is pending.
+    /// Provisional: taken from xoreos's description of the format and checked only against a
+    /// synthetic vector; not yet against a shipped DA2 archive or the DA2 executable.
     pub(crate) fn da2_cipher(&self, digest: &[u8; 16]) -> Option<Blowfish> {
         let cipher = Blowfish::new_from_slice(&self.password).ok()?;
         let mut challenge = std::array::from_fn::<_, 256, _>(|i| i as u8);
