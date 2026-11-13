@@ -607,7 +607,7 @@ fn check_data(
                 .map(|_| ())
                 .ok_or_else(|| format!("not a conversation (file type {})", doc.file_type)),
         ),
-        (_, "cut") => Some({
+        (_, "cut" | "cl") => Some({
             // Every cutscene's tracks read, and the camera placed at each cut.
             let tracks = thedas_sim::cuttracks::Tracks::from_gff4(&doc);
             for &(at, _) in &tracks.cuts {
