@@ -1535,18 +1535,6 @@ impl D3dPass {
 
         let mut pending = Vec::new();
         for (di, d) in scene.draws.iter().enumerate() {
-            if std::env::var_os("THEDAS_DEBUG_DRAWS").is_some() && di >= scene.static_draws {
-                let m = &scene.materials[d.material];
-                eprintln!(
-                    "DRAW {di} mesh {} mao {} sem {} programs {:?}",
-                    scene.meshes[d.mesh].key,
-                    m.mao,
-                    m.semantic,
-                    material_programs
-                        .get(d.material)
-                        .map(|p| p.iter().map(|q| q.name.clone()).collect::<Vec<_>>())
-                );
-            }
             let Some(passes) = material_programs.get(d.material) else {
                 continue;
             };
