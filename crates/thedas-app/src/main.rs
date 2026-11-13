@@ -1100,22 +1100,7 @@ impl App {
             // Portraits are drawn by the objects' renderers, whose constants this frame's
             // draws use too: they are drawn (and submitted) before the frame is encoded, so
             // the frame is not drawn from the portrait camera.
-            if self.screens.is_some() {
-                let key = ui::portrait_key(&live.sim());
-                if g.ui.wants_portraits(key, dt) {
-                    let shots = live.portraits(&g.ctx, ui::PORTRAIT_SIZE);
-                    g.ui.set_portraits(shots);
-                }
-                let due = self
-                    .screens
-                    .as_ref()
-                    .and_then(|s| g.ui.wants_paperdoll(s, &live.sim(), dt));
-                if let Some((who, yaw)) = due {
-                    let (w, h) = ui::PAPERDOLL_SIZE;
-                    let shot = live.paperdoll(&g.ctx, who, yaw, w, h);
-                    g.ui.set_paperdoll(shot);
-                }
-            }
+            draw_likenesses(live, &mut g.ui, self.screens.as_ref(), &g.ctx, dt);
         }
         let size = (g.config.width, g.config.height);
         let drawn = match (self.live.as_mut(), g.renderer.as_mut()) {
@@ -1244,6 +1229,10 @@ impl App {
             if self.screens.is_some() {
                 loading_screen(live, &mut g.ui, &mut self.load_screen_up);
             }
+            // The party's portraits and the paperdoll are drawn into their own targets, so
+            // they are kept up with no frame to present too (a hidden window's portraits
+            // stayed empty, and a client's offscreen frame showed them so).
+            draw_likenesses(live, &mut g.ui, self.screens.as_ref(), &g.ctx, dt);
         }
         if self.live.is_none() {
             if let Some(r) = g.renderer.as_mut() {
@@ -2958,6 +2947,32 @@ fn travel_to_pin(sim: &mut thedas_sim::Sim, tag: &str) -> bool {
         })
         .map(|o| o.id);
     pin.is_some_and(|p| sim.begin_travel(p))
+}
+
+/// Draws the party's portraits and the paperdoll when they are due (see
+/// [`ui::UiLayer::wants_portraits`] and [`ui::UiLayer::wants_paperdoll`]), with the
+/// interface up.
+fn draw_likenesses(
+    live: &mut live::Live,
+    ui: &mut ui::UiLayer,
+    screens: Option<&screens::Screens>,
+    ctx: &GpuContext,
+    dt: f64,
+) {
+    let Some(screens) = screens else {
+        return;
+    };
+    let key = ui::portrait_key(&live.sim());
+    if ui.wants_portraits(key, dt) {
+        let shots = live.portraits(ctx, ui::PORTRAIT_SIZE);
+        ui.set_portraits(shots);
+    }
+    let due = ui.wants_paperdoll(screens, &live.sim(), dt);
+    if let Some((who, yaw)) = due {
+        let (w, h) = ui::PAPERDOLL_SIZE;
+        let shot = live.paperdoll(ctx, who, yaw, w, h);
+        ui.set_paperdoll(shot);
+    }
 }
 
 fn loading_screen(live: &live::Live, ui: &mut ui::UiLayer, up: &mut bool) {

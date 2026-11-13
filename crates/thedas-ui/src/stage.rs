@@ -222,8 +222,9 @@ fn add_book_backdrop(m: &mut UiMovie) {
 }
 /// The quickbar's movie.
 const QUICKBAR: &str = "quickbar.gfx";
-/// The frames quickbar.gfx takes to lay itself out before its width is put back.
-const QUICKBAR_SETTLE_FRAMES: u32 = 3;
+/// How long (the movie's time) quickbar.gfx is given to lay itself out, its width put back
+/// whenever it changes it.
+const QUICKBAR_SETTLE_MS: f64 = 500.0;
 
 /// The engine value holding how far the quickbar is dragged open (see [`Stage::new`]).
 pub const QUICKBAR_EXPAND_VALUE: &str = "Party.QuickbarExpandValue";
@@ -241,9 +242,9 @@ pub struct Stage {
     /// level-up mark, shown for its first frames) took that for a roll-over and left its
     /// tooltip up. Far off the stage until the mouse first moves.
     mouse: (f64, f64),
-    /// The quickbar's width as the engine held it when quickbar.gfx opened, put back after
-    /// the movie's first frame (see [`QUICKBAR_EXPAND_VALUE`]).
-    quickbar_width: Option<(UiValue, u32)>,
+    /// The quickbar's width as the engine held it when quickbar.gfx opened, put back while
+    /// the movie settles (see [`QUICKBAR_EXPAND_VALUE`]).
+    quickbar_width: Option<(UiValue, f64)>,
     /// Recent ActionScript traces and warnings, newest last (at most 500).
     pub log: Vec<String>,
     pub bridge: GameBridge,
@@ -359,7 +360,7 @@ impl Stage {
             self.quickbar_width = self
                 .bridge
                 .value(QUICKBAR_EXPAND_VALUE)
-                .map(|v| (v, QUICKBAR_SETTLE_FRAMES));
+                .map(|v| (v, QUICKBAR_SETTLE_MS));
         }
         let (swf, rep) = {
             let mut images = self
@@ -478,20 +479,25 @@ impl Stage {
             // quickbar.gfx's first frame places its expansion handle before the handle's
             // own init (Ruffle runs the clips' init in another order than Scaleform): the
             // handle sits at its authored place, the bar's full width, and the movie writes
-            // that back as the player's choice. The engine's value is put back and laid out
-            // again once that frame is done. Provisional: inferred from the movie's code
+            // that back as the player's choice. While the movie settles, the engine's value
+            // is put back and the bar laid out again whenever the movie has changed it. The
+            // window is the movie's own time: a tick does not always play a frame (a short
+            // one plays none), so counting ticks could end before that first frame, and the
+            // bar then stayed at its full width with six slots never filled in ("00" over
+            // "??"). Provisional: inferred from the movie's code
             // (`UpdateExpansionMaskPosition` before `ExpansionHandle_mc_init`).
             if m.name == QUICKBAR {
-                match self.quickbar_width.take() {
-                    Some((width, 0)) => {
+                if let Some((width, left)) = self.quickbar_width.take() {
+                    if self.bridge.value(QUICKBAR_EXPAND_VALUE).as_ref() != Some(&width) {
                         self.bridge.set_value(QUICKBAR_EXPAND_VALUE, width.clone());
                         m.call(
                             "_level0.QuickbarAndEffectBar_mc.Quickbar_mc.ExpandQuickbarFromGameData",
-                            &[width],
+                            std::slice::from_ref(&width),
                         );
                     }
-                    Some((width, n)) => self.quickbar_width = Some((width, n - 1)),
-                    None => {}
+                    if left > dt_ms {
+                        self.quickbar_width = Some((width, left - dt_ms));
+                    }
                 }
             }
             let messages: Vec<GameMessage> = m
