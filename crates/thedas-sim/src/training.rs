@@ -231,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn a_swap_ends_the_unequip_and_the_equip_steps() {
+    fn an_unequip_then_an_equip_end_both_steps_and_a_swap_ends_neither() {
         let ldf = "int EVENT_TYPE_TRAINING_BEGIN = 1059;\n\
                    int EVENT_TYPE_TRAINING_ITEM_UNEQUIPPED = 1070;\n\
                    int EVENT_TYPE_TRAINING_ITEM_EQUIPPED = 1071;\n\
@@ -244,8 +244,14 @@ mod tests {
         s.add_script(TRAINING_SCRIPT, arms_equip_step());
         s.set_training_mode(5);
         s.begin_training_step(7, 1070, 4);
-        // The equip's unequip of the worn chest piece, then the equip itself, with nothing
-        // run in between: the first arms the step the second ends.
+        // A swap (equipping over the worn chest piece) raises only ITEM_EQUIPPED: the
+        // displaced item is not an unequip (DAOrigins.exe's container Add removes it, not
+        // the unequip routine; see `Sim::displace`). The unequip step stays armed.
+        assert!(!s.training_event("ITEM_EQUIPPED", 4));
+        assert_eq!(s.world.training.step, 7);
+        assert_eq!(s.world.training.expected, 1070);
+        // Taking the piece off, then putting one on, with nothing run in between: the
+        // first is delivered at once and arms the step the second ends.
         assert!(s.training_event("ITEM_UNEQUIPPED", 4));
         assert_eq!(s.world.training.step, 10);
         assert_eq!(s.world.training.expected, 1071);
