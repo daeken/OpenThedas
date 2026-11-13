@@ -74,9 +74,19 @@ pub fn last(targets: &[FocusTarget]) -> Option<usize> {
 /// The movie of the screens' tab bar (navbar.gfx), which LB and RB already work.
 pub const TAB_BAR: &str = "navbar.gfx";
 
-/// Where a screen's focus starts: its first button ([`first`]) outside the tab bar and other
-/// than its Close or Back (B's), or the first of all when it has nothing else.
+/// Where a screen's focus starts: the first entry of its item list when it has one, else its
+/// first button ([`first`]) outside the tab bar and other than its Close or Back (B's), or
+/// the first of all when it has nothing else.
 pub fn first_content(targets: &[FocusTarget]) -> Option<usize> {
+    // A list of items (the inventory's, a store's) is what the screen is for: the focus
+    // starts on its first entry, not on the sort picker or the tabs above it.
+    let entries: Vec<usize> = (0..targets.len())
+        .filter(|&i| targets[i].path.contains(".ItemEntry"))
+        .collect();
+    if !entries.is_empty() {
+        let picked: Vec<FocusTarget> = entries.iter().map(|&i| targets[i].clone()).collect();
+        return first(&picked).map(|j| entries[j]);
+    }
     let content: Vec<usize> = (0..targets.len())
         .filter(|&i| targets[i].movie != TAB_BAR && !is_back(&targets[i]))
         .collect();
