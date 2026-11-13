@@ -327,6 +327,23 @@ impl Vfs {
         hash
     }
 
+    /// Rewrites the labels of the layers at or above `from`.
+    pub fn relabel(&mut self, from: usize, f: impl Fn(&str) -> String) {
+        for l in self.layers.iter_mut().skip(from) {
+            l.label = f(&l.label);
+        }
+    }
+
+    /// How many files a layer of this stack holds (archive entries, or loose files), counting
+    /// ones a higher layer hides. 0 for a layer that does not exist.
+    pub fn layer_files(&self, layer: usize) -> usize {
+        match self.layers.get(layer).map(|l| &l.source) {
+            Some(LayerSource::Archive { erf, .. }) => erf.entries.len(),
+            Some(_) => self.dir_files[layer].len(),
+            None => 0,
+        }
+    }
+
     /// The current top of the stack, for a later [`Vfs::truncate`].
     pub fn mark(&self) -> usize {
         self.layers.len()
