@@ -930,8 +930,20 @@ impl Sim {
                 }
                 continue;
             }
-            // One cutscene at a time: the next waits for the one playing.
-            if !self.world.cutscenes.is_empty() && self.world.cutscene.is_none() {
+            // One cutscene at a time: the next waits for the one playing. It also waits for
+            // the events due now: DAOrigins.exe switches to the cutscene or conversation mode
+            // at the start of the next update (0x641d30), after the update that asked for it
+            // has dispatched its events, so an area's load events (SPECIAL, PRELOADEXIT,
+            // POSTLOADEXIT, the hero's ENTER) all run before a cutscene the first of them
+            // queued. The City Elf's house dresses the hero and Shianni in those later
+            // events, before `start_wake` shows them.
+            let events_due = self
+                .world
+                .queue
+                .keys()
+                .next()
+                .is_some_and(|k| k.0 <= self.world.time_ms);
+            if !self.world.cutscenes.is_empty() && self.world.cutscene.is_none() && !events_due {
                 let name = self.world.cutscenes.remove(0);
                 let res = crate::cutscene::Cutscene::resource(&name);
                 let from_dialog = match self.world.dialog_cutscenes.iter().position(|n| *n == res) {
