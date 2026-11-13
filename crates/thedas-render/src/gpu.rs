@@ -514,6 +514,13 @@ pub struct AreaRenderer {
     pub effects_epoch: Option<f64>,
     /// The distortion effect's targets, made when a frame first has distortion to draw.
     distortion: Option<crate::distortion::Distortion>,
+    /// The frame buffer effects the cutscene playing has running, which
+    /// [`AreaRenderer::finish_frame_with`] draws (see [`crate::cut_effects`]); the caller
+    /// sets them each frame, and empties them when no cutscene plays.
+    pub cut_effects: crate::cut_effects::CutEffects,
+    cut_pass: Option<crate::cut_effects::CutEffectsPass>,
+    /// The projection the frame was last drawn with.
+    frame_projection: Option<glam::Mat4>,
     /// The draws of `CutAway` meshes ([`AreaScene::cut_away`]).
     cut_away: Vec<usize>,
     /// The emitters of models with a `CutAway` mesh ([`SceneEmitter::cut_away`]).
@@ -986,6 +993,9 @@ impl AreaRenderer {
                 .collect(),
             effects_epoch: None,
             distortion: None,
+            cut_effects: Default::default(),
+            cut_pass: None,
+            frame_projection: None,
             light: StandInLight::default(),
             stats,
             cut_away: scene.cut_away.clone(),
@@ -1233,7 +1243,9 @@ impl AreaRenderer {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: DEPTH_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                // Sampled by the depth of field (see [`crate::cut_effects`]).
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
             self.depth = Some((
@@ -1333,6 +1345,8 @@ impl AreaRenderer {
         camera: &Camera,
         over: Option<&wgpu::TextureView>,
     ) {
+        // For the effects that read the depth buffer back (see `finish_frame_with`).
+        self.frame_projection = Some(camera.projection(width as f32 / height.max(1) as f32));
         let frame = FrameUniforms {
             view_proj: camera
                 .view_proj(width as f32 / height.max(1) as f32)
@@ -1479,6 +1493,37 @@ impl AreaRenderer {
                 });
             }
         }
+        // The cutscene's own effects: depth of field (layer 5) before the level's (bloom
+        // 10, the Fade's 10, the colour matrix 20), the colour fades (40) after.
+        if !self.cut_effects.is_empty() {
+            let fits = self
+                .cut_pass
+                .as_ref()
+                .is_some_and(|p| p.fits(target.format(), (width, height)));
+            if !fits {
+                self.cut_pass = Some(crate::cut_effects::CutEffectsPass::new(
+                    &ctx.device,
+                    target.format(),
+                    (width, height),
+                ));
+            }
+        }
+        let depth = self.depth(&ctx.device, width, height);
+        if let (Some(dof), Some(pass), Some(projection)) = (
+            &self.cut_effects.depth_of_field,
+            &self.cut_pass,
+            self.frame_projection,
+        ) {
+            pass.depth_of_field(
+                &ctx.device,
+                &ctx.queue,
+                encoder,
+                target,
+                &depth,
+                projection,
+                dof,
+            );
+        }
         if let Some(e) = self.effects.as_mut() {
             e.apply(
                 &ctx.device,
@@ -1488,6 +1533,16 @@ impl AreaRenderer {
                 width,
                 height,
                 self.time as f32,
+            );
+        }
+        if let (false, Some(pass)) = (self.cut_effects.fades.is_empty(), &self.cut_pass) {
+            pass.fades(
+                &ctx.device,
+                &ctx.queue,
+                encoder,
+                target,
+                &depth,
+                &self.cut_effects.fades,
             );
         }
     }

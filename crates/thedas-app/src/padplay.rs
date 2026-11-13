@@ -139,6 +139,10 @@ pub struct PadPlay {
     swallow_release: bool,
     /// The same for Y, when its press put an item on the quickbar.
     swallow_right: bool,
+    /// The highlight is held (RT in the field): every creature near shows its name, as
+    /// the keyboard's Tab. A deliberate addition, and provisional: the PC original has no
+    /// pad, and RT alone is otherwise only the second quickslot row's modifier.
+    pub highlight: bool,
     /// An issue report was asked for (both sticks); the app makes it and clears this.
     pub report: bool,
 }
@@ -182,6 +186,7 @@ impl PadPlay {
         }
         let popup = host.popup();
         let ctx = context(host.screens().map(|s| &*s), popup, self.picker.is_some());
+        self.highlight = ctx == Context::Field && state.held(crate::pad::Button::RT);
         // The picker only lives over the field: anything else coming up closes it.
         if self.picker.is_some() && !matches!(ctx, Context::Picker | Context::Field) {
             self.close_picker(host);

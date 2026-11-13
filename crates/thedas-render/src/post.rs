@@ -4,7 +4,8 @@
 //! A level's layout lists its effects ([`thedas_formats::level::FrameEffect`]); each names a
 //! `.ffx.xml` effect and gives values for its exposed parameters. `da_bloom` (on all but five
 //! of the 216 layouts), `da_hsvmatrix` (204 layouts, identity on all but about sixteen) and
-//! `da_fade` (the Fade's layouts) are drawn here; `da_dof` is not.
+//! `da_fade` (the Fade's layouts) are drawn here; `da_dof`, which no layout lists, is
+//! drawn for cutscenes ([`crate::cut_effects`]).
 //!
 //! Order: the effects run by their `.ffx.xml` `layer` (`da_dof` 5, `da_bloom` 10, `da_fade`
 //! 10, `da_hsvmatrix` 20), effects of one layer in the order the layout lists them (see

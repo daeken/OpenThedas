@@ -1276,7 +1276,9 @@ impl App {
         g.ui.set_line_voiced(voiced);
         // Tab held shows every creature's name (never while it is typed into a field):
         // keymap.gda binds `HighlightObjects` to Tab.
-        let tab = self.all_names || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
+        let tab = self.all_names
+            || self.pad.highlight
+            || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
         g.ui.set_show_all_names(tab);
         play_interface(
             &mut g.ui,
@@ -1286,6 +1288,22 @@ impl App {
             dt,
         );
         self.requests.append(&mut g.ui.requests);
+        // A save just written gets the picture of the game as it stands (the world alone,
+        // as the save and load screens show it).
+        let saved = g.ui.take_saved_slots();
+        if !saved.is_empty() {
+            let (w, h) = (g.config.width, g.config.height);
+            let shot = self
+                .live
+                .as_mut()
+                .and_then(|l| l.capture(&g.ctx, &self.camera, (w, h)).ok().flatten())
+                .and_then(|px| saves::shot_png(&px, w, h));
+            if let Some(png) = shot {
+                for slot in saved {
+                    g.ui.set_save_screenshot(slot, &png);
+                }
+            }
+        }
         for a in g.ui.take_text_answers() {
             // OK sends (or saves) the report with the note; the other button keeps it on
             // this computer only, unsent.
@@ -1409,7 +1427,9 @@ impl App {
         g.ui.set_line_voiced(voiced);
         // Tab held shows every creature's name (never while it is typed into a field):
         // keymap.gda binds `HighlightObjects` to Tab.
-        let tab = self.all_names || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
+        let tab = self.all_names
+            || self.pad.highlight
+            || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
         g.ui.set_show_all_names(tab);
         play_interface(
             &mut g.ui,
@@ -1419,6 +1439,22 @@ impl App {
             dt,
         );
         self.requests.append(&mut g.ui.requests);
+        // A save just written gets the picture of the game as it stands (the world alone,
+        // as the save and load screens show it).
+        let saved = g.ui.take_saved_slots();
+        if !saved.is_empty() {
+            let (w, h) = (g.config.width, g.config.height);
+            let shot = self
+                .live
+                .as_mut()
+                .and_then(|l| l.capture(&g.ctx, &self.camera, (w, h)).ok().flatten())
+                .and_then(|px| saves::shot_png(&px, w, h));
+            if let Some(png) = shot {
+                for slot in saved {
+                    g.ui.set_save_screenshot(slot, &png);
+                }
+            }
+        }
         for a in g.ui.take_text_answers() {
             // OK sends (or saves) the report with the note; the other button keeps it on
             // this computer only, unsent.
@@ -4329,6 +4365,8 @@ fn main() -> Result<()> {
         // The mouse hovers nothing until a `hover` step moves it: it starts at the centre
         // (for aiming), which is over the hero, whose name would be in every capture.
         let mut hovering = false;
+        // The highlight held by an `allnames` step (the pad's RT holds it too).
+        let mut all_names = false;
         // The game controller as `pad` steps hold it, and its part of the game.
         let mut pad_state = pad::PadState::default();
         let mut pad_play = padplay::PadPlay::default();
@@ -4534,6 +4572,8 @@ fn main() -> Result<()> {
                                     println!("aiming ability {}", aim.ability);
                                     l.aiming = Some(aim);
                                 }
+                                // No picture is taken for a save made headless.
+                                layer.take_saved_slots();
                                 for a in layer.take_text_answers() {
                                     println!(
                                         "text box {}: {} {:?}",
@@ -4551,6 +4591,7 @@ fn main() -> Result<()> {
                                     size.0 as f32,
                                     size.1 as f32,
                                 );
+                                layer.set_show_all_names(all_names || pad_play.highlight);
                                 let over = hovering.then(|| l.hovered_creature(o, d));
                                 layer.set_hovered(over.flatten());
                                 layer.update_floaties(&l.sim, &camera, dt, &|c| l.head_height(c));
@@ -4686,9 +4727,7 @@ fn main() -> Result<()> {
                         println!("asktext {prompt:?}");
                     }
                     &Step::AllNames(on) => {
-                        if let Some((layer, _)) = played.as_mut() {
-                            layer.set_show_all_names(on);
-                        }
+                        all_names = on;
                         println!("allnames {on}");
                     }
                     Step::AskChoice(prompt) => {
