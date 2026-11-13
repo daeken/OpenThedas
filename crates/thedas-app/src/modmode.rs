@@ -120,6 +120,12 @@ pub enum Action {
     Report(String),
     /// The conversation panel's request (see [`crate::modconv`]).
     Conv(crate::modconv::ConvAction),
+    /// The world-state browser's request (see [`crate::modworld`]).
+    World(crate::modworld::WorldAction),
+    /// The free camera on (true) or back to following the leader.
+    Fly(bool),
+    /// The free camera moved to look at this object.
+    FlyTo(ObjectId),
 }
 
 /// Mod mode's state and its egui overlay.
@@ -145,6 +151,10 @@ pub struct ModMode {
     pub scrub: Option<Scrub>,
     /// The conversation launcher.
     pub convs: crate::modconv::Convs,
+    /// The world-state browser.
+    pub world: crate::modworld::WorldBrowser,
+    /// Whether the camera flies free (the app keeps this up to date).
+    pub fly: bool,
     actions: Vec<Action>,
 }
 
@@ -174,6 +184,8 @@ impl ModMode {
             selected: None,
             scrub: None,
             convs: Default::default(),
+            world: Default::default(),
+            fly: false,
             actions: Vec::new(),
         }
     }
@@ -309,11 +321,34 @@ impl ModMode {
                     }
                     ui.label("or Ctrl+click in the world");
                 });
-                if ui
-                    .selectable_label(self.convs.open, "Conversations")
-                    .clicked()
-                {
-                    self.convs.open = !self.convs.open;
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.convs.open, "Conversations")
+                        .clicked()
+                    {
+                        self.convs.open = !self.convs.open;
+                    }
+                    if ui
+                        .selectable_label(self.world.open, "World state")
+                        .clicked()
+                    {
+                        self.world.open = !self.world.open;
+                        // Opened again, it reads the world afresh.
+                        self.world.snapshot = None;
+                    }
+                    if ui
+                        .selectable_label(self.fly, "Fly")
+                        .on_hover_text(
+                            "The camera flies free: WASD to move, Q/E down and up, Shift \
+                             faster, the right mouse button to look (F does the same)",
+                        )
+                        .clicked()
+                    {
+                        self.actions.push(Action::Fly(!self.fly));
+                    }
+                });
+                if self.fly {
+                    ui.weak("WASD move, Q/E down/up, Shift faster, right mouse looks");
                 }
                 ui.separator();
                 match inspected {
@@ -326,6 +361,9 @@ impl ModMode {
         let mut asked = Vec::new();
         self.convs.window(ctx, &mut asked);
         self.actions.extend(asked.into_iter().map(Action::Conv));
+        let mut asked = Vec::new();
+        self.world.window(ctx, &mut asked);
+        self.actions.extend(asked.into_iter().map(Action::World));
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui, o: &Inspected) {
@@ -335,7 +373,18 @@ impl ModMode {
                 ui.monospace(v);
                 ui.end_row();
             };
-            row(ui, "object", format!("{} ({})", o.id, o.kind));
+            ui.label("object");
+            ui.horizontal(|ui| {
+                ui.monospace(format!("{} ({})", o.id, o.kind));
+                if ui
+                    .small_button("Fly to")
+                    .on_hover_text("The free camera looks at it")
+                    .clicked()
+                {
+                    self.actions.push(Action::FlyTo(o.id));
+                }
+            });
+            ui.end_row();
             row(ui, "tag", o.tag.clone());
             row(ui, "template", o.template.clone());
             if let Some(n) = &o.name {
