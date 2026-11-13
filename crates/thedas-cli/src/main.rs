@@ -65,6 +65,14 @@ enum Command {
         #[arg(long)]
         list: Option<PathBuf>,
     },
+    /// Show what the mod cache holds (the `.7z` and `.dazip` files unpacked for the mod list):
+    /// each folder's size and whether the list still uses it. `--prune` deletes the ones it no
+    /// longer uses; nothing is deleted without it.
+    ModCache {
+        /// Delete the cache folders the mod list no longer uses.
+        #[arg(long)]
+        prune: bool,
+    },
     /// List the add-ins (DLC) an install has, in stack order from the one that wins shared
     /// files down, with where each is known from and what of it joins the base campaign.
     Addins { install: PathBuf },
@@ -384,6 +392,7 @@ fn run() -> Result<()> {
         }
         Command::Mods { install, list } => mods(&install, list.as_deref()),
         Command::Addins { install } => addins(&install),
+        Command::ModCache { prune } => mod_cache(prune),
         Command::Resolve {
             install,
             name,
@@ -568,6 +577,47 @@ fn load_target(target: &str) -> Result<Vec<u8>> {
         .find(entry)
         .with_context(|| format!("{archive} has no entry {entry}"))?;
     Ok(erf.read(e, None)?)
+}
+
+fn mod_cache(prune: bool) -> Result<()> {
+    use thedas_vfs::mods;
+    let cache = mods::cache_dir();
+    let list = mods::default_list_file()
+        .map(|f| mods::ModList::load(&f))
+        .unwrap_or_default();
+    println!("cache: {}", cache.display());
+    let gb = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let report = mods::cache_report(&cache, &list);
+    if report.is_empty() {
+        println!("empty");
+        return Ok(());
+    }
+    println!("{:>9} {:>8}  {:<7} folder", "size", "files", "in use");
+    for e in &report {
+        println!(
+            "{:>7.2}GB {:>8}  {:<7} {}",
+            gb(e.bytes),
+            e.files,
+            if e.in_use { "yes" } else { "no" },
+            e.dir.file_name().unwrap_or_default().to_string_lossy()
+        );
+    }
+    let unused: Vec<_> = report.iter().filter(|e| !e.in_use).collect();
+    let unused_bytes: u64 = unused.iter().map(|e| e.bytes).sum();
+    println!(
+        "{} folders, {:.2} GB; {} not used by the mod list, {:.2} GB",
+        report.len(),
+        gb(report.iter().map(|e| e.bytes).sum()),
+        unused.len(),
+        gb(unused_bytes)
+    );
+    if prune {
+        let removed = mods::prune_cache(&cache, &list);
+        println!("deleted {} folders", removed.len());
+    } else if !unused.is_empty() {
+        println!("run again with --prune to delete the folders not in use");
+    }
+    Ok(())
 }
 
 fn addins(install: &Path) -> Result<()> {

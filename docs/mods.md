@@ -101,8 +101,20 @@ Documents folders, or `THEDAS_MODS=<path to another list>` to use a different li
 `.7z` and `.dazip` files are unpacked once into `mod-cache` inside your data folder, and used
 from there on later starts. A big texture pack takes a while and a lot of disk the first time
 (a 4x texture pack of 11 GB unpacks to about 20 GB). If you change or replace the archive it
-is unpacked again under a new name; old copies are not removed for you, so delete folders in
-`mod-cache` you no longer need. Nothing else lives there.
+is unpacked again under a new name, and the old copy stays until you remove it:
+
+```text
+thedas mod-cache
+```
+
+lists what the cache holds, how big each folder is and whether your list still uses it, and
+
+```text
+thedas mod-cache --prune
+```
+
+deletes the ones it no longer uses. It only ever deletes its own folders inside `mod-cache`,
+never a mod of yours.
 
 ## What does not work yet
 
