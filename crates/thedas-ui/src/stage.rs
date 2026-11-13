@@ -74,10 +74,11 @@ pub fn table_lookup(vfs: &Arc<Vfs>) -> crate::protocol::TableLookup {
     })
 }
 
-/// English talk-table strings from every `*en-us.tlk` in the stack.
+/// English talk-table strings from every `*en-us.tlk` in the stack, then Dragon Age II's
+/// `*en-us_p.tlk` patch tables over them.
 pub fn talk_table(vfs: &Vfs) -> crate::protocol::StringLookup {
     let mut map = std::collections::HashMap::new();
-    for name in vfs.names().into_iter().filter(|n| n.ends_with("en-us.tlk")) {
+    for name in vfs.talk_tables("en-us") {
         if let Ok((data, _)) = vfs.read(&name) {
             if let Ok(t) = thedas_formats::Tlk::parse(&data) {
                 map.extend(

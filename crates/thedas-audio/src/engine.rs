@@ -52,6 +52,46 @@ pub struct PlayOptions {
     /// and `FadeOut`).
     pub fade_in_ms: Option<u32>,
     pub fade_out_ms: Option<u32>,
+    /// The source's sound cone (a placed sound's facing and `Cone*` fields).
+    pub cone: Option<Cone>,
+}
+
+/// A 3D source's sound cone, as FMOD's: full level within the inside angle about
+/// `forward`, the outside level beyond the outside angle, and between them in between.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Cone {
+    /// The way the source faces (unit).
+    pub forward: [f32; 3],
+    /// Full widths, degrees.
+    pub inside: f32,
+    pub outside: f32,
+    /// Scales the event's own outside level.
+    pub outside_gain: f32,
+}
+
+impl Cone {
+    /// The level towards `to` (from the source), given the event's outside level.
+    /// Provisional: the fall between the angles is taken as linear in level.
+    pub fn gain(&self, to: [f32; 3], event_outside: f32) -> f32 {
+        let outside = (event_outside * self.outside_gain).clamp(0.0, 1.0);
+        let len = dot(to, to).sqrt();
+        if len < 1e-3 || self.inside >= 360.0 {
+            return 1.0;
+        }
+        let angle = 2.0
+            * (dot(to, self.forward) / len)
+                .clamp(-1.0, 1.0)
+                .acos()
+                .to_degrees();
+        if angle <= self.inside {
+            1.0
+        } else if angle >= self.outside {
+            outside
+        } else {
+            let t = (angle - self.inside) / (self.outside - self.inside).max(1e-3);
+            1.0 + (outside - 1.0) * t
+        }
+    }
 }
 
 impl Default for PlayOptions {
@@ -65,6 +105,7 @@ impl Default for PlayOptions {
             pitch: 0.0,
             fade_in_ms: None,
             fade_out_ms: None,
+            cone: None,
         }
     }
 }
@@ -996,9 +1037,13 @@ impl AudioEngine {
             let duck_gain = 10f32.powf(duck_db / 20.0);
             let mut gain3d = 1.0;
             let mut pan = 0.0;
+            let mut cone_gain = 1.0;
             let distance = inst.options.position.filter(|_| ev.is_3d()).map(|p| {
                 let d = sub(p, listener.position);
                 let len = dot(d, d).sqrt();
+                if let Some(c) = &inst.options.cone {
+                    cone_gain = c.gain([-d[0], -d[1], -d[2]], ev.cone_outside_volume);
+                }
                 if len > 1e-3 {
                     pan = (dot(d, listener.right) / len).clamp(-1.0, 1.0) * ev.pan_level_3d;
                 }
@@ -1015,6 +1060,7 @@ impl AudioEngine {
                         min / dd
                     };
                 }
+                gain3d *= cone_gain;
             }
             for s in &inst.slots {
                 let (sound, env_gain) = match &ev.body {
@@ -1391,6 +1437,36 @@ mod tests {
         e.stop(d, true);
         let back = run(&mut e, &m, 0.5);
         assert!((back - full).abs() < 1e-3, "{back}");
+    }
+
+    #[test]
+    fn a_cone_is_full_ahead_and_its_outside_level_behind() {
+        let c = Cone {
+            forward: [0.0, -1.0, 0.0],
+            inside: 160.0,
+            outside: 180.0,
+            outside_gain: 0.0,
+        };
+        assert_eq!(c.gain([0.0, -5.0, 0.0], 1.0), 1.0);
+        assert_eq!(c.gain([4.0, -4.0, 0.0], 1.0), 1.0);
+        assert_eq!(c.gain([0.0, 5.0, 0.0], 1.0), 0.0);
+        // Halfway between the angles (85 degrees off the axis): half.
+        let (s, co) = 85f32.to_radians().sin_cos();
+        assert!((c.gain([s, -co, 0.0], 1.0) - 0.5).abs() < 1e-3);
+        // The event's own outside level when the sound leaves it alone.
+        let c = Cone {
+            outside_gain: 1.0,
+            ..c
+        };
+        assert_eq!(c.gain([0.0, 5.0, 0.0], 0.25), 0.25);
+        // At the source, or with no cone: full.
+        assert_eq!(c.gain([0.0, 0.0, 0.0], 0.0), 1.0);
+        let c = Cone {
+            inside: 360.0,
+            outside: 360.0,
+            ..c
+        };
+        assert_eq!(c.gain([0.0, 5.0, 0.0], 0.0), 1.0);
     }
 
     #[test]

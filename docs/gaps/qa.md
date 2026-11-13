@@ -63,7 +63,7 @@ in each run folder's `.log` files).
 - No original reference captures yet: under Wine, the first reference captures were taken on 2026-11-12 (main menu, load screen, Cousland hall, King's camp, alienage, Commons); trees close up, the Vaughan scene, start-camera frames and the close-range fade are still to capture.
 - No audio recording of the original yet (no loopback device; plan: FMOD WAV writer on a patched exe copy).
 - Fight saves with a won fight are needed to test corpse decay.
-- With DLC installed, nothing of it shows: no bonus items at the start of a game, no DLC pins on the world map after Lothering, no camp additions (`FMT-047`). Later areas and stores not compared.
+- With DLC installed, a new game now gets the first DLC item from the add-ins' scripts, but there are no DLC pins on the world map after Lothering and no camp additions (`FMT-047`). Later areas and stores not compared.
 
 ### 2. Accepted as parity or improvements (don't re-file)
 Letterbox absent at 16:9; `<emp>` shown plain; the Fade's radial blur; 3 m camera start (with tutorials on, a new game starts in the tactical view of training step 1, as the original does) and no minimum camera distance (the fade is the fix); pause-until-tutorial-queue-empty; money 0 at start; Cyrion in the next room; Duncan's weapons in inventory, unequipped; early empty journals (Dwarf Commoner/Noble, City Elf); pad A on a door closes it (and #312, which skips open doors, is a deliberate improvement); "2 0" prices; the output limiter (the original clips: an improvement); GUI sound 55 silent; hero-no-rustle where the ground has no vegetation; Leske's dialog hub loops on reply 0 (the original's structure).
