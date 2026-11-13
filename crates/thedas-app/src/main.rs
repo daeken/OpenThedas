@@ -560,6 +560,8 @@ struct App {
     /// The last check of whether the interface covers the cursor while it is over a
     /// creature: (cursor, creature) → covered (see `App::update_hover`).
     hover_probe: Option<((f64, f64), thedas_script::vm::ObjectId, bool)>,
+    /// The highlight key held by an `allnames` step (see `Step::AllNames`).
+    all_names: bool,
     camera: Camera,
     size: (u32, u32),
     gfx: Option<Gfx>,
@@ -1272,6 +1274,9 @@ impl App {
         };
         g.ui.set_hovered(hovered);
         g.ui.set_line_voiced(voiced);
+        // Tab held shows every creature's name (never while it is typed into a field).
+        let tab = self.all_names || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
+        g.ui.set_show_all_names(tab);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -1401,6 +1406,9 @@ impl App {
         };
         g.ui.set_hovered(hovered);
         g.ui.set_line_voiced(voiced);
+        // Tab held shows every creature's name (never while it is typed into a field).
+        let tab = self.all_names || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
+        g.ui.set_show_all_names(tab);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -2352,6 +2360,10 @@ impl App {
                     g.ui.ask_text(0, prompt, "", "OK", "Cancel");
                 }
                 log.push(format!("asktext {prompt:?}"));
+            }
+            &Step::AllNames(on) => {
+                self.all_names = on;
+                log.push(format!("allnames {on}"));
             }
             Step::AskChoice(prompt) => {
                 if let Some(g) = self.gfx.as_mut() {
@@ -3801,6 +3813,9 @@ enum Step {
     /// The engine's own text box (`asktext Describe the issue`), as
     /// `ui::UiLayer::ask_text` shows it; its answer is logged.
     AskText(String),
+    /// The highlight key held or let go (`allnames on`, `allnames off`): every creature near
+    /// shows its name, as while Tab is down.
+    AllNames(bool),
     /// The engine's own two-button box (`askchoice Is it fixed?`), as
     /// `ui::UiLayer::ask_choice` shows it (Yes / No); its answer is logged.
     AskChoice(String),
@@ -4010,6 +4025,7 @@ fn parse_step(s: &str) -> Result<Step> {
         }
         "floaty" => Step::Floaty(arg.to_string()),
         "asktext" => Step::AskText(arg.trim().to_string()),
+        "allnames" => Step::AllNames(arg.trim() == "on"),
         "askchoice" => Step::AskChoice(arg.trim().to_string()),
         "training" => Step::Training(arg.trim().to_ascii_uppercase()),
         "trainingmode" => {
@@ -4111,6 +4127,21 @@ fn main() -> Result<()> {
     // A client's or a test's run sends and fetches nothing (see `upload::online`).
     if args.control.is_some() || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some() {
         upload::set_automated();
+    }
+    // A newer build an update fetched takes over from the one the player started.
+    if args.capture.is_none() && args.check_report.is_none() {
+        if let Some(exe) = update::newest_build() {
+            match std::process::Command::new(&exe)
+                .args(std::env::args_os().skip(1))
+                .spawn()
+            {
+                Ok(_) => {
+                    log::info!("update: handing over to {}", exe.display());
+                    return Ok(());
+                }
+                Err(e) => log::warn!("update: {} did not start: {e}", exe.display()),
+            }
+        }
     }
     if let Some(secs) = args.pad_probe {
         paddev::probe(secs);
@@ -4555,6 +4586,12 @@ fn main() -> Result<()> {
                         }
                         println!("asktext {prompt:?}");
                     }
+                    &Step::AllNames(on) => {
+                        if let Some((layer, _)) = played.as_mut() {
+                            layer.set_show_all_names(on);
+                        }
+                        println!("allnames {on}");
+                    }
                     Step::AskChoice(prompt) => {
                         if let Some((layer, _)) = played.as_mut() {
                             layer.ask_choice(0, prompt, "Yes", "No");
@@ -4855,6 +4892,7 @@ fn main() -> Result<()> {
             .or_else(|| args.control.is_none().then(saves::default_settings)),
         cursor: (0.0, 0.0),
         hover_probe: None,
+        all_names: false,
         camera,
         size,
         gfx: None,

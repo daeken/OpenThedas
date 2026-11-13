@@ -49,19 +49,40 @@ pub fn online() -> bool {
         || std::env::var_os("THEDAS_REPORT_UPLOAD").is_some_and(|v| v == "1")
 }
 
-/// The webhook's address, if the player has set one up (never in an automated run).
+/// A one-line setup file of this machine's (`discord-webhook`, `update-url`): from the
+/// player's data folder, else from beside the program, where a test build's download has
+/// it. One found beside the program is copied to the data folder, so a later build
+/// (which lives in a folder of its own, see [`crate::update`]) finds it too.
+pub fn setup_file(name: &str) -> Option<String> {
+    let own = crate::saves::data_dir().join(name);
+    if let Ok(text) = std::fs::read_to_string(&own) {
+        return Some(text.trim().to_string());
+    }
+    let beside = std::env::current_exe().ok()?.parent()?.join(name);
+    let text = std::fs::read_to_string(beside).ok()?.trim().to_string();
+    if let Some(dir) = own.parent() {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(&own, format!("{text}\n"));
+    }
+    Some(text)
+}
+
+/// Where reports are sent, if this machine is set up for it (never in an automated run):
+/// a Discord webhook's address in `discord-webhook`, else the test builds' own receiver
+/// (`report` under the address in `update-url`), which passes them on to the channel.
 pub fn webhook() -> Option<String> {
     if !online() {
         return None;
     }
-    let path = crate::saves::data_dir().join(WEBHOOK_FILE);
-    let url = std::fs::read_to_string(path).ok()?.trim().to_string();
-    let ok = url.starts_with("https://discord.com/api/webhooks/")
-        || url.starts_with("https://discordapp.com/api/webhooks/");
-    if !ok {
-        log::warn!("report: {WEBHOOK_FILE} does not hold a Discord webhook address");
+    if let Some(url) = setup_file(WEBHOOK_FILE) {
+        let ok = url.starts_with("https://discord.com/api/webhooks/")
+            || url.starts_with("https://discordapp.com/api/webhooks/");
+        if !ok {
+            log::warn!("report: {WEBHOOK_FILE} does not hold a Discord webhook address");
+        }
+        return ok.then_some(url);
     }
-    ok.then_some(url)
+    crate::update::base_url().map(|base| format!("{base}report"))
 }
 
 /// Sends the report in `dir` on a thread of its own; the result is logged and written
