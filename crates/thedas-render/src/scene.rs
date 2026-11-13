@@ -476,6 +476,8 @@ pub struct AreaScene {
     pub atmosphere: Option<thedas_formats::level::Atmosphere>,
     /// The level's clouds.
     pub clouds: Option<thedas_formats::level::Clouds>,
+    /// A Dragon Age II level's fog, which its layout holds in place of an atmosphere.
+    pub layout_fog: Option<thedas_formats::level::LayoutFog>,
     /// The layout's sunlight direction as stored (see
     /// [`thedas_formats::level::Arl::sunlight_direction`]): the sky's celestial body sits
     /// against it.
@@ -3093,6 +3095,7 @@ impl AreaScene {
                 detail: like.detail,
                 atmosphere: like.atmosphere,
                 clouds: like.clouds,
+                layout_fog: like.layout_fog,
                 ..Default::default()
             },
             mmh: HashMap::new(),
@@ -3176,6 +3179,7 @@ impl AreaScene {
             l.scene.effects = arl.effects.clone();
             l.scene.atmosphere = arl.atmosphere;
             l.scene.clouds = arl.clouds;
+            l.scene.layout_fog = arl.fog;
             l.scene.sunlight_direction = arl.sunlight_direction.map(Vec3::from_array);
             l.scene.cutaway_height = Some(arl.cutaway_height);
             // The level's wind file, `<level>_<n>.wnd` (one per level).

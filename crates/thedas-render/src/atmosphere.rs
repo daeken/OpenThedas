@@ -70,6 +70,24 @@ pub fn fog_params(a: Option<&Atmosphere>) -> [[f32; 4]; 2] {
     ]
 }
 
+/// The fog registers of a Dragon Age II level (its shaders' `mml_vFogParams`, two vectors):
+/// the colour with the most the fog covers, then the distances at which it starts and is
+/// full and the heights of its second fog's none and full (see
+/// [`thedas_formats::level::LayoutFog`]). A range of no length is given a little, which the
+/// shaders divide by.
+pub fn layout_fog_params(f: &thedas_formats::level::LayoutFog) -> [[f32; 4]; 2] {
+    let apart = |from: f32, to: f32| if to == from { from + 1e-3 } else { to };
+    [
+        [f.color[0], f.color[1], f.color[2], f.cap],
+        [
+            f.start,
+            apart(f.start, f.end),
+            f.height_start,
+            apart(f.height_start, f.height_end),
+        ],
+    ]
+}
+
 /// The cloud registers (`CloudParameters`): the `CLDS` values and the celestial body's up
 /// axis (no atmosphere: the update's `(0, 1, 0, 0)`).
 pub fn cloud_params(c: Option<&Clouds>, celestial: Option<&Celestial>) -> [[f32; 4]; 3] {
@@ -253,6 +271,30 @@ mod tests {
         // No atmosphere: nothing fogs.
         assert_eq!(fog_params(None)[0][3], 0.0);
         assert_eq!(fog_params(None)[1][0], 1.0);
+    }
+
+    #[test]
+    fn a_layouts_fog_is_its_colour_and_two_ranges() {
+        let fog = thedas_formats::level::LayoutFog {
+            color: [0.61, 0.65, 0.68],
+            start: 16.0,
+            end: 64.0,
+            cap: 0.3,
+            height_start: 1.5,
+            height_end: -3.0,
+        };
+        assert_eq!(
+            layout_fog_params(&fog),
+            [[0.61, 0.65, 0.68, 0.3], [16.0, 64.0, 1.5, -3.0]]
+        );
+        // A range of no length is never divided by.
+        let flat = thedas_formats::level::LayoutFog {
+            end: 16.0,
+            height_end: 1.5,
+            ..fog
+        };
+        let p = layout_fog_params(&flat);
+        assert!(p[1][1] > p[1][0] && p[1][3] > p[1][2]);
     }
 
     #[test]

@@ -2005,7 +2005,10 @@ impl D3dPass {
                 })
                 .collect(),
             sun: scene.sun,
-            fog: crate::atmosphere::fog_params(scene.atmosphere.as_ref()),
+            fog: match &scene.layout_fog {
+                Some(f) => crate::atmosphere::layout_fog_params(f),
+                None => crate::atmosphere::fog_params(scene.atmosphere.as_ref()),
+            },
             sky: celestial
                 .as_ref()
                 .zip(scene.atmosphere.as_ref())
