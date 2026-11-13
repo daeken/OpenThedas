@@ -9,22 +9,15 @@
 //! the set already holds (`0x4ec910` returns -1 and `0x4eca10` moves on), within one worksheet
 //! and across worksheets alike.
 //!
-//! The order of the worksheets is the order of the original's resource listing (`0x4c56b0`),
-//! traced in two parts:
-//!
-//! - Its resource sources (one per archive or folder) are walked from the lowest priority
-//!   number up, each adding the names not listed yet, so a worksheet in a higher-priority
-//!   source (an add-in's, a mod's) comes before the base game's. Ours follows that by stack
-//!   layer.
-//! - Inside one archive the source lists its entries in the order of an MSVC `stdext::hash_map`
-//!   keyed by the lowercased entry name and hashed with CRC-32 of its UTF-16 bytes
-//!   ([`archive_position`]). That order is neither alphabetical nor the archive's own, and the
-//!   shipped AI package tables depend on it: `aip_archer`'s prefix also matches
-//!   `aip_archer_human.gda`, `_elf` and `_dwarf` in the same archive, which reuse its row ids,
-//!   and the hash order puts `aip_archer_human.gda` first.
-//!
-//! Provisional: worksheets that are loose files (a folder's own order in the original is not
-//! traced) come in name order after their layer's rank.
+//! The order of the worksheets is the order of the original's resource listing (`0x4c56b0`):
+//! its resource locations from the lowest priority number up, so a worksheet in a
+//! higher-priority folder (an add-in's, a mod's) comes before the base game's. That much is
+//! traced and ours follows it by stack layer. Inside one location the original lists resources
+//! in the order of a hash container keyed by name (CRC-32 of the UTF-16 name, MSVC
+//! `hash_map` bucket order), which is not reproduced yet. Provisional: among worksheets served
+//! from the same layer the later name comes first, which keeps the result this loader gave
+//! before rows stopped overwriting each other (the shipped AI package tables, `aip_archer` and
+//! `aip_archer_*`, share row ids inside one archive, so this choice decides them).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -122,49 +115,13 @@ fn prefix_set<'a>(gdas: &'a [String], prefix: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// Where an archive source of the original lists an entry among its own: the bucket of an
-/// MSVC `stdext::hash_map` (bucket size 4, 8 starting buckets, as compiled into the original's
-/// insert at 0x4cdb50) holding `entries` names, keyed by the ASCII-lowercased name and hashed
-/// with CRC-32 over its UTF-16LE bytes (0x4ca9a0). The map's element list runs bucket by
-/// bucket, names ascending inside a bucket, and the source's list method (0x4e6a90) walks it.
-fn archive_position(name: &str, entries: usize) -> (u32, Vec<u16>) {
-    // The mask and the bucket count after `entries` inserts: the table grows by one bucket
-    // whenever the count reaches four times the buckets, doubling its mask as needed.
-    let (mut slots, mut mask, mut buckets) = (9u32, 1u32, 1u32);
-    for size in 0..entries as u32 {
-        if buckets <= size / 4 {
-            if slots - 1 <= buckets {
-                mask = ((slots - 1) << 1) - 1;
-                slots = mask + 2;
-            } else if mask < buckets {
-                mask = (mask << 1) + 1;
-            }
-            buckets += 1;
-        }
-    }
-    let lower = name.to_ascii_lowercase();
-    let key: Vec<u16> = lower.encode_utf16().collect();
-    // The same hash the tables' column names use.
-    let mut bucket = thedas_formats::gda::column_hash(&lower) & mask;
-    if buckets <= bucket {
-        bucket -= (mask >> 1) + 1;
-    }
-    (bucket, key)
-}
-
 /// Orders the worksheets of a set as their rows take precedence: the one the resource stack
-/// serves from a higher layer first, then, inside one archive, the original's own order
-/// ([`archive_position`]); loose files by name (see the module documentation).
+/// serves from a higher layer first (traced), then the later name first (provisional; see the
+/// module documentation).
 fn in_set_order<'a>(vfs: &Vfs, mut names: Vec<&'a str>) -> Vec<&'a str> {
     names.sort_by_cached_key(|n| {
-        let (layer, position) = match vfs.winning_archive(n) {
-            Some((layer, entries)) => (layer, archive_position(n, entries)),
-            None => (
-                vfs.lookup(n).map_or(0, |p| p.layer),
-                (0, n.encode_utf16().collect()),
-            ),
-        };
-        (std::cmp::Reverse(layer), position)
+        let layer = vfs.lookup(n).map_or(0, |p| p.layer);
+        std::cmp::Reverse((layer, n.to_string()))
     });
     names
 }
@@ -232,8 +189,7 @@ impl Tables {
     /// The names of every GDA in the stack whose name starts with `prefix` (any case): a
     /// prefix set, as the original opens them (`0x4ec7a0`; `M2DA_` for the table list,
     /// `PRCSCR_` for the add-ins' start-up scripts). In the order their rows take precedence
-    /// (see the module documentation): higher layer first, then the original's order inside
-    /// one archive.
+    /// (see the module documentation): higher layer first, then the later name first.
     pub fn prefix_set(&self, prefix: &str) -> Vec<&str> {
         let names = prefix_set(&self.gdas, prefix);
         match &self.vfs {
@@ -416,43 +372,10 @@ mod tests {
             [
                 "aip_archer_fire.gda",
                 "aip_archer_dlc.gda",
-                "aip_archer.gda",
-                "aip_archer_base.gda"
+                "aip_archer_base.gda",
+                "aip_archer.gda"
             ]
         );
         std::fs::remove_dir_all(&base).unwrap();
-    }
-
-    /// The original's order inside one archive, checked against the algorithm run by hand
-    /// for an archive of 749 entries (the core game's `2da.erf`): mask 255, 188 buckets.
-    #[test]
-    fn archive_entries_come_in_the_original_hash_order() {
-        let pos = |n: &str| archive_position(n, 749);
-        // CRC-32 of the UTF-16LE name, masked to 255, folded back by 128 when 188 or more:
-        // the values below were computed independently (Python zlib).
-        for (n, bucket) in [("aip_archer.gda", 106), ("aip_archer_human.gda", 25)] {
-            assert_eq!(pos(n).0, bucket, "{n}");
-            assert_eq!(pos(&n.to_uppercase()), pos(n), "{n}");
-        }
-        let mut names = vec![
-            "aip_archer.gda",
-            "aip_archer_dwarf.gda",
-            "aip_archer_elf.gda",
-            "aip_archer_human.gda",
-        ];
-        names.sort_by_key(|n| pos(n));
-        assert_eq!(
-            names,
-            [
-                "aip_archer_human.gda",
-                "aip_archer_elf.gda",
-                "aip_archer.gda",
-                "aip_archer_dwarf.gda"
-            ]
-        );
-        // Small tables: one bucket until four entries, then growth one bucket at a time.
-        assert_eq!(archive_position("a", 1).0, 0);
-        assert_eq!(archive_position("a", 4).0, 0);
-        assert!(archive_position("a", 9).0 < 3);
     }
 }
