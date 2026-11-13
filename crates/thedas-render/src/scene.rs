@@ -490,6 +490,9 @@ pub struct Prop {
     /// Equipment tints by model (of `models` or `attached`): (model, `.tnt` without
     /// extension). They fill the model's materials' `mml_vTintMaskColours`.
     pub tints: Vec<(String, String)>,
+    /// Visual effect models on it (without `.mmh`): their emitters follow the body (see
+    /// `Loader::place_effect`).
+    pub effects: Vec<String>,
     /// Model to world.
     pub transform: Mat4,
 }
@@ -526,6 +529,18 @@ pub struct PropDraws {
     pub draws: std::ops::Range<usize>,
     /// Models hung from a node of the body: their draws follow that node.
     pub attachments: Vec<PropAttachment>,
+    /// The emitters of its visual effects ([`Prop::effects`]), which follow it.
+    pub emitters: Vec<PropEmitter>,
+}
+
+/// An emitter that follows a prop: its index in [`AreaScene::emitters`], its placement in
+/// the prop's model space at rest, and the body node it follows (a skeleton of
+/// [`AreaScene::skeletons`] and a node of it), if any; else the prop's root.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PropEmitter {
+    pub emitter: usize,
+    pub in_model: Mat4,
+    pub follows: Option<(usize, usize)>,
 }
 
 /// An attached model's draws and the body node they hang from.
@@ -547,6 +562,7 @@ impl AreaScene {
             .clone()
             .filter_map(|d| self.draws.get(d)?.skin.as_ref().map(|s| s.skeleton))
             .chain(p.attachments.iter().map(|a| a.skeleton))
+            .chain(p.emitters.iter().filter_map(|e| e.follows.map(|(s, _)| s)))
             .collect();
         out.sort_unstable();
         out.dedup();
@@ -2372,6 +2388,75 @@ impl<'a> Loader<'a> {
         rigid
     }
 
+    /// A visual effect model on `prop` (DAOrigins.exe's crust effects, `VFX_base.gda` models
+    /// such as `fxa_fire_crust_c`): its emitters, placed on the body and following it. An
+    /// emitter under a crust node (`crst`, named after a body node: `CrustHook1` …) sits
+    /// where the first of the prop's models with that node has it, by the transforms below
+    /// the crust node, and follows that node as the body moves; the others follow the
+    /// prop's root by their place in the effect model. Provisional: the crust node's own
+    /// transform is not used, effect models' meshes are not drawn, and an effect on a body
+    /// without the named node is left out.
+    fn place_effect(&mut self, effect: &str, prop: &Prop) -> Vec<PropEmitter> {
+        use thedas_formats::emitter::Emitter;
+        use thedas_formats::model::{KIND_CRUST, Node};
+        let Some(model) = self.model(effect) else {
+            self.warn(format!("{}: no effect model {effect}", prop.label));
+            return Vec::new();
+        };
+        // Emitters with the crust node above them, and their transform below it (or from
+        // the model root when there is none).
+        type Found<'a> = Vec<(&'a Emitter, Option<&'a str>, Option<&'a str>, Mat4)>;
+        fn walk<'a>(n: &'a Node, below: Mat4, hook: Option<&'a str>, out: &mut Found<'a>) {
+            let (below, hook) = if n.kind == KIND_CRUST {
+                (Mat4::IDENTITY, n.name.as_deref().or(hook))
+            } else {
+                (below * transform_matrix(&n.transform), hook)
+            };
+            if let Some(e) = &n.emitter {
+                out.push((e, n.name.as_deref(), hook, below));
+            }
+            for c in &n.children {
+                walk(c, below, hook, out);
+            }
+        }
+        let mut found = Vec::new();
+        for n in &model.nodes {
+            walk(n, Mat4::IDENTITY, None, &mut found);
+        }
+        let mut out = Vec::new();
+        for (e, name, hook, below) in found {
+            let (in_model, follows) = match hook {
+                Some(hook) => {
+                    let body = prop.models.iter().find_map(|m| {
+                        let mmh = self.model(m)?;
+                        let chain = mmh.node_chain(hook)?;
+                        Some((m.clone(), mmh, chain))
+                    });
+                    let Some((body, mmh, chain)) = body else {
+                        continue;
+                    };
+                    let at = chain
+                        .iter()
+                        .fold(Mat4::IDENTITY, |m, t| m * transform_matrix(t));
+                    let skeleton = self.skeleton(&body, &mmh);
+                    let node = self.scene.skeletons[skeleton].node(hook);
+                    (at * below, node.map(|n| (skeleton, n)))
+                }
+                None => (below, None),
+            };
+            if let Some(emitter) =
+                self.push_emitter(effect, e, name, prop.transform * in_model, &[], false)
+            {
+                out.push(PropEmitter {
+                    emitter,
+                    in_model,
+                    follows,
+                });
+            }
+        }
+        out
+    }
+
     /// The particle emitters of a placed model. Mesh-particle and physics emitters are left
     /// out (not mirrored yet), as are emitters whose material does not load.
     fn place_emitters(
@@ -2383,13 +2468,38 @@ impl<'a> Loader<'a> {
         cut_away: bool,
     ) {
         for piece in model.emitters() {
-            let e = piece.emitter;
+            let node = piece
+                .chain
+                .iter()
+                .fold(Mat4::IDENTITY, |m, t| m * transform_matrix(t));
+            self.push_emitter(
+                model_name,
+                piece.emitter,
+                piece.name,
+                placement * node,
+                user_params,
+                cut_away,
+            );
+        }
+    }
+
+    /// Adds one emitter at `transform` (node to world) to the scene and returns its index:
+    /// `None` for those not drawn (mesh-particle and physics emitters, and emitters whose
+    /// material does not load).
+    fn push_emitter(
+        &mut self,
+        model_name: &str,
+        e: &thedas_formats::emitter::Emitter,
+        name: Option<&str>,
+        transform: Mat4,
+        user_params: &[(String, [f32; 4])],
+        cut_away: bool,
+    ) -> Option<usize> {
+        {
             if e.mesh_model.is_some() || e.physics || e.material.is_empty() {
-                continue;
+                return None;
             }
-            let Some(mut material) = self.material(&e.material) else {
-                continue;
-            };
+            let mut material = self.material(&e.material)?;
             if e.flipbook {
                 let (c, r) = (e.flipbook_columns.max(1), e.flipbook_rows.max(1));
                 material = self.overridden_material(
@@ -2415,14 +2525,9 @@ impl<'a> Loader<'a> {
                     &[(USER_COLOR_PARAMETER.to_string(), vec![*value])],
                 );
             }
-            let node = piece
-                .chain
-                .iter()
-                .fold(Mat4::IDENTITY, |m, t| m * transform_matrix(t));
-            let transform = placement * node;
             log::debug!(
                 "emitter {model_name}:{} at {:?} ({})",
-                piece.name.unwrap_or(""),
+                name.unwrap_or(""),
                 transform.w_axis.truncate(),
                 e.material
             );
@@ -2431,9 +2536,10 @@ impl<'a> Loader<'a> {
                 transform,
                 material,
                 model: model_name.to_string(),
-                node: piece.name.unwrap_or("").to_string(),
+                node: name.unwrap_or("").to_string(),
                 cut_away,
             });
+            Some(self.scene.emitters.len() - 1)
         }
     }
 
@@ -2943,11 +3049,18 @@ impl AreaScene {
                     }
                 }
             }
+            let draws = first..l.scene.draws.len();
+            let emitters = prop
+                .effects
+                .iter()
+                .flat_map(|effect| l.place_effect(effect, prop))
+                .collect();
             l.scene.props.push(PropDraws {
                 label: prop.label.clone(),
                 transform: prop.transform,
-                draws: first..l.scene.draws.len(),
+                draws,
                 attachments,
+                emitters,
             });
         }
         l.assign_probes();

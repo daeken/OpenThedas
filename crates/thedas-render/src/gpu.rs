@@ -1145,6 +1145,19 @@ impl AreaRenderer {
                 }
             }
         }
+        // Its visual effects' emitters follow the body node they sit on, else its root.
+        for e in &p.emitters {
+            let follow = e
+                .follows
+                .and_then(|(s, n)| {
+                    let (rest, pose) = pose_of(s)?;
+                    Some(*pose.get(n)? * rest.get(n)?.inverse())
+                })
+                .unwrap_or(glam::Mat4::IDENTITY);
+            if let Some(state) = self.emitters.get_mut(e.emitter) {
+                state.world = transform * follow * e.in_model;
+            }
+        }
     }
 
     /// Advances the shaders' clock (`ApplicationTime`) and the particle emitters by a

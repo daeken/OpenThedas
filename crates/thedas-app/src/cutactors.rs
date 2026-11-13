@@ -332,6 +332,7 @@ fn own_creatures(sim: &Sim, tracks: &Tracks, bound: &[Bound]) -> Vec<(usize, Obj
                 tints: d.tints,
                 morph: d.morph,
                 hide_hair: d.hide_hair,
+                effects: thedas_ui::models::visual_effects(s, o),
                 motion: thedas_ui::models::motion(s, o),
                 position: a.position,
                 facing: 0.0,
