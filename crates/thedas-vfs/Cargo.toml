@@ -15,3 +15,7 @@ md-5.workspace = true
 log.workspace = true
 dirs = "6"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+sevenz-rust2 = { version = "0.25", default-features = false }
+
+[dev-dependencies]
+sevenz-rust2 = { version = "0.25", default-features = false, features = ["compress"] }
