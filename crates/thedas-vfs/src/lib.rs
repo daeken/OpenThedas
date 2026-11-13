@@ -14,6 +14,7 @@
 
 pub mod crypto;
 pub mod erf;
+mod gog_dlc;
 pub mod install;
 pub mod path;
 pub mod vfs;

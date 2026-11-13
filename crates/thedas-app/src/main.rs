@@ -4108,6 +4108,10 @@ fn main() -> Result<()> {
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
     ));
     let args = Args::parse();
+    // A client's or a test's run sends and fetches nothing (see `upload::online`).
+    if args.control.is_some() || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some() {
+        upload::set_automated();
+    }
     if let Some(secs) = args.pad_probe {
         paddev::probe(secs);
         return Ok(());
@@ -4206,6 +4210,9 @@ fn main() -> Result<()> {
             audio::GameAudio::recording(&install, &args.module, &loaded.vfs, &args.language, 48000)
         });
         let mut cursor = (size.0 as f64 / 2.0, size.1 as f64 / 2.0);
+        // The mouse hovers nothing until a `hover` step moves it: it starts at the centre
+        // (for aiming), which is over the hero, whose name would be in every capture.
+        let mut hovering = false;
         // The game controller as `pad` steps hold it, and its part of the game.
         let mut pad_state = pad::PadState::default();
         let mut pad_play = padplay::PadPlay::default();
@@ -4250,6 +4257,7 @@ fn main() -> Result<()> {
                 match step {
                     &Step::Hover(x, y) => {
                         cursor = (x, y);
+                        hovering = true;
                         if let Some((layer, _)) = played.as_mut() {
                             layer.mouse_move(x, y);
                         }
@@ -4427,7 +4435,8 @@ fn main() -> Result<()> {
                                     size.0 as f32,
                                     size.1 as f32,
                                 );
-                                layer.set_hovered(l.hovered_creature(o, d));
+                                let over = hovering.then(|| l.hovered_creature(o, d));
+                                layer.set_hovered(over.flatten());
                                 layer.update_floaties(&l.sim, &camera, dt, &|c| l.head_height(c));
                                 ui_time += t.elapsed();
                             }

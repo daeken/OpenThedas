@@ -236,7 +236,7 @@ fn check_archive(path: &Path, label: &str, stats: &mut Stats, keep: usize) {
         let es = stats.by_ext.entry(ext.clone()).or_default();
         es.entries += 1;
         es.bytes += entry.size as u64;
-        if erf.is_encrypted() {
+        if erf.is_encrypted() && erf.installed_key().is_none() {
             es.encrypted += 1;
             continue;
         }
