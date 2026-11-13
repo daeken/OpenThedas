@@ -7,12 +7,17 @@
 //!
 //! A row id belongs to the first worksheet that defines it: the original skips a row whose id
 //! the set already holds (`0x4ec910` returns -1 and `0x4eca10` moves on), within one worksheet
-//! and across worksheets alike. The shipped tables depend on it: a table's prefix is often the
-//! start of another table's name (`aip_archer` and `aip_archer_*`), and those other
-//! worksheets reuse its row ids. Provisional: the order of the worksheets. The original walks
-//! the resource manager's listing, whose order is not traced; ours is the worksheet from the
-//! higher layer of the resource stack first (an add-in's or a mod's before the base game's),
-//! then by name (so `aip_archer.gda` before `aip_archer_fire.gda`).
+//! and across worksheets alike.
+//!
+//! The order of the worksheets is the order of the original's resource listing (`0x4c56b0`):
+//! its resource locations from the lowest priority number up, so a worksheet in a
+//! higher-priority folder (an add-in's, a mod's) comes before the base game's. That much is
+//! traced and ours follows it by stack layer. Inside one location the original lists resources
+//! in the order of a hash container keyed by name (CRC-32 of the UTF-16 name, MSVC
+//! `hash_map` bucket order), which is not reproduced yet. Provisional: among worksheets served
+//! from the same layer the later name comes first, which keeps the result this loader gave
+//! before rows stopped overwriting each other (the shipped AI package tables, `aip_archer` and
+//! `aip_archer_*`, share row ids inside one archive, so this choice decides them).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -111,11 +116,12 @@ fn prefix_set<'a>(gdas: &'a [String], prefix: &str) -> Vec<&'a str> {
 }
 
 /// Orders the worksheets of a set as their rows take precedence: the one the resource stack
-/// serves from a higher layer first, then by name. Provisional (see the module documentation).
+/// serves from a higher layer first (traced), then the later name first (provisional; see the
+/// module documentation).
 fn in_set_order<'a>(vfs: &Vfs, mut names: Vec<&'a str>) -> Vec<&'a str> {
     names.sort_by_cached_key(|n| {
         let layer = vfs.lookup(n).map_or(0, |p| p.layer);
-        (std::cmp::Reverse(layer), n.to_string())
+        std::cmp::Reverse((layer, n.to_string()))
     });
     names
 }
@@ -183,7 +189,7 @@ impl Tables {
     /// The names of every GDA in the stack whose name starts with `prefix` (any case): a
     /// prefix set, as the original opens them (`0x4ec7a0`; `M2DA_` for the table list,
     /// `PRCSCR_` for the add-ins' start-up scripts). In the order their rows take precedence
-    /// (see the module documentation): higher layer first, then by name.
+    /// (see the module documentation): higher layer first, then the later name first.
     pub fn prefix_set(&self, prefix: &str) -> Vec<&str> {
         let names = prefix_set(&self.gdas, prefix);
         match &self.vfs {
@@ -337,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn worksheets_from_higher_layers_come_first_then_by_name() {
+    fn worksheets_from_higher_layers_come_first() {
         let base = std::env::temp_dir().join(format!("thedas-m2da-order-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let write = |rel: &str| {
@@ -366,8 +372,8 @@ mod tests {
             [
                 "aip_archer_fire.gda",
                 "aip_archer_dlc.gda",
-                "aip_archer.gda",
-                "aip_archer_base.gda"
+                "aip_archer_base.gda",
+                "aip_archer.gda"
             ]
         );
         std::fs::remove_dir_all(&base).unwrap();
