@@ -1606,7 +1606,12 @@ impl Live {
                 .map(|l| l.vfs.clone())
                 .context("effects before their level")?;
             let spec = self.spec(format);
-            let scene = AreaScene::load_effects_at(&vfs, layout, &props, spec.detail)?;
+            let like = &self
+                .objects
+                .as_ref()
+                .context("effects before their objects")?
+                .scene;
+            let scene = AreaScene::load_effects_like(&vfs, like, &props);
             let loaded = started.elapsed();
             let programs = crate::programs_cached(&vfs, &scene, &spec.shaders, &mut self.cache)?;
             let translated = started.elapsed();

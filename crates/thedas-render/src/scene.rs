@@ -2808,14 +2808,14 @@ impl AreaScene {
         level: &str,
         props: &[Prop],
     ) -> Result<AreaScene, SceneError> {
-        Self::load_parts(vfs, level, props, true, false, Detail::default())
+        Self::load_parts(vfs, level, props, true, Detail::default())
     }
 
     /// The objects alone in a level: `props` lit by the level's lights and probes, without
     /// the level's own meshes, for drawing over a scene of the level drawn once (see
     /// `AreaRenderer::render_over`): objects that come and go then rebuild only themselves.
     pub fn load_objects(vfs: &Vfs, level: &str, props: &[Prop]) -> Result<AreaScene, SceneError> {
-        Self::load_parts(vfs, level, props, false, false, Detail::default())
+        Self::load_parts(vfs, level, props, false, Detail::default())
     }
 
     /// [`AreaScene::load_with_props`] at a graphics detail level.
@@ -2825,7 +2825,7 @@ impl AreaScene {
         props: &[Prop],
         detail: Detail,
     ) -> Result<AreaScene, SceneError> {
-        Self::load_parts(vfs, level, props, true, false, detail)
+        Self::load_parts(vfs, level, props, true, detail)
     }
 
     /// [`AreaScene::load_objects`] at a graphics detail level.
@@ -2835,19 +2835,50 @@ impl AreaScene {
         props: &[Prop],
         detail: Detail,
     ) -> Result<AreaScene, SceneError> {
-        Self::load_parts(vfs, level, props, false, false, detail)
+        Self::load_parts(vfs, level, props, false, detail)
     }
 
     /// Only the props' visual effects ([`Prop::effects`]): the props' models are read for
     /// the nodes the effects sit on and follow, and not drawn. A scene of its own for the
-    /// effects lets them come and go without the objects' scene being rebuilt.
-    pub fn load_effects_at(
-        vfs: &Vfs,
-        level: &str,
-        props: &[Prop],
-        detail: Detail,
-    ) -> Result<AreaScene, SceneError> {
-        Self::load_parts(vfs, level, props, false, true, detail)
+    /// effects lets them come and go without the objects' scene being rebuilt. The level is
+    /// not read again: what the effects' shaders take from it (its fog) comes from `like`,
+    /// a scene of the same level.
+    pub fn load_effects_like(vfs: &Vfs, like: &AreaScene, props: &[Prop]) -> AreaScene {
+        let mut l = Loader {
+            vfs,
+            scene: AreaScene {
+                level: like.level.clone(),
+                name: like.name.clone(),
+                detail: like.detail,
+                atmosphere: like.atmosphere,
+                clouds: like.clouds,
+                ..Default::default()
+            },
+            mmh: HashMap::new(),
+            msh: HashMap::new(),
+            mesh_index: HashMap::new(),
+            mat_defs: HashMap::new(),
+            material_index: HashMap::new(),
+            morphs: HashMap::new(),
+            tints: HashMap::new(),
+            skeleton_index: HashMap::new(),
+        };
+        for prop in props {
+            let first = l.scene.draws.len();
+            let emitters = prop
+                .effects
+                .iter()
+                .flat_map(|effect| l.place_effect(effect, prop))
+                .collect();
+            l.scene.props.push(PropDraws {
+                label: prop.label.clone(),
+                transform: prop.transform,
+                draws: first..first,
+                attachments: Vec::new(),
+                emitters,
+            });
+        }
+        l.scene
     }
 
     fn load_parts(
@@ -2855,7 +2886,6 @@ impl AreaScene {
         level: &str,
         props: &[Prop],
         level_meshes: bool,
-        effects_only: bool,
         detail: Detail,
     ) -> Result<AreaScene, SceneError> {
         let mut l = Loader {
@@ -3068,21 +3098,6 @@ impl AreaScene {
         l.scene.static_draws = l.scene.draws.len();
         for prop in props {
             let first = l.scene.draws.len();
-            if effects_only {
-                let emitters = prop
-                    .effects
-                    .iter()
-                    .flat_map(|effect| l.place_effect(effect, prop))
-                    .collect();
-                l.scene.props.push(PropDraws {
-                    label: prop.label.clone(),
-                    transform: prop.transform,
-                    draws: first..first,
-                    attachments: Vec::new(),
-                    emitters,
-                });
-                continue;
-            }
             let at = prop.transform.w_axis.truncate();
             let in_room = room_at(&arl.rooms, at);
             let probe = match in_room {
