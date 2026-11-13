@@ -2228,7 +2228,8 @@ impl GameAudio {
     /// conversation's `VO/VOambient` event with the line's sample, once, kept apart from the
     /// open conversation's voice (it neither cuts that voice nor is cut by it, and it sets
     /// none of what the conversation screen reads). Nothing plays for a line without a
-    /// sample. Provisional: that DAOrigins.exe voices ambient lines through `VOambient` at
+    /// sample; a line whose speaker is not found (`at` is `None`) plays 2D at full level.
+    /// Provisional: that DAOrigins.exe voices ambient lines through `VOambient` at
     /// the speaker is read from how the event data is set up, not traced.
     fn say_ambient(&mut self, line: VoiceLine, at: Option<[f32; 3]>) {
         let Some(sample) = self.voice_sample(&line) else {
