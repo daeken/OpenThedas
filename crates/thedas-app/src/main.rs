@@ -562,6 +562,9 @@ struct App {
     hover_probe: Option<((f64, f64), thedas_script::vm::ObjectId, bool)>,
     /// The highlight key held by an `allnames` step (see `Step::AllNames`).
     all_names: bool,
+    /// The keyboard's movement keys were walking the leader last frame (see
+    /// `App::key_walk`).
+    key_walking: bool,
     camera: Camera,
     size: (u32, u32),
     gfx: Option<Gfx>,
@@ -1010,10 +1013,37 @@ impl App {
         Ok(())
     }
 
+    /// The keyboard's movement keys walk the leader while they are held: W and S forward
+    /// and back, Q and E to the left and right (keymap.gda's `RunCharacterForward`,
+    /// `RunCharacterBackward`, `RunCharacterLeft` and `RunCharacterRight`), relative to the
+    /// camera, as the pad's left stick does; letting go stops. Provisional: the keys are
+    /// fixed (the player's bindings are not read), and the walk is the pad's (a move order a
+    /// little ahead each frame), not the exe's own keyboard movement, which is not traced.
+    fn key_walk(&mut self) {
+        let k = |c| self.keys.contains(&c);
+        let typing = self.gfx.as_mut().is_some_and(|g| g.ui.stage.text_focused());
+        let v = if self.follow.is_some() && self.live.is_some() && !typing {
+            glam::Vec2::new(
+                (k(KeyCode::KeyE) as i32 - k(KeyCode::KeyQ) as i32) as f32,
+                (k(KeyCode::KeyW) as i32 - k(KeyCode::KeyS) as i32) as f32,
+            )
+        } else {
+            glam::Vec2::ZERO
+        };
+        if v == glam::Vec2::ZERO && !self.key_walking {
+            return;
+        }
+        self.key_walking = v != glam::Vec2::ZERO;
+        let pad = std::mem::take(&mut self.pad);
+        pad.walk_keys(self, v);
+        self.pad = pad;
+    }
+
     fn update(&mut self) {
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32().min(0.1);
         self.last = now;
+        self.key_walk();
         let k = |c| self.keys.contains(&c);
         // The camera waits for a load to finish: it resets as the world comes up.
         let loading = self.live.as_ref().is_some_and(|l| l.loading());
@@ -1026,7 +1056,9 @@ impl App {
             }
         }
         if let Some(f) = self.follow.as_mut() {
-            let turn = (k(KeyCode::KeyQ) as i32 - k(KeyCode::KeyE) as i32) as f32;
+            // A and D turn the camera round the leader: keymap.gda's `MoveCameraLeft` and
+            // `MoveCameraRight`. Provisional: the rate.
+            let turn = (k(KeyCode::KeyA) as i32 - k(KeyCode::KeyD) as i32) as f32;
             f.orbit(turn * 1.8 * dt, 0.0);
             // Page Down zooms in and Page Up out while held, the original's second zoom
             // bindings (KeyBindings.ini: ZoomIn_1=Keyboard::Button_Next,
@@ -2447,6 +2479,14 @@ impl App {
             &Step::AllNames(on) => {
                 self.all_names = on;
                 log.push(format!("allnames {on}"));
+            }
+            &Step::HoldKey(code, down) => {
+                if down {
+                    self.keys.insert(code);
+                } else {
+                    self.keys.remove(&code);
+                }
+                log.push(format!("key {code:?} {}", if down { "down" } else { "up" }));
             }
             Step::AskChoice(prompt) => {
                 if let Some(g) = self.gfx.as_mut() {
@@ -3921,6 +3961,9 @@ enum Step {
     /// The engine's own text box (`asktext Describe the issue`), as
     /// `ui::UiLayer::ask_text` shows it; its answer is logged.
     AskText(String),
+    /// A movement key held or let go (`keydown w`, `keyup w`; w, a, s, d, q or e), as the
+    /// keyboard holds it.
+    HoldKey(KeyCode, bool),
     /// The highlight key held or let go (`allnames on`, `allnames off`): every creature near
     /// shows its name, as while Tab is down.
     AllNames(bool),
@@ -4153,6 +4196,18 @@ fn parse_step(s: &str) -> Result<Step> {
         "floaty" => Step::Floaty(arg.to_string()),
         "asktext" => Step::AskText(arg.trim().to_string()),
         "allnames" => Step::AllNames(arg.trim() == "on"),
+        "keydown" | "keyup" => {
+            let code = match arg.trim().to_ascii_lowercase().as_str() {
+                "w" => KeyCode::KeyW,
+                "a" => KeyCode::KeyA,
+                "s" => KeyCode::KeyS,
+                "d" => KeyCode::KeyD,
+                "q" => KeyCode::KeyQ,
+                "e" => KeyCode::KeyE,
+                other => bail!("{verb} takes w, a, s, d, q or e, not {other:?}"),
+            };
+            Step::HoldKey(code, verb == "keydown")
+        }
         "askchoice" => Step::AskChoice(arg.trim().to_string()),
         "training" => Step::Training(arg.trim().to_ascii_uppercase()),
         "trainingmode" => {
@@ -4738,6 +4793,8 @@ fn main() -> Result<()> {
                         all_names = on;
                         println!("allnames {on}");
                     }
+                    // The movement keys are the window's (see `App::key_walk`).
+                    Step::HoldKey(..) => println!("keydown and keyup need a window"),
                     Step::AskChoice(prompt) => {
                         if let Some((layer, _)) = played.as_mut() {
                             layer.ask_choice(0, prompt, "Yes", "No");
@@ -5039,6 +5096,7 @@ fn main() -> Result<()> {
         cursor: (0.0, 0.0),
         hover_probe: None,
         all_names: false,
+        key_walking: false,
         camera,
         size,
         gfx: None,

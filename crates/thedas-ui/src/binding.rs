@@ -2643,12 +2643,14 @@ mod tests {
                 resref: "plt_bhn100pt_father".into(),
                 name: None,
                 completed: true,
+                ..Default::default()
             },
             Alert {
                 kind: ALERT_CODEX,
                 resref: "plt_cod_cha_duncan".into(),
                 name: None,
                 completed: false,
+                ..Default::default()
             },
         ];
         let v = sim_values(&sim);
