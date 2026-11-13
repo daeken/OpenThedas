@@ -432,6 +432,8 @@ pub struct AreaScene {
     pub tree_constants: HashMap<usize, crate::d3d::TreeConstants>,
     /// SpeedTree draws' levels of detail by draw.
     pub tree_lods: HashMap<usize, TreeLod>,
+    /// The level's wind for its trees (strength, direction), from its `.wnd` file.
+    pub wind: Option<(f32, [f32; 3])>,
 }
 
 /// A model (or several, drawn together) the simulation places in the level: a creature or a
@@ -879,6 +881,7 @@ impl<'a> Loader<'a> {
         let leaf_material = material(self, &atlas, "spt_leafcards");
         let frond_material = material(self, &atlas, "spt_fronds");
         let leaf_mesh_material = material(self, &atlas, "spt_leafmesh");
+        let mut placed_trees = 0usize;
         for &(tree, placement, scale, color) in spots {
             let built = built_trees.entry(tree).or_insert_with(|| {
                 let name = format!("{}.spt", trees.get(tree)?.to_ascii_lowercase());
@@ -1047,8 +1050,13 @@ impl<'a> Loader<'a> {
                     scale,
                     color,
                     leaf_angle_scalars: spt.leaf_angle_scalars,
-                    wind_offset: 0.0,
+                    // The game draws `rand() % 100` per placement (0x5cbfb7) and hands out
+                    // its five winds in creation order (0x531de6); ours follow the
+                    // placement's order, so they repeat from load to load.
+                    wind_offset: (placed_trees.wrapping_mul(37) % 100) as f32,
+                    wind: placed_trees % 5,
                 };
+                placed_trees += 1;
                 let (near, far) = TreeLod::range(radius * scale, 0);
                 for (mesh, material, part, levels) in &spt.parts {
                     let draw = self.scene.draws.len();
@@ -2393,6 +2401,19 @@ impl AreaScene {
         l.scene.clouds = arl.clouds;
         l.scene.sunlight_direction = arl.sunlight_direction.map(Vec3::from_array);
         l.scene.cutaway_height = Some(arl.cutaway_height);
+        // The level's wind file, `<level>_<n>.wnd` (one per level).
+        let prefix = format!("{}_", level.to_ascii_lowercase());
+        let wnd = vfs
+            .names()
+            .into_iter()
+            .find(|n| n.starts_with(&prefix) && n.ends_with(".wnd"));
+        if let Some(name) = wnd {
+            match l.read(&name).map(|d| thedas_formats::level::Wnd::parse(&d)) {
+                Ok(Ok(w)) => l.scene.wind = Some((w.strength, w.direction)),
+                Ok(Err(e)) => l.warn(format!("{name}: {e}")),
+                Err(e) => l.warn(e.to_string()),
+            }
+        }
         // Characters (the objects' scene) take the sun's character colour.
         l.scene.sun = arl.sun.map(|s| {
             let color = if level_meshes {

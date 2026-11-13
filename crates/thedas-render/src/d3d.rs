@@ -646,18 +646,43 @@ pub struct TreeConstants {
     pub leaf_angle_scalars: [f32; 2],
     /// `g_fWindMatrixOffset`: which of the six wind matrices index 0 means.
     pub wind_offset: f32,
+    /// Which of the level's five winds (0.2 s apart) moves it.
+    pub wind: usize,
+}
+
+/// One wind's state for a frame (docs/speedtree 7.11): its six matrices and eight leaf
+/// (rock, rustle) angles in radians.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindFrame {
+    pub matrices: [[[f32; 4]; 4]; 6],
+    pub leaf_angles: [[f32; 2]; 8],
+}
+
+impl WindFrame {
+    /// No wind: identity matrices, leaves at rest.
+    pub const STILL: WindFrame = WindFrame {
+        matrices: [[
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]; 6],
+        leaf_angles: [[0.0; 2]; 8],
+    };
 }
 
 impl TreeConstants {
     /// A constant of the `spt_*` shaders, when `name` is one: the per-placement ones,
     /// `g_vCameraAngles` from the camera looking along `forward`, the sun (`g_vLightDir`
-    /// towards it, `g_vLightDiffuse`), and the wind held still (identity matrices, no leaf
-    /// rocking). Provisional: the wind is not animated.
+    /// towards it, `g_vLightDiffuse`), and the wind's matrices and leaf angles
+    /// (`g_amWindMatrices`: the six matrices' rows, then an identity the shaders never
+    /// reach; `g_vLeafAngles`: (rock, rustle) per entry, the rest zero).
     pub fn value(
         &self,
         name: &str,
         forward: Vec3,
         sun: Option<(Vec3, Vec3)>,
+        wind: &WindFrame,
     ) -> Option<Vec<[f32; 4]>> {
         let yaw = self.position[3];
         Some(match name {
@@ -675,14 +700,19 @@ impl TreeConstants {
             }
             "g_fWindMatrixOffset" => vec![[self.wind_offset, 0.0, 0.0, 0.0]],
             "g_fAlphaMultiplier" => vec![[1.0, 0.0, 0.0, 0.0]],
-            "g_amWindMatrices" => (0..28)
+            "g_amWindMatrices" => wind
+                .matrices
+                .iter()
+                .chain(&WindFrame::STILL.matrices[..1])
+                .flatten()
+                .copied()
+                .collect(),
+            "g_vLeafAngles" => (0..20)
                 .map(|i| {
-                    let mut r = [0.0; 4];
-                    r[i % 4] = 1.0;
-                    r
+                    let [rock, rustle] = wind.leaf_angles.get(i).copied().unwrap_or_default();
+                    [rock, rustle, 0.0, 0.0]
                 })
                 .collect(),
-            "g_vLeafAngles" => vec![[0.0; 4]; 20],
             "g_vCameraAngles" => {
                 // The tree library's camera angles (azimuth = atan2(y, x) of the view
                 // direction, pitch = −asin(z)), the azimuth wrapped into [0, 2π) (0x52d810).
@@ -735,6 +765,9 @@ pub struct ConstantContext<'a> {
     pub partition: Option<Mat4>,
     /// For a SpeedTree draw with the game's shaders: its placement's constants.
     pub tree: Option<&'a TreeConstants>,
+    /// The level's winds this frame ([`TreeConstants::wind`] picks one); empty holds the
+    /// trees still.
+    pub winds: &'a [WindFrame],
 }
 
 /// The ambient term's base (see the module docs): zero at every Graphics Detail setting
@@ -914,7 +947,8 @@ impl ConstantContext<'_> {
         }
         if let Some(t) = self.tree {
             let forward = -self.view.inverse().z_axis.truncate();
-            if let Some(v) = t.value(&c.name, forward, self.sun) {
+            let wind = self.winds.get(t.wind).unwrap_or(&WindFrame::STILL);
+            if let Some(v) = t.value(&c.name, forward, self.sun, wind) {
                 return Some(Value::Vectors(v));
             }
         }
@@ -1056,6 +1090,8 @@ impl ConstantContext<'_> {
                 | "aur_mModelView"
                 | "g_vCameraPosition"
                 | "g_vCameraAngles"
+                | "g_amWindMatrices"
+                | "g_vLeafAngles"
                 | "bsm_bones"
         )
     }
@@ -1303,6 +1339,7 @@ mod tests {
             shadow: NO_SHADOW_DATA,
             partition: None,
             tree: None,
+            winds: &[],
         };
         let t = table(vec![
             constant(
@@ -1437,6 +1474,7 @@ mod tests {
             shadow: NO_SHADOW_DATA,
             partition: None,
             tree: None,
+            winds: &[],
         };
         let c = cc.fill(Some(&table(vec![constant(
             "mml_vTintColor",
@@ -1526,6 +1564,7 @@ mod tests {
                 shadow: NO_SHADOW_DATA,
                 partition: None,
                 tree: None,
+                winds: &[],
             };
             let c = cc.fill(Some(&table(vec![constant(
                 "aur_mWorld",
