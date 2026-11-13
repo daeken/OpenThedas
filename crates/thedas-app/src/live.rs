@@ -1139,8 +1139,14 @@ impl Live {
         let view = self
             .cutscene_camera
             .camera(&sim, base, &|id| drawn_root(posed, id));
-        // Held for the conversation line it plays over (see `Live::conversation_camera`).
-        if let (Some(v), Some(line)) = (view, talk_line(&sim)) {
+        // Held for the conversation line it plays over (see `Live::conversation_camera`), when
+        // that line is the one that played it: City Elf's first line plays its own cuts and
+        // keeps their last view for its replies (reference city_elf_opening_shianni.png),
+        // while Vaughan's line 40 comes up during line 39's 45005.cut and takes its own
+        // stage camera (soris_decision, reference vaughan_scene/v_15). Provisional, from the
+        // two reference sequences.
+        let own = talk_line(&sim).filter(|l| l.2.is_some() && l.2 == sim.cutscene_line());
+        if let (Some(v), Some(line)) = (view, own) {
             self.cut_held = Some((line, v));
         }
         view
