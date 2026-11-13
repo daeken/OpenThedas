@@ -32,6 +32,60 @@ fn drawn_root(
     (t.is_finite() && r.is_finite()).then(|| (t.to_array(), r.to_array()))
 }
 
+/// A cutscene's light actors as lights of the scene: for each, the point lights of the
+/// light model (`base_light`: one for characters, one for the level; read into `model` the
+/// first time) placed with the actor, with the radius, colour and intensity the actor's
+/// tracks have set, the model's own where they have not. DAOrigins.exe sets a track's value
+/// on every point light of the actor's model alike (0x7d0b80, 0x7d0c00, 0x7d0c80).
+fn cut_scene_lights(
+    model: &mut Option<Vec<thedas_render::scene::SceneLight>>,
+    vfs: &Vfs,
+    lights: &[crate::cutactors::CutLight],
+) -> Vec<thedas_render::scene::SceneLight> {
+    use thedas_render::scene::{LightRig, SceneLight};
+    if lights.is_empty() {
+        return Vec::new();
+    }
+    let nodes = model.get_or_insert_with(|| {
+        LightRig::load(vfs, thedas_sim::cuttracks::LIGHT_MODEL, "", Mat4::IDENTITY).lights
+    });
+    lights
+        .iter()
+        .flat_map(|l| {
+            let q = glam::Quat::from_array(l.rotation);
+            let q = if q.is_finite() && q.length_squared() > 0.0 {
+                q.normalize()
+            } else {
+                glam::Quat::IDENTITY
+            };
+            let placed = Mat4::from_rotation_translation(q, glam::Vec3::from_array(l.position));
+            nodes.iter().filter_map(move |n| match n {
+                SceneLight::Point {
+                    position,
+                    color,
+                    radius,
+                    name,
+                    domain,
+                    is_static,
+                    version,
+                    ..
+                } => Some(SceneLight::Point {
+                    position: placed.transform_point3(*position),
+                    color: l.show.color.map_or(*color, glam::Vec3::from_array),
+                    radius: l.show.radius.unwrap_or(*radius),
+                    name: name.clone(),
+                    domain: *domain,
+                    is_static: *is_static,
+                    version: *version,
+                    intensity: l.show.intensity.unwrap_or(1.0),
+                    room: None,
+                }),
+                SceneLight::Ambient { .. } => None,
+            })
+        })
+        .collect()
+}
+
 /// What the objects' scene was built for: each object's models. A change rebuilds it.
 type ObjectsKey = Vec<(u32, Vec<String>)>;
 
@@ -215,6 +269,9 @@ pub struct Live {
     cutscene_camera: crate::cutcam::CutsceneCamera,
     /// The creatures cutscenes and conversation lines pose (see [`crate::cutactors`]).
     cut_actors: crate::cutactors::CutsceneActors,
+    /// The point lights of the cutscenes' light model, in the model's own space; read when
+    /// a cutscene first shows a light.
+    cut_light_model: Option<Vec<thedas_render::scene::SceneLight>>,
     /// The creatures' head trackers, and the shaders' clock when they were last advanced.
     looks: crate::looks::Looks,
     looks_clock: Option<f64>,
@@ -579,6 +636,7 @@ impl Live {
             talk_camera: Default::default(),
             cutscene_camera: Default::default(),
             cut_actors: Default::default(),
+            cut_light_model: None,
             looks: Default::default(),
             looks_clock: None,
             shader_time: 0.0,
@@ -1488,6 +1546,7 @@ impl Live {
         let shown = self
             .cut_actors
             .shown(&sim, tracks, &|id| drawn_root(posed, id));
+        let cut_lights = shown.lights;
         let mut posing = shown.actors;
         for (m, show) in shown.own {
             posing.insert(m.id, show);
@@ -1706,6 +1765,12 @@ impl Live {
                 self.opacity.get(&m.id).copied().unwrap_or(1.0)
             };
             objects.renderer.set_prop_opacity(ctx, &objects.scene, i, o);
+        }
+        // A cutscene's lights join the level's, for the level and for the objects.
+        let lights = cut_scene_lights(&mut self.cut_light_model, &level.vfs, &cut_lights);
+        objects.renderer.set_extra_lights(&lights);
+        if let Some(level) = self.level.as_mut() {
+            level.renderer.set_extra_lights(&lights);
         }
         self.posed = models
             .iter()

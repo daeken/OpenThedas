@@ -683,6 +683,15 @@ impl UiMovie {
             // standalone Flash player: label names for text, test content (popuplayer.gfx's
             // "Sell how many items?" box) and art left where it was authored.
             .with_load_behavior(ruffle_core::LoadBehavior::Blocking)
+            // No script timeout. Ruffle's release default stops a movie's scripts for good
+            // once one update has run for 15 seconds (a browser's guard against a runaway
+            // movie), and it counts everything the update waits on: on a very slow start (a
+            // software renderer, a cold disk) conversation.gfx's first update took far
+            // longer, its scripts were halted, and the conversation showed the movie as it
+            // was authored (letterbox bars at the 4:3 stage's width, sample text in the
+            // subtitle) until it was closed. The game's own movies are trusted and the
+            // original has no such limit.
+            .with_max_execution_duration(std::time::Duration::MAX)
             .with_movie(movie)
             .build();
         if let Ok(mut p) = player.lock() {
