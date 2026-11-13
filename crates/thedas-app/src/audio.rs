@@ -1781,6 +1781,40 @@ impl GameAudio {
                     all.len(),
                     all.iter().filter(|o| **o >= 1.0).count()
                 );
+                // The nearest muffled ones, as places to go and listen: each is heard
+                // (muffled) from within its reach of where it stands.
+                let mut near: Vec<(f32, f32, &AreaSound)> = a
+                    .sounds
+                    .iter()
+                    .filter(|s| s.occludable && s.region.is_none() && s.active)
+                    .filter_map(|s| {
+                        let o = self.occluders.set.between(listener, s.position);
+                        let d = (0..3)
+                            .map(|k| (s.position[k] - listener[k]).powi(2))
+                            .sum::<f32>()
+                            .sqrt();
+                        (o > 0.0).then_some((d, o, s))
+                    })
+                    .collect();
+                near.sort_by(|x, y| x.0.total_cmp(&y.0));
+                for (d, o, s) in near.into_iter().take(3) {
+                    let project = s.event.split('/').next().unwrap_or("");
+                    let reach = self
+                        .engine
+                        .library
+                        .project(project)
+                        .and_then(|f| f.event(&s.event).map(|e| e.max_distance))
+                        .unwrap_or(0.0)
+                        * s.max_distance_mult.max(0.0);
+                    log::debug!(
+                        "audio: occlusion: {} at [{:.1}, {:.1}, {:.1}] ({d:.1} m away, heard \
+                         within {reach:.1} m) is muffled {o:.2}",
+                        s.event,
+                        s.position[0],
+                        s.position[1],
+                        s.position[2]
+                    );
+                }
             }
         }
         for i in 0..a.sounds.len() {
