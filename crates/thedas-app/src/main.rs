@@ -57,6 +57,7 @@ mod cutactors;
 mod cutcam;
 mod focusnav;
 mod follow;
+mod glb;
 mod intro;
 mod live;
 mod looks;
@@ -1779,6 +1780,12 @@ impl App {
                 modmode::Action::World(a) => self.mod_mode_world(a),
                 modmode::Action::Fly(on) => self.set_fly(on),
                 modmode::Action::FlyTo(id) => self.fly_to(id),
+                modmode::Action::Export(id) => {
+                    let note = self.export_glb(id);
+                    if let Some(m) = self.mod_mode.as_mut() {
+                        m.exported = Some(note);
+                    }
+                }
             }
         }
     }
@@ -1826,6 +1833,94 @@ impl App {
             return;
         }
         self.follow = (!on).then(|| follow::Follow::behind(self.camera.yaw));
+    }
+
+    /// Writes object `id`'s models for Blender into the player's folder,
+    /// `workspace/blender/<tag>/`: `<tag>.glb`, its textures as PNGs and `manifest.json`
+    /// (see [`glb`]). Says what it wrote, or why not.
+    fn export_glb(&mut self, id: thedas_script::vm::ObjectId) -> String {
+        let Some(live) = self.live.as_ref() else {
+            return "Export: not playing".into();
+        };
+        let (subject, drawn, vfs) = {
+            let sim = live.sim();
+            let Some(o) = sim.world.get(id) else {
+                return "Export: the object is gone".into();
+            };
+            let subject = glb::Subject {
+                id,
+                tag: o.tag.clone(),
+                area: o.area.and_then(|a| sim.world.get(a)).map(|a| a.tag.clone()),
+                template: o.template.clone(),
+                position: o.position,
+                facing: o.facing,
+            };
+            (
+                subject,
+                thedas_ui::models::object_models(&sim, o),
+                sim.vfs.clone(),
+            )
+        };
+        if drawn.models.is_empty() {
+            return format!("Export: {} draws no model", subject.tag);
+        }
+        let read = |name: &str| {
+            vfs.read(name).ok().map(|(data, p)| glb::Read {
+                data,
+                layer: p.layer_label,
+                entry: p.entry,
+            })
+        };
+        let mut e = glb::export(&read, &subject, &drawn.models);
+        e.manifest["left_out"] = serde_json::json!({
+            "attached": drawn.attached.iter().map(|a| [&a.model, &a.node]).collect::<Vec<_>>(),
+            "morph": drawn.morph,
+            "tints": drawn.tints,
+        });
+        let safe: String = subject
+            .tag
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let dir = saves::data_dir()
+            .join("workspace")
+            .join("blender")
+            .join(&safe);
+        let write = || -> std::io::Result<()> {
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join(format!("{safe}.glb")), &e.glb)?;
+            for (name, png) in &e.images {
+                std::fs::write(dir.join(name), png)?;
+            }
+            let manifest = serde_json::to_vec_pretty(&e.manifest).unwrap_or_default();
+            std::fs::write(dir.join("manifest.json"), manifest)
+        };
+        match write() {
+            Ok(()) => {
+                let meshes = glb::check(&e.glb).unwrap_or(0);
+                let note = format!(
+                    "Exported {} ({} models, {meshes} meshes, {} textures{}) to {}",
+                    subject.tag,
+                    drawn.models.len(),
+                    e.images.len(),
+                    if e.warnings.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {} warnings in the manifest", e.warnings.len())
+                    },
+                    dir.display()
+                );
+                log::info!("{note}");
+                note
+            }
+            Err(err) => format!("Export to {} failed: {err}", dir.display()),
+        }
     }
 
     /// The camera flies free and looks at object `id`.
@@ -3382,6 +3477,10 @@ impl App {
             },
             Step::ModWorld => log.push(self.mod_mode_world_step(None)),
             Step::ModPlot(name) => log.push(self.mod_mode_world_step(Some(name))),
+            Step::ModExport => match self.mod_mode.as_ref().and_then(|m| m.selected) {
+                Some(id) => log.push(self.export_glb(id)),
+                None => log.push("modexport: nothing inspected".into()),
+            },
             Step::ModLocal(who, name, kind, value) => {
                 log.push(self.mod_mode_local(who, name, kind, value))
             }
@@ -4816,6 +4915,8 @@ enum Step {
     ModWorld,
     /// The world-state browser looks up a plot (`modplot NAME`).
     ModPlot(String),
+    /// The inspected object's models are exported for Blender (`modexport`).
+    ModExport,
     /// A variable set from the world-state browser (`modlocal WHO NAME TYPE VALUE`, WHO
     /// `module`, `area` or an object's tag; TYPE `int`, `float`, `string`, `object` or
     /// `resource`, or `remove` with no value).
@@ -5202,6 +5303,7 @@ fn parse_step(s: &str) -> Result<Step> {
         "modflyto" => Step::ModFlyTo,
         "modworld" => Step::ModWorld,
         "modplot" if !arg.is_empty() => Step::ModPlot(arg.to_string()),
+        "modexport" => Step::ModExport,
         "modlocal" => {
             let mut w = arg.splitn(4, ' ');
             let (Some(who), Some(name), Some(kind)) = (w.next(), w.next(), w.next()) else {
@@ -5500,6 +5602,7 @@ fn main() -> Result<()> {
                     | Step::ModFlyTo
                     | Step::ModWorld
                     | Step::ModPlot(_)
+                    | Step::ModExport
                     | Step::ModLocal(..) => {
                         println!("mod mode: windowed only")
                     }
