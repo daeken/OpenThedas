@@ -810,6 +810,12 @@ impl UiLayer {
         screens.menu = Some(Screen::SaveLoad);
     }
 
+    /// Shows the start menu's buttons, logo and log-in line again, when the menu is up.
+    fn start_menu_back(&mut self) {
+        self.stage
+            .call_in("startmenu2.gfx", "StartMenu.ShowContents", &[]);
+    }
+
     /// The start menu's and the game menu's messages: options (`GameModeController.
     /// PushGUIScreen Options`), the game menu closing itself (`HideGUIScreen MainMenu`), and
     /// back to the start menu (`ExitToStartMenuMessage`, from the game menu;
@@ -830,6 +836,16 @@ impl UiLayer {
             {
                 screens.menu = None;
                 self.requests.push(FrontEnd::Report);
+            }
+            // The start menu hides its own buttons (`StartMenu.HideContents`) before it asks
+            // for a screen this game does not have yet: the credits, and the online profile
+            // behind "Player Profile". Its buttons are put back at once
+            // (`StartMenu.ShowContents`, the movie's own), so the player is not left on the
+            // bare title picture with no way back. Provisional: the original shows those
+            // screens and puts the menu back when they close.
+            "GameModePregame.ShowCredits" => self.start_menu_back(),
+            "GameModeController.PushGUIScreen" if first == Some("GUICommunityFeatures") => {
+                self.start_menu_back();
             }
             "GameModeController.HideGUIScreen" if first == Some("MainMenu") => {
                 if screens.menu == Some(Screen::GameMenu) {
