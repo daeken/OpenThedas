@@ -156,6 +156,9 @@ pub enum FrontEnd {
     /// The game menu's "Report Issue" (its online-features button, relabelled; see
     /// `UiLayer::front_end_message`): an issue report, as F8 makes one.
     Report,
+    /// The game menu's "Mod Mode" (a button the interface adds): mod mode's panels open or
+    /// close, as F10 does.
+    ModMode,
 }
 
 impl std::fmt::Debug for FrontEnd {
@@ -166,6 +169,7 @@ impl std::fmt::Debug for FrontEnd {
             FrontEnd::StartMenu => write!(f, "StartMenu"),
             FrontEnd::Quit => write!(f, "Quit"),
             FrontEnd::Report => write!(f, "Report"),
+            FrontEnd::ModMode => write!(f, "ModMode"),
         }
     }
 }
@@ -245,6 +249,9 @@ fn branches_pass(paths: &[&str], multiply: &[&str]) -> thedas_ui::MultiplyPass {
 /// are placed over its first moments), and how often.
 const DEATH_SETTLE_MS: f64 = 6000.0;
 const DEATH_LOOK_MS: f64 = 250.0;
+
+/// The message the game menu's "Mod Mode" button sends (see `UiLayer::mod_mode_button`).
+const MOD_MODE_MESSAGE: &str = "OpenThedas.ModMode";
 
 /// For how long after a large notification becomes the first its splash is looked for
 /// (its clip replaces the one before within a few of the movie's frames).
@@ -372,6 +379,8 @@ pub struct UiLayer {
     /// The game menu's online-features button has been relabelled "Report Issue" since
     /// mainmenu.gfx was loaded (see `UiLayer::report_button`).
     report_labelled: bool,
+    /// The game menu's "Mod Mode" button has been added to the mainmenu.gfx now up.
+    mod_button_added: bool,
     text_answers: Vec<TextAnswer>,
     /// A party portrait was clicked (see [`UiLayer::mouse_button`]).
     portrait_clicked: Option<u32>,
@@ -790,6 +799,7 @@ impl UiLayer {
             script_popup: None,
             text_popup: None,
             report_labelled: false,
+            mod_button_added: false,
             text_answers: Vec::new(),
             portrait_clicked: None,
             uber_splash: None,
@@ -907,6 +917,14 @@ impl UiLayer {
             {
                 screens.menu = None;
                 self.requests.push(FrontEnd::Report);
+            }
+            // The game menu's "Mod Mode" (see `mod_mode_button`): the menu closes and mod
+            // mode's panels open over the game.
+            MOD_MODE_MESSAGE => {
+                if screens.menu == Some(Screen::GameMenu) {
+                    screens.menu = None;
+                }
+                self.requests.push(FrontEnd::ModMode);
             }
             // The start menu hides its own buttons (`StartMenu.HideContents`) before it asks
             // for a screen this game does not have yet: the credits, and the online profile
@@ -1518,6 +1536,120 @@ impl UiLayer {
         self.report_labelled = true;
     }
 
+    /// The game menu gets a "Mod Mode" button under "Report Issue" (ours: the original has
+    /// none), which opens mod mode's panels (`FrontEnd::ModMode`). It is a copy of the menu's
+    /// own button (`Screenshots_mc`, duplicated with its class), placed one row down; the
+    /// ornament and "Exit Game" under it move down a row to make room, once the menu has
+    /// faded in. Its action sends
+    /// [`MOD_MODE_MESSAGE`] (`_global.thedas_button_message`). Added once mainmenu.gfx has
+    /// laid out its buttons, each time it is loaded.
+    fn mod_mode_button(&mut self) {
+        const MOVIE: &str = "mainmenu.gfx";
+        const NAME: &str = "ModMode_mc";
+        if !self.stage.movies.iter().any(|m| m.name == MOVIE) {
+            self.mod_button_added = false;
+            return;
+        }
+        if self.mod_button_added {
+            return;
+        }
+        let Some(thedas_ui::UiValue::String(tree)) =
+            self.stage.call_in(MOVIE, "_global.thedas_tree_list", &[])
+        else {
+            return;
+        };
+        let paths: Vec<&str> = tree
+            .split(';')
+            .filter_map(|e| e.split('|').next())
+            .collect();
+        let find = |name: &str| {
+            paths
+                .iter()
+                .find(|p| p.ends_with(&format!(".{name}")))
+                .map(|p| p.to_string())
+        };
+        let (Some(source), Some(options), Some(exit)) =
+            (find("Screenshots_mc"), find("Options_mc"), find("Exit_mc"))
+        else {
+            return;
+        };
+        let Some((parent, _)) = source.rsplit_once('.') else {
+            return;
+        };
+        let parent = parent.to_string();
+        let num = |v: Option<thedas_ui::UiValue>| match v {
+            Some(thedas_ui::UiValue::Number(n)) => Some(n),
+            Some(thedas_ui::UiValue::String(s)) => s.parse::<f64>().ok(),
+            _ => None,
+        };
+        let stage = &mut self.stage;
+        // Not while the menu fades in: its buttons' timeline sets their opacity frame by
+        // frame, and a clip a script has moved is left where the timeline last put it.
+        if num(stage.call_in(MOVIE, &format!("{exit}._alpha.valueOf"), &[])) != Some(100.0) {
+            return;
+        }
+        let mut y = |path: &str| num(stage.call_in(MOVIE, &format!("{path}._y.valueOf"), &[]));
+        let (Some(source_y), Some(options_y), Some(exit_y)) = (y(&source), y(&options), y(&exit))
+        else {
+            return;
+        };
+        // One row: the distance between two buttons in the list.
+        let row = source_y - options_y;
+        if row <= 0.0 {
+            return;
+        }
+        // The ornament between "Report Issue" and "Exit Game": the parent's unnamed clips.
+        let ornaments: Vec<String> = paths
+            .iter()
+            .filter(|p| {
+                p.strip_prefix(&parent)
+                    .and_then(|r| r.strip_prefix(".instance"))
+                    .is_some_and(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_digit()))
+            })
+            .map(|p| p.to_string())
+            .collect();
+        let depth = num(self
+            .stage
+            .call_in(MOVIE, &format!("{parent}.getNextHighestDepth"), &[]))
+        .unwrap_or(1000.0);
+        use thedas_ui::UiValue;
+        self.stage.call_in(
+            MOVIE,
+            &format!("{source}.duplicateMovieClip"),
+            &[UiValue::String(NAME.into()), UiValue::Number(depth)],
+        );
+        let button = format!("{parent}.{NAME}");
+        let made = self
+            .stage
+            .call_in(MOVIE, &format!("{button}._y.valueOf"), &[]);
+        if num(made).is_none() {
+            return;
+        }
+        if let Some(m) = self.stage.movies.iter_mut().find(|m| m.name == MOVIE) {
+            m.set(&format!("{button}._y"), UiValue::Number(source_y + row));
+            m.set(&format!("{exit}._y"), UiValue::Number(exit_y + row));
+            for o in &ornaments {
+                if let Some(oy) = num(Some(m.call(&format!("{o}._y.valueOf"), &[]))) {
+                    m.set(&format!("{o}._y"), UiValue::Number(oy + row));
+                }
+            }
+        }
+        self.stage.call_in(
+            MOVIE,
+            &format!("{button}.SetText"),
+            &[UiValue::String("Mod Mode".into())],
+        );
+        self.stage.call_in(
+            MOVIE,
+            "_global.thedas_button_message",
+            &[
+                UiValue::String(button),
+                UiValue::String(MOD_MODE_MESSAGE.into()),
+            ],
+        );
+        self.mod_button_added = true;
+    }
+
     /// Shows the engine's own text box once its values have reached the movie.
     fn show_text_popup(&mut self) {
         let Some((_, frames)) = self.text_popup.as_mut() else {
@@ -2017,6 +2149,7 @@ impl UiLayer {
         self.show_script_popup(sim);
         self.show_text_popup();
         self.report_button();
+        self.mod_mode_button();
         self.select_clicked_portrait(sim);
         self.uber_alert_splash(sim, dt_ms);
         self.death_blood(dt_ms);

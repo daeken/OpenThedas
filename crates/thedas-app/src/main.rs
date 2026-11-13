@@ -3586,6 +3586,11 @@ impl App {
                     continue;
                 }
                 // The game menu's Report Issue: an issue report, as F8 makes one.
+                // The game menu's Mod Mode: mod mode's panels, as F10 opens them.
+                ui::FrontEnd::ModMode => {
+                    self.toggle_mod_mode();
+                    continue;
+                }
                 ui::FrontEnd::Report => {
                     self.report(None, None);
                     continue;
@@ -5788,7 +5793,9 @@ fn main() -> Result<()> {
                     for r in std::mem::take(&mut layer.requests) {
                         println!("front end: {r:?}");
                         let start = match &r {
-                            ui::FrontEnd::Quit | ui::FrontEnd::Report => continue,
+                            ui::FrontEnd::Quit | ui::FrontEnd::Report | ui::FrontEnd::ModMode => {
+                                continue;
+                            }
                             ui::FrontEnd::NewGame => live::Start::NewGame,
                             ui::FrontEnd::Load(b) => live::Start::SaveBytes(b),
                             ui::FrontEnd::StartMenu => live::Start::Menu,
