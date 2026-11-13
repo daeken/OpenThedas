@@ -147,6 +147,32 @@ impl DaoInstall {
         Ok(files)
     }
 
+    /// The number the original holds a registry item's `GameVersion` against: the first two
+    /// dot-separated parts of its executable's `FileVersion` string, read as a number
+    /// (`1.05.13263.0` gives 1.05). Traced: the gate at 0x5ede19 asks its platform object
+    /// (`Eclipse::PlatformWin32`, virtual slot +0x5c, function 0x4142c0) for the version, and
+    /// that function reads the `\StringFileInfo\<lang>\FileVersion` string of its own module's
+    /// version resource; the gate then cuts it at the second `.` (0x5ede33..0x5ede5b).
+    ///
+    /// `None`, which skips the gate, when the install has no `bin_ship/DAOrigins.exe` or the
+    /// string cannot be found in it, and for Dragon Age II: without the executable there is
+    /// nothing to hold an add-in against, and dropping add-ins on a guess would be worse.
+    pub fn game_version(&self) -> Option<f64> {
+        if self.game() != Game::Origins {
+            return None;
+        }
+        let exe = resolve_ci(&self.root, "bin_ship/DAOrigins.exe").filter(|p| p.is_file())?;
+        let bytes = std::fs::read(exe).ok()?;
+        let version = file_version_string(&bytes)?;
+        let mut parts = version.splitn(3, '.');
+        let two = match (parts.next(), parts.next()) {
+            (Some(major), Some(minor)) => format!("{major}.{minor}"),
+            (Some(major), None) => major.to_string(),
+            _ => return None,
+        };
+        Some(leading_number(&two))
+    }
+
     /// DLC packages, in the order the stack takes them (lowest first; see `sort_addins`).
     ///
     /// The original keeps one registry of add-ins, `AddIns.xml`, and many shipped add-ins (the
@@ -165,15 +191,18 @@ impl DaoInstall {
         let dir = join_ci(&self.root, "Addins");
         let mut out: Vec<AddIn> = Vec::new();
         let install_registry = join_ci(&self.root, "__support/userdocs/AddIns.xml");
-        let game_version = (self.game() == Game::Origins).then_some(ORIGINS_VERSION);
+        let game_version = self.game_version();
         for registry in registries.iter().chain([&install_registry]) {
             let Ok(bytes) = std::fs::read(registry) else {
                 continue;
             };
-            for item in registry_items(&String::from_utf8_lossy(&bytes), game_version) {
+            for (item, left_out) in registry_items(&String::from_utf8_lossy(&bytes), game_version) {
                 let known = out.iter().any(|a| a.uid.eq_ignore_ascii_case(&item.uid));
                 let folder = resolve_ci(&dir, &item.uid).filter(|d| d.is_dir());
                 if let (false, Some(folder)) = (known, folder) {
+                    if let Some(why) = left_out {
+                        log_left_out(&item.uid, &why);
+                    }
                     out.push(AddIn {
                         dir: folder,
                         rank: Some(out.len()),
@@ -540,8 +569,11 @@ fn archives_in(dir: &Path) -> Result<Vec<PathBuf>> {
 /// The `<GameVersion>` child is a gate too (record byte +0x177: set at 0x5ede12, cleared at
 /// 0x5edea4 when the number read from the item's `GameVersion` is greater than the number read
 /// from the running game's version): an add-in made for a newer game is not registered.
-/// `game_version` is the game's side of that comparison; `None` skips the gate.
-fn registry_items(text: &str, game_version: Option<f64>) -> Vec<AddIn> {
+/// `game_version` is the game's side of that comparison ([`DaoInstall::game_version`]); `None`
+/// skips the gate.
+///
+/// Each item comes with the reason it is left out, when it is.
+fn registry_items(text: &str, game_version: Option<f64>) -> Vec<(AddIn, Option<String>)> {
     let mut out = Vec::new();
     let mut rest = text;
     while let Some(start) = rest.find("<AddInItem") {
@@ -567,20 +599,65 @@ fn registry_items(text: &str, game_version: Option<f64>) -> Vec<AddIn> {
             leading_number(&value[..value.find('<').unwrap_or(value.len())])
         });
         let mut addin = addin_from_manifest(tag, PathBuf::new(), String::new());
-        addin.enabled &= matches!(kind, Some(1 | 2));
-        addin.enabled &= game_version.is_none_or(|game| needs <= game);
+        let why = if !addin.enabled {
+            Some("its registry entry says Enabled=\"0\"".to_string())
+        } else if !matches!(kind, Some(1 | 2)) {
+            Some(match kind {
+                Some(k) => format!("its registry entry has Type {k}, not 1 or 2"),
+                None => "its registry entry has no Type".to_string(),
+            })
+        } else {
+            game_version
+                .filter(|game| needs > *game)
+                .map(|game| format!("it asks for game version {needs}, and this game is {game}"))
+        };
+        addin.enabled = why.is_none();
         if !addin.uid.is_empty() {
-            out.push(addin);
+            out.push((addin, why));
         }
     }
     out
 }
 
-/// The game version Dragon Age: Origins' final executable reports, for the registry's
-/// `GameVersion` gate. Provisional: the original compares against a version string it builds
-/// at run time (0x5ede19..0x5ede77), not read; 1.05 is the last retail patch, which the GOG
-/// build is.
-const ORIGINS_VERSION: f64 = 1.05;
+/// Says once per process that an add-in on disk is not mounted, and why.
+fn log_left_out(uid: &str, why: &str) {
+    static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let Ok(mut said) = SAID.lock() else { return };
+    if !said.iter().any(|u| u == uid) {
+        said.push(uid.to_string());
+        log::info!("add-ins: {uid} is installed but not mounted: {why}");
+    }
+}
+
+/// The `FileVersion` string of a Windows executable's version resource (`1.05.13263.0`),
+/// found by its UTF-16 key: the value follows the key and its padding. `None` when there is
+/// no such key or no text after it.
+fn file_version_string(exe: &[u8]) -> Option<String> {
+    let key: Vec<u8> = "FileVersion\0"
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    let mut from = 0;
+    while let Some(at) = exe[from..].windows(key.len()).position(|w| w == key) {
+        let mut i = from + at + key.len();
+        // The value is aligned to four bytes; padding is zero.
+        while exe.get(i..i + 2) == Some(&[0, 0]) && i < from + at + key.len() + 4 {
+            i += 2;
+        }
+        let units: Vec<u16> = exe[i..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|&u| u != 0)
+            .take(64)
+            .collect();
+        let text = String::from_utf16_lossy(&units);
+        if text.starts_with(|c: char| c.is_ascii_digit()) {
+            return Some(text);
+        }
+        from += at + key.len();
+    }
+    None
+}
 
 /// The number a C `wcstod` would read off the start of a string: leading spaces, an optional
 /// sign, digits with at most one point; 0 when there are no digits there (`V1.03` is 0).
@@ -1034,6 +1111,11 @@ mod tests {
             "install/Addins/with_manifest/Manifest.xml",
             br#"<AddInItem UID="WITH_MANIFEST" ExtendedModuleUID="Single Player" Priority="9" Enabled="1">"#,
         );
+        // The game's own version, for the `GameVersion` gate.
+        write(
+            "install/bin_ship/DAOrigins.exe",
+            &exe_with_version("1.05.13263.0"),
+        );
         write(
             "install/__support/userdocs/AddIns.xml",
             br#"<?xml version="1.0"?><AddInsList>
@@ -1120,6 +1202,45 @@ mod tests {
             .unwrap();
         assert!(vfs.lookup("p1.uti").is_some());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A stand-in for an executable: bytes with a version resource's `FileVersion` entry.
+    fn exe_with_version(version: &str) -> Vec<u8> {
+        let utf16 =
+            |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect() };
+        let mut out = b"MZ junk before".to_vec();
+        out.extend(utf16("\\VarFileInfo\\Translation\0"));
+        out.extend(utf16("FileVersion\0"));
+        out.extend([0, 0]);
+        out.extend(utf16(version));
+        out.extend([0, 0, 0, 0]);
+        out.extend(utf16("InternalName\0"));
+        out
+    }
+
+    #[test]
+    fn the_game_version_is_the_executables_file_version() {
+        assert_eq!(
+            file_version_string(&exe_with_version("1.05.13263.0")).as_deref(),
+            Some("1.05.13263.0")
+        );
+        assert_eq!(file_version_string(b"no version here"), None);
+        let root = std::env::temp_dir().join(format!("thedas-exever-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("packages/core")).unwrap();
+        let install = DaoInstall::open(&root).unwrap();
+        // No executable: no number, and so no gate.
+        assert_eq!(install.game_version(), None);
+        std::fs::create_dir_all(root.join("Bin_Ship")).unwrap();
+        std::fs::write(
+            root.join("Bin_Ship/daorigins.EXE"),
+            exe_with_version("1.05.13263.0"),
+        )
+        .unwrap();
+        assert_eq!(install.game_version(), Some(1.05));
+        std::fs::write(root.join("Bin_Ship/daorigins.EXE"), exe_with_version("1.0")).unwrap();
+        assert_eq!(install.game_version(), Some(1.0));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
