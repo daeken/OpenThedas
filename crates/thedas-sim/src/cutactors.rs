@@ -322,6 +322,7 @@ mod tests {
             id: 1,
             name: tag.into(),
             creature: None,
+            model: None,
             tag: Some(tag.into()),
             position: [0.0; 3],
             rotation: [0.0, 0.0, 0.0, 1.0],
