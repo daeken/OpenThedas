@@ -395,6 +395,21 @@ impl Sim {
             .collect()
     }
 
+    /// Whether a point lies in the doorway of a closed door of the area.
+    pub(crate) fn in_closed_doorway(
+        &mut self,
+        area: thedas_script::vm::ObjectId,
+        p: [f32; 3],
+    ) -> bool {
+        let Some(g) = self.nav_grid(area) else {
+            return false;
+        };
+        let Some(i) = g.cell(p).map(|c| (c.1 * g.columns + c.0) as usize) else {
+            return false;
+        };
+        self.closed_doors(area).iter().any(|d| d.1.contains(&i))
+    }
+
     /// Whether a placeable is a door: its appearance's state controller (`placeable_types`)
     /// is `StateCnt_Door`.
     pub fn is_door(&self, id: thedas_script::vm::ObjectId) -> bool {
@@ -1171,6 +1186,108 @@ mod tests {
                 .all(|c| by_radius.contains(c) || (c % w as usize) == 10),
             "{with_leaf:?}"
         );
+    }
+
+    /// The grid of [`grid`] with a closed door in the wall's gap, and a walker.
+    #[cfg(test)]
+    fn door_in_the_gap(
+        walker_at: [f32; 3],
+    ) -> (
+        Sim,
+        thedas_script::vm::ObjectId,
+        thedas_script::vm::ObjectId,
+        Arc<NavGrid>,
+    ) {
+        use crate::world::ObjectKind;
+        use thedas_formats::gda::Cell;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let t = crate::m2da::Tables::empty();
+        t.insert(
+            "placeable_types",
+            &["ID", "Label", "#9a320a51"],
+            vec![(
+                93,
+                vec![
+                    Cell::Int(93),
+                    Cell::String("Door".into()),
+                    Cell::String("StateCnt_Door".into()),
+                ],
+            )],
+        );
+        s.world.tables = Arc::new(t);
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        s.area_layouts.insert(area, "walled".into());
+        let g = Arc::new(grid());
+        s.nav_grids.insert("walled".into(), Some(g.clone()));
+        let door = s.world.spawn(ObjectKind::Placeable, "door");
+        {
+            let o = s.world.get_mut(door).unwrap();
+            o.area = Some(area);
+            o.appearance = 93;
+            o.position = [2.5, 2.5, 0.0];
+        }
+        let walker = s.world.spawn(ObjectKind::Creature, "walker");
+        {
+            let o = s.world.get_mut(walker).unwrap();
+            o.area = Some(area);
+            o.position = walker_at;
+        }
+        (s, walker, area, g)
+    }
+
+    #[test]
+    fn a_move_aimed_into_a_closed_doorway_ends_at_the_door_not_in_it() {
+        // A held stick aims three metres ahead, often into a doorway or onto the door
+        // itself: the walk's route stops at the door, and the walker must stay there. It was
+        // set down at the aimed point when the command ended: inside a locked door's
+        // doorway (Highever's hall door, where nothing then got the hero out) or past it.
+        for aim in [[2.5, 2.5, 0.0], [1.5, 2.5, 0.0], [3.4, 2.6, 0.0]] {
+            let (mut s, walker, area, g) = door_in_the_gap([0.5, 0.5, 0.0]);
+            let doorway = s.closed_doors(area)[0].1.clone();
+            s.order_move(walker, aim);
+            for _ in 0..200 {
+                s.tick(33);
+            }
+            let o = s.world.get(walker).unwrap();
+            let i = g
+                .cell(o.position)
+                .map(|c| (c.1 * g.columns + c.0) as usize)
+                .unwrap();
+            assert!(
+                !doorway.contains(&i),
+                "aimed at {aim:?}, set down in the doorway at {:?}",
+                o.position
+            );
+            assert!(
+                o.position[0] < 2.0,
+                "still on its own side: {:?}",
+                o.position
+            );
+        }
+    }
+
+    #[test]
+    fn a_walker_standing_in_a_closed_doorway_can_walk_out() {
+        // Set down in the middle of the doorway (by a save made there, a jump, the door
+        // shutting on it), every neighbouring cell is the door's or the wall's: no route
+        // could start, and every move failed against the door.
+        let (mut s, walker, area, _) = door_in_the_gap([2.5, 2.5, 0.0]);
+        assert_eq!(s.closed_doors(area).len(), 1);
+        let to = [0.5, 0.5, 0.0];
+        assert!(matches!(s.route_to(walker, to), Routed::Path(_)));
+        s.order_move(walker, to);
+        for _ in 0..200 {
+            s.tick(33);
+        }
+        let p = s.world.get(walker).unwrap().position;
+        assert!(crate::engine::dist(p, to) < 0.05, "{p:?}");
+        // Once out, the door is in the way again.
+        assert!(matches!(
+            s.route_to(walker, [4.5, 0.5, 0.0]),
+            Routed::Door(_)
+        ));
     }
 
     #[test]

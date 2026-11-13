@@ -2281,7 +2281,34 @@ impl Sim {
         let Some(g) = self.nav_grid(area) else {
             return Routed::Straight;
         };
-        let doors = self.closed_doors(area);
+        let mut doors = self.closed_doors(area);
+        // A mover standing in a closed door's doorway (set down there by a jump, a save, a
+        // body's push, or the door shutting on it) can walk out: the cells of that doorway
+        // on its own side of the leaf, those it reaches without the line from where it
+        // stands crossing a closed door's collision, do not block it. The far side stays
+        // shut. Without the leaf's collision (no game data) the whole doorway is open to it.
+        if let Some(own) = g.cell(from).map(|c| (c.1 * g.columns + c.0) as usize) {
+            if doors.iter().any(|d| d.1.contains(&own)) {
+                let leaves = self.door_sight(area);
+                let up = [0.0, 0.0, 1.0];
+                let eye = [from[0] + up[0], from[1] + up[1], from[2] + up[2]];
+                let near = |i: usize| {
+                    let c = ((i as u32) % g.columns, (i as u32) / g.columns);
+                    let m = g.center(c);
+                    let m = [m[0], m[1], crate::nav::height(&g, c) + 1.0];
+                    !leaves.solid.iter().any(|l| l.blocked(eye, m))
+                };
+                for d in doors.iter_mut().filter(|d| d.1.contains(&own)) {
+                    let far: Vec<usize> = d.1.iter().copied().filter(|&i| !near(i)).collect();
+                    // Standing inside the leaf itself every line is cut: let it out.
+                    d.1 = if far.len() == d.1.len() {
+                        Vec::new()
+                    } else {
+                        far
+                    };
+                }
+            }
+        }
         let blocked: std::collections::HashSet<usize> =
             doors.iter().flat_map(|d| d.1.iter().copied()).collect();
         if let Some(p) = crate::nav::route_avoiding(&g, from, to, &blocked) {
@@ -3124,16 +3151,31 @@ impl Sim {
         // jump the hero to a waypoint this way). Provisional: the jumper keeps its facing.
         let to_object =
             cmd.name.starts_with("CommandMoveToObject") || cmd.name == "CommandJumpToObject";
+        // A walk whose end lies in a closed door's doorway stopped at the door (its route is
+        // cut short there, see `Sim::route_to`): the walker stays where the route left it
+        // and is not set down at the end asked for, inside the doorway or past the leaf. (A
+        // held stick aims three metres ahead, often into a doorway: the hero was put in a
+        // locked door's doorway, or through it.) Jumps go where they say.
+        let walked = cmd.name.starts_with("CommandMoveTo");
+        let at_door = |s: &mut Self, p: [f32; 3], area: Option<ObjectId>| {
+            walked && area.is_some_and(|a| s.in_closed_doorway(a, p))
+        };
         if let (Some(t), true) = (cmd.target, to_object) {
             if let Some(p) = self.world.get(t).map(|o| (o.position, o.area)) {
-                if let Some(obj) = self.world.get_mut(id) {
-                    obj.position = p.0;
-                    obj.area = p.1;
+                if !at_door(self, p.0, p.1) {
+                    if let Some(obj) = self.world.get_mut(id) {
+                        obj.position = p.0;
+                        obj.area = p.1;
+                    }
                 }
             }
         }
         // A command's location is where it goes, except an ability's, which is where it lands.
-        if let Some(l) = cmd.location.filter(|_| cmd.name != "CommandUseAbility") {
+        let location = cmd
+            .location
+            .filter(|_| cmd.name != "CommandUseAbility")
+            .filter(|l| !at_door(self, l.position, Some(l.area)));
+        if let Some(l) = location {
             // Cross the triggers between where the move began and its end on the way (along
             // its route, or a straight line).
             let here = self.world.get(id).map(|o| (o.position, o.area));
