@@ -621,8 +621,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn its_shaders_translate_for_opengl() {
-        crate::gl_check::translates("cut effects", SHADER);
+    fn its_shaders_translate_for_every_backend() {
+        crate::backend_check::translates("cut effects", SHADER);
     }
 
     #[test]

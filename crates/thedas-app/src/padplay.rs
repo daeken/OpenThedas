@@ -107,6 +107,10 @@ pub struct PadPlay {
     pub controller: Controller,
     /// What A acts on (the D-pad cycles it).
     pub target: Option<ObjectId>,
+    /// The player picked the target (the D-pad, the stick's click): A keeps acting on it.
+    /// One A found by itself is only shown; the next A looks again, and walking drops it,
+    /// so A never goes back to something acted on earlier while a nearer thing is in front.
+    held: bool,
     /// The conversation reply picked (from 0), and the line it belongs to.
     pub reply: usize,
     reply_line: Option<(String, String)>,
@@ -273,6 +277,7 @@ impl PadPlay {
         });
         if !ok {
             self.target = None;
+            self.held = false;
         }
     }
 
@@ -302,7 +307,13 @@ impl PadPlay {
     fn apply(&mut self, order: Order, host: &mut dyn Host) -> Option<String> {
         match order {
             Order::Act(a) => self.act(a, host),
-            Order::Walk(v) => walk(host, v, self.group),
+            Order::Walk(v) => {
+                // Walking on leaves behind a target A found by itself.
+                if v != Vec2::ZERO && !self.held {
+                    self.target = None;
+                }
+                walk(host, v, self.group)
+            }
             Order::Camera { yaw, zoom } => {
                 let near = match host.follow() {
                     Some(f) => {
@@ -386,22 +397,26 @@ impl PadPlay {
                 "quickbar picker closed".into()
             }
             Action::FocusTarget => {
-                if self.target.is_none() {
+                if self.target.is_none() || !self.held {
                     self.target = best_in_front(host, false);
                 }
+                self.held = self.target.is_some();
                 self.target_message(host)
             }
             Action::NextTarget | Action::PrevTarget => {
                 let step = if a == Action::NextTarget { 1 } else { -1 };
                 self.target = cycle_target(host, self.target, step);
+                self.held = self.target.is_some();
                 self.target_message(host)
             }
             Action::NearestHostile => {
                 self.target = best_in_front(host, true);
+                self.held = self.target.is_some();
                 self.target_message(host)
             }
             Action::ClearTarget => {
                 self.target = None;
+                self.held = false;
                 match host.live().and_then(|l| l.aiming.take()) {
                     Some(aim) => format!("target cleared; ability {} not aimed", aim.ability),
                     None => "target cleared".into(),
@@ -694,7 +709,7 @@ impl PadPlay {
             return done;
         }
         let aiming = host.live().and_then(|l| l.aiming.clone());
-        let target = match self.target {
+        let target = match self.held_target() {
             Some(t) => Some(t),
             None => best_in_front(host, aiming.is_some()),
         };
@@ -790,7 +805,7 @@ impl PadPlay {
         let Some(ability) = crate::use_quickslot(live, slot) else {
             return format!("quickslot {}", slot + 1);
         };
-        let target = self.target.or_else(|| best_in_front(host, true));
+        let target = self.held_target().or_else(|| best_in_front(host, true));
         match target {
             Some(t) => {
                 self.target = Some(t);
@@ -821,6 +836,11 @@ impl PadPlay {
                 l.paused = was;
             }
         }
+    }
+
+    /// The target the player picked, if one is held (see [`PadPlay::held`]).
+    fn held_target(&self) -> Option<ObjectId> {
+        self.target.filter(|_| self.held)
     }
 
     fn target_message(&self, host: &mut dyn Host) -> String {

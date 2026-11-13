@@ -383,6 +383,14 @@ fn check_other(
         MaterialState::parse(data)
             .map(|_| ())
             .map_err(|e| e.to_string())
+    } else if ext == "vlm" {
+        thedas_formats::vlm::Vlm::parse(data)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else if ext == "mat" && thedas_formats::bmat::is_bmat(data) {
+        thedas_formats::bmat::Bmat::parse(data)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     } else if ext == "dds" {
         Dds::parse(data).map(|_| ()).map_err(|e| e.to_string())
     } else if ext == "mtx" {
@@ -476,8 +484,9 @@ fn check_script(data: &[u8], location: String, stats: &mut Stats, keep: usize) {
     }
 }
 
-/// Shaders: parse the D3D9 bytecode, translate it to naga IR and validate it. Failures are
-/// grouped by the missing opcode or feature, so coverage gaps show up as counts.
+/// Shaders: parse the D3D9 bytecode, translate it to naga IR, validate it and translate
+/// that for each GPU backend. Failures are grouped by the missing opcode or feature, or by
+/// the backend that refused, so coverage gaps show up as counts.
 fn check_shader(data: &[u8], location: String, stats: &mut Stats, keep: usize) {
     let result = match thedas_shader::Shader::parse(data) {
         Err(e) => Err(("parse".to_string(), e.to_string())),
@@ -496,8 +505,16 @@ fn check_shader(data: &[u8], location: String, stats: &mut Stats, keep: usize) {
                 ))
                 .or_default() += 1;
             thedas_shader::translate(&shader, &Default::default())
-                .map(|_| ())
                 .map_err(|e| (e.key(), e.to_string()))
+                .and_then(|t| {
+                    // What each GPU backend makes of the translation (Direct3D 12's HLSL,
+                    // Vulkan's SPIR-V, OpenGL's GLSL): a shader one of them refuses stops
+                    // the game on that backend only.
+                    match thedas_shader::backends::failures(&t.module, &t.info).first() {
+                        None => Ok(()),
+                        Some((backend, e)) => Err((format!("backend/{backend:?}"), e.clone())),
+                    }
+                })
         }
     };
     let es = stats.by_ext.entry("fxo".into()).or_default();
@@ -574,6 +591,11 @@ fn check_data(
             thedas_formats::morph::MorphPreset::from_gff4(&doc).map(|_| ())
         )),
         (_, "msh") => Some(s(Msh::from_gff4(&doc).map(|_| ()))),
+        (b"MAO ", _) => Some(
+            MaterialObject::from_gff4(&doc)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        ),
         (_, "ani") => Some(s(
             thedas_formats::anim::Animation::from_gff(&doc).map(|_| ())
         )),
@@ -602,6 +624,15 @@ fn check_data(
         (_, "plo") => Some(if &doc.file_type.0 == b"PLTS" {
             let _ = thedas_sim::plot::plots_from_gff4(&doc, "");
             Ok(())
+        } else if &doc.file_type.0 == b"PLOT" {
+            // Dragon Age II: one plot, and every composite flag's expression well formed.
+            match thedas_sim::plot::plots_from_gff4(&doc, "").first() {
+                None => Err("plot without a GUID".to_string()),
+                Some(p) => match p.composites.iter().find(|(_, c)| !c.well_formed()) {
+                    Some((id, _)) => Err(format!("composite flag {id}: malformed expression")),
+                    None => Ok(()),
+                },
+            }
         } else {
             Err(format!("not a plot file (file type {})", doc.file_type))
         }),
