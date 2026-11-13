@@ -44,6 +44,9 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
 /// movies' frames).
 pub(crate) struct Composite {
     pub(crate) pipeline: wgpu::RenderPipeline,
+    /// Multiplies a premultiplied texture onto the target: target x (src + 1 - src alpha),
+    /// Flash's `multiply` over an opaque picture (see `thedas_ui::MultiplyPass`).
+    pub(crate) multiply: wgpu::RenderPipeline,
     pub(crate) layout: wgpu::BindGroupLayout,
     pub(crate) sampler: wgpu::Sampler,
 }
@@ -80,31 +83,52 @@ impl Composite {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("ui composite"),
-            layout: Some(&pl),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[],
+        let make = |label: &str, blend: wgpu::BlendState| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = make(
+            "ui composite",
+            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+        );
+        let multiply = make(
+            "ui multiply",
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Dst,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        );
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -112,6 +136,7 @@ impl Composite {
         });
         Self {
             pipeline,
+            multiply,
             layout,
             sampler,
         }
@@ -138,6 +163,52 @@ impl std::fmt::Debug for FrontEnd {
             FrontEnd::StartMenu => write!(f, "StartMenu"),
             FrontEnd::Quit => write!(f, "Quit"),
         }
+    }
+}
+
+/// The multiply pass for a large notification's splash at `splash` (its
+/// `UberNotification<n>.instance1`), from the visible clips' `paths`: the pass hides every
+/// clip beside the splash's branch at each level up to the root, shows the splash, and draws
+/// its `multiply` pieces (`is_multiply`) normally.
+fn splash_pass(
+    paths: &[&str],
+    splash: &str,
+    mut is_multiply: impl FnMut(&str) -> bool,
+) -> thedas_ui::MultiplyPass {
+    let child_of = |p: &str, parent: &str| {
+        p.strip_prefix(parent)
+            .and_then(|r| r.strip_prefix('.'))
+            .is_some_and(|r| !r.contains('.'))
+    };
+    let mut hide = Vec::new();
+    // Each ancestor of the splash (from `_level0` down to its notification), and the child
+    // on the way down: the ancestor's other children are hidden.
+    let mut parent = "_level0";
+    let mut rest = splash.strip_prefix("_level0.").unwrap_or(splash);
+    while let Some((step, tail)) = rest.split_once('.').or(Some((rest, ""))) {
+        let keep = format!("{parent}.{step}");
+        hide.extend(
+            paths
+                .iter()
+                .filter(|p| child_of(p, parent) && **p != keep)
+                .map(|p| p.to_string()),
+        );
+        if tail.is_empty() {
+            break;
+        }
+        parent = &splash[..keep.len()];
+        rest = tail;
+    }
+    let multiply = paths
+        .iter()
+        .filter(|p| child_of(p, splash))
+        .filter(|p| is_multiply(p))
+        .map(|p| p.to_string())
+        .collect();
+    thedas_ui::MultiplyPass {
+        hide,
+        show: vec![splash.to_string()],
+        multiply,
     }
 }
 
@@ -786,18 +857,23 @@ impl UiLayer {
         }
     }
 
-    /// A large notification ("New Quest") draws a blood splash behind its plate with the
-    /// multiply blend, meant to darken the game's picture under it. The interface is drawn
-    /// into its own transparent picture, where a multiply leaves the splash's white paper
-    /// showing as a white block, so the splash is hidden and the plate shows alone.
-    /// Provisional: until the interface can multiply onto the scene.
+    /// A large notification ("New Quest") draws a blood splash behind its plate, pieces with
+    /// the multiply blend that darken the game's picture under it. The interface is drawn
+    /// into its own transparent picture, where a multiply has nothing under it (the splash's
+    /// white paper would show as a white block), so the splash is hidden from the movie's own
+    /// picture and drawn alone in its multiply pass (`thedas_ui::MultiplyPass`), multiplied
+    /// onto the frame under the movie.
     fn uber_alert_splash(&mut self, sim: &Arc<Mutex<Sim>>) {
         let head = {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             sim.world.uber_alerts.first().map(|a| a.resref.clone())
         };
         let Some(head) = head else {
-            self.uber_splash = None;
+            if self.uber_splash.take().is_some() {
+                for m in self.stage.movies.iter_mut() {
+                    m.set_multiply_pass(None);
+                }
+            }
             return;
         };
         if self.uber_splash.as_deref() == Some(head.as_str()) {
@@ -820,13 +896,22 @@ impl UiLayer {
             (n.chars().all(|c| c.is_ascii_digit()) && tail == "instance1").then_some(path)
         });
         if let Some(path) = splash {
+            let paths: Vec<&str> = tree
+                .split(';')
+                .filter_map(|e| e.split('|').next())
+                .collect();
             for m in self
                 .stage
                 .movies
                 .iter_mut()
                 .filter(|m| m.name == "notifications.gfx")
             {
+                let pass = splash_pass(&paths, path, |p| {
+                    m.call(&format!("{p}.blendMode.toString"), &[])
+                        == thedas_ui::UiValue::String("multiply".into())
+                });
                 m.set(&format!("{path}._visible"), thedas_ui::UiValue::Bool(false));
+                m.set_multiply_pass(Some(pass));
             }
             self.uber_splash = Some(head);
         }
@@ -2191,11 +2276,9 @@ impl UiLayer {
             .composite
             .get_or_insert_with(|| Composite::new(&self.device, format));
         let mut groups = Vec::new();
-        for m in &mut self.stage.movies {
-            m.render();
-            let Some(tex) = m.texture() else { continue };
+        let group = |tex: &wgpu::Texture| {
             let view = tex.create_view(&Default::default());
-            groups.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ui movie"),
                 layout: &comp.layout,
                 entries: &[
@@ -2208,7 +2291,20 @@ impl UiLayer {
                         resource: wgpu::BindingResource::Sampler(&comp.sampler),
                     },
                 ],
-            }));
+            })
+        };
+        // The movies' multiplied clips first, onto the game's picture under the whole
+        // interface (the original's "New Quest" splash leaves the minimap above it as it
+        // was: reference cx_city_elf_after_unpause_new_quest.png).
+        for m in &mut self.stage.movies {
+            if let Some(tex) = m.render_multiply() {
+                groups.push((group(&tex), true));
+            }
+        }
+        for m in &mut self.stage.movies {
+            m.render();
+            let Some(tex) = m.texture() else { continue };
+            groups.push((group(&tex), false));
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("ui composite"),
@@ -2223,8 +2319,12 @@ impl UiLayer {
             })],
             ..Default::default()
         });
-        pass.set_pipeline(&comp.pipeline);
-        for g in &groups {
+        for (g, multiply) in &groups {
+            pass.set_pipeline(if *multiply {
+                &comp.multiply
+            } else {
+                &comp.pipeline
+            });
             pass.set_bind_group(0, g, &[]);
             pass.draw(0..3, 0..1);
         }
@@ -2324,6 +2424,35 @@ fn gui_id(s: Screen, container: bool) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_splash_pass_hides_everything_beside_the_splash_branch() {
+        let n = "_level0.UberNotificationArea_mc.UberNotification5";
+        let splash = format!("{n}.instance1");
+        let paths = [
+            "_level0.UberNotificationArea_mc".to_string(),
+            n.to_string(),
+            format!("{n}.GUI_mc"),
+            format!("{n}.GUI_mc.Header_mc"),
+            splash.clone(),
+            format!("{splash}.instance9"),
+            format!("{splash}.instance9.instance11"),
+            format!("{splash}.instance2"),
+            "_level0.NotificationArea_mc".to_string(),
+            "_level0.NotificationArea_mc.NotificationActivate4".to_string(),
+        ];
+        let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let pass = splash_pass(&paths, &splash, |p| p.ends_with("instance9"));
+        assert_eq!(
+            pass.hide,
+            [
+                "_level0.NotificationArea_mc".to_string(),
+                format!("{n}.GUI_mc")
+            ]
+        );
+        assert_eq!(pass.show, [splash.clone()]);
+        assert_eq!(pass.multiply, [format!("{splash}.instance9")]);
+    }
 
     #[test]
     fn floaties_shrink_to_two_thirds_from_5_to_30_metres() {
