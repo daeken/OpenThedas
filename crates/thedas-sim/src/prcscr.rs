@@ -150,7 +150,7 @@ mod tests {
         s.world.hero = Some(hero);
         s.world.trace.keep = true;
         // The scripts are not in the (empty) resource stack: each run is noted as missing.
-        let mut ran = |s: &mut Sim, to: ObjectId| -> Vec<String> {
+        let ran = |s: &mut Sim, to: ObjectId| -> Vec<String> {
             s.world.get_mut(hero).unwrap().area = Some(to);
             s.world.trace.entries.clear();
             s.tick(100);
