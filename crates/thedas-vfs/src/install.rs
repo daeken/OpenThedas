@@ -144,9 +144,47 @@ impl DaoInstall {
         Ok(files)
     }
 
-    /// DLC packages, ordered by manifest priority (lowest first), then UID.
+    /// DLC packages, ordered by priority (lowest first), then UID.
+    ///
+    /// The original keeps one registry of add-ins, `AddIns.xml`, and many shipped add-ins (the
+    /// promotional items) have no manifest of their own in their folder. So an add-in is
+    /// known from the install's copy of the registry when it has one (GOG's installer keeps
+    /// it at `__support/userdocs/AddIns.xml` and copies it to the player's documents), and
+    /// from its folder's `Manifest.xml` otherwise.
     pub fn addins(&self) -> Result<Vec<AddIn>> {
-        addins_in(&join_ci(&self.root, "Addins"))
+        self.addins_with(&[])
+    }
+
+    /// [`DaoInstall::addins`] with other copies of the registry consulted first (the one in
+    /// the player's documents, `Settings/AddIns.xml`): the first registry to name an add-in
+    /// describes it, enabled or not.
+    fn addins_with(&self, registries: &[PathBuf]) -> Result<Vec<AddIn>> {
+        let dir = join_ci(&self.root, "Addins");
+        let mut out: Vec<AddIn> = Vec::new();
+        let install_registry = join_ci(&self.root, "__support/userdocs/AddIns.xml");
+        for registry in registries.iter().chain([&install_registry]) {
+            let Ok(bytes) = std::fs::read(registry) else {
+                continue;
+            };
+            for item in registry_items(&String::from_utf8_lossy(&bytes)) {
+                let known = out.iter().any(|a| a.uid.eq_ignore_ascii_case(&item.uid));
+                let folder = resolve_ci(&dir, &item.uid).filter(|d| d.is_dir());
+                if let (false, Some(folder)) = (known, folder) {
+                    out.push(AddIn {
+                        dir: folder,
+                        ..item
+                    });
+                }
+            }
+        }
+        for addin in addins_in(&dir)? {
+            let known = |a: &AddIn| a.dir == addin.dir || a.uid.eq_ignore_ascii_case(&addin.uid);
+            if !out.iter().any(known) {
+                out.push(addin);
+            }
+        }
+        sort_addins(&mut out);
+        Ok(out)
     }
 
     /// The install's own resource stack: core package, single-player campaign, then enabled
@@ -223,7 +261,11 @@ impl DaoInstall {
             push_package(&mut vfs, &user_core, quality, false, &player)?;
             push_package(&mut vfs, &join_ci(user, &campaign), quality, true, &player)?;
         }
-        let mut addins = self.addins()?;
+        let registries: Vec<PathBuf> = user
+            .map(|u| join_ci(u, "Settings/AddIns.xml"))
+            .into_iter()
+            .collect();
+        let mut addins = self.addins_with(&registries)?;
         if let Some(user) = user {
             addins.extend(self.user_addins(user)?);
         }
@@ -453,6 +495,24 @@ fn archives_in(dir: &Path) -> Result<Vec<PathBuf>> {
     files.retain(|p| is_archive(p));
     files.sort();
     Ok(files)
+}
+
+/// The `AddInItem`s of an `AddIns.xml` registry, in file order, without their folders. An
+/// item with no `UID` is skipped.
+fn registry_items(text: &str) -> Vec<AddIn> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<AddInItem") {
+        rest = &rest[start..];
+        let end = rest.find('>').map_or(rest.len(), |e| e + 1);
+        let tag = &rest[..end];
+        let addin = addin_from_manifest(tag, PathBuf::new(), String::new());
+        if !addin.uid.is_empty() {
+            out.push(addin);
+        }
+        rest = &rest[end..];
+    }
+    out
 }
 
 /// Pulls one attribute off the first occurrence of an element. Enough for DLC manifests,
@@ -828,6 +888,105 @@ mod tests {
         let vfs = stack(packaged(60, "Some Other Campaign"));
         assert_eq!(read(&vfs, "sword.uti"), "packaged");
         assert!(vfs.lookup("area.are").is_none());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Add-ins the registry names are found without a manifest of their own; the registry in
+    /// the player's documents is asked before the install's, and a folder's manifest only
+    /// for add-ins no registry names.
+    #[test]
+    fn the_registry_names_addins_that_have_no_manifest() {
+        let base = std::env::temp_dir().join(format!("thedas-registry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("install");
+        let write = |rel: &str, bytes: &[u8]| {
+            let p = base.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        };
+        write(
+            "install/packages/core/data/core.erf",
+            &erf_v20(&[("a.uti", b"core")]),
+        );
+        // Two add-ins with no manifest, one with, one the registry names but is not there.
+        write(
+            "install/Addins/promo_one/core/data/p1.erf",
+            &erf_v20(&[("p1.uti", b"promo one")]),
+        );
+        write(
+            "install/Addins/promo_one/module/data/p1m.erf",
+            &erf_v20(&[("p1.plo", b"plot")]),
+        );
+        write(
+            "install/Addins/Promo_Two/core/data/p2.erf",
+            &erf_v20(&[("p2.uti", b"promo two")]),
+        );
+        write(
+            "install/Addins/Promo_Two/module/data/p2m.erf",
+            &erf_v20(&[("p2.plo", b"plot")]),
+        );
+        write(
+            "install/Addins/with_manifest/core/data/m.erf",
+            &erf_v20(&[("m.uti", b"manifest")]),
+        );
+        write(
+            "install/Addins/with_manifest/Manifest.xml",
+            br#"<AddInItem UID="WITH_MANIFEST" ExtendedModuleUID="Single Player" Priority="9" Enabled="1">"#,
+        );
+        write(
+            "install/__support/userdocs/AddIns.xml",
+            br#"<?xml version="1.0"?><AddInsList>
+  <AddInItem UID="PROMO_ONE" Name="One" ExtendedModuleUID="Single Player" Priority="1" Enabled="1" State="2">
+    <Title DefaultText="One"><en-us><![CDATA[One > Two]]></en-us></Title>
+  </AddInItem>
+  <AddInItem UID="PROMO_TWO" ExtendedModuleUID="Another Campaign" Priority="5" Enabled="1" >
+  </AddInItem>
+  <AddInItem UID="NOT_INSTALLED" ExtendedModuleUID="Single Player" Priority="2" Enabled="1">
+  </AddInItem>
+  <AddInItem UID="WITH_MANIFEST" ExtendedModuleUID="Single Player" Priority="3" Enabled="1">
+  </AddInItem>
+</AddInsList>"#,
+        );
+        let install = DaoInstall::open(&root).unwrap();
+        let list: Vec<(String, i64)> = install
+            .addins()
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.uid, a.priority))
+            .collect();
+        // The registry's priority for the one that also has a manifest (3, not 9).
+        assert_eq!(
+            list,
+            [
+                ("PROMO_ONE".to_string(), 1),
+                ("WITH_MANIFEST".to_string(), 3),
+                ("PROMO_TWO".to_string(), 5)
+            ]
+        );
+        let vfs = install.global_vfs(TextureQuality::High).unwrap();
+        assert_eq!(vfs.read("p1.uti").unwrap().0, b"promo one");
+        assert!(vfs.lookup("p1.plo").is_some());
+        // Another campaign's: `core` only.
+        assert_eq!(vfs.read("p2.uti").unwrap().0, b"promo two");
+        assert!(vfs.lookup("p2.plo").is_none());
+        assert_eq!(vfs.read("m.uti").unwrap().0, b"manifest");
+
+        // The player's own registry comes first: here it switches one add-in off.
+        write(
+            "docs/Settings/AddIns.xml",
+            br#"<AddInsList><AddInItem UID="promo_one" ExtendedModuleUID="Single Player" Priority="1" Enabled="0"></AddInItem></AddInsList>"#,
+        );
+        let vfs = install
+            .stack(TextureQuality::High, Some(&base.join("docs")), Vec::new())
+            .unwrap();
+        assert!(vfs.lookup("p1.uti").is_none());
+        assert!(vfs.lookup("p2.uti").is_some());
+        // An empty registry there changes nothing.
+        write("docs/Settings/AddIns.xml", b"<AddInsList />");
+        let vfs = install
+            .stack(TextureQuality::High, Some(&base.join("docs")), Vec::new())
+            .unwrap();
+        assert!(vfs.lookup("p1.uti").is_some());
         std::fs::remove_dir_all(&base).unwrap();
     }
 
