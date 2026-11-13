@@ -476,6 +476,8 @@ pub struct AreaScene {
     pub atmosphere: Option<thedas_formats::level::Atmosphere>,
     /// The level's clouds.
     pub clouds: Option<thedas_formats::level::Clouds>,
+    /// A Dragon Age II level's fog, which its layout holds in place of an atmosphere.
+    pub layout_fog: Option<thedas_formats::level::LayoutFog>,
     /// The layout's sunlight direction as stored (see
     /// [`thedas_formats::level::Arl::sunlight_direction`]): the sky's celestial body sits
     /// against it.
@@ -748,6 +750,15 @@ fn piece_light<'a>(
     } else {
         PieceLight::Map(b)
     })
+}
+
+/// Whether a material semantic is the sky's: `Sky` and `Clouds` (Dragon Age: Origins'
+/// dome and cloud layer), `Sky2` and `BeastSky` (Dragon Age II's). Such draws follow the
+/// camera and are never culled.
+pub fn sky_semantic(name: &str) -> bool {
+    ["Sky", "Clouds", "Sky2", "BeastSky"]
+        .iter()
+        .any(|s| name.eq_ignore_ascii_case(s))
 }
 
 pub fn transform_matrix(t: &Transform) -> Mat4 {
@@ -3084,6 +3095,7 @@ impl AreaScene {
                 detail: like.detail,
                 atmosphere: like.atmosphere,
                 clouds: like.clouds,
+                layout_fog: like.layout_fog,
                 ..Default::default()
             },
             mmh: HashMap::new(),
@@ -3167,6 +3179,7 @@ impl AreaScene {
             l.scene.effects = arl.effects.clone();
             l.scene.atmosphere = arl.atmosphere;
             l.scene.clouds = arl.clouds;
+            l.scene.layout_fog = arl.fog;
             l.scene.sunlight_direction = arl.sunlight_direction.map(Vec3::from_array);
             l.scene.cutaway_height = Some(arl.cutaway_height);
             // The level's wind file, `<level>_<n>.wnd` (one per level).
@@ -3338,13 +3351,22 @@ impl AreaScene {
                         skin: None,
                     },
                 );
+                // Dragon Age II gives a level its own sky: the material object
+                // `sky_<level>.mao` (its gradient, sun and clouds), drawn on the one dome
+                // model every level names. Provisional: inferred from the names (the dome's
+                // own material object sets nothing); the executable's lookup is not traced.
+                let own = format!("sky_{}", level.to_ascii_lowercase());
+                if l.vfs.read(&format!("{own}.mao")).is_ok()
+                    && let Some(material) = l.material(&own)
+                {
+                    for d in &mut l.scene.draws[first..] {
+                        d.material = material;
+                    }
+                }
                 let materials = &l.scene.materials;
                 let mut i = 0;
                 l.scene.draws.retain(|d| {
-                    let keep = i < first || {
-                        let sem = &materials[d.material].semantic;
-                        sem.eq_ignore_ascii_case("Sky") || sem.eq_ignore_ascii_case("Clouds")
-                    };
+                    let keep = i < first || sky_semantic(&materials[d.material].semantic);
                     i += 1;
                     keep
                 });
@@ -3598,6 +3620,16 @@ fn name_of_tree(trees: &[String], tree: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn both_games_skies_are_skies() {
+        for name in ["Sky", "clouds", "Sky2", "BeastSky"] {
+            assert!(sky_semantic(name), "{name}");
+        }
+        for name in ["Default", "Sky3", "", "SkyTint"] {
+            assert!(!sky_semantic(name), "{name}");
+        }
+    }
 
     #[test]
     fn a_piece_takes_its_lightmap_by_id_or_by_place() {

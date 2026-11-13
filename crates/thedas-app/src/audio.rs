@@ -103,6 +103,9 @@ pub struct AudioState {
     pub picker_left: std::collections::HashMap<u32, PickerMember>,
     /// Events scripts played (`PlaySound`), with where the object stands (none: 2D).
     pub script_sounds: Vec<(String, Option<[f32; 3]>)>,
+    /// Lines said in passing (ambient conversations' lines), with where the speaker's head
+    /// is: each is voiced once, apart from the open conversation's voice.
+    pub ambient_lines: Vec<(VoiceLine, Option<[f32; 3]>)>,
     /// Scripts' `SetMusicIntensity`, the latest this frame.
     pub music_intensity: Option<i32>,
     /// A boot movie playing (its file) and how far it has played (milliseconds): its own
@@ -2083,6 +2086,9 @@ impl GameAudio {
         for (set, entry, probability, at) in std::mem::take(&mut state.sound_sets) {
             self.say_sound_set(&set, entry, probability, at);
         }
+        for (line, at) in std::mem::take(&mut state.ambient_lines) {
+            self.say_ambient(line, at);
+        }
         for (event, position) in std::mem::take(&mut state.script_sounds) {
             if self
                 .engine
@@ -2229,6 +2235,34 @@ impl GameAudio {
     #[allow(dead_code)] // For the conversation screen's subtitles (UI-203).
     pub fn dialog_audible(&self) -> bool {
         self.engine.volumes.dialog > 0.0
+    }
+
+    /// Says a line said in passing at its speaker (`at`, the speaker's head): the
+    /// conversation's `VO/VOambient` event with the line's sample, once, kept apart from the
+    /// open conversation's voice (it neither cuts that voice nor is cut by it, and it sets
+    /// none of what the conversation screen reads). Nothing plays for a line without a
+    /// sample; a line whose speaker is not found (`at` is `None`) plays 2D at full level.
+    /// Provisional: that DAOrigins.exe voices ambient lines through `VOambient` at
+    /// the speaker is read from how the event data is set up, not traced.
+    fn say_ambient(&mut self, line: VoiceLine, at: Option<[f32; 3]>) {
+        let Some(sample) = self.voice_sample(&line) else {
+            return;
+        };
+        let project = line.dialog.to_ascii_lowercase();
+        if self
+            .engine
+            .play(
+                &format!("{project}/VO/VOambient"),
+                PlayOptions {
+                    position: at,
+                    programmer_sound: Some(sample),
+                    ..Default::default()
+                },
+            )
+            .is_none()
+        {
+            log::debug!("audio: {project} has no VOambient event");
+        }
     }
 
     fn speak(&mut self, line: VoiceLine) -> (VoiceLine, Option<EventHandle>, Option<f64>) {

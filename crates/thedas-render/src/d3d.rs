@@ -868,13 +868,13 @@ pub const NO_SHADOW_DATA: [[f32; 4]; 9] = [
 /// lighting; the second's `x` applies the shadow partition, `y` the fog, `z` shows a debug
 /// view in place of the output; the third's `x` shows another, and `z` keeps the specular
 /// term; the fourth's `y` and `z` show two more. These are the switches for the ordinary
-/// picture, with shadows and fog off because their constants are not fed yet.
+/// picture, with shadows off because their constants are not fed yet.
 ///
 /// Provisional: read from that one shader's code; the values the executable writes are not
 /// traced, and other shaders may read components this leaves zero.
 pub const DEBUG_CONTROL: [[f32; 4]; 4] = [
     [0.0, 1.0, 1.0, 1.0],
-    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
     [0.0, 0.0, 1.0, 0.0],
     [0.0, 0.0, 0.0, 0.0],
 ];

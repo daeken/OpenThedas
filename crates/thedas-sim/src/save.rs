@@ -254,6 +254,9 @@ impl Sim {
         // end (saves made by test drivers can hold one; reloading it would put the last
         // line on screen again). One still going is kept.
         self.talk = save.talk.filter(|c| !c.ended);
+        // What was being said in passing belonged to the game left behind.
+        self.ambient.clear();
+        self.world.ambient_lines.clear();
         self.forget_world_caches();
         // The area list is loaded again, so the add-ins' scripts for it run again.
         self.prcscr_ran = None;

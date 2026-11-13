@@ -1718,7 +1718,7 @@ impl D3dPass {
                     // drawn whatever their bounds (the original draws them through their own
                     // submission queue, `sky.sub.xml`, not Umbra's visibility).
                     let sem = &scene.materials[d.material].semantic;
-                    if sem.eq_ignore_ascii_case("Sky") || sem.eq_ignore_ascii_case("Clouds") {
+                    if crate::scene::sky_semantic(sem) {
                         None
                     } else {
                         Some(
@@ -2005,7 +2005,10 @@ impl D3dPass {
                 })
                 .collect(),
             sun: scene.sun,
-            fog: crate::atmosphere::fog_params(scene.atmosphere.as_ref()),
+            fog: match &scene.layout_fog {
+                Some(f) => crate::atmosphere::layout_fog_params(f),
+                None => crate::atmosphere::fog_params(scene.atmosphere.as_ref()),
+            },
             sky: celestial
                 .as_ref()
                 .zip(scene.atmosphere.as_ref())

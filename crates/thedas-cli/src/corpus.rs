@@ -602,6 +602,11 @@ fn check_data(
         (_, "anb") => Some(s(thedas_formats::anim::AnimTree::from_gff(&doc).map(|_| ()))),
         (_, "gad") => Some(s(thedas_formats::anim::AnimInfo::from_gff(&doc).map(|_| ()))),
         (_, "evt") => Some(s(thedas_formats::anim::events_from_gff(&doc).map(|_| ()))),
+        (_, "cnv") => Some(
+            thedas_sim::cnv::dlg_from_cnv(&doc, "")
+                .map(|_| ())
+                .ok_or_else(|| format!("not a conversation (file type {})", doc.file_type)),
+        ),
         (_, "dlg") => Some(
             thedas_sim::dialog::Dlg::from_gff4(&doc, "")
                 .map(|_| ())

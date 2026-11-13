@@ -16,6 +16,7 @@ pub mod aoe;
 pub mod appearance;
 pub mod chanters;
 pub mod chargen;
+pub mod cnv;
 pub mod collision;
 pub mod combat;
 pub mod container;
@@ -43,6 +44,7 @@ pub mod tactics;
 pub mod threat;
 pub mod trace;
 pub mod training;
+pub mod voice;
 pub mod world;
 pub mod worldmap;
 

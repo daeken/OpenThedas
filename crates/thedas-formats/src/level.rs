@@ -53,6 +53,13 @@ pub mod field {
     pub const FBE_PARAMETERS: u32 = 5522;
     pub const FBEP_NAME: u32 = 5523;
     pub const FBEP_VALUE: u32 = 5524;
+    /// Dragon Age II's fog, in the layout itself (see [`super::LayoutFog`]).
+    pub const ARL_FOG_COLOR: u32 = 3165;
+    pub const ARL_FOG_END: u32 = 3166;
+    pub const ARL_FOG_START: u32 = 3169;
+    pub const ARL_FOG_CAP: u32 = 3173;
+    pub const ARL_FOG_HEIGHT_START: u32 = 3190;
+    pub const ARL_FOG_HEIGHT_END: u32 = 3191;
     pub const ARL_SUN_COLOR_CHAR: u32 = 3149;
     pub const ARL_SUN_DIRECTION: u32 = 3150;
     pub const ARL_SUN_COLOR: u32 = 3152;
@@ -144,6 +151,28 @@ pub struct ArlRoom {
     pub bounds_max: [f32; 3],
 }
 
+/// Dragon Age II's fog, which its layouts hold themselves (they have no atmosphere): the
+/// colour (3165), the distances from the camera at which it starts (3169) and is full
+/// (3166), the most it covers (3173, 0 to 1), and the heights between which a second fog
+/// goes from none (3190) to full (3191), whichever way up (a pit's fog thickens downwards,
+/// a skyline's haze upwards).
+///
+/// Provisional: the fields' meanings are worked out from the game's shaders (their
+/// `mml_vFogParams` is a colour with a factor, then two ranges: `static_static_p0.vsh` fogs
+/// by the greater of a smooth step over the distance and one over the height) and from the
+/// values the shipped layouts give (a day exterior: a pale haze from 16 m, full by 64 m, at
+/// most 0.3, thickening from 22 m up to 72 m), not from the executable. A sixth field
+/// beside them (3176) is not read.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayoutFog {
+    pub color: [f32; 3],
+    pub start: f32,
+    pub end: f32,
+    pub cap: f32,
+    pub height_start: f32,
+    pub height_end: f32,
+}
+
 /// An area layout.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Arl {
@@ -165,6 +194,8 @@ pub struct Arl {
     pub atmosphere: Option<Atmosphere>,
     /// The level's clouds (22600), when it has them.
     pub clouds: Option<Clouds>,
+    /// Dragon Age II's fog, when the layout gives one.
+    pub fog: Option<LayoutFog>,
     /// The SpeedTrees the rooms place (`.spt` stems, 3355), indexed by
     /// [`TreePlacement::tree`].
     pub trees: Vec<String>,
@@ -547,6 +578,43 @@ impl Arl {
                 .filter(|m| !m.is_empty()),
             atmosphere,
             clouds,
+            fog: (|| {
+                let number = |label| {
+                    Ok::<_, crate::typed::TypedError>(
+                        d.opt_f32(root, label)?.filter(|v| v.is_finite()),
+                    )
+                };
+                let color = d
+                    .opt_vec3(root, field::ARL_FOG_COLOR)?
+                    .filter(|c| c.iter().all(|x| x.is_finite()));
+                Ok::<_, crate::typed::TypedError>(
+                    match (
+                        color,
+                        number(field::ARL_FOG_START)?,
+                        number(field::ARL_FOG_END)?,
+                        number(field::ARL_FOG_CAP)?,
+                        number(field::ARL_FOG_HEIGHT_START)?,
+                        number(field::ARL_FOG_HEIGHT_END)?,
+                    ) {
+                        (
+                            Some(color),
+                            Some(start),
+                            Some(end),
+                            Some(cap),
+                            Some(height_start),
+                            Some(height_end),
+                        ) => Some(LayoutFog {
+                            color,
+                            start,
+                            end,
+                            cap,
+                            height_start,
+                            height_end,
+                        }),
+                        _ => None,
+                    },
+                )
+            })()?,
             trees: d
                 .structs(root, field::ARL_TREES)?
                 .into_iter()
@@ -1095,6 +1163,41 @@ mod tests {
         assert_eq!(c.density, 0.67);
         assert_eq!(c.color, [0.12, 0.14, 0.12]);
         assert_eq!(c.range_1, 0.0);
+        assert_eq!(
+            arl.fog, None,
+            "a layout with an atmosphere has no fog of its own"
+        );
+    }
+
+    #[test]
+    fn reads_a_layouts_own_fog() {
+        let layout = |cap: Option<f32>| {
+            let mut b = Builder::new(b"ARL ");
+            let mut fields = vec![
+                (field::ARL_FOG_COLOR, Value::Vec3([0.61, 0.65, 0.68])),
+                (field::ARL_FOG_START, Value::F32(16.0)),
+                (field::ARL_FOG_END, Value::F32(64.0)),
+                (field::ARL_FOG_HEIGHT_START, Value::F32(22.0)),
+                (field::ARL_FOG_HEIGHT_END, Value::F32(72.0)),
+            ];
+            fields.extend(cap.map(|c| (field::ARL_FOG_CAP, Value::F32(c))));
+            let root = b.add(b"AREA", fields);
+            Arl::from_gff4(&b.finish(root)).unwrap()
+        };
+        assert_eq!(
+            layout(Some(0.3)).fog,
+            Some(LayoutFog {
+                color: [0.61, 0.65, 0.68],
+                start: 16.0,
+                end: 64.0,
+                cap: 0.3,
+                height_start: 22.0,
+                height_end: 72.0,
+            })
+        );
+        // Every field or none.
+        assert_eq!(layout(None).fog, None);
+        assert_eq!(layout(Some(f32::NAN)).fog, None);
     }
 
     #[test]
