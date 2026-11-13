@@ -565,8 +565,10 @@ impl Actor {
     /// The animations the actor plays `t` seconds into a cutscene `length` seconds long,
     /// in the file's order, each with seconds into it: those whose span holds `t`, and the
     /// last one started if it is a pose (no span) or runs past the cutscene's end, which
-    /// holds its last frame. Provisional: the executable's blending out of a track at its
-    /// end (0x7d9450, 0x7d92e0 under fields 5405 and 5411) is not followed.
+    /// holds its last frame. Provisional: what the executable does with a track's pose at
+    /// its end is not followed (its root motion is: 0x7d92e0 and 0x7d9450, see
+    /// [`AnimationTrack::root_at`]; what the booleans 5405, 5411 and 5413 switch is not
+    /// traced).
     pub fn animations_at(&self, t: f32, length: f32) -> Vec<(&AnimationTrack, f32)> {
         let latest = self
             .animations
