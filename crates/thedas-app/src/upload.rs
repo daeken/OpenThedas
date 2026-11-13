@@ -32,16 +32,57 @@ const ZIPPED: &[&str] = &[
     "save_before.json",
 ];
 
-/// The webhook's address, if the player has set one up.
-pub fn webhook() -> Option<String> {
-    let path = crate::saves::data_dir().join(WEBHOOK_FILE);
-    let url = std::fs::read_to_string(path).ok()?.trim().to_string();
-    let ok = url.starts_with("https://discord.com/api/webhooks/")
-        || url.starts_with("https://discordapp.com/api/webhooks/");
-    if !ok {
-        log::warn!("report: {WEBHOOK_FILE} does not hold a Discord webhook address");
+/// Set when the game is driven by a client or a test (`--control`, a hidden window): then
+/// nothing is sent or fetched (reports, verdicts, the update check), so a test under a
+/// home that is set up for sending never posts. `THEDAS_REPORT_UPLOAD=1` allows it again
+/// (the sending tests' own opt-in).
+static AUTOMATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks this run as driven by a client or a test (see [`AUTOMATED`]).
+pub fn set_automated() {
+    AUTOMATED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this run may reach the network for reports and updates.
+pub fn online() -> bool {
+    !AUTOMATED.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("THEDAS_REPORT_UPLOAD").is_some_and(|v| v == "1")
+}
+
+/// A one-line setup file of this machine's (`discord-webhook`, `update-url`): from the
+/// player's data folder, else from beside the program, where a test build's download has
+/// it. One found beside the program is copied to the data folder, so a later build
+/// (which lives in a folder of its own, see [`crate::update`]) finds it too.
+pub fn setup_file(name: &str) -> Option<String> {
+    let own = crate::saves::data_dir().join(name);
+    if let Ok(text) = std::fs::read_to_string(&own) {
+        return Some(text.trim().to_string());
     }
-    ok.then_some(url)
+    let beside = std::env::current_exe().ok()?.parent()?.join(name);
+    let text = std::fs::read_to_string(beside).ok()?.trim().to_string();
+    if let Some(dir) = own.parent() {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(&own, format!("{text}\n"));
+    }
+    Some(text)
+}
+
+/// Where reports are sent, if this machine is set up for it (never in an automated run):
+/// a Discord webhook's address in `discord-webhook`, else the test builds' own receiver
+/// (`report` under the address in `update-url`), which passes them on to the channel.
+pub fn webhook() -> Option<String> {
+    if !online() {
+        return None;
+    }
+    if let Some(url) = setup_file(WEBHOOK_FILE) {
+        let ok = url.starts_with("https://discord.com/api/webhooks/")
+            || url.starts_with("https://discordapp.com/api/webhooks/");
+        if !ok {
+            log::warn!("report: {WEBHOOK_FILE} does not hold a Discord webhook address");
+        }
+        return ok.then_some(url);
+    }
+    crate::update::base_url().map(|base| format!("{base}report"))
 }
 
 /// Sends the report in `dir` on a thread of its own; the result is logged and written
@@ -184,6 +225,16 @@ fn post(url: &str, content: &str, files: &[(String, &str, Vec<u8>)]) -> Result<S
     Ok(reply["id"].as_str().unwrap_or("?").to_string())
 }
 
+/// Posts a plain message to the webhook.
+pub fn post_text(url: &str, content: &str) -> Result<()> {
+    let body = json!({ "content": content, "allowed_mentions": { "parse": [] } });
+    ureq::post(url)
+        .header("Content-Type", "application/json")
+        .send(body.to_string().as_bytes())
+        .map_err(|e| anyhow::anyhow!("posting to Discord: {e}"))?;
+    Ok(())
+}
+
 /// The player's home folder as text, for [`redact`].
 fn home() -> Option<String> {
     std::env::var_os("HOME")
@@ -247,7 +298,7 @@ fn half_size(png: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// A zip of `files` (deflated), as Windows, macOS and Linux open it.
-fn zip(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
+pub fn zip(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
     use flate2::Compression;
     use flate2::write::DeflateEncoder;
     let mut out = Vec::new();

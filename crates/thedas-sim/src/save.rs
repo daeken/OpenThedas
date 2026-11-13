@@ -238,6 +238,12 @@ impl Sim {
         // not there could never end. Saves written mid-training by tools would otherwise load
         // paused under it.
         world.training = Default::default();
+        // Nor does a HUD notification: they are the HUD's, raised as journal and codex entries
+        // arrive, and the notifications movie shows every one it is handed, so carried in a
+        // save they came back on every load. Provisional: the exe's notification queue is
+        // not traced.
+        world.alerts.clear();
+        world.uber_alerts.clear();
         self.world = world;
         // A conversation whose last line was already shown does not come back: the game
         // cannot be saved during a conversation, so a loaded game never resumes one at its
@@ -414,6 +420,31 @@ mod tests {
         let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 7);
         s.module_info.name = "test".into();
         s
+    }
+
+    #[test]
+    fn notifications_do_not_come_back_on_a_load() {
+        let mut s = sim();
+        let alert = crate::journal::Alert {
+            kind: 1,
+            resref: "bec100pt_main".into(),
+            name: None,
+            completed: false,
+        };
+        s.world.alerts.push(alert.clone());
+        s.world.uber_alerts.push(alert);
+        let bytes = s.save_json().unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("bec100pt_main"));
+        for _ in 0..2 {
+            let mut t = sim();
+            t.load_json(&bytes).unwrap();
+            assert!(t.world.alerts.is_empty() && t.world.uber_alerts.is_empty());
+        }
+        // An in-memory save (the MCP's) does not carry them either.
+        let save = s.save_game();
+        let mut t = sim();
+        t.load_game(save).unwrap();
+        assert!(t.world.alerts.is_empty() && t.world.uber_alerts.is_empty());
     }
 
     #[test]

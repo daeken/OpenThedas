@@ -4001,6 +4001,7 @@ dependencies = [
  "pollster",
  "serde",
  "serde_json",
+ "sha2",
  "thedas-audio",
  "thedas-formats",
  "thedas-render",
@@ -4143,6 +4144,7 @@ version = "0.1.0"
 dependencies = [
  "blowfish",
  "flate2",
+ "log",
  "md-5",
  "thiserror 2.0.18",
 ]
