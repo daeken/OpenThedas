@@ -198,6 +198,22 @@ const COL_STATE_CONTROLLER: u32 = 0x9a32_0a51;
 /// the pathing grid leaves in walls where doors stand are about 2.5 m wide.
 pub const DOORWAY_RADIUS: f32 = 1.25;
 
+/// An area's closed doors for sight lines (see [`Sim::door_sight`]).
+#[derive(Clone, Default)]
+pub struct DoorSight {
+    /// Doors with collision: their shapes block a ray between eyes.
+    pub solid: Vec<Arc<crate::collision::Collision>>,
+    /// Doors without: their positions, tested with [`Sim::door_between`].
+    pub points: Vec<[f32; 3]>,
+}
+
+impl DoorSight {
+    /// Whether a closed door stands between a creature at `a` and one at `b` (feet).
+    pub fn blocks(&self, a: [f32; 3], b: [f32; 3]) -> bool {
+        self.solid.iter().any(|c| c.sight_blocked(a, b)) || Sim::door_between(&self.points, a, b)
+    }
+}
+
 /// A door and the grid cells of its doorway (row-major indices).
 pub type Doorway = (thedas_script::vm::ObjectId, Vec<usize>);
 
@@ -351,23 +367,88 @@ impl Sim {
         out
     }
 
-    /// Whether one point of an area can see another: no closed door's doorway and no wall
-    /// of the pathing grid on the line between them (see [`wall_between`]). Provisional.
+    /// Whether one point of an area can see another: no closed door (see
+    /// [`Sim::door_sight`]) and no wall of the pathing grid on the line between them (see
+    /// [`wall_between`]). Provisional.
     pub fn line_of_sight(
         &mut self,
         area: thedas_script::vm::ObjectId,
         a: [f32; 3],
         b: [f32; 3],
     ) -> bool {
-        let doors: Vec<[f32; 3]> = self
-            .closed_doors(area)
-            .into_iter()
-            .filter_map(|(d, _)| self.world.get(d).map(|o| o.position))
-            .collect();
-        if Sim::door_between(&doors, a, b) {
+        if self.door_sight(area).blocks(a, b) {
             return false;
         }
         !self.nav_grid(area).is_some_and(|g| wall_between(&g, a, b))
+    }
+
+    /// The closed doors of an area as sight blockers. A closed door blocks with its own
+    /// collision (its model's `.phy` shapes in the sight mask, at rest), as DAOrigins.exe's
+    /// sight ray hits doors in the `Placeables` group (see [`crate::collision`]), so a
+    /// creature standing against a closed door does not see through it. A door whose model
+    /// has no such shapes (or with no game data to read them from) falls back to
+    /// [`Sim::door_between`]. Provisional: whether the exe moves a door's shapes as it opens
+    /// is not traced; open doors are left out.
+    pub fn door_sight(&mut self, area: thedas_script::vm::ObjectId) -> DoorSight {
+        use std::hash::{Hash, Hasher};
+        let closed: Vec<thedas_script::vm::ObjectId> = self
+            .closed_doors(area)
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        let tables = self.world.tables();
+        let types = tables.get(0, "placeable_types");
+        let mut out = DoorSight::default();
+        for d in closed {
+            let Some(o) = self.world.get(d) else {
+                continue;
+            };
+            let (position, facing) = (o.position, o.facing);
+            let model = types
+                .as_ref()
+                .and_then(|t| match t.cell("ModelName", o.appearance as i64)? {
+                    thedas_formats::gda::Cell::String(m) => {
+                        Some(crate::engine::clean(m).to_string())
+                    }
+                    _ => None,
+                })
+                .filter(|m| !m.is_empty());
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (&model, position.map(f32::to_bits), facing.to_bits()).hash(&mut h);
+            let key = h.finish();
+            let solid = match self.door_collisions.get(&d) {
+                Some((k, c)) if *k == key => c.clone(),
+                _ => {
+                    let c = model
+                        .as_ref()
+                        .map(|m| {
+                            crate::collision::load_placeables(
+                                &self.vfs,
+                                &[(m.clone(), position, facing)],
+                            )
+                        })
+                        .filter(|c| !c.is_empty())
+                        .map(Arc::new);
+                    let t = self.world.time_ms;
+                    self.world.trace.push(crate::trace::TraceEntry::Log {
+                        t,
+                        channel: -2,
+                        text: format!(
+                            "door sight: {d} model {} {} shapes",
+                            model.as_deref().unwrap_or("-"),
+                            c.as_ref().map_or(0, |c| c.len())
+                        ),
+                    });
+                    self.door_collisions.insert(d, (key, c.clone()));
+                    c
+                }
+            };
+            match solid {
+                Some(c) => out.solid.push(c),
+                None => out.points.push(position),
+            }
+        }
+        out
     }
 
     /// Whether the straight line between two points passes through a closed door's
@@ -557,6 +638,64 @@ mod tests {
             heights: vec![0.0; (w * h) as usize],
             surfaces: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_closed_door_blocks_sight_at_any_distance() {
+        // A door leaf across x = 2.5, from y 1.5 to 3.5, 3 m tall.
+        let leaf = crate::collision::Collision::from_triangles(&[
+            [[2.5, 1.5, 0.0], [2.5, 3.5, 0.0], [2.5, 3.5, 3.0]],
+            [[2.5, 1.5, 0.0], [2.5, 3.5, 3.0], [2.5, 1.5, 3.0]],
+        ]);
+        let doors = DoorSight {
+            solid: vec![Arc::new(leaf)],
+            points: Vec::new(),
+        };
+        // Tower of Ishal floor 3: one creature 0.47 m from the door, the other well beyond.
+        let (near, far) = ([2.03, 2.5, 0.0], [9.0, 2.5, 0.0]);
+        assert!(doors.blocks(near, far));
+        assert!(doors.blocks(far, near));
+        // The doorway stand-in leaves out the ends of the line, so it misses this one.
+        assert!(!Sim::door_between(&[[2.5, 2.5, 0.0]], near, far));
+        // Two creatures on the same side see each other, however close to the door.
+        assert!(!doors.blocks([0.5, 2.5, 0.0], [2.3, 2.0, 0.0]));
+        // Past the leaf's end, the line is clear.
+        assert!(!doors.blocks([0.5, 5.0, 0.0], [9.0, 5.0, 0.0]));
+    }
+
+    #[test]
+    fn loads_and_restores_drop_caches_keyed_by_object_id() {
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let fill = |s: &mut Sim| {
+            s.area_layouts.insert(7, "lvl".into());
+            s.door_cells.insert(7, Arc::new(Vec::new()));
+            s.placeable_collisions.insert(
+                7,
+                (
+                    1,
+                    Arc::new(crate::collision::Collision::from_triangles(&[])),
+                ),
+            );
+            s.door_collisions.insert(8, (1, None));
+            s.blocked_since.insert(9, (0, false));
+        };
+        let empty = |s: &Sim| {
+            s.area_layouts.is_empty()
+                && s.door_cells.is_empty()
+                && s.placeable_collisions.is_empty()
+                && s.door_collisions.is_empty()
+                && s.blocked_since.is_empty()
+        };
+        fill(&mut s);
+        let snap = s.snapshot();
+        s.restore(snap);
+        assert!(empty(&s), "after a restore");
+        fill(&mut s);
+        let save = s.save_game();
+        s.load_game(save).unwrap();
+        assert!(empty(&s), "after a load");
     }
 
     #[test]

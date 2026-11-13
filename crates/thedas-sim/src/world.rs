@@ -549,12 +549,14 @@ pub struct World {
     /// The training tutorial under way, if any (see [`crate::training`]).
     #[serde(default)]
     pub training: crate::training::Training,
-    /// The HUD's notifications not yet dismissed (see [`crate::journal::Alert`]).
-    #[serde(default)]
+    /// The HUD's notifications not yet dismissed (see [`crate::journal::Alert`]). Not
+    /// saved: they belong to the HUD of the game they were raised in, and a loaded game
+    /// would show them again on every load (see `Sim::load_game`).
+    #[serde(skip)]
     pub alerts: Vec<crate::journal::Alert>,
     /// The HUD's large notifications waiting, the first on screen (notifications.gfx's
-    /// `Party.UberAlerts`: "New Quest: ..."), see [`crate::journal::Alert`].
-    #[serde(default)]
+    /// `Party.UberAlerts`: "New Quest: ..."), see [`crate::journal::Alert`]. Not saved.
+    #[serde(skip)]
     pub uber_alerts: Vec<crate::journal::Alert>,
     pub game_mode: i32,
     /// While a conversation holds the game (`GM_DIALOG`, 4): the mode it replaced, and a
@@ -563,6 +565,11 @@ pub struct World {
     pub mode_before_talk: Option<i32>,
     #[serde(default)]
     pub mode_after_talk: Option<i32>,
+    /// Conversations asked for while another was going on (initiator, owner, the
+    /// conversation), in order: each starts when the one before it ends (see
+    /// `Sim::start_conversation`).
+    #[serde(default)]
+    pub pending_talks: Vec<(ObjectId, ObjectId, crate::dialog::Dlg)>,
     /// Cutscenes loaded with `LoadCutscene` that have not played yet, in order. Each starts
     /// once the scripts that loaded it have run (see [`crate::sim::CutscenePolicy`]).
     #[serde(default)]
@@ -787,6 +794,7 @@ impl World {
             game_mode: 0,
             mode_before_talk: None,
             mode_after_talk: None,
+            pending_talks: Vec::new(),
             cutscenes: Vec::new(),
             dialog_cutscenes: Vec::new(),
             cutscene: None,

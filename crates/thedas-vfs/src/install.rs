@@ -33,8 +33,28 @@ pub struct AddIn {
     pub uid: String,
     pub priority: i64,
     pub enabled: bool,
+    /// The manifest's `ExtendedModuleUID`: the campaign this add-in adds to (`Single Player`
+    /// for the base game's own DLC, `DAO_PRC_EP_1` for Awakening's), or empty or absent for
+    /// an add-in that is a campaign of its own.
+    pub extends: Option<String>,
     pub dir: PathBuf,
 }
+
+impl AddIn {
+    /// Whether the add-in's `module` folder belongs to the base campaign. Provisional: the
+    /// rule is read off the shipped manifests (the stand-alone campaigns leave
+    /// `ExtendedModuleUID` empty, and their `module` folders reuse base names such as
+    /// `default_player.utc`), not traced in the original executable. An add-in with no such
+    /// attribute counts as not extending it.
+    pub fn extends_base_campaign(&self) -> bool {
+        self.extends
+            .as_deref()
+            .is_some_and(|m| m.trim().eq_ignore_ascii_case(BASE_CAMPAIGN_UID))
+    }
+}
+
+/// The base campaign's module UID, as add-in manifests name it.
+const BASE_CAMPAIGN_UID: &str = "Single Player";
 
 #[derive(Clone, Debug)]
 pub struct DaoInstall {
@@ -110,10 +130,12 @@ impl DaoInstall {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(0);
             let enabled = xml_attr(&text, "AddInItem", "Enabled").as_deref() != Some("0");
+            let extends = xml_attr(&text, "AddInItem", "ExtendedModuleUID");
             out.push(AddIn {
                 uid,
                 priority,
                 enabled,
+                extends,
                 dir: path,
             });
         }
@@ -122,6 +144,9 @@ impl DaoInstall {
     }
 
     /// The global resource stack: core package, single-player campaign, then enabled DLC.
+    /// Every enabled add-in's `core` folder is mounted; its `module` folder only when the
+    /// add-in extends the base campaign ([`AddIn::extends_base_campaign`], provisional), so a
+    /// stand-alone DLC campaign's own resources cannot replace the base game's.
     /// Area (`env`) and module archives are loaded per area at runtime, so they are not here.
     pub fn global_vfs(&self, quality: TextureQuality) -> Result<Vfs> {
         let mut vfs = Vfs::new();
@@ -133,7 +158,9 @@ impl DaoInstall {
         )?;
         for addin in self.addins()?.into_iter().filter(|a| a.enabled) {
             self.push_package(&mut vfs, &join_ci(&addin.dir, "core"), quality)?;
-            self.push_package(&mut vfs, &join_ci(&addin.dir, "module"), quality)?;
+            if addin.extends_base_campaign() {
+                self.push_package(&mut vfs, &join_ci(&addin.dir, "module"), quality)?;
+            }
         }
         Ok(vfs)
     }
@@ -421,6 +448,86 @@ mod tests {
         mount.unmount(&mut vfs);
         assert!(install.mount_level(&mut vfs, "DEN201D").is_ok());
         assert!(install.mount_level(&mut vfs, "den201").is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A stand-alone DLC campaign's `module` folder must not replace base resources; an
+    /// add-in that extends the base campaign does, and every add-in's `core` folder is mounted.
+    #[test]
+    fn only_base_campaign_addins_mount_their_module_folder() {
+        let root = std::env::temp_dir().join(format!("thedas-addins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, bytes: &[u8]| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        };
+        let manifest = |uid: &str, extends: Option<&str>, priority: u32| {
+            let extends = extends.map_or(String::new(), |m| format!(r#" ExtendedModuleUID="{m}""#));
+            format!(
+                r#"<Manifest Type="AddIn"><AddInsList><AddInItem UID="{uid}"{extends} Priority="{priority}" Enabled="1">"#
+            )
+        };
+        write(
+            "packages/core/data/base.erf",
+            &erf_v20(&[("hero.utc", b"base"), ("sword.uti", b"base")]),
+        );
+        // Its own campaign, at the highest priority: `module` stays out, `core` is mounted.
+        write(
+            "Addins/own/Manifest.xml",
+            manifest("OWN", Some(""), 900).as_bytes(),
+        );
+        write(
+            "Addins/own/module/data/own.erf",
+            &erf_v20(&[("hero.utc", b"own campaign"), ("own_only.utc", b"x")]),
+        );
+        write(
+            "Addins/own/core/data/own_core.erf",
+            &erf_v20(&[("own_core.uti", b"own core")]),
+        );
+        // Another campaign's add-in, and one whose manifest names none.
+        write(
+            "Addins/ep/Manifest.xml",
+            manifest("EP", Some("DAO_PRC_EP_1"), 800).as_bytes(),
+        );
+        write(
+            "Addins/ep/module/data/ep.erf",
+            &erf_v20(&[("hero.utc", b"expansion")]),
+        );
+        write(
+            "Addins/bare/Manifest.xml",
+            manifest("BARE", None, 700).as_bytes(),
+        );
+        write(
+            "Addins/bare/module/data/bare.erf",
+            &erf_v20(&[("hero.utc", b"bare")]),
+        );
+        // The base campaign's own add-in, in another case: its `module` folder is mounted.
+        write(
+            "Addins/sp/Manifest.xml",
+            manifest("SP", Some("single player"), 10).as_bytes(),
+        );
+        write(
+            "Addins/sp/module/data/sp.erf",
+            &erf_v20(&[("sword.uti", b"dlc sword"), ("sp_only.utc", b"y")]),
+        );
+
+        let install = DaoInstall::open(&root).unwrap();
+        let addins = install.addins().unwrap();
+        let extends: Vec<(&str, bool)> = addins
+            .iter()
+            .map(|a| (a.uid.as_str(), a.extends_base_campaign()))
+            .collect();
+        assert_eq!(
+            extends,
+            [("SP", true), ("BARE", false), ("EP", false), ("OWN", false)]
+        );
+        let vfs = install.global_vfs(TextureQuality::High).unwrap();
+        assert_eq!(vfs.read("hero.utc").unwrap().0, b"base");
+        assert!(vfs.lookup("own_only.utc").is_none());
+        assert_eq!(vfs.read("own_core.uti").unwrap().0, b"own core");
+        assert_eq!(vfs.read("sword.uti").unwrap().0, b"dlc sword");
+        assert!(vfs.lookup("sp_only.utc").is_some());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
