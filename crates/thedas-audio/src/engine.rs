@@ -175,6 +175,9 @@ struct Instance {
     /// Playback-rate factor from the event's pitch and its random offset.
     rate: f32,
     age: f32,
+    /// How much geometry between it and the listener muffles it, 0..=1 (see
+    /// [`AudioEngine::set_occlusion`]).
+    occlusion: f32,
     /// Its category (or one above it) is paused: its voices hold where they are and it
     /// neither ages nor starts sounds (see [`AudioEngine::set_category_paused`]).
     paused: bool,
@@ -497,6 +500,7 @@ impl AudioEngine {
             reverb_send,
             rate,
             age: 0.0,
+            occlusion: 0.0,
             paused: false,
         };
         log::debug!(
@@ -637,6 +641,16 @@ impl AudioEngine {
     pub fn set_parameter(&mut self, handle: EventHandle, name: &str, value: f32) {
         if let Some(i) = self.instances.iter_mut().find(|i| i.handle == handle) {
             i.params.insert(name.to_ascii_lowercase(), value);
+        }
+    }
+
+    /// Set a 3D event's direct occlusion, 0 (clear) to 1 (blocked), as FMOD's
+    /// `Event::set3DOcclusion`. Provisional: applied as a gain of `1 - occlusion` (FMOD's
+    /// volume occlusion); a low-pass, if the original's FMOD was set up for one, is not
+    /// modelled.
+    pub fn set_occlusion(&mut self, handle: EventHandle, occlusion: f32) {
+        if let Some(i) = self.instances.iter_mut().find(|i| i.handle == handle) {
+            i.occlusion = occlusion.clamp(0.0, 1.0);
         }
     }
 
@@ -1060,7 +1074,7 @@ impl AudioEngine {
                         min / dd
                     };
                 }
-                gain3d *= cone_gain;
+                gain3d *= cone_gain * (1.0 - inst.occlusion);
             }
             for s in &inst.slots {
                 let (sound, env_gain) = match &ev.body {
@@ -1467,6 +1481,28 @@ mod tests {
             ..c
         };
         assert_eq!(c.gain([0.0, 5.0, 0.0], 0.0), 1.0);
+    }
+
+    #[test]
+    fn occlusion_turns_a_3d_event_down() {
+        let (mut e, m) = engine("occl");
+        let h = e
+            .play(
+                "test/grp/loop",
+                PlayOptions {
+                    position: Some([0.0, 0.0, 0.0]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let full = run(&mut e, &m, 0.5);
+        e.set_occlusion(h, 0.75);
+        let muffled = run(&mut e, &m, 0.5);
+        if full > 0.0 {
+            assert!((muffled - full * 0.25).abs() < 1e-3, "{full} -> {muffled}");
+        }
+        e.set_occlusion(h, 0.0);
+        assert!((run(&mut e, &m, 0.5) - full).abs() < 1e-3);
     }
 
     #[test]
