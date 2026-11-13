@@ -1201,6 +1201,10 @@ impl ConstantContext<'_> {
             ("ApplicationTime", _) => Value::Vectors(vec![[self.time, 0.0, 0.0, 0.0]]),
             ("CloudParameters", _) => Value::Vectors(self.clouds.to_vec()),
             ("ShadowData", _) => Value::Vectors(self.shadow.to_vec()),
+            // Dragon Age II's shadow partitions are not drawn: its shaders get the
+            // partition matrices that find every point lit, whatever this pass's partitions
+            // hold (its face shaders test the shadow with no switch to turn it off).
+            ("ShadowDataUnshadowed", _) => Value::Vectors(NO_SHADOW_DATA.to_vec()),
             // Four rows of the partition's matrix, as `PSSMMesh.vsh` reads them (`dp4`).
             ("ShadowPartitionMatrix", _) => Value::Vectors(
                 self.partition

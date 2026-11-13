@@ -521,7 +521,7 @@ pub fn engine_usage(source: u32) -> Option<&'static str> {
         20 => "ShaderControlBooleans",
         21 => "ShadowPartitionMatrix",
         22 => "ShadowTexture_Primary",
-        24 => "ShadowData",
+        24 => "ShadowDataUnshadowed",
         25 => "EnvironmentMap",
         28 => "RemoteMaterialSettings",
         29 => "SHEnvironment",
