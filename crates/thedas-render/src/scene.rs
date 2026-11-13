@@ -346,6 +346,10 @@ pub struct SceneEmitter {
     /// Whether its model has a `CutAway` mesh: its particles fade with the cutaway
     /// (DAOrigins.exe 0x466f40).
     pub cut_away: bool,
+    /// For a prop's visual effect: the prop, the effect ([`PropEffect::key`]) and which of
+    /// the effect's emitters it is, the same from one scene to the next, so its particles
+    /// can carry over when the scene is rebuilt.
+    pub owner: Option<String>,
 }
 
 /// A light placed in the level (from the room's `_ll` light model).
@@ -490,11 +494,25 @@ pub struct Prop {
     /// Equipment tints by model (of `models` or `attached`): (model, `.tnt` without
     /// extension). They fill the model's materials' `mml_vTintMaskColours`.
     pub tints: Vec<(String, String)>,
-    /// Visual effect models on it (without `.mmh`): their emitters follow the body (see
-    /// `Loader::place_effect`).
-    pub effects: Vec<String>,
+    /// Visual effects on it: their emitters follow the body (see `Loader::place_effect`).
+    pub effects: Vec<PropEffect>,
     /// Model to world.
     pub transform: Mat4,
+}
+
+/// A visual effect on a prop.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PropEffect {
+    /// Its model, without `.mmh` (`fxa_fire_crust_c`).
+    pub model: String,
+    /// Tells this effect from the prop's others, the same from one scene to the next while
+    /// the effect lasts (its emitters are named by it: [`SceneEmitter::owner`]).
+    pub key: String,
+    /// Seconds since it started, when the scene is built.
+    pub age: f32,
+    /// It stays until it is removed (its duration animation loops after its impact one);
+    /// else it plays its impact animation once.
+    pub lasting: bool,
 }
 
 impl Prop {
@@ -541,13 +559,48 @@ pub struct PropEmitter {
     pub emitter: usize,
     pub in_model: Mat4,
     pub follows: Option<(usize, usize)>,
-    /// Its birthrate and birthrate range as its effect's looping animation sets them, and
-    /// that animation's length in seconds (see `Loader::place_effect`).
-    pub rate: Option<EffectRate>,
+    /// Its birthrate and birthrate range over the effect's life, as its effect's
+    /// animations set them (see `Loader::place_effect`).
+    pub rate: Option<EffectTimeline>,
 }
 
-/// An effect emitter's birthrate over time: the `<emitter>_birthrate` and
-/// `<emitter>_birthraterange` float tracks of its effect's animation, which loops.
+/// An effect emitter's birthrate over its effect's life: the impact animation
+/// (`<effect>.impa.ani`) once from the start, then, for a lasting effect, the duration
+/// animation (`<effect>.dura.ani`) looped. While an animation plays that has no tracks for
+/// the emitter, the emitter keeps its own birthrate (`fxa_heal_impact_c`'s emitters); an
+/// instant effect's emitters stop after its impact. Provisional: the exe's playing of these
+/// animations is not traced, the cessation animation (`.cess.ani`) is not played, and the
+/// animations' other tracks (nodes moving, lights) are not applied.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectTimeline {
+    /// The effect's age in seconds when the scene was built ([`PropEffect::age`]).
+    pub age: f32,
+    pub lasting: bool,
+    pub impact: Option<EffectRate>,
+    pub duration: Option<EffectRate>,
+}
+
+impl EffectTimeline {
+    /// How long an instant effect whose model has no impact animation plays, in seconds.
+    pub const UNTIMED_FLASH: f32 = 2.0;
+
+    /// (birthrate, range) `since_built` seconds after the scene was built; `None` for the
+    /// emitter's own.
+    pub fn at(&self, since_built: f32) -> Option<(f32, f32)> {
+        let t = self.age + since_built.max(0.0);
+        let impact = self.impact.as_ref().map_or(0.0, |i| i.length);
+        match (&self.impact, &self.duration) {
+            (Some(i), _) if t < impact => i.at(t),
+            (_, Some(d)) if self.lasting => d.at(t - impact),
+            _ if self.lasting => None,
+            (None, _) if t < Self::UNTIMED_FLASH => None,
+            _ => Some((0.0, 0.0)),
+        }
+    }
+}
+
+/// An effect emitter's birthrate over one of its effect's animations: the
+/// `<emitter>_birthrate` and `<emitter>_birthraterange` float tracks.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EffectRate {
     pub length: f32,
@@ -556,17 +609,21 @@ pub struct EffectRate {
 }
 
 impl EffectRate {
-    /// (birthrate, range) at `t` seconds into the loop.
-    pub fn at(&self, t: f32) -> (f32, f32) {
+    /// (birthrate, range) at `t` seconds, the animation looping; `None` when it has no
+    /// tracks for the emitter.
+    pub fn at(&self, t: f32) -> Option<(f32, f32)> {
+        if self.birthrate.is_none() && self.range.is_none() {
+            return None;
+        }
         let t = if self.length > 0.0 {
             t.rem_euclid(self.length)
         } else {
             0.0
         };
-        (
+        Some((
             self.birthrate.as_ref().map_or(0.0, |k| k.at(t)),
             self.range.as_ref().map_or(0.0, |k| k.at(t)),
-        )
+        ))
     }
 }
 
@@ -2427,9 +2484,10 @@ impl<'a> Loader<'a> {
     /// game plays around it are not played, the crust node's own transform is not used,
     /// effect models' meshes and other animated parameters (`gob_remotematerialalpha`)
     /// are not drawn, and an effect on a body without the named node is left out.
-    fn place_effect(&mut self, effect: &str, prop: &Prop) -> Vec<PropEmitter> {
+    fn place_effect(&mut self, instance: &PropEffect, prop: &Prop) -> Vec<PropEmitter> {
         use thedas_formats::emitter::Emitter;
         use thedas_formats::model::{KIND_CRUST, Node};
+        let effect = instance.model.as_str();
         let Some(model) = self.model(effect) else {
             self.warn(format!("{}: no effect model {effect}", prop.label));
             return Vec::new();
@@ -2454,12 +2512,14 @@ impl<'a> Loader<'a> {
         for n in &model.nodes {
             walk(n, Mat4::IDENTITY, None, &mut found);
         }
-        let looping = self
-            .read(&format!("{effect}.dura.ani"))
-            .ok()
-            .and_then(|d| thedas_formats::anim::Animation::parse(&d).ok());
+        let mut animation = |suffix: &str| {
+            self.read(&format!("{effect}.{suffix}.ani"))
+                .ok()
+                .and_then(|d| thedas_formats::anim::Animation::parse(&d).ok())
+        };
+        let (impact, looping) = (animation("impa"), animation("dura"));
         let mut out = Vec::new();
-        for (e, name, hook, below) in found {
+        for (k, (e, name, hook, below)) in found.into_iter().enumerate() {
             let (in_model, follows) = match hook {
                 Some(hook) => {
                     let body = prop.models.iter().find_map(|m| {
@@ -2479,24 +2539,34 @@ impl<'a> Loader<'a> {
                 }
                 None => (below, None),
             };
-            let rate = looping.as_ref().and_then(|a| {
-                let name = name?.to_ascii_lowercase();
+            // The emitter's tracks in an animation; an animation that plays without them
+            // gives it nothing.
+            let rate_in = |a: &Option<thedas_formats::anim::Animation>| {
+                let a = a.as_ref()?;
+                let name = name.unwrap_or("").to_ascii_lowercase();
                 let track = |suffix: &str| {
                     a.scalars
                         .iter()
                         .find(|s| s.target == format!("{name}_{suffix}"))
                         .cloned()
                 };
-                let (birthrate, range) = (track("birthrate"), track("birthraterange"));
-                (birthrate.is_some() || range.is_some()).then_some(EffectRate {
+                Some(EffectRate {
                     length: a.length,
-                    birthrate,
-                    range,
+                    birthrate: track("birthrate"),
+                    range: track("birthraterange"),
                 })
+            };
+            let rate = Some(EffectTimeline {
+                age: instance.age,
+                lasting: instance.lasting,
+                impact: rate_in(&impact),
+                duration: rate_in(&looping),
             });
             if let Some(emitter) =
                 self.push_emitter(effect, e, name, prop.transform * in_model, &[], false)
             {
+                self.scene.emitters[emitter].owner =
+                    Some(format!("{}/{}/{k}", prop.label, instance.key));
                 out.push(PropEmitter {
                     emitter,
                     in_model,
@@ -2589,6 +2659,7 @@ impl<'a> Loader<'a> {
                 model: model_name.to_string(),
                 node: name.unwrap_or("").to_string(),
                 cut_away,
+                owner: None,
             });
             Some(self.scene.emitters.len() - 1)
         }
@@ -2765,6 +2836,49 @@ impl AreaScene {
         detail: Detail,
     ) -> Result<AreaScene, SceneError> {
         Self::load_parts(vfs, level, props, false, detail)
+    }
+
+    /// Only the props' visual effects ([`Prop::effects`]): the props' models are read for
+    /// the nodes the effects sit on and follow, and not drawn. A scene of its own for the
+    /// effects lets them come and go without the objects' scene being rebuilt. The level is
+    /// not read again: what the effects' shaders take from it (its fog) comes from `like`,
+    /// a scene of the same level.
+    pub fn load_effects_like(vfs: &Vfs, like: &AreaScene, props: &[Prop]) -> AreaScene {
+        let mut l = Loader {
+            vfs,
+            scene: AreaScene {
+                level: like.level.clone(),
+                name: like.name.clone(),
+                detail: like.detail,
+                atmosphere: like.atmosphere,
+                clouds: like.clouds,
+                ..Default::default()
+            },
+            mmh: HashMap::new(),
+            msh: HashMap::new(),
+            mesh_index: HashMap::new(),
+            mat_defs: HashMap::new(),
+            material_index: HashMap::new(),
+            morphs: HashMap::new(),
+            tints: HashMap::new(),
+            skeleton_index: HashMap::new(),
+        };
+        for prop in props {
+            let first = l.scene.draws.len();
+            let emitters = prop
+                .effects
+                .iter()
+                .flat_map(|effect| l.place_effect(effect, prop))
+                .collect();
+            l.scene.props.push(PropDraws {
+                label: prop.label.clone(),
+                transform: prop.transform,
+                draws: first..first,
+                attachments: Vec::new(),
+                emitters,
+            });
+        }
+        l.scene
     }
 
     fn load_parts(
@@ -3272,9 +3386,43 @@ mod tests {
             }),
             range: None,
         };
-        assert_eq!(r.at(1.0), (7.5, 0.0));
+        assert_eq!(r.at(1.0), Some((7.5, 0.0)));
         // Looped: 3 s is 1 s into the second pass.
-        assert_eq!(r.at(3.0), (7.5, 0.0));
+        assert_eq!(r.at(3.0), Some((7.5, 0.0)));
+        // No tracks for the emitter: its own birthrate.
+        let own = EffectRate {
+            length: 2.0,
+            birthrate: None,
+            range: None,
+        };
+        assert_eq!(own.at(1.0), None);
+
+        // A lasting effect: the impact once, then the duration looped, from its age on.
+        let lasting = EffectTimeline {
+            age: 0.5,
+            lasting: true,
+            impact: Some(r.clone()),
+            duration: Some(EffectRate {
+                length: 1.0,
+                birthrate: Some(ScalarTrack {
+                    target: "flame_default_birthrate".into(),
+                    keys: vec![(0.0, 20.0), (1.0, 20.0)],
+                }),
+                range: None,
+            }),
+        };
+        assert_eq!(lasting.at(0.5), Some((7.5, 0.0)));
+        assert_eq!(lasting.at(5.0), Some((20.0, 0.0)));
+        // An instant one stops after its impact; untracked, it keeps its own rate until
+        // then.
+        let flash = EffectTimeline {
+            age: 0.0,
+            lasting: false,
+            impact: Some(own),
+            duration: None,
+        };
+        assert_eq!(flash.at(1.0), None);
+        assert_eq!(flash.at(2.5), Some((0.0, 0.0)));
     }
 
     #[test]

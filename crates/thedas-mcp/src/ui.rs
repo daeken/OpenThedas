@@ -106,7 +106,7 @@ impl UiWorld {
                 morph: p.morph.clone(),
                 hide_hair: p.hide_hair,
                 tints: p.tints.clone(),
-                effects: p.effects.clone(),
+                effects: Vec::new(),
 
                 transform: thedas_render::Prop::placement(p.position, p.facing),
             })

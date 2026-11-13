@@ -68,6 +68,12 @@ fn load<T>(
 }
 
 impl Animator {
+    /// Forgets the skeletons posed so far (they are kept by their index in a scene), for
+    /// posing another scene's; the animations read stay.
+    pub fn forget_skeletons(&mut self) {
+        self.rests.clear();
+    }
+
     /// The `.ani` resource a clip plays (the first tree with one of its actions), and the
     /// animation itself: its events (`<stem>.evt`) are named after it.
     pub fn animation_resource(
