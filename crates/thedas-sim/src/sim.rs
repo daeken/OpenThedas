@@ -653,6 +653,22 @@ impl Sim {
         self.blocked_since.clear();
     }
 
+    /// A script `location` value for a place, for tools that call engine functions taking
+    /// one (the MCP's `call_engine_function`).
+    pub fn location_value(&mut self, area: ObjectId, position: [f32; 3], facing: f32) -> Value {
+        let handle = self
+            .world
+            .store(crate::world::EngineData::Location(crate::world::Location {
+                area,
+                position,
+                facing,
+            }));
+        Value::Engine {
+            ty: self.types.location,
+            handle: Some(handle),
+        }
+    }
+
     /// Registers a compiled script under a name, ahead of the resource stack (tools, tests).
     pub fn add_script(&mut self, name: &str, ncs: Ncs) {
         self.scripts

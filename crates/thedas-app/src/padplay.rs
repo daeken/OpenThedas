@@ -974,6 +974,19 @@ fn pointer_to(host: &mut dyn Host, x: f64, y: f64) {
 /// The left stick: the leader walks toward a point a little ahead in the stick's direction
 /// (relative to the camera), as a click on the ground there would order; let go, it stops
 /// where it stands (a walk to its own feet).
+impl PadPlay {
+    /// The leader walks as the keyboard's movement keys ask (`v` as a stick's deflection:
+    /// +y away from the camera, +x to its right; zero stops), the way the left stick walks
+    /// it. Only in the field: a screen, a conversation or a cutscene takes the keys instead.
+    pub fn walk_keys(&self, host: &mut dyn Host, v: Vec2) {
+        let popup = host.popup();
+        let ctx = context(host.screens().map(|s| &*s), popup, self.picker.is_some());
+        if ctx == Context::Field || v == Vec2::ZERO {
+            walk(host, v, self.group);
+        }
+    }
+}
+
 fn walk(host: &mut dyn Host, v: Vec2, group: bool) -> Option<String> {
     let yaw = host.camera().yaw;
     let live = host.live()?;
