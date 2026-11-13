@@ -476,8 +476,9 @@ fn check_script(data: &[u8], location: String, stats: &mut Stats, keep: usize) {
     }
 }
 
-/// Shaders: parse the D3D9 bytecode, translate it to naga IR and validate it. Failures are
-/// grouped by the missing opcode or feature, so coverage gaps show up as counts.
+/// Shaders: parse the D3D9 bytecode, translate it to naga IR, validate it and translate
+/// that for each GPU backend. Failures are grouped by the missing opcode or feature, or by
+/// the backend that refused, so coverage gaps show up as counts.
 fn check_shader(data: &[u8], location: String, stats: &mut Stats, keep: usize) {
     let result = match thedas_shader::Shader::parse(data) {
         Err(e) => Err(("parse".to_string(), e.to_string())),
@@ -496,8 +497,16 @@ fn check_shader(data: &[u8], location: String, stats: &mut Stats, keep: usize) {
                 ))
                 .or_default() += 1;
             thedas_shader::translate(&shader, &Default::default())
-                .map(|_| ())
                 .map_err(|e| (e.key(), e.to_string()))
+                .and_then(|t| {
+                    // What each GPU backend makes of the translation (Direct3D 12's HLSL,
+                    // Vulkan's SPIR-V, OpenGL's GLSL): a shader one of them refuses stops
+                    // the game on that backend only.
+                    match thedas_shader::backends::failures(&t.module, &t.info).first() {
+                        None => Ok(()),
+                        Some((backend, e)) => Err((format!("backend/{backend:?}"), e.clone())),
+                    }
+                })
         }
     };
     let es = stats.by_ext.entry("fxo".into()).or_default();

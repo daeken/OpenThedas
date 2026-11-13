@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 thedas-vfs.workspace = true
 thedas-formats.workspace = true
-thedas-shader.workspace = true
+thedas-shader = { workspace = true, features = ["backend-check"] }
 thedas-script.workspace = true
 thedas-sim.workspace = true
 clap.workspace = true
