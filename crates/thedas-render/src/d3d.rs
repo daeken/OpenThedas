@@ -1010,12 +1010,12 @@ impl ConstantContext<'_> {
                 Some(self.projection * world_view)
             }
             ("PartTrans" | "Part", _) | (_, "aur_mWorld") => Some(self.world),
-            ("ModelView" | "ModelViewTrans", _) | (_, "aur_mModelView") => Some(world_view),
-            ("ModelViewInvTrans", _) => Some(world_view.inverse()),
-            ("View" | "ViewTrans", _) => Some(self.view),
-            ("ViewInv" | "ViewInvTrans", _) => Some(self.view.inverse()),
-            ("Projection" | "ProjectionTrans", _) => Some(self.projection),
-            ("ViewProjection" | "ViewProjectionTrans", _) => Some(self.projection * self.view),
+            ("ModelView", _) | (_, "aur_mModelView") => Some(world_view),
+            ("ModelViewInv", _) => Some(world_view.inverse()),
+            ("View", _) => Some(self.view),
+            ("ViewInv", _) => Some(self.view.inverse()),
+            ("Projection", _) => Some(self.projection),
+            ("ViewProjection", _) => Some(self.projection * self.view),
             _ => None,
         };
         if let Some(m) = matrix {
@@ -1157,12 +1157,7 @@ impl ConstantContext<'_> {
                 | "ViewInv"
                 | "Projection"
                 | "ViewProjection"
-                | "ModelViewTrans"
-                | "ModelViewInvTrans"
-                | "ViewTrans"
-                | "ViewInvTrans"
-                | "ProjectionTrans"
-                | "ViewProjectionTrans"
+                | "ModelViewInv"
                 | "CameraPosition"
                 | "ApplicationTime"
                 | "ShadowData"
@@ -1749,8 +1744,8 @@ mod tests {
         };
         let c = cc.fill(Some(&t));
         assert_eq!(c.floats[13..17], DEBUG_CONTROL);
-        // The view and projection without the draw's placement, in the `Trans` layout.
-        let m = projection;
+        // The view and projection without the draw's placement, in the plain layout.
+        let m = projection.transpose();
         assert_eq!(
             c.floats[20..24],
             [m.x_axis, m.y_axis, m.z_axis, m.w_axis].map(|v| v.to_array())

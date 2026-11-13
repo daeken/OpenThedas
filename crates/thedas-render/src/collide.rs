@@ -560,6 +560,7 @@ mod tests {
             },
             raw_vertices: vec![],
             positions: None,
+            vertex_light: None,
         };
         let draw = |x: f32| DrawItem {
             mesh: 0,
