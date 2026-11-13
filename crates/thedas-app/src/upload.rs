@@ -32,8 +32,28 @@ const ZIPPED: &[&str] = &[
     "save_before.json",
 ];
 
-/// The webhook's address, if the player has set one up.
+/// Set when the game is driven by a client or a test (`--control`, a hidden window): then
+/// nothing is sent or fetched (reports, verdicts, the update check), so a test under a
+/// home that is set up for sending never posts. `THEDAS_REPORT_UPLOAD=1` allows it again
+/// (the sending tests' own opt-in).
+static AUTOMATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks this run as driven by a client or a test (see [`AUTOMATED`]).
+pub fn set_automated() {
+    AUTOMATED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this run may reach the network for reports and updates.
+pub fn online() -> bool {
+    !AUTOMATED.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("THEDAS_REPORT_UPLOAD").is_some_and(|v| v == "1")
+}
+
+/// The webhook's address, if the player has set one up (never in an automated run).
 pub fn webhook() -> Option<String> {
+    if !online() {
+        return None;
+    }
     let path = crate::saves::data_dir().join(WEBHOOK_FILE);
     let url = std::fs::read_to_string(path).ok()?.trim().to_string();
     let ok = url.starts_with("https://discord.com/api/webhooks/")

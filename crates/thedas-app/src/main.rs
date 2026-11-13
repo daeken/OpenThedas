@@ -4108,6 +4108,10 @@ fn main() -> Result<()> {
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
     ));
     let args = Args::parse();
+    // A client's or a test's run sends and fetches nothing (see `upload::online`).
+    if args.control.is_some() || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some() {
+        upload::set_automated();
+    }
     if let Some(secs) = args.pad_probe {
         paddev::probe(secs);
         return Ok(());
