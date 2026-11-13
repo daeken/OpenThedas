@@ -84,9 +84,10 @@ enum Command {
     /// Run the headless simulation: load a module and area, tick, report.
     Sim {
         install: PathBuf,
-        /// Module folder under `modules/`.
-        #[arg(long, default_value = "single player")]
-        module: String,
+        /// Module folder under `modules/`; the install's base campaign when not given
+        /// (`single player`, or `campaign_base` for Dragon Age II).
+        #[arg(long)]
+        module: Option<String>,
         /// Area resource (e.g. cir110ar_inn); defaults to the module's start area.
         #[arg(long)]
         area: Option<String>,
@@ -116,8 +117,9 @@ enum Command {
         install: PathBuf,
         /// A save made with the MCP's save_state.
         save: PathBuf,
-        #[arg(long, default_value = "single player")]
-        module: String,
+        /// The install's base campaign when not given.
+        #[arg(long)]
+        module: Option<String>,
         #[arg(long, default_value_t = 10)]
         seeds: u64,
         #[arg(long, default_value_t = 1)]
@@ -419,8 +421,10 @@ fn run() -> Result<()> {
             talk,
             replies,
         } => sim::run(&sim::Options {
+            module: module
+                .as_deref()
+                .unwrap_or_else(|| thedas_vfs::install::campaign_module(&install)),
             install: &install,
-            module: &module,
             area: area.as_deref(),
             waypoint: waypoint.as_deref(),
             ticks,
@@ -456,8 +460,10 @@ fn run() -> Result<()> {
             coverage,
             save_to,
         } => autoplay::run(&autoplay::Options {
+            module: module
+                .as_deref()
+                .unwrap_or_else(|| thedas_vfs::install::campaign_module(&install)),
             install: &install,
-            module: &module,
             save: &save,
             seeds,
             first_seed,
