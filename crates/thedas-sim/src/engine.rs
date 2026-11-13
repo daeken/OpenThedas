@@ -197,10 +197,8 @@ const PRESENTATION: &[&str] = &[
     "SetCreatureGoreLevel",
     // Only the indicator on the quickbar; the modal effect itself is the scripts'.
     "Engine_SetModalAbilityGUI",
-    // An icon over a creature's head (DAOrigins.exe 0x662db0) and the specialisation
-    // notice (0x663b80): interface only.
+    // An icon over a creature's head (DAOrigins.exe 0x662db0): interface only.
     "ShowFloatyIcon",
-    "ShowSpecUnlockedNotification",
 ];
 
 /// Engine functions answered with a fixed placeholder because the simulation lacks what
@@ -1620,12 +1618,58 @@ pub fn call(
         // the Abilities M2DA (column 0xe1a8f4ea, 0x669b4c) and does nothing for an id of 0 or
         // below or one with no row; HasAbility answers false for it.
         "AddAbility" => {
-            let id = int(a, 1);
+            let (who, id) = (obj(a, 0), int(a, 1));
             if h.sim.ability_known(id)
-                && let Some(o) = h.sim.world.get_mut(obj(a, 0))
+                && let Some(o) = h.sim.world.get_mut(who)
             {
                 o.abilities.insert(id);
+                // With bSendNotification, a party member's new ability shows as a large
+                // alert with its name, its icon and who got it (DAOrigins.exe 0x669bd0:
+                // the flag, then the party test 0x6316f0, then the builder 0x6291c0).
+                // Provisional: the exe skips abilities of type 4 before adding them at all,
+                // which is not modelled here.
+                if a.len() > 2 && int(a, 2) != 0 && h.sim.in_party(who) {
+                    let cell = |h: &ScriptHost, col: &str| {
+                        h.sim
+                            .world
+                            .tables()
+                            .get(0, "ABI_base")
+                            .and_then(|t| t.cell(col, id as i64).cloned())
+                    };
+                    let name = match cell(h, "NameStrRef") {
+                        Some(Cell::Int(n)) if n > 0 => h.sim.string(n as u32),
+                        _ => None,
+                    };
+                    let icon = match cell(h, "Icon") {
+                        Some(Cell::String(s)) => Some(clean(&s).to_string()),
+                        _ => None,
+                    };
+                    h.sim
+                        .raise_large_alert(crate::journal::ALERT_ABILITY, name, icon, Some(who));
+                }
             }
+            void()
+        }
+        // DAOrigins.exe (0x663b80 -> 0x628e10): a large alert with the specialization's
+        // name (`NameStrRef`, column 0x3273f70d) and icon (`Icon`, 0xbcddb871) from its
+        // row of the classes table (`CLA_base`, as script.ldf says of nSpecID).
+        "ShowSpecUnlockedNotification" => {
+            let spec = int(a, 0) as i64;
+            let tables = h.sim.world.tables();
+            let row = tables.get(0, "CLA_base");
+            let name = match row
+                .as_ref()
+                .and_then(|t| t.cell("NameStrRef", spec).cloned())
+            {
+                Some(Cell::Int(n)) if n > 0 => h.sim.string(n as u32),
+                _ => None,
+            };
+            let icon = match row.as_ref().and_then(|t| t.cell("Icon", spec).cloned()) {
+                Some(Cell::String(s)) => Some(clean(&s).to_string()),
+                _ => None,
+            };
+            h.sim
+                .raise_large_alert(crate::journal::ALERT_SPECIALIZATION, name, icon, None);
             void()
         }
         "RemoveAbility" => {
@@ -2498,7 +2542,19 @@ pub fn call(
             }
             void()
         }
-        "Engine_ApplyEffectAtLocation" | "ShowAreaUnlockedNotification" => {
+        // DAOrigins.exe (0x663bd0 -> 0x629360): a large alert with the area's name as the
+        // script gives it and, when given, the image to show with it.
+        "ShowAreaUnlockedNotification" => {
+            let image = (a.len() > 1).then(|| string(a, 1));
+            h.sim.raise_large_alert(
+                crate::journal::ALERT_WORLD_MAP,
+                Some(string(a, 0)),
+                image,
+                None,
+            );
+            void()
+        }
+        "Engine_ApplyEffectAtLocation" => {
             let effect = match h.sim.world.handle(handle(a, 1)) {
                 Some(EngineData::Effect(e)) => Some(e.ty),
                 _ => None,
@@ -6095,7 +6151,10 @@ mod coverage_tests {
         void SetZoomLevel(float f) = 115;\n\
         void SetLoadHint(int n, int t = 206) = 116;\n\
         void ApplyEffectVisualEffect(object c, object t, int v, int d, float f, int a = 0) = 117;\n\
-        void SetDeathHint(int n, int t = 205) = 118;\n";
+        void SetDeathHint(int n, int t = 205) = 118;\n\
+        void AddAbility(object o, int a, int n = FALSE) = 119;\n\
+        void ShowSpecUnlockedNotification(int s) = 120;\n\
+        void ShowAreaUnlockedNotification(string a, string i = \"\") = 121;\n";
 
     #[test]
     fn visual_effects_on_objects_are_applied_as_effects() {
@@ -6152,6 +6211,97 @@ mod coverage_tests {
             .collect();
         assert_eq!(left, vec![1022], "the glow has run out");
         assert!(s.world.instant_vfx.is_empty(), "the flash note has gone");
+    }
+
+    #[test]
+    fn abilities_map_areas_and_specializations_raise_large_alerts() {
+        use crate::journal::{ALERT_ABILITY, ALERT_SPECIALIZATION, ALERT_WORLD_MAP};
+        let mut s = sim();
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        let stranger = s.world.spawn(ObjectKind::Creature, "stranger");
+        s.world.hero = Some(hero);
+        let t = s.world.tables();
+        t.insert(
+            "ABI_base",
+            &["ID", "NameStrRef", "Icon"],
+            vec![(
+                10001,
+                vec![
+                    Cell::Int(10001),
+                    Cell::Int(500),
+                    Cell::String("ico_winters_grasp".into()),
+                ],
+            )],
+        );
+        t.insert(
+            "CLA_base",
+            &["ID", "NameStrRef", "Icon"],
+            vec![(
+                4,
+                vec![
+                    Cell::Int(4),
+                    Cell::Int(501),
+                    Cell::String("ico_spec_shapeshifter".into()),
+                ],
+            )],
+        );
+        let _ = s.strings.set(
+            [(500, "Winter's Grasp"), (501, "Shapeshifter")]
+                .into_iter()
+                .map(|(k, v)| (k, v.to_string()))
+                .collect(),
+        );
+        let add = |s: &mut Sim, who: ObjectId, notify: i32| {
+            run(
+                s,
+                who,
+                "AddAbility",
+                &[Value::Object(who), Value::Int(10001), Value::Int(notify)],
+            );
+        };
+        // Only with bSendNotification, and only for a party member.
+        add(&mut s, hero, 0);
+        add(&mut s, stranger, 1);
+        assert!(s.world.uber_alerts.is_empty());
+        add(&mut s, hero, 1);
+        run(
+            &mut s,
+            hero,
+            "ShowSpecUnlockedNotification",
+            &[Value::Int(4)],
+        );
+        run(
+            &mut s,
+            hero,
+            "ShowAreaUnlockedNotification",
+            &[Value::String("Soldier's Peak".into())],
+        );
+        type Shown<'a> = (i32, Option<&'a str>, Option<&'a str>, Option<ObjectId>);
+        let got: Vec<Shown> = s
+            .world
+            .uber_alerts
+            .iter()
+            .map(|a| (a.kind, a.text.as_deref(), a.icon.as_deref(), a.creature))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    ALERT_ABILITY,
+                    Some("Winter's Grasp"),
+                    Some("ico_winters_grasp"),
+                    Some(hero)
+                ),
+                (
+                    ALERT_SPECIALIZATION,
+                    Some("Shapeshifter"),
+                    Some("ico_spec_shapeshifter"),
+                    None
+                ),
+                (ALERT_WORLD_MAP, Some("Soldier's Peak"), None, None),
+            ]
+        );
+        assert!(s.world.alerts.is_empty(), "none of them is a small alert");
     }
 
     #[test]

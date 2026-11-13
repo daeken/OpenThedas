@@ -42,14 +42,34 @@ pub fn modal(targets: Vec<FocusTarget>) -> Vec<FocusTarget> {
         })
         .collect();
     if targets.iter().any(|t| t.path.contains(LIST)) {
-        targets
+        return targets
             .into_iter()
             .filter(|t| t.path.contains(LIST))
-            .collect()
-    } else {
-        targets
+            .collect();
+    }
+    // A dialog box (popuplayer.gfx's, known by its row of buttons) is modal over
+    // everything else its movie shows: the tutorial panel beside it is not to be had while
+    // the box is up (its Next sat above a tall box's buttons and took the first focus).
+    const BOX_BUTTONS: &str = ".Buttons_mc.Button";
+    let root = targets
+        .iter()
+        .find(|t| t.movie == POPUP_MOVIE && t.path.contains(BOX_BUTTONS))
+        .and_then(|t| {
+            t.path
+                .find(BOX_BUTTONS)
+                .map(|i| format!("{}.", &t.path[..i]))
+        });
+    match root {
+        Some(root) => targets
+            .into_iter()
+            .filter(|t| t.movie == POPUP_MOVIE && t.path.starts_with(&root))
+            .collect(),
+        None => targets,
     }
 }
+
+/// The movie of the game's dialog boxes and tutorial panel.
+const POPUP_MOVIE: &str = "popuplayer.gfx";
 
 /// The first target in reading order: the topmost row, then its leftmost.
 pub fn first(targets: &[FocusTarget]) -> Option<usize> {
@@ -223,6 +243,35 @@ mod tests {
             path: path.into(),
             rect: [x, y, x + w, y + h],
         }
+    }
+
+    #[test]
+    fn a_dialog_box_is_modal_over_the_tutorial_panel() {
+        let p = |path: &str, y: f64| FocusTarget {
+            movie: POPUP_MOVIE.into(),
+            path: path.into(),
+            rect: [500.0, y, 700.0, y + 30.0],
+        };
+        let next = "_level0.TutorialContainer_mc.Fade_mc.Tutorial_mc.TutorialNextOKButton_mc";
+        let targets = vec![
+            // The tutorial's Next sits above the box's buttons.
+            p(next, 300.0),
+            p("_level0.null.Buttons_mc.Button1_mc", 420.0),
+            p("_level0.null.Buttons_mc.Button2_mc", 420.0),
+            p("_level0.null.TextInput_mc", 380.0),
+            t("_level0.Other_mc", 0.0, 0.0, 10.0, 10.0),
+        ];
+        let kept: Vec<String> = modal(targets).into_iter().map(|t| t.path).collect();
+        assert_eq!(
+            kept,
+            [
+                "_level0.null.Buttons_mc.Button1_mc",
+                "_level0.null.Buttons_mc.Button2_mc",
+                "_level0.null.TextInput_mc"
+            ]
+        );
+        // Without a box the tutorial's button is a target like any other.
+        assert_eq!(modal(vec![p(next, 300.0)]).len(), 1);
     }
 
     /// The start menu's column of buttons.
