@@ -1811,7 +1811,7 @@ fn tactics(sim: &Sim, who: u32, v: &mut BTreeMap<String, UiValue>) {
 /// The inventory screen: the party's backpack (`GUIInventory.PartyBackpackView.N.Item`, the
 /// items of the chosen category tab, `filter`) with plot items listed apart
 /// (`PartyPlotItemsView`), the money, and what the selected party member (`who`) wears
-/// (`GUI.SelectedChar.Equipment.<INVENTORY_SLOT_*>`, 0 for an empty slot).
+/// (`GUI.SelectedChar.Equipment.<INVENTORY_SLOT_*>`, null for an empty slot).
 fn inventory(sim: &Sim, who: Option<u32>, filter: i32, v: &mut BTreeMap<String, UiValue>) {
     let pack = sim.party_backpack();
     let (plot, gear): (Vec<u32>, Vec<u32>) = pack
@@ -1908,9 +1908,12 @@ fn inventory(sim: &Sim, who: Option<u32>, filter: i32, v: &mut BTreeMap<String, 
                 v.insert(k.clone(), num(*id));
                 item(sim, &k, *id, v);
             }
+            // An empty slot reads as no item: null. The slot's update (inventory.gfx's
+            // equipment slot) shows an item's icon for any value other than null, so a 0
+            // put an empty grey icon in a slot just emptied.
             None => {
-                v.insert(k.clone(), num(0));
-                v.insert(format!("{k}.ID"), num(0));
+                v.insert(k.clone(), UiValue::Null);
+                v.insert(format!("{k}.ID"), UiValue::Null);
             }
         }
     }
@@ -2069,7 +2072,7 @@ mod tests {
         );
         assert_eq!(all["Party.BackpackSize"], UiValue::Number(1.0));
         // An empty slot reads as no item.
-        assert_eq!(all["GUI.SelectedChar.Equipment.0"], UiValue::Number(0.0));
+        assert_eq!(all["GUI.SelectedChar.Equipment.0"], UiValue::Null);
         let weapons = sim_values_for(
             &sim,
             &Presentation {
