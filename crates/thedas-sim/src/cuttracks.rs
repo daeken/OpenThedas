@@ -64,6 +64,7 @@ const FIELD_ACTOR_TRACKS: u32 = 5206;
 const FIELD_ACTOR_CREATURE: u32 = 5208;
 const FIELD_ACTOR_POSITION: u32 = 5214;
 const FIELD_ACTOR_ROTATION: u32 = 5215;
+const FIELD_ACTOR_POSE: u32 = 5211;
 const FIELD_ACTOR_TAG: u32 = 5216;
 const FIELD_ACTOR_END_POSITION: u32 = 5221;
 const FIELD_ACTOR_END_ROTATION: u32 = 5222;
@@ -92,6 +93,9 @@ const FIELD_ANIMATION: u32 = 5400;
 const FIELD_ANIMATION_TREE: u32 = 5401;
 const FIELD_ANIMATION_SPEED: u32 = 5402;
 const FIELD_ANIMATION_OFFSET: u32 = 5403;
+const FIELD_ANIMATION_ROOT_POSITIONS: u32 = 5408;
+const FIELD_ANIMATION_ROOT_ROTATIONS: u32 = 5409;
+const FIELD_ANIMATION_ROOT_HELD: u32 = 5410;
 const FIELD_CURVE_DEFAULT: u32 = 5350;
 const FIELD_CURVE_KEYS: u32 = 5351;
 const FIELD_CURVE_TRANSITIONS: u32 = 5352;
@@ -300,6 +304,15 @@ pub struct AnimationTrack {
     pub speed: f32,
     /// Field 5403 (+0x64): seconds into the animation it starts at.
     pub offset: f32,
+    /// Field 5408 (+0xb4): the animation's root motion as the cutscene file bakes it, keys of
+    /// (seconds into the animation, x, y, z) in the actor's own frame. Empty for a pose.
+    pub root_positions: Vec<[f32; 4]>,
+    /// Field 5409 (+0xbc): the root's turn, keys of (seconds, x, y, z, w).
+    pub root_rotations: Vec<[f32; 5]>,
+    /// Field 5410 (+0x81): the root motion does not move the actor. Provisional: the
+    /// executable takes another path for such a track (0x7d8180), which is not traced, so
+    /// what the boolean means is inferred from the branch alone.
+    pub root_held: bool,
 }
 
 impl AnimationTrack {
@@ -309,6 +322,64 @@ impl AnimationTrack {
     pub fn time_at(&self, t: f32) -> f32 {
         let since = (t - self.start).clamp(0.0, (self.end - self.start).max(0.0));
         self.speed * since + self.offset
+    }
+
+    /// How far the animation's root motion has moved and turned the actor `t` seconds into
+    /// the cutscene: the root keys at the animation's time, in the actor's own frame.
+    /// `None` before the track starts, for a track without root keys and for one that
+    /// holds its actor ([`AnimationTrack::root_held`]).
+    ///
+    /// The executable's track update (0x7d92e0) samples the two key lists (0xa38de0,
+    /// 0xa38d20), turns the position into the actor's frame (0x7d3c80) and sets the actor's
+    /// position to its own plus that, and its rotation to its own times the turn (0x4cb640);
+    /// the track's end (0x7d9450) leaves the last keys in place, so the actor stays where
+    /// the animation took it (a quarter turn keeps the actor turned).
+    ///
+    /// Provisional: the keys are taken as linear between samples, and what fields 5405,
+    /// 5411 and 5413 switch is not traced.
+    pub fn root_at(&self, t: f32) -> Option<([f32; 3], [f32; 4])> {
+        if self.root_held
+            || t < self.start
+            || (self.root_positions.is_empty() && self.root_rotations.is_empty())
+        {
+            return None;
+        }
+        let at = self.time_at(t);
+        // The keys either side of `at` and how far between them it is.
+        fn span<const N: usize>(keys: &[[f32; N]], at: f32) -> Option<(usize, usize, f32)> {
+            let last = keys.len().checked_sub(1)?;
+            let next = keys.iter().position(|k| k[0] >= at).unwrap_or(last);
+            let prev = next.saturating_sub(1);
+            let (a, b) = (keys[prev][0], keys[next][0]);
+            let f = if b > a && at > a {
+                ((at - a) / (b - a)).clamp(0.0, 1.0)
+            } else if at >= b {
+                1.0
+            } else {
+                0.0
+            };
+            Some((prev, next, f))
+        }
+        let position = match span(&self.root_positions, at) {
+            Some((a, b, f)) => {
+                let (a, b) = (self.root_positions[a], self.root_positions[b]);
+                [1, 2, 3].map(|i| a[i] + (b[i] - a[i]) * f)
+            }
+            None => [0.0; 3],
+        };
+        let rotation = match span(&self.root_rotations, at) {
+            Some((a, b, f)) => {
+                let (a, b) = (self.root_rotations[a], self.root_rotations[b]);
+                let (qa, mut qb) = ([a[1], a[2], a[3], a[4]], [b[1], b[2], b[3], b[4]]);
+                // The short way round between the two keys.
+                if qa.iter().zip(&qb).map(|(x, y)| x * y).sum::<f32>() < 0.0 {
+                    qb = qb.map(|x| -x);
+                }
+                normalize([0, 1, 2, 3].map(|i| qa[i] + (qb[i] - qa[i]) * f))
+            }
+            None => [0.0, 0.0, 0.0, 1.0],
+        };
+        Some((position, rotation))
     }
 }
 
@@ -460,6 +531,10 @@ pub struct Actor {
     pub end_rotation: [f32; 4],
     /// The actor has an `ActionSnapToWalkmesh` track (kind 38): it is kept on the ground.
     pub snaps: bool,
+    /// Field 5211 (+0x454): the base pose the actor holds through the cutscene, the node
+    /// `pose_<n>` of the cutscene's animation tree (17 is a sitting loop; see
+    /// [`Actor::pose_node`]). `None` when the file gives none (the executable's -1).
+    pub pose: Option<i64>,
     /// Field 5214: the base the motion curves are placed from.
     pub position: [f32; 3],
     /// Field 5215: the base rotation (x, y, z, w).
@@ -492,11 +567,26 @@ pub struct Pose {
 }
 
 impl Actor {
+    /// The node of the cutscene's animation tree that is the actor's base pose: `pose_<n>`
+    /// for its pose number (field 5211). The executable makes the name with `pose_%d`
+    /// (0x7ce490, the string at 0xb23164) and plays it under the actor's animation tracks
+    /// (the actor update, 0x7d6240 on, through 0x7ce330); the trees hold such nodes beside
+    /// the animations they stand for (`pose_17` with `mh.wi_sit_lp`).
+    ///
+    /// Provisional: the `transition_<from>_<to>` nodes the executable plays between two
+    /// poses (the same function, with field 5219 as the other number) are not followed; the
+    /// actor is in its pose from the start.
+    pub fn pose_node(&self) -> Option<String> {
+        self.pose.map(|n| format!("pose_{n}"))
+    }
+
     /// The animations the actor plays `t` seconds into a cutscene `length` seconds long,
     /// in the file's order, each with seconds into it: those whose span holds `t`, and the
     /// last one started if it is a pose (no span) or runs past the cutscene's end, which
-    /// holds its last frame. Provisional: the executable's blending out of a track at its
-    /// end (0x7d9450, 0x7d92e0 under fields 5405 and 5411) is not followed.
+    /// holds its last frame. Provisional: what the executable does with a track's pose at
+    /// its end is not followed (its root motion is: 0x7d92e0 and 0x7d9450, see
+    /// [`AnimationTrack::root_at`]; what the booleans 5405, 5411 and 5413 switch is not
+    /// traced).
     pub fn animations_at(&self, t: f32, length: f32) -> Vec<(&AnimationTrack, f32)> {
         let latest = self
             .animations
@@ -556,6 +646,13 @@ impl Actor {
                 }
                 _ => normalize(rot),
             };
+        }
+        // Each animation's root motion moves the actor on from there, in the file's order,
+        // and stays once its track has ended (see [`AnimationTrack::root_at`]).
+        for (step, turn) in self.animations.iter().filter_map(|a| a.root_at(t)) {
+            let moved = rotate(pose.rotation, step);
+            pose.position = [0, 1, 2].map(|i| pose.position[i] + moved[i]);
+            pose.rotation = normalize(mul(pose.rotation, turn));
         }
         pose
     }
@@ -841,6 +938,10 @@ impl Tracks {
                     _ => [0.0, 0.0, 0.0, 1.0],
                 },
                 snaps: false,
+                pose: g
+                    .field(a, FIELD_ACTOR_POSE)
+                    .and_then(Value::as_i64)
+                    .filter(|&p| p >= 0),
                 motion: Vec::new(),
                 turn: Vec::new(),
                 fov: Vec::new(),
@@ -1005,6 +1106,12 @@ impl Tracks {
                                 tree,
                                 speed: f32_field(g, tr, FIELD_ANIMATION_SPEED).unwrap_or(1.0),
                                 offset: f32_field(g, tr, FIELD_ANIMATION_OFFSET).unwrap_or(0.0),
+                                root_positions: float_keys(g, tr, FIELD_ANIMATION_ROOT_POSITIONS),
+                                root_rotations: float_keys(g, tr, FIELD_ANIMATION_ROOT_ROTATIONS),
+                                root_held: g
+                                    .field(tr, FIELD_ANIMATION_ROOT_HELD)
+                                    .and_then(Value::as_i64)
+                                    .is_some_and(|v| v != 0),
                             });
                         }
                     }
@@ -1140,6 +1247,26 @@ fn f32_field(g: &Gff4, id: StructId, label: u32) -> Option<f32> {
         .and_then(Value::as_f64)
         .map(|v| v as f32)
         .filter(|v| v.is_finite())
+}
+
+/// A list of floats read as keys of `N` floats each (a root motion list of an animation
+/// track); keys with a value that is not finite, and a ragged tail, are left out.
+fn float_keys<const N: usize>(g: &Gff4, id: StructId, label: u32) -> Vec<[f32; N]> {
+    let list = match g.field(id, label) {
+        Some(Value::List(Some(l))) => Some(l),
+        Some(Value::Generic(slot)) => match &slot.value {
+            Some(Value::List(Some(l))) => Some(l),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(thedas_formats::gff4::List::F32(v)) = list else {
+        return Vec::new();
+    };
+    v.chunks_exact(N)
+        .filter(|k| k.iter().all(|x| x.is_finite()))
+        .map(|k| std::array::from_fn(|i| k[i]))
+        .collect()
 }
 
 /// Hamilton's product `a·b` of (x, y, z, w) quaternions (0x4cb640).
@@ -1850,6 +1977,112 @@ mod tests {
         }
     }
 
+    /// An actor's pose number names its base pose's node in the cutscene's tree.
+    #[test]
+    fn an_actors_pose_number_names_its_base_pose() {
+        let mut a = Actor {
+            id: 1,
+            name: "a".into(),
+            creature: None,
+            tag: None,
+            end_position: [0.0; 3],
+            end_rotation: [0.0, 0.0, 0.0, 1.0],
+            snaps: false,
+            pose: Some(17),
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            motion: Vec::new(),
+            turn: Vec::new(),
+            fov: Vec::new(),
+            animations: Vec::new(),
+            places: Vec::new(),
+            camera_jumps: Vec::new(),
+            links: Vec::new(),
+        };
+        assert_eq!(a.pose_node().as_deref(), Some("pose_17"));
+        a.pose = Some(0);
+        assert_eq!(a.pose_node().as_deref(), Some("pose_0"));
+        a.pose = None;
+        assert_eq!(a.pose_node(), None);
+    }
+
+    /// An animation track's root motion moves and turns its actor, and stays after the
+    /// track ends (a cutscene's quarter turn keeps the actor turned).
+    #[test]
+    fn an_animations_root_motion_moves_the_actor_and_stays() {
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        let turn = AnimationTrack {
+            start: 2.0,
+            end: 4.0,
+            node: "turn".into(),
+            tree: "x.cub".into(),
+            speed: 1.0,
+            offset: 0.0,
+            // One metre along the actor's own +Y over two seconds, and a quarter turn left.
+            root_positions: vec![[0.0, 0.0, 0.0, 0.0], [2.0, 0.0, 1.0, 0.0]],
+            root_rotations: vec![[0.0, 0.0, 0.0, 0.0, 1.0], [2.0, 0.0, 0.0, h, h]],
+            root_held: false,
+        };
+        assert_eq!(turn.root_at(1.9), None);
+        let (p, r) = turn.root_at(3.0).unwrap();
+        assert!((p[1] - 0.5).abs() < 1e-5);
+        assert!((facing_of(r).unwrap() - facing_of([0.0, 0.0, 0.0, 1.0]).unwrap()).abs() > 1.0);
+        // Past its end the last keys hold.
+        let (p, r) = turn.root_at(60.0).unwrap();
+        assert!((p[1] - 1.0).abs() < 1e-5);
+        assert!((r[2] - h).abs() < 1e-5 && (r[3] - h).abs() < 1e-5);
+        // A track that holds its actor, and a pose without keys, move nothing.
+        let held = AnimationTrack {
+            root_held: true,
+            ..turn.clone()
+        };
+        assert_eq!(held.root_at(3.0), None);
+        let pose = AnimationTrack {
+            root_positions: Vec::new(),
+            root_rotations: Vec::new(),
+            ..turn.clone()
+        };
+        assert_eq!(pose.root_at(3.0), None);
+
+        // On an actor that stands at (10, 0, 0) turned a quarter left (its +Y is world -X):
+        // the step goes along world -X, and two such tracks turn it half way round.
+        let mut a = Actor {
+            id: 1,
+            name: "a".into(),
+            creature: None,
+            tag: None,
+            end_position: [0.0; 3],
+            end_rotation: [0.0, 0.0, 0.0, 1.0],
+            snaps: false,
+            pose: None,
+            position: [10.0, 0.0, 0.0],
+            rotation: [0.0, 0.0, h, h],
+            motion: Vec::new(),
+            turn: Vec::new(),
+            fov: Vec::new(),
+            animations: vec![turn.clone()],
+            places: Vec::new(),
+            camera_jumps: Vec::new(),
+            links: Vec::new(),
+        };
+        let none: &PlaceLookup = &|_| None;
+        let before = a.stage_pose_at(1.0, none);
+        assert_eq!(before.position, [10.0, 0.0, 0.0]);
+        let after = a.stage_pose_at(9.0, none);
+        assert!((after.position[0] - 9.0).abs() < 1e-4 && after.position[1].abs() < 1e-4);
+        // A half turn about Z: (0, 0, 1, 0) up to sign.
+        assert!(after.rotation[2].abs() > 0.999 && after.rotation[3].abs() < 1e-3);
+        a.animations.push(AnimationTrack {
+            start: 5.0,
+            end: 7.0,
+            ..turn
+        });
+        let twice = a.stage_pose_at(9.0, none);
+        // The second step is taken in the frame the first left: along world -Y.
+        assert!((twice.position[0] - 9.0).abs() < 1e-4 && (twice.position[1] + 1.0).abs() < 1e-4);
+        assert!((twice.rotation[2].abs() - h).abs() < 1e-3);
+    }
+
     #[test]
     fn plays_jumps_and_animations_as_the_tracks_say() {
         let t = Tracks::from_gff4(&cut());
@@ -1883,6 +2116,9 @@ mod tests {
             tree: "x.cub".into(),
             speed: 2.0,
             offset: 1.0,
+            root_positions: Vec::new(),
+            root_rotations: Vec::new(),
+            root_held: false,
         };
         a.animations = vec![
             anim("pose", 0.0, 0.0),

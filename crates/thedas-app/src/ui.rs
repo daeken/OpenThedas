@@ -216,6 +216,10 @@ fn splash_pass(
     }
 }
 
+/// For how long after a large notification becomes the first its splash is looked for
+/// (its clip replaces the one before within a few of the movie's frames).
+const UBER_SETTLE_MS: f64 = 1500.0;
+
 /// For how many frames after a dialog box shows its text field is given the focus (see
 /// `Stage::focus_dialog_field`).
 const FOCUS_FRAMES: u8 = 10;
@@ -326,6 +330,9 @@ pub struct UiLayer {
     /// The large notification whose splash has been dealt with (see
     /// [`UiLayer::uber_alert_splash`]).
     uber_splash: Option<String>,
+    /// Milliseconds left in which the large notification's splash is looked for again (see
+    /// `UiLayer::uber_alert_splash`).
+    uber_settle: f64,
     /// A large notification was cut off: notifications.gfx went away (a full-screen screen
     /// opened) while it showed, so it is dismissed as the movie would at its end.
     uber_cut: bool,
@@ -704,6 +711,7 @@ impl UiLayer {
             text_answers: Vec::new(),
             portrait_clicked: None,
             uber_splash: None,
+            uber_settle: 0.0,
             uber_cut: false,
             notifications_up: false,
             alerts_cut: false,
@@ -1064,10 +1072,20 @@ impl UiLayer {
     /// white paper would show as a white block), so the splash is hidden from the movie's own
     /// picture and drawn alone in its multiply pass (`thedas_ui::MultiplyPass`), multiplied
     /// onto the frame under the movie.
-    fn uber_alert_splash(&mut self, sim: &Arc<Mutex<Sim>>) {
+    fn uber_alert_splash(&mut self, sim: &Arc<Mutex<Sim>>, dt_ms: f64) {
         let head = {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
-            sim.world.uber_alerts.first().map(|a| a.resref.clone())
+            // What tells one large notification from the next: its kind, plot and text, and
+            // how many wait behind it (two alike in a row differ by that).
+            let n = sim.world.uber_alerts.len();
+            sim.world.uber_alerts.first().map(|a| {
+                format!(
+                    "{}:{}:{}:{n}",
+                    a.kind,
+                    a.resref,
+                    a.text.as_deref().unwrap_or_default()
+                )
+            })
         };
         // The movie that showed it is gone (the HUD makes way for a full-screen screen and is
         // loaded again after): the banner is dismissed (`Party.HideUberAlert`) instead of
@@ -1081,10 +1099,12 @@ impl UiLayer {
             .any(|m| m.name == "notifications.gfx");
         // Likewise the small notifications up when it went: they are dismissed as when they
         // fade, not shown again by the HUD that comes back.
-        if std::mem::replace(&mut self.notifications_up, notifications) && !notifications {
+        let was_up = std::mem::replace(&mut self.notifications_up, notifications);
+        if was_up && !notifications {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             self.alerts_cut |= !sim.world.alerts.is_empty();
         }
+
         if head.is_some() && self.uber_splash.is_some() && !notifications {
             self.uber_splash = None;
             self.uber_cut = true;
@@ -1098,6 +1118,7 @@ impl UiLayer {
             }
             return;
         };
+
         // The same notification, unless notifications.gfx was loaded again meanwhile (the
         // HUD comes back after a full-screen screen): a new movie has no pass yet.
         let reloaded = self
@@ -1105,25 +1126,43 @@ impl UiLayer {
             .movies
             .iter()
             .any(|m| m.name == "notifications.gfx" && !m.has_multiply_pass());
-        if self.uber_splash.as_deref() == Some(head.as_str()) && !reloaded {
+        // A notification's clip takes the place (and often the name) of the one before a
+        // few frames after its alert becomes the first, so its splash is looked for again
+        // on each of its first frames, not once.
+        if self.uber_splash.as_deref() != Some(head.as_str()) || reloaded {
+            self.uber_settle = UBER_SETTLE_MS;
+            self.uber_splash = Some(head);
+        }
+        if self.uber_settle <= 0.0 {
             return;
         }
+        self.uber_settle -= dt_ms;
+
         // The notification's clip is named as it is added (`UberNotification<n>`); its
-        // splash is its `instance1`.
+        // splash is its unnamed child.
         let Some(thedas_ui::UiValue::String(tree)) =
             self.stage
                 .call_in("notifications.gfx", "_global.thedas_tree_list", &[])
         else {
             return;
         };
-        let splash = tree.split(';').find_map(|e| {
-            let path = e.split('|').next()?;
-            let rest = path
-                .split_once("UberNotificationArea_mc.UberNotification")?
-                .1;
-            let (n, tail) = rest.split_once('.')?;
-            (n.chars().all(|c| c.is_ascii_digit()) && tail == "instance1").then_some(path)
-        });
+        // The last listed is the newest (a clip the one before left fading is listed first).
+        let splash = tree
+            .split(';')
+            .filter_map(|e| {
+                let path = e.split('|').next()?;
+                let rest = path
+                    .split_once("UberNotificationArea_mc.UberNotification")?
+                    .1;
+                let (n, tail) = rest.split_once('.')?;
+                // The splash is the notification's unnamed child (`instance<k>`; its plate
+                // is `GUI_mc`).
+                let unnamed = tail
+                    .strip_prefix("instance")
+                    .is_some_and(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_digit()));
+                (n.chars().all(|c| c.is_ascii_digit()) && unnamed).then_some(path)
+            })
+            .next_back();
         if let Some(path) = splash {
             let paths: Vec<&str> = tree
                 .split(';')
@@ -1142,7 +1181,6 @@ impl UiLayer {
                 m.set(&format!("{path}._visible"), thedas_ui::UiValue::Bool(false));
                 m.set_multiply_pass(Some(pass));
             }
-            self.uber_splash = Some(head);
         }
     }
 
@@ -1741,7 +1779,7 @@ impl UiLayer {
         self.show_text_popup();
         self.report_button();
         self.select_clicked_portrait(sim);
-        self.uber_alert_splash(sim);
+        self.uber_alert_splash(sim, dt_ms);
         self.loading_frame(dt_ms);
         self.travel_map_frame();
         let mut messages = self.stage.tick(dt_ms);
