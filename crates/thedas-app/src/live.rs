@@ -2323,6 +2323,7 @@ fn objects_key(models: &[ObjectModel]) -> ObjectsKey {
             v.extend(m.attached.iter().map(|a| format!("{}@{}", a.model, a.node)));
             v.extend(m.morph.iter().map(|x| format!("{x}.mor{}", m.hide_hair)));
             v.extend(m.tints.iter().map(|(a, t)| format!("{a}:{t}")));
+            v.extend(m.effects.iter().map(|e| format!("fx:{e}")));
             (m.id, v)
         })
         .collect()
@@ -2366,6 +2367,7 @@ pub fn prop(m: &ObjectModel) -> Prop {
         morph: m.morph.clone(),
         hide_hair: m.hide_hair,
         tints: m.tints.clone(),
+        effects: m.effects.clone(),
         transform: Prop::placement(m.position, m.facing),
     }
 }
