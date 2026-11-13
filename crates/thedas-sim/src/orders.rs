@@ -33,6 +33,10 @@ fn command(sim: &Sim, ty: &str, name: &str) -> Command {
     }
 }
 
+/// How far apart in height two points of walkable ground may be and still count as one
+/// level for a player's move (see `Sim::order_move`). Provisional.
+const SAME_LEVEL: f32 = 1.0;
+
 impl Sim {
     /// Makes `who` the party member the player controls (the hero when `None`, or when `who`
     /// is not in the party): its AI stops and the rest follow it.
@@ -77,17 +81,21 @@ impl Sim {
         } else {
             facing
         };
-        // A place that is not walkable ground (beyond the walkable area: a held stick aims
-        // there) is not walked onto: the move goes along the line towards it as far as the
-        // ground stays walkable, so the walker stops at the edge on its own level. (A route
-        // otherwise ends at the place asked for, and a move without a route takes a straight
-        // line.) A walker already off the walkable ground makes for the nearest of it.
+        // A place that is not walkable ground (beyond the walkable area, or in a wall: a
+        // held stick aims there) is not walked onto. The move goes to the walkable ground
+        // nearest it on the walker's own level, which carries a walker pushing into an edge
+        // along it; failing that, along the line towards it as far as the ground stays
+        // walkable. (A route otherwise ends at the place asked for, and a move without a
+        // route takes a straight line: at Lothering the hero ran 290 m off the highway.)
         // Provisional: DAOrigins.exe moves the player's character with its physics
         // controller over the walkable mesh.
         let to = match self.nav_grid(area) {
-            Some(g) if !crate::nav::on_walkable(&g, to) => crate::nav::walkable_reach(&g, from, to)
-                .or_else(|| crate::nav::nearest_walkable_point(&g, to))
-                .unwrap_or(from),
+            Some(g) if !crate::nav::on_walkable(&g, to) => {
+                crate::nav::nearest_walkable_point(&g, to)
+                    .filter(|p| (p[2] - from[2]).abs() <= SAME_LEVEL)
+                    .or_else(|| crate::nav::walkable_reach(&g, from, to))
+                    .unwrap_or(from)
+            }
             _ => to,
         };
         let mut c = command(
