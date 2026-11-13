@@ -16,6 +16,7 @@
 //! - [`mesh`]: `.msh` mesh data with D3D9 vertex declarations (GFF4).
 //! - [`material`]: `.mao` material objects and `.mat` material definitions (XML).
 //! - [`state`]: `.sta` render states (XML).
+//! - [`bmat`]: Dragon Age II's compiled material definitions (`.mat`, binary).
 //! - [`dds`]: DDS textures, with a CPU decoder for BC1/2/3.
 //! - [`morph`]: head morphs (`.mor`): a character's face, hair and their materials.
 //! - [`tint`]: item material tints (`.tnt`), the colours of tint-masked equipment.
@@ -38,6 +39,7 @@
 
 pub mod anim;
 pub mod area;
+pub mod bmat;
 pub mod cur;
 pub mod dds;
 pub mod emitter;
