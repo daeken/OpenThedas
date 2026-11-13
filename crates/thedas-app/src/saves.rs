@@ -46,19 +46,7 @@ pub const KIND_QUICK: i32 = 2;
 /// OneDrive), where the original keeps its own (`BioWare\Dragon Age`); elsewhere
 /// `.openthedas` in the home folder (`HOME`). Beside the game when neither is found.
 pub fn data_dir() -> PathBuf {
-    if cfg!(windows) {
-        if let Some(d) = dirs::document_dir() {
-            return d.join("OpenThedas");
-        }
-    }
-    let home = std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir);
-    match home {
-        Some(h) => h.join(".openthedas"),
-        None => PathBuf::from(".openthedas"),
-    }
+    thedas_vfs::mods::user_data_dir()
 }
 
 /// The player's settings file (see `thedas_ui::options::to_text`).
