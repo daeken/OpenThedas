@@ -4100,6 +4100,22 @@ fn test_floaty(sim: &mut thedas_sim::Sim, text: &str) {
             });
         return;
     }
+    // `floaty banner: KIND ICON TEXT` is a large notification of notifications.gfx's kind
+    // (7 new ability, 10 map area, 11 specialization), with an icon resource (`-` for none)
+    // and its text, about the controlled creature.
+    if let Some(rest) = text.strip_prefix("banner:") {
+        let mut words = rest.split_whitespace();
+        let kind = words.next().and_then(|k| k.parse().ok()).unwrap_or(7);
+        let icon = words.next().filter(|i| *i != "-").map(str::to_string);
+        sim.world.uber_alerts.push(thedas_sim::journal::Alert {
+            kind,
+            text: Some(words.collect::<Vec<_>>().join(" ")),
+            icon,
+            creature: sim.world.controlled(),
+            ..Default::default()
+        });
+        return;
+    }
     // `floaty status: TEXT` is a status message (a script's `DisplayStatusMessage`).
     if let Some(text) = text.strip_prefix("status:") {
         sim.world
