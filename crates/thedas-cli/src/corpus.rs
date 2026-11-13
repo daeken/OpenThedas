@@ -383,6 +383,10 @@ fn check_other(
         MaterialState::parse(data)
             .map(|_| ())
             .map_err(|e| e.to_string())
+    } else if ext == "vlm" {
+        thedas_formats::vlm::Vlm::parse(data)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     } else if ext == "mat" && thedas_formats::bmat::is_bmat(data) {
         thedas_formats::bmat::Bmat::parse(data)
             .map(|_| ())
@@ -603,7 +607,7 @@ fn check_data(
                 .map(|_| ())
                 .ok_or_else(|| format!("not a conversation (file type {})", doc.file_type)),
         ),
-        (_, "cut") => Some({
+        (_, "cut" | "cl") => Some({
             // Every cutscene's tracks read, and the camera placed at each cut.
             let tracks = thedas_sim::cuttracks::Tracks::from_gff4(&doc);
             for &(at, _) in &tracks.cuts {
@@ -620,6 +624,15 @@ fn check_data(
         (_, "plo") => Some(if &doc.file_type.0 == b"PLTS" {
             let _ = thedas_sim::plot::plots_from_gff4(&doc, "");
             Ok(())
+        } else if &doc.file_type.0 == b"PLOT" {
+            // Dragon Age II: one plot, and every composite flag's expression well formed.
+            match thedas_sim::plot::plots_from_gff4(&doc, "").first() {
+                None => Err("plot without a GUID".to_string()),
+                Some(p) => match p.composites.iter().find(|(_, c)| !c.well_formed()) {
+                    Some((id, _)) => Err(format!("composite flag {id}: malformed expression")),
+                    None => Ok(()),
+                },
+            }
         } else {
             Err(format!("not a plot file (file type {})", doc.file_type))
         }),

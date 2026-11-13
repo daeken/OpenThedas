@@ -36,6 +36,10 @@
 //! below that folder's loose files, and of two loose files with one name the later path wins.
 //! Those three rules are provisional: they are not traced in the original.
 //!
+//! A `.7z` archive is unpacked once into the same cache folder ([`unpack_7z`]) and then mounted
+//! as a folder: a 7z is one compressed stream, so serving single files out of it in place is
+//! not practical. `archive.7z!/folder` picks one folder of it, as for a zip.
+//!
 //! A `.dazip` is the original's add-in package: a zip holding `Manifest.xml` and `Contents/`,
 //! with add-ins under `Contents/addins/<uid>/` and sometimes files for
 //! `Contents/packages/core/override/`. The original installs it into the player's documents.
@@ -327,6 +331,22 @@ fn mount_entry(
                 None => {}
             }
         }
+        "7z" => {
+            let (root, skipped) = unpack_7z(path, cache)?;
+            problems.extend(skipped);
+            let dir = match entry.inner.as_deref() {
+                Some(inner) => match resolve_ci(&root, inner).filter(|d| d.is_dir()) {
+                    Some(dir) => dir,
+                    None => {
+                        problems.push(format!("no folder {inner:?} in the archive"));
+                        return Ok(());
+                    }
+                },
+                None => root,
+            };
+            let label = |p: &Path| label_under(cache, p);
+            mount_folder(overlay, &dir, &label, problems)?;
+        }
         "zip" | "override" => {
             let skipped = overlay.push_zip(path, entry.inner.as_deref(), label(entry, path))?;
             if !skipped.is_empty() {
@@ -338,7 +358,7 @@ fn mount_entry(
             }
         }
         _ => problems.push(
-            "not a folder, .zip, .dazip, .erf or .rim (unpack other archive types to a folder and list the folder)"
+            "not a folder, .zip, .7z, .dazip, .erf or .rim (unpack other archive types to a folder and list the folder)"
                 .into(),
         ),
     }
@@ -347,8 +367,11 @@ fn mount_entry(
 
 /// Where `.dazip` packages are unpacked: `mod-cache` in the player's data folder.
 pub fn cache_dir() -> PathBuf {
-    user_data_dir().join("mod-cache")
+    user_data_dir().join(CACHE_DIR_NAME)
 }
+
+/// The cache folder's name inside the data folder.
+const CACHE_DIR_NAME: &str = "mod-cache";
 
 /// The label of a layer served from the cache: `mod:<package folder>/<path inside it>`.
 pub(crate) fn cache_label(path: &Path) -> String {
@@ -361,6 +384,225 @@ fn label_under(cache: &Path, path: &Path) -> String {
         .to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "/");
     format!("{MOD_LABEL}{rel}")
+}
+
+/// Where an archive is unpacked inside `cache`: a folder named after the file, its size and
+/// its modification time, so a changed archive is unpacked afresh and an unchanged one is
+/// reused. Also returns the file's name made safe for a folder name.
+fn cache_slot(path: &Path, cache: &Path) -> Result<(PathBuf, String)> {
+    let meta = std::fs::metadata(path).map_err(|e| crate::Error::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    let stem: String = path
+        .file_stem()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(48)
+        .collect();
+    let root = cache.join(format!("{stem}-{:x}-{modified:x}", meta.len()));
+    Ok((root, stem))
+}
+
+/// A path inside an archive as a relative path that cannot leave the folder it is unpacked
+/// into: no root, no drive, no `..`. `None` for anything else, and for an empty name.
+fn contained(name: &str) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for part in name.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            p if p.contains(':') => return None,
+            p => out.push(p),
+        }
+    }
+    (!name.starts_with(['/', '\\']) && out.components().next().is_some()).then_some(out)
+}
+
+/// Unpacks a `.7z` archive into its own folder under `cache` ([`cache_slot`]) and returns the
+/// folder and what was skipped. A 7z archive is usually one compressed stream, so reading a
+/// single file out of it means decoding everything before it; unpacking once is the only
+/// practical way to serve it. The same rules as [`unpack_dazip`]: nothing is written outside
+/// the folder, an entry whose path would leave it is skipped and reported, the size limits
+/// hold, and nothing is run. Encrypted archives are refused.
+pub fn unpack_7z(path: &Path, cache: &Path) -> Result<(PathBuf, Vec<String>)> {
+    let bad = |reason: String| crate::Error::Malformed {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let (root, stem) = cache_slot(path, cache)?;
+    let mut problems = Vec::new();
+    if root.is_dir() {
+        return Ok((root, problems));
+    }
+    let mut archive = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
+        .map_err(|e| bad(format!("not a readable 7z: {e}")))?;
+    if archive.archive().files.len() > MAX_DAZIP_ENTRIES {
+        return Err(bad(format!("{} entries", archive.archive().files.len())));
+    }
+    let partial = cache.join(format!(".{stem}-{}.partial", std::process::id()));
+    let _ = std::fs::remove_dir_all(&partial);
+    std::fs::create_dir_all(&partial).map_err(|e| crate::Error::Io {
+        path: partial.clone(),
+        source: e,
+    })?;
+    let mut left = MAX_DAZIP_BYTES;
+    let mut failure: Option<String> = None;
+    let walked = archive.for_each_entries(|entry, reader| {
+        let name = entry.name().to_string();
+        let Some(rel) = contained(&name) else {
+            problems.push(format!("{name}: path leaves the archive, skipped"));
+            // The entry's bytes still have to be read past.
+            std::io::copy(reader, &mut std::io::sink())?;
+            return Ok(true);
+        };
+        let out = partial.join(rel);
+        if entry.is_directory() {
+            std::fs::create_dir_all(&out)?;
+            return Ok(true);
+        }
+        if entry.size() > left {
+            failure = Some("unpacks past the size limit".into());
+            return Ok(false);
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut to = std::fs::File::create(&out)?;
+        let copied = {
+            use std::io::Read;
+            std::io::copy(&mut reader.take(left + 1), &mut to)?
+        };
+        if copied > left {
+            failure = Some("unpacks past the size limit".into());
+            return Ok(false);
+        }
+        left -= copied;
+        Ok(true)
+    });
+    if let Some(reason) = failure.or_else(|| walked.err().map(|e| e.to_string())) {
+        let _ = std::fs::remove_dir_all(&partial);
+        return Err(bad(reason));
+    }
+    // Another session may have unpacked the same archive meanwhile: keep theirs.
+    if std::fs::rename(&partial, &root).is_err() {
+        let _ = std::fs::remove_dir_all(&partial);
+        if !root.is_dir() {
+            return Err(bad(
+                "could not move the unpacked archive into the cache".into()
+            ));
+        }
+    }
+    Ok((root, problems))
+}
+
+/// One unpacked archive in the mod cache.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheEntry {
+    /// Its folder, directly inside the cache.
+    pub dir: PathBuf,
+    /// Bytes and files it holds.
+    pub bytes: u64,
+    pub files: usize,
+    /// Whether an archive in the list unpacks to this folder, as the archive is now.
+    pub in_use: bool,
+}
+
+/// Whether a name is one this module gives a folder in the cache: `<name>-<size>-<time>` with
+/// the last two in hexadecimal ([`cache_slot`]), or a leftover `.<name>-<pid>.partial`.
+fn is_cache_name(name: &str) -> bool {
+    let hex = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit());
+    let safe = |s: &str| {
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    if let Some(inner) = name
+        .strip_prefix('.')
+        .and_then(|n| n.strip_suffix(".partial"))
+    {
+        return safe(inner);
+    }
+    let mut parts = name.rsplitn(3, '-');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(time), Some(size), Some(stem)) => hex(time) && hex(size) && safe(stem),
+        _ => false,
+    }
+}
+
+/// What the mod cache holds: every folder directly inside `cache` that carries one of our
+/// names, with its size and whether `list` still uses it. Anything else found there is left
+/// out, and never touched.
+pub fn cache_report(cache: &Path, list: &ModList) -> Vec<CacheEntry> {
+    let used: Vec<PathBuf> = list
+        .entries
+        .iter()
+        .filter(|e| {
+            let ext = e.path.extension().map(|x| x.to_ascii_lowercase());
+            e.path.is_file()
+                && matches!(
+                    ext.as_deref().and_then(|x| x.to_str()),
+                    Some("7z" | "dazip")
+                )
+        })
+        .filter_map(|e| cache_slot(&e.path, cache).ok().map(|(dir, _)| dir))
+        .collect();
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(cache) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let dir = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // A real folder of ours: not a link, not a file, not a stranger.
+        let real_dir = std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_dir());
+        if !real_dir || !is_cache_name(&name) {
+            continue;
+        }
+        let mut files = Vec::new();
+        let _ = collect_files(&dir, true, &mut files);
+        let bytes = files
+            .iter()
+            .filter_map(|f| std::fs::symlink_metadata(f).ok())
+            .map(|m| m.len())
+            .sum();
+        out.push(CacheEntry {
+            in_use: used.contains(&dir),
+            dir,
+            bytes,
+            files: files.len(),
+        });
+    }
+    out.sort_by(|a, b| a.dir.cmp(&b.dir));
+    out
+}
+
+/// Deletes the cache folders `list` no longer uses and returns them. Only ever removes what
+/// [`cache_report`] lists (our own folders, directly inside `cache`), and only when `cache` is
+/// a folder named `mod-cache`: it cannot be pointed at a mod folder or anything else.
+pub fn prune_cache(cache: &Path, list: &ModList) -> Vec<CacheEntry> {
+    if cache.file_name().and_then(|n| n.to_str()) != Some(CACHE_DIR_NAME) {
+        return Vec::new();
+    }
+    let mut removed = Vec::new();
+    for entry in cache_report(cache, list) {
+        if !entry.in_use && std::fs::remove_dir_all(&entry.dir).is_ok() {
+            removed.push(entry);
+        }
+    }
+    removed
 }
 
 /// An unpacked `.dazip`.
@@ -397,27 +639,7 @@ pub fn unpack_dazip(path: &Path, cache: &Path) -> Result<Dazip> {
         path: path.to_path_buf(),
         reason,
     };
-    let meta = std::fs::metadata(path).map_err(io(path))?;
-    let modified = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs());
-    let stem: String = path
-        .file_stem()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(48)
-        .collect();
-    let root = cache.join(format!("{stem}-{:x}-{modified:x}", meta.len()));
+    let (root, stem) = cache_slot(path, cache)?;
     let mut problems = Vec::new();
     if !root.is_dir() {
         let file = std::fs::File::open(path).map_err(io(path))?;
@@ -828,5 +1050,166 @@ mod tests {
         assert_eq!((report[0].layers, report[0].problems.len()), (0, 1));
         assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    fn sevenz_of(path: &Path, files: &[(&str, &[u8])]) {
+        let mut w = sevenz_rust2::ArchiveWriter::create(path).unwrap();
+        for (name, data) in files {
+            w.push_archive_entry(
+                sevenz_rust2::ArchiveEntry::new_file(name),
+                Some(std::io::Cursor::new(data.to_vec())),
+            )
+            .unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    #[test]
+    fn a_7z_is_unpacked_once_into_the_cache_and_mounted_as_a_folder() {
+        let base = scratch("7z");
+        let cache = base.join("cache");
+        sevenz_of(
+            &base.join("Faces (v2).7z"),
+            &[
+                ("Faces/Pearly White/face.dds", b"pearly"),
+                ("Faces/Pearly White/sub/teeth.dds", b"pearly teeth"),
+                ("Faces/Dingy Dog/face.dds", b"dingy"),
+                ("Faces/readme.txt", b"hi"),
+                ("../escape.txt", b"no"),
+                ("C:/escape2.txt", b"no"),
+            ],
+        );
+        // The whole archive, then one folder of it.
+        let list = ModList::parse("Faces (v2).7z\nFaces (v2).7z!/faces/pearly white\n", &base);
+        let mut overlay = Vfs::new();
+        let report = list.mount_with_cache(&mut overlay, &cache);
+        assert_eq!(report[0].layers, 1);
+        assert_eq!(report[0].problems.len(), 2, "{:?}", report[0].problems);
+        assert_eq!(report[1].layers, 1);
+        assert!(report[1].problems.len() <= 2);
+        assert!(!base.join("escape.txt").exists() && !cache.join("escape.txt").exists());
+        assert_eq!(overlay.read("face.dds").unwrap().0, b"pearly");
+        assert_eq!(overlay.read("teeth.dds").unwrap().0, b"pearly teeth");
+        assert_eq!(overlay.read("readme.txt").unwrap().0, b"hi");
+        let top = overlay.lookup("face.dds").unwrap();
+        assert!(
+            top.layer_label.starts_with("mod:Faces__v2_-"),
+            "{}",
+            top.layer_label
+        );
+        // (Lowercased: a case-insensitive volume keeps the case the list asked for.)
+        let label = top.layer_label.to_ascii_lowercase();
+        assert!(label.ends_with("/faces/pearly white"), "{label}");
+        // Unpacked once: one folder in the cache, reused by the second entry.
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
+
+        // A folder the archive does not have, and a file that is not a 7z.
+        write(&base, "broken.7z", b"7z junk");
+        let list = ModList::parse("Faces (v2).7z!/nope\nbroken.7z\n", &base);
+        let mut overlay = Vfs::new();
+        let report = list.mount_with_cache(&mut overlay, &cache);
+        assert_eq!((report[0].layers, report[1].layers), (0, 0));
+        assert!(report[0].problems.iter().any(|p| p.contains("nope")));
+        assert_eq!(report[1].problems.len(), 1);
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn paths_that_would_leave_the_folder_are_refused() {
+        assert_eq!(contained("a/b.txt"), Some(PathBuf::from("a/b.txt")));
+        assert_eq!(contained("a\\b.txt"), Some(PathBuf::from("a/b.txt")));
+        assert_eq!(contained("./a//b.txt"), Some(PathBuf::from("a/b.txt")));
+        for bad in [
+            "../a",
+            "a/../../b",
+            "/etc/x",
+            "\\x",
+            "C:/x",
+            "a/C:b",
+            "",
+            ".",
+        ] {
+            assert_eq!(contained(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_cache_is_reported_and_pruned_without_touching_anything_else() {
+        let base = scratch("cachereport");
+        let cache = base.join("mod-cache");
+        sevenz_of(&base.join("kept.7z"), &[("a/face.dds", b"kept face")]);
+        sevenz_of(
+            &base.join("dropped.7z"),
+            &[("b.dds", b"dropped"), ("c.dds", b"c")],
+        );
+        let both = ModList::parse("kept.7z\ndropped.7z\nloose\n", &base);
+        write(&base, "loose/face.dds", b"loose mod, not in the cache");
+        both.mount_with_cache(&mut Vfs::new(), &cache);
+        // Things that are not ours, inside the cache folder.
+        write(&cache, "notes.txt", b"mine");
+        write(&cache, "My Own Folder/keep.dds", b"mine");
+        write(&cache, ".dropped-123.partial/half.dds", b"stale");
+
+        let report = cache_report(&cache, &both);
+        let names = |r: &[CacheEntry]| -> Vec<(String, bool, usize)> {
+            r.iter()
+                .map(|e| {
+                    let n = e.dir.file_name().unwrap().to_string_lossy().into_owned();
+                    (n.split('-').next().unwrap().to_string(), e.in_use, e.files)
+                })
+                .collect()
+        };
+        assert_eq!(
+            names(&report),
+            [
+                (".dropped".to_string(), false, 1),
+                ("dropped".to_string(), true, 2),
+                ("kept".to_string(), true, 1)
+            ]
+        );
+        assert_eq!(report[2].bytes, 9);
+
+        // The list no longer names one archive: only its folder and the stale one go.
+        let only_kept = ModList::parse("kept.7z\nloose\n", &base);
+        let removed = prune_cache(&cache, &only_kept);
+        assert_eq!(removed.len(), 2);
+        assert!(removed.iter().all(|e| !e.in_use));
+        assert_eq!(
+            names(&cache_report(&cache, &only_kept)),
+            [("kept".to_string(), true, 1)]
+        );
+        assert!(cache.join("notes.txt").is_file());
+        assert!(cache.join("My Own Folder/keep.dds").is_file());
+        assert!(base.join("loose/face.dds").is_file() && base.join("dropped.7z").is_file());
+
+        // Pointed at a folder that is not the cache, it removes nothing at all.
+        std::fs::create_dir_all(base.join("mods/abc-1f-2e")).unwrap();
+        assert!(prune_cache(&base.join("mods"), &ModList::default()).is_empty());
+        assert!(base.join("mods/abc-1f-2e").is_dir());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn only_our_own_names_count_as_cache_folders() {
+        for ours in [
+            "Faces__v2_-13b-6af7542d",
+            "x-0-0",
+            ".Faces-4412.partial",
+            "a-b-c-1f-2e",
+        ] {
+            assert!(is_cache_name(ours), "{ours}");
+        }
+        for not in [
+            "My Own Folder",
+            "notes.txt",
+            "abc",
+            "abc-xyz-12",
+            "a b-1f-2e",
+            ".partial",
+            "x-1f-",
+        ] {
+            assert!(!is_cache_name(not), "{not}");
+        }
     }
 }

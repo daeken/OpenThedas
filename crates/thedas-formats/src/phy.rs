@@ -39,6 +39,8 @@ pub mod field {
     pub const MASK_TERRAIN_WALL: u32 = 6295;
     pub const MASK_WALKABLE: u32 = 6305;
     pub const FADEABLE: u32 = 6252;
+    /// A node's sound material (xoreos: MMHNodeSoundMaterial).
+    pub const SOUND_MATERIAL: u32 = 6330;
     pub const BOX_HALF: u32 = 6071;
     pub const RADIUS: u32 = 6072;
     pub const HEIGHT: u32 = 6073;
@@ -96,6 +98,11 @@ pub struct Shape {
 pub struct Phy {
     pub name: Option<String>,
     pub shapes: Vec<Shape>,
+    /// The model's sound material: its root node's (6330), a `sound_geometry_mat_types.gda`
+    /// row (0 Unknown, 1 Wood, 5 Stone, ...). DAOrigins.exe gives every part of a model its
+    /// root's (0x543e70 walks the parents up and copies the root's byte), and sound
+    /// occlusion reads it for the shapes a ray crosses (0x81c4f0 -> 0x5429c0).
+    pub sound_material: u8,
 }
 
 const MAX_DEPTH: usize = 64;
@@ -114,9 +121,22 @@ impl Phy {
         let root = gff.root;
         let mut shapes = Vec::new();
         walk(&d, root, None, &mut shapes, 0)?;
+        // The root node: the first node under the model header.
+        let mut sound_material = 0;
+        for c in d.structs(root, field::CHILDREN)? {
+            let label = d.label(c).0;
+            if &label == b"node" || &label == b"mshh" {
+                sound_material = d
+                    .opt_i64(c, field::SOUND_MATERIAL)?
+                    .unwrap_or(0)
+                    .clamp(0, 255) as u8;
+                break;
+            }
+        }
         Ok(Phy {
             name: d.opt_str(root, field::NAME)?,
             shapes,
+            sound_material,
         })
     }
 }
@@ -388,6 +408,7 @@ mod tests {
             b"node",
             vec![
                 (field::NAME, s("Root")),
+                (field::SOUND_MATERIAL, Value::U8(5)),
                 (field::CHILDREN, generic(&[cobj])),
             ],
         );
@@ -401,6 +422,7 @@ mod tests {
         let phy = Phy::from_gff4(&b.finish(root)).unwrap();
         assert_eq!(phy.name.as_deref(), Some("plc_test_0"));
         assert_eq!(phy.shapes.len(), 3);
+        assert_eq!(phy.sound_material, 5);
         assert_eq!(phy.shapes[0].parent.as_deref(), Some("Root"));
         assert_eq!(
             phy.shapes[0].geometry,

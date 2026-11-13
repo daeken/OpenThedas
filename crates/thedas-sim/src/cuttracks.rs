@@ -1170,10 +1170,10 @@ impl Tracks {
     }
 
     pub fn from_gff4(g: &Gff4) -> Self {
-        if g.file_type.0 != *b"CUT " {
-            return Self::default();
+        match crate::cutscene::cut_root(g) {
+            Some(root) => Self::from_cut(g, root),
+            None => Self::default(),
         }
-        Self::from_cut(g, g.root)
     }
 
     /// The tracks of a cutscene struct (`CUT `): a `.cut` file's root, or a conversation

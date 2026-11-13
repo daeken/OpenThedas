@@ -1844,6 +1844,7 @@ mod tests {
                 chunk,
                 raw_vertices: vec![],
                 positions: None,
+                vertex_light: None,
             }],
             materials: vec![SceneMaterial {
                 mao: "t.mao".into(),
