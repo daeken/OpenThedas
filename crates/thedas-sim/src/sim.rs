@@ -2673,17 +2673,42 @@ impl Sim {
             })
             .collect();
         let span = melee_slot_span(target_r, mine);
-        let free = |slot: i32| {
-            held.iter().all(|&(s, k)| {
-                let gap = (slot - s).rem_euclid(MELEE_RING_SLOTS);
-                gap.min(MELEE_RING_SLOTS - gap) > span + k
-            })
-        };
         let base = melee_slot_toward(b, a);
         let ring = reach;
         let at = |slot: i32| {
             let ang = (slot as f32 * MELEE_RING_STEP_DEG).to_radians();
             [b[0] + ring * ang.cos(), b[1] + ring * ang.sin(), b[2]]
+        };
+        // A place another creature's body covers is not free either, whatever that creature
+        // is doing (casting at the same target, attacking another, standing by): the
+        // attacker would be put inside it. Provisional: DAOrigins.exe reserves places on the
+        // ring (0x7cb0e0), which is not traced; bodies stand in for the reservations of
+        // those who are not counted above.
+        let mine_body = self.capsule_radius(id);
+        let bodies: Vec<([f32; 3], f32)> = self
+            .world
+            .objects
+            .values()
+            .filter(|o| {
+                o.id != id
+                    && o.id != target
+                    && o.kind == crate::world::ObjectKind::Creature
+                    && o.area == me.area
+                    && o.active
+                    && !o.dead
+                    && o.parked.is_none()
+                    && crate::engine::dist(o.position, b) <= ring + 3.0
+            })
+            .map(|o| (o.position, mine_body + self.capsule_radius(o.id)))
+            .collect();
+        let free = |slot: i32| {
+            let p = at(slot);
+            held.iter().all(|&(s, k)| {
+                let gap = (slot - s).rem_euclid(MELEE_RING_SLOTS);
+                gap.min(MELEE_RING_SLOTS - gap) > span + k
+            }) && bodies
+                .iter()
+                .all(|&(q, r)| ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt() >= r)
         };
         let slot = (0..=MELEE_RING_SLOTS / 2)
             .flat_map(|k| [k, -k])
@@ -5360,6 +5385,66 @@ mod tests {
                 .entries
                 .iter()
                 .any(|e| matches!(e, TraceEntry::EventQueued { target, .. } if *target == late))
+        );
+    }
+
+    /// A creature that is no melee attacker of the target (a caster, a bystander) still
+    /// keeps attackers off the place its body covers.
+    #[test]
+    fn a_melee_place_under_another_body_is_not_free() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let t = s.world.spawn(ObjectKind::Creature, "target");
+        let by = s.world.spawn(ObjectKind::Creature, "bystander");
+        let a = s.world.spawn(ObjectKind::Creature, "attacker");
+        let ring = 2.0 * crate::combat::DEFAULT_RADIUS + crate::combat::MELEE_GAP;
+        // The bystander stands on the place nearest the attacker.
+        for (id, x) in [(t, 0.0), (by, ring), (a, 8.0)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = [x, 0.0, 0.0];
+        }
+        let cmd = Command {
+            ty: 7,
+            name: "CommandAttack".into(),
+            target: Some(t),
+            location: None,
+            seconds: 0.0,
+            ints: Vec::new(),
+            strings: Vec::new(),
+            due: None,
+            from: None,
+            approach: None,
+            ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
+            arrived: false,
+            path: Vec::new(),
+        };
+        let clear = s.capsule_radius(a) + s.capsule_radius(by);
+        let apart = |s: &Sim, p: [f32; 3]| {
+            let q = s.world.get(by).unwrap().position;
+            ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt()
+        };
+        let Approach::Walk(_, p) = s.approach_point(a, &cmd) else {
+            panic!("the attacker is out of reach");
+        };
+        assert!(apart(&s, p) >= clear, "{p:?} is inside the bystander");
+        // It takes the nearest place beside the bystander, and attacks from there.
+        s.world.get_mut(a).unwrap().commands.push(cmd);
+        s.tick(1000);
+        s.tick(1000);
+        let o = s.world.get(a).unwrap();
+        assert!(apart(&s, o.position) >= clear - 0.01, "{:?}", o.position);
+        let d = (o.position[0].powi(2) + o.position[1].powi(2)).sqrt();
+        assert!(
+            d <= ring + crate::combat::MELEE_REACH_TOLERANCE,
+            "{:?}",
+            o.position
+        );
+        assert_eq!(
+            o.commands.first().map(|c| (c.name.as_str(), c.approach)),
+            Some(("CommandAttack", None))
         );
     }
 
