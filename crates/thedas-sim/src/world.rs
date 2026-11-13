@@ -482,6 +482,16 @@ pub struct FloatyMessage {
     pub duration: f32,
 }
 
+/// A message by a party member's portrait (`DisplayPortraitMessage(oPlayerCreature, sMessage,
+/// nColour)`), as DAOrigins.exe hands it to portraits.gfx (0x661f40). Output only.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PortraitMessage {
+    pub target: ObjectId,
+    pub text: String,
+    /// 0xRRGGBB.
+    pub colour: i32,
+}
+
 /// A sound a script asked for (`PlaySound`, `PlaySoundSet`, `PlaySoundObject`, `PlayMusic`)
 /// or a blow made, for the presentation to play. Output only. (`SetMusicIntensity` is kept
 /// in [`World::music_intensity`].)
@@ -698,6 +708,11 @@ pub struct World {
     /// the simulation reads it.
     #[serde(skip)]
     pub floaties: Vec<FloatyMessage>,
+    /// The messages scripts showed by party members' portraits (`DisplayPortraitMessage`)
+    /// that the interface has not taken yet. Output only: nothing in the simulation reads
+    /// it.
+    #[serde(skip)]
+    pub portrait_messages: Vec<PortraitMessage>,
     /// The sounds scripts asked for that the presentation has not taken yet. Output only:
     /// nothing in the simulation reads it.
     #[serde(skip)]
@@ -832,6 +847,7 @@ impl World {
             rng: Rng::new(seed),
             trace: Trace::default(),
             floaties: Vec::new(),
+            portrait_messages: Vec::new(),
             sounds: Vec::new(),
             tables,
         }

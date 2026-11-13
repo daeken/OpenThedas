@@ -677,6 +677,20 @@ pub fn call(
                     duration: float(a, 4),
                 });
             }
+            if name == "DisplayPortraitMessage" {
+                // Kept short when nothing takes them (a headless run).
+                if h.sim.world.portrait_messages.len() >= 64 {
+                    h.sim.world.portrait_messages.remove(0);
+                }
+                h.sim
+                    .world
+                    .portrait_messages
+                    .push(crate::world::PortraitMessage {
+                        target: obj(a, 0),
+                        text: text.clone(),
+                        colour: int(a, 2),
+                    });
+            }
             if name == "Warning" {
                 let key: String = text.chars().take(160).collect();
                 *h.sim.world.trace.warnings.entry(key).or_default() += 1;
@@ -6865,6 +6879,14 @@ mod coverage_tests {
         );
         assert!(s.world.trace.entries.iter().any(|e| matches!(e,
             TraceEntry::Log { channel: -1, text, .. } if text == "Approval +5")));
+        assert_eq!(
+            s.world.portrait_messages,
+            [crate::world::PortraitMessage {
+                target: 1,
+                text: "Approval +5".into(),
+                colour: 0xff,
+            }]
+        );
     }
 
     #[test]
