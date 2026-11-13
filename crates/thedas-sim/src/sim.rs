@@ -147,7 +147,9 @@ pub struct Sim {
     item_looks: std::sync::Mutex<std::collections::HashMap<String, ItemLook>>,
 }
 
-pub const MAX_DEPTH: usize = 24;
+/// How many scripts may run inside one another: DAOrigins.exe counts the runs in progress
+/// (vm +0x64) and refuses the one that would be the tenth (0xa2dc4d-0xa2dc56), so nine.
+pub const MAX_DEPTH: usize = 9;
 
 /// The length of a route from `from` through `points`.
 fn path_length(from: [f32; 3], points: &[[f32; 3]]) -> f32 {
