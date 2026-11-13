@@ -1509,20 +1509,19 @@ impl AreaRenderer {
             }
         }
         let depth = self.depth(&ctx.device, width, height);
-        if let (Some(dof), Some(pass), Some(projection)) = (
-            &self.cut_effects.depth_of_field,
-            &self.cut_pass,
-            self.frame_projection,
-        ) {
-            pass.depth_of_field(
-                &ctx.device,
-                &ctx.queue,
-                encoder,
-                target,
-                &depth,
-                projection,
-                dof,
-            );
+        if let (Some(pass), Some(projection)) = (&self.cut_pass, self.frame_projection) {
+            for (nth, dof) in self.cut_effects.depth_of_field.iter().enumerate() {
+                pass.depth_of_field(
+                    &ctx.device,
+                    &ctx.queue,
+                    encoder,
+                    target,
+                    &depth,
+                    projection,
+                    nth,
+                    dof,
+                );
+            }
         }
         if let Some(e) = self.effects.as_mut() {
             e.apply(
