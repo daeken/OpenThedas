@@ -2055,12 +2055,16 @@ impl Sim {
             return;
         };
         for (i, f) in followers.into_iter().enumerate() {
+            // A move of its own (a script's order, such as Alistair's walk to the tent after
+            // Ostagar's war council) is left to finish: carried along meanwhile, it was
+            // resumed when the walk stopped, and the follower walked back across the camp.
+            let following = self.following.contains(&f);
             let ok = self.world.get(f).is_some_and(|o| {
                 !o.dead
                     && o.area == area
                     && !o.combat.in_combat
                     && o.commands.first().is_none_or(|c| {
-                        matches!(c.name.as_str(), "CommandWait" | "CommandMoveToLocation")
+                        c.name == "CommandWait" || (c.name == "CommandMoveToLocation" && following)
                     })
                     && o.fields.get("FollowPartyLeader").copied().unwrap_or(1) != 0
             });
@@ -5031,6 +5035,50 @@ mod tests {
         assert!(
             (dog_pos[0] - 9.0).abs() < 1e-4,
             "dog follows a metre behind: {dog_pos:?}"
+        );
+    }
+
+    #[test]
+    fn a_follower_with_an_order_of_its_own_is_not_carried_along() {
+        // After Ostagar's war council Alistair has a script's order to walk to the tent;
+        // the tools' walk carried him along with the hero meanwhile, and he resumed the
+        // order (walking back across the camp) when the walk stopped.
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let al = s.world.spawn(ObjectKind::Creature, "alistair");
+        s.world.hero = Some(hero);
+        for id in [hero, al] {
+            s.world.get_mut(id).unwrap().area = Some(area);
+        }
+        s.world.get_mut(hero).unwrap().followers = vec![al];
+        let tent = [0.0, 20.0, 0.0];
+        s.world.get_mut(al).unwrap().commands.push(Command {
+            ty: 0,
+            name: "CommandMoveToLocation".into(),
+            target: None,
+            location: Some(crate::world::Location {
+                area,
+                position: tent,
+                facing: 0.0,
+            }),
+            seconds: 0.0,
+            ints: Vec::new(),
+            strings: Vec::new(),
+            due: None,
+            from: None,
+            approach: None,
+            ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
+            arrived: false,
+            path: Vec::new(),
+        });
+        assert!(s.walk(hero, [10.0, 0.0, 0.0], None));
+        let p = s.world.get(al).unwrap().position;
+        assert!(
+            p[1] > 5.0 && p[0].abs() < 1.0,
+            "on his way to the tent: {p:?}"
         );
     }
 
