@@ -677,6 +677,20 @@ pub fn call(
                     duration: float(a, 4),
                 });
             }
+            if name == "DisplayPortraitMessage" {
+                // Kept short when nothing takes them (a headless run).
+                if h.sim.world.portrait_messages.len() >= 64 {
+                    h.sim.world.portrait_messages.remove(0);
+                }
+                h.sim
+                    .world
+                    .portrait_messages
+                    .push(crate::world::PortraitMessage {
+                        target: obj(a, 0),
+                        text: text.clone(),
+                        colour: int(a, 2),
+                    });
+            }
             if name == "Warning" {
                 let key: String = text.chars().take(160).collect();
                 *h.sim.world.trace.warnings.entry(key).or_default() += 1;
@@ -3070,6 +3084,13 @@ pub fn call(
         "IsStringEmpty" => ok(b(string(a, 0).is_empty())),
         "GetLowResTimer" => ok(Value::Int(h.sim.world.time_ms as i32)),
         "DEBUG_PrintToScreen" | "DisplayStatusMessage" => {
+            if name == "DisplayStatusMessage" {
+                // For the interface's status lines (kept short when nothing takes them).
+                if h.sim.world.status_messages.len() >= 64 {
+                    h.sim.world.status_messages.remove(0);
+                }
+                h.sim.world.status_messages.push((string(a, 0), int(a, 1)));
+            }
             h.sim.world.trace.push(TraceEntry::Log {
                 t,
                 channel: -2,
@@ -6865,6 +6886,14 @@ mod coverage_tests {
         );
         assert!(s.world.trace.entries.iter().any(|e| matches!(e,
             TraceEntry::Log { channel: -1, text, .. } if text == "Approval +5")));
+        assert_eq!(
+            s.world.portrait_messages,
+            [crate::world::PortraitMessage {
+                target: 1,
+                text: "Approval +5".into(),
+                colour: 0xff,
+            }]
+        );
     }
 
     #[test]

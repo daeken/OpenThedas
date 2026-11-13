@@ -262,6 +262,13 @@ fn damage_number_shows(
     (in_party && party_numbers) || (hostile && hostile_numbers)
 }
 
+/// `SharedLibrary.Portrait.DisplayPortraitMessage`'s argument as DAOrigins.exe builds it
+/// (0x662046-0x662099): the creature's id, the colour and the message, a space between.
+/// (The movie splits it at spaces and joins the message's words again.)
+fn portrait_message_arg(target: thedas_script::vm::ObjectId, colour: i32, text: &str) -> String {
+    format!("{target} {colour} {text}")
+}
+
 /// A floaty's scale at `d` metres from the camera (DAOrigins.exe 0x63bfa0): full size up to
 /// 5 m, shrinking linearly to two thirds at 30 m and beyond. (Its alpha, 0x63c020, runs from
 /// 1 at 2 m to 1 at 7 m: always 1.)
@@ -2182,6 +2189,8 @@ impl UiLayer {
             Vec::new(),
             Vec::new(),
         );
+        let portrait_messages;
+        let status_messages;
         let size = self.stage.size();
         let scale = thedas_ui::stage_scale(size, (1024.0, 768.0));
         let (w, h) = (size.0 as f32, size.1 as f32);
@@ -2231,6 +2240,8 @@ impl UiLayer {
                     left_s: f64::from(f.duration.max(0.0)) + LINGER_S,
                 });
             }
+            portrait_messages = std::mem::take(&mut sim.world.portrait_messages);
+            status_messages = std::mem::take(&mut sim.world.status_messages);
             let mut per_target: std::collections::BTreeMap<u32, u32> = Default::default();
             self.floaties.retain_mut(|f| {
                 f.left_s -= dt_ms / 1000.0;
@@ -2369,6 +2380,28 @@ impl UiLayer {
                 stat_max.push(num(f64::from(max)));
                 stat_ranks.push(num(f64::from(o.rank)));
             }
+        }
+        // Messages by the party's portraits, as the exe hands them to portraits.gfx
+        // (0x661f40): `SharedLibrary.Portrait.DisplayPortraitMessage` with the member's id,
+        // the colour and the text in one string, spaces between.
+        for m in portrait_messages {
+            self.stage.call_in(
+                "portraits.gfx",
+                "_global.SharedLibrary.Portrait.DisplayPortraitMessage",
+                &[UiValue::String(portrait_message_arg(
+                    m.target, m.colour, &m.text,
+                ))],
+            );
+        }
+        // Status messages, as the exe hands them to the floaty layer (0x63c260):
+        // `FloatyLayer.DisplayStatusMessage` with the text and its colour. Provisional: that
+        // the script function reaches 0x63c260 (through the interface's virtual 0x5239d0) is
+        // inferred, not followed call by call.
+        for (text, colour) in status_messages {
+            self.stage.movies[movie].call(
+                &format!("{LAYER}.DisplayStatusMessage"),
+                &[UiValue::String(text), num(f64::from(colour))],
+            );
         }
         let m = &mut self.stage.movies[movie];
         let list = |v: Vec<UiValue>| UiValue::List(v);
@@ -2854,6 +2887,14 @@ fn gui_id(s: Screen, container: bool) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_portrait_message_is_the_id_the_colour_and_the_text() {
+        assert_eq!(
+            portrait_message_arg(124, 0xff0000, "Approval +5"),
+            "124 16711680 Approval +5"
+        );
+    }
 
     #[test]
     fn damage_numbers_follow_the_options_and_other_floaties_always_show() {

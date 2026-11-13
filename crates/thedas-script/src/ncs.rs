@@ -90,6 +90,10 @@ pub enum Op {
     Unknown2E,
     WriteArray,
     ReadArray,
+    /// `0x37` (Dragon Age II): pushes a reference to a stack variable.
+    GetRef,
+    /// `0x39` (Dragon Age II): pops an index and pushes a reference to that array element.
+    GetRefArray,
 }
 
 impl Op {
@@ -144,6 +148,8 @@ impl Op {
             0x2E => Unknown2E,
             0x30 => WriteArray,
             0x32 => ReadArray,
+            0x37 => GetRef,
+            0x39 => GetRefArray,
             _ => return None,
         })
     }
@@ -199,6 +205,8 @@ impl Op {
             Unknown2E => "OP_2E",
             WriteArray => "WRITEARRAY",
             ReadArray => "READARRAY",
+            GetRef => "GETREF",
+            GetRefArray => "GETREFARRAY",
         }
     }
 }
@@ -365,7 +373,8 @@ impl Ncs {
             let op = Op::from_byte(opb).ok_or(NcsError::UnknownOpcode { op: opb, ty, at })?;
             use Op::*;
             let arg = match op {
-                CpDownSp | CpTopSp | CpDownBp | CpTopBp | WriteArray | ReadArray => Arg::Copy {
+                CpDownSp | CpTopSp | CpDownBp | CpTopBp | WriteArray | ReadArray | GetRef
+                | GetRefArray => Arg::Copy {
                     offset: r.i32()?,
                     size: r.u16()?,
                 },
