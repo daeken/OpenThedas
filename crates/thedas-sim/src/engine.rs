@@ -1192,6 +1192,12 @@ pub fn call(
             ty: ty.event,
             handle: h.event,
         }),
+        // Dragon Age II: the type of the event the script is handling, without the event
+        // (provisional: read from its script.ldf signature, `int GetCurrentEventType()`).
+        "GetCurrentEventType" => ok(Value::Int(match h.sim.world.handle(h.event) {
+            Some(EngineData::Event(e)) => e.ty,
+            _ => 0,
+        })),
         "GetEventType" | "GetEventCreator" | "GetEventTarget" | "GetEventInteger"
         | "GetEventFloat" | "GetEventString" | "GetEventObject" | "GetEventResource" => {
             let ev = match h.sim.world.handle(handle(a, 0)) {
