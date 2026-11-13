@@ -175,6 +175,27 @@ pub struct Plots {
     loaded: bool,
     /// Defined flags being answered by their plot scripts, innermost last.
     asking: Vec<(String, i32)>,
+    /// While a report is being made (see [`Sim::conversation_conditions`]), every flag read,
+    /// outermost first.
+    pub(crate) reads: Option<Vec<FlagRead>>,
+    /// While a report is being made, every flag set: (plot GUID, flag, value).
+    pub(crate) sets: Option<Vec<(String, i32, bool)>>,
+}
+
+/// A plot flag read while a condition was evaluated.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct FlagRead {
+    /// The plot's GUID.
+    pub plot: String,
+    /// Its resource name, when the plot file was found.
+    pub resref: Option<String>,
+    pub flag: i32,
+    /// The flag's name in the plot file.
+    pub name: Option<String>,
+    pub value: bool,
+    /// A defined flag ([`DEFINED_FLAGS`] and up): its value is the plot script's answer (or a
+    /// Dragon Age II composite's), not a stored one.
+    pub defined: bool,
 }
 
 fn s(g: &Gff4, id: StructId, l: u32) -> Option<String> {
@@ -440,6 +461,34 @@ impl Sim {
         call_script: bool,
         owner: ObjectId,
     ) -> bool {
+        // Only the condition's own reads are reported, not those of the plot scripts that
+        // answer them.
+        let outermost = self.plots.asking.is_empty();
+        let value = self.read_plot_flag(plot, flag, call_script, owner);
+        if outermost && self.plots.reads.is_some() {
+            let info = self.plot_info(plot);
+            let read = FlagRead {
+                plot: self.plot_key(plot),
+                resref: info.as_ref().map(|p| p.resref.clone()),
+                flag,
+                name: info.as_ref().and_then(|p| p.flags.get(&flag).cloned()),
+                value,
+                defined: flag >= DEFINED_FLAGS,
+            };
+            if let Some(r) = self.plots.reads.as_mut() {
+                r.push(read);
+            }
+        }
+        value
+    }
+
+    fn read_plot_flag(
+        &mut self,
+        plot: &str,
+        flag: i32,
+        call_script: bool,
+        owner: ObjectId,
+    ) -> bool {
         let key = self.plot_key(plot);
         let defined = flag >= DEFINED_FLAGS;
         // A Dragon Age II composite flag: the plot file states its value as an expression
@@ -492,6 +541,12 @@ impl Sim {
         }
     }
 
+    /// The value an ordinary flag holds now, as an undo puts it back.
+    pub(crate) fn stored_flag_for_undo(&mut self, plot: &str, flag: i32) -> bool {
+        let key = self.plot_key(plot);
+        self.stored_plot_flag(plot, key, flag)
+    }
+
     /// Whether a script has set an ordinary flag: the stored value only, not the value the
     /// plot file starts it with (the journal counts what happened; a Chanter's Board posting
     /// starts set). Defined flags are never stored and read false.
@@ -532,6 +587,9 @@ impl Sim {
                     }
                 }
             }
+        }
+        if let Some(sets) = self.plots.sets.as_mut() {
+            sets.push((key.clone(), flag, value));
         }
         let t = self.world.time_ms;
         self.world.trace.push(TraceEntry::PlotFlag {

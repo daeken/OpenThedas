@@ -743,6 +743,11 @@ pub struct World {
     /// [`AmbientLine`]). Output only: nothing in the simulation reads it.
     #[serde(skip)]
     pub ambient_lines: Vec<AmbientLine>,
+    /// The commands given to the simulation from outside it (mod mode, the MCP server,
+    /// test harnesses) and what each did, oldest first (see [`crate::commands`]). Saved:
+    /// mod mode's entries are its edit history.
+    #[serde(default)]
+    pub command_journal: Vec<crate::commands::JournalEntry>,
     /// The status messages scripts showed (`DisplayStatusMessage(sMessage, nColour)`: the
     /// text and its 0xRRGGBB colour) that the interface has not taken yet. Output only.
     #[serde(skip)]
@@ -884,6 +889,7 @@ impl World {
             floaties: Vec::new(),
             portrait_messages: Vec::new(),
             ambient_lines: Vec::new(),
+            command_journal: Vec::new(),
             status_messages: Vec::new(),
             sounds: Vec::new(),
             tables,

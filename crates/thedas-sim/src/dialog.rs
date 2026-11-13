@@ -233,6 +233,27 @@ pub const AMBIENT_LINE_MS: u32 = 7000;
 /// (0x6ff713 to 0x6ff748).
 pub const AMBIENT_VOICED_MIN_MS: u32 = 2000;
 
+/// One line or reply of a conversation as its conditions stand now (see
+/// [`Sim::conversation_conditions`]).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct NodeCondition {
+    /// Its index in the conversation's line list.
+    pub node: usize,
+    /// A start of the conversation (one of its first lines).
+    pub start: bool,
+    /// A reply of the player's rather than a line.
+    pub reply: bool,
+    pub text: String,
+    /// Whether it could be used now: its condition passes and, if it shows once, it has
+    /// not been shown.
+    pub usable: bool,
+    /// The plot flags its condition read, in order.
+    pub reads: Vec<crate::plot::FlagRead>,
+    /// Plot flags its condition's scripts set while it was evaluated (a condition is not
+    /// meant to change anything, but scripts can): (plot, flag, value).
+    pub sets: Vec<(String, i32, bool)>,
+}
+
 /// An open conversation as presentation sees it: its dialog (resource name without
 /// `.dlg`), the node being shown (an index into the dialog's line list), its owner and the
 /// player character in it.
@@ -499,6 +520,69 @@ impl Sim {
             .iter()
             .filter(|r| r.dialog.eq_ignore_ascii_case(dlg))
             .count() as u32
+    }
+
+    /// Every line and reply of conversation `dialog` (empty: `owner`'s own) with the plot
+    /// flags its condition reads and whether it could be used now, as the conversation would
+    /// be opened by the hero with `owner`. The conditions run as they would when the
+    /// conversation is walked, so a condition script that sets flags sets them (reported
+    /// in `sets`). `None` when there is no such conversation.
+    pub fn conversation_conditions(
+        &mut self,
+        owner: ObjectId,
+        dialog: &str,
+    ) -> Option<Vec<NodeCondition>> {
+        let name = if dialog.is_empty() {
+            self.world.get(owner).and_then(|o| o.dialog.clone())?
+        } else {
+            dialog.trim_end_matches(".dlg").to_string()
+        };
+        let d = self
+            .vfs
+            .read(&format!("{}.dlg", name.to_ascii_lowercase()))
+            .ok()
+            .and_then(|(data, _)| Dlg::parse(&data, &name))?;
+        Some(self.dlg_conditions(owner, &d))
+    }
+
+    /// [`Sim::conversation_conditions`] for a conversation already read.
+    pub(crate) fn dlg_conditions(&mut self, owner: ObjectId, d: &Dlg) -> Vec<NodeCondition> {
+        let player = self.world.hero.unwrap_or(owner);
+        let c = Conversation {
+            dlg: d.clone(),
+            owner,
+            player,
+            line: None,
+            replies: Vec::new(),
+            ended: false,
+            shown: Vec::new(),
+            chain: Vec::new(),
+            cut_from: None,
+            cut_lines_left: 0,
+            staged: Vec::new(),
+            staged_at: None,
+            ambient_run: false,
+        };
+        let ambient_before = self.dialog_ambient;
+        let mut out = Vec::new();
+        for (i, n) in d.nodes.iter().enumerate() {
+            self.plots.reads = Some(Vec::new());
+            self.plots.sets = Some(Vec::new());
+            let usable = self.usable(&c, i);
+            let reads = self.plots.reads.take().unwrap_or_default();
+            let sets = self.plots.sets.take().unwrap_or_default();
+            out.push(NodeCondition {
+                node: i,
+                start: d.starts.contains(&i),
+                reply: n.reply,
+                text: self.node_text(n),
+                usable,
+                reads,
+                sets,
+            });
+        }
+        self.dialog_ambient = ambient_before;
+        out
     }
 
     /// Starts a conversation between `initiator` and `target` (the owner); an empty `dlg`
@@ -1302,5 +1386,28 @@ mod tests {
         sim.tick(8000);
         assert_eq!(said(&sim).len(), 5);
         assert!(sim.ambient.is_empty());
+    }
+    #[test]
+    fn a_conversations_conditions_report_the_flags_they_read() {
+        let (mut sim, _hero, npc) = passers_by();
+        let mut d = remarks("guard", &["one", "two"], false);
+        d.nodes[0].condition = PlotRef {
+            plot: Some("some_plot".into()),
+            flag: 3,
+            value: true,
+            script: None,
+        };
+        let report = sim.dlg_conditions(npc, &d);
+        assert_eq!(report.len(), 3);
+        let first = &report[0];
+        assert!(first.start && !first.reply && !first.usable);
+        assert_eq!(first.text, "one");
+        assert_eq!(first.reads.len(), 1);
+        assert_eq!((first.reads[0].flag, first.reads[0].value), (3, false));
+        // The unconditioned reply and line read nothing and are usable.
+        assert!(report[1].reply && report[1].usable && report[1].reads.is_empty());
+        assert!(report[2].usable && report[2].sets.is_empty());
+        // Nothing is left recording.
+        assert!(sim.plots.reads.is_none() && sim.plots.sets.is_none());
     }
 }
