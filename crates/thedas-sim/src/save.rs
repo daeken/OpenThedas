@@ -216,6 +216,7 @@ impl Sim {
 
     /// Replaces the world with a saved one. The save must be for this simulation's module.
     pub fn load_game(&mut self, save: SaveGame) -> Result<(), SimError> {
+        self.loads += 1;
         if save.format != SAVE_FORMAT {
             return Err(SimError::Parse(
                 "save".into(),
