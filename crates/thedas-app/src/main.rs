@@ -768,10 +768,24 @@ enum Marking {
 /// Smallest box (pixels a side) taken as a marked spot; smaller is a stray click.
 const MIN_MARK: f32 = 8.0;
 
-fn ask_mark_choice(ui: &mut ui::UiLayer) {
+/// What the question whether to mark spots says to a player on the pad.
+const MARK_PROMPT_PAD: &str = "Want to point at something? Choose Mark spots, then move the \
+     pointer with the left stick, press A at one corner of the thing that is wrong and A again \
+     at the other, and say what is wrong there. Press B or Start when done.";
+
+/// The question whether to mark spots, worded for the pad when it was used last.
+fn mark_prompt(pad: bool) -> &'static str {
+    if pad {
+        MARK_PROMPT_PAD
+    } else {
+        report::MARK_PROMPT
+    }
+}
+
+fn ask_mark_choice(ui: &mut ui::UiLayer, pad: bool) {
     ui.ask_choice(
         report::MARK_ID,
-        report::MARK_PROMPT,
+        mark_prompt(pad),
         "Mark spots",
         "Just a note",
     );
@@ -2188,26 +2202,21 @@ impl App {
         // before a game: the report is kept without one).
         let in_game = self.live.as_ref().is_some_and(|l| !l.front_end)
             && self.screens.as_ref().is_some_and(|s| !s.front_end);
-        let mut note_asked = None;
         let mut marking = Marking::Off;
         match (report::preset_note(note), self.gfx.as_mut()) {
             (Some(text), _) => self.recorder.note(Some(text)),
-            // With the mouse, the player may first mark spots on the screen; the pad
-            // cannot draw boxes yet, so it goes straight to the note.
-            (None, Some(g)) if in_game && !self.pad_last => {
-                ask_mark_choice(&mut g.ui);
-                marking = Marking::Offered(0, 0);
-            }
+            // The player may first mark spots on the screen: boxes dragged with the mouse,
+            // or drawn with the pad's pointer (see `PadPlay::mark`).
             (None, Some(g)) if in_game => {
-                ask_report_note(&mut g.ui, self.pad.used);
-                note_asked = Some((0, 0));
+                ask_mark_choice(&mut g.ui, self.pad_last);
+                marking = Marking::Offered(0, 0);
             }
             (None, _) => self.recorder.note(Some(String::new())),
         }
         self.report_wait = Some(ReportWait {
             shot,
             reply,
-            note_asked,
+            note_asked: None,
             send: true,
             pause,
             paused_it: false,
@@ -2287,6 +2296,7 @@ impl App {
     /// One frame of marking: the choice and a spot's note asked again when they do not
     /// show (as the report's note is), the choice given up after a few tries.
     fn marking_frame(&mut self) {
+        let pad = self.pad_last;
         let (Some(w), Some(g)) = (self.report_wait.as_mut(), self.gfx.as_mut()) else {
             return;
         };
@@ -2295,7 +2305,7 @@ impl App {
             Marking::Off => {}
             Marking::Offered(frames, tries) => {
                 *frames += 1;
-                if box_shows(&g.ui, report::MARK_PROMPT) {
+                if box_shows(&g.ui, report::MARK_PROMPT) || box_shows(&g.ui, MARK_PROMPT_PAD) {
                     *frames = 0;
                 } else if *frames > NOTE_REASK_FRAMES {
                     *frames = 0;
@@ -2303,7 +2313,7 @@ impl App {
                     if *tries > NOTE_TRIES {
                         self.end_marking();
                     } else if !up {
-                        ask_mark_choice(&mut g.ui);
+                        ask_mark_choice(&mut g.ui, pad);
                     }
                 }
             }
@@ -3891,6 +3901,23 @@ impl App {
 }
 
 impl padplay::Host for App {
+    fn marking(&mut self) -> Option<bool> {
+        match self.report_wait.as_ref().map(|w| &w.marking) {
+            Some(Marking::On { drag, asking: None }) => Some(drag.is_some()),
+            _ => None,
+        }
+    }
+
+    fn end_marking(&mut self) {
+        App::end_marking(self);
+    }
+
+    fn drop_mark(&mut self) {
+        if let Some(Marking::On { drag, .. }) = self.report_wait.as_mut().map(|w| &mut w.marking) {
+            *drag = None;
+        }
+    }
+
     fn live(&mut self) -> Option<&mut live::Live> {
         self.live.as_mut()
     }
