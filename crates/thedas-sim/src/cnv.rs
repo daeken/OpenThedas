@@ -4,7 +4,7 @@
 //! A DA2 conversation is a list of lines (field 30002) and the links between them: the root's
 //! starting links (30001) and each line's onward links (30204). A link names its target line
 //! (30100); a link the player picks on the dialogue wheel also carries the wheel's paraphrase
-//! (30101, a talk-table id) and an icon (30300). A line holds its speaker (30200), its text
+//! (30101, a talk-table id) and an icon (30300). A line holds a flag word (30200), its text
 //! (30201), a condition (30202) and an action (30203); a condition or action is a plot GUID
 //! (30400), a flag (30401) and a value (30402, 255 set or 0 clear).
 //!
@@ -16,22 +16,21 @@
 //!
 //! Provisional throughout: the fields are read from the shipped files (see
 //! `OpenThedas-testdata/notes/da2-conversations.md`), not traced in DragonAge2.exe. Field
-//! 30200 is read as the speaker: 258 is the player and 257 the conversation's owner in every
-//! sample, and 10 marks the player's unspoken "continue" between two lines of the other side
-//! (empty text, reached by a link whose paraphrase is empty and whose icon is 0); other
-//! values (1, 9, ...) are taken to be the owner until the numbers are worked out. Not carried
-//! yet: the wheel icon, the conversation-level condition (30003), fields 30301 and 30303,
-//! and whether a line is ambient (no such field is known).
+//! 30200 is a set of flags, not a speaker: bit 0 marks a line of the other side and bit 1 a
+//! line of the player (over 30,000 lines of 250 conversations, every line a wheel choice
+//! leads to has bit 1 and every other line bit 0, without exception). Its other bits (2, 3,
+//! 5, 6, 8) are not worked out; which creature says a line of the other side is not in the
+//! conversation file, so it is taken to be the owner. Not carried yet: the wheel icon, the
+//! conversation-level condition (30003), fields 30301 and 30303, and whether a line is
+//! ambient (no such field is known).
 
 use thedas_formats::gff4::{FourCC, List};
 use thedas_formats::{Gff4, StructId, Value};
 
 use crate::dialog::{Dlg, Node, PlotRef};
 
-/// The speaker number that is the player.
-const SPEAKER_PLAYER: i64 = 258;
-/// The speaker number that is the conversation's owner.
-const SPEAKER_OWNER: i64 = 257;
+/// Field 30200's bit for a line the player says.
+const FLAG_PLAYER_LINE: i64 = 0x2;
 
 /// Whether a parsed GFF4 is a Dragon Age II conversation.
 pub fn is_cnv(g: &Gff4) -> bool {
@@ -97,9 +96,8 @@ pub fn dlg_from_cnv(g: &Gff4, name: &str) -> Option<Dlg> {
             strref: strref(g, l, 30201),
             text: None,
             speaker: match int(g, l, 30200) {
-                Some(SPEAKER_PLAYER) => "PLAYER".into(),
-                Some(SPEAKER_OWNER) | None => "OWNER".into(),
-                Some(_) => String::new(),
+                Some(flags) if flags & FLAG_PLAYER_LINE != 0 => "PLAYER".into(),
+                _ => "OWNER".into(),
             },
             listener: String::new(),
             condition: plotref(g, l, 30202),
@@ -224,10 +222,10 @@ mod tests {
                 // 1: start link -> line 0
                 link(0, u32::MAX, 255),
                 // 2..5: lines 0..3
-                line(257, 100, 10, 10, &[6, 7]),
-                line(258, 101, 10, 11, &[8]),
-                line(258, 102, 12, 10, &[]),
-                line(257, 103, 10, 10, &[]),
+                line(0x101, 100, 10, 10, &[6, 7]),
+                line(0x4e, 101, 10, 11, &[8]),
+                line(0x0a, 102, 12, 10, &[]),
+                line(0x45, 103, 10, 10, &[]),
                 // 6, 7: wheel links from line 0
                 link(1, 200, 2),
                 link(2, 201, 7),
