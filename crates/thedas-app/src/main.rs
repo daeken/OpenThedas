@@ -1205,7 +1205,8 @@ impl App {
             .map(|(p, ms)| (p.to_path_buf(), ms));
         let live = self.live.as_mut().filter(|_| self.intro.is_none());
         let ui = self.gfx.as_mut().map(|g| &mut g.ui);
-        let state = audio_state(a, live, ui, &self.camera, movie);
+        let mut state = audio_state(a, live, ui, &self.camera, movie);
+        state.gui = self.screens.as_ref().is_some_and(|s| s.world_stopped());
         a.frame(state);
         let voice = a.voice_ms();
         if let Some(g) = self.gfx.as_mut() {
@@ -3732,8 +3733,10 @@ fn main() -> Result<()> {
                                 ui_time += t.elapsed();
                             }
                             if let Some(a) = recording.as_mut() {
+                                let gui = played.as_ref().is_some_and(|(_, s)| s.world_stopped());
                                 let ui = played.as_mut().map(|(layer, _)| layer);
-                                let state = audio_state(a, Some(&mut *l), ui, &camera, None);
+                                let mut state = audio_state(a, Some(&mut *l), ui, &camera, None);
+                                state.gui = gui;
                                 a.record(state, dt as f32 / 1000.0);
                                 let voice = a.voice_ms();
                                 if let Some((layer, _)) = played.as_mut() {
