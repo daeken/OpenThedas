@@ -125,6 +125,9 @@ struct Instance {
     /// Playback-rate factor from the event's pitch and its random offset.
     rate: f32,
     age: f32,
+    /// Its category (or one above it) is paused: its voices hold where they are and it
+    /// neither ages nor starts sounds (see [`AudioEngine::set_category_paused`]).
+    paused: bool,
 }
 
 impl Instance {
@@ -201,6 +204,8 @@ pub struct AudioEngine {
     ducking: HashMap<String, (f32, f32, f32)>,
     /// Each ducked category's target last update (for the debug log of changes).
     duck_targets: HashMap<String, f32>,
+    /// Paused categories (lowercase); those under them are paused too.
+    paused: std::collections::HashSet<String>,
     pub volumes: Volumes,
     listener: Listener,
     rng: u64,
@@ -297,6 +302,7 @@ impl AudioEngine {
             parents,
             ducking: HashMap::new(),
             duck_targets: HashMap::new(),
+            paused: Default::default(),
             volumes: Volumes::default(),
             listener: Listener {
                 position: [0.0; 3],
@@ -441,6 +447,7 @@ impl AudioEngine {
             reverb_send,
             rate,
             age: 0.0,
+            paused: false,
         };
         log::debug!(
             "audio: play {path} (pitch x{rate:.3} = {:+.2} semitones, random gain x{random_gain:.3})",
@@ -515,6 +522,42 @@ impl AudioEngine {
             -1e9
         };
         self.update(0.0);
+    }
+
+    /// Pause or resume a category (`audio_categories.fev`'s, by name, any case) and the
+    /// categories under it, as FMOD's `EventCategory::setPaused`: its events' voices hold
+    /// where they are, events started in it wait, and nothing of it ages until resumed.
+    pub fn set_category_paused(&mut self, category: &str, paused: bool) {
+        let c = category.to_ascii_lowercase();
+        let changed = if paused {
+            self.paused.insert(c)
+        } else {
+            self.paused.remove(&c)
+        };
+        if changed {
+            log::debug!(
+                "audio: category {category} {}",
+                if paused { "paused" } else { "resumed" }
+            );
+        }
+    }
+
+    /// Whether `category` or one above it is paused.
+    fn category_paused(&self, category: &str) -> bool {
+        if self.paused.is_empty() {
+            return false;
+        }
+        let mut c = Some(category);
+        for _ in 0..32 {
+            let Some(name) = c else {
+                return false;
+            };
+            if self.paused.contains(name) {
+                return true;
+            }
+            c = self.parents.get(name).map(String::as_str);
+        }
+        false
     }
 
     pub fn stop_all(&mut self) {
@@ -730,6 +773,11 @@ impl AudioEngine {
                 )
             });
             if let Ok(id) = id {
+                if inst.paused
+                    && let Ok(mut m) = self.mixer.lock()
+                {
+                    m.set_paused(id, true);
+                }
                 log::debug!(
                     "audio: voice of {} (sound pitch x{:.3}, sound gain x{:.3})",
                     inst.path,
@@ -750,7 +798,19 @@ impl AudioEngine {
         let mut rng = self.rng;
         let rate = self.mixer.lock().map(|m| m.rate()).unwrap_or(48000) as f32;
         for ii in 0..self.instances.len() {
+            let paused = self.category_paused(&self.instances[ii].category);
             let inst = &mut self.instances[ii];
+            if paused || inst.paused {
+                if let Ok(mut m) = self.mixer.lock() {
+                    for v in inst.slots.iter().flat_map(|s| &s.voices) {
+                        m.set_paused(*v, paused);
+                    }
+                }
+                inst.paused = paused;
+                if paused {
+                    continue;
+                }
+            }
             inst.age += dt;
             inst.fade = (inst.fade + inst.fade_rate * dt).clamp(0.0, 1.0);
             if !inst.stopping && inst.fade >= 1.0 {
@@ -1317,6 +1377,28 @@ mod tests {
         e.stop(d, true);
         let back = run(&mut e, &m, 0.5);
         assert!((back - full).abs() < 1e-3, "{back}");
+    }
+
+    #[test]
+    fn a_paused_category_holds_its_events() {
+        let (mut e, m) = engine("pause");
+        let h = e.play("test/grp/loop", PlayOptions::default()).unwrap();
+        let full = run(&mut e, &m, 0.5);
+        assert!(full > 0.0);
+        e.set_category_paused("SFX", true);
+        let at = e.position(h).map(|p| p.0);
+        assert_eq!(run(&mut e, &m, 0.5), 0.0);
+        assert_eq!(e.position(h).map(|p| p.0), at);
+        // An event started while its category is paused waits too.
+        let (mut e2, m2) = engine("pause2");
+        e2.set_category_paused("sfx", true);
+        e2.play("test/grp/loop", PlayOptions::default()).unwrap();
+        assert_eq!(run(&mut e2, &m2, 0.5), 0.0);
+        e2.set_category_paused("sfx", false);
+        assert!(run(&mut e2, &m2, 0.5) > 0.0);
+        e.set_category_paused("sfx", false);
+        let back = run(&mut e, &m, 0.1);
+        assert!((back - full).abs() < 1e-3, "{full} -> {back}");
     }
 
     #[test]
