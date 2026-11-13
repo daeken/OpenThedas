@@ -97,8 +97,8 @@ these, so they are the places where one person or stream can take a large, separ
 - **Shader families outside the default set** fall back to a hand-written stand-in or are
   skipped (`RND-112`, `RND-113`).
 - **SpeedTree.** Trees draw as real geometry on the game's own shaders, with distance levels,
-  billboards far away and wind sway. The billboards are a stand-in that does not fade in, and
-  the wind's per-tree details are provisional (`RND-075` to `RND-078`).
+  billboards that fade in far away and wind sway. Some LOD and billboard details and the
+  wind's per-tree details are provisional (`RND-075` to `RND-078`).
 - **Effects on creatures and items.** Spell effects, crust effects and weapon glows are not
   drawn; only effects placed at a location are (`RND-094`).
 - **Animation blending.** No blend weights, crossfades, inverse kinematics or root motion

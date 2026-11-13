@@ -92,6 +92,47 @@ pub(crate) struct D3dCache {
     vertices: HashMap<(String, String), wgpu::Buffer>,
 }
 
+/// The level's far billboard batch's vertex buffer, whose TEXCOORD0 each frame rewrites with
+/// the placements' fades ([`crate::scene::BillboardInstance::texcoord0`]).
+struct BillboardStream {
+    buffer: wgpu::Buffer,
+    /// The buffer's contents as last written.
+    data: std::sync::Mutex<Vec<f32>>,
+    /// Floats per vertex, and where TEXCOORD0 sits in one.
+    stride: usize,
+    at: usize,
+    instances: Vec<crate::scene::BillboardInstance>,
+}
+
+impl BillboardStream {
+    /// Rewrites the TEXCOORD0 of the placements whose fade changed for a camera at `eye`, in
+    /// one write spanning them.
+    fn update(&self, queue: &wgpu::Queue, eye: Vec3) {
+        let mut data = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let mut span: Option<(usize, usize)> = None;
+        for (k, instance) in self.instances.iter().enumerate() {
+            let value = instance.texcoord0(eye);
+            for v in 4 * k..4 * k + 4 {
+                let at = v * self.stride + self.at;
+                let Some(slot) = data.get_mut(at..at + 4) else {
+                    continue;
+                };
+                if slot != value {
+                    slot.copy_from_slice(&value);
+                    span = Some(span.map_or((at, at + 4), |(a, b)| (a.min(at), b.max(at + 4))));
+                }
+            }
+        }
+        if let Some((a, b)) = span {
+            queue.write_buffer(
+                &self.buffer,
+                (a * 4) as u64,
+                bytemuck::cast_slice(&data[a..b]),
+            );
+        }
+    }
+}
+
 pub(crate) struct D3dPass {
     pipelines: Vec<D3dPipeline>,
     /// Per pipeline, its faded variant (see [`Self::set_opacity`]), made when first needed.
@@ -121,6 +162,8 @@ pub(crate) struct D3dPass {
     /// index range to draw and the alpha reference, `None` when the part is not drawn.
     tree_lods: Vec<Option<crate::scene::TreeLod>>,
     tree_frame: std::sync::Mutex<Vec<Option<(u32, u32, f32)>>>,
+    /// The level's far billboard batches.
+    billboards: Vec<BillboardStream>,
     /// The level's five winds for its trees, 0.2 s apart (DAOrigins.exe 0x5365c0); empty
     /// when the level has no wind file.
     winds: std::sync::Mutex<Vec<thedas_formats::speedtree_gen::wind::Wind>>,
@@ -1404,6 +1447,7 @@ impl D3dPass {
         });
 
         let mut draws = Vec::new();
+        let mut billboards: Vec<BillboardStream> = Vec::new();
         let mut mesh_spheres: HashMap<usize, (Vec3, f32)> = HashMap::new();
         for (k, (di, pi, multipass)) in pending.into_iter().enumerate() {
             let d = &scene.draws[di];
@@ -1414,19 +1458,41 @@ impl D3dPass {
                 .iter()
                 .map(|s| format!("{:?}{}@{};", s.semantic.usage, s.semantic.index, s.location))
                 .collect();
+            let batch = scene.tree_billboards.get(&di);
             let vertices = cache
                 .vertices
                 .entry((mesh.key.clone(), sig))
                 .or_insert_with(|| {
                     use wgpu::util::DeviceExt;
                     let data = expand_vertices(mesh, inputs);
+                    // The billboard batch's fades are rewritten each frame.
+                    let usage = match batch {
+                        Some(_) => wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        None => wgpu::BufferUsages::VERTEX,
+                    };
                     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some(&mesh.key),
                         contents: bytemuck::cast_slice(&data),
-                        usage: wgpu::BufferUsages::VERTEX,
+                        usage,
                     })
                 })
                 .clone();
+            if let Some(instances) = batch
+                && !billboards
+                    .iter()
+                    .any(|b: &BillboardStream| b.buffer == vertices)
+                && let Some(at) = inputs.iter().position(|s| {
+                    decl_usage(s.semantic.usage) == DeclUsage::TexCoord && s.semantic.index == 0
+                })
+            {
+                billboards.push(BillboardStream {
+                    buffer: vertices.clone(),
+                    data: std::sync::Mutex::new(expand_vertices(mesh, inputs)),
+                    stride: inputs.len() * 4,
+                    at: at * 4,
+                    instances: instances.clone(),
+                });
+            }
             let buf = buffer.as_ref().expect("buffer exists when there are draws");
             let slot = slot_size * k as u64;
             let consts = const_group(device, &consts_layout, buf, slot);
@@ -1719,12 +1785,13 @@ impl D3dPass {
             bones: vec![Vec::new(); scene.draws.len()],
             scene_probes: scene.probes.iter().map(|p| p.probe.clone()).collect(),
             trees: (0..scene.draws.len())
-                .map(|i| scene.tree_constants.get(&i).copied())
+                .map(|i| scene.tree_constants.get(&i).cloned())
                 .collect(),
             tree_lods: (0..scene.draws.len())
                 .map(|i| scene.tree_lods.get(&i).cloned())
                 .collect(),
             tree_frame: std::sync::Mutex::new(vec![None; scene.draws.len()]),
+            billboards,
             wind_time: std::sync::Mutex::new(0.0),
             winds: std::sync::Mutex::new(match scene.wind {
                 Some((strength, direction)) if !scene.tree_constants.is_empty() => (0..5)
@@ -2124,6 +2191,9 @@ impl D3dPass {
         if !warm {
             for (frame, lod) in tree_frame.iter_mut().zip(&self.tree_lods) {
                 *frame = lod.as_ref().and_then(|l| l.frame(camera.position));
+            }
+            for b in &self.billboards {
+                b.update(&ctx.queue, camera.position);
             }
         }
         let in_view: Vec<bool> = self
