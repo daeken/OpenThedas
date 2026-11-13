@@ -198,6 +198,12 @@ struct Args {
     /// screen, the death screen's load). Defaults to `$HOME/.openthedas/saves`.
     #[arg(long)]
     saves: Option<PathBuf>,
+    /// The player's settings file (the options screen's settings, kept between runs).
+    /// Playing in a window without `--control` it defaults to `options.ini` in the
+    /// player's folder (`.openthedas` in the home folder, on Windows too); otherwise
+    /// settings are kept only when this is given.
+    #[arg(long)]
+    settings: Option<PathBuf>,
     /// List the game controllers gilrs sees (names, ids, mapping, which inputs it maps) and
     /// print their events for this many seconds, then exit. No window, no install needed.
     #[arg(long)]
@@ -539,6 +545,8 @@ struct App {
     ui: Vec<String>,
     /// Where the player's games are saved.
     saves_dir: PathBuf,
+    /// The player's settings file, when settings are kept (see `Args::settings`).
+    settings: Option<PathBuf>,
     cursor: (f64, f64),
     /// The last check of whether the interface covers the cursor while it is over a
     /// creature: (cursor, creature) → covered (see `App::update_hover`).
@@ -887,6 +895,9 @@ impl App {
             &self.ui,
             (config.width, config.height),
         );
+        if let Some(path) = &self.settings {
+            ui.set_settings_file(path.clone());
+        }
         if let (Some(live), Some(_)) = (&self.live, &self.screens) {
             ui.attach(&live.sim);
             ui.set_saves(saves::SaveStore::new(self.saves_dir.clone()));
@@ -2655,6 +2666,41 @@ impl ApplicationHandler for App {
 /// the boot movies), its interface (`ui`: the sounds it asked for, the player's volumes),
 /// the camera, and a boot movie playing. A cutscene's or area's sound data is read here
 /// when it starts.
+/// The voice-over the line on screen wants: the conversation's line, else a cutscene's line
+/// that has its own voice. With [`audio::GameAudio::line_voice`] this says whether the line
+/// is voiced (and for how long) as soon as it is chosen, before its voice plays.
+pub(crate) fn voice_line(sim: &thedas_sim::Sim) -> Option<audio::VoiceLine> {
+    let line = sim.conversation_line().and_then(|l| {
+        let female = sim
+            .world
+            .get(l.player)
+            .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
+        Some(audio::VoiceLine {
+            dialog: l.dialog.to_string(),
+            strref: l.strref?,
+            female,
+            ambient: l.ambient,
+        })
+    });
+    if line.is_some() {
+        return line;
+    }
+    let c = sim.world.cutscene.as_ref()?;
+    let l = c.line_now().filter(|l| l.vo_mode == 0)?;
+    let conv = l.conversation.as_ref()?;
+    let female = sim
+        .world
+        .hero
+        .and_then(|h| sim.world.get(h))
+        .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
+    Some(audio::VoiceLine {
+        dialog: conv.clone(),
+        strref: l.strref,
+        female,
+        ambient: false,
+    })
+}
+
 fn audio_state(
     a: &mut audio::GameAudio,
     live: Option<&mut live::Live>,
@@ -2800,19 +2846,8 @@ fn audio_state(
             .hero
             .and_then(|h| sim.world.get(h))
             .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
-        state.line = sim.conversation_line().and_then(|l| {
-            let female = sim
-                .world
-                .get(l.player)
-                .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
-            Some(audio::VoiceLine {
-                dialog: l.dialog.to_string(),
-                strref: l.strref?,
-                female,
-                ambient: l.ambient,
-            })
-        });
-        // A cutscene's sound tracks, and its line's voice when the line has its own.
+        state.line = voice_line(&sim);
+        // A cutscene's sound tracks.
         if let Some(c) = sim.world.cutscene.as_ref() {
             if a.wants_cutscene(&c.name) {
                 let tracks = sim
@@ -2823,23 +2858,6 @@ fn audio_state(
                 a.set_cutscene(&c.name, tracks);
             }
             state.cutscene = Some((c.name.clone(), c.elapsed_ms as f32 / 1000.0));
-            if state.line.is_none()
-                && let Some(l) = c.line_now()
-                && l.vo_mode == 0
-                && let Some(conv) = l.conversation.as_ref()
-            {
-                let female = sim
-                    .world
-                    .hero
-                    .and_then(|h| sim.world.get(h))
-                    .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
-                state.line = Some(audio::VoiceLine {
-                    dialog: conv.clone(),
-                    strref: l.strref,
-                    female,
-                    ambient: false,
-                });
-            }
         }
     }
     // Sounds the simulation asked for (scripts, character creation's voice preview).
@@ -3764,6 +3782,9 @@ fn main() -> Result<()> {
             l.movies_wait = true;
             if ui.is_empty() {
                 let mut layer = ui::UiLayer::new(&ctx, &loaded.vfs, &[], size);
+                if let Some(path) = &args.settings {
+                    layer.set_settings_file(path.clone());
+                }
                 layer.attach(&l.sim);
                 layer.set_saves(saves::SaveStore::new(saves_dir.clone()));
                 let mut s = screens::Screens::new(l.front_end);
@@ -4362,6 +4383,10 @@ fn main() -> Result<()> {
         screens,
         ui,
         saves_dir: saves_dir.clone(),
+        settings: args
+            .settings
+            .clone()
+            .or_else(|| args.control.is_none().then(saves::default_settings)),
         cursor: (0.0, 0.0),
         hover_probe: None,
         camera,

@@ -32,6 +32,21 @@ pub struct SaveMeta {
     pub class: i32,
 }
 
+/// The player's own folder for the game's saves and settings: `.openthedas` in the home
+/// folder (`HOME`, or `USERPROFILE` on Windows), or beside the game when neither is set.
+pub fn data_dir() -> PathBuf {
+    let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
+    match var("HOME").or_else(|| var("USERPROFILE")) {
+        Some(h) => Path::new(&h).join(".openthedas"),
+        None => PathBuf::from(".openthedas"),
+    }
+}
+
+/// The player's settings file (see `thedas_ui::options::to_text`).
+pub fn default_settings() -> PathBuf {
+    data_dir().join("options.ini")
+}
+
 pub struct SaveStore {
     dir: PathBuf,
 }
