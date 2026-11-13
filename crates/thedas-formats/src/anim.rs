@@ -295,7 +295,11 @@ impl ScalarTrack {
         for w in self.keys.windows(2) {
             let ((a, va), (b, vb)) = (w[0], w[1]);
             if t <= b {
-                return if b > a { va + (vb - va) * (t - a) / (b - a) } else { vb };
+                return if b > a {
+                    va + (vb - va) * (t - a) / (b - a)
+                } else {
+                    vb
+                };
             }
         }
         self.keys.last().map_or(v0, |k| k.1)
@@ -682,7 +686,10 @@ mod tests {
     #[test]
     fn float_tracks_are_kept_by_their_parameter_name() {
         let mut b = Builder::new(b"ANI ");
-        let k1 = b.add(b"flot", vec![(4035, Value::U16(0)), (4036, Value::F32(5.0))]);
+        let k1 = b.add(
+            b"flot",
+            vec![(4035, Value::U16(0)), (4036, Value::F32(5.0))],
+        );
         let k2 = b.add(
             b"flot",
             vec![(4035, Value::U16(65535)), (4036, Value::F32(10.0))],
@@ -696,7 +703,10 @@ mod tests {
                 (4004, Value::Struct(Some(l))),
             ],
         );
-        let root = b.add(b"anim", vec![(4005, structs(&[t])), (4009, Value::F32(2.0))]);
+        let root = b.add(
+            b"anim",
+            vec![(4005, structs(&[t])), (4009, Value::F32(2.0))],
+        );
         let a = Animation::from_gff(&b.finish(root)).unwrap();
         assert!(a.tracks.is_empty());
         assert_eq!(a.scalars.len(), 1);

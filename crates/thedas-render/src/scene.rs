@@ -558,7 +558,11 @@ pub struct EffectRate {
 impl EffectRate {
     /// (birthrate, range) at `t` seconds into the loop.
     pub fn at(&self, t: f32) -> (f32, f32) {
-        let t = if self.length > 0.0 { t.rem_euclid(self.length) } else { 0.0 };
+        let t = if self.length > 0.0 {
+            t.rem_euclid(self.length)
+        } else {
+            0.0
+        };
         (
             self.birthrate.as_ref().map_or(0.0, |k| k.at(t)),
             self.range.as_ref().map_or(0.0, |k| k.at(t)),
@@ -2484,7 +2488,7 @@ impl<'a> Loader<'a> {
                         .cloned()
                 };
                 let (birthrate, range) = (track("birthrate"), track("birthraterange"));
-                (birthrate.is_some() || range.is_some()).then(|| EffectRate {
+                (birthrate.is_some() || range.is_some()).then_some(EffectRate {
                     length: a.length,
                     birthrate,
                     range,
