@@ -118,6 +118,8 @@ impl Scrub {
 pub enum Action {
     /// File an issue report with this note.
     Report(String),
+    /// The conversation panel's request (see [`crate::modconv`]).
+    Conv(crate::modconv::ConvAction),
 }
 
 /// Mod mode's state and its egui overlay.
@@ -141,6 +143,8 @@ pub struct ModMode {
     ctrl: bool,
     pub selected: Option<ObjectId>,
     pub scrub: Option<Scrub>,
+    /// The conversation launcher.
+    pub convs: crate::modconv::Convs,
     actions: Vec<Action>,
 }
 
@@ -169,6 +173,7 @@ impl ModMode {
             ctrl: false,
             selected: None,
             scrub: None,
+            convs: Default::default(),
             actions: Vec::new(),
         }
     }
@@ -304,6 +309,12 @@ impl ModMode {
                     }
                     ui.label("or Ctrl+click in the world");
                 });
+                if ui
+                    .selectable_label(self.convs.open, "Conversations")
+                    .clicked()
+                {
+                    self.convs.open = !self.convs.open;
+                }
                 ui.separator();
                 match inspected {
                     None => {
@@ -312,6 +323,9 @@ impl ModMode {
                     Some(o) => self.inspector(ui, o),
                 }
             });
+        let mut asked = Vec::new();
+        self.convs.window(ctx, &mut asked);
+        self.actions.extend(asked.into_iter().map(Action::Conv));
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui, o: &Inspected) {

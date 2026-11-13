@@ -60,6 +60,7 @@ mod follow;
 mod intro;
 mod live;
 mod looks;
+mod modconv;
 mod modmode;
 mod occlusion;
 mod pad;
@@ -1768,6 +1769,7 @@ impl App {
         for a in actions {
             match a {
                 modmode::Action::Report(note) => self.report(Some(note), None),
+                modmode::Action::Conv(a) => self.mod_mode_conv(a),
             }
         }
     }
@@ -1790,6 +1792,58 @@ impl App {
                 m.scrub = None;
             }
         }
+    }
+
+    /// Carries out a conversation-panel request on the simulation.
+    fn mod_mode_conv(&mut self, a: modconv::ConvAction) {
+        let (Some(m), Some(live)) = (self.mod_mode.as_mut(), self.live.as_ref()) else {
+            return;
+        };
+        let mut sim = live.sim();
+        modconv::carry_out(&mut sim, &mut m.convs, a, m.selected);
+    }
+
+    /// The `modconv` step: the conversation panel opens on `dialog`. Its log line counts
+    /// the owners found and the lines usable now.
+    fn mod_mode_choose(&mut self, dialog: &str) -> String {
+        if !self.mod_mode_up() {
+            self.toggle_mod_mode();
+        }
+        if let Some(m) = self.mod_mode.as_mut() {
+            m.convs.open = true;
+        }
+        self.mod_mode_conv(modconv::ConvAction::Choose(dialog.to_string()));
+        let Some(c) = self.mod_mode.as_ref().map(|m| &m.convs) else {
+            return format!("modconv {dialog}: no window");
+        };
+        let owners: Vec<_> = c
+            .owners
+            .iter()
+            .map(|(id, t)| format!("{t} ({id})"))
+            .collect();
+        match &c.lines {
+            None => format!("modconv {dialog}: could not be read"),
+            Some(lines) => format!(
+                "modconv {dialog}: owners [{}], {} lines, {} usable, {} flag reads",
+                owners.join(", "),
+                lines.len(),
+                lines.iter().filter(|l| l.usable).count(),
+                lines.iter().map(|l| l.reads.len()).sum::<usize>()
+            ),
+        }
+    }
+
+    /// The `modstart` and `modflag` steps: the conversation panel's Start, or a flag set
+    /// from it. The log line is what the panel shows.
+    fn mod_mode_command(&mut self, a: modconv::ConvAction) -> String {
+        if self.mod_mode.is_none() {
+            return "mod mode is not open".into();
+        }
+        self.mod_mode_conv(a);
+        self.mod_mode
+            .as_ref()
+            .map(|m| m.convs.status.clone())
+            .unwrap_or_default()
     }
 
     /// The `modselect` step: the inspector picks the object with this tag nearest the
@@ -3137,6 +3191,27 @@ impl App {
             }
             Step::ModSelect(tag) => log.push(self.mod_mode_select(tag)),
             &Step::ModFrame(n) => log.push(self.mod_mode_hold(n)),
+            Step::ModConv(d) => log.push(self.mod_mode_choose(d)),
+            Step::ModStart => log.push(self.mod_mode_command(modconv::ConvAction::Start)),
+            Step::ModFlag(plot, flag, value) => {
+                let number = flag.parse::<i32>().ok().or_else(|| {
+                    let info = self.live.as_ref()?.sim().plot_info(plot)?;
+                    let found = info
+                        .flags
+                        .iter()
+                        .find(|(_, n)| n.eq_ignore_ascii_case(flag));
+                    found.map(|(k, _)| *k)
+                });
+                log.push(match number {
+                    Some(n) => self.mod_mode_command(modconv::ConvAction::SetFlag {
+                        plot: plot.clone(),
+                        flag: n,
+                        value: *value,
+                    }),
+                    None => format!("modflag: {plot} has no flag {flag}"),
+                });
+            }
+            &Step::ModUndo(n) => log.push(self.mod_mode_command(modconv::ConvAction::Undo(n))),
             Step::Talk(tag) => {
                 let Some(live) = self.live.as_mut() else {
                     return;
@@ -4536,6 +4611,15 @@ enum Step {
     ModSelect(String),
     /// Mod mode holds the inspected object's animation at this frame (from 0).
     ModFrame(i64),
+    /// Mod mode's conversation panel opens on this conversation (`modconv`).
+    ModConv(String),
+    /// The conversation panel's Start (`modstart`).
+    ModStart,
+    /// A plot flag (its number or name) set (1) or cleared (0) from the conversation panel
+    /// (`modflag PLOT FLAG 1`).
+    ModFlag(String, String, bool),
+    /// The conversation panel's history entry n (from 0) is undone (`modundo`).
+    ModUndo(usize),
     /// The conversation's reply n (from 0) is chosen.
     Reply(usize),
     /// The game camera turns (degrees of yaw, then pitch), as dragging with the right
@@ -4880,6 +4964,25 @@ fn parse_step(s: &str) -> Result<Step> {
         "modmode" => Step::ModMode,
         "modselect" if !arg.is_empty() => Step::ModSelect(arg.to_string()),
         "modframe" => Step::ModFrame(arg.parse().context("modframe takes a frame number")?),
+        "modconv" if !arg.is_empty() => Step::ModConv(arg.to_string()),
+        "modstart" => Step::ModStart,
+        "modflag" => {
+            let mut w = arg.split_whitespace();
+            let (Some(plot), Some(flag), Some(v), None) = (w.next(), w.next(), w.next(), w.next())
+            else {
+                bail!("modflag takes PLOT FLAG 0|1");
+            };
+            Step::ModFlag(
+                plot.to_string(),
+                flag.to_string(),
+                match v {
+                    "1" => true,
+                    "0" => false,
+                    _ => bail!("modflag's value is 0 or 1"),
+                },
+            )
+        }
+        "modundo" => Step::ModUndo(arg.parse().context("modundo takes a history entry")?),
         "key" if arg.len() == 1 && arg.as_bytes()[0].is_ascii_digit() => {
             // 1 is the first slot, 0 the tenth.
             Step::Quickslot((arg.as_bytes()[0] - b'0' + 9) as i32 % 10)
@@ -5156,7 +5259,13 @@ fn main() -> Result<()> {
                         l.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
                         println!("rebuild: {:.3}s", t.elapsed().as_secs_f64());
                     }
-                    Step::ModMode | Step::ModSelect(_) | Step::ModFrame(_) => {
+                    Step::ModMode
+                    | Step::ModSelect(_)
+                    | Step::ModFrame(_)
+                    | Step::ModConv(_)
+                    | Step::ModStart
+                    | Step::ModFlag(..)
+                    | Step::ModUndo(_) => {
                         println!("mod mode: windowed only")
                     }
                     Step::Talk(tag) => {
@@ -5946,6 +6055,22 @@ mod tests {
             ]
         );
         assert!(parse_steps("modframe twelve").is_err());
+        assert_eq!(
+            parse_steps("modconv alistair_main; modstart; modflag gen00pt_party 3 1; modundo 0")
+                .unwrap(),
+            vec![
+                Step::ModConv("alistair_main".into()),
+                Step::ModStart,
+                Step::ModFlag("gen00pt_party".into(), "3".into(), true),
+                Step::ModUndo(0),
+            ]
+        );
+        assert!(parse_steps("modflag gen00pt_party 3").is_err());
+        assert!(parse_steps("modflag gen00pt_party 3 yes").is_err());
+        assert_eq!(
+            parse_steps("modflag plt_a SOME_FLAG 0").unwrap(),
+            vec![Step::ModFlag("plt_a".into(), "SOME_FLAG".into(), false)]
+        );
         assert_eq!(
             parse_steps("type Rowan Cousland; key backspace; key ctrl+a; key Enter").unwrap(),
             vec![
