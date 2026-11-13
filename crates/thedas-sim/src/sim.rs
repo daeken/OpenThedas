@@ -199,6 +199,10 @@ fn along(from: [f32; 3], points: &[[f32; 3]], f: f32) -> [f32; 3] {
 /// `Sim::slide_past_bodies`).
 const SLIDE_PASSES: usize = 4;
 
+/// How near a walker held up by a body must be to its next waypoint for that waypoint to
+/// count as reached (see `Sim::advance_movers`), in metres. Provisional.
+const WAYPOINT_REACHED: f32 = 0.05;
+
 /// How long a walker held up by bodies may make no progress before it is reported.
 const BLOCKED_REPORT_MS: u64 = 3_000;
 
@@ -2461,7 +2465,17 @@ impl Sim {
                 // making for it only goes round and round that creature: it goes on to the
                 // next one (not past the end of the path). Provisional: DAOrigins.exe's
                 // path follower is not traced.
-                while rest.len() > 1 && self.body_covers(id, rest[0]) {
+                // Nor does it go back to a waypoint it had reached when the body turned it
+                // aside: progress along the route is measured from where it was, so a
+                // waypoint it stood on counts as still ahead, and it would walk back to it
+                // and into the body again for as long as the body stood there (the Tower
+                // of Ishal's third floor: the hero behind Alistair, 35 m from the archer he
+                // was sent at).
+                while rest.len() > 1
+                    && (self.body_covers(id, rest[0])
+                        || ((rest[0][0] - was[0]).powi(2) + (rest[0][1] - was[1]).powi(2)).sqrt()
+                            < WAYPOINT_REACHED)
+                {
                     rest.remove(0);
                 }
                 // At the speed the move was set going at (a walk stays a walk).
