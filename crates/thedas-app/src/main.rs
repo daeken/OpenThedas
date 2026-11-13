@@ -1921,15 +1921,49 @@ impl App {
             (None, _, Some(s)) => format!(
                 "modworld: {} globals, area {} with {} variables and {} objects, {} plots with \
                  {} stored flags",
-                s.module.len(),
-                s.area.as_ref().map_or("none", |a| a.0.as_str()),
-                s.area.as_ref().map_or(0, |a| a.1.len()),
+                s.module.as_ref().map_or(0, |m| m.vars.len()),
+                s.area.as_ref().map_or("none", |a| a.tag.as_str()),
+                s.area.as_ref().map_or(0, |a| a.vars.len()),
                 s.things.len(),
                 s.plots.len(),
                 s.plots.iter().map(|p| p.flags.len()).sum::<usize>()
             ),
             _ => "modworld: nothing read".into(),
         }
+    }
+
+    /// The `modlocal` step: a variable set (or removed) as the world-state browser does.
+    fn mod_mode_local(&mut self, who: &str, name: &str, kind: &str, value: &str) -> String {
+        if self.mod_mode.is_none() {
+            return "mod mode is not open".into();
+        }
+        let target = self.live.as_ref().and_then(|l| {
+            let sim = l.sim();
+            match who {
+                "module" => sim.world.module,
+                "area" => sim.world.area,
+                tag => sim.world.find_tag(tag, 0),
+            }
+        });
+        let Some(target) = target else {
+            return format!("modlocal: no {who}");
+        };
+        let value = match kind {
+            "remove" => None,
+            k => match modworld::parse_value(k, value) {
+                Ok(v) => Some(v),
+                Err(e) => return format!("modlocal: {e}"),
+            },
+        };
+        self.mod_mode_world(modworld::WorldAction::SetLocal {
+            target,
+            name: name.to_string(),
+            value,
+        });
+        self.mod_mode
+            .as_ref()
+            .map(|m| m.convs.status.clone())
+            .unwrap_or_default()
     }
 
     /// The `modstart` and `modflag` steps: the conversation panel's Start, or a flag set
@@ -3359,6 +3393,9 @@ impl App {
             },
             Step::ModWorld => log.push(self.mod_mode_world_step(None)),
             Step::ModPlot(name) => log.push(self.mod_mode_world_step(Some(name))),
+            Step::ModLocal(who, name, kind, value) => {
+                log.push(self.mod_mode_local(who, name, kind, value))
+            }
             Step::Talk(tag) => {
                 let Some(live) = self.live.as_mut() else {
                     return;
@@ -4801,6 +4838,10 @@ enum Step {
     ModWorld,
     /// The world-state browser looks up a plot (`modplot NAME`).
     ModPlot(String),
+    /// A variable set from the world-state browser (`modlocal WHO NAME TYPE VALUE`, WHO
+    /// `module`, `area` or an object's tag; TYPE `int`, `float`, `string`, `object` or
+    /// `resource`, or `remove` with no value).
+    ModLocal(String, String, String, String),
     /// The conversation's reply n (from 0) is chosen.
     Reply(usize),
     /// The game camera turns (degrees of yaw, then pitch), as dragging with the right
@@ -5183,6 +5224,14 @@ fn parse_step(s: &str) -> Result<Step> {
         "modflyto" => Step::ModFlyTo,
         "modworld" => Step::ModWorld,
         "modplot" if !arg.is_empty() => Step::ModPlot(arg.to_string()),
+        "modlocal" => {
+            let mut w = arg.splitn(4, ' ');
+            let (Some(who), Some(name), Some(kind)) = (w.next(), w.next(), w.next()) else {
+                bail!("modlocal takes WHO NAME TYPE VALUE");
+            };
+            let value = w.next().unwrap_or_default();
+            Step::ModLocal(who.into(), name.into(), kind.into(), value.into())
+        }
         "key" if arg.len() == 1 && arg.as_bytes()[0].is_ascii_digit() => {
             // 1 is the first slot, 0 the tenth.
             Step::Quickslot((arg.as_bytes()[0] - b'0' + 9) as i32 % 10)
@@ -5472,7 +5521,8 @@ fn main() -> Result<()> {
                     | Step::ModFly
                     | Step::ModFlyTo
                     | Step::ModWorld
-                    | Step::ModPlot(_) => {
+                    | Step::ModPlot(_)
+                    | Step::ModLocal(..) => {
                         println!("mod mode: windowed only")
                     }
                     Step::Talk(tag) => {
@@ -6315,12 +6365,18 @@ mod tests {
         );
         assert!(parse_steps("modflag gen00pt_party 3").is_err());
         assert_eq!(
-            parse_steps("modfly; modflyto; modworld; modplot plt_a").unwrap(),
+            parse_steps(
+                "modfly; modflyto; modworld; modplot plt_a; modlocal module X string a b; \
+                 modlocal area Y remove"
+            )
+            .unwrap(),
             vec![
                 Step::ModFly,
                 Step::ModFlyTo,
                 Step::ModWorld,
-                Step::ModPlot("plt_a".into())
+                Step::ModPlot("plt_a".into()),
+                Step::ModLocal("module".into(), "X".into(), "string".into(), "a b".into()),
+                Step::ModLocal("area".into(), "Y".into(), "remove".into(), "".into()),
             ]
         );
         assert!(parse_steps("modflag gen00pt_party 3 yes").is_err());
