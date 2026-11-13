@@ -690,6 +690,9 @@ impl PadPlay {
     /// A: a waiting ability goes to the target (or the ground ahead for one aimed at
     /// places); otherwise the leader acts on the target, or on the best thing in front.
     fn interact(&mut self, host: &mut dyn Host) -> String {
+        if let Some(done) = self.tutorial_screen(host) {
+            return done;
+        }
         let aiming = host.live().and_then(|l| l.aiming.clone());
         let target = match self.target {
             Some(t) => Some(t),
@@ -733,6 +736,49 @@ impl PadPlay {
             }
         }
         order
+    }
+
+    /// A while a training tutorial holds the game paused until a screen is opened (its text
+    /// names a mouse click or a key: "left-click on the + button next to your character's
+    /// portrait", "press I"): opens that screen, as the click or the key would, so a player
+    /// on the pad is not left in the pause. The level-up screen is asked for as the
+    /// portrait's button asks (`Sim::request_level_up`); the inventory and tactics screens
+    /// open as their keys open them. `None` when no tutorial waits for a screen.
+    fn tutorial_screen(&mut self, host: &mut dyn Host) -> Option<String> {
+        let waits = {
+            let live = host.live()?;
+            let mut sim = live.sim();
+            let t = sim.world.training;
+            if t.mode == 0 || t.expected == 0 {
+                return None;
+            }
+            let waits = |sim: &thedas_sim::Sim, name: &str| {
+                t.expected == sim.event_type(&format!("TRAINING_{name}"))
+            };
+            if waits(&sim, "GUI_LEVLUP_OPENED") {
+                let who = sim.world.controlled().or(sim.world.hero)?;
+                sim.request_level_up(who);
+                sim.tick(0);
+                return Some("level-up opened (the tutorial waits for it)".into());
+            }
+            if waits(&sim, "GUI_INVENTORY_OPENED") {
+                Screen::Inventory
+            } else if waits(&sim, "GUI_TACTICS_OPENED") {
+                Screen::Tactics
+            } else {
+                return None;
+            }
+        };
+        let s = host.screens()?;
+        if s.front_end || s.menu.is_some() {
+            return None;
+        }
+        s.menu = Some(waits);
+        self.page = PAGES
+            .iter()
+            .position(|p| matches!(p, Page::Menu(m) if *m == waits))
+            .unwrap_or(0);
+        Some(format!("{waits:?} opened (the tutorial waits for it)"))
     }
 
     /// X, Y, B (RT for the second set): the quickbar's slot, aimed at once at the target (or
