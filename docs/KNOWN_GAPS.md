@@ -96,9 +96,9 @@ these, so they are the places where one person or stream can take a large, separ
 
 - **Shader families outside the default set** fall back to a hand-written stand-in or are
   skipped (`RND-112`, `RND-113`).
-- **SpeedTree.** Trees draw as real geometry with distance levels and billboards far away, but
-  only leaf cards use the game's own shader, nothing sways in the wind, and grass and bushes are
-  absent (`RND-075` to `RND-078`).
+- **SpeedTree.** Trees draw as real geometry on the game's own shaders, with distance levels,
+  billboards far away and wind sway. The billboards are a stand-in that does not fade in, and
+  the wind's per-tree details are provisional (`RND-075` to `RND-078`).
 - **Effects on creatures and items.** Spell effects, crust effects and weapon glows are not
   drawn; only effects placed at a location are (`RND-094`).
 - **Animation blending.** No blend weights, crossfades, inverse kinematics or root motion
