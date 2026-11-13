@@ -20,6 +20,6 @@ log.workspace = true
 pollster.workspace = true
 
 [dev-dependencies]
-# The OpenGL backend's shader translation, to check the hand-written shaders against it
-# (see `gl_check`).
-naga = { workspace = true, features = ["glsl-out"] }
+# Every backend's shader translation, to check the hand-written shaders against them (see
+# `thedas_shader::backends`).
+thedas-shader = { workspace = true, features = ["backend-check"] }
