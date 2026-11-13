@@ -30,7 +30,8 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
 
 8. **Placed-sound fields** (`.are` `SoundList`).
    - Applied: `Volume`, `MaxDistanceMult`, `Active`, `Tag`, and `Pitch` (added to the event's), `FadeIn` and `FadeOut` (replacing the event's; most sounds fade out over 34 ms), as the sound start does (0x7c261d..0x7c2637).
-   - Not applied: `ConeInside`, `ConeOutside`, `ConeVolume` (directional sounds; the start puts them in the event's cone angles and scales its outside volume, 0x7c265b..0x7c26c8; 710 sounds), `Priority`, `Occludable`.
+   - Also applied: the cone (`ConeInside`, `ConeOutside`, `ConeVolume`; 710 sounds, mostly half-spaces that are silent behind, such as waterfalls and wall creaks). The sound's facing is the event's orientation (slot 0x68, 0x5bf660); the angles replace the event's and `ConeVolume` (dB, when 0 or below) scales its outside level (0x7c265b..0x7c26c8). Provisional: that the loader turns the `.are` orientation into the facing vector, and a linear fall between the angles.
+   - Not applied: `Priority`, `Occludable`.
    - Medium.
 9. **Occlusion.**
    - Original: imports `Event::set3DOcclusion`, and sounds have an `Occludable` flag, so they are muffled behind geometry.

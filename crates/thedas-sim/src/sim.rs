@@ -599,16 +599,12 @@ impl Sim {
         }
     }
 
-    /// A talk-table string (English tables: `*_en-us.tlk` in the stack, merged).
+    /// A talk-table string (English tables: `*_en-us.tlk` in the stack, merged, then Dragon
+    /// Age II's `*_en-us_p.tlk` patch tables over them).
     pub fn string(&self, strref: u32) -> Option<String> {
         let map = self.strings.get_or_init(|| {
             let mut m = std::collections::BTreeMap::new();
-            for name in self
-                .vfs
-                .names()
-                .into_iter()
-                .filter(|n| n.ends_with("en-us.tlk"))
-            {
+            for name in self.vfs.talk_tables("en-us") {
                 if let Ok((data, _)) = self.vfs.read(&name) {
                     if let Ok(t) = thedas_formats::Tlk::parse(&data) {
                         m.extend(t.strings);
