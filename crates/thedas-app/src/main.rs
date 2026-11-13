@@ -4351,6 +4351,7 @@ fn main() -> Result<()> {
         if let Some(exe) = update::newest_build() {
             match std::process::Command::new(&exe)
                 .args(std::env::args_os().skip(1))
+                .envs(update::program_dir().map(|d| (update::PROGRAM_DIR, d)))
                 .spawn()
             {
                 Ok(_) => {
