@@ -137,15 +137,27 @@ pub fn send(dir: &Path, url: &str) -> Result<String> {
         files.push((name.to_string(), redact(bytes, home.as_deref())));
     }
     let id = info["id"].as_str().unwrap_or("report").to_string();
-    let mut zip = zip(&files)?;
-    if zip.len() > MAX_UPLOAD {
-        files.retain(|(n, _)| !JOURNAL.contains(&n.as_str()));
-        zip = self::zip(&files)?;
-    }
     // The marked copy, when the player marked spots: it shows what they pointed at.
     let mut shot = std::fs::read(dir.join("screenshot_marked.png"))
         .or_else(|_| std::fs::read(dir.join("screenshot.png")))
         .ok();
+    let mut zip = zip(&files)?;
+    // The journal is the only part ever left out: when the report and its screenshot would
+    // be over the limit with it, it stays in the local folder only, and report.json says so.
+    let shot_len = shot.as_ref().map_or(0, |p| p.len());
+    let has_journal = files.iter().any(|(n, _)| JOURNAL.contains(&n.as_str()));
+    if has_journal && zip.len() + shot_len > MAX_UPLOAD {
+        files.retain(|(n, _)| !JOURNAL.contains(&n.as_str()));
+        info["journal_left_out"] = json!(format!(
+            "{} bytes zipped with the screenshot, over the {} byte limit; it is in the report's folder",
+            zip.len() + shot_len,
+            MAX_UPLOAD
+        ));
+        if let Some(r) = files.iter_mut().find(|(n, _)| n == "report.json") {
+            r.1 = redact(serde_json::to_vec_pretty(&info)?, home.as_deref());
+        }
+        zip = self::zip(&files)?;
+    }
     if let Some(png) = &shot {
         if zip.len() + png.len() > MAX_UPLOAD {
             shot = half_size(png)
