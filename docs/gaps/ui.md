@@ -24,7 +24,7 @@ How the list was built:
 |---|---|---|---|---|
 | load_light for same-list area changes, load_fade for the party picker, `fademap` | The exe shows load_light.gfx for an area change within the same area list and load_fade.gfx before the party picker (trace: OpenThedas-testdata/notes/loading-screen-trace.md). | load_town.gfx shows for every area load (UI side merged); the app does not tell area lists apart, and the party picker does not fade. | S | Area-list knowledge (sim/app) |
 | Epilogue slideshow (`slideshow.gfx`) | End-game slides with text from plot flags. | Nothing. | M | Sim: epilogue plot evaluation |
-| Credits (`credits.gfx`) | Start-menu Credits and after the ending. | Nothing is shown: the start menu's Credits (and its Player Profile, the original's online screen) leave the menu as it is, since the menu's own buttons are put back at once (they used to stay hidden, with no way back). | S | — |
+| Credits after the ending, and other campaigns' credits | The credits play after the ending; the start menu lists each campaign's credits when there are several. | The start menu's Credits shows the base game's credits (English); nothing plays them after the ending, and the list of campaigns' credits is not built. The start menu's Player Profile (the original's online screen) leaves the menu as it is. | S | Sim: the ending |
 | Crafting (`crafting.gfx`) | Herbalism, Poison-Making and Trap-Making recipe screens: lists known recipes, checks ingredients, crafts. | Recipes are learned (#25x), but there is no screen. The item binding has a `Crafting` category. | M | Sim: craft action, ingredient consume |
 | Rune/item upgrade (`itemupgrade.gfx`) | Puts runes in weapon and armour slots (Sandal). | Nothing. | M | Sim: rune slot properties |
 | Army control (`armycontrol.gfx`) | Summoning allied armies in the final battle. | Nothing. | M | Sim: army summons (late game) |
@@ -393,6 +393,7 @@ against the project's own goal.
 - Character creation screen (chargen.gfx): gender, race, class, background, name, appearance sliders, voice set and previews, paperdoll camera presets.
 - Level-up screen (levelup.gfx) opened from the character record or a portrait; points spent through the simulation.
 - Skills and spells/talents screens (abilities.gfx) with ability chains, specialization trees included.
+- Credits (credits.gfx) from the start menu: the game's credits text scrolling by; a click, a key or B goes back to the menu.
 - Character record with attributes, modifiers and Heroic Accomplishments rows.
 - Inventory: backpack, plot items, category tabs, equip and unequip, next/previous member, paperdoll drawing and turning, equipment layouts (Shale, the dog), backpack size and capacity, money.
 - Item examine screen opened from inventory, character record and store.

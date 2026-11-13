@@ -42,6 +42,8 @@ pub enum Screen {
     SpellsTalents,
     /// The start menu (startmenu2.gfx), before a game: New Game, Load, Options, Exit.
     StartMenu,
+    /// The credits (credits.gfx), from the start menu: the credits text scrolling by.
+    Credits,
     /// The game menu over a running game (mainmenu.gfx, Escape or Start): save, load,
     /// options, back to the start menu.
     GameMenu,
@@ -99,6 +101,7 @@ impl Screen {
             Screen::ItemExamine => &["itemexamine.gfx"],
             // Its confirmations (quitting) are dialog boxes on the popup layer.
             Screen::StartMenu => &["startmenu2.gfx", "popuplayer.gfx"],
+            Screen::Credits => &["credits.gfx"],
             Screen::GameMenu => &["mainmenu.gfx", "popuplayer.gfx"],
             Screen::LoadTown => &["load_town.gfx"],
             Screen::LoadLight => &["load_light.gfx"],
