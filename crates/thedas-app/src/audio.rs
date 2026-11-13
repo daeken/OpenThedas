@@ -1605,6 +1605,11 @@ impl GameAudio {
                             position: Some(position),
                             volume: 10f32.powf(s.volume / 20.0),
                             distance_scale: s.max_distance_mult.max(1e-3),
+                            // The placed sound's own pitch offset and fade times
+                            // (DAOrigins.exe 0x7c261d..0x7c2637).
+                            pitch: s.pitch,
+                            fade_in_ms: Some(s.fade_in_ms),
+                            fade_out_ms: Some(s.fade_out_ms),
                             ..Default::default()
                         },
                     ));
