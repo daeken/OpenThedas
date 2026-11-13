@@ -526,6 +526,14 @@ impl Sim {
             .read(&format!("{}.dlg", name.to_ascii_lowercase()))
             .ok()
             .and_then(|(data, _)| Dlg::parse(&data, &name))
+            .or_else(|| {
+                // Dragon Age II's conversations are `.cnv` files (see `crate::cnv`).
+                let (data, _) = self
+                    .vfs
+                    .read(&format!("{}.cnv", name.to_ascii_lowercase()))
+                    .ok()?;
+                crate::cnv::dlg_from_cnv(&Gff4::parse(&data).ok()?, &name)
+            })
         else {
             let t = self.world.time_ms;
             self.world.trace.push(TraceEntry::Missing {
