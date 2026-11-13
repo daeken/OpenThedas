@@ -2,7 +2,9 @@
 //! harnesses set plot flags and start conversations through [`Sim::apply`], and every call
 //! is kept in the world's journal ([`crate::world::World::command_journal`]) with what it
 //! did. Mod mode's entries are its edit history: they are never dropped, and a flag set
-//! records the value it replaced, for undo.
+//! records the value it replaced, for undo. Play inputs (the clock, the player's orders,
+//! the interface's messages) go through the same door; the journal keeps only edits, and
+//! every command goes to [`Sim::input_log`] when it is on (journal-style saves replay it).
 
 use thedas_script::vm::{OBJECT_INVALID, ObjectId};
 
@@ -19,6 +21,10 @@ pub enum CommandSource {
     ModMode,
     Mcp,
     Test,
+    /// The player, through the game's controls and interface.
+    Player,
+    /// The app itself (its clock, debug steps, the game's own flow outside the scripts).
+    App,
 }
 
 /// A command from outside the simulation.
@@ -40,6 +46,119 @@ pub enum SimCommand {
         target: ObjectId,
         dialog: String,
     },
+    /// The simulation's clock goes on by `ms` milliseconds (0: what is due now runs).
+    Tick {
+        ms: u64,
+    },
+    /// Player orders (see the `order_*` methods).
+    OrderMove {
+        who: ObjectId,
+        to: [f32; 3],
+    },
+    OrderAttack {
+        who: ObjectId,
+        target: ObjectId,
+    },
+    OrderTalk {
+        who: ObjectId,
+        target: ObjectId,
+    },
+    OrderUse {
+        who: ObjectId,
+        target: ObjectId,
+    },
+    OrderAbility {
+        who: ObjectId,
+        ability: i32,
+        target: ObjectId,
+        item: String,
+    },
+    OrderAbilityAt {
+        who: ObjectId,
+        ability: i32,
+        at: [f32; 3],
+        item: String,
+    },
+    /// The player picks who they control.
+    PlayerSelects {
+        who: ObjectId,
+    },
+    /// The camera came close to the controlled creature (a tutorial waits for it).
+    PlayerZoomedIn,
+    /// The player picks reply `choice` of the open conversation.
+    ChooseReply {
+        choice: usize,
+    },
+    EndConversation,
+    SkipCutscene,
+    EndCutscene {
+        name: String,
+    },
+    /// A message from the interface's movies (`GUI.*`), or an options message.
+    GuiMessage {
+        name: String,
+        args: Vec<String>,
+    },
+    ClientOptionMessage {
+        name: String,
+        args: Vec<String>,
+    },
+    GuiOpened {
+        gui: i32,
+    },
+    TrainingEvent {
+        name: String,
+        arg: i32,
+    },
+    SetTrainingMode {
+        mode: i32,
+    },
+    ConsumeTutorial {
+        all: bool,
+    },
+    AnswerPopup {
+        button: i32,
+        text: String,
+    },
+    RequestLevelUp {
+        creature: ObjectId,
+    },
+    SetFaceChoice {
+        creature: ObjectId,
+        slider: u32,
+        value: f32,
+    },
+    ChargenSoundSet {
+        set: String,
+    },
+    PartyPicker,
+    PartyPickerToggle {
+        who: ObjectId,
+    },
+    PartyPickerSubmit,
+    CloseStore,
+    CloseContainer,
+    BeginTravel {
+        pin: ObjectId,
+    },
+    /// What runs before the game is saved.
+    Presave,
+    /// A debug kill (the app's test steps).
+    Kill {
+        id: ObjectId,
+        killer: ObjectId,
+    },
+}
+
+impl SimCommand {
+    /// Whether the world's journal keeps it: edits (plot flags, conversations started from
+    /// outside), not the stream of play inputs, which goes to [`Sim::input_log`].
+    pub fn is_edit(&self) -> bool {
+        matches!(
+            self,
+            SimCommand::SetPlotFlag { .. } | SimCommand::StartConversation { .. }
+        )
+    }
 }
 
 /// What a command did.
@@ -61,8 +180,19 @@ pub enum CommandOutcome {
     /// Another conversation is open: this one starts when it ends (if its owner is still
     /// there to talk).
     ConversationQueued { dialog: String },
+    /// A play input carried out (`ok`: what the method answered, where it answers).
+    Done { ok: bool },
     /// Nothing was done.
     Refused { reason: String },
+}
+
+/// A play input as the input log keeps it (see [`Sim::input_log`]).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct InputEntry {
+    /// Simulation time when it was given, in milliseconds.
+    pub t: u64,
+    pub source: CommandSource,
+    pub command: SimCommand,
 }
 
 /// An object named by a command, as it can be found again in another session: object
@@ -131,7 +261,20 @@ impl Sim {
                 target,
                 dialog,
             } => self.start_commanded_conversation(*initiator, *target, dialog),
+            other => CommandOutcome::Done {
+                ok: self.play_input(other),
+            },
         };
+        if let Some(log) = self.input_log.as_mut() {
+            log.push(InputEntry {
+                t: self.world.time_ms,
+                source,
+                command: command.clone(),
+            });
+        }
+        if !command.is_edit() {
+            return outcome;
+        }
         let objects = match &command {
             SimCommand::StartConversation {
                 initiator, target, ..
@@ -139,7 +282,7 @@ impl Sim {
                 .iter()
                 .filter_map(|&id| self.object_ref(id))
                 .collect(),
-            SimCommand::SetPlotFlag { .. } => Vec::new(),
+            _ => Vec::new(),
         };
         let entry = JournalEntry {
             t: self.world.time_ms,
@@ -164,6 +307,134 @@ impl Sim {
             }
         }
         outcome
+    }
+
+    /// Carries out a play input; what the method answered, where it answers.
+    fn play_input(&mut self, c: &SimCommand) -> bool {
+        use SimCommand as C;
+        match c {
+            C::SetPlotFlag { .. } | C::StartConversation { .. } => false,
+            C::Tick { ms } => {
+                self.tick(*ms);
+                true
+            }
+            C::OrderMove { who, to } => {
+                self.order_move(*who, *to);
+                true
+            }
+            C::OrderAttack { who, target } => {
+                self.order_attack(*who, *target);
+                true
+            }
+            C::OrderTalk { who, target } => {
+                self.order_talk(*who, *target);
+                true
+            }
+            C::OrderUse { who, target } => {
+                self.order_use(*who, *target);
+                true
+            }
+            C::OrderAbility {
+                who,
+                ability,
+                target,
+                item,
+            } => {
+                self.order_ability(*who, *ability, *target, item);
+                true
+            }
+            C::OrderAbilityAt {
+                who,
+                ability,
+                at,
+                item,
+            } => {
+                self.order_ability_at(*who, *ability, *at, item);
+                true
+            }
+            C::PlayerSelects { who } => {
+                self.player_selects(*who);
+                true
+            }
+            C::PlayerZoomedIn => self.player_zoomed_in(),
+            C::ChooseReply { choice } => self.choose_reply(*choice).is_some(),
+            C::EndConversation => {
+                self.end_conversation();
+                true
+            }
+            C::SkipCutscene => {
+                self.skip_cutscene();
+                true
+            }
+            C::EndCutscene { name } => {
+                self.end_cutscene(name);
+                true
+            }
+            C::GuiMessage { name, args } => self.gui_message(name, args),
+            C::ClientOptionMessage { name, args } => self.client_option_message(name, args),
+            C::GuiOpened { gui } => {
+                self.gui_opened(*gui);
+                true
+            }
+            C::TrainingEvent { name, arg } => self.training_event(name, *arg),
+            C::SetTrainingMode { mode } => {
+                self.set_training_mode(*mode);
+                true
+            }
+            C::ConsumeTutorial { all } => {
+                self.consume_tutorial(*all);
+                true
+            }
+            C::AnswerPopup { button, text } => self.answer_popup_with_text(*button, text),
+            C::RequestLevelUp { creature } => {
+                self.request_level_up(*creature);
+                true
+            }
+            C::SetFaceChoice {
+                creature,
+                slider,
+                value,
+            } => {
+                self.set_face_choice(*creature, *slider, *value);
+                true
+            }
+            C::ChargenSoundSet { set } => self.chargen_sound_set(set),
+            C::PartyPicker => {
+                self.party_picker();
+                true
+            }
+            C::PartyPickerToggle { who } => self.party_picker_toggle(*who),
+            C::PartyPickerSubmit => self.party_picker_submit(),
+            C::CloseStore => {
+                self.close_store();
+                true
+            }
+            C::CloseContainer => {
+                self.close_container();
+                true
+            }
+            C::BeginTravel { pin } => self.begin_travel(*pin),
+            C::Presave => {
+                self.presave();
+                true
+            }
+            C::Kill { id, killer } => {
+                self.kill(*id, *killer);
+                true
+            }
+        }
+    }
+
+    /// Carries out a play input from the player or the app, answering what its method
+    /// answered (see [`Sim::apply`]).
+    pub fn input(&mut self, source: CommandSource, command: SimCommand) -> bool {
+        matches!(
+            self.apply(source, command),
+            CommandOutcome::Done { ok: true }
+                | CommandOutcome::PlotFlagSet { .. }
+                | CommandOutcome::ConversationStarted { .. }
+                | CommandOutcome::ConversationQueued { .. }
+        )
     }
 
     /// A conversation asked for from outside: its owner must be an active, living creature

@@ -32,7 +32,15 @@ pub struct Aim {
 pub fn use_quickslot(sim: &mut Sim, who: u32, slot: i32) -> Option<Aim> {
     let (_, q) = sim.quickbar(who).into_iter().find(|(s, _)| *s == slot)?;
     if sim.ability_on_self(q.ability) {
-        sim.order_ability(who, q.ability, who, &q.item);
+        sim.input(
+            thedas_sim::commands::CommandSource::Player,
+            thedas_sim::commands::SimCommand::OrderAbility {
+                who,
+                ability: q.ability,
+                target: who,
+                item: q.item.to_string(),
+            },
+        );
         return None;
     }
     Some(Aim {
@@ -73,10 +81,16 @@ pub fn aim(sim: &Sim, name: &str, args: &[String]) -> Option<Aim> {
 /// conversation closed.
 pub fn reply(sim: &mut Sim, n: usize) -> bool {
     if sim.dialog_state().is_some_and(|d| d.ended) {
-        sim.end_conversation();
+        sim.input(
+            thedas_sim::commands::CommandSource::Player,
+            thedas_sim::commands::SimCommand::EndConversation,
+        );
         return true;
     }
-    sim.choose_reply(n);
+    sim.input(
+        thedas_sim::commands::CommandSource::Player,
+        thedas_sim::commands::SimCommand::ChooseReply { choice: n },
+    );
     false
 }
 
@@ -130,8 +144,17 @@ pub fn apply(sim: &mut Sim, name: &str, args: &[String]) -> bool {
             .and_then(|a| a.trim().parse::<f64>().ok())
             .map_or(1, |b| b as i32);
         let text = args.get(3).map(String::as_str).unwrap_or("");
-        let answered = sim.answer_popup_with_text(button, text);
-        sim.tick(0);
+        let answered = sim.input(
+            thedas_sim::commands::CommandSource::Player,
+            thedas_sim::commands::SimCommand::AnswerPopup {
+                button,
+                text: text.to_string(),
+            },
+        );
+        sim.input(
+            thedas_sim::commands::CommandSource::App,
+            thedas_sim::commands::SimCommand::Tick { ms: 0 },
+        );
         return answered;
     }
     if name == GIFT_ITEM {
@@ -143,7 +166,10 @@ pub fn apply(sim: &mut Sim, name: &str, args: &[String]) -> bool {
             .and_then(|a| a.parse::<usize>().ok())
             .unwrap_or(0);
         reply(sim, n);
-        sim.tick(0);
+        sim.input(
+            thedas_sim::commands::CommandSource::App,
+            thedas_sim::commands::SimCommand::Tick { ms: 0 },
+        );
         return true;
     }
     // An ability used on its user goes at once; one that needs a target waits for the
@@ -152,7 +178,15 @@ pub fn apply(sim: &mut Sim, name: &str, args: &[String]) -> bool {
         if !sim.ability_on_self(a.ability) {
             return false;
         }
-        sim.order_ability(a.caster, a.ability, a.caster, &a.item);
+        sim.input(
+            thedas_sim::commands::CommandSource::Player,
+            thedas_sim::commands::SimCommand::OrderAbility {
+                who: a.caster,
+                ability: a.ability,
+                target: a.caster,
+                item: a.item.to_string(),
+            },
+        );
         return true;
     }
     // The level-up button (character record, a portrait's level-up arrow): the creature and
@@ -165,8 +199,14 @@ pub fn apply(sim: &mut Sim, name: &str, args: &[String]) -> bool {
             .map(|v| v as u32)
             .filter(|w| thedas_sim::engine::party_of(sim).contains(w));
         let Some(who) = who else { return false };
-        sim.request_level_up(who);
-        sim.tick(0);
+        sim.input(
+            thedas_sim::commands::CommandSource::Player,
+            thedas_sim::commands::SimCommand::RequestLevelUp { creature: who },
+        );
+        sim.input(
+            thedas_sim::commands::CommandSource::App,
+            thedas_sim::commands::SimCommand::Tick { ms: 0 },
+        );
         return true;
     }
     // An appearance slider moved (`GUICharGen.AppearanceSliders.N.Value`, value): the
@@ -185,13 +225,29 @@ pub fn apply(sim: &mut Sim, name: &str, args: &[String]) -> bool {
         let Some(slider) = crate::appearance::slider_at(sim, index) else {
             return false;
         };
-        sim.set_face_choice(who, slider, value);
+        sim.input(
+            thedas_sim::commands::CommandSource::Player,
+            thedas_sim::commands::SimCommand::SetFaceChoice {
+                creature: who,
+                slider,
+                value,
+            },
+        );
         return true;
     }
-    if sim.gui_message(name, args) {
+    if sim.input(
+        thedas_sim::commands::CommandSource::Player,
+        thedas_sim::commands::SimCommand::GuiMessage {
+            name: name.to_string(),
+            args: args.to_vec(),
+        },
+    ) {
         // (Loading a tactics preset raises `EVENT_TYPE_TRAINING_TACTIC_PRESET_SELECTED` in
         // the simulation, where the preset is applied: `Sim::gui_message`'s LoadPreset.)
-        sim.tick(0);
+        sim.input(
+            thedas_sim::commands::CommandSource::App,
+            thedas_sim::commands::SimCommand::Tick { ms: 0 },
+        );
         return true;
     }
     false
@@ -433,11 +489,20 @@ pub fn handler_for(sim: Arc<Mutex<Sim>>, shown: Arc<Mutex<Presentation>>) -> Mes
         if name == SELECT_RESPONSE
             || name == thedas_sim::journal::MSG_HIDE_ALERT
             || name.starts_with(thedas_sim::tactics::PREFIX)
-            || !sim.gui_message(name, args)
+            || !sim.input(
+                thedas_sim::commands::CommandSource::Player,
+                thedas_sim::commands::SimCommand::GuiMessage {
+                    name: name.to_string(),
+                    args: args.to_vec(),
+                },
+            )
         {
             return None;
         }
-        sim.tick(0);
+        sim.input(
+            thedas_sim::commands::CommandSource::App,
+            thedas_sim::commands::SimCommand::Tick { ms: 0 },
+        );
         Some(
             crate::binding::sim_values_for(&sim, &p)
                 .into_iter()

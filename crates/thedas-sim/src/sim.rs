@@ -157,6 +157,9 @@ pub struct Sim {
     pub(crate) ambient: Vec<crate::dialog::AmbientTalk>,
     /// The install's voice banks, for the lengths of voiced lines.
     pub voices: crate::voice::Voices,
+    /// Every command given through [`Sim::apply`] since it was turned on (`Some`), for
+    /// journal-style saves to write out. Off (`None`) by default.
+    pub input_log: Option<Vec<crate::commands::InputEntry>>,
     pub(crate) plots: crate::plot::Plots,
     /// The talk tables' strings, read once (tests set them).
     pub(crate) strings: std::sync::OnceLock<std::collections::BTreeMap<u32, String>>,
@@ -591,6 +594,7 @@ impl Sim {
             dialog_ambient: false,
             ambient: Vec::new(),
             voices: crate::voice::Voices::new(),
+            input_log: None,
             install_root: None,
             area_layouts: HashMap::new(),
             nav_grids: HashMap::new(),
