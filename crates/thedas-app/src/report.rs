@@ -10,6 +10,10 @@
 //!   settings in force, where the game was (area, leader, party, conversation, cutscene,
 //!   screens), the layers the player has over the install (`mods`: the original's override
 //!   and add-in folders, the mod list), the frame times, and what the snapshots cover;
+//! - `journal_checkpoint.json` and `journal.jsonl`: the game's journal (see
+//!   [`crate::journal`]): its last checkpoint and every input since, which replays the game
+//!   up to the press exactly (`thedas-app --resume` with them as the data folder's
+//!   `journal/checkpoint.json` and `checkpoint.journal`);
 //! - `log.txt`: the last [`LOG_LINES`] log lines;
 //! - `trace.json`: the simulation's last [`TRACE_RECENT`] orders, script log lines,
 //!   conversation lines, plot flags, failed scripts and missing functions and resources
@@ -221,7 +225,13 @@ impl Recorder {
 
     /// Starts a report made now: everything but the screenshot and the note, which come
     /// later (`screenshot`, `note`). Writes what it has at once.
-    pub fn start(&mut self, now_save: Option<Vec<u8>>, trace: Option<J>, mut info: J) -> PathBuf {
+    pub fn start(
+        &mut self,
+        now_save: Option<Vec<u8>>,
+        trace: Option<J>,
+        journal: Option<(Vec<u8>, Vec<u8>)>,
+        mut info: J,
+    ) -> PathBuf {
         let now = Instant::now();
         let written = crate::saves::now_secs();
         let area = info["game"]["area"].as_str().unwrap_or("none").to_string();
@@ -277,6 +287,7 @@ impl Recorder {
             log: log_lines(),
             input,
             trace,
+            journal,
         };
         if let Err(e) = files.write() {
             log::warn!("report: writing {}: {e:#}", path.display());
@@ -528,6 +539,8 @@ struct Files {
     log: Vec<String>,
     input: Vec<String>,
     trace: Option<J>,
+    /// The journal's checkpoint and log.
+    journal: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl Files {
@@ -560,6 +573,10 @@ impl Files {
         put("input.txt", &input)?;
         if let Some(t) = &self.trace {
             put("trace.json", &serde_json::to_vec_pretty(t)?)?;
+        }
+        if let Some((checkpoint, log)) = &self.journal {
+            put("journal_checkpoint.json", checkpoint)?;
+            put("journal.jsonl", log)?;
         }
         Ok(())
     }
@@ -730,7 +747,7 @@ mod tests {
         keep_line("a line for the report".into());
         let info = json!({ "game": { "area": "lot100ar/Lothering" } });
         let trace = json!([{ "kind": "log", "t": 5, "channel": 0, "text": "hello" }]);
-        let path = r.start(Some(b"{\"now\":1}".to_vec()), Some(trace), info);
+        let path = r.start(Some(b"{\"now\":1}".to_vec()), Some(trace), None, info);
         assert!(r.busy());
         assert!(
             path.file_name()
@@ -773,7 +790,7 @@ mod tests {
         );
         // A second report the same minute gets a folder of its own; cancelling deletes it.
         let info = json!({ "game": { "area": "lot100ar/Lothering" } });
-        let second = r.start(None, None, info);
+        let second = r.start(None, None, None, info);
         assert_ne!(second, path);
         r.screenshot(Err(anyhow::anyhow!("no frame")));
         r.note(None);
@@ -801,7 +818,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("thedas-report-marks-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut r = Recorder::new(&dir);
-        let path = r.start(None, None, json!({ "game": { "area": "x" } }));
+        let path = r.start(None, None, None, json!({ "game": { "area": "x" } }));
         let shot = thedas_ui::Rgba {
             width: 64,
             height: 48,
