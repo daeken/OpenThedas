@@ -77,6 +77,17 @@ impl Sim {
         } else {
             facing
         };
+        // A place with no route to it (beyond the walkable area: a held stick aims there)
+        // is walked towards only as far as the ground is walkable, not in the straight line
+        // a move without a route otherwise takes. Provisional: DAOrigins.exe moves the
+        // player's character with its physics controller over the walkable mesh.
+        let to = match self.route_to(who, to) {
+            crate::nav::Routed::Straight => self
+                .nav_grid(area)
+                .and_then(|g| crate::nav::walkable_reach(&g, from, to))
+                .unwrap_or(to),
+            _ => to,
+        };
         let mut c = command(
             self,
             "COMMAND_TYPE_MOVE_TO_LOCATION",
