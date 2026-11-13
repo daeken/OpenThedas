@@ -10,7 +10,7 @@ repository.
 
 ## Status
 
-Last updated 2026-11-13 06:20 UTC, main 91d4812
+Last updated 2026-11-13 15:30 UTC, main 0426459
 
 For everything that is wrong or missing, in detail and split into items that can be picked up in
 parallel, see [docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md).
@@ -31,6 +31,9 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
     - the original's default speaker framing for unstaged lines;
     - cutscene and conversation actors posed and animated by their tracks, and conversation lines leaving creatures on their stage marks in the sim, as the exe does (Oskias sits; the Dalish hunters face the hero);
     - conversations start as the exe starts them: dialog game mode for the talk, and talk commands go through the dialogue event to the target's script. A first line that plays before its screen is up no longer stalls the conversation;
+    - cutscenes and conversation lines draw the depth of field and the fades their own tracks ask for, and every conversation gets the original's second depth of field from the game's tables;
+    - speaker and listener turn head and eyes to each other, and cutscene actors follow their head-tracking tracks;
+    - a cutscene animation's baked root motion moves the actor and stays after the clip (a character who turns stays turned), actors hold their base pose (seated characters sit), and cutscene props, actor visibility and weapon draws are played;
     - line cutscene cameras are placed with their cutscene's stage, and ActionJumpToCamera puts the camera on stage cameras: the City Elf Vaughan scene plays as staged shots.
   - Open:
     - cameras and actors linked with LinkToActor are placed (provisional: links use the target's root frame);
@@ -104,10 +107,12 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Not yet: voice-over positioning, and the master and secondary reverb chain. (The PlayMusic and StopMusic script calls do nothing in the original either, traced in #395.)
   - Sound is off with `--control` (unless `--audio`) and in headless captures.
 - 🟡 **Controller**: Xbox 360-style layout; menus and in-game screens use focus navigation, and A dismisses tutorial popups. The PC right-click radial menu doesn't exist as a movie in the game data, so LT opens a quickbar picker instead. In the inventory A equips and unequips and Y puts a usable item in the first free quickbar slot; on Tactics the pad reaches the Presets and Behaviour pickers; B in an open dropdown closes only the list.
-- ✅ **Saves**: F5/F9 quick save and load, save/load screens, typed names. Revision 7 fills older saves' empty containers.
+- ✅ **Saves**: F5/F9 quick save and load, save/load screens with a picture of the game for each save made in a window, typed names. Revision 7 fills older saves' empty containers.
+- 🟡 **Keyboard and mouse**: W, S, Q and E walk the leader relative to the camera and A and D turn the camera, as the game's key map binds them; click to move, hover names, and name and health floaties shown as the original shows them (hovered, targeted, or with Tab held). Selection rings are drawn under party members and fighting enemies (when an enemy shows its ring is provisional).
 - ✅ **Performance**: frustum culling, shadow caching and skinned-draw culling (Lothering about 8 ms, the chapel about 1.5 ms offscreen). Model node trees are read with a heap stack, so small worker-thread stacks are safe.
-- 🟡 **DLC and add-ins**: encrypted DLC archives are read (passwords recovered from the player's own GOG Ultimate Edition executable; nothing is shipped). Every enabled add-in's `core` folder is mounted, and its `module` folder only when its manifest extends the base campaign (provisional), so stand-alone campaigns cannot replace base-game files. DLC content itself does not appear yet: no bonus items at the start, no DLC map pins, nothing added in camp (`FMT-047`). Install paths are matched without regard to case, so the game runs from a case-sensitive file system.
+- 🟡 **DLC and add-ins**: encrypted DLC archives are read (passwords recovered from the player's own GOG Ultimate Edition executable; nothing is shipped). Every enabled add-in's `core` folder is mounted, and its `module` folder only when its manifest extends the base campaign (provisional), so stand-alone campaigns cannot replace base-game files. The add-ins' area-list scripts run as in the original, so a new game hands out the first DLC item; DLC map pins and camp additions do not appear yet (`FMT-047`). Install paths are matched without regard to case, so the game runs from a case-sensitive file system.
 - 🟡 **Issue reports**: F8, both sticks clicked or the menu's Report Issue entry saves a screenshot, the current save, a save from about a minute earlier, the log, recent input and settings to the user's data folder (`Documents\OpenThedas` on Windows), and can send it to the project's report server.
+- 🟡 **Mods**: an ordered list of mod layers sits above the whole resource stack (later entries win; nothing is extracted over the game's files), `.dazip` packages in the list are unpacked into a cache and join as add-ins, and the original's folders in the player's Documents are read in the original's places. `THEDAS_MODS=none` turns all of it off; `thedas mods <install>` lists the layers.
 - 🟡 **DA2**: scoping. Archives whose entries carry only name hashes (ERF V3.0) resolve by name; nothing of the game runs yet.
 
 ### Known blockers
