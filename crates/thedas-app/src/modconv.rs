@@ -432,6 +432,7 @@ pub fn describe(o: &CommandOutcome) -> String {
         CommandOutcome::ConversationQueued { dialog } => {
             format!("{dialog} starts when the open conversation ends")
         }
+        CommandOutcome::Done { ok } => if *ok { "done" } else { "did nothing" }.into(),
         CommandOutcome::Refused { reason } => format!("refused: {reason}"),
     }
 }
