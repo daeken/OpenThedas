@@ -119,6 +119,9 @@ pub struct Sim {
     /// Each area's doors and their doorways' grid cells (doors do not move; see
     /// `Sim::closed_doors`).
     pub(crate) door_cells: HashMap<ObjectId, Arc<Vec<crate::nav::Doorway>>>,
+    /// The last route's waypoints as far as the closed door that blocked it (see
+    /// `Sim::route_and_approach`).
+    pub(crate) route_approach: Vec<[f32; 3]>,
     /// The closed door that stopped the last `walk`, if one did.
     pub walk_blocked_by: Option<ObjectId>,
     pub(crate) nav_grids: HashMap<String, Option<Arc<thedas_formats::level::NavGrid>>>,
@@ -595,6 +598,7 @@ impl Sim {
             ability_anims: HashMap::new(),
             save_issues: Vec::new(),
             door_cells: HashMap::new(),
+            route_approach: Vec::new(),
             walk_blocked_by: None,
             talk: None,
             plots: crate::plot::Plots::default(),
@@ -1952,8 +1956,10 @@ impl Sim {
     /// is one (see `nav`), otherwise a straight line in half-metre steps. Stops early when a
     /// conversation starts, the area changes, the walker dies or (for the hero) a fight
     /// breaks out; returns whether it arrived. A destination in another area is a teleport.
-    /// A closed door in the way stops it before it sets out (the door is left in
-    /// `walk_blocked_by`; the player opens doors by using them).
+    /// A closed door in the way stops it at the door: it walks as far as the doorway, as a
+    /// player would, and the door is left in `walk_blocked_by` (the player opens doors by
+    /// using them). What lies before the door so happens: at Highever the hall beyond the
+    /// family's rooms holds the soldiers whose deaths unlock its far door.
     pub fn walk(&mut self, id: ObjectId, to: [f32; 3], area: Option<ObjectId>) -> bool {
         self.walk_blocked_by = None;
         let Some((from, here)) = self.world.get(id).map(|o| (o.position, o.area)) else {
@@ -1964,12 +1970,17 @@ impl Sim {
             self.tick(0);
             return true;
         }
-        let routed = match self.route_to(id, to) {
-            crate::nav::Routed::Path(p) => Some(p),
-            crate::nav::Routed::Straight => None,
-            crate::nav::Routed::Door(d) => {
-                self.walk_blocked_by = Some(d);
-                return false;
+        let mut door = None;
+        let routed = match self.route_and_approach(id, to) {
+            (crate::nav::Routed::Path(p), _) => Some(p),
+            (crate::nav::Routed::Straight, _) => None,
+            (crate::nav::Routed::Door(d), up_to) => {
+                door = Some(d);
+                if up_to.is_empty() {
+                    self.walk_blocked_by = door;
+                    return false;
+                }
+                Some(up_to)
             }
         };
         let points: Vec<[f32; 3]> = match routed {
@@ -2013,10 +2024,12 @@ impl Sim {
                 || (!talking && self.talk.as_ref().is_some_and(|c| !c.ended))
                 || (hero_at_peace && self.world.game_mode == combat);
             if stopped {
-                return i + 1 == n;
+                return door.is_none() && i + 1 == n;
             }
         }
-        true
+        // At the door: it is still in the way if it is still shut.
+        self.walk_blocked_by = door;
+        door.is_none()
     }
 
     /// Keeps the hero's followers with it as [`Sim::walk`] steps it along: each living
@@ -2245,7 +2258,23 @@ impl Sim {
     /// through one, the result is that door (the original fails such a move with
     /// `COMMAND_FAILED_PATH_ACTION_REQUIRED`, and the AI opens the door and tries again).
     pub(crate) fn route_to(&mut self, id: ObjectId, to: [f32; 3]) -> crate::nav::Routed {
+        self.route_and_approach(id, to).0
+    }
+
+    /// [`Sim::route_to`], and with a closed door in the way the route as far as that door
+    /// (the waypoints before its doorway; empty otherwise).
+    pub(crate) fn route_and_approach(
+        &mut self,
+        id: ObjectId,
+        to: [f32; 3],
+    ) -> (crate::nav::Routed, Vec<[f32; 3]>) {
+        let routed = self.route_inner(id, to);
+        (routed, std::mem::take(&mut self.route_approach))
+    }
+
+    fn route_inner(&mut self, id: ObjectId, to: [f32; 3]) -> crate::nav::Routed {
         use crate::nav::Routed;
+        self.route_approach.clear();
         let Some((from, Some(area))) = self.world.get(id).map(|o| (o.position, o.area)) else {
             return Routed::Straight;
         };
@@ -2301,6 +2330,7 @@ impl Sim {
                         }
                         return Routed::Path(up_to);
                     }
+                    self.route_approach = p[..n].to_vec();
                     return Routed::Door(*door);
                 }
             }
