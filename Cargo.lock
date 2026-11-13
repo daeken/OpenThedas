@@ -4001,6 +4001,7 @@ dependencies = [
  "pollster",
  "serde",
  "serde_json",
+ "sha2",
  "thedas-audio",
  "thedas-formats",
  "thedas-render",
