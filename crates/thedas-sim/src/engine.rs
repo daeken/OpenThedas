@@ -3084,6 +3084,13 @@ pub fn call(
         "IsStringEmpty" => ok(b(string(a, 0).is_empty())),
         "GetLowResTimer" => ok(Value::Int(h.sim.world.time_ms as i32)),
         "DEBUG_PrintToScreen" | "DisplayStatusMessage" => {
+            if name == "DisplayStatusMessage" {
+                // For the interface's status lines (kept short when nothing takes them).
+                if h.sim.world.status_messages.len() >= 64 {
+                    h.sim.world.status_messages.remove(0);
+                }
+                h.sim.world.status_messages.push((string(a, 0), int(a, 1)));
+            }
             h.sim.world.trace.push(TraceEntry::Log {
                 t,
                 channel: -2,
