@@ -438,6 +438,9 @@ pub struct RenderCache {
     pub(crate) programs: HashMap<String, Option<std::sync::Arc<crate::d3d::D3dProgram>>>,
     /// The shadow partitions every renderer made with this cache draws into and reads.
     pub(crate) shadows: Option<std::sync::Arc<crate::d3d_gpu::ShadowTargets>>,
+    /// What the objects' scenes built over these resources share (see
+    /// [`AreaScene::load_objects_cached`]).
+    pub scenes: crate::scene::SceneCache,
 }
 
 #[derive(Clone, Copy)]

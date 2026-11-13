@@ -758,6 +758,32 @@ const SKIN_ENTRIES: [usize; 2] = [8, 9];
 /// times entry 0's `w`.
 const SKIN_OPACITY_ENTRIES: [usize; 2] = [0, 1];
 
+/// What an area's objects' scenes share from one rebuild to the next (see
+/// [`AreaScene::load_objects_cached`]).
+#[derive(Default)]
+pub struct SceneCache {
+    level: Option<LevelFrame>,
+    parsed: Parsed,
+}
+
+/// An objects' scene as it stands once its level's part is read, before any object.
+struct LevelFrame {
+    level: String,
+    detail: Detail,
+    rooms: Arc<Vec<ArlRoom>>,
+    scene: AreaScene,
+}
+
+/// Resources as parsed, by name (`None`: did not load).
+#[derive(Default)]
+struct Parsed {
+    mmh: HashMap<String, Option<Arc<Mmh>>>,
+    msh: HashMap<String, Option<Arc<Msh>>>,
+    mat_defs: HashMap<String, Option<Arc<MaterialDef>>>,
+    morphs: HashMap<String, Option<Arc<Morph>>>,
+    tints: HashMap<String, Option<Arc<Tint>>>,
+}
+
 struct Loader<'a> {
     vfs: &'a Vfs,
     scene: AreaScene,
@@ -2808,14 +2834,14 @@ impl AreaScene {
         level: &str,
         props: &[Prop],
     ) -> Result<AreaScene, SceneError> {
-        Self::load_parts(vfs, level, props, true, Detail::default())
+        Self::load_parts(vfs, level, props, true, Detail::default(), None)
     }
 
     /// The objects alone in a level: `props` lit by the level's lights and probes, without
     /// the level's own meshes, for drawing over a scene of the level drawn once (see
     /// `AreaRenderer::render_over`): objects that come and go then rebuild only themselves.
     pub fn load_objects(vfs: &Vfs, level: &str, props: &[Prop]) -> Result<AreaScene, SceneError> {
-        Self::load_parts(vfs, level, props, false, Detail::default())
+        Self::load_parts(vfs, level, props, false, Detail::default(), None)
     }
 
     /// [`AreaScene::load_with_props`] at a graphics detail level.
@@ -2825,7 +2851,7 @@ impl AreaScene {
         props: &[Prop],
         detail: Detail,
     ) -> Result<AreaScene, SceneError> {
-        Self::load_parts(vfs, level, props, true, detail)
+        Self::load_parts(vfs, level, props, true, detail, None)
     }
 
     /// [`AreaScene::load_objects`] at a graphics detail level.
@@ -2835,7 +2861,21 @@ impl AreaScene {
         props: &[Prop],
         detail: Detail,
     ) -> Result<AreaScene, SceneError> {
-        Self::load_parts(vfs, level, props, false, detail)
+        Self::load_parts(vfs, level, props, false, detail, None)
+    }
+
+    /// [`AreaScene::load_objects_at`], keeping in `cache` what an area's objects' scenes
+    /// share from one rebuild to the next: the level's part (its lights, probes and rooms,
+    /// which take reading every room's layout and models) and the models, materials, morphs
+    /// and tints read. The cache is for one resource stack: make a new one when it changes.
+    pub fn load_objects_cached(
+        vfs: &Vfs,
+        level: &str,
+        props: &[Prop],
+        detail: Detail,
+        cache: &mut SceneCache,
+    ) -> Result<AreaScene, SceneError> {
+        Self::load_parts(vfs, level, props, false, detail, Some(cache))
     }
 
     /// Only the props' visual effects ([`Prop::effects`]): the props' models are read for
@@ -2887,7 +2927,18 @@ impl AreaScene {
         props: &[Prop],
         level_meshes: bool,
         detail: Detail,
+        mut cache: Option<&mut SceneCache>,
     ) -> Result<AreaScene, SceneError> {
+        // What the cache holds is this level's, at this detail.
+        if let Some(c) = cache.as_deref_mut()
+            && c.level
+                .as_ref()
+                .is_some_and(|f| f.level != level || f.detail != detail)
+        {
+            *c = SceneCache::default();
+        }
+        let kept = cache.as_deref_mut().map(|c| std::mem::take(&mut c.parsed));
+        let kept = kept.unwrap_or_default();
         let mut l = Loader {
             vfs,
             scene: AreaScene {
@@ -2895,211 +2946,232 @@ impl AreaScene {
                 detail,
                 ..Default::default()
             },
-            mmh: HashMap::new(),
-            msh: HashMap::new(),
+            mmh: kept.mmh,
+            msh: kept.msh,
             mesh_index: HashMap::new(),
-            mat_defs: HashMap::new(),
+            mat_defs: kept.mat_defs,
             material_index: HashMap::new(),
-            morphs: HashMap::new(),
-            tints: HashMap::new(),
+            morphs: kept.morphs,
+            tints: kept.tints,
             skeleton_index: HashMap::new(),
         };
-        let arl_name = format!("{level}.arl");
-        let arl = Arl::parse(&l.read(&arl_name)?).map_err(|e| SceneError::Parse {
-            name: arl_name.clone(),
-            message: e.to_string(),
-        })?;
-        l.scene.name = arl.name.clone();
-        l.scene.effects = arl.effects.clone();
-        l.scene.atmosphere = arl.atmosphere;
-        l.scene.clouds = arl.clouds;
-        l.scene.sunlight_direction = arl.sunlight_direction.map(Vec3::from_array);
-        l.scene.cutaway_height = Some(arl.cutaway_height);
-        // The level's wind file, `<level>_<n>.wnd` (one per level).
-        let prefix = format!("{}_", level.to_ascii_lowercase());
-        let wnd = vfs
-            .names()
-            .into_iter()
-            .find(|n| n.starts_with(&prefix) && n.ends_with(".wnd"));
-        if let Some(name) = wnd {
-            match l.read(&name).map(|d| thedas_formats::level::Wnd::parse(&d)) {
-                Ok(Ok(w)) => l.scene.wind = Some((w.strength, w.direction)),
-                Ok(Err(e)) => l.warn(format!("{name}: {e}")),
-                Err(e) => l.warn(e.to_string()),
-            }
-        }
-        // Characters (the objects' scene) take the sun's character colour.
-        l.scene.sun = arl.sun.map(|s| {
-            let color = if level_meshes {
-                s.color
-            } else {
-                s.character_color
-            };
-            (Vec3::from_array(s.direction), Vec3::from_array(color))
-        });
-        l.scene.bounds = arl
-            .bounds()
-            .map(|(lo, hi)| (Vec3::from_array(lo), Vec3::from_array(hi)));
-        l.load_probes(level);
-        l.scene.room_boxes = arl
-            .rooms
-            .iter()
-            .map(|r| {
-                (
-                    r.id,
-                    Vec3::from_array(r.bounds_min),
-                    Vec3::from_array(r.bounds_max),
-                )
-            })
-            .collect();
-        // SpeedTree placements (rooms' and the level's): tree, world placement, scale.
-        let mut tree_spots: Vec<(usize, Mat4, f32, [f32; 4])> = Vec::new();
-        for room in &arl.rooms {
-            l.scene.rooms.push(room.name.clone());
-            let room_probe = l.room_probe(level, &room.name);
-            // Exterior (terrain) levels keep each sector's layout per level of detail:
-            // `<room>_0.rml` is the most detailed.
-            let mut rml_name = format!("{}.rml", room.name);
-            if l.vfs.lookup(&rml_name).is_none() {
-                let lod0 = format!("{}_0.rml", room.name);
-                if l.vfs.lookup(&lod0).is_some() {
-                    rml_name = lod0;
+        // The level's part of an objects' scene (its lights, probes and rooms) is the same
+        // from one rebuild to the next.
+        let frame = cache
+            .as_deref()
+            .and_then(|c| c.level.as_ref())
+            .filter(|_| !level_meshes);
+        let rooms: Arc<Vec<ArlRoom>>;
+        if let Some(f) = frame {
+            l.scene = f.scene.clone();
+            rooms = f.rooms.clone();
+        } else {
+            let arl_name = format!("{level}.arl");
+            let arl = Arl::parse(&l.read(&arl_name)?).map_err(|e| SceneError::Parse {
+                name: arl_name.clone(),
+                message: e.to_string(),
+            })?;
+            l.scene.name = arl.name.clone();
+            l.scene.effects = arl.effects.clone();
+            l.scene.atmosphere = arl.atmosphere;
+            l.scene.clouds = arl.clouds;
+            l.scene.sunlight_direction = arl.sunlight_direction.map(Vec3::from_array);
+            l.scene.cutaway_height = Some(arl.cutaway_height);
+            // The level's wind file, `<level>_<n>.wnd` (one per level).
+            let prefix = format!("{}_", level.to_ascii_lowercase());
+            let wnd = vfs
+                .names()
+                .into_iter()
+                .find(|n| n.starts_with(&prefix) && n.ends_with(".wnd"));
+            if let Some(name) = wnd {
+                match l.read(&name).map(|d| thedas_formats::level::Wnd::parse(&d)) {
+                    Ok(Ok(w)) => l.scene.wind = Some((w.strength, w.direction)),
+                    Ok(Err(e)) => l.warn(format!("{name}: {e}")),
+                    Err(e) => l.warn(e.to_string()),
                 }
             }
-            let rml = match l.read(&rml_name).map(|d| Rml::parse(&d)) {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    l.warn(format!("{rml_name}: {e}"));
-                    continue;
+            // Characters (the objects' scene) take the sun's character colour.
+            l.scene.sun = arl.sun.map(|s| {
+                let color = if level_meshes {
+                    s.color
+                } else {
+                    s.character_color
+                };
+                (Vec3::from_array(s.direction), Vec3::from_array(color))
+            });
+            l.scene.bounds = arl
+                .bounds()
+                .map(|(lo, hi)| (Vec3::from_array(lo), Vec3::from_array(hi)));
+            l.load_probes(level);
+            l.scene.room_boxes = arl
+                .rooms
+                .iter()
+                .map(|r| {
+                    (
+                        r.id,
+                        Vec3::from_array(r.bounds_min),
+                        Vec3::from_array(r.bounds_max),
+                    )
+                })
+                .collect();
+            // SpeedTree placements (rooms' and the level's): tree, world placement, scale.
+            let mut tree_spots: Vec<(usize, Mat4, f32, [f32; 4])> = Vec::new();
+            for room in &arl.rooms {
+                l.scene.rooms.push(room.name.clone());
+                let room_probe = l.room_probe(level, &room.name);
+                // Exterior (terrain) levels keep each sector's layout per level of detail:
+                // `<room>_0.rml` is the most detailed.
+                let mut rml_name = format!("{}.rml", room.name);
+                if l.vfs.lookup(&rml_name).is_none() {
+                    let lod0 = format!("{}_0.rml", room.name);
+                    if l.vfs.lookup(&lod0).is_some() {
+                        rml_name = lod0;
+                    }
                 }
-                Err(e) => {
-                    l.warn(e.to_string());
-                    continue;
+                let rml = match l.read(&rml_name).map(|d| Rml::parse(&d)) {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => {
+                        l.warn(format!("{rml_name}: {e}"));
+                        continue;
+                    }
+                    Err(e) => {
+                        l.warn(e.to_string());
+                        continue;
+                    }
+                };
+                l.scene.light_rooms.insert(room.id, rml.light_rooms.clone());
+                let room_m = transform_matrix(&rml.transform);
+                tree_spots.extend(rml.trees.iter().map(|t| {
+                    (
+                        t.tree,
+                        room_m * transform_matrix(&t.transform),
+                        t.scale,
+                        t.color,
+                    )
+                }));
+                for p in &rml.placements {
+                    let placement = room_m
+                        * transform_matrix(&p.transform)
+                        * Mat4::from_scale(Vec3::splat(p.scale));
+                    let sphere = p.sphere.map(|(c, r)| (Vec3::from_array(c), r));
+                    l.place(
+                        &p.model,
+                        placement,
+                        Placing {
+                            scale: p.scale,
+                            sphere,
+                            lightmaps: &p.lightmaps,
+                            room: &room.name,
+                            room_id: Some(room.id),
+                            layout_room: Some(room.id),
+                            probe: room_probe,
+                            morph: None,
+                            tint: None,
+                            lights_only: !level_meshes,
+                            user_params: &p.user_params,
+                            skin: None,
+                        },
+                    );
                 }
-            };
-            l.scene.light_rooms.insert(room.id, rml.light_rooms.clone());
-            let room_m = transform_matrix(&rml.transform);
-            tree_spots.extend(rml.trees.iter().map(|t| {
-                (
-                    t.tree,
-                    room_m * transform_matrix(&t.transform),
-                    t.scale,
-                    t.color,
-                )
-            }));
-            for p in &rml.placements {
-                let placement = room_m
-                    * transform_matrix(&p.transform)
-                    * Mat4::from_scale(Vec3::splat(p.scale));
-                let sphere = p.sphere.map(|(c, r)| (Vec3::from_array(c), r));
+            }
+            // The level's own layout (`<level>.rml`, beside the rooms' in the level archive):
+            // what stands outside the rooms, such as water (`oth000d_water_1442`), the horizon
+            // (`vst_frostbacks01_1`, `hro_fie_bkcitye`), tree lines, Ostagar's tents and its
+            // SpeedTrees. It names no room id; its models belong to no room.
+            let level_rml = format!("{level}.rml");
+            if l.vfs.lookup(&level_rml).is_some() {
+                match l.read(&level_rml).map(|d| Rml::parse(&d)) {
+                    Ok(Ok(rml)) => {
+                        let probe = l.room_probe(level, "");
+                        let level_m = transform_matrix(&rml.transform);
+                        tree_spots.extend(rml.trees.iter().map(|t| {
+                            (
+                                t.tree,
+                                level_m * transform_matrix(&t.transform),
+                                t.scale,
+                                t.color,
+                            )
+                        }));
+                        for p in &rml.placements {
+                            let placement = level_m
+                                * transform_matrix(&p.transform)
+                                * Mat4::from_scale(Vec3::splat(p.scale));
+                            let sphere = p.sphere.map(|(c, r)| (Vec3::from_array(c), r));
+                            l.place(
+                                &p.model,
+                                placement,
+                                Placing {
+                                    scale: p.scale,
+                                    sphere,
+                                    lightmaps: &p.lightmaps,
+                                    room: "",
+                                    room_id: None,
+                                    layout_room: None,
+                                    probe,
+                                    morph: None,
+                                    tint: None,
+                                    lights_only: !level_meshes,
+                                    user_params: &p.user_params,
+                                    skin: None,
+                                },
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => l.warn(format!("{level_rml}: {e}")),
+                    Err(e) => l.warn(e.to_string()),
+                }
+            }
+            if level_meshes && !tree_spots.is_empty() {
+                l.place_tree_billboards(level, &arl.trees, &tree_spots);
+            }
+            // The sky, around the camera (its vertex shader centres it there): its dome and its
+            // cloud layer.
+            if level_meshes && let Some(sky) = arl.sky_model.as_deref() {
+                let first = l.scene.draws.len();
                 l.place(
-                    &p.model,
-                    placement,
+                    &sky.to_ascii_lowercase(),
+                    Mat4::IDENTITY,
                     Placing {
-                        scale: p.scale,
-                        sphere,
-                        lightmaps: &p.lightmaps,
-                        room: &room.name,
-                        room_id: Some(room.id),
-                        layout_room: Some(room.id),
-                        probe: room_probe,
+                        scale: 1.0,
+                        sphere: None,
+                        lightmaps: &[],
+                        room: "",
+                        room_id: None,
+                        layout_room: None,
+                        probe: None,
                         morph: None,
                         tint: None,
-                        lights_only: !level_meshes,
-                        user_params: &p.user_params,
+                        lights_only: false,
+                        user_params: &[],
                         skin: None,
                     },
                 );
+                let materials = &l.scene.materials;
+                let mut i = 0;
+                l.scene.draws.retain(|d| {
+                    let keep = i < first || {
+                        let sem = &materials[d.material].semantic;
+                        sem.eq_ignore_ascii_case("Sky") || sem.eq_ignore_ascii_case("Clouds")
+                    };
+                    i += 1;
+                    keep
+                });
+            }
+            l.scene.static_draws = l.scene.draws.len();
+            rooms = Arc::new(arl.rooms.clone());
+            if !level_meshes && let Some(c) = cache.as_deref_mut() {
+                c.level = Some(LevelFrame {
+                    level: level.to_string(),
+                    detail,
+                    rooms: rooms.clone(),
+                    scene: l.scene.clone(),
+                });
             }
         }
-        // The level's own layout (`<level>.rml`, beside the rooms' in the level archive):
-        // what stands outside the rooms, such as water (`oth000d_water_1442`), the horizon
-        // (`vst_frostbacks01_1`, `hro_fie_bkcitye`), tree lines, Ostagar's tents and its
-        // SpeedTrees. It names no room id; its models belong to no room.
-        let level_rml = format!("{level}.rml");
-        if l.vfs.lookup(&level_rml).is_some() {
-            match l.read(&level_rml).map(|d| Rml::parse(&d)) {
-                Ok(Ok(rml)) => {
-                    let probe = l.room_probe(level, "");
-                    let level_m = transform_matrix(&rml.transform);
-                    tree_spots.extend(rml.trees.iter().map(|t| {
-                        (
-                            t.tree,
-                            level_m * transform_matrix(&t.transform),
-                            t.scale,
-                            t.color,
-                        )
-                    }));
-                    for p in &rml.placements {
-                        let placement = level_m
-                            * transform_matrix(&p.transform)
-                            * Mat4::from_scale(Vec3::splat(p.scale));
-                        let sphere = p.sphere.map(|(c, r)| (Vec3::from_array(c), r));
-                        l.place(
-                            &p.model,
-                            placement,
-                            Placing {
-                                scale: p.scale,
-                                sphere,
-                                lightmaps: &p.lightmaps,
-                                room: "",
-                                room_id: None,
-                                layout_room: None,
-                                probe,
-                                morph: None,
-                                tint: None,
-                                lights_only: !level_meshes,
-                                user_params: &p.user_params,
-                                skin: None,
-                            },
-                        );
-                    }
-                }
-                Ok(Err(e)) => l.warn(format!("{level_rml}: {e}")),
-                Err(e) => l.warn(e.to_string()),
-            }
-        }
-        if level_meshes && !tree_spots.is_empty() {
-            l.place_tree_billboards(level, &arl.trees, &tree_spots);
-        }
-        // The sky, around the camera (its vertex shader centres it there): its dome and its
-        // cloud layer.
-        if level_meshes && let Some(sky) = arl.sky_model.as_deref() {
-            let first = l.scene.draws.len();
-            l.place(
-                &sky.to_ascii_lowercase(),
-                Mat4::IDENTITY,
-                Placing {
-                    scale: 1.0,
-                    sphere: None,
-                    lightmaps: &[],
-                    room: "",
-                    room_id: None,
-                    layout_room: None,
-                    probe: None,
-                    morph: None,
-                    tint: None,
-                    lights_only: false,
-                    user_params: &[],
-                    skin: None,
-                },
-            );
-            let materials = &l.scene.materials;
-            let mut i = 0;
-            l.scene.draws.retain(|d| {
-                let keep = i < first || {
-                    let sem = &materials[d.material].semantic;
-                    sem.eq_ignore_ascii_case("Sky") || sem.eq_ignore_ascii_case("Clouds")
-                };
-                i += 1;
-                keep
-            });
-        }
-        l.scene.static_draws = l.scene.draws.len();
         for prop in props {
             let first = l.scene.draws.len();
             let at = prop.transform.w_axis.truncate();
-            let in_room = room_at(&arl.rooms, at);
+            let in_room = room_at(&rooms, at);
             let probe = match in_room {
                 Some(room) => l.room_probe(level, &room.name),
                 None => l.room_probe(level, ""),
@@ -3229,6 +3301,15 @@ impl AreaScene {
             });
         }
         l.assign_probes();
+        if let Some(c) = cache {
+            c.parsed = Parsed {
+                mmh: l.mmh,
+                msh: l.msh,
+                mat_defs: l.mat_defs,
+                morphs: l.morphs,
+                tints: l.tints,
+            };
+        }
         Ok(l.scene)
     }
 }

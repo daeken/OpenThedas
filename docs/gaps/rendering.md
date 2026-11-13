@@ -61,7 +61,7 @@ Each item: original / ours / evidence / size / dependencies. Sizes: S < 1 day, M
 34. **Level-layout doors and placeables** (not sim objects) never pose. Size S.
 
 ### Performance
-35. **Frame time** ~12 ms headless in the Wilds (09_wilds_vials spot, yaw 270, 1024x768) after the billboard batch and tree instancing. Left: per-pass GPU timestamps, instancing for repeated props, culling by room/Umbra, and fewer per-frame constant copies (RND-153). Size M.
+35. **Frame time** ~12 ms headless in the Wilds (09_wilds_vials spot, yaw 270, 1024x768) after the billboard batch and tree instancing. Left: per-pass GPU timestamps, instancing for repeated props, culling by room/Umbra, and fewer per-frame constant copies (RND-153). An object coming, going or changing what it wears or holds rebuilds the objects' scene on the frame it happens (about 60 ms with 154 objects in the Wilds, with the level's part and the parsed models kept between rebuilds); it is not incremental and not off the frame. Size M.
 36. **Area preloading** (requested by the maintainer). The model loader is now stack-safe for worker threads (#289). Size L.
 
 ### Interface overlap (rendering side of UI)
