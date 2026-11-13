@@ -235,6 +235,10 @@ pub fn route_avoiding(
 /// `StateCnt_AreaTransition`, ...). The column's name is not known.
 const COL_STATE_CONTROLLER: u32 = 0x9a32_0a51;
 
+/// `placeable_types.gda`: a placeable appearance's animation set (`PRB_door.anb`), empty
+/// for one that never moves. The column's name is not known.
+const COL_ANIMATION_SET: u32 = 0x70f4_63fa;
+
 /// How far a closed door's doorway reaches from the door, in metres. Provisional: the gaps
 /// the pathing grid leaves in walls where doors stand are about 2.5 m wide.
 pub const DOORWAY_RADIUS: f32 = 1.25;
@@ -249,11 +253,15 @@ const LEAF_REACH: f32 = 6.0;
 /// from it than the radius: the Dalish ruins' mirror room door (`bed110ip_mirror_door`, a
 /// 2.7 m leaf) left the far half of its doorway open, and a walker went through the shut
 /// door without using it (using it is what wakes the bereskarn). A cell is under the leaf
-/// when one of its edges crosses it, 0.5 or 1.5 m above the floor.
+/// when one of its edges crosses it, 0.5 or 1.5 m above the floor. A door that never moves
+/// (`swings` false: a gate model without an animation set, such as Ostagar's open Tower
+/// gate, `Gate, Large, Open`) takes only the cells under its model, not the radius: the
+/// way between its open leaves stays free.
 pub(crate) fn doorway_cells(
     g: &NavGrid,
     door: [f32; 3],
     leaf: Option<&crate::collision::Collision>,
+    swings: bool,
 ) -> Vec<usize> {
     let Some((cx, cy)) = g.cell(door) else {
         return Vec::new();
@@ -277,7 +285,8 @@ pub(crate) fn doorway_cells(
                 continue;
             }
             let m = g.center(c);
-            let near = crate::engine::dist(m, [door[0], door[1], m[2]]) <= DOORWAY_RADIUS;
+            let near = (swings || leaf.is_none())
+                && crate::engine::dist(m, [door[0], door[1], m[2]]) <= DOORWAY_RADIUS;
             let under = || {
                 leaf.is_some_and(|l| {
                     let z = height(g, c);
@@ -474,7 +483,16 @@ impl Sim {
                 .filter(|m| !m.is_empty())
                 .map(|m| crate::collision::load_placeables(&self.vfs, &[(m, o.position, o.facing)]))
                 .filter(|c| !c.is_empty());
-            out.push((o.id, doorway_cells(&g, o.position, leaf.as_ref())));
+            // A door without an animation set never opens or shuts: what blocks is its
+            // model as it stands. Provisional: how DAOrigins.exe keeps walkers out of a
+            // door's way is not traced (its collision is a PhysX shape, see SIM-013).
+            let swings = types.as_ref().is_none_or(|t| {
+                matches!(
+                    t.cell_by_hash(COL_ANIMATION_SET, o.appearance as i64),
+                    Some(thedas_formats::gda::Cell::String(a)) if !crate::engine::clean(a).is_empty()
+                )
+            });
+            out.push((o.id, doorway_cells(&g, o.position, leaf.as_ref(), swings)));
         }
         out
     }
@@ -1168,7 +1186,7 @@ mod tests {
         let door = [5.25, 4.75, 0.0];
         let gap: Vec<usize> = (4..10).map(|y| (y * w + 10) as usize).collect();
         // By the radius alone the far half of the gap is left open (rows 4 to 6).
-        let by_radius = doorway_cells(&g, door, None);
+        let by_radius = doorway_cells(&g, door, None, true);
         assert!(gap[3..].iter().all(|c| by_radius.contains(c)));
         assert!(gap[..3].iter().all(|c| !by_radius.contains(c)));
         // With the leaf (a wall 2.7 m wide and 3.9 m tall from the hinge) all of it shuts.
@@ -1177,7 +1195,7 @@ mod tests {
             [[5.25, bottom, 0.0], [5.25, top, 0.0], [5.25, top, 3.9]],
             [[5.25, bottom, 0.0], [5.25, top, 3.9], [5.25, bottom, 3.9]],
         ]);
-        let with_leaf = doorway_cells(&g, door, Some(&leaf));
+        let with_leaf = doorway_cells(&g, door, Some(&leaf), true);
         assert!(gap.iter().all(|c| with_leaf.contains(c)), "{with_leaf:?}");
         // Nothing beyond the wall's line is taken that the radius did not take.
         assert!(
@@ -1186,6 +1204,47 @@ mod tests {
                 .all(|c| by_radius.contains(c) || (c % w as usize) == 10),
             "{with_leaf:?}"
         );
+    }
+
+    #[test]
+    fn a_gate_that_never_moves_blocks_only_where_its_model_stands() {
+        // Ostagar's Tower gate on the night of the battle is the open gate model (no
+        // animation set), standing in a 7 m gap with its two leaves swung back along the
+        // gap's sides: the way between them was taken as shut, and the party went round
+        // through the fighting.
+        let (w, h) = (20u32, 30u32);
+        let mut data = vec![1u8; (w * h) as usize];
+        for y in (0..h).filter(|y| !(8..22).contains(y)) {
+            data[(y * w + 10) as usize] = 10;
+        }
+        let g = NavGrid {
+            columns: w,
+            rows: h,
+            cell_size: 0.5,
+            clearance: 2.0,
+            base: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            data,
+            heights: vec![0.0; (w * h) as usize],
+            surfaces: Vec::new(),
+        };
+        let gate = [5.25, 7.5, 0.0];
+        // Two leaves 1.75 m long, swung back east from the gap's ends (y 4.25 and 10.75).
+        let wall = |y: f32| {
+            [
+                [[5.5, y, 0.0], [7.25, y, 0.0], [7.25, y, 3.9]],
+                [[5.5, y, 0.0], [7.25, y, 3.9], [5.5, y, 3.9]],
+            ]
+        };
+        let tris: Vec<[[f32; 3]; 3]> = wall(4.25).into_iter().chain(wall(10.75)).collect();
+        let leaves = crate::collision::Collision::from_triangles(&tris);
+        let middle = (gate[1] / 0.5) as u32 * w + 10;
+        let fixed = doorway_cells(&g, gate, Some(&leaves), false);
+        assert!(!fixed.contains(&(middle as usize)), "{fixed:?}");
+        assert!(!fixed.is_empty(), "the leaves' own cells are taken");
+        // A door that swings shuts its middle whatever its model at rest.
+        let swinging = doorway_cells(&g, gate, Some(&leaves), true);
+        assert!(swinging.contains(&(middle as usize)));
     }
 
     /// The grid of [`grid`] with a closed door in the wall's gap, and a walker.
