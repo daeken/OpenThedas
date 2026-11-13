@@ -15,6 +15,7 @@
 //! mask at runtime (opened, destroyed) is not traced; triangles are two-sided (whether the
 //! exe's mesh raycast culls back faces is not traced).
 
+use crate::fmath::DetMath;
 use std::sync::Arc;
 
 use thedas_formats::Rml;
@@ -931,7 +932,7 @@ pub fn load_placeables(global: &Vfs, placed: &[(String, V, f32)]) -> Collision {
         let half = facing.to_radians() * 0.5;
         let at = Xf {
             t: *position,
-            q: [0.0, 0.0, half.sin(), half.cos()],
+            q: [0.0, 0.0, half.dsin(), half.dcos()],
             s: 1.0,
         };
         add_model(&phy, mmh.as_deref(), &at, Some(index as u32), &mut prims);
