@@ -144,6 +144,16 @@ pub struct LiveEffects {
     renderer: AreaRenderer,
 }
 
+/// The selection rings under creatures, as a scene of their own drawn after the level and
+/// before the creatures (see [`crate::rings`]).
+pub struct LiveRings {
+    /// Each ring's creature and model.
+    key: Vec<(ObjectId, String)>,
+    layout: String,
+    scene: AreaScene,
+    renderer: AreaRenderer,
+}
+
 pub struct Live {
     /// Shared with the interface, whose movies act on it as they send messages.
     pub sim: Arc<Mutex<Sim>>,
@@ -155,6 +165,9 @@ pub struct Live {
     pub level: Option<LiveLevel>,
     pub objects: Option<LiveObjects>,
     effects: Option<LiveEffects>,
+    rings: Option<LiveRings>,
+    /// The creature the mouse was last found over ([`Live::hovered_creature`]).
+    hovered: Option<ObjectId>,
     /// When each lasting effect was first seen on its object (world milliseconds): the
     /// simulation does not keep when it was applied.
     effects_seen: std::collections::HashMap<(ObjectId, String), u64>,
@@ -537,6 +550,8 @@ impl Live {
             effects: None,
             effects_seen: Default::default(),
             effects_layout: None,
+            rings: None,
+            hovered: None,
             effects_animator: Animator::default(),
             animator: Animator::default(),
             camera_fade: Default::default(),
@@ -1628,7 +1643,107 @@ impl Live {
             .zip(posed)
             .map(|(m, (t, c))| (m.id, t, c))
             .collect();
-        self.show_effects(ctx, format, &layout, &models)
+        self.show_effects(ctx, format, &layout, &models)?;
+        self.show_rings(ctx, format, &layout, &models)
+    }
+
+    /// Shows the selection rings of the creatures drawn (see [`crate::rings`]): a scene of
+    /// the rings' models, rebuilt when a ring comes, goes or changes, each moved under its
+    /// creature every time.
+    fn show_rings(
+        &mut self,
+        ctx: &GpuContext,
+        format: wgpu::TextureFormat,
+        layout: &str,
+        models: &[ObjectModel],
+    ) -> Result<()> {
+        let hovered = self.hovered;
+        let wanted: Vec<(ObjectId, String)> = {
+            let sim = self.sim();
+            models
+                .iter()
+                .filter_map(|m| {
+                    let o = sim.world.get(m.id)?;
+                    let row = crate::rings::row(&sim, o, hovered)?;
+                    let model = crate::rings::model(&sim, row, sim.body_radius(m.id))?;
+                    Some((m.id, model))
+                })
+                .collect()
+        };
+        if wanted.is_empty() {
+            self.rings = None;
+            return Ok(());
+        }
+        let current = self
+            .rings
+            .as_ref()
+            .is_some_and(|r| r.key == wanted && r.layout == layout);
+        if !current {
+            let started = std::time::Instant::now();
+            let ring_models: Vec<ObjectModel> = wanted
+                .iter()
+                .enumerate()
+                .map(|(i, (id, model))| ObjectModel {
+                    id: crate::rings::RING_IDS + i as ObjectId,
+                    tag: format!("ring of {id}"),
+                    kind: thedas_sim::world::ObjectKind::Placeable,
+                    models: vec![model.clone()],
+                    attached: Vec::new(),
+                    tints: Vec::new(),
+                    morph: None,
+                    hide_hair: false,
+                    effects: Vec::new(),
+                    motion: None,
+                    position: [0.0; 3],
+                    facing: 0.0,
+                })
+                .collect();
+            let vfs = self
+                .level
+                .as_ref()
+                .map(|l| l.vfs.clone())
+                .context("rings before their level")?;
+            let spec = self.spec(format);
+            let props: Vec<Prop> = ring_models.iter().map(prop).collect();
+            let scene = AreaScene::load_objects_cached(
+                &vfs,
+                layout,
+                &props,
+                spec.detail,
+                &mut self.cache.scenes,
+            )?;
+            let programs = crate::programs_cached(&vfs, &scene, &spec.shaders, &mut self.cache)?;
+            let mut renderer = AreaRenderer::new_cached(
+                ctx,
+                &vfs,
+                &scene,
+                &programs,
+                spec.format,
+                &mut self.cache,
+            );
+            renderer.set_time(self.shader_time);
+            log::debug!(
+                "{layout}: {} rings, {} draws, built in {:.1} ms: {:?}",
+                wanted.len(),
+                scene.draws.len(),
+                started.elapsed().as_secs_f64() * 1000.0,
+                wanted
+            );
+            self.rings = Some(LiveRings {
+                key: wanted,
+                layout: layout.to_string(),
+                scene,
+                renderer,
+            });
+        }
+        if let Some(rings) = self.rings.as_mut() {
+            for (i, (id, _)) in rings.key.iter().enumerate() {
+                if let Some((_, transform, _)) = self.posed.iter().find(|p| p.0 == *id) {
+                    rings.renderer.move_prop(ctx, &rings.scene, i, *transform);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Builds the objects' visual effects' scene when the effects on them change, and places
@@ -1832,6 +1947,11 @@ impl Live {
         level
             .renderer
             .render_main(ctx, encoder, target, width, height, camera);
+        if let Some(r) = self.rings.as_mut() {
+            let depth = level.renderer.depth(&ctx.device, width, height);
+            r.renderer
+                .render_over(ctx, encoder, target, width, height, camera, &depth);
+        }
         if let Some(o) = self.objects.as_mut() {
             let depth = level.renderer.depth(&ctx.device, width, height);
             o.renderer
@@ -1935,9 +2055,10 @@ impl Live {
         };
         level.renderer.cut_effects = cut_effects;
         let mut overlays: Vec<&mut AreaRenderer> = self
-            .objects
+            .rings
             .iter_mut()
-            .map(|o| &mut o.renderer)
+            .map(|r| &mut r.renderer)
+            .chain(self.objects.iter_mut().map(|o| &mut o.renderer))
             .chain(self.effects.iter_mut().map(|e| &mut e.renderer))
             .collect();
         Ok(Some(level.renderer.capture_with(
@@ -2283,11 +2404,13 @@ impl Live {
                 }
             }
         }
+        self.hovered = None;
         let (t, id) = best?;
-        match sim.ground_hit(area, origin.to_array(), dir.to_array(), 300.0) {
+        self.hovered = match sim.ground_hit(area, origin.to_array(), dir.to_array(), 300.0) {
             Some(g) if origin.distance(glam::Vec3::from_array(g)) < t => None,
             _ => Some(id),
-        }
+        };
+        self.hovered
     }
 
     /// Orders the party leader as a click on `pick` does: lead with a party member, attack a
