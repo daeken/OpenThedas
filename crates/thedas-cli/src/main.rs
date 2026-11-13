@@ -604,6 +604,14 @@ fn addins(install: &Path) -> Result<()> {
     }
     let on = all.iter().filter(|a| a.enabled).count();
     println!("{} add-ins, {on} mounted", all.len());
+    match install.game_version() {
+        Some(v) => {
+            println!("game version {v} (from the executable; add-ins asking for more are left out)")
+        }
+        None => println!(
+            "game version unknown (no readable executable): no add-in is left out for its GameVersion"
+        ),
+    }
     Ok(())
 }
 
