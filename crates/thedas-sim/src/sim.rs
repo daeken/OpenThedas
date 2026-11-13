@@ -523,7 +523,7 @@ pub enum CutscenePolicy {
 }
 
 /// What the simulation does when a script shows the party picker (`ShowPartyPickerGUI`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PartyPickerPolicy {
     /// Decide at once (headless runs: nobody picks): the choice given beforehand
     /// ([`crate::world::World::party_choice`]), else the party as it was, filled from the pool.

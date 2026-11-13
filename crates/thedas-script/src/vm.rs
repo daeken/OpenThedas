@@ -350,7 +350,7 @@ impl Vm {
             (Action, Arg::Action { id, argc }) => {
                 let f = self
                     .table
-                    .function(*id)
+                    .function_for_call(*id, *argc as usize)
                     .ok_or(VmError::UnknownAction { id: *id, at })?;
                 let argc = *argc as usize;
                 if argc > f.params.len() || argc < f.required() {

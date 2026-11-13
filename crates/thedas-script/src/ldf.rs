@@ -117,6 +117,10 @@ pub struct EngineTable {
     pub functions: Vec<Function>,
     by_id: HashMap<u16, usize>,
     by_name: HashMap<String, usize>,
+    /// Earlier declarations of an id declared more than once, in declaration order.
+    /// Dragon Age II's `script.ldf` declares 11 ids twice or three times; see
+    /// [`EngineTable::function_for_call`].
+    shadowed: HashMap<u16, Vec<Function>>,
 }
 
 impl EngineTable {
@@ -125,7 +129,32 @@ impl EngineTable {
     }
 
     pub fn function_by_name(&self, name: &str) -> Option<&Function> {
-        self.by_name.get(name).map(|&i| &self.functions[i])
+        let f = self.by_name.get(name).map(|&i| &self.functions[i])?;
+        if f.name == name {
+            return Some(f);
+        }
+        self.shadowed.get(&f.id)?.iter().find(|s| s.name == name)
+    }
+
+    /// The function a compiled call of `id` with `argc` arguments means. Usually the one
+    /// declaration of `id`. For an id declared more than once (Dragon Age II's `script.ldf`
+    /// declares 11 so: 654 is both `GetCurrentEventType()` and `GetPlayerMapPin(object,
+    /// string, int = 0)`), the last declaration whose parameters take `argc` arguments, else
+    /// the last declaration. The shipped DA2 scripts settle each case this way (they call 654
+    /// with no arguments, 651 `ResetCameraFacing()`, its third declaration, with none, and
+    /// 784 `GetItemPropertyPower`, its first, with four), where neither the first nor the
+    /// last declaration is right every time. Provisional: inferred from the shipped scripts,
+    /// not from DragonAge2.exe's function table.
+    pub fn function_for_call(&self, id: u16, argc: usize) -> Option<&Function> {
+        let last = self.function(id)?;
+        let fits = |f: &Function| f.required() <= argc && argc <= f.params.len();
+        if fits(last) {
+            return Some(last);
+        }
+        self.shadowed
+            .get(&id)
+            .and_then(|earlier| earlier.iter().rev().find(|f| fits(f)))
+            .or(Some(last))
     }
 
     /// Adds or replaces a function.
@@ -204,9 +233,11 @@ impl EngineTable {
             if s.contains('(') {
                 let f = parse_function(&table, s).map_err(err)?;
                 if table.by_id.contains_key(&f.id) {
-                    // Later declarations win, as they would in a compiler symbol table.
+                    // Later declarations win, as they would in a compiler symbol table; the
+                    // earlier ones are kept for [`EngineTable::function_for_call`].
                     let i = table.by_id[&f.id];
-                    table.functions[i] = f.clone();
+                    let earlier = std::mem::replace(&mut table.functions[i], f.clone());
+                    table.shadowed.entry(f.id).or_default().push(earlier);
                 } else {
                     table.by_id.insert(f.id, table.functions.len());
                     table.functions.push(f.clone());
@@ -504,5 +535,52 @@ mod tests {
         let g = t.function(8).unwrap();
         assert!(g.params.iter().all(|p| !p.by_ref));
         assert_eq!(g.params[1].name, "refIndex");
+    }
+
+    #[test]
+    fn a_call_picks_the_declaration_its_arguments_fit() {
+        // Dragon Age II's script.ldf declares some ids more than once.
+        let ldf = "int GetCurrentEventType() = 654;\n\
+            object GetPlayerMapPin( object pPlayer, string sTag, int nNth = 0) = 654;\n\
+            void SetMaxItemStackSize( object oItem, int nMaxStackSize ) = 651;\n\
+            void ResetCameraFacing() = 651;\n\
+            int Plain(int n) = 1;\n";
+        let t = EngineTable::parse(ldf.as_bytes()).unwrap();
+        // The last declaration stays the id's function, as before.
+        assert_eq!(t.function(654).unwrap().name, "GetPlayerMapPin");
+        assert_eq!(
+            t.function_for_call(654, 0).unwrap().name,
+            "GetCurrentEventType"
+        );
+        assert_eq!(t.function_for_call(654, 2).unwrap().name, "GetPlayerMapPin");
+        assert_eq!(t.function_for_call(654, 3).unwrap().name, "GetPlayerMapPin");
+        assert_eq!(
+            t.function_for_call(651, 0).unwrap().name,
+            "ResetCameraFacing"
+        );
+        assert_eq!(
+            t.function_for_call(651, 2).unwrap().name,
+            "SetMaxItemStackSize"
+        );
+        // No declaration fits: the last one, as before.
+        assert_eq!(t.function_for_call(654, 7).unwrap().name, "GetPlayerMapPin");
+        assert_eq!(t.function_for_call(1, 1).unwrap().name, "Plain");
+        assert!(t.function_for_call(99, 0).is_none());
+        // Every declaration is found by its own name.
+        assert_eq!(t.function_by_name("GetCurrentEventType").unwrap().id, 654);
+        assert_eq!(
+            t.function_by_name("GetCurrentEventType")
+                .unwrap()
+                .params
+                .len(),
+            0
+        );
+        assert_eq!(
+            t.function_by_name("SetMaxItemStackSize")
+                .unwrap()
+                .params
+                .len(),
+            2
+        );
     }
 }

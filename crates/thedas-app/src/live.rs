@@ -598,10 +598,19 @@ impl Live {
                 );
             }
         }
-        // The player is in control (saves made by test drivers may have the autopilot on).
-        sim.world.autopilot = false;
-        // The player chooses the party when the scripts show the picker.
-        sim.party_picker_policy = thedas_sim::sim::PartyPickerPolicy::Player;
+        // The player is in control (saves made by test drivers may have the autopilot on),
+        // and chooses the party when the scripts show the picker. Commands, so a replay of
+        // the game from here sets them up the same.
+        sim.input(
+            thedas_sim::commands::CommandSource::App,
+            thedas_sim::commands::SimCommand::SetAutopilot { on: false },
+        );
+        sim.input(
+            thedas_sim::commands::CommandSource::App,
+            thedas_sim::commands::SimCommand::SetPartyPickerPolicy {
+                policy: thedas_sim::sim::PartyPickerPolicy::Player,
+            },
+        );
         Ok(Self {
             sim: Arc::new(Mutex::new(sim)),
             front_end: matches!(start, Start::Menu),
@@ -1239,7 +1248,7 @@ impl Live {
         );
         if state == crate::intro::MovieState::CannotPlay {
             sim.input(
-                thedas_sim::commands::CommandSource::Player,
+                thedas_sim::commands::CommandSource::App,
                 thedas_sim::commands::SimCommand::SkipCutscene,
             );
             self.cutscene_movies
