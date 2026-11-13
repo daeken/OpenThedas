@@ -218,7 +218,7 @@ impl PadPlay {
         let mut log = Vec::new();
         // Marking spots for an issue report: the pad has a pointer of its own.
         let marking = if popup { None } else { host.marking() };
-        let was = std::mem::replace(&mut self.mark_held, (false, false, false));
+        let was = std::mem::take(&mut self.mark_held);
         self.marking = false;
         if let Some(drawing) = marking {
             self.mark(state, host, drawing, was, dt_ms, &mut log);
