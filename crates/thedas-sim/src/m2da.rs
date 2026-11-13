@@ -2,29 +2,9 @@
 //!
 //! `m2da_base.gda`, and any other GDA whose name starts with `m2da_`, lists each table id with
 //! a label and a worksheet prefix (`1, Abilities, ABI_`). A table is the union of every GDA resource whose name starts with the prefix
-//! (`abi_base.gda`, `abi_dlc.gda`, ...), indexed by the first column (`ID`). Scripts can also
-//! name a worksheet directly (the optional `s2DA` argument), which reads just that file.
-//!
-//! A row id belongs to the first worksheet that defines it: the original skips a row whose id
-//! the set already holds (`0x4ec910` returns -1 and `0x4eca10` moves on), within one worksheet
-//! and across worksheets alike.
-//!
-//! The order of the worksheets is the order of the original's resource listing (`0x4c56b0`),
-//! traced in two parts:
-//!
-//! - Its resource sources (one per archive or folder) are walked from the lowest priority
-//!   number up, each adding the names not listed yet, so a worksheet in a higher-priority
-//!   source (an add-in's, a mod's) comes before the base game's. Ours follows that by stack
-//!   layer.
-//! - Inside one archive the source lists its entries in the order of an MSVC `stdext::hash_map`
-//!   keyed by the lowercased entry name and hashed with CRC-32 of its UTF-16 bytes
-//!   ([`archive_position`]). That order is neither alphabetical nor the archive's own, and the
-//!   shipped AI package tables depend on it: `aip_archer`'s prefix also matches
-//!   `aip_archer_human.gda`, `_elf` and `_dwarf` in the same archive, which reuse its row ids,
-//!   and the hash order puts `aip_archer_human.gda` first.
-//!
-//! Provisional: worksheets that are loose files (a folder's own order in the original is not
-//! traced) come in name order after their layer's rank.
+//! (`abi_base.gda`, `abi_dlc.gda`, ...), indexed by the first column (`ID`). Provisional: when
+//! two worksheets define the same row id, the one that sorts later by name wins; scripts can
+//! also name a worksheet directly (the optional `s2DA` argument), which reads just that file.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -63,11 +43,9 @@ impl Table {
                     cells[*at] = c.clone();
                 }
             }
-            // The first definition of a row id stands.
-            if self.rows.contains_key(&id) {
-                continue;
+            if !self.rows.contains_key(&id) {
+                self.order.push(id);
             }
-            self.order.push(id);
             self.rows.insert(id, cells);
         }
         for r in self.rows.values_mut() {
@@ -122,63 +100,14 @@ fn prefix_set<'a>(gdas: &'a [String], prefix: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// Where an archive source of the original lists an entry among its own: the bucket of an
-/// MSVC `stdext::hash_map` (bucket size 4, 8 starting buckets, as compiled into the original's
-/// insert at 0x4cdb50) holding `entries` names, keyed by the ASCII-lowercased name and hashed
-/// with CRC-32 over its UTF-16LE bytes (0x4ca9a0). The map's element list runs bucket by
-/// bucket, names ascending inside a bucket, and the source's list method (0x4e6a90) walks it.
-fn archive_position(name: &str, entries: usize) -> (u32, Vec<u16>) {
-    // The mask and the bucket count after `entries` inserts: the table grows by one bucket
-    // whenever the count reaches four times the buckets, doubling its mask as needed.
-    let (mut slots, mut mask, mut buckets) = (9u32, 1u32, 1u32);
-    for size in 0..entries as u32 {
-        if buckets <= size / 4 {
-            if slots - 1 <= buckets {
-                mask = ((slots - 1) << 1) - 1;
-                slots = mask + 2;
-            } else if mask < buckets {
-                mask = (mask << 1) + 1;
-            }
-            buckets += 1;
-        }
-    }
-    let lower = name.to_ascii_lowercase();
-    let key: Vec<u16> = lower.encode_utf16().collect();
-    // The same hash the tables' column names use.
-    let mut bucket = thedas_formats::gda::column_hash(&lower) & mask;
-    if buckets <= bucket {
-        bucket -= (mask >> 1) + 1;
-    }
-    (bucket, key)
-}
-
-/// Orders the worksheets of a set as their rows take precedence: the one the resource stack
-/// serves from a higher layer first, then, inside one archive, the original's own order
-/// ([`archive_position`]); loose files by name (see the module documentation).
-fn in_set_order<'a>(vfs: &Vfs, mut names: Vec<&'a str>) -> Vec<&'a str> {
-    names.sort_by_cached_key(|n| {
-        let (layer, position) = match vfs.winning_archive(n) {
-            Some((layer, entries)) => (layer, archive_position(n, entries)),
-            None => (
-                vfs.lookup(n).map_or(0, |p| p.layer),
-                (0, n.encode_utf16().collect()),
-            ),
-        };
-        (std::cmp::Reverse(layer), position)
-    });
-    names
-}
-
-/// Adds one table-list worksheet's rows (table id, label, worksheet prefix) to `prefixes`. An
-/// id an earlier worksheet (or row) gave keeps its prefix, as rows do in any prefix set.
+/// Adds one table-list worksheet's rows (table id, label, worksheet prefix) to `prefixes`.
+/// Provisional: a later worksheet's row replaces an earlier one's for the same id.
 fn add_prefixes(prefixes: &mut HashMap<i32, String>, list: &Gda) {
     let ws = list.column("Worksheet").unwrap_or(2);
     for row in &list.rows {
         if let (Some(Cell::Int(id)), Some(Cell::String(p))) = (row.first(), row.get(ws)) {
             let p = p.trim_matches(|c: char| c == '\0' || c.is_whitespace());
-            prefixes
-                .entry(*id as i32)
-                .or_insert_with(|| p.to_ascii_lowercase());
+            prefixes.insert(*id as i32, p.to_ascii_lowercase());
         }
     }
 }
@@ -214,7 +143,7 @@ impl Tables {
         // starts with `M2DA_` (0x4e0cf8), so an add-in or mod adds tables with its own
         // `m2da_*.gda` beside `m2da_base.gda`.
         let mut prefixes = HashMap::new();
-        for name in in_set_order(&vfs, prefix_set(&gdas, TABLE_LIST_PREFIX)) {
+        for name in prefix_set(&gdas, TABLE_LIST_PREFIX) {
             if let Ok((data, _)) = vfs.read(name) {
                 if let Ok(g) = Gda::parse(&data) {
                     add_prefixes(&mut prefixes, &g);
@@ -229,17 +158,11 @@ impl Tables {
         }
     }
 
-    /// The names of every GDA in the stack whose name starts with `prefix` (any case): a
-    /// prefix set, as the original opens them (`0x4ec7a0`; `M2DA_` for the table list,
-    /// `PRCSCR_` for the add-ins' start-up scripts). In the order their rows take precedence
-    /// (see the module documentation): higher layer first, then the original's order inside
-    /// one archive.
+    /// The names of every GDA in the stack whose name starts with `prefix` (any case), sorted:
+    /// a prefix set, as the original opens them (`0x4ec7a0`; `M2DA_` for the table list,
+    /// `PRCSCR_` for the add-ins' start-up scripts).
     pub fn prefix_set(&self, prefix: &str) -> Vec<&str> {
-        let names = prefix_set(&self.gdas, prefix);
-        match &self.vfs {
-            Some(vfs) => in_set_order(vfs, names),
-            None => names,
-        }
+        prefix_set(&self.gdas, prefix)
     }
 
     /// Each worksheet of a prefix set as its own table, in [`Tables::prefix_set`] order, for
@@ -287,7 +210,7 @@ impl Tables {
         let mut table = Table::default();
         if worksheet.is_empty() {
             let prefix = self.prefixes.get(&id)?;
-            for name in in_set_order(vfs, prefix_set(&self.gdas, prefix)) {
+            for name in prefix_set(&self.gdas, prefix) {
                 if let Ok((data, _)) = vfs.read(name) {
                     if let Ok(g) = Gda::parse(&data) {
                         table.merge(&g);
@@ -364,95 +287,9 @@ mod tests {
         add_prefixes(&mut prefixes, &list(&[(1, "ABI_\0"), (2, " ITM_ ")]));
         add_prefixes(&mut prefixes, &list(&[(2, "ITX_"), (9000, "MYMOD_")]));
         assert_eq!(prefixes[&1], "abi_");
-        // The first worksheet to give an id keeps it, and new ids are added.
-        assert_eq!(prefixes[&2], "itm_");
+        // A later worksheet's row replaces an earlier one's, and new ids are added.
+        assert_eq!(prefixes[&2], "itx_");
         assert_eq!(prefixes[&9000], "mymod_");
         assert_eq!(prefixes.len(), 3);
-    }
-
-    #[test]
-    fn the_first_definition_of_a_row_stands() {
-        let mut t = Table::default();
-        // Twice in one worksheet, then again in a later one.
-        t.merge(&list(&[(5, "first"), (5, "same sheet"), (6, "six")]));
-        t.merge(&list(&[(5, "later sheet"), (7, "seven")]));
-        let text = |id: i64| match t.cell("Worksheet", id) {
-            Some(Cell::String(s)) => s.clone(),
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(text(5), "first");
-        assert_eq!(text(6), "six");
-        assert_eq!(text(7), "seven");
-        assert_eq!(t.order, [5, 6, 7]);
-    }
-
-    #[test]
-    fn worksheets_from_higher_layers_come_first() {
-        let base = std::env::temp_dir().join(format!("thedas-m2da-order-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let write = |rel: &str| {
-            let p = base.join(rel);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(p, b"x").unwrap();
-        };
-        write("core/aip_archer.gda");
-        write("core/aip_archer_fire.gda");
-        write("core/aip_archer_base.gda");
-        write("addin/aip_archer_dlc.gda");
-        write("mod/aip_archer_fire.gda");
-        let mut vfs = Vfs::new();
-        vfs.push_directory(base.join("core"), false, "core")
-            .unwrap();
-        vfs.push_directory(base.join("addin"), false, "addin")
-            .unwrap();
-        let mut overlay = Vfs::new();
-        overlay
-            .push_directory(base.join("mod"), false, "mod:m")
-            .unwrap();
-        vfs.set_overlay(overlay);
-        let tables = Tables::new(std::sync::Arc::new(vfs));
-        assert_eq!(
-            tables.prefix_set("AIP_ARCHER"),
-            [
-                "aip_archer_fire.gda",
-                "aip_archer_dlc.gda",
-                "aip_archer.gda",
-                "aip_archer_base.gda"
-            ]
-        );
-        std::fs::remove_dir_all(&base).unwrap();
-    }
-
-    /// The original's order inside one archive, checked against the algorithm run by hand
-    /// for an archive of 749 entries (the core game's `2da.erf`): mask 255, 188 buckets.
-    #[test]
-    fn archive_entries_come_in_the_original_hash_order() {
-        let pos = |n: &str| archive_position(n, 749);
-        // CRC-32 of the UTF-16LE name, masked to 255, folded back by 128 when 188 or more:
-        // the values below were computed independently (Python zlib).
-        for (n, bucket) in [("aip_archer.gda", 106), ("aip_archer_human.gda", 25)] {
-            assert_eq!(pos(n).0, bucket, "{n}");
-            assert_eq!(pos(&n.to_uppercase()), pos(n), "{n}");
-        }
-        let mut names = vec![
-            "aip_archer.gda",
-            "aip_archer_dwarf.gda",
-            "aip_archer_elf.gda",
-            "aip_archer_human.gda",
-        ];
-        names.sort_by_key(|n| pos(n));
-        assert_eq!(
-            names,
-            [
-                "aip_archer_human.gda",
-                "aip_archer_elf.gda",
-                "aip_archer.gda",
-                "aip_archer_dwarf.gda"
-            ]
-        );
-        // Small tables: one bucket until four entries, then growth one bucket at a time.
-        assert_eq!(archive_position("a", 1).0, 0);
-        assert_eq!(archive_position("a", 4).0, 0);
-        assert!(archive_position("a", 9).0 < 3);
     }
 }

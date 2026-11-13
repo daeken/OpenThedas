@@ -30,6 +30,7 @@ pub fn clip(m: &thedas_ui::models::Motion) -> thedas_render::Clip {
         looping: m.looping,
         layers: Vec::new(),
         absolute: false,
+        ..Default::default()
     }
 }
 
