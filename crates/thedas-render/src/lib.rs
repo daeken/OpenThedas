@@ -16,6 +16,7 @@ pub mod atmosphere;
 pub mod camera;
 pub mod collide;
 pub mod cut_effects;
+pub mod look;
 pub mod d3d;
 mod d3d_gpu;
 pub mod distortion;
