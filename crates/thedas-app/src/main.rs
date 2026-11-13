@@ -1755,6 +1755,12 @@ impl App {
                 }
                 log.push(format!("asktext {prompt:?}"));
             }
+            Step::AskChoice(prompt) => {
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.ask_choice(0, prompt, "Yes", "No");
+                }
+                log.push(format!("askchoice {prompt:?}"));
+            }
             Step::Use(tag) => {
                 if let Some(l) = self.live.as_ref() {
                     let mut sim = l.sim();
@@ -3180,6 +3186,9 @@ enum Step {
     /// The engine's own text box (`asktext Describe the issue`), as
     /// `ui::UiLayer::ask_text` shows it; its answer is logged.
     AskText(String),
+    /// The engine's own two-button box (`askchoice Is it fixed?`), as
+    /// `ui::UiLayer::ask_choice` shows it (Yes / No); its answer is logged.
+    AskChoice(String),
     /// Sets a plot flag as a script would (`plot plt_tut_explore 0`), running the plot's
     /// script, for trying journal entries and tutorial popups headless.
     Plot(String, i32),
@@ -3386,6 +3395,7 @@ fn parse_step(s: &str) -> Result<Step> {
         }
         "floaty" => Step::Floaty(arg.to_string()),
         "asktext" => Step::AskText(arg.trim().to_string()),
+        "askchoice" => Step::AskChoice(arg.trim().to_string()),
         "training" => Step::Training(arg.trim().to_ascii_uppercase()),
         "trainingmode" => {
             Step::TrainingMode(arg.trim().parse().context("trainingmode takes a number")?)
@@ -3921,6 +3931,12 @@ fn main() -> Result<()> {
                             layer.ask_text(0, prompt, "", "OK", "Cancel");
                         }
                         println!("asktext {prompt:?}");
+                    }
+                    Step::AskChoice(prompt) => {
+                        if let Some((layer, _)) = played.as_mut() {
+                            layer.ask_choice(0, prompt, "Yes", "No");
+                        }
+                        println!("askchoice {prompt:?}");
                     }
                     Step::Use(tag) => {
                         let mut sim = l.sim();

@@ -216,6 +216,10 @@ fn splash_pass(
     }
 }
 
+/// For how many frames after a dialog box shows its text field is given the focus (see
+/// `Stage::focus_dialog_field`).
+const FOCUS_FRAMES: u8 = 10;
+
 /// The message the engine's own text box's buttons send: `<id> <button, from 1>`. The app
 /// adds the text typed (see [`UiLayer::ask_text`]).
 const TEXT_POPUP_RESULT: &str = "OpenThedas.TextPopupResult";
@@ -1054,6 +1058,17 @@ impl UiLayer {
     /// [`UiLayer::take_text_answers`] with `id`. It shows once its values have reached the
     /// movie, two frames on, and replaces one still up. Needs the popup layer (the HUD).
     pub fn ask_text(&mut self, id: u32, prompt: &str, text: &str, ok: &str, cancel: &str) {
+        self.ask(id, prompt, Some(text), ok, cancel);
+    }
+
+    /// Asks the player to choose between two buttons (`a`, `b`) with the game's own message
+    /// box, as [`UiLayer::ask_text`] does but with no text field: the answer's `accepted`
+    /// is `a`, and its text is empty.
+    pub fn ask_choice(&mut self, id: u32, prompt: &str, a: &str, b: &str) {
+        self.ask(id, prompt, None, a, b);
+    }
+
+    fn ask(&mut self, id: u32, prompt: &str, text: Option<&str>, ok: &str, cancel: &str) {
         use thedas_ui::UiValue;
         let k = "GUIPopupLayer";
         let b = &self.stage.bridge;
@@ -1062,8 +1077,14 @@ impl UiLayer {
             UiValue::String(prompt.into()),
         );
         b.set_value(&format!("{k}.NumButtons"), UiValue::Number(2.0));
-        b.set_value(&format!("{k}.InputBox"), UiValue::Number(1.0));
-        b.set_value(&format!("{k}.InputText"), UiValue::String(text.into()));
+        b.set_value(
+            &format!("{k}.InputBox"),
+            UiValue::Number(f64::from(u8::from(text.is_some()))),
+        );
+        b.set_value(
+            &format!("{k}.InputText"),
+            UiValue::String(text.unwrap_or_default().into()),
+        );
         b.set_value(&format!("{k}.Checkbox"), UiValue::Number(0.0));
         for e in [
             "CheckboxText",
@@ -1131,6 +1152,12 @@ impl UiLayer {
             return;
         };
         if *frames >= 2 {
+            // Up: its field takes the typing (see `Stage::focus_dialog_field`), for its first
+            // frames (later, a press on its buttons lets go of the focus on purpose).
+            if *frames < FOCUS_FRAMES {
+                *frames += 1;
+                self.stage.focus_dialog_field();
+            }
             return;
         }
         *frames += 1;
@@ -1162,6 +1189,12 @@ impl UiLayer {
         match (open, self.script_popup.as_mut()) {
             (None, _) => self.script_popup = None,
             (Some(k), Some((shown, frames))) if *shown == k => {
+                // A box with a text field (a name prompt) gives it the typing, as the
+                // engine's own does (see `show_text_popup`).
+                if (2..FOCUS_FRAMES).contains(frames) {
+                    *frames += 1;
+                    self.stage.focus_dialog_field();
+                }
                 if *frames < 2 {
                     *frames += 1;
                     if *frames == 2 {
