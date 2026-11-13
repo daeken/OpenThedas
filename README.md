@@ -10,7 +10,7 @@ repository.
 
 ## Status
 
-Last updated 2026-11-12 23:25 UTC, main 4f84bcf
+Last updated 2026-11-13 00:10 UTC, main b4ed5e7
 
 For everything that is wrong or missing, in detail and split into items that can be picked up in
 parallel, see [docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md).
@@ -60,7 +60,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Corpses decay and fade as the exe does them; a body bag takes the corpse's place and draws its corpse model.
   - Live creatures block each other as the exe's capsules do (slide, no push, no re-path; the dead do not block), and a blocked walker keeps its own speed. QA graded it in the live app.
   - Ability functions ignore unknown ability ids as the exe does, and saves drop invalid ones on load.
-  - Training tutorials (the original's step-by-step first-play lessons) run from the scripts: SetTrainingMode, BeginTrainingStep, the completed-steps gate and the events that end each step. Every lesson can be finished: each step's ending event has a sender, including while a screen or a tutorial popup holds the game. As in the exe, saving is refused while a lesson is active, and a load clears it.
+  - Training tutorials (the original's step-by-step first-play lessons) run from the scripts: SetTrainingMode, BeginTrainingStep, the completed-steps gate and the events that end each step. Every lesson can be finished, with mouse and keyboard or on the pad alone: each step's ending event has a sender and is delivered to the tutorial script at once, as the exe does, including while a screen or a tutorial popup holds the game. As in the exe, saving is refused while a lesson is active, and a load clears it.
   - The engine raises the mana-or-stamina-depleted, area-load-from-save and module pre-save events. Opening a screen tells the module. The damaged event and eight others were confirmed to come from scripts only.
   - Followers walking with the leader take their formation slots.
   - Visual effects applied at places (the Proving crowd) are exposed to rendering and drawn.
@@ -103,7 +103,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Also merged: the ducking of world sound in conversations, cutscenes, death and loads (#392), music volume triggers, area music carrying on across areas that share a theme, and placeables' animation sounds.
   - Not yet: voice-over positioning, and the master and secondary reverb chain. (The PlayMusic and StopMusic script calls do nothing in the original either, traced in #395.)
   - Sound is off with `--control` (unless `--audio`) and in headless captures.
-- 🟡 **Controller**: Xbox 360-style layout; menus and in-game screens use focus navigation, and A dismisses tutorial popups. The PC right-click radial menu doesn't exist as a movie in the game data, so LT opens a quickbar picker instead.
+- 🟡 **Controller**: Xbox 360-style layout; menus and in-game screens use focus navigation, and A dismisses tutorial popups. The PC right-click radial menu doesn't exist as a movie in the game data, so LT opens a quickbar picker instead. In the inventory A equips and unequips and Y puts a usable item in the first free quickbar slot; on Tactics the pad reaches the Presets and Behaviour pickers; B in an open dropdown closes only the list.
 - ✅ **Saves**: F5/F9 quick save and load, save/load screens, typed names. Revision 7 fills older saves' empty containers.
 - ✅ **Performance**: frustum culling, shadow caching and skinned-draw culling (Lothering about 8 ms, the chapel about 1.5 ms offscreen). Model node trees are read with a heap stack, so small worker-thread stacks are safe.
 - ⬜ **DA2**: not started. There is no Dragon Age II work in the git log.
