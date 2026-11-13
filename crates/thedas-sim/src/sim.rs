@@ -2362,6 +2362,24 @@ impl Sim {
         Some([at[0], at[1], b[2]])
     }
 
+    /// Whether a point lies inside the space another living creature's body keeps `id` out of.
+    fn body_covers(&self, id: ObjectId, p: [f32; 3]) -> bool {
+        let Some(area) = self.world.get(id).and_then(|o| o.area) else {
+            return false;
+        };
+        let mine = self.capsule_radius(id);
+        self.world.objects.values().any(|o| {
+            o.id != id
+                && o.kind == crate::world::ObjectKind::Creature
+                && o.area == Some(area)
+                && o.active
+                && !o.dead
+                && o.parked.is_none()
+                && ((o.position[0] - p[0]).powi(2) + (o.position[1] - p[1]).powi(2)).sqrt()
+                    < mine + self.capsule_radius(o.id)
+        })
+    }
+
     /// Keeps track of a walker held up by bodies, logging once when it has made no progress
     /// for [`BLOCKED_REPORT_MS`] (for finding stuck walkers).
     fn note_blocked(&mut self, id: ObjectId, progressed: bool) {
@@ -2426,7 +2444,14 @@ impl Sim {
                 p = slid;
                 // From where the walker was, not where it meant to get to: a waypoint the
                 // blocked step would have passed is still ahead of it.
-                let rest = remaining_points(from, &points, progress_of(from, &points, was));
+                let mut rest = remaining_points(from, &points, progress_of(from, &points, was));
+                // A waypoint another creature stands on cannot be reached, and a walker
+                // making for it only goes round and round that creature: it goes on to the
+                // next one (not past the end of the path). Provisional: DAOrigins.exe's
+                // path follower is not traced.
+                while rest.len() > 1 && self.body_covers(id, rest[0]) {
+                    rest.remove(0);
+                }
                 // At the speed the move was set going at (a walk stays a walk).
                 let speed = (path_length(from, &points) * 1000.0 / (due - t0) as f32).max(0.01);
                 let left = path_length(p, &rest);

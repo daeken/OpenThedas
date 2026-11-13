@@ -432,6 +432,7 @@ mod tests {
             resref: "bec100pt_main".into(),
             name: None,
             completed: false,
+            ..Default::default()
         };
         s.world.alerts.push(alert.clone());
         s.world.uber_alerts.push(alert);

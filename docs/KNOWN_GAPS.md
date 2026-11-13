@@ -39,7 +39,7 @@ so an untraced item starts with a trace, not with a guess.
 | Rendering | [gaps/rendering.md](gaps/rendering.md) | 152 (`RND-`) |
 | Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 183 (`UI-`), plus the movies never opened and the values no screen gets answered |
 | Audio | [gaps/audio.md](gaps/audio.md) | 55 (`AUD-`) |
-| Cameras, cutscene presentation, startup | [gaps/cameras-cutscenes.md](gaps/cameras-cutscenes.md) | 42 (`CAM-`) |
+| Cameras, cutscene presentation, startup | [gaps/cameras-cutscenes.md](gaps/cameras-cutscenes.md) | 41 (`CAM-`) |
 | File formats and file system | [gaps/formats.md](gaps/formats.md) | 46 (`FMT-`), plus a table of every resource type and the tables and types nothing reads |
 | Tooling, platforms and project | [gaps/tooling.md](gaps/tooling.md) | 23 (`TOOL-`) |
 | What a player sees (QA) | [gaps/qa.md](gaps/qa.md) | open findings, accepted differences, content coverage |
@@ -100,7 +100,7 @@ these, so they are the places where one person or stream can take a large, separ
   billboards that fade in far away and wind sway. Some LOD and billboard details and the
   wind's per-tree details are provisional (`RND-075` to `RND-078`).
 - **Effects on creatures and items.** Spell effects and impact flashes draw their particles
-  on the body, but not their meshes, lights or heat shimmer, and weapon glows are not drawn
+  on the body, but not their meshes or lights, and weapon glows are not drawn
   (`RND-094`).
 - **Animation blending.** No blend weights, crossfades, inverse kinematics or root motion
   (`RND-064` to `RND-068`).
@@ -112,7 +112,9 @@ these, so they are the places where one person or stream can take a large, separ
   terrain detail levels (`RND-001` to `RND-003`).
 - **Video options.** Graphics detail, VSync, full screen, resolution and gamma have no effect
   from the options screen (`RND-108`, `RND-110`, `RND-150`, `RND-151`).
-- **Screen effects.** Depth of field, distortion, script-driven screen effects, anti-aliasing,
+- **Screen effects.** Distortion other than heat haze from particles (`RND-107`), cutscene
+  screen effects other than depth of field and fades (`RND-158`), script-driven screen effects,
+  anti-aliasing,
   decals, trails, weather, selection circles and area-map fog are not drawn; transparent draws
   are not sorted.
 

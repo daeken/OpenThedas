@@ -570,10 +570,21 @@ impl Arl {
     }
 }
 
+/// A lightmap binding's chunk id. Dragon Age: Origins stores a string (`_7u`); Dragon Age II
+/// stores a number, kept here in decimal. Provisional for DA2: how its models name the
+/// matching mesh piece is not worked out yet.
+fn lightmap_chunk(d: &Doc, l: StructId) -> TypedResult<String> {
+    match d.opt_i64(l, field::LMAT_CHUNK) {
+        Ok(Some(n)) => Ok(n.to_string()),
+        _ => d.str(l, field::LMAT_CHUNK),
+    }
+}
+
 /// Binds one mesh chunk of a placed model to a region of a lightmap atlas.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LightmapBinding {
-    /// Matches the lightmap id of a mesh piece in the model (`_7u` and similar).
+    /// Matches the lightmap id of a mesh piece in the model (`_7u` and similar). Dragon Age II
+    /// files store a number instead, which is kept in decimal.
     pub chunk: String,
     /// The atlas texture, e.g. `lgt101d_room000.dds`.
     pub texture: String,
@@ -732,7 +743,7 @@ fn read_placement(gff: &Gff4, m: StructId) -> TypedResult<Placement> {
             .opt_vec4(l, field::LMAT_OFFSET_SCALE, 0.0)?
             .unwrap_or([0.0, 0.0, 1.0, 1.0]);
         lightmaps.push(LightmapBinding {
-            chunk: d.str(l, field::LMAT_CHUNK)?,
+            chunk: lightmap_chunk(&d, l)?,
             texture: d.str(l, field::LMAT_TEXTURE)?,
             offset: [ox, oy],
             scale: [sx, sy],
@@ -944,6 +955,30 @@ mod tests {
         );
         assert_eq!(rml.placements[1].model, "prop");
         assert_eq!(rml.placements[1].scale, 1.0);
+    }
+
+    #[test]
+    fn reads_a_numeric_lightmap_chunk() {
+        // Dragon Age II room layouts store the chunk as a number.
+        let mut b = Builder::new(b"RML ");
+        let lm = b.add(
+            b"LMAT",
+            vec![
+                (field::LMAT_CHUNK, Value::I32(3)),
+                (field::LMAT_TEXTURE, s("HLAC_room_0_13")),
+            ],
+        );
+        let m = b.add(
+            b"MDL ",
+            vec![
+                (field::MDL_NAME, s("water")),
+                (field::MDL_LIGHTMAPS, generic(&[lm])),
+            ],
+        );
+        let root = b.add(b"ROOM", vec![(field::RML_MODELS, structs(&[m]))]);
+        let rml = Rml::from_gff4(&b.finish(root)).unwrap();
+        assert_eq!(rml.placements[0].lightmaps[0].chunk, "3");
+        assert_eq!(rml.placements[0].lightmaps[0].texture, "HLAC_room_0_13");
     }
 
     #[test]

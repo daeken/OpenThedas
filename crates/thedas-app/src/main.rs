@@ -332,7 +332,7 @@ fn load(
     detail: thedas_render::scene::Detail,
 ) -> Result<Loaded> {
     let install = DaoInstall::open(install)?;
-    let mut vfs = install.global_vfs(TextureQuality::High)?;
+    let mut vfs = install.play_vfs(TextureQuality::High)?;
     if area == "none" {
         return Ok(Loaded {
             vfs: Arc::new(vfs),
@@ -1274,8 +1274,11 @@ impl App {
         };
         g.ui.set_hovered(hovered);
         g.ui.set_line_voiced(voiced);
-        // Tab held shows every creature's name (never while it is typed into a field).
-        let tab = self.all_names || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
+        // Tab held shows every creature's name (never while it is typed into a field):
+        // keymap.gda binds `HighlightObjects` to Tab.
+        let tab = self.all_names
+            || self.pad.highlight
+            || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
         g.ui.set_show_all_names(tab);
         play_interface(
             &mut g.ui,
@@ -1285,6 +1288,22 @@ impl App {
             dt,
         );
         self.requests.append(&mut g.ui.requests);
+        // A save just written gets the picture of the game as it stands (the world alone,
+        // as the save and load screens show it).
+        let saved = g.ui.take_saved_slots();
+        if !saved.is_empty() {
+            let (w, h) = (g.config.width, g.config.height);
+            let shot = self
+                .live
+                .as_mut()
+                .and_then(|l| l.capture(&g.ctx, &self.camera, (w, h)).ok().flatten())
+                .and_then(|px| saves::shot_png(&px, w, h));
+            if let Some(png) = shot {
+                for slot in saved {
+                    g.ui.set_save_screenshot(slot, &png);
+                }
+            }
+        }
         for a in g.ui.take_text_answers() {
             // OK sends (or saves) the report with the note; the other button keeps it on
             // this computer only, unsent.
@@ -1406,8 +1425,11 @@ impl App {
         };
         g.ui.set_hovered(hovered);
         g.ui.set_line_voiced(voiced);
-        // Tab held shows every creature's name (never while it is typed into a field).
-        let tab = self.all_names || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
+        // Tab held shows every creature's name (never while it is typed into a field):
+        // keymap.gda binds `HighlightObjects` to Tab.
+        let tab = self.all_names
+            || self.pad.highlight
+            || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
         g.ui.set_show_all_names(tab);
         play_interface(
             &mut g.ui,
@@ -1417,6 +1439,22 @@ impl App {
             dt,
         );
         self.requests.append(&mut g.ui.requests);
+        // A save just written gets the picture of the game as it stands (the world alone,
+        // as the save and load screens show it).
+        let saved = g.ui.take_saved_slots();
+        if !saved.is_empty() {
+            let (w, h) = (g.config.width, g.config.height);
+            let shot = self
+                .live
+                .as_mut()
+                .and_then(|l| l.capture(&g.ctx, &self.camera, (w, h)).ok().flatten())
+                .and_then(|px| saves::shot_png(&px, w, h));
+            if let Some(png) = shot {
+                for slot in saved {
+                    g.ui.set_save_screenshot(slot, &png);
+                }
+            }
+        }
         for a in g.ui.take_text_answers() {
             // OK sends (or saves) the report with the note; the other button keeps it on
             // this computer only, unsent.
@@ -1519,6 +1557,14 @@ impl App {
                 "format": format!("{:?}", g.config.format),
             });
         }
+        // What the player has layered over the install (the original's override and add-in
+        // folders, the mod list): these change what the game reads.
+        info["mods"] = json!(
+            thedas_vfs::mods::player_layers(&self.loaded.vfs)
+                .iter()
+                .map(|l| json!({ "layer": l.label, "files": l.files }))
+                .collect::<Vec<_>>()
+        );
         let mut now_save = None;
         let mut trace = None;
         let mut pause = false;
@@ -1755,7 +1801,16 @@ impl App {
             Returning::Fetching(rx, save, report) => match rx.try_recv() {
                 Ok(Ok(exe)) => {
                     let size = self.started_with["size"].as_str().unwrap_or("1280x720");
-                    match update::start_build(&exe, &self.install, save, report, size) {
+                    // The next build is as quiet and as driven as this one: no sound where
+                    // this had none, and the same control address (free once this closes).
+                    let mut more = Vec::new();
+                    if self.audio.is_none() {
+                        more.push("--no-audio".to_string());
+                    }
+                    if let Some(c) = &self.control {
+                        more.extend(["--control".to_string(), c.addr.to_string()]);
+                    }
+                    match update::start_build(&exe, &self.install, save, report, size, &more) {
                         Ok(()) => {
                             log::info!("update: started {}; closing this one", exe.display());
                             self.quit = true;
@@ -2056,8 +2111,8 @@ impl App {
             // While playing, P opens the spells/talents screen instead.
             KeyCode::KeyP if self.screens.is_none() => println!("camera {}", self.camera.spec()),
             // F5 quick save, F9 quick load: the exe's `QuickSave` and `QuickLoad` actions
-            // (0x51e4d0, 0x51e6f6). Provisional: that they are bound to F5 and F9 is the
-            // original's default as played, not read from keymap.gda here.
+            // (0x51e4d0, 0x51e6f6), which keymap.gda binds to F5 and F9. Provisional: the
+            // keys are fixed here, not read from the player's bindings.
             KeyCode::F5 | KeyCode::F9
                 if self
                     .screens
@@ -2675,6 +2730,11 @@ impl App {
             "lines": c.lines.len(),
         })));
         out["screens"] = json!(self.screens.as_ref().map(|s| format!("{:?}", s.shown())));
+        // The movies' input contexts, innermost last, and whether a dialog box has the input.
+        if let Some(g) = self.gfx.as_ref() {
+            out["contexts"] = json!(g.ui.stage.bridge.contexts());
+            out["popup"] = json!(g.ui.stage.dialog_up());
+        }
         out
     }
 
@@ -4313,6 +4373,8 @@ fn main() -> Result<()> {
         // The mouse hovers nothing until a `hover` step moves it: it starts at the centre
         // (for aiming), which is over the hero, whose name would be in every capture.
         let mut hovering = false;
+        // The highlight held by an `allnames` step (the pad's RT holds it too).
+        let mut all_names = false;
         // The game controller as `pad` steps hold it, and its part of the game.
         let mut pad_state = pad::PadState::default();
         let mut pad_play = padplay::PadPlay::default();
@@ -4518,6 +4580,8 @@ fn main() -> Result<()> {
                                     println!("aiming ability {}", aim.ability);
                                     l.aiming = Some(aim);
                                 }
+                                // No picture is taken for a save made headless.
+                                layer.take_saved_slots();
                                 for a in layer.take_text_answers() {
                                     println!(
                                         "text box {}: {} {:?}",
@@ -4535,6 +4599,7 @@ fn main() -> Result<()> {
                                     size.0 as f32,
                                     size.1 as f32,
                                 );
+                                layer.set_show_all_names(all_names || pad_play.highlight);
                                 let over = hovering.then(|| l.hovered_creature(o, d));
                                 layer.set_hovered(over.flatten());
                                 layer.update_floaties(&l.sim, &camera, dt, &|c| l.head_height(c));
@@ -4670,9 +4735,7 @@ fn main() -> Result<()> {
                         println!("asktext {prompt:?}");
                     }
                     &Step::AllNames(on) => {
-                        if let Some((layer, _)) = played.as_mut() {
-                            layer.set_show_all_names(on);
-                        }
+                        all_names = on;
                         println!("allnames {on}");
                     }
                     Step::AskChoice(prompt) => {

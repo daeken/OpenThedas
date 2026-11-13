@@ -10,13 +10,13 @@
 //! events (0x64b010): a plain script run with the hero as `OBJECT_SELF` and no event.
 //!
 //! Provisional: the order the tables are read in is the resource manager's, not traced;
-//! here they go by name. The exe also runs them again when add-ins are refreshed while
+//! here it is the prefix set's (`Tables::prefix_worksheets`). The exe also runs them again when add-ins are refreshed while
 //! playing (0x6031c0), which the simulation does not do. The module's area tree names a
 //! list `al_<name>`, cut to 27 characters, so a cut name matches by prefix.
 
 use std::sync::Arc;
 
-use thedas_formats::gda::{Cell, Gda};
+use thedas_formats::gda::Cell;
 
 use crate::sim::Sim;
 
@@ -26,19 +26,20 @@ const COL_SCRIPT: u32 = 0xf333_fe09;
 /// The longest an area tree's list name gets (`al_` and 24 characters).
 const TREE_NAME_MAX: usize = 27;
 
-/// The rows of one `PRCSCR_*.gda`: (area list, script), lower case.
-pub fn rows(g: &Gda) -> Vec<(String, String)> {
-    let col = |h: u32| g.columns.iter().position(|c| c.hash == h);
-    let (Some(list), Some(script)) = (col(COL_AREA_LIST), col(COL_SCRIPT)) else {
-        return Vec::new();
-    };
-    let text = |c: &Cell| match c {
-        Cell::String(s) => crate::engine::clean(s).to_ascii_lowercase(),
+/// The rows of one `PRCSCR_*` worksheet: (area list, script), lower case, in file order.
+pub fn rows(t: &crate::m2da::Table) -> Vec<(String, String)> {
+    let text = |c: Option<&Cell>| match c {
+        Some(Cell::String(s)) => crate::engine::clean(s).to_ascii_lowercase(),
         _ => String::new(),
     };
-    g.rows
+    t.order
         .iter()
-        .map(|r| (text(&r[list]), text(&r[script])))
+        .map(|&id| {
+            (
+                text(t.cell_by_hash(COL_AREA_LIST, id)),
+                text(t.cell_by_hash(COL_SCRIPT, id)),
+            )
+        })
         .filter(|(l, s)| !l.is_empty() && !s.is_empty())
         .collect()
 }
@@ -51,26 +52,19 @@ pub fn names_list(row: &str, tree: &str) -> bool {
 }
 
 impl Sim {
-    /// Every `PRCSCR_*.gda` row in the resource stack, read once.
+    /// Every row of the `PRCSCR_` prefix set (see `Tables::prefix_worksheets`: each
+    /// worksheet read on its own, in the set's order), read once.
     fn prcscr_rows(&mut self) -> Arc<Vec<(String, String)>> {
         if let Some(r) = &self.prcscr {
             return r.clone();
         }
-        let mut out = Vec::new();
-        for name in self.vfs.names() {
-            let lower = name.to_ascii_lowercase();
-            if !(lower.starts_with("prcscr_") && lower.ends_with(".gda")) {
-                continue;
-            }
-            if let Some(g) = self
-                .vfs
-                .read(&name)
-                .ok()
-                .and_then(|(d, _)| Gda::parse(&d).ok())
-            {
-                out.extend(rows(&g));
-            }
-        }
+        let out: Vec<(String, String)> = self
+            .world
+            .tables()
+            .prefix_worksheets("PRCSCR_")
+            .iter()
+            .flat_map(|(_, t)| rows(t))
+            .collect();
         let out = Arc::new(out);
         self.prcscr = Some(out.clone());
         out

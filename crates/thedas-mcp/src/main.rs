@@ -570,7 +570,7 @@ impl Server {
             let root = install_from_env().ok_or("no install: set THEDAS_INSTALL or call load")?;
             let install = thedas_vfs::DaoInstall::open(&root).map_err(|e| e.to_string())?;
             let vfs = install
-                .global_vfs(thedas_vfs::install::TextureQuality::High)
+                .play_vfs(thedas_vfs::install::TextureQuality::High)
                 .map_err(|e| e.to_string())?;
             st.ui_vfs = Some(Arc::new(vfs));
         }

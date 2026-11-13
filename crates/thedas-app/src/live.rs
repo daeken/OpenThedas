@@ -343,7 +343,7 @@ fn build_level_with(
 ) -> Result<LiveLevel> {
     let started = std::time::Instant::now();
     let install = DaoInstall::open(&spec.install)?;
-    let mut vfs = install.global_vfs(TextureQuality::High)?;
+    let mut vfs = install.play_vfs(TextureQuality::High)?;
     install.mount_level(&mut vfs, layout)?;
     let scene = AreaScene::load_with_props_at(&vfs, layout, &[], spec.detail)?;
     let programs = crate::programs_cached(&vfs, &scene, &spec.shaders, cache)?;
@@ -379,15 +379,24 @@ fn build_objects_with(
 ) -> Result<(AreaScene, AreaRenderer)> {
     let started = std::time::Instant::now();
     let props: Vec<Prop> = models.iter().map(prop).collect();
-    let scene = AreaScene::load_objects_at(vfs, layout, &props, spec.detail)?;
+    let scene =
+        AreaScene::load_objects_cached(vfs, layout, &props, spec.detail, &mut cache.scenes)?;
+    let loaded = started.elapsed();
     let programs = crate::programs_cached(vfs, &scene, &spec.shaders, cache)?;
+    let translated = started.elapsed();
     let mut renderer = AreaRenderer::new_cached(ctx, vfs, &scene, &programs, spec.format, cache);
+    let made = started.elapsed();
     renderer.warm(ctx, spec.size.0, spec.size.1);
     log::info!(
-        "{layout}: {} objects, {} draws, built in {:.2}s",
+        "{layout}: {} objects, {} draws, built in {:.2}s (scene {:.0} ms, programs {:.0}, \
+         renderer {:.0}, warm {:.0})",
         models.len(),
         scene.draws.len(),
-        started.elapsed().as_secs_f64()
+        started.elapsed().as_secs_f64(),
+        loaded.as_secs_f64() * 1000.0,
+        (translated - loaded).as_secs_f64() * 1000.0,
+        (made - translated).as_secs_f64() * 1000.0,
+        (started.elapsed() - made).as_secs_f64() * 1000.0
     );
     Ok((scene, renderer))
 }
@@ -690,6 +699,7 @@ impl Live {
             // Drop the old level now: its world is gone.
             self.level = None;
             self.cache = RenderCache::default();
+            self.animator = Animator::default();
             let (tx, rx) = std::sync::mpsc::channel();
             let (ctx, spec, name) = (share(ctx), self.spec(format), layout.to_string());
             let spawned = std::thread::Builder::new()
@@ -1743,6 +1753,42 @@ impl Live {
         true
     }
 
+    /// The frame buffer effects the playing cutscene, or the shown conversation line's own
+    /// cutscene, has running (their kind-19 tracks; see [`thedas_render::cut_effects`]):
+    /// depth of field and colour fades. Its other effects (`da_motionblur`, and the bloom
+    /// and colour matrix values a cutscene sets) are not drawn.
+    fn cut_effects(&mut self) -> thedas_render::cut_effects::CutEffects {
+        use thedas_render::cut_effects::{ColourFade, CutEffects, DepthOfField};
+        let sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
+        let states = match sim.world.cutscene.as_ref() {
+            Some(c) => {
+                let t = c.elapsed_ms as f32 / 1000.0;
+                self.cutscene_camera
+                    .tracks(&sim)
+                    .map(|tracks| tracks.frame_effects_at(t))
+                    .unwrap_or_default()
+            }
+            None => self.talk_camera.line_cut_effects(&sim),
+        };
+        let mut out = CutEffects::default();
+        for s in &states {
+            if s.effect.eq_ignore_ascii_case("da_dof") {
+                out.depth_of_field = Some(DepthOfField::from_parameters(|name| {
+                    s.parameter(name).map(|v| v[0])
+                }));
+            } else if s.effect.eq_ignore_ascii_case("da_colorfade") {
+                // The effect file's defaults for what the cutscene leaves out.
+                out.fades.push(ColourFade {
+                    start: s.parameter("StartColour").unwrap_or([0.0; 4]),
+                    end: s.parameter("EndColour").unwrap_or([1.0; 4]),
+                    time_to_fade: s.parameter("TimeToFade").map_or(6.0, |v| v[0]),
+                    time: s.time,
+                });
+            }
+        }
+        out
+    }
+
     /// Records the level's frame buffer effects over a frame [`Live::render`] drew into
     /// `target` (which needs `COPY_SRC` usage).
     pub fn finish_frame(
@@ -1755,10 +1801,18 @@ impl Live {
         if self.cutscene_movies.showing() {
             return;
         }
+        let cut_effects = self.cut_effects();
         if let Some(level) = self.level.as_mut() {
+            level.renderer.cut_effects = cut_effects;
+            let overlays: Vec<&AreaRenderer> = self
+                .objects
+                .iter()
+                .map(|o| &o.renderer)
+                .chain(self.effects.iter().map(|e| &e.renderer))
+                .collect();
             level
                 .renderer
-                .finish_frame(ctx, encoder, target, width, height);
+                .finish_frame_with(ctx, encoder, target, width, height, &overlays);
         }
     }
 
@@ -1778,9 +1832,11 @@ impl Live {
         }
         self.set_shader_time();
         self.apply_cutaway(ctx);
+        let cut_effects = self.cut_effects();
         let Some(level) = self.level.as_mut() else {
             return Ok(None);
         };
+        level.renderer.cut_effects = cut_effects;
         let mut overlays: Vec<&mut AreaRenderer> = self
             .objects
             .iter_mut()
@@ -1815,6 +1871,7 @@ impl Live {
     ) -> Result<LiveLevel> {
         // A new resource stack: nothing cached carries over.
         self.cache = RenderCache::default();
+        self.animator = Animator::default();
         build_level_with(ctx, &self.spec(format), layout, &mut self.cache)
     }
 
@@ -1845,8 +1902,8 @@ impl Live {
         scene: AreaScene,
         renderer: AreaRenderer,
     ) -> LiveObjects {
-        // A new scene means new skeleton indices.
-        self.animator = Animator::default();
+        // A new scene means new skeleton indices; the animations read stay.
+        self.animator.forget_skeletons();
         let mut bounds = std::collections::HashMap::new();
         let mut faces = std::collections::HashMap::new();
         let mut shapes = std::collections::HashMap::new();

@@ -174,6 +174,9 @@ pub struct SaveListing {
     /// The kind of save (`SaveType`): DAOrigins.exe's save folders by kind (0x642c70) are
     /// `Slot_` 0, `AutoSave_` 1, `QuickSave_` 2 and `PostCampaign_` 3.
     pub kind: i32,
+    /// The picture of the game taken when it was saved, as the name saveload.gfx loads
+    /// (`FILE:<name>`); empty for a save without one (the movie shows its default).
+    pub screenshot: String,
 }
 
 /// The inventory screen's item category tabs (inventory.gfx's `CATEGORY_*`).
@@ -968,8 +971,14 @@ const HASH_LOAD_HINT_TEXT: u32 = 0x4063_41be;
 /// text as DAOrigins.exe does at once (0x660ee0). None when no script set one: the random
 /// hints are the scripts' own picks (`SetLoadHint` from their random tables), not the exe's.
 pub fn load_hint(sim: &Sim) -> Option<String> {
+    hint_text(sim, sim.world.transition_hint)
+}
+
+/// A hint's text: row `hint.0` of M2DA `hint.1` (the load and death hint tables share their
+/// text column).
+fn hint_text(sim: &Sim, hint: Option<(i32, i32)>) -> Option<String> {
     use thedas_formats::gda::Cell;
-    let (row, table) = sim.world.transition_hint?;
+    let (row, table) = hint?;
     match sim
         .world
         .tables()
@@ -1604,7 +1613,11 @@ fn saves(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
             format!("{k}.LastLocation"),
             UiValue::String(last.map(|s| s.area.clone()).unwrap_or_default()),
         );
-        v.insert(format!("{k}.Screenshot"), UiValue::String(String::new()));
+        // The hero's picture is the newest save's.
+        v.insert(
+            format!("{k}.Screenshot"),
+            UiValue::String(last.map(|s| s.screenshot.clone()).unwrap_or_default()),
+        );
         // The details pane's level and class icon: the hero's (before a game, the newest
         // save's).
         let (level, class) = match sim.world.hero {
@@ -1662,7 +1675,10 @@ fn saves(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
             UiValue::String(s.last_played.clone()),
         );
         v.insert(format!("{k}.Story"), UiValue::String(String::new()));
-        v.insert(format!("{k}.Screenshot"), UiValue::String(String::new()));
+        v.insert(
+            format!("{k}.Screenshot"),
+            UiValue::String(s.screenshot.clone()),
+        );
         // The save's own class (the new save's is the hero's).
         let class = match (s.slot, sim.world.hero) {
             (-1, Some(h)) => sim.property_total(h, PROPERTY_CLASS),
@@ -1671,7 +1687,12 @@ fn saves(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
         v.insert(format!("{k}.ClassID"), num(class));
     }
     v.insert("Party.CapturedOnDeath".into(), num(0));
-    v.insert("GUIDeath.DeathHint".into(), UiValue::String(String::new()));
+    // The death screen's hint, when a script set one (`SetDeathHint`): its row's text in
+    // the hints table, as the load hints' (the same text column).
+    v.insert(
+        "GUIDeath.DeathHint".into(),
+        UiValue::String(hint_text(sim, sim.world.death_hint).unwrap_or_default()),
+    );
 }
 
 /// Time played as the screens show it, hours and minutes.
@@ -2622,12 +2643,14 @@ mod tests {
                 resref: "plt_bhn100pt_father".into(),
                 name: None,
                 completed: true,
+                ..Default::default()
             },
             Alert {
                 kind: ALERT_CODEX,
                 resref: "plt_cod_cha_duncan".into(),
                 name: None,
                 completed: false,
+                ..Default::default()
             },
         ];
         let v = sim_values(&sim);

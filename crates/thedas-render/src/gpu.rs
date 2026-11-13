@@ -438,6 +438,9 @@ pub struct RenderCache {
     pub(crate) programs: HashMap<String, Option<std::sync::Arc<crate::d3d::D3dProgram>>>,
     /// The shadow partitions every renderer made with this cache draws into and reads.
     pub(crate) shadows: Option<std::sync::Arc<crate::d3d_gpu::ShadowTargets>>,
+    /// What the objects' scenes built over these resources share (see
+    /// [`AreaScene::load_objects_cached`]).
+    pub scenes: crate::scene::SceneCache,
 }
 
 #[derive(Clone, Copy)]
@@ -509,6 +512,15 @@ pub struct AreaRenderer {
     /// The clock when the props were first posed, which their effects' timelines run from
     /// ([`crate::scene::EffectTimeline`]).
     pub effects_epoch: Option<f64>,
+    /// The distortion effect's targets, made when a frame first has distortion to draw.
+    distortion: Option<crate::distortion::Distortion>,
+    /// The frame buffer effects the cutscene playing has running, which
+    /// [`AreaRenderer::finish_frame_with`] draws (see [`crate::cut_effects`]); the caller
+    /// sets them each frame, and empties them when no cutscene plays.
+    pub cut_effects: crate::cut_effects::CutEffects,
+    cut_pass: Option<crate::cut_effects::CutEffectsPass>,
+    /// The projection the frame was last drawn with.
+    frame_projection: Option<glam::Mat4>,
     /// The draws of `CutAway` meshes ([`AreaScene::cut_away`]).
     cut_away: Vec<usize>,
     /// The emitters of models with a `CutAway` mesh ([`SceneEmitter::cut_away`]).
@@ -980,6 +992,10 @@ impl AreaRenderer {
                 })
                 .collect(),
             effects_epoch: None,
+            distortion: None,
+            cut_effects: Default::default(),
+            cut_pass: None,
+            frame_projection: None,
             light: StandInLight::default(),
             stats,
             cut_away: scene.cut_away.clone(),
@@ -1227,7 +1243,9 @@ impl AreaRenderer {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: DEPTH_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                // Sampled by the depth of field (see [`crate::cut_effects`]).
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
             self.depth = Some((
@@ -1327,6 +1345,8 @@ impl AreaRenderer {
         camera: &Camera,
         over: Option<&wgpu::TextureView>,
     ) {
+        // For the effects that read the depth buffer back (see `finish_frame_with`).
+        self.frame_projection = Some(camera.projection(width as f32 / height.max(1) as f32));
         let frame = FrameUniforms {
             view_proj: camera
                 .view_proj(width as f32 / height.max(1) as f32)
@@ -1417,7 +1437,7 @@ impl AreaRenderer {
         // Particles last, over everything else (the emitters' render classes are
         // transparent).
         if self.only_draws.is_none() {
-            self.d3d.draw_particles(&mut pass);
+            self.d3d.draw_particles(&mut pass, false);
         }
     }
 
@@ -1432,8 +1452,77 @@ impl AreaRenderer {
         width: u32,
         height: u32,
     ) {
+        self.finish_frame_with(ctx, encoder, target, width, height, &[]);
+    }
+
+    /// [`AreaRenderer::finish_frame`] for a frame `overlays` drew over this renderer's (see
+    /// [`AreaRenderer::render_over`]): their distortion particles go into the distortion
+    /// effect's mask with this renderer's (see [`crate::distortion`]). The distortion runs
+    /// before the level's own effects.
+    pub fn finish_frame_with(
+        &mut self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+        width: u32,
+        height: u32,
+        overlays: &[&AreaRenderer],
+    ) {
         if !self.frame_effects {
             return;
+        }
+        if self.d3d.has_distortion() || overlays.iter().any(|o| o.d3d.has_distortion()) {
+            let fits = self
+                .distortion
+                .as_ref()
+                .is_some_and(|d| d.fits(target.format(), (width, height)));
+            if !fits {
+                self.distortion = Some(crate::distortion::Distortion::new(
+                    &ctx.device,
+                    target.format(),
+                    (width, height),
+                ));
+            }
+            let depth = self.depth(&ctx.device, width, height);
+            if let Some(d) = &self.distortion {
+                d.apply(encoder, target, &depth, |pass| {
+                    self.d3d.draw_particles(pass, true);
+                    for o in overlays {
+                        o.d3d.draw_particles(pass, true);
+                    }
+                });
+            }
+        }
+        // The cutscene's own effects: depth of field (layer 5) before the level's (bloom
+        // 10, the Fade's 10, the colour matrix 20), the colour fades (40) after.
+        if !self.cut_effects.is_empty() {
+            let fits = self
+                .cut_pass
+                .as_ref()
+                .is_some_and(|p| p.fits(target.format(), (width, height)));
+            if !fits {
+                self.cut_pass = Some(crate::cut_effects::CutEffectsPass::new(
+                    &ctx.device,
+                    target.format(),
+                    (width, height),
+                ));
+            }
+        }
+        let depth = self.depth(&ctx.device, width, height);
+        if let (Some(dof), Some(pass), Some(projection)) = (
+            &self.cut_effects.depth_of_field,
+            &self.cut_pass,
+            self.frame_projection,
+        ) {
+            pass.depth_of_field(
+                &ctx.device,
+                &ctx.queue,
+                encoder,
+                target,
+                &depth,
+                projection,
+                dof,
+            );
         }
         if let Some(e) = self.effects.as_mut() {
             e.apply(
@@ -1444,6 +1533,16 @@ impl AreaRenderer {
                 width,
                 height,
                 self.time as f32,
+            );
+        }
+        if let (false, Some(pass)) = (self.cut_effects.fades.is_empty(), &self.cut_pass) {
+            pass.fades(
+                &ctx.device,
+                &ctx.queue,
+                encoder,
+                target,
+                &depth,
+                &self.cut_effects.fades,
             );
         }
     }
@@ -1516,7 +1615,10 @@ impl AreaRenderer {
                 o.render_over(ctx, &mut encoder, &view, width, height, camera, &depth);
             }
         }
-        self.finish_frame(ctx, &mut encoder, &target, width, height);
+        {
+            let over: Vec<&AreaRenderer> = overlays.iter().map(|o| &**o).collect();
+            self.finish_frame_with(ctx, &mut encoder, &target, width, height, &over);
+        }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &target,
