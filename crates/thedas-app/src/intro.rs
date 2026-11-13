@@ -2,8 +2,9 @@
 //! (0x5ec247, filled by 0x5dd870) is `dragon_age_ea_logo.bik` then `dragon_age_main.bik`,
 //! from `packages/core/data/movies`.
 //!
-//! Provisional: the Bink frames are decoded by an `ffmpeg` on the PATH (Homebrew's, on the
-//! Mac) until there is a Bink decoder of our own; without one the movies are skipped. They
+//! Provisional: the Bink frames are decoded by an `ffmpeg` beside the game or on the PATH
+//! (Homebrew's, on the Mac) until there is a Bink decoder of our own; without one the movies
+//! are skipped. They
 //! play silent (there is no audio yet). A key, a click or the pad's A, B or Start skips the
 //! movie playing (the exe's skip input is not traced). The options' `DisableIntroMovies`
 //! (and the exe's `FirstRun` gate) are not read; `--no-intro` skips them.
@@ -94,14 +95,36 @@ pub fn movie_path(vfs: &thedas_vfs::Vfs, install: &Path, name: &str) -> PathBuf 
     }
 }
 
-/// The `ffmpeg` that decodes the movies, if there is one.
+/// The `ffmpeg` that decodes the movies, if there is one: beside our own executable first
+/// (where a Windows player would drop `ffmpeg.exe`), then on the PATH, then, on the Mac, in
+/// Homebrew's folders (an app started from Finder does not get the shell's PATH).
 pub fn find_ffmpeg() -> Option<PathBuf> {
-    let candidates = std::env::var_os("PATH")
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let path = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
-        .unwrap_or_default()
-        .into_iter()
-        .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
-    candidates.map(|d| d.join("ffmpeg")).find(|p| p.is_file())
+        .unwrap_or_default();
+    let homebrew: &[&str] = if cfg!(target_os = "macos") {
+        &["/opt/homebrew/bin", "/usr/local/bin"]
+    } else {
+        &[]
+    };
+    ffmpeg_in(
+        beside
+            .into_iter()
+            .chain(path)
+            .chain(homebrew.iter().map(PathBuf::from)),
+    )
+}
+
+/// The first of `dirs` that holds an `ffmpeg` executable under this platform's name
+/// (`ffmpeg.exe` on Windows).
+fn ffmpeg_in(dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    let name = format!("ffmpeg{}", std::env::consts::EXE_SUFFIX);
+    dirs.into_iter()
+        .map(|d| d.join(&name))
+        .find(|p| p.is_file())
 }
 
 /// A movie decoding as it plays.
@@ -642,6 +665,37 @@ mod tests {
             b.extend_from_slice(&u32::to_le_bytes(v));
         }
         b
+    }
+
+    /// `ffmpeg` is found under the platform's executable name (`ffmpeg.exe` on Windows), in
+    /// the first folder that has it; a folder of that name does not count.
+    #[test]
+    fn ffmpeg_is_found_by_the_platforms_name_in_the_first_folder_that_has_it() {
+        let root = std::env::temp_dir().join(format!("thedas-ffmpeg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let name = format!("ffmpeg{}", std::env::consts::EXE_SUFFIX);
+        let dirs: Vec<PathBuf> = ["empty", "folder", "first", "second"]
+            .iter()
+            .map(|d| root.join(d))
+            .collect();
+        for d in &dirs {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::create_dir(dirs[1].join(&name)).unwrap();
+        std::fs::write(dirs[2].join(&name), b"").unwrap();
+        std::fs::write(dirs[3].join(&name), b"").unwrap();
+        // The other platform's name is never taken.
+        let other = if cfg!(windows) {
+            "ffmpeg"
+        } else {
+            "ffmpeg.exe"
+        };
+        std::fs::write(dirs[0].join(other), b"").unwrap();
+
+        assert_eq!(ffmpeg_in(dirs.clone()), Some(dirs[2].join(&name)));
+        assert_eq!(ffmpeg_in(dirs[..2].to_vec()), None);
+        assert_eq!(ffmpeg_in(Vec::new()), None);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
