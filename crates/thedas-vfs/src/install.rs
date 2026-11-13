@@ -499,6 +499,19 @@ fn archives_in(dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// The `AddInItem`s of an `AddIns.xml` registry, in file order, without their folders. An
 /// item with no `UID` is skipped.
+///
+/// `enabled` is what the original's registration tests, as far as the registry decides it
+/// (traced: the parser at 0x5faa34 and the record fill at 0x5f3b21..0x5f3f6f): the `Enabled`
+/// attribute must be non-zero (record byte +0x15d), and the `<Type>` child must be 1 or 2
+/// (record dword +0x150; 0x5f4610 registers an add-in's folders for nothing else, and an item
+/// without the element reads as 0). `State` is copied to the record (+0x170) but neither
+/// registration function tests it, so it is ignored here too.
+///
+/// Not applied, on purpose: `RequiresAuthorization` (+0x15e) needs the record's "authorized"
+/// byte (+0x15f), which the original sets from its online entitlement check; we have none,
+/// and an add-in on the player's disk is taken as theirs (GOG's registry carries no such
+/// attribute). Not reproduced: the byte at +0x177, which looks like the item's `GameVersion`
+/// held against the running game's.
 fn registry_items(text: &str) -> Vec<AddIn> {
     let mut out = Vec::new();
     let mut rest = text;
@@ -506,11 +519,25 @@ fn registry_items(text: &str) -> Vec<AddIn> {
         rest = &rest[start..];
         let end = rest.find('>').map_or(rest.len(), |e| e + 1);
         let tag = &rest[..end];
-        let addin = addin_from_manifest(tag, PathBuf::new(), String::new());
+        rest = &rest[end..];
+        // The item's children run to its closing tag, or to the next item, whichever is first.
+        let body = if tag.ends_with("/>") {
+            ""
+        } else {
+            let close = rest.find("</AddInItem>").unwrap_or(rest.len());
+            &rest[..rest
+                .find("<AddInItem")
+                .map_or(close, |next| close.min(next))]
+        };
+        let kind = body.find("<Type>").and_then(|a| {
+            let value = &body[a + "<Type>".len()..];
+            value[..value.find('<')?].trim().parse::<i64>().ok()
+        });
+        let mut addin = addin_from_manifest(tag, PathBuf::new(), String::new());
+        addin.enabled &= matches!(kind, Some(1 | 2));
         if !addin.uid.is_empty() {
             out.push(addin);
         }
-        rest = &rest[end..];
     }
     out
 }
@@ -929,6 +956,16 @@ mod tests {
             "install/Addins/with_manifest/core/data/m.erf",
             &erf_v20(&[("m.uti", b"manifest")]),
         );
+        // Named by the registry but switched off, with no type, and with a type the original
+        // registers nothing for: none of them is mounted.
+        for (dir, name) in [
+            ("switched_off", "off"),
+            ("no_type", "n"),
+            ("type_three", "t"),
+        ] {
+            let rel = format!("install/Addins/{dir}/core/data/{name}.erf");
+            write(&rel, &erf_v20(&[(&format!("{name}.uti"), b"x")]));
+        }
         write(
             "install/Addins/with_manifest/Manifest.xml",
             br#"<AddInItem UID="WITH_MANIFEST" ExtendedModuleUID="Single Player" Priority="9" Enabled="1">"#,
@@ -936,23 +973,41 @@ mod tests {
         write(
             "install/__support/userdocs/AddIns.xml",
             br#"<?xml version="1.0"?><AddInsList>
-  <AddInItem UID="PROMO_ONE" Name="One" ExtendedModuleUID="Single Player" Priority="1" Enabled="1" State="2">
+  <AddInItem UID="PROMO_ONE" Name="One" ExtendedModuleUID="Single Player" Priority="1" Enabled="1" State="0">
     <Title DefaultText="One"><en-us><![CDATA[One > Two]]></en-us></Title>
+    <Type>1</Type>
   </AddInItem>
   <AddInItem UID="PROMO_TWO" ExtendedModuleUID="Another Campaign" Priority="5" Enabled="1" >
+    <Type> 2 </Type>
   </AddInItem>
   <AddInItem UID="NOT_INSTALLED" ExtendedModuleUID="Single Player" Priority="2" Enabled="1">
+    <Type>1</Type>
   </AddInItem>
-  <AddInItem UID="WITH_MANIFEST" ExtendedModuleUID="Single Player" Priority="3" Enabled="1">
+  <AddInItem UID="WITH_MANIFEST" ExtendedModuleUID="Single Player" Priority="3" Enabled="1" RequiresAuthorization="1">
+    <Type>1</Type>
+  </AddInItem>
+  <AddInItem UID="SWITCHED_OFF" ExtendedModuleUID="Single Player" Priority="4" Enabled="0">
+    <Type>1</Type>
+  </AddInItem>
+  <AddInItem UID="NO_TYPE" ExtendedModuleUID="Single Player" Priority="4" Enabled="1">
+  </AddInItem>
+  <AddInItem UID="TYPE_THREE" ExtendedModuleUID="Single Player" Priority="4" Enabled="1">
+    <Type>3</Type>
   </AddInItem>
 </AddInsList>"#,
         );
         let install = DaoInstall::open(&root).unwrap();
-        let list: Vec<(String, i64)> = install
-            .addins()
-            .unwrap()
-            .into_iter()
-            .map(|a| (a.uid, a.priority))
+        let all = install.addins().unwrap();
+        let off: Vec<&str> = all
+            .iter()
+            .filter(|a| !a.enabled)
+            .map(|a| a.uid.as_str())
+            .collect();
+        assert_eq!(off, ["NO_TYPE", "SWITCHED_OFF", "TYPE_THREE"]);
+        let list: Vec<(String, i64)> = all
+            .iter()
+            .filter(|a| a.enabled)
+            .map(|a| (a.uid.clone(), a.priority))
             .collect();
         // The registry's priority for the one that also has a manifest (3, not 9).
         assert_eq!(
@@ -969,12 +1024,16 @@ mod tests {
         // Another campaign's: `core` only.
         assert_eq!(vfs.read("p2.uti").unwrap().0, b"promo two");
         assert!(vfs.lookup("p2.plo").is_none());
+        // `RequiresAuthorization` does not keep an add-in out, nor does `State`.
         assert_eq!(vfs.read("m.uti").unwrap().0, b"manifest");
+        for gone in ["off.uti", "n.uti", "t.uti"] {
+            assert!(vfs.lookup(gone).is_none(), "{gone}");
+        }
 
         // The player's own registry comes first: here it switches one add-in off.
         write(
             "docs/Settings/AddIns.xml",
-            br#"<AddInsList><AddInItem UID="promo_one" ExtendedModuleUID="Single Player" Priority="1" Enabled="0"></AddInItem></AddInsList>"#,
+            br#"<AddInsList><AddInItem UID="promo_one" ExtendedModuleUID="Single Player" Priority="1" Enabled="0"><Type>1</Type></AddInItem></AddInsList>"#,
         );
         let vfs = install
             .stack(TextureQuality::High, Some(&base.join("docs")), Vec::new())
