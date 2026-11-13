@@ -129,6 +129,9 @@ pub struct Sim {
     pub(crate) collisions: HashMap<String, Option<Arc<crate::collision::Collision>>>,
     /// Each area's placeables' collision and the key of the placeables it was built from.
     pub(crate) placeable_collisions: HashMap<ObjectId, (u64, Arc<crate::collision::Collision>)>,
+    /// Each door's collision for sight lines (`None`: its model has none) and the key of the
+    /// model and placement it was built from (see `Sim::door_sight`).
+    pub(crate) door_collisions: HashMap<ObjectId, (u64, Option<Arc<crate::collision::Collision>>)>,
     /// Walkers held up by another creature's body: since when, and whether that was
     /// reported (see `Sim::advance_movers`). Not saved.
     pub(crate) blocked_since: HashMap<ObjectId, (u64, bool)>,
@@ -543,6 +546,7 @@ impl Sim {
             line_cuts: HashMap::new(),
             collisions: HashMap::new(),
             placeable_collisions: HashMap::new(),
+            door_collisions: HashMap::new(),
             blocked_since: HashMap::new(),
             fire_lengths: HashMap::new(),
             attack_lengths: HashMap::new(),
@@ -598,6 +602,17 @@ impl Sim {
     pub fn restore(&mut self, s: (World, Option<crate::dialog::Conversation>)) {
         self.world = s.0;
         self.talk = s.1;
+        self.forget_world_caches();
+    }
+
+    /// Drops the caches keyed by object id, which belong to a world just replaced (a load
+    /// or a restore): object ids are reused across worlds.
+    pub(crate) fn forget_world_caches(&mut self) {
+        self.area_layouts.clear();
+        self.door_cells.clear();
+        self.placeable_collisions.clear();
+        self.door_collisions.clear();
+        self.blocked_since.clear();
     }
 
     /// Registers a compiled script under a name, ahead of the resource stack (tools, tests).

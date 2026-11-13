@@ -36,3 +36,4 @@ gilrs = "0.11"
 dirs = "6"
 flate2.workspace = true
 ureq = "3"
+sha2 = "0.11"

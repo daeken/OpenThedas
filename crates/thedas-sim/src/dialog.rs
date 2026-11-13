@@ -494,6 +494,12 @@ impl Sim {
             });
             return false;
         };
+        self.open_conversation(initiator, target, d)
+    }
+
+    /// Starts conversation `d` (read when it was asked for, as DAOrigins.exe loads it with
+    /// the request, 0x68cee0 -> 0x7ef310) between `initiator` and `target`.
+    fn open_conversation(&mut self, initiator: ObjectId, target: ObjectId, d: Dlg) -> bool {
         let player = if Some(initiator) == self.world.hero || target == OBJECT_INVALID {
             initiator
         } else {
@@ -522,6 +528,14 @@ impl Sim {
             let party = crate::engine::party_of(sim);
             ambient_start || (!party.contains(&initiator) && !party.contains(&target))
         };
+        // One asked for while another is going on waits for it to end: DAOrigins.exe's
+        // conversation is a game mode request (0x697765), and a running conversation does
+        // not give way (its +0x28 is false), so the request waits in the mode controller's
+        // pending list (0x6414a0, 0x640c60). Its start is chosen when it starts.
+        if !ambient(self) && self.talk.as_ref().is_some_and(|t| !t.ended) {
+            self.world.pending_talks.push((initiator, target, d));
+            return true;
+        }
         let c = Conversation {
             ambient_run: ambient(self),
             ..c
@@ -584,6 +598,11 @@ impl Sim {
     /// Once no conversation is going on, the game goes back to the mode the conversation
     /// replaced (or one a script asked for meanwhile), and the module hears it.
     pub(crate) fn leave_conversation_mode(&mut self) {
+        // A conversation waiting for this one starts in its place, in the same mode.
+        while self.talk.as_ref().is_none_or(|c| c.ended) && !self.world.pending_talks.is_empty() {
+            let (initiator, target, d) = self.world.pending_talks.remove(0);
+            self.open_conversation(initiator, target, d);
+        }
         let Some(before) = self.world.mode_before_talk else {
             return;
         };
@@ -840,6 +859,39 @@ mod tests {
         let st = sim.choose_reply(0).unwrap();
         assert_eq!(st.line, "line 13");
         assert!(st.ended);
+    }
+
+    #[test]
+    fn a_conversation_asked_for_during_another_waits_for_it() {
+        // The City Elf's hooligans: the hero's talk with Valora, ordered before the trigger,
+        // came due during Vaughan's conversation and cut it short.
+        let d = Dlg::from_gff4(&doc(), "test").unwrap();
+        let named = |name: &str| Dlg {
+            name: name.into(),
+            ..d.clone()
+        };
+        let table = std::sync::Arc::new(thedas_script::EngineTable::default());
+        let mut sim = Sim::new(std::sync::Arc::new(thedas_vfs::Vfs::new()), table, 1);
+        let mut spawn = |tag: &str| sim.world.spawn(crate::world::ObjectKind::Creature, tag);
+        let (hero, vaughan, valora) = (spawn("player"), spawn("vaughan"), spawn("valora"));
+        sim.world.hero = Some(hero);
+        assert!(sim.open_conversation(hero, vaughan, named("vaughan")));
+        assert!(
+            sim.open_conversation(hero, valora, named("valora")),
+            "asked for"
+        );
+        let talk = sim.talk.as_ref().unwrap();
+        assert_eq!((talk.dlg.name.as_str(), talk.owner), ("vaughan", vaughan));
+        assert_eq!(sim.dialog_state().unwrap().line, "line 10", "still going");
+        sim.tick(100);
+        assert_eq!(sim.talk.as_ref().unwrap().owner, vaughan, "it waits");
+        // Vaughan's ends; Valora's starts in its place.
+        assert!(sim.choose_reply(0).unwrap().ended);
+        sim.tick(0);
+        let talk = sim.talk.as_ref().unwrap();
+        assert_eq!((talk.dlg.name.as_str(), talk.owner), ("valora", valora));
+        assert!(!talk.ended);
+        assert!(sim.world.pending_talks.is_empty());
     }
 
     #[test]
