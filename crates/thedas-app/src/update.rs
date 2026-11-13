@@ -20,6 +20,22 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::json;
 
+/// The environment variable naming the folder of the program the player started, handed
+/// down to every build started from it (an update's, or the newest build taking over), so
+/// what the player put beside their download (`ffmpeg.exe`) is still found.
+pub const PROGRAM_DIR: &str = "THEDAS_PROGRAM_DIR";
+
+/// The folder to hand down as [`PROGRAM_DIR`]: the one already handed to us, else our own.
+pub fn program_dir() -> Option<PathBuf> {
+    std::env::var_os(PROGRAM_DIR)
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        })
+}
+
 /// The file holding the builds' address, in the player's data folder.
 pub const URL_FILE: &str = "update-url";
 /// The most a build's download may be (bytes).
@@ -377,6 +393,7 @@ pub fn start_build(
         .arg(size)
         .arg("--no-intro")
         .args(more)
+        .envs(program_dir().map(|d| (PROGRAM_DIR, d)))
         .current_dir(exe.parent().unwrap_or(Path::new(".")))
         .spawn()
         .with_context(|| format!("starting {}", exe.display()))?;
