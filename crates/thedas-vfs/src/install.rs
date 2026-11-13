@@ -165,11 +165,12 @@ impl DaoInstall {
         let dir = join_ci(&self.root, "Addins");
         let mut out: Vec<AddIn> = Vec::new();
         let install_registry = join_ci(&self.root, "__support/userdocs/AddIns.xml");
+        let game_version = (self.game() == Game::Origins).then_some(ORIGINS_VERSION);
         for registry in registries.iter().chain([&install_registry]) {
             let Ok(bytes) = std::fs::read(registry) else {
                 continue;
             };
-            for item in registry_items(&String::from_utf8_lossy(&bytes)) {
+            for item in registry_items(&String::from_utf8_lossy(&bytes), game_version) {
                 let known = out.iter().any(|a| a.uid.eq_ignore_ascii_case(&item.uid));
                 let folder = resolve_ci(&dir, &item.uid).filter(|d| d.is_dir());
                 if let (false, Some(folder)) = (known, folder) {
@@ -534,9 +535,13 @@ fn archives_in(dir: &Path) -> Result<Vec<PathBuf>> {
 /// Not applied, on purpose: `RequiresAuthorization` (+0x15e) needs the record's "authorized"
 /// byte (+0x15f), which the original sets from its online entitlement check; we have none,
 /// and an add-in on the player's disk is taken as theirs (GOG's registry carries no such
-/// attribute). Not reproduced: the byte at +0x177, which looks like the item's `GameVersion`
-/// held against the running game's.
-fn registry_items(text: &str) -> Vec<AddIn> {
+/// attribute).
+///
+/// The `<GameVersion>` child is a gate too (record byte +0x177: set at 0x5ede12, cleared at
+/// 0x5edea4 when the number read from the item's `GameVersion` is greater than the number read
+/// from the running game's version): an add-in made for a newer game is not registered.
+/// `game_version` is the game's side of that comparison; `None` skips the gate.
+fn registry_items(text: &str, game_version: Option<f64>) -> Vec<AddIn> {
     let mut out = Vec::new();
     let mut rest = text;
     while let Some(start) = rest.find("<AddInItem") {
@@ -557,13 +562,46 @@ fn registry_items(text: &str) -> Vec<AddIn> {
             let value = &body[a + "<Type>".len()..];
             value[..value.find('<')?].trim().parse::<i64>().ok()
         });
+        let needs = body.find("<GameVersion>").map_or(0.0, |a| {
+            let value = &body[a + "<GameVersion>".len()..];
+            leading_number(&value[..value.find('<').unwrap_or(value.len())])
+        });
         let mut addin = addin_from_manifest(tag, PathBuf::new(), String::new());
         addin.enabled &= matches!(kind, Some(1 | 2));
+        addin.enabled &= game_version.is_none_or(|game| needs <= game);
         if !addin.uid.is_empty() {
             out.push(addin);
         }
     }
     out
+}
+
+/// The game version Dragon Age: Origins' final executable reports, for the registry's
+/// `GameVersion` gate. Provisional: the original compares against a version string it builds
+/// at run time (0x5ede19..0x5ede77), not read; 1.05 is the last retail patch, which the GOG
+/// build is.
+const ORIGINS_VERSION: f64 = 1.05;
+
+/// The number a C `wcstod` would read off the start of a string: leading spaces, an optional
+/// sign, digits with at most one point; 0 when there are no digits there (`V1.03` is 0).
+fn leading_number(s: &str) -> f64 {
+    let s = s.trim_start();
+    let mut end = 0;
+    let mut seen_point = false;
+    let mut digits = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '+' | '-' if i == 0 => {}
+            '0'..='9' => digits += 1,
+            '.' if !seen_point => seen_point = true,
+            _ => break,
+        }
+        end = i + c.len_utf8();
+    }
+    if digits == 0 {
+        return 0.0;
+    }
+    s[..end].trim_end_matches('.').parse().unwrap_or(0.0)
 }
 
 /// Pulls one attribute off the first occurrence of an element. Enough for DLC manifests,
@@ -987,6 +1025,7 @@ mod tests {
             ("switched_off", "off"),
             ("no_type", "n"),
             ("type_three", "t"),
+            ("too_new", "new"),
         ] {
             let rel = format!("install/Addins/{dir}/core/data/{name}.erf");
             write(&rel, &erf_v20(&[(&format!("{name}.uti"), b"x")]));
@@ -1000,6 +1039,7 @@ mod tests {
             br#"<?xml version="1.0"?><AddInsList>
   <AddInItem UID="PROMO_ONE" Name="One" ExtendedModuleUID="Single Player" Priority="1" Enabled="1" State="0">
     <Title DefaultText="One"><en-us><![CDATA[One > Two]]></en-us></Title>
+    <GameVersion>V1.03</GameVersion>
     <Type>1</Type>
   </AddInItem>
   <AddInItem UID="PROMO_TWO" ExtendedModuleUID="Another Campaign" Priority="5" Enabled="1" >
@@ -1016,6 +1056,10 @@ mod tests {
   </AddInItem>
   <AddInItem UID="NO_TYPE" ExtendedModuleUID="Single Player" Priority="4" Enabled="1">
   </AddInItem>
+  <AddInItem UID="TOO_NEW" ExtendedModuleUID="Single Player" Priority="4" Enabled="1">
+    <GameVersion>1.06</GameVersion>
+    <Type>1</Type>
+  </AddInItem>
   <AddInItem UID="TYPE_THREE" ExtendedModuleUID="Single Player" Priority="4" Enabled="1">
     <Type>3</Type>
   </AddInItem>
@@ -1029,7 +1073,7 @@ mod tests {
             .map(|a| a.uid.as_str())
             .collect();
         // Lowest in the stack first: the registry's order backwards.
-        assert_eq!(off, ["TYPE_THREE", "NO_TYPE", "SWITCHED_OFF"]);
+        assert_eq!(off, ["TYPE_THREE", "TOO_NEW", "NO_TYPE", "SWITCHED_OFF"]);
         let list: Vec<(String, i64)> = all
             .iter()
             .filter(|a| a.enabled)
@@ -1055,7 +1099,7 @@ mod tests {
         assert!(vfs.lookup("p2.plo").is_none());
         // `RequiresAuthorization` does not keep an add-in out, nor does `State`.
         assert_eq!(vfs.read("m.uti").unwrap().0, b"manifest");
-        for gone in ["off.uti", "n.uti", "t.uti"] {
+        for gone in ["off.uti", "n.uti", "t.uti", "new.uti"] {
             assert!(vfs.lookup(gone).is_none(), "{gone}");
         }
 
@@ -1076,6 +1120,22 @@ mod tests {
             .unwrap();
         assert!(vfs.lookup("p1.uti").is_some());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn reads_a_leading_number_as_the_c_library_would() {
+        for (text, n) in [
+            ("1.04", 1.04),
+            (" 1", 1.0),
+            ("1.0.3", 1.0),
+            ("V1.03", 0.0),
+            ("", 0.0),
+            ("1.", 1.0),
+            ("-2.5x", -2.5),
+            (".5", 0.5),
+        ] {
+            assert_eq!(leading_number(text), n, "{text:?}");
+        }
     }
 
     #[test]
