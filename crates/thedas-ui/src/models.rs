@@ -268,6 +268,68 @@ fn base_head(sim: &Sim, prefix: &str) -> Vec<String> {
         .collect()
 }
 
+/// Dragon Age II's one table of item and body-part models (`item_variations.gda`); Dragon
+/// Age: Origins has a table per item type instead, so its presence tells the games apart.
+const DA2_ITEM_VARIATIONS: &str = "item_variations";
+
+/// `item_variations.gda`'s rows for the unclothed chest, hands and feet.
+const DA2_UNCLOTHED: [i64; 3] = [10, 11, 12];
+
+/// A Dragon Age II model resource (without `.mmh`): the art folder, the folder of the race
+/// and gender, and the model (`art\characters\playercharacter\humanmale\arm_nuda`). DA2
+/// names model resources by their whole art path and without a level-of-detail suffix.
+fn da2_model(path: &str, folder: &str, model: &str) -> String {
+    format!("{path}\\{folder}\\{model}").to_ascii_lowercase()
+}
+
+/// The models of a Dragon Age II creature with appearance row `app` of `apr_base.gda`.
+///
+/// Read from the shipped tables and resources (provisional; not traced in DragonAge2.exe,
+/// and the table columns are the ones xoreos names):
+/// - `ModelRace` and `ModelGenderOverride` are words (`Human`, `Male`) that join into the
+///   folder its models are in (`humanmale`); a row with neither uses `shared`.
+/// - A whole-body row's `ModelName` is the model's full art path.
+/// - A part-based row (`ModelType` `P`) has no `ModelName`: its body is the chest, hands
+///   and feet of `item_variations.gda` (`ModelPath` and `Model`; the unclothed ones for now).
+/// - The head is the first row of the race's head table (`Head_Worksheet`, a table id).
+///
+/// Not done yet: worn equipment, head morphs (their node names are hashed), hair, tints
+/// and weapons. The names are what the tables say; the caller keeps the ones that exist.
+fn da2_creature_models(
+    sim: &Sim,
+    apr: &thedas_sim::m2da::Table,
+    variations: &thedas_sim::m2da::Table,
+    app: i64,
+) -> Vec<String> {
+    let word = |column: &str| text(apr.cell(column, app)).unwrap_or_default();
+    let folder = match format!("{}{}", word("ModelRace"), word("ModelGenderOverride")) {
+        f if f.is_empty() => "shared".to_string(),
+        f => f,
+    };
+    let part = |table: &thedas_sim::m2da::Table, row: i64| {
+        let model = text(table.cell("Model", row))?;
+        let path = text(table.cell("ModelPath", row)).unwrap_or_default();
+        Some(da2_model(&path, &folder, &model))
+    };
+    let mut models = Vec::new();
+    match text(apr.cell("ModelName", app)) {
+        Some(name) => models.push(name.to_ascii_lowercase()),
+        None => models.extend(
+            DA2_UNCLOTHED
+                .iter()
+                .filter_map(|&row| part(variations, row)),
+        ),
+    }
+    let heads = match apr.cell("Head_Worksheet", app) {
+        Some(Cell::Int(id)) if *id > 0 => sim.world.tables().get(*id as i32, ""),
+        _ => None,
+    };
+    if let Some(heads) = heads {
+        models.extend(heads.order.first().and_then(|&row| part(&heads, row)));
+    }
+    models
+}
+
 /// What draws one creature or placeable.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Drawn {
@@ -428,6 +490,14 @@ fn object_models_in(sim: &Sim, o: &Object, gear: Gear) -> Drawn {
                 return Drawn::default();
             };
             let app = o.appearance as i64;
+            if let Some(variations) = tables.get(0, DA2_ITEM_VARIATIONS) {
+                let mut models = da2_creature_models(sim, &t, &variations, app);
+                models.retain(|m| has_model(sim, m));
+                return Drawn {
+                    models,
+                    ..Default::default()
+                };
+            }
             let kind = text(t.cell("ModelType", app)).unwrap_or_default();
             let morph = head_morph(sim, o);
             let mut hide_hair = false;
@@ -1199,6 +1269,128 @@ mod tests {
         assert_eq!(var(sword), Some(("lsw".into(), "ls01a".into())));
         assert_eq!(var(claw), None, "no variation table");
         assert_eq!(var(unknown), None, "no such variation");
+    }
+
+    #[test]
+    fn dragon_age_2_creatures_name_their_models_by_art_path() {
+        use std::sync::Arc;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let t = s.world.tables();
+        let st = |v: &str| Cell::String(v.into());
+        t.insert(
+            "apr_base",
+            &[
+                "Label",
+                "ModelName",
+                "ModelType",
+                "ModelRace",
+                "ModelGenderOverride",
+                "Head_Worksheet",
+            ],
+            vec![
+                (
+                    15,
+                    vec![
+                        st("PC - Human, Male"),
+                        Cell::Empty,
+                        st("P "),
+                        st("Human "),
+                        st("Male "),
+                        Cell::Int(13000),
+                    ],
+                ),
+                (
+                    17,
+                    vec![
+                        st("PC Home - Human, Male"),
+                        st("art\\Characters\\PlayerCharacter\\HumanMale\\cth_homa "),
+                        st("H "),
+                        st("Human "),
+                        st("Male "),
+                        Cell::Int(13000),
+                    ],
+                ),
+                (
+                    90,
+                    vec![
+                        st("Mabari"),
+                        st("art\\characters\\creatures\\mabari\\c_dog"),
+                        st("S"),
+                        Cell::Empty,
+                        Cell::Empty,
+                        Cell::Int(0),
+                    ],
+                ),
+            ],
+        );
+        t.insert(
+            DA2_ITEM_VARIATIONS,
+            &["Label", "ModelPath", "Model"],
+            vec![
+                (
+                    10,
+                    vec![
+                        st("Nude - Chest"),
+                        st("art\\characters\\playercharacter "),
+                        st("arm_nuda "),
+                    ],
+                ),
+                (
+                    11,
+                    vec![
+                        st("Nude - Hands"),
+                        st("art\\characters\\playercharacter"),
+                        st("glv_nuda"),
+                    ],
+                ),
+                (
+                    12,
+                    vec![
+                        st("Nude - Boots"),
+                        st("art\\characters\\playercharacter"),
+                        st("boo_nuda"),
+                    ],
+                ),
+            ],
+        );
+        t.insert(
+            "#13000",
+            &["Label", "ModelPath", "Model"],
+            vec![(
+                1,
+                vec![
+                    st("Default"),
+                    st("art\\characters\\playercharacter"),
+                    st("mt_bas_hm"),
+                ],
+            )],
+        );
+        let apr = t.get(0, "apr_base").unwrap();
+        let vars = t.get(0, DA2_ITEM_VARIATIONS).unwrap();
+        let models = |app| da2_creature_models(&s, &apr, &vars, app);
+        // Part-based: the unclothed chest, hands and feet, then the race's base head.
+        assert_eq!(
+            models(15),
+            [
+                "art\\characters\\playercharacter\\humanmale\\arm_nuda",
+                "art\\characters\\playercharacter\\humanmale\\glv_nuda",
+                "art\\characters\\playercharacter\\humanmale\\boo_nuda",
+                "art\\characters\\playercharacter\\humanmale\\mt_bas_hm",
+            ]
+        );
+        // Whole body with a head: the row's own model, then the head.
+        assert_eq!(
+            models(17),
+            [
+                "art\\characters\\playercharacter\\humanmale\\cth_homa",
+                "art\\characters\\playercharacter\\humanmale\\mt_bas_hm",
+            ]
+        );
+        // A creature with neither race nor head table: just its model.
+        assert_eq!(models(90), ["art\\characters\\creatures\\mabari\\c_dog"]);
+        assert!(models(999).is_empty(), "no such appearance");
     }
 
     #[test]
