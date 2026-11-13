@@ -1274,7 +1274,8 @@ impl App {
         };
         g.ui.set_hovered(hovered);
         g.ui.set_line_voiced(voiced);
-        // Tab held shows every creature's name (never while it is typed into a field).
+        // Tab held shows every creature's name (never while it is typed into a field):
+        // keymap.gda binds `HighlightObjects` to Tab.
         let tab = self.all_names || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
         g.ui.set_show_all_names(tab);
         play_interface(
@@ -1406,7 +1407,8 @@ impl App {
         };
         g.ui.set_hovered(hovered);
         g.ui.set_line_voiced(voiced);
-        // Tab held shows every creature's name (never while it is typed into a field).
+        // Tab held shows every creature's name (never while it is typed into a field):
+        // keymap.gda binds `HighlightObjects` to Tab.
         let tab = self.all_names || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
         g.ui.set_show_all_names(tab);
         play_interface(
@@ -2056,8 +2058,8 @@ impl App {
             // While playing, P opens the spells/talents screen instead.
             KeyCode::KeyP if self.screens.is_none() => println!("camera {}", self.camera.spec()),
             // F5 quick save, F9 quick load: the exe's `QuickSave` and `QuickLoad` actions
-            // (0x51e4d0, 0x51e6f6). Provisional: that they are bound to F5 and F9 is the
-            // original's default as played, not read from keymap.gda here.
+            // (0x51e4d0, 0x51e6f6), which keymap.gda binds to F5 and F9. Provisional: the
+            // keys are fixed here, not read from the player's bindings.
             KeyCode::F5 | KeyCode::F9
                 if self
                     .screens
