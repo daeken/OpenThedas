@@ -46,6 +46,13 @@ pub enum SimCommand {
         target: ObjectId,
         dialog: String,
     },
+    /// Sets one of an object's variables (`value`), or removes it (`None`). The module
+    /// object's variables are the game's globals.
+    SetLocal {
+        target: ObjectId,
+        name: String,
+        value: Option<LocalValue>,
+    },
     /// The simulation's clock goes on by `ms` milliseconds (0: what is due now runs).
     Tick {
         ms: u64,
@@ -175,8 +182,35 @@ impl SimCommand {
     pub fn is_edit(&self) -> bool {
         matches!(
             self,
-            SimCommand::SetPlotFlag { .. } | SimCommand::StartConversation { .. }
+            SimCommand::SetPlotFlag { .. }
+                | SimCommand::StartConversation { .. }
+                | SimCommand::SetLocal { .. }
         )
+    }
+}
+
+/// A variable's value, of one of the types an object keeps
+/// ([`crate::world::Locals`]; locations are not set this way).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum LocalValue {
+    Int(i32),
+    Float(f32),
+    String(String),
+    Object(ObjectId),
+    Resource(String),
+}
+
+impl LocalValue {
+    /// The variable's type, as the panels name it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            LocalValue::Int(_) => "int",
+            LocalValue::Float(_) => "float",
+            LocalValue::String(_) => "string",
+            LocalValue::Object(_) => "object",
+            LocalValue::Resource(_) => "resource",
+        }
     }
 }
 
@@ -199,6 +233,9 @@ pub enum CommandOutcome {
     /// Another conversation is open: this one starts when it ends (if its owner is still
     /// there to talk).
     ConversationQueued { dialog: String },
+    /// The variable was set (or removed). `replaced` is what it held, of the same type
+    /// (`None`: it was not there): setting it back undoes it.
+    LocalSet { replaced: Option<LocalValue> },
     /// A play input carried out (`ok`: what the method answered, where it answers).
     Done { ok: bool },
     /// Nothing was done.
@@ -280,6 +317,11 @@ impl Sim {
                 target,
                 dialog,
             } => self.start_commanded_conversation(*initiator, *target, dialog),
+            SimCommand::SetLocal {
+                target,
+                name,
+                value,
+            } => self.set_commanded_local(*target, name, value.as_ref()),
             other => CommandOutcome::Done {
                 ok: self.play_input(other),
             },
@@ -301,6 +343,7 @@ impl Sim {
                 .iter()
                 .filter_map(|&id| self.object_ref(id))
                 .collect(),
+            SimCommand::SetLocal { target, .. } => self.object_ref(*target).into_iter().collect(),
             _ => Vec::new(),
         };
         let entry = JournalEntry {
@@ -328,11 +371,49 @@ impl Sim {
         outcome
     }
 
+    /// [`SimCommand::SetLocal`]: the variable of `value`'s type set, or (`None`) removed.
+    fn set_commanded_local(
+        &mut self,
+        target: ObjectId,
+        name: &str,
+        value: Option<&LocalValue>,
+    ) -> CommandOutcome {
+        let Some(o) = self.world.get_mut(target) else {
+            return CommandOutcome::Refused {
+                reason: "no such object".into(),
+            };
+        };
+        let l = &mut o.locals;
+        let name = name.to_string();
+        let replaced = match value {
+            Some(LocalValue::Int(v)) => l.ints.insert(name, *v).map(LocalValue::Int),
+            Some(LocalValue::Float(v)) => l.floats.insert(name, *v).map(LocalValue::Float),
+            Some(LocalValue::String(v)) => {
+                l.strings.insert(name, v.clone()).map(LocalValue::String)
+            }
+            Some(LocalValue::Object(v)) => l.objects.insert(name, *v).map(LocalValue::Object),
+            Some(LocalValue::Resource(v)) => l
+                .resources
+                .insert(name, v.clone())
+                .map(LocalValue::Resource),
+            // Removed: whichever type holds it (the first, should two types share a name).
+            None => l
+                .ints
+                .remove(&name)
+                .map(LocalValue::Int)
+                .or_else(|| l.floats.remove(&name).map(LocalValue::Float))
+                .or_else(|| l.strings.remove(&name).map(LocalValue::String))
+                .or_else(|| l.objects.remove(&name).map(LocalValue::Object))
+                .or_else(|| l.resources.remove(&name).map(LocalValue::Resource)),
+        };
+        CommandOutcome::LocalSet { replaced }
+    }
+
     /// Carries out a play input; what the method answered, where it answers.
     fn play_input(&mut self, c: &SimCommand) -> bool {
         use SimCommand as C;
         match c {
-            C::SetPlotFlag { .. } | C::StartConversation { .. } => false,
+            C::SetPlotFlag { .. } | C::StartConversation { .. } | C::SetLocal { .. } => false,
             C::Tick { ms } => {
                 self.tick(*ms);
                 true
@@ -550,6 +631,90 @@ mod tests {
             std::sync::Arc::new(thedas_script::EngineTable::default()),
             1,
         )
+    }
+
+    #[test]
+    fn variables_are_set_journalled_and_undone() {
+        let mut s = sim();
+        let m = s.world.spawn(ObjectKind::Module, "module");
+        s.world
+            .get_mut(m)
+            .unwrap()
+            .locals
+            .ints
+            .insert("COUNT".into(), 3);
+        let set = |s: &mut Sim, value| {
+            s.apply(
+                CommandSource::ModMode,
+                SimCommand::SetLocal {
+                    target: m,
+                    name: "COUNT".into(),
+                    value,
+                },
+            )
+        };
+        let out = set(&mut s, Some(LocalValue::Int(7)));
+        assert_eq!(
+            out,
+            CommandOutcome::LocalSet {
+                replaced: Some(LocalValue::Int(3))
+            }
+        );
+        assert_eq!(s.world.get(m).unwrap().locals.ints["COUNT"], 7);
+        let e = s.world.command_journal.last().unwrap();
+        assert_eq!(e.objects.len(), 1);
+        assert_eq!(e.objects[0].tag, "module");
+        // Undo: set back what it replaced.
+        set(&mut s, Some(LocalValue::Int(3)));
+        assert_eq!(s.world.get(m).unwrap().locals.ints["COUNT"], 3);
+        // A new variable replaces nothing; removing it gives back its value.
+        let out = s.apply(
+            CommandSource::ModMode,
+            SimCommand::SetLocal {
+                target: m,
+                name: "NEW".into(),
+                value: Some(LocalValue::String("x".into())),
+            },
+        );
+        assert_eq!(out, CommandOutcome::LocalSet { replaced: None });
+        let out = s.apply(
+            CommandSource::ModMode,
+            SimCommand::SetLocal {
+                target: m,
+                name: "NEW".into(),
+                value: None,
+            },
+        );
+        assert_eq!(
+            out,
+            CommandOutcome::LocalSet {
+                replaced: Some(LocalValue::String("x".into()))
+            }
+        );
+        assert!(s.world.get(m).unwrap().locals.strings.is_empty());
+        assert_eq!(s.world.command_journal.len(), 4);
+        let out = s.apply(
+            CommandSource::ModMode,
+            SimCommand::SetLocal {
+                target: 999_999,
+                name: "X".into(),
+                value: None,
+            },
+        );
+        assert_eq!(
+            out,
+            CommandOutcome::Refused {
+                reason: "no such object".into()
+            }
+        );
+    }
+
+    #[test]
+    fn local_values_serialize_with_their_type() {
+        let v = LocalValue::Float(1.5);
+        let j = serde_json::to_string(&v).unwrap();
+        assert_eq!(j, r#"{"type":"float","value":1.5}"#);
+        assert_eq!(serde_json::from_str::<LocalValue>(&j).unwrap(), v);
     }
 
     #[test]
