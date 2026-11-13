@@ -1313,11 +1313,26 @@ pub fn call(
                 _ => Value::Resource(cell_string(c)),
             })
         }
-        "GetHashedM2DAInt" => {
+        // `(n2DA, nColumnHash, nRow)`: the column is given by its name's hash, as the
+        // tables key their columns. DA:O has the Int one; Dragon Age II adds the others
+        // (provisional: read like their `GetM2DA*` counterparts; Bool is the cell as an
+        // integer, non-zero for true).
+        "GetHashedM2DAInt"
+        | "GetHashedM2DABool"
+        | "GetHashedM2DAFloat"
+        | "GetHashedM2DAString"
+        | "GetHashedM2DAResource" => {
             let table = h.sim.world.tables.get(int(a, 0), "");
-            ok(Value::Int(cell_int(table.as_ref().and_then(|t| {
-                t.cell_by_hash(int(a, 1) as u32, int(a, 2) as i64)
-            }))))
+            let c = table
+                .as_ref()
+                .and_then(|t| t.cell_by_hash(int(a, 1) as u32, int(a, 2) as i64));
+            ok(match name {
+                "GetHashedM2DAInt" => Value::Int(cell_int(c)),
+                "GetHashedM2DABool" => Value::Int((cell_int(c) != 0) as i32),
+                "GetHashedM2DAFloat" => Value::Float(cell_float(c)),
+                "GetHashedM2DAString" => Value::String(cell_string(c)),
+                _ => Value::Resource(cell_string(c)),
+            })
         }
         "GetM2DARows" => ok(Value::Int(
             h.sim
@@ -4735,7 +4750,64 @@ mod tests {
         int FOLLOWER_STATE_AVAILABLE = 2;\n\
         int PROPERTY_SIMPLE_EXPERIENCE = 19;\n\
         int PROPERTY_SIMPLE_LEVEL = 15;\n\
-        int GetCanDiePermanently(object o) = 184;\n";
+        int GetCanDiePermanently(object o) = 184;\n\
+        int GetHashedM2DAInt(int n2DA, int nColumnHash, int nRow) = 841;\n\
+        int GetHashedM2DABool(int n2DA, int nColumnHash, int nRow) = 883;\n\
+        float GetHashedM2DAFloat(int n2DA, int nColumnHash, int nRow) = 864;\n\
+        string GetHashedM2DAString(int n2DA, int nColumnHash, int nRow) = 865;\n\
+        resource GetHashedM2DAResource(int n2DA, int nColumnHash, int nRow) = 866;\n";
+
+    #[test]
+    fn hashed_table_reads_find_columns_by_hash() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.tables().insert(
+            "#77",
+            &["Label", "Speed", "Flag", "Model"],
+            vec![(
+                3,
+                vec![
+                    Cell::String("row".into()),
+                    Cell::Float(1.5),
+                    Cell::Int(2),
+                    Cell::String("c_dog\0".into()),
+                ],
+            )],
+        );
+        let col = |name: &str| Value::Int(thedas_formats::gda::column_hash(name) as i32);
+        let read = |s: &mut Sim, f: &str, column: &str, row: i32| {
+            run(s, 1, f, &[Value::Int(77), col(column), Value::Int(row)])
+        };
+        assert_eq!(
+            read(&mut s, "GetHashedM2DAFloat", "Speed", 3),
+            Some(Value::Float(1.5))
+        );
+        assert_eq!(
+            read(&mut s, "GetHashedM2DAInt", "Flag", 3),
+            Some(Value::Int(2))
+        );
+        assert_eq!(
+            read(&mut s, "GetHashedM2DABool", "Flag", 3),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            read(&mut s, "GetHashedM2DAString", "Label", 3),
+            Some(Value::String("row".into()))
+        );
+        assert_eq!(
+            read(&mut s, "GetHashedM2DAResource", "Model", 3),
+            Some(Value::Resource("c_dog".into()))
+        );
+        // A missing row or column reads as the type's empty value.
+        assert_eq!(
+            read(&mut s, "GetHashedM2DABool", "Flag", 9),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            read(&mut s, "GetHashedM2DAString", "Nope", 3),
+            Some(Value::String(String::new()))
+        );
+    }
 
     /// Calls engine function `name` as `caller`.
     fn run(s: &mut Sim, caller: ObjectId, name: &str, a: &[Value]) -> Option<Value> {
