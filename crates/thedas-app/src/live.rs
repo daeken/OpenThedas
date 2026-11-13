@@ -248,6 +248,12 @@ pub struct Live {
     /// Each drawn object's id, placement and motion at the last sync (in the objects' scene
     /// order).
     posed: Vec<(ObjectId, Mat4, Option<Clip>)>,
+    /// Mod mode's scrubber: a creature drawn with its own animation held at this time, in
+    /// seconds (its layers shifted with it). Drawing only; the simulation is not touched.
+    scrub: Option<(ObjectId, f32)>,
+    /// The held creature's motion as it was when the hold began: kept, so the creature's
+    /// next action does not swap the animation under the scrubber.
+    frozen: Option<(ObjectId, Clip)>,
     models: ModelCache,
     /// Placeables' state changes, for their swings (a door opening).
     swings: thedas_ui::models::PlaceableSwings,
@@ -618,6 +624,8 @@ impl Live {
             creature_shapes: Default::default(),
             aiming: None,
             posed: Vec::new(),
+            scrub: None,
+            frozen: None,
             models: ModelCache::default(),
             swings: Default::default(),
             opacity: Default::default(),
@@ -1435,6 +1443,76 @@ impl Live {
         out
     }
 
+    /// Mod mode's scrubber: draws creature `id` with its own animation held at `time`
+    /// seconds, or lets go (`None`).
+    pub fn set_scrub(&mut self, scrub: Option<(ObjectId, f32)>) {
+        if scrub.map(|s| s.0) != self.frozen.as_ref().map(|f| f.0) {
+            self.frozen = None;
+        }
+        self.scrub = scrub;
+    }
+
+    /// What mod mode's inspector shows of object `id`: what it is, and what it was animating
+    /// at the last sync (its own motion first, then the layers over it).
+    pub fn inspect(&mut self, id: ObjectId) -> Option<crate::modmode::Inspected> {
+        let mut out = {
+            let sim = self.sim();
+            let o = sim.world.get(id)?;
+            crate::modmode::Inspected {
+                id,
+                kind: format!("{:?}", o.kind),
+                tag: o.tag.clone(),
+                template: o.template.clone(),
+                name: o.name.clone(),
+                area: o
+                    .area
+                    .and_then(|a| sim.world.get(a))
+                    .map(|a| a.tag.clone())
+                    .unwrap_or_default(),
+                position: o.position,
+                facing: o.facing,
+                active: o.active,
+                dead: o.dead,
+                dialog: o.dialog.clone(),
+                animations: Vec::new(),
+            }
+        };
+        let Some(level) = self.level.as_ref() else {
+            return Some(out);
+        };
+        let Some(clip) = self
+            .posed
+            .iter()
+            .find(|p| p.0 == id)
+            .and_then(|p| p.2.clone())
+        else {
+            return Some(out);
+        };
+        for (layer, c) in std::iter::once(&clip).chain(&clip.layers).enumerate() {
+            let found = self.animator.animation_resource(&level.vfs, c);
+            let (animation, length) = match &found {
+                Some((ani, anim)) => (Some(ani.clone()), anim.length),
+                None => (None, 0.0),
+            };
+            let time = if c.looping && length > 0.0 {
+                c.time.rem_euclid(length)
+            } else {
+                c.time.min(length)
+            };
+            out.animations.push(crate::modmode::AnimLine {
+                layer,
+                tree: c.trees.first().cloned().unwrap_or_default(),
+                action: c.actions.first().cloned().unwrap_or_default(),
+                animation,
+                time,
+                length,
+                looping: c.looping,
+                weight: c.weight,
+            });
+        }
+        Some(out)
+    }
+
     /// Where the party leader stands, when it is in the current area.
     pub fn leader_feet(&self) -> Option<glam::Vec3> {
         let sim = self.sim();
@@ -1746,6 +1824,17 @@ impl Live {
                         .is_some()
                 });
                 c.layers.extend(layers);
+            }
+            if let Some((held, t)) = self.scrub
+                && held == m.id
+            {
+                match &self.frozen {
+                    Some((_, f)) => c = Some(f.clone()),
+                    None => self.frozen = c.clone().map(|f| (held, f)),
+                }
+                if let Some(c) = c.as_mut() {
+                    hold_clip(c, t);
+                }
             }
             posed.push((Prop::placement(at, facing), c));
         }
@@ -3058,6 +3147,17 @@ fn cut_layer(
         layers: Vec::new(),
         absolute: true,
         ..Default::default()
+    }
+}
+
+/// Holds a clip at `time` seconds into its own animation for mod mode's scrubber: the
+/// layers laid over it move by the same amount, so a cutscene's layers stay in step with it.
+/// Head-tracking layers, placed by phase rather than time, are left alone.
+pub fn hold_clip(c: &mut Clip, time: f32) {
+    let shift = time - c.time;
+    c.time = time;
+    for l in c.layers.iter_mut().filter(|l| l.phase.is_none()) {
+        l.time += shift;
     }
 }
 
