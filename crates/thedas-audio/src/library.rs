@@ -75,26 +75,26 @@ impl Library {
     /// modules' folders (`packages/core_ep1`, DLC `module` folders) are not: they carry their
     /// own projects under the same names (`music`), which the campaign must not pick up.
     pub fn install_dirs(root: &Path, module: &str, language: &str) -> Vec<PathBuf> {
-        let mut packages = vec![root.join("packages/core")];
+        // Folder names are matched in any case, as the Windows original does (see
+        // `thedas_vfs::path`).
+        use thedas_vfs::join_ci;
+        let mut packages = vec![join_ci(root, "packages/core")];
         for top in ["Addins", "Offers"] {
-            let mut dlc: Vec<PathBuf> = std::fs::read_dir(root.join(top))
+            let mut dlc: Vec<PathBuf> = std::fs::read_dir(join_ci(root, top))
                 .into_iter()
                 .flatten()
                 .flatten()
-                .map(|e| e.path().join("core"))
+                .map(|e| join_ci(&e.path(), "core"))
                 .filter(|p| p.is_dir())
                 .collect();
             dlc.sort();
             packages.extend(dlc);
         }
-        packages.push(root.join("modules").join(module));
+        packages.push(join_ci(root, &format!("modules/{module}")));
         let mut out = Vec::new();
         for p in packages {
-            for sub in [
-                PathBuf::from("audio/sound"),
-                Path::new("audio/vo").join(language).join("vo"),
-            ] {
-                let d = p.join(sub);
+            for sub in ["audio/sound".to_string(), format!("audio/vo/{language}/vo")] {
+                let d = join_ci(&p, &sub);
                 if d.is_dir() {
                     out.push(d);
                 }

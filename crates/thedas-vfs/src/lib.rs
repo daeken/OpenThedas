@@ -9,16 +9,20 @@
 //!   conflicts and shadowed files.
 //! - [`install`]: discovers a DA:O install, builds the default layer stack for it, and mounts
 //!   a level's own archives on top while its area is loaded.
+//! - [`path`]: case-insensitive file-system paths, for names the original (a Windows game)
+//!   treats case-insensitively but a case-sensitive volume would not.
 
 pub mod crypto;
 pub mod erf;
 pub mod install;
+pub mod path;
 pub mod vfs;
 
 use std::path::PathBuf;
 
 pub use erf::{Erf, ErfEntry, ErfVersion};
 pub use install::{DaoInstall, LevelMount};
+pub use path::{join_ci, resolve_ci};
 pub use vfs::{Layer, Provenance, Vfs};
 
 #[derive(Debug, thiserror::Error)]
