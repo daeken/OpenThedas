@@ -978,6 +978,8 @@ impl DrawnKey {
 
 /// The `effects.gda` type of a visual effect (`EffectVisualEffect`).
 const EFFECT_TYPE_VISUAL_EFFECT: i32 = 4;
+/// The engine integer of an effect that holds its visual (see [`visual_effects`]).
+const EFFECT_ENGINE_INTEGER_VFX: i32 = 2;
 
 /// A visual effect on an object, as drawn.
 #[derive(Clone, Debug, PartialEq)]
@@ -999,6 +1001,12 @@ pub struct EffectModel {
 /// `VFX_base.gda` row (its integer 0) names the model (`ModelName`, e.g.
 /// `fxa_fire_crust_c`). Provisional: the row's other columns (detail-level variants,
 /// attachment, scale, priority) are not mirrored.
+///
+/// An effect of any other type shows a visual of its own while it is on the object: the
+/// scripts give it a `VFX_base.gda` row as its engine integer 2 (`SetEffectEngineInteger`;
+/// Rock Armor's upkeep effect, type 1012, carries 90147, the stone crust). Provisional:
+/// that integer 2 is the visual is read from the data the scripts set, the executable's
+/// reader is not traced.
 pub fn visual_effects(sim: &Sim, o: &Object) -> Vec<EffectModel> {
     let Some(t) = sim.world.tables().get(0, "vfx_base") else {
         return Vec::new();
@@ -1010,10 +1018,19 @@ pub fn visual_effects(sim: &Sim, o: &Object) -> Vec<EffectModel> {
     let now = sim.world.time_ms;
     let mut out: Vec<EffectModel> = Vec::new();
     for e in &o.effects {
-        if e.ty != EFFECT_TYPE_VISUAL_EFFECT || e.expires.is_some_and(|x| x <= now) {
+        if e.expires.is_some_and(|x| x <= now) {
             continue;
         }
-        let Some(&row) = e.ints.first() else { continue };
+        let row = if e.ty == EFFECT_TYPE_VISUAL_EFFECT {
+            e.ints.first().copied()
+        } else {
+            e.engine_ints
+                .iter()
+                .find(|(i, _)| *i == EFFECT_ENGINE_INTEGER_VFX)
+                .map(|(_, row)| *row)
+                .filter(|row| *row > 0)
+        };
+        let Some(row) = row else { continue };
         let Some(model) = model(row) else { continue };
         // Effects carry no id of their own: what was applied, and which of its like.
         let base = format!(
