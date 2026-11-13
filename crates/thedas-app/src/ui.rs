@@ -290,6 +290,9 @@ pub struct UiLayer {
     /// The large notification whose splash has been dealt with (see
     /// [`UiLayer::uber_alert_splash`]).
     uber_splash: Option<String>,
+    /// A large notification was cut off: notifications.gfx went away (a full-screen screen
+    /// opened) while it showed, so it is dismissed as the movie would at its end.
+    uber_cut: bool,
     /// The loading screen up, if any (see [`UiLayer::loading_begin`]).
     loading: Option<Loading>,
     /// The world map is held up as the loading screen (see [`UiLayer::hold_world_map`]).
@@ -627,6 +630,7 @@ impl UiLayer {
             text_answers: Vec::new(),
             portrait_clicked: None,
             uber_splash: None,
+            uber_cut: false,
             loading: None,
             travel_map: false,
             travel_out: None,
@@ -960,6 +964,21 @@ impl UiLayer {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             sim.world.uber_alerts.first().map(|a| a.resref.clone())
         };
+        // The movie that showed it is gone (the HUD makes way for a full-screen screen and is
+        // loaded again after): the banner is dismissed (`Party.HideUberAlert`) instead of
+        // playing again from the start when the HUD comes back. Provisional: what the
+        // original does with a banner when its game menu opens is not traced; it does not
+        // replay it.
+        let notifications = self
+            .stage
+            .movies
+            .iter()
+            .any(|m| m.name == "notifications.gfx");
+        if head.is_some() && self.uber_splash.is_some() && !notifications {
+            self.uber_splash = None;
+            self.uber_cut = true;
+            return;
+        }
         let Some(head) = head else {
             if self.uber_splash.take().is_some() {
                 for m in self.stage.movies.iter_mut() {
@@ -1561,6 +1580,12 @@ impl UiLayer {
                     args.push(typed);
                 }
             }
+        }
+        if std::mem::take(&mut self.uber_cut) {
+            messages.push(GameMessage::Send(
+                thedas_sim::journal::MSG_HIDE_UBER_ALERT.into(),
+                Vec::new(),
+            ));
         }
         if std::mem::take(&mut self.continue_pending) {
             messages.push(GameMessage::Send(
