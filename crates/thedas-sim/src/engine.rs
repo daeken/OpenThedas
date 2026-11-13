@@ -1664,7 +1664,7 @@ pub fn call(
             if ok_ && h.sim.world.get(who).is_some() {
                 // Off wherever it was, and what the slot held comes off (the engine's side
                 // of both: see `Sim::take_off`).
-                h.sim.unequip(who, item);
+                h.sim.displace(who, item);
                 let (active, in_hand, other) = h
                     .sim
                     .world
@@ -1683,7 +1683,7 @@ pub fn call(
                     && crate::world::WEAPON_SET_SLOTS.contains(&slot);
                 let held = if inactive { other } else { in_hand };
                 if let Some(old) = held {
-                    h.sim.unequip(who, old);
+                    h.sim.displace(who, old);
                 }
                 if let Some(o) = h.sim.world.get_mut(who) {
                     if !o.inventory.contains(&item) {

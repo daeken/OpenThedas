@@ -271,13 +271,6 @@ impl Sim {
             self.remove_effect(who, &e);
         }
         self.equip_event("UNEQUIP", who, item, slot, false);
-        // A party member's unequip is what the inventory lesson waits for: DAOrigins.exe
-        // raises `EVENT_TYPE_TRAINING_ITEM_UNEQUIPPED` (1070) from its unequip routine
-        // (0x6b7690, at 0x6b7886), which its equip routine also calls for what it displaces
-        // (0x6bc943). Provisional: the argument is taken to be the slot.
-        if self.world.training.mode != 0 && crate::engine::party_of(self).contains(&who) {
-            self.training_event("ITEM_UNEQUIPPED", slot);
-        }
     }
 
     pub(crate) fn equip_event(
@@ -291,7 +284,10 @@ impl Sim {
         let mut ev = self.new_event(name, Some(who));
         ev.objects = vec![item];
         ev.ints = vec![slot, by_player as i32];
-        self.world.queue_event(0, who, ev, None);
+        // Delivered at once, inside the equip or unequip: DAOrigins.exe's container hooks
+        // (EQUIP 0x6c16e0, UNEQUIP 0x6c19f0) send through 0x64ad80, which runs the script in
+        // the same call, not through the queue (0x64ace0).
+        self.deliver(who, ev, None);
     }
 
     /// The slot `who` wears `item` in.
@@ -360,18 +356,18 @@ impl Sim {
         if !self.party_backpack().contains(&item) && self.wearer(item).is_none() {
             return false;
         }
-        // Whoever wore it takes it off, and what `who` wore in the slot comes off (each an
-        // unequip like any other, so a swap ends the inventory lesson's unequip step too:
-        // see `Sim::take_off`).
+        // Whoever wore it gives it up, and what `who` wore in the slot comes off: both hear
+        // UNEQUIP, but neither counts as an unequip for the inventory lesson (see
+        // `Sim::displace`).
         if let Some(m) = self.wearer(item) {
-            self.unequip(m, item);
+            self.displace(m, item);
         }
         if let Some(old) = self
             .world
             .get(who)
             .and_then(|o| o.equipment.get(&slot).copied())
         {
-            self.unequip(who, old);
+            self.displace(who, old);
         }
         for m in party {
             if m != who {
@@ -393,10 +389,30 @@ impl Sim {
 
     /// Takes `item` off `who` (either weapon set) as the engine does: see [`Sim::take_off`].
     /// Returns whether `who` wore it.
+    ///
+    /// This is the exe's unequip routine (0x6b7690): after the item is off and its owner has
+    /// heard UNEQUIP, a party member's unequip raises
+    /// `EVENT_TYPE_TRAINING_ITEM_UNEQUIPPED` (1070, 0x6b7886) for the inventory lesson.
+    /// Provisional: the argument is taken to be the slot.
     pub(crate) fn unequip(&mut self, who: ObjectId, item: ObjectId) -> bool {
-        let Some(o) = self.world.get_mut(who) else {
-            return false;
-        };
+        match self.displace(who, item) {
+            Some(slot) => {
+                if self.world.training.mode != 0 && crate::engine::party_of(self).contains(&who) {
+                    self.training_event("ITEM_UNEQUIPPED", slot);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Takes `item` out of `who`'s equipment because another item takes its slot, or it
+    /// moves to another wearer: its effects end and `who` hears UNEQUIP, but this is not the
+    /// unequip routine, so no training event is raised (DAOrigins.exe's container Add
+    /// removes the occupant itself, 0x762240, and only two-handed and ammunition conflicts
+    /// go through 0x6b7690). Returns the slot it was in.
+    pub(crate) fn displace(&mut self, who: ObjectId, item: ObjectId) -> Option<i32> {
+        let o = self.world.get_mut(who)?;
         let slot = o
             .equipment
             .iter()
@@ -405,13 +421,9 @@ impl Sim {
             .map(|(s, _)| *s);
         o.equipment.retain(|_, i| *i != item);
         o.other_set.retain(|_, i| *i != item);
-        match slot {
-            Some(slot) => {
-                self.take_off(who, item, slot);
-                true
-            }
-            None => false,
-        }
+        let slot = slot?;
+        self.take_off(who, item, slot);
+        Some(slot)
     }
 
     /// The player takes `item` off party member `who`; it stays in the backpack. Returns
@@ -1243,7 +1255,7 @@ mod screen_tests {
         // Not a slot the pelt fits.
         assert!(!s.equip_item(hero, pelt, 0));
         // Into the occupied main hand: the sword goes to the backpack. The item displaced
-        // counts as unequipped for the inventory lesson (slot 0 here).
+        // does not count as unequipped for the inventory lesson; taking one off does.
         let m = s.world.spawn(ObjectKind::Module, "module");
         s.world.module = Some(m);
         s.world.training.mode = 5;
@@ -1251,6 +1263,11 @@ mod screen_tests {
         s.world.training.arg = 0;
         s.world.trace.keep = true;
         assert!(s.equip_item(hero, spare, 0));
+        assert_eq!(
+            s.world.training.expected, 1070,
+            "a swap leaves the step armed"
+        );
+        assert!(s.unequip_item(hero, spare));
         // Heard, and delivered to genev_tutorial at once (see `Sim::raise_training_event`).
         assert!(
             s.world
@@ -1260,6 +1277,7 @@ mod screen_tests {
                 .any(|e| matches!(e, crate::trace::TraceEntry::EventDelivered { ty: 1070, .. }))
         );
         assert_eq!(s.world.training.expected, 0);
+        assert!(s.equip_item(hero, spare, 0));
         s.world.training = Default::default();
         assert_eq!(s.world.get(hero).unwrap().equipment.get(&0), Some(&spare));
         assert!(s.party_backpack().contains(&sword));
@@ -1342,21 +1360,31 @@ mod screen_tests {
             },
         );
         s.world.get_mut(hero).unwrap().inventory.push(amulet);
+        s.world.get_mut(hero).unwrap().script = Some("hero".into());
+        s.world.trace.keep = true;
         assert!(s.equip_item(hero, amulet, 255));
         let worn = &s.world.get(hero).unwrap().effects;
         assert_eq!(worn.len(), 1);
         assert_eq!((worn[0].ty, worn[0].creator), (1012, Some(amulet)));
         assert_eq!((worn[0].ints[0], worn[0].floats[0]), (6, 2.0));
-        let events = |s: &Sim| -> Vec<(i32, Vec<ObjectId>, Vec<i32>)> {
+        // The wearer hears EQUIP (11) at once, inside the equip, not from the queue.
+        let events = |s: &Sim| -> Vec<i32> {
             s.world
-                .queue
-                .values()
-                .filter(|q| q.target == hero)
-                .map(|q| (q.event.ty, q.event.objects.clone(), q.event.ints.clone()))
+                .trace
+                .entries
+                .iter()
+                .filter_map(|e| match e {
+                    crate::trace::TraceEntry::EventDelivered { target, ty, .. }
+                        if *target == hero =>
+                    {
+                        Some(*ty)
+                    }
+                    _ => None,
+                })
                 .collect()
         };
-        // Put on from the inventory screen: integer 1 says the player did it.
-        assert_eq!(events(&s), vec![(11, vec![amulet], vec![11, 1])]);
+        assert_eq!(events(&s), vec![11]);
+        assert!(!s.world.queue.values().any(|q| q.target == hero));
         // Changing a worn item's properties changes what it gives its wearer.
         assert!(s.remove_item_property(amulet, 1005));
         assert!(s.world.get(hero).unwrap().effects.is_empty());
@@ -1365,7 +1393,7 @@ mod screen_tests {
         assert_eq!((worn.len(), worn[0].floats[0]), (1, 3.0));
         assert!(s.unequip_item(hero, amulet));
         assert!(s.world.get(hero).unwrap().effects.is_empty());
-        assert_eq!(events(&s)[1], (12, vec![amulet], vec![11, 0]));
+        assert_eq!(events(&s), vec![11, 12]);
     }
 
     #[test]
