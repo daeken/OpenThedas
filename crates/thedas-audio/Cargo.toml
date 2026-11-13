@@ -14,6 +14,7 @@ device = ["dep:cpal"]
 
 [dependencies]
 thedas-formats.workspace = true
+thedas-vfs.workspace = true
 thiserror.workspace = true
 log.workspace = true
 symphonia-core = "0.5"

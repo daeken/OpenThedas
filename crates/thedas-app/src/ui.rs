@@ -153,6 +153,9 @@ pub enum FrontEnd {
     StartMenu,
     /// Exit the game.
     Quit,
+    /// The game menu's "Report Issue" (its online-features button, relabelled; see
+    /// `UiLayer::front_end_message`): an issue report, as F8 makes one.
+    Report,
 }
 
 impl std::fmt::Debug for FrontEnd {
@@ -162,6 +165,7 @@ impl std::fmt::Debug for FrontEnd {
             FrontEnd::Load(b) => write!(f, "Load({} bytes)", b.len()),
             FrontEnd::StartMenu => write!(f, "StartMenu"),
             FrontEnd::Quit => write!(f, "Quit"),
+            FrontEnd::Report => write!(f, "Report"),
         }
     }
 }
@@ -212,6 +216,21 @@ fn splash_pass(
     }
 }
 
+/// The message the engine's own text box's buttons send: `<id> <button, from 1>`. The app
+/// adds the text typed (see [`UiLayer::ask_text`]).
+const TEXT_POPUP_RESULT: &str = "OpenThedas.TextPopupResult";
+
+/// The answer to the engine's own text box ([`UiLayer::ask_text`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextAnswer {
+    /// The id it was asked with.
+    pub id: u32,
+    /// OK (true) or Cancel.
+    pub accepted: bool,
+    /// What was typed.
+    pub text: String,
+}
+
 /// A message floaty up over a creature.
 struct Floaty {
     id: u32,
@@ -259,11 +278,21 @@ pub struct UiLayer {
     /// it has waited for its values to reach the popup layer (see
     /// [`UiLayer::show_script_popup`]).
     script_popup: Option<((i32, i32, u32), u8)>,
+    /// The engine's own text box up (see [`UiLayer::ask_text`]): its id and the frames
+    /// since its values were set, and the answers not yet taken.
+    text_popup: Option<(u32, u8)>,
+    /// The game menu's online-features button has been relabelled "Report Issue" since
+    /// mainmenu.gfx was loaded (see `UiLayer::report_button`).
+    report_labelled: bool,
+    text_answers: Vec<TextAnswer>,
     /// A party portrait was clicked (see [`UiLayer::mouse_button`]).
     portrait_clicked: Option<u32>,
     /// The large notification whose splash has been dealt with (see
     /// [`UiLayer::uber_alert_splash`]).
     uber_splash: Option<String>,
+    /// A large notification was cut off: notifications.gfx went away (a full-screen screen
+    /// opened) while it showed, so it is dismissed as the movie would at its end.
+    uber_cut: bool,
     /// The loading screen up, if any (see [`UiLayer::loading_begin`]).
     loading: Option<Loading>,
     /// The world map is held up as the loading screen (see [`UiLayer::hold_world_map`]).
@@ -277,6 +306,12 @@ pub struct UiLayer {
     floaties: Vec<Floaty>,
     /// The stats floaties up (name and health bar over a creature): creature → floaty id.
     stat_floaties: std::collections::BTreeMap<thedas_script::vm::ObjectId, u32>,
+    /// The player's settings file and the settings last written to it (see
+    /// [`UiLayer::set_settings_file`]).
+    settings_file: Option<(std::path::PathBuf, std::collections::BTreeMap<String, f64>)>,
+    /// Whether the conversation line the game is on has a voice-over, known as it is chosen
+    /// (see [`UiLayer::set_line_voiced`]).
+    line_voiced: bool,
     /// The creature the mouse is over (see [`UiLayer::set_hovered`]).
     hovered: Option<thedas_script::vm::ObjectId>,
     /// A conversation line's continue the movie could not send (see `continue_conversation`).
@@ -395,6 +430,9 @@ struct Line {
     /// How long its voice-over runs (milliseconds), when it has one: it plays that long
     /// instead of a reading time.
     voice_ms: Option<f64>,
+    /// Whether conversation.gfx was last told the line has a voice-over (see
+    /// `UiLayer::play`).
+    voiced: bool,
     /// Nothing to choose: it continues by itself once played.
     waits: bool,
     continued: bool,
@@ -482,6 +520,13 @@ impl UiLayer {
         std::mem::take(&mut self.sound_set_previews)
     }
 
+    /// Whether the line the game is on is voiced, as the audio knows it once the line is
+    /// chosen (`audio::GameAudio::line_voice`), before it plays: set before
+    /// [`UiLayer::play`], so the conversation screen hears `Conversation.HasVO` with the line.
+    pub fn set_line_voiced(&mut self, voiced: bool) {
+        self.line_voiced = voiced;
+    }
+
     /// The conversation line on screen speaks for this long (milliseconds; see
     /// [`crate::audio`]), or has no voice-over.
     pub fn set_line_voice_ms(&mut self, ms: Option<f64>) {
@@ -501,6 +546,41 @@ impl UiLayer {
             thedas_ui::options::MSG_SET,
             &[name.to_string(), value.to_string()],
         )
+    }
+
+    /// Keeps the player's settings in `path` (see `thedas_ui::options::to_text`): what it
+    /// holds now is taken, and every change the options screen makes is written back.
+    /// A missing or unreadable file leaves the defaults.
+    pub fn set_settings_file(&mut self, path: std::path::PathBuf) {
+        let read = std::fs::read_to_string(&path)
+            .map(|t| thedas_ui::options::from_text(&t))
+            .unwrap_or_default();
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.options.extend(read.clone());
+        }
+        self.settings_file = Some((path, read));
+    }
+
+    /// Writes the player's settings when they changed since last written.
+    fn write_settings(&mut self) {
+        let Some((path, written)) = self.settings_file.as_mut() else {
+            return;
+        };
+        let Some(now) = self.shown.lock().ok().map(|s| s.options.clone()) else {
+            return;
+        };
+        if now == *written {
+            return;
+        }
+        *written = now.clone();
+        let text = thedas_ui::options::to_text(&now);
+        let result = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| std::fs::write(&*path, text));
+        if let Err(e) = result {
+            log::warn!("settings: writing {}: {e}", path.display());
+        }
     }
 
     /// A player setting (`AudioOptions.MusicVolume`) as the options screen keeps it.
@@ -545,8 +625,12 @@ impl UiLayer {
             tooltip_text: None,
             tooltip_relayout: 0,
             script_popup: None,
+            text_popup: None,
+            report_labelled: false,
+            text_answers: Vec::new(),
             portrait_clicked: None,
             uber_splash: None,
+            uber_cut: false,
             loading: None,
             travel_map: false,
             travel_out: None,
@@ -554,6 +638,8 @@ impl UiLayer {
             floaties: Vec::new(),
             stat_floaties: Default::default(),
             hovered: None,
+            line_voiced: false,
+            settings_file: None,
             continue_pending: false,
             next_floaty: 1,
             portraits: PortraitClock::default(),
@@ -599,6 +685,16 @@ impl UiLayer {
         match name {
             "GameModeController.PushGUIScreen" if first == Some("Options") => {
                 screens.menu = Some(Screen::Options);
+            }
+            // The game menu's online-features button ("Player Profile", for the original's
+            // online service, which this game does not have) is the issue report's: the
+            // menu closes and the report is made of the game behind it.
+            "GameModeController.PushGUIScreen"
+                if first == Some("GUICommunityFeatures")
+                    && screens.menu == Some(Screen::GameMenu) =>
+            {
+                screens.menu = None;
+                self.requests.push(FrontEnd::Report);
             }
             "GameModeController.HideGUIScreen" if first == Some("MainMenu") => {
                 if screens.menu == Some(Screen::GameMenu) {
@@ -868,6 +964,21 @@ impl UiLayer {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             sim.world.uber_alerts.first().map(|a| a.resref.clone())
         };
+        // The movie that showed it is gone (the HUD makes way for a full-screen screen and is
+        // loaded again after): the banner is dismissed (`Party.HideUberAlert`) instead of
+        // playing again from the start when the HUD comes back. Provisional: what the
+        // original does with a banner when its game menu opens is not traced; it does not
+        // replay it.
+        let notifications = self
+            .stage
+            .movies
+            .iter()
+            .any(|m| m.name == "notifications.gfx");
+        if head.is_some() && self.uber_splash.is_some() && !notifications {
+            self.uber_splash = None;
+            self.uber_cut = true;
+            return;
+        }
         let Some(head) = head else {
             if self.uber_splash.take().is_some() {
                 for m in self.stage.movies.iter_mut() {
@@ -876,7 +987,14 @@ impl UiLayer {
             }
             return;
         };
-        if self.uber_splash.as_deref() == Some(head.as_str()) {
+        // The same notification, unless notifications.gfx was loaded again meanwhile (the
+        // HUD comes back after a full-screen screen): a new movie has no pass yet.
+        let reloaded = self
+            .stage
+            .movies
+            .iter()
+            .any(|m| m.name == "notifications.gfx" && !m.has_multiply_pass());
+        if self.uber_splash.as_deref() == Some(head.as_str()) && !reloaded {
             return;
         }
         // The notification's clip is named as it is added (`UberNotification<n>`); its
@@ -914,6 +1032,106 @@ impl UiLayer {
                 m.set_multiply_pass(Some(pass));
             }
             self.uber_splash = Some(head);
+        }
+    }
+
+    /// Asks the player for a line of text with the game's own message box (popuplayer.gfx,
+    /// as a script's `ShowPopup` with a text field shows it): `prompt` over a text field
+    /// holding `text`, and OK / Cancel buttons (`ok`, `cancel`; the pad's A and B press
+    /// them). Nothing goes through the simulation; the answer comes back from
+    /// [`UiLayer::take_text_answers`] with `id`. It shows once its values have reached the
+    /// movie, two frames on, and replaces one still up. Needs the popup layer (the HUD).
+    pub fn ask_text(&mut self, id: u32, prompt: &str, text: &str, ok: &str, cancel: &str) {
+        use thedas_ui::UiValue;
+        let k = "GUIPopupLayer";
+        let b = &self.stage.bridge;
+        b.set_value(
+            &format!("{k}.DialogBoxText"),
+            UiValue::String(prompt.into()),
+        );
+        b.set_value(&format!("{k}.NumButtons"), UiValue::Number(2.0));
+        b.set_value(&format!("{k}.InputBox"), UiValue::Number(1.0));
+        b.set_value(&format!("{k}.InputText"), UiValue::String(text.into()));
+        b.set_value(&format!("{k}.Checkbox"), UiValue::Number(0.0));
+        for e in [
+            "CheckboxText",
+            "CheckboxControlledAttribute",
+            "PickerList",
+            "PickerDescriptions",
+        ] {
+            b.set_value(&format!("{k}.{e}"), UiValue::String(String::new()));
+        }
+        b.set_value(&format!("{k}.PickerDefault"), UiValue::Number(0.0));
+        b.set_value(&format!("{k}.Filter"), UiValue::Number(0.0));
+        for (i, label) in [ok, cancel].into_iter().enumerate() {
+            b.set_value(&format!("{k}.Label{i}"), UiValue::String(label.into()));
+            b.set_value(
+                &format!("{k}.Callback{i}"),
+                UiValue::String(format!("{TEXT_POPUP_RESULT} {id} {}", i + 1)),
+            );
+        }
+        self.text_popup = Some((id, 0));
+    }
+
+    /// The answers to [`UiLayer::ask_text`] since last asked.
+    pub fn take_text_answers(&mut self) -> Vec<TextAnswer> {
+        std::mem::take(&mut self.text_answers)
+    }
+
+    /// The game menu's online-features button ("Player Profile": the original's online
+    /// service, which this game does not have) reads "Report Issue": pressing it asks for
+    /// an issue report (`FrontEnd::Report`, see `front_end_message`). Relabelled once
+    /// mainmenu.gfx has laid out its buttons, each time it is loaded.
+    fn report_button(&mut self) {
+        let up = self.stage.movies.iter().any(|m| m.name == "mainmenu.gfx");
+        if !up {
+            self.report_labelled = false;
+            return;
+        }
+        if self.report_labelled {
+            return;
+        }
+        let Some(thedas_ui::UiValue::String(tree)) =
+            self.stage
+                .call_in("mainmenu.gfx", "_global.thedas_tree_list", &[])
+        else {
+            return;
+        };
+        let Some(button) = tree
+            .split(';')
+            .filter_map(|e| e.split('|').next())
+            .find(|p| p.ends_with(".Screenshots_mc"))
+            .map(str::to_string)
+        else {
+            return;
+        };
+        self.stage.call_in(
+            "mainmenu.gfx",
+            &format!("{button}.SetText"),
+            &[thedas_ui::UiValue::String("Report Issue".into())],
+        );
+        self.report_labelled = true;
+    }
+
+    /// Shows the engine's own text box once its values have reached the movie.
+    fn show_text_popup(&mut self) {
+        let Some((_, frames)) = self.text_popup.as_mut() else {
+            return;
+        };
+        if *frames >= 2 {
+            return;
+        }
+        *frames += 1;
+        if *frames == 2 {
+            let up = self.stage.call_in(
+                thedas_ui::stage::POPUP_LAYER,
+                "_global.PopupLayer.ShowDialogBoxFromGame",
+                &[],
+            );
+            if up.is_none() {
+                log::warn!("ui: a text box with no popup layer up");
+                self.text_popup = None;
+            }
         }
     }
 
@@ -1262,6 +1480,7 @@ impl UiLayer {
                 key,
                 t: 0.0,
                 voice_ms: None,
+                voiced: self.line_voiced,
                 waits,
                 continued: false,
                 cut_seen: cutscene,
@@ -1269,6 +1488,38 @@ impl UiLayer {
             }),
             (None, _) => None,
         };
+        // Whether the line is voiced (`Conversation.HasVO`): conversation.gfx's
+        // `UpdateMainText` hides a voiced NPC line when the Subtitles option is "No
+        // subtitles" (`ClientOptions.GameOptions.SubtitlesLevel` 0, the default), and shows
+        // it otherwise. The audio says so as the line is chosen (`set_line_voiced`), before
+        // the movie hears of the line this frame; should the voice turn up only once it
+        // plays (`set_line_voice_ms`), the movie is given the line again then. Provisional:
+        // when the exe sets HasVO (the line's +0xd4, read at 0x690193) is not traced; the
+        // line having a voice-over stands in.
+        let mut retell = None;
+        let early = self.line_voiced;
+        if let Some(l) = self.line.as_mut() {
+            let voiced = early || l.voice_ms.is_some();
+            self.stage.bridge.set_value(
+                "Conversation.HasVO",
+                thedas_ui::UiValue::Number(f64::from(u8::from(voiced))),
+            );
+            if voiced != l.voiced {
+                l.voiced = voiced;
+                retell = Some(l.key.1.clone());
+            }
+        }
+        let subtitles = self
+            .stage
+            .bridge
+            .value("ClientOptions.GameOptions.SubtitlesLevel");
+        if let Some(text) = retell.filter(|_| subtitles == Some(thedas_ui::UiValue::Number(0.0))) {
+            self.stage.call_in(
+                "conversation.gfx",
+                "_global.Conversation.UpdateMainText",
+                &[thedas_ui::UiValue::String(text)],
+            );
+        }
         if let Some(l) = self.line.as_mut() {
             let played = l.played();
             self.stage.bridge.set_value(
@@ -1282,8 +1533,11 @@ impl UiLayer {
                 self.continue_conversation();
             }
         }
+        self.write_settings();
         self.show_cutscene_line(sim);
         self.show_script_popup(sim);
+        self.show_text_popup();
+        self.report_button();
         self.select_clicked_portrait(sim);
         self.uber_alert_splash(sim);
         self.loading_frame(dt_ms);
@@ -1292,6 +1546,28 @@ impl UiLayer {
         // A script message box's answer carries the text typed into it, which the box set
         // as `GUIPopupLayer.InputText` just before (popuplayer.gfx's `OnButtonAction`); the
         // exe passes it on as the result event's string 0 (0x709971).
+        // The engine's own text box answered: taken here, with what was typed.
+        messages.retain(|m| match m {
+            GameMessage::Send(name, args) if name == TEXT_POPUP_RESULT => {
+                let typed = match self.stage.bridge.value("GUIPopupLayer.InputText") {
+                    Some(thedas_ui::UiValue::String(s)) => s,
+                    _ => String::new(),
+                };
+                let num = |i: usize| args.get(i).and_then(|a| a.trim().parse::<u32>().ok());
+                if let (Some(id), Some(button)) = (num(0), num(1)) {
+                    self.text_answers.push(TextAnswer {
+                        id,
+                        accepted: button == 1,
+                        text: typed,
+                    });
+                }
+                if self.text_popup.is_some_and(|(up, _)| Some(up) == num(0)) {
+                    self.text_popup = None;
+                }
+                false
+            }
+            _ => true,
+        });
         for m in &mut messages {
             if let GameMessage::Send(name, args) = m {
                 if name == thedas_ui::input::SCRIPT_DIALOG_RESULT {
@@ -1304,6 +1580,12 @@ impl UiLayer {
                     args.push(typed);
                 }
             }
+        }
+        if std::mem::take(&mut self.uber_cut) {
+            messages.push(GameMessage::Send(
+                thedas_sim::journal::MSG_HIDE_UBER_ALERT.into(),
+                Vec::new(),
+            ));
         }
         if std::mem::take(&mut self.continue_pending) {
             messages.push(GameMessage::Send(

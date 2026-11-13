@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use thedas_formats::fev::Fev;
 use thedas_formats::fsb::Fsb;
+use thedas_vfs::join_ci;
 
 use crate::decode::{Pcm, decode};
 
@@ -74,24 +75,26 @@ impl Library {
     /// (`modules/<module>`), each with `audio/sound` then `audio/vo/<language>/vo`. Other
     /// modules' folders (`packages/core_ep1`, DLC `module` folders) are not: they carry their
     /// own projects under the same names (`music`), which the campaign must not pick up.
+    /// Folder names are matched in any case, as the Windows original does
+    /// ([`thedas_vfs::resolve_ci`]); module and language names come from flags.
     pub fn install_dirs(root: &Path, module: &str, language: &str) -> Vec<PathBuf> {
-        let mut packages = vec![join_any_case(root, "packages/core")];
+        let mut packages = vec![join_ci(root, "packages/core")];
         for top in ["Addins", "Offers"] {
-            let mut dlc: Vec<PathBuf> = std::fs::read_dir(join_any_case(root, top))
+            let mut dlc: Vec<PathBuf> = std::fs::read_dir(join_ci(root, top))
                 .into_iter()
                 .flatten()
                 .flatten()
-                .map(|e| join_any_case(&e.path(), "core"))
+                .map(|e| join_ci(&e.path(), "core"))
                 .filter(|p| p.is_dir())
                 .collect();
             dlc.sort();
             packages.extend(dlc);
         }
-        packages.push(join_any_case(root, &format!("modules/{module}")));
+        packages.push(join_ci(root, &format!("modules/{module}")));
         let mut out = Vec::new();
         for p in packages {
             for sub in ["audio/sound".to_string(), format!("audio/vo/{language}/vo")] {
-                let d = join_any_case(&p, &sub);
+                let d = join_ci(&p, &sub);
                 if d.is_dir() {
                     out.push(d);
                 }
@@ -216,27 +219,6 @@ impl Library {
         cache.0.insert(ck, pcm.clone());
         Some(pcm)
     }
-}
-
-/// `base` joined with the `/`-separated `rel`, each part matched case-insensitively against
-/// what is on disk (the install may sit on a case-sensitive volume, and module and language
-/// names come from flags); a part with no match is kept as given.
-fn join_any_case(base: &Path, rel: &str) -> PathBuf {
-    let mut out = base.to_path_buf();
-    for part in rel.split('/').filter(|p| !p.is_empty()) {
-        let exact = out.join(part);
-        if exact.exists() {
-            out = exact;
-            continue;
-        }
-        let found = std::fs::read_dir(&out).ok().and_then(|rd| {
-            rd.flatten()
-                .find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(part))
-                .map(|e| e.path())
-        });
-        out = found.unwrap_or(exact);
-    }
-    out
 }
 
 #[cfg(test)]

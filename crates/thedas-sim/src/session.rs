@@ -80,5 +80,5 @@ pub fn install_from_env() -> Option<std::path::PathBuf> {
 }
 
 pub fn exists(p: &Path) -> bool {
-    p.join("packages").join("core").is_dir()
+    thedas_vfs::join_ci(p, "packages/core").is_dir()
 }
