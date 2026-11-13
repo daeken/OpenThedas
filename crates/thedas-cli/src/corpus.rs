@@ -383,6 +383,10 @@ fn check_other(
         MaterialState::parse(data)
             .map(|_| ())
             .map_err(|e| e.to_string())
+    } else if ext == "mat" && thedas_formats::bmat::is_bmat(data) {
+        thedas_formats::bmat::Bmat::parse(data)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     } else if ext == "dds" {
         Dds::parse(data).map(|_| ()).map_err(|e| e.to_string())
     } else if ext == "mtx" {
