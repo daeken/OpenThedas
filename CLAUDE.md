@@ -18,5 +18,9 @@
   the checks ran, do it again.
   Run the tests in a debug build (plain `cargo test`), not only `--release`: debug stack frames
   and overflow checks catch things a release build hides.
+  All worktrees share one `.git`, so another stream's fetch moves `origin/main` under you.
+  Never squash or reset onto `origin/main` by name; use the exact commit you merged and tested.
+  Stage by path. Before every push and merge, after a fresh fetch and merge,
+  `git diff --stat origin/main HEAD` must list only files you meant to change.
 - Mark anything taken from xoreos or guesswork, rather than verified against the original
   executable, as provisional in its doc comment.
