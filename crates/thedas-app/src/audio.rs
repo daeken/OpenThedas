@@ -1567,11 +1567,20 @@ impl GameAudio {
         for i in 0..a.sounds.len() {
             let s = &a.sounds[i];
             let on = s.active && !state.inactive_sounds.contains(&s.tag);
+            // An audio volume's sound follows the listener (see `SoundRegion`): at the
+            // listener while the party leader is inside the volume, else at the volume's
+            // nearest point, when within the volume's radius of the event's reach.
+            // Provisional: re-placed every frame rather than every 0.06 s after 0.25 m.
+            let position = match &s.region {
+                Some(r) if state.leader.is_some_and(|p| r.contains(p)) => listener,
+                Some(r) => r.nearest(listener),
+                None => s.position,
+            };
             let d = {
                 let v = [
-                    s.position[0] - listener[0],
-                    s.position[1] - listener[1],
-                    s.position[2] - listener[2],
+                    position[0] - listener[0],
+                    position[1] - listener[1],
+                    position[2] - listener[2],
                 ];
                 (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
             };
@@ -1593,7 +1602,7 @@ impl GameAudio {
                     a.playing[i] = Some(self.engine.play(
                         &s.event,
                         PlayOptions {
-                            position: Some(s.position),
+                            position: Some(position),
                             volume: 10f32.powf(s.volume / 20.0),
                             distance_scale: s.max_distance_mult.max(1e-3),
                             ..Default::default()
@@ -1608,6 +1617,9 @@ impl GameAudio {
                 }
                 (Some(Some(h)), true) if !self.engine.is_playing(h) => {
                     a.playing[i] = Some(None);
+                }
+                (Some(Some(h)), true) if s.region.is_some() => {
+                    self.engine.set_position(h, position);
                 }
                 _ => {}
             }
