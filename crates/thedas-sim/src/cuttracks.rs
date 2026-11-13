@@ -2385,6 +2385,51 @@ mod tests {
     }
 
     #[test]
+    fn the_shakes_noise_is_the_c_runtimes() {
+        // `srand(1)` then `rand()`: the C runtime's well known first values.
+        let mut r = Rand(1);
+        assert_eq!([r.next(), r.next(), r.next()], [41, 18467, 6334]);
+        let white = Rand(1).white(2);
+        assert!((white[0] - (41.0 / 16383.5 - 1.0) as f32).abs() < 1e-6);
+        assert!(white.iter().all(|v| (-1.0..=1.0).contains(v)));
+    }
+
+    #[test]
+    fn a_shake_turns_its_actor_by_faded_noise_scaled_by_its_curves() {
+        let amplitude = Curve::constant;
+        let shake = |curves: Vec<Curve>| {
+            ShakeTrack::new(2.0, 12.0, 179_082, 0.6, 1, false, 0.0, (0.5, 0.5), curves).unwrap()
+        };
+        let s = shake(vec![amplitude(1.0), amplitude(0.5), amplitude(0.0)]);
+        // A sample a hundredth of a second, for the whole span and its last instant.
+        assert_eq!(s.noise.len(), 1001);
+        // Nothing outside its span; no turn at its start and end, where it has faded.
+        assert_eq!(s.at(1.9), None);
+        assert_eq!(s.at(12.1), None);
+        assert_eq!(s.at(2.0), Some([0.0, 0.0, 0.0, 1.0]));
+        assert!(s.noise[1000].abs() < 1e-6);
+        // In between it turns, by no more than the curves allow (the noise is within 1).
+        let turn = s.at(7.0).unwrap();
+        assert!(turn[3] < 1.0 && turn[3] > 0.9999, "{turn:?}");
+        assert!(s.noise.iter().all(|v| v.abs() <= 1.0));
+        assert!(s.noise.iter().any(|v| v.abs() > 0.2));
+        // Value noise at 0.6 a second moves slowly: neighbouring samples are close.
+        let step = s
+            .noise
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max);
+        assert!(step < 0.05, "{step}");
+        // The same seed gives the same shake; without curves it turns nothing.
+        assert_eq!(shake(vec![amplitude(1.0)]).noise, s.noise);
+        assert_eq!(shake(Vec::new()).at(7.0), Some([0.0, 0.0, 0.0, 1.0]));
+        // A span too long to be a real shake is left out.
+        assert!(
+            ShakeTrack::new(0.0, 1e10, 1, 0.6, 1, false, 0.0, (0.5, 0.5), Vec::new()).is_none()
+        );
+    }
+
+    #[test]
     fn visibility_and_weapon_draws_hold_from_their_start() {
         let mut a = Actor {
             id: 1,
