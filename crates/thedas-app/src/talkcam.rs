@@ -574,6 +574,7 @@ mod tests {
             end_position: [0.0; 3],
             end_rotation: [0.0, 0.0, 0.0, 1.0],
             snaps: false,
+            pose: None,
             position: [0.0; 3],
             rotation: [0.0, 0.0, 0.0, 1.0],
             motion: Vec::new(),
