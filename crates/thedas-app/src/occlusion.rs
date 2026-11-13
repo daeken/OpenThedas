@@ -13,13 +13,17 @@
 //!   grass 10, unknown 0). A triangle mesh has no outline, so the angle is 0.
 //! - A static hit within 0.5 m of an earlier static hit counts in full (0xa2c9b1..0xa2ca01).
 //!
-//! The event's occlusion moves towards the result at 1.2 per second (0x5b6eb0, 0xafebc0).
+//! An occluded event is low-passed, not turned down (`thedas_audio`'s `occlusion_cutoff`):
+//! FMOD's software occlusion, which the exe turns on.
+//!
+//! The event's occlusion moves towards the result at 1.2 per second (0x5b6eb0, 0xafebc0;
+//! `thedas_audio::AudioEngine::occlude`). Every occludable 3D event is tested, not only placed
+//! sounds: the exe's events are occludable unless their player says otherwise.
 //!
 //! Provisional: the box's angle (the exe picks one corner by a score not decoded and tests
 //! its three edges; here the corner nearest the hit), a third shape group in the ray's
 //! mask (0x1000, whose shapes are not identified), the distance the 0.5 m rule measures
-//! (taken from the listener), and that only placed sounds are tested (their `Occludable`
-//! flag; how other events get theirs is not traced).
+//! (taken from the listener).
 
 use thedas_sim::collision::{Collision, Outline};
 
@@ -221,17 +225,6 @@ impl Occluders {
     }
 }
 
-/// An event's occlusion `dt` seconds on, moving from `now` towards `target` at 1.2 per
-/// second (0x5b6eb0).
-pub fn approach(now: f32, target: f32, dt: f32) -> f32 {
-    let step = 1.2 * dt.max(0.0);
-    if now < target {
-        (now + step).min(target)
-    } else {
-        (now - step).max(target)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,12 +307,5 @@ mod tests {
         assert_eq!(occlusion(&[stone(30.0, 0.0)]), 0.0);
         assert_eq!(occlusion(&[stone(60.0, 100.0)]), 1.0);
         assert!((occlusion(&[stone(45.0, 40.0)]) - 0.4).abs() < 1e-6);
-    }
-
-    #[test]
-    fn occlusion_ramps_at_its_rate() {
-        assert!((approach(0.0, 1.0, 0.5) - 0.6).abs() < 1e-6);
-        assert_eq!(approach(0.9, 1.0, 0.5), 1.0);
-        assert!((approach(1.0, 0.0, 0.25) - 0.7).abs() < 1e-6);
     }
 }
