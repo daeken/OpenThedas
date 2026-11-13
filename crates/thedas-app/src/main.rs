@@ -2171,9 +2171,11 @@ impl App {
         );
         let mut now_save = None;
         let mut trace = None;
+        let mut journal = None;
         let mut pause = false;
         if let Some(live) = self.live.as_mut() {
             if !live.front_end {
+                journal = live.journal.as_mut().and_then(|j| j.files());
                 let sim = live.sim();
                 info["game"]["training_mode"] = json!(sim.world.training.mode);
                 info["game"]["hero"] = json!(sim.world.hero.map(|h| sim.display_name(h)));
@@ -2188,7 +2190,7 @@ impl App {
                 pause = !live.paused;
             }
         }
-        let dir = self.recorder.start(now_save, trace, info);
+        let dir = self.recorder.start(now_save, trace, journal, info);
         log::info!("report: started in {}", dir.display());
         // The frame as presented, read back as the next one is drawn; drawn again
         // offscreen where the surface cannot be read back.
