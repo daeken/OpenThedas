@@ -81,6 +81,9 @@ pub fn platform() -> String {
 
 /// The builds' address, if this machine is set up for them (ends in `/`).
 pub fn base_url() -> Option<String> {
+    if !crate::upload::online() {
+        return None;
+    }
     let text = std::fs::read_to_string(crate::saves::data_dir().join(URL_FILE)).ok()?;
     let url = text.trim();
     if !url.starts_with("https://") {
