@@ -151,6 +151,11 @@ pub struct AttackResult {
     pub effects: [Option<Effect>; 2],
 }
 
+/// How far from where it stands a creature whose eye is inside a solid may be taken to
+/// stand for sight (see `Sim::update_perception`): the pathing cell it is in or the next
+/// one, in metres. Provisional.
+const STAND_ASIDE: f32 = 0.75;
+
 fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
@@ -245,9 +250,29 @@ impl Sim {
             .as_ref()
             .and_then(|_| self.placeable_collision(area))
             .filter(|c| !c.is_empty());
+        // A creature whose eye is inside a solid of the level sees from the middle of the
+        // pathing cell it stands in (or the nearest walkable one): the original's capsules
+        // are kept out of the level's geometry, while ours stand anywhere in a cell, and a
+        // cell that straddles a wall's end is partly inside the wall (see
+        // `Collision::sight_blocked_standing`). Provisional.
+        let stand = |p: [f32; 3]| -> [f32; 3] {
+            let inside = solid.as_ref().is_some_and(|c| c.eye_inside(p))
+                || props.as_ref().is_some_and(|c| c.eye_inside(p));
+            if !inside {
+                return p;
+            }
+            grid.as_ref()
+                .and_then(|g| crate::nav::nearest_walkable_point(g, p))
+                .filter(|q| ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).sqrt() <= STAND_ASIDE)
+                .unwrap_or(p)
+        };
         let wall = |a: [f32; 3], b: [f32; 3]| match &solid {
             Some(c) => {
-                c.sight_blocked(a, b) || props.as_ref().is_some_and(|p| p.sight_blocked(a, b))
+                let (a, b) = (stand(a), stand(b));
+                c.sight_blocked_standing(a, b)
+                    || props
+                        .as_ref()
+                        .is_some_and(|p| p.sight_blocked_standing(a, b))
             }
             None => grid
                 .as_ref()
@@ -2698,6 +2723,68 @@ mod tests {
         s.world.get_mut(near_sighted).unwrap().position = [70.0, 0.0, 0.0];
         s.update_perception();
         assert!(s.world.get(hero).unwrap().combat.perceived.is_empty());
+    }
+
+    #[test]
+    fn a_creature_standing_in_a_walls_end_still_sees_its_enemies() {
+        // The Dalish ruins' mirror room, turned to the axes: a wall 0.7 m thick ends at
+        // y = 2.17 beside a doorway, and a companion stands 16 cm inside its end, in a
+        // pathing cell the wall's end straddles. The enemy is 3.8 m away in the open.
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let (w, h) = (24u32, 24u32);
+        let mut data = vec![1u8; (w * h) as usize];
+        // The wall's cells are unwalkable up to y = 2 (the cell 2.0..2.5 holds its end).
+        for y in 0..4 {
+            data[(y * w + 4) as usize] = 10;
+        }
+        s.area_layouts.insert(area, "ruins".into());
+        s.nav_grids.insert(
+            "ruins".into(),
+            Some(std::sync::Arc::new(thedas_formats::level::NavGrid {
+                columns: w,
+                rows: h,
+                cell_size: 0.5,
+                clearance: 2.0,
+                base: [0.0, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                data,
+                heights: vec![0.0; (w * h) as usize],
+                surfaces: Vec::new(),
+            })),
+        );
+        s.collisions.insert(
+            "ruins".into(),
+            Some(std::sync::Arc::new(
+                crate::collision::Collision::from_boxes(&[([2.25, 0.5, 2.75], [0.35, 1.67, 2.75])]),
+            )),
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let tamlen = s.world.spawn(ObjectKind::Creature, "tamlen");
+        let bear = s.world.spawn(ObjectKind::Creature, "bear");
+        s.world.hero = Some(hero);
+        for (id, p, g) in [
+            (hero, [7.75, 2.25, 0.0], 0),
+            (tamlen, [2.13, 2.01, 0.0], 0),
+            (bear, [5.9, 2.2, 0.0], 2),
+        ] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = p;
+            o.group = g;
+        }
+        s.world.hostility.insert((0, 2), true);
+        s.update_perception();
+        let sees = |s: &Sim, a: ObjectId| s.world.get(a).unwrap().combat.perceived_hostile.clone();
+        assert_eq!(sees(&s, tamlen), vec![bear]);
+        assert!(sees(&s, bear).contains(&tamlen) && sees(&s, bear).contains(&hero));
+        // Behind the wall he is hidden as before.
+        s.world.get_mut(tamlen).unwrap().position = [1.25, 0.75, 0.0];
+        s.world.get_mut(tamlen).unwrap().combat.perceived.clear();
+        s.world.get_mut(bear).unwrap().combat.perceived.clear();
+        s.world.get_mut(bear).unwrap().position = [5.9, 0.6, 0.0];
+        s.update_perception();
+        assert!(sees(&s, tamlen).is_empty());
     }
 
     #[test]
