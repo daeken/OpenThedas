@@ -3900,6 +3900,7 @@ dependencies = [
  "symphonia-bundle-mp3",
  "symphonia-core",
  "thedas-formats",
+ "thedas-vfs",
  "thiserror 2.0.18",
 ]
 
