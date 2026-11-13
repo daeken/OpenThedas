@@ -2450,7 +2450,7 @@ mod tests {
                 format!("{n}.GUI_mc")
             ]
         );
-        assert_eq!(pass.show, [splash.clone()]);
+        assert_eq!(pass.show, std::slice::from_ref(&splash));
         assert_eq!(pass.multiply, [format!("{splash}.instance9")]);
     }
 
