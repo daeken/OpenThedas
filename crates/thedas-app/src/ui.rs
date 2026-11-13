@@ -294,6 +294,8 @@ pub struct UiLayer {
     queue: wgpu::Queue,
     /// Messages the simulation did not take, already logged.
     ignored: std::collections::HashSet<String>,
+    /// The cursor the movies last asked for (`SetCursor`); empty before any did.
+    cursor: String,
     /// The screens' own choices (the inventory's category tab), shared with the message
     /// handler.
     shown: Arc<Mutex<thedas_ui::binding::Presentation>>,
@@ -715,6 +717,7 @@ impl UiLayer {
             device: ctx.device.clone(),
             queue: ctx.queue.clone(),
             ignored: Default::default(),
+            cursor: String::new(),
             shown: Default::default(),
             line: None,
             level: None,
@@ -1937,6 +1940,13 @@ impl UiLayer {
                         self.requests.push(FrontEnd::NewGame);
                     }
                     "QuitGame" => self.requests.push(FrontEnd::Quit),
+                    // A movie asks for a cursor by name (`standard`, `ibeam`, and their
+                    // `_pressed` forms): see [`crate::cursor`].
+                    "SetCursor" => {
+                        if let Some(thedas_ui::UiValue::String(name)) = call.args.first() {
+                            self.cursor = name.trim().to_ascii_lowercase();
+                        }
+                    }
 
                     other => {
                         if self.ignored.insert(other.to_string()) {
@@ -2726,6 +2736,12 @@ impl UiLayer {
         for m in &mut self.stage.movies {
             m.render();
         }
+    }
+
+    /// The cursor the movies last asked for by name (the `SetCursor` fscommand); empty before
+    /// any did.
+    pub fn cursor(&self) -> &str {
+        &self.cursor
     }
 
     /// Whether a movie drew at window pixel (`x`, `y`) in its last rendered frame: a click
