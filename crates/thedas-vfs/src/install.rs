@@ -41,6 +41,9 @@ pub struct AddIn {
     /// an add-in that is a campaign of its own.
     pub extends: Option<String>,
     pub dir: PathBuf,
+    /// Its place in the registry (`AddIns.xml`) that named it, counted from the first item;
+    /// `None` for an add-in known only from its folder's manifest.
+    pub rank: Option<usize>,
 }
 
 impl AddIn {
@@ -144,7 +147,7 @@ impl DaoInstall {
         Ok(files)
     }
 
-    /// DLC packages, ordered by priority (lowest first), then UID.
+    /// DLC packages, in the order the stack takes them (lowest first; see `sort_addins`).
     ///
     /// The original keeps one registry of add-ins, `AddIns.xml`, and many shipped add-ins (the
     /// promotional items) have no manifest of their own in their folder. So an add-in is
@@ -172,6 +175,7 @@ impl DaoInstall {
                 if let (false, Some(folder)) = (known, folder) {
                     out.push(AddIn {
                         dir: folder,
+                        rank: Some(out.len()),
                         ..item
                     });
                 }
@@ -347,8 +351,27 @@ fn push_package(
     Ok(())
 }
 
+/// Orders add-ins as the stack takes them, lowest first.
+///
+/// The original keeps its add-in records in the order its registry lists them: the parser
+/// appends each item to the record vector (`push_back` at 0x5f8b70, called from 0x5fa6da) and
+/// nothing sorts it; `Priority` is copied to the record (+0x154) and read once, for a
+/// `Format="0"` item (0x5f4074), never to order records. Both registration functions walk
+/// the vector from its last record to its first, handing out priority numbers from 9000
+/// downwards, lowest number winning: so **the first item in the registry beats every later
+/// one**. Ours: registry add-ins in reverse registry order, so the first is pushed last.
+///
+/// Provisional: add-ins no registry names (a folder with only a manifest, one from the
+/// player's `AddIns` folder, one unpacked from a `.dazip`) go below every registry add-in,
+/// ordered among themselves by manifest `Priority` then UID. The original would have them in
+/// its registry, appended when installed, which is also below the shipped ones.
 fn sort_addins(addins: &mut [AddIn]) {
-    addins.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.uid.cmp(&b.uid)));
+    addins.sort_by(|a, b| match (a.rank, b.rank) {
+        (Some(x), Some(y)) => y.cmp(&x),
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, None) => a.priority.cmp(&b.priority).then_with(|| a.uid.cmp(&b.uid)),
+    });
 }
 
 /// An add-in described by a manifest's first `AddInItem`. `fallback_uid` names it when the
@@ -362,6 +385,7 @@ pub(crate) fn addin_from_manifest(text: &str, dir: PathBuf, fallback_uid: String
         enabled: xml_attr(text, "AddInItem", "Enabled").as_deref() != Some("0"),
         extends: xml_attr(text, "AddInItem", "ExtendedModuleUID"),
         dir,
+        rank: None,
     }
 }
 
@@ -899,6 +923,7 @@ mod tests {
             enabled: true,
             extends: Some(extends.into()),
             dir: base.join("cache/pkg"),
+            rank: None,
         };
         let install = DaoInstall::open(&root).unwrap();
         let read = |vfs: &Vfs, n: &str| String::from_utf8(vfs.read(n).unwrap().0).unwrap();
@@ -938,7 +963,7 @@ mod tests {
         // Two add-ins with no manifest, one with, one the registry names but is not there.
         write(
             "install/Addins/promo_one/core/data/p1.erf",
-            &erf_v20(&[("p1.uti", b"promo one")]),
+            &erf_v20(&[("p1.uti", b"promo one"), ("shared.uti", b"promo one")]),
         );
         write(
             "install/Addins/promo_one/module/data/p1m.erf",
@@ -946,7 +971,7 @@ mod tests {
         );
         write(
             "install/Addins/Promo_Two/core/data/p2.erf",
-            &erf_v20(&[("p2.uti", b"promo two")]),
+            &erf_v20(&[("p2.uti", b"promo two"), ("shared.uti", b"promo two")]),
         );
         write(
             "install/Addins/Promo_Two/module/data/p2m.erf",
@@ -954,7 +979,7 @@ mod tests {
         );
         write(
             "install/Addins/with_manifest/core/data/m.erf",
-            &erf_v20(&[("m.uti", b"manifest")]),
+            &erf_v20(&[("m.uti", b"manifest"), ("shared.uti", b"manifest")]),
         );
         // Named by the registry but switched off, with no type, and with a type the original
         // registers nothing for: none of them is mounted.
@@ -1003,24 +1028,28 @@ mod tests {
             .filter(|a| !a.enabled)
             .map(|a| a.uid.as_str())
             .collect();
-        assert_eq!(off, ["NO_TYPE", "SWITCHED_OFF", "TYPE_THREE"]);
+        // Lowest in the stack first: the registry's order backwards.
+        assert_eq!(off, ["TYPE_THREE", "NO_TYPE", "SWITCHED_OFF"]);
         let list: Vec<(String, i64)> = all
             .iter()
             .filter(|a| a.enabled)
             .map(|a| (a.uid.clone(), a.priority))
             .collect();
-        // The registry's priority for the one that also has a manifest (3, not 9).
+        // The registry's priority for the one that also has a manifest (3, not 9), and the
+        // registry's first item last, so on top: `Priority` does not order them.
         assert_eq!(
             list,
             [
-                ("PROMO_ONE".to_string(), 1),
                 ("WITH_MANIFEST".to_string(), 3),
-                ("PROMO_TWO".to_string(), 5)
+                ("PROMO_TWO".to_string(), 5),
+                ("PROMO_ONE".to_string(), 1)
             ]
         );
         let vfs = install.global_vfs(TextureQuality::High).unwrap();
         assert_eq!(vfs.read("p1.uti").unwrap().0, b"promo one");
         assert!(vfs.lookup("p1.plo").is_some());
+        // The registry's first item owns a file three add-ins provide.
+        assert_eq!(vfs.read("shared.uti").unwrap().0, b"promo one");
         // Another campaign's: `core` only.
         assert_eq!(vfs.read("p2.uti").unwrap().0, b"promo two");
         assert!(vfs.lookup("p2.plo").is_none());
