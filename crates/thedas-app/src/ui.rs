@@ -281,6 +281,9 @@ pub struct UiLayer {
     /// The engine's own text box up (see [`UiLayer::ask_text`]): its id and the frames
     /// since its values were set, and the answers not yet taken.
     text_popup: Option<(u32, u8)>,
+    /// The game menu's online-features button has been relabelled "Report Issue" since
+    /// mainmenu.gfx was loaded (see `UiLayer::report_button`).
+    report_labelled: bool,
     text_answers: Vec<TextAnswer>,
     /// A party portrait was clicked (see [`UiLayer::mouse_button`]).
     portrait_clicked: Option<u32>,
@@ -620,6 +623,7 @@ impl UiLayer {
             tooltip_relayout: 0,
             script_popup: None,
             text_popup: None,
+            report_labelled: false,
             text_answers: Vec::new(),
             portrait_clicked: None,
             uber_splash: None,
@@ -964,7 +968,14 @@ impl UiLayer {
             }
             return;
         };
-        if self.uber_splash.as_deref() == Some(head.as_str()) {
+        // The same notification, unless notifications.gfx was loaded again meanwhile (the
+        // HUD comes back after a full-screen screen): a new movie has no pass yet.
+        let reloaded = self
+            .stage
+            .movies
+            .iter()
+            .any(|m| m.name == "notifications.gfx" && !m.has_multiply_pass());
+        if self.uber_splash.as_deref() == Some(head.as_str()) && !reloaded {
             return;
         }
         // The notification's clip is named as it is added (`UberNotification<n>`); its
@@ -1046,6 +1057,41 @@ impl UiLayer {
     /// The answers to [`UiLayer::ask_text`] since last asked.
     pub fn take_text_answers(&mut self) -> Vec<TextAnswer> {
         std::mem::take(&mut self.text_answers)
+    }
+
+    /// The game menu's online-features button ("Player Profile": the original's online
+    /// service, which this game does not have) reads "Report Issue": pressing it asks for
+    /// an issue report (`FrontEnd::Report`, see `front_end_message`). Relabelled once
+    /// mainmenu.gfx has laid out its buttons, each time it is loaded.
+    fn report_button(&mut self) {
+        let up = self.stage.movies.iter().any(|m| m.name == "mainmenu.gfx");
+        if !up {
+            self.report_labelled = false;
+            return;
+        }
+        if self.report_labelled {
+            return;
+        }
+        let Some(thedas_ui::UiValue::String(tree)) =
+            self.stage
+                .call_in("mainmenu.gfx", "_global.thedas_tree_list", &[])
+        else {
+            return;
+        };
+        let Some(button) = tree
+            .split(';')
+            .filter_map(|e| e.split('|').next())
+            .find(|p| p.ends_with(".Screenshots_mc"))
+            .map(str::to_string)
+        else {
+            return;
+        };
+        self.stage.call_in(
+            "mainmenu.gfx",
+            &format!("{button}.SetText"),
+            &[thedas_ui::UiValue::String("Report Issue".into())],
+        );
+        self.report_labelled = true;
     }
 
     /// Shows the engine's own text box once its values have reached the movie.
@@ -1472,6 +1518,7 @@ impl UiLayer {
         self.show_cutscene_line(sim);
         self.show_script_popup(sim);
         self.show_text_popup();
+        self.report_button();
         self.select_clicked_portrait(sim);
         self.uber_alert_splash(sim);
         self.loading_frame(dt_ms);
