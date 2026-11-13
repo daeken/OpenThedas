@@ -10,14 +10,14 @@ repository.
 
 ## Status
 
-Last updated 2026-11-13 02:10 UTC, main d893fa0
+Last updated 2026-11-13 06:20 UTC, main 91d4812
 
 For everything that is wrong or missing, in detail and split into items that can be picked up in
 parallel, see [docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md).
 
 Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–20, with fixes merged since then noted.
 
-- ✅ **Boot flow**: EA logo and intro movies play with their sound (decoded via ffmpeg), then the start menu.
+- ✅ **Boot flow**: EA logo and intro movies play with their sound (decoded via ffmpeg, looked for beside the executable, on the path, and in Homebrew on macOS), then the start menu.
 - ✅ **Start menu**: New Game, Load, Options and Quit are wired; QA graded it near pixel-identical to the original.
 - 🟡 **Character creation**: full flow with the original's stage, blended camera presets and portrait.
   - Appearance menu: preset, hair, beard, the exe's per-race eye and nose shapes, makeup and complexion. Also colour sliders, difficulty and name.
@@ -51,7 +51,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
 - 🟡 **Combat and simulation**:
   - NWScript VM with a large share of the engine functions; melee and ability timing; threat; AI-driven party; tactics; loot.
   - Containers hold their template's items and open on USE with the original loot panel (Take All, Close).
-  - Perception and combat mode work as the exe does them. Sight lines are cast through the level's collision (`.phy`) and placeables. SetCanLevelUp follows unspent points.
+  - Perception and combat mode work as the exe does them. Sight lines are cast through the level's collision (`.phy`) and placeables, and a closed door blocks sight with its own collision. SetCanLevelUp follows unspent points.
   - Weapons are sheathed out of combat and drawn in combat; draw and sheathe animation timing is not traced.
   - Melee approach works in the live app (#269), and the Proving duel can be finished with the pad.
   - Melee attackers take slots on the target's 40-slot melee ring at the bodies' reach, as the exe places them, and step into place before swinging. The default body radius is the exe's 0.6 m.
@@ -106,7 +106,9 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
 - 🟡 **Controller**: Xbox 360-style layout; menus and in-game screens use focus navigation, and A dismisses tutorial popups. The PC right-click radial menu doesn't exist as a movie in the game data, so LT opens a quickbar picker instead. In the inventory A equips and unequips and Y puts a usable item in the first free quickbar slot; on Tactics the pad reaches the Presets and Behaviour pickers; B in an open dropdown closes only the list.
 - ✅ **Saves**: F5/F9 quick save and load, save/load screens, typed names. Revision 7 fills older saves' empty containers.
 - ✅ **Performance**: frustum culling, shadow caching and skinned-draw culling (Lothering about 8 ms, the chapel about 1.5 ms offscreen). Model node trees are read with a heap stack, so small worker-thread stacks are safe.
-- ⬜ **DA2**: not started. There is no Dragon Age II work in the git log.
+- 🟡 **DLC and add-ins**: encrypted DLC archives are read (passwords recovered from the player's own GOG Ultimate Edition executable; nothing is shipped). Every enabled add-in's `core` folder is mounted, and its `module` folder only when its manifest extends the base campaign (provisional), so stand-alone campaigns cannot replace base-game files. DLC content itself does not appear yet: no bonus items at the start, no DLC map pins, nothing added in camp (`FMT-047`). Install paths are matched without regard to case, so the game runs from a case-sensitive file system.
+- 🟡 **Issue reports**: F8, both sticks clicked or the menu's Report Issue entry saves a screenshot, the current save, a save from about a minute earlier, the log, recent input and settings to the user's data folder (`Documents\OpenThedas` on Windows), and can send it to the project's report server.
+- 🟡 **DA2**: scoping. Archives whose entries carry only name hashes (ERF V3.0) resolve by name; nothing of the game runs yet.
 
 ### Known blockers
 
