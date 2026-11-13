@@ -1276,7 +1276,9 @@ impl App {
         g.ui.set_line_voiced(voiced);
         // Tab held shows every creature's name (never while it is typed into a field):
         // keymap.gda binds `HighlightObjects` to Tab.
-        let tab = self.all_names || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
+        let tab = self.all_names
+            || self.pad.highlight
+            || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
         g.ui.set_show_all_names(tab);
         play_interface(
             &mut g.ui,
@@ -1409,7 +1411,9 @@ impl App {
         g.ui.set_line_voiced(voiced);
         // Tab held shows every creature's name (never while it is typed into a field):
         // keymap.gda binds `HighlightObjects` to Tab.
-        let tab = self.all_names || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
+        let tab = self.all_names
+            || self.pad.highlight
+            || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
         g.ui.set_show_all_names(tab);
         play_interface(
             &mut g.ui,
@@ -1757,7 +1761,16 @@ impl App {
             Returning::Fetching(rx, save, report) => match rx.try_recv() {
                 Ok(Ok(exe)) => {
                     let size = self.started_with["size"].as_str().unwrap_or("1280x720");
-                    match update::start_build(&exe, &self.install, save, report, size) {
+                    // The next build is as quiet and as driven as this one: no sound where
+                    // this had none, and the same control address (free once this closes).
+                    let mut more = Vec::new();
+                    if self.audio.is_none() {
+                        more.push("--no-audio".to_string());
+                    }
+                    if let Some(c) = &self.control {
+                        more.extend(["--control".to_string(), c.addr.to_string()]);
+                    }
+                    match update::start_build(&exe, &self.install, save, report, size, &more) {
                         Ok(()) => {
                             log::info!("update: started {}; closing this one", exe.display());
                             self.quit = true;
@@ -2677,6 +2690,11 @@ impl App {
             "lines": c.lines.len(),
         })));
         out["screens"] = json!(self.screens.as_ref().map(|s| format!("{:?}", s.shown())));
+        // The movies' input contexts, innermost last, and whether a dialog box has the input.
+        if let Some(g) = self.gfx.as_ref() {
+            out["contexts"] = json!(g.ui.stage.bridge.contexts());
+            out["popup"] = json!(g.ui.stage.dialog_up());
+        }
         out
     }
 
@@ -4315,6 +4333,8 @@ fn main() -> Result<()> {
         // The mouse hovers nothing until a `hover` step moves it: it starts at the centre
         // (for aiming), which is over the hero, whose name would be in every capture.
         let mut hovering = false;
+        // The highlight held by an `allnames` step (the pad's RT holds it too).
+        let mut all_names = false;
         // The game controller as `pad` steps hold it, and its part of the game.
         let mut pad_state = pad::PadState::default();
         let mut pad_play = padplay::PadPlay::default();
@@ -4537,6 +4557,7 @@ fn main() -> Result<()> {
                                     size.0 as f32,
                                     size.1 as f32,
                                 );
+                                layer.set_show_all_names(all_names || pad_play.highlight);
                                 let over = hovering.then(|| l.hovered_creature(o, d));
                                 layer.set_hovered(over.flatten());
                                 layer.update_floaties(&l.sim, &camera, dt, &|c| l.head_height(c));
@@ -4672,9 +4693,7 @@ fn main() -> Result<()> {
                         println!("asktext {prompt:?}");
                     }
                     &Step::AllNames(on) => {
-                        if let Some((layer, _)) = played.as_mut() {
-                            layer.set_show_all_names(on);
-                        }
+                        all_names = on;
                         println!("allnames {on}");
                     }
                     Step::AskChoice(prompt) => {

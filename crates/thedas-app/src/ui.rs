@@ -355,6 +355,9 @@ pub struct UiLayer {
     /// The highlight key is held: every creature near shows its name (see
     /// [`UiLayer::set_show_all_names`]).
     show_all_names: bool,
+    /// The settings as they were when the options screen opened, while it is up: Cancel
+    /// goes back to them (see `UiLayer::options_screen`).
+    options_before: Option<std::collections::BTreeMap<String, f64>>,
     /// The creature the mouse is over (see [`UiLayer::set_hovered`]).
     hovered: Option<thedas_script::vm::ObjectId>,
     /// A conversation line's continue the movie could not send (see `continue_conversation`).
@@ -604,8 +607,33 @@ impl UiLayer {
         self.settings_file = Some((path, read));
     }
 
-    /// Writes the player's settings when they changed since last written.
+    /// The options screen's Cancel leaves the settings as they were when it opened.
+    /// optionsmenu.gfx sets each option as the player changes it and sends
+    /// `ClientOptions.CommitOptions` only from OK (and from its resolution confirmation), so
+    /// what was set without it is dropped when the screen goes. Provisional: the exe's own
+    /// handling (its handlers at 0x7946c0) is not traced, and the difficulty, which the
+    /// simulation keeps, is not put back.
+    fn options_screen(&mut self, up: bool) {
+        match (up, self.options_before.take()) {
+            (true, None) => {
+                self.options_before = self.shown.lock().ok().map(|s| s.options.clone());
+            }
+            (true, before) => self.options_before = before,
+            (false, Some(before)) => {
+                if let Ok(mut shown) = self.shown.lock() {
+                    shown.options = before;
+                }
+            }
+            (false, None) => {}
+        }
+    }
+
+    /// Writes the player's settings when they changed since last written; not while the
+    /// options screen is up (what it sets is kept only by its OK).
     fn write_settings(&mut self) {
+        if self.options_before.is_some() {
+            return;
+        }
         let Some((path, written)) = self.settings_file.as_mut() else {
             return;
         };
@@ -683,6 +711,7 @@ impl UiLayer {
             floaties: Vec::new(),
             stat_floaties: Default::default(),
             hovered: None,
+            options_before: None,
             show_all_names: false,
             line_voiced: false,
             settings_file: None,
@@ -1672,6 +1701,7 @@ impl UiLayer {
                 self.continue_conversation();
             }
         }
+        self.options_screen(screens.menu == Some(Screen::Options));
         self.write_settings();
         self.show_cutscene_line(sim);
         self.show_script_popup(sim);
@@ -1788,6 +1818,10 @@ impl UiLayer {
         for m in &messages {
             if let GameMessage::Handled(name, args) | GameMessage::Send(name, args) = m {
                 log::info!("ui: {name} {args:?}");
+                // The options screen's OK: what it set is kept (see `options_screen`).
+                if name == "ClientOptions.CommitOptions" && self.options_before.is_some() {
+                    self.options_before = self.shown.lock().ok().map(|s| s.options.clone());
+                }
                 // load_fade.gfx's fade to black is done.
                 if name == "GUIFadeToBlackLoading.FadeComplete"
                     && let Some(l) = self.loading.as_mut()

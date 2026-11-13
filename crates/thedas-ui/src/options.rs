@@ -8,9 +8,10 @@
 //! changes it (its resolution revert sends the old values back the same way, so a change
 //! takes effect when it is set), `ClientOptions.CommitOptions` from OK and
 //! `ClientOptions.RestoreDefaults` from its button. The defaults are those DAOrigins.exe's
-//! ClientOptions sets up (0x5e8735-0x5ec18d). Provisional: Cancel keeps what was set (the
-//! executable's handlers, registered at 0x7946c0, are not traced). The app keeps the settings
-//! in the player's settings file ([`to_text`]), written whenever one changes. The audio volumes and mutes, auto-pause in combat, the
+//! ClientOptions sets up (0x5e8735-0x5ec18d). Provisional: The app drops what was set when the
+//! screen is cancelled and keeps the settings in the player's settings file ([`to_text`]),
+//! written when the screen's OK commits them (the executable's handlers, registered at
+//! 0x7946c0, are not traced). The audio volumes and mutes, auto-pause in combat, the
 //! tutorials, mouse sensitivity and the inverted axes take effect; the other settings change nothing yet but what the screen shows.
 
 use std::collections::BTreeMap;

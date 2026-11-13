@@ -131,10 +131,18 @@ pub struct PadPlay {
     focus_check_ms: f64,
     /// The view's size when the focus last moved (its marker stays inside it).
     view: (u32, u32),
+    /// A dialog box was up last frame, and one that just showed still waits for its buttons
+    /// to take the focus (see `PadPlay::focus_popup`).
+    popup_was: bool,
+    popup_focus_due: bool,
     /// A's release after a press that only focused a button (it clicks nothing).
     swallow_release: bool,
     /// The same for Y, when its press put an item on the quickbar.
     swallow_right: bool,
+    /// The highlight is held (RT in the field): every creature near shows its name, as
+    /// the keyboard's Tab. A deliberate addition, and provisional: the PC original has no
+    /// pad, and RT alone is otherwise only the second quickslot row's modifier.
+    pub highlight: bool,
     /// An issue report was asked for (both sticks); the app makes it and clears this.
     pub report: bool,
 }
@@ -178,12 +186,14 @@ impl PadPlay {
         }
         let popup = host.popup();
         let ctx = context(host.screens().map(|s| &*s), popup, self.picker.is_some());
+        self.highlight = ctx == Context::Field && state.held(crate::pad::Button::RT);
         // The picker only lives over the field: anything else coming up closes it.
         if self.picker.is_some() && !matches!(ctx, Context::Picker | Context::Field) {
             self.close_picker(host);
         }
         self.keep_target(host);
         self.follow_line(host);
+        self.focus_popup(host, popup);
         self.keep_focus(host, ctx, dt_ms);
         if ctx == Context::Conversation && self.used {
             self.show_reply(host);
@@ -195,6 +205,29 @@ impl PadPlay {
             }
         }
         log
+    }
+
+    /// A dialog box that shows while the pad is in use opens with its first button focused,
+    /// so one A press answers it. A box with a text field keeps the field's focus instead
+    /// (the D-pad types there). The focus waits for the box's buttons to be laid out.
+    fn focus_popup(&mut self, host: &mut dyn Host, popup: bool) {
+        if popup && !self.popup_was {
+            self.popup_focus_due = self.used;
+            // The focus of whatever was under the box is not the box's.
+            self.focused = None;
+        }
+        self.popup_was = popup;
+        if !popup {
+            self.popup_focus_due = false;
+            return;
+        }
+        if !self.popup_focus_due || self.controller.free_pointer || host.text_focused() {
+            return;
+        }
+        if !crate::focusnav::modal(host.focus_targets()).is_empty() {
+            self.popup_focus_due = false;
+            self.focus(host, 0, 1);
+        }
     }
 
     /// Keeps the focus marker on its button: looked for again every [`FOCUS_CHECK_MS`],
@@ -427,6 +460,13 @@ impl PadPlay {
                 let targets = host.focus_targets();
                 if !targets.is_empty() && crate::focusnav::under(&targets, host.cursor()).is_none()
                 {
+                    // On a dialog box the press answers it at once (its first button); on a
+                    // screen it only focuses.
+                    if host.popup() && !host.text_focused() {
+                        let m = self.focus(host, 0, 1);
+                        host.left_button(true);
+                        return m;
+                    }
                     self.swallow_release = true;
                     return self.focus(host, 0, 1);
                 }
