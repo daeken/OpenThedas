@@ -73,6 +73,9 @@ pub struct Param {
     pub name: String,
     /// The default as written in the declaration (`0`, `TRUE`, `"", [0.0, 0.0, 0.0]`).
     pub default: Option<String>,
+    /// Declared `ref` (Dragon Age II): the script passes a reference to its variable and the
+    /// engine changes it in place, as in `void SetEventIntegerRef(ref event evEvent, ...)`.
+    pub by_ref: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -347,11 +350,17 @@ fn parse_function(table: &EngineTable, s: &str) -> Result<Function, String> {
             Some(i) => (&p[..i], Some(p[i + 1..].trim().to_string())),
             None => (p, None),
         };
+        let decl = decl.trim_start();
+        let (decl, by_ref) = match decl.strip_prefix("ref") {
+            Some(rest) if rest.starts_with(char::is_whitespace) => (rest, true),
+            _ => (decl, false),
+        };
         let (ty, pname) = split_type(decl).ok_or_else(|| format!("bad parameter {p:?}"))?;
         params.push(Param {
             ty: parse_type(table, &ty)?,
             name: pname.trim().to_string(),
             default,
+            by_ref,
         });
     }
     Ok(Function {
@@ -477,5 +486,23 @@ mod tests {
         assert!(EngineTable::parse(b"void F( int x ) = nope;").is_err());
         assert!(EngineTable::parse(b"int X = abc;").is_err());
         assert!(EngineTable::parse(b"int X = 1 + 2;").is_err());
+    }
+
+    #[test]
+    fn parses_reference_parameters() {
+        // Dragon Age II's script.ldf declares in-place variants of the event and effect
+        // accessors with `ref`.
+        let ldf = "#define ENGINE_STRUCTURE_0 event\n\
+            void SetEventIntegerRef( ref event evEvent, int nIndex, int nValue ) = 7;\n\
+            int GetRefCount( resource rName, int refIndex = 0 ) = 8;\n";
+        let t = EngineTable::parse(ldf.as_bytes()).unwrap();
+        let f = t.function(7).unwrap();
+        assert!(f.params[0].by_ref);
+        assert_eq!(f.params[0].ty, Type::Engine(0));
+        assert_eq!(f.params[0].name, "evEvent");
+        assert!(!f.params[1].by_ref);
+        let g = t.function(8).unwrap();
+        assert!(g.params.iter().all(|p| !p.by_ref));
+        assert_eq!(g.params[1].name, "refIndex");
     }
 }
