@@ -2686,6 +2686,11 @@ impl App {
             "lines": c.lines.len(),
         })));
         out["screens"] = json!(self.screens.as_ref().map(|s| format!("{:?}", s.shown())));
+        // The movies' input contexts, innermost last, and whether a dialog box has the input.
+        if let Some(g) = self.gfx.as_ref() {
+            out["contexts"] = json!(g.ui.stage.bridge.contexts());
+            out["popup"] = json!(g.ui.stage.dialog_up());
+        }
         out
     }
 

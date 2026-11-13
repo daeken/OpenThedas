@@ -291,6 +291,14 @@ impl GameBridge {
             .unwrap_or_default()
     }
 
+    /// Takes every `name` off the context stack: the movie that pushed it is gone or loaded
+    /// anew, so nothing will pop it.
+    pub fn drop_context(&self, name: &str) {
+        if let Ok(mut s) = self.state.lock() {
+            s.contexts.retain(|c| c != name);
+        }
+    }
+
     /// `GetValue` names nobody answered, with counts.
     pub fn unanswered(&self) -> BTreeMap<String, u64> {
         self.state
