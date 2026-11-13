@@ -174,6 +174,16 @@ impl EmitterState {
         }
     }
 
+    /// Carries on from `old`, the same emitter in a scene since rebuilt: its particles and
+    /// where its counting stood. The placement and the birthrate stay this one's.
+    pub fn carry_on_from(&mut self, old: &EmitterState) {
+        self.particles = old.particles.clone();
+        self.births = old.births;
+        self.directions = old.directions;
+        self.accumulator = old.accumulator;
+        self.burst_done = old.burst_done;
+    }
+
     /// Advances by `seconds`, in steps of at most [`MAX_STEP`].
     pub fn advance(&mut self, seconds: f32) {
         if seconds.is_nan() || seconds <= 0.0 || !seconds.is_finite() {
@@ -266,7 +276,8 @@ impl EmitterState {
                     }
                 }
             }
-            1 if !self.burst_done => {
+            // A burst waits for a birthrate (an effect's emitter before its timeline starts).
+            1 if !self.burst_done && birthrate + birthrate_range > 0.0 => {
                 self.burst_done = true;
                 (birthrate + self.births.signed() * birthrate_range).max(0.0) as u32
             }

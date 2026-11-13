@@ -29,4 +29,4 @@ pub use animate::{Animator, Clip};
 pub use camera::Camera;
 pub use gpu::{AreaRenderer, GpuContext, RenderCache};
 pub use material::{ProgramRegistry, ProgramSource};
-pub use scene::{AreaScene, Prop, PropDraws, SceneProbe};
+pub use scene::{AreaScene, Prop, PropDraws, PropEffect, SceneProbe};
