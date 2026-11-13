@@ -280,6 +280,9 @@ pub struct UiLayer {
     /// The player's settings file and the settings last written to it (see
     /// [`UiLayer::set_settings_file`]).
     settings_file: Option<(std::path::PathBuf, std::collections::BTreeMap<String, f64>)>,
+    /// Whether the conversation line the game is on has a voice-over, known as it is chosen
+    /// (see [`UiLayer::set_line_voiced`]).
+    line_voiced: bool,
     /// The creature the mouse is over (see [`UiLayer::set_hovered`]).
     hovered: Option<thedas_script::vm::ObjectId>,
     /// A conversation line's continue the movie could not send (see `continue_conversation`).
@@ -488,6 +491,13 @@ impl UiLayer {
         std::mem::take(&mut self.sound_set_previews)
     }
 
+    /// Whether the line the game is on is voiced, as the audio knows it once the line is
+    /// chosen (`audio::GameAudio::line_voice`), before it plays: set before
+    /// [`UiLayer::play`], so the conversation screen hears `Conversation.HasVO` with the line.
+    pub fn set_line_voiced(&mut self, voiced: bool) {
+        self.line_voiced = voiced;
+    }
+
     /// The conversation line on screen speaks for this long (milliseconds; see
     /// [`crate::audio`]), or has no voice-over.
     pub fn set_line_voice_ms(&mut self, ms: Option<f64>) {
@@ -595,6 +605,7 @@ impl UiLayer {
             floaties: Vec::new(),
             stat_floaties: Default::default(),
             hovered: None,
+            line_voiced: false,
             settings_file: None,
             continue_pending: false,
             next_floaty: 1,
@@ -1304,7 +1315,7 @@ impl UiLayer {
                 key,
                 t: 0.0,
                 voice_ms: None,
-                voiced: false,
+                voiced: self.line_voiced,
                 waits,
                 continued: false,
                 cut_seen: cutscene,
@@ -1315,13 +1326,15 @@ impl UiLayer {
         // Whether the line is voiced (`Conversation.HasVO`): conversation.gfx's
         // `UpdateMainText` hides a voiced NPC line when the Subtitles option is "No
         // subtitles" (`ClientOptions.GameOptions.SubtitlesLevel` 0, the default), and shows
-        // it otherwise. The voice is known once it plays (see `set_line_voice_ms`), a frame
-        // or more after the line's text reached the movie, so the movie is given the line
-        // again then. Provisional: when the exe sets HasVO (its attribute at 0x690193) is not
-        // traced; a voice-over playing stands in.
+        // it otherwise. The audio says so as the line is chosen (`set_line_voiced`), before
+        // the movie hears of the line this frame; should the voice turn up only once it
+        // plays (`set_line_voice_ms`), the movie is given the line again then. Provisional:
+        // when the exe sets HasVO (the line's +0xd4, read at 0x690193) is not traced; the
+        // line having a voice-over stands in.
         let mut retell = None;
+        let early = self.line_voiced;
         if let Some(l) = self.line.as_mut() {
-            let voiced = l.voice_ms.is_some();
+            let voiced = early || l.voice_ms.is_some();
             self.stage.bridge.set_value(
                 "Conversation.HasVO",
                 thedas_ui::UiValue::Number(f64::from(u8::from(voiced))),

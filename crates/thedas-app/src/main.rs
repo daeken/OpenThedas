@@ -199,7 +199,7 @@ struct Args {
     saves: Option<PathBuf>,
     /// The player's settings file (the options screen's settings, kept between runs).
     /// Playing in a window without `--control` it defaults to `options.ini` in the
-    /// player's folder (`.openthedas` in the home folder, on Windows too); otherwise
+    /// player's folder (`~/.openthedas`; `Documents\OpenThedas` on Windows); otherwise
     /// settings are kept only when this is given.
     #[arg(long)]
     settings: Option<PathBuf>,
@@ -1156,10 +1156,12 @@ impl App {
         }
         g.ui.set_pad_active(self.pad.used);
         let hovered = self.hovered_creature();
+        let voiced = self.line_voiced();
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
         };
         g.ui.set_hovered(hovered);
+        g.ui.set_line_voiced(voiced);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -1261,10 +1263,12 @@ impl App {
         }
         g.ui.set_pad_active(self.pad.used);
         let hovered = self.hovered_creature();
+        let voiced = self.line_voiced();
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
         };
         g.ui.set_hovered(hovered);
+        g.ui.set_line_voiced(voiced);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -1317,6 +1321,16 @@ impl App {
         write_png(&path, w, h, &pixels)?;
         println!("wrote {} (camera {})", path.display(), self.camera.spec());
         Ok(())
+    }
+
+    /// Whether the line the game is on has a voice-over the audio can play (see
+    /// `ui::UiLayer::set_line_voiced`); never without sound.
+    fn line_voiced(&self) -> bool {
+        let (Some(a), Some(live)) = (self.audio.as_ref(), self.live.as_ref()) else {
+            return false;
+        };
+        let line = voice_line(&live.sim());
+        line.is_some_and(|l| a.line_voice(&l).is_some())
     }
 
     /// The creature the mouse is over, for its name over its head: none while the
@@ -3736,6 +3750,10 @@ fn main() -> Result<()> {
                                 }
                                 layer.set_paused(l.paused);
                                 layer.set_pad_active(pad_play.used);
+                                let voiced = recording.as_ref().is_some_and(|a| {
+                                    voice_line(&l.sim()).is_some_and(|v| a.line_voice(&v).is_some())
+                                });
+                                layer.set_line_voiced(voiced);
                                 if let Some(aim) = layer.play(s, &l.sim, dt).pop() {
                                     println!("aiming ability {}", aim.ability);
                                     l.aiming = Some(aim);
