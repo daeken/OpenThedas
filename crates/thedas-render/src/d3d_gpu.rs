@@ -2925,6 +2925,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn its_shaders_translate_for_opengl() {
+        crate::gl_check::translates("shadow blur", SHADOW_BLUR_WGSL);
+    }
+
+    #[test]
     fn fading_scales_only_the_engine_fade() {
         use thedas_shader::ctab::{Constant, ConstantTable, ParamClass, RegisterSet};
         let k = |name: &str, register| Constant {

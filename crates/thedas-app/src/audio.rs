@@ -280,7 +280,9 @@ pub struct GameAudio {
     /// The simulation's music intensity last seen (scripts' `SetMusicIntensity`).
     script_intensity: Option<i32>,
     /// `ss_types.gda`: each sound set type's first entry row and default probability.
-    ss_types: std::collections::HashMap<i32, (i64, f32)>,
+    ss_types: std::collections::HashMap<i32, (i64, f32, bool)>,
+    /// `ss_probabilitymodif.gda` (see [`ss_modifiers`]).
+    ss_modifiers: std::collections::HashMap<i64, f32>,
     /// Each sound set's entries (`sse_<set>.gda`: entry row -> line strref), read once.
     sound_set_entries: std::collections::HashMap<String, Arc<SoundSetLines>>,
     /// Per (set, type): the lines not yet drawn from its bag.
@@ -299,6 +301,20 @@ pub struct GameAudio {
     /// theirs (from a save made before the simulation kept it).
     template_sets: std::collections::HashMap<String, Option<String>>,
     last: Instant,
+}
+
+/// Whether a change of music track happens at once instead of at the playing track's next
+/// marker (DAOrigins.exe's music update 0x5c4b10, state 4, 0x5c4c69..0x5c4ce2): the marker
+/// is looked for only between `main` and `combat` (a change to or from any other track,
+/// such as `Death`, leaves the switch time 0), and not when leaving `combat` in a
+/// conversation or cutscene (the update's second argument, the director's "mode is dialog
+/// or cutscene", 0x5bb9dc..0x5bb9fb: 0x5c4cc7), so a conversation in a fight cuts to `main`
+/// at once.
+fn music_cuts(playing: &str, want: &str, mode: i32) -> bool {
+    let pair = |t: &str| matches!(t, "main" | "combat");
+    !pair(playing)
+        || !pair(want)
+        || (matches!(mode, GM_DIALOG | GM_CUTSCENE) && playing == "combat")
 }
 
 /// When a music change takes effect, in seconds into the playing track at `pos` with markers
@@ -542,8 +558,9 @@ fn table_event(t: &thedas_formats::Gda, row: i64, col: u32) -> Option<String> {
 
 /// `ss_types.gda`: each sound set type (1 COMBAT ATTACK, 2 COMBAT BATTLE CRY, ...) with the
 /// row its entries start at in a set's `sse_<set>.gda` (100, 200, ...) and the chance a
-/// line of it is said.
-fn ss_types(vfs: &Vfs) -> std::collections::HashMap<i32, (i64, f32)> {
+/// line of it is said, and whether that chance is scaled by how many lines the set has
+/// (column 0x6ddd6b8b; see [`sound_set_chance`]).
+fn ss_types(vfs: &Vfs) -> std::collections::HashMap<i32, (i64, f32, bool)> {
     use thedas_formats::gda::Cell;
     let mut out = std::collections::HashMap::new();
     let Some(t) = vfs
@@ -562,12 +579,65 @@ fn ss_types(vfs: &Vfs) -> std::collections::HashMap<i32, (i64, f32)> {
                 _ => None,
             })
             .collect();
-        // ID, first entry row, probability, ...
+        // ID, first entry row, probability, two flags, the modifier flag (0x6ddd6b8b; the
+        // exe takes a missing one as set, 0x6b59fe).
         if let [id, base, p, ..] = nums[..] {
-            out.insert(id as i32, (base as i64, p as f32));
+            let modified = nums.get(5).is_none_or(|m| *m > 0.0);
+            out.insert(id as i32, (base as i64, p as f32, modified));
         }
     }
     out
+}
+
+/// `ss_probabilitymodif.gda` (table 0x119, "Soundset probablity modifier"): a factor on a
+/// line's chance by how many lines its set has of that type (column 0x29f4e2fb: 1 line
+/// 0.2, 2 0.33, 3 0.5, 4 0.8, 5 1).
+fn ss_modifiers(vfs: &Vfs) -> std::collections::HashMap<i64, f32> {
+    use thedas_formats::gda::Cell;
+    let Some(t) = read_gda(vfs, "ss_probabilitymodif.gda") else {
+        return Default::default();
+    };
+    let col = t
+        .columns
+        .iter()
+        .position(|c| c.hash == 0x29f4_e2fb)
+        .unwrap_or(1);
+    t.rows
+        .iter()
+        .filter_map(|r| {
+            let Some(Cell::Int(id)) = r.first() else {
+                return None;
+            };
+            match r.get(col) {
+                Some(Cell::Float(f)) => Some((*id, *f as f32)),
+                Some(Cell::Int(i)) => Some((*id, *i as f32)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// The chance a sound set line is said (DAOrigins.exe's sound-set player,
+/// 0x6b5994..0x6b5a5f): the caller's `probability` when it gives one; else the type's own
+/// (`ss_types.gda` column 0xa3000ead), times, for types flagged for it (column
+/// 0x6ddd6b8b), the factor `ss_probabilitymodif.gda` has for the number of lines `n` the
+/// set has of the type (no row, as for 6 lines and more: no factor). So a set with one
+/// battle cry says it a fifth as often as one with five.
+///
+/// Provisional: a creature flag (+0x969, set at 0x6bd1ed) that makes its lines certain is
+/// not applied.
+fn sound_set_chance(
+    probability: f32,
+    type_chance: f32,
+    modified: bool,
+    n: i64,
+    modifiers: &std::collections::HashMap<i64, f32>,
+) -> f32 {
+    if probability != 0.0 {
+        return probability;
+    }
+    let factor = modifiers.get(&n).copied().filter(|_| modified);
+    type_chance * factor.unwrap_or(1.0)
 }
 
 /// `sound_weapon_actions.gda` and `sound_movement_foley.gda`: events by (row, column hash).
@@ -810,6 +880,7 @@ impl GameAudio {
             director: MusicDirector::new(),
             container: None,
             ss_types: ss_types(vfs),
+            ss_modifiers: ss_modifiers(vfs),
             sound_set_entries: Default::default(),
             sound_set_bags: Default::default(),
             hero_female: false,
@@ -867,21 +938,19 @@ impl GameAudio {
     ///   for `k < n` (column 0xd7bb7367: the line's strref).
     /// - With more than one, the next is drawn from a bag of the type's lines that refills
     ///   once all have been drawn (0x5b8890, 0x5b8970), whether or not it is then said.
-    /// - It is said with probability `probability` (0: the type's, `ss_types.gda` column
-    ///   0xa3000ead), against `(rand() % 100 + 1) / 100`.
+    /// - It is said with the chance [`sound_set_chance`] gives, against
+    ///   `(rand() % 100 + 1) / 100`.
     /// - The line is named as a conversation line is (0x7f2b70): `<set>/VO/<strref>` with
     ///   `_f` for a female hero when the event `<set>/VO/<strref>_f` exists, else `_m`. An
     ///   event of that name (creature sets: `ss_wolf/VO/179451_m`, which picks among the
     ///   line's variants) plays as itself; otherwise the set's `VO/VOambient_ss` plays the
     ///   sample of that name (voiced sets: `179996_m`).
     ///
-    /// Provisional: the bag's draw order (taken as random), a per-creature multiplier on
-    /// the probability for some types (table 0x119, column 0x29f4e2fb, when the type's
-    /// column 0x6ddd6b8b is set) and a creature flag (+0x969) that makes it certain; how
+    /// Provisional: the bag's draw order (taken as random); how
     /// the name is played (the event when it exists, else the sample) is inferred from the
     /// data, as the builder returns both.
     fn say_sound_set(&mut self, set: &str, entry: i32, probability: f32, at: Option<[f32; 3]>) {
-        let Some(&(_, p)) = self.ss_types.get(&entry) else {
+        let Some(&(_, p, modified)) = self.ss_types.get(&entry) else {
             log::debug!("audio: no sound set type {entry}");
             return;
         };
@@ -957,7 +1026,7 @@ impl GameAudio {
         let Some(strref) = strref.filter(|s| *s > 0) else {
             return;
         };
-        let chance = if probability > 0.0 { probability } else { p };
+        let chance = sound_set_chance(probability, p, modified, n, &self.ss_modifiers);
         let roll = (self.random() % 100 + 1) as f32 / 100.0;
         if chance < roll {
             return;
@@ -1478,8 +1547,13 @@ impl GameAudio {
             // 4 and 5): the first sync point more than 0.4 s ahead (0x190 ms) and less than
             // 15 s ahead (0x3a98 ms), else 0.4 s on. The first track of an area starts at once.
             let mut now = a.track.is_none();
+            let mode = self.director.mode;
             match a.track {
                 Some((playing, _)) if playing == want => a.switch = None,
+                Some((playing, _)) if music_cuts(playing, want, mode) => {
+                    log::debug!("audio: music to {want} at once (from {playing}, mode {mode})");
+                    now = true;
+                }
                 Some((_, h)) => match (a.switch, self.engine.position(h)) {
                     (Some((w, at, last, waited)), Some((pos, _))) if w == want => {
                         // Due, past the end of a loop, or waited past the longest wait.
@@ -1603,13 +1677,24 @@ impl GameAudio {
                         &s.event,
                         PlayOptions {
                             position: Some(position),
-                            volume: 10f32.powf(s.volume / 20.0),
+                            // `Volume` above 0 dB is left out (0x7c25c0..0x7c25cd).
+                            volume: 10f32.powf(s.volume.min(0.0) / 20.0),
                             distance_scale: s.max_distance_mult.max(1e-3),
                             // The placed sound's own pitch offset and fade times
                             // (DAOrigins.exe 0x7c261d..0x7c2637).
                             pitch: s.pitch,
                             fade_in_ms: Some(s.fade_in_ms),
                             fade_out_ms: Some(s.fade_out_ms),
+                            // Its cone (see `AreaSound::forward`); a volume's sound faces
+                            // the listener, so has none.
+                            cone: (s.region.is_none() && s.cone_inside < 360.0).then_some(
+                                thedas_audio::engine::Cone {
+                                    forward: s.forward,
+                                    inside: s.cone_inside,
+                                    outside: s.cone_outside,
+                                    outside_gain: s.cone_outside_gain,
+                                },
+                            ),
                             ..Default::default()
                         },
                     ));
@@ -2108,6 +2193,35 @@ mod tests {
         // GM_GUI (3) and loading: not this event.
         assert!(!pause_duck(true, 3));
         assert!(!pause_duck(true, GM_LOADING));
+    }
+
+    #[test]
+    fn a_sound_set_with_few_lines_speaks_less_often() {
+        let m: std::collections::HashMap<i64, f32> =
+            [(0, 1.0), (1, 0.2), (2, 0.33), (5, 1.0)].into();
+        // The caller's own chance stands.
+        assert_eq!(sound_set_chance(1.0, 0.2, true, 1, &m), 1.0);
+        // The type's chance, scaled by the number of lines.
+        assert!((sound_set_chance(0.0, 0.2, true, 1, &m) - 0.04).abs() < 1e-6);
+        assert!((sound_set_chance(0.0, 0.3, true, 2, &m) - 0.099).abs() < 1e-6);
+        assert_eq!(sound_set_chance(0.0, 0.3, true, 5, &m), 0.3);
+        // No row (many lines), or a type not flagged for it: the type's chance.
+        assert_eq!(sound_set_chance(0.0, 0.3, true, 9, &m), 0.3);
+        assert_eq!(sound_set_chance(0.0, 0.5, false, 1, &m), 0.5);
+    }
+
+    #[test]
+    fn music_cuts_outside_main_and_combat_and_into_conversations() {
+        // Between main and combat while playing: at the marker.
+        assert!(!music_cuts("main", "combat", GM_COMBAT));
+        assert!(!music_cuts("combat", "main", GM_EXPLORE));
+        // A conversation or cutscene in a fight: at once.
+        assert!(music_cuts("combat", "main", GM_DIALOG));
+        assert!(music_cuts("combat", "main", GM_CUTSCENE));
+        assert!(!music_cuts("main", "combat", GM_DIALOG));
+        // Death and the rest: at once.
+        assert!(music_cuts("main", "Death", GM_DEAD));
+        assert!(music_cuts("Death", "main", GM_EXPLORE));
     }
 
     #[test]

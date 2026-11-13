@@ -14,6 +14,7 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
 
 1. **Music changes.**
    - Done: a change waits for the playing track's next marker (first sync point 0.4–15 s ahead, else 0.4 s on); the stinger, started paused, and the new track start together there, and the old track fades out (0x5c4b10 states 3–7). An area with the same theme as the last keeps its music playing (SetTheme ignores the theme already playing, 0x5c0ec9).
+   - Also done: a change to or from a track other than `main` and `combat` (such as `Death`), and leaving `combat` in a conversation or cutscene, happens at once with no marker wait (0x5c4c69..0x5c4ce2).
    - Not done: the 12 s load timeout ("Music failed to start") and delayed theme changes (state 9, counted in frames); both belong to theme changes (SetTheme 0x5c0e60), not traced from area entry yet.
    - Size: small.
 4. **Music during cutscenes and conversations.**
@@ -30,7 +31,8 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
 
 8. **Placed-sound fields** (`.are` `SoundList`).
    - Applied: `Volume`, `MaxDistanceMult`, `Active`, `Tag`, and `Pitch` (added to the event's), `FadeIn` and `FadeOut` (replacing the event's; most sounds fade out over 34 ms), as the sound start does (0x7c261d..0x7c2637).
-   - Not applied: `ConeInside`, `ConeOutside`, `ConeVolume` (directional sounds; the start puts them in the event's cone angles and scales its outside volume, 0x7c265b..0x7c26c8; 710 sounds), `Priority`, `Occludable`.
+   - Also applied: the cone (`ConeInside`, `ConeOutside`, `ConeVolume`; 710 sounds, mostly half-spaces that are silent behind, such as waterfalls and wall creaks). The sound's facing is the event's orientation (slot 0x68, 0x5bf660); the angles replace the event's and `ConeVolume` (dB, when 0 or below) scales its outside level (0x7c265b..0x7c26c8). Provisional: that the loader turns the `.are` orientation into the facing vector, and a linear fall between the angles.
+   - Not applied: `Priority`, `Occludable`.
    - Medium.
 9. **Occlusion.**
    - Original: imports `Event::set3DOcclusion`, and sounds have an `Occludable` flag, so they are muffled behind geometry.
@@ -52,7 +54,8 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
 14. **VO placement.** Conversation lines are 2D, and 3D for ambient lines. The original's speaker positioning isn't checked. Small to medium.
 15. **VO timing and lip-sync.** Check that conversation timing follows the line lengths as the original does. Not audio-only.
 16. **The sound-set player** is traced (#290: `sst` counts, shuffle bag, the roll, gender via 0x7f2b70).
-    - Not applied: a per-creature probability multiplier (table 0x119, column 0x29f4e2fb, when the type's column 0x6ddd6b8b is set) and a creature flag (+0x969) that makes a line certain.
+    - Applied: the type's chance is scaled by how many lines the set has of it (`ss_probabilitymodif.gda`, table 0x119: 1 line 0.2, 2 0.33, 3 0.5, 4 0.8, 5 and more 1), for types flagged in `ss_types.gda` column 0x6ddd6b8b (0x6b59fe..0x6b5a5f).
+    - Not applied: a creature flag (+0x969) that makes a line certain.
     - Small.
 17. **Event or sample for a sound-set line.** Inferred from the data: the event if it exists, otherwise the sample on `VOambient_ss`. Small.
 

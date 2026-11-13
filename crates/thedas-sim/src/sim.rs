@@ -199,6 +199,10 @@ fn along(from: [f32; 3], points: &[[f32; 3]], f: f32) -> [f32; 3] {
 /// `Sim::slide_past_bodies`).
 const SLIDE_PASSES: usize = 4;
 
+/// How near a walker held up by a body must be to its next waypoint for that waypoint to
+/// count as reached (see `Sim::advance_movers`), in metres. Provisional.
+const WAYPOINT_REACHED: f32 = 0.05;
+
 /// How long a walker held up by bodies may make no progress before it is reported.
 const BLOCKED_REPORT_MS: u64 = 3_000;
 
@@ -2461,7 +2465,17 @@ impl Sim {
                 // making for it only goes round and round that creature: it goes on to the
                 // next one (not past the end of the path). Provisional: DAOrigins.exe's
                 // path follower is not traced.
-                while rest.len() > 1 && self.body_covers(id, rest[0]) {
+                // Nor does it go back to a waypoint it had reached when the body turned it
+                // aside: progress along the route is measured from where it was, so a
+                // waypoint it stood on counts as still ahead, and it would walk back to it
+                // and into the body again for as long as the body stood there (the Tower
+                // of Ishal's third floor: the hero behind Alistair, 35 m from the archer he
+                // was sent at).
+                while rest.len() > 1
+                    && (self.body_covers(id, rest[0])
+                        || ((rest[0][0] - was[0]).powi(2) + (rest[0][1] - was[1]).powi(2)).sqrt()
+                            < WAYPOINT_REACHED)
+                {
                     rest.remove(0);
                 }
                 // At the speed the move was set going at (a walk stays a walk).
@@ -3126,6 +3140,21 @@ impl Sim {
         }
         self.update_triggers(id);
         if cmd.name == "CommandAttack" {
+            self.finish_attack(id, cmd.target.unwrap_or(OBJECT_INVALID));
+        } else if cmd.name == "CommandDeathBlow" {
+            // A finishing move lands the blow the attack it replaced had been given: when a
+            // hit would kill and the rules choose a death blow, rules_core stores the
+            // killing result (`SetAttackResult`) and then puts this command at the front
+            // of the queue, and the result is sent as the impact by the death blow's
+            // animation, like any attack's (DAOrigins.exe's animation event handler,
+            // 0x6c0bf0, sends the stored slot through 0x6a6230 for every hit event,
+            // whatever the command). Without it the kill was thrown away and the next
+            // attack rolled again: a boss, whose death is always a death blow, could not
+            // die (the Dalish origin's bereskarn stood at 2 of 250 health for good).
+            // Provisional: the command's own executor is not traced; the blow lands when
+            // the command's time is up, not at the animation's hit event, the pair is not
+            // moved into place, and the attack the script says the command clears stays
+            // queued behind it (it ends at once against the dead target).
             self.finish_attack(id, cmd.target.unwrap_or(OBJECT_INVALID));
         } else if cmd.name == "CommandUseAbility" && !cmd.impacted {
             self.finish_ability(id, &cmd);
@@ -5087,6 +5116,73 @@ mod tests {
         assert_eq!(direction_along([0.0; 3], &points, 0.75), Some((0.0, 10.0)));
         assert_eq!(direction_along([0.0; 3], &points, 1.0), Some((0.0, 10.0)));
         assert_eq!(direction_along([0.0; 3], &[[0.0, 0.0, 5.0]], 0.5), None);
+    }
+
+    #[test]
+    fn a_death_blow_lands_the_stored_attack_result() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let (a, t) = (
+            s.world.spawn(ObjectKind::Creature, "a"),
+            s.world.spawn(ObjectKind::Creature, "bereskarn"),
+        );
+        for (id, x) in [(a, 0.0), (t, 1.5)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = [x, 0.0, 0.0];
+        }
+        // What rules_core leaves when a hit would kill and it picks a finishing move: the
+        // killing result stored for the main hand, then the death blow at the front of the
+        // queue, ahead of the attack.
+        let cmd = |name: &str| Command {
+            ty: 0,
+            name: name.into(),
+            target: Some(t),
+            location: None,
+            seconds: 0.0,
+            ints: vec![0],
+            strings: Vec::new(),
+            due: None,
+            from: None,
+            approach: None,
+            ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
+            arrived: false,
+            path: Vec::new(),
+        };
+        let blow = crate::world::Effect {
+            ty: 1024,
+            floats: vec![300.0],
+            ..Default::default()
+        };
+        {
+            let o = s.world.get_mut(a).unwrap();
+            o.combat.attack = Some(crate::combat::AttackResult {
+                results: [5, 0],
+                effects: [Some(blow), None],
+            });
+            o.commands.push(cmd("CommandDeathBlow"));
+        }
+        s.tick(1000);
+        let landed: Vec<(ObjectId, ObjectId, i32, f32)> = s
+            .world
+            .trace
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                TraceEntry::Attack {
+                    attacker,
+                    target,
+                    result,
+                    damage,
+                    ..
+                } => Some((*attacker, *target, *result, *damage)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(landed, [(a, t, 5, 300.0)]);
+        assert!(s.world.get(a).unwrap().combat.attack.is_none());
     }
 
     #[test]
