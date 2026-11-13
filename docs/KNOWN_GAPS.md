@@ -99,8 +99,9 @@ these, so they are the places where one person or stream can take a large, separ
 - **SpeedTree.** Trees draw as real geometry on the game's own shaders, with distance levels,
   billboards that fade in far away and wind sway. Some LOD and billboard details and the
   wind's per-tree details are provisional (`RND-075` to `RND-078`).
-- **Effects on creatures and items.** Spell effects, crust effects and weapon glows are not
-  drawn; only effects placed at a location are (`RND-094`).
+- **Effects on creatures and items.** Lasting effects kept on a creature draw on its body,
+  but the simulation does not keep most spell visuals yet, and weapon glows are not drawn
+  (`RND-094`).
 - **Animation blending.** No blend weights, crossfades, inverse kinematics or root motion
   (`RND-064` to `RND-068`).
 - **Faces.** No facial animation or lip sync anywhere, and head-morph bone offsets are read but
