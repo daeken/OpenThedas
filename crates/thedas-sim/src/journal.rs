@@ -682,6 +682,34 @@ mod tests {
     }
 
     #[test]
+    fn a_new_quest_shows_large_only_and_its_later_entries_small() {
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        s.plots.insert(plot("bec_group", KIND_GROUP, None, &[]));
+        s.plots.insert(plot(
+            "bec000pt_main",
+            KIND_QUEST,
+            Some("plt_bec_group"),
+            &[(0, 30), (1, 31)],
+        ));
+        let _ = s.strings.set(
+            [30, 31]
+                .into_iter()
+                .map(|t| (t, format!("text {t}")))
+                .collect(),
+        );
+        let o = OBJECT_INVALID;
+        // "New Quest: A Day For Celebration", with no "Quest updated" beside it.
+        s.set_plot_flag("bec000pt_main", 0, true, false, o);
+        let kinds = |a: &[Alert]| a.iter().map(|a| a.kind).collect::<Vec<_>>();
+        assert_eq!(kinds(&s.world.uber_alerts), [ALERT_QUEST]);
+        assert!(s.world.alerts.is_empty());
+        // Its next entry is an update.
+        s.set_plot_flag("bec000pt_main", 1, true, false, o);
+        assert_eq!(kinds(&s.world.uber_alerts), [ALERT_QUEST]);
+        assert_eq!(kinds(&s.world.alerts), [ALERT_QUEST]);
+    }
+
+    #[test]
     fn quests_show_their_latest_entry_under_their_group_and_the_codex_unlocks() {
         let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
         let mut group = plot("lot_plot_group", KIND_GROUP, None, &[]);

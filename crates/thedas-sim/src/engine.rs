@@ -6151,7 +6151,10 @@ mod coverage_tests {
         void SetZoomLevel(float f) = 115;\n\
         void SetLoadHint(int n, int t = 206) = 116;\n\
         void ApplyEffectVisualEffect(object c, object t, int v, int d, float f, int a = 0) = 117;\n\
-        void SetDeathHint(int n, int t = 205) = 118;\n";
+        void SetDeathHint(int n, int t = 205) = 118;\n\
+        void AddAbility(object o, int a, int n = FALSE) = 119;\n\
+        void ShowSpecUnlockedNotification(int s) = 120;\n\
+        void ShowAreaUnlockedNotification(string a, string i = \"\") = 121;\n";
 
     #[test]
     fn visual_effects_on_objects_are_applied_as_effects() {
@@ -6208,6 +6211,96 @@ mod coverage_tests {
             .collect();
         assert_eq!(left, vec![1022], "the glow has run out");
         assert!(s.world.instant_vfx.is_empty(), "the flash note has gone");
+    }
+
+    #[test]
+    fn abilities_map_areas_and_specializations_raise_large_alerts() {
+        use crate::journal::{ALERT_ABILITY, ALERT_SPECIALIZATION, ALERT_WORLD_MAP};
+        let mut s = sim();
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        let stranger = s.world.spawn(ObjectKind::Creature, "stranger");
+        s.world.hero = Some(hero);
+        let t = s.world.tables();
+        t.insert(
+            "ABI_base",
+            &["ID", "NameStrRef", "Icon"],
+            vec![(
+                10001,
+                vec![
+                    Cell::Int(10001),
+                    Cell::Int(500),
+                    Cell::String("ico_winters_grasp".into()),
+                ],
+            )],
+        );
+        t.insert(
+            "CLA_base",
+            &["ID", "NameStrRef", "Icon"],
+            vec![(
+                4,
+                vec![
+                    Cell::Int(4),
+                    Cell::Int(501),
+                    Cell::String("ico_spec_shapeshifter".into()),
+                ],
+            )],
+        );
+        let _ = s.strings.set(
+            [(500, "Winter's Grasp"), (501, "Shapeshifter")]
+                .into_iter()
+                .map(|(k, v)| (k, v.to_string()))
+                .collect(),
+        );
+        let add = |s: &mut Sim, who: ObjectId, notify: i32| {
+            run(
+                s,
+                who,
+                "AddAbility",
+                &[Value::Object(who), Value::Int(10001), Value::Int(notify)],
+            );
+        };
+        // Only with bSendNotification, and only for a party member.
+        add(&mut s, hero, 0);
+        add(&mut s, stranger, 1);
+        assert!(s.world.uber_alerts.is_empty());
+        add(&mut s, hero, 1);
+        run(
+            &mut s,
+            hero,
+            "ShowSpecUnlockedNotification",
+            &[Value::Int(4)],
+        );
+        run(
+            &mut s,
+            hero,
+            "ShowAreaUnlockedNotification",
+            &[Value::String("Soldier's Peak".into())],
+        );
+        let got: Vec<(i32, Option<&str>, Option<&str>, Option<ObjectId>)> = s
+            .world
+            .uber_alerts
+            .iter()
+            .map(|a| (a.kind, a.text.as_deref(), a.icon.as_deref(), a.creature))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    ALERT_ABILITY,
+                    Some("Winter's Grasp"),
+                    Some("ico_winters_grasp"),
+                    Some(hero)
+                ),
+                (
+                    ALERT_SPECIALIZATION,
+                    Some("Shapeshifter"),
+                    Some("ico_spec_shapeshifter"),
+                    None
+                ),
+                (ALERT_WORLD_MAP, Some("Soldier's Peak"), None, None),
+            ]
+        );
+        assert!(s.world.alerts.is_empty(), "none of them is a small alert");
     }
 
     #[test]
