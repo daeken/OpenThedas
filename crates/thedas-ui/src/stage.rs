@@ -361,6 +361,17 @@ impl Stage {
         }
     }
 
+    /// A picture the engine holds as a PNG already (a save's screenshot), served to the
+    /// movies under `name` as [`Stage::set_image`]'s are; `None` takes it away.
+    pub fn set_image_png(&self, name: &str, png: Option<Vec<u8>>) {
+        if let Ok(mut m) = self.made.lock() {
+            match png {
+                Some(b) => m.insert(name.to_string(), b),
+                None => m.remove(name),
+            };
+        }
+    }
+
     pub fn set_image(&self, name: &str, rgba: Option<&Rgba>) {
         let bytes = rgba.and_then(encode_png);
         if let Ok(mut m) = self.made.lock() {
