@@ -1753,6 +1753,42 @@ impl Live {
         true
     }
 
+    /// The frame buffer effects the playing cutscene, or the shown conversation line's own
+    /// cutscene, has running (their kind-19 tracks; see [`thedas_render::cut_effects`]):
+    /// depth of field and colour fades. Its other effects (`da_motionblur`, and the bloom
+    /// and colour matrix values a cutscene sets) are not drawn.
+    fn cut_effects(&mut self) -> thedas_render::cut_effects::CutEffects {
+        use thedas_render::cut_effects::{ColourFade, CutEffects, DepthOfField};
+        let sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
+        let states = match sim.world.cutscene.as_ref() {
+            Some(c) => {
+                let t = c.elapsed_ms as f32 / 1000.0;
+                self.cutscene_camera
+                    .tracks(&sim)
+                    .map(|tracks| tracks.frame_effects_at(t))
+                    .unwrap_or_default()
+            }
+            None => self.talk_camera.line_cut_effects(&sim),
+        };
+        let mut out = CutEffects::default();
+        for s in &states {
+            if s.effect.eq_ignore_ascii_case("da_dof") {
+                out.depth_of_field = Some(DepthOfField::from_parameters(|name| {
+                    s.parameter(name).map(|v| v[0])
+                }));
+            } else if s.effect.eq_ignore_ascii_case("da_colorfade") {
+                // The effect file's defaults for what the cutscene leaves out.
+                out.fades.push(ColourFade {
+                    start: s.parameter("StartColour").unwrap_or([0.0; 4]),
+                    end: s.parameter("EndColour").unwrap_or([1.0; 4]),
+                    time_to_fade: s.parameter("TimeToFade").map_or(6.0, |v| v[0]),
+                    time: s.time,
+                });
+            }
+        }
+        out
+    }
+
     /// Records the level's frame buffer effects over a frame [`Live::render`] drew into
     /// `target` (which needs `COPY_SRC` usage).
     pub fn finish_frame(
@@ -1765,7 +1801,9 @@ impl Live {
         if self.cutscene_movies.showing() {
             return;
         }
+        let cut_effects = self.cut_effects();
         if let Some(level) = self.level.as_mut() {
+            level.renderer.cut_effects = cut_effects;
             let overlays: Vec<&AreaRenderer> = self
                 .objects
                 .iter()
@@ -1794,9 +1832,11 @@ impl Live {
         }
         self.set_shader_time();
         self.apply_cutaway(ctx);
+        let cut_effects = self.cut_effects();
         let Some(level) = self.level.as_mut() else {
             return Ok(None);
         };
+        level.renderer.cut_effects = cut_effects;
         let mut overlays: Vec<&mut AreaRenderer> = self
             .objects
             .iter_mut()
