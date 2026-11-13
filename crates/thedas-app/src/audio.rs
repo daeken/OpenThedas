@@ -301,6 +301,20 @@ pub struct GameAudio {
     last: Instant,
 }
 
+/// Whether a change of music track happens at once instead of at the playing track's next
+/// marker (DAOrigins.exe's music update 0x5c4b10, state 4, 0x5c4c69..0x5c4ce2): the marker
+/// is looked for only between `main` and `combat` (a change to or from any other track,
+/// such as `Death`, leaves the switch time 0), and not when leaving `combat` in a
+/// conversation or cutscene (the update's second argument, the director's "mode is dialog
+/// or cutscene", 0x5bb9dc..0x5bb9fb: 0x5c4cc7), so a conversation in a fight cuts to `main`
+/// at once.
+fn music_cuts(playing: &str, want: &str, mode: i32) -> bool {
+    let pair = |t: &str| matches!(t, "main" | "combat");
+    !pair(playing)
+        || !pair(want)
+        || (matches!(mode, GM_DIALOG | GM_CUTSCENE) && playing == "combat")
+}
+
 /// When a music change takes effect, in seconds into the playing track at `pos` with markers
 /// (sync points) `markers`: the first marker more than 0.4 s ahead and less than 15 s ahead,
 /// else 0.4 s on (DAOrigins.exe 0x5c4b10 state 4: 0x190 ms, 0x3a98 ms).
@@ -1478,8 +1492,13 @@ impl GameAudio {
             // 4 and 5): the first sync point more than 0.4 s ahead (0x190 ms) and less than
             // 15 s ahead (0x3a98 ms), else 0.4 s on. The first track of an area starts at once.
             let mut now = a.track.is_none();
+            let mode = self.director.mode;
             match a.track {
                 Some((playing, _)) if playing == want => a.switch = None,
+                Some((playing, _)) if music_cuts(playing, want, mode) => {
+                    log::debug!("audio: music to {want} at once (from {playing}, mode {mode})");
+                    now = true;
+                }
                 Some((_, h)) => match (a.switch, self.engine.position(h)) {
                     (Some((w, at, last, waited)), Some((pos, _))) if w == want => {
                         // Due, past the end of a loop, or waited past the longest wait.
@@ -1603,13 +1622,24 @@ impl GameAudio {
                         &s.event,
                         PlayOptions {
                             position: Some(position),
-                            volume: 10f32.powf(s.volume / 20.0),
+                            // `Volume` above 0 dB is left out (0x7c25c0..0x7c25cd).
+                            volume: 10f32.powf(s.volume.min(0.0) / 20.0),
                             distance_scale: s.max_distance_mult.max(1e-3),
                             // The placed sound's own pitch offset and fade times
                             // (DAOrigins.exe 0x7c261d..0x7c2637).
                             pitch: s.pitch,
                             fade_in_ms: Some(s.fade_in_ms),
                             fade_out_ms: Some(s.fade_out_ms),
+                            // Its cone (see `AreaSound::forward`); a volume's sound faces
+                            // the listener, so has none.
+                            cone: (s.region.is_none() && s.cone_inside < 360.0).then_some(
+                                thedas_audio::engine::Cone {
+                                    forward: s.forward,
+                                    inside: s.cone_inside,
+                                    outside: s.cone_outside,
+                                    outside_gain: s.cone_outside_gain,
+                                },
+                            ),
                             ..Default::default()
                         },
                     ));
@@ -2108,6 +2138,20 @@ mod tests {
         // GM_GUI (3) and loading: not this event.
         assert!(!pause_duck(true, 3));
         assert!(!pause_duck(true, GM_LOADING));
+    }
+
+    #[test]
+    fn music_cuts_outside_main_and_combat_and_into_conversations() {
+        // Between main and combat while playing: at the marker.
+        assert!(!music_cuts("main", "combat", GM_COMBAT));
+        assert!(!music_cuts("combat", "main", GM_EXPLORE));
+        // A conversation or cutscene in a fight: at once.
+        assert!(music_cuts("combat", "main", GM_DIALOG));
+        assert!(music_cuts("combat", "main", GM_CUTSCENE));
+        assert!(!music_cuts("main", "combat", GM_DIALOG));
+        // Death and the rest: at once.
+        assert!(music_cuts("main", "Death", GM_DEAD));
+        assert!(music_cuts("Death", "main", GM_EXPLORE));
     }
 
     #[test]

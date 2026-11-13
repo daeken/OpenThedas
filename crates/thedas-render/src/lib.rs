@@ -19,6 +19,8 @@ pub mod cut_effects;
 pub mod d3d;
 mod d3d_gpu;
 pub mod distortion;
+#[cfg(test)]
+mod gl_check;
 pub mod gpu;
 pub mod look;
 pub mod material;

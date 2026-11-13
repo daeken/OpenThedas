@@ -172,7 +172,10 @@ struct P {
 @group(0) @binding(1) var smp: sampler;
 @group(0) @binding(2) var src: texture_2d<f32>;
 @group(0) @binding(3) var other: texture_2d<f32>;
-@group(0) @binding(4) var depth: texture_depth_2d;
+// The depth buffer, bound as plain numbers rather than as a depth texture: the OpenGL
+// backend cannot read single texels of a depth texture (`textureLoad`), and a depth format
+// may be bound either way.
+@group(0) @binding(4) var depth: texture_2d<f32>;
 
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
@@ -185,7 +188,7 @@ fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
 fn distance_at(uv: vec2<f32>) -> f32 {
     let size = vec2<f32>(textureDimensions(depth));
     let at = clamp(vec2<i32>(floor(uv * size)), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
-    let z = textureLoad(depth, at, 0);
+    let z = textureLoad(depth, at, 0).x;
     let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, z, 1.0);
     let view = p.inv_projection * ndc;
     return abs(view.z / view.w);
@@ -377,7 +380,7 @@ impl CutEffectsPass {
                 },
                 tex(2, float),
                 tex(3, float),
-                tex(4, wgpu::TextureSampleType::Depth),
+                tex(4, wgpu::TextureSampleType::Float { filterable: false }),
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -616,6 +619,11 @@ impl CutEffectsPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn its_shaders_translate_for_opengl() {
+        crate::gl_check::translates("cut effects", SHADER);
+    }
 
     #[test]
     fn a_fade_runs_from_its_start_colour_to_its_end_and_holds() {

@@ -884,6 +884,86 @@ mod tests {
     }
 
     #[test]
+    fn a_walker_does_not_go_back_to_a_waypoint_a_body_slid_it_past() {
+        // The Tower of Ishal's third floor: the hero, sent at an archer 35 m to the north,
+        // stood touching Alistair, who waited dead ahead of him. Pressed straight into him
+        // the hero went round on the right, but the first point of his route lay where he
+        // had started, so he walked back to it and into Alistair again, for as long as
+        // Alistair stood there (hero (-14.730, 6.271), Alistair (-14.730, 6.691)).
+        use crate::world::{Command, ObjectKind};
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let (w, h) = (24u32, 48u32);
+        s.area_layouts.insert(area, "open".into());
+        s.nav_grids.insert(
+            "open".into(),
+            Some(Arc::new(NavGrid {
+                columns: w,
+                rows: h,
+                cell_size: 0.5,
+                clearance: 2.0,
+                base: [0.0, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                data: vec![1u8; (w * h) as usize],
+                heights: vec![0.0; (w * h) as usize],
+                surfaces: Vec::new(),
+            })),
+        );
+        // Human bodies (personal space 0.35): capsules of 0.21, touching at 0.42.
+        s.world.tables().insert(
+            "apr_base",
+            &["PERSPACE"],
+            vec![(15, vec![thedas_formats::gda::Cell::Float(0.35)])],
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let waits = s.world.spawn(ObjectKind::Creature, "alistair");
+        let stands = [6.25, 2.670_97, 0.0];
+        for (id, p) in [(hero, [6.250_015, 1.75, 0.0]), (waits, stands)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = p;
+            o.appearance = 15;
+        }
+        // An archer far off to the north, attacked: the hero walks up to it.
+        let archer = s.world.spawn(ObjectKind::Creature, "archer");
+        {
+            let o = s.world.get_mut(archer).unwrap();
+            o.area = Some(area);
+            o.position = [6.25, 22.25, 0.0];
+            o.appearance = 15;
+        }
+        s.world.get_mut(hero).unwrap().commands.push(Command {
+            ty: 0,
+            name: "CommandAttack".into(),
+            target: Some(archer),
+            location: None,
+            seconds: 0.0,
+            ints: Vec::new(),
+            strings: Vec::new(),
+            due: None,
+            from: None,
+            approach: None,
+            ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
+            arrived: false,
+            path: Vec::new(),
+        });
+        let r = 2.0 * s.capsule_radius(hero);
+        for _ in 0..150 {
+            s.tick(33);
+            let p = s.world.get(hero).unwrap().position;
+            let d = crate::engine::dist(p, stands);
+            assert!(d >= r - 0.02, "{d} < {r} at {p:?}");
+        }
+        let o = s.world.get(hero).unwrap();
+        assert!(o.position[1] > 15.0, "{:?} {:?}", o.position, o.commands);
+        assert_eq!(s.world.get(waits).unwrap().position, stands);
+    }
+
+    #[test]
     fn a_players_move_with_no_route_stops_at_the_edge_of_the_walkable_area() {
         // Lothering's highway: the stick held forward aimed the hero at points beyond the
         // walkable area, which have no route, and the straight-line fallback ran him 290 m
