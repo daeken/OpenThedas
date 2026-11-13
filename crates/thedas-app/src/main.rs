@@ -3060,10 +3060,13 @@ impl App {
                 if let Some(l) = self.live.as_ref() {
                     // As a script's DoAreaTransition does: performed at the start of the next
                     // update (`TRANSITION_DELAY_MS`).
-                    let mut sim = l.sim();
-                    sim.world.transition = Some((area.clone(), waypoint.clone()));
-                    sim.world.transition_at =
-                        Some(sim.world.time_ms + thedas_sim::sim::TRANSITION_DELAY_MS);
+                    l.sim().input(
+                        thedas_sim::commands::CommandSource::App,
+                        thedas_sim::commands::SimCommand::Transition {
+                            area: area.clone(),
+                            waypoint: waypoint.clone(),
+                        },
+                    );
                 }
                 log.push(format!("transition {area} {waypoint}"));
             }
@@ -3152,19 +3155,24 @@ impl App {
             }
             Step::Plot(plot, flag) => {
                 if let Some(l) = self.live.as_ref() {
-                    l.sim().set_plot_flag(
-                        plot,
-                        *flag,
-                        true,
-                        true,
-                        thedas_script::vm::OBJECT_INVALID,
+                    l.sim().input(
+                        thedas_sim::commands::CommandSource::App,
+                        thedas_sim::commands::SimCommand::SetPlotFlag {
+                            plot: plot.clone(),
+                            flag: *flag,
+                            value: true,
+                            call_script: true,
+                        },
                     );
                 }
                 log.push(format!("plot {plot} {flag}"));
             }
             Step::Cutscene(name) => {
                 if let Some(l) = self.live.as_ref() {
-                    l.sim().world.cutscenes.push(name.clone());
+                    l.sim().input(
+                        thedas_sim::commands::CommandSource::App,
+                        thedas_sim::commands::SimCommand::QueueCutscene { name: name.clone() },
+                    );
                 }
                 log.push(format!("cutscene {name}"));
             }
@@ -5596,10 +5604,13 @@ fn main() -> Result<()> {
                     Step::Transition(area, waypoint) => {
                         // As a script's DoAreaTransition does: performed at the start of the next
                         // update (`TRANSITION_DELAY_MS`).
-                        let mut sim = l.sim();
-                        sim.world.transition = Some((area.clone(), waypoint.clone()));
-                        sim.world.transition_at =
-                            Some(sim.world.time_ms + thedas_sim::sim::TRANSITION_DELAY_MS);
+                        l.sim().input(
+                            thedas_sim::commands::CommandSource::App,
+                            thedas_sim::commands::SimCommand::Transition {
+                                area: area.clone(),
+                                waypoint: waypoint.clone(),
+                            },
+                        );
                         println!("transition {area} {waypoint}");
                     }
                     Step::Floaty(text) => {
@@ -5672,17 +5683,22 @@ fn main() -> Result<()> {
                         println!("training {name}: {heard}");
                     }
                     Step::Plot(plot, flag) => {
-                        l.sim().set_plot_flag(
-                            plot,
-                            *flag,
-                            true,
-                            true,
-                            thedas_script::vm::OBJECT_INVALID,
+                        l.sim().input(
+                            thedas_sim::commands::CommandSource::App,
+                            thedas_sim::commands::SimCommand::SetPlotFlag {
+                                plot: plot.clone(),
+                                flag: *flag,
+                                value: true,
+                                call_script: true,
+                            },
                         );
                         println!("plot {plot} {flag}");
                     }
                     Step::Cutscene(name) => {
-                        l.sim().world.cutscenes.push(name.clone());
+                        l.sim().input(
+                            thedas_sim::commands::CommandSource::App,
+                            thedas_sim::commands::SimCommand::QueueCutscene { name: name.clone() },
+                        );
                         println!("cutscene {name}");
                     }
                     &Step::Menu(m) => {
