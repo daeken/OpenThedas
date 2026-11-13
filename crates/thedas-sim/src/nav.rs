@@ -603,12 +603,13 @@ impl Sim {
             Err(_) => {
                 let root = self.install_root.as_ref()?;
                 let install = thedas_vfs::DaoInstall::open(root).ok()?;
-                let dir = install
+                // The layout's name may differ in case from the file (see `thedas_vfs::path`).
+                let path = install
                     .env_dirs()
                     .ok()?
                     .into_iter()
-                    .find(|d| d.join(&file).is_file())?;
-                std::fs::read(dir.join(&file)).ok()?
+                    .find_map(|d| thedas_vfs::resolve_ci(&d, &file).filter(|p| p.is_file()))?;
+                std::fs::read(path).ok()?
             }
         };
         thedas_formats::Arl::parse(&data).ok()?.grid

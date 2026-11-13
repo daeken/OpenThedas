@@ -194,6 +194,9 @@ pub mod track_kind {
     pub const QUAT64: i64 = 4;
     /// Translations as three floats.
     pub const VEC3: i64 = 6;
+    /// A single float (an exported parameter of a model: an emitter's birthrate, a remote
+    /// material's alpha).
+    pub const FLOAT: i64 = 8;
 }
 
 /// The key time that means the end of the animation.
@@ -269,6 +272,40 @@ pub enum Channel {
     Translation,
 }
 
+/// A track of one float (track kind 8): an exported parameter of the animated model, such as
+/// a visual effect's `flame_default_birthrate`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScalarTrack {
+    /// The parameter's name, lowercase.
+    pub target: String,
+    /// (time in seconds, value), in time order.
+    pub keys: Vec<(f32, f32)>,
+}
+
+impl ScalarTrack {
+    /// The value at `t` seconds: linear between keys, held before the first and after the
+    /// last. Provisional: the exe's interpolation of float tracks is not traced.
+    pub fn at(&self, t: f32) -> f32 {
+        let Some(&(t0, v0)) = self.keys.first() else {
+            return 0.0;
+        };
+        if t <= t0 {
+            return v0;
+        }
+        for w in self.keys.windows(2) {
+            let ((a, va), (b, vb)) = (w[0], w[1]);
+            if t <= b {
+                return if b > a {
+                    va + (vb - va) * (t - a) / (b - a)
+                } else {
+                    vb
+                };
+            }
+        }
+        self.keys.last().map_or(v0, |k| k.1)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Track {
     /// The bone (lowercase), from the target name without its `_rotation` or
@@ -294,6 +331,8 @@ pub struct Animation {
     /// `mh_o.eyejitter.ani`).
     pub additive: bool,
     pub tracks: Vec<Track>,
+    /// Its float tracks ([`track_kind::FLOAT`]).
+    pub scalars: Vec<ScalarTrack>,
 }
 
 /// Keys are kept to this many per track, far above any shipped animation.
@@ -316,6 +355,7 @@ impl Animation {
             )));
         }
         let mut tracks = Vec::new();
+        let mut scalars = Vec::new();
         for t in d.structs(root, ani::TRACKS)? {
             let target = d
                 .opt_str(t, ani::TARGET)?
@@ -327,7 +367,27 @@ impl Animation {
             } else if let Some(b) = target.strip_suffix("_translation") {
                 (b, Channel::Translation)
             } else {
-                // Other targets (morph weights and the like) are not bone transforms.
+                // Other targets (morph weights, exported parameters) are not bone
+                // transforms; float tracks are kept as they are.
+                if kind == track_kind::FLOAT
+                    && let Some(list) = d.opt_struct(t, ani::KEYS)?
+                {
+                    let raw = d.structs(list, ani::KEYS)?;
+                    if raw.len() > MAX_KEYS {
+                        return Err(TypedError::Invalid(format!(
+                            "animation: {} keys in {target}",
+                            raw.len()
+                        )));
+                    }
+                    let mut keys = Vec::with_capacity(raw.len());
+                    for k in raw {
+                        let time =
+                            d.opt_i64(k, ani::TIME)?.unwrap_or(0) as f32 / TIME_SCALE * length;
+                        keys.push((time, d.opt_f32(k, ani::VALUE)?.unwrap_or(0.0)));
+                    }
+                    keys.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    scalars.push(ScalarTrack { target, keys });
+                }
                 continue;
             };
             let Some(list) = d.opt_struct(t, ani::KEYS)? else {
@@ -393,6 +453,7 @@ impl Animation {
             length,
             additive: d.opt_i64(root, ani::ADDITIVE)?.is_some_and(|v| v != 0),
             tracks,
+            scalars,
         })
     }
 }
@@ -620,6 +681,41 @@ mod tests {
         assert_eq!(a.tracks[1].keys[0].value, [1.0, 2.0, 3.0, 0.0]);
         assert!((a.tracks[1].keys[0].time - 1.0).abs() < 1e-3);
         assert!(!a.additive, "no 4011: a pose");
+    }
+
+    #[test]
+    fn float_tracks_are_kept_by_their_parameter_name() {
+        let mut b = Builder::new(b"ANI ");
+        let k1 = b.add(
+            b"flot",
+            vec![(4035, Value::U16(0)), (4036, Value::F32(5.0))],
+        );
+        let k2 = b.add(
+            b"flot",
+            vec![(4035, Value::U16(65535)), (4036, Value::F32(10.0))],
+        );
+        let l = b.add(b"list", vec![(4004, structs(&[k2, k1]))]);
+        let t = b.add(
+            b"node",
+            vec![
+                (4000, s("Flame_Default_birthrate")),
+                (4001, Value::U32(8)),
+                (4004, Value::Struct(Some(l))),
+            ],
+        );
+        let root = b.add(
+            b"anim",
+            vec![(4005, structs(&[t])), (4009, Value::F32(2.0))],
+        );
+        let a = Animation::from_gff(&b.finish(root)).unwrap();
+        assert!(a.tracks.is_empty());
+        assert_eq!(a.scalars.len(), 1);
+        let track = &a.scalars[0];
+        assert_eq!(track.target, "flame_default_birthrate");
+        assert_eq!(track.keys, vec![(0.0, 5.0), (2.0, 10.0)]);
+        assert_eq!(track.at(-1.0), 5.0);
+        assert_eq!(track.at(1.0), 7.5);
+        assert_eq!(track.at(3.0), 10.0);
     }
 
     #[test]

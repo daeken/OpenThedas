@@ -14,6 +14,13 @@ pub struct AreaSound {
     pub volume: f32,
     pub max_distance_mult: f32,
     pub active: bool,
+    /// Added to the event's pitch (DAOrigins.exe's sound start 0x7c261d: +0x480, read from
+    /// `Pitch` at 0x7c22b1).
+    pub pitch: f32,
+    /// Fade-in and fade-out times (ms) that replace the event's (0x7c2623..0x7c2637: +0x484
+    /// `FadeIn`, +0x488 `FadeOut`). Most sounds fade out over 34 ms.
+    pub fade_in_ms: u32,
+    pub fade_out_ms: u32,
     /// The audio volume it belongs to, for a sound of a volume's own `SoundList` (see
     /// [`SoundRegion`]); `None` for the area's.
     pub region: Option<SoundRegion>,
@@ -151,6 +158,9 @@ pub fn area_audio(data: &[u8]) -> (Option<String>, Vec<AreaSound>) {
                 volume: num(s, "Volume").unwrap_or(0.0),
                 max_distance_mult: num(s, "MaxDistanceMult").unwrap_or(1.0),
                 active: num(s, "Active").unwrap_or(1.0) != 0.0,
+                pitch: num(s, "Pitch").unwrap_or(0.0),
+                fade_in_ms: num(s, "FadeIn").unwrap_or(0.0).max(0.0) as u32,
+                fade_out_ms: num(s, "FadeOut").unwrap_or(0.0).max(0.0) as u32,
                 region: region.clone(),
             });
         }
@@ -465,7 +475,9 @@ mod tests {
                     id: 6,
                     fields: vec![
                         f("Active", Value::Byte(0)),
+                        f("FadeOut", Value::Dword(34)),
                         f("MaxDistanceMult", Value::Float(0.5)),
+                        f("Pitch", Value::Float(-0.05)),
                         f("Sound", Value::ExoString(b"kw/3D/amb_crow".to_vec())),
                         f("Tag", Value::ExoString(b"Amb_Crow".to_vec())),
                         f("Volume", Value::Float(-4.0)),
@@ -520,6 +532,9 @@ mod tests {
                 volume: -4.0,
                 max_distance_mult: 0.5,
                 active: false,
+                pitch: -0.05,
+                fade_in_ms: 0,
+                fade_out_ms: 34,
                 region: None,
             }
         );

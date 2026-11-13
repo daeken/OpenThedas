@@ -154,6 +154,9 @@ pub struct EmitterState {
     /// DAOrigins.exe 0x466f40 setting emitter +0x360). Provisional: what +0x360 scales is
     /// not traced.
     pub opacity: f32,
+    /// Birthrate and its range set by an animation of the emitter's model (a visual
+    /// effect's exported `<emitter>_birthrate` parameters), over the emitter's own.
+    pub rate: Option<(f32, f32)>,
 }
 
 impl EmitterState {
@@ -167,6 +170,7 @@ impl EmitterState {
             accumulator: 0.0,
             burst_done: false,
             opacity: 1.0,
+            rate: None,
         }
     }
 
@@ -238,14 +242,15 @@ impl EmitterState {
     fn count(&mut self, dt: f32) -> u32 {
         let e = &self.blueprint;
         let dt = dt.max(0.0);
+        let (birthrate, birthrate_range) = self.rate.unwrap_or((e.birthrate, e.birthrate_range));
         match e.emitter_type {
             0 => {
-                if e.birthrate <= 0.0 {
+                if birthrate <= 0.0 {
                     return 0;
                 }
-                if e.birthrate_range == 0.0 {
+                if birthrate_range == 0.0 {
                     self.accumulator += dt;
-                    let n = (self.accumulator * e.birthrate) as i64;
+                    let n = (self.accumulator * birthrate) as i64;
                     if n > 0 {
                         self.accumulator = 0.0;
                         n as u32
@@ -253,7 +258,7 @@ impl EmitterState {
                         0
                     }
                 } else {
-                    let x = (self.births.signed() * e.birthrate_range + e.birthrate) * dt;
+                    let x = (self.births.signed() * birthrate_range + birthrate) * dt;
                     if x > 1.0 {
                         x as u32
                     } else {
@@ -263,7 +268,7 @@ impl EmitterState {
             }
             1 if !self.burst_done => {
                 self.burst_done = true;
-                (e.birthrate + self.births.signed() * e.birthrate_range).max(0.0) as u32
+                (birthrate + self.births.signed() * birthrate_range).max(0.0) as u32
             }
             _ => 0,
         }
