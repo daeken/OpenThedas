@@ -30,6 +30,9 @@ use serde_json::{Value as J, json};
 /// How long a connection waits for the game to answer one request.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// How many times a busy address is tried again (200 ms apart) before giving up.
+const BIND_TRIES: u32 = 25;
+
 /// The longest request line taken (bytes); a longer one is answered with an error and the
 /// connection closed, so a stray client cannot grow the game's memory without bound.
 pub const MAX_REQUEST: usize = 4 << 20;
@@ -56,7 +59,19 @@ impl Control {
         if !addr.ip().is_loopback() {
             bail!("--control must listen on a loopback address (127.0.0.1 or ::1), not {addr}");
         }
-        let listener = TcpListener::bind(addr).with_context(|| format!("listening on {addr}"))?;
+        // The address may still be held for a moment by the build that started this one
+        // (an update hands its control address on, see `update::start_build`).
+        let mut tries = 0;
+        let listener = loop {
+            match TcpListener::bind(addr) {
+                Ok(l) => break l,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && tries < BIND_TRIES => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(e) => return Err(e).with_context(|| format!("listening on {addr}")),
+            }
+        };
         let addr = listener.local_addr()?;
         let (tx, requests) = mpsc::channel();
         std::thread::Builder::new()

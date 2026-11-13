@@ -355,13 +355,16 @@ pub fn unzip(z: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
     Ok(out)
 }
 
-/// Starts `exe` on the game: the install, `save` loaded, and `report` to ask about.
+/// Starts `exe` on the game: the install, `save` loaded, and `report` to ask about. `more`
+/// carries on what this run was started with that the next must keep (no sound, a
+/// client's control address).
 pub fn start_build(
     exe: &Path,
     install: &Path,
     save: &Path,
     report: &Path,
     size: &str,
+    more: &[String],
 ) -> Result<()> {
     std::process::Command::new(exe)
         .arg("--install")
@@ -373,6 +376,7 @@ pub fn start_build(
         .arg("--size")
         .arg(size)
         .arg("--no-intro")
+        .args(more)
         .current_dir(exe.parent().unwrap_or(Path::new(".")))
         .spawn()
         .with_context(|| format!("starting {}", exe.display()))?;
