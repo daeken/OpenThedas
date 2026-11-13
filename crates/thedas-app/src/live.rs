@@ -379,15 +379,24 @@ fn build_objects_with(
 ) -> Result<(AreaScene, AreaRenderer)> {
     let started = std::time::Instant::now();
     let props: Vec<Prop> = models.iter().map(prop).collect();
-    let scene = AreaScene::load_objects_at(vfs, layout, &props, spec.detail)?;
+    let scene =
+        AreaScene::load_objects_cached(vfs, layout, &props, spec.detail, &mut cache.scenes)?;
+    let loaded = started.elapsed();
     let programs = crate::programs_cached(vfs, &scene, &spec.shaders, cache)?;
+    let translated = started.elapsed();
     let mut renderer = AreaRenderer::new_cached(ctx, vfs, &scene, &programs, spec.format, cache);
+    let made = started.elapsed();
     renderer.warm(ctx, spec.size.0, spec.size.1);
     log::info!(
-        "{layout}: {} objects, {} draws, built in {:.2}s",
+        "{layout}: {} objects, {} draws, built in {:.2}s (scene {:.0} ms, programs {:.0}, \
+         renderer {:.0}, warm {:.0})",
         models.len(),
         scene.draws.len(),
-        started.elapsed().as_secs_f64()
+        started.elapsed().as_secs_f64(),
+        loaded.as_secs_f64() * 1000.0,
+        (translated - loaded).as_secs_f64() * 1000.0,
+        (made - translated).as_secs_f64() * 1000.0,
+        (started.elapsed() - made).as_secs_f64() * 1000.0
     );
     Ok((scene, renderer))
 }
@@ -690,6 +699,7 @@ impl Live {
             // Drop the old level now: its world is gone.
             self.level = None;
             self.cache = RenderCache::default();
+            self.animator = Animator::default();
             let (tx, rx) = std::sync::mpsc::channel();
             let (ctx, spec, name) = (share(ctx), self.spec(format), layout.to_string());
             let spawned = std::thread::Builder::new()
@@ -1815,6 +1825,7 @@ impl Live {
     ) -> Result<LiveLevel> {
         // A new resource stack: nothing cached carries over.
         self.cache = RenderCache::default();
+        self.animator = Animator::default();
         build_level_with(ctx, &self.spec(format), layout, &mut self.cache)
     }
 
@@ -1845,8 +1856,8 @@ impl Live {
         scene: AreaScene,
         renderer: AreaRenderer,
     ) -> LiveObjects {
-        // A new scene means new skeleton indices.
-        self.animator = Animator::default();
+        // A new scene means new skeleton indices; the animations read stay.
+        self.animator.forget_skeletons();
         let mut bounds = std::collections::HashMap::new();
         let mut faces = std::collections::HashMap::new();
         let mut shapes = std::collections::HashMap::new();
