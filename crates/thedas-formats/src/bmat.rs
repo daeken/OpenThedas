@@ -547,7 +547,9 @@ impl Bmat {
 
     /// This material as a definition of the kind Dragon Age: Origins' `.mat.xml` gives
     /// ([`crate::material::MaterialDef`]), for what draws by those: each semantic with the
-    /// one technique drawn here ([`Semantic::technique`]); each pass with its shaders
+    /// one technique drawn here ([`Semantic::technique`]), and after them a second form,
+    /// named with [`PER_VERTEX`] after the semantic's name, of each semantic that has a
+    /// technique for lighting baked per vertex; each pass with its shaders
     /// (without the `.fxo`, as the XML names them), its parameters (the engine's as
     /// internal ones, textures by their samplers, the others with their defaults), and in
     /// place of a state file's name a [`pass_reference`] into `resource` (this material's
@@ -787,7 +789,19 @@ mod tests {
             technique("HighToo", [1, 0, 2, 0, 1, 0]),
         ]);
         assert_eq!(s.technique().map(|(i, _)| i), Some(2));
+        assert_eq!(s.per_vertex_technique().map(|(i, _)| i), Some(3));
         assert!(semantic(Vec::new()).technique().is_none());
+        assert!(semantic(Vec::new()).per_vertex_technique().is_none());
+        // The definition gives the per-vertex technique as a second form of the semantic.
+        let def = Bmat { semantics: vec![s] }.definition("static.mat");
+        let names: Vec<&str> = def.semantics.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Default", "Default#PerVertex"]);
+        assert_eq!(
+            def.semantics[1].logic[0].techniques[0].name.as_deref(),
+            Some("HighToo")
+        );
+        assert_eq!(engine_usage(6), Some("ModelViewProjection"));
+        assert_eq!(engine_usage(7), Some("ModelViewProjectionTrans"));
         assert_eq!(engine_usage(51), Some("DebugControlBooleans"));
         assert_eq!(engine_usage(1000), None);
         assert_eq!(parse_pass_reference("static.mat#1#2"), None);

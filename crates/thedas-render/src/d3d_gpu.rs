@@ -881,8 +881,10 @@ fn expand_vertices(mesh: &SceneMesh, inputs: &[IoSlot]) -> Vec<f32> {
                 continue;
             }
             // Dragon Age II's lighting baked per vertex: its three colours are texture
-            // coordinates 1, 2 and 3 (`static_static_p1.vsh`). Provisional: the bytes are
-            // taken in the order stored, as red, green, blue.
+            // coordinates 1, 2 and 3 (`static_static_p1.vsh`, which cubes each and never
+            // reads the fourth byte). Provisional: the bytes are taken in the order stored
+            // as red, green and blue; so read, `lt_backalley_g`'s colours average the same
+            // blue-grey as its lightmaps (72, 76, 90 against 73, 74, 85).
             if let (DeclUsage::TexCoord, i @ 1..=3, Some(light)) =
                 (usage, slot.semantic.index, mesh.vertex_light.as_ref())
             {
@@ -2937,6 +2939,71 @@ mod tests {
     #[test]
     fn its_shaders_translate_for_every_backend() {
         crate::backend_check::translates("shadow blur", SHADOW_BLUR_WGSL);
+    }
+
+    #[test]
+    fn lighting_baked_per_vertex_is_read_as_three_texture_coordinates() {
+        use thedas_formats::mesh::{IndexFormat, MeshChunk};
+        use thedas_shader::translate::Semantic;
+        let vertex = |x: f32| crate::scene::Vertex {
+            position: [x, 0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            uv0: [0.25, 0.5],
+            uv1: [0.0, 0.0],
+        };
+        let mesh = SceneMesh {
+            key: "piece".into(),
+            vertices: vec![vertex(1.0), vertex(2.0)],
+            indices: vec![0, 1, 0],
+            chunk: MeshChunk {
+                name: "piece".into(),
+                vertex_size: 0,
+                vertex_count: 2,
+                index_count: 3,
+                primitive: 0,
+                index_format: IndexFormat::U16,
+                base_vertex: 0,
+                vertex_offset: 0,
+                start_index: 0,
+                elements: vec![],
+                bounds: None,
+            },
+            raw_vertices: vec![],
+            positions: None,
+            // The second vertex is past the file's end: it reads as unlit.
+            vertex_light: Some(vec![[
+                [255, 0, 51, 186],
+                [0, 255, 0, 186],
+                [0, 0, 102, 186],
+            ]]),
+        };
+        let slot = |usage, index, register| IoSlot {
+            semantic: Semantic { usage, index },
+            register,
+            location: register,
+        };
+        let inputs = [
+            slot(Usage::TexCoord, 0, 0),
+            slot(Usage::TexCoord, 1, 1),
+            slot(Usage::TexCoord, 3, 2),
+        ];
+        let out = expand_vertices(&mesh, &inputs);
+        let near = |a: &[f32], b: [f32; 4]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6);
+        assert_eq!(out.len(), 2 * 3 * 4);
+        assert!(near(&out[0..4], [0.25, 0.5, 0.0, 1.0]));
+        assert!(near(&out[4..8], [1.0, 0.0, 0.2, 186.0 / 255.0]));
+        assert!(near(&out[8..12], [0.0, 0.0, 0.4, 186.0 / 255.0]));
+        assert!(near(&out[16..20], [0.0; 4]));
+        assert!(near(&out[20..24], [0.0; 4]));
+        // A mesh without such lighting reads its own second coordinates.
+        let plain = SceneMesh {
+            vertex_light: None,
+            ..mesh
+        };
+        assert!(near(
+            &expand_vertices(&plain, &inputs)[4..8],
+            [0.0, 0.0, 0.0, 1.0]
+        ));
     }
 
     #[test]

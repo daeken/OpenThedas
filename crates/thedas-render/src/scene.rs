@@ -60,9 +60,10 @@ pub struct SceneMesh {
     pub raw_vertices: Vec<u8>,
     /// Positions that replace the raw stream's (a head morph's face), one per vertex.
     pub positions: Option<Vec<[f32; 4]>>,
-    /// Dragon Age II's lighting baked per vertex, one entry per vertex: the three colours
-    /// its vertex shaders for such lighting read as texture coordinates 1, 2 and 3.
-    pub vertex_light: Option<Vec<[[u8; 4]; 3]>>,
+    /// Dragon Age II's lighting baked per vertex ([`thedas_formats::vlm`]), one entry per
+    /// vertex: the three colours its vertex shaders for such lighting read as texture
+    /// coordinates 1, 2 and 3.
+    pub vertex_light: Option<Vec<thedas_formats::vlm::VertexLight>>,
 }
 
 /// A material object resolved down to its material definition.
@@ -741,17 +742,6 @@ fn piece_light<'a>(
         PieceLight::Vertices(&b.texture)
     } else {
         PieceLight::Map(b)
-    })
-}
-
-/// A `.vlm` resource's colours: three (the light arriving along each of three directions,
-/// as a lightmap's three textures) of four bytes for each vertex, in the piece's vertex
-/// order, with no header.
-fn vertex_light(data: &[u8]) -> Option<Vec<[[u8; 4]; 3]>> {
-    (data.len() % 12 == 0).then(|| {
-        data.chunks_exact(12)
-            .map(|v| [0, 4, 8].map(|at| [v[at], v[at + 1], v[at + 2], v[at + 3]]))
-            .collect()
     })
 }
 
@@ -2294,7 +2284,9 @@ impl<'a> Loader<'a> {
                 // first of its vertices and now and then not all of them; the rest are
                 // never drawn.
                 let n = self.scene.meshes[mesh].vertices.len();
-                let colours = vertex_light(&d)
+                let colours = thedas_formats::vlm::Vlm::parse(&d)
+                    .ok()
+                    .map(|v| v.vertices)
                     .filter(|c| !c.is_empty() && c.len() <= n)
                     .map(|mut c| {
                         c.resize(n, [[0; 4]; 3]);
@@ -3643,16 +3635,6 @@ mod tests {
             piece_light(&da2[..1], Some("_0"), 0, 1),
             Some(PieceLight::Map(&da2[0]))
         );
-        // Three colours of four bytes a vertex, and nothing else.
-        let bytes: Vec<u8> = (0..24).collect();
-        let light = vertex_light(&bytes).unwrap();
-        assert_eq!(light.len(), 2);
-        assert_eq!(
-            light[1],
-            [[12, 13, 14, 15], [16, 17, 18, 19], [20, 21, 22, 23]]
-        );
-        assert_eq!(vertex_light(&bytes[..23]), None);
-
         let lightmap = |texture: &str| LightmapRef {
             texture: texture.into(),
             offset: [0.0; 2],
