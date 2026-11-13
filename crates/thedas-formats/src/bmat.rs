@@ -483,6 +483,37 @@ impl Pass {
     }
 }
 
+/// The usage (as Dragon Age: Origins' material definitions spell them, with a few of this
+/// reader's own for values that game does not have) of an engine parameter's source number.
+///
+/// Provisional: the numbers' meanings are taken from the constants' names across every
+/// material (source 7 is always `aur_mWorldViewProj` or the sky's, 16 always
+/// `g_vLightParams`, and so on), not from the executable. The matrix usages end in `Trans`
+/// because the shaders read these matrices the way Origins' read its `…Trans` ones.
+pub fn engine_usage(source: u32) -> Option<&'static str> {
+    Some(match source {
+        2 | 3 => "PartTrans",
+        6 | 7 => "ModelViewProjectionTrans",
+        8 => "ModelViewTrans",
+        10 => "ModelViewInvTrans",
+        16 => "LightsArray",
+        20 => "ShaderControlBooleans",
+        21 => "ShadowPartitionMatrix",
+        22 => "ShadowTexture_Primary",
+        24 => "ShadowData",
+        25 => "EnvironmentMap",
+        31 => "ProjectionTrans",
+        34 => "ViewTrans",
+        36 => "ViewInvTrans",
+        38 => "ViewProjectionTrans",
+        39 => "CameraPosition",
+        41 => "ApplicationTime",
+        46 => "FogParameters",
+        51 => "DebugControlBooleans",
+        _ => return None,
+    })
+}
+
 impl Bmat {
     /// The pass a [`pass_reference`]'s places name.
     pub fn pass_at(&self, semantic: usize, technique: usize, pass: usize) -> Option<&Pass> {
@@ -535,7 +566,7 @@ impl Bmat {
                                         name: e.name.clone(),
                                         sampler: (!e.sampler.is_empty()).then(|| e.sampler.clone()),
                                         stage: None,
-                                        usage: None,
+                                        usage: engine_usage(e.source).map(str::to_string),
                                         default: None,
                                     })
                                     .chain(p.parameters.iter().map(|q| m::Parameter {
@@ -653,6 +684,85 @@ mod tests {
         assert_eq!(p.parameters[1].default, "sb03_bcloud");
         assert_eq!(p.render_states, vec![(7, 23)]);
         assert_eq!(p.sampler_states, vec![(0, 9, 0)]);
+    }
+
+    #[test]
+    fn becomes_a_material_definition() {
+        let m = Bmat::parse(&sample()).unwrap();
+        let def = m.definition("Sky.mat");
+        assert_eq!(def.name, "Sky.mat");
+        let sem = &def.semantics[0];
+        assert_eq!(sem.name, "Sky2");
+        assert_eq!(sem.render_class.as_deref(), Some("sky"));
+        // The only technique is not a main one (its second word is 2) and is still drawn.
+        let pass = &sem.logic[0].techniques[0].passes[0];
+        assert_eq!(pass.vertex_shader.as_deref(), Some("sky_sky2_p0.vsh"));
+        assert_eq!(pass.pixel_shader.as_deref(), Some("sky_sky2_p0.psh"));
+        assert_eq!(pass.state.as_deref(), Some("sky.mat#0#0#0"));
+        assert_eq!(
+            parse_pass_reference(pass.state.as_deref().unwrap()),
+            Some(("sky.mat", 0, 0, 0))
+        );
+        let p = &pass.parameters;
+        assert_eq!(p[0].name, "aur_mSkyViewProjection");
+        assert!(p[0].internal);
+        assert_eq!(p[0].usage.as_deref(), Some("ModelViewProjectionTrans"));
+        assert_eq!(p[1].name, "vSunColor");
+        assert_eq!(p[1].default.as_deref(), Some("1 1 1 5"));
+        assert_eq!(p[2].ty, "Texture");
+        assert_eq!(p[2].sampler.as_deref(), Some("smpSkyTextureA"));
+        assert_eq!(p[2].default.as_deref(), Some("sb03_bcloud"));
+
+        // Its states read as a state file's: culling off (7 = 23), and sampler 0 linear
+        // (the default written for every stage) and not sRGB (9 = 0).
+        let state = m.pass_at(0, 0, 0).unwrap().material_state("sky.mat#0#0#0");
+        assert_eq!(state.device_state("DS_CULLMODE"), Some("CULL_NONE"));
+        let pass_state = state.pass().unwrap();
+        assert_eq!(pass_state.cull, crate::state::Cull::None);
+        assert!(pass_state.blend.is_none());
+        let sampler = state.sampler_at(None, Some(0)).unwrap();
+        assert_eq!(sampler.min, crate::state::Filter::Linear);
+        assert!(!sampler.srgb);
+        assert!(m.pass_at(0, 0, 1).is_none());
+    }
+
+    #[test]
+    fn picks_the_technique_to_draw() {
+        let technique = |name: &str, header: [u32; 6]| Technique {
+            name: name.to_string(),
+            header,
+            passes: Vec::new(),
+        };
+        let semantic = |techniques: Vec<Technique>| Semantic {
+            name: "Default".into(),
+            render_class: "Opaque".into(),
+            techniques,
+        };
+        // Baked per-pixel lighting at high detail wins over what comes before it.
+        let s = semantic(vec![
+            technique("DepthWrite", [1, 1, 0, 0, 1, 0]),
+            technique("VertexLit", [1, 0, 2, 0, 1, 0]),
+            technique("Baked", [1, 0, 1, 2, 1, 0]),
+            technique("BakedLow", [0, 0, 1, 2, 1, 0]),
+        ]);
+        assert_eq!(
+            s.technique().map(|(i, t)| (i, t.name.as_str())),
+            Some((2, "Baked"))
+        );
+        // Without one, the highest detail of the main techniques, the earliest among equals.
+        let s = semantic(vec![
+            technique("ShadowPass", [1, 2, 0, 0, 1, 0]),
+            technique("Low", [0, 0, 3, 0, 1, 0]),
+            technique("High", [1, 0, 3, 0, 1, 0]),
+            technique("HighToo", [1, 0, 2, 0, 1, 0]),
+        ]);
+        assert_eq!(s.technique().map(|(i, _)| i), Some(2));
+        assert!(semantic(Vec::new()).technique().is_none());
+        assert_eq!(engine_usage(51), Some("DebugControlBooleans"));
+        assert_eq!(engine_usage(1000), None);
+        assert_eq!(parse_pass_reference("static.mat#1#2"), None);
+        assert_eq!(parse_pass_reference("static.mat#1#2#3#4"), None);
+        assert_eq!(parse_pass_reference("static.xml"), None);
     }
 
     #[test]
