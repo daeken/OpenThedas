@@ -64,6 +64,7 @@ mod paddev;
 mod padplay;
 mod report;
 mod reticle;
+mod rings;
 mod saves;
 mod screens;
 mod talkcam;
