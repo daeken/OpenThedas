@@ -606,7 +606,7 @@ struct App {
     /// that asked for it (`--control`'s `report`), waiting for where it went.
     report_wait: Option<ReportWait>,
     /// The settings the game was started with, for reports.
-    settings: J,
+    started_with: J,
 }
 
 /// What a report under way waits for.
@@ -1349,7 +1349,7 @@ impl App {
         }
         let mut info = json!({
             "build": report::build_info(),
-            "settings": self.settings,
+            "settings": self.started_with,
             "game": self.status(),
         });
         if let Some(g) = self.gfx.as_ref() {
@@ -1370,6 +1370,7 @@ impl App {
             });
         }
         let mut now_save = None;
+        let mut trace = None;
         let mut paused_it = false;
         if let Some(live) = self.live.as_mut() {
             if !live.front_end {
@@ -1382,6 +1383,7 @@ impl App {
                     Ok(b) => now_save = Some(b),
                     Err(e) => log::warn!("report: the game's state: {e}"),
                 }
+                trace = serde_json::to_value(&sim.world.trace.recent).ok();
                 drop(sim);
                 if !live.paused {
                     live.paused = true;
@@ -1389,7 +1391,7 @@ impl App {
                 }
             }
         }
-        let dir = self.recorder.start(now_save, info, paused_it);
+        let dir = self.recorder.start(now_save, trace, info, paused_it);
         log::info!("report: started in {}", dir.display());
         // The frame as presented, read back as the next one is drawn; drawn again
         // offscreen where the surface cannot be read back.
@@ -4420,7 +4422,7 @@ fn main() -> Result<()> {
         zoom_key: 0.0,
         recorder: report::Recorder::new(report::Recorder::default_dir()),
         report_wait: None,
-        settings: json!({
+        started_with: json!({
             "size": args.size,
             "shaders": args.shaders,
             "detail": args.detail,

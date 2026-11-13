@@ -10,6 +10,9 @@
 //!   settings in force, where the game was (area, leader, party, conversation, cutscene,
 //!   screens), the frame times, and what the snapshots cover;
 //! - `log.txt`: the last [`LOG_LINES`] log lines;
+//! - `trace.json`: the simulation's last [`TRACE_RECENT`] orders, script log lines,
+//!   conversation lines, plot flags, failed scripts and missing functions and resources
+//!   (`Trace::recent`), oldest first;
 //! - `input.txt`: the player's input over the last [`INPUT_WINDOW`], timed from the earlier
 //!   save;
 //! - `note.txt`: what the player typed about it.
@@ -31,6 +34,8 @@ use serde_json::{Value as J, json};
 
 /// How often a snapshot of the game is kept while playing.
 pub const SNAPSHOT_EVERY: Duration = Duration::from_secs(20);
+/// How soon a snapshot that could not be taken is tried again.
+pub const SNAPSHOT_RETRY: Duration = Duration::from_secs(2);
 /// How many snapshots are kept (the oldest goes): a minute and a bit back.
 pub const SNAPSHOTS_KEPT: usize = 4;
 /// The age of the snapshot a report calls "before" (the youngest at least this old).
@@ -39,6 +44,8 @@ pub const BEFORE_AGE: Duration = Duration::from_secs(50);
 pub const LOG_LINES: usize = 400;
 /// The input kept for a report.
 pub const INPUT_WINDOW: Duration = Duration::from_secs(120);
+/// The simulation's recent trace entries kept for a report (`Trace::recent`).
+pub const TRACE_RECENT: usize = 4000;
 /// The frame times kept for a report's statistics.
 pub const FRAMES_KEPT: usize = 600;
 
@@ -114,7 +121,8 @@ fn log_lines() -> Vec<String> {
 /// What a report keeps between presses: the snapshots, the input and the frame times.
 pub struct Recorder {
     snapshots: VecDeque<Snapshot>,
-    last_snapshot: Option<Instant>,
+    /// When the next snapshot is due (now, when none is).
+    next_snapshot: Option<Instant>,
     input: VecDeque<(Instant, String)>,
     frames: VecDeque<f32>,
     /// Where reports are written.
@@ -127,7 +135,7 @@ impl Recorder {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             snapshots: VecDeque::new(),
-            last_snapshot: None,
+            next_snapshot: None,
             input: VecDeque::new(),
             frames: VecDeque::new(),
             dir: dir.into(),
@@ -163,13 +171,12 @@ impl Recorder {
 
     /// Whether a snapshot is due now.
     pub fn snapshot_due(&self, now: Instant) -> bool {
-        self.last_snapshot
-            .is_none_or(|t| now.duration_since(t) >= SNAPSHOT_EVERY)
+        self.next_snapshot.is_none_or(|t| now >= t)
     }
 
     /// Keeps a snapshot (the oldest goes past [`SNAPSHOTS_KEPT`]).
     pub fn keep(&mut self, s: Snapshot) {
-        self.last_snapshot = Some(s.taken);
+        self.next_snapshot = Some(s.taken + SNAPSHOT_EVERY);
         // The game's clock went back: another save was loaded, and the snapshots kept are
         // not of the game being played now.
         if self.snapshots.back().is_some_and(|b| b.time_ms > s.time_ms) {
@@ -181,16 +188,16 @@ impl Recorder {
         self.snapshots.push_back(s);
     }
 
-    /// A snapshot could not be taken (saving refused, nothing playing): try again later,
-    /// not every frame.
+    /// A snapshot could not be taken (saving refused, nothing playing): try again in
+    /// [`SNAPSHOT_RETRY`], not every frame.
     pub fn skip_snapshot(&mut self, now: Instant) {
-        self.last_snapshot = Some(now);
+        self.next_snapshot = Some(now + SNAPSHOT_RETRY);
     }
 
     /// Forgets the snapshots (a different game was loaded or started: they are not of it).
     pub fn forget(&mut self) {
         self.snapshots.clear();
-        self.last_snapshot = None;
+        self.next_snapshot = None;
     }
 
     /// The snapshot a report made `now` calls "before": the youngest at least
@@ -210,7 +217,13 @@ impl Recorder {
 
     /// Starts a report made now: everything but the screenshot and the note, which come
     /// later (`screenshot`, `note`). Writes what it has at once.
-    pub fn start(&mut self, now_save: Option<Vec<u8>>, mut info: J, paused_it: bool) -> PathBuf {
+    pub fn start(
+        &mut self,
+        now_save: Option<Vec<u8>>,
+        trace: Option<J>,
+        mut info: J,
+        paused_it: bool,
+    ) -> PathBuf {
         let now = Instant::now();
         let written = crate::saves::now_secs();
         let area = info["game"]["area"].as_str().unwrap_or("none").to_string();
@@ -265,6 +278,7 @@ impl Recorder {
             before: before.map(|s| s.save),
             log: log_lines(),
             input,
+            trace,
         };
         if let Err(e) = files.write() {
             log::warn!("report: writing {}: {e:#}", path.display());
@@ -342,6 +356,7 @@ struct Files {
     before: Option<Vec<u8>>,
     log: Vec<String>,
     input: Vec<String>,
+    trace: Option<J>,
 }
 
 impl Files {
@@ -372,6 +387,9 @@ impl Files {
             writeln!(input, "{l}")?;
         }
         put("input.txt", &input)?;
+        if let Some(t) = &self.trace {
+            put("trace.json", &serde_json::to_vec_pretty(t)?)?;
+        }
         Ok(())
     }
 }
@@ -539,7 +557,8 @@ mod tests {
         r.frame(33.0);
         keep_line("a line for the report".into());
         let info = json!({ "game": { "area": "lot100ar/Lothering" } });
-        let path = r.start(Some(b"{\"now\":1}".to_vec()), info, true);
+        let trace = json!([{ "kind": "log", "t": 5, "channel": 0, "text": "hello" }]);
+        let path = r.start(Some(b"{\"now\":1}".to_vec()), Some(trace), info, true);
         assert!(r.busy());
         assert!(
             path.file_name()
@@ -583,7 +602,7 @@ mod tests {
         );
         // A second report the same minute gets a folder of its own; cancelling deletes it.
         let info = json!({ "game": { "area": "lot100ar/Lothering" } });
-        let second = r.start(None, info, false);
+        let second = r.start(None, None, info, false);
         assert_ne!(second, path);
         r.screenshot(Err(anyhow::anyhow!("no frame")));
         r.note(None);
