@@ -38,8 +38,9 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
    - Large; needs collision geometry from the sim or render side.
 10. **Audio volume triggers (Type 4, CCTriggerAudioVolume).**
     - Their reverb is applied (#279).
-    - Not handled: their `SoundList` (sounds that play only inside the volume, 0x79a000) and `ObjectId`.
-    - Medium.
+    - Their `SoundList` plays (0x79a000; about 11,900 sounds in 2,829 volumes): each sound stands at the volume, and while the listener is near it follows the listener, at the listener while the party leader is inside and at the volume's nearest point otherwise (0x7c2ee0).
+    - Provisional: the nearest point is taken on the outline (0x798de0 not traced past its bounds test); sounds are re-placed every frame instead of every 0.06 s after 0.25 m; `ObjectId` (save identity) is not kept.
+    - Small.
 12. **Ambient one-shots** (`amb_oneshots`, `glo_amb_creat`). Played only where the data places them; any engine-driven ambient spawning isn't checked. Small to medium.
 13. **Placeable sounds** (doors, chests and so on).
     - Done: animation events of kind 27 (`ClosedToOpened`, `OpenedToClosed`, `Destroyed`, `Used`) play the `placeable_types.gda` column they name for the placeable's type (0x74c360).
