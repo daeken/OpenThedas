@@ -116,6 +116,23 @@ impl<'a> Doc<'a> {
         }
     }
 
+    /// A name stored either as a string or, in Dragon Age II, as its
+    /// [`crate::name_hash32`] (any integer field): the hash comes back as
+    /// [`crate::hashed_name`].
+    pub fn opt_name_or_hash(&self, id: StructId, label: u32) -> TypedResult<Option<String>> {
+        match self.get(id, label) {
+            Some(v @ Value::String(_)) => {
+                let _ = v;
+                self.opt_str(id, label)
+            }
+            Some(v) => match v.as_i64() {
+                Some(h) => Ok(Some(crate::hashed_name(h as u32))),
+                None => Err(self.wrong(label, v)),
+            },
+            None => Ok(None),
+        }
+    }
+
     pub fn str(&self, id: StructId, label: u32) -> TypedResult<String> {
         self.opt_str(id, label)?.ok_or_else(|| self.missing(label))
     }
