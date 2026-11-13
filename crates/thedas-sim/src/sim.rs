@@ -3079,7 +3079,7 @@ impl Sim {
     /// area and the area tree. Creates the module object, the hero and the party.
     pub fn load_module(&mut self, install_root: &Path, module_dir: &str) -> Result<(), SimError> {
         self.install_root = Some(install_root.to_path_buf());
-        let dir = install_root.join("modules").join(module_dir);
+        let dir = thedas_vfs::join_ci(install_root, &format!("modules/{module_dir}"));
         let cif = std::fs::read_dir(&dir)
             .map_err(|_| SimError::NotFound(dir.display().to_string()))?
             .filter_map(|e| e.ok())

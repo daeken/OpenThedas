@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use thedas_formats::fev::Fev;
 use thedas_formats::fsb::Fsb;
+use thedas_vfs::join_ci;
 
 use crate::decode::{Pcm, decode};
 
@@ -74,27 +75,26 @@ impl Library {
     /// (`modules/<module>`), each with `audio/sound` then `audio/vo/<language>/vo`. Other
     /// modules' folders (`packages/core_ep1`, DLC `module` folders) are not: they carry their
     /// own projects under the same names (`music`), which the campaign must not pick up.
+    /// Folder names are matched in any case, as the Windows original does
+    /// ([`thedas_vfs::resolve_ci`]); module and language names come from flags.
     pub fn install_dirs(root: &Path, module: &str, language: &str) -> Vec<PathBuf> {
-        let mut packages = vec![root.join("packages/core")];
+        let mut packages = vec![join_ci(root, "packages/core")];
         for top in ["Addins", "Offers"] {
-            let mut dlc: Vec<PathBuf> = std::fs::read_dir(root.join(top))
+            let mut dlc: Vec<PathBuf> = std::fs::read_dir(join_ci(root, top))
                 .into_iter()
                 .flatten()
                 .flatten()
-                .map(|e| e.path().join("core"))
+                .map(|e| join_ci(&e.path(), "core"))
                 .filter(|p| p.is_dir())
                 .collect();
             dlc.sort();
             packages.extend(dlc);
         }
-        packages.push(root.join("modules").join(module));
+        packages.push(join_ci(root, &format!("modules/{module}")));
         let mut out = Vec::new();
         for p in packages {
-            for sub in [
-                PathBuf::from("audio/sound"),
-                Path::new("audio/vo").join(language).join("vo"),
-            ] {
-                let d = p.join(sub);
+            for sub in ["audio/sound".to_string(), format!("audio/vo/{language}/vo")] {
+                let d = join_ci(&p, &sub);
                 if d.is_dir() {
                     out.push(d);
                 }
@@ -218,5 +218,29 @@ impl Library {
         cache.1 += bytes;
         cache.0.insert(ck, pcm.clone());
         Some(pcm)
+    }
+}
+
+#[cfg(test)]
+mod case_tests {
+    use super::*;
+
+    #[test]
+    fn install_folders_resolve_in_any_case() {
+        let root = std::env::temp_dir().join(format!("thedas-lib-case-{}", std::process::id()));
+        let vo = root.join("Packages/Core/Audio/VO/EN-US/vo");
+        std::fs::create_dir_all(&vo).unwrap();
+        std::fs::create_dir_all(root.join("modules/Single Player/audio/sound")).unwrap();
+        let dirs = Library::install_dirs(&root, "single player", "en-us");
+        // Both found (on a case-insensitive volume the given case may be kept).
+        let same = |a: &Path, b: &Path| {
+            a.to_string_lossy()
+                .eq_ignore_ascii_case(&b.to_string_lossy())
+        };
+        assert_eq!(dirs.len(), 2, "{dirs:?}");
+        assert!(dirs.iter().any(|d| same(d, &vo)), "{dirs:?}");
+        let sound = root.join("modules/Single Player/audio/sound");
+        assert!(dirs.iter().any(|d| same(d, &sound)), "{dirs:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
