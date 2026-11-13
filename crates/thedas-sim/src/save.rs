@@ -39,7 +39,11 @@ pub const SAVE_FORMAT: u32 = 1;
 ///   containers do in the original. Loading an earlier save fills each empty container with
 ///   its template's items (one that was emptied by looting is filled again: earlier saves
 ///   cannot tell the two apart).
-pub const SAVE_REVISION: u32 = 7;
+/// - 8: creatures have the abilities their templates list (`TalentList`, `SpellList`,
+///   `SkillList`: a monster's own abilities). Loading an earlier save adds each creature's
+///   template abilities to what it has (one a script took away since is given back: earlier
+///   saves cannot tell).
+pub const SAVE_REVISION: u32 = 8;
 
 /// The trace channel loading reports save damage on.
 pub const SAVE_CHANNEL: i32 = -7;
@@ -353,6 +357,9 @@ impl Sim {
         // original saves the tutorial queue at all is not traced.
         if self.world.tutorials.is_empty() {
             self.world.tutorial_paused = false;
+        }
+        if save_revision < 8 {
+            self.restore_template_abilities();
         }
         self.save_issues = if save_revision < 3 {
             self.check_property_damage()
