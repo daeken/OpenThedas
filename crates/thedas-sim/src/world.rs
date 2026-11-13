@@ -713,6 +713,10 @@ pub struct World {
     /// it.
     #[serde(skip)]
     pub portrait_messages: Vec<PortraitMessage>,
+    /// The status messages scripts showed (`DisplayStatusMessage(sMessage, nColour)`: the
+    /// text and its 0xRRGGBB colour) that the interface has not taken yet. Output only.
+    #[serde(skip)]
+    pub status_messages: Vec<(String, i32)>,
     /// The sounds scripts asked for that the presentation has not taken yet. Output only:
     /// nothing in the simulation reads it.
     #[serde(skip)]
@@ -848,6 +852,7 @@ impl World {
             trace: Trace::default(),
             floaties: Vec::new(),
             portrait_messages: Vec::new(),
+            status_messages: Vec::new(),
             sounds: Vec::new(),
             tables,
         }
