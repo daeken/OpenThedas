@@ -93,6 +93,9 @@ pub struct Presentation {
     /// The save and load screen's mode: 1 saving, 2 loading (saveload.gfx's `SAVE_MODE`,
     /// `LOAD_MODE`).
     pub save_mode: i32,
+    /// The credits' text while the credits screen is up (credits.gfx reads
+    /// `GUICredits.CreditsText` and its line count, `GUICredits.CreditsNewlines`).
+    pub credits: Option<String>,
     /// The slot a new save would take.
     pub open_slot: i32,
     /// The journal, while its screen is up (the app builds it: [`thedas_sim::Sim::journal`]).
@@ -1585,6 +1588,18 @@ fn chargen_screen(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
 /// (it counts the list). Provisional: no screenshots, every save of kind 0; a party is never
 /// captured on death (`Party.CapturedOnDeath` 0) and the death screen has no hint.
 fn saves(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
+    // The credits screen's text and how many lines it has (credits.gfx scrolls faster for
+    // a longer text).
+    if let Some(text) = &shown.credits {
+        v.insert(
+            "GUICredits.CreditsNewlines".into(),
+            num(text.matches('\n').count() as u32),
+        );
+        v.insert(
+            "GUICredits.CreditsText".into(),
+            UiValue::String(text.clone()),
+        );
+    }
     v.insert("SaveLoad.Mode".into(), num(shown.save_mode));
     v.insert("SaveLoad.OpenSlot".into(), num(shown.open_slot));
     // The save details' player name (saveload.gfx's `PlayerName_mc` reads it as text; it

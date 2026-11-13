@@ -292,6 +292,8 @@ pub struct UiLayer {
     composite: Option<Composite>,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// The game's resources (the credits' text is read from them).
+    vfs: Arc<Vfs>,
     /// Messages the simulation did not take, already logged.
     ignored: std::collections::HashSet<String>,
     /// The cursor the movies last asked for (`SetCursor`); empty before any did.
@@ -716,6 +718,7 @@ impl UiLayer {
             composite: None,
             device: ctx.device.clone(),
             queue: ctx.queue.clone(),
+            vfs: vfs.clone(),
             ignored: Default::default(),
             cursor: String::new(),
             shown: Default::default(),
@@ -810,6 +813,21 @@ impl UiLayer {
         screens.menu = Some(Screen::SaveLoad);
     }
 
+    /// The game's credits (`credits_core_pc_en-us.txt`, UTF-16 with `<header1>` to
+    /// `<header3>` tags credits.gfx turns into font sizes), one line feed a line. `None` when
+    /// the install has none. Provisional: English only, as the talk tables are.
+    fn credits_text(&self) -> Option<String> {
+        let (data, _) = self.vfs.read("credits_core_pc_en-us.txt").ok()?;
+        let text = decode_text(&data);
+        (!text.trim().is_empty()).then_some(text)
+    }
+
+    /// Shows the start menu's buttons, logo and log-in line again, when the menu is up.
+    fn start_menu_back(&mut self) {
+        self.stage
+            .call_in("startmenu2.gfx", "StartMenu.ShowContents", &[]);
+    }
+
     /// The start menu's and the game menu's messages: options (`GameModeController.
     /// PushGUIScreen Options`), the game menu closing itself (`HideGUIScreen MainMenu`), and
     /// back to the start menu (`ExitToStartMenuMessage`, from the game menu;
@@ -830,6 +848,48 @@ impl UiLayer {
             {
                 screens.menu = None;
                 self.requests.push(FrontEnd::Report);
+            }
+            // The start menu hides its own buttons (`StartMenu.HideContents`) before it asks
+            // for a screen this game does not have yet: the credits, and the online profile
+            // behind "Player Profile". Its buttons are put back at once
+            // (`StartMenu.ShowContents`, the movie's own), so the player is not left on the
+            // bare title picture with no way back. Provisional: the original shows those
+            // screens and puts the menu back when they close.
+            "GameModeController.PushGUIScreen" if first == Some("GUICommunityFeatures") => {
+                self.start_menu_back();
+            }
+            // The start menu's Credits: the credits screen with the game's credits text;
+            // without the text the menu comes straight back. The list of credits the menu
+            // asks for first (`RefreshCreditEntries`: one entry per campaign with credits
+            // of its own) is left empty, which sends it straight here. Provisional: the
+            // exe's handlers (`ShowCreditsMessage`, `RefreshCreditEntriesMessage`) are not
+            // traced; the base game's credits are the ones shown.
+            "GameModePregame.RefreshCreditEntries" => {}
+            "GameModePregame.ShowCredits" => match self.credits_text() {
+                Some(text) if screens.front_end => {
+                    if let Ok(mut shown) = self.shown.lock() {
+                        shown.credits = Some(text);
+                    }
+                    screens.menu = Some(Screen::Credits);
+                }
+                _ => self.start_menu_back(),
+            },
+            // credits.gfx closing itself (a click, a key, its end).
+            "GameModeController.HideGUIScreen" if first == Some("Credits") => {
+                if screens.menu == Some(Screen::Credits) {
+                    screens.menu = None;
+                }
+                if let Ok(mut shown) = self.shown.lock() {
+                    shown.credits = None;
+                }
+            }
+            // A movie asks for a function of another movie to be called ("startmenu2
+            // StartMenu.ShowContents": the credits putting the menu's buttons back).
+            "GameModeController.InvokeCallbackMessage" => {
+                if let Some((movie, path)) = first.and_then(|a| a.split_once(' ')) {
+                    self.stage
+                        .call_in(&format!("{}.gfx", movie.trim()), path.trim(), &[]);
+                }
             }
             "GameModeController.HideGUIScreen" if first == Some("MainMenu") => {
                 if screens.menu == Some(Screen::GameMenu) {
@@ -3022,6 +3082,30 @@ struct Loading {
 /// about 1.3 s at its 30 fps).
 const LOADING_OUTRO_MAX_MS: f64 = 2000.0;
 
+/// A text resource as a string: UTF-16 (either byte order, by its mark) or UTF-8, without
+/// the mark, line ends as single line feeds.
+fn decode_text(data: &[u8]) -> String {
+    let units = |be: bool| {
+        data[2..]
+            .chunks_exact(2)
+            .map(|c| {
+                if be {
+                    u16::from_be_bytes([c[0], c[1]])
+                } else {
+                    u16::from_le_bytes([c[0], c[1]])
+                }
+            })
+            .collect::<Vec<u16>>()
+    };
+    let text = match data {
+        [0xff, 0xfe, ..] => String::from_utf16_lossy(&units(false)),
+        [0xfe, 0xff, ..] => String::from_utf16_lossy(&units(true)),
+        [0xef, 0xbb, 0xbf, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+        _ => String::from_utf8_lossy(data).into_owned(),
+    };
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 /// A screen's `GUI_*` id (script.ldf's `EVENT_TYPE_GUI_OPENED` constants), the inventory on a
 /// container as `GUI_CONTAINER_INVENTORY`. None for screens script.ldf names no id for.
 fn gui_id(s: Screen, container: bool) -> Option<i32> {
@@ -3047,13 +3131,40 @@ fn gui_id(s: Screen, container: bool) -> Option<i32> {
         Screen::Tactics => 23,
         Screen::PartyPicker => 27,
         Screen::LoadTown | Screen::LoadLight | Screen::LoadFade => 14,
-        Screen::Store | Screen::LevelUp | Screen::ItemExamine => return None,
+        Screen::Store | Screen::LevelUp | Screen::ItemExamine | Screen::Credits => return None,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_resources_decode_by_their_byte_order_mark() {
+        let utf16 = |s: &str, be: bool| {
+            let mut d = if be {
+                vec![0xfe, 0xff]
+            } else {
+                vec![0xff, 0xfe]
+            };
+            for u in s.encode_utf16() {
+                d.extend(if be { u.to_be_bytes() } else { u.to_le_bytes() });
+            }
+            d
+        };
+        let text = "<header1>A</header1>\r\nB\r\n";
+        assert_eq!(
+            decode_text(&utf16(text, false)),
+            "<header1>A</header1>\nB\n"
+        );
+        assert_eq!(decode_text(&utf16(text, true)), "<header1>A</header1>\nB\n");
+        assert_eq!(decode_text(b"\xef\xbb\xbfA\rB"), "A\nB");
+        assert_eq!(decode_text(b"plain"), "plain");
+        // An odd byte at the end is dropped, not read past.
+        assert_eq!(decode_text(&[0xff, 0xfe, b'A', 0, b'B']), "A");
+        assert_eq!(decode_text(&[0xff, 0xfe]), "");
+        assert_eq!(decode_text(&[]), "");
+    }
 
     #[test]
     fn a_heard_cutscene_line_shows_no_text_without_subtitles() {
