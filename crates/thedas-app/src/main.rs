@@ -58,11 +58,13 @@ mod live;
 mod pad;
 mod paddev;
 mod padplay;
+mod report;
 mod reticle;
 mod saves;
 mod screens;
 mod talkcam;
 mod ui;
+mod upload;
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -599,6 +601,45 @@ struct App {
     intro_pad_held: bool,
     /// A zoom key a step holds down (`key pagedown MS`): +1 in, -1 out, 0 none.
     zoom_key: f32,
+    /// Issue reports (F8): the snapshots, input and frame times they keep (see [`report`]).
+    recorder: report::Recorder,
+    /// A report under way: its screenshot and the player's note, to come, and the client
+    /// that asked for it (`--control`'s `report`), waiting for where it went.
+    report_wait: Option<ReportWait>,
+    /// The settings the game was started with, for reports.
+    started_with: J,
+}
+
+/// Frames a report's text box may take to come up before it is asked again.
+const NOTE_REASK_FRAMES: u32 = 30;
+/// How many times it may fail to come up before the report is kept without a note.
+const NOTE_TRIES: u32 = 10;
+
+/// Asks for a report's note in the game's own text box: Send when reports go to the
+/// project's Discord (see [`upload`]), else Save. Either button keeps the report: an
+/// accidental one costs a folder, a lost one costs the bug.
+fn ask_report_note(ui: &mut ui::UiLayer) {
+    let (prompt, ok, other) = match upload::webhook() {
+        Some(_) => (report::NOTE_PROMPT_SEND, "Send report", "Keep here"),
+        None => (report::NOTE_PROMPT, "Save report", "Save, no note"),
+    };
+    ui.ask_text(report::NOTE_ID, prompt, "", ok, other);
+}
+
+/// What a report under way waits for.
+struct ReportWait {
+    shot: Option<std::sync::mpsc::Receiver<J>>,
+    reply: Option<std::sync::mpsc::Sender<J>>,
+    /// The note is asked in the game's text box: frames since it was last asked (or seen
+    /// up), and how many times it has not come up.
+    note_asked: Option<(u32, u32)>,
+    /// The report goes on to the project's Discord once written, if set up (see
+    /// [`upload`]); the text box's second button keeps it here.
+    send: bool,
+    /// The game is to pause once the screenshot is in (so the frame shows no "Paused"),
+    /// and whether the report paused it (it carries on when the report is done).
+    pause: bool,
+    paused_it: bool,
 }
 
 /// What the window's surface gave a redraw.
@@ -1057,6 +1098,7 @@ impl App {
         let dt = self.last.elapsed().as_secs_f64() * 1000.0;
         self.serve_control(dt);
         self.pad_frame(dt);
+        self.report_frame(dt);
         self.update();
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
@@ -1171,6 +1213,16 @@ impl App {
         );
         self.requests.append(&mut g.ui.requests);
         for a in g.ui.take_text_answers() {
+            // OK sends (or saves) the report with the note; the other button keeps it on
+            // this computer only, unsent.
+            if a.id == report::NOTE_ID && self.recorder.busy() {
+                if let Some(w) = self.report_wait.as_mut() {
+                    w.note_asked = None;
+                    w.send = a.accepted;
+                }
+                self.recorder.note(Some(a.text));
+                continue;
+            }
             log::info!(
                 "text box {}: {} {:?}",
                 a.id,
@@ -1286,6 +1338,16 @@ impl App {
         );
         self.requests.append(&mut g.ui.requests);
         for a in g.ui.take_text_answers() {
+            // OK sends (or saves) the report with the note; the other button keeps it on
+            // this computer only, unsent.
+            if a.id == report::NOTE_ID && self.recorder.busy() {
+                if let Some(w) = self.report_wait.as_mut() {
+                    w.note_asked = None;
+                    w.send = a.accepted;
+                }
+                self.recorder.note(Some(a.text));
+                continue;
+            }
             log::info!(
                 "text box {}: {} {:?}",
                 a.id,
@@ -1337,6 +1399,250 @@ impl App {
         write_png(&path, w, h, &pixels)?;
         println!("wrote {} (camera {})", path.display(), self.camera.spec());
         Ok(())
+    }
+
+    /// An issue report (F8, the pad's two sticks clicked, or a client's `report`): the
+    /// frame as presented, the game now and about a minute back, and what the game knows of
+    /// itself, then the player's note (see [`report`]). The game pauses while the note is
+    /// asked for. `note` answers the question instead (a client's); `reply` hears where the
+    /// report went once it is written.
+    fn report(&mut self, note: Option<String>, reply: Option<std::sync::mpsc::Sender<J>>) {
+        if self.recorder.busy() {
+            if let Some(r) = reply {
+                let _ = r.send(control::failure("a report is already under way"));
+            }
+            return;
+        }
+        let mut info = json!({
+            "build": report::build_info(),
+            "settings": self.started_with,
+            "game": self.status(),
+        });
+        if let Some(g) = self.gfx.as_ref() {
+            let a = g.ctx.adapter.get_info();
+            info["gpu"] = json!({
+                "name": a.name,
+                "backend": format!("{:?}", a.backend),
+                "device_type": format!("{:?}", a.device_type),
+                "driver": a.driver,
+                "driver_info": a.driver_info,
+                "vendor": a.vendor,
+                "device": a.device,
+            });
+            info["window"] = json!({
+                "size": [g.config.width, g.config.height],
+                "scale_factor": g.window.scale_factor(),
+                "format": format!("{:?}", g.config.format),
+            });
+        }
+        let mut now_save = None;
+        let mut trace = None;
+        let mut pause = false;
+        if let Some(live) = self.live.as_mut() {
+            if !live.front_end {
+                let sim = live.sim();
+                info["game"]["training_mode"] = json!(sim.world.training.mode);
+                info["game"]["hero"] = json!(sim.world.hero.map(|h| sim.display_name(h)));
+                info["game"]["area_name"] = json!(sim.world.area.map(|a| sim.display_name(a)));
+                info["game"]["coverage"] = sim.world.trace.coverage();
+                match sim.save_json() {
+                    Ok(b) => now_save = Some(b),
+                    Err(e) => log::warn!("report: the game's state: {e}"),
+                }
+                trace = serde_json::to_value(&sim.world.trace.recent).ok();
+                drop(sim);
+                pause = !live.paused;
+            }
+        }
+        let dir = self.recorder.start(now_save, trace, info);
+        log::info!("report: started in {}", dir.display());
+        // The frame as presented, read back as the next one is drawn; drawn again
+        // offscreen where the surface cannot be read back.
+        let readable = self
+            .gfx
+            .as_ref()
+            .is_some_and(|g| g.config.usage.contains(wgpu::TextureUsages::COPY_SRC));
+        let shot = if readable {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.frame_requests.push((tx, 1));
+            Some(rx)
+        } else {
+            let png = self
+                .screenshot_rgba()
+                .and_then(|f| thedas_ui::stage::encode_png(&f).context("encoding the screenshot"));
+            self.recorder.screenshot(png);
+            None
+        };
+        // The player's note: a client's, else asked in the game's own text box (none
+        // before a game: the report is kept without one).
+        let in_game = self.live.as_ref().is_some_and(|l| !l.front_end)
+            && self.screens.as_ref().is_some_and(|s| !s.front_end);
+        let mut note_asked = None;
+        match (report::preset_note(note), self.gfx.as_mut()) {
+            (Some(text), _) => self.recorder.note(Some(text)),
+            (None, Some(g)) if in_game => {
+                ask_report_note(&mut g.ui);
+                note_asked = Some((0, 0));
+            }
+            (None, _) => self.recorder.note(Some(String::new())),
+        }
+        self.report_wait = Some(ReportWait {
+            shot,
+            reply,
+            note_asked,
+            send: true,
+            pause,
+            paused_it: false,
+        });
+    }
+
+    /// One frame of reports: a snapshot of the game when one is due, and a report under
+    /// way finished once its screenshot and note are in.
+    fn report_frame(&mut self, dt_ms: f64) {
+        self.recorder.frame(dt_ms);
+        let now = Instant::now();
+        if self.recorder.snapshot_due(now) {
+            self.take_snapshot(now);
+        }
+        let Some(w) = self.report_wait.as_mut() else {
+            return;
+        };
+        if let Some(rx) = &w.shot {
+            match rx.try_recv() {
+                Ok(frame) => {
+                    w.shot = None;
+                    let png = match frame["png"].as_str() {
+                        Some(b64) => {
+                            use base64::Engine as _;
+                            base64::engine::general_purpose::STANDARD
+                                .decode(b64)
+                                .context("decoding the screenshot")
+                        }
+                        None => Err(anyhow::anyhow!(
+                            "{}",
+                            frame["error"].as_str().unwrap_or("no frame")
+                        )),
+                    };
+                    self.recorder.screenshot(png);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    w.shot = None;
+                    self.recorder
+                        .screenshot(Err(anyhow::anyhow!("the frame was never read back")));
+                }
+            }
+        }
+        // The frame is in: the game holds still while the player writes.
+        if w.pause && w.shot.is_none() {
+            w.pause = false;
+            if let Some(live) = self.live.as_mut().filter(|l| !l.paused) {
+                live.paused = true;
+                w.paused_it = true;
+            }
+        }
+        // The text box can be lost (a script's message box shown over it, or no popup
+        // layer up yet): with none up a moment after asking it is asked again, and while
+        // another box keeps it out, or after a few tries, the report is kept without a note
+        // so the game never waits on it.
+        if let (Some((frames, tries)), Some(g)) = (w.note_asked.as_mut(), self.gfx.as_mut()) {
+            let up = g.ui.stage.dialog_up();
+            let ours = up
+                && matches!(
+                    g.ui.stage.bridge.value("GUIPopupLayer.DialogBoxText"),
+                    Some(thedas_ui::UiValue::String(t))
+                        if t == report::NOTE_PROMPT || t == report::NOTE_PROMPT_SEND
+                );
+            *frames += 1;
+            if ours {
+                *frames = 0;
+            } else if *frames > NOTE_REASK_FRAMES {
+                *frames = 0;
+                *tries += 1;
+                if *tries > NOTE_TRIES {
+                    log::warn!("report: the note could not be asked; kept without one");
+                    w.note_asked = None;
+                    self.recorder.note(Some(String::new()));
+                } else if !up {
+                    ask_report_note(&mut g.ui);
+                }
+            }
+        }
+        let Some(dir) = self.recorder.finish() else {
+            return;
+        };
+        let Some(w) = self.report_wait.take() else {
+            return;
+        };
+        let reply = w.reply;
+        if w.paused_it {
+            if let Some(live) = self.live.as_mut() {
+                live.paused = false;
+            }
+        }
+        // Sent on when the player has set that up (see [`upload`]).
+        if let (true, Some(d), Some(url)) = (w.send, dir.as_ref(), upload::webhook()) {
+            upload::send_in_background(d.clone(), url);
+        }
+        if let Some(r) = reply {
+            let _ = r.send(match dir {
+                Some(d) => json!({ "ok": true, "dir": d.display().to_string() }),
+                None => json!({ "ok": true, "cancelled": true }),
+            });
+        }
+    }
+
+    /// Keeps a snapshot of the game for reports, as a save would hold it: not while a level
+    /// loads, before a game, during character creation or while saving is refused (a
+    /// training lesson). Only reads the simulation (no PRESAVE event).
+    fn take_snapshot(&mut self, now: Instant) {
+        let in_chargen = self
+            .screens
+            .as_ref()
+            .is_some_and(|s| s.shown().contains(&screens::Screen::CharGen));
+        let Some(live) = self.live.as_ref() else {
+            self.recorder.skip_snapshot(now);
+            return;
+        };
+        if live.front_end || live.loading() || in_chargen || self.report_wait.is_some() {
+            self.recorder.skip_snapshot(now);
+            return;
+        }
+        let started = Instant::now();
+        let sim = live.sim();
+        if sim.saving_blocked().is_some() {
+            drop(sim);
+            self.recorder.skip_snapshot(now);
+            return;
+        }
+        let time_ms = sim.world.time_ms;
+        let area = sim
+            .world
+            .area
+            .and_then(|a| sim.world.get(a))
+            .map(|o| o.tag.clone())
+            .unwrap_or_default();
+        let saved = sim.save_json();
+        drop(sim);
+        match saved {
+            Ok(save) => {
+                log::debug!(
+                    "report: snapshot at {time_ms} ms in {area}, {} bytes, {:.1} ms",
+                    save.len(),
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+                self.recorder.keep(report::Snapshot {
+                    taken: now,
+                    time_ms,
+                    area,
+                    save,
+                });
+            }
+            Err(e) => {
+                log::warn!("report: snapshot: {e}");
+                self.recorder.skip_snapshot(now);
+            }
+        }
     }
 
     /// Whether the line the game is on has a voice-over the audio can play (see
@@ -1435,7 +1741,10 @@ impl App {
 
     /// A key pressed (not a repeat). Returns whether the game should close.
     fn key_down(&mut self, code: KeyCode) -> bool {
+        self.recorder.input(format!("key {code:?}"));
         match code {
+            // An issue report (see [`report`]): ours, not the original's.
+            KeyCode::F8 => self.report(None, None),
             // Escape closes the screen up, else opens the game menu over a game; the viewer
             // closes. The start menu stays (its Exit quits).
             KeyCode::Escape => match self.screens.as_mut() {
@@ -1521,6 +1830,7 @@ impl App {
     /// The mouse wheel turns `steps` (up positive): over the interface, or with a screen up,
     /// the list or text under the mouse scrolls; elsewhere the game camera zooms.
     fn wheel(&mut self, steps: f64) {
+        self.recorder.input(format!("wheel {steps:.2}"));
         let (x, y) = self.cursor;
         if let Some(g) = self.gfx.as_mut() {
             let on_ui = self
@@ -1551,6 +1861,10 @@ impl App {
     /// The left button goes down or up at the cursor.
     fn left_button(&mut self, pressed: bool) {
         let (x, y) = self.cursor;
+        self.recorder.input(format!(
+            "{} {x:.0},{y:.0}",
+            if pressed { "press" } else { "release" }
+        ));
         // A click skips a cutscene. Provisional: the game's own skip key is not traced.
         if pressed
             && self
@@ -1611,6 +1925,10 @@ impl App {
     /// The right button goes down or up at the cursor.
     fn right_button(&mut self, pressed: bool) {
         let (x, y) = self.cursor;
+        self.recorder.input(format!(
+            "{} {x:.0},{y:.0}",
+            if pressed { "rpress" } else { "rrelease" }
+        ));
         // Over the interface (or with a menu up) a right click is the interface's (an item's
         // actions); elsewhere it turns the camera.
         if pressed {
@@ -1934,6 +2252,13 @@ impl App {
                     Some(Err(e)) => control::failure(e),
                     None => control::failure("not playing"),
                 }),
+                // An issue report, as F8 makes one; `"note"` is the player's note (none
+                // asks, as F8 does). The reply comes when it is written.
+                "report" => {
+                    let note = r.body["note"].as_str().map(str::to_string);
+                    self.report(note, Some(r.reply.clone()));
+                    None
+                }
                 "input" => match parse_steps(r.body["steps"].as_str().unwrap_or_default()) {
                     Ok(steps) => {
                         self.remote.push_back(Remote {
@@ -2085,8 +2410,13 @@ impl App {
         let mut pad = std::mem::take(&mut self.pad);
         for m in pad.frame(&state, self, dt_ms) {
             log::info!("pad: {m}");
+            self.recorder.input(format!("pad: {m}"));
         }
+        let report = std::mem::take(&mut pad.report);
         self.pad = pad;
+        if report {
+            self.report(None, None);
+        }
     }
 
     /// Acts on what the start menu and the game menu asked (see [`ui::FrontEnd`]): a new game
@@ -2100,8 +2430,11 @@ impl App {
                     self.quit = true;
                     continue;
                 }
-                // The issue report (the reporting stream makes it, as F8 does).
-                ui::FrontEnd::Report => continue,
+                // The game menu's Report Issue: an issue report, as F8 makes one.
+                ui::FrontEnd::Report => {
+                    self.report(None, None);
+                    continue;
+                }
                 ui::FrontEnd::NewGame => live::Start::NewGame,
                 ui::FrontEnd::Load(b) => live::Start::SaveBytes(b),
                 ui::FrontEnd::StartMenu => live::Start::Menu,
@@ -2214,6 +2547,8 @@ impl App {
         self.screens = Some(screens::Screens::new(l.front_end));
         l.async_loads = true;
         self.live = Some(l);
+        // The snapshots were of the game this one replaces.
+        self.recorder.forget();
     }
 
     fn fail(&mut self, event_loop: &ActiveEventLoop, e: anyhow::Error) {
@@ -3479,10 +3814,9 @@ fn parse_step(s: &str) -> Result<Step> {
 const DEFAULT_AREA: &str = "lgt101d";
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(
+    report::init_logging(env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
-    )
-    .init();
+    ));
     let args = Args::parse();
     if let Some(secs) = args.pad_probe {
         paddev::probe(secs);
@@ -4245,6 +4579,24 @@ fn main() -> Result<()> {
             .flatten(),
         intro_pad_held: false,
         zoom_key: 0.0,
+        recorder: report::Recorder::new(report::Recorder::default_dir()),
+        report_wait: None,
+        started_with: json!({
+            "size": args.size,
+            "shaders": args.shaders,
+            "detail": args.detail,
+            "frame_effects": args.frame_effects,
+            "language": args.language,
+            "module": args.module,
+            "install": report::install_info(&install, &args.language),
+            "no_intro": args.no_intro,
+            "audio": !(args.no_audio || std::env::var_os("THEDAS_NO_AUDIO").is_some()),
+            "control": args.control.is_some(),
+            "env": (["THEDAS_ASYNC_LOADS", "THEDAS_HIDDEN_WINDOW", "THEDAS_NO_LOAD_MOVIE"]
+                .iter()
+                .filter(|v| std::env::var_os(v).is_some())
+                .collect::<Vec<_>>()),
+        }),
         audio: {
             let off = args.no_audio
                 || std::env::var_os("THEDAS_NO_AUDIO").is_some()
