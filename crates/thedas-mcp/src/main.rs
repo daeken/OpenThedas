@@ -503,6 +503,8 @@ fn value_json(v: &Value) -> J {
         Value::Vector(v) => json!(v),
         Value::Engine { ty, handle } => json!({ "engine": ty, "handle": handle }),
         Value::Array { items, .. } => J::Array(items.iter().map(value_json).collect()),
+        // Lives only on the VM's stack; a host never receives one.
+        Value::Ref(_) => J::Null,
     }
 }
 
