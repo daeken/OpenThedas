@@ -78,17 +78,16 @@ impl Sim {
             facing
         };
         // A place that is not walkable ground (beyond the walkable area: a held stick aims
-        // there) is not walked onto: the move goes to the walkable ground nearest it, or
-        // failing that along the line towards it as far as the ground is walkable. A route
+        // there) is not walked onto: the move goes along the line towards it as far as the
+        // ground stays walkable, so the walker stops at the edge on its own level. (A route
         // otherwise ends at the place asked for, and a move without a route takes a straight
-        // line. Provisional: DAOrigins.exe moves the player's character with its physics
+        // line.) A walker already off the walkable ground makes for the nearest of it.
+        // Provisional: DAOrigins.exe moves the player's character with its physics
         // controller over the walkable mesh.
         let to = match self.nav_grid(area) {
-            Some(g) if !crate::nav::on_walkable(&g, to) => {
-                crate::nav::nearest_walkable_point(&g, to)
-                    .or_else(|| crate::nav::walkable_reach(&g, from, to))
-                    .unwrap_or(from)
-            }
+            Some(g) if !crate::nav::on_walkable(&g, to) => crate::nav::walkable_reach(&g, from, to)
+                .or_else(|| crate::nav::nearest_walkable_point(&g, to))
+                .unwrap_or(from),
             _ => to,
         };
         let mut c = command(
