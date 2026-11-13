@@ -11,7 +11,8 @@
 //!
 //! Provisional: the conditions the trace could not name (creature +0xb80, +0x42c, +0x421:
 //! here a living, active hostile creature has its ring while it fights or the mouse is
-//! over it, and none is shown while a conversation or a cutscene is up); "selected" is the controlled creature; the neutral
+//! over it, and none is shown while a conversation, a cutscene or character creation is
+//! up); "selected" is the controlled creature; the neutral
 //! ring (30002) and the backstab rows (30025 on) are not shown; which size variant a
 //! creature takes (the row's medium and large models are taken to be for bodies wider than
 //! the number beside the model before them); and where the pass falls in the frame (the
@@ -40,7 +41,12 @@ pub fn row(sim: &Sim, o: &Object, hovered: Option<ObjectId>) -> Option<i32> {
     if o.kind != ObjectKind::Creature || o.dead || !o.active {
         return None;
     }
-    if sim.world.cutscene.is_some() || sim.conversation_line().is_some() {
+    // The executable asks the game mode first (0x6aac50: no ring when its check fails).
+    // Provisional: taken to fail in a cutscene, a conversation and character creation.
+    if sim.world.cutscene.is_some()
+        || sim.conversation_line().is_some()
+        || sim.world.chargen.is_some()
+    {
         return None;
     }
     let party = thedas_sim::engine::party_of(sim);
