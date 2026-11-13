@@ -8,7 +8,7 @@
 //! ([`skeleton`]): tree set-up and the branch skeleton, on the rotation frames of [`frame`].
 //! Stage 3 ([`geometry`]): branch tubes and branch LOD. Stage 4 ([`fronds`]): fronds. Stage 5
 //! ([`leaves`]): leaves. [`generate`] runs them all in the order of 5.1; [`mesh::TreeMesh`]
-//! flattens the result for drawing (stage 7).
+//! flattens the result for drawing (stage 7); [`wind::Wind`] animates the wind (7.11).
 
 pub mod frame;
 pub mod fronds;
@@ -17,6 +17,7 @@ pub mod leaves;
 pub mod limits;
 pub mod mesh;
 pub mod skeleton;
+pub mod wind;
 
 pub use skeleton::{Branch, Bud, Flare, Guide, Skeleton, Vertex, Wind, grow};
 

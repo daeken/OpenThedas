@@ -674,6 +674,12 @@ impl Sim {
     }
 
     /// The open conversation, for presentation.
+    /// The conversation line whose cutscene is playing or last played (the line that
+    /// queued it; the conversation may have moved on to a later line meanwhile).
+    pub fn cutscene_line(&self) -> Option<usize> {
+        self.talk.as_ref().and_then(|c| c.cut_from)
+    }
+
     pub fn conversation_line(&self) -> Option<OpenLine<'_>> {
         let c = self.talk.as_ref().filter(|c| !c.ended)?;
         let node = c.line.and_then(|l| c.dlg.nodes.get(l));

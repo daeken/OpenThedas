@@ -1174,3 +1174,56 @@ self-shadow map). DA:O's shaders never sample this layer (7.6), so it can be lef
   (corners k[0..7]): s ← lerp(k[2], k[0], s), t ← lerp(k[5], k[1], t). A section without a
   shadow entry uses k = (1, 1, 0, 1, 0, 0, 1, 0).
 - With texture flip on (7.1), t is negated, as for the other layers.
+
+### 7.11 Wind animation (the computation)
+
+The wind is a small simulation separate from tree growth. Each step gives N wind matrices
+(7.6, 7.7) and K leaf rock and rustle angles (7.2, 7.3). DA:O uses N = 6 and K = 8.
+
+**Settings.** Strength S (clamped to [0, 1] when set) and a direction (normalised when set,
+unless zero); response p and response limit a; maximum bend B (degrees); branch and leaf
+exponents; gust strength range, duration range and frequency; and four oscillators (branch
+horizontal, branch vertical, leaf rocking, leaf rustling), each with a low-wind angle, a
+high-wind angle, a low-wind speed and a high-wind speed.
+
+**State**, all zero at the start: the last time; four *followers* (strength, direction x, y,
+z), each with a current value, a wanted value, its last step δ₀ and that step's time dt₀; the
+gust strength and gust stop time; and each oscillator's own clock θ. Setting the direction
+sets the three direction followers' wanted values; it does not move their current values.
+
+**One step to time t:**
+
+1. dt = t − last time; last time = t.
+2. Gusts. If t > gust stop time: gust = 0; then draw r₁ = rand/RAND_MAX (C runtime); if
+   frequency · dt > r₁: gust = lerp over the strength range by another draw, and gust stop
+   time = t + a duration by a third draw (each as min + rand · (max − min)/RAND_MAX). With
+   frequency 0, as in every DA:O level, no gust ever starts.
+3. The strength follower's wanted value = clamp(S + gust, 0, 1). Advance it, then clamp its
+   current value to [0, 1]. Advance the three direction followers.
+   **Advancing a follower:** h = min(dt, 0.03); δ = p · h · (wanted − current). If a ≠ 0:
+   when |δ| > |δ₀| and h > 0 and dt₀ > 0, acc = clamp(δ/h − δ₀/dt₀, −a, a) and
+   δ = δ₀ + acc · h; then δ₀ = δ and dt₀ = h. Finally current += δ.
+4. s = the strength follower's current value. Branch strength s_b = s^(branch exponent); leaf
+   strength s_l = s^(leaf exponent).
+5. Bend = s_b · B · |d|, with d the direction followers' current values (|d| its length).
+6. Oscillators, each with its strength (s_b for the two branch ones, s_l for the two leaf
+   ones): angle = lerp(low angle, high angle, strength); speed = lerp(low speed, high speed,
+   strength); θ += dt · speed (the full dt, not h); output i = angle · sin(θ + i) for
+   i = 0 … N − 1 (branch) or 0 … K − 1 (leaf), with i added in radians.
+7. Wind matrices. w = −atan2(d.x, d.y); x = −cos w; y = −sin w. For each i:
+   Mᵢ = R(bend + vertical output i, axis (x, y, 0)) · R(horizontal output i, axis (−y, x, 0)),
+   where R is the unit-axis rotation matrix of 2.2 (angle in degrees) and the product is the
+   ordinary 3×3 product, completed to 4×4 with a unit diagonal.
+8. Leaf angles: rock angle i = the rocking oscillator's output i, rustle angle i = the
+   rustling oscillator's output i, in degrees.
+
+**How DA:O drives it** (traced): N = 6, K = 8; response 0.4, limit 0.01; maximum bend 35;
+both exponents 2; oscillators as (low angle, high angle, low speed, high speed): the two
+branch ones (0.3, 3, 6, 3) and (0.1, 4, 8, 4) (which is horizontal and which vertical is
+taken in that order, provisional), leaf rocking (1, 2, 2, 10), leaf rustling (3, 1, 2, 20).
+Strength (clamped to [0, 1]) and direction come from the level's wind file; its gust
+frequency is 0 everywhere. Five copies of this simulation run with their times 0.2 s apart
+(t, t + 0.2, …, t + 0.8) and placements take them in turn; t accumulates the frame times
+while the game is not paused. Each frame the game copies matrix m's sixteen numbers in row
+order into `g_amWindMatrices` (the shaders use a point as a row vector times the matrix,
+7.6) and (rock i, rustle i) into `g_vLeafAngles[i]` in radians.

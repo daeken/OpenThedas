@@ -36,7 +36,7 @@ so an untraced item starts with a trace, not with a guess.
 | --- | --- | --- |
 | Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 167 (`SIM-`), plus ability coverage by family |
 | Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 96 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
-| Rendering | [gaps/rendering.md](gaps/rendering.md) | 151 (`RND-`) |
+| Rendering | [gaps/rendering.md](gaps/rendering.md) | 150 (`RND-`) |
 | Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 186 (`UI-`), plus the movies never opened and the values no screen gets answered |
 | Audio | [gaps/audio.md](gaps/audio.md) | 55 (`AUD-`) |
 | Cameras, cutscene presentation, startup | [gaps/cameras-cutscenes.md](gaps/cameras-cutscenes.md) | 44 (`CAM-`) |
@@ -101,8 +101,8 @@ these, so they are the places where one person or stream can take a large, separ
   absent (`RND-075` to `RND-078`).
 - **Effects on creatures and items.** Spell effects, crust effects and weapon glows are not
   drawn; only effects placed at a location are (`RND-094`).
-- **Animation blending.** No blend weights, crossfades, additive layers, inverse kinematics or
-  root motion (`RND-064` to `RND-068`).
+- **Animation blending.** No blend weights, crossfades, inverse kinematics or root motion
+  (`RND-064` to `RND-068`).
 - **Faces.** No facial animation or lip sync anywhere, and head-morph bone offsets are read but
   not applied (`RND-050`, `RND-069`, `RND-070`, `FMT-027`, `AUD-052`, `CAM-013`).
 - **Lighting.** Level geometry still uses an older light-picking rule; spot lights, animated

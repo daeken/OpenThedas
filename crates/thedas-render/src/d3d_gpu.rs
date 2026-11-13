@@ -121,6 +121,11 @@ pub(crate) struct D3dPass {
     /// index range to draw and the alpha reference, `None` when the part is not drawn.
     tree_lods: Vec<Option<crate::scene::TreeLod>>,
     tree_frame: std::sync::Mutex<Vec<Option<(u32, u32, f32)>>>,
+    /// The level's five winds for its trees, 0.2 s apart (DAOrigins.exe 0x5365c0); empty
+    /// when the level has no wind file.
+    winds: std::sync::Mutex<Vec<thedas_formats::speedtree_gen::wind::Wind>>,
+    /// The time the winds were last stepped to.
+    wind_time: std::sync::Mutex<f32>,
     /// The level's sun (direction, colour), if it has one.
     sun: Option<(Vec3, Vec3)>,
     fog: [[f32; 4]; 2],
@@ -1720,6 +1725,13 @@ impl D3dPass {
                 .map(|i| scene.tree_lods.get(&i).cloned())
                 .collect(),
             tree_frame: std::sync::Mutex::new(vec![None; scene.draws.len()]),
+            wind_time: std::sync::Mutex::new(0.0),
+            winds: std::sync::Mutex::new(match scene.wind {
+                Some((strength, direction)) if !scene.tree_constants.is_empty() => (0..5)
+                    .map(|_| thedas_formats::speedtree_gen::wind::Wind::dao(strength, direction))
+                    .collect(),
+                _ => Vec::new(),
+            }),
             ambients: scene
                 .draws
                 .iter()
@@ -1834,6 +1846,7 @@ impl D3dPass {
                 shadow: crate::d3d::NO_SHADOW_DATA,
                 partition: None,
                 tree: None,
+                winds: &[],
             };
             let mut data = vec![0u8; slot_size];
             for (table, base) in [(program.vs.ctab.as_ref(), 0), (program.ps.ctab.as_ref(), 3)] {
@@ -2068,6 +2081,44 @@ impl D3dPass {
         // Only the draws in view get constants (and are drawn); a skinned draw's bounds
         // follow its bones (see [`skinned_sphere`]).
         let view_proj = projection * view;
+        // The winds step to this frame's time, each 0.2 s after the last; a paused clock
+        // leaves them where they are.
+        let wind_from = {
+            let mut last = self.wind_time.lock().unwrap_or_else(|e| e.into_inner());
+            let from = *last;
+            if !warm {
+                *last = time;
+            }
+            from
+        };
+        let winds: Vec<crate::d3d::WindFrame> = self
+            .winds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+            .enumerate()
+            .map(|(k, w)| {
+                if !warm {
+                    // The simulation is built for frame-sized steps (its followers move
+                    // by at most 0.03 s a step), so a jump in time (a headless capture at
+                    // a late time, a long stall) is walked in thirtieths of a second, up
+                    // to a minute of them.
+                    let mut t = wind_from.max(time - 60.0);
+                    while time - t > 0.05 {
+                        t += 1.0 / 30.0;
+                        w.advance(t + 0.2 * k as f32);
+                    }
+                    w.advance(time + 0.2 * k as f32);
+                }
+                let rad = std::f32::consts::PI / 180.0;
+                crate::d3d::WindFrame {
+                    matrices: w.matrices(),
+                    leaf_angles: w
+                        .leaf_angles()
+                        .map(|(rock, rustle)| [rock * rad, rustle * rad]),
+                }
+            })
+            .collect();
         // The trees' levels of detail for this camera.
         let mut tree_frame = self.tree_frame.lock().unwrap_or_else(|e| e.into_inner());
         if !warm {
@@ -2164,6 +2215,7 @@ impl D3dPass {
                 shadow,
                 partition: None,
                 tree: self.trees.get(d.draw).and_then(|t| t.as_ref()),
+                winds: &winds,
             };
             // The constants that stay as the draw was made are filled once (see
             // [`ConstantContext::per_frame`]); each frame refills the rest over them.
@@ -2426,6 +2478,7 @@ impl D3dPass {
                     shadow: crate::d3d::NO_SHADOW_DATA,
                     partition: Some(partitions[k].view_proj),
                     tree: None,
+                    winds: &[],
                 };
                 for (table, base) in [(program.vs.ctab.as_ref(), 0), (program.ps.ctab.as_ref(), 3)]
                 {
