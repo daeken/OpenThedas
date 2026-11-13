@@ -645,6 +645,13 @@ impl UiMovie {
             .with_viewport_dimensions(size.0, size.1, stage_scale(size, authored))
             .with_scale_mode(StageScaleMode::NoScale, true)
             .with_autoplay(true)
+            // The whole movie is loaded before its first frame runs. Ruffle otherwise loads
+            // it a frame's worth of time at a go; on a slow start (a debug build, a busy
+            // machine) frame one was not in by the time the game starts the scene, the
+            // start call found nothing to call, and the movie then started itself as in a
+            // standalone Flash player: label names for text, test content (popuplayer.gfx's
+            // "Sell how many items?" box) and art left where it was authored.
+            .with_load_behavior(ruffle_core::LoadBehavior::Blocking)
             .with_movie(movie)
             .build();
         if let Ok(mut p) = player.lock() {
