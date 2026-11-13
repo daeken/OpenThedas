@@ -17,6 +17,7 @@
 
 use crate::sim::Sim;
 use serde::{Deserialize, Serialize};
+use thedas_script::vm::ObjectId;
 
 /// The training under way: its mode (0 none), the step shown (0 none), and the training event
 /// (`EVENT_TYPE_TRAINING_*`) the step waits for, with the argument it must carry (0 any).
@@ -56,7 +57,8 @@ impl Sim {
             ..Default::default()
         };
         if mode != 0 {
-            self.raise_training_event("TRAINING_BEGIN", mode);
+            let module = self.world.module;
+            self.raise_training_event("TRAINING_BEGIN", mode, module);
         }
     }
 
@@ -85,7 +87,11 @@ impl Sim {
         // Provisional: the exe's 0x693290 does not clear it; a move order held down would
         // otherwise post the event every frame.
         self.world.training.expected = 0;
-        self.raise_training_event(&name, t.mode);
+        // The step's events run on the main controlled creature, not the module
+        // (0x693290 targets 0x5d5cc0(), the player's main creature), and only for the
+        // event the step waits for (+0x9c, checked above).
+        let target = self.world.controlled().or(self.world.hero);
+        self.raise_training_event(&name, t.mode, target);
         true
     }
 
@@ -103,24 +109,26 @@ impl Sim {
             .then_some("a training tutorial is under way (it disables saving)")
     }
 
-    /// Runs `genev_tutorial` on the module for training event `name` (`TRAINING_BEGIN`
-    /// included), its integer the mode, now, as DAOrigins.exe does: 0x693290 (at 0x693362)
+    /// Runs `genev_tutorial` on `target` for training event `name`, its integer the mode,
+    /// now: `TRAINING_BEGIN` on the module (0x692e90), a step's events on the main
+    /// controlled creature (0x693290 targets 0x5d5cc0(); sim's trace,
+    /// equip-queue-and-disabled-events-trace.md). As DAOrigins.exe does: 0x693290 (at 0x693362)
     /// and 0x692e90 call 0x6985f0, which runs the script in the same call through the
     /// script VM (0xa31e70 -> 0xa31d00 -> the interpreter 0xa301b0, at 0x6986a0); nothing
     /// is queued. So the script's `BeginTrainingStep` (0x663760 -> 0x693190, which writes
     /// the next expected event at once) has armed the next step before the caller goes
-    /// on: an equip that displaces a worn item raises `ITEM_UNEQUIPPED`, then
-    /// `ITEM_EQUIPPED`, and the second finds the step the first armed. Reached from inside
+    /// on: a step's event that arms the next lets an event raised right after it (in the
+    /// same action) find that step. Reached from inside
     /// a running script the run nests (the VM's depth at +0x64; it refuses a tenth level,
     /// 0xa2dc53), as the simulation's other engine-raised events do. Not followed: the
     /// module's set of disabled event types (module+0x28c) that 0x6985f0 checks first.
-    fn raise_training_event(&mut self, name: &str, mode: i32) {
-        let Some(module) = self.world.module else {
+    fn raise_training_event(&mut self, name: &str, mode: i32, target: Option<ObjectId>) {
+        let Some(target) = target else {
             return;
         };
         let mut ev = self.new_event(name, self.world.hero);
         ev.ints = vec![mode];
-        self.deliver(module, ev, Some(TRAINING_SCRIPT.to_string()));
+        self.deliver(target, ev, Some(TRAINING_SCRIPT.to_string()));
     }
 }
 
@@ -138,6 +146,8 @@ mod tests {
         s.world.trace.keep = true;
         let m = s.world.spawn(crate::world::ObjectKind::Module, "module");
         s.world.module = Some(m);
+        let hero = s.world.spawn(crate::world::ObjectKind::Creature, "player");
+        s.world.hero = Some(hero);
         s
     }
 
@@ -231,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn a_swap_ends_the_unequip_and_the_equip_steps() {
+    fn an_event_finds_the_step_the_one_before_it_armed() {
         let ldf = "int EVENT_TYPE_TRAINING_BEGIN = 1059;\n\
                    int EVENT_TYPE_TRAINING_ITEM_UNEQUIPPED = 1070;\n\
                    int EVENT_TYPE_TRAINING_ITEM_EQUIPPED = 1071;\n\
@@ -241,14 +251,22 @@ mod tests {
         s.world.trace.keep = true;
         let m = s.world.spawn(crate::world::ObjectKind::Module, "module");
         s.world.module = Some(m);
+        let hero = s.world.spawn(crate::world::ObjectKind::Creature, "player");
+        s.world.hero = Some(hero);
         s.add_script(TRAINING_SCRIPT, arms_equip_step());
         s.set_training_mode(5);
         s.begin_training_step(7, 1070, 4);
-        // The equip's unequip of the worn chest piece, then the equip itself, with nothing
-        // run in between: the first arms the step the second ends.
+        // An unequip, then an equip, with nothing run in between: the first arms the step
+        // the second ends (the step's script runs during the first, see
+        // `Sim::raise_training_event`).
         assert!(s.training_event("ITEM_UNEQUIPPED", 4));
         assert_eq!(s.world.training.step, 10);
         assert_eq!(s.world.training.expected, 1071);
         assert!(s.training_event("ITEM_EQUIPPED", 4));
+        // Delivered to the main controlled creature, not the module (0x693290).
+        assert!(s.world.trace.entries.iter().any(|e| matches!(
+            e,
+            crate::trace::TraceEntry::EventDelivered { ty: 1071, target, .. } if *target == hero
+        )));
     }
 }
