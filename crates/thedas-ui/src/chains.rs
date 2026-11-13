@@ -284,7 +284,12 @@ fn listed(
         return Vec::new();
     };
     // A humanoid: the appearance's combat blend tree is the humanoids' (0x69f030).
-    let appearance = o.fields.get("Appearance").copied().unwrap_or(0) as i64;
+    let appearance = o
+        .fields
+        .get("Appearance_Type")
+        .or_else(|| o.fields.get("Appearance"))
+        .copied()
+        .unwrap_or(0) as i64;
     let humanoid = tables.get(APPEARANCES, "").is_some_and(|t| {
         matches!(t.cell_by_hash(APPEARANCE_COMBAT, appearance),
             Some(Cell::String(s)) if s.to_ascii_lowercase().contains("combat_humanoid"))
@@ -516,7 +521,7 @@ mod tests {
         let o = s.world.get_mut(c).unwrap();
         o.properties.insert(PROPERTY_LEVEL, (1.0, 0.0));
         o.fields
-            .insert("Appearance".into(), if humanoid { 1 } else { 2 });
+            .insert("Appearance_Type".into(), if humanoid { 1 } else { 2 });
         o.abilities = abilities.iter().copied().collect();
         (s, c)
     }
