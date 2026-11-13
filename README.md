@@ -10,7 +10,7 @@ repository.
 
 ## Status
 
-Last updated 2026-11-13 15:30 UTC, main 0426459
+Last updated 2026-11-13 16:45 UTC, main b48ed11
 
 For everything that is wrong or missing, in detail and split into items that can be picked up in
 parallel, see [docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md).
@@ -34,6 +34,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
     - cutscenes and conversation lines draw the depth of field and the fades their own tracks ask for, and every conversation gets the original's second depth of field from the game's tables;
     - speaker and listener turn head and eyes to each other, and cutscene actors follow their head-tracking tracks;
     - a cutscene animation's baked root motion moves the actor and stays after the clip (a character who turns stays turned), actors hold their base pose (seated characters sit), and cutscene props, actor visibility and weapon draws are played;
+    - cutscene cameras shake as their shake tracks ask;
     - line cutscene cameras are placed with their cutscene's stage, and ActionJumpToCamera puts the camera on stage cameras: the City Elf Vaughan scene plays as staged shots.
   - Open:
     - cameras and actors linked with LinkToActor are placed (provisional: links use the target's root frame);
@@ -50,6 +51,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - The follow camera resets behind the leader after a load and at the end of a cutscene, as the exe does, and keeps its zoom across loads.
   - Loading screens: a new area, a save load and a new game build on a worker thread while the window keeps presenting the original's loading movie (load_town for a save load, a new game or a change of area list, with the script's hint; load_light for a change within one area list). The screen goes up before the old area goes, as in the exe: a scripted transition is held one update (33 ms, provisional length), the world holds still, its sounds duck and the camera resets as the world comes up. load_town plays its outro in about 1.6 s at 60 fps. A world map journey keeps the map up as its loading screen. Headless captures load within the frame as before; `THEDAS_ASYNC_LOADS=1` uses the worker there too (frames wait for the load), `THEDAS_HIDDEN_WINDOW=1` runs the window unseen for driving it with `--control` (a test hook), and `THEDAS_NO_LOAD_MOVIE=1` leaves the movie out.
   - The field of view narrows from 60° to 42.5° toward the far, tactical end of zoom, as the exe does. Page Up and Page Down zoom.
+  - Creatures glance at the player's character while exploring.
   - Creatures placed by an area stand on its floor, as the exe projects them (this was the "see-through guard" in the Dust Town opening).
 - 🟡 **Combat and simulation**:
   - NWScript VM with a large share of the engine functions; melee and ability timing; threat; AI-driven party; tactics; loot.
@@ -67,6 +69,8 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - The engine raises the mana-or-stamina-depleted, area-load-from-save and module pre-save events. Opening a screen tells the module. The damaged event and eight others were confirmed to come from scripts only.
   - Followers walking with the leader take their formation slots.
   - Visual effects applied at places (the Proving crowd) are exposed to rendering and drawn.
+  - A finishing move lands the kill the rules stored for it, so bosses (whose death is always a finishing move) can die; before this the Dalish origin's bear could not be killed. Provisional: the blow lands when the command ends, not at the animation's hit event.
+  - A walker turned aside by a body no longer walks back to the waypoint it stood on (this stalled the Tower's third floor).
   - Not every script engine function is implemented.
 - 🟡 **Party, inventory, journal and other UI screens**:
   - Wired to the simulation: inventory (with paperdoll and item examine), character record, level-up, store, tactics, journal and codex, options, area map, HUD notifications and the screen tab bar.
@@ -80,6 +84,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Script message boxes show, answer the script, and pass typed text along (the dog-naming prompt works).
   - The auto-pause and show-tutorials options reach the simulation.
   - Level Up shows the member's portrait. In combat each party portrait shows what that member is doing, and hovering a portrait shows the class.
+  - Ability, talent and spell lists are built as the exe builds them. A new codex entry shows the large alert only at the plot priorities the exe uses.
   - Open: screens have not all been audited against the original.
 - 🟡 **Rendering**:
   - Working: areas, terrain, sky, fog, clouds, bloom, colour grading, dynamic sun shadows (Low to High detail) and the original shaders.
@@ -95,25 +100,26 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
     - Trees, bushes and grass are real geometry from a clean-room SpeedTree generator written from our own spec (`docs/speedtree/`): trunks, branches, fronds, leaf cards and mesh leaves, with the game's distance rule for switching to billboards, batched per ground cell. Branches, fronds, leaf cards and mesh leaves draw with the game's own shaders, with its fades between distance levels (#427, #431, #432), and sway by the game's wind simulation fed from the level's wind file (#462, #463, #470). The far billboards are a stand-in that does not fade in, and which wind copy a tree takes is provisional (`RND-075`, `RND-076`).
     - Emitters in a cut-away model do not fade with it.
   - The backend stays on wgpu, and its types are kept inside `thedas-render`.
+  - Every shader, the original's 610 and ours, is checked in tests against wgpu's translation for Direct3D 12, Vulkan and OpenGL. On a machine that offers only OpenGL (some virtual machines) the game runs there; an effect the backend refuses is logged once and left out. Untested on real OpenGL hardware.
 - 🟡 **Audio**:
   - Merged:
     - playback: FMOD event (`.fev`) and bank (`.fsb`) playback, mixer, the exe's slider-to-dB volume mapping, event and sound-definition pitch, and per-play random pitch and volume, so repeated sounds vary;
     - music: menu and area music, SetMusicIntensity driving `music_state` (kept in saves), with changes timed to the music's markers as the original does;
-    - world: world reverb (area presets and reverb triggers as traced, levels per I3DL2 with room LF), placed 3D sounds;
+    - world: world reverb (area presets and reverb triggers as traced, levels per I3DL2 with room LF), placed 3D sounds with their cones;
     - movement: footsteps by walkmesh surface, foley and vegetation rustles, as traced;
     - effects: UI sounds, boot movie sound, script PlaySound, animation sound events (swings, armour foley) and bodyfalls; blows sound at the hit frame with the weapon's action;
     - voices: conversation and cutscene voice-over, sound-set and engine barks with the exe's sound-set player (counts, shuffle bag, gender), creature sound-set events, party picker lines, the chargen voice preview.
   - Also merged: the ducking of world sound in conversations, cutscenes, death and loads (#392), music volume triggers, area music carrying on across areas that share a theme, and placeables' animation sounds.
   - Not yet: voice-over positioning, and the master and secondary reverb chain. (The PlayMusic and StopMusic script calls do nothing in the original either, traced in #395.)
   - Sound is off with `--control` (unless `--audio`) and in headless captures.
-- 🟡 **Controller**: Xbox 360-style layout; menus and in-game screens use focus navigation, and A dismisses tutorial popups. The PC right-click radial menu doesn't exist as a movie in the game data, so LT opens a quickbar picker instead. In the inventory A equips and unequips and Y puts a usable item in the first free quickbar slot; on Tactics the pad reaches the Presets and Behaviour pickers; B in an open dropdown closes only the list.
+- 🟡 **Controller**: Xbox 360-style layout; menus and in-game screens use focus navigation, and A dismisses tutorial popups, then opens the screen a paused training lesson waits for (level-up, inventory, tactics). The PC right-click radial menu doesn't exist as a movie in the game data, so LT opens a quickbar picker instead. In the inventory A equips and unequips and Y puts a usable item in the first free quickbar slot; on Tactics the pad reaches the Presets and Behaviour pickers; B in an open dropdown closes only the list.
 - ✅ **Saves**: F5/F9 quick save and load, save/load screens with a picture of the game for each save made in a window, typed names. Revision 7 fills older saves' empty containers.
 - 🟡 **Keyboard and mouse**: W, S, Q and E walk the leader relative to the camera and A and D turn the camera, as the game's key map binds them; click to move, hover names, and name and health floaties shown as the original shows them (hovered, targeted, or with Tab held). Selection rings are drawn under party members and fighting enemies (when an enemy shows its ring is provisional).
 - ✅ **Performance**: frustum culling, shadow caching and skinned-draw culling (Lothering about 8 ms, the chapel about 1.5 ms offscreen). Model node trees are read with a heap stack, so small worker-thread stacks are safe.
-- 🟡 **DLC and add-ins**: encrypted DLC archives are read (passwords recovered from the player's own GOG Ultimate Edition executable; nothing is shipped). Every enabled add-in's `core` folder is mounted, and its `module` folder only when its manifest extends the base campaign (provisional), so stand-alone campaigns cannot replace base-game files. The add-ins' area-list scripts run as in the original, so a new game hands out the first DLC item; DLC map pins and camp additions do not appear yet (`FMT-047`). Install paths are matched without regard to case, so the game runs from a case-sensitive file system.
+- 🟡 **DLC and add-ins**: encrypted DLC archives are read (passwords recovered from the player's own GOG Ultimate Edition executable; nothing is shipped). Every enabled add-in's `core` folder is mounted, and its `module` folder only when it extends the base campaign, so stand-alone campaigns cannot replace base-game files. Add-ins are found from the original's `AddIns.xml` registry as well as from manifests, which brings in the promotional items' add-ins. The add-ins' area-list scripts run as in the original, so a new game hands out the first DLC item; DLC map pins and camp additions do not appear yet (`FMT-047`). Install paths are matched without regard to case, so the game runs from a case-sensitive file system.
 - 🟡 **Issue reports**: F8, both sticks clicked or the menu's Report Issue entry saves a screenshot, the current save, a save from about a minute earlier, the log, recent input and settings to the user's data folder (`Documents\OpenThedas` on Windows), and can send it to the project's report server.
 - 🟡 **Mods**: an ordered list of mod layers sits above the whole resource stack (later entries win; nothing is extracted over the game's files), `.dazip` packages in the list are unpacked into a cache and join as add-ins, and the original's folders in the player's Documents are read in the original's places. `THEDAS_MODS=none` turns all of it off; `thedas mods <install>` lists the layers.
-- 🟡 **DA2**: scoping. Archives whose entries carry only name hashes (ERF V3.0) resolve by name; nothing of the game runs yet.
+- 🟡 **DA2**: scoping. Archives whose entries carry only name hashes (ERF V3.0) resolve by name; patch talk tables and material files are read; nothing of the game runs yet.
 
 ### Known blockers
 
