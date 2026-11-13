@@ -174,6 +174,9 @@ pub struct SaveListing {
     /// The kind of save (`SaveType`): DAOrigins.exe's save folders by kind (0x642c70) are
     /// `Slot_` 0, `AutoSave_` 1, `QuickSave_` 2 and `PostCampaign_` 3.
     pub kind: i32,
+    /// The picture of the game taken when it was saved, as the name saveload.gfx loads
+    /// (`FILE:<name>`); empty for a save without one (the movie shows its default).
+    pub screenshot: String,
 }
 
 /// The inventory screen's item category tabs (inventory.gfx's `CATEGORY_*`).
@@ -1610,7 +1613,11 @@ fn saves(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
             format!("{k}.LastLocation"),
             UiValue::String(last.map(|s| s.area.clone()).unwrap_or_default()),
         );
-        v.insert(format!("{k}.Screenshot"), UiValue::String(String::new()));
+        // The hero's picture is the newest save's.
+        v.insert(
+            format!("{k}.Screenshot"),
+            UiValue::String(last.map(|s| s.screenshot.clone()).unwrap_or_default()),
+        );
         // The details pane's level and class icon: the hero's (before a game, the newest
         // save's).
         let (level, class) = match sim.world.hero {
@@ -1668,7 +1675,10 @@ fn saves(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
             UiValue::String(s.last_played.clone()),
         );
         v.insert(format!("{k}.Story"), UiValue::String(String::new()));
-        v.insert(format!("{k}.Screenshot"), UiValue::String(String::new()));
+        v.insert(
+            format!("{k}.Screenshot"),
+            UiValue::String(s.screenshot.clone()),
+        );
         // The save's own class (the new save's is the hero's).
         let class = match (s.slot, sim.world.hero) {
             (-1, Some(h)) => sim.property_total(h, PROPERTY_CLASS),

@@ -569,20 +569,27 @@ fn load_target(target: &str) -> Result<Vec<u8>> {
 fn mods(install: &Path, list: Option<&Path>) -> Result<()> {
     use thedas_vfs::mods;
     let install = DaoInstall::open(install)?;
-    let mut vfs = install.global_vfs(TextureQuality::High)?;
-    let report = match list {
+    let (vfs, report) = match list {
         Some(file) => {
-            let mut overlay = thedas_vfs::Vfs::new();
+            let mut vfs = install.global_vfs(TextureQuality::High)?;
+            let mut overlay = vfs.take_overlay().unwrap_or_default();
             let report = mods::ModList::load(file).mount(&mut overlay);
             vfs.set_overlay(overlay);
-            report
+            (vfs, report)
         }
         None => {
             match mods::default_list_file() {
                 Some(f) => println!("list: {}", f.display()),
                 None => println!("mods are switched off ({})", mods::ENV_VAR),
             }
-            mods::mount_default(&mut vfs)
+            if let Some(d) = mods::original_user_dir(install.game()) {
+                println!("original's user folder: {}", d.display());
+            }
+            // The list is mounted once more on a scratch stack only to report its problems.
+            let report = mods::default_list_file()
+                .map(|f| mods::ModList::load(&f).mount(&mut thedas_vfs::Vfs::new()))
+                .unwrap_or_default();
+            (install.play_vfs(TextureQuality::High)?, report)
         }
     };
     for m in &report {
