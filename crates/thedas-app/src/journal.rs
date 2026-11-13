@@ -138,7 +138,6 @@ impl GameJournal {
     }
 
     /// The checkpoint and the log as they stand, written out first (for an issue report).
-    #[allow(dead_code)] // For issue reports (next PR).
     pub fn files(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
         self.writer.flush().ok()?;
         let checkpoint = std::fs::read(checkpoint_path(&self.dir)).ok()?;
@@ -217,16 +216,6 @@ pub fn discard(dir: &Path) -> std::io::Result<()> {
     set_aside(dir)?;
     let _ = std::fs::remove_file(closed_path(dir));
     Ok(())
-}
-
-impl GameJournal {
-    /// The checkpoint and the log as they stand, written out first (for an issue report).
-    pub fn files(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
-        self.writer.flush().ok()?;
-        let checkpoint = std::fs::read(checkpoint_path(&self.dir)).ok()?;
-        let log = std::fs::read(log_path(&self.dir)).ok()?;
-        Some((checkpoint, log))
-    }
 }
 
 /// The checkpoint to resume from, if there is one.
