@@ -135,6 +135,11 @@ pub struct Sim {
     /// Walkers held up by another creature's body: since when, and whether that was
     /// reported (see `Sim::advance_movers`). Not saved.
     pub(crate) blocked_since: HashMap<ObjectId, (u64, bool)>,
+    /// The add-ins' area-list scripts, read once (see [`crate::prcscr`]).
+    pub(crate) prcscr: Option<Arc<Vec<(String, String)>>>,
+    /// The area list whose add-in scripts have run since it was loaded. Not saved: a load
+    /// loads the list again.
+    pub(crate) prcscr_ran: Option<String>,
     /// The effect an `APPLY_EFFECT` handler is looking at, and whether it is still valid.
     pub(crate) current_effect: Option<(crate::world::Effect, bool)>,
     /// Who the effect in `current_effect` is being applied to.
@@ -579,6 +584,8 @@ impl Sim {
             placeable_collisions: HashMap::new(),
             door_collisions: HashMap::new(),
             blocked_since: HashMap::new(),
+            prcscr: None,
+            prcscr_ran: None,
             fire_lengths: HashMap::new(),
             attack_lengths: HashMap::new(),
             ability_anims: HashMap::new(),
@@ -1114,6 +1121,8 @@ impl Sim {
                 _ => break,
             }
         }
+        // The add-ins' scripts for an area list just loaded run after the update's events.
+        self.run_area_list_scripts();
         let elapsed = until.saturating_sub(start);
         self.world.time_ms = until;
         self.advance_movers();

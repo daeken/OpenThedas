@@ -251,6 +251,8 @@ impl Sim {
         // line on screen again). One still going is kept.
         self.talk = save.talk.filter(|c| !c.ended);
         self.forget_world_caches();
+        // The area list is loaded again, so the add-ins' scripts for it run again.
+        self.prcscr_ran = None;
         if save_revision < 1 {
             self.apply_worn_properties();
         }
