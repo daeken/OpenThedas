@@ -442,17 +442,22 @@ fn sampler_state(state: u32, value: u32) -> Option<(&'static str, &'static str)>
 impl Pass {
     /// The pass's render and sampler states as a state file's ([`crate::state`]), `name`
     /// naming it. Where the pass is silent the engine's defaults are written out first:
-    /// clockwise culling (the reflection map techniques, drawn mirrored, set
+    /// an alpha test by "at least", clockwise culling (the reflection map techniques, drawn mirrored, set
     /// counter-clockwise), and for every sampler linear filtering with mip maps (the
     /// passes that set filters at all set them to point, for screen passes). Blending
     /// that is turned on without factors blends by the source's alpha. Provisional (see
     /// [`render_state`]): a sampler is named by its register, as the shader has it.
     pub fn material_state(&self, name: &str) -> crate::state::MaterialState {
         use crate::state::{MaterialState, SamplerState};
+        // An alpha test turned on without a compare function compares by "at least": the
+        // hair's depth pass tests against 255 with none given, which "greater" would leave
+        // empty and "always" would fill with the hair cards' transparent texels.
+        // Provisional: the engine's own default is not traced.
         let mut device: Vec<(String, String)> = [
             ("DS_CULLMODE", "CULL_CW"),
             ("DS_SRCBLEND", "BLEND_SRCALPHA"),
             ("DS_DESTBLEND", "BLEND_INVSRCALPHA"),
+            ("DS_ALPHAFUNC", "CMP_GREATEREQUAL"),
         ]
         .iter()
         .map(|(s, v)| (s.to_string(), v.to_string()))
@@ -761,6 +766,36 @@ mod tests {
         assert_eq!(sampler.min, crate::state::Filter::Linear);
         assert!(!sampler.srgb);
         assert!(m.pass_at(0, 0, 1).is_none());
+    }
+
+    #[test]
+    fn an_alpha_test_without_a_function_keeps_at_least_its_reference() {
+        // The hair's depth pass: alpha test on, reference 255, no function; colour off.
+        let pass = Pass {
+            name: "Pass 1".into(),
+            flags: 0,
+            vertex_shader: "hairalpha_hair_p0.vsh.fxo".into(),
+            pixel_shader: "hairalpha_hair_p0.psh.fxo".into(),
+            engine_parameters: Vec::new(),
+            parameters: Vec::new(),
+            render_states: vec![(4, 1), (7, 23), (32, 0), (9, 255)],
+            sampler_states: Vec::new(),
+        };
+        let state = pass.material_state("hairalpha.mat#0#2#0").pass().unwrap();
+        let (func, reference) = state.alpha_test.unwrap();
+        assert_eq!(func, crate::state::CompareFunc::GreaterEqual);
+        assert_eq!(reference, 255);
+        assert_eq!(state.color_write, 0);
+        // A function given wins.
+        let given = Pass {
+            render_states: vec![(4, 1), (10, 0x1e), (9, 0)],
+            ..pass
+        };
+        let state = given.material_state("x").pass().unwrap();
+        assert_eq!(
+            state.alpha_test.unwrap().0,
+            crate::state::CompareFunc::Greater
+        );
     }
 
     #[test]
