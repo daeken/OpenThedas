@@ -652,6 +652,9 @@ enum UpdateAsk {
     Where(update::Offer),
     /// The build started on a report: is it fixed? (The report's folder, the question.)
     Verdict(PathBuf, String),
+    /// Its answer given (fixed or not): anything to add? (A text box, whose first button
+    /// wants text; with none the second, "No note", sends the answer as it is.)
+    VerdictNote(PathBuf, bool),
     /// Something went wrong.
     Failed(String),
 }
@@ -672,6 +675,12 @@ impl UpdateAsk {
                 (UPDATE_ASK_ID + 2, prompt.clone(), "Fixed", "Not fixed")
             }
             UpdateAsk::Failed(why) => (UPDATE_ASK_ID + 3, why.clone(), "OK", "Close"),
+            UpdateAsk::VerdictNote(..) => (
+                UPDATE_ASK_ID + 4,
+                "Thanks. Anything to add for us? It goes with your answer.".to_string(),
+                "Send note",
+                "No note",
+            ),
         }
     }
 }
@@ -1339,7 +1348,7 @@ impl App {
         for a in g.ui.take_text_answers() {
             // OK sends (or saves) the report with the note; the other button keeps it on
             // this computer only, unsent.
-            if (UPDATE_ASK_ID..UPDATE_ASK_ID + 4).contains(&a.id) {
+            if (UPDATE_ASK_ID..UPDATE_ASK_ID + 5).contains(&a.id) {
                 self.update_answers.push(a);
                 continue;
             }
@@ -1490,7 +1499,7 @@ impl App {
         for a in g.ui.take_text_answers() {
             // OK sends (or saves) the report with the note; the other button keeps it on
             // this computer only, unsent.
-            if (UPDATE_ASK_ID..UPDATE_ASK_ID + 4).contains(&a.id) {
+            if (UPDATE_ASK_ID..UPDATE_ASK_ID + 5).contains(&a.id) {
                 self.update_answers.push(a);
                 continue;
             }
@@ -1796,7 +1805,7 @@ impl App {
                 let up = g.ui.stage.dialog_up();
                 match p.asked.as_mut() {
                     None if !up => {
-                        if matches!(p.kind, UpdateAsk::Verdict(..)) {
+                        if matches!(p.kind, UpdateAsk::VerdictNote(..)) {
                             g.ui.ask_text(id, &prompt, "", ok, other);
                         } else {
                             g.ui.ask_choice(id, &prompt, ok, other);
@@ -1820,7 +1829,7 @@ impl App {
                                 // Asked again later, once nothing else is up.
                                 p.asked = None;
                             } else {
-                                if matches!(p.kind, UpdateAsk::Verdict(..)) {
+                                if matches!(p.kind, UpdateAsk::VerdictNote(..)) {
                                     g.ui.ask_text(id, &prompt, "", ok, other);
                                 } else {
                                     g.ui.ask_choice(id, &prompt, ok, other);
@@ -1914,8 +1923,16 @@ impl App {
                     Err(e) => self.update_failed(format!("The game could not be saved: {e:#}")),
                 }
             }
+            // Fixed or not, then (a second box) anything to add.
             UpdateAsk::Verdict(dir, _) => {
-                update::send_verdict_in_background(dir, a.accepted, a.text);
+                self.returning = Returning::Asking(Box::new(UpdatePrompt {
+                    kind: UpdateAsk::VerdictNote(dir, a.accepted),
+                    asked: None,
+                }));
+            }
+            UpdateAsk::VerdictNote(dir, fixed) => {
+                let note = if a.accepted { a.text } else { String::new() };
+                update::send_verdict_in_background(dir, fixed, note);
             }
             UpdateAsk::Failed(_) => {}
         }
