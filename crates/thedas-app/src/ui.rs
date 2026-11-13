@@ -624,9 +624,12 @@ impl UiLayer {
                 true
             }
             ("GUI.SetSoundSet", Some(set)) => {
-                sim.lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .chargen_sound_set(&set);
+                sim.lock().unwrap_or_else(|p| p.into_inner()).input(
+                    thedas_sim::commands::CommandSource::Player,
+                    thedas_sim::commands::SimCommand::ChargenSoundSet {
+                        set: set.to_string(),
+                    },
+                );
                 true
             }
             _ => false,
@@ -713,12 +716,16 @@ impl UiLayer {
                 }
                 let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
                 if sim.world.difficulty != difficulty {
-                    sim.client_option_message(
-                        thedas_sim::chargen::MSG_CLIENT_OPTION,
-                        &[
-                            thedas_ui::options::DIFFICULTY.to_string(),
-                            difficulty.to_string(),
-                        ],
+                    sim.input(
+                        thedas_sim::commands::CommandSource::Player,
+                        thedas_sim::commands::SimCommand::ClientOptionMessage {
+                            name: thedas_sim::chargen::MSG_CLIENT_OPTION.to_string(),
+                            args: [
+                                thedas_ui::options::DIFFICULTY.to_string(),
+                                difficulty.to_string(),
+                            ]
+                            .to_vec(),
+                        },
                     );
                 }
             }
@@ -1076,7 +1083,10 @@ impl UiLayer {
         let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
         for s in opened {
             if let Some(id) = gui_id(s, sim.world.container.is_some()) {
-                sim.gui_opened(id);
+                sim.input(
+                    thedas_sim::commands::CommandSource::Player,
+                    thedas_sim::commands::SimCommand::GuiOpened { gui: id },
+                );
             }
             let name = match s {
                 Screen::Tactics => "GUI_TACTICS_OPENED",
@@ -1084,7 +1094,13 @@ impl UiLayer {
                 Screen::Inventory => "GUI_INVENTORY_OPENED",
                 _ => continue,
             };
-            sim.training_event(name, 0);
+            sim.input(
+                thedas_sim::commands::CommandSource::Player,
+                thedas_sim::commands::SimCommand::TrainingEvent {
+                    name: name.to_string(),
+                    arg: 0,
+                },
+            );
         }
     }
 
@@ -1852,7 +1868,10 @@ impl UiLayer {
             return false;
         }
         // The module hears the save coming first (EVENT_TYPE_MODULE_PRESAVE).
-        sim.presave();
+        sim.input(
+            thedas_sim::commands::CommandSource::App,
+            thedas_sim::commands::SimCommand::Presave,
+        );
         let area = sim
             .world
             .area
@@ -2060,7 +2079,10 @@ impl UiLayer {
         }
         // The store's close button: the simulation's store closes too.
         if changes.dismissed.contains(&Screen::Store) {
-            sim.lock().unwrap_or_else(|p| p.into_inner()).close_store();
+            sim.lock().unwrap_or_else(|p| p.into_inner()).input(
+                thedas_sim::commands::CommandSource::Player,
+                thedas_sim::commands::SimCommand::CloseStore,
+            );
         }
         // The inventory closed (its close button or Escape) while a container was open:
         // the container closes too.
@@ -2069,15 +2091,19 @@ impl UiLayer {
         {
             let mut s = sim.lock().unwrap_or_else(|p| p.into_inner());
             if s.world.container.is_some() {
-                s.close_container();
+                s.input(
+                    thedas_sim::commands::CommandSource::Player,
+                    thedas_sim::commands::SimCommand::CloseContainer,
+                );
             }
         }
         // A picker that closed itself without its Accept keeps the members picked so far.
         // Provisional: partypicker.gfx has no other way out.
         if changes.dismissed.contains(&Screen::PartyPicker) {
-            sim.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .party_picker_submit();
+            sim.lock().unwrap_or_else(|p| p.into_inner()).input(
+                thedas_sim::commands::CommandSource::Player,
+                thedas_sim::commands::SimCommand::PartyPickerSubmit,
+            );
         }
         self.line = match (line, self.line.take()) {
             (Some((key, _, cutscene)), Some(mut l)) if l.key == key => {
@@ -3259,7 +3285,10 @@ impl UiLayer {
         };
         let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
         if thedas_sim::engine::party_of(&sim).contains(&id) {
-            sim.player_selects(id);
+            sim.input(
+                thedas_sim::commands::CommandSource::Player,
+                thedas_sim::commands::SimCommand::PlayerSelects { who: id },
+            );
         }
     }
 
