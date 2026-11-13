@@ -17,6 +17,7 @@ fn p(ty: Type, name: &str, default: Option<&str>) -> Param {
         ty,
         name: name.into(),
         default: default.map(str::to_string),
+        by_ref: false,
     }
 }
 

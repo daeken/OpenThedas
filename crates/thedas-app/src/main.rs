@@ -3969,6 +3969,25 @@ fn menu_key(code: KeyCode) -> Option<screens::Screen> {
 /// A floating message over the controlled creature (the `floaty` step): white, the default
 /// style, two seconds.
 fn test_floaty(sim: &mut thedas_sim::Sim, text: &str) {
+    // `floaty portrait: TEXT` is a message by the controlled creature's portrait instead
+    // (a script's `DisplayPortraitMessage`).
+    if let (Some(text), Some(target)) = (text.strip_prefix("portrait:"), sim.world.controlled()) {
+        sim.world
+            .portrait_messages
+            .push(thedas_sim::world::PortraitMessage {
+                target,
+                text: text.trim().to_string(),
+                colour: 0xffffff,
+            });
+        return;
+    }
+    // `floaty status: TEXT` is a status message (a script's `DisplayStatusMessage`).
+    if let Some(text) = text.strip_prefix("status:") {
+        sim.world
+            .status_messages
+            .push((text.trim().to_string(), 0xffffff));
+        return;
+    }
     if let Some(target) = sim.world.controlled() {
         sim.world.floaties.push(thedas_sim::world::FloatyMessage {
             target,
