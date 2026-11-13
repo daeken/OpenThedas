@@ -96,12 +96,17 @@ pub fn movie_path(vfs: &thedas_vfs::Vfs, install: &Path, name: &str) -> PathBuf 
 }
 
 /// The `ffmpeg` that decodes the movies, if there is one: beside our own executable first
-/// (where a Windows player would drop `ffmpeg.exe`), then on the PATH, then, on the Mac, in
-/// Homebrew's folders (an app started from Finder does not get the shell's PATH).
+/// (where a Windows player would drop `ffmpeg.exe`), then beside the program the player
+/// started (a build an update fetched runs from a folder of its own, see
+/// `update::PROGRAM_DIR`), then in the player's data folder, then on the PATH, then, on the
+/// Mac, in Homebrew's folders (an app started from Finder does not get the shell's PATH).
 pub fn find_ffmpeg() -> Option<PathBuf> {
     let beside = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .into_iter()
+        .chain(std::env::var_os(crate::update::PROGRAM_DIR).map(PathBuf::from))
+        .chain([crate::saves::data_dir()]);
     let path = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
         .unwrap_or_default();
@@ -110,12 +115,7 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
     } else {
         &[]
     };
-    ffmpeg_in(
-        beside
-            .into_iter()
-            .chain(path)
-            .chain(homebrew.iter().map(PathBuf::from)),
-    )
+    ffmpeg_in(beside.chain(path).chain(homebrew.iter().map(PathBuf::from)))
 }
 
 /// The first of `dirs` that holds an `ffmpeg` executable under this platform's name
