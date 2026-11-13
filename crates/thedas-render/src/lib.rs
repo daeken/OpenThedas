@@ -20,6 +20,7 @@ pub mod d3d;
 mod d3d_gpu;
 pub mod distortion;
 pub mod gpu;
+pub mod look;
 pub mod material;
 pub mod particles;
 pub mod post;
