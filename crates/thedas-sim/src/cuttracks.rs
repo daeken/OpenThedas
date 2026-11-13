@@ -64,6 +64,7 @@ const FIELD_ACTOR_TRACKS: u32 = 5206;
 const FIELD_ACTOR_CREATURE: u32 = 5208;
 const FIELD_ACTOR_POSITION: u32 = 5214;
 const FIELD_ACTOR_ROTATION: u32 = 5215;
+const FIELD_ACTOR_POSE: u32 = 5211;
 const FIELD_ACTOR_TAG: u32 = 5216;
 const FIELD_ACTOR_END_POSITION: u32 = 5221;
 const FIELD_ACTOR_END_ROTATION: u32 = 5222;
@@ -460,6 +461,10 @@ pub struct Actor {
     pub end_rotation: [f32; 4],
     /// The actor has an `ActionSnapToWalkmesh` track (kind 38): it is kept on the ground.
     pub snaps: bool,
+    /// Field 5211 (+0x454): the base pose the actor holds through the cutscene, the node
+    /// `pose_<n>` of the cutscene's animation tree (17 is a sitting loop; see
+    /// [`Actor::pose_node`]). `None` when the file gives none (the executable's -1).
+    pub pose: Option<i64>,
     /// Field 5214: the base the motion curves are placed from.
     pub position: [f32; 3],
     /// Field 5215: the base rotation (x, y, z, w).
@@ -492,6 +497,19 @@ pub struct Pose {
 }
 
 impl Actor {
+    /// The node of the cutscene's animation tree that is the actor's base pose: `pose_<n>`
+    /// for its pose number (field 5211). The executable makes the name with `pose_%d`
+    /// (0x7ce490, the string at 0xb23164) and plays it under the actor's animation tracks
+    /// (the actor update, 0x7d6240 on, through 0x7ce330); the trees hold such nodes beside
+    /// the animations they stand for (`pose_17` with `mh.wi_sit_lp`).
+    ///
+    /// Provisional: the `transition_<from>_<to>` nodes the executable plays between two
+    /// poses (the same function, with field 5219 as the other number) are not followed; the
+    /// actor is in its pose from the start.
+    pub fn pose_node(&self) -> Option<String> {
+        self.pose.map(|n| format!("pose_{n}"))
+    }
+
     /// The animations the actor plays `t` seconds into a cutscene `length` seconds long,
     /// in the file's order, each with seconds into it: those whose span holds `t`, and the
     /// last one started if it is a pose (no span) or runs past the cutscene's end, which
@@ -841,6 +859,10 @@ impl Tracks {
                     _ => [0.0, 0.0, 0.0, 1.0],
                 },
                 snaps: false,
+                pose: g
+                    .field(a, FIELD_ACTOR_POSE)
+                    .and_then(Value::as_i64)
+                    .filter(|&p| p >= 0),
                 motion: Vec::new(),
                 turn: Vec::new(),
                 fov: Vec::new(),
@@ -1848,6 +1870,35 @@ mod tests {
                 "{target}"
             );
         }
+    }
+
+    /// An actor's pose number names its base pose's node in the cutscene's tree.
+    #[test]
+    fn an_actors_pose_number_names_its_base_pose() {
+        let mut a = Actor {
+            id: 1,
+            name: "a".into(),
+            creature: None,
+            tag: None,
+            end_position: [0.0; 3],
+            end_rotation: [0.0, 0.0, 0.0, 1.0],
+            snaps: false,
+            pose: Some(17),
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            motion: Vec::new(),
+            turn: Vec::new(),
+            fov: Vec::new(),
+            animations: Vec::new(),
+            places: Vec::new(),
+            camera_jumps: Vec::new(),
+            links: Vec::new(),
+        };
+        assert_eq!(a.pose_node().as_deref(), Some("pose_17"));
+        a.pose = Some(0);
+        assert_eq!(a.pose_node().as_deref(), Some("pose_0"));
+        a.pose = None;
+        assert_eq!(a.pose_node(), None);
     }
 
     #[test]
