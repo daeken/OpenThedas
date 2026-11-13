@@ -539,6 +539,9 @@ struct App {
     /// Where the player's games are saved.
     saves_dir: PathBuf,
     cursor: (f64, f64),
+    /// The last check of whether the interface covers the cursor while it is over a
+    /// creature: (cursor, creature) → covered (see `App::update_hover`).
+    hover_probe: Option<((f64, f64), thedas_script::vm::ObjectId, bool)>,
     camera: Camera,
     size: (u32, u32),
     gfx: Option<Gfx>,
@@ -642,7 +645,7 @@ fn play_interface(
                 live.aiming = Some(aim);
             }
             ui.update_minimap(&live.sim, camera);
-            ui.update_floaties(&live.sim, camera, dt.min(100.0));
+            ui.update_floaties(&live.sim, camera, dt.min(100.0), &|c| live.head_height(c));
         }
         _ => {
             for call in ui.tick(dt.min(100.0)) {
@@ -1141,6 +1144,11 @@ impl App {
             }
         }
         g.ui.set_pad_active(self.pad.used);
+        let hovered = self.hovered_creature();
+        let Some(g) = self.gfx.as_mut() else {
+            return Ok(());
+        };
+        g.ui.set_hovered(hovered);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -1197,7 +1205,8 @@ impl App {
             .map(|(p, ms)| (p.to_path_buf(), ms));
         let live = self.live.as_mut().filter(|_| self.intro.is_none());
         let ui = self.gfx.as_mut().map(|g| &mut g.ui);
-        let state = audio_state(a, live, ui, &self.camera, movie);
+        let mut state = audio_state(a, live, ui, &self.camera, movie);
+        state.gui = self.screens.as_ref().is_some_and(|s| s.world_stopped());
         a.frame(state);
         let voice = a.voice_ms();
         if let Some(g) = self.gfx.as_mut() {
@@ -1240,6 +1249,11 @@ impl App {
             }
         }
         g.ui.set_pad_active(self.pad.used);
+        let hovered = self.hovered_creature();
+        let Some(g) = self.gfx.as_mut() else {
+            return Ok(());
+        };
+        g.ui.set_hovered(hovered);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -1292,6 +1306,29 @@ impl App {
         write_png(&path, w, h, &pixels)?;
         println!("wrote {} (camera {})", path.display(), self.camera.spec());
         Ok(())
+    }
+
+    /// The creature the mouse is over, for its name over its head: none while the
+    /// interface covers the cursor (a screen, the HUD). The interface's cover is read back
+    /// from the GPU, so it is checked again only when the cursor or the creature changes.
+    fn hovered_creature(&mut self) -> Option<thedas_script::vm::ObjectId> {
+        let (Some(live), Some(g)) = (self.live.as_mut(), self.gfx.as_ref()) else {
+            return None;
+        };
+        let (w, h) = (g.config.width as f32, g.config.height as f32);
+        let (x, y) = self.cursor;
+        let (origin, dir) = self.camera.ray(x as f32, y as f32, w, h);
+        let creature = live.hovered_creature(origin, dir)?;
+        let covered = match self.hover_probe {
+            Some((at, c, covered)) if at == self.cursor && c == creature => covered,
+            _ => {
+                let covered = g.ui.covers(x, y);
+                log::debug!(target: "thedas_app::hover", "{creature:?} at {x},{y}, covered {covered}");
+                self.hover_probe = Some((self.cursor, creature, covered));
+                covered
+            }
+        };
+        (!covered).then_some(creature)
     }
 
     /// A left click at window pixel (`x`, `y`) while playing: the party leader is ordered to
@@ -3683,12 +3720,23 @@ fn main() -> Result<()> {
                                     l.aiming = Some(aim);
                                 }
                                 layer.update_minimap(&l.sim, &camera);
-                                layer.update_floaties(&l.sim, &camera, dt);
+                                // Headless, the interface's cover of the cursor is not
+                                // checked (its movies are drawn only for the capture).
+                                let (o, d) = camera.ray(
+                                    cursor.0 as f32,
+                                    cursor.1 as f32,
+                                    size.0 as f32,
+                                    size.1 as f32,
+                                );
+                                layer.set_hovered(l.hovered_creature(o, d));
+                                layer.update_floaties(&l.sim, &camera, dt, &|c| l.head_height(c));
                                 ui_time += t.elapsed();
                             }
                             if let Some(a) = recording.as_mut() {
+                                let gui = played.as_ref().is_some_and(|(_, s)| s.world_stopped());
                                 let ui = played.as_mut().map(|(layer, _)| layer);
-                                let state = audio_state(a, Some(&mut *l), ui, &camera, None);
+                                let mut state = audio_state(a, Some(&mut *l), ui, &camera, None);
+                                state.gui = gui;
                                 a.record(state, dt as f32 / 1000.0);
                                 let voice = a.voice_ms();
                                 if let Some((layer, _)) = played.as_mut() {
@@ -4082,6 +4130,7 @@ fn main() -> Result<()> {
         ui,
         saves_dir: saves_dir.clone(),
         cursor: (0.0, 0.0),
+        hover_probe: None,
         camera,
         size,
         gfx: None,

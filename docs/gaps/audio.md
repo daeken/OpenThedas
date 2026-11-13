@@ -19,7 +19,8 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
 4. **Music during cutscenes and conversations.**
    - Done: the game mode's ducking (0x5bd220): dialog and cutscenes play `OnCutscene` (music −3 dB, ambience and effects lower), death `OnDeath`, loading `OnGameLoading` (world sounds −60 dB; music and voice untouched).
    - Also done: `OnExploreMusic` while `main` plays and `OnCombatMusic` while `combat` does, while the music volume is above 0 (0x5bccd0, 0x5bc6f6); and a theme change during a load waits for the load to end, the old music playing on (0x5bfdf0, 0x5b7070 -> 0x5c4060).
-   - Not done: the music director's own mode changes (0x5bb630: cues per mode, `chargen`).
+   - Also done: the music director's cues per game mode (0x5bb630): explore `main`, combat `combat` (6 s late when it follows the interface, dialog or a cutscene), dialog and cutscenes `main` (except one after the other), death `Death`, the interface and loading keep the track.
+   - Provisional: our combat and interface modes come from the party's fighting and the menus up, not from game modes the simulation keeps.
    - Medium.
 5. **Death and party-wipe music.** The `Death` track plays when the game is over; exactly when the original switches isn't traced. Small.
 6. **Other main-menu music** (after the credits, DLC menus). Only `music/_menu` is wired. Small.
@@ -37,12 +38,13 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
    - Large; needs collision geometry from the sim or render side.
 10. **Audio volume triggers (Type 4, CCTriggerAudioVolume).**
     - Their reverb is applied (#279).
-    - Not handled: their `SoundList` (sounds that play only inside the volume, 0x79a000) and `ObjectId`.
-    - Medium.
+    - Their `SoundList` plays (0x79a000; about 11,900 sounds in 2,829 volumes): each sound stands at the volume, and while the listener is near it follows the listener, at the listener while the party leader is inside and at the volume's nearest point otherwise (0x7c2ee0).
+    - Provisional: the nearest point is taken on the outline (0x798de0 not traced past its bounds test); sounds are re-placed every frame instead of every 0.06 s after 0.25 m; `ObjectId` (save identity) is not kept.
+    - Small.
 12. **Ambient one-shots** (`amb_oneshots`, `glo_amb_creat`). Played only where the data places them; any engine-driven ambient spawning isn't checked. Small to medium.
 13. **Placeable sounds** (doors, chests and so on).
     - Done: animation events of kind 27 (`ClosedToOpened`, `OpenedToClosed`, `Destroyed`, `Used`) play the `placeable_types.gda` column they name for the placeable's type (0x74c360).
-    - Not done: sounds the exe plays from code rather than animations. These are `sound_plc_column_names.gda`'s rows through 0x74c110 (`Locked`, `Hit`; callers not traced), the unlock and lock-pick-failure columns, (the container-opening column, 0x98094859, now plays as a container's inventory opens). They need the sim's lock and container events.
+    - Not done: sounds the exe plays from code rather than animations. The exe's player of `sound_plc_column_names.gda`'s rows (0x74c110, `Locked`, `Hit`) has no caller in the executable: it is only in the placeable vtable (0xb1c15c, slot 0x200) and no call goes through that slot, so it looks unused. Still open: the unlock and lock-pick-failure columns, (the container-opening column, 0x98094859, now plays as a container's inventory opens). They need the sim's lock and container events.
     - Small to medium.
 
 ### Voice-over and conversations
@@ -124,7 +126,7 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
     - `PlayGUISound` comes from the interface movies. Rows with no event (for example 55, "open tutorial") are correctly silent.
     - Coverage of the movies' sound calls isn't checked.
     - Small.
-38. **Pause.** Done: pausing in explore, combat, dialog or cutscene mode plays `OnGamePause` (0x5d6742), whose ducks apply. Not done: its `#pause:` categories are only ducked, not paused (AUD-027); pausing in `GM_GUI` pauses the `VOambient`, `VOconversation` and `VOnarration` categories instead (0x5d684e); `OnMovie` (0x6dc0ba, 0x7ce7cb) ducks nothing. Small.
+38. **Pause.** Done: pausing in explore, combat, dialog or cutscene mode plays `OnGamePause` (0x5d6742), whose ducks apply. Also done: pausing in `GM_GUI` pauses the `VOambient`, `VOconversation` and `VOnarration` categories instead (0x5d684e), and unpausing resumes them. Not done: its `#pause:` categories are only ducked, not paused (AUD-027); `OnMovie` (0x6dc0ba, 0x7ce7cb) ducks nothing. Small.
 
 ### Loading and system
 
@@ -197,7 +199,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 - **AUD-046** **Pan law is unchecked.** Original: `fmodex.dll` pan law. Ours: linear balance. Evidence: `crates/thedas-audio/src/mixer.rs:5`, `crates/thedas-audio/src/mixer.rs:298`. Size: S. Depends: none. Kind: provisional.
 - **AUD-047** **Output limiter (deliberate difference).** Original: FMOD's mixer clips (per comment; whether the exe adds a limiter is not traced). Ours: a -0.3 dBFS limiter with 0.2 s release. Evidence: `crates/thedas-audio/src/mixer.rs:207`. Size: S. Depends: none. Kind: provisional.
 - **AUD-048** **Volume options are not persisted.** Original: volume options persisted. Ours: the options screen's slider values feed `volumes()` but nothing writes the player's settings file. Evidence: `crates/thedas-ui/src/options.rs:11`, `crates/thedas-app/src/audio.rs:1527`. Size: S. Depends: CAM-044. Kind: missing.
-- **AUD-049** **Pause only ducks.** Original: the pause toggle (0x5d6742) plays `OnGamePause`, which pauses some categories and ducks others, or pauses the VO categories in `GM_GUI`. Ours: the ducks apply (`AudioState::paused`); nothing is paused, and `Mixer::set_paused` has no caller. Evidence: `crates/thedas-app/src/audio.rs:398`. Size: S. Depends: AUD-027. Kind: provisional.
+- **AUD-049** **Pause only ducks.** Original: the pause toggle (0x5d6742) plays `OnGamePause`, which pauses some categories and ducks others, or pauses the VO categories in `GM_GUI`. Ours: the ducks apply (`AudioState::paused`) and the VO categories pause in `GM_GUI` (`AudioEngine::set_category_paused`); the `#pause:` categories are only ducked. Evidence: `crates/thedas-app/src/audio.rs:398`. Size: S. Depends: AUD-027. Kind: provisional.
 
 ### Voice-over
 
