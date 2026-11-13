@@ -32,9 +32,10 @@ type LoadedModel = (Arc<Phy>, Option<Arc<Mmh>>);
 pub const EYE_HEIGHT: f32 = 1.8;
 
 /// How far inside a solid a standing creature's eye may lie and still be taken to be just
-/// outside it (see [`Collision::sight_blocked_standing`]): about a body's radius and half
-/// a pathing cell. Provisional.
-pub const EYE_INSIDE: f32 = 0.5;
+/// outside it (see [`Collision::sight_blocked_standing`]): about a body's radius, less
+/// than half the thickness of the walls the levels are built from, so that the way out is
+/// never through to a wall's far side. Provisional.
+pub const EYE_INSIDE: f32 = 0.25;
 
 fn add(a: V, b: V) -> V {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
@@ -486,6 +487,51 @@ impl Collision {
         )
     }
 
+    /// Collision made of boxes (tests): each a centre and half extents, axis-aligned.
+    #[cfg(test)]
+    pub(crate) fn from_boxes(boxes: &[(V, V)]) -> Self {
+        Self::build(
+            boxes
+                .iter()
+                .map(|&(c, half)| Prim::Obb {
+                    c,
+                    axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    half,
+                })
+                .collect(),
+        )
+    }
+
+    /// Whether the eye of a creature standing at `p` lies inside a solid (a box, sphere or
+    /// capsule).
+    pub fn eye_inside(&self, p: V) -> bool {
+        let e = add(p, [0.0, 0.0, EYE_HEIGHT]);
+        let mut stack = if self.nodes.is_empty() {
+            Vec::new()
+        } else {
+            vec![0usize]
+        };
+        while let Some(n) = stack.pop() {
+            let node = &self.nodes[n];
+            if (0..3).any(|i| e[i] < node.lo[i] || e[i] > node.hi[i]) {
+                continue;
+            }
+            if node.count > 0 {
+                let s = node.first as usize;
+                if self.prims[s..s + node.count as usize]
+                    .iter()
+                    .any(|prim| prim.pushed_out(e).is_some())
+                {
+                    return true;
+                }
+            } else {
+                stack.push(node.first as usize);
+                stack.push(node.first as usize + 1);
+            }
+        }
+        false
+    }
+
     /// Where an eye at `p` is taken to be when it lies a little way inside a solid (a box,
     /// sphere or capsule): the nearest point just outside, if that is within
     /// [`EYE_INSIDE`]. See [`Collision::sight_blocked_standing`].
@@ -529,7 +575,8 @@ impl Collision {
     }
 
     /// [`Collision::sight_blocked`] for creatures standing in the level: an eye that lies
-    /// a little way inside a solid is taken to be at the nearest point outside it.
+    /// a little way inside a solid (up to [`EYE_INSIDE`]) is taken to be at the nearest
+    /// point outside it.
     ///
     /// DAOrigins.exe's creatures are capsules the level's geometry keeps out, so a
     /// creature's eye is never inside a wall. Ours follow the pathing grid, whose half-metre
@@ -537,8 +584,10 @@ impl Collision {
     /// box, where every sight ray from its eye starts inside the box and is blocked (the
     /// Dalish ruins' mirror room: Tamlen 16 cm inside the end of the wall beside the
     /// doorway saw no enemy and no enemy saw him, so the fight ended whenever the hero
-    /// fell). Provisional: this stands in for keeping creatures out of geometry as they
-    /// move; triangle meshes have no inside and are not treated.
+    /// fell). Perception first moves such a creature's standing point to the middle of
+    /// its pathing cell (`Sim::update_perception`); this covers what is left. Provisional:
+    /// both stand in for keeping creatures out of geometry as they move; triangle meshes
+    /// have no inside and are not treated.
     pub fn sight_blocked_standing(&self, a: V, b: V) -> bool {
         self.blocked(
             self.eye_clear(add(a, [0.0, 0.0, EYE_HEIGHT])),
@@ -765,9 +814,15 @@ mod tests {
         let behind = [-78.5, -3.5, 0.0];
         assert!(wall.sight_blocked_standing(bear, behind));
         assert!(wall.sight_blocked_standing([-75.0, -3.0, 0.0], behind));
-        // An eye deep inside it is not helped out.
+        // An eye deep inside it is not helped out, nor one nearer the far side of a wall.
         let deep = [-76.655, -3.5, 0.0];
         assert!(wall.sight_blocked_standing(deep, bear));
+        assert!(wall.eye_inside(tamlen) && wall.eye_inside(deep) && !wall.eye_inside(bear));
+        let west_side = [-76.95, -3.0, 0.0];
+        assert!(
+            wall.sight_blocked_standing(west_side, bear),
+            "5 cm in from the west"
+        );
     }
 
     #[test]
