@@ -901,6 +901,12 @@ fn probe_at(probe: &IrradianceProbe, n: Vec3) -> Vec3 {
     )
 }
 
+/// How much nearer the sun a Dragon Age II receiver is put than its own depth in the
+/// partition (in the partition's depth units, 0 to 1): its shaders compare the map with the
+/// depth as it is, and its shadow techniques set no depth bias, so without it a surface
+/// shadows itself. Provisional: the engine's own bias is not traced.
+pub const DA2_SHADOW_BIAS: f32 = 0.002;
+
 /// Light from every direction for draws in a level with no irradiance probe. Provisional.
 pub const NO_PROBE_IRRADIANCE: [f32; 3] = [0.35, 0.35, 0.35];
 
@@ -1220,7 +1226,11 @@ impl ConstantContext<'_> {
             // Dragon Age II's shaders read one partition (`smpShadowPartition1`, bound to
             // the first): its matrix's rows to the map's x, y and depth, which Origins'
             // shadow data begins with. With no partitions drawn they find every point lit.
-            ("ShadowDataFirstPartition", _) => Value::Vectors(self.shadow[..3].to_vec()),
+            ("ShadowDataFirstPartition", _) => {
+                let mut rows = self.shadow[..3].to_vec();
+                rows[2][3] -= DA2_SHADOW_BIAS;
+                Value::Vectors(rows)
+            }
             // Four rows of the partition's matrix, as `PSSMMesh.vsh` reads them (`dp4`).
             ("ShadowPartitionMatrix", _) => Value::Vectors(
                 self.partition
