@@ -383,6 +383,10 @@ fn check_other(
         MaterialState::parse(data)
             .map(|_| ())
             .map_err(|e| e.to_string())
+    } else if ext == "mat" && thedas_formats::bmat::is_bmat(data) {
+        thedas_formats::bmat::Bmat::parse(data)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     } else if ext == "dds" {
         Dds::parse(data).map(|_| ()).map_err(|e| e.to_string())
     } else if ext == "mtx" {
@@ -583,6 +587,11 @@ fn check_data(
             thedas_formats::morph::MorphPreset::from_gff4(&doc).map(|_| ())
         )),
         (_, "msh") => Some(s(Msh::from_gff4(&doc).map(|_| ()))),
+        (b"MAO ", _) => Some(
+            MaterialObject::from_gff4(&doc)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        ),
         (_, "ani") => Some(s(
             thedas_formats::anim::Animation::from_gff(&doc).map(|_| ())
         )),
