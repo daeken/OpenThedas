@@ -10,3 +10,8 @@ rust-version.workspace = true
 [dependencies]
 thiserror.workspace = true
 naga.workspace = true
+
+[features]
+# Translating shaders for each GPU backend, to check them without the hardware (see
+# `backends`).
+backend-check = ["naga/glsl-out", "naga/hlsl-out", "naga/spv-out"]
