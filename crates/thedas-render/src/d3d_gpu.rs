@@ -277,6 +277,9 @@ pub(crate) struct ParticleDraw {
     pub emitter: usize,
     /// How many indices to draw this frame (six per quad).
     count: std::sync::atomic::AtomicU32,
+    /// Drawn into the distortion mask, not the frame (a `DistortionMask.sta` program; see
+    /// [`crate::distortion`]).
+    distortion: bool,
 }
 
 /// The format of the shadow partitions: `PSSMStatic.psh` writes depth and its square into
@@ -1167,6 +1170,12 @@ fn fade_constants(
     }
 }
 
+/// Whether `program` draws into the distortion mask: `DADistortionMask.mat`'s passes, by
+/// their state.
+fn is_distortion(program: &D3dProgram) -> bool {
+    program.name.ends_with("+distortionmask.sta")
+}
+
 fn create_pipeline(
     device: &wgpu::Device,
     program: &D3dProgram,
@@ -1225,13 +1234,14 @@ fn create_pipeline_faded(
             wgpu::Face::Back
         }),
     };
-    let blend = pass.blend.map(|(src, dst, op)| {
-        let c = wgpu::BlendComponent {
-            src_factor: blend_factor(src),
-            dst_factor: blend_factor(dst),
-            operation: blend_op(op),
-        };
-        wgpu::BlendState { color: c, alpha: c }
+    let component = |(src, dst, op)| wgpu::BlendComponent {
+        src_factor: blend_factor(src),
+        dst_factor: blend_factor(dst),
+        operation: blend_op(op),
+    };
+    let blend = pass.blend.map(|colour| wgpu::BlendState {
+        color: component(colour),
+        alpha: component(pass.blend_alpha.unwrap_or(colour)),
     });
     let blend = blend.or(faded.then_some(wgpu::BlendState::ALPHA_BLENDING));
     let mut write = wgpu::ColorWrites::empty();
@@ -1375,7 +1385,17 @@ fn texture_group(
 
 /// Particle quad corners laid out as `inputs` (a vertex shader's inputs) read them, one
 /// `Float32x4` each: `POSITION` (w 1), `COLOR0`, `TEXCOORD0`; anything else (0, 0, 0, 1).
-fn particle_vertices(quads: &[crate::particles::ParticleVertex], inputs: &[IoSlot]) -> Vec<f32> {
+/// `basis` is the camera's (right, up, forward): the quads face it, so a shader that reads a
+/// tangent frame (`DistortionVFX.vsh`) gets the normal towards the camera, the tangent to
+/// its right and the binormal up. Provisional: which of right and up the game's sprites call
+/// the tangent is not traced.
+fn particle_vertices(
+    quads: &[crate::particles::ParticleVertex],
+    inputs: &[IoSlot],
+    basis: (Vec3, Vec3, Vec3),
+) -> Vec<f32> {
+    let (right, up, forward) = basis;
+    let direction = |d: Vec3| [d.x, d.y, d.z, 0.0];
     let mut out = Vec::with_capacity(quads.len() * inputs.len() * 4);
     for v in quads {
         for slot in inputs {
@@ -1383,6 +1403,9 @@ fn particle_vertices(quads: &[crate::particles::ParticleVertex], inputs: &[IoSlo
                 (DeclUsage::Position, 0) => [v.position[0], v.position[1], v.position[2], 1.0],
                 (DeclUsage::Color, 0) => v.color,
                 (DeclUsage::TexCoord, 0) => v.texcoord,
+                (DeclUsage::Normal, 0) => direction(-forward),
+                (DeclUsage::Tangent, 0) => direction(right),
+                (DeclUsage::Binormal, 0) => direction(up),
                 _ => [0.0, 0.0, 0.0, 1.0],
             };
             out.extend_from_slice(&value);
@@ -1768,14 +1791,20 @@ impl D3dPass {
             let Some(program) = material_programs.get(e.material).and_then(|p| p.first()) else {
                 continue;
             };
+            // The distortion programs draw into the mask.
+            let format = if is_distortion(program) {
+                crate::distortion::MASK_FORMAT
+            } else {
+                color_format
+            };
             let pi = *by_name.entry(program.name.clone()).or_insert_with(|| {
                 let (pipeline, tl) = cache
                     .pipelines
-                    .entry((program.name.clone(), color_format))
+                    .entry((program.name.clone(), format))
                     .or_insert_with(|| {
                         let tl = texture_layout(device, program);
                         let pipeline =
-                            create_pipeline(device, program, &consts_layout, &tl, color_format);
+                            create_pipeline(device, program, &consts_layout, &tl, format);
                         (pipeline, tl)
                     })
                     .clone();
@@ -1846,6 +1875,7 @@ impl D3dPass {
                 material: e.material,
                 emitter: ei,
                 count: std::sync::atomic::AtomicU32::new(0),
+                distortion: is_distortion(&program),
             });
         }
 
@@ -2004,7 +2034,8 @@ impl D3dPass {
             if n == 0 {
                 continue;
             }
-            let data = particle_vertices(&quads, &program.vs.interface.inputs);
+            let data =
+                particle_vertices(&quads, &program.vs.interface.inputs, (right, up, forward));
             ctx.queue
                 .write_buffer(&d.vertices, 0, bytemuck::cast_slice(&data));
             let cc = ConstantContext {
@@ -2050,14 +2081,15 @@ impl D3dPass {
         }
     }
 
-    /// Draws the particle draws filled by [`D3dPass::update_particles`].
-    pub fn draw_particles(&self, pass: &mut wgpu::RenderPass<'_>) {
+    /// Draws the particle draws filled by [`D3dPass::update_particles`]: the frame's, or
+    /// with `distortion` those of the distortion mask (see [`crate::distortion`]).
+    pub fn draw_particles(&self, pass: &mut wgpu::RenderPass<'_>, distortion: bool) {
         let Some(indices) = &self.quad_indices else {
             return;
         };
         for d in &self.particles {
             let count = d.count.load(std::sync::atomic::Ordering::Relaxed);
-            if count == 0 {
+            if count == 0 || d.distortion != distortion {
                 continue;
             }
             pass.set_pipeline(&self.pipelines[d.pipeline].pipeline);
@@ -2067,6 +2099,13 @@ impl D3dPass {
             pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..count, 0, 0..1);
         }
+    }
+
+    /// Whether any distortion particles are to be drawn this frame.
+    pub fn has_distortion(&self) -> bool {
+        self.particles
+            .iter()
+            .any(|d| d.distortion && d.count.load(std::sync::atomic::Ordering::Relaxed) > 0)
     }
 
     /// Sets scene draw `draw`'s skinning palette rows for the next frames.

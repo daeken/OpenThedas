@@ -1766,9 +1766,15 @@ impl Live {
             return;
         }
         if let Some(level) = self.level.as_mut() {
+            let overlays: Vec<&AreaRenderer> = self
+                .objects
+                .iter()
+                .map(|o| &o.renderer)
+                .chain(self.effects.iter().map(|e| &e.renderer))
+                .collect();
             level
                 .renderer
-                .finish_frame(ctx, encoder, target, width, height);
+                .finish_frame_with(ctx, encoder, target, width, height, &overlays);
         }
     }
 
