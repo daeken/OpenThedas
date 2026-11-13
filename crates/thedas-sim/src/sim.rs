@@ -2289,9 +2289,37 @@ impl Sim {
         // shut. Without the leaf's collision (no game data) the whole doorway is open to it.
         if let Some(own) = g.cell(from).map(|c| (c.1 * g.columns + c.0) as usize) {
             if doors.iter().any(|d| d.1.contains(&own)) {
+                // Out of the doorway, not about in it: an end that is itself in a closed
+                // doorway is not walked to from inside one (a cell on the mover's side can
+                // reach past the leaf, and two such steps would cross it).
+                let to_cell = g.cell(to).map(|c| (c.1 * g.columns + c.0) as usize);
+                if to_cell.is_some_and(|i| doors.iter().any(|d| d.1.contains(&i))) {
+                    return Routed::Path(vec![from]);
+                }
                 let leaves = self.door_sight(area);
-                let up = [0.0, 0.0, 1.0];
-                let eye = [from[0] + up[0], from[1] + up[1], from[2] + up[2]];
+                let mut eye = [from[0], from[1], from[2] + 1.0];
+                // Standing inside the leaf itself (set down there before doorways were
+                // kept clear), its side is the one it is nearest: the lines are drawn
+                // from the nearest point outside the leaf.
+                let inside = |q: [f32; 3]| {
+                    leaves
+                        .solid
+                        .iter()
+                        .any(|l| l.blocked(q, [q[0], q[1], q[2] + 0.01]))
+                };
+                if inside(eye) {
+                    'out: for k in 1..=16 {
+                        let r = k as f32 * 0.05;
+                        for a in 0..16 {
+                            let t = a as f32 * std::f32::consts::TAU / 16.0;
+                            let q = [eye[0] + r * t.cos(), eye[1] + r * t.sin(), eye[2]];
+                            if !inside(q) {
+                                eye = q;
+                                break 'out;
+                            }
+                        }
+                    }
+                }
                 let near = |i: usize| {
                     let c = ((i as u32) % g.columns, (i as u32) / g.columns);
                     let m = g.center(c);
@@ -2300,7 +2328,7 @@ impl Sim {
                 };
                 for d in doors.iter_mut().filter(|d| d.1.contains(&own)) {
                     let far: Vec<usize> = d.1.iter().copied().filter(|&i| !near(i)).collect();
-                    // Standing inside the leaf itself every line is cut: let it out.
+                    // With every line cut (deep in a thick leaf) it is let out all the same.
                     d.1 = if far.len() == d.1.len() {
                         Vec::new()
                     } else {
