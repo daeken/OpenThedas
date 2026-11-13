@@ -395,9 +395,6 @@ struct Line {
     /// How long its voice-over runs (milliseconds), when it has one: it plays that long
     /// instead of a reading time.
     voice_ms: Option<f64>,
-    /// Whether conversation.gfx was last told the line has a voice-over (see
-    /// `UiLayer::play`).
-    voiced: bool,
     /// Nothing to choose: it continues by itself once played.
     waits: bool,
     continued: bool,
@@ -1265,7 +1262,6 @@ impl UiLayer {
                 key,
                 t: 0.0,
                 voice_ms: None,
-                voiced: false,
                 waits,
                 continued: false,
                 cut_seen: cutscene,
@@ -1273,36 +1269,6 @@ impl UiLayer {
             }),
             (None, _) => None,
         };
-        // Whether the line is voiced (`Conversation.HasVO`): conversation.gfx's
-        // `UpdateMainText` hides a voiced NPC line when the Subtitles option is "No
-        // subtitles" (`ClientOptions.GameOptions.SubtitlesLevel` 0, the default), and shows
-        // it otherwise. The voice is known once it plays (see `set_line_voice_ms`), a frame
-        // or more after the line's text reached the movie, so the movie is given the line
-        // again then. Provisional: when the exe sets HasVO (its attribute at 0x690193) is not
-        // traced; a voice-over playing stands in.
-        let mut retell = None;
-        if let Some(l) = self.line.as_mut() {
-            let voiced = l.voice_ms.is_some();
-            self.stage.bridge.set_value(
-                "Conversation.HasVO",
-                thedas_ui::UiValue::Number(f64::from(u8::from(voiced))),
-            );
-            if voiced != l.voiced {
-                l.voiced = voiced;
-                retell = Some(l.key.1.clone());
-            }
-        }
-        let subtitles = self
-            .stage
-            .bridge
-            .value("ClientOptions.GameOptions.SubtitlesLevel");
-        if let Some(text) = retell.filter(|_| subtitles == Some(thedas_ui::UiValue::Number(0.0))) {
-            self.stage.call_in(
-                "conversation.gfx",
-                "_global.Conversation.UpdateMainText",
-                &[thedas_ui::UiValue::String(text)],
-            );
-        }
         if let Some(l) = self.line.as_mut() {
             let played = l.played();
             self.stage.bridge.set_value(
