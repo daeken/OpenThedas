@@ -76,6 +76,29 @@ impl SaveStore {
         self.dir.join(format!("{slot:04}.meta.json"))
     }
 
+    fn shot_path(&self, slot: i32) -> PathBuf {
+        self.dir.join(format!("{slot:04}.png"))
+    }
+
+    /// Keeps the picture of the game taken with save `slot` (a PNG), which the save and load
+    /// screens show. Provisional: the original keeps a screenshot in each save's folder;
+    /// its size and form are not followed.
+    pub fn write_screenshot(&self, slot: i32, png: &[u8]) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        std::fs::write(self.shot_path(slot), png)
+    }
+
+    /// Save `slot`'s picture, when it has one.
+    pub fn screenshot(&self, slot: i32) -> Option<Vec<u8>> {
+        std::fs::read(self.shot_path(slot)).ok()
+    }
+
+    /// The name the screens load save `slot`'s picture by: new with each write of the save,
+    /// so a slot written over shows its new picture.
+    pub fn screenshot_name(slot: i32, written: u64) -> String {
+        format!("save_{slot}_{written}.dds")
+    }
+
     /// The saves there are, newest first.
     pub fn list(&self) -> Vec<SaveListing> {
         let Ok(rd) = std::fs::read_dir(&self.dir) else {
@@ -102,6 +125,11 @@ impl SaveStore {
                         level: meta.level,
                         class: meta.class,
                         kind: meta.kind,
+                        screenshot: if self.shot_path(slot).is_file() {
+                            Self::screenshot_name(slot, meta.written)
+                        } else {
+                            String::new()
+                        },
                     },
                 ))
             })
@@ -139,6 +167,7 @@ impl SaveStore {
     pub fn delete(&self, slot: i32) -> std::io::Result<()> {
         std::fs::remove_file(self.save_path(slot))?;
         let _ = std::fs::remove_file(self.meta_path(slot));
+        let _ = std::fs::remove_file(self.shot_path(slot));
         Ok(())
     }
 
@@ -146,6 +175,48 @@ impl SaveStore {
     pub fn latest(&self) -> Option<i32> {
         self.list().first().map(|s| s.slot)
     }
+}
+
+/// The width of a save's picture (pixels); its height keeps the frame's shape.
+pub const SHOT_WIDTH: u32 = 512;
+
+/// A frame (RGBA8, `w` x `h`) shrunk to a save's picture, [`SHOT_WIDTH`] wide (or the
+/// frame's own width when smaller), each pixel the average of the frame's under it, as a
+/// PNG. `None` for an empty or short frame.
+pub fn shot_png(pixels: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+    if w == 0 || h == 0 || pixels.len() < w as usize * h as usize * 4 {
+        return None;
+    }
+    let tw = SHOT_WIDTH.min(w);
+    let th = ((u64::from(h) * u64::from(tw)) / u64::from(w)).max(1) as u32;
+    let mut out = Vec::with_capacity(tw as usize * th as usize * 4);
+    for ty in 0..th {
+        let (y0, y1) = (ty * h / th, ((ty + 1) * h / th).max(ty * h / th + 1).min(h));
+        for tx in 0..tw {
+            let (x0, x1) = (tx * w / tw, ((tx + 1) * w / tw).max(tx * w / tw + 1).min(w));
+            let mut sum = [0u32; 3];
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = (y as usize * w as usize + x as usize) * 4;
+                    for c in 0..3 {
+                        sum[c] += u32::from(pixels[i + c]);
+                    }
+                }
+            }
+            let n = (y1 - y0) * (x1 - x0);
+            out.extend([
+                (sum[0] / n) as u8,
+                (sum[1] / n) as u8,
+                (sum[2] / n) as u8,
+                255,
+            ]);
+        }
+    }
+    thedas_ui::stage::encode_png(&thedas_ui::Rgba {
+        width: tw,
+        height: th,
+        pixels: out,
+    })
 }
 
 /// Seconds since the epoch as `YYYY-MM-DD HH:MM` (UTC).
@@ -181,6 +252,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_frame_shrinks_to_a_picture_of_its_shape() {
+        // 1024 x 512 of one colour: a 512 x 256 PNG.
+        let frame = [10u8, 20, 30, 255].repeat(1024 * 512);
+        let png = shot_png(&frame, 1024, 512).unwrap();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        // IHDR: width and height, big-endian, at bytes 16..24.
+        assert_eq!(&png[16..24], &[0, 0, 2, 0, 0, 0, 1, 0]);
+        // A frame smaller than the picture keeps its size; a short one gives none.
+        let small = [0u8, 0, 0, 255].repeat(4 * 2);
+        assert_eq!(
+            &shot_png(&small, 4, 2).unwrap()[16..24],
+            &[0, 0, 0, 4, 0, 0, 0, 2]
+        );
+        assert_eq!(shot_png(&small, 8, 8), None);
+        assert_eq!(shot_png(&[], 0, 0), None);
+    }
+
+    #[test]
     fn saves_are_listed_newest_first_and_can_be_read_back_and_deleted() {
         let dir = std::env::temp_dir().join(format!("thedas-saves-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -203,7 +292,13 @@ mod tests {
         assert_eq!(store.latest(), Some(2));
         assert_eq!(store.open_slot(), 3);
         assert_eq!(store.read(1).unwrap(), b"one");
+        // A save's picture is listed by a name that changes with each write.
+        assert_eq!(l[0].screenshot, "");
+        store.write_screenshot(2, b"png").unwrap();
+        assert_eq!(store.list()[0].screenshot, "save_2_200.dds");
+        assert_eq!(store.screenshot(2).as_deref(), Some(&b"png"[..]));
         store.delete(2).unwrap();
+        assert_eq!(store.screenshot(2), None);
         assert_eq!(store.latest(), Some(1));
         // The quick save is found by its kind.
         assert_eq!(store.quick_slot(), None);

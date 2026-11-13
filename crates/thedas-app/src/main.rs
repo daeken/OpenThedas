@@ -1288,6 +1288,22 @@ impl App {
             dt,
         );
         self.requests.append(&mut g.ui.requests);
+        // A save just written gets the picture of the game as it stands (the world alone,
+        // as the save and load screens show it).
+        let saved = g.ui.take_saved_slots();
+        if !saved.is_empty() {
+            let (w, h) = (g.config.width, g.config.height);
+            let shot = self
+                .live
+                .as_mut()
+                .and_then(|l| l.capture(&g.ctx, &self.camera, (w, h)).ok().flatten())
+                .and_then(|px| saves::shot_png(&px, w, h));
+            if let Some(png) = shot {
+                for slot in saved {
+                    g.ui.set_save_screenshot(slot, &png);
+                }
+            }
+        }
         for a in g.ui.take_text_answers() {
             // OK sends (or saves) the report with the note; the other button keeps it on
             // this computer only, unsent.
@@ -1423,6 +1439,22 @@ impl App {
             dt,
         );
         self.requests.append(&mut g.ui.requests);
+        // A save just written gets the picture of the game as it stands (the world alone,
+        // as the save and load screens show it).
+        let saved = g.ui.take_saved_slots();
+        if !saved.is_empty() {
+            let (w, h) = (g.config.width, g.config.height);
+            let shot = self
+                .live
+                .as_mut()
+                .and_then(|l| l.capture(&g.ctx, &self.camera, (w, h)).ok().flatten())
+                .and_then(|px| saves::shot_png(&px, w, h));
+            if let Some(png) = shot {
+                for slot in saved {
+                    g.ui.set_save_screenshot(slot, &png);
+                }
+            }
+        }
         for a in g.ui.take_text_answers() {
             // OK sends (or saves) the report with the note; the other button keeps it on
             // this computer only, unsent.
@@ -4540,6 +4572,8 @@ fn main() -> Result<()> {
                                     println!("aiming ability {}", aim.ability);
                                     l.aiming = Some(aim);
                                 }
+                                // No picture is taken for a save made headless.
+                                layer.take_saved_slots();
                                 for a in layer.take_text_answers() {
                                     println!(
                                         "text box {}: {} {:?}",

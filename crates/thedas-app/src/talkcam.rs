@@ -215,6 +215,34 @@ impl TalkCamera {
         ))
     }
 
+    /// The frame buffer effects the shown line's own cutscene has running (its kind-19
+    /// tracks: depth of field, fades), when it is the line the simulation staged; on the
+    /// clock its camera runs on (see [`Self::line_cut_camera`]).
+    pub fn line_cut_effects(&mut self, sim: &Sim) -> Vec<thedas_sim::cuttracks::FrameEffectState> {
+        let Some(open) = sim.conversation_line() else {
+            return Vec::new();
+        };
+        let line: LineKey = ((open.dialog.to_ascii_lowercase(), open.owner), open.line);
+        let Some((dlg, at, _, _)) = sim.line_staging() else {
+            return Vec::new();
+        };
+        if !dlg.eq_ignore_ascii_case(&line.0.0) || Some(at) != line.1 {
+            return Vec::new();
+        }
+        let tracks = self
+            .line_cuts(sim, &line.0.0)
+            .and_then(|cuts| cuts.get(at)?.tracks.clone());
+        let Some(tracks) = tracks else {
+            return Vec::new();
+        };
+        let now = self.clock_ms;
+        let since = match &self.shown {
+            Some((l, since)) if *l == line => *since,
+            _ => now,
+        };
+        tracks.frame_effects_at(((now - since) / 1000.0) as f32)
+    }
+
     /// The view of the shown line's own cutscene (see [`line_cut_view`]), when it is the
     /// line the simulation staged and its cutscene has camera cuts.
     fn line_cut_camera(
