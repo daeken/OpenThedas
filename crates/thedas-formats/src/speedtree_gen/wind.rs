@@ -326,8 +326,8 @@ mod tests {
         run(&mut wind, 60.0);
         for m in wind.matrices() {
             // Rows stay unit length and perpendicular: a rotation.
-            for r in 0..3 {
-                let n: f32 = (0..3).map(|c| m[r][c] * m[r][c]).sum();
+            for row in &m[..3] {
+                let n: f32 = row[..3].iter().map(|x| x * x).sum();
                 assert!((n - 1.0).abs() < 1e-4);
             }
             let dot: f32 = (0..3).map(|c| m[0][c] * m[1][c]).sum();
