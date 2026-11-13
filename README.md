@@ -10,7 +10,7 @@ repository.
 
 ## Status
 
-Last updated 2026-11-13 00:10 UTC, main b4ed5e7
+Last updated 2026-11-13 01:40 UTC, main 27e86b8
 
 For everything that is wrong or missing, in detail and split into items that can be picked up in
 parallel, see [docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md).
@@ -34,8 +34,8 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
     - line cutscene cameras are placed with their cutscene's stage, and ActionJumpToCamera puts the camera on stage cameras: the City Elf Vaughan scene plays as staged shots.
   - Open:
     - cameras and actors linked with LinkToActor are placed (provisional: links use the target's root frame);
-    - a cutscene's last view is held for the rest of the conversation line it plays over (provisional), which frames the City Elf opening as the original does;
-    - City Elf: Vaughan faces away from the camera in one shot (reference frames from the original now exist; comparison pending).
+    - a cutscene's last view is held only for the conversation line that queued it (provisional), which frames the City Elf opening as the original does and frees the next reply's shot;
+    - additive animation clips (the `.ani` additive flag, 196 of the 4,520 clips, most of them conversation gestures) are laid over the pose beneath them as the exe does, instead of replacing it; this fixes arms pointing straight up during gestures. Their weight is provisional (`RND-064`), and two other overlay kinds still overwrite (`RND-071`).
 - 🟡 **Exploration and camera**:
   - Walking, click-to-pick, doors and companions following. Followers come along on area changes, and they stand in the exe's formation slots and follow by its rules.
   - The area map shows map notes and only perceived enemies.
