@@ -421,6 +421,9 @@ impl Live {
         } else {
             thedas_sim::session::open(&opts)?
         };
+        // The last orders, script log lines and the like, for issue reports (a debug read
+        // only; see `crate::report`).
+        sim.world.trace.keep_recent = crate::report::TRACE_RECENT;
         let save = match start {
             Start::Save(path) => Some((
                 std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
