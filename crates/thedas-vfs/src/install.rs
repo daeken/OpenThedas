@@ -169,6 +169,7 @@ impl DaoInstall {
         let user = crate::mods::original_user_dir(self.game());
         let mut vfs = self.stack(quality, user.as_deref())?;
         crate::mods::mount_default(&mut vfs, user.as_deref());
+        crate::mods::log_player_layers(&vfs);
         Ok(vfs)
     }
 
@@ -186,11 +187,28 @@ impl DaoInstall {
         let campaign = format!("modules/{}", self.game().campaign_module());
         let mut vfs = Vfs::new();
         let core = join_ci(&self.root, "packages/core");
-        self.push_package(&mut vfs, &core, quality, false)?;
-        self.push_package(&mut vfs, &join_ci(&self.root, &campaign), quality, true)?;
+        let install = |p: &Path| self.relative(p).into_owned();
+        // Layers from the player's folder are labelled `user:<path under it>`, so tools can
+        // tell them from the install's and a label never carries the player's home path.
+        let player = |p: &Path| {
+            let rel = user.and_then(|u| p.strip_prefix(u).ok()).unwrap_or(p);
+            let rel = rel
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            format!("{}{rel}", crate::mods::USER_LABEL)
+        };
+        push_package(&mut vfs, &core, quality, false, &install)?;
+        push_package(
+            &mut vfs,
+            &join_ci(&self.root, &campaign),
+            quality,
+            true,
+            &install,
+        )?;
         if let Some(user) = user {
-            self.push_package(&mut vfs, &join_ci(user, "packages/core"), quality, false)?;
-            self.push_package(&mut vfs, &join_ci(user, &campaign), quality, true)?;
+            let user_core = join_ci(user, "packages/core");
+            push_package(&mut vfs, &user_core, quality, false, &player)?;
+            push_package(&mut vfs, &join_ci(user, &campaign), quality, true, &player)?;
         }
         let mut addins = self.addins()?;
         if let Some(user) = user {
@@ -199,8 +217,19 @@ impl DaoInstall {
         }
         for addin in addins.into_iter().filter(|a| a.enabled) {
             if addin.extends_base_campaign() {
-                self.push_package(&mut vfs, &join_ci(&addin.dir, "core"), quality, true)?;
-                self.push_package(&mut vfs, &join_ci(&addin.dir, "module"), quality, true)?;
+                let label: &dyn Fn(&Path) -> String = if addin.dir.starts_with(&self.root) {
+                    &install
+                } else {
+                    &player
+                };
+                push_package(&mut vfs, &join_ci(&addin.dir, "core"), quality, true, label)?;
+                push_package(
+                    &mut vfs,
+                    &join_ci(&addin.dir, "module"),
+                    quality,
+                    true,
+                    label,
+                )?;
             }
         }
         let over = join_ci(&core, "override");
@@ -211,53 +240,52 @@ impl DaoInstall {
         }
         Ok(vfs)
     }
+}
 
-    /// Pushes one package folder's layers. `with_override` also pushes its `override` folder
-    /// on top; the core package's is the stack's overlay instead.
-    fn push_package(
-        &self,
-        vfs: &mut Vfs,
-        dir: &Path,
-        quality: TextureQuality,
-        with_override: bool,
-    ) -> Result<()> {
-        if !dir.is_dir() {
-            return Ok(());
-        }
-        let label = |p: &Path| self.relative(p).into_owned();
-        // Loose files first (lowest), as xoreos does.
-        for (sub, recursive) in [
-            ("data", false),
-            ("data/abilities", false),
-            ("data/movies", false),
-            ("data/talktables", false),
-            ("data/cursors", false),
-            ("textures", true),
-            ("audio", true),
-            ("patch", false),
-        ] {
-            let d = join_ci(dir, sub);
-            if d.is_dir() {
-                vfs.push_directory(&d, recursive, label(&d))?;
-            }
-        }
-        for sub in [
-            "data",
-            "data/abilities",
-            &format!("textures/{}", quality.dir()),
-            "patch",
-        ] {
-            for archive in archives_in(&join_ci(dir, sub))? {
-                let l = label(&archive);
-                vfs.push_archive(&archive, l)?;
-            }
-        }
-        let over = join_ci(dir, "override");
-        if with_override && over.is_dir() {
-            vfs.push_directory(&over, true, label(&over))?;
-        }
-        Ok(())
+/// Pushes one package folder's layers. `with_override` also pushes its `override` folder
+/// on top; the core package's is the stack's overlay instead.
+fn push_package(
+    vfs: &mut Vfs,
+    dir: &Path,
+    quality: TextureQuality,
+    with_override: bool,
+    label: &dyn Fn(&Path) -> String,
+) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
     }
+    // Loose files first (lowest), as xoreos does.
+    for (sub, recursive) in [
+        ("data", false),
+        ("data/abilities", false),
+        ("data/movies", false),
+        ("data/talktables", false),
+        ("data/cursors", false),
+        ("textures", true),
+        ("audio", true),
+        ("patch", false),
+    ] {
+        let d = join_ci(dir, sub);
+        if d.is_dir() {
+            vfs.push_directory(&d, recursive, label(&d))?;
+        }
+    }
+    for sub in [
+        "data",
+        "data/abilities",
+        &format!("textures/{}", quality.dir()),
+        "patch",
+    ] {
+        for archive in archives_in(&join_ci(dir, sub))? {
+            let l = label(&archive);
+            vfs.push_archive(&archive, l)?;
+        }
+    }
+    let over = join_ci(dir, "override");
+    if with_override && over.is_dir() {
+        vfs.push_directory(&over, true, label(&over))?;
+    }
+    Ok(())
 }
 
 fn sort_addins(addins: &mut [AddIn]) {
@@ -701,6 +729,19 @@ mod tests {
             ]
         );
         assert_eq!(vfs.hits("a.txt").len(), 7);
+        // The player's layers are named apart from the install's, without the home path.
+        let mine: Vec<(String, usize)> = crate::mods::player_layers(&vfs)
+            .into_iter()
+            .map(|l| (l.label, l.files))
+            .collect();
+        assert_eq!(
+            mine,
+            [
+                ("user:packages/core/data/ucore.erf".to_string(), 5),
+                ("user:modules/Single Player/override".to_string(), 4),
+                ("user:AddIns/y/core/data/y.erf".to_string(), 2),
+            ]
+        );
         // Without the player's folders: the install alone, override still on top.
         let vfs = install.global_vfs(TextureQuality::High).unwrap();
         assert_eq!(read(&vfs, "a.txt"), "core override");

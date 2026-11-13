@@ -52,6 +52,58 @@ pub const LIST_FILE: &str = "mods.txt";
 /// to load no mods at all, not even the user override folder.
 pub const ENV_VAR: &str = "THEDAS_MODS";
 
+/// Label prefix of a layer mounted from the original's folder in the player's documents.
+pub const USER_LABEL: &str = "user:";
+
+/// Label prefix of a layer mounted from the load-order list.
+pub const MOD_LABEL: &str = "mod:";
+
+/// A layer of a stack that does not come from the install: the player's own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayerLayer {
+    /// `user:<path under the original's documents folder>` or `mod:<name>`.
+    pub label: String,
+    /// Files the layer holds, counting ones a higher layer hides.
+    pub files: usize,
+}
+
+/// Every layer of `vfs` that came from the player's folders or the mod list, lowest priority
+/// first: what a problem report should name, since these change what the game reads.
+pub fn player_layers(vfs: &Vfs) -> Vec<PlayerLayer> {
+    let of = |v: &Vfs| -> Vec<PlayerLayer> {
+        v.layers()
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.label.starts_with(USER_LABEL) || l.label.starts_with(MOD_LABEL))
+            .map(|(i, l)| PlayerLayer {
+                label: l.label.clone(),
+                files: v.layer_files(i),
+            })
+            .collect()
+    };
+    let mut out = of(vfs);
+    if let Some(o) = vfs.overlay() {
+        out.extend(of(o));
+    }
+    out
+}
+
+/// Logs, once per process, how much of a session's stack is the player's own.
+pub(crate) fn log_player_layers(vfs: &Vfs) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let layers = player_layers(vfs);
+        let count = |prefix: &str| -> (usize, usize) {
+            let mine = layers.iter().filter(|l| l.label.starts_with(prefix));
+            (mine.clone().count(), mine.map(|l| l.files).sum())
+        };
+        let ((ul, uf), (ml, mf)) = (count(USER_LABEL), count(MOD_LABEL));
+        log::info!(
+            "mods: {uf} file(s) in {ul} layer(s) from the original's documents folder, {mf} file(s) in {ml} layer(s) from the mod list"
+        );
+    });
+}
+
 /// One line of the load-order list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModEntry {
@@ -194,7 +246,7 @@ fn label(entry: &ModEntry, what: &Path) -> String {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| p.to_string_lossy().into_owned())
     };
-    let mut l = format!("mod:{}", name(&entry.path));
+    let mut l = format!("{MOD_LABEL}{}", name(&entry.path));
     if let Some(inner) = &entry.inner {
         l.push_str("!/");
         l.push_str(inner);
@@ -279,8 +331,10 @@ pub fn mount_default(vfs: &mut Vfs, user: Option<&Path>) -> Vec<Mounted> {
         .map(|u| join_ci(u, "packages/core/override"))
         .filter(|d| d.is_dir());
     if let Some(dir) = user_override {
+        // Mounted as a mod folder is (archives in it below its loose files), under `user:`.
+        let before = overlay.layers().len();
         let entry = ModEntry {
-            path: dir,
+            path: dir.clone(),
             inner: None,
         };
         let mut problems = Vec::new();
@@ -290,6 +344,10 @@ pub fn mount_default(vfs: &mut Vfs, user: Option<&Path>) -> Vec<Mounted> {
         for p in problems {
             log::warn!("mods: user override folder: {p}");
         }
+        overlay.relabel(before, |l| {
+            let rest = l.strip_prefix(MOD_LABEL).unwrap_or(l);
+            format!("{USER_LABEL}packages/core/{rest}")
+        });
     }
     let report = ModList::load(&list_file).mount(&mut overlay);
     for m in &report {
