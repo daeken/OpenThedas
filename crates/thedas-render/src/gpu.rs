@@ -506,6 +506,9 @@ pub struct AreaRenderer {
     updated: bool,
     /// The scene's particle emitters, as [`AreaScene::emitters`] orders them.
     pub emitters: Vec<crate::particles::EmitterState>,
+    /// The clock when the props were first posed, which their effects' timelines run from
+    /// ([`crate::scene::EffectTimeline`]).
+    pub effects_epoch: Option<f64>,
     /// The draws of `CutAway` meshes ([`AreaScene::cut_away`]).
     cut_away: Vec<usize>,
     /// The emitters of models with a `CutAway` mesh ([`SceneEmitter::cut_away`]).
@@ -963,13 +966,20 @@ impl AreaRenderer {
                 .iter()
                 .enumerate()
                 .map(|(i, e)| {
-                    crate::particles::EmitterState::new(
+                    let mut state = crate::particles::EmitterState::new(
                         e.emitter.clone(),
                         e.transform,
                         crate::particles::seed(i, e.transform),
-                    )
+                    );
+                    // A prop's effect emits nothing until its timeline says (the first
+                    // posing), so the clock's first setting does not run it on.
+                    if e.owner.is_some() {
+                        state.rate = Some((0.0, 0.0));
+                    }
+                    state
                 })
                 .collect(),
+            effects_epoch: None,
             light: StandInLight::default(),
             stats,
             cut_away: scene.cut_away.clone(),
@@ -1156,7 +1166,9 @@ impl AreaRenderer {
                 .unwrap_or(glam::Mat4::IDENTITY);
             if let Some(state) = self.emitters.get_mut(e.emitter) {
                 state.world = transform * follow * e.in_model;
-                state.rate = e.rate.as_ref().map(|r| r.at(self.time as f32));
+                // Timed from the first posing, when the scene was built.
+                let epoch = *self.effects_epoch.get_or_insert(self.time);
+                state.rate = e.rate.as_ref().map(|r| r.at((self.time - epoch) as f32));
             }
         }
     }
