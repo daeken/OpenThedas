@@ -56,6 +56,24 @@ impl AddIn {
 /// The base campaign's module UID, as add-in manifests name it.
 const BASE_CAMPAIGN_UID: &str = "Single Player";
 
+/// Which game an install holds. Both use the same folder layout; what differs here is the
+/// base campaign's module folder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Game {
+    Origins,
+    DragonAge2,
+}
+
+impl Game {
+    /// The base campaign's folder under `modules/`.
+    pub fn campaign_module(self) -> &'static str {
+        match self {
+            Game::Origins => "single player",
+            Game::DragonAge2 => "campaign_base",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DaoInstall {
     root: PathBuf,
@@ -68,7 +86,7 @@ impl DaoInstall {
         if !join_ci(&root, "packages/core").is_dir() {
             return Err(Error::Malformed {
                 path: root,
-                reason: "not a Dragon Age: Origins install (no packages/core)".into(),
+                reason: "not a Dragon Age install (no packages/core)".into(),
             });
         }
         Ok(Self { root })
@@ -76,6 +94,17 @@ impl DaoInstall {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The game this install holds: Dragon Age II when it has `modules/campaign_base`,
+    /// Dragon Age: Origins otherwise.
+    pub fn game(&self) -> Game {
+        let da2 = format!("modules/{}", Game::DragonAge2.campaign_module());
+        if join_ci(&self.root, &da2).is_dir() {
+            Game::DragonAge2
+        } else {
+            Game::Origins
+        }
     }
 
     /// A path relative to the install root, for labels and reports. Always uses `/` as the
@@ -153,7 +182,10 @@ impl DaoInstall {
         self.push_package(&mut vfs, &join_ci(&self.root, "packages/core"), quality)?;
         self.push_package(
             &mut vfs,
-            &join_ci(&self.root, "modules/single player"),
+            &join_ci(
+                &self.root,
+                &format!("modules/{}", self.game().campaign_module()),
+            ),
             quality,
         )?;
         for addin in self.addins()?.into_iter().filter(|a| a.enabled) {
@@ -545,5 +577,25 @@ mod tests {
         );
         assert_eq!(xml_attr(xml, "AddInItem", "Missing"), None);
         assert_eq!(xml_attr(xml, "Nope", "UID"), None);
+    }
+
+    #[test]
+    fn a_dragon_age_2_install_mounts_campaign_base() {
+        let root = std::env::temp_dir().join(format!("thedas-install-da2-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("packages/core/data")).unwrap();
+        let origins = DaoInstall::open(&root).unwrap();
+        assert_eq!(origins.game(), Game::Origins);
+        assert_eq!(origins.game().campaign_module(), "single player");
+
+        let data = root.join("modules/campaign_base/data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("campaign.txt"), b"da2").unwrap();
+        let install = DaoInstall::open(&root).unwrap();
+        assert_eq!(install.game(), Game::DragonAge2);
+        let vfs = install.global_vfs(TextureQuality::High).unwrap();
+        let (bytes, prov) = vfs.read("campaign.txt").unwrap();
+        assert_eq!(bytes, b"da2");
+        assert_eq!(prov.layer_label, "modules/campaign_base/data");
+        std::fs::remove_dir_all(&root).ok();
     }
 }
