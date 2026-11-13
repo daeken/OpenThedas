@@ -45,6 +45,13 @@ pub const ALERT_QUEST: i32 = 1;
 pub const ALERT_CODEX: i32 = 2;
 /// notifications.gfx's `Alert.ALERT_ITEMS`: "Items received".
 pub const ALERT_ITEMS: i32 = 3;
+/// notifications.gfx's large alert types besides a new quest and a new codex entry: a new
+/// ability, an area unlocked on the world map and a specialization unlocked. DAOrigins.exe
+/// pushes these to the party's large-alert list only (builders 0x6291c0, 0x629360,
+/// 0x628e10).
+pub const ALERT_ABILITY: i32 = 7;
+pub const ALERT_WORLD_MAP: i32 = 10;
+pub const ALERT_SPECIALIZATION: i32 = 11;
 
 /// Quests, Chanter's Board jobs and quest groups (`plottypes.gda` rows).
 const KIND_QUEST: i32 = 1;
@@ -100,6 +107,17 @@ pub struct Alert {
     pub name: Option<u32>,
     /// The quest is done (`QuestCompleted`).
     pub completed: bool,
+    /// Text of its own (`CustomText`): the ability's, the map area's or the
+    /// specialization's name.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// An icon of its own (`CustomIcon`): the ability's or the specialization's icon
+    /// resource, or the image a script gave for a map area.
+    #[serde(default)]
+    pub icon: Option<String>,
+    /// The party member it is about (`Portrait`): who got the ability.
+    #[serde(default)]
+    pub creature: Option<thedas_script::vm::ObjectId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -247,22 +265,45 @@ impl Sim {
             return;
         };
         let completed = kind == ALERT_QUEST && info.finals.iter().any(|&f| self.flag_on(info, f));
-        self.world.alerts.retain(|a| a.kind != kind);
         let alert = Alert {
             kind,
             resref: info.resref.clone(),
             name: info.name_strref,
             completed,
+            ..Default::default()
         };
-        // A quest's first entry also shows large ("New Quest: A Day For Celebration"), one
-        // at a time (`Party.UberAlerts`; the movie asks for the next with
-        // `Party.HideUberAlert`). Provisional: seen in the original at the City Elf's first
-        // quest; which other alerts the exe shows large (the movie has headers for a new
-        // codex entry, ability, specialization and map area) is not traced.
+        // A quest's first entry shows large ("New Quest: A Day For Celebration"), one at a
+        // time (`Party.UberAlerts`; the movie asks for the next with `Party.HideUberAlert`),
+        // and not as the small "Quest updated" too: DAOrigins.exe's quest builder (0x628fe0,
+        // from the journal update at 0x75ff59) pushes to the large list only, and the
+        // original shows no small alert beside the banner at the City Elf's first quest.
+        // Provisional: the journal update's tests before the builder are not traced, and a
+        // new codex entry stays a small alert (the exe shows it large when its caller's
+        // flag is set, 0x6f44d4, which is not traced).
         if first && kind == ALERT_QUEST && !completed {
-            self.world.uber_alerts.push(alert.clone());
+            self.world.uber_alerts.push(alert);
+            return;
         }
+        self.world.alerts.retain(|a| a.kind != kind);
         self.world.alerts.push(alert);
+    }
+
+    /// Queues a large alert for a new ability, an unlocked map area or an unlocked
+    /// specialization (see [`ALERT_ABILITY`]).
+    pub(crate) fn raise_large_alert(
+        &mut self,
+        kind: i32,
+        text: Option<String>,
+        icon: Option<String>,
+        creature: Option<thedas_script::vm::ObjectId>,
+    ) {
+        self.world.uber_alerts.push(Alert {
+            kind,
+            text: text.filter(|t| !t.is_empty()),
+            icon: icon.filter(|i| !i.is_empty()),
+            creature,
+            ..Default::default()
+        });
     }
 
     /// Whether a plot type is a codex category (`plottypes.gda`'s `IsCodex`).
