@@ -64,6 +64,7 @@ mod paddev;
 mod padplay;
 mod report;
 mod reticle;
+mod rings;
 mod saves;
 mod screens;
 mod talkcam;
@@ -1310,6 +1311,9 @@ impl App {
         }
         g.ui.set_pad_active(self.pad.used);
         let hovered = self.hovered_creature();
+        if let Some(live) = self.live.as_mut() {
+            live.set_hovered(hovered);
+        }
         let voiced = self.line_voiced();
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
@@ -1461,6 +1465,9 @@ impl App {
         }
         g.ui.set_pad_active(self.pad.used);
         let hovered = self.hovered_creature();
+        if let Some(live) = self.live.as_mut() {
+            live.set_hovered(hovered);
+        }
         let voiced = self.line_voiced();
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());

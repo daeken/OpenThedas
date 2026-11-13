@@ -337,6 +337,8 @@ mod tests {
             camera_jumps: Vec::new(),
             links: Vec::new(),
             head_tracks: Vec::new(),
+            visibility: Vec::new(),
+            weapon_draws: Vec::new(),
         }
     }
 
