@@ -364,7 +364,7 @@ pub struct UiLayer {
     show_all_names: bool,
     /// The settings as they were when the options screen opened, while it is up: Cancel
     /// goes back to them (see `UiLayer::options_screen`).
-    options_before: Option<std::collections::BTreeMap<String, f64>>,
+    options_before: Option<(std::collections::BTreeMap<String, f64>, i32)>,
     /// Slots saved to whose picture the app has not taken yet (see
     /// [`UiLayer::take_saved_slots`]).
     saved_slots: Vec<i32>,
@@ -620,18 +620,37 @@ impl UiLayer {
     /// The options screen's Cancel leaves the settings as they were when it opened.
     /// optionsmenu.gfx sets each option as the player changes it and sends
     /// `ClientOptions.CommitOptions` only from OK (and from its resolution confirmation), so
-    /// what was set without it is dropped when the screen goes. Provisional: the exe's own
-    /// handling (its handlers at 0x7946c0) is not traced, and the difficulty, which the
-    /// simulation keeps, is not put back.
-    fn options_screen(&mut self, up: bool) {
+    /// what was set without it is dropped when the screen goes. The difficulty, which the
+    /// simulation keeps, is put back the way the screen sets it (the same message).
+    /// Provisional: the exe's own handling (its handlers at 0x7946c0) is not traced.
+    fn options_screen(&mut self, up: bool, sim: &Arc<Mutex<Sim>>) {
         match (up, self.options_before.take()) {
             (true, None) => {
-                self.options_before = self.shown.lock().ok().map(|s| s.options.clone());
+                let difficulty = sim
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .world
+                    .difficulty;
+                self.options_before = self
+                    .shown
+                    .lock()
+                    .ok()
+                    .map(|s| (s.options.clone(), difficulty));
             }
             (true, before) => self.options_before = before,
-            (false, Some(before)) => {
+            (false, Some((options, difficulty))) => {
                 if let Ok(mut shown) = self.shown.lock() {
-                    shown.options = before;
+                    shown.options = options;
+                }
+                let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+                if sim.world.difficulty != difficulty {
+                    sim.client_option_message(
+                        thedas_sim::chargen::MSG_CLIENT_OPTION,
+                        &[
+                            thedas_ui::options::DIFFICULTY.to_string(),
+                            difficulty.to_string(),
+                        ],
+                    );
                 }
             }
             (false, None) => {}
@@ -1772,7 +1791,7 @@ impl UiLayer {
                 self.continue_conversation();
             }
         }
-        self.options_screen(screens.menu == Some(Screen::Options));
+        self.options_screen(screens.menu == Some(Screen::Options), sim);
         self.write_settings();
         self.show_cutscene_line(sim);
         self.show_script_popup(sim);
@@ -1891,7 +1910,16 @@ impl UiLayer {
                 log::info!("ui: {name} {args:?}");
                 // The options screen's OK: what it set is kept (see `options_screen`).
                 if name == "ClientOptions.CommitOptions" && self.options_before.is_some() {
-                    self.options_before = self.shown.lock().ok().map(|s| s.options.clone());
+                    let difficulty = sim
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .world
+                        .difficulty;
+                    self.options_before = self
+                        .shown
+                        .lock()
+                        .ok()
+                        .map(|s| (s.options.clone(), difficulty));
                 }
                 // load_fade.gfx's fade to black is done.
                 if name == "GUIFadeToBlackLoading.FadeComplete"
