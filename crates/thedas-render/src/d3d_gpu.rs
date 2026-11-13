@@ -78,6 +78,27 @@ pub(crate) struct D3dDraw {
     sphere: Option<(Vec3, f32)>,
     /// A SpeedTree part's draw distances ([`crate::scene::DrawLod`]).
     lod: Option<crate::scene::DrawLod>,
+    /// Its position in [`D3dPass::draws`].
+    index: usize,
+    /// Drawn with a program that reads its constants per instance ([`D3dProgram::instanced`]):
+    /// with the other draws in view that share its pipeline, mesh, textures and index range,
+    /// as one instanced draw (see [`Instancing`]).
+    instanced: bool,
+    /// Which slot chunk ([`D3dPass::slot_groups`]) holds its constants, and its slot there.
+    chunk: usize,
+    local: u32,
+    /// What its textures come from: its material and probe; a draw with a lightmap never
+    /// shares its textures.
+    textures_key: (usize, Option<usize>, Option<usize>),
+}
+
+/// This frame's instanced draws ([`D3dDraw::instanced`]): per draw, the group it leads (one
+/// draw per group leads it; the others draw with it), and per group its first instance in the
+/// instance list, its instance count and its index range.
+#[derive(Default)]
+struct Instancing {
+    lead: Vec<Option<usize>>,
+    groups: Vec<(u32, u32, (u32, u32))>,
 }
 
 /// Pipelines and vertex buffers kept between passes (see [`crate::gpu::RenderCache`]).
@@ -85,11 +106,54 @@ pub(crate) struct D3dDraw {
 pub(crate) struct D3dCache {
     /// The constants layout every cached pipeline was made with.
     consts_layout: Option<wgpu::BindGroupLayout>,
+    /// The same for programs with per-instance constants ([`D3dProgram::instanced`]).
+    instanced_layout: Option<wgpu::BindGroupLayout>,
     /// By program name and target format: the pipeline and its texture layout.
     pipelines:
         HashMap<(String, wgpu::TextureFormat), (wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
     /// By mesh key and vertex input signature.
     vertices: HashMap<(String, String), wgpu::Buffer>,
+}
+
+/// The level's far billboard batch's vertex buffer, whose TEXCOORD0 each frame rewrites with
+/// the placements' fades ([`crate::scene::BillboardInstance::texcoord0`]).
+struct BillboardStream {
+    buffer: wgpu::Buffer,
+    /// The buffer's contents as last written.
+    data: std::sync::Mutex<Vec<f32>>,
+    /// Floats per vertex, and where TEXCOORD0 sits in one.
+    stride: usize,
+    at: usize,
+    instances: Vec<crate::scene::BillboardInstance>,
+}
+
+impl BillboardStream {
+    /// Rewrites the TEXCOORD0 of the placements whose fade changed for a camera at `eye`, in
+    /// one write spanning them.
+    fn update(&self, queue: &wgpu::Queue, eye: Vec3) {
+        let mut data = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let mut span: Option<(usize, usize)> = None;
+        for (k, instance) in self.instances.iter().enumerate() {
+            let value = instance.texcoord0(eye);
+            for v in 4 * k..4 * k + 4 {
+                let at = v * self.stride + self.at;
+                let Some(slot) = data.get_mut(at..at + 4) else {
+                    continue;
+                };
+                if slot != value {
+                    slot.copy_from_slice(&value);
+                    span = Some(span.map_or((at, at + 4), |(a, b)| (a.min(at), b.max(at + 4))));
+                }
+            }
+        }
+        if let Some((a, b)) = span {
+            queue.write_buffer(
+                &self.buffer,
+                (a * 4) as u64,
+                bytemuck::cast_slice(&data[a..b]),
+            );
+        }
+    }
 }
 
 pub(crate) struct D3dPass {
@@ -121,6 +185,18 @@ pub(crate) struct D3dPass {
     /// index range to draw and the alpha reference, `None` when the part is not drawn.
     tree_lods: Vec<Option<crate::scene::TreeLod>>,
     tree_frame: std::sync::Mutex<Vec<Option<(u32, u32, f32)>>>,
+    /// The level's far billboard batches.
+    billboards: Vec<BillboardStream>,
+    /// For the instanced programs: per chunk of slots, its constants and the instance list
+    /// ([`instanced_const_layout`]); the list itself; and this frame's groups.
+    slot_groups: Vec<wgpu::BindGroup>,
+    instance_buffer: Option<wgpu::Buffer>,
+    instancing: std::sync::Mutex<Instancing>,
+    /// The level's five winds for its trees, 0.2 s apart (DAOrigins.exe 0x5365c0); empty
+    /// when the level has no wind file.
+    winds: std::sync::Mutex<Vec<thedas_formats::speedtree_gen::wind::Wind>>,
+    /// The time the winds were last stepped to.
+    wind_time: std::sync::Mutex<f32>,
     /// The level's sun (direction, colour), if it has one.
     sun: Option<(Vec3, Vec3)>,
     fog: [[f32; 4]; 2],
@@ -990,6 +1066,31 @@ fn texture_layout(device: &wgpu::Device, program: &D3dProgram) -> wgpu::BindGrou
     })
 }
 
+/// The constants of programs with per-instance constants: every slot of a chunk as one
+/// storage array, and this frame's instance list.
+fn instanced_const_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let entry = |binding: u32, vis: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: vis,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("d3d instanced constants"),
+        entries: &[
+            entry(
+                translate::BINDING_SLOTS,
+                wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ),
+            entry(translate::BINDING_INSTANCES, wgpu::ShaderStages::VERTEX),
+        ],
+    })
+}
+
 fn const_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     let entry = |binding: u32, vis: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
         binding,
@@ -1338,6 +1439,10 @@ impl D3dPass {
             .consts_layout
             .get_or_insert_with(|| const_layout(device))
             .clone();
+        let instanced_layout = cache
+            .instanced_layout
+            .get_or_insert_with(|| instanced_const_layout(device))
+            .clone();
         let mut pipelines: Vec<D3dPipeline> = Vec::new();
         let mut layouts: Vec<wgpu::BindGroupLayout> = Vec::new();
         let mut by_name: HashMap<String, usize> = HashMap::new();
@@ -1371,8 +1476,12 @@ impl D3dPass {
                         .entry((program.name.clone(), color_format))
                         .or_insert_with(|| {
                             let tl = texture_layout(device, program);
-                            let pipeline =
-                                create_pipeline(device, program, &consts_layout, &tl, color_format);
+                            let cl = if program.instanced {
+                                &instanced_layout
+                            } else {
+                                &consts_layout
+                            };
+                            let pipeline = create_pipeline(device, program, cl, &tl, color_format);
                             (pipeline, tl)
                         })
                         .clone();
@@ -1393,12 +1502,56 @@ impl D3dPass {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("d3d constants"),
                 size: slot_size * pending.len() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::UNIFORM
+                    | wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })
         });
+        // The instanced programs read the slots as storage arrays, as many slots a chunk as
+        // one storage binding may hold, and their slot from the frame's instance list.
+        let per_chunk = (device.limits().max_storage_buffer_binding_size / slot_size).max(1);
+        let any_instanced = pending
+            .iter()
+            .any(|&(_, pi, _)| pipelines[pi].program.instanced);
+        let instance_buffer = (any_instanced && !pending.is_empty()).then(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("d3d instance list"),
+                size: 4 * pending.len() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        let slot_groups: Vec<wgpu::BindGroup> = match (&buffer, &instance_buffer) {
+            (Some(buf), Some(list)) => (0..(pending.len() as u64).div_ceil(per_chunk))
+                .map(|c| {
+                    let first = c * per_chunk;
+                    let n = per_chunk.min(pending.len() as u64 - first);
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("d3d instanced constants"),
+                        layout: &instanced_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: translate::BINDING_SLOTS,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: buf,
+                                    offset: first * slot_size,
+                                    size: wgpu::BufferSize::new(n * slot_size),
+                                }),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: translate::BINDING_INSTANCES,
+                                resource: list.as_entire_binding(),
+                            },
+                        ],
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
 
         let mut draws = Vec::new();
+        let mut billboards: Vec<BillboardStream> = Vec::new();
         let mut mesh_spheres: HashMap<usize, (Vec3, f32)> = HashMap::new();
         for (k, (di, pi, multipass)) in pending.into_iter().enumerate() {
             let d = &scene.draws[di];
@@ -1409,19 +1562,41 @@ impl D3dPass {
                 .iter()
                 .map(|s| format!("{:?}{}@{};", s.semantic.usage, s.semantic.index, s.location))
                 .collect();
+            let batch = scene.tree_billboards.get(&di);
             let vertices = cache
                 .vertices
                 .entry((mesh.key.clone(), sig))
                 .or_insert_with(|| {
                     use wgpu::util::DeviceExt;
                     let data = expand_vertices(mesh, inputs);
+                    // The billboard batch's fades are rewritten each frame.
+                    let usage = match batch {
+                        Some(_) => wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        None => wgpu::BufferUsages::VERTEX,
+                    };
                     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some(&mesh.key),
                         contents: bytemuck::cast_slice(&data),
-                        usage: wgpu::BufferUsages::VERTEX,
+                        usage,
                     })
                 })
                 .clone();
+            if let Some(instances) = batch
+                && !billboards
+                    .iter()
+                    .any(|b: &BillboardStream| b.buffer == vertices)
+                && let Some(at) = inputs.iter().position(|s| {
+                    decl_usage(s.semantic.usage) == DeclUsage::TexCoord && s.semantic.index == 0
+                })
+            {
+                billboards.push(BillboardStream {
+                    buffer: vertices.clone(),
+                    data: std::sync::Mutex::new(expand_vertices(mesh, inputs)),
+                    stride: inputs.len() * 4,
+                    at: at * 4,
+                    instances: instances.clone(),
+                });
+            }
             let buf = buffer.as_ref().expect("buffer exists when there are draws");
             let slot = slot_size * k as u64;
             let consts = const_group(device, &consts_layout, buf, slot);
@@ -1441,7 +1616,13 @@ impl D3dPass {
                     .and_then(|p| scene.probes.get(p))
                     .map(|p| p.name.as_str()),
             );
+            let instanced = program.instanced;
             draws.push(D3dDraw {
+                index: draws.len(),
+                instanced,
+                chunk: (k as u64 / per_chunk) as usize,
+                local: (k as u64 % per_chunk) as u32,
+                textures_key: (d.material, d.probe, d.lightmap.is_some().then_some(di)),
                 pipeline: pi,
                 vertices,
                 mesh: d.mesh,
@@ -1714,12 +1895,23 @@ impl D3dPass {
             bones: vec![Vec::new(); scene.draws.len()],
             scene_probes: scene.probes.iter().map(|p| p.probe.clone()).collect(),
             trees: (0..scene.draws.len())
-                .map(|i| scene.tree_constants.get(&i).copied())
+                .map(|i| scene.tree_constants.get(&i).cloned())
                 .collect(),
             tree_lods: (0..scene.draws.len())
                 .map(|i| scene.tree_lods.get(&i).cloned())
                 .collect(),
             tree_frame: std::sync::Mutex::new(vec![None; scene.draws.len()]),
+            billboards,
+            slot_groups,
+            instance_buffer,
+            instancing: std::sync::Mutex::new(Instancing::default()),
+            wind_time: std::sync::Mutex::new(0.0),
+            winds: std::sync::Mutex::new(match scene.wind {
+                Some((strength, direction)) if !scene.tree_constants.is_empty() => (0..5)
+                    .map(|_| thedas_formats::speedtree_gen::wind::Wind::dao(strength, direction))
+                    .collect(),
+                _ => Vec::new(),
+            }),
             ambients: scene
                 .draws
                 .iter()
@@ -1834,6 +2026,7 @@ impl D3dPass {
                 shadow: crate::d3d::NO_SHADOW_DATA,
                 partition: None,
                 tree: None,
+                winds: &[],
             };
             let mut data = vec![0u8; slot_size];
             for (table, base) in [(program.vs.ctab.as_ref(), 0), (program.ps.ctab.as_ref(), 3)] {
@@ -2068,11 +2261,52 @@ impl D3dPass {
         // Only the draws in view get constants (and are drawn); a skinned draw's bounds
         // follow its bones (see [`skinned_sphere`]).
         let view_proj = projection * view;
+        // The winds step to this frame's time, each 0.2 s after the last; a paused clock
+        // leaves them where they are.
+        let wind_from = {
+            let mut last = self.wind_time.lock().unwrap_or_else(|e| e.into_inner());
+            let from = *last;
+            if !warm {
+                *last = time;
+            }
+            from
+        };
+        let winds: Vec<crate::d3d::WindFrame> = self
+            .winds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+            .enumerate()
+            .map(|(k, w)| {
+                if !warm {
+                    // The simulation is built for frame-sized steps (its followers move
+                    // by at most 0.03 s a step), so a jump in time (a headless capture at
+                    // a late time, a long stall) is walked in thirtieths of a second, up
+                    // to a minute of them.
+                    let mut t = wind_from.max(time - 60.0);
+                    while time - t > 0.05 {
+                        t += 1.0 / 30.0;
+                        w.advance(t + 0.2 * k as f32);
+                    }
+                    w.advance(time + 0.2 * k as f32);
+                }
+                let rad = std::f32::consts::PI / 180.0;
+                crate::d3d::WindFrame {
+                    matrices: w.matrices(),
+                    leaf_angles: w
+                        .leaf_angles()
+                        .map(|(rock, rustle)| [rock * rad, rustle * rad]),
+                }
+            })
+            .collect();
         // The trees' levels of detail for this camera.
         let mut tree_frame = self.tree_frame.lock().unwrap_or_else(|e| e.into_inner());
         if !warm {
             for (frame, lod) in tree_frame.iter_mut().zip(&self.tree_lods) {
                 *frame = lod.as_ref().and_then(|l| l.frame(camera.position));
+            }
+            for b in &self.billboards {
+                b.update(&ctx.queue, camera.position);
             }
         }
         let in_view: Vec<bool> = self
@@ -2095,6 +2329,9 @@ impl D3dPass {
                         .is_none_or(|(centre, radius)| in_view(&view_proj, centre, radius))
             })
             .collect();
+        if !warm {
+            self.group_instances(ctx, &in_view, &tree_frame);
+        }
         let slot_size = SLOT[7] as usize;
         // The constants of consecutive slots written whole, in one go.
         let mut run: Vec<u8> = Vec::new();
@@ -2164,6 +2401,7 @@ impl D3dPass {
                 shadow,
                 partition: None,
                 tree: self.trees.get(d.draw).and_then(|t| t.as_ref()),
+                winds: &winds,
             };
             // The constants that stay as the draw was made are filled once (see
             // [`ConstantContext::per_frame`]); each frame refills the rest over them.
@@ -2426,6 +2664,7 @@ impl D3dPass {
                     shadow: crate::d3d::NO_SHADOW_DATA,
                     partition: Some(partitions[k].view_proj),
                     tree: None,
+                    winds: &[],
                 };
                 for (table, base) in [(program.vs.ctab.as_ref(), 0), (program.ps.ctab.as_ref(), 3)]
                 {
@@ -2541,6 +2780,58 @@ impl D3dPass {
         v.get(i).copied().unwrap_or(v.is_empty())
     }
 
+    /// Groups this frame's instanced draws in view by pipeline, mesh, textures, slot chunk
+    /// and index range, and writes the instance list: each group's slots, in draw order.
+    fn group_instances(
+        &self,
+        ctx: &GpuContext,
+        in_view: &[bool],
+        tree_frame: &[Option<(u32, u32, f32)>],
+    ) {
+        let Some(list_buffer) = &self.instance_buffer else {
+            return;
+        };
+        type Key = (
+            usize,
+            usize,
+            usize,
+            (usize, Option<usize>, Option<usize>),
+            (u32, u32),
+        );
+        let mut by_key: HashMap<Key, usize> = HashMap::new();
+        let mut members: Vec<(usize, (u32, u32), Vec<u32>)> = Vec::new();
+        for (i, d) in self.draws.iter().enumerate() {
+            if !d.instanced || !in_view.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let range = match tree_frame.get(d.draw) {
+                Some(Some((first, n, _))) => (*first, *n),
+                _ => (0, u32::MAX),
+            };
+            let key = (d.chunk, d.pipeline, d.mesh, d.textures_key, range);
+            let g = *by_key.entry(key).or_insert_with(|| {
+                members.push((i, range, Vec::new()));
+                members.len() - 1
+            });
+            members[g].2.push(d.local);
+        }
+        let mut inst = self.instancing.lock().unwrap_or_else(|e| e.into_inner());
+        inst.lead.clear();
+        inst.lead.resize(self.draws.len(), None);
+        inst.groups.clear();
+        let mut list: Vec<u32> = Vec::new();
+        for (leader, range, slots) in members {
+            inst.lead[leader] = Some(inst.groups.len());
+            inst.groups
+                .push((list.len() as u32, slots.len() as u32, range));
+            list.extend(slots);
+        }
+        if !list.is_empty() {
+            ctx.queue
+                .write_buffer(list_buffer, 0, bytemuck::cast_slice(&list));
+        }
+    }
+
     pub fn draw(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -2548,6 +2839,26 @@ impl D3dPass {
         indices: &wgpu::Buffer,
         count: u32,
     ) {
+        if d.instanced {
+            // Drawn by its group's leader, with the group's other draws as instances.
+            let inst = self.instancing.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(&Some(g)) = inst.lead.get(d.index) else {
+                return;
+            };
+            let (Some(&(start, n, (first, len))), Some(consts)) =
+                (inst.groups.get(g), self.slot_groups.get(d.chunk))
+            else {
+                return;
+            };
+            pass.set_pipeline(&self.pipelines[d.pipeline].pipeline);
+            pass.set_bind_group(0, consts, &[]);
+            pass.set_bind_group(1, &d.textures, &[]);
+            pass.set_vertex_buffer(0, d.vertices.slice(..));
+            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+            let end = first.saturating_add(len).min(count);
+            pass.draw_indexed(first.min(end)..end, 0, start..start + n);
+            return;
+        }
         let faded = self
             .faded_pipeline(d)
             .unwrap_or(&self.pipelines[d.pipeline].pipeline);

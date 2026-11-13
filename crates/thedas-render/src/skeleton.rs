@@ -8,6 +8,11 @@
 //! out (the root's keys lack the hip height, other nodes' come out doubled), so they apply
 //! as offsets from the clip's first key on top of the rest translation (provisional).
 //! Nodes without a track keep their rest placement.
+//!
+//! An additive animation ([`Animation::additive`], field 4011: conversation gestures such as
+//! `mh.po_2arm_06.ani` and the face overlays `mh_o.*`) holds offsets from the identity, not
+//! a pose: it turns the pose beneath rather than replacing it (see
+//! [`Skeleton::pose_layers`]).
 
 use std::collections::HashMap;
 
@@ -114,11 +119,20 @@ impl Skeleton {
     /// animation's lowered hips stay lowered against the standing pose). Provisional: from
     /// what the animations look like; the executable's blend layers and weights are not
     /// followed.
+    ///
+    /// Additive layers ([`Animation::additive`]) go on last, in their order, whatever their
+    /// place in `layers` (DAOrigins.exe keeps them on a list of their own and blends it after
+    /// the others, 0x8149d0, 0x544620): each rotation key turns its bone's pose (key × pose,
+    /// 0x8111e0 → 0x4cb640) and each translation key is added to its bone's translation
+    /// (0x8110f0), on the bones the clip has tracks for. They are taken at full weight
+    /// (provisional: the executable scales each by its instance's weight, which is not
+    /// followed), and the translation sum rests on the key convention above (provisional).
     pub fn pose_layers(&self, layers: &[(&Animation, f32, bool)]) -> Vec<Mat4> {
         let mut rot: Vec<Option<Quat>> = vec![None; self.bones.len()];
         let mut pos: Vec<Option<Vec3>> = vec![None; self.bones.len()];
         let mut reference: Vec<Option<Vec3>> = vec![None; self.bones.len()];
-        if let Some((base, _, _)) = layers.first() {
+        let (additive, posed): (Vec<_>, Vec<_>) = layers.iter().partition(|(a, _, _)| a.additive);
+        if let Some((base, _, _)) = posed.first() {
             for track in &base.tracks {
                 if track.channel == Channel::Translation
                     && let (Some(i), Some(k)) = (self.node(&track.bone), track.keys.first())
@@ -128,9 +142,12 @@ impl Skeleton {
                 }
             }
         }
-        for (n, (anim, time, against_base)) in layers.iter().enumerate() {
+        for (n, (anim, time, against_base)) in posed.iter().enumerate() {
             let r = (n > 0 && *against_base).then_some(reference.as_slice());
             self.sample_into(anim, *time, r, &mut rot, &mut pos);
+        }
+        for (anim, time, _) in additive {
+            self.add_into(anim, time, &mut rot, &mut pos);
         }
         self.globals(|i| {
             let b = &self.bones[i];
@@ -139,6 +156,39 @@ impl Skeleton {
                 rot[i].unwrap_or(b.rest_rotation),
             )
         })
+    }
+
+    /// Lays additive animation `anim` at `time` over the local pose in `rot` and `pos`
+    /// (bones not set there are at rest): see [`Skeleton::pose_layers`].
+    fn add_into(
+        &self,
+        anim: &Animation,
+        time: f32,
+        rot: &mut [Option<Quat>],
+        pos: &mut [Option<Vec3>],
+    ) {
+        let t = time.clamp(0.0, anim.length.max(0.0));
+        for track in &anim.tracks {
+            let Some(i) = self.node(&track.bone) else {
+                continue;
+            };
+            let rest = &self.bones[i];
+            match track.channel {
+                Channel::Rotation => {
+                    if let (Some(d), Some(slot)) = (sample_rotation(&track.keys, t), rot.get_mut(i))
+                    {
+                        *slot = Some((d * slot.unwrap_or(rest.rest_rotation)).normalize());
+                    }
+                }
+                Channel::Translation => {
+                    if let (Some(d), Some(slot)) =
+                        (sample_translation(&track.keys, t), pos.get_mut(i))
+                    {
+                        *slot = Some(slot.unwrap_or(rest.rest_translation) + d);
+                    }
+                }
+            }
+        }
     }
 
     fn sample_into(
@@ -282,6 +332,7 @@ mod tests {
         let anim = Animation {
             name: "t".into(),
             length: 1.0,
+            additive: false,
             tracks: vec![Track {
                 bone: "shoulder".into(),
                 channel: Channel::Rotation,
@@ -318,6 +369,113 @@ mod tests {
             rows[3],
             [1.0, 0.0, 0.0, 0.0],
             "a missing bone stays at rest"
+        );
+    }
+
+    fn rotation_clip(bone: &str, additive: bool, keys: &[(f32, Quat)]) -> Animation {
+        Animation {
+            name: "t".into(),
+            length: 1.0,
+            additive,
+            tracks: vec![Track {
+                bone: bone.into(),
+                channel: Channel::Rotation,
+                keys: keys
+                    .iter()
+                    .map(|(time, q)| Key {
+                        time: *time,
+                        value: q.to_array(),
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    fn local_rotation(s: &Skeleton, pose: &[Mat4], bone: &str) -> Quat {
+        let i = s.node(bone).unwrap();
+        let parent = s.bones[i].parent.map_or(Mat4::IDENTITY, |p| pose[p]);
+        let (_, r, _) = (parent.inverse() * pose[i]).to_scale_rotation_translation();
+        r
+    }
+
+    #[test]
+    fn an_additive_layer_turns_the_pose_beneath_it() {
+        use std::f32::consts::FRAC_PI_2;
+        let s = arm();
+        // The body holds the shoulder a quarter turn about z.
+        let held = Quat::from_rotation_z(FRAC_PI_2);
+        let body = rotation_clip("shoulder", false, &[(0.0, held)]);
+        // A gesture's offsets start at the identity and lift the arm about x by 0.3 rad;
+        // it also has an elbow track at the identity.
+        let lift = Quat::from_rotation_x(0.3);
+        let mut gesture = rotation_clip("shoulder", true, &[(0.0, Quat::IDENTITY), (1.0, lift)]);
+        gesture.tracks.push(Track {
+            bone: "elbow".into(),
+            channel: Channel::Rotation,
+            keys: vec![Key {
+                time: 0.0,
+                value: [0.0, 0.0, 0.0, 1.0],
+            }],
+        });
+        let close = |a: Quat, b: Quat| a.dot(b).abs() > 1.0 - 1e-5;
+        // At its start it leaves the pose as the body has it.
+        let start = s.pose_layers(&[(&body, 0.0, false), (&gesture, 0.0, true)]);
+        assert!(close(local_rotation(&s, &start, "shoulder"), held));
+        // At its end the lift turns the held shoulder (key × pose), not replacing it.
+        let end = s.pose_layers(&[(&body, 0.0, false), (&gesture, 1.0, true)]);
+        assert!(close(local_rotation(&s, &end, "shoulder"), lift * held));
+        // An identity offset leaves a bone the body does not animate at its rest.
+        assert!(close(local_rotation(&s, &end, "elbow"), Quat::IDENTITY));
+        // Applied as a pose, the same gesture would have dropped the held turn.
+        let wrong = s.pose_layers(&[
+            (&body, 0.0, false),
+            (&rotation_clip("shoulder", false, &[(0.0, lift)]), 0.0, true),
+        ]);
+        assert!(!close(local_rotation(&s, &wrong, "shoulder"), lift * held));
+    }
+
+    #[test]
+    fn additive_layers_go_on_after_the_poses() {
+        use std::f32::consts::FRAC_PI_2;
+        let s = arm();
+        let body = rotation_clip("shoulder", false, &[(0.0, Quat::IDENTITY)]);
+        let lift = Quat::from_rotation_x(0.3);
+        let gesture = rotation_clip("shoulder", true, &[(0.0, lift)]);
+        // A pose layer listed after the additive one still lies beneath it.
+        let turn = Quat::from_rotation_z(FRAC_PI_2);
+        let later = rotation_clip("shoulder", false, &[(0.0, turn)]);
+        let p = s.pose_layers(&[
+            (&body, 0.0, false),
+            (&gesture, 0.0, true),
+            (&later, 0.0, true),
+        ]);
+        assert!(local_rotation(&s, &p, "shoulder").dot(lift * turn).abs() > 1.0 - 1e-5);
+        // With nothing beneath, the offsets turn the rest pose.
+        let alone = s.pose_layers(&[(&gesture, 0.0, true)]);
+        assert!(local_rotation(&s, &alone, "shoulder").dot(lift).abs() > 1.0 - 1e-5);
+    }
+
+    #[test]
+    fn an_additive_translation_is_added() {
+        let s = arm();
+        let shift = Animation {
+            name: "t".into(),
+            length: 1.0,
+            additive: true,
+            tracks: vec![Track {
+                bone: "elbow".into(),
+                channel: Channel::Translation,
+                keys: vec![Key {
+                    time: 0.0,
+                    value: [0.0, 0.5, 0.0, 0.0],
+                }],
+            }],
+        };
+        let p = s.pose_layers(&[(&shift, 0.0, false)]);
+        let elbow = p[s.node("elbow").unwrap()].transform_point3(Vec3::ZERO);
+        assert!(
+            (elbow - Vec3::new(1.0, 0.5, 1.0)).length() < 1e-5,
+            "{elbow:?}"
         );
     }
 

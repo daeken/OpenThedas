@@ -539,6 +539,9 @@ struct App {
     /// Where the player's games are saved.
     saves_dir: PathBuf,
     cursor: (f64, f64),
+    /// The last check of whether the interface covers the cursor while it is over a
+    /// creature: (cursor, creature) → covered (see `App::update_hover`).
+    hover_probe: Option<((f64, f64), thedas_script::vm::ObjectId, bool)>,
     camera: Camera,
     size: (u32, u32),
     gfx: Option<Gfx>,
@@ -642,7 +645,7 @@ fn play_interface(
                 live.aiming = Some(aim);
             }
             ui.update_minimap(&live.sim, camera);
-            ui.update_floaties(&live.sim, camera, dt.min(100.0));
+            ui.update_floaties(&live.sim, camera, dt.min(100.0), &|c| live.head_height(c));
         }
         _ => {
             for call in ui.tick(dt.min(100.0)) {
@@ -1100,22 +1103,7 @@ impl App {
             // Portraits are drawn by the objects' renderers, whose constants this frame's
             // draws use too: they are drawn (and submitted) before the frame is encoded, so
             // the frame is not drawn from the portrait camera.
-            if self.screens.is_some() {
-                let key = ui::portrait_key(&live.sim());
-                if g.ui.wants_portraits(key, dt) {
-                    let shots = live.portraits(&g.ctx, ui::PORTRAIT_SIZE);
-                    g.ui.set_portraits(shots);
-                }
-                let due = self
-                    .screens
-                    .as_ref()
-                    .and_then(|s| g.ui.wants_paperdoll(s, &live.sim(), dt));
-                if let Some((who, yaw)) = due {
-                    let (w, h) = ui::PAPERDOLL_SIZE;
-                    let shot = live.paperdoll(&g.ctx, who, yaw, w, h);
-                    g.ui.set_paperdoll(shot);
-                }
-            }
+            draw_likenesses(live, &mut g.ui, self.screens.as_ref(), &g.ctx, dt);
         }
         let size = (g.config.width, g.config.height);
         let drawn = match (self.live.as_mut(), g.renderer.as_mut()) {
@@ -1156,6 +1144,11 @@ impl App {
             }
         }
         g.ui.set_pad_active(self.pad.used);
+        let hovered = self.hovered_creature();
+        let Some(g) = self.gfx.as_mut() else {
+            return Ok(());
+        };
+        g.ui.set_hovered(hovered);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -1212,7 +1205,8 @@ impl App {
             .map(|(p, ms)| (p.to_path_buf(), ms));
         let live = self.live.as_mut().filter(|_| self.intro.is_none());
         let ui = self.gfx.as_mut().map(|g| &mut g.ui);
-        let state = audio_state(a, live, ui, &self.camera, movie);
+        let mut state = audio_state(a, live, ui, &self.camera, movie);
+        state.gui = self.screens.as_ref().is_some_and(|s| s.world_stopped());
         a.frame(state);
         let voice = a.voice_ms();
         if let Some(g) = self.gfx.as_mut() {
@@ -1244,6 +1238,10 @@ impl App {
             if self.screens.is_some() {
                 loading_screen(live, &mut g.ui, &mut self.load_screen_up);
             }
+            // The party's portraits and the paperdoll are drawn into their own targets, so
+            // they are kept up with no frame to present too (a hidden window's portraits
+            // stayed empty, and a client's offscreen frame showed them so).
+            draw_likenesses(live, &mut g.ui, self.screens.as_ref(), &g.ctx, dt);
         }
         if self.live.is_none() {
             if let Some(r) = g.renderer.as_mut() {
@@ -1251,6 +1249,11 @@ impl App {
             }
         }
         g.ui.set_pad_active(self.pad.used);
+        let hovered = self.hovered_creature();
+        let Some(g) = self.gfx.as_mut() else {
+            return Ok(());
+        };
+        g.ui.set_hovered(hovered);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -1303,6 +1306,29 @@ impl App {
         write_png(&path, w, h, &pixels)?;
         println!("wrote {} (camera {})", path.display(), self.camera.spec());
         Ok(())
+    }
+
+    /// The creature the mouse is over, for its name over its head: none while the
+    /// interface covers the cursor (a screen, the HUD). The interface's cover is read back
+    /// from the GPU, so it is checked again only when the cursor or the creature changes.
+    fn hovered_creature(&mut self) -> Option<thedas_script::vm::ObjectId> {
+        let (Some(live), Some(g)) = (self.live.as_mut(), self.gfx.as_ref()) else {
+            return None;
+        };
+        let (w, h) = (g.config.width as f32, g.config.height as f32);
+        let (x, y) = self.cursor;
+        let (origin, dir) = self.camera.ray(x as f32, y as f32, w, h);
+        let creature = live.hovered_creature(origin, dir)?;
+        let covered = match self.hover_probe {
+            Some((at, c, covered)) if at == self.cursor && c == creature => covered,
+            _ => {
+                let covered = g.ui.covers(x, y);
+                log::debug!(target: "thedas_app::hover", "{creature:?} at {x},{y}, covered {covered}");
+                self.hover_probe = Some((self.cursor, creature, covered));
+                covered
+            }
+        };
+        (!covered).then_some(creature)
     }
 
     /// A left click at window pixel (`x`, `y`) while playing: the party leader is ordered to
@@ -2395,6 +2421,41 @@ impl ApplicationHandler for App {
 /// the boot movies), its interface (`ui`: the sounds it asked for, the player's volumes),
 /// the camera, and a boot movie playing. A cutscene's or area's sound data is read here
 /// when it starts.
+/// The voice-over the line on screen wants: the conversation's line, else a cutscene's line
+/// that has its own voice. With [`audio::GameAudio::line_voice`] this says whether the line
+/// is voiced (and for how long) as soon as it is chosen, before its voice plays.
+pub(crate) fn voice_line(sim: &thedas_sim::Sim) -> Option<audio::VoiceLine> {
+    let line = sim.conversation_line().and_then(|l| {
+        let female = sim
+            .world
+            .get(l.player)
+            .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
+        Some(audio::VoiceLine {
+            dialog: l.dialog.to_string(),
+            strref: l.strref?,
+            female,
+            ambient: l.ambient,
+        })
+    });
+    if line.is_some() {
+        return line;
+    }
+    let c = sim.world.cutscene.as_ref()?;
+    let l = c.line_now().filter(|l| l.vo_mode == 0)?;
+    let conv = l.conversation.as_ref()?;
+    let female = sim
+        .world
+        .hero
+        .and_then(|h| sim.world.get(h))
+        .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
+    Some(audio::VoiceLine {
+        dialog: conv.clone(),
+        strref: l.strref,
+        female,
+        ambient: false,
+    })
+}
+
 fn audio_state(
     a: &mut audio::GameAudio,
     live: Option<&mut live::Live>,
@@ -2540,19 +2601,8 @@ fn audio_state(
             .hero
             .and_then(|h| sim.world.get(h))
             .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
-        state.line = sim.conversation_line().and_then(|l| {
-            let female = sim
-                .world
-                .get(l.player)
-                .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
-            Some(audio::VoiceLine {
-                dialog: l.dialog.to_string(),
-                strref: l.strref?,
-                female,
-                ambient: l.ambient,
-            })
-        });
-        // A cutscene's sound tracks, and its line's voice when the line has its own.
+        state.line = voice_line(&sim);
+        // A cutscene's sound tracks.
         if let Some(c) = sim.world.cutscene.as_ref() {
             if a.wants_cutscene(&c.name) {
                 let tracks = sim
@@ -2563,23 +2613,6 @@ fn audio_state(
                 a.set_cutscene(&c.name, tracks);
             }
             state.cutscene = Some((c.name.clone(), c.elapsed_ms as f32 / 1000.0));
-            if state.line.is_none()
-                && let Some(l) = c.line_now()
-                && l.vo_mode == 0
-                && let Some(conv) = l.conversation.as_ref()
-            {
-                let female = sim
-                    .world
-                    .hero
-                    .and_then(|h| sim.world.get(h))
-                    .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
-                state.line = Some(audio::VoiceLine {
-                    dialog: conv.clone(),
-                    strref: l.strref,
-                    female,
-                    ambient: false,
-                });
-            }
         }
     }
     // Sounds the simulation asked for (scripts, character creation's voice preview).
@@ -2958,6 +2991,32 @@ fn travel_to_pin(sim: &mut thedas_sim::Sim, tag: &str) -> bool {
         })
         .map(|o| o.id);
     pin.is_some_and(|p| sim.begin_travel(p))
+}
+
+/// Draws the party's portraits and the paperdoll when they are due (see
+/// [`ui::UiLayer::wants_portraits`] and [`ui::UiLayer::wants_paperdoll`]), with the
+/// interface up.
+fn draw_likenesses(
+    live: &mut live::Live,
+    ui: &mut ui::UiLayer,
+    screens: Option<&screens::Screens>,
+    ctx: &GpuContext,
+    dt: f64,
+) {
+    let Some(screens) = screens else {
+        return;
+    };
+    let key = ui::portrait_key(&live.sim());
+    if ui.wants_portraits(key, dt) {
+        let shots = live.portraits(ctx, ui::PORTRAIT_SIZE);
+        ui.set_portraits(shots);
+    }
+    let due = ui.wants_paperdoll(screens, &live.sim(), dt);
+    if let Some((who, yaw)) = due {
+        let (w, h) = ui::PAPERDOLL_SIZE;
+        let shot = live.paperdoll(ctx, who, yaw, w, h);
+        ui.set_paperdoll(shot);
+    }
 }
 
 fn loading_screen(live: &live::Live, ui: &mut ui::UiLayer, up: &mut bool) {
@@ -3668,12 +3727,23 @@ fn main() -> Result<()> {
                                     l.aiming = Some(aim);
                                 }
                                 layer.update_minimap(&l.sim, &camera);
-                                layer.update_floaties(&l.sim, &camera, dt);
+                                // Headless, the interface's cover of the cursor is not
+                                // checked (its movies are drawn only for the capture).
+                                let (o, d) = camera.ray(
+                                    cursor.0 as f32,
+                                    cursor.1 as f32,
+                                    size.0 as f32,
+                                    size.1 as f32,
+                                );
+                                layer.set_hovered(l.hovered_creature(o, d));
+                                layer.update_floaties(&l.sim, &camera, dt, &|c| l.head_height(c));
                                 ui_time += t.elapsed();
                             }
                             if let Some(a) = recording.as_mut() {
+                                let gui = played.as_ref().is_some_and(|(_, s)| s.world_stopped());
                                 let ui = played.as_mut().map(|(layer, _)| layer);
-                                let state = audio_state(a, Some(&mut *l), ui, &camera, None);
+                                let mut state = audio_state(a, Some(&mut *l), ui, &camera, None);
+                                state.gui = gui;
                                 a.record(state, dt as f32 / 1000.0);
                                 let voice = a.voice_ms();
                                 if let Some((layer, _)) = played.as_mut() {
@@ -4067,6 +4137,7 @@ fn main() -> Result<()> {
         ui,
         saves_dir: saves_dir.clone(),
         cursor: (0.0, 0.0),
+        hover_probe: None,
         camera,
         size,
         gfx: None,

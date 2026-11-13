@@ -77,6 +77,9 @@ pub struct D3dProgram {
     pub ps: Translation,
     pub pass: PassState,
     pub state: MaterialState,
+    /// Translated with per-instance constants ([`Options::instanced`]): the SpeedTree
+    /// programs, whose many placements go as instanced draws.
+    pub instanced: bool,
 }
 
 impl std::fmt::Debug for D3dProgram {
@@ -154,6 +157,7 @@ fn build(vfs: &Vfs, vs_name: &str, ps_name: &str, state_name: &str) -> Result<D3
             alpha_test,
             // The game sets the trees' alpha reference per draw (their LOD fades).
             alpha_ref_uniform: spt,
+            instanced: spt,
             ..Default::default()
         },
     )
@@ -163,6 +167,7 @@ fn build(vfs: &Vfs, vs_name: &str, ps_name: &str, state_name: &str) -> Result<D3
         &vs,
         &Options {
             extra_outputs: extra,
+            instanced: spt,
             ..Default::default()
         },
     )
@@ -178,6 +183,7 @@ fn build(vfs: &Vfs, vs_name: &str, ps_name: &str, state_name: &str) -> Result<D3
         ps: ps_t,
         pass,
         state,
+        instanced: spt,
     })
 }
 
@@ -333,7 +339,8 @@ pub fn static1_filter() -> ShaderFilter {
 /// and lashes (`Eye0`), cloth (`Cloth1`), props (`Prop1`) and weapons (`Weapon1`), with any
 /// pixel shader; and exterior terrain (`Terrain2`, terrain.mat's pass above Low detail, and
 /// `Terrain3`, its Low detail pass); the sky's dome and clouds (`Sky`, `Clouds`); lava
-/// (`Lava0`); and water (`Water0`).
+/// (`Lava0`); water (`Water0`); and SpeedTrees (`SPT_*`: leaf cards, branches, fronds,
+/// mesh leaves, and the far billboards' two passes).
 pub fn object_filter() -> ShaderFilter {
     let mut v = static1_filter().unwrap_or_default();
     for vs in OBJECT_VERTEX_SHADERS.iter().chain(&VFX_VERTEX_SHADERS) {
@@ -357,7 +364,7 @@ pub const VFX_VERTEX_SHADERS: [&str; 8] = [
 ];
 
 /// See [`object_filter`].
-pub const OBJECT_VERTEX_SHADERS: [&str; 18] = [
+pub const OBJECT_VERTEX_SHADERS: [&str; 20] = [
     "Char1.vsh",
     "Hair0_Pass1.vsh",
     "Hair0.vsh",
@@ -376,6 +383,8 @@ pub const OBJECT_VERTEX_SHADERS: [&str; 18] = [
     "SPT_Branch.vsh",
     "SPT_Fronds.vsh",
     "SPT_LeafMeshes.vsh",
+    "SPT_Billboards0.vsh",
+    "SPT_Billboards1.vsh",
 ];
 
 /// Point lights chosen for one draw.
@@ -634,7 +643,7 @@ pub fn ambient_of(lights: &[SceneLight], class: LightClass) -> Vec3 {
 /// One SpeedTree placement's constants for the game's `spt_*` shaders (DAOrigins.exe's
 /// per-instance set-up 0x52dfa0; speedtree-exe-trace §8.3): the shaders place the tree from
 /// these, not from a world matrix.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TreeConstants {
     /// `g_vTreePos`: the placement's position, `w` its yaw (radians).
     pub position: [f32; 4],
@@ -646,18 +655,47 @@ pub struct TreeConstants {
     pub leaf_angle_scalars: [f32; 2],
     /// `g_fWindMatrixOffset`: which of the six wind matrices index 0 means.
     pub wind_offset: f32,
+    /// Which of the level's five winds (0.2 s apart) moves it.
+    pub wind: usize,
+    /// For the level's billboard batch (`SPT_Billboards0`), `g_v360TexCoords`: per billboard
+    /// image, two opposite corners in the billboard atlas, (corner 2's u, v, corner 0's u, v)
+    /// (DAOrigins.exe 0x530b70, speedtree-exe-trace §7). Empty for other draws.
+    pub billboard_images: std::sync::Arc<[[f32; 4]]>,
+}
+
+/// One wind's state for a frame (docs/speedtree 7.11): its six matrices and eight leaf
+/// (rock, rustle) angles in radians.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindFrame {
+    pub matrices: [[[f32; 4]; 4]; 6],
+    pub leaf_angles: [[f32; 2]; 8],
+}
+
+impl WindFrame {
+    /// No wind: identity matrices, leaves at rest.
+    pub const STILL: WindFrame = WindFrame {
+        matrices: [[
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]; 6],
+        leaf_angles: [[0.0; 2]; 8],
+    };
 }
 
 impl TreeConstants {
     /// A constant of the `spt_*` shaders, when `name` is one: the per-placement ones,
     /// `g_vCameraAngles` from the camera looking along `forward`, the sun (`g_vLightDir`
-    /// towards it, `g_vLightDiffuse`), and the wind held still (identity matrices, no leaf
-    /// rocking). Provisional: the wind is not animated.
+    /// towards it, `g_vLightDiffuse`), and the wind's matrices and leaf angles
+    /// (`g_amWindMatrices`: the six matrices' rows, then an identity the shaders never
+    /// reach; `g_vLeafAngles`: (rock, rustle) per entry, the rest zero).
     pub fn value(
         &self,
         name: &str,
         forward: Vec3,
         sun: Option<(Vec3, Vec3)>,
+        wind: &WindFrame,
     ) -> Option<Vec<[f32; 4]>> {
         let yaw = self.position[3];
         Some(match name {
@@ -675,14 +713,19 @@ impl TreeConstants {
             }
             "g_fWindMatrixOffset" => vec![[self.wind_offset, 0.0, 0.0, 0.0]],
             "g_fAlphaMultiplier" => vec![[1.0, 0.0, 0.0, 0.0]],
-            "g_amWindMatrices" => (0..28)
+            "g_amWindMatrices" => wind
+                .matrices
+                .iter()
+                .chain(&WindFrame::STILL.matrices[..1])
+                .flatten()
+                .copied()
+                .collect(),
+            "g_vLeafAngles" => (0..20)
                 .map(|i| {
-                    let mut r = [0.0; 4];
-                    r[i % 4] = 1.0;
-                    r
+                    let [rock, rustle] = wind.leaf_angles.get(i).copied().unwrap_or_default();
+                    [rock, rustle, 0.0, 0.0]
                 })
                 .collect(),
-            "g_vLeafAngles" => vec![[0.0; 4]; 20],
             "g_vCameraAngles" => {
                 // The tree library's camera angles (azimuth = atan2(y, x) of the view
                 // direction, pitch = −asin(z)), the azimuth wrapped into [0, 2π) (0x52d810).
@@ -690,6 +733,24 @@ impl TreeConstants {
                 let azimuth = f.y.atan2(f.x).rem_euclid(std::f32::consts::TAU);
                 let pitch = -f.z.clamp(-1.0, 1.0).asin();
                 vec![[azimuth, pitch, 0.0, 0.0]]
+            }
+            "g_v360TexCoords" if !self.billboard_images.is_empty() => {
+                self.billboard_images.to_vec()
+            }
+            // The billboards' lighting frame, one row per corner (all four alike): the normal
+            // is the camera's horizontal view direction, the tangent that turned a quarter
+            // left, the binormal up (docs/speedtree 7.5). Provisional: which way the game's
+            // upload orders these registers is not traced; the shaders read corner i's
+            // vector from the matrix's register i.
+            "g_amBBNormals" | "g_amBBTangents" | "g_amBBBinormals" => {
+                let f = forward.normalize_or_zero();
+                let (sin, cos) = f.y.atan2(f.x).sin_cos();
+                let row = match name {
+                    "g_amBBNormals" => [cos, sin, 0.0, 0.0],
+                    "g_amBBTangents" => [-sin, cos, 0.0, 0.0],
+                    _ => [0.0, 0.0, 1.0, 0.0],
+                };
+                vec![row; 4]
             }
             "g_vLightDir" => {
                 let d = sun.map_or(Vec3::Z, |(dir, _)| -dir.normalize_or_zero());
@@ -735,6 +796,9 @@ pub struct ConstantContext<'a> {
     pub partition: Option<Mat4>,
     /// For a SpeedTree draw with the game's shaders: its placement's constants.
     pub tree: Option<&'a TreeConstants>,
+    /// The level's winds this frame ([`TreeConstants::wind`] picks one); empty holds the
+    /// trees still.
+    pub winds: &'a [WindFrame],
 }
 
 /// The ambient term's base (see the module docs): zero at every Graphics Detail setting
@@ -914,7 +978,8 @@ impl ConstantContext<'_> {
         }
         if let Some(t) = self.tree {
             let forward = -self.view.inverse().z_axis.truncate();
-            if let Some(v) = t.value(&c.name, forward, self.sun) {
+            let wind = self.winds.get(t.wind).unwrap_or(&WindFrame::STILL);
+            if let Some(v) = t.value(&c.name, forward, self.sun, wind) {
                 return Some(Value::Vectors(v));
             }
         }
@@ -1056,6 +1121,11 @@ impl ConstantContext<'_> {
                 | "aur_mModelView"
                 | "g_vCameraPosition"
                 | "g_vCameraAngles"
+                | "g_amBBNormals"
+                | "g_amBBTangents"
+                | "g_amBBBinormals"
+                | "g_amWindMatrices"
+                | "g_vLeafAngles"
                 | "bsm_bones"
         )
     }
@@ -1221,6 +1291,28 @@ pub fn sampler_texture(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn billboards_are_lit_facing_away_from_the_camera_across_its_view() {
+        let t = TreeConstants {
+            position: [0.0; 4],
+            scale: 1.0,
+            color: [1.0; 4],
+            leaf_angle_scalars: [0.0; 2],
+            wind_offset: 0.0,
+            wind: 0,
+            billboard_images: std::sync::Arc::from([[0.1, 0.9, 0.3, 0.6]]),
+        };
+        let v = |name| t.value(name, Vec3::new(0.0, 2.0, -1.0), None, &WindFrame::STILL);
+        let near = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6);
+        let normals = v("g_amBBNormals").unwrap();
+        assert_eq!(normals.len(), 4);
+        assert!(normals.iter().all(|&n| near(n, [0.0, 1.0, 0.0, 0.0])));
+        assert!(near(v("g_amBBTangents").unwrap()[2], [-1.0, 0.0, 0.0, 0.0]));
+        assert!(near(v("g_amBBBinormals").unwrap()[3], [0.0, 0.0, 1.0, 0.0]));
+        assert_eq!(v("g_v360TexCoords"), Some(vec![[0.1, 0.9, 0.3, 0.6]]));
+    }
+
     use super::*;
     use crate::scene::{DOMAIN_CHARACTERS, DOMAIN_LEVEL};
     use thedas_formats::MaterialObject;
@@ -1303,6 +1395,7 @@ mod tests {
             shadow: NO_SHADOW_DATA,
             partition: None,
             tree: None,
+            winds: &[],
         };
         let t = table(vec![
             constant(
@@ -1437,6 +1530,7 @@ mod tests {
             shadow: NO_SHADOW_DATA,
             partition: None,
             tree: None,
+            winds: &[],
         };
         let c = cc.fill(Some(&table(vec![constant(
             "mml_vTintColor",
@@ -1526,6 +1620,7 @@ mod tests {
                 shadow: NO_SHADOW_DATA,
                 partition: None,
                 tree: None,
+                winds: &[],
             };
             let c = cc.fill(Some(&table(vec![constant(
                 "aur_mWorld",
