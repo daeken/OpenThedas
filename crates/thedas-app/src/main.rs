@@ -60,6 +60,7 @@ mod follow;
 mod intro;
 mod live;
 mod looks;
+mod modmode;
 mod occlusion;
 mod pad;
 mod paddev;
@@ -639,6 +640,8 @@ struct App {
     update_answers: Vec<ui::TextAnswer>,
     /// Answers about marking spots for a report, acted on next frame.
     mark_answers: Vec<ui::TextAnswer>,
+    /// Mod mode's panels over the game (see [`modmode`]), made the first time it opens.
+    mod_mode: Option<modmode::ModMode>,
     /// The last input came from a game controller (not the mouse or keyboard): a report
     /// then skips marking spots, which needs the mouse.
     pad_last: bool,
@@ -902,6 +905,61 @@ fn read_frame(
         height,
         row,
     }
+}
+
+/// `frame` with `paint` drawn over it on the GPU (in the window's `format`), read back.
+fn paint_over(
+    ctx: &GpuContext,
+    format: wgpu::TextureFormat,
+    frame: thedas_ui::Rgba,
+    paint: impl FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+) -> Result<thedas_ui::Rgba> {
+    let (width, height) = (frame.width, frame.height);
+    let size = wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+    let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("offscreen overlay"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let mut pixels = frame.pixels;
+    if matches!(
+        format,
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+    ) {
+        pixels.chunks_exact_mut(4).for_each(|p| p.swap(0, 2));
+    }
+    ctx.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        size,
+    );
+    let view = texture.create_view(&Default::default());
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    paint(&mut encoder, &view);
+    let readback = read_frame(ctx, &mut encoder, &texture);
+    ctx.queue.submit([encoder.finish()]);
+    finish_read_frame(ctx, readback, format)
 }
 
 /// The copied frame, as opaque RGBA.
@@ -1277,6 +1335,7 @@ impl App {
         self.serve_control(dt);
         self.pad_frame(dt);
         self.report_frame(dt);
+        self.mod_mode_frame(dt);
         self.returning_frame();
         self.update();
         let Some(g) = self.gfx.as_mut() else {
@@ -1463,6 +1522,16 @@ impl App {
         pointer.extend(marks);
         g.reticle
             .draw(&g.ctx.device, &mut encoder, &view, size, &pointer);
+        // Mod mode's panels go over everything, the interface included.
+        if let Some(m) = self.mod_mode.as_mut() {
+            m.paint(
+                &g.ctx.device,
+                &g.ctx.queue,
+                &mut encoder,
+                &view,
+                [g.config.width, g.config.height],
+            );
+        }
         let readback = (!self.frame_requests.is_empty())
             .then(|| read_frame(&g.ctx, &mut encoder, &frame.texture));
         g.ctx.queue.submit([encoder.finish()]);
@@ -1648,6 +1717,123 @@ impl App {
         write_png(&path, w, h, &pixels)?;
         println!("wrote {} (camera {})", path.display(), self.camera.spec());
         Ok(())
+    }
+
+    /// Opens or closes mod mode's panels (F10, and the pause menu's entry).
+    pub fn toggle_mod_mode(&mut self) {
+        if self.mod_mode.is_none() {
+            let Some(g) = self.gfx.as_ref() else {
+                return;
+            };
+            self.mod_mode = Some(modmode::ModMode::new(
+                &g.window,
+                &g.ctx.device,
+                g.config.format,
+            ));
+        }
+        if let Some(m) = self.mod_mode.as_mut() {
+            m.toggle();
+            log::info!("mod mode {}", if m.open { "open" } else { "closed" });
+            if !m.open
+                && let Some(l) = self.live.as_mut()
+            {
+                l.set_scrub(None);
+            }
+        }
+    }
+
+    /// Whether mod mode's panels are up.
+    pub fn mod_mode_up(&self) -> bool {
+        self.mod_mode.as_ref().is_some_and(|m| m.open)
+    }
+
+    /// Mod mode's frame: its panels laid out from the picked object, the scrubber's hold
+    /// passed to the game's drawing, and what the panels asked for done.
+    fn mod_mode_frame(&mut self, dt_ms: f64) {
+        let Some(m) = self.mod_mode.as_mut() else {
+            return;
+        };
+        let inspected = match (m.open.then_some(m.selected).flatten(), self.live.as_mut()) {
+            (Some(id), Some(l)) => l.inspect(id),
+            _ => None,
+        };
+        let Some(g) = self.gfx.as_ref() else {
+            return;
+        };
+        let actions = m.frame(&g.window, inspected.as_ref(), (dt_ms / 1000.0) as f32);
+        let hold = m.scrub.as_ref().map(|s| (s.id, s.time));
+        if let Some(l) = self.live.as_mut() {
+            l.set_scrub(hold);
+        }
+        for a in actions {
+            match a {
+                modmode::Action::Report(note) => self.report(Some(note), None),
+            }
+        }
+    }
+
+    /// A mod-mode click in the world: picks the object under the cursor for the inspector.
+    fn mod_mode_pick(&mut self) {
+        let (Some(live), Some(g)) = (self.live.as_mut(), self.gfx.as_ref()) else {
+            return;
+        };
+        let (w, h) = (g.config.width as f32, g.config.height as f32);
+        let (x, y) = self.cursor;
+        let (origin, dir) = self.camera.ray(x as f32, y as f32, w, h);
+        let picked = match live.pick(origin, dir) {
+            Some(live::Pick::Object(id)) => Some(id),
+            _ => None,
+        };
+        if let Some(m) = self.mod_mode.as_mut() {
+            m.selected = picked;
+            if m.scrub.as_ref().is_some_and(|s| Some(s.id) != picked) {
+                m.scrub = None;
+            }
+        }
+    }
+
+    /// The `modselect` step: the inspector picks the object with this tag nearest the
+    /// leader. Opens mod mode if it is closed.
+    fn mod_mode_select(&mut self, tag: &str) -> String {
+        if !self.mod_mode_up() {
+            self.toggle_mod_mode();
+        }
+        let Some(live) = self.live.as_mut() else {
+            return format!("modselect {tag}: not playing");
+        };
+        let sim = live.sim();
+        let found = match sim.world.controlled() {
+            Some(w) => nearest_tagged(&sim, w, tag),
+            None => sim.world.find_tag(tag, 0),
+        };
+        drop(sim);
+        let Some(m) = self.mod_mode.as_mut() else {
+            return format!("modselect {tag}: no window");
+        };
+        m.selected = found;
+        m.scrub = None;
+        match found {
+            Some(id) => format!("modselect {tag}: object {id}"),
+            None => format!("modselect {tag}: nobody"),
+        }
+    }
+
+    /// The `modframe` step: the inspected object's animation is held at frame `n`.
+    fn mod_mode_hold(&mut self, n: i64) -> String {
+        let Some(id) = self.mod_mode.as_ref().and_then(|m| m.selected) else {
+            return "modframe: nothing inspected".into();
+        };
+        let Some(o) = self.live.as_mut().and_then(|l| l.inspect(id)) else {
+            return "modframe: the object is gone".into();
+        };
+        let Some(m) = self.mod_mode.as_mut() else {
+            return "modframe: no window".into();
+        };
+        if !m.hold(&o, Some(n)) {
+            return format!("modframe: {} plays no animation", o.tag);
+        }
+        let s = m.scrub.as_ref().expect("just held");
+        modmode::frame_note(&o, s)
     }
 
     /// An issue report (F8, the pad's two sticks clicked, or a client's `report`): the
@@ -2370,7 +2556,8 @@ impl App {
 
     /// Shows the cursor for this frame.
     fn show_cursor(&mut self) {
-        if self.cursors.is_none() {
+        // Over mod mode's panels their own cursor shows.
+        if self.cursors.is_none() || self.mod_mode.as_ref().is_some_and(|m| m.owns_cursor()) {
             return;
         }
         let name = self.cursor_name();
@@ -2445,6 +2632,7 @@ impl App {
         self.recorder.input(format!("key {code:?}"));
         self.pad_last = false;
         match code {
+            KeyCode::F10 => self.toggle_mod_mode(),
             // Marking spots for a report: F8, Enter or Escape is done.
             KeyCode::F8 | KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Escape
                 if self.marking() =>
@@ -2940,6 +3128,15 @@ impl App {
                     log.push(reply(live, n));
                 }
             }
+            Step::ModMode => {
+                self.toggle_mod_mode();
+                log.push(format!(
+                    "mod mode {}",
+                    if self.mod_mode_up() { "open" } else { "closed" }
+                ));
+            }
+            Step::ModSelect(tag) => log.push(self.mod_mode_select(tag)),
+            &Step::ModFrame(n) => log.push(self.mod_mode_hold(n)),
             Step::Talk(tag) => {
                 let Some(live) = self.live.as_mut() else {
                     return;
@@ -3078,6 +3275,7 @@ impl App {
             "camera": self.camera.spec(),
             "size": self.gfx.as_ref().map(|g| [g.config.width, g.config.height]),
             "playing": self.live.is_some(),
+            "mod_mode": self.mod_mode_up(),
         });
         let Some(live) = self.live.as_ref() else {
             return out;
@@ -3171,6 +3369,11 @@ impl App {
         let mut over = self.pad.pointer(self.cursor, ctx);
         over.extend(self.marking_lines());
         reticle::draw_rgba(&mut frame.pixels, (w, h), &over);
+        if let (Some(m), Some(g)) = (self.mod_mode.as_mut().filter(|m| m.open), self.gfx.as_ref()) {
+            frame = paint_over(&g.ctx, g.config.format, frame, |encoder, view| {
+                m.paint(&g.ctx.device, &g.ctx.queue, encoder, view, [w, h])
+            })?;
+        }
         Ok(frame)
     }
 
@@ -3444,6 +3647,23 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        // Mod mode's panels see input first while they are up (see [`modmode`]).
+        if let (Some(m), Some(g)) = (self.mod_mode.as_mut(), self.gfx.as_ref()) {
+            match m.window_event(&g.window, &event) {
+                modmode::Routed::Game => {}
+                modmode::Routed::Swallowed => return,
+                modmode::Routed::CursorOnly => {
+                    if let WindowEvent::CursorMoved { position, .. } = event {
+                        self.cursor = (position.x, position.y);
+                    }
+                    return;
+                }
+                modmode::Routed::Pick => {
+                    self.mod_mode_pick();
+                    return;
+                }
+            }
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -4304,6 +4524,13 @@ enum Step {
     Quickslot(i32),
     /// Space: the game pauses or carries on.
     Pause,
+    /// F10: mod mode's panels open or close (windowed only).
+    ModMode,
+    /// Mod mode's inspector picks the creature or placeable with this tag nearest the
+    /// leader (as a Ctrl+click on it does).
+    ModSelect(String),
+    /// Mod mode holds the inspected object's animation at this frame (from 0).
+    ModFrame(i64),
     /// The conversation's reply n (from 0) is chosen.
     Reply(usize),
     /// The game camera turns (degrees of yaw, then pitch), as dragging with the right
@@ -4644,6 +4871,10 @@ fn parse_step(s: &str) -> Result<Step> {
             Step::Leader(arg[1..].parse::<usize>()? - 1)
         }
         "key" if arg.eq_ignore_ascii_case("space") => Step::Pause,
+        "key" if arg.eq_ignore_ascii_case("f10") => Step::ModMode,
+        "modmode" => Step::ModMode,
+        "modselect" if !arg.is_empty() => Step::ModSelect(arg.to_string()),
+        "modframe" => Step::ModFrame(arg.parse().context("modframe takes a frame number")?),
         "key" if arg.len() == 1 && arg.as_bytes()[0].is_ascii_digit() => {
             // 1 is the first slot, 0 the tenth.
             Step::Quickslot((arg.as_bytes()[0] - b'0' + 9) as i32 % 10)
@@ -4919,6 +5150,9 @@ fn main() -> Result<()> {
                         let t = Instant::now();
                         l.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
                         println!("rebuild: {:.3}s", t.elapsed().as_secs_f64());
+                    }
+                    Step::ModMode | Step::ModSelect(_) | Step::ModFrame(_) => {
+                        println!("mod mode: windowed only")
                     }
                     Step::Talk(tag) => {
                         let mut sim = l.sim();
@@ -5548,6 +5782,7 @@ fn main() -> Result<()> {
         },
         update_answers: Vec::new(),
         mark_answers: Vec::new(),
+        mod_mode: None,
         pad_last: false,
         started_with: json!({
             "size": args.size,
@@ -5694,6 +5929,16 @@ mod tests {
             vec![Step::Talk("lot110cr_bryant".into())]
         );
         assert_eq!(parse_steps("rebuild").unwrap(), vec![Step::Rebuild]);
+        assert_eq!(
+            parse_steps("key F10; modselect lot110cr_bryant; modframe 12; modmode").unwrap(),
+            vec![
+                Step::ModMode,
+                Step::ModSelect("lot110cr_bryant".into()),
+                Step::ModFrame(12),
+                Step::ModMode,
+            ]
+        );
+        assert!(parse_steps("modframe twelve").is_err());
         assert_eq!(
             parse_steps("type Rowan Cousland; key backspace; key ctrl+a; key Enter").unwrap(),
             vec![
