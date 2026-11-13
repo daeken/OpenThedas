@@ -10,7 +10,7 @@
 
 use thedas_script::vm::{OBJECT_INVALID, ObjectId};
 use thedas_sim::Sim;
-use thedas_sim::commands::{CommandOutcome, CommandSource, SimCommand};
+use thedas_sim::commands::{CommandOutcome, CommandSource, LocalValue, SimCommand};
 use thedas_sim::dialog::NodeCondition;
 use thedas_sim::world::ObjectKind;
 
@@ -42,9 +42,10 @@ pub enum ConvAction {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Edit {
     pub text: String,
-    /// The flags to set back to undo it, in order; empty when it cannot be undone (a
-    /// conversation started, a defined flag, a command refused).
-    pub undo: Vec<(String, i32, bool)>,
+    /// The commands that undo it, in order (flags and variables set back to what they
+    /// held); empty when it cannot be undone (a conversation started, a defined flag, a
+    /// command refused).
+    pub undo: Vec<SimCommand>,
 }
 
 /// Which of the conversation's lines the panel lists.
@@ -338,17 +339,8 @@ pub fn carry_out(sim: &mut Sim, convs: &mut Convs, a: ConvAction, selected: Opti
             };
             let undo = std::mem::take(&mut e.undo);
             let what = e.text.clone();
-            for (plot, flag, value) in undo {
-                // Set back as it was stored, without running the plot script again.
-                sim.apply(
-                    CommandSource::ModMode,
-                    SimCommand::SetPlotFlag {
-                        plot,
-                        flag,
-                        value,
-                        call_script: false,
-                    },
-                );
+            for c in undo {
+                sim.apply(CommandSource::ModMode, c);
             }
             convs.status = format!("undone: {what}");
             convs.history.push(Edit {
@@ -382,7 +374,15 @@ pub fn set_flag(sim: &mut Sim, plot: &str, flag: i32, value: bool, call_script: 
         CommandOutcome::PlotFlagSet { changed, .. } => changed
             .iter()
             .rev()
-            .filter_map(|c| c.replaced.map(|r| (c.plot.clone(), c.flag, r)))
+            .filter_map(|c| {
+                // Set back as it was stored, without running the plot script again.
+                c.replaced.map(|r| SimCommand::SetPlotFlag {
+                    plot: c.plot.clone(),
+                    flag: c.flag,
+                    value: r,
+                    call_script: false,
+                })
+            })
             .collect(),
         _ => Vec::new(),
     };
@@ -403,6 +403,50 @@ pub fn set_flag(sim: &mut Sim, plot: &str, flag: i32, value: bool, call_script: 
             if value { "set" } else { "clear" },
             describe(&outcome)
         ),
+        undo,
+    }
+}
+
+/// A variable's value as the panels write it.
+pub fn show_value(v: &LocalValue) -> String {
+    match v {
+        LocalValue::Int(x) => x.to_string(),
+        LocalValue::Float(x) => format!("{x}"),
+        LocalValue::String(x) => format!("{x:?}"),
+        LocalValue::Object(x) => format!("object {x}"),
+        LocalValue::Resource(x) => x.clone(),
+    }
+}
+
+/// Sets (or, with `None`, removes) one of `target`'s variables as mod mode's command, and
+/// what the history shows of it.
+pub fn set_local(sim: &mut Sim, target: ObjectId, name: &str, value: Option<LocalValue>) -> Edit {
+    let tag = sim
+        .world
+        .get(target)
+        .map_or_else(|| target.to_string(), |o| o.tag.clone());
+    let what = match &value {
+        Some(v) => format!("{tag}.{name} = {}", show_value(v)),
+        None => format!("remove {tag}.{name}"),
+    };
+    let outcome = sim.apply(
+        CommandSource::ModMode,
+        SimCommand::SetLocal {
+            target,
+            name: name.to_string(),
+            value,
+        },
+    );
+    let undo = match &outcome {
+        CommandOutcome::LocalSet { replaced } => vec![SimCommand::SetLocal {
+            target,
+            name: name.to_string(),
+            value: replaced.clone(),
+        }],
+        _ => Vec::new(),
+    };
+    Edit {
+        text: format!("{what}: {}", describe(&outcome)),
         undo,
     }
 }
@@ -432,6 +476,10 @@ pub fn describe(o: &CommandOutcome) -> String {
         CommandOutcome::ConversationQueued { dialog } => {
             format!("{dialog} starts when the open conversation ends")
         }
+        CommandOutcome::LocalSet { replaced } => match replaced {
+            Some(v) => format!("was {}", show_value(v)),
+            None => "was not set".into(),
+        },
         CommandOutcome::Done { ok } => if *ok { "done" } else { "did nothing" }.into(),
         CommandOutcome::Refused { reason } => format!("refused: {reason}"),
     }
