@@ -1511,6 +1511,26 @@ impl Live {
         // Who looks at whom, from where the creatures were last drawn.
         self.looks.prepare(&sim);
         let pairs = crate::looks::pairs(&sim);
+        // While exploring, the creatures near the player's character may glance at it.
+        let exploring = pairs.is_empty()
+            && posing.is_empty()
+            && sim.world.cutscene.is_none()
+            && sim.world.chargen.is_none()
+            && sim.conversation_line().is_none();
+        let hero = sim.world.controlled().or(sim.world.hero);
+        let glancers: Vec<ObjectId> = match (exploring, hero, self.looks.glance_reach()) {
+            (true, Some(hero), Some(_)) => models
+                .iter()
+                .filter(|m| m.id != hero && m.kind == thedas_sim::world::ObjectKind::Creature)
+                .filter(|m| {
+                    sim.world
+                        .get(m.id)
+                        .is_some_and(|o| !o.dead && o.active && !o.combat.in_combat)
+                })
+                .map(|m| m.id)
+                .collect(),
+            _ => Vec::new(),
+        };
         drop(sim);
         let look_dt = self
             .looks_clock
@@ -1518,7 +1538,7 @@ impl Live {
         self.looks_clock = Some(self.shader_time);
         // A cutscene's actors look where its head tracking actions say; the others as the
         // conversation has them.
-        let wants: Vec<(ObjectId, Option<ObjectId>, f32)> = pairs
+        let mut wants: Vec<(ObjectId, Option<ObjectId>, f32)> = pairs
             .iter()
             .filter(|(from, _)| !posing.contains_key(from))
             .map(|&(from, to)| (from, Some(to), 1.0))
@@ -1527,6 +1547,36 @@ impl Live {
                 Some((*id, look.target, look.speed))
             }))
             .collect();
+        // Glances: each creature thinks for itself; it tracks while the player's character
+        // is within reach and in front of it. The speed it turns away with is kept for
+        // when it lets go.
+        let mut away: std::collections::HashMap<ObjectId, f32> = Default::default();
+        if let (Some(hero), Some(reach)) = (hero, self.looks.glance_reach()) {
+            let place = |id| self.posed.iter().find(|p| p.0 == id).map(|p| p.1);
+            let hero_at = place(hero);
+            for &id in &glancers {
+                let in_reach = match (place(id), hero_at) {
+                    // Roots first: the heads' heights are only worked out for the near.
+                    (Some(a), Some(h))
+                        if a.w_axis.truncate().distance(h.w_axis.truncate()) <= reach + 2.0 =>
+                    {
+                        let head = |id, t: Mat4| {
+                            t.w_axis.truncate() + glam::Vec3::Z * self.head_height(id)
+                        };
+                        let to = head(hero, h) - head(id, a);
+                        to.length() <= reach && to.dot(a.transform_vector3(glam::Vec3::Y)) > 0.0
+                    }
+                    _ => false,
+                };
+                let (tracking, speed) = self.looks.glance(id, look_dt, in_reach);
+                if tracking {
+                    wants.push((id, Some(hero), speed));
+                } else {
+                    away.insert(id, speed);
+                }
+            }
+        }
+        self.looks.keep_glances(&|id| glancers.contains(&id));
         let sights: std::collections::HashMap<ObjectId, crate::looks::Sight> = wants
             .iter()
             .filter_map(|&(from, to, speed)| {
@@ -1630,7 +1680,8 @@ impl Live {
                 && crate::looks::humanoid(&c.trees)
             {
                 let animator = &mut self.animator;
-                let layers = self.looks.step(m.id, sight, look_dt, |action| {
+                let release = away.get(&m.id).copied().unwrap_or(1.0);
+                let layers = self.looks.step(m.id, sight, release, look_dt, |action| {
                     animator
                         .action_animation(&level.vfs, "humanoid_overlay", action)
                         .is_some()

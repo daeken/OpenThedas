@@ -17,6 +17,8 @@
 pub enum MaterialError {
     #[error("XML: {0}")]
     Xml(String),
+    #[error("binary material object: {0}")]
+    Binary(String),
     #[error("expected root element {expected}, found {found}")]
     WrongRoot {
         expected: &'static str,
@@ -146,6 +148,11 @@ pub struct MaterialObject {
 
 impl MaterialObject {
     pub fn parse(data: &[u8]) -> Result<Self> {
+        if crate::gff4::is_gff4(data) {
+            let gff =
+                crate::gff4::Gff4::parse(data).map_err(|e| MaterialError::Binary(e.to_string()))?;
+            return Self::from_gff4(&gff);
+        }
         let text = document(data)?;
         let doc = parse_doc(&text)?;
         let root = doc.root_element();
@@ -201,6 +208,57 @@ impl MaterialObject {
                 v.resize(16, 0.0);
                 mao.vector_arrays.push((name.to_string(), v));
             }
+        }
+        if mao.material.is_empty() {
+            return Err(MaterialError::MissingAttr {
+                element: "Material",
+                attr: "Name",
+            });
+        }
+        Ok(mao)
+    }
+
+    /// A binary material object: Dragon Age II stores most `.mao` files as a GFF4 of type
+    /// `MAO ` with the same content as the XML form. Labels read from the shipped files: the
+    /// root holds 33012 the material, 33013 the default semantic and four lists: 33015
+    /// integers (33000 name, 33001 value), 33016 floats (33002, 33003), 33017 vectors
+    /// (33004, 33005) and 33020 textures (33010 parameter, 33011 resource). The object's
+    /// name is not stored. Provisional: integers are kept as floats, and whether a binary
+    /// texture can be a `RequiresID` placeholder is not known.
+    pub fn from_gff4(gff: &crate::gff4::Gff4) -> Result<Self> {
+        use crate::typed::Doc;
+        let bin = |e: crate::typed::TypedError| MaterialError::Binary(e.to_string());
+        let d = Doc::new(gff, "mao");
+        d.expect_type("MAO ").map_err(bin)?;
+        let root = gff.root;
+        let mut mao = MaterialObject {
+            name: String::new(),
+            material: d.str(root, 33012).map_err(bin)?,
+            default_semantic: d.opt_str(root, 33013).map_err(bin)?,
+            textures: Vec::new(),
+            floats: Vec::new(),
+            vectors: Vec::new(),
+            vector_arrays: Vec::new(),
+        };
+        for i in d.structs(root, 33015).map_err(bin)? {
+            let value = d.i64(i, 33001).map_err(bin)?;
+            mao.floats
+                .push((d.str(i, 33000).map_err(bin)?, value as f32));
+        }
+        for f in d.structs(root, 33016).map_err(bin)? {
+            let value = d.opt_f32(f, 33003).map_err(bin)?.unwrap_or(0.0);
+            mao.floats.push((d.str(f, 33002).map_err(bin)?, value));
+        }
+        for v in d.structs(root, 33017).map_err(bin)? {
+            let value = d.opt_vec4(v, 33005, 0.0).map_err(bin)?.unwrap_or([0.0; 4]);
+            mao.vectors.push((d.str(v, 33004).map_err(bin)?, value));
+        }
+        for t in d.structs(root, 33020).map_err(bin)? {
+            mao.textures.push(TextureBinding {
+                parameter: d.str(t, 33010).map_err(bin)?,
+                res_name: d.opt_str(t, 33011).map_err(bin)?.unwrap_or_default(),
+                requires_id: false,
+            });
         }
         if mao.material.is_empty() {
             return Err(MaterialError::MissingAttr {
@@ -630,5 +688,62 @@ mod tests {
         let xml = br#"<MaterialObject><Material Name="a.mat"/><Vector4fArray Name="v" value="0.5 -1.#QNAN0 1.#INF00 0"/></MaterialObject>"#;
         let mao = MaterialObject::parse(xml).unwrap();
         assert_eq!(mao.vector_arrays[0].1.len(), 4);
+    }
+
+    #[test]
+    fn reads_a_binary_material_object() {
+        use crate::gff4::Value;
+        use crate::typed::testutil::{Builder, s, structs};
+        let mut b = Builder::new(b"MAO ");
+        let count = b.add(
+            b"int ",
+            vec![(33000, s("mml_nLayers")), (33001, Value::I32(3))],
+        );
+        let fade = b.add(
+            b"flot",
+            vec![(33002, s("mml_fFade")), (33003, Value::F32(0.5))],
+        );
+        let tint = b.add(
+            b"flt4",
+            vec![
+                (33004, s("mml_vTint")),
+                (33005, Value::Vec4([1.0, 0.5, 0.25, 1.0])),
+            ],
+        );
+        let diffuse = b.add(
+            b"tex ",
+            vec![(33010, s("mml_tDiffuse")), (33011, s("wall_d.dds"))],
+        );
+        let root = b.add(
+            b"mao ",
+            vec![
+                (33012, s("Static.mat")),
+                (33013, s("Default")),
+                (33015, structs(&[count])),
+                (33016, structs(&[fade])),
+                (33017, structs(&[tint])),
+                (33020, structs(&[diffuse])),
+            ],
+        );
+        let mao = MaterialObject::from_gff4(&b.finish(root)).unwrap();
+        assert_eq!(mao.material, "Static.mat");
+        assert_eq!(mao.default_semantic.as_deref(), Some("Default"));
+        assert_eq!(
+            mao.floats,
+            vec![
+                ("mml_nLayers".to_string(), 3.0),
+                ("mml_fFade".to_string(), 0.5)
+            ]
+        );
+        assert_eq!(
+            mao.vectors,
+            vec![("mml_vTint".to_string(), [1.0, 0.5, 0.25, 1.0])]
+        );
+        assert_eq!(mao.texture("mml_tDiffuse").unwrap().res_name, "wall_d.dds");
+
+        // A material object must name its material.
+        let mut b = Builder::new(b"MAO ");
+        let root = b.add(b"mao ", vec![(33013, s("Default"))]);
+        assert!(MaterialObject::from_gff4(&b.finish(root)).is_err());
     }
 }
