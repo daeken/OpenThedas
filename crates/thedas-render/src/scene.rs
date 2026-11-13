@@ -2205,11 +2205,7 @@ impl<'a> Loader<'a> {
                 else {
                     continue;
                 };
-                match morph
-                    .nodes
-                    .iter_mut()
-                    .find(|n| n.name.eq_ignore_ascii_case(&piece.node))
-                {
+                match morph.nodes.iter_mut().find(|n| n.is(&piece.node)) {
                     Some(n) => n.vertices = vertices,
                     None => morph.nodes.push(MorphNode {
                         name: piece.node.clone(),
