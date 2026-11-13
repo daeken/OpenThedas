@@ -620,6 +620,15 @@ fn check_data(
         (_, "plo") => Some(if &doc.file_type.0 == b"PLTS" {
             let _ = thedas_sim::plot::plots_from_gff4(&doc, "");
             Ok(())
+        } else if &doc.file_type.0 == b"PLOT" {
+            // Dragon Age II: one plot, and every composite flag's expression well formed.
+            match thedas_sim::plot::plots_from_gff4(&doc, "").first() {
+                None => Err("plot without a GUID".to_string()),
+                Some(p) => match p.composites.iter().find(|(_, c)| !c.well_formed()) {
+                    Some((id, _)) => Err(format!("composite flag {id}: malformed expression")),
+                    None => Ok(()),
+                },
+            }
         } else {
             Err(format!("not a plot file (file type {})", doc.file_type))
         }),
