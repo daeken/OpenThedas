@@ -342,7 +342,7 @@ impl Tracker {
             } else {
                 continue;
             }
-            q = q * part.rotation.conjugate();
+            q *= part.rotation.conjugate();
         }
         if self.state == State::Returning && self.parts.iter().all(|p| p.rotation.w.abs() > 0.9999)
         {
