@@ -6276,7 +6276,8 @@ mod coverage_tests {
             "ShowAreaUnlockedNotification",
             &[Value::String("Soldier's Peak".into())],
         );
-        let got: Vec<(i32, Option<&str>, Option<&str>, Option<ObjectId>)> = s
+        type Shown<'a> = (i32, Option<&'a str>, Option<&'a str>, Option<ObjectId>);
+        let got: Vec<Shown> = s
             .world
             .uber_alerts
             .iter()
