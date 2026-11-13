@@ -19,6 +19,7 @@ pub mod chargen;
 pub mod cnv;
 pub mod collision;
 pub mod combat;
+pub mod commands;
 pub mod container;
 pub mod cutactors;
 pub mod cutscene;

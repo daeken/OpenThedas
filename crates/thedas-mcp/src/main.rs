@@ -420,6 +420,14 @@ struct PlotArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct ConditionArgs {
+    /// The conversation's owner: object id (number) or tag.
+    object: String,
+    /// The conversation's resource name; omit for the owner's own.
+    dialog: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct LocalArgs {
     /// Object id or tag.
     object: String,
@@ -1277,8 +1285,17 @@ impl Server {
             // placeable's conversation when it has one; a door's own script may only talk
             // while it is locked). Creatures are talked to.
             if kind == ObjectKind::Creature {
-                if !sim.start_conversation(hero, id, "") {
-                    return Err("it has nothing to say".into());
+                use thedas_sim::commands::{CommandOutcome, CommandSource, SimCommand};
+                let out = sim.apply(
+                    CommandSource::Mcp,
+                    SimCommand::StartConversation {
+                        initiator: hero,
+                        target: id,
+                        dialog: String::new(),
+                    },
+                );
+                if let CommandOutcome::Refused { reason } = out {
+                    return Err(format!("it has nothing to say: {reason}"));
                 }
             } else {
                 let ev = sim.use_event(hero, id);
@@ -1887,6 +1904,30 @@ impl Server {
         })
     }
 
+    #[tool(
+        description = "The commands given to the simulation from outside it (mod mode, this server, test harnesses): each with its time, source, command and what it did (a plot flag set records the value it replaced)."
+    )]
+    async fn command_journal(&self) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_ref().ok_or("no sim")?;
+            Ok(json!(sim.world.command_journal))
+        })
+    }
+
+    #[tool(
+        description = "Every line and reply of a creature's conversation (or the named one) with the plot flags its condition reads and whether it could be used now. Conditions run as when the conversation is walked: a condition script that sets flags sets them (listed under sets)."
+    )]
+    async fn conversation_conditions(&self, Parameters(a): Parameters<ConditionArgs>) -> String {
+        self.with_sim(|st| {
+            let sim = st.sim.as_mut().ok_or("no sim")?;
+            let id = resolve(sim, &a.object).ok_or("no such object")?;
+            let report = sim
+                .conversation_conditions(id, a.dialog.as_deref().unwrap_or(""))
+                .ok_or("no such conversation")?;
+            Ok(json!(report))
+        })
+    }
+
     #[tool(description = "End the current conversation.")]
     async fn end_conversation(&self) -> String {
         self.with_sim(|st| {
@@ -1902,7 +1943,16 @@ impl Server {
             let owner = sim.world.hero.unwrap_or(OBJECT_INVALID);
             let call = a.call_script.unwrap_or(true);
             if let Some(v) = a.value {
-                sim.set_plot_flag(&a.plot, a.flag, v, call, owner);
+                use thedas_sim::commands::{CommandSource, SimCommand};
+                sim.apply(
+                    CommandSource::Mcp,
+                    SimCommand::SetPlotFlag {
+                        plot: a.plot.clone(),
+                        flag: a.flag,
+                        value: v,
+                        call_script: call,
+                    },
+                );
                 sim.tick(0);
             }
             let info = sim.plot_info(&a.plot);
