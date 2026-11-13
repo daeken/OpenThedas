@@ -149,6 +149,14 @@ struct Floaty {
     left_s: f64,
 }
 
+/// A floaty's scale at `d` metres from the camera (DAOrigins.exe 0x63bfa0): full size up to
+/// 5 m, shrinking linearly to two thirds at 30 m and beyond. (Its alpha, 0x63c020, runs from
+/// 1 at 2 m to 1 at 7 m: always 1.)
+fn floaty_scale(d: f32) -> f64 {
+    let t = ((d - 5.0) / (30.0 - 5.0)).clamp(0.0, 1.0);
+    f64::from(1.0 + t * (2.0 / 3.0 - 1.0))
+}
+
 pub struct UiLayer {
     pub stage: Stage,
     composite: Option<Composite>,
@@ -198,6 +206,8 @@ pub struct UiLayer {
     floaties: Vec<Floaty>,
     /// The stats floaties up (name and health bar over a creature): creature → floaty id.
     stat_floaties: std::collections::BTreeMap<thedas_script::vm::ObjectId, u32>,
+    /// The creature the mouse is over (see [`UiLayer::set_hovered`]).
+    hovered: Option<thedas_script::vm::ObjectId>,
     /// A conversation line's continue the movie could not send (see `continue_conversation`).
     continue_pending: bool,
     next_floaty: u32,
@@ -472,6 +482,7 @@ impl UiLayer {
             screens_up: Default::default(),
             floaties: Vec::new(),
             stat_floaties: Default::default(),
+            hovered: None,
             continue_pending: false,
             next_floaty: 1,
             portraits: PortraitClock::default(),
@@ -1409,6 +1420,13 @@ impl UiLayer {
 
     /// Whether the player has paused the game (Space): the floaty layer's pause border and
     /// "Paused" text (`Client.Paused`, `Client.UserPaused`).
+    /// The creature the mouse is over, whose name the stats floaties show (see
+    /// [`crate::live::Live::hovered_creature`]); `None` when it is over none, or over the
+    /// interface.
+    pub fn set_hovered(&mut self, creature: Option<thedas_script::vm::ObjectId>) {
+        self.hovered = creature;
+    }
+
     pub fn set_paused(&self, paused: bool) {
         if let Ok(mut shown) = self.shown.lock() {
             shown.paused = paused;
@@ -1600,12 +1618,14 @@ impl UiLayer {
     /// `FloatyLayer.ProcessBatchUpdates`. Positions are in the visible area's stage units
     /// (`SetFloatyPosition` adds the area's offset itself). Provisional: the head height, the
     /// time a floaty stays after its duration, and stacking several on one creature by
-    /// `BatchUpdateOffsets` are inferred from the movie, not traced.
+    /// `BatchUpdateOffsets` are inferred from the movie, not traced. A floaty stands 0.1 m
+    /// over its creature's head, `head(creature)` metres above its feet (exe 0x764884).
     pub fn update_floaties(
         &mut self,
         sim: &Arc<Mutex<Sim>>,
         camera: &thedas_render::Camera,
         dt_ms: f64,
+        head: &dyn Fn(thedas_script::vm::ObjectId) -> f32,
     ) {
         use thedas_ui::UiValue;
         const LAYER: &str = "_global.FloatyLayer";
@@ -1616,10 +1636,11 @@ impl UiLayer {
         const SHOW_HEALTH_BAR: f64 = 2.0;
         const SHOW_TARGET: f64 = 4.0;
         const IS_HOSTILE: f64 = 32.0;
+        const IS_IN_PARTY: f64 = 64.0;
         /// Seconds a floaty stays past its duration (its own fade).
         const LINGER_S: f64 = 1.0;
-        /// Metres above a creature's feet.
-        const HEAD: f32 = 2.0;
+        /// Metres over a creature's head (0xae7d70).
+        const OVER_HEAD: f32 = 0.1;
         let Some(movie) = self
             .stage
             .movies
@@ -1692,7 +1713,8 @@ impl UiLayer {
                     return false;
                 }
                 let o = o.expect("checked");
-                let p = glam::Vec3::new(o.position[0], o.position[1], o.position[2] + HEAD);
+                let z = o.position[2] + head(o.id) + OVER_HEAD;
+                let p = glam::Vec3::new(o.position[0], o.position[1], z);
                 let c = vp * p.extend(1.0);
                 let (x, y, alpha) = if c.w > 1e-4 {
                     let n = c.truncate() / c.w;
@@ -1707,7 +1729,7 @@ impl UiLayer {
                 places.extend([
                     num(f64::from(x) / scale),
                     num(f64::from(y) / scale),
-                    num(1.0),
+                    num(floaty_scale(camera.position.distance(p))),
                     num(alpha),
                     num(f64::from(f.id)),
                 ]);
@@ -1725,7 +1747,24 @@ impl UiLayer {
                 .and_then(|c| c.target);
             let party = thedas_sim::engine::party_of(&sim);
             let health = thedas_sim::sim::constant(&sim.table, "PROPERTY_DEPLETABLE_HEALTH");
-            let wanted: Vec<thedas_script::vm::ObjectId> = sim
+            // The creature under the mouse gets one too (exe 0x6a52c0: creature+0xa10, the
+            // hover mark, makes the floaty), while within 50 m of the leader (0x7c4ae0
+            // compares the squared distance with 2500).
+            let leader_at = leader
+                .and_then(|l| sim.world.get(l))
+                .map(|o| glam::Vec3::from_array(o.position));
+            let hovered = self.hovered.filter(|&c| {
+                sim.world.get(c).is_some_and(|o| {
+                    o.kind == thedas_sim::world::ObjectKind::Creature
+                        && o.active
+                        && !o.dead
+                        && o.area == sim.world.area
+                        && leader_at.is_some_and(|l| {
+                            l.distance_squared(glam::Vec3::from_array(o.position)) < 2500.0
+                        })
+                })
+            });
+            let mut wanted: Vec<thedas_script::vm::ObjectId> = sim
                 .world
                 .objects
                 .values()
@@ -1739,6 +1778,9 @@ impl UiLayer {
                 })
                 .map(|o| o.id)
                 .collect();
+            if let Some(h) = hovered.filter(|h| !wanted.contains(h)) {
+                wanted.push(h);
+            }
             for (&c, &id) in &self.stat_floaties {
                 if !wanted.contains(&c) {
                     destroy.push(num(f64::from(id)));
@@ -1759,7 +1801,8 @@ impl UiLayer {
                     }
                 };
                 let Some(o) = sim.world.get(c) else { continue };
-                let p = glam::Vec3::new(o.position[0], o.position[1], o.position[2] + HEAD);
+                let z = o.position[2] + head(o.id) + OVER_HEAD;
+                let p = glam::Vec3::new(o.position[0], o.position[1], z);
                 let cl = vp * p.extend(1.0);
                 let (x, y, alpha) = if cl.w > 1e-4 {
                     let n = cl.truncate() / cl.w;
@@ -1772,13 +1815,33 @@ impl UiLayer {
                 places.extend([
                     num(f64::from(x) / scale),
                     num(f64::from(y) / scale),
-                    num(1.0),
+                    num(floaty_scale(camera.position.distance(p))),
                     num(alpha),
                     num(f64::from(id)),
                 ]);
-                let mut flags = SHOW_HEALTH_BAR + IS_HOSTILE;
+                let mut flags = if Some(c) == hovered {
+                    // The exe's flags (0x764e40): the name always; the health bar for a
+                    // hostile, a party member or a creature in combat; whether it is
+                    // hostile or in the party. Provisional: HAS_MANA (the class's mana,
+                    // 0x71a060) is not sent.
+                    let hostile = party.iter().any(|&m| sim.hostile(m, c));
+                    let in_party = party.contains(&c);
+                    let mut f = SHOW_NAME;
+                    if hostile || in_party || o.combat.in_combat {
+                        f += SHOW_HEALTH_BAR;
+                    }
+                    if hostile {
+                        f += IS_HOSTILE;
+                    }
+                    if in_party {
+                        f += IS_IN_PARTY;
+                    }
+                    f
+                } else {
+                    SHOW_HEALTH_BAR + IS_HOSTILE
+                };
                 if Some(c) == target {
-                    flags += SHOW_NAME + SHOW_TARGET;
+                    flags = SHOW_HEALTH_BAR + IS_HOSTILE + SHOW_NAME + SHOW_TARGET;
                 }
                 let (cur, max) = (
                     o.properties.get(&health).map_or(0.0, |p| f64::from(p.1)),
@@ -2261,6 +2324,15 @@ fn gui_id(s: Screen, container: bool) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floaties_shrink_to_two_thirds_from_5_to_30_metres() {
+        assert_eq!(floaty_scale(0.0), 1.0);
+        assert_eq!(floaty_scale(5.0), 1.0);
+        assert!((floaty_scale(17.5) - 5.0 / 6.0).abs() < 1e-6);
+        assert!((floaty_scale(30.0) - 2.0 / 3.0).abs() < 1e-6);
+        assert!((floaty_scale(300.0) - 2.0 / 3.0).abs() < 1e-6);
+    }
 
     #[test]
     fn lines_play_for_a_reading_time() {

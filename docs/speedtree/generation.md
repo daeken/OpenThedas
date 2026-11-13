@@ -1041,6 +1041,18 @@ The game ignores the file's `near` and `far` and computes its own per placement:
   each with the placement position and corner index, the billboard's width and height and a
   per-frame fade alpha, the image's atlas entry and the placement's yaw, scale and colour.
   The fade is an alpha test (greater than 84) on texture alpha scaled by the fade.
+- **Lighting frame.** The billboard shader lights the quad from a normal map with one frame
+  shared by every billboard and all four corners, recomputed when the camera turns: with a
+  the camera's azimuth (atan2(y, x) of its view direction), normal = (cos a, sin a, 0),
+  tangent = (−sin a, cos a, 0), binormal = (0, 0, 1). The normal is the view direction
+  flattened, pointing away from the camera.
+- **Light scalars** (the file's standard-shader section; defaults when absent: global 1,
+  dark side 1, bright side 1, billboard ambient 0.5). Each billboard vertex carries
+  (global × bright side, dark side × global, billboard ambient).
+- **Image-angle threshold.** Each billboard vertex also carries the file's
+  `billboard_transition` (0 when absent). The shader fades a billboard by the view angle
+  around the tree against this threshold, in two passes of the same image, so it matters
+  even with one image (7.8's note is about the LOD computation only).
 
 ### 7.6 Branch and frond vertices, shader constants, wind
 
@@ -1159,7 +1171,8 @@ The game uses them as 7.4 describes.
     slot 1 level = region.
   - None: slot 0 level 0, alpha T. Pop: slot 0 level (int)((1 − ℓ)·N_l), alpha T.
 - **Fade hints** (3.7, 4.6) are not used here; they are for renderers that fade per vertex.
-  `billboard_transition` affects only 360° billboard images, which DA:O does not use.
+  `billboard_transition` does not enter this computation (the billboard shader reads it,
+  7.5).
 
 ### 7.9 Self-shadow coordinates
 

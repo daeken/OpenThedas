@@ -121,6 +121,8 @@ pub struct AudioState {
     pub container: Option<(u32, i64)>,
     /// The game is paused (the player's pause).
     pub paused: bool,
+    /// A menu the world waits behind is up (the game's `GM_GUI`).
+    pub gui: bool,
     /// An area is loading (the load screen is up): the game mode is `GM_LOADING` for the
     /// sound, whatever the simulation's says.
     pub loading: bool,
@@ -268,6 +270,11 @@ pub struct GameAudio {
     container: Option<u32>,
     /// The pause's ducking event playing (see [`pause_duck`]).
     pause_duck: Option<Option<EventHandle>>,
+    /// Paused last frame, and whether that pause holds the voice categories
+    /// ([`PAUSED_VOICES`]).
+    paused: Option<bool>,
+    /// The music director (see [`MusicDirector`]).
+    director: MusicDirector,
     /// The music track's ambience ducking event playing (see [`music_duck`]).
     music_duck: Option<(&'static str, Option<EventHandle>)>,
     /// The simulation's music intensity last seen (scripts' `SetMusicIntensity`).
@@ -392,17 +399,112 @@ const PAUSE_DUCK: &str = "audio_categories/ducking/OnGamePause";
 /// Whether the pause plays `OnGamePause` (DAOrigins.exe's pause toggle 0x5d6742: pausing
 /// in explore, combat, dead, dialog or cutscene mode plays it, 0x5d67fc..0x5d683c;
 /// unpausing stops it, 0x5d68fb). It lowers music, ambience and placeables 6 to 9 dB and
-/// pauses movement, footsteps, effects and ambient voices. Provisional: the exe pauses
-/// the `VOambient`, `VOconversation` and `VOnarration` categories when pausing in
-/// `GM_GUI` (0x5d684e) instead, which is not modelled, nor is pausing (see `Duck`).
+/// pauses movement, footsteps, effects and ambient voices (see `Duck`).
 fn pause_duck(paused: bool, mode: i32) -> bool {
-    paused && matches!(mode, 0 | 1 | GM_DEAD | GM_DIALOG | GM_CUTSCENE)
+    paused
+        && matches!(
+            mode,
+            GM_EXPLORE | GM_COMBAT | GM_DEAD | GM_DIALOG | GM_CUTSCENE
+        )
 }
 
+/// The voice categories the pause holds when it begins in `GM_GUI` (DAOrigins.exe's pause
+/// toggle 0x5d684e..0x5d68e3: each through 0x5b7540, which pauses the FMOD category,
+/// strings 0xafeb60, 0xafeb74, 0xafeb2c). Unpausing in any mode resumes them
+/// (0x5d6932..0x5d69c2).
+const PAUSED_VOICES: [&str; 3] = ["VOambient", "VOconversation", "VOnarration"];
+
+/// DAOrigins.exe's music director (0x5bb630, run each frame with the frame time): when the
+/// game mode changes it cues the theme's track for the new mode (music vtable slot 0x8,
+/// 0x5bfdf0, which the music update then switches to at the playing track's next marker).
+///
+/// - Explore and pregame cue `main` (0x5bb90c, string 0xafebd8).
+/// - Combat cues `combat` (0xafed3c), but coming from `GM_GUI`, dialog or a cutscene only
+///   after 6 s (0xafed38) still in combat (0x5bb726..0x5bb76e: the cue waits at +0x5c with
+///   its time at +0x7c, counted down at 0x5bb95c; any mode change drops it, 0x5bb6d6).
+/// - Dialog and cutscenes cue `main`, except when one follows the other (0x5bb773,
+///   0x5bb7d6).
+/// - Death cues `death` (0xafed2c), character creation `chargen` (0xafed1c).
+/// - The interface, loading and the rest leave the track as it is.
+#[derive(Clone, Debug, PartialEq)]
+struct MusicDirector {
+    mode: i32,
+    track: &'static str,
+    /// A combat cue waiting: seconds left.
+    delayed: Option<f32>,
+}
+
+impl MusicDirector {
+    fn new() -> MusicDirector {
+        MusicDirector {
+            mode: GM_LOADING,
+            track: "main",
+            delayed: None,
+        }
+    }
+
+    /// The track to play in `mode`, `dt` seconds after the last call.
+    fn update(&mut self, mode: i32, dt: f32) -> &'static str {
+        if mode != self.mode {
+            let old = std::mem::replace(&mut self.mode, mode);
+            self.delayed = None;
+            match mode {
+                GM_COMBAT if matches!(old, GM_GUI | GM_DIALOG | GM_CUTSCENE) => {
+                    self.delayed = Some(6.0)
+                }
+                GM_COMBAT => self.track = "combat",
+                GM_CUTSCENE if old == GM_DIALOG => {}
+                GM_DIALOG if old == GM_CUTSCENE => {}
+                GM_EXPLORE | GM_PREGAME | GM_DIALOG | GM_CUTSCENE => self.track = "main",
+                GM_DEAD => self.track = "Death",
+                GM_CHARGEN => self.track = "chargen",
+                _ => {}
+            }
+        } else if let Some(left) = self.delayed.as_mut() {
+            *left -= dt;
+            if *left <= 0.0 {
+                self.delayed = None;
+                self.track = "combat";
+            }
+        }
+        self.track
+    }
+}
+
+const GM_EXPLORE: i32 = 0;
+const GM_COMBAT: i32 = 1;
 const GM_DEAD: i32 = 2;
+const GM_GUI: i32 = 3;
 const GM_DIALOG: i32 = 4;
 const GM_CUTSCENE: i32 = 5;
+const GM_PREGAME: i32 = 8;
 const GM_LOADING: i32 = 9;
+const GM_CHARGEN: i32 = 11;
+
+/// The game mode as the sound sees it (`GM_*` in `script.ldf`): loading while the load
+/// screen is up, dead once the party has fallen, a cutscene while one plays outside a
+/// conversation, the simulation's own mode when it says dialog or another special one,
+/// `GM_GUI` while a menu stops the world, combat while the party fights, else explore.
+///
+/// Provisional: the simulation does not keep combat or the interface as game modes, so
+/// those come from the party's fighting and the menus up.
+fn game_mode(state: &AudioState) -> i32 {
+    if state.loading {
+        GM_LOADING
+    } else if state.dead {
+        GM_DEAD
+    } else if state.cutscene.is_some() && state.game_mode != GM_DIALOG {
+        GM_CUTSCENE
+    } else if !matches!(state.game_mode, GM_EXPLORE | GM_COMBAT) {
+        state.game_mode
+    } else if state.gui {
+        GM_GUI
+    } else if state.combat {
+        GM_COMBAT
+    } else {
+        GM_EXPLORE
+    }
+}
 
 /// The ducking event a game mode plays while it lasts (DAOrigins.exe's mode-change handler
 /// 0x5bd220, tables 0x5bd618 and 0x5bd638): `OnDeath` for `GM_DEAD`, `OnCutscene` for
@@ -704,6 +806,8 @@ impl GameAudio {
             script_intensity: None,
             music_duck: None,
             pause_duck: None,
+            paused: None,
+            director: MusicDirector::new(),
             container: None,
             ss_types: ss_types(vfs),
             sound_set_entries: Default::default(),
@@ -1288,16 +1392,7 @@ impl GameAudio {
     /// The game mode's ducking (see [`mode_duck`]): on a change of mode the old mode's event
     /// stops (its ducks ramp back over their fade-outs) and the new one's starts, unless both
     /// modes use the same event, which then plays on.
-    fn follow_mode(&mut self, state: &AudioState) {
-        let mode = if state.loading {
-            GM_LOADING
-        } else if state.dead {
-            GM_DEAD
-        } else if state.cutscene.is_some() && state.game_mode != GM_DIALOG {
-            GM_CUTSCENE
-        } else {
-            state.game_mode
-        };
+    fn follow_mode(&mut self, mode: i32) {
         let want = mode_duck(mode);
         if self.mode_duck.as_ref().map(|d| d.0) == want {
             return;
@@ -1377,13 +1472,8 @@ impl GameAudio {
             return;
         };
         if let Some(theme) = a.theme.clone().filter(|_| !state.loading) {
-            let want = if state.dead {
-                "Death"
-            } else if state.combat {
-                "combat"
-            } else {
-                "main"
-            };
+            // The track the music director cues for the game mode (see `MusicDirector`).
+            let want = self.director.track;
             // A change waits for the playing track's next marker (DAOrigins.exe 0x5c4b10, states
             // 4 and 5): the first sync point more than 0.4 s ahead (0x190 ms) and less than
             // 15 s ahead (0x3a98 ms), else 0.4 s on. The first track of an area starts at once.
@@ -1477,11 +1567,20 @@ impl GameAudio {
         for i in 0..a.sounds.len() {
             let s = &a.sounds[i];
             let on = s.active && !state.inactive_sounds.contains(&s.tag);
+            // An audio volume's sound follows the listener (see `SoundRegion`): at the
+            // listener while the party leader is inside the volume, else at the volume's
+            // nearest point, when within the volume's radius of the event's reach.
+            // Provisional: re-placed every frame rather than every 0.06 s after 0.25 m.
+            let position = match &s.region {
+                Some(r) if state.leader.is_some_and(|p| r.contains(p)) => listener,
+                Some(r) => r.nearest(listener),
+                None => s.position,
+            };
             let d = {
                 let v = [
-                    s.position[0] - listener[0],
-                    s.position[1] - listener[1],
-                    s.position[2] - listener[2],
+                    position[0] - listener[0],
+                    position[1] - listener[1],
+                    position[2] - listener[2],
                 ];
                 (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
             };
@@ -1503,7 +1602,7 @@ impl GameAudio {
                     a.playing[i] = Some(self.engine.play(
                         &s.event,
                         PlayOptions {
-                            position: Some(s.position),
+                            position: Some(position),
                             volume: 10f32.powf(s.volume / 20.0),
                             distance_scale: s.max_distance_mult.max(1e-3),
                             ..Default::default()
@@ -1518,6 +1617,9 @@ impl GameAudio {
                 }
                 (Some(Some(h)), true) if !self.engine.is_playing(h) => {
                     a.playing[i] = Some(None);
+                }
+                (Some(Some(h)), true) if s.region.is_some() => {
+                    self.engine.set_position(h, position);
                 }
                 _ => {}
             }
@@ -1752,10 +1854,25 @@ impl GameAudio {
                 self.set_music_state(s);
             }
         }
-        self.follow_mode(&state);
+        let mode = game_mode(&state);
+        self.follow_mode(mode);
+        let before = self.director.track;
+        let track = self.director.update(mode, dt);
+        if track != before {
+            log::debug!("audio: game mode {mode}: music cue {track}");
+        }
         self.follow_area(&state, dt);
         self.follow_music_duck(&state);
-        let pause = pause_duck(state.paused, state.game_mode);
+        // The pause's voices (see `PAUSED_VOICES`): held when the pause begins in GUI mode,
+        // resumed when it ends.
+        if state.paused != self.paused.is_some() {
+            let hold = state.paused && mode == GM_GUI;
+            for c in PAUSED_VOICES {
+                self.engine.set_category_paused(c, hold);
+            }
+            self.paused = state.paused.then_some(hold);
+        }
+        let pause = pause_duck(state.paused, mode);
         if pause != self.pause_duck.is_some() {
             if let Some(Some(h)) = self.pause_duck.take() {
                 log::debug!("audio: pause duck ends");
@@ -1950,6 +2067,34 @@ mod tests {
         // GM_GUI (3) and loading: not this event.
         assert!(!pause_duck(true, 3));
         assert!(!pause_duck(true, GM_LOADING));
+    }
+
+    #[test]
+    fn the_director_cues_a_track_per_game_mode() {
+        let mut d = MusicDirector::new();
+        // Out of the load: main; a fight: combat at once.
+        assert_eq!(d.update(GM_EXPLORE, 0.1), "main");
+        assert_eq!(d.update(GM_COMBAT, 0.1), "combat");
+        // A conversation in the fight: main, and through a cutscene it leads into.
+        assert_eq!(d.update(GM_DIALOG, 0.1), "main");
+        d.track = "combat";
+        assert_eq!(d.update(GM_CUTSCENE, 0.1), "combat");
+        assert_eq!(d.update(GM_DIALOG, 0.1), "combat");
+        // Back to the fight from dialog: combat only after 6 s still fighting.
+        d.track = "main";
+        assert_eq!(d.update(GM_COMBAT, 0.1), "main");
+        assert_eq!(d.update(GM_COMBAT, 5.0), "main");
+        assert_eq!(d.update(GM_COMBAT, 1.0), "combat");
+        // The interface keeps the track; a mode change drops a waiting cue.
+        assert_eq!(d.update(GM_GUI, 0.1), "combat");
+        d.track = "main";
+        d.update(GM_COMBAT, 0.1);
+        d.update(GM_GUI, 0.1);
+        assert_eq!(d.update(GM_GUI, 10.0), "main");
+        assert_eq!(d.update(GM_DEAD, 0.1), "Death");
+        assert_eq!(d.update(GM_LOADING, 0.1), "Death");
+        assert_eq!(d.update(GM_PREGAME, 0.1), "main");
+        assert_eq!(d.update(GM_CHARGEN, 0.1), "chargen");
     }
 
     #[test]
