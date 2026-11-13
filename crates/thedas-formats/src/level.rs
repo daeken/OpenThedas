@@ -632,6 +632,34 @@ pub struct TreePlacement {
     pub flag: i64,
 }
 
+/// A level's wind (`<level>_<n>.wnd`, GFF4 `WND `), as far as the trees read it
+/// (DAOrigins.exe 0x5c89b0): its strength (22003) and direction (22004). The other fields
+/// feed the engine's own wind users and are not read here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Wnd {
+    pub strength: f32,
+    pub direction: [f32; 3],
+}
+
+impl Wnd {
+    pub const STRENGTH: u32 = 22003;
+    pub const DIRECTION: u32 = 22004;
+
+    pub fn parse(data: &[u8]) -> TypedResult<Self> {
+        let gff = Gff4::parse(data)?;
+        let d = Doc::new(&gff, "wnd");
+        d.expect_type("WND ")?;
+        let finite = |v: f32| if v.is_finite() { v } else { 0.0 };
+        Ok(Wnd {
+            strength: finite(d.opt_f32(gff.root, Self::STRENGTH)?.unwrap_or(0.0)),
+            direction: d
+                .opt_vec3(gff.root, Self::DIRECTION)?
+                .unwrap_or_default()
+                .map(finite),
+        })
+    }
+}
+
 impl Rml {
     pub fn parse(data: &[u8]) -> TypedResult<Self> {
         Self::from_gff4(&Gff4::parse(data)?)

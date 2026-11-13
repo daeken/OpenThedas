@@ -1103,6 +1103,17 @@ impl Live {
         // from the reference frame (reference/original/triage/city_elf_opening_shianni.png),
         // not traced in the exe.
         let line = talk_line(&sim);
+        // Unless the line's stage has a `decision` camera to hand back to: Vaughan's line
+        // cuts (44998-45005) end on the Soris/hero two-shot in the original, the stage's
+        // decision camera, while City Elf's first line (its stage has none) keeps
+        // start_wake's last view. Provisional, from the two reference sequences.
+        let decision = self
+            .talk_camera
+            .staging(&sim, base)
+            .is_some_and(|st| st.decision.is_some());
+        if decision {
+            self.cut_held = None;
+        }
         match (&self.cut_held, &line) {
             (Some((held, view)), Some(now)) if held == now => {
                 let mut c = *view;
@@ -1128,8 +1139,14 @@ impl Live {
         let view = self
             .cutscene_camera
             .camera(&sim, base, &|id| drawn_root(posed, id));
-        // Held for the conversation line it plays over (see `Live::conversation_camera`).
-        if let (Some(v), Some(line)) = (view, talk_line(&sim)) {
+        // Held for the conversation line it plays over (see `Live::conversation_camera`), when
+        // that line is the one that played it: City Elf's first line plays its own cuts and
+        // keeps their last view for its replies (reference city_elf_opening_shianni.png),
+        // while Vaughan's line 40 comes up during line 39's 45005.cut and takes its own
+        // stage camera (soris_decision, reference vaughan_scene/v_15). Provisional, from the
+        // two reference sequences.
+        let own = talk_line(&sim).filter(|l| l.2.is_some() && l.2 == sim.cutscene_line());
+        if let (Some(v), Some(line)) = (view, own) {
             self.cut_held = Some((line, v));
         }
         view
