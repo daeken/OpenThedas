@@ -574,6 +574,11 @@ fn check_data(
             thedas_formats::morph::MorphPreset::from_gff4(&doc).map(|_| ())
         )),
         (_, "msh") => Some(s(Msh::from_gff4(&doc).map(|_| ()))),
+        (b"MAO ", _) => Some(
+            MaterialObject::from_gff4(&doc)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        ),
         (_, "ani") => Some(s(
             thedas_formats::anim::Animation::from_gff(&doc).map(|_| ())
         )),
