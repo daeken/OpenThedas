@@ -7,7 +7,7 @@
 //! layout is ours. Provisional: one hero's saves only (the screens' hero list holds the one
 //! playing), no screenshots, every save of the manual kind.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thedas_ui::binding::SaveListing;
@@ -56,7 +56,7 @@ impl SaveStore {
         Self { dir: dir.into() }
     }
 
-    /// `saves` in the player's [`data_dir`].
+    /// `$HOME/.openthedas/saves`, or `./openthedas-saves` without a home.
     pub fn default_dir() -> PathBuf {
         data_dir().join("saves")
     }
@@ -129,20 +129,6 @@ impl SaveStore {
     pub fn latest(&self) -> Option<i32> {
         self.list().first().map(|s| s.slot)
     }
-}
-
-/// The player's own OpenThedas folder: on Windows `OpenThedas` in the user's application
-/// data (`%APPDATA%`), elsewhere `.openthedas` in their home; `./openthedas` without
-/// either.
-pub fn data_dir() -> PathBuf {
-    #[cfg(windows)]
-    let dir = dirs::data_dir().map(|d| d.join("OpenThedas"));
-    #[cfg(not(windows))]
-    let dir = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)
-        .map(|h| h.join(".openthedas"));
-    dir.unwrap_or_else(|| PathBuf::from("openthedas"))
 }
 
 /// Seconds since the epoch as `YYYY-MM-DD HH:MM` (UTC).
