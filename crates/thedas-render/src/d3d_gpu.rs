@@ -1542,7 +1542,9 @@ impl D3dPass {
                     scene.meshes[d.mesh].key,
                     m.mao,
                     m.semantic,
-                    material_programs.get(d.material).map(|p| p.iter().map(|q| q.name.clone()).collect::<Vec<_>>())
+                    material_programs
+                        .get(d.material)
+                        .map(|p| p.iter().map(|q| q.name.clone()).collect::<Vec<_>>())
                 );
             }
             let Some(passes) = material_programs.get(d.material) else {

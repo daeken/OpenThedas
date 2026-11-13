@@ -1127,6 +1127,17 @@ impl ConstantContext<'_> {
                 Value::Vectors(vec![[self.camera.x, self.camera.y, self.camera.z, 0.0]])
             }
             ("FocalPlane", _) => Value::Vectors(vec![[1.0, 0.0, 0.0, 0.0]]),
+            // Dragon Age II's shaders normalize the sun's direction whether or not there
+            // is a sun (`face_face_p0.psh`), so a level without one gives it a direction
+            // straight down with no colour: a zero direction would light every pixel of
+            // their faces with NaN, which draws black.
+            ("LightsArrayDirected", _) => {
+                let mut v = self.light_params();
+                if self.sun.is_none() {
+                    v[2] = [0.0, 0.0, -1.0, 1.0];
+                }
+                Value::Vectors(v)
+            }
             ("LightsArray", _) | (_, "g_vLightParams") => Value::Vectors(self.light_params()),
             ("ShaderControlBooleans", _) | (_, "g_bShaderControlBooleans") => {
                 // b0: the D/E list's first entry; b1, b2: lights B and C (0x46be70).

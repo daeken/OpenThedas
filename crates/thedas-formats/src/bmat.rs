@@ -516,7 +516,7 @@ pub fn engine_usage(source: u32) -> Option<&'static str> {
         7 => "ModelViewProjectionTrans",
         8 => "ModelView",
         10 => "ModelViewInv",
-        16 => "LightsArray",
+        16 => "LightsArrayDirected",
         17 => "BonesWorld",
         20 => "ShaderControlBooleans",
         21 => "ShadowPartitionMatrix",
