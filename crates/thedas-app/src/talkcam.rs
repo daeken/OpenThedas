@@ -7,13 +7,17 @@
 //!
 //! Presentation only: reads the simulation and the dialog and stage resources.
 //!
-//! Once a line with its own cinematics has run its length (the cut's, 5000) and the player
-//! has replies to choose, the view moves to the stage's `decision` camera.
+//! A line whose own cutscene cuts between camera actors is seen through that cutscene's
+//! camera as it plays (see [`line_cut_view`], traced).
 //!
-//! Provisional: the camera's field of view is taken as
-//! vertical; the original's camera moves between and within
-//! lines and lines staged at the speaker's
-//! current location (`StageAtCurrentLocation`) are not followed.
+//! Once a line with its own cinematics has run its length (the cut's, 5000) and the player
+//! has replies to choose, the view moves to the stage's `decision` camera. Provisional, and
+//! our own invention: the executable has no `decision` string and no such fallback was found
+//! in `GameModeDialog`; what the original shows while the player chooses is not traced.
+//!
+//! Provisional: the camera's field of view is taken as vertical; camera moves between
+//! lines, and within a line whose cutscene has no camera cuts, are not followed; nor are
+//! lines staged at the speaker's current location (`StageAtCurrentLocation`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -110,7 +114,8 @@ impl TalkCamera {
 
     /// The camera for the open conversation: the line's shot, or the stage's decision camera
     /// once a line with its own cinematics has run its length and the player has replies
-    /// to choose. Provisional: the original's line length is its voice-over's; the cut's
+    /// to choose. Provisional: the decision camera as a fallback is our own invention (see
+    /// the module docs); the original's line length is its voice-over's; the cut's
     /// length (5000) is taken instead, and lines without one keep their shot.
     ///
     /// A line without a shot of its own is framed as the executable frames a line that
@@ -601,9 +606,8 @@ mod tests {
         let placement = Placement::facing([10.0, 20.0, 0.0], 90.0);
         let base = Camera::new(Vec3::ZERO, 0.0, 0.0);
         let none: &DrawnRoots = &|_| None;
-        let view = |t: f32| {
-            line_cut_view(&tracks, t, placement, Some(&stage), &[], none, &base).unwrap()
-        };
+        let view =
+            |t: f32| line_cut_view(&tracks, t, placement, Some(&stage), &[], none, &base).unwrap();
         // First the speaker's close camera: stage (0, -1) is world (11, 20), looking along
         // stage +Y = world -X.
         let c = view(0.2);
