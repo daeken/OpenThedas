@@ -201,8 +201,6 @@ struct AreaPlay {
     inside: Vec<bool>,
     /// Which music volumes the party leader was inside last frame.
     music_inside: Vec<bool>,
-    /// Per sound: how occluded it is now (see [`crate::occlusion`]).
-    occlusion: Vec<f32>,
     /// The layout (environment level) the area is built on, from its `.are`.
     layout: Option<String>,
 }
@@ -1423,6 +1421,41 @@ impl GameAudio {
         self.area.as_ref().is_none_or(|a| a.resref != resref)
     }
 
+    /// Every occludable 3D sound playing is muffled by what stands between it and the
+    /// listener (see [`crate::occlusion`]), as DAOrigins.exe's audio update does for each
+    /// playing event (0x5b7220): not in the party picker (game mode 12, 0x5b7248), and not
+    /// the controlled character's own sounds (0x6aa98c..0x6aa99c).
+    ///
+    /// Provisional: the controlled character's sounds are told by where they are (within
+    /// 0.75 m of the party leader) rather than by who makes them.
+    fn follow_occlusion(
+        &mut self,
+        listener: Option<[f32; 3]>,
+        leader: Option<[f32; 3]>,
+        game_mode: i32,
+    ) {
+        const GM_PARTYPICKER: i32 = 12;
+        let Some(listener) = listener else {
+            return;
+        };
+        if game_mode == GM_PARTYPICKER
+            || self.area.as_ref().map(|a| a.resref.as_str()) != Some(self.occluders.area.as_str())
+        {
+            return;
+        }
+        for (h, p) in self.engine.occludable_sources() {
+            let own = leader.is_some_and(|l| {
+                (l[0] - p[0]).hypot(l[1] - p[1]) < 0.75 && (l[2] - p[2]).abs() < 2.5
+            });
+            let target = if own {
+                0.0
+            } else {
+                self.occluders.set.between(listener, p)
+            };
+            self.engine.occlude(h, target);
+        }
+    }
+
     /// Whether the area's sound occluders want looking at again (twice a second, and at
     /// once in a new area).
     pub fn wants_occluders(&self, resref: &str) -> bool {
@@ -1553,7 +1586,6 @@ impl GameAudio {
             preset: None,
             inside: Vec::new(),
             music_inside: Vec::new(),
-            occlusion: vec![0.0; n],
             layout: thedas_formats::Area::parse(data)
                 .ok()
                 .and_then(|a| a.layout),
@@ -1816,20 +1848,8 @@ impl GameAudio {
                     * 1.1
             };
             let near = d <= reach.max(1.0);
-            // How much the geometry between muffles it (see `crate::occlusion`): at once
-            // when it starts (the exe's forced update, 0x5b73c9), then at 1.2 per second.
-            let target = (s.occludable && on && near && self.occluders.area == a.resref)
-                .then(|| self.occluders.set.between(listener, position));
             match (a.playing[i], on && near) {
                 (None, true) => {
-                    a.occlusion[i] = target.unwrap_or(0.0);
-                    if a.occlusion[i] > 0.0 {
-                        log::debug!(
-                            "audio: occlusion of {}: starts at {:.2}",
-                            s.event,
-                            a.occlusion[i]
-                        );
-                    }
                     a.playing[i] = Some(self.engine.play(
                         &s.event,
                         PlayOptions {
@@ -1842,6 +1862,8 @@ impl GameAudio {
                             pitch: s.pitch,
                             fade_in_ms: Some(s.fade_in_ms),
                             fade_out_ms: Some(s.fade_out_ms),
+                            // Its `Occludable` field (see `follow_occlusion`).
+                            occludable: s.occludable,
                             // Its cone (see `AreaSound::forward`); a volume's sound faces
                             // the listener, so has none.
                             cone: (s.region.is_none() && s.cone_inside < 360.0).then_some(
@@ -1869,18 +1891,6 @@ impl GameAudio {
                     self.engine.set_position(h, position);
                 }
                 _ => {}
-            }
-            if let (Some(Some(h)), Some(target)) = (a.playing[i], target) {
-                let now = crate::occlusion::approach(a.occlusion[i], target, dt);
-                if (now > 0.0) != (a.occlusion[i] > 0.0) || (now >= 1.0) != (a.occlusion[i] >= 1.0)
-                {
-                    log::debug!(
-                        "audio: occlusion of {}: {now:.2} (towards {target:.2})",
-                        s.event
-                    );
-                }
-                a.occlusion[i] = now;
-                self.engine.set_occlusion(h, now);
             }
         }
     }
@@ -1982,6 +1992,8 @@ impl GameAudio {
 
     fn frame_dt(&mut self, mut state: AudioState, dt: f32) {
         self.occluders.age += dt;
+        // For `follow_occlusion`, once this frame's sounds have started.
+        let occlusion_from = (state.listener.map(|l| l.0), state.leader, state.game_mode);
         self.engine.volumes = state.volumes;
         self.hero_female = state.hero_female;
         if let Some((pos, right)) = state.listener {
@@ -2173,6 +2185,7 @@ impl GameAudio {
             }
             self.voice = state.line.map(|line| self.speak(line));
         }
+        self.follow_occlusion(occlusion_from.0, occlusion_from.1, occlusion_from.2);
         self.engine.update(dt);
     }
 

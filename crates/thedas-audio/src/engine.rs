@@ -54,6 +54,12 @@ pub struct PlayOptions {
     pub fade_out_ms: Option<u32>,
     /// The source's sound cone (a placed sound's facing and `Cone*` fields).
     pub cone: Option<Cone>,
+    /// Whether geometry between a 3D source and the listener muffles it. DAOrigins.exe's
+    /// events are occludable unless their player says otherwise (the event object's +0xbd
+    /// is 1 from its constructor, 0x5ba2ed): a placed sound gives its `Occludable` field
+    /// (0x7c2537) and a creature's sounds are not when it is the controlled character
+    /// (0x6aa98c..0x6aa99c).
+    pub occludable: bool,
 }
 
 /// A 3D source's sound cone, as FMOD's: full level within the inside angle about
@@ -106,6 +112,7 @@ impl Default for PlayOptions {
             fade_in_ms: None,
             fade_out_ms: None,
             cone: None,
+            occludable: true,
         }
     }
 }
@@ -178,6 +185,8 @@ struct Instance {
     /// How much geometry between it and the listener muffles it, 0..=1 (see
     /// [`AudioEngine::set_occlusion`]).
     occlusion: f32,
+    /// What its occlusion is moving towards ([`AudioEngine::occlude`]); none yet given.
+    occlusion_target: Option<f32>,
     /// Its category (or one above it) is paused: its voices hold where they are and it
     /// neither ages nor starts sounds (see [`AudioEngine::set_category_paused`]).
     paused: bool,
@@ -501,6 +510,7 @@ impl AudioEngine {
             rate,
             age: 0.0,
             occlusion: 0.0,
+            occlusion_target: None,
             paused: false,
         };
         log::debug!(
@@ -651,7 +661,56 @@ impl AudioEngine {
     pub fn set_occlusion(&mut self, handle: EventHandle, occlusion: f32) {
         if let Some(i) = self.instances.iter_mut().find(|i| i.handle == handle) {
             i.occlusion = occlusion.clamp(0.0, 1.0);
+            i.occlusion_target = Some(i.occlusion);
         }
+    }
+
+    /// The playing events geometry can muffle, with where they are: 3D events with a
+    /// position that are occludable ([`PlayOptions::occludable`]) and within 1.25 times
+    /// their reach of the listener (DAOrigins.exe leaves the others' occlusion as it is,
+    /// 0x5b72af, 0xafebd0).
+    pub fn occludable_sources(&self) -> Vec<(EventHandle, [f32; 3])> {
+        let listener = self.listener.position;
+        self.instances
+            .iter()
+            .filter(|i| !i.stopping && i.options.occludable)
+            .filter_map(|i| {
+                let p = i.options.position?;
+                let ev = i.event().filter(|e| e.is_3d())?;
+                let d = sub(p, listener);
+                let reach = ev.max_distance * i.options.distance_scale.max(1e-3) * 1.25;
+                (dot(d, d).sqrt() < reach).then_some((i.handle, p))
+            })
+            .collect()
+    }
+
+    /// Give an event the occlusion the geometry in its way makes (0 clear to 1 blocked).
+    /// The first is taken at once (the exe's forced update when a sound starts, 0x5b73c9);
+    /// after that the event's occlusion moves towards it at 1.2 per second (0x5b6eb0,
+    /// 0xafebc0).
+    pub fn occlude(&mut self, handle: EventHandle, target: f32) {
+        let Some(i) = self.instances.iter_mut().find(|i| i.handle == handle) else {
+            return;
+        };
+        let target = target.clamp(0.0, 1.0);
+        let before = i.occlusion_target;
+        if before.is_none() {
+            i.occlusion = target;
+        }
+        if before.is_none_or(|b| (b > 0.0) != (target > 0.0) || (b >= 1.0) != (target >= 1.0))
+            && (target > 0.0 || before.is_some())
+        {
+            log::debug!(
+                "audio: occlusion of {}: {} {target:.2}",
+                i.path,
+                if before.is_none() {
+                    "starts at"
+                } else {
+                    "towards"
+                }
+            );
+        }
+        i.occlusion_target = Some(target);
     }
 
     pub fn set_position(&mut self, handle: EventHandle, position: [f32; 3]) {
@@ -869,6 +928,14 @@ impl AudioEngine {
         for ii in 0..self.instances.len() {
             let paused = self.category_paused(&self.instances[ii].category);
             let inst = &mut self.instances[ii];
+            if let Some(target) = inst.occlusion_target {
+                let step = 1.2 * dt.max(0.0);
+                inst.occlusion = if inst.occlusion < target {
+                    (inst.occlusion + step).min(target)
+                } else {
+                    (inst.occlusion - step).max(target)
+                };
+            }
             if paused || inst.paused {
                 if let Ok(mut m) = self.mixer.lock() {
                     for v in inst.slots.iter().flat_map(|s| &s.voices) {
@@ -1504,10 +1571,22 @@ mod tests {
         assert!((muffled - full * 0.25).abs() < 1e-3, "{full} -> {muffled}");
         e.set_occlusion(h, 0.0);
         assert!((run(&mut e, &m, 0.5) - full).abs() < 1e-3);
+        // A target given by the geometry: the first at once, later ones at 1.2 a second.
+        assert_eq!(e.occludable_sources().len(), 1);
+        e.occlude(h, 0.0);
+        e.occlude(h, 1.0);
+        let half = run(&mut e, &m, 0.5);
+        assert!((half - full * 0.4).abs() < 0.03 * full, "{full} -> {half}");
+        assert!(run(&mut e, &m, 0.5) < 1e-4);
+        let (mut e, m) = engine("occl-start");
+        let h = e.play("test/grp/loop3d", at.clone()).unwrap();
+        e.occlude(h, 0.5);
+        assert!((run(&mut e, &m, 0.05) - full * 0.5).abs() < 1e-3);
         // A 2D event has nothing in its way.
         let (mut e, m) = engine("occl2d");
         let h = e.play("test/grp/loop", at).unwrap();
         let full = run(&mut e, &m, 0.5);
+        assert!(e.occludable_sources().is_empty());
         e.set_occlusion(h, 1.0);
         assert!((run(&mut e, &m, 0.5) - full).abs() < 1e-3);
     }

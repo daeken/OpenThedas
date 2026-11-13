@@ -35,11 +35,11 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
    - Not applied: `Priority`, `Occludable`.
    - Medium.
 9. **Occlusion.**
-   - Done for placed sounds: each frame, for an event flagged `Occludable` within 1.25 times its reach, a physics ray is cast from the listener to the source through placeables, static geometry and a third shape group (mask 0x1024; 0x5b7220 -> 0xa2c700). Occlusion starts at 0 and each hit adds `(1 - occlusion) * a`.
+   - Done for every occludable 3D event (events are occludable unless their player says otherwise, 0x5ba2ed; a placed sound gives its `Occludable` field and the controlled character's own sounds are not, 0x6aa98c): each frame, for such an event within 1.25 times its reach, a physics ray is cast from the listener to the source through placeables, static geometry and a third shape group (mask 0x1024; 0x5b7220 -> 0xa2c700). Occlusion starts at 0 and each hit adds `(1 - occlusion) * a`.
    - For a sphere, box or capsule, `a` is how far inside the shape's outline the ray passes, in degrees over 45 (0x828400), times the surface's percentage for static geometry (`sound_geometry_mat_types.gda` column 0xae2b65f5: stone and metal 100, wood 40, grass 10, unknown 0). The surface is the model's root node's sound material (`.phy` field 6330). A placeable gives its type's value (`placeable_types.gda` column 0x913e3094: doors 0.4 to 0.7). A triangle mesh adds nothing, except that a static hit within 0.5 m of an earlier one counts in full.
    - The result moves at 1.2 per second into the event's occlusion (0x5b6eb0); the reverb's occlusion stays 0.
    - Ours reads the `.phy` shapes the simulation already loads (`Collision::ray_hits`, read-only).
-   - Provisional: the box's angle (the exe picks a corner by a score not decoded; ours takes the corner nearest the hit); the third shape group (0x1000) is not identified; the 0.5 m rule's distance is measured from the listener; doors occlude only while closed; occlusion is applied as a gain of `1 - occlusion` with no low-pass; only placed sounds are tested (how other events get the flag is not traced).
+   - Provisional: the box's angle (the exe picks a corner by a score not decoded; ours takes the corner nearest the hit); the third shape group (0x1000) is not identified; the 0.5 m rule's distance is measured from the listener; doors occlude only while closed; occlusion is applied as a gain of `1 - occlusion` with no low-pass; the controlled character's own sounds are told by their place (within 0.75 m of the party leader), not by who makes them.
    - Not checked against a recording of the original.
 10. **Audio volume triggers (Type 4, CCTriggerAudioVolume).**
     - Their reverb is applied (#279).
