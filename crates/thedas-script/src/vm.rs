@@ -42,6 +42,19 @@ pub enum Value {
     },
     /// Only at the host boundary: vectors are three float cells on the stack.
     Vector([f32; 3]),
+    /// Only on the VM's own stack (Dragon Age II): a reference to a script variable, made by
+    /// `GETREF`/`GETREFARRAY` and consumed by the engine call that follows. Hosts never see
+    /// one: the VM passes the variable's value and writes the argument back afterwards.
+    Ref(RefTarget),
+}
+
+/// What a [`Value::Ref`] points at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefTarget {
+    /// A stack cell, by its index from the bottom of the stack.
+    Cell(usize),
+    /// An element of the array held in a stack cell.
+    Element { array: usize, index: usize },
 }
 
 impl Value {
@@ -74,6 +87,7 @@ impl Value {
             Value::Engine { .. } => "engine",
             Value::Array { .. } => "array",
             Value::Vector(_) => "vector",
+            Value::Ref(_) => "reference",
         }
     }
 
@@ -131,6 +145,19 @@ pub trait Host {
         f: &Function,
         args: Vec<Value>,
     ) -> VmResult<Option<Value>>;
+
+    /// Runs an engine function that was passed at least one variable by reference
+    /// (Dragon Age II's `ref` parameters, [`crate::ldf::Param::by_ref`]). `args` holds the
+    /// variables' current values; whatever the host leaves in a by-reference argument is
+    /// written back to the script's variable. The default leaves them unchanged.
+    fn action_ref(
+        &mut self,
+        caller: ObjectId,
+        f: &Function,
+        args: &mut Vec<Value>,
+    ) -> VmResult<Option<Value>> {
+        self.action(caller, f, args.clone())
+    }
 }
 
 /// A host that implements nothing: every call returns the default of its return type.
@@ -335,6 +362,8 @@ impl Vm {
                     });
                 }
                 let mut args = Vec::with_capacity(argc);
+                // (argument index, variable) for each argument passed by reference.
+                let mut refs = Vec::new();
                 for p in &f.params[..argc] {
                     if p.ty == Type::Vector {
                         let z = pop_float(st)?;
@@ -342,10 +371,26 @@ impl Vm {
                         let x = pop_float(st)?;
                         args.push(Value::Vector([x, y, z]));
                     } else {
-                        args.push(pop(st)?);
+                        match pop(st)? {
+                            Value::Ref(target) => {
+                                refs.push((args.len(), target));
+                                args.push(read_ref(st, target, at)?);
+                            }
+                            v => args.push(v),
+                        }
                     }
                 }
-                let ret = host.action(caller, f, args)?;
+                let ret = if refs.is_empty() {
+                    host.action(caller, f, args)?
+                } else {
+                    let ret = host.action_ref(caller, f, &mut args)?;
+                    for (i, target) in refs {
+                        if let Some(v) = args.get(i) {
+                            write_ref(st, target, v.clone(), at)?;
+                        }
+                    }
+                    ret
+                };
                 if f.ret != Type::Void {
                     push_return(st, &f.ret, ret);
                 }
@@ -585,6 +630,29 @@ impl Vm {
                     st.stack.push(v);
                 }
             }
+            (GetRef | GetRefArray, Arg::Copy { offset, size }) => {
+                if cells(*size)? != 1 {
+                    return Err(VmError::Unsupported {
+                        op: "multi-cell references",
+                        at,
+                    });
+                }
+                // The offset is taken before the index is popped, as for array reads.
+                let i = cell(st.stack.len(), *offset)?;
+                let target = if ins.op == GetRef {
+                    RefTarget::Cell(i)
+                } else {
+                    let index = pop_int(st)?;
+                    let index = usize::try_from(index).map_err(|_| VmError::BadOffset {
+                        offset: index as i64,
+                        at,
+                    })?;
+                    RefTarget::Element { array: i, index }
+                };
+                // Fail here, where the reference is made, if it points at nothing.
+                read_ref(st, target, at)?;
+                st.stack.push(Value::Ref(target));
+            }
             (StoreState | StoreStateAll | Unknown2E, _) => {
                 return Err(VmError::Unsupported {
                     op: ins.op.mnemonic(),
@@ -729,6 +797,65 @@ fn host_vector(v: Option<Value>) -> [f32; 3] {
     }
 }
 
+/// The value a reference points at. An array element past the end reads as the element
+/// type's default, as `READARRAY` does (provisional, like that rule).
+fn read_ref(st: &State, target: RefTarget, at: usize) -> VmResult<Value> {
+    let bad = |i: usize| VmError::BadOffset {
+        offset: i as i64,
+        at,
+    };
+    match target {
+        RefTarget::Cell(i) => match st.stack.get(i) {
+            Some(Value::Ref(_)) | None => Err(bad(i)),
+            Some(v) => Ok(v.clone()),
+        },
+        RefTarget::Element { array, index } => match st.stack.get(array) {
+            Some(Value::Array { elem, items }) => Ok(items
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| Value::default_for(elem))),
+            Some(other) => Err(VmError::TypeMismatch {
+                at,
+                expected: "array",
+                found: other.kind(),
+            }),
+            None => Err(bad(array)),
+        },
+    }
+}
+
+/// Stores through a reference. Writing an array element past the end grows the array, as
+/// `WRITEARRAY` does.
+fn write_ref(st: &mut State, target: RefTarget, value: Value, at: usize) -> VmResult<()> {
+    let bad = |i: usize| VmError::BadOffset {
+        offset: i as i64,
+        at,
+    };
+    match target {
+        RefTarget::Cell(i) => {
+            *st.stack.get_mut(i).ok_or_else(|| bad(i))? = value;
+        }
+        RefTarget::Element { array, index } => match st.stack.get_mut(array) {
+            Some(Value::Array { elem, items }) => {
+                if index >= items.len() {
+                    let d = Value::default_for(elem);
+                    items.resize(index + 1, d);
+                }
+                items[index] = value;
+            }
+            Some(other) => {
+                return Err(VmError::TypeMismatch {
+                    at,
+                    expected: "array",
+                    found: other.kind(),
+                });
+            }
+            None => return Err(bad(array)),
+        },
+    }
+    Ok(())
+}
+
 fn push_return(st: &mut State, t: &Type, v: Option<Value>) {
     match t {
         Type::Vector => {
@@ -750,7 +877,8 @@ mod tests {
         int AddOne(int n) = 1;\n\
         vector Vec(float x, float y, float z) = 2;\n\
         float VecX(vector v) = 3;\n\
-        string GetTag(object o) = 4;\n";
+        string GetTag(object o) = 4;\n\
+        void Bump(ref int n, int by = 10) = 5;\n";
 
     struct TestHost {
         log: Vec<String>,
@@ -788,6 +916,20 @@ mod tests {
                 )),
                 _ => None,
             })
+        }
+
+        fn action_ref(
+            &mut self,
+            _: ObjectId,
+            f: &Function,
+            args: &mut Vec<Value>,
+        ) -> VmResult<Option<Value>> {
+            self.log.push(format!("{}{:?}", f.name, args));
+            if f.name == "Bump" {
+                let by = args.get(1).and_then(Value::as_int).unwrap_or(10);
+                args[0] = Value::Int(args[0].as_int().unwrap() + by);
+            }
+            Ok(None)
         }
     }
 
@@ -952,5 +1094,71 @@ mod tests {
         b.extend(i32b(1));
         b.extend([0x14, 0x20]);
         assert!(matches!(run(&b).0, Err(VmError::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn engine_calls_change_variables_passed_by_reference() {
+        // The pattern Dragon Age II scripts use (GETREF then ACTION), on an int for the test:
+        // RSADD I; CONST I 5; CPDOWNSP -8,4; MOVSP -4; GETREF -4,4; ACTION Bump(1);
+        // CPTOPSP -4,4; ACTION PrintInteger(1); RETN
+        let mut b = vec![0x02, 0x03, 0x04, 0x03];
+        b.extend(i32b(5));
+        b.extend([0x01, 0x01]);
+        b.extend(i32b(-8));
+        b.extend([0x00, 0x04, 0x1b, 0x00]);
+        b.extend(i32b(-4));
+        b.extend([0x37, 0x01]);
+        b.extend(i32b(-4));
+        b.extend([0x00, 0x04, 0x05, 0x00, 0x00, 0x05, 0x01]);
+        b.extend([0x03, 0x01]);
+        b.extend(i32b(-4));
+        b.extend([0x00, 0x04, 0x05, 0x00, 0x00, 0x00, 0x01, 0x20, 0x00]);
+        let (r, log) = run(&b);
+        assert_eq!(r.unwrap().value, Some(Value::Int(15)));
+        assert_eq!(log, vec!["Bump[Int(5)]", "PrintInteger[Int(15)]"]);
+    }
+
+    #[test]
+    fn engine_calls_change_array_elements_passed_by_reference() {
+        // RSADD int[]; CONST I 7; CONST I 2; WRITEARRAY -12,4; MOVSP -4;
+        // CONST I 3; CONST I 2; GETREFARRAY -12,4; ACTION Bump(2);
+        // CONST I 2; READARRAY -8,4; ACTION PrintInteger(1); RETN
+        let mut b = vec![0x02, 0x40, 0x04, 0x03];
+        b.extend(i32b(7));
+        b.extend([0x04, 0x03]);
+        b.extend(i32b(2));
+        b.extend([0x30, 0x01]);
+        b.extend(i32b(-12));
+        b.extend([0x00, 0x04, 0x1b, 0x00]);
+        b.extend(i32b(-4));
+        b.extend([0x04, 0x03]);
+        b.extend(i32b(3));
+        b.extend([0x04, 0x03]);
+        b.extend(i32b(2));
+        b.extend([0x39, 0x01]);
+        b.extend(i32b(-12));
+        b.extend([0x00, 0x04, 0x05, 0x00, 0x00, 0x05, 0x02]);
+        b.extend([0x04, 0x03]);
+        b.extend(i32b(2));
+        b.extend([0x32, 0x01]);
+        b.extend(i32b(-8));
+        b.extend([0x00, 0x04, 0x05, 0x00, 0x00, 0x00, 0x01, 0x20, 0x00]);
+        let (r, log) = run(&b);
+        r.unwrap();
+        assert_eq!(log, vec!["Bump[Int(7), Int(3)]", "PrintInteger[Int(10)]"]);
+    }
+
+    #[test]
+    fn a_host_without_reference_support_leaves_the_variable_alone() {
+        // RSADD I; GETREF -4,4; ACTION Bump(1); RETN
+        let mut b = vec![0x02, 0x03, 0x37, 0x01];
+        b.extend(i32b(-4));
+        b.extend([0x00, 0x04, 0x05, 0x00, 0x00, 0x05, 0x01, 0x20, 0x00]);
+        let ncs = Arc::new(Ncs::parse(&assemble(&b)).unwrap());
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut host = NullHost::default();
+        let r = Vm::new(ncs, table).run(&mut host, 7).unwrap();
+        assert_eq!(r.value, Some(Value::Int(0)));
+        assert_eq!(host.calls, vec![("Bump".to_string(), vec![Value::Int(0)])]);
     }
 }

@@ -25,7 +25,7 @@ pub mod vfs;
 use std::path::PathBuf;
 
 pub use erf::{Erf, ErfEntry, ErfVersion};
-pub use install::{DaoInstall, LevelMount};
+pub use install::{DaoInstall, Game, LevelMount};
 pub use path::{join_ci, resolve_ci};
 pub use vfs::{Layer, Provenance, Vfs};
 

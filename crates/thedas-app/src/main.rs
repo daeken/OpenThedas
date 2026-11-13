@@ -1940,8 +1940,7 @@ impl App {
         let (Some(a), Some(live)) = (self.audio.as_ref(), self.live.as_ref()) else {
             return false;
         };
-        let line = voice_line(&live.sim());
-        line.is_some_and(|l| a.line_voice(&l).is_some())
+        line_is_voiced(a, &live.sim())
     }
 
     /// The quick save (`save`) or quick load key, while playing with no menu up.
@@ -3132,6 +3131,23 @@ impl ApplicationHandler for App {
 /// the boot movies), its interface (`ui`: the sounds it asked for, the player's volumes),
 /// the camera, and a boot movie playing. A cutscene's or area's sound data is read here
 /// when it starts.
+/// Whether the line on screen is heard: its own voice-over is in the audio's banks (see
+/// [`voice_line`]), or it is a cutscene's line whose voice is mixed into the cutscene's own
+/// sound (`CutsceneLine::vo_mode` not 0, the intro's narration). For the subtitles: a line
+/// that is heard shows no text under "No subtitles".
+fn line_is_voiced(audio: &audio::GameAudio, sim: &thedas_sim::Sim) -> bool {
+    if voice_line(sim).is_some_and(|l| audio.line_voice(&l).is_some()) {
+        return true;
+    }
+    sim.conversation_line().is_none()
+        && sim
+            .world
+            .cutscene
+            .as_ref()
+            .and_then(|c| c.line_now())
+            .is_some_and(|l| l.vo_mode != 0)
+}
+
 /// The voice-over the line on screen wants: the conversation's line, else a cutscene's line
 /// that has its own voice. With [`audio::GameAudio::line_voice`] this says whether the line
 /// is voiced (and for how long) as soon as it is chosen, before its voice plays.
@@ -3969,6 +3985,25 @@ fn menu_key(code: KeyCode) -> Option<screens::Screen> {
 /// A floating message over the controlled creature (the `floaty` step): white, the default
 /// style, two seconds.
 fn test_floaty(sim: &mut thedas_sim::Sim, text: &str) {
+    // `floaty portrait: TEXT` is a message by the controlled creature's portrait instead
+    // (a script's `DisplayPortraitMessage`).
+    if let (Some(text), Some(target)) = (text.strip_prefix("portrait:"), sim.world.controlled()) {
+        sim.world
+            .portrait_messages
+            .push(thedas_sim::world::PortraitMessage {
+                target,
+                text: text.trim().to_string(),
+                colour: 0xffffff,
+            });
+        return;
+    }
+    // `floaty status: TEXT` is a status message (a script's `DisplayStatusMessage`).
+    if let Some(text) = text.strip_prefix("status:") {
+        sim.world
+            .status_messages
+            .push((text.trim().to_string(), 0xffffff));
+        return;
+    }
     if let Some(target) = sim.world.controlled() {
         sim.world.floaties.push(thedas_sim::world::FloatyMessage {
             target,
@@ -4475,9 +4510,9 @@ fn main() -> Result<()> {
                                 }
                                 layer.set_paused(l.paused);
                                 layer.set_pad_active(pad_play.used);
-                                let voiced = recording.as_ref().is_some_and(|a| {
-                                    voice_line(&l.sim()).is_some_and(|v| a.line_voice(&v).is_some())
-                                });
+                                let voiced = recording
+                                    .as_ref()
+                                    .is_some_and(|a| line_is_voiced(a, &l.sim()));
                                 layer.set_line_voiced(voiced);
                                 if let Some(aim) = layer.play(s, &l.sim, dt).pop() {
                                     println!("aiming ability {}", aim.ability);
