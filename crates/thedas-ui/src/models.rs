@@ -312,13 +312,17 @@ fn da2_creature_models(
         Some(da2_model(&path, &folder, &model))
     };
     let mut models = Vec::new();
+    if !apr.rows.contains_key(&app) {
+        return models;
+    }
     match text(apr.cell("ModelName", app)) {
         Some(name) => models.push(name.to_ascii_lowercase()),
-        None => models.extend(
+        None if word("ModelType").eq_ignore_ascii_case("P") => models.extend(
             DA2_UNCLOTHED
                 .iter()
                 .filter_map(|&row| part(variations, row)),
         ),
+        None => {}
     }
     let heads = match apr.cell("Head_Worksheet", app) {
         Some(Cell::Int(id)) if *id > 0 => sim.world.tables().get(*id as i32, ""),
