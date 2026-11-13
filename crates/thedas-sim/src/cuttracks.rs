@@ -45,6 +45,7 @@
 //!   [`CameraJump`].
 //! - Kind 19, the frame buffer effect action (`AFBE`): see [`FrameEffectTrack`].
 //! - Kind 27, `ActionLinkToActor` (built by 0x7db900, update 0x7d3cf0): see [`ActorLink`].
+//! - Kind 20, `ActionShake` (built by 0x7da990, update 0x7d0ed0): see [`ShakeTrack`].
 //! - Kind 28, `ActionHeadtracking` (built by 0x7da820, update 0x7d0d00): see [`HeadTrack`].
 //! - Kind 32, `ActionChangeVisibility` (built by 0x7dba50, update 0x7d44c0): from its start
 //!   the actor is shown or hidden as its field 5680 says (0x7d4220); when the cutscene lets
@@ -91,6 +92,14 @@ const FIELD_PARAMETER_VALUE: u32 = 5524;
 const FIELD_PARAMETER_CURVE: u32 = 5525;
 const FIELD_PARAMETER_COMPONENT: u32 = 5526;
 const FIELD_JUMP_BY_PLACE: u32 = 5570;
+const FIELD_SHAKE_KIND: u32 = 5600;
+const FIELD_SHAKE_SEED: u32 = 5603;
+const FIELD_SHAKE_FREQUENCY: u32 = 5604;
+const FIELD_SHAKE_NOISE: u32 = 5605;
+const FIELD_SHAKE_SMOOTH: u32 = 5606;
+const FIELD_SHAKE_PERSISTENCE: u32 = 5607;
+const FIELD_SHAKE_FADE_IN: u32 = 5608;
+const FIELD_SHAKE_FADE_OUT: u32 = 5609;
 const FIELD_VISIBLE: u32 = 5680;
 const FIELD_DRAW_MAIN: u32 = 5730;
 const FIELD_DRAW_OFF: u32 = 5731;
@@ -123,6 +132,7 @@ pub const TRACK_CAMERA_FOV: u64 = 13;
 pub const TRACK_MOVE_SPLINE: u64 = 17;
 pub const TRACK_ROTATE: u64 = 18;
 pub const TRACK_FRAME_EFFECT: u64 = 19;
+pub const TRACK_SHAKE: u64 = 20;
 pub const TRACK_LINK_TO_ACTOR: u64 = 27;
 pub const TRACK_HEAD_TRACKING: u64 = 28;
 pub const TRACK_CHANGE_VISIBILITY: u64 = 32;
@@ -510,6 +520,192 @@ impl ActorLink {
     }
 }
 
+/// How many samples of its noise a shake keeps a second (0xae7ff0: one a hundredth).
+const SHAKE_RATE: f32 = 100.0;
+/// The longest shake kept, in seconds: the executable makes its table for the action's
+/// whole span, and the game's shakes end with their cutscenes.
+const SHAKE_MAX_SECONDS: f32 = 1800.0;
+
+/// The C runtime's `rand` (0x8e6a8e): the shake's noise is made with it.
+struct Rand(u32);
+
+impl Rand {
+    fn next(&mut self) -> i32 {
+        self.0 = self.0.wrapping_mul(214_013).wrapping_add(2_531_011);
+        ((self.0 >> 16) & 0x7fff) as i32
+    }
+
+    /// `count` values within -1 to 1 (0xa3c030).
+    fn white(&mut self, count: usize) -> Vec<f32> {
+        (0..count)
+            .map(|_| (self.next() as f64 / 16383.5 - 1.0) as f32)
+            .collect()
+    }
+}
+
+/// Value noise over `seconds` (0xa3c1e0): for each octave `o` up to `octaves`, random
+/// values `1 / (2^o × frequency)` seconds apart, joined by cosine curves and scaled by
+/// `persistence^o`, summed at [`SHAKE_RATE`] samples a second. `smooth` first blends each
+/// value with its neighbours (a quarter of each, half of itself).
+fn value_noise(
+    seed: i32,
+    frequency: f32,
+    smooth: bool,
+    persistence: f32,
+    octaves: i32,
+    seconds: f32,
+    count: usize,
+) -> Vec<f32> {
+    let mut rand = Rand(seed as u32);
+    let seeds: Vec<i32> = (0..=octaves.max(-1)).map(|_| rand.next()).collect();
+    let mut out = vec![0.0f32; count];
+    for (o, seed) in seeds.into_iter().enumerate() {
+        let mut rand = Rand(seed as u32);
+        let period = 1.0 / (2f32.powi(o as i32) * frequency);
+        let amplitude = persistence.powi(o as i32);
+        let points = (seconds / period) as i64 + 2;
+        if !period.is_finite() || period <= 0.0 || !(2..=4_000_000).contains(&points) {
+            continue;
+        }
+        let mut noise = rand.white(points as usize);
+        if smooth {
+            let raw = noise.clone();
+            let last = raw.len() - 1;
+            for i in 1..last {
+                noise[i] = raw[i - 1] * 0.25 + raw[i] * 0.5 + raw[i + 1] * 0.25;
+            }
+            noise[0] = raw[0] * 0.75 + raw[1] * 0.25;
+            noise[last] = raw[last] * 0.75 + raw[last - 1] * 0.25;
+        }
+        for (i, sample) in out.iter_mut().enumerate() {
+            let t = i as f32 / SHAKE_RATE;
+            let k = (t / period) as usize;
+            let (Some(a), Some(b)) = (noise.get(k), noise.get(k + 1)) else {
+                continue;
+            };
+            let along = (t - k as f32 * period) / period;
+            // 0xa3c0c0: a cosine ease from one value to the next.
+            let f = (1.0 - (along * std::f32::consts::PI).cos()) * 0.5;
+            *sample += (a * (1.0 - f) + b * f) * amplitude;
+        }
+    }
+    out
+}
+
+/// White noise blurred with a bell `2 × width` samples wide (0xa3c110).
+fn blurred_noise(seed: i32, width: usize, count: usize) -> Vec<f32> {
+    let raw = Rand(seed as u32).white(count + 2 * width);
+    (0..count)
+        .map(|i| {
+            let sum: f32 = (0..2 * width)
+                .map(|j| {
+                    let x = (width as f32 - j as f32) / width as f32;
+                    (-x * x).exp() * raw[i + j]
+                })
+                .sum();
+            sum / (2 * width) as f32
+        })
+        .collect()
+}
+
+/// An `ActionShake` track (kind 20; `ASHK`): noise that turns the actor, a camera held by
+/// hand. Every camera of a conversation's lines carries one.
+///
+/// Traced: the action's constructor (0x7da990) makes a table of noise for its span, one
+/// sample a hundredth of a second (0xa3c530), and scales it by each of its three curves in
+/// turn (the curve's value at that sample's time); its update (0x7d0ed0) takes the three
+/// tables' samples at the time as a heading, a pitch and a roll in degrees and multiplies
+/// that turn onto the actor's rotation (kind 1; kind 2 is not followed). The noise, by
+/// field 5605: 0 is white noise, blurred when field 5606 is set over a width set by field
+/// 5604; 1 is value noise, random values `1 / frequency` (5604) seconds apart joined by
+/// cosine curves; 2 is the same summed over octaves, each twice as fast and `persistence`
+/// (5607) as strong as the last. All three tables are made from the one seed (5603), so
+/// the three angles move together, apart by their curves. The table fades in over field
+/// 5608's seconds and out over 5609's.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShakeTrack {
+    pub start: f32,
+    pub end: f32,
+    /// The noise, [`SHAKE_RATE`] samples a second from the action's start, faded.
+    pub noise: Vec<f32>,
+    /// What scales the noise into the heading, the pitch and the roll (degrees).
+    pub curves: Vec<Curve>,
+}
+
+impl ShakeTrack {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        start: f32,
+        end: f32,
+        seed: i32,
+        frequency: f32,
+        kind: u8,
+        smooth: bool,
+        persistence: f32,
+        fades: (f32, f32),
+        curves: Vec<Curve>,
+    ) -> Option<Self> {
+        let seconds = end - start;
+        if !(0.0..=SHAKE_MAX_SECONDS).contains(&seconds) || !frequency.is_finite() {
+            return None;
+        }
+        let count = 1 + (seconds * SHAKE_RATE) as usize;
+        let mut noise = match kind {
+            0 if smooth => {
+                let width = ((1.0 / (frequency / SHAKE_RATE)) as i64).clamp(1, 100_000);
+                blurred_noise(seed, width as usize, count)
+            }
+            0 => Rand(seed as u32).white(count),
+            1 => value_noise(seed, frequency, smooth, 0.0, 0, seconds, count),
+            2 => {
+                let octaves =
+                    (((SHAKE_RATE / frequency).ln() / 2f32.ln()) as i32 + 1).clamp(3, 100);
+                value_noise(
+                    seed,
+                    frequency,
+                    smooth,
+                    persistence,
+                    octaves,
+                    seconds,
+                    count,
+                )
+            }
+            _ => return None,
+        };
+        let (fade_in, fade_out) = fades;
+        for (i, sample) in noise.iter_mut().enumerate() {
+            let t = i as f32 / SHAKE_RATE;
+            if fade_in > 0.001 && t < fade_in {
+                *sample *= t / fade_in;
+            }
+            if fade_out > 0.001 && t > seconds - fade_out {
+                *sample *= (seconds - t) / fade_out;
+            }
+        }
+        Some(ShakeTrack {
+            start,
+            end,
+            noise,
+            curves,
+        })
+    }
+
+    /// The turn it gives its actor `t` seconds into the cutscene (x, y, z, w); none outside
+    /// its span.
+    pub fn at(&self, t: f32) -> Option<[f32; 4]> {
+        let since = t - self.start;
+        if since < 0.0 || since > self.end - self.start {
+            return None;
+        }
+        let i = (since * SHAKE_RATE) as usize;
+        let n = *self.noise.get(i)?;
+        // Each table is the noise times its curve at the sample's own time.
+        let at = self.start + i as f32 / SHAKE_RATE;
+        let angle = |c: usize| self.curves.get(c).map_or(0.0, |curve| n * curve.at(at));
+        Some(euler_zxy(angle(0), angle(1), angle(2)))
+    }
+}
+
 /// An `ActionDrawWeapon` track (kind 41; `ADW_`): where the actor's creature carries its
 /// weapons from the action's start.
 ///
@@ -609,6 +805,8 @@ pub struct Actor {
     pub camera_jumps: Vec<CameraJump>,
     /// Kind-27 tracks, in the file's order.
     pub links: Vec<ActorLink>,
+    /// Kind-20 tracks, in the file's order.
+    pub shakes: Vec<ShakeTrack>,
     /// Kind-28 tracks, in the file's order.
     pub head_tracks: Vec<HeadTrack>,
     /// Kind-32 tracks, in the file's order: when, and whether shown from then.
@@ -1042,6 +1240,7 @@ impl Tracks {
                 places: Vec::new(),
                 camera_jumps: Vec::new(),
                 links: Vec::new(),
+                shakes: Vec::new(),
                 head_tracks: Vec::new(),
                 visibility: Vec::new(),
                 weapon_draws: Vec::new(),
@@ -1115,6 +1314,26 @@ impl Tracks {
                                 node,
                                 keep_offset: flag(FIELD_LINK_KEEP_OFFSET),
                             });
+                        }
+                    }
+                    TRACK_SHAKE => {
+                        let int = |l| g.field(tr, l).and_then(Value::as_i64).unwrap_or(0);
+                        let real = |l| f32_field(g, tr, l).unwrap_or(0.0);
+                        // Kind 1 turns the actor; kind 2 is not followed.
+                        if int(FIELD_SHAKE_KIND) == 1
+                            && let Some(shake) = ShakeTrack::new(
+                                start,
+                                end,
+                                int(FIELD_SHAKE_SEED) as i32,
+                                real(FIELD_SHAKE_FREQUENCY),
+                                int(FIELD_SHAKE_NOISE) as u8,
+                                int(FIELD_SHAKE_SMOOTH) != 0,
+                                real(FIELD_SHAKE_PERSISTENCE),
+                                (real(FIELD_SHAKE_FADE_IN), real(FIELD_SHAKE_FADE_OUT)),
+                                curves().curves,
+                            )
+                        {
+                            actor.shakes.push(shake);
                         }
                     }
                     TRACK_CHANGE_VISIBILITY => {
@@ -1306,6 +1525,25 @@ impl Tracks {
     }
 
     fn world_pose_within(
+        &self,
+        i: usize,
+        t: f32,
+        placement: Placement,
+        find: &Finders,
+        depth: u32,
+    ) -> Option<Pose> {
+        let mut pose = self.steady_pose_within(i, t, placement, find, depth)?;
+        // A shake turns the actor after whatever placed it (0x7d0ed0 multiplies its turn
+        // onto the actor's rotation). Provisional: that it comes after the jumps and links.
+        for shake in &self.actors.get(i)?.shakes {
+            if let Some(turn) = shake.at(t) {
+                pose.rotation = mul(pose.rotation, turn);
+            }
+        }
+        Some(pose)
+    }
+
+    fn steady_pose_within(
         &self,
         i: usize,
         t: f32,
@@ -2125,6 +2363,7 @@ mod tests {
             places: Vec::new(),
             camera_jumps: Vec::new(),
             links: Vec::new(),
+            shakes: Vec::new(),
             head_tracks: Vec::new(),
             visibility: Vec::new(),
             weapon_draws: Vec::new(),
@@ -2166,6 +2405,7 @@ mod tests {
             places: Vec::new(),
             camera_jumps: Vec::new(),
             links: Vec::new(),
+            shakes: Vec::new(),
             head_tracks: Vec::new(),
             visibility: vec![(32.2, true), (0.0, false)],
             weapon_draws: Vec::new(),
@@ -2204,6 +2444,7 @@ mod tests {
             places: Vec::new(),
             camera_jumps: Vec::new(),
             links: Vec::new(),
+            shakes: Vec::new(),
             head_tracks: Vec::new(),
             visibility: Vec::new(),
             weapon_draws: Vec::new(),
@@ -2274,6 +2515,7 @@ mod tests {
             places: Vec::new(),
             camera_jumps: Vec::new(),
             links: Vec::new(),
+            shakes: Vec::new(),
             head_tracks: Vec::new(),
             visibility: Vec::new(),
             weapon_draws: Vec::new(),
