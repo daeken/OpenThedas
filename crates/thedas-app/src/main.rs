@@ -1557,6 +1557,14 @@ impl App {
                 "format": format!("{:?}", g.config.format),
             });
         }
+        // What the player has layered over the install (the original's override and add-in
+        // folders, the mod list): these change what the game reads.
+        info["mods"] = json!(
+            thedas_vfs::mods::player_layers(&self.loaded.vfs)
+                .iter()
+                .map(|l| json!({ "layer": l.label, "files": l.files }))
+                .collect::<Vec<_>>()
+        );
         let mut now_save = None;
         let mut trace = None;
         let mut pause = false;
