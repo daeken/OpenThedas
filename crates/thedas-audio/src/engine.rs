@@ -1269,7 +1269,12 @@ mod tests {
             .u32(0)
             .u32(1)
             .u32(10000)
-            .u32(0x0018_0008);
+            // 2D, or for a name ending in `3d`: 3D, world-relative, linear rolloff.
+            .u32(if name.ends_with("3d") {
+                0x0028_0010
+            } else {
+                0x0018_0008
+            });
         w.f(1.0).f(10000.0).u32(0);
         for _ in 0..8 {
             w.f(1.0);
@@ -1311,11 +1316,12 @@ mod tests {
         w.u32(1).u32(0x200).u32(1).s("test");
         w.s("master").f(1.0).f(0.0).u32(0).u32(0).u32(1);
         w.s("sfx").f(0.5).f(0.0).u32(0).u32(0).u32(0);
-        w.u32(1).s("grp").u32(0).u32(0).u32(4);
+        w.u32(1).s("grp").u32(0).u32(0).u32(5);
         event(&mut w, "loop", 1.0, 100, 100, 0, 0);
         event(&mut w, "once", 0.5, 0, 0, 0, 1);
         event(&mut w, "vo", 1.0, 0, 0, 1, 1);
         event_with(&mut w, "duck", 0.0, (0, 0), 0, 0, "#duck:sfx,100,0,200,-20");
+        event(&mut w, "loop3d", 1.0, 0, 0, 0, 0);
         // Templates: sequential, programmer-selected.
         w.u32(2);
         for mode in [0u32, 5] {
@@ -1486,22 +1492,23 @@ mod tests {
     #[test]
     fn occlusion_turns_a_3d_event_down() {
         let (mut e, m) = engine("occl");
-        let h = e
-            .play(
-                "test/grp/loop",
-                PlayOptions {
-                    position: Some([0.0, 0.0, 0.0]),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let at = PlayOptions {
+            position: Some([0.0, 0.0, 0.0]),
+            ..Default::default()
+        };
+        let h = e.play("test/grp/loop3d", at.clone()).unwrap();
         let full = run(&mut e, &m, 0.5);
+        assert!(full > 0.0);
         e.set_occlusion(h, 0.75);
         let muffled = run(&mut e, &m, 0.5);
-        if full > 0.0 {
-            assert!((muffled - full * 0.25).abs() < 1e-3, "{full} -> {muffled}");
-        }
+        assert!((muffled - full * 0.25).abs() < 1e-3, "{full} -> {muffled}");
         e.set_occlusion(h, 0.0);
+        assert!((run(&mut e, &m, 0.5) - full).abs() < 1e-3);
+        // A 2D event has nothing in its way.
+        let (mut e, m) = engine("occl2d");
+        let h = e.play("test/grp/loop", at).unwrap();
+        let full = run(&mut e, &m, 0.5);
+        e.set_occlusion(h, 1.0);
         assert!((run(&mut e, &m, 0.5) - full).abs() < 1e-3);
     }
 
