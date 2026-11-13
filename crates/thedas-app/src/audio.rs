@@ -1916,6 +1916,48 @@ impl GameAudio {
         self.engine.update(dt);
     }
 
+    /// The voice-over sample a line plays, if it has one: `<strref>_f` for a female hero
+    /// when the dialog's bank has it, else `<strref>_m` (DAOrigins.exe 0x7f2be9), from the
+    /// bank named after the dialog.
+    fn voice_sample(&self, line: &VoiceLine) -> Option<String> {
+        let lib = &self.engine.library;
+        let bank = line.dialog.to_ascii_lowercase();
+        let female = format!("{}_f", line.strref);
+        let male = format!("{}_m", line.strref);
+        if line.female && lib.find_sample(&bank, &female).is_some() {
+            Some(female)
+        } else if lib.find_sample(&bank, &male).is_some() {
+            Some(male)
+        } else {
+            None
+        }
+    }
+
+    /// Whether a conversation line is voiced and how long its voice-over runs
+    /// (milliseconds; `Some(None)` when voiced but its length is unknown), known as soon as
+    /// the line is chosen, before it plays: the sample is looked up in the dialog's bank
+    /// headers, nothing is decoded.
+    pub fn line_voice(&self, line: &VoiceLine) -> Option<Option<f64>> {
+        let sample = self.voice_sample(line)?;
+        let bank = line.dialog.to_ascii_lowercase();
+        Some(
+            self.engine
+                .library
+                .sample_seconds(&bank, &sample)
+                .map(|s| s * 1000.0),
+        )
+    }
+
+    /// Whether voice-over can be heard: the options' Dialog volume is above silence (a
+    /// disabled Dialog, or a slider at 0, is -60 dB, silent: DAOrigins.exe 0x5b61b0 ->
+    /// 0x5b6110). Lines still play silently, timed as usual; whether the exe also counts
+    /// such a line as unvoiced for its subtitles (`Conversation.HasVO`, the line's +0xd4
+    /// read at 0x690193) is not traced.
+    #[allow(dead_code)] // For the conversation screen's subtitles (UI-203).
+    pub fn dialog_audible(&self) -> bool {
+        self.engine.volumes.dialog > 0.0
+    }
+
     fn speak(&mut self, line: VoiceLine) -> (VoiceLine, Option<EventHandle>, Option<f64>) {
         let project = line.dialog.to_ascii_lowercase();
         let event = if line.ambient {
@@ -1923,21 +1965,10 @@ impl GameAudio {
         } else {
             "VOconversation"
         };
-        let lib = self.engine.library.clone();
-        let bank = project.clone();
-        let female = format!("{}_f", line.strref);
-        let male = format!("{}_m", line.strref);
-        let sample = if line.female && lib.find_sample(&bank, &female).is_some() {
-            Some(female)
-        } else if lib.find_sample(&bank, &male).is_some() {
-            Some(male)
-        } else {
-            None
-        };
-        let Some(sample) = sample else {
+        let Some(sample) = self.voice_sample(&line) else {
             return (line, None, None);
         };
-        let ms = lib.sample_seconds(&bank, &sample).map(|s| s * 1000.0);
+        let ms = self.line_voice(&line).flatten();
         let h = self.engine.play(
             &format!("{project}/VO/{event}"),
             PlayOptions {
