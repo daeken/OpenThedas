@@ -522,7 +522,7 @@ impl fmt::Display for Display<'_> {
             Arg::Action { id, argc } => {
                 let name = self
                     .table
-                    .and_then(|t| t.function(*id))
+                    .and_then(|t| t.function_for_call(*id, *argc as usize))
                     .map_or_else(|| format!("#{id}"), |fun| fun.name.clone());
                 write!(f, "{m:<14} {name}({argc})")
             }

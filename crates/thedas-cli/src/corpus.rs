@@ -457,7 +457,7 @@ fn check_script(data: &[u8], location: String, stats: &mut Stats, keep: usize) {
     };
     let Some(table) = table else { return };
     for (id, argc) in ncs.actions() {
-        match table.function(id) {
+        match table.function_for_call(id, argc as usize) {
             None => {
                 stats.fail(
                     "script/undeclared-action",
