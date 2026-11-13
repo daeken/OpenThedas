@@ -225,6 +225,66 @@ impl Prim {
         }
     }
 
+    /// Where along the segment from `p` to `p + d` (0..=1) it first meets the primitive,
+    /// when [`Prim::hits`] says it does.
+    fn hit_at(&self, p: V, d: V) -> Option<f32> {
+        if !self.hits(p, d) {
+            return None;
+        }
+        let len2 = dot(d, d);
+        Some(match self {
+            Prim::Tri(t) => {
+                // The plane's crossing (the segment is known to cross inside the triangle).
+                let n = cross(sub(t[1], t[0]), sub(t[2], t[0]));
+                let den = dot(n, d);
+                if den.abs() < 1e-12 {
+                    0.0
+                } else {
+                    (dot(n, sub(t[0], p)) / den).clamp(0.0, 1.0)
+                }
+            }
+            Prim::Sphere { c, r } => {
+                // The nearer root of |p + t d - c| = r, or the start when it is inside.
+                let m = sub(p, *c);
+                let (b, cc) = (dot(m, d), dot(m, m) - r * r);
+                let disc = b * b - len2 * cc;
+                if cc <= 0.0 || len2 <= 0.0 || disc < 0.0 {
+                    0.0
+                } else {
+                    ((-b - disc.sqrt()) / len2).clamp(0.0, 1.0)
+                }
+            }
+            Prim::Capsule { a, b, .. } => {
+                // The segment's nearest approach to the axis.
+                let e = sub(*b, *a);
+                let r = sub(p, *a);
+                let (aa, bb, cc) = (len2, dot(d, e), dot(e, e));
+                let (f, g) = (dot(d, r), dot(e, r));
+                let den = aa * cc - bb * bb;
+                if den > 1e-12 {
+                    ((bb * g - cc * f) / den).clamp(0.0, 1.0)
+                } else if aa > 1e-12 {
+                    (-f / aa).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            }
+            Prim::Obb { c, axes, half } => {
+                let lp = sub(p, *c);
+                let mut lo = 0.0f32;
+                for i in 0..3 {
+                    let (pi, di) = (dot(lp, axes[i]), dot(d, axes[i]));
+                    if di.abs() < 1e-12 {
+                        continue;
+                    }
+                    let (t0, t1) = ((-half[i] - pi) / di, (half[i] - pi) / di);
+                    lo = lo.max(t0.min(t1));
+                }
+                lo.clamp(0.0, 1.0)
+            }
+        })
+    }
+
     /// Whether the segment from `p` to `p + d` touches the primitive.
     fn hits(&self, p: V, d: V) -> bool {
         match self {
@@ -352,6 +412,54 @@ struct Node {
 pub struct Collision {
     prims: Vec<Prim>,
     nodes: Vec<Node>,
+    /// Per primitive, the shape it is part of (an index into `shapes`); empty when the
+    /// collision was built without shapes.
+    tags: Vec<u32>,
+    shapes: Vec<ShapeInfo>,
+}
+
+/// A shape's outline, for queries that ask how deep inside it a ray passes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Outline {
+    Sphere {
+        c: V,
+        r: f32,
+    },
+    Capsule {
+        a: V,
+        b: V,
+        r: f32,
+    },
+    Box {
+        c: V,
+        axes: [V; 3],
+        half: [f32; 3],
+    },
+    /// A triangle mesh: no outline is kept.
+    Mesh,
+}
+
+/// What a collision shape is, for [`Collision::ray_hits`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShapeInfo {
+    /// The engine mask ([`thedas_formats::phy::mask`]).
+    pub mask: u32,
+    /// Its model's sound material ([`thedas_formats::phy::Phy::sound_material`]).
+    pub material: u8,
+    /// Which of [`load_placeables`]'s models it belongs to (its index in the list); `None`
+    /// for a layout's models.
+    pub object: Option<u32>,
+    pub outline: Outline,
+}
+
+/// Where a segment first meets a shape.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RayHit {
+    /// How far along the segment, in metres from its start.
+    pub distance: f32,
+    pub point: V,
+    /// The shape ([`Collision::shape`]).
+    pub shape: usize,
 }
 
 const LEAF: usize = 4;
@@ -363,10 +471,18 @@ impl Collision {
         Self::build(tris.iter().map(|t| Prim::Tri(*t)).collect())
     }
 
-    fn build(mut prims: Vec<Prim>) -> Self {
+    #[cfg(test)]
+    fn build(prims: Vec<Prim>) -> Self {
+        Self::build_shapes(prims, Vec::new(), Vec::new())
+    }
+
+    /// As [`Collision::build`], keeping each primitive's shape (`tags[i]` indexes `shapes`).
+    fn build_shapes(mut prims: Vec<Prim>, tags: Vec<u32>, shapes: Vec<ShapeInfo>) -> Self {
         let mut c = Collision {
             prims: Vec::new(),
             nodes: Vec::new(),
+            tags: Vec::new(),
+            shapes,
         };
         if prims.is_empty() {
             return c;
@@ -438,8 +554,62 @@ impl Collision {
             .iter()
             .map(|&i| sorted[i].take().expect("each primitive once"))
             .collect();
+        if tags.len() == order.len() {
+            c.tags = order.iter().map(|&i| tags[i]).collect();
+        }
         items.clear();
         c
+    }
+
+    /// A shape a [`RayHit`] names.
+    pub fn shape(&self, i: usize) -> Option<&ShapeInfo> {
+        self.shapes.get(i)
+    }
+
+    /// Every shape the segment from `a` to `b` meets, each once at its first meeting,
+    /// nearest first (as PhysX's all-shapes ray cast reports one hit per shape). Empty for
+    /// a collision built without shapes. Read-only; sight queries do not use it.
+    ///
+    /// Provisional: a capsule's distance is that of the segment's nearest approach to its
+    /// axis, not of its surface.
+    pub fn ray_hits(&self, a: V, b: V) -> Vec<RayHit> {
+        let mut best: std::collections::BTreeMap<u32, f32> = std::collections::BTreeMap::new();
+        if self.nodes.is_empty() || self.tags.len() != self.prims.len() {
+            return Vec::new();
+        }
+        let d = sub(b, a);
+        let mut stack = vec![0usize];
+        while let Some(n) = stack.pop() {
+            let node = &self.nodes[n];
+            if !segment_aabb(a, d, node.lo, node.hi) {
+                continue;
+            }
+            if node.count > 0 {
+                let s = node.first as usize;
+                for i in s..s + node.count as usize {
+                    if let Some(t) = self.prims[i].hit_at(a, d) {
+                        let e = best.entry(self.tags[i]).or_insert(t);
+                        if t < *e {
+                            *e = t;
+                        }
+                    }
+                }
+            } else {
+                stack.push(node.first as usize);
+                stack.push(node.first as usize + 1);
+            }
+        }
+        let len = dot(d, d).sqrt();
+        let mut hits: Vec<RayHit> = best
+            .into_iter()
+            .map(|(shape, t)| RayHit {
+                distance: t * len,
+                point: add(a, scale(d, t)),
+                shape: shape as usize,
+            })
+            .collect();
+        hits.sort_by(|x, y| x.distance.total_cmp(&y.distance));
+        hits
     }
 
     pub fn is_empty(&self) -> bool {
@@ -596,12 +766,38 @@ impl Collision {
     }
 }
 
-/// Collects a model's sight-blocking shapes into `out`, placed by `at`.
-fn add_model(phy: &Phy, mmh: Option<&Mmh>, at: &Xf, out: &mut Vec<Prim>) {
+/// Primitives being collected, with the shape each is part of.
+#[derive(Default)]
+struct Parts {
+    prims: Vec<Prim>,
+    tags: Vec<u32>,
+    shapes: Vec<ShapeInfo>,
+}
+
+impl Parts {
+    fn push(&mut self, prim: Prim) {
+        self.prims.push(prim);
+        self.tags.push(self.shapes.len().saturating_sub(1) as u32);
+    }
+
+    fn build(self) -> Collision {
+        Collision::build_shapes(self.prims, self.tags, self.shapes)
+    }
+}
+
+/// Collects a model's sight-blocking shapes into `out`, placed by `at`; `object` is the
+/// placed model they belong to, for [`ShapeInfo::object`].
+fn add_model(phy: &Phy, mmh: Option<&Mmh>, at: &Xf, object: Option<u32>, out: &mut Parts) {
     for shape in &phy.shapes {
         if shape.mask & mask::SIGHT == 0 {
             continue;
         }
+        out.shapes.push(ShapeInfo {
+            mask: shape.mask,
+            material: phy.sound_material,
+            object,
+            outline: Outline::Mesh,
+        });
         let mut xf = *at;
         if let (Some(m), Some(parent)) = (mmh, shape.parent.as_deref()) {
             if let Some(chain) = m.node_chain(parent) {
@@ -625,15 +821,24 @@ fn add_model(phy: &Phy, mmh: Option<&Mmh>, at: &Xf, out: &mut Vec<Prim>) {
                     ]));
                 }
             }
-            Geometry::Sphere { radius } => out.push(Prim::Sphere {
-                c: xf.apply([0.0; 3]),
-                r: radius * xf.s,
-            }),
-            Geometry::Capsule { radius, height } => out.push(Prim::Capsule {
-                a: xf.apply([0.0, 0.0, *radius]),
-                b: xf.apply([0.0, 0.0, radius + height]),
-                r: radius * xf.s,
-            }),
+            Geometry::Sphere { radius } => {
+                let (c, r) = (xf.apply([0.0; 3]), radius * xf.s);
+                if let Some(info) = out.shapes.last_mut() {
+                    info.outline = Outline::Sphere { c, r };
+                }
+                out.push(Prim::Sphere { c, r });
+            }
+            Geometry::Capsule { radius, height } => {
+                let (a, b, r) = (
+                    xf.apply([0.0, 0.0, *radius]),
+                    xf.apply([0.0, 0.0, radius + height]),
+                    radius * xf.s,
+                );
+                if let Some(info) = out.shapes.last_mut() {
+                    info.outline = Outline::Capsule { a, b, r };
+                }
+                out.push(Prim::Capsule { a, b, r });
+            }
             Geometry::Box { half } => {
                 let axes = [
                     xf.rotate([1.0, 0.0, 0.0]),
@@ -644,10 +849,18 @@ fn add_model(phy: &Phy, mmh: Option<&Mmh>, at: &Xf, out: &mut Vec<Prim>) {
                     let n = dot(a, a).sqrt();
                     if n > 0.0 { scale(a, 1.0 / n) } else { a }
                 });
+                let (c, half) = (xf.apply([0.0; 3]), half.map(|h| h * xf.s));
+                if let Some(info) = out.shapes.last_mut() {
+                    info.outline = Outline::Box {
+                        c,
+                        axes: unit,
+                        half,
+                    };
+                }
                 out.push(Prim::Obb {
-                    c: xf.apply([0.0; 3]),
+                    c,
                     axes: unit,
-                    half: half.map(|h| h * xf.s),
+                    half,
                 });
             }
         }
@@ -667,7 +880,7 @@ pub fn load_layout(level: &Vfs, global: &Vfs, arl: &thedas_formats::Arl) -> Coll
     };
     let mut models: std::collections::HashMap<String, Option<LoadedModel>> =
         std::collections::HashMap::new();
-    let mut prims = Vec::new();
+    let mut prims = Parts::default();
     for room in &arl.rooms {
         let rml = [format!("{}.rml", room.name), format!("{}_0.rml", room.name)]
             .iter()
@@ -691,10 +904,10 @@ pub fn load_layout(level: &Vfs, global: &Vfs, arl: &thedas_formats::Arl) -> Coll
                 1.0
             };
             let at = room_xf.then(&Xf::from_transform(&p.transform, scale));
-            add_model(&phy, mmh.as_deref(), &at, &mut prims);
+            add_model(&phy, mmh.as_deref(), &at, None, &mut prims);
         }
     }
-    Collision::build(prims)
+    prims.build()
 }
 
 /// Builds the collision of an area's placeables: each one's model (`placeable_types.gda`
@@ -703,8 +916,8 @@ pub fn load_layout(level: &Vfs, global: &Vfs, arl: &thedas_formats::Arl) -> Coll
 pub fn load_placeables(global: &Vfs, placed: &[(String, V, f32)]) -> Collision {
     let mut models: std::collections::HashMap<String, Option<LoadedModel>> =
         std::collections::HashMap::new();
-    let mut prims = Vec::new();
-    for (model, position, facing) in placed {
+    let mut prims = Parts::default();
+    for (index, (model, position, facing)) in placed.iter().enumerate() {
         let stem = model.to_ascii_lowercase();
         let entry = models.entry(stem.clone()).or_insert_with(|| {
             let read = |n: &str| global.read(n).ok().map(|(d, _)| d);
@@ -721,9 +934,9 @@ pub fn load_placeables(global: &Vfs, placed: &[(String, V, f32)]) -> Collision {
             q: [0.0, 0.0, half.sin(), half.cos()],
             s: 1.0,
         };
-        add_model(&phy, mmh.as_deref(), &at, &mut prims);
+        add_model(&phy, mmh.as_deref(), &at, Some(index as u32), &mut prims);
     }
-    Collision::build(prims)
+    prims.build()
 }
 
 #[cfg(test)]
@@ -764,6 +977,64 @@ mod tests {
             !c.blocked([-5.0, -12.0, 0.0], [5.0, -12.0, 0.0]),
             "beside the box"
         );
+    }
+
+    #[test]
+    fn ray_hits_report_each_shape_once_nearest_first() {
+        let shape = |material, object, outline| ShapeInfo {
+            mask: mask::STATIC,
+            material,
+            object,
+            outline,
+        };
+        // A two-triangle wall at x = 5 (one mesh shape), a sphere at x = 10, a box at x = 20.
+        let c = Collision::build_shapes(
+            vec![
+                Prim::Tri([[5.0, -2.0, -2.0], [5.0, 2.0, -2.0], [5.0, 2.0, 2.0]]),
+                Prim::Tri([[5.0, -2.0, -2.0], [5.0, 2.0, 2.0], [5.0, -2.0, 2.0]]),
+                Prim::Sphere {
+                    c: [10.0, 0.0, 0.0],
+                    r: 1.0,
+                },
+                Prim::Obb {
+                    c: [20.0, 0.0, 0.0],
+                    axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    half: [1.0, 1.0, 1.0],
+                },
+            ],
+            vec![0, 0, 1, 2],
+            vec![
+                shape(5, None, Outline::Mesh),
+                shape(
+                    1,
+                    Some(7),
+                    Outline::Sphere {
+                        c: [10.0, 0.0, 0.0],
+                        r: 1.0,
+                    },
+                ),
+                shape(0, None, Outline::Mesh),
+            ],
+        );
+        let hits = c.ray_hits([0.0, 0.5, 0.0], [30.0, 0.5, 0.0]);
+        let got: Vec<(usize, f32)> = hits.iter().map(|h| (h.shape, h.distance)).collect();
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got[0].0, 0);
+        assert!((got[0].1 - 5.0).abs() < 1e-4, "{got:?}");
+        assert_eq!(got[1].0, 1);
+        assert!((got[1].1 - (10.0 - 0.75f32.sqrt())).abs() < 1e-3, "{got:?}");
+        assert_eq!(got[2].0, 2);
+        assert!((got[2].1 - 19.0).abs() < 1e-4, "{got:?}");
+        assert_eq!(
+            c.shape(1).map(|s| (s.material, s.object)),
+            Some((1, Some(7)))
+        );
+        // Short of everything, and a collision built without shapes: nothing.
+        assert!(c.ray_hits([0.0, 0.5, 0.0], [4.0, 0.5, 0.0]).is_empty());
+        let plain =
+            Collision::from_triangles(&[[[5.0, -2.0, -2.0], [5.0, 2.0, -2.0], [5.0, 2.0, 2.0]]]);
+        assert!(plain.blocked([0.0, 1.0, 0.0], [9.0, 1.0, 0.0]));
+        assert!(plain.ray_hits([0.0, 1.0, 0.0], [9.0, 1.0, 0.0]).is_empty());
     }
 
     #[test]

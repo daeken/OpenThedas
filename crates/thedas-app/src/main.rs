@@ -60,6 +60,7 @@ mod follow;
 mod intro;
 mod live;
 mod looks;
+mod occlusion;
 mod pad;
 mod paddev;
 mod padplay;
@@ -3608,6 +3609,16 @@ fn audio_state(
                     .unwrap_or_default();
                 a.set_area(&resref, &data);
             }
+            // Its sound occluders (read-only: the simulation's own collision is used only
+            // when it has already loaded it).
+            if a.wants_occluders(&resref) {
+                a.set_occluders(
+                    &resref,
+                    sim.loaded_collision(area_id),
+                    sim.install_root.clone(),
+                    sim.sound_occluders(area_id),
+                );
+            }
             state.area = Some(resref);
             state.combat = sim.world.party_fighting;
             state.music_intensity = Some(sim.world.music_intensity);
@@ -4426,6 +4437,7 @@ fn main() -> Result<()> {
         if let Some(exe) = update::newest_build() {
             match std::process::Command::new(&exe)
                 .args(std::env::args_os().skip(1))
+                .envs(update::program_dir().map(|d| (update::PROGRAM_DIR, d)))
                 .spawn()
             {
                 Ok(_) => {

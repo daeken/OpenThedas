@@ -383,6 +383,10 @@ fn check_other(
         MaterialState::parse(data)
             .map(|_| ())
             .map_err(|e| e.to_string())
+    } else if ext == "vlm" {
+        thedas_formats::vlm::Vlm::parse(data)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     } else if ext == "mat" && thedas_formats::bmat::is_bmat(data) {
         thedas_formats::bmat::Bmat::parse(data)
             .map(|_| ())
@@ -603,7 +607,7 @@ fn check_data(
                 .map(|_| ())
                 .ok_or_else(|| format!("not a conversation (file type {})", doc.file_type)),
         ),
-        (_, "cut") => Some({
+        (_, "cut" | "cl") => Some({
             // Every cutscene's tracks read, and the camera placed at each cut.
             let tracks = thedas_sim::cuttracks::Tracks::from_gff4(&doc);
             for &(at, _) in &tracks.cuts {

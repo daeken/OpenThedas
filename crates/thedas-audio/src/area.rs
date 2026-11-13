@@ -34,6 +34,9 @@ pub struct AreaSound {
     pub cone_inside: f32,
     pub cone_outside: f32,
     pub cone_outside_gain: f32,
+    /// Whether geometry between the sound and the listener muffles it (`Occludable`, read
+    /// at 0x7c238b into the sound's +0x4a3 and given to its event, 0x7c2531).
+    pub occludable: bool,
     /// The audio volume it belongs to, for a sound of a volume's own `SoundList` (see
     /// [`SoundRegion`]); `None` for the area's.
     pub region: Option<SoundRegion>,
@@ -203,6 +206,7 @@ pub fn area_audio(data: &[u8]) -> (Option<String>, Vec<AreaSound>) {
                         if g > 0.001 { g } else { 0.0 }
                     }
                 },
+                occludable: num(s, "Occludable").unwrap_or(1.0) != 0.0,
                 region: region.clone(),
             });
         }
@@ -587,6 +591,7 @@ mod tests {
                 cone_inside: 160.0,
                 cone_outside: 180.0,
                 cone_outside_gain: 0.0,
+                occludable: true,
                 region: None,
             }
         );
