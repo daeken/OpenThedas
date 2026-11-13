@@ -441,14 +441,18 @@ impl Erf {
         Ok(data)
     }
 
-    /// The password read from the player's own `DAOrigins.exe` when it matches the header's
-    /// digest (see [`crate::gog_dlc`]; GOG Ultimate Edition layout only, provisional).
+    /// The password that matches the header's digest: read from the player's own
+    /// `DAOrigins.exe` when it is the GOG build, else found by trying every eight-digit
+    /// password against the digest once and kept in the player's data folder (see
+    /// [`crate::dlc_search`]).
     pub fn installed_key(&self) -> Option<&DaoKey> {
         self.installed_key
             .get_or_init(|| match self.encryption {
-                Encryption::Xor | Encryption::BlowfishDao => {
-                    crate::gog_dlc::key(&self.path, self.module_id, self.password_digest.as_ref()?)
-                }
+                Encryption::Xor | Encryption::BlowfishDao => crate::dlc_search::key(
+                    &self.path,
+                    self.module_id,
+                    self.password_digest.as_ref()?,
+                ),
                 _ => None,
             })
             .as_ref()

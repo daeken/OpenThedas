@@ -15,6 +15,7 @@
 //!   treats case-insensitively but a case-sensitive volume would not.
 
 pub mod crypto;
+mod dlc_search;
 pub mod erf;
 mod gog_dlc;
 pub mod install;
