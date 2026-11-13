@@ -339,6 +339,9 @@ pub struct UiLayer {
     /// Whether the conversation line the game is on has a voice-over, known as it is chosen
     /// (see [`UiLayer::set_line_voiced`]).
     line_voiced: bool,
+    /// The highlight key is held: every creature near shows its name (see
+    /// [`UiLayer::set_show_all_names`]).
+    show_all_names: bool,
     /// The creature the mouse is over (see [`UiLayer::set_hovered`]).
     hovered: Option<thedas_script::vm::ObjectId>,
     /// A conversation line's continue the movie could not send (see `continue_conversation`).
@@ -667,6 +670,7 @@ impl UiLayer {
             floaties: Vec::new(),
             stat_floaties: Default::default(),
             hovered: None,
+            show_all_names: false,
             line_voiced: false,
             settings_file: None,
             continue_pending: false,
@@ -1864,6 +1868,12 @@ impl UiLayer {
         self.hovered = creature;
     }
 
+    /// The highlight key (Tab) is held: every creature within 50 m of the leader shows its
+    /// name over its head, as the original shows them while its key is down.
+    pub fn set_show_all_names(&mut self, held: bool) {
+        self.show_all_names = held;
+    }
+
     pub fn set_paused(&self, paused: bool) {
         if let Ok(mut shown) = self.shown.lock() {
             shown.paused = paused;
@@ -2071,7 +2081,6 @@ impl UiLayer {
         // floatylayer.gfx's `FLOATY_STATS_*` flags.
         const SHOW_NAME: f64 = 1.0;
         const SHOW_HEALTH_BAR: f64 = 2.0;
-        const SHOW_TARGET: f64 = 4.0;
         const IS_HOSTILE: f64 = 32.0;
         const IS_IN_PARTY: f64 = 64.0;
         /// Seconds a floaty stays past its duration (its own fade).
@@ -2198,10 +2207,9 @@ impl UiLayer {
                 ]);
                 true
             });
-            // The stats floaties (name and health bar over a creature): the hostiles in a
-            // fight with the party, the leader's attack target named. Provisional: the
-            // exe's choice of creatures and flags is not traced; this follows what the
-            // original shows in a fight (a health bar over each enemy, the target's name).
+            // The stats floaties (name and health bar over a creature), for the creatures the
+            // exe gives one (see below). Provisional: which object the game mode marks as
+            // selected is not traced.
             let leader = sim.world.controlled();
             let target = leader
                 .and_then(|l| sim.world.get(l))
@@ -2216,34 +2224,29 @@ impl UiLayer {
             let leader_at = leader
                 .and_then(|l| sim.world.get(l))
                 .map(|o| glam::Vec3::from_array(o.position));
-            let hovered = self.hovered.filter(|&c| {
-                sim.world.get(c).is_some_and(|o| {
-                    o.kind == thedas_sim::world::ObjectKind::Creature
-                        && o.active
-                        && !o.dead
-                        && o.area == sim.world.area
-                        && leader_at.is_some_and(|l| {
-                            l.distance_squared(glam::Vec3::from_array(o.position)) < 2500.0
-                        })
-                })
-            });
-            let mut wanted: Vec<thedas_script::vm::ObjectId> = sim
+            let near = |o: &thedas_sim::world::Object| {
+                o.kind == thedas_sim::world::ObjectKind::Creature
+                    && o.active
+                    && !o.dead
+                    && o.area == sim.world.area
+                    && leader_at.is_some_and(|l| {
+                        l.distance_squared(glam::Vec3::from_array(o.position)) < 2500.0
+                    })
+            };
+            let hovered = self.hovered.filter(|&c| sim.world.get(c).is_some_and(near));
+            // A creature has its floaty while the mouse is over it, while it is the one
+            // selected (creature+0x42d, set by 0x70d6e0 for the game mode's object; the
+            // leader's attack target stands in), or while the highlight key is held
+            // (input action 0x2d, read at 0x69aa72 and 0x70d36b): 0x6a52c0.
+            let show_all = self.show_all_names;
+            let wanted: Vec<thedas_script::vm::ObjectId> = sim
                 .world
                 .objects
                 .values()
-                .filter(|o| {
-                    o.kind == thedas_sim::world::ObjectKind::Creature
-                        && o.active
-                        && !o.dead
-                        && o.area == sim.world.area
-                        && (Some(o.id) == target
-                            || (o.combat.in_combat && party.iter().any(|&m| sim.hostile(m, o.id))))
-                })
+                .filter(|o| near(o))
+                .filter(|o| show_all || Some(o.id) == target || Some(o.id) == hovered)
                 .map(|o| o.id)
                 .collect();
-            if let Some(h) = hovered.filter(|h| !wanted.contains(h)) {
-                wanted.push(h);
-            }
             for (&c, &id) in &self.stat_floaties {
                 if !wanted.contains(&c) {
                     destroy.push(num(f64::from(id)));
@@ -2282,29 +2285,20 @@ impl UiLayer {
                     num(alpha),
                     num(f64::from(id)),
                 ]);
-                let mut flags = if Some(c) == hovered {
-                    // The exe's flags (0x764e40): the name always; the health bar for a
-                    // hostile, a party member or a creature in combat; whether it is
-                    // hostile or in the party. Provisional: HAS_MANA (the class's mana,
-                    // 0x71a060) is not sent.
-                    let hostile = party.iter().any(|&m| sim.hostile(m, c));
-                    let in_party = party.contains(&c);
-                    let mut f = SHOW_NAME;
-                    if hostile || in_party || o.combat.in_combat {
-                        f += SHOW_HEALTH_BAR;
-                    }
-                    if hostile {
-                        f += IS_HOSTILE;
-                    }
-                    if in_party {
-                        f += IS_IN_PARTY;
-                    }
-                    f
-                } else {
-                    SHOW_HEALTH_BAR + IS_HOSTILE
-                };
-                if Some(c) == target {
-                    flags = SHOW_HEALTH_BAR + IS_HOSTILE + SHOW_NAME + SHOW_TARGET;
+                // The exe's flags (0x764e40): the name always; the health bar for a hostile,
+                // a party member or a creature in combat; whether it is hostile or in the
+                // party. Provisional: HAS_MANA (the class's mana, 0x71a060) is not sent.
+                let hostile = party.iter().any(|&m| sim.hostile(m, c));
+                let in_party = party.contains(&c);
+                let mut flags = SHOW_NAME;
+                if hostile || in_party || o.combat.in_combat {
+                    flags += SHOW_HEALTH_BAR;
+                }
+                if hostile {
+                    flags += IS_HOSTILE;
+                }
+                if in_party {
+                    flags += IS_IN_PARTY;
                 }
                 let (cur, max) = (
                     o.properties.get(&health).map_or(0.0, |p| f64::from(p.1)),
