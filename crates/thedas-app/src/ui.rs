@@ -44,6 +44,9 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
 /// movies' frames).
 pub(crate) struct Composite {
     pub(crate) pipeline: wgpu::RenderPipeline,
+    /// Multiplies a premultiplied texture onto the target: target x (src + 1 - src alpha),
+    /// Flash's `multiply` over an opaque picture (see `thedas_ui::MultiplyPass`).
+    pub(crate) multiply: wgpu::RenderPipeline,
     pub(crate) layout: wgpu::BindGroupLayout,
     pub(crate) sampler: wgpu::Sampler,
 }
@@ -80,31 +83,52 @@ impl Composite {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("ui composite"),
-            layout: Some(&pl),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[],
+        let make = |label: &str, blend: wgpu::BlendState| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = make(
+            "ui composite",
+            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+        );
+        let multiply = make(
+            "ui multiply",
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Dst,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        );
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -112,6 +136,7 @@ impl Composite {
         });
         Self {
             pipeline,
+            multiply,
             layout,
             sampler,
         }
@@ -141,12 +166,66 @@ impl std::fmt::Debug for FrontEnd {
     }
 }
 
+/// The multiply pass for a large notification's splash at `splash` (its
+/// `UberNotification<n>.instance1`), from the visible clips' `paths`: the pass hides every
+/// clip beside the splash's branch at each level up to the root, shows the splash, and draws
+/// its `multiply` pieces (`is_multiply`) normally.
+fn splash_pass(
+    paths: &[&str],
+    splash: &str,
+    mut is_multiply: impl FnMut(&str) -> bool,
+) -> thedas_ui::MultiplyPass {
+    let child_of = |p: &str, parent: &str| {
+        p.strip_prefix(parent)
+            .and_then(|r| r.strip_prefix('.'))
+            .is_some_and(|r| !r.contains('.'))
+    };
+    let mut hide = Vec::new();
+    // Each ancestor of the splash (from `_level0` down to its notification), and the child
+    // on the way down: the ancestor's other children are hidden.
+    let mut parent = "_level0";
+    let mut rest = splash.strip_prefix("_level0.").unwrap_or(splash);
+    while let Some((step, tail)) = rest.split_once('.').or(Some((rest, ""))) {
+        let keep = format!("{parent}.{step}");
+        hide.extend(
+            paths
+                .iter()
+                .filter(|p| child_of(p, parent) && **p != keep)
+                .map(|p| p.to_string()),
+        );
+        if tail.is_empty() {
+            break;
+        }
+        parent = &splash[..keep.len()];
+        rest = tail;
+    }
+    let multiply = paths
+        .iter()
+        .filter(|p| child_of(p, splash))
+        .filter(|p| is_multiply(p))
+        .map(|p| p.to_string())
+        .collect();
+    thedas_ui::MultiplyPass {
+        hide,
+        show: vec![splash.to_string()],
+        multiply,
+    }
+}
+
 /// A message floaty up over a creature.
 struct Floaty {
     id: u32,
     target: thedas_script::vm::ObjectId,
     /// Seconds until it goes.
     left_s: f64,
+}
+
+/// A floaty's scale at `d` metres from the camera (DAOrigins.exe 0x63bfa0): full size up to
+/// 5 m, shrinking linearly to two thirds at 30 m and beyond. (Its alpha, 0x63c020, runs from
+/// 1 at 2 m to 1 at 7 m: always 1.)
+fn floaty_scale(d: f32) -> f64 {
+    let t = ((d - 5.0) / (30.0 - 5.0)).clamp(0.0, 1.0);
+    f64::from(1.0 + t * (2.0 / 3.0 - 1.0))
 }
 
 pub struct UiLayer {
@@ -198,6 +277,8 @@ pub struct UiLayer {
     floaties: Vec<Floaty>,
     /// The stats floaties up (name and health bar over a creature): creature → floaty id.
     stat_floaties: std::collections::BTreeMap<thedas_script::vm::ObjectId, u32>,
+    /// The creature the mouse is over (see [`UiLayer::set_hovered`]).
+    hovered: Option<thedas_script::vm::ObjectId>,
     /// A conversation line's continue the movie could not send (see `continue_conversation`).
     continue_pending: bool,
     next_floaty: u32,
@@ -472,6 +553,7 @@ impl UiLayer {
             screens_up: Default::default(),
             floaties: Vec::new(),
             stat_floaties: Default::default(),
+            hovered: None,
             continue_pending: false,
             next_floaty: 1,
             portraits: PortraitClock::default(),
@@ -775,18 +857,23 @@ impl UiLayer {
         }
     }
 
-    /// A large notification ("New Quest") draws a blood splash behind its plate with the
-    /// multiply blend, meant to darken the game's picture under it. The interface is drawn
-    /// into its own transparent picture, where a multiply leaves the splash's white paper
-    /// showing as a white block, so the splash is hidden and the plate shows alone.
-    /// Provisional: until the interface can multiply onto the scene.
+    /// A large notification ("New Quest") draws a blood splash behind its plate, pieces with
+    /// the multiply blend that darken the game's picture under it. The interface is drawn
+    /// into its own transparent picture, where a multiply has nothing under it (the splash's
+    /// white paper would show as a white block), so the splash is hidden from the movie's own
+    /// picture and drawn alone in its multiply pass (`thedas_ui::MultiplyPass`), multiplied
+    /// onto the frame under the movie.
     fn uber_alert_splash(&mut self, sim: &Arc<Mutex<Sim>>) {
         let head = {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             sim.world.uber_alerts.first().map(|a| a.resref.clone())
         };
         let Some(head) = head else {
-            self.uber_splash = None;
+            if self.uber_splash.take().is_some() {
+                for m in self.stage.movies.iter_mut() {
+                    m.set_multiply_pass(None);
+                }
+            }
             return;
         };
         if self.uber_splash.as_deref() == Some(head.as_str()) {
@@ -809,13 +896,22 @@ impl UiLayer {
             (n.chars().all(|c| c.is_ascii_digit()) && tail == "instance1").then_some(path)
         });
         if let Some(path) = splash {
+            let paths: Vec<&str> = tree
+                .split(';')
+                .filter_map(|e| e.split('|').next())
+                .collect();
             for m in self
                 .stage
                 .movies
                 .iter_mut()
                 .filter(|m| m.name == "notifications.gfx")
             {
+                let pass = splash_pass(&paths, path, |p| {
+                    m.call(&format!("{p}.blendMode.toString"), &[])
+                        == thedas_ui::UiValue::String("multiply".into())
+                });
                 m.set(&format!("{path}._visible"), thedas_ui::UiValue::Bool(false));
+                m.set_multiply_pass(Some(pass));
             }
             self.uber_splash = Some(head);
         }
@@ -1409,6 +1505,13 @@ impl UiLayer {
 
     /// Whether the player has paused the game (Space): the floaty layer's pause border and
     /// "Paused" text (`Client.Paused`, `Client.UserPaused`).
+    /// The creature the mouse is over, whose name the stats floaties show (see
+    /// [`crate::live::Live::hovered_creature`]); `None` when it is over none, or over the
+    /// interface.
+    pub fn set_hovered(&mut self, creature: Option<thedas_script::vm::ObjectId>) {
+        self.hovered = creature;
+    }
+
     pub fn set_paused(&self, paused: bool) {
         if let Ok(mut shown) = self.shown.lock() {
             shown.paused = paused;
@@ -1600,12 +1703,14 @@ impl UiLayer {
     /// `FloatyLayer.ProcessBatchUpdates`. Positions are in the visible area's stage units
     /// (`SetFloatyPosition` adds the area's offset itself). Provisional: the head height, the
     /// time a floaty stays after its duration, and stacking several on one creature by
-    /// `BatchUpdateOffsets` are inferred from the movie, not traced.
+    /// `BatchUpdateOffsets` are inferred from the movie, not traced. A floaty stands 0.1 m
+    /// over its creature's head, `head(creature)` metres above its feet (exe 0x764884).
     pub fn update_floaties(
         &mut self,
         sim: &Arc<Mutex<Sim>>,
         camera: &thedas_render::Camera,
         dt_ms: f64,
+        head: &dyn Fn(thedas_script::vm::ObjectId) -> f32,
     ) {
         use thedas_ui::UiValue;
         const LAYER: &str = "_global.FloatyLayer";
@@ -1616,10 +1721,11 @@ impl UiLayer {
         const SHOW_HEALTH_BAR: f64 = 2.0;
         const SHOW_TARGET: f64 = 4.0;
         const IS_HOSTILE: f64 = 32.0;
+        const IS_IN_PARTY: f64 = 64.0;
         /// Seconds a floaty stays past its duration (its own fade).
         const LINGER_S: f64 = 1.0;
-        /// Metres above a creature's feet.
-        const HEAD: f32 = 2.0;
+        /// Metres over a creature's head (0xae7d70).
+        const OVER_HEAD: f32 = 0.1;
         let Some(movie) = self
             .stage
             .movies
@@ -1692,7 +1798,8 @@ impl UiLayer {
                     return false;
                 }
                 let o = o.expect("checked");
-                let p = glam::Vec3::new(o.position[0], o.position[1], o.position[2] + HEAD);
+                let z = o.position[2] + head(o.id) + OVER_HEAD;
+                let p = glam::Vec3::new(o.position[0], o.position[1], z);
                 let c = vp * p.extend(1.0);
                 let (x, y, alpha) = if c.w > 1e-4 {
                     let n = c.truncate() / c.w;
@@ -1707,7 +1814,7 @@ impl UiLayer {
                 places.extend([
                     num(f64::from(x) / scale),
                     num(f64::from(y) / scale),
-                    num(1.0),
+                    num(floaty_scale(camera.position.distance(p))),
                     num(alpha),
                     num(f64::from(f.id)),
                 ]);
@@ -1725,7 +1832,24 @@ impl UiLayer {
                 .and_then(|c| c.target);
             let party = thedas_sim::engine::party_of(&sim);
             let health = thedas_sim::sim::constant(&sim.table, "PROPERTY_DEPLETABLE_HEALTH");
-            let wanted: Vec<thedas_script::vm::ObjectId> = sim
+            // The creature under the mouse gets one too (exe 0x6a52c0: creature+0xa10, the
+            // hover mark, makes the floaty), while within 50 m of the leader (0x7c4ae0
+            // compares the squared distance with 2500).
+            let leader_at = leader
+                .and_then(|l| sim.world.get(l))
+                .map(|o| glam::Vec3::from_array(o.position));
+            let hovered = self.hovered.filter(|&c| {
+                sim.world.get(c).is_some_and(|o| {
+                    o.kind == thedas_sim::world::ObjectKind::Creature
+                        && o.active
+                        && !o.dead
+                        && o.area == sim.world.area
+                        && leader_at.is_some_and(|l| {
+                            l.distance_squared(glam::Vec3::from_array(o.position)) < 2500.0
+                        })
+                })
+            });
+            let mut wanted: Vec<thedas_script::vm::ObjectId> = sim
                 .world
                 .objects
                 .values()
@@ -1739,6 +1863,9 @@ impl UiLayer {
                 })
                 .map(|o| o.id)
                 .collect();
+            if let Some(h) = hovered.filter(|h| !wanted.contains(h)) {
+                wanted.push(h);
+            }
             for (&c, &id) in &self.stat_floaties {
                 if !wanted.contains(&c) {
                     destroy.push(num(f64::from(id)));
@@ -1759,7 +1886,8 @@ impl UiLayer {
                     }
                 };
                 let Some(o) = sim.world.get(c) else { continue };
-                let p = glam::Vec3::new(o.position[0], o.position[1], o.position[2] + HEAD);
+                let z = o.position[2] + head(o.id) + OVER_HEAD;
+                let p = glam::Vec3::new(o.position[0], o.position[1], z);
                 let cl = vp * p.extend(1.0);
                 let (x, y, alpha) = if cl.w > 1e-4 {
                     let n = cl.truncate() / cl.w;
@@ -1772,13 +1900,33 @@ impl UiLayer {
                 places.extend([
                     num(f64::from(x) / scale),
                     num(f64::from(y) / scale),
-                    num(1.0),
+                    num(floaty_scale(camera.position.distance(p))),
                     num(alpha),
                     num(f64::from(id)),
                 ]);
-                let mut flags = SHOW_HEALTH_BAR + IS_HOSTILE;
+                let mut flags = if Some(c) == hovered {
+                    // The exe's flags (0x764e40): the name always; the health bar for a
+                    // hostile, a party member or a creature in combat; whether it is
+                    // hostile or in the party. Provisional: HAS_MANA (the class's mana,
+                    // 0x71a060) is not sent.
+                    let hostile = party.iter().any(|&m| sim.hostile(m, c));
+                    let in_party = party.contains(&c);
+                    let mut f = SHOW_NAME;
+                    if hostile || in_party || o.combat.in_combat {
+                        f += SHOW_HEALTH_BAR;
+                    }
+                    if hostile {
+                        f += IS_HOSTILE;
+                    }
+                    if in_party {
+                        f += IS_IN_PARTY;
+                    }
+                    f
+                } else {
+                    SHOW_HEALTH_BAR + IS_HOSTILE
+                };
                 if Some(c) == target {
-                    flags += SHOW_NAME + SHOW_TARGET;
+                    flags = SHOW_HEALTH_BAR + IS_HOSTILE + SHOW_NAME + SHOW_TARGET;
                 }
                 let (cur, max) = (
                     o.properties.get(&health).map_or(0.0, |p| f64::from(p.1)),
@@ -2128,11 +2276,9 @@ impl UiLayer {
             .composite
             .get_or_insert_with(|| Composite::new(&self.device, format));
         let mut groups = Vec::new();
-        for m in &mut self.stage.movies {
-            m.render();
-            let Some(tex) = m.texture() else { continue };
+        let group = |tex: &wgpu::Texture| {
             let view = tex.create_view(&Default::default());
-            groups.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ui movie"),
                 layout: &comp.layout,
                 entries: &[
@@ -2145,7 +2291,20 @@ impl UiLayer {
                         resource: wgpu::BindingResource::Sampler(&comp.sampler),
                     },
                 ],
-            }));
+            })
+        };
+        // The movies' multiplied clips first, onto the game's picture under the whole
+        // interface (the original's "New Quest" splash leaves the minimap above it as it
+        // was: reference cx_city_elf_after_unpause_new_quest.png).
+        for m in &mut self.stage.movies {
+            if let Some(tex) = m.render_multiply() {
+                groups.push((group(&tex), true));
+            }
+        }
+        for m in &mut self.stage.movies {
+            m.render();
+            let Some(tex) = m.texture() else { continue };
+            groups.push((group(&tex), false));
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("ui composite"),
@@ -2160,8 +2319,12 @@ impl UiLayer {
             })],
             ..Default::default()
         });
-        pass.set_pipeline(&comp.pipeline);
-        for g in &groups {
+        for (g, multiply) in &groups {
+            pass.set_pipeline(if *multiply {
+                &comp.multiply
+            } else {
+                &comp.pipeline
+            });
             pass.set_bind_group(0, g, &[]);
             pass.draw(0..3, 0..1);
         }
@@ -2261,6 +2424,44 @@ fn gui_id(s: Screen, container: bool) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_splash_pass_hides_everything_beside_the_splash_branch() {
+        let n = "_level0.UberNotificationArea_mc.UberNotification5";
+        let splash = format!("{n}.instance1");
+        let paths = [
+            "_level0.UberNotificationArea_mc".to_string(),
+            n.to_string(),
+            format!("{n}.GUI_mc"),
+            format!("{n}.GUI_mc.Header_mc"),
+            splash.clone(),
+            format!("{splash}.instance9"),
+            format!("{splash}.instance9.instance11"),
+            format!("{splash}.instance2"),
+            "_level0.NotificationArea_mc".to_string(),
+            "_level0.NotificationArea_mc.NotificationActivate4".to_string(),
+        ];
+        let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let pass = splash_pass(&paths, &splash, |p| p.ends_with("instance9"));
+        assert_eq!(
+            pass.hide,
+            [
+                "_level0.NotificationArea_mc".to_string(),
+                format!("{n}.GUI_mc")
+            ]
+        );
+        assert_eq!(pass.show, std::slice::from_ref(&splash));
+        assert_eq!(pass.multiply, [format!("{splash}.instance9")]);
+    }
+
+    #[test]
+    fn floaties_shrink_to_two_thirds_from_5_to_30_metres() {
+        assert_eq!(floaty_scale(0.0), 1.0);
+        assert_eq!(floaty_scale(5.0), 1.0);
+        assert!((floaty_scale(17.5) - 5.0 / 6.0).abs() < 1e-6);
+        assert!((floaty_scale(30.0) - 2.0 / 3.0).abs() < 1e-6);
+        assert!((floaty_scale(300.0) - 2.0 / 3.0).abs() < 1e-6);
+    }
 
     #[test]
     fn lines_play_for_a_reading_time() {
