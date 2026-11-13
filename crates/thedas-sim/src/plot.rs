@@ -52,7 +52,9 @@ pub struct PlotInfo {
     /// quest group. Provisional: the field is inferred from the data (every `plt_cod_*` plot
     /// has a codex type, every `*_plot_group` plot 14).
     pub kind: i32,
-    /// The plot's priority (field 13010, 0 to 3), which orders quest groups. Provisional.
+    /// The plot's priority (field 13010, 0 to 3), which orders quest groups (provisional)
+    /// and decides whether its first entry shows as a large alert (0 or 1: DAOrigins.exe
+    /// 0x75ff0c for a quest, 0x75fde3 for a codex entry).
     pub priority: i32,
     /// The plot it belongs under (field 13017, a plot resource): a quest group for a quest, a
     /// quest for a sub-quest. Provisional.
