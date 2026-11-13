@@ -121,6 +121,13 @@ pub struct Options {
     /// instead of the constant in [`Options::alpha_test`], for draws whose reference changes
     /// (D3D9's `ALPHAREF` render state set per draw).
     pub alpha_ref_uniform: bool,
+    /// Read the constants per instance: every draw's constant slot is one element of a
+    /// storage array ([`BINDING_SLOTS`], laid out as [`slot_struct`] says), and the vertex
+    /// stage picks its slot from the instance list ([`BINDING_INSTANCES`]) by
+    /// `instance_index`, handing it to the pixel stage at [`INSTANCE_LOCATION`]. Both stages
+    /// of a program must agree; draws that share a mesh and textures can then go as one
+    /// instanced draw.
+    pub instanced: bool,
 }
 
 pub struct Translation {
@@ -139,6 +146,49 @@ pub const BOOL_CONSTANTS: u32 = 16;
 pub const GROUP_CONSTANTS: u32 = 0;
 pub const GROUP_SAMPLERS: u32 = 1;
 pub const BINDING_FIXUP: u32 = 6;
+/// With [`Options::instanced`]: the constant slots, and the instance list.
+pub const BINDING_SLOTS: u32 = 7;
+pub const BINDING_INSTANCES: u32 = 8;
+/// With [`Options::instanced`]: the inter-stage location carrying the slot index (otherwise
+/// `PSIZE`'s, which only point sprites use).
+pub const INSTANCE_LOCATION: u32 = 15;
+
+/// The WGSL struct of one draw's constant slot for [`Options::instanced`]: the vertex
+/// stage's float, integer and boolean registers, the pixel stage's, then the fix-up vector,
+/// each section padded to 256 bytes (the host's slot layout).
+pub fn slot_struct() -> String {
+    let pad = |bytes: u32| bytes.div_ceil(256) * 256;
+    let f = FLOAT_CONSTANTS * 16;
+    let i = INT_CONSTANTS * 16;
+    let b = BOOL_CONSTANTS * 16;
+    let mut fields = Vec::new();
+    for stage in ["v", "p"] {
+        fields.push(format!("{stage}f: array<vec4<f32>, {FLOAT_CONSTANTS}>"));
+        if pad(f) > f {
+            fields.push(format!(
+                "{stage}f_pad: array<vec4<f32>, {}>",
+                (pad(f) - f) / 16
+            ));
+        }
+        fields.push(format!("{stage}i: array<vec4<i32>, {INT_CONSTANTS}>"));
+        if pad(i) > i {
+            fields.push(format!(
+                "{stage}i_pad: array<vec4<f32>, {}>",
+                (pad(i) - i) / 16
+            ));
+        }
+        fields.push(format!("{stage}b: array<vec4<u32>, {BOOL_CONSTANTS}>"));
+        if pad(b) > b {
+            fields.push(format!(
+                "{stage}b_pad: array<vec4<f32>, {}>",
+                (pad(b) - b) / 16
+            ));
+        }
+    }
+    fields.push("fx: vec4<f32>".into());
+    fields.push("fx_pad: array<vec4<f32>, 15>".into());
+    format!("struct D3dSlot {{ {} }}", fields.join(", "))
+}
 pub const VERTEX_SAMPLER_BASE: u32 = 32;
 
 pub fn binding_float(stage: Stage) -> u32 {
@@ -1062,16 +1112,33 @@ fn assemble(g: &mut Gen) -> Result<String> {
          struct IntConstants {{ c: array<vec4<i32>, {INT_CONSTANTS}> }}\n\
          struct BoolConstants {{ c: array<vec4<u32>, {BOOL_CONSTANTS}> }}"
     );
-    let _ = writeln!(
-        w,
-        "@group({GROUP_CONSTANTS}) @binding({}) var<uniform> cf: FloatConstants;\n\
-         @group({GROUP_CONSTANTS}) @binding({}) var<uniform> ci_u: IntConstants;\n\
-         @group({GROUP_CONSTANTS}) @binding({}) var<uniform> cb_u: BoolConstants;",
-        binding_float(stage),
-        binding_int(stage),
-        binding_bool(stage)
-    );
-    if stage == Stage::Vertex || (g.opts.alpha_ref_uniform && g.opts.alpha_test.is_some()) {
+    if g.opts.instanced {
+        let _ = writeln!(
+            w,
+            "{}\n@group({GROUP_CONSTANTS}) @binding({BINDING_SLOTS}) var<storage, read> d3d_slots: array<D3dSlot>;\n\
+             var<private> d3d_inst: u32;",
+            slot_struct()
+        );
+        if stage == Stage::Vertex {
+            let _ = writeln!(
+                w,
+                "@group({GROUP_CONSTANTS}) @binding({BINDING_INSTANCES}) var<storage, read> d3d_instances: array<u32>;"
+            );
+        }
+    } else {
+        let _ = writeln!(
+            w,
+            "@group({GROUP_CONSTANTS}) @binding({}) var<uniform> cf: FloatConstants;\n\
+             @group({GROUP_CONSTANTS}) @binding({}) var<uniform> ci_u: IntConstants;\n\
+             @group({GROUP_CONSTANTS}) @binding({}) var<uniform> cb_u: BoolConstants;",
+            binding_float(stage),
+            binding_int(stage),
+            binding_bool(stage)
+        );
+    }
+    if !g.opts.instanced
+        && (stage == Stage::Vertex || (g.opts.alpha_ref_uniform && g.opts.alpha_test.is_some()))
+    {
         let _ = writeln!(
             w,
             "@group({GROUP_CONSTANTS}) @binding({BINDING_FIXUP}) var<uniform> d3d_fixup: vec4<f32>;"
@@ -1153,9 +1220,32 @@ fn assemble(g: &mut Gen) -> Result<String> {
     for (r, v) in g.bool_defs.clone() {
         let _ = writeln!(w, "    cb{r} = {v};");
     }
-    w.push_str(&prologue);
-    w.push_str(&g.body);
-    w.push_str(&epilogue);
+    if g.opts.instanced {
+        // The slot comes first: the vertex stage's from the instance list, the pixel
+        // stage's from the vertex stage.
+        let _ = writeln!(
+            w,
+            "    d3d_inst = {};",
+            match stage {
+                Stage::Vertex => "d3d_instances[input.d3d_instance]",
+                Stage::Pixel => "input.d3d_slot",
+            }
+        );
+        let s = if stage == Stage::Vertex { "v" } else { "p" };
+        let per_instance = |code: &str| {
+            code.replace("cf.c[", &format!("d3d_slots[d3d_inst].{s}f["))
+                .replace("ci_u.c[", &format!("d3d_slots[d3d_inst].{s}i["))
+                .replace("cb_u.c[", &format!("d3d_slots[d3d_inst].{s}b["))
+                .replace("d3d_fixup", "d3d_slots[d3d_inst].fx")
+        };
+        w.push_str(&per_instance(&prologue));
+        w.push_str(&per_instance(&g.body));
+        w.push_str(&per_instance(&epilogue));
+    } else {
+        w.push_str(&prologue);
+        w.push_str(&g.body);
+        w.push_str(&epilogue);
+    }
     w.push_str("}\n");
     Ok(w)
 }
@@ -1165,6 +1255,9 @@ fn vertex_interface(g: &mut Gen) -> Result<(String, String, String, String)> {
     let mut pro = String::new();
     if g.inputs.is_empty() {
         ins.push_str("    @builtin(vertex_index) vertex_index: u32,\n");
+    }
+    if g.opts.instanced {
+        ins.push_str("    @builtin(instance_index) d3d_instance: u32,\n");
     }
     for r in g.inputs.keys() {
         let _ = writeln!(ins, "    @location({r}) v{r}: vec4<f32>,");
@@ -1219,6 +1312,17 @@ fn vertex_interface(g: &mut Gen) -> Result<(String, String, String, String)> {
     for (l, (name, _)) in &outs {
         let _ = writeln!(out, "    @location({l}) {name}: vec4<f32>,");
     }
+    if g.opts.instanced {
+        if outs.contains_key(&INSTANCE_LOCATION) {
+            return Err(unsupported(format!(
+                "instanced constants need location {INSTANCE_LOCATION}"
+            )));
+        }
+        let _ = writeln!(
+            out,
+            "    @location({INSTANCE_LOCATION}) @interpolate(flat) d3d_slot: u32,"
+        );
+    }
     out.push_str("}\n");
     let mut epi = String::from("    var out: StageOut;\n");
     // Half-pixel shift from D3D9 to wgpu rasterization (see module docs).
@@ -1229,6 +1333,9 @@ fn vertex_interface(g: &mut Gen) -> Result<(String, String, String, String)> {
     );
     for (name, _) in outs.values() {
         let _ = writeln!(epi, "    out.{name} = {name};");
+    }
+    if g.opts.instanced {
+        epi.push_str("    out.d3d_slot = d3d_inst;\n");
     }
     epi.push_str("    return out;\n");
     g.outputs
@@ -1281,6 +1388,17 @@ fn pixel_interface(g: &mut Gen) -> Result<(String, String, String, String)> {
         };
         let _ = writeln!(ins, "    @location({l}){interp} t{t}: vec4<f32>,");
         let _ = writeln!(pro, "    t{t} = input.t{t};");
+    }
+    if g.opts.instanced {
+        if used.contains(&INSTANCE_LOCATION) {
+            return Err(unsupported(format!(
+                "instanced constants need location {INSTANCE_LOCATION}"
+            )));
+        }
+        let _ = writeln!(
+            ins,
+            "    @location({INSTANCE_LOCATION}) @interpolate(flat) d3d_slot: u32,"
+        );
     }
     ins.push_str("}\n");
 
@@ -1440,6 +1558,44 @@ mod tests {
         assert!(tr.wgsl.contains("d3d_fixup"));
         assert_eq!(tr.interface.outputs.len(), 1);
         assert_eq!(tr.interface.outputs[0].location, 3);
+    }
+
+    #[test]
+    fn instanced_constants_read_the_slot_the_instance_list_names() {
+        let mut t = vec![0xFFFE_0300];
+        t.extend([ins(31, 2), 0x8000_0000, dst(1, 0, 0xf)]); // dcl_position v0
+        t.extend([ins(31, 2), 0x8000_0000 | 1 << 16, dst(1, 1, 0xf)]); // dcl_position1 v1
+        t.extend([ins(31, 2), 0x8000_0000, dst(6, 0, 0xf)]); // dcl_position o0
+        t.extend([ins(31, 2), 0x8000_0005 | (3 << 16), dst(6, 1, 0xf)]); // dcl_texcoord3 o1
+        t.extend([ins(46, 2), dst(3, 0, 0b0001), src(1, 1, 0, 0)]); // mova a0.x, v1.x
+        t.extend([
+            ins(1, 3),
+            dst(6, 1, 0xf),
+            src(2, 4, XYZW, 0) | (1 << 13),
+            src(3, 0, 0, 0),
+        ]); // mov o1, c[a0.x + 4]
+        t.extend([
+            ins(20, 3),
+            dst(6, 0, 0xf),
+            src(1, 0, XYZW, 0),
+            src(2, 0, XYZW, 0),
+        ]); // m4x4 o0, v0, c0
+        t.push(0xFFFF);
+        let s = assemble_tokens(&t);
+        let opts = Options {
+            instanced: true,
+            ..Default::default()
+        };
+        let tr = translate(&s, &opts).unwrap_or_else(|e| panic!("{e}"));
+        let w = &tr.wgsl;
+        assert!(
+            w.contains("d3d_inst = d3d_instances[input.d3d_instance]"),
+            "{w}"
+        );
+        assert!(w.contains("d3d_slots[d3d_inst].vf[clamp(4 + a0.x"), "{w}");
+        assert!(w.contains("d3d_slots[d3d_inst].fx.x"), "{w}");
+        assert!(w.contains("out.d3d_slot = d3d_inst"), "{w}");
+        assert!(!w.contains("cf.c[") && !w.contains("var<uniform>"), "{w}");
     }
 
     #[test]

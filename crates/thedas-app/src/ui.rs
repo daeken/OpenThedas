@@ -44,6 +44,9 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
 /// movies' frames).
 pub(crate) struct Composite {
     pub(crate) pipeline: wgpu::RenderPipeline,
+    /// Multiplies a premultiplied texture onto the target: target x (src + 1 - src alpha),
+    /// Flash's `multiply` over an opaque picture (see `thedas_ui::MultiplyPass`).
+    pub(crate) multiply: wgpu::RenderPipeline,
     pub(crate) layout: wgpu::BindGroupLayout,
     pub(crate) sampler: wgpu::Sampler,
 }
@@ -80,31 +83,52 @@ impl Composite {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("ui composite"),
-            layout: Some(&pl),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[],
+        let make = |label: &str, blend: wgpu::BlendState| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = make(
+            "ui composite",
+            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+        );
+        let multiply = make(
+            "ui multiply",
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Dst,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        );
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -112,6 +136,7 @@ impl Composite {
         });
         Self {
             pipeline,
+            multiply,
             layout,
             sampler,
         }
@@ -128,6 +153,9 @@ pub enum FrontEnd {
     StartMenu,
     /// Exit the game.
     Quit,
+    /// The game menu's "Report Issue" (its online-features button, relabelled; see
+    /// `UiLayer::front_end_message`): an issue report, as F8 makes one.
+    Report,
 }
 
 impl std::fmt::Debug for FrontEnd {
@@ -137,8 +165,74 @@ impl std::fmt::Debug for FrontEnd {
             FrontEnd::Load(b) => write!(f, "Load({} bytes)", b.len()),
             FrontEnd::StartMenu => write!(f, "StartMenu"),
             FrontEnd::Quit => write!(f, "Quit"),
+            FrontEnd::Report => write!(f, "Report"),
         }
     }
+}
+
+/// The multiply pass for a large notification's splash at `splash` (its
+/// `UberNotification<n>.instance1`), from the visible clips' `paths`: the pass hides every
+/// clip beside the splash's branch at each level up to the root, shows the splash, and draws
+/// its `multiply` pieces (`is_multiply`) normally.
+fn splash_pass(
+    paths: &[&str],
+    splash: &str,
+    mut is_multiply: impl FnMut(&str) -> bool,
+) -> thedas_ui::MultiplyPass {
+    let child_of = |p: &str, parent: &str| {
+        p.strip_prefix(parent)
+            .and_then(|r| r.strip_prefix('.'))
+            .is_some_and(|r| !r.contains('.'))
+    };
+    let mut hide = Vec::new();
+    // Each ancestor of the splash (from `_level0` down to its notification), and the child
+    // on the way down: the ancestor's other children are hidden.
+    let mut parent = "_level0";
+    let mut rest = splash.strip_prefix("_level0.").unwrap_or(splash);
+    while let Some((step, tail)) = rest.split_once('.').or(Some((rest, ""))) {
+        let keep = format!("{parent}.{step}");
+        hide.extend(
+            paths
+                .iter()
+                .filter(|p| child_of(p, parent) && **p != keep)
+                .map(|p| p.to_string()),
+        );
+        if tail.is_empty() {
+            break;
+        }
+        parent = &splash[..keep.len()];
+        rest = tail;
+    }
+    let multiply = paths
+        .iter()
+        .filter(|p| child_of(p, splash))
+        .filter(|p| is_multiply(p))
+        .map(|p| p.to_string())
+        .collect();
+    thedas_ui::MultiplyPass {
+        hide,
+        show: vec![splash.to_string()],
+        multiply,
+    }
+}
+
+/// For how many frames after a dialog box shows its text field is given the focus (see
+/// `Stage::focus_dialog_field`).
+const FOCUS_FRAMES: u8 = 10;
+
+/// The message the engine's own text box's buttons send: `<id> <button, from 1>`. The app
+/// adds the text typed (see [`UiLayer::ask_text`]).
+const TEXT_POPUP_RESULT: &str = "OpenThedas.TextPopupResult";
+
+/// The answer to the engine's own text box ([`UiLayer::ask_text`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextAnswer {
+    /// The id it was asked with.
+    pub id: u32,
+    /// OK (true) or Cancel.
+    pub accepted: bool,
+    /// What was typed.
+    pub text: String,
 }
 
 /// A message floaty up over a creature.
@@ -147,6 +241,33 @@ struct Floaty {
     target: thedas_script::vm::ObjectId,
     /// Seconds until it goes.
     left_s: f64,
+}
+
+/// Whether a floaty of `style` over a creature shows (DAOrigins.exe 0x6a7414-0x6a749e):
+/// a damage number (`FLOATY_HIT` 1, `FLOATY_CRITICAL_HIT` 2) shows over a party member
+/// when the party's numbers are on (`ShowPartyDamageNumbers`), otherwise over a hostile
+/// when the hostiles' are (`ShowHostileDamageNumbers`), and over no one else; any other
+/// floaty shows. Provisional: the exe's first test (0x631830 on the object from 0x5d57c0)
+/// is taken to be membership of the party.
+fn damage_number_shows(
+    style: i32,
+    in_party: bool,
+    hostile: bool,
+    party_numbers: bool,
+    hostile_numbers: bool,
+) -> bool {
+    if style != 1 && style != 2 {
+        return true;
+    }
+    (in_party && party_numbers) || (hostile && hostile_numbers)
+}
+
+/// A floaty's scale at `d` metres from the camera (DAOrigins.exe 0x63bfa0): full size up to
+/// 5 m, shrinking linearly to two thirds at 30 m and beyond. (Its alpha, 0x63c020, runs from
+/// 1 at 2 m to 1 at 7 m: always 1.)
+fn floaty_scale(d: f32) -> f64 {
+    let t = ((d - 5.0) / (30.0 - 5.0)).clamp(0.0, 1.0);
+    f64::from(1.0 + t * (2.0 / 3.0 - 1.0))
 }
 
 pub struct UiLayer {
@@ -180,11 +301,25 @@ pub struct UiLayer {
     /// it has waited for its values to reach the popup layer (see
     /// [`UiLayer::show_script_popup`]).
     script_popup: Option<((i32, i32, u32), u8)>,
+    /// The engine's own text box up (see [`UiLayer::ask_text`]): its id and the frames
+    /// since its values were set, and the answers not yet taken.
+    text_popup: Option<(u32, u8)>,
+    /// The game menu's online-features button has been relabelled "Report Issue" since
+    /// mainmenu.gfx was loaded (see `UiLayer::report_button`).
+    report_labelled: bool,
+    text_answers: Vec<TextAnswer>,
     /// A party portrait was clicked (see [`UiLayer::mouse_button`]).
     portrait_clicked: Option<u32>,
     /// The large notification whose splash has been dealt with (see
     /// [`UiLayer::uber_alert_splash`]).
     uber_splash: Option<String>,
+    /// A large notification was cut off: notifications.gfx went away (a full-screen screen
+    /// opened) while it showed, so it is dismissed as the movie would at its end.
+    uber_cut: bool,
+    /// notifications.gfx was up last frame, and the small notifications ("Quest updated")
+    /// were cut off by its going (dismissed as when they fade, `Party.HideAlert`).
+    notifications_up: bool,
+    alerts_cut: bool,
     /// The loading screen up, if any (see [`UiLayer::loading_begin`]).
     loading: Option<Loading>,
     /// The world map is held up as the loading screen (see [`UiLayer::hold_world_map`]).
@@ -198,6 +333,17 @@ pub struct UiLayer {
     floaties: Vec<Floaty>,
     /// The stats floaties up (name and health bar over a creature): creature → floaty id.
     stat_floaties: std::collections::BTreeMap<thedas_script::vm::ObjectId, u32>,
+    /// The player's settings file and the settings last written to it (see
+    /// [`UiLayer::set_settings_file`]).
+    settings_file: Option<(std::path::PathBuf, std::collections::BTreeMap<String, f64>)>,
+    /// Whether the conversation line the game is on has a voice-over, known as it is chosen
+    /// (see [`UiLayer::set_line_voiced`]).
+    line_voiced: bool,
+    /// The highlight key is held: every creature near shows its name (see
+    /// [`UiLayer::set_show_all_names`]).
+    show_all_names: bool,
+    /// The creature the mouse is over (see [`UiLayer::set_hovered`]).
+    hovered: Option<thedas_script::vm::ObjectId>,
     /// A conversation line's continue the movie could not send (see `continue_conversation`).
     continue_pending: bool,
     next_floaty: u32,
@@ -314,6 +460,9 @@ struct Line {
     /// How long its voice-over runs (milliseconds), when it has one: it plays that long
     /// instead of a reading time.
     voice_ms: Option<f64>,
+    /// Whether conversation.gfx was last told the line has a voice-over (see
+    /// `UiLayer::play`).
+    voiced: bool,
     /// Nothing to choose: it continues by itself once played.
     waits: bool,
     continued: bool,
@@ -401,6 +550,13 @@ impl UiLayer {
         std::mem::take(&mut self.sound_set_previews)
     }
 
+    /// Whether the line the game is on is voiced, as the audio knows it once the line is
+    /// chosen (`audio::GameAudio::line_voice`), before it plays: set before
+    /// [`UiLayer::play`], so the conversation screen hears `Conversation.HasVO` with the line.
+    pub fn set_line_voiced(&mut self, voiced: bool) {
+        self.line_voiced = voiced;
+    }
+
     /// The conversation line on screen speaks for this long (milliseconds; see
     /// [`crate::audio`]), or has no voice-over.
     pub fn set_line_voice_ms(&mut self, ms: Option<f64>) {
@@ -420,6 +576,41 @@ impl UiLayer {
             thedas_ui::options::MSG_SET,
             &[name.to_string(), value.to_string()],
         )
+    }
+
+    /// Keeps the player's settings in `path` (see `thedas_ui::options::to_text`): what it
+    /// holds now is taken, and every change the options screen makes is written back.
+    /// A missing or unreadable file leaves the defaults.
+    pub fn set_settings_file(&mut self, path: std::path::PathBuf) {
+        let read = std::fs::read_to_string(&path)
+            .map(|t| thedas_ui::options::from_text(&t))
+            .unwrap_or_default();
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.options.extend(read.clone());
+        }
+        self.settings_file = Some((path, read));
+    }
+
+    /// Writes the player's settings when they changed since last written.
+    fn write_settings(&mut self) {
+        let Some((path, written)) = self.settings_file.as_mut() else {
+            return;
+        };
+        let Some(now) = self.shown.lock().ok().map(|s| s.options.clone()) else {
+            return;
+        };
+        if now == *written {
+            return;
+        }
+        *written = now.clone();
+        let text = thedas_ui::options::to_text(&now);
+        let result = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| std::fs::write(&*path, text));
+        if let Err(e) = result {
+            log::warn!("settings: writing {}: {e}", path.display());
+        }
     }
 
     /// A player setting (`AudioOptions.MusicVolume`) as the options screen keeps it.
@@ -464,14 +655,24 @@ impl UiLayer {
             tooltip_text: None,
             tooltip_relayout: 0,
             script_popup: None,
+            text_popup: None,
+            report_labelled: false,
+            text_answers: Vec::new(),
             portrait_clicked: None,
             uber_splash: None,
+            uber_cut: false,
+            notifications_up: false,
+            alerts_cut: false,
             loading: None,
             travel_map: false,
             travel_out: None,
             screens_up: Default::default(),
             floaties: Vec::new(),
             stat_floaties: Default::default(),
+            hovered: None,
+            show_all_names: false,
+            line_voiced: false,
+            settings_file: None,
             continue_pending: false,
             next_floaty: 1,
             portraits: PortraitClock::default(),
@@ -517,6 +718,16 @@ impl UiLayer {
         match name {
             "GameModeController.PushGUIScreen" if first == Some("Options") => {
                 screens.menu = Some(Screen::Options);
+            }
+            // The game menu's online-features button ("Player Profile", for the original's
+            // online service, which this game does not have) is the issue report's: the
+            // menu closes and the report is made of the game behind it.
+            "GameModeController.PushGUIScreen"
+                if first == Some("GUICommunityFeatures")
+                    && screens.menu == Some(Screen::GameMenu) =>
+            {
+                screens.menu = None;
+                self.requests.push(FrontEnd::Report);
             }
             "GameModeController.HideGUIScreen" if first == Some("MainMenu") => {
                 if screens.menu == Some(Screen::GameMenu) {
@@ -775,21 +986,54 @@ impl UiLayer {
         }
     }
 
-    /// A large notification ("New Quest") draws a blood splash behind its plate with the
-    /// multiply blend, meant to darken the game's picture under it. The interface is drawn
-    /// into its own transparent picture, where a multiply leaves the splash's white paper
-    /// showing as a white block, so the splash is hidden and the plate shows alone.
-    /// Provisional: until the interface can multiply onto the scene.
+    /// A large notification ("New Quest") draws a blood splash behind its plate, pieces with
+    /// the multiply blend that darken the game's picture under it. The interface is drawn
+    /// into its own transparent picture, where a multiply has nothing under it (the splash's
+    /// white paper would show as a white block), so the splash is hidden from the movie's own
+    /// picture and drawn alone in its multiply pass (`thedas_ui::MultiplyPass`), multiplied
+    /// onto the frame under the movie.
     fn uber_alert_splash(&mut self, sim: &Arc<Mutex<Sim>>) {
         let head = {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             sim.world.uber_alerts.first().map(|a| a.resref.clone())
         };
-        let Some(head) = head else {
+        // The movie that showed it is gone (the HUD makes way for a full-screen screen and is
+        // loaded again after): the banner is dismissed (`Party.HideUberAlert`) instead of
+        // playing again from the start when the HUD comes back. Provisional: what the
+        // original does with a banner when its game menu opens is not traced; it does not
+        // replay it.
+        let notifications = self
+            .stage
+            .movies
+            .iter()
+            .any(|m| m.name == "notifications.gfx");
+        // Likewise the small notifications up when it went: they are dismissed as when they
+        // fade, not shown again by the HUD that comes back.
+        if std::mem::replace(&mut self.notifications_up, notifications) && !notifications {
+            let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+            self.alerts_cut |= !sim.world.alerts.is_empty();
+        }
+        if head.is_some() && self.uber_splash.is_some() && !notifications {
             self.uber_splash = None;
+            self.uber_cut = true;
+            return;
+        }
+        let Some(head) = head else {
+            if self.uber_splash.take().is_some() {
+                for m in self.stage.movies.iter_mut() {
+                    m.set_multiply_pass(None);
+                }
+            }
             return;
         };
-        if self.uber_splash.as_deref() == Some(head.as_str()) {
+        // The same notification, unless notifications.gfx was loaded again meanwhile (the
+        // HUD comes back after a full-screen screen): a new movie has no pass yet.
+        let reloaded = self
+            .stage
+            .movies
+            .iter()
+            .any(|m| m.name == "notifications.gfx" && !m.has_multiply_pass());
+        if self.uber_splash.as_deref() == Some(head.as_str()) && !reloaded {
             return;
         }
         // The notification's clip is named as it is added (`UberNotification<n>`); its
@@ -809,15 +1053,147 @@ impl UiLayer {
             (n.chars().all(|c| c.is_ascii_digit()) && tail == "instance1").then_some(path)
         });
         if let Some(path) = splash {
+            let paths: Vec<&str> = tree
+                .split(';')
+                .filter_map(|e| e.split('|').next())
+                .collect();
             for m in self
                 .stage
                 .movies
                 .iter_mut()
                 .filter(|m| m.name == "notifications.gfx")
             {
+                let pass = splash_pass(&paths, path, |p| {
+                    m.call(&format!("{p}.blendMode.toString"), &[])
+                        == thedas_ui::UiValue::String("multiply".into())
+                });
                 m.set(&format!("{path}._visible"), thedas_ui::UiValue::Bool(false));
+                m.set_multiply_pass(Some(pass));
             }
             self.uber_splash = Some(head);
+        }
+    }
+
+    /// Asks the player for a line of text with the game's own message box (popuplayer.gfx,
+    /// as a script's `ShowPopup` with a text field shows it): `prompt` over a text field
+    /// holding `text`, and OK / Cancel buttons (`ok`, `cancel`; the pad's A and B press
+    /// them). Nothing goes through the simulation; the answer comes back from
+    /// [`UiLayer::take_text_answers`] with `id`. It shows once its values have reached the
+    /// movie, two frames on, and replaces one still up. Needs the popup layer (the HUD).
+    pub fn ask_text(&mut self, id: u32, prompt: &str, text: &str, ok: &str, cancel: &str) {
+        self.ask(id, prompt, Some(text), ok, cancel);
+    }
+
+    /// Asks the player to choose between two buttons (`a`, `b`) with the game's own message
+    /// box, as [`UiLayer::ask_text`] does but with no text field: the answer's `accepted`
+    /// is `a`, and its text is empty.
+    pub fn ask_choice(&mut self, id: u32, prompt: &str, a: &str, b: &str) {
+        self.ask(id, prompt, None, a, b);
+    }
+
+    fn ask(&mut self, id: u32, prompt: &str, text: Option<&str>, ok: &str, cancel: &str) {
+        use thedas_ui::UiValue;
+        let k = "GUIPopupLayer";
+        let b = &self.stage.bridge;
+        b.set_value(
+            &format!("{k}.DialogBoxText"),
+            UiValue::String(prompt.into()),
+        );
+        b.set_value(&format!("{k}.NumButtons"), UiValue::Number(2.0));
+        b.set_value(
+            &format!("{k}.InputBox"),
+            UiValue::Number(f64::from(u8::from(text.is_some()))),
+        );
+        b.set_value(
+            &format!("{k}.InputText"),
+            UiValue::String(text.unwrap_or_default().into()),
+        );
+        b.set_value(&format!("{k}.Checkbox"), UiValue::Number(0.0));
+        for e in [
+            "CheckboxText",
+            "CheckboxControlledAttribute",
+            "PickerList",
+            "PickerDescriptions",
+        ] {
+            b.set_value(&format!("{k}.{e}"), UiValue::String(String::new()));
+        }
+        b.set_value(&format!("{k}.PickerDefault"), UiValue::Number(0.0));
+        b.set_value(&format!("{k}.Filter"), UiValue::Number(0.0));
+        for (i, label) in [ok, cancel].into_iter().enumerate() {
+            b.set_value(&format!("{k}.Label{i}"), UiValue::String(label.into()));
+            b.set_value(
+                &format!("{k}.Callback{i}"),
+                UiValue::String(format!("{TEXT_POPUP_RESULT} {id} {}", i + 1)),
+            );
+        }
+        self.text_popup = Some((id, 0));
+    }
+
+    /// The answers to [`UiLayer::ask_text`] since last asked.
+    pub fn take_text_answers(&mut self) -> Vec<TextAnswer> {
+        std::mem::take(&mut self.text_answers)
+    }
+
+    /// The game menu's online-features button ("Player Profile": the original's online
+    /// service, which this game does not have) reads "Report Issue": pressing it asks for
+    /// an issue report (`FrontEnd::Report`, see `front_end_message`). Relabelled once
+    /// mainmenu.gfx has laid out its buttons, each time it is loaded.
+    fn report_button(&mut self) {
+        let up = self.stage.movies.iter().any(|m| m.name == "mainmenu.gfx");
+        if !up {
+            self.report_labelled = false;
+            return;
+        }
+        if self.report_labelled {
+            return;
+        }
+        let Some(thedas_ui::UiValue::String(tree)) =
+            self.stage
+                .call_in("mainmenu.gfx", "_global.thedas_tree_list", &[])
+        else {
+            return;
+        };
+        let Some(button) = tree
+            .split(';')
+            .filter_map(|e| e.split('|').next())
+            .find(|p| p.ends_with(".Screenshots_mc"))
+            .map(str::to_string)
+        else {
+            return;
+        };
+        self.stage.call_in(
+            "mainmenu.gfx",
+            &format!("{button}.SetText"),
+            &[thedas_ui::UiValue::String("Report Issue".into())],
+        );
+        self.report_labelled = true;
+    }
+
+    /// Shows the engine's own text box once its values have reached the movie.
+    fn show_text_popup(&mut self) {
+        let Some((_, frames)) = self.text_popup.as_mut() else {
+            return;
+        };
+        if *frames >= 2 {
+            // Up: its field takes the typing (see `Stage::focus_dialog_field`), for its first
+            // frames (later, a press on its buttons lets go of the focus on purpose).
+            if *frames < FOCUS_FRAMES {
+                *frames += 1;
+                self.stage.focus_dialog_field();
+            }
+            return;
+        }
+        *frames += 1;
+        if *frames == 2 {
+            let up = self.stage.call_in(
+                thedas_ui::stage::POPUP_LAYER,
+                "_global.PopupLayer.ShowDialogBoxFromGame",
+                &[],
+            );
+            if up.is_none() {
+                log::warn!("ui: a text box with no popup layer up");
+                self.text_popup = None;
+            }
         }
     }
 
@@ -836,6 +1212,12 @@ impl UiLayer {
         match (open, self.script_popup.as_mut()) {
             (None, _) => self.script_popup = None,
             (Some(k), Some((shown, frames))) if *shown == k => {
+                // A box with a text field (a name prompt) gives it the typing, as the
+                // engine's own does (see `show_text_popup`).
+                if (2..FOCUS_FRAMES).contains(frames) {
+                    *frames += 1;
+                    self.stage.focus_dialog_field();
+                }
                 if *frames < 2 {
                     *frames += 1;
                     if *frames == 2 {
@@ -956,59 +1338,11 @@ impl UiLayer {
                 };
                 // The list's new save (slot -1) goes in the open slot.
                 let slot = if slot > 0 { slot } else { store.open_slot() };
-                let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
-                // No saving during a training tutorial (script.ldf's SetTrainingMode).
-                if sim.training_paused() {
-                    log::warn!("ui: no saving during a training tutorial");
-                    return true;
-                }
-                // The module hears the save coming first (EVENT_TYPE_MODULE_PRESAVE).
-                sim.presave();
-                let area = sim
-                    .world
-                    .area
-                    .map(|a| sim.display_name(a))
-                    .unwrap_or_default();
                 let typed = args
                     .get(1)
                     .map(|n| n.trim().to_string())
                     .unwrap_or_default();
-                let meta = crate::saves::SaveMeta {
-                    name: if typed.is_empty() {
-                        area.clone()
-                    } else {
-                        typed
-                    },
-                    area,
-                    time_ms: sim.world.time_ms,
-                    written: crate::saves::now_secs(),
-                    hero: sim
-                        .world
-                        .hero
-                        .map(|h| sim.display_name(h))
-                        .unwrap_or_default(),
-                    level: sim
-                        .world
-                        .hero
-                        .map_or(0, |h| sim.property_total(h, 15) as i32),
-                    class: sim
-                        .world
-                        .hero
-                        .map_or(0, |h| sim.property_total(h, 27) as i32),
-                };
-                let saved = match sim.saving_blocked() {
-                    Some(why) => Err(why.to_string()),
-                    None => sim.save_json().map_err(|e| e.to_string()),
-                };
-                match saved {
-                    Ok(b) => match store.write(slot, &b, &meta) {
-                        Ok(()) => log::info!("ui: saved to slot {slot}"),
-                        Err(e) => log::warn!("ui: saving to slot {slot}: {e}"),
-                    },
-                    Err(e) => log::warn!("ui: the game could not be saved: {e}"),
-                }
-                drop(sim);
-                self.refresh_saves();
+                self.write_save(sim, slot, typed, crate::saves::KIND_SLOT);
                 screens.menu = None;
             }
             "SaveLoad.DeleteSaveGame" => {
@@ -1022,6 +1356,112 @@ impl UiLayer {
             _ => return false,
         }
         true
+    }
+
+    /// Saves the game to `slot` as the save screen does: named `name` (the area's name
+    /// when empty), of `kind` (`crate::saves::KIND_*`). Returns whether it was written.
+    fn write_save(&mut self, sim: &Arc<Mutex<Sim>>, slot: i32, name: String, kind: i32) -> bool {
+        let Some(store) = self.saves.as_ref() else {
+            return false;
+        };
+        let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+        // No saving during a training tutorial (script.ldf's SetTrainingMode).
+        if sim.training_paused() {
+            log::warn!("ui: no saving during a training tutorial");
+            return false;
+        }
+        // The module hears the save coming first (EVENT_TYPE_MODULE_PRESAVE).
+        sim.presave();
+        let area = sim
+            .world
+            .area
+            .map(|a| sim.display_name(a))
+            .unwrap_or_default();
+        let meta = crate::saves::SaveMeta {
+            name: if name.is_empty() { area.clone() } else { name },
+            area,
+            time_ms: sim.world.time_ms,
+            written: crate::saves::now_secs(),
+            hero: sim
+                .world
+                .hero
+                .map(|h| sim.display_name(h))
+                .unwrap_or_default(),
+            level: sim
+                .world
+                .hero
+                .map_or(0, |h| sim.property_total(h, 15) as i32),
+            class: sim
+                .world
+                .hero
+                .map_or(0, |h| sim.property_total(h, 27) as i32),
+            kind,
+        };
+        let saved = match sim.saving_blocked() {
+            Some(why) => Err(why.to_string()),
+            None => sim.save_json().map_err(|e| e.to_string()),
+        };
+        let written = match saved {
+            Ok(b) => match store.write(slot, &b, &meta) {
+                Ok(()) => {
+                    log::info!("ui: saved to slot {slot}");
+                    true
+                }
+                Err(e) => {
+                    log::warn!("ui: saving to slot {slot}: {e}");
+                    false
+                }
+            },
+            Err(e) => {
+                log::warn!("ui: the game could not be saved: {e}");
+                false
+            }
+        };
+        drop(sim);
+        self.refresh_saves();
+        written
+    }
+
+    /// The quick save key (`QuickSave`, F5): the game is saved to the quick save's slot,
+    /// over the one before. Provisional: the original's name for it in the list and any
+    /// notice it shows are not traced; it is named "Quicksave".
+    pub fn quick_save(&mut self, sim: &Arc<Mutex<Sim>>) -> bool {
+        let Some(store) = self.saves.as_ref() else {
+            return false;
+        };
+        let slot = store.quick_slot().unwrap_or_else(|| store.open_slot());
+        self.write_save(sim, slot, "Quicksave".into(), crate::saves::KIND_QUICK)
+    }
+
+    /// The quick load key (`QuickLoad`, F9): the quick save is loaded into the running
+    /// game, as the load screen loads a save. Returns whether there was one to load.
+    pub fn quick_load(&mut self, sim: &Arc<Mutex<Sim>>) -> bool {
+        let Some(store) = self.saves.as_ref() else {
+            return false;
+        };
+        let Some(slot) = store.quick_slot() else {
+            log::info!("ui: no quick save to load");
+            return false;
+        };
+        match store.read(slot) {
+            Ok(b) => {
+                let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+                match sim.load_json(&b) {
+                    Ok(()) => {
+                        log::info!("ui: loaded the quick save (slot {slot})");
+                        true
+                    }
+                    Err(e) => {
+                        log::warn!("ui: the quick save did not load: {e}");
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("ui: the quick save: {e}");
+                false
+            }
+        }
     }
 
     /// Plays the game's screens over a running game: the movies act on `sim` as they send
@@ -1166,6 +1606,7 @@ impl UiLayer {
                 key,
                 t: 0.0,
                 voice_ms: None,
+                voiced: self.line_voiced,
                 waits,
                 continued: false,
                 cut_seen: cutscene,
@@ -1173,6 +1614,38 @@ impl UiLayer {
             }),
             (None, _) => None,
         };
+        // Whether the line is voiced (`Conversation.HasVO`): conversation.gfx's
+        // `UpdateMainText` hides a voiced NPC line when the Subtitles option is "No
+        // subtitles" (`ClientOptions.GameOptions.SubtitlesLevel` 0, the default), and shows
+        // it otherwise. The audio says so as the line is chosen (`set_line_voiced`), before
+        // the movie hears of the line this frame; should the voice turn up only once it
+        // plays (`set_line_voice_ms`), the movie is given the line again then. Provisional:
+        // when the exe sets HasVO (the line's +0xd4, read at 0x690193) is not traced; the
+        // line having a voice-over stands in.
+        let mut retell = None;
+        let early = self.line_voiced;
+        if let Some(l) = self.line.as_mut() {
+            let voiced = early || l.voice_ms.is_some();
+            self.stage.bridge.set_value(
+                "Conversation.HasVO",
+                thedas_ui::UiValue::Number(f64::from(u8::from(voiced))),
+            );
+            if voiced != l.voiced {
+                l.voiced = voiced;
+                retell = Some(l.key.1.clone());
+            }
+        }
+        let subtitles = self
+            .stage
+            .bridge
+            .value("ClientOptions.GameOptions.SubtitlesLevel");
+        if let Some(text) = retell.filter(|_| subtitles == Some(thedas_ui::UiValue::Number(0.0))) {
+            self.stage.call_in(
+                "conversation.gfx",
+                "_global.Conversation.UpdateMainText",
+                &[thedas_ui::UiValue::String(text)],
+            );
+        }
         if let Some(l) = self.line.as_mut() {
             let played = l.played();
             self.stage.bridge.set_value(
@@ -1186,8 +1659,11 @@ impl UiLayer {
                 self.continue_conversation();
             }
         }
+        self.write_settings();
         self.show_cutscene_line(sim);
         self.show_script_popup(sim);
+        self.show_text_popup();
+        self.report_button();
         self.select_clicked_portrait(sim);
         self.uber_alert_splash(sim);
         self.loading_frame(dt_ms);
@@ -1196,6 +1672,28 @@ impl UiLayer {
         // A script message box's answer carries the text typed into it, which the box set
         // as `GUIPopupLayer.InputText` just before (popuplayer.gfx's `OnButtonAction`); the
         // exe passes it on as the result event's string 0 (0x709971).
+        // The engine's own text box answered: taken here, with what was typed.
+        messages.retain(|m| match m {
+            GameMessage::Send(name, args) if name == TEXT_POPUP_RESULT => {
+                let typed = match self.stage.bridge.value("GUIPopupLayer.InputText") {
+                    Some(thedas_ui::UiValue::String(s)) => s,
+                    _ => String::new(),
+                };
+                let num = |i: usize| args.get(i).and_then(|a| a.trim().parse::<u32>().ok());
+                if let (Some(id), Some(button)) = (num(0), num(1)) {
+                    self.text_answers.push(TextAnswer {
+                        id,
+                        accepted: button == 1,
+                        text: typed,
+                    });
+                }
+                if self.text_popup.is_some_and(|(up, _)| Some(up) == num(0)) {
+                    self.text_popup = None;
+                }
+                false
+            }
+            _ => true,
+        });
         for m in &mut messages {
             if let GameMessage::Send(name, args) = m {
                 if name == thedas_ui::input::SCRIPT_DIALOG_RESULT {
@@ -1208,6 +1706,18 @@ impl UiLayer {
                     args.push(typed);
                 }
             }
+        }
+        if std::mem::take(&mut self.alerts_cut) {
+            messages.push(GameMessage::Send(
+                thedas_sim::journal::MSG_HIDE_ALERT.into(),
+                Vec::new(),
+            ));
+        }
+        if std::mem::take(&mut self.uber_cut) {
+            messages.push(GameMessage::Send(
+                thedas_sim::journal::MSG_HIDE_UBER_ALERT.into(),
+                Vec::new(),
+            ));
         }
         if std::mem::take(&mut self.continue_pending) {
             messages.push(GameMessage::Send(
@@ -1409,6 +1919,19 @@ impl UiLayer {
 
     /// Whether the player has paused the game (Space): the floaty layer's pause border and
     /// "Paused" text (`Client.Paused`, `Client.UserPaused`).
+    /// The creature the mouse is over, whose name the stats floaties show (see
+    /// [`crate::live::Live::hovered_creature`]); `None` when it is over none, or over the
+    /// interface.
+    pub fn set_hovered(&mut self, creature: Option<thedas_script::vm::ObjectId>) {
+        self.hovered = creature;
+    }
+
+    /// The highlight key (Tab) is held: every creature within 50 m of the leader shows its
+    /// name over its head, as the original shows them while its key is down.
+    pub fn set_show_all_names(&mut self, held: bool) {
+        self.show_all_names = held;
+    }
+
     pub fn set_paused(&self, paused: bool) {
         if let Ok(mut shown) = self.shown.lock() {
             shown.paused = paused;
@@ -1600,12 +2123,14 @@ impl UiLayer {
     /// `FloatyLayer.ProcessBatchUpdates`. Positions are in the visible area's stage units
     /// (`SetFloatyPosition` adds the area's offset itself). Provisional: the head height, the
     /// time a floaty stays after its duration, and stacking several on one creature by
-    /// `BatchUpdateOffsets` are inferred from the movie, not traced.
+    /// `BatchUpdateOffsets` are inferred from the movie, not traced. A floaty stands 0.1 m
+    /// over its creature's head, `head(creature)` metres above its feet (exe 0x764884).
     pub fn update_floaties(
         &mut self,
         sim: &Arc<Mutex<Sim>>,
         camera: &thedas_render::Camera,
         dt_ms: f64,
+        head: &dyn Fn(thedas_script::vm::ObjectId) -> f32,
     ) {
         use thedas_ui::UiValue;
         const LAYER: &str = "_global.FloatyLayer";
@@ -1614,12 +2139,12 @@ impl UiLayer {
         // floatylayer.gfx's `FLOATY_STATS_*` flags.
         const SHOW_NAME: f64 = 1.0;
         const SHOW_HEALTH_BAR: f64 = 2.0;
-        const SHOW_TARGET: f64 = 4.0;
         const IS_HOSTILE: f64 = 32.0;
+        const IS_IN_PARTY: f64 = 64.0;
         /// Seconds a floaty stays past its duration (its own fade).
         const LINGER_S: f64 = 1.0;
-        /// Metres above a creature's feet.
-        const HEAD: f32 = 2.0;
+        /// Metres over a creature's head (0xae7d70).
+        const OVER_HEAD: f32 = 0.1;
         let Some(movie) = self
             .stage
             .movies
@@ -1663,7 +2188,33 @@ impl UiLayer {
         let vp = camera.view_proj(w / h.max(1.0));
         {
             let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+            // Damage numbers (`FLOATY_HIT`, `FLOATY_CRITICAL_HIT`) follow the options, as the
+            // exe's floaty handler does (0x6a7414-0x6a749e): over a party member with "party
+            // damage numbers" on, else over a hostile with "hostile damage numbers" on, else
+            // not at all. Other floaties always show.
+            let option = |name: &str| {
+                self.shown
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.options.get(name).copied())
+                    .unwrap_or(1.0)
+                    != 0.0
+            };
+            let (party_numbers, hostile_numbers) = (
+                option("GameOptions.ShowPartyDamageNumbers"),
+                option("GameOptions.ShowHostileDamageNumbers"),
+            );
+            let members = thedas_sim::engine::party_of(&sim);
             for f in std::mem::take(&mut sim.world.floaties) {
+                if !damage_number_shows(
+                    f.style,
+                    members.contains(&f.target),
+                    members.iter().any(|&m| sim.hostile(m, f.target)),
+                    party_numbers,
+                    hostile_numbers,
+                ) {
+                    continue;
+                }
                 let id = self.next_floaty;
                 self.next_floaty += 1;
                 create.push(num(f64::from(id)));
@@ -1692,7 +2243,8 @@ impl UiLayer {
                     return false;
                 }
                 let o = o.expect("checked");
-                let p = glam::Vec3::new(o.position[0], o.position[1], o.position[2] + HEAD);
+                let z = o.position[2] + head(o.id) + OVER_HEAD;
+                let p = glam::Vec3::new(o.position[0], o.position[1], z);
                 let c = vp * p.extend(1.0);
                 let (x, y, alpha) = if c.w > 1e-4 {
                     let n = c.truncate() / c.w;
@@ -1707,16 +2259,15 @@ impl UiLayer {
                 places.extend([
                     num(f64::from(x) / scale),
                     num(f64::from(y) / scale),
-                    num(1.0),
+                    num(floaty_scale(camera.position.distance(p))),
                     num(alpha),
                     num(f64::from(f.id)),
                 ]);
                 true
             });
-            // The stats floaties (name and health bar over a creature): the hostiles in a
-            // fight with the party, the leader's attack target named. Provisional: the
-            // exe's choice of creatures and flags is not traced; this follows what the
-            // original shows in a fight (a health bar over each enemy, the target's name).
+            // The stats floaties (name and health bar over a creature), for the creatures the
+            // exe gives one (see below). Provisional: which object the game mode marks as
+            // selected is not traced.
             let leader = sim.world.controlled();
             let target = leader
                 .and_then(|l| sim.world.get(l))
@@ -1725,18 +2276,33 @@ impl UiLayer {
                 .and_then(|c| c.target);
             let party = thedas_sim::engine::party_of(&sim);
             let health = thedas_sim::sim::constant(&sim.table, "PROPERTY_DEPLETABLE_HEALTH");
+            // The creature under the mouse gets one too (exe 0x6a52c0: creature+0xa10, the
+            // hover mark, makes the floaty), while within 50 m of the leader (0x7c4ae0
+            // compares the squared distance with 2500).
+            let leader_at = leader
+                .and_then(|l| sim.world.get(l))
+                .map(|o| glam::Vec3::from_array(o.position));
+            let near = |o: &thedas_sim::world::Object| {
+                o.kind == thedas_sim::world::ObjectKind::Creature
+                    && o.active
+                    && !o.dead
+                    && o.area == sim.world.area
+                    && leader_at.is_some_and(|l| {
+                        l.distance_squared(glam::Vec3::from_array(o.position)) < 2500.0
+                    })
+            };
+            let hovered = self.hovered.filter(|&c| sim.world.get(c).is_some_and(near));
+            // A creature has its floaty while the mouse is over it, while it is the one
+            // selected (creature+0x42d, set by 0x70d6e0 for the game mode's object; the
+            // leader's attack target stands in), or while the highlight key is held
+            // (input action 0x2d, read at 0x69aa72 and 0x70d36b): 0x6a52c0.
+            let show_all = self.show_all_names;
             let wanted: Vec<thedas_script::vm::ObjectId> = sim
                 .world
                 .objects
                 .values()
-                .filter(|o| {
-                    o.kind == thedas_sim::world::ObjectKind::Creature
-                        && o.active
-                        && !o.dead
-                        && o.area == sim.world.area
-                        && (Some(o.id) == target
-                            || (o.combat.in_combat && party.iter().any(|&m| sim.hostile(m, o.id))))
-                })
+                .filter(|o| near(o))
+                .filter(|o| show_all || Some(o.id) == target || Some(o.id) == hovered)
                 .map(|o| o.id)
                 .collect();
             for (&c, &id) in &self.stat_floaties {
@@ -1759,7 +2325,8 @@ impl UiLayer {
                     }
                 };
                 let Some(o) = sim.world.get(c) else { continue };
-                let p = glam::Vec3::new(o.position[0], o.position[1], o.position[2] + HEAD);
+                let z = o.position[2] + head(o.id) + OVER_HEAD;
+                let p = glam::Vec3::new(o.position[0], o.position[1], z);
                 let cl = vp * p.extend(1.0);
                 let (x, y, alpha) = if cl.w > 1e-4 {
                     let n = cl.truncate() / cl.w;
@@ -1772,13 +2339,24 @@ impl UiLayer {
                 places.extend([
                     num(f64::from(x) / scale),
                     num(f64::from(y) / scale),
-                    num(1.0),
+                    num(floaty_scale(camera.position.distance(p))),
                     num(alpha),
                     num(f64::from(id)),
                 ]);
-                let mut flags = SHOW_HEALTH_BAR + IS_HOSTILE;
-                if Some(c) == target {
-                    flags += SHOW_NAME + SHOW_TARGET;
+                // The exe's flags (0x764e40): the name always; the health bar for a hostile,
+                // a party member or a creature in combat; whether it is hostile or in the
+                // party. Provisional: HAS_MANA (the class's mana, 0x71a060) is not sent.
+                let hostile = party.iter().any(|&m| sim.hostile(m, c));
+                let in_party = party.contains(&c);
+                let mut flags = SHOW_NAME;
+                if hostile || in_party || o.combat.in_combat {
+                    flags += SHOW_HEALTH_BAR;
+                }
+                if hostile {
+                    flags += IS_HOSTILE;
+                }
+                if in_party {
+                    flags += IS_IN_PARTY;
                 }
                 let (cur, max) = (
                     o.properties.get(&health).map_or(0.0, |p| f64::from(p.1)),
@@ -2128,11 +2706,9 @@ impl UiLayer {
             .composite
             .get_or_insert_with(|| Composite::new(&self.device, format));
         let mut groups = Vec::new();
-        for m in &mut self.stage.movies {
-            m.render();
-            let Some(tex) = m.texture() else { continue };
+        let group = |tex: &wgpu::Texture| {
             let view = tex.create_view(&Default::default());
-            groups.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ui movie"),
                 layout: &comp.layout,
                 entries: &[
@@ -2145,7 +2721,20 @@ impl UiLayer {
                         resource: wgpu::BindingResource::Sampler(&comp.sampler),
                     },
                 ],
-            }));
+            })
+        };
+        // The movies' multiplied clips first, onto the game's picture under the whole
+        // interface (the original's "New Quest" splash leaves the minimap above it as it
+        // was: reference cx_city_elf_after_unpause_new_quest.png).
+        for m in &mut self.stage.movies {
+            if let Some(tex) = m.render_multiply() {
+                groups.push((group(&tex), true));
+            }
+        }
+        for m in &mut self.stage.movies {
+            m.render();
+            let Some(tex) = m.texture() else { continue };
+            groups.push((group(&tex), false));
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("ui composite"),
@@ -2160,8 +2749,12 @@ impl UiLayer {
             })],
             ..Default::default()
         });
-        pass.set_pipeline(&comp.pipeline);
-        for g in &groups {
+        for (g, multiply) in &groups {
+            pass.set_pipeline(if *multiply {
+                &comp.multiply
+            } else {
+                &comp.pipeline
+            });
             pass.set_bind_group(0, g, &[]);
             pass.draw(0..3, 0..1);
         }
@@ -2261,6 +2854,57 @@ fn gui_id(s: Screen, container: bool) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn damage_numbers_follow_the_options_and_other_floaties_always_show() {
+        // A message shows whatever the options.
+        assert!(damage_number_shows(0, false, false, false, false));
+        // Over a party member: the party's option; over a hostile: the hostiles'.
+        assert!(damage_number_shows(1, true, false, true, false));
+        assert!(!damage_number_shows(1, true, false, false, true));
+        assert!(damage_number_shows(2, false, true, false, true));
+        assert!(!damage_number_shows(2, false, true, true, false));
+        // Over a bystander: never.
+        assert!(!damage_number_shows(1, false, false, true, true));
+    }
+
+    #[test]
+    fn a_splash_pass_hides_everything_beside_the_splash_branch() {
+        let n = "_level0.UberNotificationArea_mc.UberNotification5";
+        let splash = format!("{n}.instance1");
+        let paths = [
+            "_level0.UberNotificationArea_mc".to_string(),
+            n.to_string(),
+            format!("{n}.GUI_mc"),
+            format!("{n}.GUI_mc.Header_mc"),
+            splash.clone(),
+            format!("{splash}.instance9"),
+            format!("{splash}.instance9.instance11"),
+            format!("{splash}.instance2"),
+            "_level0.NotificationArea_mc".to_string(),
+            "_level0.NotificationArea_mc.NotificationActivate4".to_string(),
+        ];
+        let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let pass = splash_pass(&paths, &splash, |p| p.ends_with("instance9"));
+        assert_eq!(
+            pass.hide,
+            [
+                "_level0.NotificationArea_mc".to_string(),
+                format!("{n}.GUI_mc")
+            ]
+        );
+        assert_eq!(pass.show, std::slice::from_ref(&splash));
+        assert_eq!(pass.multiply, [format!("{splash}.instance9")]);
+    }
+
+    #[test]
+    fn floaties_shrink_to_two_thirds_from_5_to_30_metres() {
+        assert_eq!(floaty_scale(0.0), 1.0);
+        assert_eq!(floaty_scale(5.0), 1.0);
+        assert!((floaty_scale(17.5) - 5.0 / 6.0).abs() < 1e-6);
+        assert!((floaty_scale(30.0) - 2.0 / 3.0).abs() < 1e-6);
+        assert!((floaty_scale(300.0) - 2.0 / 3.0).abs() < 1e-6);
+    }
 
     #[test]
     fn lines_play_for_a_reading_time() {

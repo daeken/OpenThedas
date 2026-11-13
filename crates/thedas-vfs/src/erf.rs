@@ -12,9 +12,9 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
-use crate::crypto::{DaoKey, blowfish_ecb_decrypt};
+use crate::crypto::{DaoKey, blowfish_ecb_decrypt, decrypt_blocks};
 use crate::{Error, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,11 +115,15 @@ pub struct ErfEntry {
 }
 
 impl ErfEntry {
-    /// A printable name: the stored name, or the hash for unnamed V3.0 entries.
+    /// A printable name: the stored name, or for unnamed V3.0 entries the name hash, with the
+    /// extension when the type hash is a known one (`#<hash>.<ext>`).
     pub fn display_name(&self) -> String {
         match (&self.name, self.name_hash) {
             (Some(n), _) => n.clone(),
-            (None, Some(h)) => format!("#{h:016x}"),
+            (None, Some(h)) => match self.type_hash.and_then(crate::extension_for_type_hash) {
+                Some(ext) => format!("#{h:016x}.{ext}"),
+                None => format!("#{h:016x}"),
+            },
             (None, None) => "<unnamed>".to_string(),
         }
     }
@@ -131,6 +135,7 @@ impl ErfEntry {
 pub struct Erf {
     path: PathBuf,
     file: Mutex<File>,
+    installed_key: OnceLock<Option<DaoKey>>,
     pub version: ErfVersion,
     pub encryption: Encryption,
     pub compression: Compression,
@@ -279,6 +284,7 @@ impl Erf {
         let mut erf = Erf {
             path: path.to_path_buf(),
             file: Mutex::new(file),
+            installed_key: OnceLock::new(),
             version,
             encryption: Encryption::None,
             compression: Compression::None,
@@ -435,36 +441,85 @@ impl Erf {
         Ok(data)
     }
 
+    /// The password read from the player's own `DAOrigins.exe` when it matches the header's
+    /// digest (see [`crate::gog_dlc`]; GOG Ultimate Edition layout only, provisional).
+    pub fn installed_key(&self) -> Option<&DaoKey> {
+        self.installed_key
+            .get_or_init(|| match self.encryption {
+                Encryption::Xor | Encryption::BlowfishDao => {
+                    crate::gog_dlc::key(&self.path, self.module_id, self.password_digest.as_ref()?)
+                }
+                _ => None,
+            })
+            .as_ref()
+    }
+
     /// Reads an entry, decrypting and decompressing as needed.
+    /// An explicit key takes precedence over the password from the local installation.
     pub fn read(&self, entry: &ErfEntry, key: Option<&DaoKey>) -> Result<Vec<u8>> {
+        if !self.is_encrypted() {
+            return self.decompress(entry, self.read_raw(entry)?);
+        }
+
+        let encrypted = || Error::Encrypted {
+            path: self.path.clone(),
+            name: entry.display_name(),
+        };
+        let wrong_key = || Error::WrongKey {
+            path: self.path.clone(),
+        };
+        let key = key.or_else(|| self.installed_key()).ok_or_else(encrypted)?;
+        let digest = self.password_digest.as_ref().ok_or_else(wrong_key)?;
         let mut data = self.read_raw(entry)?;
         match self.encryption {
-            Encryption::None => {}
-            Encryption::BlowfishDao => {
-                let key = key.ok_or_else(|| Error::Encrypted {
-                    path: self.path.clone(),
-                    name: entry.display_name(),
-                })?;
-                if let Some(digest) = &self.password_digest {
-                    if !key.matches_digest(digest) {
-                        return Err(Error::WrongKey {
-                            path: self.path.clone(),
-                        });
-                    }
+            Encryption::Xor | Encryption::BlowfishDao => {
+                if !key.matches_digest(digest) {
+                    return Err(wrong_key());
                 }
-                let bf = key.blowfish_key().ok_or_else(|| Error::WrongKey {
-                    path: self.path.clone(),
-                })?;
-                blowfish_ecb_decrypt(&bf, &mut data);
+                let bytes = key
+                    .blowfish_key()
+                    .filter(|b| *b != [0; 8])
+                    .ok_or_else(wrong_key)?;
+                if self.encryption == Encryption::Xor {
+                    // CBWCXor uses an inclusive end index. The zero-initialized byte
+                    // after the eight-byte numeric key is the ninth byte of the cycle.
+                    let mut mask = [0; 9];
+                    mask[..8].copy_from_slice(&bytes);
+                    for (byte, mask) in data.iter_mut().zip(mask.into_iter().cycle()) {
+                        *byte ^= mask;
+                    }
+                } else {
+                    self.check_blowfish_size(entry)?;
+                    blowfish_ecb_decrypt(&bytes, &mut data);
+                }
             }
-            _ => {
-                return Err(Error::Encrypted {
-                    path: self.path.clone(),
-                    name: entry.display_name(),
-                });
+            Encryption::BlowfishDa2 => {
+                self.check_blowfish_size(entry)?;
+                let cipher = key.da2_cipher(digest).ok_or_else(wrong_key)?;
+                decrypt_blocks(&cipher, &mut data);
             }
+            _ => return Err(encrypted()),
+        }
+        if self.compression == Compression::None {
+            if data.len() < entry.size as usize {
+                return Err(malformed(
+                    &self.path,
+                    "decrypted entry is shorter than its declared size",
+                ));
+            }
+            data.truncate(entry.size as usize);
         }
         self.decompress(entry, data)
+    }
+
+    fn check_blowfish_size(&self, entry: &ErfEntry) -> Result<()> {
+        if entry.packed_size & 7 != 0 {
+            return Err(malformed(
+                &self.path,
+                "Blowfish entry length is not a multiple of eight",
+            ));
+        }
+        Ok(())
     }
 
     fn decompress(&self, entry: &ErfEntry, data: Vec<u8>) -> Result<Vec<u8>> {
@@ -607,6 +662,95 @@ mod tests {
         assert_eq!(archive.build_year, 2010);
         let e = &archive.entries[0];
         assert_eq!(archive.read(e, None).unwrap(), plain);
+    }
+
+    fn write_encrypted_v22(path: &Path, digest: [u8; 16], payload: &[u8], size: u32, kind: u32) {
+        let mut bytes = utf16("ERF V2.2", 16);
+        for word in [1u32, 110, 1, u32::MAX, kind << 4, 100] {
+            bytes.extend(word.to_le_bytes());
+        }
+        bytes.extend(digest);
+        bytes.extend(utf16("fixture.txt", 64));
+        bytes.extend(132u32.to_le_bytes());
+        bytes.extend((payload.len() as u32).to_le_bytes());
+        bytes.extend(size.to_le_bytes());
+        bytes.extend(payload);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn reads_xor_using_the_original_inclusive_key_index() {
+        use md5::{Digest, Md5};
+
+        // Explicit ciphertext for a nine-byte cycle, including the zero at index eight.
+        let cipher = [
+            0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x69, 0x6b, 0x69,
+        ];
+        let path = temp_file("xor.erf", b"");
+        write_encrypted_v22(
+            &path,
+            Md5::digest(b"578437695752307201").into(),
+            &cipher,
+            11,
+            1,
+        );
+        let archive = Erf::open(&path).unwrap();
+        let entry = &archive.entries[0];
+        assert_eq!(
+            archive
+                .read(entry, Some(&DaoKey::new("578437695752307201")))
+                .unwrap(),
+            b"abcdefghijk"
+        );
+        assert!(matches!(
+            archive.read(entry, Some(&DaoKey::new("1"))),
+            Err(Error::WrongKey { .. })
+        ));
+    }
+
+    #[test]
+    fn reads_da2_blowfish_with_a_raw_password_and_challenge_digest() {
+        // Ciphertext and digest produced independently with OpenSSL Blowfish ECB.
+        let password = [0, 255, 128, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+        let digest = [
+            0x87, 0x34, 0x4d, 0x5d, 0x6d, 0x8d, 0xa6, 0xb5, 0xd6, 0xac, 0xd7, 0xf4, 0x2e, 0x32,
+            0x1e, 0x7f,
+        ];
+        let cipher = [
+            0x7b, 0x6c, 0x94, 0x8a, 0xb0, 0x9e, 0xa4, 0x31, 0x06, 0xd1, 0x79, 0x07, 0x7e, 0x74,
+            0x82, 0x2c,
+        ];
+        // V3.0 has no string table in this fixture and one hash-only entry.
+        let mut bytes = utf16("ERF V3.0", 16);
+        for word in [0u32, 1, 0x30, 1] {
+            bytes.extend(word.to_le_bytes());
+        }
+        bytes.extend(digest);
+        bytes.extend(u32::MAX.to_le_bytes());
+        bytes.extend(1u64.to_le_bytes());
+        bytes.extend(1u32.to_le_bytes());
+        bytes.extend(76u32.to_le_bytes());
+        bytes.extend(16u32.to_le_bytes());
+        bytes.extend(11u32.to_le_bytes());
+        bytes.extend(cipher);
+
+        let path = temp_file("type3.erf", &bytes);
+        let archive = Erf::open(&path).unwrap();
+        let entry = &archive.entries[0];
+        assert_eq!(
+            archive
+                .read(entry, Some(&DaoKey::from_bytes(password)))
+                .unwrap(),
+            b"sample data"
+        );
+        assert!(matches!(
+            archive.read(entry, Some(&DaoKey::new("invalid"))),
+            Err(Error::WrongKey { .. })
+        ));
+        assert!(matches!(
+            archive.read(entry, None),
+            Err(Error::Encrypted { .. })
+        ));
     }
 
     #[test]

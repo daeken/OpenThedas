@@ -1041,6 +1041,18 @@ The game ignores the file's `near` and `far` and computes its own per placement:
   each with the placement position and corner index, the billboard's width and height and a
   per-frame fade alpha, the image's atlas entry and the placement's yaw, scale and colour.
   The fade is an alpha test (greater than 84) on texture alpha scaled by the fade.
+- **Lighting frame.** The billboard shader lights the quad from a normal map with one frame
+  shared by every billboard and all four corners, recomputed when the camera turns: with a
+  the camera's azimuth (atan2(y, x) of its view direction), normal = (cos a, sin a, 0),
+  tangent = (−sin a, cos a, 0), binormal = (0, 0, 1). The normal is the view direction
+  flattened, pointing away from the camera.
+- **Light scalars** (the file's standard-shader section; defaults when absent: global 1,
+  dark side 1, bright side 1, billboard ambient 0.5). Each billboard vertex carries
+  (global × bright side, dark side × global, billboard ambient).
+- **Image-angle threshold.** Each billboard vertex also carries the file's
+  `billboard_transition` (0 when absent). The shader fades a billboard by the view angle
+  around the tree against this threshold, in two passes of the same image, so it matters
+  even with one image (7.8's note is about the LOD computation only).
 
 ### 7.6 Branch and frond vertices, shader constants, wind
 
@@ -1159,7 +1171,8 @@ The game uses them as 7.4 describes.
     slot 1 level = region.
   - None: slot 0 level 0, alpha T. Pop: slot 0 level (int)((1 − ℓ)·N_l), alpha T.
 - **Fade hints** (3.7, 4.6) are not used here; they are for renderers that fade per vertex.
-  `billboard_transition` affects only 360° billboard images, which DA:O does not use.
+  `billboard_transition` does not enter this computation (the billboard shader reads it,
+  7.5).
 
 ### 7.9 Self-shadow coordinates
 
@@ -1218,9 +1231,12 @@ sets the three direction followers' wanted values; it does not move their curren
    rustling oscillator's output i, in degrees.
 
 **How DA:O drives it** (traced): N = 6, K = 8; response 0.4, limit 0.01; maximum bend 35;
-both exponents 2; oscillators as (low angle, high angle, low speed, high speed): the two
-branch ones (0.3, 3, 6, 3) and (0.1, 4, 8, 4) (which is horizontal and which vertical is
-taken in that order, provisional), leaf rocking (1, 2, 2, 10), leaf rustling (3, 1, 2, 20).
+both exponents 2; oscillators as (low angle, high angle, low speed, high speed): branch
+horizontal (0.3, 6, 3, 3), branch vertical (0.1, 8, 4, 4), leaf rocking (1, 2, 2, 10), leaf
+rustling (3, 2, 1, 20). (The game hands these over as configuration text whose four numbers
+per oscillator run low angle, low speed, high angle, high speed, with the horizontal
+oscillator first; an earlier revision of this section read them in the wrong order, which
+made the branches sway about half as much.)
 Strength (clamped to [0, 1]) and direction come from the level's wind file; its gust
 frequency is 0 everywhere. Five copies of this simulation run with their times 0.2 s apart
 (t, t + 0.2, …, t + 0.8) and placements take them in turn; t accumulates the frame times

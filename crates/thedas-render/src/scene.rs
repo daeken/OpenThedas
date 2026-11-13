@@ -157,6 +157,39 @@ impl DrawLod {
     }
 }
 
+/// One placement in the level's far billboard batch (`SPT_Billboards0`): DAOrigins.exe
+/// rewrites its four vertices' fade every frame from the instance's LOD (0x532bd8 →
+/// 0x52ce50; speedtree-exe-trace §11.3; docs/speedtree 7.5, 7.8).
+///
+/// Provisional: the detail option and zoom factor `G` are taken as 1.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BillboardInstance {
+    /// The placement point the LOD is measured from.
+    pub anchor: Vec3,
+    pub near: f32,
+    pub far: f32,
+    pub transition: thedas_formats::speedtree_gen::mesh::Transition,
+    /// The billboard's width and height before the placement's scale.
+    pub size: [f32; 2],
+}
+
+impl BillboardInstance {
+    /// Its vertices' TEXCOORD0 with the camera at `eye`: (width, height, 0, fade) while the
+    /// billboard shows (fade > 0; 1 beyond the far distance), else all zero. The game leaves
+    /// a hidden instance out of the frame's index list (0x532a70); a quad of no size draws
+    /// nothing either.
+    pub fn texcoord0(&self, eye: Vec3) -> [f32; 4] {
+        use thedas_formats::speedtree_gen::mesh::{lod_alphas, lod_value};
+        let l = lod_value(eye.distance_squared(self.anchor), self.near, self.far, 1.0);
+        let fade = lod_alphas(l, [1, 1, 1], self.transition).billboard_alpha;
+        if fade > 0.0 {
+            [self.size[0], self.size[1], 0.0, fade]
+        } else {
+            [0.0; 4]
+        }
+    }
+}
+
 /// Which part of a SpeedTree a draw is, for its level of detail ([`TreeLod`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TreePart {
@@ -432,6 +465,8 @@ pub struct AreaScene {
     pub tree_constants: HashMap<usize, crate::d3d::TreeConstants>,
     /// SpeedTree draws' levels of detail by draw.
     pub tree_lods: HashMap<usize, TreeLod>,
+    /// The level's far billboard batch by draw: its placements, four vertices each, in order.
+    pub tree_billboards: HashMap<usize, Vec<BillboardInstance>>,
     /// The level's wind for its trees (strength, direction), from its `.wnd` file.
     pub wind: Option<(f32, [f32; 3])>,
 }
@@ -455,6 +490,9 @@ pub struct Prop {
     /// Equipment tints by model (of `models` or `attached`): (model, `.tnt` without
     /// extension). They fill the model's materials' `mml_vTintMaskColours`.
     pub tints: Vec<(String, String)>,
+    /// Visual effect models on it (without `.mmh`): their emitters follow the body (see
+    /// `Loader::place_effect`).
+    pub effects: Vec<String>,
     /// Model to world.
     pub transform: Mat4,
 }
@@ -491,6 +529,45 @@ pub struct PropDraws {
     pub draws: std::ops::Range<usize>,
     /// Models hung from a node of the body: their draws follow that node.
     pub attachments: Vec<PropAttachment>,
+    /// The emitters of its visual effects ([`Prop::effects`]), which follow it.
+    pub emitters: Vec<PropEmitter>,
+}
+
+/// An emitter that follows a prop: its index in [`AreaScene::emitters`], its placement in
+/// the prop's model space at rest, and the body node it follows (a skeleton of
+/// [`AreaScene::skeletons`] and a node of it), if any; else the prop's root.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PropEmitter {
+    pub emitter: usize,
+    pub in_model: Mat4,
+    pub follows: Option<(usize, usize)>,
+    /// Its birthrate and birthrate range as its effect's looping animation sets them, and
+    /// that animation's length in seconds (see `Loader::place_effect`).
+    pub rate: Option<EffectRate>,
+}
+
+/// An effect emitter's birthrate over time: the `<emitter>_birthrate` and
+/// `<emitter>_birthraterange` float tracks of its effect's animation, which loops.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectRate {
+    pub length: f32,
+    pub birthrate: Option<thedas_formats::anim::ScalarTrack>,
+    pub range: Option<thedas_formats::anim::ScalarTrack>,
+}
+
+impl EffectRate {
+    /// (birthrate, range) at `t` seconds into the loop.
+    pub fn at(&self, t: f32) -> (f32, f32) {
+        let t = if self.length > 0.0 {
+            t.rem_euclid(self.length)
+        } else {
+            0.0
+        };
+        (
+            self.birthrate.as_ref().map_or(0.0, |k| k.at(t)),
+            self.range.as_ref().map_or(0.0, |k| k.at(t)),
+        )
+    }
 }
 
 /// An attached model's draws and the body node they hang from.
@@ -512,6 +589,7 @@ impl AreaScene {
             .clone()
             .filter_map(|d| self.draws.get(d)?.skin.as_ref().map(|s| s.skeleton))
             .chain(p.attachments.iter().map(|a| a.skeleton))
+            .chain(p.emitters.iter().filter_map(|e| e.follows.map(|(s, _)| s)))
             .collect();
         out.sort_unstable();
         out.dedup();
@@ -835,6 +913,17 @@ impl<'a> Loader<'a> {
                         format!(
                             r#"<MaterialObject Name="spt_fronds"><Material Name="SPT_Fronds.mat"/><DefaultSemantic Name="default"/><Texture Name="smpDiffuseMap" ResName="{texture}"/></MaterialObject>"#
                         )
+                    } else if semantic == "spt_billboards" {
+                        // The level's billboard normal atlas beside its diffuse one.
+                        let normal = texture.replace("_diffuse_billboards", "_normal_billboards");
+                        let normal = if l.read(&normal).is_ok() {
+                            format!(r#"<Texture Name="smpNormalMap" ResName="{normal}"/>"#)
+                        } else {
+                            String::new()
+                        };
+                        format!(
+                            r#"<MaterialObject Name="spt_billboards"><Material Name="SPT_Billboards0.mat"/><DefaultSemantic Name="default"/><Texture Name="smpDiffuseMap" ResName="{texture}"/>{normal}</MaterialObject>"#
+                        )
                     } else if let Some(normal) = semantic.strip_prefix("spt_branch:") {
                         // The bark's normal map, when it loads (the shader's default
                         // otherwise).
@@ -881,6 +970,23 @@ impl<'a> Loader<'a> {
         let leaf_material = material(self, &atlas, "spt_leafcards");
         let frond_material = material(self, &atlas, "spt_fronds");
         let leaf_mesh_material = material(self, &atlas, "spt_leafmesh");
+        // The far billboards: one batch for the level with the game's `SPT_Billboards0`,
+        // and per tree its image's entry in the batch's image table (at most 120 entries,
+        // 0x530b70) and what its vertices carry.
+        let billboard_material = material(self, &billboards, "spt_billboards");
+        struct BillboardTree {
+            size: [f32; 2],
+            image: usize,
+            transition: thedas_formats::speedtree_gen::mesh::Transition,
+            /// TEXCOORD1.x: the file's billboard transition (0 when absent).
+            threshold: f32,
+            /// TEXCOORD2.xyz: the file's light scalars (7.5).
+            light: [f32; 3],
+        }
+        let mut billboard_trees: HashMap<usize, BillboardTree> = HashMap::new();
+        let mut billboard_images: Vec<[f32; 4]> = Vec::new();
+        // Per placement: its tree, placement point, scale, yaw, colour and LOD radius.
+        let mut billboard_spots: Vec<(usize, Vec3, f32, f32, [f32; 4], f32)> = Vec::new();
         let mut placed_trees = 0usize;
         for &(tree, placement, scale, color) in spots {
             let built = built_trees.entry(tree).or_insert_with(|| {
@@ -1008,6 +1114,33 @@ impl<'a> Loader<'a> {
                 if !bush
                     && let Some(b) = mesh.billboard
                     && b.height > 0.0
+                    && billboard_material.is_some()
+                    && billboard_images.len() < 120
+                {
+                    // The image's corners 2 and 0 (`v` down, as the leaf cards').
+                    billboard_images.push([b.uv[2][0], b.uv[2][1], b.uv[0][0], b.uv[0][1]]);
+                    let s = tree_file.shader_scalars.unwrap_or_default();
+                    let global = s.global_light.unwrap_or(1.0);
+                    billboard_trees.insert(
+                        tree,
+                        BillboardTree {
+                            size: [b.width, b.height],
+                            image: billboard_images.len() - 1,
+                            transition: mesh.transition,
+                            threshold: tree_file
+                                .lod
+                                .and_then(|l| l.billboard_transition)
+                                .unwrap_or(0.0),
+                            light: [
+                                global * s.billboard_bright_side.unwrap_or(1.0),
+                                s.billboard_dark_side.unwrap_or(1.0) * global,
+                                s.billboard_ambient.unwrap_or(0.5),
+                            ],
+                        },
+                    );
+                } else if !bush
+                    && let Some(b) = mesh.billboard
+                    && b.height > 0.0
                     && let Some(m) = material(self, &billboards, "Punch")
                 {
                     let us = b.uv.map(|c| c[0]);
@@ -1022,7 +1155,10 @@ impl<'a> Loader<'a> {
                     let billboard = self.billboard_mesh(&name, 0.5 * b.width, b.height, uv);
                     parts.push((billboard, m, true));
                 }
-                if parts.is_empty() && !spt_parts.contains_key(&tree) {
+                if parts.is_empty()
+                    && !spt_parts.contains_key(&tree)
+                    && !billboard_trees.contains_key(&tree)
+                {
                     return None;
                 }
                 let (lo, hi) = (Vec3::from(mesh.bounds.0), Vec3::from(mesh.bounds.1));
@@ -1040,11 +1176,14 @@ impl<'a> Loader<'a> {
                 (anchor.x / TREE_CELL).floor() as i64,
                 (anchor.y / TREE_CELL).floor() as i64,
             );
+            let yaw = {
+                let x = placement.x_axis;
+                x.y.atan2(x.x)
+            };
+            if billboard_trees.contains_key(&tree) {
+                billboard_spots.push((tree, anchor, scale, yaw, color, radius * scale));
+            }
             if let Some(spt) = spt_parts.get(&tree) {
-                let yaw = {
-                    let x = placement.x_axis;
-                    x.y.atan2(x.x)
-                };
                 let constants = crate::d3d::TreeConstants {
                     position: [anchor.x, anchor.y, anchor.z, yaw],
                     scale,
@@ -1055,12 +1194,13 @@ impl<'a> Loader<'a> {
                     // placement's order, so they repeat from load to load.
                     wind_offset: (placed_trees.wrapping_mul(37) % 100) as f32,
                     wind: placed_trees % 5,
+                    billboard_images: std::sync::Arc::from([]),
                 };
                 placed_trees += 1;
                 let (near, far) = TreeLod::range(radius * scale, 0);
                 for (mesh, material, part, levels) in &spt.parts {
                     let draw = self.scene.draws.len();
-                    self.scene.tree_constants.insert(draw, constants);
+                    self.scene.tree_constants.insert(draw, constants.clone());
                     self.scene.tree_lods.insert(
                         draw,
                         TreeLod {
@@ -1095,6 +1235,34 @@ impl<'a> Loader<'a> {
                     .or_default()
                     .push((transform, anchor, far));
             }
+        }
+        if let Some(material) = billboard_material
+            && !billboard_spots.is_empty()
+        {
+            self.spt_billboards(
+                material,
+                probe,
+                billboard_spots
+                    .iter()
+                    .filter_map(|&(tree, anchor, scale, yaw, color, r)| {
+                        let t = billboard_trees.get(&tree)?;
+                        let (near, far) = TreeLod::range(r, 0);
+                        let instance = BillboardInstance {
+                            anchor,
+                            near,
+                            far,
+                            transition: t.transition,
+                            size: t.size,
+                        };
+                        // TEXCOORD1 and TEXCOORD2 (speedtree-exe-trace §7): the yaw as the
+                        // game keeps it, in [0, 2π).
+                        let yaw = yaw.rem_euclid(std::f32::consts::TAU);
+                        let tc1 = [t.threshold, t.image as f32, 1.0, yaw];
+                        let tc2 = [t.light[0], t.light[1], t.light[2], scale];
+                        Some((instance, tc1, tc2, color, scale))
+                    }),
+                billboard_images.into(),
+            );
         }
         // Each tree type's part, per cell of the ground, is one draw: its placements' copies
         // merged in world space. Interim batching (the game instances each placement with
@@ -1162,6 +1330,124 @@ impl<'a> Loader<'a> {
                 }),
             });
         }
+    }
+
+    /// The level's far billboards as one draw with the game's `SPT_Billboards0` (two passes),
+    /// as DAOrigins.exe batches them per forest (0x534230, 0x532c70; speedtree-exe-trace §7,
+    /// §11.3; docs/speedtree 7.5): four vertices per placement, each FLOAT4 POSITION0
+    /// (placement point, corner 0–3), TEXCOORD0 (width, height, 0, fade; rewritten every
+    /// frame, see [`BillboardInstance::texcoord0`]), TEXCOORD1 (billboard transition, image
+    /// entry, image count 1, yaw), TEXCOORD2 (bright and dark side light scalars, billboard
+    /// ambient scalar, placement scale), TEXCOORD3 the placement colour (RML 3375). The
+    /// shaders turn the quad to the camera and fade it by alpha test.
+    fn spt_billboards(
+        &mut self,
+        material: usize,
+        probe: Option<usize>,
+        spots: impl Iterator<Item = (BillboardInstance, [f32; 4], [f32; 4], [f32; 4], f32)>,
+        images: std::sync::Arc<[[f32; 4]]>,
+    ) {
+        use thedas_formats::mesh::{DeclType, VertexElement};
+        const STRIDE: u32 = 80;
+        let mut raw: Vec<u8> = Vec::new();
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let mut instances = Vec::new();
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for (instance, tc1, tc2, color, scale) in spots {
+            let base = vertices.len() as u32;
+            let a = instance.anchor;
+            let [w, h] = instance.size;
+            for corner in 0..4 {
+                let attrs: [[f32; 4]; 5] = [
+                    [a.x, a.y, a.z, corner as f32],
+                    [w, h, 0.0, 1.0],
+                    tc1,
+                    tc2,
+                    color,
+                ];
+                raw.extend_from_slice(bytemuck::cast_slice(&attrs));
+                vertices.push(Vertex {
+                    position: a.to_array(),
+                    normal: [0.0, 0.0, 1.0],
+                    uv0: [0.0, 0.0],
+                    uv1: [0.0, 0.0],
+                });
+            }
+            indices.extend([0, 1, 2, 0, 2, 3].map(|i| base + i));
+            let r = 0.5 * w * scale;
+            lo = lo.min(a - Vec3::new(r, r, 0.0));
+            hi = hi.max(a + Vec3::new(r, r, h * scale));
+            instances.push(instance);
+        }
+        if instances.is_empty() {
+            return;
+        }
+        let element = |offset: u32, usage: DeclUsage, usage_index: u32| VertexElement {
+            stream: 0,
+            offset,
+            ty: DeclType::Float4,
+            usage,
+            usage_index,
+        };
+        let key = "spt_billboards".to_string();
+        let count = vertices.len() as u32;
+        self.scene.meshes.push(SceneMesh {
+            key: key.clone(),
+            chunk: MeshChunk {
+                name: key,
+                vertex_size: STRIDE,
+                vertex_count: count,
+                index_count: indices.len() as u32,
+                primitive: 0,
+                index_format: thedas_formats::mesh::IndexFormat::U32,
+                base_vertex: 0,
+                vertex_offset: 0,
+                start_index: 0,
+                elements: vec![
+                    element(0, DeclUsage::Position, 0),
+                    element(16, DeclUsage::TexCoord, 0),
+                    element(32, DeclUsage::TexCoord, 1),
+                    element(48, DeclUsage::TexCoord, 2),
+                    element(64, DeclUsage::TexCoord, 3),
+                ],
+                bounds: None,
+            },
+            vertices,
+            indices,
+            raw_vertices: raw,
+            positions: None,
+        });
+        let mesh = self.scene.meshes.len() - 1;
+        let draw = self.scene.draws.len();
+        self.scene.tree_constants.insert(
+            draw,
+            crate::d3d::TreeConstants {
+                position: [0.0; 4],
+                scale: 1.0,
+                color: [1.0; 4],
+                leaf_angle_scalars: [0.0; 2],
+                wind_offset: 0.0,
+                wind: 0,
+                billboard_images: images,
+            },
+        );
+        self.scene.tree_billboards.insert(draw, instances);
+        self.scene.draws.push(DrawItem {
+            mesh,
+            material,
+            transform: Mat4::IDENTITY,
+            lightmap: None,
+            sphere: ((lo + hi) * 0.5, (hi - lo).length() * 0.5),
+            model: "spt_billboards".into(),
+            room: String::new(),
+            room_id: None,
+            probe,
+            skin: None,
+            // Provisional (RND-080): no shadow, as before.
+            cast_shadow: Some(false),
+            lod: None,
+        });
     }
 
     /// A tree's leaf cards as the game packs them for `SPT_LeafCards` (speedtree-exe-trace
@@ -2129,6 +2415,99 @@ impl<'a> Loader<'a> {
         rigid
     }
 
+    /// A visual effect model on `prop` (DAOrigins.exe's crust effects, `VFX_base.gda` models
+    /// such as `fxa_fire_crust_c`): its emitters, placed on the body and following it. An
+    /// emitter under a crust node (`crst`, named after a body node: `CrustHook1` …) sits
+    /// where the first of the prop's models with that node has it, by the transforms below
+    /// the crust node, and follows that node as the body moves; the others follow the
+    /// prop's root by their place in the effect model. Their birthrates come from the
+    /// effect's duration animation (`<effect>.dura.ani`, whose float tracks are named
+    /// `<emitter>_birthrate` and `<emitter>_birthraterange`), looped: the models themselves
+    /// carry 0. Provisional: the impact (`.impa`) and cessation (`.cess`) animations the
+    /// game plays around it are not played, the crust node's own transform is not used,
+    /// effect models' meshes and other animated parameters (`gob_remotematerialalpha`)
+    /// are not drawn, and an effect on a body without the named node is left out.
+    fn place_effect(&mut self, effect: &str, prop: &Prop) -> Vec<PropEmitter> {
+        use thedas_formats::emitter::Emitter;
+        use thedas_formats::model::{KIND_CRUST, Node};
+        let Some(model) = self.model(effect) else {
+            self.warn(format!("{}: no effect model {effect}", prop.label));
+            return Vec::new();
+        };
+        // Emitters with the crust node above them, and their transform below it (or from
+        // the model root when there is none).
+        type Found<'a> = Vec<(&'a Emitter, Option<&'a str>, Option<&'a str>, Mat4)>;
+        fn walk<'a>(n: &'a Node, below: Mat4, hook: Option<&'a str>, out: &mut Found<'a>) {
+            let (below, hook) = if n.kind == KIND_CRUST {
+                (Mat4::IDENTITY, n.name.as_deref().or(hook))
+            } else {
+                (below * transform_matrix(&n.transform), hook)
+            };
+            if let Some(e) = &n.emitter {
+                out.push((e, n.name.as_deref(), hook, below));
+            }
+            for c in &n.children {
+                walk(c, below, hook, out);
+            }
+        }
+        let mut found = Vec::new();
+        for n in &model.nodes {
+            walk(n, Mat4::IDENTITY, None, &mut found);
+        }
+        let looping = self
+            .read(&format!("{effect}.dura.ani"))
+            .ok()
+            .and_then(|d| thedas_formats::anim::Animation::parse(&d).ok());
+        let mut out = Vec::new();
+        for (e, name, hook, below) in found {
+            let (in_model, follows) = match hook {
+                Some(hook) => {
+                    let body = prop.models.iter().find_map(|m| {
+                        let mmh = self.model(m)?;
+                        let chain = mmh.node_chain(hook)?;
+                        Some((m.clone(), mmh, chain))
+                    });
+                    let Some((body, mmh, chain)) = body else {
+                        continue;
+                    };
+                    let at = chain
+                        .iter()
+                        .fold(Mat4::IDENTITY, |m, t| m * transform_matrix(t));
+                    let skeleton = self.skeleton(&body, &mmh);
+                    let node = self.scene.skeletons[skeleton].node(hook);
+                    (at * below, node.map(|n| (skeleton, n)))
+                }
+                None => (below, None),
+            };
+            let rate = looping.as_ref().and_then(|a| {
+                let name = name?.to_ascii_lowercase();
+                let track = |suffix: &str| {
+                    a.scalars
+                        .iter()
+                        .find(|s| s.target == format!("{name}_{suffix}"))
+                        .cloned()
+                };
+                let (birthrate, range) = (track("birthrate"), track("birthraterange"));
+                (birthrate.is_some() || range.is_some()).then_some(EffectRate {
+                    length: a.length,
+                    birthrate,
+                    range,
+                })
+            });
+            if let Some(emitter) =
+                self.push_emitter(effect, e, name, prop.transform * in_model, &[], false)
+            {
+                out.push(PropEmitter {
+                    emitter,
+                    in_model,
+                    follows,
+                    rate,
+                });
+            }
+        }
+        out
+    }
+
     /// The particle emitters of a placed model. Mesh-particle and physics emitters are left
     /// out (not mirrored yet), as are emitters whose material does not load.
     fn place_emitters(
@@ -2140,13 +2519,38 @@ impl<'a> Loader<'a> {
         cut_away: bool,
     ) {
         for piece in model.emitters() {
-            let e = piece.emitter;
+            let node = piece
+                .chain
+                .iter()
+                .fold(Mat4::IDENTITY, |m, t| m * transform_matrix(t));
+            self.push_emitter(
+                model_name,
+                piece.emitter,
+                piece.name,
+                placement * node,
+                user_params,
+                cut_away,
+            );
+        }
+    }
+
+    /// Adds one emitter at `transform` (node to world) to the scene and returns its index:
+    /// `None` for those not drawn (mesh-particle and physics emitters, and emitters whose
+    /// material does not load).
+    fn push_emitter(
+        &mut self,
+        model_name: &str,
+        e: &thedas_formats::emitter::Emitter,
+        name: Option<&str>,
+        transform: Mat4,
+        user_params: &[(String, [f32; 4])],
+        cut_away: bool,
+    ) -> Option<usize> {
+        {
             if e.mesh_model.is_some() || e.physics || e.material.is_empty() {
-                continue;
+                return None;
             }
-            let Some(mut material) = self.material(&e.material) else {
-                continue;
-            };
+            let mut material = self.material(&e.material)?;
             if e.flipbook {
                 let (c, r) = (e.flipbook_columns.max(1), e.flipbook_rows.max(1));
                 material = self.overridden_material(
@@ -2172,14 +2576,9 @@ impl<'a> Loader<'a> {
                     &[(USER_COLOR_PARAMETER.to_string(), vec![*value])],
                 );
             }
-            let node = piece
-                .chain
-                .iter()
-                .fold(Mat4::IDENTITY, |m, t| m * transform_matrix(t));
-            let transform = placement * node;
             log::debug!(
                 "emitter {model_name}:{} at {:?} ({})",
-                piece.name.unwrap_or(""),
+                name.unwrap_or(""),
                 transform.w_axis.truncate(),
                 e.material
             );
@@ -2188,9 +2587,10 @@ impl<'a> Loader<'a> {
                 transform,
                 material,
                 model: model_name.to_string(),
-                node: piece.name.unwrap_or("").to_string(),
+                node: name.unwrap_or("").to_string(),
                 cut_away,
             });
+            Some(self.scene.emitters.len() - 1)
         }
     }
 
@@ -2700,11 +3100,18 @@ impl AreaScene {
                     }
                 }
             }
+            let draws = first..l.scene.draws.len();
+            let emitters = prop
+                .effects
+                .iter()
+                .flat_map(|effect| l.place_effect(effect, prop))
+                .collect();
             l.scene.props.push(PropDraws {
                 label: prop.label.clone(),
                 transform: prop.transform,
-                draws: first..l.scene.draws.len(),
+                draws,
                 attachments,
+                emitters,
             });
         }
         l.assign_probes();
@@ -2830,6 +3237,44 @@ mod tests {
         let eye = Vec3::new(30.0, 0.0, 0.0);
         let (first, _, _) = lod(TreePart::Branches).frame(eye).unwrap();
         assert!(first > 0);
+    }
+
+    #[test]
+    fn a_billboard_fades_in_at_the_end_of_the_lod_range_and_hides_inside_it() {
+        let b = BillboardInstance {
+            anchor: Vec3::ZERO,
+            near: 15.0,
+            far: 35.0,
+            transition: Default::default(),
+            size: [8.0, 12.0],
+        };
+        // Inside the geometry's range: no size, so nothing draws.
+        assert_eq!(b.texcoord0(Vec3::new(20.0, 0.0, 0.0)), [0.0; 4]);
+        // Beyond far: fully on.
+        assert_eq!(
+            b.texcoord0(Vec3::new(40.0, 0.0, 0.0)),
+            [8.0, 12.0, 0.0, 1.0]
+        );
+        // Just inside far (LOD below the transition width 0.14): partly faded in.
+        let [w, h, _, fade] = b.texcoord0(Vec3::new(34.5, 0.0, 0.0));
+        assert_eq!((w, h), (8.0, 12.0));
+        assert!(fade > 0.0 && fade <= 1.0, "{fade}");
+    }
+
+    #[test]
+    fn an_effect_birthrate_loops_with_its_animation() {
+        use thedas_formats::anim::ScalarTrack;
+        let r = EffectRate {
+            length: 2.0,
+            birthrate: Some(ScalarTrack {
+                target: "flame_default_birthrate".into(),
+                keys: vec![(0.0, 5.0), (2.0, 10.0)],
+            }),
+            range: None,
+        };
+        assert_eq!(r.at(1.0), (7.5, 0.0));
+        // Looped: 3 s is 1 s into the second pass.
+        assert_eq!(r.at(3.0), (7.5, 0.0));
     }
 
     #[test]

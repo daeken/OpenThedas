@@ -421,6 +421,9 @@ impl Live {
         } else {
             thedas_sim::session::open(&opts)?
         };
+        // The last orders, script log lines and the like, for issue reports (a debug read
+        // only; see `crate::report`).
+        sim.world.trace.keep_recent = crate::report::TRACE_RECENT;
         let save = match start {
             Start::Save(path) => Some((
                 std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
@@ -863,19 +866,7 @@ impl Live {
                     continue;
                 }
                 let touches = models.iter().any(|m| {
-                    let key = m.to_ascii_lowercase();
-                    let shapes = self.creature_shapes.entry(key.clone()).or_insert_with(|| {
-                        let read = |n: &str| level.vfs.read(n).ok().map(|(d, _)| d);
-                        let phy = read(&format!("{key}.phy"))
-                            .and_then(|d| thedas_formats::phy::Phy::parse(&d).ok());
-                        let mmh = read(&format!("{key}.mmh"))
-                            .and_then(|d| thedas_formats::model::Mmh::parse(&d).ok());
-                        Arc::new(
-                            phy.map(|p| crate::camfade::model_shapes(&p, mmh.as_ref()))
-                                .unwrap_or_default(),
-                        )
-                    });
-                    shapes
+                    creature_shapes(&mut self.creature_shapes, level, m)
                         .iter()
                         .any(|s| s.touches(placement, eye, crate::camfade::FADE_RADIUS))
                 });
@@ -1197,6 +1188,33 @@ impl Live {
         };
         self.stage_shown = Some((preset, c));
         Some(c)
+    }
+
+    /// How far drawn creature `id`'s head bone stands above its feet, at rest: what
+    /// DAOrigins.exe's creature height (vtable +0x1b0, 0x6a1a30) reads, the model's `head`
+    /// node over the creature's position, or 1.75 m (0xb0f44c) without one. The floaties
+    /// over a creature stand 0.1 m above it. Provisional: the exe reads the node's placement
+    /// when it measures (and keeps the value, creature+0x7b0); the rest pose stands in.
+    pub fn head_height(&self, id: ObjectId) -> f32 {
+        const NO_HEAD: f32 = 1.75;
+        let (Some(objects), Some(i)) = (
+            self.objects.as_ref(),
+            self.posed.iter().position(|p| p.0 == id),
+        ) else {
+            return NO_HEAD;
+        };
+        let transform = self.posed[i].1;
+        objects
+            .scene
+            .prop_skeletons(i)
+            .into_iter()
+            .find_map(|s| {
+                let skeleton = objects.scene.skeletons.get(s)?;
+                let node = skeleton.node("head")?;
+                let rest = skeleton.rest().get(node)?.w_axis.truncate();
+                Some(transform.transform_point3(rest).z - transform.w_axis.z)
+            })
+            .unwrap_or(NO_HEAD)
     }
 
     /// Where drawn object `id`'s head bone is now (in the world), when it has one.
@@ -1725,6 +1743,30 @@ pub enum Pick {
     Ground([f32; 3]),
 }
 
+/// A model's creature shapes (its `.phy`'s creatures group, see [`crate::camfade`]), read
+/// once per model and kept in `cache`.
+fn creature_shapes(
+    cache: &mut std::collections::HashMap<String, Arc<Vec<crate::camfade::Shape>>>,
+    level: &LiveLevel,
+    model: &str,
+) -> Arc<Vec<crate::camfade::Shape>> {
+    let key = model.to_ascii_lowercase();
+    cache
+        .entry(key.clone())
+        .or_insert_with(|| {
+            let read = |n: &str| level.vfs.read(n).ok().map(|(d, _)| d);
+            let phy =
+                read(&format!("{key}.phy")).and_then(|d| thedas_formats::phy::Phy::parse(&d).ok());
+            let mmh = read(&format!("{key}.mmh"))
+                .and_then(|d| thedas_formats::model::Mmh::parse(&d).ok());
+            Arc::new(
+                phy.map(|p| crate::camfade::model_shapes(&p, mmh.as_ref()))
+                    .unwrap_or_default(),
+            )
+        })
+        .clone()
+}
+
 /// Creatures are picked as upright cylinders this tall (metres). Provisional.
 pub const PICK_HEIGHT: f32 = 1.9;
 /// How far a click reaches into the scene (metres).
@@ -1817,6 +1859,77 @@ impl Live {
             (Some((_, id)), None) => Some(Pick::Object(id)),
             (_, Some(g)) => Some(Pick::Ground(g)),
             (None, None) => None,
+        }
+    }
+
+    /// The creature the mouse is over (a ray from the camera, `origin` and unit `dir`): the
+    /// nearest living creature in the area it passes through, the party leader included,
+    /// unless the ground is nearer. DAOrigins.exe marks that creature (creature+0xa10, set
+    /// by 0x712710 for the creature under the cursor and cleared on the one before), and a
+    /// marked creature gets its stats floaty, its name over its head (0x6a52c0). Provisional:
+    /// the exe's picker and its rule for several creatures under the cursor at once are not
+    /// traced; the nearest stands in.
+    pub fn hovered_creature(&mut self, origin: glam::Vec3, dir: glam::Vec3) -> Option<ObjectId> {
+        let shared = self.sim.clone();
+        let mut sim = shared.lock().unwrap_or_else(|p| p.into_inner());
+        let area = sim.world.area?;
+        let mut best: Option<(f32, ObjectId)> = None;
+        for o in sim.world.objects.values() {
+            if o.area != Some(area)
+                || !o.active
+                || o.dead
+                || o.kind != thedas_sim::world::ObjectKind::Creature
+            {
+                continue;
+            }
+            // The models' creature shapes where the creature is drawn (see
+            // [`crate::camfade`]); a cylinder for one without any.
+            let posed = self
+                .objects
+                .as_ref()
+                .and_then(|s| s.bodies.iter().position(|(id, _)| *id == o.id))
+                .and_then(|i| self.posed.get(i).filter(|p| p.0 == o.id).map(|p| (i, p.1)));
+            let mut t = None;
+            if let (Some((i, placement)), Some(level), Some(objects)) =
+                (posed, self.level.as_ref(), self.objects.as_ref())
+            {
+                for m in &objects.bodies[i].1 {
+                    for shape in creature_shapes(&mut self.creature_shapes, level, m).iter() {
+                        if let Some(h) = shape.ray(&placement, origin, dir) {
+                            t = Some(t.map_or(h, |b: f32| b.min(h)));
+                        }
+                    }
+                }
+            }
+            let shaped = posed.is_some_and(|(i, _)| {
+                self.objects.as_ref().is_some_and(|objects| {
+                    objects.bodies[i].1.iter().any(|m| {
+                        self.creature_shapes
+                            .get(&m.to_ascii_lowercase())
+                            .is_some_and(|s| !s.is_empty())
+                    })
+                })
+            });
+            if !shaped {
+                let r = sim.body_radius(o.id).max(0.35);
+                t = ray_cylinder(
+                    origin,
+                    dir,
+                    glam::Vec3::from_array(o.position),
+                    r,
+                    PICK_HEIGHT,
+                );
+            }
+            if let Some(t) = t {
+                if best.is_none_or(|(b, _)| t < b) {
+                    best = Some((t, o.id));
+                }
+            }
+        }
+        let (t, id) = best?;
+        match sim.ground_hit(area, origin.to_array(), dir.to_array(), 300.0) {
+            Some(g) if origin.distance(glam::Vec3::from_array(g)) < t => None,
+            _ => Some(id),
         }
     }
 
@@ -2212,6 +2325,7 @@ fn objects_key(models: &[ObjectModel]) -> ObjectsKey {
             v.extend(m.attached.iter().map(|a| format!("{}@{}", a.model, a.node)));
             v.extend(m.morph.iter().map(|x| format!("{x}.mor{}", m.hide_hair)));
             v.extend(m.tints.iter().map(|(a, t)| format!("{a}:{t}")));
+            v.extend(m.effects.iter().map(|e| format!("fx:{e}")));
             (m.id, v)
         })
         .collect()
@@ -2255,6 +2369,7 @@ pub fn prop(m: &ObjectModel) -> Prop {
         morph: m.morph.clone(),
         hide_hair: m.hide_hair,
         tints: m.tints.clone(),
+        effects: m.effects.clone(),
         transform: Prop::placement(m.position, m.facing),
     }
 }

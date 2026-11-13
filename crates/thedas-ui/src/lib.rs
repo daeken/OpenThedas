@@ -530,6 +530,25 @@ pub struct UiMovie {
     slots_loaded: Vec<String>,
     /// How many inline images each text field (by its index, see `avm1::IMG_TAKE`) shows.
     inline_images: std::collections::HashMap<u32, usize>,
+    /// Clips the movie blends with `multiply` onto the game's picture, drawn in a pass of
+    /// their own (see [`MultiplyPass`]), and the texture that pass is copied to.
+    multiply_pass: Option<MultiplyPass>,
+    multiply_texture: Option<wgpu::Texture>,
+}
+
+/// Clips a movie draws with the `multiply` blend onto what is under the interface (the
+/// "New Quest" banner's blood splash darkens the game's picture). The movie renders into
+/// its own transparent texture, where a multiply has nothing under it, so these clips are
+/// drawn alone in a pass of their own, with the normal blend, and that picture is multiplied
+/// onto the frame before the movie's own (where they are hidden).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MultiplyPass {
+    /// Clips the pass hides: everything outside the multiplied clips' branch.
+    pub hide: Vec<String>,
+    /// Clips the pass shows: the multiplied clips' parent, hidden in the movie's own frame.
+    pub show: Vec<String>,
+    /// The `multiply` clips, drawn with the normal blend in the pass.
+    pub multiply: Vec<String>,
 }
 
 /// An `<img>` tag in HTML text: where it is, its linkage name and its horizontal space.
@@ -583,6 +602,18 @@ fn inline_images(html: &str) -> Vec<InlineImage> {
 }
 
 /// Where the last line of `html` starts (after its last line break).
+/// Where the line of `html` that `from` is on ends: the first line break after it, or the
+/// end.
+fn line_end(html: &str, from: usize) -> usize {
+    let lower = html.to_ascii_lowercase();
+    let rest = lower.get(from..).unwrap_or("");
+    ["<br>", "<br/>", "<br />", "</p>", "\n", "\r"]
+        .iter()
+        .filter_map(|b| rest.find(b).map(|i| from + i))
+        .min()
+        .unwrap_or(html.len())
+}
+
 fn last_line_start(html: &str) -> usize {
     let lower = html.to_ascii_lowercase();
     ["<br>", "<br/>", "<br />", "</p>", "\n", "\r"]
@@ -645,6 +676,13 @@ impl UiMovie {
             .with_viewport_dimensions(size.0, size.1, stage_scale(size, authored))
             .with_scale_mode(StageScaleMode::NoScale, true)
             .with_autoplay(true)
+            // The whole movie is loaded before its first frame runs. Ruffle otherwise loads
+            // it a frame's worth of time at a go; on a slow start (a debug build, a busy
+            // machine) frame one was not in by the time the game starts the scene, the
+            // start call found nothing to call, and the movie then started itself as in a
+            // standalone Flash player: label names for text, test content (popuplayer.gfx's
+            // "Sell how many items?" box) and art left where it was authored.
+            .with_load_behavior(ruffle_core::LoadBehavior::Blocking)
             .with_movie(movie)
             .build();
         if let Ok(mut p) = player.lock() {
@@ -667,6 +705,8 @@ impl UiMovie {
             engine_images: BTreeMap::new(),
             slots_loaded: Vec::new(),
             inline_images: Default::default(),
+            multiply_pass: None,
+            multiply_texture: None,
         })
     }
 
@@ -793,7 +833,8 @@ impl UiMovie {
     /// Draws the inline images of the text fields that took new text (see
     /// [`avm1::IMG_TAKE`]): each `<img>` is replaced in the text by enough non-breaking
     /// spaces to hold it, and the image, by its linkage name, is placed over them. An image
-    /// is centred on its line. Provisional: Scaleform's own image layout (`align`, `vspace`,
+    /// is centred on its line, and a right-aligned or centred field's line (the stores'
+    /// price columns) starts where its alignment puts it. Provisional: Scaleform's own image layout (`align`, `vspace`,
     /// `hspace`) is not traced, and a line the field wraps by itself is not followed.
     fn layout_inline_images(&mut self) {
         let UiValue::List(v) = self.call(avm1::IMG_TAKE, &[]) else {
@@ -883,11 +924,32 @@ impl UiMovie {
                 &[UiValue::Number(k), UiValue::String(text.clone())],
             );
             let line = measure(self, "&nbsp;", true).1.max(1.0);
+            // A right-aligned or centred field (a price column) starts each line that much
+            // further in: the room the line leaves, all or half.
+            let (field_width, align) = match self.call(avm1::IMG_FIELD, &[UiValue::Number(k)]) {
+                UiValue::List(l) if l.len() == 2 => (
+                    num(&l[0]),
+                    match &l[1] {
+                        UiValue::String(a) => a.to_ascii_lowercase(),
+                        _ => String::new(),
+                    },
+                ),
+                _ => (0.0, String::new()),
+            };
             for (n, ((im, &(w, h)), &pos)) in images.iter().zip(&sizes).zip(&at).enumerate() {
                 let before = &text[..pos];
                 let lines = measure(self, &format!("{before}&nbsp;"), true).1;
                 let line_start = last_line_start(before);
-                let x = measure(self, &before[line_start..], false).0 + im.hspace;
+                let room = match align.as_str() {
+                    "right" | "center" => {
+                        let line_text = &text[line_start..line_end(&text, pos)];
+                        // The field's gutters, 2 pixels each side.
+                        let room = (field_width - 4.0 - measure(self, line_text, false).0).max(0.0);
+                        if align == "right" { room } else { room / 2.0 }
+                    }
+                    _ => 0.0,
+                };
+                let x = room + measure(self, &before[line_start..], false).0 + im.hspace;
                 let y = (lines - line) + (line - h) / 2.0;
                 // The text field's gutter (2 pixels each way), and a pixel's gap from the
                 // text before (the measuring field came out a little narrower than the
@@ -918,6 +980,110 @@ impl UiMovie {
     /// Renders the current frame into the texture.
     pub fn render(&mut self) {
         self.with_player(|p| p.render());
+    }
+
+    /// Whether the movie has a multiply pass (see [`MultiplyPass`]).
+    pub fn has_multiply_pass(&self) -> bool {
+        self.multiply_pass.is_some()
+    }
+
+    /// The clips to draw in a multiply pass of their own, or none (see [`MultiplyPass`]).
+    pub fn set_multiply_pass(&mut self, pass: Option<MultiplyPass>) {
+        self.multiply_pass = pass;
+    }
+
+    /// Sets the movie up for its multiply pass, runs `f`, and puts the clips back as they
+    /// were (their visibility read first: the movie may have changed it since the pass was
+    /// made). `None` without a pass.
+    fn in_multiply_pass<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        let pass = self.multiply_pass.clone()?;
+        let visible = |m: &mut Self, path: &str| {
+            m.call(&format!("{path}._visible.toString"), &[]) == UiValue::String("true".into())
+        };
+        let was: Vec<(String, bool)> = pass
+            .hide
+            .iter()
+            .chain(&pass.show)
+            .map(|p| (p.clone(), visible(self, p)))
+            .collect();
+        for p in &pass.hide {
+            self.set(&format!("{p}._visible"), UiValue::Bool(false));
+        }
+        for p in &pass.show {
+            self.set(&format!("{p}._visible"), UiValue::Bool(true));
+        }
+        for p in &pass.multiply {
+            self.set(&format!("{p}.blendMode"), UiValue::String("normal".into()));
+        }
+        let r = f(self);
+        for p in &pass.multiply {
+            self.set(
+                &format!("{p}.blendMode"),
+                UiValue::String("multiply".into()),
+            );
+        }
+        for (p, v) in was {
+            self.set(&format!("{p}._visible"), UiValue::Bool(v));
+        }
+        Some(r)
+    }
+
+    /// Renders the movie's multiply pass (see [`MultiplyPass`]) and returns a copy of it
+    /// (RGBA8, premultiplied), to multiply onto the frame under the movie's own picture.
+    /// `None` without a pass.
+    pub fn render_multiply(&mut self) -> Option<wgpu::Texture> {
+        self.in_multiply_pass(|m| {
+            m.render();
+            let (texture, device, queue) = m
+                .with_player(|p| {
+                    let r: &mut dyn std::any::Any = p.renderer_mut();
+                    r.downcast_mut::<WgpuRenderBackend<TextureTarget>>()
+                        .map(|b| {
+                            (
+                                b.target().texture.clone(),
+                                b.descriptors().device.clone(),
+                                b.descriptors().queue.clone(),
+                            )
+                        })
+                })
+                .flatten()?;
+            let same = m
+                .multiply_texture
+                .as_ref()
+                .is_some_and(|t| t.size() == texture.size() && t.format() == texture.format());
+            if !same {
+                m.multiply_texture = Some(device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("ui multiply pass"),
+                    size: texture.size(),
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: texture.format(),
+                    usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                }));
+            }
+            let copy = m.multiply_texture.clone()?;
+            let mut encoder = device.create_command_encoder(&Default::default());
+            encoder.copy_texture_to_texture(
+                texture.as_image_copy(),
+                copy.as_image_copy(),
+                texture.size(),
+            );
+            queue.submit([encoder.finish()]);
+            Some(copy)
+        })
+        .flatten()
+    }
+
+    /// The movie's multiply pass read back to the CPU (RGBA8, premultiplied), as
+    /// [`UiMovie::render_multiply`] draws it. `None` without a pass.
+    pub fn capture_multiply(&mut self) -> Option<Rgba> {
+        self.in_multiply_pass(|m| {
+            m.render();
+            m.capture()
+        })
+        .flatten()
     }
 
     /// The texture the movie renders into (RGBA8, premultiplied alpha).
@@ -1265,6 +1431,14 @@ mod inline_image_tests {
         assert_eq!(last_line_start("abc"), 0);
         assert_eq!(last_line_start("a<br>bc"), 5);
         assert_eq!(last_line_start("a<BR/>b\nc"), 8);
+    }
+
+    #[test]
+    fn a_line_ends_at_the_next_break() {
+        assert_eq!(line_end("abc", 0), 3);
+        assert_eq!(line_end("a<br>bc<BR/>d", 1), 1);
+        assert_eq!(line_end("a<br>bc<BR/>d", 5), 7);
+        assert_eq!(line_end("ab", 9), 2);
     }
 }
 

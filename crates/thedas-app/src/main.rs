@@ -41,6 +41,9 @@
 //! the D-pad or stick picks a reply and A chooses it. The PC original has no controller
 //! support: this is a deliberate addition, following the Xbox 360 version's controls.
 //!
+//! F8 (or both sticks clicked in, or the game menu's Report Issue) makes an issue report
+//! (see [`report`]); a build that fixes one is offered at start (see [`update`]).
+//!
 //! `--control 127.0.0.1:7878` lets a local client (`thedas-mcp`'s `attach`) drive the
 //! running game: the same steps as `--steps`, screenshots and the simulation's state (see
 //! [`control`]).
@@ -58,11 +61,14 @@ mod live;
 mod pad;
 mod paddev;
 mod padplay;
+mod report;
 mod reticle;
 mod saves;
 mod screens;
 mod talkcam;
 mod ui;
+mod update;
+mod upload;
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -197,6 +203,12 @@ struct Args {
     /// screen, the death screen's load). Defaults to `$HOME/.openthedas/saves`.
     #[arg(long)]
     saves: Option<PathBuf>,
+    /// The player's settings file (the options screen's settings, kept between runs).
+    /// Playing in a window without `--control` it defaults to `options.ini` in the
+    /// player's folder (`~/.openthedas`; `Documents\OpenThedas` on Windows); otherwise
+    /// settings are kept only when this is given.
+    #[arg(long)]
+    settings: Option<PathBuf>,
     /// List the game controllers gilrs sees (names, ids, mapping, which inputs it maps) and
     /// print their events for this many seconds, then exit. No window, no install needed.
     #[arg(long)]
@@ -215,6 +227,10 @@ struct Args {
     /// never to the speakers.
     #[arg(long)]
     audio_wav: Option<PathBuf>,
+    /// Ask whether the problem reported in this report folder is fixed, once the game is up
+    /// (a build started by the update after a fix, see `update`).
+    #[arg(long)]
+    check_report: Option<PathBuf>,
     /// The voice-over language folder (`audio/vo/<language>`).
     #[arg(long, default_value = "en-us")]
     language: String,
@@ -538,7 +554,14 @@ struct App {
     ui: Vec<String>,
     /// Where the player's games are saved.
     saves_dir: PathBuf,
+    /// The player's settings file, when settings are kept (see `Args::settings`).
+    settings: Option<PathBuf>,
     cursor: (f64, f64),
+    /// The last check of whether the interface covers the cursor while it is over a
+    /// creature: (cursor, creature) → covered (see `App::update_hover`).
+    hover_probe: Option<((f64, f64), thedas_script::vm::ObjectId, bool)>,
+    /// The highlight key held by an `allnames` step (see `Step::AllNames`).
+    all_names: bool,
     camera: Camera,
     size: (u32, u32),
     gfx: Option<Gfx>,
@@ -588,6 +611,104 @@ struct App {
     intro_pad_held: bool,
     /// A zoom key a step holds down (`key pagedown MS`): +1 in, -1 out, 0 none.
     zoom_key: f32,
+    /// Issue reports (F8): the snapshots, input and frame times they keep (see [`report`]).
+    recorder: report::Recorder,
+    /// A report under way: its screenshot and the player's note, to come, and the client
+    /// that asked for it (`--control`'s `report`), waiting for where it went.
+    report_wait: Option<ReportWait>,
+    /// The settings the game was started with, for reports.
+    started_with: J,
+    /// The way back from a report: a fix offered, fetched and checked (see [`update`]).
+    returning: Returning,
+    /// Answers to its questions, taken from the interface, acted on next frame.
+    update_answers: Vec<ui::TextAnswer>,
+}
+
+/// Where the way back from a report is (see [`update`]).
+enum Returning {
+    Idle,
+    /// Looking for a build that fixes a report sent from here.
+    Checking(std::sync::mpsc::Receiver<Option<update::Offer>>),
+    /// A question up, or waiting to go up.
+    Asking(Box<UpdatePrompt>),
+    /// The build being fetched; the save it starts on and the report it asks about.
+    Fetching(std::sync::mpsc::Receiver<Result<PathBuf>>, PathBuf, PathBuf),
+}
+
+/// A question of the way back, in the game's text box.
+struct UpdatePrompt {
+    kind: UpdateAsk,
+    /// Frames since asked and times it failed to show (as the report's note).
+    asked: Option<(u32, u32)>,
+}
+
+enum UpdateAsk {
+    /// A build fixes a report: update now?
+    Offer(update::Offer),
+    /// Load where the player is, or where they reported it?
+    Where(update::Offer),
+    /// The build started on a report: is it fixed? (The report's folder, the question.)
+    Verdict(PathBuf, String),
+    /// Something went wrong.
+    Failed(String),
+}
+
+impl UpdateAsk {
+    /// Its text box's id, prompt and buttons.
+    fn ask(&self) -> (u32, String, &'static str, &'static str) {
+        match self {
+            UpdateAsk::Offer(o) => (UPDATE_ASK_ID, update::offer_prompt(o), "Update", "Later"),
+            UpdateAsk::Where(_) => (
+                UPDATE_ASK_ID + 1,
+                "Start the new build where you are now, or where you reported the problem?"
+                    .to_string(),
+                "Where I am",
+                "Where I reported",
+            ),
+            UpdateAsk::Verdict(_, prompt) => {
+                (UPDATE_ASK_ID + 2, prompt.clone(), "Fixed", "Not fixed")
+            }
+            UpdateAsk::Failed(why) => (UPDATE_ASK_ID + 3, why.clone(), "OK", "Close"),
+        }
+    }
+}
+
+/// The ids the way back's questions go by (`UiLayer::ask_text`).
+const UPDATE_ASK_ID: u32 = 0x5550_4400;
+
+/// Frames a report's text box may take to come up before it is asked again.
+const NOTE_REASK_FRAMES: u32 = 30;
+/// How many times it may fail to come up before the report is kept without a note.
+const NOTE_TRIES: u32 = 10;
+
+/// Asks for a report's note in the game's own text box: Send when reports go to the
+/// project's Discord (see [`upload`]), else Save. Either button keeps the report: an
+/// accidental one costs a folder, a lost one costs the bug.
+fn ask_report_note(ui: &mut ui::UiLayer, pad: bool) {
+    let (prompt, ok, other) = match upload::webhook() {
+        Some(_) => (report::NOTE_PROMPT_SEND, "Send report", "Keep here"),
+        None => (report::NOTE_PROMPT, "Save report", "Save, no note"),
+    };
+    // The box's OK wants some text, and the pad cannot type yet: a pad's report starts
+    // with a line that can go as it is.
+    let text = if pad { "(sent from a controller)" } else { "" };
+    ui.ask_text(report::NOTE_ID, prompt, text, ok, other);
+}
+
+/// What a report under way waits for.
+struct ReportWait {
+    shot: Option<std::sync::mpsc::Receiver<J>>,
+    reply: Option<std::sync::mpsc::Sender<J>>,
+    /// The note is asked in the game's text box: frames since it was last asked (or seen
+    /// up), and how many times it has not come up.
+    note_asked: Option<(u32, u32)>,
+    /// The report goes on to the project's Discord once written, if set up (see
+    /// [`upload`]); the text box's second button keeps it here.
+    send: bool,
+    /// The game is to pause once the screenshot is in (so the frame shows no "Paused"),
+    /// and whether the report paused it (it carries on when the report is done).
+    pause: bool,
+    paused_it: bool,
 }
 
 /// What the window's surface gave a redraw.
@@ -642,7 +763,7 @@ fn play_interface(
                 live.aiming = Some(aim);
             }
             ui.update_minimap(&live.sim, camera);
-            ui.update_floaties(&live.sim, camera, dt.min(100.0));
+            ui.update_floaties(&live.sim, camera, dt.min(100.0), &|c| live.head_height(c));
         }
         _ => {
             for call in ui.tick(dt.min(100.0)) {
@@ -869,6 +990,9 @@ impl App {
             &self.ui,
             (config.width, config.height),
         );
+        if let Some(path) = &self.settings {
+            ui.set_settings_file(path.clone());
+        }
         if let (Some(live), Some(_)) = (&self.live, &self.screens) {
             ui.attach(&live.sim);
             ui.set_saves(saves::SaveStore::new(self.saves_dir.clone()));
@@ -1043,6 +1167,8 @@ impl App {
         let dt = self.last.elapsed().as_secs_f64() * 1000.0;
         self.serve_control(dt);
         self.pad_frame(dt);
+        self.report_frame(dt);
+        self.returning_frame();
         self.update();
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
@@ -1100,22 +1226,7 @@ impl App {
             // Portraits are drawn by the objects' renderers, whose constants this frame's
             // draws use too: they are drawn (and submitted) before the frame is encoded, so
             // the frame is not drawn from the portrait camera.
-            if self.screens.is_some() {
-                let key = ui::portrait_key(&live.sim());
-                if g.ui.wants_portraits(key, dt) {
-                    let shots = live.portraits(&g.ctx, ui::PORTRAIT_SIZE);
-                    g.ui.set_portraits(shots);
-                }
-                let due = self
-                    .screens
-                    .as_ref()
-                    .and_then(|s| g.ui.wants_paperdoll(s, &live.sim(), dt));
-                if let Some((who, yaw)) = due {
-                    let (w, h) = ui::PAPERDOLL_SIZE;
-                    let shot = live.paperdoll(&g.ctx, who, yaw, w, h);
-                    g.ui.set_paperdoll(shot);
-                }
-            }
+            draw_likenesses(live, &mut g.ui, self.screens.as_ref(), &g.ctx, dt);
         }
         let size = (g.config.width, g.config.height);
         let drawn = match (self.live.as_mut(), g.renderer.as_mut()) {
@@ -1156,6 +1267,16 @@ impl App {
             }
         }
         g.ui.set_pad_active(self.pad.used);
+        let hovered = self.hovered_creature();
+        let voiced = self.line_voiced();
+        let Some(g) = self.gfx.as_mut() else {
+            return Ok(());
+        };
+        g.ui.set_hovered(hovered);
+        g.ui.set_line_voiced(voiced);
+        // Tab held shows every creature's name (never while it is typed into a field).
+        let tab = self.all_names || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
+        g.ui.set_show_all_names(tab);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -1164,6 +1285,28 @@ impl App {
             dt,
         );
         self.requests.append(&mut g.ui.requests);
+        for a in g.ui.take_text_answers() {
+            // OK sends (or saves) the report with the note; the other button keeps it on
+            // this computer only, unsent.
+            if (UPDATE_ASK_ID..UPDATE_ASK_ID + 4).contains(&a.id) {
+                self.update_answers.push(a);
+                continue;
+            }
+            if a.id == report::NOTE_ID && self.recorder.busy() {
+                if let Some(w) = self.report_wait.as_mut() {
+                    w.note_asked = None;
+                    w.send = a.accepted;
+                }
+                self.recorder.note(Some(a.text));
+                continue;
+            }
+            log::info!(
+                "text box {}: {} {:?}",
+                a.id,
+                if a.accepted { "OK" } else { "Cancel" },
+                a.text
+            );
+        }
         // An ability aimed at a place shows where it would land, under the interface.
         if let Some(live) = self.live.as_mut() {
             let mut lines = live.reticle(&self.camera, size, self.cursor);
@@ -1212,7 +1355,8 @@ impl App {
             .map(|(p, ms)| (p.to_path_buf(), ms));
         let live = self.live.as_mut().filter(|_| self.intro.is_none());
         let ui = self.gfx.as_mut().map(|g| &mut g.ui);
-        let state = audio_state(a, live, ui, &self.camera, movie);
+        let mut state = audio_state(a, live, ui, &self.camera, movie);
+        state.gui = self.screens.as_ref().is_some_and(|s| s.world_stopped());
         a.frame(state);
         let voice = a.voice_ms();
         if let Some(g) = self.gfx.as_mut() {
@@ -1244,6 +1388,10 @@ impl App {
             if self.screens.is_some() {
                 loading_screen(live, &mut g.ui, &mut self.load_screen_up);
             }
+            // The party's portraits and the paperdoll are drawn into their own targets, so
+            // they are kept up with no frame to present too (a hidden window's portraits
+            // stayed empty, and a client's offscreen frame showed them so).
+            draw_likenesses(live, &mut g.ui, self.screens.as_ref(), &g.ctx, dt);
         }
         if self.live.is_none() {
             if let Some(r) = g.renderer.as_mut() {
@@ -1251,6 +1399,16 @@ impl App {
             }
         }
         g.ui.set_pad_active(self.pad.used);
+        let hovered = self.hovered_creature();
+        let voiced = self.line_voiced();
+        let Some(g) = self.gfx.as_mut() else {
+            return Ok(());
+        };
+        g.ui.set_hovered(hovered);
+        g.ui.set_line_voiced(voiced);
+        // Tab held shows every creature's name (never while it is typed into a field).
+        let tab = self.all_names || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
+        g.ui.set_show_all_names(tab);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -1259,6 +1417,28 @@ impl App {
             dt,
         );
         self.requests.append(&mut g.ui.requests);
+        for a in g.ui.take_text_answers() {
+            // OK sends (or saves) the report with the note; the other button keeps it on
+            // this computer only, unsent.
+            if (UPDATE_ASK_ID..UPDATE_ASK_ID + 4).contains(&a.id) {
+                self.update_answers.push(a);
+                continue;
+            }
+            if a.id == report::NOTE_ID && self.recorder.busy() {
+                if let Some(w) = self.report_wait.as_mut() {
+                    w.note_asked = None;
+                    w.send = a.accepted;
+                }
+                self.recorder.note(Some(a.text));
+                continue;
+            }
+            log::info!(
+                "text box {}: {} {:?}",
+                a.id,
+                if a.accepted { "OK" } else { "Cancel" },
+                a.text
+            );
+        }
         Ok(())
     }
 
@@ -1303,6 +1483,500 @@ impl App {
         write_png(&path, w, h, &pixels)?;
         println!("wrote {} (camera {})", path.display(), self.camera.spec());
         Ok(())
+    }
+
+    /// An issue report (F8, the pad's two sticks clicked, or a client's `report`): the
+    /// frame as presented, the game now and about a minute back, and what the game knows of
+    /// itself, then the player's note (see [`report`]). The game pauses while the note is
+    /// asked for. `note` answers the question instead (a client's); `reply` hears where the
+    /// report went once it is written.
+    fn report(&mut self, note: Option<String>, reply: Option<std::sync::mpsc::Sender<J>>) {
+        if self.recorder.busy() {
+            if let Some(r) = reply {
+                let _ = r.send(control::failure("a report is already under way"));
+            }
+            return;
+        }
+        let mut info = json!({
+            "build": report::build_info(),
+            "settings": self.started_with,
+            "game": self.status(),
+        });
+        if let Some(g) = self.gfx.as_ref() {
+            let a = g.ctx.adapter.get_info();
+            info["gpu"] = json!({
+                "name": a.name,
+                "backend": format!("{:?}", a.backend),
+                "device_type": format!("{:?}", a.device_type),
+                "driver": a.driver,
+                "driver_info": a.driver_info,
+                "vendor": a.vendor,
+                "device": a.device,
+            });
+            info["window"] = json!({
+                "size": [g.config.width, g.config.height],
+                "scale_factor": g.window.scale_factor(),
+                "format": format!("{:?}", g.config.format),
+            });
+        }
+        let mut now_save = None;
+        let mut trace = None;
+        let mut pause = false;
+        if let Some(live) = self.live.as_mut() {
+            if !live.front_end {
+                let sim = live.sim();
+                info["game"]["training_mode"] = json!(sim.world.training.mode);
+                info["game"]["hero"] = json!(sim.world.hero.map(|h| sim.display_name(h)));
+                info["game"]["area_name"] = json!(sim.world.area.map(|a| sim.display_name(a)));
+                info["game"]["coverage"] = sim.world.trace.coverage();
+                match sim.save_json() {
+                    Ok(b) => now_save = Some(b),
+                    Err(e) => log::warn!("report: the game's state: {e}"),
+                }
+                trace = serde_json::to_value(&sim.world.trace.recent).ok();
+                drop(sim);
+                pause = !live.paused;
+            }
+        }
+        let dir = self.recorder.start(now_save, trace, info);
+        log::info!("report: started in {}", dir.display());
+        // The frame as presented, read back as the next one is drawn; drawn again
+        // offscreen where the surface cannot be read back.
+        let readable = self
+            .gfx
+            .as_ref()
+            .is_some_and(|g| g.config.usage.contains(wgpu::TextureUsages::COPY_SRC));
+        let shot = if readable {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.frame_requests.push((tx, 1));
+            Some(rx)
+        } else {
+            let png = self
+                .screenshot_rgba()
+                .and_then(|f| thedas_ui::stage::encode_png(&f).context("encoding the screenshot"));
+            self.recorder.screenshot(png);
+            None
+        };
+        // The player's note: a client's, else asked in the game's own text box (none
+        // before a game: the report is kept without one).
+        let in_game = self.live.as_ref().is_some_and(|l| !l.front_end)
+            && self.screens.as_ref().is_some_and(|s| !s.front_end);
+        let mut note_asked = None;
+        match (report::preset_note(note), self.gfx.as_mut()) {
+            (Some(text), _) => self.recorder.note(Some(text)),
+            (None, Some(g)) if in_game => {
+                ask_report_note(&mut g.ui, self.pad.used);
+                note_asked = Some((0, 0));
+            }
+            (None, _) => self.recorder.note(Some(String::new())),
+        }
+        self.report_wait = Some(ReportWait {
+            shot,
+            reply,
+            note_asked,
+            send: true,
+            pause,
+            paused_it: false,
+        });
+    }
+
+    /// One frame of reports: a snapshot of the game when one is due, and a report under
+    /// way finished once its screenshot and note are in.
+    fn report_frame(&mut self, dt_ms: f64) {
+        self.recorder.frame(dt_ms);
+        let now = Instant::now();
+        if self.recorder.snapshot_due(now) {
+            self.take_snapshot(now);
+        }
+        let Some(w) = self.report_wait.as_mut() else {
+            return;
+        };
+        if let Some(rx) = &w.shot {
+            match rx.try_recv() {
+                Ok(frame) => {
+                    w.shot = None;
+                    let png = match frame["png"].as_str() {
+                        Some(b64) => {
+                            use base64::Engine as _;
+                            base64::engine::general_purpose::STANDARD
+                                .decode(b64)
+                                .context("decoding the screenshot")
+                        }
+                        None => Err(anyhow::anyhow!(
+                            "{}",
+                            frame["error"].as_str().unwrap_or("no frame")
+                        )),
+                    };
+                    self.recorder.screenshot(png);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    w.shot = None;
+                    self.recorder
+                        .screenshot(Err(anyhow::anyhow!("the frame was never read back")));
+                }
+            }
+        }
+        // The frame is in: the game holds still while the player writes.
+        if w.pause && w.shot.is_none() {
+            w.pause = false;
+            if let Some(live) = self.live.as_mut().filter(|l| !l.paused) {
+                live.paused = true;
+                w.paused_it = true;
+            }
+        }
+        // The text box can be lost (a script's message box shown over it, or no popup
+        // layer up yet): with none up a moment after asking it is asked again, and while
+        // another box keeps it out, or after a few tries, the report is kept without a note
+        // so the game never waits on it.
+        if let (Some((frames, tries)), Some(g)) = (w.note_asked.as_mut(), self.gfx.as_mut()) {
+            let up = g.ui.stage.dialog_up();
+            let ours = up
+                && matches!(
+                    g.ui.stage.bridge.value("GUIPopupLayer.DialogBoxText"),
+                    Some(thedas_ui::UiValue::String(t))
+                        if t == report::NOTE_PROMPT || t == report::NOTE_PROMPT_SEND
+                );
+            *frames += 1;
+            if ours {
+                *frames = 0;
+            } else if *frames > NOTE_REASK_FRAMES {
+                *frames = 0;
+                *tries += 1;
+                if *tries > NOTE_TRIES {
+                    log::warn!("report: the note could not be asked; kept without one");
+                    w.note_asked = None;
+                    self.recorder.note(Some(String::new()));
+                } else if !up {
+                    ask_report_note(&mut g.ui, self.pad.used);
+                }
+            }
+        }
+        let Some(dir) = self.recorder.finish() else {
+            return;
+        };
+        let Some(w) = self.report_wait.take() else {
+            return;
+        };
+        let reply = w.reply;
+        if w.paused_it {
+            if let Some(live) = self.live.as_mut() {
+                live.paused = false;
+            }
+        }
+        // Sent on when the player has set that up (see [`upload`]).
+        if let (true, Some(d), Some(url)) = (w.send, dir.as_ref(), upload::webhook()) {
+            upload::send_in_background(d.clone(), url);
+        }
+        if let Some(r) = reply {
+            let _ = r.send(match dir {
+                Some(d) => json!({ "ok": true, "dir": d.display().to_string() }),
+                None => json!({ "ok": true, "cancelled": true }),
+            });
+        }
+    }
+
+    /// One frame of the way back from a report (see [`update`]): the check's result, the
+    /// question up (asked again when lost, as the report's note), the answers, the fetch.
+    fn returning_frame(&mut self) {
+        let answers = std::mem::take(&mut self.update_answers);
+        for a in answers {
+            self.update_answer(a);
+        }
+        match &mut self.returning {
+            Returning::Idle => {}
+            Returning::Checking(rx) => match rx.try_recv() {
+                Ok(Some(offer)) => {
+                    log::info!(
+                        "update: build {} fixes report {}",
+                        offer.build.commit,
+                        offer.report.message
+                    );
+                    self.returning = Returning::Asking(Box::new(UpdatePrompt {
+                        kind: UpdateAsk::Offer(offer),
+                        asked: None,
+                    }));
+                }
+                Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.returning = Returning::Idle;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            },
+            Returning::Asking(p) => {
+                let in_game = self
+                    .live
+                    .as_ref()
+                    .is_some_and(|l| !l.front_end && !l.loading())
+                    && self.screens.as_ref().is_some_and(|s| !s.front_end);
+                let Some(g) = self.gfx.as_mut() else {
+                    return;
+                };
+                if !in_game || self.recorder.busy() {
+                    return;
+                }
+                let (id, prompt, ok, other) = p.kind.ask();
+                let up = g.ui.stage.dialog_up();
+                match p.asked.as_mut() {
+                    None if !up => {
+                        if matches!(p.kind, UpdateAsk::Verdict(..)) {
+                            g.ui.ask_text(id, &prompt, "", ok, other);
+                        } else {
+                            g.ui.ask_choice(id, &prompt, ok, other);
+                        }
+                        p.asked = Some((0, 0));
+                    }
+                    None => {}
+                    Some((frames, tries)) => {
+                        let ours = up
+                            && matches!(
+                                g.ui.stage.bridge.value("GUIPopupLayer.DialogBoxText"),
+                                Some(thedas_ui::UiValue::String(t)) if t == prompt
+                            );
+                        *frames += 1;
+                        if ours {
+                            *frames = 0;
+                        } else if *frames > NOTE_REASK_FRAMES && !up {
+                            *frames = 0;
+                            *tries += 1;
+                            if *tries > NOTE_TRIES {
+                                // Asked again later, once nothing else is up.
+                                p.asked = None;
+                            } else {
+                                if matches!(p.kind, UpdateAsk::Verdict(..)) {
+                                    g.ui.ask_text(id, &prompt, "", ok, other);
+                                } else {
+                                    g.ui.ask_choice(id, &prompt, ok, other);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Returning::Fetching(rx, save, report) => match rx.try_recv() {
+                Ok(Ok(exe)) => {
+                    let size = self.started_with["size"].as_str().unwrap_or("1280x720");
+                    match update::start_build(&exe, &self.install, save, report, size) {
+                        Ok(()) => {
+                            log::info!("update: started {}; closing this one", exe.display());
+                            self.quit = true;
+                            self.returning = Returning::Idle;
+                        }
+                        Err(e) => self.update_failed(format!("The new build did not start: {e:#}")),
+                    }
+                }
+                Ok(Err(e)) => {
+                    self.update_failed(format!("The new build could not be fetched: {e:#}"))
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.update_failed("The new build could not be fetched.".to_string())
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            },
+        }
+    }
+
+    fn update_failed(&mut self, why: String) {
+        log::warn!("update: {why}");
+        self.returning = Returning::Asking(Box::new(UpdatePrompt {
+            kind: UpdateAsk::Failed(why),
+            asked: None,
+        }));
+    }
+
+    /// The player answered one of the way back's questions.
+    fn update_answer(&mut self, a: ui::TextAnswer) {
+        let Returning::Asking(p) = std::mem::replace(&mut self.returning, Returning::Idle) else {
+            return;
+        };
+        if p.kind.ask().0 != a.id {
+            self.returning = Returning::Asking(p);
+            return;
+        }
+        match p.kind {
+            UpdateAsk::Offer(o) if a.accepted => {
+                self.returning = Returning::Asking(Box::new(UpdatePrompt {
+                    kind: UpdateAsk::Where(o),
+                    asked: None,
+                }));
+            }
+            UpdateAsk::Offer(_) => log::info!("update: later"),
+            UpdateAsk::Where(o) => {
+                // Where I am: the game saved now (a save of the player's, in the list too);
+                // where I reported: the report's earlier save.
+                let save = if a.accepted {
+                    self.save_for_update()
+                } else {
+                    let before = o.report.dir.join("save_before.json");
+                    Ok(if before.is_file() {
+                        before
+                    } else {
+                        o.report.dir.join("save_now.json")
+                    })
+                };
+                match save {
+                    Ok(save) => {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let report = o.report.dir.clone();
+                        let _ = std::thread::Builder::new()
+                            .name("update fetch".into())
+                            .spawn(move || {
+                                let _ = tx.send(update::fetch_build(&o));
+                            });
+                        self.returning = Returning::Fetching(rx, save, report);
+                    }
+                    Err(e) => self.update_failed(format!("The game could not be saved: {e:#}")),
+                }
+            }
+            UpdateAsk::Verdict(dir, _) => {
+                update::send_verdict_in_background(dir, a.accepted, a.text);
+            }
+            UpdateAsk::Failed(_) => {}
+        }
+    }
+
+    /// Saves the game for an update to start from: in a new slot of the player's saves
+    /// (as the save screen does: the module hears PRESAVE first) and as a file the new
+    /// build is started with.
+    fn save_for_update(&mut self) -> Result<PathBuf> {
+        let live = self.live.as_ref().context("no game is running")?;
+        let mut sim = live.sim();
+        if let Some(why) = sim.saving_blocked() {
+            bail!("{why}");
+        }
+        sim.presave();
+        let bytes = sim.save_json()?;
+        let area = sim
+            .world
+            .area
+            .map(|a| sim.display_name(a))
+            .unwrap_or_default();
+        let meta = saves::SaveMeta {
+            name: format!("Before update ({area})"),
+            area,
+            time_ms: sim.world.time_ms,
+            written: saves::now_secs(),
+            hero: sim
+                .world
+                .hero
+                .map(|h| sim.display_name(h))
+                .unwrap_or_default(),
+            level: sim
+                .world
+                .hero
+                .map_or(0, |h| sim.property_total(h, 15) as i32),
+            class: sim
+                .world
+                .hero
+                .map_or(0, |h| sim.property_total(h, 27) as i32),
+            kind: saves::KIND_SLOT,
+        };
+        drop(sim);
+        let store = saves::SaveStore::new(self.saves_dir.clone());
+        if let Err(e) = store.write(store.open_slot(), &bytes, &meta) {
+            log::warn!("update: keeping the save in the list: {e}");
+        }
+        let path = saves::data_dir().join("builds").join("resume.json");
+        std::fs::create_dir_all(path.parent().context("no folder")?)?;
+        std::fs::write(&path, &bytes)?;
+        Ok(path)
+    }
+
+    /// Keeps a snapshot of the game for reports, as a save would hold it: not while a level
+    /// loads, before a game, during character creation or while saving is refused (a
+    /// training lesson). Only reads the simulation (no PRESAVE event).
+    fn take_snapshot(&mut self, now: Instant) {
+        let in_chargen = self
+            .screens
+            .as_ref()
+            .is_some_and(|s| s.shown().contains(&screens::Screen::CharGen));
+        let Some(live) = self.live.as_ref() else {
+            self.recorder.skip_snapshot(now);
+            return;
+        };
+        if live.front_end || live.loading() || in_chargen || self.report_wait.is_some() {
+            self.recorder.skip_snapshot(now);
+            return;
+        }
+        let started = Instant::now();
+        let sim = live.sim();
+        if sim.saving_blocked().is_some() {
+            drop(sim);
+            self.recorder.skip_snapshot(now);
+            return;
+        }
+        let time_ms = sim.world.time_ms;
+        let area = sim
+            .world
+            .area
+            .and_then(|a| sim.world.get(a))
+            .map(|o| o.tag.clone())
+            .unwrap_or_default();
+        let saved = sim.save_json();
+        drop(sim);
+        match saved {
+            Ok(save) => {
+                log::debug!(
+                    "report: snapshot at {time_ms} ms in {area}, {} bytes, {:.1} ms",
+                    save.len(),
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+                self.recorder.keep(report::Snapshot {
+                    taken: now,
+                    time_ms,
+                    area,
+                    save,
+                });
+            }
+            Err(e) => {
+                log::warn!("report: snapshot: {e}");
+                self.recorder.skip_snapshot(now);
+            }
+        }
+    }
+
+    /// Whether the line the game is on has a voice-over the audio can play (see
+    /// `ui::UiLayer::set_line_voiced`); never without sound.
+    fn line_voiced(&self) -> bool {
+        let (Some(a), Some(live)) = (self.audio.as_ref(), self.live.as_ref()) else {
+            return false;
+        };
+        let line = voice_line(&live.sim());
+        line.is_some_and(|l| a.line_voice(&l).is_some())
+    }
+
+    /// The quick save (`save`) or quick load key, while playing with no menu up.
+    fn quick(&mut self, save: bool) -> bool {
+        let (Some(g), Some(live)) = (self.gfx.as_mut(), self.live.as_ref()) else {
+            return false;
+        };
+        if save {
+            g.ui.quick_save(&live.sim)
+        } else {
+            g.ui.quick_load(&live.sim)
+        }
+    }
+
+    /// The creature the mouse is over, for its name over its head: none while the
+    /// interface covers the cursor (a screen, the HUD). The interface's cover is read back
+    /// from the GPU, so it is checked again only when the cursor or the creature changes.
+    fn hovered_creature(&mut self) -> Option<thedas_script::vm::ObjectId> {
+        let (Some(live), Some(g)) = (self.live.as_mut(), self.gfx.as_ref()) else {
+            return None;
+        };
+        let (w, h) = (g.config.width as f32, g.config.height as f32);
+        let (x, y) = self.cursor;
+        let (origin, dir) = self.camera.ray(x as f32, y as f32, w, h);
+        let creature = live.hovered_creature(origin, dir)?;
+        let covered = match self.hover_probe {
+            Some((at, c, covered)) if at == self.cursor && c == creature => covered,
+            _ => {
+                let covered = g.ui.covers(x, y);
+                log::debug!(target: "thedas_app::hover", "{creature:?} at {x},{y}, covered {covered}");
+                self.hover_probe = Some((self.cursor, creature, covered));
+                covered
+            }
+        };
+        (!covered).then_some(creature)
     }
 
     /// A left click at window pixel (`x`, `y`) while playing: the party leader is ordered to
@@ -1368,7 +2042,10 @@ impl App {
 
     /// A key pressed (not a repeat). Returns whether the game should close.
     fn key_down(&mut self, code: KeyCode) -> bool {
+        self.recorder.input(format!("key {code:?}"));
         match code {
+            // An issue report (see [`report`]): ours, not the original's.
+            KeyCode::F8 => self.report(None, None),
             // Escape closes the screen up, else opens the game menu over a game; the viewer
             // closes. The start menu stays (its Exit quits).
             KeyCode::Escape => match self.screens.as_mut() {
@@ -1379,12 +2056,16 @@ impl App {
             },
             // While playing, P opens the spells/talents screen instead.
             KeyCode::KeyP if self.screens.is_none() => println!("camera {}", self.camera.spec()),
-            // F5 the save screen, F9 the load screen. Provisional: the game's own bindings
-            // (quick save and quick load) are not traced.
-            KeyCode::F5 | KeyCode::F9 if self.screens.as_ref().is_some_and(|s| !s.front_end) => {
-                if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_mut()) {
-                    g.ui.open_saves(s, if code == KeyCode::F5 { 1 } else { 2 });
-                }
+            // F5 quick save, F9 quick load: the exe's `QuickSave` and `QuickLoad` actions
+            // (0x51e4d0, 0x51e6f6). Provisional: that they are bound to F5 and F9 is the
+            // original's default as played, not read from keymap.gda here.
+            KeyCode::F5 | KeyCode::F9
+                if self
+                    .screens
+                    .as_ref()
+                    .is_some_and(|s| !s.front_end && s.menu.is_none()) =>
+            {
+                self.quick(code == KeyCode::F5);
             }
             KeyCode::F1 | KeyCode::F2 | KeyCode::F3 | KeyCode::F4 if self.live.is_some() => {
                 let n = match code {
@@ -1454,6 +2135,7 @@ impl App {
     /// The mouse wheel turns `steps` (up positive): over the interface, or with a screen up,
     /// the list or text under the mouse scrolls; elsewhere the game camera zooms.
     fn wheel(&mut self, steps: f64) {
+        self.recorder.input(format!("wheel {steps:.2}"));
         let (x, y) = self.cursor;
         if let Some(g) = self.gfx.as_mut() {
             let on_ui = self
@@ -1484,6 +2166,10 @@ impl App {
     /// The left button goes down or up at the cursor.
     fn left_button(&mut self, pressed: bool) {
         let (x, y) = self.cursor;
+        self.recorder.input(format!(
+            "{} {x:.0},{y:.0}",
+            if pressed { "press" } else { "release" }
+        ));
         // A click skips a cutscene. Provisional: the game's own skip key is not traced.
         if pressed
             && self
@@ -1544,6 +2230,10 @@ impl App {
     /// The right button goes down or up at the cursor.
     fn right_button(&mut self, pressed: bool) {
         let (x, y) = self.cursor;
+        self.recorder.input(format!(
+            "{} {x:.0},{y:.0}",
+            if pressed { "rpress" } else { "rrelease" }
+        ));
         // Over the interface (or with a menu up) a right click is the interface's (an item's
         // actions); elsewhere it turns the camera.
         if pressed {
@@ -1611,8 +2301,20 @@ impl App {
                 log.push("party picker".into());
             }
             &Step::Saves(mode) => {
-                self.key_down(if mode == 1 { KeyCode::F5 } else { KeyCode::F9 });
+                if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_mut()) {
+                    if !s.front_end {
+                        g.ui.open_saves(s, mode);
+                    }
+                }
                 log.push(format!("saves {mode}"));
+            }
+            &Step::Quick(save) => {
+                let done = self.quick(save);
+                log.push(format!(
+                    "quick {}: {}",
+                    if save { "save" } else { "load" },
+                    if done { "done" } else { "not done" }
+                ));
             }
             Step::Type(t) => {
                 let typed = self.gfx.as_mut().is_some_and(|g| g.ui.type_text(t));
@@ -1681,6 +2383,22 @@ impl App {
                     test_floaty(&mut l.sim(), text);
                 }
                 log.push(format!("floaty {text:?}"));
+            }
+            Step::AskText(prompt) => {
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.ask_text(0, prompt, "", "OK", "Cancel");
+                }
+                log.push(format!("asktext {prompt:?}"));
+            }
+            &Step::AllNames(on) => {
+                self.all_names = on;
+                log.push(format!("allnames {on}"));
+            }
+            Step::AskChoice(prompt) => {
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.ask_choice(0, prompt, "Yes", "No");
+                }
+                log.push(format!("askchoice {prompt:?}"));
             }
             Step::Use(tag) => {
                 if let Some(l) = self.live.as_ref() {
@@ -1861,6 +2579,13 @@ impl App {
                     Some(Err(e)) => control::failure(e),
                     None => control::failure("not playing"),
                 }),
+                // An issue report, as F8 makes one; `"note"` is the player's note (none
+                // asks, as F8 does). The reply comes when it is written.
+                "report" => {
+                    let note = r.body["note"].as_str().map(str::to_string);
+                    self.report(note, Some(r.reply.clone()));
+                    None
+                }
                 "input" => match parse_steps(r.body["steps"].as_str().unwrap_or_default()) {
                     Ok(steps) => {
                         self.remote.push_back(Remote {
@@ -2012,8 +2737,13 @@ impl App {
         let mut pad = std::mem::take(&mut self.pad);
         for m in pad.frame(&state, self, dt_ms) {
             log::info!("pad: {m}");
+            self.recorder.input(format!("pad: {m}"));
         }
+        let report = std::mem::take(&mut pad.report);
         self.pad = pad;
+        if report {
+            self.report(None, None);
+        }
     }
 
     /// Acts on what the start menu and the game menu asked (see [`ui::FrontEnd`]): a new game
@@ -2025,6 +2755,11 @@ impl App {
             let start = match &r {
                 ui::FrontEnd::Quit => {
                     self.quit = true;
+                    continue;
+                }
+                // The game menu's Report Issue: an issue report, as F8 makes one.
+                ui::FrontEnd::Report => {
+                    self.report(None, None);
                     continue;
                 }
                 ui::FrontEnd::NewGame => live::Start::NewGame,
@@ -2139,6 +2874,8 @@ impl App {
         self.screens = Some(screens::Screens::new(l.front_end));
         l.async_loads = true;
         self.live = Some(l);
+        // The snapshots were of the game this one replaces.
+        self.recorder.forget();
     }
 
     fn fail(&mut self, event_loop: &ActiveEventLoop, e: anyhow::Error) {
@@ -2395,6 +3132,41 @@ impl ApplicationHandler for App {
 /// the boot movies), its interface (`ui`: the sounds it asked for, the player's volumes),
 /// the camera, and a boot movie playing. A cutscene's or area's sound data is read here
 /// when it starts.
+/// The voice-over the line on screen wants: the conversation's line, else a cutscene's line
+/// that has its own voice. With [`audio::GameAudio::line_voice`] this says whether the line
+/// is voiced (and for how long) as soon as it is chosen, before its voice plays.
+pub(crate) fn voice_line(sim: &thedas_sim::Sim) -> Option<audio::VoiceLine> {
+    let line = sim.conversation_line().and_then(|l| {
+        let female = sim
+            .world
+            .get(l.player)
+            .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
+        Some(audio::VoiceLine {
+            dialog: l.dialog.to_string(),
+            strref: l.strref?,
+            female,
+            ambient: l.ambient,
+        })
+    });
+    if line.is_some() {
+        return line;
+    }
+    let c = sim.world.cutscene.as_ref()?;
+    let l = c.line_now().filter(|l| l.vo_mode == 0)?;
+    let conv = l.conversation.as_ref()?;
+    let female = sim
+        .world
+        .hero
+        .and_then(|h| sim.world.get(h))
+        .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
+    Some(audio::VoiceLine {
+        dialog: conv.clone(),
+        strref: l.strref,
+        female,
+        ambient: false,
+    })
+}
+
 fn audio_state(
     a: &mut audio::GameAudio,
     live: Option<&mut live::Live>,
@@ -2540,19 +3312,8 @@ fn audio_state(
             .hero
             .and_then(|h| sim.world.get(h))
             .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
-        state.line = sim.conversation_line().and_then(|l| {
-            let female = sim
-                .world
-                .get(l.player)
-                .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
-            Some(audio::VoiceLine {
-                dialog: l.dialog.to_string(),
-                strref: l.strref?,
-                female,
-                ambient: l.ambient,
-            })
-        });
-        // A cutscene's sound tracks, and its line's voice when the line has its own.
+        state.line = voice_line(&sim);
+        // A cutscene's sound tracks.
         if let Some(c) = sim.world.cutscene.as_ref() {
             if a.wants_cutscene(&c.name) {
                 let tracks = sim
@@ -2563,23 +3324,6 @@ fn audio_state(
                 a.set_cutscene(&c.name, tracks);
             }
             state.cutscene = Some((c.name.clone(), c.elapsed_ms as f32 / 1000.0));
-            if state.line.is_none()
-                && let Some(l) = c.line_now()
-                && l.vo_mode == 0
-                && let Some(conv) = l.conversation.as_ref()
-            {
-                let female = sim
-                    .world
-                    .hero
-                    .and_then(|h| sim.world.get(h))
-                    .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
-                state.line = Some(audio::VoiceLine {
-                    dialog: conv.clone(),
-                    strref: l.strref,
-                    female,
-                    ambient: false,
-                });
-            }
         }
     }
     // Sounds the simulation asked for (scripts, character creation's voice preview).
@@ -2960,6 +3704,32 @@ fn travel_to_pin(sim: &mut thedas_sim::Sim, tag: &str) -> bool {
     pin.is_some_and(|p| sim.begin_travel(p))
 }
 
+/// Draws the party's portraits and the paperdoll when they are due (see
+/// [`ui::UiLayer::wants_portraits`] and [`ui::UiLayer::wants_paperdoll`]), with the
+/// interface up.
+fn draw_likenesses(
+    live: &mut live::Live,
+    ui: &mut ui::UiLayer,
+    screens: Option<&screens::Screens>,
+    ctx: &GpuContext,
+    dt: f64,
+) {
+    let Some(screens) = screens else {
+        return;
+    };
+    let key = ui::portrait_key(&live.sim());
+    if ui.wants_portraits(key, dt) {
+        let shots = live.portraits(ctx, ui::PORTRAIT_SIZE);
+        ui.set_portraits(shots);
+    }
+    let due = ui.wants_paperdoll(screens, &live.sim(), dt);
+    if let Some((who, yaw)) = due {
+        let (w, h) = ui::PAPERDOLL_SIZE;
+        let shot = live.paperdoll(ctx, who, yaw, w, h);
+        ui.set_paperdoll(shot);
+    }
+}
+
 fn loading_screen(live: &live::Live, ui: &mut ui::UiLayer, up: &mut bool) {
     // Travelling on the world map: the map stays up as that load's screen (GUI 16 in the
     // exe, 0x6c6060; the simulation closes it to input when travel starts), from the pin
@@ -3005,8 +3775,11 @@ enum Step {
     /// The party picker opens as a script's `ShowPartyPickerGUI` opens it (for trying the
     /// picker headless).
     Picker,
-    /// F5 or F9: the save screen (1) or the load screen (2) opens.
+    /// `key f5` or `key f9`: the save screen (1) or the load screen (2) opens (the keys
+    /// themselves quick save and quick load, see `Quick`).
     Saves(i32),
+    /// `quicksave` or `quickload`: what the F5 and F9 keys do.
+    Quick(bool),
     /// Text typed into the focused text field (`type <text>`).
     Type(String),
     /// A key for the focused text field (`key backspace`, `enter`, `delete`, `left`, `right`,
@@ -3069,6 +3842,15 @@ enum Step {
     /// A floating message over the controlled creature, as a script's
     /// `DisplayFloatyMessage` makes one (`floaty 12`), for trying the floaty layer headless.
     Floaty(String),
+    /// The engine's own text box (`asktext Describe the issue`), as
+    /// `ui::UiLayer::ask_text` shows it; its answer is logged.
+    AskText(String),
+    /// The highlight key held or let go (`allnames on`, `allnames off`): every creature near
+    /// shows its name, as while Tab is down.
+    AllNames(bool),
+    /// The engine's own two-button box (`askchoice Is it fixed?`), as
+    /// `ui::UiLayer::ask_choice` shows it (Yes / No); its answer is logged.
+    AskChoice(String),
     /// Sets a plot flag as a script would (`plot plt_tut_explore 0`), running the plot's
     /// script, for trying journal entries and tutorial popups headless.
     Plot(String, i32),
@@ -3274,6 +4056,9 @@ fn parse_step(s: &str) -> Result<Step> {
             Step::SetValue(k.to_string(), v.trim().to_string())
         }
         "floaty" => Step::Floaty(arg.to_string()),
+        "asktext" => Step::AskText(arg.trim().to_string()),
+        "allnames" => Step::AllNames(arg.trim() == "on"),
+        "askchoice" => Step::AskChoice(arg.trim().to_string()),
         "training" => Step::Training(arg.trim().to_ascii_uppercase()),
         "trainingmode" => {
             Step::TrainingMode(arg.trim().parse().context("trainingmode takes a number")?)
@@ -3340,6 +4125,8 @@ fn parse_step(s: &str) -> Result<Step> {
         "key" if text_key(arg).is_some() => {
             Step::TextKey(text_key(arg).unwrap_or(thedas_ui::UiKey::Enter))
         }
+        "quicksave" => Step::Quick(true),
+        "quickload" => Step::Quick(false),
         "key" if arg.eq_ignore_ascii_case("f5") => Step::Saves(1),
         "key" if arg.eq_ignore_ascii_case("f9") => Step::Saves(2),
         "hover" => {
@@ -3367,11 +4154,29 @@ fn parse_step(s: &str) -> Result<Step> {
 const DEFAULT_AREA: &str = "lgt101d";
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(
+    report::init_logging(env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
-    )
-    .init();
+    ));
     let args = Args::parse();
+    // A client's or a test's run sends and fetches nothing (see `upload::online`).
+    if args.control.is_some() || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some() {
+        upload::set_automated();
+    }
+    // A newer build an update fetched takes over from the one the player started.
+    if args.capture.is_none() && args.check_report.is_none() {
+        if let Some(exe) = update::newest_build() {
+            match std::process::Command::new(&exe)
+                .args(std::env::args_os().skip(1))
+                .spawn()
+            {
+                Ok(_) => {
+                    log::info!("update: handing over to {}", exe.display());
+                    return Ok(());
+                }
+                Err(e) => log::warn!("update: {} did not start: {e}", exe.display()),
+            }
+        }
+    }
     if let Some(secs) = args.pad_probe {
         paddev::probe(secs);
         return Ok(());
@@ -3470,6 +4275,9 @@ fn main() -> Result<()> {
             audio::GameAudio::recording(&install, &args.module, &loaded.vfs, &args.language, 48000)
         });
         let mut cursor = (size.0 as f64 / 2.0, size.1 as f64 / 2.0);
+        // The mouse hovers nothing until a `hover` step moves it: it starts at the centre
+        // (for aiming), which is over the hero, whose name would be in every capture.
+        let mut hovering = false;
         // The game controller as `pad` steps hold it, and its part of the game.
         let mut pad_state = pad::PadState::default();
         let mut pad_play = padplay::PadPlay::default();
@@ -3479,6 +4287,9 @@ fn main() -> Result<()> {
             l.movies_wait = true;
             if ui.is_empty() {
                 let mut layer = ui::UiLayer::new(&ctx, &loaded.vfs, &[], size);
+                if let Some(path) = &args.settings {
+                    layer.set_settings_file(path.clone());
+                }
                 layer.attach(&l.sim);
                 layer.set_saves(saves::SaveStore::new(saves_dir.clone()));
                 let mut s = screens::Screens::new(l.front_end);
@@ -3511,6 +4322,7 @@ fn main() -> Result<()> {
                 match step {
                     &Step::Hover(x, y) => {
                         cursor = (x, y);
+                        hovering = true;
                         if let Some((layer, _)) = played.as_mut() {
                             layer.mouse_move(x, y);
                         }
@@ -3663,17 +4475,41 @@ fn main() -> Result<()> {
                                 }
                                 layer.set_paused(l.paused);
                                 layer.set_pad_active(pad_play.used);
+                                let voiced = recording.as_ref().is_some_and(|a| {
+                                    voice_line(&l.sim()).is_some_and(|v| a.line_voice(&v).is_some())
+                                });
+                                layer.set_line_voiced(voiced);
                                 if let Some(aim) = layer.play(s, &l.sim, dt).pop() {
                                     println!("aiming ability {}", aim.ability);
                                     l.aiming = Some(aim);
                                 }
+                                for a in layer.take_text_answers() {
+                                    println!(
+                                        "text box {}: {} {:?}",
+                                        a.id,
+                                        if a.accepted { "OK" } else { "Cancel" },
+                                        a.text
+                                    );
+                                }
                                 layer.update_minimap(&l.sim, &camera);
-                                layer.update_floaties(&l.sim, &camera, dt);
+                                // Headless, the interface's cover of the cursor is not
+                                // checked (its movies are drawn only for the capture).
+                                let (o, d) = camera.ray(
+                                    cursor.0 as f32,
+                                    cursor.1 as f32,
+                                    size.0 as f32,
+                                    size.1 as f32,
+                                );
+                                let over = hovering.then(|| l.hovered_creature(o, d));
+                                layer.set_hovered(over.flatten());
+                                layer.update_floaties(&l.sim, &camera, dt, &|c| l.head_height(c));
                                 ui_time += t.elapsed();
                             }
                             if let Some(a) = recording.as_mut() {
+                                let gui = played.as_ref().is_some_and(|(_, s)| s.world_stopped());
                                 let ui = played.as_mut().map(|(layer, _)| layer);
-                                let state = audio_state(a, Some(&mut *l), ui, &camera, None);
+                                let mut state = audio_state(a, Some(&mut *l), ui, &camera, None);
+                                state.gui = gui;
                                 a.record(state, dt as f32 / 1000.0);
                                 let voice = a.voice_ms();
                                 if let Some((layer, _)) = played.as_mut() {
@@ -3737,6 +4573,20 @@ fn main() -> Result<()> {
                         }
                         println!("{} screen", if mode == 1 { "save" } else { "load" });
                     }
+                    &Step::Quick(save) => {
+                        let done = played.as_mut().is_some_and(|(layer, _)| {
+                            if save {
+                                layer.quick_save(&l.sim)
+                            } else {
+                                layer.quick_load(&l.sim)
+                            }
+                        });
+                        println!(
+                            "quick {}: {}",
+                            if save { "save" } else { "load" },
+                            if done { "done" } else { "not done" }
+                        );
+                    }
                     Step::Wipe => {
                         wipe(&mut l.sim());
                         println!("the party falls");
@@ -3777,6 +4627,24 @@ fn main() -> Result<()> {
                     Step::Floaty(text) => {
                         test_floaty(&mut l.sim(), text);
                         println!("floaty {text:?}");
+                    }
+                    Step::AskText(prompt) => {
+                        if let Some((layer, _)) = played.as_mut() {
+                            layer.ask_text(0, prompt, "", "OK", "Cancel");
+                        }
+                        println!("asktext {prompt:?}");
+                    }
+                    &Step::AllNames(on) => {
+                        if let Some((layer, _)) = played.as_mut() {
+                            layer.set_show_all_names(on);
+                        }
+                        println!("allnames {on}");
+                    }
+                    Step::AskChoice(prompt) => {
+                        if let Some((layer, _)) = played.as_mut() {
+                            layer.ask_choice(0, prompt, "Yes", "No");
+                        }
+                        println!("askchoice {prompt:?}");
                     }
                     Step::Use(tag) => {
                         let mut sim = l.sim();
@@ -3896,7 +4764,7 @@ fn main() -> Result<()> {
                     for r in std::mem::take(&mut layer.requests) {
                         println!("front end: {r:?}");
                         let start = match &r {
-                            ui::FrontEnd::Quit => continue,
+                            ui::FrontEnd::Quit | ui::FrontEnd::Report => continue,
                             ui::FrontEnd::NewGame => live::Start::NewGame,
                             ui::FrontEnd::Load(b) => live::Start::SaveBytes(b),
                             ui::FrontEnd::StartMenu => live::Start::Menu,
@@ -4066,7 +4934,13 @@ fn main() -> Result<()> {
         screens,
         ui,
         saves_dir: saves_dir.clone(),
+        settings: args
+            .settings
+            .clone()
+            .or_else(|| args.control.is_none().then(saves::default_settings)),
         cursor: (0.0, 0.0),
+        hover_probe: None,
+        all_names: false,
         camera,
         size,
         gfx: None,
@@ -4096,6 +4970,33 @@ fn main() -> Result<()> {
             .flatten(),
         intro_pad_held: false,
         zoom_key: 0.0,
+        recorder: report::Recorder::new(report::Recorder::default_dir()),
+        report_wait: None,
+        returning: match &args.check_report {
+            Some(dir) => Returning::Asking(Box::new(UpdatePrompt {
+                kind: UpdateAsk::Verdict(dir.clone(), update::verdict_prompt(dir)),
+                asked: None,
+            })),
+            None => update::check_in_background(report::Recorder::default_dir())
+                .map_or(Returning::Idle, Returning::Checking),
+        },
+        update_answers: Vec::new(),
+        started_with: json!({
+            "size": args.size,
+            "shaders": args.shaders,
+            "detail": args.detail,
+            "frame_effects": args.frame_effects,
+            "language": args.language,
+            "module": args.module,
+            "install": report::install_info(&install, &args.language),
+            "no_intro": args.no_intro,
+            "audio": !(args.no_audio || std::env::var_os("THEDAS_NO_AUDIO").is_some()),
+            "control": args.control.is_some(),
+            "env": (["THEDAS_ASYNC_LOADS", "THEDAS_HIDDEN_WINDOW", "THEDAS_NO_LOAD_MOVIE"]
+                .iter()
+                .filter(|v| std::env::var_os(v).is_some())
+                .collect::<Vec<_>>()),
+        }),
         audio: {
             let off = args.no_audio
                 || std::env::var_os("THEDAS_NO_AUDIO").is_some()

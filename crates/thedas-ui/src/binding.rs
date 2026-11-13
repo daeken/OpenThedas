@@ -171,6 +171,9 @@ pub struct SaveListing {
     pub hero: String,
     pub level: i32,
     pub class: i32,
+    /// The kind of save (`SaveType`): DAOrigins.exe's save folders by kind (0x642c70) are
+    /// `Slot_` 0, `AutoSave_` 1, `QuickSave_` 2 and `PostCampaign_` 3.
+    pub kind: i32,
 }
 
 /// The inventory screen's item category tabs (inventory.gfx's `CATEGORY_*`).
@@ -1649,7 +1652,7 @@ fn saves(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
         v.insert(format!("{k}.Name"), UiValue::String(s.name.clone()));
         v.insert(format!("{k}.Slot"), num(s.slot));
         v.insert(format!("{k}.Area"), UiValue::String(s.area.clone()));
-        v.insert(format!("{k}.SaveType"), num(0));
+        v.insert(format!("{k}.SaveType"), num(s.kind));
         v.insert(
             format!("{k}.TimePlayed"),
             UiValue::String(played(s.time_played_s)),

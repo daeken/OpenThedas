@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::path::{join_ci, resolve_ci};
 use crate::vfs::{Vfs, collect_files, is_archive};
 use crate::{Error, Result};
 
@@ -32,8 +33,28 @@ pub struct AddIn {
     pub uid: String,
     pub priority: i64,
     pub enabled: bool,
+    /// The manifest's `ExtendedModuleUID`: the campaign this add-in adds to (`Single Player`
+    /// for the base game's own DLC, `DAO_PRC_EP_1` for Awakening's), or empty or absent for
+    /// an add-in that is a campaign of its own.
+    pub extends: Option<String>,
     pub dir: PathBuf,
 }
+
+impl AddIn {
+    /// Whether the add-in's `module` folder belongs to the base campaign. Provisional: the
+    /// rule is read off the shipped manifests (the stand-alone campaigns leave
+    /// `ExtendedModuleUID` empty, and their `module` folders reuse base names such as
+    /// `default_player.utc`), not traced in the original executable. An add-in with no such
+    /// attribute counts as not extending it.
+    pub fn extends_base_campaign(&self) -> bool {
+        self.extends
+            .as_deref()
+            .is_some_and(|m| m.trim().eq_ignore_ascii_case(BASE_CAMPAIGN_UID))
+    }
+}
+
+/// The base campaign's module UID, as add-in manifests name it.
+const BASE_CAMPAIGN_UID: &str = "Single Player";
 
 #[derive(Clone, Debug)]
 pub struct DaoInstall {
@@ -44,7 +65,7 @@ impl DaoInstall {
     /// Opens an install root: the directory holding `packages/` and `modules/`.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        if !root.join("packages").join("core").is_dir() {
+        if !join_ci(&root, "packages/core").is_dir() {
             return Err(Error::Malformed {
                 path: root,
                 reason: "not a Dragon Age: Origins install (no packages/core)".into(),
@@ -82,7 +103,7 @@ impl DaoInstall {
 
     /// DLC packages, ordered by manifest priority (lowest first), then UID.
     pub fn addins(&self) -> Result<Vec<AddIn>> {
-        let dir = self.root.join("Addins");
+        let dir = join_ci(&self.root, "Addins");
         let mut out = Vec::new();
         if !dir.is_dir() {
             return Ok(out);
@@ -96,10 +117,7 @@ impl DaoInstall {
             if !path.is_dir() {
                 continue;
             }
-            let manifest = ["Manifest.xml", "manifest.xml"]
-                .iter()
-                .map(|m| path.join(m))
-                .find(|p| p.is_file());
+            let manifest = resolve_ci(&path, "manifest.xml").filter(|p| p.is_file());
             let Some(manifest) = manifest else { continue };
             let text = std::fs::read(&manifest).map_err(|e| Error::Io {
                 path: manifest.clone(),
@@ -112,10 +130,12 @@ impl DaoInstall {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(0);
             let enabled = xml_attr(&text, "AddInItem", "Enabled").as_deref() != Some("0");
+            let extends = xml_attr(&text, "AddInItem", "ExtendedModuleUID");
             out.push(AddIn {
                 uid,
                 priority,
                 enabled,
+                extends,
                 dir: path,
             });
         }
@@ -124,14 +144,23 @@ impl DaoInstall {
     }
 
     /// The global resource stack: core package, single-player campaign, then enabled DLC.
+    /// Every enabled add-in's `core` folder is mounted; its `module` folder only when the
+    /// add-in extends the base campaign ([`AddIn::extends_base_campaign`], provisional), so a
+    /// stand-alone DLC campaign's own resources cannot replace the base game's.
     /// Area (`env`) and module archives are loaded per area at runtime, so they are not here.
     pub fn global_vfs(&self, quality: TextureQuality) -> Result<Vfs> {
         let mut vfs = Vfs::new();
-        self.push_package(&mut vfs, &self.root.join("packages/core"), quality)?;
-        self.push_package(&mut vfs, &self.root.join("modules/single player"), quality)?;
+        self.push_package(&mut vfs, &join_ci(&self.root, "packages/core"), quality)?;
+        self.push_package(
+            &mut vfs,
+            &join_ci(&self.root, "modules/single player"),
+            quality,
+        )?;
         for addin in self.addins()?.into_iter().filter(|a| a.enabled) {
-            self.push_package(&mut vfs, &addin.dir.join("core"), quality)?;
-            self.push_package(&mut vfs, &addin.dir.join("module"), quality)?;
+            self.push_package(&mut vfs, &join_ci(&addin.dir, "core"), quality)?;
+            if addin.extends_base_campaign() {
+                self.push_package(&mut vfs, &join_ci(&addin.dir, "module"), quality)?;
+            }
         }
         Ok(vfs)
     }
@@ -152,7 +181,7 @@ impl DaoInstall {
             ("audio", true),
             ("patch", false),
         ] {
-            let d = dir.join(sub);
+            let d = join_ci(dir, sub);
             if d.is_dir() {
                 vfs.push_directory(&d, recursive, label(&d))?;
             }
@@ -163,12 +192,12 @@ impl DaoInstall {
             &format!("textures/{}", quality.dir()),
             "patch",
         ] {
-            for archive in archives_in(&dir.join(sub))? {
+            for archive in archives_in(&join_ci(dir, sub))? {
                 let l = label(&archive);
                 vfs.push_archive(&archive, l)?;
             }
         }
-        let over = dir.join("override");
+        let over = join_ci(dir, "override");
         if over.is_dir() {
             vfs.push_directory(&over, true, label(&over))?;
         }
@@ -200,12 +229,12 @@ impl DaoInstall {
     /// The `env` directories that can hold levels, in search order: the core package, then
     /// enabled DLC packages by priority (highest first). Provisional, like the global order.
     pub fn env_dirs(&self) -> Result<Vec<PathBuf>> {
-        let mut dirs = vec![self.root.join("packages/core/env")];
+        let mut dirs = vec![join_ci(&self.root, "packages/core/env")];
         let mut addins: Vec<AddIn> = self.addins()?.into_iter().filter(|a| a.enabled).collect();
         addins.reverse();
         for a in addins {
-            dirs.push(a.dir.join("core/env"));
-            dirs.push(a.dir.join("module/env"));
+            dirs.push(join_ci(&a.dir, "core/env"));
+            dirs.push(join_ci(&a.dir, "module/env"));
         }
         Ok(dirs)
     }
@@ -222,20 +251,26 @@ impl DaoInstall {
         {
             return Err(Error::NotFound(format!("level {level:?}")));
         }
+        // Data names levels in any case (a City Elf area's layout is `Den201d`, the folder
+        // `den201d`), as Windows matched them; so the files and folder are matched likewise.
+        let file = |dir: &Path, ext: &str| {
+            resolve_ci(dir, &format!("{level}.{ext}")).filter(|p| p.is_file())
+        };
+        let level_dir = |dir: &Path| resolve_ci(dir, level).filter(|p| p.is_dir());
         let env_dir = self
             .env_dirs()?
             .into_iter()
-            .find(|d| d.join(format!("{level}.arl")).is_file() || d.join(level).is_dir())
+            .find(|d| file(d, "arl").is_some() || level_dir(d).is_some())
             .ok_or_else(|| Error::NotFound(format!("level {level}")))?;
         let mark = vfs.mark();
         let files: Vec<PathBuf> = ["arl", "opf"]
             .iter()
-            .map(|ext| env_dir.join(format!("{level}.{ext}")))
-            .filter(|p| p.is_file())
+            .filter_map(|ext| file(&env_dir, ext))
             .collect();
+        let dir = level_dir(&env_dir).unwrap_or_else(|| env_dir.join(level));
         let label = |p: &Path| self.relative(p).into_owned();
-        vfs.push_files(&files, label(&env_dir.join(level)));
-        let mut archives = archives_in(&env_dir.join(level))?;
+        vfs.push_files(&files, label(&dir));
+        let mut archives = archives_in(&dir)?;
         // Plain rims first, then GPU rims; each group sorted by name.
         archives.sort_by_key(|p| {
             let name = p
@@ -358,6 +393,142 @@ mod tests {
         assert!(install.mount_level(&mut vfs, "missing").is_err());
         assert!(install.mount_level(&mut vfs, "../data").is_err());
         assert_eq!(vfs.layers().len(), before);
+    }
+
+    /// Folder and file names in another case than the data uses, as the Windows original
+    /// accepts. Passes on case-sensitive and case-insensitive volumes alike (run the tests with
+    /// `TMPDIR` on a case-sensitive volume to exercise the listing path).
+    #[test]
+    fn finds_folders_levels_and_manifests_in_any_case() {
+        let root = std::env::temp_dir().join(format!("thedas-install-ci-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let env = root.join("Packages/Core/ENV");
+        std::fs::create_dir_all(env.join("den201d")).unwrap();
+        std::fs::create_dir_all(root.join("Packages/Core/Data")).unwrap();
+        std::fs::write(
+            root.join("Packages/Core/Data/global.erf"),
+            erf_v20(&[("shared.dds", b"global")]),
+        )
+        .unwrap();
+        std::fs::write(env.join("den201d.ARL"), b"arl").unwrap();
+        std::fs::write(env.join("Den201D.opf"), b"opf").unwrap();
+        std::fs::write(
+            env.join("den201d/den201d.rim"),
+            erf_v20(&[("den201d_0.rml", b"rml")]),
+        )
+        .unwrap();
+        let addin = root.join("ADDINS/Some_DLC");
+        std::fs::create_dir_all(addin.join("Core/Env")).unwrap();
+        std::fs::write(
+            addin.join("MANIFEST.XML"),
+            br#"<AddInItem UID="some_dlc" Priority="5" Enabled="1">"#,
+        )
+        .unwrap();
+
+        let install = DaoInstall::open(&root).unwrap();
+        let addins = install.addins().unwrap();
+        assert_eq!(addins.len(), 1);
+        assert_eq!(
+            (addins[0].uid.as_str(), addins[0].priority),
+            ("some_dlc", 5)
+        );
+        // Core's env, then the DLC's core/env (found) and module/env (absent).
+        let dirs = install.env_dirs().unwrap();
+        assert_eq!(dirs.len(), 3);
+        assert!(dirs[0].is_dir() && dirs[1].is_dir() && !dirs[2].exists());
+
+        let mut vfs = install.global_vfs(TextureQuality::High).unwrap();
+        assert_eq!(vfs.read("shared.dds").unwrap().0, b"global");
+        let mount = install.mount_level(&mut vfs, "Den201d").unwrap();
+        assert_eq!(mount.files.len(), 2);
+        assert_eq!(mount.archives.len(), 1);
+        assert_eq!(vfs.read("den201d.arl").unwrap().0, b"arl");
+        assert_eq!(vfs.read("den201d.opf").unwrap().0, b"opf");
+        assert_eq!(vfs.read("den201d_0.rml").unwrap().0, b"rml");
+        mount.unmount(&mut vfs);
+        assert!(install.mount_level(&mut vfs, "DEN201D").is_ok());
+        assert!(install.mount_level(&mut vfs, "den201").is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A stand-alone DLC campaign's `module` folder must not replace base resources; an
+    /// add-in that extends the base campaign does, and every add-in's `core` folder is mounted.
+    #[test]
+    fn only_base_campaign_addins_mount_their_module_folder() {
+        let root = std::env::temp_dir().join(format!("thedas-addins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, bytes: &[u8]| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        };
+        let manifest = |uid: &str, extends: Option<&str>, priority: u32| {
+            let extends = extends.map_or(String::new(), |m| format!(r#" ExtendedModuleUID="{m}""#));
+            format!(
+                r#"<Manifest Type="AddIn"><AddInsList><AddInItem UID="{uid}"{extends} Priority="{priority}" Enabled="1">"#
+            )
+        };
+        write(
+            "packages/core/data/base.erf",
+            &erf_v20(&[("hero.utc", b"base"), ("sword.uti", b"base")]),
+        );
+        // Its own campaign, at the highest priority: `module` stays out, `core` is mounted.
+        write(
+            "Addins/own/Manifest.xml",
+            manifest("OWN", Some(""), 900).as_bytes(),
+        );
+        write(
+            "Addins/own/module/data/own.erf",
+            &erf_v20(&[("hero.utc", b"own campaign"), ("own_only.utc", b"x")]),
+        );
+        write(
+            "Addins/own/core/data/own_core.erf",
+            &erf_v20(&[("own_core.uti", b"own core")]),
+        );
+        // Another campaign's add-in, and one whose manifest names none.
+        write(
+            "Addins/ep/Manifest.xml",
+            manifest("EP", Some("DAO_PRC_EP_1"), 800).as_bytes(),
+        );
+        write(
+            "Addins/ep/module/data/ep.erf",
+            &erf_v20(&[("hero.utc", b"expansion")]),
+        );
+        write(
+            "Addins/bare/Manifest.xml",
+            manifest("BARE", None, 700).as_bytes(),
+        );
+        write(
+            "Addins/bare/module/data/bare.erf",
+            &erf_v20(&[("hero.utc", b"bare")]),
+        );
+        // The base campaign's own add-in, in another case: its `module` folder is mounted.
+        write(
+            "Addins/sp/Manifest.xml",
+            manifest("SP", Some("single player"), 10).as_bytes(),
+        );
+        write(
+            "Addins/sp/module/data/sp.erf",
+            &erf_v20(&[("sword.uti", b"dlc sword"), ("sp_only.utc", b"y")]),
+        );
+
+        let install = DaoInstall::open(&root).unwrap();
+        let addins = install.addins().unwrap();
+        let extends: Vec<(&str, bool)> = addins
+            .iter()
+            .map(|a| (a.uid.as_str(), a.extends_base_campaign()))
+            .collect();
+        assert_eq!(
+            extends,
+            [("SP", true), ("BARE", false), ("EP", false), ("OWN", false)]
+        );
+        let vfs = install.global_vfs(TextureQuality::High).unwrap();
+        assert_eq!(vfs.read("hero.utc").unwrap().0, b"base");
+        assert!(vfs.lookup("own_only.utc").is_none());
+        assert_eq!(vfs.read("own_core.uti").unwrap().0, b"own core");
+        assert_eq!(vfs.read("sword.uti").unwrap().0, b"dlc sword");
+        assert!(vfs.lookup("sp_only.utc").is_some());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

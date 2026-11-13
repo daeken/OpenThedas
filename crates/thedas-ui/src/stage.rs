@@ -142,6 +142,26 @@ pub fn blend_premultiplied(base: &mut Rgba, src: &Rgba) {
     }
 }
 
+/// Multiplies `src` (premultiplied) onto `base`, as Flash's `multiply` blend draws over an
+/// opaque picture: each channel becomes base x (src + 1 - src alpha), so a clear pixel
+/// leaves the base as it was and an opaque one multiplies it by its colour.
+pub fn blend_multiply(base: &mut Rgba, src: &Rgba) {
+    if (base.width, base.height) != (src.width, src.height) {
+        return;
+    }
+    for (b, s) in base
+        .pixels
+        .chunks_exact_mut(4)
+        .zip(src.pixels.chunks_exact(4))
+    {
+        let inv = 255 - u32::from(s[3]);
+        for c in 0..3 {
+            let f = (u32::from(s[c]) + inv).min(255);
+            b[c] = ((u32::from(b[c]) * f + 127) / 255) as u8;
+        }
+    }
+}
+
 /// The path of the movie's focused text field when it is an input field
 /// (`Selection.getFocus`, then the field's `type`).
 fn focused_input_field(m: &mut UiMovie) -> Option<String> {
@@ -157,10 +177,10 @@ fn focused_input_field(m: &mut UiMovie) -> Option<String> {
 /// button's press (popuplayer.gfx's push buttons: the first click on Save only moved the
 /// focus, the second saved). Provisional: Scaleform's focus handling is not traced; this keeps
 /// one click enough.
-fn release_text_focus(m: &mut UiMovie) {
-    if focused_input_field(m).is_some() {
-        m.call("_global.Selection.setFocus", &[UiValue::Null]);
-    }
+fn release_text_focus(m: &mut UiMovie) -> Option<String> {
+    let path = focused_input_field(m)?;
+    m.call("_global.Selection.setFocus", &[UiValue::Null]);
+    Some(path)
 }
 
 /// The movie that shows the game's dialog boxes (`PopupLayer.ShowDialogBoxFromGame`).
@@ -222,8 +242,9 @@ fn add_book_backdrop(m: &mut UiMovie) {
 }
 /// The quickbar's movie.
 const QUICKBAR: &str = "quickbar.gfx";
-/// The frames quickbar.gfx takes to lay itself out before its width is put back.
-const QUICKBAR_SETTLE_FRAMES: u32 = 3;
+/// How long (the movie's time) quickbar.gfx is given to lay itself out, its width put back
+/// whenever it changes it.
+const QUICKBAR_SETTLE_MS: f64 = 500.0;
 
 /// The engine value holding how far the quickbar is dragged open (see [`Stage::new`]).
 pub const QUICKBAR_EXPAND_VALUE: &str = "Party.QuickbarExpandValue";
@@ -241,9 +262,12 @@ pub struct Stage {
     /// level-up mark, shown for its first frames) took that for a roll-over and left its
     /// tooltip up. Far off the stage until the mouse first moves.
     mouse: (f64, f64),
-    /// The quickbar's width as the engine held it when quickbar.gfx opened, put back after
-    /// the movie's first frame (see [`QUICKBAR_EXPAND_VALUE`]).
-    quickbar_width: Option<(UiValue, u32)>,
+    /// The dialog box's text field a press let go of (see `release_text_focus`), given
+    /// back when the click leaves the box up with nothing focused.
+    dialog_focus: Option<String>,
+    /// The quickbar's width as the engine held it when quickbar.gfx opened, put back while
+    /// the movie settles (see [`QUICKBAR_EXPAND_VALUE`]).
+    quickbar_width: Option<(UiValue, f64)>,
     /// Recent ActionScript traces and warnings, newest last (at most 500).
     pub log: Vec<String>,
     pub bridge: GameBridge,
@@ -287,6 +311,7 @@ impl Stage {
         Self {
             movies: Vec::new(),
             mouse: OFF_STAGE,
+            dialog_focus: None,
             quickbar_width: None,
             log: Vec::new(),
             bridge: {
@@ -359,7 +384,7 @@ impl Stage {
             self.quickbar_width = self
                 .bridge
                 .value(QUICKBAR_EXPAND_VALUE)
-                .map(|v| (v, QUICKBAR_SETTLE_FRAMES));
+                .map(|v| (v, QUICKBAR_SETTLE_MS));
         }
         let (swf, rep) = {
             let mut images = self
@@ -478,20 +503,25 @@ impl Stage {
             // quickbar.gfx's first frame places its expansion handle before the handle's
             // own init (Ruffle runs the clips' init in another order than Scaleform): the
             // handle sits at its authored place, the bar's full width, and the movie writes
-            // that back as the player's choice. The engine's value is put back and laid out
-            // again once that frame is done. Provisional: inferred from the movie's code
+            // that back as the player's choice. While the movie settles, the engine's value
+            // is put back and the bar laid out again whenever the movie has changed it. The
+            // window is the movie's own time: a tick does not always play a frame (a short
+            // one plays none), so counting ticks could end before that first frame, and the
+            // bar then stayed at its full width with six slots never filled in ("00" over
+            // "??"). Provisional: inferred from the movie's code
             // (`UpdateExpansionMaskPosition` before `ExpansionHandle_mc_init`).
             if m.name == QUICKBAR {
-                match self.quickbar_width.take() {
-                    Some((width, 0)) => {
+                if let Some((width, left)) = self.quickbar_width.take() {
+                    if self.bridge.value(QUICKBAR_EXPAND_VALUE).as_ref() != Some(&width) {
                         self.bridge.set_value(QUICKBAR_EXPAND_VALUE, width.clone());
                         m.call(
                             "_level0.QuickbarAndEffectBar_mc.Quickbar_mc.ExpandQuickbarFromGameData",
-                            &[width],
+                            std::slice::from_ref(&width),
                         );
                     }
-                    Some((width, n)) => self.quickbar_width = Some((width, n - 1)),
-                    None => {}
+                    if left > dt_ms {
+                        self.quickbar_width = Some((width, left - dt_ms));
+                    }
                 }
             }
             let messages: Vec<GameMessage> = m
@@ -587,11 +617,89 @@ impl Stage {
     }
 
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
+        let mut released = None;
         for m in self.input_movies() {
             if down {
-                release_text_focus(m);
+                released = released.or(release_text_focus(m));
             }
             m.mouse_button(x, y, down);
+        }
+        self.after_click(released, !down);
+    }
+
+    /// A dialog box with a text field (a script's name prompt, the engine's own text box)
+    /// gives the field the keyboard focus when nothing has it, so typing reaches it at once.
+    /// Returns whether a field has the focus. Provisional: when Scaleform focused the field
+    /// is not traced; popuplayer.gfx sometimes focuses it itself.
+    pub fn focus_dialog_field(&mut self) -> bool {
+        if !self.dialog_up() {
+            return false;
+        }
+        let Some(m) = self.movies.iter_mut().find(|m| m.name == POPUP_LAYER) else {
+            return false;
+        };
+        if focused_input_field(m).is_some() {
+            return true;
+        }
+        let UiValue::String(tree) = m.call("_global.thedas_tree_list", &[]) else {
+            return false;
+        };
+        let field = tree
+            .split(';')
+            .filter_map(|e| e.split('|').next())
+            .filter(|p| p.ends_with(".TextInput_mc"))
+            .map(|p| format!("{p}.TextField"))
+            .find(|f| {
+                m.call(&format!("{f}.type.toString"), &[]) == UiValue::String("input".into())
+            });
+        match field {
+            Some(f) => {
+                m.call("_global.Selection.setFocus", &[UiValue::String(f)]);
+                focused_input_field(m).is_some()
+            }
+            None => false,
+        }
+    }
+
+    /// A dialog box's text field keeps the focus through a click that leaves the box up
+    /// and gives it to nothing else (a click beside the field, on the box or off it): the
+    /// field a press let go of (`released`) is focused again once the click is done
+    /// (`done`), so typing goes on reaching it. Provisional: Scaleform's focus handling is
+    /// not traced; a modal box with a text field keeps it here.
+    fn after_click(&mut self, released: Option<String>, done: bool) {
+        if self.dialog_up() {
+            if let Some(p) = released {
+                self.dialog_focus = Some(p);
+            }
+        } else {
+            self.dialog_focus = None;
+        }
+        if !done {
+            return;
+        }
+        let Some(path) = self.dialog_focus.take() else {
+            return;
+        };
+        if !self.dialog_up() {
+            return;
+        }
+        if let Some(m) = self.movies.iter_mut().find(|m| m.name == POPUP_LAYER) {
+            if focused_input_field(m).is_none() {
+                // Focusing selects the whole text, which the next key would replace: the
+                // caret goes back to its end.
+                m.call(
+                    "_global.Selection.setFocus",
+                    &[UiValue::String(path.clone())],
+                );
+                let len = match m.call(&format!("{path}.length.toString"), &[]) {
+                    UiValue::String(n) => n.parse::<f64>().unwrap_or(0.0),
+                    _ => 0.0,
+                };
+                m.call(
+                    "_global.Selection.setSelection",
+                    &[UiValue::Number(len), UiValue::Number(len)],
+                );
+            }
         }
     }
 
@@ -636,14 +744,16 @@ impl Stage {
     /// for a double click), delivered as an ordinary click with the button set aside (see
     /// [`crate::avm1::BUTTON_VAR`]).
     pub fn click_as(&mut self, button: f64, x: f64, y: f64) {
+        let mut released = None;
         for m in self.input_movies() {
             m.set(crate::avm1::BUTTON_VAR, UiValue::Number(button));
             m.mouse_move(x, y);
-            release_text_focus(m);
+            released = released.or(release_text_focus(m));
             m.mouse_button(x, y, true);
             m.mouse_button(x, y, false);
             m.set(crate::avm1::BUTTON_VAR, UiValue::Undefined);
         }
+        self.after_click(released, true);
     }
 
     /// A press (`down`) or release at (`x`, `y`) that the movies see as Scaleform `button`
@@ -651,15 +761,17 @@ impl Stage {
     /// aside (see [`crate::avm1::BUTTON_VAR`]): a right press opens an item's radial menu,
     /// and its release picks the action under the mouse.
     pub fn button_as(&mut self, button: f64, x: f64, y: f64, down: bool) {
+        let mut released = None;
         for m in self.input_movies() {
             m.set(crate::avm1::BUTTON_VAR, UiValue::Number(button));
             m.mouse_move(x, y);
             if down {
-                release_text_focus(m);
+                released = released.or(release_text_focus(m));
             }
             m.mouse_button(x, y, down);
             m.set(crate::avm1::BUTTON_VAR, UiValue::Undefined);
         }
+        self.after_click(released, !down);
     }
 
     /// Loads that failed, by movie.
@@ -677,6 +789,13 @@ impl Stage {
 
     /// Renders every movie and blends the frames over `base` (straight RGBA) on the CPU.
     pub fn capture_over(&mut self, base: &mut Rgba) -> Result<(), UiError> {
+        // The movies' multiplied clips first, onto the picture under the whole interface
+        // (see `UiMovie::render_multiply`).
+        for m in &mut self.movies {
+            if let Some(pass) = m.capture_multiply() {
+                blend_multiply(base, &pass);
+            }
+        }
         for m in &mut self.movies {
             m.render();
             let frame = m
@@ -696,6 +815,25 @@ fn is_hide_request(m: &GameMessage) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiply_darkens_by_the_colour_and_leaves_clear_pixels_alone() {
+        let mut base = Rgba {
+            width: 3,
+            height: 1,
+            pixels: vec![200, 100, 50, 255, 200, 100, 50, 255, 200, 100, 50, 255],
+        };
+        // Opaque half grey; clear; half-covered black (premultiplied).
+        let src = Rgba {
+            width: 3,
+            height: 1,
+            pixels: vec![128, 128, 128, 255, 0, 0, 0, 0, 0, 0, 0, 128],
+        };
+        blend_multiply(&mut base, &src);
+        assert_eq!(&base.pixels[0..4], &[100, 50, 25, 255]);
+        assert_eq!(&base.pixels[4..8], &[200, 100, 50, 255]);
+        assert_eq!(&base.pixels[8..12], &[100, 50, 25, 255]);
+    }
 
     #[test]
     fn names_movies() {

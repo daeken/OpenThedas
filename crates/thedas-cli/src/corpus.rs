@@ -81,12 +81,7 @@ fn gather(paths: &[PathBuf]) -> Result<(Vec<Item>, Option<PathBuf>)> {
             walk(p, &mut files)?;
             files.sort();
             for f in files {
-                let ext = f
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(str::to_ascii_lowercase)
-                    .unwrap_or_default();
-                if ext == "erf" || ext == "rim" {
+                if thedas_vfs::vfs::is_archive_path(&f) {
                     items.push(Item::Archive(f));
                 } else {
                     items.push(Item::Loose(f));
@@ -241,7 +236,7 @@ fn check_archive(path: &Path, label: &str, stats: &mut Stats, keep: usize) {
         let es = stats.by_ext.entry(ext.clone()).or_default();
         es.entries += 1;
         es.bytes += entry.size as u64;
-        if erf.is_encrypted() {
+        if erf.is_encrypted() && erf.installed_key().is_none() {
             es.encrypted += 1;
             continue;
         }
@@ -321,7 +316,7 @@ fn check_loose(path: &Path, label: &str, stats: &mut Stats, keep: usize) {
             stats.fail(
                 "unexpected-archive",
                 label.to_string(),
-                "ERF magic in a file without .erf/.rim extension".into(),
+                "ERF magic in a file without an archive extension".into(),
                 keep,
             );
         }
