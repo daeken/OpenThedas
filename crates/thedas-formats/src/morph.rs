@@ -52,7 +52,9 @@ pub mod slot {
 /// One node's data: a face bone's offset, or a face mesh's vertices and material overrides.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MorphNode {
-    /// The bone or mesh node's name (`cheek_left`, `FaceM1`).
+    /// The bone or mesh node's name (`cheek_left`, `FaceM1`). Dragon Age II stores only
+    /// the name's hash: the node is then named by [`crate::hashed_name`] (`#688706f5`), and
+    /// [`MorphNode::is`] matches it.
     pub name: String,
     pub offset: [f32; 3],
     /// Morphed vertex positions in model space, one per vertex of the mesh's chunk; empty
@@ -76,6 +78,14 @@ pub struct Morph {
 
 /// Vertices are kept to this many, far above any head mesh in the game.
 const MAX_VERTICES: usize = 1 << 20;
+
+impl MorphNode {
+    /// Whether this is the node named `name`, ignoring case, whether its name was stored or
+    /// only its hash (Dragon Age II).
+    pub fn is(&self, name: &str) -> bool {
+        crate::name_matches(&self.name, name)
+    }
+}
 
 impl Morph {
     pub fn parse(data: &[u8]) -> TypedResult<Self> {
@@ -103,11 +113,9 @@ impl Morph {
         self.models.get(slot)?.as_deref()
     }
 
-    /// The node with this name, ignoring case.
+    /// The node with this name, ignoring case (see [`MorphNode::is`]).
     pub fn node(&self, name: &str) -> Option<&MorphNode> {
-        self.nodes
-            .iter()
-            .find(|n| n.name.eq_ignore_ascii_case(name))
+        self.nodes.iter().find(|n| n.is(name))
     }
 }
 
@@ -738,7 +746,7 @@ fn read_node(d: &Doc, n: StructId) -> TypedResult<MorphNode> {
         }
     }
     Ok(MorphNode {
-        name: d.opt_str(n, field::NAME)?.unwrap_or_default(),
+        name: d.opt_name_or_hash(n, field::NAME)?.unwrap_or_default(),
         offset: d.opt_vec3(n, field::OFFSET)?.unwrap_or_default(),
         vertices,
         textures,
@@ -1126,5 +1134,24 @@ mod tests {
             uvs: &nuv,
         };
         assert!(blend_targets(&base, &indices, &uvs, &[other]).is_none());
+    }
+
+    #[test]
+    fn dragon_age_2_morph_nodes_are_found_by_name() {
+        let node = MorphNode {
+            name: crate::hashed_name(crate::name_hash32("FaceM1")),
+            offset: [0.0; 3],
+            vertices: Vec::new(),
+            textures: Vec::new(),
+            vectors: Vec::new(),
+        };
+        let m = Morph {
+            name: None,
+            models: Vec::new(),
+            tints: Vec::new(),
+            nodes: vec![node],
+        };
+        assert!(m.node("facem1").is_some());
+        assert!(m.node("EyesM1").is_none());
     }
 }

@@ -78,3 +78,63 @@ pub use model::Mmh;
 pub use state::MaterialState;
 pub use tlk::Tlk;
 pub use typed::TypedError;
+
+/// Dragon Age II's 32-bit name hash: over the name's UTF-16 code units, each with `A`-`Z`
+/// lowered, `h = h * 1000003 ^ c` from 0. DragonAge2.exe hashes a model's controller names
+/// with it (0x713160, called from the model loader at 0x74abfe), and DA2's animations
+/// (`.ani` field 4000) and head morphs (`.mor` field 2) store their targets as these hashes
+/// instead of names. Verified on the shipped files: it reproduces 434 of a skeleton's 444
+/// controller names among the animations' targets, and every node of a dwarf head morph.
+pub fn name_hash32(name: &str) -> u32 {
+    name.encode_utf16().fold(0u32, |h, c| {
+        let c = if (0x41..=0x5a).contains(&c) {
+            c + 0x20
+        } else {
+            c
+        };
+        h.wrapping_mul(1_000_003) ^ c as u32
+    })
+}
+
+/// How a name stored only as its [`name_hash32`] is kept where a name is expected:
+/// `#` and eight lowercase hex digits. No real name starts with `#`.
+pub fn hashed_name(hash: u32) -> String {
+    format!("#{hash:08x}")
+}
+
+/// The hash a [`hashed_name`] holds; `None` for a real name.
+pub fn hash_of_hashed_name(name: &str) -> Option<u32> {
+    let hex = name.strip_prefix('#')?;
+    (hex.len() == 8).then(|| u32::from_str_radix(hex, 16).ok())?
+}
+
+/// Whether `stored` (a name, or a [`hashed_name`]) is `name`, ignoring case.
+pub fn name_matches(stored: &str, name: &str) -> bool {
+    match hash_of_hashed_name(stored) {
+        Some(h) => h == name_hash32(name),
+        None => stored.eq_ignore_ascii_case(name),
+    }
+}
+
+#[cfg(test)]
+mod name_hash_tests {
+    use super::*;
+
+    #[test]
+    fn hashes_names_as_dragon_age_2_does() {
+        // Values as the shipped DA2 data stores them: an eye animation's track, and a
+        // head morph's node.
+        assert_eq!(name_hash32("lefteye_rotation"), 0x7363_0f0f);
+        assert_eq!(name_hash32("FaceM1"), 0x6887_06f5);
+        assert_eq!(name_hash32("FACEM1"), name_hash32("facem1"));
+        assert_eq!(name_hash32(""), 0);
+        let stored = hashed_name(name_hash32("FaceM1"));
+        assert_eq!(stored, "#688706f5");
+        assert_eq!(hash_of_hashed_name(&stored), Some(0x6887_06f5));
+        assert!(name_matches(&stored, "facem1"));
+        assert!(!name_matches(&stored, "EyesM1"));
+        assert!(name_matches("FaceM1", "facem1"));
+        assert_eq!(hash_of_hashed_name("#xyz"), None);
+        assert_eq!(hash_of_hashed_name("head"), None);
+    }
+}
