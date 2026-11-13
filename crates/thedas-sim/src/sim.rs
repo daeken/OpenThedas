@@ -3699,7 +3699,63 @@ fn apply_template(o: &mut crate::world::Object, t: &Gff3) {
             }
         }
     }
+    o.abilities.extend(template_abilities(t));
     read_text_fields(o, r);
+}
+
+/// The abilities a creature template lists: its talents, spells and skills (`TalentList` of
+/// `TalentNumber`, `SpellList` of `SpellNumber`, `SkillList`; DAOrigins.exe's creature
+/// template reader names them at 0xb06990 and 0xb176d8). A monster's own abilities are here
+/// (the giant spider's web and overwhelm), not in a script. Provisional: the reader itself
+/// is not traced; each list entry's one number is taken as an ability id.
+pub(crate) fn template_abilities(t: &Gff3) -> Vec<i32> {
+    let Some(r) = t.structs.first() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for list in ["TalentList", "SpellList", "SkillList"] {
+        if let Some(G3::List(items)) = field(r, list) {
+            for &i in items {
+                let id = t
+                    .structs
+                    .get(i as usize)
+                    .and_then(|e| e.fields.iter().find_map(|f| int(e, &f.label)));
+                out.extend(id.filter(|&id| id > 0));
+            }
+        }
+    }
+    out
+}
+
+impl Sim {
+    /// Gives the creatures of a game saved before templates' ability lists were read the
+    /// abilities their templates list (see [`template_abilities`]).
+    pub(crate) fn restore_template_abilities(&mut self) {
+        let creatures: Vec<(ObjectId, String)> = self
+            .world
+            .objects
+            .values()
+            .filter(|o| o.kind == ObjectKind::Creature && !o.template.is_empty())
+            .map(|o| (o.id, o.template.to_ascii_lowercase()))
+            .collect();
+        let mut read: HashMap<String, Vec<i32>> = HashMap::new();
+        for (id, template) in creatures {
+            let abilities = match read.get(&template) {
+                Some(a) => a.clone(),
+                None => {
+                    let a = self
+                        .read_gff3(&format!("{template}.utc"))
+                        .map(|t| template_abilities(&t))
+                        .unwrap_or_default();
+                    read.insert(template, a.clone());
+                    a
+                }
+            };
+            if let Some(o) = self.world.get_mut(id) {
+                o.abilities.extend(abilities);
+            }
+        }
+    }
 }
 
 /// The string fields engine functions read, as [`crate::world::Object::text_fields`].
@@ -4259,6 +4315,44 @@ mod tests {
         // The top level wins where both give a value.
         assert_eq!(o.fields.get("SkinTint"), Some(&7));
         assert_eq!(o.fields.get("Race"), Some(&3));
+    }
+
+    #[test]
+    fn creature_templates_give_the_abilities_they_list() {
+        // spider_giant.utc: the web, the spiders' properties and overwhelm.
+        use thedas_formats::gff3::{Field, Gff3, Struct, Value};
+        let f = |label: &str, value| Field {
+            label: label.into(),
+            value,
+        };
+        let entry = |label: &str, n: u32| Struct {
+            id: 6,
+            fields: vec![f(label, Value::Dword(n))],
+        };
+        let t = Gff3 {
+            file_type: *b"UTC ",
+            file_version: *b"V3.2",
+            structs: vec![
+                Struct {
+                    id: 0xFFFF_FFFF,
+                    fields: vec![
+                        f("Rank", Value::Byte(1)),
+                        f("TalentList", Value::List(vec![1, 2, 3])),
+                        f("SpellList", Value::List(vec![4])),
+                        f("SkillList", Value::List(Vec::new())),
+                    ],
+                },
+                entry("TalentNumber", 90029),
+                entry("TalentNumber", 90082),
+                entry("TalentNumber", 90133),
+                entry("SpellNumber", 10001),
+            ],
+        };
+        let mut o = crate::world::Object::new(1, ObjectKind::Creature, "spider_giant");
+        o.abilities.insert(5);
+        apply_template(&mut o, &t);
+        let got: Vec<i32> = o.abilities.iter().copied().collect();
+        assert_eq!(got, [5, 10001, 90029, 90082, 90133]);
     }
 
     #[test]
