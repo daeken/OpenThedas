@@ -28,6 +28,7 @@
 //! (event switch 8 at 0x7a043d) is taken to leave ENTER on; and an ENTER is not held back in
 //! conversations (0x6a2960).
 
+use crate::fmath::DetMath;
 use serde::{Deserialize, Serialize};
 use thedas_formats::gda::Cell;
 use thedas_script::vm::{OBJECT_INVALID, ObjectId};
@@ -81,7 +82,8 @@ impl AoeShape {
             AoeShape::Rect { width, length } => {
                 let (dx, dy) = (p[0] - center[0], p[1] - center[1]);
                 let h = crate::world::heading_of(facing).to_radians();
-                let (along, across) = (dx * h.cos() + dy * h.sin(), dx * h.sin() - dy * h.cos());
+                let (along, across) =
+                    (dx * h.dcos() + dy * h.dsin(), dx * h.dsin() - dy * h.dcos());
                 along.abs() <= length * 0.5 && across.abs() <= width * 0.5
             }
         }

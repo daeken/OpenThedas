@@ -4419,6 +4419,7 @@ dependencies = [
 name = "thedas-sim"
 version = "0.1.0"
 dependencies = [
+ "libm",
  "serde",
  "serde_json",
  "thedas-formats",
