@@ -135,6 +135,8 @@ pub struct PadPlay {
     swallow_release: bool,
     /// The same for Y, when its press put an item on the quickbar.
     swallow_right: bool,
+    /// An issue report was asked for (both sticks); the app makes it and clears this.
+    pub report: bool,
 }
 
 /// How often the focused button is looked for again (milliseconds).
@@ -392,6 +394,10 @@ impl PadPlay {
                 };
                 self.page = 0;
                 format!("screens: {:?}", s.menu)
+            }
+            Action::Report => {
+                self.report = true;
+                "issue report".into()
             }
             Action::GameMenu => {
                 let s = host.screens()?;

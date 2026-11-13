@@ -90,7 +90,7 @@ pub fn letterbox(w: u32, h: u32, size: (u32, u32)) -> (f32, f32, f32, f32) {
 pub fn movie_path(vfs: &thedas_vfs::Vfs, install: &Path, name: &str) -> PathBuf {
     match vfs.lookup(name) {
         Some(p) if p.entry.is_none() => p.file,
-        _ => install.join(MOVIES_DIR).join(name),
+        _ => thedas_vfs::join_ci(install, &format!("{MOVIES_DIR}/{name}")),
     }
 }
 

@@ -890,6 +890,10 @@ impl World {
         for (_, id) in due {
             if Some(id) != self.hero {
                 self.objects.remove(&id);
+                // A destroyed follower leaves the party (the list holds no dead ids).
+                if let Some(h) = self.hero.and_then(|h| self.objects.get_mut(&h)) {
+                    h.followers.retain(|&f| f != id);
+                }
             }
         }
     }

@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::path::{join_ci, resolve_ci};
 use crate::vfs::{Vfs, collect_files, is_archive};
 use crate::{Error, Result};
 
@@ -44,7 +45,7 @@ impl DaoInstall {
     /// Opens an install root: the directory holding `packages/` and `modules/`.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        if !root.join("packages").join("core").is_dir() {
+        if !join_ci(&root, "packages/core").is_dir() {
             return Err(Error::Malformed {
                 path: root,
                 reason: "not a Dragon Age: Origins install (no packages/core)".into(),
@@ -82,7 +83,7 @@ impl DaoInstall {
 
     /// DLC packages, ordered by manifest priority (lowest first), then UID.
     pub fn addins(&self) -> Result<Vec<AddIn>> {
-        let dir = self.root.join("Addins");
+        let dir = join_ci(&self.root, "Addins");
         let mut out = Vec::new();
         if !dir.is_dir() {
             return Ok(out);
@@ -96,10 +97,7 @@ impl DaoInstall {
             if !path.is_dir() {
                 continue;
             }
-            let manifest = ["Manifest.xml", "manifest.xml"]
-                .iter()
-                .map(|m| path.join(m))
-                .find(|p| p.is_file());
+            let manifest = resolve_ci(&path, "manifest.xml").filter(|p| p.is_file());
             let Some(manifest) = manifest else { continue };
             let text = std::fs::read(&manifest).map_err(|e| Error::Io {
                 path: manifest.clone(),
@@ -127,11 +125,15 @@ impl DaoInstall {
     /// Area (`env`) and module archives are loaded per area at runtime, so they are not here.
     pub fn global_vfs(&self, quality: TextureQuality) -> Result<Vfs> {
         let mut vfs = Vfs::new();
-        self.push_package(&mut vfs, &self.root.join("packages/core"), quality)?;
-        self.push_package(&mut vfs, &self.root.join("modules/single player"), quality)?;
+        self.push_package(&mut vfs, &join_ci(&self.root, "packages/core"), quality)?;
+        self.push_package(
+            &mut vfs,
+            &join_ci(&self.root, "modules/single player"),
+            quality,
+        )?;
         for addin in self.addins()?.into_iter().filter(|a| a.enabled) {
-            self.push_package(&mut vfs, &addin.dir.join("core"), quality)?;
-            self.push_package(&mut vfs, &addin.dir.join("module"), quality)?;
+            self.push_package(&mut vfs, &join_ci(&addin.dir, "core"), quality)?;
+            self.push_package(&mut vfs, &join_ci(&addin.dir, "module"), quality)?;
         }
         Ok(vfs)
     }
@@ -152,7 +154,7 @@ impl DaoInstall {
             ("audio", true),
             ("patch", false),
         ] {
-            let d = dir.join(sub);
+            let d = join_ci(dir, sub);
             if d.is_dir() {
                 vfs.push_directory(&d, recursive, label(&d))?;
             }
@@ -163,12 +165,12 @@ impl DaoInstall {
             &format!("textures/{}", quality.dir()),
             "patch",
         ] {
-            for archive in archives_in(&dir.join(sub))? {
+            for archive in archives_in(&join_ci(dir, sub))? {
                 let l = label(&archive);
                 vfs.push_archive(&archive, l)?;
             }
         }
-        let over = dir.join("override");
+        let over = join_ci(dir, "override");
         if over.is_dir() {
             vfs.push_directory(&over, true, label(&over))?;
         }
@@ -200,12 +202,12 @@ impl DaoInstall {
     /// The `env` directories that can hold levels, in search order: the core package, then
     /// enabled DLC packages by priority (highest first). Provisional, like the global order.
     pub fn env_dirs(&self) -> Result<Vec<PathBuf>> {
-        let mut dirs = vec![self.root.join("packages/core/env")];
+        let mut dirs = vec![join_ci(&self.root, "packages/core/env")];
         let mut addins: Vec<AddIn> = self.addins()?.into_iter().filter(|a| a.enabled).collect();
         addins.reverse();
         for a in addins {
-            dirs.push(a.dir.join("core/env"));
-            dirs.push(a.dir.join("module/env"));
+            dirs.push(join_ci(&a.dir, "core/env"));
+            dirs.push(join_ci(&a.dir, "module/env"));
         }
         Ok(dirs)
     }
@@ -222,20 +224,26 @@ impl DaoInstall {
         {
             return Err(Error::NotFound(format!("level {level:?}")));
         }
+        // Data names levels in any case (a City Elf area's layout is `Den201d`, the folder
+        // `den201d`), as Windows matched them; so the files and folder are matched likewise.
+        let file = |dir: &Path, ext: &str| {
+            resolve_ci(dir, &format!("{level}.{ext}")).filter(|p| p.is_file())
+        };
+        let level_dir = |dir: &Path| resolve_ci(dir, level).filter(|p| p.is_dir());
         let env_dir = self
             .env_dirs()?
             .into_iter()
-            .find(|d| d.join(format!("{level}.arl")).is_file() || d.join(level).is_dir())
+            .find(|d| file(d, "arl").is_some() || level_dir(d).is_some())
             .ok_or_else(|| Error::NotFound(format!("level {level}")))?;
         let mark = vfs.mark();
         let files: Vec<PathBuf> = ["arl", "opf"]
             .iter()
-            .map(|ext| env_dir.join(format!("{level}.{ext}")))
-            .filter(|p| p.is_file())
+            .filter_map(|ext| file(&env_dir, ext))
             .collect();
+        let dir = level_dir(&env_dir).unwrap_or_else(|| env_dir.join(level));
         let label = |p: &Path| self.relative(p).into_owned();
-        vfs.push_files(&files, label(&env_dir.join(level)));
-        let mut archives = archives_in(&env_dir.join(level))?;
+        vfs.push_files(&files, label(&dir));
+        let mut archives = archives_in(&dir)?;
         // Plain rims first, then GPU rims; each group sorted by name.
         archives.sort_by_key(|p| {
             let name = p
@@ -358,6 +366,62 @@ mod tests {
         assert!(install.mount_level(&mut vfs, "missing").is_err());
         assert!(install.mount_level(&mut vfs, "../data").is_err());
         assert_eq!(vfs.layers().len(), before);
+    }
+
+    /// Folder and file names in another case than the data uses, as the Windows original
+    /// accepts. Passes on case-sensitive and case-insensitive volumes alike (run the tests with
+    /// `TMPDIR` on a case-sensitive volume to exercise the listing path).
+    #[test]
+    fn finds_folders_levels_and_manifests_in_any_case() {
+        let root = std::env::temp_dir().join(format!("thedas-install-ci-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let env = root.join("Packages/Core/ENV");
+        std::fs::create_dir_all(env.join("den201d")).unwrap();
+        std::fs::create_dir_all(root.join("Packages/Core/Data")).unwrap();
+        std::fs::write(
+            root.join("Packages/Core/Data/global.erf"),
+            erf_v20(&[("shared.dds", b"global")]),
+        )
+        .unwrap();
+        std::fs::write(env.join("den201d.ARL"), b"arl").unwrap();
+        std::fs::write(env.join("Den201D.opf"), b"opf").unwrap();
+        std::fs::write(
+            env.join("den201d/den201d.rim"),
+            erf_v20(&[("den201d_0.rml", b"rml")]),
+        )
+        .unwrap();
+        let addin = root.join("ADDINS/Some_DLC");
+        std::fs::create_dir_all(addin.join("Core/Env")).unwrap();
+        std::fs::write(
+            addin.join("MANIFEST.XML"),
+            br#"<AddInItem UID="some_dlc" Priority="5" Enabled="1">"#,
+        )
+        .unwrap();
+
+        let install = DaoInstall::open(&root).unwrap();
+        let addins = install.addins().unwrap();
+        assert_eq!(addins.len(), 1);
+        assert_eq!(
+            (addins[0].uid.as_str(), addins[0].priority),
+            ("some_dlc", 5)
+        );
+        // Core's env, then the DLC's core/env (found) and module/env (absent).
+        let dirs = install.env_dirs().unwrap();
+        assert_eq!(dirs.len(), 3);
+        assert!(dirs[0].is_dir() && dirs[1].is_dir() && !dirs[2].exists());
+
+        let mut vfs = install.global_vfs(TextureQuality::High).unwrap();
+        assert_eq!(vfs.read("shared.dds").unwrap().0, b"global");
+        let mount = install.mount_level(&mut vfs, "Den201d").unwrap();
+        assert_eq!(mount.files.len(), 2);
+        assert_eq!(mount.archives.len(), 1);
+        assert_eq!(vfs.read("den201d.arl").unwrap().0, b"arl");
+        assert_eq!(vfs.read("den201d.opf").unwrap().0, b"opf");
+        assert_eq!(vfs.read("den201d_0.rml").unwrap().0, b"rml");
+        mount.unmount(&mut vfs);
+        assert!(install.mount_level(&mut vfs, "DEN201D").is_ok());
+        assert!(install.mount_level(&mut vfs, "den201").is_err());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

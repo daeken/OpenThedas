@@ -48,6 +48,9 @@ pub struct ObjectModel {
     pub morph: Option<String>,
     /// A helmet hides the morph's hair and beard (provisional).
     pub hide_hair: bool,
+    /// The lasting visual effects on it (see [`visual_effects`]): their models, without
+    /// `.mmh`.
+    pub effects: Vec<String>,
     /// What the creature's body is doing, for its skeleton.
     pub motion: Option<Motion>,
     pub position: [f32; 3],
@@ -368,6 +371,7 @@ pub fn template_look(sim: &Sim, o: &Object, template: &str) -> Option<ObjectMode
         tints: d.tints,
         morph: d.morph,
         hide_hair: d.hide_hair,
+        effects: Vec::new(),
         motion: motion(sim, &look),
         position: o.position,
         facing: o.facing,
@@ -973,6 +977,31 @@ impl DrawnKey {
     }
 }
 
+/// The `effects.gda` type of a visual effect (`EffectVisualEffect`).
+const EFFECT_TYPE_VISUAL_EFFECT: i32 = 4;
+
+/// The models of the lasting visual effects scripts applied to object `o` (an
+/// `EffectVisualEffect` with a duration, kept on the object until it runs out or is removed,
+/// such as a spell's glow or a crust of flames): each effect's `VFX_base.gda` row (its integer
+/// 0) names the model (`ModelName`, e.g. `fxa_fire_crust_c`). Effects with an instant
+/// duration are not kept by the simulation, so they are not drawn. Provisional: the row's
+/// other columns (detail-level variants, attachment, scale, priority) are not mirrored.
+pub fn visual_effects(sim: &Sim, o: &Object) -> Vec<String> {
+    let Some(t) = sim.world.tables().get(0, "vfx_base") else {
+        return Vec::new();
+    };
+    let now = sim.world.time_ms;
+    o.effects
+        .iter()
+        .filter(|e| e.ty == EFFECT_TYPE_VISUAL_EFFECT && e.expires.is_none_or(|x| x > now))
+        .filter_map(|e| {
+            let row = *e.ints.first()? as i64;
+            let model = text(t.cell("ModelName", row))?.to_ascii_lowercase();
+            (!model.is_empty()).then_some(model)
+        })
+        .collect()
+}
+
 /// Where the ids of [`location_vfx_models`] start: above any object id the world hands out.
 pub const LOCATION_VFX_IDS: ObjectId = 0xf000_0000;
 
@@ -1000,6 +1029,7 @@ pub fn location_vfx_models(sim: &Sim, area: ObjectId) -> Vec<ObjectModel> {
                 tints: Vec::new(),
                 morph: None,
                 hide_hair: false,
+                effects: Vec::new(),
                 motion: None,
                 position: v.position,
                 facing: v.facing,
@@ -1041,6 +1071,7 @@ pub fn area_models_cached(sim: &Sim, area: ObjectId, cache: &mut ModelCache) -> 
                 tints: d.tints,
                 morph: d.morph,
                 hide_hair: d.hide_hair,
+                effects: visual_effects(sim, o),
                 motion: motion(sim, o),
                 position: o.position,
                 facing: o.facing,
@@ -1173,6 +1204,7 @@ mod tests {
             tints: vec![],
             morph: None,
             hide_hair: false,
+            effects: vec![],
             motion: motion(s, s.world.get(id).unwrap()),
             position: [0.0; 3],
             facing: 0.0,
