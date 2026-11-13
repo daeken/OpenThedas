@@ -948,6 +948,11 @@ impl UiMovie {
         self.with_player(|p| p.render());
     }
 
+    /// Whether the movie has a multiply pass (see [`MultiplyPass`]).
+    pub fn has_multiply_pass(&self) -> bool {
+        self.multiply_pass.is_some()
+    }
+
     /// The clips to draw in a multiply pass of their own, or none (see [`MultiplyPass`]).
     pub fn set_multiply_pass(&mut self, pass: Option<MultiplyPass>) {
         self.multiply_pass = pass;
