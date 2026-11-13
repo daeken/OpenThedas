@@ -86,6 +86,11 @@ pub struct ActorShow {
     pub animations: Vec<CutAnimation>,
     /// What its head tracker is told, when a head tracking action has started for it.
     pub look: Option<ActorLook>,
+    /// The cutscene hides it (see [`thedas_sim::cuttracks::Actor::visible_at`]).
+    pub hidden: bool,
+    /// Where the cutscene has it carry its weapons, once a draw action has started
+    /// ([`thedas_sim::cuttracks::Actor::weapons_at`]).
+    pub weapons: Option<(bool, Option<bool>)>,
 }
 
 /// What a cutscene's head tracking action tells an actor's head tracker (see
@@ -332,6 +337,8 @@ fn show(tracks: &Tracks, i: usize, at: &Moment) -> Option<ActorShow> {
         snaps: a.snaps,
         animations,
         look,
+        hidden: a.visible_at(t) == Some(false),
+        weapons: a.weapons_at(t),
     })
 }
 

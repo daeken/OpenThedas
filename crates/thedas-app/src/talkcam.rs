@@ -614,6 +614,8 @@ mod tests {
             }],
             links: Vec::new(),
             head_tracks: Vec::new(),
+            visibility: Vec::new(),
+            weapon_draws: Vec::new(),
         }
     }
 

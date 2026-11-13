@@ -166,7 +166,7 @@ pub struct Live {
     pub objects: Option<LiveObjects>,
     effects: Option<LiveEffects>,
     rings: Option<LiveRings>,
-    /// The creature the mouse was last found over ([`Live::hovered_creature`]).
+    /// The creature the mouse is over ([`Live::set_hovered`]).
     hovered: Option<ObjectId>,
     /// When each lasting effect was first seen on its object (world milliseconds): the
     /// simulation does not keep when it was applied.
@@ -1494,6 +1494,20 @@ impl Live {
             models.push(m);
         }
         let kept = shown.kept;
+        // A cutscene's weapon draws and hidden actors.
+        let mut hidden = std::collections::HashSet::new();
+        for (id, show) in &posing {
+            if show.hidden {
+                hidden.insert(*id);
+            }
+            if let (Some((main, off)), Some(o), Some(m)) = (
+                show.weapons,
+                sim.world.get(*id),
+                models.iter_mut().find(|m| m.id == *id),
+            ) {
+                m.attached = thedas_ui::models::weapons_in_cutscene(&sim, o, main, off);
+            }
+        }
         // Who looks at whom, from where the creatures were last drawn.
         self.looks.prepare(&sim);
         let pairs = crate::looks::pairs(&sim);
@@ -1635,7 +1649,11 @@ impl Live {
         );
         objects.follow_poses();
         for (i, m) in models.iter().enumerate() {
-            let o = self.opacity.get(&m.id).copied().unwrap_or(1.0);
+            let o = if hidden.contains(&m.id) {
+                0.0
+            } else {
+                self.opacity.get(&m.id).copied().unwrap_or(1.0)
+            };
             objects.renderer.set_prop_opacity(ctx, &objects.scene, i, o);
         }
         self.posed = models
@@ -2404,13 +2422,17 @@ impl Live {
                 }
             }
         }
-        self.hovered = None;
         let (t, id) = best?;
-        self.hovered = match sim.ground_hit(area, origin.to_array(), dir.to_array(), 300.0) {
+        match sim.ground_hit(area, origin.to_array(), dir.to_array(), 300.0) {
             Some(g) if origin.distance(glam::Vec3::from_array(g)) < t => None,
             _ => Some(id),
-        };
-        self.hovered
+        }
+    }
+
+    /// Tells the world which creature the mouse is over, as the interface has it (none
+    /// while the interface covers the cursor): its ring shows it (see [`crate::rings`]).
+    pub fn set_hovered(&mut self, hovered: Option<ObjectId>) {
+        self.hovered = hovered;
     }
 
     /// Orders the party leader as a click on `pick` does: lead with a party member, attack a
