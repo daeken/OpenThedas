@@ -13,8 +13,11 @@
 //! measured against the creature's facing (the executable reads nodes of the models,
 //! 0x6ca450); a creature is taken to have the head and eye pose animations when its own
 //! trees are the humanoid ones (they are `humanoid_overlay.anb`'s; which overlay tree a
-//! creature plays is not traced), and no creature here has the body's. Not followed: the
-//! glances creatures give the party while exploring (0x6cad80) and `SetLookAtEnabled`.
+//! creature plays is not traced), and no creature here has the body's.
+//!
+//! While exploring, creatures glance at the player's character ([`Glance`]; the tracker's
+//! own update, 0x6cad80). Not followed: its other targets (what a creature's action is
+//! aimed at, and what the player has selected, within 25 m) and `SetLookAtEnabled`.
 
 use std::collections::HashMap;
 
@@ -96,11 +99,125 @@ pub struct Sight {
     pub speed: f32,
 }
 
+/// How creatures glance at the player's character while exploring: `globals.gda` (table
+/// 105; its value column's name is not known), rows 0 to 6 and 10.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlanceSettings {
+    /// `MIN_TIME_FOR_LOOKAT_ACTION` and `MAX_…` (milliseconds): how long before a creature
+    /// thinks again about looking.
+    pub think_ms: (f32, f32),
+    /// `PERCENT_CHANCE_TO_LOOK_AT_PLAYER`.
+    pub chance: u32,
+    /// `MIN_LOOKAT_HEADTURN_SPEED` and `MAX_…`: what the tracker's speeds are multiplied
+    /// by as it turns to look.
+    pub look_speed: (f32, f32),
+    /// `MIN_LOOKAWAY_HEADTURN_SPEED` and `MAX_…`: as it turns away.
+    pub away_speed: (f32, f32),
+    /// `LOOKAT_THRESHOLD_DISTANCE_NEARBYNPC` (metres): how near the player's character
+    /// has to be.
+    pub near: f32,
+}
+
+/// `globals.gda`'s value column.
+const COL_GLOBAL_VALUE: u32 = 0x3fc1_3de1;
+
+fn glance_settings(sim: &Sim) -> Option<GlanceSettings> {
+    use thedas_formats::gda::Cell;
+    let t = sim.world.tables().get(105, "")?;
+    let v = |row: i64| match t.cell_by_hash(COL_GLOBAL_VALUE, row)? {
+        Cell::Float(v) => Some(*v as f32),
+        Cell::Int(v) => Some(*v as f32),
+        _ => None,
+    };
+    Some(GlanceSettings {
+        think_ms: (v(0)?, v(1)?),
+        chance: v(2)?.max(0.0) as u32,
+        look_speed: (v(3)?, v(4)?),
+        away_speed: (v(5)?, v(6)?),
+        near: v(10)?,
+    })
+}
+
+/// One creature's glancing at the player's character while exploring.
+///
+/// Traced (the tracker's update, 0x6cad80): a timer runs down; when it is out the creature
+/// rolls a hundred-sided die: one not looking starts to with the settings' chance, one
+/// looking goes on with half that chance and otherwise stops; the timer is set anew
+/// between the settings' two times. While it means to look, it tracks the player's
+/// character whenever that is within the settings' distance and in front of it; as it
+/// starts to and as it stops, the tracker's speeds are scaled by a random factor within
+/// the settings' ranges. The player's own character does not glance.
+///
+/// Provisional: the die is the C runtime's generator seeded per creature here (the
+/// executable's is shared), and a creature in combat is taken not to glance (the
+/// executable asks 0x7c4970 of it, which is not traced).
+#[derive(Clone, Copy, Debug)]
+pub struct Glance {
+    timer_ms: f32,
+    looking: bool,
+    tracking: bool,
+    /// The scale the tracker's speeds have now.
+    speed: f32,
+    rand: u32,
+}
+
+impl Glance {
+    pub fn new(seed: u32) -> Self {
+        Glance {
+            timer_ms: 0.0,
+            looking: false,
+            tracking: false,
+            speed: 1.0,
+            rand: seed,
+        }
+    }
+
+    fn roll(&mut self) -> u32 {
+        self.rand = self.rand.wrapping_mul(214_013).wrapping_add(2_531_011);
+        (self.rand >> 16) & 0x7fff
+    }
+
+    fn within(&mut self, (low, high): (f32, f32)) -> f32 {
+        low + self.roll() as f32 / 32767.0 * (high - low)
+    }
+
+    /// Advances it by `dt` seconds; `in_reach` says whether the player's character is near
+    /// enough and in front. Gives whether it tracks now and the speed scale to track or to
+    /// turn away with.
+    pub fn advance(&mut self, s: &GlanceSettings, dt: f32, in_reach: bool) -> (bool, f32) {
+        if self.timer_ms > 0.0 {
+            self.timer_ms -= dt * 1000.0;
+        } else {
+            let die = self.roll() % 100;
+            self.looking = if self.looking {
+                die < s.chance / 2
+            } else {
+                die < s.chance
+            };
+            let span = (s.think_ms.1 - s.think_ms.0).max(1.0) as u32;
+            self.timer_ms = s.think_ms.0 + (self.roll() % span) as f32;
+        }
+        let tracking = self.looking && in_reach;
+        if tracking != self.tracking {
+            self.speed = if tracking {
+                self.within(s.look_speed)
+            } else {
+                self.within(s.away_speed)
+            };
+            self.tracking = tracking;
+        }
+        (tracking, self.speed)
+    }
+}
+
 #[derive(Default)]
 pub struct Looks {
     /// The table, read at first use (`Some(None)`: the data has none).
     config: Option<Option<[PartConfig; 3]>>,
     trackers: HashMap<ObjectId, Tracker>,
+    /// The glances' settings, read at first use, and each creature's glancing.
+    glance_settings: Option<Option<GlanceSettings>>,
+    glances: HashMap<ObjectId, Glance>,
 }
 
 impl Looks {
@@ -113,6 +230,32 @@ impl Looks {
             }
             self.config = Some(c);
         }
+        if self.glance_settings.is_none() {
+            self.glance_settings = Some(glance_settings(sim));
+        }
+    }
+
+    /// How near the player's character has to be for a creature to glance at it (metres);
+    /// none when the game's data has no settings for glances.
+    pub fn glance_reach(&self) -> Option<f32> {
+        Some(self.glance_settings??.near)
+    }
+
+    /// Advances creature `id`'s glancing ([`Glance::advance`]): whether it tracks the
+    /// player's character now, and the speed scale for its tracker.
+    pub fn glance(&mut self, id: ObjectId, dt: f32, in_reach: bool) -> (bool, f32) {
+        let Some(Some(settings)) = self.glance_settings else {
+            return (false, 1.0);
+        };
+        self.glances
+            .entry(id)
+            .or_insert_with(|| Glance::new(id.wrapping_mul(2_654_435_761)))
+            .advance(&settings, dt, in_reach)
+    }
+
+    /// Forgets the glancing of creatures not among `kept` (those no longer drawn).
+    pub fn keep_glances(&mut self, kept: &dyn Fn(ObjectId) -> bool) {
+        self.glances.retain(|id, _| kept(*id));
     }
 
     /// Whether `id` has a tracker running (tracking, or still turning back to rest).
@@ -121,13 +264,15 @@ impl Looks {
     }
 
     /// Advances creature `id`'s tracker by `dt` seconds towards `sight` (none: it lets go
-    /// and turns back to rest), and gives the pose animations to lay over its clip.
+    /// and turns back to rest, at the speed scale `away`), and gives the pose animations to
+    /// lay over its clip.
     /// `valid(action)` says whether the creature has that pose animation; it is asked when
     /// the tracker is made.
     pub fn step(
         &mut self,
         id: ObjectId,
         sight: Option<Sight>,
+        away: f32,
         dt: f32,
         mut valid: impl FnMut(&str) -> bool,
     ) -> Vec<Clip> {
@@ -152,7 +297,12 @@ impl Looks {
                 tracker.set_origin(s.origin, s.base);
                 tracker.set_target(s.target);
             }
-            None => tracker.stop(),
+            None => {
+                if tracker.tracking() {
+                    tracker.set_speed_scale(away);
+                }
+                tracker.stop();
+            }
         }
         tracker.update(dt);
         if !tracker.active() {
@@ -187,4 +337,53 @@ pub fn humanoid(trees: &[String]) -> bool {
     trees
         .iter()
         .any(|t| t.to_ascii_lowercase().starts_with("humanoid"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The game's settings.
+    const SETTINGS: GlanceSettings = GlanceSettings {
+        think_ms: (1500.0, 4000.0),
+        chance: 70,
+        look_speed: (0.75, 1.0),
+        away_speed: (0.4, 0.6),
+        near: 5.0,
+    };
+
+    #[test]
+    fn a_creature_thinks_about_looking_every_few_seconds_and_looks_most_of_the_time() {
+        let mut g = Glance::new(7);
+        // A minute of frames with the player in reach.
+        let (mut looked, mut changes, mut was) = (0, 0, false);
+        let frames = 60 * 30;
+        for _ in 0..frames {
+            let (tracking, speed) = g.advance(&SETTINGS, 1.0 / 30.0, true);
+            looked += tracking as u32;
+            if tracking != was {
+                changes += 1;
+                // Turning to look is quicker than turning away.
+                if tracking {
+                    assert!((0.75..=1.0).contains(&speed), "{speed}");
+                } else {
+                    assert!((0.4..=0.6).contains(&speed), "{speed}");
+                }
+            }
+            was = tracking;
+        }
+        // It changes its mind no more often than every 1.5 s, and does change it.
+        assert!((2..=40).contains(&changes), "{changes}");
+        // Starting at 70 in a hundred and staying at 35: it looks roughly half the time.
+        let share = looked as f32 / frames as f32;
+        assert!((0.25..=0.8).contains(&share), "{share}");
+    }
+
+    #[test]
+    fn a_creature_out_of_reach_does_not_track() {
+        let mut g = Glance::new(3);
+        for _ in 0..600 {
+            assert!(!g.advance(&SETTINGS, 1.0 / 30.0, false).0);
+        }
+    }
 }
