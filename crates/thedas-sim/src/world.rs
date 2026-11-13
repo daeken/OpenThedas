@@ -546,6 +546,11 @@ pub struct World {
     pub mode_before_talk: Option<i32>,
     #[serde(default)]
     pub mode_after_talk: Option<i32>,
+    /// Conversations asked for while another was going on (initiator, owner, the
+    /// conversation), in order: each starts when the one before it ends (see
+    /// `Sim::start_conversation`).
+    #[serde(default)]
+    pub pending_talks: Vec<(ObjectId, ObjectId, crate::dialog::Dlg)>,
     /// Cutscenes loaded with `LoadCutscene` that have not played yet, in order. Each starts
     /// once the scripts that loaded it have run (see [`crate::sim::CutscenePolicy`]).
     #[serde(default)]
@@ -767,6 +772,7 @@ impl World {
             game_mode: 0,
             mode_before_talk: None,
             mode_after_talk: None,
+            pending_talks: Vec::new(),
             cutscenes: Vec::new(),
             dialog_cutscenes: Vec::new(),
             cutscene: None,
