@@ -155,6 +155,25 @@ pub enum SimCommand {
         id: ObjectId,
         killer: ObjectId,
     },
+    /// An area transition, as a script's `DoAreaTransition` asks for one (the app's test
+    /// steps): performed at the start of the next update.
+    Transition {
+        area: String,
+        waypoint: String,
+    },
+    /// A cutscene queued to play (the app's test steps).
+    QueueCutscene {
+        name: String,
+    },
+    /// Whether the party AI plays the controlled character too (test drivers; the app turns
+    /// it off when a game starts).
+    SetAutopilot {
+        on: bool,
+    },
+    /// What happens when a script shows the party picker (the app: the player picks).
+    SetPartyPickerPolicy {
+        policy: crate::sim::PartyPickerPolicy,
+    },
 }
 
 impl SimCommand {
@@ -501,6 +520,24 @@ impl Sim {
             }
             C::Kill { id, killer } => {
                 self.kill(*id, *killer);
+                true
+            }
+            C::Transition { area, waypoint } => {
+                self.world.transition = Some((area.clone(), waypoint.clone()));
+                self.world.transition_at =
+                    Some(self.world.time_ms + crate::sim::TRANSITION_DELAY_MS);
+                true
+            }
+            C::QueueCutscene { name } => {
+                self.world.cutscenes.push(name.clone());
+                true
+            }
+            C::SetAutopilot { on } => {
+                self.world.autopilot = *on;
+                true
+            }
+            C::SetPartyPickerPolicy { policy } => {
+                self.party_picker_policy = *policy;
                 true
             }
         }
