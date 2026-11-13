@@ -38,6 +38,7 @@ pub mod orders;
 pub mod plot;
 pub mod prcscr;
 pub mod quickbar;
+pub mod replay;
 pub mod save;
 pub mod session;
 pub mod sim;
