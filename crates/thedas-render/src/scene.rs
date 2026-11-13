@@ -98,6 +98,22 @@ pub struct LightmapRef {
     pub scale: [f32; 2],
 }
 
+impl LightmapRef {
+    /// The three textures of a Dragon Age II lightmap, which a room names without an
+    /// extension (`HLAC_lt_backalley_g_1_5`): the name with `x`, `y` and `z` appended, the
+    /// light arriving along each of three directions (its materials' `mml_tLightmap0`, `1`
+    /// and `2`). `None` for a Dragon Age: Origins atlas, a single texture named with its
+    /// extension.
+    ///
+    /// From the files: every lightmap name the rooms of `lt_backalley_g` give has exactly
+    /// these three textures among the level's. Provisional: which of the three each sampler
+    /// takes is the order of the letters, not traced in the executable.
+    pub fn planes(&self) -> Option<[String; 3]> {
+        (!self.texture.contains('.'))
+            .then(|| ["x", "y", "z"].map(|p| format!("{}{p}.dds", self.texture)))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DrawItem {
     pub mesh: usize,
@@ -665,11 +681,46 @@ impl AreaScene {
         }
         for d in &self.draws {
             if let Some(l) = &d.lightmap {
-                out.insert(l.texture.clone());
+                match l.planes() {
+                    Some(planes) => out.extend(planes),
+                    None => {
+                        out.insert(l.texture.clone());
+                    }
+                }
             }
         }
         out
     }
+}
+
+/// The lightmap a room binds to a model's mesh piece: the piece's lightmap id (`_7u`), and
+/// its place among the model's mesh pieces.
+///
+/// Dragon Age: Origins binds by the id. Dragon Age II's rooms give a number instead, and its
+/// props' pieces have no id: the number is taken as the piece's place (a prop of three
+/// pieces is bound 0, 1 and 2; a room's own model, of one piece with the id `_0`, is bound
+/// 0). Provisional, from the files.
+///
+/// A Dragon Age II binding named `VX…` is not a lightmap: it names the piece's per-vertex
+/// lighting (a `.vlm` file of three colours a vertex), which is not read yet, so such a
+/// piece is drawn without a lightmap (its material's default, an even grey).
+fn lightmap_binding<'a>(
+    bindings: &'a [LightmapBinding],
+    id: Option<&str>,
+    place: usize,
+) -> Option<&'a LightmapBinding> {
+    let lightmaps = || {
+        bindings.iter().filter(|b| {
+            b.texture.contains('.')
+                || !b
+                    .texture
+                    .get(..2)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("vx"))
+        })
+    };
+    lightmaps()
+        .find(|b| id.is_some_and(|id| b.chunk.eq_ignore_ascii_case(id)))
+        .or_else(|| lightmaps().find(|b| b.chunk.parse() == Ok(place)))
 }
 
 pub fn transform_matrix(t: &Transform) -> Mat4 {
@@ -949,9 +1000,26 @@ impl<'a> Loader<'a> {
                     None
                 }
             },
-            Err(e) => {
-                self.warn(e.to_string());
-                None
+            Err(missing) => {
+                // Dragon Age II has no `<material>.xml`: the material's resource itself is
+                // its compiled definition (see [`thedas_formats::bmat`]).
+                let compiled = key.strip_suffix(".xml").and_then(|resource| {
+                    let d = self.read(resource).ok()?;
+                    thedas_formats::bmat::is_bmat(&d).then_some((resource.to_string(), d))
+                });
+                match compiled {
+                    Some((resource, d)) => match thedas_formats::bmat::Bmat::parse(&d) {
+                        Ok(b) => Some(Arc::new(b.definition(&resource))),
+                        Err(e) => {
+                            self.warn(format!("{resource}: {e}"));
+                            None
+                        }
+                    },
+                    None => {
+                        self.warn(missing.to_string());
+                        None
+                    }
+                }
             }
         };
         self.mat_defs.insert(key, loaded.clone());
@@ -2393,7 +2461,7 @@ impl<'a> Loader<'a> {
             self.warn(format!("{model_name}.mmh: mesh nodes but no .msh"));
             return rigid;
         };
-        for piece in pieces {
+        for (piece_index, piece) in pieces.into_iter().enumerate() {
             let Some(mut mesh) = self.mesh(&msh_name, &piece.mesh.chunk) else {
                 continue;
             };
@@ -2435,16 +2503,14 @@ impl<'a> Loader<'a> {
                 .chain
                 .iter()
                 .fold(Mat4::IDENTITY, |m, t| m * transform_matrix(t));
-            let lightmap = piece.mesh.lightmap_id.as_ref().and_then(|id| {
-                lightmaps
-                    .iter()
-                    .find(|b| b.chunk.eq_ignore_ascii_case(id))
-                    .map(|b| LightmapRef {
+            let lightmap =
+                lightmap_binding(lightmaps, piece.mesh.lightmap_id.as_deref(), piece_index).map(
+                    |b| LightmapRef {
                         texture: b.texture.to_ascii_lowercase(),
                         offset: b.offset,
                         scale: b.scale,
-                    })
-            });
+                    },
+                );
             let transform = placement * node;
             let skin = (!piece.mesh.bones.is_empty()).then(|| {
                 let skeleton = self.skeleton(model_name, &model);
@@ -3406,6 +3472,54 @@ fn name_of_tree(trees: &[String], tree: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_piece_takes_its_lightmap_by_id_or_by_place() {
+        let binding = |chunk: &str, texture: &str| LightmapBinding {
+            chunk: chunk.into(),
+            texture: texture.into(),
+            offset: [0.0; 2],
+            scale: [1.0; 2],
+        };
+        // Dragon Age: Origins: by the piece's id, whatever its place.
+        let dao = [
+            binding("_7u", "lvl_room000.dds"),
+            binding("_8k", "lvl_room001.dds"),
+        ];
+        let texture = |b: &[LightmapBinding], id, place| {
+            lightmap_binding(b, id, place).map(|b| b.texture.clone())
+        };
+        assert_eq!(
+            texture(&dao, Some("_8K"), 0).as_deref(),
+            Some("lvl_room001.dds")
+        );
+        assert_eq!(texture(&dao, Some("_9z"), 0), None);
+        assert_eq!(texture(&dao, None, 1), None);
+        // Dragon Age II: by the piece's place; a `VX` binding is per-vertex lighting.
+        let da2 = [
+            binding("0", "HLAC_lt_room_1_5"),
+            binding("1", "VXlt_room_1n1_0_1"),
+            binding("2", "HLAC_lt_room_1_3"),
+        ];
+        assert_eq!(
+            texture(&da2, Some("_0"), 0).as_deref(),
+            Some("HLAC_lt_room_1_5")
+        );
+        assert_eq!(texture(&da2, None, 1), None);
+        assert_eq!(texture(&da2, None, 2).as_deref(), Some("HLAC_lt_room_1_3"));
+        assert_eq!(texture(&da2, None, 3), None);
+
+        let lightmap = |texture: &str| LightmapRef {
+            texture: texture.into(),
+            offset: [0.0; 2],
+            scale: [1.0; 2],
+        };
+        assert_eq!(
+            lightmap("hlac_lt_room_1_5").planes(),
+            Some(["x", "y", "z"].map(|p| format!("hlac_lt_room_1_5{p}.dds")))
+        );
+        assert_eq!(lightmap("lvl_room000.dds").planes(), None);
+    }
 
     #[test]
     fn a_tree_part_draws_its_level_inside_the_far_distance_only() {
