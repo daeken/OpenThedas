@@ -54,7 +54,8 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
 14. **VO placement.** Conversation lines are 2D, and 3D for ambient lines. The original's speaker positioning isn't checked. Small to medium.
 15. **VO timing and lip-sync.** Check that conversation timing follows the line lengths as the original does. Not audio-only.
 16. **The sound-set player** is traced (#290: `sst` counts, shuffle bag, the roll, gender via 0x7f2b70).
-    - Not applied: a per-creature probability multiplier (table 0x119, column 0x29f4e2fb, when the type's column 0x6ddd6b8b is set) and a creature flag (+0x969) that makes a line certain.
+    - Applied: the type's chance is scaled by how many lines the set has of it (`ss_probabilitymodif.gda`, table 0x119: 1 line 0.2, 2 0.33, 3 0.5, 4 0.8, 5 and more 1), for types flagged in `ss_types.gda` column 0x6ddd6b8b (0x6b59fe..0x6b5a5f).
+    - Not applied: a creature flag (+0x969) that makes a line certain.
     - Small.
 17. **Event or sample for a sound-set line.** Inferred from the data: the event if it exists, otherwise the sample on `VOambient_ss`. Small.
 
