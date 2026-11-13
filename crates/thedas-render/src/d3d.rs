@@ -126,12 +126,29 @@ fn read_shader(vfs: &Vfs, name: &str) -> Result<Shader, String> {
     Shader::parse(&data).map_err(|e| format!("{res}: {e}"))
 }
 
-fn build(vfs: &Vfs, vs_name: &str, ps_name: &str, state_name: &str) -> Result<D3dProgram, String> {
+/// The render state a pass names: a state file (`<name>.xml`), or for a pass of one of
+/// Dragon Age II's compiled materials the states stored in the material itself (the name
+/// is then a [`thedas_formats::bmat::pass_reference`]).
+fn read_state(vfs: &Vfs, state_name: &str) -> Result<MaterialState, String> {
+    if let Some((resource, s, t, p)) = thedas_formats::bmat::parse_pass_reference(state_name) {
+        let (data, _) = vfs.read(resource).map_err(|e| format!("{resource}: {e}"))?;
+        let material =
+            thedas_formats::bmat::Bmat::parse(&data).map_err(|e| format!("{resource}: {e}"))?;
+        return material
+            .pass_at(s, t, p)
+            .map(|pass| pass.material_state(state_name))
+            .ok_or_else(|| format!("{state_name}: no such pass"));
+    }
     let state_res = format!("{}.xml", state_name.to_ascii_lowercase());
     let (data, _) = vfs
         .read(&state_res)
         .map_err(|e| format!("{state_res}: {e}"))?;
-    let state = MaterialState::parse(&data).map_err(|e| format!("{state_res}: {e}"))?;
+    MaterialState::parse(&data).map_err(|e| format!("{state_res}: {e}"))
+}
+
+fn build(vfs: &Vfs, vs_name: &str, ps_name: &str, state_name: &str) -> Result<D3dProgram, String> {
+    let state_res = state_name.to_ascii_lowercase();
+    let state = read_state(vfs, state_name)?;
     let pass = state.pass().map_err(|e| format!("{state_res}: {e}"))?;
     let vs = read_shader(vfs, vs_name)?;
     let ps = read_shader(vfs, ps_name)?;
@@ -209,10 +226,14 @@ impl D3dSource {
                 continue;
             };
             if let Some(f) = filter {
-                let listed = |(vs, ps, _): &(&str, &str, &str)| {
-                    f.iter().any(|(v, q)| {
-                        v.eq_ignore_ascii_case(vs) && (q == "*" || q.eq_ignore_ascii_case(ps))
-                    })
+                // The list names Dragon Age: Origins' shaders; a pass of one of Dragon Age
+                // II's compiled materials (its state is a reference into the material)
+                // is taken whatever its shaders are called.
+                let listed = |(vs, ps, st): &(&str, &str, &str)| {
+                    thedas_formats::bmat::parse_pass_reference(st).is_some()
+                        || f.iter().any(|(v, q)| {
+                            v.eq_ignore_ascii_case(vs) && (q == "*" || q.eq_ignore_ascii_case(ps))
+                        })
                 };
                 if !passes.iter().all(listed) {
                     continue;
@@ -835,6 +856,24 @@ pub const NO_SHADOW_DATA: [[f32; 4]; 9] = [
     [0.0, 0.0, 0.0, 0.0],
 ];
 
+/// Dragon Age II's `g_bDebugControlBooleans` (usage `DebugControlBooleans`): float vectors
+/// its shaders test component by component, greater than zero meaning on. As
+/// `static_static_p0.psh` reads them: the first vector's `x` replaces the output with the
+/// wireframe colour, `y` samples the diffuse texture, `z` the normal map, and `w` applies
+/// lighting; the second's `x` applies the shadow partition, `y` the fog, `z` shows a debug
+/// view in place of the output; the third's `x` shows another, and `z` keeps the specular
+/// term; the fourth's `y` and `z` show two more. These are the switches for the ordinary
+/// picture, with shadows and fog off because their constants are not fed yet.
+///
+/// Provisional: read from that one shader's code; the values the executable writes are not
+/// traced, and other shaders may read components this leaves zero.
+pub const DEBUG_CONTROL: [[f32; 4]; 4] = [
+    [0.0, 1.0, 1.0, 1.0],
+    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+];
+
 /// Light from every direction for draws in a level with no irradiance probe. Provisional.
 pub const NO_PROBE_IRRADIANCE: [f32; 3] = [0.35, 0.35, 0.35];
 
@@ -971,11 +1010,12 @@ impl ConstantContext<'_> {
                 Some(self.projection * world_view)
             }
             ("PartTrans" | "Part", _) | (_, "aur_mWorld") => Some(self.world),
-            ("ModelView", _) | (_, "aur_mModelView") => Some(world_view),
-            ("View", _) => Some(self.view),
-            ("ViewInv", _) => Some(self.view.inverse()),
-            ("Projection", _) => Some(self.projection),
-            ("ViewProjection", _) => Some(self.projection * self.view),
+            ("ModelView" | "ModelViewTrans", _) | (_, "aur_mModelView") => Some(world_view),
+            ("ModelViewInvTrans", _) => Some(world_view.inverse()),
+            ("View" | "ViewTrans", _) => Some(self.view),
+            ("ViewInv" | "ViewInvTrans", _) => Some(self.view.inverse()),
+            ("Projection" | "ProjectionTrans", _) => Some(self.projection),
+            ("ViewProjection" | "ViewProjectionTrans", _) => Some(self.projection * self.view),
             _ => None,
         };
         if let Some(m) = matrix {
@@ -1008,6 +1048,7 @@ impl ConstantContext<'_> {
                     self.sun.is_some(),
                 ])
             }
+            ("DebugControlBooleans", _) => Value::Vectors(DEBUG_CONTROL.to_vec()),
             // Three 4x4 matrices, red, green and blue: the vertex shaders light a normal n
             // with n^T M n (see `thedas_formats::probe`).
             (_, "g_mLightParams") => Value::Vectors(
@@ -1116,6 +1157,12 @@ impl ConstantContext<'_> {
                 | "ViewInv"
                 | "Projection"
                 | "ViewProjection"
+                | "ModelViewTrans"
+                | "ModelViewInvTrans"
+                | "ViewTrans"
+                | "ViewInvTrans"
+                | "ProjectionTrans"
+                | "ViewProjectionTrans"
                 | "CameraPosition"
                 | "ApplicationTime"
                 | "ShadowData"
@@ -1244,6 +1291,16 @@ pub fn sampler_texture(
     if usage.starts_with("ShadowTexture") {
         let slot = u8::from(usage.eq_ignore_ascii_case("ShadowTexture_Secondary"));
         return (Some(sampler), TextureSource::Shadow(slot));
+    }
+    // Dragon Age II's three lightmap textures (see [`LightmapRef::planes`]); a draw without
+    // a lightmap reads the parameter's default (`Default_Gray50`).
+    let plane = ["mml_tLightmap0", "mml_tLightmap1", "mml_tLightmap2"]
+        .iter()
+        .position(|n| param.name.eq_ignore_ascii_case(n));
+    if let Some(i) = plane
+        && let Some(planes) = lightmap.and_then(|l| l.planes())
+    {
+        return (Some(sampler), TextureSource::Resource(planes[i].clone()));
     }
     if param.name.eq_ignore_ascii_case("mml_tLightmap") {
         return (
@@ -1565,6 +1622,141 @@ mod tests {
         let z1 = sat(dp4(sd[2], p) / dp4(sd[3], p));
         let lit1 = if map[0] - z1 >= 0.0 { 1.0 } else { sat(map[1]) };
         if -near >= 0.0 { far } else { lit1 }
+    }
+
+    #[test]
+    fn a_compiled_material_binds_three_lightmaps_and_the_switches() {
+        use thedas_formats::bmat::{
+            Bmat, EngineParameter, MaterialParameter, Pass, Semantic, Technique,
+        };
+        let engine = |name: &str, sampler: &str, source| EngineParameter {
+            name: name.into(),
+            sampler: sampler.into(),
+            source,
+            ty: 0,
+            index: -1,
+        };
+        let texture = |name: &str, sampler: &str, default: &str| MaterialParameter {
+            name: name.into(),
+            sampler: sampler.into(),
+            default: default.into(),
+            ty: 0,
+            count: 1,
+            index: -1,
+        };
+        let def = Bmat {
+            semantics: vec![Semantic {
+                name: "Default".into(),
+                render_class: "Opaque,Static1".into(),
+                techniques: vec![Technique {
+                    name: "BakedLightingPerPixelHighLOD".into(),
+                    header: [1, 0, 1, 0, 1, 0],
+                    passes: vec![Pass {
+                        name: "Pass 1".into(),
+                        flags: 0,
+                        vertex_shader: "static_static_p0.vsh.fxo".into(),
+                        pixel_shader: "static_static_p0.psh.fxo".into(),
+                        engine_parameters: vec![
+                            engine("g_bDebugControlBooleans", "", 51),
+                            engine("aur_mViewProjection", "", 38),
+                        ],
+                        parameters: vec![
+                            texture("mml_tLightmap0", "smpLightmap0", "Default_Gray50"),
+                            texture("mml_tLightmap1", "smpLightmap1", "Default_Gray50"),
+                            texture("mml_tLightmap2", "smpLightmap2", "Default_Gray50"),
+                        ],
+                        render_states: Vec::new(),
+                        sampler_states: Vec::new(),
+                    }],
+                }],
+            }],
+        }
+        .definition("static.mat");
+        let xml = br#"<MaterialObject Name="w"><Material Name="static.mat"/></MaterialObject>"#;
+        let material = SceneMaterial {
+            mao: "w.mao".into(),
+            object: MaterialObject::parse(xml).unwrap(),
+            technique: def.select("Default", 3, "HIGH").cloned(),
+            definition: Some(Arc::new(def)),
+            semantic: "Default".into(),
+            render_class: None,
+        };
+        assert!(material.technique.is_some());
+        let sampler = |name: &str, register| Constant {
+            ty: 12,
+            ..constant(name, RegisterSet::Sampler, register, 1, ParamClass::Object)
+        };
+        let t = table(vec![
+            sampler("smpLightmap0", 1),
+            sampler("smpLightmap1", 6),
+            sampler("smpLightmap2", 12),
+            constant(
+                "g_bDebugControlBooleans",
+                RegisterSet::Float4,
+                13,
+                4,
+                ParamClass::Vector,
+            ),
+            constant(
+                "aur_mViewProjection",
+                RegisterSet::Float4,
+                20,
+                4,
+                ParamClass::MatrixRows,
+            ),
+        ]);
+        // A Dragon Age II lightmap is three textures; a piece without one reads the default.
+        let lm = LightmapRef {
+            texture: "hlac_lt_room_1_5".into(),
+            offset: [0.0; 2],
+            scale: [1.0; 2],
+        };
+        let tex = |r, l: Option<&LightmapRef>| {
+            sampler_texture(Some(&t), r, TextureType::Tex2D, &material, l, None).1
+        };
+        for (register, plane) in [(1, "x"), (6, "y"), (12, "z")] {
+            assert_eq!(
+                tex(register, Some(&lm)),
+                TextureSource::Resource(format!("hlac_lt_room_1_5{plane}.dds"))
+            );
+            assert_eq!(
+                tex(register, None),
+                TextureSource::Resource("default_gray50.dds".into())
+            );
+        }
+        let lights = DrawLights::default();
+        let projection = Mat4::perspective_rh(1.0, 1.5, 0.1, 100.0);
+        let cc = ConstantContext {
+            view: Mat4::IDENTITY,
+            projection,
+            world: Mat4::from_translation(Vec3::new(5.0, 0.0, 0.0)),
+            camera: Vec3::ZERO,
+            material: &material,
+            lightmap: Some(&lm),
+            lights: &lights,
+            ambient: Vec3::ZERO,
+            bones: &[],
+            irradiance: None,
+            sun: None,
+            fog: crate::atmosphere::fog_params(None),
+            sky: None,
+            clouds: crate::atmosphere::cloud_params(None, None),
+            time: 0.0,
+            shadow: NO_SHADOW_DATA,
+            partition: None,
+            tree: None,
+            winds: &[],
+        };
+        let c = cc.fill(Some(&t));
+        assert_eq!(c.floats[13..17], DEBUG_CONTROL);
+        // The view and projection without the draw's placement, in the `Trans` layout.
+        let m = projection;
+        assert_eq!(
+            c.floats[20..24],
+            [m.x_axis, m.y_axis, m.z_axis, m.w_axis].map(|v| v.to_array())
+        );
+        assert!(cc.per_frame(&t.constants[4]));
+        assert!(!cc.per_frame(&t.constants[3]));
     }
 
     #[test]

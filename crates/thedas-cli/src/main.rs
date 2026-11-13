@@ -65,6 +65,9 @@ enum Command {
         #[arg(long)]
         list: Option<PathBuf>,
     },
+    /// List the add-ins (DLC) an install has, in stack order from the one that wins shared
+    /// files down, with where each is known from and what of it joins the base campaign.
+    Addins { install: PathBuf },
     /// Compiled scripts: disassemble, run, or rank engine functions by use.
     Script {
         #[command(subcommand)]
@@ -380,6 +383,7 @@ fn run() -> Result<()> {
             dump::dump(&data, raw, &mut std::io::stdout().lock())
         }
         Command::Mods { install, list } => mods(&install, list.as_deref()),
+        Command::Addins { install } => addins(&install),
         Command::Resolve {
             install,
             name,
@@ -564,6 +568,43 @@ fn load_target(target: &str) -> Result<Vec<u8>> {
         .find(entry)
         .with_context(|| format!("{archive} has no entry {entry}"))?;
     Ok(erf.read(e, None)?)
+}
+
+fn addins(install: &Path) -> Result<()> {
+    let install = DaoInstall::open(install)?;
+    let mut all = install.addins()?;
+    // `addins` is lowest first; show the winner first.
+    all.reverse();
+    println!(
+        "{:>3}  {:<22} {:<9} {:<13} {:<16} folder",
+        "#", "uid", "known by", "mounted", "extends"
+    );
+    for (i, a) in all.iter().enumerate() {
+        let mounted = match (a.enabled, a.extends_base_campaign()) {
+            (false, _) => "no",
+            (true, true) => "core+module",
+            (true, false) => "core",
+        };
+        println!(
+            "{:>3}  {:<22} {:<9} {:<13} {:<16} {}",
+            i + 1,
+            a.uid,
+            if a.rank.is_some() {
+                "registry"
+            } else {
+                "manifest"
+            },
+            mounted,
+            a.extends
+                .as_deref()
+                .filter(|e| !e.is_empty())
+                .unwrap_or("-"),
+            install.relative(&a.dir)
+        );
+    }
+    let on = all.iter().filter(|a| a.enabled).count();
+    println!("{} add-ins, {on} mounted", all.len());
+    Ok(())
 }
 
 fn mods(install: &Path, list: Option<&Path>) -> Result<()> {
