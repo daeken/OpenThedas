@@ -84,7 +84,7 @@ pub fn base_url() -> Option<String> {
     if !crate::upload::online() {
         return None;
     }
-    let text = std::fs::read_to_string(crate::saves::data_dir().join(URL_FILE)).ok()?;
+    let text = crate::upload::setup_file(URL_FILE)?;
     let url = text.trim();
     if !url.starts_with("https://") {
         log::warn!("update: {URL_FILE} does not hold an https address");
@@ -241,7 +241,31 @@ pub fn fetch_build(offer: &Offer) -> Result<PathBuf> {
     if !exe.is_file() {
         bail!("the build has no {}", offer.file.exe);
     }
+    // The build the player's own launcher goes on to from now on (see [`newest_build`]).
+    let current = json!({ "commit": commit, "exe": exe.display().to_string() });
+    let _ = std::fs::write(
+        crate::saves::data_dir().join("builds").join("current.json"),
+        serde_json::to_vec_pretty(&current).unwrap_or_default(),
+    );
     Ok(exe)
+}
+
+/// The build an update fetched, when it is not this one: the program the player started
+/// (the download's, which is never replaced) hands over to it, so the game they start is
+/// always the newest they have. `None` in automated runs.
+pub fn newest_build() -> Option<PathBuf> {
+    if !crate::upload::online() {
+        return None;
+    }
+    let bytes = std::fs::read(crate::saves::data_dir().join("builds").join("current.json")).ok()?;
+    let current: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let commit = current["commit"].as_str()?;
+    if option_env!("THEDAS_GIT_COMMIT").is_some_and(|own| own == commit) {
+        return None;
+    }
+    let exe = PathBuf::from(current["exe"].as_str()?);
+    let own = std::env::current_exe().ok()?;
+    (exe.is_file() && exe != own).then_some(exe)
 }
 
 /// A file name from an archive, with no folders in it.
