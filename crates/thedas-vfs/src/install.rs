@@ -729,17 +729,19 @@ mod tests {
             ]
         );
         assert_eq!(vfs.hits("a.txt").len(), 7);
-        // The player's layers are named apart from the install's, without the home path.
+        // The player's layers are named apart from the install's, without the home path
+        // (lowercased here: on a case-insensitive volume a folder keeps the case asked for).
         let mine: Vec<(String, usize)> = crate::mods::player_layers(&vfs)
             .into_iter()
-            .map(|l| (l.label, l.files))
+            .filter(|l| l.files > 0)
+            .map(|l| (l.label.to_ascii_lowercase(), l.files))
             .collect();
         assert_eq!(
             mine,
             [
                 ("user:packages/core/data/ucore.erf".to_string(), 5),
-                ("user:modules/Single Player/override".to_string(), 4),
-                ("user:AddIns/y/core/data/y.erf".to_string(), 2),
+                ("user:modules/single player/override".to_string(), 4),
+                ("user:addins/y/core/data/y.erf".to_string(), 2),
             ]
         );
         // Without the player's folders: the install alone, override still on top.
