@@ -142,6 +142,26 @@ pub fn blend_premultiplied(base: &mut Rgba, src: &Rgba) {
     }
 }
 
+/// Multiplies `src` (premultiplied) onto `base`, as Flash's `multiply` blend draws over an
+/// opaque picture: each channel becomes base x (src + 1 - src alpha), so a clear pixel
+/// leaves the base as it was and an opaque one multiplies it by its colour.
+pub fn blend_multiply(base: &mut Rgba, src: &Rgba) {
+    if (base.width, base.height) != (src.width, src.height) {
+        return;
+    }
+    for (b, s) in base
+        .pixels
+        .chunks_exact_mut(4)
+        .zip(src.pixels.chunks_exact(4))
+    {
+        let inv = 255 - u32::from(s[3]);
+        for c in 0..3 {
+            let f = (u32::from(s[c]) + inv).min(255);
+            b[c] = ((u32::from(b[c]) * f + 127) / 255) as u8;
+        }
+    }
+}
+
 /// The path of the movie's focused text field when it is an input field
 /// (`Selection.getFocus`, then the field's `type`).
 fn focused_input_field(m: &mut UiMovie) -> Option<String> {
@@ -683,6 +703,13 @@ impl Stage {
 
     /// Renders every movie and blends the frames over `base` (straight RGBA) on the CPU.
     pub fn capture_over(&mut self, base: &mut Rgba) -> Result<(), UiError> {
+        // The movies' multiplied clips first, onto the picture under the whole interface
+        // (see `UiMovie::render_multiply`).
+        for m in &mut self.movies {
+            if let Some(pass) = m.capture_multiply() {
+                blend_multiply(base, &pass);
+            }
+        }
         for m in &mut self.movies {
             m.render();
             let frame = m
@@ -702,6 +729,25 @@ fn is_hide_request(m: &GameMessage) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiply_darkens_by_the_colour_and_leaves_clear_pixels_alone() {
+        let mut base = Rgba {
+            width: 3,
+            height: 1,
+            pixels: vec![200, 100, 50, 255, 200, 100, 50, 255, 200, 100, 50, 255],
+        };
+        // Opaque half grey; clear; half-covered black (premultiplied).
+        let src = Rgba {
+            width: 3,
+            height: 1,
+            pixels: vec![128, 128, 128, 255, 0, 0, 0, 0, 0, 0, 0, 128],
+        };
+        blend_multiply(&mut base, &src);
+        assert_eq!(&base.pixels[0..4], &[100, 50, 25, 255]);
+        assert_eq!(&base.pixels[4..8], &[200, 100, 50, 255]);
+        assert_eq!(&base.pixels[8..12], &[100, 50, 25, 255]);
+    }
 
     #[test]
     fn names_movies() {

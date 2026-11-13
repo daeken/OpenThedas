@@ -530,6 +530,25 @@ pub struct UiMovie {
     slots_loaded: Vec<String>,
     /// How many inline images each text field (by its index, see `avm1::IMG_TAKE`) shows.
     inline_images: std::collections::HashMap<u32, usize>,
+    /// Clips the movie blends with `multiply` onto the game's picture, drawn in a pass of
+    /// their own (see [`MultiplyPass`]), and the texture that pass is copied to.
+    multiply_pass: Option<MultiplyPass>,
+    multiply_texture: Option<wgpu::Texture>,
+}
+
+/// Clips a movie draws with the `multiply` blend onto what is under the interface (the
+/// "New Quest" banner's blood splash darkens the game's picture). The movie renders into
+/// its own transparent texture, where a multiply has nothing under it, so these clips are
+/// drawn alone in a pass of their own, with the normal blend, and that picture is multiplied
+/// onto the frame before the movie's own (where they are hidden).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MultiplyPass {
+    /// Clips the pass hides: everything outside the multiplied clips' branch.
+    pub hide: Vec<String>,
+    /// Clips the pass shows: the multiplied clips' parent, hidden in the movie's own frame.
+    pub show: Vec<String>,
+    /// The `multiply` clips, drawn with the normal blend in the pass.
+    pub multiply: Vec<String>,
 }
 
 /// An `<img>` tag in HTML text: where it is, its linkage name and its horizontal space.
@@ -674,6 +693,8 @@ impl UiMovie {
             engine_images: BTreeMap::new(),
             slots_loaded: Vec::new(),
             inline_images: Default::default(),
+            multiply_pass: None,
+            multiply_texture: None,
         })
     }
 
@@ -925,6 +946,105 @@ impl UiMovie {
     /// Renders the current frame into the texture.
     pub fn render(&mut self) {
         self.with_player(|p| p.render());
+    }
+
+    /// The clips to draw in a multiply pass of their own, or none (see [`MultiplyPass`]).
+    pub fn set_multiply_pass(&mut self, pass: Option<MultiplyPass>) {
+        self.multiply_pass = pass;
+    }
+
+    /// Sets the movie up for its multiply pass, runs `f`, and puts the clips back as they
+    /// were (their visibility read first: the movie may have changed it since the pass was
+    /// made). `None` without a pass.
+    fn in_multiply_pass<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        let pass = self.multiply_pass.clone()?;
+        let visible = |m: &mut Self, path: &str| {
+            m.call(&format!("{path}._visible.toString"), &[]) == UiValue::String("true".into())
+        };
+        let was: Vec<(String, bool)> = pass
+            .hide
+            .iter()
+            .chain(&pass.show)
+            .map(|p| (p.clone(), visible(self, p)))
+            .collect();
+        for p in &pass.hide {
+            self.set(&format!("{p}._visible"), UiValue::Bool(false));
+        }
+        for p in &pass.show {
+            self.set(&format!("{p}._visible"), UiValue::Bool(true));
+        }
+        for p in &pass.multiply {
+            self.set(&format!("{p}.blendMode"), UiValue::String("normal".into()));
+        }
+        let r = f(self);
+        for p in &pass.multiply {
+            self.set(
+                &format!("{p}.blendMode"),
+                UiValue::String("multiply".into()),
+            );
+        }
+        for (p, v) in was {
+            self.set(&format!("{p}._visible"), UiValue::Bool(v));
+        }
+        Some(r)
+    }
+
+    /// Renders the movie's multiply pass (see [`MultiplyPass`]) and returns a copy of it
+    /// (RGBA8, premultiplied), to multiply onto the frame under the movie's own picture.
+    /// `None` without a pass.
+    pub fn render_multiply(&mut self) -> Option<wgpu::Texture> {
+        self.in_multiply_pass(|m| {
+            m.render();
+            let (texture, device, queue) = m
+                .with_player(|p| {
+                    let r: &mut dyn std::any::Any = p.renderer_mut();
+                    r.downcast_mut::<WgpuRenderBackend<TextureTarget>>()
+                        .map(|b| {
+                            (
+                                b.target().texture.clone(),
+                                b.descriptors().device.clone(),
+                                b.descriptors().queue.clone(),
+                            )
+                        })
+                })
+                .flatten()?;
+            let same = m
+                .multiply_texture
+                .as_ref()
+                .is_some_and(|t| t.size() == texture.size() && t.format() == texture.format());
+            if !same {
+                m.multiply_texture = Some(device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("ui multiply pass"),
+                    size: texture.size(),
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: texture.format(),
+                    usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                }));
+            }
+            let copy = m.multiply_texture.clone()?;
+            let mut encoder = device.create_command_encoder(&Default::default());
+            encoder.copy_texture_to_texture(
+                texture.as_image_copy(),
+                copy.as_image_copy(),
+                texture.size(),
+            );
+            queue.submit([encoder.finish()]);
+            Some(copy)
+        })
+        .flatten()
+    }
+
+    /// The movie's multiply pass read back to the CPU (RGBA8, premultiplied), as
+    /// [`UiMovie::render_multiply`] draws it. `None` without a pass.
+    pub fn capture_multiply(&mut self) -> Option<Rgba> {
+        self.in_multiply_pass(|m| {
+            m.render();
+            m.capture()
+        })
+        .flatten()
     }
 
     /// The texture the movie renders into (RGBA8, premultiplied alpha).
