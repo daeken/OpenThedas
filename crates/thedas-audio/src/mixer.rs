@@ -167,8 +167,9 @@ impl Mixer {
     }
 
     /// Low-pass a voice at `cutoff` Hz (10 to 22000), or not at all: FMOD's "Lowpass Simple"
-    /// unit, which its software channels use for occlusion. Provisional: the unit is taken
-    /// as FMOD documents it, two one-pole RC stages in a row; its code is not traced.
+    /// unit, which its software channels use for occlusion: two one-pole stages in a row
+    /// (its state is two values a channel, fmodex.dll 0x1004ad3e) with the step
+    /// [`lowpass_step`] gives.
     pub fn set_lowpass(&mut self, id: VoiceId, cutoff: Option<f32>) {
         if let Some(v) = self.voice(id) {
             if v.cutoff.is_none() && cutoff.is_some() {
@@ -268,11 +269,7 @@ impl Mixer {
             let step = pcm.rate as f64 / rate * v.params.pitch as f64;
             let bus = buses[v.params.bus.index()] * master;
             let (lp, rp) = pan_gains(v.params.pan);
-            // The low-pass's step: an RC stage's `dt / (RC + dt)` with `RC = 1 / (2 pi f)`.
-            let alpha = v.cutoff.map(|f| {
-                let w = std::f32::consts::TAU * f / rate as f32;
-                w / (1.0 + w)
-            });
+            let alpha = v.cutoff.map(|f| lowpass_step(f, rate as f32));
             for (o, so) in out.chunks_exact_mut(2).zip(send.chunks_exact_mut(2)) {
                 if let Some((start, end)) = v.params.looping {
                     let end = end.min(frames);
@@ -331,6 +328,24 @@ impl Mixer {
     }
 }
 
+/// The step `a` of a "Lowpass Simple" stage, `y += a * (x - y)`, for a cutoff at an output
+/// rate, as fmodex.dll works it out when the cutoff is set (0x1004ad59):
+/// - at 22000 Hz and above, 1 (the signal passes);
+/// - up to `rate / pi`, an RC stage's `dt / (RC + dt)` with `RC = 1 / (2 pi cutoff)`;
+/// - between, a line from 2/3 at `rate / pi` to 1 at 22000 Hz.
+fn lowpass_step(cutoff: f32, rate: f32) -> f32 {
+    let knee = rate / std::f32::consts::PI;
+    if cutoff >= 22000.0 {
+        1.0
+    } else if cutoff <= knee {
+        let dt = 1.0 / rate;
+        let rc = 1.0 / (std::f32::consts::TAU * cutoff.max(1e-3));
+        dt / (rc + dt)
+    } else {
+        (cutoff - knee) / ((22000.0 - knee) * 3.0) + 2.0 / 3.0
+    }
+}
+
 /// Left and right gains for a pan position: the far side falls off linearly, the near side
 /// stays at full gain.
 fn pan_gains(pan: f32) -> (f32, f32) {
@@ -369,6 +384,11 @@ mod tests {
         let (low, high) = (level(100.0, None), level(8000.0, None));
         assert!(level(100.0, Some(1000.0)) > 0.95 * low);
         assert!(level(8000.0, Some(1000.0)) < 0.05 * high);
+        // The step: an RC stage below the knee, a line above it, 1 from 22000 Hz.
+        assert!((lowpass_step(1000.0, 48000.0) - 0.11574).abs() < 1e-4);
+        assert!((lowpass_step(48000.0 / std::f32::consts::PI, 48000.0) - 2.0 / 3.0).abs() < 1e-4);
+        assert!((lowpass_step(18639.4, 48000.0) - 0.8333).abs() < 1e-3);
+        assert_eq!(lowpass_step(22000.0, 48000.0), 1.0);
         // The floor (10 Hz) leaves next to nothing.
         assert!(level(1000.0, Some(0.0)) < 0.001 * low);
     }
