@@ -5,6 +5,7 @@
 //! number), object ids are handed out sequentially, and randomness comes from a seeded
 //! generator.
 
+use crate::fmath::DetMath;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -90,7 +91,7 @@ pub fn heading_of(facing: f32) -> f32 {
 
 /// The facing that looks along a direction (dx, dy).
 pub fn facing_toward(dx: f32, dy: f32) -> f32 {
-    (dy.atan2(dx).to_degrees() - 90.0).rem_euclid(360.0)
+    (dy.datan2(dx).to_degrees() - 90.0).rem_euclid(360.0)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1040,7 +1041,7 @@ mod tests {
         assert!((facing_toward(-1.0, 0.0) - 90.0).abs() < 1e-4);
         for f in [0.0f32, 45.0, 92.5, 180.0, 300.0] {
             let h = heading_of(f).to_radians();
-            assert!((facing_toward(h.cos(), h.sin()) - f).abs() < 1e-3, "{f}");
+            assert!((facing_toward(h.dcos(), h.dsin()) - f).abs() < 1e-3, "{f}");
         }
     }
 }
