@@ -949,9 +949,26 @@ impl<'a> Loader<'a> {
                     None
                 }
             },
-            Err(e) => {
-                self.warn(e.to_string());
-                None
+            Err(missing) => {
+                // Dragon Age II has no `<material>.xml`: the material's resource itself is
+                // its compiled definition (see [`thedas_formats::bmat`]).
+                let compiled = key.strip_suffix(".xml").and_then(|resource| {
+                    let d = self.read(resource).ok()?;
+                    thedas_formats::bmat::is_bmat(&d).then_some((resource.to_string(), d))
+                });
+                match compiled {
+                    Some((resource, d)) => match thedas_formats::bmat::Bmat::parse(&d) {
+                        Ok(b) => Some(Arc::new(b.definition(&resource))),
+                        Err(e) => {
+                            self.warn(format!("{resource}: {e}"));
+                            None
+                        }
+                    },
+                    None => {
+                        self.warn(missing.to_string());
+                        None
+                    }
+                }
             }
         };
         self.mat_defs.insert(key, loaded.clone());

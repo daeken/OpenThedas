@@ -255,6 +255,330 @@ fn pass(r: &mut Reader) -> Result<Pass> {
     })
 }
 
+/// How a pass of a compiled material is named where a state file's name goes in a
+/// [`crate::material::Pass`] made from it ([`Bmat::definition`]): the material's resource,
+/// then the semantic's, the technique's and the pass's places in it.
+pub fn pass_reference(resource: &str, semantic: usize, technique: usize, pass: usize) -> String {
+    format!(
+        "{}#{semantic}#{technique}#{pass}",
+        resource.to_ascii_lowercase()
+    )
+}
+
+/// Takes a [`pass_reference`] apart: the material's resource and the three places.
+pub fn parse_pass_reference(reference: &str) -> Option<(&str, usize, usize, usize)> {
+    let mut parts = reference.split('#');
+    let resource = parts.next().filter(|r| !r.is_empty())?;
+    let mut place = || parts.next()?.parse().ok();
+    let (s, t, p) = (place()?, place()?, place()?);
+    parts.next().is_none().then_some((resource, s, t, p))
+}
+
+impl Technique {
+    /// Whether this draws the picture itself: its second header word is 0, where the depth,
+    /// shadow, reflection map and motion vector techniques have 1 to 4. Provisional, from
+    /// the shipped files' technique names.
+    pub fn is_main(&self) -> bool {
+        self.header[1] == 0
+    }
+}
+
+impl Semantic {
+    /// The technique drawn here: of the main ones ([`Technique::is_main`]), the one for
+    /// high detail with baked per-pixel lighting when there is one (first header word 1,
+    /// third 1: `BakedLightingPerPixelHighLOD…`), else the one with the highest first
+    /// word, the earliest among equals; any technique when none is a main one.
+    /// Provisional: how the game picks by detail level and lighting mode is not known.
+    pub fn technique(&self) -> Option<(usize, &Technique)> {
+        let main = || {
+            self.techniques
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.is_main())
+        };
+        main()
+            .find(|(_, t)| t.header[0] == 1 && t.header[2] == 1)
+            .or_else(|| main().max_by_key(|(i, t)| (t.header[0], std::cmp::Reverse(*i))))
+            .or_else(|| self.techniques.iter().enumerate().next())
+    }
+}
+
+/// Dragon Age II's numbers for render states and their values, as the names Dragon Age:
+/// Origins' state files use ([`crate::state`]). Provisional throughout: worked out from
+/// which semantics of the shipped materials set what (blended ones set 11 and the factors 5
+/// and 6, punch-through ones 4, 9 and 10, the reflection map techniques flip 7, and so on),
+/// not from the executable. Values count on from the D3D9 enumerations at an offset each.
+fn render_state(state: u32, value: u32) -> Option<(&'static str, String)> {
+    let flag = |v: u32| if v != 0 { "TRUE" } else { "FALSE" }.to_string();
+    let compare = |v: u32| {
+        Some(
+            match v {
+                0x1a => "CMP_NEVER",
+                0x1b => "CMP_LESS",
+                0x1c => "CMP_EQUAL",
+                0x1d => "CMP_LESSEQUAL",
+                0x1e => "CMP_GREATER",
+                0x1f => "CMP_NOTEQUAL",
+                0x20 => "CMP_GREATEREQUAL",
+                0x21 => "CMP_ALWAYS",
+                _ => return None,
+            }
+            .to_string(),
+        )
+    };
+    let factor = |v: u32| {
+        Some(
+            match v {
+                8 => "BLEND_ZERO",
+                9 => "BLEND_ONE",
+                10 => "BLEND_SRCCOLOR",
+                11 => "BLEND_INVSRCCOLOR",
+                12 => "BLEND_SRCALPHA",
+                13 => "BLEND_INVSRCALPHA",
+                14 => "BLEND_DESTALPHA",
+                15 => "BLEND_INVDESTALPHA",
+                16 => "BLEND_DESTCOLOR",
+                17 => "BLEND_INVDESTCOLOR",
+                _ => return None,
+            }
+            .to_string(),
+        )
+    };
+    let operation = |v: u32| {
+        Some(
+            match v {
+                0x2e => "BLENDOP_ADD",
+                0x2f => "BLENDOP_SUBTRACT",
+                0x30 => "BLENDOP_REVSUBTRACT",
+                0x31 => "BLENDOP_MIN",
+                0x32 => "BLENDOP_MAX",
+                _ => return None,
+            }
+            .to_string(),
+        )
+    };
+    Some(match state {
+        0 => ("DS_ZENABLE", flag(value)),
+        3 => ("DS_ZWRITEENABLE", flag(value)),
+        4 => ("DS_ALPHATESTENABLE", flag(value)),
+        5 => ("DS_SRCBLEND", factor(value)?),
+        6 => ("DS_DESTBLEND", factor(value)?),
+        7 => (
+            "DS_CULLMODE",
+            match value {
+                0x17 => "CULL_NONE",
+                0x18 => "CULL_CW",
+                0x19 => "CULL_CCW",
+                _ => return None,
+            }
+            .to_string(),
+        ),
+        8 => ("DS_ZFUNC", compare(value)?),
+        9 => ("DS_ALPHAREF", value.to_string()),
+        10 => ("DS_ALPHAFUNC", compare(value)?),
+        11 => ("DS_ALPHABLENDENABLE", flag(value)),
+        32 => ("DS_COLORWRITEENABLE", value.to_string()),
+        33 => ("DS_BLENDOP", operation(value)?),
+        47 => ("DS_SEPARATEALPHABLENDENABLE", flag(value)),
+        48 => ("DS_SRCBLENDALPHA", factor(value)?),
+        49 => ("DS_DESTBLENDALPHA", factor(value)?),
+        50 => ("DS_BLENDOPALPHA", operation(value)?),
+        // Fill mode (1), stencil (19, 22 to 24, 36, 39, 40), depth bias (35, 46) and 45 are
+        // not carried: nothing here draws with them.
+        _ => return None,
+    })
+}
+
+/// A sampler state and its value likewise (see [`render_state`]): 0 to 2 the address
+/// modes, 3 to 5 the filters, 9 whether the texture is read as sRGB.
+fn sampler_state(state: u32, value: u32) -> Option<(&'static str, &'static str)> {
+    let address = |v: u32| {
+        Some(match v {
+            0 => "TEXADD_WRAP",
+            1 => "TEXADD_MIRROR",
+            2 => "TEXADD_CLAMP",
+            3 => "TEXADD_BORDER",
+            _ => return None,
+        })
+    };
+    let filter = |v: u32| {
+        Some(match v {
+            5 => "TEXFILT_NONE",
+            6 => "TEXFILT_POINT",
+            7 => "TEXFILT_LINEAR",
+            8 => "TEXFILT_ANISOTROPIC",
+            _ => return None,
+        })
+    };
+    Some(match state {
+        0 => ("SAMP_ADDRESSU", address(value)?),
+        1 => ("SAMP_ADDRESSV", address(value)?),
+        2 => ("SAMP_ADDRESSW", address(value)?),
+        3 => ("SAMP_MINFILTER", filter(value)?),
+        4 => ("SAMP_MAGFILTER", filter(value)?),
+        5 => ("SAMP_MIPFILTER", filter(value)?),
+        9 => (
+            "SAMP_SRGBTEXTURE",
+            if value != 0 { "TRUE" } else { "FALSE" },
+        ),
+        _ => return None,
+    })
+}
+
+impl Pass {
+    /// The pass's render and sampler states as a state file's ([`crate::state`]), `name`
+    /// naming it. Where the pass is silent the engine's defaults are written out first:
+    /// clockwise culling (the reflection map techniques, drawn mirrored, set
+    /// counter-clockwise), and for every sampler linear filtering with mip maps (the
+    /// passes that set filters at all set them to point, for screen passes). Blending
+    /// that is turned on without factors blends by the source's alpha. Provisional (see
+    /// [`render_state`]): a sampler is named by its register, as the shader has it.
+    pub fn material_state(&self, name: &str) -> crate::state::MaterialState {
+        use crate::state::{MaterialState, SamplerState};
+        let mut device: Vec<(String, String)> = [
+            ("DS_CULLMODE", "CULL_CW"),
+            ("DS_SRCBLEND", "BLEND_SRCALPHA"),
+            ("DS_DESTBLEND", "BLEND_INVSRCALPHA"),
+        ]
+        .iter()
+        .map(|(s, v)| (s.to_string(), v.to_string()))
+        .collect();
+        device.extend(
+            self.render_states
+                .iter()
+                .filter_map(|&(s, v)| render_state(s, v))
+                .map(|(s, v)| (s.to_string(), v)),
+        );
+        let stages: std::collections::BTreeSet<u32> = (0..16).collect();
+        let mut samplers = Vec::new();
+        for stage in stages {
+            for (state, value) in [
+                ("SAMP_MINFILTER", "TEXFILT_LINEAR"),
+                ("SAMP_MAGFILTER", "TEXFILT_LINEAR"),
+                ("SAMP_MIPFILTER", "TEXFILT_LINEAR"),
+            ] {
+                samplers.push(SamplerState {
+                    sampler: String::new(),
+                    stage: Some(stage),
+                    state: state.to_string(),
+                    value: value.to_string(),
+                });
+            }
+        }
+        for &(stage, state, value) in &self.sampler_states {
+            if let Some((state, value)) = sampler_state(state, value) {
+                samplers.push(SamplerState {
+                    sampler: String::new(),
+                    stage: Some(stage),
+                    state: state.to_string(),
+                    value: value.to_string(),
+                });
+            }
+        }
+        MaterialState {
+            name: name.to_string(),
+            device,
+            samplers,
+        }
+    }
+}
+
+impl Bmat {
+    /// The pass a [`pass_reference`]'s places name.
+    pub fn pass_at(&self, semantic: usize, technique: usize, pass: usize) -> Option<&Pass> {
+        self.semantics
+            .get(semantic)?
+            .techniques
+            .get(technique)?
+            .passes
+            .get(pass)
+    }
+
+    /// This material as a definition of the kind Dragon Age: Origins' `.mat.xml` gives
+    /// ([`crate::material::MaterialDef`]), for what draws by those: each semantic with the
+    /// one technique drawn here ([`Semantic::technique`]); each pass with its shaders
+    /// (without the `.fxo`, as the XML names them), its parameters (the engine's as
+    /// internal ones, textures by their samplers, the others with their defaults), and in
+    /// place of a state file's name a [`pass_reference`] into `resource` (this material's
+    /// resource name, `static.mat`), by which [`Pass::material_state`] is found again.
+    pub fn definition(&self, resource: &str) -> crate::material::MaterialDef {
+        use crate::material as m;
+        let shader = |name: &str| {
+            let name = name.strip_suffix(".fxo").unwrap_or(name);
+            (!name.is_empty()).then(|| name.to_string())
+        };
+        let semantics = self
+            .semantics
+            .iter()
+            .enumerate()
+            .map(|(si, s)| {
+                let techniques = s
+                    .technique()
+                    .map(|(ti, t)| m::Technique {
+                        name: Some(t.name.clone()),
+                        passes: t
+                            .passes
+                            .iter()
+                            .enumerate()
+                            .map(|(pi, p)| m::Pass {
+                                name: Some(p.name.clone()),
+                                vertex_shader: shader(&p.vertex_shader),
+                                pixel_shader: shader(&p.pixel_shader),
+                                state: Some(pass_reference(resource, si, ti, pi)),
+                                parameter_sets: Vec::new(),
+                                parameters: p
+                                    .engine_parameters
+                                    .iter()
+                                    .map(|e| m::Parameter {
+                                        internal: true,
+                                        ty: String::new(),
+                                        name: e.name.clone(),
+                                        sampler: (!e.sampler.is_empty()).then(|| e.sampler.clone()),
+                                        stage: None,
+                                        usage: None,
+                                        default: None,
+                                    })
+                                    .chain(p.parameters.iter().map(|q| m::Parameter {
+                                        internal: false,
+                                        ty: if q.sampler.is_empty() {
+                                            String::new()
+                                        } else {
+                                            "Texture".to_string()
+                                        },
+                                        name: q.name.clone(),
+                                        sampler: (!q.sampler.is_empty()).then(|| q.sampler.clone()),
+                                        stage: None,
+                                        usage: None,
+                                        default: (!q.default.is_empty()).then(|| q.default.clone()),
+                                    }))
+                                    .collect(),
+                                streams: Vec::new(),
+                            })
+                            .collect(),
+                    })
+                    .into_iter()
+                    .collect();
+                m::Semantic {
+                    name: s.name.clone(),
+                    render_class: (!s.render_class.trim().is_empty())
+                        .then(|| s.render_class.clone()),
+                    logic: vec![m::Logic {
+                        note: None,
+                        test: None,
+                        techniques,
+                        children: Vec::new(),
+                    }],
+                }
+            })
+            .collect();
+        m::MaterialDef {
+            name: resource.to_string(),
+            parameter_sets: Vec::new(),
+            semantics,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

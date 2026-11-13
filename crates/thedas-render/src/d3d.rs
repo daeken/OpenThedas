@@ -126,12 +126,29 @@ fn read_shader(vfs: &Vfs, name: &str) -> Result<Shader, String> {
     Shader::parse(&data).map_err(|e| format!("{res}: {e}"))
 }
 
-fn build(vfs: &Vfs, vs_name: &str, ps_name: &str, state_name: &str) -> Result<D3dProgram, String> {
+/// The render state a pass names: a state file (`<name>.xml`), or for a pass of one of
+/// Dragon Age II's compiled materials the states stored in the material itself (the name
+/// is then a [`thedas_formats::bmat::pass_reference`]).
+fn read_state(vfs: &Vfs, state_name: &str) -> Result<MaterialState, String> {
+    if let Some((resource, s, t, p)) = thedas_formats::bmat::parse_pass_reference(state_name) {
+        let (data, _) = vfs.read(resource).map_err(|e| format!("{resource}: {e}"))?;
+        let material =
+            thedas_formats::bmat::Bmat::parse(&data).map_err(|e| format!("{resource}: {e}"))?;
+        return material
+            .pass_at(s, t, p)
+            .map(|pass| pass.material_state(state_name))
+            .ok_or_else(|| format!("{state_name}: no such pass"));
+    }
     let state_res = format!("{}.xml", state_name.to_ascii_lowercase());
     let (data, _) = vfs
         .read(&state_res)
         .map_err(|e| format!("{state_res}: {e}"))?;
-    let state = MaterialState::parse(&data).map_err(|e| format!("{state_res}: {e}"))?;
+    MaterialState::parse(&data).map_err(|e| format!("{state_res}: {e}"))
+}
+
+fn build(vfs: &Vfs, vs_name: &str, ps_name: &str, state_name: &str) -> Result<D3dProgram, String> {
+    let state_res = state_name.to_ascii_lowercase();
+    let state = read_state(vfs, state_name)?;
     let pass = state.pass().map_err(|e| format!("{state_res}: {e}"))?;
     let vs = read_shader(vfs, vs_name)?;
     let ps = read_shader(vfs, ps_name)?;
@@ -209,10 +226,14 @@ impl D3dSource {
                 continue;
             };
             if let Some(f) = filter {
-                let listed = |(vs, ps, _): &(&str, &str, &str)| {
-                    f.iter().any(|(v, q)| {
-                        v.eq_ignore_ascii_case(vs) && (q == "*" || q.eq_ignore_ascii_case(ps))
-                    })
+                // The list names Dragon Age: Origins' shaders; a pass of one of Dragon Age
+                // II's compiled materials (its state is a reference into the material)
+                // is taken whatever its shaders are called.
+                let listed = |(vs, ps, st): &(&str, &str, &str)| {
+                    thedas_formats::bmat::parse_pass_reference(st).is_some()
+                        || f.iter().any(|(v, q)| {
+                            v.eq_ignore_ascii_case(vs) && (q == "*" || q.eq_ignore_ascii_case(ps))
+                        })
                 };
                 if !passes.iter().all(listed) {
                     continue;
