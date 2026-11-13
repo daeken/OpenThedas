@@ -216,6 +216,36 @@ fn splash_pass(
     }
 }
 
+/// The multiply pass for clips blended with `multiply` in several branches of a movie
+/// (`multiply`, among the visible clips' `paths`): everything beside the branches leading to
+/// them is hidden, and they are shown and drawn normally.
+fn branches_pass(paths: &[&str], multiply: &[&str]) -> thedas_ui::MultiplyPass {
+    let within = |outer: &str, p: &str| {
+        p == outer || p.strip_prefix(outer).is_some_and(|r| r.starts_with('.'))
+    };
+    // On the way to a multiplied clip, one itself, or inside one.
+    let kept = |p: &str| multiply.iter().any(|m| within(p, m) || within(m, p));
+    let leads = |p: &str| p == "_level0" || multiply.iter().any(|m| *m != p && within(p, m));
+    let mut hide: Vec<String> = Vec::new();
+    for p in paths {
+        let beside = !kept(p) && p.rsplit_once('.').is_some_and(|(parent, _)| leads(parent));
+        if beside && !hide.iter().any(|h| h == p) {
+            hide.push(p.to_string());
+        }
+    }
+    let multiply: Vec<String> = multiply.iter().map(|m| m.to_string()).collect();
+    thedas_ui::MultiplyPass {
+        hide,
+        show: multiply.clone(),
+        multiply,
+    }
+}
+
+/// For how long after the death screen comes up its blood is looked for again (its layers
+/// are placed over its first moments), and how often.
+const DEATH_SETTLE_MS: f64 = 6000.0;
+const DEATH_LOOK_MS: f64 = 250.0;
+
 /// For how long after a large notification becomes the first its splash is looked for
 /// (its clip replaces the one before within a few of the movie's frames).
 const UBER_SETTLE_MS: f64 = 1500.0;
@@ -348,6 +378,12 @@ pub struct UiLayer {
     /// The large notification whose splash has been dealt with (see
     /// [`UiLayer::uber_alert_splash`]).
     uber_splash: Option<String>,
+    /// For how long the death screen's blood is still looked for (see `death_blood`): its
+    /// layers come in over the screen's first moments.
+    death_settle: Option<f64>,
+    /// The death screen's multiplied layers found so far (one hidden for the movie's own
+    /// picture is no longer listed among its visible clips, so they are remembered).
+    death_multiply: Vec<String>,
     /// Milliseconds left in which the large notification's splash is looked for again (see
     /// `UiLayer::uber_alert_splash`).
     uber_settle: f64,
@@ -757,6 +793,8 @@ impl UiLayer {
             text_answers: Vec::new(),
             portrait_clicked: None,
             uber_splash: None,
+            death_settle: None,
+            death_multiply: Vec::new(),
             uber_settle: 0.0,
             uber_cut: false,
             notifications_up: false,
@@ -1215,7 +1253,12 @@ impl UiLayer {
         }
         let Some(head) = head else {
             if self.uber_splash.take().is_some() {
-                for m in self.stage.movies.iter_mut() {
+                for m in self
+                    .stage
+                    .movies
+                    .iter_mut()
+                    .filter(|m| m.name == "notifications.gfx")
+                {
                     m.set_multiply_pass(None);
                 }
             }
@@ -1284,6 +1327,99 @@ impl UiLayer {
                 m.set(&format!("{path}._visible"), thedas_ui::UiValue::Bool(false));
                 m.set_multiply_pass(Some(pass));
             }
+        }
+    }
+
+    /// The death screen's blood (deathscreen.gfx): five layers blended with `multiply`, which
+    /// darken what is under them. In the movie's own transparent picture a multiply has
+    /// nothing under it and the layers showed as pale rectangles, so they are drawn in a
+    /// pass of their own and multiplied onto the frame (see `thedas_ui::MultiplyPass`), as
+    /// the large notifications' splash is. The layers overlap, so in the pass they keep
+    /// their blend and are drawn over a white backdrop (a clip added under everything,
+    /// shown only in the pass): the pass's picture is then the layers' product, which is
+    /// what multiplying each in turn gives. Looked for again over the screen's first
+    /// seconds, as its layers are placed. Provisional: the pass multiplies onto the game's
+    /// picture under the whole movie, not onto the movie's own background art as well.
+    fn death_blood(&mut self, dt_ms: f64) {
+        const MOVIE: &str = "deathscreen.gfx";
+        const BACKDROP: &str = "_level0.thedas_white";
+        if !self.stage.movies.iter().any(|m| m.name == MOVIE) {
+            self.death_settle = None;
+            self.death_multiply.clear();
+            return;
+        }
+        let left = self.death_settle.unwrap_or(DEATH_SETTLE_MS);
+        if left <= 0.0 {
+            return;
+        }
+        let next = left - dt_ms;
+        self.death_settle = Some(next);
+        // Each time another `DEATH_LOOK_MS` of the settling time has gone by, and at once.
+        let due = left == DEATH_SETTLE_MS
+            || (left / DEATH_LOOK_MS).floor() != (next / DEATH_LOOK_MS).floor();
+        if !due {
+            return;
+        }
+        let Some(thedas_ui::UiValue::String(tree)) =
+            self.stage.call_in(MOVIE, "_global.thedas_tree_list", &[])
+        else {
+            return;
+        };
+        let paths: Vec<&str> = tree
+            .split(';')
+            .filter_map(|e| e.split('|').next())
+            .filter(|p| !p.is_empty() && *p != BACKDROP)
+            .collect();
+        let found = &mut self.death_multiply;
+        for m in self.stage.movies.iter_mut().filter(|m| m.name == MOVIE) {
+            for p in &paths {
+                let blended = m.call(&format!("{p}.blendMode.toString"), &[])
+                    == thedas_ui::UiValue::String("multiply".into());
+                if blended && !found.iter().any(|f| f == p) {
+                    found.push(p.to_string());
+                }
+            }
+            if found.is_empty() {
+                continue;
+            }
+            let multiply: Vec<&str> = found.iter().map(String::as_str).collect();
+            for p in &multiply {
+                m.set(&format!("{p}._visible"), thedas_ui::UiValue::Bool(false));
+            }
+            // The white backdrop, under every clip of the movie (the lowest depth a script
+            // can use), once.
+            let num = thedas_ui::UiValue::Number;
+            if m.call(&format!("{BACKDROP}._visible.toString"), &[])
+                == thedas_ui::UiValue::Undefined
+            {
+                m.call(
+                    "_level0.createEmptyMovieClip",
+                    &[
+                        thedas_ui::UiValue::String("thedas_white".into()),
+                        num(-16384.0),
+                    ],
+                );
+                m.call(
+                    &format!("{BACKDROP}.beginFill"),
+                    &[num(16_777_215.0), num(100.0)],
+                );
+                let far = 20_000.0;
+                m.call(&format!("{BACKDROP}.moveTo"), &[num(-far), num(-far)]);
+                for (x, y) in [(far, -far), (far, far), (-far, far), (-far, -far)] {
+                    m.call(&format!("{BACKDROP}.lineTo"), &[num(x), num(y)]);
+                }
+                m.call(&format!("{BACKDROP}.endFill"), &[]);
+                m.set(
+                    &format!("{BACKDROP}._visible"),
+                    thedas_ui::UiValue::Bool(false),
+                );
+            }
+            let mut pass = branches_pass(&paths, &multiply);
+            pass.hide.retain(|h| h != BACKDROP);
+            pass.show.push(BACKDROP.into());
+            // The layers keep their blend in the pass.
+            pass.multiply.clear();
+            m.set_multiply_pass(Some(pass));
         }
     }
 
@@ -1883,6 +2019,7 @@ impl UiLayer {
         self.report_button();
         self.select_clicked_portrait(sim);
         self.uber_alert_splash(sim, dt_ms);
+        self.death_blood(dt_ms);
         self.loading_frame(dt_ms);
         self.travel_map_frame();
         let mut messages = self.stage.tick(dt_ms);
@@ -3269,6 +3406,48 @@ mod tests {
         assert!(!damage_number_shows(2, false, true, true, false));
         // Over a bystander: never.
         assert!(!damage_number_shows(1, false, false, true, true));
+    }
+
+    #[test]
+    fn a_branches_pass_keeps_only_the_ways_to_the_multiplied_clips() {
+        let paths = [
+            "_level0.Death_mc",
+            "_level0.Death_mc.DeathHint_mc",
+            "_level0.Death_mc.instance34",
+            "_level0.Death_mc.instance34.Quit_mc",
+            "_level0.Death_mc.AllBlood_mc",
+            "_level0.Death_mc.AllBlood_mc.instance32",
+            "_level0.Death_mc.AllBlood_mc.instance32.instance45",
+            "_level0.Death_mc.AllBlood_mc.instance30",
+            "_level0.Death_mc.AllBlood_mc.instance30.instance31",
+            "_level0.Death_mc.blood_mc",
+            "_level0.Death_mc.blood_mc.instance6",
+            "_level0.Death_mc.blood_mc.instance6.instance7",
+            "_level0.Death_mc.Background_mc",
+            "_level0.Death_mc.Background_mc.instance1",
+            "_level0.Other_mc",
+        ];
+        let multiply = [
+            "_level0.Death_mc.AllBlood_mc.instance32.instance45",
+            "_level0.Death_mc.blood_mc.instance6.instance7",
+        ];
+        let pass = branches_pass(&paths, &multiply);
+        assert_eq!(
+            pass.hide,
+            [
+                // Beside the way, at each level; what is under a hidden clip is not listed.
+                "_level0.Death_mc.DeathHint_mc",
+                "_level0.Death_mc.instance34",
+                "_level0.Death_mc.AllBlood_mc.instance30",
+                "_level0.Death_mc.Background_mc",
+                "_level0.Other_mc",
+            ]
+        );
+        assert_eq!(pass.show, multiply);
+        assert_eq!(pass.multiply, multiply);
+        // Nothing multiplied: nothing shown, and the top level's clips would all be hidden
+        // (the caller sets no pass then).
+        assert!(branches_pass(&paths, &[]).show.is_empty());
     }
 
     #[test]

@@ -91,6 +91,16 @@ impl Game {
     }
 }
 
+/// The base campaign's module folder of the install at `root` (`single player` for Dragon
+/// Age: Origins, `campaign_base` for Dragon Age II): what the tools load when no module is
+/// named. An install that does not open counts as Origins.
+pub fn campaign_module(root: &Path) -> &'static str {
+    DaoInstall::open(root)
+        .map(|i| i.game())
+        .unwrap_or(Game::Origins)
+        .campaign_module()
+}
+
 #[derive(Clone, Debug)]
 pub struct DaoInstall {
     root: PathBuf,
@@ -1288,6 +1298,8 @@ mod tests {
         std::fs::write(data.join("campaign.txt"), b"da2").unwrap();
         let install = DaoInstall::open(&root).unwrap();
         assert_eq!(install.game(), Game::DragonAge2);
+        assert_eq!(campaign_module(&root), "campaign_base");
+        assert_eq!(campaign_module(&root.join("missing")), "single player");
         let vfs = install.global_vfs(TextureQuality::High).unwrap();
         let (bytes, prov) = vfs.read("campaign.txt").unwrap();
         assert_eq!(bytes, b"da2");

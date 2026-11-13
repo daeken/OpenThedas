@@ -221,7 +221,8 @@ fn pretty(v: J) -> String {
 struct LoadArgs {
     /// Install root (the folder with packages/ and modules/); defaults to $THEDAS_INSTALL.
     install: Option<String>,
-    /// Module folder under modules/ (default "single player").
+    /// Module folder under modules/ (default: the install's base campaign, "single player"
+    /// or, for Dragon Age II, "campaign_base").
     module: Option<String>,
     /// Area resource, e.g. "cir110ar_inn" (the Spoiled Princess). Default: the module's start area.
     area: Option<String>,
@@ -973,8 +974,10 @@ impl Server {
             None => return err("no install: pass install or set THEDAS_INSTALL"),
         };
         let opts = SessionOptions {
+            module: a
+                .module
+                .unwrap_or_else(|| thedas_vfs::install::campaign_module(&install).to_string()),
             install,
-            module: a.module.unwrap_or_else(|| "single player".into()),
             area: a.area,
             waypoint: a.waypoint,
             seed: a.seed.unwrap_or(1),
@@ -2098,8 +2101,8 @@ impl Server {
                 let install = install_from_env()
                     .ok_or("no install: set THEDAS_INSTALL (or call load first)")?;
                 let sim = open(&SessionOptions {
+                    module: thedas_vfs::install::campaign_module(&install).to_string(),
                     install,
-                    module: "single player".into(),
                     area: None,
                     waypoint: None,
                     seed: 1,
