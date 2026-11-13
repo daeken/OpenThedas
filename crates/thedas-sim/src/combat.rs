@@ -247,7 +247,10 @@ impl Sim {
             .filter(|c| !c.is_empty());
         let wall = |a: [f32; 3], b: [f32; 3]| match &solid {
             Some(c) => {
-                c.sight_blocked(a, b) || props.as_ref().is_some_and(|p| p.sight_blocked(a, b))
+                c.sight_blocked_standing(a, b)
+                    || props
+                        .as_ref()
+                        .is_some_and(|p| p.sight_blocked_standing(a, b))
             }
             None => grid
                 .as_ref()
