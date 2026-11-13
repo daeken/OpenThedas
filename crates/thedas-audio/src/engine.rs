@@ -46,6 +46,12 @@ pub struct PlayOptions {
     /// Scales the event's distances (a placed sound's `MaxDistanceMult`): the source is
     /// heard as though it were this much closer (below 1: farther).
     pub distance_scale: f32,
+    /// Added to the event's pitch, in its units (a placed sound's `Pitch`).
+    pub pitch: f32,
+    /// Fade-in and fade-out times (ms) replacing the event's (a placed sound's `FadeIn`
+    /// and `FadeOut`).
+    pub fade_in_ms: Option<u32>,
+    pub fade_out_ms: Option<u32>,
 }
 
 impl Default for PlayOptions {
@@ -56,6 +62,9 @@ impl Default for PlayOptions {
             parameters: Vec::new(),
             volume: 1.0,
             distance_scale: 1.0,
+            pitch: 0.0,
+            fade_in_ms: None,
+            fade_out_ms: None,
         }
     }
 }
@@ -406,7 +415,7 @@ impl AudioEngine {
             let u = |e: &mut Self| (e.random() % 32768) as f32 / 32767.0;
             let (u1, u2) = (u(self), u(self));
             event_variation(
-                event.pitch,
+                event.pitch + options.pitch,
                 event.pitch_randomization,
                 event.volume_randomization,
                 event.flags,
@@ -414,7 +423,7 @@ impl AudioEngine {
             )
         };
         let category_gain = category_gain * random_gain;
-        let fade_in = event.fade_in_ms as f32 / 1000.0;
+        let fade_in = options.fade_in_ms.unwrap_or(event.fade_in_ms) as f32 / 1000.0;
         let inst = Instance {
             handle,
             project: project.clone(),
@@ -511,7 +520,12 @@ impl AudioEngine {
         let Some(i) = self.instances.iter_mut().find(|i| i.handle == handle) else {
             return;
         };
-        let fade_out = i.event().map_or(0, |e| e.fade_out_ms) as f32 / 1000.0;
+        let fade_out = i
+            .options
+            .fade_out_ms
+            .or(i.event().map(|e| e.fade_out_ms))
+            .unwrap_or(0) as f32
+            / 1000.0;
         if immediate || fade_out <= 0.0 {
             i.fade = 0.0;
         }
@@ -1377,6 +1391,26 @@ mod tests {
         e.stop(d, true);
         let back = run(&mut e, &m, 0.5);
         assert!((back - full).abs() < 1e-3, "{back}");
+    }
+
+    #[test]
+    fn play_options_replace_the_fades() {
+        // The loop fades out over 100 ms on its own; a 0 ms fade-out stops it at once.
+        let (mut e, m) = engine("fades");
+        let h = e
+            .play(
+                "test/grp/loop",
+                PlayOptions {
+                    fade_in_ms: Some(0),
+                    fade_out_ms: Some(0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // No fade-in: at full level at once.
+        assert!(run(&mut e, &m, 0.02) > 0.0);
+        e.stop(h, false);
+        assert_eq!(run(&mut e, &m, 0.02), 0.0);
     }
 
     #[test]
