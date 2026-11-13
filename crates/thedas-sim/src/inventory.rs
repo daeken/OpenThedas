@@ -771,7 +771,7 @@ impl Sim {
     }
 
     /// Whether `id` is the hero or one of the hero's followers.
-    fn in_party(&self, id: ObjectId) -> bool {
+    pub(crate) fn in_party(&self, id: ObjectId) -> bool {
         let Some(hero) = self.world.hero else {
             return false;
         };
