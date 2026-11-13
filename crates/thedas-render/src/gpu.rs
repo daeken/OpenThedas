@@ -1242,6 +1242,12 @@ impl AreaRenderer {
         }
     }
 
+    /// Adds `lights` to the scene's lights, in place of those added before (see
+    /// [`crate::d3d_gpu::D3dPass::set_extra_lights`]).
+    pub fn set_extra_lights(&mut self, lights: &[crate::scene::SceneLight]) {
+        self.d3d.set_extra_lights(lights);
+    }
+
     /// Lights every draw with `rig` instead of the scene's lights (`None` restores them).
     pub fn set_light_rig(&mut self, rig: Option<crate::scene::LightRig>) {
         self.d3d.set_rig(rig);

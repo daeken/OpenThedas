@@ -325,6 +325,7 @@ impl LightRig {
                         domain: *affect_domain,
                         is_static: is_static.unwrap_or(false),
                         version: version.unwrap_or(0),
+                        intensity: 1.0,
                         room: None,
                     });
                 }
@@ -388,6 +389,10 @@ pub enum SceneLight {
         is_static: bool,
         /// `Version`: 0 or 1, the influence formula (see [`crate::d3d::pick_lights`]).
         version: i64,
+        /// The light's intensity (DAOrigins.exe's light +0x1b4): 1 unless a cutscene drives
+        /// it. It multiplies the colour the shaders are given (0x46b47e) and weighs the
+        /// light when a draw's lights are picked (0x53d35f).
+        intensity: f32,
         /// The room (id) whose layout placed it: it reaches that room and the rooms the
         /// room's [`AreaScene::light_rooms`] lists. `None` for a light a placed object
         /// carries (provisional: it reaches every room).
@@ -2529,6 +2534,7 @@ impl<'a> Loader<'a> {
                     domain: *affect_domain,
                     is_static: is_static.unwrap_or(false),
                     version: version.unwrap_or(0),
+                    intensity: 1.0,
                     room: layout_room,
                 },
                 thedas_formats::model::Light::Ambient { color } => SceneLight::Ambient {

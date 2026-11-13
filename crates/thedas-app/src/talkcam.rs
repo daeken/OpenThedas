@@ -618,6 +618,7 @@ mod tests {
             head_tracks: Vec::new(),
             visibility: Vec::new(),
             weapon_draws: Vec::new(),
+            light: None,
         }
     }
 
