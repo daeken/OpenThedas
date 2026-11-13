@@ -214,6 +214,25 @@ pub struct Conversation {
     pub ambient_run: bool,
 }
 
+/// A conversation said in passing, under way (DAOrigins.exe's ambient dialogs, updated at
+/// 0x6ff570): one line at a time, each for its own time, around a game that goes on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AmbientTalk {
+    pub(crate) c: Conversation,
+    /// The lines and replies it has used: it stops when it comes back to one (chants loop).
+    pub(crate) used: Vec<usize>,
+    /// How long its line still has, in milliseconds.
+    pub(crate) left_ms: i64,
+}
+
+/// How long a line said in passing lasts without a voice, in milliseconds (0xb15250, set
+/// at 0x6fe4f8).
+pub const AMBIENT_LINE_MS: u32 = 7000;
+/// The least a voiced line said in passing lasts, in milliseconds (0xae1998, set at
+/// 0x6fe728 when its voice starts): it ends when this is over and its voice has stopped
+/// (0x6ff713 to 0x6ff748).
+pub const AMBIENT_VOICED_MIN_MS: u32 = 2000;
+
 /// An open conversation as presentation sees it: its dialog (resource name without
 /// `.dlg`), the node being shown (an index into the dialog's line list), its owner and the
 /// player character in it.
@@ -355,6 +374,27 @@ impl Sim {
                 replies.push(r);
             }
         }
+        // A line said in passing takes its time: what follows it is said when it is over
+        // (see [`Sim::advance_ambient`]). Presentation is told of it.
+        if c.ambient_run {
+            let (voiced, ms) = self.ambient_line_time(&c, line);
+            if self.world.ambient_lines.len() >= 64 {
+                self.world.ambient_lines.remove(0);
+            }
+            let text = self.node_text(&node);
+            self.world.ambient_lines.push(crate::world::AmbientLine {
+                speaker,
+                dialog: c.dlg.name.clone(),
+                strref: node.strref,
+                text,
+                female: self.player_is_female(c.player),
+                voiced,
+                seconds: ms as f32 / 1000.0,
+            });
+            c.ended = replies.is_empty();
+            c.replies = replies;
+            return c;
+        }
         // An NPC line followed directly by another NPC line continues on its own (but not
         // round a loop of lines already spoken in this exchange).
         if let Some(&next) = replies.first() {
@@ -486,6 +526,14 @@ impl Sim {
             .read(&format!("{}.dlg", name.to_ascii_lowercase()))
             .ok()
             .and_then(|(data, _)| Dlg::parse(&data, &name))
+            .or_else(|| {
+                // Dragon Age II's conversations are `.cnv` files (see `crate::cnv`).
+                let (data, _) = self
+                    .vfs
+                    .read(&format!("{}.cnv", name.to_ascii_lowercase()))
+                    .ok()?;
+                crate::cnv::dlg_from_cnv(&Gff4::parse(&data).ok()?, &name)
+            })
         else {
             let t = self.world.time_ms;
             self.world.trace.push(TraceEntry::Missing {
@@ -545,13 +593,19 @@ impl Sim {
             None => Conversation { ended: true, ..c },
         };
         if ambient(self) {
-            let c = Conversation {
-                ambient_run: true,
-                staged: Vec::new(),
-                staged_at: None,
-                ..c
-            };
-            self.run_ambient(c);
+            // One at a time for a speaker: a new one takes the place of the one it was
+            // saying. Provisional: what DAOrigins.exe does with a second ambient
+            // conversation of the same owner is not traced.
+            let owner = c.owner;
+            self.ambient.retain(|a| a.c.owner != owner);
+            if let Some(line) = c.line.filter(|_| start.is_some()) {
+                let (_, ms) = self.ambient_line_time(&c, line);
+                self.ambient.push(AmbientTalk {
+                    used: vec![line],
+                    left_ms: i64::from(ms),
+                    c,
+                });
+            }
             return true;
         }
         // A conversation begun over another ends the other's line.
@@ -631,30 +685,111 @@ impl Sim {
         }
     }
 
-    /// Plays an ambient conversation to its end, taking the first reply each time and
-    /// stopping if it comes back to a node it has used (chants loop).
-    fn run_ambient(&mut self, mut c: Conversation) {
-        let mut used: Vec<usize> = c.line.into_iter().collect();
-        for _ in 0..64 {
-            if c.ended {
-                break;
+    /// Whether line `line` of `c` has a voice, and how long it lasts said in passing, in
+    /// milliseconds: [`AMBIENT_LINE_MS`] without a voice, else the voice's length and at
+    /// least [`AMBIENT_VOICED_MIN_MS`] (DAOrigins.exe 0x6fe4a0 and 0x6ff6e5: the line's
+    /// timer, then its voice still playing). The voice's length is read from the
+    /// conversation's bank in the install ([`crate::voice`]); without an install no line is
+    /// voiced. Provisional: the exe counts a line as voiced when its voice started to play,
+    /// so with voices off or a sample that fails it takes the unvoiced time.
+    fn ambient_line_time(&mut self, c: &Conversation, line: usize) -> (bool, u32) {
+        let female = self.player_is_female(c.player);
+        let voice = match (&self.install_root, c.dlg.nodes[line].strref) {
+            (Some(root), Some(strref)) => self.voices.line_ms(root, &c.dlg.name, strref, female),
+            _ => None,
+        };
+        match voice {
+            Some(ms) => (true, ms.max(AMBIENT_VOICED_MIN_MS)),
+            None => (false, AMBIENT_LINE_MS),
+        }
+    }
+
+    /// Whether the player character of a conversation is female (her readings of the lines
+    /// are the `_f` samples).
+    fn player_is_female(&self, player: ObjectId) -> bool {
+        self.world
+            .get(player)
+            .is_some_and(|o| o.fields.get("Gender").copied() == Some(2))
+    }
+
+    /// The conversations said in passing go on by `ms`: one whose line is over says its
+    /// next, taking the first reply each time, or ends (DAOrigins.exe 0x6ff6e5 to 0x6ff7a8:
+    /// the line's floaty goes, then 0x7f1910 picks what follows). Provisional: 0x7f1910 is
+    /// not traced ("the first usable reply, then its first usable line" is how a
+    /// conversation with nobody choosing reads); the exe holds these still in some game
+    /// modes (0x6ff5a3 to 0x6ff633), here they run with the simulation's clock; they are
+    /// not saved.
+    pub(crate) fn advance_ambient(&mut self, ms: u64) {
+        if self.ambient.is_empty() {
+            return;
+        }
+        let mut going = Vec::new();
+        for mut a in std::mem::take(&mut self.ambient) {
+            // Its owner gone or dead, the rest is not said (provisional: not traced).
+            if !self.world.get(a.c.owner).is_some_and(|o| !o.dead) {
+                continue;
             }
-            let Some(&r) = c.replies.first() else { break };
-            if used.contains(&r) {
-                break;
+            a.left_ms -= ms as i64;
+            if a.left_ms > 0 {
+                going.push(a);
+            } else if let Some(a) = self.ambient_next(a) {
+                going.push(a);
             }
-            used.push(r);
+        }
+        // Those a line's action began meanwhile take their speakers' places.
+        let begun = std::mem::take(&mut self.ambient);
+        going.retain(|a| !begun.iter().any(|b| b.c.owner == a.c.owner));
+        going.extend(begun);
+        self.ambient = going;
+    }
+
+    /// The line of an ambient conversation is over: its next line is said, or `None` when
+    /// it has ended (no reply left, or one it has used already).
+    fn ambient_next(&mut self, a: AmbientTalk) -> Option<AmbientTalk> {
+        let AmbientTalk {
+            mut c, mut used, ..
+        } = a;
+        if c.ended {
+            return None;
+        }
+        let &r = c.replies.first()?;
+        if used.contains(&r) {
+            return None;
+        }
+        used.push(r);
+        // A reply nobody chooses is taken; a line that follows a line directly is said.
+        let next = if c.dlg.nodes[r].reply {
             let node = c.dlg.nodes[r].clone();
             self.mark_shown(&mut c, r);
             self.node_action(&node, c.owner);
-            match node.children.iter().copied().find(|&n| self.usable(&c, n)) {
-                Some(n) if !used.contains(&n) => {
-                    used.push(n);
-                    c = self.speak(c, n);
-                }
-                _ => break,
+            let n = node
+                .children
+                .iter()
+                .copied()
+                .find(|&n| self.usable(&c, n))?;
+            if used.contains(&n) {
+                return None;
             }
-        }
+            used.push(n);
+            n
+        } else {
+            r
+        };
+        let c = self.speak(c, next);
+        let (_, ms) = self.ambient_line_time(&c, next);
+        Some(AmbientTalk {
+            c,
+            used,
+            left_ms: i64::from(ms),
+        })
+    }
+
+    /// Stops the conversations `owner` is saying in passing (all of them for
+    /// [`OBJECT_INVALID`]): what was still to be said is not (`ClearAmbientDialogs`,
+    /// DAOrigins.exe 0x6510f0).
+    pub(crate) fn clear_ambient(&mut self, owner: ObjectId) {
+        self.ambient
+            .retain(|a| owner != OBJECT_INVALID && a.c.owner != owner);
     }
 
     /// Picks reply `choice` (an index into the current replies).
@@ -1063,5 +1198,109 @@ mod tests {
         sim.speak(c, 1);
         assert_eq!(sim.world.cutscenes, ["intro"]);
         assert_eq!(sim.world.dialog_cutscenes, ["intro.cut"]);
+    }
+    /// A conversation of remarks said in passing: each line is followed by an unspoken
+    /// reply that leads to the next, or (`direct`) by the next line itself.
+    fn remarks(name: &str, lines: &[&str], direct: bool) -> Dlg {
+        let node = |reply: bool, text: Option<&str>, children: Vec<usize>| Node {
+            reply,
+            strref: None,
+            text: text.map(Into::into),
+            speaker: String::new(),
+            listener: String::new(),
+            condition: PlotRef::default(),
+            action: PlotRef::default(),
+            children,
+            show_once: 0,
+            ambient: !reply,
+            cutscene: None,
+        };
+        let mut nodes = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            let last = i + 1 == lines.len();
+            let at = nodes.len();
+            match (last, direct) {
+                (true, _) => nodes.push(node(false, Some(l), vec![])),
+                (false, true) => nodes.push(node(false, Some(l), vec![at + 1])),
+                (false, false) => {
+                    nodes.push(node(false, Some(l), vec![at + 1]));
+                    nodes.push(node(true, None, vec![at + 2]));
+                }
+            }
+        }
+        Dlg {
+            name: name.into(),
+            starts: vec![0],
+            nodes,
+        }
+    }
+
+    fn passers_by() -> (Sim, ObjectId, ObjectId) {
+        let table = std::sync::Arc::new(thedas_script::EngineTable::default());
+        let mut sim = Sim::new(std::sync::Arc::new(thedas_vfs::Vfs::new()), table, 1);
+        let hero = sim
+            .world
+            .spawn(crate::world::ObjectKind::Creature, "player");
+        let npc = sim.world.spawn(crate::world::ObjectKind::Creature, "guard");
+        sim.world.hero = Some(hero);
+        (sim, hero, npc)
+    }
+
+    fn said(sim: &Sim) -> Vec<&str> {
+        sim.world
+            .ambient_lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_conversation_said_in_passing_says_one_line_at_a_time() {
+        // King Endrin at the feast answered "Quickly, find Trian and send him to me." and
+        // nobody heard it: the whole conversation was run at once and kept from the
+        // presentation.
+        for direct in [false, true] {
+            let (mut sim, hero, npc) = passers_by();
+            assert!(sim.open_conversation(hero, npc, remarks("guard", &["one", "two"], direct)));
+            // No dialog screen: the game goes on, and the presentation is told the line.
+            assert!(sim.talk.is_none());
+            assert_eq!(said(&sim), ["one"]);
+            let l = &sim.world.ambient_lines[0];
+            assert_eq!((l.speaker, l.voiced), (npc, false));
+            assert_eq!(l.seconds, AMBIENT_LINE_MS as f32 / 1000.0);
+            // Unvoiced, a line lasts seven seconds; then the next is said.
+            sim.tick(6000);
+            assert_eq!(said(&sim), ["one"]);
+            sim.tick(1500);
+            assert_eq!(said(&sim), ["one", "two"]);
+            sim.tick(8000);
+            assert_eq!(said(&sim), ["one", "two"]);
+            assert!(sim.ambient.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_speaker_says_one_ambient_conversation_and_can_be_stopped() {
+        let (mut sim, hero, npc) = passers_by();
+        let d = remarks("guard", &["one", "two"], false);
+        // Asked again, the speaker starts over instead of saying both at once.
+        assert!(sim.open_conversation(hero, npc, d.clone()));
+        sim.tick(1000);
+        assert!(sim.open_conversation(hero, npc, d.clone()));
+        assert_eq!(sim.ambient.len(), 1);
+        sim.tick(6500);
+        assert_eq!(said(&sim), ["one", "one"]);
+        sim.tick(1000);
+        assert_eq!(said(&sim), ["one", "one", "two"]);
+        // `ClearAmbientDialogs` stops what was still to be said; so does the speaker's death.
+        assert!(sim.open_conversation(hero, npc, d.clone()));
+        sim.clear_ambient(npc);
+        sim.tick(8000);
+        assert_eq!(said(&sim).len(), 4);
+        assert!(sim.open_conversation(hero, npc, d));
+        sim.world.get_mut(npc).unwrap().dead = true;
+        sim.tick(8000);
+        assert_eq!(said(&sim).len(), 5);
+        assert!(sim.ambient.is_empty());
     }
 }

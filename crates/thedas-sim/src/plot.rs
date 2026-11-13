@@ -97,7 +97,7 @@ impl Composite {
     /// malformed (see [`Composite::well_formed`]), or when it holds a "not" without exactly
     /// one sub-expression (two shipped flags have a "not" of nothing; what the original
     /// makes of that is not known).
-    pub fn eval(&self, flag: &dyn Fn(&str, i32) -> bool) -> Option<bool> {
+    pub fn eval(&self, flag: &mut dyn FnMut(&str, i32) -> bool) -> Option<bool> {
         let mut at = 0;
         let value = self.walk(&mut at, flag, 0)?;
         if at == self.clauses.len() {
@@ -115,7 +115,7 @@ impl Composite {
             return true;
         }
         let mut at = 0;
-        self.walk(&mut at, &|_, _| false, 0).is_some() && at == self.clauses.len()
+        self.walk(&mut at, &mut |_, _| false, 0).is_some() && at == self.clauses.len()
     }
 
     /// Walks one sub-expression from clause `at`, leaving `at` past it. The outer `None` is
@@ -123,7 +123,7 @@ impl Composite {
     fn walk(
         &self,
         at: &mut usize,
-        flag: &dyn Fn(&str, i32) -> bool,
+        flag: &mut dyn FnMut(&str, i32) -> bool,
         depth: usize,
     ) -> Option<Option<bool>> {
         // Shipped expressions nest three deep at most; this only bounds malformed input.
@@ -442,6 +442,25 @@ impl Sim {
     ) -> bool {
         let key = self.plot_key(plot);
         let defined = flag >= DEFINED_FLAGS;
+        // A Dragon Age II composite flag: the plot file states its value as an expression
+        // over other flags (see [`Composite`]), so no script is asked. Provisional: the
+        // evaluation is not traced in DragonAge2.exe. A flag already being answered (a cycle)
+        // and an expression with no value read false.
+        if defined {
+            if let Some(c) = self
+                .plot_info(plot)
+                .and_then(|p| p.composites.get(&flag).cloned())
+            {
+                let asking = (key, flag);
+                if self.plots.asking.contains(&asking) {
+                    return false;
+                }
+                self.plots.asking.push(asking);
+                let value = c.eval(&mut |guid, f| self.get_plot_flag(guid, f, false, owner));
+                self.plots.asking.pop();
+                return value.unwrap_or(false);
+            }
+        }
         if defined || call_script {
             if let Some(script) = self.plot_info(plot).and_then(|p| p.script.clone()) {
                 // A plot script that reads the flag it is answering would recurse forever;
@@ -655,7 +674,7 @@ mod tests {
             clauses: vec![(1, 3), (0, 0), (3, 1), (0, 1), (2, 2), (0, 2), (0, 3)],
         };
         let with = |set: &'static [(&'static str, i32)]| {
-            c.eval(&move |guid, flag| set.contains(&(guid, flag)))
+            c.eval(&mut move |guid, flag| set.contains(&(guid, flag)))
         };
         assert_eq!(with(&[("P", 1), ("Q", 4)]), Some(true));
         assert_eq!(with(&[("P", 1), ("P", 2), ("Q", 4)]), Some(false));
@@ -667,34 +686,34 @@ mod tests {
             operands: vec![("P".into(), 1)],
             clauses,
         };
-        assert_eq!(bad(vec![]).eval(&|_, _| true), None, "no expression");
+        assert_eq!(bad(vec![]).eval(&mut |_, _| true), None, "no expression");
         assert!(bad(vec![]).well_formed());
         // A "not" of nothing (two shipped flags): well formed, value unknown, and an "all"
         // around it is false only if another term is.
         let odd = bad(vec![(1, 2), (0, 0), (3, 0)]);
         assert!(odd.well_formed());
-        assert_eq!(odd.eval(&|_, _| true), None);
-        assert_eq!(odd.eval(&|_, _| false), Some(false));
+        assert_eq!(odd.eval(&mut |_, _| true), None);
+        assert_eq!(odd.eval(&mut |_, _| false), Some(false));
         assert!(!bad(vec![(1, 2), (0, 0)]).well_formed());
         assert!(!bad(vec![(0, 5)]).well_formed());
         assert!(!bad(vec![(9, 1), (0, 0)]).well_formed());
         assert_eq!(
-            bad(vec![(0, 5)]).eval(&|_, _| true),
+            bad(vec![(0, 5)]).eval(&mut |_, _| true),
             None,
             "operand past the list"
         );
         assert_eq!(
-            bad(vec![(1, 2), (0, 0)]).eval(&|_, _| true),
+            bad(vec![(1, 2), (0, 0)]).eval(&mut |_, _| true),
             None,
             "ends early"
         );
         assert_eq!(
-            bad(vec![(0, 0), (0, 0)]).eval(&|_, _| true),
+            bad(vec![(0, 0), (0, 0)]).eval(&mut |_, _| true),
             None,
             "left over"
         );
         assert_eq!(
-            bad(vec![(9, 1), (0, 0)]).eval(&|_, _| true),
+            bad(vec![(9, 1), (0, 0)]).eval(&mut |_, _| true),
             None,
             "unknown operator"
         );
@@ -790,8 +809,8 @@ mod tests {
         let c = &p.composites[&256];
         assert_eq!(c.operands, vec![("FFEE".to_string(), 12)]);
         // not(FFEE flag 12)
-        assert_eq!(c.eval(&|_, _| false), Some(true));
-        assert_eq!(c.eval(&|g, f| g == "FFEE" && f == 12), Some(false));
+        assert_eq!(c.eval(&mut |_, _| false), Some(true));
+        assert_eq!(c.eval(&mut |g, f| g == "FFEE" && f == 12), Some(false));
         // The caller's resource name wins when it gives one.
         assert_eq!(plots_from_gff4(&g, "plt_x")[0].resref, "plt_x");
     }

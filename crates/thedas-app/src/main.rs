@@ -183,8 +183,9 @@ struct Args {
     /// `pad stick-right X,Y MS` (a stick held there while the game runs MS, then let go).
     #[arg(long, default_value = "")]
     steps: String,
-    /// Module for `--save` and `--objects`.
-    #[arg(long, default_value = "single player")]
+    /// Module for `--save` and `--objects`; the install's base campaign when not given
+    /// (`single player`, or `campaign_base` for Dragon Age II).
+    #[arg(long, default_value = "")]
     module: String,
     /// Window, playing: take input from local clients on this loopback address
     /// (`127.0.0.1:7878`), as `thedas-mcp`'s `attach` sends it.
@@ -3388,6 +3389,7 @@ fn audio_state(
         movie,
         ..Default::default()
     };
+    let mut ambient = Vec::new();
     if let Some(ui) = ui {
         state.gui_sounds = ui.stage.bridge.drain_sounds();
         // Character creation's voice previews: always said, by nobody in particular.
@@ -3395,6 +3397,7 @@ fn audio_state(
             state.sound_sets.push((set, entry, 1.0, None));
         }
         state.volumes = audio::volumes(|n| ui.client_option(n));
+        ambient = ui.drain_ambient_lines();
     }
     let Some(live) = live else {
         return state;
@@ -3534,6 +3537,28 @@ fn audio_state(
                 a.set_cutscene(&c.name, tracks);
             }
             state.cutscene = Some((c.name.clone(), c.elapsed_ms as f32 / 1000.0));
+        }
+    }
+    // Lines said in passing, at their speakers' heads.
+    {
+        let sim = live.sim();
+        for l in ambient {
+            let Some(strref) = l.strref else {
+                continue;
+            };
+            let at = sim.world.get(l.speaker).map(|o| {
+                let p = o.position;
+                [p[0], p[1], p[2] + live.head_height(o.id)]
+            });
+            state.ambient_lines.push((
+                audio::VoiceLine {
+                    dialog: l.dialog,
+                    strref,
+                    female: l.female,
+                    ambient: true,
+                },
+                at,
+            ));
         }
     }
     // Sounds the simulation asked for (scripts, character creation's voice preview).
@@ -4427,7 +4452,7 @@ fn main() -> Result<()> {
     report::init_logging(env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
     ));
-    let args = Args::parse();
+    let mut args = Args::parse();
     // A client's or a test's run sends and fetches nothing (see `upload::online`).
     if args.control.is_some() || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some() {
         upload::set_automated();
@@ -4437,6 +4462,7 @@ fn main() -> Result<()> {
         if let Some(exe) = update::newest_build() {
             match std::process::Command::new(&exe)
                 .args(std::env::args_os().skip(1))
+                .envs(update::program_dir().map(|d| (update::PROGRAM_DIR, d)))
                 .spawn()
             {
                 Ok(_) => {
@@ -4455,6 +4481,9 @@ fn main() -> Result<()> {
         .install
         .or_else(|| std::env::var_os("THEDAS_INSTALL").map(PathBuf::from))
         .context("give --install or set THEDAS_INSTALL")?;
+    if args.module.is_empty() {
+        args.module = thedas_vfs::install::campaign_module(&install).to_string();
+    }
     let size = parse_size(&args.size)?;
     let saves_dir = args
         .saves

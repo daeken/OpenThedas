@@ -151,6 +151,11 @@ pub struct Sim {
     /// (`DialogIsAmbient`; DAOrigins.exe's server flag at +0x214).
     pub(crate) dialog_ambient: bool,
     pub(crate) talk: Option<crate::dialog::Conversation>,
+    /// The conversations being said in passing (see [`crate::dialog::AmbientTalk`]). Not
+    /// saved.
+    pub(crate) ambient: Vec<crate::dialog::AmbientTalk>,
+    /// The install's voice banks, for the lengths of voiced lines.
+    pub voices: crate::voice::Voices,
     pub(crate) plots: crate::plot::Plots,
     /// The talk tables' strings, read once (tests set them).
     pub(crate) strings: std::sync::OnceLock<std::collections::BTreeMap<u32, String>>,
@@ -583,6 +588,8 @@ impl Sim {
             current_effect: None,
             current_effect_target: None,
             dialog_ambient: false,
+            ambient: Vec::new(),
+            voices: crate::voice::Voices::new(),
             install_root: None,
             area_layouts: HashMap::new(),
             nav_grids: HashMap::new(),
@@ -971,6 +978,7 @@ impl Sim {
             .instant_vfx
             .retain(|v| v.started_ms + crate::world::INSTANT_VFX_MS > end);
         self.leave_conversation_mode();
+        self.advance_ambient(ms);
         self.update_perception();
         self.keep_party_together();
         let mut held = 0;
@@ -3330,6 +3338,7 @@ impl Sim {
     /// area and the area tree. Creates the module object, the hero and the party.
     pub fn load_module(&mut self, install_root: &Path, module_dir: &str) -> Result<(), SimError> {
         self.install_root = Some(install_root.to_path_buf());
+        self.voices.module = module_dir.to_string();
         let dir = thedas_vfs::join_ci(install_root, &format!("modules/{module_dir}"));
         let cif = std::fs::read_dir(&dir)
             .map_err(|_| SimError::NotFound(dir.display().to_string()))?
@@ -3780,7 +3789,10 @@ impl Sim {
 fn apply_template(o: &mut crate::world::Object, t: &Gff3) {
     let Some(r) = t.structs.first() else { return };
     o.script = resref_field(r, "EventScript").or_else(|| resref_field(r, "ScriptResRefID"));
-    o.dialog = resref_field(r, "DialogResRef").or_else(|| resref_field(r, "Conversation"));
+    // Dragon Age II's templates name it `ConversationResR` (a 16-character GFF3 label).
+    o.dialog = resref_field(r, "DialogResRef")
+        .or_else(|| resref_field(r, "Conversation"))
+        .or_else(|| resref_field(r, "ConversationResR"));
     o.name_strref = strref(r, "LocName");
     o.immortal = int(r, "Immortal").unwrap_or(0) != 0;
     o.plot = int(r, "Plot").unwrap_or(0) != 0;

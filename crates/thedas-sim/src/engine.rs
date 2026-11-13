@@ -2834,9 +2834,12 @@ pub fn call(
         // always the line's.
         "DialogIsAmbient" => ok(b(h.sim.dialog_ambient)),
         // DAOrigins.exe (0x6510f0) stops the ambient lines still to be spoken by an object
-        // (all of them for OBJECT_INVALID) and returns TRUE. The simulation plays an ambient
-        // conversation to its end when it starts, so none are ever waiting.
-        "ClearAmbientDialogs" => ok(Value::Int(1)),
+        // (all of them for OBJECT_INVALID) and returns TRUE.
+        "ClearAmbientDialogs" => {
+            let o = obj(a, 0);
+            h.sim.clear_ambient(o);
+            ok(Value::Int(1))
+        }
         "SetTacticPresetID" => {
             h.sim.apply_tactic_preset(obj(a, 0), int(a, 1));
             void()
