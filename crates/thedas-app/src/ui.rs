@@ -243,6 +243,25 @@ struct Floaty {
     left_s: f64,
 }
 
+/// Whether a floaty of `style` over a creature shows (DAOrigins.exe 0x6a7414-0x6a749e):
+/// a damage number (`FLOATY_HIT` 1, `FLOATY_CRITICAL_HIT` 2) shows over a party member
+/// when the party's numbers are on (`ShowPartyDamageNumbers`), otherwise over a hostile
+/// when the hostiles' are (`ShowHostileDamageNumbers`), and over no one else; any other
+/// floaty shows. Provisional: the exe's first test (0x631830 on the object from 0x5d57c0)
+/// is taken to be membership of the party.
+fn damage_number_shows(
+    style: i32,
+    in_party: bool,
+    hostile: bool,
+    party_numbers: bool,
+    hostile_numbers: bool,
+) -> bool {
+    if style != 1 && style != 2 {
+        return true;
+    }
+    (in_party && party_numbers) || (hostile && hostile_numbers)
+}
+
 /// A floaty's scale at `d` metres from the camera (DAOrigins.exe 0x63bfa0): full size up to
 /// 5 m, shrinking linearly to two thirds at 30 m and beyond. (Its alpha, 0x63c020, runs from
 /// 1 at 2 m to 1 at 7 m: always 1.)
@@ -2102,7 +2121,33 @@ impl UiLayer {
         let vp = camera.view_proj(w / h.max(1.0));
         {
             let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+            // Damage numbers (`FLOATY_HIT`, `FLOATY_CRITICAL_HIT`) follow the options, as the
+            // exe's floaty handler does (0x6a7414-0x6a749e): over a party member with "party
+            // damage numbers" on, else over a hostile with "hostile damage numbers" on, else
+            // not at all. Other floaties always show.
+            let option = |name: &str| {
+                self.shown
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.options.get(name).copied())
+                    .unwrap_or(1.0)
+                    != 0.0
+            };
+            let (party_numbers, hostile_numbers) = (
+                option("GameOptions.ShowPartyDamageNumbers"),
+                option("GameOptions.ShowHostileDamageNumbers"),
+            );
+            let members = thedas_sim::engine::party_of(&sim);
             for f in std::mem::take(&mut sim.world.floaties) {
+                if !damage_number_shows(
+                    f.style,
+                    members.contains(&f.target),
+                    members.iter().any(|&m| sim.hostile(m, f.target)),
+                    party_numbers,
+                    hostile_numbers,
+                ) {
+                    continue;
+                }
                 let id = self.next_floaty;
                 self.next_floaty += 1;
                 create.push(num(f64::from(id)));
@@ -2757,6 +2802,19 @@ fn gui_id(s: Screen, container: bool) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn damage_numbers_follow_the_options_and_other_floaties_always_show() {
+        // A message shows whatever the options.
+        assert!(damage_number_shows(0, false, false, false, false));
+        // Over a party member: the party's option; over a hostile: the hostiles'.
+        assert!(damage_number_shows(1, true, false, true, false));
+        assert!(!damage_number_shows(1, true, false, false, true));
+        assert!(damage_number_shows(2, false, true, false, true));
+        assert!(!damage_number_shows(2, false, true, true, false));
+        // Over a bystander: never.
+        assert!(!damage_number_shows(1, false, false, true, true));
+    }
 
     #[test]
     fn a_splash_pass_hides_everything_beside_the_splash_branch() {
