@@ -308,8 +308,9 @@ pub struct AnimationTrack {
     pub root_positions: Vec<[f32; 4]>,
     /// Field 5409 (+0xbc): the root's turn, keys of (seconds, x, y, z, w).
     pub root_rotations: Vec<[f32; 5]>,
-    /// Field 5410 (+0x81): the root motion does not move the actor (the executable takes
-    /// another path, 0x7d8180, which is not followed).
+    /// Field 5410 (+0x81): the root motion does not move the actor. Provisional: the
+    /// executable takes another path for such a track (0x7d8180), which is not traced, so
+    /// what the boolean means is inferred from the branch alone.
     pub root_held: bool,
 }
 
@@ -344,12 +345,11 @@ impl AnimationTrack {
         }
         let at = self.time_at(t);
         // The keys either side of `at` and how far between them it is.
-        fn span(times: impl Iterator<Item = f32>, at: f32) -> Option<(usize, usize, f32)> {
-            let times: Vec<f32> = times.collect();
-            let last = times.len().checked_sub(1)?;
-            let next = times.iter().position(|&k| k >= at).unwrap_or(last);
+        fn span<const N: usize>(keys: &[[f32; N]], at: f32) -> Option<(usize, usize, f32)> {
+            let last = keys.len().checked_sub(1)?;
+            let next = keys.iter().position(|k| k[0] >= at).unwrap_or(last);
             let prev = next.saturating_sub(1);
-            let (a, b) = (times[prev], times[next]);
+            let (a, b) = (keys[prev][0], keys[next][0]);
             let f = if b > a && at > a {
                 ((at - a) / (b - a)).clamp(0.0, 1.0)
             } else if at >= b {
@@ -359,14 +359,14 @@ impl AnimationTrack {
             };
             Some((prev, next, f))
         }
-        let position = match span(self.root_positions.iter().map(|k| k[0]), at) {
+        let position = match span(&self.root_positions, at) {
             Some((a, b, f)) => {
                 let (a, b) = (self.root_positions[a], self.root_positions[b]);
                 [1, 2, 3].map(|i| a[i] + (b[i] - a[i]) * f)
             }
             None => [0.0; 3],
         };
-        let rotation = match span(self.root_rotations.iter().map(|k| k[0]), at) {
+        let rotation = match span(&self.root_rotations, at) {
             Some((a, b, f)) => {
                 let (a, b) = (self.root_rotations[a], self.root_rotations[b]);
                 let (qa, mut qb) = ([a[1], a[2], a[3], a[4]], [b[1], b[2], b[3], b[4]]);
