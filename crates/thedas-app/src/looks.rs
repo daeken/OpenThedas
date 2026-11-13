@@ -6,13 +6,15 @@
 //! other as its look target, 0x69eaa0, and its tracker is started, 0x6cab00). The trackers'
 //! table is `look_at.gda` (table 229), whose animations are rows of `ANIM_base`.
 //!
+//! A cutscene's actors, and those of a line with its own cinematics, look where its head
+//! tracking actions say instead ([`thedas_sim::cuttracks::HeadTrack`]).
+//!
 //! Provisional: the tracker looks from the creature's head at rest height to the other's,
 //! measured against the creature's facing (the executable reads nodes of the models,
 //! 0x6ca450); a creature is taken to have the head and eye pose animations when its own
 //! trees are the humanoid ones (they are `humanoid_overlay.anb`'s; which overlay tree a
 //! creature plays is not traced), and no creature here has the body's. Not followed: the
-//! glances creatures give the party while exploring (0x6cad80), a cutscene's head tracking
-//! actions (kind 28), and the listener of a line with its own cinematics.
+//! glances creatures give the party while exploring (0x6cad80) and `SetLookAtEnabled`.
 
 use std::collections::HashMap;
 
@@ -88,7 +90,10 @@ pub struct Sight {
     pub origin: Vec3,
     /// The creature's facing.
     pub base: Quat,
-    pub target: Vec3,
+    /// None: straight ahead.
+    pub target: Option<Vec3>,
+    /// What the tracker's speeds are multiplied by (1 but for a cutscene's actions).
+    pub speed: f32,
 }
 
 #[derive(Default)]
@@ -143,8 +148,9 @@ impl Looks {
         match sight {
             Some(s) => {
                 tracker.start();
+                tracker.set_speed_scale(s.speed);
                 tracker.set_origin(s.origin, s.base);
-                tracker.set_target(Some(s.target));
+                tracker.set_target(s.target);
             }
             None => tracker.stop(),
         }

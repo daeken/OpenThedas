@@ -1487,16 +1487,28 @@ impl Live {
             .looks_clock
             .map_or(0.0, |was| (self.shader_time - was).clamp(0.0, 0.25) as f32);
         self.looks_clock = Some(self.shader_time);
-        let sights: std::collections::HashMap<ObjectId, crate::looks::Sight> = pairs
+        // A cutscene's actors look where its head tracking actions say; the others as the
+        // conversation has them.
+        let wants: Vec<(ObjectId, Option<ObjectId>, f32)> = pairs
             .iter()
-            .filter_map(|&(from, to)| {
+            .filter(|(from, _)| !posing.contains_key(from))
+            .map(|&(from, to)| (from, Some(to), 1.0))
+            .chain(posing.iter().filter_map(|(id, show)| {
+                let look = show.look?;
+                Some((*id, look.target, look.speed))
+            }))
+            .collect();
+        let sights: std::collections::HashMap<ObjectId, crate::looks::Sight> = wants
+            .iter()
+            .filter_map(|&(from, to, speed)| {
                 let place = |id| self.posed.iter().find(|p| p.0 == id).map(|p| p.1);
                 let head = |id, t: Mat4| t.w_axis.truncate() + glam::Vec3::Z * self.head_height(id);
-                let (a, b) = (place(from)?, place(to)?);
+                let a = place(from)?;
                 let sight = crate::looks::Sight {
                     origin: head(from, a),
                     base: glam::Quat::from_mat4(&a),
-                    target: head(to, b),
+                    target: to.and_then(|to| Some(head(to, place(to)?))),
+                    speed,
                 };
                 Some((from, sight))
             })
@@ -1582,12 +1594,8 @@ impl Live {
                 None => (m.position, m.facing),
             };
             // Head tracking: the pose animations of a creature that looks at another, or is
-            // turning back from it. A cutscene's actors are left to its own head tracking
-            // actions, which are not followed.
-            let sight = sights
-                .get(&m.id)
-                .copied()
-                .filter(|_| !posing.contains_key(&m.id));
+            // turning back from it.
+            let sight = sights.get(&m.id).copied();
             if (sight.is_some() || self.looks.has(m.id))
                 && let Some(c) = c.as_mut()
                 && crate::looks::humanoid(&c.trees)

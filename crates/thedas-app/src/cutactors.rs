@@ -84,6 +84,18 @@ pub struct ActorShow {
     pub snaps: bool,
     /// Its animations, the later over the earlier.
     pub animations: Vec<CutAnimation>,
+    /// What its head tracker is told, when a head tracking action has started for it.
+    pub look: Option<ActorLook>,
+}
+
+/// What a cutscene's head tracking action tells an actor's head tracker (see
+/// [`thedas_sim::cuttracks::HeadTrack`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ActorLook {
+    /// The drawn object looked at; none: straight ahead.
+    pub target: Option<ObjectId>,
+    /// What the tracker's speeds are multiplied by.
+    pub speed: f32,
 }
 
 /// What the cutscenes playing show: the world's creatures (by id) and the cutscene's own,
@@ -306,11 +318,20 @@ fn show(tracks: &Tracks, i: usize, at: &Moment) -> Option<ActorShow> {
                 }),
         )
         .collect();
+    let look = a.head_track_at(t).map(|h| ActorLook {
+        target: h
+            .target
+            .filter(|id| *id != a.id)
+            .and_then(|id| tracks.actors.iter().position(|x| x.id == id))
+            .and_then(|j| drawn_object(tracks, at.bound, j)),
+        speed: h.speed,
+    });
     Some(ActorShow {
         position: pose.position,
         facing: facing_of(pose.rotation).unwrap_or(0.0),
         snaps: a.snaps,
         animations,
+        look,
     })
 }
 

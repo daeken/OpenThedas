@@ -613,6 +613,7 @@ mod tests {
                 by_place,
             }],
             links: Vec::new(),
+            head_tracks: Vec::new(),
         }
     }
 

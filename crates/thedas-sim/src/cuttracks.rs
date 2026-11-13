@@ -45,6 +45,7 @@
 //!   [`CameraJump`].
 //! - Kind 19, the frame buffer effect action (`AFBE`): see [`FrameEffectTrack`].
 //! - Kind 27, `ActionLinkToActor` (built by 0x7db900, update 0x7d3cf0): see [`ActorLink`].
+//! - Kind 28, `ActionHeadtracking` (built by 0x7da820, update 0x7d0d00): see [`HeadTrack`].
 //!
 //! Provisional: which way a camera actor looks (taken as its local +Y, as a stage camera's;
 //! up is +Z); whether a field of view is vertical; tracks outside their span (a track is
@@ -85,6 +86,8 @@ const FIELD_PARAMETER_VALUE: u32 = 5524;
 const FIELD_PARAMETER_CURVE: u32 = 5525;
 const FIELD_PARAMETER_COMPONENT: u32 = 5526;
 const FIELD_JUMP_BY_PLACE: u32 = 5570;
+const FIELD_LOOK_TARGET: u32 = 5620;
+const FIELD_LOOK_SPEED: u32 = 5621;
 const FIELD_LINK_TARGET: u32 = 5630;
 const FIELD_LINK_NODE: u32 = 5631;
 const FIELD_LINK_BY_BONE: u32 = 5636;
@@ -113,6 +116,7 @@ pub const TRACK_MOVE_SPLINE: u64 = 17;
 pub const TRACK_ROTATE: u64 = 18;
 pub const TRACK_FRAME_EFFECT: u64 = 19;
 pub const TRACK_LINK_TO_ACTOR: u64 = 27;
+pub const TRACK_HEAD_TRACKING: u64 = 28;
 pub const TRACK_JUMP_TO_CAMERA: u64 = 24;
 pub const TRACK_JUMP_TO_PLACE: u64 = 25;
 pub const TRACK_SNAP_TO_WALKMESH: u64 = 38;
@@ -496,6 +500,26 @@ impl ActorLink {
     }
 }
 
+/// An `ActionHeadtracking` track (kind 28; `ACHT`): what the actor's head tracker looks at.
+///
+/// Traced (update 0x7d0d00): as the action starts, the actor's creature's head tracker is
+/// started (0x6cab00) and its turn speeds are scaled by field 5621 (0x6c9f10); each update
+/// it is given the place to look at on the actor whose id (5201) is field 5620, and with
+/// no such actor, or the actor itself, it looks straight ahead. Fields 5628 and 5629
+/// (booleans) are not followed.
+///
+/// Provisional: nothing was seen to stop the tracker when the action ends, so the actor is
+/// taken to go on looking as its last started action said ([`Actor::head_track_at`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeadTrack {
+    pub start: f32,
+    pub end: f32,
+    /// The id (5201) of the actor looked at; `None` when the field is absent.
+    pub target: Option<i64>,
+    /// Field 5621: what the tracker's speeds are multiplied by.
+    pub speed: f32,
+}
+
 /// Where a cutscene's actor (an index into [`Tracks::actors`]) is drawn in the world: its
 /// model's root's position and rotation (x, y, z, w). `None` when it is not drawn.
 pub type RootLookup<'a> = dyn Fn(usize) -> Option<([f32; 3], [f32; 4])> + 'a;
@@ -553,6 +577,8 @@ pub struct Actor {
     pub camera_jumps: Vec<CameraJump>,
     /// Kind-27 tracks, in the file's order.
     pub links: Vec<ActorLink>,
+    /// Kind-28 tracks, in the file's order.
+    pub head_tracks: Vec<HeadTrack>,
 }
 
 /// Where an actor is at a moment of the cutscene.
@@ -567,6 +593,15 @@ pub struct Pose {
 }
 
 impl Actor {
+    /// The head tracking action that says where the actor looks `t` seconds in: the last
+    /// started (see [`HeadTrack`]).
+    pub fn head_track_at(&self, t: f32) -> Option<&HeadTrack> {
+        self.head_tracks
+            .iter()
+            .filter(|h| h.start <= t + KEY_SNAP)
+            .max_by(|a, b| a.start.total_cmp(&b.start))
+    }
+
     /// The node of the cutscene's animation tree that is the actor's base pose: `pose_<n>`
     /// for its pose number (field 5211). The executable makes the name with `pose_%d`
     /// (0x7ce490, the string at 0xb23164) and plays it under the actor's animation tracks
@@ -949,6 +984,7 @@ impl Tracks {
                 places: Vec::new(),
                 camera_jumps: Vec::new(),
                 links: Vec::new(),
+                head_tracks: Vec::new(),
             };
             for tr in structs(g, a, FIELD_ACTOR_TRACKS) {
                 let Some(kind) = g.field(tr, FIELD_TRACK_KIND).and_then(Value::as_u64) else {
@@ -1020,6 +1056,17 @@ impl Tracks {
                                 keep_offset: flag(FIELD_LINK_KEEP_OFFSET),
                             });
                         }
+                    }
+                    TRACK_HEAD_TRACKING => {
+                        actor.head_tracks.push(HeadTrack {
+                            start,
+                            end,
+                            target: g.field(tr, FIELD_LOOK_TARGET).and_then(Value::as_i64),
+                            speed: g
+                                .field(tr, FIELD_LOOK_SPEED)
+                                .and_then(Value::as_f64)
+                                .map_or(1.0, |v| v as f32),
+                        });
                     }
                     TRACK_FRAME_EFFECT => {
                         let effect = g
@@ -1998,6 +2045,7 @@ mod tests {
             places: Vec::new(),
             camera_jumps: Vec::new(),
             links: Vec::new(),
+            head_tracks: Vec::new(),
         };
         assert_eq!(a.pose_node().as_deref(), Some("pose_17"));
         a.pose = Some(0);
@@ -2064,6 +2112,7 @@ mod tests {
             places: Vec::new(),
             camera_jumps: Vec::new(),
             links: Vec::new(),
+            head_tracks: Vec::new(),
         };
         let none: &PlaceLookup = &|_| None;
         let before = a.stage_pose_at(1.0, none);

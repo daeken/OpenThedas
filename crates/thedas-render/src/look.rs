@@ -225,6 +225,8 @@ pub struct Tracker {
     target: Option<Vec3>,
     /// Where it looks with no target (relative to its base).
     explicit: Quat,
+    /// What the parts' speeds are scaled by.
+    scale: f32,
 }
 
 impl Tracker {
@@ -244,6 +246,7 @@ impl Tracker {
             base: Quat::IDENTITY,
             target: None,
             explicit: Quat::IDENTITY,
+            scale: 1.0,
         }
     }
 
@@ -277,6 +280,10 @@ impl Tracker {
     /// Scales the parts' speeds from the table's (0x6c9f10): a cutscene's head tracking
     /// action gives its own scale.
     pub fn set_speed_scale(&mut self, scale: f32) {
+        if scale == self.scale {
+            return;
+        }
+        self.scale = scale;
         for p in &mut self.parts {
             p.slow = p.config.slow * scale;
             p.fast = p.config.fast * scale;
