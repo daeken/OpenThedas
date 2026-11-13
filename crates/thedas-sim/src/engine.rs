@@ -4109,8 +4109,9 @@ pub fn call(
             let id = obj(a, 0);
             let in_party = party_of(h.sim).contains(&id);
             ok(b(!in_party
-                && h.object(id)
-                    .is_some_and(|o| o.fields.get("NoPermDeath").copied().unwrap_or(0) == 0)))
+                && h.object(id).is_some_and(|o| {
+                    o.fields.get("NoPermDeath").copied().unwrap_or(0) == 0
+                })))
         }
         // A placeable's treasure category and rank, as its instance sets them (`TreasureCategory`,
         // `Rank`). Provisional: the rank is taken to be the placed object's `Rank`.
