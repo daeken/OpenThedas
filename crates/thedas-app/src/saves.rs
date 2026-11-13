@@ -7,7 +7,7 @@
 //! layout is ours. Provisional: one hero's saves only (the screens' hero list holds the one
 //! playing), no screenshots, every save of the manual kind.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use thedas_ui::binding::SaveListing;
@@ -32,12 +32,22 @@ pub struct SaveMeta {
     pub class: i32,
 }
 
-/// The player's own folder for the game's saves and settings: `.openthedas` in the home
-/// folder (`HOME`, or `USERPROFILE` on Windows), or beside the game when neither is set.
+/// The player's own folder for the game's saves and settings. On Windows it is
+/// `OpenThedas` in the player's Documents (the known folder, which may be redirected, e.g. to
+/// OneDrive), where the original keeps its own (`BioWare\Dragon Age`); elsewhere
+/// `.openthedas` in the home folder (`HOME`). Beside the game when neither is found.
 pub fn data_dir() -> PathBuf {
-    let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
-    match var("HOME").or_else(|| var("USERPROFILE")) {
-        Some(h) => Path::new(&h).join(".openthedas"),
+    if cfg!(windows) {
+        if let Some(d) = dirs::document_dir() {
+            return d.join("OpenThedas");
+        }
+    }
+    let home = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir);
+    match home {
+        Some(h) => h.join(".openthedas"),
         None => PathBuf::from(".openthedas"),
     }
 }

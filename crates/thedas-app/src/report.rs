@@ -15,7 +15,9 @@
 //!   (`Trace::recent`), oldest first;
 //! - `input.txt`: the player's input over the last [`INPUT_WINDOW`], timed from the earlier
 //!   save;
-//! - `note.txt`: what the player typed about it.
+//! - `note.txt`: what the player typed about it, in the game's own text box (either of
+//!   its buttons keeps the report; before a game, where there is no box, it is kept with
+//!   no note).
 //!
 //! This is an addition of ours, not the original's. The snapshots only read the
 //! simulation: they do not run the module's PRESAVE event a real save runs (it runs
@@ -26,7 +28,6 @@ use std::collections::VecDeque;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -471,31 +472,21 @@ fn case_sensitive(path: &std::path::Path) -> Option<bool> {
     Some(!other.exists())
 }
 
-/// Asks the player what went wrong, on a thread of its own: the answer arrives on the
-/// receiver, `None` when they cancel. `preset` (a client's note) or `THEDAS_REPORT_NOTE`
-/// (tests) answers instead. The question is a system dialog box (tinyfiledialogs: Windows,
-/// macOS and Linux), outside the game's own interface. Provisional: an in-game form, which
-/// the pad could fill in too, would replace it.
-pub fn ask_note(preset: Option<String>) -> mpsc::Receiver<Option<String>> {
-    let (tx, rx) = mpsc::channel();
-    if let Some(text) = preset.or_else(|| std::env::var("THEDAS_REPORT_NOTE").ok()) {
-        let _ = tx.send(Some(text));
-        return rx;
-    }
-    let _ = std::thread::Builder::new()
-        .name("report note".into())
-        .spawn(move || {
-            // tinyfiledialogs takes no quotes in its text.
-            let note = tinyfiledialogs::input_box(
-                "Report an issue",
-                "What went wrong? Say what you expected and what happened instead. A \
-                 screenshot, two saves and the game log are kept with it, on this computer \
-                 only. Cancel drops the report.",
-                "",
-            );
-            let _ = tx.send(note);
-        });
-    rx
+/// The id the report's question goes by in the game's text box (`UiLayer::ask_text`).
+pub const NOTE_ID: u32 = 0x5245_5054;
+
+/// What the report's question says, kept on this computer only.
+pub const NOTE_PROMPT: &str = "What went wrong? Say what you expected and what happened \
+     instead. A screenshot, two saves and the game's log are kept with it on this computer.";
+/// What it says when reports are sent (see [`crate::upload`]).
+pub const NOTE_PROMPT_SEND: &str = "What went wrong? Say what you expected and what happened \
+     instead. Send posts it to the OpenThedas Discord with a screenshot, two saves and the \
+     game's log; Keep here keeps it on this computer only.";
+
+/// A note given with the request (a client's), or `THEDAS_REPORT_NOTE` (tests): the
+/// player is not asked then.
+pub fn preset_note(preset: Option<String>) -> Option<String> {
+    preset.or_else(|| std::env::var("THEDAS_REPORT_NOTE").ok())
 }
 
 #[cfg(test)]

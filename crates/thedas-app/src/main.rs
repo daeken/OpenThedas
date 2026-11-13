@@ -64,6 +64,7 @@ mod saves;
 mod screens;
 mod talkcam;
 mod ui;
+mod upload;
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -200,7 +201,7 @@ struct Args {
     saves: Option<PathBuf>,
     /// The player's settings file (the options screen's settings, kept between runs).
     /// Playing in a window without `--control` it defaults to `options.ini` in the
-    /// player's folder (`.openthedas` in the home folder, on Windows too); otherwise
+    /// player's folder (`~/.openthedas`; `Documents\OpenThedas` on Windows); otherwise
     /// settings are kept only when this is given.
     #[arg(long)]
     settings: Option<PathBuf>,
@@ -609,11 +610,32 @@ struct App {
     started_with: J,
 }
 
+/// Frames a report's text box may take to come up before it is asked again.
+const NOTE_REASK_FRAMES: u32 = 30;
+/// How many times it may fail to come up before the report is kept without a note.
+const NOTE_TRIES: u32 = 10;
+
+/// Asks for a report's note in the game's own text box: Send when reports go to the
+/// project's Discord (see [`upload`]), else Save. Either button keeps the report: an
+/// accidental one costs a folder, a lost one costs the bug.
+fn ask_report_note(ui: &mut ui::UiLayer) {
+    let (prompt, ok, other) = match upload::webhook() {
+        Some(_) => (report::NOTE_PROMPT_SEND, "Send report", "Keep here"),
+        None => (report::NOTE_PROMPT, "Save report", "Save, no note"),
+    };
+    ui.ask_text(report::NOTE_ID, prompt, "", ok, other);
+}
+
 /// What a report under way waits for.
 struct ReportWait {
     shot: Option<std::sync::mpsc::Receiver<J>>,
-    note: Option<std::sync::mpsc::Receiver<Option<String>>>,
     reply: Option<std::sync::mpsc::Sender<J>>,
+    /// The note is asked in the game's text box: frames since it was last asked (or seen
+    /// up), and how many times it has not come up.
+    note_asked: Option<(u32, u32)>,
+    /// The report goes on to the project's Discord once written, if set up (see
+    /// [`upload`]); the text box's second button keeps it here.
+    send: bool,
     /// The game is to pause once the screenshot is in (so the frame shows no "Paused"),
     /// and whether the report paused it (it carries on when the report is done).
     pause: bool,
@@ -1176,10 +1198,12 @@ impl App {
         }
         g.ui.set_pad_active(self.pad.used);
         let hovered = self.hovered_creature();
+        let voiced = self.line_voiced();
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
         };
         g.ui.set_hovered(hovered);
+        g.ui.set_line_voiced(voiced);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -1188,6 +1212,24 @@ impl App {
             dt,
         );
         self.requests.append(&mut g.ui.requests);
+        for a in g.ui.take_text_answers() {
+            // OK sends (or saves) the report with the note; the other button keeps it on
+            // this computer only, unsent.
+            if a.id == report::NOTE_ID && self.recorder.busy() {
+                if let Some(w) = self.report_wait.as_mut() {
+                    w.note_asked = None;
+                    w.send = a.accepted;
+                }
+                self.recorder.note(Some(a.text));
+                continue;
+            }
+            log::info!(
+                "text box {}: {} {:?}",
+                a.id,
+                if a.accepted { "OK" } else { "Cancel" },
+                a.text
+            );
+        }
         // An ability aimed at a place shows where it would land, under the interface.
         if let Some(live) = self.live.as_mut() {
             let mut lines = live.reticle(&self.camera, size, self.cursor);
@@ -1281,10 +1323,12 @@ impl App {
         }
         g.ui.set_pad_active(self.pad.used);
         let hovered = self.hovered_creature();
+        let voiced = self.line_voiced();
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
         };
         g.ui.set_hovered(hovered);
+        g.ui.set_line_voiced(voiced);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -1293,6 +1337,24 @@ impl App {
             dt,
         );
         self.requests.append(&mut g.ui.requests);
+        for a in g.ui.take_text_answers() {
+            // OK sends (or saves) the report with the note; the other button keeps it on
+            // this computer only, unsent.
+            if a.id == report::NOTE_ID && self.recorder.busy() {
+                if let Some(w) = self.report_wait.as_mut() {
+                    w.note_asked = None;
+                    w.send = a.accepted;
+                }
+                self.recorder.note(Some(a.text));
+                continue;
+            }
+            log::info!(
+                "text box {}: {} {:?}",
+                a.id,
+                if a.accepted { "OK" } else { "Cancel" },
+                a.text
+            );
+        }
         Ok(())
     }
 
@@ -1411,10 +1473,24 @@ impl App {
             self.recorder.screenshot(png);
             None
         };
+        // The player's note: a client's, else asked in the game's own text box (none
+        // before a game: the report is kept without one).
+        let in_game = self.live.as_ref().is_some_and(|l| !l.front_end)
+            && self.screens.as_ref().is_some_and(|s| !s.front_end);
+        let mut note_asked = None;
+        match (report::preset_note(note), self.gfx.as_mut()) {
+            (Some(text), _) => self.recorder.note(Some(text)),
+            (None, Some(g)) if in_game => {
+                ask_report_note(&mut g.ui);
+                note_asked = Some((0, 0));
+            }
+            (None, _) => self.recorder.note(Some(String::new())),
+        }
         self.report_wait = Some(ReportWait {
             shot,
-            note: Some(report::ask_note(note)),
             reply,
+            note_asked,
+            send: true,
             pause,
             paused_it: false,
         });
@@ -1465,16 +1541,30 @@ impl App {
                 w.paused_it = true;
             }
         }
-        if let Some(rx) = &w.note {
-            match rx.try_recv() {
-                Ok(note) => {
-                    w.note = None;
-                    self.recorder.note(note);
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    w.note = None;
-                    self.recorder.note(None);
+        // The text box can be lost (a script's message box shown over it, or no popup
+        // layer up yet): with none up a moment after asking it is asked again, and while
+        // another box keeps it out, or after a few tries, the report is kept without a note
+        // so the game never waits on it.
+        if let (Some((frames, tries)), Some(g)) = (w.note_asked.as_mut(), self.gfx.as_mut()) {
+            let up = g.ui.stage.dialog_up();
+            let ours = up
+                && matches!(
+                    g.ui.stage.bridge.value("GUIPopupLayer.DialogBoxText"),
+                    Some(thedas_ui::UiValue::String(t))
+                        if t == report::NOTE_PROMPT || t == report::NOTE_PROMPT_SEND
+                );
+            *frames += 1;
+            if ours {
+                *frames = 0;
+            } else if *frames > NOTE_REASK_FRAMES {
+                *frames = 0;
+                *tries += 1;
+                if *tries > NOTE_TRIES {
+                    log::warn!("report: the note could not be asked; kept without one");
+                    w.note_asked = None;
+                    self.recorder.note(Some(String::new()));
+                } else if !up {
+                    ask_report_note(&mut g.ui);
                 }
             }
         }
@@ -1489,6 +1579,10 @@ impl App {
             if let Some(live) = self.live.as_mut() {
                 live.paused = false;
             }
+        }
+        // Sent on when the player has set that up (see [`upload`]).
+        if let (true, Some(d), Some(url)) = (w.send, dir.as_ref(), upload::webhook()) {
+            upload::send_in_background(d.clone(), url);
         }
         if let Some(r) = reply {
             let _ = r.send(match dir {
@@ -1549,6 +1643,16 @@ impl App {
                 self.recorder.skip_snapshot(now);
             }
         }
+    }
+
+    /// Whether the line the game is on has a voice-over the audio can play (see
+    /// `ui::UiLayer::set_line_voiced`); never without sound.
+    fn line_voiced(&self) -> bool {
+        let (Some(a), Some(live)) = (self.audio.as_ref(), self.live.as_ref()) else {
+            return false;
+        };
+        let line = voice_line(&live.sim());
+        line.is_some_and(|l| a.line_voice(&l).is_some())
     }
 
     /// The creature the mouse is over, for its name over its head: none while the
@@ -1963,6 +2067,12 @@ impl App {
                 }
                 log.push(format!("floaty {text:?}"));
             }
+            Step::AskText(prompt) => {
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.ask_text(0, prompt, "", "OK", "Cancel");
+                }
+                log.push(format!("asktext {prompt:?}"));
+            }
             Step::Use(tag) => {
                 if let Some(l) = self.live.as_ref() {
                     let mut sim = l.sim();
@@ -2318,6 +2428,11 @@ impl App {
             let start = match &r {
                 ui::FrontEnd::Quit => {
                     self.quit = true;
+                    continue;
+                }
+                // The game menu's Report Issue: an issue report, as F8 makes one.
+                ui::FrontEnd::Report => {
+                    self.report(None, None);
                     continue;
                 }
                 ui::FrontEnd::NewGame => live::Start::NewGame,
@@ -3397,6 +3512,9 @@ enum Step {
     /// A floating message over the controlled creature, as a script's
     /// `DisplayFloatyMessage` makes one (`floaty 12`), for trying the floaty layer headless.
     Floaty(String),
+    /// The engine's own text box (`asktext Describe the issue`), as
+    /// `ui::UiLayer::ask_text` shows it; its answer is logged.
+    AskText(String),
     /// Sets a plot flag as a script would (`plot plt_tut_explore 0`), running the plot's
     /// script, for trying journal entries and tutorial popups headless.
     Plot(String, i32),
@@ -3602,6 +3720,7 @@ fn parse_step(s: &str) -> Result<Step> {
             Step::SetValue(k.to_string(), v.trim().to_string())
         }
         "floaty" => Step::Floaty(arg.to_string()),
+        "asktext" => Step::AskText(arg.trim().to_string()),
         "training" => Step::Training(arg.trim().to_ascii_uppercase()),
         "trainingmode" => {
             Step::TrainingMode(arg.trim().parse().context("trainingmode takes a number")?)
@@ -3993,9 +4112,21 @@ fn main() -> Result<()> {
                                 }
                                 layer.set_paused(l.paused);
                                 layer.set_pad_active(pad_play.used);
+                                let voiced = recording.as_ref().is_some_and(|a| {
+                                    voice_line(&l.sim()).is_some_and(|v| a.line_voice(&v).is_some())
+                                });
+                                layer.set_line_voiced(voiced);
                                 if let Some(aim) = layer.play(s, &l.sim, dt).pop() {
                                     println!("aiming ability {}", aim.ability);
                                     l.aiming = Some(aim);
+                                }
+                                for a in layer.take_text_answers() {
+                                    println!(
+                                        "text box {}: {} {:?}",
+                                        a.id,
+                                        if a.accepted { "OK" } else { "Cancel" },
+                                        a.text
+                                    );
                                 }
                                 layer.update_minimap(&l.sim, &camera);
                                 // Headless, the interface's cover of the cursor is not
@@ -4119,6 +4250,12 @@ fn main() -> Result<()> {
                         test_floaty(&mut l.sim(), text);
                         println!("floaty {text:?}");
                     }
+                    Step::AskText(prompt) => {
+                        if let Some((layer, _)) = played.as_mut() {
+                            layer.ask_text(0, prompt, "", "OK", "Cancel");
+                        }
+                        println!("asktext {prompt:?}");
+                    }
                     Step::Use(tag) => {
                         let mut sim = l.sim();
                         let who = sim.world.controlled();
@@ -4237,7 +4374,7 @@ fn main() -> Result<()> {
                     for r in std::mem::take(&mut layer.requests) {
                         println!("front end: {r:?}");
                         let start = match &r {
-                            ui::FrontEnd::Quit => continue,
+                            ui::FrontEnd::Quit | ui::FrontEnd::Report => continue,
                             ui::FrontEnd::NewGame => live::Start::NewGame,
                             ui::FrontEnd::Load(b) => live::Start::SaveBytes(b),
                             ui::FrontEnd::StartMenu => live::Start::Menu,
