@@ -4102,7 +4102,16 @@ pub fn call(
             }
             void()
         }
-        "GetCanDiePermanently" => ok(b(h.object(obj(a, 0)).is_some_and(|o| !o.immortal))),
+        // DAOrigins.exe 0x6645a0: the template's `NoPermDeath` is 0 and the creature is not
+        // in the party (0x6316f0 on the party list). So the scripts that eat corpses (Death
+        // Magic's heartbeat) leave a fallen party member alone.
+        "GetCanDiePermanently" => {
+            let id = obj(a, 0);
+            let in_party = party_of(h.sim).contains(&id);
+            ok(b(!in_party
+                && h.object(id)
+                    .is_some_and(|o| o.fields.get("NoPermDeath").copied().unwrap_or(0) == 0)))
+        }
         // A placeable's treasure category and rank, as its instance sets them (`TreasureCategory`,
         // `Rank`). Provisional: the rank is taken to be the placed object's `Rank`.
         "GetPlaceableTreasureCategory" => ok(Value::Int(
@@ -4599,7 +4608,8 @@ mod tests {
         void SetIndividualImpactAOEEvent(object c, object t, int n, location l, int d = 0) = 42;\n\
         int FOLLOWER_STATE_AVAILABLE = 2;\n\
         int PROPERTY_SIMPLE_EXPERIENCE = 19;\n\
-        int PROPERTY_SIMPLE_LEVEL = 15;\n";
+        int PROPERTY_SIMPLE_LEVEL = 15;\n\
+        int GetCanDiePermanently(object o) = 184;\n";
 
     /// Calls engine function `name` as `caller`.
     fn run(s: &mut Sim, caller: ObjectId, name: &str, a: &[Value]) -> Option<Value> {
@@ -4610,6 +4620,32 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn party_members_and_no_perm_death_creatures_cannot_die_permanently() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        s.world.hero = Some(hero);
+        let follower = s.world.spawn(ObjectKind::Creature, "follower");
+        s.world.get_mut(hero).unwrap().followers.push(follower);
+        let foe = s.world.spawn(ObjectKind::Creature, "foe");
+        let kept = s.world.spawn(ObjectKind::Creature, "kept");
+        s.world
+            .get_mut(kept)
+            .unwrap()
+            .fields
+            .insert("NoPermDeath".into(), 1);
+        let mut can = |id| run(&mut s, hero, "GetCanDiePermanently", &[Value::Object(id)]);
+        assert_eq!(can(foe), Some(Value::Int(1)));
+        assert_eq!(can(follower), Some(Value::Int(0)));
+        assert_eq!(can(hero), Some(Value::Int(0)));
+        assert_eq!(can(kept), Some(Value::Int(0)));
+        // A destroyed follower leaves the party list.
+        s.world.queue_destroy(0, follower);
+        s.world.destroy_due();
+        assert!(s.world.get(hero).unwrap().followers.is_empty());
     }
 
     #[test]
