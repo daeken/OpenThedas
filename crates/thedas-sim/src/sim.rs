@@ -194,11 +194,6 @@ const SLIDE_PASSES: usize = 4;
 /// How long a walker held up by bodies may make no progress before it is reported.
 const BLOCKED_REPORT_MS: u64 = 3_000;
 
-/// How deep two bodies may overlap and still touch: a walker this far or less inside a
-/// body is on its surface (left there by a slide, give or take rounding) and is held by it;
-/// one further in started out overlapping it.
-const BODY_SKIN: f32 = 0.02;
-
 /// A move along a body's surface whose inward part is this little of it (rounding left by
 /// a slide) does not meet the body.
 const GRAZE: f32 = 1.0e-3;
@@ -227,9 +222,9 @@ fn round_on_the_right(rest: [f32; 2], nrm: [f32; 2], slid: [f32; 2]) -> [f32; 2]
 /// Moving from `at` by `d`, against a circle at `c` of radius `r`: how far along the move
 /// (0 to 1) it meets the circle, where it stops on the circle and what is left of the move
 /// slid along the circle's tangent, or `None` when the move does not run into it. A move
-/// out of a circle it is on is not stopped; one further in loses its inward part. A walker
-/// deeper inside than [`BODY_SKIN`] (placed overlapping: on a load, a jump or a spawn) is
-/// not held by the circle at all, so that bodies placed on one another can separate.
+/// out of a circle it is on or inside (placed overlapping: on a load, a jump or a spawn) is
+/// not stopped; one further in loses its inward part, so bodies placed on one another come
+/// apart and do not sink into each other (see also [`round_on_the_right`]).
 fn slide_circle(
     at: [f32; 2],
     d: [f32; 2],
@@ -244,11 +239,10 @@ fn slide_circle(
     let mm = m[0] * m[0] + m[1] * m[1];
     let md = m[0] * d[0] + m[1] * d[1];
     if mm < r * r {
-        let inner = (r - BODY_SKIN).max(0.0);
-        if mm < inner * inner || md >= 0.0 || mm <= 1e-12 {
+        if md >= 0.0 || mm <= 1e-12 {
             return None;
         }
-        // On the surface: only the inward part of the move is lost.
+        // On the surface or inside: only the inward part of the move is lost.
         let n = mm.sqrt();
         let nrm = [m[0] / n, m[1] / n];
         let k = d[0] * nrm[0] + d[1] * nrm[1];
@@ -2267,9 +2261,10 @@ impl Sim {
     /// slides along it, nothing is pushed, and there is no steering round it. Dead creatures
     /// do not block (their controllers stop interacting: 0x6a0df0). Bodies are circles on
     /// the ground. Provisional: up to [`SLIDE_PASSES`] slides per move stand in for PhysX's
-    /// iterated sweep; a walker placed overlapping a body is not held by it (see
-    /// [`slide_circle`]; held, two bodies placed on one another and walking into each other
-    /// stood locked for good); the step offset (0.5 m) is not modelled.
+    /// iterated sweep; a walker pressed straight into a body goes round it on its right (see
+    /// [`round_on_the_right`]; otherwise two bodies placed on one another and walking into
+    /// each other, or two walkers meeting head-on, stood locked for good); the step offset
+    /// (0.5 m) is not modelled.
     fn slide_past_bodies(&self, id: ObjectId, a: [f32; 3], b: [f32; 3]) -> Option<[f32; 3]> {
         let me = self.world.get(id)?;
         let area = me.area?;
@@ -5470,9 +5465,19 @@ mod tests {
         }
         s.order_move(hero, [0.0, -6.0, 0.0]);
         s.order_move(follower, [0.0, 6.0, 0.0]);
+        let mut closest = f32::MAX;
         for _ in 0..150 {
             s.tick(33);
+            let (a, b) = (
+                s.world.get(hero).unwrap().position,
+                s.world.get(follower).unwrap().position,
+            );
+            closest = closest.min(((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt());
         }
+        assert!(
+            closest >= 0.41,
+            "they do not sink into each other: {closest}"
+        );
         let at = |id| s.world.get(id).unwrap().position;
         assert!((at(hero)[1] + 6.0).abs() < 0.05, "{:?}", at(hero));
         assert!((at(follower)[1] - 6.0).abs() < 0.05, "{:?}", at(follower));
@@ -5512,7 +5517,7 @@ mod tests {
                 .collect();
             for (i, j) in [(0, 1), (2, 3)] {
                 let d = ((p[i][0] - p[j][0]).powi(2) + (p[i][1] - p[j][1]).powi(2)).sqrt();
-                assert!(d >= r - BODY_SKIN - 0.001, "{d} < {r}");
+                assert!(d >= r - 0.02, "{d} < {r}");
             }
         }
         let pos = |i: usize| s.world.get(ids[i]).unwrap().position;
@@ -5556,7 +5561,7 @@ mod tests {
             for b in [b1, b2] {
                 let q = s.world.get(b).unwrap().position;
                 let d = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt();
-                assert!(d >= r - BODY_SKIN - 0.001, "{d} < {r} at {p:?}");
+                assert!(d >= r - 0.02, "{d} < {r} at {p:?}");
             }
         }
     }
