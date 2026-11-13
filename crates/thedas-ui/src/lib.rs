@@ -602,6 +602,18 @@ fn inline_images(html: &str) -> Vec<InlineImage> {
 }
 
 /// Where the last line of `html` starts (after its last line break).
+/// Where the line of `html` that `from` is on ends: the first line break after it, or the
+/// end.
+fn line_end(html: &str, from: usize) -> usize {
+    let lower = html.to_ascii_lowercase();
+    let rest = lower.get(from..).unwrap_or("");
+    ["<br>", "<br/>", "<br />", "</p>", "\n", "\r"]
+        .iter()
+        .filter_map(|b| rest.find(b).map(|i| from + i))
+        .min()
+        .unwrap_or(html.len())
+}
+
 fn last_line_start(html: &str) -> usize {
     let lower = html.to_ascii_lowercase();
     ["<br>", "<br/>", "<br />", "</p>", "\n", "\r"]
@@ -821,7 +833,8 @@ impl UiMovie {
     /// Draws the inline images of the text fields that took new text (see
     /// [`avm1::IMG_TAKE`]): each `<img>` is replaced in the text by enough non-breaking
     /// spaces to hold it, and the image, by its linkage name, is placed over them. An image
-    /// is centred on its line. Provisional: Scaleform's own image layout (`align`, `vspace`,
+    /// is centred on its line, and a right-aligned or centred field's line (the stores'
+    /// price columns) starts where its alignment puts it. Provisional: Scaleform's own image layout (`align`, `vspace`,
     /// `hspace`) is not traced, and a line the field wraps by itself is not followed.
     fn layout_inline_images(&mut self) {
         let UiValue::List(v) = self.call(avm1::IMG_TAKE, &[]) else {
@@ -911,11 +924,32 @@ impl UiMovie {
                 &[UiValue::Number(k), UiValue::String(text.clone())],
             );
             let line = measure(self, "&nbsp;", true).1.max(1.0);
+            // A right-aligned or centred field (a price column) starts each line that much
+            // further in: the room the line leaves, all or half.
+            let (field_width, align) = match self.call(avm1::IMG_FIELD, &[UiValue::Number(k)]) {
+                UiValue::List(l) if l.len() == 2 => (
+                    num(&l[0]),
+                    match &l[1] {
+                        UiValue::String(a) => a.to_ascii_lowercase(),
+                        _ => String::new(),
+                    },
+                ),
+                _ => (0.0, String::new()),
+            };
             for (n, ((im, &(w, h)), &pos)) in images.iter().zip(&sizes).zip(&at).enumerate() {
                 let before = &text[..pos];
                 let lines = measure(self, &format!("{before}&nbsp;"), true).1;
                 let line_start = last_line_start(before);
-                let x = measure(self, &before[line_start..], false).0 + im.hspace;
+                let room = match align.as_str() {
+                    "right" | "center" => {
+                        let line_text = &text[line_start..line_end(&text, pos)];
+                        // The field's gutters, 2 pixels each side.
+                        let room = (field_width - 4.0 - measure(self, line_text, false).0).max(0.0);
+                        if align == "right" { room } else { room / 2.0 }
+                    }
+                    _ => 0.0,
+                };
+                let x = room + measure(self, &before[line_start..], false).0 + im.hspace;
                 let y = (lines - line) + (line - h) / 2.0;
                 // The text field's gutter (2 pixels each way), and a pixel's gap from the
                 // text before (the measuring field came out a little narrower than the
@@ -1397,6 +1431,14 @@ mod inline_image_tests {
         assert_eq!(last_line_start("abc"), 0);
         assert_eq!(last_line_start("a<br>bc"), 5);
         assert_eq!(last_line_start("a<BR/>b\nc"), 8);
+    }
+
+    #[test]
+    fn a_line_ends_at_the_next_break() {
+        assert_eq!(line_end("abc", 0), 3);
+        assert_eq!(line_end("a<br>bc<BR/>d", 1), 1);
+        assert_eq!(line_end("a<br>bc<BR/>d", 5), 7);
+        assert_eq!(line_end("ab", 9), 2);
     }
 }
 
