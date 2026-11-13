@@ -43,6 +43,7 @@
 //!
 //! - Kind 24, `ActionJumpToCamera` (`AJSC`; built by 0x7dc450, update 0x7df2f0): see
 //!   [`CameraJump`].
+//! - Kind 19, the frame buffer effect action (`AFBE`): see [`FrameEffectTrack`].
 //! - Kind 27, `ActionLinkToActor` (built by 0x7db900, update 0x7d3cf0): see [`ActorLink`].
 //!
 //! Provisional: which way a camera actor looks (taken as its local +Y, as a stage camera's;
@@ -76,6 +77,12 @@ const FIELD_TRACK_START: u32 = 5301;
 const FIELD_TRACK_END: u32 = 5302;
 const FIELD_TRACK_CURVES: u32 = 5303;
 const FIELD_CAMERA_ACTOR: u32 = 5610;
+const FIELD_EFFECT_NAME: u32 = 5521;
+const FIELD_EFFECT_PARAMETERS: u32 = 5522;
+const FIELD_PARAMETER_NAME: u32 = 5523;
+const FIELD_PARAMETER_VALUE: u32 = 5524;
+const FIELD_PARAMETER_CURVE: u32 = 5525;
+const FIELD_PARAMETER_COMPONENT: u32 = 5526;
 const FIELD_JUMP_BY_PLACE: u32 = 5570;
 const FIELD_LINK_TARGET: u32 = 5630;
 const FIELD_LINK_NODE: u32 = 5631;
@@ -100,6 +107,7 @@ pub const TRACK_MAKE_ACTIVE_CAMERA: u64 = 11;
 pub const TRACK_CAMERA_FOV: u64 = 13;
 pub const TRACK_MOVE_SPLINE: u64 = 17;
 pub const TRACK_ROTATE: u64 = 18;
+pub const TRACK_FRAME_EFFECT: u64 = 19;
 pub const TRACK_LINK_TO_ACTOR: u64 = 27;
 pub const TRACK_JUMP_TO_CAMERA: u64 = 24;
 pub const TRACK_JUMP_TO_PLACE: u64 = 25;
@@ -665,6 +673,85 @@ pub fn facing_of(q: [f32; 4]) -> Option<f32> {
     (len > 1e-6 && len.is_finite()).then(|| crate::world::facing_toward(f[0], f[1]))
 }
 
+/// A frame buffer effect a cutscene runs over its span (`AFBE`, kind 19): the effect
+/// (`da_dof`, `da_colorfade`, ...; 5521) and the values it gives the effect's exposed
+/// parameters (5522: `FBEP` structs).
+///
+/// Traced: the action's constructor (0x7dbbe6-0x7dbf49) looks each parameter up by name
+/// (5523) on the effect and by its type keeps a float's value (5524) and curve index (5525),
+/// or one component (5526, 0 to 3; others are dropped) of a vector's value and that
+/// component's curve index. The curve index counts the action's own curves (5303); -1 is none.
+///
+/// Provisional (the action's update is not traced): a parameter with a curve takes the
+/// curve's value at the cutscene's time, else its own; the effect is on from the action's
+/// start to its end, and its clock (`effect_time`, which `da_colorfade` fades by) runs from
+/// the action's start.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrameEffectTrack {
+    pub start: f32,
+    pub end: f32,
+    pub effect: String,
+    pub parameters: Vec<FrameEffectParameter>,
+}
+
+/// One value a [`FrameEffectTrack`] sets.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrameEffectParameter {
+    pub name: String,
+    /// Which component of a vector parameter (0 to 3); `None` for a float.
+    pub component: Option<u8>,
+    /// Its value over the cutscene's time: constant without a curve.
+    pub value: Curve,
+}
+
+/// A frame buffer effect as it stands at a time of the cutscene.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrameEffectState {
+    pub effect: String,
+    /// Seconds since the effect's action started.
+    pub time: f32,
+    /// Each parameter set, by name (as the file spells it); a float is in `[0]`.
+    pub parameters: Vec<(String, [f32; 4])>,
+}
+
+impl FrameEffectState {
+    /// Parameter `name` (names compare without case).
+    pub fn parameter(&self, name: &str) -> Option<[f32; 4]> {
+        self.parameters
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| *v)
+    }
+}
+
+impl FrameEffectTrack {
+    /// The effect `t` seconds into the cutscene, while the action runs.
+    pub fn at(&self, t: f32) -> Option<FrameEffectState> {
+        if !(self.start..=self.end).contains(&t) {
+            return None;
+        }
+        let mut parameters: Vec<(String, [f32; 4])> = Vec::new();
+        for p in &self.parameters {
+            let i = match parameters
+                .iter()
+                .position(|(n, _)| n.eq_ignore_ascii_case(&p.name))
+            {
+                Some(i) => i,
+                None => {
+                    parameters.push((p.name.clone(), [0.0; 4]));
+                    parameters.len() - 1
+                }
+            };
+            parameters[i].1[usize::from(p.component.unwrap_or(0))] = p.value.at(t);
+        }
+        Some(FrameEffectState {
+            effect: self.effect.clone(),
+            time: t - self.start,
+            parameters,
+        })
+    }
+}
+
 /// What a cutscene does to its actors.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Tracks {
@@ -679,6 +766,9 @@ pub struct Tracks {
     /// Camera cuts (kind-11 tracks): from this time (seconds), the actor with this id is the
     /// camera. By time; on a tie, the file's order.
     pub cuts: Vec<(f32, i64)>,
+    /// The frame buffer effects it runs (kind-19 tracks, whichever actor carries them), in
+    /// the file's order.
+    pub frame_effects: Vec<FrameEffectTrack>,
 }
 
 impl Tracks {
@@ -825,6 +915,53 @@ impl Tracks {
                             });
                         }
                     }
+                    TRACK_FRAME_EFFECT => {
+                        let effect = g
+                            .field(tr, FIELD_EFFECT_NAME)
+                            .and_then(Value::as_str)
+                            .map(|s| s.trim_end_matches('\0').trim().to_string())
+                            .unwrap_or_default();
+                        if effect.is_empty() {
+                            continue;
+                        }
+                        let own = curves().curves;
+                        let mut parameters = Vec::new();
+                        for p in structs(g, tr, FIELD_EFFECT_PARAMETERS) {
+                            let Some(name) = g
+                                .field(p, FIELD_PARAMETER_NAME)
+                                .and_then(Value::as_str)
+                                .map(|s| s.trim_end_matches('\0').trim().to_string())
+                                .filter(|s| !s.is_empty())
+                            else {
+                                continue;
+                            };
+                            let int = |l| g.field(p, l).and_then(Value::as_i64).unwrap_or(-1);
+                            let component = match int(FIELD_PARAMETER_COMPONENT) {
+                                c @ 0..=3 => Some(c as u8),
+                                c if c < 0 => None,
+                                _ => continue,
+                            };
+                            let value = usize::try_from(int(FIELD_PARAMETER_CURVE))
+                                .ok()
+                                .and_then(|i| own.get(i).cloned())
+                                .unwrap_or_else(|| {
+                                    Curve::constant(
+                                        f32_field(g, p, FIELD_PARAMETER_VALUE).unwrap_or(0.0),
+                                    )
+                                });
+                            parameters.push(FrameEffectParameter {
+                                name,
+                                component,
+                                value,
+                            });
+                        }
+                        out.frame_effects.push(FrameEffectTrack {
+                            start,
+                            end,
+                            effect,
+                            parameters,
+                        });
+                    }
                     TRACK_SNAP_TO_WALKMESH => actor.snaps = true,
                     TRACK_JUMP_TO_PLACE => {
                         let text = |l| {
@@ -872,6 +1009,11 @@ impl Tracks {
         }
         out.cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
         out
+    }
+
+    /// The frame buffer effects running `t` seconds into the cutscene, in the file's order.
+    pub fn frame_effects_at(&self, t: f32) -> Vec<FrameEffectState> {
+        self.frame_effects.iter().filter_map(|e| e.at(t)).collect()
     }
 
     /// The camera actor `t` seconds into the cutscene: the one the latest cut that has
