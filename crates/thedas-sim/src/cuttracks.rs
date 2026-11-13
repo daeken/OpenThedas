@@ -66,6 +66,7 @@ const FIELD_ACTORS: u32 = 5200;
 const FIELD_ACTOR_NAME: u32 = 2;
 const FIELD_ACTOR_ID: u32 = 5201;
 const FIELD_ACTOR_TRACKS: u32 = 5206;
+const FIELD_ACTOR_MODEL: u32 = 5202;
 const FIELD_ACTOR_CREATURE: u32 = 5208;
 const FIELD_ACTOR_POSITION: u32 = 5214;
 const FIELD_ACTOR_ROTATION: u32 = 5215;
@@ -569,6 +570,11 @@ pub struct Actor {
     /// The creature template it stands for (field 5208), when it is one: a creature the
     /// cutscene shows by itself when no object of the world stands in for the actor.
     pub creature: Option<String>,
+    /// The model it is drawn as (field 5202), when it is a prop of the cutscene rather than
+    /// a creature or a camera: a placeable (`plc_arrow_01`), a weapon (`w_arr_la01a_0`) or
+    /// an effect (`fxa_bloodslice_c`). `tools_null`, which every other actor has, and
+    /// `base_light`, a light, are left out.
+    pub model: Option<String>,
     /// Field 5216 (actor +0x44): the object of the world that plays the actor, found by
     /// this name when the cutscene starts (0x7e36b0): `OWNER`, `PLAYER`, `HENCH...` or a
     /// tag.
@@ -1004,6 +1010,9 @@ impl Tracks {
                     .unwrap_or(-1),
                 name: text(FIELD_ACTOR_NAME).unwrap_or_default(),
                 creature: text(FIELD_ACTOR_CREATURE),
+                model: text(FIELD_ACTOR_MODEL)
+                    .map(|m| m.to_ascii_lowercase())
+                    .filter(|m| m != "tools_null" && m != "base_light"),
                 position: match g.field(a, FIELD_ACTOR_POSITION) {
                     Some(Value::Vec3(v)) if v.iter().all(|x| x.is_finite()) => *v,
                     _ => [0.0; 3],
@@ -2101,6 +2110,7 @@ mod tests {
             id: 1,
             name: "a".into(),
             creature: None,
+            model: None,
             tag: None,
             end_position: [0.0; 3],
             end_rotation: [0.0, 0.0, 0.0, 1.0],
@@ -2141,6 +2151,7 @@ mod tests {
             id: 1,
             name: "a".into(),
             creature: None,
+            model: None,
             tag: None,
             end_position: [0.0; 3],
             end_rotation: [0.0, 0.0, 0.0, 1.0],
@@ -2178,6 +2189,7 @@ mod tests {
             id: 1,
             name: "a".into(),
             creature: None,
+            model: None,
             tag: None,
             end_position: [0.0; 3],
             end_rotation: [0.0, 0.0, 0.0, 1.0],
@@ -2247,6 +2259,7 @@ mod tests {
             id: 1,
             name: "a".into(),
             creature: None,
+            model: None,
             tag: None,
             end_position: [0.0; 3],
             end_rotation: [0.0, 0.0, 0.0, 1.0],

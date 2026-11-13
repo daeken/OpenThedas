@@ -2435,6 +2435,51 @@ impl Live {
         self.hovered = hovered;
     }
 
+    /// What the mouse is over for its cursor (see [`crate::cursor`]), by what a click there
+    /// would do ([`Live::click`]): `None` over the ground, a body or nothing.
+    pub fn hover_over(
+        &mut self,
+        origin: glam::Vec3,
+        dir: glam::Vec3,
+    ) -> Option<crate::cursor::Over> {
+        use crate::cursor::Over;
+        let Some(Pick::Object(id)) = self.pick(origin, dir) else {
+            return None;
+        };
+        let shared = self.sim.clone();
+        let sim = shared.lock().unwrap_or_else(|p| p.into_inner());
+        let o = sim.world.get(id)?;
+        match o.kind {
+            thedas_sim::world::ObjectKind::Creature if o.dead => None,
+            thedas_sim::world::ObjectKind::Creature => {
+                let leader = sim.world.controlled();
+                let party = thedas_sim::engine::party_of(&sim);
+                Some(if party.contains(&id) {
+                    Over::Creature
+                } else if leader.is_some_and(|l| sim.hostile(l, id)) {
+                    Over::Hostile
+                } else if o.dialog.is_some() {
+                    Over::Talker
+                } else {
+                    Over::Creature
+                })
+            }
+            thedas_sim::world::ObjectKind::Placeable => Some(Over::Placeable(
+                sim.placeable_cursor(id).unwrap_or_default(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Whether an ability waits for its target, and whether it is aimed at a place.
+    pub fn aim(&self) -> Option<crate::cursor::Aim> {
+        let aim = self.aiming.as_ref()?;
+        let sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
+        Some(crate::cursor::Aim {
+            place: sim.ability_targets_place(aim.ability),
+        })
+    }
+
     /// Orders the party leader as a click on `pick` does: lead with a party member, attack a
     /// living hostile, talk to another creature that has a conversation, use an interactive
     /// placeable, walk to a point on the ground. The order is an ordinary command queue; the simulation runs it.

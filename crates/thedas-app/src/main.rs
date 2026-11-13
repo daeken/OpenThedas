@@ -52,6 +52,7 @@ mod audio;
 mod camfade;
 mod chargen_stage;
 mod control;
+mod cursor;
 mod cutactors;
 mod cutcam;
 mod focusnav;
@@ -594,6 +595,13 @@ struct App {
     pad: padplay::PadPlay,
     /// The pad as clients' `pad` steps hold it (merged with the device's).
     remote_pad: pad::PadState,
+    /// The game's mouse cursors (none before the window is up).
+    cursors: Option<cursor::Cursors>,
+    /// The left button is down.
+    left_down: bool,
+    /// Whether the interface covers the cursor, as last read back: the cursor's place and
+    /// what was under it in the world then.
+    cursor_probe: Option<((f64, f64), cursor::Over, bool)>,
     /// The install, module and shaders a game the start menu starts is opened with.
     install: PathBuf,
     module: String,
@@ -1012,6 +1020,7 @@ impl App {
             ui.set_saves(saves::SaveStore::new(self.saves_dir.clone()));
         }
         let reticle = reticle::ReticlePass::new(&ctx.device, config.format);
+        self.cursors = Some(cursor::Cursors::load(event_loop, &self.install));
         self.gfx = Some(Gfx {
             window,
             surface,
@@ -1315,6 +1324,7 @@ impl App {
             live.set_hovered(hovered);
         }
         let voiced = self.line_voiced();
+        self.show_cursor();
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
         };
@@ -1469,6 +1479,7 @@ impl App {
             live.set_hovered(hovered);
         }
         let voiced = self.line_voiced();
+        self.show_cursor();
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
         };
@@ -2090,6 +2101,60 @@ impl App {
         (!covered).then_some(creature)
     }
 
+    /// The mouse cursor's name now (see [`cursor`]): the movies' own over the interface and
+    /// wherever a click does nothing, else by what is under it in the world. The interface's
+    /// cover is read back from the GPU, so it is checked again only when the cursor moves or
+    /// what is under it changes, and only when something is.
+    fn cursor_name(&mut self) -> String {
+        let pressed = self.left_down;
+        let Some(g) = self.gfx.as_ref() else {
+            return "standard".to_string();
+        };
+        let ui = g.ui.cursor().to_string();
+        // Where a click would not reach the world (a screen, a cutscene, a conversation):
+        // the movies' cursor.
+        let playing = self.ui.is_empty()
+            && self
+                .screens
+                .as_ref()
+                .is_none_or(|s| s.exploring() || s.picking_party());
+        let Some(live) = self.live.as_mut().filter(|_| playing) else {
+            return cursor::name(&ui, true, None, None, pressed);
+        };
+        let (w, h) = (g.config.width as f32, g.config.height as f32);
+        let (x, y) = self.cursor;
+        let (origin, dir) = self.camera.ray(x as f32, y as f32, w, h);
+        let aim = live.aim();
+        let over = live.hover_over(origin, dir);
+        let covered = match (&over, aim) {
+            (None, None) => false,
+            (over, _) => {
+                // An aimed ability with nothing under the mouse is probed as a plain creature.
+                let key = over.clone().unwrap_or(cursor::Over::Creature);
+                match &self.cursor_probe {
+                    Some((at, o, covered)) if *at == self.cursor && *o == key => *covered,
+                    _ => {
+                        let covered = g.ui.covers(x, y);
+                        self.cursor_probe = Some((self.cursor, key, covered));
+                        covered
+                    }
+                }
+            }
+        };
+        cursor::name(&ui, covered, aim, over.as_ref(), pressed)
+    }
+
+    /// Shows the cursor for this frame.
+    fn show_cursor(&mut self) {
+        if self.cursors.is_none() {
+            return;
+        }
+        let name = self.cursor_name();
+        if let (Some(c), Some(g)) = (self.cursors.as_mut(), self.gfx.as_ref()) {
+            c.show(&g.window, &name);
+        }
+    }
+
     /// A left click at window pixel (`x`, `y`) while playing: the party leader is ordered to
     /// whatever it lands on.
     fn click(&mut self, x: f64, y: f64) {
@@ -2276,6 +2341,7 @@ impl App {
 
     /// The left button goes down or up at the cursor.
     fn left_button(&mut self, pressed: bool) {
+        self.left_down = pressed;
         let (x, y) = self.cursor;
         self.recorder.input(format!(
             "{} {x:.0},{y:.0}",
@@ -2798,6 +2864,8 @@ impl App {
         // The movies' input contexts, innermost last, and whether a dialog box has the input.
         if let Some(g) = self.gfx.as_ref() {
             out["contexts"] = json!(g.ui.stage.bridge.contexts());
+            // The mouse cursor shown (empty with none of the game's loaded).
+            out["cursor"] = json!(self.cursors.as_ref().map_or("", |c| c.shown()));
             out["popup"] = json!(g.ui.stage.dialog_up());
         }
         out
@@ -5155,6 +5223,9 @@ fn main() -> Result<()> {
         pads: paddev::Pads::new(),
         pad: padplay::PadPlay::default(),
         remote_pad: pad::PadState::default(),
+        cursors: None,
+        left_down: false,
+        cursor_probe: None,
         install: install.clone(),
         module: args.module.clone(),
         shaders: args.shaders.clone(),

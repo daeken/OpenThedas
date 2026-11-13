@@ -594,6 +594,7 @@ mod tests {
             id,
             name: name.into(),
             creature: None,
+            model: None,
             tag: None,
             end_position: [0.0; 3],
             end_rotation: [0.0, 0.0, 0.0, 1.0],
