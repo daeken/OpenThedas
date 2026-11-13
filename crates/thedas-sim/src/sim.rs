@@ -4315,6 +4315,21 @@ pub struct ScriptHost<'a> {
     pub script: String,
 }
 
+/// An engine function's integer or float result in the numeric type the engine table
+/// declares. The engine arms follow Dragon Age: Origins' signatures, and Dragon Age II's
+/// `script.ldf` declares some of the same functions with the other numeric type
+/// (`float GetItemPropertyPower(...)`, `int` in DA:O); a script compiled against it expects
+/// that type on the stack. A float becomes an integer by truncation. Other values are left
+/// as they are.
+fn numeric_as_declared(v: Value, ret: &thedas_script::ldf::Type) -> Value {
+    use thedas_script::ldf::Type;
+    match (v, ret) {
+        (Value::Int(i), Type::Float) => Value::Float(i as f32),
+        (Value::Float(x), Type::Int) => Value::Int(x as i32),
+        (v, _) => v,
+    }
+}
+
 impl Host for ScriptHost<'_> {
     fn action(
         &mut self,
@@ -4343,7 +4358,26 @@ impl Host for ScriptHost<'_> {
             _ => None,
         });
         let mana_before = mana_target.map(|id| (id, self.sim.mana_now(id)));
-        let result = crate::engine::call(self, caller, f, &args);
+        let mut result = crate::engine::call(self, caller, f, &args);
+        if let Some(Ok(Some(v))) = &mut result {
+            let declared = numeric_as_declared(v.clone(), &f.ret);
+            if declared != *v {
+                // Traced, so an arm answering in the wrong type shows up: on Dragon Age:
+                // Origins there should be none (each would be an arm to fix); Dragon Age II's
+                // retyped functions are expected here.
+                let t = self.sim.world.time_ms;
+                self.sim.world.trace.push(TraceEntry::Missing {
+                    t,
+                    what: format!(
+                        "engine function {} answered {}, declared {}",
+                        f.name,
+                        v.kind(),
+                        f.ret
+                    ),
+                });
+                *v = declared;
+            }
+        }
         if let Some((id, before)) = mana_before {
             self.sim.note_mana_change(id, before);
         }
