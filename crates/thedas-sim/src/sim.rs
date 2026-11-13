@@ -131,8 +131,7 @@ pub struct Sim {
     pub(crate) placeable_collisions: HashMap<ObjectId, (u64, Arc<crate::collision::Collision>)>,
     /// Each door's collision for sight lines (`None`: its model has none) and the key of the
     /// model and placement it was built from (see `Sim::door_sight`).
-    pub(crate) door_collisions:
-        HashMap<ObjectId, (u64, Option<Arc<crate::collision::Collision>>)>,
+    pub(crate) door_collisions: HashMap<ObjectId, (u64, Option<Arc<crate::collision::Collision>>)>,
     /// Walkers held up by another creature's body: since when, and whether that was
     /// reported (see `Sim::advance_movers`). Not saved.
     pub(crate) blocked_since: HashMap<ObjectId, (u64, bool)>,

@@ -262,10 +262,10 @@ impl Sim {
             // alone (0x6b8873); only a hostile one needs a clear line of sight, a ray through
             // the level's collision from 1.8 m above each one's feet (0xb004d8; 0x67c530).
             // Keeping track (0x6a8d60) tests no sight, out to 60 m (0xadef18).
-            // Provisional: closed doors stand in for the exe's room visibility for everyone,
-            // and a wall of the pathing grid for the collision ray; the grid, the only geometry
-            // the simulation has, marks large furniture and rubble the same way as walls, so
-            // those block hostiles too.
+            // Provisional: closed doors (their own collision, `Sim::door_sight`) stand in for
+            // the exe's room visibility for everyone; without the level's collision files a
+            // wall of the pathing grid stands in for the ray, and the grid marks large
+            // furniture and rubble the same way as walls, so those block hostiles too.
             let ring = self.perception_range(id);
             let seen = self
                 .world

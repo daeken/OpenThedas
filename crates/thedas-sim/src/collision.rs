@@ -9,8 +9,9 @@
 //! placement is room × placement (with its scale) × the `.mmh` node the shape hangs under ×
 //! the shape's own pose.
 //!
-//! An area's placeables are added with [`load_placeables`], all but doors, which keep their own
-//! test ([`crate::sim::Sim::closed_doors`]). Provisional: whether the exe changes a placeable's
+//! An area's placeables are added with [`load_placeables`], all but doors: a closed door's
+//! shapes are tested on their own, so that opening it clears them
+//! ([`crate::sim::Sim::door_sight`]). Provisional: whether the exe changes a placeable's
 //! mask at runtime (opened, destroyed) is not traced; triangles are two-sided (whether the
 //! exe's mesh raycast culls back faces is not traced).
 

@@ -391,8 +391,11 @@ impl Sim {
     /// is not traced; open doors are left out.
     pub fn door_sight(&mut self, area: thedas_script::vm::ObjectId) -> DoorSight {
         use std::hash::{Hash, Hasher};
-        let closed: Vec<thedas_script::vm::ObjectId> =
-            self.closed_doors(area).into_iter().map(|(d, _)| d).collect();
+        let closed: Vec<thedas_script::vm::ObjectId> = self
+            .closed_doors(area)
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
         let tables = self.world.tables();
         let types = tables.get(0, "placeable_types");
         let mut out = DoorSight::default();
@@ -417,11 +420,25 @@ impl Sim {
                 Some((k, c)) if *k == key => c.clone(),
                 _ => {
                     let c = model
+                        .as_ref()
                         .map(|m| {
-                            crate::collision::load_placeables(&self.vfs, &[(m, position, facing)])
+                            crate::collision::load_placeables(
+                                &self.vfs,
+                                &[(m.clone(), position, facing)],
+                            )
                         })
                         .filter(|c| !c.is_empty())
                         .map(Arc::new);
+                    let t = self.world.time_ms;
+                    self.world.trace.push(crate::trace::TraceEntry::Log {
+                        t,
+                        channel: -2,
+                        text: format!(
+                            "door sight: {d} model {} {} shapes",
+                            model.as_deref().unwrap_or("-"),
+                            c.as_ref().map_or(0, |c| c.len())
+                        ),
+                    });
                     self.door_collisions.insert(d, (key, c.clone()));
                     c
                 }
@@ -655,7 +672,10 @@ mod tests {
             s.door_cells.insert(7, Arc::new(Vec::new()));
             s.placeable_collisions.insert(
                 7,
-                (1, Arc::new(crate::collision::Collision::from_triangles(&[]))),
+                (
+                    1,
+                    Arc::new(crate::collision::Collision::from_triangles(&[])),
+                ),
             );
             s.door_collisions.insert(8, (1, None));
             s.blocked_since.insert(9, (0, false));
