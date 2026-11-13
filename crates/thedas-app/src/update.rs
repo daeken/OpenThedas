@@ -397,6 +397,21 @@ pub fn send_verdict_in_background(report: PathBuf, fixed: bool, comment: String)
         });
 }
 
+/// The words for the question a build started on `report` asks.
+pub fn verdict_prompt(report: &Path) -> String {
+    let what = sent_reports(report.parent().unwrap_or(report))
+        .iter()
+        .find(|s| s.dir == report)
+        .map(|s| {
+            let note: String = s.note.chars().take(120).collect();
+            format!(" in {} (\"{note}\")", s.place)
+        })
+        .unwrap_or_default();
+    format!(
+        "Is the problem you reported{what} fixed? Anything you write here goes with your answer."
+    )
+}
+
 /// The words for an offer's question.
 pub fn offer_prompt(o: &Offer) -> String {
     let note: String = o.report.note.chars().take(120).collect();

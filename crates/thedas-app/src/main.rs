@@ -645,8 +645,8 @@ enum UpdateAsk {
     Offer(update::Offer),
     /// Load where the player is, or where they reported it?
     Where(update::Offer),
-    /// The build started on a report: is it fixed?
-    Verdict(PathBuf),
+    /// The build started on a report: is it fixed? (The report's folder, the question.)
+    Verdict(PathBuf, String),
     /// Something went wrong.
     Failed(String),
 }
@@ -663,28 +663,8 @@ impl UpdateAsk {
                 "Where I am",
                 "Where I reported",
             ),
-            UpdateAsk::Verdict(dir) => {
-                let sent = update::sent_reports(dir.parent().unwrap_or(dir));
-                let what = sent
-                    .iter()
-                    .find(|s| &s.dir == dir)
-                    .map(|s| {
-                        format!(
-                            "in {} (\"{}\")",
-                            s.place,
-                            s.note.chars().take(120).collect::<String>()
-                        )
-                    })
-                    .unwrap_or_default();
-                (
-                    UPDATE_ASK_ID + 2,
-                    format!(
-                        "Is the problem you reported {what} fixed? Anything you write here goes \
-                         with your answer."
-                    ),
-                    "Fixed",
-                    "Not fixed",
-                )
+            UpdateAsk::Verdict(_, prompt) => {
+                (UPDATE_ASK_ID + 2, prompt.clone(), "Fixed", "Not fixed")
             }
             UpdateAsk::Failed(why) => (UPDATE_ASK_ID + 3, why.clone(), "OK", "Close"),
         }
@@ -702,12 +682,15 @@ const NOTE_TRIES: u32 = 10;
 /// Asks for a report's note in the game's own text box: Send when reports go to the
 /// project's Discord (see [`upload`]), else Save. Either button keeps the report: an
 /// accidental one costs a folder, a lost one costs the bug.
-fn ask_report_note(ui: &mut ui::UiLayer) {
+fn ask_report_note(ui: &mut ui::UiLayer, pad: bool) {
     let (prompt, ok, other) = match upload::webhook() {
         Some(_) => (report::NOTE_PROMPT_SEND, "Send report", "Keep here"),
         None => (report::NOTE_PROMPT, "Save report", "Save, no note"),
     };
-    ui.ask_text(report::NOTE_ID, prompt, "", ok, other);
+    // The box's OK wants some text, and the pad cannot type yet: a pad's report starts
+    // with a line that can go as it is.
+    let text = if pad { "(sent from a controller)" } else { "" };
+    ui.ask_text(report::NOTE_ID, prompt, text, ok, other);
 }
 
 /// What a report under way waits for.
@@ -1574,7 +1557,7 @@ impl App {
         match (report::preset_note(note), self.gfx.as_mut()) {
             (Some(text), _) => self.recorder.note(Some(text)),
             (None, Some(g)) if in_game => {
-                ask_report_note(&mut g.ui);
+                ask_report_note(&mut g.ui, self.pad.used);
                 note_asked = Some((0, 0));
             }
             (None, _) => self.recorder.note(Some(String::new())),
@@ -1657,7 +1640,7 @@ impl App {
                     w.note_asked = None;
                     self.recorder.note(Some(String::new()));
                 } else if !up {
-                    ask_report_note(&mut g.ui);
+                    ask_report_note(&mut g.ui, self.pad.used);
                 }
             }
         }
@@ -1727,7 +1710,11 @@ impl App {
                 let up = g.ui.stage.dialog_up();
                 match p.asked.as_mut() {
                     None if !up => {
-                        g.ui.ask_text(id, &prompt, "", ok, other);
+                        if matches!(p.kind, UpdateAsk::Verdict(..)) {
+                            g.ui.ask_text(id, &prompt, "", ok, other);
+                        } else {
+                            g.ui.ask_choice(id, &prompt, ok, other);
+                        }
                         p.asked = Some((0, 0));
                     }
                     None => {}
@@ -1747,7 +1734,11 @@ impl App {
                                 // Asked again later, once nothing else is up.
                                 p.asked = None;
                             } else {
-                                g.ui.ask_text(id, &prompt, "", ok, other);
+                                if matches!(p.kind, UpdateAsk::Verdict(..)) {
+                                    g.ui.ask_text(id, &prompt, "", ok, other);
+                                } else {
+                                    g.ui.ask_choice(id, &prompt, ok, other);
+                                }
                             }
                         }
                     }
@@ -1828,7 +1819,7 @@ impl App {
                     Err(e) => self.update_failed(format!("The game could not be saved: {e:#}")),
                 }
             }
-            UpdateAsk::Verdict(dir) => {
+            UpdateAsk::Verdict(dir, _) => {
                 update::send_verdict_in_background(dir, a.accepted, a.text);
             }
             UpdateAsk::Failed(_) => {}
@@ -4888,7 +4879,7 @@ fn main() -> Result<()> {
         report_wait: None,
         returning: match &args.check_report {
             Some(dir) => Returning::Asking(Box::new(UpdatePrompt {
-                kind: UpdateAsk::Verdict(dir.clone()),
+                kind: UpdateAsk::Verdict(dir.clone(), update::verdict_prompt(dir)),
                 asked: None,
             })),
             None => update::check_in_background(report::Recorder::default_dir())
