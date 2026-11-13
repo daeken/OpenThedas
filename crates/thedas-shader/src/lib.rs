@@ -1,6 +1,8 @@
 //! Direct3D 9 shaders as DA:O ships them: bytecode and constant-table parsing
 //! ([`bytecode`], [`ctab`]) and translation to validated naga IR ([`translate`]).
 
+#[cfg(feature = "backend-check")]
+pub mod backends;
 pub mod bytecode;
 pub mod ctab;
 pub mod translate;
