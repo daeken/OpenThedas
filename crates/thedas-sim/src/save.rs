@@ -250,10 +250,7 @@ impl Sim {
         // end (saves made by test drivers can hold one; reloading it would put the last
         // line on screen again). One still going is kept.
         self.talk = save.talk.filter(|c| !c.ended);
-        // Caches keyed by object id belong to the world just replaced.
-        self.area_layouts.clear();
-        self.door_cells.clear();
-        self.placeable_collisions.clear();
+        self.forget_world_caches();
         if save_revision < 1 {
             self.apply_worn_properties();
         }
