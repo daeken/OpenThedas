@@ -176,7 +176,6 @@ fn format_float(f: f32, width: i32, decimals: i32) -> String {
 
 /// Functions that only drive presentation; accepted as no-ops.
 const PRESENTATION: &[&str] = &[
-    "ApplyEffectVisualEffect",
     "SetAtmosphere",
     "SetAtmosphereRGB",
     "FB_SetEffectResource",
@@ -435,6 +434,21 @@ fn applied_effect(
         e.expires = Some(h.sim.world.time_ms + (duration.min(1.0e6) * 1000.0) as u64);
     }
     Some(e)
+}
+
+/// Applies a visual effect (type 4) to an object as any effect is applied; an instant one,
+/// which leaves nothing on the object, is noted for presentation ([`crate::world::InstantVfx`]).
+fn apply_visual_or_effect(h: &mut ScriptHost, target: ObjectId, e: Effect) {
+    let instant = constant(&h.sim.table, "EFFECT_DURATION_TYPE_INSTANT");
+    if e.ty == 4 && e.duration_type == instant && h.object(target).is_some() {
+        let note = crate::world::InstantVfx {
+            target,
+            vfx: e.ints.first().copied().unwrap_or(0),
+            started_ms: h.sim.world.time_ms,
+        };
+        h.sim.world.instant_vfx.push(note);
+    }
+    h.sim.apply_effect(target, e);
 }
 
 /// Converts `CommandMoveToObject` to `COMMAND_TYPE_MOVE_TO_OBJECT`.
@@ -1884,12 +1898,34 @@ pub fn call(
                 handle: Some(hd),
             })
         }
+        // DAOrigins.exe (0x65d300, function 635): makes an effect of type 4 (as
+        // EffectVisualEffect does) with the VFX as its integer 0, gives it the duration type,
+        // the duration (seconds x 1000), the creator and the ability, and applies it to the
+        // target through the same call as Engine_ApplyEffectOnObject (0x7a1a20).
+        "ApplyEffectVisualEffect" => {
+            let e = Effect {
+                ty: 4,
+                ints: vec![int(a, 2)],
+                ..Default::default()
+            };
+            let hd = h.sim.world.store(EngineData::Effect(e));
+            let ability = (a.len() > 5).then(|| int(a, 5));
+            if let Some(e) = applied_effect(h, Some(hd), int(a, 3), float(a, 4), obj(a, 0), ability)
+            {
+                apply_visual_or_effect(h, obj(a, 1), e);
+            }
+            void()
+        }
         "Engine_ApplyEffectOnObject" | "ApplyEffectOnObject" => {
             let ability = (a.len() > 5).then(|| int(a, 5));
             if let Some(mut e) =
                 applied_effect(h, handle(a, 1), int(a, 0), float(a, 3), obj(a, 4), ability)
             {
                 let target = obj(a, 2);
+                if e.ty == 4 {
+                    apply_visual_or_effect(h, target, e);
+                    return void();
+                }
                 // An area of effect on an object goes with it (see [`crate::aoe`]); the
                 // effect names it (object 0, as 0x7a0230 sets it) and takes it away when it
                 // goes.
@@ -6028,7 +6064,65 @@ mod coverage_tests {
         void RemoveEffect(object o, effect e) = 113;\n\
         void SetGameMode(int n) = 114;\n\
         void SetZoomLevel(float f) = 115;\n\
-        void SetLoadHint(int n, int t = 206) = 116;\n";
+        void SetLoadHint(int n, int t = 206) = 116;\n\
+        void ApplyEffectVisualEffect(object c, object t, int v, int d, float f, int a = 0) = 117;\n";
+
+    #[test]
+    fn visual_effects_on_objects_are_applied_as_effects() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let (mage, vein) = (
+            s.world.spawn(ObjectKind::Creature, "mage"),
+            s.world.spawn(ObjectKind::Placeable, "vein"),
+        );
+        for id in [mage, vein] {
+            s.world.get_mut(id).unwrap().area = Some(area);
+        }
+        let apply = |s: &mut Sim, vfx: i32, duration_type: i32, seconds: f32| {
+            run(
+                s,
+                mage,
+                "ApplyEffectVisualEffect",
+                &[
+                    Value::Object(mage),
+                    Value::Object(vein),
+                    Value::Int(vfx),
+                    Value::Int(duration_type),
+                    Value::Float(seconds),
+                    Value::Int(200),
+                ],
+            );
+        };
+        // A glow for three seconds, a lasting one, and an instant flash.
+        apply(&mut s, 1021, 2, 3.0);
+        apply(&mut s, 1022, 3, 0.0);
+        apply(&mut s, 77, 1, 0.0);
+        let kept: Vec<(i32, i32, Option<ObjectId>, i32)> = s
+            .world
+            .get(vein)
+            .unwrap()
+            .effects
+            .iter()
+            .map(|e| (e.ty, e.ints[0], e.creator, e.ability))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![(4, 1021, Some(mage), 200), (4, 1022, Some(mage), 200)]
+        );
+        let flash = &s.world.instant_vfx;
+        assert_eq!((flash.len(), flash[0].target, flash[0].vfx), (1, vein, 77));
+        s.tick(3_500);
+        let left: Vec<i32> = s
+            .world
+            .get(vein)
+            .unwrap()
+            .effects
+            .iter()
+            .map(|e| e.ints[0])
+            .collect();
+        assert_eq!(left, vec![1022], "the glow has run out");
+        assert!(s.world.instant_vfx.is_empty(), "the flash note has gone");
+    }
 
     #[test]
     fn a_load_hint_waits_for_the_next_transition() {

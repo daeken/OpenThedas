@@ -560,6 +560,8 @@ struct App {
     /// The last check of whether the interface covers the cursor while it is over a
     /// creature: (cursor, creature) → covered (see `App::update_hover`).
     hover_probe: Option<((f64, f64), thedas_script::vm::ObjectId, bool)>,
+    /// The highlight key held by an `allnames` step (see `Step::AllNames`).
+    all_names: bool,
     camera: Camera,
     size: (u32, u32),
     gfx: Option<Gfx>,
@@ -1272,6 +1274,9 @@ impl App {
         };
         g.ui.set_hovered(hovered);
         g.ui.set_line_voiced(voiced);
+        // Tab held shows every creature's name (never while it is typed into a field).
+        let tab = self.all_names || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
+        g.ui.set_show_all_names(tab);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -1401,6 +1406,9 @@ impl App {
         };
         g.ui.set_hovered(hovered);
         g.ui.set_line_voiced(voiced);
+        // Tab held shows every creature's name (never while it is typed into a field).
+        let tab = self.all_names || (self.keys.contains(&KeyCode::Tab) && !g.ui.stage.dialog_up());
+        g.ui.set_show_all_names(tab);
         play_interface(
             &mut g.ui,
             self.screens.as_mut(),
@@ -1860,6 +1868,7 @@ impl App {
                 .world
                 .hero
                 .map_or(0, |h| sim.property_total(h, 27) as i32),
+            kind: saves::KIND_SLOT,
         };
         drop(sim);
         let store = saves::SaveStore::new(self.saves_dir.clone());
@@ -1933,6 +1942,18 @@ impl App {
         };
         let line = voice_line(&live.sim());
         line.is_some_and(|l| a.line_voice(&l).is_some())
+    }
+
+    /// The quick save (`save`) or quick load key, while playing with no menu up.
+    fn quick(&mut self, save: bool) -> bool {
+        let (Some(g), Some(live)) = (self.gfx.as_mut(), self.live.as_ref()) else {
+            return false;
+        };
+        if save {
+            g.ui.quick_save(&live.sim)
+        } else {
+            g.ui.quick_load(&live.sim)
+        }
     }
 
     /// The creature the mouse is over, for its name over its head: none while the
@@ -2035,12 +2056,16 @@ impl App {
             },
             // While playing, P opens the spells/talents screen instead.
             KeyCode::KeyP if self.screens.is_none() => println!("camera {}", self.camera.spec()),
-            // F5 the save screen, F9 the load screen. Provisional: the game's own bindings
-            // (quick save and quick load) are not traced.
-            KeyCode::F5 | KeyCode::F9 if self.screens.as_ref().is_some_and(|s| !s.front_end) => {
-                if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_mut()) {
-                    g.ui.open_saves(s, if code == KeyCode::F5 { 1 } else { 2 });
-                }
+            // F5 quick save, F9 quick load: the exe's `QuickSave` and `QuickLoad` actions
+            // (0x51e4d0, 0x51e6f6). Provisional: that they are bound to F5 and F9 is the
+            // original's default as played, not read from keymap.gda here.
+            KeyCode::F5 | KeyCode::F9
+                if self
+                    .screens
+                    .as_ref()
+                    .is_some_and(|s| !s.front_end && s.menu.is_none()) =>
+            {
+                self.quick(code == KeyCode::F5);
             }
             KeyCode::F1 | KeyCode::F2 | KeyCode::F3 | KeyCode::F4 if self.live.is_some() => {
                 let n = match code {
@@ -2276,8 +2301,20 @@ impl App {
                 log.push("party picker".into());
             }
             &Step::Saves(mode) => {
-                self.key_down(if mode == 1 { KeyCode::F5 } else { KeyCode::F9 });
+                if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_mut()) {
+                    if !s.front_end {
+                        g.ui.open_saves(s, mode);
+                    }
+                }
                 log.push(format!("saves {mode}"));
+            }
+            &Step::Quick(save) => {
+                let done = self.quick(save);
+                log.push(format!(
+                    "quick {}: {}",
+                    if save { "save" } else { "load" },
+                    if done { "done" } else { "not done" }
+                ));
             }
             Step::Type(t) => {
                 let typed = self.gfx.as_mut().is_some_and(|g| g.ui.type_text(t));
@@ -2352,6 +2389,10 @@ impl App {
                     g.ui.ask_text(0, prompt, "", "OK", "Cancel");
                 }
                 log.push(format!("asktext {prompt:?}"));
+            }
+            &Step::AllNames(on) => {
+                self.all_names = on;
+                log.push(format!("allnames {on}"));
             }
             Step::AskChoice(prompt) => {
                 if let Some(g) = self.gfx.as_mut() {
@@ -3734,8 +3775,11 @@ enum Step {
     /// The party picker opens as a script's `ShowPartyPickerGUI` opens it (for trying the
     /// picker headless).
     Picker,
-    /// F5 or F9: the save screen (1) or the load screen (2) opens.
+    /// `key f5` or `key f9`: the save screen (1) or the load screen (2) opens (the keys
+    /// themselves quick save and quick load, see `Quick`).
     Saves(i32),
+    /// `quicksave` or `quickload`: what the F5 and F9 keys do.
+    Quick(bool),
     /// Text typed into the focused text field (`type <text>`).
     Type(String),
     /// A key for the focused text field (`key backspace`, `enter`, `delete`, `left`, `right`,
@@ -3801,6 +3845,9 @@ enum Step {
     /// The engine's own text box (`asktext Describe the issue`), as
     /// `ui::UiLayer::ask_text` shows it; its answer is logged.
     AskText(String),
+    /// The highlight key held or let go (`allnames on`, `allnames off`): every creature near
+    /// shows its name, as while Tab is down.
+    AllNames(bool),
     /// The engine's own two-button box (`askchoice Is it fixed?`), as
     /// `ui::UiLayer::ask_choice` shows it (Yes / No); its answer is logged.
     AskChoice(String),
@@ -4010,6 +4057,7 @@ fn parse_step(s: &str) -> Result<Step> {
         }
         "floaty" => Step::Floaty(arg.to_string()),
         "asktext" => Step::AskText(arg.trim().to_string()),
+        "allnames" => Step::AllNames(arg.trim() == "on"),
         "askchoice" => Step::AskChoice(arg.trim().to_string()),
         "training" => Step::Training(arg.trim().to_ascii_uppercase()),
         "trainingmode" => {
@@ -4077,6 +4125,8 @@ fn parse_step(s: &str) -> Result<Step> {
         "key" if text_key(arg).is_some() => {
             Step::TextKey(text_key(arg).unwrap_or(thedas_ui::UiKey::Enter))
         }
+        "quicksave" => Step::Quick(true),
+        "quickload" => Step::Quick(false),
         "key" if arg.eq_ignore_ascii_case("f5") => Step::Saves(1),
         "key" if arg.eq_ignore_ascii_case("f9") => Step::Saves(2),
         "hover" => {
@@ -4111,6 +4161,21 @@ fn main() -> Result<()> {
     // A client's or a test's run sends and fetches nothing (see `upload::online`).
     if args.control.is_some() || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some() {
         upload::set_automated();
+    }
+    // A newer build an update fetched takes over from the one the player started.
+    if args.capture.is_none() && args.check_report.is_none() {
+        if let Some(exe) = update::newest_build() {
+            match std::process::Command::new(&exe)
+                .args(std::env::args_os().skip(1))
+                .spawn()
+            {
+                Ok(_) => {
+                    log::info!("update: handing over to {}", exe.display());
+                    return Ok(());
+                }
+                Err(e) => log::warn!("update: {} did not start: {e}", exe.display()),
+            }
+        }
     }
     if let Some(secs) = args.pad_probe {
         paddev::probe(secs);
@@ -4508,6 +4573,20 @@ fn main() -> Result<()> {
                         }
                         println!("{} screen", if mode == 1 { "save" } else { "load" });
                     }
+                    &Step::Quick(save) => {
+                        let done = played.as_mut().is_some_and(|(layer, _)| {
+                            if save {
+                                layer.quick_save(&l.sim)
+                            } else {
+                                layer.quick_load(&l.sim)
+                            }
+                        });
+                        println!(
+                            "quick {}: {}",
+                            if save { "save" } else { "load" },
+                            if done { "done" } else { "not done" }
+                        );
+                    }
                     Step::Wipe => {
                         wipe(&mut l.sim());
                         println!("the party falls");
@@ -4554,6 +4633,12 @@ fn main() -> Result<()> {
                             layer.ask_text(0, prompt, "", "OK", "Cancel");
                         }
                         println!("asktext {prompt:?}");
+                    }
+                    &Step::AllNames(on) => {
+                        if let Some((layer, _)) = played.as_mut() {
+                            layer.set_show_all_names(on);
+                        }
+                        println!("allnames {on}");
                     }
                     Step::AskChoice(prompt) => {
                         if let Some((layer, _)) = played.as_mut() {
@@ -4855,6 +4940,7 @@ fn main() -> Result<()> {
             .or_else(|| args.control.is_none().then(saves::default_settings)),
         cursor: (0.0, 0.0),
         hover_probe: None,
+        all_names: false,
         camera,
         size,
         gfx: None,
