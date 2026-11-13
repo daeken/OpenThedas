@@ -1103,6 +1103,17 @@ impl Live {
         // from the reference frame (reference/original/triage/city_elf_opening_shianni.png),
         // not traced in the exe.
         let line = talk_line(&sim);
+        // Unless the line's stage has a `decision` camera to hand back to: Vaughan's line
+        // cuts (44998-45005) end on the Soris/hero two-shot in the original, the stage's
+        // decision camera, while City Elf's first line (its stage has none) keeps
+        // start_wake's last view. Provisional, from the two reference sequences.
+        let decision = self
+            .talk_camera
+            .staging(&sim, base)
+            .is_some_and(|st| st.decision.is_some());
+        if decision {
+            self.cut_held = None;
+        }
         match (&self.cut_held, &line) {
             (Some((held, view)), Some(now)) if held == now => {
                 let mut c = *view;
