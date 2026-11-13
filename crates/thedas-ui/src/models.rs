@@ -48,9 +48,8 @@ pub struct ObjectModel {
     pub morph: Option<String>,
     /// A helmet hides the morph's hair and beard (provisional).
     pub hide_hair: bool,
-    /// The lasting visual effects on it (see [`visual_effects`]): their models, without
-    /// `.mmh`.
-    pub effects: Vec<String>,
+    /// The visual effects on it (see [`visual_effects`]).
+    pub effects: Vec<EffectModel>,
     /// What the creature's body is doing, for its skeleton.
     pub motion: Option<Motion>,
     pub position: [f32; 3],
@@ -980,26 +979,69 @@ impl DrawnKey {
 /// The `effects.gda` type of a visual effect (`EffectVisualEffect`).
 const EFFECT_TYPE_VISUAL_EFFECT: i32 = 4;
 
-/// The models of the lasting visual effects scripts applied to object `o` (an
-/// `EffectVisualEffect` with a duration, kept on the object until it runs out or is removed,
-/// such as a spell's glow or a crust of flames): each effect's `VFX_base.gda` row (its integer
-/// 0) names the model (`ModelName`, e.g. `fxa_fire_crust_c`). Effects with an instant
-/// duration are not kept by the simulation, so they are not drawn. Provisional: the row's
-/// other columns (detail-level variants, attachment, scale, priority) are not mirrored.
-pub fn visual_effects(sim: &Sim, o: &Object) -> Vec<String> {
+/// A visual effect on an object, as drawn.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectModel {
+    /// The effect's model, without `.mmh` (`fxa_fire_crust_c`).
+    pub model: String,
+    /// Tells it from the object's other effects, the same for as long as it is on.
+    pub key: String,
+    /// World time an instant effect was played; a lasting one's start is not kept by the
+    /// simulation.
+    pub started_ms: Option<u64>,
+    /// Kept on the object until it runs out or is removed; else a flash played once.
+    pub lasting: bool,
+}
+
+/// The visual effects scripts applied to object `o` (`EffectVisualEffect`): the lasting ones
+/// kept on it until they run out or are removed (a spell's glow, a crust of flames), and the
+/// instant ones just played on it (`World::instant_vfx`: an impact). Each effect's
+/// `VFX_base.gda` row (its integer 0) names the model (`ModelName`, e.g.
+/// `fxa_fire_crust_c`). Provisional: the row's other columns (detail-level variants,
+/// attachment, scale, priority) are not mirrored.
+pub fn visual_effects(sim: &Sim, o: &Object) -> Vec<EffectModel> {
     let Some(t) = sim.world.tables().get(0, "vfx_base") else {
         return Vec::new();
     };
+    let model = |row: i32| {
+        let m = text(t.cell("ModelName", row as i64))?.to_ascii_lowercase();
+        (!m.is_empty()).then_some(m)
+    };
     let now = sim.world.time_ms;
-    o.effects
-        .iter()
-        .filter(|e| e.ty == EFFECT_TYPE_VISUAL_EFFECT && e.expires.is_none_or(|x| x > now))
-        .filter_map(|e| {
-            let row = *e.ints.first()? as i64;
-            let model = text(t.cell("ModelName", row))?.to_ascii_lowercase();
-            (!model.is_empty()).then_some(model)
-        })
-        .collect()
+    let mut out: Vec<EffectModel> = Vec::new();
+    for e in &o.effects {
+        if e.ty != EFFECT_TYPE_VISUAL_EFFECT || e.expires.is_some_and(|x| x <= now) {
+            continue;
+        }
+        let Some(&row) = e.ints.first() else { continue };
+        let Some(model) = model(row) else { continue };
+        // Effects carry no id of their own: what was applied, and which of its like.
+        let base = format!(
+            "l{row}_{}_{}_{}",
+            e.ability,
+            e.creator.map_or(-1, i64::from),
+            e.expires.map_or(-1, |x| x as i64)
+        );
+        let n = out.iter().filter(|x| x.key.starts_with(&base)).count();
+        out.push(EffectModel {
+            model,
+            key: format!("{base}_{n}"),
+            started_ms: None,
+            lasting: true,
+        });
+    }
+    for v in sim.world.instant_vfx.iter().filter(|v| v.target == o.id) {
+        let Some(model) = model(v.vfx) else { continue };
+        let base = format!("i{}_{}", v.vfx, v.started_ms);
+        let n = out.iter().filter(|x| x.key.starts_with(&base)).count();
+        out.push(EffectModel {
+            model,
+            key: format!("{base}_{n}"),
+            started_ms: Some(v.started_ms),
+            lasting: false,
+        });
+    }
+    out
 }
 
 /// Where the ids of [`location_vfx_models`] start: above any object id the world hands out.

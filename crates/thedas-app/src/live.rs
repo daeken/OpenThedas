@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use glam::Mat4;
-use thedas_render::{Animator, AreaRenderer, AreaScene, Clip, GpuContext, Prop, RenderCache};
+use thedas_render::{
+    Animator, AreaRenderer, AreaScene, Clip, GpuContext, Prop, PropEffect, RenderCache,
+};
 use thedas_script::vm::ObjectId;
 use thedas_sim::Sim;
 use thedas_ui::models::{ModelCache, ObjectModel};
@@ -126,6 +128,22 @@ impl LiveObjects {
     }
 }
 
+/// Which objects carry which visual effects: each with its models and its effects' keys.
+type EffectsKey = Vec<(ObjectId, Vec<String>, Vec<String>)>;
+
+/// The visual effects on the area's objects (a spell's glow, a crust of flames, an impact's
+/// flash), drawn over the objects in a scene of their own, so they come and go without the
+/// objects' scene being rebuilt. Their emitters sit on the objects' bodies and follow them.
+pub struct LiveEffects {
+    key: EffectsKey,
+    /// The level they were built for.
+    layout: String,
+    /// The scene's props' objects, in its order.
+    objects: Vec<ObjectId>,
+    scene: AreaScene,
+    renderer: AreaRenderer,
+}
+
 pub struct Live {
     /// Shared with the interface, whose movies act on it as they send messages.
     pub sim: Arc<Mutex<Sim>>,
@@ -136,6 +154,15 @@ pub struct Live {
     shaders: String,
     pub level: Option<LiveLevel>,
     pub objects: Option<LiveObjects>,
+    effects: Option<LiveEffects>,
+    /// When each lasting effect was first seen on its object (world milliseconds): the
+    /// simulation does not keep when it was applied.
+    effects_seen: std::collections::HashMap<(ObjectId, String), u64>,
+    /// The level whose objects' effects have been looked at: those already on when a level
+    /// comes up are taken as long since started.
+    effects_layout: Option<String>,
+    /// Poses the effects' scene (its skeletons are its own).
+    effects_animator: Animator,
     animator: Animator,
     /// The creatures the game camera has faded (see [`crate::camfade`]) and the models'
     /// creature shapes read so far.
@@ -456,6 +483,10 @@ impl Live {
             shaders: shaders.to_string(),
             level: None,
             objects: None,
+            effects: None,
+            effects_seen: Default::default(),
+            effects_layout: None,
+            effects_animator: Animator::default(),
             animator: Animator::default(),
             camera_fade: Default::default(),
             cutaway: Default::default(),
@@ -635,6 +666,7 @@ impl Live {
             self.loading = None;
             self.level = None;
             self.objects = None;
+            self.effects = None;
         }
     }
 
@@ -789,6 +821,7 @@ impl Live {
         self.loading = None;
         self.level = None;
         self.objects = None;
+        self.effects = None;
         self.failed_layout = Some(layout.to_string());
     }
 
@@ -1079,6 +1112,9 @@ impl Live {
         if let Some(o) = self.objects.as_mut() {
             o.renderer.set_time(t);
         }
+        if let Some(e) = self.effects.as_mut() {
+            e.renderer.set_time(t);
+        }
     }
 
     /// The open conversation's camera, when its lines are staged (see [`crate::talkcam`]);
@@ -1323,12 +1359,14 @@ impl Live {
         let Some(layout) = layout else {
             self.level = None;
             self.objects = None;
+            self.effects = None;
             self.staged = None;
             return Ok(());
         };
         let area = sim.world.area.unwrap_or_default();
         if self.level.as_ref().map(|l| l.layout.as_str()) != Some(layout.as_str()) {
             self.objects = None;
+            self.effects = None;
             if self.async_loads {
                 drop(sim);
                 match self.poll_level(ctx, format, &layout) {
@@ -1486,6 +1524,150 @@ impl Live {
             .zip(posed)
             .map(|(m, (t, c))| (m.id, t, c))
             .collect();
+        self.show_effects(ctx, format, &layout, &models)
+    }
+
+    /// Builds the objects' visual effects' scene when the effects on them change, and places
+    /// it on the objects as posed (see [`LiveEffects`]). An effect that carries over keeps
+    /// its particles.
+    fn show_effects(
+        &mut self,
+        ctx: &GpuContext,
+        format: wgpu::TextureFormat,
+        layout: &str,
+        models: &[ObjectModel],
+    ) -> Result<()> {
+        /// How old an effect already on when its level came up is taken to be, in
+        /// milliseconds: past any impact.
+        const LONG_SINCE_MS: u64 = 3_600_000;
+        let now = self.sim().world.time_ms;
+        let with: Vec<&ObjectModel> = models.iter().filter(|m| !m.effects.is_empty()).collect();
+        let fresh_level = self.effects_layout.as_deref() != Some(layout);
+        self.effects_layout = Some(layout.to_string());
+        self.effects_seen.retain(|(id, key), _| {
+            with.iter()
+                .any(|m| m.id == *id && m.effects.iter().any(|e| e.key == *key))
+        });
+        if with.is_empty() {
+            self.effects = None;
+            return Ok(());
+        }
+        let key: EffectsKey = with
+            .iter()
+            .map(|m| {
+                let keys = m.effects.iter().map(|e| e.key.clone()).collect();
+                (m.id, m.models.clone(), keys)
+            })
+            .collect();
+        let current = self
+            .effects
+            .as_ref()
+            .is_some_and(|e| e.key == key && e.layout == layout);
+        if !current {
+            let started = std::time::Instant::now();
+            let first_seen = if fresh_level {
+                now.saturating_sub(LONG_SINCE_MS)
+            } else {
+                now
+            };
+            let props: Vec<Prop> = with
+                .iter()
+                .map(|m| Prop {
+                    label: format!("{} {}", m.id, m.tag),
+                    models: m.models.clone(),
+                    attached: Vec::new(),
+                    morph: None,
+                    hide_hair: false,
+                    tints: Vec::new(),
+                    effects: m
+                        .effects
+                        .iter()
+                        .map(|e| {
+                            let since = e.started_ms.unwrap_or_else(|| {
+                                *self
+                                    .effects_seen
+                                    .entry((m.id, e.key.clone()))
+                                    .or_insert(first_seen)
+                            });
+                            PropEffect {
+                                model: e.model.clone(),
+                                key: e.key.clone(),
+                                age: now.saturating_sub(since) as f32 / 1000.0,
+                                lasting: e.lasting,
+                            }
+                        })
+                        .collect(),
+                    transform: Prop::placement(m.position, m.facing),
+                })
+                .collect();
+            let vfs = self
+                .level
+                .as_ref()
+                .map(|l| l.vfs.clone())
+                .context("effects before their level")?;
+            let spec = self.spec(format);
+            let scene = AreaScene::load_effects_at(&vfs, layout, &props, spec.detail)?;
+            let programs = crate::programs_cached(&vfs, &scene, &spec.shaders, &mut self.cache)?;
+            let mut renderer = AreaRenderer::new_cached(
+                ctx,
+                &vfs,
+                &scene,
+                &programs,
+                spec.format,
+                &mut self.cache,
+            );
+            // The clock first (it runs the emitters on), then the particles carried over.
+            renderer.set_time(self.shader_time);
+            if let Some(old) = self.effects.take() {
+                let was: std::collections::HashMap<&str, &thedas_render::particles::EmitterState> =
+                    old.scene
+                        .emitters
+                        .iter()
+                        .zip(&old.renderer.emitters)
+                        .filter_map(|(e, s)| Some((e.owner.as_deref()?, s)))
+                        .collect();
+                for (e, s) in scene.emitters.iter().zip(renderer.emitters.iter_mut()) {
+                    if let Some(o) = e.owner.as_deref().and_then(|k| was.get(k)) {
+                        s.carry_on_from(o);
+                    }
+                }
+            }
+            self.effects_animator.forget_skeletons();
+            log::debug!(
+                "{layout}: effects on {} objects, {} emitters, built in {:.1} ms",
+                props.len(),
+                scene.emitters.len(),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+            self.effects = Some(LiveEffects {
+                key,
+                layout: layout.to_string(),
+                objects: with.iter().map(|m| m.id).collect(),
+                scene,
+                renderer,
+            });
+        }
+        let (Some(level), Some(effects)) = (self.level.as_ref(), self.effects.as_mut()) else {
+            return Ok(());
+        };
+        let posed: Vec<(Mat4, Option<Clip>)> = effects
+            .objects
+            .iter()
+            .map(|id| {
+                self.posed
+                    .iter()
+                    .find(|p| p.0 == *id)
+                    .map_or((Mat4::IDENTITY, None), |p| (p.1, p.2.clone()))
+            })
+            .collect();
+        self.effects_animator.pose_props(
+            &level.vfs,
+            &effects.scene,
+            &mut effects.renderer,
+            ctx,
+            &posed,
+            0.0,
+        );
         Ok(())
     }
 
@@ -1539,6 +1721,11 @@ impl Live {
             o.renderer
                 .render_over(ctx, encoder, target, width, height, camera, &depth);
         }
+        if let Some(e) = self.effects.as_mut() {
+            let depth = level.renderer.depth(&ctx.device, width, height);
+            e.renderer
+                .render_over(ctx, encoder, target, width, height, camera, &depth);
+        }
         true
     }
 
@@ -1580,8 +1767,12 @@ impl Live {
         let Some(level) = self.level.as_mut() else {
             return Ok(None);
         };
-        let mut overlays: Vec<&mut AreaRenderer> =
-            self.objects.iter_mut().map(|o| &mut o.renderer).collect();
+        let mut overlays: Vec<&mut AreaRenderer> = self
+            .objects
+            .iter_mut()
+            .map(|o| &mut o.renderer)
+            .chain(self.effects.iter_mut().map(|e| &mut e.renderer))
+            .collect();
         Ok(Some(level.renderer.capture_with(
             ctx,
             camera,
@@ -2323,7 +2514,6 @@ fn objects_key(models: &[ObjectModel]) -> ObjectsKey {
             v.extend(m.attached.iter().map(|a| format!("{}@{}", a.model, a.node)));
             v.extend(m.morph.iter().map(|x| format!("{x}.mor{}", m.hide_hair)));
             v.extend(m.tints.iter().map(|(a, t)| format!("{a}:{t}")));
-            v.extend(m.effects.iter().map(|e| format!("fx:{e}")));
             (m.id, v)
         })
         .collect()
@@ -2367,7 +2557,8 @@ pub fn prop(m: &ObjectModel) -> Prop {
         morph: m.morph.clone(),
         hide_hair: m.hide_hair,
         tints: m.tints.clone(),
-        effects: m.effects.clone(),
+        // Drawn in a scene of their own (see `Live::show_effects`).
+        effects: Vec::new(),
         transform: Prop::placement(m.position, m.facing),
     }
 }

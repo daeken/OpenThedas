@@ -2552,14 +2552,15 @@ impl<'a> Loader<'a> {
             let (impact, duration) = (rate_in(&impact), rate_in(&looping));
             // An emitter no animation drives keeps its own birthrate while a lasting
             // effect is on.
-            let rate = (has_tracks(&impact) || has_tracks(&duration) || !instance.lasting).then(
-                || EffectTimeline {
-                    age: instance.age,
-                    lasting: instance.lasting,
-                    impact,
-                    duration,
-                },
-            );
+            let rate =
+                (has_tracks(&impact) || has_tracks(&duration) || !instance.lasting).then(|| {
+                    EffectTimeline {
+                        age: instance.age,
+                        lasting: instance.lasting,
+                        impact,
+                        duration,
+                    }
+                });
             if let Some(emitter) =
                 self.push_emitter(effect, e, name, prop.transform * in_model, &[], false)
             {
