@@ -91,6 +91,16 @@ impl GameJournal {
     }
 }
 
+impl GameJournal {
+    /// The checkpoint and the log as they stand, written out first (for an issue report).
+    pub fn files(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.writer.flush().ok()?;
+        let checkpoint = std::fs::read(checkpoint_path(&self.dir)).ok()?;
+        let log = std::fs::read(log_path(&self.dir)).ok()?;
+        Some((checkpoint, log))
+    }
+}
+
 /// The checkpoint to resume from, if there is one.
 pub fn checkpoint(dir: &Path) -> Option<Vec<u8>> {
     std::fs::read(checkpoint_path(dir)).ok()

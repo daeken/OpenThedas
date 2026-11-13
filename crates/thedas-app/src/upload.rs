@@ -30,7 +30,13 @@ const ZIPPED: &[&str] = &[
     "trace.json",
     "save_now.json",
     "save_before.json",
+    "journal_checkpoint.json",
+    "journal.jsonl",
 ];
+
+/// The journal's files (the game since its last checkpoint, input by input): left out
+/// when the report would be over the limit with them.
+const JOURNAL: &[&str] = &["journal_checkpoint.json", "journal.jsonl"];
 
 /// Set when the game is driven by a client or a test (`--control`, a hidden window): then
 /// nothing is sent or fetched (reports, verdicts, the update check), so a test under a
@@ -131,7 +137,11 @@ pub fn send(dir: &Path, url: &str) -> Result<String> {
         files.push((name.to_string(), redact(bytes, home.as_deref())));
     }
     let id = info["id"].as_str().unwrap_or("report").to_string();
-    let zip = zip(&files)?;
+    let mut zip = zip(&files)?;
+    if zip.len() > MAX_UPLOAD {
+        files.retain(|(n, _)| !JOURNAL.contains(&n.as_str()));
+        zip = self::zip(&files)?;
+    }
     // The marked copy, when the player marked spots: it shows what they pointed at.
     let mut shot = std::fs::read(dir.join("screenshot_marked.png"))
         .or_else(|_| std::fs::read(dir.join("screenshot.png")))
