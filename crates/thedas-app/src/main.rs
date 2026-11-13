@@ -1320,6 +1320,9 @@ impl App {
         }
         g.ui.set_pad_active(self.pad.used);
         let hovered = self.hovered_creature();
+        if let Some(live) = self.live.as_mut() {
+            live.set_hovered(hovered);
+        }
         let voiced = self.line_voiced();
         self.show_cursor();
         let Some(g) = self.gfx.as_mut() else {
@@ -1472,6 +1475,9 @@ impl App {
         }
         g.ui.set_pad_active(self.pad.used);
         let hovered = self.hovered_creature();
+        if let Some(live) = self.live.as_mut() {
+            live.set_hovered(hovered);
+        }
         let voiced = self.line_voiced();
         self.show_cursor();
         let Some(g) = self.gfx.as_mut() else {

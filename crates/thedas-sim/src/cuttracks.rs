@@ -46,6 +46,10 @@
 //! - Kind 19, the frame buffer effect action (`AFBE`): see [`FrameEffectTrack`].
 //! - Kind 27, `ActionLinkToActor` (built by 0x7db900, update 0x7d3cf0): see [`ActorLink`].
 //! - Kind 28, `ActionHeadtracking` (built by 0x7da820, update 0x7d0d00): see [`HeadTrack`].
+//! - Kind 32, `ActionChangeVisibility` (built by 0x7dba50, update 0x7d44c0): from its start
+//!   the actor is shown or hidden as its field 5680 says (0x7d4220); when the cutscene lets
+//!   go of the actor it is as the world has it again (0x7d44d0). See [`Actor::visible_at`].
+//! - Kind 41, `ActionDrawWeapon` (built by 0x7dce50, update 0x7d1210): see [`WeaponDraw`].
 //!
 //! Provisional: which way a camera actor looks (taken as its local +Y, as a stage camera's;
 //! up is +Z); whether a field of view is vertical; tracks outside their span (a track is
@@ -86,6 +90,9 @@ const FIELD_PARAMETER_VALUE: u32 = 5524;
 const FIELD_PARAMETER_CURVE: u32 = 5525;
 const FIELD_PARAMETER_COMPONENT: u32 = 5526;
 const FIELD_JUMP_BY_PLACE: u32 = 5570;
+const FIELD_VISIBLE: u32 = 5680;
+const FIELD_DRAW_MAIN: u32 = 5730;
+const FIELD_DRAW_OFF: u32 = 5731;
 const FIELD_LOOK_TARGET: u32 = 5620;
 const FIELD_LOOK_SPEED: u32 = 5621;
 const FIELD_LINK_TARGET: u32 = 5630;
@@ -117,6 +124,8 @@ pub const TRACK_ROTATE: u64 = 18;
 pub const TRACK_FRAME_EFFECT: u64 = 19;
 pub const TRACK_LINK_TO_ACTOR: u64 = 27;
 pub const TRACK_HEAD_TRACKING: u64 = 28;
+pub const TRACK_CHANGE_VISIBILITY: u64 = 32;
+pub const TRACK_DRAW_WEAPON: u64 = 41;
 pub const TRACK_JUMP_TO_CAMERA: u64 = 24;
 pub const TRACK_JUMP_TO_PLACE: u64 = 25;
 pub const TRACK_SNAP_TO_WALKMESH: u64 = 38;
@@ -500,6 +509,23 @@ impl ActorLink {
     }
 }
 
+/// An `ActionDrawWeapon` track (kind 41; `ADW_`): where the actor's creature carries its
+/// weapons from the action's start.
+///
+/// Traced (update 0x7d1210, through 0x7cfdb0): the main hand's item (inventory slot 3) goes
+/// to its drawn place when field 5730 is set, else to its sheathed place (the item's
+/// `BITM_base.gda` parts, columns 0x48859b70 and 0x7083f7d4); when field 5731 is set the
+/// off hand's item (slot 4) goes to its drawn place (column 0x9cc4a4af) and is otherwise
+/// left as it is. When the cutscene lets go of the actor both are sheathed (0x7d1260).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WeaponDraw {
+    pub start: f32,
+    /// Field 5730: the main hand's weapon is drawn (else sheathed).
+    pub main: bool,
+    /// Field 5731: the off hand's is drawn too (else left as it is).
+    pub off: bool,
+}
+
 /// An `ActionHeadtracking` track (kind 28; `ACHT`): what the actor's head tracker looks at.
 ///
 /// Traced (update 0x7d0d00): as the action starts, the actor's creature's head tracker is
@@ -579,6 +605,10 @@ pub struct Actor {
     pub links: Vec<ActorLink>,
     /// Kind-28 tracks, in the file's order.
     pub head_tracks: Vec<HeadTrack>,
+    /// Kind-32 tracks, in the file's order: when, and whether shown from then.
+    pub visibility: Vec<(f32, bool)>,
+    /// Kind-41 tracks, in the file's order.
+    pub weapon_draws: Vec<WeaponDraw>,
 }
 
 /// Where an actor is at a moment of the cutscene.
@@ -593,6 +623,25 @@ pub struct Pose {
 }
 
 impl Actor {
+    /// Whether the cutscene shows or hides the actor `t` seconds in: what its last started
+    /// visibility action says; `None` before the first (it is as the world has it).
+    pub fn visible_at(&self, t: f32) -> Option<bool> {
+        self.visibility
+            .iter()
+            .filter(|(start, _)| *start <= t + KEY_SNAP)
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, shown)| *shown)
+    }
+
+    /// Where the cutscene has the actor carry its weapons `t` seconds in: whether the main
+    /// hand's is drawn (as its last started draw action says) and, when any action started
+    /// so far drew it, that the off hand's is. `None` before the first action.
+    pub fn weapons_at(&self, t: f32) -> Option<(bool, Option<bool>)> {
+        let started = || self.weapon_draws.iter().filter(|w| w.start <= t + KEY_SNAP);
+        let last = started().max_by(|a, b| a.start.total_cmp(&b.start))?;
+        Some((last.main, started().any(|w| w.off).then_some(true)))
+    }
+
     /// The head tracking action that says where the actor looks `t` seconds in: the last
     /// started (see [`HeadTrack`]).
     pub fn head_track_at(&self, t: f32) -> Option<&HeadTrack> {
@@ -985,6 +1034,8 @@ impl Tracks {
                 camera_jumps: Vec::new(),
                 links: Vec::new(),
                 head_tracks: Vec::new(),
+                visibility: Vec::new(),
+                weapon_draws: Vec::new(),
             };
             for tr in structs(g, a, FIELD_ACTOR_TRACKS) {
                 let Some(kind) = g.field(tr, FIELD_TRACK_KIND).and_then(Value::as_u64) else {
@@ -1056,6 +1107,25 @@ impl Tracks {
                                 keep_offset: flag(FIELD_LINK_KEEP_OFFSET),
                             });
                         }
+                    }
+                    TRACK_CHANGE_VISIBILITY => {
+                        let shown = g
+                            .field(tr, FIELD_VISIBLE)
+                            .and_then(Value::as_u64)
+                            .is_some_and(|v| v != 0);
+                        actor.visibility.push((start, shown));
+                    }
+                    TRACK_DRAW_WEAPON => {
+                        let flag = |l| {
+                            g.field(tr, l)
+                                .and_then(Value::as_u64)
+                                .is_some_and(|v| v != 0)
+                        };
+                        actor.weapon_draws.push(WeaponDraw {
+                            start,
+                            main: flag(FIELD_DRAW_MAIN),
+                            off: flag(FIELD_DRAW_OFF),
+                        });
                     }
                     TRACK_HEAD_TRACKING => {
                         actor.head_tracks.push(HeadTrack {
@@ -2046,6 +2116,8 @@ mod tests {
             camera_jumps: Vec::new(),
             links: Vec::new(),
             head_tracks: Vec::new(),
+            visibility: Vec::new(),
+            weapon_draws: Vec::new(),
         };
         assert_eq!(a.head_track_at(1.0), None);
         let track = |start: f32, end: f32, target: i64| HeadTrack {
@@ -2061,6 +2133,43 @@ mod tests {
         assert_eq!(a.head_track_at(3.0).and_then(|h| h.target), Some(2));
         assert_eq!(a.head_track_at(5.0).and_then(|h| h.target), Some(3));
         assert_eq!(a.head_track_at(9.0).and_then(|h| h.target), Some(3));
+    }
+
+    #[test]
+    fn visibility_and_weapon_draws_hold_from_their_start() {
+        let mut a = Actor {
+            id: 1,
+            name: "a".into(),
+            creature: None,
+            tag: None,
+            end_position: [0.0; 3],
+            end_rotation: [0.0, 0.0, 0.0, 1.0],
+            snaps: false,
+            pose: None,
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            motion: Vec::new(),
+            turn: Vec::new(),
+            fov: Vec::new(),
+            animations: Vec::new(),
+            places: Vec::new(),
+            camera_jumps: Vec::new(),
+            links: Vec::new(),
+            head_tracks: Vec::new(),
+            visibility: vec![(32.2, true), (0.0, false)],
+            weapon_draws: Vec::new(),
+        };
+        assert_eq!(a.visible_at(1.0), Some(false));
+        assert_eq!(a.visible_at(40.0), Some(true));
+        assert_eq!(a.weapons_at(40.0), None);
+        let draw = |start: f32, main: bool, off: bool| WeaponDraw { start, main, off };
+        a.weapon_draws = vec![draw(5.0, true, true), draw(9.0, false, false)];
+        assert_eq!(a.weapons_at(1.0), None);
+        assert_eq!(a.weapons_at(6.0), Some((true, Some(true))));
+        // Sheathing the main hand's leaves the off hand's where an earlier action put it.
+        assert_eq!(a.weapons_at(10.0), Some((false, Some(true))));
+        a.visibility.clear();
+        assert_eq!(a.visible_at(1.0), None);
     }
 
     #[test]
@@ -2084,6 +2193,8 @@ mod tests {
             camera_jumps: Vec::new(),
             links: Vec::new(),
             head_tracks: Vec::new(),
+            visibility: Vec::new(),
+            weapon_draws: Vec::new(),
         };
         assert_eq!(a.pose_node().as_deref(), Some("pose_17"));
         a.pose = Some(0);
@@ -2151,6 +2262,8 @@ mod tests {
             camera_jumps: Vec::new(),
             links: Vec::new(),
             head_tracks: Vec::new(),
+            visibility: Vec::new(),
+            weapon_draws: Vec::new(),
         };
         let none: &PlaceLookup = &|_| None;
         let before = a.stage_pose_at(1.0, none);
