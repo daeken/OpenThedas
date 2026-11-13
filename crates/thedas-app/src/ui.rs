@@ -277,6 +277,9 @@ pub struct UiLayer {
     floaties: Vec<Floaty>,
     /// The stats floaties up (name and health bar over a creature): creature → floaty id.
     stat_floaties: std::collections::BTreeMap<thedas_script::vm::ObjectId, u32>,
+    /// The player's settings file and the settings last written to it (see
+    /// [`UiLayer::set_settings_file`]).
+    settings_file: Option<(std::path::PathBuf, std::collections::BTreeMap<String, f64>)>,
     /// The creature the mouse is over (see [`UiLayer::set_hovered`]).
     hovered: Option<thedas_script::vm::ObjectId>,
     /// A conversation line's continue the movie could not send (see `continue_conversation`).
@@ -503,6 +506,41 @@ impl UiLayer {
         )
     }
 
+    /// Keeps the player's settings in `path` (see `thedas_ui::options::to_text`): what it
+    /// holds now is taken, and every change the options screen makes is written back.
+    /// A missing or unreadable file leaves the defaults.
+    pub fn set_settings_file(&mut self, path: std::path::PathBuf) {
+        let read = std::fs::read_to_string(&path)
+            .map(|t| thedas_ui::options::from_text(&t))
+            .unwrap_or_default();
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.options.extend(read.clone());
+        }
+        self.settings_file = Some((path, read));
+    }
+
+    /// Writes the player's settings when they changed since last written.
+    fn write_settings(&mut self) {
+        let Some((path, written)) = self.settings_file.as_mut() else {
+            return;
+        };
+        let Some(now) = self.shown.lock().ok().map(|s| s.options.clone()) else {
+            return;
+        };
+        if now == *written {
+            return;
+        }
+        *written = now.clone();
+        let text = thedas_ui::options::to_text(&now);
+        let result = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| std::fs::write(&*path, text));
+        if let Err(e) = result {
+            log::warn!("settings: writing {}: {e}", path.display());
+        }
+    }
+
     /// A player setting (`AudioOptions.MusicVolume`) as the options screen keeps it.
     pub fn client_option(&self, name: &str) -> Option<f64> {
         self.shown.lock().ok()?.options.get(name).copied()
@@ -554,6 +592,7 @@ impl UiLayer {
             floaties: Vec::new(),
             stat_floaties: Default::default(),
             hovered: None,
+            settings_file: None,
             continue_pending: false,
             next_floaty: 1,
             portraits: PortraitClock::default(),
@@ -1282,6 +1321,7 @@ impl UiLayer {
                 self.continue_conversation();
             }
         }
+        self.write_settings();
         self.show_cutscene_line(sim);
         self.show_script_popup(sim);
         self.select_clicked_portrait(sim);

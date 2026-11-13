@@ -197,6 +197,12 @@ struct Args {
     /// screen, the death screen's load). Defaults to `$HOME/.openthedas/saves`.
     #[arg(long)]
     saves: Option<PathBuf>,
+    /// The player's settings file (the options screen's settings, kept between runs).
+    /// Playing in a window without `--control` it defaults to `options.ini` in the
+    /// player's folder (`.openthedas` in the home folder, on Windows too); otherwise
+    /// settings are kept only when this is given.
+    #[arg(long)]
+    settings: Option<PathBuf>,
     /// List the game controllers gilrs sees (names, ids, mapping, which inputs it maps) and
     /// print their events for this many seconds, then exit. No window, no install needed.
     #[arg(long)]
@@ -538,6 +544,8 @@ struct App {
     ui: Vec<String>,
     /// Where the player's games are saved.
     saves_dir: PathBuf,
+    /// The player's settings file, when settings are kept (see `Args::settings`).
+    settings: Option<PathBuf>,
     cursor: (f64, f64),
     /// The last check of whether the interface covers the cursor while it is over a
     /// creature: (cursor, creature) → covered (see `App::update_hover`).
@@ -872,6 +880,9 @@ impl App {
             &self.ui,
             (config.width, config.height),
         );
+        if let Some(path) = &self.settings {
+            ui.set_settings_file(path.clone());
+        }
         if let (Some(live), Some(_)) = (&self.live, &self.screens) {
             ui.attach(&live.sim);
             ui.set_saves(saves::SaveStore::new(self.saves_dir.clone()));
@@ -3538,6 +3549,9 @@ fn main() -> Result<()> {
             l.movies_wait = true;
             if ui.is_empty() {
                 let mut layer = ui::UiLayer::new(&ctx, &loaded.vfs, &[], size);
+                if let Some(path) = &args.settings {
+                    layer.set_settings_file(path.clone());
+                }
                 layer.attach(&l.sim);
                 layer.set_saves(saves::SaveStore::new(saves_dir.clone()));
                 let mut s = screens::Screens::new(l.front_end);
@@ -4136,6 +4150,10 @@ fn main() -> Result<()> {
         screens,
         ui,
         saves_dir: saves_dir.clone(),
+        settings: args
+            .settings
+            .clone()
+            .or_else(|| args.control.is_none().then(saves::default_settings)),
         cursor: (0.0, 0.0),
         hover_probe: None,
         camera,

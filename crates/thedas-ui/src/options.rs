@@ -9,8 +9,8 @@
 //! takes effect when it is set), `ClientOptions.CommitOptions` from OK and
 //! `ClientOptions.RestoreDefaults` from its button. The defaults are those DAOrigins.exe's
 //! ClientOptions sets up (0x5e8735-0x5ec18d). Provisional: Cancel keeps what was set (the
-//! executable's handlers, registered at 0x7946c0, are not traced) and nothing is written to the
-//! player's settings file. The audio volumes and mutes, auto-pause in combat, the
+//! executable's handlers, registered at 0x7946c0, are not traced). The app keeps the settings
+//! in the player's settings file ([`to_text`]), written whenever one changes. The audio volumes and mutes, auto-pause in combat, the
 //! tutorials, mouse sensitivity and the inverted axes take effect; the other settings change nothing yet but what the screen shows.
 
 use std::collections::BTreeMap;
@@ -102,6 +102,55 @@ pub fn option_message(options: &mut BTreeMap<String, f64>, name: &str, args: &[S
     }
 }
 
+/// The player's settings file, in the form of the original's own (`DragonAge.ini` in
+/// `BioWare\Dragon Age\Settings\` under the player's documents, exe 0xb01458): a
+/// `[Group]` section per group with `Name=value` lines, here only for the settings changed
+/// from their defaults (the difficulty is the game's, and `ScreenResIndex` follows the
+/// window, so neither is written). Provisional: when the original writes it (OK, or each
+/// change) is not traced.
+pub fn to_text(options: &BTreeMap<String, f64>) -> String {
+    let mut out = String::new();
+    let mut group = "";
+    for (k, v) in options {
+        let Some((g, name)) = k.split_once('.') else {
+            continue;
+        };
+        if k == DIFFICULTY || !DEFAULTS.iter().any(|(d, _)| d == k) || !v.is_finite() {
+            continue;
+        }
+        if g != group {
+            out.push_str(&format!("[{g}]\n"));
+            group = g;
+        }
+        out.push_str(&format!("{name}={v}\n"));
+    }
+    out
+}
+
+/// Reads a settings file ([`to_text`]): the settings it names that the options screen
+/// keeps, with finite values; anything else is skipped.
+pub fn from_text(text: &str) -> BTreeMap<String, f64> {
+    let mut group = String::new();
+    let mut out = BTreeMap::new();
+    for line in text.lines().map(str::trim) {
+        if let Some(g) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            group = g.trim().to_string();
+            continue;
+        }
+        let Some((name, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = format!("{group}.{}", name.trim());
+        let Ok(v) = v.trim().parse::<f64>() else {
+            continue;
+        };
+        if key != DIFFICULTY && v.is_finite() && DEFAULTS.iter().any(|(d, _)| *d == key) {
+            out.insert(key, v);
+        }
+    }
+    out
+}
+
 /// The settings as optionsmenu.gfx reads them (`ClientOptions.<Group>.<Name>`), with the
 /// resolutions it offers (`ClientOptions.ScreenResList`): the one the game runs at
 /// (`resolution`, also as `VideoOptions.ResolutionWidth` and `ResolutionHeight`).
@@ -132,6 +181,26 @@ pub fn values(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_settings_file_keeps_known_settings_and_skips_the_rest() {
+        let mut o = BTreeMap::new();
+        o.insert("GameOptions.SubtitlesLevel".to_string(), 1.0);
+        o.insert("AudioOptions.MusicVolume".to_string(), 4.5);
+        o.insert(DIFFICULTY.to_string(), 3.0);
+        let text = to_text(&o);
+        assert_eq!(
+            text,
+            "[AudioOptions]\nMusicVolume=4.5\n[GameOptions]\nSubtitlesLevel=1\n"
+        );
+        let back = from_text(&format!(
+            "{text}garbage\n[Nonsense]\nOption=1\n[GameOptions]\nShowGore=x\nAutoSave=NaN\nDifficultyLevel=2\nLocale=en-us\n"
+        ));
+        assert_eq!(back.len(), 2);
+        assert_eq!(back["GameOptions.SubtitlesLevel"], 1.0);
+        assert_eq!(back["AudioOptions.MusicVolume"], 4.5);
+        assert!(from_text("").is_empty());
+    }
 
     #[test]
     fn settings_change_restore_and_leave_the_difficulty_to_the_game() {
