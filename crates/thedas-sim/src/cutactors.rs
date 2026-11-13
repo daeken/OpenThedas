@@ -322,6 +322,7 @@ mod tests {
             id: 1,
             name: tag.into(),
             creature: None,
+            model: None,
             tag: Some(tag.into()),
             position: [0.0; 3],
             rotation: [0.0, 0.0, 0.0, 1.0],
@@ -337,6 +338,8 @@ mod tests {
             camera_jumps: Vec::new(),
             links: Vec::new(),
             head_tracks: Vec::new(),
+            visibility: Vec::new(),
+            weapon_draws: Vec::new(),
         }
     }
 

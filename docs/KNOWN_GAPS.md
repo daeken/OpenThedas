@@ -37,7 +37,7 @@ so an untraced item starts with a trace, not with a guess.
 | Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 167 (`SIM-`), plus ability coverage by family |
 | Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 96 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
 | Rendering | [gaps/rendering.md](gaps/rendering.md) | 152 (`RND-`) |
-| Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 181 (`UI-`), plus the movies never opened and the values no screen gets answered |
+| Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 180 (`UI-`), plus the movies never opened and the values no screen gets answered |
 | Audio | [gaps/audio.md](gaps/audio.md) | 55 (`AUD-`) |
 | Cameras, cutscene presentation, startup | [gaps/cameras-cutscenes.md](gaps/cameras-cutscenes.md) | 41 (`CAM-`) |
 | File formats and file system | [gaps/formats.md](gaps/formats.md) | 46 (`FMT-`), plus a table of every resource type and the tables and types nothing reads |
@@ -115,7 +115,7 @@ these, so they are the places where one person or stream can take a large, separ
 - **Screen effects.** Distortion other than heat haze from particles (`RND-107`), cutscene
   screen effects other than depth of field and fades (`RND-158`), script-driven screen effects,
   anti-aliasing,
-  decals, trails, weather, selection circles and area-map fog are not drawn; transparent draws
+  decals, trails, weather and area-map fog are not drawn; transparent draws
   are not sorted.
 
 ### Interface and input

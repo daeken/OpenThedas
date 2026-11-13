@@ -594,6 +594,7 @@ mod tests {
             id,
             name: name.into(),
             creature: None,
+            model: None,
             tag: None,
             end_position: [0.0; 3],
             end_rotation: [0.0, 0.0, 0.0, 1.0],
@@ -614,6 +615,8 @@ mod tests {
             }],
             links: Vec::new(),
             head_tracks: Vec::new(),
+            visibility: Vec::new(),
+            weapon_draws: Vec::new(),
         }
     }
 

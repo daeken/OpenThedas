@@ -34,9 +34,11 @@
 //! Interface:
 //!
 //! - [`gfx`]: Scaleform GFx movies (SWF with Scaleform tags), with a rewriter to plain SWF.
+//! - [`cur`]: Windows cursor files, the game's mouse cursors.
 
 pub mod anim;
 pub mod area;
+pub mod cur;
 pub mod dds;
 pub mod emitter;
 pub mod fev;
