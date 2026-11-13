@@ -3258,6 +3258,22 @@ mod tests {
     }
 
     #[test]
+    fn an_effect_birthrate_loops_with_its_animation() {
+        use thedas_formats::anim::ScalarTrack;
+        let r = EffectRate {
+            length: 2.0,
+            birthrate: Some(ScalarTrack {
+                target: "flame_default_birthrate".into(),
+                keys: vec![(0.0, 5.0), (2.0, 10.0)],
+            }),
+            range: None,
+        };
+        assert_eq!(r.at(1.0), (7.5, 0.0));
+        // Looped: 3 s is 1 s into the second pass.
+        assert_eq!(r.at(3.0), (7.5, 0.0));
+    }
+
+    #[test]
     fn the_lod_distances_follow_the_radius() {
         assert_eq!(TreeLod::range(1.0, 0), (15.0, 35.0));
         assert_eq!(TreeLod::range(30.0, 0), (20.0, 120.0));

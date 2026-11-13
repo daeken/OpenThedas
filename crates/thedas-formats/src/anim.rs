@@ -680,6 +680,35 @@ mod tests {
     }
 
     #[test]
+    fn float_tracks_are_kept_by_their_parameter_name() {
+        let mut b = Builder::new(b"ANI ");
+        let k1 = b.add(b"flot", vec![(4035, Value::U16(0)), (4036, Value::F32(5.0))]);
+        let k2 = b.add(
+            b"flot",
+            vec![(4035, Value::U16(65535)), (4036, Value::F32(10.0))],
+        );
+        let l = b.add(b"list", vec![(4004, structs(&[k2, k1]))]);
+        let t = b.add(
+            b"node",
+            vec![
+                (4000, s("Flame_Default_birthrate")),
+                (4001, Value::U32(8)),
+                (4004, Value::Struct(Some(l))),
+            ],
+        );
+        let root = b.add(b"anim", vec![(4005, structs(&[t])), (4009, Value::F32(2.0))]);
+        let a = Animation::from_gff(&b.finish(root)).unwrap();
+        assert!(a.tracks.is_empty());
+        assert_eq!(a.scalars.len(), 1);
+        let track = &a.scalars[0];
+        assert_eq!(track.target, "flame_default_birthrate");
+        assert_eq!(track.keys, vec![(0.0, 5.0), (2.0, 10.0)]);
+        assert_eq!(track.at(-1.0), 5.0);
+        assert_eq!(track.at(1.0), 7.5);
+        assert_eq!(track.at(3.0), 10.0);
+    }
+
+    #[test]
     fn field_4011_marks_an_additive_animation() {
         let anim = |flag: Option<u8>| {
             let mut b = Builder::new(b"ANI ");
