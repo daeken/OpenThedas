@@ -183,8 +183,9 @@ struct Args {
     /// `pad stick-right X,Y MS` (a stick held there while the game runs MS, then let go).
     #[arg(long, default_value = "")]
     steps: String,
-    /// Module for `--save` and `--objects`.
-    #[arg(long, default_value = "single player")]
+    /// Module for `--save` and `--objects`; the install's base campaign when not given
+    /// (`single player`, or `campaign_base` for Dragon Age II).
+    #[arg(long, default_value = "")]
     module: String,
     /// Window, playing: take input from local clients on this loopback address
     /// (`127.0.0.1:7878`), as `thedas-mcp`'s `attach` sends it.
@@ -4427,7 +4428,7 @@ fn main() -> Result<()> {
     report::init_logging(env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
     ));
-    let args = Args::parse();
+    let mut args = Args::parse();
     // A client's or a test's run sends and fetches nothing (see `upload::online`).
     if args.control.is_some() || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some() {
         upload::set_automated();
@@ -4456,6 +4457,9 @@ fn main() -> Result<()> {
         .install
         .or_else(|| std::env::var_os("THEDAS_INSTALL").map(PathBuf::from))
         .context("give --install or set THEDAS_INSTALL")?;
+    if args.module.is_empty() {
+        args.module = thedas_vfs::install::campaign_module(&install).to_string();
+    }
     let size = parse_size(&args.size)?;
     let saves_dir = args
         .saves
