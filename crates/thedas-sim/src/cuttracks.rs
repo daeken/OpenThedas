@@ -2026,6 +2026,44 @@ mod tests {
 
     /// An actor's pose number names its base pose's node in the cutscene's tree.
     #[test]
+    fn an_actor_looks_as_its_last_started_head_tracking_action_says() {
+        let mut a = Actor {
+            id: 1,
+            name: "a".into(),
+            creature: None,
+            tag: None,
+            end_position: [0.0; 3],
+            end_rotation: [0.0, 0.0, 0.0, 1.0],
+            snaps: false,
+            pose: None,
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            motion: Vec::new(),
+            turn: Vec::new(),
+            fov: Vec::new(),
+            animations: Vec::new(),
+            places: Vec::new(),
+            camera_jumps: Vec::new(),
+            links: Vec::new(),
+            head_tracks: Vec::new(),
+        };
+        assert_eq!(a.head_track_at(1.0), None);
+        let track = |start: f32, end: f32, target: i64| HeadTrack {
+            start,
+            end,
+            target: Some(target),
+            speed: 0.5,
+        };
+        a.head_tracks = vec![track(4.0, 6.0, 3), track(1.0, 2.0, 2)];
+        assert_eq!(a.head_track_at(0.5), None);
+        assert_eq!(a.head_track_at(1.0).and_then(|h| h.target), Some(2));
+        // Held after its end, until the next starts.
+        assert_eq!(a.head_track_at(3.0).and_then(|h| h.target), Some(2));
+        assert_eq!(a.head_track_at(5.0).and_then(|h| h.target), Some(3));
+        assert_eq!(a.head_track_at(9.0).and_then(|h| h.target), Some(3));
+    }
+
+    #[test]
     fn an_actors_pose_number_names_its_base_pose() {
         let mut a = Actor {
             id: 1,
