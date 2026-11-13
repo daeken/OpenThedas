@@ -255,9 +255,13 @@ impl Sim {
             },
         );
         // The HUD's notification: a codex entry, or a quest the journal lists. There is one
-        // per type, naming the latest plot (notifications.gfx hides them by type,
-        // `Party.HideAlert <type>`). Provisional: inferred from that message.
+        // small one per type, naming the latest plot (notifications.gfx hides them by type,
+        // `Party.HideAlert <type>`). A tutorial's entry raises none (the journal update,
+        // 0x75fdd5: `plottypes.gda` IsTutorial); its popup is its notice.
         let kind = if self.is_codex_kind(info.kind) {
+            if self.is_tutorial_kind(info.kind) {
+                return;
+            }
             ALERT_CODEX
         } else if matches!(info.kind, KIND_QUEST | KIND_CHANTERS) && info.parent.is_some() {
             ALERT_QUEST
@@ -272,15 +276,21 @@ impl Sim {
             completed,
             ..Default::default()
         };
-        // A quest's first entry shows large ("New Quest: A Day For Celebration"), one at a
-        // time (`Party.UberAlerts`; the movie asks for the next with `Party.HideUberAlert`),
-        // and not as the small "Quest updated" too: DAOrigins.exe's quest builder (0x628fe0,
-        // from the journal update at 0x75ff59) pushes to the large list only, and the
-        // original shows no small alert beside the banner at the City Elf's first quest.
-        // Provisional: the journal update's tests before the builder are not traced, and a
-        // new codex entry stays a small alert (the exe shows it large when its caller's
-        // flag is set, 0x6f44d4, which is not traced).
-        if first && kind == ALERT_QUEST && !completed {
+        // A plot's first entry shows large ("New Quest: A Day For Celebration", "New Codex
+        // Entry"), one at a time (`Party.UberAlerts`; the movie asks for the next with
+        // `Party.HideUberAlert`), and not as the small alert too, but only for a plot of
+        // priority 0 or 1: DAOrigins.exe's journal update tests the plot's field 13010 for
+        // both (0x75ff0c before the quest builder 0x628fe0, 0x75fde3 for the flag it hands
+        // the codex setter 0x6f42d0, which picks the large builder 0x6290e0 at 0x6f44d4 for
+        // a plot with no entry yet). So the creature entries (priority 2), the thieves'
+        // guild's picks and the random Chantry board jobs stay small. A quest's ending
+        // entry (field 13005) and a Chanter's board plot never show large either (0x75ff29,
+        // 0x75ff05). Provisional: "no entry yet" is our own mark for the plot; the exe's
+        // test for a quest (0x6ebb70 on the plot's name) is not traced.
+        let large = first
+            && matches!(info.priority, 0 | 1)
+            && (kind == ALERT_CODEX || (info.kind == KIND_QUEST && !info.finals.contains(&flag)));
+        if large {
             self.world.uber_alerts.push(alert);
             return;
         }
@@ -681,6 +691,86 @@ mod tests {
         assert!(!s.world.tutorial_paused);
     }
 
+    /// Field 13010 of the plot decides whether a first entry shows large (0 or 1).
+    #[test]
+    fn only_plots_of_priority_0_or_1_show_large() {
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        s.world.tables().insert(
+            "#108",
+            &["#eb84ee4d", "#12e4743c"],
+            vec![
+                (1, vec![Cell::Int(0), Cell::Int(0)]),
+                (3, vec![Cell::Int(1), Cell::Int(0)]),
+                (6, vec![Cell::Int(1), Cell::Int(0)]),
+                (13, vec![Cell::Int(1), Cell::Int(1)]),
+            ],
+        );
+        s.plots.insert(plot("den_group", KIND_GROUP, None, &[]));
+        let mut book = plot("cod_hst_ferelden", 6, None, &[(0, 40), (1, 41)]);
+        book.priority = 1;
+        let mut wolf = plot("cod_crt_wolf", 3, None, &[(0, 42)]);
+        wolf.priority = 2;
+        let mut pick = plot(
+            "den200pt_thief_pick1",
+            KIND_QUEST,
+            Some("plt_den_group"),
+            &[(0, 43)],
+        );
+        pick.priority = 2;
+        let mut ending = plot(
+            "den200pt_mia",
+            KIND_QUEST,
+            Some("plt_den_group"),
+            &[(0, 44)],
+        );
+        ending.finals.insert(0);
+        for p in [
+            book,
+            wolf,
+            pick,
+            ending,
+            plot("tut_explore", 13, None, &[(0, 45)]),
+        ] {
+            s.plots.insert(p);
+        }
+        let _ = s
+            .strings
+            .set((40..=45).map(|t| (t, format!("text {t}"))).collect());
+        let o = OBJECT_INVALID;
+        let shown = |s: &Sim| {
+            let names = |a: &[Alert]| {
+                a.iter()
+                    .map(|a| (a.kind, a.resref.clone()))
+                    .collect::<Vec<_>>()
+            };
+            (names(&s.world.uber_alerts), names(&s.world.alerts))
+        };
+        // A new book: "New Codex Entry", large only. Its next entry is small.
+        s.set_plot_flag("cod_hst_ferelden", 0, true, false, o);
+        let book = (ALERT_CODEX, "plt_cod_hst_ferelden".to_string());
+        assert_eq!(shown(&s), (vec![book.clone()], vec![]));
+        s.set_plot_flag("cod_hst_ferelden", 1, true, false, o);
+        assert_eq!(shown(&s), (vec![book.clone()], vec![book.clone()]));
+        // A creature's entry (priority 2) is small though new, and so is a priority 2
+        // quest; a quest whose first entry ends it is small too.
+        s.set_plot_flag("cod_crt_wolf", 0, true, false, o);
+        let wolf = (ALERT_CODEX, "plt_cod_crt_wolf".to_string());
+        assert_eq!(shown(&s), (vec![book.clone()], vec![wolf.clone()]));
+        s.set_plot_flag("den200pt_thief_pick1", 0, true, false, o);
+        let pick = (ALERT_QUEST, "plt_den200pt_thief_pick1".to_string());
+        assert_eq!(shown(&s), (vec![book.clone()], vec![wolf.clone(), pick]));
+        s.set_plot_flag("den200pt_mia", 0, true, false, o);
+        let mia = (ALERT_QUEST, "plt_den200pt_mia".to_string());
+        assert_eq!(
+            shown(&s),
+            (vec![book.clone()], vec![wolf.clone(), mia.clone()])
+        );
+        // A tutorial's entry raises no alert at all (its popup shows instead).
+        s.set_plot_flag("tut_explore", 0, true, false, o);
+        assert_eq!(shown(&s), (vec![book], vec![wolf, mia]));
+        assert_eq!(s.world.tutorials.len(), 1);
+    }
+
     #[test]
     fn a_new_quest_shows_large_only_and_its_later_entries_small() {
         let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
@@ -732,8 +822,10 @@ mod tests {
         // No parent: bookkeeping, not a quest.
         s.plots
             .insert(plot("lot000pt_ambient", KIND_QUEST, None, &[(0, 700)]));
-        s.plots
-            .insert(plot("cod_crt_ogre", 3, None, &[(0, 800), (1, 801)]));
+        // Creature entries are priority 2 in the shipped plots: never a large alert.
+        let mut ogre = plot("cod_crt_ogre", 3, None, &[(0, 800), (1, 801)]);
+        ogre.priority = 2;
+        s.plots.insert(ogre);
         s.plots.insert(plot("cod_crt_wolf", 3, None, &[(0, 900)]));
         s.world.tables().insert(
             "#108",

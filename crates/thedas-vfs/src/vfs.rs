@@ -488,6 +488,25 @@ impl Vfs {
         Err(first_err.unwrap_or_else(|| Error::NotFound(name.to_string())))
     }
 
+    /// The talk tables of one language (`en-us`), in the order to merge them: the tables
+    /// named `*<language>.tlk`, sorted by name, then the patch tables `*<language>_p.tlk`,
+    /// sorted by name. Dragon Age II ships its corrections to shipped strings as `_p` tables
+    /// in each package's `patch` folder; Dragon Age: Origins has none. Provisional: that a
+    /// patch table overrides every base table, whichever package it is in, is not traced.
+    pub fn talk_tables(&self, language: &str) -> Vec<String> {
+        let language = language.to_ascii_lowercase();
+        let base = format!("{language}.tlk");
+        let patch = format!("{language}_p.tlk");
+        let names = self.names();
+        let mut out: Vec<String> = names
+            .iter()
+            .filter(|n| n.ends_with(&base))
+            .cloned()
+            .collect();
+        out.extend(names.iter().filter(|n| n.ends_with(&patch)).cloned());
+        out
+    }
+
     /// All visible names whose names are known, sorted. Entries a Dragon Age II archive
     /// stores only by hash can be looked up by name but are not listed here.
     pub fn names(&self) -> Vec<String> {
@@ -717,6 +736,35 @@ mod tests {
             out.extend_from_slice(data);
         }
         out
+    }
+
+    #[test]
+    fn patch_talk_tables_come_after_the_base_tables() {
+        let base = std::env::temp_dir().join(format!("thedas-vfs-tlk-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        for name in [
+            "core_en-us.tlk",
+            "core_EN-US_p.tlk",
+            "campaign_base_en-us.tlk",
+            "aaa_en-us_p.tlk",
+            "core_fr-fr.tlk",
+            "notes.txt",
+        ] {
+            std::fs::write(base.join(name), b"x").unwrap();
+        }
+        let mut vfs = Vfs::new();
+        vfs.push_directory(&base, false, "tables").unwrap();
+        assert_eq!(
+            vfs.talk_tables("en-us"),
+            [
+                "campaign_base_en-us.tlk",
+                "core_en-us.tlk",
+                "aaa_en-us_p.tlk",
+                "core_en-us_p.tlk"
+            ]
+        );
+        assert_eq!(vfs.talk_tables("fr-fr"), ["core_fr-fr.tlk"]);
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
