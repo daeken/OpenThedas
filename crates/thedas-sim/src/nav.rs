@@ -769,6 +769,80 @@ mod tests {
     }
 
     #[test]
+    fn a_walker_gets_round_a_creature_standing_on_its_route() {
+        // The City Elf's alienage, the leader told to talk to Valora: the route through the
+        // pathing grid, a point every half metre, passes through a villager standing still,
+        // and some of its points lie inside her body. Making for the first of them, the
+        // leader pressed on her for good (at (70.5, 64.8), against bec100cr_ambient_f_1).
+        use crate::world::{Command, Location, ObjectKind};
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let (w, h) = (24u32, 24u32);
+        s.area_layouts.insert(area, "open".into());
+        s.nav_grids.insert(
+            "open".into(),
+            Some(Arc::new(NavGrid {
+                columns: w,
+                rows: h,
+                cell_size: 0.5,
+                clearance: 2.0,
+                base: [0.0, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                data: vec![1u8; (w * h) as usize],
+                heights: vec![0.0; (w * h) as usize],
+                surfaces: Vec::new(),
+            })),
+        );
+        let leader = s.world.spawn(ObjectKind::Creature, "leader");
+        let villager = s.world.spawn(ObjectKind::Creature, "villager");
+        let stands = [2.28, 6.15, 0.0];
+        for (id, p) in [(leader, [2.25, 10.25, 0.0]), (villager, stands)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = p;
+        }
+        let to = [2.25, 2.25, 0.0];
+        s.world.get_mut(leader).unwrap().commands.push(Command {
+            ty: 0,
+            name: "CommandMoveToLocation".into(),
+            target: None,
+            location: Some(Location {
+                area,
+                position: to,
+                facing: 0.0,
+            }),
+            seconds: 0.0,
+            ints: Vec::new(),
+            strings: Vec::new(),
+            due: None,
+            from: None,
+            approach: None,
+            ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
+            arrived: false,
+            path: Vec::new(),
+        });
+        let r = 2.0 * s.capsule_radius(leader);
+        for _ in 0..400 {
+            s.tick(33);
+            let p = s.world.get(leader).unwrap().position;
+            let d = crate::engine::dist(p, stands);
+            assert!(d >= r - 0.02, "{d} < {r} at {p:?}");
+        }
+        let o = s.world.get(leader).unwrap();
+        assert!(
+            crate::engine::dist(o.position, to) < 0.05,
+            "{:?}",
+            o.position
+        );
+        assert!(o.commands.is_empty());
+        assert_eq!(s.world.get(villager).unwrap().position, stands);
+    }
+
+    #[test]
     fn creatures_move_along_routes_round_walls() {
         use crate::world::{Command, Location, ObjectKind};
         use thedas_script::EngineTable;
