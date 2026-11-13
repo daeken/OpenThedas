@@ -877,6 +877,9 @@ impl Sim {
         self.world
             .location_vfx
             .retain(|v| v.duration_ms.is_none_or(|d| v.started_ms + d > end));
+        self.world
+            .instant_vfx
+            .retain(|v| v.started_ms + crate::world::INSTANT_VFX_MS > end);
         self.leave_conversation_mode();
         self.update_perception();
         self.keep_party_together();
