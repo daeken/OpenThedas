@@ -1,7 +1,7 @@
 //! Merged 2DA tables (M2DA), as `GetM2DAInt` and friends read them.
 //!
-//! `m2da_base.gda` lists each table id with a label and a worksheet prefix (`1, Abilities,
-//! ABI_`). A table is the union of every GDA resource whose name starts with the prefix
+//! `m2da_base.gda`, and any other GDA whose name starts with `m2da_`, lists each table id with
+//! a label and a worksheet prefix (`1, Abilities, ABI_`). A table is the union of every GDA resource whose name starts with the prefix
 //! (`abi_base.gda`, `abi_dlc.gda`, ...), indexed by the first column (`ID`). Provisional: when
 //! two worksheets define the same row id, the one that sorts later by name wins; scripts can
 //! also name a worksheet directly (the optional `s2DA` argument), which reads just that file.
@@ -88,6 +88,30 @@ impl Table {
     }
 }
 
+/// The prefix of the GDAs that list the merged tables (`m2da_base.gda` and any other).
+const TABLE_LIST_PREFIX: &str = "m2da_";
+
+/// The names in `gdas` (lowercase resource names) that start with `prefix`, in `gdas`' order.
+fn prefix_set<'a>(gdas: &'a [String], prefix: &str) -> Vec<&'a str> {
+    let prefix = prefix.to_ascii_lowercase();
+    gdas.iter()
+        .map(String::as_str)
+        .filter(|n| n.starts_with(&prefix))
+        .collect()
+}
+
+/// Adds one table-list worksheet's rows (table id, label, worksheet prefix) to `prefixes`.
+/// Provisional: a later worksheet's row replaces an earlier one's for the same id.
+fn add_prefixes(prefixes: &mut HashMap<i32, String>, list: &Gda) {
+    let ws = list.column("Worksheet").unwrap_or(2);
+    for row in &list.rows {
+        if let (Some(Cell::Int(id)), Some(Cell::String(p))) = (row.first(), row.get(ws)) {
+            let p = p.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+            prefixes.insert(*id as i32, p.to_ascii_lowercase());
+        }
+    }
+}
+
 /// Every M2DA table, built lazily from the resource stack.
 pub struct Tables {
     /// Table id -> worksheet prefix (lowercase).
@@ -109,34 +133,46 @@ impl Tables {
     }
 
     pub fn new(vfs: std::sync::Arc<Vfs>) -> Self {
-        let mut prefixes = HashMap::new();
-        if let Ok((data, _)) = vfs.read("m2da_base.gda") {
-            if let Ok(g) = Gda::parse(&data) {
-                let ws = g.column("Worksheet").unwrap_or(2);
-                for row in &g.rows {
-                    if let (Some(Cell::Int(id)), Some(Cell::String(p))) = (row.first(), row.get(ws))
-                    {
-                        prefixes.insert(
-                            *id as i32,
-                            p.trim_matches(|c: char| c == '\0' || c.is_whitespace())
-                                .to_ascii_lowercase(),
-                        );
-                    }
-                }
-            }
-        }
         let mut gdas: Vec<String> = vfs
             .names()
             .into_iter()
             .filter(|n| n.ends_with(".gda"))
             .collect();
         gdas.sort();
+        // The list of tables is itself a prefix set: the original opens every GDA whose name
+        // starts with `M2DA_` (0x4e0cf8), so an add-in or mod adds tables with its own
+        // `m2da_*.gda` beside `m2da_base.gda`.
+        let mut prefixes = HashMap::new();
+        for name in prefix_set(&gdas, TABLE_LIST_PREFIX) {
+            if let Ok((data, _)) = vfs.read(name) {
+                if let Ok(g) = Gda::parse(&data) {
+                    add_prefixes(&mut prefixes, &g);
+                }
+            }
+        }
         Tables {
             prefixes,
             gdas,
             loaded: Mutex::new(HashMap::new()),
             vfs: Some(vfs),
         }
+    }
+
+    /// The names of every GDA in the stack whose name starts with `prefix` (any case), sorted:
+    /// a prefix set, as the original opens them (`0x4ec7a0`; `M2DA_` for the table list,
+    /// `PRCSCR_` for the add-ins' start-up scripts).
+    pub fn prefix_set(&self, prefix: &str) -> Vec<&str> {
+        prefix_set(&self.gdas, prefix)
+    }
+
+    /// Each worksheet of a prefix set as its own table, in [`Tables::prefix_set`] order, for
+    /// sets whose files are read one by one rather than merged by row id. A worksheet that
+    /// cannot be read or parsed is left out.
+    pub fn prefix_worksheets(&self, prefix: &str) -> Vec<(String, std::sync::Arc<Table>)> {
+        self.prefix_set(prefix)
+            .into_iter()
+            .filter_map(|name| Some((name.to_string(), self.get(0, name)?)))
+            .collect()
     }
 
     /// Puts a ready-made table under a worksheet name (as `get(_, name)` finds it, and
@@ -174,7 +210,7 @@ impl Tables {
         let mut table = Table::default();
         if worksheet.is_empty() {
             let prefix = self.prefixes.get(&id)?;
-            for name in self.gdas.iter().filter(|n| n.starts_with(prefix.as_str())) {
+            for name in prefix_set(&self.gdas, prefix) {
                 if let Ok((data, _)) = vfs.read(name) {
                     if let Ok(g) = Gda::parse(&data) {
                         table.merge(&g);
@@ -193,5 +229,67 @@ impl Tables {
         let t = std::sync::Arc::new(table);
         self.loaded.lock().ok()?.insert(key, t.clone());
         Some(t)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thedas_formats::gda::{Column, column_hash};
+
+    fn list(rows: &[(i64, &str)]) -> Gda {
+        Gda {
+            version: thedas_formats::FourCC(*b"V0.2"),
+            columns: ["ID", "Label", "Worksheet"]
+                .iter()
+                .map(|n| Column {
+                    hash: column_hash(n),
+                    kind: None,
+                })
+                .collect(),
+            rows: rows
+                .iter()
+                .map(|(id, p)| {
+                    vec![
+                        Cell::Int(*id),
+                        Cell::String("label".into()),
+                        Cell::String(p.to_string()),
+                    ]
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn every_table_list_worksheet_adds_tables() {
+        let gdas: Vec<String> = [
+            "abi_base.gda",
+            "m2da_base.gda",
+            "m2da_base_mymod.gda",
+            "m2dax.gda",
+            "prcscr_one.gda",
+            "prcscr_two.gda",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            prefix_set(&gdas, "M2DA_"),
+            ["m2da_base.gda", "m2da_base_mymod.gda"]
+        );
+        assert_eq!(
+            prefix_set(&gdas, "PRCSCR_"),
+            ["prcscr_one.gda", "prcscr_two.gda"]
+        );
+        assert!(prefix_set(&gdas, "none_").is_empty());
+
+        let mut prefixes = HashMap::new();
+        add_prefixes(&mut prefixes, &list(&[(1, "ABI_\0"), (2, " ITM_ ")]));
+        add_prefixes(&mut prefixes, &list(&[(2, "ITX_"), (9000, "MYMOD_")]));
+        assert_eq!(prefixes[&1], "abi_");
+        // A later worksheet's row replaces an earlier one's, and new ids are added.
+        assert_eq!(prefixes[&2], "itx_");
+        assert_eq!(prefixes[&9000], "mymod_");
+        assert_eq!(prefixes.len(), 3);
     }
 }
