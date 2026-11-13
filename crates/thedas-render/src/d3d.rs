@@ -352,7 +352,7 @@ pub fn object_filter() -> ShaderFilter {
 /// The vertex shaders of `VFX.mat`'s sprite semantics (particles and effect cards, read as
 /// `POSITION`, `COLOR0`, `TEXCOORD0`), part of [`object_filter`]. The `Chunky` and `VolTex`
 /// ones are not drawn yet.
-pub const VFX_VERTEX_SHADERS: [&str; 8] = [
+pub const VFX_VERTEX_SHADERS: [&str; 10] = [
     "VFX0.vsh",
     "VFX0_Addv.vsh",
     "VFX0_ContactSheet.vsh",
@@ -361,6 +361,10 @@ pub const VFX_VERTEX_SHADERS: [&str; 8] = [
     "VFX0_CS_Alt.vsh",
     "VFX0_DBA.vsh",
     "VFX0_CS_DBA.vsh",
+    // `DADistortionMask.mat`'s particle semantics, drawn into the distortion mask (see
+    // [`crate::distortion`]).
+    "DistortionVFX.vsh",
+    "DistortionVFX_CS.vsh",
 ];
 
 /// See [`object_filter`].

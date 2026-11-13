@@ -7,10 +7,15 @@
 //! Layers can be mounted for a while and removed again: take a [`Vfs::mark`], push the
 //! layers (for example a level's own archives while its area is loaded), and later
 //! [`Vfs::truncate`] back to the mark.
+//!
+//! A stack can also carry an *overlay*: a second stack whose layers beat every layer of the
+//! base one, whatever is mounted on the base later. Player mods live there (see
+//! [`crate::mods`]), so a level's archives mounted while its area is loaded never hide a mod's
+//! file, as the original's override folders outrank its `env` folders.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::crypto::DaoKey;
 use crate::erf::Erf;
@@ -28,7 +33,33 @@ pub enum LayerSource {
     },
     /// An explicit list of loose files, such as a level's `.arl` beside its archives.
     Files,
+    /// The files of a zip archive (a mod as downloaded, or a `.dazip`), read in place.
+    Zip(ZipSource),
 }
+
+/// An open zip archive serving a layer. Entries are inflated into memory on each read; nothing
+/// is ever written to disk.
+pub struct ZipSource {
+    path: PathBuf,
+    archive: Mutex<zip::ZipArchive<std::fs::File>>,
+}
+
+impl ZipSource {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl std::fmt::Debug for ZipSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZipSource")
+            .field("path", &self.path)
+            .finish()
+    }
+}
+
+/// The largest zip entry a layer will inflate, so a hostile archive cannot exhaust memory.
+const MAX_ZIP_ENTRY: u64 = 1 << 30;
 
 #[derive(Debug)]
 pub struct Layer {
@@ -68,6 +99,8 @@ pub struct Vfs {
     index: HashMap<u64, Vec<(usize, Slot)>>,
     /// Name hash -> normalized name, for every hit whose name is known.
     names: HashMap<u64, String>,
+    /// Layers that beat every layer of this stack; see the module documentation.
+    overlay: Option<Box<Vfs>>,
 }
 
 impl Vfs {
@@ -79,13 +112,36 @@ impl Vfs {
         &self.layers
     }
 
+    /// The overlay stack, if one is set.
+    pub fn overlay(&self) -> Option<&Vfs> {
+        self.overlay.as_deref()
+    }
+
+    /// Sets the overlay: a stack whose layers beat every layer here, now and after later
+    /// pushes. An empty overlay is dropped. An overlay's own overlay is ignored.
+    pub fn set_overlay(&mut self, mut overlay: Vfs) {
+        overlay.overlay = None;
+        self.overlay = (!overlay.layers.is_empty()).then(|| Box::new(overlay));
+    }
+
+    /// Removes and returns the overlay.
+    pub fn take_overlay(&mut self) -> Option<Vfs> {
+        self.overlay.take().map(|b| *b)
+    }
+
     /// Number of distinct resource names visible through the stack.
     pub fn len(&self) -> usize {
-        self.index.len()
+        let extra = self.overlay.as_ref().map_or(0, |o| {
+            o.index
+                .keys()
+                .filter(|k| !self.index.contains_key(*k))
+                .count()
+        });
+        self.index.len() + extra
     }
 
     pub fn is_empty(&self) -> bool {
-        self.index.is_empty()
+        self.index.is_empty() && self.overlay.as_ref().is_none_or(|o| o.index.is_empty())
     }
 
     pub fn push_archive(&mut self, path: impl AsRef<Path>, label: impl Into<String>) -> Result<()> {
@@ -179,6 +235,89 @@ impl Vfs {
         self.dir_files.push(named);
     }
 
+    /// Adds the files of a zip archive as one layer, without unpacking it. With `inner`, only
+    /// the files under that folder of the archive (matched ignoring case, `/` or `\\`
+    /// separators) are added. Folders in the archive are flattened as a recursive directory
+    /// layer is: a resource is named by its file name alone, and of two files with one name the
+    /// later path (in byte order) wins. ERF and RIM archives inside the zip are not opened;
+    /// their names are returned so the caller can tell the player.
+    pub fn push_zip(
+        &mut self,
+        path: impl AsRef<Path>,
+        inner: Option<&str>,
+        label: impl Into<String>,
+    ) -> Result<Vec<String>> {
+        let path = path.as_ref().to_path_buf();
+        let io = |e: std::io::Error| Error::Io {
+            path: path.clone(),
+            source: e,
+        };
+        let bad = |reason: String| Error::Malformed {
+            path: path.clone(),
+            reason,
+        };
+        let file = std::fs::File::open(&path).map_err(io)?;
+        let archive = zip::ZipArchive::new(file).map_err(|e| bad(format!("not a zip: {e}")))?;
+        let prefix: Vec<String> = inner
+            .unwrap_or("")
+            .split(['/', '\\'])
+            .filter(|c| !c.is_empty())
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        let mut inner_names: Vec<String> = archive
+            .file_names()
+            .filter(|n| !n.ends_with(['/', '\\']))
+            .filter(|n| {
+                let comps: Vec<&str> = n.split(['/', '\\']).filter(|c| !c.is_empty()).collect();
+                comps.len() > prefix.len()
+                    && comps
+                        .iter()
+                        .zip(&prefix)
+                        .all(|(c, p)| c.eq_ignore_ascii_case(p))
+            })
+            .map(str::to_string)
+            .collect();
+        inner_names.sort();
+        let mut skipped = Vec::new();
+        let layer = self.layers.len();
+        let mut named = Vec::with_capacity(inner_names.len());
+        for inner_name in inner_names {
+            let Some(name) = inner_name
+                .rsplit(['/', '\\'])
+                .next()
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if is_archive(Path::new(&name)) {
+                skipped.push(inner_name);
+                continue;
+            }
+            let i = named.len();
+            let hits = {
+                let key = self.key(&name);
+                self.index.entry(key).or_default()
+            };
+            if let Some(last) = hits.last() {
+                if last.0 == layer {
+                    hits.pop();
+                }
+            }
+            hits.push((layer, Slot::File(i)));
+            named.push((name, PathBuf::from(inner_name)));
+        }
+        self.layers.push(Layer {
+            label: label.into(),
+            source: LayerSource::Zip(ZipSource {
+                path,
+                archive: Mutex::new(archive),
+            }),
+        });
+        self.dir_files.push(named);
+        Ok(skipped)
+    }
+
     /// The index key for a name, remembering the name so [`Vfs::names`] can list it.
     fn key(&mut self, name: &str) -> u64 {
         let hash = name_hash(name);
@@ -224,12 +363,27 @@ impl Vfs {
                 file: self.dir_files[layer][i].1.clone(),
                 entry: None,
             },
+            (LayerSource::Zip(zip), Slot::File(i)) => Provenance {
+                layer,
+                layer_label: l.label.clone(),
+                file: zip.path.clone(),
+                entry: Some(self.dir_files[layer][i].1.to_string_lossy().into_owned()),
+            },
             _ => unreachable!("slot kind always matches layer kind"),
         }
     }
 
+    /// An overlay hit's provenance, with its layer counted above this stack's layers.
+    fn lifted(&self, mut p: Provenance) -> Provenance {
+        p.layer += self.layers.len();
+        p
+    }
+
     /// The winning source for a name, if any layer provides it.
     pub fn lookup(&self, name: &str) -> Option<Provenance> {
+        if let Some(p) = self.overlay.as_ref().and_then(|o| o.lookup(name)) {
+            return Some(self.lifted(p));
+        }
         let hits = self.index.get(&name_hash(name))?;
         let &(layer, slot) = hits.last()?;
         Some(self.provenance(layer, slot))
@@ -237,15 +391,15 @@ impl Vfs {
 
     /// Every source for a name, highest priority first.
     pub fn hits(&self, name: &str) -> Vec<Provenance> {
-        self.index
-            .get(&name_hash(name))
-            .map(|h| {
-                h.iter()
-                    .rev()
-                    .map(|&(l, s)| self.provenance(l, s))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let mut out: Vec<Provenance> = self
+            .overlay
+            .as_ref()
+            .map(|o| o.hits(name).into_iter().map(|p| self.lifted(p)).collect())
+            .unwrap_or_default();
+        if let Some(h) = self.index.get(&name_hash(name)) {
+            out.extend(h.iter().rev().map(|&(l, s)| self.provenance(l, s)));
+        }
+        out
     }
 
     fn read_slot(&self, layer: usize, slot: Slot) -> Result<Vec<u8>> {
@@ -260,6 +414,10 @@ impl Vfs {
                     source: e,
                 })
             }
+            (LayerSource::Zip(zip), Slot::File(i)) => {
+                let inner = self.dir_files[layer][i].1.to_string_lossy();
+                read_zip_entry(zip, &inner)
+            }
             _ => unreachable!("slot kind always matches layer kind"),
         }
     }
@@ -271,11 +429,18 @@ impl Vfs {
     /// names the layer that actually supplied the data. With every DLC key available this
     /// is the original's lookup; without keys it is the closest readable approximation.
     pub fn read(&self, name: &str) -> Result<(Vec<u8>, Provenance)> {
-        let hits = self
-            .index
-            .get(&name_hash(name))
-            .ok_or_else(|| Error::NotFound(name.to_string()))?;
         let mut first_err = None;
+        if let Some(o) = &self.overlay {
+            match o.read(name) {
+                Ok((data, p)) => return Ok((data, self.lifted(p))),
+                Err(Error::NotFound(_)) => {}
+                Err(e @ Error::Encrypted { .. }) => first_err = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        let Some(hits) = self.index.get(&name_hash(name)) else {
+            return Err(first_err.unwrap_or_else(|| Error::NotFound(name.to_string())));
+        };
         for &(layer, slot) in hits.iter().rev() {
             match self.read_slot(layer, slot) {
                 Ok(data) => return Ok((data, self.provenance(layer, slot))),
@@ -292,9 +457,43 @@ impl Vfs {
     /// stores only by hash can be looked up by name but are not listed here.
     pub fn names(&self) -> Vec<String> {
         let mut v: Vec<String> = self.names.values().cloned().collect();
+        if let Some(o) = &self.overlay {
+            v.extend(
+                o.names
+                    .iter()
+                    .filter(|(k, _)| !self.names.contains_key(*k))
+                    .map(|(_, n)| n.clone()),
+            );
+        }
         v.sort();
         v
     }
+}
+
+fn read_zip_entry(zip: &ZipSource, inner: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let fail = |reason: String| Error::Decompress {
+        path: zip.path.clone(),
+        name: inner.to_string(),
+        reason,
+    };
+    let mut archive = zip
+        .archive
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = archive.by_name(inner).map_err(|e| fail(e.to_string()))?;
+    if entry.size() > MAX_ZIP_ENTRY {
+        return Err(fail(format!("entry is {} bytes", entry.size())));
+    }
+    let mut out = Vec::with_capacity(entry.size() as usize);
+    entry
+        .take(MAX_ZIP_ENTRY + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| fail(e.to_string()))?;
+    if out.len() as u64 > MAX_ZIP_ENTRY {
+        return Err(fail("entry inflates past the size limit".into()));
+    }
+    Ok(out)
 }
 
 /// Whether a path has an archive extension: `.erf` or `.rim`, or Dragon Age II's `.crf`

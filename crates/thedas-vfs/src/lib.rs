@@ -9,6 +9,8 @@
 //!   conflicts and shadowed files.
 //! - [`install`]: discovers a DA:O install, builds the default layer stack for it, and mounts
 //!   a level's own archives on top while its area is loaded.
+//! - [`mods`]: player mods mounted as ordered layers above the whole stack, never unpacked over
+//!   the install.
 //! - [`path`]: case-insensitive file-system paths, for names the original (a Windows game)
 //!   treats case-insensitively but a case-sensitive volume would not.
 
@@ -16,6 +18,7 @@ pub mod crypto;
 pub mod erf;
 mod gog_dlc;
 pub mod install;
+pub mod mods;
 pub mod path;
 pub mod vfs;
 

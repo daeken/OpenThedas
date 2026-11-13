@@ -636,6 +636,10 @@ pub struct World {
     /// shows; taken by that transition into [`World::transition_hint`].
     #[serde(default)]
     pub load_hint: Option<(i32, i32)>,
+    /// `SetDeathHint`: the hint (row, M2DA table) the death screen shows the next time it
+    /// is up ("Death Hints" 205 by default, 272 for the random ones).
+    #[serde(default)]
+    pub death_hint: Option<(i32, i32)>,
     /// The hint for the transition under way or last made (what the loading screen reads);
     /// `None` when no script set one for it.
     #[serde(default)]
@@ -833,6 +837,7 @@ impl World {
             destroy_at: Vec::new(),
             corpse_decay_max_ms: crate::decay::DEFAULT_MAX_MS,
             load_hint: None,
+            death_hint: None,
             transition_hint: None,
             held: Vec::new(),
             dialog_shown: Default::default(),

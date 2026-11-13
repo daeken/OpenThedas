@@ -332,7 +332,7 @@ fn load(
     detail: thedas_render::scene::Detail,
 ) -> Result<Loaded> {
     let install = DaoInstall::open(install)?;
-    let mut vfs = install.global_vfs(TextureQuality::High)?;
+    let mut vfs = install.play_vfs(TextureQuality::High)?;
     if area == "none" {
         return Ok(Loaded {
             vfs: Arc::new(vfs),
@@ -1757,7 +1757,16 @@ impl App {
             Returning::Fetching(rx, save, report) => match rx.try_recv() {
                 Ok(Ok(exe)) => {
                     let size = self.started_with["size"].as_str().unwrap_or("1280x720");
-                    match update::start_build(&exe, &self.install, save, report, size) {
+                    // The next build is as quiet and as driven as this one: no sound where
+                    // this had none, and the same control address (free once this closes).
+                    let mut more = Vec::new();
+                    if self.audio.is_none() {
+                        more.push("--no-audio".to_string());
+                    }
+                    if let Some(c) = &self.control {
+                        more.extend(["--control".to_string(), c.addr.to_string()]);
+                    }
+                    match update::start_build(&exe, &self.install, save, report, size, &more) {
                         Ok(()) => {
                             log::info!("update: started {}; closing this one", exe.display());
                             self.quit = true;
@@ -2677,6 +2686,11 @@ impl App {
             "lines": c.lines.len(),
         })));
         out["screens"] = json!(self.screens.as_ref().map(|s| format!("{:?}", s.shown())));
+        // The movies' input contexts, innermost last, and whether a dialog box has the input.
+        if let Some(g) = self.gfx.as_ref() {
+            out["contexts"] = json!(g.ui.stage.bridge.contexts());
+            out["popup"] = json!(g.ui.stage.dialog_up());
+        }
         out
     }
 

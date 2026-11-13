@@ -3789,7 +3789,15 @@ pub fn call(
                 handle: Some(hd),
             })
         }
-        "SetDeathHint" => void(),
+        // The death screen's hint: a row of `n2DAReference` (205 "Death Hints" by default,
+        // 272 for the random hints), shown the next time the death screen is up (script.ldf).
+        // Provisional: script.ldf says it is cleared when the death screen is hidden; here it
+        // stays until another is set (a load replaces the world's).
+        "SetDeathHint" => {
+            let table = if a.len() > 1 { int(a, 1) } else { 205 };
+            h.sim.world.death_hint = Some((int(a, 0), table));
+            void()
+        }
         "IsItemDroppable" => ok(b(h
             .object(obj(a, 0))
             .is_some_and(|o| o.fields.get("Droppable").copied().unwrap_or(0) != 0))),
@@ -6086,7 +6094,8 @@ mod coverage_tests {
         void SetGameMode(int n) = 114;\n\
         void SetZoomLevel(float f) = 115;\n\
         void SetLoadHint(int n, int t = 206) = 116;\n\
-        void ApplyEffectVisualEffect(object c, object t, int v, int d, float f, int a = 0) = 117;\n";
+        void ApplyEffectVisualEffect(object c, object t, int v, int d, float f, int a = 0) = 117;\n\
+        void SetDeathHint(int n, int t = 205) = 118;\n";
 
     #[test]
     fn visual_effects_on_objects_are_applied_as_effects() {
@@ -6161,6 +6170,16 @@ mod coverage_tests {
         s.area_transition("nowhere", "");
         assert_eq!(s.world.load_hint, None);
         assert_eq!(s.world.transition_hint, Some((3, 271)));
+        // The death screen's hint is kept the same way, from its own tables.
+        run(&mut s, hero, "SetDeathHint", &[Value::Int(4)]);
+        assert_eq!(s.world.death_hint, Some((4, 205)));
+        run(
+            &mut s,
+            hero,
+            "SetDeathHint",
+            &[Value::Int(2), Value::Int(272)],
+        );
+        assert_eq!(s.world.death_hint, Some((2, 272)));
     }
 
     fn sim() -> Sim {

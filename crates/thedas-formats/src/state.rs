@@ -115,6 +115,9 @@ pub struct PassState {
     pub z_func: CompareFunc,
     pub cull: Cull,
     pub blend: Option<(BlendFactor, BlendFactor, BlendOp)>,
+    /// The alpha channel's own blend, when the state separates it
+    /// (`DS_SEPARATEALPHABLENDENABLE`); else alpha blends as colour does.
+    pub blend_alpha: Option<(BlendFactor, BlendFactor, BlendOp)>,
     /// Alpha test: function and reference in 0..=255.
     pub alpha_test: Option<(CompareFunc, u8)>,
     /// Which colour channels are written (bit 0 = red ... bit 3 = alpha).
@@ -313,22 +316,35 @@ impl MaterialState {
             let f = |s: &str, d| -> Result<BlendFactor, MaterialError> {
                 Ok(get(s).and_then(blend_factor).unwrap_or(d))
             };
-            let op = match get("DS_BLENDOP") {
-                None | Some("BLENDOP_ADD") => BlendOp::Add,
-                Some("BLENDOP_SUBTRACT") => BlendOp::Subtract,
-                Some("BLENDOP_REVSUBTRACT") => BlendOp::RevSubtract,
-                Some("BLENDOP_MIN") => BlendOp::Min,
-                Some("BLENDOP_MAX") => BlendOp::Max,
-                Some(v) => return Err(bad("DS_BLENDOP", v)),
+            let op = |s: &'static str| -> Result<BlendOp, MaterialError> {
+                Ok(match get(s) {
+                    None | Some("BLENDOP_ADD") => BlendOp::Add,
+                    Some("BLENDOP_SUBTRACT") => BlendOp::Subtract,
+                    Some("BLENDOP_REVSUBTRACT") => BlendOp::RevSubtract,
+                    Some("BLENDOP_MIN") => BlendOp::Min,
+                    Some("BLENDOP_MAX") => BlendOp::Max,
+                    Some(v) => return Err(bad(s, v)),
+                })
             };
-            Some((
+            let colour = (
                 f("DS_SRCBLEND", BlendFactor::One)?,
                 f("DS_DESTBLEND", BlendFactor::Zero)?,
-                op,
-            ))
+                op("DS_BLENDOP")?,
+            );
+            let alpha = if get("DS_SEPARATEALPHABLENDENABLE").is_some_and(truthy) {
+                Some((
+                    f("DS_SRCBLENDALPHA", BlendFactor::One)?,
+                    f("DS_DESTBLENDALPHA", BlendFactor::Zero)?,
+                    op("DS_BLENDOPALPHA")?,
+                ))
+            } else {
+                None
+            };
+            (Some(colour), alpha)
         } else {
-            None
+            (None, None)
         };
+        let (blend, blend_alpha) = blend;
         let alpha_test = if get("DS_ALPHATESTENABLE").is_some_and(truthy) {
             let func = parse_cmp("DS_ALPHAFUNC", CompareFunc::Always)?;
             let r = match get("DS_ALPHAREF") {
@@ -367,6 +383,7 @@ impl MaterialState {
             z_func,
             cull,
             blend,
+            blend_alpha,
             alpha_test,
             color_write,
             srgb_write: get("DS_SRGBWRITEENABLE").is_some_and(truthy),
@@ -465,6 +482,45 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn alpha_blends_on_its_own_when_the_state_separates_it() {
+        let xml = r#"<MaterialState Name="Mask">
+  <DeviceState State="DS_ALPHABLENDENABLE" Value="TRUE" />
+  <DeviceState State="DS_SRCBLEND" Value="BLEND_DESTALPHA" />
+  <DeviceState State="DS_DESTBLEND" Value="BLEND_INVDESTALPHA" />
+  <DeviceState State="DS_SEPARATEALPHABLENDENABLE" Value="TRUE" />
+  <DeviceState State="DS_SRCBLENDALPHA" Value="BLEND_DESTALPHA" />
+  <DeviceState State="DS_DESTBLENDALPHA" Value="BLEND_ZERO" />
+  <DeviceState State="DS_BLENDOPALPHA" Value="BLENDOP_ADD" />
+</MaterialState>"#;
+        let p = MaterialState::parse(xml.as_bytes())
+            .unwrap()
+            .pass()
+            .unwrap();
+        assert_eq!(
+            p.blend,
+            Some((
+                BlendFactor::DestAlpha,
+                BlendFactor::InvDestAlpha,
+                BlendOp::Add
+            ))
+        );
+        assert_eq!(
+            p.blend_alpha,
+            Some((BlendFactor::DestAlpha, BlendFactor::Zero, BlendOp::Add))
+        );
+        // Not separated: alpha goes as colour does.
+        let joined = xml.replace(
+            r#"<DeviceState State="DS_SEPARATEALPHABLENDENABLE" Value="TRUE" />"#,
+            "",
+        );
+        let p = MaterialState::parse(joined.as_bytes())
+            .unwrap()
+            .pass()
+            .unwrap();
+        assert_eq!(p.blend_alpha, None);
     }
 
     #[test]
