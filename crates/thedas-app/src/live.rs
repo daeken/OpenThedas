@@ -257,6 +257,45 @@ fn talk_line(sim: &Sim) -> Option<TalkLine> {
         .map(|o| (o.dialog.to_string(), o.owner, o.line))
 }
 
+/// The depth of field an open conversation runs
+/// ([`thedas_render::cut_effects::conversation_depth_of_field`]), from the game's tables 203
+/// and 204 (`conversation_dof_values`, `conversation_dof_parameters`). Provisional: taken
+/// to run whenever a conversation line is up, the conversation game mode's own start and
+/// end not being modelled.
+fn conversation_depth_of_field(sim: &Sim) -> Option<thedas_render::cut_effects::DepthOfField> {
+    use thedas_formats::gda::Cell;
+    sim.conversation_line()?;
+    let tables = sim.world.tables();
+    let values = tables.get(203, "");
+    let parameters = tables.get(204, "");
+    let number = |c: Option<&Cell>| match c {
+        Some(Cell::Float(v)) => Some(*v as f32),
+        Some(Cell::Int(v)) => Some(*v as f32),
+        _ => None,
+    };
+    // The first row whose focus distance is below zero holds the values.
+    let row = values.as_ref().and_then(|t| {
+        t.order
+            .iter()
+            .copied()
+            .find(|&r| number(t.cell("FocusDistance", r)).is_some_and(|v| v < 0.0))
+    });
+    let listed = |name: &str| {
+        parameters.as_ref().is_some_and(|t| {
+            t.order.iter().any(|&r| {
+                matches!(t.cell("Parameter", r), Some(Cell::String(s))
+                    if s.trim_end_matches('\0').trim() == name)
+            })
+        })
+    };
+    Some(thedas_render::cut_effects::conversation_depth_of_field(
+        |name| {
+            let (t, row) = (values.as_ref()?, row?);
+            listed(name).then(|| number(t.cell(name, row)))?
+        },
+    ))
+}
+
 /// A level, or a level's objects, being built on a worker thread. While one is under way
 /// the world does not run ([`Live::step`]) and the window shows a loading frame instead of
 /// the world; the simulation's own load is unchanged (it happened in its tick).
@@ -1755,11 +1794,14 @@ impl Live {
 
     /// The frame buffer effects the playing cutscene, or the shown conversation line's own
     /// cutscene, has running (their kind-19 tracks; see [`thedas_render::cut_effects`]):
-    /// depth of field and colour fades. Its other effects (`da_motionblur`, and the bloom
-    /// and colour matrix values a cutscene sets) are not drawn.
+    /// depth of field and colour fades, after the depth of field a conversation itself
+    /// runs while it is open ([`conversation_depth_of_field`]). Its other effects
+    /// (`da_motionblur`, and the bloom and colour matrix values a cutscene sets) are not
+    /// drawn.
     fn cut_effects(&mut self) -> thedas_render::cut_effects::CutEffects {
         use thedas_render::cut_effects::{ColourFade, CutEffects, DepthOfField};
         let sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
+        let talk = conversation_depth_of_field(&sim);
         let states = match sim.world.cutscene.as_ref() {
             Some(c) => {
                 let t = c.elapsed_ms as f32 / 1000.0;
@@ -1771,11 +1813,13 @@ impl Live {
             None => self.talk_camera.line_cut_effects(&sim),
         };
         let mut out = CutEffects::default();
+        out.depth_of_field.extend(talk);
         for s in &states {
             if s.effect.eq_ignore_ascii_case("da_dof") {
-                out.depth_of_field = Some(DepthOfField::from_parameters(|name| {
-                    s.parameter(name).map(|v| v[0])
-                }));
+                out.depth_of_field
+                    .push(DepthOfField::from_parameters(|name| {
+                        s.parameter(name).map(|v| v[0])
+                    }));
             } else if s.effect.eq_ignore_ascii_case("da_colorfade") {
                 // The effect file's defaults for what the cutscene leaves out.
                 out.fades.push(ColourFade {
