@@ -382,7 +382,7 @@ impl Sim {
             }
         }
         let text = self.node_text(&node);
-        let speaker = match self.line_speaker_tag(&node).as_str() {
+        let speaker = match self.line_speaker_tag(&node, c.owner == c.player).as_str() {
             "OWNER" | "" => c.owner,
             "PLAYER" => c.player,
             tag => self.world.by_tag(tag).next().map_or(c.owner, |o| o.id),
@@ -468,7 +468,11 @@ impl Sim {
             .dlg
             .nodes
             .get(line)
-            .map(|n| self.line_speaker_tag(n).trim_end_matches('\0').to_string())
+            .map(|n| {
+                self.line_speaker_tag(n, c.owner == c.player)
+                    .trim_end_matches('\0')
+                    .to_string()
+            })
             .filter(|s| !s.is_empty())
             .and_then(|s| self.cutscene_actor_object(&s, Some(c.owner), Some(c.player)))
             .unwrap_or(c.owner);
@@ -602,13 +606,28 @@ impl Sim {
         out
     }
 
-    /// The tag (or `OWNER`, `PLAYER`) of whoever says line `n`. A Dragon Age II line given to
-    /// the conversation's other participant ([`crate::cnv::PARTNER`]) goes to the first of
-    /// its candidates that is active and alive, else the first that is there, else the owner.
-    pub fn line_speaker_tag(&self, n: &Node) -> String {
+    /// The tag (or `OWNER`, `PLAYER`) of whoever says line `n` of a conversation the player
+    /// owns or not (`player_owned`). A Dragon Age II line said by a follower
+    /// ([`crate::cnv::FOLLOWER`]) goes to that `conversation_followers` row's tag. One given
+    /// to the conversation's other participant ([`crate::cnv::PARTNER`]) goes to the owner,
+    /// unless the player owns the conversation: then to the first of its candidates that is
+    /// active and alive, else the first that is there, else the owner.
+    pub fn line_speaker_tag(&self, n: &Node, player_owned: bool) -> String {
+        if let Some(row) = n.speaker.strip_prefix(crate::cnv::FOLLOWER) {
+            let tag = row.parse::<i64>().ok().and_then(|r| {
+                let t = self.world.tables().get(296, "")?;
+                Some(crate::engine::cell_string(t.cell("Tag", r)))
+            });
+            return tag
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| "OWNER".into());
+        }
         let Some(list) = n.speaker.strip_prefix(crate::cnv::PARTNER) else {
             return n.speaker.clone();
         };
+        if !player_owned {
+            return "OWNER".into();
+        }
         let tags: Vec<&str> = list.split('|').filter(|t| !t.is_empty()).collect();
         let here = |live: bool| {
             tags.iter()
@@ -1097,7 +1116,9 @@ impl Sim {
         Some(DialogState {
             dialog: c.dlg.name.clone(),
             owner: c.owner,
-            speaker: line.map(|n| self.line_speaker_tag(n)).unwrap_or_default(),
+            speaker: line
+                .map(|n| self.line_speaker_tag(n, c.owner == c.player))
+                .unwrap_or_default(),
             line: line.map(|n| self.node_text(n)).unwrap_or_default(),
             replies: c
                 .replies
