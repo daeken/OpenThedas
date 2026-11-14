@@ -228,6 +228,30 @@ mod tests {
     }
 
     #[test]
+    fn dragon_age_2_quick_start_chooses_a_male_warrior_first() {
+        let table = EngineTable::parse(LDF.as_bytes()).unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let m = s.world.spawn(ObjectKind::Module, "module");
+        s.world.module = Some(m);
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        s.start_chargen(hero, 0, 0);
+        let origins: Vec<i32> = queued(&s).into_iter().map(|q| q.0).collect();
+        assert_eq!(origins, vec![44, 59]);
+        s.world.queue.clear();
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.start_chargen(hero, 0, 0);
+        assert_eq!(
+            queued(&s),
+            vec![
+                (44, vec![0, 0], vec![]),
+                (54, vec![1, 1], vec![]),
+                (47, vec![0, 1], vec![]),
+                (59, vec![0, 0], vec![]),
+            ]
+        );
+    }
+
+    #[test]
     fn the_creation_screen_choices_become_chargen_events() {
         let table = EngineTable::parse(LDF.as_bytes()).unwrap();
         let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);

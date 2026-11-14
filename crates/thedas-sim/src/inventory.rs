@@ -19,6 +19,11 @@ pub const MSG_UNEQUIP: &str = "GUI.SelectedChar.UnequipItem";
 /// The party screens' arrows: the next or previous party member becomes the selected one
 /// (the one the player controls).
 pub const MSG_NEXT_CHARACTER: &str = "GUI.SelectNextCharacterMessage";
+/// The quickbar's weapon set button (quickbar.gfx's `WeaponSetToggleButton_mc`, which sends
+/// `1 - ActiveWeaponSet`): the set the selected party member switches to; -1 (the key) the
+/// other one. Provisional: the switch is made at once, as the script's `SwitchWeaponSet`; the
+/// exe's route (its `SwitchWeaponSetMessage`, 0x6e0e86, 0x793777) is not followed.
+pub const MSG_SWITCH_WEAPON_SET: &str = "GUI.SelectedChar.SwitchWeaponSet";
 pub const MSG_PREVIOUS_CHARACTER: &str = "GUI.SelectPreviousCharacterMessage";
 
 /// `itemprps.gda` columns whose names are not known: the property's kind (1 while worn, 2
@@ -454,6 +459,14 @@ impl Sim {
                 (at + n - 1) % n
             };
             self.player_selects(party[next]);
+            return true;
+        }
+        if name == MSG_SWITCH_WEAPON_SET {
+            let set = args.first().and_then(|a| a.trim().parse::<f64>().ok());
+            let (Some(who), Some(set)) = (self.world.controlled(), set) else {
+                return false;
+            };
+            self.switch_weapon_set(who, set as i32);
             return true;
         }
         let int = |i: usize| {
@@ -1130,6 +1143,41 @@ mod screen_tests {
     use thedas_vfs::Vfs;
 
     use super::*;
+
+    #[test]
+    fn the_weapon_set_button_switches_the_controlled_members_set() {
+        let mut s = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(EngineTable::parse(b"").unwrap()),
+            1,
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.hero = Some(hero);
+        let (sword, bow) = (
+            s.world.spawn(ObjectKind::Item, "sword"),
+            s.world.spawn(ObjectKind::Item, "bow"),
+        );
+        let h = s.world.get_mut(hero).unwrap();
+        h.equipment.insert(0, sword);
+        h.other_set.insert(0, bow);
+        let set = |s: &Sim| {
+            s.world
+                .get(hero)
+                .unwrap()
+                .fields
+                .get("ActiveWeaponSet")
+                .copied()
+        };
+        // The button sends the set it switches to.
+        assert!(s.gui_message(MSG_SWITCH_WEAPON_SET, &["1".into()]));
+        assert_eq!(set(&s), Some(1));
+        assert_eq!(s.world.get(hero).unwrap().equipment.get(&0), Some(&bow));
+        // The key sends -1: the other set.
+        assert!(s.gui_message(MSG_SWITCH_WEAPON_SET, &["-1".into()]));
+        assert_eq!(set(&s), Some(0));
+        assert_eq!(s.world.get(hero).unwrap().equipment.get(&0), Some(&sword));
+        assert!(!s.gui_message(MSG_SWITCH_WEAPON_SET, &[]));
+    }
 
     #[test]
     fn stackable_items_fill_matching_stacks_up_to_their_maximum() {

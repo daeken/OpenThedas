@@ -1909,6 +1909,8 @@ impl App {
             return None;
         }
         let (mut done, mut failed) = workspace::apply(&changes, &overrides);
+        // Objects moved in a saved file, moved in the world after the meshes.
+        let mut moves = Vec::new();
         // Saved meshes: read against the game's own files, not earlier live edits.
         if !glbs.is_empty() {
             let vfs = self.live.as_ref().map(|l| l.sim().vfs.clone());
@@ -1922,11 +1924,14 @@ impl App {
             };
             for g in &glbs {
                 match workspace::import_glb(g, &overrides, &read) {
-                    Ok((written, notes)) => {
-                        for n in notes {
+                    Ok(r) => {
+                        for n in &r.notes {
                             log::info!("live edits: {}: {n}", g.display());
                         }
-                        done.extend(written);
+                        done.extend(r.written);
+                        if let Some(m) = r.moved {
+                            moves.push(m);
+                        }
                     }
                     Err(e) => failed.push(format!("{}: {e}", g.display())),
                 }
@@ -1941,13 +1946,42 @@ impl App {
                 l.reload(&done);
             }
         }
+        let mut placed = Vec::new();
+        for (id, tag, p) in moves {
+            // The exported object, if it is still that one; else the one with its tag here.
+            let target = self.live.as_ref().and_then(|l| {
+                let sim = l.sim();
+                match sim.world.get(id) {
+                    Some(o) if o.tag.eq_ignore_ascii_case(&tag) => Some(id),
+                    _ => sim.world.find_tag(&tag, 0),
+                }
+            });
+            match target {
+                Some(t) => {
+                    let n = self.place_object(
+                        thedas_sim::commands::SimCommand::MoveObject {
+                            target: t,
+                            position: p.position,
+                            facing: p.facing,
+                        },
+                        format!("move {tag} (from Blender)"),
+                    );
+                    placed.push(n);
+                }
+                None => failed.push(format!("{tag}: not in the world to move")),
+            }
+        }
+        let mut said = Vec::new();
+        if !done.is_empty() {
+            said.push(format!("{} updated", done.join(", ")));
+        }
+        said.extend(placed);
+        if said.is_empty() {
+            said.push("nothing written".into());
+        }
         let note = format!(
             "Live edits: {}{}",
-            if done.is_empty() {
-                "nothing written".to_string()
-            } else {
-                format!("{} updated", done.join(", "))
-            },
+            said.join("; "),
             if failed.is_empty() {
                 String::new()
             } else {
@@ -2096,12 +2130,25 @@ impl App {
         command: thedas_sim::commands::SimCommand,
         what: String,
     ) -> String {
-        let (Some(m), Some(live)) = (self.mod_mode.as_mut(), self.live.as_mut()) else {
+        if self.mod_mode.is_none() {
             return "mod mode is not open".into();
+        }
+        self.place_object(command, what)
+    }
+
+    /// [`App::mod_mode_place`], also when mod mode's panels were never opened (live edits
+    /// from the launch option): the history is kept once they are.
+    fn place_object(&mut self, command: thedas_sim::commands::SimCommand, what: String) -> String {
+        let Some(live) = self.live.as_mut() else {
+            return "not playing".into();
         };
         let edit = {
             let mut sim = live.sim();
             modconv::object_edit(&mut sim, command, what)
+        };
+        let Some(m) = self.mod_mode.as_mut() else {
+            log::info!("mod mode: {}", edit.text);
+            return edit.text;
         };
         // Positions are read each frame, and a made or removed object changes the objects'
         // key, which rebuilds them.
@@ -3265,6 +3312,15 @@ impl App {
                     log::info!("leading with {tag}");
                 }
             }
+            // `SwapWeaponSets` (keymap.gda binds it to /): the controlled party member's other
+            // weapon set, as the quickbar's weapon set button. Provisional: the key is fixed
+            // here, not read from the player's bindings.
+            KeyCode::Slash if self.live.is_some() => {
+                if let Some(live) = self.live.as_ref() {
+                    switch_weapon_set(live);
+                    log::info!("weapon set switched");
+                }
+            }
             // The quickbar's first ten slots: 1 to 9, then 0.
             c if self.live.is_some() && quickslot_key(c).is_some() => {
                 let slot = quickslot_key(c).unwrap_or(0);
@@ -3735,6 +3791,10 @@ impl App {
                     Some(ability) => format!("aiming ability {ability} (click a target)"),
                     None => format!("quickslot {}", slot + 1),
                 });
+            }
+            Step::SwapWeapons => {
+                self.key_down(KeyCode::Slash);
+                log.push("weapon set key".into());
             }
             Step::Pause => {
                 // As the Space key does (a training tutorial takes it as its unpause).
@@ -5357,6 +5417,8 @@ enum Step {
     Quickslot(i32),
     /// Space: the game pauses or carries on.
     Pause,
+    /// The weapon set key (/).
+    SwapWeapons,
     /// F10: mod mode's panels open or close (windowed only).
     ModMode,
     /// Mod mode's inspector picks the creature or placeable with this tag nearest the
@@ -5537,6 +5599,18 @@ fn set_client_option(ui: Option<&ui::UiLayer>, live: Option<&live::Live>, name: 
             },
         );
     }
+}
+
+/// The weapon set key: the controlled party member switches to its other set, as the
+/// quickbar's weapon set button does.
+fn switch_weapon_set(live: &live::Live) {
+    live.sim().input(
+        thedas_sim::commands::CommandSource::Player,
+        thedas_sim::commands::SimCommand::GuiMessage {
+            name: thedas_sim::inventory::MSG_SWITCH_WEAPON_SET.into(),
+            args: vec!["-1".into()],
+        },
+    );
 }
 
 /// Whether the screen up is one the game put up that the player leaves by its Close: a store,
@@ -5768,6 +5842,7 @@ fn parse_step(s: &str) -> Result<Step> {
             Step::Leader(arg[1..].parse::<usize>()? - 1)
         }
         "key" if arg.eq_ignore_ascii_case("space") => Step::Pause,
+        "key" if arg == "/" => Step::SwapWeapons,
         "key" if arg.eq_ignore_ascii_case("f10") => Step::ModMode,
         "modmode" => Step::ModMode,
         "modselect" if !arg.is_empty() => Step::ModSelect(arg.to_string()),
@@ -6548,6 +6623,10 @@ fn main() -> Result<()> {
                         Some(ability) => println!("aiming ability {ability}"),
                         None => println!("quickslot {}", slot + 1),
                     },
+                    Step::SwapWeapons => {
+                        switch_weapon_set(l);
+                        println!("weapon set switched");
+                    }
                     Step::Pause => {
                         // As the Space key does (a training tutorial takes it as its unpause).
                         l.toggle_pause();

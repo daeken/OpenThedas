@@ -49,6 +49,7 @@ pub fn open(o: &SessionOptions) -> Result<Sim, SimError> {
     sim.world.trace.keep = o.keep_trace;
     sim.cutscene_policy = o.cutscenes;
     sim.chargen_policy = o.chargen.clone();
+    sim.game = install.game();
     sim.load_module(install.root(), &o.module)?;
     let area = o
         .area
@@ -71,7 +72,9 @@ pub fn open_bare(o: &SessionOptions) -> Result<Sim, SimError> {
     let table = EngineTable::parse(&data)
         .map_err(|e| SimError::Parse("script.ldf".into(), e.to_string()))?
         .with_inferred();
-    Ok(Sim::new(Arc::new(vfs), Arc::new(table), o.seed))
+    let mut sim = Sim::new(Arc::new(vfs), Arc::new(table), o.seed);
+    sim.game = install.game();
+    Ok(sim)
 }
 
 /// The install root from `THEDAS_INSTALL`, if set.
