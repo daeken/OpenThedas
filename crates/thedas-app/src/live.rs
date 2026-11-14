@@ -2376,6 +2376,12 @@ impl Live {
         Ok(())
     }
 
+    pub fn set_deferred_shadow_reuse(&mut self, enabled: Option<bool>) {
+        if let Some(level) = &mut self.level {
+            level.renderer.set_deferred_shadow_reuse(enabled);
+        }
+    }
+
     /// Sets how the level is drawn, and for the deferred path the lights the frame's glowing
     /// particles give (its objects' and the visual effects'; the level's renderer adds its
     /// own), which light the level's geometry (ours: the original's particles light
@@ -2469,7 +2475,12 @@ impl Live {
             o.renderer.encode_shadows(encoder, false);
         }
         level.renderer.finish_shadows(encoder);
-        let mut contributors: Vec<_> = self.objects.iter_mut().map(|o| &mut o.renderer).collect();
+        let mut contributors: Vec<_> = self
+            .objects
+            .iter_mut()
+            .map(|o| &mut o.renderer)
+            .chain(self.effects.iter_mut().map(|e| &mut e.renderer))
+            .collect();
         level.renderer.render_main_with(
             ctx,
             encoder,
@@ -2486,11 +2497,17 @@ impl Live {
             .renderer
             .frame_view(&ctx.device, target, width, height);
         // An aimed ability's reticle lies on the ground: under the creatures, as the rings.
-        reticle.draw(&ctx.device, encoder, &frame, (width, height), &aim);
-        if let Some(r) = self.rings.as_mut() {
+        if !aim.is_empty() || self.rings.is_some() {
             let depth = level.renderer.depth(&ctx.device, width, height);
-            r.renderer
-                .render_over(ctx, encoder, &frame, width, height, camera, &depth);
+            level
+                .renderer
+                .render_ground(ctx, encoder, &frame, |encoder| {
+                    reticle.draw(&ctx.device, encoder, &frame, (width, height), &aim);
+                    if let Some(r) = self.rings.as_mut() {
+                        r.renderer
+                            .render_over(ctx, encoder, &frame, width, height, camera, &depth);
+                    }
+                });
         }
         if let Some(o) = self.objects.as_mut() {
             let depth = level.renderer.depth(&ctx.device, width, height);
@@ -2501,6 +2518,16 @@ impl Live {
             let depth = level.renderer.depth(&ctx.device, width, height);
             e.renderer
                 .render_over(ctx, encoder, &frame, width, height, camera, &depth);
+        }
+        let depth = level.renderer.depth(&ctx.device, width, height);
+        level.renderer.finish_transparency(encoder, &frame, &depth);
+        for r in self
+            .objects
+            .iter_mut()
+            .map(|o| &mut o.renderer)
+            .chain(self.effects.iter_mut().map(|e| &mut e.renderer))
+        {
+            r.finish_transparency(encoder, &frame, &depth);
         }
         level
             .renderer
@@ -2601,11 +2628,13 @@ impl Live {
             return Ok(None);
         };
         level.renderer.cut_effects = cut_effects;
+        let depth = level.renderer.depth(&ctx.device, width, height);
+        let ground = !aim.is_empty() || self.rings.is_some();
+        let rings = &mut self.rings;
         let mut overlays: Vec<&mut AreaRenderer> = self
-            .rings
+            .objects
             .iter_mut()
-            .map(|r| &mut r.renderer)
-            .chain(self.objects.iter_mut().map(|o| &mut o.renderer))
+            .map(|o| &mut o.renderer)
             .chain(self.effects.iter_mut().map(|e| &mut e.renderer))
             .collect();
         Ok(Some(level.renderer.capture_with(
@@ -2614,7 +2643,15 @@ impl Live {
             width,
             height,
             &mut overlays,
-            &mut |encoder, view| reticle.draw(&ctx.device, encoder, view, (width, height), &aim),
+            ground.then_some(&mut |encoder, view: &wgpu::TextureView| {
+                reticle.draw(&ctx.device, encoder, view, (width, height), &aim);
+                // Ground overlays belong under the creatures, just as in the window;
+                // they must not join the delayed world-transparency phase.
+                if let Some(r) = rings.as_mut() {
+                    r.renderer
+                        .render_over(ctx, encoder, view, width, height, camera, &depth);
+                }
+            }),
         )?))
     }
 
