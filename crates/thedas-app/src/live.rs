@@ -556,6 +556,15 @@ pub enum Start<'a> {
     Resume(&'a Path),
 }
 
+/// Whether an ability waiting for its target can no longer be aimed (see
+/// [`Live::drop_stale_aim`]).
+pub fn aim_is_stale(sim: &Sim, aim: &thedas_ui::input::Aim, field: bool) -> bool {
+    let caster = sim.world.get(aim.caster);
+    !field
+        || sim.world.controlled() != Some(aim.caster)
+        || caster.is_none_or(|c| c.dead || c.area != sim.world.area)
+}
+
 /// Who gets a portrait drawn: the party, and the followers picked in an open party picker
 /// (partypicker.gfx shows theirs).
 pub fn portrait_subjects(sim: &Sim) -> Vec<ObjectId> {
@@ -3309,6 +3318,19 @@ impl Live {
         );
     }
 
+    /// Drops an ability waiting for its target once nothing can aim it: a screen is up over
+    /// the field (`field` false: a conversation, cutscene, menu or the like), the player
+    /// now controls someone else, or the caster is gone, dead or in another area. Returns
+    /// the ability dropped. Provisional: the exe's own rule for ending its targeting mode is
+    /// not traced; a right click, a world click and the pad's B or D-pad down end it too.
+    pub fn drop_stale_aim(&mut self, field: bool) -> Option<i32> {
+        let aim = self.aiming.as_ref()?;
+        if !aim_is_stale(&self.sim(), aim, field) {
+            return None;
+        }
+        self.aiming.take().map(|a| a.ability)
+    }
+
     pub fn toggle_pause(&mut self) {
         let mut sim = self.sim();
         if sim.training_paused() {
@@ -3573,5 +3595,45 @@ mod load_screen_tests {
         // No area before (the first load), or an area outside the tree.
         assert_eq!(load_screen_for(None, list), LoadScreen::Town);
         assert_eq!(load_screen_for(list, None), LoadScreen::Town);
+    }
+}
+
+#[cfg(test)]
+mod aim_tests {
+    use std::sync::Arc;
+
+    use thedas_script::EngineTable;
+    use thedas_sim::Sim;
+    use thedas_sim::world::ObjectKind;
+    use thedas_vfs::Vfs;
+
+    use super::aim_is_stale;
+
+    #[test]
+    fn an_aim_lasts_only_while_its_caster_can_still_aim_it() {
+        let mut s = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(EngineTable::parse(b"").unwrap()),
+            1,
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let other = s.world.spawn(ObjectKind::Creature, "other");
+        s.world.hero = Some(hero);
+        let aim = thedas_ui::input::Aim {
+            caster: hero,
+            ability: 10_000,
+            item: String::new(),
+        };
+        assert!(!aim_is_stale(&s, &aim, true));
+        // A screen over the field: a conversation, a menu.
+        assert!(aim_is_stale(&s, &aim, false));
+        // Someone else's aim, or a dead caster.
+        let theirs = thedas_ui::input::Aim {
+            caster: other,
+            ..aim.clone()
+        };
+        assert!(aim_is_stale(&s, &theirs, true));
+        s.world.get_mut(hero).unwrap().dead = true;
+        assert!(aim_is_stale(&s, &aim, true));
     }
 }
