@@ -59,8 +59,10 @@ mod focusnav;
 mod follow;
 mod glb;
 mod glb_in;
+mod icon;
 mod intro;
 mod journal;
+mod launcher;
 mod live;
 mod looks;
 mod modconv;
@@ -262,6 +264,20 @@ struct Args {
     /// The voice-over language folder (`audio/vo/<language>`).
     #[arg(long, default_value = "en-us")]
     language: String,
+    /// Show the launcher (installs, mods, play options) even when an install is given or the
+    /// player chose to skip it. Started with no install and none of the headless options, the
+    /// game shows it anyway.
+    #[arg(long)]
+    launcher: bool,
+    /// Draw a launcher page (`welcome`, `search`, `keys`, `play`, `games`, `mods`,
+    /// `settings`; see `--launcher-page`) to this PNG offscreen at `--size`, then exit.
+    #[arg(long, hide = true)]
+    launcher_capture: Option<PathBuf>,
+    #[arg(long, hide = true, default_value = "play")]
+    launcher_page: String,
+    /// Pixels per point for `--launcher-capture`.
+    #[arg(long, hide = true, default_value_t = 1.0)]
+    launcher_scale: f32,
 }
 
 /// Behind and above a hero at `pos` with the game's `facing`, looking the same way (as the
@@ -1170,9 +1186,13 @@ impl App {
                         None => "OpenThedas".to_string(),
                     })
                     .with_inner_size(LogicalSize::new(self.size.0, self.size.1))
+                    .with_window_icon(icon::window_icon())
                     .with_visible(std::env::var_os("THEDAS_HIDDEN_WINDOW").is_none()),
             )?,
         );
+        if std::env::var_os("THEDAS_HIDDEN_WINDOW").is_none() {
+            icon::set_dock_icon();
+        }
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let surface = instance.create_surface(window.clone())?;
@@ -3205,8 +3225,16 @@ impl App {
             }
             // An issue report (see [`report`]): ours, not the original's.
             KeyCode::F8 => self.report(None, None),
-            // Escape closes the screen up, else opens the game menu over a game; the viewer
-            // closes. The start menu stays (its Exit quits).
+            // Escape closes a store, container, job board or world map the game put up by
+            // its own Close (as the pad's B), else the player's screen up, else opens the game
+            // menu over a game; the viewer closes. The start menu stays (its Exit quits).
+            // Provisional: the exe's Escape on the game's screens is not traced.
+            KeyCode::Escape if self.screens.as_ref().is_some_and(game_screen_up) => {
+                match padplay::press_back(self) {
+                    Some(path) => log::info!("escape: {path}"),
+                    None => log::info!("escape: no close button on this screen"),
+                }
+            }
             KeyCode::Escape => match self.screens.as_mut() {
                 None => return true,
                 Some(s) if s.menu.is_some() => s.menu = None,
@@ -5511,6 +5539,18 @@ fn set_client_option(ui: Option<&ui::UiLayer>, live: Option<&live::Live>, name: 
     }
 }
 
+/// Whether the screen up is one the game put up that the player leaves by its Close: a store,
+/// a container (the inventory screen the player did not open), the job board or the world map.
+fn game_screen_up(s: &screens::Screens) -> bool {
+    use screens::Screen;
+    !s.front_end
+        && s.shown().iter().any(|m| match m {
+            Screen::Store | Screen::Chanters | Screen::WorldMap => true,
+            Screen::Inventory => s.menu != Some(Screen::Inventory),
+            _ => false,
+        })
+}
+
 /// A `key` step's text-field key, by name.
 fn text_key(name: &str) -> Option<thedas_ui::UiKey> {
     use thedas_ui::UiKey;
@@ -5881,13 +5921,35 @@ fn main() -> Result<()> {
         paddev::probe(secs);
         return Ok(());
     }
+    if let Some(out) = &args.launcher_capture {
+        return launcher::capture(
+            out,
+            &args.launcher_page,
+            parse_size(&args.size)?,
+            args.launcher_scale,
+        );
+    }
     if let Some(keys) = &args.keys {
         thedas_vfs::keys_file::set_path(keys);
     }
     let install = args
         .install
-        .or_else(|| std::env::var_os("THEDAS_INSTALL").map(PathBuf::from))
-        .context("give --install or set THEDAS_INSTALL")?;
+        .clone()
+        .or_else(|| std::env::var_os("THEDAS_INSTALL").map(PathBuf::from));
+    // No install named, playing in a window: the launcher picks one (and the game starts as
+    // a process of its own). Headless and driven runs keep needing `--install`.
+    let headless = args.capture.is_some()
+        || args.control.is_some()
+        || !args.steps.is_empty()
+        || args.check_report.is_some()
+        || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some();
+    if args.launcher || (install.is_none() && !headless) {
+        if let Some(launch) = launcher::run(args.launcher)? {
+            launch.spawn()?;
+        }
+        return Ok(());
+    }
+    let install = install.context("give --install or set THEDAS_INSTALL")?;
     if args.module.is_empty() {
         args.module = thedas_vfs::install::campaign_module(&install).to_string();
     }

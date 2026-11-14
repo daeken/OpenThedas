@@ -1,5 +1,10 @@
 //! Records the commit the app is built from, for issue reports (`report::build_info`).
 //! Without git it is not set.
+//!
+//! On Windows it also gives the executable the OpenThedas emblem as its icon
+//! (`assets/icon/openthedas.rc`). Best effort: a machine with no resource compiler (`windres`,
+//! `llvm-rc`) builds the game without the icon and says so; the window still shows the emblem
+//! at run time.
 
 use std::process::Command;
 
@@ -21,4 +26,13 @@ fn main() {
         println!("cargo:rerun-if-changed={dir}/logs/HEAD");
     }
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=assets/icon/openthedas.rc");
+    println!("cargo:rerun-if-changed=assets/icon/openthedas.ico");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        if let Err(e) = embed_resource::compile("assets/icon/openthedas.rc", embed_resource::NONE)
+            .manifest_optional()
+        {
+            println!("cargo:warning=no executable icon: {e}");
+        }
+    }
 }
