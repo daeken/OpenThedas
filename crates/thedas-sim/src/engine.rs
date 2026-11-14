@@ -7756,6 +7756,68 @@ mod tests {
     }
 
     #[test]
+    fn old_placeable_saves_preserve_explicit_currents_and_default_missing_fields() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
+                  int GetHealth(object o) = 1;\n\
+                  int Deprecated_GetMaxHealth(object o) = 2;",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let id = s.world.spawn(ObjectKind::Placeable, "old_chest");
+        for fields in [
+            vec![],
+            vec![("Health", 16)],
+            vec![("MaxHealth", 77)],
+            vec![("Health", 16), ("MaxHealth", 77)],
+        ] {
+            for current in [None, Some(0.0), Some(80.0)] {
+                let o = s.world.get_mut(id).unwrap();
+                o.fields = fields.iter().map(|&(k, v)| (k.into(), v)).collect();
+                o.properties.clear();
+                if let Some(current) = current {
+                    o.properties.insert(7, (100.0, current));
+                }
+                let fields = o.fields.clone();
+                let properties = o.properties.clone();
+                // #844 adds no Object or SaveGame members. Older JSON may also
+                // omit #838's independently defaulted creature health floor.
+                let mut legacy: serde_json::Value =
+                    serde_json::from_slice(&s.save_json().unwrap()).unwrap();
+                legacy["world"]["objects"][id.to_string()]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("health_floor_one");
+                s.load_json(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+                for _ in 0..2 {
+                    let o = s.world.get(id).unwrap();
+                    assert_eq!(o.fields, fields);
+                    assert_eq!(o.properties, properties);
+                    assert!(!o.health_floor_one);
+                    assert_eq!(
+                        run(&mut s, id, "GetHealth", &[Value::Object(id)]),
+                        Some(Value::Int(
+                            current.unwrap_or(*fields.get("Health").unwrap_or(&0) as f32) as i32
+                        ))
+                    );
+                    assert_eq!(
+                        run(&mut s, id, "Deprecated_GetMaxHealth", &[Value::Object(id)]),
+                        Some(Value::Int(
+                            *fields
+                                .get("MaxHealth")
+                                .or_else(|| fields.get("Health"))
+                                .unwrap_or(&0)
+                        ))
+                    );
+                    s.load_json(&s.save_json().unwrap()).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn party_members_and_no_perm_death_creatures_cannot_die_permanently() {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);

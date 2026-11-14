@@ -49,3 +49,21 @@ These 9,530 field changes are the only saved differences. Complete story
 logs, engine logs, ordered plots, ending areas, creature health observations
 and developer-heal results remain equal. This does not complete the missing
 explicit placeable current setter or its nonpositive destruction lifecycle.
+
+## Compatibility and destruction review
+
+This change introduces no required JSON members or save revision. The old
+explicit property-7 current keeps precedence, including zero; missing
+`Health` reads as zero. A regression loads all four combinations of missing
+and present `Health`/`MaxHealth`, with absent, zero and positive explicit
+currents, then saves and reloads each without changing either field map.
+
+The separate bashing requirement is not established by this maximum setter.
+A private compiled-script lethal-damage probe against main and this change
+leaves both an ordinary door and a chest unchanged, with or without an
+explicit current. `SetPlaceableHealth` is still a presentation no-op on
+both branches. Its native handler (`0x65a250`) calls the current virtual
+`+0x124` after signed-short narrowing. The placeable method (`0x74e8e0`)
+has additional nonpositive-current inventory and destruction side effects;
+these need their own traced implementation and end-to-end tests. The
+maximum setter must not stand in for that missing current setter.
