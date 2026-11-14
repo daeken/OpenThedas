@@ -171,7 +171,7 @@ Concrete defects found during the code read. Each is small and independent.
 | --- | --- |
 | `SCR-059` | A command pushed to the front leaves the displaced command with its old timer |
 | `SCR-074` | Comparing two effects, locations or events compares handles, so equal values differ |
-| `SIM-148` | The module's start position is parsed and never used |
+| `SIM-148` | The module's start position is parsed and never used (barely visible: single player's start area is left at once) |
 | `RND-043` | Alpha-tested casters are skipped, so foliage, fences and hair cast no sun shadow |
 | `RND-095` | Location effects with an instant duration are discarded and never drawn |
 | `RND-139` | Compressed textures lose their smallest mip levels |
