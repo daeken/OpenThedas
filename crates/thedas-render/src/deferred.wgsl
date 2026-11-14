@@ -440,7 +440,7 @@ fn alpha_kept(sampled: f32) -> bool {
 fn alpha_test(sampled: f32, test: vec4<f32>) -> bool {
     if (test.x < 0.5) { return true; }
     let opacity = sampled * test.z;
-    if (opacity < test.w) { return false; }
+    if (test.w >= 0.0 && opacity < test.w) { return false; }
     let a = floor(clamp(opacity, 0.0, 1.0) * 255.0 + 0.5);
     let r = test.y;
     switch u32(test.x) {

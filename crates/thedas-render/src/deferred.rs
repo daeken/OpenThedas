@@ -404,7 +404,9 @@ impl DeferredPass {
             let Some(item) = scene.draws.get(d.draw) else {
                 continue;
             };
-            let alpha = punch.get(&k);
+            let alpha = punch.get(&k).filter(|_| {
+                objects_enabled || !crate::deferred_alpha::character(&program.name)
+            });
             let taken = !d3d.is_blended(d)
                 && !d.multipass
                 && (faces_enabled

@@ -329,7 +329,8 @@ The existing `THEDAS_BENCH_FRAMES` and same-process
 ABBA path comparison can collect warmed samples for each renderer.
 
 CPU encoding, submission/wait/pixel unpacking and GPU execution are reported separately.
-GPU stages can overlap CPU work, so their durations cannot be summed into CPU frame time.
+Per-pass GPU intervals can overlap on pipelined GPUs and can overlap CPU work.
+Keep each interval separate when interpreting the frame budget.
 The GPU samples cover these four passes. Forward object passes, shadows, uploads and
 post-processing need separate instrumentation for a complete GPU frame budget.
 Profiling adds query resources, timestamp writes and a diagnostic readback per capture.
