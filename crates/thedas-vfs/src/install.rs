@@ -568,9 +568,13 @@ fn push_package(
 /// then `textures`, then `patch`.
 ///
 /// The `data` source is the rank-1 directory factory (0x4d0150). Its scan registers each
-/// child directory with the parent's priority (0x4cf89c..0x4cf977), recursively; the greater
-/// UTF-16 folder path wins, just as in an override folder. The separate final flag controls
-/// change notifications (0x4cfdd0), not whether subfolders are scanned.
+/// child directory with the parent's priority (0x4cf89c..0x4cf977), recursively. The separate
+/// final flag controls change notifications (0x4cfdd0), not whether subfolders are scanned.
+/// PROVISIONAL: the greater UTF-16 directory path wins duplicate names among `data/`
+/// subfolders. Recursive registration, inherited priority/rank and the general comparator
+/// (0x4e6660) are traced, but their complete registration-to-winning-lookup path for duplicate
+/// loose names across `data/` children has not been traced end to end. No running-original
+/// comparison establishes this tie-break; synthetic fixtures only check our implementation.
 ///
 /// Provisional: `.rim` archives here are still eagerly mounted; the original records their
 /// names for explicit loading instead (0x4c7b00). Nested `.erf` discovery and the original's
@@ -607,6 +611,8 @@ fn push_origins_package(
             .filter_map(|p| p.parent().map(Path::to_path_buf))
             .chain([data.clone()])
             .collect();
+        // PROVISIONAL duplicate-name tie-break: greater UTF-16 directory path wins.
+        // See the trace limits on push_origins_package above.
         folders.sort_by_cached_key(|p| container_key(&data, p, true));
         folders.dedup();
         // Keep each folder a separate source, so GDA worksheet listing also follows the

@@ -15,9 +15,18 @@ Static trace of the GOG executable:
   0x4c7ea0 at 0x4cf977 with the parent's priority and factory 1. The child performs the same
   scan. The final flag copied to +0xc1 controls filesystem change watching (0x4cfdd0),
   rather than child discovery.
-- Sources compare priority, rank, then path (0x4e6660); the greater UTF-16 path wins at
-  equal priority and rank. Directory paths include their trailing backslash. Thus a child
-  beats its root, and `talktables` beats `cursors`, independent of registration sequence.
+- The general source comparator compares priority, rank, then path (0x4e6660), placing the
+  greater UTF-16 path first at equal priority and rank. Directory paths include their
+  trailing backslash.
+
+**PROVISIONAL: duplicate-name tie-break among `data/` subfolders.** OpenThedas makes the
+greater UTF-16 directory path win: a child beats its root, and `talktables` beats `cursors`,
+independent of registration sequence. The static trace establishes the DATA factory,
+recursive child registration, inherited priority/rank, and the general comparator. The
+complete registration-to-winning-lookup path for a duplicate loose name across two `data/`
+children has **not been traced end to end**. Applying the general comparator to that case
+is an inference; no comparison with a running original establishes the winner. Synthetic
+fixtures only check that OpenThedas implements the chosen rule.
 
 `push_origins_package` now uses recursive loose-file discovery and the existing source-path
 ordering. Audio remains below data; textures and patch remain above it. DA2 is unchanged.
