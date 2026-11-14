@@ -5018,12 +5018,18 @@ fn audio_state(
                 .collect();
         }
     }
-    // Between the party leader and the camera (`sound_settings.gda` "Camera / player
-    // listener balance position": 0.17 of the way to the camera).
+    // Between the party leader's head and the camera (`sound_settings.gda` "Camera /
+    // player listener balance position": 0.17 of the way to the camera). DAOrigins.exe's
+    // listener update (0x5d6610) takes the controlled creature's position raised 1.8 m
+    // (0xb004d8) and moves it towards the camera (0x5b6390); sound occlusion casts its rays
+    // from there (0x5b731c). Without a creature to follow, the camera itself.
     let cam = camera.position;
-    let feet = live.leader_feet().unwrap_or(cam);
+    let head = live
+        .leader_feet()
+        .map(|f| f + glam::Vec3::new(0.0, 0.0, 1.8))
+        .unwrap_or(cam);
     state.leader = live.leader_feet().map(|f| f.to_array());
-    let p = feet + (cam - feet) * 0.17;
+    let p = head + (cam - head) * 0.17;
     let right = [camera.yaw.sin(), -camera.yaw.cos(), 0.0];
     state.listener = Some((p.to_array(), right));
     state
