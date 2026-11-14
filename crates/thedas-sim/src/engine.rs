@@ -107,7 +107,6 @@ fn void() -> Option<VmResult<Option<Value>>> {
 /// and the rest); DA2's templates do not carry them.
 const DA2_AMBIENT_ACTIVITY: &str = "AmbientActivityPattern";
 const DA2_AMBIENT_MOVEMENT: &str = "AmbientMovementPattern";
-const DA2_ENCOUNTER: &str = "EncounterId";
 
 /// DA2's rating conversion (DragonAge2.exe 0x697c00, command 861 at 0x4ed090).
 /// Table 371 selects one of four level curves in table 405. Below the optimal rating
@@ -4310,6 +4309,13 @@ pub fn call(
             void()
         }
 
+        // DragonAge2.exe commands 425–427; see crate::encounter.
+        "GetEncounterId" => ok(Value::Int(h.sim.da2_encounter_id(obj(a, 0)))),
+        "GetEncounter" => ok(objects(h.sim.da2_encounter(int(a, 0)))),
+        "SetEncounterId" => {
+            h.sim.set_da2_encounter_id(obj(a, 0), int(a, 1));
+            void()
+        }
         // Dragon Age II's additions (none is in DA:O's script.ldf). Provisional: read from
         // their script.ldf declarations and the fields DA2's templates carry, not traced in
         // DragonAge2.exe.
@@ -4317,8 +4323,7 @@ pub fn call(
         | "GetItemVariation"
         | "GetPlaceableStateController"
         | "GetCreatureAmbientActivityPattern"
-        | "GetCreatureAmbientMovementPattern"
-        | "GetEncounterId" => {
+        | "GetCreatureAmbientMovementPattern" => {
             let field = match name {
                 "GetItemLevel" => "Level",
                 "GetItemVariation" => "ModelVariation",
@@ -4326,8 +4331,7 @@ pub fn call(
                 // placeable_statecontrollers.gda (4 informational, 2 area transition, ...).
                 "GetPlaceableStateController" => "StateController",
                 "GetCreatureAmbientActivityPattern" => DA2_AMBIENT_ACTIVITY,
-                "GetCreatureAmbientMovementPattern" => DA2_AMBIENT_MOVEMENT,
-                _ => DA2_ENCOUNTER,
+                _ => DA2_AMBIENT_MOVEMENT,
             };
             ok(Value::Int(
                 h.object(obj(a, 0))
@@ -4337,13 +4341,11 @@ pub fn call(
         }
         "SetItemLevel"
         | "SetCreatureAmbientActivityPattern"
-        | "SetCreatureAmbientMovementPattern"
-        | "SetEncounterId" => {
+        | "SetCreatureAmbientMovementPattern" => {
             let field = match name {
                 "SetItemLevel" => "Level",
                 "SetCreatureAmbientActivityPattern" => DA2_AMBIENT_ACTIVITY,
-                "SetCreatureAmbientMovementPattern" => DA2_AMBIENT_MOVEMENT,
-                _ => DA2_ENCOUNTER,
+                _ => DA2_AMBIENT_MOVEMENT,
             };
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
                 o.fields.insert(field.to_string(), int(a, 1));
@@ -5213,6 +5215,9 @@ mod tests {
         string GetHashedM2DAString(int n2DA, int nColumnHash, int nRow) = 865;\n\
         resource GetHashedM2DAResource(int n2DA, int nColumnHash, int nRow) = 866;\n\
         int GetItemLevel( object oItem ) = 701;\n\
+        void SetEncounterId(object o, int id) = 425;\n\
+        int GetEncounterId(object o) = 426;\n\
+        object[] GetEncounter(int id) = 427;\n\
         void SetItemLevel( object oItem, int nLevel ) = 880;\n\
         int GetPlaceableStateController( object oPlaceable ) = 134;\n\
         int GetCreatureAmbientActivityPattern(object oCreature) = 670;\n\
@@ -5228,6 +5233,47 @@ mod tests {
         void SetHeadMorphName(object o, string s) = 887;\n\
         int GetUpgradableAbilityHashedM2DAInt(object o, int nColumnHash, int nAbilityId) = 875;\n\
         float GetUpgradableAbilityHashedM2DAFloat(object o, int nColumnHash, int nAbilityId) = 876;\n";
+
+    #[test]
+    fn da2_encounter_commands_read_template_case_and_update_membership() {
+        let mut s = sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        s.world.area = Some(area);
+        let npc = s.world.spawn(ObjectKind::Creature, "npc");
+        let o = s.world.get_mut(npc).unwrap();
+        o.area = Some(area);
+        o.active = false;
+        o.fields.insert("EncounterID".into(), 42);
+        s.restore_da2_encounters();
+        assert_eq!(
+            run(&mut s, 1, "GetEncounterId", &[Value::Object(npc)]),
+            Some(Value::Int(42))
+        );
+        let members = Some(Value::Array {
+            elem: Type::Object,
+            items: vec![Value::Object(npc)],
+        });
+        assert_eq!(run(&mut s, 1, "GetEncounter", &[Value::Int(42)]), members);
+        run(
+            &mut s,
+            1,
+            "SetEncounterId",
+            &[Value::Object(npc), Value::Int(43)],
+        );
+        assert_eq!(
+            run(&mut s, 1, "GetEncounterId", &[Value::Object(npc)]),
+            Some(Value::Int(43))
+        );
+        assert_eq!(run(&mut s, 1, "GetEncounter", &[Value::Int(43)]), members);
+        assert_eq!(
+            run(&mut s, 1, "GetEncounter", &[Value::Int(42)]),
+            Some(Value::Array {
+                elem: Type::Object,
+                items: vec![]
+            })
+        );
+    }
 
     #[test]
     fn da2_scaled_ratings_follow_level_curves_and_both_sides_of_the_knee() {

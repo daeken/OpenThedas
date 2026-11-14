@@ -256,6 +256,7 @@ impl Sim {
         world.alerts.clear();
         world.uber_alerts.clear();
         self.world = world;
+        self.restore_da2_encounters();
         // A conversation whose last line was already shown does not come back: the game
         // cannot be saved during a conversation, so a loaded game never resumes one at its
         // end (saves made by test drivers can hold one; reloading it would put the last
