@@ -84,6 +84,9 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
    Focused fields track a selection anchor and caret. Ctrl+A and `Selection.setSelection`
    replace/delete the selected range; Shift navigation extends it. Selection getters and
    setters translate script UTF-16 indices to the text storage's character boundaries.
+   Programmatic `Selection.setFocus` selects all existing text, including refocusing the
+   same field, so typing replaces a prefilled save name. Invalid targets preserve focus;
+   null/undefined clear it. Mouse focus still places the caret from the pointer.
    Layout retains character advances, including spaces, for selection highlighting and the
    insertion caret. Focused ranges draw white text over black highlights; an input caret
    blinks at 500 ms intervals, resets on edits/navigation, and disappears on focus loss.
