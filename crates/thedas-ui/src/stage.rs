@@ -267,7 +267,11 @@ mod profile {
     /// Ticks between reports.
     const EVERY: u32 = 300;
 
-    static TIMES: Mutex<Option<(u32, BTreeMap<String, (Duration, Duration)>)>> = Mutex::new(None);
+    /// Each movie's summed sync and tick time.
+    type ByMovie = BTreeMap<String, (Duration, Duration)>;
+
+    /// The ticks counted and the times summed since the last report.
+    static TIMES: Mutex<Option<(u32, ByMovie)>> = Mutex::new(None);
 
     fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
