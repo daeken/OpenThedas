@@ -1,8 +1,7 @@
-//! Renders movies through Ruffle and through our own player, the same way the game opens
-//! them, and writes both pictures side by side (Ruffle left, ours right) with timings.
+//! Captures movies on the game's Scaleform player and reports load/render timings.
 //!
-//! `sidebyside INSTALL OUT.png MOVIES [FRAMES] [WIDTHxHEIGHT]`, MOVIES as for the stage
-//! (`mainmenu`, `hud`, `portraits,quickbar`).
+//! `capture INSTALL OUT.png MOVIES [FRAMES] [WIDTHxHEIGHT]`; movies may be `menu`,
+//! `hud` or a comma-separated list. `SF_CAPTURE_SETUP` accepts `call`/`set` steps.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -13,7 +12,7 @@ use thedas_ui::{Gpu, Rgba, UiValue};
 /// Optional reproducible setup, e.g. `call portraits.gfx _root.attachMovie
 /// PendingCommandText probe 500; set portraits.gfx _root.probe.TextField.text Attack`.
 fn setup(stage: &mut Stage) {
-    let Ok(steps) = std::env::var("SF_COMPARE_SETUP") else {
+    let Ok(steps) = std::env::var("SF_CAPTURE_SETUP") else {
         return;
     };
     let value = |s: &str| {
@@ -56,16 +55,11 @@ fn gpu() -> Gpu {
     }))
     .expect("adapter");
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("sidebyside"),
+        label: Some("capture"),
         ..Default::default()
     }))
     .expect("device");
-    Gpu {
-        instance,
-        adapter,
-        device,
-        queue,
-    }
+    Gpu { device, queue }
 }
 
 fn run(
@@ -74,12 +68,7 @@ fn run(
     names: &[String],
     frames: u32,
     size: (u32, u32),
-    own: bool,
 ) -> (Rgba, String) {
-    // SAFETY: single-threaded tool; the variable is read when each movie opens.
-    unsafe {
-        std::env::set_var("THEDAS_UI_PLAYER", if own { "own" } else { "ruffle" });
-    }
     let mut stage = Stage::new(gpu.clone(), vfs, size);
     let t0 = Instant::now();
     stage.open_all(names);
@@ -119,8 +108,7 @@ fn run(
     (
         base,
         format!(
-            "{}: open {open:?}, {frames} ticks {ticks:?}, capture {cap:?}, steady tick+render {steady:?}\n  {}",
-            if own { "own" } else { "ruffle" },
+            "open {open:?}, {frames} ticks {ticks:?}, capture {cap:?}, steady tick+render {steady:?}\n  {}",
             log.join("\n  ")
         ),
     )
@@ -130,7 +118,7 @@ fn main() {
     env_logger::init();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
-        eprintln!("usage: sidebyside INSTALL OUT.png MOVIES [FRAMES] [WxH]");
+        eprintln!("usage: capture INSTALL OUT.png MOVIES [FRAMES] [WxH]");
         std::process::exit(2);
     }
     let install = thedas_vfs::DaoInstall::open(&args[1]).expect("install");
@@ -147,61 +135,8 @@ fn main() {
         .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
         .unwrap_or((1280u32, 720u32));
     let gpu = gpu();
-    let (a, ta) = run(&gpu, &vfs, &names, frames, size, false);
-    let (b, tb) = run(&gpu, &vfs, &names, frames, size, true);
-    println!("{ta}\n{tb}");
-    // An optional reference picture (the original game, same size) goes first.
-    let reference = args.get(6).and_then(|p| {
-        let f = std::fs::File::open(p).ok()?;
-        let mut d = png::Decoder::new(std::io::BufReader::new(f));
-        d.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-        let mut r = d.read_info().ok()?;
-        let mut buf = vec![0; r.output_buffer_size()?];
-        let info = r.next_frame(&mut buf).ok()?;
-        if (info.width, info.height) != size {
-            eprintln!(
-                "reference is {}x{}, not {}x{}",
-                info.width, info.height, size.0, size.1
-            );
-            return None;
-        }
-        let px: Vec<u8> = match info.color_type {
-            png::ColorType::Rgb => buf[..info.buffer_size()]
-                .chunks_exact(3)
-                .flat_map(|c| [c[0], c[1], c[2], 255])
-                .collect(),
-            _ => buf[..info.buffer_size()].to_vec(),
-        };
-        Some(Rgba {
-            width: size.0,
-            height: size.1,
-            pixels: px,
-        })
-    });
-    let gap = 8;
-    let mut imgs: Vec<&Rgba> = Vec::new();
-    if let Some(r) = &reference {
-        imgs.push(r);
-    }
-    imgs.push(&a);
-    imgs.push(&b);
-    let n = imgs.len() as u32;
-    let w = size.0 * n + gap * (n - 1);
-    let mut out = vec![0u8; (w * size.1 * 4) as usize];
-    for y in 0..size.1 as usize {
-        for (i, img) in imgs.iter().enumerate() {
-            let x0 = i * (size.0 + gap) as usize;
-            let src = &img.pixels[y * size.0 as usize * 4..(y + 1) * size.0 as usize * 4];
-            let _ = &x0;
-            let at = (y * w as usize + x0) * 4;
-            out[at..at + src.len()].copy_from_slice(src);
-        }
-    }
-    let png = thedas_ui::stage::encode_png(&Rgba {
-        width: w,
-        height: size.1,
-        pixels: out,
-    })
-    .expect("png");
+    let (frame, timing) = run(&gpu, &vfs, &names, frames, size);
+    println!("{timing}");
+    let png = thedas_ui::stage::encode_png(&frame).expect("png");
     std::fs::write(&args[2], png).expect("write");
 }
