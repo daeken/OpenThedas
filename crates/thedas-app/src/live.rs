@@ -285,6 +285,10 @@ pub struct Live {
     /// The creatures' head trackers, and the shaders' clock when they were last advanced.
     looks: crate::looks::Looks,
     looks_clock: Option<f64>,
+    /// The speaker's lip sync (see [`crate::faces`]).
+    faces: crate::faces::Faces,
+    /// The campaign's module (`single player`), for the lip sync's archives.
+    module: String,
     /// The shaders' clock (`ApplicationTime`), in seconds: real time, running while the
     /// world is stopped too.
     pub shader_time: f64,
@@ -645,6 +649,7 @@ impl Live {
             front_end: matches!(start, Start::Menu),
             paused: false,
             install: install.to_path_buf(),
+            module: module.to_string(),
             shaders: shaders.to_string(),
             level: None,
             objects: None,
@@ -685,6 +690,7 @@ impl Live {
             cut_light_model: None,
             looks: Default::default(),
             looks_clock: None,
+            faces: Default::default(),
             shader_time: 0.0,
             stage: None,
             staged: None,
@@ -1798,6 +1804,16 @@ impl Live {
             && sim.world.chargen.is_none()
             && sim.conversation_line().is_none();
         let hero = sim.world.controlled().or(sim.world.hero);
+        // The voiced conversation line's speaker, for its lip sync.
+        let spoken = crate::talkcam::line_speaker_and_listener(&sim)
+            .zip(crate::voice_line(&sim))
+            .filter(|(_, l)| !l.ambient)
+            .map(|((speaker, _), l)| crate::faces::SpokenLine {
+                speaker,
+                dialog: l.dialog,
+                strref: l.strref,
+                female: l.female,
+            });
         let glancers: Vec<ObjectId> = match (exploring, hero, self.looks.glance_reach()) {
             (true, Some(hero), Some(_)) => models
                 .iter()
@@ -1816,6 +1832,8 @@ impl Live {
             .looks_clock
             .map_or(0.0, |was| (self.shader_time - was).clamp(0.0, 0.25) as f32);
         self.looks_clock = Some(self.shader_time);
+        self.faces
+            .step(&self.install, &self.module, spoken, look_dt);
         // A cutscene's actors look where its head tracking actions say; the others as the
         // conversation has them.
         let mut wants: Vec<(ObjectId, Option<ObjectId>, f32)> = pairs
@@ -1967,6 +1985,14 @@ impl Live {
                         .is_some()
                 });
                 c.layers.extend(layers);
+            }
+            // Lip sync: the speaker's face, over everything else.
+            if let Some(c) = c.as_mut()
+                && let Some(face) =
+                    self.faces
+                        .layer(&level.vfs, m.id, m.morph.iter().chain(&m.models))
+            {
+                c.layers.push(face);
             }
             if let Some((held, t)) = self.scrub
                 && held == m.id

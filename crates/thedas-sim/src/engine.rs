@@ -1041,6 +1041,23 @@ pub fn call(
                 handle: Some(hd),
             })
         }
+        // DAOrigins.exe 0x65b0d0: the location moved to a safe spot by the safe-location
+        // search (see [`Sim::safe_location`]); an invalid location comes back as it is.
+        "GetSafeLocation" => {
+            let l = match h.sim.world.handle(handle(a, 0)) {
+                Some(EngineData::Location(l)) => h.sim.safe_location(*l),
+                _ => Location {
+                    area: OBJECT_INVALID,
+                    position: [0.0; 3],
+                    facing: 0.0,
+                },
+            };
+            let hd = h.sim.world.store(EngineData::Location(l));
+            ok(Value::Engine {
+                ty: ty.location,
+                handle: Some(hd),
+            })
+        }
         "GetPositionFromLocation"
         | "GetAreaFromLocation"
         | "GetFacingFromLocation"
@@ -1124,6 +1141,17 @@ pub fn call(
                 })
                 .unwrap_or(0),
         )),
+        // DAOrigins.exe 0x66be50 (function 813): the creature's answer to a restriction
+        // script's question (+0xc70), read by [`Sim::can_use_item`].
+        "SetCanUseItem" => {
+            h.sim.can_use_answers.insert(obj(a, 0), int(a, 1));
+            void()
+        }
+        // DAOrigins.exe 0x665710: 0x6ae8b0 on the creature and item ([`Sim::can_use_item`]).
+        "CanUseItem" => {
+            let ok_ = h.sim.can_use_item(obj(a, 0), obj(a, 1));
+            ok(Value::Int(ok_ as i32))
+        }
         "SetLocalInt" => {
             let k = local_name(h.sim, obj(a, 0), a, 1);
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {

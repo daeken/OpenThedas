@@ -771,6 +771,10 @@ pub struct Motion {
 /// out of and in combat.
 pub const COL_AMBIENT_TREE: u32 = 0x5009_76ec;
 pub const COL_COMBAT_TREE: u32 = 0xde80_b418;
+/// Dragon Age II's `apr_base` column naming the damage-reaction tree
+/// (`humanoid_damage_reactions.anb` for humanoids and hurlocks), which holds the deaths
+/// (`die_quick_*`). Its name is not known, only its hash; DA:O's table has no such column.
+pub const COL_DA2_REACTION_TREE: u32 = 0x3678_42f0;
 
 /// Actions in the trees (from `humanoid.anb`, `combat_humanoid.anb`, `movement.anb` and the
 /// weapon-style trees).
@@ -778,6 +782,8 @@ pub mod action {
     pub const PAUSE: &str = "pause";
     pub const RUN: &str = "runf";
     pub const DIE: &str = "die";
+    /// Dragon Age II's fall straight back (its damage-reaction tree's deaths).
+    pub const DA2_DIE: &str = "die_quick_straight_back";
     /// Ranged styles' shot.
     pub const FIRE: &str = "fire";
     /// Melee swings `attk_v1` to `attk_v6`; misses `miss_v1` to `miss_v4`.
@@ -851,11 +857,14 @@ pub fn motion(sim: &Sim, o: &Object) -> Option<Motion> {
     let style = weapon_style(sim, o).map(|s| format!("{s}.anb"));
     if o.dead {
         // From when it died, held on the last frame; a death of unknown time (a save from
-        // before deaths were timed) shows the last frame.
+        // before deaths were timed) shows the last frame. Dragon Age II's creatures die in
+        // their damage-reaction tree, whose deaths are named by the fall's direction; the
+        // straight fall back stands in for the one the original picks. Provisional.
         let time = o.died_at.map_or(f32::MAX, |t| secs(now.saturating_sub(t)));
+        let reactions = tree(COL_DA2_REACTION_TREE);
         return Some(Motion {
-            trees: trees(&[&style, &ambient, &combat]),
-            actions: vec![action::DIE.into()],
+            trees: trees(&[&style, &ambient, &combat, &reactions]),
+            actions: vec![action::DIE.into(), action::DA2_DIE.into()],
             time,
             looping: false,
         });
@@ -1675,7 +1684,8 @@ mod tests {
         }
         s.world.time_ms = 2_500;
         let m = motion(&s, s.world.get(id).unwrap()).unwrap();
-        assert_eq!(m.actions, vec![action::DIE]);
+        // DA:O trees name the death `die`; DA2's fall back is tried after it.
+        assert_eq!(m.actions, vec![action::DIE, action::DA2_DIE]);
         assert_eq!(m.trees, vec!["humanoid.anb", "combat_humanoid.anb"]);
         assert!(!m.looping);
         assert!((m.time - 1.5).abs() < 1e-6);

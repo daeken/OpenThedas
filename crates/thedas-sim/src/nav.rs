@@ -18,6 +18,12 @@ use crate::sim::Sim;
 /// The largest height change between neighbouring cells a walker can take, in metres.
 pub const MAX_STEP: f32 = 0.6;
 
+/// The radius of the body the safe-location search places (DAOrigins.exe 0xae7104).
+const SAFE_BODY_RADIUS: f32 = 0.5;
+
+/// How far round a point the safe-location search looks (DAOrigins.exe 0xae72fc).
+const SAFE_SEARCH_RADIUS: f32 = 20.0;
+
 /// Longest route searched, in cells expanded.
 const SEARCH_LIMIT: usize = 400_000;
 
@@ -622,6 +628,99 @@ impl Sim {
         })
     }
 
+    /// Where DAOrigins.exe's safe-location search (0x73e370) puts a body of the default
+    /// radius (0.5 m, 0xae7104) asked to stand at `l`, for `GetSafeLocation` (0x65b0d0).
+    /// A point that is walkable and free of other bodies is kept, on the floor. Otherwise
+    /// the original asks the physics scene for something to stand on there (0x6493e0) and
+    /// keeps the point unchanged if it finds it; only then does it search square rings round
+    /// the point, half a pathing cell apart and out to 20 m (0xae72fc): per ring the bottom
+    /// and top rows by rising x, then the left and right sides by rising y, the first free
+    /// point winning, on the floor. Nothing found leaves the point unchanged.
+    /// Provisional: there is no physics scene, so any point over the area's pathing grid
+    /// counts as having something to stand on (the rings then only run off the grid); the
+    /// body test (0x67cfa0) is read as other living bodies within reach, and the check from
+    /// the point to each ring candidate (0x67cfa0 again) as no wall between them. See
+    /// OpenThedas-testdata/notes/arrival-placement-trace.md.
+    pub fn safe_location(&mut self, l: crate::world::Location) -> crate::world::Location {
+        if !self
+            .world
+            .get(l.area)
+            .is_some_and(|o| o.kind == crate::world::ObjectKind::Area)
+        {
+            return l;
+        }
+        let Some(g) = self.nav_grid(l.area) else {
+            return l;
+        };
+        let on_floor = |p: [f32; 3]| match g.cell(p) {
+            Some(c) => [p[0], p[1], height(&g, c)],
+            None => p,
+        };
+        let free = |s: &Sim, p: [f32; 3]| {
+            on_walkable(&g, p) && !s.body_in_the_way(l.area, p, SAFE_BODY_RADIUS)
+        };
+        let p = l.position;
+        if free(self, p) {
+            return crate::world::Location {
+                position: on_floor(p),
+                ..l
+            };
+        }
+        if g.cell(p).is_some() {
+            return l;
+        }
+        let step = g.cell_size * 0.5;
+        if step <= 0.0 {
+            return l;
+        }
+        let ok = |s: &Sim, q: [f32; 3]| free(s, q) && !wall_between(&g, p, q);
+        let mut r = step;
+        while r <= SAFE_SEARCH_RADIUS {
+            let (x0, x1, y0, y1) = (p[0] - r, p[0] + r, p[1] - r, p[1] + r);
+            let mut x = x0;
+            while x <= x1 {
+                for y in [y0, y1] {
+                    let q = [x, y, p[2]];
+                    if ok(self, q) {
+                        return crate::world::Location {
+                            position: on_floor(q),
+                            ..l
+                        };
+                    }
+                }
+                x += step;
+            }
+            let mut y = y0 + step;
+            while y <= y1 - step {
+                for x in [x0, x1] {
+                    let q = [x, y, p[2]];
+                    if ok(self, q) {
+                        return crate::world::Location {
+                            position: on_floor(q),
+                            ..l
+                        };
+                    }
+                }
+                y += step;
+            }
+            r += step;
+        }
+        l
+    }
+
+    /// Whether a living creature's body in `area` reaches within `radius` of `p`.
+    fn body_in_the_way(&self, area: thedas_script::vm::ObjectId, p: [f32; 3], radius: f32) -> bool {
+        self.world.objects.values().any(|o| {
+            o.kind == crate::world::ObjectKind::Creature
+                && o.area == Some(area)
+                && o.active
+                && !o.dead
+                && o.parked.is_none()
+                && ((o.position[0] - p[0]).powi(2) + (o.position[1] - p[1]).powi(2)).sqrt()
+                    < radius + self.capsule_radius(o.id)
+        })
+    }
+
     /// The pathing grid of an area (by its object id), loaded once per layout.
     pub fn nav_grid(&mut self, area: thedas_script::vm::ObjectId) -> Option<Arc<NavGrid>> {
         let name = self.area_layout(area)?;
@@ -850,6 +949,72 @@ mod tests {
             heights: vec![0.0; (w * h) as usize],
             surfaces: Vec::new(),
         }
+    }
+
+    #[test]
+    fn safe_location_keeps_free_and_standable_points_and_searches_rings_off_the_grid() {
+        use crate::world::{Location, ObjectKind};
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        // 8x8 cells of 0.5 m from (10, 10), floor at 1 m; the cell at (11.25, 11.25) blocked.
+        let (w, h) = (8u32, 8u32);
+        let mut data = vec![1u8; (w * h) as usize];
+        data[(2 * w + 2) as usize] = 9;
+        s.area_layouts.insert(area, "open".into());
+        s.nav_grids.insert(
+            "open".into(),
+            Some(Arc::new(NavGrid {
+                columns: w,
+                rows: h,
+                cell_size: 0.5,
+                clearance: 2.0,
+                base: [10.0, 10.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                data,
+                heights: vec![16.0; (w * h) as usize],
+                surfaces: Vec::new(),
+            })),
+        );
+        let at = |p: [f32; 3]| Location {
+            area,
+            position: p,
+            facing: 1.0,
+        };
+        // Free and walkable: kept, on the floor.
+        let l = s.safe_location(at([12.25, 12.25, 3.0]));
+        assert_eq!((l.position, l.facing), ([12.25, 12.25, 1.0], 1.0));
+        // Blocked, but there is something to stand on: kept as it is.
+        assert_eq!(
+            s.safe_location(at([11.25, 11.25, 3.0])).position,
+            [11.25, 11.25, 3.0]
+        );
+        // Off the grid, 0.6 m left of it: the first ring point to reach it, its bottom row
+        // scanned first.
+        let l = s.safe_location(at([9.4, 12.0, 3.0]));
+        assert!(on_walkable(&s.loaded_nav_grid(area).unwrap(), l.position));
+        assert!((l.position[0] - 10.15).abs() < 1e-4, "{:?}", l.position);
+        assert!(
+            l.position[1] < 12.0 && l.position[2] == 1.0,
+            "{:?}",
+            l.position
+        );
+        // Another body on a free point: the point still counts as standable and is kept.
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let o = s.world.get_mut(c).unwrap();
+        o.area = Some(area);
+        o.position = [12.25, 12.25, 1.0];
+        assert_eq!(
+            s.safe_location(at([12.25, 12.25, 3.0])).position,
+            [12.25, 12.25, 3.0]
+        );
+        // Not an area: unchanged.
+        let l = Location {
+            area: c,
+            ..at([0.0, 0.0, 0.0])
+        };
+        assert_eq!(s.safe_location(l).position, [0.0, 0.0, 0.0]);
     }
 
     #[test]

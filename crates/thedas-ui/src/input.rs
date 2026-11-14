@@ -472,16 +472,20 @@ pub fn query(sim: &Sim, name: &str, args: &[String]) -> UiValue {
                     .is_some_and(|o| o.abilities.contains(&(int(1) as i32))),
         ),
         // `CreatureCanUseItem(item, creature)`: whether the creature may use the item;
-        // inventory.gfx dims the rows of items it cannot (`ItemEquippable_mc`). The exe's
-        // test (0x6ae8b0) checks the item's requirements against the creature. Provisional:
-        // requirements are not modelled yet, so any item and creature that exist pass.
-        "CreatureCanUseItem" => UiValue::Bool(
-            sim.world.get(who).is_some()
-                && u32::try_from(int(1))
-                    .ok()
-                    .and_then(|c| sim.world.get(c))
-                    .is_some(),
-        ),
+        // inventory.gfx dims the rows of items it cannot (`ItemEquippable_mc`). The exe
+        // answers with its check (0x6ae8b0); here the answer the simulation worked out when
+        // the screen opened ([`Sim::item_usable`], restriction scripts included). An item
+        // with no answer (picked up since) counts as usable.
+        "CreatureCanUseItem" => {
+            let creature = u32::try_from(int(1)).ok();
+            UiValue::Bool(
+                sim.world.get(who).is_some()
+                    && creature.is_some_and(|c| {
+                        sim.world.get(c).is_some()
+                            && sim.item_usable.get(&(c, who)).copied().unwrap_or(true)
+                    }),
+            )
+        }
         _ => UiValue::Undefined,
     }
 }
