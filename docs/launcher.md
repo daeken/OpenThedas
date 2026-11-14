@@ -5,6 +5,8 @@ finds an existing Dragon Age: Origins install, or helps the player get one from 
 
 ## Shape
 
+- `thedas-store` (library, no GPU): downloading the game from Steam or GOG with the
+  player's own account (see "Getting the game").
 - `thedas-launcher` (library, no GPU): install detection, the launcher's settings file, the
   mod list editor and the store links. Everything in it is plain file and registry reading, so
   it is unit tested with synthetic folders.
@@ -56,17 +58,67 @@ Save, and the first save keeps the old list as `mods.txt.bak`.
 
 ## Getting the game
 
-Handing off to the store's own client, never downloading game files ourselves:
+Two ways, side by side on the welcome page ("Don't have the game?"):
 
-- Steam: `steam://install/<id>` opens Steam's install dialog when the player owns it; the
-  store page otherwise. On macOS and Linux, Steam installs the Windows game only through
-  Proton or a CrossOver bottle, and the launcher says so.
-- GOG: `goggalaxy://openGameView/1949616134` for Galaxy on Windows, the store page otherwise.
-  On macOS the GOG offline installer runs in CrossOver; the wizard then finds the bottle.
+- **Download here** (`thedas-store`, the launcher's Download page): the player signs in to
+  their own Steam or GOG account and the launcher downloads the Windows game's files into a
+  folder (default `~/Games/<game>`, which the search looks in), then adds it as an install.
+  The files are all the engine needs, so on macOS and Linux no Steam client, Galaxy, Wine or
+  CrossOver is involved. Sera asked for this on 2026-11-14.
+- **The store's own client**: `steam://install/<id>` (Steam's install dialog), Galaxy's
+  `goggalaxy://openGameView/1949616134` on Windows, or the store pages; then search again.
 
-Later, not built: unpacking GOG's offline installer directly (an Inno Setup reader) so a Mac
-needs no Wine at all, and `steamcmd` with `+@sSteamCmdForcePlatformType windows` as a
-Valve-sanctioned download path on macOS and Linux.
+### Credentials are never saved
+
+Sera's rule: credentials are never saved, and only used for the download. The page says so
+on every view. In the code:
+
+- A typed password, a Steam Guard code and the GOG sign-in code move out of their text fields
+  into `thedas_store::Secret` (zeroed on drop, `[redacted]` in `Debug`) when they are used;
+  egui's state for those fields (its undo history) is wiped at the same moment.
+- Steam's and GOG's tokens live in memory, inside the download's session, and are dropped
+  with it. No refresh token is kept after the download (ask Sera before changing that).
+- Nothing is written to disk except the game's files: steamroom-client's `TokenStore`,
+  `ManifestCache` and `DepotConfig` are not used.
+- The HTTP and Steam libraries (`reqwest`, `hyper`, `h2`, `rustls`, `steamroom`) log only
+  warnings, whatever `RUST_LOG` says (`report.rs`), so no URL or header with a token reaches
+  the console or a report's log. `thedas-store` itself never logs a credential.
+
+### Steam
+
+Through `steamroom` / `steamroom-client` (MIT OR Apache-2.0), Steam's own client protocol:
+QR sign-in (scanned in the Steam mobile app, no password typed) or account name and password
+followed by a Steam Guard code or a confirmation in the app. Product info names the depots:
+those for Windows (or any OS) with a public manifest, in the chosen language or none (English
+when the language has no depot), skipping depots another app provides; DLC depots the account
+can't open are skipped. Each depot's key, then its manifest (every path checked to stay inside
+the folder, links refused), then `DepotJob` fetches, decrypts and checks each chunk. Origins
+downloads app 47810 (Ultimate Edition, all DLC), DA2 app 1238040.
+
+### GOG
+
+Origins only (GOG does not sell DA2). Provisional: written from public descriptions of GOG's
+content system and checked against GOG's public build and file lists for Origins (32,418
+files, 38.8 GB in English); the signed download addresses need an account and have not been
+seen working yet.
+
+- Sign-in happens on GOG's own page in the browser, so the launcher never sees the password.
+  GOG ends on `embed.gog.com/on_login_success?origin=client&code=...`; the player pastes that
+  address and the launcher takes the code. GOG Galaxy's public client id and secret are in
+  the repository for this (Sera's decision, 2026-11-14; the one exception to "no key material
+  in the repository").
+- `content-system.gog.com/products/1949616134/os/windows/builds?generation=2` lists builds; the
+  newest public generation-2 build's manifest (zlib JSON) names depots by language (`*` for
+  all). Each depot's file list is `gog-cdn-fastly.gog.com/content-system/v2/meta/aa/bb/<hash>`.
+- `secure_link` signs download addresses for the account (renewed every 15 minutes or when
+  refused; the access token is renewed with the in-memory refresh token on a long download).
+  Each chunk is fetched, its compressed MD5 checked, inflated, and its MD5 checked again.
+- Files land as `<name>.part` and are renamed when whole; a file already there at the right
+  size is kept, so starting again picks up where it stopped. Four files and twelve chunks at
+  a time.
+
+Later, not built: unpacking GOG's offline installer directly (an Inno Setup reader) for
+players who already downloaded it.
 
 ## Icon
 
@@ -81,13 +133,15 @@ build warns and goes on). `openthedas.icns` is for a future macOS app bundle.
 
 `thedas-app --launcher-capture out.png --launcher-page <page> --size 1920x1360
 --launcher-scale 2` draws a page (`welcome`, `search`, `keys`, `play`, `games`, `mods`,
-`settings`) offscreen and exits. It reads the settings of whatever `HOME` is set, so a scratch
+`settings`, `download`, `download-gog`, `download-progress`) offscreen and exits. It reads the settings of whatever `HOME` is set, so a scratch
 `HOME` with synthetic installs shows the pages without touching the player's.
 
 ## Slices
 
 1. Detection, settings, mod list editor, store links (`thedas-launcher`), with tests. Built.
 2. The wizard and launcher window in `thedas-app`. Built.
-3. Next: game configuration the in-game options screen does not cover; a launcher entry in
+3. Downloading from Steam and GOG in the launcher (`thedas-store`). Built; the GOG download
+   itself is untested without an account.
+4. Next: game configuration the in-game options screen does not cover; a launcher entry in
    the pause menu; a macOS app bundle using `openthedas.icns`; controller navigation of the
    launcher.

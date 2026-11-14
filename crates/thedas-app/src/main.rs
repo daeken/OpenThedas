@@ -63,6 +63,7 @@ mod icon;
 mod intro;
 mod journal;
 mod launcher;
+mod launcher_download;
 mod live;
 mod looks;
 mod modconv;

@@ -20,6 +20,9 @@ use egui::{Color32, RichText};
 use thedas_launcher::config::{GameKind, Install, LauncherConfig};
 use thedas_launcher::detect::{self, Found, Inspected, Os};
 use thedas_launcher::{ModFile, store};
+use thedas_store::Store;
+
+use crate::launcher_download::{Download, Want};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
@@ -27,11 +30,11 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 /// The emblem's gold and the dark red behind it.
-const GOLD: Color32 = Color32::from_rgb(0xe8, 0xa8, 0x4c);
-const GOLD_DIM: Color32 = Color32::from_rgb(0xb8, 0x80, 0x3c);
+pub(crate) const GOLD: Color32 = Color32::from_rgb(0xe8, 0xa8, 0x4c);
+pub(crate) const GOLD_DIM: Color32 = Color32::from_rgb(0xb8, 0x80, 0x3c);
 const BG: Color32 = Color32::from_rgb(0x26, 0x0d, 0x0b);
 const BG_DEEP: Color32 = Color32::from_rgb(0x17, 0x07, 0x06);
-const BAD: Color32 = Color32::from_rgb(0xff, 0x7a, 0x5c);
+pub(crate) const BAD: Color32 = Color32::from_rgb(0xff, 0x7a, 0x5c);
 
 /// What starting the game takes.
 #[derive(Clone, Debug, PartialEq)]
@@ -128,8 +131,16 @@ pub fn capture(out: &Path, page: &str, size: (u32, u32), scale: f32) -> Result<(
         "games" => Page::Games,
         "mods" => Page::Mods,
         "settings" => Page::Settings,
+        "download" | "download-gog" | "download-progress" => Page::Download,
         other => anyhow::bail!("no launcher page {other}"),
     };
+    if page == "download-gog" {
+        ui.dl.preset(GameKind::Origins, Store::Gog);
+    }
+    let demo = page == "download-progress";
+    if demo {
+        ui.dl.demo_running();
+    }
     if ui.page == Page::Search {
         ui.start_search(Page::Play);
         let started = Instant::now();
@@ -163,6 +174,7 @@ pub fn capture(out: &Path, page: &str, size: (u32, u32), scale: f32) -> Result<(
             .entry(egui::ViewportId::ROOT)
             .or_default()
             .native_pixels_per_point = Some(scale);
+        ui.demo = demo;
         let output = ctx.run_ui(input, |eui| ui.draw(eui));
         textures.append(output.textures_delta);
         shapes = Some((
@@ -221,6 +233,7 @@ enum Page {
     Games,
     Mods,
     Settings,
+    Download,
 }
 
 impl Page {
@@ -240,6 +253,9 @@ enum Action {
     OpenFolder(PathBuf),
     Search,
     Play,
+    PickDownloadDest,
+    /// The download page, set up for a game and store.
+    Download(GameKind, Store),
 }
 
 /// One install the search found, looked over.
@@ -270,6 +286,11 @@ struct Ui {
     emblem: Option<egui::TextureHandle>,
     os: Os,
     custom_size: String,
+    dl: Download,
+    /// The page the download page's Back returns to.
+    before_download: Page,
+    /// Screenshots only: draw the download page mid-download.
+    demo: bool,
 }
 
 const SIZES: &[&str] = &[
@@ -290,6 +311,7 @@ impl Ui {
         let mods = ModFile::load(&mods_path().unwrap_or_else(|| {
             thedas_vfs::mods::user_data_dir().join(thedas_vfs::mods::LIST_FILE)
         }));
+        let cfg_language = cfg.play.language.clone();
         Ui {
             custom_size: cfg.play.size.clone(),
             saved_cfg: cfg.clone(),
@@ -306,6 +328,9 @@ impl Ui {
             launch: None,
             emblem: None,
             os: Os::current(),
+            dl: Download::new(&cfg_language),
+            before_download: Page::Welcome,
+            demo: false,
         }
     }
 
@@ -457,6 +482,12 @@ impl Ui {
                         Page::Games => self.games_page(ui),
                         Page::Mods => self.mods_page(ui),
                         Page::Settings => self.settings_page(ui),
+                        Page::Download if self.demo => self.dl.draw_demo(ui),
+                        Page::Download => {
+                            if let Some(w) = self.dl.draw(ui) {
+                                self.download_wants(w);
+                            }
+                        }
                     });
             });
     }
@@ -535,6 +566,11 @@ impl Ui {
                             } else {
                                 Page::Welcome
                             };
+                        }
+                    }
+                    Page::Download => {
+                        if ui.button("Back").clicked() {
+                            self.page = self.before_download;
                         }
                     }
                     Page::Keys => {
@@ -1107,14 +1143,24 @@ impl Ui {
             .default_open(open)
             .show(ui, |ui| {
                 ui.label(
-                    "OpenThedas needs a copy of the game you own. These open the store's own \
-                     app or page; when it's installed, search again.",
+                    "OpenThedas needs a copy of the game you own. Download it here with your \
+                     Steam or GOG account (the sign-in is never saved), or use the store's own \
+                     app or page and search again once it's installed.",
                 );
                 for game in [GameKind::Origins, GameKind::Da2] {
                     ui.add_space(6.0);
                     ui.label(RichText::new(game.name()).strong());
                     let links = store::links(game, self.os);
                     ui.horizontal_wrapped(|ui| {
+                        for st in [Store::Steam, Store::Gog] {
+                            if st.sells(game)
+                                && ui
+                                    .add(big_button(&format!("Download from {}", st.name())))
+                                    .clicked()
+                            {
+                                self.actions.push(Action::Download(game, st));
+                            }
+                        }
                         for l in &links {
                             if ui.button(&l.label).clicked() {
                                 self.actions.push(Action::OpenUrl(l.url.clone()));
@@ -1127,11 +1173,52 @@ impl Ui {
                         .filter(|n| !n.is_empty())
                         .collect();
                     notes.dedup();
+                    // The notes are about the store's own app; a download here needs none of it.
                     for n in notes {
-                        ui.label(RichText::new(n).small().color(GOLD_DIM));
+                        ui.label(
+                            RichText::new(format!("With the store's own app: {n}"))
+                                .small()
+                                .color(GOLD_DIM),
+                        );
                     }
                 }
             });
+    }
+
+    fn download_wants(&mut self, w: Want) {
+        match w {
+            Want::OpenUrl(url) => self.actions.push(Action::OpenUrl(url)),
+            Want::PickDest => self.actions.push(Action::PickDownloadDest),
+            Want::Installed(root, st) => {
+                match self.add_root(root.clone(), format!("Downloaded from {}", st.name())) {
+                    Some(i) => {
+                        self.cfg.selected = Some(i);
+                        let name = self.cfg.installs[i].game.name();
+                        self.status = Some((format!("{name} is downloaded and ready."), false));
+                        if !self.cfg.wizard_done && self.keys_step_wanted() {
+                            self.page = Page::Keys;
+                        } else {
+                            self.finish_wizard();
+                        }
+                        self.save_config();
+                    }
+                    None => {
+                        self.status = Some((
+                            format!(
+                                "The download finished, but {} doesn't look like a game install.",
+                                root.display()
+                            ),
+                            true,
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the window should keep redrawing: a search or a download is running.
+    fn busy(&self) -> bool {
+        self.search.is_some() || self.dl.running()
     }
 
     // ---- actions ----
@@ -1226,6 +1313,21 @@ impl Ui {
                         self.status = Some((format!("Could not open the folder: {e}"), true));
                     }
                 }
+                Action::Download(game, st) => {
+                    self.dl.preset(game, st);
+                    if self.page != Page::Download {
+                        self.before_download = self.page;
+                    }
+                    self.page = Page::Download;
+                }
+                Action::PickDownloadDest => {
+                    if let Some(d) = rfd::FileDialog::new()
+                        .set_title("Choose where to put the game")
+                        .pick_folder()
+                    {
+                        self.dl.dest = Some(d);
+                    }
+                }
                 Action::Play => {
                     let Some(inst) = self.cfg.selected_install().cloned() else {
                         continue;
@@ -1273,7 +1375,7 @@ fn mod_name(line: &str, path: &Path) -> String {
 }
 
 /// A path for showing, with the home folder as `~`.
-fn tilde(p: &Path) -> String {
+pub(crate) fn tilde(p: &Path) -> String {
     let home = std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
@@ -1284,7 +1386,7 @@ fn tilde(p: &Path) -> String {
     }
 }
 
-fn big_button(text: &str) -> egui::Button<'static> {
+pub(crate) fn big_button(text: &str) -> egui::Button<'static> {
     egui::Button::new(
         RichText::new(text.to_string())
             .size(18.0)
@@ -1422,6 +1524,9 @@ impl LauncherApp {
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let Some(g) = self.gfx.as_mut() else { return };
         self.ui.poll_search();
+        if let Some(w) = self.ui.dl.poll() {
+            self.ui.download_wants(w);
+        }
         let input = g.state.take_egui_input(&g.window);
         let ui = &mut self.ui;
         let output = g.ctx.run_ui(input, |eui| ui.draw(eui));
@@ -1498,7 +1603,7 @@ impl LauncherApp {
             .viewport_output
             .get(&egui::ViewportId::ROOT)
             .is_some_and(|v| v.repaint_delay < Duration::from_millis(100));
-        if soon || self.ui.search.is_some() {
+        if soon || self.ui.busy() {
             g.window.request_redraw();
         }
     }
@@ -1540,8 +1645,8 @@ impl ApplicationHandler for LauncherApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // While the search runs, look for its result now and then.
-        if self.ui.search.is_some() {
+        // While a search or download runs, look for news now and then.
+        if self.ui.busy() {
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(100),
             ));
