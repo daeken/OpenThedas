@@ -59,6 +59,15 @@ pub enum SimCommand {
         name: String,
         value: Option<LocalValue>,
     },
+    /// Sets a creature's property (`properties.gda` id): its base, then its current value
+    /// (a depletable's: health, mana or stamina), each when given, as a script's
+    /// `SetCreatureProperty` does.
+    SetProperty {
+        target: ObjectId,
+        property: i32,
+        base: Option<f32>,
+        current: Option<f32>,
+    },
     /// Puts an object at `position`, turned to `facing` (degrees), at once: no walking,
     /// nothing triggered on the way.
     MoveObject {
@@ -210,6 +219,7 @@ impl SimCommand {
             SimCommand::SetPlotFlag { .. }
                 | SimCommand::StartConversation { .. }
                 | SimCommand::SetLocal { .. }
+                | SimCommand::SetProperty { .. }
                 | SimCommand::MoveObject { .. }
                 | SimCommand::CreateObject { .. }
                 | SimCommand::DestroyObject { .. }
@@ -264,6 +274,9 @@ pub enum CommandOutcome {
     /// The variable was set (or removed). `replaced` is what it held, of the same type
     /// (`None`: it was not there): setting it back undoes it.
     LocalSet { replaced: Option<LocalValue> },
+    /// The property was set; `base` and `current` are what it held (setting them back
+    /// undoes it).
+    PropertySet { base: f32, current: f32 },
     /// The object was moved; `from` and `from_facing` are where it was (moving it back
     /// undoes it).
     ObjectMoved { from: [f32; 3], from_facing: f32 },
@@ -368,6 +381,12 @@ impl Sim {
                 position,
                 facing,
             } => self.move_commanded(*target, *position, *facing),
+            SimCommand::SetProperty {
+                target,
+                property,
+                base,
+                current,
+            } => self.set_property_commanded(*target, *property, *base, *current),
             SimCommand::CreateObject {
                 kind,
                 template,
@@ -396,7 +415,9 @@ impl Sim {
                 .iter()
                 .filter_map(|&id| self.object_ref(id))
                 .collect(),
-            SimCommand::SetLocal { target, .. } | SimCommand::MoveObject { target, .. } => {
+            SimCommand::SetLocal { target, .. }
+            | SimCommand::MoveObject { target, .. }
+            | SimCommand::SetProperty { target, .. } => {
                 self.object_ref(*target).into_iter().collect()
             }
             SimCommand::CreateObject { .. } => match &outcome {
@@ -476,6 +497,7 @@ impl Sim {
             C::SetPlotFlag { .. }
             | C::StartConversation { .. }
             | C::SetLocal { .. }
+            | C::SetProperty { .. }
             | C::MoveObject { .. }
             | C::CreateObject { .. }
             | C::DestroyObject { .. } => false,
@@ -700,6 +722,70 @@ impl Sim {
     }
 
     /// How an object can be found again in another session.
+    /// [`SimCommand::SetProperty`], through the scripts' own path
+    /// ([`Sim::set_creature_property`]): base first, so the current value is clamped to the
+    /// new total.
+    fn set_property_commanded(
+        &mut self,
+        target: ObjectId,
+        property: i32,
+        base: Option<f32>,
+        current: Option<f32>,
+    ) -> CommandOutcome {
+        let refused = |reason: &str| CommandOutcome::Refused {
+            reason: reason.to_string(),
+        };
+        let Some(o) = self.world.get(target) else {
+            return refused("no such object");
+        };
+        if o.kind != ObjectKind::Creature {
+            return refused("only creatures have properties");
+        }
+        if crate::engine::property_bounds(self, property).is_none() {
+            return refused(&format!("property {property} is not in properties.gda"));
+        }
+        if base.into_iter().chain(current).any(|v| !v.is_finite()) {
+            return refused("the value is not a number");
+        }
+        let kind = crate::engine::property_kind(self, property);
+        if current.is_some() && kind != crate::engine::PropertyKind::Depletable {
+            return refused(&format!(
+                "property {property} has no current value (it is not depletable)"
+            ));
+        }
+        let (was_base, was_current) = o.properties.get(&property).copied().unwrap_or((0.0, 0.0));
+        let table = self.table.clone();
+        let c = |n: &str| crate::sim::constant(&table, n);
+        if let Some(v) = base {
+            let vt = c("PROPERTY_VALUE_BASE");
+            self.set_creature_property(
+                OBJECT_INVALID,
+                "mod mode".into(),
+                target,
+                property,
+                v,
+                vt,
+                false,
+            );
+        }
+        if let Some(v) = current {
+            let vt = c("PROPERTY_VALUE_CURRENT");
+            self.set_creature_property(
+                OBJECT_INVALID,
+                "mod mode".into(),
+                target,
+                property,
+                v,
+                vt,
+                false,
+            );
+        }
+        CommandOutcome::PropertySet {
+            base: was_base,
+            current: was_current,
+        }
+    }
+
     /// [`SimCommand::MoveObject`].
     fn move_commanded(
         &mut self,

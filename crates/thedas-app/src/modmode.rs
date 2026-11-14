@@ -263,7 +263,12 @@ impl ModMode {
                     && key.physical_key == PhysicalKey::Code(KeyCode::Escape)
                     && (self.picking || self.scrub.is_some())
                 {
-                    self.picking = false;
+                    // Escape ends picking, else lets go of a held animation.
+                    if self.picking {
+                        self.picking = false;
+                    } else {
+                        self.scrub = None;
+                    }
                     return Routed::Swallowed;
                 }
                 if self.ctx.egui_wants_keyboard_input() {
