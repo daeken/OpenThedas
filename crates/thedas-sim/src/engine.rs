@@ -1339,8 +1339,14 @@ pub fn call(
         "IsDead" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.dead))),
         "IsImmortal" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.immortal))),
         "SetImmortal" | "Engine_SetImmortal" => {
+            let origins = h.sim.game == thedas_vfs::Game::Origins;
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
                 o.immortal = int(a, 1) != 0;
+                // 0x6ad130 -> property 7 +0x30: write the floor without
+                // reclamping current. Other objects use the flag-only virtual.
+                if origins && o.kind == ObjectKind::Creature && o.properties.contains_key(&7) {
+                    o.health_floor_one = o.immortal;
+                }
             }
             void()
         }
@@ -2019,20 +2025,16 @@ pub fn call(
             if h.object(id).is_some_and(|o| {
                 o.kind == ObjectKind::Creature && (!origins || o.properties.contains_key(&p))
             }) {
-                let mut total = h.sim.property_total(id, p);
-                if name == "SetCreatureStamina" {
-                    // Depletable current setter 0x5bd800 caps usable stamina by its
-                    // reserved percentage (property 11), while GetMax returns nominal total.
-                    let reserved = h.sim.property_total(id, 11).clamp(0.0, 100.0);
-                    total *= 1.0 - reserved * 0.01;
-                }
                 let requested = int(a, 1) as f32;
                 let current = if origins {
-                    // 0x79c2d0 applies the floor first, then selects the total when it
-                    // is smaller or unordered. A negative total stays negative.
-                    let floored = requested.max(0.0);
-                    if total > floored { floored } else { total }
+                    h.sim.clamped_current(id, p, requested)
                 } else {
+                    let mut total = h.sim.property_total(id, p);
+                    if name == "SetCreatureStamina" {
+                        // Retain DA2's reserved-stamina setter, including its clamp order.
+                        let reserved = h.sim.property_total(id, 11).clamp(0.0, 100.0);
+                        total *= 1.0 - reserved * 0.01;
+                    }
                     requested.clamp(0.0, total.max(0.0))
                 };
                 if let Some(o) = h.sim.world.get_mut(id) {
@@ -3439,9 +3441,24 @@ pub fn call(
             }
         }
         "SetMaxHealth" => {
-            // PROPERTY_DEPLETABLE_HEALTH: base is the maximum, current is clamped to it.
-            let health = constant(&h.sim.table, "PROPERTY_DEPLETABLE_HEALTH");
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+            let id = obj(a, 0);
+            if h.sim.game == thedas_vfs::Game::Origins
+                && h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature)
+            {
+                // 0x65a330 -> 0x6ab5b0 writes existing health's CURRENT, after
+                // sign-extending the low 16 argument bits. The base stays put.
+                let current = h.sim.clamped_current(id, 7, f32::from(int(a, 1) as i16));
+                if let Some(v) = h
+                    .sim
+                    .world
+                    .get_mut(id)
+                    .and_then(|o| o.properties.get_mut(&7))
+                {
+                    v.1 = current;
+                }
+            } else if let Some(o) = h.sim.world.get_mut(id) {
+                // Other object virtuals and DA2 retain their provisional paths.
+                let health = constant(&h.sim.table, "PROPERTY_DEPLETABLE_HEALTH");
                 let max = int(a, 1) as f32;
                 let e = o.properties.entry(health).or_insert((max, max));
                 e.0 = max;
@@ -5542,11 +5559,16 @@ impl Sim {
                 o.properties.entry(p).or_insert((0.0, 0.0)).0 = value;
             }
         } else if vt == current && kind == PropertyKind::Depletable {
-            let max = self.depletable_current_ceiling(id, p);
+            let previous = self
+                .world
+                .get(id)
+                .and_then(|o| o.properties.get(&p))
+                .map_or(0.0, |e| e.1);
+            let v = if update { previous + value } else { value };
+            let v = self.clamped_current(id, p, v);
             if let Some(o) = self.world.get_mut(id) {
                 let e = o.properties.entry(p).or_insert((0.0, 0.0));
-                let v = if update { e.1 + value } else { value };
-                e.1 = v.clamp(0.0, max.max(0.0));
+                e.1 = v;
             }
         } else if vt == modifier && kind != PropertyKind::Simple {
             let gear = self.equipment_bonus(id, p);
@@ -7665,6 +7687,276 @@ mod tests {
         s.world.queue_destroy(0, follower);
         s.world.destroy_due();
         assert!(s.world.get(hero).unwrap().followers.is_empty());
+    }
+
+    fn health_floor_sim() -> Sim {
+        let table = EngineTable::parse(
+            b"int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
+              int PROPERTY_VALUE_TOTAL = 1;\n\
+              int PROPERTY_VALUE_BASE = 2;\n\
+              int PROPERTY_VALUE_CURRENT = 3;\n\
+              int PROPERTY_VALUE_MODIFIER = 4;\n\
+              void SetMaxHealth(object o, int n) = 1;\n\
+              void SetImmortal(object o, int n) = 2;\n\
+              void Engine_SetImmortal(object o, int n) = 3;\n\
+              void SetCreatureProperty(object o, int p, float v, int t) = 4;\n\
+              void UpdateCreatureProperty(object o, int p, float v, int t) = 5;\n\
+              void SetCreatureMana(object o, int n) = 6;",
+        )
+        .unwrap();
+        Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1)
+    }
+
+    #[test]
+    fn origins_set_max_health_writes_current_using_a_signed_short() {
+        let mut s = health_floor_sim();
+        let id = s.world.spawn(ObjectKind::Creature, "creature");
+        let o = s.world.get_mut(id).unwrap();
+        o.properties.insert(7, (40.0, 12.0));
+        o.modifiers.insert(7, 13.5);
+        o.dead = true;
+        o.active = false;
+        for (requested, expected) in [
+            (i32::MIN, 0.0),
+            (-65537, 0.0),
+            (-32769, 53.5),
+            (-32768, 0.0),
+            (-1, 0.0),
+            (0, 0.0),
+            (1, 1.0),
+            (30, 30.0),
+            (32767, 53.5),
+            (32768, 0.0),
+            (65535, 0.0),
+            (65536, 0.0),
+            (i32::MAX, 0.0),
+        ] {
+            let queued = s.world.queue.len();
+            run(
+                &mut s,
+                id,
+                "SetMaxHealth",
+                &[Value::Object(id), Value::Int(requested)],
+            );
+            let o = s.world.get(id).unwrap();
+            assert_eq!(o.properties[&7], (40.0, expected), "{requested}");
+            assert_eq!(o.modifiers[&7], 13.5);
+            assert!(o.dead);
+            assert!(!o.active);
+            assert_eq!(s.world.queue.len(), queued);
+        }
+        s.world.get_mut(id).unwrap().properties.remove(&7);
+        run(
+            &mut s,
+            id,
+            "SetMaxHealth",
+            &[Value::Object(id), Value::Int(90)],
+        );
+        assert!(!s.world.get(id).unwrap().properties.contains_key(&7));
+        run(
+            &mut s,
+            id,
+            "SetMaxHealth",
+            &[Value::Object(OBJECT_INVALID), Value::Int(90)],
+        );
+    }
+
+    #[test]
+    fn health_floor_is_distinct_from_the_flag_and_survives_our_saves_and_clones() {
+        let mut s = health_floor_sim();
+        let id = s.world.spawn(ObjectKind::Creature, "creature");
+        let o = s.world.get_mut(id).unwrap();
+        o.properties.insert(7, (40.0, 0.0));
+        o.immortal = true; // Flag-only construction/loading must not infer a floor.
+        let saved = s.save_json().unwrap();
+        assert!(
+            !std::str::from_utf8(&saved)
+                .unwrap()
+                .contains("health_floor_one")
+        );
+        s.load_json(&saved).unwrap();
+        run(
+            &mut s,
+            id,
+            "SetMaxHealth",
+            &[Value::Object(id), Value::Int(-1)],
+        );
+        assert_eq!(s.world.get(id).unwrap().properties[&7].1, 0.0);
+        for setter in ["SetImmortal", "Engine_SetImmortal"] {
+            for flag in [-2, 0, 2] {
+                let before = s.world.get(id).unwrap().properties[&7];
+                run(&mut s, id, setter, &[Value::Object(id), Value::Int(flag)]);
+                let o = s.world.get(id).unwrap();
+                assert_eq!(o.properties[&7], before, "the floor setter must not clamp");
+                assert_eq!(o.immortal, flag != 0);
+                assert_eq!(o.health_floor_one, flag != 0);
+                assert_eq!(o.clone().health_floor_one, flag != 0);
+                s.load_json(&s.save_json().unwrap()).unwrap();
+                run(
+                    &mut s,
+                    id,
+                    "SetMaxHealth",
+                    &[Value::Object(id), Value::Int(-1)],
+                );
+                assert_eq!(
+                    s.world.get(id).unwrap().properties[&7],
+                    (40.0, f32::from(flag != 0))
+                );
+            }
+        }
+        let absent = s.world.spawn(ObjectKind::Creature, "absent");
+        let chest = s.world.spawn(ObjectKind::Placeable, "chest");
+        s.world
+            .get_mut(chest)
+            .unwrap()
+            .properties
+            .insert(7, (40.0, 12.0));
+        for target in [absent, chest] {
+            run(
+                &mut s,
+                id,
+                "SetImmortal",
+                &[Value::Object(target), Value::Int(1)],
+            );
+            let o = s.world.get(target).unwrap();
+            assert!(o.immortal);
+            assert!(!o.health_floor_one);
+        }
+        assert!(!s.world.get(absent).unwrap().properties.contains_key(&7));
+        s.world
+            .get_mut(absent)
+            .unwrap()
+            .properties
+            .insert(7, (40.0, 12.0));
+        run(
+            &mut s,
+            id,
+            "SetMaxHealth",
+            &[Value::Object(absent), Value::Int(0)],
+        );
+        assert_eq!(s.world.get(absent).unwrap().properties[&7], (40.0, 0.0));
+        // Other virtuals and DA2 keep their previous paths in this creature-only slice.
+        for (game, target) in [
+            (thedas_vfs::Game::Origins, chest),
+            (thedas_vfs::Game::DragonAge2, id),
+        ] {
+            s.game = game;
+            s.world
+                .get_mut(target)
+                .unwrap()
+                .properties
+                .insert(7, (40.0, 12.0));
+            run(
+                &mut s,
+                id,
+                "SetMaxHealth",
+                &[Value::Object(target), Value::Int(30)],
+            );
+            assert_eq!(s.world.get(target).unwrap().properties[&7], (30.0, 12.0));
+        }
+    }
+
+    #[test]
+    fn depletable_writes_apply_the_health_floor_before_the_total() {
+        let mut s = health_floor_sim();
+        let id = s.world.spawn(ObjectKind::Creature, "creature");
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .properties
+            .insert(7, (40.0, 12.0));
+        run(
+            &mut s,
+            id,
+            "SetImmortal",
+            &[Value::Object(id), Value::Int(1)],
+        );
+        for (base, modifier, expected) in [
+            (40.0, 0.0, 1.0),
+            (0.5, 0.0, 0.5),
+            (0.0, 0.0, 0.0),
+            (40.0, -45.0, -5.0),
+        ] {
+            let o = s.world.get_mut(id).unwrap();
+            o.properties.insert(7, (base, 12.0));
+            o.modifiers.insert(7, modifier);
+            run(
+                &mut s,
+                id,
+                "SetMaxHealth",
+                &[Value::Object(id), Value::Int(-1)],
+            );
+            assert_eq!(s.world.get(id).unwrap().properties[&7], (base, expected));
+        }
+        s.world.get_mut(id).unwrap().modifiers.clear();
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .properties
+            .insert(7, (40.0, 0.0));
+        for setter in ["SetCreatureProperty", "UpdateCreatureProperty"] {
+            run(
+                &mut s,
+                id,
+                setter,
+                &[
+                    Value::Object(id),
+                    Value::Int(7),
+                    Value::Float(-10.0),
+                    Value::Int(3),
+                ],
+            );
+            assert_eq!(s.world.get(id).unwrap().properties[&7], (40.0, 1.0));
+        }
+        // Changing a base also runs the native current setter.
+        run(
+            &mut s,
+            id,
+            "SetCreatureProperty",
+            &[
+                Value::Object(id),
+                Value::Int(7),
+                Value::Float(0.5),
+                Value::Int(2),
+            ],
+        );
+        assert_eq!(s.world.get(id).unwrap().properties[&7], (0.5, 0.5));
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .properties
+            .insert(8, (40.0, 12.0));
+        run(
+            &mut s,
+            id,
+            "SetCreatureMana",
+            &[Value::Object(id), Value::Int(-1)],
+        );
+        assert_eq!(s.world.get(id).unwrap().properties[&8], (40.0, 0.0));
+        let o = s.world.get_mut(id).unwrap();
+        o.properties.insert(7, (f32::NAN, 12.0));
+        run(
+            &mut s,
+            id,
+            "SetMaxHealth",
+            &[Value::Object(id), Value::Int(30)],
+        );
+        assert!(s.world.get(id).unwrap().properties[&7].1.is_nan());
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .properties
+            .insert(7, (40.0, f32::NAN));
+        s.clamp_current(id, 7);
+        assert_eq!(s.world.get(id).unwrap().properties[&7].1, 1.0);
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .properties
+            .insert(7, (40.0, 0.0));
+        s.clamp_current(id, 7);
+        assert_eq!(s.world.get(id).unwrap().properties[&7].1, 0.0);
     }
 
     #[test]
