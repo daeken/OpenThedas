@@ -3088,6 +3088,13 @@ impl Sim {
         let Some(range) = self.ability_range(ability) else {
             return Approach::InReach;
         };
+        // DA2's native cast check includes the caster's personal space as
+        // well as the target bound (0x64111b..0x641153).
+        let range = if self.game == thedas_vfs::Game::DragonAge2 {
+            range + self.body_radius(id)
+        } else {
+            range
+        };
         let (to, reach) = match cmd.target.filter(|&t| t != id && t != OBJECT_INVALID) {
             Some(t) => match self.world.get(t) {
                 Some(o) if o.area == me.area => (o.position, range + self.body_radius(t)),
@@ -6235,6 +6242,7 @@ mod tests {
             &["#a7fa7789"],
             vec![
                 (5510, vec![Cell::Int(6)]),
+                (3110, vec![Cell::Int(1)]),
                 (7000, vec![Cell::Int(0)]),
                 (7001, vec![Cell::Int(8)]),
                 (7002, vec![Cell::Int(99)]),
@@ -6244,6 +6252,7 @@ mod tests {
             "#301",
             &["#814f8b88"],
             vec![
+                (1, vec![Cell::Float(1.5)]),
                 (6, vec![Cell::Float(35.)]),
                 (8, vec![Cell::Float(f64::NAN)]),
             ],
@@ -6284,6 +6293,15 @@ mod tests {
         assert!(matches!(
             s.ability_approach(caster, &cmd),
             Approach::Walk(..)
+        ));
+        s.world.get_mut(target).unwrap().position = [2.5, 0., 0.];
+        let mut melee = cmd;
+        melee.ints[0] = 3110;
+        // 1.5 m plus two fallback 0.6 m personal spaces. Counting only the
+        // target's radius would keep replanning an already valid melee cast.
+        assert!(matches!(
+            s.ability_approach(caster, &melee),
+            Approach::InReach
         ));
     }
 
