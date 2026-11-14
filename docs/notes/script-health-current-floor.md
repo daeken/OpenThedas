@@ -54,3 +54,35 @@ ordered plot writes and ending areas. Its only saved-state changes are
 Each belongs to an immortal creature with existing health; removing just
 those members makes all 35 complete states equal. No health, base,
 modifier, timing or other saved field differs in that sweep.
+
+## Combat and developer-heal review
+
+The independent property floor does not replace the combat scripts' protection.
+`Sim::apply_effect` in `combat.rs` dispatches `APPLY_EFFECT` to the creature's
+script, which forwards damage to `rules_core`. Its damage handler tests
+`IsImmortal` and explicitly writes current health 1 for a lethal hit. That
+`SetCreatureProperty` call reaches `Sim::set_creature_property` in `engine.rs`;
+both its set and update branches call `clamped_current`. A requested 1 remains
+1 with a normal positive total even when `health_floor_one` is false.
+`Sim::check_death` separately refuses to kill immortal or plot creatures.
+Plot targets reject damage before the health write: they keep their existing
+health, including 1 when starting at 1, as on main.
+
+The review probe applies 33 lethal hits per binary, including repeated hits
+after our save/reload, old saves lacking the floor member, all immortal/plot
+flag combinations, and an actual immortal template created through
+`CreateObject`. It retains a false floor and survives at 1 after becoming a
+hostile combat target. Mortal controls reach zero and die. Health/death results
+agree with main; only explicitly assigned floor metadata differs.
+
+A fresh extended s01–s16 comparison against main `d0a0e51a` records every
+existing health inspection and party health before/after each `healplayer`
+invocation. All 9,599 observations and 44 heal pairs per binary are
+byte-identical. The s12/s13 health audits contain 1,244/3,333 observations
+and 5/16 heal pairs, respectively; their story logs also match. The shipped
+developer heal uses current-property updates, not `SetMaxHealth`. All 32
+scenario exits succeed. Extending the chain retains 116 true floor members
+on 12 creatures across 18 of 35 saves; removing only those members makes
+the complete worlds equal. No current health, total, modifier or other field
+differs. Native load/death lifecycle questions outside this combat path
+remain open.
