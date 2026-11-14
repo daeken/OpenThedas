@@ -154,6 +154,15 @@ impl Animator {
         t.action(action)?.animation.clone()
     }
 
+    /// Whether action `action` of tree `tree` plays its animation once (field 4027), if the
+    /// tree has the action.
+    pub fn action_once(&mut self, vfs: &Vfs, tree: &str, action: &str) -> Option<bool> {
+        let t = load(&mut self.trees, vfs, &tree_resource(tree), |d| {
+            AnimTree::parse(d).ok()
+        })?;
+        Some(t.action(action)?.once)
+    }
+
     /// Whether animation `ani` plays once in the first of `trees` that has it (field 4027),
     /// if one does.
     pub fn plays_once(&mut self, vfs: &Vfs, trees: &[String], ani: &str) -> Option<bool> {
