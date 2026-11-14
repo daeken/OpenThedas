@@ -1064,6 +1064,29 @@ pub fn goto(vm: &mut Vm, d: DisplayId, frame: u16, play: bool) {
         Some(cur) if frame > cur => cur + 1,
         _ => 0,
     };
+    // On a rewind, retain an instance only when the target uses its original placement.
+    // Reusing a symbol after RemoveObject starts a new lifetime even at the same depth.
+    let mut origins = HashMap::new();
+    if forward_from == 0 {
+        for (fi, f) in tl
+            .frames
+            .iter()
+            .enumerate()
+            .take(cur.map_or(0, |f| f as usize + 1))
+        {
+            for cmd in &f.commands {
+                match cmd {
+                    Command::Remove { depth } => {
+                        origins.remove(&(*depth as i32 + DEPTH_OFFSET));
+                    }
+                    Command::Place(p) if !p.is_move => {
+                        origins.insert(p.depth as i32 + DEPTH_OFFSET, fi as u16);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     // Replay the commands from `forward_from` to `frame` into one final state per depth.
     let mut state: HashMap<i32, Option<Place>> = HashMap::new();
     if forward_from == 0 {
@@ -1106,7 +1129,11 @@ pub fn goto(vm: &mut Vm, d: DisplayId, frame: u16, play: bool) {
                         }
                         (false, _) => {
                             *entry = Some((**p).clone());
-                            replaced.insert(depth);
+                            if forward_from != 0 || origins.get(&depth) != Some(&fi) {
+                                replaced.insert(depth);
+                            } else {
+                                replaced.remove(&depth);
+                            }
                         }
                     }
                 }
@@ -1145,7 +1172,7 @@ pub fn goto(vm: &mut Vm, d: DisplayId, frame: u16, play: bool) {
                     })
                 });
                 if let Some(e) = existing {
-                    if p.is_move || (same_char && !replaced.contains(&depth)) || same_char {
+                    if p.is_move || (same_char && !replaced.contains(&depth)) {
                         let mut q = p.clone();
                         q.is_move = true;
                         place(vm, d, &q);
@@ -2624,6 +2651,95 @@ mod queue_tests {
         p.vm.call_method(&target, "attachBitmap", &[bitmap, Value::Number(1.0)]);
         assert!(p.vm.display.get(old).is_none());
         assert_eq!(p.vm.display.get(root).unwrap().children.len(), 1);
+    }
+
+    #[test]
+    fn goto_recreates_replaced_symbols_but_preserves_continuous_instances() {
+        let (mut p, _) = input_player();
+        let root = p.vm.root;
+        let mut movie = Movie::default();
+        movie.characters.insert(
+            1,
+            Character::Sprite(Arc::new(crate::swf::Timeline {
+                frames: vec![Default::default()],
+                labels: vec![],
+            })),
+        );
+        p.vm.movie = Arc::new(movie);
+        let placement = |depth, name: &str| {
+            Command::Place(Box::new(Place {
+                depth,
+                character: Some(1),
+                name: Some(name.into()),
+                ..Default::default()
+            }))
+        };
+        let timeline = Arc::new(crate::swf::Timeline {
+            frames: vec![
+                crate::swf::Frame {
+                    commands: vec![placement(2, "race_nav"), placement(3, "continuous")],
+                    ..Default::default()
+                },
+                crate::swf::Frame {
+                    commands: vec![Command::Remove { depth: 2 }],
+                    ..Default::default()
+                },
+                crate::swf::Frame {
+                    commands: vec![placement(2, "appearance_nav")],
+                    ..Default::default()
+                },
+                Default::default(),
+            ],
+            labels: vec![],
+        });
+        p.vm.display
+            .get_mut(root)
+            .unwrap()
+            .clip_mut()
+            .unwrap()
+            .timeline = timeline;
+        enter_frame_of(&mut p.vm, root, 0);
+        p.run_queue();
+        let first = p.vm.display.child_named(root, "race_nav").unwrap();
+        let continuous = p.vm.display.child_named(root, "continuous").unwrap();
+        let first_value = p.vm.display_object(first);
+        p.vm.set(&first_value, "callback", Value::from("race"));
+        let continuous_value = p.vm.display_object(continuous);
+        p.vm.set(&continuous_value, "callback", Value::from("retained"));
+        goto(&mut p.vm, root, 3, false);
+        p.run_queue();
+        let second = p.vm.display.child_named(root, "appearance_nav").unwrap();
+        assert_ne!(first, second);
+        assert!(p.vm.display.get(first).is_none());
+        assert!(p.vm.display.child_named(root, "race_nav").is_none());
+        let second_value = p.vm.display_object(second);
+        assert_eq!(p.vm.get(&second_value, "callback"), Value::Undefined);
+        p.vm.set(&second_value, "callback", Value::from("appearance"));
+        // Rewinding within the new instance's lifetime preserves its script state.
+        goto(&mut p.vm, root, 2, false);
+        assert_eq!(
+            p.vm.display.child_named(root, "appearance_nav"),
+            Some(second)
+        );
+        assert_eq!(
+            p.vm.get(&second_value, "callback"),
+            Value::from("appearance")
+        );
+        // Rewinding past the removal restores a fresh original instance.
+        goto(&mut p.vm, root, 0, false);
+        p.run_queue();
+        let restored = p.vm.display.child_named(root, "race_nav").unwrap();
+        assert_ne!(restored, first);
+        assert_ne!(restored, second);
+        assert!(p.vm.display.get(second).is_none());
+        assert_eq!(
+            p.vm.display.child_named(root, "continuous"),
+            Some(continuous)
+        );
+        assert_eq!(
+            p.vm.get(&continuous_value, "callback"),
+            Value::from("retained")
+        );
     }
 
     #[test]
