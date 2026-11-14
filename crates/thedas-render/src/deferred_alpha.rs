@@ -87,7 +87,27 @@ pub(crate) fn material(
     .flatten()
     .filter(|n| !n.eq_ignore_ascii_case("default_missing.dds"))
     .find_map(|n| cache.view(ctx, vfs, &n, TextureType::Tex2D))?;
-    let s = program.state.sampler_at(Some("smpDecal"), Some(0)).ok()?;
+    let sampler = sampler(ctx, program, "smpDecal", 0)?;
+    let (cmp, reference) = p.alpha_test.unwrap_or((CompareFunc::Always, 0));
+    Some(Material {
+        diffuse,
+        sampler,
+        test: [
+            comparison(cmp),
+            reference as f32,
+            opacity,
+            if character { -1.0 } else { 0.3 },
+        ],
+    })
+}
+
+pub(crate) fn sampler(
+    ctx: &GpuContext,
+    program: &D3dProgram,
+    name: &str,
+    stage: u32,
+) -> Option<wgpu::Sampler> {
+    let s = program.state.sampler_at(Some(name), Some(stage)).ok()?;
     let border = ctx
         .device
         .features()
@@ -104,7 +124,7 @@ pub(crate) fn material(
     };
     let uses_border =
         border && [s.address_u, s.address_v, s.address_w].contains(&AddressMode::Border);
-    let sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor {
+    Some(ctx.device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("deferred punch diffuse"),
         address_mode_u: address(s.address_u),
         address_mode_v: address(s.address_v),
@@ -124,18 +144,7 @@ pub(crate) fn material(
             },
         ),
         ..Default::default()
-    });
-    let (cmp, reference) = p.alpha_test.unwrap_or((CompareFunc::Always, 0));
-    Some(Material {
-        diffuse,
-        sampler,
-        test: [
-            comparison(cmp),
-            reference as f32,
-            opacity,
-            if character { -1.0 } else { 0.3 },
-        ],
-    })
+    }))
 }
 
 #[cfg(test)]

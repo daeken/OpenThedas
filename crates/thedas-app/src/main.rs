@@ -556,6 +556,7 @@ fn capture(
                         | "lighting"
                         | "specialized-gbuffer"
                         | "specialized-lighting"
+                        | "forward-lighting"
                         | "early-light-reject"
                         | "depth-lights"
                         | "terrain-layers"
@@ -566,7 +567,7 @@ fn capture(
                 )
             }) {
                 bail!(
-                    "THEDAS_BENCH_DEFERRED_COMPARE must be all, tiles, shadows, faithful, reflections, tile-frusta, light-masks, opaque-gbuffer, lighting, specialized-gbuffer, specialized-lighting, early-light-reject, depth-lights, terrain-layers, pass-cost, fronds, trees or tree-shadows"
+                    "THEDAS_BENCH_DEFERRED_COMPARE must be all, tiles, shadows, faithful, reflections, tile-frusta, light-masks, opaque-gbuffer, lighting, specialized-gbuffer, specialized-lighting, forward-lighting, early-light-reject, depth-lights, terrain-layers, pass-cost, fronds, trees or tree-shadows"
                 );
             }
             let comparison = std::env::var("THEDAS_BENCH_SHADOW_COMPARE").ok();
@@ -613,6 +614,8 @@ fn capture(
                             level
                                 .renderer
                                 .set_deferred_specialized_lighting(Some(enabled));
+                        } else if compare == "forward-lighting" {
+                            level.renderer.set_deferred_forward_lighting(Some(enabled));
                         } else if compare == "lighting" {
                             level.renderer.set_deferred_tight_tiles(Some(enabled));
                             level.renderer.set_deferred_light_masks(Some(enabled));
@@ -678,6 +681,7 @@ fn capture(
                     level.renderer.set_deferred_opaque_gbuffer(None);
                     level.renderer.set_deferred_specialized_gbuffer(None);
                     level.renderer.set_deferred_specialized_lighting(None);
+                    level.renderer.set_deferred_forward_lighting(None);
                     level.renderer.set_deferred_early_light_reject(None);
                     level.renderer.set_deferred_depth_lights(None);
                     level.renderer.set_deferred_direct_terrain_layers(None);
