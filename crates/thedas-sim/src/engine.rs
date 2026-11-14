@@ -256,6 +256,55 @@ pub(crate) fn cell_float(c: Option<&Cell>) -> f32 {
     }
 }
 
+fn upgradable_ability_data(
+    sim: &Sim,
+    id: ObjectId,
+    column: u32,
+    ability: i32,
+    floating: bool,
+) -> Option<(std::sync::Arc<crate::m2da::Table>, Vec<i64>)> {
+    let creature = sim
+        .world
+        .get(id)
+        .filter(|o| o.kind == ObjectKind::Creature)?;
+    let table = sim.world.tables.get(1, "")?;
+    let ability = i64::from(ability);
+    let cell = |row| table.cell_by_hash(column, row);
+    let mut rows = vec![ability];
+    let upgradeable = if floating {
+        cell_float(cell(0)) != 0.0
+    } else {
+        cell_int(cell(0)) != 0
+    };
+    if upgradeable && cell(ability).is_some() {
+        for upgrade in [0xd300_f4d9, 0xf82d_a71a, 0xe136_965b, 0xae77_009c] {
+            let id = cell_int(table.cell_by_hash(upgrade, ability));
+            if creature.abilities.contains(&id) {
+                rows.push(i64::from(id));
+            }
+        }
+    }
+    Some((table, rows))
+}
+
+pub(crate) fn upgradable_ability_int(sim: &Sim, id: ObjectId, column: u32, ability: i32) -> i32 {
+    let Some((table, rows)) = upgradable_ability_data(sim, id, column, ability, false) else {
+        return 0;
+    };
+    rows.into_iter().fold(0i32, |n, row| {
+        n.wrapping_add(cell_int(table.cell_by_hash(column, row)))
+    })
+}
+
+fn upgradable_ability_float(sim: &Sim, id: ObjectId, column: u32, ability: i32) -> f32 {
+    let Some((table, rows)) = upgradable_ability_data(sim, id, column, ability, true) else {
+        return 0.0;
+    };
+    rows.into_iter().fold(0.0, |n, row| {
+        n + cell_float(table.cell_by_hash(column, row))
+    })
+}
+
 pub(crate) fn cell_string(c: Option<&Cell>) -> String {
     match c {
         Some(Cell::Int(v)) => v.to_string(),
@@ -1681,48 +1730,12 @@ pub fn call(
         // row 0 marks which columns accept additions from the four learned upgrades.
         // Read the live ability set, so grants/removals and reload need no cached totals.
         "GetUpgradableAbilityHashedM2DAInt" | "GetUpgradableAbilityHashedM2DAFloat" => {
-            let Some(creature) = h
-                .object(obj(a, 0))
-                .filter(|o| o.kind == ObjectKind::Creature)
-            else {
-                return ok(if name.ends_with("Float") {
-                    Value::Float(0.0)
-                } else {
-                    Value::Int(0)
-                });
-            };
-            let table = h.sim.world.tables.get(1, "");
             let column = int(a, 1) as u32;
-            let ability = i64::from(int(a, 2));
-            let cell = |row| table.as_ref().and_then(|t| t.cell_by_hash(column, row));
-            let mut rows = vec![ability];
-            let upgradeable = if name.ends_with("Float") {
-                cell_float(cell(0)) != 0.0
-            } else {
-                cell_int(cell(0)) != 0
-            };
-            if upgradeable && cell(ability).is_some() {
-                for upgrade in [0xd300_f4d9, 0xf82d_a71a, 0xe136_965b, 0xae77_009c] {
-                    let id = cell_int(
-                        table
-                            .as_ref()
-                            .and_then(|t| t.cell_by_hash(upgrade, ability)),
-                    );
-                    if creature.abilities.contains(&id) {
-                        rows.push(i64::from(id));
-                    }
-                }
-            }
+            let ability = int(a, 2);
             ok(if name.ends_with("Float") {
-                Value::Float(
-                    rows.into_iter()
-                        .fold(0.0, |n, row| n + cell_float(cell(row))),
-                )
+                Value::Float(upgradable_ability_float(h.sim, obj(a, 0), column, ability))
             } else {
-                Value::Int(
-                    rows.into_iter()
-                        .fold(0i32, |n, row| n.wrapping_add(cell_int(cell(row)))),
-                )
+                Value::Int(upgradable_ability_int(h.sim, obj(a, 0), column, ability))
             })
         }
         "GetM2DARows" => ok(Value::Int(
