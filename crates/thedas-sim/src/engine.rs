@@ -867,6 +867,18 @@ pub fn call(
             if a.len() > 2 { int(a, 2) } else { 9 },
         ))),
         "IntToFloat" => ok(Value::Float(int(a, 0) as f32)),
+        "FloatToInt" if h.sim.game == thedas_vfs::Game::Origins => {
+            // 0x64f3f0 -> 0x8e34f0 uses the CRT's SSE2 truncating conversion.
+            // Its invalid result is i32::MIN, including NaNs and positive overflow.
+            let value = float(a, 0);
+            ok(Value::Int(
+                if (i32::MIN as f32..2147483648.0).contains(&value) {
+                    value as i32
+                } else {
+                    i32::MIN
+                },
+            ))
+        }
         "FloatToInt" => ok(Value::Int(float(a, 0) as i32)),
         "StringToInt" | "HexStringToInt" if h.sim.game == thedas_vfs::Game::Origins => {
             ok(Value::Int(origins_string_to_int(&string(a, 0))))
@@ -6342,6 +6354,51 @@ mod tests {
             );
         }
         assert!(convert(&mut s, "NaN").is_nan());
+    }
+
+    #[test]
+    fn origins_float_to_int_uses_the_native_sse2_invalid_result() {
+        let table = Arc::new(EngineTable::parse(b"int FloatToInt(float f) = 49;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for (value, expected, da2_expected) in [
+            (0.0, 0, 0),
+            (-0.0, 0, 0),
+            (f32::from_bits(1), 0, 0),
+            (-f32::from_bits(1), 0, 0),
+            (0.99, 0, 0),
+            (-0.99, 0, 0),
+            (1.0, 1, 1),
+            (-1.0, -1, -1),
+            (1.99, 1, 1),
+            (-1.99, -1, -1),
+            (f32::from_bits(0x4effffff), 2147483520, 2147483520),
+            (2147483648.0, i32::MIN, i32::MAX),
+            (f32::from_bits(0x4f000001), i32::MIN, i32::MAX),
+            (-2147483648.0, i32::MIN, i32::MIN),
+            (f32::from_bits(0xceffffff), -2147483520, -2147483520),
+            (f32::from_bits(0xcf000001), i32::MIN, i32::MIN),
+            (f32::MAX, i32::MIN, i32::MAX),
+            (f32::MIN, i32::MIN, i32::MIN),
+            (f32::INFINITY, i32::MIN, i32::MAX),
+            (f32::NEG_INFINITY, i32::MIN, i32::MIN),
+            (f32::NAN, i32::MIN, 0),
+            (-f32::NAN, i32::MIN, 0),
+            (f32::from_bits(0x7f800001), i32::MIN, 0),
+            (f32::from_bits(0xff800001), i32::MIN, 0),
+        ] {
+            for (game, result) in [
+                (thedas_vfs::Game::Origins, expected),
+                (thedas_vfs::Game::DragonAge2, da2_expected),
+            ] {
+                s.game = game;
+                assert_eq!(
+                    run(&mut s, 1, "FloatToInt", &[Value::Float(value)]),
+                    Some(Value::Int(result)),
+                    "{game:?}, float bits {:08x}",
+                    value.to_bits()
+                );
+            }
+        }
     }
 
     #[test]
