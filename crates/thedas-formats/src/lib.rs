@@ -24,6 +24,8 @@
 //! - [`probe`]: irradiance probes (`.mtx`), the diffuse light characters and props receive.
 //! - [`stage`]: conversation stages (`.stg`) and the shot each conversation line takes.
 //! - [`anim`]: animation trees (`.anb`), animation lengths (`.gad`) and events (`.evt`).
+//! - [`facefx`]: FaceFX lip sync: each voiced line's facial animation (`.fxe`) and the face
+//!   rigs (`.fxa`) it drives.
 //! - [`phy`]: collision models (`.phy`): the shapes rays and perception test against.
 //! - [`speedtree`]: SpeedTree 4 tree descriptions (`.spt`) for level vegetation.
 //! - [`speedtree_gen`]: growing SpeedTree trees from their descriptions (in progress).
@@ -44,6 +46,7 @@ pub mod bmat;
 pub mod cur;
 pub mod dds;
 pub mod emitter;
+pub mod facefx;
 pub mod fev;
 pub mod fsb;
 pub mod gda;
