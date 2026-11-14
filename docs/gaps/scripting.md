@@ -398,6 +398,7 @@ Dispatch summary: `engine::call` (`crates/thedas-sim/src/engine.rs:483`) matches
 - SCR-053 `SetCreatureMana` preserves an absent property and applies its initialized zero floor before the total ceiling, including negative or unordered totals ([trace](../notes/mana-property-floor.md)).
 - Effect constructors and accessors (Effect, Get/SetEffect*, GetHasEffects, GetEffects, RemoveEffect, RemoveAllEffects, RemoveEffectsByParameters, GetCurrentEffect, SetIsCurrentEffectValid, Engine_ApplyEffectOnObject, Engine_ApplyEffectOnParty).
 - Location functions (Location, GetLocation, SetLocationPosition/Facing, Get*FromLocation, IsLocationValid, GetDistanceBetweenLocations, AngleToVector, VectorToAngle, VectorToString).
+- SCR-001 Origins `IsDestroyable`/`SetDestroyable` read and write the independent CCObject flag, including its native true default and failed-lookup behavior ([trace](../notes/script-destroyability-flag.md)). Stage/map/map-pin casts, DA2 and placeable destruction remain outside this accessor slice.
 - Trigger enter/exit on movement and area entry.
 - Perception events (appear/disappear, stealth flag) and perception queries.
 - Area and module load events (with the order caveat in SCR-064).

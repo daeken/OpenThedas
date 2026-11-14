@@ -41,6 +41,10 @@ inventory; their state is tracked separately in the scripting gap list.
 
 ## Called unanswered declarations
 
+Later traced slice: Origins `IsDestroyable` and `SetDestroyable` now answer
+for the established CCObject kinds ([trace](script-destroyability-flag.md)).
+Their rows below remain part of this dated baseline snapshot.
+
 | function | id | calls | scripts |
 | --- | --- | --- | --- |
 | DEBUG_ConsoleCommand | 704 | 649 | 57 |
