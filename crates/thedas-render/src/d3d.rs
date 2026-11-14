@@ -80,6 +80,10 @@ pub struct D3dProgram {
     /// Translated with per-instance constants ([`Options::instanced`]): the SpeedTree
     /// programs, whose many placements go as instanced draws.
     pub instanced: bool,
+    /// The pixel shader with its alpha test as coverage ([`Options::alpha_to_coverage`]),
+    /// for multisampled frames: made for opaque passes whose test passes above its
+    /// reference. Same interface and constants as `ps`.
+    pub ps_coverage: Option<String>,
 }
 
 impl std::fmt::Debug for D3dProgram {
@@ -179,6 +183,24 @@ fn build(vfs: &Vfs, vs_name: &str, ps_name: &str, state_name: &str) -> Result<D3
         },
     )
     .map_err(|e| format!("{ps_name}: {e}"))?;
+    // Alpha-to-coverage for an opaque cut-out (see `Options::alpha_to_coverage`).
+    let ps_coverage = alpha_test
+        .filter(|(c, _)| matches!(c, Comparison::Gt | Comparison::Ge) && pass.blend.is_none())
+        .and_then(|_| {
+            translate::translate(
+                &ps,
+                &Options {
+                    color_targets: Some(1),
+                    alpha_test,
+                    alpha_ref_uniform: spt,
+                    instanced: spt,
+                    alpha_to_coverage: true,
+                    ..Default::default()
+                },
+            )
+            .ok()
+            .map(|t| t.wgsl)
+        });
     let extra: Vec<Semantic> = ps_t.interface.inputs.iter().map(|i| i.semantic).collect();
     let vs_t = translate::translate(
         &vs,
@@ -201,6 +223,7 @@ fn build(vfs: &Vfs, vs_name: &str, ps_name: &str, state_name: &str) -> Result<D3
         pass,
         state,
         instanced: spt,
+        ps_coverage,
     })
 }
 
