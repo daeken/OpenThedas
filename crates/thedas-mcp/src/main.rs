@@ -1244,7 +1244,24 @@ impl Server {
                 Some(t) => {
                     let id = resolve(sim, t).ok_or("no such object")?;
                     let o = sim.world.get(id).ok_or("no such object")?;
-                    (o.position, o.area)
+                    let (mut to, area) = (o.position, o.area);
+                    // A walk up to a creature stops against it, as the player's click does,
+                    // not on its spot: short of it by the two bodies, on the line from the
+                    // hero.
+                    let here = sim.world.get(hero).map(|h| (h.position, h.area));
+                    if o.kind == ObjectKind::Creature && id != hero {
+                        if let Some((h, _)) = here.filter(|(_, a)| *a == area) {
+                            let (dx, dy) = (h[0] - to[0], h[1] - to[1]);
+                            let d = (dx * dx + dy * dy).sqrt();
+                            let gap = sim.capsule_radius(hero) + sim.capsule_radius(id) + 0.05;
+                            if d > gap {
+                                to = [to[0] + dx * gap / d, to[1] + dy * gap / d, to[2]];
+                            } else {
+                                to = h;
+                            }
+                        }
+                    }
+                    (to, area)
                 }
                 None => (
                     [a.x.unwrap_or(0.0), a.y.unwrap_or(0.0), a.z.unwrap_or(0.0)],
