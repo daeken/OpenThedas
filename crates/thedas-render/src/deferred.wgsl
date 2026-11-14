@@ -33,8 +33,23 @@ struct Draw {
     falloff: vec4<f32>,
     // x: room index (0: none), y: mml_fSpecularReflectionMult
     room: vec4<f32>,
-    probe: array<vec4<f32>, 12>,
     terrain: Terrain,
+    probe: array<vec4<f32>, 12>,
+    tint: array<vec4<f32>, 10>,
+    material: vec4<f32>,
+    tint_color: vec4<f32>,
+    character: Character,
+};
+
+struct Character {
+    age: array<vec4<f32>, 6>,
+    emotion: array<vec4<f32>, 2>,
+    hair_weights: array<vec4<f32>, 2>,
+    hair_colour: vec4<f32>,
+    tattoo: array<vec4<f32>, 5>,
+    specular: array<vec4<f32>, 3>,
+    ambient: vec4<f32>,
+    eye: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -54,12 +69,17 @@ struct Draw {
 @group(1) @binding(10) var point_smp: sampler;
 @group(1) @binding(11) var terrain_diffuse: texture_2d<f32>;
 @group(1) @binding(12) var terrain_normal: texture_2d<f32>;
+@group(1) @binding(13) var tint_tex: texture_2d<f32>;
+@group(1) @binding(14) var emissive_tex: texture_2d<f32>;
+@group(1) @binding(15) var face_age_tex: texture_2d<f32>;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) uv0: vec2<f32>,
     @location(3) uv1: vec2<f32>,
+    @location(4) weights: vec4<f32>,
+    @location(5) indices: vec4<f32>,
 };
 
 struct VsOut {
@@ -69,24 +89,33 @@ struct VsOut {
     @location(2) normal: vec3<f32>,
     @location(3) world: vec3<f32>,
     @location(4) terrain_falloff: f32,
+    @location(5) irradiance: vec3<f32>,
 };
 
 @vertex
 fn vs_gbuffer(v: VsIn) -> VsOut {
     let f = draw;
+    let position = skin_vector(vec4<f32>(v.position, 1.0), v.weights, v.indices);
+    let normal = skin_vector(vec4<f32>(v.normal, 0.0), v.weights, v.indices);
     var out: VsOut;
     // As Static1.vsh does it (`mul`, `mad`, `mad`, `add` by the matrix's columns), so the
     // depth matches what the original shaders write for the same surface.
-    var r = f.mvp[1] * v.position.y;
-    r = v.position.x * f.mvp[0] + r;
-    r = v.position.z * f.mvp[2] + r;
+    var r = f.mvp[1] * position.y;
+    r = position.x * f.mvp[0] + r;
+    r = position.z * f.mvp[2] + r;
     let p = r + f.mvp[3];
     out.clip = vec4<f32>(p.x + frame.fixup.x * p.w, p.y - frame.fixup.y * p.w, p.z, p.w);
     out.uv0 = v.uv0;
     out.uv_lm = select(v.uv1, v.uv0, f.room.z > 0.5) * f.lightmap.zw + f.lightmap.xy;
-    out.normal = (f.world * vec4<f32>(v.normal, 0.0)).xyz;
-    out.world = (f.world * vec4<f32>(v.position, 1.0)).xyz;
+    out.normal = (f.world * vec4<f32>(normal, 0.0)).xyz;
+    out.world = (f.world * vec4<f32>(position, 1.0)).xyz;
     out.terrain_falloff = 2.0 - length(frame.eye.xyz - out.world) / 32.0;
+    out.irradiance = vec3<f32>(0.0);
+    if (draw.material.x > 0.5) {
+        // Character/prop shaders interpolate probe light from posed vertex normals;
+        // normal maps change direct lighting, not the probe's coarse baked lobes.
+        out.irradiance = object_probe(normalize(out.normal));
+    }
     return out;
 }
 
@@ -170,6 +199,43 @@ fn surface(in: VsOut) -> Surface {
     return surface_normal(in, textureSample(normal_tex, wrap_smp, in.uv0));
 }
 
+fn object_probe(n: vec3<f32>) -> vec3<f32> {
+    let v = vec4<f32>(n, 1.0);
+    var result: vec3<f32>;
+    for (var c = 0u; c < 3u; c += 1u) {
+        let row = c * 4u;
+        result[c] = max(dot(v, vec4<f32>(dot(draw.probe[row], v), dot(draw.probe[row + 1u], v),
+            dot(draw.probe[row + 2u], v), dot(draw.probe[row + 3u], v))), 0.0);
+    }
+    return result;
+}
+
+// Lerped tint semantics: independent diffuse/specular opacities, interleaved colours.
+fn tint_mode(base: vec3<f32>, mask: vec4<f32>, specular: bool, mode: f32) -> vec3<f32> {
+    let channel = select(0u, 1u, specular);
+    let weights = mask * draw.tint[channel];
+    if (mode > 1.5 && !specular) {
+        let skin_colour = base * mix(vec3<f32>(1.0), draw.tint[8].rgb, weights.w);
+        let colour = draw.tint[2].rgb * weights.x + draw.tint[4].rgb * weights.y + draw.tint[6].rgb * weights.z;
+        let opacity = weights.x + weights.y + weights.z;
+        if (mode > 2.5) {
+            return mix(skin_colour, colour, opacity);
+        }
+        return skin_colour * mix(vec3<f32>(1.0), colour, opacity);
+    }
+    var colour = vec3<f32>(0.0);
+    let channels = select(4u, 3u, mode > 2.5);
+    for (var k = 0u; k < channels; k += 1u) {
+        colour += draw.tint[2u + k * 2u + channel].rgb * weights[k];
+    }
+    let opacity = weights.x + weights.y + weights.z + select(weights.w, 0.0, mode > 2.5);
+    return mix(base, colour, opacity);
+}
+
+fn object_tint(base: vec3<f32>, mask: vec4<f32>, specular: bool) -> vec3<f32> {
+    return tint_mode(base, mask, specular, draw.material.z);
+}
+
 struct TerrainMaterial {
     albedo: vec4<f32>,
     normal: vec4<f32>,
@@ -223,8 +289,112 @@ fn terrain_material(uv: vec2<f32>) -> TerrainMaterial {
     return result;
 }
 
+// Face textures reuse the terrain-only and ordinary specular/emissive slots. This keeps
+// the material plus sun bindings inside the portable sixteen-texture fragment limit.
+fn face_material(uv: vec2<f32>) -> TerrainMaterial {
+    let emo0 = textureSample(mask_a, clamp_smp, uv);
+    let emo1 = textureSample(mask_a2, clamp_smp, uv);
+    let base = textureSample(diffuse_tex, wrap_smp, uv);
+    let aged = textureSample(face_age_tex, wrap_smp, uv);
+    let tint = textureSample(tint_tex, wrap_smp, uv);
+    let normal = textureSample(normal_tex, wrap_smp, uv);
+    let age_normal = textureSample(spec_tex, wrap_smp, uv);
+    let emotion_normal = textureSample(lightmap_tex, clamp_smp, uv);
+    let hair = textureSample(emissive_tex, wrap_smp, uv);
+    let hair_normal = textureSample(terrain_diffuse, clamp_smp, uv);
+    let tattoo = textureSample(terrain_normal, clamp_smp, uv);
+    return compose_face(base, aged, normal, age_normal, emotion_normal, emo0, emo1,
+        tint, hair, hair_normal, tattoo);
+}
+
+// Texture-independent composition is also exercised by the asset-free GPU fixture.
+fn compose_face(base: vec4<f32>, aged: vec4<f32>, normal: vec4<f32>, age_normal: vec4<f32>,
+    emotion_normal: vec4<f32>, emo0: vec4<f32>, emo1: vec4<f32>, tint: vec4<f32>,
+    hair: vec4<f32>, hair_normal: vec4<f32>, tattoo: vec4<f32>) -> TerrainMaterial {
+    let c = draw.character;
+    let colour_age = min(dot(emo0, c.age[0]) + dot(emo1, c.age[1]) + c.age[2].w, 1.0);
+    let normal_age = min(dot(emo0, c.age[3]) + dot(emo1, c.age[4]) + c.age[5].w, 1.0);
+    let expression = dot(emo0, c.emotion[0]) + dot(emo1, c.emotion[1]);
+    let hair_coverage = clamp(mix(dot(hair, c.hair_weights[1]), dot(hair, c.hair_weights[0]),
+        clamp(emo1.r + emo1.g + emo1.b, 0.0, 1.0)), 0.0, 1.0);
+    let xy = mix(normal.wy, age_normal.wy, normal_age)
+        + (emotion_normal.wy - vec2<f32>(0.5)) * expression
+        + (hair_normal.wy - vec2<f32>(0.5)) * hair_coverage;
+    var colour = mix(base, aged, colour_age);
+    colour = vec4<f32>(colour.rgb * mix(vec3<f32>(1.0), draw.tint[8].rgb, tint.a), colour.a);
+    let tattoo_weights = tattoo * c.tattoo[0];
+    let tattoo_colour = tattoo_weights.x * c.tattoo[1].rgb + tattoo_weights.y * c.tattoo[2].rgb
+        + tattoo_weights.z * c.tattoo[3].rgb + tattoo_weights.w * c.tattoo[4].rgb;
+    colour = vec4<f32>(colour.rgb * mix(vec3<f32>(1.0), tattoo_colour,
+        clamp(dot(tattoo_weights, vec4<f32>(1.0)), 0.0, 1.0)), colour.a);
+    colour = vec4<f32>(mix(colour.rgb, c.hair_colour.rgb, hair_coverage), colour.a);
+    let weights = tint.rgb * draw.tint[0].rgb;
+    let tint_colour = weights.x * draw.tint[2].rgb + weights.y * draw.tint[4].rgb + weights.z * draw.tint[6].rgb;
+    colour = vec4<f32>(mix(colour.rgb, tint_colour, clamp(dot(weights, vec3<f32>(1.0)), 0.0, 1.0)), colour.a);
+    let unmasked = 1.0 - clamp(dot(emo0 + emo1, vec4<f32>(1.0)) + tint.r, 0.0, 1.0);
+    let roughness = clamp(dot(emo0, c.specular[0]) + dot(emo1, c.specular[1])
+        + tint.r * c.specular[2].x + unmasked * c.specular[2].y, 0.02, 1.0);
+    // A single Blinn lobe approximates the skin BRDF lookup; authored regional
+    // roughness and diffuse alpha still control its power and amount.
+    let power = clamp(2.0 / (roughness * roughness) - 2.0, 1.0, 256.0);
+    // A modest dielectric reflectance keeps this unnormalised Blinn approximation
+    // from turning the face's detail into bright metallic-looking highlights.
+    let amount = 0.04 * max(colour.a * (1.0 - hair_coverage), 0.0);
+    let spec_weights = tint.rgb * draw.tint[1].rgb;
+    let spec_colour = spec_weights.x * draw.tint[3].rgb + spec_weights.y * draw.tint[5].rgb
+        + spec_weights.z * draw.tint[7].rgb;
+    let skin_spec = vec3<f32>(amount) * mix(vec3<f32>(1.0), draw.tint[9].rgb, tint.a);
+    var out: TerrainMaterial;
+    out.albedo = colour;
+    out.normal = vec4<f32>(0.5, xy.y, 0.5, xy.x);
+    out.specular = vec4<f32>(mix(skin_spec, spec_colour,
+        clamp(dot(spec_weights, vec3<f32>(1.0)), 0.0, 1.0)), (power - 1.0) / 255.0);
+    return out;
+}
+
+fn eye_material(uv: vec2<f32>) -> TerrainMaterial {
+    let base = textureSample(diffuse_tex, wrap_smp, uv);
+    let tint = textureSample(tint_tex, wrap_smp, uv);
+    let normal = textureSample(normal_tex, wrap_smp, uv);
+    let cornea = textureSample(spec_tex, wrap_smp, uv);
+    return compose_eye(base, tint, normal, cornea);
+}
+
+fn compose_eye(base: vec4<f32>, tint: vec4<f32>, normal: vec4<f32>, cornea: vec4<f32>) -> TerrainMaterial {
+    let weights = tint.rgb * draw.tint[0].rgb;
+    let colour = weights.x * draw.tint[2].rgb + weights.y * draw.tint[4].rgb + weights.z * draw.tint[6].rgb;
+    let e = draw.character.eye;
+    let cornea_amount = base.a * e.y;
+    let sclera_amount = (1.0 - base.a) * e.w;
+    let total = max(cornea_amount + sclera_amount, 0.0);
+    let blend = clamp(cornea_amount / max(total, 1e-6), 0.0, 1.0);
+    var out: TerrainMaterial;
+    out.albedo = vec4<f32>(mix(base.rgb, colour, dot(weights, vec3<f32>(1.0))), 1.0);
+    // The G-buffer stores one lobe: preserve each authored normal and power by its
+    // corresponding mask, approximating their separate forward highlights.
+    out.normal = mix(normal, cornea, blend);
+    out.specular = vec4<f32>(vec3<f32>(total), (clamp(mix(e.z, e.x, blend), 1.0, 256.0) - 1.0) / 255.0);
+    return out;
+}
+
 @fragment
 fn fs_gbuffer(in: VsOut) -> GBuffer {
+    if (draw.material.w > 0.5) {
+        var m: TerrainMaterial;
+        if (draw.material.w < 1.5) {
+            m = face_material(in.uv0);
+        } else {
+            m = eye_material(in.uv0);
+        }
+        let s = surface_normal(in, m.normal);
+        var out: GBuffer;
+        out.albedo = vec4<f32>(mix(m.albedo.rgb, draw.tint_color.rgb, draw.tint_color.a), 192.0 / 255.0);
+        out.specular = m.specular;
+        out.normal = vec4<f32>(oct_encode(s.n), draw.room.x, 1.0);
+        let ambient = select(vec3<f32>(1.0), draw.character.ambient.rgb, draw.material.w < 1.5);
+        out.lightmap = vec4<f32>(in.irradiance * ambient, 1.0);
+        return out;
+    }
     if (draw.room.z > 0.5) {
         let m = terrain_material(in.uv0);
         let s = surface_normal(in, m.normal);
@@ -244,7 +414,16 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
     out.specular = textureSample(spec_tex, wrap_smp, in.uv0);
     out.normal = vec4<f32>(oct_encode(s.n), draw.room.x, s.falloff);
     out.lightmap = textureSample(lightmap_tex, clamp_smp, in.uv_lm);
-    if (frame.fog.w > 0.5) {
+    if (draw.material.x > 0.5) {
+        out.albedo.a = select(64.0 / 255.0, 192.0 / 255.0, draw.material.x > 1.5);
+        out.lightmap = vec4<f32>(in.irradiance, 1.0);
+        if (draw.material.z > 0.5) {
+            let mask = textureSample(tint_tex, wrap_smp, in.uv0);
+            out.albedo = vec4<f32>(object_tint(out.albedo.rgb, mask, false), out.albedo.a);
+            out.specular = vec4<f32>(object_tint(out.specular.rgb, mask, true), out.specular.a);
+        }
+        out.albedo = vec4<f32>(mix(out.albedo.rgb, draw.tint_color.rgb, draw.tint_color.a), out.albedo.a);
+    } else if (frame.fog.w > 0.5) {
         out.lightmap = vec4<f32>(probe_irradiance(s.n), 1.0);
     }
     return out;
@@ -256,6 +435,9 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
 // and the falloff.
 @fragment
 fn fs_env(in: VsOut) -> @location(0) vec4<f32> {
+    if (draw.material.w > 0.5) {
+        return vec4<f32>(0.0);
+    }
     if (draw.room.z > 0.5) {
         let m = terrain_material(in.uv0);
         let s = surface_normal(in, m.normal);
@@ -270,14 +452,18 @@ fn fs_env(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>((reflection + m.albedo.rgb * draw.terrain.tint.rgb) * fog, 1.0);
     }
     let s = surface(in);
-    let specular = textureSample(spec_tex, wrap_smp, in.uv0);
+    var specular = textureSample(spec_tex, wrap_smp, in.uv0);
+    if (draw.material.x > 0.5 && draw.material.z > 0.5) {
+        specular = vec4<f32>(object_tint(specular.rgb, textureSample(tint_tex, wrap_smp, in.uv0), true), specular.a);
+    }
     let r = 2.0 * dot(s.n, s.v) * s.n - s.v;
     let power = specular.a * 255.0 + 1.0;
     let env = textureSampleLevel(env_tex, wrap_smp, r, (1.0 - power / 255.0) * 9.0).rgb;
     // Fogged as the rest of Static1's colour is: what is added comes through at the fog factor.
     let to_eye = in.world - frame.eye.xyz;
     let f = max(min(exp(-dot(to_eye, to_eye) * frame.fog.x), 1.0), frame.fog.y);
-    return vec4<f32>(env * draw.room.y * specular.rgb * s.falloff * f, 1.0);
+    let emissive = textureSample(emissive_tex, wrap_smp, in.uv0).rgb * draw.material.y;
+    return vec4<f32>((env * draw.room.y * specular.rgb * s.falloff + emissive) * f, 1.0);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -451,6 +637,11 @@ fn reaches(l: Light, room: u32) -> bool {
     return (bits & (1u << (room % 32u))) != 0u;
 }
 
+fn point_uses_baked_mask(is_static: bool, material: u32) -> bool {
+    // Props and characters have probes, not baked direct-light visibility.
+    return is_static && material != 64u && material != 192u;
+}
+
 fn world_at(pixel: vec2<i32>, depth: f32) -> vec3<f32> {
     // Pixel centres minus the half-pixel fix-up are integer pixel coordinates.
     let ndc = vec2<f32>(f32(pixel.x) / lighting.size.x * 2.0 - 1.0,
@@ -519,8 +710,11 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
     let ga = textureLoad(g_albedo, px, 0);
     let albedo = ga.rgb;
-    let terrain = ga.a > 0.25;
-    let terrain_low = terrain && ga.a < 0.75;
+    let material = u32(round(ga.a * 255.0));
+    let terrain = material == 128u || material == 255u;
+    let terrain_low = material == 128u;
+    let character = material == 192u;
+    let object = material == 64u || character;
     let spec = textureLoad(g_specular, px, 0);
     let gn = textureLoad(g_normal, px, 0);
     let lm = textureLoad(g_lightmap, px, 0);
@@ -538,6 +732,9 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     var spec_d = vec3<f32>(0.0);
     for (var i = 0u; i < lighting.counts.x; i = i + 1u) {
         let l = lights[i];
+        if ((character && l.shadow.y < 1.5) || (!character && l.shadow.y > 1.5 && l.shadow.y < 2.5)) {
+            continue;
+        }
         if (lighting.counts.y != 7u && !reaches(l, room)) {
             continue;
         }
@@ -569,7 +766,9 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         }
         let dif = att * ndl * l.colour.rgb * shade;
         let sp = att * pow(ndh, power) * l.colour.rgb * shade;
-        if (l.colour.w > 0.5) {
+        // Objects have no baked direct visibility. Their point lights use their own
+        // cube visibility, never the sun's mask or Static1's grazing-angle floor.
+        if (point_uses_baked_mask(l.colour.w > 0.5, material)) {
             diff_s = diff_s + dif;
             spec_s = spec_s + sp;
         } else {
@@ -587,14 +786,14 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             spec_s = spec_s + pow(ndh, power) * lighting.sun_colour.rgb;
         }
     }
-    let sun_shade = sun_visibility(p, n, !terrain_low);
+    let sun_shade = sun_visibility(p, n, !terrain_low && !object);
     let plane_n = geometric * inverseSqrt(max(dot(geometric, geometric), 1e-20));
     let oriented_n = select(-plane_n, plane_n, dot(plane_n, n) >= 0.0);
     let ao = ambient_visibility(p, select(n, oriented_n, dot(geometric, geometric) > 1e-20));
     // Static1: alpha masks baked direct visibility once; RGB is baked bounce,
     // dimmed by only 15% in a runtime shadow (exploration camera w = 0).
     // Dynamic lights have their own visibility and never take this sun mask.
-    let ambient_shade = select(mix(1.0, sun_shade, 0.15), ao, lighting.counts.w > 0u);
+    let ambient_shade = select(select(mix(1.0, sun_shade, 0.15), 1.0, object), ao, lighting.counts.w > 0u);
     // Terrain1 masks static diffuse twice; Static1 and Low's Terrain3 only once.
     let diffuse = diff_s * sun_shade * select(lm.a, lm.a * lm.a, terrain && !terrain_low)
         + lm.rgb * ambient_shade + diff_d;
