@@ -1724,11 +1724,15 @@ impl Server {
                 Some(o) => resolve(sim, o).ok_or("no such object")?,
                 None => sim.world.hero.ok_or("no hero")?,
             };
-            if sim.world.chargen != Some(who) {
+            if sim.world.chargen != Some(who)
+                || (sim.game == thedas_vfs::Game::DragonAge2 && sim.world.chargen_mode != 1)
+            {
                 sim.request_level_up(who);
                 sim.tick(0);
             }
-            if sim.world.chargen != Some(who) {
+            if sim.world.chargen != Some(who)
+                || (sim.game == thedas_vfs::Game::DragonAge2 && sim.world.chargen_mode != 1)
+            {
                 return Err(
                     "the level-up screen did not open (in combat, or not a party member?)".into(),
                 );

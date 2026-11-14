@@ -4161,9 +4161,12 @@ pub fn call(
             }
             void()
         }
-        "IsAbilityAvailable" => ok(b(h
-            .object(obj(a, 0))
-            .is_some_and(|o| o.abilities.contains(&int(a, 1))))),
+        "IsAbilityAvailable" => ok(b(if h.sim.game == thedas_vfs::Game::DragonAge2 {
+            h.sim.da2_ability_available(obj(a, 0), int(a, 1))
+        } else {
+            h.object(obj(a, 0))
+                .is_some_and(|o| o.abilities.contains(&int(a, 1)))
+        })),
         "LoadItemsFromTemplate" => {
             h.sim
                 .load_items_from_template(obj(a, 0), &string(a, 1), int(a, 2) != 0);

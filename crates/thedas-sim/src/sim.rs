@@ -1895,6 +1895,23 @@ impl Sim {
         let Some(module) = self.world.module else {
             return;
         };
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            // DA2's GoToLevelUpMessage (0x647fe0) selects the creature in object 0
+            // and notifies the module with event 24. That script notification handles
+            // tutorials; unlike Origins it never calls StartCharGen. The native UI's
+            // level-up scope must therefore be opened here for the requested member.
+            if !self.in_party(creature)
+                || !self.has_level_up_points(creature)
+                || self
+                    .world
+                    .get(creature)
+                    .is_none_or(|o| o.dead || o.combat.in_combat)
+            {
+                return;
+            }
+            self.world.chargen = Some(creature);
+            self.world.chargen_mode = 1;
+        }
         let mut ev = self.new_event("PLAYERLEVELUP", Some(creature));
         ev.objects = vec![creature];
         self.world.queue_event(0, module, ev, None);

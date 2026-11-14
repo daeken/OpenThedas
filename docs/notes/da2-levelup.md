@@ -29,3 +29,18 @@ creature handler, this does not reconstruct all eligibility checks performed by
 the ability-tree movie. Quickbar slot selection retains the existing provisional
 policy. The native optional quickbar-overflow tutorial notification is not added
 here; it does not execute the learned ability's damage or passive bonuses.
+
+IsAbilityAvailable (0x4e6280 -> 0x556600) is eligibility to learn: truncated
+level 36 must meet column 0x38681c66; each nonzero prerequisite ability in
+0x0ca45f1d, 0xb2de6b6b, 0x99f338a8 and 0x80e809e9 must be learned; both
+attribute-id/value pairs (0x535458ed/0x2150237a and 0x78790b2e/0x0a7d70b9)
+must be satisfied. It does not require the queried ability itself or available
+purchase points. Treating it as HasAbility made sys_chargen's auto allocator
+incapable of learning: it specifically requires unlearned AND available.
+
+DA2's GoToLevelUpMessage (0x647fe0) identifies the requested creature in event
+24's object slot 0. The module handles tutorials rather than calling StartCharGen
+as Origins does. The simulation opens the requested member's input scope itself;
+a stale scope for Hawke must not prevent opening a companion's screen after the
+first level-up. Input remains limited to living party members out of combat with
+attribute or talent points. Character creation's existing start/end path is unchanged.

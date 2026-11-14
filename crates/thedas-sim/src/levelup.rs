@@ -26,6 +26,45 @@ pub const MSG_SELECT_NAME: &str = "GUICharGen.CharGenSelectName";
 pub const MSG_CHAINS: &str = "GameModeController.FindAbilityChains";
 
 impl Sim {
+    /// DA2 IsAbilityAvailable (0x4e6280 -> 0x556600): level, all four prerequisite
+    /// abilities (0x551ee0), and both required attributes. This is eligibility to learn,
+    /// not HasAbility and not a check of the creature's remaining purchase points.
+    pub(crate) fn da2_ability_available(&self, who: ObjectId, ability: i32) -> bool {
+        let Some(o) = self
+            .world
+            .get(who)
+            .filter(|o| o.kind == crate::world::ObjectKind::Creature)
+        else {
+            return false;
+        };
+        let Some(t) = self
+            .world
+            .tables()
+            .get(1, "")
+            .filter(|t| ability > 0 && t.has_row(i64::from(ability)))
+        else {
+            return false;
+        };
+        let int = |hash| match t.cell_by_hash(hash, i64::from(ability)) {
+            Some(thedas_formats::gda::Cell::Int(n)) => *n as i32,
+            _ => 0,
+        };
+        if (self.property_total(who, 36) as i32) < int(0x3868_1c66)
+            || [0x0ca4_5f1d, 0xb2de_6b6b, 0x99f3_38a8, 0x80e8_09e9]
+                .into_iter()
+                .map(int)
+                .any(|p| p != 0 && !o.abilities.contains(&p))
+        {
+            return false;
+        }
+        [(0x5354_58ed, 0x2150_237a), (0x7879_0b2e, 0x0a7d_70b9)]
+            .into_iter()
+            .all(|(property, value)| {
+                let p = int(property);
+                p == 0 || self.property_total(who, p) >= int(value) as f32
+            })
+    }
+
     /// Unspent attribute, skill and talent points in the current game's property layout.
     /// DA2 has no skill pool; specialization points (40) are separate from its level-up mark.
     pub fn level_up_points(&self, who: ObjectId) -> [f32; 3] {
@@ -131,7 +170,7 @@ impl Sim {
             return false;
         }
         let points = self.property_total(who, pool);
-        if buying && points < cost as f32 {
+        if buying && (points < cost as f32 || !self.da2_ability_available(who, id)) {
             return false;
         }
         let o = self.world.get_mut(who).unwrap();
@@ -431,7 +470,9 @@ impl Sim {
     pub fn level_up_auto(&mut self, who: ObjectId) -> bool {
         self.request_level_up(who);
         self.tick(0);
-        if self.world.chargen != Some(who) {
+        if self.world.chargen != Some(who)
+            || (self.game == thedas_vfs::Game::DragonAge2 && self.world.chargen_mode != 1)
+        {
             return false;
         }
         self.auto_level(who);
@@ -551,6 +592,95 @@ mod tests {
             "no invented fallback allocation without a script"
         );
         assert!(s.world.trace.entries.iter().any(|e| matches!(e, TraceEntry::EventQueued { ty: 56, target, .. } if Some(*target) == s.world.module)));
+    }
+
+    #[test]
+    fn da2_level_up_reopens_for_the_requested_party_member() {
+        let (mut s, hero) = da2();
+        let follower = s.world.spawn(ObjectKind::Creature, "follower");
+        s.world.get_mut(hero).unwrap().followers.push(follower);
+        s.world
+            .get_mut(follower)
+            .unwrap()
+            .properties
+            .insert(38, (3.0, 0.0));
+        s.world.chargen = None;
+        s.request_level_up(hero);
+        assert_eq!((s.world.chargen, s.world.chargen_mode), (Some(hero), 1));
+        assert!(s.chargen_event("CHARGEN_END", vec![1, 0], vec![]));
+        s.request_level_up(follower);
+        assert_eq!(s.world.chargen, Some(follower));
+        assert!(
+            !s.assign_level_up_attribute(hero, 1, 3),
+            "the former screen's token cannot spend"
+        );
+        assert!(s.assign_level_up_attribute(follower, 1, 3));
+        s.chargen_event("CHARGEN_END", vec![1, 0], vec![]);
+        s.request_level_up(follower);
+        assert_eq!(s.world.chargen, None, "no points remaining");
+        s.world.get_mut(hero).unwrap().combat.in_combat = true;
+        s.request_level_up(hero);
+        assert_eq!(s.world.chargen, None, "combat blocks input");
+        s.world.chargen = Some(hero);
+        s.world.chargen_mode = 0;
+        assert!(
+            !s.level_up_auto(hero),
+            "a stale creation scope cannot bypass combat"
+        );
+    }
+
+    #[test]
+    fn da2_eligibility_checks_all_prerequisites_without_requiring_the_ability_itself() {
+        use thedas_formats::gda::Cell;
+        let (mut s, who) = da2();
+        s.world.tables.insert(
+            "#1",
+            &[
+                "#38681c66",
+                "#0ca45f1d",
+                "#b2de6b6b",
+                "#99f338a8",
+                "#80e809e9",
+                "#535458ed",
+                "#2150237a",
+                "#78790b2e",
+                "#0a7d70b9",
+            ],
+            vec![(
+                99,
+                [3, 11, 12, 13, 14, 1, 12, 2, 11]
+                    .into_iter()
+                    .map(Cell::Int)
+                    .collect(),
+            )],
+        );
+        assert!(!s.da2_ability_available(who, 99));
+        let o = s.world.get_mut(who).unwrap();
+        o.properties
+            .extend([(36, (3.0, 0.0)), (1, (12.0, 0.0)), (2, (11.0, 0.0))]);
+        o.abilities.extend([11, 12, 13]);
+        assert!(
+            !s.da2_ability_available(who, 99),
+            "every prerequisite is required"
+        );
+        s.world.get_mut(who).unwrap().abilities.insert(14);
+        assert!(
+            s.da2_ability_available(who, 99),
+            "an unlearned ability can be available"
+        );
+        s.world
+            .get_mut(who)
+            .unwrap()
+            .properties
+            .get_mut(&2)
+            .unwrap()
+            .0 = 10.0;
+        assert!(
+            !s.da2_ability_available(who, 99),
+            "the second attribute also matters"
+        );
+        assert!(!s.da2_ability_available(who, 0));
+        assert!(!s.da2_ability_available(who, 100));
     }
 
     #[test]
