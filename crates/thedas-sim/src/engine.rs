@@ -47,6 +47,24 @@ fn obj(a: &[Value], i: usize) -> ObjectId {
     }
 }
 
+/// Origins' health lookup rejects module/area/party objects; these other kinds
+/// inherit CCObject's -1 maximum getter and no-op setter. See script-base-health.md.
+fn origins_has_no_health(kind: ObjectKind) -> bool {
+    matches!(
+        kind,
+        ObjectKind::Module
+            | ObjectKind::Area
+            | ObjectKind::Party
+            | ObjectKind::Item
+            | ObjectKind::Trigger
+            | ObjectKind::Sound
+            | ObjectKind::Waypoint
+            | ObjectKind::Projectile
+            | ObjectKind::Store
+            | ObjectKind::AreaOfEffect
+    )
+}
+
 /// What `GetHasEffects`, `GetEffects` and `RemoveEffectsByParameters` select effects by, as
 /// script.ldf documents them: an effect type (`EFFECT_TYPE_INVALID`, 0, for any), an ability
 /// (−1 for any, `GetHasEffects`' default; 0, `ABILITY_INVALID`, for any, the other two's
@@ -3370,6 +3388,19 @@ pub fn call(
                 o.fields.remove("HeartbeatMs");
             }
             void()
+        }
+        "Deprecated_GetMaxHealth" | "SetMaxHealth"
+            if h.sim.game == thedas_vfs::Game::Origins
+                && h.object(obj(a, 0))
+                    .is_none_or(|o| origins_has_no_health(o.kind)) =>
+        {
+            // 0x65a2c0 / 0x65a330: failed CCObject lookup, or base virtuals
+            // 0x4e13d0 / 0x455850. Do not read fields or create a health property.
+            if name == "Deprecated_GetMaxHealth" {
+                ok(Value::Int(-1))
+            } else {
+                void()
+            }
         }
         "SetMaxHealth" => {
             // PROPERTY_DEPLETABLE_HEALTH: base is the maximum, current is clamped to it.
@@ -7530,7 +7561,9 @@ mod tests {
         for kind in [
             ObjectKind::Creature,
             ObjectKind::Placeable,
-            ObjectKind::Item,
+            ObjectKind::Stage,
+            ObjectKind::Map,
+            ObjectKind::MapPin,
         ] {
             let id = s.world.spawn(kind, "target");
             s.world
@@ -7559,6 +7592,100 @@ mod tests {
                         "{game:?} {kind:?} {maximum:?}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn origins_base_objects_have_no_maximum_health_and_ignore_its_setter() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"int Deprecated_GetMaxHealth(object o) = 235;\n\
+                  void SetMaxHealth(object o, int n) = 236;\n\
+                  int PROPERTY_DEPLETABLE_HEALTH = 7;",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for kind in [
+            ObjectKind::Module,
+            ObjectKind::Area,
+            ObjectKind::Party,
+            ObjectKind::Item,
+            ObjectKind::Trigger,
+            ObjectKind::Sound,
+            ObjectKind::Waypoint,
+            ObjectKind::Projectile,
+            ObjectKind::Store,
+            ObjectKind::AreaOfEffect,
+        ] {
+            let id = s.world.spawn(kind, "target");
+            for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+                s.game = game;
+                for present in [false, true] {
+                    for maximum in [None, Some(0), Some(22)] {
+                        let o = s.world.get_mut(id).unwrap();
+                        o.fields.remove("MaxHealth");
+                        o.fields.insert("Health".into(), 11);
+                        if let Some(maximum) = maximum {
+                            o.fields.insert("MaxHealth".into(), maximum);
+                        }
+                        o.properties.remove(&7);
+                        if present {
+                            o.properties.insert(7, (100.0, 12.0));
+                        }
+                        o.modifiers.insert(7, 3.5);
+                        o.dead = true;
+                        o.active = false;
+                        o.immortal = true;
+                        let before = serde_json::to_value(&s.world).unwrap();
+                        for value in [i32::MIN, -65537, 0, 30, 32768, i32::MAX] {
+                            let expected = if game == thedas_vfs::Game::Origins {
+                                -1
+                            } else {
+                                maximum.unwrap_or(11)
+                            };
+                            assert_eq!(
+                                run(&mut s, id, "Deprecated_GetMaxHealth", &[Value::Object(id)]),
+                                Some(Value::Int(expected)),
+                                "{game:?} {kind:?} {present} {maximum:?}"
+                            );
+                            run(
+                                &mut s,
+                                id,
+                                "SetMaxHealth",
+                                &[Value::Object(id), Value::Int(value)],
+                            );
+                            if game == thedas_vfs::Game::Origins {
+                                assert_eq!(serde_json::to_value(&s.world).unwrap(), before);
+                            } else {
+                                assert_eq!(s.world.get(id).unwrap().properties[&7].0, value as f32);
+                            }
+                            s.load_game(s.save_game()).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            s.game = game;
+            for id in [OBJECT_INVALID, u32::MAX] {
+                let before = serde_json::to_value(&s.world).unwrap();
+                assert_eq!(
+                    run(&mut s, 0, "Deprecated_GetMaxHealth", &[Value::Object(id)]),
+                    Some(Value::Int(if game == thedas_vfs::Game::Origins {
+                        -1
+                    } else {
+                        0
+                    }))
+                );
+                run(
+                    &mut s,
+                    0,
+                    "SetMaxHealth",
+                    &[Value::Object(id), Value::Int(30)],
+                );
+                assert_eq!(serde_json::to_value(&s.world).unwrap(), before);
             }
         }
     }
