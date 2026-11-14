@@ -25,10 +25,23 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
                 if (p.x < 3.0) {{ return vec4<f32>(object_probe(vec3<f32>(0.0, 0.0, 1.0)), 1.0); }}
                 if (p.x < 5.0) {{ return vec4<f32>(object_tint(vec3<f32>(0.2, 0.4, 0.6), vec4<f32>(0.5, 0.25, 0.0, 0.0), p.x > 4.0), 1.0); }}
                 if (p.x < 7.0) {{ return vec4<f32>(tint_mode(vec3<f32>(0.2, 0.4, 0.6), vec4<f32>(0.5, 0.25, 0.0, 0.5), false, select(2.0, 3.0, p.x > 6.0)), 1.0); }}
-                return vec4<f32>(select(0.0, 1.0, point_uses_baked_mask(true, 64u)),
+                if (p.x < 8.0) {{ return vec4<f32>(select(0.0, 1.0, point_uses_baked_mask(true, 64u)),
                     select(0.0, 1.0, point_uses_baked_mask(true, 192u)),
                     select(0.0, 1.0, point_uses_baked_mask(true, 0u)),
-                    select(0.0, 1.0, point_uses_baked_mask(true, 128u)));
+                    select(0.0, 1.0, point_uses_baked_mask(true, 128u))); }}
+                let face = compose_face(vec4<f32>(0.2, 0.4, 0.6, 0.8), vec4<f32>(0.6, 0.8, 1.0, 0.4),
+                    vec4<f32>(0.5), vec4<f32>(0.5, 0.7, 0.5, 0.6), vec4<f32>(0.5, 0.6, 0.5, 0.7),
+                    vec4<f32>(1.0, 0.0, 0.0, 0.0), vec4<f32>(1.0, 0.0, 0.0, 0.0),
+                    vec4<f32>(0.0, 0.0, 0.0, 0.5), vec4<f32>(1.0, 0.0, 0.0, 0.0),
+                    vec4<f32>(0.5, 0.6, 0.5, 0.7), vec4<f32>(0.5, 0.0, 0.0, 0.0));
+                if (p.x < 9.0) {{ return face.albedo; }}
+                if (p.x < 10.0) {{ return face.normal; }}
+                if (p.x < 11.0) {{ return face.specular; }}
+                let eye = compose_eye(vec4<f32>(0.2, 0.4, 0.6, select(0.0, 1.0, p.x < 14.0)),
+                    vec4<f32>(0.5, 0.25, 0.0, 0.0), vec4<f32>(0.5), vec4<f32>(0.5, 0.6, 0.5, 0.7));
+                if (p.x < 12.0) {{ return eye.albedo; }}
+                if (p.x < 13.0 || p.x >= 15.0) {{ return eye.normal; }}
+                return eye.specular;
             }}
         "#).into()),
     });
@@ -65,6 +78,18 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
     data.tint[4] = [0.0, 1.0, 0.0, 0.0];
     data.tint[5] = [1.0, 1.0, 0.0, 0.0];
     data.tint[8] = [0.5, 0.25, 0.75, 0.0];
+    data.tint[9] = [1.0, 0.5, 0.25, 0.0];
+    data.character.age[0][0] = 0.5;
+    data.character.age[3][0] = 0.25;
+    data.character.emotion[0][0] = 0.4;
+    data.character.hair_weights[0][0] = 0.5;
+    data.character.hair_weights[1][0] = 0.25;
+    data.character.hair_colour = [0.1, 0.2, 0.3, 0.0];
+    data.character.tattoo[0][0] = 1.0;
+    data.character.tattoo[1] = [1.0, 0.5, 0.25, 0.0];
+    data.character.specular[0][0] = 0.1;
+    data.character.specular[1][0] = 0.2;
+    data.character.eye = [30.0, 0.75, 75.0, 0.5];
     let draw = DrawUniforms {
         mvp: Mat4::IDENTITY.to_cols_array_2d(),
         world: Mat4::IDENTITY.to_cols_array_2d(),
@@ -109,7 +134,7 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
         size: wgpu::Extent3d {
-            width: 8,
+            width: 16,
             height: 1,
             depth_or_array_layers: 1,
         },
@@ -174,7 +199,7 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
     rx.recv().unwrap().unwrap();
     let mapped = readback.slice(..).get_mapped_range().unwrap();
-    let actual: &[f32] = bytemuck::cast_slice(&mapped[..128]);
+    let actual: &[f32] = bytemuck::cast_slice(&mapped[..256]);
     let expected = [
         [6.25, 1.25, 3.75, 1.0],
         [0.25, 0.75, 0.0, 1.0],
@@ -184,6 +209,14 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
         [0.09375, 0.109375, 0.13125, 1.0],
         [0.4125, 0.25, 0.13125, 1.0],
         [0.0, 0.0, 1.0, 1.0], // Object point lights must not inherit a sun/lightmap mask.
+        [0.1625, 0.2171875, 0.346875, 0.6],
+        [0.5, 0.64, 0.5, 0.705],
+        [0.012, 0.009, 0.0075, (2.0 / 0.09 - 3.0) / 255.0],
+        [0.425, 0.2875, 0.15, 1.0],
+        [0.5, 0.6, 0.5, 0.7],
+        [0.75, 0.75, 0.75, 29.0 / 255.0],
+        [0.5, 0.5, 0.5, 74.0 / 255.0],
+        [0.5; 4],
     ];
     for (actual, expected) in actual.iter().zip(expected.iter().flatten()) {
         assert!((actual - expected).abs() < 0.0001, "{actual} != {expected}");
