@@ -704,7 +704,15 @@ impl Vfs {
     /// The talk tables of one language (`en-us`), in the order to merge them: the tables
     /// named `*<language>.tlk`, sorted by name, then the patch tables `*<language>_p.tlk`,
     /// sorted by name. Dragon Age II ships its corrections to shipped strings as `_p` tables
-    /// in each package's `patch` folder; Dragon Age: Origins has none. Provisional: that a
+    /// in each package's `patch` folder; Dragon Age: Origins has none.
+    ///
+    /// Provisional for Origins: CTlkTable registers tables by name (0x4e5a80/0x4e5810),
+    /// appends them as they load, and looks up a string in the first loaded table that has
+    /// it (0x4e4990). RIM load/unload events change that membership. This suffix listing
+    /// and its callers' later-table-wins merge do not reproduce that lifecycle; changing
+    /// filename order alone cannot do so. See `docs/resource-order-tlk.md`.
+    ///
+    /// Provisional for Dragon Age II: that a
     /// patch table overrides every base table, whichever package it is in, is not traced.
     pub fn talk_tables(&self, language: &str) -> Vec<String> {
         let language = language.to_ascii_lowercase();
