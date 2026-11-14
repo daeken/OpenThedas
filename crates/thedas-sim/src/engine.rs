@@ -1585,6 +1585,28 @@ pub fn call(
                 handle: Some(hd),
             })
         }
+        // DA2's native 0x4f00d0 constructs the ability's delayed impact payload and
+        // schedules it for oObject. Its creator is the calling script's object, not
+        // necessarily the caster; the explicit script overrides oObject's handler.
+        "ConstructAbilityImpactandDelayEvent" => {
+            let target = obj(a, 1);
+            if h.object(target).is_none() {
+                return void();
+            }
+            let ev = Event {
+                ty: int(a, 3),
+                creator: Some(caller),
+                objects: (4..8).map(|i| obj(a, i)).collect(),
+                floats: vec![float(a, 8)],
+                ints: (9..14).map(|i| int(a, i)).collect(),
+                vectors: vec![vector(a, 14)],
+                ..Default::default()
+            };
+            let script = Some(string(a, 2)).filter(|s| !s.is_empty());
+            let ms = (float(a, 0).max(0.0) * 1000.0).round() as u64;
+            h.sim.world.queue_event(ms, target, ev, script);
+            void()
+        }
         "SignalEvent" | "DelayEvent" => {
             let (target, hi, delay) = if name == "SignalEvent" {
                 (obj(a, 0), 1, 0.0)
@@ -6359,6 +6381,78 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn da2_delayed_ability_impacts_keep_the_payload_and_delivery_time_on_reload() {
+        let table = Arc::new(
+            EngineTable::parse(
+                br#"
+            void ConstructAbilityImpactandDelayEvent(float delay, object receiver,
+                string script, int type, object caster, object victim, object item,
+                object secondary, float damage, int ability, int result, int hit,
+                int hand, int damageType, vector position) = 890;
+        "#,
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.game = thedas_vfs::Game::DragonAge2;
+        let caller = s.world.spawn(ObjectKind::Creature, "caller");
+        let receiver = s.world.spawn(ObjectKind::Creature, "receiver");
+        let caster = s.world.spawn(ObjectKind::Creature, "caster");
+        s.world.time_ms = 500;
+        let mut args = vec![
+            Value::Float(0.125),
+            Value::Object(receiver),
+            Value::String("impact".into()),
+            Value::Int(1066),
+            Value::Object(caster),
+            Value::Object(41),
+            Value::Object(OBJECT_INVALID),
+            Value::Object(43),
+            Value::Float(17.25),
+            Value::Int(123),
+            Value::Int(8),
+            Value::Int(2),
+            Value::Int(1),
+            Value::Int(4),
+            Value::Vector([1.0, -2.0, 3.5]),
+        ];
+        run(&mut s, caller, "ConstructAbilityImpactandDelayEvent", &args);
+        assert!(s.world.pop_due(624).is_none());
+        let serialized = serde_json::to_vec(&s.world).unwrap();
+        let mut restored: crate::world::World = serde_json::from_slice(&serialized).unwrap();
+        let (due, queued) = restored.pop_due(625).unwrap();
+        assert_eq!(due, 625);
+        assert_eq!(queued.target, receiver);
+        assert_eq!(queued.script.as_deref(), Some("impact"));
+        assert_eq!(
+            queued.event,
+            Event {
+                ty: 1066,
+                creator: Some(caller),
+                objects: vec![caster, 41, OBJECT_INVALID, 43],
+                floats: vec![17.25],
+                ints: vec![123, 8, 2, 1, 4],
+                vectors: vec![[1.0, -2.0, 3.5]],
+                ..Default::default()
+            }
+        );
+        assert!(restored.pop_due(u64::MAX).is_none());
+        assert_eq!(s.world.pop_due(625).unwrap().1.event, queued.event);
+
+        // No override uses the receiver's ordinary handler. Even a zero or negative
+        // delay is queued, so this helper does not re-enter the caller's script.
+        args[0] = Value::Float(-1.0);
+        args[2] = Value::String(String::new());
+        run(&mut s, caller, "ConstructAbilityImpactandDelayEvent", &args);
+        let (due, queued) = s.world.pop_due(500).unwrap();
+        assert_eq!(due, 500);
+        assert_eq!(queued.script, None);
+        args[1] = Value::Object(OBJECT_INVALID);
+        run(&mut s, caller, "ConstructAbilityImpactandDelayEvent", &args);
+        assert!(s.world.pop_due(u64::MAX).is_none());
     }
 
     #[test]
