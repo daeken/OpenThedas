@@ -205,6 +205,8 @@ pub(crate) struct DeferredPass {
     /// Experimental probe + runtime visibility mode. Fixed when this renderer is built.
     baked_lighting: bool,
     ssao: bool,
+    /// Diagnostic override: tiled lighting and cube-face culling, respectively.
+    culling: Option<[bool; 2]>,
 }
 
 pub(crate) struct Contributor<'a> {
@@ -232,6 +234,8 @@ struct Gpu {
     material_groups: Vec<wgpu::BindGroup>,
     lighting_buffer: wgpu::Buffer,
     light_buffer: wgpu::Buffer,
+    tile_buffer: wgpu::Buffer,
+    tiles: Vec<[u32; 8]>,
     /// The shadowed lights' maps, and their faces' view-projections for the lighting.
     shadows: Option<crate::deferred_shadow::ShadowPool>,
     sun_fallback: wgpu::TextureView,
@@ -727,6 +731,7 @@ impl DeferredPass {
             refused: false,
             baked_lighting: std::env::var("THEDAS_DEFERRED_BAKED_LIGHTING").as_deref() != Ok("0"),
             ssao: std::env::var("THEDAS_DEFERRED_SSAO").as_deref() != Ok("0"),
+            culling: None,
         })
     }
 
@@ -764,6 +769,10 @@ impl DeferredPass {
     /// Sets the lights its own renderer's glowing emitters give this frame.
     pub(crate) fn set_own_lights(&mut self, lights: Vec<SceneLight>) {
         self.own_lights = lights;
+    }
+
+    pub(crate) fn set_culling(&mut self, culling: Option<[bool; 2]>) {
+        self.culling = culling;
     }
 
     /// Whether the GPU refused the pass.
@@ -872,6 +881,7 @@ impl DeferredPass {
                 buffer_entry(0, f, uniform),
                 buffer_entry(1, f, uniform),
                 buffer_entry(2, f, uniform),
+                buffer_entry(3, f, uniform),
             ],
         });
         let targets_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1223,6 +1233,12 @@ impl DeferredPass {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let tile_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("deferred light tiles"),
+            size: std::mem::size_of::<crate::deferred_tiles::Masks>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let lighting_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("deferred lighting"),
             layout: &lighting_layout,
@@ -1238,6 +1254,10 @@ impl DeferredPass {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: faces_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: tile_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -1274,6 +1294,8 @@ impl DeferredPass {
             material_groups,
             lighting_buffer,
             light_buffer,
+            tile_buffer,
+            tiles: Vec::new(),
             shadows: None,
             sun_fallback: device
                 .create_texture(&wgpu::TextureDescriptor {
@@ -1597,6 +1619,35 @@ impl DeferredPass {
             }
             gpu.lights = lights;
         }
+        let tiles = crate::deferred_tiles::build(
+            projection * view,
+            (width, height),
+            gpu.lights.iter().map(|l| l.position),
+            if debug_view() == 9 { 2.0 } else { 1.0 },
+            self.culling.map(|c| c[0]).unwrap_or_else(|| {
+                std::env::var("THEDAS_DEFERRED_TILED_LIGHTS").as_deref() != Ok("0")
+            }),
+        );
+        if gpu.tiles.as_slice() != tiles {
+            ctx.queue
+                .write_buffer(&gpu.tile_buffer, 0, bytemuck::cast_slice(&tiles));
+            gpu.tiles = tiles.to_vec();
+        }
+        if std::env::var_os("THEDAS_DEFERRED_LOG_LIGHTS").is_some() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                let counts: Vec<_> = tiles
+                    .iter()
+                    .map(|t| t.iter().map(|v| v.count_ones()).sum::<u32>())
+                    .collect();
+                log::info!(
+                    "deferred tiles: {} lights, {:.1} average / {} max candidates per tile",
+                    gpu.lights.len(),
+                    counts.iter().sum::<u32>() as f32 / counts.len() as f32,
+                    counts.iter().max().copied().unwrap_or(0)
+                );
+            });
+        }
         let (sun_dir, sun_colour) = match d3d.sun() {
             Some((dir, colour)) => (dir.normalize_or_zero().extend(1.0), colour.extend(0.0)),
             None => (Vec4::ZERO, Vec4::ZERO),
@@ -1665,10 +1716,9 @@ impl DeferredPass {
                     casters.extend(casters_for_contributor(c, g));
                 }
             }
-            gpu.shadows
-                .as_mut()
-                .expect("point shadows")
-                .encode(device, &ctx.queue, encoder, &shadowed, &casters);
+            let pool = gpu.shadows.as_mut().expect("point shadows");
+            pool.set_culling(self.culling.map(|c| c[1]));
+            pool.encode(device, &ctx.queue, encoder, &shadowed, &casters);
         }
 
         let Some(targets) = gpu.targets.as_ref() else {
@@ -2087,7 +2137,7 @@ pub fn emitter_light(e: &crate::particles::EmitterState) -> Option<SceneLight> {
 }
 
 /// The six planes (`n·p + w ≥ 0` inside) of a view-projection with depth 0..1.
-fn frustum(m: Mat4) -> [Vec4; 6] {
+pub(super) fn frustum(m: Mat4) -> [Vec4; 6] {
     let (r0, r1, r2, r3) = (m.row(0), m.row(1), m.row(2), m.row(3));
     [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2].map(|p| {
         let len = p.truncate().length();
@@ -2101,6 +2151,8 @@ mod tests {
 
     #[test]
     fn material_and_skin_uniforms_fit_portable_limits() {
+        assert_eq!(MAX_LIGHTS, 192);
+        assert!(std::mem::size_of::<crate::deferred_tiles::Masks>() <= 16 * 1024);
         assert!(std::mem::size_of::<DrawUniforms>() <= DRAW_STRIDE);
         assert_eq!(DRAW_STRIDE % 256, 0);
         assert_eq!(SKIN_STRIDE % 256, 0);

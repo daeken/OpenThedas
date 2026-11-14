@@ -9,7 +9,7 @@
 //! Casters are eligible deferred level, terrain and object draws, including skinned ones.
 //! Forward materials and trees do not cast these shadows yet.
 
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec3, Vec4};
 
 use crate::deferred_mesh::{DeferredVertex, ROWS};
 use crate::gpu::{DEPTH_FORMAT, GpuMesh};
@@ -53,6 +53,18 @@ pub(crate) fn faces(position: Vec3, radius: f32) -> [Mat4; 6] {
     FACES.map(|(forward, up)| projection * Mat4::look_to_rh(position, forward, up))
 }
 
+/// Posed world bounds are conservative. Keep unknown bounds and a millimetre margin
+/// at face/near/far seams rather than risk removing a visible shadow fragment.
+fn intersects_face(planes: &[Vec4; 6], (centre, radius): (Vec3, f32)) -> bool {
+    if !centre.is_finite() || !radius.is_finite() || radius < 0.0 {
+        return true;
+    }
+    planes.iter().all(|p| {
+        let distance = p.truncate().dot(centre) + p.w;
+        !distance.is_finite() || distance >= -radius - 0.001
+    })
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct DrawUniforms {
@@ -82,6 +94,7 @@ pub(crate) struct ShadowPool {
     buffer: wgpu::Buffer,
     /// Slots of [`STRIDE`] the buffer holds.
     capacity: usize,
+    culling: Option<bool>,
     material_layout: wgpu::BindGroupLayout,
     opaque: crate::deferred_cutout::Material,
     /// Per layer (slot · 6 + face), the colour and depth views drawn into.
@@ -273,6 +286,7 @@ impl ShadowPool {
             layout,
             buffer,
             capacity: 1,
+            culling: None,
             material_layout,
             opaque,
             layers,
@@ -289,6 +303,10 @@ impl ShadowPool {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })
+    }
+
+    pub(crate) fn set_culling(&mut self, culling: Option<bool>) {
+        self.culling = culling;
     }
 
     fn group(&self, device: &wgpu::Device, bones: &wgpu::Buffer) -> wgpu::BindGroup {
@@ -329,6 +347,10 @@ impl ShadowPool {
         // Per layer, its draws: (caster, slot in the buffer).
         let mut data: Vec<u8> = Vec::new();
         let mut layers: Vec<Vec<(usize, u32)>> = Vec::new();
+        let cull = self
+            .culling
+            .unwrap_or_else(|| std::env::var("THEDAS_DEFERRED_SHADOW_CULL").as_deref() != Ok("0"));
+        let mut before = 0;
         for &(position, radius) in lights.iter().take(SLOTS) {
             let near: Vec<usize> = casters
                 .iter()
@@ -337,9 +359,14 @@ impl ShadowPool {
                 .map(|(i, _)| i)
                 .collect();
             for view_proj in faces(position, radius) {
+                let planes = crate::deferred::frustum(view_proj);
+                before += near.len();
                 let mut draws = Vec::with_capacity(near.len());
                 for &i in &near {
                     let c = &casters[i];
+                    if cull && !intersects_face(&planes, c.sphere) {
+                        continue;
+                    }
                     let u = DrawUniforms {
                         mvp: (view_proj * c.world).to_cols_array_2d(),
                         world: c.world.to_cols_array_2d(),
@@ -353,6 +380,16 @@ impl ShadowPool {
                 }
                 layers.push(draws);
             }
+        }
+        if std::env::var_os("THEDAS_DEFERRED_LOG_LIGHTS").is_some() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                log::info!(
+                    "deferred shadows: {} draw submissions ({} before face culling)",
+                    layers.iter().map(Vec::len).sum::<usize>(),
+                    before
+                )
+            });
         }
         if !data.is_empty() {
             let need = data.len() / STRIDE;
@@ -638,6 +675,46 @@ mod tests {
         );
         ctx.queue.write_buffer(&bones, 0, &rows);
         assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [true, false]);
+    }
+
+    #[test]
+    fn face_culling_keeps_seams_near_crossings_and_unknown_bounds() {
+        let planes = faces(Vec3::ZERO, 10.0).map(crate::deferred::frustum);
+        assert!(intersects_face(&planes[0], (Vec3::new(2.0, 0.0, 0.0), 0.1)));
+        assert!(!intersects_face(
+            &planes[1],
+            (Vec3::new(2.0, 0.0, 0.0), 0.1)
+        ));
+        for face in [0, 2] {
+            assert!(intersects_face(
+                &planes[face],
+                (Vec3::new(2.0, 2.0, 0.0), 0.1)
+            ));
+        }
+        assert!(intersects_face(&planes[0], (Vec3::new(0.3, 0.0, 0.0), 0.1)));
+        assert!(!intersects_face(
+            &planes[0],
+            (Vec3::new(0.1, 0.0, 0.0), 0.01)
+        ));
+        for p in &planes {
+            assert!(intersects_face(p, (Vec3::ZERO, 2.0)));
+            assert!(intersects_face(p, (Vec3::splat(f32::NAN), 1.0)));
+            assert!(intersects_face(p, (Vec3::ZERO, f32::INFINITY)));
+        }
+        // Every point inside each face's true clip volume must retain its enclosing
+        // sphere, including at non-origin light positions and face boundaries.
+        let at = Vec3::new(1000.0, -500.0, 20.0);
+        for vp in faces(at, 10.0) {
+            let p = crate::deferred::frustum(vp);
+            for z in [0.0, 0.01, 0.5, 0.99, 1.0] {
+                for x in [-1.0, 0.0, 1.0] {
+                    for y in [-1.0, 0.0, 1.0] {
+                        let world = vp.inverse().project_point3(Vec3::new(x, y, z));
+                        assert!(intersects_face(&p, (world, 0.01)), "lost {world:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

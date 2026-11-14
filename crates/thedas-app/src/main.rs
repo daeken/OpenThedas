@@ -541,10 +541,38 @@ fn capture(
             .filter(|n| *n > 0)
         {
             let mut ms = Vec::new();
-            for _ in 0..n {
+            let compare = std::env::var("THEDAS_BENCH_DEFERRED_COMPARE").ok();
+            let original_path = live.render_path;
+            let mut modes = Vec::new();
+            for frame in 0..n {
+                // ABBA pairs share the scene, pipelines, camera and fixed shader clock.
+                // No process-wide environment mutation while loader/audio threads exist.
+                if let Some(compare) = compare.as_deref() {
+                    let enabled = ((frame + frame / 2) & 1) != 0;
+                    if compare == "faithful" {
+                        live.render_path = if enabled {
+                            thedas_render::RenderPath::Deferred
+                        } else {
+                            thedas_render::RenderPath::Faithful
+                        };
+                    } else if let Some(level) = live.level.as_mut() {
+                        level.renderer.set_deferred_culling(Some([
+                            enabled && compare != "shadows",
+                            enabled && compare != "tiles",
+                        ]));
+                    }
+                    modes.push(if enabled { "1" } else { "0" });
+                }
                 let t = Instant::now();
                 live.capture(ctx, &camera, (w, h))?;
                 ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            if compare.is_some() {
+                live.render_path = original_path;
+                if let Some(level) = live.level.as_mut() {
+                    level.renderer.set_deferred_culling(None);
+                }
+                println!("bench comparison modes: {}", modes.join(" "));
             }
             let avg = ms.iter().sum::<f64>() / ms.len() as f64;
             let worst = ms.iter().cloned().fold(0.0, f64::max);

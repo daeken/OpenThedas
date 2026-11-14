@@ -55,8 +55,14 @@ original scene before selecting `path = RenderPath::Deferred`.
    level lights whose reach is in view (the scene's and the added ones, i.e. cutscene
    lights; nearest first past 192), each with a bit set of the rooms it reaches
    (`AreaScene::light_rooms`), tested against the pixel's room: no 3-light cap, no leaking
-   through walls into rooms the original never lit. Tiled or clustered culling replaces
-   the per-pixel loop over all of them when light counts call for it.
+   through walls into rooms the original never lit. A conservative 16-by-9 screen grid
+   projects each light sphere's world AABB, with one pixel of margin for reconstruction
+   and tile edges. Bounds crossing the eye plane use every tile. Six ascending 32-bit
+   masks per tile select candidates; exact radius, room and material-domain tests still
+   run per pixel, in the original accumulation order. Two padded vec4s per tile take
+   4,608 bytes in a portable uniform buffer; there are no storage buffers or candidate
+   count truncations. The `wrap` debug view expands tile bounds to twice the radius.
+   `THEDAS_DEFERRED_TILED_LIGHTS=0` puts every light in every tile for comparisons.
 4. Everything not deferred draws forward with its original shaders over that colour and
    depth. In a shared deferred frame, all renderers first draw their remaining opaque
    geometry (including hair depth cores and unsupported materials). Blended and faded
@@ -195,7 +201,11 @@ debug views now include the ground. Terrain also joins the point-shadow caster l
   times radius over distance from the camera. Each is six 512-square `R32Float` distance
   maps with a 0.35 m near plane to leave the flame's enclosing torch bowl out. Opaque
   eligible deferred meshes cast from both faces, including geometry outside the camera's
-  view. The lighting pass compares distances with a bilinear 2-by-2 filter, a 4 cm normal
+  view. Each cube face conservatively culls posed world spheres against all six clip
+  planes before allocating/uploading draw uniforms. Face seams and near/far crossings
+  retain a millimetre margin, and unknown bounds stay in every face.
+  `THEDAS_DEFERRED_SHADOW_CULL=0` restores six submissions per in-range caster for
+  comparisons. The lighting pass compares distances with a bilinear 2-by-2 filter, a 4 cm normal
   offset and 2 cm distance bias. Supported skinned objects and terrain cast too; forward
   materials and trees do not, except for the cutouts below. Static lights keep baked
   visibility. At most 24 face passes per frame.
@@ -252,6 +262,20 @@ budget, missing occluders, screen edges and coarse room probes can cause light l
 ambient discontinuities. The original baked image remains the default while those are
 addressed. Moving the remaining material families into the G-buffer is still
 the next coverage step.
+
+## Measuring frame cost
+
+For fixed-scene save captures (`--save ...`), `THEDAS_BENCH_FRAMES=120 THEDAS_BENCH_DUMP=1`
+reports the headless capture loop's CPU/submission/GPU-wait/readback cost, excluding
+scene load and PNG encoding. `THEDAS_BENCH_DEFERRED_COMPARE=all` alternates full-candidate
+and optimized frames in ABBA order within one loaded scene. `tiles` or `shadows` isolates
+one optimization; `faithful` alternates the faithful path with optimized deferred.
+Start with `--renderer deferred` so planning is already complete, keep `--time`, camera,
+resolution and AA fixed, and discard the first twenty frames before comparing adjacent
+pairs. `bench comparison modes` labels control frames 0 and test frames 1. Overrides
+are per renderer, without mutating environment variables while other threads run, and
+are cleared after the benchmark. These measurements are not isolated GPU timings or
+whole-gameplay FPS; shared-machine load can still affect absolute values.
 
 ## Order of work
 
