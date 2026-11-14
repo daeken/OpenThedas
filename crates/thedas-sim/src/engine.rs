@@ -276,7 +276,7 @@ pub(crate) fn cell_string(c: Option<&Cell>) -> String {
 /// number neither answers keeps its digits as its name. Provisional: read from DA2's scripts,
 /// tables and templates (`PlayCutscene`'s callers set `var_module` rows 1014 to 1016,
 /// `gen00tr_talk` reads its trigger's speaker at 0), not traced in the executable.
-fn local_name(sim: &Sim, o: ObjectId, a: &[Value], i: usize) -> String {
+pub(crate) fn local_name(sim: &Sim, o: ObjectId, a: &[Value], i: usize) -> String {
     let Some(Value::Int(row)) = a.get(i) else {
         return string(a, i);
     };
