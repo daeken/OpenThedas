@@ -46,7 +46,9 @@ impl Sim {
             let class = self.da2_stat_cell(163, 0xe02e_9b49, package).unwrap_or(0.) as i32;
             // AS_ScaleCreature's PC path requires both a PC race and a PC class. A
             // monster's zero attributes are intentional; a PC's six zero bases are not.
-            if self.da2_stat_cell(5, 0xb6bc_e25c, race) != Some(1.)
+            if o.rank <= 0
+                || o.fields.get("Combatant").copied().unwrap_or(0) != 0
+                || self.da2_stat_cell(5, 0xb6bc_e25c, race) != Some(1.)
                 || self.da2_stat_cell(3, 0x7612_4935, class) != Some(1.)
                 || !(1..=6).all(|p| o.properties.get(&p).is_none_or(|v| v.0 <= 0.))
             {
@@ -153,6 +155,7 @@ impl Sim {
             // actors whose saved perception/combat state proves that step already ran.
             if !o.active
                 || o.dead
+                || o.area != self.world.hero.and_then(|h| self.world.get(h)?.area)
                 || o.rank <= 0
                 || o.rank == 100
                 || o.fields.get("Combatant").copied().unwrap_or(0) != 0
@@ -635,12 +638,21 @@ mod tests {
         );
         let id = s.world.spawn(ObjectKind::Creature, "old follower");
         let o = s.world.get_mut(id).unwrap();
+        o.rank = 100;
         o.fields
             .extend([("Race".into(), 7), ("Package".into(), 42)]);
         o.properties
             .extend([(7, (100., 40.)), (36, (0., 0.)), (51, (12., 0.))]);
         o.abilities.insert(400);
         o.locals.ints.insert("already_hired".into(), 1);
+        let ambient = s.world.spawn(ObjectKind::Creature, "noncombatant");
+        let o = s.world.get_mut(ambient).unwrap();
+        o.rank = 100;
+        o.fields.extend([
+            ("Race".into(), 7),
+            ("Package".into(), 42),
+            ("Combatant".into(), 2),
+        ]);
         let rng = serde_json::to_value(&s.world.rng).unwrap();
         let mut old = s.save_game();
         old.revision = 8;
@@ -653,6 +665,7 @@ mod tests {
         assert_eq!(s.world.get(id).unwrap().properties[&7], (50., 40.));
         assert_eq!(s.world.get(id).unwrap().locals.ints["already_hired"], 1);
         assert_eq!(s.world.get(id).unwrap().abilities.len(), 5);
+        assert!(s.world.get(ambient).unwrap().properties.is_empty());
         assert_eq!(serde_json::to_value(&s.world.rng).unwrap(), rng);
         let properties = s.world.get(id).unwrap().properties.clone();
         let save = s.save_json().unwrap();
@@ -698,6 +711,7 @@ mod tests {
             .insert("#2", &["#d0c45555"], vec![(12, vec![Cell::Int(8)])]);
         let npc = s.world.spawn(ObjectKind::Creature, "npc");
         let o = s.world.get_mut(npc).unwrap();
+        o.area = Some(area);
         o.appearance = 12;
         o.rank = 1;
         assert_eq!(s.da2_encounter_level(npc), Some(4));
