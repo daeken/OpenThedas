@@ -2019,6 +2019,67 @@ mod queue_tests {
     }
 
     #[test]
+    fn select_all_replaces_text_and_keeps_restrictions_limits_and_notifications() {
+        let (mut p, field) = input_player();
+        let selection = Value::Object(p.vm.selection);
+        assert_eq!(
+            p.vm.call_method(&selection, "getBeginIndex", &[]),
+            Value::Number(-1.0)
+        );
+        set_focus(&mut p.vm, Some(field));
+        let text_value = p.vm.display_object(field);
+        let changed = p.vm.new_native(|vm, this, _| {
+            let text = vm.get(&this, "text");
+            let s = vm.to_str(&text);
+            vm.log.push(format!("changed: {s}"));
+            Value::Undefined
+        });
+        p.vm.set(&text_value, "onChanged", Value::Object(changed));
+        let t = p.vm.display.get_mut(field).unwrap().text_mut().unwrap();
+        t.variable = "name".into();
+        t.max_chars = 5;
+        t.restrict = Some("A-Za-z".into());
+        p.type_text("Rowan");
+        p.select_all();
+        assert_eq!(
+            p.vm.call_method(&selection, "getBeginIndex", &[]),
+            Value::Number(0.0)
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "getEndIndex", &[]),
+            Value::Number(5.0)
+        );
+        p.type_text("!");
+        assert_eq!(
+            p.vm.display.get(field).unwrap().text().unwrap().selection(),
+            (0, 5)
+        );
+        p.type_text("Sera");
+        let t = p.vm.display.get(field).unwrap().text().unwrap();
+        assert_eq!(t.text(), "Sera");
+        assert_eq!(t.selection(), (4, 4));
+        let root = p.vm.display_object(p.vm.root);
+        assert_eq!(p.vm.get(&root, "name"), Value::from("Sera"));
+        assert_eq!(p.drain_log().last().unwrap(), "changed: Sera");
+        p.key_down(17, None);
+        p.key_down(65, Some('a'));
+        p.key_up(65);
+        p.key_up(17);
+        p.key_down(8, None);
+        p.key_up(8);
+        assert_eq!(p.vm.display.get(field).unwrap().text().unwrap().text(), "");
+        assert_eq!(
+            p.vm.call_method(&selection, "getCaretIndex", &[]),
+            Value::Number(0.0)
+        );
+        set_focus(&mut p.vm, None);
+        assert_eq!(
+            p.vm.call_method(&selection, "getCaretIndex", &[]),
+            Value::Number(-1.0)
+        );
+    }
+
+    #[test]
     fn stationary_hover_refreshes_after_geometry_visibility_and_wheel_changes() {
         fn over(vm: &mut Vm, this: Value, _: &[Value]) -> Value {
             let name = vm.get(&this, "_name");
@@ -2079,67 +2140,6 @@ mod queue_tests {
         p.vm.set(&bv, "_visible", Value::Bool(true));
         p.mouse_wheel(10.0, 10.0, 1.0);
         assert_eq!(p.drain_log(), ["a out", "b over"]);
-    }
-
-    #[test]
-    fn select_all_replaces_text_and_keeps_restrictions_limits_and_notifications() {
-        let (mut p, field) = input_player();
-        let selection = Value::Object(p.vm.selection);
-        assert_eq!(
-            p.vm.call_method(&selection, "getBeginIndex", &[]),
-            Value::Number(-1.0)
-        );
-        set_focus(&mut p.vm, Some(field));
-        let text_value = p.vm.display_object(field);
-        let changed = p.vm.new_native(|vm, this, _| {
-            let text = vm.get(&this, "text");
-            let s = vm.to_str(&text);
-            vm.log.push(format!("changed: {s}"));
-            Value::Undefined
-        });
-        p.vm.set(&text_value, "onChanged", Value::Object(changed));
-        let t = p.vm.display.get_mut(field).unwrap().text_mut().unwrap();
-        t.variable = "name".into();
-        t.max_chars = 5;
-        t.restrict = Some("A-Za-z".into());
-        p.type_text("Rowan");
-        p.select_all();
-        assert_eq!(
-            p.vm.call_method(&selection, "getBeginIndex", &[]),
-            Value::Number(0.0)
-        );
-        assert_eq!(
-            p.vm.call_method(&selection, "getEndIndex", &[]),
-            Value::Number(5.0)
-        );
-        p.type_text("!");
-        assert_eq!(
-            p.vm.display.get(field).unwrap().text().unwrap().selection(),
-            (0, 5)
-        );
-        p.type_text("Sera");
-        let t = p.vm.display.get(field).unwrap().text().unwrap();
-        assert_eq!(t.text(), "Sera");
-        assert_eq!(t.selection(), (4, 4));
-        let root = p.vm.display_object(p.vm.root);
-        assert_eq!(p.vm.get(&root, "name"), Value::from("Sera"));
-        assert_eq!(p.drain_log().last().unwrap(), "changed: Sera");
-        p.key_down(17, None);
-        p.key_down(65, Some('a'));
-        p.key_up(65);
-        p.key_up(17);
-        p.key_down(8, None);
-        p.key_up(8);
-        assert_eq!(p.vm.display.get(field).unwrap().text().unwrap().text(), "");
-        assert_eq!(
-            p.vm.call_method(&selection, "getCaretIndex", &[]),
-            Value::Number(0.0)
-        );
-        set_focus(&mut p.vm, None);
-        assert_eq!(
-            p.vm.call_method(&selection, "getCaretIndex", &[]),
-            Value::Number(-1.0)
-        );
     }
 
     #[test]
