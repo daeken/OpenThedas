@@ -7060,6 +7060,100 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_cleanup_preserves_hero_defaults_and_presentation_routing() {
+        let table = Arc::new(
+            EngineTable::parse(
+                br#"
+          int FOLLOWER_STATE_ACTIVE = 1;
+          int GetFollowerState(object o) = 1;
+          int GetFollowerSubState(object o) = 2;
+          int GetPackage(object o) = 3;
+          int GetCreatureRacialType(object o) = 4;
+          int GetCombatantType(object o) = 5;
+          int GetItemUnique(object o) = 6;
+          int GetItemMaterialProgression(object o) = 7;
+          void SetCreatureGoreLevel(object o, float f) = 8;
+        "#,
+            )
+            .unwrap(),
+        );
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut s = Sim::new(Arc::new(Vfs::new()), table.clone(), 1);
+            s.game = game;
+            let hero = s.world.spawn(ObjectKind::Creature, "hero");
+            let other = s.world.spawn(ObjectKind::Creature, "other");
+            s.world.hero = Some(hero);
+            let args = [Value::Object(hero)];
+            assert!(
+                !s.world
+                    .get(hero)
+                    .unwrap()
+                    .fields
+                    .contains_key("FollowerState")
+            );
+            assert_eq!(
+                run(&mut s, hero, "GetFollowerState", &args),
+                Some(Value::Int(1))
+            );
+            for who in [other, OBJECT_INVALID] {
+                assert_eq!(
+                    run(&mut s, hero, "GetFollowerState", &[Value::Object(who)]),
+                    Some(Value::Int(0))
+                );
+            }
+            assert_eq!(
+                run(&mut s, hero, "GetFollowerSubState", &args),
+                Some(Value::Int(0))
+            );
+            // The removed copies could never supply ACTIVE to any of these getters.
+            for (name, field) in [
+                ("GetPackage", "Package"),
+                ("GetCreatureRacialType", "Race"),
+                ("GetCombatantType", "Combatant"),
+                ("GetItemUnique", "Unique"),
+                ("GetItemMaterialProgression", "MaterialProgress"),
+            ] {
+                assert_eq!(run(&mut s, hero, name, &args), Some(Value::Int(0)));
+                s.world
+                    .get_mut(hero)
+                    .unwrap()
+                    .fields
+                    .insert(field.into(), 37);
+                assert_eq!(run(&mut s, hero, name, &args), Some(Value::Int(37)));
+            }
+            // A stored state, including zero, takes priority over the hero fallback.
+            for state in [0, 5] {
+                s.world
+                    .get_mut(hero)
+                    .unwrap()
+                    .fields
+                    .insert("FollowerState".into(), state);
+                assert_eq!(
+                    run(&mut s, hero, "GetFollowerState", &args),
+                    Some(Value::Int(state))
+                );
+            }
+            assert_eq!(
+                run(
+                    &mut s,
+                    hero,
+                    "SetCreatureGoreLevel",
+                    &[Value::Object(hero), Value::Float(1.0)]
+                ),
+                None
+            );
+            assert_eq!(
+                s.world.trace.presentation.get("SetCreatureGoreLevel"),
+                Some(&1)
+            );
+            assert!(
+                s.world.trace.entries.is_empty(),
+                "the later log arm is unreachable"
+            );
+        }
+    }
+
+    #[test]
     fn followers_joining_the_party_take_the_heros_side() {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
