@@ -3548,10 +3548,22 @@ pub fn call(
                 .unwrap_or(0),
         )),
         "GetTeam" => {
-            let (team, mask) = (int(a, 0), int(a, 1));
-            let mask = if mask == 0 { 32 } else { mask };
-            // Only the loaded area's objects (active or not): areas left behind keep
-            // their teams, and those must not keep a team here alive.
+            let team = int(a, 0);
+            let mask = if a.len() > 1 { int(a, 1) } else { 32 };
+            // Origins 0x66e570 obtains the current area's team registry (0x5d4fc0,
+            // 0x5fe470). Its type argument selects one bucket, log2(type) + 1,
+            // rather than combining the bits. -1 is the invalid team id.
+            let mask = if h.sim.game == thedas_vfs::Game::Origins {
+                if team == -1 || mask <= 0 || h.sim.world.area.is_none() {
+                    return ok(objects(Vec::new()));
+                }
+                1 << (mask as u32).ilog2()
+            } else if mask == 0 {
+                32
+            } else {
+                mask
+            };
+            // Inactive and dead members remain in the registry; other areas do not.
             let here = h.sim.world.area;
             let v: Vec<ObjectId> = h
                 .sim
@@ -6754,6 +6766,48 @@ mod tests {
             r,
             Some(objects(vec![team[0], team[1]])),
             "inactive members count, other areas' do not"
+        );
+        s.world.get_mut(team[0]).unwrap().dead = true;
+        assert_eq!(
+            run(&mut s, there, "GetTeam", &[Value::Int(16)]),
+            Some(objects(vec![team[0], team[1]])),
+            "the default includes dead creatures and uses the loaded area, not the caller"
+        );
+        let chest = s.world.spawn(ObjectKind::Placeable, "chest");
+        let o = s.world.get_mut(chest).unwrap();
+        o.team = 16;
+        o.area = Some(here);
+        // A multi-bit type selects its highest bit's bucket, rather than a union.
+        for mask in [512, 512 | 32, 1023] {
+            assert_eq!(
+                run(&mut s, here, "GetTeam", &[Value::Int(16), Value::Int(mask)]),
+                Some(objects(vec![chest]))
+            );
+        }
+        s.world.get_mut(team[1]).unwrap().team = -1;
+        for (id, mask) in [(-1, 32), (99, 32), (16, 0), (16, -1)] {
+            assert_eq!(
+                run(&mut s, here, "GetTeam", &[Value::Int(id), Value::Int(mask)]),
+                Some(objects(vec![]))
+            );
+        }
+        s.world.area = Some(there);
+        assert_eq!(
+            run(&mut s, here, "GetTeam", &[Value::Int(16)]),
+            Some(objects(vec![team[2]]))
+        );
+        // With no loaded area, area-less objects are not a substitute registry.
+        s.world.get_mut(team[2]).unwrap().area = None;
+        s.world.area = None;
+        assert_eq!(
+            run(&mut s, here, "GetTeam", &[Value::Int(16)]),
+            Some(objects(vec![]))
+        );
+        // DA2 retains its earlier provisional mask and area-less behavior.
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(
+            run(&mut s, here, "GetTeam", &[Value::Int(16), Value::Int(0)]),
+            Some(objects(vec![team[2]]))
         );
     }
 
