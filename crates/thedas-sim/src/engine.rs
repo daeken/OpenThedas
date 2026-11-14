@@ -234,7 +234,7 @@ fn objects(items: Vec<ObjectId>) -> Value {
     }
 }
 
-fn cell_int(c: Option<&Cell>) -> i32 {
+pub(crate) fn cell_int(c: Option<&Cell>) -> i32 {
     match c {
         Some(Cell::Int(v)) => *v as i32,
         Some(Cell::Float(v)) => *v as i32,
