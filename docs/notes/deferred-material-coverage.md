@@ -179,3 +179,49 @@ blend opposite faces in order. Moving any one of them into the opaque G-buffer
 would break that relationship. Eyelashes and Prop punch already cast sampled point
 shadows through the independent cutout plan; their fractional colour remains forward.
 Further coverage needs a compatible forward-lighting or transparency design.
+
+## Ordered character lighting
+
+The optional renderer now lights the 265 eyelash passes and 800 hair passes through
+their existing forward phases, using the shared deferred light list, screen/depth
+tiles, room/domain masks and sun/point visibility. These **1,065 passes remain
+forward geometry**; G-buffer coverage stays at 33,159 / 34,360. Another **136 passes**
+still use their faithful lighting. Planned counts include offscreen geometry.
+`THEDAS_DEFERRED_LOG_MATERIALS=1` reports ordered lighting separately with
+`deferred-forward-material` planning and first-frame visibility rows.
+
+Hair admission requires all four compatible passes and valid packed/noise textures,
+tangents and skin data. The packed texture retains red strand shift, green tint,
+blue opacity and alpha specular mask. Noise uses its own authored sampler and tile
+factor. Interleaved tint colours and both authored strand powers are retained.
+Direct lights use the optional renderer's radius cutoff and cube visibility; this
+is its own lighting model, rather than a claim of faithful pixel parity.
+Finite zero tangent slots, present in several shipped meshes, remain eligible;
+a degenerate interpolated strand uses a finite perpendicular tangent.
+
+All four passes use one posed vertex calculation with invariant clip positions.
+The colour-disabled core tests
+blue coverage against the authored 8-bit alpha reference and writes depth. The
+second pass tests equal depth, with no depth writes or blend. The third draws the
+back faces with source-alpha blending and no depth writes; the fourth draws front
+faces with that blend and depth writes. Both test less depth. This path needs no
+translation-invariance depth bias between hair shaders. It retains the existing
+per-material order and delayed transparency phase, including under MSAA.
+The faithful backend currently relaxes the colour pass's equal test to less-or-equal
+and biases the blended back-face overlay. Native invariant positions retain the
+authored comparisons here. Fractional strand gaps can therefore look softer than
+that provisional faithful coverage; before/after media includes this difference.
+
+Eyelashes retain diffuse alpha, opacity, the authored comparison, source-alpha
+blend, cull/depth state, and their -2.5 diffuse mip bias. Both families interpolate
+the assigned probe from posed normals. They receive all eligible lights in reach;
+the original object light-count limit no longer applies to these receivers.
+Their fractional colour is not written to the opaque G-buffer or SSAO depth.
+Existing sampled eyelash/hair-core point casters remain independent and unchanged.
+
+Runtime fades return the complete material family to its faithful controls for
+that frame. Missing or incompatible inputs retain the same fallback. The faithful
+renderer continues to use its own pipelines. `THEDAS_DEFERRED_FORWARD_LIGHTING=0`
+disables planning; the control is read once. A renderer-local
+`THEDAS_BENCH_DEFERRED_COMPARE=forward-lighting` compares lighting paths within one
+load and restores the override after capture.

@@ -13,7 +13,7 @@ use thedas_shader::{
     translate::{Interface, IoSlot, Semantic},
 };
 
-fn translation(wgsl: &str, stage: Stage, constant: Constant) -> Translation {
+pub(super) fn translation(wgsl: &str, stage: Stage, constant: Constant) -> Translation {
     let module = naga::front::wgsl::parse_str(wgsl).unwrap();
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
