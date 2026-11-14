@@ -88,7 +88,6 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
    insertion caret. Focused ranges draw white text over black highlights; an input caret
    blinks at 500 ms intervals, resets on edits/navigation, and disappears on focus loss.
    Blink boundaries invalidate the picture without discarding the cached text layout.
-   Mouse caret placement remains separate work.
 5. **`render`**: wgpu. Shapes are tessellated once per character (lyon) into cached vertex
    buffers; bitmaps (atlas DDS pages) uploaded once; scale9 drawn natively. Colour transform
    and blend mode per draw; multiply and the few other modes against the scene picture,
