@@ -480,6 +480,10 @@ pub struct RenderCache {
     /// What the objects' scenes built over these resources share (see
     /// [`AreaScene::load_objects_cached`]).
     pub scenes: crate::scene::SceneCache,
+    /// The samples a pixel the frames of the renderers made with this cache are drawn with
+    /// (see [`crate::msaa`]; 0 and 1: single-sampled). Every renderer drawn into one frame
+    /// (the level, its objects, the rings) must share it.
+    pub samples: u32,
 }
 
 impl RenderCache {
@@ -553,6 +557,10 @@ pub struct AreaRenderer {
     /// find its coverage).
     pub clear: wgpu::Color,
     depth: Option<(wgpu::TextureView, u32, u32)>,
+    /// The samples a pixel it draws with (see [`RenderCache::samples`]), and its
+    /// multisampled targets when more than one ([`crate::msaa`]).
+    samples: u32,
+    msaa: Option<crate::msaa::MsaaTargets>,
     /// The level's frame buffer effects, for a renderer of the level's own meshes.
     effects: Option<crate::post::FrameEffects>,
     /// Whether [`AreaRenderer::finish_frame`] draws the level's frame buffer effects (the
@@ -732,6 +740,8 @@ impl AreaRenderer {
         });
 
         // Textures.
+        let samples = render_cache.samples.max(1);
+        render_cache.d3d.samples = samples;
         let RenderCache {
             textures: cache,
             d3d: d3d_cache,
@@ -885,7 +895,14 @@ impl AreaRenderer {
                         })
                     });
                     pipelines.push((
-                        create_pipeline(device, &pipeline_layout, module, &program, color_format),
+                        create_pipeline(
+                            device,
+                            &pipeline_layout,
+                            module,
+                            &program,
+                            color_format,
+                            samples,
+                        ),
                         program.blend,
                     ));
                     stats.programs.push(program.name.clone());
@@ -1028,6 +1045,8 @@ impl AreaRenderer {
             only_draws: None,
             clear: wgpu::Color::BLACK,
             depth: None,
+            samples,
+            msaa: None,
             // Only a renderer of the level's own meshes runs its effects; the objects' scene
             // draws over it.
             effects: (scene.static_draws > 0)
@@ -1088,6 +1107,26 @@ impl AreaRenderer {
                 .collect(),
             path: crate::deferred::RenderPath::Faithful,
             deferred,
+        }
+    }
+
+    /// The lights its glowing particle emitters give the deferred path this frame (see
+    /// [`crate::deferred::emitter_light`]); the faithful path has none of these.
+    pub fn emitter_lights(&self) -> Vec<crate::scene::SceneLight> {
+        self.d3d
+            .glowing_emitters()
+            .into_iter()
+            .filter_map(|i| self.emitters.get(i))
+            .filter_map(crate::deferred::emitter_light)
+            .collect()
+    }
+
+    /// Gives the deferred path `lights` beside the scene's for the next frames (the
+    /// emitters' of every renderer drawn over this one); a renderer that cannot draw
+    /// deferred ignores them.
+    pub fn set_effect_lights(&mut self, lights: Vec<crate::scene::SceneLight>) {
+        if let Some(d) = self.deferred.as_mut() {
+            d.set_effect_lights(lights);
         }
     }
 
@@ -1352,9 +1391,81 @@ impl AreaRenderer {
     }
 
     /// This renderer's depth buffer for a target of the given size, for a later pass to
-    /// draw over (see [`AreaRenderer::render_over`]).
+    /// draw over (see [`AreaRenderer::render_over`]): the multisampled one when it
+    /// multisamples ([`crate::msaa`]).
     pub fn depth(&mut self, device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
-        self.depth_view(device, width, height).clone()
+        match self.msaa_targets(device, width, height) {
+            Some(m) => m.depth.clone(),
+            None => self.depth_view(device, width, height).clone(),
+        }
+    }
+
+    /// The view the frame is drawn into for a target `target` of the given size: this
+    /// renderer's multisampled colour when it multisamples, else `target` itself. Later
+    /// passes (the objects, the rings) draw over it, before [`AreaRenderer::resolve`].
+    pub fn frame_view(
+        &mut self,
+        device: &wgpu::Device,
+        target: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) -> wgpu::TextureView {
+        match self.msaa_targets(device, width, height) {
+            Some(m) => m.colour.clone(),
+            None => target.clone(),
+        }
+    }
+
+    /// The samples a pixel it draws with.
+    pub fn samples(&self) -> u32 {
+        self.samples
+    }
+
+    /// When it multisamples: the frame drawn so far (by it and the passes over it) resolved
+    /// into `target`, and its depth into the single-sampled depth the frame buffer effects
+    /// read. Call it after the last world pass and before [`AreaRenderer::finish_frame`].
+    pub fn resolve(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) {
+        if self.samples <= 1 {
+            return;
+        }
+        let depth = self.depth_view(device, width, height).clone();
+        if let Some(m) = self.msaa_targets(device, width, height) {
+            m.resolve(device, encoder, target, &depth);
+        }
+    }
+
+    /// Its multisampled targets for frames of this size, made when first needed; `None`
+    /// when it draws single-sampled.
+    fn msaa_targets(
+        &mut self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+    ) -> Option<&crate::msaa::MsaaTargets> {
+        if self.samples <= 1 {
+            return None;
+        }
+        let (format, samples) = (self.color_format, self.samples);
+        if !self
+            .msaa
+            .as_ref()
+            .is_some_and(|m| m.fits(format, (width, height), samples))
+        {
+            self.msaa = Some(crate::msaa::MsaaTargets::new(
+                device,
+                format,
+                (width, height),
+                samples,
+            ));
+        }
+        self.msaa.as_ref()
     }
 
     /// Records the area pass into `encoder`, drawing into `target` of the given size.
@@ -1371,6 +1482,7 @@ impl AreaRenderer {
         self.encode_shadows(encoder, true);
         self.finish_shadows(encoder);
         self.render_pass(ctx, encoder, target, width, height, camera, None);
+        self.resolve(&ctx.device, encoder, target, width, height);
     }
 
     /// [`AreaRenderer::render`] after [`AreaRenderer::encode_shadows`] recorded this frame's
@@ -1461,11 +1573,26 @@ impl AreaRenderer {
         }
         self.d3d
             .update_particles(ctx, camera, width, height, self.time as f32, &self.emitters);
-        let depth = match over {
-            Some(d) => d.clone(),
-            None => self.depth_view(&ctx.device, width, height).clone(),
+        // Multisampled (see [`crate::msaa`]): the frame's own pass draws into this
+        // renderer's multisampled targets; a pass over another's (`over`) is handed them.
+        let ms = match over {
+            None => self
+                .msaa_targets(&ctx.device, width, height)
+                .map(|m| (m.colour.clone(), m.depth.clone(), m.single.clone())),
+            Some(_) => None,
+        };
+        let single_depth = self.depth_view(&ctx.device, width, height).clone();
+        let depth = match (over, &ms) {
+            (Some(d), _) => d.clone(),
+            (None, Some((_, d, _))) => d.clone(),
+            (None, None) => single_depth.clone(),
         };
         // The deferred path draws its share first, clearing the frame; the rest goes over.
+        // Multisampled, it draws single-sampled and every sample is filled from that.
+        let (deferred_target, deferred_depth) = match &ms {
+            Some((_, _, single)) => (single.clone(), single_depth.clone()),
+            None => (target.clone(), depth.clone()),
+        };
         let deferred = over.is_none()
             && self.only_draws.is_none()
             && self.path == crate::deferred::RenderPath::Deferred
@@ -1473,9 +1600,9 @@ impl AreaRenderer {
                 p.encode(
                     ctx,
                     encoder,
-                    target,
+                    &deferred_target,
                     self.color_format,
-                    &depth,
+                    &deferred_depth,
                     (width, height),
                     camera,
                     &self.d3d,
@@ -1483,14 +1610,18 @@ impl AreaRenderer {
                     self.clear,
                 )
             });
+        if deferred && let Some(m) = &self.msaa {
+            m.fill(&ctx.device, encoder, &deferred_target, &deferred_depth);
+        }
         let (color_load, depth_load) = match over {
             None if !deferred => (wgpu::LoadOp::Clear(self.clear), wgpu::LoadOp::Clear(1.0)),
             _ => (wgpu::LoadOp::Load, wgpu::LoadOp::Load),
         };
+        let colour = ms.as_ref().map_or(target, |(c, _, _)| c);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("area"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
+                view: colour,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -1584,7 +1715,7 @@ impl AreaRenderer {
     ) {
         self.frame_effects_with(ctx, encoder, target, width, height, overlays);
         // Edges smoothed last, over everything the world drew (see [`crate::fxaa`]).
-        if self.antialias && !self.antialias_refused {
+        if self.antialias && self.samples <= 1 && !self.antialias_refused {
             if !self
                 .fxaa
                 .as_ref()
@@ -1630,7 +1761,7 @@ impl AreaRenderer {
                 });
                 self.distortion_refused = self.distortion.is_none();
             }
-            let depth = self.depth(&ctx.device, width, height);
+            let depth = self.depth_view(&ctx.device, width, height).clone();
             if let Some(d) = &self.distortion {
                 d.apply(encoder, target, &depth, |pass| {
                     self.d3d.draw_particles(pass, true);
@@ -1662,7 +1793,7 @@ impl AreaRenderer {
                 self.cut_refused = self.cut_pass.is_none();
             }
         }
-        let depth = self.depth(&ctx.device, width, height);
+        let depth = self.depth_view(&ctx.device, width, height).clone();
         if let (Some(pass), Some(projection)) = (&self.cut_pass, self.frame_projection) {
             for (nth, dof) in self.cut_effects.depth_of_field.iter().enumerate() {
                 pass.depth_of_field(
@@ -1764,13 +1895,15 @@ impl AreaRenderer {
         }
         self.finish_shadows(&mut encoder);
         self.render_pass(ctx, &mut encoder, &view, width, height, camera, None);
-        under(&mut encoder, &view);
+        let frame = self.frame_view(&ctx.device, &view, width, height);
+        under(&mut encoder, &frame);
         if !overlays.is_empty() {
             let depth = self.depth(&ctx.device, width, height);
             for o in overlays.iter_mut() {
-                o.render_over(ctx, &mut encoder, &view, width, height, camera, &depth);
+                o.render_over(ctx, &mut encoder, &frame, width, height, camera, &depth);
             }
         }
+        self.resolve(&ctx.device, &mut encoder, &view, width, height);
         {
             let over: Vec<&AreaRenderer> = overlays.iter().map(|o| &**o).collect();
             self.finish_frame_with(ctx, &mut encoder, &target, width, height, &over);
@@ -1840,6 +1973,7 @@ fn create_pipeline(
     module: &wgpu::ShaderModule,
     program: &MaterialProgram,
     color_format: wgpu::TextureFormat,
+    samples: u32,
 ) -> wgpu::RenderPipeline {
     let blend = match program.blend {
         BlendMode::AlphaBlend => Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -1872,7 +2006,10 @@ fn create_pipeline(
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        },
         fragment: Some(wgpu::FragmentState {
             module,
             entry_point: Some(program.fs_entry),
