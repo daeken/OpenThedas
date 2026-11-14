@@ -418,6 +418,18 @@ fn sort_addins(addins: &mut [AddIn]) {
     });
 }
 
+/// Every `AddInItem` of a manifest (or registry), in file order, as written (no gates
+/// applied, no folders).
+pub(crate) fn manifest_items(text: &str) -> Vec<AddIn> {
+    registry_items(text, None)
+        .into_iter()
+        .map(|(mut a, _)| {
+            a.enabled = true;
+            a
+        })
+        .collect()
+}
+
 /// An add-in described by a manifest's first `AddInItem`. `fallback_uid` names it when the
 /// manifest gives no UID.
 pub(crate) fn addin_from_manifest(text: &str, dir: PathBuf, fallback_uid: String) -> AddIn {
@@ -487,10 +499,28 @@ impl LevelMount {
 
 impl DaoInstall {
     /// The `env` directories that can hold levels, in search order: the core package, then
-    /// enabled DLC packages by priority (highest first). Provisional, like the global order.
+    /// enabled add-ins in the stack's order (the one that wins first). With mods on (as
+    /// [`DaoInstall::play_vfs`] decides), the player's add-ins join them: those in the
+    /// original's documents folder and those packaged in the mod list's `.dazip` files, so
+    /// a mod's new areas are found. Provisional, like the global order.
     pub fn env_dirs(&self) -> Result<Vec<PathBuf>> {
+        let mut player = Vec::new();
+        if crate::mods::default_list_file().is_some() {
+            if let Some(user) = crate::mods::original_user_dir(self.game()) {
+                player.extend(self.user_addins(&user).unwrap_or_default());
+            }
+            player.extend(crate::mods::default_list_addins());
+        }
+        self.env_dirs_with(player)
+    }
+
+    /// [`DaoInstall::env_dirs`] with `player`'s add-ins among the install's.
+    pub fn env_dirs_with(&self, player: Vec<AddIn>) -> Result<Vec<PathBuf>> {
         let mut dirs = vec![join_ci(&self.root, "packages/core/env")];
-        let mut addins: Vec<AddIn> = self.addins()?.into_iter().filter(|a| a.enabled).collect();
+        let mut addins: Vec<AddIn> = self.addins()?;
+        addins.extend(player);
+        let mut addins: Vec<AddIn> = addins.into_iter().filter(|a| a.enabled).collect();
+        sort_addins(&mut addins);
         addins.reverse();
         for a in addins {
             dirs.push(join_ci(&a.dir, "core/env"));
