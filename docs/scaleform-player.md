@@ -27,7 +27,10 @@ Script: `OpenThedas-testdata/scaleform/scripts/inventory.py`; output `inventory.
   atlases), ExporterInfo, FileAttributes, SetBackgroundColor, Metadata.
   **None of**: buttons, static text, sounds, video, bitmaps embedded as SWF bitmaps, AS3.
 - Fills: bitmap clip (2.3k, mostly non-smoothed), solid (577), linear 28, radial 20, focal 1.
-  Strokes: 38 line styles in all. Masks (clip depth): 177. Colour transforms everywhere.
+  Strokes: 38 line styles in all. Authored strokes retain round/flat/square endpoint caps,
+  round/bevel/miter joins and miter limits. Shape4's no-close flag keeps meeting endpoints
+  capped; legacy shapes and morph strokes use their implicit round caps and joins.
+  Masks (clip depth): 177. Colour transforms everywhere.
 - Blend modes: multiply (253), overlay 5, difference 4, hardlight 4, invert 2, add, erase,
   screen 1 each. Filters: Glow 2, DropShadow 1. cacheAsBitmap 3.
 - Text: 706 edit texts, almost all `useOutlines`, read-only, non-selectable, 476 HTML; 18 input
@@ -67,6 +70,9 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
    `onLoad` after the frame's code; `Stage.width/height` report the visible area.
 3. **`display`**: the display list (MovieClip, Shape, EditText, Morph), timelines, depth
    rules, mouse picking (with `hitTestDisable`), focus and keyboard routing, input text.
+   Timeline-placed registered classes construct parents before descendants. This preserves
+   the GUI framework's last-created element and associates post-load callbacks with the
+   intended child, including popup centring before the text resizes its box.
 4. **`text`**: HTML-subset parser (p, br, font face/size/color, b, i, u, img), layout with
    word wrap, autosize, `textAutoSize` shrink, shadows; glyphs from the font library's
    DefineFont3 outlines, rasterised into a glyph atlas at the drawn size.
@@ -99,15 +105,30 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
   optionsmenu, newgame. All 66 movies start and run headless without errors.
 - Release build, idle: 10 µs to 9 ms of script per frame per movie (quickbar 0.27 ms against
   Ruffle's 2.1 ms); a movie that did not change is not drawn again.
+- Display objects stringify to their paths and unnamed timeline clips/text fields receive
+  unique `instanceN` names. Host tree walks can now configure notification multiply passes
+  (removing the black bands behind popups) and find menu buttons. Popup vertical placement
+  still differs from Ruffle by about 45 pixels in the choice/text comparison recipes.
+- Engine render targets (`paperdoll`) replace their external placeholder shapes at the
+  authored bounds. Same-size frames update the existing GPU texture and cached bindings;
+  clearing a target makes it transparent.
 - Glow/DropShadow/Blur filters flatten the subtree, repeat separable box blur by quality,
   then composite premultiplied colour with strength, inner/knockout and source visibility.
   Parent stencil masks clip the result; nested filters and ordered filter lists are supported.
   Intermediates currently cover the viewport, so content outside it cannot cast a shadow
   back into view; cropped/padded filter targets and pooling remain optimizations.
+- Layer blend groups render to isolated targets. Alpha/erase modify that layer's picture;
+  outside a layer they draw nothing, matching Flash and avoiding the map's black border.
+- Export-backed `BitmapData.loadBitmap` and `MovieClip.attachBitmap` let the shared host
+  inline-image helper place copper/silver/gold icons in inventory and store prices. Timeline
+  jumps distinguish text characters, so the unaffordable-price state can replace gold text
+  with its authored red definition. Native text-layout `<img>` rendering remains separate.
+- `MovieClip.duplicateMovieClip` constructs a fresh instance of the registered class with
+  the source's transform, colour, drawing and clip events. The host can now add its Mod Mode
+  button alongside Report Issue using the same menu setup on either backend.
 - Not yet: text `shadowStyle`, overlay / hard light /
-  difference / invert / erase blends (drawn normal), `setMask`, inline `<img>` in text, the
-  engine-drawn paperdoll image, and movies checked with real engine state (book screens,
-  popups, conversation).
+  difference / invert blends (drawn normal), `setMask`, inline `<img>` in text,
+  and complete parity on engine-state screens (book screens, popups, conversation).
 - Tools: `cargo run -p thedas-ui --example sidebyside -- INSTALL OUT.png MOVIES [FRAMES]
   [WxH] [ORIGINAL.png]` (Ruffle and ours, optionally after a shot of the original);
   `thedas-gfx` examples `gfxscan` (parse), `gfxrun` (run headless; `GFX_RENDER=1` times

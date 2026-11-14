@@ -10,6 +10,9 @@ use crate::display::{Clip, DEPTH_OFFSET, Display, DisplayId, Kind, Object};
 use crate::swf::{Character, ClipAction, Command, Movie, Place, Record, clip_event};
 use crate::text::{Fonts, TextField};
 
+#[cfg(test)]
+mod construction_tests;
+
 /// Scaleform's mouse buttons as the movies number them.
 pub const MOUSE_LEFT: u8 = 1;
 pub const MOUSE_RIGHT: u8 = 2;
@@ -26,6 +29,7 @@ pub struct Player {
     pressed: Option<(DisplayId, u8)>,
     queue_init: VecDeque<Queued>,
     queue_construct: VecDeque<Queued>,
+    queue_default: VecDeque<Queued>,
     /// Whether press handlers get the mouse button as Scaleform passed it (`onPress(1)`).
     pub pass_buttons: bool,
 }
@@ -82,6 +86,7 @@ impl Player {
         let root = display.add(root_obj);
         let stage_size = movie.stage_size();
         let mut vm = Vm {
+            next_instance_id: 1,
             heap,
             display,
             global,
@@ -132,6 +137,7 @@ impl Player {
             pressed: None,
             queue_init: VecDeque::new(),
             queue_construct: VecDeque::new(),
+            queue_default: VecDeque::new(),
             pass_buttons: true,
         };
         // The root's first frame.
@@ -225,13 +231,14 @@ impl Player {
                 match q {
                     Queued::Init(..) => self.queue_init.push_back(q),
                     Queued::Construct { .. } => self.queue_construct.push_back(q),
-                    _ => self.queue_construct.push_back(q),
+                    _ => self.queue_default.push_back(q),
                 }
             }
             let Some(q) = self
                 .queue_init
                 .pop_front()
                 .or_else(|| self.queue_construct.pop_front())
+                .or_else(|| self.queue_default.pop_front())
             else {
                 break;
             };
@@ -240,6 +247,7 @@ impl Player {
                 self.vm.warn_once("action queue runaway".into());
                 self.queue_init.clear();
                 self.queue_construct.clear();
+                self.queue_default.clear();
                 break;
             }
             run_queued(&mut self.vm, q);
@@ -289,6 +297,7 @@ impl Player {
             .iter()
             .chain(self.queue_init.iter())
             .chain(self.queue_construct.iter())
+            .chain(self.queue_default.iter())
         {
             if let Queued::Construct { ctor: Some(c), .. } = q {
                 extra.push(c.clone());
@@ -797,17 +806,22 @@ fn place(vm: &mut Vm, parent: DisplayId, p: &Place) {
         }
         remove_clip(vm, e);
     }
-    let Some(obj) = instantiate(vm, id) else {
+    let Some(mut obj) = instantiate(vm, id) else {
         return;
+    };
+    obj.name = match &p.name {
+        Some(n) => Str::from(n.as_str()),
+        None if matches!(obj.kind, Kind::Clip(_) | Kind::Text(_)) => {
+            let name = Str::from(format!("instance{}", vm.next_instance_id));
+            vm.next_instance_id = vm.next_instance_id.wrapping_add(1);
+            name
+        }
+        None => Str::from(""),
     };
     let new = vm.display.add(obj);
     insert_child(vm, parent, new, depth);
     if let Some(o) = vm.display.get_mut(new) {
         o.from_timeline = true;
-        o.name = match &p.name {
-            Some(n) => Str::from(n.as_str()),
-            None => Str::from(""),
-        };
     }
     apply_place_props(vm, new, p);
     if let Some(c) = vm.display.get_mut(new).and_then(|o| o.clip_mut()) {
@@ -921,6 +935,19 @@ fn constructed(vm: &mut Vm, d: DisplayId, by_script: bool, init: Option<ObjId>) 
     let character = o.clip().map(|c| c.character).unwrap_or(0);
     let ctor = vm.classes.get(&character).cloned();
     display_api::display_value(vm, d);
+    if !by_script {
+        // Reserve the parent's construction work before frame one recursively places
+        // its children. Registered classes may keep the last instance they construct
+        // to associate post-load callbacks with the final descendant.
+        for e in clip_events(vm, d, clip_event::INITIALIZE) {
+            vm.queue.push_back(Queued::Init(d, e));
+        }
+        vm.queue.push_back(Queued::Construct {
+            clip: d,
+            ctor: ctor.clone(),
+            events: clip_events(vm, d, clip_event::CONSTRUCT),
+        });
+    }
     // The clip's load event is queued before its first frame makes its children, so a
     // parent hears `onLoad` before the clips inside it (as Ruffle and Scaleform order it).
     let load = clip_events(vm, d, clip_event::LOAD);
@@ -948,15 +975,6 @@ fn constructed(vm: &mut Vm, d: DisplayId, by_script: bool, init: Option<ObjId>) 
             }
             vm.call_with_base(&ctor, obj, &[], proto);
         }
-    } else {
-        for e in clip_events(vm, d, clip_event::INITIALIZE) {
-            vm.queue.push_back(Queued::Init(d, e));
-        }
-        vm.queue.push_back(Queued::Construct {
-            clip: d,
-            ctor,
-            events: clip_events(vm, d, clip_event::CONSTRUCT),
-        });
     }
 }
 
@@ -1056,7 +1074,7 @@ pub fn goto(vm: &mut Vm, d: DisplayId, frame: u16, play: bool) {
                     vm.display.get(e).is_some_and(|o| match &o.kind {
                         Kind::Clip(c) => Some(c.character) == p.character,
                         Kind::Shape(_, c) | Kind::Morph(_, c) => Some(*c) == p.character,
-                        Kind::Text(_) => true,
+                        Kind::Text(t) => p.character.and_then(|id| vm.movie.characters.get(&id)).is_some_and(|c| matches!(c, Character::EditText(def) if Arc::ptr_eq(&t.def, def))),
                         _ => false,
                     })
                 });
@@ -1217,6 +1235,53 @@ fn replace_at(vm: &mut Vm, parent: DisplayId, depth: i32) {
     }
 }
 
+/// Duplicates a clip's authored symbol and drawing, then constructs a fresh script object.
+/// Dynamic properties belong to the original and are not copied.
+pub fn duplicate(
+    vm: &mut Vm,
+    source: DisplayId,
+    name: &str,
+    depth: i32,
+    init: Option<ObjId>,
+) -> Option<DisplayId> {
+    // Flash's allowed depths, expressed in the same unshifted units as getDepth.
+    if !(DEPTH_OFFSET..=2_130_690_044).contains(&depth) {
+        return None;
+    }
+    let source = vm.display.get(source)?;
+    let parent = source.parent?;
+    let clip = source.clip()?;
+    let (character, matrix, color, drawing, actions) = (
+        clip.character,
+        source.matrix,
+        source.color,
+        clip.drawing.clone(),
+        clip.clip_actions.clone(),
+    );
+    let mut object = if character == 0 {
+        Object::new(Kind::Clip(Box::new(clip_for(
+            Arc::new(crate::swf::Timeline {
+                frames: vec![Default::default()],
+                labels: vec![],
+            }),
+            0,
+        ))))
+    } else {
+        instantiate(vm, character)?
+    };
+    object.name = Str::from(name);
+    object.matrix = matrix;
+    object.color = color;
+    let clip = object.clip_mut()?;
+    clip.drawing = drawing;
+    clip.clip_actions = actions;
+    replace_at(vm, parent, depth);
+    let new = vm.display.add(object);
+    insert_child(vm, parent, new, depth);
+    constructed(vm, new, true, init);
+    Some(new)
+}
+
 pub fn create_empty(vm: &mut Vm, parent: DisplayId, name: &str, depth: i32) -> Option<DisplayId> {
     replace_at(vm, parent, depth);
     let tl = Arc::new(crate::swf::Timeline {
@@ -1319,6 +1384,23 @@ pub fn load_into(vm: &mut Vm, d: DisplayId, url: &str) -> bool {
         c.loaded_image = Some(url.to_string());
     }
     true
+}
+
+pub fn attach_bitmap(
+    vm: &mut Vm,
+    parent: DisplayId,
+    depth: i32,
+    url: String,
+    width: u16,
+    height: u16,
+) {
+    replace_at(vm, parent, depth);
+    let bitmap = vm.display.add(Object::new(Kind::Bitmap {
+        url,
+        width: width as f32,
+        height: height as f32,
+    }));
+    insert_child(vm, parent, bitmap, depth);
 }
 
 pub fn unload(vm: &mut Vm, d: DisplayId) {
@@ -1818,4 +1900,294 @@ pub fn topmost(vm: &Vm) -> Option<DisplayId> {
         (vm.mouse_pos.0 * 20.0) as f32,
         (vm.mouse_pos.1 * 20.0) as f32,
     )
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    use crate::avm1::{Host, HostValue};
+    use crate::text::Fonts;
+
+    struct Empty;
+    impl Host for Empty {
+        fn fscommand(&mut self, _: &str, _: &str) {}
+        fn external_call(&mut self, _: &str, _: &[HostValue]) -> HostValue {
+            HostValue::Undefined
+        }
+    }
+    impl Fonts for Empty {
+        fn font(&self, _: &str, _: bool, _: bool) -> Option<Arc<crate::swf::Font>> {
+            None
+        }
+    }
+
+    fn trace(text: &str) -> crate::swf::Actions {
+        let mut code = vec![0x96];
+        code.extend_from_slice(&((text.len() + 2) as u16).to_le_bytes());
+        code.push(0);
+        code.extend_from_slice(text.as_bytes());
+        code.extend_from_slice(&[0, 0x26, 0]);
+        Arc::from(code)
+    }
+
+    #[test]
+    fn initialize_then_construct_then_fifo_frame_and_load_actions() {
+        // Empty one-frame SWF; only the queued actions below matter.
+        let movie = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut player =
+            Player::new(movie, "queue-test", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        let root = player.vm.root;
+        player.vm.queue.extend([
+            Queued::Frame(root, trace("frame")),
+            Queued::Event(root, "onLoad", vec![trace("load")]),
+            Queued::Construct {
+                clip: root,
+                ctor: None,
+                events: vec![trace("construct")],
+            },
+            Queued::Init(root, trace("initialize")),
+        ]);
+        player.run_queue();
+        assert_eq!(
+            player.drain_log(),
+            [
+                "trace: initialize",
+                "trace: construct",
+                "trace: frame",
+                "trace: load"
+            ]
+        );
+    }
+
+    #[test]
+    fn unnamed_clips_get_unique_paths_for_host_and_post_load_callbacks() {
+        let movie = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p = Player::new(movie, "paths", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        let root = p.vm.root;
+        Arc::get_mut(&mut p.vm.movie).unwrap().characters.insert(
+            1,
+            Character::Sprite(Arc::new(crate::swf::Timeline {
+                frames: vec![Default::default()],
+                labels: vec![],
+            })),
+        );
+        for depth in 1..=2 {
+            place(
+                &mut p.vm,
+                root,
+                &Place {
+                    depth,
+                    character: Some(1),
+                    ..Default::default()
+                },
+            );
+        }
+        p.run_queue();
+        let first = p.vm.display.child_named(root, "instance1").unwrap();
+        let second = p.vm.display.child_named(root, "instance2").unwrap();
+        let value = display_api::display_value(&mut p.vm, first);
+        assert_eq!(&*p.vm.to_str(&value), "_level0.instance1");
+        let primitive = p.vm.to_primitive(&value, false);
+        assert_eq!(primitive, value);
+        assert_eq!(&*p.vm.to_str(&primitive), "_level0.instance1");
+        assert!(p.vm.to_number(&value).is_nan());
+        let root_value = p.vm.display_object(root);
+        let keys = p.vm.keys(&root_value);
+        assert!(keys.iter().any(|s| s.as_ref() == "instance1"));
+        assert!(keys.iter().any(|s| s.as_ref() == "instance2"));
+        assert_ne!(first, second);
+
+        // Moving an existing placement preserves its name; a fresh placement gets a
+        // fresh name even when the arena slot is reused.
+        place(
+            &mut p.vm,
+            root,
+            &Place {
+                depth: 1,
+                is_move: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(p.vm.display.child_named(root, "instance1"), Some(first));
+        remove_clip(&mut p.vm, first);
+        place(
+            &mut p.vm,
+            root,
+            &Place {
+                depth: 1,
+                character: Some(1),
+                ..Default::default()
+            },
+        );
+        assert!(p.vm.display.child_named(root, "instance3").is_some());
+    }
+
+    #[test]
+    fn exported_bitmaps_attach_with_intrinsic_size_and_replace_their_depth() {
+        let bytes = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p = Player::new(bytes, "bitmaps", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        let mut movie = Movie::default();
+        movie.characters.insert(
+            1,
+            Character::Image(crate::swf::ExternalImage {
+                format: 0,
+                width: 32,
+                height: 24,
+                export_name: "test_coin".into(),
+                file: "test-coin.dds".into(),
+            }),
+        );
+        movie.exports.insert("test_coin".into(), 1);
+        p.vm.movie = Arc::new(movie);
+        let global = Value::Object(p.vm.global);
+        let flash = p.vm.get(&global, "flash");
+        let display = p.vm.get(&flash, "display");
+        let class = p.vm.get(&display, "BitmapData");
+        let bitmap =
+            p.vm.call_method(&class, "loadBitmap", &[Value::from("test_coin")]);
+        assert_eq!(p.vm.get(&bitmap, "width"), Value::Number(32.0));
+        p.vm.set(&bitmap, "width", Value::Number(1.0));
+        assert_eq!(p.vm.get(&bitmap, "width"), Value::Number(32.0));
+        assert_eq!(
+            p.vm.call_method(&class, "loadBitmap", &[Value::from("missing")]),
+            Value::Null
+        );
+        let root = p.vm.root;
+        let target = p.vm.display_object(root);
+        p.vm.call_method(
+            &target,
+            "attachBitmap",
+            &[bitmap.clone(), Value::Number(1.0)],
+        );
+        let old = p.vm.display.get(root).unwrap().children[&1];
+        let bounds = display_api::local_bounds(&p.vm, root).unwrap();
+        assert_eq!((bounds.width(), bounds.height()), (640, 480));
+        assert!(
+            matches!(&p.vm.display.get(old).unwrap().kind, Kind::Bitmap {url, ..} if url == "test-coin.dds")
+        );
+        p.vm.call_method(&target, "attachBitmap", &[Value::Null, Value::Number(1.0)]);
+        assert!(p.vm.display.get(old).is_some());
+        p.vm.call_method(&target, "attachBitmap", &[bitmap, Value::Number(1.0)]);
+        assert!(p.vm.display.get(old).is_none());
+        assert_eq!(p.vm.display.get(root).unwrap().children.len(), 1);
+    }
+
+    #[test]
+    fn goto_replaces_a_different_text_character_at_the_same_depth() {
+        let bytes = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p =
+            Player::new(bytes, "text-state", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        let mut movie = Movie::default();
+        for (id, r, g) in [(1, 200, 180), (2, 153, 0)] {
+            movie.characters.insert(
+                id,
+                Character::EditText(Arc::new(crate::swf::EditText {
+                    color: Some(crate::swf::Color { r, g, b: 0, a: 255 }),
+                    initial: Some("price".into()),
+                    ..Default::default()
+                })),
+            );
+        }
+        let placement = |id| {
+            Command::Place(Box::new(Place {
+                depth: 1,
+                character: Some(id),
+                name: Some("TextField".into()),
+                ..Default::default()
+            }))
+        };
+        let timeline = Arc::new(crate::swf::Timeline {
+            frames: vec![
+                crate::swf::Frame {
+                    commands: vec![placement(1)],
+                    ..Default::default()
+                },
+                crate::swf::Frame {
+                    commands: vec![Command::Remove { depth: 1 }, placement(2)],
+                    ..Default::default()
+                },
+            ],
+            labels: vec![],
+        });
+        p.vm.movie = Arc::new(movie);
+        let root = p.vm.root;
+        p.vm.display
+            .get_mut(root)
+            .unwrap()
+            .clip_mut()
+            .unwrap()
+            .timeline = timeline;
+        enter_frame_of(&mut p.vm, root, 0);
+        let old = p.vm.display.child_named(root, "TextField").unwrap();
+        goto(&mut p.vm, root, 1, false);
+        let red = p.vm.display.child_named(root, "TextField").unwrap();
+        assert_ne!(old, red);
+        assert_eq!(
+            display_api::display_get(&mut p.vm, red, "textColor"),
+            Some(Value::Number(0x990000 as f64))
+        );
+        goto(&mut p.vm, root, 0, false);
+        let gold = p.vm.display.child_named(root, "TextField").unwrap();
+        assert_eq!(
+            display_api::display_get(&mut p.vm, gold, "textColor"),
+            Some(Value::Number(0xc8b400 as f64))
+        );
+    }
+
+    #[test]
+    fn duplicate_clip_constructs_the_class_without_copying_dynamic_properties() {
+        let bytes = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p =
+            Player::new(bytes, "duplicate", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        let mut movie = Movie::default();
+        movie.characters.insert(
+            1,
+            Character::Sprite(Arc::new(crate::swf::Timeline {
+                frames: vec![crate::swf::Frame {
+                    actions: vec![trace("first frame")],
+                    ..Default::default()
+                }],
+                labels: vec![],
+            })),
+        );
+        movie.exports.insert("button".into(), 1);
+        p.vm.movie = Arc::new(movie);
+        let constructor = p.vm.new_native(|vm, this, _| {
+            let seed = vm.get(&this, "seed");
+            vm.set(&this, "constructed_with", seed);
+            Value::Undefined
+        });
+        let prototype = p.vm.new_object();
+        p.vm.define(prototype, "class_member", Value::Bool(true), 0);
+        p.vm.define(constructor, "prototype", Value::Object(prototype), 0);
+        p.vm.classes.insert(1, Value::Object(constructor));
+        let root = p.vm.root;
+        let source = attach(&mut p.vm, root, "button", "original", 1, None).unwrap();
+        p.run_queue();
+        p.drain_log();
+        let source_value = p.vm.display_object(source);
+        p.vm.set(&source_value, "private", Value::Number(99.0));
+        let object = p.vm.display.get_mut(source).unwrap();
+        object.matrix.tx = 400.0;
+        object.color.mul[3] = 0.5;
+        let init = p.vm.new_object();
+        p.vm.define(init, "seed", Value::Number(42.0), 0);
+        let copy = duplicate(&mut p.vm, source, "copy", 2, Some(init)).unwrap();
+        p.run_queue();
+        assert_eq!(p.drain_log(), ["trace: first frame"]);
+        let copy_value = p.vm.display_object(copy);
+        assert_eq!(
+            p.vm.get(&copy_value, "constructed_with"),
+            Value::Number(42.0)
+        );
+        assert_eq!(p.vm.get(&copy_value, "class_member"), Value::Bool(true));
+        assert_eq!(p.vm.get(&copy_value, "private"), Value::Undefined);
+        assert_eq!(p.vm.display.get(copy).unwrap().matrix.tx, 400.0);
+        assert_eq!(p.vm.display.get(copy).unwrap().color.mul[3], 0.5);
+        assert_eq!(p.vm.display.child_named(root, "original"), Some(source));
+        assert!(duplicate(&mut p.vm, root, "root-copy", 3, None).is_none());
+        let replaced = duplicate(&mut p.vm, source, "copy2", 2, None).unwrap();
+        assert!(p.vm.display.get(copy).is_none());
+        assert_eq!(p.vm.display.child_named(root, "copy2"), Some(replaced));
+    }
 }
