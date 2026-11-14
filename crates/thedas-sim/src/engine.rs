@@ -3461,6 +3461,14 @@ pub fn call(
             void()
         }
         // Heartbeats: EVENT_TYPE_HEARTBEAT2 every interval until EndHeartbeat.
+        "InitHeartbeat" | "EndHeartbeat"
+            if h.sim.game == thedas_vfs::Game::Origins
+                && h.object(obj(a, 0))
+                    .is_none_or(|o| o.kind != ObjectKind::Creature) =>
+        {
+            // 0x666380 / 0x666400 both require the creature lookup 0x5d58c0.
+            void()
+        }
         "InitHeartbeat" => {
             let who = obj(a, 0);
             let ms = ((float(a, 1).max(0.1)) * 1000.0) as i32;
@@ -7278,6 +7286,87 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn origins_scripted_heartbeat_setters_require_a_creature() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"void InitHeartbeat(object o, float seconds) = 342;\n\
+              void EndHeartbeat(object o) = 343;\n\
+              int EVENT_TYPE_HEARTBEAT2 = 81;\n",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            s.game = game;
+            for kind in [
+                ObjectKind::Module,
+                ObjectKind::Area,
+                ObjectKind::Creature,
+                ObjectKind::Placeable,
+                ObjectKind::Item,
+                ObjectKind::Trigger,
+                ObjectKind::Sound,
+                ObjectKind::Waypoint,
+                ObjectKind::Party,
+                ObjectKind::Stage,
+                ObjectKind::Map,
+                ObjectKind::MapPin,
+                ObjectKind::Projectile,
+                ObjectKind::Store,
+                ObjectKind::AreaOfEffect,
+            ] {
+                let id = s.world.spawn(kind, "heartbeat");
+                s.world
+                    .get_mut(id)
+                    .unwrap()
+                    .fields
+                    .insert("HeartbeatMs".into(), 600);
+                let before = s.save_json().unwrap();
+                let queue_len = s.world.queue.len();
+                run(
+                    &mut s,
+                    id,
+                    "InitHeartbeat",
+                    &[Value::Object(id), Value::Float(2.0)],
+                );
+                let accepted = game == thedas_vfs::Game::DragonAge2 || kind == ObjectKind::Creature;
+                assert_eq!(
+                    s.world.get(id).unwrap().fields["HeartbeatMs"],
+                    if accepted { 2000 } else { 600 }
+                );
+                assert_eq!(s.world.queue.len(), queue_len + usize::from(accepted));
+                if !accepted {
+                    assert_eq!(s.save_json().unwrap(), before);
+                }
+                s.load_json(&s.save_json().unwrap()).unwrap();
+                let before = s.save_json().unwrap();
+                let queued = s.world.queue.len();
+                run(&mut s, id, "EndHeartbeat", &[Value::Object(id)]);
+                assert_eq!(
+                    s.world.get(id).unwrap().fields.get("HeartbeatMs").copied(),
+                    if accepted { None } else { Some(600) }
+                );
+                assert_eq!(s.world.queue.len(), queued);
+                if !accepted {
+                    assert_eq!(s.save_json().unwrap(), before);
+                }
+            }
+        }
+        s.game = thedas_vfs::Game::Origins;
+        for id in [OBJECT_INVALID, u32::MAX] {
+            let before = s.save_json().unwrap();
+            run(
+                &mut s,
+                id,
+                "InitHeartbeat",
+                &[Value::Object(id), Value::Float(2.0)],
+            );
+            run(&mut s, id, "EndHeartbeat", &[Value::Object(id)]);
+            assert_eq!(s.save_json().unwrap(), before);
+        }
     }
 
     #[test]
