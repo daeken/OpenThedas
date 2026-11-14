@@ -30,6 +30,9 @@ pub const MSG_PREVIOUS_CHARACTER: &str = "GUI.SelectPreviousCharacterMessage";
 /// `itemprps.gda` columns whose names are not known: the property's kind (1 while worn, 2
 /// on hit, 3 a restriction, 4 other) and the effect parameter its power scales (`Float0`).
 const ITEMPRPS_KIND: u32 = 0x4fe5_e973;
+/// `itemprps.gda`'s column naming a restriction property's script (DAOrigins.exe reads it
+/// in 0x6ae8b0; name unknown).
+const ITEMPRPS_SCRIPT: u32 = 0x7578_4cde;
 const ITEMPRPS_POWER_PARAM: u32 = 0x3600_1b03;
 /// An item property kind that holds while the item is worn.
 const ITEMPRPS_WORN: i64 = 1;
@@ -140,6 +143,58 @@ impl Sim {
                 if let Some(held) = held {
                     self.remove_effect(who, &held);
                 }
+            }
+        }
+        true
+    }
+
+    /// Whether `creature` may use `item`, as far as the item's restriction properties say
+    /// (`CanUseItem`; the inventory screen's `CreatureCanUseItem`). DAOrigins.exe's check
+    /// (0x6ae8b0), for each of the item's properties whose `itemprps.gda` kind (column
+    /// 0x4fe5e973) is 3: clears the creature's answer (+0xc70), runs the row's script
+    /// (column 0x75784cde, the `ip_restrict_*` scripts) on the creature with
+    /// `EVENT_TYPE_ITEM_ONTEST_USABLE` (70; creator the creature, objects the item and the
+    /// creature, int 0 the property), and refuses the item if the answer, given with
+    /// `SetCanUseItem`, is still 0. Provisional: the check's other tests are not modelled
+    /// (the item's flag at +0x5e0, its attribute requirements, 0x6aceb0, and its list of
+    /// allowed users, +0x6ec), nor is the property's int traced (the row is passed).
+    pub fn can_use_item(&mut self, creature: ObjectId, item: ObjectId) -> bool {
+        use thedas_formats::gda::Cell;
+        if self.world.get(creature).is_none() || self.world.get(item).is_none() {
+            return false;
+        }
+        let scripts: Vec<(i32, String)> = {
+            let tables = self.world.tables();
+            let Some(t) = tables.get(0, "itemprps") else {
+                return true;
+            };
+            self.item_properties(item)
+                .into_iter()
+                .filter(|&(row, _)| {
+                    matches!(
+                        t.cell_by_hash(ITEMPRPS_KIND, row as i64),
+                        Some(Cell::Int(3))
+                    )
+                })
+                .map(|(row, _)| {
+                    let script = match t.cell_by_hash(ITEMPRPS_SCRIPT, row as i64) {
+                        Some(Cell::String(s)) => s.trim_end_matches('\0').trim().to_string(),
+                        _ => String::new(),
+                    };
+                    (row, script)
+                })
+                .collect()
+        };
+        for (row, script) in scripts {
+            self.can_use_answers.insert(creature, 0);
+            if !script.is_empty() {
+                let mut ev = self.new_event("ITEM_ONTEST_USABLE", Some(creature));
+                ev.objects = vec![item, creature];
+                ev.ints = vec![row];
+                self.run_script(&script, creature, Some(ev));
+            }
+            if self.can_use_answers.get(&creature).copied().unwrap_or(0) == 0 {
+                return false;
             }
         }
         true
@@ -1339,6 +1394,57 @@ mod screen_tests {
         assert!(s.unequip_item(ally, sword));
         assert!(!s.unequip_item(ally, sword));
         assert!(s.party_backpack().contains(&sword));
+    }
+
+    /// A script answering `SetCanUseItem(OBJECT_SELF, answer)`.
+    fn answers(answer: i32) -> thedas_script::ncs::Ncs {
+        let mut b: Vec<u8> = vec![0x04, 0x03];
+        b.extend(answer.to_be_bytes());
+        b.extend([0x04, 0x06, 0, 0, 0, 0, 0x05, 0x00]);
+        b.extend(813u16.to_be_bytes());
+        b.extend([0x02, 0x20, 0x00]);
+        let mut v = b"NCS V1.0B".to_vec();
+        v.extend(((13 + b.len()) as u32).to_be_bytes());
+        v.extend(b);
+        thedas_script::ncs::Ncs::parse(&v).unwrap()
+    }
+
+    #[test]
+    fn restriction_properties_ask_their_scripts_whether_a_creature_may_use_an_item() {
+        let table = EngineTable::parse(
+            b"int EVENT_TYPE_ITEM_ONTEST_USABLE = 70;\n\
+              void SetCanUseItem(object oCreature, int value) = 813;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        s.world.tables().insert(
+            "itemprps",
+            &["#4fe5e973", "#75784cde"],
+            vec![
+                (1, vec![Cell::Int(1), Cell::String(String::new())]),
+                (6027, vec![Cell::Int(3), Cell::String("ip_no".into())]),
+                (6030, vec![Cell::Int(3), Cell::String("ip_yes".into())]),
+                (6031, vec![Cell::Int(3), Cell::String(String::new())]),
+            ],
+        );
+        s.add_script("ip_no", answers(0));
+        s.add_script("ip_yes", answers(1));
+        let who = s.world.spawn(ObjectKind::Creature, "who");
+        let item = |s: &mut Sim, props: Vec<(i32, i32)>| {
+            let i = s.world.spawn(ObjectKind::Item, "item");
+            s.world.get_mut(i).unwrap().item_properties = Some(props);
+            i
+        };
+        let plain = item(&mut s, vec![(1, 1)]);
+        let refused = item(&mut s, vec![(6030, 0), (6027, 0)]);
+        let allowed = item(&mut s, vec![(6030, 0)]);
+        let no_script = item(&mut s, vec![(6031, 0)]);
+        assert!(s.can_use_item(who, plain));
+        assert!(!s.can_use_item(who, refused));
+        assert!(s.can_use_item(who, allowed));
+        // A restriction without a script leaves the cleared answer: refused.
+        assert!(!s.can_use_item(who, no_script));
+        assert!(!s.can_use_item(who, 9999));
     }
 
     #[test]
