@@ -17,6 +17,7 @@ pub mod atmosphere;
 mod backend_check;
 pub mod camera;
 pub mod collide;
+mod config;
 pub mod cut_effects;
 pub mod d3d;
 mod d3d_gpu;

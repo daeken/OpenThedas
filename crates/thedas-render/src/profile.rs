@@ -6,7 +6,7 @@ use std::time::Instant;
 const CAPACITY: u32 = 32;
 
 pub(crate) fn enabled() -> bool {
-    std::env::var("THEDAS_RENDER_PROFILE").as_deref() == Ok("1")
+    crate::config::CONFIG.profile
 }
 
 struct Gpu {

@@ -394,7 +394,7 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
         out.normal = vec4<f32>(oct_encode(s.n), draw.room.x, 1.0);
         let ambient = select(vec3<f32>(1.0), draw.character.ambient.rgb, draw.material.w < 1.5);
         out.lightmap = vec4<f32>(in.irradiance * ambient, 1.0);
-        return out;
+        return baked_base(in, out, s);
     }
     if (draw.room.z > 0.5) {
         let m = terrain_material(in.uv0);
@@ -407,7 +407,7 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
         if (frame.fog.w > 0.5) {
             out.lightmap = vec4<f32>(probe_irradiance(s.n), 1.0);
         }
-        return out;
+        return baked_base(in, out, s);
     }
     let s = surface(in);
     var out: GBuffer;
@@ -429,7 +429,7 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
         out.lightmap = vec4<f32>(probe_irradiance(s.n), 1.0);
     }
     if (!alpha_kept(diffuse.a)) { discard; }
-    return out;
+    return baked_base(in, out, s);
 }
 
 // Match the translated D3D9 shader's extra clip and rounded saturated 8-bit alpha test.
@@ -453,6 +453,44 @@ fn alpha_test(sampled: f32, test: vec4<f32>) -> bool {
         case 7u: { return a >= r; }
         default: { return true; }
     }
+}
+
+// Baked bounce, probe reflection and emission are independent of point lights. Their
+// sum fits in the existing HDR lightmap target, leaving its baked visibility alpha
+// intact. Reuse this draw's full-precision material samples and tangent frame instead
+// of evaluating them again in a second geometry pass. Probe/SSAO and debug modes keep
+// the separate terms because AO must be evaluated after the depth buffer is complete.
+fn baked_base(in: VsOut, g: GBuffer, s: Surface) -> GBuffer {
+    if (frame.fixup.z < 0.5) { return g; }
+    var out = g;
+    let terrain = draw.room.z > 0.5;
+    let object = draw.material.x > 0.5;
+    var shade = 1.0;
+    if (!object) {
+        shade = sun_visibility(in.world, s.n, !terrain || draw.room.w < 0.5);
+    }
+    let ambient_shade = select(mix(1.0, shade, 0.15), 1.0, object);
+    // Bounce previously used the stored UNORM albedo and half-float lightmap. Keep
+    // that clipping/precision, including material tints outside [0, 1]. Reflection
+    // and terrain's additive tint still use the full-precision material samples.
+    let albedo = floor(clamp(g.albedo.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * 255.0 + 0.5) / 255.0;
+    var base = albedo * quantizeToF16(g.lightmap.rgb) * ambient_shade;
+    if (draw.material.w < 0.5) {
+        if (terrain || draw.room.y != 0.0) {
+            let r = 2.0 * dot(s.n, s.v) * s.n - s.v;
+            let power = g.specular.a * 255.0 + 1.0;
+            let env = textureSampleLevel(env_tex, wrap_smp, r, (1.0 - power / 255.0) * 9.0).rgb;
+            let visibility = select(draw.room.y, 0.75 * shade * g.lightmap.a + 0.25, terrain);
+            base += env * visibility * g.specular.rgb * s.falloff;
+        }
+        if (terrain) {
+            base += g.albedo.rgb * draw.terrain.tint.rgb;
+        } else if (draw.material.y != 0.0) {
+            base += textureSample(emissive_tex, wrap_smp, in.uv0).rgb * draw.material.y;
+        }
+    }
+    out.lightmap = vec4<f32>(base, g.lightmap.a);
+    return out;
 }
 
 // Static1's reflection, which no light changes, added over the lit frame by a second draw of
@@ -836,11 +874,14 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // Dynamic lights have their own visibility and never take this sun mask.
     let ambient_shade = select(select(mix(1.0, sun_shade, 0.15), 1.0, object), ao, lighting.counts.w > 0u);
     // Terrain1 masks static diffuse twice; Static1 and Low's Terrain3 only once.
-    let diffuse = diff_s * sun_shade * select(lm.a, lm.a * lm.a, terrain && !terrain_low)
-        + lm.rgb * ambient_shade + diff_d;
+    let static_diffuse = diff_s * sun_shade * select(lm.a, lm.a * lm.a, terrain && !terrain_low);
+    let diffuse = static_diffuse + lm.rgb * ambient_shade + diff_d;
     let specular = select((spec_s * sun_shade * max(lm.a, 0.2) + spec_d) * 3.0,
         (spec_s * (0.75 * sun_shade * lm.a + 0.25) + spec_d) * 3.0, terrain);
     var colour = albedo * diffuse + spec.rgb * specular * falloff;
+    if (lighting.size.z > 0.5) {
+        colour = albedo * (static_diffuse + diff_d) + spec.rgb * specular * falloff + lm.rgb;
+    }
     switch lighting.counts.y {
         case 1u: { return vec4<f32>(albedo, 1.0); }
         case 2u: { return vec4<f32>(n * 0.5 + 0.5, 1.0); }
