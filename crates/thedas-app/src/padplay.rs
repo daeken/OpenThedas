@@ -1207,6 +1207,22 @@ fn walk(host: &mut dyn Host, v: Vec2, group: bool) -> Option<String> {
             );
             continue;
         }
+        // Walked into a closed door: the game's script answers the blocked walk by giving
+        // the walker the door to open (rules_core, see `Sim::fail_blocked`). That use goes
+        // ahead before the next walk order, which would otherwise replace it (the stick and
+        // the keys order a walk several times a second): pushed into a shut door, the hero
+        // opens it, every time rather than now and then. Letting go still stops the walker,
+        // dropping a use not begun, so a door is not opened after the stick is let go.
+        let opening = sim
+            .world
+            .get(who)
+            .and_then(|o| o.commands.first())
+            .is_some_and(|c| {
+                c.name == "CommandUseObject" && c.target.is_some_and(|t| sim.is_door(t))
+            });
+        if opening {
+            continue;
+        }
         // A point a little ahead, on the ground there when it can be found; else at the
         // leader's own height, as a click on the far side of a rock would be: the walk's
         // route finds the way round (the ground under a point ahead is often a tree's or a
