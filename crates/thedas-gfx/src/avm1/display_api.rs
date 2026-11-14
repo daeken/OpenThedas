@@ -1294,8 +1294,14 @@ fn selection_set_range(vm: &mut Vm, _: Value, args: &[Value]) -> Value {
 }
 
 fn selection_set_focus(vm: &mut Vm, _: Value, args: &[Value]) -> Value {
-    let a = arg(args, 0);
-    let d = match &a {
+    let Some(a) = args.first() else {
+        return Value::Bool(false);
+    };
+    if a.is_nullish() {
+        crate::player::set_focus(vm, None);
+        return Value::Bool(true);
+    }
+    let d = match a {
         Value::String(s) => {
             let scope = std::rc::Rc::new(super::Scope {
                 object: vm.global,
@@ -1308,7 +1314,16 @@ fn selection_set_focus(vm: &mut Vm, _: Value, args: &[Value]) -> Value {
         }
         v => vm.display_of(v),
     };
-    crate::player::set_focus(vm, d);
+    let Some(d) = d else {
+        return Value::Bool(false);
+    };
+    crate::player::set_focus(vm, Some(d));
+    // AVM1 programmatic focus selects the field, even when it already had focus.
+    // Mouse focus continues to place its caret from the pointer in the player.
+    if let Some(t) = vm.display.get_mut(d).and_then(|o| o.text_mut()) {
+        t.set_selection(0, t.len());
+        vm.dirty = true;
+    }
     Value::Bool(true)
 }
 

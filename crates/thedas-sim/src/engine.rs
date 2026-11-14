@@ -314,8 +314,8 @@ pub(crate) fn local_name(sim: &Sim, o: ObjectId, a: &[Value], i: usize) -> Strin
     }
 }
 
-/// NWScript's float-to-string: `%<width>.<decimals>f`, right-aligned. Provisional for
-/// `ToString` on floats (assumed `%f` with six decimals).
+/// Origins uses `%<width>.<decimals>f`, right-aligned (0x669100), and `%f` for
+/// `ToString` (0x4c2b80). Legacy rounding, special values and output bounds are provisional.
 fn format_float(f: f32, width: i32, decimals: i32) -> String {
     let d = decimals.clamp(0, 9) as usize;
     let s = format!("{f:.d$}");
@@ -692,7 +692,38 @@ fn apply_visual_or_effect(h: &mut ScriptHost, target: ObjectId, e: Effect) {
         };
         h.sim.world.instant_vfx.push(note);
     }
+    // DA2 area save-load handlers rebuild environmental visuals (the prologue
+    // firewall does this on AREALOADSAVE_POSTLOADEXIT). Our snapshots already
+    // contain those effects. Reconcile an exact replay after running APPLY_EFFECT,
+    // retaining its script side effects and any unrelated or temporary visuals.
+    // This is snapshot compatibility, not a general rule against stacking VFX.
+    let replay = (h.sim.game == thedas_vfs::Game::DragonAge2
+        && e.ty == 4
+        && e.ability == 0
+        && e.expires.is_none()
+        && e.duration_type == constant(&h.sim.table, "EFFECT_DURATION_TYPE_PERMANENT")
+        && e.creator.is_some_and(|area| {
+            h.object(area).is_some_and(|o| o.kind == ObjectKind::Area)
+                && h.object(target)
+                    .is_some_and(|o| o.kind == ObjectKind::Placeable && o.area == Some(area))
+        })
+        && matches!(h.sim.world.handle(h.event), Some(EngineData::Event(ev)) if matches!(
+            h.sim.event_name(ev.ty).as_str(),
+            "AREALOADSAVE_SPECIAL" | "AREALOADSAVE_PRELOADEXIT" | "AREALOADSAVE_POSTLOADEXIT"
+        )))
+    .then(|| e.clone());
     h.sim.apply_effect(target, e);
+    if let (Some(replay), Some(o)) = (replay, h.sim.world.get_mut(target)) {
+        let mut kept = false;
+        o.effects.retain(|e| {
+            if *e != replay {
+                return true;
+            }
+            let first = !kept;
+            kept = true;
+            first
+        });
+    }
 }
 
 /// Converts `CommandMoveToObject` to `COMMAND_TYPE_MOVE_TO_OBJECT`.
@@ -797,6 +828,33 @@ pub fn call(
         "ToString" => ok(Value::String(match a.first() {
             Some(Value::Int(v)) => v.to_string(),
             Some(Value::Float(v)) => format_float(*v, 0, 6),
+            // Origins 0x668f30 resolves objects and reads CCObject's tag through virtual
+            // +0x18. Other variants use a fixed diagnostic. See notes/script-tostring.md.
+            Some(Value::Object(id)) if h.sim.game == thedas_vfs::Game::Origins => h
+                .object(*id)
+                .map(|o| match o.kind {
+                    ObjectKind::Creature
+                    | ObjectKind::Placeable
+                    | ObjectKind::Trigger
+                    | ObjectKind::Waypoint
+                    | ObjectKind::Store
+                    | ObjectKind::Sound
+                    | ObjectKind::Item
+                    | ObjectKind::Projectile
+                    | ObjectKind::AreaOfEffect => {
+                        o.tag.split('\0').next().unwrap_or_default().into()
+                    }
+                    ObjectKind::Module
+                    | ObjectKind::Area
+                    | ObjectKind::Stage
+                    | ObjectKind::Party
+                    | ObjectKind::Map
+                    | ObjectKind::MapPin => "OBJECT_INVALID".into(),
+                })
+                .unwrap_or_default(),
+            Some(_) if h.sim.game == thedas_vfs::Game::Origins => {
+                "(can not cast variable to string)".into()
+            }
             Some(Value::String(s)) | Some(Value::Resource(s)) => s.clone(),
             Some(Value::Object(o)) => o.to_string(),
             Some(other) => format!("{other:?}"),
@@ -809,6 +867,18 @@ pub fn call(
             if a.len() > 2 { int(a, 2) } else { 9 },
         ))),
         "IntToFloat" => ok(Value::Float(int(a, 0) as f32)),
+        "FloatToInt" if h.sim.game == thedas_vfs::Game::Origins => {
+            // 0x64f3f0 -> 0x8e34f0 uses the CRT's SSE2 truncating conversion.
+            // Its invalid result is i32::MIN, including NaNs and positive overflow.
+            let value = float(a, 0);
+            ok(Value::Int(
+                if (i32::MIN as f32..2147483648.0).contains(&value) {
+                    value as i32
+                } else {
+                    i32::MIN
+                },
+            ))
+        }
         "FloatToInt" => ok(Value::Int(float(a, 0) as i32)),
         "StringToInt" | "HexStringToInt" if h.sim.game == thedas_vfs::Game::Origins => {
             ok(Value::Int(origins_string_to_int(&string(a, 0))))
@@ -1646,19 +1716,52 @@ pub fn call(
                 _ => Value::Resource(cell_string(c)),
             })
         }
-        // Dragon Age II: a number from ability `a[2]`'s row of the abilities table (M2DA 1,
-        // `ABI_*`), in the column whose name hashes to `a[1]`, for creature `a[0]`.
-        // Provisional: DA2's script.ldf declares it; how an upgrade the creature has to the
-        // ability changes the number is not traced, so the ability's own row answers.
+        // DragonAge2.exe 0x4e1700/0x4e17a0 -> 0x6a1300/0x6a1b50:
+        // row 0 marks which columns accept additions from the four learned upgrades.
+        // Read the live ability set, so grants/removals and reload need no cached totals.
         "GetUpgradableAbilityHashedM2DAInt" | "GetUpgradableAbilityHashedM2DAFloat" => {
+            let Some(creature) = h
+                .object(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::Creature)
+            else {
+                return ok(if name.ends_with("Float") {
+                    Value::Float(0.0)
+                } else {
+                    Value::Int(0)
+                });
+            };
             let table = h.sim.world.tables.get(1, "");
-            let c = table
-                .as_ref()
-                .and_then(|t| t.cell_by_hash(int(a, 1) as u32, int(a, 2) as i64));
-            ok(if name.ends_with("Float") {
-                Value::Float(cell_float(c))
+            let column = int(a, 1) as u32;
+            let ability = i64::from(int(a, 2));
+            let cell = |row| table.as_ref().and_then(|t| t.cell_by_hash(column, row));
+            let mut rows = vec![ability];
+            let upgradeable = if name.ends_with("Float") {
+                cell_float(cell(0)) != 0.0
             } else {
-                Value::Int(cell_int(c))
+                cell_int(cell(0)) != 0
+            };
+            if upgradeable && cell(ability).is_some() {
+                for upgrade in [0xd300_f4d9, 0xf82d_a71a, 0xe136_965b, 0xae77_009c] {
+                    let id = cell_int(
+                        table
+                            .as_ref()
+                            .and_then(|t| t.cell_by_hash(upgrade, ability)),
+                    );
+                    if creature.abilities.contains(&id) {
+                        rows.push(i64::from(id));
+                    }
+                }
+            }
+            ok(if name.ends_with("Float") {
+                Value::Float(
+                    rows.into_iter()
+                        .fold(0.0, |n, row| n + cell_float(cell(row))),
+                )
+            } else {
+                Value::Int(
+                    rows.into_iter()
+                        .fold(0i32, |n, row| n.wrapping_add(cell_int(cell(row)))),
+                )
             })
         }
         "GetM2DARows" => ok(Value::Int(
@@ -5930,6 +6033,141 @@ mod tests {
     }
 
     #[test]
+    fn da2_upgradable_numbers_add_only_learned_direct_upgrades_in_marked_columns() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 7);
+        s.world.tables().insert(
+            "#1",
+            &[
+                "Range",
+                "Charges",
+                "Fixed",
+                "#d300f4d9",
+                "#f82da71a",
+                "#e136965b",
+                "#ae77009c",
+            ],
+            vec![
+                (0, vec![Cell::Float(1.0), Cell::Int(1), Cell::Int(0)]),
+                (
+                    100,
+                    vec![
+                        Cell::Float(2.5),
+                        Cell::Int(3),
+                        Cell::Int(9),
+                        Cell::Int(101),
+                        Cell::Int(102),
+                        Cell::Int(103),
+                        Cell::Int(104),
+                    ],
+                ),
+                (
+                    101,
+                    vec![
+                        Cell::Float(0.75),
+                        Cell::Int(2),
+                        Cell::Int(100),
+                        Cell::Int(105),
+                    ],
+                ),
+                (102, vec![Cell::Float(-0.25), Cell::Int(-1), Cell::Int(200)]),
+                (103, vec![Cell::Float(0.5), Cell::Int(4), Cell::Int(300)]),
+                (104, vec![Cell::Float(1.25), Cell::Int(5), Cell::Int(400)]),
+                (105, vec![Cell::Float(99.0), Cell::Int(99), Cell::Int(999)]),
+            ],
+        );
+        let npc = s.world.spawn(ObjectKind::Creature, "npc");
+        let read = |s: &mut Sim, float: bool, column: &str| {
+            run(
+                s,
+                npc,
+                if float {
+                    "GetUpgradableAbilityHashedM2DAFloat"
+                } else {
+                    "GetUpgradableAbilityHashedM2DAInt"
+                },
+                &[
+                    Value::Object(npc),
+                    Value::Int(thedas_formats::gda::column_hash(column) as i32),
+                    Value::Int(100),
+                ],
+            )
+        };
+        assert_eq!(read(&mut s, true, "Range"), Some(Value::Float(2.5)));
+        assert_eq!(read(&mut s, false, "Charges"), Some(Value::Int(3)));
+        // The base ability need not be learned. A learned upgrade's own upgrade
+        // does not recursively contribute, and an unlearned direct upgrade does not.
+        s.world
+            .get_mut(npc)
+            .unwrap()
+            .abilities
+            .extend([101, 103, 104, 105]);
+        let before = s.save_json().unwrap();
+        assert_eq!(read(&mut s, true, "Range"), Some(Value::Float(5.0)));
+        assert_eq!(read(&mut s, false, "Charges"), Some(Value::Int(14)));
+        assert_eq!(read(&mut s, false, "Fixed"), Some(Value::Int(9)));
+        assert_eq!(read(&mut s, false, "Missing"), Some(Value::Int(0)));
+        assert_eq!(
+            s.save_json().unwrap(),
+            before,
+            "queries change no world state or RNG"
+        );
+        s.world.get_mut(npc).unwrap().abilities.remove(&101);
+        assert_eq!(read(&mut s, true, "Range"), Some(Value::Float(4.25)));
+        assert_eq!(read(&mut s, false, "Charges"), Some(Value::Int(12)));
+        s.world.get_mut(npc).unwrap().abilities.insert(102);
+        assert_eq!(read(&mut s, true, "Range"), Some(Value::Float(4.0)));
+        assert_eq!(read(&mut s, false, "Charges"), Some(Value::Int(11)));
+    }
+
+    #[test]
+    fn da2_upgradable_numbers_require_a_creature_and_respect_missing_metadata() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 7);
+        s.world.tables().insert(
+            "#1",
+            &["Value", "#d300f4d9"],
+            vec![
+                (100, vec![Cell::Int(7), Cell::Int(101)]),
+                (101, vec![Cell::Int(99)]),
+            ],
+        );
+        let creature = s.world.spawn(ObjectKind::Creature, "creature");
+        let item = s.world.spawn(ObjectKind::Item, "item");
+        s.world.get_mut(creature).unwrap().abilities.insert(101);
+        let column = Value::Int(thedas_formats::gda::column_hash("Value") as i32);
+        for (id, expected) in [(creature, 7), (item, 0), (OBJECT_INVALID, 0)] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    creature,
+                    "GetUpgradableAbilityHashedM2DAInt",
+                    &[Value::Object(id), column.clone(), Value::Int(100)]
+                ),
+                Some(Value::Int(expected))
+            );
+            assert_eq!(
+                run(
+                    &mut s,
+                    creature,
+                    "GetUpgradableAbilityHashedM2DAFloat",
+                    &[Value::Object(id), column.clone(), Value::Int(100)]
+                ),
+                Some(Value::Float(expected as f32))
+            );
+        }
+        assert_eq!(
+            run(
+                &mut s,
+                creature,
+                "GetUpgradableAbilityHashedM2DAInt",
+                &[Value::Object(creature), column, Value::Int(999)]
+            ),
+            Some(Value::Int(0))
+        );
+    }
+
+    #[test]
     fn dragon_age_2_upgradable_ability_numbers_come_from_the_ability_row() {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
@@ -6119,6 +6357,51 @@ mod tests {
     }
 
     #[test]
+    fn origins_float_to_int_uses_the_native_sse2_invalid_result() {
+        let table = Arc::new(EngineTable::parse(b"int FloatToInt(float f) = 49;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for (value, expected, da2_expected) in [
+            (0.0, 0, 0),
+            (-0.0, 0, 0),
+            (f32::from_bits(1), 0, 0),
+            (-f32::from_bits(1), 0, 0),
+            (0.99, 0, 0),
+            (-0.99, 0, 0),
+            (1.0, 1, 1),
+            (-1.0, -1, -1),
+            (1.99, 1, 1),
+            (-1.99, -1, -1),
+            (f32::from_bits(0x4effffff), 2147483520, 2147483520),
+            (2147483648.0, i32::MIN, i32::MAX),
+            (f32::from_bits(0x4f000001), i32::MIN, i32::MAX),
+            (-2147483648.0, i32::MIN, i32::MIN),
+            (f32::from_bits(0xceffffff), -2147483520, -2147483520),
+            (f32::from_bits(0xcf000001), i32::MIN, i32::MIN),
+            (f32::MAX, i32::MIN, i32::MAX),
+            (f32::MIN, i32::MIN, i32::MIN),
+            (f32::INFINITY, i32::MIN, i32::MAX),
+            (f32::NEG_INFINITY, i32::MIN, i32::MIN),
+            (f32::NAN, i32::MIN, 0),
+            (-f32::NAN, i32::MIN, 0),
+            (f32::from_bits(0x7f800001), i32::MIN, 0),
+            (f32::from_bits(0xff800001), i32::MIN, 0),
+        ] {
+            for (game, result) in [
+                (thedas_vfs::Game::Origins, expected),
+                (thedas_vfs::Game::DragonAge2, da2_expected),
+            ] {
+                s.game = game;
+                assert_eq!(
+                    run(&mut s, 1, "FloatToInt", &[Value::Float(value)]),
+                    Some(Value::Int(result)),
+                    "{game:?}, float bits {:08x}",
+                    value.to_bits()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn origins_object_to_string_formats_raw_ids_as_signed_decimal() {
         let table = Arc::new(EngineTable::parse(b"string ObjectToString(object o) = 54;").unwrap());
         let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
@@ -6148,6 +6431,113 @@ mod tests {
             (0xffff_ffff, "4294967295"),
         ] {
             assert_eq!(convert(&mut s, id), Some(Value::String(expected.into())));
+        }
+    }
+
+    #[test]
+    fn origins_to_string_distinguishes_tags_non_ccobjects_and_missing_ids() {
+        let table = Arc::new(EngineTable::parse(b"string ToString(any v) = 1;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for (kind, expected) in [
+            (ObjectKind::Creature, "Mixed_Tag"),
+            (ObjectKind::Placeable, "Mixed_Tag"),
+            (ObjectKind::Trigger, "Mixed_Tag"),
+            (ObjectKind::Waypoint, "Mixed_Tag"),
+            (ObjectKind::Store, "Mixed_Tag"),
+            (ObjectKind::Sound, "Mixed_Tag"),
+            (ObjectKind::Item, "Mixed_Tag"),
+            (ObjectKind::Projectile, "Mixed_Tag"),
+            (ObjectKind::AreaOfEffect, "Mixed_Tag"),
+            (ObjectKind::Module, "OBJECT_INVALID"),
+            (ObjectKind::Area, "OBJECT_INVALID"),
+            (ObjectKind::Stage, "OBJECT_INVALID"),
+            (ObjectKind::Party, "OBJECT_INVALID"),
+            (ObjectKind::Map, "OBJECT_INVALID"),
+            (ObjectKind::MapPin, "OBJECT_INVALID"),
+        ] {
+            let id = s.world.spawn(kind, "Mixed_Tag");
+            s.world.get_mut(id).unwrap().template = "different_template".into();
+            assert_eq!(
+                run(&mut s, id, "ToString", &[Value::Object(id)]),
+                Some(Value::String(expected.into())),
+                "{kind:?}"
+            );
+            // DA2 keeps its raw unsigned ID, regardless of kind or tag.
+            s.game = thedas_vfs::Game::DragonAge2;
+            assert_eq!(
+                run(&mut s, id, "ToString", &[Value::Object(id)]),
+                Some(Value::String(id.to_string()))
+            );
+            s.game = thedas_vfs::Game::Origins;
+        }
+        let creature = s.world.spawn(ObjectKind::Creature, "");
+        for (tag, expected) in [
+            ("", ""),
+            (
+                "a_long_tag_which_exceeds_thirty_one_characters_é",
+                "a_long_tag_which_exceeds_thirty_one_characters_é",
+            ),
+            ("prefix\0suffix", "prefix"),
+        ] {
+            s.world.get_mut(creature).unwrap().tag = tag.into();
+            assert_eq!(
+                run(&mut s, 0, "ToString", &[Value::Object(creature)]),
+                Some(Value::String(expected.into()))
+            );
+        }
+        let removed = s.world.spawn(ObjectKind::Creature, "removed");
+        s.world.objects.remove(&removed);
+        for id in [0, removed, OBJECT_INVALID, 0xffff_ffff] {
+            assert_eq!(
+                run(&mut s, 0, "ToString", &[Value::Object(id)]),
+                Some(Value::String(String::new()))
+            );
+        }
+    }
+
+    #[test]
+    fn origins_to_string_uses_the_diagnostic_for_other_variants() {
+        let table = Arc::new(EngineTable::parse(b"string ToString(any v) = 1;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let values = [
+            Value::String("text".into()),
+            Value::Resource("resource".into()),
+            Value::Vector([1.0, 2.0, 3.0]),
+            Value::Engine {
+                ty: 3,
+                handle: None,
+            },
+            Value::Engine {
+                ty: 3,
+                handle: Some(123),
+            },
+            Value::Array {
+                elem: Type::Int,
+                items: vec![Value::Int(7)],
+            },
+        ];
+        for value in values {
+            let args = [value.clone()];
+            assert_eq!(
+                run(&mut s, 0, "ToString", &args),
+                Some(Value::String("(can not cast variable to string)".into()))
+            );
+            s.game = thedas_vfs::Game::DragonAge2;
+            let expected = match value {
+                Value::String(text) | Value::Resource(text) => text,
+                other => format!("{other:?}"),
+            };
+            assert_eq!(
+                run(&mut s, 0, "ToString", &args),
+                Some(Value::String(expected))
+            );
+            s.game = thedas_vfs::Game::Origins;
+        }
+        for (value, expected) in [(Value::Int(-42), "-42"), (Value::Float(1.5), "1.500000")] {
+            assert_eq!(
+                run(&mut s, 0, "ToString", &[value]),
+                Some(Value::String(expected.into()))
+            );
         }
     }
 
@@ -8120,6 +8510,101 @@ mod coverage_tests {
         void AddAbility(object o, int a, int n = FALSE) = 119;\n\
         void ShowSpecUnlockedNotification(int s) = 120;\n\
         void ShowAreaUnlockedNotification(string a, string i = \"\") = 121;\n";
+
+    #[test]
+    fn da2_area_load_visual_replays_reconcile_saved_copies() {
+        let table = EngineTable::parse(
+            format!("{LDF}\nint EVENT_TYPE_AREALOADSAVE_POSTLOADEXIT = 43;\n").as_bytes(),
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 7);
+        s.game = thedas_vfs::Game::DragonAge2;
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        let wall = s.world.spawn(ObjectKind::Placeable, "wall");
+        s.world.get_mut(wall).unwrap().area = Some(area);
+        let fire = Effect {
+            ty: 4,
+            creator: Some(area),
+            duration_type: 3,
+            ints: vec![600001],
+            ..Default::default()
+        };
+        let other = Effect {
+            ints: vec![600002],
+            ..fire.clone()
+        };
+        // An older snapshot may already contain several copies. Only the exact
+        // environmental visual reissued by the load handler is reconciled.
+        s.world.get_mut(wall).unwrap().effects = vec![fire.clone(), other.clone(), fire.clone()];
+        for _ in 0..3 {
+            s.load_game(s.save_game()).unwrap();
+            let event = s.new_event("AREALOADSAVE_POSTLOADEXIT", None);
+            let event = Some(s.world.store(EngineData::Event(event)));
+            let mut h = ScriptHost {
+                sim: &mut s,
+                event,
+                script: "area".into(),
+            };
+            apply_visual_or_effect(&mut h, wall, fire.clone());
+            assert_eq!(
+                s.world.get(wall).unwrap().effects,
+                [fire.clone(), other.clone()]
+            );
+        }
+    }
+
+    #[test]
+    fn area_load_visual_reconciliation_preserves_other_effect_applications() {
+        for case in 0..7 {
+            let table = EngineTable::parse(
+                format!(
+                    "{LDF}\nint EVENT_TYPE_AREALOADSAVE_POSTLOADEXIT = 43;\n\
+                     int EVENT_TYPE_AREALOAD_POSTLOADEXIT = 39;\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 7);
+            s.game = thedas_vfs::Game::DragonAge2;
+            let area = s.world.spawn(ObjectKind::Area, "area");
+            let caster = s.world.spawn(ObjectKind::Creature, "caster");
+            let target = s.world.spawn(ObjectKind::Placeable, "target");
+            s.world.get_mut(target).unwrap().area = Some(area);
+            let mut effect = Effect {
+                ty: 4,
+                creator: Some(area),
+                duration_type: 3,
+                ints: vec![600001],
+                ..Default::default()
+            };
+            let mut event = s.new_event("AREALOADSAVE_POSTLOADEXIT", None);
+            match case {
+                0 => s.game = thedas_vfs::Game::Origins,
+                1 => event = s.new_event("AREALOAD_POSTLOADEXIT", None),
+                2 => effect.ability = 123,
+                3 => {
+                    effect.duration_type = 2;
+                    effect.expires = Some(1000);
+                }
+                4 => effect.creator = Some(caster),
+                5 => s.world.get_mut(target).unwrap().kind = ObjectKind::Creature,
+                _ => s.world.get_mut(target).unwrap().area = None,
+            }
+            s.world
+                .get_mut(target)
+                .unwrap()
+                .effects
+                .push(effect.clone());
+            let event = Some(s.world.store(EngineData::Event(event)));
+            let mut h = ScriptHost {
+                sim: &mut s,
+                event,
+                script: "area".into(),
+            };
+            apply_visual_or_effect(&mut h, target, effect);
+            assert_eq!(s.world.get(target).unwrap().effects.len(), 2, "case {case}");
+        }
+    }
 
     #[test]
     fn visual_effects_on_objects_are_applied_as_effects() {
