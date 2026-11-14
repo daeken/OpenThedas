@@ -132,7 +132,7 @@ pub(crate) fn plan(
                 && (p.color_write != 0 || p.alpha_test != Some((CompareFunc::GreaterEqual, 255))))
             || item.cast_shadow == Some(false)
             || item.lod.is_some()
-            || scene.cut_away.contains(&d.draw)
+            || (!crate::config::CONFIG.cutaway && scene.cut_away.contains(&d.draw))
             || item
                 .skin
                 .as_ref()
