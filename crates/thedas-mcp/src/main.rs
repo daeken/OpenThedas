@@ -1770,7 +1770,17 @@ impl Server {
             // Until the swing resolves (walking up first if out of reach), at most 10 s.
             for _ in 0..100 {
                 sim.tick(100);
-                if sim.world.get(hero).is_none_or(|h| h.commands.is_empty()) {
+                if sim.world.get(hero).is_none_or(|h| {
+                    h.commands.is_empty()
+                        // DA2's controlled hero can receive a fresh AI wait in the same
+                        // tick that this attack finishes. Waiting for an empty queue then
+                        // advances the entire ten seconds after a single swing, leaving
+                        // the hero idle while followers and enemies keep attacking.
+                        || (sim.game == thedas_vfs::Game::DragonAge2
+                            && h.commands.first().is_none_or(|c| {
+                                c.name != "CommandAttack" || c.target != Some(target)
+                            }))
+                }) {
                     break;
                 }
             }
