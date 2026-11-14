@@ -2384,6 +2384,23 @@ impl D3dPass {
         self.sun
     }
 
+    /// The emitters (by index into the scene's) drawn adding light to the frame: an
+    /// additive blend (destination factor one), not into the distortion mask.
+    pub(crate) fn glowing_emitters(&self) -> std::collections::BTreeSet<usize> {
+        self.particles
+            .iter()
+            .filter(|p| {
+                !p.distortion
+                    && self.pipelines[p.pipeline]
+                        .program
+                        .pass
+                        .blend
+                        .is_some_and(|(_, dst, _)| dst == thedas_formats::state::BlendFactor::One)
+            })
+            .map(|p| p.emitter)
+            .collect()
+    }
+
     /// The fog registers (`mml_vFogParams`, see [`crate::atmosphere::fog_params`]).
     pub(crate) fn fog(&self) -> [[f32; 4]; 2] {
         self.fog

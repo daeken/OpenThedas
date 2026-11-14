@@ -2347,6 +2347,30 @@ impl Live {
         Ok(())
     }
 
+    /// Sets how the level is drawn, and for the deferred path the lights the frame's glowing
+    /// particles give (the level's, its objects' and the visual effects'), which light the
+    /// level's geometry (ours: the original's particles light nothing).
+    fn give_effect_lights(&mut self) {
+        let path = self.render_path;
+        if let Some(l) = self.level.as_mut() {
+            l.renderer.path = path;
+        }
+        if path != thedas_render::RenderPath::Deferred {
+            return;
+        }
+        let lights: Vec<_> = self
+            .level
+            .iter()
+            .map(|l| &l.renderer)
+            .chain(self.objects.iter().map(|o| &o.renderer))
+            .chain(self.effects.iter().map(|e| &e.renderer))
+            .flat_map(|r| r.emitter_lights())
+            .collect();
+        if let Some(l) = self.level.as_mut() {
+            l.renderer.set_effect_lights(lights);
+        }
+    }
+
     /// Records the frame: the level, then the objects over it.
     pub fn render(
         &mut self,
@@ -2376,6 +2400,7 @@ impl Live {
         }
         self.set_shader_time();
         self.apply_cutaway(ctx);
+        self.give_effect_lights();
         let aim = self.reticle(camera, (width, height), self.cursor);
         let format = self.format.unwrap_or(thedas_render::gpu::CAPTURE_FORMAT);
         let samples = self.level.as_ref().map_or(1, |l| l.renderer.samples());
@@ -2383,7 +2408,6 @@ impl Live {
         let Some(level) = self.level.as_mut() else {
             return false;
         };
-        level.renderer.path = self.render_path;
         // Every renderer's shadow casters go into the partitions before anything is drawn.
         level.renderer.prepare_shadows(ctx, camera, width, height);
         if let Some(o) = self.objects.as_mut() {
@@ -2509,6 +2533,7 @@ impl Live {
         }
         self.set_shader_time();
         self.apply_cutaway(ctx);
+        self.give_effect_lights();
         let cut_effects = self.cut_effects();
         let aim = self.reticle(camera, (width, height), self.cursor);
         let samples = self.level.as_ref().map_or(1, |l| l.renderer.samples());
@@ -2517,7 +2542,6 @@ impl Live {
             return Ok(None);
         };
         level.renderer.cut_effects = cut_effects;
-        level.renderer.path = self.render_path;
         let mut overlays: Vec<&mut AreaRenderer> = self
             .rings
             .iter_mut()

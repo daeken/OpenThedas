@@ -71,6 +71,13 @@ characters and placeables, move over in later steps.
 - Area lights: `AreaScene::lights` (`_ll` light models: point lights with colour, radius,
   intensity, room) plus `set_extra_lights` (cutscene lights). Ambient light nodes keep
   lighting placeables only, as in the original.
+- Glowing emitters (done): every particle emitter drawn additively (torch and brazier
+  flames, embers, spell effects), in the level's, its objects' and the visual effects'
+  renderers, gives the deferred pass a point light each frame at its particles' glow-
+  weighted centre, its colour their hue and its strength rising with the light they show
+  (`deferred::emitter_light`, constants tuned by eye). A light of no room reaches from the
+  room its box puts it in. `THEDAS_DEFERRED_LOG_LIGHTS=1` logs a frame's. Original idea
+  below kept for what is left:
 - Spell and VFX lights (later step): each live emitter of a prop's effect becomes a point
   light at the emitter, its colour the particles' current colour, scaled by how many are
   alive against the emitter's peak, its radius from the emitter's spread. Light nodes inside
