@@ -2970,6 +2970,38 @@ mod queue_tests {
     }
 
     #[test]
+    fn zero_and_negative_goto_calls_leave_the_frame_and_play_state_unchanged() {
+        let (mut p, _) = input_player();
+        let root = p.vm.root;
+        p.vm.display
+            .get_mut(root)
+            .unwrap()
+            .clip_mut()
+            .unwrap()
+            .timeline = Arc::new(crate::swf::Timeline {
+            frames: vec![Default::default(); 100],
+            labels: vec![],
+        });
+        goto(&mut p.vm, root, 82, true);
+        let object = p.vm.display_object(root);
+        for value in [
+            Value::Number(0.0),
+            Value::Number(-1.0),
+            Value::from("0"),
+            Value::from("-42"),
+        ] {
+            p.vm.call_method(&object, "gotoAndStop", &[value]);
+            let clip = p.vm.display.get(root).unwrap().clip().unwrap();
+            assert_eq!(clip.frame, Some(82));
+            assert!(clip.playing);
+        }
+        p.vm.call_method(&object, "gotoAndStop", &[Value::Number(8.0)]);
+        let clip = p.vm.display.get(root).unwrap().clip().unwrap();
+        assert_eq!(clip.frame, Some(7));
+        assert!(!clip.playing);
+    }
+
+    #[test]
     fn goto_recreates_replaced_symbols_but_preserves_continuous_instances() {
         let (mut p, _) = input_player();
         let root = p.vm.root;

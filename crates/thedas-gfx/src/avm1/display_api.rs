@@ -716,13 +716,16 @@ fn mc_goto(vm: &mut Vm, this: Value, args: &[Value], play: bool) -> Value {
     };
     match arg(args, 0) {
         Value::String(s) => match s.parse::<f64>() {
-            Ok(n) => crate::player::goto(vm, d, (n as i64 - 1).max(0) as u16, play),
+            Ok(n) if n >= 1.0 && n.is_finite() => {
+                crate::player::goto(vm, d, (n - 1.0).min(u16::MAX as f64) as u16, play);
+            }
+            Ok(_) => {}
             Err(_) => crate::player::goto_label(vm, d, &s, play),
         },
         v => {
             let n = vm.to_number(&v);
-            if n.is_finite() {
-                crate::player::goto(vm, d, (n as i64 - 1).max(0) as u16, play);
+            if n.is_finite() && n >= 1.0 {
+                crate::player::goto(vm, d, (n - 1.0).min(u16::MAX as f64) as u16, play);
             }
         }
     }
