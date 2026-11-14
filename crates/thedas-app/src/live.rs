@@ -3347,8 +3347,18 @@ pub fn prop(m: &ObjectModel) -> Prop {
 
 /// A creature's motion as an animation clip.
 /// A cutscene animation as a layer over a creature's own motion (whose trees are `trees`):
-/// it loops when those trees loop its animation, else when its track spans the whole
-/// cutscene (see [`crate::cutactors`]).
+/// it loops when those trees loop its animation; when they do not have it as a plain
+/// animation (`humanoid.anb` plays `mov.walkf.ani` only inside its movement blends), when
+/// the cutscene's own tree loops its node (field 4027; a `.cub` has 0, loop, throughout),
+/// or its track spans the whole cutscene (see [`crate::cutactors`]). A passer-by whose
+/// track plays a walk cycle for ten seconds while a position track moves it so keeps
+/// walking, where it stood frozen in the cycle's last frame and slid.
+///
+/// Provisional: the executable sets a track's animation to the track's time each frame
+/// (0x7db400 through 0x7ce1b0, a virtual call on the creature's animation), and what that
+/// call does with a time past the animation's end is not traced. That the time wraps is
+/// inferred from 0x7db400 holding the time 0.001 s (0xae7118) short of the track's end,
+/// which only matters to a player that wraps, and from the trees' loop flag.
 fn cut_layer(
     animator: &mut Animator,
     vfs: &Vfs,
@@ -3357,7 +3367,12 @@ fn cut_layer(
 ) -> Clip {
     let once = animator
         .action_animation(vfs, &a.tree, &a.node)
-        .and_then(|ani| animator.plays_once(vfs, trees, &ani));
+        .and_then(|ani| animator.plays_once(vfs, trees, &ani))
+        .or_else(|| {
+            animator
+                .action_once(vfs, &a.tree, &a.node)
+                .map(|once| once && !a.unbounded)
+        });
     Clip {
         trees: vec![a.tree.clone()],
         actions: vec![a.node.clone()],
