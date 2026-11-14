@@ -3198,7 +3198,19 @@ impl AreaScene {
                 } else {
                     s.character_color
                 };
-                (Vec3::from_array(s.direction), Vec3::from_array(color))
+                // A Dragon Age II layout (one holding its own fog) stores the sunlight's
+                // direction turned half round about the vertical: as stored, the shadows
+                // cast by it fall where the level's baked lightmaps are lit, and turned
+                // they fall on the baked ones (Hightown: the ground under a building's
+                // shadow matches the lightmaps at 39.5 dB turned, 27.6 as stored).
+                // Provisional: from that comparison, not the executable.
+                let d = Vec3::from_array(s.direction);
+                let d = if arl.fog.is_some() {
+                    Vec3::new(-d.x, -d.y, d.z)
+                } else {
+                    d
+                };
+                (d, Vec3::from_array(color))
             });
             l.scene.bounds = arl
                 .bounds()
