@@ -204,6 +204,53 @@ fn da2_ability_list(sim: &Sim, who: ObjectId, ty: i32, cooling: bool) -> Vec<i32
 /// The party's inventory slots before any backpack (provisional).
 pub const DEFAULT_INVENTORY_SIZE: i32 = 70;
 
+/// Origins 0x662f00 reads CCParty +0xc4, initialized from the XP tables at 0x63b765.
+/// These tables are fixed for this simulation; derive the same value without saved state.
+fn origins_max_level(sim: &Sim) -> i32 {
+    if !sim
+        .world
+        .party
+        .and_then(|id| sim.world.get(id))
+        .is_some_and(|o| o.kind == ObjectKind::Party)
+    {
+        return 0;
+    }
+    let Some(properties) = sim.world.tables.get(98, "") else {
+        return 0;
+    };
+    let Some(xp) = sim.world.tables.get(164, "") else {
+        return 0;
+    };
+    // The native float reader reads the cell's 32 bits, with zero for an absent value.
+    let max_xp = match properties.cell_by_hash(0x61d4_debf, 19) {
+        Some(Cell::Float(v)) => *v as f32,
+        Some(Cell::Int(v)) => f32::from_bits(*v as u32),
+        Some(Cell::Empty) => 0.0,
+        _ => return 0,
+    };
+    // The same SSE2 CRT conversion as FloatToInt (0x8e34f0).
+    let max_xp = if (i32::MIN as f32..2147483648.0).contains(&max_xp) {
+        max_xp as i32
+    } else {
+        i32::MIN
+    };
+    let mut level = 0;
+    for (index, row) in xp.order.iter().enumerate() {
+        // 0x4ecd50 takes a row POSITION, unlike the properties read's row id 19.
+        let required = match xp.cell_by_hash(0xa0f0_2e99, *row) {
+            Some(Cell::Int(v)) => *v as i32,
+            Some(Cell::Float(v)) => (*v as f32).to_bits() as i32,
+            Some(Cell::Empty) => 0,
+            _ => break,
+        };
+        if required > max_xp {
+            break;
+        }
+        level = index as i32;
+    }
+    level
+}
+
 fn store_field(h: &ScriptHost, store: ObjectId, name: &str, default: i32) -> i32 {
     h.object(store)
         .and_then(|o| o.fields.get(name).copied())
@@ -2015,7 +2062,11 @@ pub fn call(
                     && c.from.is_none()
             })
         }))),
-        "GetMaxLevel" => ok(Value::Int(20)),
+        "GetMaxLevel" => ok(Value::Int(if h.sim.game == thedas_vfs::Game::Origins {
+            origins_max_level(h.sim)
+        } else {
+            20
+        })),
         "GetTime" => ok(Value::Int((h.sim.world.time_ms / 1000) as i32)),
         "ReadIniEntry" => ok(Value::String(String::new())),
         // Achievements belong to the player's profile, not the game: the simulation's profile has
@@ -7191,6 +7242,136 @@ mod tests {
             .find(|q| q.target == c)
             .map(|q| q.event.clone());
         assert_eq!(ev.map(|e| e.ints), Some(vec![7, -2]));
+    }
+
+    #[test]
+    fn origins_max_level_uses_merged_xp_tables_and_row_positions() {
+        let table = Arc::new(EngineTable::parse(b"int GetMaxLevel() = 840;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.party = Some(s.world.spawn(ObjectKind::Party, "party"));
+        s.world
+            .tables
+            .insert("#98", &["Max"], vec![(19, vec![Cell::Float(100.99)])]);
+        // A direct worksheet must not bypass the merged properties table.
+        s.world
+            .tables
+            .insert("properties", &["Max"], vec![(19, vec![Cell::Float(0.0)])]);
+        s.world.tables.insert(
+            "#164",
+            &["XP"],
+            vec![
+                (10, vec![Cell::Int(0)]),
+                (20, vec![Cell::Int(50)]),
+                (30, vec![Cell::Int(100)]),
+                (40, vec![Cell::Int(101)]),
+                (50, vec![Cell::Int(0)]),
+            ],
+        );
+        let before = s.save_json().unwrap();
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(2)));
+        assert_eq!(s.save_json().unwrap(), before);
+        s.load_json(&before).unwrap();
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(2)));
+        // The first over-cap row stops the walk; a later low threshold is never visited.
+        s.world
+            .tables
+            .insert("#98", &["Max"], vec![(19, vec![Cell::Float(99.99)])]);
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(1)));
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(20)));
+    }
+
+    #[test]
+    fn origins_max_level_handles_missing_party_and_table_inputs() {
+        let table = Arc::new(EngineTable::parse(b"int GetMaxLevel() = 840;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world
+            .tables
+            .insert("#98", &["Max"], vec![(19, vec![Cell::Float(100.0)])]);
+        s.world.tables.insert(
+            "#164",
+            &["XP"],
+            vec![(0, vec![Cell::Int(0)]), (1, vec![Cell::Int(100)])],
+        );
+        for party in [None, Some(OBJECT_INVALID)] {
+            s.world.party = party;
+            assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(0)));
+        }
+        s.world.party = Some(s.world.spawn(ObjectKind::Creature, "wrong_kind"));
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(0)));
+        s.world.party = Some(s.world.spawn(ObjectKind::Party, "party"));
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(1)));
+        let tables = s.world.tables.clone();
+        s.world.tables = Arc::new(crate::m2da::Tables::empty());
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(0)));
+        s.world.tables = tables;
+        for rows in [vec![], vec![(18, vec![Cell::Float(100.0)])]] {
+            s.world.tables.insert("#98", &["Max"], rows);
+            assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(0)));
+        }
+        s.world
+            .tables
+            .insert("#98", &["Other"], vec![(19, vec![Cell::Float(100.0)])]);
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(0)));
+        s.world
+            .tables
+            .insert("#98", &["Max"], vec![(19, vec![Cell::Float(100.0)])]);
+        for (columns, rows) in [("XP", vec![]), ("Other", vec![(0, vec![Cell::Int(0)])])] {
+            s.world.tables.insert("#164", &[columns], rows);
+            assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(0)));
+        }
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.world.party = None;
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(20)));
+    }
+
+    #[test]
+    fn origins_max_level_uses_native_numeric_cell_reads_and_sse2_conversion() {
+        let table = Arc::new(EngineTable::parse(b"int GetMaxLevel() = 840;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.party = Some(s.world.spawn(ObjectKind::Party, "party"));
+        s.world.tables.insert(
+            "#164",
+            &["XP"],
+            vec![
+                (0, vec![Cell::Int(0)]),
+                (1, vec![Cell::Int(1)]),
+                (2, vec![Cell::Int(2)]),
+            ],
+        );
+        for (cap, expected) in [
+            (Cell::Float(1.99), 1),
+            (Cell::Float(2.0), 2),
+            (Cell::Float(-1.0), 0),
+            (Cell::Float(f64::NAN), 0),
+            (Cell::Float(f64::INFINITY), 0),
+            (Cell::Float(2147483648.0), 0),
+            (Cell::Int(2.0f32.to_bits() as i64), 2),
+            (Cell::Empty, 0),
+        ] {
+            s.world
+                .tables
+                .insert("#98", &["Max"], vec![(19, vec![cap.clone()])]);
+            assert_eq!(
+                run(&mut s, 0, "GetMaxLevel", &[]),
+                Some(Value::Int(expected)),
+                "{cap:?}"
+            );
+        }
+        s.world
+            .tables
+            .insert("#98", &["Max"], vec![(19, vec![Cell::Float(1.0)])]);
+        s.world.tables.insert(
+            "#164",
+            &["XP"],
+            vec![
+                (0, vec![Cell::Int(0)]),
+                (1, vec![Cell::Empty]),
+                (2, vec![Cell::Float(1.0)]),
+            ],
+        );
+        // The native int reader reinterprets the float cell's bits, rather than converting 1.0.
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(1)));
     }
 
     #[test]
