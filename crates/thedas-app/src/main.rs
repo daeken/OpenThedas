@@ -5012,6 +5012,7 @@ fn audio_state(
                         }),
                     placeable: (o.kind == thedas_sim::world::ObjectKind::Placeable)
                         .then_some(o.appearance as i64),
+                    height: Some(live::appearance_height(&sim, *id)),
                 },
             );
         }

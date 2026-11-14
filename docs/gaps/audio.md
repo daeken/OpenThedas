@@ -22,7 +22,7 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
    - Also done: `OnExploreMusic` while `main` plays and `OnCombatMusic` while `combat` does, while the music volume is above 0 (0x5bccd0, 0x5bc6f6); and a theme change during a load waits for the load to end, the old music playing on (0x5bfdf0, 0x5b7070 -> 0x5c4060).
    - Also done: the music director's cues per game mode (0x5bb630): explore `main`, combat `combat` (6 s late when it follows the interface, dialog or a cutscene), dialog and cutscenes `main` (except one after the other), death `Death`, the interface and loading keep the track.
    - Also done: sound events that cue a track (`#music:<track>,<delay>[,combat]`, the cutscene `music/cutscene/*_switch` events; parsed at 0x5b9750, cued on event start 0x5bac80 -> 0x5b70c0): a delay of 0 or less cues the track of the current theme at once, a longer one waits like the deferred combat cue, and a game-mode change drops it.
-   - Not done: the `combat` token on a cue (stored at event+0xb4) is read but not used; what the exe does with it is not traced.
+   - Not needed: the `combat` token on a cue (event+0xb4) is read but not acted on. In the exe it marks the cued track (music +0x15d, then +0x15c once it plays, 0x5c2f0e), and a cutscene that passes its last time mark (0x7cf2e0) cues `main` at once if the playing track is marked (0x5b73f0). None of the 77 `#music:` cues in the shipped banks carries it.
    - Provisional: our combat and interface modes come from the party's fighting and the menus up, not from game modes the simulation keeps.
    - Medium.
 5. **Death and party-wipe music.** Done: the music director cues `Death` when the game mode becomes dead (0x5bb84e), and the change is immediate (0x5c4c69). Provisional: our dead mode is the simulation's game-over flag.
@@ -68,6 +68,7 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
 ### Combat and animation sounds
 
 18. **Blows at the hit frame** are done (#297).
+    - Where animation sounds play: a creature has two sound emitters (0x6aa5fd..0x6aa6d4): the body's at half its appearance's height above its feet (0.9 m without an appearance), and the head's at its model's node in slot 3, else with the body's. Footsteps, foley, rustles, bodyfalls and named events (kinds 14, 17, 18, 20 and others) sound from the body; swings, (un)sheathing and blows (kinds 1, 3-7, 9, 10, 19, 21) from the head (play switch 0x6b6497). So a blow sounds from the striker, not the target. Provisional: ours puts the head emitter at the appearance's full height.
     - Not done: placeable targets (worksheet 93, placeable +0x4f0).
     - The armour material is taken from the chest item's base material; the exe goes through worksheet 89 "Material Types" (column 0xbb8ad13b) and an override (0x7485d0).
     - Small.
