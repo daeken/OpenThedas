@@ -256,6 +256,55 @@ pub(crate) fn cell_float(c: Option<&Cell>) -> f32 {
     }
 }
 
+fn upgradable_ability_data(
+    sim: &Sim,
+    id: ObjectId,
+    column: u32,
+    ability: i32,
+    floating: bool,
+) -> Option<(std::sync::Arc<crate::m2da::Table>, Vec<i64>)> {
+    let creature = sim
+        .world
+        .get(id)
+        .filter(|o| o.kind == ObjectKind::Creature)?;
+    let table = sim.world.tables.get(1, "")?;
+    let ability = i64::from(ability);
+    let cell = |row| table.cell_by_hash(column, row);
+    let mut rows = vec![ability];
+    let upgradeable = if floating {
+        cell_float(cell(0)) != 0.0
+    } else {
+        cell_int(cell(0)) != 0
+    };
+    if upgradeable && cell(ability).is_some() {
+        for upgrade in [0xd300_f4d9, 0xf82d_a71a, 0xe136_965b, 0xae77_009c] {
+            let id = cell_int(table.cell_by_hash(upgrade, ability));
+            if creature.abilities.contains(&id) {
+                rows.push(i64::from(id));
+            }
+        }
+    }
+    Some((table, rows))
+}
+
+pub(crate) fn upgradable_ability_int(sim: &Sim, id: ObjectId, column: u32, ability: i32) -> i32 {
+    let Some((table, rows)) = upgradable_ability_data(sim, id, column, ability, false) else {
+        return 0;
+    };
+    rows.into_iter().fold(0i32, |n, row| {
+        n.wrapping_add(cell_int(table.cell_by_hash(column, row)))
+    })
+}
+
+fn upgradable_ability_float(sim: &Sim, id: ObjectId, column: u32, ability: i32) -> f32 {
+    let Some((table, rows)) = upgradable_ability_data(sim, id, column, ability, true) else {
+        return 0.0;
+    };
+    rows.into_iter().fold(0.0, |n, row| {
+        n + cell_float(table.cell_by_hash(column, row))
+    })
+}
+
 pub(crate) fn cell_string(c: Option<&Cell>) -> String {
     match c {
         Some(Cell::Int(v)) => v.to_string(),
@@ -1626,6 +1675,28 @@ pub fn call(
                 handle: Some(hd),
             })
         }
+        // DA2's native 0x4f00d0 constructs the ability's delayed impact payload and
+        // schedules it for oObject. Its creator is the calling script's object, not
+        // necessarily the caster; the explicit script overrides oObject's handler.
+        "ConstructAbilityImpactandDelayEvent" => {
+            let target = obj(a, 1);
+            if h.object(target).is_none() {
+                return void();
+            }
+            let ev = Event {
+                ty: int(a, 3),
+                creator: Some(caller),
+                objects: (4..8).map(|i| obj(a, i)).collect(),
+                floats: vec![float(a, 8)],
+                ints: (9..14).map(|i| int(a, i)).collect(),
+                vectors: vec![vector(a, 14)],
+                ..Default::default()
+            };
+            let script = Some(string(a, 2)).filter(|s| !s.is_empty());
+            let ms = (float(a, 0).max(0.0) * 1000.0).round() as u64;
+            h.sim.world.queue_event(ms, target, ev, script);
+            void()
+        }
         "SignalEvent" | "DelayEvent" => {
             let (target, hi, delay) = if name == "SignalEvent" {
                 (obj(a, 0), 1, 0.0)
@@ -1742,48 +1813,12 @@ pub fn call(
         // row 0 marks which columns accept additions from the four learned upgrades.
         // Read the live ability set, so grants/removals and reload need no cached totals.
         "GetUpgradableAbilityHashedM2DAInt" | "GetUpgradableAbilityHashedM2DAFloat" => {
-            let Some(creature) = h
-                .object(obj(a, 0))
-                .filter(|o| o.kind == ObjectKind::Creature)
-            else {
-                return ok(if name.ends_with("Float") {
-                    Value::Float(0.0)
-                } else {
-                    Value::Int(0)
-                });
-            };
-            let table = h.sim.world.tables.get(1, "");
             let column = int(a, 1) as u32;
-            let ability = i64::from(int(a, 2));
-            let cell = |row| table.as_ref().and_then(|t| t.cell_by_hash(column, row));
-            let mut rows = vec![ability];
-            let upgradeable = if name.ends_with("Float") {
-                cell_float(cell(0)) != 0.0
-            } else {
-                cell_int(cell(0)) != 0
-            };
-            if upgradeable && cell(ability).is_some() {
-                for upgrade in [0xd300_f4d9, 0xf82d_a71a, 0xe136_965b, 0xae77_009c] {
-                    let id = cell_int(
-                        table
-                            .as_ref()
-                            .and_then(|t| t.cell_by_hash(upgrade, ability)),
-                    );
-                    if creature.abilities.contains(&id) {
-                        rows.push(i64::from(id));
-                    }
-                }
-            }
+            let ability = int(a, 2);
             ok(if name.ends_with("Float") {
-                Value::Float(
-                    rows.into_iter()
-                        .fold(0.0, |n, row| n + cell_float(cell(row))),
-                )
+                Value::Float(upgradable_ability_float(h.sim, obj(a, 0), column, ability))
             } else {
-                Value::Int(
-                    rows.into_iter()
-                        .fold(0i32, |n, row| n.wrapping_add(cell_int(cell(row)))),
-                )
+                Value::Int(upgradable_ability_int(h.sim, obj(a, 0), column, ability))
             })
         }
         "GetM2DARows" => ok(Value::Int(
@@ -6790,6 +6825,78 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn da2_delayed_ability_impacts_keep_the_payload_and_delivery_time_on_reload() {
+        let table = Arc::new(
+            EngineTable::parse(
+                br#"
+            void ConstructAbilityImpactandDelayEvent(float delay, object receiver,
+                string script, int type, object caster, object victim, object item,
+                object secondary, float damage, int ability, int result, int hit,
+                int hand, int damageType, vector position) = 890;
+        "#,
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.game = thedas_vfs::Game::DragonAge2;
+        let caller = s.world.spawn(ObjectKind::Creature, "caller");
+        let receiver = s.world.spawn(ObjectKind::Creature, "receiver");
+        let caster = s.world.spawn(ObjectKind::Creature, "caster");
+        s.world.time_ms = 500;
+        let mut args = vec![
+            Value::Float(0.125),
+            Value::Object(receiver),
+            Value::String("impact".into()),
+            Value::Int(1066),
+            Value::Object(caster),
+            Value::Object(41),
+            Value::Object(OBJECT_INVALID),
+            Value::Object(43),
+            Value::Float(17.25),
+            Value::Int(123),
+            Value::Int(8),
+            Value::Int(2),
+            Value::Int(1),
+            Value::Int(4),
+            Value::Vector([1.0, -2.0, 3.5]),
+        ];
+        run(&mut s, caller, "ConstructAbilityImpactandDelayEvent", &args);
+        assert!(s.world.pop_due(624).is_none());
+        let serialized = serde_json::to_vec(&s.world).unwrap();
+        let mut restored: crate::world::World = serde_json::from_slice(&serialized).unwrap();
+        let (due, queued) = restored.pop_due(625).unwrap();
+        assert_eq!(due, 625);
+        assert_eq!(queued.target, receiver);
+        assert_eq!(queued.script.as_deref(), Some("impact"));
+        assert_eq!(
+            queued.event,
+            Event {
+                ty: 1066,
+                creator: Some(caller),
+                objects: vec![caster, 41, OBJECT_INVALID, 43],
+                floats: vec![17.25],
+                ints: vec![123, 8, 2, 1, 4],
+                vectors: vec![[1.0, -2.0, 3.5]],
+                ..Default::default()
+            }
+        );
+        assert!(restored.pop_due(u64::MAX).is_none());
+        assert_eq!(s.world.pop_due(625).unwrap().1.event, queued.event);
+
+        // No override uses the receiver's ordinary handler. Even a zero or negative
+        // delay is queued, so this helper does not re-enter the caller's script.
+        args[0] = Value::Float(-1.0);
+        args[2] = Value::String(String::new());
+        run(&mut s, caller, "ConstructAbilityImpactandDelayEvent", &args);
+        let (due, queued) = s.world.pop_due(500).unwrap();
+        assert_eq!(due, 500);
+        assert_eq!(queued.script, None);
+        args[1] = Value::Object(OBJECT_INVALID);
+        run(&mut s, caller, "ConstructAbilityImpactandDelayEvent", &args);
+        assert!(s.world.pop_due(u64::MAX).is_none());
     }
 
     #[test]
