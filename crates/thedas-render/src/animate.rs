@@ -62,6 +62,12 @@ fn tree_resource(tree: &str) -> String {
     }
 }
 
+/// Each track's node on a skeleton (see [`crate::skeleton::Skeleton::track_nodes`]).
+type TrackNodes = Arc<[Option<usize>]>;
+
+/// A skeleton's rest pose and its pose (model space).
+type Posed = (Arc<Vec<Mat4>>, Vec<Mat4>);
+
 /// The most threads the props' posing is spread over.
 const POSE_THREADS: usize = 4;
 
@@ -78,7 +84,7 @@ pub struct Animator {
     unhashed: std::collections::HashSet<String>,
     /// Each animation's track nodes on each skeleton (by the skeleton's index, then the
     /// animation's resource): see [`crate::skeleton::Skeleton::track_nodes`].
-    track_nodes: HashMap<usize, HashMap<String, Arc<[Option<usize>]>>>,
+    track_nodes: HashMap<usize, HashMap<String, TrackNodes>>,
 }
 
 fn load<T>(
@@ -382,8 +388,7 @@ impl Animator {
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .clamp(1, POSE_THREADS);
-        let mut posed: Vec<(usize, usize, (Arc<Vec<Mat4>>, Vec<Mat4>))> =
-            Vec::with_capacity(jobs.len());
+        let mut posed: Vec<(usize, usize, Posed)> = Vec::with_capacity(jobs.len());
         if threads <= 1 || jobs.len() < 8 {
             posed.extend(jobs.into_iter().map(|(i, s, p)| (i, s, p.pose())));
         } else {
