@@ -4753,6 +4753,11 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => self.cursor_to(position.x, position.y),
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.mouse_leave();
+                }
+            }
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,

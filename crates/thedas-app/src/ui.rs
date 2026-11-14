@@ -3285,6 +3285,11 @@ impl UiLayer {
         self.stage.mouse_move(x, y);
     }
 
+    /// The mouse left the window.
+    pub fn mouse_leave(&mut self) {
+        self.stage.mouse_leave();
+    }
+
     /// The mouse wheel turned `lines` (up positive) at (`x`, `y`): lists and text under the
     /// mouse scroll.
     pub fn mouse_wheel(&mut self, x: f64, y: f64, lines: f64) {
