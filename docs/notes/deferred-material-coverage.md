@@ -39,7 +39,8 @@ and effects introduced after that frame require further surveys.
 | Ch1AlphArmTnt / Character_Alpha | 1 | 0 |
 
 Static1, Static1_Punch and Prop1 also have G-buffer draws in this survey. Their
-forward rows are cutaway exclusions. Blended materials and all four hair passes
+forward rows were cutaway exclusions (now supported while opaque; see below).
+Blended materials and all four hair passes
 keep their authored colour and ordering. `THEDAS_DEFERRED_LOG_MATERIALS=1` logs
 the complete program names, planned forward/G-buffer counts, exclusion reasons,
 particle emitter programs, and the first frame's visible geometry counts. The
@@ -131,3 +132,50 @@ instances) into deferred rendering. Planned G-buffer coverage is now 31,226 of
 planned count are cutaway Static1 (1,092), Black (768), eyelash Eye0 (265) and the
 four hair passes (200 each). The inventory above retains the original baseline
 counts for comparison. These counts do not measure GPU submissions after instancing.
+
+## Opaque cutaways and Black
+
+The continued survey admits another **1,933 planned passes**: 1,092 cutaway Static1,
+768 Black, 49 cutaway Static1 punch and 24 cutaway Prop1. The five scenes now plan
+**33,159 G-buffer passes out of 34,360**, leaving **1,201 forward passes**. At the
+fixed cameras this moves 962 visible instances (557 Static1, 368 Black, 25 punch,
+12 props), before instancing. Planning counts include opaque-capable cutaways even
+when the live camera subsequently fades them forward.
+
+Cutaways no longer have a blanket exclusion. Fully opaque supported surfaces share
+deferred lighting, depth and point casting. Runtime fades return colour to the
+faithful blended phase; faded surfaces cast no point shadow. Returning to full
+opacity restores the deferred draw and caster, refreshing affected cubes. The
+independent punch caster samples the same cutout holes. No roof is made permanently
+opaque. `THEDAS_DEFERRED_CUTAWAY=0` restores the earlier exclusion; it is read once.
+
+Black's locally inspected shaders project rigid positions and output opaque black,
+without texture sampling, fog or lighting. Its additional original render target is
+not used by the current faithful world pipeline. Deferred Black has a dedicated
+material tag and preserves that unlit colour, including in probe and diagnostic
+modes. It contributes depth and finite normal data, obeys cast flags and fades, and
+does not submit a reflection redraw. `THEDAS_DEFERRED_BLACK=0` keeps it forward and
+is read once. Unsupported states, instancing and skinning remain excluded. Its
+silhouette has the same single-sample G-buffer limitation as other deferred geometry.
+
+The remaining families, ranked by planned passes, are:
+
+| Forward family | Planned passes | Required semantics |
+|---|---:|---|
+| Eye0 / Eyelash0 | 265 | Alpha test plus fractional source-alpha blending and depth writes |
+| Four hair passes | 800 (200 each) | Colour-disabled depth core, depth-equal opaque colour, then two blended face passes |
+| Static1_Alpha | 70 | Source-alpha blending |
+| PropAlpha1 | 19 | Source-alpha blending |
+| Water0 | 18 | Authored water colour/depth behavior |
+| Prop1_Punch | 11 | Alpha test plus fractional source-alpha blending |
+| Clouds and Sky | 8 | Authored background/scattering equations |
+| Two far billboard passes | 6 | Viewing LOD/fade and billboard equations |
+| Cloth1 blended | 3 | Source-alpha blending |
+| Character_Alpha | 1 | Source-alpha blending |
+
+The hair states were inspected locally: pass one writes depth only at alpha 255;
+pass two writes colour at equal depth without depth writes; passes three and four
+blend opposite faces in order. Moving any one of them into the opaque G-buffer
+would break that relationship. Eyelashes and Prop punch already cast sampled point
+shadows through the independent cutout plan; their fractional colour remains forward.
+Further coverage needs a compatible forward-lighting or transparency design.
