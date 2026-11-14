@@ -125,6 +125,7 @@ pub enum Filter {
         strength: f32,
         inner: bool,
         knockout: bool,
+        composite_source: bool,
         passes: u8,
     },
     /// Read and skipped (no movie uses them).
@@ -466,7 +467,7 @@ fn read_filters(r: &mut Reader) -> Result<Vec<Filter>> {
                     strength,
                     inner: f & 0x80 != 0,
                     knockout: f & 0x40 != 0,
-                    hide_object: f & 0x20 != 0,
+                    hide_object: f & 0x20 == 0,
                     passes: f & 0x1f,
                 }
             }
@@ -486,6 +487,7 @@ fn read_filters(r: &mut Reader) -> Result<Vec<Filter>> {
                     strength,
                     inner: f & 0x80 != 0,
                     knockout: f & 0x40 != 0,
+                    composite_source: f & 0x20 != 0,
                     passes: f & 0x1f,
                 }
             }
@@ -593,6 +595,29 @@ fn read_place(r: &mut Reader, v3: bool) -> Result<Place> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filter_source_visibility_and_quality() {
+        for flags in [0, 0x20, 0xff] {
+            // One DropShadow and one Glow, with RGBA, fixed-point sizes and strength.
+            let mut data = vec![2, 0, 10, 20, 30, 128];
+            data.extend_from_slice(&[0; 18]);
+            data.push(flags);
+            data.extend_from_slice(&[2, 40, 50, 60, 64]);
+            data.extend_from_slice(&[0; 10]);
+            data.push(flags);
+            let filters = read_filters(&mut Reader::new(&data)).unwrap();
+            assert!(
+                matches!(filters[0], Filter::DropShadow { hide_object, passes, inner, knockout, .. }
+                if hide_object == (flags & 0x20 == 0) && passes == flags & 31
+                    && inner == (flags & 0x80 != 0) && knockout == (flags & 0x40 != 0))
+            );
+            assert!(
+                matches!(filters[1], Filter::Glow { composite_source, passes, .. }
+                if composite_source == (flags & 0x20 != 0) && passes == flags & 31)
+            );
+        }
+    }
 
     fn tag(code: u16, body: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();

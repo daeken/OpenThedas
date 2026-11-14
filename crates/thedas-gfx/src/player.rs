@@ -26,6 +26,7 @@ pub struct Player {
     pressed: Option<(DisplayId, u8)>,
     queue_init: VecDeque<Queued>,
     queue_construct: VecDeque<Queued>,
+    queue_default: VecDeque<Queued>,
     /// Whether press handlers get the mouse button as Scaleform passed it (`onPress(1)`).
     pub pass_buttons: bool,
 }
@@ -132,6 +133,7 @@ impl Player {
             pressed: None,
             queue_init: VecDeque::new(),
             queue_construct: VecDeque::new(),
+            queue_default: VecDeque::new(),
             pass_buttons: true,
         };
         // The root's first frame.
@@ -225,13 +227,14 @@ impl Player {
                 match q {
                     Queued::Init(..) => self.queue_init.push_back(q),
                     Queued::Construct { .. } => self.queue_construct.push_back(q),
-                    _ => self.queue_construct.push_back(q),
+                    _ => self.queue_default.push_back(q),
                 }
             }
             let Some(q) = self
                 .queue_init
                 .pop_front()
                 .or_else(|| self.queue_construct.pop_front())
+                .or_else(|| self.queue_default.pop_front())
             else {
                 break;
             };
@@ -240,6 +243,7 @@ impl Player {
                 self.vm.warn_once("action queue runaway".into());
                 self.queue_init.clear();
                 self.queue_construct.clear();
+                self.queue_default.clear();
                 break;
             }
             run_queued(&mut self.vm, q);
@@ -289,6 +293,7 @@ impl Player {
             .iter()
             .chain(self.queue_init.iter())
             .chain(self.queue_construct.iter())
+            .chain(self.queue_default.iter())
         {
             if let Queued::Construct { ctor: Some(c), .. } = q {
                 extra.push(c.clone());
@@ -1818,4 +1823,62 @@ pub fn topmost(vm: &Vm) -> Option<DisplayId> {
         (vm.mouse_pos.0 * 20.0) as f32,
         (vm.mouse_pos.1 * 20.0) as f32,
     )
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    use crate::avm1::{Host, HostValue};
+    use crate::text::Fonts;
+
+    struct Empty;
+    impl Host for Empty {
+        fn fscommand(&mut self, _: &str, _: &str) {}
+        fn external_call(&mut self, _: &str, _: &[HostValue]) -> HostValue {
+            HostValue::Undefined
+        }
+    }
+    impl Fonts for Empty {
+        fn font(&self, _: &str, _: bool, _: bool) -> Option<Arc<crate::swf::Font>> {
+            None
+        }
+    }
+
+    fn trace(text: &str) -> crate::swf::Actions {
+        let mut code = vec![0x96];
+        code.extend_from_slice(&((text.len() + 2) as u16).to_le_bytes());
+        code.push(0);
+        code.extend_from_slice(text.as_bytes());
+        code.extend_from_slice(&[0, 0x26, 0]);
+        Arc::from(code)
+    }
+
+    #[test]
+    fn initialize_then_construct_then_fifo_frame_and_load_actions() {
+        // Empty one-frame SWF; only the queued actions below matter.
+        let movie = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut player =
+            Player::new(movie, "queue-test", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        let root = player.vm.root;
+        player.vm.queue.extend([
+            Queued::Frame(root, trace("frame")),
+            Queued::Event(root, "onLoad", vec![trace("load")]),
+            Queued::Construct {
+                clip: root,
+                ctor: None,
+                events: vec![trace("construct")],
+            },
+            Queued::Init(root, trace("initialize")),
+        ]);
+        player.run_queue();
+        assert_eq!(
+            player.drain_log(),
+            [
+                "trace: initialize",
+                "trace: construct",
+                "trace: frame",
+                "trace: load"
+            ]
+        );
+    }
 }

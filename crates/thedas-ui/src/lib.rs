@@ -925,6 +925,9 @@ impl UiMovie {
     /// The engine's drawing of image `name` (`paperdoll`) is now at `url`
     /// (`img://thedas_paperdoll_3.png`), or there is none.
     pub fn set_engine_image(&mut self, name: &str, url: Option<&str>) {
+        if let Backend::Own(m) = &mut self.backend {
+            m.set_engine_image(name, url);
+        }
         match url {
             Some(u) => self.engine_images.insert(name.to_string(), u.to_string()),
             None => self.engine_images.remove(name),
