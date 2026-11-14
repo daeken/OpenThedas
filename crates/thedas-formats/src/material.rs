@@ -538,9 +538,15 @@ impl MaterialDef {
 /// renamed (`name`), and each `(parameter, resource)` of `textures` bound (the parameter's
 /// `Texture` element's `ResName` set, or a new `Texture` element added). Everything else
 /// keeps its bytes. The binary form (Dragon Age II's) is not written.
-pub fn rewrite_xml(data: &[u8], name: Option<&str>, textures: &[(String, String)]) -> Result<Vec<u8>> {
+pub fn rewrite_xml(
+    data: &[u8],
+    name: Option<&str>,
+    textures: &[(String, String)],
+) -> Result<Vec<u8>> {
     if crate::gff4::is_gff4(data) {
-        return Err(MaterialError::Binary("a binary material object is not written".into()));
+        return Err(MaterialError::Binary(
+            "a binary material object is not written".into(),
+        ));
     }
     let bom = String::from_utf8_lossy(data).starts_with('\u{feff}');
     let text = document(data)?;
@@ -586,12 +592,12 @@ pub fn rewrite_xml(data: &[u8], name: Option<&str>, textures: &[(String, String)
     if !added.is_empty() {
         // Before the root's closing tag.
         let end = root.range().end;
-        let close = text[..end].rfind("</").ok_or_else(|| {
-            MaterialError::Xml("the material object has no closing tag".into())
-        })?;
+        let close = text[..end]
+            .rfind("</")
+            .ok_or_else(|| MaterialError::Xml("the material object has no closing tag".into()))?;
         edits.push((close, 0, added));
     }
-    edits.sort_by(|a, b| b.0.cmp(&a.0));
+    edits.sort_by_key(|a| std::cmp::Reverse(a.0));
     let mut out = text.clone();
     for (at, len, new) in edits {
         out.replace_range(at..at + len, &new);
@@ -647,7 +653,10 @@ mod tests {
         assert!(text.starts_with('\u{feff}'));
         assert!(text.contains("<Float Name=\"x\" value=\"0.5\" />"));
         // Nothing to change: the same bytes.
-        assert_eq!(rewrite_xml(src.as_bytes(), None, &[]).unwrap(), src.as_bytes());
+        assert_eq!(
+            rewrite_xml(src.as_bytes(), None, &[]).unwrap(),
+            src.as_bytes()
+        );
     }
 
     const MAO: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>

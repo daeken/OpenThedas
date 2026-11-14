@@ -966,8 +966,15 @@ pub fn import(
             },
         );
     }
-    let (textures, materials, material_edits) =
-        materials_of(&g, manifest, &targets, &drawn_with, read, files, &mut warnings);
+    let (textures, materials, material_edits) = materials_of(
+        &g,
+        manifest,
+        &targets,
+        &drawn_with,
+        read,
+        files,
+        &mut warnings,
+    );
     let mut out = Vec::new();
     for (msh_name, (data, msh)) in &msh_cache {
         let mut chunks: Vec<ChunkData> = Vec::new();
@@ -1170,16 +1177,29 @@ fn resource_name(s: &str) -> String {
 }
 
 /// A glTF image's pixels: from the file's own buffer, or from a file beside it.
-fn image_rgba(g: &Gltf, image: &J, files: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<(u32, u32, Vec<u8>), String> {
+fn image_rgba(
+    g: &Gltf,
+    image: &J,
+    files: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> Result<(u32, u32, Vec<u8>), String> {
     let bytes = match (image["bufferView"].as_u64(), image["uri"].as_str()) {
         (Some(v), _) => {
-            let view = g.arr("bufferViews").get(v as usize).ok_or("no such buffer view")?;
+            let view = g
+                .arr("bufferViews")
+                .get(v as usize)
+                .ok_or("no such buffer view")?;
             let o = view["byteOffset"].as_u64().unwrap_or(0) as usize;
             let l = view["byteLength"].as_u64().unwrap_or(0) as usize;
-            g.bin.get(o..o + l).ok_or("an image runs past its buffer")?.to_vec()
+            g.bin
+                .get(o..o + l)
+                .ok_or("an image runs past its buffer")?
+                .to_vec()
         }
         (None, Some(uri)) if uri.starts_with("data:") => {
-            let b64 = uri.split_once(";base64,").ok_or("an inline image not in base64")?.1;
+            let b64 = uri
+                .split_once(";base64,")
+                .ok_or("an inline image not in base64")?
+                .1;
             use base64::Engine as _;
             base64::engine::general_purpose::STANDARD
                 .decode(b64)
@@ -1211,11 +1231,17 @@ fn materials_of(
     read: &dyn Fn(&str) -> Option<Read>,
     files: &dyn Fn(&str) -> Option<Vec<u8>>,
     warnings: &mut Vec<String>,
-) -> (Vec<NewTexture>, Vec<(String, Vec<u8>)>, Vec<(String, ModelEdit)>) {
+) -> (
+    Vec<NewTexture>,
+    Vec<(String, Vec<u8>)>,
+    Vec<(String, ModelEdit)>,
+) {
     // The export's materials: key -> (diffuse parameter, texture resource, PNG).
     let mut exported: BTreeMap<String, (String, String, String)> = BTreeMap::new();
     for m in manifest["materials"].as_array().into_iter().flatten() {
-        let Some(mao) = m["mao"]["resource"].as_str() else { continue };
+        let Some(mao) = m["mao"]["resource"].as_str() else {
+            continue;
+        };
         let key = mao.trim_end_matches(".mao").to_ascii_lowercase();
         let diffuse = m["textures"].as_array().into_iter().flatten().find(|t| {
             t["parameter"]
@@ -1280,7 +1306,13 @@ fn materials_of(
         if let Some((param, res, png)) = exported.get(&key) {
             // A material the export wrote: its diffuse painted anew?
             if key != orig {
-                edits.push((t.mmh.clone(), ModelEdit::Material { chunk: t.chunk.clone(), material: key.clone() }));
+                edits.push((
+                    t.mmh.clone(),
+                    ModelEdit::Material {
+                        chunk: t.chunk.clone(),
+                        material: key.clone(),
+                    },
+                ));
             }
             if let Some(img) = &image
                 && !param.is_empty()
@@ -1301,7 +1333,9 @@ fn materials_of(
         let file = format!("{key}.mao");
         if !made.iter().any(|(f, _)| *f == file) {
             let Some(base) = read(&format!("{orig}.mao")) else {
-                warnings.push(format!("material {key}: {orig}.mao not found to start from"));
+                warnings.push(format!(
+                    "material {key}: {orig}.mao not found to start from"
+                ));
                 continue;
             };
             let (param, like) = exported
@@ -1328,7 +1362,13 @@ fn materials_of(
                 }
             }
         }
-        edits.push((t.mmh.clone(), ModelEdit::Material { chunk: t.chunk.clone(), material: key }));
+        edits.push((
+            t.mmh.clone(),
+            ModelEdit::Material {
+                chunk: t.chunk.clone(),
+                material: key,
+            },
+        ));
     }
     (textures, made, edits)
 }
@@ -1990,6 +2030,178 @@ mod tests {
         assert!((at(&new) - at(&head)).length() < 1e-3);
         assert_eq!(new.len(), head.len());
         assert!(!imp.meshes.is_empty());
+    }
+
+    /// Against a real install: every XML material object written back with no change keeps
+    /// its bytes, and renamed with a texture bound anew reads back as made.
+    #[test]
+    #[ignore]
+    fn every_material_rewrites() {
+        use thedas_formats::material::{MaterialObject, rewrite_xml};
+        let root = std::env::var_os("THEDAS_INSTALL").expect("THEDAS_INSTALL");
+        let install = thedas_vfs::DaoInstall::open(root).unwrap();
+        let vfs = install
+            .global_vfs(thedas_vfs::install::TextureQuality::High)
+            .unwrap();
+        let names: Vec<String> = vfs
+            .names()
+            .into_iter()
+            .filter(|n| n.ends_with(".mao"))
+            .collect();
+        let (mut same, mut edited, mut bad) = (0, 0, Vec::new());
+        for n in &names {
+            let Ok((data, _)) = vfs.read(n) else { continue };
+            let Ok(orig) = MaterialObject::parse(&data) else {
+                continue;
+            };
+            match rewrite_xml(&data, None, &[]) {
+                Ok(d) if d == data => same += 1,
+                Ok(_) => bad.push(format!("{n}: bytes changed with no edit")),
+                Err(e) => {
+                    bad.push(format!("{n}: {e}"));
+                    continue;
+                }
+            }
+            let param = orig
+                .textures
+                .first()
+                .map_or("mml_tDiffuse".to_string(), |t| t.parameter.clone());
+            let out = rewrite_xml(
+                &data,
+                Some("mm_renamed"),
+                &[
+                    (param.clone(), "mm_new_d.dds".into()),
+                    ("mm_extra".into(), "mm_x.dds".into()),
+                ],
+            );
+            match out.map(|d| MaterialObject::parse(&d)) {
+                Ok(Ok(m)) => {
+                    let ok = m.name == "mm_renamed"
+                        && m.texture(&param)
+                            .is_some_and(|t| t.res_name == "mm_new_d.dds")
+                        && m.texture("mm_extra")
+                            .is_some_and(|t| t.res_name == "mm_x.dds")
+                        && m.material == orig.material
+                        && m.floats == orig.floats
+                        && m.vectors == orig.vectors
+                        && m.textures.len()
+                            == orig.textures.len()
+                                + 1
+                                + usize::from(orig.texture(&param).is_none());
+                    if ok {
+                        edited += 1;
+                    } else {
+                        bad.push(format!("{n}: edits did not read back"));
+                    }
+                }
+                Ok(Err(e)) => bad.push(format!("{n}: edited: {e}")),
+                Err(e) => bad.push(format!("{n}: edited: {e}")),
+            }
+        }
+        println!(
+            "{} materials: {same} unchanged, {edited} edited, {} problems",
+            names.len(),
+            bad.len()
+        );
+        for b in bad.iter().take(20) {
+            println!("  {b}");
+        }
+        assert!(bad.is_empty());
+    }
+
+    /// Against a real install: the dog's diffuse painted in the file is written as its
+    /// texture; its material renamed in the file becomes a new material object from the
+    /// dog's own, with the file's image as its diffuse, and the mesh draws with it.
+    #[test]
+    #[ignore]
+    fn painted_and_new_materials() {
+        let root = std::env::var_os("THEDAS_INSTALL").expect("THEDAS_INSTALL");
+        let install = thedas_vfs::DaoInstall::open(root).unwrap();
+        let vfs = install
+            .global_vfs(thedas_vfs::install::TextureQuality::High)
+            .unwrap();
+        let read = |name: &str| {
+            vfs.read(name).ok().map(|(data, p)| Read {
+                data,
+                layer: p.layer_label,
+                entry: p.entry,
+            })
+        };
+        let s = crate::glb::Subject {
+            id: 0,
+            tag: "t".into(),
+            area: None,
+            template: "t".into(),
+            position: [0.0; 3],
+            facing: 0.0,
+        };
+        let e = crate::glb::export(&read, &s, &["c_doga_0".to_string()]);
+        // Unchanged: no texture, no material.
+        let files = |n: &str| {
+            e.images
+                .iter()
+                .find(|(f, _)| f == n)
+                .map(|(_, b)| b.clone())
+        };
+        let imp = import(&e.glb, &e.manifest, &read, &files, false).unwrap();
+        assert!(imp.textures.is_empty() && imp.materials.is_empty() && imp.models.is_empty());
+        // The diffuse painted in the editor: the file's image is another picture (an editor
+        // writing a .glb embeds it, or saves it under its own name). A PNG painted over the
+        // export's own is the live texture watcher's, not the import's.
+        let red = thedas_ui::stage::encode_png(&thedas_ui::Rgba {
+            width: 4,
+            height: 4,
+            pixels: [200, 30, 30, 255].repeat(16),
+        })
+        .unwrap();
+        let painted = |n: &str| {
+            if n == "painted.png" {
+                Some(red.clone())
+            } else {
+                files(n)
+            }
+        };
+        let repainted = with_json(&e.glb, |j| {
+            for im in j["images"].as_array_mut().unwrap() {
+                if im["uri"] == "c_doga_0d.png" {
+                    im["uri"] = serde_json::json!("painted.png");
+                }
+            }
+        });
+        let imp = import(&repainted, &e.manifest, &read, &painted, false).unwrap();
+        let names: Vec<&str> = imp.textures.iter().map(|t| t.resource.as_str()).collect();
+        assert_eq!(names, ["c_doga_0d.dds"]);
+        assert!(imp.materials.is_empty());
+        // The material renamed: a new one.
+        let renamed = with_json(&repainted, |j| {
+            for m in j["materials"].as_array_mut().unwrap() {
+                if m["name"] == "c_doga" {
+                    m["name"] = serde_json::json!("My Dog");
+                    m.as_object_mut().unwrap().remove("extras");
+                }
+            }
+        });
+        let imp = import(&renamed, &e.manifest, &read, &painted, false).unwrap();
+        let [(file, data)] = imp.materials.as_slice() else {
+            panic!(
+                "{:?}",
+                imp.materials.iter().map(|m| &m.0).collect::<Vec<_>>()
+            );
+        };
+        assert_eq!(file, "my_dog.mao");
+        let m = thedas_formats::material::MaterialObject::parse(data).unwrap();
+        assert_eq!(m.texture("mml_tDiffuse").unwrap().res_name, "my_dog_d.dds");
+        assert!(imp.textures.iter().any(|t| t.resource == "my_dog_d.dds"));
+        let [model] = imp.models.as_slice() else {
+            panic!()
+        };
+        let back = Mmh::parse(&model.data).unwrap();
+        let mats: Vec<String> = back
+            .mesh_pieces()
+            .iter()
+            .map(|p| p.mesh.material.to_ascii_lowercase())
+            .collect();
+        assert!(mats.contains(&"my_dog".to_string()), "{mats:?}");
     }
 
     #[test]
