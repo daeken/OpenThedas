@@ -522,6 +522,12 @@ pub fn portrait_key(sim: &thedas_sim::Sim) -> Vec<(u32, u64)> {
                 o.equipment.hash(&mut h);
                 o.area.hash(&mut h);
                 o.fields.get("Gender").hash(&mut h);
+                // Character creation's Portrait sliders.
+                let p = sim.portrait(id);
+                [p.pitch, p.turn, p.distance, p.shift.0, p.shift.1]
+                    .map(f32::to_bits)
+                    .hash(&mut h);
+                p.background.hash(&mut h);
             }
             // Drawn on character creation's stage, or in the world.
             (sim.world.chargen == Some(id) && sim.world.chargen_mode == 0).hash(&mut h);
