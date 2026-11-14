@@ -441,15 +441,32 @@ impl Erf {
         Ok(data)
     }
 
-    /// The password read from the player's own `DAOrigins.exe` when it matches the header's
-    /// digest (see [`crate::gog_dlc`]; GOG Ultimate Edition layout only, provisional).
+    /// The password that matches the header's digest: from the player's keys file (see
+    /// [`crate::keys_file`]), else for DA:O read from the player's own `DAOrigins.exe` when it is the
+    /// GOG build or found by trying every eight-digit password against the digest once (see
+    /// [`crate::dlc_search`]). Dragon Age II's
+    /// come only from the keys file.
     pub fn installed_key(&self) -> Option<&DaoKey> {
         self.installed_key
-            .get_or_init(|| match self.encryption {
-                Encryption::Xor | Encryption::BlowfishDao => {
-                    crate::gog_dlc::key(&self.path, self.module_id, self.password_digest.as_ref()?)
+            .get_or_init(|| {
+                let digest = self.password_digest.as_ref()?;
+                if let Some(k) = crate::keys_file::key(self.encryption, digest) {
+                    return Some(k);
                 }
-                _ => None,
+                match self.encryption {
+                    Encryption::Xor | Encryption::BlowfishDao => {
+                        crate::dlc_search::key(&self.path, self.module_id, digest)
+                    }
+                    Encryption::BlowfishDa2 => {
+                        log::warn!(
+                            "dlc: {} is encrypted. {}",
+                            self.path.display(),
+                            crate::keys_file::da2_hint()
+                        );
+                        None
+                    }
+                    _ => None,
+                }
             })
             .as_ref()
     }
@@ -464,6 +481,10 @@ impl Erf {
         let encrypted = || Error::Encrypted {
             path: self.path.clone(),
             name: entry.display_name(),
+            hint: match self.encryption {
+                Encryption::BlowfishDa2 => format!(" ({})", crate::keys_file::da2_hint()),
+                _ => String::new(),
+            },
         };
         let wrong_key = || Error::WrongKey {
             path: self.path.clone(),

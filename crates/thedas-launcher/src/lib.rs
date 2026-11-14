@@ -21,4 +21,4 @@ pub use modlist::{ModFile, ModRow};
 
 /// Environment variable the game reads its DLC keys file from (an `erfpasswords.txt`-format
 /// file), after `--keys` and before `keys.txt` in the data folder.
-pub const KEYS_ENV: &str = "THEDAS_KEYS";
+pub const KEYS_ENV: &str = thedas_vfs::keys_file::ENV;
