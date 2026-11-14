@@ -2616,11 +2616,12 @@ impl Live {
             return Ok(None);
         };
         level.renderer.cut_effects = cut_effects;
+        let depth = level.renderer.depth(&ctx.device, width, height);
+        let rings = &mut self.rings;
         let mut overlays: Vec<&mut AreaRenderer> = self
-            .rings
+            .objects
             .iter_mut()
-            .map(|r| &mut r.renderer)
-            .chain(self.objects.iter_mut().map(|o| &mut o.renderer))
+            .map(|o| &mut o.renderer)
             .chain(self.effects.iter_mut().map(|e| &mut e.renderer))
             .collect();
         Ok(Some(level.renderer.capture_with(
@@ -2629,7 +2630,15 @@ impl Live {
             width,
             height,
             &mut overlays,
-            &mut |encoder, view| reticle.draw(&ctx.device, encoder, view, (width, height), &aim),
+            &mut |encoder, view| {
+                reticle.draw(&ctx.device, encoder, view, (width, height), &aim);
+                // Ground overlays belong under the creatures, just as in the window;
+                // they must not join the delayed world-transparency phase.
+                if let Some(r) = rings.as_mut() {
+                    r.renderer
+                        .render_over(ctx, encoder, view, width, height, camera, &depth);
+                }
+            },
         )?))
     }
 
