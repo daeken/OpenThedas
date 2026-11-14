@@ -867,6 +867,18 @@ pub fn call(
             if a.len() > 2 { int(a, 2) } else { 9 },
         ))),
         "IntToFloat" => ok(Value::Float(int(a, 0) as f32)),
+        "FloatToInt" if h.sim.game == thedas_vfs::Game::Origins => {
+            // 0x64f3f0 -> 0x8e34f0 uses the CRT's SSE2 truncating conversion.
+            // Its invalid result is i32::MIN, including NaNs and positive overflow.
+            let value = float(a, 0);
+            ok(Value::Int(
+                if (i32::MIN as f32..2147483648.0).contains(&value) {
+                    value as i32
+                } else {
+                    i32::MIN
+                },
+            ))
+        }
         "FloatToInt" => ok(Value::Int(float(a, 0) as i32)),
         "StringToInt" | "HexStringToInt" if h.sim.game == thedas_vfs::Game::Origins => {
             ok(Value::Int(origins_string_to_int(&string(a, 0))))
@@ -1639,12 +1651,32 @@ pub fn call(
                 Some(EngineData::Event(e)) => e.clone(),
                 _ => return void(),
             };
-            let script = string(a, 1);
+            let (script, target) = if h.sim.game == thedas_vfs::Game::Origins {
+                // 0x6586d0 resolves OBJECT_SELF, strips the explicit resource's suffix,
+                // and falls back to that object's script. See notes/script-handle-event.md.
+                let Some(object) = h.object(caller) else {
+                    return void();
+                };
+                if matches!(
+                    object.kind,
+                    ObjectKind::Stage | ObjectKind::Party | ObjectKind::Map | ObjectKind::MapPin
+                ) {
+                    return void();
+                }
+                let resource = string(a, 1);
+                let name = resource.split(['.', '\0']).next().unwrap_or_default();
+                let script = if name.is_empty() {
+                    object.script.clone().unwrap_or_default()
+                } else {
+                    name.to_string()
+                };
+                (script, caller)
+            } else {
+                (string(a, 1), ev.target.unwrap_or(caller))
+            };
             if script.is_empty() {
-                // With no script, the engine's default handling applies; we have none.
                 return void();
             }
-            let target = ev.target.unwrap_or(caller);
             h.sim.run_script(&script, target, Some(ev));
             void()
         }
@@ -5930,6 +5962,167 @@ mod tests {
     }
 
     #[test]
+    fn handle_event_selects_the_callers_default_script_in_origins() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"#define ENGINE_STRUCTURE_0 event\n\
+                void HandleEvent(event e, resource r = R\"\") = 121;\n\
+                event GetCurrentEvent() = 2;\n\
+                int GetEventInteger(event e, int i) = 3;\n\
+                void PrintInteger(int n) = 4;\n",
+            )
+            .unwrap(),
+        );
+        // Our fixture prints integer slot zero from the forwarded current event.
+        let code = [
+            4, 3, 0, 0, 0, 0, 5, 0, 0, 2, 0, 5, 0, 0, 3, 2, 5, 0, 0, 4, 1, 0x20, 0,
+        ];
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend_from_slice(&((13 + code.len()) as u32).to_be_bytes());
+        bytes.extend_from_slice(&code);
+        let script = thedas_script::Ncs::parse(&bytes).unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.trace.keep = true;
+        for name in ["fallback", "explicit", "explicit.extra.ncs"] {
+            s.add_script(name, script.clone());
+        }
+        let other = s.world.spawn(ObjectKind::Creature, "other");
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            s.game = game;
+            for kind in [
+                ObjectKind::Module,
+                ObjectKind::Area,
+                ObjectKind::Creature,
+                ObjectKind::Placeable,
+                ObjectKind::Item,
+                ObjectKind::Trigger,
+                ObjectKind::Sound,
+                ObjectKind::Waypoint,
+                ObjectKind::Projectile,
+                ObjectKind::Store,
+                ObjectKind::AreaOfEffect,
+                ObjectKind::Stage,
+                ObjectKind::Party,
+                ObjectKind::Map,
+                ObjectKind::MapPin,
+            ] {
+                let caller = s.world.spawn(kind, "caller");
+                for (own_script, resource, selected) in [
+                    (None, "", None),
+                    (Some(""), "", None),
+                    (Some("fallback"), "", Some("fallback")),
+                    (None, "explicit.extra.ncs", Some("explicit")),
+                    (Some("fallback"), "explicit.extra.ncs", Some("explicit")),
+                ] {
+                    s.world.get_mut(caller).unwrap().script = own_script.map(str::to_string);
+                    let event = s.world.store(EngineData::Event(Event {
+                        ty: 77,
+                        creator: Some(other),
+                        target: Some(other),
+                        ints: vec![31415],
+                        ..Event::default()
+                    }));
+                    s.world.trace.entries.clear();
+                    run(
+                        &mut s,
+                        caller,
+                        "HandleEvent",
+                        &[
+                            Value::Engine {
+                                ty: 0,
+                                handle: Some(event),
+                            },
+                            Value::Resource(resource.into()),
+                        ],
+                    );
+                    let expected = match game {
+                        thedas_vfs::Game::Origins
+                            if matches!(
+                                kind,
+                                ObjectKind::Stage
+                                    | ObjectKind::Party
+                                    | ObjectKind::Map
+                                    | ObjectKind::MapPin
+                            ) =>
+                        {
+                            None
+                        }
+                        thedas_vfs::Game::Origins => selected.map(|name| (name, caller)),
+                        _ => (!resource.is_empty()).then_some((resource, other)),
+                    };
+                    let started: Vec<_> = s
+                        .world
+                        .trace
+                        .entries
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            TraceEntry::ScriptStart { script, caller, .. } => {
+                                Some((script.as_str(), *caller))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(
+                        started,
+                        expected.into_iter().collect::<Vec<_>>(),
+                        "{game:?} {kind:?} {resource:?}"
+                    );
+                    let messages: Vec<_> = s
+                        .world
+                        .trace
+                        .entries
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            TraceEntry::Log {
+                                channel: 0, text, ..
+                            } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(
+                        messages,
+                        if expected.is_some() {
+                            vec!["31415"]
+                        } else {
+                            vec![]
+                        }
+                    );
+                    assert!(s.world.trace.script_errors.is_empty());
+                    assert!(s.world.queue.is_empty());
+                }
+            }
+        }
+        s.game = thedas_vfs::Game::Origins;
+        let event = s.world.store(EngineData::Event(Event::default()));
+        s.world.trace.entries.clear();
+        run(
+            &mut s,
+            OBJECT_INVALID,
+            "HandleEvent",
+            &[
+                Value::Engine {
+                    ty: 0,
+                    handle: Some(event),
+                },
+                Value::Resource("explicit".into()),
+            ],
+        );
+        run(
+            &mut s,
+            other,
+            "HandleEvent",
+            &[
+                Value::Engine {
+                    ty: 0,
+                    handle: None,
+                },
+                Value::Resource("explicit".into()),
+            ],
+        );
+        assert!(s.world.trace.entries.is_empty());
+    }
+
+    #[test]
     fn dragon_age_2_events_carry_vectors() {
         let ldf = "#define ENGINE_STRUCTURE_0 event\n\
             event Event(int nType) = 1;\n\
@@ -6342,6 +6535,51 @@ mod tests {
             );
         }
         assert!(convert(&mut s, "NaN").is_nan());
+    }
+
+    #[test]
+    fn origins_float_to_int_uses_the_native_sse2_invalid_result() {
+        let table = Arc::new(EngineTable::parse(b"int FloatToInt(float f) = 49;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for (value, expected, da2_expected) in [
+            (0.0, 0, 0),
+            (-0.0, 0, 0),
+            (f32::from_bits(1), 0, 0),
+            (-f32::from_bits(1), 0, 0),
+            (0.99, 0, 0),
+            (-0.99, 0, 0),
+            (1.0, 1, 1),
+            (-1.0, -1, -1),
+            (1.99, 1, 1),
+            (-1.99, -1, -1),
+            (f32::from_bits(0x4effffff), 2147483520, 2147483520),
+            (2147483648.0, i32::MIN, i32::MAX),
+            (f32::from_bits(0x4f000001), i32::MIN, i32::MAX),
+            (-2147483648.0, i32::MIN, i32::MIN),
+            (f32::from_bits(0xceffffff), -2147483520, -2147483520),
+            (f32::from_bits(0xcf000001), i32::MIN, i32::MIN),
+            (f32::MAX, i32::MIN, i32::MAX),
+            (f32::MIN, i32::MIN, i32::MIN),
+            (f32::INFINITY, i32::MIN, i32::MAX),
+            (f32::NEG_INFINITY, i32::MIN, i32::MIN),
+            (f32::NAN, i32::MIN, 0),
+            (-f32::NAN, i32::MIN, 0),
+            (f32::from_bits(0x7f800001), i32::MIN, 0),
+            (f32::from_bits(0xff800001), i32::MIN, 0),
+        ] {
+            for (game, result) in [
+                (thedas_vfs::Game::Origins, expected),
+                (thedas_vfs::Game::DragonAge2, da2_expected),
+            ] {
+                s.game = game;
+                assert_eq!(
+                    run(&mut s, 1, "FloatToInt", &[Value::Float(value)]),
+                    Some(Value::Int(result)),
+                    "{game:?}, float bits {:08x}",
+                    value.to_bits()
+                );
+            }
+        }
     }
 
     #[test]
