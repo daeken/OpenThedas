@@ -256,6 +256,7 @@ impl Sim {
         world.alerts.clear();
         world.uber_alerts.clear();
         self.world = world;
+        self.restore_da2_encounters();
         // A conversation whose last line was already shown does not come back: the game
         // cannot be saved during a conversation, so a loaded game never resumes one at its
         // end (saves made by test drivers can hold one; reloading it would put the last
@@ -265,6 +266,14 @@ impl Sim {
         self.ambient.clear();
         self.world.ambient_lines.clear();
         self.forget_world_caches();
+        // Native DA2 template loading initializes race from appearance. Earlier saves
+        // omitted it; filling only absent fields preserves script-assigned races.
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            let ids: Vec<ObjectId> = self.world.objects.keys().copied().collect();
+            for id in ids {
+                self.init_da2_race(id);
+            }
+        }
         // The area list is loaded again, so the add-ins' scripts for it run again.
         self.prcscr_ran = None;
         if save_revision < 1 {
@@ -371,6 +380,10 @@ impl Sim {
         if save_revision < 8 {
             self.restore_template_abilities();
         }
+        // DA2 snapshots can contain PC followers initialized through the monster path
+        // and already-perceived NPCs with no level. Rebuild only absent stats; the
+        // predicates make this idempotent without changing Origins' save revision.
+        self.repair_da2_stats();
         self.save_issues = if save_revision < 3 {
             self.check_property_damage()
         } else {

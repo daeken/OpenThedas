@@ -1712,6 +1712,7 @@ impl Sim {
         let area = self.world.get(hero).and_then(|h| h.area);
         let group = self.world.get(hero).map_or(0, |h| h.group);
         for p in self.party_pool() {
+            let before_area = self.world.get(p).and_then(|o| o.area);
             let on = chosen.contains(&p);
             if let Some(o) = self.world.get_mut(p) {
                 let locked = o.fields.get("FollowerState")
@@ -1730,6 +1731,7 @@ impl Sim {
                     o.group = group;
                 }
             }
+            self.da2_encounter_area_changed(p, before_area);
         }
         let before = self
             .world
@@ -1810,6 +1812,7 @@ impl Sim {
                     .map(|h| (h.position, h.facing));
                 for (k, id) in party.iter().skip(1).enumerate() {
                     self.following.remove(id);
+                    let before_area = self.world.get(*id).and_then(|o| o.area);
                     if let Some(o) = self.world.get_mut(*id) {
                         o.area = Some(new);
                         if let Some((p, facing)) = at {
@@ -1828,6 +1831,7 @@ impl Sim {
                         ev.objects = vec![*id];
                         self.world.queue_event(0, new, ev, None);
                     }
+                    self.da2_encounter_area_changed(*id, before_area);
                 }
             }
             Err(e) => {
@@ -2015,15 +2019,18 @@ impl Sim {
             }
         }
         self.world.objects.remove(&id);
+        self.world.da2_encounter_order.retain(|&c| c != id);
     }
 
     pub fn move_object(&mut self, id: ObjectId, position: [f32; 3], area: Option<ObjectId>) {
+        let before_area = self.world.get(id).and_then(|o| o.area);
         if let Some(o) = self.world.get_mut(id) {
             o.position = position;
             if area.is_some() {
                 o.area = area;
             }
         }
+        self.da2_encounter_area_changed(id, before_area);
         self.update_triggers(id);
     }
 
@@ -3506,6 +3513,7 @@ impl Sim {
 
     /// Completes an object's front command: applies its movement and tells the object.
     fn finish_command(&mut self, id: ObjectId) {
+        let before_area = self.world.get(id).and_then(|o| o.area);
         let Some(cmd) = self.world.get_mut(id).and_then(|o| {
             if o.commands.is_empty() {
                 None
@@ -3587,6 +3595,7 @@ impl Sim {
                 obj.facing = l.facing;
             }
         }
+        self.da2_encounter_area_changed(id, before_area);
         self.update_triggers(id);
         if cmd.name == "CommandAttack" {
             self.finish_attack(id, cmd.target.unwrap_or(OBJECT_INVALID));
@@ -3760,7 +3769,9 @@ impl Sim {
     }
 
     fn created(&mut self, id: ObjectId) {
+        self.init_da2_race(id);
         self.lay_out_if_spawned_dead(id);
+        self.register_da2_encounter(id);
         if let Some(o) = self.world.get(id) {
             let e = TraceEntry::ObjectCreated {
                 t: self.world.time_ms,
@@ -3939,11 +3950,13 @@ impl Sim {
                 .find(|o| waypoint.is_none_or(|w| o.tag.eq_ignore_ascii_case(w)))
                 .map(|o| (o.position, o.facing));
             let h = self.world.get_mut(hero).expect("hero exists");
+            let before_area = h.area;
             h.area = Some(area);
             if let Some((p, f)) = wp {
                 h.position = p;
                 h.facing = f;
             }
+            self.da2_encounter_area_changed(hero, before_area);
         }
 
         // Load events (order provisional, see the module docs).
