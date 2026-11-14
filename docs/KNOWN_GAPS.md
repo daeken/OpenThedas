@@ -34,7 +34,7 @@ so an untraced item starts with a trace, not with a guess.
 
 | Area | File | Inventory items |
 | --- | --- | --- |
-| Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 166 (`SIM-`), plus ability coverage by family |
+| Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 165 (`SIM-`), plus ability coverage by family |
 | Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 96 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
 | Rendering | [gaps/rendering.md](gaps/rendering.md) | 152 (`RND-`) |
 | Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 180 (`UI-`), plus the movies never opened and the values no screen gets answered |
