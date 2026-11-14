@@ -1497,87 +1497,9 @@ pub fn call(
         "SetCreatureProperty" | "UpdateCreatureProperty" => {
             let (id, p, value, vt) = (obj(a, 0), int(a, 1), float(a, 2), int(a, 3));
             let update = name == "UpdateCreatureProperty";
-            let base_type = constant(&h.sim.table, "PROPERTY_VALUE_BASE");
-            let total_type = constant(&h.sim.table, "PROPERTY_VALUE_TOTAL");
-            let current = constant(&h.sim.table, "PROPERTY_VALUE_CURRENT");
-            let modifier = constant(&h.sim.table, "PROPERTY_VALUE_MODIFIER");
-            let kind = property_kind(h.sim, p);
-            // Health before, to record what a hit takes.
-            let health = constant(&h.sim.table, "PROPERTY_DEPLETABLE_HEALTH");
-            let health_before = (p == health && vt == current)
-                .then(|| {
-                    h.object(id)
-                        .filter(|o| !o.dead)
-                        .and_then(|o| o.properties.get(&health))
-                        .map(|v| v.1)
-                })
-                .flatten();
-            // The hero's experience before, for followers waiting in the pool.
-            let xp = constant(&h.sim.table, "PROPERTY_SIMPLE_EXPERIENCE");
-            let hero_xp_before = (p == xp && Some(id) == h.sim.world.hero).then(|| {
-                h.object(id)
-                    .and_then(|o| o.properties.get(&xp))
-                    .map_or(0.0, |v| v.0)
-            });
-            if (vt == base_type || vt == total_type) && !update {
-                if let Some(o) = h.sim.world.get_mut(id) {
-                    o.properties.entry(p).or_insert((0.0, 0.0)).0 = value;
-                }
-            } else if vt == current && kind == PropertyKind::Depletable {
-                let max = h.sim.property_total(id, p);
-                if let Some(o) = h.sim.world.get_mut(id) {
-                    let e = o.properties.entry(p).or_insert((0.0, 0.0));
-                    let v = if update { e.1 + value } else { value };
-                    e.1 = v.clamp(0.0, max.max(0.0));
-                }
-            } else if vt == modifier && kind != PropertyKind::Simple {
-                let gear = h.sim.equipment_bonus(id, p);
-                if let Some(o) = h.sim.world.get_mut(id) {
-                    let m = o.modifiers.entry(p).or_insert(0.0);
-                    *m = if update { *m + value } else { value - gear };
-                }
-            }
-            if kind == PropertyKind::Depletable && vt != current {
-                h.sim.clamp_current(id, p);
-            }
-            // Scripts bring the dead back by giving them health (module_core's
-            // HandleEvent_Resurrection applies no effect). Provisional.
-            if let Some(o) = h.sim.world.get_mut(id) {
-                if p == health
-                    && vt == current
-                    && o.dead
-                    && o.properties.get(&health).is_some_and(|v| v.1 > 0.0)
-                {
-                    o.dead = false;
-                    o.died_at = None;
-                    // One placed dead is no longer (DAOrigins.exe 0x6bc5fb-0x6bc631: health
-                    // rising above 0 sets a CREATURE_SPAWN_DEAD of 1 to 0).
-                    if let Some(v) = o.locals.ints.get_mut("CREATURE_SPAWN_DEAD")
-                        && *v == 1
-                    {
-                        *v = 0;
-                    }
-                }
-            }
-            if let Some(before) = health_before {
-                let after = h
-                    .object(obj(a, 0))
-                    .and_then(|o| o.properties.get(&health))
-                    .map_or(before, |v| v.1);
-                h.sim
-                    .record_health_loss(caller, obj(a, 0), before - after.max(0.0));
-            }
-            if let Some(before) = hero_xp_before {
-                let after = h
-                    .object(obj(a, 0))
-                    .and_then(|o| o.properties.get(&xp))
-                    .map_or(0.0, |v| v.0);
-                if after > before {
-                    let by = h.script.clone();
-                    *h.sim.world.trace.hero_xp.entry(by).or_default() += (after - before) as u64;
-                }
-                h.sim.share_pool_xp(after - before);
-            }
+            let by = h.script.clone();
+            h.sim
+                .set_creature_property(caller, by, id, p, value, vt, update);
             void()
         }
 
@@ -4787,6 +4709,110 @@ pub(crate) fn placeable_default_action(sim: &Sim, id: ObjectId) -> Option<i32> {
     }
 }
 
+impl Sim {
+    /// `SetCreatureProperty` (or, with `update`, `UpdateCreatureProperty`): property
+    /// `property` of creature `id` set to (or moved by) `value` as `value_type` says (base,
+    /// total, current, modifier), within `properties.gda`'s bounds; a depletable's current
+    /// clamped to its total, a hit's health loss recorded for `caller`, and the hero's
+    /// experience shared with the followers waiting in the pool (`by`: the script doing it,
+    /// for the trace).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn set_creature_property(
+        &mut self,
+        caller: ObjectId,
+        by: String,
+        id: ObjectId,
+        p: i32,
+        value: f32,
+        vt: i32,
+        update: bool,
+    ) {
+        let base_type = constant(&self.table, "PROPERTY_VALUE_BASE");
+        let total_type = constant(&self.table, "PROPERTY_VALUE_TOTAL");
+        let current = constant(&self.table, "PROPERTY_VALUE_CURRENT");
+        let modifier = constant(&self.table, "PROPERTY_VALUE_MODIFIER");
+        let kind = property_kind(self, p);
+        // Health before, to record what a hit takes.
+        let health = constant(&self.table, "PROPERTY_DEPLETABLE_HEALTH");
+        let health_before = (p == health && vt == current)
+            .then(|| {
+                self.world
+                    .get(id)
+                    .filter(|o| !o.dead)
+                    .and_then(|o| o.properties.get(&health))
+                    .map(|v| v.1)
+            })
+            .flatten();
+        // The hero's experience before, for followers waiting in the pool.
+        let xp = constant(&self.table, "PROPERTY_SIMPLE_EXPERIENCE");
+        let hero_xp_before = (p == xp && Some(id) == self.world.hero).then(|| {
+            self.world
+                .get(id)
+                .and_then(|o| o.properties.get(&xp))
+                .map_or(0.0, |v| v.0)
+        });
+        if (vt == base_type || vt == total_type) && !update {
+            if let Some(o) = self.world.get_mut(id) {
+                o.properties.entry(p).or_insert((0.0, 0.0)).0 = value;
+            }
+        } else if vt == current && kind == PropertyKind::Depletable {
+            let max = self.property_total(id, p);
+            if let Some(o) = self.world.get_mut(id) {
+                let e = o.properties.entry(p).or_insert((0.0, 0.0));
+                let v = if update { e.1 + value } else { value };
+                e.1 = v.clamp(0.0, max.max(0.0));
+            }
+        } else if vt == modifier && kind != PropertyKind::Simple {
+            let gear = self.equipment_bonus(id, p);
+            if let Some(o) = self.world.get_mut(id) {
+                let m = o.modifiers.entry(p).or_insert(0.0);
+                *m = if update { *m + value } else { value - gear };
+            }
+        }
+        if kind == PropertyKind::Depletable && vt != current {
+            self.clamp_current(id, p);
+        }
+        // Scripts bring the dead back by giving them health (module_core's
+        // HandleEvent_Resurrection applies no effect). Provisional.
+        if let Some(o) = self.world.get_mut(id) {
+            if p == health
+                && vt == current
+                && o.dead
+                && o.properties.get(&health).is_some_and(|v| v.1 > 0.0)
+            {
+                o.dead = false;
+                o.died_at = None;
+                // One placed dead is no longer (DAOrigins.exe 0x6bc5fb-0x6bc631: health
+                // rising above 0 sets a CREATURE_SPAWN_DEAD of 1 to 0).
+                if let Some(v) = o.locals.ints.get_mut("CREATURE_SPAWN_DEAD")
+                    && *v == 1
+                {
+                    *v = 0;
+                }
+            }
+        }
+        if let Some(before) = health_before {
+            let after = self
+                .world
+                .get(id)
+                .and_then(|o| o.properties.get(&health))
+                .map_or(before, |v| v.1);
+            self.record_health_loss(caller, id, before - after.max(0.0));
+        }
+        if let Some(before) = hero_xp_before {
+            let after = self
+                .world
+                .get(id)
+                .and_then(|o| o.properties.get(&xp))
+                .map_or(0.0, |v| v.0);
+            if after > before {
+                *self.world.trace.hero_xp.entry(by).or_default() += (after - before) as u64;
+            }
+            self.share_pool_xp(after - before);
+        }
+    }
+}
+
 /// A property's type (as `GetCreaturePropertyType`), Min and Max from `properties.gda`.
 /// A property's kind (`properties.gda`'s Type), which decides which of its values exist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6299,6 +6325,75 @@ mod tests {
             run(&mut s, c, "GetTacticCommandItemTag", &slot(1)),
             Some(Value::String(String::new()))
         );
+    }
+
+    #[test]
+    fn mod_mode_sets_properties_as_scripts_do() {
+        use crate::commands::{CommandOutcome, CommandSource, SimCommand};
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let t = crate::m2da::Tables::empty();
+        let row = |id: i64, ty: &str, min: f64, max: f64| {
+            (
+                id,
+                vec![
+                    Cell::Int(id),
+                    Cell::String(ty.into()),
+                    Cell::Float(min),
+                    Cell::Float(max),
+                ],
+            )
+        };
+        t.insert(
+            "properties",
+            &["ID", "Type", "Min", "Max"],
+            vec![
+                row(7, "DEPLETABLE", 1.0, 9999.0),
+                row(40, "SIMPLE", -1000.0, 1000.0),
+            ],
+        );
+        s.world.tables = Arc::new(t);
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let set = |s: &mut Sim, property: i32, base: Option<f32>, current: Option<f32>| {
+            s.apply(
+                CommandSource::ModMode,
+                SimCommand::SetProperty {
+                    target: c,
+                    property,
+                    base,
+                    current,
+                },
+            )
+        };
+        // A depletable: the base first, then the current value, clamped to the new total.
+        let out = set(&mut s, 7, Some(50.0), Some(80.0));
+        assert_eq!(
+            out,
+            CommandOutcome::PropertySet {
+                base: 0.0,
+                current: 0.0
+            }
+        );
+        assert_eq!(s.world.get(c).unwrap().properties[&7], (50.0, 50.0));
+        let out = set(&mut s, 7, None, Some(20.0));
+        assert_eq!(
+            out,
+            CommandOutcome::PropertySet {
+                base: 50.0,
+                current: 50.0
+            }
+        );
+        assert_eq!(s.world.get(c).unwrap().properties[&7], (50.0, 20.0));
+        // Undo: what it held, set back.
+        set(&mut s, 7, Some(50.0), Some(50.0));
+        assert_eq!(s.world.get(c).unwrap().properties[&7], (50.0, 50.0));
+        assert_eq!(s.world.command_journal.len(), 3);
+        // A simple property has no current value; unknown properties and NaN are refused.
+        let refused = |o: CommandOutcome| matches!(o, CommandOutcome::Refused { .. });
+        assert!(refused(set(&mut s, 40, None, Some(1.0))));
+        assert!(refused(set(&mut s, 99, Some(1.0), None)));
+        assert!(refused(set(&mut s, 7, Some(f32::NAN), None)));
+        assert!(!refused(set(&mut s, 40, Some(-3.0), None)));
     }
 
     #[test]
