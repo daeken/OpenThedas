@@ -692,7 +692,38 @@ fn apply_visual_or_effect(h: &mut ScriptHost, target: ObjectId, e: Effect) {
         };
         h.sim.world.instant_vfx.push(note);
     }
+    // DA2 area save-load handlers rebuild environmental visuals (the prologue
+    // firewall does this on AREALOADSAVE_POSTLOADEXIT). Our snapshots already
+    // contain those effects. Reconcile an exact replay after running APPLY_EFFECT,
+    // retaining its script side effects and any unrelated or temporary visuals.
+    // This is snapshot compatibility, not a general rule against stacking VFX.
+    let replay = (h.sim.game == thedas_vfs::Game::DragonAge2
+        && e.ty == 4
+        && e.ability == 0
+        && e.expires.is_none()
+        && e.duration_type == constant(&h.sim.table, "EFFECT_DURATION_TYPE_PERMANENT")
+        && e.creator.is_some_and(|area| {
+            h.object(area).is_some_and(|o| o.kind == ObjectKind::Area)
+                && h.object(target)
+                    .is_some_and(|o| o.kind == ObjectKind::Placeable && o.area == Some(area))
+        })
+        && matches!(h.sim.world.handle(h.event), Some(EngineData::Event(ev)) if matches!(
+            h.sim.event_name(ev.ty).as_str(),
+            "AREALOADSAVE_SPECIAL" | "AREALOADSAVE_PRELOADEXIT" | "AREALOADSAVE_POSTLOADEXIT"
+        )))
+    .then(|| e.clone());
     h.sim.apply_effect(target, e);
+    if let (Some(replay), Some(o)) = (replay, h.sim.world.get_mut(target)) {
+        let mut kept = false;
+        o.effects.retain(|e| {
+            if *e != replay {
+                return true;
+            }
+            let first = !kept;
+            kept = true;
+            first
+        });
+    }
 }
 
 /// Converts `CommandMoveToObject` to `COMMAND_TYPE_MOVE_TO_OBJECT`.
@@ -8120,6 +8151,101 @@ mod coverage_tests {
         void AddAbility(object o, int a, int n = FALSE) = 119;\n\
         void ShowSpecUnlockedNotification(int s) = 120;\n\
         void ShowAreaUnlockedNotification(string a, string i = \"\") = 121;\n";
+
+    #[test]
+    fn da2_area_load_visual_replays_reconcile_saved_copies() {
+        let table = EngineTable::parse(
+            format!("{LDF}\nint EVENT_TYPE_AREALOADSAVE_POSTLOADEXIT = 43;\n").as_bytes(),
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 7);
+        s.game = thedas_vfs::Game::DragonAge2;
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        let wall = s.world.spawn(ObjectKind::Placeable, "wall");
+        s.world.get_mut(wall).unwrap().area = Some(area);
+        let fire = Effect {
+            ty: 4,
+            creator: Some(area),
+            duration_type: 3,
+            ints: vec![600001],
+            ..Default::default()
+        };
+        let other = Effect {
+            ints: vec![600002],
+            ..fire.clone()
+        };
+        // An older snapshot may already contain several copies. Only the exact
+        // environmental visual reissued by the load handler is reconciled.
+        s.world.get_mut(wall).unwrap().effects = vec![fire.clone(), other.clone(), fire.clone()];
+        for _ in 0..3 {
+            s.load_game(s.save_game()).unwrap();
+            let event = s.new_event("AREALOADSAVE_POSTLOADEXIT", None);
+            let event = Some(s.world.store(EngineData::Event(event)));
+            let mut h = ScriptHost {
+                sim: &mut s,
+                event,
+                script: "area".into(),
+            };
+            apply_visual_or_effect(&mut h, wall, fire.clone());
+            assert_eq!(
+                s.world.get(wall).unwrap().effects,
+                [fire.clone(), other.clone()]
+            );
+        }
+    }
+
+    #[test]
+    fn area_load_visual_reconciliation_preserves_other_effect_applications() {
+        for case in 0..7 {
+            let table = EngineTable::parse(
+                format!(
+                    "{LDF}\nint EVENT_TYPE_AREALOADSAVE_POSTLOADEXIT = 43;\n\
+                     int EVENT_TYPE_AREALOAD_POSTLOADEXIT = 39;\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 7);
+            s.game = thedas_vfs::Game::DragonAge2;
+            let area = s.world.spawn(ObjectKind::Area, "area");
+            let caster = s.world.spawn(ObjectKind::Creature, "caster");
+            let target = s.world.spawn(ObjectKind::Placeable, "target");
+            s.world.get_mut(target).unwrap().area = Some(area);
+            let mut effect = Effect {
+                ty: 4,
+                creator: Some(area),
+                duration_type: 3,
+                ints: vec![600001],
+                ..Default::default()
+            };
+            let mut event = s.new_event("AREALOADSAVE_POSTLOADEXIT", None);
+            match case {
+                0 => s.game = thedas_vfs::Game::Origins,
+                1 => event = s.new_event("AREALOAD_POSTLOADEXIT", None),
+                2 => effect.ability = 123,
+                3 => {
+                    effect.duration_type = 2;
+                    effect.expires = Some(1000);
+                }
+                4 => effect.creator = Some(caster),
+                5 => s.world.get_mut(target).unwrap().kind = ObjectKind::Creature,
+                _ => s.world.get_mut(target).unwrap().area = None,
+            }
+            s.world
+                .get_mut(target)
+                .unwrap()
+                .effects
+                .push(effect.clone());
+            let event = Some(s.world.store(EngineData::Event(event)));
+            let mut h = ScriptHost {
+                sim: &mut s,
+                event,
+                script: "area".into(),
+            };
+            apply_visual_or_effect(&mut h, target, effect);
+            assert_eq!(s.world.get(target).unwrap().effects.len(), 2, "case {case}");
+        }
+    }
 
     #[test]
     fn visual_effects_on_objects_are_applied_as_effects() {
