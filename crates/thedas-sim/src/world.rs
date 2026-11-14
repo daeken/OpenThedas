@@ -165,6 +165,10 @@ pub struct Object {
     pub team: i32,
     pub group: i32,
     pub appearance: i32,
+    /// An Origins base changed by SetAppearanceType, retained across temporary changes.
+    /// Older worlds fall back to their template appearance until a base is assigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_appearance: Option<u16>,
     pub rank: i32,
     pub interactive: bool,
     /// Trigger polygon (XY used for containment).
@@ -245,6 +249,7 @@ impl Object {
             team: -1,
             group: 0,
             appearance: 0,
+            base_appearance: None,
             rank: 0,
             interactive: true,
             geometry: Vec::new(),
