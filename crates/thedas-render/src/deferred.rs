@@ -207,6 +207,7 @@ pub(crate) struct DeferredPass {
     ssao: bool,
     /// Diagnostic override: tiled lighting and cube-face culling, respectively.
     culling: Option<[bool; 2]>,
+    shadow_reuse: Option<bool>,
 }
 
 pub(crate) struct Contributor<'a> {
@@ -732,12 +733,17 @@ impl DeferredPass {
             baked_lighting: std::env::var("THEDAS_DEFERRED_BAKED_LIGHTING").as_deref() != Ok("0"),
             ssao: std::env::var("THEDAS_DEFERRED_SSAO").as_deref() != Ok("0"),
             culling: None,
+            shadow_reuse: None,
         })
     }
 
     /// Whether faithful draw `k` (an index into [`D3dPass::draws`]) is this pass's to draw.
     pub(crate) fn takes(&self, k: usize) -> bool {
         self.takes.get(k).copied().unwrap_or(false)
+    }
+
+    pub(crate) fn set_shadow_reuse(&mut self, enabled: Option<bool>) {
+        self.shadow_reuse = enabled;
     }
 
     /// Sets the lights only this pass draws (see [`DeferredPass::effect_lights`]).
@@ -1722,6 +1728,7 @@ impl DeferredPass {
             }
             let pool = gpu.shadows.as_mut().expect("point shadows");
             pool.set_culling(self.culling.map(|c| c[1]));
+            pool.reuse_override = self.shadow_reuse;
             pool.encode(device, &ctx.queue, encoder, &shadowed, &casters);
         }
 
@@ -1944,7 +1951,7 @@ fn casters<'a>(
     draws: &'a [PlanDraw],
     cutouts: &'a [crate::deferred_cutout::Draw],
     materials: &'a [crate::deferred_cutout::Material],
-    d3d: &D3dPass,
+    d3d: &'a D3dPass,
     meshes: &'a [GpuMesh],
     streams: (&'a HashMap<usize, wgpu::Buffer>, &'a wgpu::Buffer),
 ) -> Vec<crate::deferred_shadow::Caster<'a>> {
@@ -1958,6 +1965,11 @@ fn casters<'a>(
                 vertices: vertices.get(&d.mesh)?,
                 bones,
                 bone_offset: (d.skin_slot * SKIN_STRIDE) as u32,
+                pose: if d.skin_slot > 0 {
+                    d3d.bones(d.draw)
+                } else {
+                    &[]
+                },
                 world: d3d.world(d.draw).unwrap_or(Mat4::IDENTITY),
                 sphere: d3d.draw_sphere(&d3d.draws[d.k]).unwrap_or(d.sphere),
                 alpha: [0.0; 4],
@@ -1976,6 +1988,11 @@ fn casters<'a>(
                     vertices: vertices.get(&d.mesh)?,
                     bones,
                     bone_offset: (d.skin_slot * SKIN_STRIDE) as u32,
+                    pose: if d.skin_slot > 0 {
+                        d3d.bones(d.draw)
+                    } else {
+                        &[]
+                    },
                     world: d3d.world(d.draw).unwrap_or(Mat4::IDENTITY),
                     sphere: d3d.draw_sphere(&d3d.draws[d.k]).unwrap_or(d.sphere),
                     alpha: d.alpha,

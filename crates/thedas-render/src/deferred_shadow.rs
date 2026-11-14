@@ -81,11 +81,54 @@ pub(crate) struct Caster<'a> {
     pub vertices: &'a wgpu::Buffer,
     pub bones: &'a wgpu::Buffer,
     pub bone_offset: u32,
+    /// Current palette values; buffer identity alone cannot detect an in-place update.
+    pub pose: &'a [[f32; 4]],
     pub world: Mat4,
     pub sphere: (Vec3, f32),
     pub alpha: [f32; 4],
     pub clip: f32,
     pub material: Option<&'a crate::deferred_cutout::Material>,
+}
+
+/// Exact inputs to a cube, independent of the viewing camera. Material textures and
+/// mesh buffers are immutable for a renderer's lifetime; reloads create new handles.
+#[derive(PartialEq)]
+struct CubeInputs {
+    light: (Vec3, f32),
+    casters: Vec<CasterInputs>,
+}
+
+#[derive(PartialEq)]
+struct CasterInputs {
+    indices: wgpu::Buffer,
+    vertices: wgpu::Buffer,
+    count: u32,
+    bones: wgpu::Buffer,
+    bone_offset: u32,
+    pose: Vec<[f32; 4]>,
+    world: Mat4,
+    sphere: (Vec3, f32),
+    alpha: [f32; 4],
+    clip: f32,
+    material: Option<(wgpu::TextureView, wgpu::Sampler)>,
+}
+
+impl CasterInputs {
+    fn new(c: &Caster<'_>) -> Self {
+        Self {
+            indices: c.mesh.indices.clone(),
+            vertices: c.vertices.clone(),
+            count: c.mesh.count,
+            bones: c.bones.clone(),
+            bone_offset: c.bone_offset,
+            pose: c.pose.to_vec(),
+            world: c.world,
+            sphere: c.sphere,
+            alpha: c.alpha,
+            clip: c.clip,
+            material: c.material.map(|m| (m.view.clone(), m.sampler.clone())),
+        }
+    }
 }
 
 pub(crate) struct ShadowPool {
@@ -97,6 +140,10 @@ pub(crate) struct ShadowPool {
     culling: Option<bool>,
     material_layout: wgpu::BindGroupLayout,
     opaque: crate::deferred_cutout::Material,
+    previous: Vec<CubeInputs>,
+    pub(crate) reuse_override: Option<bool>,
+    #[cfg(test)]
+    rendered_cubes: usize,
     /// Per layer (slot · 6 + face), the colour and depth views drawn into.
     layers: Vec<(wgpu::TextureView, wgpu::TextureView)>,
     /// Every layer, for the lighting pass.
@@ -289,6 +336,10 @@ impl ShadowPool {
             culling: None,
             material_layout,
             opaque,
+            previous: Vec::new(),
+            reuse_override: None,
+            #[cfg(test)]
+            rendered_cubes: 0,
             layers,
             view,
             #[cfg(test)]
@@ -344,6 +395,38 @@ impl ShadowPool {
         lights: &[(Vec3, f32)],
         casters: &[Caster<'_>],
     ) {
+        let reuse = self
+            .reuse_override
+            .unwrap_or_else(|| std::env::var("THEDAS_DEFERRED_SHADOW_REUSE").as_deref() != Ok("0"));
+        // Paired benchmarks keep exact input bookkeeping in both modes and force the
+        // control's redraw. Its freshly drawn maps can then be reused by the next frame.
+        let inputs: Vec<_> = if reuse || self.reuse_override.is_some() {
+            lights
+                .iter()
+                .take(SLOTS)
+                .map(|&(position, radius)| CubeInputs {
+                    light: (position, radius),
+                    casters: casters
+                        .iter()
+                        .filter(|c| c.sphere.0.distance(position) < c.sphere.1 + radius)
+                        .map(CasterInputs::new)
+                        .collect(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let dirty: Vec<_> = (0..lights.len().min(SLOTS))
+            .map(|i| !reuse || self.previous.get(i) != inputs.get(i))
+            .collect();
+        self.previous = inputs;
+        if !dirty.iter().any(|d| *d) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.rendered_cubes += dirty.iter().filter(|d| **d).count();
+        }
         // Per layer, its draws: (caster, slot in the buffer).
         let mut data: Vec<u8> = Vec::new();
         let mut layers: Vec<Vec<(usize, u32)>> = Vec::new();
@@ -351,7 +434,11 @@ impl ShadowPool {
             .culling
             .unwrap_or_else(|| std::env::var("THEDAS_DEFERRED_SHADOW_CULL").as_deref() != Ok("0"));
         let mut before = 0;
-        for &(position, radius) in lights.iter().take(SLOTS) {
+        for (slot, &(position, radius)) in lights.iter().take(SLOTS).enumerate() {
+            if !dirty[slot] {
+                layers.extend((0..6).map(|_| Vec::new()));
+                continue;
+            }
             let near: Vec<usize> = casters
                 .iter()
                 .enumerate()
@@ -441,6 +528,9 @@ impl ShadowPool {
             })
             .collect();
         for (layer, draws) in layers.iter().enumerate() {
+            if !dirty[layer / 6] {
+                continue;
+            }
             let Some((colour, depth)) = self.layers.get(layer) else {
                 continue;
             };
@@ -495,6 +585,85 @@ impl ShadowPool {
 mod tests {
     use super::*;
     use wgpu::util::DeviceExt;
+
+    #[test]
+    fn reused_cubes_follow_slot_changes_and_reappearing_lights() {
+        let ctx = crate::gpu::GpuContext::headless().unwrap();
+        let device = &ctx.device;
+        let mut pool = ShadowPool::new(device);
+        let check = |pool: &mut ShadowPool, lights: &[(Vec3, f32)]| {
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 512,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            pool.encode(device, &ctx.queue, &mut encoder, lights, &[]);
+            for slot in 0..lights.len() {
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &pool.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: 0,
+                            z: slot as u32 * 6,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &readback,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: slot as u64 * 256,
+                            bytes_per_row: Some(256),
+                            rows_per_image: Some(1),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            ctx.queue.submit([encoder.finish()]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            readback
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            rx.recv().unwrap().unwrap();
+            let bytes = readback.slice(..).get_mapped_range().unwrap();
+            for slot in 0..lights.len() {
+                let offset = slot * 256;
+                assert_eq!(
+                    *bytemuck::from_bytes::<f32>(&bytes[offset..offset + 4]),
+                    1_000_000_000.0,
+                    "empty cube slot {slot} was not cleared"
+                );
+            }
+        };
+        let a = (Vec3::ZERO, 10.0);
+        let b = (Vec3::X * 100.0, 20.0);
+        check(&mut pool, &[a, b]);
+        assert_eq!(pool.rendered_cubes, 2);
+        check(&mut pool, &[a, b]);
+        assert_eq!(pool.rendered_cubes, 2);
+        let moved = (Vec3::X, 10.0);
+        check(&mut pool, &[moved, b]);
+        assert_eq!(pool.rendered_cubes, 3);
+        check(&mut pool, &[b, moved]);
+        assert_eq!(pool.rendered_cubes, 5);
+        check(&mut pool, &[b]);
+        assert_eq!(pool.rendered_cubes, 5);
+        check(&mut pool, &[b, moved]);
+        assert_eq!(pool.rendered_cubes, 6);
+        check(&mut pool, &[]);
+        assert_eq!(pool.rendered_cubes, 6);
+        check(&mut pool, &[b, moved]);
+        assert_eq!(pool.rendered_cubes, 8);
+    }
 
     #[test]
     fn textured_shadow_faces_keep_holes_comparisons_blue_opacity_and_skin_motion() {
@@ -571,14 +740,20 @@ mod tests {
             view: texture.create_view(&Default::default()),
             sampler: device.create_sampler(&Default::default()),
         };
+        let pose = std::cell::RefCell::<Vec<[f32; 4]>>::default();
+        let world = std::cell::Cell::new(Mat4::IDENTITY);
+        let light = std::cell::Cell::new((Vec3::ZERO, 10.0));
+        let present = std::cell::Cell::new(true);
         let read = |pool: &mut ShadowPool, alpha: [f32; 4], clip: f32| {
+            let pose = pose.borrow();
             let caster = Caster {
                 mesh: &mesh,
                 vertices: &vertices,
                 bones: &bones,
                 bone_offset: 0,
-                world: Mat4::IDENTITY,
-                sphere: (Vec3::new(2.0, 0.0, 0.0), 3.0),
+                pose: &pose,
+                world: world.get(),
+                sphere: (world.get().transform_point3(Vec3::new(2.0, 0.0, 0.0)), 3.0),
                 alpha,
                 clip,
                 material: Some(&material),
@@ -590,12 +765,13 @@ mod tests {
                 mapped_at_creation: false,
             });
             let mut encoder = device.create_command_encoder(&Default::default());
+            let casters = [caster];
             pool.encode(
                 device,
                 &ctx.queue,
                 &mut encoder,
-                &[(Vec3::ZERO, 10.0)],
-                &[caster],
+                &[light.get()],
+                if present.get() { &casters } else { &[] },
             );
             for (i, x) in [210, 300].into_iter().enumerate() {
                 encoder.copy_texture_to_buffer(
@@ -632,9 +808,26 @@ mod tests {
             device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
             rx.recv().unwrap().unwrap();
             let bytes = readback.slice(..).get_mapped_range().unwrap();
-            [0, 256].map(|i| *bytemuck::from_bytes::<f32>(&bytes[i..i + 4]) < 10.0)
+            [0, 256].map(|i| *bytemuck::from_bytes::<f32>(&bytes[i..i + 4]) < light.get().1)
         };
         assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [false, true]);
+        let rendered = pool.rendered_cubes;
+        assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [false, true]);
+        assert_eq!(
+            pool.rendered_cubes, rendered,
+            "unchanged cube should be reused"
+        );
+        pool.reuse_override = Some(false);
+        assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [false, true]);
+        assert_eq!(pool.rendered_cubes, rendered + 1);
+        pool.reuse_override = Some(true);
+        assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [false, true]);
+        assert_eq!(
+            pool.rendered_cubes,
+            rendered + 1,
+            "benchmark reuse must retain the control's maps"
+        );
+        pool.reuse_override = None;
         assert_eq!(read(&mut pool, [7.0, 255.0, 2.0, 1.0], 0.0), [true, false]);
         // Match D3D9's 8-bit rounding: a fraction below one still passes >= 255.
         assert_eq!(
@@ -642,6 +835,9 @@ mod tests {
             [false, true]
         );
         write_opacity(128);
+        // Fixture-only in-place texture editing: real renderer material textures are
+        // immutable, and resource reloads replace the renderer and its pool.
+        pool.previous.clear();
         use thedas_formats::state::CompareFunc;
         for (cmp, expected) in [
             (CompareFunc::Never, [false, false]),
@@ -665,6 +861,8 @@ mod tests {
         }
         assert_eq!(read(&mut pool, [8.0, 0.0, 3.0, 1.0], 0.3), [false, true]);
         write_opacity(255);
+        pool.previous.clear();
+        assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [false, true]);
         crate::deferred_mesh::write_palette(
             &mut rows,
             &[
@@ -674,7 +872,34 @@ mod tests {
             ],
         );
         ctx.queue.write_buffer(&bones, 0, &rows);
+        *pose.borrow_mut() = bytemuck::cast_slice(&rows).to_vec();
+        let rendered = pool.rendered_cubes;
         assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [true, false]);
+        assert_eq!(
+            pool.rendered_cubes,
+            rendered + 1,
+            "in-place palette update must redraw"
+        );
+        world.set(Mat4::from_translation(Vec3::Y * 10.0));
+        assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [false, false]);
+        world.set(Mat4::IDENTITY);
+        assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [true, false]);
+        present.set(false);
+        assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [false, false]);
+        present.set(true);
+        assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [true, false]);
+        for change in [(Vec3::new(0.0, -3.0, 0.0), 10.0), (Vec3::ZERO, 12.0)] {
+            light.set(change);
+            let rendered = pool.rendered_cubes;
+            let output = read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0);
+            assert_eq!(
+                pool.rendered_cubes,
+                rendered + 1,
+                "changed light must redraw"
+            );
+            pool.previous.clear();
+            assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), output);
+        }
     }
 
     #[test]
