@@ -123,6 +123,11 @@ The player lives in `crates/thedas-gfx`:
 
 - Every movie opened by `thedas-ui::Stage` uses `thedas-gfx` directly from its GFx bytes.
   There is no backend selector or fallback player.
+- Native held Shift reaches pointer input, including movies opened while it is held.
+  A click in the focused text field retains its selection anchor; clicks outside
+  keep the existing one-click dialog-button handling. Keyboard selection edits do
+  not release a host-held modifier. `shift down` / `shift up` automation steps
+  exercise the same held state, and window focus loss releases it.
 - Unknown opcodes, tags or built-ins are logged once per movie.
 - `Mouse.getTopMostEntity(false)` finds the deepest enabled clip with mouse
   handlers, skipping decorative labels above picker buttons. `true` and the
