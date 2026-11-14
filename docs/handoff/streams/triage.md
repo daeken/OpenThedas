@@ -4,12 +4,15 @@ Role: the release and integration lane. Triage takes what breaks in play-testing
 
 ## How the stream was set up
 
-- **Two halves.** A cloud session (this thread) holds the plan, talks to the coordinator, merges PRs through the GitHub API, and cross-builds the Windows packages. A Remote Control session on Sera's Mac (`/Volumes/External2`, triage ports 7930-39, helpers 7910-29) does everything that needs the game data: native builds, the gate, captures, traces of `DAOrigins.exe`, and fixes. The Mac half never merges. The cloud half never runs the game.
+- **Two halves.** A cloud session (this thread) holds the plan, talks to the coordinator, merges PRs through the GitHub API, and cross-builds the Windows packages. A Remote Control session on Sera's Mac (`/Volumes/External2`, triage ports 7930-39, helpers 7910-29) does everything that needs the game data: native builds, the gate, captures, traces of `DAOrigins.exe`, and fixes. The Mac half pushes branches and opens PRs (for example #690), but it can't merge, add reviewers, or pause its own jobs with `kill -STOP`, because its permission mode refuses those. The cloud half never runs the game. On the Mac, candidates are built in `OpenThedas-wt/bench`, and fixes in `OpenThedas-wt/convcam` (target dir `convcam-target`). Keep `TMPDIR` in place while a build runs. Fuller Mac notes: `OpenThedas-testdata/notes/triage-mac-handoff-1114.md`.
+- **Mac rules triage learned the hard way.**
+  - Every automated run uses a scratch `HOME` and `THEDAS_MODS=none`, because the real HOME holds a live Discord webhook.
+  - A visible game with sound on the real HOME is started only on the maintainer's own message, the way play.command starts it: detached, and never closed by us. A relayed approval doesn't count.
 - **The candidate gate.** A commit is "good" for testers only after this whole list passes on that exact commit, compared against the last good build:
   - fmt, clippy and debug `cargo test`
   - a chargen click-through (`triage/convcam/bin/convcap.sh dcommon|hnoble`, plus the other origins)
   - the six origin saves load
-  - `OpenThedas-testdata/gate/gate.sh` (s01-s16 scenario steps: end areas, plot sets, log diffs)
+  - `OpenThedas-testdata/gate/gate.sh`, which runs the scenario steps you name. The default is five (s04, s07, s11, s14, s15); candidates ran ten (adding s05, s06, s08, s09, s12). It compares end areas, plot sets and log diffs. Baselines live in `gate/bin`, and `GATE_DIR` isolates a run.
   - s13 tower seeds 1-3 via `sim-work/s13seed.sh`, judged by step and call counts, never wall time
   - `gate/detcheck.sh` (four saves run twice and through save+reload must match)
   - `thedas corpus <install>`
@@ -32,7 +35,8 @@ Role: the release and integration lane. Triage takes what breaks in play-testing
 
 ## In flight or parked when this was written
 
-- Beraht "moonwalking" at the start of the Dwarf Commoner conversation: his line cutscene 39366.cut plays `mh.dg_wandereast` with baked root motion, and ours turns him further than its keys. Waiting on QA's footage of the original's first ~10 s.
+- Beraht "moonwalking" at the start of the Dwarf Commoner conversation. QA's capture of the original (`reference/original/triage/dc_intro_beraht`) shows no moonwalk, so it is our bug. His line cutscene 39366.cut plays `mh.dg_wandereast` with baked root motion, and ours turns him further than its keys. The cause isn't found yet. A save that keeps the walk-in needs the MCP cutscene-policy option.
+- Pins: play.command's binary and `qa/bin/thedas-app` are still the testers' build (8137c5d, tree b587d51). The play checkout's HEAD is 6ad8390, with the outside agent's uncommitted edits. The newest placed binaries are `qa/bin/thedas-app-078b146` and `sim-bin/thedas-mcp-078b146`, built only, with no gate.
 - The first update (cb8205a or later): needs QA's VM grade on `windows-build/cb8205a(-arm64)`, then Sera's go. After that, issue reporting publishes it, play.command is pinned, and its notes link `docs/mod-mode-testing.md`.
 - Performance: the interface used about 15 ms of a 22 ms frame (UI cut the idle cost in #698; picking with the mouse in the window still costs), and the Ostagar camp issues about 9,700 draws (rendering).
 - DLC passwords by search (#623) were never checked on a real non-GOG install. Don't send that check to a Mac session: one ended with a safeguards refusal.
