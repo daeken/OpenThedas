@@ -129,6 +129,14 @@ and show your edits while the game runs:
 3. Save over one of the export's PNGs, from Blender or any paint program. Within half a
    second it is written to `workspace/override/` under the game's own texture name, and the
    object is drawn with it.
+4. Or edit the model in Blender and export it over the `.glb` (glTF Binary). Its meshes are
+   written back as the game's `.msh` files in `workspace/override/` and the object is drawn
+   with them: reshaped, moved or re-skinned, it keeps the game's own vertex layout and
+   bones. `.imported` in the export's folder says what was written, or why not.
+
+Meshes: keep each mesh's name (the export names them after the game's chunks), and its
+armature's bone names; a vertex can only follow bones its mesh already used (new bones need
+the model file, which is not written yet). A mesh deleted in Blender is written empty.
 
 `workspace/override/` is an ordinary mod folder: put it in `mods.txt` (or copy its files
 anywhere a mod goes) to keep your edits. Live edits are never mounted unless you ask, and
@@ -137,7 +145,7 @@ layer, so a report from an edited game is not taken for a bug in the original's 
 
 Textures are written uncompressed for now (bigger files, same look). What was already
 loaded from an old file stays until it is read again: creatures and objects are redrawn at
-once; the level's own textures change on its next load.
+once; the level's own textures and meshes change on its next load.
 
 ## What does not work yet
 

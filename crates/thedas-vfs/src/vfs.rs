@@ -602,6 +602,12 @@ impl Vfs {
                 return Ok((data, p));
             }
         }
+        self.read_beneath_workspace(name)
+    }
+
+    /// [`Vfs::read`] as if no workspace were mounted: what the layers hold (mod mode reads
+    /// the originals of what it rewrites this way).
+    pub fn read_beneath_workspace(&self, name: &str) -> Result<(Vec<u8>, Provenance)> {
         let mut first_err = None;
         if let Some(o) = &self.overlay {
             match o.read(name) {

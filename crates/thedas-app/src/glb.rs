@@ -240,7 +240,7 @@ fn source(name: &str, r: &Read) -> J {
     json!({"resource": name, "layer": r.layer, "entry": r.entry})
 }
 
-fn trs(t: &thedas_formats::level::Transform) -> Mat4 {
+pub(crate) fn trs(t: &thedas_formats::level::Transform) -> Mat4 {
     let q = Quat::from_array(t.rotation);
     let q = if q.length_squared() > 0.0 {
         q.normalize()
@@ -251,7 +251,7 @@ fn trs(t: &thedas_formats::level::Transform) -> Mat4 {
 }
 
 /// How many components a declaration type holds (Direct3D 9 fills the rest).
-fn components(t: DeclType) -> usize {
+pub(crate) fn components(t: DeclType) -> usize {
     use DeclType::*;
     match t {
         Float1 => 1,
@@ -263,7 +263,7 @@ fn components(t: DeclType) -> usize {
 
 /// Blend weights as glTF wants them: four, the implied last one filled in (Direct3D 9's
 /// rule for fewer components), summing to one.
-fn weights(w: [f32; 4], given: usize) -> [f32; 4] {
+pub(crate) fn weights(w: [f32; 4], given: usize) -> [f32; 4] {
     let mut w = w;
     if given < 4 {
         let sum: f32 = w[..given].iter().sum();
@@ -430,6 +430,9 @@ pub fn export(read: &dyn Fn(&str) -> Option<Read>, subject: &Subject, models: &[
                     "joints": joints,
                     "inverseBindMatrices": acc,
                     "name": format!("{name}:{}", m.chunk),
+                    // Each joint's palette slot's bone, for the import (a bone the model
+                    // lacks has no node of its own).
+                    "extras": {"thedas": {"palette": m.bones}},
                 }));
                 Some(d.skins.len() - 1)
             };
@@ -649,6 +652,15 @@ fn mesh(
             json!(d.floats(&v, 4, "VEC4", false, Some(ARRAY_BUFFER))),
         );
     }
+    // The binormal as stored (not always the normal crossed with the tangent), for the
+    // import; an editor that drops it gets one made from the tangent's side.
+    if let Some(b) = attr(DeclUsage::Binormal, 0)? {
+        let v: Vec<f32> = b.iter().flat_map(|v| [v[0], v[1], v[2]]).collect();
+        attributes.insert(
+            "_BINORMAL".into(),
+            json!(d.floats(&v, 3, "VEC3", false, Some(ARRAY_BUFFER))),
+        );
+    }
     for set in 0..8 {
         if let Some(uv) = attr(DeclUsage::TexCoord, set)? {
             let v: Vec<f32> = uv.iter().flat_map(|v| [v[0], v[1]]).collect();
@@ -656,6 +668,16 @@ fn mesh(
                 format!("TEXCOORD_{set}"),
                 json!(d.floats(&v, 2, "VEC2", false, Some(ARRAY_BUFFER))),
             );
+            // A set of more than two components keeps the rest for the import.
+            if c.element(DeclUsage::TexCoord, set)
+                .is_some_and(|e| components(e.ty) > 2)
+            {
+                let v: Vec<f32> = uv.iter().flatten().copied().collect();
+                attributes.insert(
+                    format!("_TEXCOORD_{set}"),
+                    json!(d.floats(&v, 4, "VEC4", false, Some(ARRAY_BUFFER))),
+                );
+            }
         }
     }
     if let Some(col) = attr(DeclUsage::Color, 0)? {
@@ -664,6 +686,14 @@ fn mesh(
             "COLOR_0".into(),
             json!(d.floats(&v, 4, "VEC4", false, Some(ARRAY_BUFFER))),
         );
+        // Some meshes (hair, beards) keep other data than colour there: kept as it was.
+        if col.iter().flatten().any(|x| !(0.0..=1.0).contains(x)) {
+            let v: Vec<f32> = col.iter().flatten().copied().collect();
+            attributes.insert(
+                "_COLOR_0".into(),
+                json!(d.floats(&v, 4, "VEC4", false, Some(ARRAY_BUFFER))),
+            );
+        }
     }
     if skinned {
         let idx = attr(DeclUsage::BlendIndices, 0)?.ok_or("skinned, but no blend indices")?;

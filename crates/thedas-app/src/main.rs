@@ -58,6 +58,7 @@ mod cutcam;
 mod focusnav;
 mod follow;
 mod glb;
+mod glb_in;
 mod intro;
 mod journal;
 mod live;
@@ -1883,10 +1884,34 @@ impl App {
         }
         let overrides = workspace::override_dir();
         let changes = workspace::changes(&workspace::blender_dir(), &overrides);
-        if changes.is_empty() {
+        let glbs = workspace::glb_changes(&workspace::blender_dir());
+        if changes.is_empty() && glbs.is_empty() {
             return None;
         }
-        let (done, failed) = workspace::apply(&changes, &overrides);
+        let (mut done, mut failed) = workspace::apply(&changes, &overrides);
+        // Saved meshes: read against the game's own files, not earlier live edits.
+        if !glbs.is_empty() {
+            let vfs = self.live.as_ref().map(|l| l.sim().vfs.clone());
+            let read = |name: &str| {
+                let (data, p) = vfs.as_ref()?.read_beneath_workspace(name).ok()?;
+                Some(glb::Read {
+                    data,
+                    layer: p.layer_label,
+                    entry: p.entry,
+                })
+            };
+            for g in &glbs {
+                match workspace::import_glb(g, &overrides, &read) {
+                    Ok((written, notes)) => {
+                        for n in notes {
+                            log::info!("live edits: {}: {n}", g.display());
+                        }
+                        done.extend(written);
+                    }
+                    Err(e) => failed.push(format!("{}: {e}", g.display())),
+                }
+            }
+        }
         for f in &failed {
             log::warn!("live edits: {f}");
         }
