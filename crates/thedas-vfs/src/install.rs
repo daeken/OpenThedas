@@ -44,6 +44,7 @@ pub struct AddIn {
     /// Its place in the registry (`AddIns.xml`) that named it, counted from the first item;
     /// `None` for an add-in known only from its folder's manifest.
     pub rank: Option<usize>,
+    pub metadata: crate::manifest::Metadata,
 }
 
 impl AddIn {
@@ -456,10 +457,20 @@ impl DaoInstall {
         if let Some(user) = user {
             addins.extend(self.user_addins(user)?);
         }
+        let requested: Vec<String> = packaged
+            .iter()
+            .filter(|a| a.enabled)
+            .map(|a| a.uid.clone())
+            .collect();
         addins.extend(packaged);
+        let version = self.game_version();
+        enable_prerequisites(&mut addins, &requested, version);
         sort_addins(&mut addins);
         let from_user = |p: &Path| user.is_some_and(|u| p.starts_with(u));
-        let addins: Vec<AddIn> = addins.into_iter().filter(|a| a.enabled).collect();
+        let addins: Vec<AddIn> = addins
+            .into_iter()
+            .filter(|a| compatible(a, version))
+            .collect();
         vfs.set_addins(addins.iter().map(|a| a.uid.clone()).collect());
         for addin in addins {
             let label: &dyn Fn(&Path) -> String = if addin.dir.starts_with(&self.root) {
@@ -651,16 +662,48 @@ fn sort_addins(addins: &mut [AddIn]) {
     });
 }
 
-/// Every `AddInItem` of a manifest (or registry), in file order, as written (no gates
-/// applied, no folders).
-pub(crate) fn manifest_items(text: &str) -> Vec<AddIn> {
-    registry_items(text, None)
-        .into_iter()
-        .map(|(mut a, _)| {
-            a.enabled = true;
-            a
-        })
-        .collect()
+fn version_allows(addin: &AddIn, game: Option<f64>) -> bool {
+    let needs = leading_number(&addin.metadata.game_version);
+    if let Some(game) = game.filter(|game| needs > *game) {
+        log_left_out(
+            &addin.uid,
+            &format!("it asks for game version {needs}, and this game is {game}"),
+        );
+        false
+    } else {
+        true
+    }
+}
+
+fn compatible(addin: &AddIn, game: Option<f64>) -> bool {
+    addin.enabled && version_allows(addin, game)
+}
+
+/// Enabling an add-in recursively enables the installed prerequisites it names by
+/// microContentID (0x5f5f40, recursive call at 0x5f60c2). ProductID and Title are metadata;
+/// the enable lookup compares UIDs. A missing prerequisite does not reject the parent:
+/// the original enable operation simply finds no matching record. Report that case here.
+fn enable_prerequisites(addins: &mut [AddIn], requested: &[String], game: Option<f64>) {
+    let mut pending = requested.to_vec();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(uid) = pending.pop() {
+        if !seen.insert(uid.to_ascii_lowercase()) {
+            continue;
+        }
+        let Some(index) = addins
+            .iter()
+            .rposition(|a| a.uid.eq_ignore_ascii_case(&uid))
+        else {
+            log::warn!("add-ins: prerequisite {uid} is not installed");
+            continue;
+        };
+        let addin = &mut addins[index];
+        if !matches!(addin.metadata.kind, Some(1 | 2)) || !version_allows(addin, game) {
+            continue;
+        }
+        addin.enabled = true;
+        pending.extend(addin.metadata.prerequisites.iter().map(|p| p.uid.clone()));
+    }
 }
 
 /// An add-in described by a manifest's first `AddInItem`. `fallback_uid` names it when the
@@ -681,6 +724,14 @@ fn item_from(text: &str, element: &str, dir: PathBuf, fallback_uid: String) -> A
         extends: xml_attr(text, element, "ExtendedModuleUID"),
         dir,
         rank: None,
+        metadata: roxmltree::Document::parse(text)
+            .ok()
+            .and_then(|doc| {
+                doc.descendants()
+                    .find(|n| n.has_tag_name(element))
+                    .map(crate::manifest::metadata)
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -757,8 +808,18 @@ impl DaoInstall {
     pub fn env_dirs_with(&self, player: Vec<AddIn>) -> Result<Vec<PathBuf>> {
         let mut dirs = vec![join_ci(&self.root, "packages/core/env")];
         let mut addins: Vec<AddIn> = self.addins()?;
+        let requested: Vec<String> = player
+            .iter()
+            .filter(|a| a.enabled)
+            .map(|a| a.uid.clone())
+            .collect();
         addins.extend(player);
-        let mut addins: Vec<AddIn> = addins.into_iter().filter(|a| a.enabled).collect();
+        let version = self.game_version();
+        enable_prerequisites(&mut addins, &requested, version);
+        let mut addins: Vec<AddIn> = addins
+            .into_iter()
+            .filter(|a| compatible(a, version))
+            .collect();
         sort_addins(&mut addins);
         addins.reverse();
         for a in addins {
@@ -890,6 +951,10 @@ fn items_of(text: &str, element: &str, game_version: Option<f64>) -> Vec<(AddIn,
             leading_number(&value[..value.find('<').unwrap_or(value.len())])
         });
         let mut addin = item_from(tag, element, PathBuf::new(), String::new());
+        let xml = format!("{tag}{body}</{element}>");
+        if let Ok(doc) = roxmltree::Document::parse(&xml) {
+            addin.metadata = crate::manifest::metadata(doc.root_element());
+        }
         let why = if !addin.enabled {
             Some("its registry entry says Enabled=\"0\"".to_string())
         } else if !offers && !matches!(kind, Some(1 | 2)) {
@@ -1579,6 +1644,32 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
+    #[test]
+    fn packaged_enablement_follows_prerequisites_but_keeps_the_version_gate() {
+        let xml = r#"<Manifest>
+          <AddInItem UID="parent"><Type>2</Type><Version>999</Version><GameVersion>1.05</GameVersion>
+            <PrereqList><PrereqItem ProductID="99" microContentID="dep" Title="Dependency"/>
+              <PrereqItem ProductID="99" microContentID="newer" Title="Newer"/>
+              <PrereqItem ProductID="99" microContentID="absent" Title="Missing"/></PrereqList>
+          </AddInItem>
+          <AddInItem UID="dep"><Type>2</Type><PrereqList>
+            <PrereqItem ProductID="99" microContentID="parent" Title="Cycle"/>
+          </PrereqList></AddInItem>
+          <AddInItem UID="newer"><Type>2</Type><GameVersion>1.06</GameVersion></AddInItem>
+        </Manifest>"#;
+        let mut addins = crate::manifest::items(xml).unwrap();
+        addins[1].enabled = false;
+        addins[2].enabled = false;
+        enable_prerequisites(&mut addins, &["PARENT".into()], Some(1.05));
+        assert!(compatible(&addins[0], Some(1.05)));
+        assert!(compatible(&addins[1], Some(1.05)));
+        assert!(!compatible(&addins[2], Some(1.05)));
+        // Unknown game version skips that gate, as for the runtime registry.
+        assert!(version_allows(&addins[2], None));
+        addins[0].metadata.game_version = "1.06".into();
+        assert!(!compatible(&addins[0], Some(1.05)));
+    }
+
     /// An add-in handed over from an unpacked package joins the stack like an installed one:
     /// `core` always, `module` when it extends the base campaign, placed by its priority.
     #[test]
@@ -1612,6 +1703,7 @@ mod tests {
             extends: Some(extends.into()),
             dir: base.join("cache/pkg"),
             rank: None,
+            metadata: crate::manifest::Metadata::default(),
         };
         let install = DaoInstall::open(&root).unwrap();
         let read = |vfs: &Vfs, n: &str| String::from_utf8(vfs.read(n).unwrap().0).unwrap();
@@ -1628,6 +1720,28 @@ mod tests {
         let vfs = stack(packaged(60, "Some Other Campaign"));
         assert_eq!(read(&vfs, "sword.uti"), "packaged");
         assert!(vfs.lookup("area.are").is_none());
+        write(
+            "install/bin_ship/DAOrigins.exe",
+            &exe_with_version("1.05.13263.0"),
+        );
+        let mut newer = packaged(60, "Single Player");
+        newer.metadata.kind = Some(2);
+        newer.metadata.version = "999".into();
+        newer.metadata.game_version = "1.06".into();
+        let vfs = stack(newer.clone());
+        assert_eq!(read(&vfs, "sword.uti"), "installed");
+        assert!(!vfs.addin_enabled("PKG"));
+        let dirs = install.env_dirs_with(vec![newer.clone()]).unwrap();
+        assert!(!dirs.iter().any(|d| d.starts_with(&newer.dir)));
+        newer.metadata.game_version = "1.05".into();
+        assert_eq!(read(&stack(newer.clone()), "sword.uti"), "packaged");
+        assert!(
+            install
+                .env_dirs_with(vec![newer.clone()])
+                .unwrap()
+                .iter()
+                .any(|d| d.starts_with(&newer.dir))
+        );
         std::fs::remove_dir_all(&base).unwrap();
     }
 

@@ -140,6 +140,8 @@ pub struct TextField {
     pub shadow_color: [u8; 3],
     /// Caret position in characters, when the field has focus.
     pub caret: Option<usize>,
+    /// The other end of the focused selection; equal to the caret for an insertion point.
+    pub selection_anchor: usize,
     pub layout: Option<Layout>,
     /// Bumped whenever the text, its format or its box change (renderers cache by it).
     pub revision: u64,
@@ -198,6 +200,7 @@ impl TextField {
             shadow_style: String::new(),
             shadow_color: [0, 0, 0],
             caret: None,
+            selection_anchor: 0,
             layout: None,
             revision: 0,
             def,
@@ -387,6 +390,19 @@ impl TextField {
             .last()
             .map(|s| s.format.clone())
             .unwrap_or_else(|| self.default_format.clone())
+    }
+
+    pub fn selection(&self) -> (usize, usize) {
+        let len = self.len();
+        let caret = self.caret.unwrap_or(len).min(len);
+        let anchor = self.selection_anchor.min(len);
+        (caret.min(anchor), caret.max(anchor))
+    }
+
+    pub fn set_selection(&mut self, anchor: usize, caret: usize) {
+        let len = self.len();
+        self.selection_anchor = anchor.min(len);
+        self.caret = Some(caret.min(len));
     }
 
     pub fn len(&self) -> usize {

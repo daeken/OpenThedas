@@ -6246,6 +6246,7 @@ dependencies = [
  "flate2",
  "log",
  "md-5",
+ "roxmltree",
  "sevenz-rust2",
  "thiserror 2.0.18",
  "unrar",

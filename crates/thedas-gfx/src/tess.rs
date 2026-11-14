@@ -7,7 +7,7 @@ use lyon::tessellation::{
     StrokeTessellator, StrokeVertex, VertexBuffers,
 };
 
-use crate::swf::{Fill, Line, Matrix, Record};
+use crate::swf::{Fill, Line, LineCap, LineJoin, Matrix, Record};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -268,13 +268,15 @@ pub fn tessellate_shape(
     for (style, edges) in line_paths {
         let mut b = Path::builder();
         let mut started = false;
+        let mut first = (0.0, 0.0);
         let mut last = (f32::NAN, f32::NAN);
         for (a, c, to) in edges {
             if !started || a != last {
                 if started {
-                    b.end(false);
+                    b.end(!style.no_close && last == first);
                 }
                 b.begin(point(a.0, a.1));
+                first = a;
                 started = true;
             }
             match c {
@@ -288,15 +290,34 @@ pub fn tessellate_shape(
             last = to;
         }
         if started {
-            b.end(false);
+            b.end(!style.no_close && last == first);
         }
         let path = b.build();
         let width = (style.width as f32).max(20.0);
+        let cap = |c| match c {
+            LineCap::Round => lyon::path::LineCap::Round,
+            LineCap::None => lyon::path::LineCap::Butt,
+            LineCap::Square => lyon::path::LineCap::Square,
+        };
+        let mut opts = StrokeOptions::tolerance(TOLERANCE)
+            .with_line_width(width)
+            .with_start_cap(cap(style.start_cap))
+            .with_end_cap(cap(style.end_cap));
+        let join = match style.join {
+            LineJoin::Round => lyon::path::LineJoin::Round,
+            LineJoin::Bevel => lyon::path::LineJoin::Bevel,
+            LineJoin::Miter(limit) if limit >= StrokeOptions::MINIMUM_MITER_LIMIT => {
+                opts = opts.with_miter_limit(limit);
+                lyon::path::LineJoin::MiterClip
+            }
+            LineJoin::Miter(_) => lyon::path::LineJoin::Bevel,
+        };
+        opts = opts.with_line_join(join);
         let mut buf: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
         if stroke
             .tessellate_path(
                 &path,
-                &StrokeOptions::tolerance(TOLERANCE).with_line_width(width),
+                &opts,
                 &mut BuffersBuilder::new(&mut buf, |v: StrokeVertex| v.position().to_array()),
             )
             .is_err()
@@ -443,6 +464,116 @@ pub fn tessellate_polygon(points: &[(f32, f32)], color: [u8; 4]) -> Option<Mesh>
 mod tests {
     use super::*;
     use crate::swf::Color;
+
+    fn line_style() -> Line {
+        Line {
+            width: 100,
+            color: Color {
+                r: 0,
+                g: 255,
+                b: 0,
+                a: 255,
+            },
+            fill: None,
+            no_scale: (false, false),
+            start_cap: LineCap::None,
+            end_cap: LineCap::None,
+            join: LineJoin::Round,
+            no_close: false,
+        }
+    }
+
+    fn stroke(style: Line, points: &[(i32, i32)]) -> Vec<Mesh> {
+        let mut records = vec![Record::Style {
+            move_to: Some(points[0]),
+            fill0: None,
+            fill1: None,
+            line: Some(1),
+            new_styles: None,
+        }];
+        records.extend(points[1..].iter().map(|to| Record::Line { to: *to }));
+        tessellate_shape(&[], &[style], &records, &|_| None)
+    }
+
+    fn covers(meshes: &[Mesh], p: [f32; 2]) -> bool {
+        meshes.iter().any(|mesh| {
+            mesh.indices.chunks_exact(3).any(|tri| {
+                let v = [tri[0], tri[1], tri[2]].map(|i| mesh.vertices[i as usize].pos);
+                let area = (v[1][0] - v[0][0]) * (v[2][1] - v[0][1])
+                    - (v[1][1] - v[0][1]) * (v[2][0] - v[0][0]);
+                if area.abs() < 1e-6 {
+                    return false;
+                }
+                let side = |a: [f32; 2], b: [f32; 2]| {
+                    (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+                };
+                let sides = [side(v[0], v[1]), side(v[1], v[2]), side(v[2], v[0])];
+                sides.iter().all(|s| *s >= 0.0) || sides.iter().all(|s| *s <= 0.0)
+            })
+        })
+    }
+
+    #[test]
+    fn stroke_start_and_end_caps_keep_their_independent_shapes() {
+        for start in [LineCap::Round, LineCap::None, LineCap::Square] {
+            for end in [LineCap::Round, LineCap::None, LineCap::Square] {
+                let mut style = line_style();
+                style.start_cap = start;
+                style.end_cap = end;
+                let meshes = stroke(style, &[(0, 0), (200, 0)]);
+                for (cap, x) in [(start, -40.0), (end, 240.0)] {
+                    assert_eq!(covers(&meshes, [x, 0.0]), cap != LineCap::None, "{cap:?}");
+                    assert_eq!(
+                        covers(&meshes, [x, 40.0]),
+                        cap == LineCap::Square,
+                        "{cap:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stroke_joins_round_bevel_and_clip_miters() {
+        for (join, diagonal, corner) in [
+            (LineJoin::Round, true, false),
+            (LineJoin::Bevel, false, false),
+            (LineJoin::Miter(4.0), true, true),
+            (LineJoin::Miter(1.0), true, true),
+            (LineJoin::Miter(0.5), false, false),
+        ] {
+            let mut style = line_style();
+            style.join = join;
+            let meshes = stroke(style, &[(0, 200), (0, 0), (200, 0)]);
+            assert_eq!(covers(&meshes, [-30.0, -30.0]), diagonal, "{join:?}");
+            assert_eq!(covers(&meshes, [-45.0, -45.0]), corner, "{join:?}");
+        }
+        // A sharp turn extends the miter far enough to reach its authored limit.
+        let mut tips = Vec::new();
+        for limit in [1.0, 4.0] {
+            let mut style = line_style();
+            style.join = LineJoin::Miter(limit);
+            let meshes = stroke(style, &[(0, 2000), (0, 0), (500, 2000)]);
+            let tip = meshes
+                .iter()
+                .flat_map(|m| &m.vertices)
+                .map(|v| v.pos[1])
+                .fold(f32::INFINITY, f32::min);
+            tips.push(tip);
+        }
+        assert!(tips[1] < tips[0] - 50.0, "miter tips {tips:?}");
+    }
+
+    #[test]
+    fn stroke_no_close_leaves_meeting_endpoints_capped() {
+        for no_close in [false, true] {
+            let mut style = line_style();
+            style.join = LineJoin::Miter(4.0);
+            style.no_close = no_close;
+            let meshes = stroke(style, &[(0, 0), (200, 0), (200, 200), (0, 200), (0, 0)]);
+            assert_eq!(covers(&meshes, [-30.0, -30.0]), !no_close);
+        }
+    }
 
     #[test]
     fn square_fills() {
