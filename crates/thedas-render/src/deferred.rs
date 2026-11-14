@@ -60,8 +60,8 @@ impl RenderPath {
 }
 
 /// The most lights one frame lights with (the nearest, past it): the shader's uniform
-/// array, 16 KiB, which every backend can bind.
-const MAX_LIGHTS: usize = 256;
+/// array, at most 16 KiB, which every backend can bind.
+const MAX_LIGHTS: usize = 192;
 /// Dynamic uniform offsets must be multiples of this on every backend.
 const DRAW_STRIDE: usize = 256;
 /// Room indices the lights' room sets can name; rooms past it are lit by every light.
@@ -121,6 +121,8 @@ struct GpuLight {
     position: [f32; 4],
     colour: [f32; 4],
     rooms: [u32; 8],
+    /// x: its shadow slot ([`crate::deferred_shadow`]), −1 for none.
+    shadow: [f32; 4],
 }
 
 /// One draw the deferred pass takes from the faithful one.
@@ -134,6 +136,8 @@ struct PlanDraw {
     /// Its textures ([`DeferredPass::groups`]).
     group: usize,
     cull: Option<wgpu::Face>,
+    /// Its world bounding sphere as placed, for picking shadow casters.
+    sphere: (Vec3, f32),
 }
 
 /// The deferred pass of one renderer (the level's own): what it draws, worked out when the
@@ -148,12 +152,12 @@ pub(crate) struct DeferredPass {
     /// The index each room id has in the lights' room sets (1 on; 0 is "no room").
     rooms: HashMap<i64, u32>,
     light_rooms: HashMap<i64, Vec<i64>>,
-    /// The rooms' boxes ([`AreaScene::room_boxes`]), to place a light of no room.
-    room_boxes: Vec<(i64, Vec3, Vec3)>,
     gpu: Option<Gpu>,
     /// Lights only this pass draws, set each frame ([`DeferredPass::set_effect_lights`]):
-    /// the glowing emitters', the level's and its objects'.
+    /// the glowing emitters of the renderers drawn over the level's.
     effect_lights: Vec<SceneLight>,
+    /// The lights its own renderer's glowing emitters give, set each frame.
+    own_lights: Vec<SceneLight>,
     /// The GPU refused the pass: the level stays faithful.
     refused: bool,
 }
@@ -174,6 +178,9 @@ struct Gpu {
     material_groups: Vec<wgpu::BindGroup>,
     lighting_buffer: wgpu::Buffer,
     light_buffer: wgpu::Buffer,
+    /// The shadowed lights' maps, and their faces' view-projections for the lighting.
+    shadows: crate::deferred_shadow::ShadowPool,
+    faces_buffer: wgpu::Buffer,
     lighting_group: wgpu::BindGroup,
     targets_layout: wgpu::BindGroupLayout,
     targets: Option<Targets>,
@@ -331,6 +338,7 @@ impl DeferredPass {
                 mesh: d.mesh,
                 group,
                 cull: cull_of(program.pass.cull),
+                sphere: item.sphere,
             });
             data.push(DrawData {
                 lightmap: item.lightmap.as_ref().map_or([0.0, 0.0, 1.0, 1.0], |l| {
@@ -352,9 +360,9 @@ impl DeferredPass {
             takes,
             rooms,
             light_rooms: scene.light_rooms.clone(),
-            room_boxes: scene.room_boxes.clone(),
             gpu: None,
             effect_lights: Vec::new(),
+            own_lights: Vec::new(),
             refused: false,
         })
     }
@@ -388,6 +396,11 @@ impl DeferredPass {
             });
         }
         self.effect_lights = lights;
+    }
+
+    /// Sets the lights its own renderer's glowing emitters give this frame.
+    pub(crate) fn set_own_lights(&mut self, lights: Vec<SceneLight>) {
+        self.own_lights = lights;
     }
 
     /// Whether the GPU refused the pass.
@@ -469,7 +482,11 @@ impl DeferredPass {
         });
         let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("deferred lighting"),
-            entries: &[buffer_entry(0, f, uniform), buffer_entry(1, f, uniform)],
+            entries: &[
+                buffer_entry(0, f, uniform),
+                buffer_entry(1, f, uniform),
+                buffer_entry(2, f, uniform),
+            ],
         });
         let targets_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("deferred g-buffer"),
@@ -479,6 +496,16 @@ impl DeferredPass {
                 tex(2, false),
                 tex(3, false),
                 tex(4, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: f,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let gbuffer_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -717,6 +744,12 @@ impl DeferredPass {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let faces_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("deferred shadow faces"),
+            size: (64 * 6 * crate::deferred_shadow::SLOTS) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let lighting_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("deferred lighting"),
             layout: &lighting_layout,
@@ -728,6 +761,10 @@ impl DeferredPass {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: light_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: faces_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -747,6 +784,8 @@ impl DeferredPass {
             material_groups,
             lighting_buffer,
             light_buffer,
+            shadows: crate::deferred_shadow::ShadowPool::new(device),
+            faces_buffer,
             lighting_group,
             targets_layout,
             targets: None,
@@ -785,7 +824,25 @@ impl DeferredPass {
                 return false;
             }
         }
-        let lights = self.lights(camera, width, height, d3d);
+        let mut lights = self.lights(camera, width, height, d3d);
+        // Keep a capture/benchmark switch for comparing only the shadow contribution.
+        let shadowed = if std::env::var("THEDAS_DEFERRED_POINT_SHADOWS").as_deref() == Ok("0") {
+            Vec::new()
+        } else {
+            shadow_slots(&mut lights, camera.position)
+        };
+        if std::env::var_os("THEDAS_DEFERRED_LOG_LIGHTS").is_some() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                log::info!(
+                    "deferred frame: {} lights in view ({} from emitters here, {} given), shadowed {:?}",
+                    lights.len(),
+                    self.own_lights.len(),
+                    self.effect_lights.len(),
+                    shadowed
+                );
+            });
+        }
         let Some(gpu) = self.gpu.as_mut() else {
             return false;
         };
@@ -814,16 +871,22 @@ impl DeferredPass {
                     })
                     .create_view(&wgpu::TextureViewDescriptor::default())
             });
-            // Targets 0-3 at bindings 0-3, the depth at 4.
-            let entries: Vec<wgpu::BindGroupEntry> =
-                [&views[0], &views[1], &views[2], &views[3], depth]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, v)| wgpu::BindGroupEntry {
-                        binding: i as u32,
-                        resource: wgpu::BindingResource::TextureView(v),
-                    })
-                    .collect();
+            // Targets 0-3 at bindings 0-3, the depth at 4, the shadow maps at 5.
+            let entries: Vec<wgpu::BindGroupEntry> = [
+                &views[0],
+                &views[1],
+                &views[2],
+                &views[3],
+                depth,
+                &gpu.shadows.view,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: wgpu::BindingResource::TextureView(v),
+            })
+            .collect();
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("deferred g-buffer"),
                 layout: &gpu.targets_layout,
@@ -903,6 +966,28 @@ impl DeferredPass {
         };
         ctx.queue
             .write_buffer(&gpu.lighting_buffer, 0, bytemuck::bytes_of(&lighting));
+
+        // The shadowed lights' maps, before anything reads them.
+        let mut faces = Vec::with_capacity(64 * 6 * shadowed.len());
+        for &(p, r) in &shadowed {
+            for m in crate::deferred_shadow::faces(p, r) {
+                faces.extend_from_slice(bytemuck::bytes_of(&m.to_cols_array_2d()));
+            }
+        }
+        if !faces.is_empty() {
+            ctx.queue.write_buffer(&gpu.faces_buffer, 0, &faces);
+            let casters: Vec<crate::deferred_shadow::Caster> = self
+                .draws
+                .iter()
+                .map(|d| crate::deferred_shadow::Caster {
+                    mesh: d.mesh,
+                    world: d3d.world(d.draw).unwrap_or(Mat4::IDENTITY),
+                    sphere: d.sphere,
+                })
+                .collect();
+            gpu.shadows
+                .encode(device, &ctx.queue, encoder, &shadowed, &casters, meshes);
+        }
 
         let Some(targets) = gpu.targets.as_ref() else {
             return false;
@@ -998,6 +1083,7 @@ impl DeferredPass {
             .lights()
             .iter()
             .chain(&self.effect_lights)
+            .chain(&self.own_lights)
             .filter_map(|l| self.light(l, &planes, camera.position))
             .collect();
         if out.len() > MAX_LIGHTS {
@@ -1039,11 +1125,11 @@ impl DeferredPass {
             GpuLight {
                 position: position.extend(*radius).to_array(),
                 colour: colour.extend(if *is_static { 1.0 } else { 0.0 }).to_array(),
-                // A light of no room (an object's, an emitter's) reaches from the room it is
-                // in, when it is in one.
-                rooms: self.room_bits(
-                    room.or_else(|| crate::scene::room_id_at(&self.room_boxes, *position)),
-                ),
+                shadow: [-1.0, 0.0, 0.0, 0.0],
+                // A light of no room (an object's, an emitter's) reaches every room: placed by
+                // the rooms' boxes it missed the floors around Ishal's torches, whose boxes
+                // overlap; the nearest of them get shadow maps instead.
+                rooms: self.room_bits(*room),
             },
         ))
     }
@@ -1100,12 +1186,39 @@ fn draw_all(
     }
 }
 
+/// Gives the shadow slots to the dynamic lights (those the lightmaps' visibility does not
+/// already mask: the emitters' and other moving lights) that matter most from `eye`: their
+/// brightness times reach over their distance. Returns each slot's light (position,
+/// radius).
+fn shadow_slots(lights: &mut [GpuLight], eye: Vec3) -> Vec<(Vec3, f32)> {
+    let score = |l: &GpuLight| {
+        let p = Vec3::from_slice(&l.position[..3]);
+        let bright = l.colour[0].max(l.colour[1]).max(l.colour[2]);
+        bright * l.position[3] / (1.0 + p.distance(eye))
+    };
+    let mut order: Vec<usize> = (0..lights.len())
+        .filter(|&i| lights[i].colour[3] < 0.5 && lights[i].position[3] > 0.0)
+        .collect();
+    order.sort_by(|&a, &b| score(&lights[b]).total_cmp(&score(&lights[a])));
+    order.truncate(crate::deferred_shadow::SLOTS);
+    order
+        .into_iter()
+        .enumerate()
+        .map(|(slot, i)| {
+            lights[i].shadow[0] = slot as f32;
+            let l = &lights[i];
+            (Vec3::from_slice(&l.position[..3]), l.position[3])
+        })
+        .collect()
+}
+
 /// A debug view in place of the lit frame, from `THEDAS_DEFERRED_VIEW`: `albedo`,
 /// `normal`, `lightmap` (its rgb), `visibility` (its alpha), `diffuse` (the light arriving,
 /// halved), `specular`, `no-rooms` (lit, every light reaching every room), `flat` (lit,
 /// the normal maps left out) or `wrap` (lit with Static1's falloff as it is, which past a
 /// light's radius rises again to full at twice it: most of the faithful Cousland floor's
-/// brightness, per pixel a hard-edged ring). Read once.
+/// brightness, per pixel a hard-edged ring) or `shadows` (red: how much of the first
+/// shadowed light in reach gets through, green: its falloff). Read once.
 fn debug_view() -> u32 {
     static VIEW: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *VIEW.get_or_init(|| {
@@ -1120,6 +1233,7 @@ fn debug_view() -> u32 {
             "no-rooms" => 7,
             "flat" => 8,
             "wrap" => 9,
+            "shadows" => 10,
             _ => 0,
         }
     })
@@ -1258,6 +1372,41 @@ mod tests {
         // Hidden (a cut-away model's), it gives none.
         e.opacity = 0.0;
         assert_eq!(emitter_light(&e), None);
+    }
+
+    #[test]
+    fn shadow_pool_prioritizes_dynamic_lights_and_caps_the_slots() {
+        let light = |distance: f32, brightness: f32, is_static: bool| GpuLight {
+            position: [distance, 0.0, 0.0, 5.0],
+            colour: [
+                brightness,
+                brightness,
+                brightness,
+                if is_static { 1.0 } else { 0.0 },
+            ],
+            rooms: [u32::MAX; 8],
+            shadow: [-1.0, 0.0, 0.0, 0.0],
+        };
+        let mut lights = vec![
+            light(1.0, 100.0, true),
+            light(1.0, 1.0, false),
+            light(2.0, 1.0, false),
+            light(3.0, 1.0, false),
+            light(4.0, 1.0, false),
+            light(100.0, 1.0, false),
+        ];
+        let slots = shadow_slots(&mut lights, Vec3::ZERO);
+        assert_eq!(slots.len(), crate::deferred_shadow::SLOTS);
+        assert_eq!(
+            lights[0].shadow[0], -1.0,
+            "baked lights keep baked visibility"
+        );
+        assert_eq!(lights[1].shadow[0], 0.0, "nearest dynamic light wins");
+        assert_eq!(lights[5].shadow[0], -1.0, "the pool has a fixed budget");
+        for (slot, (position, radius)) in slots.into_iter().enumerate() {
+            assert_eq!(position.x, (slot + 1) as f32);
+            assert_eq!(radius, 5.0);
+        }
     }
 
     #[test]

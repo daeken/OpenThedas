@@ -1777,7 +1777,9 @@ impl LauncherApp {
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let Some(g) = self.gfx.as_mut() else { return };
         self.ui.poll_search();
-        self.ui.mod_report.poll();
+        self.ui
+            .mod_report
+            .poll(self.ui.cfg.selected_install().map(|i| &i.root));
         if let Some(w) = self.ui.dl.poll() {
             self.ui.download_wants(w);
         }

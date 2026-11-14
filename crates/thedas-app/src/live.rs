@@ -2357,8 +2357,9 @@ impl Live {
     }
 
     /// Sets how the level is drawn, and for the deferred path the lights the frame's glowing
-    /// particles give (the level's, its objects' and the visual effects'), which light the
-    /// level's geometry (ours: the original's particles light nothing).
+    /// particles give (its objects' and the visual effects'; the level's renderer adds its
+    /// own), which light the level's geometry (ours: the original's particles light
+    /// nothing).
     fn give_effect_lights(&mut self) {
         let path = self.render_path;
         if let Some(l) = self.level.as_mut() {
@@ -2368,10 +2369,9 @@ impl Live {
             return;
         }
         let lights: Vec<_> = self
-            .level
+            .objects
             .iter()
-            .map(|l| &l.renderer)
-            .chain(self.objects.iter().map(|o| &o.renderer))
+            .map(|o| &o.renderer)
             .chain(self.effects.iter().map(|e| &e.renderer))
             .flat_map(|r| r.emitter_lights())
             .collect();
