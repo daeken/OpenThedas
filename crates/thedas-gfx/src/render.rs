@@ -220,8 +220,9 @@ pub struct Renderer {
     targets: Option<Targets>,
     /// Draws in the last frame.
     pub draws: usize,
-    /// Drawing a filter's copies (filters inside are not applied again).
-    in_filter: bool,
+    filters: crate::filters::Filters,
+    filter_stack: Vec<DisplayId>,
+    masking: bool,
 }
 
 struct Targets {
@@ -312,7 +313,9 @@ impl Renderer {
             bitmaps: HashMap::new(),
             targets: None,
             draws: 0,
-            in_filter: false,
+            filters: crate::filters::Filters::new(device, format),
+            filter_stack: Vec::new(),
+            masking: false,
         }
     }
 
@@ -390,6 +393,10 @@ impl Renderer {
         if self.targets.as_ref().is_some_and(|t| t.size == size) {
             return;
         }
+        self.targets = Some(self.create_targets(size));
+    }
+
+    fn create_targets(&self, size: (u32, u32)) -> Targets {
         let tex = |format, samples, usage| {
             self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("gfx target"),
@@ -421,12 +428,12 @@ impl Renderer {
             wgpu::TextureUsages::RENDER_ATTACHMENT,
         )
         .create_view(&Default::default());
-        self.targets = Some(Targets {
+        Targets {
             size,
             output,
             msaa,
             stencil,
-        });
+        }
     }
 
     /// The texture [`Renderer::render`] draws into.
@@ -480,6 +487,18 @@ impl Renderer {
             &mut b,
         );
         self.draws = b.ops.len();
+        if let Some(targets) = self.targets.take() {
+            self.draw_build(&b, &targets);
+            self.targets = Some(targets);
+        }
+        // Drop text meshes of fields that are gone.
+        self.texts
+            .retain(|d, _| player.vm.display.get(*d).is_some());
+        self.drawings
+            .retain(|d, _| player.vm.display.get(*d).is_some());
+    }
+
+    fn draw_build(&mut self, b: &Build, t: &Targets) {
         // Upload the uniforms.
         let need = (b.uniforms.len().max(1) as u64) * UNIFORM_STRIDE;
         if self.uniforms.as_ref().is_none_or(|u| u.2 < need) {
@@ -521,7 +540,6 @@ impl Renderer {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gfx") });
         {
-            let Some(t) = &self.targets else { return };
             let out_view = t.output.create_view(&Default::default());
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("gfx"),
@@ -564,11 +582,6 @@ impl Renderer {
             }
         }
         self.queue.submit(Some(encoder.finish()));
-        // Drop text meshes of fields that are gone.
-        self.texts
-            .retain(|d, _| player.vm.display.get(*d).is_some());
-        self.drawings
-            .retain(|d, _| player.vm.display.get(*d).is_some());
     }
 
     fn upload(
@@ -877,42 +890,86 @@ impl Renderer {
         if !o.visible {
             return;
         }
-        // Glow and drop shadow filters: the object drawn again in the filter's colour
-        // around (or offset from) itself, before it. Provisional: an approximation of the
-        // blur by copies on a ring, not Scaleform's filter.
-        if !o.filters.is_empty() && !self.in_filter {
+        if !self.masking
+            && !self.filter_stack.contains(&d)
+            && o.filters.iter().any(crate::filters::Filters::supported)
+        {
             let filters = o.filters.clone();
-            let k = view.k * 20.0;
-            for f in &filters {
-                let copies = filter_copies(f);
-                if copies.is_empty() {
-                    continue;
-                }
-                self.in_filter = true;
-                for (dx, dy, tint) in copies {
-                    // Offsets are in screen pixels: undo the view's scale.
-                    let shift = Matrix::translate(dx * 20.0 / k, dy * 20.0 / k);
-                    self.walk(
-                        player,
-                        images,
-                        d,
-                        shift.mul(&parent),
-                        tint.concat(&parent_cx),
-                        parent_blend,
-                        view,
-                        stencil,
-                        b,
-                    );
-                }
-                self.in_filter = false;
+            let blend = if o.blend == BlendMode::Normal {
+                parent_blend
+            } else {
+                Blend::of(o.blend)
+            };
+            // Isolate just this object. Descendant filters still run, and the parent's
+            // stencil clips the final result, rather than clipping the blur's input.
+            self.filter_stack.push(d);
+            let mut source = Build {
+                ops: Vec::new(),
+                uniforms: Vec::new(),
+            };
+            self.walk(
+                player,
+                images,
+                d,
+                parent,
+                parent_cx,
+                Blend::Normal,
+                view,
+                0,
+                &mut source,
+            );
+            self.filter_stack.pop();
+            let targets = self.create_targets((view.w as u32, view.h as u32));
+            self.draw_build(&source, &targets);
+            let output = self.filters.apply(
+                &self.device,
+                &self.queue,
+                targets.output,
+                &filters,
+                view.k * 20.0,
+            );
+            let binding = Arc::new(texture_binding(
+                &self.device,
+                &self.texture_layout,
+                &output,
+                &self.clamp,
+            ));
+            let mesh = Mesh {
+                paint: Paint::Solid,
+                vertices: [
+                    (-1.0, 1.0, 0.0, 0.0),
+                    (1.0, 1.0, 1.0, 0.0),
+                    (1.0, -1.0, 1.0, 1.0),
+                    (-1.0, -1.0, 0.0, 1.0),
+                ]
+                .map(|(x, y, u, v)| Vertex {
+                    pos: [x, y],
+                    uv: [u, v],
+                    color: [255; 4],
+                })
+                .to_vec(),
+                indices: vec![0, 1, 2, 0, 2, 3],
+            };
+            if let Some(mesh) = self.upload(&mesh, Some(binding), 1.0, Matrix::IDENTITY) {
+                let u = b.uniforms.len() as u32;
+                b.uniforms.push(DrawU {
+                    m0: [1.0, 0.0, 0.0, 0.0],
+                    m1: [0.0, 1.0, 0.0, 0.0],
+                    mul: [1.0; 4],
+                    ..Default::default()
+                });
+                b.push(&mesh, u, blend, stencil);
             }
+            return;
         }
         let Some(o) = player.vm.display.get(d) else {
             return;
         };
         let world = parent.mul(&o.matrix);
         let cx = parent_cx.concat(&o.color);
-        let blend = if o.blend == BlendMode::Normal {
+        let blend = if self.filter_stack.last() == Some(&d) {
+            Blend::Normal
+        } else if o.blend == BlendMode::Normal {
             parent_blend
         } else {
             Blend::of(o.blend)
@@ -1005,7 +1062,9 @@ impl Renderer {
             }
             if let Some((noscale, remap)) = &grid {
                 let shape = player.vm.display.get(c).and_then(|co| match &co.kind {
-                    Kind::Shape(_, id) if co.visible => Some((*id, co.matrix, co.color)),
+                    Kind::Shape(_, id) if co.visible && co.filters.is_empty() => {
+                        Some((*id, co.matrix, co.color))
+                    }
                     _ => None,
                 });
                 if let Some((id, place, ccx)) = shape {
@@ -1066,6 +1125,8 @@ impl Renderer {
         if let Some(o) = player.vm.display.get_mut(m) {
             o.visible = true;
         }
+        let was_masking = self.masking;
+        self.masking = true;
         self.walk(
             player,
             images,
@@ -1077,6 +1138,7 @@ impl Renderer {
             0,
             &mut tmp,
         );
+        self.masking = was_masking;
         if let (Some(v), Some(o)) = (vis, player.vm.display.get_mut(m)) {
             o.visible = v;
         }
@@ -1187,62 +1249,6 @@ impl Renderer {
     /// Forgets cached drawings of `d` (the drawing API changed it).
     pub fn forget_drawing(&mut self, d: DisplayId) {
         self.drawings.remove(&d);
-    }
-}
-
-/// A filter as copies of the object: offset (screen pixels) and the colour transform each is
-/// drawn with.
-fn filter_copies(f: &crate::swf::Filter) -> Vec<(f32, f32, ColorTransform)> {
-    use crate::swf::Filter;
-    let tint = |c: &crate::swf::Color, alpha: f32| ColorTransform {
-        mul: [0.0, 0.0, 0.0, alpha],
-        add: [c.r as f32, c.g as f32, c.b as f32, 0.0],
-    };
-    let ring = |cx: f32, cy: f32, r: f32, n: usize| -> Vec<(f32, f32)> {
-        if r < 0.5 {
-            return vec![(cx, cy)];
-        }
-        (0..n)
-            .map(|i| {
-                let a = i as f32 / n as f32 * std::f32::consts::TAU;
-                (cx + a.cos() * r, cy + a.sin() * r)
-            })
-            .collect()
-    };
-    match f {
-        Filter::Glow {
-            color,
-            blur,
-            strength,
-            inner: false,
-            ..
-        } => {
-            let r = (blur.0 + blur.1) / 4.0;
-            let a = color.a as f32 / 255.0 * strength.min(2.0) * 0.3;
-            let mut pts = ring(0.0, 0.0, r, 12);
-            pts.extend(ring(0.0, 0.0, r * 0.5, 8));
-            pts.into_iter()
-                .map(|(x, y)| (x, y, tint(color, a)))
-                .collect()
-        }
-        Filter::DropShadow {
-            color,
-            blur,
-            angle,
-            distance,
-            strength,
-            inner: false,
-            ..
-        } => {
-            let (cx, cy) = (angle.cos() * distance, angle.sin() * distance);
-            let r = (blur.0 + blur.1) / 4.0;
-            let pts = ring(cx, cy, r, 8);
-            let a = color.a as f32 / 255.0 * strength.min(2.0) / (pts.len() as f32).sqrt();
-            pts.into_iter()
-                .map(|(x, y)| (x, y, tint(color, a)))
-                .collect()
-        }
-        _ => Vec::new(),
     }
 }
 
