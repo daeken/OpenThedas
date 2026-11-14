@@ -8,7 +8,44 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use thedas_ui::stage::{Stage, movie_names};
-use thedas_ui::{Gpu, Rgba};
+use thedas_ui::{Gpu, Rgba, UiValue};
+
+/// Optional reproducible setup, e.g. `call portraits.gfx _root.attachMovie
+/// PendingCommandText probe 500; set portraits.gfx _root.probe.TextField.text Attack`.
+fn setup(stage: &mut Stage) {
+    let Ok(steps) = std::env::var("SF_COMPARE_SETUP") else {
+        return;
+    };
+    let value = |s: &str| {
+        s.parse::<f64>()
+            .map(UiValue::Number)
+            .unwrap_or_else(|_| match s {
+                "true" => UiValue::Bool(true),
+                "false" => UiValue::Bool(false),
+                "null" => UiValue::Null,
+                _ => UiValue::String(s.into()),
+            })
+    };
+    for step in steps.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let words: Vec<&str> = step.split_whitespace().collect();
+        assert!(words.len() >= 4, "setup: {step}");
+        let movie = stage
+            .movies
+            .iter_mut()
+            .find(|m| m.name == words[1])
+            .expect("setup movie");
+        match words[0] {
+            "call" => {
+                movie.call(
+                    words[2],
+                    &words[3..].iter().map(|s| value(s)).collect::<Vec<_>>(),
+                );
+            }
+            "set" => movie.set(words[2], value(&words[3..].join(" "))),
+            _ => panic!("setup: {step}"),
+        }
+    }
+}
 
 fn gpu() -> Gpu {
     let instance =
@@ -51,6 +88,7 @@ fn run(
     for _ in 0..frames {
         stage.tick(1000.0 / 30.0);
     }
+    setup(&mut stage);
     let ticks = t1.elapsed();
     let mut base = Rgba {
         width: size.0,

@@ -220,6 +220,9 @@ pub struct Renderer {
     targets: Option<Targets>,
     /// Draws in the last frame.
     pub draws: usize,
+    filters: crate::filters::Filters,
+    filter_stack: Vec<DisplayId>,
+    masking: bool,
 }
 
 struct Targets {
@@ -310,6 +313,9 @@ impl Renderer {
             bitmaps: HashMap::new(),
             targets: None,
             draws: 0,
+            filters: crate::filters::Filters::new(device, format),
+            filter_stack: Vec::new(),
+            masking: false,
         }
     }
 
@@ -387,6 +393,10 @@ impl Renderer {
         if self.targets.as_ref().is_some_and(|t| t.size == size) {
             return;
         }
+        self.targets = Some(self.create_targets(size));
+    }
+
+    fn create_targets(&self, size: (u32, u32)) -> Targets {
         let tex = |format, samples, usage| {
             self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("gfx target"),
@@ -418,12 +428,12 @@ impl Renderer {
             wgpu::TextureUsages::RENDER_ATTACHMENT,
         )
         .create_view(&Default::default());
-        self.targets = Some(Targets {
+        Targets {
             size,
             output,
             msaa,
             stencil,
-        });
+        }
     }
 
     /// The texture [`Renderer::render`] draws into.
@@ -477,6 +487,18 @@ impl Renderer {
             &mut b,
         );
         self.draws = b.ops.len();
+        if let Some(targets) = self.targets.take() {
+            self.draw_build(&b, &targets);
+            self.targets = Some(targets);
+        }
+        // Drop text meshes of fields that are gone.
+        self.texts
+            .retain(|d, _| player.vm.display.get(*d).is_some());
+        self.drawings
+            .retain(|d, _| player.vm.display.get(*d).is_some());
+    }
+
+    fn draw_build(&mut self, b: &Build, t: &Targets) {
         // Upload the uniforms.
         let need = (b.uniforms.len().max(1) as u64) * UNIFORM_STRIDE;
         if self.uniforms.as_ref().is_none_or(|u| u.2 < need) {
@@ -518,7 +540,6 @@ impl Renderer {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gfx") });
         {
-            let Some(t) = &self.targets else { return };
             let out_view = t.output.create_view(&Default::default());
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("gfx"),
@@ -561,11 +582,6 @@ impl Renderer {
             }
         }
         self.queue.submit(Some(encoder.finish()));
-        // Drop text meshes of fields that are gone.
-        self.texts
-            .retain(|d, _| player.vm.display.get(*d).is_some());
-        self.drawings
-            .retain(|d, _| player.vm.display.get(*d).is_some());
     }
 
     fn upload(
@@ -874,9 +890,86 @@ impl Renderer {
         if !o.visible {
             return;
         }
+        if !self.masking
+            && !self.filter_stack.contains(&d)
+            && o.filters.iter().any(crate::filters::Filters::supported)
+        {
+            let filters = o.filters.clone();
+            let blend = if o.blend == BlendMode::Normal {
+                parent_blend
+            } else {
+                Blend::of(o.blend)
+            };
+            // Isolate just this object. Descendant filters still run, and the parent's
+            // stencil clips the final result, rather than clipping the blur's input.
+            self.filter_stack.push(d);
+            let mut source = Build {
+                ops: Vec::new(),
+                uniforms: Vec::new(),
+            };
+            self.walk(
+                player,
+                images,
+                d,
+                parent,
+                parent_cx,
+                Blend::Normal,
+                view,
+                0,
+                &mut source,
+            );
+            self.filter_stack.pop();
+            let targets = self.create_targets((view.w as u32, view.h as u32));
+            self.draw_build(&source, &targets);
+            let output = self.filters.apply(
+                &self.device,
+                &self.queue,
+                targets.output,
+                &filters,
+                view.k * 20.0,
+            );
+            let binding = Arc::new(texture_binding(
+                &self.device,
+                &self.texture_layout,
+                &output,
+                &self.clamp,
+            ));
+            let mesh = Mesh {
+                paint: Paint::Solid,
+                vertices: [
+                    (-1.0, 1.0, 0.0, 0.0),
+                    (1.0, 1.0, 1.0, 0.0),
+                    (1.0, -1.0, 1.0, 1.0),
+                    (-1.0, -1.0, 0.0, 1.0),
+                ]
+                .map(|(x, y, u, v)| Vertex {
+                    pos: [x, y],
+                    uv: [u, v],
+                    color: [255; 4],
+                })
+                .to_vec(),
+                indices: vec![0, 1, 2, 0, 2, 3],
+            };
+            if let Some(mesh) = self.upload(&mesh, Some(binding), 1.0, Matrix::IDENTITY) {
+                let u = b.uniforms.len() as u32;
+                b.uniforms.push(DrawU {
+                    m0: [1.0, 0.0, 0.0, 0.0],
+                    m1: [0.0, 1.0, 0.0, 0.0],
+                    mul: [1.0; 4],
+                    ..Default::default()
+                });
+                b.push(&mesh, u, blend, stencil);
+            }
+            return;
+        }
+        let Some(o) = player.vm.display.get(d) else {
+            return;
+        };
         let world = parent.mul(&o.matrix);
         let cx = parent_cx.concat(&o.color);
-        let blend = if o.blend == BlendMode::Normal {
+        let blend = if self.filter_stack.last() == Some(&d) {
+            Blend::Normal
+        } else if o.blend == BlendMode::Normal {
             parent_blend
         } else {
             Blend::of(o.blend)
@@ -969,7 +1062,9 @@ impl Renderer {
             }
             if let Some((noscale, remap)) = &grid {
                 let shape = player.vm.display.get(c).and_then(|co| match &co.kind {
-                    Kind::Shape(_, id) if co.visible => Some((*id, co.matrix, co.color)),
+                    Kind::Shape(_, id) if co.visible && co.filters.is_empty() => {
+                        Some((*id, co.matrix, co.color))
+                    }
                     _ => None,
                 });
                 if let Some((id, place, ccx)) = shape {
@@ -1030,6 +1125,8 @@ impl Renderer {
         if let Some(o) = player.vm.display.get_mut(m) {
             o.visible = true;
         }
+        let was_masking = self.masking;
+        self.masking = true;
         self.walk(
             player,
             images,
@@ -1041,6 +1138,7 @@ impl Renderer {
             0,
             &mut tmp,
         );
+        self.masking = was_masking;
         if let (Some(v), Some(o)) = (vis, player.vm.display.get_mut(m)) {
             o.visible = v;
         }
