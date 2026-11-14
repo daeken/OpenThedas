@@ -2261,10 +2261,17 @@ pub fn call(
                 arrived: false,
                 path: Vec::new(),
             };
+            // Only the first float is kept (a wait's seconds, a move's minimum range): a
+            // later one (CommandMoveToObject's fMaxRange) used to land there when the first
+            // was 0.
+            let mut first_float = true;
             for (p, v) in f.params.iter().zip(a) {
                 match (&p.ty, v) {
                     (Type::Object, Value::Object(o)) if c.target.is_none() => c.target = Some(*o),
-                    (Type::Float, Value::Float(x)) if c.seconds == 0.0 => c.seconds = *x,
+                    (Type::Float, Value::Float(x)) if first_float => {
+                        first_float = false;
+                        c.seconds = *x;
+                    }
                     (Type::Int, Value::Int(x)) => c.ints.push(*x),
                     (Type::String | Type::Resource, Value::String(s) | Value::Resource(s)) => {
                         c.strings.push(s.clone())
