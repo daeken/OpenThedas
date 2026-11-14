@@ -269,6 +269,8 @@ pub fn apply_all(sim: &mut Sim, messages: &[GameMessage]) -> Vec<(String, Vec<St
 
 /// inventory.gfx's category tab: the engine lists only that category's items.
 pub const SET_ITEM_FILTER: &str = "GUIInventory.SetItemListFilter";
+/// The store's category tabs (store.gfx), as the inventory's.
+pub const SET_STORE_FILTER: &str = "GUIStore.SetItemListFilter";
 
 /// A screen's inspect action (inventory.gfx's `ItemUtils.ExamineItem`): the item's token,
 /// which side to show on and whether to check the requirements.
@@ -364,6 +366,32 @@ pub fn present(shown: &mut Presentation, name: &str, args: &[String]) -> bool {
                 .and_then(|a| a.trim().parse::<f64>().ok())
                 .map_or(0, |v| v as i32);
             true
+        }
+        SET_STORE_FILTER => {
+            shown.store_filter = args
+                .first()
+                .and_then(|a| a.trim().parse::<f64>().ok())
+                .map_or(0, |v| v as i32);
+            true
+        }
+        // A trade at the store is noted for its buy-back tabs and left to the simulation.
+        thedas_sim::store::MSG_BUY | thedas_sim::store::MSG_SELL => {
+            if let Some(item) = args
+                .get(1)
+                .and_then(|a| a.trim().parse::<f64>().ok())
+                .filter(|v| *v > 0.0 && v.fract() == 0.0)
+            {
+                let t = &mut shown.store_traded;
+                let list = if name == thedas_sim::store::MSG_SELL {
+                    &mut t.sold
+                } else {
+                    &mut t.bought
+                };
+                if !list.contains(&(item as u32)) {
+                    list.push(item as u32);
+                }
+            }
+            false
         }
         _ => false,
     }
