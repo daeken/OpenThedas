@@ -324,8 +324,11 @@ pub struct Live {
     pub frame_size: (u32, u32),
     /// Where the mouse is in the frame (pixels), for the aiming reticle.
     pub cursor: (f64, f64),
+    /// Samples a pixel the world is drawn with (multisampling, the original's
+    /// `AntialiasingLevel`; 1: off). Taken when the level and its objects are next built.
+    pub antialiasing: u32,
     /// The aiming reticle's pass, for the format it was made for.
-    reticle_pass: Option<(wgpu::TextureFormat, crate::reticle::ReticlePass)>,
+    reticle_pass: Option<(wgpu::TextureFormat, u32, crate::reticle::ReticlePass)>,
     /// The load under way while [`Live::async_loads`] is set (see [`Loading`]).
     loading: Option<Loading>,
     /// A layout whose build failed: not tried again until the area changes.
@@ -422,6 +425,19 @@ enum Building {
     },
 }
 
+/// The samples a pixel new games draw with (the `--antialiasing` flag; see
+/// [`Live::antialiasing`]).
+pub static ANTIALIASING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// The most samples a pixel at or under `wanted` that the adapter supports for `format`.
+fn supported_samples(ctx: &GpuContext, format: wgpu::TextureFormat, wanted: u32) -> u32 {
+    thedas_render::msaa::supported_samples(&ctx.adapter, format)
+        .into_iter()
+        .filter(|&n| n <= wanted.max(1))
+        .max()
+        .unwrap_or(1)
+}
+
 /// What a build needs from [`Live`], to run on another thread.
 #[derive(Clone)]
 struct BuildSpec {
@@ -431,6 +447,8 @@ struct BuildSpec {
     frame_effects: bool,
     format: wgpu::TextureFormat,
     size: (u32, u32),
+    /// Samples a pixel (see [`Live::antialiasing`]).
+    samples: u32,
 }
 
 /// A handle on the same device and queue, for a worker thread.
@@ -485,6 +503,7 @@ fn build_level_with(
     cache: &mut RenderCache,
 ) -> Result<LiveLevel> {
     let started = std::time::Instant::now();
+    cache.samples = supported_samples(ctx, spec.format, spec.samples);
     let install = DaoInstall::open(&spec.install)?;
     let mut vfs = install.play_vfs(TextureQuality::High)?;
     install.mount_level(&mut vfs, layout)?;
@@ -521,6 +540,7 @@ fn build_objects_with(
     cache: &mut RenderCache,
 ) -> Result<(AreaScene, AreaRenderer)> {
     let started = std::time::Instant::now();
+    cache.samples = supported_samples(ctx, spec.format, spec.samples);
     let props: Vec<Prop> = models.iter().map(prop).collect();
     let scene =
         AreaScene::load_objects_cached(vfs, layout, &props, spec.detail, &mut cache.scenes)?;
@@ -700,6 +720,9 @@ impl Live {
             async_loads: false,
             frame_size: (1280, 720),
             cursor: (0.0, 0.0),
+            antialiasing: ANTIALIASING
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(1),
             reticle_pass: None,
             loading: None,
             failed_layout: None,
@@ -2352,7 +2375,8 @@ impl Live {
         self.apply_cutaway(ctx);
         let aim = self.reticle(camera, (width, height), self.cursor);
         let format = self.format.unwrap_or(thedas_render::gpu::CAPTURE_FORMAT);
-        let reticle = self.reticle_pass(&ctx.device, format);
+        let samples = self.level.as_ref().map_or(1, |l| l.renderer.samples());
+        let reticle = self.reticle_pass(&ctx.device, format, samples);
         let Some(level) = self.level.as_mut() else {
             return false;
         };
@@ -2370,23 +2394,31 @@ impl Live {
         level
             .renderer
             .render_main(ctx, encoder, target, width, height, camera);
+        // The rest goes over the level's frame: multisampled, its own targets (see
+        // `thedas_render::msaa`), resolved into `target` at the end.
+        let frame = level
+            .renderer
+            .frame_view(&ctx.device, target, width, height);
         // An aimed ability's reticle lies on the ground: under the creatures, as the rings.
-        reticle.draw(&ctx.device, encoder, target, (width, height), &aim);
+        reticle.draw(&ctx.device, encoder, &frame, (width, height), &aim);
         if let Some(r) = self.rings.as_mut() {
             let depth = level.renderer.depth(&ctx.device, width, height);
             r.renderer
-                .render_over(ctx, encoder, target, width, height, camera, &depth);
+                .render_over(ctx, encoder, &frame, width, height, camera, &depth);
         }
         if let Some(o) = self.objects.as_mut() {
             let depth = level.renderer.depth(&ctx.device, width, height);
             o.renderer
-                .render_over(ctx, encoder, target, width, height, camera, &depth);
+                .render_over(ctx, encoder, &frame, width, height, camera, &depth);
         }
         if let Some(e) = self.effects.as_mut() {
             let depth = level.renderer.depth(&ctx.device, width, height);
             e.renderer
-                .render_over(ctx, encoder, target, width, height, camera, &depth);
+                .render_over(ctx, encoder, &frame, width, height, camera, &depth);
         }
+        level
+            .renderer
+            .resolve(&ctx.device, encoder, target, width, height);
         true
     }
 
@@ -2476,7 +2508,8 @@ impl Live {
         self.apply_cutaway(ctx);
         let cut_effects = self.cut_effects();
         let aim = self.reticle(camera, (width, height), self.cursor);
-        let reticle = self.reticle_pass(&ctx.device, thedas_render::gpu::CAPTURE_FORMAT);
+        let samples = self.level.as_ref().map_or(1, |l| l.renderer.samples());
+        let reticle = self.reticle_pass(&ctx.device, thedas_render::gpu::CAPTURE_FORMAT, samples);
         let Some(level) = self.level.as_mut() else {
             return Ok(None);
         };
@@ -2504,12 +2537,13 @@ impl Live {
         &mut self,
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
+        samples: u32,
     ) -> crate::reticle::ReticlePass {
         match &self.reticle_pass {
-            Some((f, p)) if *f == format => p.clone(),
+            Some((f, n, p)) if *f == format && *n == samples => p.clone(),
             _ => {
-                let p = crate::reticle::ReticlePass::new(device, format);
-                self.reticle_pass = Some((format, p.clone()));
+                let p = crate::reticle::ReticlePass::new(device, format, samples);
+                self.reticle_pass = Some((format, samples, p.clone()));
                 p
             }
         }
@@ -2523,6 +2557,7 @@ impl Live {
             frame_effects: self.frame_effects,
             format,
             size: self.frame_size,
+            samples: self.antialiasing.max(1),
         }
     }
 

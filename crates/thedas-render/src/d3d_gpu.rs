@@ -102,15 +102,20 @@ struct Instancing {
 }
 
 /// Pipelines and vertex buffers kept between passes (see [`crate::gpu::RenderCache`]).
+type PipelineKey = (String, wgpu::TextureFormat, u32);
+
 #[derive(Default)]
 pub(crate) struct D3dCache {
     /// The constants layout every cached pipeline was made with.
     consts_layout: Option<wgpu::BindGroupLayout>,
     /// The same for programs with per-instance constants ([`D3dProgram::instanced`]).
     instanced_layout: Option<wgpu::BindGroupLayout>,
-    /// By program name and target format: the pipeline and its texture layout.
-    pipelines:
-        HashMap<(String, wgpu::TextureFormat), (wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
+    /// By program name, target format and sample count: the pipeline and its texture
+    /// layout.
+    pipelines: HashMap<PipelineKey, (wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
+    /// The samples a pixel the frame's pipelines are made for (see
+    /// [`crate::gpu::RenderCache::samples`]); 0 is taken as 1.
+    pub(crate) samples: u32,
     /// By mesh key and vertex input signature.
     vertices: HashMap<(String, String), wgpu::Buffer>,
 }
@@ -171,6 +176,8 @@ pub(crate) struct D3dPass {
     layouts: Vec<wgpu::BindGroupLayout>,
     fade_consts: wgpu::BindGroupLayout,
     color_format: wgpu::TextureFormat,
+    /// The samples a pixel of the frame it draws into (see [`D3dCache::samples`]).
+    samples: u32,
     /// Per scene draw, the opacity its object is drawn at (1: as its material says).
     opacity: Vec<f32>,
     pub draws: Vec<D3dDraw>,
@@ -1249,8 +1256,17 @@ fn create_pipeline(
     consts: &wgpu::BindGroupLayout,
     textures: &wgpu::BindGroupLayout,
     color_format: wgpu::TextureFormat,
+    samples: u32,
 ) -> wgpu::RenderPipeline {
-    create_pipeline_faded(device, program, consts, textures, color_format, false)
+    create_pipeline_faded(
+        device,
+        program,
+        consts,
+        textures,
+        color_format,
+        false,
+        samples,
+    )
 }
 
 /// [`create_pipeline`]; `faded` blends an opaque pass by its output alpha
@@ -1262,6 +1278,7 @@ fn create_pipeline_faded(
     textures: &wgpu::BindGroupLayout,
     color_format: wgpu::TextureFormat,
     faded: bool,
+    samples: u32,
 ) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(&program.name),
@@ -1363,7 +1380,10 @@ fn create_pipeline_faded(
                 wgpu::DepthBiasState::default()
             },
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: samples.max(1),
+            ..Default::default()
+        },
         fragment: Some(wgpu::FragmentState {
             module: &ps,
             entry_point: Some(translate::ENTRY_POINT),
@@ -1529,6 +1549,7 @@ impl D3dPass {
         color_format: wgpu::TextureFormat,
     ) -> Self {
         let device = &ctx.device;
+        let samples = cache.samples.max(1);
         let consts_layout = cache
             .consts_layout
             .get_or_insert_with(|| const_layout(device))
@@ -1567,7 +1588,7 @@ impl D3dPass {
                 let pi = *by_name.entry(program.name.clone()).or_insert_with(|| {
                     let (pipeline, tl) = cache
                         .pipelines
-                        .entry((program.name.clone(), color_format))
+                        .entry((program.name.clone(), color_format, samples))
                         .or_insert_with(|| {
                             let tl = texture_layout(device, program);
                             let cl = if program.instanced {
@@ -1575,7 +1596,8 @@ impl D3dPass {
                             } else {
                                 &consts_layout
                             };
-                            let pipeline = create_pipeline(device, program, cl, &tl, color_format);
+                            let pipeline =
+                                create_pipeline(device, program, cl, &tl, color_format, samples);
                             (pipeline, tl)
                         })
                         .clone();
@@ -1799,6 +1821,7 @@ impl D3dPass {
                             &consts_layout,
                             &empty,
                             SHADOW_FORMAT,
+                            1,
                         ));
                         caster_programs_used.push(program.clone());
                         caster_pipelines.len() - 1
@@ -1859,19 +1882,25 @@ impl D3dPass {
                 continue;
             };
             // The distortion programs draw into the mask.
-            let format = if is_distortion(program) {
-                crate::distortion::MASK_FORMAT
+            let (format, particle_samples) = if is_distortion(program) {
+                (crate::distortion::MASK_FORMAT, 1)
             } else {
-                color_format
+                (color_format, samples)
             };
             let pi = *by_name.entry(program.name.clone()).or_insert_with(|| {
                 let (pipeline, tl) = cache
                     .pipelines
-                    .entry((program.name.clone(), format))
+                    .entry((program.name.clone(), format, particle_samples))
                     .or_insert_with(|| {
                         let tl = texture_layout(device, program);
-                        let pipeline =
-                            create_pipeline(device, program, &consts_layout, &tl, format);
+                        let pipeline = create_pipeline(
+                            device,
+                            program,
+                            &consts_layout,
+                            &tl,
+                            format,
+                            particle_samples,
+                        );
                         (pipeline, tl)
                     })
                     .clone();
@@ -1975,6 +2004,7 @@ impl D3dPass {
             layouts,
             fade_consts: consts_layout,
             color_format,
+            samples,
             opacity: vec![1.0; scene.draws.len()],
             draws,
             buffer,
@@ -2317,6 +2347,7 @@ impl D3dPass {
                     &self.layouts[pi],
                     self.color_format,
                     true,
+                    self.samples,
                 ));
             }
         }
