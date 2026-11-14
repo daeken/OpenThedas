@@ -1226,6 +1226,13 @@ impl AreaRenderer {
         }
     }
 
+    /// Per-frame benchmark override; `None` restores the configured reflection policy.
+    pub fn set_deferred_fused_reflections(&mut self, enabled: Option<bool>) {
+        if let Some(d) = &mut self.deferred {
+            d.set_fused_reflections(enabled);
+        }
+    }
+
     /// Grades the frame as area `grade` says: its colour curve and `da_hsvmatrix` values
     /// (DAOrigins.exe swaps them when an area becomes active, 0x67b1b0).
     pub fn set_area_grade(&mut self, ctx: &GpuContext, vfs: &Vfs, grade: &crate::post::AreaGrade) {
@@ -1574,7 +1581,7 @@ impl AreaRenderer {
             wgpu::TextureUsages::COPY_SRC
         };
         if self.deferred_frame
-            && std::env::var("THEDAS_DEFERRED_GROUND_MASK").as_deref() != Ok("0")
+            && crate::config::CONFIG.ground_mask
             && frame.texture().usage().contains(usage)
             && let Some(material) = material
         {
@@ -1818,9 +1825,7 @@ impl AreaRenderer {
                 )
             });
         drop(contributors);
-        let late = deferred
-            && !objects.is_empty()
-            && std::env::var("THEDAS_DEFERRED_LATE_TRANSPARENCY").as_deref() != Ok("0");
+        let late = deferred && !objects.is_empty() && crate::config::CONFIG.late_transparency;
         if over.is_none() {
             self.late_transparency = late;
         }
