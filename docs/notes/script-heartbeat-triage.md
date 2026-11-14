@@ -67,5 +67,11 @@ The ordinary regressions also cover strict equality, disabled/nonfinite
 intervals, stopped/inactive/parked/dead creatures, legacy pending events,
 snapshot continuation, invalid types and DA2 controls.
 
-Evidence is private under `codex-mods-target/gaps/scr068-heartbeat-scheduling/`;
-the exact main binaries are under `gaps/main-9d53c12f/bin/`.
+A fresh full triage after merging interface PRs #851/#859 uses exact main
+`0b42da74`. All 35 main saves and all 35 candidate saves reproduce their
+earlier counterparts exactly. The same classifications and controls apply.
+Final workspace checks pass 1,164 tests, zero failures and 16 ignored.
+
+Evidence is private under `codex-mods-target/gaps/scr068-heartbeat-scheduling/`
+and `gaps/scr068-heartbeat-scheduling-after859/`; the respective exact main
+binaries are under `gaps/main-9d53c12f/bin/` and `gaps/main-0b42da74/bin/`.
