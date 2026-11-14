@@ -30,7 +30,13 @@ const ZIPPED: &[&str] = &[
     "trace.json",
     "save_now.json",
     "save_before.json",
+    "journal_checkpoint.json",
+    "journal.jsonl",
 ];
+
+/// The journal's files (the game since its last checkpoint, input by input): left out
+/// when the report would be over the limit with them.
+const JOURNAL: &[&str] = &["journal_checkpoint.json", "journal.jsonl"];
 
 /// Set when the game is driven by a client or a test (`--control`, a hidden window): then
 /// nothing is sent or fetched (reports, verdicts, the update check), so a test under a
@@ -131,26 +137,75 @@ pub fn send(dir: &Path, url: &str) -> Result<String> {
         files.push((name.to_string(), redact(bytes, home.as_deref())));
     }
     let id = info["id"].as_str().unwrap_or("report").to_string();
-    let zip = zip(&files)?;
-    let mut shot = std::fs::read(dir.join("screenshot.png")).ok();
-    if let Some(png) = &shot {
-        if zip.len() + png.len() > MAX_UPLOAD {
-            shot = half_size(png)
-                .ok()
-                .filter(|p| zip.len() + p.len() <= MAX_UPLOAD);
-        }
-    }
-    if zip.len() > MAX_UPLOAD {
-        bail!(
-            "the report is {} bytes zipped, over Discord's limit",
-            zip.len()
-        );
-    }
+    // The marked copy, when the player marked spots: it shows what they pointed at.
+    let shot = std::fs::read(dir.join("screenshot_marked.png"))
+        .or_else(|_| std::fs::read(dir.join("screenshot.png")))
+        .ok();
+    let packed = pack(files, shot, MAX_UPLOAD, half_size, |left_out| {
+        info["journal_left_out"] = json!(left_out);
+        let bytes = serde_json::to_vec_pretty(&info).unwrap_or_default();
+        // The report's folder says so too.
+        let _ = std::fs::write(dir.join("report.json"), &bytes);
+        redact(bytes, home.as_deref())
+    })?;
+    let (zip, shot) = (packed.zip, packed.shot);
     let mut parts = vec![(format!("{id}.zip"), "application/zip", zip)];
     if let Some(png) = shot {
         parts.push(("screenshot.png".to_string(), "image/png", png));
     }
     post(url, &message, &parts)
+}
+
+/// A report packed for sending: the zip, and the screenshot beside it.
+struct Packed {
+    zip: Vec<u8>,
+    shot: Option<Vec<u8>>,
+}
+
+/// Packs a report's files and screenshot into at most `max` bytes. The journal is the only
+/// part ever left out, and only after a half-size screenshot was tried: the full report
+/// with the screenshot; else with the screenshot at half size; else without the journal
+/// (`left_out` is told why and gives report.json again, saying so), with the screenshot
+/// full, then half size, then none. An error when even that is over.
+fn pack(
+    mut files: Vec<(String, Vec<u8>)>,
+    shot: Option<Vec<u8>>,
+    max: usize,
+    half: impl Fn(&[u8]) -> Result<Vec<u8>>,
+    mut left_out: impl FnMut(String) -> Vec<u8>,
+) -> Result<Packed> {
+    let fits = |zip: &[u8], png: Option<&Vec<u8>>| zip.len() + png.map_or(0, |p| p.len()) <= max;
+    let halved = shot.as_deref().and_then(|p| half(p).ok());
+    let mut zip = zip(&files)?;
+    if fits(&zip, shot.as_ref()) {
+        return Ok(Packed { zip, shot });
+    }
+    if shot.is_some() && fits(&zip, halved.as_ref()) {
+        return Ok(Packed { zip, shot: halved });
+    }
+    if files.iter().any(|(n, _)| JOURNAL.contains(&n.as_str())) {
+        let why = format!(
+            "{} bytes zipped with the screenshot, over the {max} byte limit; it is in the report's folder",
+            zip.len() + shot.as_ref().map_or(0, |p| p.len())
+        );
+        files.retain(|(n, _)| !JOURNAL.contains(&n.as_str()));
+        let report = left_out(why);
+        if let Some(r) = files.iter_mut().find(|(n, _)| n == "report.json") {
+            r.1 = report;
+        }
+        zip = self::zip(&files)?;
+    }
+    if zip.len() > max {
+        bail!(
+            "the report is {} bytes zipped, over Discord's limit",
+            zip.len()
+        );
+    }
+    let shot = [shot, halved]
+        .into_iter()
+        .flatten()
+        .find(|p| fits(&zip, Some(p)));
+    Ok(Packed { zip, shot })
 }
 
 /// The message: the player's note first, then where and on what.
@@ -183,7 +238,26 @@ fn message(dir: &Path, info: &J) -> String {
     } else {
         note.to_string()
     };
-    format!("{note}\n\n{head}")
+    let spots: Vec<String> = info["regions"]
+        .as_array()
+        .map(|r| {
+            r.iter()
+                .map(|r| {
+                    let n = r["n"].as_u64().unwrap_or(0);
+                    let t: String = r["note"].as_str().unwrap_or("").chars().take(200).collect();
+                    format!("{n}. {t}")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = format!("{note}\n\n{head}");
+    if !spots.is_empty() {
+        let list = format!("\nMarked on the screenshot:\n{}", spots.join("\n"));
+        if out.chars().count() + list.chars().count() <= 1990 {
+            out.push_str(&list);
+        }
+    }
+    out
 }
 
 /// Posts `content` with `files` to the webhook (multipart, as Discord takes attachments);
@@ -281,24 +355,7 @@ fn replace_all(hay: &[u8], pat: &[u8], with: &[u8]) -> Vec<u8> {
 
 /// The screenshot at half size.
 fn half_size(png: &[u8]) -> Result<Vec<u8>> {
-    let decoder = png::Decoder::new(std::io::Cursor::new(png));
-    let mut reader = decoder.read_info()?;
-    let mut buf = vec![
-        0;
-        reader
-            .output_buffer_size()
-            .context("screenshot too large")?
-    ];
-    let frame = reader.next_frame(&mut buf)?;
-    if frame.color_type != png::ColorType::Rgba || frame.bit_depth != png::BitDepth::Eight {
-        bail!("the screenshot is not 8-bit RGBA");
-    }
-    buf.truncate(frame.buffer_size());
-    let img = thedas_ui::Rgba {
-        width: frame.width,
-        height: frame.height,
-        pixels: buf,
-    };
+    let img = crate::report::decode_png(png)?;
     thedas_ui::stage::encode_png(&crate::shrink(&img, 2)).context("encoding the screenshot")
 }
 
@@ -369,6 +426,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_the_journal_is_left_out_and_only_after_a_smaller_screenshot() {
+        let noise = |n: usize, seed: u64| {
+            let mut x = seed;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect::<Vec<u8>>()
+        };
+        let files = |journal: usize| {
+            vec![
+                ("report.json".to_string(), b"{}".to_vec()),
+                ("save_now.json".to_string(), noise(1000, 1)),
+                ("journal.jsonl".to_string(), noise(journal, 2)),
+            ]
+        };
+        let half = |p: &[u8]| Ok(p[..p.len() / 2].to_vec());
+        let shot = Some(noise(4000, 3));
+        let mut told = None;
+        // Everything fits.
+        let p = pack(files(1000), shot.clone(), 10_000, half, |_| unreachable!()).unwrap();
+        assert_eq!(p.shot.as_ref().map(|s| s.len()), Some(4000));
+        // A half-size screenshot keeps the journal in.
+        let p = pack(files(3000), shot.clone(), 7_500, half, |_| unreachable!()).unwrap();
+        assert_eq!(p.shot.as_ref().map(|s| s.len()), Some(2000));
+        // Too big even so: the journal goes, report.json says so, the screenshot stays.
+        let p = pack(files(8000), shot, 7_500, half, |why| {
+            told = Some(why);
+            b"{\"journal_left_out\":1}".to_vec()
+        })
+        .unwrap();
+        assert!(told.is_some());
+        assert_eq!(p.shot.as_ref().map(|s| s.len()), Some(4000));
+        assert!(p.zip.len() < 7_500);
+    }
+
+    #[test]
     fn home_paths_are_written_as_tilde() {
         let text = br#"{"dir":"/Users/sam/.openthedas/reports/x","win":"C:\\Users\\sam\\x"}"#;
         let out = redact(text.to_vec(), Some("/Users/sam"));
@@ -423,6 +520,11 @@ mod tests {
         modded["mods"] =
             json!([{ "layer": "mod:a", "files": 3 }, { "layer": "user:x", "files": 1 }]);
         assert!(message(&dir, &modded).contains("Test GPU, 2 mod layers"));
+        let mut marked = info.clone();
+        marked["regions"] = json!([{ "n": 1, "note": "fire missing here" }]);
+        assert!(
+            message(&dir, &marked).ends_with("Marked on the screenshot:\n1. fire missing here")
+        );
         std::fs::write(dir.join("note.txt"), "x".repeat(5000)).unwrap();
         assert!(message(&dir, &info).chars().count() <= 2000);
         let _ = std::fs::remove_dir_all(&dir);

@@ -223,6 +223,9 @@ pub struct AmbientTalk {
     pub(crate) used: Vec<usize>,
     /// How long its line still has, in milliseconds.
     pub(crate) left_ms: i64,
+    /// Begun on a line flagged ambient (rather than between creatures outside the party):
+    /// it ends at the first line that is not (see [`Sim::ambient_next`]).
+    pub(crate) flagged: bool,
 }
 
 /// How long a line said in passing lasts without a voice, in milliseconds (0xb15250, set
@@ -232,6 +235,27 @@ pub const AMBIENT_LINE_MS: u32 = 7000;
 /// 0x6fe728 when its voice starts): it ends when this is over and its voice has stopped
 /// (0x6ff713 to 0x6ff748).
 pub const AMBIENT_VOICED_MIN_MS: u32 = 2000;
+
+/// One line or reply of a conversation as its conditions stand now (see
+/// [`Sim::conversation_conditions`]).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct NodeCondition {
+    /// Its index in the conversation's line list.
+    pub node: usize,
+    /// A start of the conversation (one of its first lines).
+    pub start: bool,
+    /// A reply of the player's rather than a line.
+    pub reply: bool,
+    pub text: String,
+    /// Whether it could be used now: its condition passes and, if it shows once, it has
+    /// not been shown.
+    pub usable: bool,
+    /// The plot flags its condition read, in order.
+    pub reads: Vec<crate::plot::FlagRead>,
+    /// Plot flags its condition's scripts would set (a condition is not meant to change
+    /// anything, but scripts can). The report itself changes nothing: they are undone.
+    pub sets: Vec<crate::plot::FlagChange>,
+}
 
 /// An open conversation as presentation sees it: its dialog (resource name without
 /// `.dlg`), the node being shown (an index into the dialog's line list), its owner and the
@@ -501,6 +525,83 @@ impl Sim {
             .count() as u32
     }
 
+    /// Every line and reply of conversation `dialog` (empty: `owner`'s own) with the plot
+    /// flags its condition reads and whether it could be used now, as the conversation would
+    /// be opened by the hero with `owner`. The conditions run as they would when the
+    /// conversation is walked, then the world is put back as it was: what a condition
+    /// script would set is reported in `sets` and not kept (the world, the random numbers,
+    /// the conversations going on). Simulation state outside the world (`training_done`,
+    /// `following`, `next_follow_ms`) is not put back. `None` when there is no such
+    /// conversation.
+    pub fn conversation_conditions(
+        &mut self,
+        owner: ObjectId,
+        dialog: &str,
+    ) -> Option<Vec<NodeCondition>> {
+        let name = if dialog.is_empty() {
+            self.world.get(owner).and_then(|o| o.dialog.clone())?
+        } else {
+            dialog.trim_end_matches(".dlg").to_string()
+        };
+        let d = self
+            .vfs
+            .read(&format!("{}.dlg", name.to_ascii_lowercase()))
+            .ok()
+            .and_then(|(data, _)| Dlg::parse(&data, &name))?;
+        Some(self.dlg_conditions(owner, &d))
+    }
+
+    /// [`Sim::conversation_conditions`] for a conversation already read.
+    pub(crate) fn dlg_conditions(&mut self, owner: ObjectId, d: &Dlg) -> Vec<NodeCondition> {
+        let player = self.world.hero.unwrap_or(owner);
+        let c = Conversation {
+            dlg: d.clone(),
+            owner,
+            player,
+            line: None,
+            replies: Vec::new(),
+            ended: false,
+            shown: Vec::new(),
+            chain: Vec::new(),
+            cut_from: None,
+            cut_lines_left: 0,
+            staged: Vec::new(),
+            staged_at: None,
+            ambient_run: false,
+        };
+        // Conditions' scripts can set flags, draw random numbers and change objects: all of
+        // it is undone when the report is made.
+        let world = self.world.clone();
+        let talk = self.talk.clone();
+        let ambient = self.ambient.clone();
+        let ambient_before = self.dialog_ambient;
+        let mut out = Vec::new();
+        for (i, n) in d.nodes.iter().enumerate() {
+            self.plots.reads = Some(Vec::new());
+            self.plots.sets = Some(Vec::new());
+            let usable = self.usable(&c, i);
+            let reads = self.plots.reads.take().unwrap_or_default();
+            let sets = self.plots.sets.take().unwrap_or_default();
+            out.push(NodeCondition {
+                node: i,
+                start: d.starts.contains(&i),
+                reply: n.reply,
+                text: self.node_text(n),
+                usable,
+                reads,
+                sets,
+            });
+        }
+        // The trace keeps what ran (it is not part of the world as saved).
+        let trace = std::mem::take(&mut self.world.trace);
+        self.world = world;
+        self.world.trace = trace;
+        self.talk = talk;
+        self.ambient = ambient;
+        self.dialog_ambient = ambient_before;
+        out
+    }
+
     /// Starts a conversation between `initiator` and `target` (the owner); an empty `dlg`
     /// uses the target's own conversation. Returns whether it started.
     pub fn start_conversation(&mut self, initiator: ObjectId, target: ObjectId, dlg: &str) -> bool {
@@ -584,6 +685,19 @@ impl Sim {
             self.world.pending_talks.push((initiator, target, d));
             return true;
         }
+        // The speaker is already saying this conversation in passing: it goes on, and is
+        // not begun again (the sweep clicked Alistair during his exchange with the mage at
+        // Ostagar, and the exchange started over every time). Provisional: what
+        // DAOrigins.exe does when a conversation is asked of a creature saying one in
+        // passing is not traced.
+        if ambient(self)
+            && self
+                .ambient
+                .iter()
+                .any(|a| a.c.owner == target && a.c.dlg.name == d.name)
+        {
+            return true;
+        }
         let c = Conversation {
             ambient_run: ambient(self),
             ..c
@@ -603,6 +717,7 @@ impl Sim {
                 self.ambient.push(AmbientTalk {
                     used: vec![line],
                     left_ms: i64::from(ms),
+                    flagged: ambient_start,
                     c,
                 });
             }
@@ -730,10 +845,18 @@ impl Sim {
                 continue;
             }
             a.left_ms -= ms as i64;
-            if a.left_ms > 0 {
-                going.push(a);
-            } else if let Some(a) = self.ambient_next(a) {
-                going.push(a);
+            // A long step says the lines that fall within it, each for its own time.
+            let mut a = Some(a);
+            while let Some(t) = a.take() {
+                if t.left_ms > 0 {
+                    going.push(t);
+                    break;
+                }
+                let over = t.left_ms;
+                a = self.ambient_next(t).map(|mut n| {
+                    n.left_ms += over;
+                    n
+                });
             }
         }
         // Those a line's action began meanwhile take their speakers' places.
@@ -747,13 +870,29 @@ impl Sim {
     /// it has ended (no reply left, or one it has used already).
     fn ambient_next(&mut self, a: AmbientTalk) -> Option<AmbientTalk> {
         let AmbientTalk {
-            mut c, mut used, ..
+            mut c,
+            mut used,
+            flagged,
+            ..
         } = a;
         if c.ended {
             return None;
         }
         let &r = c.replies.first()?;
         if used.contains(&r) {
+            return None;
+        }
+        // A choice for the player is not made in passing: there the conversation turns to
+        // the player and opens as any other (Alistair, the mage gone: "You know, one good
+        // thing about the Blight..." and the player's replies), or ends when another is
+        // open. Provisional: 0x7f1910 is not traced.
+        if c.dlg.nodes[r].reply && !self.node_text(&c.dlg.nodes[r]).trim().is_empty() {
+            if self.talk.as_ref().is_none_or(|t| t.ended) {
+                c.ambient_run = false;
+                c.chain.clear();
+                self.talk = Some(c);
+                self.enter_conversation_mode();
+            }
             return None;
         }
         used.push(r);
@@ -775,12 +914,20 @@ impl Sim {
         } else {
             r
         };
+        // One begun on an ambient line is said in passing as far as its ambient lines go:
+        // Alistair's exchange with the mage at Ostagar runs on into his own conversation
+        // with the player ("You know, one good thing about the Blight..."), which waits
+        // for the player to speak to him. Provisional: 0x7f1910 is not traced.
+        if flagged && !c.dlg.nodes[next].ambient {
+            return None;
+        }
         let c = self.speak(c, next);
         let (_, ms) = self.ambient_line_time(&c, next);
         Some(AmbientTalk {
             c,
             used,
             left_ms: i64::from(ms),
+            flagged,
         })
     }
 
@@ -1283,24 +1430,71 @@ mod tests {
     fn a_speaker_says_one_ambient_conversation_and_can_be_stopped() {
         let (mut sim, hero, npc) = passers_by();
         let d = remarks("guard", &["one", "two"], false);
-        // Asked again, the speaker starts over instead of saying both at once.
+        // Asked again while saying it, the speaker goes on rather than starting over (the
+        // sweep's click on Alistair restarted his exchange with the mage every time).
         assert!(sim.open_conversation(hero, npc, d.clone()));
         sim.tick(1000);
         assert!(sim.open_conversation(hero, npc, d.clone()));
         assert_eq!(sim.ambient.len(), 1);
         sim.tick(6500);
-        assert_eq!(said(&sim), ["one", "one"]);
-        sim.tick(1000);
-        assert_eq!(said(&sim), ["one", "one", "two"]);
+        assert_eq!(said(&sim), ["one", "two"]);
+        sim.tick(8000);
         // `ClearAmbientDialogs` stops what was still to be said; so does the speaker's death.
         assert!(sim.open_conversation(hero, npc, d.clone()));
         sim.clear_ambient(npc);
         sim.tick(8000);
-        assert_eq!(said(&sim).len(), 4);
+        assert_eq!(said(&sim).len(), 3);
         assert!(sim.open_conversation(hero, npc, d));
         sim.world.get_mut(npc).unwrap().dead = true;
         sim.tick(8000);
-        assert_eq!(said(&sim).len(), 5);
+        assert_eq!(said(&sim).len(), 4);
         assert!(sim.ambient.is_empty());
+    }
+    #[test]
+    fn a_conversations_conditions_report_the_flags_they_read() {
+        let (mut sim, _hero, npc) = passers_by();
+        let mut d = remarks("guard", &["one", "two"], false);
+        d.nodes[0].condition = PlotRef {
+            plot: Some("some_plot".into()),
+            flag: 3,
+            value: true,
+            script: None,
+        };
+        let report = sim.dlg_conditions(npc, &d);
+        assert_eq!(report.len(), 3);
+        let first = &report[0];
+        assert!(first.start && !first.reply && !first.usable);
+        assert_eq!(first.text, "one");
+        assert_eq!(first.reads.len(), 1);
+        assert_eq!((first.reads[0].flag, first.reads[0].value), (3, false));
+        // The unconditioned reply and line read nothing and are usable.
+        assert!(report[1].reply && report[1].usable && report[1].reads.is_empty());
+        assert!(report[2].usable && report[2].sets.is_empty());
+        // Nothing is left recording.
+        assert!(sim.plots.reads.is_none() && sim.plots.sets.is_none());
+    }
+
+    #[test]
+    fn an_ambient_run_ends_where_the_player_is_spoken_to() {
+        // Alistair's exchange with the mage at Ostagar is ambient, and runs on into his own
+        // conversation with the player, which waits for the player to talk to him.
+        let (mut sim, hero, npc) = passers_by();
+        let mut d = remarks("alistair", &["one", "two", "three"], false);
+        // "three" is said to the player, not in passing.
+        d.nodes[4].ambient = false;
+        assert!(sim.open_conversation(hero, npc, d.clone()));
+        sim.tick(20000);
+        assert_eq!(said(&sim), ["one", "two"]);
+        assert!(sim.ambient.is_empty());
+        // At a choice for the player it turns to the player: the dialog opens on its line.
+        let (mut sim, hero, npc) = passers_by();
+        let mut d = remarks("alistair", &["one", "two"], false);
+        d.nodes[1].text = Some("A choice".into());
+        assert!(sim.open_conversation(hero, npc, d));
+        sim.tick(20000);
+        assert_eq!(said(&sim), ["one"]);
+        assert!(sim.ambient.is_empty());
+        let st = sim.dialog_state().expect("the dialog is open");
+        assert_eq!((st.line.as_str(), st.replies.len()), ("one", 1));
     }
 }

@@ -317,7 +317,7 @@ mod tests {
     use crate::cuttracks::Actor;
 
     fn actor(tag: &str, end: [f32; 3], turn: f32) -> Actor {
-        let (s, w) = (turn.to_radians() * 0.5).sin_cos();
+        let (s, w) = crate::fmath::DetMath::dsin_cos(turn.to_radians() * 0.5);
         Actor {
             id: 1,
             name: tag.into(),

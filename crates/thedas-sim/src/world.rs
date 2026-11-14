@@ -5,6 +5,7 @@
 //! number), object ids are handed out sequentially, and randomness comes from a seeded
 //! generator.
 
+use crate::fmath::DetMath;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -90,7 +91,7 @@ pub fn heading_of(facing: f32) -> f32 {
 
 /// The facing that looks along a direction (dx, dy).
 pub fn facing_toward(dx: f32, dy: f32) -> f32 {
-    (dy.atan2(dx).to_degrees() - 90.0).rem_euclid(360.0)
+    (dy.datan2(dx).to_degrees() - 90.0).rem_euclid(360.0)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -448,6 +449,10 @@ impl Rng {
     pub fn new(seed: u64) -> Self {
         Rng(seed.max(1))
     }
+    /// The generator's state, for [`crate::replay::world_hash`].
+    pub fn state(&self) -> u64 {
+        self.0
+    }
     pub fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
@@ -743,6 +748,11 @@ pub struct World {
     /// [`AmbientLine`]). Output only: nothing in the simulation reads it.
     #[serde(skip)]
     pub ambient_lines: Vec<AmbientLine>,
+    /// The commands given to the simulation from outside it (mod mode, the MCP server,
+    /// test harnesses) and what each did, oldest first (see [`crate::commands`]). Saved:
+    /// mod mode's entries are its edit history.
+    #[serde(default)]
+    pub command_journal: Vec<crate::commands::JournalEntry>,
     /// The status messages scripts showed (`DisplayStatusMessage(sMessage, nColour)`: the
     /// text and its 0xRRGGBB colour) that the interface has not taken yet. Output only.
     #[serde(skip)]
@@ -884,6 +894,7 @@ impl World {
             floaties: Vec::new(),
             portrait_messages: Vec::new(),
             ambient_lines: Vec::new(),
+            command_journal: Vec::new(),
             status_messages: Vec::new(),
             sounds: Vec::new(),
             tables,
@@ -1034,7 +1045,7 @@ mod tests {
         assert!((facing_toward(-1.0, 0.0) - 90.0).abs() < 1e-4);
         for f in [0.0f32, 45.0, 92.5, 180.0, 300.0] {
             let h = heading_of(f).to_radians();
-            assert!((facing_toward(h.cos(), h.sin()) - f).abs() < 1e-3, "{f}");
+            assert!((facing_toward(h.dcos(), h.dsin()) - f).abs() < 1e-3, "{f}");
         }
     }
 }

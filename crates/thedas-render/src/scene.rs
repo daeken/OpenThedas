@@ -863,6 +863,19 @@ struct LevelFrame {
     scene: AreaScene,
 }
 
+impl SceneCache {
+    /// Forgets parsed resources (by name, any case); see [`crate::RenderCache::forget`].
+    pub(crate) fn forget(&mut self, names: &[String]) {
+        let keep = |k: &String| !names.iter().any(|n| n.eq_ignore_ascii_case(k));
+        let p = &mut self.parsed;
+        p.mmh.retain(|k, _| keep(k));
+        p.msh.retain(|k, _| keep(k));
+        p.mat_defs.retain(|k, _| keep(k));
+        p.morphs.retain(|k, _| keep(k));
+        p.tints.retain(|k, _| keep(k));
+    }
+}
+
 /// Resources as parsed, by name (`None`: did not load).
 #[derive(Default)]
 struct Parsed {
@@ -2205,11 +2218,7 @@ impl<'a> Loader<'a> {
                 else {
                     continue;
                 };
-                match morph
-                    .nodes
-                    .iter_mut()
-                    .find(|n| n.name.eq_ignore_ascii_case(&piece.node))
-                {
+                match morph.nodes.iter_mut().find(|n| n.is(&piece.node)) {
                     Some(n) => n.vertices = vertices,
                     None => morph.nodes.push(MorphNode {
                         name: piece.node.clone(),

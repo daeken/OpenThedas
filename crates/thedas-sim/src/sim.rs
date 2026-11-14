@@ -10,6 +10,7 @@
 //! and the command executor, which completes commands as soon as it reaches them (waits last
 //! their duration) and then sends `COMMAND_COMPLETE`.
 
+use crate::fmath::DetMath;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -156,6 +157,12 @@ pub struct Sim {
     pub(crate) ambient: Vec<crate::dialog::AmbientTalk>,
     /// The install's voice banks, for the lengths of voiced lines.
     pub voices: crate::voice::Voices,
+    /// Every command given through [`Sim::apply`] since it was turned on (`Some`), for
+    /// journal-style saves to write out. Off (`None`) by default.
+    pub input_log: Option<Vec<crate::commands::InputEntry>>,
+    /// How many games have been loaded into this simulation (journal-style saves start a
+    /// new checkpoint after each).
+    pub loads: u64,
     pub(crate) plots: crate::plot::Plots,
     /// The talk tables' strings, read once (tests set them).
     pub(crate) strings: std::sync::OnceLock<std::collections::BTreeMap<u32, String>>,
@@ -374,7 +381,7 @@ pub const FORMATION: [[f32; 2]; 11] = [
 /// Provisional: slots past the table (the exe picks a random point within 4 m) take its last.
 pub fn behind(p: [f32; 3], facing: f32, k: usize) -> [f32; 3] {
     let heading = crate::world::heading_of(facing).to_radians();
-    let (fx, fy) = (heading.cos(), heading.sin());
+    let (fx, fy) = (heading.dcos(), heading.dsin());
     // The leader's right: forward turned a quarter turn clockwise.
     let (rx, ry) = (fy, -fx);
     let [x, y] = FORMATION[k.min(FORMATION.len() - 1)];
@@ -454,7 +461,7 @@ const MELEE_GAP_AT_SLOT: f32 = 1.25;
 
 /// The ring slot nearest the bearing from `centre` to `p`.
 fn melee_slot_toward(centre: [f32; 3], p: [f32; 3]) -> i32 {
-    let deg = (p[1] - centre[1]).atan2(p[0] - centre[0]).to_degrees();
+    let deg = (p[1] - centre[1]).datan2(p[0] - centre[0]).to_degrees();
     (deg / MELEE_RING_STEP_DEG).round() as i32
 }
 
@@ -469,7 +476,7 @@ fn melee_slot_span(target: f32, attacker: f32) -> i32 {
     let w = attacker * ring / d;
     let half = (MELEE_RING_STEP_DEG / 2.0).to_radians();
     let mut k = 1;
-    while k < MELEE_RING_SLOTS / 2 && 2.0 * ring * (k as f32 * half).sin() < w {
+    while k < MELEE_RING_SLOTS / 2 && 2.0 * ring * (k as f32 * half).dsin() < w {
         k += 1;
     }
     k
@@ -519,7 +526,7 @@ pub enum CutscenePolicy {
 }
 
 /// What the simulation does when a script shows the party picker (`ShowPartyPickerGUI`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PartyPickerPolicy {
     /// Decide at once (headless runs: nobody picks): the choice given beforehand
     /// ([`crate::world::World::party_choice`]), else the party as it was, filled from the pool.
@@ -590,6 +597,8 @@ impl Sim {
             dialog_ambient: false,
             ambient: Vec::new(),
             voices: crate::voice::Voices::new(),
+            input_log: None,
+            loads: 0,
             install_root: None,
             area_layouts: HashMap::new(),
             nav_grids: HashMap::new(),
@@ -772,6 +781,15 @@ impl Sim {
     pub fn deliver(&mut self, target: ObjectId, mut event: Event, script: Option<String>) {
         if event.target.is_none() {
             event.target = Some(target);
+        }
+        if self.path_action_stale(target, &event) {
+            let t = self.world.time_ms;
+            self.world.trace.push(TraceEntry::Log {
+                t,
+                channel: -2,
+                text: format!("path action for {target} dropped: a newer order"),
+            });
+            return;
         }
         let Some(obj) = self.world.get(target) else {
             self.world.trace.push(TraceEntry::Missing {
@@ -1408,7 +1426,7 @@ impl Sim {
                 } else {
                     (1.0, 0.0)
                 };
-                h.cos() * dx + h.sin() * dy >= 0.0
+                h.dcos() * dx + h.dsin() * dy >= 0.0
             }
             _ => false,
         };
@@ -2055,12 +2073,16 @@ impl Sim {
             return;
         };
         for (i, f) in followers.into_iter().enumerate() {
+            // A move of its own (a script's order, such as Alistair's walk to the tent after
+            // Ostagar's war council) is left to finish: carried along meanwhile, it was
+            // resumed when the walk stopped, and the follower walked back across the camp.
+            let following = self.following.contains(&f);
             let ok = self.world.get(f).is_some_and(|o| {
                 !o.dead
                     && o.area == area
                     && !o.combat.in_combat
                     && o.commands.first().is_none_or(|c| {
-                        matches!(c.name.as_str(), "CommandWait" | "CommandMoveToLocation")
+                        c.name == "CommandWait" || (c.name == "CommandMoveToLocation" && following)
                     })
                     && o.fields.get("FollowPartyLeader").copied().unwrap_or(1) != 0
             });
@@ -2320,7 +2342,7 @@ impl Sim {
                         let r = k as f32 * 0.05;
                         for a in 0..16 {
                             let t = a as f32 * std::f32::consts::TAU / 16.0;
-                            let q = [eye[0] + r * t.cos(), eye[1] + r * t.sin(), eye[2]];
+                            let q = [eye[0] + r * t.dcos(), eye[1] + r * t.dsin(), eye[2]];
                             if !inside(q) {
                                 eye = q;
                                 break 'out;
@@ -2786,7 +2808,7 @@ impl Sim {
         let ring = reach;
         let at = |slot: i32| {
             let ang = (slot as f32 * MELEE_RING_STEP_DEG).to_radians();
-            [b[0] + ring * ang.cos(), b[1] + ring * ang.sin(), b[2]]
+            [b[0] + ring * ang.dcos(), b[1] + ring * ang.dsin(), b[2]]
         };
         let slot = (0..=MELEE_RING_SLOTS / 2)
             .flat_map(|k| [k, -k])
@@ -2807,7 +2829,7 @@ impl Sim {
             None => {
                 let ang = (base as f32 * MELEE_RING_STEP_DEG).to_radians();
                 let r = ring + 2.0 * mine + 0.3;
-                let p = [b[0] + r * ang.cos(), b[1] + r * ang.sin(), b[2]];
+                let p = [b[0] + r * ang.dcos(), b[1] + r * ang.dsin(), b[2]];
                 let walk = crate::engine::dist(a, p);
                 if walk < 0.3 {
                     Approach::Wait(a)
@@ -2925,8 +2947,51 @@ impl Sim {
     /// the script hears of it), and a held stick orders a new move about ten times a
     /// second, each replacing the mover's commands, so the use command runs only when it
     /// gets in before the next order: on some pushes the hero stands at the door instead.
+    ///
+    /// A failure the player has overtaken is not told: when the event falls due, the player
+    /// has given the creature another order since and is no longer walking into that door (a
+    /// let-go stick's stop, a click elsewhere), the script does not hear of it, so the door
+    /// does not open after the player has stopped (it did, 1.5 s after a released stick).
+    /// Still pushing into the same door, it is told, and the door opens. Provisional:
+    /// whether DAOrigins.exe drops a stale path action, or ties it to its command, is not
+    /// traced; its executor answers in the update the command fails, before a newer order
+    /// can come, which this delay stands in for.
     pub(crate) fn fail_blocked(&mut self, id: ObjectId, door: ObjectId) {
+        if let Some(o) = self.world.get_mut(id) {
+            o.combat.path_action_at = Some(o.combat.player_orders);
+        }
         self.fail_front_command_with(id, "COMMAND_FAILED_PATH_ACTION_REQUIRED", Some(door));
+    }
+
+    /// Whether a path action that fell due for `id` is stale (see [`Sim::fail_blocked`]).
+    fn path_action_stale(&mut self, id: ObjectId, event: &Event) -> bool {
+        let path_action = constant(&self.table, "COMMAND_FAILED_PATH_ACTION_REQUIRED");
+        if event.ty != self.event_type("COMMAND_COMPLETE")
+            || event.ints.get(1).copied() != Some(path_action)
+        {
+            return false;
+        }
+        let Some((at, now)) = self
+            .world
+            .get_mut(id)
+            .and_then(|o| Some((o.combat.path_action_at.take()?, o.combat.player_orders)))
+        else {
+            return false;
+        };
+        if at == now {
+            return false;
+        }
+        let door = event.objects.get(2).copied().unwrap_or(OBJECT_INVALID);
+        let pushing = self
+            .world
+            .get(id)
+            .and_then(|o| o.commands.first())
+            .filter(|c| c.name == "CommandMoveToLocation")
+            .and_then(|c| c.location.as_ref().map(|l| l.position));
+        match pushing {
+            Some(to) => self.route_to(id, to) != crate::nav::Routed::Door(door),
+            None => true,
+        }
     }
 
     pub(crate) fn fail_front_command(&mut self, id: ObjectId, result: &str) {
@@ -3126,7 +3191,7 @@ impl Sim {
                                 (dx / len, dy / len)
                             } else {
                                 let h = crate::world::heading_of(facing).to_radians();
-                                (-h.cos(), -h.sin())
+                                (-h.dcos(), -h.dsin())
                             };
                             let to = [t[0] + dx * away, t[1] + dy * away, p[2]];
                             cmd.location = Some(crate::world::Location {
@@ -3682,7 +3747,7 @@ impl Sim {
             float(inst, "ZPosition"),
         ];
         // Rotation about Z from the quaternion, in degrees.
-        o.facing = (2.0 * q[2].atan2(q[3])).to_degrees().rem_euclid(360.0);
+        o.facing = (2.0 * q[2].datan2(q[3])).to_degrees().rem_euclid(360.0);
         if let Some(a) = int(inst, "Active") {
             o.active = a != 0;
         }
@@ -4306,6 +4371,21 @@ pub struct ScriptHost<'a> {
     pub script: String,
 }
 
+/// An engine function's integer or float result in the numeric type the engine table
+/// declares. The engine arms follow Dragon Age: Origins' signatures, and Dragon Age II's
+/// `script.ldf` declares some of the same functions with the other numeric type
+/// (`float GetItemPropertyPower(...)`, `int` in DA:O); a script compiled against it expects
+/// that type on the stack. A float becomes an integer by truncation. Other values are left
+/// as they are.
+fn numeric_as_declared(v: Value, ret: &thedas_script::ldf::Type) -> Value {
+    use thedas_script::ldf::Type;
+    match (v, ret) {
+        (Value::Int(i), Type::Float) => Value::Float(i as f32),
+        (Value::Float(x), Type::Int) => Value::Int(x as i32),
+        (v, _) => v,
+    }
+}
+
 impl Host for ScriptHost<'_> {
     fn action(
         &mut self,
@@ -4334,7 +4414,26 @@ impl Host for ScriptHost<'_> {
             _ => None,
         });
         let mana_before = mana_target.map(|id| (id, self.sim.mana_now(id)));
-        let result = crate::engine::call(self, caller, f, &args);
+        let mut result = crate::engine::call(self, caller, f, &args);
+        if let Some(Ok(Some(v))) = &mut result {
+            let declared = numeric_as_declared(v.clone(), &f.ret);
+            if declared != *v {
+                // Traced, so an arm answering in the wrong type shows up: on Dragon Age:
+                // Origins there should be none (each would be an arm to fix); Dragon Age II's
+                // retyped functions are expected here.
+                let t = self.sim.world.time_ms;
+                self.sim.world.trace.push(TraceEntry::Missing {
+                    t,
+                    what: format!(
+                        "engine function {} answered {}, declared {}",
+                        f.name,
+                        v.kind(),
+                        f.ret
+                    ),
+                });
+                *v = declared;
+            }
+        }
         if let Some((id, before)) = mana_before {
             self.sim.note_mana_change(id, before);
         }
@@ -4375,6 +4474,44 @@ impl Host for ScriptHost<'_> {
             }
         }
     }
+
+    /// Dragon Age II's by-reference functions (`void SetEventIntegerRef(ref event evEvent,
+    /// int nIndex, int nValue)` and 40 more) are the in-place twins of functions both games
+    /// have: `<Name>Ref` does on the referenced event or effect what `<Name>` does on a copy.
+    /// So each runs as its twin; a void setter's result (the changed event or effect, as
+    /// Dragon Age: Origins' setters return it) is written back into the referenced argument.
+    /// A function without a twin in the engine table is traced as unimplemented. Provisional:
+    /// the twins' equivalence is read from the names and signatures in DA2's `script.ldf`,
+    /// not traced in DragonAge2.exe, and so is the write-back of a setter's result into the
+    /// referenced variable.
+    fn action_ref(
+        &mut self,
+        caller: ObjectId,
+        f: &Function,
+        args: &mut Vec<Value>,
+    ) -> VmResult<Option<Value>> {
+        let twin = f
+            .name
+            .strip_suffix("Ref")
+            .and_then(|plain| self.sim.table.function_by_name(plain))
+            .cloned();
+        let Some(twin) = twin else {
+            return self.action(caller, f, args.clone());
+        };
+        let result = self.action(caller, &twin, args.clone())?;
+        if f.ret != thedas_script::ldf::Type::Void {
+            return Ok(result);
+        }
+        // A setter: the twin returns the changed value for the referenced argument.
+        if let Some(changed @ Value::Engine { .. }) = result {
+            if let Some(i) = f.params.iter().position(|p| p.by_ref) {
+                if let Some(slot) = args.get_mut(i) {
+                    *slot = changed;
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 impl ScriptHost<'_> {
@@ -4401,6 +4538,45 @@ impl ScriptHost<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dragon_age_2_reference_functions_run_as_their_twins() {
+        let ldf = "#define ENGINE_STRUCTURE_0 event\n\
+            event Event(int nType) = 0;\n\
+            event SetEventInteger(event ev, int nIndex, int nValue) = 1;\n\
+            int GetEventInteger(event ev, int nIndex) = 2;\n\
+            void SetEventIntegerRef(ref event ev, int nIndex, int nValue) = 3;\n\
+            int GetEventIntegerRef(ref event ev, int nIndex) = 4;\n\
+            void NoTwinRef(ref event ev) = 5;\n";
+        let table = Arc::new(EngineTable::parse(ldf.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table.clone(), 1);
+        let f = |name: &str| table.function_by_name(name).cloned().unwrap();
+        let mut h = ScriptHost {
+            sim: &mut s,
+            event: None,
+            script: "test".into(),
+        };
+        let ev = h
+            .action(1, &f("Event"), vec![Value::Int(7)])
+            .unwrap()
+            .unwrap();
+        // The setter changes the referenced event in place.
+        let mut args = vec![ev, Value::Int(2), Value::Int(42)];
+        let r = h
+            .action_ref(1, &f("SetEventIntegerRef"), &mut args)
+            .unwrap();
+        assert_eq!(r, None);
+        assert!(matches!(args[0], Value::Engine { .. }));
+        // The getter reads the changed event.
+        let mut read = vec![args[0].clone(), Value::Int(2)];
+        let got = h
+            .action_ref(1, &f("GetEventIntegerRef"), &mut read)
+            .unwrap();
+        assert_eq!(got, Some(Value::Int(42)));
+        // A by-reference function without a twin is unimplemented and changes nothing.
+        let mut none = vec![args[0].clone()];
+        assert_eq!(h.action_ref(1, &f("NoTwinRef"), &mut none).unwrap(), None);
+        assert_eq!(none[0], args[0]);
+    }
 
     #[test]
     fn creature_templates_give_their_appearance_datas_fields() {
@@ -5035,6 +5211,50 @@ mod tests {
     }
 
     #[test]
+    fn a_follower_with_an_order_of_its_own_is_not_carried_along() {
+        // After Ostagar's war council Alistair has a script's order to walk to the tent;
+        // the tools' walk carried him along with the hero meanwhile, and he resumed the
+        // order (walking back across the camp) when the walk stopped.
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let al = s.world.spawn(ObjectKind::Creature, "alistair");
+        s.world.hero = Some(hero);
+        for id in [hero, al] {
+            s.world.get_mut(id).unwrap().area = Some(area);
+        }
+        s.world.get_mut(hero).unwrap().followers = vec![al];
+        let tent = [0.0, 20.0, 0.0];
+        s.world.get_mut(al).unwrap().commands.push(Command {
+            ty: 0,
+            name: "CommandMoveToLocation".into(),
+            target: None,
+            location: Some(crate::world::Location {
+                area,
+                position: tent,
+                facing: 0.0,
+            }),
+            seconds: 0.0,
+            ints: Vec::new(),
+            strings: Vec::new(),
+            due: None,
+            from: None,
+            approach: None,
+            ring_wait: false,
+            after_impact_ms: None,
+            impacted: false,
+            arrived: false,
+            path: Vec::new(),
+        });
+        assert!(s.walk(hero, [10.0, 0.0, 0.0], None));
+        let p = s.world.get(al).unwrap().position;
+        assert!(
+            p[1] > 5.0 && p[0].abs() < 1.0,
+            "on his way to the tent: {p:?}"
+        );
+    }
+
+    #[test]
     fn followers_take_the_formation_slots_behind_the_leader() {
         // A leader at the origin facing 0 (toward +Y): its right is +X.
         let near =
@@ -5322,8 +5542,8 @@ mod tests {
             let o = s.world.get(walker).unwrap();
             assert!(o.position[0] * dx >= 0.0 && o.position[1] * dy >= 0.0);
             let h = crate::world::heading_of(o.facing).to_radians();
-            let want = dy.atan2(dx);
-            let off = (h - want).sin().abs() + (1.0 - (h - want).cos());
+            let want = dy.datan2(dx);
+            let off = (h - want).dsin().abs() + (1.0 - (h - want).dcos());
             assert!(off < 1e-3, "walking ({dx}, {dy}): facing {}", o.facing);
         }
         // Along a route, the leg it is on: east, then north.
@@ -5613,7 +5833,7 @@ mod tests {
             let c = s.world.spawn(ObjectKind::Creature, "crowd");
             let o = s.world.get_mut(c).unwrap();
             o.area = Some(area);
-            o.position = [ring * ang.cos(), ring * ang.sin(), 0.0];
+            o.position = [ring * ang.dcos(), ring * ang.dsin(), 0.0];
             o.commands.push(Command {
                 ty: 7,
                 name: "CommandAttack".into(),

@@ -1124,6 +1124,27 @@ fn focus_list_function() -> Vec<u8> {
 }
 
 /// The list function of a walk named `walk` (see [`walk_function`]).
+/// `function (p, msg) { eval(p).SetButtonAction(function () {
+/// ExternalCommands.SendMessage(msg); }); }`: gives the menu button at path `p` (one the
+/// interface added) the action of sending `msg` to the game, as the movies' own buttons
+/// send theirs.
+fn button_message_function() -> Vec<u8> {
+    let mut inner = Vec::new();
+    push(&mut inner, &[Push::Str("msg")]);
+    inner.push(GET_VARIABLE);
+    push(&mut inner, &[Push::Int(1)]);
+    get_path(&mut inner, &["ExternalCommands"]);
+    push(&mut inner, &[Push::Str("SendMessage")]);
+    inner.extend_from_slice(&[CALL_METHOD, POP]);
+    let mut c = function(&[], &inner);
+    push(&mut c, &[Push::Int(1), Push::Str("p")]);
+    // The path's value, then the clip it names.
+    c.extend_from_slice(&[GET_VARIABLE, GET_VARIABLE]);
+    push(&mut c, &[Push::Str("SetButtonAction")]);
+    c.extend_from_slice(&[CALL_METHOD, POP]);
+    function(&["p", "msg"], &c)
+}
+
 fn list_function(walk: &str) -> Vec<u8> {
     let mut c = Vec::new();
     push(&mut c, &[Push::Str("o"), Push::Int(0), Push::Str("Array")]);
@@ -1675,6 +1696,7 @@ pub fn register_invoke() -> Vec<u8> {
         ("thedas_focus_list", focus_list_function()),
         ("thedas_tree", tree_function()),
         ("thedas_tree_list", list_function("thedas_tree")),
+        ("thedas_button_message", button_message_function()),
     ] {
         get_path(&mut out, &["_global"]);
         push(&mut out, &[Push::Str(name)]);

@@ -116,6 +116,29 @@ thedas mod-cache --prune
 deletes the ones it no longer uses. It only ever deletes its own folders inside `mod-cache`,
 never a mod of yours.
 
+## Mod mode's live edits
+
+Mod mode (F10, or Mod Mode in the game menu) can export a creature or object for Blender
+and show your edits while the game runs:
+
+1. Pick the object (Ctrl+click) and press **Export to Blender**. Its models go to
+   `workspace/blender/<tag>/` in your data folder: a `.glb` Blender opens, its textures as
+   PNGs, and `manifest.json` saying where each came from.
+2. Tick **Live edits** (or start the game with `--mod-workspace`). This mounts
+   `workspace/override/` in your data folder above everything else, your last mod included.
+3. Save over one of the export's PNGs, from Blender or any paint program. Within half a
+   second it is written to `workspace/override/` under the game's own texture name, and the
+   object is drawn with it.
+
+`workspace/override/` is an ordinary mod folder: put it in `mods.txt` (or copy its files
+anywhere a mod goes) to keep your edits. Live edits are never mounted unless you ask, and
+not at all with `THEDAS_MODS=none`; while they are, reports name the `workspace:override`
+layer, so a report from an edited game is not taken for a bug in the original's behaviour.
+
+Textures are written uncompressed for now (bigger files, same look). What was already
+loaded from an old file stays until it is read again: creatures and objects are redrawn at
+once; the level's own textures change on its next load.
+
 ## What does not work yet
 
 - `.rar` archives, and encrypted `.7z` archives.

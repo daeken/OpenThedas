@@ -116,7 +116,7 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
 - ✅ **Saves**: F5/F9 quick save and load, save/load screens with a picture of the game for each save made in a window, typed names. Revision 7 fills older saves' empty containers.
 - 🟡 **Keyboard and mouse**: W, S, Q and E walk the leader relative to the camera and A and D turn the camera, as the game's key map binds them; click to move, hover names, and name and health floaties shown as the original shows them (hovered, targeted, or with Tab held). Selection rings are drawn under party members and fighting enemies (when an enemy shows its ring is provisional).
 - ✅ **Performance**: frustum culling, shadow caching and skinned-draw culling (Lothering about 8 ms, the chapel about 1.5 ms offscreen). Model node trees are read with a heap stack, so small worker-thread stacks are safe.
-- 🟡 **DLC and add-ins**: encrypted DLC archives are read (passwords recovered from the player's own GOG Ultimate Edition executable, or on other editions found once from each archive's own digest and kept in the player's data folder; nothing is shipped). Every enabled add-in's `core` folder is mounted, and its `module` folder only when it extends the base campaign, so stand-alone campaigns cannot replace base-game files. Add-ins are found from the original's `AddIns.xml` registry as well as from manifests, which brings in the promotional items' add-ins. The add-ins' area-list scripts run as in the original, so a new game hands out the first DLC item; DLC map pins and camp additions do not appear yet (`FMT-047`). Install paths are matched without regard to case, so the game runs from a case-sensitive file system.
+- 🟡 **DLC and add-ins**: encrypted DLC archives are read (passwords from a keys file the player supplies, recovered from the player's own GOG Ultimate Edition executable, or on other editions found once from each archive's own digest and kept in the player's data folder; nothing is shipped). Every enabled add-in's `core` folder is mounted, and its `module` folder only when it extends the base campaign, so stand-alone campaigns cannot replace base-game files. Add-ins are found from the original's `AddIns.xml` registry as well as from manifests, which brings in the promotional items' add-ins. The add-ins' area-list scripts run as in the original, so a new game hands out the first DLC item; DLC map pins and camp additions do not appear yet (`FMT-047`). Install paths are matched without regard to case, so the game runs from a case-sensitive file system.
 - 🟡 **Issue reports**: F8, both sticks clicked or the menu's Report Issue entry saves a screenshot, the current save, a save from about a minute earlier, the log, recent input and settings to the user's data folder (`Documents\OpenThedas` on Windows), and can send it to the project's report server.
 - 🟡 **Mods**: an ordered list of mod layers sits above the whole resource stack (later entries win; nothing is extracted over the game's files), `.dazip` packages in the list are unpacked into a cache and join as add-ins, and the original's folders in the player's Documents are read in the original's places. `.7z` archives are unpacked into the same cache. `THEDAS_MODS=none` turns all of it off; `thedas mods <install>` lists the layers. How to use it: [docs/mods.md](docs/mods.md).
 - 🟡 **DA2**: scoping. Archives whose entries carry only name hashes (ERF V3.0) resolve by name; patch talk tables and material files are read; nothing of the game runs yet.
@@ -266,9 +266,11 @@ GAME=~/path/to/Dragon\ Age\ Origins   # the folder holding packages/ and modules
 (including loose files such as talk tables), writes each one back out and checks that it reads
 back to the same document, and parses GDA, TLK, area, layout, model, mesh, material (XML) and DDS
 files into their typed forms. It exits non-zero
-on fatal failures. The reader recovers DLC passwords from the local GOG Ultimate Edition
-`bin_ship/DAOrigins.exe` and checks them against the archive header. Encrypted entries
-whose passwords are unavailable are counted in the `encrypted` column.
+on fatal failures. DLC passwords come from a keys file the player supplies (the format of the
+commonly shared `erfpasswords.txt`; `--keys <file>`, else `THEDAS_KEYS`, else `keys.txt` in the
+data folder), else for DA:O from the local GOG Ultimate Edition `bin_ship/DAOrigins.exe`; each is
+checked against the archive header. Dragon Age II's DLC can only be read with a keys file.
+Encrypted entries whose passwords are unavailable are counted in the `encrypted` column.
 
 ## Driving the simulation over MCP
 

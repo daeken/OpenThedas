@@ -8,6 +8,7 @@
 //! are accepted as no-ops: the simulation is headless and presentation reads it, never the
 //! other way round.
 
+use crate::fmath::DetMath;
 use thedas_formats::gda::Cell;
 use thedas_script::ldf::{Function, Type};
 use thedas_script::vm::{OBJECT_INVALID, ObjectId, Value, VmResult};
@@ -101,6 +102,12 @@ fn ok(v: Value) -> Option<VmResult<Option<Value>>> {
 fn void() -> Option<VmResult<Option<Value>>> {
     Some(Ok(None))
 }
+
+/// Dragon Age II creature fields its scripts set and read (`SetCreatureAmbientActivityPattern`
+/// and the rest); DA2's templates do not carry them.
+const DA2_AMBIENT_ACTIVITY: &str = "AmbientActivityPattern";
+const DA2_AMBIENT_MOVEMENT: &str = "AmbientMovementPattern";
+const DA2_ENCOUNTER: &str = "EncounterId";
 
 /// The party's inventory slots before any backpack (provisional).
 pub const DEFAULT_INVENTORY_SIZE: i32 = 70;
@@ -232,7 +239,7 @@ fn in_shape(sim: &Sim, id: ObjectId, shape: i32, l: &Location, fa: f32, fb: f32)
             }
             let heading = (l.facing + 90.0).to_radians();
             let half = (fa * 0.5).to_radians();
-            let edge = |a: f32| [a.cos() * fb, a.sin() * fb];
+            let edge = |a: f32| [a.dcos() * fb, a.dsin() * fb];
             let (left, right) = (edge(heading + half), edge(heading - half));
             let cross = |e: [f32; 2]| e[0] * py - e[1] * px;
             if cross(right) >= 0.0 && cross(left) <= 0.0 {
@@ -606,14 +613,14 @@ pub fn call(
         "fabs" => ok(Value::Float(float(a, 0).abs())),
         "sqrt" => ok(Value::Float(float(a, 0).max(0.0).sqrt())),
         // Radians, per script.ldf; out-of-domain inputs are clamped rather than giving NaN.
-        "sin" => ok(Value::Float(float(a, 0).sin())),
-        "cos" => ok(Value::Float(float(a, 0).cos())),
-        "tan" => ok(Value::Float(float(a, 0).tan())),
-        "asin" => ok(Value::Float(float(a, 0).clamp(-1.0, 1.0).asin())),
-        "acos" => ok(Value::Float(float(a, 0).clamp(-1.0, 1.0).acos())),
-        "atan" => ok(Value::Float(float(a, 0).atan())),
-        "log" => ok(Value::Float(float(a, 0).max(f32::MIN_POSITIVE).ln())),
-        "pow" => ok(Value::Float(float(a, 0).powf(float(a, 1)))),
+        "sin" => ok(Value::Float(float(a, 0).dsin())),
+        "cos" => ok(Value::Float(float(a, 0).dcos())),
+        "tan" => ok(Value::Float(float(a, 0).dtan())),
+        "asin" => ok(Value::Float(float(a, 0).clamp(-1.0, 1.0).dasin())),
+        "acos" => ok(Value::Float(float(a, 0).clamp(-1.0, 1.0).dacos())),
+        "atan" => ok(Value::Float(float(a, 0).datan())),
+        "log" => ok(Value::Float(float(a, 0).max(f32::MIN_POSITIVE).dln())),
+        "pow" => ok(Value::Float(float(a, 0).dpowf(float(a, 1)))),
         "Random" => ok(Value::Int(h.sim.world.rng.below(int(a, 0)))),
         "RandomFloat" => ok(Value::Float(h.sim.world.rng.unit())),
         "Vector" => ok(Value::Vector([float(a, 0), float(a, 1), float(a, 2)])),
@@ -622,12 +629,12 @@ pub fn call(
         // atan2(-x, y) in degrees, -180 to 180 (0x4ee570).
         "AngleToVector" => {
             let r = -(float(a, 0) as f64) * DEG_TO_RAD;
-            ok(Value::Vector([r.sin() as f32, r.cos() as f32, 0.0]))
+            ok(Value::Vector([r.dsin() as f32, r.dcos() as f32, 0.0]))
         }
         "VectorToAngle" => {
             let v = vector(a, 0);
             let (x, y) = (-(v[0] as f64), v[1] as f64);
-            ok(Value::Float((x.atan2(y) * RAD_TO_DEG) as f32))
+            ok(Value::Float((x.datan2(y) * RAD_TO_DEG) as f32))
         }
         // "%f %f %f" (0x64f9d0).
         "VectorToString" => {
@@ -1191,6 +1198,12 @@ pub fn call(
             ty: ty.event,
             handle: h.event,
         }),
+        // Dragon Age II: the type of the event the script is handling, without the event
+        // (provisional: read from its script.ldf signature, `int GetCurrentEventType()`).
+        "GetCurrentEventType" => ok(Value::Int(match h.sim.world.handle(h.event) {
+            Some(EngineData::Event(e)) => e.ty,
+            _ => 0,
+        })),
         "GetEventType" | "GetEventCreator" | "GetEventTarget" | "GetEventInteger"
         | "GetEventFloat" | "GetEventString" | "GetEventObject" | "GetEventResource" => {
             let ev = match h.sim.world.handle(handle(a, 0)) {
@@ -1312,11 +1325,26 @@ pub fn call(
                 _ => Value::Resource(cell_string(c)),
             })
         }
-        "GetHashedM2DAInt" => {
+        // `(n2DA, nColumnHash, nRow)`: the column is given by its name's hash, as the
+        // tables key their columns. DA:O has the Int one; Dragon Age II adds the others
+        // (provisional: read like their `GetM2DA*` counterparts; Bool is the cell as an
+        // integer, non-zero for true).
+        "GetHashedM2DAInt"
+        | "GetHashedM2DABool"
+        | "GetHashedM2DAFloat"
+        | "GetHashedM2DAString"
+        | "GetHashedM2DAResource" => {
             let table = h.sim.world.tables.get(int(a, 0), "");
-            ok(Value::Int(cell_int(table.as_ref().and_then(|t| {
-                t.cell_by_hash(int(a, 1) as u32, int(a, 2) as i64)
-            }))))
+            let c = table
+                .as_ref()
+                .and_then(|t| t.cell_by_hash(int(a, 1) as u32, int(a, 2) as i64));
+            ok(match name {
+                "GetHashedM2DAInt" => Value::Int(cell_int(c)),
+                "GetHashedM2DABool" => Value::Int((cell_int(c) != 0) as i32),
+                "GetHashedM2DAFloat" => Value::Float(cell_float(c)),
+                "GetHashedM2DAString" => Value::String(cell_string(c)),
+                _ => Value::Resource(cell_string(c)),
+            })
         }
         "GetM2DARows" => ok(Value::Int(
             h.sim
@@ -4034,6 +4062,60 @@ pub fn call(
             void()
         }
 
+        // Dragon Age II's additions (none is in DA:O's script.ldf). Provisional: read from
+        // their script.ldf declarations and the fields DA2's templates carry, not traced in
+        // DragonAge2.exe.
+        "GetItemLevel"
+        | "GetItemVariation"
+        | "GetPlaceableStateController"
+        | "GetCreatureAmbientActivityPattern"
+        | "GetCreatureAmbientMovementPattern"
+        | "GetEncounterId" => {
+            let field = match name {
+                "GetItemLevel" => "Level",
+                "GetItemVariation" => "ModelVariation",
+                // A placeable template's state controller: a row of
+                // placeable_statecontrollers.gda (4 informational, 2 area transition, ...).
+                "GetPlaceableStateController" => "StateController",
+                "GetCreatureAmbientActivityPattern" => DA2_AMBIENT_ACTIVITY,
+                "GetCreatureAmbientMovementPattern" => DA2_AMBIENT_MOVEMENT,
+                _ => DA2_ENCOUNTER,
+            };
+            ok(Value::Int(
+                h.object(obj(a, 0))
+                    .and_then(|o| o.fields.get(field).copied())
+                    .unwrap_or(0),
+            ))
+        }
+        "SetItemLevel"
+        | "SetCreatureAmbientActivityPattern"
+        | "SetCreatureAmbientMovementPattern"
+        | "SetEncounterId" => {
+            let field = match name {
+                "SetItemLevel" => "Level",
+                "SetCreatureAmbientActivityPattern" => DA2_AMBIENT_ACTIVITY,
+                "SetCreatureAmbientMovementPattern" => DA2_AMBIENT_MOVEMENT,
+                _ => DA2_ENCOUNTER,
+            };
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields.insert(field.to_string(), int(a, 1));
+            }
+            void()
+        }
+        "min" => ok(Value::Int(int(a, 0).min(int(a, 1)))),
+        "max" => ok(Value::Int(int(a, 0).max(int(a, 1)))),
+        "minf" => ok(Value::Float(float(a, 0).min(float(a, 1)))),
+        "maxf" => ok(Value::Float(float(a, 0).max(float(a, 1)))),
+        // The player's profile unlocks, the cross-game vault and the GUI attribute tree are
+        // not kept: none is set.
+        "GetGlobalUnlock" | "GetVaultInt" | "GetAttributeBool" => ok(Value::Int(0)),
+        // Presentation only.
+        "PreloadCreatureForConversation"
+        | "SetGUIElementEnabled"
+        | "SetPartyMailArea"
+        | "SetNextLoadScreenMovie"
+        | "ShowHelmetInPortrait"
+        | "SetAudioGlobalGameParameter" => void(),
         "GetItemStackSize" => ok(Value::Int(
             h.object(obj(a, 0))
                 .and_then(|o| o.fields.get("StackSize").copied())
@@ -4508,7 +4590,7 @@ pub fn in_trigger(p: [f32; 3], trigger: &crate::world::Object) -> bool {
         return false;
     }
     let (dx, dy) = (p[0] - trigger.position[0], p[1] - trigger.position[1]);
-    let (s, c) = (-trigger.facing.to_radians()).sin_cos();
+    let (s, c) = (-trigger.facing.to_radians()).dsin_cos();
     let local = [dx * c - dy * s, dx * s + dy * c, p[2]];
     inside(local, &trigger.geometry)
 }
@@ -4734,7 +4816,122 @@ mod tests {
         int FOLLOWER_STATE_AVAILABLE = 2;\n\
         int PROPERTY_SIMPLE_EXPERIENCE = 19;\n\
         int PROPERTY_SIMPLE_LEVEL = 15;\n\
-        int GetCanDiePermanently(object o) = 184;\n";
+        int GetCanDiePermanently(object o) = 184;\n\
+        int GetHashedM2DAInt(int n2DA, int nColumnHash, int nRow) = 841;\n\
+        int GetHashedM2DABool(int n2DA, int nColumnHash, int nRow) = 883;\n\
+        float GetHashedM2DAFloat(int n2DA, int nColumnHash, int nRow) = 864;\n\
+        string GetHashedM2DAString(int n2DA, int nColumnHash, int nRow) = 865;\n\
+        resource GetHashedM2DAResource(int n2DA, int nColumnHash, int nRow) = 866;\n\
+        int GetItemLevel( object oItem ) = 701;\n\
+        void SetItemLevel( object oItem, int nLevel ) = 880;\n\
+        int GetPlaceableStateController( object oPlaceable ) = 134;\n\
+        int GetCreatureAmbientActivityPattern(object oCreature) = 670;\n\
+        void SetCreatureAmbientActivityPattern(object oCreature, int n) = 671;\n\
+        int max(int a, int b) = 422;\n\
+        float minf(float a, float b) = 423;\n";
+
+    #[test]
+    fn dragon_age_2_functions_read_and_set_template_fields() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let item = s.world.spawn(ObjectKind::Item, "sword");
+        s.world
+            .get_mut(item)
+            .unwrap()
+            .fields
+            .insert("Level".into(), 7);
+        let door = s.world.spawn(ObjectKind::Placeable, "door");
+        s.world
+            .get_mut(door)
+            .unwrap()
+            .fields
+            .insert("StateController".into(), 1);
+        let npc = s.world.spawn(ObjectKind::Creature, "npc");
+        let o = |id| Value::Object(id);
+        assert_eq!(
+            run(&mut s, 1, "GetItemLevel", &[o(item)]),
+            Some(Value::Int(7))
+        );
+        run(&mut s, 1, "SetItemLevel", &[o(item), Value::Int(9)]);
+        assert_eq!(
+            run(&mut s, 1, "GetItemLevel", &[o(item)]),
+            Some(Value::Int(9))
+        );
+        assert_eq!(
+            run(&mut s, 1, "GetPlaceableStateController", &[o(door)]),
+            Some(Value::Int(1))
+        );
+        run(
+            &mut s,
+            1,
+            "SetCreatureAmbientActivityPattern",
+            &[o(npc), Value::Int(3)],
+        );
+        assert_eq!(
+            run(&mut s, 1, "GetCreatureAmbientActivityPattern", &[o(npc)]),
+            Some(Value::Int(3))
+        );
+        assert_eq!(
+            run(&mut s, 1, "max", &[Value::Int(2), Value::Int(5)]),
+            Some(Value::Int(5))
+        );
+        assert_eq!(
+            run(&mut s, 1, "minf", &[Value::Float(2.5), Value::Float(1.5)]),
+            Some(Value::Float(1.5))
+        );
+    }
+
+    #[test]
+    fn hashed_table_reads_find_columns_by_hash() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.tables().insert(
+            "#77",
+            &["Label", "Speed", "Flag", "Model"],
+            vec![(
+                3,
+                vec![
+                    Cell::String("row".into()),
+                    Cell::Float(1.5),
+                    Cell::Int(2),
+                    Cell::String("c_dog\0".into()),
+                ],
+            )],
+        );
+        let col = |name: &str| Value::Int(thedas_formats::gda::column_hash(name) as i32);
+        let read = |s: &mut Sim, f: &str, column: &str, row: i32| {
+            run(s, 1, f, &[Value::Int(77), col(column), Value::Int(row)])
+        };
+        assert_eq!(
+            read(&mut s, "GetHashedM2DAFloat", "Speed", 3),
+            Some(Value::Float(1.5))
+        );
+        assert_eq!(
+            read(&mut s, "GetHashedM2DAInt", "Flag", 3),
+            Some(Value::Int(2))
+        );
+        assert_eq!(
+            read(&mut s, "GetHashedM2DABool", "Flag", 3),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            read(&mut s, "GetHashedM2DAString", "Label", 3),
+            Some(Value::String("row".into()))
+        );
+        assert_eq!(
+            read(&mut s, "GetHashedM2DAResource", "Model", 3),
+            Some(Value::Resource("c_dog".into()))
+        );
+        // A missing row or column reads as the type's empty value.
+        assert_eq!(
+            read(&mut s, "GetHashedM2DABool", "Flag", 9),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            read(&mut s, "GetHashedM2DAString", "Nope", 3),
+            Some(Value::String(String::new()))
+        );
+    }
 
     /// Calls engine function `name` as `caller`.
     fn run(s: &mut Sim, caller: ObjectId, name: &str, a: &[Value]) -> Option<Value> {

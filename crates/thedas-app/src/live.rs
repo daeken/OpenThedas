@@ -211,6 +211,10 @@ pub struct LiveRings {
 pub struct Live {
     /// Shared with the interface, whose movies act on it as they send messages.
     pub sim: Arc<Mutex<Sim>>,
+    /// The journal of the game being played (see [`crate::journal`]): started with the
+    /// first step of a game, off with `THEDAS_NO_JOURNAL` set or when it cannot be written.
+    pub journal: Option<crate::journal::GameJournal>,
+    journal_off: bool,
     /// The start menu's, before a game is chosen: nothing is loaded and nothing runs.
     pub front_end: bool,
     pub paused: bool,
@@ -248,6 +252,12 @@ pub struct Live {
     /// Each drawn object's id, placement and motion at the last sync (in the objects' scene
     /// order).
     posed: Vec<(ObjectId, Mat4, Option<Clip>)>,
+    /// Mod mode's scrubber: a creature drawn with its own animation held at this time, in
+    /// seconds (its layers shifted with it). Drawing only; the simulation is not touched.
+    scrub: Option<(ObjectId, f32)>,
+    /// The held creature's motion as it was when the hold began: kept, so the creature's
+    /// next action does not swap the animation under the scrubber.
+    frozen: Option<(ObjectId, Clip)>,
     models: ModelCache,
     /// Placeables' state changes, for their swings (a door opening).
     swings: thedas_ui::models::PlaceableSwings,
@@ -528,6 +538,10 @@ pub enum Start<'a> {
     Menu,
     /// A saved game's bytes (`Sim::save_json`), as the load screen picked it.
     SaveBytes(&'a [u8]),
+    /// The game kept in a journal folder (see [`crate::journal`]): its checkpoint, and the
+    /// inputs since it replayed. An error when there is none, or its log cannot be
+    /// replayed by this build.
+    Resume(&'a Path),
 }
 
 /// Who gets a portrait drawn: the party, and the followers picked in an open party picker
@@ -578,6 +592,11 @@ impl Live {
                 path.display().to_string(),
             )),
             Start::SaveBytes(b) => Some((b.to_vec(), "picked on the load screen".to_string())),
+            Start::Resume(dir) => Some((
+                crate::journal::checkpoint(dir)
+                    .with_context(|| format!("no journal to resume in {}", dir.display()))?,
+                format!("the journal in {}", dir.display()),
+            )),
             _ => None,
         };
         if let Some((bytes, path)) = save {
@@ -592,10 +611,33 @@ impl Live {
                 );
             }
         }
-        // The player is in control (saves made by test drivers may have the autopilot on).
-        sim.world.autopilot = false;
-        // The player chooses the party when the scripts show the picker.
-        sim.party_picker_policy = thedas_sim::sim::PartyPickerPolicy::Player;
+        // The player is in control (saves made by test drivers may have the autopilot on),
+        // and chooses the party when the scripts show the picker. Commands, so a replay of
+        // the game from here sets them up the same.
+        sim.input(
+            thedas_sim::commands::CommandSource::App,
+            thedas_sim::commands::SimCommand::SetAutopilot { on: false },
+        );
+        sim.input(
+            thedas_sim::commands::CommandSource::App,
+            thedas_sim::commands::SimCommand::SetPartyPickerPolicy {
+                policy: thedas_sim::sim::PartyPickerPolicy::Player,
+            },
+        );
+        if let Start::Resume(dir) = start {
+            let report = crate::journal::replay(&mut sim, dir);
+            if let Some(why) = report.refused {
+                anyhow::bail!("the journal cannot be resumed: {why}");
+            }
+            match report.mismatch {
+                Some((at, _, _)) => log::warn!(
+                    "resume: the replay went its own way at input {at}; the game is as it was there ({} of {} inputs)",
+                    report.applied,
+                    report.inputs
+                ),
+                None => log::info!("resume: {} inputs replayed", report.applied),
+            }
+        }
         Ok(Self {
             sim: Arc::new(Mutex::new(sim)),
             front_end: matches!(start, Start::Menu),
@@ -618,6 +660,8 @@ impl Live {
             creature_shapes: Default::default(),
             aiming: None,
             posed: Vec::new(),
+            scrub: None,
+            frozen: None,
             models: ModelCache::default(),
             swings: Default::default(),
             opacity: Default::default(),
@@ -649,7 +693,37 @@ impl Live {
             cutscene_movies: Default::default(),
             movies_wait: false,
             format: None,
+            journal: None,
+            journal_off: false,
         })
+    }
+
+    /// Keeps the journal: starts it at the game's first quiet step, then writes the inputs
+    /// given since the last call (see [`crate::journal`]).
+    pub fn keep_journal(&mut self) {
+        if self.journal_off || self.front_end || !crate::journal::enabled() {
+            return;
+        }
+        let sim = self.sim.clone();
+        let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+        let done = match self.journal.as_mut() {
+            Some(j) => j.after_frame(&mut sim),
+            None => crate::journal::GameJournal::start(&mut sim, &crate::journal::default_dir())
+                .map(|j| self.journal = j),
+        };
+        if let Err(e) = done {
+            log::warn!("journal: {e}; not kept from here");
+            self.journal = None;
+            self.journal_off = true;
+            sim.input_log = None;
+        }
+    }
+
+    /// The game is being quit: the journal writes what is left and is marked closed.
+    pub fn close_journal(&mut self) {
+        if let Some(j) = self.journal.as_mut() {
+            j.close(&mut self.sim.lock().unwrap_or_else(|p| p.into_inner()));
+        }
     }
 
     /// The simulation, locked. Not held across the interface's tick, which locks it too.
@@ -660,7 +734,13 @@ impl Live {
     /// Advances the simulation by `dt_ms` of real time (at most [`MAX_STEP_MS`]), unless
     /// paused.
     pub fn step(&mut self, dt_ms: f64) {
-        if self.paused || self.front_end || self.loading() {
+        if self.front_end || self.loading() {
+            return;
+        }
+        // What the player and the interface gave since the last step goes to the journal
+        // first, in the order given.
+        self.keep_journal();
+        if self.paused {
             return;
         }
         // A training tutorial holds the game's time until its mode ends, but its script
@@ -670,7 +750,10 @@ impl Live {
         // (one left up would otherwise swallow the step's event: the Wilds' "Select
         // Alistair").
         if self.sim().training_paused() {
-            self.sim().tick(0);
+            self.sim().input(
+                thedas_sim::commands::CommandSource::App,
+                thedas_sim::commands::SimCommand::Tick { ms: 0 },
+            );
             return;
         }
         // A tutorial that pauses the game holds it until its popup is dismissed.
@@ -684,7 +767,10 @@ impl Live {
             let started = std::time::Instant::now();
             let mut sim = self.sim();
             let area = sim.world.area;
-            sim.tick(whole as u64);
+            sim.input(
+                thedas_sim::commands::CommandSource::App,
+                thedas_sim::commands::SimCommand::Tick { ms: whole as u64 },
+            );
             if sim.world.area != area {
                 // The frame the window stands still for: the simulation's own load.
                 log::info!(
@@ -1224,7 +1310,10 @@ impl Live {
             self.movies_wait,
         );
         if state == crate::intro::MovieState::CannotPlay {
-            sim.skip_cutscene();
+            sim.input(
+                thedas_sim::commands::CommandSource::App,
+                thedas_sim::commands::SimCommand::SkipCutscene,
+            );
             self.cutscene_movies
                 .follow(None, &sim.vfs, &self.install, false);
         }
@@ -1433,6 +1522,83 @@ impl Live {
             ));
         }
         out
+    }
+
+    /// Resources that changed on disk (mod mode's live edits) are read again: the objects
+    /// are drawn anew with them. The level keeps what it has (see `workspace`).
+    pub fn reload(&mut self, names: &[String]) {
+        self.cache.forget(names);
+        self.objects = None;
+    }
+
+    /// Mod mode's scrubber: draws creature `id` with its own animation held at `time`
+    /// seconds, or lets go (`None`).
+    pub fn set_scrub(&mut self, scrub: Option<(ObjectId, f32)>) {
+        if scrub.map(|s| s.0) != self.frozen.as_ref().map(|f| f.0) {
+            self.frozen = None;
+        }
+        self.scrub = scrub;
+    }
+
+    /// What mod mode's inspector shows of object `id`: what it is, and what it was animating
+    /// at the last sync (its own motion first, then the layers over it).
+    pub fn inspect(&mut self, id: ObjectId) -> Option<crate::modmode::Inspected> {
+        let mut out = {
+            let sim = self.sim();
+            let o = sim.world.get(id)?;
+            crate::modmode::Inspected {
+                id,
+                kind: format!("{:?}", o.kind),
+                tag: o.tag.clone(),
+                template: o.template.clone(),
+                name: o.name.clone(),
+                area: o
+                    .area
+                    .and_then(|a| sim.world.get(a))
+                    .map(|a| a.tag.clone())
+                    .unwrap_or_default(),
+                position: o.position,
+                facing: o.facing,
+                active: o.active,
+                dead: o.dead,
+                dialog: o.dialog.clone(),
+                animations: Vec::new(),
+            }
+        };
+        let Some(level) = self.level.as_ref() else {
+            return Some(out);
+        };
+        let Some(clip) = self
+            .posed
+            .iter()
+            .find(|p| p.0 == id)
+            .and_then(|p| p.2.clone())
+        else {
+            return Some(out);
+        };
+        for (layer, c) in std::iter::once(&clip).chain(&clip.layers).enumerate() {
+            let found = self.animator.animation_resource(&level.vfs, c);
+            let (animation, length) = match &found {
+                Some((ani, anim)) => (Some(ani.clone()), anim.length),
+                None => (None, 0.0),
+            };
+            let time = if c.looping && length > 0.0 {
+                c.time.rem_euclid(length)
+            } else {
+                c.time.min(length)
+            };
+            out.animations.push(crate::modmode::AnimLine {
+                layer,
+                tree: c.trees.first().cloned().unwrap_or_default(),
+                action: c.actions.first().cloned().unwrap_or_default(),
+                animation,
+                time,
+                length,
+                looping: c.looping,
+                weight: c.weight,
+            });
+        }
+        Some(out)
     }
 
     /// Where the party leader stands, when it is in the current area.
@@ -1746,6 +1912,17 @@ impl Live {
                         .is_some()
                 });
                 c.layers.extend(layers);
+            }
+            if let Some((held, t)) = self.scrub
+                && held == m.id
+            {
+                match &self.frozen {
+                    Some((_, f)) => c = Some(f.clone()),
+                    None => self.frozen = c.clone().map(|f| (held, f)),
+                }
+                if let Some(c) = c.as_mut() {
+                    hold_clip(c, t);
+                }
             }
             posed.push((Prop::placement(at, facing), c));
         }
@@ -2619,15 +2796,39 @@ impl Live {
             return Some(match (target, pick) {
                 // An ability only for places is cast at the creature's feet.
                 (Some((_, tag, at)), _) if only_place => {
-                    sim.order_ability_at(aim.caster, aim.ability, at, &aim.item);
+                    sim.input(
+                        thedas_sim::commands::CommandSource::Player,
+                        thedas_sim::commands::SimCommand::OrderAbilityAt {
+                            who: aim.caster,
+                            ability: aim.ability,
+                            at,
+                            item: aim.item.to_string(),
+                        },
+                    );
                     format!("use ability {} at {tag}", aim.ability)
                 }
                 (Some((id, tag, _)), _) => {
-                    sim.order_ability(aim.caster, aim.ability, id, &aim.item);
+                    sim.input(
+                        thedas_sim::commands::CommandSource::Player,
+                        thedas_sim::commands::SimCommand::OrderAbility {
+                            who: aim.caster,
+                            ability: aim.ability,
+                            target: id,
+                            item: aim.item.to_string(),
+                        },
+                    );
                     format!("use ability {} on {tag}", aim.ability)
                 }
                 (None, Pick::Ground(at)) if place => {
-                    sim.order_ability_at(aim.caster, aim.ability, at, &aim.item);
+                    sim.input(
+                        thedas_sim::commands::CommandSource::Player,
+                        thedas_sim::commands::SimCommand::OrderAbilityAt {
+                            who: aim.caster,
+                            ability: aim.ability,
+                            at,
+                            item: aim.item.to_string(),
+                        },
+                    );
                     format!("use ability {} at {:.1} {:.1}", aim.ability, at[0], at[1])
                 }
                 _ => format!("ability {} not aimed", aim.ability),
@@ -2636,7 +2837,12 @@ impl Live {
         // The party picker is open: a click on a follower picks or drops them.
         if sim.world.party_picker.is_some() {
             return Some(match pick {
-                Pick::Object(id) if sim.party_picker_toggle(id) => {
+                Pick::Object(id)
+                    if sim.input(
+                        thedas_sim::commands::CommandSource::Player,
+                        thedas_sim::commands::SimCommand::PartyPickerToggle { who: id },
+                    ) =>
+                {
                     let tag = sim.world.get(id).map(|o| o.tag.clone()).unwrap_or_default();
                     format!("party picker: {tag} picked or dropped")
                 }
@@ -2646,8 +2852,17 @@ impl Live {
         let leader = sim.world.controlled()?;
         match pick {
             Pick::Ground(p) => {
-                sim.order_move(leader, p);
-                sim.training_event("MOVEMENT_COMMAND_ISSUED", 0);
+                sim.input(
+                    thedas_sim::commands::CommandSource::Player,
+                    thedas_sim::commands::SimCommand::OrderMove { who: leader, to: p },
+                );
+                sim.input(
+                    thedas_sim::commands::CommandSource::Player,
+                    thedas_sim::commands::SimCommand::TrainingEvent {
+                        name: "MOVEMENT_COMMAND_ISSUED".to_string(),
+                        arg: 0,
+                    },
+                );
                 Some(format!("move to {:.1} {:.1}", p[0], p[1]))
             }
             Pick::Object(id) => {
@@ -2661,15 +2876,33 @@ impl Live {
                 let (kind, dead, tag, talks) = (o.kind, o.dead, o.tag.clone(), o.dialog.is_some());
                 match kind {
                     thedas_sim::world::ObjectKind::Creature if !dead && sim.hostile(leader, id) => {
-                        sim.order_attack(leader, id);
+                        sim.input(
+                            thedas_sim::commands::CommandSource::Player,
+                            thedas_sim::commands::SimCommand::OrderAttack {
+                                who: leader,
+                                target: id,
+                            },
+                        );
                         Some(format!("attack {tag}"))
                     }
                     thedas_sim::world::ObjectKind::Creature if !dead && talks => {
-                        sim.order_talk(leader, id);
+                        sim.input(
+                            thedas_sim::commands::CommandSource::Player,
+                            thedas_sim::commands::SimCommand::OrderTalk {
+                                who: leader,
+                                target: id,
+                            },
+                        );
                         Some(format!("talk to {tag}"))
                     }
                     thedas_sim::world::ObjectKind::Placeable => {
-                        sim.order_use(leader, id);
+                        sim.input(
+                            thedas_sim::commands::CommandSource::Player,
+                            thedas_sim::commands::SimCommand::OrderUse {
+                                who: leader,
+                                target: id,
+                            },
+                        );
                         Some(format!("use {tag}"))
                     }
                     _ => None,
@@ -2962,7 +3195,13 @@ impl Live {
     pub fn toggle_pause(&mut self) {
         let mut sim = self.sim();
         if sim.training_paused() {
-            sim.training_event("UNPAUSE", 0);
+            sim.input(
+                thedas_sim::commands::CommandSource::Player,
+                thedas_sim::commands::SimCommand::TrainingEvent {
+                    name: "UNPAUSE".to_string(),
+                    arg: 0,
+                },
+            );
             return;
         }
         drop(sim);
@@ -2975,7 +3214,10 @@ impl Live {
         let party = thedas_sim::engine::party_of(&sim);
         let id = *party.get(n)?;
         // The simulation learns who the player controls, so that member's AI stands down.
-        sim.player_selects(id);
+        sim.input(
+            thedas_sim::commands::CommandSource::Player,
+            thedas_sim::commands::SimCommand::PlayerSelects { who: id },
+        );
         sim.world.get(id).map(|o| o.tag.clone())
     }
 }
@@ -3058,6 +3300,17 @@ fn cut_layer(
         layers: Vec::new(),
         absolute: true,
         ..Default::default()
+    }
+}
+
+/// Holds a clip at `time` seconds into its own animation for mod mode's scrubber: the
+/// layers laid over it move by the same amount, so a cutscene's layers stay in step with it.
+/// Head-tracking layers, placed by phase rather than time, are left alone.
+pub fn hold_clip(c: &mut Clip, time: f32) {
+    let shift = time - c.time;
+    c.time = time;
+    for l in c.layers.iter_mut().filter(|l| l.phase.is_none()) {
+        l.time += shift;
     }
 }
 

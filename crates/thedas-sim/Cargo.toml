@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+libm = "0.2"
 thedas-vfs.workspace = true
 thedas-formats.workspace = true
 thedas-script.workspace = true

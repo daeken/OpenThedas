@@ -309,7 +309,9 @@ impl ScalarTrack {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Track {
     /// The bone (lowercase), from the target name without its `_rotation` or
-    /// `_translation` suffix.
+    /// `_translation` suffix. In a Dragon Age II animation, until
+    /// [`Animation::resolve_bones`] names it, the target's hash as a
+    /// [`crate::hashed_name`] (the hash of `<bone>_rotation` or `<bone>_translation`).
     pub bone: String,
     pub channel: Channel,
     /// Keys in time order.
@@ -339,6 +341,38 @@ pub struct Animation {
 const MAX_KEYS: usize = 1 << 16;
 
 impl Animation {
+    /// Names the bones of a Dragon Age II animation's tracks, which store only the hash of
+    /// `<bone>_rotation` or `<bone>_translation` (see [`crate::name_hash32`]), from the bones
+    /// a skeleton has. Tracks whose hash no given bone makes keep their hashed name, and
+    /// tracks with real names are left alone. Returns how many tracks were named.
+    pub fn resolve_bones<'a>(&mut self, bones: impl IntoIterator<Item = &'a str>) -> usize {
+        let mut by_hash = std::collections::HashMap::new();
+        for bone in bones {
+            let bone = bone.to_ascii_lowercase();
+            by_hash.insert(
+                crate::name_hash32(&format!("{bone}_rotation")),
+                (bone.clone(), Channel::Rotation),
+            );
+            by_hash.insert(
+                crate::name_hash32(&format!("{bone}_translation")),
+                (bone, Channel::Translation),
+            );
+        }
+        let mut named = 0;
+        for t in &mut self.tracks {
+            let Some(h) = crate::hash_of_hashed_name(&t.bone) else {
+                continue;
+            };
+            if let Some((bone, channel)) = by_hash.get(&h) {
+                if *channel == t.channel {
+                    t.bone = bone.clone();
+                    named += 1;
+                }
+            }
+        }
+        named
+    }
+
     pub fn parse(data: &[u8]) -> TypedResult<Self> {
         Self::from_gff(&Gff4::parse(data)?)
     }
@@ -358,11 +392,22 @@ impl Animation {
         let mut scalars = Vec::new();
         for t in d.structs(root, ani::TRACKS)? {
             let target = d
-                .opt_str(t, ani::TARGET)?
+                .opt_name_or_hash(t, ani::TARGET)?
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             let kind = d.opt_i64(t, ani::KIND)?.unwrap_or(-1);
-            let (bone, channel) = if let Some(b) = target.strip_suffix("_rotation") {
+            let hashed = crate::hash_of_hashed_name(&target).is_some();
+            let (bone, channel) = if hashed
+                && matches!(
+                    kind,
+                    track_kind::QUAT32 | track_kind::QUAT48 | track_kind::QUAT64
+                ) {
+                // Dragon Age II: only `<bone>_rotation`'s hash is stored; the bone stays
+                // hashed until [`Animation::resolve_bones`] names it.
+                (target.as_str(), Channel::Rotation)
+            } else if hashed && kind == track_kind::VEC3 {
+                (target.as_str(), Channel::Translation)
+            } else if let Some(b) = target.strip_suffix("_rotation") {
                 (b, Channel::Rotation)
             } else if let Some(b) = target.strip_suffix("_translation") {
                 (b, Channel::Translation)
@@ -681,6 +726,70 @@ mod tests {
         assert_eq!(a.tracks[1].keys[0].value, [1.0, 2.0, 3.0, 0.0]);
         assert!((a.tracks[1].keys[0].time - 1.0).abs() < 1e-3);
         assert!(!a.additive, "no 4011: a pose");
+    }
+
+    #[test]
+    fn dragon_age_2_tracks_name_their_bones_by_hash() {
+        let mut b = Builder::new(b"ANI ");
+        let q = 3u64 | ((2_097_151 / 2) << 43) | ((2_097_151 / 2) << 22) | ((1_048_575 / 2) << 2);
+        let k1 = b.add(b"quat", vec![(4035, Value::U16(0)), (4036, Value::U64(q))]);
+        let l1 = b.add(b"list", vec![(4004, structs(&[k1]))]);
+        let k2 = b.add(
+            b"vec3",
+            vec![
+                (4035, Value::U16(0)),
+                (4036, Value::F32(1.0)),
+                (4037, Value::F32(2.0)),
+                (4038, Value::F32(3.0)),
+            ],
+        );
+        let l2 = b.add(b"list", vec![(4004, structs(&[k2]))]);
+        let hash = |n: &str| Value::U32(crate::name_hash32(n));
+        let rot = b.add(
+            b"node",
+            vec![
+                (4000, hash("LeftEye_rotation")),
+                (4001, Value::U32(4)),
+                (4004, Value::Struct(Some(l1))),
+            ],
+        );
+        let tr = b.add(
+            b"node",
+            vec![
+                (4000, hash("root_translation")),
+                (4001, Value::U32(6)),
+                (4004, Value::Struct(Some(l2))),
+            ],
+        );
+        let unknown = b.add(
+            b"node",
+            vec![
+                (4000, hash("tail_rotation")),
+                (4001, Value::U32(4)),
+                (4004, Value::Struct(Some(l1))),
+            ],
+        );
+        let root = b.add(
+            b"anim",
+            vec![
+                (4005, structs(&[rot, tr, unknown])),
+                (4009, Value::F32(1.0)),
+            ],
+        );
+        let mut a = Animation::from_gff(&b.finish(root)).unwrap();
+        assert_eq!(a.tracks.len(), 3);
+        assert_eq!(
+            a.tracks[0].bone,
+            crate::hashed_name(crate::name_hash32("lefteye_rotation"))
+        );
+        assert_eq!(a.tracks[0].channel, Channel::Rotation);
+        assert_eq!(a.tracks[1].channel, Channel::Translation);
+        // The skeleton's bones name them; a bone it lacks stays hashed.
+        assert_eq!(a.resolve_bones(["LeftEye", "Root", "Head"]), 2);
+        assert_eq!(a.tracks[0].bone, "lefteye");
+        assert_eq!(a.tracks[1].bone, "root");
+        assert!(a.tracks[2].bone.starts_with('#'));
+        assert_eq!(a.tracks[1].keys[0].value, [1.0, 2.0, 3.0, 0.0]);
     }
 
     #[test]

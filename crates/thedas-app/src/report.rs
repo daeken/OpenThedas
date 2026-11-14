@@ -10,12 +10,18 @@
 //!   settings in force, where the game was (area, leader, party, conversation, cutscene,
 //!   screens), the layers the player has over the install (`mods`: the original's override
 //!   and add-in folders, the mod list), the frame times, and what the snapshots cover;
+//! - `journal_checkpoint.json` and `journal.jsonl`: the game's journal (see
+//!   [`crate::journal`]): its last checkpoint and every input since, which replays the game
+//!   up to the press exactly (`thedas-app --resume` with them as the data folder's
+//!   `journal/checkpoint.json` and `checkpoint.journal`);
 //! - `log.txt`: the last [`LOG_LINES`] log lines;
 //! - `trace.json`: the simulation's last [`TRACE_RECENT`] orders, script log lines,
 //!   conversation lines, plot flags, failed scripts and missing functions and resources
 //!   (`Trace::recent`), oldest first;
 //! - `input.txt`: the player's input over the last [`INPUT_WINDOW`], timed from the earlier
 //!   save;
+//! - `screenshot_marked.png` and `regions` in `report.json`: the spots the player marked on
+//!   the screenshot (boxes they dragged, each with a note), when they marked any;
 //! - `note.txt`: what the player typed about it, in the game's own text box (either of
 //!   its buttons keeps the report; before a game, where there is no box, it is kept with
 //!   no note).
@@ -219,7 +225,13 @@ impl Recorder {
 
     /// Starts a report made now: everything but the screenshot and the note, which come
     /// later (`screenshot`, `note`). Writes what it has at once.
-    pub fn start(&mut self, now_save: Option<Vec<u8>>, trace: Option<J>, mut info: J) -> PathBuf {
+    pub fn start(
+        &mut self,
+        now_save: Option<Vec<u8>>,
+        trace: Option<J>,
+        journal: Option<(Vec<u8>, Vec<u8>)>,
+        mut info: J,
+    ) -> PathBuf {
         let now = Instant::now();
         let written = crate::saves::now_secs();
         let area = info["game"]["area"].as_str().unwrap_or("none").to_string();
@@ -275,6 +287,7 @@ impl Recorder {
             log: log_lines(),
             input,
             trace,
+            journal,
         };
         if let Err(e) = files.write() {
             log::warn!("report: writing {}: {e:#}", path.display());
@@ -283,6 +296,7 @@ impl Recorder {
             dir: path.clone(),
             shot: None,
             note: None,
+            regions: Vec::new(),
         });
         path
     }
@@ -308,6 +322,18 @@ impl Recorder {
         }
     }
 
+    /// The player marked a spot on the screenshot.
+    pub fn add_region(&mut self, region: Region) {
+        if let Some(p) = self.pending.as_mut() {
+            p.regions.push(region);
+        }
+    }
+
+    /// The spots marked so far on the report under way.
+    pub fn regions(&self) -> &[Region] {
+        self.pending.as_ref().map_or(&[], |p| &p.regions)
+    }
+
     /// Finishes the report once its screenshot and note are in. Returns its folder (`None`
     /// when cancelled) once done.
     pub fn finish(&mut self) -> Option<Option<PathBuf>> {
@@ -326,6 +352,11 @@ impl Recorder {
                 if let Err(e) = std::fs::write(p.dir.join("note.txt"), text.as_bytes()) {
                     log::warn!("report: writing the note: {e}");
                 }
+                if !p.regions.is_empty() {
+                    if let Err(e) = write_regions(&p.dir, &p.regions) {
+                        log::warn!("report: the marked spots: {e:#}");
+                    }
+                }
                 log::info!("report: written to {}", p.dir.display());
                 Some(Some(p.dir))
             }
@@ -339,6 +370,164 @@ struct Pending {
     shot: Option<bool>,
     /// The note came: `Some(None)` cancelled.
     note: Option<Option<String>>,
+    /// The spots the player marked on the screenshot, in order.
+    regions: Vec<Region>,
+}
+
+/// A spot the player marked on the screenshot (a box dragged over it) and what they said
+/// about it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Region {
+    /// The box's corners in the screenshot's pixels: left, top, right, bottom.
+    pub rect: [f32; 4],
+    pub note: String,
+}
+
+/// The box `a`..`b` (two corners in any order) as left, top, right, bottom.
+pub fn rect_of(a: glam::Vec2, b: glam::Vec2) -> [f32; 4] {
+    [a.x.min(b.x), a.y.min(b.y), a.x.max(b.x), a.y.max(b.y)]
+}
+
+/// The outline of marked box `rect`, with its number (from 1) in its top left corner in
+/// digits `digit_h` pixels high, as line segments in pixels (see `reticle`).
+pub fn region_lines(rect: [f32; 4], number: Option<usize>, digit_h: f32) -> Vec<[glam::Vec2; 2]> {
+    use glam::Vec2;
+    let [l, t, r, b] = rect;
+    let mut out = vec![
+        [Vec2::new(l, t), Vec2::new(r, t)],
+        [Vec2::new(r, t), Vec2::new(r, b)],
+        [Vec2::new(r, b), Vec2::new(l, b)],
+        [Vec2::new(l, b), Vec2::new(l, t)],
+    ];
+    if let Some(n) = number {
+        let pad = digit_h * 0.4;
+        let mut x = l + pad;
+        for d in n.to_string().bytes() {
+            out.extend(digit_lines(d - b'0', Vec2::new(x, t + pad), digit_h));
+            x += digit_h * 0.8;
+        }
+    }
+    out
+}
+
+/// Digit `d` as seven-segment strokes `h` pixels high, its top left at `at`.
+fn digit_lines(d: u8, at: glam::Vec2, h: f32) -> Vec<[glam::Vec2; 2]> {
+    use glam::Vec2;
+    let w = h * 0.5;
+    let p = |x: f32, y: f32| at + Vec2::new(x * w, y * h * 0.5);
+    // Segments a (top) b c d e f g (middle), as in the usual seven-segment lettering.
+    let seg = [
+        [p(0.0, 0.0), p(1.0, 0.0)],
+        [p(1.0, 0.0), p(1.0, 1.0)],
+        [p(1.0, 1.0), p(1.0, 2.0)],
+        [p(0.0, 2.0), p(1.0, 2.0)],
+        [p(0.0, 1.0), p(0.0, 2.0)],
+        [p(0.0, 0.0), p(0.0, 1.0)],
+        [p(0.0, 1.0), p(1.0, 1.0)],
+    ];
+    let on: &[usize] = match d {
+        0 => &[0, 1, 2, 3, 4, 5],
+        1 => &[1, 2],
+        2 => &[0, 1, 6, 4, 3],
+        3 => &[0, 1, 6, 2, 3],
+        4 => &[5, 6, 1, 2],
+        5 => &[0, 5, 6, 2, 3],
+        6 => &[0, 5, 6, 4, 2, 3],
+        7 => &[0, 1, 2],
+        8 => &[0, 1, 2, 3, 4, 5, 6],
+        _ => &[0, 1, 2, 3, 5, 6],
+    };
+    on.iter().map(|&i| seg[i]).collect()
+}
+
+/// How high a marked box's number is drawn on a frame `height` pixels high.
+pub fn digit_height(height: u32) -> f32 {
+    (height as f32 / 28.0).max(14.0)
+}
+
+/// Draws `lines` onto RGBA8 `pixels` (`width` x `height`) `thick` pixels wide, in the
+/// reticle's colour with a dark edge so they read on light and dark ground alike.
+fn draw_thick(
+    pixels: &mut [u8],
+    (width, height): (u32, u32),
+    lines: &[[glam::Vec2; 2]],
+    thick: f32,
+) {
+    let colour = crate::reticle::COLOUR.map(|c| (c * 255.0) as u8);
+    for (r, c) in [(thick * 0.5 + 1.5, [0, 0, 0, 255]), (thick * 0.5, colour)] {
+        let ri = r.ceil() as i32;
+        for [a, b] in lines {
+            let steps = (*b - *a).length().ceil().max(1.0) as i32;
+            for s in 0..=steps {
+                let p = *a + (*b - *a) * (s as f32 / steps as f32);
+                for dy in -ri..=ri {
+                    for dx in -ri..=ri {
+                        if (dx * dx + dy * dy) as f32 > r * r {
+                            continue;
+                        }
+                        let (x, y) = (p.x as i32 + dx, p.y as i32 + dy);
+                        if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+                            continue;
+                        }
+                        let i = (y as usize * width as usize + x as usize) * 4;
+                        if let Some(px) = pixels.get_mut(i..i + 4) {
+                            px.copy_from_slice(&c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// An RGBA8 PNG decoded (the app's screenshots).
+pub fn decode_png(png: &[u8]) -> Result<thedas_ui::Rgba> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(png));
+    let mut reader = decoder.read_info()?;
+    let size = reader.output_buffer_size().context("image too large")?;
+    let mut buf = vec![0; size];
+    let frame = reader.next_frame(&mut buf)?;
+    if frame.color_type != png::ColorType::Rgba || frame.bit_depth != png::BitDepth::Eight {
+        anyhow::bail!("the image is not 8-bit RGBA");
+    }
+    buf.truncate(frame.buffer_size());
+    Ok(thedas_ui::Rgba {
+        width: frame.width,
+        height: frame.height,
+        pixels: buf,
+    })
+}
+
+/// The report's screenshot with its marked boxes and their numbers drawn on
+/// (`screenshot_marked.png`), and the boxes and notes in `report.json` (`regions`).
+fn write_regions(dir: &std::path::Path, regions: &[Region]) -> Result<()> {
+    let path = dir.join("report.json");
+    let mut info: J = serde_json::from_slice(&std::fs::read(&path)?)?;
+    info["regions"] = json!(
+        regions
+            .iter()
+            .enumerate()
+            .map(|(i, r)| json!({
+                "n": i + 1,
+                "x": r.rect[0], "y": r.rect[1],
+                "w": r.rect[2] - r.rect[0], "h": r.rect[3] - r.rect[1],
+                "note": r.note,
+            }))
+            .collect::<Vec<_>>()
+    );
+    std::fs::write(&path, serde_json::to_vec_pretty(&info)?)?;
+    let mut img = decode_png(&std::fs::read(dir.join("screenshot.png"))?)?;
+    let h = digit_height(img.height);
+    let lines: Vec<_> = regions
+        .iter()
+        .enumerate()
+        .flat_map(|(i, r)| region_lines(r.rect, Some(i + 1), h))
+        .collect();
+    let thick = (img.height as f32 / 240.0).max(3.0);
+    draw_thick(&mut img.pixels, (img.width, img.height), &lines, thick);
+    let png = thedas_ui::stage::encode_png(&img).context("encoding the marked screenshot")?;
+    std::fs::write(dir.join("screenshot_marked.png"), png)?;
+    Ok(())
 }
 
 /// A report's files, but the screenshot and the note.
@@ -350,6 +539,8 @@ struct Files {
     log: Vec<String>,
     input: Vec<String>,
     trace: Option<J>,
+    /// The journal's checkpoint and log.
+    journal: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl Files {
@@ -382,6 +573,10 @@ impl Files {
         put("input.txt", &input)?;
         if let Some(t) = &self.trace {
             put("trace.json", &serde_json::to_vec_pretty(t)?)?;
+        }
+        if let Some((checkpoint, log)) = &self.journal {
+            put("journal_checkpoint.json", checkpoint)?;
+            put("journal.jsonl", log)?;
         }
         Ok(())
     }
@@ -484,6 +679,17 @@ pub const NOTE_PROMPT_SEND: &str = "What went wrong? Say what you expected and w
      instead. Send posts it to the OpenThedas Discord with a screenshot, two saves and the \
      game's log; Keep here keeps it on this computer only.";
 
+/// The id of the question whether to mark spots, and of the note for one spot.
+pub const MARK_ID: u32 = NOTE_ID + 1;
+pub const REGION_ID: u32 = NOTE_ID + 2;
+
+/// What the question whether to mark spots says.
+pub const MARK_PROMPT: &str = "Want to point at something? Choose Mark spots, then drag a box \
+     around each thing on screen and say what is wrong there. Press F8 or Enter when done.";
+
+/// What the note for one marked spot asks.
+pub const REGION_PROMPT: &str = "What about this spot?";
+
 /// A note given with the request (a client's), or `THEDAS_REPORT_NOTE` (tests): the
 /// player is not asked then.
 pub fn preset_note(preset: Option<String>) -> Option<String> {
@@ -541,7 +747,7 @@ mod tests {
         keep_line("a line for the report".into());
         let info = json!({ "game": { "area": "lot100ar/Lothering" } });
         let trace = json!([{ "kind": "log", "t": 5, "channel": 0, "text": "hello" }]);
-        let path = r.start(Some(b"{\"now\":1}".to_vec()), Some(trace), info);
+        let path = r.start(Some(b"{\"now\":1}".to_vec()), Some(trace), None, info);
         assert!(r.busy());
         assert!(
             path.file_name()
@@ -584,13 +790,63 @@ mod tests {
         );
         // A second report the same minute gets a folder of its own; cancelling deletes it.
         let info = json!({ "game": { "area": "lot100ar/Lothering" } });
-        let second = r.start(None, None, info);
+        let second = r.start(None, None, None, info);
         assert_ne!(second, path);
         r.screenshot(Err(anyhow::anyhow!("no frame")));
         r.note(None);
         assert_eq!(r.finish(), Some(None));
         assert!(!second.exists());
         assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn marked_spots_go_in_the_report_and_onto_a_copy_of_the_screenshot() {
+        use glam::Vec2;
+        assert_eq!(
+            rect_of(Vec2::new(30.0, 40.0), Vec2::new(10.0, 5.0)),
+            [10.0, 5.0, 30.0, 40.0]
+        );
+        // Four sides, then the number's strokes ("1" is two, "8" seven).
+        assert_eq!(region_lines([0.0, 0.0, 50.0, 50.0], None, 14.0).len(), 4);
+        assert_eq!(region_lines([0.0, 0.0, 50.0, 50.0], Some(1), 14.0).len(), 6);
+        assert_eq!(
+            region_lines([0.0, 0.0, 50.0, 50.0], Some(18), 14.0).len(),
+            13
+        );
+
+        let dir = std::env::temp_dir().join(format!("thedas-report-marks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut r = Recorder::new(&dir);
+        let path = r.start(None, None, None, json!({ "game": { "area": "x" } }));
+        let shot = thedas_ui::Rgba {
+            width: 64,
+            height: 48,
+            pixels: [10, 20, 30, 255].repeat(64 * 48),
+        };
+        r.screenshot(Ok(thedas_ui::stage::encode_png(&shot).unwrap()));
+        assert!(r.regions().is_empty());
+        r.add_region(Region {
+            rect: [4.0, 4.0, 40.0, 30.0],
+            note: "fire missing here".into(),
+        });
+        r.note(Some("overall".into()));
+        assert_eq!(r.finish(), Some(Some(path.clone())));
+        let info: J =
+            serde_json::from_slice(&std::fs::read(path.join("report.json")).unwrap()).unwrap();
+        assert_eq!(info["regions"][0]["n"], 1);
+        assert_eq!(info["regions"][0]["w"], 36.0);
+        assert_eq!(info["regions"][0]["note"], "fire missing here");
+        let marked =
+            decode_png(&std::fs::read(path.join("screenshot_marked.png")).unwrap()).unwrap();
+        assert_eq!((marked.width, marked.height), (64, 48));
+        // The box's top edge is drawn in the reticle's colour; the middle is untouched.
+        let at = |x: usize, y: usize| &marked.pixels[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
+        assert_eq!(
+            at(20, 4)[..3],
+            crate::reticle::COLOUR.map(|c| (c * 255.0) as u8)[..3]
+        );
+        assert_eq!(at(30, 20), [10, 20, 30, 255]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

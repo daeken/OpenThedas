@@ -60,6 +60,15 @@ pub trait Host {
     fn text_key(&mut self, key: thedas_ui::UiKey) -> bool;
     /// A value read from a movie (a call of `path`, as the headless `call` step makes).
     fn movie_value(&mut self, movie: &str, path: &str) -> Option<thedas_ui::UiValue>;
+    /// Whether spots are being marked for an issue report, and if so whether a box is
+    /// being drawn (`Some(true)`); `None` when not marking, or while a spot's note is asked.
+    fn marking(&mut self) -> Option<bool> {
+        None
+    }
+    /// Marking is done: the report's note is asked.
+    fn end_marking(&mut self) {}
+    /// The box being drawn is dropped (no note is asked for it).
+    fn drop_mark(&mut self) {}
 }
 
 /// The letters the D-pad steps through when typing on the pad, in order.
@@ -149,6 +158,12 @@ pub struct PadPlay {
     pub highlight: bool,
     /// An issue report was asked for (both sticks); the app makes it and clears this.
     pub report: bool,
+    /// Spots are being marked for an issue report (see `PadPlay::mark`): the pointer shows.
+    marking: bool,
+    /// A, B and Start as they were held last frame while marking (their presses act).
+    mark_held: (bool, bool, bool),
+    /// The D-pad directions held while marking (each press nudges once).
+    mark_dpad: Vec<crate::pad::Button>,
 }
 
 /// How often the focused button is looked for again (milliseconds).
@@ -203,12 +218,102 @@ impl PadPlay {
             self.show_reply(host);
         }
         let mut log = Vec::new();
+        // Marking spots for an issue report: the pad has a pointer of its own.
+        let marking = if popup { None } else { host.marking() };
+        // A, B and Start as held now and last frame, every frame: the A press that answers
+        // "Mark spots" is still held when marking starts, and must not start a box.
+        use crate::pad::Button;
+        let now = (
+            state.held(Button::A),
+            state.held(Button::B),
+            state.held(Button::Start),
+        );
+        let was = std::mem::replace(&mut self.mark_held, now);
+        self.marking = false;
+        if let Some(drawing) = marking {
+            self.mark(state, host, drawing, (was, now), dt_ms, &mut log);
+            return log;
+        }
         for order in self.controller.update(state, ctx, dt_ms) {
             if let Some(m) = self.apply(order, host) {
                 log.push(m);
             }
         }
         log
+    }
+
+    /// Marking spots for an issue report with the pad (ours, as reports are): the left stick
+    /// moves the pointer (the D-pad nudges it), A starts a box where it is and a second A
+    /// ends it there (the box's note is then asked, as after a mouse drag); B drops a box
+    /// being drawn, or with none ends marking, as Start does; the report's note follows.
+    fn mark(
+        &mut self,
+        state: &PadState,
+        host: &mut dyn Host,
+        drawing: bool,
+        (was, now): ((bool, bool, bool), (bool, bool, bool)),
+        dt_ms: f64,
+        log: &mut Vec<String>,
+    ) {
+        use crate::pad::Button;
+        self.marking = true;
+        self.snapped = false;
+        self.focused = None;
+        let (w, h) = host.size();
+        let v = crate::pad::dead_zone(state.left);
+        let mut step = Vec2::new(v.x, -v.y)
+            * ((dt_ms / 1000.0) as f32 * crate::pad::POINTER_SPEED * v.length());
+        // The D-pad nudges by a step a press.
+        for (b, d) in [
+            (Button::Left, Vec2::new(-1.0, 0.0)),
+            (Button::Right, Vec2::new(1.0, 0.0)),
+            (Button::Up, Vec2::new(0.0, -1.0)),
+            (Button::Down, Vec2::new(0.0, 1.0)),
+        ] {
+            let held = state.held(b);
+            let before = self.mark_dpad.contains(&b);
+            if held && !before {
+                step += d * POINTER_STEP as f32 / 4.0;
+                self.mark_dpad.push(b);
+            } else if !held && before {
+                self.mark_dpad.retain(|&x| x != b);
+            }
+        }
+        if step != Vec2::ZERO {
+            let (x, y) = host.cursor();
+            pointer_to(
+                host,
+                (x + step.x as f64).clamp(0.0, w as f64 - 1.0),
+                (y + step.y as f64).clamp(0.0, h as f64 - 1.0),
+            );
+        }
+        let pressed = |n: bool, o: bool| n && !o;
+        if pressed(now.0, was.0) {
+            host.left_button(!drawing);
+            log.push(
+                if drawing {
+                    "mark: box ended"
+                } else {
+                    "mark: box started"
+                }
+                .into(),
+            );
+        } else if pressed(now.1, was.1) {
+            if drawing {
+                host.drop_mark();
+                log.push("mark: box dropped".into());
+            } else {
+                host.end_marking();
+                log.push("mark: done".into());
+            }
+        } else if pressed(now.2, was.2) {
+            // A box half drawn is dropped, not kept without its note.
+            if drawing {
+                host.drop_mark();
+            }
+            host.end_marking();
+            log.push("mark: done".into());
+        }
     }
 
     /// A dialog box that shows while the pad is in use opens with its first button focused,
@@ -326,7 +431,10 @@ impl PadPlay {
                     }
                 };
                 if near && let Some(l) = host.live() {
-                    l.sim().player_zoomed_in();
+                    l.sim().input(
+                        thedas_sim::commands::CommandSource::Player,
+                        thedas_sim::commands::SimCommand::PlayerZoomedIn,
+                    );
                 }
                 None
             }
@@ -353,7 +461,10 @@ impl PadPlay {
         {
             let mut sim = live.sim();
             if !sim.world.tutorials.is_empty() {
-                sim.consume_tutorial(false);
+                sim.input(
+                    thedas_sim::commands::CommandSource::Player,
+                    thedas_sim::commands::SimCommand::ConsumeTutorial { all: false },
+                );
                 return Some("tutorial dismissed".into());
             }
         }
@@ -692,7 +803,10 @@ impl PadPlay {
             Action::Skip => {
                 let cutscene = host.screens().is_some_and(|s| s.in_cutscene());
                 if cutscene {
-                    host.live()?.sim().skip_cutscene();
+                    host.live()?.sim().input(
+                        thedas_sim::commands::CommandSource::Player,
+                        thedas_sim::commands::SimCommand::SkipCutscene,
+                    );
                     "cutscene skipped".into()
                 } else {
                     host.interface_clicked();
@@ -743,7 +857,10 @@ impl PadPlay {
                 if hostile {
                     for m in party_with(&sim) {
                         if Some(m) != leader {
-                            sim.order_attack(m, t);
+                            sim.input(
+                                thedas_sim::commands::CommandSource::Player,
+                                thedas_sim::commands::SimCommand::OrderAttack { who: m, target: t },
+                            );
                         }
                     }
                     return format!("{order} (with the whole party)");
@@ -772,8 +889,14 @@ impl PadPlay {
             };
             if waits(&sim, "GUI_LEVLUP_OPENED") {
                 let who = sim.world.controlled().or(sim.world.hero)?;
-                sim.request_level_up(who);
-                sim.tick(0);
+                sim.input(
+                    thedas_sim::commands::CommandSource::Player,
+                    thedas_sim::commands::SimCommand::RequestLevelUp { creature: who },
+                );
+                sim.input(
+                    thedas_sim::commands::CommandSource::App,
+                    thedas_sim::commands::SimCommand::Tick { ms: 0 },
+                );
                 return Some("level-up opened (the tutorial waits for it)".into());
             }
             if waits(&sim, "GUI_INVENTORY_OPENED") {
@@ -857,11 +980,12 @@ impl PadPlay {
     /// Whether the pointer is drawn: the pad drives it (on a screen or in the picker).
     pub fn pointer_shown(&self, ctx: Context) -> bool {
         self.used
-            && match ctx {
-                Context::Picker => true,
-                Context::Screen => !self.snapped,
-                _ => false,
-            }
+            && (self.marking
+                || match ctx {
+                    Context::Picker => true,
+                    Context::Screen => !self.snapped,
+                    _ => false,
+                })
     }
 
     /// The usable item under the pointer in the inventory's list goes on the controlled
@@ -893,14 +1017,18 @@ impl PadPlay {
         if ability <= 0 {
             return Some("that item cannot go on the quickbar".into());
         }
-        sim.gui_message(
-            "GUI.SelectedChar.SetQuickslot",
-            &[
-                who.to_string(),
-                "-1".into(),
-                ability.to_string(),
-                tag.clone(),
-            ],
+        sim.input(
+            thedas_sim::commands::CommandSource::Player,
+            thedas_sim::commands::SimCommand::GuiMessage {
+                name: "GUI.SelectedChar.SetQuickslot".to_string(),
+                args: [
+                    who.to_string(),
+                    "-1".into(),
+                    ability.to_string(),
+                    tag.clone(),
+                ]
+                .to_vec(),
+            },
         );
         Some(format!("{tag} put on the quickbar"))
     }
@@ -1070,7 +1198,13 @@ fn walk(host: &mut dyn Host, v: Vec2, group: bool) -> Option<String> {
             continue;
         };
         if v == Vec2::ZERO {
-            sim.order_move(who, at.to_array());
+            sim.input(
+                thedas_sim::commands::CommandSource::Player,
+                thedas_sim::commands::SimCommand::OrderMove {
+                    who,
+                    to: at.to_array(),
+                },
+            );
             continue;
         }
         // A point a little ahead, on the ground there when it can be found; else at the
@@ -1082,8 +1216,17 @@ fn walk(host: &mut dyn Host, v: Vec2, group: bool) -> Option<String> {
         let to = sim
             .ground_hit(area, [p.x, p.y, p.z + 4.0], [0.0, 0.0, -1.0], 8.0)
             .unwrap_or(p.to_array());
-        sim.order_move(who, to);
-        sim.training_event("MOVEMENT_COMMAND_ISSUED", 0);
+        sim.input(
+            thedas_sim::commands::CommandSource::Player,
+            thedas_sim::commands::SimCommand::OrderMove { who, to },
+        );
+        sim.input(
+            thedas_sim::commands::CommandSource::Player,
+            thedas_sim::commands::SimCommand::TrainingEvent {
+                name: "MOVEMENT_COMMAND_ISSUED".to_string(),
+                arg: 0,
+            },
+        );
     }
     None
 }
