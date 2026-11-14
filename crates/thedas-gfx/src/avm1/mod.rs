@@ -296,10 +296,13 @@ impl Vm {
         matches!(self.heap.get(o).map(|x| &x.kind), Some(Kind::Function(_)))
     }
 
-    /// The object a primitive's properties are found on (its prototype), or the object.
+    /// The object a primitive's properties are found on (its prototype), or a live object.
     fn object_for(&self, v: &Value) -> Option<ObjId> {
         match v {
-            Value::Object(o) => Some(*o),
+            Value::Object(o) => match self.heap.get(*o).map(|object| &object.kind) {
+                Some(Kind::Display(d)) if self.display.get(*d).is_none() => None,
+                _ => Some(*o),
+            },
             Value::String(_) => Some(self.protos.string),
             Value::Number(_) => Some(self.protos.number),
             Value::Bool(_) => Some(self.protos.boolean),

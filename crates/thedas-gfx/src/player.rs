@@ -3000,6 +3000,35 @@ mod queue_tests {
     }
 
     #[test]
+    fn removed_clips_stop_exposing_own_properties_and_delayed_methods() {
+        let (mut player, _) = input_player();
+        let root = player.vm.display_object(player.vm.root);
+        let clip = player.vm.call_method(
+            &root,
+            "createEmptyMovieClip",
+            &[Value::from("temporary"), Value::Number(1.0)],
+        );
+        player.vm.set(&clip, "value", Value::Number(42.0));
+        let update = player.vm.new_native(|vm, _, _| {
+            vm.log.push("updated removed clip".into());
+            Value::Undefined
+        });
+        player.vm.set(&clip, "update", Value::Object(update));
+        assert!(player.vm.has_property(&clip, "value"));
+        assert_eq!(player.vm.get(&clip, "value"), Value::Number(42.0));
+        player.vm.call_method(&clip, "removeMovieClip", &[]);
+        assert_eq!(player.vm.get(&clip, "value"), Value::Undefined);
+        assert_eq!(player.vm.get(&clip, "update"), Value::Undefined);
+        assert_eq!(player.vm.get(&clip, "__proto__"), Value::Undefined);
+        assert!(!player.vm.has_property(&clip, "value"));
+        player.vm.call_method(&clip, "update", &[]);
+        assert_eq!(
+            player.drain_log(),
+            ["warning: call to missing method update on object"]
+        );
+    }
+
+    #[test]
     fn zero_and_negative_goto_calls_leave_the_frame_and_play_state_unchanged() {
         let (mut p, _) = input_player();
         let root = p.vm.root;
