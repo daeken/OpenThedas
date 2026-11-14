@@ -126,7 +126,7 @@ impl Sim {
             6 => (attr(3) - 10.0).max(0.0),
             7 => (attr(1) - 10.0).max(0.0),
             8 => {
-                let mut bonus = (attr(4) - 10.0).max(0.0);
+                let mut bonus = attr(4) - 10.0;
                 // Devious Harm (0x5bdc90): its Power multiplies cunning's contribution.
                 if o.abilities.contains(&210040) {
                     let power = self
@@ -135,9 +135,9 @@ impl Sim {
                         .get(1, "")
                         .and_then(|t| number(t.cell_by_hash(0x15bd_f19c, 210040)))
                         .unwrap_or(0.0);
-                    bonus *= 1.0 + power * 0.01;
+                    bonus *= 1.0 + power * 100.0;
                 }
-                bonus
+                bonus.max(0.0)
             }
             _ => 0.0,
         }
@@ -276,6 +276,22 @@ mod tests {
             .properties
             .insert(36, (1000., 0.));
         assert_eq!(s.property_total(id, 36), 100.);
+    }
+
+    #[test]
+    fn devious_harm_power_is_a_fraction_of_each_cunning_point() {
+        let (mut s, id) = sim();
+        s.world.tables.insert(
+            "#1",
+            &["#15bdf19c"],
+            vec![(210040, vec![Cell::Float(0.02)])],
+        );
+        s.world.get_mut(id).unwrap().properties.insert(4, (12., 0.));
+        assert_eq!(s.property_total(id, 16), 2.);
+        s.world.get_mut(id).unwrap().abilities.insert(210040);
+        assert!((s.property_total(id, 16) - 6.).abs() < 0.00001);
+        s.world.get_mut(id).unwrap().properties.insert(4, (8., 0.));
+        assert_eq!(s.property_total(id, 16), 0.);
     }
 
     #[test]
