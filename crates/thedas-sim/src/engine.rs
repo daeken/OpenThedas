@@ -323,6 +323,61 @@ fn format_float(f: f32, width: i32, decimals: i32) -> String {
     format!("{s:>w$}", w = width.clamp(0, 18) as usize)
 }
 
+/// Origins' shared StringToInt/HexStringToInt handler uses signed wide strtol,
+/// base zero (0x64f510 -> 0x4c0950 -> 0x8e835f). See notes/script-integer-parsing.md.
+fn origins_string_to_int(s: &str) -> i32 {
+    // The CRT's wide digit helper (0x8fc637) recognizes these decimal families.
+    let digit = |c: char| {
+        [
+            0x30, 0x660, 0x6f0, 0x966, 0x9e6, 0xa66, 0xae6, 0xb66, 0xc66, 0xce6, 0xd66, 0xe50,
+            0xed0, 0xf20, 0x1040, 0x17e0, 0x1810, 0xff10,
+        ]
+        .into_iter()
+        .find_map(|start| {
+            (start..start + 10)
+                .contains(&(c as u32))
+                .then(|| c as u32 - start)
+        })
+    };
+    // The low-byte C-locale table accepts space, 9..13 and NBSP. Above U+00ff,
+    // retain our Unicode-space approximation of the native OS classification.
+    let mut chars = s
+        .trim_start_matches(|c: char| {
+            matches!(c, ' ' | '\t'..='\r' | '\u{a0}') || (c as u32 >= 0x100 && c.is_whitespace())
+        })
+        .chars()
+        .peekable();
+    let negative = chars.peek() == Some(&'-');
+    if matches!(chars.peek(), Some('+' | '-')) {
+        chars.next();
+    }
+    let radix = if chars.peek().and_then(|&c| digit(c)) == Some(0) {
+        let mut prefix = chars.clone();
+        prefix.next();
+        if matches!(prefix.peek(), Some('x' | 'X')) {
+            chars.next();
+            chars.next();
+            16
+        } else {
+            8
+        }
+    } else {
+        10
+    };
+    let limit = i64::from(i32::MAX) + i64::from(negative);
+    let mut value = 0i64;
+    for c in chars {
+        let Some(d) = digit(c).or_else(|| c.to_digit(36)) else {
+            break;
+        };
+        if d >= radix {
+            break;
+        }
+        value = (value * i64::from(radix) + i64::from(d)).min(limit);
+    }
+    (if negative { -value } else { value }) as i32
+}
+
 /// Functions that only drive presentation; accepted as no-ops.
 const PRESENTATION: &[&str] = &[
     "SetAtmosphere",
@@ -713,6 +768,9 @@ pub fn call(
         ))),
         "IntToFloat" => ok(Value::Float(int(a, 0) as f32)),
         "FloatToInt" => ok(Value::Int(float(a, 0) as i32)),
+        "StringToInt" | "HexStringToInt" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(Value::Int(origins_string_to_int(&string(a, 0))))
+        }
         "StringToInt" => ok(Value::Int(string(a, 0).trim().parse().unwrap_or(0))),
         "StringToFloat" => ok(Value::Float(string(a, 0).trim().parse().unwrap_or(0.0))),
         "ResourceToString" => ok(Value::String(string(a, 0))),
@@ -5813,6 +5871,74 @@ mod tests {
             ),
             Some(Value::Int(0))
         );
+    }
+
+    #[test]
+    fn origins_integer_conversions_share_prefix_radix_and_signed_limits() {
+        let table = Arc::new(
+            EngineTable::parse(
+                br#"
+            int StringToInt(string s) = 51;
+            int HexStringToInt(string s) = 58;
+        "#,
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for name in ["StringToInt", "HexStringToInt"] {
+            for (text, expected) in [
+                ("", 0),
+                ("text", 0),
+                ("+", 0),
+                ("- 1", 0),
+                (" \t\n\u{b}\u{c}\r\u{a0}-42 trailing", -42),
+                ("\u{85}42", 0),
+                ("123abc", 123),
+                ("1_234", 1),
+                ("12\0x", 12),
+                ("0779", 63),
+                ("08", 0),
+                ("+0X2a!", 42),
+                ("-0x2a", -42),
+                ("ff", 0),
+                ("0x", 0),
+                ("0xg", 0),
+                ("0x1p2", 1),
+                ("2147483647", i32::MAX),
+                ("2147483648", i32::MAX),
+                ("-2147483648", i32::MIN),
+                ("-2147483649", i32::MIN),
+                ("0xffffffff", i32::MAX),
+                ("-0x80000000", i32::MIN),
+                ("99999999999999999999999999999999", i32::MAX),
+                ("-99999999999999999999999999999999", i32::MIN),
+                ("\u{ff11}\u{ff12}rest", 12),
+                ("\u{660}\u{667}8", 7),
+                ("\u{660}xF", 15),
+                ("\u{1d7cf}", 0),
+            ] {
+                assert_eq!(
+                    run(&mut s, 1, name, &[Value::String(text.into())]),
+                    Some(Value::Int(expected)),
+                    "{name}({text:?})"
+                );
+            }
+        }
+        // DA2 keeps its earlier whole-decimal parser and unimplemented hex conversion.
+        s.game = thedas_vfs::Game::DragonAge2;
+        for (text, expected) in [("077", 77), ("12tail", 0), ("0x2a", 0), ("2147483648", 0)] {
+            assert_eq!(
+                run(&mut s, 1, "StringToInt", &[Value::String(text.into())]),
+                Some(Value::Int(expected))
+            );
+        }
+        let f = s.table.function_by_name("HexStringToInt").unwrap().clone();
+        let mut host = ScriptHost {
+            sim: &mut s,
+            event: None,
+            script: "test".into(),
+        };
+        assert!(call(&mut host, 1, &f, &[Value::String("0x2a".into())]).is_none());
     }
 
     /// Calls engine function `name` as `caller`.
