@@ -87,11 +87,15 @@ worker threads exist. Discard warm-up frames and pair adjacent opposite modes.
    4,608 bytes in a portable uniform buffer; there are no storage buffers or candidate
    count truncations. The `wrap` debug view expands tile bounds to twice the radius.
    `THEDAS_DEFERRED_TILED_LIGHTS=0` puts every light in every tile for comparisons.
-4. Roomless rigid `SPT_Fronds` draws join the G-buffer using their existing translated
+4. Roomless rigid `SPT_Fronds`, `SPT_Branch`, `SPT_LeafMeshes` and `SPT_LeafCards`
+   draws join the G-buffer using their existing translated
    wind/placement vertex shader, instance groups and LOD alpha references. Their authored
-   ambient and rotated normals feed the shared per-pixel lighting. Fronds receive runtime
-   shadows and contribute to SSAO depth. Their point-shadow casting remains to come.
-   `THEDAS_DEFERRED_FRONDS=0` keeps them forward. The material survey and remaining coverage
+   ambient and world normals feed the shared per-pixel lighting, including branch normal
+   maps. Leaves retain the original 8-bit LOD cutout rule; bark remains opaque. These
+   surfaces receive runtime shadows and contribute to SSAO depth. Their point-shadow
+   casting remains to come. `THEDAS_DEFERRED_FRONDS=0`, `THEDAS_DEFERRED_BRANCHES=0`,
+   `THEDAS_DEFERRED_MESH_LEAVES=0` and `THEDAS_DEFERRED_LEAF_CARDS=0` each keep that
+   family forward. The material survey and remaining coverage
    are recorded in [the inventory](notes/deferred-material-coverage.md).
 5. Everything not deferred draws forward with its original shaders over that colour and
    depth. In a shared deferred frame, all renderers first draw their remaining opaque
