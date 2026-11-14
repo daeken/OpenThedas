@@ -2842,6 +2842,7 @@ mod queue_tests {
         let (mut p, field) = input_player();
         let text = p.vm.display.get_mut(field).unwrap().text_mut().unwrap();
         text.bounds = (0.0, 0.0, 100.0, 20.0);
+        text.default_format.size = 10.0;
         text.input = true;
         text.selectable = true;
         let value = p.vm.display_object(field);
