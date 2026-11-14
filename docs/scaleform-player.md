@@ -84,7 +84,10 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
    Focused fields track a selection anchor and caret. Ctrl+A and `Selection.setSelection`
    replace/delete the selected range; Shift navigation extends it. Selection getters and
    setters translate script UTF-16 indices to the text storage's character boundaries.
-   Selection highlighting, mouse caret placement and caret drawing remain separate work.
+   Layout retains character advances, including spaces, for selection highlighting and the
+   insertion caret. Focused ranges draw white text over black highlights; an input caret
+   blinks at 500 ms intervals, resets on edits/navigation, and disappears on focus loss.
+   Blink boundaries invalidate the picture without discarding the cached text layout.
 5. **`render`**: wgpu. Shapes are tessellated once per character (lyon) into cached vertex
    buffers; bitmaps (atlas DDS pages) uploaded once; scale9 drawn natively. Colour transform
    and blend mode per draw; multiply and the few other modes against the scene picture,
@@ -92,6 +95,9 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
 6. **Change tracking**: any change to a display property, frame, text, or the display list
    marks the movie dirty. A tick that changes nothing does no rendering and the texture is
    reused. Static subtrees can be cached to a texture later if profiling asks for it.
+   Dirty mouse picking is refreshed after frame/interval actions and wheel listeners, so
+   clips moved or hidden beneath a stationary pointer receive the corresponding rollover
+   changes. Unchanged display lists skip the pick walk.
 
 ## Switch and parity
 
@@ -140,6 +146,10 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
 - `MovieClip.duplicateMovieClip` constructs a fresh instance of the registered class with
   the source's transform, colour, drawing and clip events. The host can now add its Mod Mode
   button alongside Report Issue using the same menu setup on either backend.
+- Clicking editable/selectable text places the caret at the nearest character boundary.
+  Dragging extends the selection, including outside the field until release; Shift-click
+  retains its anchor. Picking uses the field's inverse world transform and the layout's
+  aligned, wrapped and scrolled character advances, including spaces and missing glyphs.
 - Remaining work includes complete text `shadowStyle`, native inline `<img>` layout,
   cached bitmap alpha masks, and broader interaction parity.
 - Tools: `cargo run -p thedas-ui --example sidebyside -- INSTALL OUT.png MOVIES [FRAMES]
