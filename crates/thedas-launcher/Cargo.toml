@@ -1,0 +1,18 @@
+[package]
+name = "thedas-launcher"
+description = "OpenThedas launcher: finding installs, the launcher's settings, the mod list and store links"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thedas-vfs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+dirs = "6"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"

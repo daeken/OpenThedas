@@ -40,3 +40,13 @@ sha2 = "0.11"
 egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
 egui-wgpu = { version = "0.37", default-features = false }
 egui-winit = { version = "0.37", default-features = false }
+thedas-launcher.workspace = true
+rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
+
+[build-dependencies]
+embed-resource = "3"
