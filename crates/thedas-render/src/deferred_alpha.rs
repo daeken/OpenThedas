@@ -1,4 +1,4 @@
-//! Opaque punch materials whose surviving texels can share the G-buffer.
+//! Opaque cutout materials whose surviving texels can share the G-buffer.
 
 use crate::{
     d3d::D3dProgram,
@@ -20,6 +20,25 @@ pub(crate) fn supported(name: &str) -> bool {
     matches!(
         (name.split('+').next(), name.split('+').nth(1)),
         (Some("static1.vsh"), Some("static1_punch.psh"))
+    ) || character(name)
+}
+
+pub(crate) fn character(name: &str) -> bool {
+    matches!(
+        (name.split('+').next(), name.split('+').nth(1)),
+        (
+            Some("char1.vsh"),
+            Some(
+                "ch1alph.psh"
+                    | "ch1alphnotnt.psh"
+                    | "ch1alphmultnt.psh"
+                    | "ch1alpharmtnt.psh"
+                    | "ch1alphem.psh"
+                    | "ch1alphemnotnt.psh"
+                    | "ch1alphemmultnt.psh"
+                    | "ch1alphemarmtnt.psh"
+            )
+        )
     )
 }
 
@@ -44,12 +63,16 @@ pub(crate) fn material(
     program: &D3dProgram,
 ) -> Option<Material> {
     let p = &program.pass;
+    let character = character(&program.name);
     if !supported(&program.name)
         || program.instanced
         || p.blend.is_some()
         || !p.z_enable
         || !p.z_write
         || p.color_write != 15
+        || (character
+            && (p.alpha_test.is_none()
+                || std::env::var("THEDAS_DEFERRED_CHARACTER_CUTOUTS").as_deref() == Ok("0")))
     {
         return None;
     }
@@ -108,7 +131,12 @@ pub(crate) fn material(
     Some(Material {
         diffuse,
         sampler,
-        test: [comparison(cmp), reference as f32, opacity, 0.3],
+        test: [
+            comparison(cmp),
+            reference as f32,
+            opacity,
+            if character { -1.0 } else { 0.3 },
+        ],
     })
 }
 
@@ -119,7 +147,23 @@ mod tests {
     #[test]
     fn only_the_represented_punch_equation_qualifies() {
         assert!(supported("static1.vsh+static1_punch.psh+damshpnch1s.sta"));
+        for ps in [
+            "ch1alph",
+            "ch1alphnotnt",
+            "ch1alphmultnt",
+            "ch1alpharmtnt",
+            "ch1alphem",
+            "ch1alphemnotnt",
+            "ch1alphemmultnt",
+            "ch1alphemarmtnt",
+        ] {
+            let name = format!("char1.vsh+{ps}.psh+characterpt.sta");
+            assert!(supported(&name));
+            assert!(character(&name));
+        }
         for name in [
+            "char1.vsh+ch1.psh+character.sta",
+            "char2.vsh+ch2.psh+characterpt.sta",
             "static1.vsh+static1_alpha.psh+blend.sta",
             "prop1.vsh+prop1_punch.psh+prop.sta",
             "hair0_pass1.vsh+hair0_pass1.psh+hair.sta",

@@ -205,6 +205,9 @@ pub(crate) struct DeferredPass {
     /// Experimental probe + runtime visibility mode. Fixed when this renderer is built.
     baked_lighting: bool,
     ssao: bool,
+    /// Diagnostic override: tiled lighting and cube-face culling, respectively.
+    culling: Option<[bool; 2]>,
+    shadow_reuse: Option<bool>,
 }
 
 pub(crate) struct Contributor<'a> {
@@ -232,6 +235,8 @@ struct Gpu {
     material_groups: Vec<wgpu::BindGroup>,
     lighting_buffer: wgpu::Buffer,
     light_buffer: wgpu::Buffer,
+    tile_buffer: wgpu::Buffer,
+    tiles: Vec<[u32; 8]>,
     /// The shadowed lights' maps, and their faces' view-projections for the lighting.
     shadows: Option<crate::deferred_shadow::ShadowPool>,
     sun_fallback: wgpu::TextureView,
@@ -399,7 +404,9 @@ impl DeferredPass {
             let Some(item) = scene.draws.get(d.draw) else {
                 continue;
             };
-            let alpha = punch.get(&k);
+            let alpha = punch
+                .get(&k)
+                .filter(|_| objects_enabled || !crate::deferred_alpha::character(&program.name));
             let taken = !d3d.is_blended(d)
                 && !d.multipass
                 && (faces_enabled
@@ -433,6 +440,8 @@ impl DeferredPass {
             let is_terrain = terrain(program);
             let is_face = program.name.starts_with("face1.");
             let is_eye = program.name.starts_with("eye0.");
+            let is_object =
+                object_material(program) || crate::deferred_alpha::character(&program.name);
             // The probe's cubemap as the faithful pass binds it (see `d3d::sampler_texture`).
             let cube = item.probe.and_then(|p| scene.probes.get(p)).map(|p| {
                 let name = p.name.to_ascii_lowercase();
@@ -647,7 +656,7 @@ impl DeferredPass {
                     })
                 },
                 material: [
-                    if object_material(program) {
+                    if is_object {
                         if crate::d3d::LightClass::of(m.render_class.as_deref())
                             == crate::d3d::LightClass::Character
                         {
@@ -658,7 +667,10 @@ impl DeferredPass {
                     } else {
                         0.0
                     },
-                    if program.name.contains("ch1em") || program.name.starts_with("prop1.") {
+                    if program.name.contains("ch1em")
+                        || program.name.contains("ch1alphem")
+                        || program.name.starts_with("prop1.")
+                    {
                         1.0
                     } else {
                         0.0
@@ -709,6 +721,12 @@ impl DeferredPass {
             "deferred: {} punch G-buffer draws",
             data.iter().filter(|d| d.alpha[0] > 0.5).count()
         );
+        log::info!(
+            "deferred: {} character cutout G-buffer draws",
+            data.iter()
+                .filter(|d| d.material[0] > 0.5 && d.alpha[0] > 0.5)
+                .count()
+        );
         (!draws.is_empty() || !cutouts.is_empty()).then(|| DeferredPass {
             draws,
             cutouts,
@@ -727,12 +745,18 @@ impl DeferredPass {
             refused: false,
             baked_lighting: std::env::var("THEDAS_DEFERRED_BAKED_LIGHTING").as_deref() != Ok("0"),
             ssao: std::env::var("THEDAS_DEFERRED_SSAO").as_deref() != Ok("0"),
+            culling: None,
+            shadow_reuse: None,
         })
     }
 
     /// Whether faithful draw `k` (an index into [`D3dPass::draws`]) is this pass's to draw.
     pub(crate) fn takes(&self, k: usize) -> bool {
         self.takes.get(k).copied().unwrap_or(false)
+    }
+
+    pub(crate) fn set_shadow_reuse(&mut self, enabled: Option<bool>) {
+        self.shadow_reuse = enabled;
     }
 
     /// Sets the lights only this pass draws (see [`DeferredPass::effect_lights`]).
@@ -766,6 +790,10 @@ impl DeferredPass {
         self.own_lights = lights;
     }
 
+    pub(crate) fn set_culling(&mut self, culling: Option<[bool; 2]>) {
+        self.culling = culling;
+    }
+
     /// Whether the GPU refused the pass.
     pub(crate) fn refused(&self) -> bool {
         self.refused
@@ -773,6 +801,10 @@ impl DeferredPass {
 
     pub(crate) fn ready(&self) -> bool {
         self.gpu.is_some() && !self.refused
+    }
+
+    pub(crate) fn material_mask(&self) -> Option<&wgpu::TextureView> {
+        Some(&self.gpu.as_ref()?.targets.as_ref()?.views[0])
     }
 
     fn build(&self, ctx: &GpuContext, color_format: wgpu::TextureFormat) -> Gpu {
@@ -872,6 +904,7 @@ impl DeferredPass {
                 buffer_entry(0, f, uniform),
                 buffer_entry(1, f, uniform),
                 buffer_entry(2, f, uniform),
+                buffer_entry(3, f, uniform),
             ],
         });
         let targets_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1223,6 +1256,12 @@ impl DeferredPass {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let tile_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("deferred light tiles"),
+            size: std::mem::size_of::<crate::deferred_tiles::Masks>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let lighting_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("deferred lighting"),
             layout: &lighting_layout,
@@ -1238,6 +1277,10 @@ impl DeferredPass {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: faces_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: tile_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -1274,6 +1317,8 @@ impl DeferredPass {
             material_groups,
             lighting_buffer,
             light_buffer,
+            tile_buffer,
+            tiles: Vec::new(),
             shadows: None,
             sun_fallback: device
                 .create_texture(&wgpu::TextureDescriptor {
@@ -1433,6 +1478,7 @@ impl DeferredPass {
         meshes: &[GpuMesh],
         clear: wgpu::Color,
         contributors: &mut [Contributor<'_>],
+        mut profile: Option<&mut crate::profile::CaptureProfile>,
     ) -> bool {
         for c in contributors.iter() {
             for &room in c.pass.rooms.keys() {
@@ -1597,6 +1643,35 @@ impl DeferredPass {
             }
             gpu.lights = lights;
         }
+        let tiles = crate::deferred_tiles::build(
+            projection * view,
+            (width, height),
+            gpu.lights.iter().map(|l| l.position),
+            if debug_view() == 9 { 2.0 } else { 1.0 },
+            self.culling.map(|c| c[0]).unwrap_or_else(|| {
+                std::env::var("THEDAS_DEFERRED_TILED_LIGHTS").as_deref() != Ok("0")
+            }),
+        );
+        if gpu.tiles.as_slice() != tiles {
+            ctx.queue
+                .write_buffer(&gpu.tile_buffer, 0, bytemuck::cast_slice(&tiles));
+            gpu.tiles = tiles.to_vec();
+        }
+        if std::env::var_os("THEDAS_DEFERRED_LOG_LIGHTS").is_some() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                let counts: Vec<_> = tiles
+                    .iter()
+                    .map(|t| t.iter().map(|v| v.count_ones()).sum::<u32>())
+                    .collect();
+                log::info!(
+                    "deferred tiles: {} lights, {:.1} average / {} max candidates per tile",
+                    gpu.lights.len(),
+                    counts.iter().sum::<u32>() as f32 / counts.len() as f32,
+                    counts.iter().max().copied().unwrap_or(0)
+                );
+            });
+        }
         let (sun_dir, sun_colour) = match d3d.sun() {
             Some((dir, colour)) => (dir.normalize_or_zero().extend(1.0), colour.extend(0.0)),
             None => (Vec4::ZERO, Vec4::ZERO),
@@ -1642,6 +1717,9 @@ impl DeferredPass {
             .write_buffer(&gpu.sun_buffer, 0, bytemuck::bytes_of(&sun));
         ctx.queue
             .write_buffer(&gpu.lighting_buffer, 0, bytemuck::bytes_of(&lighting));
+        if let Some(p) = profile.as_deref_mut() {
+            p.mark("deferred_prepare");
+        }
 
         // The shadowed lights' maps, before anything reads them.
         let mut faces = Vec::with_capacity(64 * 6 * shadowed.len());
@@ -1665,10 +1743,13 @@ impl DeferredPass {
                     casters.extend(casters_for_contributor(c, g));
                 }
             }
-            gpu.shadows
-                .as_mut()
-                .expect("point shadows")
-                .encode(device, &ctx.queue, encoder, &shadowed, &casters);
+            let pool = gpu.shadows.as_mut().expect("point shadows");
+            pool.set_culling(self.culling.map(|c| c[1]));
+            pool.reuse_override = self.shadow_reuse;
+            pool.encode(device, &ctx.queue, encoder, &shadowed, &casters);
+        }
+        if let Some(p) = profile.as_deref_mut() {
+            p.mark("point_shadows");
         }
 
         let Some(targets) = gpu.targets.as_ref() else {
@@ -1701,7 +1782,7 @@ impl DeferredPass {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: profile.as_deref_mut().and_then(|p| p.pass("gbuffer")),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -1711,6 +1792,9 @@ impl DeferredPass {
                     draw_all(&c.pass.draws, &mut pass, g, &g.gbuffer, c.d3d, c.meshes);
                 }
             }
+        }
+        if let Some(p) = profile.as_deref_mut() {
+            p.mark("gbuffer");
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1725,7 +1809,7 @@ impl DeferredPass {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: profile.as_deref_mut().and_then(|p| p.pass("lighting")),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -1734,6 +1818,9 @@ impl DeferredPass {
             pass.set_bind_group(1, &targets.group, &[]);
             pass.set_bind_group(2, gpu.sun_group.as_ref().expect("sun targets"), &[]);
             pass.draw(0..3, 0..1);
+        }
+        if let Some(p) = profile.as_deref_mut() {
+            p.mark("lighting");
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("deferred reflection"),
@@ -1754,7 +1841,7 @@ impl DeferredPass {
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: None,
+            timestamp_writes: profile.as_deref_mut().and_then(|p| p.pass("reflection")),
             occlusion_query_set: None,
             multiview_mask: None,
         });
@@ -1764,6 +1851,10 @@ impl DeferredPass {
             if let Some(g) = c.pass.gpu.as_ref() {
                 draw_all(&c.pass.draws, &mut pass, g, &g.env, c.d3d, c.meshes);
             }
+        }
+        drop(pass);
+        if let Some(p) = profile {
+            p.mark("reflection");
         }
         true
     }
@@ -1890,7 +1981,7 @@ fn casters<'a>(
     draws: &'a [PlanDraw],
     cutouts: &'a [crate::deferred_cutout::Draw],
     materials: &'a [crate::deferred_cutout::Material],
-    d3d: &D3dPass,
+    d3d: &'a D3dPass,
     meshes: &'a [GpuMesh],
     streams: (&'a HashMap<usize, wgpu::Buffer>, &'a wgpu::Buffer),
 ) -> Vec<crate::deferred_shadow::Caster<'a>> {
@@ -1904,6 +1995,11 @@ fn casters<'a>(
                 vertices: vertices.get(&d.mesh)?,
                 bones,
                 bone_offset: (d.skin_slot * SKIN_STRIDE) as u32,
+                pose: if d.skin_slot > 0 {
+                    d3d.bones(d.draw)
+                } else {
+                    &[]
+                },
                 world: d3d.world(d.draw).unwrap_or(Mat4::IDENTITY),
                 sphere: d3d.draw_sphere(&d3d.draws[d.k]).unwrap_or(d.sphere),
                 alpha: [0.0; 4],
@@ -1922,6 +2018,11 @@ fn casters<'a>(
                     vertices: vertices.get(&d.mesh)?,
                     bones,
                     bone_offset: (d.skin_slot * SKIN_STRIDE) as u32,
+                    pose: if d.skin_slot > 0 {
+                        d3d.bones(d.draw)
+                    } else {
+                        &[]
+                    },
                     world: d3d.world(d.draw).unwrap_or(Mat4::IDENTITY),
                     sphere: d3d.draw_sphere(&d3d.draws[d.k]).unwrap_or(d.sphere),
                     alpha: d.alpha,
@@ -2087,7 +2188,7 @@ pub fn emitter_light(e: &crate::particles::EmitterState) -> Option<SceneLight> {
 }
 
 /// The six planes (`n·p + w ≥ 0` inside) of a view-projection with depth 0..1.
-fn frustum(m: Mat4) -> [Vec4; 6] {
+pub(super) fn frustum(m: Mat4) -> [Vec4; 6] {
     let (r0, r1, r2, r3) = (m.row(0), m.row(1), m.row(2), m.row(3));
     [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2].map(|p| {
         let len = p.truncate().length();
@@ -2101,6 +2202,8 @@ mod tests {
 
     #[test]
     fn material_and_skin_uniforms_fit_portable_limits() {
+        assert_eq!(MAX_LIGHTS, 192);
+        assert!(std::mem::size_of::<crate::deferred_tiles::Masks>() <= 16 * 1024);
         assert!(std::mem::size_of::<DrawUniforms>() <= DRAW_STRIDE);
         assert_eq!(DRAW_STRIDE % 256, 0);
         assert_eq!(SKIN_STRIDE % 256, 0);

@@ -440,7 +440,7 @@ fn alpha_kept(sampled: f32) -> bool {
 fn alpha_test(sampled: f32, test: vec4<f32>) -> bool {
     if (test.x < 0.5) { return true; }
     let opacity = sampled * test.z;
-    if (opacity < test.w) { return false; }
+    if (test.w >= 0.0 && opacity < test.w) { return false; }
     let a = floor(clamp(opacity, 0.0, 1.0) * 255.0 + 0.5);
     let r = test.y;
     switch u32(test.x) {
@@ -532,6 +532,8 @@ struct Light {
 @group(0) @binding(1) var<uniform> lights: array<Light, 192>;
 // Per shadow slot, its six faces' view-projections (`deferred_shadow::faces`).
 @group(0) @binding(2) var<uniform> shadow_faces: array<mat4x4<f32>, 24>;
+// 16 x 9 screen tiles, two vec4s each: six ascending 32-bit light masks plus padding.
+@group(0) @binding(3) var<uniform> tile_lights: array<vec4<u32>, 288>;
 
 @group(1) @binding(0) var g_albedo: texture_2d<f32>;
 @group(1) @binding(1) var g_specular: texture_2d<f32>;
@@ -760,7 +762,15 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     var spec_s = vec3<f32>(0.0);
     var diff_d = vec3<f32>(0.0);
     var spec_d = vec3<f32>(0.0);
-    for (var i = 0u; i < lighting.counts.x; i = i + 1u) {
+    let tile_x = min(u32(frag.x * 16.0 / lighting.size.x), 15u);
+    let tile_y = min(u32(frag.y * 9.0 / lighting.size.y), 8u);
+    let tile_base = (tile_y * 16u + tile_x) * 2u;
+    for (var word = 0u; word < 6u; word = word + 1u) {
+      var bits = tile_lights[tile_base + word / 4u][word % 4u];
+      while (bits != 0u) {
+        let i = word * 32u + firstTrailingBit(bits);
+        bits = bits & (bits - 1u);
+        if (i >= lighting.counts.x) { continue; }
         let l = lights[i];
         if ((character && l.shadow.y < 1.5) || (!character && l.shadow.y > 1.5 && l.shadow.y < 2.5)) {
             continue;
@@ -805,6 +815,7 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             diff_d = diff_d + dif;
             spec_d = spec_d + sp;
         }
+      }
     }
     if (lighting.sun_dir.w > 0.5) {
         let ls = -lighting.sun_dir.xyz;
