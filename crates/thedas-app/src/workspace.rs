@@ -176,6 +176,14 @@ pub fn import_glb(
         std::fs::create_dir_all(overrides).map_err(|e| e.to_string())?;
         let mut written = Vec::new();
         let mut warnings = imp.warnings;
+        for m in &imp.models {
+            if m.mmh.contains(['/', '\\']) || m.mmh.starts_with('.') {
+                continue;
+            }
+            std::fs::write(overrides.join(&m.mmh), &m.data).map_err(|e| e.to_string())?;
+            written.push(m.mmh.clone());
+            warnings.push(format!("{}: {}", m.mmh, m.changes.join("; ")));
+        }
         for m in &imp.meshes {
             if m.msh.contains(['/', '\\']) || m.msh.starts_with('.') {
                 continue;

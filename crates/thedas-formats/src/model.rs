@@ -500,6 +500,316 @@ fn read_emitter(gff: &Gff4, id: StructId) -> TypedResult<Box<crate::emitter::Emi
     crate::emitter::Emitter::read(gff, id).map(Box::new)
 }
 
+/// A change to a model (see [`rewrite`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModelEdit {
+    /// A node's local transform (the first node with this name, any case).
+    Transform { node: String, transform: Transform },
+    /// A mesh node's palette (the node drawing this chunk): the bone index each blend
+    /// index of its vertices names.
+    Palette { chunk: String, bones: Vec<u32> },
+    /// A new skeleton node under `parent`, with bone index `bone`, at `transform` from its
+    /// parent. Made like the model's other bone nodes (a copy of one, its animation
+    /// exports left out: a new bone has no animation of its own and keeps its rest place).
+    AddBone {
+        parent: String,
+        name: String,
+        bone: u32,
+        transform: Transform,
+    },
+}
+
+/// A model with some changes, written as [`crate::gff4::Gff4::write`] writes it. Every
+/// field the reader does not know is kept as it was. Provisional, as the reader is: the
+/// model's own counts of its bones and exports (root fields 6256 and 6275) are left as
+/// they were.
+pub fn rewrite(data: &[u8], edits: &[ModelEdit]) -> TypedResult<Vec<u8>> {
+    let mut gff = Gff4::parse(data)?;
+    let invalid = |m: String| TypedError::Invalid(m);
+    for e in edits {
+        match e {
+            ModelEdit::Transform { node, transform } => {
+                let id = find_node(&gff, |g, s| {
+                    name_of(g, s).is_some_and(|n| n.eq_ignore_ascii_case(node))
+                })
+                .ok_or_else(|| invalid(format!("mmh: no node {node}")))?;
+                set_transform(&mut gff, id, transform)?;
+            }
+            ModelEdit::Palette { chunk, bones } => {
+                let id = find_node(&gff, |g, s| {
+                    Doc::new(g, "mmh mesh")
+                        .opt_str(s, field::MESH_CHUNK)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|c| c.eq_ignore_ascii_case(chunk))
+                })
+                .ok_or_else(|| invalid(format!("mmh: no mesh node draws {chunk}")))?;
+                let v = value_mut(&mut gff, id, field::MESH_BONES)
+                    .ok_or_else(|| invalid(format!("mmh: {chunk} has no palette")))?;
+                set_numbers(v, bones).ok_or_else(|| {
+                    invalid(format!("mmh: {chunk}'s palette is not a number list"))
+                })?;
+            }
+            ModelEdit::AddBone {
+                parent,
+                name,
+                bone,
+                transform,
+            } => add_bone(&mut gff, parent, name, *bone, transform)?,
+        }
+    }
+    Ok(gff.write()?)
+}
+
+/// A node's name (without the stored trailing NUL).
+fn name_of(gff: &Gff4, id: StructId) -> Option<String> {
+    Doc::new(gff, "mmh node")
+        .opt_str(id, field::NAME)
+        .ok()
+        .flatten()
+}
+
+/// The first struct (depth first from the root) that `want` picks.
+fn find_node(gff: &Gff4, want: impl Fn(&Gff4, StructId) -> bool) -> Option<StructId> {
+    let d = Doc::new(gff, "mmh");
+    let mut stack = vec![gff.root];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) || seen.len() > 1 << 20 {
+            continue;
+        }
+        if id != gff.root && want(gff, id) {
+            return Some(id);
+        }
+        let kids = d.structs(id, field::CHILDREN).unwrap_or_default();
+        stack.extend(kids.into_iter().rev());
+    }
+    None
+}
+
+/// A struct's field value to change (inside a generic slot if it is one).
+fn value_mut(gff: &mut Gff4, id: StructId, label: u32) -> Option<&mut crate::gff4::Value> {
+    use crate::gff4::Value;
+    let t = gff.structs.get(id.0)?.template as usize;
+    let i = gff
+        .templates
+        .get(t)?
+        .fields
+        .iter()
+        .position(|f| f.label == label)?;
+    match gff.structs.get_mut(id.0)?.values.get_mut(i)? {
+        Value::Absent => None,
+        Value::Generic(slot) => slot.value.as_mut(),
+        v => Some(v),
+    }
+}
+
+/// A number list set to `n`, keeping its element type; `None` if it is not one, or a
+/// value does not fit.
+fn set_numbers(v: &mut crate::gff4::Value, n: &[u32]) -> Option<()> {
+    use crate::gff4::{List, Value};
+    let Value::List(Some(l)) = v else {
+        return None;
+    };
+    // NO_BONE is stored as -1.
+    let signed = |b: u32| if b == NO_BONE { -1i64 } else { b as i64 };
+    *l = match l {
+        List::U8(_) => List::U8(
+            n.iter()
+                .map(|&b| u8::try_from(b).ok())
+                .collect::<Option<_>>()?,
+        ),
+        List::U16(_) => List::U16(
+            n.iter()
+                .map(|&b| u16::try_from(b).ok())
+                .collect::<Option<_>>()?,
+        ),
+        List::U32(_) => List::U32(n.to_vec()),
+        List::I16(_) => List::I16(
+            n.iter()
+                .map(|&b| i16::try_from(signed(b)).ok())
+                .collect::<Option<_>>()?,
+        ),
+        List::I32(_) => List::I32(
+            n.iter()
+                .map(|&b| i32::try_from(signed(b)).ok())
+                .collect::<Option<_>>()?,
+        ),
+        List::I64(_) => List::I64(n.iter().map(|&b| signed(b)).collect()),
+        List::F32(_) => List::F32(n.iter().map(|&b| signed(b) as f32).collect()),
+        _ => return None,
+    };
+    Some(())
+}
+
+/// A node's `trsl` and `rota` children set to `t`.
+fn set_transform(gff: &mut Gff4, id: StructId, t: &Transform) -> TypedResult<()> {
+    use crate::gff4::Value;
+    let d = Doc::new(gff, "mmh node");
+    let kids = d.structs(id, field::CHILDREN)?;
+    let (mut trsl, mut rota) = (None, None);
+    for c in kids {
+        let k = d.label(c);
+        if k == KIND_TRANSLATION && trsl.is_none() {
+            trsl = Some(c);
+        } else if k == KIND_ROTATION && rota.is_none() {
+            rota = Some(c);
+        }
+    }
+    let (Some(trsl), Some(rota)) = (trsl, rota) else {
+        return Err(TypedError::Invalid(
+            "mmh: the node keeps no translation and rotation to set".into(),
+        ));
+    };
+    let [x, y, z] = t.position;
+    match value_mut(gff, trsl, field::TRANSLATION) {
+        Some(Value::Vec4(v)) => *v = [x, y, z, v[3]],
+        Some(Value::Vec3(v)) => *v = [x, y, z],
+        _ => {
+            return Err(TypedError::Invalid(
+                "mmh: a translation of another type".into(),
+            ));
+        }
+    }
+    match value_mut(gff, rota, field::ROTATION) {
+        Some(Value::Vec4(v) | Value::Quat(v)) => *v = t.rotation,
+        _ => {
+            return Err(TypedError::Invalid(
+                "mmh: a rotation of another type".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [`ModelEdit::AddBone`].
+fn add_bone(gff: &mut Gff4, parent: &str, name: &str, bone: u32, t: &Transform) -> TypedResult<()> {
+    use crate::gff4::{GenericSlot, List, Value};
+    let invalid = |m: String| TypedError::Invalid(m);
+    let parent_id = find_node(gff, |g, s| {
+        name_of(g, s).is_some_and(|n| n.eq_ignore_ascii_case(parent))
+    })
+    .ok_or_else(|| invalid(format!("mmh: no node {parent}")))?;
+    if find_node(gff, |g, s| {
+        name_of(g, s).is_some_and(|n| n.eq_ignore_ascii_case(name))
+    })
+    .is_some()
+    {
+        return Err(invalid(format!("mmh: there is already a node {name}")));
+    }
+    // A bone node to copy: one with a bone index, its translation and rotation.
+    let template = find_node(gff, |g, s| {
+        Doc::new(g, "mmh node")
+            .opt_i64(s, field::BONE_INDEX)
+            .ok()
+            .flatten()
+            .is_some_and(|b| b >= 0)
+    })
+    .ok_or_else(|| invalid("mmh: no bone node to make a new one like".into()))?;
+    let children_at = |g: &Gff4, s: StructId| {
+        let tl = g.structs[s.0].template as usize;
+        g.templates[tl]
+            .fields
+            .iter()
+            .position(|f| f.label == field::CHILDREN)
+    };
+    let ci =
+        children_at(gff, template).ok_or_else(|| invalid("mmh: a bone without children".into()))?;
+    let Value::List(Some(List::Generic(slots))) = gff.structs[template.0].values[ci].clone() else {
+        return Err(invalid(
+            "mmh: a bone's children are not a generic list".into(),
+        ));
+    };
+    // Its translation and rotation, copied; the rest (animation exports, children) left.
+    let mut kids = Vec::new();
+    let mut node_slot = None;
+    for slot in &slots {
+        let Some(Value::Struct(Some(c))) = &slot.value else {
+            continue;
+        };
+        let k = Doc::new(gff, "mmh node").label(*c);
+        if k == KIND_TRANSLATION || k == KIND_ROTATION {
+            let copy = gff.structs[c.0].clone();
+            gff.structs.push(copy);
+            kids.push(GenericSlot {
+                type_code: slot.type_code,
+                flags: slot.flags,
+                value: Some(Value::Struct(Some(StructId(gff.structs.len() - 1)))),
+            });
+        }
+    }
+    // The slot type a node takes in its parent's list: the template's own, from its parent.
+    let pi = children_at(gff, parent_id)
+        .ok_or_else(|| invalid(format!("mmh: {parent} keeps no children")))?;
+    let holds = |g: &Gff4, s: StructId| {
+        Doc::new(g, "mmh node")
+            .structs(s, field::CHILDREN)
+            .is_ok_and(|k| k.contains(&template))
+    };
+    let owner = if holds(gff, gff.root) {
+        Some(gff.root)
+    } else {
+        find_node(gff, holds)
+    };
+    if let Some(owner) = owner {
+        let oi = children_at(gff, owner).unwrap_or(0);
+        if let Value::List(Some(List::Generic(os))) = &gff.structs[owner.0].values[oi] {
+            node_slot = os
+                .iter()
+                .find(|x| matches!(x.value, Some(Value::Struct(Some(c))) if c == template))
+                .map(|x| (x.type_code, x.flags));
+        }
+    }
+    let (type_code, flags) =
+        node_slot.ok_or_else(|| invalid("mmh: the bone's place is not found".into()))?;
+    let mut node = gff.structs[template.0].clone();
+    node.values[ci] = Value::List(Some(List::Generic(kids)));
+    gff.structs.push(node);
+    let id = StructId(gff.structs.len() - 1);
+    let named = format!("{name}\0");
+    match value_mut(gff, id, field::NAME) {
+        Some(Value::String(s)) => *s = Some(named),
+        _ => return Err(invalid("mmh: a bone without a name field".into())),
+    }
+    match value_mut(gff, id, field::BONE_INDEX) {
+        Some(v) => {
+            set_int(v, bone as i64).ok_or_else(|| invalid(format!("mmh: bone index {bone}")))?
+        }
+        None => return Err(invalid("mmh: a bone without an index field".into())),
+    }
+    set_transform(gff, id, t)?;
+    match &mut gff.structs[parent_id.0].values[pi] {
+        Value::List(Some(List::Generic(ps))) => ps.push(GenericSlot {
+            type_code,
+            flags,
+            value: Some(Value::Struct(Some(id))),
+        }),
+        _ => {
+            return Err(invalid(format!(
+                "mmh: {parent}'s children are not a generic list"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Sets an integer value of whatever width it has; `None` if `n` does not fit it.
+fn set_int(v: &mut crate::gff4::Value, n: i64) -> Option<()> {
+    use crate::gff4::Value;
+    match v {
+        Value::U8(x) => *x = u8::try_from(n).ok()?,
+        Value::I8(x) => *x = i8::try_from(n).ok()?,
+        Value::U16(x) => *x = u16::try_from(n).ok()?,
+        Value::I16(x) => *x = i16::try_from(n).ok()?,
+        Value::U32(x) => *x = u32::try_from(n).ok()?,
+        Value::I32(x) => *x = i32::try_from(n).ok()?,
+        Value::U64(x) => *x = u64::try_from(n).ok()?,
+        Value::I64(x) => *x = n,
+        _ => return None,
+    }
+    Some(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
