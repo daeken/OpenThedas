@@ -3,7 +3,8 @@
 //! The pieces, bottom up:
 //!
 //! - [`erf`]: the ERF container family (V2.0, V2.1, V2.2, V3.0). DA:O `.rim` files are ERF V2.0.
-//! - [`crypto`]: the Blowfish scheme DA:O uses for encrypted DLC archives (ERF V2.2).
+//! - [`crypto`]: the Blowfish schemes of encrypted DLC archives (DA:O's ERF V2.2, DA2's V3.0),
+//!   and [`keys_file`]: their passwords from a file the player supplies.
 //! - [`vfs`]: an ordered stack of layers (archives and loose directories). Lookups return the
 //!   highest-priority hit together with where it came from, so later tooling can show mod
 //!   conflicts and shadowed files.
@@ -15,9 +16,11 @@
 //!   treats case-insensitively but a case-sensitive volume would not.
 
 pub mod crypto;
+mod dlc_search;
 pub mod erf;
 mod gog_dlc;
 pub mod install;
+pub mod keys_file;
 pub mod mods;
 pub mod path;
 pub mod vfs;
@@ -43,8 +46,13 @@ pub enum Error {
     UnsupportedVersion { path: PathBuf, version: String },
     #[error("{path}: malformed archive: {reason}")]
     Malformed { path: PathBuf, reason: String },
-    #[error("{path}: entry {name} is encrypted and no key was supplied")]
-    Encrypted { path: PathBuf, name: String },
+    /// `hint` says where a key could come from (empty, or a sentence in brackets).
+    #[error("{path}: entry {name} is encrypted and no key was supplied{hint}")]
+    Encrypted {
+        path: PathBuf,
+        name: String,
+        hint: String,
+    },
     #[error("{path}: key does not match the archive's password digest")]
     WrongKey { path: PathBuf },
     #[error("{path}: entry {name}: unsupported compression {compression}")]

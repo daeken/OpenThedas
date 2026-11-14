@@ -148,9 +148,10 @@ these, so they are the places where one person or stream can take a large, separ
 ### Platform, formats and project
 
 - **Movies need an external `ffmpeg`** beside the game or on the PATH (`CAM-029`).
-- **DLC passwords come only from the GOG Ultimate Edition executable.** Other editions' encrypted
-  DLC stays unread, and the DA2 and XOR readers are checked only synthetically (`FMT-001`,
-  `FMT-002`).
+- **DA:O DLC passwords on editions other than GOG are found by a search** over the archive's
+  digest (a few seconds once, then kept in the player's data folder), not yet tried on a real
+  non-GOG install. DA2 DLC needs the player's keys file, and the XOR reader is checked only
+  synthetically (`FMT-001`, `FMT-002`).
 - **Only the base campaign can be played.** Awakening, DLC campaigns and toolset modules cannot
   be selected (`FMT-014`).
 - **Windows and Linux are untested**, continuous integration is switched off, there is no
