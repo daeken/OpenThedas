@@ -18,11 +18,6 @@ repository.
 - **From source**: install Rust, then `cargo build --release -p thedas-app` and run
   `target/release/thedas-app --install "$GAME"`.
 
-Movies (the logos, the opening, each origin's intro film) need `ffmpeg`, which is not included.
-Without it they are skipped and nothing else changes. Put `ffmpeg` (`ffmpeg.exe` on Windows) in
-your OpenThedas data folder, next to the program, or on your `PATH`; on macOS Homebrew's is
-found too.
-
 Your saves, settings, reports and the journal live in your data folder: `Documents\OpenThedas`
 on Windows, `~/.openthedas` elsewhere.
 
@@ -35,7 +30,7 @@ parallel, see [docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md).
 
 Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–20, with fixes merged since then noted.
 
-- ✅ **Boot flow**: EA logo and intro movies play with their sound (decoded via ffmpeg, looked for beside the executable, on the path, and in Homebrew on macOS), then the start menu.
+- ✅ **Boot flow**: EA logo and intro movies play with their sound (decoded by our own Bink decoder, `thedas-video`), then the start menu.
 - ✅ **Start menu**: New Game, Load, Options and Quit are wired; QA graded it near pixel-identical to the original.
 - 🟡 **Character creation**: full flow with the original's stage, blended camera presets and portrait.
   - Appearance menu: preset, hair, beard, the exe's per-race eye and nose shapes, makeup and complexion. Also colour sliders, difficulty and name.
@@ -198,8 +193,7 @@ simulation.
 | `thedas-ui` | Scaleform GFx movies on Ruffle: GFx-to-SWF rewriting with atlas images inlined, offscreen rendering into a wgpu texture, and the engine side of the game's GUI protocol |
 | `thedas-mcp` | An MCP server over the simulation, so an AI assistant (or any MCP client) can play and test the game |
 | `thedas-cli` | The `thedas` tool: `ls`, `extract`, `dump`, `resolve`, `corpus` |
-
-Planned crates follow the architecture doc: `thedas-video` (movies currently go through an external `ffmpeg`).
+| `thedas-video` | Bink movies: the container, Bink 1 video (revision `i`) and Bink audio (DCT), decoded natively |
 
 ## Playing
 
@@ -214,7 +208,7 @@ With nothing else, the game boots to its start menu (startmenu2.gfx): New Game g
 character creation, Load Game lists the saves in `~/.openthedas/saves` (`--saves` for another
 folder), Options and Quit work. In a game, Escape (Start on a pad) opens the game menu: save,
 load, options, and Exit Game back to the start menu. The logo and intro movies the original
-plays before the menu are shown when `ffmpeg` is installed (`--no-intro` skips them). `--new-game` (with `--quick-start`)
+plays before the menu are shown (`--no-intro` skips them). `--new-game` (with `--quick-start`)
 and `--save <file>` still start a game directly.
 
 ## Issue reports and updates

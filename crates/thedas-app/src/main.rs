@@ -1,7 +1,7 @@
 //! `thedas-app`: play Dragon Age: Origins, or walk through an area.
 //!
 //! With only `--install`, the game boots as the original does: the EA logo and intro movies
-//! (decoded by `ffmpeg`, silent for now; a key, a click or the pad's A, B or Start skips
+//! (decoded by `thedas-video`, with their sound; a key, a click or the pad's A, B or Start skips
 //! one; `--no-intro` skips them), then its start menu (startmenu2.gfx: New Game, Load,
 //! Options, Quit); in a game Escape (or the pad's Start) opens the game menu (mainmenu.gfx),
 //! whose Exit Game returns to the start menu.
@@ -6968,14 +6968,14 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    /// Against a real install (`THEDAS_INSTALL`) and `ffmpeg`, offscreen: the EA logo's frame
+    /// Against a real install (`THEDAS_INSTALL`), offscreen: the EA logo's frame
     /// two seconds in is drawn letterboxed in a taller window (written to `$INTRO_PNG` when
     /// set, to look at).
     #[test]
     #[ignore]
     fn the_intro_draws_its_frame_letterboxed() {
         let install = PathBuf::from(std::env::var_os("THEDAS_INSTALL").expect("THEDAS_INSTALL"));
-        let mut intro = intro::Intro::boot(&install).expect("ffmpeg and the movies");
+        let mut intro = intro::Intro::boot(&install).expect("the movies");
         let ctx = GpuContext::headless().unwrap();
         let (w, h) = (1280, 960);
         let format = wgpu::TextureFormat::Bgra8Unorm;
