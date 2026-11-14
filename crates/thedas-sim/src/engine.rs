@@ -3615,12 +3615,35 @@ pub fn call(
             }
             void()
         }
-        // -1 restores the creature's own appearance (rules_core ends a shapeshift so).
-        // Provisional: its own is taken to be its template's. A party member losing its
-        // appearance is traced: it draws nothing.
         "SetAppearanceType" => {
             let who = obj(a, 0);
             let mut app = int(a, 1);
+            if h.sim.game == thedas_vfs::Game::Origins {
+                // 0x674c80: validate before narrowing, update the base before comparing
+                // current values, and let -1 restore that base (0x747b40/0x748a40).
+                if app != -1 && app <= 0 {
+                    return void();
+                }
+                let Some(o) = h.object(who).filter(|o| o.kind == ObjectKind::Creature) else {
+                    return void();
+                };
+                let current = o.appearance as u16;
+                let base = o.base_appearance;
+                let base = base.unwrap_or_else(|| {
+                    h.sim.original_appearance(who).unwrap_or(i32::from(current)) as u16
+                });
+                let o = h.sim.world.get_mut(who).unwrap();
+                if app > 0 {
+                    // Capture the fallback on the first temporary change, too: creatures
+                    // without a readable template must still retain their prior base.
+                    o.base_appearance = Some(if int(a, 2) != 0 { app as u16 } else { base });
+                }
+                if current != app as u16 {
+                    o.appearance = i32::from(if app == -1 { base } else { app as u16 });
+                }
+                return void();
+            }
+            // DA2's setter is untraced; retain its existing template fallback and inputs.
             if app == -1 {
                 app = h
                     .sim
@@ -6755,6 +6778,104 @@ mod tests {
                 Some(Value::String(expected.into()))
             );
         }
+    }
+
+    #[test]
+    fn origins_appearance_base_survives_temporary_changes_and_reload() {
+        let table =
+            EngineTable::parse(b"void SetAppearanceType(object o, int n, int b = 0) = 178;\n")
+                .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        s.module_info.name = "test".into();
+        let creature = s.world.spawn(ObjectKind::Creature, "creature");
+        s.world.get_mut(creature).unwrap().appearance = 15;
+        let set = |s: &mut Sim, appearance, base| {
+            run(
+                s,
+                creature,
+                "SetAppearanceType",
+                &[
+                    Value::Object(creature),
+                    Value::Int(appearance),
+                    Value::Int(base),
+                ],
+            );
+        };
+        set(&mut s, 93, 0);
+        assert_eq!(s.world.get(creature).unwrap().base_appearance, Some(15));
+        // Updating the base still takes effect when the current appearance is unchanged.
+        set(&mut s, 93, -1);
+        assert_eq!(s.world.get(creature).unwrap().base_appearance, Some(93));
+        set(&mut s, 1, 0);
+        s.load_game(s.save_game()).unwrap();
+        set(&mut s, -1, 1);
+        let o = s.world.get(creature).unwrap();
+        assert_eq!((o.appearance, o.base_appearance), (93, Some(93)));
+        // Positive arguments narrow to 16 bits, including a wrapped zero base.
+        set(&mut s, 65536, 1);
+        set(&mut s, 15, 0);
+        set(&mut s, -1, 0);
+        assert_eq!(s.world.get(creature).unwrap().appearance, 0);
+        set(&mut s, 15, 1);
+        set(&mut s, 65535, 0);
+        set(&mut s, -1, 0);
+        // The native 16-bit current comparison happens before the -1 restoration.
+        assert_eq!(s.world.get(creature).unwrap().appearance, 65535);
+        set(&mut s, 65536 + 93, 1);
+        assert_eq!(s.world.get(creature).unwrap().appearance, 93);
+    }
+
+    #[test]
+    fn origins_appearance_validation_preserves_objects_and_da2_behavior() {
+        let table =
+            EngineTable::parse(b"void SetAppearanceType(object o, int n, int b = 0) = 178;\n")
+                .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        for kind in [
+            ObjectKind::Creature,
+            ObjectKind::Placeable,
+            ObjectKind::Item,
+        ] {
+            let id = s.world.spawn(kind, "object");
+            s.world.get_mut(id).unwrap().appearance = 15;
+            for appearance in [0, -2, i32::MIN] {
+                run(
+                    &mut s,
+                    id,
+                    "SetAppearanceType",
+                    &[Value::Object(id), Value::Int(appearance), Value::Int(1)],
+                );
+                let o = s.world.get(id).unwrap();
+                assert_eq!((o.appearance, o.base_appearance), (15, None));
+            }
+            if kind != ObjectKind::Creature {
+                run(
+                    &mut s,
+                    id,
+                    "SetAppearanceType",
+                    &[Value::Object(id), Value::Int(93), Value::Int(1)],
+                );
+                assert_eq!(s.world.get(id).unwrap().appearance, 15);
+            }
+            s.game = thedas_vfs::Game::DragonAge2;
+            run(
+                &mut s,
+                id,
+                "SetAppearanceType",
+                &[Value::Object(id), Value::Int(65536), Value::Int(1)],
+            );
+            let o = s.world.get(id).unwrap();
+            assert_eq!((o.appearance, o.base_appearance), (65536, None));
+            s.game = thedas_vfs::Game::Origins;
+        }
+        let count = s.world.objects.len();
+        run(
+            &mut s,
+            OBJECT_INVALID,
+            "SetAppearanceType",
+            &[Value::Object(OBJECT_INVALID), Value::Int(93), Value::Int(1)],
+        );
+        assert_eq!(s.world.objects.len(), count);
     }
 
     /// Calls engine function `name` as `caller`.
