@@ -5064,7 +5064,11 @@ pub fn property_kind(sim: &Sim, property: i32) -> PropertyKind {
 }
 
 pub(crate) fn property_bounds(sim: &Sim, property: i32) -> Option<(i32, f32, f32)> {
-    let t = sim.world.tables.get(0, "properties")?;
+    let t = if sim.game == thedas_vfs::Game::DragonAge2 {
+        sim.world.tables.get(98, "")?
+    } else {
+        sim.world.tables.get(0, "properties")?
+    };
     let num = |c: Option<&Cell>| match c {
         Some(Cell::Int(v)) => Some(*v as f32),
         Some(Cell::Float(v)) => Some(*v as f32),

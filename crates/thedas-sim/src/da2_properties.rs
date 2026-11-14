@@ -224,7 +224,6 @@ mod tests {
                 )
             })
             .collect();
-        t.insert("properties", &columns, props.clone());
         t.insert("#98", &columns, props);
         t.insert(
             "#371",
