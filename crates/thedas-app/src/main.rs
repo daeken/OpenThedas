@@ -1453,6 +1453,9 @@ impl App {
         if let Some(g) = self.gfx.as_mut() {
             if let Some(stats) = g.frames.frame(Instant::now()) {
                 g.window.set_title(&format!("{} | {stats}", g.title));
+                if g.frames.log_due() {
+                    log::info!("frame rate: {stats}");
+                }
             }
         }
         self.audio_frame();
