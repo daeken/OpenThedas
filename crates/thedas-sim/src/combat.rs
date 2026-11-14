@@ -1930,6 +1930,9 @@ impl Sim {
     /// keeps the style in the creature's combat state (0x6a3c30); how it sets it is not
     /// traced, so it is read from the weapons as [`attack_tree`] reads them.
     pub fn weapon_style(&self, id: ObjectId) -> i32 {
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            return self.da2_combat_style(id);
+        }
         let Some(o) = self.world.get(id) else {
             return constant_of(self, "WEAPONSTYLE_NONE");
         };
