@@ -1889,12 +1889,22 @@ pub fn call(
         // (0x66cd00 -> 0x79c8d0). That setter clamps between the property's current floor
         // and computed total. Mana's floor stays at its initialized zero; the immortality
         // setter changes health's floor only (0x6ad130). See notes/mana-property-floor.md.
-        "GetCreatureMana" | "GetCreatureMaxMana" => {
-            let (id, p) = (obj(a, 0), PROPERTY_MANA_STAMINA);
+        // DA2's renamed stamina calls use property 10: 0x4fb030 reads current,
+        // 0x4fb110 reads total, and both truncate to int (-1 for a non-creature).
+        "GetCreatureMana"
+        | "GetCreatureMaxMana"
+        | "GetCreatureStamina"
+        | "GetCreatureMaxStamina" => {
+            let id = obj(a, 0);
+            let p = if name.ends_with("Stamina") {
+                10
+            } else {
+                PROPERTY_MANA_STAMINA
+            };
             let creature = h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature);
             ok(Value::Int(if !creature {
                 -1
-            } else if name == "GetCreatureMana" {
+            } else if matches!(name, "GetCreatureMana" | "GetCreatureStamina") {
                 h.object(id)
                     .and_then(|o| o.properties.get(&p))
                     .map_or(0.0, |v| v.1) as i32
@@ -1902,8 +1912,14 @@ pub fn call(
                 h.sim.property_total(id, p) as i32
             }))
         }
-        "SetCreatureMana" => {
-            let (id, p) = (obj(a, 0), PROPERTY_MANA_STAMINA);
+        "SetCreatureMana" | "SetCreatureStamina" => {
+            // DA2 0x4fb0a0 passes the integer as a float to property 10's current setter.
+            let id = obj(a, 0);
+            let p = if name == "SetCreatureStamina" {
+                10
+            } else {
+                PROPERTY_MANA_STAMINA
+            };
             if h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature) {
                 let max = h.sim.property_total(id, p);
                 if let Some(o) = h.sim.world.get_mut(id) {
@@ -8751,6 +8767,9 @@ mod coverage_tests {
         int GetCreatureMana(object o) = 72;\n\
         void SetCreatureMana(object o, int n) = 73;\n\
         int GetCreatureMaxMana(object o) = 74;\n\
+        int GetCreatureStamina(object o) = 238;\n\
+        void SetCreatureStamina(object o, int n) = 239;\n\
+        int GetCreatureMaxStamina(object o) = 240;\n\
         void RemoveAllEffects(object o, int i = TRUE, int d = FALSE) = 75;\n\
         void SetCreatureIsGhost(object o, int v) = 76;\n\
         void SetQuickslotBar(object o, int n) = 77;\n\
@@ -9396,6 +9415,51 @@ mod coverage_tests {
             s.world.get(chest).unwrap().properties[&PROPERTY_MANA_STAMINA],
             (40.0, 12.0)
         );
+    }
+
+    #[test]
+    fn da2_stamina_uses_property_ten_and_its_computed_ceiling() {
+        let mut s = sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let mage = s.world.spawn(ObjectKind::Creature, "mage");
+        let chest = s.world.spawn(ObjectKind::Placeable, "chest");
+        let o = s.world.get_mut(mage).unwrap();
+        o.properties
+            .extend([(8, (999.0, 998.0)), (10, (40.0, 12.7))]);
+        o.modifiers.insert(10, 13.5);
+        let get = |s: &mut Sim, f: &str, id| run(s, id, f, &[Value::Object(id)]);
+        assert_eq!(
+            get(&mut s, "GetCreatureStamina", mage),
+            Some(Value::Int(12))
+        );
+        assert_eq!(
+            get(&mut s, "GetCreatureMaxStamina", mage),
+            Some(Value::Int(53))
+        );
+        for (value, current) in [(30, 30.0), (90, 53.5), (-5, 0.0)] {
+            run(
+                &mut s,
+                mage,
+                "SetCreatureStamina",
+                &[Value::Object(mage), Value::Int(value)],
+            );
+            assert_eq!(s.world.get(mage).unwrap().properties[&10].1, current);
+        }
+        assert_eq!(s.world.get(mage).unwrap().properties[&8], (999.0, 998.0));
+        for id in [chest, OBJECT_INVALID] {
+            assert_eq!(get(&mut s, "GetCreatureStamina", id), Some(Value::Int(-1)));
+            assert_eq!(
+                get(&mut s, "GetCreatureMaxStamina", id),
+                Some(Value::Int(-1))
+            );
+            run(
+                &mut s,
+                mage,
+                "SetCreatureStamina",
+                &[Value::Object(id), Value::Int(90)],
+            );
+        }
+        assert!(!s.world.get(chest).unwrap().properties.contains_key(&10));
     }
 
     #[test]
