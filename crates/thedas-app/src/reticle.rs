@@ -126,6 +126,7 @@ fn fs() -> @location(0) vec4<f32> { return colour; }
 "#;
 
 /// Draws the reticle over the frame in the window.
+#[derive(Clone)]
 pub struct ReticlePass {
     pipeline: wgpu::RenderPipeline,
     group: wgpu::BindGroup,

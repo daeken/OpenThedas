@@ -492,7 +492,7 @@ fn capture(
     shader_time: f64,
     (overlay, pointer): (Vec<[glam::Vec2; 2]>, Vec<[glam::Vec2; 2]>),
 ) -> Result<()> {
-    let mut reticle = overlay;
+    let reticle = overlay;
     let pixels = if let Some(live) = live {
         live.frame_size = (w, h);
         live.sync(ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
@@ -504,7 +504,8 @@ fn capture(
         if let Some(l) = live.level.as_ref() {
             log_stats(&l.renderer);
         }
-        reticle.extend(live.reticle(&camera, (w, h), cursor));
+        // The aiming reticle is drawn with the world, under the creatures.
+        live.cursor = cursor;
         // THEDAS_BENCH_FRAMES=n: draws the frame n more times first and reports how long
         // each took (with its read back to memory), for comparing builds.
         if let Some(n) = std::env::var("THEDAS_BENCH_FRAMES")
@@ -1531,7 +1532,10 @@ impl App {
         }
         let size = (g.config.width, g.config.height);
         let drawn = match (self.live.as_mut(), g.renderer.as_mut()) {
-            (Some(live), _) => live.render(&g.ctx, &mut encoder, &view, size, &self.camera),
+            (Some(live), _) => {
+                live.cursor = self.cursor;
+                live.render(&g.ctx, &mut encoder, &view, size, &self.camera)
+            }
             (None, Some(r)) => {
                 r.advance_time(dt / 1000.0);
                 r.render(&g.ctx, &mut encoder, &view, size.0, size.1, &self.camera);
@@ -1654,13 +1658,13 @@ impl App {
                 a.text
             );
         }
-        // An ability aimed at a place shows where it would land, under the interface.
+        // The pad's marks on the world, under the interface (an ability aimed at a place
+        // shows where it would land with the world itself: see `Live::render`).
         if let Some(live) = self.live.as_mut() {
-            let mut lines = live.reticle(&self.camera, size, self.cursor);
             let ctx = self
                 .pad
                 .context_for(self.screens.as_ref(), g.ui.stage.dialog_up());
-            lines.extend(self.pad.overlay(Some(&*live), &self.camera, size, ctx));
+            let lines = self.pad.overlay(Some(&*live), &self.camera, size, ctx);
             g.reticle
                 .draw(&g.ctx.device, &mut encoder, &view, size, &lines);
         }
@@ -4265,7 +4269,7 @@ impl App {
         let mut reticle = Vec::new();
         let pixels = match (self.live.as_mut(), g.renderer.as_mut()) {
             (Some(live), _) => {
-                reticle = live.reticle(&self.camera, (w, h), self.cursor);
+                live.cursor = self.cursor;
                 let ctx = self
                     .pad
                     .context_for(self.screens.as_ref(), g.ui.stage.dialog_up());
