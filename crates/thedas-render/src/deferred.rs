@@ -1840,7 +1840,7 @@ fn casters<'a>(
     draws: &'a [PlanDraw],
     cutouts: &'a [crate::deferred_cutout::Draw],
     materials: &'a [crate::deferred_cutout::Material],
-    d3d: &D3dPass,
+    d3d: &'a D3dPass,
     meshes: &'a [GpuMesh],
     streams: (&'a HashMap<usize, wgpu::Buffer>, &'a wgpu::Buffer),
 ) -> Vec<crate::deferred_shadow::Caster<'a>> {
@@ -1854,6 +1854,11 @@ fn casters<'a>(
                 vertices: vertices.get(&d.mesh)?,
                 bones,
                 bone_offset: (d.skin_slot * SKIN_STRIDE) as u32,
+                pose: if d.skin_slot > 0 {
+                    d3d.bones(d.draw)
+                } else {
+                    &[]
+                },
                 world: d3d.world(d.draw).unwrap_or(Mat4::IDENTITY),
                 sphere: d3d.draw_sphere(&d3d.draws[d.k]).unwrap_or(d.sphere),
                 alpha: [0.0; 4],
@@ -1872,6 +1877,11 @@ fn casters<'a>(
                     vertices: vertices.get(&d.mesh)?,
                     bones,
                     bone_offset: (d.skin_slot * SKIN_STRIDE) as u32,
+                    pose: if d.skin_slot > 0 {
+                        d3d.bones(d.draw)
+                    } else {
+                        &[]
+                    },
                     world: d3d.world(d.draw).unwrap_or(Mat4::IDENTITY),
                     sphere: d3d.draw_sphere(&d3d.draws[d.k]).unwrap_or(d.sphere),
                     alpha: d.alpha,

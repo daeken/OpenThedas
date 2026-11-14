@@ -31,6 +31,16 @@ original scene before selecting `path = RenderPath::Deferred`.
 
 ## Frame (deferred path)
 
+Point-shadow cubes retain their previous contents when their exact inputs are unchanged.
+Each slot compares its light position/radius and the eligible casters in reach: geometry
+buffers, transform, posed bounds, bone palette values, opacity test/clip, and immutable
+material texture/sampler handles. A changed slot redraws all six faces; removed/faded
+casters and newly empty slots clear correctly. Camera movement alone can reuse a cube,
+unless it changes slot selection. Resource reloads replace the renderer and its cache.
+`THEDAS_DEFERRED_SHADOW_REUSE=0` redraws every active cube for comparison. Animated or moving
+casters still invalidate every cube they reach; stationary capture gains do not predict
+the same gain during motion.
+
 1. Shadows exactly as now (the faithful pass places and draws the sun partitions).
 2. **G-buffer pass** over the deferred draws, writing the shared depth buffer:
 
