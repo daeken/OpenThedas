@@ -37,6 +37,7 @@ pub mod material;
 pub mod msaa;
 pub mod particles;
 pub mod post;
+mod profile;
 pub mod scene;
 pub mod shadow;
 pub mod skeleton;

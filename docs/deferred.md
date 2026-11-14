@@ -128,6 +128,15 @@ Cutout point shadows use the independent textured-caster plan; these cards never
 the opaque cube-shadow pipeline. Prop punch, eyelashes, hair, trees and blended materials
 retain their own forward equations.
 
+Single-pass, depth-writing `Char1` / `Ch1Alph` character cutouts also share the G-buffer
+when their pass alpha-tests without blending. The ordinary, NoTint, MulTint, ArmourTint
+and corresponding emissive variants retain the existing character probe, tint and lighting
+equations. Coverage uses diffuse alpha times the authored opacity multiplier and the
+pass's rounded 8-bit comparison/reference. This family has no additional shader clip.
+The same sampled coverage supplies posed point-shadow casters. Missing opacity maps,
+multi-pass materials, runtime fades and unsupported palettes retain the forward fallback.
+`THEDAS_DEFERRED_CHARACTER_CUTOUTS=0` disables both additions for comparison.
+
 **Objects and characters**: opaque, single-pass `Prop1`, `Weapon1`, `Cloth1`, and
 `Char1` with `Ch1`, its NoTint, MulTint and ArmourTint variants, and their emissive
 variants. Static1 draws in object renderers also qualify. `THEDAS_DEFERRED_OBJECTS=0`
@@ -235,7 +244,8 @@ debug views now include the ground. Terrain also joins the point-shadow caster l
   visibility. At most 24 face passes per frame.
   `THEDAS_DEFERRED_POINT_SHADOWS=0` disables both rendering and sampling these maps for
   captures and cost comparisons; it does not change the faithful path.
-- Forward cutouts: known Origins `Static1_Punch`, `Prop1_Punch`, `Eye0/Eyelash0`, and the
+- Forward cutouts: known Origins `Static1_Punch`, `Prop1_Punch`, alpha-tested `Ch1Alph`,
+  `Eye0/Eyelash0`, and the
   colour-disabled `Hair0_Pass1` depth core also cast into point-light cubes, independently
   of G-buffer coverage and `THEDAS_DEFERRED_OBJECTS`. Geometry retains UVs, morphs and the
   current four-weight pose. The opacity map, sampler address/filter/mip states, opacity
@@ -307,6 +317,23 @@ pairs. `bench comparison modes` labels control frames 0 and test frames 1. Overr
 are per renderer, without mutating environment variables while other threads run, and
 are cleared after the benchmark. These measurements are not isolated GPU timings or
 whole-gameplay FPS; shared-machine load can still affect absolute values.
+
+## Capture profiling
+
+`THEDAS_RENDER_PROFILE=1` records CPU stage durations for offscreen world captures and
+requests optional GPU timestamps from the adapter. When timestamps are
+available, it also reports durations on the actual G-buffer, lighting, reflection and
+level-forward render passes. CPU stages cover shadow preparation/encoding, object overlays,
+post-processing and pixel copies too. Unsupported adapters still report CPU durations.
+The existing `THEDAS_BENCH_FRAMES` and same-process
+ABBA path comparison can collect warmed samples for each renderer.
+
+CPU encoding, submission/wait/pixel unpacking and GPU execution are reported separately.
+GPU stages can overlap CPU work, so their durations cannot be summed into CPU frame time.
+The GPU samples cover these four passes. Forward object passes, shadows, uploads and
+post-processing need separate instrumentation for a complete GPU frame budget.
+Profiling adds query resources, timestamp writes and a diagnostic readback per capture.
+Use ordinary paired captures with profiling disabled for the relative frame-cost target.
 
 ## Order of work
 

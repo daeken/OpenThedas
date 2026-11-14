@@ -49,6 +49,9 @@ fn rule(name: &str) -> Option<Rule> {
             ("mml_tPackedTexture", "smpHairTexture", 2, -1.0, true)
         }
         ("eye0.vsh", "eyelash0.psh") => ("mml_tDiffuse", "smpDecal", 3, -1.0, false),
+        ("char1.vsh", _) if crate::deferred_alpha::character(name) => {
+            ("mml_tDiffuse", "smpDecal", 3, -1.0, false)
+        }
         _ => return None,
     };
     Some(Rule {
@@ -112,6 +115,11 @@ pub(crate) fn plan(
         let Some(r) = rule(&program.name) else {
             continue;
         };
+        if crate::deferred_alpha::character(&program.name)
+            && std::env::var("THEDAS_DEFERRED_CHARACTER_CUTOUTS").as_deref() == Ok("0")
+        {
+            continue;
+        }
         let p = &program.pass;
         let Some(item) = scene.draws.get(d.draw) else {
             continue;
@@ -309,5 +317,26 @@ mod tests {
                 .channel,
             3
         );
+    }
+
+    #[test]
+    fn character_cutouts_keep_diffuse_alpha_and_reject_blended_colour() {
+        let r = rule("char1.vsh+ch1alphemarmtnt.psh+characterpt.sta").unwrap();
+        assert_eq!(r.channel, 3);
+        assert_eq!(r.clip, -1.0);
+        assert_eq!(r.texture, "mml_tDiffuse");
+        let mut pass =
+            thedas_formats::state::MaterialState::parse(br#"<MaterialState Name="fixture"/>"#)
+                .unwrap()
+                .pass()
+                .unwrap();
+        pass.alpha_test = Some((CompareFunc::GreaterEqual, 128));
+        assert!(supported_pass(r, &pass, true));
+        pass.blend = Some((
+            BlendFactor::SrcAlpha,
+            BlendFactor::InvSrcAlpha,
+            BlendOp::Add,
+        ));
+        assert!(!supported_pass(r, &pass, true));
     }
 }

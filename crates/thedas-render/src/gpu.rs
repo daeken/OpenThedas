@@ -76,8 +76,11 @@ impl GpuContext {
             .contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
         // Clamping to a border colour (D3D's `TEXADD_BORDER`: the sky's celestial body) when
         // the adapter can; samplers fall back to clamping to the edge otherwise.
-        let wanted =
+        let mut wanted =
             wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER;
+        if crate::profile::enabled() {
+            wanted |= wgpu::Features::TIMESTAMP_QUERY;
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("thedas"),
@@ -1639,7 +1642,9 @@ impl AreaRenderer {
         camera: &Camera,
         objects: &mut [&mut AreaRenderer],
     ) {
-        self.render_pass_with(ctx, encoder, target, width, height, camera, None, objects);
+        self.render_pass_with(
+            ctx, encoder, target, width, height, camera, None, objects, None,
+        );
     }
 
     /// Fills this frame's constants: placing the shadow partitions (a renderer of the
@@ -1694,7 +1699,17 @@ impl AreaRenderer {
         camera: &Camera,
         over: Option<&wgpu::TextureView>,
     ) {
-        self.render_pass_with(ctx, encoder, target, width, height, camera, over, &mut []);
+        self.render_pass_with(
+            ctx,
+            encoder,
+            target,
+            width,
+            height,
+            camera,
+            over,
+            &mut [],
+            None,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1708,6 +1723,7 @@ impl AreaRenderer {
         camera: &Camera,
         over: Option<&wgpu::TextureView>,
         objects: &mut [&mut AreaRenderer],
+        mut profile: Option<&mut crate::profile::CaptureProfile>,
     ) {
         let contributed = std::mem::take(&mut self.deferred_in_frame);
         if over.is_none() {
@@ -1780,6 +1796,9 @@ impl AreaRenderer {
                 })
             })
             .collect();
+        if let Some(p) = profile.as_deref_mut() {
+            p.mark("frame_prepare");
+        }
         let deferred = deferred_now
             && self.deferred.as_mut().is_some_and(|p| {
                 p.set_own_lights(own);
@@ -1795,6 +1814,7 @@ impl AreaRenderer {
                     &self.meshes,
                     self.clear,
                     &mut contributors,
+                    profile.as_deref_mut(),
                 )
             });
         drop(contributors);
@@ -1839,7 +1859,7 @@ impl AreaRenderer {
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: None,
+            timestamp_writes: profile.as_deref_mut().and_then(|p| p.pass("level_forward")),
             occlusion_query_set: None,
             multiview_mask: None,
         });
@@ -1849,6 +1869,10 @@ impl AreaRenderer {
             !self.late_transparency,
             deferred || contributed,
         );
+        drop(pass);
+        if let Some(p) = profile {
+            p.mark("level_forward");
+        }
     }
 
     /// Completes this renderer's delayed blended/faded draws and particles over a shared
@@ -2115,6 +2139,7 @@ impl AreaRenderer {
         overlays: &mut [&mut AreaRenderer],
         under: Option<GroundUnderlay<'_>>,
     ) -> Result<Vec<u8>, GpuError> {
+        let mut profile = crate::profile::CaptureProfile::new(ctx);
         let target = ctx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("capture"),
             size: wgpu::Extent3d {
@@ -2142,15 +2167,24 @@ impl AreaRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("capture"),
             });
+        if let Some(p) = &mut profile {
+            p.mark("allocate");
+        }
         self.prepare_shadows(ctx, camera, width, height);
         for o in overlays.iter_mut() {
             o.prepare_shadows(ctx, camera, width, height);
+        }
+        if let Some(p) = &mut profile {
+            p.mark("sun_prepare");
         }
         self.encode_shadows(&mut encoder, true);
         for o in overlays.iter_mut() {
             o.encode_shadows(&mut encoder, false);
         }
         self.finish_shadows(&mut encoder);
+        if let Some(p) = &mut profile {
+            p.mark("sun_shadows");
+        }
         self.render_pass_with(
             ctx,
             &mut encoder,
@@ -2160,12 +2194,16 @@ impl AreaRenderer {
             camera,
             None,
             overlays,
+            profile.as_mut(),
         );
         let frame = self.frame_view(&ctx.device, &view, width, height);
         if let Some(under) = under {
             self.render_ground(ctx, &mut encoder, &frame, |encoder| {
                 under(encoder, &frame);
             });
+        }
+        if let Some(p) = &mut profile {
+            p.mark("ground");
         }
         if !overlays.is_empty() {
             let depth = self.depth(&ctx.device, width, height);
@@ -2177,10 +2215,16 @@ impl AreaRenderer {
                 o.finish_transparency(&mut encoder, &frame, &depth);
             }
         }
+        if let Some(p) = &mut profile {
+            p.mark("object_transparency");
+        }
         self.resolve(&ctx.device, &mut encoder, &view, width, height);
         {
             let over: Vec<&AreaRenderer> = overlays.iter().map(|o| &**o).collect();
             self.finish_frame_with(ctx, &mut encoder, &target, width, height, &over);
+        }
+        if let Some(p) = &mut profile {
+            p.mark("resolve_post");
         }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -2203,6 +2247,10 @@ impl AreaRenderer {
                 depth_or_array_layers: 1,
             },
         );
+        if let Some(p) = &mut profile {
+            p.mark("copy_pixels");
+            p.resolve(&mut encoder);
+        }
         ctx.queue.submit([encoder.finish()]);
         let (tx, rx) = std::sync::mpsc::channel();
         readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
@@ -2236,6 +2284,9 @@ impl AreaRenderer {
         // Captures are opaque images.
         for px in out.chunks_exact_mut(4) {
             px[3] = 255;
+        }
+        if let Some(p) = profile {
+            p.finish(ctx, self.path)?;
         }
         Ok(out)
     }
