@@ -131,8 +131,8 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
 - `MovieClip.duplicateMovieClip` constructs a fresh instance of the registered class with
   the source's transform, colour, drawing and clip events. The host can now add its Mod Mode
   button alongside Report Issue using the same menu setup on either backend.
-- Not yet: complete text `shadowStyle`, `setMask`, inline `<img>` in text,
-  and complete parity on engine-state screens (book screens, popups, conversation).
+- Remaining work includes complete text `shadowStyle`, native inline `<img>` layout,
+  cached bitmap alpha masks, and broader interaction parity.
 - Tools: `cargo run -p thedas-ui --example sidebyside -- INSTALL OUT.png MOVIES [FRAMES]
   [WxH] [ORIGINAL.png]` (Ruffle and ours, optionally after a shot of the original);
   `thedas-gfx` examples `gfxscan` (parse), `gfxrun` (run headless; `GFX_RENDER=1` times
