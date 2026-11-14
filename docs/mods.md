@@ -26,9 +26,10 @@ Start the game. That is all.
 | a folder | Every file in it, at any depth, is used. `.erf` and `.rim` archives inside it are opened too. |
 | a `.zip` | Read where it is; nothing is unpacked. Archives inside the zip are not opened. |
 | a `.7z` | Unpacked once into the mod cache (see below), then used like a folder. |
+| a `.rar` | The same as a `.7z`. For an archive split into parts, list the first part and keep the others beside it. |
 | a `.dazip` | The original's add-in package. Unpacked once into the mod cache; its add-in joins the game's DLC and its override files become a mod layer. |
 | an `.erf` or `.rim` | Opened as it is. |
-| `archive!/folder` | Only that folder of a `.zip` or `.7z`. Use it when a mod ships several variants with the same file names. |
+| `archive!/folder` | Only that folder of a `.zip`, `.7z` or `.rar`. Use it when a mod ships several variants with the same file names. |
 
 Rules for the list:
 
@@ -98,7 +99,7 @@ Documents folders, or `THEDAS_MODS=<path to another list>` to use a different li
 
 ## The mod cache
 
-`.7z` and `.dazip` files are unpacked once into `mod-cache` inside your data folder, and used
+`.7z`, `.rar` and `.dazip` files are unpacked once into `mod-cache` inside your data folder, and used
 from there on later starts. A big texture pack takes a while and a lot of disk the first time
 (a 4x texture pack of 11 GB unpacks to about 20 GB). If you change or replace the archive it
 is unpacked again under a new name, and the old copy stays until you remove it:
@@ -163,9 +164,21 @@ once; the level's own textures and meshes change on its next load.
 
 ## What does not work yet
 
-- `.rar` archives, and encrypted `.7z` archives.
+- Encrypted `.7z` and `.rar` archives.
 - Archives inside a `.zip`.
-- The original's "offers" (its in-game DLC shop stubs) are not loaded.
 
 The full list, with what the original does in each case, is in
 [`docs/gaps/formats.md`](gaps/formats.md) under "Layering, DLC, mods".
+
+## UnRAR
+
+`.rar` archives are read with the UnRAR library (through the `unrar` crate). Its licence asks
+that this paragraph go with any program that includes its source:
+
+> UnRAR source code may be used in any software to handle RAR archives without limitations
+> free of charge, but cannot be used to develop RAR (WinRAR) compatible archiver and to
+> re-create RAR compression algorithm, which is proprietary. Distribution of modified UnRAR
+> source code in separate form or as a part of other software is permitted, provided that
+> full text of this paragraph, starting from "UnRAR source code" words, is included in
+> license, or in documentation if license is not available, and in source code comments of
+> resulting package.

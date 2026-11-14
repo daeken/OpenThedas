@@ -12,6 +12,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
 use thedas_formats::level::NavGrid;
+use thedas_script::vm::ObjectId;
 
 use crate::sim::Sim;
 
@@ -21,8 +22,34 @@ pub const MAX_STEP: f32 = 0.6;
 /// The radius of the body the safe-location search places (DAOrigins.exe 0xae7104).
 const SAFE_BODY_RADIUS: f32 = 0.5;
 
-/// How far round a point the safe-location search looks (DAOrigins.exe 0xae72fc).
+/// How far round a point the safe-location search looks for `GetSafeLocation` and an
+/// arriving party (DAOrigins.exe 0xae72fc).
 const SAFE_SEARCH_RADIUS: f32 = 20.0;
+
+/// How a caller of the safe-location search (DAOrigins.exe 0x73e370) runs it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SafeSearch {
+    /// How far round the point to look.
+    pub radius: f32,
+    /// The radius of the body being placed.
+    pub body_radius: f32,
+    /// The body being placed, which does not block itself.
+    pub mover: Option<ObjectId>,
+    /// The exe's "check" argument: a point over something to stand on is kept as it is
+    /// (the physics query, stood in for by the pathing grid), and the search reports it as
+    /// not moved.
+    pub standable_keeps: bool,
+}
+
+impl SafeSearch {
+    /// `GetSafeLocation` (0x65b0d0): the default 0.5 m body, 20 m, check on.
+    pub const GET_SAFE_LOCATION: SafeSearch = SafeSearch {
+        radius: SAFE_SEARCH_RADIUS,
+        body_radius: SAFE_BODY_RADIUS,
+        mover: None,
+        standable_keeps: true,
+    };
+}
 
 /// Longest route searched, in cells expanded.
 const SEARCH_LIMIT: usize = 400_000;
@@ -642,50 +669,59 @@ impl Sim {
     /// the point to each ring candidate (0x67cfa0 again) as no wall between them. See
     /// OpenThedas-testdata/notes/arrival-placement-trace.md.
     pub fn safe_location(&mut self, l: crate::world::Location) -> crate::world::Location {
+        match self.safe_search(l.area, l.position, SafeSearch::GET_SAFE_LOCATION) {
+            Some(p) => crate::world::Location { position: p, ..l },
+            None => l,
+        }
+    }
+
+    /// The safe-location search (DAOrigins.exe 0x73e370) for a body of radius
+    /// `how.body_radius` at `p` in `area`: the point itself on the floor if it is walkable
+    /// and free, else (when `how.standable_keeps`, the exe's physics query) `None` if the
+    /// point is over the pathing grid, else the first free ring point out to `how.radius`.
+    /// `None` when nothing is found, or there is no area or grid. See
+    /// [`Sim::safe_location`] for the order and what is provisional.
+    pub(crate) fn safe_search(
+        &mut self,
+        area: ObjectId,
+        p: [f32; 3],
+        how: SafeSearch,
+    ) -> Option<[f32; 3]> {
         if !self
             .world
-            .get(l.area)
+            .get(area)
             .is_some_and(|o| o.kind == crate::world::ObjectKind::Area)
         {
-            return l;
+            return None;
         }
-        let Some(g) = self.nav_grid(l.area) else {
-            return l;
-        };
+        let g = self.nav_grid(area)?;
         let on_floor = |p: [f32; 3]| match g.cell(p) {
             Some(c) => [p[0], p[1], height(&g, c)],
             None => p,
         };
         let free = |s: &Sim, p: [f32; 3]| {
-            on_walkable(&g, p) && !s.body_in_the_way(l.area, p, SAFE_BODY_RADIUS)
+            on_walkable(&g, p) && !s.body_in_the_way(area, p, how.body_radius, how.mover)
         };
-        let p = l.position;
         if free(self, p) {
-            return crate::world::Location {
-                position: on_floor(p),
-                ..l
-            };
+            return Some(on_floor(p));
         }
-        if g.cell(p).is_some() {
-            return l;
+        if how.standable_keeps && g.cell(p).is_some() {
+            return None;
         }
         let step = g.cell_size * 0.5;
         if step <= 0.0 {
-            return l;
+            return None;
         }
         let ok = |s: &Sim, q: [f32; 3]| free(s, q) && !wall_between(&g, p, q);
         let mut r = step;
-        while r <= SAFE_SEARCH_RADIUS {
+        while r <= how.radius {
             let (x0, x1, y0, y1) = (p[0] - r, p[0] + r, p[1] - r, p[1] + r);
             let mut x = x0;
             while x <= x1 {
                 for y in [y0, y1] {
                     let q = [x, y, p[2]];
                     if ok(self, q) {
-                        return crate::world::Location {
-                            position: on_floor(q),
-                            ..l
-                        };
+                        return Some(on_floor(q));
                     }
                 }
                 x += step;
@@ -695,23 +731,28 @@ impl Sim {
                 for x in [x0, x1] {
                     let q = [x, y, p[2]];
                     if ok(self, q) {
-                        return crate::world::Location {
-                            position: on_floor(q),
-                            ..l
-                        };
+                        return Some(on_floor(q));
                     }
                 }
                 y += step;
             }
             r += step;
         }
-        l
+        None
     }
 
     /// Whether a living creature's body in `area` reaches within `radius` of `p`.
-    fn body_in_the_way(&self, area: thedas_script::vm::ObjectId, p: [f32; 3], radius: f32) -> bool {
+    /// `mover`, the body being placed, does not count.
+    fn body_in_the_way(
+        &self,
+        area: ObjectId,
+        p: [f32; 3],
+        radius: f32,
+        mover: Option<ObjectId>,
+    ) -> bool {
         self.world.objects.values().any(|o| {
-            o.kind == crate::world::ObjectKind::Creature
+            Some(o.id) != mover
+                && o.kind == crate::world::ObjectKind::Creature
                 && o.area == Some(area)
                 && o.active
                 && !o.dead

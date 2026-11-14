@@ -26,6 +26,7 @@ pub mod fxaa;
 pub mod gpu;
 pub mod look;
 pub mod material;
+pub mod msaa;
 pub mod particles;
 pub mod post;
 pub mod scene;

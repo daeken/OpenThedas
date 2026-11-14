@@ -667,6 +667,33 @@ fn addins(install: &Path) -> Result<()> {
     }
     let on = all.iter().filter(|a| a.enabled).count();
     println!("{} add-ins, {on} mounted", all.len());
+    let offers = install.offers()?;
+    if !offers.is_empty() {
+        println!("\noffers (under the core package; the first wins between them):");
+        for (i, o) in offers.iter().enumerate() {
+            let mounted = match (o.enabled, o.extends_base_campaign()) {
+                (false, _) => "no",
+                (true, true) => "core+module",
+                (true, false) => "core",
+            };
+            println!(
+                "{:>3}  {:<22} {:<9} {:<13} {:<16} {}",
+                i + 1,
+                o.uid,
+                if o.rank.is_some() {
+                    "registry"
+                } else {
+                    "manifest"
+                },
+                mounted,
+                o.extends
+                    .as_deref()
+                    .filter(|e| !e.is_empty())
+                    .unwrap_or("-"),
+                install.relative(&o.dir)
+            );
+        }
+    }
     match install.game_version() {
         Some(v) => {
             println!("game version {v} (from the executable; add-ins asking for more are left out)")

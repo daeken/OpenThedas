@@ -65,6 +65,7 @@ mod icon;
 mod intro;
 mod journal;
 mod launcher;
+mod launcher_control;
 mod launcher_download;
 mod live;
 mod looks;
@@ -229,6 +230,11 @@ struct Args {
     /// sun shadows are 1024 texels a side and reach further).
     #[arg(long, default_value = "medium", value_parser = ["low", "medium", "high"])]
     detail: String,
+    /// Multisampled anti-aliasing for the world: samples a pixel (the original's
+    /// `AntialiasingLevel`; 1 is off, which leaves the post-process smoothing on). Limited to
+    /// what the GPU supports.
+    #[arg(long, default_value_t = 1)]
+    antialiasing: u32,
     /// Headless: the shaders' clock (`ApplicationTime`) at the capture, in seconds; it runs
     /// on from there through `run` steps. The clouds drift with it.
     #[arg(long, default_value_t = 0.0)]
@@ -286,6 +292,12 @@ struct Args {
     /// Pixels per point for `--launcher-capture`.
     #[arg(long, hide = true, default_value_t = 1.0)]
     launcher_scale: f32,
+    /// Drive the launcher (implies `--launcher`): steps separated by `;`, played through its
+    /// accessibility tree, e.g. `click Search this computer; wait; tree; click Continue`.
+    /// See `launcher_control.rs` for the steps. With `--launcher`, `--control` takes the same
+    /// commands as JSON requests.
+    #[arg(long)]
+    launcher_steps: Option<String>,
 }
 
 /// Behind and above a hero at `pos` with the game's `facing`, looking the same way (as the
@@ -955,6 +967,10 @@ fn play_interface(
                 log::info!("aiming ability {} (click a target)", aim.ability);
                 live.aiming = Some(aim);
             }
+            let field = screens.shown().iter().all(|s| *s == screens::Screen::Hud);
+            if let Some(ability) = live.drop_stale_aim(field) {
+                log::info!("ability {ability} not aimed (nothing can aim it now)");
+            }
             // A script's DoAutoSave, made between frames as every save is.
             let autosave = live.sim().take_autosave_request();
             if autosave {
@@ -1265,7 +1281,7 @@ impl App {
             ui.attach(&live.sim);
             ui.set_saves(saves::SaveStore::new(self.saves_dir.clone()));
         }
-        let reticle = reticle::ReticlePass::new(&ctx.device, config.format);
+        let reticle = reticle::ReticlePass::new(&ctx.device, config.format, 1);
         self.cursors = Some(cursor::Cursors::load(event_loop, &self.install));
         self.gfx = Some(Gfx {
             window,
@@ -6203,6 +6219,10 @@ fn main() -> Result<()> {
     ));
     let mut args = Args::parse();
     faces::set_language(&args.language);
+    live::ANTIALIASING.store(
+        args.antialiasing.max(1),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // A client's or a test's run sends and fetches nothing (see `upload::online`).
     if args.control.is_some() || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some() {
         upload::set_automated();
@@ -6249,8 +6269,27 @@ fn main() -> Result<()> {
         || !args.steps.is_empty()
         || args.check_report.is_some()
         || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some();
-    if args.launcher || (install.is_none() && !headless) {
-        if let Some(launch) = launcher::run(args.launcher)? {
+    let driven = args.launcher_steps.is_some();
+    if args.launcher || driven || (install.is_none() && !headless) {
+        // Driven only when asked for the launcher: `--control` alone still drives the game.
+        let script = if args.launcher || driven {
+            let steps = match &args.launcher_steps {
+                Some(s) => launcher_control::parse_steps(s)?,
+                None => Vec::new(),
+            };
+            let control = match &args.control {
+                Some(addr) => {
+                    let c = control::Control::listen(addr)?;
+                    log::info!("launcher control listening on {}", c.addr);
+                    Some(c)
+                }
+                None => None,
+            };
+            (driven || control.is_some()).then(|| launcher_control::Script::new(steps, control))
+        } else {
+            None
+        };
+        if let Some(launch) = launcher::run(args.launcher || driven, script)? {
             launch.spawn()?;
         }
         return Ok(());
@@ -6609,6 +6648,10 @@ fn main() -> Result<()> {
                                 if let Some(aim) = layer.play(s, &l.sim, dt).pop() {
                                     println!("aiming ability {}", aim.ability);
                                     l.aiming = Some(aim);
+                                }
+                                let field = s.shown().iter().all(|x| *x == screens::Screen::Hud);
+                                if let Some(ability) = l.drop_stale_aim(field) {
+                                    println!("ability {ability} not aimed");
                                 }
                                 // No picture is taken for a save made headless.
                                 layer.take_saved_slots();

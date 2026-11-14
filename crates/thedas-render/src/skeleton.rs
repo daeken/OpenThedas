@@ -34,6 +34,17 @@ pub struct Bone {
     pub index: Option<u32>,
 }
 
+/// One animation laid on a skeleton (see [`Skeleton::pose_mapped`]): sampled at `time`
+/// seconds; `against_base` and `weight` as in [`Skeleton::pose_weighted`]; `nodes` its
+/// tracks' nodes ([`Skeleton::track_nodes`]).
+pub struct Layer<'a> {
+    pub anim: &'a Animation,
+    pub time: f32,
+    pub against_base: bool,
+    pub weight: f32,
+    pub nodes: &'a [Option<usize>],
+}
+
 /// Every node of a model, parents before children.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Skeleton {
@@ -79,7 +90,18 @@ impl Skeleton {
     }
 
     pub fn node(&self, name: &str) -> Option<usize> {
-        self.by_name.get(&name.to_ascii_lowercase()).copied()
+        if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            self.by_name.get(&name.to_ascii_lowercase()).copied()
+        } else {
+            self.by_name.get(name).copied()
+        }
+    }
+
+    /// The node each of `anim`'s tracks animates, in track order (`None` for a bone this
+    /// skeleton lacks): worked out once for an animation and a skeleton, then given to
+    /// [`Skeleton::pose_mapped`] each frame.
+    pub fn track_nodes(&self, anim: &Animation) -> Vec<Option<usize>> {
+        anim.tracks.iter().map(|t| self.node(&t.bone)).collect()
     }
 
     pub fn node_of_bone(&self, index: u32) -> Option<usize> {
@@ -138,27 +160,45 @@ impl Skeleton {
     /// the weight. Provisional: the executable scales each additive clip by its instance's
     /// weight (+0xc of its blend entry), but how is not traced. Other layers ignore it.
     pub fn pose_weighted(&self, layers: &[(&Animation, f32, bool, f32)]) -> Vec<Mat4> {
+        let nodes: Vec<Vec<Option<usize>>> =
+            layers.iter().map(|(a, ..)| self.track_nodes(a)).collect();
+        let mapped: Vec<Layer<'_>> = layers
+            .iter()
+            .zip(&nodes)
+            .map(|(&(anim, time, against_base, weight), nodes)| Layer {
+                anim,
+                time,
+                against_base,
+                weight,
+                nodes,
+            })
+            .collect();
+        self.pose_mapped(&mapped)
+    }
+
+    /// [`Skeleton::pose_weighted`] with each layer's track nodes given
+    /// ([`Skeleton::track_nodes`]), so no bone is looked up by name.
+    pub fn pose_mapped(&self, layers: &[Layer<'_>]) -> Vec<Mat4> {
         let mut rot: Vec<Option<Quat>> = vec![None; self.bones.len()];
         let mut pos: Vec<Option<Vec3>> = vec![None; self.bones.len()];
         let mut reference: Vec<Option<Vec3>> = vec![None; self.bones.len()];
-        let (additive, posed): (Vec<_>, Vec<_>) =
-            layers.iter().partition(|(a, _, _, _)| a.additive);
-        if let Some((base, _, _, _)) = posed.first() {
-            for track in &base.tracks {
+        let (additive, posed): (Vec<_>, Vec<_>) = layers.iter().partition(|l| l.anim.additive);
+        if let Some(base) = posed.first() {
+            for (track, node) in base.anim.tracks.iter().zip(base.nodes) {
                 if track.channel == Channel::Translation
-                    && let (Some(i), Some(k)) = (self.node(&track.bone), track.keys.first())
-                    && let Some(slot) = reference.get_mut(i)
+                    && let (Some(i), Some(k)) = (node, track.keys.first())
+                    && let Some(slot) = reference.get_mut(*i)
                 {
                     *slot = Some(Vec3::new(k.value[0], k.value[1], k.value[2]));
                 }
             }
         }
-        for (n, (anim, time, against_base, _)) in posed.iter().enumerate() {
-            let r = (n > 0 && *against_base).then_some(reference.as_slice());
-            self.sample_into(anim, *time, r, &mut rot, &mut pos);
+        for (n, l) in posed.iter().enumerate() {
+            let r = (n > 0 && l.against_base).then_some(reference.as_slice());
+            self.sample_into(l, r, &mut rot, &mut pos);
         }
-        for (anim, time, _, weight) in additive {
-            self.add_into(anim, time, weight, &mut rot, &mut pos);
+        for l in additive {
+            self.add_into(l, &mut rot, &mut pos);
         }
         self.globals(|i| {
             let b = &self.bones[i];
@@ -171,17 +211,11 @@ impl Skeleton {
 
     /// Lays additive animation `anim` at `time` and `weight` over the local pose in `rot`
     /// and `pos` (bones not set there are at rest): see [`Skeleton::pose_weighted`].
-    fn add_into(
-        &self,
-        anim: &Animation,
-        time: f32,
-        weight: f32,
-        rot: &mut [Option<Quat>],
-        pos: &mut [Option<Vec3>],
-    ) {
-        let t = time.clamp(0.0, anim.length.max(0.0));
-        for track in &anim.tracks {
-            let Some(i) = self.node(&track.bone) else {
+    fn add_into(&self, layer: &Layer<'_>, rot: &mut [Option<Quat>], pos: &mut [Option<Vec3>]) {
+        let (anim, weight) = (layer.anim, layer.weight);
+        let t = layer.time.clamp(0.0, anim.length.max(0.0));
+        for (track, node) in anim.tracks.iter().zip(layer.nodes) {
+            let Some(i) = *node else {
                 continue;
             };
             let rest = &self.bones[i];
@@ -210,15 +244,15 @@ impl Skeleton {
 
     fn sample_into(
         &self,
-        anim: &Animation,
-        time: f32,
+        layer: &Layer<'_>,
         reference: Option<&[Option<Vec3>]>,
         rot: &mut [Option<Quat>],
         pos: &mut [Option<Vec3>],
     ) {
-        let t = time.clamp(0.0, anim.length.max(0.0));
-        for track in &anim.tracks {
-            let Some(i) = self.node(&track.bone) else {
+        let anim = layer.anim;
+        let t = layer.time.clamp(0.0, anim.length.max(0.0));
+        for (track, node) in anim.tracks.iter().zip(layer.nodes) {
+            let Some(i) = *node else {
                 continue;
             };
             match track.channel {
