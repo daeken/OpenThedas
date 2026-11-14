@@ -921,6 +921,10 @@ fn constructed(vm: &mut Vm, d: DisplayId, by_script: bool, init: Option<ObjId>) 
     let character = o.clip().map(|c| c.character).unwrap_or(0);
     let ctor = vm.classes.get(&character).cloned();
     display_api::display_value(vm, d);
+    // The clip's load event is queued before its first frame makes its children, so a
+    // parent hears `onLoad` before the clips inside it (as Ruffle and Scaleform order it).
+    let load = clip_events(vm, d, clip_event::LOAD);
+    vm.queue.push_back(Queued::Event(d, "onLoad", load));
     enter_frame_of(vm, d, 0);
     if let Some(init) = init {
         let keys = vm.keys(&Value::Object(init));
@@ -954,8 +958,6 @@ fn constructed(vm: &mut Vm, d: DisplayId, by_script: bool, init: Option<ObjId>) 
             events: clip_events(vm, d, clip_event::CONSTRUCT),
         });
     }
-    let load = clip_events(vm, d, clip_event::LOAD);
-    vm.queue.push_back(Queued::Event(d, "onLoad", load));
 }
 
 /// Shows frame `frame` (0-based) of clip `d`, rebuilding its timeline children as Flash does

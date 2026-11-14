@@ -68,7 +68,19 @@ fn dump(p: &Player, d: thedas_gfx::display::DisplayId, indent: usize, out: &mut 
         kind,
         o.matrix.tx / 20.0,
         o.matrix.ty / 20.0,
-        if o.visible { "" } else { " hidden" },
+        if o.visible {
+            String::new()
+        } else {
+            " hidden".to_string()
+        } + &if o.blend != thedas_gfx::swf::BlendMode::Normal {
+            format!(" blend={:?}", o.blend)
+        } else {
+            String::new()
+        } + &if o.color.is_identity() {
+            String::new()
+        } else {
+            format!(" cx={:?}/{:?}", o.color.mul, o.color.add)
+        },
         indent = indent
     ));
     for c in o.children.values() {
@@ -148,12 +160,25 @@ fn main() {
         .split(',')
         .filter(|s| !s.is_empty())
     {
-        println!("{path} = {:?}", p.get_variable(path));
+        let v = p.get_value(path);
+        let f = matches!(&v, thedas_gfx::avm1::value::Value::Object(o) if p.vm.is_function(*o));
+        println!(
+            "{path} = {:?}{}",
+            p.get_variable(path),
+            if f { " (function)" } else { "" }
+        );
     }
     let mut out = String::new();
     dump(&p, p.vm.root, 0, &mut out);
     let lines: Vec<&str> = out.lines().collect();
-    for l in lines.iter().take(120) {
+    for l in lines
+        .iter()
+        .take(if std::env::var_os("GFX_TREE").is_some() {
+            usize::MAX
+        } else {
+            120
+        })
+    {
         println!("{l}");
     }
     println!(

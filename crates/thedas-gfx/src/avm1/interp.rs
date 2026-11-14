@@ -69,14 +69,19 @@ pub fn call_code(
     base: Option<ObjId>,
 ) -> Value {
     if vm.trace_calls {
-        let n = vm.to_host(&args.first().cloned().unwrap_or_default(), 2);
+        let n = match args.first() {
+            Some(Value::String(s)) => s.to_string(),
+            Some(Value::Number(x)) => x.to_string(),
+            Some(v) => v.type_name().to_string(),
+            None => String::new(),
+        };
         let name = vm
             .fn_names
             .get(&fobj)
             .cloned()
             .unwrap_or_else(|| code.name.clone());
         vm.log
-            .push(format!("call {} ({} args) {:?}", name, args.len(), n));
+            .push(format!("call {name} ({} args) {n}", args.len()));
     }
     let act = vm.alloc(None, Kind::Plain);
     let target = code
