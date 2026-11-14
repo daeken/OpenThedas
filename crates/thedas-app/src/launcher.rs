@@ -1173,8 +1173,13 @@ impl Ui {
                         .filter(|n| !n.is_empty())
                         .collect();
                     notes.dedup();
+                    // The notes are about the store's own app; a download here needs none of it.
                     for n in notes {
-                        ui.label(RichText::new(n).small().color(GOLD_DIM));
+                        ui.label(
+                            RichText::new(format!("With the store's own app: {n}"))
+                                .small()
+                                .color(GOLD_DIM),
+                        );
                     }
                 }
             });
