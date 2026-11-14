@@ -2392,6 +2392,13 @@ impl D3dPass {
         self.sun
     }
 
+    /// This frame's sun partitions, shared read-only with the deferred lighting pass.
+    pub(crate) fn sun_shadows(&self) -> Option<([[f32; 4]; 9], &[wgpu::TextureView; 2])> {
+        let targets = self.shadows.as_ref()?;
+        let (_, data) = targets.frame()?;
+        Some((data, &targets.views))
+    }
+
     /// The emitters (by index into the scene's) drawn adding light to the frame: an
     /// additive blend (destination factor one), not into the distortion mask.
     pub(crate) fn glowing_emitters(&self) -> std::collections::BTreeSet<usize> {
