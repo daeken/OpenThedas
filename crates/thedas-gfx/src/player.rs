@@ -2116,110 +2116,6 @@ mod queue_tests {
     }
 
     #[test]
-    fn interval_callbacks_catch_up_in_deadline_order_without_drift() {
-        let (mut p, _) = input_player();
-        let trace = p.vm.new_native(|vm, _, args| {
-            let text = vm.to_str(args.first().unwrap());
-            vm.log.push(text.to_string());
-            Value::Undefined
-        });
-        let global = Value::Object(p.vm.global);
-        for (delay, name) in [(20.0, "a"), (35.0, "b")] {
-            p.vm.call_method(
-                &global,
-                "setInterval",
-                &[
-                    Value::Object(trace),
-                    Value::Number(delay),
-                    Value::from(name),
-                ],
-            );
-        }
-        p.tick(81.0);
-        assert_eq!(p.drain_log(), ["a", "b", "a", "a", "b", "a"]);
-        // Keep the original deadline rather than postponing it after each update.
-        p.tick(19.0);
-        assert!(p.drain_log().is_empty());
-        p.tick(1.0);
-        assert_eq!(p.drain_log(), ["a"]);
-    }
-
-    #[test]
-    fn interval_catchup_is_bounded_without_rewinding_get_timer() {
-        let (mut p, _) = input_player();
-        let trace = p.vm.new_native(|vm, _, _| {
-            vm.log.push("tick".into());
-            Value::Undefined
-        });
-        let global = Value::Object(p.vm.global);
-        p.vm.call_method(
-            &global,
-            "setInterval",
-            &[Value::Object(trace), Value::Number(1.0)],
-        );
-        assert_eq!(p.vm.intervals[0].every, 10.0);
-        p.tick(10.0);
-        assert!(p.drain_log().is_empty());
-        p.tick(990.0);
-        assert_eq!(p.drain_log().len(), 10);
-        assert_eq!(
-            p.vm.call_method(&global, "getTimer", &[]),
-            Value::Number(1000.0)
-        );
-        p.tick(20.0);
-        assert_eq!(p.drain_log().len(), 2);
-        assert_eq!(
-            p.vm.call_method(&global, "getTimer", &[]),
-            Value::Number(1020.0)
-        );
-    }
-
-    #[test]
-    fn interval_callbacks_can_cancel_and_removed_clip_methods_stop() {
-        let (mut p, _) = input_player();
-        let global = Value::Object(p.vm.global);
-        let trace = p.vm.new_native(|vm, _, _| {
-            vm.log.push("repeat".into());
-            Value::Undefined
-        });
-        let id = p.vm.call_method(
-            &global,
-            "setInterval",
-            &[Value::Object(trace), Value::Number(20.0)],
-        );
-        p.vm.set(&global, "cancelId", id);
-        let cancel = p.vm.new_native(|vm, _, _| {
-            vm.log.push("timeout".into());
-            let global = Value::Object(vm.global);
-            let id = vm.get(&global, "cancelId");
-            vm.call_method(&global, "clearInterval", &[id]);
-            Value::Undefined
-        });
-        p.vm.call_method(
-            &global,
-            "setTimeout",
-            &[Value::Object(cancel), Value::Number(55.0)],
-        );
-        p.tick(81.0);
-        assert_eq!(p.drain_log(), ["repeat", "repeat", "timeout"]);
-        assert!(p.vm.intervals.is_empty());
-        let root = p.vm.root;
-        let clip = create_empty(&mut p.vm, root, "timer", 2).unwrap();
-        let receiver = p.vm.display_object(clip);
-        p.vm.set(&receiver, "onTick", Value::Object(trace));
-        p.vm.call_method(
-            &global,
-            "setInterval",
-            &[receiver, Value::from("onTick"), Value::Number(16.9)],
-        );
-        assert_eq!(p.vm.intervals[0].every, 16.0);
-        remove_clip(&mut p.vm, clip);
-        p.tick(100.0);
-        assert!(p.drain_log().is_empty());
-        assert!(p.vm.intervals.is_empty());
-    }
-
-    #[test]
     fn mouse_caret_and_drag_selection_use_transformed_text_coordinates() {
         let (mut p, field) = input_player();
         let o = p.vm.display.get_mut(field).unwrap();
@@ -2363,6 +2259,110 @@ mod queue_tests {
             p.vm.call_method(&selection, "getCaretIndex", &[]),
             Value::Number(-1.0)
         );
+    }
+
+    #[test]
+    fn interval_callbacks_catch_up_in_deadline_order_without_drift() {
+        let (mut p, _) = input_player();
+        let trace = p.vm.new_native(|vm, _, args| {
+            let text = vm.to_str(args.first().unwrap());
+            vm.log.push(text.to_string());
+            Value::Undefined
+        });
+        let global = Value::Object(p.vm.global);
+        for (delay, name) in [(20.0, "a"), (35.0, "b")] {
+            p.vm.call_method(
+                &global,
+                "setInterval",
+                &[
+                    Value::Object(trace),
+                    Value::Number(delay),
+                    Value::from(name),
+                ],
+            );
+        }
+        p.tick(81.0);
+        assert_eq!(p.drain_log(), ["a", "b", "a", "a", "b", "a"]);
+        // Keep the original deadline rather than postponing it after each update.
+        p.tick(19.0);
+        assert!(p.drain_log().is_empty());
+        p.tick(1.0);
+        assert_eq!(p.drain_log(), ["a"]);
+    }
+
+    #[test]
+    fn interval_catchup_is_bounded_without_rewinding_get_timer() {
+        let (mut p, _) = input_player();
+        let trace = p.vm.new_native(|vm, _, _| {
+            vm.log.push("tick".into());
+            Value::Undefined
+        });
+        let global = Value::Object(p.vm.global);
+        p.vm.call_method(
+            &global,
+            "setInterval",
+            &[Value::Object(trace), Value::Number(1.0)],
+        );
+        assert_eq!(p.vm.intervals[0].every, 10.0);
+        p.tick(10.0);
+        assert!(p.drain_log().is_empty());
+        p.tick(990.0);
+        assert_eq!(p.drain_log().len(), 10);
+        assert_eq!(
+            p.vm.call_method(&global, "getTimer", &[]),
+            Value::Number(1000.0)
+        );
+        p.tick(20.0);
+        assert_eq!(p.drain_log().len(), 2);
+        assert_eq!(
+            p.vm.call_method(&global, "getTimer", &[]),
+            Value::Number(1020.0)
+        );
+    }
+
+    #[test]
+    fn interval_callbacks_can_cancel_and_removed_clip_methods_stop() {
+        let (mut p, _) = input_player();
+        let global = Value::Object(p.vm.global);
+        let trace = p.vm.new_native(|vm, _, _| {
+            vm.log.push("repeat".into());
+            Value::Undefined
+        });
+        let id = p.vm.call_method(
+            &global,
+            "setInterval",
+            &[Value::Object(trace), Value::Number(20.0)],
+        );
+        p.vm.set(&global, "cancelId", id);
+        let cancel = p.vm.new_native(|vm, _, _| {
+            vm.log.push("timeout".into());
+            let global = Value::Object(vm.global);
+            let id = vm.get(&global, "cancelId");
+            vm.call_method(&global, "clearInterval", &[id]);
+            Value::Undefined
+        });
+        p.vm.call_method(
+            &global,
+            "setTimeout",
+            &[Value::Object(cancel), Value::Number(55.0)],
+        );
+        p.tick(81.0);
+        assert_eq!(p.drain_log(), ["repeat", "repeat", "timeout"]);
+        assert!(p.vm.intervals.is_empty());
+        let root = p.vm.root;
+        let clip = create_empty(&mut p.vm, root, "timer", 2).unwrap();
+        let receiver = p.vm.display_object(clip);
+        p.vm.set(&receiver, "onTick", Value::Object(trace));
+        p.vm.call_method(
+            &global,
+            "setInterval",
+            &[receiver, Value::from("onTick"), Value::Number(16.9)],
+        );
+        assert_eq!(p.vm.intervals[0].every, 16.0);
+        remove_clip(&mut p.vm, clip);
+        p.tick(100.0);
+        assert!(p.drain_log().is_empty());
+        assert!(p.vm.intervals.is_empty());
     }
 
     #[test]
