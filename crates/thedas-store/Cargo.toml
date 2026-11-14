@@ -1,0 +1,23 @@
+[package]
+name = "thedas-store"
+description = "OpenThedas launcher: downloading Dragon Age from the player's own Steam or GOG account"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thedas-launcher.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+flate2.workspace = true
+md-5.workspace = true
+log.workspace = true
+zeroize = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "fs", "io-util", "macros"] }
+reqwest = { version = "0.13", features = ["json", "query"] }
+steamroom = "0.3"
+steamroom-client = "0.3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+qrcode = { version = "0.14", default-features = false }
