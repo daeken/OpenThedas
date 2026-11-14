@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use glam::{Mat3, Mat4, Quat, Vec2, Vec3, Vec4};
 use serde_json::Value as J;
 use thedas_formats::mesh::{ChunkData, DeclUsage, MeshChunk, Msh};
-use thedas_formats::model::{Mmh, Node};
+use thedas_formats::model::{Mmh, ModelEdit, Node};
 
 use crate::glb::Read;
 
@@ -289,7 +289,20 @@ struct Target {
     bones: BTreeMap<String, u32>,
     /// The export wrote it (a chunk it could not write is left as it is).
     exported: bool,
+    /// The model's resource (`.mmh`, lowercase).
+    mmh: String,
+    /// The model's nodes' rest places in model space, by lowercase name (every node, bone
+    /// or not).
+    rests: std::sync::Arc<BTreeMap<String, Mat4>>,
+    /// The highest bone index the model uses.
+    top_bone: u32,
+    /// From model space to the file's world (the axes and the object's place).
+    place: Mat4,
 }
+
+/// The widest palette the game's own models give a mesh (67, on the GOG 1.05 data): a
+/// mesh's palette does not grow past it. Provisional: the shaders' own limit is not traced.
+pub const PALETTE_MAX: usize = 67;
 
 /// One `.msh` written back.
 pub struct Imported {
@@ -300,9 +313,18 @@ pub struct Imported {
     pub emptied: Vec<String>,
 }
 
+/// One `.mmh` written back: new bones, palettes grown.
+pub struct ImportedModel {
+    pub mmh: String,
+    pub data: Vec<u8>,
+    /// What changed, one line each.
+    pub changes: Vec<String>,
+}
+
 /// What an import made.
 pub struct Import {
     pub meshes: Vec<Imported>,
+    pub models: Vec<ImportedModel>,
     /// The object's new place, when the file moved or turned it (see [`import`]).
     pub moved: Option<Placed>,
     pub warnings: Vec<String>,
@@ -399,13 +421,18 @@ fn targets(
         let model = Mmh::parse(&r.data).map_err(|e| format!("{mmh}: {e}"))?;
         let mut bones = BTreeMap::new();
         let mut pieces = Vec::new();
+        let mut rests = BTreeMap::new();
         fn walk(
             n: &Node,
             above: Mat4,
             bones: &mut BTreeMap<String, u32>,
             pieces: &mut Vec<(String, Vec<u32>, Mat4)>,
+            rests: &mut BTreeMap<String, Mat4>,
         ) {
             let here = above * crate::glb::trs(&n.transform);
+            if let Some(name) = &n.name {
+                rests.entry(name.to_ascii_lowercase()).or_insert(here);
+            }
             if let (Some(b), Some(name)) = (n.bone, &n.name) {
                 bones.entry(name.to_ascii_lowercase()).or_insert(b);
             }
@@ -413,12 +440,14 @@ fn targets(
                 pieces.push((m.chunk.clone(), m.bones.clone(), here));
             }
             for c in &n.children {
-                walk(c, here, bones, pieces);
+                walk(c, here, bones, pieces, rests);
             }
         }
         for n in &model.nodes {
-            walk(n, Mat4::IDENTITY, &mut bones, &mut pieces);
+            walk(n, Mat4::IDENTITY, &mut bones, &mut pieces, &mut rests);
         }
+        let top_bone = bones.values().copied().max().unwrap_or(0);
+        let rests = std::sync::Arc::new(rests);
         let name = m["model"].as_str().unwrap_or(mmh).to_string();
         let exported: Vec<&str> = m["meshes"]
             .as_array()
@@ -436,6 +465,10 @@ fn targets(
                 exported: was,
                 palette,
                 bones: bones.clone(),
+                mmh: mmh.to_ascii_lowercase(),
+                rests: rests.clone(),
+                top_bone,
+                place,
             });
         }
     }
@@ -670,6 +703,10 @@ pub fn import(
     // Chunk data by (msh, chunk).
     let mut made: BTreeMap<(String, String), ChunkData> = BTreeMap::new();
     let mut seen: BTreeMap<(String, String), usize> = BTreeMap::new();
+    // New bones by (model, lowercase name): their index and how they are added.
+    let mut new_bones: BTreeMap<(String, String), (u32, ModelEdit)> = BTreeMap::new();
+    // Grown palettes by (model, chunk).
+    let mut grown: BTreeMap<(String, String), Vec<u32>> = BTreeMap::new();
     let mut msh_cache: BTreeMap<String, (Vec<u8>, Msh)> = BTreeMap::new();
     for (ni, node) in nodes.iter().enumerate() {
         let Some(mi) = node["mesh"].as_u64() else {
@@ -777,23 +814,35 @@ pub fn import(
                     .filter_map(|b| b.as_u64().map(|b| b as u32))
                     .collect();
                 let palette = (palette.len() == joints.len()).then_some(palette);
-                let bones: Vec<Option<u32>> = joints
-                    .iter()
-                    .enumerate()
-                    .map(|(k, &j)| {
-                        if let Some(p) = &palette {
-                            return Some(p[k]);
-                        }
-                        let n = nodes.get(j)?;
-                        n["extras"]["thedas"]["bone"]
-                            .as_u64()
-                            .map(|b| b as u32)
-                            .or_else(|| {
-                                let nm = n["name"].as_str()?;
-                                t.bones.get(&base_name(nm).to_ascii_lowercase()).copied()
-                            })
-                    })
-                    .collect();
+                let mut bones: Vec<Option<u32>> = Vec::with_capacity(joints.len());
+                for (k, &j) in joints.iter().enumerate() {
+                    if let Some(p) = &palette {
+                        bones.push(Some(p[k]));
+                        continue;
+                    }
+                    let Some(n) = nodes.get(j) else {
+                        bones.push(None);
+                        continue;
+                    };
+                    let known = n["extras"]["thedas"]["bone"]
+                        .as_u64()
+                        .map(|b| b as u32)
+                        .or_else(|| {
+                            let nm = n["name"].as_str()?;
+                            t.bones.get(&base_name(nm).to_ascii_lowercase()).copied()
+                        });
+                    bones.push(known.or_else(|| {
+                        new_bone(
+                            t,
+                            j,
+                            nodes,
+                            &parents,
+                            &worlds,
+                            &mut new_bones,
+                            &mut warnings,
+                        )
+                    }));
+                }
                 (drawn, Some(bones))
             }
             None => (worlds[ni], None),
@@ -842,14 +891,18 @@ pub fn import(
                 .collect(),
             None => make_tangents(&pos, &normal, &uv0, &got.indices),
         };
+        let mut palette = t.palette.clone();
         let influences = influences(
             &got,
             joint_bones.as_deref(),
-            &t.palette,
+            &mut palette,
             chunk,
             &mut warnings,
             name,
         );
+        if palette != t.palette {
+            grown.insert((t.mmh.clone(), t.chunk.clone()), palette);
+        }
         // The same vertices and triangles as the game's: what the file cannot say (weights
         // on a mesh it has no skin for, unknown elements) or says the same way comes from
         // the original bytes.
@@ -924,7 +977,7 @@ pub fn import(
         if !keep_unchanged && emptied.is_empty() {
             let after = Msh::parse(&new).map_err(|e| format!("{msh_name}: {e}"))?;
             let same = done.iter().all(|c| match (msh.chunk(c), after.chunk(c)) {
-                (Some(a), Some(b)) => chunk_difference(msh, a, &after, b).is_none(),
+                (Some(a), Some(b)) => chunk_difference(msh, a, &after, b, true).is_none(),
                 _ => false,
             });
             if same {
@@ -938,8 +991,36 @@ pub fn import(
             emptied,
         });
     }
+    // The models whose bones or palettes changed.
+    let mut edits: BTreeMap<String, (Vec<ModelEdit>, Vec<String>)> = BTreeMap::new();
+    let mut added: Vec<_> = new_bones.into_iter().collect();
+    // Parents before children: in the order they were made.
+    added.sort_by_key(|(_, (i, _))| *i);
+    for ((mmh, _), (_, e)) in added {
+        let (es, said) = edits.entry(mmh).or_default();
+        if let ModelEdit::AddBone {
+            name, parent, bone, ..
+        } = &e
+        {
+            said.push(format!("new bone {name} ({bone}) under {parent}"));
+        }
+        es.push(e);
+    }
+    for ((mmh, chunk), bones) in grown {
+        let (es, said) = edits.entry(mmh).or_default();
+        said.push(format!("{chunk}'s palette is {} bones", bones.len()));
+        es.push(ModelEdit::Palette { chunk, bones });
+    }
+    let mut models = Vec::new();
+    for (mmh, (es, changes)) in edits {
+        let r = read(&mmh).ok_or_else(|| format!("{mmh}: not found"))?;
+        let data =
+            thedas_formats::model::rewrite(&r.data, &es).map_err(|e| format!("{mmh}: {e}"))?;
+        models.push(ImportedModel { mmh, data, changes });
+    }
     Ok(Import {
         meshes: out,
+        models,
         moved,
         warnings,
     })
@@ -947,12 +1028,14 @@ pub fn import(
 
 /// How a rewritten chunk differs from the original beyond what its types keep (`None`: it
 /// says the same): its triangles, or a vertex attribute (directions within about a
-/// degree, weights after summing to one, blend indices not compared).
+/// degree, weights after summing to one; blend indices, where `indices`, on the slots a
+/// weight uses).
 pub(crate) fn chunk_difference(
     orig: &Msh,
     a: &MeshChunk,
     new: &Msh,
     b: &MeshChunk,
+    indices: bool,
 ) -> Option<String> {
     use thedas_formats::mesh::DeclType as T;
     if orig.indices(a).ok()? != new.indices(b).ok()? {
@@ -967,6 +1050,27 @@ pub(crate) fn chunk_difference(
         DeclUsage::Color,
         DeclUsage::BlendWeight,
     ];
+    if indices
+        && let (Some(xi), Some(yi), Some(xw)) = (
+            orig.attribute(a, DeclUsage::BlendIndices, 0).ok().flatten(),
+            new.attribute(b, DeclUsage::BlendIndices, 0).ok().flatten(),
+            orig.attribute(a, DeclUsage::BlendWeight, 0).ok().flatten(),
+        )
+    {
+        let given = a
+            .element(DeclUsage::BlendWeight, 0)
+            .map_or(4, |e| crate::glb::components(e.ty));
+        let off = xi.iter().zip(&yi).zip(&xw).position(|((p, q), w)| {
+            let w = crate::glb::weights(*w, given);
+            (0..4).any(|k| w[k] > 0.0 && p[k] != q[k])
+        });
+        if let Some(i) = off {
+            return Some(format!(
+                "blend indices: vertex {i}: {:?} became {:?}",
+                xi[i], yi[i]
+            ));
+        }
+    }
     for e in a.elements.iter().filter(|e| usages.contains(&e.usage)) {
         let x = orig.attribute(a, e.usage, e.usage_index).ok()??;
         let Some(y) = new.attribute(b, e.usage, e.usage_index).ok()? else {
@@ -1016,12 +1120,67 @@ pub(crate) fn chunk_difference(
     None
 }
 
+/// A joint the model lacks becomes a new bone (and so, first, any unknown node between it
+/// and a node the model has): under that node, where the file puts it at rest, with the
+/// next free bone index. Returns its index; `None` for a joint with no known node above.
+#[allow(clippy::too_many_arguments)]
+fn new_bone(
+    t: &Target,
+    j: usize,
+    nodes: &[J],
+    parents: &[Option<usize>],
+    worlds: &[Mat4],
+    made: &mut BTreeMap<(String, String), (u32, ModelEdit)>,
+    warnings: &mut Vec<String>,
+) -> Option<u32> {
+    let name = base_name(nodes.get(j)?["name"].as_str()?).to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let key = (t.mmh.clone(), name.to_ascii_lowercase());
+    if let Some((i, _)) = made.get(&key) {
+        return Some(*i);
+    }
+    // The node above it the model has (or a new bone made for an unknown one).
+    let p = parents.get(j).copied().flatten()?;
+    let pname = base_name(nodes.get(p)?["name"].as_str().unwrap_or("")).to_string();
+    let parent_rest = match t.rests.get(&pname.to_ascii_lowercase()) {
+        Some(r) => *r,
+        None => {
+            new_bone(t, p, nodes, parents, worlds, made, warnings)?;
+            // A new bone's rest in model space: where the file puts it.
+            t.place.inverse() * worlds[p]
+        }
+    };
+    let local = (t.place * parent_rest).inverse() * worlds.get(j)?;
+    let (_, rotation, position) = local.to_scale_rotation_translation();
+    let index = t.top_bone + 1 + made.keys().filter(|(m, _)| *m == t.mmh).count() as u32;
+    let parent = pname;
+    made.insert(
+        key,
+        (
+            index,
+            ModelEdit::AddBone {
+                parent,
+                name: name.clone(),
+                bone: index,
+                transform: thedas_formats::level::Transform {
+                    position: position.to_array(),
+                    rotation: rotation.normalize().to_array(),
+                },
+            },
+        ),
+    );
+    warnings.push(format!("{name}: a new bone ({index})"));
+    Some(index)
+}
+
 /// Each vertex's influences as (palette slot, weight), strongest first, at most as many as
 /// the chunk's weights hold.
 fn influences(
     got: &Gathered,
     joint_bones: Option<&[Option<u32>]>,
-    palette: &[u32],
+    palette: &mut Vec<u32>,
     chunk: &MeshChunk,
     warnings: &mut Vec<String>,
     name: &str,
@@ -1044,11 +1203,16 @@ fn influences(
             let mut v: Vec<(u32, f32)> = (0..4)
                 .map(|k| {
                     let w = weights[i][k].max(0.0);
-                    let slot = bones
-                        .get(joints[i][k] as usize)
-                        .copied()
-                        .flatten()
-                        .and_then(|b| palette.iter().position(|&p| p == b));
+                    let bone = bones.get(joints[i][k] as usize).copied().flatten();
+                    // A bone the mesh did not use joins its palette, while there is room.
+                    let slot = bone.and_then(|b| match palette.iter().position(|&p| p == b) {
+                        Some(s) => Some(s),
+                        None if w > 0.0 && palette.len() < PALETTE_MAX => {
+                            palette.push(b);
+                            Some(palette.len() - 1)
+                        }
+                        None => None,
+                    });
                     match slot {
                         Some(s) => (s as u32, w),
                         None if w > 0.0 => {
@@ -1075,7 +1239,8 @@ fn influences(
         .collect();
     if dropped > 0 {
         warnings.push(format!(
-            "mesh {name:?}: {dropped} influences on bones its palette lacks were dropped"
+            "mesh {name:?}: {dropped} influences dropped (a bone the model lacks, or a palette \
+             already {PALETTE_MAX} bones wide)"
         ));
     }
     out
@@ -1299,7 +1464,7 @@ mod tests {
                 for name in &im.chunks {
                     chunks += 1;
                     let (a, b) = (orig.chunk(name).unwrap(), new.chunk(name).unwrap());
-                    if let Some(d) = chunk_difference(&orig, a, &new, b) {
+                    if let Some(d) = chunk_difference(&orig, a, &new, b, false) {
                         bad.push(format!("{m}: {name}: {d}"));
                     }
                 }
@@ -1411,6 +1576,207 @@ mod tests {
                 imp.warnings
             );
         }
+    }
+
+    /// Against a real install: every model written back with no change reads the same, and
+    /// with a moved node, a grown palette and a new bone reads those changes and nothing
+    /// else.
+    #[test]
+    #[ignore]
+    fn every_model_rewrites() {
+        use thedas_formats::model::{ModelEdit, rewrite};
+        let root = std::env::var_os("THEDAS_INSTALL").expect("THEDAS_INSTALL");
+        let install = thedas_vfs::DaoInstall::open(root).unwrap();
+        let vfs = install
+            .global_vfs(thedas_vfs::install::TextureQuality::High)
+            .unwrap();
+        let names: Vec<String> = vfs
+            .names()
+            .into_iter()
+            .filter(|n| n.ends_with(".mmh"))
+            .collect();
+        let (mut ok, mut edited, mut bad) = (0, 0, Vec::new());
+        for n in &names {
+            let Ok((data, _)) = vfs.read(n) else { continue };
+            let Ok(orig) = Mmh::parse(&data) else {
+                continue;
+            };
+            match rewrite(&data, &[]).map(|d| Mmh::parse(&d)) {
+                Ok(Ok(m)) if m == orig => ok += 1,
+                Ok(Ok(_)) => bad.push(format!("{n}: reads differently written back")),
+                Ok(Err(e)) | Err(e) => {
+                    bad.push(format!("{n}: {e}"));
+                    continue;
+                }
+            }
+            // A bone node to hang a new one on, and a skinned mesh to grow.
+            fn first<'a>(ns: &'a [Node], f: &dyn Fn(&Node) -> bool) -> Option<&'a Node> {
+                ns.iter()
+                    .find_map(|n| if f(n) { Some(n) } else { first(&n.children, f) })
+            }
+            let Some(parent) = first(&orig.nodes, &|n| n.bone.is_some() && n.name.is_some()) else {
+                continue;
+            };
+            let mut top = 0;
+            fn most(ns: &[Node], top: &mut u32) {
+                for n in ns {
+                    *top = (*top).max(n.bone.unwrap_or(0));
+                    most(&n.children, top);
+                }
+            }
+            most(&orig.nodes, &mut top);
+            let pname = parent.name.clone().unwrap();
+            let t = thedas_formats::level::Transform {
+                position: [0.1, 0.2, 0.3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            };
+            let mut edits = vec![
+                ModelEdit::AddBone {
+                    parent: pname.clone(),
+                    name: "mm_new_bone".into(),
+                    bone: top + 1,
+                    transform: t,
+                },
+                ModelEdit::Transform {
+                    node: pname.clone(),
+                    transform: t,
+                },
+            ];
+            let skinned = first(&orig.nodes, &|n| {
+                n.mesh.as_ref().is_some_and(|m| !m.bones.is_empty())
+            })
+            .and_then(|n| n.mesh.clone());
+            if let Some(m) = &skinned {
+                let mut b = m.bones.clone();
+                b.push(top + 1);
+                edits.push(ModelEdit::Palette {
+                    chunk: m.chunk.clone(),
+                    bones: b,
+                });
+            }
+            let after = match rewrite(&data, &edits).map(|d| Mmh::parse(&d)) {
+                Ok(Ok(m)) => m,
+                Ok(Err(e)) | Err(e) => {
+                    bad.push(format!("{n}: edited: {e}"));
+                    continue;
+                }
+            };
+            let new = first(&after.nodes, &|x| x.name.as_deref() == Some("mm_new_bone"));
+            let moved = first(&after.nodes, &|x| x.name.as_deref() == Some(pname.as_str()));
+            let grown = skinned.as_ref().map(|m| {
+                first(&after.nodes, &|x| {
+                    x.mesh.as_ref().is_some_and(|y| y.chunk == m.chunk)
+                })
+                .and_then(|x| x.mesh.as_ref())
+                .map(|y| y.bones.len() == m.bones.len() + 1 && y.bones.last() == Some(&(top + 1)))
+                    == Some(true)
+            });
+            let ok_new = new.is_some_and(|x| {
+                x.bone == Some(top + 1) && x.transform == t && x.children.is_empty()
+            });
+            let ok_moved = moved.is_some_and(|x| {
+                x.transform == t
+                    && x.children
+                        .iter()
+                        .any(|c| c.name.as_deref() == Some("mm_new_bone"))
+            });
+            if !ok_new
+                || !ok_moved
+                || grown == Some(false)
+                || after.mesh_pieces().len() != orig.mesh_pieces().len()
+            {
+                bad.push(format!("{n}: edits did not read back (new {ok_new}, moved {ok_moved}, palette {grown:?})"));
+            } else {
+                edited += 1;
+            }
+        }
+        let widest = names
+            .iter()
+            .filter_map(|n| Mmh::parse(&vfs.read(n).ok()?.0).ok())
+            .flat_map(|m| {
+                m.mesh_pieces()
+                    .into_iter()
+                    .map(|p| p.mesh.bones.len())
+                    .collect::<Vec<_>>()
+            })
+            .max()
+            .unwrap_or(0);
+        println!(
+            "{} models: {ok} rewritten unchanged, {edited} edited, {} problems; widest palette {widest}",
+            names.len(),
+            bad.len()
+        );
+        for b in bad.iter().take(20) {
+            println!("  {b}");
+        }
+        assert!(bad.is_empty());
+    }
+
+    /// Against a real install: a joint renamed in the file (as a new bone an editor added
+    /// would be) becomes a new bone under the same parent, joins the palettes of the meshes
+    /// weighted to it, and the model and meshes are written; the model reads it back.
+    #[test]
+    #[ignore]
+    fn a_new_bone_grows_the_model_and_the_palette() {
+        let root = std::env::var_os("THEDAS_INSTALL").expect("THEDAS_INSTALL");
+        let install = thedas_vfs::DaoInstall::open(root).unwrap();
+        let vfs = install
+            .global_vfs(thedas_vfs::install::TextureQuality::High)
+            .unwrap();
+        let read = |name: &str| {
+            if name.ends_with(".dds") {
+                return None;
+            }
+            vfs.read(name).ok().map(|(data, p)| Read {
+                data,
+                layer: p.layer_label,
+                entry: p.entry,
+            })
+        };
+        let s = crate::glb::Subject {
+            id: 0,
+            tag: "t".into(),
+            area: None,
+            template: "t".into(),
+            position: [3.0, 4.0, 5.0],
+            facing: 30.0,
+        };
+        let e = crate::glb::export(&read, &s, &["c_doga_0".to_string()]);
+        let renamed = with_json(&e.glb, |j| {
+            for n in j["nodes"].as_array_mut().unwrap() {
+                n.as_object_mut().unwrap().remove("extras");
+                if n["name"]
+                    .as_str()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("head"))
+                {
+                    n["name"] = serde_json::json!("mm_head2");
+                }
+            }
+            for sk in j["skins"].as_array_mut().into_iter().flatten() {
+                sk.as_object_mut().unwrap().remove("extras");
+            }
+        });
+        let imp = import(&renamed, &e.manifest, &read, false).unwrap();
+        let [m] = imp.models.as_slice() else {
+            panic!("models {:?}", imp.models.len());
+        };
+        println!("{}: {:?}", m.mmh, m.changes);
+        assert!(m.changes.iter().any(|c| c.contains("new bone mm_head2")));
+        assert!(m.changes.iter().any(|c| c.contains("palette")));
+        let back = Mmh::parse(&m.data).unwrap();
+        let orig = Mmh::parse(&read(&m.mmh).unwrap().data).unwrap();
+        let new = back.node_chain("mm_head2").expect("the new bone");
+        let head = orig.node_chain("head").unwrap();
+        // Where the head is, under the head's parent.
+        let at = |c: &[thedas_formats::level::Transform]| {
+            c.iter()
+                .fold(Mat4::IDENTITY, |m, t| m * crate::glb::trs(t))
+                .w_axis
+                .truncate()
+        };
+        assert!((at(&new) - at(&head)).length() < 1e-3);
+        assert_eq!(new.len(), head.len());
+        assert!(!imp.meshes.is_empty());
     }
 
     #[test]

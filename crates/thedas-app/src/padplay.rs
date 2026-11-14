@@ -525,6 +525,10 @@ impl PadPlay {
                 self.held = self.target.is_some();
                 self.target_message(host)
             }
+            Action::SwapWeapons => {
+                host.live()?.switch_weapon_set();
+                "weapon set switched".into()
+            }
             Action::ClearTarget => {
                 self.target = None;
                 self.held = false;

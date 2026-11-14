@@ -139,8 +139,12 @@ the game, as mod mode's Move does: undo puts it back. A model that is only moved
 mesh file. A tilt or a stretch of the whole object goes into its meshes instead.
 
 Meshes: keep each mesh's name (the export names them after the game's chunks), and its
-armature's bone names; a vertex can only follow bones its mesh already used (new bones need
-the model file, which is not written yet). A mesh deleted in Blender is written empty.
+armature's bone names. Weighting a mesh to another bone of the model, or to a bone you add
+in Blender, works: a new bone is added to the model under its parent (it has no animation
+of its own and follows its parent), and the mesh's bone list grows (to at most 67 bones, the
+widest the game uses). The model file is then written to `workspace/override/` too. Moving
+the game's own bones in Blender is not written back (Blender may turn bones on import, and
+the game's animations depend on them). A mesh deleted in Blender is written empty.
 
 `workspace/override/` is an ordinary mod folder: put it in `mods.txt` (or copy its files
 anywhere a mod goes) to keep your edits. Live edits are never mounted unless you ask, and
