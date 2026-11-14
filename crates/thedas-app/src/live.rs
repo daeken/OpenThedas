@@ -1551,6 +1551,49 @@ impl Live {
         self.scrub = scrub;
     }
 
+    /// The actions creature `id`'s animation tree plays (each with its `.ani`), for mod
+    /// mode's animation list.
+    pub fn creature_actions(&mut self, id: ObjectId) -> Vec<(String, String)> {
+        let (Some(level), Some(tree)) = (
+            self.level.as_ref(),
+            self.posed
+                .iter()
+                .find(|p| p.0 == id)
+                .and_then(|p| p.2.as_ref())
+                .and_then(|c| c.trees.first().cloned()),
+        ) else {
+            return Vec::new();
+        };
+        self.animator.actions(&level.vfs, &tree)
+    }
+
+    /// Mod mode's scrubber holds creature `id` on action `action` of its own animation tree
+    /// from its start (drawing only). False when it is not drawn with a tree.
+    pub fn play_action(&mut self, id: ObjectId, action: &str) -> bool {
+        let Some(trees) = self
+            .posed
+            .iter()
+            .find(|p| p.0 == id)
+            .and_then(|p| p.2.as_ref())
+            .map(|c| c.trees.clone())
+            .filter(|t| !t.is_empty())
+        else {
+            return false;
+        };
+        self.frozen = Some((
+            id,
+            Clip {
+                trees,
+                actions: vec![action.to_string()],
+                time: 0.0,
+                looping: true,
+                ..Default::default()
+            },
+        ));
+        self.scrub = Some((id, 0.0));
+        true
+    }
+
     /// What mod mode's inspector shows of object `id`: what it is, and what it was animating
     /// at the last sync (its own motion first, then the layers over it).
     pub fn inspect(&mut self, id: ObjectId) -> Option<crate::modmode::Inspected> {

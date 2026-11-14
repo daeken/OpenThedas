@@ -12,8 +12,12 @@
 //! keeps the done modes as bits in the player's profile, `CompletedTraining`). With
 //! tutorials off no mode starts.
 //!
-//! Provisional: the done modes are kept for the session, not in a profile; the exe pauses
-//! only in game modes 0 and 1 (explore, combat), which is not checked here.
+//! The game pauses only when the mode starts in explore or combat (0x692f81 to 0x692f9b:
+//! game modes 0 and 1); started from a conversation (a dialogue line's action starts the
+//! Dwarf Commoner's tactical-camera lesson while the hero still talks to the sister), the
+//! conversation and the world run on. Saving is refused either way.
+//!
+//! Provisional: the done modes are kept for the session, not in a profile.
 
 use crate::sim::Sim;
 use serde::{Deserialize, Serialize};
@@ -27,6 +31,9 @@ pub struct Training {
     pub step: i32,
     pub expected: i32,
     pub arg: i32,
+    /// The game holds still for it (it started in explore or combat).
+    #[serde(default)]
+    pub paused: bool,
 }
 
 /// The script the training events run (on the module), not the module's own: DAOrigins.exe
@@ -52,8 +59,12 @@ impl Sim {
         if old.mode > 0 {
             self.training_done |= 1 << (old.mode - 1);
         }
+        let explore = crate::sim::constant(&self.table, "GM_EXPLORE");
+        let combat = crate::sim::constant(&self.table, "GM_COMBAT");
+        let gm = self.world.game_mode;
         self.world.training = Training {
             mode,
+            paused: mode != 0 && (gm == explore || gm == combat),
             ..Default::default()
         };
         if mode != 0 {
@@ -95,9 +106,9 @@ impl Sim {
         true
     }
 
-    /// Whether training holds the game paused.
+    /// Whether training holds the game paused (see the module's doc).
     pub fn training_paused(&self) -> bool {
-        self.world.training.mode != 0
+        self.world.training.mode != 0 && self.world.training.paused
     }
 
     /// Why the game cannot be saved now, if it cannot: training mode disables saving
@@ -105,7 +116,7 @@ impl Sim {
     /// holds a training step. The player's save screen and the MCP's save tool refuse;
     /// `Sim::save_json` itself still writes (a tool's state dump is not a save).
     pub fn saving_blocked(&self) -> Option<&'static str> {
-        self.training_paused()
+        (self.world.training.mode != 0)
             .then_some("a training tutorial is under way (it disables saving)")
     }
 
@@ -169,6 +180,16 @@ mod tests {
             .collect();
         s.world.trace.entries.clear();
         out
+    }
+
+    #[test]
+    fn a_lesson_started_in_a_conversation_does_not_pause_the_game() {
+        let mut s = sim();
+        s.world.game_mode = 4;
+        s.set_training_mode(1);
+        assert_eq!(s.world.training.mode, 1);
+        assert!(!s.training_paused(), "the conversation runs on");
+        assert!(s.saving_blocked().is_some(), "saving is still refused");
     }
 
     #[test]

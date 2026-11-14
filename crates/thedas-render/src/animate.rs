@@ -126,6 +126,25 @@ impl Animator {
         None
     }
 
+    /// Every action of tree `tree` that plays an animation, with that animation (`.ani`),
+    /// by action name.
+    pub fn actions(&mut self, vfs: &Vfs, tree: &str) -> Vec<(String, String)> {
+        let Some(t) = load(&mut self.trees, vfs, &tree_resource(tree), |d| {
+            AnimTree::parse(d).ok()
+        }) else {
+            return Vec::new();
+        };
+        let mut v: Vec<(String, String)> = t
+            .nodes
+            .iter()
+            .filter_map(|n| Some((n.action.clone(), n.animation.clone()?)))
+            .filter(|(a, _)| !a.is_empty())
+            .collect();
+        v.sort_by_key(|a| a.0.to_ascii_lowercase());
+        v.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
+        v
+    }
+
     /// The `.ani` resource action `action` names in tree `tree` (a name with an extension,
     /// or an `.anb`).
     pub fn action_animation(&mut self, vfs: &Vfs, tree: &str, action: &str) -> Option<String> {

@@ -142,6 +142,9 @@ pub struct PadPlay {
     /// since it was last looked for (it moves or goes with its screen).
     focused: Option<(String, [f64; 4])>,
     focus_check_ms: f64,
+    /// A first focus asked for while an open container's list was not drawn yet: how long it
+    /// has waited (see [`PadPlay::focus`]).
+    first_wait_ms: Option<f64>,
     /// The view's size when the focus last moved (its marker stays inside it).
     view: (u32, u32),
     /// A dialog box was up last frame, and one that just showed still waits for its buttons
@@ -214,10 +217,20 @@ impl PadPlay {
         self.follow_line(host);
         self.focus_popup(host, popup);
         self.keep_focus(host, ctx, dt_ms);
+        let mut log = Vec::new();
+        if let Some(waited) = self.first_wait_ms.take() {
+            let waited = waited + dt_ms;
+            if ctx != Context::Screen {
+                // The screen went: nothing to focus.
+            } else if waited < FIRST_WAIT_MS && chest_list_pending(host) {
+                self.first_wait_ms = Some(waited);
+            } else if let Some(m) = self.focus(host, 0, 1) {
+                log.push(m);
+            }
+        }
         if ctx == Context::Conversation && self.used {
             self.show_reply(host);
         }
-        let mut log = Vec::new();
         // Marking spots for an issue report: the pad has a pointer of its own.
         let marking = if popup { None } else { host.marking() };
         // A, B and Start as held now and last frame, every frame: the A press that answers
@@ -1055,6 +1068,12 @@ impl PadPlay {
         };
         let at = match from {
             Some(i) => focusnav::step(&targets, i, (dx, dy)),
+            // A chest just opened draws its list a few frames after the screen: the first
+            // focus waits for it (it would land on the party's list), up to FIRST_WAIT_MS.
+            None if chest_list_pending(host) => {
+                self.first_wait_ms = Some(0.0);
+                return Some("focus: waiting for the container's list".into());
+            }
             None => focusnav::first_content(&targets)?,
         };
         let t = &targets[at];
@@ -1402,6 +1421,26 @@ fn best_in_front(host: &mut dyn Host, hostile: bool) -> Option<ObjectId> {
 fn cycle_target(host: &mut dyn Host, current: Option<ObjectId>, step: i32) -> Option<ObjectId> {
     let (from, facing, cands) = viewpoint(host)?;
     cycle(&cands, from, facing, current, step)
+}
+
+/// How long a first focus waits for an open container's list to be drawn.
+const FIRST_WAIT_MS: f64 = 2000.0;
+
+/// Whether a container with items is open but its list's entries are not among the screen's
+/// focus targets yet.
+fn chest_list_pending(host: &mut dyn Host) -> bool {
+    let has_items = host.live().is_some_and(|l| {
+        let sim = l.sim();
+        sim.world
+            .container
+            .and_then(|c| sim.world.get(c))
+            .is_some_and(|c| !c.inventory.is_empty())
+    });
+    has_items
+        && !host
+            .focus_targets()
+            .iter()
+            .any(|t| t.path.contains(".ContainerItemEntry"))
 }
 
 /// Leaves the screen up by its own way out: a dialog box, the start menu, character

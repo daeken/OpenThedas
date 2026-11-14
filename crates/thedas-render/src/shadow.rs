@@ -62,6 +62,13 @@ pub fn partition_reach(detail: crate::scene::Detail) -> [f32; 2] {
     }
 }
 
+/// The partitions' reach for a Dragon Age II level, whose shaders read only the first
+/// partition (`smpShadowPartition1`, see [`crate::d3d::DEBUG_CONTROL`]): it must hold all
+/// the shadows a frame shows, so it reaches 50 m (the second, unread, then reaches 100).
+/// Provisional: Dragon Age II's own shadow distance is not traced; 50 m keeps a 1024-texel
+/// map at about 5 cm a texel across a street.
+pub const SINGLE_PARTITION_REACH: [f32; 2] = [50.0, 100.0];
+
 /// How far towards the sun a partition's box may reach beyond its camera slice, for the
 /// casters standing outside the slice (provisional, see [`partitions`]).
 pub const SUN_REACH: f32 = 60.0;

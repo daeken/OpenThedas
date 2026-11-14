@@ -201,7 +201,6 @@ modules, not that the scripts cannot do it.
 - **SIM-056** **Knockdown, stun and similar engine effects.** Original: knockdown and other effects. Ours: no code found in these modules (effects run only through the target's `APPLY_EFFECT` handler). Evidence: `crates/thedas-sim/src/combat.rs:536-537`. Size: L. Depends: SIM-041. Kind: missing.
 - **SIM-057** **Difficulty scaling.** Original: difficulty scaling. Ours: the difficulty is stored and read by `GetGameDifficulty`; no engine-side scaling found. Evidence: `crates/thedas-sim/src/world.rs:571-572`, `crates/thedas-sim/src/chargen.rs:78-81`. Size: M. Depends: none. Kind: unverified.
 - **SIM-058** **Injuries.** Original: injuries. Ours: no code found in these modules. Evidence: `crates/thedas-sim/src/combat.rs:536`. Size: M. Depends: none. Kind: missing.
-- **SIM-059** **Fatigue.** Original: fatigue. Ours: no code found beyond a save repair that zeroes Fatigue's base. Evidence: `crates/thedas-sim/src/save.rs:47-48`. Size: S. Depends: none. Kind: missing.
 - **SIM-060** **Threat order ties and update rate.** Original: sort not traced; the update runs per rendered frame (0x6ab620). Ours: ties broken by object id, update once per simulation tick. Evidence: `crates/thedas-sim/src/threat.rs:20-21`. Size: S. Depends: none. Kind: provisional.
 - **SIM-061** **Weapon-set switch sends no equip events.** Original: switch 0x6a8fa0 for `SwitchWeaponSet` (0x65ccc0) and the command (0x7a1ed0). Ours: slots swap with no `EQUIP`/`UNEQUIP` events. Evidence: `crates/thedas-sim/src/combat.rs:1020-1024`. Size: S. Depends: none. Kind: provisional.
 
@@ -330,7 +329,6 @@ modules, not that the scripts cannot do it.
 ### Saves
 
 - **SIM-160** **Original save import.** Original: `.das` saves. Ours: JSON world dump only; no `.das` read or write. Evidence: `crates/thedas-sim/src/save.rs:3-6`. Size: L. Depends: none. Kind: missing.
-- **SIM-161** **Autosave and quicksave.** Original: autosave, quicksave. Ours: `DoAutoSave` logs and does nothing; no quicksave code found. Evidence: `crates/thedas-sim/src/engine.rs:2823-2829`. Size: S. Depends: SIM-160. Kind: missing.
 - **SIM-162** **Tutorial queue saved.** Original: whether saved is not traced. Ours: saved; a held pause with an empty queue is released on load. Evidence: `crates/thedas-sim/src/save.rs:333-335`. Size: S. Depends: none. Kind: provisional.
 - **SIM-163** **Music intensity saved.** Original: not traced. Ours: saved. Evidence: `crates/thedas-sim/src/world.rs:566-568`. Size: S. Depends: none. Kind: provisional.
 - **SIM-164** **Sim-level state outside the world is not saved.** Original: not traced. Ours: `Sim` fields such as `following`, `next_follow_ms`, `walk_blocked_by`, `auto_pause_combat` and the policies are not in `SaveGame`. Evidence: `crates/thedas-sim/src/sim.rs:73-139`, `crates/thedas-sim/src/save.rs:87-96`. Size: S. Depends: none. Kind: unverified.

@@ -166,6 +166,7 @@ pub fn import_glb(
     glb: &Path,
     overrides: &Path,
     read: &dyn Fn(&str) -> Option<crate::glb::Read>,
+    format_of: &dyn Fn(&str) -> Option<thedas_formats::dds::DdsFormat>,
 ) -> Result<GlbImport, String> {
     let dir = glb.parent().ok_or("no folder")?;
     let result = (|| {
@@ -173,10 +174,36 @@ pub fn import_glb(
             .map_err(|e| format!("manifest.json: {e}"))
             .and_then(|b| serde_json::from_slice(&b).map_err(|e| format!("manifest.json: {e}")))?;
         let bytes = std::fs::read(glb).map_err(|e| format!("{}: {e}", glb.display()))?;
-        let imp = crate::glb_in::import(&bytes, &manifest, read, false)?;
+        // Files beside the export: its PNGs, and images an editor saved beside it.
+        let files = |name: &str| -> Option<Vec<u8>> {
+            if name.contains(['/', '\\']) || name.starts_with('.') {
+                return None;
+            }
+            std::fs::read(dir.join(name)).ok()
+        };
+        let imp = crate::glb_in::import(&bytes, &manifest, read, &files, false)?;
         std::fs::create_dir_all(overrides).map_err(|e| e.to_string())?;
         let mut written = Vec::new();
         let mut warnings = imp.warnings;
+        let safe = |n: &str| !n.contains(['/', '\\']) && !n.starts_with('.') && !n.is_empty();
+        for t in imp.textures {
+            if !safe(&t.resource) {
+                continue;
+            }
+            let encoding = Encoding::like(format_of(&t.like));
+            let dds = encode_dds(t.width, t.height, t.rgba, encoding);
+            std::fs::write(overrides.join(&t.resource), dds).map_err(|e| e.to_string())?;
+            warnings.push(format!("{}: painted ({encoding:?})", t.resource));
+            written.push(t.resource);
+        }
+        for (file, data) in &imp.materials {
+            if !safe(file) {
+                continue;
+            }
+            std::fs::write(overrides.join(file), data).map_err(|e| e.to_string())?;
+            warnings.push(format!("{file}: a new material"));
+            written.push(file.clone());
+        }
         for m in &imp.models {
             if m.mmh.contains(['/', '\\']) || m.mmh.starts_with('.') {
                 continue;
@@ -287,6 +314,12 @@ impl Encoding {
 /// A PNG as a DDS of `encoding`, with every mip down to 1x1 (each a box filter of the one
 /// above).
 pub fn png_to_dds(png: &[u8], encoding: Encoding) -> Result<Vec<u8>, String> {
+    let (w, h, rgba) = decode_png(png)?;
+    Ok(encode_dds(w, h, rgba, encoding))
+}
+
+/// A PNG's pixels as 8-bit RGBA: (width, height, pixels).
+pub fn decode_png(png: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(png));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
@@ -313,7 +346,7 @@ pub fn png_to_dds(png: &[u8], encoding: Encoding) -> Result<Vec<u8>, String> {
         png::ColorType::Grayscale => buf[..px].iter().flat_map(|&g| [g, g, g, 255]).collect(),
         png::ColorType::Indexed => return Err("an indexed PNG was not expanded".into()),
     };
-    Ok(encode_dds(w, h, rgba, encoding))
+    Ok((w, h, rgba))
 }
 
 /// An RGBA image as a DDS of `encoding`, with its mip chain: the one place textures are
