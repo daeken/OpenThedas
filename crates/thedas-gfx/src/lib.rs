@@ -4,4 +4,13 @@
 //! Ruffle. Only what Dragon Age: Origins' movies use is implemented; see
 //! `docs/scaleform-player.md` for the inventory and the design.
 
+pub mod avm1;
+pub mod display;
+pub mod player;
+pub mod render;
 pub mod swf;
+pub mod tess;
+pub mod text;
+
+pub use avm1::{Host, HostValue};
+pub use player::Player;

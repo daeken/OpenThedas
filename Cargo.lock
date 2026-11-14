@@ -5692,9 +5692,12 @@ dependencies = [
 name = "thedas-gfx"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "flate2",
  "log",
+ "lyon",
  "thiserror 2.0.18",
+ "wgpu",
 ]
 
 [[package]]
@@ -5799,13 +5802,16 @@ version = "0.1.0"
 dependencies = [
  "async-channel",
  "encoding_rs",
+ "env_logger",
  "futures",
  "log",
  "png",
+ "pollster 0.4.0",
  "roxmltree",
  "ruffle_core",
  "ruffle_render_wgpu",
  "thedas-formats",
+ "thedas-gfx",
  "thedas-script",
  "thedas-sim",
  "thedas-vfs",

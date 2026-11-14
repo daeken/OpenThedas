@@ -11,3 +11,6 @@ rust-version.workspace = true
 thiserror.workspace = true
 flate2.workspace = true
 log.workspace = true
+wgpu.workspace = true
+bytemuck.workspace = true
+lyon = "1.0.19"

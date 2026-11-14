@@ -391,18 +391,8 @@ impl Stage {
     }
 
     /// Loads a movie (`mainmenu.gfx`) on top of the others and starts it.
-    pub fn open(&mut self, name: &str) -> Result<(), UiError> {
-        // A popup layer loaded anew has no dialog box up, whatever the one before it left
-        // on the context stack.
-        if name == POPUP_LAYER {
-            self.bridge.drop_context(POPUP_CONTEXT);
-        }
-        if name == QUICKBAR {
-            self.quickbar_width = self
-                .bridge
-                .value(QUICKBAR_EXPAND_VALUE)
-                .map(|v| (v, QUICKBAR_SETTLE_MS));
-        }
+    /// A movie on Ruffle: rewritten to a plain SWF with its images inlined.
+    fn open_ruffle(&mut self, name: &str) -> Result<UiMovie, UiError> {
         let (swf, rep) = {
             let mut images = self
                 .images
@@ -429,6 +419,37 @@ impl Stage {
         )?;
         m.set_scale9(rep.scale9.clone());
         m.set_slots(rep.slots.clone());
+        Ok(m)
+    }
+
+    pub fn open(&mut self, name: &str) -> Result<(), UiError> {
+        // A popup layer loaded anew has no dialog box up, whatever the one before it left
+        // on the context stack.
+        if name == POPUP_LAYER {
+            self.bridge.drop_context(POPUP_CONTEXT);
+        }
+        if name == QUICKBAR {
+            self.quickbar_width = self
+                .bridge
+                .value(QUICKBAR_EXPAND_VALUE)
+                .map(|v| (v, QUICKBAR_SETTLE_MS));
+        }
+        let mut m = if crate::own::wanted(name) {
+            let gfx = (self.lookup)(name).ok_or_else(|| UiError::NotFound(name.to_string()))?;
+            log::info!("ui: {name}: on our own player");
+            UiMovie::new_own(
+                &self.gpu,
+                name,
+                &gfx,
+                self.size,
+                self.lookup.clone(),
+                self.images.clone(),
+                Some(self.bridge.responder()),
+            )?
+        } else {
+            self.open_ruffle(name)?
+        };
+        let swf = (self.lookup)(name).unwrap_or_default();
         m.mouse_move(self.mouse.0, self.mouse.1);
         for (name, url) in &self.engine_images {
             m.set_engine_image(name, Some(url));
