@@ -1909,11 +1909,22 @@ pub fn call(
         }
         "SetCreatureMana" => {
             let (id, p) = (obj(a, 0), PROPERTY_MANA_STAMINA);
-            if h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature) {
-                let max = h.sim.property_total(id, p);
+            let origins = h.sim.game == thedas_vfs::Game::Origins;
+            if h.object(id).is_some_and(|o| {
+                o.kind == ObjectKind::Creature && (!origins || o.properties.contains_key(&p))
+            }) {
+                let total = h.sim.property_total(id, p);
+                let requested = int(a, 1) as f32;
+                let current = if origins {
+                    // 0x79c2d0 applies the floor first, then selects the total when it
+                    // is smaller or unordered. A negative total stays negative.
+                    let floored = requested.max(0.0);
+                    if total > floored { floored } else { total }
+                } else {
+                    requested.clamp(0.0, total.max(0.0))
+                };
                 if let Some(o) = h.sim.world.get_mut(id) {
-                    o.properties.entry(p).or_insert((0.0, 0.0)).1 =
-                        (int(a, 1) as f32).clamp(0.0, max.max(0.0));
+                    o.properties.entry(p).or_insert((0.0, 0.0)).1 = current;
                 }
             }
             void()
@@ -9824,7 +9835,7 @@ mod coverage_tests {
             "SetCreatureMana",
             &[Value::Object(mage), Value::Int(90)],
         );
-        assert_eq!(get(&mut s, "GetCreatureMana", mage), Some(Value::Int(0)));
+        assert_eq!(get(&mut s, "GetCreatureMana", mage), Some(Value::Int(-5)));
         s.world
             .get_mut(chest)
             .unwrap()
@@ -9842,6 +9853,92 @@ mod coverage_tests {
             s.world.get(chest).unwrap().properties[&PROPERTY_MANA_STAMINA],
             (40.0, 12.0)
         );
+    }
+
+    #[test]
+    fn origins_mana_setter_preserves_absence_and_applies_the_total_after_the_floor() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut s = sim();
+            s.game = game;
+            let creature = s.world.spawn(ObjectKind::Creature, "creature");
+            let set = |s: &mut Sim, requested| {
+                run(
+                    s,
+                    creature,
+                    "SetCreatureMana",
+                    &[Value::Object(creature), Value::Int(requested)],
+                )
+            };
+            set(&mut s, 90);
+            let property = s.world.get(creature).unwrap().properties.get(&8).copied();
+            let origins = game == thedas_vfs::Game::Origins;
+            assert_eq!(property, if origins { None } else { Some((0.0, 0.0)) });
+
+            // Modded bounds can admit a total below the initialized zero floor.
+            let tables = crate::m2da::Tables::empty();
+            tables.insert(
+                "properties",
+                &["ID", "Type", "Min", "Max"],
+                vec![(
+                    8,
+                    vec![
+                        Cell::Int(8),
+                        Cell::Int(3),
+                        Cell::Float(-10.0),
+                        Cell::Float(50.0),
+                    ],
+                )],
+            );
+            s.world.tables = Arc::new(tables);
+            for (base, modifier, requested, native, previous) in [
+                (-5.0, 0.0, 90, -5.0, 0.0),
+                (-5.0, 0.0, -90, -5.0, 0.0),
+                (40.0, -47.5, 90, -7.5, 0.0),
+                (40.0, 13.5, 90, 50.0, 53.5),
+                (40.0, 0.0, -90, 0.0, 0.0),
+                (40.0, 0.0, 30, 30.0, 30.0),
+                (40.0, 0.0, 90, 40.0, 40.0),
+                (0.0, 0.0, i32::MIN, 0.0, 0.0),
+                (0.0, 0.0, i32::MAX, 0.0, 0.0),
+            ] {
+                // DA2 reads a different property table and keeps its existing clamp.
+                let expected = if origins { native } else { previous };
+                let object = s.world.get_mut(creature).unwrap();
+                object.properties.insert(8, (base, 12.0));
+                object.modifiers.insert(8, modifier);
+                object.immortal = true;
+                object.dead = true;
+                object.active = false;
+                let queued = s.world.queue.len();
+                set(&mut s, requested);
+                let object = s.world.get(creature).unwrap();
+                assert_eq!(
+                    object.properties[&8],
+                    (base, expected),
+                    "{game:?}, {requested}"
+                );
+                assert_eq!(object.modifiers[&8], modifier);
+                assert!(object.dead);
+                assert!(!object.active);
+                assert_eq!(s.world.queue.len(), queued);
+            }
+            let saved = s.save_json().unwrap();
+            s.load_json(&saved).unwrap();
+            set(&mut s, 90);
+            assert_eq!(s.world.get(creature).unwrap().properties[&8], (0.0, 0.0));
+
+            // Unordered totals follow the ceiling branch of the native comparison.
+            let object = s.world.get_mut(creature).unwrap();
+            object.properties.insert(8, (f32::NAN, 12.0));
+            object.modifiers.clear();
+            set(&mut s, 30);
+            let current = s.world.get(creature).unwrap().properties[&8].1;
+            if origins {
+                assert!(current.is_nan());
+            } else {
+                assert_eq!(current, 0.0);
+            }
+        }
     }
 
     #[test]
