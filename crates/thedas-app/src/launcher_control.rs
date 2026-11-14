@@ -17,7 +17,7 @@
 //! - `key <name>`: presses a key (`Enter`, `Tab`, `Escape`, ...).
 //! - `choose <path>`: the next file or folder dialog answers `path` instead of opening (native
 //!   dialogs can't be driven), e.g. `choose C:\Games\DAO; click Pick a folder…`.
-//! - `wait [seconds]`: until no search or download is running (default 300 s).
+//! - `wait [seconds]`: until no search, download or mod check is running (default 300 s).
 //! - `run <ms>`: lets the launcher run that long.
 //! - `tree`: every named control and text on the page: role, name, value, enabled, checked.
 //! - `status`: the page, the footer's message, the installs, whether a search or download runs.
