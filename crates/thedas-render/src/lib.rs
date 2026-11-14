@@ -22,6 +22,7 @@ pub mod d3d;
 mod d3d_gpu;
 pub mod deferred;
 pub mod distortion;
+pub mod fxaa;
 pub mod gpu;
 pub mod look;
 pub mod material;
