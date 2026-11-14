@@ -232,9 +232,10 @@ struct Args {
     detail: String,
     /// Multisampled anti-aliasing for the world: samples a pixel (the original's
     /// `AntialiasingLevel`; 1 is off, which leaves the post-process smoothing on). Limited to
-    /// what the GPU supports.
-    #[arg(long, default_value_t = 1)]
-    antialiasing: u32,
+    /// what the GPU supports. Without it the window plays at the Options screen's choice (4x
+    /// unless the player chose another) and headless runs draw without it.
+    #[arg(long)]
+    antialiasing: Option<u32>,
     /// Headless: the shaders' clock (`ApplicationTime`) at the capture, in seconds; it runs
     /// on from there through `run` steps. The clouds drift with it.
     #[arg(long, default_value_t = 0.0)]
@@ -1277,6 +1278,12 @@ impl App {
         if let Some(path) = &self.settings {
             ui.set_settings_file(path.clone());
         }
+        // The anti-aliasing slider offers what the device draws the world with; the choice
+        // (4x unless the player chose) is the world's samples (see `sync_antialiasing`).
+        ui.set_antialias_samples(
+            thedas_render::msaa::supported_samples(&ctx.adapter, config.format),
+            !upload::automated(),
+        );
         if let (Some(live), Some(_)) = (&self.live, &self.screens) {
             ui.attach(&live.sim);
             ui.set_saves(saves::SaveStore::new(self.saves_dir.clone()));
@@ -1599,6 +1606,16 @@ impl App {
             }
         }
         g.ui.set_pad_active(self.pad.used);
+        // The world's samples follow the Options screen's choice, unless `--antialiasing`
+        // gave them: new games take it, a running one at its next level build.
+        if !live::ANTIALIASING_FORCED.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(n) = g.ui.antialiasing()
+        {
+            live::ANTIALIASING.store(n, std::sync::atomic::Ordering::Relaxed);
+            if let Some(live) = self.live.as_mut() {
+                live.antialiasing = n;
+            }
+        }
         let hovered = self.hovered_creature();
         if let Some(live) = self.live.as_mut() {
             live.set_hovered(hovered);
@@ -6220,7 +6237,11 @@ fn main() -> Result<()> {
     let mut args = Args::parse();
     faces::set_language(&args.language);
     live::ANTIALIASING.store(
-        args.antialiasing.max(1),
+        args.antialiasing.unwrap_or(1).max(1),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    live::ANTIALIASING_FORCED.store(
+        args.antialiasing.is_some(),
         std::sync::atomic::Ordering::Relaxed,
     );
     // A client's or a test's run sends and fetches nothing (see `upload::online`).
