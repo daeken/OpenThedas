@@ -129,6 +129,28 @@ Windows executable's icon through `build.rs` when a resource compiler is on the 
 (`x86_64-w64-mingw32-windres` from binutils-mingw-w64 for the cross builds; without one the
 build warns and goes on). `openthedas.icns` is for a future macOS app bundle.
 
+## Accessibility and scripting
+
+The launcher's controls are exposed through AccessKit (egui's accessibility tree): UI
+Automation on Windows, VoiceOver on macOS, AT-SPI on Linux. Buttons whose text repeats per game
+or install ("Remove", "Download from Steam") carry a fuller accessible name ("Remove Dragon
+Age: Origins (Steam, This computer)", "Download Dragon Age II from Steam"); text fields are
+labelled by the text beside them.
+
+Scripts drive the launcher through the same tree, clicking controls by name
+(`launcher_control.rs` has the full list):
+
+- `thedas-app --launcher --launcher-steps "click Search this computer; wait; tree; click
+  Continue; shot out.png; quit"`: steps in order; `tree` and `status` print JSON; a failed step
+  ends the run with a non-zero exit.
+- `thedas-app --launcher --control 127.0.0.1:8020`: JSON requests a line at a time
+  (`{"cmd":"click","name":"Continue"}`, `type`, `key`, `choose`, `wait`, `run`, `tree`,
+  `status`, `screenshot`, `quit`). `--control` without `--launcher` still drives the game.
+- File and folder dialogs can't be driven, so `choose <path>` answers the next one:
+  `choose C:\Games\Dragon Age; click Pick the game's folder myself…`.
+- Typed text never reaches a log line (a step logs only the field and the length), and a
+  password field reads back as dots.
+
 ## Screenshots and checks
 
 `thedas-app --launcher-capture out.png --launcher-page <page> --size 1920x1360
