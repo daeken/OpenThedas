@@ -113,6 +113,7 @@ struct LightingUniforms {
     fog1: [f32; 4],
     counts: [u32; 4],
     size: [f32; 4],
+    sun_shadow: [[f32; 4]; 9],
 }
 
 #[repr(C)]
@@ -180,6 +181,8 @@ struct Gpu {
     light_buffer: wgpu::Buffer,
     /// The shadowed lights' maps, and their faces' view-projections for the lighting.
     shadows: crate::deferred_shadow::ShadowPool,
+    sun_fallback: wgpu::TextureView,
+    sun_sampler: wgpu::Sampler,
     faces_buffer: wgpu::Buffer,
     lighting_group: wgpu::BindGroup,
     targets_layout: wgpu::BindGroupLayout,
@@ -506,6 +509,9 @@ impl DeferredPass {
                     },
                     count: None,
                 },
+                tex(6, true),
+                tex(7, true),
+                smp(8),
             ],
         });
         let gbuffer_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -785,6 +791,30 @@ impl DeferredPass {
             lighting_buffer,
             light_buffer,
             shadows: crate::deferred_shadow::ShadowPool::new(device),
+            sun_fallback: device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("deferred unused sun partition"),
+                    size: wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: crate::d3d_gpu::SHADOW_FORMAT,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default()),
+            sun_sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("deferred sun partitions"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            }),
             faces_buffer,
             lighting_group,
             targets_layout,
@@ -872,13 +902,16 @@ impl DeferredPass {
                     .create_view(&wgpu::TextureViewDescriptor::default())
             });
             // Targets 0-3 at bindings 0-3, the depth at 4, the shadow maps at 5.
-            let entries: Vec<wgpu::BindGroupEntry> = [
+            let sun_views = d3d.sun_shadows().map(|(_, views)| views);
+            let mut entries: Vec<wgpu::BindGroupEntry> = [
                 &views[0],
                 &views[1],
                 &views[2],
                 &views[3],
                 depth,
                 &gpu.shadows.view,
+                sun_views.map_or(&gpu.sun_fallback, |v| &v[0]),
+                sun_views.map_or(&gpu.sun_fallback, |v| &v[1]),
             ]
             .into_iter()
             .enumerate()
@@ -887,6 +920,10 @@ impl DeferredPass {
                 resource: wgpu::BindingResource::TextureView(v),
             })
             .collect();
+            entries.push(wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::Sampler(&gpu.sun_sampler),
+            });
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("deferred g-buffer"),
                 layout: &gpu.targets_layout,
@@ -961,8 +998,19 @@ impl DeferredPass {
             sun_colour: sun_colour.to_array(),
             fog0: fog[0],
             fog1: fog[1],
-            counts: [gpu.lights.len() as u32, debug_view(), 0, 0],
+            counts: [
+                gpu.lights.len() as u32,
+                debug_view(),
+                u32::from(
+                    d3d.sun_shadows().is_some()
+                        && std::env::var("THEDAS_DEFERRED_SUN_SHADOWS").as_deref() != Ok("0"),
+                ),
+                0,
+            ],
             size: [width as f32, height as f32, 0.0, 0.0],
+            sun_shadow: d3d
+                .sun_shadows()
+                .map_or(crate::d3d::NO_SHADOW_DATA, |(data, _)| data),
         };
         ctx.queue
             .write_buffer(&gpu.lighting_buffer, 0, bytemuck::bytes_of(&lighting));
@@ -1234,6 +1282,7 @@ fn debug_view() -> u32 {
             "flat" => 8,
             "wrap" => 9,
             "shadows" => 10,
+            "sun-shadows" => 11,
             _ => 0,
         }
     })

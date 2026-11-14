@@ -53,7 +53,7 @@ lightmaps. It is not parity work; where the two differ, the faithful path is rig
    cut-away meshes, particles. Then the frame effects as now.
 
 Debug views in place of the lit frame: `THEDAS_DEFERRED_VIEW=albedo|normal|lightmap|
-visibility|diffuse|specular|no-rooms|flat|wrap` (see `deferred::debug_view`).
+visibility|diffuse|specular|no-rooms|flat|wrap|shadows|sun-shadows` (see `deferred::debug_view`).
 
 The environment reflection Static1 adds (the probe cubemap times
 `mml_fSpecularReflectionMult`, the specular mask and falloff) has no room in the G-buffer
@@ -87,7 +87,16 @@ characters and placeables, move over in later steps.
 ## Shadows
 
 - Sun: the faithful path's two partitions, sampled in the lighting pass (same matrices,
-  `ShadowTargets::frame`), so both paths agree on where shadows fall.
+  targets, casters, quality and temporal box smoothing). Static1's five-tap near filter
+  reads red depth and blurred green coverage; the far filter compares four depths and
+  fades to lit over the final quarter of its reach. Its grazing-angle floor is retained.
+  Outside either map is lit. `THEDAS_DEFERRED_SUN_SHADOWS=0` disables sampling for comparison;
+  `THEDAS_DEFERRED_VIEW=sun-shadows` shows visibility on deferred surfaces.
+  The baked direct visibility `lm.a` still applies once to static diffuse (and with a 0.2
+  floor to specular), multiplied by runtime visibility as in Static1. Baked RGB bounce
+  takes only `lerp(1, visibility, 0.15)`, the original exploration-camera blend; neither
+  the whole lightmap nor dynamic emitter lights are multiplied by a second sun mask.
+  World reconstruction undoes the G-buffer vertex shader's half-pixel fix-up.
 - Point and VFX lights: four cube shadow slots, allocated to dynamic lights by brightness
   times radius over distance from the camera. Each is six 512-square `R32Float` distance
   maps with a 0.35 m near plane to leave the flame's enclosing torch bowl out. Opaque
@@ -97,7 +106,8 @@ characters and placeables, move over in later steps.
   yet; static lights keep their baked visibility. At most 24 face passes per frame.
   `THEDAS_DEFERRED_POINT_SHADOWS=0` disables both rendering and sampling these maps for
   captures and cost comparisons; it does not change the faithful path.
-- With both in, `lm.a` is no longer needed as the visibility term.
+- These maps do not replace baked visibility yet: static lights and static geometry still
+  depend on `lm.a`; removing it requires the later lightmaps-off work below.
 
 ## Real-time lighting in place of lightmaps (later steps)
 
