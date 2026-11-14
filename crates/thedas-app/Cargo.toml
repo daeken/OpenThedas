@@ -28,6 +28,7 @@ pollster.workspace = true
 glam.workspace = true
 bytemuck.workspace = true
 png.workspace = true
+texpresso.workspace = true
 log.workspace = true
 env_logger.workspace = true
 serde_json.workspace = true
