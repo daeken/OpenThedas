@@ -25,6 +25,7 @@ mod deferred_character;
 mod deferred_mesh;
 mod deferred_shadow;
 mod deferred_terrain;
+mod deferred_tiles;
 pub mod distortion;
 pub mod fxaa;
 pub mod gpu;
