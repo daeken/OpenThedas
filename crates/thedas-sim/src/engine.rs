@@ -109,6 +109,99 @@ const DA2_AMBIENT_ACTIVITY: &str = "AmbientActivityPattern";
 const DA2_AMBIENT_MOVEMENT: &str = "AmbientMovementPattern";
 const DA2_ENCOUNTER: &str = "EncounterId";
 
+/// DA2's rating conversion (DragonAge2.exe 0x697c00, command 861 at 0x4ed090).
+/// Table 371 selects one of four level curves in table 405. Below the optimal rating
+/// the fraction follows a power curve; above it, each further optimal-sized increment
+/// halves the distance to the ceiling. Column names are unknown, so use their hashes.
+fn da2_percentage_from_scaled(sim: &Sim, level: i32, scaled: f32, property: i32) -> f32 {
+    let tables = sim.world.tables();
+    let Some(functions) = tables.get(371, "") else {
+        return 0.0;
+    };
+    let row = property as i64;
+    let Some(Cell::Int(selector)) = functions.cell_by_hash(0x1d78_b8e3, row) else {
+        return 0.0;
+    };
+    let columns = [0x73a8_6afe, 0xe337_46bf, 0xf9fc_7170, 0x6e1d_17ea];
+    let Some(&column) = usize::try_from(*selector).ok().and_then(|i| columns.get(i)) else {
+        return 0.0;
+    };
+    let optimal = cell_float(
+        tables
+            .get(405, "")
+            .and_then(|t| t.cell_by_hash(column, level as i64).cloned())
+            .as_ref(),
+    );
+    if optimal <= 0.0 || optimal.is_nan() {
+        return 0.0;
+    }
+    let Some(knee) = functions
+        .cell_by_hash(0x2c4e_dea1, row)
+        .filter(|c| !matches!(c, Cell::Empty))
+    else {
+        return 0.0;
+    };
+    let knee = cell_float(Some(knee)) as f64;
+    let ratio = scaled as f64 / optimal as f64;
+    let fraction = if scaled <= optimal {
+        let exponent = cell_float(functions.cell_by_hash(0x7fc1_781c, row)) as f64;
+        knee * ratio.dpowf(exponent)
+    } else {
+        let ceiling = cell_float(functions.cell_by_hash(0x5ee2_2fe7, row)) as f64;
+        ceiling - (ceiling - knee) * 0.5_f64.dpowf(ratio - 1.0)
+    };
+    fraction as f32
+}
+
+/// DA2 command 646 (0x51af60 -> 0x560a00). Item abilities (type 4) are never
+/// returned. The cooldown-only path enumerates active cooldown records, including an
+/// ability since removed from the creature; the ordinary path reads known abilities.
+fn da2_ability_list(sim: &Sim, who: ObjectId, ty: i32, cooling: bool) -> Vec<i32> {
+    let Some(o) = sim
+        .world
+        .get(who)
+        .filter(|o| o.kind == ObjectKind::Creature)
+    else {
+        return Vec::new();
+    };
+    if ty == 4 {
+        return Vec::new();
+    }
+    let tables = sim.world.tables();
+    let abilities = tables.get(1, "");
+    // DA2 uses this column, not DA:O's `AbilityType` column (0xe1a8f4ea).
+    let cell = |id| {
+        abilities
+            .as_ref()
+            .and_then(|t| t.cell_by_hash(0x100b_492a, id))
+    };
+    let matches_type = |id| {
+        let kind = cell_int(cell(id));
+        kind != 4 && (ty == 0 || ty == kind)
+    };
+    if cooling {
+        let mut ids: Vec<i32> = o
+            .combat
+            .cooldowns
+            .iter()
+            .filter(|(_, until)| **until > sim.world.time_ms)
+            .filter_map(|(key, _)| key.split_once(':')?.0.parse().ok())
+            .filter(|&id| matches_type(id as i64))
+            .collect();
+        // Keep the simulation's ability lists in deterministic id order. Distinct
+        // cooldown records may name the same ability, and retain their multiplicity.
+        ids.sort_unstable();
+        ids
+    } else {
+        o.abilities
+            .iter()
+            .copied()
+            .filter(|&id| cell(id as i64).is_some_and(|c| !matches!(c, Cell::Empty)))
+            .filter(|&id| matches_type(id as i64))
+            .collect()
+    }
+}
+
 /// The party's inventory slots before any backpack (provisional).
 pub const DEFAULT_INVENTORY_SIZE: i32 = 70;
 
@@ -3248,6 +3341,19 @@ pub fn call(
             }
             void()
         }
+        "GetAbilityList" => ok(Value::Array {
+            elem: Type::Int,
+            items: da2_ability_list(h.sim, obj(a, 0), int(a, 1), int(a, 2) != 0)
+                .into_iter()
+                .map(Value::Int)
+                .collect(),
+        }),
+        "CombatGetPercentageFromScaled" => ok(Value::Float(da2_percentage_from_scaled(
+            h.sim,
+            int(a, 0),
+            float(a, 1),
+            int(a, 2),
+        ))),
         // The abilities of a type (`ABI_base` `AbilityType`, 0 for any) and GUI type
         // (`guitype`, 0 for any), as script.ldf documents.
         "GetAbilityCount" => {
@@ -5043,6 +5149,8 @@ mod tests {
         effect[] GetEffects(object o, int t = 0, int a = 0, object c = OBJECT_INVALID, int d = 0, int i = -1) = 52;\n\
         void RemoveEffectsByParameters(object o, int t = 0, int a = 0, object c = OBJECT_INVALID) = 53;\n\
         int GetAbilityCount(object o, int t = 0, int g = 0) = 54;\n\
+        int[] GetAbilityList(object o, int t = 0, int cooling = 0) = 646;\n\
+        float CombatGetPercentageFromScaled(int level, float scaled, int property) = 861;\n\
         void CharGen_ClearAbilityList(object o, int t = 0) = 55;\n\
         void SetQuickslot(object o, int n, int a, string s = \"\") = 56;\n\
         int GetPlaceablePickLockLevel(object o) = 57;\n\
@@ -5086,6 +5194,177 @@ mod tests {
         void SetHeadMorphName(object o, string s) = 887;\n\
         int GetUpgradableAbilityHashedM2DAInt(object o, int nColumnHash, int nAbilityId) = 875;\n\
         float GetUpgradableAbilityHashedM2DAFloat(object o, int nColumnHash, int nAbilityId) = 876;\n";
+
+    #[test]
+    fn da2_scaled_ratings_follow_level_curves_and_both_sides_of_the_knee() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let tables = crate::m2da::Tables::empty();
+        // Synthetic curves, independent of the player's game data.
+        tables.insert(
+            "#371",
+            &["#1d78b8e3", "#2c4edea1", "#7fc1781c", "#5ee22fe7"],
+            (0..4)
+                .map(|id| {
+                    (
+                        id,
+                        vec![
+                            Cell::Int(id),
+                            Cell::Float(0.4),
+                            Cell::Float(2.0),
+                            Cell::Float(1.0),
+                        ],
+                    )
+                })
+                .chain([(4, vec![Cell::Int(4)]), (5, vec![Cell::Int(-1)])])
+                .collect(),
+        );
+        tables.insert(
+            "#405",
+            &["#73a86afe", "#e33746bf", "#f9fc7170", "#6e1d17ea"],
+            vec![
+                (
+                    1,
+                    vec![
+                        Cell::Float(100.0),
+                        Cell::Float(200.0),
+                        Cell::Float(300.0),
+                        Cell::Float(400.0),
+                    ],
+                ),
+                (
+                    2,
+                    vec![
+                        Cell::Float(200.0),
+                        Cell::Float(0.0),
+                        Cell::Float(-1.0),
+                        Cell::Float(f64::NAN),
+                    ],
+                ),
+            ],
+        );
+        s.world.tables = Arc::new(tables);
+        let percentage = |s: &mut Sim, level, scaled, property| match run(
+            s,
+            1,
+            "CombatGetPercentageFromScaled",
+            &[
+                Value::Int(level),
+                Value::Float(scaled),
+                Value::Int(property),
+            ],
+        ) {
+            Some(Value::Float(v)) => v,
+            other => panic!("expected float: {other:?}"),
+        };
+        for (scaled, want) in [
+            (0.0, 0.0),
+            (50.0, 0.1),
+            (100.0, 0.4),
+            (200.0, 0.7),
+            (300.0, 0.85),
+            (-50.0, 0.1),
+        ] {
+            assert!((percentage(&mut s, 1, scaled, 0) - want).abs() < 1e-6);
+        }
+        // Every selector chooses a different column, while a new level changes the knee.
+        for property in 0..4 {
+            let optimal = (property + 1) as f32 * 100.0;
+            assert!((percentage(&mut s, 1, optimal, property) - 0.4).abs() < 1e-6);
+        }
+        assert!((percentage(&mut s, 2, 100.0, 0) - 0.1).abs() < 1e-6);
+        for (level, property) in [(99, 0), (1, 99), (1, 4), (1, 5), (2, 1), (2, 2), (2, 3)] {
+            assert_eq!(percentage(&mut s, level, 100.0, property), 0.0);
+        }
+        assert!(percentage(&mut s, 1, f32::NAN, 0).is_nan());
+    }
+
+    #[test]
+    fn da2_scaled_rating_missing_curve_cells_keep_the_native_zero_defaults() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        assert_eq!(da2_percentage_from_scaled(&s, 1, 50.0, 0), 0.0);
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "#371",
+            &["#1d78b8e3", "#2c4edea1"],
+            vec![
+                (0, vec![Cell::Int(0), Cell::Float(0.4)]),
+                (1, vec![Cell::Int(0), Cell::Empty]),
+            ],
+        );
+        tables.insert("#405", &["#73a86afe"], vec![(1, vec![Cell::Float(100.0)])]);
+        s.world.tables = Arc::new(tables);
+        // Missing lower exponent is zero (power of zero), missing ceiling is zero.
+        assert!((da2_percentage_from_scaled(&s, 1, 50.0, 0) - 0.4).abs() < 1e-6);
+        assert!((da2_percentage_from_scaled(&s, 1, 200.0, 0) - 0.2).abs() < 1e-6);
+        assert_eq!(da2_percentage_from_scaled(&s, 1, 200.0, 1), 0.0);
+    }
+
+    #[test]
+    fn da2_ability_lists_exclude_items_and_enumerate_cooldowns_separately() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "#1",
+            &["#100b492a", "AbilityType"],
+            vec![
+                (1, vec![Cell::Int(1), Cell::Int(4)]),
+                (2, vec![Cell::Int(2), Cell::Int(4)]),
+                (3, vec![Cell::Int(4), Cell::Int(1)]),
+                (4, vec![Cell::Int(1), Cell::Int(4)]),
+                (5, vec![Cell::Int(1), Cell::Int(4)]),
+            ],
+        );
+        s.world.tables = Arc::new(tables);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let item = s.world.spawn(ObjectKind::Item, "item");
+        s.world.time_ms = 1000;
+        let o = s.world.get_mut(hero).unwrap();
+        o.abilities = [1, 2, 3, 4, 99].into_iter().collect();
+        o.combat.cooldowns = [
+            ("1:".into(), 2000),
+            ("2:".into(), 1000),
+            ("3:potion".into(), 2000),
+            ("4:".into(), 999),
+            ("5:".into(), 2000),
+            ("5:source".into(), 3000),
+        ]
+        .into_iter()
+        .collect();
+        let list = |s: &mut Sim, who, ty, cooling| match run(
+            s,
+            hero,
+            "GetAbilityList",
+            &[Value::Object(who), Value::Int(ty), Value::Int(cooling)],
+        ) {
+            Some(Value::Array {
+                elem: Type::Int,
+                items,
+            }) => items,
+            other => panic!("expected integer array: {other:?}"),
+        };
+        let ints = |ids: &[i32]| ids.iter().copied().map(Value::Int).collect::<Vec<_>>();
+        assert_eq!(list(&mut s, hero, 0, 0), ints(&[1, 2, 4]));
+        assert_eq!(list(&mut s, hero, 1, 0), ints(&[1, 4]));
+        assert_eq!(list(&mut s, hero, 2, 0), ints(&[2]));
+        assert_eq!(list(&mut s, hero, 0, 1), ints(&[1, 5, 5]));
+        assert_eq!(list(&mut s, hero, 1, 1), ints(&[1, 5, 5]));
+        for (who, ty, cooling) in [
+            (hero, 4, 0),
+            (hero, 4, 1),
+            (hero, -1, 0),
+            (item, 0, 0),
+            (OBJECT_INVALID, 0, 1),
+        ] {
+            assert!(list(&mut s, who, ty, cooling).is_empty());
+        }
+        // Expired records are ignored even while still stored; the query is read-only.
+        assert_eq!(s.world.get(hero).unwrap().combat.cooldowns.len(), 6);
+        s.world.time_ms = 3000;
+        assert!(list(&mut s, hero, 0, 1).is_empty());
+    }
 
     #[test]
     fn dragon_age_2_functions_read_and_set_template_fields() {
