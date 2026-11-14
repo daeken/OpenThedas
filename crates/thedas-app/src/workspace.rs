@@ -12,8 +12,9 @@
 //!   its meshes become the `.msh` files they came from, in `override/`, and `.imported`
 //!   in the export's folder says when and what came of it.
 //!
-//! The textures are written uncompressed (8-bit BGRA with a full mip chain), which the game
-//! reads as it reads the originals' compressed ones. Mounted only by mod mode's "Live
+//! Textures are written in the original's own format where it is block-compressed (DXT1,
+//! DXT3, DXT5, by `texpresso`), else uncompressed (8-bit BGRA), with a full mip chain, so
+//! the game reads them as it reads the originals (see [`encode_dds`]). Mounted only by mod mode's "Live
 //! edits" switch or the `--mod-workspace` launch option, never because the folder has files;
 //! not with mods switched off (`THEDAS_MODS=none`).
 
@@ -233,14 +234,19 @@ pub fn import_glb(
     result
 }
 
-/// Writes each change's texture into `overrides`. Returns the textures written, and what
-/// failed.
-pub fn apply(changes: &[Change], overrides: &Path) -> (Vec<String>, Vec<String>) {
+/// Writes each change's texture into `overrides`, in the format `format_of` gives for the
+/// texture it replaces (the original's). Returns the textures written, and what failed.
+pub fn apply(
+    changes: &[Change],
+    overrides: &Path,
+    format_of: &dyn Fn(&str) -> Option<thedas_formats::dds::DdsFormat>,
+) -> (Vec<String>, Vec<String>) {
     let (mut done, mut failed) = (Vec::new(), Vec::new());
     for c in changes {
+        let target = Encoding::like(format_of(&c.texture));
         let made = std::fs::read(&c.png)
             .map_err(|e| e.to_string())
-            .and_then(|b| png_to_dds(&b))
+            .and_then(|b| png_to_dds(&b, target))
             .and_then(|dds| {
                 std::fs::create_dir_all(overrides).map_err(|e| e.to_string())?;
                 std::fs::write(overrides.join(&c.texture), dds).map_err(|e| e.to_string())
@@ -253,9 +259,34 @@ pub fn apply(changes: &[Change], overrides: &Path) -> (Vec<String>, Vec<String>)
     (done, failed)
 }
 
-/// A PNG as an uncompressed DDS: 8-bit BGRA, with every mip down to 1x1 (each a box filter
-/// of the one above).
-pub fn png_to_dds(png: &[u8]) -> Result<Vec<u8>, String> {
+/// How a texture is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Encoding {
+    /// Uncompressed 8-bit BGRA.
+    Bgra8,
+    /// Block-compressed: DXT1, DXT3, DXT5.
+    Bc1,
+    Bc2,
+    Bc3,
+}
+
+impl Encoding {
+    /// The encoding for a texture that replaces one of `format` (uncompressed for formats
+    /// not block-compressed, or none known).
+    pub fn like(format: Option<thedas_formats::dds::DdsFormat>) -> Encoding {
+        use thedas_formats::dds::DdsFormat as F;
+        match format {
+            Some(F::Bc1) => Encoding::Bc1,
+            Some(F::Bc2) => Encoding::Bc2,
+            Some(F::Bc3) => Encoding::Bc3,
+            _ => Encoding::Bgra8,
+        }
+    }
+}
+
+/// A PNG as a DDS of `encoding`, with every mip down to 1x1 (each a box filter of the one
+/// above).
+pub fn png_to_dds(png: &[u8], encoding: Encoding) -> Result<Vec<u8>, String> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(png));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
@@ -282,11 +313,12 @@ pub fn png_to_dds(png: &[u8]) -> Result<Vec<u8>, String> {
         png::ColorType::Grayscale => buf[..px].iter().flat_map(|&g| [g, g, g, 255]).collect(),
         png::ColorType::Indexed => return Err("an indexed PNG was not expanded".into()),
     };
-    Ok(dds_bgra(w, h, rgba))
+    Ok(encode_dds(w, h, rgba, encoding))
 }
 
-/// An uncompressed DDS (A8R8G8B8) of an RGBA image, with its mip chain.
-fn dds_bgra(w: u32, h: u32, rgba: Vec<u8>) -> Vec<u8> {
+/// An RGBA image as a DDS of `encoding`, with its mip chain: the one place textures are
+/// encoded (block compression by `texpresso`, its cluster fit).
+pub fn encode_dds(w: u32, h: u32, rgba: Vec<u8>, encoding: Encoding) -> Vec<u8> {
     let mut mips = vec![(w, h, rgba)];
     while let Some((pw, ph, p)) = mips.last().filter(|(pw, ph, _)| *pw > 1 || *ph > 1) {
         let (nw, nh) = ((pw / 2).max(1), (ph / 2).max(1));
@@ -306,34 +338,75 @@ fn dds_bgra(w: u32, h: u32, rgba: Vec<u8>) -> Vec<u8> {
         }
         mips.push((nw, nh, next));
     }
-    let mut out = Vec::with_capacity(128 + mips.iter().map(|m| m.2.len()).sum::<usize>());
+    let block = match encoding {
+        Encoding::Bgra8 => None,
+        Encoding::Bc1 => Some((texpresso::Format::Bc1, *b"DXT1")),
+        Encoding::Bc2 => Some((texpresso::Format::Bc2, *b"DXT3")),
+        Encoding::Bc3 => Some((texpresso::Format::Bc3, *b"DXT5")),
+    };
+    let levels: Vec<Vec<u8>> = mips
+        .into_iter()
+        .map(|(mw, mh, p)| match block {
+            Some((f, _)) => {
+                let mut o = vec![0u8; f.compressed_size(mw as usize, mh as usize)];
+                f.compress(
+                    &p,
+                    mw as usize,
+                    mh as usize,
+                    texpresso::Params::default(),
+                    &mut o,
+                );
+                o
+            }
+            None => p
+                .chunks_exact(4)
+                .flat_map(|c| [c[2], c[1], c[0], c[3]])
+                .collect(),
+        })
+        .collect();
+    let mut out = Vec::with_capacity(128 + levels.iter().map(Vec::len).sum::<usize>());
     let mut u = |v: u32| out.extend_from_slice(&v.to_le_bytes());
-    // Header: caps, height, width, pitch, pixel format, mip count.
+    // Header: caps, height, width, pitch (or the top level's size), pixel format, mips.
     u(u32::from_le_bytes(*b"DDS "));
     u(124);
-    u(0x1 | 0x2 | 0x4 | 0x8 | 0x1000 | 0x2_0000);
+    let size_flag = if block.is_some() { 0x8_0000 } else { 0x8 };
+    u(0x1 | 0x2 | 0x4 | 0x1000 | 0x2_0000 | size_flag);
     u(h);
     u(w);
-    u(w * 4);
+    u(match block {
+        Some(_) => levels[0].len() as u32,
+        None => w * 4,
+    });
     u(0);
-    u(mips.len() as u32);
+    u(levels.len() as u32);
     for _ in 0..11 {
         u(0);
     }
     u(32);
-    u(0x40 | 0x1); // DDPF_RGB | DDPF_ALPHAPIXELS
-    u(0);
-    u(32);
-    u(0x00ff_0000);
-    u(0x0000_ff00);
-    u(0x0000_00ff);
-    u(0xff00_0000);
+    match block {
+        Some((_, fourcc)) => {
+            u(0x4); // DDPF_FOURCC
+            u(u32::from_le_bytes(fourcc));
+            for _ in 0..5 {
+                u(0);
+            }
+        }
+        None => {
+            u(0x40 | 0x1); // DDPF_RGB | DDPF_ALPHAPIXELS
+            u(0);
+            u(32);
+            u(0x00ff_0000);
+            u(0x0000_ff00);
+            u(0x0000_00ff);
+            u(0xff00_0000);
+        }
+    }
     u(0x1000 | 0x8 | 0x40_0000); // texture, complex, mipmap
     for _ in 0..4 {
         u(0);
     }
-    for (_, _, p) in mips {
-        out.extend(p.chunks_exact(4).flat_map(|c| [c[2], c[1], c[0], c[3]]));
+    for l in levels {
+        out.extend(l);
     }
     out
 }
@@ -352,9 +425,55 @@ mod tests {
     }
 
     #[test]
+    fn block_compressed_textures_keep_their_look() {
+        // A gradient with an alpha ramp, 8x8.
+        let rgba: Vec<u8> = (0..64u32)
+            .flat_map(|i| [(i * 4) as u8, (255 - i * 4) as u8, 128, (i * 4) as u8])
+            .collect();
+        for (enc, fourcc, alpha) in [
+            (Encoding::Bc1, b"DXT1", false),
+            (Encoding::Bc2, b"DXT3", true),
+            (Encoding::Bc3, b"DXT5", true),
+        ] {
+            // DXT1 keeps one bit of alpha: given opaque pixels.
+            let rgba: Vec<u8> = if alpha {
+                rgba.clone()
+            } else {
+                rgba.chunks_exact(4)
+                    .flat_map(|p| [p[0], p[1], p[2], 255])
+                    .collect()
+            };
+            let dds = encode_dds(8, 8, rgba.clone(), enc);
+            assert_eq!(&dds[84..88], fourcc);
+            let d = thedas_formats::dds::Dds::parse(&dds).unwrap();
+            assert_eq!((d.width, d.height, d.mip_count), (8, 8, 4));
+            let back = d.decode_rgba8(0, 0).unwrap();
+            let worst = back
+                .chunks_exact(4)
+                .zip(rgba.chunks_exact(4))
+                .flat_map(|(a, b)| (0..if alpha { 4 } else { 3 }).map(move |k| a[k].abs_diff(b[k])))
+                .max()
+                .unwrap();
+            assert!(worst <= 24, "{enc:?}: off by {worst}");
+            // Every mip decodes.
+            for m in 0..d.mip_count {
+                d.decode_rgba8(0, m).unwrap();
+            }
+        }
+        assert_eq!(
+            Encoding::like(Some(thedas_formats::dds::DdsFormat::Bc3)),
+            Encoding::Bc3
+        );
+        assert_eq!(
+            Encoding::like(Some(thedas_formats::dds::DdsFormat::L8)),
+            Encoding::Bgra8
+        );
+    }
+
+    #[test]
     fn a_png_becomes_a_dds_the_game_reads() {
         let rgba: Vec<u8> = (0..4 * 2 * 4).map(|i| (i * 7) as u8).collect();
-        let dds = png_to_dds(&png(4, 2, &rgba)).unwrap();
+        let dds = png_to_dds(&png(4, 2, &rgba), Encoding::Bgra8).unwrap();
         let d = thedas_formats::dds::Dds::parse(&dds).unwrap();
         assert_eq!((d.width, d.height, d.mip_count), (4, 2, 3));
         assert_eq!(d.decode_rgba8(0, 0).unwrap(), rgba);
@@ -390,7 +509,7 @@ mod tests {
         let c = changes(&blender, &overrides);
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].texture, "t_0d.dds");
-        let (done, failed) = apply(&c, &overrides);
+        let (done, failed) = apply(&c, &overrides, &|_| None);
         assert_eq!((done, failed.len()), (vec!["t_0d.dds".to_string()], 0));
         set(&overrides.join("t_0d.dds"), 3000);
         assert!(changes(&blender, &overrides).is_empty());
