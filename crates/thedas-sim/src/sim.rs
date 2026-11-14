@@ -1874,9 +1874,39 @@ impl Sim {
         ev.strings = strings;
         if ty == "CHARGEN_END" {
             self.world.chargen = None;
+            if self.game == thedas_vfs::Game::DragonAge2 && self.world.chargen_mode == 0 {
+                self.hide_chargen_lineup();
+            }
         }
         self.world.queue_event(0, module, ev, None);
         true
+    }
+
+    /// Dragon Age II's character creation shows a lineup of the hero's choices as creatures
+    /// standing in the area: those whose tags are the `CreatureTag` column of the
+    /// `chargen_dae` table (M2DA 374; `fake_warrior_male` and the rest in the prologue).
+    /// When creation ends they leave the scene, and the hero goes on as the one chosen. No
+    /// script touches them, so the engine does it. Provisional: the lineup is read from
+    /// the table, not traced in DragonAge2.exe; here they are made inactive.
+    fn hide_chargen_lineup(&mut self) {
+        let Some(t) = self.world.tables().get(374, "") else {
+            return;
+        };
+        let tags: Vec<String> = t
+            .order
+            .iter()
+            .map(|&row| crate::engine::cell_string(t.cell("CreatureTag", row)).to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let hero = self.world.hero;
+        for o in self.world.objects.values_mut() {
+            if o.kind == ObjectKind::Creature
+                && Some(o.id) != hero
+                && tags.contains(&o.tag.to_ascii_lowercase())
+            {
+                o.active = false;
+            }
+        }
     }
 
     /// How long a command takes once it reaches the front of its queue. Waits take their time,
