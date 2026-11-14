@@ -1194,6 +1194,13 @@ impl AreaRenderer {
         self.deferred.as_ref().is_some_and(|d| !d.refused())
     }
 
+    /// Per-renderer benchmark override; `None` restores the configured shadow policy.
+    pub fn set_deferred_shadow_reuse(&mut self, enabled: Option<bool>) {
+        if let Some(d) = &mut self.deferred {
+            d.set_shadow_reuse(enabled);
+        }
+    }
+
     /// Grades the frame as area `grade` says: its colour curve and `da_hsvmatrix` values
     /// (DAOrigins.exe swaps them when an area becomes active, 0x67b1b0).
     pub fn set_area_grade(&mut self, ctx: &GpuContext, vfs: &Vfs, grade: &crate::post::AreaGrade) {

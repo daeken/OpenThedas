@@ -541,11 +541,35 @@ fn capture(
             .filter(|n| *n > 0)
         {
             let mut ms = Vec::new();
-            for _ in 0..n {
+            let comparison = std::env::var("THEDAS_BENCH_SHADOW_COMPARE").ok();
+            if comparison
+                .as_deref()
+                .is_some_and(|s| s != "reuse" && s != "faithful")
+            {
+                bail!("THEDAS_BENCH_SHADOW_COMPARE must be reuse or faithful");
+            }
+            let original_path = live.render_path;
+            let mut shadow_modes = Vec::new();
+            for frame in 0..n {
+                let test = matches!(frame % 4, 1 | 2);
+                match comparison.as_deref() {
+                    Some("reuse") => live.set_deferred_shadow_reuse(Some(test)),
+                    Some("faithful") => {
+                        live.render_path = if test {
+                            thedas_render::RenderPath::Deferred
+                        } else {
+                            thedas_render::RenderPath::Faithful
+                        }
+                    }
+                    _ => {}
+                }
                 let t = Instant::now();
                 live.capture(ctx, &camera, (w, h))?;
                 ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                shadow_modes.push(u8::from(test));
             }
+            live.render_path = original_path;
+            live.set_deferred_shadow_reuse(None);
             let avg = ms.iter().sum::<f64>() / ms.len() as f64;
             let worst = ms.iter().cloned().fold(0.0, f64::max);
             println!("bench: {n} frames, avg {avg:.1} ms, worst {worst:.1} ms");
@@ -554,6 +578,16 @@ fn capture(
             if std::env::var_os("THEDAS_BENCH_DUMP").is_some() {
                 let all: Vec<String> = ms.iter().map(|m| format!("{m:.1}")).collect();
                 println!("bench frames: {}", all.join(" "));
+                if comparison.is_some() {
+                    println!(
+                        "bench shadow modes: {}",
+                        shadow_modes
+                            .iter()
+                            .map(u8::to_string)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                }
             }
         }
         live.capture(ctx, &camera, (w, h))?

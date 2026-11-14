@@ -2376,6 +2376,12 @@ impl Live {
         Ok(())
     }
 
+    pub fn set_deferred_shadow_reuse(&mut self, enabled: Option<bool>) {
+        if let Some(level) = &mut self.level {
+            level.renderer.set_deferred_shadow_reuse(enabled);
+        }
+    }
+
     /// Sets how the level is drawn, and for the deferred path the lights the frame's glowing
     /// particles give (its objects' and the visual effects'; the level's renderer adds its
     /// own), which light the level's geometry (ours: the original's particles light

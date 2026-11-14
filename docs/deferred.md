@@ -41,6 +41,13 @@ unless it changes slot selection. Resource reloads replace the renderer and its 
 casters still invalidate every cube they reach; stationary capture gains do not predict
 the same gain during motion.
 
+For same-process ABBA captures, combine `THEDAS_BENCH_FRAMES=120`,
+`THEDAS_BENCH_DUMP=1` and `THEDAS_BENCH_SHADOW_COMPARE=reuse|faithful`. The reuse
+control forces every active cube to redraw while both modes retain exact input
+bookkeeping; the other comparison alternates faithful/deferred rendering. Overrides are
+per renderer and restored afterwards, without mutating environment variables while
+worker threads exist. Discard warm-up frames and pair adjacent opposite modes.
+
 1. Shadows exactly as now (the faithful pass places and draws the sun partitions).
 2. **G-buffer pass** over the deferred draws, writing the shared depth buffer:
 

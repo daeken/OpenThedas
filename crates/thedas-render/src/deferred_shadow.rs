@@ -128,6 +128,7 @@ pub(crate) struct ShadowPool {
     material_layout: wgpu::BindGroupLayout,
     opaque: crate::deferred_cutout::Material,
     previous: Vec<CubeInputs>,
+    pub(crate) reuse_override: Option<bool>,
     #[cfg(test)]
     rendered_cubes: usize,
     /// Per layer (slot · 6 + face), the colour and depth views drawn into.
@@ -322,6 +323,7 @@ impl ShadowPool {
             material_layout,
             opaque,
             previous: Vec::new(),
+            reuse_override: None,
             #[cfg(test)]
             rendered_cubes: 0,
             layers,
@@ -375,8 +377,12 @@ impl ShadowPool {
         lights: &[(Vec3, f32)],
         casters: &[Caster<'_>],
     ) {
-        let reuse = std::env::var("THEDAS_DEFERRED_SHADOW_REUSE").as_deref() != Ok("0");
-        let inputs: Vec<_> = if reuse {
+        let reuse = self
+            .reuse_override
+            .unwrap_or_else(|| std::env::var("THEDAS_DEFERRED_SHADOW_REUSE").as_deref() != Ok("0"));
+        // Paired benchmarks keep exact input bookkeeping in both modes and force the
+        // control's redraw. Its freshly drawn maps can then be reused by the next frame.
+        let inputs: Vec<_> = if reuse || self.reuse_override.is_some() {
             lights
                 .iter()
                 .take(SLOTS)
@@ -592,12 +598,12 @@ mod tests {
             device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
             rx.recv().unwrap().unwrap();
             let bytes = readback.slice(..).get_mapped_range().unwrap();
-            for (slot, light) in lights.iter().enumerate() {
+            for slot in 0..lights.len() {
                 let offset = slot * 256;
                 assert_eq!(
                     *bytemuck::from_bytes::<f32>(&bytes[offset..offset + 4]),
-                    light.1,
-                    "stale cube slot {slot}"
+                    1_000_000_000.0,
+                    "empty cube slot {slot} was not cleared"
                 );
             }
         };
@@ -774,6 +780,17 @@ mod tests {
             pool.rendered_cubes, rendered,
             "unchanged cube should be reused"
         );
+        pool.reuse_override = Some(false);
+        assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [false, true]);
+        assert_eq!(pool.rendered_cubes, rendered + 1);
+        pool.reuse_override = Some(true);
+        assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [false, true]);
+        assert_eq!(
+            pool.rendered_cubes,
+            rendered + 1,
+            "benchmark reuse must retain the control's maps"
+        );
+        pool.reuse_override = None;
         assert_eq!(read(&mut pool, [7.0, 255.0, 2.0, 1.0], 0.0), [true, false]);
         // Match D3D9's 8-bit rounding: a fraction below one still passes >= 255.
         assert_eq!(

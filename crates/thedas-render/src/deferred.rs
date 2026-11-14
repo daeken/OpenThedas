@@ -199,6 +199,7 @@ pub(crate) struct DeferredPass {
     /// Experimental probe + runtime visibility mode. Fixed when this renderer is built.
     baked_lighting: bool,
     ssao: bool,
+    shadow_reuse: Option<bool>,
 }
 
 pub(crate) struct Contributor<'a> {
@@ -682,12 +683,17 @@ impl DeferredPass {
             refused: false,
             baked_lighting: std::env::var("THEDAS_DEFERRED_BAKED_LIGHTING").as_deref() != Ok("0"),
             ssao: std::env::var("THEDAS_DEFERRED_SSAO").as_deref() != Ok("0"),
+            shadow_reuse: None,
         })
     }
 
     /// Whether faithful draw `k` (an index into [`D3dPass::draws`]) is this pass's to draw.
     pub(crate) fn takes(&self, k: usize) -> bool {
         self.takes.get(k).copied().unwrap_or(false)
+    }
+
+    pub(crate) fn set_shadow_reuse(&mut self, enabled: Option<bool>) {
+        self.shadow_reuse = enabled;
     }
 
     /// Sets the lights only this pass draws (see [`DeferredPass::effect_lights`]).
@@ -1615,10 +1621,9 @@ impl DeferredPass {
                     casters.extend(casters_for_contributor(c, g));
                 }
             }
-            gpu.shadows
-                .as_mut()
-                .expect("point shadows")
-                .encode(device, &ctx.queue, encoder, &shadowed, &casters);
+            let pool = gpu.shadows.as_mut().expect("point shadows");
+            pool.reuse_override = self.shadow_reuse;
+            pool.encode(device, &ctx.queue, encoder, &shadowed, &casters);
         }
 
         let Some(targets) = gpu.targets.as_ref() else {
