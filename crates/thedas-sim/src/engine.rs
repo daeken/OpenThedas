@@ -174,17 +174,21 @@ pub(crate) fn cell_string(c: Option<&Cell>) -> String {
 }
 
 /// The name of the local variable argument `a[i]` names on object `o`. Dragon Age: Origins
-/// names it; Dragon Age II's scripts pass the variable's row in the object's variable table
-/// instead (`var_module`, `var_area`, `var_creature`, `var_placeable`, `var_item`,
-/// `var_trigger`), whose `Label` column is the name templates use. A row that is not there
-/// keeps its number as its name. Provisional: read from DA2's scripts and tables (its
-/// `PlayCutscene` callers set `var_module` rows 1014 to 1016, `CUTSCENE_SET_PLOT`,
-/// `CUTSCENE_SET_PLOT_FLAG` and `CUTSCENE_TALK_SPEAKER`), not traced in the executable.
+/// names it; Dragon Age II's scripts pass a number instead: the variable's row in the
+/// object's variable table (`var_module`, `var_area`, `var_creature`, `var_placeable`,
+/// `var_item`, `var_trigger`), whose `Label` column is the name templates use. An object
+/// whose template's variables are not that table's rows (a talk trigger's `TRIG_TALK_*`,
+/// which are `var_trigger_talk`'s) numbers them by their place in its template's list,
+/// which follows its own table's rows (row 0 `TRIG_TALK_SPEAKER`, 2 the conversation). A
+/// number neither answers keeps its digits as its name. Provisional: read from DA2's scripts,
+/// tables and templates (`PlayCutscene`'s callers set `var_module` rows 1014 to 1016,
+/// `gen00tr_talk` reads its trigger's speaker at 0), not traced in the executable.
 fn local_name(sim: &Sim, o: ObjectId, a: &[Value], i: usize) -> String {
     let Some(Value::Int(row)) = a.get(i) else {
         return string(a, i);
     };
-    let table = match sim.world.get(o).map(|o| o.kind) {
+    let obj = sim.world.get(o);
+    let table = match obj.map(|o| o.kind) {
         Some(ObjectKind::Module) => "var_module",
         Some(ObjectKind::Area) => "var_area",
         Some(ObjectKind::Creature) => "var_creature",
@@ -193,12 +197,24 @@ fn local_name(sim: &Sim, o: ObjectId, a: &[Value], i: usize) -> String {
         Some(ObjectKind::Trigger) => "var_trigger",
         _ => return row.to_string(),
     };
-    let name = sim
-        .world
-        .tables()
-        .get(0, table)
-        .map(|t| cell_string(t.cell("Label", *row as i64)))
-        .unwrap_or_default();
+    let Some(t) = sim.world.tables().get(0, table) else {
+        return row.to_string();
+    };
+    let name = cell_string(t.cell("Label", *row as i64));
+    // An object whose template's variables are another table's (its first is none of this
+    // table's labels) numbers them by their place in its template's list.
+    let order = obj.map(|o| &o.locals.order);
+    if let Some(first) = order.and_then(|l| l.first()) {
+        let foreign = !t
+            .order
+            .iter()
+            .any(|&r| cell_string(t.cell("Label", r)) == *first);
+        if foreign {
+            if let Some(placed) = order.and_then(|l| l.get(usize::try_from(*row).ok()?)) {
+                return placed.clone();
+            }
+        }
+    }
     if name.is_empty() {
         row.to_string()
     } else {
@@ -5067,6 +5083,67 @@ mod tests {
                 &[Value::Int(0b1010), Value::Int(0b0100)]
             ),
             Some(Value::Int(0))
+        );
+    }
+
+    #[test]
+    fn dragon_age_2_objects_with_another_tables_variables_number_them_in_template_order() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.tables().insert(
+            "var_trigger",
+            &["Label"],
+            vec![
+                (0, vec![Cell::String("TRIGGER_COUNTER_1\0".into())]),
+                (1, vec![Cell::String("TRIGGER_COUNTER_2\0".into())]),
+            ],
+        );
+        // A talk trigger: its template's variables are var_trigger_talk's, in its rows' order.
+        let talk = s.world.spawn(ObjectKind::Trigger, "gentr_talk");
+        {
+            let l = &mut s.world.get_mut(talk).unwrap().locals;
+            l.order = vec!["TRIG_TALK_SPEAKER".into(), "TRIG_TALK_REPEAT".into()];
+            l.strings
+                .insert("TRIG_TALK_SPEAKER".into(), "gen00fl_bethany".into());
+        }
+        // A generic trigger keeps the kind's table.
+        let plain = s.world.spawn(ObjectKind::Trigger, "gentr_counter");
+        s.world.get_mut(plain).unwrap().locals.order =
+            vec!["TRIGGER_COUNTER_1".into(), "TRIGGER_COUNTER_2".into()];
+        let o = |id| Value::Object(id);
+        assert_eq!(
+            run(&mut s, 1, "GetLocalString", &[o(talk), Value::Int(0)]),
+            Some(Value::String("gen00fl_bethany".into()))
+        );
+        run(
+            &mut s,
+            1,
+            "SetLocalInt",
+            &[o(talk), Value::Int(1), Value::Int(1)],
+        );
+        assert_eq!(
+            s.world
+                .get(talk)
+                .unwrap()
+                .locals
+                .ints
+                .get("TRIG_TALK_REPEAT"),
+            Some(&1)
+        );
+        run(
+            &mut s,
+            1,
+            "SetLocalInt",
+            &[o(plain), Value::Int(1), Value::Int(4)],
+        );
+        assert_eq!(
+            s.world
+                .get(plain)
+                .unwrap()
+                .locals
+                .ints
+                .get("TRIGGER_COUNTER_2"),
+            Some(&4)
         );
     }
 
