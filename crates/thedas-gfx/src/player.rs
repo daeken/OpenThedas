@@ -543,6 +543,33 @@ impl Player {
         pick_any(&self.vm, self.vm.root, (x * 20.0) as f32, (y * 20.0) as f32)
     }
 
+    /// Whether a press here would retain the currently focused text field.
+    /// Use the same picking rules as a press, including decorative overlays.
+    pub fn focused_text_at(&self, x: f64, y: f64) -> bool {
+        self.vm.focus.is_some_and(|focus| {
+            self.vm
+                .display
+                .get(focus)
+                .is_some_and(|o| o.text().is_some())
+                && pick_in(
+                    &self.vm,
+                    self.vm.root,
+                    (x * 20.0) as f32,
+                    (y * 20.0) as f32,
+                    PickMode::Focus,
+                ) == Some(focus)
+        })
+    }
+
+    /// Synchronize the host's held Shift state without inventing a key press.
+    pub fn set_shift(&mut self, down: bool) {
+        if down {
+            self.vm.keys_down.insert(16);
+        } else {
+            self.vm.keys_down.remove(&16);
+        }
+    }
+
     /// A mouse button changed. `button` is [`MOUSE_LEFT`], [`MOUSE_RIGHT`] or
     /// [`MOUSE_MIDDLE`]; `double` marks a double click's second press.
     pub fn mouse_button(&mut self, x: f64, y: f64, button: u8, down: bool, double: bool) {
@@ -2448,6 +2475,8 @@ mod queue_tests {
         assert_eq!(p.topmost_at(x, y), Some(overlay));
         p.mouse_button(x, y, MOUSE_LEFT, true, false);
         assert_eq!(p.vm.focus, Some(field));
+        assert!(p.focused_text_at(x, y));
+        assert!(!p.focused_text_at(0.0, 0.0));
         assert_eq!(
             p.vm.display.get(field).unwrap().text().unwrap().selection(),
             (1, 1)
@@ -2491,6 +2520,7 @@ mod queue_tests {
         let button = display_api::display_value(&mut p.vm, overlay);
         let press = p.vm.new_native(|_, _, _| Value::Undefined);
         p.vm.set(&button, "onPress", Value::Object(press));
+        assert!(!p.focused_text_at(x, y));
         p.mouse_button(x, y, MOUSE_LEFT, true, false);
         assert_eq!(
             p.vm.focus, None,

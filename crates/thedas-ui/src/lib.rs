@@ -844,6 +844,15 @@ impl UiMovie {
         self.button_as(avm1::MOUSE_LEFT, x, y, down);
     }
 
+    /// Whether a click would stay in the focused text field, in window pixels.
+    pub fn focused_text_at(&self, x: f64, y: f64) -> bool {
+        self.player.focused_text_at(x, y)
+    }
+
+    pub fn set_shift(&mut self, down: bool) {
+        self.player.set_shift(down);
+    }
+
     /// A press or release with Scaleform's button code (button + 4 for a double click).
     pub fn button_as(&mut self, button: f64, x: f64, y: f64, down: bool) {
         self.player.mouse_button(x, y, button, down);

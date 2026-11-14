@@ -555,6 +555,7 @@ fn capture(
                         | "opaque-gbuffer"
                         | "lighting"
                         | "specialized-gbuffer"
+                        | "specialized-lighting"
                         | "early-light-reject"
                         | "depth-lights"
                         | "terrain-layers"
@@ -565,7 +566,7 @@ fn capture(
                 )
             }) {
                 bail!(
-                    "THEDAS_BENCH_DEFERRED_COMPARE must be all, tiles, shadows, faithful, reflections, tile-frusta, light-masks, opaque-gbuffer, lighting, specialized-gbuffer, early-light-reject, depth-lights, terrain-layers, pass-cost, fronds, trees or tree-shadows"
+                    "THEDAS_BENCH_DEFERRED_COMPARE must be all, tiles, shadows, faithful, reflections, tile-frusta, light-masks, opaque-gbuffer, lighting, specialized-gbuffer, specialized-lighting, early-light-reject, depth-lights, terrain-layers, pass-cost, fronds, trees or tree-shadows"
                 );
             }
             let comparison = std::env::var("THEDAS_BENCH_SHADOW_COMPARE").ok();
@@ -608,6 +609,10 @@ fn capture(
                             level.renderer.set_deferred_light_masks(Some(enabled));
                         } else if compare == "opaque-gbuffer" {
                             level.renderer.set_deferred_opaque_gbuffer(Some(enabled));
+                        } else if compare == "specialized-lighting" {
+                            level
+                                .renderer
+                                .set_deferred_specialized_lighting(Some(enabled));
                         } else if compare == "lighting" {
                             level.renderer.set_deferred_tight_tiles(Some(enabled));
                             level.renderer.set_deferred_light_masks(Some(enabled));
@@ -672,6 +677,7 @@ fn capture(
                     level.renderer.set_deferred_light_masks(None);
                     level.renderer.set_deferred_opaque_gbuffer(None);
                     level.renderer.set_deferred_specialized_gbuffer(None);
+                    level.renderer.set_deferred_specialized_lighting(None);
                     level.renderer.set_deferred_early_light_reject(None);
                     level.renderer.set_deferred_depth_lights(None);
                     level.renderer.set_deferred_direct_terrain_layers(None);
@@ -3883,6 +3889,12 @@ impl App {
                 self.cursor_to(x, y);
                 log.push(format!("hover {x},{y}"));
             }
+            &Step::Shift(down) => {
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.stage.set_shift(down);
+                }
+                log.push(format!("shift {}", if down { "down" } else { "up" }));
+            }
             Step::MouseLeave => {
                 if let Some(g) = self.gfx.as_mut() {
                     g.ui.mouse_leave();
@@ -5016,6 +5028,11 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => self.cursor_to(position.x, position.y),
+            WindowEvent::ModifiersChanged(modifiers) => {
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.stage.set_shift(modifiers.state().shift_key());
+                }
+            }
             WindowEvent::CursorLeft { .. } => {
                 if let Some(g) = self.gfx.as_mut() {
                     g.ui.mouse_leave();
@@ -5042,6 +5059,7 @@ impl ApplicationHandler for App {
                 self.keys.clear();
                 self.looking = false;
                 if let Some(g) = self.gfx.as_mut() {
+                    g.ui.stage.set_shift(false);
                     g.ui.mouse_leave();
                 }
             }
@@ -5845,6 +5863,8 @@ enum Step {
     ClickAs(f64, f64, f64),
     /// The mouse rests at a pixel (where an aimed ability's reticle shows).
     Hover(f64, f64),
+    /// Hold or release Shift for pointer input (`shift down`, `shift up`).
+    Shift(bool),
     /// The pointer leaves the window (`leave`), clearing movie hover.
     MouseLeave,
     /// F1-F4: party member n leads.
@@ -6427,6 +6447,11 @@ fn parse_step(s: &str) -> Result<Step> {
             let (x, y) = arg.split_once(',').context("hover takes x,y")?;
             Step::Hover(x.trim().parse()?, y.trim().parse()?)
         }
+        "shift" => Step::Shift(match arg {
+            "down" => true,
+            "up" => false,
+            _ => bail!("shift takes down or up"),
+        }),
         "leave" if arg.is_empty() => Step::MouseLeave,
         "rpress" | "rrelease" => {
             let (x, y) = arg.split_once(',').context("rpress takes x,y")?;
@@ -6699,6 +6724,12 @@ fn main() -> Result<()> {
                         if let Some((layer, _)) = played.as_mut() {
                             layer.mouse_move(x, y);
                         }
+                    }
+                    &Step::Shift(down) => {
+                        if let Some((layer, _)) = played.as_mut() {
+                            layer.stage.set_shift(down);
+                        }
+                        println!("shift {}", if down { "down" } else { "up" });
                     }
                     Step::MouseLeave => {
                         hovering = false;
@@ -7733,9 +7764,15 @@ mod tests {
         );
         assert!(parse_steps("zoom far").is_err());
         assert_eq!(
-            parse_steps("press 1,2; release 3,4").unwrap(),
-            vec![Step::Press(1.0, 2.0), Step::Release(3.0, 4.0)]
+            parse_steps("shift down; press 1,2; release 3,4; shift up").unwrap(),
+            vec![
+                Step::Shift(true),
+                Step::Press(1.0, 2.0),
+                Step::Release(3.0, 4.0),
+                Step::Shift(false)
+            ]
         );
+        assert!(parse_steps("shift maybe").is_err());
         assert_eq!(
             parse_steps("pad a; pad press RT; pad release rt; pad stick-left 0,1.5 500").unwrap(),
             vec![

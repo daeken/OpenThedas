@@ -329,6 +329,15 @@ impl OwnMovie {
             .mouse_button(x, y, button as u8 & 3, down, button >= 5.0);
     }
 
+    pub fn focused_text_at(&self, x: f64, y: f64) -> bool {
+        let (x, y) = self.to_stage(x, y);
+        self.player.focused_text_at(x, y)
+    }
+
+    pub fn set_shift(&mut self, down: bool) {
+        self.player.set_shift(down);
+    }
+
     pub fn key(&mut self, key: UiKey) {
         press_key(&mut self.player, key);
     }
@@ -363,6 +372,7 @@ fn press_key(player: &mut Player, key: UiKey) {
         key,
         UiKey::SelectLeft | UiKey::SelectRight | UiKey::SelectHome | UiKey::SelectEnd
     );
+    let shift_was_down = player.vm.keys_down.contains(&16);
     let (code, ch) = match key {
         UiKey::Char(c) => (c.to_ascii_uppercase() as u32, Some(c)),
         UiKey::Backspace => (8, None),
@@ -376,12 +386,12 @@ fn press_key(player: &mut Player, key: UiKey) {
         UiKey::End | UiKey::SelectEnd => (35, None),
         UiKey::SelectAll => (65, None),
     };
-    if shift {
+    if shift && !shift_was_down {
         player.key_down(16, None);
     }
     player.key_down(code, ch);
     player.key_up(code);
-    if shift {
+    if shift && !shift_was_down {
         player.key_up(16);
     }
 }
@@ -438,6 +448,19 @@ mod tests {
         press_key(&mut player, UiKey::Char('X'));
         assert_eq!(player.vm.get(&value, "text"), Value::from("RowaX"));
         assert_eq!(range(&player), (5, 5));
+        assert!(player.vm.keys_down.is_empty());
+
+        // A host-held modifier outlives a synthesized keyboard edit, so a
+        // following Shift+click still extends from the existing anchor.
+        player.vm.set(&value, "text", Value::from("Rowan"));
+        press_key(&mut player, UiKey::End);
+        player.set_shift(true);
+        press_key(&mut player, UiKey::SelectLeft);
+        assert_eq!(range(&player), (4, 5));
+        assert!(player.vm.keys_down.contains(&16));
+        player.set_shift(false);
+        press_key(&mut player, UiKey::Left);
+        assert_eq!(range(&player), (4, 4));
         assert!(player.vm.keys_down.is_empty());
 
         press_key(&mut player, UiKey::Home);

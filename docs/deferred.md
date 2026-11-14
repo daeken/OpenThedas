@@ -410,6 +410,19 @@ unnormalized light vector, retaining a tangent-plane margin of 0.00001 times the
 light's reach for floating-point rounding. The original distance and normalized-normal
 cutoffs remain. Light accumulation order and shadow equations are preserved.
 
+Ordinary baked frames use a lighting entry point with constant mode choices. It
+omits AO derivatives, diagnostic branches and per-light room/domain checks, loads
+the intersected screen/depth/membership masks as two vectors before the light
+loop, and visits only words containing current light indices. A zero RGB specular
+mask also skips highlight normalization and exponentiation. Light indices still
+accumulate in ascending order with the same diffuse, falloff and shadow equations.
+Probe/AO, debug views, separate reflections, and disabled membership/depth/early
+rejection controls select the general lighting pipeline on that frame.
+`THEDAS_DEFERRED_SPECIALIZED_LIGHTING=0` keeps the general pipeline for comparisons;
+the control is read once. `THEDAS_BENCH_DEFERRED_COMPARE=specialized-lighting`
+alternates the pipelines in one process and restores the renderer's policy after
+capture.
+
 G-buffer draw uniforms retain their allocation and refresh only visible, unfaded
 draws. A draw re-entering the view or returning to full opacity refreshes its slot
 before drawing. Point shadows retain their independent world and skin streams, so
