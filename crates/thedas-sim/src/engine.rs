@@ -3732,29 +3732,17 @@ pub fn call(
         // hero; the owner must be an active, living creature. Nothing here looks at the game
         // mode: a conversation may start in combat (and replaces it, see
         // `Sim::start_conversation`).
-        // Dragon Age II's `int BeginConversation(object oTarget, resource rConversationFile)`
-        // has no owner argument: the script's object talks to the target. Provisional: from
-        // DA2's script.ldf declaration and its prologue, whose plot script starts the
-        // player's own conversation (`pro000_opening_pc`) running as the player's creature.
+        // DA2 command 440 (0x512660 -> 0x504c60 -> 0x5b15f0) resolves
+        // oTarget as the owner, independent of the script caller. The owner's
+        // component supplies its default conversation and rejects inactive/dead
+        // creatures. See docs/notes/da2-conversation-owner.md.
         "BeginConversation" if matches!(a.get(1), Some(Value::Resource(_) | Value::String(_))) => {
-            let target = obj(a, 0);
-            let owner = if h
-                .object(caller)
-                .is_some_and(|o| o.kind == ObjectKind::Creature)
-            {
-                caller
-            } else {
-                target
-            };
-            let target = if target == owner {
-                h.sim.world.hero.unwrap_or(target)
-            } else {
-                target
-            };
+            let owner = obj(a, 0);
+            let player = h.sim.world.hero.unwrap_or(OBJECT_INVALID);
             let can = h
                 .object(owner)
                 .is_some_and(|o| o.kind == ObjectKind::Creature && o.active && !o.dead);
-            let ok_ = can && h.sim.start_conversation(target, owner, &string(a, 1));
+            let ok_ = can && h.sim.start_conversation(player, owner, &string(a, 1));
             ok(b(ok_))
         }
         "BeginConversation" => {
@@ -6136,6 +6124,150 @@ mod tests {
         assert_eq!(s.world.get(hero).unwrap().combat.cooldowns.len(), 6);
         s.world.time_ms = 3000;
         assert!(list(&mut s, hero, 0, 1).is_empty());
+    }
+
+    #[test]
+    fn da2_begin_conversation_uses_target_owner_and_rejects_unavailable_targets() {
+        use thedas_formats::Value as G;
+        use thedas_formats::gff4::{
+            FieldDef, FourCC, Gff4, List, StructData, StructId, StructTemplate, Version,
+        };
+        let template = |label: &[u8; 4], labels: &[u32]| StructTemplate {
+            label: FourCC::new(label),
+            fields: labels
+                .iter()
+                .enumerate()
+                .map(|(index, &label)| FieldDef {
+                    label,
+                    type_code: match label {
+                        30001 => 1,
+                        30002 => 2,
+                        _ => 2, // u16.
+                    },
+                    flags: if label == 30001 || label == 30002 {
+                        0xc000
+                    } else {
+                        0
+                    },
+                    offset: (index * 4) as u32,
+                })
+                .collect(),
+            size: (labels.len() * 4) as u32,
+        };
+        let g = Gff4 {
+            version: Version::V40,
+            platform: FourCC::new(b"PC  "),
+            file_type: FourCC::new(b"CONV"),
+            file_version: FourCC::new(b"3.0 "),
+            templates: vec![
+                template(b"CONV", &[30001, 30002]),
+                template(b"LINK", &[30100]),
+                template(b"LINE", &[30200]),
+            ],
+            structs: vec![
+                StructData {
+                    template: 0,
+                    values: vec![
+                        G::List(Some(List::Struct(vec![Some(StructId(1))]))),
+                        G::List(Some(List::Struct(vec![Some(StructId(2))]))),
+                    ],
+                },
+                StructData {
+                    template: 1,
+                    values: vec![G::U16(0)],
+                },
+                StructData {
+                    template: 2,
+                    values: vec![G::U16(1)],
+                },
+            ],
+            root: StructId(0),
+            shared_strings: None,
+        };
+        let dir = std::env::temp_dir().join(format!("thedas-da2-owner-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let files = [dir.join("npc.cnv"), dir.join("override.cnv")];
+        for file in &files {
+            std::fs::write(file, g.write().unwrap()).unwrap();
+        }
+        let mut vfs = Vfs::new();
+        vfs.push_files(&files, "synthetic conversation test");
+        let table = EngineTable::parse(
+            b"int BeginConversation(object target, resource conversation) = 440;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(vfs), Arc::new(table), 1);
+        s.game = thedas_vfs::Game::DragonAge2;
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let npc = s.world.spawn(ObjectKind::Creature, "npc");
+        let other = s.world.spawn(ObjectKind::Creature, "other");
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().dialog = Some("wrong".into());
+        s.world.get_mut(npc).unwrap().dialog = Some("npc".into());
+        for caller in [hero, other, module] {
+            for resource in ["", "override.cnv"] {
+                assert_eq!(
+                    run(
+                        &mut s,
+                        caller,
+                        "BeginConversation",
+                        &[Value::Object(npc), Value::Resource(resource.into()),]
+                    ),
+                    Some(Value::Int(1)),
+                );
+                let c = s.talk.as_ref().unwrap();
+                assert_eq!((c.owner, c.player), (npc, hero));
+                assert_eq!(
+                    c.dlg.name,
+                    if resource.is_empty() {
+                        "npc"
+                    } else {
+                        "override"
+                    }
+                );
+                s.end_conversation();
+            }
+        }
+        // Self-owned prologue conversations still work.
+        assert_eq!(
+            run(
+                &mut s,
+                hero,
+                "BeginConversation",
+                &[Value::Object(hero), Value::Resource("override.cnv".into()),]
+            ),
+            Some(Value::Int(1))
+        );
+        assert_eq!(s.talk.as_ref().unwrap().owner, hero);
+        // A rejected request must leave the current conversation untouched.
+        let before = s.talk.clone();
+        for (target, active, dead) in [
+            (npc, false, false),
+            (npc, true, true),
+            (module, true, false),
+            (OBJECT_INVALID, true, false),
+            (12345, true, false),
+        ] {
+            if let Some(o) = s.world.get_mut(target) {
+                o.active = active;
+                o.dead = dead;
+            }
+            assert_eq!(
+                run(
+                    &mut s,
+                    hero,
+                    "BeginConversation",
+                    &[
+                        Value::Object(target),
+                        Value::Resource("override.cnv".into()),
+                    ]
+                ),
+                Some(Value::Int(0))
+            );
+            assert_eq!(s.talk, before);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
