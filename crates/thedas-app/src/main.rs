@@ -940,7 +940,7 @@ fn play_interface(
                 live.aiming = Some(aim);
             }
             // A script's DoAutoSave, made between frames as every save is.
-            let autosave = std::mem::take(&mut live.sim().world.autosave_requested);
+            let autosave = live.sim().take_autosave_request();
             if autosave {
                 ui.auto_save(&live.sim);
             }
