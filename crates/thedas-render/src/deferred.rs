@@ -1,10 +1,10 @@
 //! The deferred renderer: ours, not the original's, chosen at run time with
 //! [`RenderPath`] (see `docs/deferred.md`).
 //!
-//! The level's opaque Static1 draws go into a G-buffer, and one full-screen pass lights them
+//! The level's opaque Static1 and terrain draws go into a G-buffer, and one full-screen pass lights them
 //! per pixel with every light in reach: the sum Static1.psh works out per object for three
 //! lights (`notes/frame-gamma-lightmap-trace.md`), over all of them. Everything else (water,
-//! sky, terrain, trees, blended and multi-pass materials, the objects, particles) is drawn
+//! sky, trees, blended and multi-pass materials, the objects, particles) is drawn
 //! afterwards by the faithful pass, with its original shaders, over that colour and depth.
 //!
 //! Nothing here changes how the faithful path draws: with [`RenderPath::Faithful`] this
@@ -154,7 +154,7 @@ struct PlanDraw {
 pub(crate) struct DeferredPass {
     draws: Vec<PlanDraw>,
     data: Vec<DrawData>,
-    /// Diffuse, normal map, specular mask, lightmap and probe cubemap, per distinct set.
+    /// Diffuse, normal, specular, lightmap, probe cube and the three terrain masks.
     groups: Vec<[wgpu::TextureView; 8]>,
     /// Per faithful draw (index into [`D3dPass::draws`]): whether this pass draws it.
     takes: Vec<bool>,
