@@ -117,6 +117,8 @@ impl Player {
             pick_dirty: true,
             budget: 0,
             call_depth: 0,
+            script_depth: 0,
+            script_stopped: false,
             fonts,
             warned: HashSet::new(),
             dragging: None,
@@ -2149,6 +2151,100 @@ mod queue_tests {
             .children
             .insert(1, field);
         (p, field)
+    }
+
+    fn script_function(p: &mut Player, name: &str, code: crate::swf::Actions) -> Value {
+        use crate::avm1::object::{CodeFn, Func};
+        use crate::avm1::{Scope, ScopeKind};
+        use std::rc::Rc;
+        let end = code.len();
+        let function = p.vm.make_function_object(Func::Code(Rc::new(CodeFn {
+            name: Str::from(name),
+            code,
+            start: 0,
+            end,
+            params: vec![],
+            v2: None,
+            pool: Rc::new(vec![]),
+            scope: Rc::new(Scope {
+                object: p.vm.global,
+                kind: ScopeKind::Global,
+                parent: None,
+            }),
+            target: Some(p.vm.root),
+        })));
+        let value = Value::Object(function);
+        p.vm.define(p.vm.global, name, value.clone(), 0);
+        value
+    }
+
+    fn call_then_trace(name: &str, message: &str) -> crate::swf::Actions {
+        // Push the argument count and function name, call, discard the result, trace.
+        let mut code = vec![0x96];
+        code.extend_from_slice(&((name.len() + 7) as u16).to_le_bytes());
+        code.extend_from_slice(&[7, 0, 0, 0, 0, 0]);
+        code.extend_from_slice(name.as_bytes());
+        code.extend_from_slice(&[0, 0x3d, 0x17]);
+        code.extend_from_slice(&trace(message));
+        Arc::from(code)
+    }
+
+    fn with_script_stack(test: impl FnOnce() + Send + 'static) {
+        // Exercise the VM recursion guard rather than the test worker's small stack.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(test)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn recursion_limit_unwinds_the_action_list_and_later_calls_recover() {
+        with_script_stack(|| {
+            let (mut p, _) = input_player();
+            let recursive =
+                script_function(&mut p, "recursive", call_then_trace("recursive", "after"));
+            p.vm.call(&recursive, Value::Undefined, &[]);
+            assert_eq!(p.drain_log(), ["warning: call stack overflow"]);
+            assert_eq!(p.vm.call_depth, 0);
+            assert_eq!(p.vm.script_depth, 0);
+            let recovery = script_function(&mut p, "recovery", trace("recovered"));
+            p.vm.call(&recovery, Value::Undefined, &[]);
+            assert_eq!(p.drain_log(), ["trace: recovered"]);
+        });
+    }
+
+    #[test]
+    fn nested_timeline_actions_share_the_budget_and_later_frames_recover() {
+        let (mut p, _) = input_player();
+        let nested = p.vm.new_native(|vm, _, _| {
+            vm.budget = crate::avm1::OP_BUDGET;
+            interp::run_actions(vm, &trace("nested"), vm.root);
+            Value::Undefined
+        });
+        p.vm.define(p.vm.global, "nested", Value::Object(nested), 0);
+        let outer = script_function(&mut p, "outer", call_then_trace("nested", "after"));
+        p.vm.call(&outer, Value::Undefined, &[]);
+        assert_eq!(p.drain_log(), ["warning: script ran too long; stopped"]);
+        assert_eq!(p.vm.script_depth, 0);
+        let root = p.vm.root;
+        interp::run_actions(&mut p.vm, &trace("next frame"), root);
+        assert_eq!(p.drain_log(), ["trace: next frame"]);
+    }
+
+    #[test]
+    fn a_watcher_limit_preserves_the_assigned_value() {
+        with_script_stack(|| {
+            let (mut p, _) = input_player();
+            let recursive =
+                script_function(&mut p, "recursive", call_then_trace("recursive", "after"));
+            let object = Value::Object(p.vm.new_object());
+            p.vm.call_method(&object, "watch", &[Value::from("value"), recursive]);
+            p.vm.set(&object, "value", Value::Number(42.0));
+            assert_eq!(p.vm.get(&object, "value"), Value::Number(42.0));
+            assert_eq!(p.drain_log(), ["warning: call stack overflow"]);
+        });
     }
 
     #[test]

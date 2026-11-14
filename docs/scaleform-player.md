@@ -114,6 +114,11 @@ The player lives in `crates/thedas-gfx`:
 - Every movie opened by `thedas-ui::Stage` uses `thedas-gfx` directly from its GFx bytes.
   There is no backend selector or fallback player.
 - Unknown opcodes, tags or built-ins are logged once per movie.
+- Execution limits stop the remaining bytecode and nested calls in the current
+  action list. Later independent calls and timeline actions start with fresh limits;
+  nested timeline actions share their caller's operation budget. A failed watcher
+  leaves the incoming assignment intact. Recursion and operation limits still warn
+  once per movie rather than continuing callbacks with an undefined error result.
 - Compare hidden-window captures of the menu, chargen, HUD, inventory and conversation
   against the previous own-player build. Exercise the dwarf commoner and human noble
   chargen click-through as well as the simulation gates.
