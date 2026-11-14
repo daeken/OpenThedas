@@ -317,6 +317,22 @@ impl Semantic {
 /// with [`Semantic::per_vertex_technique`].
 pub const PER_VERTEX: &str = "#PerVertex";
 
+/// What [`Bmat::definition`] appends to a semantic's name for the form that draws it into
+/// the shadow partitions: its `ShadowPass` technique (second header word 2), the one
+/// Origins' materials keep in a semantic of their own, `PSSM`.
+pub const SHADOW: &str = "#Shadow";
+
+impl Semantic {
+    /// The technique drawing this semantic into the shadow partitions (second header word
+    /// 2: `ShadowPass`), the first if several. Provisional, as [`Semantic::technique`].
+    pub fn shadow_technique(&self) -> Option<(usize, &Technique)> {
+        self.techniques
+            .iter()
+            .enumerate()
+            .find(|(_, t)| t.header[1] == 2)
+    }
+}
+
 /// Dragon Age II's numbers for render states and their values, as the names Dragon Age:
 /// Origins' state files use ([`crate::state`]). Provisional throughout: worked out from
 /// which semantics of the shipped materials set what (blended ones set 11 and the factors 5
@@ -484,6 +500,24 @@ impl Pass {
                 });
             }
         }
+        // The shadow partition's sampler (engine source 22) reads white, lit, past the
+        // partition's edges, as Origins' shadow samplers do (`SAMP_BORDERCOLOR`): a point
+        // the partition does not reach is not in its shadow. Provisional: Dragon Age II's
+        // own setting is not traced.
+        for e in self.engine_parameters.iter().filter(|e| e.source == 22) {
+            for (state, value) in [
+                ("SAMP_ADDRESSU", "TEXADD_BORDER"),
+                ("SAMP_ADDRESSV", "TEXADD_BORDER"),
+                ("SAMP_BORDERCOLOR", "4294967295"),
+            ] {
+                samplers.push(SamplerState {
+                    sampler: e.sampler.clone(),
+                    stage: None,
+                    state: state.to_string(),
+                    value: value.to_string(),
+                });
+            }
+        }
         for &(stage, state, value) in &self.sampler_states {
             if let Some((state, value)) = sampler_state(state, value) {
                 samplers.push(SamplerState {
@@ -526,7 +560,7 @@ pub fn engine_usage(source: u32) -> Option<&'static str> {
         20 => "ShaderControlBooleans",
         21 => "ShadowPartitionMatrix",
         22 => "ShadowTexture_Primary",
-        24 => "ShadowDataUnshadowed",
+        24 => "ShadowDataFirstPartition",
         25 => "EnvironmentMap",
         28 => "RemoteMaterialSettings",
         29 => "SHEnvironment",
@@ -635,6 +669,9 @@ impl Bmat {
         }
         // After them, so that the first semantic stays the material's first.
         for (si, s) in self.semantics.iter().enumerate() {
+            if let Some(picked) = s.shadow_technique() {
+                semantics.push(semantic(si, s, format!("{}{SHADOW}", s.name), Some(picked)));
+            }
             if let Some(picked) = s.per_vertex_technique() {
                 semantics.push(semantic(
                     si,
@@ -832,12 +869,18 @@ mod tests {
         assert_eq!(s.per_vertex_technique().map(|(i, _)| i), Some(3));
         assert!(semantic(Vec::new()).technique().is_none());
         assert!(semantic(Vec::new()).per_vertex_technique().is_none());
-        // The definition gives the per-vertex technique as a second form of the semantic.
+        assert_eq!(s.shadow_technique().map(|(i, _)| i), Some(0));
+        // The definition gives the per-vertex and shadow techniques as further forms of the
+        // semantic.
         let def = Bmat { semantics: vec![s] }.definition("static.mat");
         let names: Vec<&str> = def.semantics.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["Default", "Default#PerVertex"]);
+        assert_eq!(names, ["Default", "Default#Shadow", "Default#PerVertex"]);
         assert_eq!(
             def.semantics[1].logic[0].techniques[0].name.as_deref(),
+            Some("ShadowPass")
+        );
+        assert_eq!(
+            def.semantics[2].logic[0].techniques[0].name.as_deref(),
             Some("HighToo")
         );
         assert_eq!(engine_usage(6), Some("ModelViewProjection"));

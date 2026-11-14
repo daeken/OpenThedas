@@ -1940,6 +1940,21 @@ impl UiLayer {
         self.write_save(sim, slot, "Quicksave".into(), crate::saves::KIND_QUICK)
     }
 
+    /// A script's `DoAutoSave`: the game is saved to the autosave's slot, over the one
+    /// before, when the Autosave option is on (it is unless the player turned it off).
+    /// Provisional: the original's name for it in the list is not traced; it is named
+    /// "Autosave".
+    pub fn auto_save(&mut self, sim: &Arc<Mutex<Sim>>) -> bool {
+        if self.client_option("GameOptions.AutoSave").unwrap_or(1.0) == 0.0 {
+            return false;
+        }
+        let Some(store) = self.saves.as_ref() else {
+            return false;
+        };
+        let slot = store.auto_slot().unwrap_or_else(|| store.open_slot());
+        self.write_save(sim, slot, "Autosave".into(), crate::saves::KIND_AUTO)
+    }
+
     /// The quick load key (`QuickLoad`, F9): the quick save is loaded into the running
     /// game, as the load screen loads a save. Returns whether there was one to load.
     pub fn quick_load(&mut self, sim: &Arc<Mutex<Sim>>) -> bool {
