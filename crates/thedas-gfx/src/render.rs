@@ -104,6 +104,8 @@ struct GpuMesh {
     to_gradient: Matrix,
     /// The texture binding (ramp or bitmap); `None` for solid colours.
     binding: Option<Arc<wgpu::BindGroup>>,
+    /// Scaleform text shadows keep shadowColor when the text's parent is tinted.
+    fixed_rgb: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -575,6 +577,17 @@ impl Renderer {
         mode: f32,
         to_gradient: Matrix,
     ) -> Option<Arc<GpuMesh>> {
+        self.upload_colored(m, binding, mode, to_gradient, false)
+    }
+
+    fn upload_colored(
+        &self,
+        m: &Mesh,
+        binding: Option<Arc<wgpu::BindGroup>>,
+        mode: f32,
+        to_gradient: Matrix,
+        fixed_rgb: bool,
+    ) -> Option<Arc<GpuMesh>> {
         if m.indices.is_empty() {
             return None;
         }
@@ -599,6 +612,7 @@ impl Renderer {
             mode,
             to_gradient,
             binding,
+            fixed_rgb,
         }))
     }
 
@@ -824,6 +838,15 @@ impl Renderer {
                 );
             }
         }
+        // Background/border/underlines are drawn first. Keep shadow geometry separate
+        // from the glyphs: a button's RGB replacement must not recolour black shadows.
+        let mut out: Vec<_> = self
+            .upload(&m, None, 0.0, Matrix::IDENTITY)
+            .into_iter()
+            .collect();
+        m.vertices.clear();
+        m.indices.clear();
+        let mut shadow_mesh = m.clone();
         for pass in 0..=shadow.len() {
             for (g, dy) in &glyphs {
                 let mesh = self.glyph(&g.font, g.glyph);
@@ -833,9 +856,14 @@ impl Renderer {
                 } else {
                     (0.0, 0.0, g.color)
                 };
-                let base = m.vertices.len() as u32;
+                let target = if pass < shadow.len() {
+                    &mut shadow_mesh
+                } else {
+                    &mut m
+                };
+                let base = target.vertices.len() as u32;
                 for p in &mesh.0 {
-                    m.vertices.push(Vertex {
+                    target.vertices.push(Vertex {
                         pos: [
                             (bx + g.x + ox) * 20.0 + p[0] * scale,
                             (by + g.y + dy + oy) * 20.0 + p[1] * scale,
@@ -844,13 +872,11 @@ impl Renderer {
                         color: [c[0], c[1], c[2], 255],
                     });
                 }
-                m.indices.extend(mesh.1.iter().map(|i| i + base));
+                target.indices.extend(mesh.1.iter().map(|i| i + base));
             }
         }
-        let out: Vec<Arc<GpuMesh>> = self
-            .upload(&m, None, 0.0, Matrix::IDENTITY)
-            .into_iter()
-            .collect();
+        out.extend(self.upload_colored(&shadow_mesh, None, 0.0, Matrix::IDENTITY, true));
+        out.extend(self.upload(&m, None, 0.0, Matrix::IDENTITY));
         self.texts.insert(d, (rev, out.clone()));
         out
     }
@@ -1337,6 +1363,11 @@ impl Grid {
 impl Build {
     fn push(&mut self, m: &Arc<GpuMesh>, u: u32, blend: Blend, stencil: u32) {
         let mut un = self.uniforms[u as usize];
+        if m.fixed_rgb {
+            // The shadow still follows alpha (including fades) and the object's matrix.
+            un.mul[..3].fill(1.0);
+            un.add[..3].fill(0.0);
+        }
         un.mode = [m.mode, 0.0, 0.0, 0.0];
         if m.mode >= 2.0 {
             let g = &m.to_gradient;
@@ -1525,5 +1556,120 @@ fn lerp_fill(a: &crate::swf::Fill, b: &crate::swf::Fill, t: f32) -> crate::swf::
             })
         }
         _ => a.clone(),
+    }
+}
+
+#[cfg(test)]
+mod shadow_tests {
+    use super::*;
+    use crate::avm1::{Host, HostValue};
+    use crate::swf::text::Glyph;
+    use crate::swf::{EditText, Font, Movie, Record, Rect};
+    use crate::text::{Fonts, Layout, Line, PlacedGlyph, TextField};
+
+    struct Empty;
+    impl Host for Empty {
+        fn fscommand(&mut self, _: &str, _: &str) {}
+        fn external_call(&mut self, _: &str, _: &[HostValue]) -> HostValue {
+            HostValue::Undefined
+        }
+    }
+    impl Fonts for Empty {
+        fn font(&self, _: &str, _: bool, _: bool) -> Option<Arc<Font>> {
+            None
+        }
+    }
+    impl Images for Empty {
+        fn image(&mut self, _: &str) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    #[test]
+    fn tinted_text_keeps_black_shadows_and_inherits_alpha() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let bytes = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut player =
+            Player::new(bytes, "shadow-test", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        player.vm.movie = Arc::new(Movie {
+            stage: Rect {
+                x_min: 0,
+                y_min: 0,
+                x_max: 640,
+                y_max: 640,
+            },
+            ..Default::default()
+        });
+        let font = Arc::new(Font {
+            em: 100.0,
+            glyphs: vec![Glyph {
+                outline: vec![
+                    Record::Style {
+                        move_to: Some((0, 0)),
+                        fill0: None,
+                        fill1: Some(1),
+                        line: None,
+                        new_styles: None,
+                    },
+                    Record::Line { to: (100, 0) },
+                    Record::Line { to: (100, 100) },
+                    Record::Line { to: (0, 100) },
+                    Record::Line { to: (0, 0) },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut text = TextField::new(
+            Arc::new(EditText {
+                bounds: Rect {
+                    x_min: 0,
+                    y_min: 0,
+                    x_max: 640,
+                    y_max: 640,
+                },
+                ..Default::default()
+            }),
+            None,
+        );
+        text.shadow_style = "s{8,0}".into();
+        text.layout = Some(Layout {
+            lines: vec![Line {
+                glyphs: vec![PlacedGlyph {
+                    font,
+                    glyph: 0,
+                    x: 2.0,
+                    y: 10.0,
+                    size: 6.0,
+                    color: [255; 3],
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let root = player.vm.root;
+        let mut object = crate::display::Object::new(Kind::Text(Box::new(text)));
+        object.parent = Some(root);
+        let id = player.vm.display.add(object);
+        let root = player.vm.display.get_mut(root).unwrap();
+        root.children.insert(1, id);
+        root.color = ColorTransform {
+            mul: [0.0, 0.0, 0.0, 0.5],
+            add: [255.0, 200.0, 0.0, 0.0],
+        };
+        let mut renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.render(&mut player, &mut Empty, (32, 32));
+        let (_, _, pixels) = renderer.capture().unwrap();
+        let pixel = |x: usize, y: usize| &pixels[(y * 32 + x) * 4..(y * 32 + x + 1) * 4];
+        let glyph = pixel(4, 14);
+        assert!(glyph[0] > 250 && (glyph[1] as i32 - 200).abs() < 3 && glyph[2] == 0);
+        assert!((glyph[3] as i32 - 128).abs() < 2);
+        let shadow = pixel(12, 14);
+        assert_eq!(&shadow[..3], &[0, 0, 0]);
+        assert!((shadow[3] as i32 - 128).abs() < 2);
     }
 }
