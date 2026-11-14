@@ -267,7 +267,7 @@ pub fn display_set(vm: &mut Vm, d: DisplayId, name: &str, v: &Value) -> bool {
         "_x" | "_y" => {
             let x = n(vm);
             if let (true, Some(o)) = (x.is_finite(), vm.display.get_mut(d)) {
-                let t = (x * 20.0).round() as f32;
+                let t = (x * 20.0).trunc() as f32;
                 if name == "_x" {
                     o.matrix.tx = t;
                 } else {
