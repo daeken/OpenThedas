@@ -2089,6 +2089,80 @@ mod queue_tests {
     }
 
     #[test]
+    fn programmatic_focus_selects_prefilled_text_and_reselects_the_same_field() {
+        let (mut p, field) = input_player();
+        p.vm.display.get_mut(field).unwrap().name = Str::from("NameField");
+        let value = p.vm.display_object(field);
+        p.vm.set(&value, "text", Value::from("Orzammar Commons"));
+        let focus = p.vm.new_native(|vm, _, _| {
+            vm.log.push("focus".into());
+            Value::Undefined
+        });
+        p.vm.set(&value, "onSetFocus", Value::Object(focus));
+        let selection = Value::Object(p.vm.selection);
+        assert_eq!(
+            p.vm.call_method(&selection, "setFocus", std::slice::from_ref(&value)),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "getBeginIndex", &[]),
+            Value::Number(0.0)
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "getEndIndex", &[]),
+            Value::Number(16.0)
+        );
+        p.type_text("Audit");
+        assert_eq!(
+            p.vm.display.get(field).unwrap().text().unwrap().text(),
+            "Audit"
+        );
+        assert_eq!(p.drain_log(), ["focus"]);
+        p.vm.set(&value, "text", Value::from("A😀B"));
+        p.vm.call_method(
+            &selection,
+            "setSelection",
+            &[Value::Number(1.0), Value::Number(1.0)],
+        );
+        p.vm.call_method(&selection, "setFocus", &[Value::from("_root.NameField")]);
+        assert_eq!(
+            p.vm.call_method(&selection, "getBeginIndex", &[]),
+            Value::Number(0.0)
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "getEndIndex", &[]),
+            Value::Number(4.0)
+        );
+        assert!(
+            p.drain_log().is_empty(),
+            "same-field focus must not fire a second focus event"
+        );
+        // Missing/invalid targets leave focus and selection alone; null clears them.
+        assert_eq!(
+            p.vm.call_method(&selection, "setFocus", &[]),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "setFocus", &[Value::from("missing")]),
+            Value::Bool(false)
+        );
+        assert_eq!(p.vm.focus, Some(field));
+        assert_eq!(
+            p.vm.call_method(&selection, "getEndIndex", &[]),
+            Value::Number(4.0)
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "setFocus", &[Value::Null]),
+            Value::Bool(true)
+        );
+        assert_eq!(p.vm.focus, None);
+        assert_eq!(
+            p.vm.call_method(&selection, "getBeginIndex", &[]),
+            Value::Number(-1.0)
+        );
+    }
+
+    #[test]
     fn mouse_caret_and_drag_selection_use_transformed_text_coordinates() {
         let (mut p, field) = input_player();
         let o = p.vm.display.get_mut(field).unwrap();
