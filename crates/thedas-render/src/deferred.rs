@@ -247,6 +247,7 @@ pub(crate) struct DeferredPass {
     light_masks: Option<bool>,
     opaque_gbuffer: Option<bool>,
     specialized_gbuffer: Option<bool>,
+    specialized_lighting: Option<bool>,
     early_light_reject: Option<bool>,
     depth_lights: Option<bool>,
     direct_terrain_layers: Option<bool>,
@@ -270,6 +271,7 @@ struct Gpu {
     /// Separate reflection for probe/AO and diagnostic modes (by cull mode).
     env: [wgpu::RenderPipeline; 3],
     lighting: wgpu::RenderPipeline,
+    lighting_baked: wgpu::RenderPipeline,
     frame_buffer: wgpu::Buffer,
     /// Every draw's [`DrawUniforms`], [`DRAW_STRIDE`] apart, rewritten each frame.
     draw_buffer: wgpu::Buffer,
@@ -894,6 +896,7 @@ impl DeferredPass {
             light_masks: None,
             opaque_gbuffer: None,
             specialized_gbuffer: None,
+            specialized_lighting: None,
             early_light_reject: None,
             depth_lights: None,
             direct_terrain_layers: None,
@@ -927,6 +930,10 @@ impl DeferredPass {
 
     pub(crate) fn set_specialized_gbuffer(&mut self, enabled: Option<bool>) {
         self.specialized_gbuffer = enabled;
+    }
+
+    pub(crate) fn set_specialized_lighting(&mut self, enabled: Option<bool>) {
+        self.specialized_lighting = enabled;
     }
 
     pub(crate) fn set_early_light_reject(&mut self, enabled: Option<bool>) {
@@ -1284,31 +1291,35 @@ impl DeferredPass {
                 ],
                 immediate_size: 0,
             });
-        let lighting = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("deferred lighting"),
-            layout: Some(&lighting_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs_fullscreen"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("fs_lighting"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: color_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let make_lighting = |entry_point| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("deferred lighting"),
+                layout: Some(&lighting_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_fullscreen"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some(entry_point),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let lighting = make_lighting("fs_lighting");
+        let lighting_baked = make_lighting("fs_lighting_baked");
 
         let frame_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("deferred frame"),
@@ -1530,6 +1541,7 @@ impl DeferredPass {
             gbuffer_black,
             env,
             lighting,
+            lighting_baked,
             mask_buffer,
             light_masks: None,
             frame_buffer,
@@ -2193,7 +2205,16 @@ impl DeferredPass {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&gpu.lighting);
+            let specialized = self
+                .specialized_lighting
+                .unwrap_or(crate::config::CONFIG.specialized_lighting)
+                && lighting.counts[1..] == [0, 1, 0]
+                && lighting.size[2..] == [1.0, 3.0];
+            pass.set_pipeline(if specialized {
+                &gpu.lighting_baked
+            } else {
+                &gpu.lighting
+            });
             pass.set_bind_group(0, &gpu.lighting_group, &[]);
             pass.set_bind_group(1, &targets.group, &[]);
             pass.set_bind_group(2, gpu.sun_group.as_ref().expect("sun targets"), &[]);

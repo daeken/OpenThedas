@@ -865,13 +865,32 @@ fn ambient_visibility(p: vec3<f32>, n: vec3<f32>) -> f32 {
 
 @fragment
 fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    return lighting_pixel(frag, false);
+}
+
+// Ordinary baked frames have fused ambient/reflection, all light masks and no
+// diagnostic view. A constant argument lets the backend remove AO and diagnostic
+// branches from this entry point while sharing every lighting equation.
+@fragment
+fn fs_lighting_baked(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    return lighting_pixel(frag, true);
+}
+
+fn lighting_pixel(frag: vec4<f32>, baked: bool) -> vec4<f32> {
+    let view = select(lighting.counts.y, 0u, baked);
+    let membership = baked || lighting.counts.z != 0u;
+    let mode = select(lighting.counts.w, 0u, baked);
+    let rejection = select(u32(lighting.size.w), 3u, baked);
     let px = vec2<i32>(frag.xy);
     let depth = textureLoad(g_depth, px, 0).x;
     let p = world_at(px, depth);
     // Depth derivatives describe geometry, rather than normal-map bumps that would
     // falsely occlude a flat wall. Evaluate before the background discard so helper
     // invocations remain available at silhouettes.
-    let geometric = cross(dpdx(p), dpdy(p));
+    var geometric = vec3<f32>(0.0);
+    if (!baked) {
+        geometric = cross(dpdx(p), dpdy(p));
+    }
     if (depth >= 1.0) {
         discard;
     }
@@ -892,6 +911,7 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let falloff = gn.w;
     let power = spec.a * 255.0 + 1.0;
     let v = normalize(lighting.eye.xyz - p);
+    let compute_specular = !baked || any(spec.rgb != vec3<f32>(0.0));
 
     // Static lights and the sun (the original's lights A-C and its directional light,
     // masked by the lightmap's alpha), and the others (its D and E).
@@ -902,17 +922,30 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let tile_x = min(u32(frag.x * 16.0 / lighting.size.x), 15u);
     let tile_y = min(u32(frag.y * 9.0 / lighting.size.y), 8u);
     let tile_base = (tile_y * 16u + tile_x) * 2u;
-    let mask_room = select(room, 0u, room > 255u || lighting.counts.y == 7u);
+    let mask_room = select(room, 0u, room > 255u || view == 7u);
     let domain_base = select(0u, 2u, character);
     let depth_slice = min(u32(max(dot(lighting.depth_plane, vec4<f32>(p, 1.0)), 0.0) / 4.0), 15u);
-    for (var word = 0u; word < 6u; word = word + 1u) {
-      var bits = tile_lights.screen[tile_base + word / 4u][word % 4u];
-      if ((u32(lighting.size.w) & 2u) != 0u) {
-          bits &= tile_lights.depth[depth_slice * 2u + word / 4u][word % 4u];
-      }
-      if (lighting.counts.z != 0u) {
-          bits &= light_masks.rooms[mask_room * 2u + word / 4u][word % 4u]
-              & light_masks.domains[domain_base + word / 4u][word % 4u];
+    let words = select(6u, (lighting.counts.x + 31u) / 32u, baked);
+    var candidates: array<vec4<u32>, 2>;
+    if (baked) {
+        for (var half = 0u; half < 2u; half += 1u) {
+            candidates[half] = tile_lights.screen[tile_base + half]
+                & tile_lights.depth[depth_slice * 2u + half]
+                & light_masks.rooms[mask_room * 2u + half]
+                & light_masks.domains[domain_base + half];
+        }
+    }
+    for (var word = 0u; word < words; word = word + 1u) {
+      var bits = candidates[word / 4u][word % 4u];
+      if (!baked) {
+          bits = tile_lights.screen[tile_base + word / 4u][word % 4u];
+          if ((rejection & 2u) != 0u) {
+              bits &= tile_lights.depth[depth_slice * 2u + word / 4u][word % 4u];
+          }
+          if (membership) {
+              bits &= light_masks.rooms[mask_room * 2u + word / 4u][word % 4u]
+                  & light_masks.domains[domain_base + word / 4u][word % 4u];
+          }
       }
       while (bits != 0u) {
         let i = word * 32u + firstTrailingBit(bits);
@@ -922,9 +955,9 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let to = position.xyz - p;
         // Reject candidates before loading the complete light or evaluating sqrt,
         // trigonometric falloff, specular normalization and shadow lookups.
-        let wrap = lighting.counts.y == 9u;
+        let wrap = view == 9u;
         let reach = position.w * select(1.0, 2.0, wrap);
-        if ((u32(lighting.size.w) & 1u) != 0u) {
+        if ((rejection & 1u) != 0u) {
             if (dot(to, to) >= reach * reach * 1.000001) { continue; }
             // Reject clear back faces before the remaining light loads and sqrt.
             // Keep a margin at the tangent plane for the later normalized dot's
@@ -933,11 +966,11 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         }
         let light_colour = lights[i].colour;
         let light_shadow = lights[i].shadow;
-        if (lighting.counts.z == 0u) {
+        if (!membership) {
             if ((character && light_shadow.y < 1.5) || (!character && light_shadow.y > 1.5 && light_shadow.y < 2.5)) {
                 continue;
             }
-            if (lighting.counts.y != 7u && !reaches(lights[i], room)) {
+            if (view != 7u && !reaches(lights[i], room)) {
                 continue;
             }
         }
@@ -956,17 +989,20 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         }
         let c = cos(d / position.w * PI * 0.5);
         let att = c * c;
-        let h = normalize(v + ln);
-        let ndh = max(dot(n, h), 1e-6);
         var shade = 1.0;
         if (light_shadow.x >= 0.0) {
             shade = shadowed(i32(light_shadow.x + 0.5), position.xyz, p, n);
-            if (lighting.counts.y == 10u) {
+            if (view == 10u) {
                 return vec4<f32>(shade, att, 0.0, 1.0);
             }
         }
         let dif = att * ndl * light_colour.rgb * shade;
-        let sp = att * pow(ndh, power) * light_colour.rgb * shade;
+        var sp = vec3<f32>(0.0);
+        if (compute_specular) {
+            let h = normalize(v + ln);
+            let ndh = max(dot(n, h), 1e-6);
+            sp = att * pow(ndh, power) * light_colour.rgb * shade;
+        }
         // Objects have no baked direct visibility. Their point lights use their own
         // cube visibility, never the sun's mask or Static1's grazing-angle floor.
         if (point_uses_baked_mask(light_colour.w > 0.5, material)) {
@@ -982,30 +1018,35 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let ls = -lighting.sun_dir.xyz;
         let ndl = dot(n, ls);
         if (ndl >= 0.0) {
-            let h = normalize(v + ls);
-            let ndh = max(dot(n, h), 1e-6);
             diff_s = diff_s + ndl * lighting.sun_colour.rgb;
-            spec_s = spec_s + pow(ndh, power) * lighting.sun_colour.rgb;
+            if (compute_specular) {
+                let h = normalize(v + ls);
+                let ndh = max(dot(n, h), 1e-6);
+                spec_s = spec_s + pow(ndh, power) * lighting.sun_colour.rgb;
+            }
         }
     }
     let sun_shade = sun_visibility(p, n, !terrain_low && !object);
-    let plane_n = geometric * inverseSqrt(max(dot(geometric, geometric), 1e-20));
-    let oriented_n = select(-plane_n, plane_n, dot(plane_n, n) >= 0.0);
-    let ao = ambient_visibility(p, select(n, oriented_n, dot(geometric, geometric) > 1e-20));
+    var ao = 1.0;
+    if (!baked) {
+        let plane_n = geometric * inverseSqrt(max(dot(geometric, geometric), 1e-20));
+        let oriented_n = select(-plane_n, plane_n, dot(plane_n, n) >= 0.0);
+        ao = ambient_visibility(p, select(n, oriented_n, dot(geometric, geometric) > 1e-20));
+    }
     // Static1: alpha masks baked direct visibility once; RGB is baked bounce,
     // dimmed by only 15% in a runtime shadow (exploration camera w = 0).
     // Dynamic lights have their own visibility and never take this sun mask.
-    let ambient_shade = select(select(mix(1.0, sun_shade, 0.15), 1.0, object), ao, lighting.counts.w > 0u);
+    let ambient_shade = select(select(mix(1.0, sun_shade, 0.15), 1.0, object), ao, mode > 0u);
     // Terrain1 masks static diffuse twice; Static1 and Low's Terrain3 only once.
     let static_diffuse = diff_s * sun_shade * select(lm.a, lm.a * lm.a, terrain && !terrain_low);
     let diffuse = static_diffuse + lm.rgb * ambient_shade + diff_d;
     let specular = select((spec_s * sun_shade * max(lm.a, 0.2) + spec_d) * 3.0,
         (spec_s * (0.75 * sun_shade * lm.a + 0.25) + spec_d) * 3.0, terrain);
     var colour = albedo * diffuse + spec.rgb * specular * falloff;
-    if (lighting.size.z > 0.5) {
+    if (baked || lighting.size.z > 0.5) {
         colour = albedo * (static_diffuse + diff_d) + spec.rgb * specular * falloff + lm.rgb;
     }
-    switch lighting.counts.y {
+    switch view {
         case 1u: { return vec4<f32>(albedo, 1.0); }
         case 2u: { return vec4<f32>(n * 0.5 + 0.5, 1.0); }
         case 3u: { return vec4<f32>(lm.rgb, 1.0); }
