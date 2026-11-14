@@ -712,7 +712,9 @@ mod tests {
         assert_eq!(found.len(), 2, "{found:?}");
         assert_eq!(found[0].source, Source::Gog);
         assert_eq!(found[0].place, "CrossOver bottle GOG");
-        assert!(found[0].root.ends_with("DAO"));
+        // A case-insensitive disk (the default on macOS) keeps the registry's casing.
+        let root = found[0].root.to_string_lossy().to_lowercase();
+        assert!(root.ends_with("dao"), "{root}");
         assert_eq!(found[1].source, Source::Folder);
     }
 
@@ -742,9 +744,11 @@ mod tests {
         let t = TestDir::new("drives");
         std::fs::create_dir_all(t.path().join("drive_c/Program Files")).unwrap();
         let root = WinRoot::wine(t.path(), "x".into()).unwrap();
+        // On a case-insensitive disk the path keeps the casing it was asked with.
+        let lower = |p: Option<PathBuf>| p.map(|p| p.to_string_lossy().to_lowercase());
         assert_eq!(
-            root.map(r"c:\program files"),
-            Some(t.path().join("drive_c/Program Files"))
+            lower(root.map(r"c:\program files")),
+            lower(Some(t.path().join("drive_c/Program Files")))
         );
         assert_eq!(root.map("D:\\x"), None);
         assert_eq!(root.map("relative"), None);
