@@ -732,6 +732,24 @@ fn mods(install: &Path, list: Option<&Path>) -> Result<()> {
         }
     };
     for m in &report {
+        for a in &m.addins {
+            println!(
+                "add-in {}: {} (version {}, game {})",
+                a.uid, a.metadata.title, a.metadata.version, a.metadata.game_version
+            );
+            if !a.metadata.publisher.is_empty() {
+                println!("  publisher: {}", a.metadata.publisher);
+            }
+            if !a.metadata.description.is_empty() {
+                println!("  {}", a.metadata.description);
+            }
+            for p in &a.metadata.prerequisites {
+                println!(
+                    "  prerequisite: {} (product {}, {})",
+                    p.uid, p.product_id, p.title
+                );
+            }
+        }
         for p in &m.problems {
             println!("problem: {}: {p}", m.entry.path.display());
         }
