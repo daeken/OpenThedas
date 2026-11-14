@@ -4179,8 +4179,8 @@ pub fn call(
             h.sim.finish_travel();
             void()
         }
-        // Projectiles fly at a fixed speed (provisional) and, if given an impact event, deliver
-        // it to their event target (the firer by default) when they arrive.
+        // DA2's supported rows use the saved flight update. Origins and unsupported
+        // rows retain the provisional fixed-speed deadline.
         "FireProjectile" | "FireHomingProjectile" => {
             let from = vector(a, 1);
             let (to, event_target) = if name == "FireProjectile" {
@@ -4189,6 +4189,21 @@ pub fn call(
                 let tgt = h.object(obj(a, 2)).map_or(from, |o| o.position);
                 (tgt, obj(a, 4))
             };
+            let homing = (name == "FireHomingProjectile").then(|| obj(a, 2));
+            if let Some(id) = h
+                .sim
+                .launch_da2_projectile(int(a, 0), caller, from, homing, to)
+            {
+                h.sim.world.get_mut(id).unwrap().locals.objects.insert(
+                    "EVENT_TARGET".into(),
+                    if event_target == OBJECT_INVALID {
+                        caller
+                    } else {
+                        event_target
+                    },
+                );
+                return ok(Value::Object(id));
+            }
             const SPEED: f32 = 20.0;
             let ms = (dist(from, to) / SPEED * 1000.0).clamp(0.0, 60_000.0) as i32;
             let area = h.object(caller).and_then(|o| o.area);
