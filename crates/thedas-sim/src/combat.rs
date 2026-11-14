@@ -113,6 +113,13 @@ pub struct CombatData {
     /// The last command that finished or failed (`GetPreviousCommand`).
     #[serde(default)]
     pub previous_command: Option<crate::world::Command>,
+    /// Orders the player has given this creature (`Sim::order_*`), counted.
+    #[serde(default)]
+    pub player_orders: u64,
+    /// When a walk of this creature's failed at a closed door: the count of player orders
+    /// then (see [`crate::sim::Sim::fail_blocked`]).
+    #[serde(default)]
+    pub path_action_at: Option<u64>,
     /// `SetStealthEnabled`: the creature is in stealth (the stealth effect's handler sets
     /// and clears it).
     #[serde(default)]
@@ -1098,6 +1105,7 @@ impl Sim {
 
     /// Orders a creature to attack another, as the player does by clicking an enemy.
     pub fn order_attack(&mut self, attacker: ObjectId, target: ObjectId) {
+        self.note_player_order(attacker);
         let cmd = crate::world::Command {
             ty: constant_of(self, "COMMAND_TYPE_ATTACK"),
             name: "CommandAttack".into(),

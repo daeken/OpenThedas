@@ -22,6 +22,10 @@ use thedas_vfs::{DaoInstall, Erf};
     about = "Inspect and validate Dragon Age: Origins data"
 )]
 struct Cli {
+    /// The DLC keys file (the format of the commonly shared `erfpasswords.txt`). Defaults to
+    /// $THEDAS_KEYS, then `keys.txt` in the player's data folder.
+    #[arg(long, global = true)]
+    keys: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -344,6 +348,9 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(keys) = &cli.keys {
+        thedas_vfs::keys_file::set_path(keys);
+    }
     match cli.command {
         Command::Ls { archive } => ls(&archive),
         Command::Play {

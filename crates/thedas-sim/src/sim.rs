@@ -782,6 +782,15 @@ impl Sim {
         if event.target.is_none() {
             event.target = Some(target);
         }
+        if self.path_action_stale(target, &event) {
+            let t = self.world.time_ms;
+            self.world.trace.push(TraceEntry::Log {
+                t,
+                channel: -2,
+                text: format!("path action for {target} dropped: a newer order"),
+            });
+            return;
+        }
         let Some(obj) = self.world.get(target) else {
             self.world.trace.push(TraceEntry::Missing {
                 t: self.world.time_ms,
@@ -2938,8 +2947,51 @@ impl Sim {
     /// the script hears of it), and a held stick orders a new move about ten times a
     /// second, each replacing the mover's commands, so the use command runs only when it
     /// gets in before the next order: on some pushes the hero stands at the door instead.
+    ///
+    /// A failure the player has overtaken is not told: when the event falls due, the player
+    /// has given the creature another order since and is no longer walking into that door (a
+    /// let-go stick's stop, a click elsewhere), the script does not hear of it, so the door
+    /// does not open after the player has stopped (it did, 1.5 s after a released stick).
+    /// Still pushing into the same door, it is told, and the door opens. Provisional:
+    /// whether DAOrigins.exe drops a stale path action, or ties it to its command, is not
+    /// traced; its executor answers in the update the command fails, before a newer order
+    /// can come, which this delay stands in for.
     pub(crate) fn fail_blocked(&mut self, id: ObjectId, door: ObjectId) {
+        if let Some(o) = self.world.get_mut(id) {
+            o.combat.path_action_at = Some(o.combat.player_orders);
+        }
         self.fail_front_command_with(id, "COMMAND_FAILED_PATH_ACTION_REQUIRED", Some(door));
+    }
+
+    /// Whether a path action that fell due for `id` is stale (see [`Sim::fail_blocked`]).
+    fn path_action_stale(&mut self, id: ObjectId, event: &Event) -> bool {
+        let path_action = constant(&self.table, "COMMAND_FAILED_PATH_ACTION_REQUIRED");
+        if event.ty != self.event_type("COMMAND_COMPLETE")
+            || event.ints.get(1).copied() != Some(path_action)
+        {
+            return false;
+        }
+        let Some((at, now)) = self
+            .world
+            .get_mut(id)
+            .and_then(|o| Some((o.combat.path_action_at.take()?, o.combat.player_orders)))
+        else {
+            return false;
+        };
+        if at == now {
+            return false;
+        }
+        let door = event.objects.get(2).copied().unwrap_or(OBJECT_INVALID);
+        let pushing = self
+            .world
+            .get(id)
+            .and_then(|o| o.commands.first())
+            .filter(|c| c.name == "CommandMoveToLocation")
+            .and_then(|c| c.location.as_ref().map(|l| l.position));
+        match pushing {
+            Some(to) => self.route_to(id, to) != crate::nav::Routed::Door(door),
+            None => true,
+        }
     }
 
     pub(crate) fn fail_front_command(&mut self, id: ObjectId, result: &str) {
