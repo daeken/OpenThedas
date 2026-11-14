@@ -3318,7 +3318,10 @@ impl App {
 
     /// Draws the level the way `path` says, or the other way than now for `None` (F11),
     /// from the next frame; returns the way it is drawn now.
-    fn set_render_path(&mut self, path: Option<thedas_render::RenderPath>) -> thedas_render::RenderPath {
+    fn set_render_path(
+        &mut self,
+        path: Option<thedas_render::RenderPath>,
+    ) -> thedas_render::RenderPath {
         let path = path.unwrap_or(self.loaded.render_path.toggled());
         self.loaded.render_path = path;
         if let Some(l) = self.live.as_mut() {
