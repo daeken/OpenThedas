@@ -271,6 +271,8 @@ pub struct Live {
     owed_ms: f64,
     /// Whether frames get the level's frame buffer effects.
     pub frame_effects: bool,
+    /// How the level is drawn: the original's shaders or our deferred renderer (F11).
+    pub render_path: thedas_render::RenderPath,
     /// The graphics detail level scenes are loaded at.
     pub detail: thedas_render::scene::Detail,
     /// The conversation camera's resources and current shot.
@@ -320,6 +322,10 @@ pub struct Live {
     pub async_loads: bool,
     /// The frame size renderers are warmed for when they are built.
     pub frame_size: (u32, u32),
+    /// Where the mouse is in the frame (pixels), for the aiming reticle.
+    pub cursor: (f64, f64),
+    /// The aiming reticle's pass, for the format it was made for.
+    reticle_pass: Option<(wgpu::TextureFormat, crate::reticle::ReticlePass)>,
     /// The load under way while [`Live::async_loads`] is set (see [`Loading`]).
     loading: Option<Loading>,
     /// A layout whose build failed: not tried again until the area changes.
@@ -675,6 +681,8 @@ impl Live {
             cache: RenderCache::default(),
             async_loads: false,
             frame_size: (1280, 720),
+            cursor: (0.0, 0.0),
+            reticle_pass: None,
             loading: None,
             failed_layout: None,
             held: false,
@@ -683,6 +691,7 @@ impl Live {
             cut_held: None,
             owed_ms: 0.0,
             frame_effects: true,
+            render_path: Default::default(),
             detail: Default::default(),
             talk_camera: Default::default(),
             cutscene_camera: Default::default(),
@@ -2323,9 +2332,13 @@ impl Live {
         }
         self.set_shader_time();
         self.apply_cutaway(ctx);
+        let aim = self.reticle(camera, (width, height), self.cursor);
+        let format = self.format.unwrap_or(thedas_render::gpu::CAPTURE_FORMAT);
+        let reticle = self.reticle_pass(&ctx.device, format);
         let Some(level) = self.level.as_mut() else {
             return false;
         };
+        level.renderer.path = self.render_path;
         // Every renderer's shadow casters go into the partitions before anything is drawn.
         level.renderer.prepare_shadows(ctx, camera, width, height);
         if let Some(o) = self.objects.as_mut() {
@@ -2339,6 +2352,8 @@ impl Live {
         level
             .renderer
             .render_main(ctx, encoder, target, width, height, camera);
+        // An aimed ability's reticle lies on the ground: under the creatures, as the rings.
+        reticle.draw(&ctx.device, encoder, target, (width, height), &aim);
         if let Some(r) = self.rings.as_mut() {
             let depth = level.renderer.depth(&ctx.device, width, height);
             r.renderer
@@ -2442,10 +2457,13 @@ impl Live {
         self.set_shader_time();
         self.apply_cutaway(ctx);
         let cut_effects = self.cut_effects();
+        let aim = self.reticle(camera, (width, height), self.cursor);
+        let reticle = self.reticle_pass(&ctx.device, thedas_render::gpu::CAPTURE_FORMAT);
         let Some(level) = self.level.as_mut() else {
             return Ok(None);
         };
         level.renderer.cut_effects = cut_effects;
+        level.renderer.path = self.render_path;
         let mut overlays: Vec<&mut AreaRenderer> = self
             .rings
             .iter_mut()
@@ -2459,7 +2477,24 @@ impl Live {
             width,
             height,
             &mut overlays,
+            &mut |encoder, view| reticle.draw(&ctx.device, encoder, view, (width, height), &aim),
         )?))
+    }
+
+    /// The aiming reticle's pass for frames of `format`, made once for each format.
+    fn reticle_pass(
+        &mut self,
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+    ) -> crate::reticle::ReticlePass {
+        match &self.reticle_pass {
+            Some((f, p)) if *f == format => p.clone(),
+            _ => {
+                let p = crate::reticle::ReticlePass::new(device, format);
+                self.reticle_pass = Some((format, p.clone()));
+                p
+            }
+        }
     }
 
     fn spec(&self, format: wgpu::TextureFormat) -> BuildSpec {
