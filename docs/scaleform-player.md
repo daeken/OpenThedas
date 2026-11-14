@@ -27,7 +27,10 @@ Script: `OpenThedas-testdata/scaleform/scripts/inventory.py`; output `inventory.
   atlases), ExporterInfo, FileAttributes, SetBackgroundColor, Metadata.
   **None of**: buttons, static text, sounds, video, bitmaps embedded as SWF bitmaps, AS3.
 - Fills: bitmap clip (2.3k, mostly non-smoothed), solid (577), linear 28, radial 20, focal 1.
-  Strokes: 38 line styles in all. Masks (clip depth): 177. Colour transforms everywhere.
+  Strokes: 38 line styles in all. Authored strokes retain round/flat/square endpoint caps,
+  round/bevel/miter joins and miter limits. Shape4's no-close flag keeps meeting endpoints
+  capped; legacy shapes and morph strokes use their implicit round caps and joins.
+  Masks (clip depth): 177. Colour transforms everywhere.
 - Blend modes: multiply (253), overlay 5, difference 4, hardlight 4, invert 2, add, erase,
   screen 1 each. Filters: Glow 2, DropShadow 1. cacheAsBitmap 3.
 - Text: 706 edit texts, almost all `useOutlines`, read-only, non-selectable, 476 HTML; 18 input
@@ -99,9 +102,6 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
   optionsmenu, newgame. All 66 movies start and run headless without errors.
 - Release build, idle: 10 µs to 9 ms of script per frame per movie (quickbar 0.27 ms against
   Ruffle's 2.1 ms); a movie that did not change is not drawn again.
-- Authored strokes retain round/flat/square endpoint caps, round/bevel/miter joins and
-  miter limits. Shape4's no-close flag keeps meeting endpoints capped; legacy shapes
-  and morph strokes use their implicit round caps and joins.
 - Glow/DropShadow/Blur filters flatten the subtree, repeat separable box blur by quality,
   then composite premultiplied colour with strength, inner/knockout and source visibility.
   Parent stencil masks clip the result; nested filters and ordered filter lists are supported.
