@@ -238,7 +238,17 @@ impl Vfs {
             collect_files(&root, recursive, &mut files)?;
         }
         files.retain(|p| !is_archive(p));
-        files.sort();
+        if recursive {
+            // The original's order (see `container_key`): each folder is its own source, and
+            // of two with one name the folder with the greater path wins; pushed lowest
+            // first, so a later file shadows an earlier one below.
+            files.sort_by_cached_key(|p| {
+                let parent = p.parent().unwrap_or(&root);
+                (container_key(&root, parent, true), p.clone())
+            });
+        } else {
+            files.sort();
+        }
         let layer = self.layers.len();
         let mut named = Vec::with_capacity(files.len());
         for path in files {
@@ -261,6 +271,47 @@ impl Vfs {
         });
         self.dir_files.push(named);
         Ok(())
+    }
+
+    /// Mounts a folder the way the original mounts a folder it scans in full (an override
+    /// folder): its `.erf` archives, anywhere under it, each as a layer below its loose files,
+    /// the one with the greater path on top; then its loose files ([`Vfs::push_directory`],
+    /// recursive). Returns the archives that could not be opened, with why.
+    ///
+    /// Traced (the folder indexer 0x4cf690 and the container list's order 0x4e6660): a
+    /// folder registered to be scanned in full registers each subfolder as a folder of its
+    /// own and each `.erf` file as an archive, all at the folder's priority. Sources of one
+    /// priority are ordered by kind (a scanned folder ranks 1, an archive above it, lower first:
+    /// vtable slot +0x20, 0x4cf1b0; an archive class ranks 2 or 3, which of the two for `.erf` is not traced) and then by path, the greater path first
+    /// (`std::wstring::compare` at 0x414600, so case counts); a lookup takes the first source
+    /// that holds the name (0x4c5c80). So any loose file beats any `.erf`, and between two
+    /// folders, or two archives, the one with the greater path wins. A `.rim` in such a folder
+    /// is handed to another registry (0x4c7b00), not mounted as an archive: not done here.
+    pub fn push_folder(
+        &mut self,
+        root: impl AsRef<Path>,
+        label: &dyn Fn(&Path) -> String,
+    ) -> Result<Vec<String>> {
+        let root = root.as_ref();
+        let mut problems = Vec::new();
+        if !root.is_dir() {
+            return Ok(problems);
+        }
+        let mut archives = Vec::new();
+        collect_files(root, true, &mut archives)?;
+        archives.retain(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("erf"))
+        });
+        archives.sort_by_cached_key(|p| container_key(root, p, false));
+        for archive in archives {
+            if let Err(e) = self.push_archive(&archive, label(&archive)) {
+                problems.push(e.to_string());
+            }
+        }
+        self.push_directory(root, true, label(root))?;
+        Ok(problems)
     }
 
     /// Adds a layer holding exactly these loose files. Missing files are skipped.
@@ -730,6 +781,25 @@ pub(crate) fn is_archive(path: &Path) -> bool {
             .as_deref(),
         Some("erf" | "rim" | "crf" | "rimp")
     )
+}
+
+/// The key the original orders one priority's sources by (see [`Vfs::push_folder`]): the
+/// source's path under `root`, with `\\` between parts as the original builds it, and a
+/// trailing `\\` for a folder, as UTF-16 code units compared in order (case counts). The root
+/// folder is `\\`, so every subfolder sorts above it.
+pub(crate) fn container_key(root: &Path, path: &Path, folder: bool) -> Vec<u16> {
+    let mut key = String::from("\\");
+    if let Ok(rel) = path.strip_prefix(root) {
+        let parts: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        key.push_str(&parts.join("\\"));
+        if folder && !parts.is_empty() {
+            key.push('\\');
+        }
+    }
+    key.encode_utf16().collect()
 }
 
 pub(crate) fn collect_files(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> Result<()> {

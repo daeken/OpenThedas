@@ -5115,12 +5115,19 @@ fn audio_state(
         }
     }
     // Lines said in passing, at their speakers' heads.
+    let mut passing = Vec::new();
     {
         let sim = live.sim();
         for l in ambient {
             let Some(strref) = l.strref else {
                 continue;
             };
+            passing.push(faces::SpokenLine {
+                speaker: l.speaker,
+                dialog: l.dialog.clone(),
+                strref,
+                female: l.female,
+            });
             let at = sim.world.get(l.speaker).map(|o| {
                 let p = o.position;
                 [p[0], p[1], p[2] + live.head_height(o.id)]
@@ -5135,6 +5142,9 @@ fn audio_state(
                 at,
             ));
         }
+    }
+    for line in &passing {
+        live.say_in_passing(line);
     }
     // Sounds the simulation asked for (scripts, character creation's voice preview).
     {

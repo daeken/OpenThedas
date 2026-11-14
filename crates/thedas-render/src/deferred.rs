@@ -148,7 +148,12 @@ pub(crate) struct DeferredPass {
     /// The index each room id has in the lights' room sets (1 on; 0 is "no room").
     rooms: HashMap<i64, u32>,
     light_rooms: HashMap<i64, Vec<i64>>,
+    /// The rooms' boxes ([`AreaScene::room_boxes`]), to place a light of no room.
+    room_boxes: Vec<(i64, Vec3, Vec3)>,
     gpu: Option<Gpu>,
+    /// Lights only this pass draws, set each frame ([`DeferredPass::set_effect_lights`]):
+    /// the glowing emitters', the level's and its objects'.
+    effect_lights: Vec<SceneLight>,
     /// The GPU refused the pass: the level stays faithful.
     refused: bool,
 }
@@ -347,7 +352,9 @@ impl DeferredPass {
             takes,
             rooms,
             light_rooms: scene.light_rooms.clone(),
+            room_boxes: scene.room_boxes.clone(),
             gpu: None,
+            effect_lights: Vec::new(),
             refused: false,
         })
     }
@@ -355,6 +362,32 @@ impl DeferredPass {
     /// Whether faithful draw `k` (an index into [`D3dPass::draws`]) is this pass's to draw.
     pub(crate) fn takes(&self, k: usize) -> bool {
         self.takes.get(k).copied().unwrap_or(false)
+    }
+
+    /// Sets the lights only this pass draws (see [`DeferredPass::effect_lights`]).
+    pub(crate) fn set_effect_lights(&mut self, lights: Vec<SceneLight>) {
+        // `THEDAS_DEFERRED_LOG_LIGHTS=1`: the first frame's effect lights, once (to frame
+        // shots of them).
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        if !lights.is_empty() && std::env::var_os("THEDAS_DEFERRED_LOG_LIGHTS").is_some() {
+            LOGGED.call_once(|| {
+                for l in &lights {
+                    if let SceneLight::Point {
+                        position,
+                        color,
+                        radius,
+                        name,
+                        ..
+                    } = l
+                    {
+                        log::info!(
+                            "effect light {name} at {position} colour {color} reach {radius}"
+                        );
+                    }
+                }
+            });
+        }
+        self.effect_lights = lights;
     }
 
     /// Whether the GPU refused the pass.
@@ -964,6 +997,7 @@ impl DeferredPass {
         let mut out: Vec<(f32, GpuLight)> = d3d
             .lights()
             .iter()
+            .chain(&self.effect_lights)
             .filter_map(|l| self.light(l, &planes, camera.position))
             .collect();
         if out.len() > MAX_LIGHTS {
@@ -1005,7 +1039,11 @@ impl DeferredPass {
             GpuLight {
                 position: position.extend(*radius).to_array(),
                 colour: colour.extend(if *is_static { 1.0 } else { 0.0 }).to_array(),
-                rooms: self.room_bits(*room),
+                // A light of no room (an object's, an emitter's) reaches from the room it is
+                // in, when it is in one.
+                rooms: self.room_bits(
+                    room.or_else(|| crate::scene::room_id_at(&self.room_boxes, *position)),
+                ),
             },
         ))
     }
@@ -1023,7 +1061,8 @@ impl DeferredPass {
                 bits[(i / 32) as usize] |= 1 << (i % 32);
             }
         }
-        bits
+        // Rooms none of the deferred draws are in: no test, as for a light of no room.
+        if bits == [0; 8] { [u32::MAX; 8] } else { bits }
     }
 }
 
@@ -1086,6 +1125,66 @@ fn debug_view() -> u32 {
     })
 }
 
+/// The brightest a glowing emitter's light gets (its strongest channel), approached as its
+/// particles show more light: `1 − e^(−shown / EMITTER_SHOWN)`, with `shown` their summed
+/// colour times alpha times area (m²). Ours, tuned by eye: a torch or brazier already has
+/// a light of the level's beside its flames, so this adds a flicker and spell glow on top
+/// rather than a second torch (provisional).
+const EMITTER_PEAK: f32 = 2.0;
+const EMITTER_SHOWN: f32 = 1.0;
+/// An emitter light's reach: this much past its particles' spread, plus this much at its
+/// peak.
+const EMITTER_REACH: f32 = 2.0;
+const EMITTER_REACH_PER: f32 = 4.0;
+
+/// The light an emitter's living particles give, as a point light at their glow-weighted
+/// centre (ours: the original's particles light nothing). `None` when they show none.
+pub fn emitter_light(e: &crate::particles::EmitterState) -> Option<SceneLight> {
+    if e.opacity <= 0.0 || e.particles.is_empty() {
+        return None;
+    }
+    let mut total = Vec3::ZERO;
+    let mut centre = Vec3::ZERO;
+    let mut weight = 0.0;
+    let mut glow = Vec::with_capacity(e.particles.len());
+    for p in &e.particles {
+        let look = e.look(p);
+        let area = (look.size[0] * look.size[1]).abs().min(4.0);
+        let c = look.color.truncate().max(Vec3::ZERO) * look.color.w.clamp(0.0, 1.0) * area;
+        let w = c.x + c.y + c.z;
+        if !w.is_finite() || w <= 0.0 {
+            continue;
+        }
+        total += c;
+        centre += p.position * w;
+        weight += w;
+        glow.push((p.position, w));
+    }
+    if weight <= 0.0 {
+        return None;
+    }
+    let centre = centre / weight;
+    let spread = glow
+        .iter()
+        .map(|(p, w)| p.distance(centre) * w)
+        .sum::<f32>()
+        / weight;
+    let shown = total.x + total.y + total.z;
+    let strength = EMITTER_PEAK * (1.0 - (-shown / EMITTER_SHOWN).exp()) * e.opacity.min(1.0);
+    let color = total / total.max_element() * strength;
+    (centre.is_finite() && strength > 0.01).then(|| SceneLight::Point {
+        position: centre,
+        color,
+        radius: EMITTER_REACH + spread.min(5.0) + EMITTER_REACH_PER * strength / EMITTER_PEAK,
+        name: format!("emitter {}", e.blueprint.material),
+        domain: None,
+        is_static: false,
+        version: 1,
+        intensity: 1.0,
+        room: None,
+    })
+}
+
 /// The six planes (`n·p + w ≥ 0` inside) of a view-projection with depth 0..1.
 fn frustum(m: Mat4) -> [Vec4; 6] {
     let (r0, r1, r2, r3) = (m.row(0), m.row(1), m.row(2), m.row(3));
@@ -1112,6 +1211,53 @@ mod tests {
         assert_eq!(RenderPath::default(), RenderPath::Faithful);
         assert_eq!(RenderPath::Faithful.toggled(), RenderPath::Deferred);
         assert_eq!(RenderPath::Deferred.toggled().name(), "faithful");
+    }
+
+    #[test]
+    fn a_glowing_emitter_lights_around_its_particles() {
+        use thedas_formats::emitter::{AgeKey, Emitter};
+        let fire = Emitter {
+            material: "fx".into(),
+            birthrate: 20.0,
+            life: 1.0,
+            initial_speed: 1.0,
+            age_color_multiplier: [1.0; 4],
+            age_scale_multiplier: [1.0, 1.0],
+            age_map: vec![AgeKey {
+                time: 0.0,
+                scale: [0.5, 0.5],
+                color: [1.0, 0.5, 0.1, 1.0],
+            }],
+            ..Default::default()
+        };
+        let at = Vec3::new(10.0, 20.0, 1.0);
+        let mut e = crate::particles::EmitterState::new(
+            std::sync::Arc::new(fire),
+            Mat4::from_translation(at),
+            1,
+        );
+        assert_eq!(emitter_light(&e), None, "no particles, no light");
+        e.advance(0.5);
+        let Some(SceneLight::Point {
+            position,
+            color,
+            radius,
+            is_static,
+            room,
+            ..
+        }) = emitter_light(&e)
+        else {
+            panic!("a burning emitter gives a point light");
+        };
+        // Near the emitter, rising with its particles; its colour the particles' hue.
+        assert!(position.distance(at) < 1.0, "{position}");
+        assert!(color.x > color.y && color.y > color.z, "{color}");
+        assert!(color.max_element() <= EMITTER_PEAK);
+        assert!(radius > EMITTER_REACH);
+        assert!(!is_static && room.is_none());
+        // Hidden (a cut-away model's), it gives none.
+        e.opacity = 0.0;
+        assert_eq!(emitter_light(&e), None);
     }
 
     #[test]

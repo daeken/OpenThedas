@@ -31,10 +31,11 @@
 //! list's folder, and a leading `~/` is the home folder. `archive.zip!/folder` mounts only that
 //! folder of the archive, for mods that ship several variants with the same file names.
 //!
-//! Inside one mod, folders are flattened (a resource is named by its file name alone, as in
-//! the original's override folder), `.erf` and `.rim` archives found in a mod folder are mounted
-//! below that folder's loose files, and of two loose files with one name the later path wins.
-//! Those three rules are provisional: they are not traced in the original.
+//! A mod folder is mounted as the original mounts its override folder (traced, see
+//! [`Vfs::push_folder`]): a resource is named by its file name alone, every `.erf` anywhere in
+//! the folder is an archive below the folder's loose files, and of two sources with one name
+//! the one with the greater path wins (case counts), loose files before archives. `.rim`
+//! files in a mod folder are mounted below the `.erf` ones, by path (not traced).
 //!
 //! A `.7z` archive is unpacked once into the same cache folder ([`unpack_7z`]) and then mounted
 //! as a folder: a 7z is one compressed stream, so serving single files out of it in place is
@@ -295,16 +296,26 @@ fn mount_folder(
     label: &dyn Fn(&Path) -> String,
     problems: &mut Vec<String>,
 ) -> Result<()> {
+    // `.rim` (and DA2 archive) files lowest, in path order: the original hands a `.rim` in
+    // a scanned folder to another registry (0x4c7b00), not traced, so where it lands is ours.
     let mut files = Vec::new();
     collect_files(dir, true, &mut files)?;
-    files.retain(|p| is_archive(p));
+    files.retain(|p| {
+        is_archive(p)
+            && !p
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("erf"))
+    });
     files.sort();
     for archive in files {
         if let Err(e) = overlay.push_archive(&archive, label(&archive)) {
             problems.push(e.to_string());
         }
     }
-    overlay.push_directory(dir, true, label(dir))
+    // Then as the original scans an override folder: `.erf` files, then loose files.
+    problems.extend(overlay.push_folder(dir, label)?);
+    Ok(())
 }
 
 fn mount_entry(

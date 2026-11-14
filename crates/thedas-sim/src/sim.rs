@@ -2748,7 +2748,82 @@ impl Sim {
             if was != p {
                 self.update_triggers(id);
             }
+            if self.move_to_object_arrived(id) {
+                // A step that went past the range ends at it (the step is at most a tick's
+                // walk, and the exe's walk stops on reaching the range).
+                self.stop_at_range(id);
+                let now = self.world.time_ms;
+                if let Some(o) = self.world.get_mut(id) {
+                    let here = o.position;
+                    if let Some(c) = o.commands.first_mut() {
+                        // Done here: what is left of the walk is standing still.
+                        c.due = Some(now);
+                        c.from = Some((here, now));
+                        c.path = vec![here];
+                    }
+                }
+            }
         }
+    }
+
+    /// Whether a `CommandMoveToObject` walker has arrived. DAOrigins.exe's executor
+    /// (0x7aa200) ends the move once the walker is within its range of the target, by its
+    /// range test (0x7a3090): the distance on the ground at most the larger of the two ranges
+    /// (the command keeps fMinRange and fMaxRange, raised to fMinRange, 0x66f312) plus
+    /// 0.05 m (0xaf70b0), and at least fMinRange less 0.05. A creature target's capsule
+    /// keeps the walker out (the controller stops against it), so a walker touching it has
+    /// arrived too. Provisional: fMaxRange is not kept (so the larger range is fMinRange),
+    /// and how the exe ends a walk stopped against its target is not traced (the
+    /// locomotion's status, 0x7a9130, decides).
+    /// Puts a `CommandMoveToObject` walker that stepped inside its minimum range back out
+    /// to it, on the line from the target.
+    fn stop_at_range(&mut self, id: ObjectId) {
+        let Some((pos, min, tpos)) = self.world.get(id).and_then(|o| {
+            let c = o.commands.first()?;
+            let t = self.world.get(c.target?)?;
+            Some((o.position, c.seconds, t.position))
+        }) else {
+            return;
+        };
+        let (dx, dy) = (pos[0] - tpos[0], pos[1] - tpos[1]);
+        let d = (dx * dx + dy * dy).sqrt();
+        if min <= 0.0 || d >= min || d <= 1e-4 {
+            return;
+        }
+        let k = min / d;
+        if let Some(o) = self.world.get_mut(id) {
+            o.position = [tpos[0] + dx * k, tpos[1] + dy * k, pos[2]];
+        }
+    }
+
+    fn move_to_object_arrived(&self, id: ObjectId) -> bool {
+        const RANGE_SLACK: f32 = 0.05;
+        let Some(o) = self.world.get(id) else {
+            return false;
+        };
+        let Some(c) = o.commands.first() else {
+            return false;
+        };
+        if !c.name.starts_with("CommandMoveToObject") {
+            return false;
+        }
+        let Some(t) = c.target.and_then(|t| self.world.get(t)) else {
+            return false;
+        };
+        if t.area != o.area || t.id == id {
+            return false;
+        }
+        let d = ((t.position[0] - o.position[0]).powi(2) + (t.position[1] - o.position[1]).powi(2))
+            .sqrt();
+        let min = c.seconds.max(0.0);
+        // A step that went past the lower bound is put back at the range by
+        // [`Sim::stop_at_range`]; a walker that starts inside it is not sent away
+        // (provisional).
+        let in_range = d <= min + RANGE_SLACK;
+        let touching = t.kind == ObjectKind::Creature
+            && self.alive(t.id)
+            && d <= self.capsule_radius(id) + self.capsule_radius(t.id) + RANGE_SLACK;
+        in_range || touching
     }
 
     /// When walkers closing in on a creature next look again (see [`APPROACH_CHECK_MS`]):
@@ -3453,9 +3528,16 @@ impl Sim {
                 }
             }
         }
-        // A move to an object ends where the object stands. Provisional: the mover keeps
-        // its facing.
-        let to_object = cmd.name.starts_with("CommandMoveToObject");
+        // A move to an object ends where the object stands, except a walk to a creature,
+        // which ends where the walk stopped, against its body or in range
+        // ([`Sim::move_to_object_arrived`]): the walker was set down on the creature (DA2's
+        // Hawke on Flemeth). Provisional: the mover keeps its facing.
+        let walked_to_creature = cmd.from.is_some()
+            && cmd
+                .target
+                .and_then(|t| self.world.get(t))
+                .is_some_and(|t| t.kind == ObjectKind::Creature);
+        let to_object = cmd.name.starts_with("CommandMoveToObject") && !walked_to_creature;
         // A walk whose end lies in a closed door's doorway stopped at the door (its route is
         // cut short there, see `Sim::route_to`): the walker stays where the route left it
         // and is not set down at the end asked for, inside the doorway or past the leaf. (A
@@ -5602,6 +5684,61 @@ mod tests {
         assert!(o.commands.is_empty());
         assert_eq!(o.position, [80.0, 120.0, 29.5]);
         assert_eq!(o.area, Some(area));
+    }
+
+    #[test]
+    fn a_walk_to_a_creature_stops_against_it_or_at_its_range() {
+        // DA2's Hawke walked to Flemeth and was set down on her. DAOrigins.exe's walk ends in
+        // range of the target (0x7a3090), and the target's body stops the walker first.
+        for (min, want) in [(0.0f32, None), (2.0, Some(2.0f32))] {
+            let mut s = sim();
+            let area = s.world.spawn(ObjectKind::Area, "a");
+            let (w, h) = (40u32, 40u32);
+            s.area_layouts.insert(area, "open".into());
+            s.nav_grids.insert(
+                "open".into(),
+                Some(Arc::new(thedas_formats::level::NavGrid {
+                    columns: w,
+                    rows: h,
+                    cell_size: 0.5,
+                    clearance: 2.0,
+                    base: [0.0, 0.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                    data: vec![1u8; (w * h) as usize],
+                    heights: vec![0.0; (w * h) as usize],
+                    surfaces: Vec::new(),
+                })),
+            );
+            let walker = s.world.spawn(ObjectKind::Creature, "walker");
+            let target = s.world.spawn(ObjectKind::Creature, "target");
+            for (id, p) in [(walker, [4.0, 10.0, 0.0]), (target, [12.0, 10.0, 0.0])] {
+                let o = s.world.get_mut(id).unwrap();
+                o.area = Some(area);
+                o.position = p;
+            }
+            s.world.get_mut(walker).unwrap().commands.push(Command {
+                name: "CommandMoveToObject".into(),
+                target: Some(target),
+                seconds: min,
+                ints: vec![1],
+                ..Default::default()
+            });
+            for _ in 0..100 {
+                s.tick(100);
+            }
+            let o = s.world.get(walker).unwrap();
+            assert!(o.commands.is_empty(), "the walk ends");
+            let d = 12.0 - o.position[0];
+            let contact = s.capsule_radius(walker) + s.capsule_radius(target);
+            match want {
+                // Against it, give or take the slide's own tolerance; well off its middle.
+                None => assert!(
+                    (d - contact).abs() < 0.1,
+                    "against the body: {d} vs {contact}"
+                ),
+                Some(r) => assert!((d - r).abs() < 0.06, "at its range: {d}"),
+            }
+        }
     }
 
     #[test]
