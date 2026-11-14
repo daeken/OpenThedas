@@ -7,6 +7,10 @@ use thedas_formats::dds::{Dds, DdsFormat, DdsKind};
 use thedas_vfs::Vfs;
 use wgpu::util::DeviceExt;
 
+#[cfg(test)]
+#[path = "forward_transparency_tests.rs"]
+mod forward_transparency_tests;
+
 use crate::camera::Camera;
 use crate::material::{BlendMode, MaterialProgram, Program, ProgramRegistry, Resolved};
 use crate::scene::{AreaScene, Vertex};
@@ -608,6 +612,8 @@ pub struct AreaRenderer {
     deferred_planned: bool,
     /// Its eligible geometry was already drawn into another renderer's G-buffer.
     deferred_in_frame: bool,
+    /// A shared deferred frame finishes every renderer's opaque overlays before blending.
+    late_transparency: bool,
 }
 
 /// The colour curve `da_hsvmatrix` reads: `name` (an area's curve, `<name>.dds`) or by
@@ -1138,6 +1144,7 @@ impl AreaRenderer {
             deferred,
             deferred_planned,
             deferred_in_frame: false,
+            late_transparency: false,
         }
     }
 
@@ -1558,7 +1565,8 @@ impl AreaRenderer {
     }
 
     /// Shares the level's G-buffer and point shadows with eligible object renderers.
-    /// Their remaining materials are drawn later by `render_over`, as usual.
+    /// Draw their opaque remainder with `render_over`, then call `finish_transparency`
+    /// on this renderer and each overlay before resolving the shared frame.
     #[allow(clippy::too_many_arguments)]
     pub fn render_main_with(
         &mut self,
@@ -1641,8 +1649,12 @@ impl AreaRenderer {
         objects: &mut [&mut AreaRenderer],
     ) {
         let contributed = std::mem::take(&mut self.deferred_in_frame);
+        if over.is_none() {
+            self.late_transparency = false;
+        }
         for o in objects.iter_mut() {
             o.deferred_in_frame = false;
+            o.late_transparency = false;
         }
         // For the effects that read the depth buffer back (see `finish_frame_with`).
         self.frame_projection = Some(camera.projection(width as f32 / height.max(1) as f32));
@@ -1725,7 +1737,14 @@ impl AreaRenderer {
                 )
             });
         drop(contributors);
+        let late = deferred
+            && !objects.is_empty()
+            && std::env::var("THEDAS_DEFERRED_LATE_TRANSPARENCY").as_deref() != Ok("0");
+        if over.is_none() {
+            self.late_transparency = late;
+        }
         for o in objects.iter_mut() {
+            o.late_transparency = late;
             o.deferred_in_frame = deferred
                 && o.path == crate::deferred::RenderPath::Deferred
                 && o.only_draws.is_none()
@@ -1762,13 +1781,66 @@ impl AreaRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        self.draw_forward(
+            &mut pass,
+            true,
+            !self.late_transparency,
+            deferred || contributed,
+        );
+    }
+
+    /// Completes this renderer's delayed blended/faded draws and particles over a shared
+    /// deferred frame, after every opaque overlay. A faithful frame has nothing pending.
+    pub fn finish_transparency(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+    ) {
+        if !std::mem::take(&mut self.late_transparency) {
+            return;
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("deferred forward transparency"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        self.draw_forward(&mut pass, false, true, false);
+    }
+
+    fn draw_forward(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        opaque: bool,
+        transparent: bool,
+        deferred: bool,
+    ) {
         // Faded objects' opaque draws go after the other opaque ones, so what lies behind
         // them is there to show through.
         let faded =
             |r: &DrawRef| matches!(*r, DrawRef::D3d(i) if self.d3d.is_faded(&self.d3d.draws[i]));
-        let opaque = self.opaque.iter().filter(|(_, r)| !faded(r));
-        let faded_opaque = self.opaque.iter().filter(|(_, r)| faded(r));
-        for (di, r) in opaque.chain(faded_opaque).chain(&self.blended) {
+        let solid = self.opaque.iter().filter(|(_, r)| opaque && !faded(r));
+        let faded_opaque = self.opaque.iter().filter(|(_, r)| transparent && faded(r));
+        let blended = self.blended.iter().filter(|_| transparent);
+        for (di, r) in solid.chain(faded_opaque).chain(blended) {
             if self
                 .only_draws
                 .as_ref()
@@ -1780,7 +1852,7 @@ impl AreaRenderer {
                 DrawRef::StandIn(i) => &self.stand_in[i],
                 DrawRef::D3d(i) => {
                     if !self.d3d.in_view(i)
-                        || ((deferred || contributed)
+                        || (deferred
                             && !self.d3d.is_faded(&self.d3d.draws[i])
                             && self.deferred.as_ref().is_some_and(|p| p.takes(i)))
                     {
@@ -1788,7 +1860,7 @@ impl AreaRenderer {
                     }
                     let d = &self.d3d.draws[i];
                     let mesh = &self.meshes[d.mesh];
-                    self.d3d.draw(&mut pass, d, &mesh.indices, mesh.count);
+                    self.d3d.draw(pass, d, &mesh.indices, mesh.count);
                     continue;
                 }
             };
@@ -1804,8 +1876,8 @@ impl AreaRenderer {
         }
         // Particles last, over everything else (the emitters' render classes are
         // transparent).
-        if self.only_draws.is_none() {
-            self.d3d.draw_particles(&mut pass, false);
+        if transparent && self.only_draws.is_none() {
+            self.d3d.draw_particles(pass, false);
         }
     }
 
@@ -2033,6 +2105,10 @@ impl AreaRenderer {
             let depth = self.depth(&ctx.device, width, height);
             for o in overlays.iter_mut() {
                 o.render_over(ctx, &mut encoder, &frame, width, height, camera, &depth);
+            }
+            self.finish_transparency(&mut encoder, &frame, &depth);
+            for o in overlays.iter_mut() {
+                o.finish_transparency(&mut encoder, &frame, &depth);
             }
         }
         self.resolve(&ctx.device, &mut encoder, &view, width, height);

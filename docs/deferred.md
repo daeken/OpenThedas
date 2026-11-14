@@ -58,8 +58,19 @@ original scene before selecting `path = RenderPath::Deferred`.
    through walls into rooms the original never lit. Tiled or clustered culling replaces
    the per-pixel loop over all of them when light counts call for it.
 4. Everything not deferred draws forward with its original shaders over that colour and
-   depth: blended, unsupported alpha-tested and multi-pass materials, water, sky, trees,
-   unsupported character materials, cut-away meshes and particles. Then frame effects as now.
+   depth. In a shared deferred frame, all renderers first draw their remaining opaque
+   geometry (including hair depth cores and unsupported materials). Blended and faded
+   geometry and particles then draw against the completed opaque depth, before the MSAA
+   resolve and frame effects. This keeps a forward object from overwriting particles or
+   water in front of it. Draw order within each renderer stays authored; this is not a
+   global transparency sort or order-independent transparency. Distortion still uses its
+   later shared mask. `THEDAS_DEFERRED_LATE_TRANSPARENCY=0` restores the earlier per-renderer
+   order for comparison. Faithful frames keep their existing order.
+
+   API callers of `render_main_with` finish their opaque overlays with `render_over`, then
+   call `finish_transparency` on the level and each overlay, using the shared frame/depth
+   views, before `resolve`. It is a no-op without pending work. `capture_with` does this
+   automatically; a standalone renderer needs no split.
 
 Debug views in place of the lit frame: `THEDAS_DEFERRED_VIEW=albedo|normal|lightmap|
 visibility|diffuse|specular|no-rooms|flat|wrap|shadows|sun-shadows|ao` (see `deferred::debug_view`).
