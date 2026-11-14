@@ -179,6 +179,8 @@ pub struct TextField {
     pub caret: Option<usize>,
     /// The other end of the focused selection; equal to the caret for an insertion point.
     pub selection_anchor: usize,
+    pub caret_visible: bool,
+    caret_elapsed_ms: f64,
     pub layout: Option<Layout>,
     /// Bumped whenever the text, its format or its box change (renderers cache by it).
     pub revision: u64,
@@ -238,6 +240,8 @@ impl TextField {
             shadow_color: [0, 0, 0],
             caret: None,
             selection_anchor: 0,
+            caret_visible: true,
+            caret_elapsed_ms: 0.0,
             layout: None,
             revision: 0,
             def,
@@ -440,6 +444,30 @@ impl TextField {
         let len = self.len();
         self.selection_anchor = anchor.min(len);
         self.caret = Some(caret.min(len));
+        self.caret_visible = true;
+        self.caret_elapsed_ms = 0.0;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.caret = None;
+        self.selection_anchor = 0;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Only invalidate the picture at a blink boundary; idle text retains its mesh/layout.
+    pub fn advance_caret(&mut self, dt_ms: f64) -> bool {
+        if self.caret.is_none() || !self.input || self.selection().0 != self.selection().1 {
+            return false;
+        }
+        self.caret_elapsed_ms = (self.caret_elapsed_ms + dt_ms) % 1000.0;
+        let visible = self.caret_elapsed_ms < 500.0;
+        if self.caret_visible == visible {
+            return false;
+        }
+        self.caret_visible = visible;
+        self.revision = self.revision.wrapping_add(1);
+        true
     }
 
     pub fn len(&self) -> usize {
@@ -1223,6 +1251,13 @@ mod tests {
         );
         assert_eq!(l.caret_position(3), Some((1, 7.0)));
         assert_eq!(l.caret_position(7).unwrap().0, 3);
-
+        t.set_selection(2, 2);
+        assert!(!t.advance_caret(499.0));
+        assert!(t.advance_caret(1.0));
+        assert!(!t.caret_visible);
+        t.set_selection(2, 2);
+        assert!(t.caret_visible);
+        t.set_selection(0, 2);
+        assert!(!t.advance_caret(600.0));
     }
 }

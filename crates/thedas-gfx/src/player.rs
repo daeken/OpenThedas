@@ -152,6 +152,14 @@ impl Player {
     pub fn tick(&mut self, dt_ms: f64) {
         let dt = dt_ms.clamp(0.0, 1000.0);
         self.vm.time_ms += dt;
+        if let Some(t) = self
+            .vm
+            .focus
+            .and_then(|d| self.vm.display.get_mut(d))
+            .and_then(|o| o.text_mut())
+        {
+            self.vm.dirty |= t.advance_caret(dt);
+        }
         self.run_intervals();
         self.accum += dt;
         let mut n = 0;
@@ -1485,8 +1493,7 @@ pub fn set_focus(vm: &mut Vm, d: Option<DisplayId>) {
         .and_then(|o| vm.display.get_mut(o))
         .and_then(|o| o.text_mut())
     {
-        t.caret = None;
-        t.selection_anchor = 0;
+        t.clear_selection();
     }
     if let Some(t) = d
         .and_then(|o| vm.display.get_mut(o))

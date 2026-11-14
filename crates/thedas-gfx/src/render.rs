@@ -1050,10 +1050,64 @@ impl Renderer {
         let shadow_color = t.shadow_color;
         let top_skip = layout.lines.get(scroll).map(|l| l.top).unwrap_or(0.0) - crate::text::GUTTER;
         let mut glyphs = Vec::new();
-        for line in layout.lines.iter().skip(scroll) {
+        let selection = t.caret.map(|_| t.selection());
+        let caret_position = t.caret.and_then(|c| layout.caret_position(c));
+        let mut selection_mesh = m.clone();
+        selection_mesh.vertices.clear();
+        selection_mesh.indices.clear();
+        let mut caret_mesh = selection_mesh.clone();
+        for (line_index, line) in layout.lines.iter().enumerate().skip(scroll) {
             let y = line.top - top_skip;
             if y > bh + 1.0 {
                 break;
+            }
+            if let Some((begin, end)) = selection {
+                let selected: Vec<_> = line
+                    .characters
+                    .iter()
+                    .filter(|c| c.index >= begin && c.index < end)
+                    .collect();
+                if let (Some(first), Some(last)) = (selected.first(), selected.last()) {
+                    let x0 = first.x.max(crate::text::GUTTER);
+                    let x1 = (last.x + last.advance).min(bw - crate::text::GUTTER);
+                    let y1 = (y
+                        + line.ascent
+                        + line.descent
+                        + if end > line.end {
+                            line.height - line.ascent - line.descent
+                        } else {
+                            0.0
+                        })
+                    .min(bh);
+                    if x1 > x0 && y1 > y.max(0.0) {
+                        quad(
+                            &mut selection_mesh,
+                            bx + x0,
+                            by + y.max(0.0),
+                            bx + x1,
+                            by + y1,
+                            [0, 0, 0, 255],
+                        );
+                    }
+                }
+                if begin == end
+                    && t.input
+                    && t.caret_visible
+                    && caret_position.is_some_and(|(i, _)| i == line_index)
+                {
+                    let x = caret_position.unwrap().1;
+                    let c = t.format_at(begin).color;
+                    if x >= 0.0 && x <= bw && y < bh {
+                        quad(
+                            &mut caret_mesh,
+                            bx + x - 0.5,
+                            by + y - 0.5,
+                            bx + x + 0.5,
+                            by + (y + line.ascent + line.descent).min(bh) - 0.5,
+                            [c[0], c[1], c[2], 255],
+                        );
+                    }
+                }
             }
             for g in &line.glyphs {
                 glyphs.push((g.clone(), y - line.top));
@@ -1076,6 +1130,7 @@ impl Renderer {
             .upload(&m, None, 0.0, Matrix::IDENTITY)
             .into_iter()
             .collect();
+        out.extend(self.upload_colored(&selection_mesh, None, 0.0, Matrix::IDENTITY, true));
         m.vertices.clear();
         m.indices.clear();
         let mut shadow_mesh = m.clone();
@@ -1086,7 +1141,15 @@ impl Renderer {
                 let (ox, oy, c) = if pass < shadow.len() {
                     (shadow[pass].0, shadow[pass].1, shadow_color)
                 } else {
-                    (0.0, 0.0, g.color)
+                    (
+                        0.0,
+                        0.0,
+                        if selection.is_some_and(|(b, e)| g.index >= b && g.index < e) {
+                            [255; 3]
+                        } else {
+                            g.color
+                        },
+                    )
                 };
                 let target = if pass < shadow.len() {
                     &mut shadow_mesh
@@ -1109,6 +1172,7 @@ impl Renderer {
         }
         out.extend(self.upload_colored(&shadow_mesh, None, 0.0, Matrix::IDENTITY, true));
         out.extend(self.upload(&m, None, 0.0, Matrix::IDENTITY));
+        out.extend(self.upload(&caret_mesh, None, 0.0, Matrix::IDENTITY));
         self.texts.insert(d, (rev, out.clone()));
         out
     }
@@ -2412,6 +2476,120 @@ mod shadow_tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn selection_and_caret_refresh_cached_text_on_blink_and_focus_changes() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let mut p = blend_player();
+        let font = Arc::new(Font {
+            em: 100.0,
+            glyphs: vec![Glyph {
+                outline: vec![
+                    Record::Style {
+                        move_to: Some((0, 0)),
+                        fill0: None,
+                        fill1: Some(1),
+                        line: None,
+                        new_styles: None,
+                    },
+                    Record::Line { to: (100, 0) },
+                    Record::Line { to: (100, 100) },
+                    Record::Line { to: (0, 100) },
+                    Record::Line { to: (0, 0) },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut text = TextField::new(Arc::new(EditText::default()), None);
+        text.bounds = (0.0, 0.0, 24.0, 20.0);
+        text.background = true;
+        text.background_color = [100; 3];
+        text.default_format.color = [255, 0, 0];
+        text.set_text("a ");
+        text.layout = Some(Layout {
+            lines: vec![Line {
+                start: 0,
+                end: 2,
+                x: 2.0,
+                top: 2.0,
+                height: 10.0,
+                ascent: 8.0,
+                descent: 2.0,
+                characters: vec![
+                    crate::text::CharacterBox {
+                        index: 0,
+                        x: 2.0,
+                        advance: 5.0,
+                    },
+                    crate::text::CharacterBox {
+                        index: 1,
+                        x: 7.0,
+                        advance: 5.0,
+                    },
+                ],
+                glyphs: vec![PlacedGlyph {
+                    index: 0,
+                    font,
+                    glyph: 0,
+                    x: 2.0,
+                    y: 3.0,
+                    size: 4.0,
+                    color: [255, 0, 0],
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut object = crate::display::Object::new(Kind::Text(Box::new(text)));
+        object.parent = Some(p.vm.root);
+        let field = p.vm.display.add(object);
+        p.vm.display
+            .get_mut(p.vm.root)
+            .unwrap()
+            .children
+            .insert(1, field);
+        crate::player::set_focus(&mut p.vm, Some(field));
+        p.vm.display
+            .get_mut(field)
+            .unwrap()
+            .text_mut()
+            .unwrap()
+            .set_selection(0, 2);
+        let mut renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.render_if_dirty(&mut p, &mut Empty, (32, 32));
+        let pixel = |renderer: &Renderer, x: usize, y: usize| {
+            let (_, _, pixels) = renderer.capture().unwrap();
+            pixels[(y * 32 + x) * 4..(y * 32 + x + 1) * 4].to_vec()
+        };
+        assert_eq!(pixel(&renderer, 4, 5), [255, 255, 255, 255]);
+        assert_eq!(pixel(&renderer, 10, 5), [0, 0, 0, 255]);
+        p.vm.display
+            .get_mut(field)
+            .unwrap()
+            .text_mut()
+            .unwrap()
+            .set_selection(2, 2);
+        p.vm.dirty = true;
+        renderer.render_if_dirty(&mut p, &mut Empty, (32, 32));
+        assert_eq!(pixel(&renderer, 4, 5), [255, 0, 0, 255]);
+        assert_ne!(pixel(&renderer, 12, 5), [100, 100, 100, 255]);
+        p.tick(499.0);
+        assert!(!p.take_dirty());
+        p.tick(1.0);
+        renderer.render_if_dirty(&mut p, &mut Empty, (32, 32));
+        assert_eq!(pixel(&renderer, 12, 5), [100, 100, 100, 255]);
+        p.tick(500.0);
+        renderer.render_if_dirty(&mut p, &mut Empty, (32, 32));
+        assert_ne!(pixel(&renderer, 12, 5), [100, 100, 100, 255]);
+        crate::player::set_focus(&mut p.vm, None);
+        renderer.render_if_dirty(&mut p, &mut Empty, (32, 32));
+        assert_eq!(pixel(&renderer, 12, 5), [100, 100, 100, 255]);
     }
 
     #[test]
