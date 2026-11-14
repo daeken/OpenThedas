@@ -215,7 +215,9 @@ impl FaceAnim {
             });
         }
         if r.count()? != n {
-            return Err(FaceFxError::Malformed("key counts for another curve count".into()));
+            return Err(FaceFxError::Malformed(
+                "key counts for another curve count".into(),
+            ));
         }
         let mut curves = Vec::with_capacity(n);
         let mut from = 0usize;
@@ -367,12 +369,7 @@ fn qnormalize(q: Quat) -> Quat {
 /// The identity turned toward `q` by `w` (0 to 1), the short way round.
 fn qtoward(q: Quat, w: f32) -> Quat {
     let q = if q[0] < 0.0 { q.map(|v| -v) } else { q };
-    qnormalize([
-        1.0 + (q[0] - 1.0) * w,
-        q[1] * w,
-        q[2] * w,
-        q[3] * w,
-    ])
+    qnormalize([1.0 + (q[0] - 1.0) * w, q[1] * w, q[2] * w, q[3] * w])
 }
 
 impl FaceActor {
@@ -568,7 +565,12 @@ impl FaceActor {
     pub fn bone_offsets(&self, values: &[f32]) -> Vec<BoneOffset> {
         let mut out = Vec::new();
         for b in &self.bones {
-            let inverse = [b.rotation[0], -b.rotation[1], -b.rotation[2], -b.rotation[3]];
+            let inverse = [
+                b.rotation[0],
+                -b.rotation[1],
+                -b.rotation[2],
+                -b.rotation[3],
+            ];
             let mut t = [0.0f32; 3];
             let mut q: Quat = [1.0, 0.0, 0.0, 0.0];
             let mut moved = false;
@@ -643,7 +645,11 @@ mod tests {
         }
         u(&mut v, 3);
         // jawOpen: 0 at 0 s, 1 at 1 s; Blink: 0.5 throughout.
-        for k in [[0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0], [0.0, 0.5, 0.0, 0.0]] {
+        for k in [
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0, 0.0],
+            [0.0, 0.5, 0.0, 0.0],
+        ] {
             for x in k {
                 f(&mut v, x);
             }
@@ -678,7 +684,10 @@ mod tests {
         for n in 0..good.len() {
             assert!(FaceAnim::parse(&good[..n]).is_err(), "truncated at {n}");
         }
-        assert!(matches!(FaceAnim::parse(b"RIFF...."), Err(FaceFxError::Magic)));
+        assert!(matches!(
+            FaceAnim::parse(b"RIFF...."),
+            Err(FaceFxError::Magic)
+        ));
         let rig = actor();
         for n in 0..rig.len() {
             assert!(FaceActor::parse(&rig[..n]).is_err(), "truncated at {n}");
@@ -698,7 +707,9 @@ mod tests {
         u(&mut v, 0);
         u(&mut v, 1);
         u(&mut v, 1);
-        for x in [0.0, -1.0, -2.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0] {
+        for x in [
+            0.0, -1.0, -2.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0,
+        ] {
             f(&mut v, x);
         }
         u(&mut v, 18);

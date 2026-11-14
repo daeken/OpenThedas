@@ -55,6 +55,7 @@ mod control;
 mod cursor;
 mod cutactors;
 mod cutcam;
+mod faces;
 mod focusnav;
 mod follow;
 mod glb;
@@ -5978,6 +5979,7 @@ fn main() -> Result<()> {
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
     ));
     let mut args = Args::parse();
+    faces::set_language(&args.language);
     // A client's or a test's run sends and fetches nothing (see `upload::online`).
     if args.control.is_some() || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some() {
         upload::set_automated();
