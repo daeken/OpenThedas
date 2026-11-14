@@ -1049,15 +1049,17 @@ pub fn call(
         // DAOrigins.exe 0x666450 -> 0x6a25a0 -> 0x69f030: a creature's
         // 16-bit appearance indexes table 2, column 0xde80b418 (combat tree).
         // The predicate is a case-sensitive substring search, not a creature-kind test
-        // or an exact match of the whole resource name.
+        // or an exact match of the whole resource name. DA2 uses different tree names;
+        // preserve its prior creature-kind answer until its predicate is traced.
         "IsHumanoid" => ok(b(h
             .object(obj(a, 0))
             .filter(|o| o.kind == ObjectKind::Creature)
             .is_some_and(|o| {
-                h.sim.world.tables.get(2, "").is_some_and(|t| {
-                    matches!(t.cell_by_hash(0xde80b418, i64::from(o.appearance as u16)),
-                        Some(Cell::String(s)) if clean(s).contains("combat_humanoid"))
-                })
+                h.sim.game != thedas_vfs::Game::Origins
+                    || h.sim.world.tables.get(2, "").is_some_and(|t| {
+                        matches!(t.cell_by_hash(0xde80b418, i64::from(o.appearance as u16)),
+                            Some(Cell::String(s)) if clean(s).contains("combat_humanoid"))
+                    })
             }))),
         "GetAppearanceType" => ok(Value::Int(h.object(obj(a, 0)).map_or(0, |o| o.appearance))),
         "GetCreatureRank" => ok(Value::Int(h.object(obj(a, 0)).map_or(0, |o| o.rank))),
@@ -5801,11 +5803,25 @@ mod tests {
                 Some(Value::Int(0))
             );
         }
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.world.get_mut(creature).unwrap().appearance = 2;
+        assert_eq!(
+            run(&mut s, creature, "IsHumanoid", &[Value::Object(creature)]),
+            Some(Value::Int(1))
+        );
+        s.game = thedas_vfs::Game::Origins;
         s.world.tables = Arc::new(crate::m2da::Tables::empty());
         assert_eq!(
             run(&mut s, creature, "IsHumanoid", &[Value::Object(creature)]),
             Some(Value::Int(0))
         );
+        s.game = thedas_vfs::Game::DragonAge2;
+        for (target, expected) in [(creature, 1), (placeable, 0), (OBJECT_INVALID, 0)] {
+            assert_eq!(
+                run(&mut s, creature, "IsHumanoid", &[Value::Object(target)]),
+                Some(Value::Int(expected))
+            );
+        }
     }
 
     #[test]
