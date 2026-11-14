@@ -159,7 +159,8 @@ impl Sim {
             crate::inventory::MSG_EQUIP
             | crate::inventory::MSG_UNEQUIP
             | crate::inventory::MSG_NEXT_CHARACTER
-            | crate::inventory::MSG_PREVIOUS_CHARACTER => self.inventory_message(name, args),
+            | crate::inventory::MSG_PREVIOUS_CHARACTER
+            | crate::inventory::MSG_SWITCH_WEAPON_SET => self.inventory_message(name, args),
             crate::store::MSG_BUY | crate::store::MSG_SELL => self.store_message(name, args),
             crate::container::MSG_ACQUIRE
             | crate::container::MSG_ACQUIRE_ALL
