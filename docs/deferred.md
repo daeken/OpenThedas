@@ -41,9 +41,11 @@ original scene before selecting `path = RenderPath::Deferred`.
 Point-shadow cubes retain their previous contents when their exact inputs are unchanged.
 Each slot compares its light position/radius and the eligible casters in reach: geometry
 buffers, transform, posed bounds, bone palette values, opacity test/clip, and immutable
-material texture/sampler handles. A changed slot redraws all six faces; removed/faded
-casters and newly empty slots clear correctly. Camera movement alone can reuse a cube,
-unless it changes slot selection. Resource reloads replace the renderer and its cache.
+material texture/sampler handles. Tree keys also include wind/placement vertex constants,
+leaf orientation, LOD index range and alpha reference. A changed slot redraws all six
+faces; removed/faded casters and newly empty slots clear correctly. Camera movement
+can reuse a cube unless it changes slot selection or a tree's LOD/orientation.
+Resource reloads replace the renderer and its cache.
 `THEDAS_DEFERRED_SHADOW_REUSE=0` redraws every active cube for comparison. Animated or moving
 casters still invalidate every cube they reach; stationary capture gains do not predict
 the same gain during motion.
@@ -92,8 +94,9 @@ worker threads exist. Discard warm-up frames and pair adjacent opposite modes.
    wind/placement vertex shader, instance groups and LOD alpha references. Their authored
    ambient and world normals feed the shared per-pixel lighting, including branch normal
    maps. Leaves retain the original 8-bit LOD cutout rule; bark remains opaque. These
-   surfaces receive runtime shadows and contribute to SSAO depth. Their point-shadow
-   casting remains to come. `THEDAS_DEFERRED_FRONDS=0`, `THEDAS_DEFERRED_BRANCHES=0`,
+   surfaces receive runtime shadows and contribute to SSAO depth. These four families
+   also cast point shadows, including when their colour stays forward.
+   `THEDAS_DEFERRED_FRONDS=0`, `THEDAS_DEFERRED_BRANCHES=0`,
    `THEDAS_DEFERRED_MESH_LEAVES=0` and `THEDAS_DEFERRED_LEAF_CARDS=0` each keep that
    family forward. The material survey and remaining coverage
    are recorded in [the inventory](notes/deferred-material-coverage.md).
@@ -264,10 +267,25 @@ debug views now include the ground. Terrain also joins the point-shadow caster l
   `THEDAS_DEFERRED_SHADOW_CULL=0` restores six submissions per in-range caster for
   comparisons. The lighting pass compares distances with a bilinear 2-by-2 filter, a 4 cm normal
   offset and 2 cm distance bias. Supported skinned objects and terrain cast too; forward
-  materials and trees do not, except for the cutouts below. Static lights keep baked
+  materials do not, except for the trees and cutouts below. Static lights keep baked
   visibility. At most 24 face passes per frame.
   `THEDAS_DEFERRED_POINT_SHADOWS=0` disables both rendering and sampling these maps for
   captures and cost comparisons; it does not change the faithful path.
+- Tree point casters: roomless rigid single-pass fronds, branches, mesh leaves and
+  leaf cards reuse their translated wind/placement shader through a private uniform
+  stream. An identity view-projection returns deformed world positions, then each
+  cube face projects them. The viewing camera still supplies leaf orientation and
+  distance LOD; its frustum and instance groups do not limit casting. Cutout families
+  sample the authored diffuse map/sampler and use the current 8-bit Greater alpha
+  reference. Bark stays opaque, including at zero diffuse alpha. Faded placements
+  and inactive LODs cast nothing. Both faces block point lights. The scene's tree
+  no-cast flag belongs to the faithful sun path; these point casters are independent.
+  Far billboards remain unsupported. `THEDAS_DEFERRED_TREE_SHADOWS=0` disables this
+  addition; the environment control is read once. The renderer-local
+  `THEDAS_BENCH_DEFERRED_COMPARE=tree-shadows` control alternates casting within one
+  load and restores the planned mode afterwards. Enable tree-shadow planning for it.
+  Switching this coverage invalidates affected cubes, so its timings include those
+  redraws. The `faithful` comparison retains steady deferred shadow reuse.
 - Forward cutouts: known Origins `Static1_Punch`, `Prop1_Punch`, alpha-tested `Ch1Alph`,
   `Eye0/Eyelash0`, and the
   colour-disabled `Hair0_Pass1` depth core also cast into point-light cubes, independently
@@ -287,8 +305,8 @@ debug views now include the ground. Terrain also joins the point-shadow caster l
   Casts are deduplicated per scene draw; explicit no-cast flags, current posed bounds,
   fade-outs and cutaway exclusions still apply. Missing opacity maps do not become
   rectangular casters. `THEDAS_DEFERRED_CUTOUT_SHADOWS=0` disables just these additions
-  for comparison. Other material families and the trees' wind/LOD/billboard paths remain
-  unsupported; this does not add cutouts to SSAO or change the faithful sun shadows.
+  for comparison. Other material families and tree billboards remain unsupported;
+  this does not add forward cutouts to SSAO or change the faithful sun shadows.
 - With baked lighting on, static lights and static geometry still depend on `lm.a`.
   The experimental lightmaps-off mode below lets static lights use the point-shadow pool.
 
@@ -319,10 +337,10 @@ switch. Choose it before loading an area. F11 still switches between faithful an
 
 This is a first comparison mode, not a complete replacement for baked lighting. Probes are
 the original baked irradiance and may contain direct illumination; they are not a new GI
-solution. Only deferred surfaces contribute to AO and point shadows, so unsupported
-forward materials and trees are missing from those occluders. Eligible characters,
-placeables and terrain contribute
-to both, and its reflections also stop using baked visibility in this mode. The small point-shadow
+solution. Deferred surfaces contribute to AO; supported forward cutouts and tree
+families also cast point shadows. Other forward families and far tree billboards
+remain missing from those occluders. Eligible characters, placeables and terrain contribute
+to both, and their reflections also stop using baked visibility in this mode. The small point-shadow
 budget, missing occluders, screen edges and coarse room probes can cause light leaks or
 ambient discontinuities. The original baked image remains the default while those are
 addressed. Moving the remaining material families into the G-buffer is still

@@ -7,7 +7,7 @@
 //! of its direction from the light and compares distances with a bilinear 2×2 filter.
 //!
 //! Casters are eligible deferred level, terrain and object draws, including skinned ones.
-//! Forward materials and trees do not cast these shadows yet.
+//! Supported forward cutouts and wind-deformed trees also cast these shadows.
 
 use glam::{Mat4, Vec3, Vec4};
 
@@ -96,6 +96,7 @@ pub(crate) struct Caster<'a> {
 struct CubeInputs {
     light: (Vec3, f32),
     casters: Vec<CasterInputs>,
+    trees: Vec<crate::deferred::tree_shadow::Inputs>,
 }
 
 #[derive(PartialEq)]
@@ -135,6 +136,8 @@ pub(crate) struct ShadowPool {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     buffer: wgpu::Buffer,
+    tree_faces: wgpu::Buffer,
+    tree_group: wgpu::BindGroup,
     /// Slots of [`STRIDE`] the buffer holds.
     capacity: usize,
     culling: Option<bool>,
@@ -143,13 +146,13 @@ pub(crate) struct ShadowPool {
     previous: Vec<CubeInputs>,
     pub(crate) reuse_override: Option<bool>,
     #[cfg(test)]
-    rendered_cubes: usize,
+    pub(crate) rendered_cubes: usize,
     /// Per layer (slot · 6 + face), the colour and depth views drawn into.
     layers: Vec<(wgpu::TextureView, wgpu::TextureView)>,
     /// Every layer, for the lighting pass.
     pub(crate) view: wgpu::TextureView,
     #[cfg(test)]
-    texture: wgpu::Texture,
+    pub(crate) texture: wgpu::Texture,
 }
 
 impl ShadowPool {
@@ -328,10 +331,29 @@ impl ShadowPool {
             ..Default::default()
         });
         let buffer = Self::slots(device, 1);
+        let tree_faces = Self::slots(device, SLOTS * 6);
+        let tree_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tree shadow faces"),
+            entries: &[crate::deferred::tree_shadow::uniform(0, 80)],
+        });
+        let tree_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tree shadow faces"),
+            layout: &tree_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &tree_faces,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(80),
+                }),
+            }],
+        });
         ShadowPool {
             pipeline,
             layout,
             buffer,
+            tree_faces,
+            tree_group,
             capacity: 1,
             culling: None,
             material_layout,
@@ -394,6 +416,7 @@ impl ShadowPool {
         encoder: &mut wgpu::CommandEncoder,
         lights: &[(Vec3, f32)],
         casters: &[Caster<'_>],
+        trees: &[crate::deferred::tree_shadow::Caster],
     ) {
         let reuse = self
             .reuse_override
@@ -410,6 +433,17 @@ impl ShadowPool {
                         .iter()
                         .filter(|c| c.sphere.0.distance(position) < c.sphere.1 + radius)
                         .map(CasterInputs::new)
+                        .collect(),
+                    trees: trees
+                        .iter()
+                        .filter(|tree| {
+                            crate::deferred::tree_shadow::reaches(
+                                tree.inputs.sphere,
+                                position,
+                                radius,
+                            )
+                        })
+                        .map(|tree| tree.inputs.clone())
                         .collect(),
                 })
                 .collect()
@@ -430,11 +464,15 @@ impl ShadowPool {
         // Per layer, its draws: (caster, slot in the buffer).
         let mut data: Vec<u8> = Vec::new();
         let mut layers: Vec<Vec<(usize, u32)>> = Vec::new();
+        let mut tree_layers = Vec::new();
+        let mut tree_faces = Vec::new();
         let cull = self.culling.unwrap_or(crate::config::CONFIG.shadow_cull);
         let mut before = 0;
         for (slot, &(position, radius)) in lights.iter().take(SLOTS).enumerate() {
             if !dirty[slot] {
                 layers.extend((0..6).map(|_| Vec::new()));
+                tree_layers.extend((0..6).map(|_| Vec::new()));
+                tree_faces.resize(tree_faces.len() + 6 * STRIDE, 0);
                 continue;
             }
             let near: Vec<usize> = casters
@@ -464,15 +502,37 @@ impl ShadowPool {
                     data.resize(data.len().next_multiple_of(STRIDE), 0);
                 }
                 layers.push(draws);
+                tree_layers.push(
+                    trees
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, tree)| {
+                            crate::deferred::tree_shadow::reaches(
+                                tree.inputs.sphere,
+                                position,
+                                radius,
+                            ) && (!cull || intersects_face(&planes, tree.inputs.sphere))
+                        })
+                        .map(|(i, _)| i)
+                        .collect::<Vec<_>>(),
+                );
+                tree_faces.extend_from_slice(bytemuck::bytes_of(&view_proj.to_cols_array_2d()));
+                tree_faces
+                    .extend_from_slice(bytemuck::bytes_of(&position.extend(radius).to_array()));
+                tree_faces.resize(tree_faces.len().next_multiple_of(STRIDE), 0);
             }
+        }
+        if !trees.is_empty() {
+            queue.write_buffer(&self.tree_faces, 0, &tree_faces);
         }
         if crate::config::CONFIG.log_lights {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 log::info!(
-                    "deferred shadows: {} draw submissions ({} before face culling)",
+                    "deferred shadows: {} mesh draw submissions ({} before face culling), {} tree draw submissions",
                     layers.iter().map(Vec::len).sum::<usize>(),
-                    before
+                    before,
+                    tree_layers.iter().map(Vec::len).sum::<usize>(),
                 )
             });
         }
@@ -575,6 +635,9 @@ impl ShadowPool {
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.count, 0, 0..1);
             }
+            for &i in &tree_layers[layer] {
+                trees[i].draw(&mut pass, &self.tree_group, (layer * STRIDE) as u32);
+            }
         }
     }
 }
@@ -597,7 +660,7 @@ mod tests {
                 mapped_at_creation: false,
             });
             let mut encoder = device.create_command_encoder(&Default::default());
-            pool.encode(device, &ctx.queue, &mut encoder, lights, &[]);
+            pool.encode(device, &ctx.queue, &mut encoder, lights, &[], &[]);
             for slot in 0..lights.len() {
                 encoder.copy_texture_to_buffer(
                     wgpu::TexelCopyTextureInfo {
@@ -770,6 +833,7 @@ mod tests {
                 &mut encoder,
                 &[light.get()],
                 if present.get() { &casters } else { &[] },
+                &[],
             );
             for (i, x) in [210, 300].into_iter().enumerate() {
                 encoder.copy_texture_to_buffer(

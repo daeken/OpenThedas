@@ -29,6 +29,9 @@ mod light_masks;
 #[path = "deferred_trees.rs"]
 mod trees;
 
+#[path = "deferred_tree_shadow.rs"]
+pub(crate) mod tree_shadow;
+
 pub const DEFERRED_WGSL: &str = concat!(
     include_str!("deferred_skin.wgsl"),
     include_str!("deferred.wgsl")
@@ -209,6 +212,8 @@ struct PlanDraw {
 pub(crate) struct DeferredPass {
     draws: Vec<PlanDraw>,
     trees: trees::Plan,
+    tree_shadows: tree_shadow::Plan,
+    tree_shadows_enabled: Option<bool>,
     cutouts: Vec<crate::deferred_cutout::Draw>,
     cutout_materials: Vec<crate::deferred_cutout::Material>,
     data: Vec<DrawData>,
@@ -255,6 +260,7 @@ pub(crate) struct Contributor<'a> {
 
 struct Gpu {
     trees: trees::Gpu,
+    tree_shadows: tree_shadow::Gpu,
     /// By cull mode: none, back, front.
     gbuffer: [wgpu::RenderPipeline; 3],
     gbuffer_opaque: [wgpu::RenderPipeline; 3],
@@ -757,6 +763,7 @@ impl DeferredPass {
             &mut skin_count,
         );
         let trees = trees::Plan::new(scene, d3d, &mut takes);
+        let tree_shadows = tree_shadow::Plan::new(scene, d3d);
         if crate::config::CONFIG.log_materials {
             // Count planned faithful passes, including offscreen and inactive LODs.
             // Keep this at load time so even large foliage scenes pay once.
@@ -832,6 +839,8 @@ impl DeferredPass {
         (!draws.is_empty() || !cutouts.is_empty() || !trees.is_empty()).then(|| DeferredPass {
             draws,
             trees,
+            tree_shadows,
+            tree_shadows_enabled: None,
             cutouts,
             cutout_materials,
             data,
@@ -911,6 +920,10 @@ impl DeferredPass {
 
     pub(crate) fn set_fronds(&mut self, enabled: Option<bool>) {
         self.trees.set_enabled(trees::Family::Fronds, enabled);
+    }
+
+    pub(crate) fn set_tree_shadows(&mut self, enabled: Option<bool>) {
+        self.tree_shadows_enabled = enabled;
     }
 
     /// Sets the lights only this pass draws (see [`DeferredPass::effect_lights`]).
@@ -1475,6 +1488,7 @@ impl DeferredPass {
         });
         Gpu {
             trees: self.trees.build(device, &frame_buffer),
+            tree_shadows: self.tree_shadows.build(device),
             gbuffer,
             gbuffer_opaque,
             gbuffer_static,
@@ -1990,6 +2004,32 @@ impl DeferredPass {
         }
         if !faces.is_empty() {
             ctx.queue.write_buffer(&gpu.faces_buffer, 0, &faces);
+            let mut trees = Vec::new();
+            if self
+                .tree_shadows_enabled
+                .unwrap_or(crate::config::CONFIG.tree_shadows)
+            {
+                trees = self.tree_shadows.casters(
+                    &mut gpu.tree_shadows,
+                    ctx,
+                    d3d,
+                    meshes,
+                    camera,
+                    &shadowed,
+                );
+                for c in contributors.iter_mut() {
+                    if let Some(g) = c.pass.gpu.as_mut() {
+                        trees.extend(c.pass.tree_shadows.casters(
+                            &mut g.tree_shadows,
+                            ctx,
+                            c.d3d,
+                            c.meshes,
+                            camera,
+                            &shadowed,
+                        ));
+                    }
+                }
+            }
             let mut casters = casters(
                 &self.draws,
                 &self.cutouts,
@@ -2006,7 +2046,7 @@ impl DeferredPass {
             let pool = gpu.shadows.as_mut().expect("point shadows");
             pool.set_culling(self.culling.map(|c| c[1]));
             pool.reuse_override = self.shadow_reuse;
-            pool.encode(device, &ctx.queue, encoder, &shadowed, &casters);
+            pool.encode(device, &ctx.queue, encoder, &shadowed, &casters, &trees);
         }
         if let Some(p) = profile.as_deref_mut() {
             p.stage(ctx, encoder, "point_shadows");

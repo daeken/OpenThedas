@@ -51,7 +51,7 @@ fn constant(name: &str, register: u16, set: RegisterSet) -> Constant {
     }
 }
 
-fn program(family: Family, instanced: bool) -> D3dProgram {
+pub(in crate::deferred) fn program(family: Family, instanced: bool) -> D3dProgram {
     let declarations = if instanced {
         format!(
             r#"{}
