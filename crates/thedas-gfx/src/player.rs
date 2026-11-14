@@ -3000,6 +3000,54 @@ mod queue_tests {
     }
 
     #[test]
+    fn array_sort_ties_follow_flash_partition_order_and_descending_reversal() {
+        let (mut p, _) = input_player();
+        for (sort_on, descending, expected) in [
+            (false, false, vec![3, 1, 0, 2, 4]),
+            (false, true, vec![4, 2, 0, 1, 3]),
+            (true, false, vec![3, 1, 0, 2, 4]),
+        ] {
+            let mut rows = Vec::new();
+            for (id, rank) in [1, 0, 1, 0, 1].into_iter().enumerate() {
+                let row = Value::Object(p.vm.new_object());
+                p.vm.set(&row, "id", Value::Number(id as f64));
+                p.vm.set(&row, "rank", Value::Number(rank as f64));
+                rows.push(row);
+            }
+            let array = Value::Object(p.vm.new_array(rows));
+            if sort_on {
+                p.vm.call_method(
+                    &array,
+                    "sortOn",
+                    &[Value::from("rank"), Value::Number(16.0)],
+                );
+            } else {
+                let comparator = p.vm.new_native(|vm, _, args| {
+                    let a = vm.get(&args[0], "rank");
+                    let b = vm.get(&args[1], "rank");
+                    Value::Number(vm.to_number(&a) - vm.to_number(&b))
+                });
+                p.vm.call_method(
+                    &array,
+                    "sort",
+                    &[
+                        Value::Object(comparator),
+                        Value::Number(if descending { 2.0 } else { 0.0 }),
+                    ],
+                );
+            }
+            let ids: Vec<_> = (0..5)
+                .map(|i| {
+                    let row = p.vm.get(&array, &i.to_string());
+                    let id = p.vm.get(&row, "id");
+                    p.vm.to_number(&id) as i32
+                })
+                .collect();
+            assert_eq!(ids, expected);
+        }
+    }
+
+    #[test]
     fn zero_and_negative_goto_calls_leave_the_frame_and_play_state_unchanged() {
         let (mut p, _) = input_player();
         let root = p.vm.root;
