@@ -65,6 +65,7 @@ mod icon;
 mod intro;
 mod journal;
 mod launcher;
+mod launcher_control;
 mod launcher_download;
 mod live;
 mod looks;
@@ -286,6 +287,12 @@ struct Args {
     /// Pixels per point for `--launcher-capture`.
     #[arg(long, hide = true, default_value_t = 1.0)]
     launcher_scale: f32,
+    /// Drive the launcher (implies `--launcher`): steps separated by `;`, played through its
+    /// accessibility tree, e.g. `click Search this computer; wait; tree; click Continue`.
+    /// See `launcher_control.rs` for the steps. With `--launcher`, `--control` takes the same
+    /// commands as JSON requests.
+    #[arg(long)]
+    launcher_steps: Option<String>,
 }
 
 /// Behind and above a hero at `pos` with the game's `facing`, looking the same way (as the
@@ -6249,8 +6256,27 @@ fn main() -> Result<()> {
         || !args.steps.is_empty()
         || args.check_report.is_some()
         || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some();
-    if args.launcher || (install.is_none() && !headless) {
-        if let Some(launch) = launcher::run(args.launcher)? {
+    let driven = args.launcher_steps.is_some();
+    if args.launcher || driven || (install.is_none() && !headless) {
+        // Driven only when asked for the launcher: `--control` alone still drives the game.
+        let script = if args.launcher || driven {
+            let steps = match &args.launcher_steps {
+                Some(s) => launcher_control::parse_steps(s)?,
+                None => Vec::new(),
+            };
+            let control = match &args.control {
+                Some(addr) => {
+                    let c = control::Control::listen(addr)?;
+                    log::info!("launcher control listening on {}", c.addr);
+                    Some(c)
+                }
+                None => None,
+            };
+            (driven || control.is_some()).then(|| launcher_control::Script::new(steps, control))
+        } else {
+            None
+        };
+        if let Some(launch) = launcher::run(args.launcher || driven, script)? {
             launch.spawn()?;
         }
         return Ok(());
