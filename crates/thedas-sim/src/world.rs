@@ -353,6 +353,13 @@ pub struct Effect {
     /// The engine data vectors scripts set (`SetEffectEngineVector`), by index.
     #[serde(default)]
     pub engine_vectors: Vec<(i32, [f32; 3])>,
+    /// The animation `SetEffectAnimation` gave it (DAOrigins.exe keeps it at effect +0x34).
+    /// Kept for presentation; the simulation does not read it.
+    #[serde(default)]
+    pub animation: i32,
+    /// The flags `SetEffectFlags` gave it (effect +0x3c). Kept; not read yet.
+    #[serde(default)]
+    pub flags: i32,
 }
 
 /// A visual effect applied at a place (`Engine_ApplyEffectAtLocation` with an

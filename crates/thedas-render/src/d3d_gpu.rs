@@ -1280,6 +1280,13 @@ fn create_pipeline_faded(
     faded: bool,
     samples: u32,
 ) -> wgpu::RenderPipeline {
+    // Multisampled, an opaque cut-out's edge goes to coverage (see
+    // `D3dProgram::ps_coverage`).
+    let coverage = samples > 1 && !faded && program.ps_coverage.is_some();
+    let ps_source = match &program.ps_coverage {
+        Some(w) if coverage => w.clone(),
+        _ => program.ps.wgsl.clone(),
+    };
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(&program.name),
         bind_group_layouts: &[Some(consts), Some(textures)],
@@ -1291,7 +1298,7 @@ fn create_pipeline_faded(
     });
     let ps = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(&program.name),
-        source: wgpu::ShaderSource::Wgsl(program.ps.wgsl.clone().into()),
+        source: wgpu::ShaderSource::Wgsl(ps_source.into()),
     });
     let inputs = &program.vs.interface.inputs;
     let attributes: Vec<wgpu::VertexAttribute> = inputs
@@ -1382,6 +1389,7 @@ fn create_pipeline_faded(
         }),
         multisample: wgpu::MultisampleState {
             count: samples.max(1),
+            alpha_to_coverage_enabled: coverage,
             ..Default::default()
         },
         fragment: Some(wgpu::FragmentState {

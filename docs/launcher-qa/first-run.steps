@@ -1,0 +1,80 @@
+# First run, start to finish, on stand-in installs (folders only: no game data). Played by
+# run.sh in a scratch home with a scratch settings file, so it changes nothing of the
+# player's. Each `expect` fails the run when the page is not as said.
+
+mkinstall ${HOME}/Games/Dragon Age Origins
+mkinstall ${SCRATCH}/Elsewhere/Dragon Age II da2
+run 300
+
+# Welcome
+expect page Welcome
+expect heading Welcome
+expect text Search this computer
+expect text Download Dragon Age: Origins from GOG
+expect no text Download Dragon Age II from GOG
+shot ${OUT}/01-welcome.png
+
+# Search finds the install under the home folder
+click Search this computer
+wait
+expect page Search
+expect heading Found 1 install
+expect text Dragon Age Origins
+expect enabled Continue
+shot ${OUT}/02-search.png
+
+# Back and forth keeps the page right
+click Back
+expect page Welcome
+click Search this computer
+wait
+expect heading Found 1 install
+
+# Add the second game by hand through the folder dialog
+choose ${SCRATCH}/Elsewhere/Dragon Age II
+# (picking a folder adds it and goes on to the DLC keys step)
+click Pick a folder…
+run 300
+expect page Keys
+expect text Dragon Age II
+shot ${OUT}/03-keys.png
+
+# The DLC keys step, then finish
+expect heading Downloadable content
+click Finish
+run 300
+expect page Play
+expect installs 2
+expect text Play Dragon Age
+shot ${OUT}/05-play.png
+
+# Play reports what it would start (dry run) and the launcher stays open
+click Play Dragon Age
+run 300
+expect launch dragon age origins
+expect launch --language
+expect message Would start
+expect no text Dragon Age is no longer
+
+# The tabs
+click Games
+expect page Games
+expect heading Your games
+expect text Remove Dragon Age II
+click Mods
+expect page Mods
+expect heading Mods
+click Settings
+expect page Settings
+expect heading Settings
+expect text Voice language
+shot ${OUT}/06-settings.png
+click Play
+expect page Play
+
+# Remove the second game again
+click Games
+click Remove Dragon Age II
+run 300
+expect installs 1
+quit

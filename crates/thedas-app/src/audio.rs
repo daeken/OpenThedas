@@ -2051,6 +2051,14 @@ impl GameAudio {
         }
     }
 
+    /// The line whose voice-over is playing and how far into its sample it is (seconds),
+    /// once its sample plays (for the speaker's lip sync).
+    pub fn voice_position(&self) -> Option<(u32, f64)> {
+        let (line, handle, _) = self.voice.as_ref()?;
+        let (at, _) = self.engine.position((*handle)?)?;
+        Some((line.strref, at))
+    }
+
     /// How long the current conversation line's voice-over runs (milliseconds), once known.
     pub fn voice_ms(&self) -> Option<f64> {
         self.voice.as_ref().and_then(|v| v.2)

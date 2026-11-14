@@ -67,6 +67,7 @@ mod journal;
 mod launcher;
 mod launcher_control;
 mod launcher_download;
+mod launcher_mods;
 mod live;
 mod looks;
 mod modconv;
@@ -232,9 +233,10 @@ struct Args {
     detail: String,
     /// Multisampled anti-aliasing for the world: samples a pixel (the original's
     /// `AntialiasingLevel`; 1 is off, which leaves the post-process smoothing on). Limited to
-    /// what the GPU supports.
-    #[arg(long, default_value_t = 1)]
-    antialiasing: u32,
+    /// what the GPU supports. Without it the window plays at the Options screen's choice (4x
+    /// unless the player chose another) and headless runs draw without it.
+    #[arg(long)]
+    antialiasing: Option<u32>,
     /// Headless: the shaders' clock (`ApplicationTime`) at the capture, in seconds; it runs
     /// on from there through `run` steps. The clouds drift with it.
     #[arg(long, default_value_t = 0.0)]
@@ -298,6 +300,10 @@ struct Args {
     /// commands as JSON requests.
     #[arg(long)]
     launcher_steps: Option<String>,
+    /// Drive the launcher from a script file (implies `--launcher`): the same steps, one or
+    /// more to a line, `#` lines ignored. See `docs/launcher.md`.
+    #[arg(long)]
+    launcher_script: Option<PathBuf>,
 }
 
 /// Behind and above a hero at `pos` with the game's `facing`, looking the same way (as the
@@ -1277,6 +1283,12 @@ impl App {
         if let Some(path) = &self.settings {
             ui.set_settings_file(path.clone());
         }
+        // The anti-aliasing slider offers what the device draws the world with; the choice
+        // (4x unless the player chose) is the world's samples (see `sync_antialiasing`).
+        ui.set_antialias_samples(
+            thedas_render::msaa::supported_samples(&ctx.adapter, config.format),
+            !upload::automated(),
+        );
         if let (Some(live), Some(_)) = (&self.live, &self.screens) {
             ui.attach(&live.sim);
             ui.set_saves(saves::SaveStore::new(self.saves_dir.clone()));
@@ -1599,6 +1611,19 @@ impl App {
             }
         }
         g.ui.set_pad_active(self.pad.used);
+        // The world's samples follow the Options screen's choice, unless `--antialiasing`
+        // gave them: new games take it, a running one at its next level build.
+        if !live::ANTIALIASING_FORCED.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(n) = g.ui.antialiasing()
+        {
+            let was = live::ANTIALIASING.swap(n, std::sync::atomic::Ordering::Relaxed);
+            if was != n {
+                log::info!("anti-aliasing: {n} samples a pixel, from the next level build");
+            }
+            if let Some(live) = self.live.as_mut() {
+                live.antialiasing = n;
+            }
+        }
         let hovered = self.hovered_creature();
         if let Some(live) = self.live.as_mut() {
             live.set_hovered(hovered);
@@ -4976,6 +5001,8 @@ fn audio_state(
     let Some(live) = live else {
         return state;
     };
+    // The voice playing keeps the speaker's lip sync in time with it.
+    live.set_voice_position(a.voice_position());
     // The loading frame is up: the world's sounds duck as in the exe's loading mode.
     state.loading = live.loading();
     state.paused = live.paused;
@@ -5115,12 +5142,19 @@ fn audio_state(
         }
     }
     // Lines said in passing, at their speakers' heads.
+    let mut passing = Vec::new();
     {
         let sim = live.sim();
         for l in ambient {
             let Some(strref) = l.strref else {
                 continue;
             };
+            passing.push(faces::SpokenLine {
+                speaker: l.speaker,
+                dialog: l.dialog.clone(),
+                strref,
+                female: l.female,
+            });
             let at = sim.world.get(l.speaker).map(|o| {
                 let p = o.position;
                 [p[0], p[1], p[2] + live.head_height(o.id)]
@@ -5135,6 +5169,9 @@ fn audio_state(
                 at,
             ));
         }
+    }
+    for line in &passing {
+        live.say_in_passing(line);
     }
     // Sounds the simulation asked for (scripts, character creation's voice preview).
     {
@@ -6220,7 +6257,11 @@ fn main() -> Result<()> {
     let mut args = Args::parse();
     faces::set_language(&args.language);
     live::ANTIALIASING.store(
-        args.antialiasing.max(1),
+        args.antialiasing.unwrap_or(1).max(1),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    live::ANTIALIASING_FORCED.store(
+        args.antialiasing.is_some(),
         std::sync::atomic::Ordering::Relaxed,
     );
     // A client's or a test's run sends and fetches nothing (see `upload::online`).
@@ -6269,14 +6310,20 @@ fn main() -> Result<()> {
         || !args.steps.is_empty()
         || args.check_report.is_some()
         || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some();
-    let driven = args.launcher_steps.is_some();
+    let driven = args.launcher_steps.is_some() || args.launcher_script.is_some();
     if args.launcher || driven || (install.is_none() && !headless) {
         // Driven only when asked for the launcher: `--control` alone still drives the game.
         let script = if args.launcher || driven {
-            let steps = match &args.launcher_steps {
-                Some(s) => launcher_control::parse_steps(s)?,
+            let mut steps = match &args.launcher_script {
+                Some(f) => launcher_control::parse_script(
+                    &std::fs::read_to_string(f)
+                        .with_context(|| format!("reading {}", f.display()))?,
+                )?,
                 None => Vec::new(),
             };
+            if let Some(s) = &args.launcher_steps {
+                steps.extend(launcher_control::parse_steps(s)?);
+            }
             let control = match &args.control {
                 Some(addr) => {
                     let c = control::Control::listen(addr)?;
