@@ -12,9 +12,11 @@
 //!   appearance with the stealthed flag, on which rules_core runs its own detection check.
 //!   The scripts also end stealth themselves (after an attack, when targeted, on detection).
 //!   Walls (`nav::wall_between`) and closed doors block noticing.
-//! - **Game mode.** The party seeing living hostiles switches `GM_EXPLORE` to `GM_COMBAT`
-//!   and back, with `GAMEMODE_CHANGE` to the module; the scripts end combat (and get fallen
-//!   party members up) on the change back.
+//! - **Game mode.** The scripts switch `GM_EXPLORE` to `GM_COMBAT` and back with
+//!   `SetGameMode` (rules_core asks the module when a follower perceives a hostile; the
+//!   module's end-of-fight check returns to explore and gets fallen members up). The engine
+//!   only applies the change and tells the module with `GAMEMODE_CHANGE`
+//!   ([`Sim::update_game_mode`] keeps the harness's view of the fight).
 //! - **Hostility.** Creatures are hostile when their groups are set hostile with
 //!   `SetGroupHostility`.
 //! - **Attacks.** When a `CommandAttack` reaches the front of the queue, its owner gets
@@ -1359,6 +1361,20 @@ impl Sim {
         };
         for hand in 0..2 {
             let hit = result.results[hand];
+            // Dragon Age II's rules_core gives an ordinary blow no result (0) and its damage
+            // as an impact effect, and its impact handler deals the damage only for a result:
+            // the engine settles the blow. Here such a blow lands as a hit
+            // (`COMBAT_RESULT_HIT`). Provisional: read from DA2's rules_core (its attack
+            // function sets a result only for deathblows); how DragonAge2.exe decides a hit
+            // or a miss is not traced, so DA2 blows never miss.
+            let da2_blow = self.game == thedas_vfs::Game::DragonAge2
+                && hit == 0
+                && result.effects[hand].iter().any(|e| e.ty == 1024);
+            let hit = if da2_blow {
+                constant_of(self, "COMBAT_RESULT_HIT")
+            } else {
+                hit
+            };
             if hit == 0 || !self.alive(id) {
                 continue;
             }
