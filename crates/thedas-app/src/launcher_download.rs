@@ -11,7 +11,8 @@ use egui::{Color32, RichText};
 use thedas_launcher::config::GameKind;
 use thedas_store::{Event, Job, Login, Reply, Request, Secret, Store, gog, size_text};
 
-use crate::launcher::{BAD, GOLD, GOLD_DIM, big_button, tilde};
+use crate::launcher::{BAD, GOLD, GOLD_DIM, big_button, heading, live, tilde};
+use egui::accesskit::Live;
 
 /// Voice-over languages the stores offer, as the game names them.
 const LANGUAGES: &[(&str, &str)] = &[
@@ -55,6 +56,8 @@ struct Run {
     qr: Option<(String, Option<egui::TextureHandle>)>,
     guard: Option<bool>,
     wrong_guard: bool,
+    /// The guard code field was just asked for: it takes keyboard focus once.
+    focus_guard: bool,
     mobile: bool,
     signed_in: bool,
     plan: Option<(u64, u64)>,
@@ -125,6 +128,7 @@ impl Download {
                 Event::NeedGuardCode { email } => {
                     r.guard = Some(email);
                     r.wrong_guard = false;
+                    r.focus_guard = true;
                 }
                 Event::WrongGuardCode => r.wrong_guard = true,
                 Event::NeedMobileConfirm => r.mobile = true,
@@ -201,7 +205,7 @@ impl Download {
     pub fn draw(&mut self, ui: &mut egui::Ui) -> Option<Want> {
         let mut want = None;
         ui.add_space(8.0);
-        ui.label(RichText::new("Download the game").size(24.0).color(GOLD));
+        heading(ui, "Download the game", 24.0);
         ui.add_space(4.0);
         notice(ui, self.store);
         ui.add_space(10.0);
@@ -392,15 +396,16 @@ impl Download {
         }
         ui.horizontal(|ui| {
             ui.spinner();
-            ui.label(RichText::new(&r.status).size(18.0));
+            let l = ui.label(RichText::new(&r.status).size(18.0));
+            live(&l, Live::Polite);
         });
         if let Some((url, tex)) = &mut r.qr {
             let tex = tex.get_or_insert_with(|| qr_texture(ui.ctx(), url));
             ui.add_space(6.0);
-            ui.add(egui::Image::new(egui::load::SizedTexture::new(
-                tex.id(),
-                [240.0, 240.0],
-            )));
+            ui.add(
+                egui::Image::new(egui::load::SizedTexture::new(tex.id(), [240.0, 240.0]))
+                    .alt_text("QR code for signing in. Scan it with the Steam app on your phone."),
+            );
             ui.label(RichText::new("Steam app → Steam Guard → scan the QR code").color(GOLD_DIM));
         }
         if r.mobile {
@@ -422,6 +427,9 @@ impl Download {
                             .desired_width(120.0),
                     )
                     .labelled_by(l.id);
+                if std::mem::take(&mut r.focus_guard) {
+                    resp.request_focus();
+                }
                 send = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 send |= ui.button("Send").clicked();
             });
@@ -446,7 +454,11 @@ impl Download {
                 0.0
             };
             ui.add_space(6.0);
-            ui.add(egui::ProgressBar::new(frac).desired_width(ui.available_width().min(600.0)));
+            ui.add(
+                egui::ProgressBar::new(frac)
+                    .desired_width(ui.available_width().min(600.0))
+                    .text(format!("{:.0}%", frac * 100.0)),
+            );
             let mut line = format!(
                 "{} of {} ({} files)",
                 size_text(done),
@@ -493,7 +505,7 @@ impl Download {
     /// For screenshots: mid-download state is drawn as if running.
     pub fn draw_demo(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
-        ui.label(RichText::new("Download the game").size(24.0).color(GOLD));
+        heading(ui, "Download the game", 24.0);
         ui.add_space(4.0);
         notice(ui, self.store);
         ui.add_space(10.0);

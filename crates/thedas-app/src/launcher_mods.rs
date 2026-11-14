@@ -11,7 +11,7 @@ use egui::RichText;
 use thedas_vfs::install::{DaoInstall, TextureQuality};
 use thedas_vfs::mods::{self, Fight, ModList, ModStats};
 
-use crate::launcher::{BAD, GOLD_DIM, named};
+use crate::launcher::{BAD, GOLD_DIM, heading, live, named};
 
 /// The most conflicts one layer's file list shows.
 const SHOWN: usize = 200;
@@ -120,11 +120,7 @@ impl ModReport {
     /// the list has unsaved changes (the game, and so this scan, reads the saved list).
     pub fn draw(&mut self, ui: &mut egui::Ui, root: Option<&PathBuf>, dirty: bool) {
         ui.add_space(12.0);
-        ui.label(
-            RichText::new("What your mods do")
-                .size(18.0)
-                .color(crate::launcher::GOLD),
-        );
+        heading(ui, "What your mods do", 18.0);
         let Some(root) = root else {
             ui.label("Choose a game on the Play page to see how your mods change it.");
             return;
@@ -147,7 +143,8 @@ impl ModReport {
             }
             if running {
                 ui.spinner();
-                ui.label("Reading your mods (a big archive is unpacked the first time)…");
+                let r = ui.label("Reading your mods (a big archive is unpacked the first time)…");
+                live(&r, egui::accesskit::Live::Polite);
             }
         });
         let mut show: Option<usize> = None;
