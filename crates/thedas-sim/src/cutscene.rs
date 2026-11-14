@@ -26,6 +26,7 @@ use thedas_formats::Gff4;
 use thedas_formats::gff4::{List, StructId, Value};
 
 const FIELD_SECONDS: u32 = 5000;
+const FIELD_END_SCRIPT: u32 = 5001;
 const FIELD_ACTORS: u32 = 5200;
 const FIELD_ACTOR_NAME: u32 = 2;
 const FIELD_TRACKS: u32 = 5206;
@@ -177,6 +178,18 @@ impl Cutscene {
             .rev()
             .find(|l| l.start <= seconds && seconds < l.end)
     }
+}
+
+/// The completion script named by the cutscene, including DA2's LINE wrapper. The
+/// DA2 loader (0x59d15a) reads field 5001 into the cutscene's string member at +0xf0.
+/// For example, the voyage names a script that performs the transition to the Gallows.
+/// Its execution context and ordering are still provisional; see `Sim::close_cutscene`.
+pub fn end_script(g: &Gff4) -> Option<String> {
+    let root = cut_root(g)?;
+    g.field(root, FIELD_END_SCRIPT)
+        .and_then(Value::as_str)
+        .map(|s| s.trim_end_matches('\0').trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// A spoken line of a cutscene that says a conversation's line rather than its own text:
@@ -648,5 +661,23 @@ mod tests {
         assert_eq!(cut_root(&other), None);
         // Any other file type is not a cutscene, as before.
         assert_eq!(cut_root(&cut(b"DLG ", 10.0)), None);
+    }
+
+    #[test]
+    fn completion_script_comes_from_the_wrapped_cutscene() {
+        let mut g = line_file(1.0);
+        assert_eq!(end_script(&g), None);
+        g.templates[0].fields.push(FieldDef {
+            label: FIELD_END_SCRIPT,
+            type_code: 14,
+            flags: 0,
+            offset: 0,
+        });
+        g.structs[0]
+            .values
+            .push(Value::String(Some(" voyage_end\0".into())));
+        assert_eq!(end_script(&g).as_deref(), Some("voyage_end"));
+        *g.structs[0].values.last_mut().unwrap() = Value::String(Some("\0".into()));
+        assert_eq!(end_script(&g), None);
     }
 }

@@ -88,12 +88,29 @@ impl Sim {
         }
     }
 
+    /// DA2's current setter (0x5bd800) reserves a percentage of the nominal total:
+    /// health's reservation is property 8, stamina's is 11 (0x5d7e2c).
+    /// The total query itself still reports the nominal maximum.
+    pub(crate) fn depletable_current_ceiling(&self, id: ObjectId, property: i32) -> f32 {
+        let max = self.property_total(id, property).max(0.0);
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            let reserved = match property {
+                7 => 8,
+                10 => 11,
+                _ => return max,
+            };
+            max * (1.0 - self.property_total(id, reserved).clamp(0.0, 100.0) * 0.01)
+        } else {
+            max
+        }
+    }
+
     /// Origins' depletable current setter (0x79c8d0): floor first, then total,
     /// including a total below the floor or unordered. Only health's floor is
     /// changed by SetImmortal; the flag alone does not establish that floor.
     pub(crate) fn clamped_current(&self, id: ObjectId, property: i32, value: f32) -> f32 {
-        let total = self.property_total(id, property);
         if self.game == thedas_vfs::Game::Origins {
+            let total = self.property_total(id, property);
             let floor = if property == 7
                 && self
                     .world
@@ -107,7 +124,7 @@ impl Sim {
             let floored = if value > floor { value } else { floor };
             if total > floored { floored } else { total }
         } else {
-            value.clamp(0.0, total.max(0.0))
+            value.clamp(0.0, self.depletable_current_ceiling(id, property))
         }
     }
 

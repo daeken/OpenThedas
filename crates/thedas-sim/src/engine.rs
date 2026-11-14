@@ -1425,7 +1425,20 @@ pub fn call(
         "GetDistanceBetween" => {
             let (x, y) = (h.object(obj(a, 0)), h.object(obj(a, 1)));
             ok(Value::Float(match (x, y) {
-                (Some(x), Some(y)) if x.area == y.area => dist(x.position, y.position),
+                (Some(x), Some(y)) if x.area == y.area => {
+                    let distance = dist(x.position, y.position);
+                    if h.sim.game == thedas_vfs::Game::DragonAge2
+                        && int(a, 2) != 0
+                        && x.kind == ObjectKind::Creature
+                        && y.kind == ObjectKind::Creature
+                    {
+                        // 0x4db770 subtracts both personal spaces when asked;
+                        // overlapping creatures may return a negative distance.
+                        distance - h.sim.body_radius(x.id) - h.sim.body_radius(y.id)
+                    } else {
+                        distance
+                    }
+                }
                 _ => -1.0,
             }))
         }
@@ -1977,12 +1990,22 @@ pub fn call(
         // (0x66cd00 -> 0x79c8d0). That setter clamps between the property's current floor
         // and computed total. Mana's floor stays at its initialized zero; the immortality
         // setter changes health's floor only (0x6ad130). See notes/mana-property-floor.md.
-        "GetCreatureMana" | "GetCreatureMaxMana" => {
-            let (id, p) = (obj(a, 0), PROPERTY_MANA_STAMINA);
+        // DA2's renamed stamina calls use property 10: 0x4fb030 reads current,
+        // 0x4fb110 reads total, and both truncate to int (-1 for a non-creature).
+        "GetCreatureMana"
+        | "GetCreatureMaxMana"
+        | "GetCreatureStamina"
+        | "GetCreatureMaxStamina" => {
+            let id = obj(a, 0);
+            let p = if name.ends_with("Stamina") {
+                10
+            } else {
+                PROPERTY_MANA_STAMINA
+            };
             let creature = h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature);
             ok(Value::Int(if !creature {
                 -1
-            } else if name == "GetCreatureMana" {
+            } else if matches!(name, "GetCreatureMana" | "GetCreatureStamina") {
                 h.object(id)
                     .and_then(|o| o.properties.get(&p))
                     .map_or(0.0, |v| v.1) as i32
@@ -1990,14 +2013,30 @@ pub fn call(
                 h.sim.property_total(id, p) as i32
             }))
         }
-        "SetCreatureMana" => {
-            let (id, p) = (obj(a, 0), PROPERTY_MANA_STAMINA);
-            let origins = h.sim.game == thedas_vfs::Game::Origins;
+        "SetCreatureMana" | "SetCreatureStamina" => {
+            // DA2 0x4fb0a0 passes the integer as a float to property 10's current setter.
+            let id = obj(a, 0);
+            let p = if name == "SetCreatureStamina" {
+                10
+            } else {
+                PROPERTY_MANA_STAMINA
+            };
+            let origins = name == "SetCreatureMana" && h.sim.game == thedas_vfs::Game::Origins;
             if h.object(id).is_some_and(|o| {
                 o.kind == ObjectKind::Creature && (!origins || o.properties.contains_key(&p))
             }) {
                 let requested = int(a, 1) as f32;
-                let current = h.sim.clamped_current(id, p, requested);
+                let current = if origins {
+                    h.sim.clamped_current(id, p, requested)
+                } else {
+                    let mut total = h.sim.property_total(id, p);
+                    if name == "SetCreatureStamina" {
+                        // Retain DA2's reserved-stamina setter, including its clamp order.
+                        let reserved = h.sim.property_total(id, 11).clamp(0.0, 100.0);
+                        total *= 1.0 - reserved * 0.01;
+                    }
+                    requested.clamp(0.0, total.max(0.0))
+                };
                 if let Some(o) = h.sim.world.get_mut(id) {
                     o.properties.entry(p).or_insert((0.0, 0.0)).1 = current;
                 }
@@ -4120,8 +4159,12 @@ pub fn call(
                     .get("EVENT_TARGET")
                     .copied()
                     .unwrap_or(caller);
-                let ms = p.fields.get("FlightMs").copied().unwrap_or(0).max(0) as u64;
-                h.sim.world.queue_event(ms, target, ev, None);
+                if h.sim.game == thedas_vfs::Game::DragonAge2 {
+                    h.sim.world.set_projectile_impact_event(proj, target, ev);
+                } else {
+                    let ms = p.fields.get("FlightMs").copied().unwrap_or(0).max(0) as u64;
+                    h.sim.world.queue_event(ms, target, ev, None);
+                }
             }
             void()
         }
@@ -4327,9 +4370,12 @@ pub fn call(
             }
             void()
         }
-        "IsAbilityAvailable" => ok(b(h
-            .object(obj(a, 0))
-            .is_some_and(|o| o.abilities.contains(&int(a, 1))))),
+        "IsAbilityAvailable" => ok(b(if h.sim.game == thedas_vfs::Game::DragonAge2 {
+            h.sim.da2_ability_available(obj(a, 0), int(a, 1))
+        } else {
+            h.object(obj(a, 0))
+                .is_some_and(|o| o.abilities.contains(&int(a, 1)))
+        })),
         "LoadItemsFromTemplate" => {
             h.sim
                 .load_items_from_template(obj(a, 0), &string(a, 1), int(a, 2) != 0);
@@ -4560,12 +4606,9 @@ pub fn call(
         }
         "SetCanLevelUp" => {
             let who = obj(a, 0);
-            let points: f32 = [34, 35, 36]
-                .iter()
-                .map(|&p| h.sim.property_total(who, p))
-                .sum();
+            let can = h.sim.has_level_up_points(who);
             if let Some(o) = h.sim.world.get_mut(who) {
-                o.fields.insert("CanLevelUp".into(), (points > 0.0) as i32);
+                o.fields.insert("CanLevelUp".into(), i32::from(can));
             }
             void()
         }
@@ -4754,6 +4797,10 @@ pub fn call(
         // DAOrigins.exe (0x665570, 0x7556d0) adds up the power of every one of the item's
         // properties with that id, then, with bIncludeSubItems, its sub-items' (runes) the
         // same way; 0 for what is not an item. Provisional: items hold no sub-items.
+        "GetItemPropertyPower" if h.sim.game == thedas_vfs::Game::DragonAge2 => ok(Value::Float(
+            h.sim
+                .da2_item_property_power(obj(a, 0), int(a, 1), int(a, 3) != 0),
+        )),
         "GetItemPropertyPower" => {
             let (item, p) = (obj(a, 0), int(a, 1));
             let power = if h.object(item).is_some_and(|o| o.kind == ObjectKind::Item) {
@@ -4770,6 +4817,15 @@ pub fn call(
         }
         // The item's property ids, in order (DAOrigins.exe 0x674260). Provisional: the
         // order and, with bIncludeSubItems, sub-items' (items hold none yet).
+        "GetItemProperties" if h.sim.game == thedas_vfs::Game::DragonAge2 => ok(Value::Array {
+            elem: Type::Int,
+            items: h
+                .sim
+                .da2_item_property_ids(obj(a, 0), if a.get(2).is_some() { int(a, 2) } else { -1 })
+                .into_iter()
+                .map(Value::Int)
+                .collect(),
+        }),
         "GetItemProperties" => ok(Value::Array {
             elem: Type::Int,
             items: if h
@@ -7164,6 +7220,107 @@ mod tests {
         args[1] = Value::Object(OBJECT_INVALID);
         run(&mut s, caller, "ConstructAbilityImpactandDelayEvent", &args);
         assert!(s.world.pop_due(u64::MAX).is_none());
+    }
+
+    #[test]
+    fn da2_projectile_payload_changes_do_not_restart_flight_or_add_hits() {
+        let table = Arc::new(
+            EngineTable::parse(
+                br#"
+            #define ENGINE_STRUCTURE_0 event
+            event Event(int type) = 1;
+            object FireProjectile(int type, vector source, vector target, int crust,
+                int wide, object receiver) = 193;
+            void SetProjectileImpactEvent(object projectile, event payload) = 371;
+        "#,
+            )
+            .unwrap(),
+        );
+        for game in [thedas_vfs::Game::DragonAge2, thedas_vfs::Game::Origins] {
+            let mut s = Sim::new(Arc::new(Vfs::new()), table.clone(), 1);
+            s.game = game;
+            let caller = s.world.spawn(ObjectKind::Creature, "caster");
+            let receiver = s.world.spawn(ObjectKind::Creature, "receiver");
+            // The deadline must remain a u64, including in worlds older than i32 ms.
+            let launch = i32::MAX as u64 + 100;
+            s.world.time_ms = launch;
+            let projectile = run(
+                &mut s,
+                caller,
+                "FireProjectile",
+                &[
+                    Value::Int(17),
+                    Value::Vector([0.0; 3]),
+                    Value::Vector([20.0, 0.0, 0.0]),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Object(receiver),
+                ],
+            )
+            .unwrap();
+            let first = run(&mut s, caller, "Event", &[Value::Int(100)]).unwrap();
+            let second = run(&mut s, caller, "Event", &[Value::Int(200)]).unwrap();
+            s.world.time_ms = launch + 250;
+            run(
+                &mut s,
+                caller,
+                "SetProjectileImpactEvent",
+                &[projectile.clone(), first],
+            );
+            // Save with a custom impact pending, then change it after reloading.
+            s.world = serde_json::from_slice(&serde_json::to_vec(&s.world).unwrap()).unwrap();
+            s.world.time_ms = launch + 500;
+            run(
+                &mut s,
+                caller,
+                "SetProjectileImpactEvent",
+                &[projectile.clone(), second],
+            );
+            if game == thedas_vfs::Game::DragonAge2 {
+                // An unrelated event for the same receiver is not replaced.
+                s.world.queue_event(
+                    500,
+                    receiver,
+                    Event {
+                        ty: 300,
+                        ..Default::default()
+                    },
+                    None,
+                );
+                assert!(s.world.pop_due(launch + 999).is_none());
+                let (due, hit) = s.world.pop_due(launch + 1000).unwrap();
+                assert_eq!(due, launch + 1000);
+                assert_eq!(hit.target, receiver);
+                assert_eq!(hit.event.ty, 200);
+                assert_eq!(hit.event.creator, Some(caller));
+                assert_eq!(s.world.pop_due(launch + 1000).unwrap().1.event.ty, 300);
+                assert!(s.world.pop_due(u64::MAX).is_none());
+                s.world.time_ms = launch + 1000;
+                s.world.destroy_due();
+                assert!(
+                    !s.world
+                        .objects
+                        .values()
+                        .any(|o| o.kind == ObjectKind::Projectile)
+                );
+                // Non-projectiles cannot acquire an impact event.
+                let event = run(&mut s, caller, "Event", &[Value::Int(400)]).unwrap();
+                run(
+                    &mut s,
+                    caller,
+                    "SetProjectileImpactEvent",
+                    &[Value::Object(caller), event],
+                );
+                assert!(s.world.pop_due(u64::MAX).is_none());
+            } else {
+                // Origins keeps its prior scheduling behavior in this DA2-only fix.
+                let (due, hit) = s.world.pop_due(u64::MAX).unwrap();
+                assert_eq!((due, hit.event.ty), (launch + 1250, 100));
+                let (due, hit) = s.world.pop_due(u64::MAX).unwrap();
+                assert_eq!((due, hit.event.ty), (launch + 1500, 200));
+                assert!(s.world.pop_due(u64::MAX).is_none());
+            }
+        }
     }
 
     #[test]
@@ -9816,6 +9973,9 @@ mod coverage_tests {
         int GetCreatureMana(object o) = 72;\n\
         void SetCreatureMana(object o, int n) = 73;\n\
         int GetCreatureMaxMana(object o) = 74;\n\
+        int GetCreatureStamina(object o) = 238;\n\
+        void SetCreatureStamina(object o, int n) = 239;\n\
+        int GetCreatureMaxStamina(object o) = 240;\n\
         void RemoveAllEffects(object o, int i = TRUE, int d = FALSE) = 75;\n\
         void SetCreatureIsGhost(object o, int v) = 76;\n\
         void SetQuickslotBar(object o, int n) = 77;\n\
@@ -10151,6 +10311,53 @@ mod coverage_tests {
         call(&mut h, caller, &f, a).unwrap().unwrap()
     }
 
+    #[test]
+    fn da2_distance_can_subtract_both_personal_spaces() {
+        use thedas_formats::gda::Cell;
+        let table = Arc::new(
+            EngineTable::parse(
+                b"float GetDistanceBetween(object a, object b, int spaces = 0) = 37;",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "apr_base",
+            &["PERSPACE"],
+            vec![(1, vec![Cell::Float(0.35)]), (2, vec![Cell::Float(0.95)])],
+        );
+        s.world.tables = Arc::new(tables);
+        let area = s.world.spawn(ObjectKind::Area, "arena");
+        let x = s.world.spawn(ObjectKind::Creature, "human");
+        let y = s.world.spawn(ObjectKind::Creature, "ogre");
+        for (id, appearance) in [(x, 1), (y, 2)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.appearance = appearance;
+        }
+        s.world.get_mut(y).unwrap().position = [3., 4., 0.];
+        let distance = |s: &mut Sim, target, spaces| match run(
+            s,
+            x,
+            "GetDistanceBetween",
+            &[Value::Object(x), Value::Object(target), Value::Int(spaces)],
+        ) {
+            Some(Value::Float(v)) => v,
+            v => panic!("expected distance, got {v:?}"),
+        };
+        // Origins keeps its existing semantics, including the optional flag.
+        assert_eq!(distance(&mut s, y, 1), 5.);
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(distance(&mut s, y, 0), 5.);
+        assert!((distance(&mut s, y, 1) - 3.7).abs() < 0.0001);
+        s.world.get_mut(y).unwrap().position = [0.; 3];
+        assert!((distance(&mut s, y, 1) + 1.3).abs() < 0.0001);
+        assert_eq!(distance(&mut s, OBJECT_INVALID, 1), -1.);
+        s.world.get_mut(y).unwrap().area = None;
+        assert_eq!(distance(&mut s, y, 1), -1.);
+    }
+
     fn effect_value(s: &mut Sim, e: Effect) -> Value {
         let hd = s.world.store(EngineData::Effect(e));
         Value::Engine {
@@ -10461,6 +10668,67 @@ mod coverage_tests {
             s.world.get(chest).unwrap().properties[&PROPERTY_MANA_STAMINA],
             (40.0, 12.0)
         );
+    }
+
+    #[test]
+    fn da2_stamina_uses_property_ten_and_its_computed_ceiling() {
+        let mut s = sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let mage = s.world.spawn(ObjectKind::Creature, "mage");
+        let chest = s.world.spawn(ObjectKind::Placeable, "chest");
+        let o = s.world.get_mut(mage).unwrap();
+        o.properties
+            .extend([(8, (999.0, 998.0)), (10, (40.0, 12.7))]);
+        o.modifiers.insert(10, 13.5);
+        let get = |s: &mut Sim, f: &str, id| run(s, id, f, &[Value::Object(id)]);
+        assert_eq!(
+            get(&mut s, "GetCreatureStamina", mage),
+            Some(Value::Int(12))
+        );
+        assert_eq!(
+            get(&mut s, "GetCreatureMaxStamina", mage),
+            Some(Value::Int(53))
+        );
+        for (value, current) in [(30, 30.0), (90, 53.5), (-5, 0.0)] {
+            run(
+                &mut s,
+                mage,
+                "SetCreatureStamina",
+                &[Value::Object(mage), Value::Int(value)],
+            );
+            assert_eq!(s.world.get(mage).unwrap().properties[&10].1, current);
+        }
+        assert_eq!(s.world.get(mage).unwrap().properties[&8], (999.0, 998.0));
+        s.world
+            .get_mut(mage)
+            .unwrap()
+            .properties
+            .insert(11, (25.0, 0.0));
+        run(
+            &mut s,
+            mage,
+            "SetCreatureStamina",
+            &[Value::Object(mage), Value::Int(90)],
+        );
+        assert_eq!(s.world.get(mage).unwrap().properties[&10].1, 40.125);
+        assert_eq!(
+            get(&mut s, "GetCreatureMaxStamina", mage),
+            Some(Value::Int(53))
+        );
+        for id in [chest, OBJECT_INVALID] {
+            assert_eq!(get(&mut s, "GetCreatureStamina", id), Some(Value::Int(-1)));
+            assert_eq!(
+                get(&mut s, "GetCreatureMaxStamina", id),
+                Some(Value::Int(-1))
+            );
+            run(
+                &mut s,
+                mage,
+                "SetCreatureStamina",
+                &[Value::Object(id), Value::Int(90)],
+            );
+        }
+        assert!(!s.world.get(chest).unwrap().properties.contains_key(&10));
     }
 
     #[test]
@@ -11251,6 +11519,60 @@ mod coverage_tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn da2_item_queries_filter_types_and_return_float_power() {
+        use thedas_formats::gda::Cell;
+        let table = Arc::new(EngineTable::parse(b"int[] GetItemProperties(object o, int sub, int desired = -1) = 316;\nfloat GetItemPropertyPower(object o, int p, int sub, int scale = 0) = 784;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "#12001",
+            &["#12a02374"],
+            vec![(100, vec![Cell::Int(10)]), (200, vec![Cell::Int(5)])],
+        );
+        s.world.tables = Arc::new(tables);
+        let item = s.world.spawn(ObjectKind::Item, "weapon");
+        s.world.get_mut(item).unwrap().item_properties = Some(vec![(100, 1), (200, 8), (100, 2)]);
+        let args = [Value::Object(item), Value::Int(0), Value::Int(5)];
+        let ids = |values: &[i32]| {
+            Some(Value::Array {
+                elem: Type::Int,
+                items: values.iter().copied().map(Value::Int).collect(),
+            })
+        };
+        // Origins retains its integer sum and existing unfiltered enumeration.
+        assert_eq!(
+            run(&mut s, item, "GetItemProperties", &args),
+            ids(&[100, 200, 100])
+        );
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(run(&mut s, item, "GetItemProperties", &args), ids(&[200]));
+        assert_eq!(
+            run(&mut s, item, "GetItemProperties", &args[..2]),
+            ids(&[100, 200])
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                item,
+                "GetItemPropertyPower",
+                &[Value::Object(item), Value::Int(200), Value::Int(0)]
+            ),
+            Some(Value::Float(8.))
+        );
+        // DA2 takes the first local property, rather than adding duplicate records.
+        assert_eq!(
+            run(
+                &mut s,
+                item,
+                "GetItemPropertyPower",
+                &[Value::Object(item), Value::Int(100), Value::Int(0)]
+            ),
+            Some(Value::Float(1.))
+        );
+        assert!(s.da2_item_property_ids(OBJECT_INVALID, -1).is_empty());
     }
 
     #[test]
