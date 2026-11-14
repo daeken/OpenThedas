@@ -245,6 +245,32 @@ impl Sim {
             .filter(|o| o.kind == ObjectKind::Creature && o.area == Some(area))
             .map(|o| (o.id, o.position))
             .collect();
+        // What the pair test reads of each creature, looked up once a tick rather than once
+        // a pair (the settled Ostagar camp has some hundreds of creatures): alive, group and
+        // stealth, as `Sim::alive`, `Sim::hostile` and `Sim::hidden_from` read them.
+        let facts: std::collections::HashMap<ObjectId, (bool, i32, bool)> = creatures
+            .iter()
+            .filter_map(|&(c, _)| {
+                let o = self.world.get(c)?;
+                Some((c, (o.active && !o.dead, o.group, o.combat.stealth)))
+            })
+            .collect();
+        // (Perception only queues events, so none of this changes during the update.)
+        let hostility = self.world.hostility.clone();
+        let hostile = |a: ObjectId, b: ObjectId| -> bool {
+            let (Some(&(_, g, _)), Some(&(_, h, _))) = (facts.get(&a), facts.get(&b)) else {
+                return false;
+            };
+            a != b
+                && g != h
+                && hostility
+                    .get(&(g.min(h), g.max(h)))
+                    .copied()
+                    .unwrap_or(false)
+        };
+        let hidden = |who: ObjectId, seen: ObjectId| {
+            facts.get(&seen).is_some_and(|f| f.2) && hostile(who, seen)
+        };
         // Closed doors block sight (see `Sim::door_sight`).
         let doors = self.door_sight(area);
         let blocked = |a: [f32; 3], b: [f32; 3]| doors.blocks(a, b);
@@ -306,19 +332,21 @@ impl Sim {
                 .get(id)
                 .map(|o| o.combat.perceived.clone())
                 .unwrap_or_default();
+            let reach = ring.max(VISUAL_RANGE);
             let in_view: Vec<ObjectId> = if alive {
                 creatures
                     .iter()
                     .filter(|&&(o, p)| {
-                        if o == id || !self.alive(o) {
+                        // Nothing beyond both ranges is seen; tested first as the cheapest.
+                        let d = dist(pos, p);
+                        if d > reach || o == id || !facts.get(&o).is_some_and(|f| f.0) {
                             return false;
                         }
-                        let d = dist(pos, p);
-                        let tracked = seen.contains(&o) && !self.hidden_from(id, o);
+                        let tracked = seen.contains(&o) && !hidden(id, o);
                         if tracked {
                             d <= VISUAL_RANGE && !blocked(pos, p)
                         } else {
-                            d <= ring && !blocked(pos, p) && (!self.hostile(id, o) || !wall(pos, p))
+                            d <= ring && !blocked(pos, p) && (!hostile(id, o) || !wall(pos, p))
                         }
                     })
                     .map(|&(o, _)| o)
