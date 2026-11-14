@@ -117,6 +117,8 @@ pub struct Vm {
     pub intervals: Vec<Interval>,
     pub next_interval: u32,
     pub time_ms: f64,
+    /// Timer time can pause to bound catch-up work while getTimer keeps elapsed time.
+    pub timer_time_ms: f64,
     pub host: Box<dyn Host>,
     /// `ExternalInterface.addCallback` registrations: name -> (this, function).
     pub callbacks: HashMap<String, (Value, Value)>,

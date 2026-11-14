@@ -363,8 +363,8 @@ pub(crate) fn local_name(sim: &Sim, o: ObjectId, a: &[Value], i: usize) -> Strin
     }
 }
 
-/// NWScript's float-to-string: `%<width>.<decimals>f`, right-aligned. Provisional for
-/// `ToString` on floats (assumed `%f` with six decimals).
+/// Origins uses `%<width>.<decimals>f`, right-aligned (0x669100), and `%f` for
+/// `ToString` (0x4c2b80). Legacy rounding, special values and output bounds are provisional.
 fn format_float(f: f32, width: i32, decimals: i32) -> String {
     let d = decimals.clamp(0, 9) as usize;
     let s = format!("{f:.d$}");
@@ -877,6 +877,33 @@ pub fn call(
         "ToString" => ok(Value::String(match a.first() {
             Some(Value::Int(v)) => v.to_string(),
             Some(Value::Float(v)) => format_float(*v, 0, 6),
+            // Origins 0x668f30 resolves objects and reads CCObject's tag through virtual
+            // +0x18. Other variants use a fixed diagnostic. See notes/script-tostring.md.
+            Some(Value::Object(id)) if h.sim.game == thedas_vfs::Game::Origins => h
+                .object(*id)
+                .map(|o| match o.kind {
+                    ObjectKind::Creature
+                    | ObjectKind::Placeable
+                    | ObjectKind::Trigger
+                    | ObjectKind::Waypoint
+                    | ObjectKind::Store
+                    | ObjectKind::Sound
+                    | ObjectKind::Item
+                    | ObjectKind::Projectile
+                    | ObjectKind::AreaOfEffect => {
+                        o.tag.split('\0').next().unwrap_or_default().into()
+                    }
+                    ObjectKind::Module
+                    | ObjectKind::Area
+                    | ObjectKind::Stage
+                    | ObjectKind::Party
+                    | ObjectKind::Map
+                    | ObjectKind::MapPin => "OBJECT_INVALID".into(),
+                })
+                .unwrap_or_default(),
+            Some(_) if h.sim.game == thedas_vfs::Game::Origins => {
+                "(can not cast variable to string)".into()
+            }
             Some(Value::String(s)) | Some(Value::Resource(s)) => s.clone(),
             Some(Value::Object(o)) => o.to_string(),
             Some(other) => format!("{other:?}"),
@@ -6360,6 +6387,113 @@ mod tests {
             (0xffff_ffff, "4294967295"),
         ] {
             assert_eq!(convert(&mut s, id), Some(Value::String(expected.into())));
+        }
+    }
+
+    #[test]
+    fn origins_to_string_distinguishes_tags_non_ccobjects_and_missing_ids() {
+        let table = Arc::new(EngineTable::parse(b"string ToString(any v) = 1;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for (kind, expected) in [
+            (ObjectKind::Creature, "Mixed_Tag"),
+            (ObjectKind::Placeable, "Mixed_Tag"),
+            (ObjectKind::Trigger, "Mixed_Tag"),
+            (ObjectKind::Waypoint, "Mixed_Tag"),
+            (ObjectKind::Store, "Mixed_Tag"),
+            (ObjectKind::Sound, "Mixed_Tag"),
+            (ObjectKind::Item, "Mixed_Tag"),
+            (ObjectKind::Projectile, "Mixed_Tag"),
+            (ObjectKind::AreaOfEffect, "Mixed_Tag"),
+            (ObjectKind::Module, "OBJECT_INVALID"),
+            (ObjectKind::Area, "OBJECT_INVALID"),
+            (ObjectKind::Stage, "OBJECT_INVALID"),
+            (ObjectKind::Party, "OBJECT_INVALID"),
+            (ObjectKind::Map, "OBJECT_INVALID"),
+            (ObjectKind::MapPin, "OBJECT_INVALID"),
+        ] {
+            let id = s.world.spawn(kind, "Mixed_Tag");
+            s.world.get_mut(id).unwrap().template = "different_template".into();
+            assert_eq!(
+                run(&mut s, id, "ToString", &[Value::Object(id)]),
+                Some(Value::String(expected.into())),
+                "{kind:?}"
+            );
+            // DA2 keeps its raw unsigned ID, regardless of kind or tag.
+            s.game = thedas_vfs::Game::DragonAge2;
+            assert_eq!(
+                run(&mut s, id, "ToString", &[Value::Object(id)]),
+                Some(Value::String(id.to_string()))
+            );
+            s.game = thedas_vfs::Game::Origins;
+        }
+        let creature = s.world.spawn(ObjectKind::Creature, "");
+        for (tag, expected) in [
+            ("", ""),
+            (
+                "a_long_tag_which_exceeds_thirty_one_characters_é",
+                "a_long_tag_which_exceeds_thirty_one_characters_é",
+            ),
+            ("prefix\0suffix", "prefix"),
+        ] {
+            s.world.get_mut(creature).unwrap().tag = tag.into();
+            assert_eq!(
+                run(&mut s, 0, "ToString", &[Value::Object(creature)]),
+                Some(Value::String(expected.into()))
+            );
+        }
+        let removed = s.world.spawn(ObjectKind::Creature, "removed");
+        s.world.objects.remove(&removed);
+        for id in [0, removed, OBJECT_INVALID, 0xffff_ffff] {
+            assert_eq!(
+                run(&mut s, 0, "ToString", &[Value::Object(id)]),
+                Some(Value::String(String::new()))
+            );
+        }
+    }
+
+    #[test]
+    fn origins_to_string_uses_the_diagnostic_for_other_variants() {
+        let table = Arc::new(EngineTable::parse(b"string ToString(any v) = 1;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let values = [
+            Value::String("text".into()),
+            Value::Resource("resource".into()),
+            Value::Vector([1.0, 2.0, 3.0]),
+            Value::Engine {
+                ty: 3,
+                handle: None,
+            },
+            Value::Engine {
+                ty: 3,
+                handle: Some(123),
+            },
+            Value::Array {
+                elem: Type::Int,
+                items: vec![Value::Int(7)],
+            },
+        ];
+        for value in values {
+            let args = [value.clone()];
+            assert_eq!(
+                run(&mut s, 0, "ToString", &args),
+                Some(Value::String("(can not cast variable to string)".into()))
+            );
+            s.game = thedas_vfs::Game::DragonAge2;
+            let expected = match value {
+                Value::String(text) | Value::Resource(text) => text,
+                other => format!("{other:?}"),
+            };
+            assert_eq!(
+                run(&mut s, 0, "ToString", &args),
+                Some(Value::String(expected))
+            );
+            s.game = thedas_vfs::Game::Origins;
+        }
+        for (value, expected) in [(Value::Int(-42), "-42"), (Value::Float(1.5), "1.500000")] {
+            assert_eq!(
+                run(&mut s, 0, "ToString", &[value]),
+                Some(Value::String(expected.into()))
+            );
         }
     }
 
