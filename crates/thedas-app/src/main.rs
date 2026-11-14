@@ -1929,7 +1929,7 @@ impl App {
                 })
             };
             for g in &glbs {
-                match workspace::import_glb(g, &overrides, &read) {
+                match workspace::import_glb(g, &overrides, &read, &format_of) {
                     Ok(r) => {
                         for n in &r.notes {
                             log::info!("live edits: {}: {n}", g.display());
