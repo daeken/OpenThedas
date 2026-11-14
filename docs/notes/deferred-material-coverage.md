@@ -67,8 +67,7 @@ Roomless, rigid, single-pass `SPT_Fronds/SPT_Fronds` geometry now shares the G-b
 The vertex wrapper calls the existing translated vertex shader. Original wind
 matrices, placement scale/yaw, instance slots, camera culling, LOD index ranges and
 the D3D9 half-pixel adjustment therefore supply the geometry. Read-only accessors
-expose its buffers, bindings and current instance/index ranges. The faithful draw
-implementation continues to use its existing entry point.
+expose its buffers, bindings and current instance/index ranges.
 
 The fragment material samples the original diffuse texture with its sampler and
 multiplies alpha by `g_fAlphaMultiplier`. The 8-bit Greater comparison reads the
