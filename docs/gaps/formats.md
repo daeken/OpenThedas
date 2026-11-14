@@ -64,8 +64,8 @@ Counts are corpus entries, with each archive copy counted.
 
 | Type | Entries | Reader | Consumer |
 | --- | --- | --- | --- |
-| `.fxe` | 308,332 | none | none (facial animation and lip sync, inferred) |
-| `.fxa` | 37 | none | none (face actors, inferred) |
+| `.fxe` | 308,332 | `facefx` | conversation lip sync (FMT-027, AUD-052) |
+| `.fxa` | 37 | `facefx` | conversation lip sync (FMT-027, AUD-052) |
 | `.met` | 2,364 | none (almost all encrypted) | none |
 | `.pwk` | 774 | generic GFF only | none (placeable walk shapes, inferred) |
 | `.dlb` | 731 | generic GFF only | none |
@@ -182,7 +182,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 - **FMT-024** **SpeedTree trees are parsed but not built.** Original: trees grown from `.spt` at load (per module doc). Ours: render takes only the first billboard's corners and the tree size; branches, fronds and leaves are unused; token layout from the SDK. Evidence: `crates/thedas-render/src/scene.rs:725`, `crates/thedas-formats/src/speedtree.rs:19`. Size: L. Depends: none. Kind: missing.
 - **FMT-025** **SpeedTree placements' fields from xoreos.** Original: not traced. Ours: `SPT ` struct field meanings from xoreos. Evidence: `crates/thedas-formats/src/level.rs:606`. Size: S. Depends: FMT-024. Kind: provisional.
 - **FMT-026** **Level and room layout labels provisional.** Original: not traced except where noted. Ours: labels identified from data or xoreos; frame-effect entries with no id or non-numeric values are skipped. Evidence: `crates/thedas-formats/src/level.rs:8`, `crates/thedas-formats/src/level.rs:186`, `crates/thedas-formats/src/level.rs:231`, `crates/thedas-formats/src/level.rs:274`. Size: M. Depends: none. Kind: provisional.
-- **FMT-027** **FaceFX.** Original: FaceFX (.fxe/.fxa). Ours: no code found. Evidence: `crates/thedas-formats/src/lib.rs:36`. Size: L. Depends: none. Kind: missing.
+- **FMT-027** **FaceFX partly interpreted.** Original: FaceFX (.fxe per voiced line, .fxa per face rig). Ours: both read (every campaign `.fxe` and every core `.fxa`; a DLC's `architect.fxa` does not parse); the curves' interpolation field, the node fields after the range, the bone links' scale and the data after the face graph (phoneme map and the like) are not interpreted, and curves are taken as Hermite. Evidence: `crates/thedas-formats/src/facefx.rs:1`. Size: S. Depends: none. Kind: provisional.
 - **FMT-028** **Mesh labels and primitive type provisional.** Original: not traced. Ours: labels from data; primitive type 0 taken as a triangle list. Evidence: `crates/thedas-formats/src/mesh.rs:6`, `crates/thedas-formats/src/mesh.rs:239`. Size: S. Depends: none. Kind: provisional.
 - **FMT-029** **Model labels and transform rule provisional.** Original: not traced. Ours: `parent * T * R` from data. Evidence: `crates/thedas-formats/src/model.rs:9`. Size: S. Depends: none. Kind: provisional.
 - **FMT-030** **Material `Logic` selection provisional.** Original: not traced. Ours: inferred ordering of detail levels and terrain UV scales. Evidence: `crates/thedas-formats/src/material.rs:13`, `crates/thedas-formats/src/material.rs:198`, `crates/thedas-formats/src/material.rs:437`. Size: S. Depends: none. Kind: provisional.

@@ -1944,8 +1944,9 @@ impl Live {
             }
             // Lip sync: the speaker's face, over everything else.
             if let Some(c) = c.as_mut()
-                && let Some(body) = m.models.first()
-                && let Some(face) = self.faces.layer(&level.vfs, m.id, body)
+                && let Some(face) =
+                    self.faces
+                        .layer(&level.vfs, m.id, m.morph.iter().chain(&m.models))
             {
                 c.layers.push(face);
             }

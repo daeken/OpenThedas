@@ -5,11 +5,12 @@
 //! when there is one, else `<strref>_m.fxe`, as the voice-over picks its sample) and sits
 //! in the voice-over folders' `facialanimations` archives
 //! (`audio/vo/<language>/facialanimations/*.erf` of the core package, the DLC `core` folders
-//! and the campaign's module, as [`thedas_audio::library::Library::install_dirs`] orders them). The
-//! speaker's face rig is the one its race's base head names (field 6248 of
-//! `<race><gender>_uhm_basa_0.mmh`: `hm_` → `humanmale.fxa`). The rig's bone offsets are laid
-//! over the speaker's pose as an additive layer, so they move the face bones of whichever
-//! of its models has them (the head).
+//! and the campaign's module, as [`thedas_audio::library::Library::install_dirs`] orders
+//! them). The speaker's face rig is the one its race's base head names (field 6248 of
+//! `<race><gender>_uhm_basa_0.mmh`: `hm_` → `humanmale.fxa`), the race and gender read from
+//! the prefix of its head morph (`hm_duncan`), else of its models. The rig's bone offsets
+//! are laid over the speaker's pose as an additive layer, so they move the face bones of
+//! whichever of its models has them (the head).
 //!
 //! Provisional: the animation runs from when the line comes up, on the frame clock, not
 //! the voice's own playback; which of a creature's models names its rig in the original is
@@ -138,13 +139,20 @@ impl Faces {
         });
     }
 
-    /// The face layer for creature `id`, whose body model is `body` (`hm_arm_cth_0`), if it
-    /// is speaking a line with an animation and its race has a rig.
-    pub fn layer(&mut self, vfs: &Vfs, id: ObjectId, body: &str) -> Option<Clip> {
+    /// The face layer for creature `id`, whose head morph and models are `models` (the
+    /// first whose race prefix has a rig gives it), if it is speaking a line with an
+    /// animation.
+    pub fn layer<'a>(
+        &mut self,
+        vfs: &Vfs,
+        id: ObjectId,
+        models: impl IntoIterator<Item = &'a String>,
+    ) -> Option<Clip> {
         let p = self.playing.as_ref().filter(|p| p.key.2 == id)?;
         let anim = p.anim.clone()?;
         let time = p.time;
-        let actor = self.actor(vfs, body)?;
+        let actor = models.into_iter().find_map(|m| self.actor(vfs, m));
+        let actor = actor?;
         let values = actor.evaluate(|node| anim.curve(node).map(|c| c.at(time)));
         let mut tracks = Vec::new();
         for o in actor.bone_offsets(&values) {
@@ -181,9 +189,10 @@ impl Faces {
         })
     }
 
-    /// The rig of the race whose body model is `body`, read once.
-    fn actor(&mut self, vfs: &Vfs, body: &str) -> Option<Arc<FaceActor>> {
-        let prefix = body.split('_').next()?.to_ascii_lowercase();
+    /// The rig of the race and gender model `model` is named for (`hm_duncan` → the
+    /// `hm` rig), read once.
+    fn actor(&mut self, vfs: &Vfs, model: &str) -> Option<Arc<FaceActor>> {
+        let prefix = model.split('_').next()?.to_ascii_lowercase();
         let rig = self
             .rigs
             .entry(prefix.clone())
