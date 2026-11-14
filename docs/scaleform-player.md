@@ -117,6 +117,9 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
   inline-image helper place copper/silver/gold icons in inventory and store prices. Timeline
   jumps distinguish text characters, so the unaffordable-price state can replace gold text
   with its authored red definition. Native text-layout `<img>` rendering remains separate.
+- `MovieClip.duplicateMovieClip` constructs a fresh instance of the registered class with
+  the source's transform, colour, drawing and clip events. The host can now add its Mod Mode
+  button alongside Report Issue using the same menu setup on either backend.
 - Not yet: text `shadowStyle`, overlay / hard light /
   difference / invert blends (drawn normal), `setMask`, inline `<img>` in text,
   and complete parity on engine-state screens (book screens, popups, conversation).

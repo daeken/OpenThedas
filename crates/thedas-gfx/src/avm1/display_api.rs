@@ -564,6 +564,22 @@ fn mc_create_empty(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
     }
 }
 
+fn mc_duplicate(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
+    let Some(source) = this_display(vm, &this) else {
+        return Value::Undefined;
+    };
+    let Some(name) = args.first() else {
+        return Value::Undefined;
+    };
+    let name = vm.to_str(name);
+    let depth = args.get(1).map(|v| vm.to_number(v)).unwrap_or(0.0);
+    let init = args.get(2).and_then(Value::as_object);
+    match crate::player::duplicate(vm, source, &name, super::value::to_int32(depth), init) {
+        Some(d) => display_value(vm, d),
+        None => Value::Undefined,
+    }
+}
+
 fn mc_create_text_field(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
     let Some(parent) = this_display(vm, &this) else {
         return Value::Undefined;
@@ -1350,6 +1366,7 @@ pub fn install(vm: &mut Vm) {
     let mc_methods: &[(&str, NativeFn)] = &[
         ("attachMovie", mc_attach_movie),
         ("createEmptyMovieClip", mc_create_empty),
+        ("duplicateMovieClip", mc_duplicate),
         ("createTextField", mc_create_text_field),
         ("removeMovieClip", mc_remove),
         ("swapDepths", mc_swap_depths),

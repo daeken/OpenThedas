@@ -1228,6 +1228,53 @@ fn replace_at(vm: &mut Vm, parent: DisplayId, depth: i32) {
     }
 }
 
+/// Duplicates a clip's authored symbol and drawing, then constructs a fresh script object.
+/// Dynamic properties belong to the original and are not copied.
+pub fn duplicate(
+    vm: &mut Vm,
+    source: DisplayId,
+    name: &str,
+    depth: i32,
+    init: Option<ObjId>,
+) -> Option<DisplayId> {
+    // Flash's allowed depths, expressed in the same unshifted units as getDepth.
+    if !(DEPTH_OFFSET..=2_130_690_044).contains(&depth) {
+        return None;
+    }
+    let source = vm.display.get(source)?;
+    let parent = source.parent?;
+    let clip = source.clip()?;
+    let (character, matrix, color, drawing, actions) = (
+        clip.character,
+        source.matrix,
+        source.color,
+        clip.drawing.clone(),
+        clip.clip_actions.clone(),
+    );
+    let mut object = if character == 0 {
+        Object::new(Kind::Clip(Box::new(clip_for(
+            Arc::new(crate::swf::Timeline {
+                frames: vec![Default::default()],
+                labels: vec![],
+            }),
+            0,
+        ))))
+    } else {
+        instantiate(vm, character)?
+    };
+    object.name = Str::from(name);
+    object.matrix = matrix;
+    object.color = color;
+    let clip = object.clip_mut()?;
+    clip.drawing = drawing;
+    clip.clip_actions = actions;
+    replace_at(vm, parent, depth);
+    let new = vm.display.add(object);
+    insert_child(vm, parent, new, depth);
+    constructed(vm, new, true, init);
+    Some(new)
+}
+
 pub fn create_empty(vm: &mut Vm, parent: DisplayId, name: &str, depth: i32) -> Option<DisplayId> {
     replace_at(vm, parent, depth);
     let tl = Arc::new(crate::swf::Timeline {
@@ -2078,5 +2125,62 @@ mod queue_tests {
             display_api::display_get(&mut p.vm, gold, "textColor"),
             Some(Value::Number(0xc8b400 as f64))
         );
+    }
+
+    #[test]
+    fn duplicate_clip_constructs_the_class_without_copying_dynamic_properties() {
+        let bytes = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p =
+            Player::new(bytes, "duplicate", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        let mut movie = Movie::default();
+        movie.characters.insert(
+            1,
+            Character::Sprite(Arc::new(crate::swf::Timeline {
+                frames: vec![crate::swf::Frame {
+                    actions: vec![trace("first frame")],
+                    ..Default::default()
+                }],
+                labels: vec![],
+            })),
+        );
+        movie.exports.insert("button".into(), 1);
+        p.vm.movie = Arc::new(movie);
+        let constructor = p.vm.new_native(|vm, this, _| {
+            let seed = vm.get(&this, "seed");
+            vm.set(&this, "constructed_with", seed);
+            Value::Undefined
+        });
+        let prototype = p.vm.new_object();
+        p.vm.define(prototype, "class_member", Value::Bool(true), 0);
+        p.vm.define(constructor, "prototype", Value::Object(prototype), 0);
+        p.vm.classes.insert(1, Value::Object(constructor));
+        let root = p.vm.root;
+        let source = attach(&mut p.vm, root, "button", "original", 1, None).unwrap();
+        p.run_queue();
+        p.drain_log();
+        let source_value = p.vm.display_object(source);
+        p.vm.set(&source_value, "private", Value::Number(99.0));
+        let object = p.vm.display.get_mut(source).unwrap();
+        object.matrix.tx = 400.0;
+        object.color.mul[3] = 0.5;
+        let init = p.vm.new_object();
+        p.vm.define(init, "seed", Value::Number(42.0), 0);
+        let copy = duplicate(&mut p.vm, source, "copy", 2, Some(init)).unwrap();
+        p.run_queue();
+        assert_eq!(p.drain_log(), ["trace: first frame"]);
+        let copy_value = p.vm.display_object(copy);
+        assert_eq!(
+            p.vm.get(&copy_value, "constructed_with"),
+            Value::Number(42.0)
+        );
+        assert_eq!(p.vm.get(&copy_value, "class_member"), Value::Bool(true));
+        assert_eq!(p.vm.get(&copy_value, "private"), Value::Undefined);
+        assert_eq!(p.vm.display.get(copy).unwrap().matrix.tx, 400.0);
+        assert_eq!(p.vm.display.get(copy).unwrap().color.mul[3], 0.5);
+        assert_eq!(p.vm.display.child_named(root, "original"), Some(source));
+        assert!(duplicate(&mut p.vm, root, "root-copy", 3, None).is_none());
+        let replaced = duplicate(&mut p.vm, source, "copy2", 2, None).unwrap();
+        assert!(p.vm.display.get(copy).is_none());
+        assert_eq!(p.vm.display.child_named(root, "copy2"), Some(replaced));
     }
 }
