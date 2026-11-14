@@ -28,7 +28,7 @@ lightmaps. It is not parity work; where the two differ, the faithful path is rig
 
    | target | format | contents |
    |---|---|---|
-   | 0 | `Rgba8Unorm` | albedo rgb (`mml_tDiffuse`), unused |
+   | 0 | `Rgba8Unorm` | albedo rgb; alpha: Static1 (0), Low terrain (0.5), other terrain (1) |
    | 1 | `Rgba8Unorm` | specular mask rgb (`mml_tSpecularMask`), specular power code (its alpha) |
    | 2 | `Rgba16Float` | normal (octahedral xy, world space, from `mml_tNormalMap` through a derivative-built tangent frame), room index, specular falloff (`mml_vFalloffParams`, as Static1's vertex shader works it out) |
    | 3 | `Rgba8Unorm` | lightmap texel (rgb baked light, a: the baked visibility Static1 multiplies the sun and lights by) |
@@ -49,7 +49,7 @@ lightmaps. It is not parity work; where the two differ, the faithful path is rig
    through walls into rooms the original never lit. Tiled or clustered culling replaces
    the per-pixel loop over all of them when light counts call for it.
 4. Everything not deferred draws forward with its original shaders over that colour and
-   depth: blended and multi-pass materials, water, sky, terrain, trees, skinned meshes,
+   depth: blended and multi-pass materials, water, sky, trees, skinned meshes,
    cut-away meshes, particles. Then the frame effects as now.
 
 Debug views in place of the lit frame: `THEDAS_DEFERRED_VIEW=albedo|normal|lightmap|
@@ -61,10 +61,28 @@ The environment reflection Static1 adds (the probe cubemap times
 
 Left out of the first cut, to come: the material tint, and the meshes' own tangents (the G-buffer builds a tangent frame from screen derivatives).
 
-**Deferred draws** (first cut): the level's own opaque draws with Static1's shaders
+**Deferred draws**: the level's own opaque draws with Static1's shaders
 (`Static1.psh`, or `Static1_Fast.psh` at Low; no alpha test, no blending), not skinned, not
-SpeedTree, not cut away. In Castle Cousland that is 2,100 of 3,997. Terrain (`terrain.mat`), then
-characters and placeables, move over in later steps.
+SpeedTree, not cut away; and Origins terrain (`Terrain2.vsh` + `Terrain1.psh`, or
+`Terrain3` at Low detail). Characters and placeables move over in later steps.
+
+Terrain's G-buffer material decodes MaskV's three layer indices with point sampling and
+blends their palette texels using MaskA/MaskA2's eight weights. The material supplies atlas
+dimensions, padding, UV scales and each layer's specular colour/power. Explicit gradients
+keep tile wrapping from choosing the wrong mip. Terrain uses TEXCOORD0 for its lightmap,
+normal-map palette at Medium/High, vertex normals and no specular at Low, and the original
+vertex-interpolated specular distance factor. As with Static1, its tangent frame comes from
+screen derivatives rather than the raw mesh tangents.
+
+The lighting keeps Terrain1's `lm.a²` static diffuse mask (Terrain3 at Low uses `lm.a` once) and
+`0.75 * runtime_visibility * lm.a + 0.25` specular mask; bounce uses the same 15% shadow
+blend as Static1. Low uses Terrain3's shadow filter without the grazing-angle floor.
+Terrain reflections use this visibility too, via shared read-only sun
+bindings, and the material's additive tint is added with the reflection pass. Point lights
+are evaluated per pixel with the deferred radius cutoff, so illumination near fires can
+differ from the faithful per-vertex single A/D lights. `THEDAS_DEFERRED_TERRAIN=0` keeps
+terrain forward for before/after captures; `albedo`, `normal`, `lightmap` and `sun-shadows`
+debug views now include the ground. Terrain also joins the point-shadow caster list.
 
 ## Lights from areas and from effects
 
@@ -102,7 +120,7 @@ characters and placeables, move over in later steps.
   maps with a 0.35 m near plane to leave the flame's enclosing torch bowl out. Opaque
   deferred static meshes cast from both faces, including geometry outside the camera's
   view. The lighting pass compares distances with a bilinear 2-by-2 filter, a 4 cm normal
-  offset and 2 cm distance bias. Creatures, trees and terrain do not cast point shadows
+  offset and 2 cm distance bias. Creatures and trees do not cast point shadows
   yet; static lights keep their baked visibility. At most 24 face passes per frame.
   `THEDAS_DEFERRED_POINT_SHADOWS=0` disables both rendering and sampling these maps for
   captures and cost comparisons; it does not change the faithful path.
