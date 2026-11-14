@@ -1121,6 +1121,54 @@ mod tests {
     }
 
     #[test]
+    fn mouse_button_constants_are_undefined_at_movie_init() {
+        use thedas_gfx::avm1::value::Value;
+
+        // Observe the globals from the movie's own DoInitAction, before the host's
+        // frame-one glue. Capture typeof so a missing initializer cannot pass.
+        let mut init = Vec::new();
+        for name in ["MIDDLE", "RIGHT", "LEFT"] {
+            get_path(&mut init, &["_root"]);
+            push(&mut init, &[Push::Str(name)]);
+            get_path(&mut init, &["_global", "Mouse", name]);
+            init.extend_from_slice(&[TYPEOF, SET_MEMBER]);
+        }
+        init.push(0);
+        let mut movie = b"FWS\x08\0\0\0\0\x08\0\0\x1e\x01\0".to_vec();
+        movie.extend_from_slice(&((59u16 << 6) | 63).to_le_bytes());
+        movie.extend_from_slice(&((init.len() + 2) as u32).to_le_bytes());
+        movie.extend_from_slice(&0u16.to_le_bytes());
+        movie.extend(init);
+        movie.extend_from_slice(&[0x40, 0, 0, 0]); // ShowFrame, End.
+        let len = movie.len() as u32;
+        movie[4..8].copy_from_slice(&len.to_le_bytes());
+        let mut player = thedas_gfx::Player::new(
+            &movie,
+            "mouse-init-test",
+            Box::new(Empty),
+            std::sync::Arc::new(Empty),
+            Some(register_invoke()),
+        )
+        .unwrap();
+        let root = player.vm.display_object(player.vm.root);
+        let mouse = Value::Object(player.vm.mouse);
+        for name in ["MIDDLE", "RIGHT", "LEFT"] {
+            assert_eq!(
+                player.vm.get(&root, name),
+                Value::from("undefined"),
+                "{name}"
+            );
+            assert_eq!(player.vm.get(&mouse, name), Value::Undefined, "{name}");
+        }
+        let global = Value::Object(player.vm.global);
+        player.vm.call_method(&global, "thedas_install", &[]);
+        player.run_frame();
+        for name in ["MIDDLE", "RIGHT", "LEFT"] {
+            assert_eq!(player.vm.get(&mouse, name), Value::Undefined, "{name}");
+        }
+    }
+
+    #[test]
     fn native_mouse_arguments_and_empty_callbacks_need_no_compatibility_globals() {
         use thedas_gfx::HostValue;
         use thedas_gfx::avm1::value::Value;
@@ -1188,6 +1236,12 @@ mod tests {
             Value::Undefined
         });
         player.vm.set(&listener, "onMouseDown", Value::Object(down));
+        let up = player.vm.new_native(|vm, _, args| {
+            assert_eq!(args.len(), 2);
+            vm.log.push(format!("up {:?}", args.first()));
+            Value::Undefined
+        });
+        player.vm.set(&listener, "onMouseUp", Value::Object(up));
         let mouse = Value::Object(player.vm.mouse);
         player.vm.call_method(&mouse, "addListener", &[listener]);
         player.drain_log();
@@ -1196,16 +1250,32 @@ mod tests {
                 player.mouse_button(20.0, 20.0, button, true, double);
                 player.mouse_button(20.0, 20.0, button, false, double);
                 let code = f64::from(button + if double { 4 } else { 0 });
-                assert_eq!(
-                    player.drain_log(),
-                    [
-                        format!("down Some(Number({code:?}))"),
-                        format!("press Some(Number({code:?}))"),
-                        format!("release Some(Number({code:?}))"),
-                    ]
-                );
+                let physical = f64::from(button);
+                let mut expected = vec![format!("down Some(Number({physical:?}))")];
+                if button == thedas_gfx::player::MOUSE_LEFT {
+                    expected.push(format!("press Some(Number({code:?}))"));
+                    expected.push(format!("release Some(Number({code:?}))"));
+                }
+                expected.push(format!("up Some(Number({physical:?}))"));
+                assert_eq!(player.drain_log(), expected);
             }
         }
+        // A non-left release cannot consume an in-progress native left press.
+        player.mouse_button(20.0, 20.0, thedas_gfx::player::MOUSE_LEFT, true, false);
+        player.mouse_button(20.0, 20.0, thedas_gfx::player::MOUSE_RIGHT, true, false);
+        player.mouse_button(20.0, 20.0, thedas_gfx::player::MOUSE_RIGHT, false, false);
+        player.mouse_button(20.0, 20.0, thedas_gfx::player::MOUSE_LEFT, false, false);
+        assert_eq!(
+            player.drain_log(),
+            [
+                "down Some(Number(1.0))",
+                "press Some(Number(1.0))",
+                "down Some(Number(2.0))",
+                "up Some(Number(2.0))",
+                "release Some(Number(1.0))",
+                "up Some(Number(1.0))",
+            ]
+        );
     }
 
     #[test]

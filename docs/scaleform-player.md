@@ -114,6 +114,13 @@ The player lives in `crates/thedas-gfx`:
 - Every movie opened by `thedas-ui::Stage` uses `thedas-gfx` directly from its GFx bytes.
   There is no backend selector or fallback player.
 - Unknown opcodes, tags or built-ins are logged once per movie.
+- `Mouse.getTopMostEntity(false)` finds the deepest enabled clip with mouse
+  handlers, skipping decorative labels above picker buttons. `true` and the
+  existing no-argument behavior include noninteractive geometry and text fields.
+- Global Mouse down/up listeners receive the physical button (1/2/3), even on
+  double clicks. Native button/clip press/release events are left-only; DAO's
+  button handlers receive 5 for a double left click. The movie's extended global
+  listener implements right/middle actions without a second native delivery.
 - Execution limits stop the remaining bytecode and nested calls in the current
   action list. Later independent calls and timeline actions start with fresh limits;
   nested timeline actions share their caller's operation budget. A failed watcher
