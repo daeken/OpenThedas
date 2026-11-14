@@ -629,34 +629,60 @@ fn compare_values(vm: &mut Vm, a: &Value, b: &Value, flags: u32) -> Ordering {
     if flags & 2 != 0 { ord.reverse() } else { ord }
 }
 
-/// A stable merge sort calling out to script comparators (std's sort may panic on an
-/// inconsistent order; this one cannot).
-fn merge_sort(
+/// AVM1 partitions around the first item, including when keys compare equal.
+/// The order of ties matters to movies which assign the same list priority to
+/// several groups. Keep our own partitioner: script comparators need not define
+/// a consistent order, which Rust's sorting routines are allowed to reject.
+fn flash_sort(
     vm: &mut Vm,
-    v: Vec<(usize, Value)>,
+    mut values: Vec<(usize, Value)>,
     cmp: &mut dyn FnMut(&mut Vm, &Value, &Value) -> Ordering,
 ) -> Vec<(usize, Value)> {
-    if v.len() <= 1 {
-        return v;
-    }
-    let mut right = v;
-    let left = right.drain(..right.len() / 2).collect::<Vec<_>>();
-    let left = merge_sort(vm, left, cmp);
-    let right = merge_sort(vm, right, cmp);
-    let mut out = Vec::with_capacity(left.len() + right.len());
-    let (mut i, mut j) = (0, 0);
-    while i < left.len() && j < right.len() {
-        if cmp(vm, &right[j].1, &left[i].1) == Ordering::Less {
-            out.push(right[j].clone());
-            j += 1;
-        } else {
-            out.push(left[i].clone());
-            i += 1;
+    let mut pending = vec![(0, values.len())];
+    let mut comparisons = 0;
+    while let Some((start, end)) = pending.pop() {
+        if end.saturating_sub(start) < 2 {
+            continue;
         }
+        let pivot = values[start].1.clone();
+        let (mut left, mut right) = (start + 1, end - 1);
+        loop {
+            while left < right {
+                comparisons += 1;
+                if comparisons > 1_000_000 {
+                    vm.warn_once("array sort comparison limit".into());
+                    return values;
+                }
+                if cmp(vm, &pivot, &values[left].1) != Ordering::Greater {
+                    break;
+                }
+                left += 1;
+            }
+            while right > start {
+                comparisons += 1;
+                if comparisons > 1_000_000 {
+                    vm.warn_once("array sort comparison limit".into());
+                    return values;
+                }
+                if cmp(vm, &pivot, &values[right].1) == Ordering::Greater {
+                    break;
+                }
+                right -= 1;
+            }
+            if left >= right {
+                break;
+            }
+            values.swap(left, right);
+            // Both cursors must make progress even for an inconsistent script
+            // comparator. With a consistent comparator the next scans do this.
+            left += 1;
+            right -= 1;
+        }
+        values.swap(start, right);
+        pending.push((right + 1, end));
+        pending.push((start, right));
     }
-    out.extend_from_slice(&left[i..]);
-    out.extend_from_slice(&right[j..]);
-    out
+    values
 }
 
 fn finish_sort(vm: &mut Vm, this: &Value, sorted: Vec<(usize, Value)>, flags: u32) -> Value {
@@ -695,24 +721,25 @@ fn array_sort(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
         None => (None, 0),
     };
     let indexed: Vec<(usize, Value)> = v.into_iter().enumerate().collect();
-    let sorted = match func {
-        Some(f) => {
-            let desc = flags & 2 != 0;
-            merge_sort(vm, indexed, &mut |vm, a, b| {
-                let r = vm.call(&f, Value::Undefined, &[a.clone(), b.clone()]);
-                let n = vm.to_number(&r);
-                let o = if n < 0.0 {
-                    Ordering::Less
-                } else if n > 0.0 {
-                    Ordering::Greater
-                } else {
-                    Ordering::Equal
-                };
-                if desc { o.reverse() } else { o }
-            })
-        }
-        None => merge_sort(vm, indexed, &mut |vm, a, b| compare_values(vm, a, b, flags)),
+    let mut sorted = match func {
+        Some(f) => flash_sort(vm, indexed, &mut |vm, a, b| {
+            let r = vm.call(&f, Value::Undefined, &[a.clone(), b.clone()]);
+            let n = vm.to_number(&r);
+            if n < 0.0 {
+                Ordering::Less
+            } else if n > 0.0 {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        }),
+        None => flash_sort(vm, indexed, &mut |vm, a, b| {
+            compare_values(vm, a, b, flags & !2)
+        }),
     };
+    if flags & 2 != 0 {
+        sorted.reverse();
+    }
     finish_sort(vm, &this, sorted, flags)
 }
 
@@ -739,7 +766,7 @@ fn array_sort_on(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
     };
     let flags0 = flag_list.first().copied().unwrap_or(0);
     let indexed: Vec<(usize, Value)> = v.into_iter().enumerate().collect();
-    let sorted = merge_sort(vm, indexed, &mut |vm, a, b| {
+    let sorted = flash_sort(vm, indexed, &mut |vm, a, b| {
         for (i, f) in fields.iter().enumerate() {
             let fa = vm.get(a, f);
             let fb = vm.get(b, f);

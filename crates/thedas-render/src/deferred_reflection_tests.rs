@@ -28,7 +28,7 @@ fn fused_base_keeps_hdr_visibility_and_material_reflection_rules() {
                 g.specular = vec4<f32>(0.5, 0.25, 0.125, 1.0);
                 g.lightmap = vec4<f32>(2.0, 3.0, 4.0, 0.25);
                 let s = Surface(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, 1.0), 0.5);
-                return baked_base(input, g, s).lightmap;
+                return baked_base(input, g, s, 0u).lightmap;
             }}
         "#
             )

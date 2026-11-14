@@ -122,6 +122,11 @@ The player lives in `crates/thedas-gfx`:
 - Every movie opened by `thedas-ui::Stage` uses `thedas-gfx` directly from its GFx bytes.
   There is no backend selector or fallback player.
 - Unknown opcodes, tags or built-ins are logged once per movie.
+- Execution limits stop the remaining bytecode and nested calls in the current
+  action list. Later independent calls and timeline actions start with fresh limits;
+  nested timeline actions share their caller's operation budget. A failed watcher
+  leaves the incoming assignment intact. Recursion and operation limits still warn
+  once per movie rather than continuing callbacks with an undefined error result.
 - Display `_x`/`_y` writes truncate to whole twips (1/20 pixel) toward zero.
   Rounding each fractional credits-scroll update instead compounds a position
   difference over time, despite matching the movie's timer rate.

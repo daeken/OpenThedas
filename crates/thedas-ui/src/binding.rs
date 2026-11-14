@@ -356,14 +356,9 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         );
         // The level-up mark on the portrait: points to spend, as DAOrigins.exe tests it
         // (0x6aca10: attribute, skill and talent/spell points, properties 34 to 36, above 0).
-        let points: f32 = [34, 35, 36]
-            .iter()
-            .filter_map(|p| o.properties.get(p))
-            .map(|p| p.0)
-            .sum();
         v.insert(
             format!("{prefix}.PortraitLevelUp"),
-            num((points > 0.0) as u8),
+            num(sim.has_level_up_points(id) as u8),
         );
         // The portrait's tint (portraits.gfx shows frame tint + 1). Provisional: always the
         // plain one; what sets the others is not traced.
@@ -518,11 +513,15 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     // the class checks that follow the sum are not traced.
     for id in &members {
         let can = sim.world.get(*id).is_some_and(|o| {
-            let points: f32 = [34, 35, 36, 38]
-                .iter()
-                .filter_map(|p| o.properties.get(p))
-                .map(|p| p.0)
-                .sum();
+            let points: f32 = if sim.game == thedas_vfs::Game::DragonAge2 {
+                &[38, 39][..]
+            } else {
+                &[34, 35, 36, 38][..]
+            }
+            .iter()
+            .filter_map(|p| o.properties.get(p))
+            .map(|p| p.0)
+            .sum();
             (o.fields.get("CanLevelUp").copied().unwrap_or(0) != 0 || points > 0.0)
                 && !o.combat.in_combat
         });

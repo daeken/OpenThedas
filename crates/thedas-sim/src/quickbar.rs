@@ -136,14 +136,39 @@ impl Sim {
         }
     }
 
+    /// The native ability range class. DA2 uses column 0xa7fa7789, read by
+    /// 0x640eb7; Origins uses ABI_base's Range column.
+    pub(crate) fn ability_range_class(&self, ability: i32) -> i32 {
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            return self.world.tables().get(1, "").map_or(0, |t| {
+                crate::engine::cell_int(t.cell_by_hash(0xa7fa_7789, i64::from(ability)))
+            });
+        }
+        self.abi_int(ability, "Range")
+    }
+
     /// How far from its target an ability can be used (metres): the `PrimaryRange` of the
     /// ranges.gda row its `ABI_base` `Range` names (`SpellRngTouch` 2.25, `SpellRngShrt` 8,
     /// `SpellRngMed` 25, `SpellRngLng` 35, `SpellRngXLong` 60). `None` for one used where its
     /// user stands (`SpellRngPers` and `SpellRngParty` are 0, and most talents name row 0).
     pub fn ability_range(&self, ability: i32) -> Option<f32> {
-        let row = self.abi_int(ability, "Range");
+        let row = self.ability_range_class(ability);
         if row <= 0 {
             return None;
+        }
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            // Native modern preparation 0x641104 reads the upper distance from
+            // combat_ranges (301), not Origins' ranges worksheet (134).
+            return self
+                .world
+                .tables()
+                .get(301, "")
+                .and_then(|t| match t.cell_by_hash(0x814f_8b88, i64::from(row)) {
+                    Some(Cell::Float(v)) => Some(*v as f32),
+                    Some(Cell::Int(v)) => Some(*v as f32),
+                    _ => None,
+                })
+                .filter(|r| r.is_finite() && *r > 0.0);
         }
         self.world
             .tables()

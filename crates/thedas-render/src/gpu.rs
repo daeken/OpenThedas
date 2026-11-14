@@ -1254,6 +1254,48 @@ impl AreaRenderer {
         }
     }
 
+    /// Diagnostic override for material-specific G-buffer shaders.
+    pub fn set_deferred_specialized_gbuffer(&mut self, enabled: Option<bool>) {
+        if let Some(d) = &mut self.deferred {
+            d.set_specialized_gbuffer(enabled);
+        }
+    }
+
+    /// Diagnostic override for squared-distance rejection before point-light shading.
+    pub fn set_deferred_early_light_reject(&mut self, enabled: Option<bool>) {
+        if let Some(d) = &mut self.deferred {
+            d.set_early_light_reject(enabled);
+        }
+    }
+
+    /// Diagnostic override for conservative view-depth light masks.
+    pub fn set_deferred_depth_lights(&mut self, enabled: Option<bool>) {
+        if let Some(d) = &mut self.deferred {
+            d.set_depth_lights(enabled);
+        }
+    }
+
+    /// Diagnostic override for direct terrain palette-layer selection.
+    pub fn set_deferred_direct_terrain_layers(&mut self, enabled: Option<bool>) {
+        if let Some(d) = &mut self.deferred {
+            d.set_direct_terrain_layers(enabled);
+        }
+    }
+
+    /// Overrides frond coverage for paired captures. `None` restores the planned mode.
+    pub fn set_deferred_fronds(&mut self, enabled: Option<bool>) {
+        if let Some(d) = self.deferred.as_mut() {
+            d.set_fronds(enabled);
+        }
+    }
+
+    /// Overrides branch and leaf coverage for paired captures.
+    pub fn set_deferred_tree_materials(&mut self, enabled: Option<bool>) {
+        if let Some(d) = self.deferred.as_mut() {
+            d.set_tree_materials(enabled);
+        }
+    }
+
     /// Grades the frame as area `grade` says: its colour curve and `da_hsvmatrix` values
     /// (DAOrigins.exe swaps them when an area becomes active, 0x67b1b0).
     pub fn set_area_grade(&mut self, ctx: &GpuContext, vfs: &Vfs, grade: &crate::post::AreaGrade) {

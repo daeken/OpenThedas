@@ -19,11 +19,15 @@ fn punch_opacity_keeps_holes_comparisons_rounding_and_shader_clip() {
         source: wgpu::ShaderSource::Wgsl(
             format!(
                 r#"{DEFERRED_WGSL}
+            {tree_alpha}
             @fragment fn fs_fixture(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {{
                 let opacity = textureSample(diffuse_tex, wrap_smp, vec2<f32>(p.x / 16.0, 0.5)).a;
-                if (!alpha_kept(opacity)) {{ discard; }}
+                if (draw.alpha.w == -2.0) {{
+                    if (!tree_alpha_kept(opacity, draw.alpha.z, draw.alpha.y)) {{ discard; }}
+                }} else if (!alpha_kept(opacity)) {{ discard; }}
                 return vec4<f32>(1.0);
-            }}"#
+            }}"#,
+                tree_alpha = trees::ALPHA_WGSL,
             )
             .into(),
         ),
@@ -147,7 +151,15 @@ fn punch_opacity_keeps_holes_comparisons_rounding_and_shader_clip() {
             (0, 0.25, -1.0),
             (255, 0.999, -1.0),
             (0, -2.0, -1.0),
+            (84, 1.0, -2.0),
+            (127, 0.5, -2.0),
+            (254, 0.999, -2.0),
+            (255, 1.0, -2.0),
+            (128, 2.0, -2.0),
         ] {
+            if clip == -2.0 && cmp != CompareFunc::Greater {
+                continue;
+            }
             draw.data.alpha = [
                 crate::deferred_alpha::comparison(cmp),
                 reference as f32,
@@ -201,7 +213,11 @@ fn punch_opacity_keeps_holes_comparisons_rounding_and_shader_clip() {
             let mapped = readback.slice(..).get_mapped_range().unwrap();
             for (i, a) in alpha.iter().enumerate() {
                 let opacity = *a as f32 / 255.0 * multiplier;
-                let rounded = (opacity.clamp(0.0, 1.0) * 255.0 + 0.5).floor() as u32;
+                let rounded = if clip == -2.0 {
+                    (opacity.clamp(0.0, 1.0) * 255.0).round_ties_even()
+                } else {
+                    (opacity.clamp(0.0, 1.0) * 255.0 + 0.5).floor()
+                } as u32;
                 let expected = (clip < 0.0 || opacity >= clip)
                     && match cmp {
                         CompareFunc::Never => false,
