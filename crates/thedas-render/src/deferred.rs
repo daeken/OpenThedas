@@ -1,10 +1,10 @@
 //! The deferred renderer: ours, not the original's, chosen at run time with
 //! [`RenderPath`] (see `docs/deferred.md`).
 //!
-//! The level's opaque Static1 draws go into a G-buffer, and one full-screen pass lights them
+//! The level's opaque Static1 and terrain draws go into a G-buffer, and one full-screen pass lights them
 //! per pixel with every light in reach: the sum Static1.psh works out per object for three
 //! lights (`notes/frame-gamma-lightmap-trace.md`), over all of them. Everything else (water,
-//! sky, terrain, trees, blended and multi-pass materials, the objects, particles) is drawn
+//! sky, trees, blended and multi-pass materials, the objects, particles) is drawn
 //! afterwards by the faithful pass, with its original shaders, over that colour and depth.
 //!
 //! Nothing here changes how the faithful path draws: with [`RenderPath::Faithful`] this
@@ -63,7 +63,7 @@ impl RenderPath {
 /// array, at most 16 KiB, which every backend can bind.
 const MAX_LIGHTS: usize = 192;
 /// Dynamic uniform offsets must be multiples of this on every backend.
-const DRAW_STRIDE: usize = 256;
+const DRAW_STRIDE: usize = 512;
 /// Room indices the lights' room sets can name; rooms past it are lit by every light.
 const MAX_ROOMS: u32 = 255;
 
@@ -100,6 +100,7 @@ struct DrawData {
     lightmap: [f32; 4],
     falloff: [f32; 4],
     room: [f32; 4],
+    terrain: crate::deferred_terrain::TerrainData,
 }
 
 #[repr(C)]
@@ -113,7 +114,14 @@ struct LightingUniforms {
     fog1: [f32; 4],
     counts: [u32; 4],
     size: [f32; 4],
-    sun_shadow: [[f32; 4]; 9],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SunUniforms {
+    data: [[f32; 4]; 9],
+    direction: [f32; 4],
+    enabled: [u32; 4],
 }
 
 #[repr(C)]
@@ -146,8 +154,8 @@ struct PlanDraw {
 pub(crate) struct DeferredPass {
     draws: Vec<PlanDraw>,
     data: Vec<DrawData>,
-    /// Diffuse, normal map, specular mask, lightmap and probe cubemap, per distinct set.
-    groups: Vec<[wgpu::TextureView; 5]>,
+    /// Diffuse, normal, specular, lightmap, probe cube and the three terrain masks.
+    groups: Vec<[wgpu::TextureView; 8]>,
     /// Per faithful draw (index into [`D3dPass::draws`]): whether this pass draws it.
     takes: Vec<bool>,
     /// The index each room id has in the lights' room sets (1 on; 0 is "no room").
@@ -183,6 +191,9 @@ struct Gpu {
     shadows: crate::deferred_shadow::ShadowPool,
     sun_fallback: wgpu::TextureView,
     sun_sampler: wgpu::Sampler,
+    sun_buffer: wgpu::Buffer,
+    sun_layout: wgpu::BindGroupLayout,
+    sun_group: Option<wgpu::BindGroup>,
     faces_buffer: wgpu::Buffer,
     lighting_group: wgpu::BindGroup,
     targets_layout: wgpu::BindGroupLayout,
@@ -241,6 +252,17 @@ fn static1(program: &crate::d3d::D3dProgram) -> bool {
         && p.z_write
 }
 
+fn terrain(program: &crate::d3d::D3dProgram) -> bool {
+    let p = &program.pass;
+    (program.name.starts_with("terrain2.vsh+terrain1.psh+")
+        || program.name.starts_with("terrain3.vsh+terrain3.psh+"))
+        && !program.instanced
+        && p.blend.is_none()
+        && p.alpha_test.is_none()
+        && p.z_enable
+        && p.z_write
+}
+
 impl DeferredPass {
     /// What a renderer of `scene` (the level's own meshes) draws deferred, with the
     /// textures it reads; `None` when nothing qualifies.
@@ -265,6 +287,7 @@ impl DeferredPass {
         let mut draws = Vec::new();
         let mut data = Vec::new();
         let mut takes = vec![false; d3d.draws.len()];
+        let terrain_enabled = std::env::var("THEDAS_DEFERRED_TERRAIN").as_deref() != Ok("0");
         for (k, d) in d3d.draws.iter().enumerate() {
             let program = d3d.program(d);
             let Some(item) = scene.draws.get(d.draw) else {
@@ -273,7 +296,7 @@ impl DeferredPass {
             let taken = d.draw < scene.static_draws
                 && !d3d.is_blended(d)
                 && !d.multipass
-                && static1(program)
+                && (static1(program) || (terrain_enabled && terrain(program)))
                 && item.skin.is_none()
                 && item.lod.is_none()
                 && !scene.cut_away.contains(&d.draw)
@@ -282,6 +305,7 @@ impl DeferredPass {
                 continue;
             };
             let lightmap = item.lightmap.as_ref().map(|l| l.texture.clone());
+            let is_terrain = terrain(program);
             // The probe's cubemap as the faithful pass binds it (see `d3d::sampler_texture`).
             let cube = item.probe.and_then(|p| scene.probes.get(p)).map(|p| {
                 let name = p.name.to_ascii_lowercase();
@@ -296,9 +320,25 @@ impl DeferredPass {
                 .or_insert_with(|| {
                     let param = |p: &str| [m.texture(p), crate::d3d::texture_default(m, p)];
                     groups.push([
-                        texture(&param("mml_tDiffuse"), tex2d, [128, 128, 128, 255]),
+                        texture(
+                            &param(if is_terrain {
+                                "palette"
+                            } else {
+                                "mml_tDiffuse"
+                            }),
+                            tex2d,
+                            [128, 128, 128, 255],
+                        ),
                         // A flat normal in DXT5nm's channels (x in alpha, y in green).
-                        texture(&param("mml_tNormalMap"), tex2d, [128, 128, 128, 128]),
+                        texture(
+                            &param(if is_terrain {
+                                "normal"
+                            } else {
+                                "mml_tNormalMap"
+                            }),
+                            tex2d,
+                            [128, 128, 128, 128],
+                        ),
                         texture(&param("mml_tSpecularMask"), tex2d, [0, 0, 0, 0]),
                         texture(
                             &[lightmap.clone(), Some("default_black.dds".into())],
@@ -310,6 +350,9 @@ impl DeferredPass {
                             TextureType::Cube,
                             [0, 0, 0, 255],
                         ),
+                        texture(&param("MaskV"), tex2d, [0, 0, 0, 255]),
+                        texture(&param("MaskA"), tex2d, [255, 0, 0, 0]),
+                        texture(&param("MaskA2"), tex2d, [0, 0, 0, 0]),
                     ]);
                     groups.len() - 1
                 });
@@ -348,13 +391,24 @@ impl DeferredPass {
                     [l.offset[0], l.offset[1], l.scale[0], l.scale[1]]
                 }),
                 falloff,
-                room: [room as f32, reflection, 0.0, 0.0],
+                room: [
+                    room as f32,
+                    reflection,
+                    if is_terrain { 1.0 } else { 0.0 },
+                    if program.name.starts_with("terrain3.") {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                ],
+                terrain: crate::deferred_terrain::TerrainData::new(m),
             });
         }
         log::info!(
-            "deferred: {} of the level's {} drawn meshes can be drawn deferred",
+            "deferred: {} of the level's {} drawn meshes can be drawn deferred ({} terrain)",
             draws.len(),
-            d3d.draws.len()
+            d3d.draws.len(),
+            data.iter().filter(|d| d.room[2] > 0.5).count()
         );
         (!draws.is_empty()).then(|| DeferredPass {
             draws,
@@ -481,6 +535,12 @@ impl DeferredPass {
                     },
                     count: None,
                 },
+                tex(7, true),
+                tex(8, true),
+                tex(9, true),
+                smp(10),
+                tex(11, true),
+                tex(12, true),
             ],
         });
         let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -509,14 +569,29 @@ impl DeferredPass {
                     },
                     count: None,
                 },
-                tex(6, true),
-                tex(7, true),
-                smp(8),
+            ],
+        });
+        let sun_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("deferred sun visibility"),
+            entries: &[
+                buffer_entry(0, f, uniform),
+                tex(1, true),
+                tex(2, true),
+                smp(3),
             ],
         });
         let gbuffer_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("deferred g-buffer"),
             bind_group_layouts: &[Some(&scene_layout), Some(&material_layout)],
+            immediate_size: 0,
+        });
+        let env_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("deferred reflection"),
+            bind_group_layouts: &[
+                Some(&scene_layout),
+                Some(&material_layout),
+                Some(&sun_layout),
+            ],
             immediate_size: 0,
         });
         let gbuffer_targets: Vec<Option<wgpu::ColorTargetState>> = GBUFFER
@@ -572,7 +647,7 @@ impl DeferredPass {
         let env = [None, Some(wgpu::Face::Back), Some(wgpu::Face::Front)].map(|cull| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("deferred reflection"),
-                layout: Some(&gbuffer_layout),
+                layout: Some(&env_layout),
                 vertex: wgpu::VertexState {
                     module: &module,
                     entry_point: Some("vs_gbuffer"),
@@ -625,7 +700,11 @@ impl DeferredPass {
         let lighting_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("deferred lighting"),
-                bind_group_layouts: &[Some(&lighting_layout), Some(&targets_layout)],
+                bind_group_layouts: &[
+                    Some(&lighting_layout),
+                    Some(&targets_layout),
+                    Some(&sun_layout),
+                ],
                 immediate_size: 0,
             });
         let lighting = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -698,10 +777,16 @@ impl DeferredPass {
         };
         let wrap = sampler("deferred wrap", wgpu::AddressMode::Repeat, 8);
         let clamp = sampler("deferred lightmap", wgpu::AddressMode::ClampToEdge, 1);
+        let point = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("deferred terrain layer indices"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
         let material_groups = self
             .groups
             .iter()
-            .map(|[d, n, s, l, e]| {
+            .map(|[d, n, s, l, e, mv, ma, ma2]| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("deferred material"),
                     layout: &material_layout,
@@ -733,6 +818,32 @@ impl DeferredPass {
                         wgpu::BindGroupEntry {
                             binding: 6,
                             resource: wgpu::BindingResource::TextureView(e),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::TextureView(mv),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: wgpu::BindingResource::TextureView(ma),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 9,
+                            resource: wgpu::BindingResource::TextureView(ma2),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 10,
+                            resource: wgpu::BindingResource::Sampler(&point),
+                        },
+                        // Separate bindings keep GL's one-sampler-per-image restriction:
+                        // static textures wrap; terrain palette textures clamp.
+                        wgpu::BindGroupEntry {
+                            binding: 11,
+                            resource: wgpu::BindingResource::TextureView(d),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 12,
+                            resource: wgpu::BindingResource::TextureView(n),
                         },
                     ],
                 })
@@ -815,6 +926,14 @@ impl DeferredPass {
                 min_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
             }),
+            sun_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("deferred sun visibility"),
+                size: std::mem::size_of::<SunUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            sun_layout,
+            sun_group: None,
             faces_buffer,
             lighting_group,
             targets_layout,
@@ -903,15 +1022,13 @@ impl DeferredPass {
             });
             // Targets 0-3 at bindings 0-3, the depth at 4, the shadow maps at 5.
             let sun_views = d3d.sun_shadows().map(|(_, views)| views);
-            let mut entries: Vec<wgpu::BindGroupEntry> = [
+            let entries: Vec<wgpu::BindGroupEntry> = [
                 &views[0],
                 &views[1],
                 &views[2],
                 &views[3],
                 depth,
                 &gpu.shadows.view,
-                sun_views.map_or(&gpu.sun_fallback, |v| &v[0]),
-                sun_views.map_or(&gpu.sun_fallback, |v| &v[1]),
             ]
             .into_iter()
             .enumerate()
@@ -920,10 +1037,32 @@ impl DeferredPass {
                 resource: wgpu::BindingResource::TextureView(v),
             })
             .collect();
-            entries.push(wgpu::BindGroupEntry {
-                binding: 8,
-                resource: wgpu::BindingResource::Sampler(&gpu.sun_sampler),
-            });
+            gpu.sun_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("deferred sun visibility"),
+                layout: &gpu.sun_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: gpu.sun_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(
+                            sun_views.map_or(&gpu.sun_fallback, |v| &v[0]),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(
+                            sun_views.map_or(&gpu.sun_fallback, |v| &v[1]),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&gpu.sun_sampler),
+                    },
+                ],
+            }));
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("deferred g-buffer"),
                 layout: &gpu.targets_layout,
@@ -998,20 +1137,26 @@ impl DeferredPass {
             sun_colour: sun_colour.to_array(),
             fog0: fog[0],
             fog1: fog[1],
-            counts: [
-                gpu.lights.len() as u32,
-                debug_view(),
+            counts: [gpu.lights.len() as u32, debug_view(), 0, 0],
+            size: [width as f32, height as f32, 0.0, 0.0],
+        };
+        let sun = SunUniforms {
+            data: d3d
+                .sun_shadows()
+                .map_or(crate::d3d::NO_SHADOW_DATA, |(data, _)| data),
+            direction: sun_dir.to_array(),
+            enabled: [
                 u32::from(
                     d3d.sun_shadows().is_some()
                         && std::env::var("THEDAS_DEFERRED_SUN_SHADOWS").as_deref() != Ok("0"),
                 ),
                 0,
+                0,
+                0,
             ],
-            size: [width as f32, height as f32, 0.0, 0.0],
-            sun_shadow: d3d
-                .sun_shadows()
-                .map_or(crate::d3d::NO_SHADOW_DATA, |(data, _)| data),
         };
+        ctx.queue
+            .write_buffer(&gpu.sun_buffer, 0, bytemuck::bytes_of(&sun));
         ctx.queue
             .write_buffer(&gpu.lighting_buffer, 0, bytemuck::bytes_of(&lighting));
 
@@ -1093,6 +1238,7 @@ impl DeferredPass {
             pass.set_pipeline(&gpu.lighting);
             pass.set_bind_group(0, &gpu.lighting_group, &[]);
             pass.set_bind_group(1, &targets.group, &[]);
+            pass.set_bind_group(2, gpu.sun_group.as_ref().expect("sun targets"), &[]);
             pass.draw(0..3, 0..1);
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1118,6 +1264,7 @@ impl DeferredPass {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        pass.set_bind_group(2, gpu.sun_group.as_ref().expect("sun targets"), &[]);
         draw_all(&self.draws, &mut pass, gpu, &gpu.env, d3d, meshes);
         true
     }
