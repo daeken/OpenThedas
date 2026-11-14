@@ -4722,7 +4722,11 @@ pub fn call(
                 .collect();
             ok(objects(list))
         }
-        "ObjectToString" => ok(Value::String(format!("{}", obj(a, 0)))),
+        // Origins formats the raw id as signed decimal, without resolving it (0x64f890).
+        "ObjectToString" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(Value::String((obj(a, 0) as i32).to_string()))
+        }
+        "ObjectToString" => ok(Value::String(obj(a, 0).to_string())),
         "GetNameStrref" => ok(Value::Int(
             h.object(obj(a, 0))
                 .and_then(|o| o.name_strref)
@@ -6096,6 +6100,39 @@ mod tests {
             );
         }
         assert!(convert(&mut s, "NaN").is_nan());
+    }
+
+    #[test]
+    fn origins_object_to_string_formats_raw_ids_as_signed_decimal() {
+        let table = Arc::new(EngineTable::parse(b"string ObjectToString(object o) = 54;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let live = s.world.spawn(ObjectKind::Creature, "not_the_id");
+        s.world.get_mut(live).unwrap().template = "not_the_template".into();
+        let removed = s.world.spawn(ObjectKind::Placeable, "removed");
+        s.world.objects.remove(&removed);
+        let convert = |s: &mut Sim, id| run(s, live, "ObjectToString", &[Value::Object(id)]);
+        for (id, expected) in [
+            (0, "0"),
+            (live, "1"),
+            (removed, "2"),
+            (OBJECT_INVALID, "2130706432"),
+            (0x7fff_ffff, "2147483647"),
+            (0x8000_0000, "-2147483648"),
+            (0xffff_fffe, "-2"),
+            (0xffff_ffff, "-1"),
+        ] {
+            assert_eq!(convert(&mut s, id), Some(Value::String(expected.into())));
+        }
+        // DA2's formatting is untraced and retains its earlier unsigned result.
+        s.game = thedas_vfs::Game::DragonAge2;
+        for (id, expected) in [
+            (live, "1"),
+            (OBJECT_INVALID, "2130706432"),
+            (0x8000_0000, "2147483648"),
+            (0xffff_ffff, "4294967295"),
+        ] {
+            assert_eq!(convert(&mut s, id), Some(Value::String(expected.into())));
+        }
     }
 
     /// Calls engine function `name` as `caller`.
