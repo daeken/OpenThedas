@@ -23,6 +23,9 @@ use crate::deferred_mesh::{DeferredVertex, ROWS, SKIN_STRIDE};
 use crate::gpu::{DEPTH_FORMAT, GpuContext, GpuMesh, TextureCache, checked};
 use crate::scene::{AreaScene, DOMAIN_CHARACTERS, DOMAIN_LEVEL, SceneLight};
 
+#[path = "deferred_light_masks.rs"]
+mod light_masks;
+
 pub const DEFERRED_WGSL: &str = concat!(
     include_str!("deferred_skin.wgsl"),
     include_str!("deferred.wgsl")
@@ -168,6 +171,7 @@ struct GpuLight {
 /// One draw the deferred pass takes from the faithful one.
 #[derive(Clone, Debug)]
 struct PlanDraw {
+    alpha_test: bool,
     /// Its index in [`D3dPass::draws`].
     k: usize,
     /// Its scene draw.
@@ -215,6 +219,9 @@ pub(crate) struct DeferredPass {
     culling: Option<[bool; 2]>,
     shadow_reuse: Option<bool>,
     fused_reflections: Option<bool>,
+    tight_tiles: Option<bool>,
+    light_masks: Option<bool>,
+    opaque_gbuffer: Option<bool>,
 }
 
 pub(crate) struct Contributor<'a> {
@@ -226,6 +233,7 @@ pub(crate) struct Contributor<'a> {
 struct Gpu {
     /// By cull mode: none, back, front.
     gbuffer: [wgpu::RenderPipeline; 3],
+    gbuffer_opaque: [wgpu::RenderPipeline; 3],
     /// Separate reflection for probe/AO and diagnostic modes (by cull mode).
     env: [wgpu::RenderPipeline; 3],
     lighting: wgpu::RenderPipeline,
@@ -243,6 +251,8 @@ struct Gpu {
     light_buffer: wgpu::Buffer,
     tile_buffer: wgpu::Buffer,
     tiles: Vec<[u32; 8]>,
+    mask_buffer: wgpu::Buffer,
+    light_masks: Option<light_masks::Masks>,
     /// The shadowed lights' maps, and their faces' view-projections for the lighting.
     shadows: Option<crate::deferred_shadow::ShadowPool>,
     sun_fallback: wgpu::TextureView,
@@ -591,6 +601,7 @@ impl DeferredPass {
                 crate::d3d::material_vector(m, "mml_fSpecularReflectionMult").map_or(1.0, |v| v[0]);
             takes[k] = true;
             draws.push(PlanDraw {
+                alpha_test: alpha.is_some(),
                 k,
                 draw: d.draw,
                 mesh: d.mesh,
@@ -754,6 +765,9 @@ impl DeferredPass {
             culling: None,
             shadow_reuse: None,
             fused_reflections: None,
+            tight_tiles: None,
+            light_masks: None,
+            opaque_gbuffer: None,
         })
     }
 
@@ -768,6 +782,18 @@ impl DeferredPass {
 
     pub(crate) fn set_fused_reflections(&mut self, enabled: Option<bool>) {
         self.fused_reflections = enabled;
+    }
+
+    pub(crate) fn set_tight_tiles(&mut self, enabled: Option<bool>) {
+        self.tight_tiles = enabled;
+    }
+
+    pub(crate) fn set_light_masks(&mut self, enabled: Option<bool>) {
+        self.light_masks = enabled;
+    }
+
+    pub(crate) fn set_opaque_gbuffer(&mut self, enabled: Option<bool>) {
+        self.opaque_gbuffer = enabled;
     }
 
     /// Sets the lights only this pass draws (see [`DeferredPass::effect_lights`]).
@@ -916,6 +942,7 @@ impl DeferredPass {
                 buffer_entry(1, f, uniform),
                 buffer_entry(2, f, uniform),
                 buffer_entry(3, f, uniform),
+                buffer_entry(4, f, uniform),
             ],
         });
         let targets_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -975,7 +1002,8 @@ impl DeferredPass {
                 })
             })
             .collect();
-        let gbuffer = [None, Some(wgpu::Face::Back), Some(wgpu::Face::Front)].map(|cull| {
+        let make_gbuffer = |entry_point| {
+            [None, Some(wgpu::Face::Back), Some(wgpu::Face::Front)].map(|cull| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("deferred g-buffer"),
                 layout: Some(&gbuffer_layout),
@@ -1007,14 +1035,17 @@ impl DeferredPass {
                 multisample: wgpu::MultisampleState::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &module,
-                    entry_point: Some("fs_gbuffer"),
+                    entry_point: Some(entry_point),
                     compilation_options: Default::default(),
                     targets: &gbuffer_targets,
                 }),
                 multiview_mask: None,
                 cache: None,
             })
-        });
+        })
+        };
+        let gbuffer = make_gbuffer("fs_gbuffer");
+        let gbuffer_opaque = make_gbuffer("fs_gbuffer_opaque");
         let env = [None, Some(wgpu::Face::Back), Some(wgpu::Face::Front)].map(|cull| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("deferred reflection"),
@@ -1277,6 +1308,12 @@ impl DeferredPass {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let mask_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("deferred light membership"),
+            size: std::mem::size_of::<light_masks::Masks>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let lighting_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("deferred lighting"),
             layout: &lighting_layout,
@@ -1297,6 +1334,10 @@ impl DeferredPass {
                     binding: 3,
                     resource: tile_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: mask_buffer.as_entire_binding(),
+                },
             ],
         });
         let mut order: Vec<usize> = (0..self.draws.len()).collect();
@@ -1306,8 +1347,11 @@ impl DeferredPass {
         });
         Gpu {
             gbuffer,
+            gbuffer_opaque,
             env,
             lighting,
+            mask_buffer,
+            light_masks: None,
             frame_buffer,
             draw_buffer,
             scene_group,
@@ -1663,12 +1707,21 @@ impl DeferredPass {
         let (view, projection) = (camera.view(), camera.projection(aspect));
         let fog = d3d.fog();
         if lights != gpu.lights {
+            let masks = light_masks::build(&lights);
+            if gpu.light_masks.as_ref() != Some(&masks) {
+                ctx.queue
+                    .write_buffer(&gpu.mask_buffer, 0, bytemuck::bytes_of(&masks));
+                gpu.light_masks = Some(masks);
+            }
             if !lights.is_empty() {
                 ctx.queue
                     .write_buffer(&gpu.light_buffer, 0, bytemuck::cast_slice(&lights));
             }
             gpu.lights = lights;
         }
+        let tight = self
+            .tight_tiles
+            .unwrap_or(crate::config::CONFIG.tight_tiles);
         let tiles = crate::deferred_tiles::build(
             projection * view,
             (width, height),
@@ -1677,6 +1730,7 @@ impl DeferredPass {
             self.culling
                 .map(|c| c[0])
                 .unwrap_or(crate::config::CONFIG.tiled_lights),
+            tight,
         );
         if gpu.tiles.as_slice() != tiles {
             ctx.queue
@@ -1684,14 +1738,14 @@ impl DeferredPass {
             gpu.tiles = tiles.to_vec();
         }
         if crate::config::CONFIG.log_lights {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
+            static ONCE: [std::sync::Once; 2] = [std::sync::Once::new(), std::sync::Once::new()];
+            ONCE[usize::from(tight)].call_once(|| {
                 let counts: Vec<_> = tiles
                     .iter()
                     .map(|t| t.iter().map(|v| v.count_ones()).sum::<u32>())
                     .collect();
                 log::info!(
-                    "deferred tiles: {} lights, {:.1} average / {} max candidates per tile",
+                    "deferred tiles (frusta={tight}): {} lights, {:.1} average / {} max candidates per tile",
                     gpu.lights.len(),
                     counts.iter().sum::<u32>() as f32 / counts.len() as f32,
                     counts.iter().max().copied().unwrap_or(0)
@@ -1713,7 +1767,10 @@ impl DeferredPass {
             counts: [
                 gpu.lights.len() as u32,
                 debug_view(),
-                0,
+                u32::from(
+                    self.light_masks
+                        .unwrap_or(crate::config::CONFIG.light_masks),
+                ),
                 if self.baked_lighting {
                     0
                 } else if self.ssao {
@@ -1777,7 +1834,7 @@ impl DeferredPass {
             pool.encode(device, &ctx.queue, encoder, &shadowed, &casters);
         }
         if let Some(p) = profile.as_deref_mut() {
-            p.mark("point_shadows");
+            p.stage(ctx, encoder, "point_shadows");
         }
 
         let Some(targets) = gpu.targets.as_ref() else {
@@ -1815,15 +1872,34 @@ impl DeferredPass {
                 multiview_mask: None,
             });
             pass.set_bind_group(2, gpu.sun_group.as_ref().expect("sun targets"), &[]);
-            draw_all(&self.draws, &mut pass, gpu, &gpu.gbuffer, d3d, meshes);
+            let opaque = self
+                .opaque_gbuffer
+                .unwrap_or(crate::config::CONFIG.opaque_gbuffer);
+            draw_all(
+                &self.draws,
+                &mut pass,
+                gpu,
+                &gpu.gbuffer,
+                opaque.then_some(&gpu.gbuffer_opaque),
+                d3d,
+                meshes,
+            );
             for c in contributors.iter() {
                 if let Some(g) = c.pass.gpu.as_ref() {
-                    draw_all(&c.pass.draws, &mut pass, g, &g.gbuffer, c.d3d, c.meshes);
+                    draw_all(
+                        &c.pass.draws,
+                        &mut pass,
+                        g,
+                        &g.gbuffer,
+                        opaque.then_some(&g.gbuffer_opaque),
+                        c.d3d,
+                        c.meshes,
+                    );
                 }
             }
         }
         if let Some(p) = profile.as_deref_mut() {
-            p.mark("gbuffer");
+            p.stage(ctx, encoder, "gbuffer");
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1849,7 +1925,7 @@ impl DeferredPass {
             pass.draw(0..3, 0..1);
         }
         if let Some(p) = profile.as_deref_mut() {
-            p.mark("lighting");
+            p.stage(ctx, encoder, "lighting");
         }
         if fused_reflections {
             if let Some(p) = profile {
@@ -1881,15 +1957,15 @@ impl DeferredPass {
             multiview_mask: None,
         });
         pass.set_bind_group(2, gpu.sun_group.as_ref().expect("sun targets"), &[]);
-        draw_all(&self.draws, &mut pass, gpu, &gpu.env, d3d, meshes);
+        draw_all(&self.draws, &mut pass, gpu, &gpu.env, None, d3d, meshes);
         for c in contributors.iter() {
             if let Some(g) = c.pass.gpu.as_ref() {
-                draw_all(&c.pass.draws, &mut pass, g, &g.env, c.d3d, c.meshes);
+                draw_all(&c.pass.draws, &mut pass, g, &g.env, None, c.d3d, c.meshes);
             }
         }
         drop(pass);
         if let Some(p) = profile {
-            p.mark("reflection");
+            p.stage(ctx, encoder, "reflection");
         }
         true
     }
@@ -2070,11 +2146,13 @@ fn casters<'a>(
 }
 
 /// Draws the deferred draws in view with `pipelines` (by cull mode).
+#[allow(clippy::too_many_arguments)]
 fn draw_all(
     draws: &[PlanDraw],
     pass: &mut wgpu::RenderPass<'_>,
     gpu: &Gpu,
     pipelines: &[wgpu::RenderPipeline; 3],
+    opaque_pipelines: Option<&[wgpu::RenderPipeline; 3]>,
     d3d: &D3dPass,
     meshes: &[GpuMesh],
 ) {
@@ -2088,9 +2166,11 @@ fn draw_all(
             continue;
         };
         let p = cull_index(d.cull);
-        if p != pipeline {
-            pass.set_pipeline(&pipelines[p]);
-            pipeline = p;
+        let opaque = opaque_pipelines.filter(|_| !d.alpha_test);
+        let key = p + if opaque.is_some() { 3 } else { 0 };
+        if key != pipeline {
+            pass.set_pipeline(&opaque.unwrap_or(pipelines)[p]);
+            pipeline = key;
         }
         if d.group != group {
             pass.set_bind_group(1, &gpu.material_groups[d.group], &[]);
@@ -2264,6 +2344,14 @@ mod tests {
                 continue;
             }
             let used = info.get_entry_point(i);
+            if entry.name == "fs_gbuffer_opaque" {
+                assert!(
+                    !used.may_kill,
+                    "opaque G-buffer must have no reachable discard"
+                );
+            } else if entry.name == "fs_gbuffer" {
+                assert!(used.may_kill, "cutout G-buffer must retain alpha rejection");
+            }
             let textures = module
                 .global_variables
                 .iter()
