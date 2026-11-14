@@ -11,6 +11,10 @@ use wgpu::util::DeviceExt;
 #[path = "forward_transparency_tests.rs"]
 mod forward_transparency_tests;
 
+#[cfg(test)]
+#[path = "deferred_cutaway_tests.rs"]
+mod deferred_cutaway_tests;
+
 use crate::camera::Camera;
 use crate::material::{BlendMode, MaterialProgram, Program, ProgramRegistry, Resolved};
 use crate::scene::{AreaScene, Vertex};

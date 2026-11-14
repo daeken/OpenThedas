@@ -507,6 +507,19 @@ fn fs_gbuffer_terrain(in: VsOut) -> GBuffer {
     return baked_base(in, sampled.data, sampled.surface, 2u);
 }
 
+@fragment
+fn fs_gbuffer_black(in: VsOut) -> GBuffer {
+    var out: GBuffer;
+    // A dedicated material tag bypasses lighting, fog and all debug colour terms.
+    // Keep a finite normal for depth-based AO and the shared ground mask.
+    out.albedo = vec4<f32>(0.0, 0.0, 0.0, 32.0 / 255.0);
+    out.specular = vec4<f32>(0.0);
+    let n = in.normal * inverseSqrt(max(dot(in.normal, in.normal), 1e-20));
+    out.normal = vec4<f32>(oct_encode(select(vec3<f32>(0.0, 0.0, 1.0), n, dot(n, n) > 0.0)), draw.room.x, 1.0);
+    out.lightmap = vec4<f32>(0.0);
+    return out;
+}
+
 // Match the translated D3D9 shader's extra clip and rounded saturated 8-bit alpha test.
 fn alpha_kept(sampled: f32) -> bool {
     return alpha_test(sampled, draw.alpha);
@@ -574,7 +587,7 @@ fn baked_base(in: VsOut, g: GBuffer, s: Surface, kind: u32) -> GBuffer {
 // and the falloff.
 @fragment
 fn fs_env(in: VsOut) -> @location(0) vec4<f32> {
-    if (draw.material.w > 0.5) {
+    if (draw.material.x < 0.0 || draw.material.w > 0.5) {
         return vec4<f32>(0.0);
     }
     if (draw.room.z > 0.5) {
@@ -866,6 +879,7 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let ga = textureLoad(g_albedo, px, 0);
     let albedo = ga.rgb;
     let material = u32(round(ga.a * 255.0));
+    if (material == 32u) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
     let terrain = material == 128u || material == 255u;
     let terrain_low = material == 128u;
     let character = material == 192u;
@@ -910,7 +924,13 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         // trigonometric falloff, specular normalization and shadow lookups.
         let wrap = lighting.counts.y == 9u;
         let reach = position.w * select(1.0, 2.0, wrap);
-        if ((u32(lighting.size.w) & 1u) != 0u && dot(to, to) >= reach * reach * 1.000001) { continue; }
+        if ((u32(lighting.size.w) & 1u) != 0u) {
+            if (dot(to, to) >= reach * reach * 1.000001) { continue; }
+            // Reject clear back faces before the remaining light loads and sqrt.
+            // Keep a margin at the tangent plane for the later normalized dot's
+            // rounding; it remains the authority for near-zero contributions.
+            if (dot(n, to) < -0.00001 * reach) { continue; }
+        }
         let light_colour = lights[i].colour;
         let light_shadow = lights[i].shadow;
         if (lighting.counts.z == 0u) {

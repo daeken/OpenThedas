@@ -57,8 +57,27 @@ pub enum UiKey {
     Right,
     Home,
     End,
+    /// Shift navigation extends the selection from its existing anchor.
+    SelectLeft,
+    SelectRight,
+    SelectHome,
+    SelectEnd,
     /// Ctrl+A: select the field's text (typing then replaces it).
     SelectAll,
+}
+
+impl UiKey {
+    /// Retains Shift on text navigation; other edits and typed characters already
+    /// carry their meaning without a modifier.
+    pub fn with_shift(self) -> Self {
+        match self {
+            Self::Left => Self::SelectLeft,
+            Self::Right => Self::SelectRight,
+            Self::Home => Self::SelectHome,
+            Self::End => Self::SelectEnd,
+            key => key,
+        }
+    }
 }
 
 /// A value passed between a movie and the application.
@@ -444,7 +463,7 @@ impl UiMovie {
             lookup,
             atlas,
             bridge,
-            avm1::register_invoke(),
+            avm1::register_invoke(name),
         )?;
         let authored = {
             let (w, h) = m.player.vm.movie.stage_size();
