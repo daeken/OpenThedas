@@ -10,6 +10,9 @@ use crate::display::{Clip, DEPTH_OFFSET, Display, DisplayId, Kind, Object};
 use crate::swf::{Character, ClipAction, Command, Movie, Place, Record, clip_event};
 use crate::text::{Fonts, TextField};
 
+#[cfg(test)]
+mod construction_tests;
+
 /// Scaleform's mouse buttons as the movies number them.
 pub const MOUSE_LEFT: u8 = 1;
 pub const MOUSE_RIGHT: u8 = 2;
@@ -932,6 +935,19 @@ fn constructed(vm: &mut Vm, d: DisplayId, by_script: bool, init: Option<ObjId>) 
     let character = o.clip().map(|c| c.character).unwrap_or(0);
     let ctor = vm.classes.get(&character).cloned();
     display_api::display_value(vm, d);
+    if !by_script {
+        // Reserve the parent's construction work before frame one recursively places
+        // its children. Registered classes may keep the last instance they construct
+        // to associate post-load callbacks with the final descendant.
+        for e in clip_events(vm, d, clip_event::INITIALIZE) {
+            vm.queue.push_back(Queued::Init(d, e));
+        }
+        vm.queue.push_back(Queued::Construct {
+            clip: d,
+            ctor: ctor.clone(),
+            events: clip_events(vm, d, clip_event::CONSTRUCT),
+        });
+    }
     // The clip's load event is queued before its first frame makes its children, so a
     // parent hears `onLoad` before the clips inside it (as Ruffle and Scaleform order it).
     let load = clip_events(vm, d, clip_event::LOAD);
@@ -959,15 +975,6 @@ fn constructed(vm: &mut Vm, d: DisplayId, by_script: bool, init: Option<ObjId>) 
             }
             vm.call_with_base(&ctor, obj, &[], proto);
         }
-    } else {
-        for e in clip_events(vm, d, clip_event::INITIALIZE) {
-            vm.queue.push_back(Queued::Init(d, e));
-        }
-        vm.queue.push_back(Queued::Construct {
-            clip: d,
-            ctor,
-            events: clip_events(vm, d, clip_event::CONSTRUCT),
-        });
     }
 }
 
