@@ -961,7 +961,7 @@ fn wrap_returning(out: &mut Vec<u8>, f: &str) {
 /// The body of a `DoAction` tag registering [`INVOKE_CALLBACK`]
 /// (`flash.external.ExternalInterface.addCallback("thedas_invoke", null, function ...)`) and
 /// wrapping [`RETURNING_FSCOMMANDS`].
-pub fn register_invoke() -> Vec<u8> {
+pub fn register_invoke(movie_name: &str) -> Vec<u8> {
     let mut out = Vec::new();
     // _global.thedas_wrap = wrap_maker
     get_path(&mut out, &["_global"]);
@@ -1089,29 +1089,32 @@ pub fn register_invoke() -> Vec<u8> {
     get_path(&mut install, &["_global"]);
     push(&mut install, &[Push::Str("thedas_text_wrap")]);
     install.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
-    // Wrap the credits' authored scroll update once, when that class is present.
-    let mut credits = Vec::new();
-    get_path(&mut credits, &["_global", "Credits"]);
-    push(&mut credits, &[Push::Str("UpdateBoxPositions")]);
-    get_path(&mut credits, &["_global", "Credits", "UpdateBoxPositions"]);
-    push(&mut credits, &[Push::Int(1)]);
-    credits.extend(credits_scroll_wrap_maker());
-    push(&mut credits, &[Push::Undefined]);
-    credits.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
-    get_path(&mut credits, &["_global", "Credits", "UpdateBoxPositions"]);
-    push(&mut credits, &[Push::Str("thedas_w"), Push::Bool(true)]);
-    credits.push(SET_MEMBER);
-    let mut credits_install = Vec::new();
-    get_path(
-        &mut credits_install,
-        &["_global", "Credits", "UpdateBoxPositions", "thedas_w"],
-    );
-    branch(&mut credits_install, IF, credits.len(), false);
-    credits_install.extend(credits);
-    get_path(&mut install, &["_global", "Credits", "UpdateBoxPositions"]);
-    install.push(NOT);
-    branch(&mut install, IF, credits_install.len(), false);
-    install.extend(credits_install);
+    // Only credits.gfx uses this layout repair. Other movies may define a Credits
+    // class too; its presence alone must never opt them into credits host glue.
+    if movie_name.eq_ignore_ascii_case("credits.gfx") {
+        let mut credits = Vec::new();
+        get_path(&mut credits, &["_global", "Credits"]);
+        push(&mut credits, &[Push::Str("UpdateBoxPositions")]);
+        get_path(&mut credits, &["_global", "Credits", "UpdateBoxPositions"]);
+        push(&mut credits, &[Push::Int(1)]);
+        credits.extend(credits_scroll_wrap_maker());
+        push(&mut credits, &[Push::Undefined]);
+        credits.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
+        get_path(&mut credits, &["_global", "Credits", "UpdateBoxPositions"]);
+        push(&mut credits, &[Push::Str("thedas_w"), Push::Bool(true)]);
+        credits.push(SET_MEMBER);
+        let mut credits_install = Vec::new();
+        get_path(
+            &mut credits_install,
+            &["_global", "Credits", "UpdateBoxPositions", "thedas_w"],
+        );
+        branch(&mut credits_install, IF, credits.len(), false);
+        credits_install.extend(credits);
+        get_path(&mut install, &["_global", "Credits", "UpdateBoxPositions"]);
+        install.push(NOT);
+        branch(&mut install, IF, credits_install.len(), false);
+        install.extend(credits_install);
+    }
     get_path(&mut out, &["_global"]);
     push(&mut out, &[Push::Str("thedas_post_load_wrap")]);
     out.extend(post_load_wrap_maker());
@@ -1214,7 +1217,7 @@ mod tests {
             "mouse-init-test",
             Box::new(Empty),
             std::sync::Arc::new(Empty),
-            Some(register_invoke()),
+            Some(register_invoke("mouse-init-test.gfx")),
         )
         .unwrap();
         let root = player.vm.display_object(player.vm.root);
@@ -1246,7 +1249,7 @@ mod tests {
             "bridge-test",
             Box::new(Empty),
             std::sync::Arc::new(Empty),
-            Some(register_invoke()),
+            Some(register_invoke("bridge-test.gfx")),
         )
         .unwrap();
         player.run_frame();
@@ -1352,10 +1355,10 @@ mod tests {
         let movie = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
         let mut player = thedas_gfx::Player::new(
             movie,
-            "credits-test",
+            "credits.gfx",
             Box::new(Empty),
             std::sync::Arc::new(Empty),
-            Some(register_invoke()),
+            Some(register_invoke("credits.gfx")),
         )
         .unwrap();
         player.run_frame();
@@ -1436,6 +1439,53 @@ mod tests {
     }
 
     #[test]
+    fn other_movies_do_not_wrap_credits_even_when_the_class_exists() {
+        use thedas_gfx::avm1::value::Value;
+
+        for name in ["journal.gfx", "mainmenu.gfx", "other-credits.gfx"] {
+            let movie = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+            let mut player = thedas_gfx::Player::new(
+                movie,
+                name,
+                Box::new(Empty),
+                std::sync::Arc::new(Empty),
+                Some(register_invoke(name)),
+            )
+            .unwrap();
+            player.run_frame();
+            let credits = Value::Object(player.vm.new_object());
+            player
+                .vm
+                .define(player.vm.global, "Credits", credits.clone(), 0);
+            let original = Value::Object(player.vm.new_native(|vm, this, _| {
+                vm.set(&this, "called", Value::Bool(true));
+                Value::Number(42.0)
+            }));
+            player
+                .vm
+                .set(&credits, "UpdateBoxPositions", original.clone());
+            for _ in 0..2 {
+                player.invoke(INSTALL, &[]);
+                assert_eq!(
+                    player.vm.get(&credits, "UpdateBoxPositions"),
+                    original,
+                    "{name}"
+                );
+                assert_eq!(
+                    player.vm.get(&original, "thedas_w"),
+                    Value::Undefined,
+                    "{name}"
+                );
+            }
+            assert_eq!(
+                player.vm.call_method(&credits, "UpdateBoxPositions", &[]),
+                Value::Number(42.0)
+            );
+            assert_eq!(player.vm.get(&credits, "called"), Value::Bool(true));
+        }
+    }
+
+    #[test]
     fn function_length_covers_body() {
         let f = invoke_function();
         assert_eq!(f[0], DEFINE_FUNCTION);
@@ -1444,6 +1494,6 @@ mod tests {
         let code = u16::from_le_bytes([header[len - 2], header[len - 1]]) as usize;
         assert_eq!(3 + len + code, f.len());
         assert_eq!(*f.last().unwrap(), RETURN);
-        assert_eq!(*register_invoke().last().unwrap(), 0);
+        assert_eq!(*register_invoke("bridge-test.gfx").last().unwrap(), 0);
     }
 }
