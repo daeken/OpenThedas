@@ -67,6 +67,10 @@ pub const LIST_FILE: &str = "mods.txt";
 /// to load no mods at all, not even the user override folder.
 pub const ENV_VAR: &str = "THEDAS_MODS";
 
+/// Explicit original-game user folder, for example a Wine prefix's Documents folder.
+/// This names the Dragon Age directory itself, rather than its Documents parent.
+pub const USER_DIR_ENV_VAR: &str = "THEDAS_USER_DIR";
+
 /// Label prefix of a layer mounted from the original's folder in the player's documents.
 pub const USER_LABEL: &str = "user:";
 
@@ -271,12 +275,35 @@ fn home_dir() -> Option<PathBuf> {
 /// The original's folder in this player's documents (`BioWare/Dragon Age`, or
 /// `BioWare/Dragon Age 2`), if there is one. Looked for under the Documents folder and, off
 /// Windows, under `HOME/Documents` (so a scratch `HOME` hides the real one).
+/// `THEDAS_USER_DIR` explicitly selects the game's user directory on either platform.
 pub fn original_user_dir(game: crate::install::Game) -> Option<PathBuf> {
     let docs = if cfg!(windows) {
         dirs::document_dir()
     } else {
         home_dir().map(|h| h.join("Documents"))
-    }?;
+    };
+    original_user_dir_at(
+        game,
+        docs,
+        std::env::var_os(USER_DIR_ENV_VAR)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from),
+    )
+}
+
+fn original_user_dir_at(
+    game: crate::install::Game,
+    docs: Option<PathBuf>,
+    explicit: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(dir) = explicit {
+        if !dir.is_dir() {
+            log::warn!("{USER_DIR_ENV_VAR}: no directory {}", dir.display());
+            return None;
+        }
+        return Some(dir);
+    }
+    let docs = docs?;
     let name = match game {
         crate::install::Game::Origins => "BioWare/Dragon Age",
         crate::install::Game::DragonAge2 => "BioWare/Dragon Age 2",
@@ -1217,6 +1244,28 @@ mod tests {
         assert_eq!(report[0].problems.len(), 1);
         assert!(overlay.is_empty());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn an_explicit_user_folder_can_live_outside_documents() {
+        let base = scratch("user-dir");
+        let docs = base.join("Documents");
+        let default = docs.join("BioWare/Dragon Age");
+        let imported = base.join("Wine/imported-user-data");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::create_dir_all(&imported).unwrap();
+        let game = crate::install::Game::Origins;
+        assert_eq!(
+            original_user_dir_at(game, Some(docs.clone()), None),
+            Some(default)
+        );
+        assert_eq!(
+            original_user_dir_at(game, Some(docs.clone()), Some(imported.clone())),
+            Some(imported)
+        );
+        assert!(original_user_dir_at(game, Some(docs), Some(base.join("missing"))).is_none());
+        assert!(original_user_dir_at(game, None, None).is_none());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
