@@ -73,6 +73,10 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
    Timeline-placed registered classes construct parents before descendants. This preserves
    the GUI framework's last-created element and associates post-load callbacks with the
    intended child, including popup centring before the text resizes its box.
+   Timeline jumps rebuild a symbol removed and placed afresh at the same depth, including
+   its name, constructor and callbacks. Rewinds preserve script state only while the
+   instance's original placement remains in the target frame. This keeps chargen's
+   appearance navigation and load-screen headers from retaining the previous scene.
    `MovieClip.setMask` accepts clip objects and activation-relative paths, transfers a mask
    from its previous owner, and clears with null/undefined. Removal detaches both links.
    Dynamic masks use filled geometry in stage space, ignore visibility/alpha and filters,
