@@ -34,7 +34,7 @@ so an untraced item starts with a trace, not with a guess.
 
 | Area | File | Inventory items |
 | --- | --- | --- |
-| Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 164 (`SIM-`), plus ability coverage by family |
+| Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 161 (`SIM-`), plus ability coverage by family |
 | Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 96 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
 | Rendering | [gaps/rendering.md](gaps/rendering.md) | 152 (`RND-`) |
 | Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 180 (`UI-`), plus the movies never opened and the values no screen gets answered |
@@ -177,7 +177,7 @@ Concrete defects found during the code read. Each is small and independent.
 | `FMT-009` | The `Offers/` folder is not mounted for resources, though audio reads it |
 
 Several stale comments and README sections were also found; they are listed in the area files
-(`SIM-004`, `SIM-029`, `SIM-147`, `UI-145`, `CAM-036`, `TOOL-001` to
+(`UI-145`, `CAM-036`, `TOOL-001` to
 `TOOL-003`).
 
 ## What this list cannot see yet

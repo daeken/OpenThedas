@@ -12,9 +12,11 @@
 //!   appearance with the stealthed flag, on which rules_core runs its own detection check.
 //!   The scripts also end stealth themselves (after an attack, when targeted, on detection).
 //!   Walls (`nav::wall_between`) and closed doors block noticing.
-//! - **Game mode.** The party seeing living hostiles switches `GM_EXPLORE` to `GM_COMBAT`
-//!   and back, with `GAMEMODE_CHANGE` to the module; the scripts end combat (and get fallen
-//!   party members up) on the change back.
+//! - **Game mode.** The scripts switch `GM_EXPLORE` to `GM_COMBAT` and back with
+//!   `SetGameMode` (rules_core asks the module when a follower perceives a hostile; the
+//!   module's end-of-fight check returns to explore and gets fallen members up). The engine
+//!   only applies the change and tells the module with `GAMEMODE_CHANGE`
+//!   ([`Sim::update_game_mode`] keeps the harness's view of the fight).
 //! - **Hostility.** Creatures are hostile when their groups are set hostile with
 //!   `SetGroupHostility`.
 //! - **Attacks.** When a `CommandAttack` reaches the front of the queue, its owner gets
