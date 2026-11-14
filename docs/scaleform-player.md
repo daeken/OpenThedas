@@ -73,6 +73,11 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
    Timeline-placed registered classes construct parents before descendants. This preserves
    the GUI framework's last-created element and associates post-load callbacks with the
    intended child, including popup centring before the text resizes its box.
+   `MovieClip.setMask` accepts clip objects and activation-relative paths, transfers a mask
+   from its previous owner, and clears with null/undefined. Removal detaches both links.
+   Dynamic masks use filled geometry in stage space, ignore visibility/alpha and filters,
+   hide the mask's normal picture, and clip the finished filtered subtree and mouse picking.
+   Stroke-only shapes do not provide mask coverage. Cached bitmap alpha masks remain separate.
 4. **`text`**: HTML-subset parser (p, br, font face/size/color, b, i, u, img), layout with
    word wrap, autosize, `textAutoSize` shrink, shadows; glyphs from the font library's
    DefineFont3 outlines, rasterised into a glyph atlas at the drawn size.

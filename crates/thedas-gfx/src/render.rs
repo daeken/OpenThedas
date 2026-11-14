@@ -277,7 +277,7 @@ pub struct Renderer {
     white: Arc<wgpu::BindGroup>,
     clamp: wgpu::Sampler,
     repeat: wgpu::Sampler,
-    shapes: HashMap<(u16, u16), Vec<Arc<GpuMesh>>>,
+    shapes: HashMap<(u16, u16, bool), Vec<Arc<GpuMesh>>>,
     cpu_shapes: HashMap<(u16, u16), Vec<CpuShape>>,
     scale9: HashMap<(DisplayId, [u32; 8]), Vec<Arc<GpuMesh>>>,
     glyphs: HashMap<(usize, usize), Arc<GlyphMesh>>,
@@ -836,7 +836,8 @@ impl Renderer {
         id: u16,
         ratio: u16,
     ) -> Vec<Arc<GpuMesh>> {
-        if let Some(m) = self.shapes.get(&(id, ratio)) {
+        let key = (id, ratio, self.masking);
+        if let Some(m) = self.shapes.get(&key) {
             return m.clone();
         }
         let movie = player.vm.movie.clone();
@@ -856,7 +857,7 @@ impl Renderer {
                 })
                 .into_iter()
                 .collect();
-            self.shapes.insert((id, ratio), out.clone());
+            self.shapes.insert(key, out.clone());
             return out;
         }
         let size = |bid: u16| -> Option<(f32, f32)> {
@@ -867,7 +868,23 @@ impl Renderer {
         };
         let meshes = match movie.characters.get(&id) {
             Some(Character::Shape(s)) => {
-                tess::tessellate_shape(&s.fills, &s.lines, &s.records, &size)
+                if self.masking {
+                    let mut records = s.records.clone();
+                    for record in &mut records {
+                        if let crate::swf::Record::Style {
+                            line, new_styles, ..
+                        } = record
+                        {
+                            *line = None;
+                            if let Some((_, lines)) = new_styles {
+                                lines.clear();
+                            }
+                        }
+                    }
+                    tess::tessellate_shape(&s.fills, &[], &records, &size)
+                } else {
+                    tess::tessellate_shape(&s.fills, &s.lines, &s.records, &size)
+                }
             }
             Some(Character::Morph(m)) => {
                 let t = ratio as f32 / 65535.0;
@@ -925,7 +942,9 @@ impl Renderer {
                     self.upload(&m, Some(bg), *kind as f32, *to_gradient)
                 }
             };
-            if let Some(g) = &g {
+            if let Some(g) = &g
+                && !self.masking
+            {
                 self.cpu_shapes
                     .entry((id, ratio))
                     .or_default()
@@ -933,7 +952,7 @@ impl Renderer {
             }
             out.extend(g);
         }
-        self.shapes.insert((id, ratio), out.clone());
+        self.shapes.insert(key, out.clone());
         out
     }
 
@@ -1110,7 +1129,81 @@ impl Renderer {
         let Some(o) = player.vm.display.get(d) else {
             return;
         };
-        if !o.visible {
+        if !self.masking && o.mask_for.is_some() {
+            return;
+        }
+        let mask = o.mask.filter(|m| player.vm.display.get(*m).is_some());
+        if let Some(mask) = mask.filter(|_| !self.masking && !self.filter_stack.contains(&d)) {
+            let mask_parent = player
+                .vm
+                .display
+                .get(mask)
+                .and_then(|o| o.parent)
+                .map(|p| player.vm.display.world_matrix(p))
+                .unwrap_or(Matrix::IDENTITY);
+            self.mask_ops(
+                player,
+                images,
+                mask,
+                mask_parent,
+                view,
+                stencil,
+                Stencil::Push,
+                b,
+            );
+            self.walk_content(
+                player,
+                images,
+                d,
+                parent,
+                parent_cx,
+                parent_blend,
+                view,
+                stencil + 1,
+                b,
+            );
+            self.mask_ops(
+                player,
+                images,
+                mask,
+                mask_parent,
+                view,
+                stencil + 1,
+                Stencil::Pop,
+                b,
+            );
+        } else {
+            self.walk_content(
+                player,
+                images,
+                d,
+                parent,
+                parent_cx,
+                parent_blend,
+                view,
+                stencil,
+                b,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_content(
+        &mut self,
+        player: &mut Player,
+        images: &mut dyn Images,
+        d: DisplayId,
+        parent: Matrix,
+        parent_cx: ColorTransform,
+        parent_blend: Blend,
+        view: &Viewport,
+        stencil: u32,
+        b: &mut Build,
+    ) {
+        let Some(o) = player.vm.display.get(d) else {
+            return;
+        };
+        if !o.visible && !self.masking {
             return;
         }
         // Alpha/erase operate on an enclosing layer's isolated picture. Outside a
@@ -1274,6 +1367,9 @@ impl Renderer {
         };
         let u = b.uniform(&world, &cx, view);
         for m in &meshes {
+            if self.masking && m.fixed_rgb {
+                continue;
+            }
             b.push(m, u, blend, stencil);
         }
         let Some(o) = player.vm.display.get(d) else {
@@ -1315,6 +1411,14 @@ impl Renderer {
                         Some((*id, co.matrix, co.color))
                     }
                     _ => None,
+                });
+                let shape = shape.filter(|_| {
+                    !self.masking
+                        && player
+                            .vm
+                            .display
+                            .get(c)
+                            .is_some_and(|co| co.mask.is_none() && co.mask_for.is_none())
                 });
                 if let Some((id, place, ccx)) = shape {
                     let key = (
@@ -2120,6 +2224,130 @@ mod shadow_tests {
         assert_eq!(
             &pixels[(16 * 32 + 25) * 4..(16 * 32 + 26) * 4],
             &[255, 0, 0, 255]
+        );
+    }
+
+    #[test]
+    fn moving_script_mask_clips_filtered_content_in_stage_space() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let bytes = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p =
+            Player::new(bytes, "mask-test", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        p.vm.movie = Arc::new(Movie {
+            stage: Rect {
+                x_max: 640,
+                y_max: 640,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let root = p.vm.root;
+        let quad = |p: &mut Player, parent, depth, color, width| {
+            let id = crate::player::create_empty(&mut p.vm, parent, "quad", depth).unwrap();
+            p.vm.display
+                .get_mut(id)
+                .unwrap()
+                .clip_mut()
+                .unwrap()
+                .drawing = Some(crate::display::Drawing {
+                fills: vec![(
+                    color,
+                    vec![(0.0, 0.0), (width, 0.0), (width, 640.0), (0.0, 640.0)],
+                )],
+                ..Default::default()
+            });
+            id
+        };
+        quad(&mut p, root, 0, [0, 0, 255, 255], 640.0);
+        let target = quad(&mut p, root, 1, [255, 0, 0, 255], 640.0);
+        p.vm.display.get_mut(target).unwrap().filters = vec![crate::swf::Filter::Blur {
+            blur: (3.0, 3.0),
+            passes: 1,
+        }];
+        let container = crate::player::create_empty(&mut p.vm, root, "elsewhere", 2).unwrap();
+        let mask = quad(&mut p, container, 0, [255; 4], 160.0);
+        let o = p.vm.display.get_mut(mask).unwrap();
+        o.visible = false;
+        o.color.mul[3] = 0.0;
+        // Overlapping mask children form a union, rather than incrementing twice.
+        quad(&mut p, mask, 0, [255; 4], 80.0);
+        assert!(p.vm.display.set_mask(target, Some(mask)));
+        let mut renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        for offset in [160.0, 320.0] {
+            p.vm.display.get_mut(container).unwrap().matrix.tx = offset;
+            renderer.render(&mut p, &mut Empty, (32, 32));
+            let (_, _, pixels) = renderer.capture().unwrap();
+            for x in [4, 12, 20, 28] {
+                let expected = if (x as f32 * 20.0) > offset && (x as f32 * 20.0) < offset + 160.0 {
+                    [255, 0, 0, 255]
+                } else {
+                    [0, 0, 255, 255]
+                };
+                assert_eq!(&pixels[(16 * 32 + x) * 4..(16 * 32 + x + 1) * 4], &expected);
+            }
+        }
+        p.vm.display.set_mask(target, None);
+        renderer.render(&mut p, &mut Empty, (32, 32));
+        let (_, _, pixels) = renderer.capture().unwrap();
+        assert_eq!(
+            &pixels[(16 * 32 + 12) * 4..(16 * 32 + 13) * 4],
+            &[255, 0, 0, 255]
+        );
+        let shape = Arc::new(crate::swf::Shape {
+            bounds: Rect {
+                x_max: 640,
+                y_max: 640,
+                ..Default::default()
+            },
+            lines: vec![crate::swf::Line {
+                width: 320,
+                color: crate::swf::Color {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
+                fill: None,
+                no_scale: (false, false),
+                start_cap: crate::swf::LineCap::Round,
+                end_cap: crate::swf::LineCap::Round,
+                join: crate::swf::LineJoin::Round,
+                no_close: false,
+            }],
+            records: vec![
+                Record::Style {
+                    move_to: Some((0, 320)),
+                    fill0: None,
+                    fill1: None,
+                    line: Some(1),
+                    new_styles: None,
+                },
+                Record::Line { to: (640, 320) },
+            ],
+            ..Default::default()
+        });
+        Arc::get_mut(&mut p.vm.movie)
+            .unwrap()
+            .characters
+            .insert(1, Character::Shape(shape.clone()));
+        let mut object = crate::display::Object::new(Kind::Shape(shape, 1));
+        object.parent = Some(root);
+        let stroke = p.vm.display.add(object);
+        p.vm.display
+            .get_mut(root)
+            .unwrap()
+            .children
+            .insert(3, stroke);
+        p.vm.display.set_mask(target, Some(stroke));
+        renderer.render(&mut p, &mut Empty, (32, 32));
+        let (_, _, pixels) = renderer.capture().unwrap();
+        assert_eq!(
+            &pixels[(16 * 32 + 12) * 4..(16 * 32 + 13) * 4],
+            &[0, 0, 255, 255]
         );
     }
 
