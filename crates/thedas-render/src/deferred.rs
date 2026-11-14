@@ -1,0 +1,965 @@
+//! The deferred renderer: ours, not the original's, chosen at run time with
+//! [`RenderPath`] (see `docs/deferred.md`).
+//!
+//! The level's opaque Static1 draws go into a G-buffer, and one full-screen pass lights them
+//! per pixel with every light in reach: the sum Static1.psh works out per object for three
+//! lights (`notes/frame-gamma-lightmap-trace.md`), over all of them. Everything else (water,
+//! sky, terrain, trees, blended and multi-pass materials, the objects, particles) is drawn
+//! afterwards by the faithful pass, with its original shaders, over that colour and depth.
+//!
+//! Nothing here changes how the faithful path draws: with [`RenderPath::Faithful`] this
+//! module is not reached, and its GPU objects are not even made.
+
+use std::collections::HashMap;
+
+use glam::{Mat4, Vec3, Vec4};
+use thedas_formats::state::Cull;
+use thedas_shader::bytecode::TextureType;
+use thedas_vfs::Vfs;
+use wgpu::util::DeviceExt;
+
+use crate::camera::Camera;
+use crate::d3d_gpu::D3dPass;
+use crate::gpu::{DEPTH_FORMAT, GpuContext, GpuMesh, TextureCache, checked};
+use crate::scene::{AreaScene, DOMAIN_CHARACTERS, SceneLight, Vertex};
+
+pub const DEFERRED_WGSL: &str = include_str!("deferred.wgsl");
+
+/// How the level is drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RenderPath {
+    /// Every material through its original shaders (the default, and the reference).
+    #[default]
+    Faithful,
+    /// Ours: the level's static geometry lit per pixel from a G-buffer.
+    Deferred,
+}
+
+impl RenderPath {
+    pub fn name(self) -> &'static str {
+        match self {
+            RenderPath::Faithful => "faithful",
+            RenderPath::Deferred => "deferred",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<RenderPath> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "faithful" => Some(RenderPath::Faithful),
+            "deferred" => Some(RenderPath::Deferred),
+            _ => None,
+        }
+    }
+
+    /// The other one.
+    pub fn toggled(self) -> RenderPath {
+        match self {
+            RenderPath::Faithful => RenderPath::Deferred,
+            RenderPath::Deferred => RenderPath::Faithful,
+        }
+    }
+}
+
+/// The most lights one frame lights with (the nearest, past it).
+const MAX_LIGHTS: usize = 1024;
+/// Room indices the lights' room sets can name; rooms past it are lit by every light.
+const MAX_ROOMS: u32 = 255;
+
+/// The G-buffer's targets: albedo; specular mask and power; normal, room and specular
+/// falloff; lightmap texel.
+const GBUFFER: [wgpu::TextureFormat; 4] = [
+    wgpu::TextureFormat::Rgba8Unorm,
+    wgpu::TextureFormat::Rgba8Unorm,
+    wgpu::TextureFormat::Rgba16Float,
+    wgpu::TextureFormat::Rgba8Unorm,
+];
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct FrameUniforms {
+    eye: [f32; 4],
+    fixup: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct FrameDraw {
+    mvp: [[f32; 4]; 4],
+    world: [[f32; 4]; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+struct DrawData {
+    lightmap: [f32; 4],
+    falloff: [f32; 4],
+    room: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct LightingUniforms {
+    inv_view_proj: [[f32; 4]; 4],
+    eye: [f32; 4],
+    sun_dir: [f32; 4],
+    sun_colour: [f32; 4],
+    fog0: [f32; 4],
+    fog1: [f32; 4],
+    counts: [u32; 4],
+    size: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuLight {
+    position: [f32; 4],
+    colour: [f32; 4],
+    rooms: [u32; 8],
+}
+
+/// One draw the deferred pass takes from the faithful one.
+#[derive(Clone, Debug)]
+struct PlanDraw {
+    /// Its index in [`D3dPass::draws`].
+    k: usize,
+    /// Its scene draw.
+    draw: usize,
+    mesh: usize,
+    /// Its textures ([`DeferredPass::groups`]).
+    group: usize,
+    cull: Option<wgpu::Face>,
+}
+
+/// The deferred pass of one renderer (the level's own): what it draws, worked out when the
+/// renderer is made, and its GPU objects, made the first time a frame is drawn deferred.
+pub(crate) struct DeferredPass {
+    draws: Vec<PlanDraw>,
+    data: Vec<DrawData>,
+    /// Diffuse, normal map, specular mask and lightmap, per distinct set.
+    groups: Vec<[wgpu::TextureView; 4]>,
+    /// Per faithful draw (index into [`D3dPass::draws`]): whether this pass draws it.
+    takes: Vec<bool>,
+    /// The index each room id has in the lights' room sets (1 on; 0 is "no room").
+    rooms: HashMap<i64, u32>,
+    light_rooms: HashMap<i64, Vec<i64>>,
+    gpu: Option<Gpu>,
+    /// The GPU refused the pass: the level stays faithful.
+    refused: bool,
+}
+
+struct Gpu {
+    /// By cull mode: none, back, front.
+    gbuffer: [wgpu::RenderPipeline; 3],
+    lighting: wgpu::RenderPipeline,
+    frame_buffer: wgpu::Buffer,
+    frame_draws: wgpu::Buffer,
+    scene_group: wgpu::BindGroup,
+    material_groups: Vec<wgpu::BindGroup>,
+    lighting_buffer: wgpu::Buffer,
+    light_buffer: wgpu::Buffer,
+    lighting_group: wgpu::BindGroup,
+    targets_layout: wgpu::BindGroupLayout,
+    targets: Option<Targets>,
+    /// The draws in drawing order (grouped by pipeline and textures).
+    order: Vec<usize>,
+    /// The lights as last written.
+    lights: Vec<GpuLight>,
+}
+
+struct Targets {
+    size: (u32, u32),
+    views: [wgpu::TextureView; 4],
+    /// The G-buffer and the depth it was drawn with, for the lighting pass.
+    group: wgpu::BindGroup,
+    /// The depth buffer `group` reads.
+    depth: wgpu::TextureView,
+}
+
+fn cull_of(c: Cull) -> Option<wgpu::Face> {
+    // As the faithful pipelines map it (see `d3d_gpu`'s `D3D_CW_IS_WGPU_CW`).
+    let cw = crate::d3d_gpu::D3D_CW_IS_WGPU_CW;
+    match c {
+        Cull::None => None,
+        Cull::Cw => Some(if cw {
+            wgpu::Face::Back
+        } else {
+            wgpu::Face::Front
+        }),
+        Cull::Ccw => Some(if cw {
+            wgpu::Face::Front
+        } else {
+            wgpu::Face::Back
+        }),
+    }
+}
+
+fn cull_index(c: Option<wgpu::Face>) -> usize {
+    match c {
+        None => 0,
+        Some(wgpu::Face::Back) => 1,
+        Some(wgpu::Face::Front) => 2,
+    }
+}
+
+/// Whether a faithful draw with `program` (its name `vs+ps+state`) can be drawn deferred:
+/// Static1's opaque passes (Static1.psh, and Static1_Fast.psh at Low detail), which write
+/// depth and test no alpha.
+fn static1(program: &crate::d3d::D3dProgram) -> bool {
+    let p = &program.pass;
+    program.name.starts_with("static1.vsh+static1")
+        && !program.instanced
+        && p.blend.is_none()
+        && p.alpha_test.is_none()
+        && p.z_enable
+        && p.z_write
+}
+
+impl DeferredPass {
+    /// What a renderer of `scene` (the level's own meshes) draws deferred, with the
+    /// textures it reads; `None` when nothing qualifies.
+    pub(crate) fn plan(
+        ctx: &GpuContext,
+        vfs: &Vfs,
+        scene: &AreaScene,
+        d3d: &D3dPass,
+        cache: &mut TextureCache,
+    ) -> Option<DeferredPass> {
+        let mut texture = |names: &[Option<String>], fallback: [u8; 4]| {
+            names
+                .iter()
+                .flatten()
+                .find_map(|n| cache.view(ctx, vfs, n, TextureType::Tex2D))
+                .unwrap_or_else(|| cache.solid(ctx, TextureType::Tex2D, fallback))
+        };
+        let mut rooms: HashMap<i64, u32> = HashMap::new();
+        let mut group_of: HashMap<(usize, String), usize> = HashMap::new();
+        let mut groups = Vec::new();
+        let mut draws = Vec::new();
+        let mut data = Vec::new();
+        let mut takes = vec![false; d3d.draws.len()];
+        for (k, d) in d3d.draws.iter().enumerate() {
+            let program = d3d.program(d);
+            let Some(item) = scene.draws.get(d.draw) else {
+                continue;
+            };
+            let taken = d.draw < scene.static_draws
+                && !d3d.is_blended(d)
+                && !d.multipass
+                && static1(program)
+                && item.skin.is_none()
+                && item.lod.is_none()
+                && !scene.cut_away.contains(&d.draw)
+                && item.lightmap.as_ref().is_none_or(|l| l.planes().is_none());
+            let Some(m) = taken.then(|| scene.materials.get(item.material)).flatten() else {
+                continue;
+            };
+            let lightmap = item.lightmap.as_ref().map(|l| l.texture.clone());
+            let group = *group_of
+                .entry((item.material, lightmap.clone().unwrap_or_default()))
+                .or_insert_with(|| {
+                    let param = |p: &str| [m.texture(p), crate::d3d::texture_default(m, p)];
+                    groups.push([
+                        texture(&param("mml_tDiffuse"), [128, 128, 128, 255]),
+                        // A flat normal in DXT5nm's channels (x in alpha, y in green).
+                        texture(&param("mml_tNormalMap"), [128, 128, 128, 128]),
+                        texture(&param("mml_tSpecularMask"), [0, 0, 0, 0]),
+                        texture(
+                            &[lightmap.clone(), Some("default_black.dds".into())],
+                            [0, 0, 0, 0],
+                        ),
+                    ]);
+                    groups.len() - 1
+                });
+            let room = match item.room_id {
+                Some(id) => {
+                    let next = rooms.len() as u32 + 1;
+                    match rooms.get(&id) {
+                        Some(&i) => i,
+                        None if next <= MAX_ROOMS => {
+                            rooms.insert(id, next);
+                            next
+                        }
+                        None => 0,
+                    }
+                }
+                None => 0,
+            };
+            let mut falloff = crate::d3d::material_vector(m, "mml_vFalloffParams")
+                .unwrap_or([0.0, 0.0, 1.5, 1.5]);
+            if falloff[2].abs() < 1e-3 {
+                falloff[2] = 1e-3;
+            }
+            takes[k] = true;
+            draws.push(PlanDraw {
+                k,
+                draw: d.draw,
+                mesh: d.mesh,
+                group,
+                cull: cull_of(program.pass.cull),
+            });
+            data.push(DrawData {
+                lightmap: item.lightmap.as_ref().map_or([0.0, 0.0, 1.0, 1.0], |l| {
+                    [l.offset[0], l.offset[1], l.scale[0], l.scale[1]]
+                }),
+                falloff,
+                room: [room as f32, 0.0, 0.0, 0.0],
+            });
+        }
+        log::info!(
+            "deferred: {} of the level's {} drawn meshes can be drawn deferred",
+            draws.len(),
+            d3d.draws.len()
+        );
+        (!draws.is_empty()).then(|| DeferredPass {
+            draws,
+            data,
+            groups,
+            takes,
+            rooms,
+            light_rooms: scene.light_rooms.clone(),
+            gpu: None,
+            refused: false,
+        })
+    }
+
+    /// Whether faithful draw `k` (an index into [`D3dPass::draws`]) is this pass's to draw.
+    pub(crate) fn takes(&self, k: usize) -> bool {
+        self.takes.get(k).copied().unwrap_or(false)
+    }
+
+    /// Whether the GPU refused the pass.
+    pub(crate) fn refused(&self) -> bool {
+        self.refused
+    }
+
+    fn build(&self, ctx: &GpuContext, color_format: wgpu::TextureFormat) -> Gpu {
+        let device = &ctx.device;
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("deferred"),
+            source: wgpu::ShaderSource::Wgsl(DEFERRED_WGSL.into()),
+        });
+        let buffer_entry = |binding, visibility, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer {
+                ty,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let storage = wgpu::BufferBindingType::Storage { read_only: true };
+        let vf = wgpu::ShaderStages::VERTEX_FRAGMENT;
+        let f = wgpu::ShaderStages::FRAGMENT;
+        let scene_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("deferred scene"),
+            entries: &[
+                buffer_entry(0, vf, wgpu::BufferBindingType::Uniform),
+                buffer_entry(1, wgpu::ShaderStages::VERTEX, storage),
+                buffer_entry(2, vf, storage),
+            ],
+        });
+        let tex = |binding, filterable| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: f,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let smp = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: f,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
+        let material_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("deferred material"),
+            entries: &[
+                tex(0, true),
+                tex(1, true),
+                tex(2, true),
+                smp(3),
+                tex(4, true),
+                smp(5),
+            ],
+        });
+        let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("deferred lighting"),
+            entries: &[
+                buffer_entry(0, f, wgpu::BufferBindingType::Uniform),
+                buffer_entry(1, f, storage),
+            ],
+        });
+        let targets_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("deferred g-buffer"),
+            entries: &[
+                tex(0, false),
+                tex(1, false),
+                tex(2, false),
+                tex(3, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: f,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let gbuffer_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("deferred g-buffer"),
+            bind_group_layouts: &[Some(&scene_layout), Some(&material_layout)],
+            immediate_size: 0,
+        });
+        let gbuffer_targets: Vec<Option<wgpu::ColorTargetState>> = GBUFFER
+            .iter()
+            .map(|&format| {
+                Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })
+            })
+            .collect();
+        let gbuffer = [None, Some(wgpu::Face::Back), Some(wgpu::Face::Front)].map(|cull| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("deferred g-buffer"),
+                layout: Some(&gbuffer_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_gbuffer"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Vertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![
+                            0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x2
+                        ],
+                    })],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: cull,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_gbuffer"),
+                    compilation_options: Default::default(),
+                    targets: &gbuffer_targets,
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        });
+        let lighting_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("deferred lighting"),
+                bind_group_layouts: &[Some(&lighting_layout), Some(&targets_layout)],
+                immediate_size: 0,
+            });
+        let lighting = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("deferred lighting"),
+            layout: Some(&lighting_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_fullscreen"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_lighting"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let frame_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("deferred frame"),
+            size: std::mem::size_of::<FrameUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let frame_draws = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("deferred frame draws"),
+            size: (std::mem::size_of::<FrameDraw>() * self.draws.len().max(1)) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let draw_data = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("deferred draws"),
+            contents: bytemuck::cast_slice(&self.data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let scene_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("deferred scene"),
+            layout: &scene_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: frame_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: frame_draws.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: draw_data.as_entire_binding(),
+                },
+            ],
+        });
+        let sampler = |label, address_mode, anisotropy_clamp| {
+            device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some(label),
+                address_mode_u: address_mode,
+                address_mode_v: address_mode,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::MipmapFilterMode::Linear,
+                anisotropy_clamp,
+                ..Default::default()
+            })
+        };
+        let wrap = sampler("deferred wrap", wgpu::AddressMode::Repeat, 8);
+        let clamp = sampler("deferred lightmap", wgpu::AddressMode::ClampToEdge, 1);
+        let material_groups = self
+            .groups
+            .iter()
+            .map(|[d, n, s, l]| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("deferred material"),
+                    layout: &material_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(d),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(n),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(s),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(&wrap),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(l),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::Sampler(&clamp),
+                        },
+                    ],
+                })
+            })
+            .collect();
+        let lighting_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("deferred lighting"),
+            size: std::mem::size_of::<LightingUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let light_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("deferred lights"),
+            size: (std::mem::size_of::<GpuLight>() * MAX_LIGHTS) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let lighting_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("deferred lighting"),
+            layout: &lighting_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: lighting_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: light_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let mut order: Vec<usize> = (0..self.draws.len()).collect();
+        order.sort_by_key(|&i| {
+            let d = &self.draws[i];
+            (cull_index(d.cull), d.group, d.mesh)
+        });
+        Gpu {
+            gbuffer,
+            lighting,
+            frame_buffer,
+            frame_draws,
+            scene_group,
+            material_groups,
+            lighting_buffer,
+            light_buffer,
+            lighting_group,
+            targets_layout,
+            targets: None,
+            order,
+            lights: Vec::new(),
+        }
+    }
+
+    /// Records the G-buffer and lighting passes for this frame into `encoder`: the lit
+    /// deferred draws into `target` (cleared to `clear` first) and their depth into
+    /// `depth` (cleared first), for the faithful pass to draw the rest over. Returns false,
+    /// recording nothing, when the GPU refuses the pass: the frame is then drawn faithfully.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode(
+        &mut self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        color_format: wgpu::TextureFormat,
+        depth: &wgpu::TextureView,
+        (width, height): (u32, u32),
+        camera: &Camera,
+        d3d: &D3dPass,
+        meshes: &[GpuMesh],
+        clear: wgpu::Color,
+    ) -> bool {
+        if self.refused {
+            return false;
+        }
+        if self.gpu.is_none() {
+            self.gpu = checked(&ctx.device, "the deferred renderer", || {
+                self.build(ctx, color_format)
+            });
+            if self.gpu.is_none() {
+                self.refused = true;
+                return false;
+            }
+        }
+        let lights = self.lights(camera, width, height, d3d);
+        let Some(gpu) = self.gpu.as_mut() else {
+            return false;
+        };
+        let device = &ctx.device;
+        let stale = !gpu
+            .targets
+            .as_ref()
+            .is_some_and(|t| t.size == (width, height) && t.depth == *depth);
+        if stale {
+            let views = GBUFFER.map(|format| {
+                device
+                    .create_texture(&wgpu::TextureDescriptor {
+                        label: Some("deferred g-buffer"),
+                        size: wgpu::Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    })
+                    .create_view(&wgpu::TextureViewDescriptor::default())
+            });
+            let mut entries: Vec<wgpu::BindGroupEntry> = views
+                .iter()
+                .enumerate()
+                .map(|(i, v)| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: wgpu::BindingResource::TextureView(v),
+                })
+                .collect();
+            entries.push(wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(depth),
+            });
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("deferred g-buffer"),
+                layout: &gpu.targets_layout,
+                entries: &entries,
+            });
+            gpu.targets = Some(Targets {
+                size: (width, height),
+                views,
+                group,
+                depth: depth.clone(),
+            });
+        }
+
+        // This frame's constants: per draw its matrices (as the faithful pass works them
+        // out: projection · (view · world)), then the lighting's.
+        let aspect = width as f32 / height.max(1) as f32;
+        let (view, projection) = (camera.view(), camera.projection(aspect));
+        let frame_draws: Vec<FrameDraw> = self
+            .draws
+            .iter()
+            .map(|d| {
+                let world = d3d.world(d.draw).unwrap_or(Mat4::IDENTITY);
+                let world_view = view * world;
+                FrameDraw {
+                    mvp: (projection * world_view).to_cols_array_2d(),
+                    world: world.to_cols_array_2d(),
+                }
+            })
+            .collect();
+        ctx.queue
+            .write_buffer(&gpu.frame_draws, 0, bytemuck::cast_slice(&frame_draws));
+        let frame = FrameUniforms {
+            eye: camera.position.extend(1.0).to_array(),
+            fixup: [
+                1.0 / width.max(1) as f32,
+                1.0 / height.max(1) as f32,
+                0.0,
+                0.0,
+            ],
+        };
+        ctx.queue
+            .write_buffer(&gpu.frame_buffer, 0, bytemuck::bytes_of(&frame));
+        if lights != gpu.lights {
+            if !lights.is_empty() {
+                ctx.queue
+                    .write_buffer(&gpu.light_buffer, 0, bytemuck::cast_slice(&lights));
+            }
+            gpu.lights = lights;
+        }
+        let (sun_dir, sun_colour) = match d3d.sun() {
+            Some((dir, colour)) => (
+                dir.normalize_or_zero().extend(1.0),
+                colour.extend(0.0),
+            ),
+            None => (Vec4::ZERO, Vec4::ZERO),
+        };
+        let fog = d3d.fog();
+        let lighting = LightingUniforms {
+            inv_view_proj: (projection * view).inverse().to_cols_array_2d(),
+            eye: camera.position.extend(1.0).to_array(),
+            sun_dir: sun_dir.to_array(),
+            sun_colour: sun_colour.to_array(),
+            fog0: fog[0],
+            fog1: fog[1],
+            counts: [gpu.lights.len() as u32, 0, 0, 0],
+            size: [width as f32, height as f32, 0.0, 0.0],
+        };
+        ctx.queue
+            .write_buffer(&gpu.lighting_buffer, 0, bytemuck::bytes_of(&lighting));
+
+        let Some(targets) = gpu.targets.as_ref() else {
+            return false;
+        };
+        {
+            let attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = targets
+                .views
+                .iter()
+                .map(|v| {
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: v,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })
+                })
+                .collect();
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("deferred g-buffer"),
+                color_attachments: &attachments,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, &gpu.scene_group, &[]);
+            let (mut pipeline, mut group) = (usize::MAX, usize::MAX);
+            for &i in &gpu.order {
+                let d = &self.draws[i];
+                if !d3d.in_view(d.k) {
+                    continue;
+                }
+                let Some(mesh) = meshes.get(d.mesh) else {
+                    continue;
+                };
+                let p = cull_index(d.cull);
+                if p != pipeline {
+                    pass.set_pipeline(&gpu.gbuffer[p]);
+                    pipeline = p;
+                }
+                if d.group != group {
+                    pass.set_bind_group(1, &gpu.material_groups[d.group], &[]);
+                    group = d.group;
+                }
+                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.count, 0, i as u32..i as u32 + 1);
+            }
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("deferred lighting"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(clear),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&gpu.lighting);
+        pass.set_bind_group(0, &gpu.lighting_group, &[]);
+        pass.set_bind_group(1, &targets.group, &[]);
+        pass.draw(0..3, 0..1);
+        true
+    }
+
+    /// The lights for a frame seen by `camera`: every point light of the scene's (and those
+    /// added since) that lights the level and reaches into the view, nearest first past
+    /// [`MAX_LIGHTS`].
+    fn lights(&self, camera: &Camera, width: u32, height: u32, d3d: &D3dPass) -> Vec<GpuLight> {
+        let planes = frustum(camera.view_proj(width as f32 / height.max(1) as f32));
+        let mut out: Vec<(f32, GpuLight)> = d3d
+            .lights()
+            .iter()
+            .filter_map(|l| self.light(l, &planes, camera.position))
+            .collect();
+        if out.len() > MAX_LIGHTS {
+            out.sort_by(|a, b| a.0.total_cmp(&b.0));
+            out.truncate(MAX_LIGHTS);
+        }
+        out.into_iter().map(|(_, l)| l).collect()
+    }
+
+    fn light(&self, l: &SceneLight, planes: &[Vec4; 6], eye: Vec3) -> Option<(f32, GpuLight)> {
+        let SceneLight::Point {
+            position,
+            color,
+            radius,
+            domain,
+            is_static,
+            intensity,
+            room,
+            ..
+        } = l
+        else {
+            return None;
+        };
+        let colour = *color * *intensity;
+        let visible = planes
+            .iter()
+            .all(|p| p.truncate().dot(*position) + p.w >= -*radius);
+        if *domain == Some(DOMAIN_CHARACTERS)
+            || !(*radius > 0.0)
+            || colour.max_element() <= 0.0
+            || !visible
+        {
+            return None;
+        }
+        Some((
+            position.distance(eye) - radius,
+            GpuLight {
+                position: position.extend(*radius).to_array(),
+                colour: colour.extend(if *is_static { 1.0 } else { 0.0 }).to_array(),
+                rooms: self.room_bits(*room),
+            },
+        ))
+    }
+
+    /// The room set of a light placed in `room`: that room and those its light reaches
+    /// ([`AreaScene::light_rooms`]); every room for a light of no room.
+    fn room_bits(&self, room: Option<i64>) -> [u32; 8] {
+        let Some(room) = room else {
+            return [u32::MAX; 8];
+        };
+        let mut bits = [0u32; 8];
+        let reach = self.light_rooms.get(&room).into_iter().flatten();
+        for r in std::iter::once(&room).chain(reach) {
+            if let Some(&i) = self.rooms.get(r) {
+                bits[(i / 32) as usize] |= 1 << (i % 32);
+            }
+        }
+        bits
+    }
+}
+
+/// The six planes (`n·p + w ≥ 0` inside) of a view-projection with depth 0..1.
+fn frustum(m: Mat4) -> [Vec4; 6] {
+    let (r0, r1, r2, r3) = (m.row(0), m.row(1), m.row(2), m.row(3));
+    [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2].map(|p| {
+        let len = p.truncate().length();
+        if len > 0.0 { p / len } else { p }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deferred_shaders_translate_everywhere() {
+        crate::backend_check::translates("deferred", DEFERRED_WGSL);
+    }
+
+    #[test]
+    fn paths_parse_and_toggle() {
+        assert_eq!(RenderPath::parse("Deferred"), Some(RenderPath::Deferred));
+        assert_eq!(RenderPath::parse("faithful"), Some(RenderPath::Faithful));
+        assert_eq!(RenderPath::parse("forward"), None);
+        assert_eq!(RenderPath::default(), RenderPath::Faithful);
+        assert_eq!(RenderPath::Faithful.toggled(), RenderPath::Deferred);
+        assert_eq!(RenderPath::Deferred.toggled().name(), "faithful");
+    }
+
+    #[test]
+    fn the_frustum_keeps_what_is_ahead() {
+        let camera = Camera::new(Vec3::ZERO, 0.0, 0.0);
+        let planes = frustum(camera.view_proj(16.0 / 9.0));
+        let inside = |p: Vec3, r: f32| planes.iter().all(|q| q.truncate().dot(p) + q.w >= -r);
+        // The camera looks along +X.
+        assert!(inside(Vec3::new(10.0, 0.0, 0.0), 0.0));
+        assert!(!inside(Vec3::new(-10.0, 0.0, 0.0), 1.0));
+        // Behind, but its reach comes into view.
+        assert!(inside(Vec3::new(-1.0, 0.0, 0.0), 5.0));
+    }
+}
