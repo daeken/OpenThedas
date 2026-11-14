@@ -541,11 +541,22 @@ fn capture(
             .filter(|n| *n > 0)
         {
             let mut ms = Vec::new();
-<<<<<<< HEAD
             let compare = std::env::var("THEDAS_BENCH_DEFERRED_COMPARE").ok();
+            let comparison = std::env::var("THEDAS_BENCH_SHADOW_COMPARE").ok();
+            if comparison
+                .as_deref()
+                .is_some_and(|s| s != "reuse" && s != "faithful")
+            {
+                bail!("THEDAS_BENCH_SHADOW_COMPARE must be reuse or faithful");
+            }
+            if compare.is_some() && comparison.is_some() {
+                bail!("choose one deferred benchmark comparison");
+            }
             let original_path = live.render_path;
             let mut modes = Vec::new();
+            let mut shadow_modes = Vec::new();
             for frame in 0..n {
+                let test = matches!(frame % 4, 1 | 2);
                 // ABBA pairs share the scene, pipelines, camera and fixed shader clock.
                 // No process-wide environment mutation while loader/audio threads exist.
                 if let Some(compare) = compare.as_deref() {
@@ -563,18 +574,7 @@ fn capture(
                         ]));
                     }
                     modes.push(if enabled { "1" } else { "0" });
-=======
-            let comparison = std::env::var("THEDAS_BENCH_SHADOW_COMPARE").ok();
-            if comparison
-                .as_deref()
-                .is_some_and(|s| s != "reuse" && s != "faithful")
-            {
-                bail!("THEDAS_BENCH_SHADOW_COMPARE must be reuse or faithful");
-            }
-            let original_path = live.render_path;
-            let mut shadow_modes = Vec::new();
-            for frame in 0..n {
-                let test = matches!(frame % 4, 1 | 2);
+                }
                 match comparison.as_deref() {
                     Some("reuse") => live.set_deferred_shadow_reuse(Some(test)),
                     Some("faithful") => {
@@ -585,14 +585,12 @@ fn capture(
                         }
                     }
                     _ => {}
->>>>>>> origin/m1-deferred-shadow-reuse
                 }
                 let t = Instant::now();
                 live.capture(ctx, &camera, (w, h))?;
                 ms.push(t.elapsed().as_secs_f64() * 1000.0);
                 shadow_modes.push(u8::from(test));
             }
-<<<<<<< HEAD
             if compare.is_some() {
                 live.render_path = original_path;
                 if let Some(level) = live.level.as_mut() {
@@ -600,10 +598,8 @@ fn capture(
                 }
                 println!("bench comparison modes: {}", modes.join(" "));
             }
-=======
             live.render_path = original_path;
             live.set_deferred_shadow_reuse(None);
->>>>>>> origin/m1-deferred-shadow-reuse
             let avg = ms.iter().sum::<f64>() / ms.len() as f64;
             let worst = ms.iter().cloned().fold(0.0, f64::max);
             println!("bench: {n} frames, avg {avg:.1} ms, worst {worst:.1} ms");
