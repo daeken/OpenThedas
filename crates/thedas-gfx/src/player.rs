@@ -83,6 +83,7 @@ impl Player {
         let root = display.add(root_obj);
         let stage_size = movie.stage_size();
         let mut vm = Vm {
+            next_instance_id: 1,
             heap,
             display,
             global,
@@ -802,17 +803,22 @@ fn place(vm: &mut Vm, parent: DisplayId, p: &Place) {
         }
         remove_clip(vm, e);
     }
-    let Some(obj) = instantiate(vm, id) else {
+    let Some(mut obj) = instantiate(vm, id) else {
         return;
+    };
+    obj.name = match &p.name {
+        Some(n) => Str::from(n.as_str()),
+        None if matches!(obj.kind, Kind::Clip(_) | Kind::Text(_)) => {
+            let name = Str::from(format!("instance{}", vm.next_instance_id));
+            vm.next_instance_id = vm.next_instance_id.wrapping_add(1);
+            name
+        }
+        None => Str::from(""),
     };
     let new = vm.display.add(obj);
     insert_child(vm, parent, new, depth);
     if let Some(o) = vm.display.get_mut(new) {
         o.from_timeline = true;
-        o.name = match &p.name {
-            Some(n) => Str::from(n.as_str()),
-            None => Str::from(""),
-        };
     }
     apply_place_props(vm, new, p);
     if let Some(c) = vm.display.get_mut(new).and_then(|o| o.clip_mut()) {
@@ -1880,5 +1886,68 @@ mod queue_tests {
                 "trace: load"
             ]
         );
+    }
+
+    #[test]
+    fn unnamed_clips_get_unique_paths_for_host_and_post_load_callbacks() {
+        let movie = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p = Player::new(movie, "paths", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        let root = p.vm.root;
+        Arc::get_mut(&mut p.vm.movie).unwrap().characters.insert(
+            1,
+            Character::Sprite(Arc::new(crate::swf::Timeline {
+                frames: vec![Default::default()],
+                labels: vec![],
+            })),
+        );
+        for depth in 1..=2 {
+            place(
+                &mut p.vm,
+                root,
+                &Place {
+                    depth,
+                    character: Some(1),
+                    ..Default::default()
+                },
+            );
+        }
+        p.run_queue();
+        let first = p.vm.display.child_named(root, "instance1").unwrap();
+        let second = p.vm.display.child_named(root, "instance2").unwrap();
+        let value = display_api::display_value(&mut p.vm, first);
+        assert_eq!(&*p.vm.to_str(&value), "_level0.instance1");
+        let primitive = p.vm.to_primitive(&value, false);
+        assert_eq!(primitive, value);
+        assert_eq!(&*p.vm.to_str(&primitive), "_level0.instance1");
+        assert!(p.vm.to_number(&value).is_nan());
+        let root_value = p.vm.display_object(root);
+        let keys = p.vm.keys(&root_value);
+        assert!(keys.iter().any(|s| s.as_ref() == "instance1"));
+        assert!(keys.iter().any(|s| s.as_ref() == "instance2"));
+        assert_ne!(first, second);
+
+        // Moving an existing placement preserves its name; a fresh placement gets a
+        // fresh name even when the arena slot is reused.
+        place(
+            &mut p.vm,
+            root,
+            &Place {
+                depth: 1,
+                is_move: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(p.vm.display.child_named(root, "instance1"), Some(first));
+        remove_clip(&mut p.vm, first);
+        place(
+            &mut p.vm,
+            root,
+            &Place {
+                depth: 1,
+                character: Some(1),
+                ..Default::default()
+            },
+        );
+        assert!(p.vm.display.child_named(root, "instance3").is_some());
     }
 }

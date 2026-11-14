@@ -99,6 +99,10 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
   optionsmenu, newgame. All 66 movies start and run headless without errors.
 - Release build, idle: 10 µs to 9 ms of script per frame per movie (quickbar 0.27 ms against
   Ruffle's 2.1 ms); a movie that did not change is not drawn again.
+- Display objects stringify to their paths and unnamed timeline clips/text fields receive
+  unique `instanceN` names. Host tree walks can now configure notification multiply passes
+  (removing the black bands behind popups) and find menu buttons. Popup vertical placement
+  still differs from Ruffle by about 45 pixels in the choice/text comparison recipes.
 - Engine render targets (`paperdoll`) replace their external placeholder shapes at the
   authored bounds. Same-size frames update the existing GPU texture and cached bindings;
   clearing a target makes it transparent.
