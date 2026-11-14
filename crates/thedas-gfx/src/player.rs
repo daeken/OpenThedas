@@ -1,0 +1,1821 @@
+//! The player: timelines, the action queue, events, input and the host interface.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+
+use crate::avm1::object::Heap;
+use crate::avm1::value::{ObjId, Str, Value};
+use crate::avm1::{Host, HostValue, Queued, Vm, builtins, display_api, interp};
+use crate::display::{Clip, DEPTH_OFFSET, Display, DisplayId, Kind, Object};
+use crate::swf::{Character, ClipAction, Command, Movie, Place, Record, clip_event};
+use crate::text::{Fonts, TextField};
+
+/// Scaleform's mouse buttons as the movies number them.
+pub const MOUSE_LEFT: u8 = 1;
+pub const MOUSE_RIGHT: u8 = 2;
+pub const MOUSE_MIDDLE: u8 = 3;
+
+pub struct Player {
+    pub vm: Vm,
+    /// Milliseconds per frame.
+    pub frame_ms: f64,
+    accum: f64,
+    /// The clip under the mouse that takes button events, and whether the button is down
+    /// on it.
+    hover: Option<DisplayId>,
+    pressed: Option<(DisplayId, u8)>,
+    queue_init: VecDeque<Queued>,
+    queue_construct: VecDeque<Queued>,
+    /// Whether press handlers get the mouse button as Scaleform passed it (`onPress(1)`).
+    pub pass_buttons: bool,
+}
+
+fn clip_for(timeline: Arc<crate::swf::Timeline>, character: u16) -> Clip {
+    Clip {
+        timeline,
+        character,
+        frame: None,
+        playing: true,
+        drawing: None,
+        clip_actions: Vec::new(),
+        loaded: false,
+        enabled: true,
+        hit_area: None,
+        loaded_image: None,
+    }
+}
+
+impl Player {
+    /// Starts a movie. `extra_frame_one` is bytecode run after frame one's own actions (the
+    /// host's glue); `stage_size` is the visible area in stage units.
+    pub fn new(
+        data: &[u8],
+        name: &str,
+        host: Box<dyn Host>,
+        fonts: Arc<dyn Fonts>,
+        extra_frame_one: Option<Vec<u8>>,
+    ) -> Result<Self, crate::swf::SwfError> {
+        let mut movie = Movie::parse(data)?;
+        if let Some(extra) = extra_frame_one {
+            let mut root = (*movie.root).clone();
+            if let Some(f) = root.frames.first_mut() {
+                f.actions.push(Arc::from(extra));
+            }
+            movie.root = Arc::new(root);
+        }
+        let movie = Arc::new(movie);
+        let mut heap = Heap::default();
+        let (global, protos) = builtins::create_protos(&mut heap);
+        let alloc_plain = |heap: &mut Heap| {
+            heap.alloc(crate::avm1::object::Object {
+                proto: Some(protos.object),
+                ..Default::default()
+            })
+        };
+        let key = alloc_plain(&mut heap);
+        let mouse = alloc_plain(&mut heap);
+        let stage = alloc_plain(&mut heap);
+        let selection = alloc_plain(&mut heap);
+        let mut display = Display::default();
+        let mut root_obj = Object::new(Kind::Clip(Box::new(clip_for(movie.root.clone(), 0))));
+        root_obj.name = Str::from("_level0");
+        let root = display.add(root_obj);
+        let stage_size = movie.stage_size();
+        let mut vm = Vm {
+            heap,
+            display,
+            global,
+            protos,
+            root,
+            movie: movie.clone(),
+            name: name.to_string(),
+            classes: HashMap::new(),
+            inits_done: HashSet::new(),
+            queue: VecDeque::new(),
+            intervals: Vec::new(),
+            next_interval: 0,
+            time_ms: 0.0,
+            host,
+            callbacks: HashMap::new(),
+            key,
+            mouse,
+            stage,
+            selection,
+            stage_size: (stage_size.0 as f64, stage_size.1 as f64),
+            mouse_pos: (-1e6, -1e6),
+            keys_down: HashSet::new(),
+            last_key: 0,
+            focus: None,
+            log: Vec::new(),
+            dirty: true,
+            pick_dirty: true,
+            budget: 0,
+            call_depth: 0,
+            fonts,
+            warned: HashSet::new(),
+            dragging: None,
+            rng: 0x9E37_79B9_7F4A_7C15,
+            trace_calls: std::env::var_os("GFX_TRACE_CALLS").is_some(),
+            fn_names: HashMap::new(),
+        };
+        builtins::install(&mut vm);
+        let frame_ms = if movie.frame_rate > 0.0 {
+            1000.0 / movie.frame_rate as f64
+        } else {
+            1000.0 / 30.0
+        };
+        let mut p = Self {
+            vm,
+            frame_ms,
+            accum: 0.0,
+            hover: None,
+            pressed: None,
+            queue_init: VecDeque::new(),
+            queue_construct: VecDeque::new(),
+            pass_buttons: true,
+        };
+        // The root's first frame.
+        display_api::display_value(&mut p.vm, root);
+        enter_frame_of(&mut p.vm, root, 0);
+        p.run_queue();
+        Ok(p)
+    }
+
+    /// Advances time; runs intervals and as many frames as the frame rate says.
+    pub fn tick(&mut self, dt_ms: f64) {
+        let dt = dt_ms.clamp(0.0, 1000.0);
+        self.vm.time_ms += dt;
+        self.run_intervals();
+        self.accum += dt;
+        let mut n = 0;
+        while self.accum >= self.frame_ms && n < 4 {
+            self.accum -= self.frame_ms;
+            self.run_frame();
+            n += 1;
+        }
+        if self.accum > self.frame_ms {
+            self.accum = 0.0;
+        }
+    }
+
+    fn run_intervals(&mut self) {
+        let now = self.vm.time_ms;
+        let due: Vec<u32> = self
+            .vm
+            .intervals
+            .iter()
+            .filter(|i| i.next <= now)
+            .map(|i| i.id)
+            .collect();
+        for id in due {
+            let Some(i) = self.vm.intervals.iter_mut().find(|i| i.id == id) else {
+                continue;
+            };
+            let once = i.every < 0.0;
+            i.next = now + i.every.abs();
+            let (this, func, method, args) = (
+                i.this.clone(),
+                i.func.clone(),
+                i.method.clone(),
+                i.args.clone(),
+            );
+            if once {
+                self.vm.intervals.retain(|x| x.id != id);
+            }
+            self.vm.budget = 0;
+            match method {
+                Some(m) => {
+                    self.vm.call_method(&this, &m, &args);
+                }
+                None => {
+                    self.vm.call(&func, Value::Undefined, &args);
+                }
+            }
+            self.run_queue();
+        }
+    }
+
+    /// Plays one frame: enter-frame handlers, then every playing timeline advances.
+    pub fn run_frame(&mut self) {
+        let clips = all_clips(&self.vm);
+        for c in &clips {
+            if self.vm.display.get(*c).is_none() {
+                continue;
+            }
+            let events = clip_events(&self.vm, *c, clip_event::ENTER_FRAME);
+            self.vm
+                .queue
+                .push_back(Queued::Event(*c, "onEnterFrame", events));
+        }
+        self.run_queue();
+        let clips = all_clips(&self.vm);
+        for c in clips {
+            advance(&mut self.vm, c);
+        }
+        self.run_queue();
+        self.maybe_collect();
+    }
+
+    /// Runs queued actions until none are left.
+    pub fn run_queue(&mut self) {
+        let mut guard = 0;
+        loop {
+            // Sort newly queued work into the priority queues.
+            while let Some(q) = self.vm.queue.pop_front() {
+                match q {
+                    Queued::Init(..) => self.queue_init.push_back(q),
+                    Queued::Construct { .. } => self.queue_construct.push_back(q),
+                    _ => self.queue_construct.push_back(q),
+                }
+            }
+            let Some(q) = self
+                .queue_init
+                .pop_front()
+                .or_else(|| self.queue_construct.pop_front())
+            else {
+                break;
+            };
+            guard += 1;
+            if guard > 100_000 {
+                self.vm.warn_once("action queue runaway".into());
+                self.queue_init.clear();
+                self.queue_construct.clear();
+                break;
+            }
+            run_queued(&mut self.vm, q);
+        }
+    }
+
+    fn maybe_collect(&mut self) {
+        if self.vm.heap.allocated_since_gc < 50_000 {
+            return;
+        }
+        let vm = &mut self.vm;
+        let mut roots: Vec<ObjId> = vec![
+            vm.global,
+            vm.key,
+            vm.mouse,
+            vm.stage,
+            vm.selection,
+            vm.protos.object,
+            vm.protos.function,
+            vm.protos.array,
+            vm.protos.string,
+            vm.protos.number,
+            vm.protos.boolean,
+            vm.protos.date,
+            vm.protos.movie_clip,
+            vm.protos.text_field,
+            vm.protos.text_format,
+        ];
+        for id in vm.display.ids().collect::<Vec<_>>() {
+            if let Some(s) = vm.display.get(id).and_then(|o| o.script) {
+                roots.push(s);
+            }
+        }
+        let mut extra: Vec<Value> = Vec::new();
+        for (t, f) in vm.callbacks.values() {
+            extra.push(t.clone());
+            extra.push(f.clone());
+        }
+        for i in &vm.intervals {
+            extra.push(i.this.clone());
+            extra.push(i.func.clone());
+            extra.extend(i.args.iter().cloned());
+        }
+        extra.extend(vm.classes.values().cloned());
+        for q in vm
+            .queue
+            .iter()
+            .chain(self.queue_init.iter())
+            .chain(self.queue_construct.iter())
+        {
+            if let Queued::Construct { ctor: Some(c), .. } = q {
+                extra.push(c.clone());
+            }
+        }
+        vm.heap.collect(roots, &extra);
+    }
+
+    // ---- host access --------------------------------------------------------------------
+
+    fn global_scope(&self) -> std::rc::Rc<crate::avm1::Scope> {
+        let g = std::rc::Rc::new(crate::avm1::Scope {
+            object: self.vm.global,
+            kind: crate::avm1::ScopeKind::Global,
+            parent: None,
+        });
+        let r = self
+            .vm
+            .display
+            .get(self.vm.root)
+            .and_then(|o| o.script)
+            .unwrap_or(self.vm.global);
+        std::rc::Rc::new(crate::avm1::Scope {
+            object: r,
+            kind: crate::avm1::ScopeKind::Target,
+            parent: Some(g),
+        })
+    }
+
+    /// The value at a dotted path (`_global.X.y`, `_root.a.b`).
+    pub fn get_variable(&mut self, path: &str) -> HostValue {
+        let scope = self.global_scope();
+        let root = self.vm.root;
+        let v = self.vm.resolve_path(path, &scope, root);
+        self.vm.to_host(&v, 0)
+    }
+
+    pub fn get_value(&mut self, path: &str) -> Value {
+        let scope = self.global_scope();
+        let root = self.vm.root;
+        self.vm.resolve_path(path, &scope, root)
+    }
+
+    pub fn set_variable(&mut self, path: &str, v: &HostValue) {
+        let scope = self.global_scope();
+        let root = self.vm.root;
+        let val = self.vm.from_host(v);
+        match path.rsplit_once('.') {
+            Some((obj, name)) => {
+                let o = self.vm.resolve_path(obj, &scope, root);
+                self.vm.set(&o, name, val);
+            }
+            None => {
+                let r = self.vm.display_object(root);
+                self.vm.set(&r, path, val);
+            }
+        }
+        self.run_queue();
+    }
+
+    /// Calls the function at `path` with its object as `this` (Scaleform's `Invoke`).
+    pub fn invoke(&mut self, path: &str, args: &[HostValue]) -> HostValue {
+        let scope = self.global_scope();
+        let root = self.vm.root;
+        let args: Vec<Value> = args.iter().map(|a| self.vm.from_host(a)).collect();
+        self.vm.budget = 0;
+        let r = match path.rsplit_once('.') {
+            Some((obj, name)) => {
+                let o = self.vm.resolve_path(obj, &scope, root);
+                if o.is_nullish() {
+                    Value::Undefined
+                } else {
+                    self.vm.call_method(&o, name, &args)
+                }
+            }
+            None => {
+                let f = self.vm.resolve_path(path, &scope, root);
+                let this = self.vm.display_object(root);
+                self.vm.call(&f, this, &args)
+            }
+        };
+        self.run_queue();
+        self.vm.to_host(&r, 0)
+    }
+
+    /// Calls a function the movie registered with `ExternalInterface.addCallback`.
+    pub fn call_callback(&mut self, name: &str, args: &[HostValue]) -> HostValue {
+        let Some((this, f)) = self.vm.callbacks.get(name).cloned() else {
+            return HostValue::Undefined;
+        };
+        let args: Vec<Value> = args.iter().map(|a| self.vm.from_host(a)).collect();
+        self.vm.budget = 0;
+        let f = match &f {
+            Value::String(m) => self.vm.get(&this, m),
+            f => f.clone(),
+        };
+        let r = self.vm.call(&f, this, &args);
+        self.run_queue();
+        self.vm.to_host(&r, 0)
+    }
+
+    pub fn callbacks(&self) -> Vec<String> {
+        self.vm.callbacks.keys().cloned().collect()
+    }
+
+    pub fn set_stage_size(&mut self, w: f64, h: f64) {
+        if self.vm.stage_size != (w, h) {
+            self.vm.stage_size = (w, h);
+            self.vm.dirty = true;
+            let stage = self.vm.stage;
+            display_api::broadcast(&mut self.vm, stage, "onResize", &[]);
+            self.run_queue();
+        }
+    }
+
+    pub fn drain_log(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.vm.log)
+    }
+
+    /// Whether anything drawn changed since the last call.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.vm.dirty, false)
+    }
+
+    // ---- input --------------------------------------------------------------------------
+
+    /// The mouse moved to `(x, y)` in stage pixels.
+    pub fn mouse_move(&mut self, x: f64, y: f64) {
+        if self.vm.mouse_pos == (x, y) {
+            return;
+        }
+        self.vm.mouse_pos = (x, y);
+        if let Some((d, lock, off)) = self.vm.dragging {
+            drag_to(&mut self.vm, d, lock, off);
+        }
+        let mouse = self.vm.mouse;
+        display_api::broadcast(&mut self.vm, mouse, "onMouseMove", &[]);
+        self.clip_mouse_event("onMouseMove", clip_event::MOUSE_MOVE, &[]);
+        self.vm.pick_dirty = true;
+        self.update_hover();
+        self.run_queue();
+    }
+
+    fn clip_mouse_event(&mut self, method: &'static str, flag: u32, _args: &[Value]) {
+        for c in all_clips(&self.vm) {
+            let events = clip_events(&self.vm, c, flag);
+            self.vm.queue.push_back(Queued::Event(c, method, events));
+        }
+    }
+
+    fn update_hover(&mut self) {
+        if !self.vm.pick_dirty {
+            return;
+        }
+        self.vm.pick_dirty = false;
+        let (x, y) = self.vm.mouse_pos;
+        let hit = pick(&self.vm, (x * 20.0) as f32, (y * 20.0) as f32);
+        if hit == self.hover {
+            return;
+        }
+        let old = self.hover;
+        self.hover = hit;
+        let pressed = self.pressed.map(|p| p.0);
+        if let Some(o) = old {
+            let ev = if pressed == Some(o) {
+                "onDragOut"
+            } else {
+                "onRollOut"
+            };
+            button_event(&mut self.vm, o, ev, &[]);
+        }
+        if let Some(n) = hit {
+            let ev = if pressed == Some(n) {
+                "onDragOver"
+            } else {
+                "onRollOver"
+            };
+            button_event(&mut self.vm, n, ev, &[]);
+        }
+    }
+
+    /// The clip `Mouse.getTopMostEntity` reports (any clip, not only buttons).
+    pub fn topmost_at(&self, x: f64, y: f64) -> Option<DisplayId> {
+        pick_any(&self.vm, self.vm.root, (x * 20.0) as f32, (y * 20.0) as f32)
+    }
+
+    /// A mouse button changed. `button` is [`MOUSE_LEFT`], [`MOUSE_RIGHT`] or
+    /// [`MOUSE_MIDDLE`]; `double` marks a double click's second press.
+    pub fn mouse_button(&mut self, x: f64, y: f64, button: u8, down: bool, double: bool) {
+        self.vm.mouse_pos = (x, y);
+        self.vm.pick_dirty = true;
+        self.update_hover();
+        let b = Value::Number((button + if double { 4 } else { 0 }) as f64);
+        let press_args: Vec<Value> = if self.pass_buttons {
+            vec![b.clone()]
+        } else {
+            Vec::new()
+        };
+        let top = self
+            .topmost_at(x, y)
+            .map(|d| display_api::display_value(&mut self.vm, d))
+            .unwrap_or_default();
+        let mouse = self.vm.mouse;
+        if down {
+            display_api::broadcast(&mut self.vm, mouse, "onMouseDown", &[b.clone(), top]);
+            self.clip_mouse_event("onMouseDown", clip_event::MOUSE_DOWN, &[]);
+            if let Some(h) = self.hover {
+                self.pressed = Some((h, button));
+                button_event(&mut self.vm, h, "onPress", &press_args);
+            }
+            // A click outside the focused text field takes its focus away.
+            let under = self.topmost_at(x, y);
+            let text = under.filter(|d| {
+                self.vm
+                    .display
+                    .get(*d)
+                    .and_then(|o| o.text())
+                    .is_some_and(|t| t.input || t.selectable)
+            });
+            if text.is_some() || self.vm.focus.is_some() {
+                set_focus(&mut self.vm, text);
+            }
+        } else {
+            // Scaleform releases the button under the mouse before the mouse-up handlers.
+            if let Some((p, _)) = self.pressed.take() {
+                if self.hover == Some(p) {
+                    button_event(&mut self.vm, p, "onRelease", &press_args);
+                } else {
+                    button_event(&mut self.vm, p, "onReleaseOutside", &press_args);
+                }
+            }
+            self.run_queue();
+            display_api::broadcast(&mut self.vm, mouse, "onMouseUp", &[b, top]);
+            self.clip_mouse_event("onMouseUp", clip_event::MOUSE_UP, &[]);
+        }
+        self.run_queue();
+        self.vm.pick_dirty = true;
+        self.update_hover();
+        self.run_queue();
+    }
+
+    pub fn mouse_wheel(&mut self, x: f64, y: f64, delta: f64) {
+        self.vm.mouse_pos = (x, y);
+        let top = self
+            .topmost_at(x, y)
+            .map(|d| display_api::display_value(&mut self.vm, d))
+            .unwrap_or_default();
+        let mouse = self.vm.mouse;
+        display_api::broadcast(
+            &mut self.vm,
+            mouse,
+            "onMouseWheel",
+            &[Value::Number(delta), top],
+        );
+        self.run_queue();
+    }
+
+    /// A key went down (`code` is Flash's key code; `ch` the character it types, if any).
+    pub fn key_down(&mut self, code: u32, ch: Option<char>) {
+        self.vm.keys_down.insert(code);
+        self.vm.last_key = code;
+        if let Some(f) = self.vm.focus {
+            if text_key(&mut self.vm, f, code, ch) {
+                self.run_queue();
+                return;
+            }
+        }
+        let key = self.vm.key;
+        display_api::broadcast(&mut self.vm, key, "onKeyDown", &[]);
+        self.clip_mouse_event("onKeyDown", clip_event::KEY_DOWN, &[]);
+        self.run_queue();
+    }
+
+    pub fn key_up(&mut self, code: u32) {
+        self.vm.keys_down.remove(&code);
+        self.vm.last_key = code;
+        let key = self.vm.key;
+        display_api::broadcast(&mut self.vm, key, "onKeyUp", &[]);
+        self.clip_mouse_event("onKeyUp", clip_event::KEY_UP, &[]);
+        self.run_queue();
+    }
+
+    /// Types `text` into the focused text field.
+    pub fn type_text(&mut self, text: &str) -> bool {
+        let Some(f) = self.vm.focus else {
+            return false;
+        };
+        let mut any = false;
+        for c in text.chars() {
+            any |= text_key(&mut self.vm, f, 0, Some(c));
+        }
+        self.run_queue();
+        any
+    }
+}
+
+fn run_queued(vm: &mut Vm, q: Queued) {
+    vm.budget = 0;
+    match q {
+        Queued::Frame(c, code) | Queued::Init(c, code) => {
+            interp::run_actions(vm, &code, c);
+        }
+        Queued::Construct { clip, ctor, events } => {
+            if vm.display.get(clip).is_none() {
+                return;
+            }
+            for e in events {
+                interp::run_actions(vm, &e, clip);
+            }
+            if let Some(ctor) = ctor {
+                let obj = display_api::display_value(vm, clip);
+                let proto = vm.get(&ctor, "prototype").as_object();
+                if let Some(o) = obj.as_object() {
+                    vm.define(
+                        o,
+                        "__constructor__",
+                        ctor.clone(),
+                        crate::avm1::object::DONT_ENUM,
+                    );
+                }
+                vm.call_with_base(&ctor, obj, &[], proto);
+            }
+        }
+        Queued::Event(c, method, events) => {
+            if vm.display.get(c).is_none() {
+                return;
+            }
+            for e in events {
+                interp::run_actions(vm, &e, c);
+            }
+            if method == "onLoad" {
+                if let Some(cl) = vm.display.get_mut(c).and_then(|o| o.clip_mut()) {
+                    cl.loaded = true;
+                }
+            }
+            let obj = display_api::display_value(vm, c);
+            let f = vm.get(&obj, method);
+            if matches!(&f, Value::Object(o) if vm.is_function(*o)) {
+                vm.call(&f, obj, &[]);
+            }
+        }
+    }
+}
+
+/// Every clip, parents before children, lower depths first.
+fn all_clips(vm: &Vm) -> Vec<DisplayId> {
+    let mut out = Vec::new();
+    let mut stack = vec![vm.root];
+    while let Some(d) = stack.pop() {
+        let Some(o) = vm.display.get(d) else { continue };
+        if o.clip().is_some() {
+            out.push(d);
+        }
+        for c in o.children.values().rev() {
+            stack.push(*c);
+        }
+    }
+    out
+}
+
+fn clip_events(vm: &Vm, d: DisplayId, flag: u32) -> Vec<crate::swf::Actions> {
+    vm.display
+        .get(d)
+        .and_then(|o| o.clip())
+        .map(|c| {
+            c.clip_actions
+                .iter()
+                .filter(|a| a.events & flag != 0)
+                .map(|a| a.actions.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Runs a button-style handler (`onPress`, ...) on clip `d`.
+fn button_event(vm: &mut Vm, d: DisplayId, method: &'static str, args: &[Value]) {
+    let flag = match method {
+        "onPress" => clip_event::PRESS,
+        "onRelease" => clip_event::RELEASE,
+        "onReleaseOutside" => clip_event::RELEASE_OUTSIDE,
+        "onRollOver" => clip_event::ROLL_OVER,
+        "onRollOut" => clip_event::ROLL_OUT,
+        "onDragOver" => clip_event::DRAG_OVER,
+        "onDragOut" => clip_event::DRAG_OUT,
+        _ => 0,
+    };
+    for e in clip_events(vm, d, flag) {
+        interp::run_actions(vm, &e, d);
+    }
+    let obj = display_api::display_value(vm, d);
+    let f = vm.get(&obj, method);
+    if matches!(&f, Value::Object(o) if vm.is_function(*o)) {
+        vm.budget = 0;
+        vm.call(&f, obj, args);
+    }
+}
+
+// ---- timelines ---------------------------------------------------------------------------
+
+/// Runs frame `frame` of clip `d` for the first time after reaching it: init actions,
+/// display commands, then its actions are queued.
+fn enter_frame_of(vm: &mut Vm, d: DisplayId, frame: u16) {
+    let Some(tl) = vm
+        .display
+        .get(d)
+        .and_then(|o| o.clip())
+        .map(|c| c.timeline.clone())
+    else {
+        return;
+    };
+    let Some(f) = tl.frames.get(frame as usize) else {
+        return;
+    };
+    for (sprite, code) in &f.init_actions {
+        // Init actions run at once, before the frame's clips are made: they register the
+        // classes those clips are constructed with.
+        if vm.inits_done.insert(*sprite) {
+            interp::run_actions(vm, code, d);
+        }
+    }
+    if let Some(c) = vm.display.get_mut(d).and_then(|o| o.clip_mut()) {
+        c.frame = Some(frame);
+    }
+    for cmd in &f.commands {
+        apply_command(vm, d, cmd);
+    }
+    for a in &f.actions {
+        vm.queue.push_back(Queued::Frame(d, a.clone()));
+    }
+    vm.dirty = true;
+    vm.pick_dirty = true;
+}
+
+fn advance(vm: &mut Vm, d: DisplayId) {
+    let Some(c) = vm.display.get(d).and_then(|o| o.clip()) else {
+        return;
+    };
+    if !c.playing || c.loaded_image.is_some() {
+        return;
+    }
+    let total = c.timeline.frames.len() as u16;
+    let cur = c.frame.unwrap_or(0);
+    if total <= 1 {
+        return;
+    }
+    let next = cur + 1;
+    if next >= total {
+        goto(vm, d, 0, true);
+    } else {
+        enter_frame_of(vm, d, next);
+    }
+}
+
+fn apply_command(vm: &mut Vm, d: DisplayId, cmd: &Command) {
+    match cmd {
+        Command::Remove { depth } => {
+            let dd = *depth as i32 + DEPTH_OFFSET;
+            if let Some(c) = vm.display.get(d).and_then(|o| o.children.get(&dd).copied()) {
+                remove_clip(vm, c);
+            }
+        }
+        Command::Place(p) => place(vm, d, p),
+    }
+}
+
+fn place(vm: &mut Vm, parent: DisplayId, p: &Place) {
+    let depth = p.depth as i32 + DEPTH_OFFSET;
+    let existing = vm
+        .display
+        .get(parent)
+        .and_then(|o| o.children.get(&depth).copied());
+    if p.is_move {
+        let Some(e) = existing else { return };
+        // A move with a new character swaps a shape's outline in place.
+        if let Some(id) = p.character {
+            let ch = vm.movie.characters.get(&id).cloned();
+            if let (Some(o), Some(ch)) = (vm.display.get_mut(e), ch) {
+                match (&mut o.kind, ch) {
+                    (Kind::Shape(s, cid), Character::Shape(n)) => {
+                        *s = n;
+                        *cid = id;
+                    }
+                    (Kind::Morph(s, cid), Character::Morph(n)) => {
+                        *s = n;
+                        *cid = id;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        apply_place_props(vm, e, p);
+        vm.dirty = true;
+        return;
+    }
+    let Some(id) = p.character else { return };
+    if let Some(e) = existing {
+        // Flash leaves an occupied depth alone unless the object there is a different one.
+        let same = vm.display.get(e).is_some_and(|o| match &o.kind {
+            Kind::Clip(c) => c.character == id,
+            Kind::Shape(_, c) | Kind::Morph(_, c) => *c == id,
+            _ => false,
+        });
+        if same {
+            apply_place_props(vm, e, p);
+            return;
+        }
+        remove_clip(vm, e);
+    }
+    let Some(obj) = instantiate(vm, id) else {
+        return;
+    };
+    let new = vm.display.add(obj);
+    insert_child(vm, parent, new, depth);
+    if let Some(o) = vm.display.get_mut(new) {
+        o.from_timeline = true;
+        o.name = match &p.name {
+            Some(n) => Str::from(n.as_str()),
+            None => Str::from(""),
+        };
+    }
+    apply_place_props(vm, new, p);
+    if let Some(c) = vm.display.get_mut(new).and_then(|o| o.clip_mut()) {
+        c.clip_actions = p.clip_actions.clone();
+    }
+    constructed(vm, new, false, None);
+}
+
+fn apply_place_props(vm: &mut Vm, d: DisplayId, p: &Place) {
+    let Some(o) = vm.display.get_mut(d) else {
+        return;
+    };
+    if let Some(m) = p.matrix {
+        o.matrix = m;
+        o.scale_rotation = None;
+    }
+    if let Some(c) = p.color {
+        o.color = c;
+    }
+    if let Some(r) = p.ratio {
+        o.ratio = r;
+    }
+    if let Some(cd) = p.clip_depth {
+        o.clip_depth = Some(cd as i32 + DEPTH_OFFSET);
+    }
+    if let Some(b) = p.blend {
+        o.blend = b;
+    }
+    if let Some(f) = &p.filters {
+        o.filters = f.clone();
+    }
+    if let Some(v) = p.visible {
+        o.visible = v;
+    }
+    vm.dirty = true;
+    vm.pick_dirty = true;
+}
+
+/// Makes a display object for character `id` (not yet in the list).
+fn instantiate(vm: &mut Vm, id: u16) -> Option<Object> {
+    let ch = vm.movie.characters.get(&id)?.clone();
+    Some(Object::new(match ch {
+        Character::Shape(s) => Kind::Shape(s, id),
+        Character::Morph(m) => Kind::Morph(m, id),
+        Character::Sprite(t) => Kind::Clip(Box::new(clip_for(t, id))),
+        Character::EditText(e) => {
+            let font = e.font.and_then(|f| font_name(vm, f));
+            Kind::Text(Box::new(TextField::new(e, font)))
+        }
+        Character::Font(_) | Character::Image(_) => return None,
+    }))
+}
+
+/// The name of the font character `id` (its own, or the one imported under that id).
+fn font_name(vm: &Vm, id: u16) -> Option<String> {
+    if let Some(Character::Font(f)) = vm.movie.characters.get(&id) {
+        return Some(f.name.clone());
+    }
+    for imp in &vm.movie.imports {
+        for (cid, name) in &imp.assets {
+            if *cid == id {
+                // `$BodyFont` / `$TitleFont`: the font library maps them to its fonts.
+                return Some(name.clone());
+            }
+        }
+    }
+    None
+}
+
+fn insert_child(vm: &mut Vm, parent: DisplayId, child: DisplayId, depth: i32) {
+    if let Some(o) = vm.display.get_mut(child) {
+        o.parent = Some(parent);
+        o.depth = depth;
+    }
+    if let Some(p) = vm.display.get_mut(parent) {
+        p.children.insert(depth, child);
+    }
+    vm.dirty = true;
+    vm.pick_dirty = true;
+}
+
+/// After a clip is in the list: its script object, its first frame, construction and load.
+fn constructed(vm: &mut Vm, d: DisplayId, by_script: bool, init: Option<ObjId>) {
+    let Some(o) = vm.display.get(d) else { return };
+    match &o.kind {
+        Kind::Text(t) => {
+            // A field bound to a variable shows it.
+            if !t.variable.is_empty() {
+                let var = t.variable.clone();
+                if let Some(p) = o.parent {
+                    let pv = display_api::display_value(vm, p);
+                    let v = vm.get(&pv, &var);
+                    if !v.is_undefined() {
+                        let s = vm.to_str(&v);
+                        if let Some(t) = vm.display.get_mut(d).and_then(|o| o.text_mut()) {
+                            if t.html {
+                                t.set_html(&s);
+                            } else {
+                                t.set_text(&s);
+                            }
+                        }
+                    }
+                }
+            }
+            display_api::apply_autosize(vm, d);
+            return;
+        }
+        Kind::Clip(_) => {}
+        _ => return,
+    }
+    let character = o.clip().map(|c| c.character).unwrap_or(0);
+    let ctor = vm.classes.get(&character).cloned();
+    display_api::display_value(vm, d);
+    // The clip's load event is queued before its first frame makes its children, so a
+    // parent hears `onLoad` before the clips inside it (as Ruffle and Scaleform order it).
+    let load = clip_events(vm, d, clip_event::LOAD);
+    vm.queue.push_back(Queued::Event(d, "onLoad", load));
+    enter_frame_of(vm, d, 0);
+    if let Some(init) = init {
+        let keys = vm.keys(&Value::Object(init));
+        let obj = display_api::display_value(vm, d);
+        for k in keys.iter().rev() {
+            let v = vm.get(&Value::Object(init), k);
+            vm.set(&obj, k, v);
+        }
+    }
+    if by_script {
+        if let Some(ctor) = ctor {
+            let obj = display_api::display_value(vm, d);
+            let proto = vm.get(&ctor, "prototype").as_object();
+            if let Some(o) = obj.as_object() {
+                vm.define(
+                    o,
+                    "__constructor__",
+                    ctor.clone(),
+                    crate::avm1::object::DONT_ENUM,
+                );
+            }
+            vm.call_with_base(&ctor, obj, &[], proto);
+        }
+    } else {
+        for e in clip_events(vm, d, clip_event::INITIALIZE) {
+            vm.queue.push_back(Queued::Init(d, e));
+        }
+        vm.queue.push_back(Queued::Construct {
+            clip: d,
+            ctor,
+            events: clip_events(vm, d, clip_event::CONSTRUCT),
+        });
+    }
+}
+
+/// Shows frame `frame` (0-based) of clip `d`, rebuilding its timeline children as Flash does
+/// for a jump, and plays or stops it.
+pub fn goto(vm: &mut Vm, d: DisplayId, frame: u16, play: bool) {
+    let Some(c) = vm.display.get(d).and_then(|o| o.clip()) else {
+        return;
+    };
+    let total = c.timeline.frames.len() as u16;
+    let frame = frame.min(total.saturating_sub(1));
+    let cur = c.frame;
+    let tl = c.timeline.clone();
+    if let Some(c) = vm.display.get_mut(d).and_then(|o| o.clip_mut()) {
+        c.playing = play;
+    }
+    if cur == Some(frame) {
+        return;
+    }
+    let forward_from = match cur {
+        Some(cur) if frame > cur => cur + 1,
+        _ => 0,
+    };
+    // Replay the commands from `forward_from` to `frame` into one final state per depth.
+    let mut state: HashMap<i32, Option<Place>> = HashMap::new();
+    if forward_from == 0 {
+        // A rewind: every timeline child not in the target state goes.
+        if let Some(o) = vm.display.get(d) {
+            for (depth, c) in &o.children {
+                if *depth < 0 && vm.display.get(*c).is_some_and(|x| x.from_timeline) {
+                    state.insert(*depth, None);
+                }
+            }
+        }
+    }
+    let mut replaced: HashSet<i32> = HashSet::new();
+    for fi in forward_from..=frame {
+        let Some(f) = tl.frames.get(fi as usize) else {
+            break;
+        };
+        for (sprite, code) in &f.init_actions {
+            if vm.inits_done.insert(*sprite) {
+                interp::run_actions(vm, code, d);
+            }
+        }
+        for cmd in &f.commands {
+            match cmd {
+                Command::Remove { depth } => {
+                    state.insert(*depth as i32 + DEPTH_OFFSET, None);
+                }
+                Command::Place(p) => {
+                    let depth = p.depth as i32 + DEPTH_OFFSET;
+                    let entry = state.entry(depth).or_insert(None);
+                    match (p.is_move, entry.as_mut()) {
+                        (true, Some(prev)) => merge_place(prev, p),
+                        (true, None) => {
+                            // A move of an object placed before the replay began.
+                            let mut q = (**p).clone();
+                            if q.character.is_none() {
+                                q.is_move = true;
+                            }
+                            *entry = Some(q);
+                        }
+                        (false, _) => {
+                            *entry = Some((**p).clone());
+                            replaced.insert(depth);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(c) = vm.display.get_mut(d).and_then(|o| o.clip_mut()) {
+        c.frame = Some(frame);
+    }
+    let mut depths: Vec<i32> = state.keys().copied().collect();
+    depths.sort();
+    for depth in depths {
+        let existing = vm
+            .display
+            .get(d)
+            .and_then(|o| o.children.get(&depth).copied());
+        match state.remove(&depth).flatten() {
+            None => {
+                if let Some(e) = existing {
+                    if vm
+                        .display
+                        .get(e)
+                        .is_some_and(|o| o.from_timeline || depth < 0)
+                    {
+                        remove_clip(vm, e);
+                    }
+                }
+            }
+            Some(p) => {
+                let same_char = existing.is_some_and(|e| {
+                    vm.display.get(e).is_some_and(|o| match &o.kind {
+                        Kind::Clip(c) => Some(c.character) == p.character,
+                        Kind::Shape(_, c) | Kind::Morph(_, c) => Some(*c) == p.character,
+                        Kind::Text(_) => true,
+                        _ => false,
+                    })
+                });
+                if let Some(e) = existing {
+                    if p.is_move || (same_char && !replaced.contains(&depth)) || same_char {
+                        let mut q = p.clone();
+                        q.is_move = true;
+                        place(vm, d, &q);
+                        continue;
+                    }
+                    remove_clip(vm, e);
+                }
+                if !p.is_move {
+                    place(vm, d, &p);
+                }
+            }
+        }
+    }
+    if let Some(f) = tl.frames.get(frame as usize) {
+        for a in &f.actions {
+            vm.queue.push_back(Queued::Frame(d, a.clone()));
+        }
+    }
+    vm.dirty = true;
+    vm.pick_dirty = true;
+}
+
+fn merge_place(prev: &mut Place, p: &Place) {
+    if let Some(c) = p.character {
+        prev.character = Some(c);
+    }
+    if p.matrix.is_some() {
+        prev.matrix = p.matrix;
+    }
+    if p.color.is_some() {
+        prev.color = p.color;
+    }
+    if p.ratio.is_some() {
+        prev.ratio = p.ratio;
+    }
+    if p.blend.is_some() {
+        prev.blend = p.blend;
+    }
+    if p.filters.is_some() {
+        prev.filters = p.filters.clone();
+    }
+    if p.visible.is_some() {
+        prev.visible = p.visible;
+    }
+    if p.clip_depth.is_some() {
+        prev.clip_depth = p.clip_depth;
+    }
+}
+
+pub fn goto_label(vm: &mut Vm, d: DisplayId, label: &str, play: bool) {
+    let Some(f) = vm
+        .display
+        .get(d)
+        .and_then(|o| o.clip())
+        .and_then(|c| c.timeline.label(label))
+    else {
+        vm.warn_once(format!("no frame label {label}"));
+        return;
+    };
+    goto(vm, d, f, play);
+}
+
+pub fn clip_step(vm: &mut Vm, d: DisplayId, by: i32) {
+    let Some(c) = vm.display.get(d).and_then(|o| o.clip()) else {
+        return;
+    };
+    let cur = c.frame.unwrap_or(0) as i32;
+    let total = c.timeline.frames.len() as i32;
+    let to = (cur + by).clamp(0, total - 1);
+    goto(vm, d, to as u16, false);
+}
+
+pub fn set_playing(vm: &mut Vm, d: DisplayId, playing: bool) {
+    if let Some(c) = vm.display.get_mut(d).and_then(|o| o.clip_mut()) {
+        c.playing = playing;
+    }
+}
+
+/// Takes `d` (and everything under it) out of the display list, running `onUnload`.
+pub fn remove_clip(vm: &mut Vm, d: DisplayId) {
+    let Some(o) = vm.display.get(d) else { return };
+    let parent = o.parent;
+    let depth = o.depth;
+    // Unload handlers run while the clip is still reachable.
+    let mut stack = vec![d];
+    let mut clips = Vec::new();
+    while let Some(x) = stack.pop() {
+        if let Some(o) = vm.display.get(x) {
+            if o.clip().is_some() {
+                clips.push(x);
+            }
+            stack.extend(o.children.values().copied());
+        }
+    }
+    for c in clips {
+        let has = vm.display.get(c).and_then(|o| o.script).is_some();
+        for e in clip_events(vm, c, clip_event::UNLOAD) {
+            interp::run_actions(vm, &e, c);
+        }
+        if has {
+            let obj = display_api::display_value(vm, c);
+            let f = vm.get(&obj, "onUnload");
+            if matches!(&f, Value::Object(x) if vm.is_function(*x)) {
+                vm.call(&f, obj, &[]);
+            }
+        }
+    }
+    if let Some(p) = parent.and_then(|p| vm.display.get_mut(p)) {
+        if p.children.get(&depth) == Some(&d) {
+            p.children.remove(&depth);
+        }
+    }
+    let gone = vm.display.free_tree(d);
+    if vm.focus.is_some_and(|f| gone.contains(&f)) {
+        vm.focus = None;
+    }
+    if vm.dragging.is_some_and(|(f, _, _)| gone.contains(&f)) {
+        vm.dragging = None;
+    }
+    // Script objects of removed clips no longer resolve to them.
+    vm.dirty = true;
+    vm.pick_dirty = true;
+}
+
+/// `attachMovie`: a new instance of the exported symbol `export` in `parent` at `depth`.
+pub fn attach(
+    vm: &mut Vm,
+    parent: DisplayId,
+    export: &str,
+    name: &str,
+    depth: i32,
+    init: Option<ObjId>,
+) -> Option<DisplayId> {
+    let id = *vm.movie.exports.get(&export.to_ascii_lowercase())?;
+    let obj = instantiate(vm, id)?;
+    replace_at(vm, parent, depth);
+    let new = vm.display.add(obj);
+    insert_child(vm, parent, new, depth);
+    if let Some(o) = vm.display.get_mut(new) {
+        o.name = Str::from(name);
+    }
+    constructed(vm, new, true, init);
+    Some(new)
+}
+
+fn replace_at(vm: &mut Vm, parent: DisplayId, depth: i32) {
+    if let Some(e) = vm
+        .display
+        .get(parent)
+        .and_then(|o| o.children.get(&depth).copied())
+    {
+        remove_clip(vm, e);
+    }
+}
+
+pub fn create_empty(vm: &mut Vm, parent: DisplayId, name: &str, depth: i32) -> Option<DisplayId> {
+    replace_at(vm, parent, depth);
+    let tl = Arc::new(crate::swf::Timeline {
+        frames: vec![Default::default()],
+        labels: Vec::new(),
+    });
+    let mut obj = Object::new(Kind::Clip(Box::new(clip_for(tl, 0))));
+    obj.name = Str::from(name);
+    let new = vm.display.add(obj);
+    insert_child(vm, parent, new, depth);
+    constructed(vm, new, true, None);
+    Some(new)
+}
+
+pub fn create_text(
+    vm: &mut Vm,
+    parent: DisplayId,
+    name: &str,
+    depth: i32,
+    rect: [f64; 4],
+) -> Option<DisplayId> {
+    replace_at(vm, parent, depth);
+    let def = crate::swf::EditText {
+        bounds: crate::swf::Rect {
+            x_min: 0,
+            y_min: 0,
+            x_max: (rect[2] * 20.0) as i32,
+            y_max: (rect[3] * 20.0) as i32,
+        },
+        read_only: true,
+        height: 240,
+        ..Default::default()
+    };
+    let mut obj = Object::new(Kind::Text(Box::new(TextField::new(Arc::new(def), None))));
+    obj.name = Str::from(name);
+    obj.matrix = crate::swf::Matrix::translate((rect[0] * 20.0) as f32, (rect[1] * 20.0) as f32);
+    let new = vm.display.add(obj);
+    insert_child(vm, parent, new, depth);
+    Some(new)
+}
+
+pub fn swap_depths(vm: &mut Vm, d: DisplayId, with: Result<DisplayId, i32>) {
+    let Some(o) = vm.display.get(d) else { return };
+    let Some(parent) = o.parent else { return };
+    let my_depth = o.depth;
+    let other_depth = match with {
+        Ok(other) => {
+            let Some(oo) = vm.display.get(other) else {
+                return;
+            };
+            if oo.parent != Some(parent) {
+                return;
+            }
+            oo.depth
+        }
+        Err(dep) => dep,
+    };
+    if other_depth == my_depth {
+        return;
+    }
+    let other = vm
+        .display
+        .get(parent)
+        .and_then(|p| p.children.get(&other_depth).copied());
+    if let Some(p) = vm.display.get_mut(parent) {
+        p.children.remove(&my_depth);
+        if let Some(other) = other {
+            p.children.insert(my_depth, other);
+        }
+        p.children.insert(other_depth, d);
+    }
+    if let Some(o) = vm.display.get_mut(d) {
+        o.depth = other_depth;
+        o.from_timeline = false;
+    }
+    if let Some(other) = other.and_then(|x| vm.display.get_mut(x)) {
+        other.depth = my_depth;
+    }
+    vm.dirty = true;
+    vm.pick_dirty = true;
+}
+
+/// Loads an image (or nothing) into clip `d`, replacing its content. Images only: the movies
+/// load `img://` engine images and atlas images this way.
+pub fn load_into(vm: &mut Vm, d: DisplayId, url: &str) -> bool {
+    unload(vm, d);
+    let size = vm.host.image_size(url);
+    let Some((w, h)) = size else {
+        vm.warn_once(format!("image {url} not found"));
+        return false;
+    };
+    let bmp = Object::new(Kind::Bitmap {
+        url: url.to_string(),
+        width: w as f32,
+        height: h as f32,
+    });
+    let b = vm.display.add(bmp);
+    insert_child(vm, d, b, 0);
+    if let Some(c) = vm.display.get_mut(d).and_then(|o| o.clip_mut()) {
+        c.loaded_image = Some(url.to_string());
+    }
+    true
+}
+
+pub fn unload(vm: &mut Vm, d: DisplayId) {
+    let kids: Vec<DisplayId> = vm
+        .display
+        .get(d)
+        .map(|o| o.children.values().copied().collect())
+        .unwrap_or_default();
+    for k in kids {
+        remove_clip(vm, k);
+    }
+    if let Some(c) = vm.display.get_mut(d).and_then(|o| o.clip_mut()) {
+        c.loaded_image = None;
+        c.drawing = None;
+    }
+}
+
+pub fn start_drag(vm: &mut Vm, d: DisplayId, lock: bool) {
+    let Some(o) = vm.display.get(d) else { return };
+    let parent_m = o
+        .parent
+        .map(|p| vm.display.world_matrix(p))
+        .unwrap_or_default();
+    let (mx, my) = parent_m
+        .invert()
+        .map(|i| {
+            i.apply(
+                (vm.mouse_pos.0 * 20.0) as f32,
+                (vm.mouse_pos.1 * 20.0) as f32,
+            )
+        })
+        .unwrap_or((0.0, 0.0));
+    let off = ((o.matrix.tx - mx) as f64, (o.matrix.ty - my) as f64);
+    vm.dragging = Some((d, lock, off));
+}
+
+fn drag_to(vm: &mut Vm, d: DisplayId, lock: bool, off: (f64, f64)) {
+    let Some(o) = vm.display.get(d) else { return };
+    let parent_m = o
+        .parent
+        .map(|p| vm.display.world_matrix(p))
+        .unwrap_or_default();
+    let Some(inv) = parent_m.invert() else { return };
+    let (mx, my) = inv.apply(
+        (vm.mouse_pos.0 * 20.0) as f32,
+        (vm.mouse_pos.1 * 20.0) as f32,
+    );
+    if let Some(o) = vm.display.get_mut(d) {
+        if lock {
+            o.matrix.tx = mx;
+            o.matrix.ty = my;
+        } else {
+            o.matrix.tx = mx + off.0 as f32;
+            o.matrix.ty = my + off.1 as f32;
+        }
+    }
+    vm.dirty = true;
+}
+
+pub fn set_focus(vm: &mut Vm, d: Option<DisplayId>) {
+    let old = vm.focus;
+    if old == d {
+        return;
+    }
+    vm.focus = d;
+    if let Some(t) = old
+        .and_then(|o| vm.display.get_mut(o))
+        .and_then(|o| o.text_mut())
+    {
+        t.caret = None;
+    }
+    if let Some(t) = d
+        .and_then(|o| vm.display.get_mut(o))
+        .and_then(|o| o.text_mut())
+    {
+        t.caret = Some(t.len());
+    }
+    let ov = old
+        .map(|o| display_api::display_value(vm, o))
+        .unwrap_or(Value::Null);
+    let nv = d
+        .map(|o| display_api::display_value(vm, o))
+        .unwrap_or(Value::Null);
+    if let Some(o) = old {
+        let obj = display_api::display_value(vm, o);
+        vm.call_method_if(&obj, "onKillFocus", std::slice::from_ref(&nv));
+    }
+    if let Some(n) = d {
+        let obj = display_api::display_value(vm, n);
+        vm.call_method_if(&obj, "onSetFocus", std::slice::from_ref(&ov));
+    }
+    let sel = vm.selection;
+    display_api::broadcast(vm, sel, "onSetFocus", &[ov, nv]);
+    vm.dirty = true;
+}
+
+impl Vm {
+    /// Calls `obj.name(args)` when it is a function.
+    pub fn call_method_if(&mut self, obj: &Value, name: &str, args: &[Value]) -> Option<Value> {
+        let f = self.get(obj, name);
+        if matches!(&f, Value::Object(o) if self.is_function(*o)) {
+            Some(self.call(&f, obj.clone(), args))
+        } else {
+            None
+        }
+    }
+}
+
+/// Edits the focused input field; true when the key was the field's.
+fn text_key(vm: &mut Vm, f: DisplayId, code: u32, ch: Option<char>) -> bool {
+    let Some(t) = vm.display.get_mut(f).and_then(|o| o.text_mut()) else {
+        return false;
+    };
+    if !t.input {
+        return false;
+    }
+    let mut text: Vec<char> = t.text().chars().collect();
+    let mut caret = t.caret.unwrap_or(text.len()).min(text.len());
+    let mut changed = false;
+    match (code, ch) {
+        (8, _) => {
+            if caret > 0 {
+                text.remove(caret - 1);
+                caret -= 1;
+                changed = true;
+            }
+        }
+        (46, _) => {
+            if caret < text.len() {
+                text.remove(caret);
+                changed = true;
+            }
+        }
+        (37, _) => caret = caret.saturating_sub(1),
+        (39, _) => caret = (caret + 1).min(text.len()),
+        (36, _) => caret = 0,
+        (35, _) => caret = text.len(),
+        (13, _) if t.multiline => {
+            text.insert(caret, '\r');
+            caret += 1;
+            changed = true;
+        }
+        (_, Some(c)) if !c.is_control() => {
+            let allowed = t.restrict.as_deref().is_none_or(|r| restrict_allows(r, c));
+            if allowed && (t.max_chars == 0 || (text.len() as u32) < t.max_chars) {
+                text.insert(caret, c);
+                caret += 1;
+                changed = true;
+            } else {
+                return true;
+            }
+        }
+        _ => return false,
+    }
+    let s: String = text.iter().collect();
+    if changed {
+        t.set_text(&s);
+    }
+    t.caret = Some(caret);
+    let var = t.variable.clone();
+    vm.dirty = true;
+    if changed {
+        let obj = display_api::display_value(vm, f);
+        vm.call_method_if(&obj, "onChanged", std::slice::from_ref(&obj));
+        if !var.is_empty() {
+            if let Some(p) = vm.display.get(f).and_then(|o| o.parent) {
+                let pv = display_api::display_value(vm, p);
+                if let Some(po) = pv.as_object() {
+                    vm.define(po, &var, Value::from(s), 0);
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Flash's `restrict` syntax: ranges, `^` to exclude, `\` to escape.
+pub fn restrict_allows(r: &str, c: char) -> bool {
+    let chars: Vec<char> = r.chars().collect();
+    let mut allowed = false;
+    let mut any_include = false;
+    let mut include = true;
+    let mut i = 0;
+    let mut first = true;
+    while i < chars.len() {
+        let mut a = chars[i];
+        if a == '^' {
+            include = !include;
+            if first {
+                allowed = true;
+            }
+            i += 1;
+            first = false;
+            continue;
+        }
+        first = false;
+        if a == '\\' && i + 1 < chars.len() {
+            i += 1;
+            a = chars[i];
+        }
+        let mut b = a;
+        if i + 2 < chars.len() && chars[i + 1] == '-' {
+            b = chars[i + 2];
+            i += 2;
+        }
+        if include {
+            any_include = true;
+        }
+        if c >= a && c <= b {
+            allowed = include;
+        }
+        i += 1;
+    }
+    if !any_include && !allowed {
+        return true;
+    }
+    allowed
+}
+
+// ---- picking -----------------------------------------------------------------------------
+
+fn takes_mouse(vm: &Vm, d: DisplayId) -> bool {
+    let Some(o) = vm.display.get(d) else {
+        return false;
+    };
+    let Some(c) = o.clip() else { return false };
+    let flags = clip_event::PRESS
+        | clip_event::RELEASE
+        | clip_event::RELEASE_OUTSIDE
+        | clip_event::ROLL_OVER
+        | clip_event::ROLL_OUT
+        | clip_event::DRAG_OVER
+        | clip_event::DRAG_OUT;
+    if c.clip_actions.iter().any(|a| a.events & flags != 0) {
+        return true;
+    }
+    let Some(s) = o.script else { return false };
+    let v = Value::Object(s);
+    for h in [
+        "onPress",
+        "onRelease",
+        "onReleaseOutside",
+        "onRollOver",
+        "onRollOut",
+        "onDragOver",
+        "onDragOut",
+    ] {
+        if let Some((_, p)) = lookup_prop(vm, s, h) {
+            if matches!(&p, Value::Object(f) if vm.is_function(*f)) {
+                let _ = &v;
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn lookup_prop(vm: &Vm, o: ObjId, name: &str) -> Option<(ObjId, Value)> {
+    let mut cur = Some(o);
+    let mut guard = 0;
+    while let Some(c) = cur {
+        let obj = vm.heap.get(c)?;
+        if let Some(p) = obj.props.get(name) {
+            return Some((c, p.value.clone()));
+        }
+        cur = obj.proto;
+        guard += 1;
+        if guard > 64 {
+            break;
+        }
+    }
+    None
+}
+
+fn enabled(vm: &Vm, d: DisplayId) -> bool {
+    let Some(s) = vm.display.get(d).and_then(|o| o.script) else {
+        return true;
+    };
+    !matches!(lookup_prop(vm, s, "enabled"), Some((_, Value::Bool(false))))
+}
+
+/// The topmost clip taking button events under the point (twips, stage space).
+fn pick(vm: &Vm, x: f32, y: f32) -> Option<DisplayId> {
+    pick_in(vm, vm.root, x, y, true)
+}
+
+fn pick_any(vm: &Vm, d: DisplayId, x: f32, y: f32) -> Option<DisplayId> {
+    pick_in(vm, d, x, y, false)
+}
+
+fn pick_in(vm: &Vm, d: DisplayId, x: f32, y: f32, buttons: bool) -> Option<DisplayId> {
+    let o = vm.display.get(d)?;
+    if !o.visible || o.hit_test_disable {
+        return None;
+    }
+    // Children, topmost first; masks hide what is outside them.
+    let kids: Vec<(i32, DisplayId)> = o.children.iter().map(|(k, v)| (*k, *v)).collect();
+    let masks: Vec<(i32, i32, DisplayId)> = kids
+        .iter()
+        .filter_map(|(depth, c)| {
+            vm.display
+                .get(*c)
+                .and_then(|co| co.clip_depth)
+                .map(|cd| (*depth, cd, *c))
+        })
+        .collect();
+    for (depth, c) in kids.iter().rev() {
+        if vm.display.get(*c).is_some_and(|co| co.clip_depth.is_some()) {
+            continue;
+        }
+        if let Some((_, _, m)) = masks.iter().find(|(md, cd, _)| depth > md && depth <= cd) {
+            if !hit_shape(vm, *m, x, y) {
+                continue;
+            }
+        }
+        let is_clip = vm.display.get(*c).is_some_and(|co| co.clip().is_some());
+        if buttons {
+            if is_clip && takes_mouse(vm, *c) && enabled(vm, *c) {
+                if hit_shape(vm, *c, x, y) {
+                    return Some(*c);
+                }
+                continue;
+            }
+            if is_clip {
+                if let Some(h) = pick_in(vm, *c, x, y, true) {
+                    return Some(h);
+                }
+            }
+        } else {
+            if is_clip {
+                if let Some(h) = pick_in(vm, *c, x, y, false) {
+                    return Some(h);
+                }
+            } else if hit_shape(vm, *c, x, y) {
+                // A shape belongs to its clip; a text field is its own entity.
+                if vm.display.get(*c).is_some_and(|co| co.text().is_some()) {
+                    return Some(*c);
+                }
+                return Some(d);
+            }
+        }
+    }
+    None
+}
+
+/// Whether the point (twips, stage space) is on `d`'s drawn content.
+pub fn hit_shape(vm: &Vm, d: DisplayId, x: f32, y: f32) -> bool {
+    let Some(o) = vm.display.get(d) else {
+        return false;
+    };
+    if !o.visible || o.hit_test_disable {
+        return false;
+    }
+    let Some(inv) = vm.display.world_matrix(d).invert() else {
+        return false;
+    };
+    let (lx, ly) = inv.apply(x, y);
+    match &o.kind {
+        Kind::Shape(s, _) => {
+            let b = s.bounds;
+            if lx < b.x_min as f32
+                || lx > b.x_max as f32
+                || ly < b.y_min as f32
+                || ly > b.y_max as f32
+            {
+                return false;
+            }
+            shape_contains(&s.records, s.lines.len(), lx, ly)
+        }
+        Kind::Morph(m, _) => {
+            let b = m.start_bounds;
+            lx >= b.x_min as f32
+                && lx <= b.x_max as f32
+                && ly >= b.y_min as f32
+                && ly <= b.y_max as f32
+        }
+        Kind::Text(t) => {
+            let (bx, by, w, h) = t.bounds;
+            let (px, py) = (lx / 20.0, ly / 20.0);
+            px >= bx && px <= bx + w && py >= by && py <= by + h
+        }
+        Kind::Bitmap { width, height, .. } => {
+            lx >= 0.0 && ly >= 0.0 && lx <= width * 20.0 && ly <= height * 20.0
+        }
+        Kind::Clip(c) => {
+            if let Some(dr) = &c.drawing {
+                for (_, pts) in &dr.fills {
+                    if polygon_contains(pts, lx, ly) {
+                        return true;
+                    }
+                }
+            }
+            let kids: Vec<DisplayId> = o.children.values().copied().collect();
+            kids.iter().any(|k| {
+                vm.display.get(*k).is_some_and(|ko| ko.clip_depth.is_none())
+                    && hit_shape(vm, *k, x, y)
+            })
+        }
+    }
+}
+
+fn polygon_contains(pts: &[(f32, f32)], x: f32, y: f32) -> bool {
+    let mut inside = false;
+    let n = pts.len();
+    for i in 0..n {
+        let (x0, y0) = pts[i];
+        let (x1, y1) = pts[(i + 1) % n];
+        if (y0 > y) != (y1 > y) && x < x0 + (y - y0) / (y1 - y0) * (x1 - x0) {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+/// Point-in-shape for SWF edge records: a point is inside when, for some fill style, the
+/// edges bounding it cross a ray from it an odd number of times.
+fn shape_contains(records: &[Record], _lines: usize, x: f32, y: f32) -> bool {
+    let mut parity: HashMap<(usize, u32), bool> = HashMap::new();
+    let (mut px, mut py) = (0.0f32, 0.0f32);
+    let (mut f0, mut f1) = (0u32, 0u32);
+    let mut styles = 0usize;
+    let mut cross = |a: (f32, f32), b: (f32, f32), f0: u32, f1: u32, styles: usize| {
+        if (a.1 > y) != (b.1 > y) && x < a.0 + (y - a.1) / (b.1 - a.1) * (b.0 - a.0) {
+            for f in [f0, f1] {
+                if f != 0 {
+                    let e = parity.entry((styles, f)).or_insert(false);
+                    *e = !*e;
+                }
+            }
+        }
+    };
+    for r in records {
+        match r {
+            Record::Style {
+                move_to,
+                fill0,
+                fill1,
+                new_styles,
+                ..
+            } => {
+                if new_styles.is_some() {
+                    styles += 1;
+                    f0 = 0;
+                    f1 = 0;
+                }
+                if let Some((mx, my)) = move_to {
+                    px = *mx as f32;
+                    py = *my as f32;
+                }
+                if let Some(f) = fill0 {
+                    f0 = *f;
+                }
+                if let Some(f) = fill1 {
+                    f1 = *f;
+                }
+            }
+            Record::Line { to } => {
+                let b = (to.0 as f32, to.1 as f32);
+                cross((px, py), b, f0, f1, styles);
+                (px, py) = b;
+            }
+            Record::Curve { control, to } => {
+                let c = (control.0 as f32, control.1 as f32);
+                let e = (to.0 as f32, to.1 as f32);
+                let mut prev = (px, py);
+                for i in 1..=8 {
+                    let t = i as f32 / 8.0;
+                    let u = 1.0 - t;
+                    let q = (
+                        u * u * px + 2.0 * u * t * c.0 + t * t * e.0,
+                        u * u * py + 2.0 * u * t * c.1 + t * t * e.1,
+                    );
+                    cross(prev, q, f0, f1, styles);
+                    prev = q;
+                }
+                (px, py) = e;
+            }
+        }
+    }
+    parity.values().any(|v| *v)
+}
+
+/// The clip actions of a placed clip (for tests and tools).
+pub fn clip_actions(vm: &Vm, d: DisplayId) -> Vec<ClipAction> {
+    vm.display
+        .get(d)
+        .and_then(|o| o.clip())
+        .map(|c| c.clip_actions.clone())
+        .unwrap_or_default()
+}
+
+/// `Mouse.getTopMostEntity`: the clip (or text field) under the mouse.
+pub fn topmost(vm: &Vm) -> Option<DisplayId> {
+    pick_any(
+        vm,
+        vm.root,
+        (vm.mouse_pos.0 * 20.0) as f32,
+        (vm.mouse_pos.1 * 20.0) as f32,
+    )
+}

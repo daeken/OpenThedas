@@ -104,8 +104,8 @@ these, so they are the places where one person or stream can take a large, separ
   (`RND-094`).
 - **Animation blending.** No blend weights, crossfades, inverse kinematics or root motion
   (`RND-064` to `RND-068`).
-- **Faces.** Conversation lines are lip synced (FaceFX), but cutscene lines and lines said in
-  passing are not, animations' morph tracks are skipped, and head-morph bone offsets are read
+- **Faces.** Conversation lines, cutscenes' own voiced lines and lines said in passing are lip synced
+  (FaceFX), but narration mixed into a cutscene's sound is not, animations' morph tracks are skipped, and head-morph bone offsets are read
   but not applied (`RND-050`, `RND-069`, `RND-070`, `FMT-027`, `AUD-052`, `CAM-013`).
 - **Lighting.** Level geometry still uses an older light-picking rule; spot lights, animated
   lights and point or spot shadows are missing (`RND-025` to `RND-030`, `RND-046`).

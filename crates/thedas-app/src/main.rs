@@ -4977,6 +4977,8 @@ fn audio_state(
     let Some(live) = live else {
         return state;
     };
+    // The voice playing keeps the speaker's lip sync in time with it.
+    live.set_voice_position(a.voice_position());
     // The loading frame is up: the world's sounds duck as in the exe's loading mode.
     state.loading = live.loading();
     state.paused = live.paused;
@@ -5116,12 +5118,19 @@ fn audio_state(
         }
     }
     // Lines said in passing, at their speakers' heads.
+    let mut passing = Vec::new();
     {
         let sim = live.sim();
         for l in ambient {
             let Some(strref) = l.strref else {
                 continue;
             };
+            passing.push(faces::SpokenLine {
+                speaker: l.speaker,
+                dialog: l.dialog.clone(),
+                strref,
+                female: l.female,
+            });
             let at = sim.world.get(l.speaker).map(|o| {
                 let p = o.position;
                 [p[0], p[1], p[2] + live.head_height(o.id)]
@@ -5136,6 +5145,9 @@ fn audio_state(
                 at,
             ));
         }
+    }
+    for line in &passing {
+        live.say_in_passing(line);
     }
     // Sounds the simulation asked for (scripts, character creation's voice preview).
     {

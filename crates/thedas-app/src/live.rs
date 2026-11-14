@@ -1824,6 +1824,7 @@ impl Live {
             .cut_actors
             .shown(&sim, tracks, &|id| drawn_root(posed, id));
         let cut_lights = shown.lights;
+        let cut_speaker = shown.speaker;
         let mut posing = shown.actors;
         for (m, show) in shown.own {
             posing.insert(m.id, show);
@@ -1855,10 +1856,15 @@ impl Live {
             && sim.conversation_line().is_none();
         let hero = sim.world.controlled().or(sim.world.hero);
         // The voiced conversation line's speaker, for its lip sync.
-        let spoken = crate::talkcam::line_speaker_and_listener(&sim)
+        // A cutscene's own voiced line: its actor's object says it.
+        let speaker = match sim.conversation_line() {
+            Some(_) => crate::talkcam::line_speaker_and_listener(&sim).map(|(s, _)| s),
+            None => cut_speaker,
+        };
+        let spoken = speaker
             .zip(crate::voice_line(&sim))
             .filter(|(_, l)| !l.ambient)
-            .map(|((speaker, _), l)| crate::faces::SpokenLine {
+            .map(|(speaker, l)| crate::faces::SpokenLine {
                 speaker,
                 dialog: l.dialog,
                 strref: l.strref,
@@ -2554,6 +2560,17 @@ impl Live {
             &mut overlays,
             &mut |encoder, view| reticle.draw(&ctx.device, encoder, view, (width, height), &aim),
         )?))
+    }
+
+    /// Where the voice-over playing is (its line's talk-table reference, seconds into it),
+    /// which the speaking line's lip sync follows (see [`crate::faces`]).
+    pub fn set_voice_position(&mut self, at: Option<(u32, f64)>) {
+        self.faces.voice_at(at);
+    }
+
+    /// A line said in passing, for its speaker's lip sync (see [`crate::faces`]).
+    pub fn say_in_passing(&mut self, line: &crate::faces::SpokenLine) {
+        self.faces.say(&self.install, &self.module, line);
     }
 
     /// The aiming reticle's pass for frames of `format`, made once for each format.
