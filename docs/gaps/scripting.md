@@ -219,14 +219,14 @@ call to the exe's event constructor 0x69bac0):
 
 | Constructor | Call sites (scripts) | Note |
 | --- | --- | --- |
-| `CommandMoveAwayFromObject` | 1,010 (169) | now walks (provisional); type number invented (`SCR-057`) |
+| `CommandMoveAwayFromObject` | 1,010 (169) | now walks (provisional); Origins runtime type 21 traced |
 | `CommandPlayAnimation` | 829 (386) | |
 | `CommandFly` | 353 (176) | DLC scripts pass a second integer |
-| `CommandMoveToMultiLocations` | 323 (295) | now walks its list (provisional); type number invented |
-| `CommandTurn` | 221 (214) | now turns (provisional); type number invented |
-| `CommandSheatheWeapons` | 14 (14) | type number invented |
+| `CommandMoveToMultiLocations` | 323 (295) | now walks its list (provisional); Origins runtime type 22 traced |
+| `CommandTurn` | 221 (214) | now turns (provisional); Origins runtime type 41 traced |
+| `CommandSheatheWeapons` | 14 (14) | Origins runtime type 39 traced; executor missing |
 | `CommandDeathBlow` | 3 (3) | |
-| `CommandUnsheatheWeapons` | 2 (1) | type number invented |
+| `CommandUnsheatheWeapons` | 2 (1) | Origins runtime type 39 traced; executor missing |
 
 `CommandEquipItem` and `CommandUnequipItem` are declared and never called. Scripts compare
 `GetCommandType` almost only with INVALID (5,042 sites), ATTACK (195) and WAIT (194).
@@ -295,7 +295,6 @@ Dispatch summary: `engine::call` (`crates/thedas-sim/src/engine.rs:483`) matches
 - **SCR-023** **GetObjectsInShape body radius and "in world" test are guessed.** Original: 0x670eb0, 0x4eb340, 0x4eb3b0. Ours: body radius from `Sim::body_radius` rather than the exe's virtual 0x9c; "in the world" (virtual 0x6c) taken as `active`. Evidence: `crates/thedas-sim/src/engine.rs:214-221`, `engine.rs:2290-2294`. Size: S. Depends: none. Kind: provisional.
 - **SCR-024** **GetClusterCenter candidates and skipped creatures are guessed.** Original: 0x671980. Ours: candidates are the perception list (the exe's per-creature limit not traced); creatures the exe skips (virtual 0x1d0) taken as the dead. Evidence: `crates/thedas-sim/src/engine.rs:268-286`. Size: S. Depends: none. Kind: provisional.
 - **SCR-026** **Guessed creature status answers.** Original: not traced. Ours: `GetCanDiePermanently` = not immortal; `HasDeathEffect` = dead flag; `IsAbilityAvailable` = has the ability (no cost, cooldown or condition test); `Deprecated_GetMaxHealth` reads template fields `MaxHealth`/`Health`, not the health property; `SetMaxHealth` resets current health to the maximum when it is 0 or above it. Evidence: `crates/thedas-sim/src/engine.rs:4052`, `engine.rs:3778`, `engine.rs:3435`, `engine.rs:3091-3100`, `engine.rs:2691-2703`. Size: S. Depends: none. Kind: unverified.
-- **SCR-027** **GetTeam only sees the loaded area.** Original: not traced. Ours: filters objects to `world.area`. Evidence: `crates/thedas-sim/src/engine.rs:3101-3116`. Size: S. Depends: none. Kind: provisional.
 - **SCR-028** **GetOrientation / location orientation is a z-rotation guess.** Original: not traced. Ours: returns `[0, 0, facing]`; `SetOrientation` takes only z. Evidence: `crates/thedas-sim/src/engine.rs:995-996`, `engine.rs:2787-2798`. Size: S. Depends: none. Kind: provisional.
 - **SCR-029** **SetName with an empty name and SetAppearanceType -1 are guessed.** Original: not traced. Ours: empty name restores the template's; -1 restores the template's appearance. Evidence: `crates/thedas-sim/src/engine.rs:734-741`, `engine.rs:2936-2965`. Size: S. Depends: none. Kind: provisional.
 - **SCR-031** **Number parsing and formatting are not matched to the exe.** Original: not traced. Ours: `StringToInt`/`StringToFloat` return 0 unless the whole trimmed string parses (no leading-digit parse); `ToString` on a float is assumed `%f` six decimals (provisional); objects print in decimal for `ToString`/`ObjectToString`; engine values print a Rust debug form. Evidence: `crates/thedas-sim/src/engine.rs:540-557`, `engine.rs:169-175`, `engine.rs:4037`. Size: S. Depends: none. Kind: unverified.
@@ -331,7 +330,6 @@ Dispatch summary: `engine::call` (`crates/thedas-sim/src/engine.rs:483`) matches
 
 - **SCR-055** **Commands accepted but not executed.** Original: not traced. Ours: only Attack, UseAbility, MoveToLocation, MoveToObject, MoveToMultiLocations, MoveAwayFromObject, JumpToLocation, JumpToObject, Turn, Wait, SwitchWeaponSet, StartConversation and UseObject do anything (MoveAway, MultiLocations and Turn are provisional: no line-of-sight search, straight legs and one pass for a loop, no turn rate). `CommandPlayAnimation`, `CommandSheatheWeapons`, `CommandUnsheatheWeapons`, `CommandDeathBlow`, `CommandFly` and any other constructor sit 500 ms in the queue and complete with success. Evidence: `crates/thedas-sim/src/sim.rs:1526-1560`, `sim.rs:2572-2663`, `crates/thedas-sim/src/world.rs:280-281`. Size: L. Depends: SCR-056. Kind: missing.
 - **SCR-056** **Command constructors drop arguments.** Original: not traced. Ours: the generic constructor keeps the first object, the first float, all ints and strings, a location, and a non-zero vector only if no location; second objects, later floats and arrays (location lists) are discarded. Evidence: `crates/thedas-sim/src/engine.rs:2089-2139`. Size: M. Depends: none. Kind: provisional.
-- **SCR-057** **Unnamed command types get invented numbers.** Original: not recovered. Ours: five constructors with no COMMAND_TYPE constant get 1000+index. Evidence: `crates/thedas-sim/src/engine.rs:461-479`. Size: S. Depends: none. Kind: provisional.
 - **SCR-058** **Command accessors read only index 0.** Original: not traced. Ours: `SetCommandFloat`/`GetCommandFloat` and `GetCommandObject` handle only index 0; other indices are dropped or answer the default. Evidence: `crates/thedas-sim/src/engine.rs:2140-2192`. Size: S. Depends: SCR-056. Kind: provisional.
 - **SCR-059** **AddCommand to the front leaves a stale timer on the displaced command.** Original: not traced. Ours: inserting at index 0 pushes the running command back with its `due`, `from` and `approach` still set; when it returns to the front it finishes at its old due time without starting again (an attack would skip COMMAND_PENDING), and it gets no completion event when displaced. Later AddCommand arguments are not read. Evidence: `crates/thedas-sim/src/engine.rs:2193-2216`, `crates/thedas-sim/src/sim.rs:2395-2398`. Size: S. Depends: none. Kind: bug.
 - **SCR-060** **ClearAllCommands and SetCommandResult are partial.** Original: not traced. Ours: `ClearAllCommands` ignores arguments after the object, always returns 1 and reports COMMAND_RESULT_INVALID for the running command (provisional); `SetCommandResult` acts only on COMMAND_RESULT_FAILED, other results are stored in an unread `CommandResult` field. Evidence: `crates/thedas-sim/src/engine.rs:2539-2554`, `engine.rs:3763-3777`. Size: S. Depends: none. Kind: provisional.
