@@ -67,6 +67,7 @@ mod journal;
 mod launcher;
 mod launcher_control;
 mod launcher_download;
+mod launcher_mods;
 mod live;
 mod looks;
 mod modconv;
