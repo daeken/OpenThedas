@@ -4902,7 +4902,12 @@ mod tests {
         int GetCreatureAmbientActivityPattern(object oCreature) = 670;\n\
         void SetCreatureAmbientActivityPattern(object oCreature, int n) = 671;\n\
         int max(int a, int b) = 422;\n\
-        float minf(float a, float b) = 423;\n";
+        float minf(float a, float b) = 423;\n\
+        void SetLocalString(object o, int n, string s) = 990;\n\
+        string GetLocalString(object o, int n) = 991;\n\
+        void SetLocalInt(object o, int n, int v) = 992;\n\
+        int GetLocalInt(object o, int n) = 993;\n\
+        void PlayCutscene(resource r) = 994;\n";
 
     #[test]
     fn dragon_age_2_functions_read_and_set_template_fields() {
@@ -4953,6 +4958,74 @@ mod tests {
             run(&mut s, 1, "minf", &[Value::Float(2.5), Value::Float(1.5)]),
             Some(Value::Float(1.5))
         );
+    }
+
+    #[test]
+    fn dragon_age_2_locals_are_named_by_their_variable_table_row() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.tables().insert(
+            "var_module",
+            &["Label"],
+            vec![
+                (1014, vec![Cell::String("CUTSCENE_SET_PLOT\0".into())]),
+                (1015, vec![Cell::String("CUTSCENE_SET_PLOT_FLAG\0".into())]),
+            ],
+        );
+        s.world.tables().insert(
+            "var_creature",
+            &["Label"],
+            vec![(1014, vec![Cell::String("AI_THING\0".into())])],
+        );
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        let npc = s.world.spawn(ObjectKind::Creature, "npc");
+        let o = |id| Value::Object(id);
+        run(
+            &mut s,
+            1,
+            "SetLocalString",
+            &[o(module), Value::Int(1014), Value::String("plt_x".into())],
+        );
+        run(
+            &mut s,
+            1,
+            "SetLocalInt",
+            &[o(module), Value::Int(1015), Value::Int(3)],
+        );
+        run(
+            &mut s,
+            1,
+            "SetLocalInt",
+            &[o(npc), Value::Int(1014), Value::Int(7)],
+        );
+        run(
+            &mut s,
+            1,
+            "SetLocalInt",
+            &[o(npc), Value::Int(55), Value::Int(8)],
+        );
+        let m = &s.world.get(module).unwrap().locals;
+        assert_eq!(
+            m.strings.get("CUTSCENE_SET_PLOT").map(String::as_str),
+            Some("plt_x")
+        );
+        assert_eq!(m.ints.get("CUTSCENE_SET_PLOT_FLAG"), Some(&3));
+        // The row is looked up in the object's own table; a row it lacks keeps its number.
+        let n = &s.world.get(npc).unwrap().locals;
+        assert_eq!(n.ints.get("AI_THING"), Some(&7));
+        assert_eq!(n.ints.get("55"), Some(&8));
+        assert_eq!(
+            run(&mut s, 1, "GetLocalInt", &[o(npc), Value::Int(1014)]),
+            Some(Value::Int(7))
+        );
+        // Dragon Age II's PlayCutscene takes the cutscene and queues it.
+        run(
+            &mut s,
+            1,
+            "PlayCutscene",
+            &[Value::Resource("pro000cs_opening.cut".into())],
+        );
+        assert_eq!(s.world.cutscenes, vec!["pro000cs_opening.cut".to_string()]);
     }
 
     #[test]
