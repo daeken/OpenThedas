@@ -892,7 +892,7 @@ impl Stage {
     pub fn capture_over(&mut self, base: &mut Rgba) -> Result<(), UiError> {
         // The movies' multiplied clips first, onto the picture under the whole interface
         // (see `UiMovie::render_multiply`).
-        for m in &mut self.movies {
+        for m in self.movies.iter_mut().filter(|m| !m.multiplies_over()) {
             if let Some(pass) = m.capture_multiply() {
                 blend_multiply(base, &pass);
             }
@@ -903,6 +903,15 @@ impl Stage {
                 .capture()
                 .ok_or_else(|| UiError::Render(format!("capturing {}", m.name)))?;
             blend_premultiplied(base, &frame);
+            // Clips multiplied onto the movie's own art, and those above them.
+            if m.multiplies_over() {
+                if let Some(pass) = m.capture_multiply() {
+                    blend_multiply(base, &pass);
+                }
+                if let Some(above) = m.capture_above() {
+                    blend_premultiplied(base, &above);
+                }
+            }
         }
         Ok(())
     }
