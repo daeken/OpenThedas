@@ -67,6 +67,9 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
    `onLoad` after the frame's code; `Stage.width/height` report the visible area.
 3. **`display`**: the display list (MovieClip, Shape, EditText, Morph), timelines, depth
    rules, mouse picking (with `hitTestDisable`), focus and keyboard routing, input text.
+   Timeline-placed registered classes construct parents before descendants. This preserves
+   the GUI framework's last-created element and associates post-load callbacks with the
+   intended child, including popup centring before the text resizes its box.
 4. **`text`**: HTML-subset parser (p, br, font face/size/color, b, i, u, img), layout with
    word wrap, autosize, `textAutoSize` shrink, shadows; glyphs from the font library's
    DefineFont3 outlines, rasterised into a glyph atlas at the drawn size.
@@ -99,9 +102,6 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
   optionsmenu, newgame. All 66 movies start and run headless without errors.
 - Release build, idle: 10 µs to 9 ms of script per frame per movie (quickbar 0.27 ms against
   Ruffle's 2.1 ms); a movie that did not change is not drawn again.
-- Timeline-placed registered classes construct parents before descendants. This preserves
-  the GUI framework's last-created element and associates post-load callbacks with the
-  intended child, including popup centring before the text resizes its box.
 - Glow/DropShadow/Blur filters flatten the subtree, repeat separable box blur by quality,
   then composite premultiplied colour with strength, inner/knockout and source visibility.
   Parent stencil masks clip the result; nested filters and ordered filter lists are supported.
