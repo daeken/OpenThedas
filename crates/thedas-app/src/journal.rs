@@ -176,7 +176,6 @@ pub struct ResumeInfo {
 
 /// What the journal in `dir` holds, without replaying it; `None` when there is none.
 /// Reads the checkpoint (a few megabytes) and the log.
-#[allow(dead_code)] // For the start menu's offer to resume (UI).
 pub fn resumable(dir: &Path) -> Option<ResumeInfo> {
     let meta = std::fs::metadata(log_path(dir)).ok()?;
     let checkpoint: serde_json::Value =
@@ -211,7 +210,6 @@ pub fn resumable(dir: &Path) -> Option<ResumeInfo> {
 }
 
 /// Sets the journal in `dir` aside (as `*.prev`), so it is not offered again.
-#[allow(dead_code)] // For the start menu's offer to resume (UI).
 pub fn discard(dir: &Path) -> std::io::Result<()> {
     set_aside(dir)?;
     let _ = std::fs::remove_file(closed_path(dir));
