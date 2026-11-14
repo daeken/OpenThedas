@@ -99,6 +99,8 @@ pub struct Interval {
 
 /// The whole script world of one movie.
 pub struct Vm {
+    /// Default names for unnamed timeline MovieClips and text fields.
+    pub(crate) next_instance_id: u32,
     pub heap: Heap,
     pub display: Display,
     pub global: ObjId,
@@ -233,7 +235,10 @@ impl Vm {
             Value::Bool(b) => Str::from(if *b { "true" } else { "false" }),
             Value::Number(n) => Str::from(number_to_string(*n)),
             Value::String(s) => s.clone(),
-            Value::Object(_) => {
+            Value::Object(o) => {
+                if let Some(Kind::Display(d)) = self.heap.get(*o).map(|o| &o.kind) {
+                    return Str::from(self.display.path(*d, true));
+                }
                 let p = self.to_primitive(v, false);
                 match p {
                     Value::Object(o) => {
@@ -254,6 +259,15 @@ impl Vm {
             return v.clone();
         };
         let o = *o;
+        if matches!(self.heap.get(o).map(|o| &o.kind), Some(Kind::Display(_))) {
+            if number_hint {
+                return v.clone();
+            }
+            // AVM1's Add2 asks a clip for valueOf, then converts the clip itself to
+            // its path if the other operand is a string. Object.toString is unrelated.
+            let f = self.get(v, "valueOf");
+            return self.call(&f, v.clone(), &[]);
+        }
         let is_date = matches!(self.heap.get(o).map(|x| &x.kind), Some(Kind::Date(_)));
         let order: [&str; 2] = if number_hint && !is_date {
             ["valueOf", "toString"]
@@ -270,10 +284,6 @@ impl Vm {
                     }
                 }
             }
-        }
-        // Display objects convert to their path.
-        if let Some(Kind::Display(d)) = self.heap.get(o).map(|x| x.kind.clone()) {
-            return Value::from(self.display.path(d, true));
         }
         v.clone()
     }

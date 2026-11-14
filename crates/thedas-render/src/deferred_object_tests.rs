@@ -24,7 +24,11 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
                 if (p.x < 2.0) {{ return vec4<f32>(skin_vector(vec4<f32>(1.0, 0.0, 0.0, 0.0), weights, indices), 1.0); }}
                 if (p.x < 3.0) {{ return vec4<f32>(object_probe(vec3<f32>(0.0, 0.0, 1.0)), 1.0); }}
                 if (p.x < 5.0) {{ return vec4<f32>(object_tint(vec3<f32>(0.2, 0.4, 0.6), vec4<f32>(0.5, 0.25, 0.0, 0.0), p.x > 4.0), 1.0); }}
-                return vec4<f32>(tint_mode(vec3<f32>(0.2, 0.4, 0.6), vec4<f32>(0.5, 0.25, 0.0, 0.5), false, select(2.0, 3.0, p.x > 6.0)), 1.0);
+                if (p.x < 7.0) {{ return vec4<f32>(tint_mode(vec3<f32>(0.2, 0.4, 0.6), vec4<f32>(0.5, 0.25, 0.0, 0.5), false, select(2.0, 3.0, p.x > 6.0)), 1.0); }}
+                return vec4<f32>(select(0.0, 1.0, point_uses_baked_mask(true, 64u)),
+                    select(0.0, 1.0, point_uses_baked_mask(true, 192u)),
+                    select(0.0, 1.0, point_uses_baked_mask(true, 0u)),
+                    select(0.0, 1.0, point_uses_baked_mask(true, 128u)));
             }}
         "#).into()),
     });
@@ -105,7 +109,7 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
         size: wgpu::Extent3d {
-            width: 7,
+            width: 8,
             height: 1,
             depth_or_array_layers: 1,
         },
@@ -170,7 +174,7 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
     rx.recv().unwrap().unwrap();
     let mapped = readback.slice(..).get_mapped_range().unwrap();
-    let actual: &[f32] = bytemuck::cast_slice(&mapped[..112]);
+    let actual: &[f32] = bytemuck::cast_slice(&mapped[..128]);
     let expected = [
         [6.25, 1.25, 3.75, 1.0],
         [0.25, 0.75, 0.0, 1.0],
@@ -179,6 +183,7 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
         [0.2125, 0.3625, 0.45, 1.0],
         [0.09375, 0.109375, 0.13125, 1.0],
         [0.4125, 0.25, 0.13125, 1.0],
+        [0.0, 0.0, 1.0, 1.0], // Object point lights must not inherit a sun/lightmap mask.
     ];
     for (actual, expected) in actual.iter().zip(expected.iter().flatten()) {
         assert!((actual - expected).abs() < 0.0001, "{actual} != {expected}");

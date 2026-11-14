@@ -84,10 +84,13 @@ The faithful renderer exposes only read-only palette and bound accessors to this
 
 The level and object renderers contribute before a single lighting pass, sharing room
 indices, depth, sun visibility and the four point-shadow slots. Their environment and
-emissive terms are added afterwards. Objects use their assigned SH probe; placeables also
+emissive terms are added afterwards. Objects interpolate their assigned SH probe's light
+from posed vertex normals; normal maps affect direct lighting. Placeables also
 take the brightest ambient node, while characters take no ambient nodes. Character-domain
 point lights affect character materials, level-domain lights affect the others, and emitter
-lights affect both. Probe bounce does not take the level lightmap's sun mask. Character
+lights affect both. Object point lights use their own visibility; only their directional
+sun takes the sun mask. Static1's grazing-angle shadow floor is confined to level materials.
+Probe bounce does not take the level lightmap's sun mask. Character
 diffuse and specular tint opacities remain independent, including the separate skin channel.
 
 This is our deferred material approximation, not shader parity: character rim lighting,

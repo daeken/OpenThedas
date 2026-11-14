@@ -76,6 +76,7 @@ struct VsOut {
     @location(2) normal: vec3<f32>,
     @location(3) world: vec3<f32>,
     @location(4) terrain_falloff: f32,
+    @location(5) irradiance: vec3<f32>,
 };
 
 @vertex
@@ -96,6 +97,12 @@ fn vs_gbuffer(v: VsIn) -> VsOut {
     out.normal = (f.world * vec4<f32>(normal, 0.0)).xyz;
     out.world = (f.world * vec4<f32>(position, 1.0)).xyz;
     out.terrain_falloff = 2.0 - length(frame.eye.xyz - out.world) / 32.0;
+    out.irradiance = vec3<f32>(0.0);
+    if (draw.material.x > 0.5) {
+        // Character/prop shaders interpolate probe light from posed vertex normals;
+        // normal maps change direct lighting, not the probe's coarse baked lobes.
+        out.irradiance = object_probe(normalize(out.normal));
+    }
     return out;
 }
 
@@ -276,7 +283,7 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
     out.lightmap = textureSample(lightmap_tex, clamp_smp, in.uv_lm);
     if (draw.material.x > 0.5) {
         out.albedo.a = select(64.0 / 255.0, 192.0 / 255.0, draw.material.x > 1.5);
-        out.lightmap = vec4<f32>(object_probe(s.n), 1.0);
+        out.lightmap = vec4<f32>(in.irradiance, 1.0);
         if (draw.material.z > 0.5) {
             let mask = textureSample(tint_tex, wrap_smp, in.uv0);
             out.albedo = vec4<f32>(object_tint(out.albedo.rgb, mask, false), out.albedo.a);
@@ -491,6 +498,11 @@ fn reaches(l: Light, room: u32) -> bool {
     return (bits & (1u << (room % 32u))) != 0u;
 }
 
+fn point_uses_baked_mask(is_static: bool, material: u32) -> bool {
+    // Props and characters have probes, not baked direct-light visibility.
+    return is_static && material != 64u && material != 192u;
+}
+
 @fragment
 fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let px = vec2<i32>(frag.xy);
@@ -562,7 +574,9 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         }
         let dif = att * ndl * l.colour.rgb * shade;
         let sp = att * pow(ndh, power) * l.colour.rgb * shade;
-        if (l.colour.w > 0.5) {
+        // Objects have no baked direct visibility. Their point lights use their own
+        // cube visibility, never the sun's mask or Static1's grazing-angle floor.
+        if (point_uses_baked_mask(l.colour.w > 0.5, material)) {
             diff_s = diff_s + dif;
             spec_s = spec_s + sp;
         } else {
@@ -580,7 +594,7 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             spec_s = spec_s + pow(ndh, power) * lighting.sun_colour.rgb;
         }
     }
-    let sun_shade = sun_visibility(p, n, !terrain_low);
+    let sun_shade = sun_visibility(p, n, !terrain_low && !object);
     // Static1: alpha masks baked direct visibility once; RGB is baked bounce,
     // dimmed by only 15% in a runtime shadow (exploration camera w = 0).
     // Dynamic lights have their own visibility and never take this sun mask.
