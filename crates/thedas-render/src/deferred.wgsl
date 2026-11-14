@@ -39,6 +39,7 @@ struct Draw {
     material: vec4<f32>,
     tint_color: vec4<f32>,
     character: Character,
+    alpha: vec4<f32>,
 };
 
 struct Character {
@@ -410,7 +411,8 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
     }
     let s = surface(in);
     var out: GBuffer;
-    out.albedo = vec4<f32>(textureSample(diffuse_tex, wrap_smp, in.uv0).rgb, 0.0);
+    let diffuse = textureSample(diffuse_tex, wrap_smp, in.uv0);
+    out.albedo = vec4<f32>(diffuse.rgb, 0.0);
     out.specular = textureSample(spec_tex, wrap_smp, in.uv0);
     out.normal = vec4<f32>(oct_encode(s.n), draw.room.x, s.falloff);
     out.lightmap = textureSample(lightmap_tex, clamp_smp, in.uv_lm);
@@ -426,7 +428,31 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
     } else if (frame.fog.w > 0.5) {
         out.lightmap = vec4<f32>(probe_irradiance(s.n), 1.0);
     }
+    if (!alpha_kept(diffuse.a)) { discard; }
     return out;
+}
+
+// Match the translated D3D9 shader's extra clip and rounded saturated 8-bit alpha test.
+fn alpha_kept(sampled: f32) -> bool {
+    return alpha_test(sampled, draw.alpha);
+}
+
+fn alpha_test(sampled: f32, test: vec4<f32>) -> bool {
+    if (test.x < 0.5) { return true; }
+    let opacity = sampled * test.z;
+    if (opacity < test.w) { return false; }
+    let a = floor(clamp(opacity, 0.0, 1.0) * 255.0 + 0.5);
+    let r = test.y;
+    switch u32(test.x) {
+        case 1u: { return false; }
+        case 2u: { return a < r; }
+        case 3u: { return a == r; }
+        case 4u: { return a <= r; }
+        case 5u: { return a > r; }
+        case 6u: { return a != r; }
+        case 7u: { return a >= r; }
+        default: { return true; }
+    }
 }
 
 // Static1's reflection, which no light changes, added over the lit frame by a second draw of
@@ -463,6 +489,10 @@ fn fs_env(in: VsOut) -> @location(0) vec4<f32> {
     let to_eye = in.world - frame.eye.xyz;
     let f = max(min(exp(-dot(to_eye, to_eye) * frame.fog.x), 1.0), frame.fog.y);
     let emissive = textureSample(emissive_tex, wrap_smp, in.uv0).rgb * draw.material.y;
+    if (draw.alpha.x > 0.5) {
+        let alpha = textureSample(diffuse_tex, wrap_smp, in.uv0).a;
+        if (!alpha_kept(alpha)) { discard; }
+    }
     return vec4<f32>((env * draw.room.y * specular.rgb * s.falloff + emissive) * f, 1.0);
 }
 
