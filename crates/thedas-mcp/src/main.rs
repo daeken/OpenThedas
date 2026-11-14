@@ -268,6 +268,8 @@ struct BoardArgs {
 struct PopupArgs {
     /// Button to press (1 for the first, e.g. Yes/OK); omit to just read the popup.
     button: Option<i32>,
+    /// The text typed in a box that asks for one (naming the dog), with `button`.
+    text: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1608,7 +1610,7 @@ impl Server {
     }
 
     #[tool(
-        description = "The open message box (ShowPopup), if any: its text and kind. With button, answer it (1 = the first button, e.g. Yes) and run what that causes."
+        description = "The open message box (ShowPopup), if any: its text and kind. With button, answer it (1 = the first button, e.g. Yes) and run what that causes; with text too, as typed in a box that asks for one."
     )]
     async fn popup(&self, Parameters(a): Parameters<PopupArgs>) -> String {
         self.with_sim(|st| {
@@ -1618,7 +1620,14 @@ impl Server {
             };
             let text = sim.string(p.strref.max(0) as u32);
             if let Some(b) = a.button {
-                sim.answer_popup(b);
+                use thedas_sim::commands::{CommandSource, SimCommand};
+                sim.apply(
+                    CommandSource::Mcp,
+                    SimCommand::AnswerPopup {
+                        button: b,
+                        text: a.text.clone().unwrap_or_default(),
+                    },
+                );
                 sim.tick(0);
                 return Ok(json!({
                     "answered": b,
