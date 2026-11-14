@@ -153,12 +153,15 @@ fn focused_input_field(m: &mut UiMovie) -> Option<String> {
     (kind == UiValue::String("input".into())).then_some(path)
 }
 
-/// A press lets go of the text field's focus first; one on the field takes it back. In the
+/// A press outside the focused text field lets go of its focus first. In the
 /// player the focus moves during the press, and the field losing it there cancels a dialog
 /// button's press (popuplayer.gfx's push buttons: the first click on Save only moved the
 /// focus, the second saved). Provisional: Scaleform's focus handling is not traced; this keeps
-/// one click enough.
-fn release_text_focus(m: &mut UiMovie) -> Option<String> {
+/// one click enough. A press in the same field retains its anchor for Shift+click.
+fn release_text_focus(m: &mut UiMovie, x: f64, y: f64) -> Option<String> {
+    if m.focused_text_at(x, y) {
+        return None;
+    }
     let path = focused_input_field(m)?;
     m.call("_global.Selection.setFocus", &[UiValue::Null]);
     Some(path)
@@ -306,6 +309,7 @@ pub struct Stage {
     /// level-up mark, shown for its first frames) took that for a roll-over and left its
     /// tooltip up. Far off the stage until the mouse first moves.
     mouse: (f64, f64),
+    shift_down: bool,
     /// The dialog box's text field a press let go of (see `release_text_focus`), given
     /// back when the click leaves the box up with nothing focused.
     dialog_focus: Option<String>,
@@ -355,6 +359,7 @@ impl Stage {
         Self {
             movies: Vec::new(),
             mouse: OFF_STAGE,
+            shift_down: false,
             dialog_focus: None,
             quickbar_width: None,
             log: Vec::new(),
@@ -456,6 +461,7 @@ impl Stage {
             self.images.clone(),
             Some(self.bridge.responder()),
         )?;
+        m.set_shift(self.shift_down);
         if self.mouse != OFF_STAGE {
             m.mouse_move(self.mouse.0, self.mouse.1);
         }
@@ -673,6 +679,14 @@ impl Stage {
         }
     }
 
+    /// Held Shift reaches existing movies and any movie opened while it is held.
+    pub fn set_shift(&mut self, down: bool) {
+        self.shift_down = down;
+        for m in &mut self.movies {
+            m.set_shift(down);
+        }
+    }
+
     /// The mouse wheel turned `lines` (up positive) at (`x`, `y`).
     pub fn mouse_wheel(&mut self, x: f64, y: f64, lines: f64) {
         for m in self.input_movies() {
@@ -684,7 +698,7 @@ impl Stage {
         let mut released = None;
         for m in self.input_movies() {
             if down {
-                released = released.or(release_text_focus(m));
+                released = released.or(release_text_focus(m, x, y));
             }
             m.mouse_button(x, y, down);
         }
@@ -810,7 +824,7 @@ impl Stage {
         let mut released = None;
         for m in self.input_movies() {
             m.mouse_move(x, y);
-            released = released.or(release_text_focus(m));
+            released = released.or(release_text_focus(m, x, y));
             m.button_as(button, x, y, true);
             m.button_as(button, x, y, false);
         }
@@ -825,7 +839,7 @@ impl Stage {
         for m in self.input_movies() {
             m.mouse_move(x, y);
             if down {
-                released = released.or(release_text_focus(m));
+                released = released.or(release_text_focus(m, x, y));
             }
             m.button_as(button, x, y, down);
         }
