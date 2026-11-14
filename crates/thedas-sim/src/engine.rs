@@ -173,6 +173,39 @@ pub(crate) fn cell_string(c: Option<&Cell>) -> String {
     }
 }
 
+/// The name of the local variable argument `a[i]` names on object `o`. Dragon Age: Origins
+/// names it; Dragon Age II's scripts pass the variable's row in the object's variable table
+/// instead (`var_module`, `var_area`, `var_creature`, `var_placeable`, `var_item`,
+/// `var_trigger`), whose `Label` column is the name templates use. A row that is not there
+/// keeps its number as its name. Provisional: read from DA2's scripts and tables (its
+/// `PlayCutscene` callers set `var_module` rows 1014 to 1016, `CUTSCENE_SET_PLOT`,
+/// `CUTSCENE_SET_PLOT_FLAG` and `CUTSCENE_TALK_SPEAKER`), not traced in the executable.
+fn local_name(sim: &Sim, o: ObjectId, a: &[Value], i: usize) -> String {
+    let Some(Value::Int(row)) = a.get(i) else {
+        return string(a, i);
+    };
+    let table = match sim.world.get(o).map(|o| o.kind) {
+        Some(ObjectKind::Module) => "var_module",
+        Some(ObjectKind::Area) => "var_area",
+        Some(ObjectKind::Creature) => "var_creature",
+        Some(ObjectKind::Placeable) => "var_placeable",
+        Some(ObjectKind::Item) => "var_item",
+        Some(ObjectKind::Trigger) => "var_trigger",
+        _ => return row.to_string(),
+    };
+    let name = sim
+        .world
+        .tables()
+        .get(0, table)
+        .map(|t| cell_string(t.cell("Label", *row as i64)))
+        .unwrap_or_default();
+    if name.is_empty() {
+        row.to_string()
+    } else {
+        name
+    }
+}
+
 /// NWScript's float-to-string: `%<width>.<decimals>f`, right-aligned. Provisional for
 /// `ToString` on floats (assumed `%f` with six decimals).
 fn format_float(f: f32, width: i32, decimals: i32) -> String {
@@ -1110,63 +1143,96 @@ pub fn call(
         // --- Locals -----------------------------------------------------------------------
         "GetLocalInt" => ok(Value::Int(
             h.object(obj(a, 0))
-                .and_then(|o| o.locals.ints.get(&string(a, 1)).copied())
+                .and_then(|o| {
+                    o.locals
+                        .ints
+                        .get(&local_name(h.sim, obj(a, 0), a, 1))
+                        .copied()
+                })
                 .unwrap_or(0),
         )),
         "SetLocalInt" => {
+            let k = local_name(h.sim, obj(a, 0), a, 1);
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.locals.ints.insert(string(a, 1), int(a, 2));
+                o.locals.ints.insert(k, int(a, 2));
             }
             void()
         }
         "GetLocalFloat" => ok(Value::Float(
             h.object(obj(a, 0))
-                .and_then(|o| o.locals.floats.get(&string(a, 1)).copied())
+                .and_then(|o| {
+                    o.locals
+                        .floats
+                        .get(&local_name(h.sim, obj(a, 0), a, 1))
+                        .copied()
+                })
                 .unwrap_or(0.0),
         )),
         "SetLocalFloat" => {
+            let k = local_name(h.sim, obj(a, 0), a, 1);
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.locals.floats.insert(string(a, 1), float(a, 2));
+                o.locals.floats.insert(k, float(a, 2));
             }
             void()
         }
         "GetLocalString" => ok(Value::String(
             h.object(obj(a, 0))
-                .and_then(|o| o.locals.strings.get(&string(a, 1)).cloned())
+                .and_then(|o| {
+                    o.locals
+                        .strings
+                        .get(&local_name(h.sim, obj(a, 0), a, 1))
+                        .cloned()
+                })
                 .unwrap_or_default(),
         )),
         "SetLocalString" => {
+            let k = local_name(h.sim, obj(a, 0), a, 1);
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.locals.strings.insert(string(a, 1), string(a, 2));
+                o.locals.strings.insert(k, string(a, 2));
             }
             void()
         }
         "GetLocalObject" => ok(Value::Object(
             h.object(obj(a, 0))
-                .and_then(|o| o.locals.objects.get(&string(a, 1)).copied())
+                .and_then(|o| {
+                    o.locals
+                        .objects
+                        .get(&local_name(h.sim, obj(a, 0), a, 1))
+                        .copied()
+                })
                 .unwrap_or(OBJECT_INVALID),
         )),
         "SetLocalObject" => {
+            let k = local_name(h.sim, obj(a, 0), a, 1);
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.locals.objects.insert(string(a, 1), obj(a, 2));
+                o.locals.objects.insert(k, obj(a, 2));
             }
             void()
         }
         "GetLocalResource" => ok(Value::Resource(
             h.object(obj(a, 0))
-                .and_then(|o| o.locals.resources.get(&string(a, 1)).cloned())
+                .and_then(|o| {
+                    o.locals
+                        .resources
+                        .get(&local_name(h.sim, obj(a, 0), a, 1))
+                        .cloned()
+                })
                 .unwrap_or_default(),
         )),
         "SetLocalResource" => {
+            let k = local_name(h.sim, obj(a, 0), a, 1);
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.locals.resources.insert(string(a, 1), string(a, 2));
+                o.locals.resources.insert(k, string(a, 2));
             }
             void()
         }
         "GetLocalLocation" => {
-            let l = h
-                .object(obj(a, 0))
-                .and_then(|o| o.locals.locations.get(&string(a, 1)).copied());
+            let l = h.object(obj(a, 0)).and_then(|o| {
+                o.locals
+                    .locations
+                    .get(&local_name(h.sim, obj(a, 0), a, 1))
+                    .copied()
+            });
             let hd = l.map(|l| h.sim.world.store(EngineData::Location(l)));
             ok(Value::Engine {
                 ty: ty.location,
@@ -1174,9 +1240,10 @@ pub fn call(
             })
         }
         "SetLocalLocation" => {
+            let k = local_name(h.sim, obj(a, 0), a, 1);
             if let Some(EngineData::Location(l)) = h.sim.world.handle(handle(a, 2)).cloned() {
                 if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                    o.locals.locations.insert(string(a, 1), l);
+                    o.locals.locations.insert(k, l);
                 }
             }
             void()
@@ -2986,6 +3053,13 @@ pub fn call(
             void()
         }
         "LoadCutscene" => {
+            h.sim.world.cutscenes.push(string(a, 0));
+            void()
+        }
+        // Dragon Age II's one call for both: `void PlayCutscene(resource rCutscene)` (its id
+        // 647 is DA:O's LoadCutscene). DA:O's own `PlayCutscene()` takes no argument and is
+        // left alone. Provisional: from DA2's script.ldf declaration.
+        "PlayCutscene" if matches!(a.first(), Some(Value::Resource(_) | Value::String(_))) => {
             h.sim.world.cutscenes.push(string(a, 0));
             void()
         }
@@ -4828,7 +4902,12 @@ mod tests {
         int GetCreatureAmbientActivityPattern(object oCreature) = 670;\n\
         void SetCreatureAmbientActivityPattern(object oCreature, int n) = 671;\n\
         int max(int a, int b) = 422;\n\
-        float minf(float a, float b) = 423;\n";
+        float minf(float a, float b) = 423;\n\
+        void SetLocalString(object o, int n, string s) = 990;\n\
+        string GetLocalString(object o, int n) = 991;\n\
+        void SetLocalInt(object o, int n, int v) = 992;\n\
+        int GetLocalInt(object o, int n) = 993;\n\
+        void PlayCutscene(resource r) = 994;\n";
 
     #[test]
     fn dragon_age_2_functions_read_and_set_template_fields() {
@@ -4879,6 +4958,74 @@ mod tests {
             run(&mut s, 1, "minf", &[Value::Float(2.5), Value::Float(1.5)]),
             Some(Value::Float(1.5))
         );
+    }
+
+    #[test]
+    fn dragon_age_2_locals_are_named_by_their_variable_table_row() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.tables().insert(
+            "var_module",
+            &["Label"],
+            vec![
+                (1014, vec![Cell::String("CUTSCENE_SET_PLOT\0".into())]),
+                (1015, vec![Cell::String("CUTSCENE_SET_PLOT_FLAG\0".into())]),
+            ],
+        );
+        s.world.tables().insert(
+            "var_creature",
+            &["Label"],
+            vec![(1014, vec![Cell::String("AI_THING\0".into())])],
+        );
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        let npc = s.world.spawn(ObjectKind::Creature, "npc");
+        let o = |id| Value::Object(id);
+        run(
+            &mut s,
+            1,
+            "SetLocalString",
+            &[o(module), Value::Int(1014), Value::String("plt_x".into())],
+        );
+        run(
+            &mut s,
+            1,
+            "SetLocalInt",
+            &[o(module), Value::Int(1015), Value::Int(3)],
+        );
+        run(
+            &mut s,
+            1,
+            "SetLocalInt",
+            &[o(npc), Value::Int(1014), Value::Int(7)],
+        );
+        run(
+            &mut s,
+            1,
+            "SetLocalInt",
+            &[o(npc), Value::Int(55), Value::Int(8)],
+        );
+        let m = &s.world.get(module).unwrap().locals;
+        assert_eq!(
+            m.strings.get("CUTSCENE_SET_PLOT").map(String::as_str),
+            Some("plt_x")
+        );
+        assert_eq!(m.ints.get("CUTSCENE_SET_PLOT_FLAG"), Some(&3));
+        // The row is looked up in the object's own table; a row it lacks keeps its number.
+        let n = &s.world.get(npc).unwrap().locals;
+        assert_eq!(n.ints.get("AI_THING"), Some(&7));
+        assert_eq!(n.ints.get("55"), Some(&8));
+        assert_eq!(
+            run(&mut s, 1, "GetLocalInt", &[o(npc), Value::Int(1014)]),
+            Some(Value::Int(7))
+        );
+        // Dragon Age II's PlayCutscene takes the cutscene and queues it.
+        run(
+            &mut s,
+            1,
+            "PlayCutscene",
+            &[Value::Resource("pro000cs_opening.cut".into())],
+        );
+        assert_eq!(s.world.cutscenes, vec!["pro000cs_opening.cut".to_string()]);
     }
 
     #[test]
