@@ -451,6 +451,34 @@ pub fn set_local(sim: &mut Sim, target: ObjectId, name: &str, value: Option<Loca
     }
 }
 
+/// Moves, makes or removes an object as mod mode's command (`what` says which, for the
+/// history), with what undoes it: a move moves it back, a made object is removed; a
+/// removal cannot be undone.
+pub fn object_edit(sim: &mut Sim, command: SimCommand, what: String) -> Edit {
+    let target = match &command {
+        SimCommand::MoveObject { target, .. } => Some(*target),
+        _ => None,
+    };
+    let outcome = sim.apply(CommandSource::ModMode, command);
+    let undo = match (&outcome, target) {
+        (CommandOutcome::ObjectMoved { from, from_facing }, Some(target)) => {
+            vec![SimCommand::MoveObject {
+                target,
+                position: *from,
+                facing: *from_facing,
+            }]
+        }
+        (CommandOutcome::ObjectCreated { id }, _) => {
+            vec![SimCommand::DestroyObject { target: *id }]
+        }
+        _ => Vec::new(),
+    };
+    Edit {
+        text: format!("{what}: {}", describe(&outcome)),
+        undo,
+    }
+}
+
 /// A command's outcome in a few words.
 pub fn describe(o: &CommandOutcome) -> String {
     match o {
@@ -480,6 +508,11 @@ pub fn describe(o: &CommandOutcome) -> String {
             Some(v) => format!("was {}", show_value(v)),
             None => "was not set".into(),
         },
+        CommandOutcome::ObjectMoved { from, .. } => {
+            format!("moved from {:.2}, {:.2}, {:.2}", from[0], from[1], from[2])
+        }
+        CommandOutcome::ObjectCreated { id } => format!("made object {id}"),
+        CommandOutcome::ObjectDestroyed => "removed".into(),
         CommandOutcome::Done { ok } => if *ok { "done" } else { "did nothing" }.into(),
         CommandOutcome::Refused { reason } => format!("refused: {reason}"),
     }

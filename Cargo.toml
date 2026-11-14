@@ -19,6 +19,7 @@ thedas-sim = { path = "crates/thedas-sim" }
 thedas-ui = { path = "crates/thedas-ui" }
 thedas-audio = { path = "crates/thedas-audio", default-features = false }
 thedas-video = { path = "crates/thedas-video" }
+thedas-launcher = { path = "crates/thedas-launcher" }
 thiserror = "2"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 blowfish = "0.9"

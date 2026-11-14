@@ -37,7 +37,7 @@ so an untraced item starts with a trace, not with a guess.
 | Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 167 (`SIM-`), plus ability coverage by family |
 | Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 96 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
 | Rendering | [gaps/rendering.md](gaps/rendering.md) | 152 (`RND-`) |
-| Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 180 (`UI-`), plus the movies never opened and the values no screen gets answered |
+| Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 181 (`UI-`), plus the movies never opened and the values no screen gets answered |
 | Audio | [gaps/audio.md](gaps/audio.md) | 55 (`AUD-`) |
 | Cameras, cutscene presentation, startup | [gaps/cameras-cutscenes.md](gaps/cameras-cutscenes.md) | 41 (`CAM-`) |
 | File formats and file system | [gaps/formats.md](gaps/formats.md) | 47 (`FMT-`), plus a table of every resource type and the tables and types nothing reads |
@@ -121,16 +121,16 @@ these, so they are the places where one person or stream can take a large, separ
 ### Interface and input
 
 - **Screens never built**: crafting, item upgrade, the slideshow, the army
-  screen, the party camp gift screen, store buyback, credits, and the online,
-  downloadable-content and achievement screens (`UI-052`, `UI-077`, `UI-124`, `UI-126`,
-  `UI-127`, and the stream's list). Of the install's 68 interface movies, 37 are never opened.
+  screen, the party camp gift screen, and the online, downloadable-content and
+  achievement screens (`UI-052`, `UI-077`, `UI-126`, `UI-127`, and the stream's list).
+  Of the install's 68 interface movies, 37 are never opened.
 - **Screens ask for values nothing answers**: 220 on the HUD (quickslot cooldowns, current and
   pending actions, summons), 170 on spells and talents, 98 on skills, 42 in the inventory
   ([gaps/ui.md](gaps/ui.md)).
 - **Options are not saved**, and most video, control and game options change nothing
   (`UI-053` to `UI-066`).
-- **Keys cannot be rebound.** The key map is hard-coded (`UI-059`), and there is no WASD
-  movement for the leader (`UI-150`).
+- **Keys cannot be rebound.** The key map is hard-coded (`UI-059`), and the movement keys
+  borrow the pad stick's walk (`UI-213`).
 - **No selection box or group selection with the mouse** (`UI-123`).
 - **Controller.** No button glyphs or prompts, no radial menu, no remapping, rumble or
   non-Xbox layouts (`UI-172`, `UI-180`). Controller support is this project's addition; the PC
@@ -147,9 +147,10 @@ these, so they are the places where one person or stream can take a large, separ
 
 ### Platform, formats and project
 
-- **DLC passwords come only from the GOG Ultimate Edition executable or a keys file.** Without
-  a keys file, other editions' encrypted DA:O DLC and all DA2 DLC stay unread, and the XOR
-  reader is checked only synthetically (`FMT-001`, `FMT-002`).
+- **DA:O DLC passwords on editions other than GOG are found by a search** over the archive's
+  digest (a few seconds once, then kept in the player's data folder), not yet tried on a real
+  non-GOG install. DA2 DLC needs the player's keys file, and the XOR reader is checked only
+  synthetically (`FMT-001`, `FMT-002`).
 - **Only the base campaign can be played.** Awakening, DLC campaigns and toolset modules cannot
   be selected (`FMT-014`).
 - **Windows and Linux are untested**, continuous integration is switched off, there is no

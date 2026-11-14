@@ -725,29 +725,12 @@ impl PadPlay {
                         .screens()
                         .is_some_and(|s| s.menu.is_some_and(|m| s.shown().contains(&m)));
                 if !menu {
-                    // A dialog box, the start menu, character creation: its own Back,
-                    // Previous, Cancel, Close or No button; in a dialog box whose buttons
-                    // are not named so, its last (Cancel, after OK; or its only one).
                     // Provisional: the 360 version's B is not traced.
-                    let popup = host.popup();
-                    let targets = host.focus_targets();
-                    // A way out (Close, Cancel, No) before a step back (Back, Previous).
-                    let named = targets
-                        .iter()
-                        .rev()
-                        .filter_map(|t| crate::focusnav::back_rank(t).map(|r| (r, t)))
-                        .min_by_key(|(r, _)| *r)
-                        .map(|(_, t)| t);
-                    let last = || crate::focusnav::last(&targets).map(|i| &targets[i]);
-                    let Some(t) = named.or_else(|| if popup { last() } else { None }) else {
+                    let Some(path) = press_back(host) else {
                         return Some("no back button on this screen".into());
                     };
-                    let (x, y) = crate::focusnav::rest(t);
-                    pointer_to(host, x, y);
-                    host.left_button(true);
-                    host.left_button(false);
                     self.snapped = true;
-                    return Some(format!("back: {}", t.path));
+                    return Some(format!("back: {path}"));
                 }
                 let m = host.screens()?.menu.take()?;
                 format!("{m:?} closed")
@@ -1207,6 +1190,22 @@ fn walk(host: &mut dyn Host, v: Vec2, group: bool) -> Option<String> {
             );
             continue;
         }
+        // Walked into a closed door: the game's script answers the blocked walk by giving
+        // the walker the door to open (rules_core, see `Sim::fail_blocked`). That use goes
+        // ahead before the next walk order, which would otherwise replace it (the stick and
+        // the keys order a walk several times a second): pushed into a shut door, the hero
+        // opens it, every time rather than now and then. Letting go still stops the walker,
+        // dropping a use not begun, so a door is not opened after the stick is let go.
+        let opening = sim
+            .world
+            .get(who)
+            .and_then(|o| o.commands.first())
+            .is_some_and(|c| {
+                c.name == "CommandUseObject" && c.target.is_some_and(|t| sim.is_door(t))
+            });
+        if opening {
+            continue;
+        }
         // A point a little ahead, on the ground there when it can be found; else at the
         // leader's own height, as a click on the far side of a rock would be: the walk's
         // route finds the way round (the ground under a point ahead is often a tree's or a
@@ -1399,6 +1398,28 @@ fn best_in_front(host: &mut dyn Host, hostile: bool) -> Option<ObjectId> {
 fn cycle_target(host: &mut dyn Host, current: Option<ObjectId>, step: i32) -> Option<ObjectId> {
     let (from, facing, cands) = viewpoint(host)?;
     cycle(&cands, from, facing, current, step)
+}
+
+/// Leaves the screen up by its own way out: a dialog box, the start menu, character
+/// creation, a store or a container's Close, Cancel or No button before its Back or Previous;
+/// in a dialog box whose buttons are not named so, its last (Cancel, after OK; or its only
+/// one). The pointer is left on the button pressed, whose path is returned.
+pub fn press_back(host: &mut dyn Host) -> Option<String> {
+    let popup = host.popup();
+    let targets = host.focus_targets();
+    let named = targets
+        .iter()
+        .rev()
+        .filter_map(|t| crate::focusnav::back_rank(t).map(|r| (r, t)))
+        .min_by_key(|(r, _)| *r)
+        .map(|(_, t)| t);
+    let last = || crate::focusnav::last(&targets).map(|i| &targets[i]);
+    let t = named.or_else(|| if popup { last() } else { None })?;
+    let (x, y) = crate::focusnav::rest(t);
+    pointer_to(host, x, y);
+    host.left_button(true);
+    host.left_button(false);
+    Some(t.path.clone())
 }
 
 #[cfg(test)]
