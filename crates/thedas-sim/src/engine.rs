@@ -3138,6 +3138,51 @@ pub fn call(
         }
         "GetItemsInInventory" => {
             let tag = string(a, 3);
+            if h.sim.game == thedas_vfs::Game::Origins {
+                // 0x672410: creature equipment first, then ordinary and plot backpacks.
+                // Placeables/stores apply only the tag filter, regardless of the options.
+                let Some(owner) = h.object(obj(a, 0)) else {
+                    return ok(objects(Vec::new()));
+                };
+                let mut items = Vec::new();
+                if owner.kind == ObjectKind::Creature {
+                    let options = a.get(1).map_or(1, |_| int(a, 1));
+                    let worn: Vec<_> = owner
+                        .equipment
+                        .values()
+                        .chain(owner.other_set.values())
+                        .copied()
+                        .collect();
+                    if options > 0 {
+                        items.extend(worn.iter().copied());
+                    }
+                    if options != 2 {
+                        for plot in [false, true] {
+                            if plot && int(a, 4) != 0 {
+                                break;
+                            }
+                            items.extend(owner.inventory.iter().copied().filter(|i| {
+                                !worn.contains(i) && h.object(*i).is_some_and(|x| x.plot == plot)
+                            }));
+                        }
+                    }
+                    let base = int(a, 2);
+                    items.retain(|i| {
+                        h.object(*i).is_some_and(|x| {
+                            x.kind == ObjectKind::Item
+                                && (base == 0 || x.fields.get("BaseItem").copied() == Some(base))
+                        })
+                    });
+                } else if matches!(owner.kind, ObjectKind::Placeable | ObjectKind::Store) {
+                    items.extend(owner.inventory.iter().copied());
+                }
+                items.retain(|i| {
+                    h.object(*i).is_some_and(|x| {
+                        x.kind == ObjectKind::Item && (tag.is_empty() || x.tag == tag)
+                    })
+                });
+                return ok(objects(items));
+            }
             let items: Vec<ObjectId> = h
                 .object(obj(a, 0))
                 .map(|o| o.inventory.clone())
@@ -5232,6 +5277,7 @@ mod tests {
         void PlayCutscene(resource r) = 994;\n\
         int hasflag(int nInt, int nFlag) = 420;\n\
         void SetHeadMorphName(object o, string s) = 887;\n\
+        object[] GetItemsInInventory(object o, int n = 1, int b = 0, string s = \"\", int p = 0) = 180;\n\
         int GetUpgradableAbilityHashedM2DAInt(object o, int nColumnHash, int nAbilityId) = 875;\n\
         float GetUpgradableAbilityHashedM2DAFloat(object o, int nColumnHash, int nAbilityId) = 876;\n";
 
@@ -6526,6 +6572,104 @@ mod tests {
         assert_eq!(
             run(&mut s, c, "GetPlotActionState", &[Value::Int(4)]),
             Some(Value::Int(2))
+        );
+    }
+
+    #[test]
+    fn inventory_queries_filter_creature_slots_and_backpacks() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let owner = s.world.spawn(ObjectKind::Creature, "owner");
+        let item = |s: &mut Sim, tag: &str, base, plot| {
+            let id = s.world.spawn(ObjectKind::Item, tag);
+            let x = s.world.get_mut(id).unwrap();
+            x.fields.insert("BaseItem".into(), base);
+            x.plot = plot;
+            id
+        };
+        let bag = item(&mut s, "loot", 25, false);
+        let case = item(&mut s, "Loot", 25, false);
+        let plot = item(&mut s, "loot", 25, true);
+        let active = item(&mut s, "loot", 2, true);
+        let inactive = item(&mut s, "loot", 25, false);
+        let armour = item(&mut s, "loot", 2, false);
+        let original = vec![plot, bag, inactive, case, armour, active];
+        let x = s.world.get_mut(owner).unwrap();
+        x.inventory = original.clone();
+        x.equipment.insert(0, active);
+        x.equipment.insert(4, armour);
+        x.other_set.insert(0, inactive);
+        let query = |s: &mut Sim, who, options, base, tag: &str, ignore_plot| {
+            run(
+                s,
+                owner,
+                "GetItemsInInventory",
+                &[
+                    Value::Object(who),
+                    Value::Int(options),
+                    Value::Int(base),
+                    Value::String(tag.into()),
+                    Value::Int(ignore_plot),
+                ],
+            )
+        };
+        let all = vec![active, armour, inactive, bag, case, plot];
+        for (options, base, tag, ignore_plot, expected) in [
+            (1, 0, "", 0, all.clone()),
+            (0, 0, "", 0, vec![bag, case, plot]),
+            (2, 0, "", 0, vec![active, armour, inactive]),
+            (3, 0, "", 0, all),
+            (-1, 0, "", 0, vec![bag, case, plot]),
+            (1, 25, "", 0, vec![inactive, bag, case, plot]),
+            (1, 999, "", 0, vec![]),
+            (1, 0, "loot", 0, vec![active, armour, inactive, bag, plot]),
+            (1, 0, "Loot", 0, vec![case]),
+            // Plot equipment remains included; only the plot backpack is skipped.
+            (1, 0, "", 1, vec![active, armour, inactive, bag, case]),
+            (0, 0, "", -1, vec![bag, case]),
+        ] {
+            assert_eq!(
+                query(&mut s, owner, options, base, tag, ignore_plot),
+                Some(objects(expected)),
+                "options={options}, base={base}, tag={tag:?}, ignore_plot={ignore_plot}"
+            );
+        }
+        // The host also supplies the declared ALL default when called directly.
+        assert_eq!(
+            run(
+                &mut s,
+                owner,
+                "GetItemsInInventory",
+                &[Value::Object(owner)]
+            ),
+            query(&mut s, owner, 1, 0, "", 0)
+        );
+        // Containers and stores ignore creature options/base/plot filters.
+        for kind in [ObjectKind::Placeable, ObjectKind::Store] {
+            let holder = s.world.spawn(kind, "holder");
+            let a = item(&mut s, "loot", 2, true);
+            let b = item(&mut s, "Loot", 2, false);
+            s.world.get_mut(holder).unwrap().inventory = vec![b, a];
+            assert_eq!(
+                query(&mut s, holder, 2, 999, "loot", 1),
+                Some(objects(vec![a]))
+            );
+            assert_eq!(
+                query(&mut s, holder, 2, 999, "", 1),
+                Some(objects(vec![b, a]))
+            );
+        }
+        assert_eq!(
+            query(&mut s, OBJECT_INVALID, 1, 0, "", 0),
+            Some(objects(vec![]))
+        );
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        assert_eq!(query(&mut s, area, 1, 0, "", 0), Some(objects(vec![])));
+        // DA2 keeps its previous order and filtering pending its own trace.
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(
+            query(&mut s, owner, 2, 999, "loot", 1),
+            Some(objects(original))
         );
     }
 
