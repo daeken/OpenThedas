@@ -135,6 +135,27 @@ pub fn dlg_from_cnv(g: &Gff4, name: &str) -> Option<Dlg> {
             }
         }
     };
+    // A link's 30303 names the follower who says the line it leads to, as a row of
+    // `conversation_followers` (M2DA 296: 0 Carver, 1 Bethany, ... 4 Aveline), for a line of
+    // the other side; on a player's line it marks the follower the choice concerns.
+    // Provisional: read from the shipped files (in `dae000_flemeth` every link into one of
+    // Aveline's lines carries 4, performed or not), not traced in DragonAge2.exe.
+    let all_links: Vec<StructId> = structs(g, g.root, 30001)
+        .into_iter()
+        .chain(lines.iter().flat_map(|&l| structs(g, l, 30204)))
+        .collect();
+    for link in all_links {
+        let (Some(target), Some(who)) = (int(g, link, 30100), int(g, link, 30303)) else {
+            continue;
+        };
+        let target = target as usize;
+        if target < line_count
+            && (0..u32::MAX as i64).contains(&who)
+            && nodes[target].speaker == "OWNER"
+        {
+            nodes[target].speaker = format!("{FOLLOWER}{who}");
+        }
+    }
     for (i, &l) in lines.iter().enumerate() {
         let children: Vec<usize> = structs(g, l, 30204)
             .into_iter()
@@ -194,10 +215,15 @@ pub fn performance_speaker(g: &Gff4) -> Option<(u32, String)> {
 /// tags, `|`-separated (see [`Sim::line_speaker_tag`](crate::sim::Sim)).
 pub const PARTNER: &str = "PARTNER:";
 
+/// A line said by a follower: [`FOLLOWER`] then the row of `conversation_followers` (M2DA
+/// 296) that names its tag.
+pub const FOLLOWER: &str = "FOLLOWER:";
+
 /// Gives the lines of conversation `d` the speakers their performances name (see
 /// [`performance_speaker`]), by talk-table id. The player's lines keep `PLAYER`. A line of
-/// the other side with no performance, or one nobody speaks in, goes to the conversation's
-/// other participant: of the speakers its performances name other than the player and the
+/// the other side with no performance, or one nobody speaks in, keeps the follower its link
+/// names ([`FOLLOWER`]); otherwise it goes to the owner, or, in a conversation the player
+/// owns, to its other participant: of the speakers its performances name other than the player and the
 /// owner, the first present when the line is said ([`PARTNER`]); with none, the owner.
 ///
 /// Provisional: Dragon Age II's short lines with no performance ("Scouts.") name no speaker
@@ -226,7 +252,10 @@ pub fn apply_speakers(d: &mut Dlg, speakers: &std::collections::HashMap<u32, Str
             Some(who) if who.eq_ignore_ascii_case("owner") => n.speaker = "OWNER".into(),
             Some(who) => n.speaker = who.clone(),
             None => {
-                if let Some(p) = &partner {
+                if let Some(p) = partner
+                    .as_ref()
+                    .filter(|_| !n.speaker.starts_with(FOLLOWER))
+                {
                     n.speaker = p.clone();
                 }
             }
@@ -396,9 +425,55 @@ mod tests {
             .spawn(crate::world::ObjectKind::Creature, "pro000cr_bethany_fake");
         s.world.get_mut(carver).unwrap().active = false;
         s.world.get_mut(bethany).unwrap().active = true;
-        assert_eq!(s.line_speaker_tag(&d.nodes[3]), "pro000cr_bethany_fake");
+        assert_eq!(
+            s.line_speaker_tag(&d.nodes[3], true),
+            "pro000cr_bethany_fake"
+        );
         s.world.get_mut(bethany).unwrap().dead = true;
-        assert_eq!(s.line_speaker_tag(&d.nodes[3]), "pro000cr_carver_fake");
-        assert_eq!(s.line_speaker_tag(&d.nodes[1]), "PLAYER");
+        assert_eq!(
+            s.line_speaker_tag(&d.nodes[3], true),
+            "pro000cr_carver_fake"
+        );
+        assert_eq!(s.line_speaker_tag(&d.nodes[1], true), "PLAYER");
+    }
+
+    #[test]
+    fn a_link_names_the_follower_who_says_its_line() {
+        let mut g = sample();
+        // Give every link a 30303; the one from line 1 to line 3 (struct 8) names follower 4.
+        g.templates[2].fields.push(FieldDef {
+            label: 30303,
+            type_code: 0,
+            flags: 0,
+            offset: 0,
+        });
+        for (i, st) in g.structs.iter_mut().enumerate() {
+            if st.template == 2 {
+                st.values
+                    .push(Value::U32(if i == 8 { 4 } else { u32::MAX }));
+            }
+        }
+        let mut d = dlg_from_cnv(&g, "test").unwrap();
+        assert_eq!(d.nodes[3].speaker, "FOLLOWER:4");
+        // No performance names a speaker for it, so it stays the follower's.
+        apply_speakers(&mut d, &std::collections::HashMap::new());
+        assert_eq!(d.nodes[3].speaker, "FOLLOWER:4");
+        assert_eq!(d.nodes[0].speaker, "OWNER");
+        let table = std::sync::Arc::new(thedas_script::EngineTable::default());
+        let s = crate::sim::Sim::new(std::sync::Arc::new(thedas_vfs::Vfs::new()), table, 1);
+        s.world.tables().insert(
+            "#296",
+            &["Tag"],
+            vec![(
+                4,
+                vec![thedas_formats::gda::Cell::String(
+                    "gen00fl_aveline\0".into(),
+                )],
+            )],
+        );
+        assert_eq!(s.line_speaker_tag(&d.nodes[3], false), "gen00fl_aveline");
+        // A row the table lacks leaves the line to the owner.
+        d.nodes[3].speaker = "FOLLOWER:9".into();
+        assert_eq!(s.line_speaker_tag(&d.nodes[3], false), "OWNER");
     }
 }
