@@ -89,7 +89,13 @@ impl Sim {
             if defaults.is_empty() {
                 continue;
             }
-            let mut abilities = vec![100, 101]; // AS_InitProperties' party basics.
+            let mut abilities = Vec::new();
+            // AS_InitProperties grants the party basics only to the hero/followers.
+            if Some(id) == self.world.hero
+                || o.fields.get("FollowerState").copied().unwrap_or(0) != 0
+            {
+                abilities.extend([100, 101]);
+            }
             for column in [0x233f_a0bd, 0xa19d_eb47, 0x8ab0_b884] {
                 if let Some(a) = self.da2_stat_cell(5, column, race) {
                     abilities.push(a as i32);
@@ -639,12 +645,20 @@ mod tests {
         let id = s.world.spawn(ObjectKind::Creature, "old follower");
         let o = s.world.get_mut(id).unwrap();
         o.rank = 100;
-        o.fields
-            .extend([("Race".into(), 7), ("Package".into(), 42)]);
+        o.fields.extend([
+            ("Race".into(), 7),
+            ("Package".into(), 42),
+            ("FollowerState".into(), 1),
+        ]);
         o.properties
             .extend([(7, (100., 40.)), (36, (0., 0.)), (51, (12., 0.))]);
         o.abilities.insert(400);
         o.locals.ints.insert("already_hired".into(), 1);
+        let recruit = s.world.spawn(ObjectKind::Creature, "unhired recruit");
+        let o = s.world.get_mut(recruit).unwrap();
+        o.rank = 1;
+        o.fields
+            .extend([("Race".into(), 7), ("Package".into(), 42)]);
         let ambient = s.world.spawn(ObjectKind::Creature, "noncombatant");
         let o = s.world.get_mut(ambient).unwrap();
         o.rank = 100;
@@ -665,6 +679,11 @@ mod tests {
         assert_eq!(s.world.get(id).unwrap().properties[&7], (50., 40.));
         assert_eq!(s.world.get(id).unwrap().locals.ints["already_hired"], 1);
         assert_eq!(s.world.get(id).unwrap().abilities.len(), 5);
+        assert_eq!(
+            s.world.get(recruit).unwrap().abilities,
+            [200, 300, 400].into_iter().collect(),
+            "unhired PC-class actors do not receive party-only abilities"
+        );
         assert!(s.world.get(ambient).unwrap().properties.is_empty());
         assert_eq!(serde_json::to_value(&s.world.rng).unwrap(), rng);
         let properties = s.world.get(id).unwrap().properties.clone();
