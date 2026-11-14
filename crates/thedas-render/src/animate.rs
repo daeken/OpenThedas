@@ -62,6 +62,9 @@ fn tree_resource(tree: &str) -> String {
     }
 }
 
+/// The most threads the props' posing is spread over.
+const POSE_THREADS: usize = 4;
+
 #[derive(Default)]
 pub struct Animator {
     trees: HashMap<String, Option<Arc<AnimTree>>>,
@@ -263,6 +266,19 @@ impl Animator {
         skeleton: usize,
         clip: &Clip,
     ) -> Option<(Arc<Vec<Mat4>>, Vec<Mat4>)> {
+        self.prepare(vfs, scene, skeleton, clip).map(Prepared::pose)
+    }
+
+    /// What posing a skeleton with a clip needs, looked up (the animations, their times
+    /// and track nodes, the rest pose); the posing itself ([`Prepared::pose`]) reads only
+    /// this, so many can run at once.
+    fn prepare(
+        &mut self,
+        vfs: &Vfs,
+        scene: &AreaScene,
+        skeleton: usize,
+        clip: &Clip,
+    ) -> Option<Prepared> {
         let s = scene.skeletons.get(skeleton)?.clone();
         let time = |c: &Clip, a: &Animation| {
             if let Some(phase) = c.phase {
@@ -274,8 +290,7 @@ impl Animator {
                 c.time.min(a.length)
             }
         };
-        type Posed = (Arc<Animation>, f32, bool, f32, Arc<[Option<usize>]>);
-        let mut layers: Vec<Posed> = Vec::new();
+        let mut layers: Vec<PreparedLayer> = Vec::new();
         for c in std::iter::once(clip).chain(&clip.layers) {
             if let Some(anim) = &c.inline {
                 // Made for this frame: its nodes are not kept.
@@ -296,7 +311,30 @@ impl Animator {
             .entry(skeleton)
             .or_insert_with(|| Arc::new(s.rest()))
             .clone();
-        let mapped: Vec<crate::skeleton::Layer<'_>> = layers
+        Some(Prepared {
+            skeleton: s,
+            rest,
+            layers,
+        })
+    }
+}
+
+/// One layer of a [`Prepared`] posing: the animation, its time, whether it is measured
+/// against the first layer, its weight and its track nodes.
+type PreparedLayer = (Arc<Animation>, f32, bool, f32, Arc<[Option<usize>]>);
+
+/// A skeleton and the layers to pose it with (see [`Animator::prepare`]).
+struct Prepared {
+    skeleton: Arc<crate::skeleton::Skeleton>,
+    rest: Arc<Vec<Mat4>>,
+    layers: Vec<PreparedLayer>,
+}
+
+impl Prepared {
+    /// The rest pose and the posed one.
+    fn pose(self) -> (Arc<Vec<Mat4>>, Vec<Mat4>) {
+        let mapped: Vec<crate::skeleton::Layer<'_>> = self
+            .layers
             .iter()
             .map(|(a, t, b, w, n)| crate::skeleton::Layer {
                 anim: a,
@@ -306,7 +344,8 @@ impl Animator {
                 nodes: n,
             })
             .collect();
-        Some((rest, s.pose_mapped(&mapped)))
+        let pose = self.skeleton.pose_mapped(&mapped);
+        (self.rest, pose)
     }
 }
 
@@ -323,20 +362,61 @@ impl Animator {
         props: &[(Mat4, Option<Clip>)],
         advance: f32,
     ) {
-        for (i, (transform, clip)) in props.iter().enumerate() {
-            let mut poses = crate::skeleton::Poses::new();
+        // The lookups first, in order (they fill the caches); then the posing, which reads
+        // only what was looked up, spread over threads (a camp holds a hundred creatures,
+        // each with several skeletons).
+        let mut jobs: Vec<(usize, usize, Prepared)> = Vec::new();
+        for (i, (_, clip)) in props.iter().enumerate() {
             if let Some(clip) = clip {
                 let mut clip = clip.clone();
                 if clip.looping {
                     clip.time += advance;
                 }
                 for s in scene.prop_skeletons(i) {
-                    if let Some(p) = self.pose(vfs, scene, s, &clip) {
-                        poses.insert(s, p);
+                    if let Some(p) = self.prepare(vfs, scene, s, &clip) {
+                        jobs.push((i, s, p));
                     }
                 }
             }
-            renderer.pose_prop(ctx, scene, i, *transform, &poses);
+        }
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .clamp(1, POSE_THREADS);
+        let mut posed: Vec<(usize, usize, (Arc<Vec<Mat4>>, Vec<Mat4>))> =
+            Vec::with_capacity(jobs.len());
+        if threads <= 1 || jobs.len() < 8 {
+            posed.extend(jobs.into_iter().map(|(i, s, p)| (i, s, p.pose())));
+        } else {
+            let chunk = jobs.len().div_ceil(threads);
+            let mut chunks: Vec<Vec<(usize, usize, Prepared)>> = Vec::new();
+            let mut jobs = jobs.into_iter().peekable();
+            while jobs.peek().is_some() {
+                chunks.push(jobs.by_ref().take(chunk).collect());
+            }
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = chunks
+                    .into_iter()
+                    .map(|c| {
+                        scope.spawn(move || {
+                            c.into_iter()
+                                .map(|(i, s, p)| (i, s, p.pose()))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    if let Ok(done) = h.join() {
+                        posed.extend(done);
+                    }
+                }
+            });
+        }
+        let mut by_prop: Vec<crate::skeleton::Poses> = vec![Default::default(); props.len()];
+        for (i, s, p) in posed {
+            by_prop[i].insert(s, p);
+        }
+        for (i, ((transform, _), poses)) in props.iter().zip(&by_prop).enumerate() {
+            renderer.pose_prop(ctx, scene, i, *transform, poses);
         }
     }
 }
