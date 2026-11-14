@@ -2562,6 +2562,12 @@ impl Live {
         )?))
     }
 
+    /// Where the voice-over playing is (its line's talk-table reference, seconds into it),
+    /// which the speaking line's lip sync follows (see [`crate::faces`]).
+    pub fn set_voice_position(&mut self, at: Option<(u32, f64)>) {
+        self.faces.voice_at(at);
+    }
+
     /// A line said in passing, for its speaker's lip sync (see [`crate::faces`]).
     pub fn say_in_passing(&mut self, line: &crate::faces::SpokenLine) {
         self.faces.say(&self.install, &self.module, line);
