@@ -344,7 +344,10 @@ mod tests {
             let c = f[face] * (at + d).extend(1.0);
             let ndc = c.truncate() / c.w;
             assert!(c.w > 0.0, "{d}: behind face {face}");
-            assert!(ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0, "{d}: {ndc} off face {face}");
+            assert!(
+                ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0,
+                "{d}: {ndc} off face {face}"
+            );
             assert!((0.0..=1.0).contains(&ndc.z), "{d}: depth {}", ndc.z);
         }
     }
