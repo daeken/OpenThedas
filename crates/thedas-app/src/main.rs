@@ -299,6 +299,10 @@ struct Args {
     /// commands as JSON requests.
     #[arg(long)]
     launcher_steps: Option<String>,
+    /// Drive the launcher from a script file (implies `--launcher`): the same steps, one or
+    /// more to a line, `#` lines ignored. See `docs/launcher.md`.
+    #[arg(long)]
+    launcher_script: Option<PathBuf>,
 }
 
 /// Behind and above a hero at `pos` with the game's `facing`, looking the same way (as the
@@ -6282,14 +6286,20 @@ fn main() -> Result<()> {
         || !args.steps.is_empty()
         || args.check_report.is_some()
         || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some();
-    let driven = args.launcher_steps.is_some();
+    let driven = args.launcher_steps.is_some() || args.launcher_script.is_some();
     if args.launcher || driven || (install.is_none() && !headless) {
         // Driven only when asked for the launcher: `--control` alone still drives the game.
         let script = if args.launcher || driven {
-            let steps = match &args.launcher_steps {
-                Some(s) => launcher_control::parse_steps(s)?,
+            let mut steps = match &args.launcher_script {
+                Some(f) => launcher_control::parse_script(
+                    &std::fs::read_to_string(f)
+                        .with_context(|| format!("reading {}", f.display()))?,
+                )?,
                 None => Vec::new(),
             };
+            if let Some(s) = &args.launcher_steps {
+                steps.extend(launcher_control::parse_steps(s)?);
+            }
             let control = match &args.control {
                 Some(addr) => {
                     let c = control::Control::listen(addr)?;

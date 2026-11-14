@@ -1972,6 +1972,25 @@ pub fn call(
                 handle: Some(hd),
             })
         }
+        // DAOrigins.exe 0x65c360 (functions 609 and 611, one handler for the effect
+        // setters): the popped effect gets the flags (+0x3c) or the animation (+0x34) and is
+        // pushed back.
+        "SetEffectAnimation" | "SetEffectFlags" => {
+            let mut e = match h.sim.world.handle(handle(a, 0)) {
+                Some(EngineData::Effect(e)) => e.clone(),
+                _ => Effect::default(),
+            };
+            if name == "SetEffectAnimation" {
+                e.animation = int(a, 1);
+            } else {
+                e.flags = int(a, 1);
+            }
+            let hd = h.sim.world.store(EngineData::Effect(e));
+            ok(Value::Engine {
+                ty: ty.effect,
+                handle: Some(hd),
+            })
+        }
         "SetEffectInteger"
         | "SetEffectFloat"
         | "SetEffectObject"
@@ -2732,6 +2751,28 @@ pub fn call(
         )),
         // Cancelling a command in progress completes it (COMMAND_RESULT_INVALID), which is
         // how the AI notices it has nothing to do. Provisional.
+        // DAOrigins.exe 0x65bf50 -> 0x73c730(-2, 0, 1, 0): the command being carried out
+        // (the front one, once started) ends with COMMAND_FAILED_COMMAND_CLEARED (-2) and
+        // the object is told (COMMAND_COMPLETE); the queue behind it stays. A command not yet
+        // started is not the current one, so nothing happens. Provisional: the exe also
+        // leaves a current command its queue marks as not to be interrupted (+4 of the
+        // queue's head); that mark is not modelled.
+        "ClearCurrentCommand" => {
+            let who = obj(a, 0);
+            let running = h.sim.world.get_mut(who).and_then(|o| {
+                if o.commands.first().is_some_and(|c| c.due.is_some()) {
+                    Some(o.commands.remove(0).ty)
+                } else {
+                    None
+                }
+            });
+            if let Some(ty) = running {
+                let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(who));
+                ev.ints = vec![ty, constant(&h.sim.table, "COMMAND_FAILED_COMMAND_CLEARED")];
+                h.sim.world.queue_event(0, who, ev, None);
+            }
+            void()
+        }
         "ClearAllCommands" => {
             let who = obj(a, 0);
             let running = h.sim.world.get_mut(who).and_then(|o| {
@@ -4944,6 +4985,9 @@ mod tests {
 
     const LDF: &str = "void SetCooldown(object o, int n, float f, string s) = 1;\n\
         void DoAutoSave() = 9001;\n\
+        void ClearCurrentCommand(object o) = 540;\n\
+        int COMMAND_FAILED_COMMAND_CLEARED = -2;\n\
+        int EVENT_TYPE_COMMAND_COMPLETE = 1004;\n\
         float GetRemainingCooldown(object o, int n, string s) = 2;\n\
         void RemoveItem(object o, int n) = 3;\n\
         void SetFollowerState(object o, int n) = 4;\n\
@@ -5399,6 +5443,37 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn clear_current_command_ends_only_the_running_command() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let cmd = |name: &str, due: Option<u64>| Command {
+            ty: 7,
+            name: name.into(),
+            due,
+            ..Default::default()
+        };
+        // Not started: nothing is current, nothing happens.
+        s.world.get_mut(c).unwrap().commands = vec![cmd("CommandWait", None)];
+        run(&mut s, c, "ClearCurrentCommand", &[Value::Object(c)]);
+        assert_eq!(s.world.get(c).unwrap().commands.len(), 1);
+        // Started: it goes, the queue behind it stays, and the creature hears the result.
+        s.world.get_mut(c).unwrap().commands =
+            vec![cmd("CommandWait", Some(500)), cmd("CommandAttack", None)];
+        run(&mut s, c, "ClearCurrentCommand", &[Value::Object(c)]);
+        let o = s.world.get(c).unwrap();
+        assert_eq!(o.commands.len(), 1);
+        assert_eq!(o.commands[0].name, "CommandAttack");
+        let ev = s
+            .world
+            .queue
+            .values()
+            .find(|q| q.target == c)
+            .map(|q| q.event.clone());
+        assert_eq!(ev.map(|e| e.ints), Some(vec![7, -2]));
     }
 
     #[test]
