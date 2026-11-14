@@ -27,6 +27,11 @@ impl DaoKey {
         }
     }
 
+    /// The password's bytes (decimal text for DA:O).
+    pub fn password(&self) -> &[u8] {
+        &self.password
+    }
+
     /// Whether this password matches an archive's stored digest.
     pub fn matches_digest(&self, digest: &[u8; 16]) -> bool {
         Md5::digest(&self.password).as_slice() == digest

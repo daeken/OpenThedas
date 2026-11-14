@@ -12,8 +12,8 @@
 //! - the image base is `0x400000`, and the RVAs used here equal file offsets;
 //! - the case code lies in [`CASES`] and the strings in [`STRINGS`].
 //!
-//! Other builds (Steam, EA, retail 1.04/1.05, other languages) are not recognised; their
-//! encrypted archives stay unread, as before (FMT-001). A wrong layout cannot supply a wrong
+//! Other builds (Steam, EA, retail 1.04/1.05, other languages) are not recognised here; their
+//! passwords are found by [`crate::dlc_search`] instead (FMT-001). A wrong layout cannot supply a wrong
 //! key: every key must match the archive's own digest.
 
 use std::collections::{HashMap, HashSet};

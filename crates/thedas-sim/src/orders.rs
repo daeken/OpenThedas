@@ -66,6 +66,7 @@ impl Sim {
 
     /// Walks `who` to `to` (in its area), dropping what it was doing.
     pub fn order_move(&mut self, who: ObjectId, to: [f32; 3]) {
+        self.note_player_order(who);
         let Some((area, from, facing)) = self
             .world
             .get(who)
@@ -114,8 +115,16 @@ impl Sim {
         }
     }
 
+    /// Counts an order the player gave `who` (see [`Sim::fail_blocked`]).
+    pub(crate) fn note_player_order(&mut self, who: ObjectId) {
+        if let Some(o) = self.world.get_mut(who) {
+            o.combat.player_orders += 1;
+        }
+    }
+
     /// Walks `who` up to `target` and starts its conversation.
     pub fn order_talk(&mut self, who: ObjectId, target: ObjectId) {
+        self.note_player_order(who);
         let mut then = command(
             self,
             "COMMAND_TYPE_START_CONVERSATION",
@@ -129,6 +138,7 @@ impl Sim {
     /// the item tagged `item` when it is an item's (a potion): an ordinary
     /// `CommandUseAbility`, which brings it in range and uses it.
     pub fn order_ability(&mut self, who: ObjectId, ability: i32, target: ObjectId, item: &str) {
+        self.note_player_order(who);
         let mut c = command(self, "COMMAND_TYPE_USE_ABILITY", "CommandUseAbility");
         c.target = Some(target);
         c.ints = vec![ability];
@@ -143,6 +153,7 @@ impl Sim {
     /// tagged `item` when it is an item's: a `CommandUseAbility` with a location and no
     /// target, which walks `who` into the ability's range first (see `Sim::ability_range`).
     pub fn order_ability_at(&mut self, who: ObjectId, ability: i32, at: [f32; 3], item: &str) {
+        self.note_player_order(who);
         let Some((area, from)) = self
             .world
             .get(who)
@@ -188,6 +199,7 @@ impl Sim {
 
     /// Walks `who` up to `target` (a door, a container, a lever) and uses it.
     pub fn order_use(&mut self, who: ObjectId, target: ObjectId) {
+        self.note_player_order(who);
         let mut then = command(self, "COMMAND_TYPE_USE_OBJECT", "CommandUseObject");
         then.target = Some(target);
         self.approach_then(who, target, then);

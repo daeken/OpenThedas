@@ -1459,6 +1459,35 @@ mod tests {
     }
 
     #[test]
+    fn a_door_the_player_has_walked_away_from_is_not_used_late() {
+        // A stick pushed into a closed door and let go: the script that would use the door
+        // heard of it after the stop, and the door opened 1.5 s after the release.
+        let dropped = |s: &Sim| {
+            s.world.trace.entries.iter().any(|e| {
+                matches!(e, crate::trace::TraceEntry::Log { text, .. } if text.contains("dropped"))
+            })
+        };
+        let (mut s, walker, _, _) = door_in_the_gap([0.5, 0.5, 0.0]);
+        s.world.trace.keep = true;
+        s.order_move(walker, [4.5, 2.5, 0.0]);
+        s.tick(0);
+        assert!(s.world.get(walker).unwrap().combat.path_action_at.is_some());
+        // Let go: a stop where it stands, before the failure is told.
+        let here = s.world.get(walker).unwrap().position;
+        s.order_move(walker, here);
+        s.tick(300);
+        assert!(dropped(&s), "the stale path action reached the script");
+        // Still pushing into the same door: it is told (the door opens, as in the game).
+        let (mut s, walker, _, _) = door_in_the_gap([0.5, 0.5, 0.0]);
+        s.world.trace.keep = true;
+        s.order_move(walker, [4.5, 2.5, 0.0]);
+        s.tick(0);
+        s.order_move(walker, [4.6, 2.4, 0.0]);
+        s.tick(300);
+        assert!(!dropped(&s));
+    }
+
+    #[test]
     fn a_move_aimed_into_a_closed_doorway_ends_at_the_door_not_in_it() {
         // A held stick aims three metres ahead, often into a doorway or onto the door
         // itself: the walk's route stops at the door, and the walker must stay there. It was
