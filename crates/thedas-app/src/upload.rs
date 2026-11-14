@@ -49,6 +49,11 @@ pub fn set_automated() {
     AUTOMATED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether this is an automated run (a control client's, a test's): not a player's window.
+pub fn automated() -> bool {
+    AUTOMATED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether this run may reach the network for reports and updates.
 pub fn online() -> bool {
     !AUTOMATED.load(std::sync::atomic::Ordering::Relaxed)
