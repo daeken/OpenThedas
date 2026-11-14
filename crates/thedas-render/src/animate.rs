@@ -31,6 +31,9 @@ pub struct Clip {
     /// Set for a head tracking pose animation ([`crate::look`]): how far through its sweep
     /// it stands, 0 to 1, in place of `time` (`phase × (length − 1/30) + 1/30` seconds).
     pub phase: Option<f32>,
+    /// An animation made in memory (a speaker's lip sync, see `thedas_formats::facefx`),
+    /// played in place of one looked up by `trees` and `actions`.
+    pub inline: Option<Arc<Animation>>,
 }
 
 impl Default for Clip {
@@ -44,6 +47,7 @@ impl Default for Clip {
             absolute: false,
             weight: 1.0,
             phase: None,
+            inline: None,
         }
     }
 }
@@ -154,6 +158,15 @@ impl Animator {
         t.action(action)?.animation.clone()
     }
 
+    /// Whether action `action` of tree `tree` plays its animation once (field 4027), if the
+    /// tree has the action.
+    pub fn action_once(&mut self, vfs: &Vfs, tree: &str, action: &str) -> Option<bool> {
+        let t = load(&mut self.trees, vfs, &tree_resource(tree), |d| {
+            AnimTree::parse(d).ok()
+        })?;
+        Some(t.action(action)?.once)
+    }
+
     /// Whether animation `ani` plays once in the first of `trees` that has it (field 4027),
     /// if one does.
     pub fn plays_once(&mut self, vfs: &Vfs, trees: &[String], ani: &str) -> Option<bool> {
@@ -223,7 +236,9 @@ impl Animator {
         };
         let mut layers: Vec<(Arc<Animation>, f32, bool, f32)> = Vec::new();
         for c in std::iter::once(clip).chain(&clip.layers) {
-            if let Some((ani, anim)) = self.animation_resource(vfs, c) {
+            if let Some(anim) = &c.inline {
+                layers.push((anim.clone(), time(c, anim), c.absolute, c.weight));
+            } else if let Some((ani, anim)) = self.animation_resource(vfs, c) {
                 let anim = self.named_for(&ani, anim, skeleton, &s);
                 let t = time(c, &anim);
                 layers.push((anim, t, c.absolute, c.weight));

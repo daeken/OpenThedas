@@ -13,7 +13,10 @@
 use std::collections::BTreeMap;
 
 use thedas_script::vm::ObjectId;
-use thedas_sim::appearance::{BEARD, HAIR, PRESET};
+use thedas_sim::appearance::{
+    BEARD, HAIR, PORTRAIT_BACKGROUND, PORTRAIT_DISTANCE, PORTRAIT_MOVE_X, PORTRAIT_MOVE_Y,
+    PORTRAIT_PITCH, PORTRAIT_TURN, PRESET,
+};
 use thedas_sim::sim::Sim;
 
 use crate::UiValue;
@@ -137,12 +140,24 @@ pub const SLIDERS: &[Slider] = &[
     f(32, 7, 374748),
     f(33, 7, 374749),
     // Portrait.
-    s(50, 8, 374751, Range::Fixed(-30.0, 30.0), false),
-    s(51, 8, 374752, Range::Fixed(-45.0, 45.0), false),
-    s(52, 8, 374753, Range::Fixed(0.5, 0.72), false),
-    s(53, 8, 374754, Range::Fixed(-0.036, 0.036), false),
-    s(54, 8, 374755, Range::Fixed(-0.02, 0.1), false),
-    s(56, 8, 374756, Range::Fixed(1.0, 20.0), true),
+    s(PORTRAIT_PITCH, 8, 374751, Range::Fixed(-30.0, 30.0), false),
+    s(PORTRAIT_TURN, 8, 374752, Range::Fixed(-45.0, 45.0), false),
+    s(PORTRAIT_DISTANCE, 8, 374753, Range::Fixed(0.5, 0.72), false),
+    s(
+        PORTRAIT_MOVE_X,
+        8,
+        374754,
+        Range::Fixed(-0.036, 0.036),
+        false,
+    ),
+    s(PORTRAIT_MOVE_Y, 8, 374755, Range::Fixed(-0.02, 0.1), false),
+    s(
+        PORTRAIT_BACKGROUND,
+        8,
+        374756,
+        Range::Fixed(1.0, 20.0),
+        true,
+    ),
     s(57, 8, 374757, Range::Fixed(0.0, 0.0), true),
 ];
 
@@ -181,6 +196,23 @@ fn value(sim: &Sim, id: ObjectId, s: &Slider, min: f32, max: f32) -> f32 {
     };
     if let Some(&v) = o.face_choices.get(&s.id) {
         return v;
+    }
+    // The Portrait group starts where the portrait is framed (`Sim::portrait`).
+    {
+        use thedas_sim::appearance as a;
+        let p = sim.portrait(id);
+        let framing = match s.id {
+            a::PORTRAIT_PITCH => Some(p.pitch),
+            a::PORTRAIT_TURN => Some(p.turn),
+            a::PORTRAIT_DISTANCE => Some(p.distance),
+            a::PORTRAIT_MOVE_X => Some(p.shift.0),
+            a::PORTRAIT_MOVE_Y => Some(p.shift.1),
+            a::PORTRAIT_BACKGROUND => Some(p.background as f32),
+            _ => None,
+        };
+        if let Some(v) = framing {
+            return v.clamp(min, max);
+        }
     }
     let head = o.head_morph.clone().or_else(|| sim.face_screen_default(id));
     let index_of = |list: &str, name: Option<String>| {
