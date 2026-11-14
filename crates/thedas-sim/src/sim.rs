@@ -1915,6 +1915,39 @@ impl Sim {
 
     /// Moves an object and sends trigger ENTER/EXIT events for creatures that cross a
     /// trigger's outline. Movement is a teleport: only the destination is tested.
+    /// `DestroyObject`: an area of effect ends; anything else but the hero is removed, an
+    /// item first leaving whoever holds it: taken off if worn (its effects end and the
+    /// wearer hears UNEQUIP), then out of the inventory, so no dangling ids stay behind (the
+    /// City Elf house script destroys the hero's starting clothes). Provisional: the exe's
+    /// container removal on destruction is not traced.
+    pub(crate) fn destroy_object(&mut self, id: ObjectId) {
+        if self
+            .world
+            .get(id)
+            .is_some_and(|o| o.kind == ObjectKind::AreaOfEffect)
+        {
+            self.destroy_aoe(id);
+            return;
+        }
+        if Some(id) == self.world.hero {
+            return;
+        }
+        let holders: Vec<ObjectId> = self
+            .world
+            .objects
+            .values()
+            .filter(|o| o.inventory.contains(&id))
+            .map(|o| o.id)
+            .collect();
+        for holder in holders {
+            self.unequip(holder, id);
+            if let Some(o) = self.world.get_mut(holder) {
+                o.inventory.retain(|&i| i != id);
+            }
+        }
+        self.world.objects.remove(&id);
+    }
+
     pub fn move_object(&mut self, id: ObjectId, position: [f32; 3], area: Option<ObjectId>) {
         if let Some(o) = self.world.get_mut(id) {
             o.position = position;

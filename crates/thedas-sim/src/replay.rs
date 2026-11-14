@@ -326,6 +326,63 @@ mod tests {
     }
 
     #[test]
+    fn mod_mode_object_edits_replay_to_the_same_world() {
+        let mut live = sim();
+        live.world.area = live.world.get(live.world.hero.unwrap()).unwrap().area;
+        let area = live.world.area;
+        let crate_ = live.world.spawn(ObjectKind::Placeable, "crate");
+        live.world.get_mut(crate_).unwrap().area = area;
+        let checkpoint = live.world.clone();
+        let mut w = JournalWriter::start(&mut live, "test", Vec::new()).unwrap();
+        w.check_every = 1;
+        let edits = [
+            SimCommand::MoveObject {
+                target: crate_,
+                position: [4.0, 5.0, 0.5],
+                facing: 90.0,
+            },
+            SimCommand::CreateObject {
+                kind: ObjectKind::Creature,
+                template: "some_wolf".into(),
+                position: [1.0, 1.0, 0.0],
+                facing: 0.0,
+            },
+            SimCommand::Tick { ms: 100 },
+            SimCommand::DestroyObject { target: crate_ },
+            SimCommand::Tick { ms: 0 },
+        ];
+        for c in edits {
+            let source = match c {
+                SimCommand::Tick { .. } => CommandSource::App,
+                _ => CommandSource::ModMode,
+            };
+            live.apply(source, c);
+            w.take(&mut live).unwrap();
+        }
+        assert!(live.world.get(crate_).is_none());
+        let made = live
+            .world
+            .objects
+            .values()
+            .filter(|o| o.tag == "some_wolf" || o.template == "some_wolf")
+            .count();
+        assert_eq!(made, 1);
+        let log = w.into_inner();
+        let mut again = sim();
+        again.world = checkpoint;
+        let r = replay(&mut again, &log[..], "test", false);
+        assert_eq!(
+            (r.inputs, r.applied, r.mismatch, r.refused),
+            (5, 5, None, None)
+        );
+        assert_eq!(world_hash(&again), world_hash(&live));
+        assert_eq!(
+            again.world.command_journal.len(),
+            live.world.command_journal.len()
+        );
+    }
+
+    #[test]
     fn a_log_replayed_onto_its_checkpoint_gives_the_same_world() {
         let mut live = sim();
         let checkpoint = live.world.clone();

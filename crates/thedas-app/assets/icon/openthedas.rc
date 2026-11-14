@@ -1,0 +1,2 @@
+// The executable's icon on Windows (see build.rs).
+1 ICON "openthedas.ico"

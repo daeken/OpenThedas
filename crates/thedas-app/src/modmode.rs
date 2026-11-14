@@ -130,6 +130,18 @@ pub enum Action {
     Export(ObjectId),
     /// Live edits on or off (see [`crate::workspace`]).
     LiveEdits(bool),
+    /// An object put at a place and facing (degrees).
+    Move {
+        id: ObjectId,
+        position: [f32; 3],
+        facing: f32,
+    },
+    /// An object put where the camera looks (the middle of the view).
+    MoveToView(ObjectId),
+    /// A creature (`creature`) or placeable made from a template where the camera looks.
+    Spawn { creature: bool, template: String },
+    /// An object removed (no undo).
+    Remove(ObjectId),
 }
 
 /// Mod mode's state and its egui overlay.
@@ -165,6 +177,13 @@ pub struct ModMode {
     pub live: bool,
     /// What live edits last did.
     pub live_note: Option<String>,
+    /// The inspected object's place as being typed: (object, position, facing).
+    place: Option<(ObjectId, [f32; 3], f32)>,
+    /// The spawn row: a template and whether it is a creature's.
+    spawn_template: String,
+    spawn_creature: bool,
+    /// What the last move, spawn or removal did.
+    pub placed: Option<String>,
     actions: Vec<Action>,
 }
 
@@ -199,6 +218,10 @@ impl ModMode {
             exported: None,
             live: false,
             live_note: None,
+            place: None,
+            spawn_template: String::new(),
+            spawn_creature: true,
+            placed: None,
             actions: Vec::new(),
         }
     }
@@ -377,6 +400,7 @@ impl ModMode {
                 if let Some(note) = &self.live_note {
                     ui.weak(note);
                 }
+                self.spawning(ui);
                 ui.separator();
                 match inspected {
                     None => {
@@ -395,6 +419,82 @@ impl ModMode {
         let mut asked = Vec::new();
         self.world.window(ctx, &self.convs.history, &mut asked);
         self.actions.extend(asked.into_iter().map(Action::World));
+    }
+
+    /// Where the inspected object stands, to change: typed, or where the camera looks;
+    /// and removing it.
+    fn placing(&mut self, ui: &mut egui::Ui, o: &Inspected) {
+        // The typed place follows the object until it is edited.
+        if self.place.is_none_or(|(id, ..)| id != o.id) {
+            self.place = Some((o.id, o.position, o.facing.rem_euclid(360.0)));
+        }
+        let Some((_, mut p, mut f)) = self.place else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.label("place");
+            for (v, l) in p.iter_mut().zip(["x", "y", "z"]) {
+                ui.add(egui::DragValue::new(v).speed(0.05).prefix(format!("{l} ")));
+            }
+            ui.add(
+                egui::DragValue::new(&mut f)
+                    .speed(1.0)
+                    .suffix("°")
+                    .range(0.0..=360.0),
+            );
+        });
+        self.place = Some((o.id, p, f));
+        ui.horizontal(|ui| {
+            if ui.button("Move").clicked() {
+                self.actions.push(Action::Move {
+                    id: o.id,
+                    position: p,
+                    facing: f,
+                });
+            }
+            if ui
+                .button("Move to view")
+                .on_hover_text("Where the middle of the view meets the ground")
+                .clicked()
+            {
+                self.actions.push(Action::MoveToView(o.id));
+                self.place = None;
+            }
+            if ui
+                .button("Remove")
+                .on_hover_text("Takes it out of the world (cannot be undone)")
+                .clicked()
+            {
+                self.actions.push(Action::Remove(o.id));
+            }
+        });
+    }
+
+    /// The spawn row: a creature or placeable from its template, where the camera looks.
+    fn spawning(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.spawn_creature, true, "creature");
+            ui.selectable_value(&mut self.spawn_creature, false, "placeable");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.spawn_template)
+                    .hint_text("template (.utc / .utp)")
+                    .desired_width(150.0),
+            );
+            if ui
+                .button("Spawn")
+                .on_hover_text("Where the middle of the view meets the ground")
+                .clicked()
+                && !self.spawn_template.trim().is_empty()
+            {
+                self.actions.push(Action::Spawn {
+                    creature: self.spawn_creature,
+                    template: self.spawn_template.trim().to_string(),
+                });
+            }
+        });
+        if let Some(note) = &self.placed {
+            ui.weak(note);
+        }
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui, o: &Inspected) {
@@ -485,6 +585,8 @@ impl ModMode {
                 }
             ));
         }
+        ui.separator();
+        self.placing(ui, o);
         ui.separator();
         self.scrubber(ui, o);
     }
