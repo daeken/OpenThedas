@@ -2579,8 +2579,9 @@ impl Live {
                     shapes.insert(m.id, shape);
                 }
             }
-            // A creature's eyes (`_uem_` meshes) or head (`_uhm_`). Provisional: from the
-            // character models' names.
+            // A creature's eyes (`_uem_` meshes) or head (`_uhm_`; Dragon Age II's heads are
+            // its morph base models, `mt_bas_hm`). Provisional: from the character models'
+            // names.
             let part = |tag: &str| {
                 p.draws.clone().find_map(|d| {
                     let d = scene.draws.get(d)?;
@@ -2590,7 +2591,10 @@ impl Live {
                         .then_some(d.sphere.0)
                 })
             };
-            if let Some(face) = part("_uem_").or_else(|| part("_uhm_")) {
+            if let Some(face) = part("_uem_")
+                .or_else(|| part("_uhm_"))
+                .or_else(|| part("\\mt_bas_"))
+            {
                 faces.insert(m.id, face - glam::Vec3::from_array(m.position));
             }
             let spheres: Vec<(glam::Vec3, f32)> = p
