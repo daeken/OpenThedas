@@ -18,9 +18,9 @@ the first matching local base power. Scaling reads the same property row:
 - Mode 2 finds the first damage-type property through 0x545aa0, evaluates its
   scaled value through 0x54d7d0 and multiplies the row's coefficient and base power.
 
-Unless the row bypasses item-type scaling, type 3 uses the base item's armor
-factor and material factor (tables 12000 and 12002); other types use the base
-item's other factor. Missing factors default to one. The selected integer or
+Unless the row bypasses item-type scaling, type 3 uses base-item column
+0x42f209a3 and material column 0xea246395 (tables 12000 and 12002); other types
+use base-item column 0xdafb8bab. Missing factors default to one. The selected integer or
 float effect parameter then multiplies the result (selection 0x36001b03).
 Float parameters may use 0x52fb40's signed rounding: magnitude below one becomes
 one; otherwise floor(abs(value) + 0.5), with the original sign. The API's integer
