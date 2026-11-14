@@ -99,9 +99,12 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
   optionsmenu, newgame. All 66 movies start and run headless without errors.
 - Release build, idle: 10 µs to 9 ms of script per frame per movie (quickbar 0.27 ms against
   Ruffle's 2.1 ms); a movie that did not change is not drawn again.
+- Engine render targets (`paperdoll`) replace their external placeholder shapes at the
+  authored bounds. Same-size frames update the existing GPU texture and cached bindings;
+  clearing a target makes it transparent.
 - Not yet: Glow and DropShadow filters (3 uses), text `shadowStyle`, overlay / hard light /
   difference / invert / erase blends (drawn normal), `setMask`, inline `<img>` in text, the
-  engine-drawn paperdoll image, and movies checked with real engine state (book screens,
+  and movies checked with real engine state (book screens,
   popups, conversation).
 - Tools: `cargo run -p thedas-ui --example sidebyside -- INSTALL OUT.png MOVIES [FRAMES]
   [WxH] [ORIGINAL.png]` (Ruffle and ours, optionally after a shot of the original);
