@@ -204,6 +204,53 @@ fn da2_ability_list(sim: &Sim, who: ObjectId, ty: i32, cooling: bool) -> Vec<i32
 /// The party's inventory slots before any backpack (provisional).
 pub const DEFAULT_INVENTORY_SIZE: i32 = 70;
 
+/// Origins 0x662f00 reads CCParty +0xc4, initialized from the XP tables at 0x63b765.
+/// These tables are fixed for this simulation; derive the same value without saved state.
+fn origins_max_level(sim: &Sim) -> i32 {
+    if !sim
+        .world
+        .party
+        .and_then(|id| sim.world.get(id))
+        .is_some_and(|o| o.kind == ObjectKind::Party)
+    {
+        return 0;
+    }
+    let Some(properties) = sim.world.tables.get(98, "") else {
+        return 0;
+    };
+    let Some(xp) = sim.world.tables.get(164, "") else {
+        return 0;
+    };
+    // The native float reader reads the cell's 32 bits, with zero for an absent value.
+    let max_xp = match properties.cell_by_hash(0x61d4_debf, 19) {
+        Some(Cell::Float(v)) => *v as f32,
+        Some(Cell::Int(v)) => f32::from_bits(*v as u32),
+        Some(Cell::Empty) => 0.0,
+        _ => return 0,
+    };
+    // The same SSE2 CRT conversion as FloatToInt (0x8e34f0).
+    let max_xp = if (i32::MIN as f32..2147483648.0).contains(&max_xp) {
+        max_xp as i32
+    } else {
+        i32::MIN
+    };
+    let mut level = 0;
+    for (index, row) in xp.order.iter().enumerate() {
+        // 0x4ecd50 takes a row POSITION, unlike the properties read's row id 19.
+        let required = match xp.cell_by_hash(0xa0f0_2e99, *row) {
+            Some(Cell::Int(v)) => *v as i32,
+            Some(Cell::Float(v)) => (*v as f32).to_bits() as i32,
+            Some(Cell::Empty) => 0,
+            _ => break,
+        };
+        if required > max_xp {
+            break;
+        }
+        level = index as i32;
+    }
+    level
+}
+
 fn store_field(h: &ScriptHost, store: ObjectId, name: &str, default: i32) -> i32 {
     h.object(store)
         .and_then(|o| o.fields.get(name).copied())
@@ -571,8 +618,8 @@ const VFX_PERSISTENT_TABLE: i32 = 96;
 ///
 /// `bReturnFirstMatch` is read but unused. Provisional: the candidates are the
 /// simulation's perception list (the engine's perception query, which also drops creatures
-/// beyond a per-creature limit, is not traced), and creatures the engine skips (virtual
-/// 0x1d0 returning 1) are taken to be the dead.
+/// beyond a per-creature limit, is not traced). Origins excludes creatures whose integer
+/// current health is at most zero (0x6a3660). DA2's predicate still needs tracing.
 fn cluster_center(
     sim: &mut Sim,
     creator: ObjectId,
@@ -588,7 +635,19 @@ fn cluster_center(
         .combat
         .perceived
         .iter()
-        .filter_map(|&c| sim.world.get(c).map(|o| (c, o.position, o.dead)))
+        .filter_map(|&c| {
+            let o = sim.world.get(c)?;
+            let excluded = if sim.game == thedas_vfs::Game::Origins {
+                // 0x6a3660 -> 0x6ab4b0 -> 0x8e34f0. Positive integer results require
+                // current health >= 1 and below SSE2's positive overflow boundary.
+                !o.properties
+                    .get(&7)
+                    .is_some_and(|&(_, current)| (1.0..2147483648.0).contains(&current))
+            } else {
+                o.dead
+            };
+            Some((c, o.position, excluded))
+        })
         .collect();
     let tables = sim.world.tables.clone();
     let abi = tables.get(0, "ABI_base");
@@ -1909,11 +1968,22 @@ pub fn call(
         }
         "SetCreatureMana" => {
             let (id, p) = (obj(a, 0), PROPERTY_MANA_STAMINA);
-            if h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature) {
-                let max = h.sim.property_total(id, p);
+            let origins = h.sim.game == thedas_vfs::Game::Origins;
+            if h.object(id).is_some_and(|o| {
+                o.kind == ObjectKind::Creature && (!origins || o.properties.contains_key(&p))
+            }) {
+                let total = h.sim.property_total(id, p);
+                let requested = int(a, 1) as f32;
+                let current = if origins {
+                    // 0x79c2d0 applies the floor first, then selects the total when it
+                    // is smaller or unordered. A negative total stays negative.
+                    let floored = requested.max(0.0);
+                    if total > floored { floored } else { total }
+                } else {
+                    requested.clamp(0.0, total.max(0.0))
+                };
                 if let Some(o) = h.sim.world.get_mut(id) {
-                    o.properties.entry(p).or_insert((0.0, 0.0)).1 =
-                        (int(a, 1) as f32).clamp(0.0, max.max(0.0));
+                    o.properties.entry(p).or_insert((0.0, 0.0)).1 = current;
                 }
             }
             void()
@@ -2015,7 +2085,11 @@ pub fn call(
                     && c.from.is_none()
             })
         }))),
-        "GetMaxLevel" => ok(Value::Int(20)),
+        "GetMaxLevel" => ok(Value::Int(if h.sim.game == thedas_vfs::Game::Origins {
+            origins_max_level(h.sim)
+        } else {
+            20
+        })),
         "GetTime" => ok(Value::Int((h.sim.world.time_ms / 1000) as i32)),
         "ReadIniEntry" => ok(Value::String(String::new())),
         // Achievements belong to the player's profile, not the game: the simulation's profile has
@@ -7214,6 +7288,136 @@ mod tests {
     }
 
     #[test]
+    fn origins_max_level_uses_merged_xp_tables_and_row_positions() {
+        let table = Arc::new(EngineTable::parse(b"int GetMaxLevel() = 840;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.party = Some(s.world.spawn(ObjectKind::Party, "party"));
+        s.world
+            .tables
+            .insert("#98", &["Max"], vec![(19, vec![Cell::Float(100.99)])]);
+        // A direct worksheet must not bypass the merged properties table.
+        s.world
+            .tables
+            .insert("properties", &["Max"], vec![(19, vec![Cell::Float(0.0)])]);
+        s.world.tables.insert(
+            "#164",
+            &["XP"],
+            vec![
+                (10, vec![Cell::Int(0)]),
+                (20, vec![Cell::Int(50)]),
+                (30, vec![Cell::Int(100)]),
+                (40, vec![Cell::Int(101)]),
+                (50, vec![Cell::Int(0)]),
+            ],
+        );
+        let before = s.save_json().unwrap();
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(2)));
+        assert_eq!(s.save_json().unwrap(), before);
+        s.load_json(&before).unwrap();
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(2)));
+        // The first over-cap row stops the walk; a later low threshold is never visited.
+        s.world
+            .tables
+            .insert("#98", &["Max"], vec![(19, vec![Cell::Float(99.99)])]);
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(1)));
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(20)));
+    }
+
+    #[test]
+    fn origins_max_level_handles_missing_party_and_table_inputs() {
+        let table = Arc::new(EngineTable::parse(b"int GetMaxLevel() = 840;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world
+            .tables
+            .insert("#98", &["Max"], vec![(19, vec![Cell::Float(100.0)])]);
+        s.world.tables.insert(
+            "#164",
+            &["XP"],
+            vec![(0, vec![Cell::Int(0)]), (1, vec![Cell::Int(100)])],
+        );
+        for party in [None, Some(OBJECT_INVALID)] {
+            s.world.party = party;
+            assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(0)));
+        }
+        s.world.party = Some(s.world.spawn(ObjectKind::Creature, "wrong_kind"));
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(0)));
+        s.world.party = Some(s.world.spawn(ObjectKind::Party, "party"));
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(1)));
+        let tables = s.world.tables.clone();
+        s.world.tables = Arc::new(crate::m2da::Tables::empty());
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(0)));
+        s.world.tables = tables;
+        for rows in [vec![], vec![(18, vec![Cell::Float(100.0)])]] {
+            s.world.tables.insert("#98", &["Max"], rows);
+            assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(0)));
+        }
+        s.world
+            .tables
+            .insert("#98", &["Other"], vec![(19, vec![Cell::Float(100.0)])]);
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(0)));
+        s.world
+            .tables
+            .insert("#98", &["Max"], vec![(19, vec![Cell::Float(100.0)])]);
+        for (columns, rows) in [("XP", vec![]), ("Other", vec![(0, vec![Cell::Int(0)])])] {
+            s.world.tables.insert("#164", &[columns], rows);
+            assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(0)));
+        }
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.world.party = None;
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(20)));
+    }
+
+    #[test]
+    fn origins_max_level_uses_native_numeric_cell_reads_and_sse2_conversion() {
+        let table = Arc::new(EngineTable::parse(b"int GetMaxLevel() = 840;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.party = Some(s.world.spawn(ObjectKind::Party, "party"));
+        s.world.tables.insert(
+            "#164",
+            &["XP"],
+            vec![
+                (0, vec![Cell::Int(0)]),
+                (1, vec![Cell::Int(1)]),
+                (2, vec![Cell::Int(2)]),
+            ],
+        );
+        for (cap, expected) in [
+            (Cell::Float(1.99), 1),
+            (Cell::Float(2.0), 2),
+            (Cell::Float(-1.0), 0),
+            (Cell::Float(f64::NAN), 0),
+            (Cell::Float(f64::INFINITY), 0),
+            (Cell::Float(2147483648.0), 0),
+            (Cell::Int(2.0f32.to_bits() as i64), 2),
+            (Cell::Empty, 0),
+        ] {
+            s.world
+                .tables
+                .insert("#98", &["Max"], vec![(19, vec![cap.clone()])]);
+            assert_eq!(
+                run(&mut s, 0, "GetMaxLevel", &[]),
+                Some(Value::Int(expected)),
+                "{cap:?}"
+            );
+        }
+        s.world
+            .tables
+            .insert("#98", &["Max"], vec![(19, vec![Cell::Float(1.0)])]);
+        s.world.tables.insert(
+            "#164",
+            &["XP"],
+            vec![
+                (0, vec![Cell::Int(0)]),
+                (1, vec![Cell::Empty]),
+                (2, vec![Cell::Float(1.0)]),
+            ],
+        );
+        // The native int reader reinterprets the float cell's bits, rather than converting 1.0.
+        assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(1)));
+    }
+
+    #[test]
     fn party_members_and_no_perm_death_creatures_cannot_die_permanently() {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
@@ -9824,7 +10028,7 @@ mod coverage_tests {
             "SetCreatureMana",
             &[Value::Object(mage), Value::Int(90)],
         );
-        assert_eq!(get(&mut s, "GetCreatureMana", mage), Some(Value::Int(0)));
+        assert_eq!(get(&mut s, "GetCreatureMana", mage), Some(Value::Int(-5)));
         s.world
             .get_mut(chest)
             .unwrap()
@@ -9842,6 +10046,92 @@ mod coverage_tests {
             s.world.get(chest).unwrap().properties[&PROPERTY_MANA_STAMINA],
             (40.0, 12.0)
         );
+    }
+
+    #[test]
+    fn origins_mana_setter_preserves_absence_and_applies_the_total_after_the_floor() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut s = sim();
+            s.game = game;
+            let creature = s.world.spawn(ObjectKind::Creature, "creature");
+            let set = |s: &mut Sim, requested| {
+                run(
+                    s,
+                    creature,
+                    "SetCreatureMana",
+                    &[Value::Object(creature), Value::Int(requested)],
+                )
+            };
+            set(&mut s, 90);
+            let property = s.world.get(creature).unwrap().properties.get(&8).copied();
+            let origins = game == thedas_vfs::Game::Origins;
+            assert_eq!(property, if origins { None } else { Some((0.0, 0.0)) });
+
+            // Modded bounds can admit a total below the initialized zero floor.
+            let tables = crate::m2da::Tables::empty();
+            tables.insert(
+                "properties",
+                &["ID", "Type", "Min", "Max"],
+                vec![(
+                    8,
+                    vec![
+                        Cell::Int(8),
+                        Cell::Int(3),
+                        Cell::Float(-10.0),
+                        Cell::Float(50.0),
+                    ],
+                )],
+            );
+            s.world.tables = Arc::new(tables);
+            for (base, modifier, requested, native, previous) in [
+                (-5.0, 0.0, 90, -5.0, 0.0),
+                (-5.0, 0.0, -90, -5.0, 0.0),
+                (40.0, -47.5, 90, -7.5, 0.0),
+                (40.0, 13.5, 90, 50.0, 53.5),
+                (40.0, 0.0, -90, 0.0, 0.0),
+                (40.0, 0.0, 30, 30.0, 30.0),
+                (40.0, 0.0, 90, 40.0, 40.0),
+                (0.0, 0.0, i32::MIN, 0.0, 0.0),
+                (0.0, 0.0, i32::MAX, 0.0, 0.0),
+            ] {
+                // DA2 reads a different property table and keeps its existing clamp.
+                let expected = if origins { native } else { previous };
+                let object = s.world.get_mut(creature).unwrap();
+                object.properties.insert(8, (base, 12.0));
+                object.modifiers.insert(8, modifier);
+                object.immortal = true;
+                object.dead = true;
+                object.active = false;
+                let queued = s.world.queue.len();
+                set(&mut s, requested);
+                let object = s.world.get(creature).unwrap();
+                assert_eq!(
+                    object.properties[&8],
+                    (base, expected),
+                    "{game:?}, {requested}"
+                );
+                assert_eq!(object.modifiers[&8], modifier);
+                assert!(object.dead);
+                assert!(!object.active);
+                assert_eq!(s.world.queue.len(), queued);
+            }
+            let saved = s.save_json().unwrap();
+            s.load_json(&saved).unwrap();
+            set(&mut s, 90);
+            assert_eq!(s.world.get(creature).unwrap().properties[&8], (0.0, 0.0));
+
+            // Unordered totals follow the ceiling branch of the native comparison.
+            let object = s.world.get_mut(creature).unwrap();
+            object.properties.insert(8, (f32::NAN, 12.0));
+            object.modifiers.clear();
+            set(&mut s, 30);
+            let current = s.world.get(creature).unwrap().properties[&8].1;
+            if origins {
+                assert!(current.is_nan());
+            } else {
+                assert_eq!(current, 0.0);
+            }
+        }
     }
 
     #[test]
@@ -9997,6 +10287,7 @@ mod coverage_tests {
             let c = s.world.spawn(ObjectKind::Creature, "c");
             let o = s.world.get_mut(c).unwrap();
             (o.area, o.group, o.position) = (Some(area), group, p);
+            o.properties.insert(7, (100.0, 100.0));
             c
         };
         let mage = put(&mut s, 1, [0.0, -10.0, 0.0]);
@@ -10054,6 +10345,48 @@ mod coverage_tests {
         let (got_area, p) = center(&mut s, vec![x2, a2, b2, c2], 1, 3, 0);
         assert_eq!(got_area, area);
         assert!((p[0] - 309.5 / 3.0).abs() < 1e-4 && (p[1] - 1.0).abs() < 1e-4);
+
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            s.game = game;
+            for dead in [false, true] {
+                for (current, origins_keeps) in [
+                    (None, false),
+                    (Some(-1.0), false),
+                    (Some(0.0), false),
+                    (Some(0.999_999_94), false),
+                    (Some(1.0), true),
+                    (Some(12.9), true),
+                    (Some(2147483520.0), true),
+                    (Some(2147483648.0), false),
+                    (Some(f32::NAN), false),
+                    (Some(f32::NEG_INFINITY), false),
+                    (Some(f32::INFINITY), false),
+                ] {
+                    let o = s.world.get_mut(a).unwrap();
+                    o.dead = dead;
+                    o.active = false;
+                    o.properties.remove(&7);
+                    if let Some(current) = current {
+                        o.properties.insert(7, (999.0, current));
+                    }
+                    let keeps = if game == thedas_vfs::Game::Origins {
+                        origins_keeps
+                    } else {
+                        !dead
+                    };
+                    let expected = if keeps {
+                        (area, [21.0, 0.0, 0.0])
+                    } else {
+                        (OBJECT_INVALID, [0.0; 3])
+                    };
+                    assert_eq!(
+                        center(&mut s, vec![lone, a, b], 2, 2, 0),
+                        expected,
+                        "{game:?} dead={dead} current={current:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

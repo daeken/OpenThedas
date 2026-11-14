@@ -11,6 +11,9 @@ pub(crate) struct Config {
     pub ssao: bool,
     pub point_shadows: bool,
     pub tiled_lights: bool,
+    pub tight_tiles: bool,
+    pub light_masks: bool,
+    pub opaque_gbuffer: bool,
     pub sun_shadows: bool,
     pub shadow_reuse: bool,
     pub shadow_cull: bool,
@@ -22,6 +25,7 @@ pub(crate) struct Config {
     pub fused_reflections: bool,
     pub log_lights: bool,
     pub profile: bool,
+    pub profile_serial: bool,
 }
 
 pub(crate) static CONFIG: LazyLock<Config> = LazyLock::new(|| {
@@ -35,6 +39,9 @@ pub(crate) static CONFIG: LazyLock<Config> = LazyLock::new(|| {
         ssao: enabled("THEDAS_DEFERRED_SSAO"),
         point_shadows: enabled("THEDAS_DEFERRED_POINT_SHADOWS"),
         tiled_lights: enabled("THEDAS_DEFERRED_TILED_LIGHTS"),
+        tight_tiles: enabled("THEDAS_DEFERRED_TIGHT_TILES"),
+        light_masks: enabled("THEDAS_DEFERRED_LIGHT_MASKS"),
+        opaque_gbuffer: enabled("THEDAS_DEFERRED_OPAQUE_GBUFFER"),
         sun_shadows: enabled("THEDAS_DEFERRED_SUN_SHADOWS"),
         shadow_reuse: enabled("THEDAS_DEFERRED_SHADOW_REUSE"),
         shadow_cull: enabled("THEDAS_DEFERRED_SHADOW_CULL"),
@@ -46,5 +53,6 @@ pub(crate) static CONFIG: LazyLock<Config> = LazyLock::new(|| {
         fused_reflections: enabled("THEDAS_DEFERRED_FUSED_REFLECTIONS"),
         log_lights: std::env::var_os("THEDAS_DEFERRED_LOG_LIGHTS").is_some(),
         profile: std::env::var("THEDAS_RENDER_PROFILE").as_deref() == Ok("1"),
+        profile_serial: std::env::var("THEDAS_RENDER_PROFILE_SERIAL").as_deref() == Ok("1"),
     }
 });

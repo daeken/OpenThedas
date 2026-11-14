@@ -543,10 +543,21 @@ fn capture(
             let mut ms = Vec::new();
             let compare = std::env::var("THEDAS_BENCH_DEFERRED_COMPARE").ok();
             if compare.as_deref().is_some_and(|s| {
-                !matches!(s, "all" | "tiles" | "shadows" | "faithful" | "reflections")
+                !matches!(
+                    s,
+                    "all"
+                        | "tiles"
+                        | "shadows"
+                        | "faithful"
+                        | "reflections"
+                        | "tile-frusta"
+                        | "light-masks"
+                        | "opaque-gbuffer"
+                        | "lighting"
+                )
             }) {
                 bail!(
-                    "THEDAS_BENCH_DEFERRED_COMPARE must be all, tiles, shadows, faithful or reflections"
+                    "THEDAS_BENCH_DEFERRED_COMPARE must be all, tiles, shadows, faithful, reflections, tile-frusta, light-masks, opaque-gbuffer or lighting"
                 );
             }
             let comparison = std::env::var("THEDAS_BENCH_SHADOW_COMPARE").ok();
@@ -577,6 +588,16 @@ fn capture(
                     } else if let Some(level) = live.level.as_mut() {
                         if compare == "reflections" {
                             level.renderer.set_deferred_fused_reflections(Some(enabled));
+                        } else if compare == "tile-frusta" {
+                            level.renderer.set_deferred_tight_tiles(Some(enabled));
+                        } else if compare == "light-masks" {
+                            level.renderer.set_deferred_light_masks(Some(enabled));
+                        } else if compare == "opaque-gbuffer" {
+                            level.renderer.set_deferred_opaque_gbuffer(Some(enabled));
+                        } else if compare == "lighting" {
+                            level.renderer.set_deferred_tight_tiles(Some(enabled));
+                            level.renderer.set_deferred_light_masks(Some(enabled));
+                            level.renderer.set_deferred_opaque_gbuffer(Some(enabled));
                         } else {
                             level.renderer.set_deferred_culling(Some([
                                 enabled && compare != "shadows",
@@ -607,6 +628,9 @@ fn capture(
                 if let Some(level) = live.level.as_mut() {
                     level.renderer.set_deferred_culling(None);
                     level.renderer.set_deferred_fused_reflections(None);
+                    level.renderer.set_deferred_tight_tiles(None);
+                    level.renderer.set_deferred_light_masks(None);
+                    level.renderer.set_deferred_opaque_gbuffer(None);
                 }
                 println!("bench comparison modes: {}", modes.join(" "));
             }
