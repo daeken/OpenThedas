@@ -8,7 +8,7 @@ use crate::{
 };
 use glam::Vec3;
 use std::collections::{HashMap, HashSet};
-use thedas_formats::state::{AddressMode, CompareFunc, Filter};
+use thedas_formats::state::{AddressMode, BlendFactor, BlendOp, CompareFunc, Filter, PassState};
 use thedas_shader::bytecode::TextureType;
 use thedas_vfs::Vfs;
 
@@ -35,17 +35,23 @@ struct Rule {
     channel: u32,
     clip: f32,
     hair_core: bool,
+    blended_cutout: bool,
 }
 
 fn rule(name: &str) -> Option<Rule> {
     let mut names = name.split('+');
     let (vs, ps) = (names.next()?, names.next()?);
     let (texture, sampler, channel, clip, hair_core) = match (vs, ps) {
-        ("static1.vsh", "static1_punch.psh") => ("mml_tDiffuse", "smpDecal", 3, 0.3, false),
+        ("static1.vsh", "static1_punch.psh") | ("prop1.vsh", "prop1_punch.psh") => {
+            ("mml_tDiffuse", "smpDecal", 3, 0.3, false)
+        }
         ("hair0_pass1.vsh", "hair0_pass1.psh") => {
             ("mml_tPackedTexture", "smpHairTexture", 2, -1.0, true)
         }
         ("eye0.vsh", "eyelash0.psh") => ("mml_tDiffuse", "smpDecal", 3, -1.0, false),
+        ("char1.vsh", _) if crate::deferred_alpha::character(name) => {
+            ("mml_tDiffuse", "smpDecal", 3, -1.0, false)
+        }
         _ => return None,
     };
     Some(Rule {
@@ -54,7 +60,23 @@ fn rule(name: &str) -> Option<Rule> {
         channel,
         clip,
         hair_core,
+        blended_cutout: matches!(
+            (vs, ps),
+            ("prop1.vsh", "prop1_punch.psh") | ("eye0.vsh", "eyelash0.psh")
+        ),
     })
+}
+
+fn supported_pass(rule: Rule, pass: &PassState, enabled: bool) -> bool {
+    pass.z_enable
+        && pass.z_write
+        && match pass.blend {
+            None => true,
+            Some((BlendFactor::SrcAlpha, BlendFactor::InvSrcAlpha, BlendOp::Add)) => {
+                enabled && rule.blended_cutout && pass.alpha_test.is_some()
+            }
+            _ => false,
+        }
 }
 
 pub(crate) fn comparison(c: CompareFunc) -> f32 {
@@ -87,19 +109,23 @@ pub(crate) fn plan(
     }
     let mut seen = HashSet::new();
     let mut material_of = HashMap::new();
+    let blended = std::env::var("THEDAS_DEFERRED_BLENDED_CUTOUTS").as_deref() != Ok("0");
     for (k, d) in d3d.draws.iter().enumerate() {
         let program = d3d.program(d);
         let Some(r) = rule(&program.name) else {
             continue;
         };
+        if crate::deferred_alpha::character(&program.name)
+            && std::env::var("THEDAS_DEFERRED_CHARACTER_CUTOUTS").as_deref() == Ok("0")
+        {
+            continue;
+        }
         let p = &program.pass;
         let Some(item) = scene.draws.get(d.draw) else {
             continue;
         };
         if program.instanced
-            || p.blend.is_some()
-            || !p.z_enable
-            || !p.z_write
+            || !supported_pass(r, p, blended)
             || (d.multipass && !r.hair_core)
             || (p.alpha_test.is_none() && r.clip < 0.0)
             || (r.hair_core
@@ -227,6 +253,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_known_tested_depth_writing_blends_supply_cutout_coverage() {
+        let mut p =
+            thedas_formats::state::MaterialState::parse(br#"<MaterialState Name="fixture"/>"#)
+                .unwrap()
+                .pass()
+                .unwrap();
+        p.alpha_test = Some((CompareFunc::Greater, 20));
+        p.blend = Some((
+            BlendFactor::SrcAlpha,
+            BlendFactor::InvSrcAlpha,
+            BlendOp::Add,
+        ));
+        for name in [
+            "prop1.vsh+prop1_punch.psh+proppunch.sta",
+            "eye0.vsh+eyelash0.psh+eyelashpnch.sta",
+        ] {
+            let r = rule(name).unwrap();
+            assert!(supported_pass(r, &p, true), "{name}");
+            assert!(!supported_pass(r, &p, false));
+            let mut no_depth = p;
+            no_depth.z_write = false;
+            assert!(!supported_pass(r, &no_depth, true));
+            no_depth.z_write = true;
+            no_depth.z_enable = false;
+            assert!(!supported_pass(r, &no_depth, true));
+            let mut untested = p;
+            untested.alpha_test = None;
+            assert!(!supported_pass(r, &untested, true));
+            let mut additive = p;
+            additive.blend = Some((BlendFactor::One, BlendFactor::One, BlendOp::Add));
+            assert!(!supported_pass(r, &additive, true));
+        }
+        for name in [
+            "static1.vsh+static1_punch.psh+punch.sta",
+            "hair0_pass1.vsh+hair0_pass1.psh+hair.sta",
+        ] {
+            assert!(!supported_pass(rule(name).unwrap(), &p, true));
+        }
+        assert!(rule("prop1.vsh+propalpha1.psh+blend.sta").is_none());
+        assert_eq!(
+            rule("prop1.vsh+prop1_punch.psh+proppunch.sta")
+                .unwrap()
+                .clip,
+            0.3
+        );
+    }
+
+    #[test]
     fn only_known_cutouts_and_the_colour_disabled_hair_core_qualify() {
         let hair = rule("hair0_pass1.vsh+hair0_pass1.psh+hairalphapass1.sta").unwrap();
         assert!(hair.hair_core);
@@ -243,5 +317,26 @@ mod tests {
                 .channel,
             3
         );
+    }
+
+    #[test]
+    fn character_cutouts_keep_diffuse_alpha_and_reject_blended_colour() {
+        let r = rule("char1.vsh+ch1alphemarmtnt.psh+characterpt.sta").unwrap();
+        assert_eq!(r.channel, 3);
+        assert_eq!(r.clip, -1.0);
+        assert_eq!(r.texture, "mml_tDiffuse");
+        let mut pass =
+            thedas_formats::state::MaterialState::parse(br#"<MaterialState Name="fixture"/>"#)
+                .unwrap()
+                .pass()
+                .unwrap();
+        pass.alpha_test = Some((CompareFunc::GreaterEqual, 128));
+        assert!(supported_pass(r, &pass, true));
+        pass.blend = Some((
+            BlendFactor::SrcAlpha,
+            BlendFactor::InvSrcAlpha,
+            BlendOp::Add,
+        ));
+        assert!(!supported_pass(r, &pass, true));
     }
 }
