@@ -1212,6 +1212,9 @@ pub fn call(
                 });
             };
             let tag = tag.to_ascii_lowercase();
+            // Origins 0x67fefa requires a type-mask intersection, including for zero.
+            // Keep DA2's untraced zero-as-any behavior.
+            let zero_is_any = h.sim.game == thedas_vfs::Game::DragonAge2;
             let mut found: Vec<(f32, ObjectId)> = h
                 .sim
                 .world
@@ -1226,7 +1229,7 @@ pub fn call(
                 .filter(|o| !perceived || seen.contains(&o.id))
                 .filter(|o| {
                     kind == -1
-                        || kind == 0
+                        || (kind == 0 && zero_is_any)
                         || (kind as u32 as i64 & o.kind.script_type() as i64) != 0
                 })
                 .map(|o| (dist(o.position, origin.0), o.id))
@@ -8856,6 +8859,73 @@ mod tests {
         match near {
             Some(Value::Array { items, .. }) => assert_eq!(items, vec![Value::Object(here)]),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn origins_nearest_object_queries_require_a_nonempty_type_mask() {
+        let table = Arc::new(EngineTable::parse(b"\
+            object[] GetNearestObject(object o, int t, int n, int l, int p, int s) = 433;\n\
+            object[] GetNearestObjectByTag(object o, string tag, int t, int n, int l, int p, int s) = 435;\n\
+            object[] GetNearestObjectByGroup(object o, int g, int t, int n, int l, int p, int s) = 436;\n\
+            object[] GetNearestObjectByHostility(object o, int h, int t, int n, int l, int p, int s) = 127;\n"
+        ).unwrap());
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut s = Sim::new(Arc::new(Vfs::new()), table.clone(), 1);
+            s.game = game;
+            let area = s.world.spawn(ObjectKind::Area, "area");
+            let origin = s.world.spawn(ObjectKind::Creature, "origin");
+            s.world.get_mut(origin).unwrap().area = Some(area);
+            let creature = s.world.spawn(ObjectKind::Creature, "match");
+            let placeable = s.world.spawn(ObjectKind::Placeable, "match");
+            for (id, x) in [(creature, 1.0), (placeable, 2.0)] {
+                let o = s.world.get_mut(id).unwrap();
+                o.area = Some(area);
+                o.position = [x, 0.0, 0.0];
+            }
+            for name in [
+                "GetNearestObject",
+                "GetNearestObjectByTag",
+                "GetNearestObjectByGroup",
+                "GetNearestObjectByHostility",
+            ] {
+                for (mask, expected) in [
+                    (
+                        0,
+                        if game == thedas_vfs::Game::Origins {
+                            vec![]
+                        } else {
+                            vec![creature, placeable]
+                        },
+                    ),
+                    (32, vec![creature]),
+                    (512, vec![placeable]),
+                    (32 | 512, vec![creature, placeable]),
+                    (-1, vec![creature, placeable]),
+                    (1, vec![]),
+                ] {
+                    let mut args = vec![Value::Object(origin)];
+                    match name {
+                        "GetNearestObjectByTag" => args.push(Value::String("match".into())),
+                        "GetNearestObjectByGroup" | "GetNearestObjectByHostility" => {
+                            args.push(Value::Int(0))
+                        }
+                        _ => {}
+                    }
+                    args.extend([
+                        Value::Int(mask),
+                        Value::Int(10),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Int(0),
+                    ]);
+                    assert_eq!(
+                        run(&mut s, origin, name, &args),
+                        Some(objects(expected)),
+                        "{game:?} {name} mask {mask}"
+                    );
+                }
+            }
         }
     }
 
