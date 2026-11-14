@@ -92,6 +92,15 @@ pub(crate) struct D3dDraw {
     textures_key: (usize, Option<usize>, Option<usize>),
 }
 
+/// Read-only geometry and bindings after this frame's visibility/instance grouping.
+pub(crate) struct DrawGeometry<'a> {
+    pub vertices: &'a wgpu::Buffer,
+    pub constants: &'a wgpu::BindGroup,
+    pub textures: &'a wgpu::BindGroup,
+    pub indices: std::ops::Range<u32>,
+    pub instances: std::ops::Range<u32>,
+}
+
 /// This frame's instanced draws ([`D3dDraw::instanced`]): per draw, the group it leads (one
 /// draw per group leads it; the others draw with it), and per group its first instance in the
 /// instance list, its instance count and its index range.
@@ -2390,6 +2399,46 @@ impl D3dPass {
     /// The program `d` draws with.
     pub(crate) fn program(&self, d: &D3dDraw) -> &D3dProgram {
         &self.pipelines[d.pipeline].program
+    }
+
+    pub(crate) fn particle_program(&self, d: &ParticleDraw) -> &D3dProgram {
+        &self.pipelines[d.pipeline].program
+    }
+
+    pub(crate) fn geometry_layouts(&self, d: &D3dDraw) -> [wgpu::BindGroupLayout; 2] {
+        let pipeline = &self.pipelines[d.pipeline].pipeline;
+        [
+            pipeline.get_bind_group_layout(0),
+            pipeline.get_bind_group_layout(1),
+        ]
+    }
+
+    pub(crate) fn geometry<'a>(&'a self, d: &'a D3dDraw, count: u32) -> Option<DrawGeometry<'a>> {
+        let (constants, indices, instances) = if d.instanced {
+            let inst = self.instancing.lock().unwrap_or_else(|e| e.into_inner());
+            let group = (*inst.lead.get(d.index)?)?;
+            let &(start, n, (first, len)) = inst.groups.get(group)?;
+            let end = first.saturating_add(len).min(count);
+            (
+                self.slot_groups.get(d.chunk)?,
+                first.min(end)..end,
+                start..start + n,
+            )
+        } else {
+            let frame = self.tree_frame.lock().unwrap_or_else(|e| e.into_inner());
+            let indices = match frame.get(d.draw) {
+                Some(Some((first, n, _))) => *first..(*first + *n).min(count),
+                _ => 0..count,
+            };
+            (&d.consts, indices, 0..1)
+        };
+        Some(DrawGeometry {
+            vertices: &d.vertices,
+            constants,
+            textures: &d.textures,
+            indices,
+            instances,
+        })
     }
 
     /// The scene's lights, then those added since ([`D3dPass::set_extra_lights`]).

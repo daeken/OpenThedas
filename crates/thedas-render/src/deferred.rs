@@ -26,6 +26,9 @@ use crate::scene::{AreaScene, DOMAIN_CHARACTERS, DOMAIN_LEVEL, SceneLight};
 #[path = "deferred_light_masks.rs"]
 mod light_masks;
 
+#[path = "deferred_fronds.rs"]
+mod fronds;
+
 pub const DEFERRED_WGSL: &str = concat!(
     include_str!("deferred_skin.wgsl"),
     include_str!("deferred.wgsl")
@@ -205,6 +208,7 @@ struct PlanDraw {
 /// renderer is made, and its GPU objects, made the first time a frame is drawn deferred.
 pub(crate) struct DeferredPass {
     draws: Vec<PlanDraw>,
+    fronds: fronds::Plan,
     cutouts: Vec<crate::deferred_cutout::Draw>,
     cutout_materials: Vec<crate::deferred_cutout::Material>,
     data: Vec<DrawData>,
@@ -215,6 +219,7 @@ pub(crate) struct DeferredPass {
     skin_count: usize,
     /// Per faithful draw (index into [`D3dPass::draws`]): whether this pass draws it.
     takes: Vec<bool>,
+    logged_materials: bool,
     /// The index each room id has in the lights' room sets (1 on; 0 is "no room").
     rooms: HashMap<i64, u32>,
     light_rooms: HashMap<i64, Vec<i64>>,
@@ -249,6 +254,7 @@ pub(crate) struct Contributor<'a> {
 }
 
 struct Gpu {
+    fronds: fronds::Gpu,
     /// By cull mode: none, back, front.
     gbuffer: [wgpu::RenderPipeline; 3],
     gbuffer_opaque: [wgpu::RenderPipeline; 3],
@@ -750,14 +756,66 @@ impl DeferredPass {
             &mut vertices,
             &mut skin_count,
         );
+        let fronds = fronds::Plan::new(scene, d3d, &mut takes);
+        if crate::config::CONFIG.log_materials {
+            // Count planned faithful passes, including offscreen and inactive LODs.
+            // Keep this at load time so even large foliage scenes pay once.
+            let mut counts: HashMap<&str, [usize; 2]> = HashMap::new();
+            for (k, d) in d3d.draws.iter().enumerate() {
+                counts.entry(&d3d.program(d).name).or_default()[usize::from(takes[k])] += 1;
+            }
+            let mut counts: Vec<_> = counts.into_iter().collect();
+            counts.sort_by(|a, b| b.1[0].cmp(&a.1[0]).then_with(|| a.0.cmp(b.0)));
+            for (program, [forward, gbuffer]) in counts {
+                log::info!(
+                    "deferred-material forward={forward} gbuffer={gbuffer} program={program}"
+                );
+            }
+            let mut particles: HashMap<&str, usize> = HashMap::new();
+            for d in &d3d.particles {
+                *particles.entry(&d3d.particle_program(d).name).or_default() += 1;
+            }
+            let mut particles: Vec<_> = particles.into_iter().collect();
+            particles.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            for (program, emitters) in particles {
+                log::info!("deferred-particle emitters={emitters} program={program}");
+            }
+            let mut reasons: HashMap<(&str, &str), usize> = HashMap::new();
+            for (_, d) in d3d.draws.iter().enumerate().filter(|(k, _)| !takes[*k]) {
+                let program = d3d.program(d);
+                let item = scene.draws.get(d.draw);
+                let reason = if scene.cut_away.contains(&d.draw) {
+                    "cutaway"
+                } else if d.multipass {
+                    "multipass"
+                } else if d3d.is_blended(d) {
+                    "blended"
+                } else if program.instanced {
+                    "instance-material"
+                } else if item.is_some_and(|i| i.lod.is_some()) {
+                    "lod-material"
+                } else if static1(program) || terrain(program) || object_material(program) {
+                    "geometry-or-control"
+                } else {
+                    "material"
+                };
+                *reasons.entry((&program.name, reason)).or_default() += 1;
+            }
+            let mut reasons: Vec<_> = reasons.into_iter().collect();
+            reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            for ((program, reason), draws) in reasons {
+                log::info!("deferred-reason draws={draws} reason={reason} program={program}");
+            }
+        }
         log::info!(
-            "deferred: {} of {} draws ({} terrain, {} props, {} character materials, {} skinned), planned in {:.1} ms ({} static draws)",
-            draws.len(),
+            "deferred: {} of {} draws ({} terrain, {} props, {} character materials, {} skinned, {} fronds), planned in {:.1} ms ({} static draws)",
+            draws.len() + fronds.len(),
             d3d.draws.len(),
             data.iter().filter(|d| d.room[2] > 0.5).count(),
             data.iter().filter(|d| d.material[0] == 1.0).count(),
             data.iter().filter(|d| d.material[0] == 2.0).count(),
             draws.iter().filter(|d| d.skin_slot > 0).count(),
+            fronds.len(),
             started.elapsed().as_secs_f64() * 1000.0,
             scene.static_draws,
         );
@@ -771,8 +829,9 @@ impl DeferredPass {
                 .filter(|d| d.material[0] > 0.5 && d.alpha[0] > 0.5)
                 .count()
         );
-        (!draws.is_empty() || !cutouts.is_empty()).then(|| DeferredPass {
+        (!draws.is_empty() || !cutouts.is_empty() || !fronds.is_empty()).then(|| DeferredPass {
             draws,
+            fronds,
             cutouts,
             cutout_materials,
             data,
@@ -781,6 +840,7 @@ impl DeferredPass {
             vertices,
             skin_count,
             takes,
+            logged_materials: false,
             rooms,
             light_rooms: scene.light_rooms.clone(),
             gpu: None,
@@ -841,6 +901,10 @@ impl DeferredPass {
 
     pub(crate) fn set_direct_terrain_layers(&mut self, enabled: Option<bool>) {
         self.direct_terrain_layers = enabled;
+    }
+
+    pub(crate) fn set_fronds(&mut self, enabled: Option<bool>) {
+        self.fronds.set_enabled(enabled);
     }
 
     /// Sets the lights only this pass draws (see [`DeferredPass::effect_lights`]).
@@ -1404,6 +1468,7 @@ impl DeferredPass {
             (cull_index(d.cull), d.group, d.mesh)
         });
         Gpu {
+            fronds: self.fronds.build(device, &frame_buffer),
             gbuffer,
             gbuffer_opaque,
             gbuffer_static,
@@ -1494,6 +1559,27 @@ impl DeferredPass {
     ) -> bool {
         if self.refused {
             return false;
+        }
+        self.fronds.prepare(d3d, &mut self.takes);
+        if crate::config::CONFIG.log_materials && !self.logged_materials {
+            self.logged_materials = true;
+            let mut counts: HashMap<&str, [usize; 2]> = HashMap::new();
+            for (k, d) in d3d
+                .draws
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| d3d.in_view(*k))
+            {
+                let taken = self.takes[k] && !d3d.is_faded(d);
+                counts.entry(&d3d.program(d).name).or_default()[usize::from(taken)] += 1;
+            }
+            let mut counts: Vec<_> = counts.into_iter().collect();
+            counts.sort_by(|a, b| b.1[0].cmp(&a.1[0]).then_with(|| a.0.cmp(b.0)));
+            for (program, [forward, gbuffer]) in counts {
+                log::info!(
+                    "deferred-visible forward={forward} gbuffer={gbuffer} program={program}"
+                );
+            }
         }
         if self.gpu.is_none() {
             self.gpu = checked(&ctx.device, "the deferred renderer", || {
@@ -1986,6 +2072,12 @@ impl DeferredPass {
                         c.d3d,
                         c.meshes,
                     );
+                }
+            }
+            self.fronds.draw(&gpu.fronds, &mut pass, d3d, meshes);
+            for c in contributors.iter() {
+                if let Some(g) = c.pass.gpu.as_ref() {
+                    c.pass.fronds.draw(&g.fronds, &mut pass, c.d3d, c.meshes);
                 }
             }
         }
