@@ -15,6 +15,13 @@ lightmaps. It is not parity work; where the two differ, the faithful path is rig
 - `thedas_render::RenderPath` (`Faithful` | `Deferred`) on `AreaRenderer::path`. The level
   and its eligible objects share a G-buffer; remaining materials, rings and effects draw
   forward over its depth.
+- Depth-disabled selection rings and the aiming reticle retain their ground-overlay
+  blending over terrain. In deferred frames, the colour before these marks is restored
+  over the G-buffer's character material code. This includes any nearer forward occluder
+  and preserves each MSAA sample. Forward-only characters still draw after the marks.
+  `THEDAS_DEFERRED_GROUND_MASK=0` disables this restoration for comparisons. Single-sample
+  targets need `COPY_SRC` usage; targets without it retain the unmasked overlay. The
+  mask follows the G-buffer's single-sample character coverage, including under MSAA.
 - `thedas-app --renderer faithful|deferred` (default `faithful`), the launcher's
   "Renderer" choice, **F11** in game to flip between them at once, and the step
   `renderer faithful|deferred|toggle` for `--steps` and `--control` runs.
@@ -30,6 +37,23 @@ API callers use `AreaRenderer::new_cached_with_path`, or call `prepare_deferred`
 original scene before selecting `path = RenderPath::Deferred`.
 
 ## Frame (deferred path)
+
+Point-shadow cubes retain their previous contents when their exact inputs are unchanged.
+Each slot compares its light position/radius and the eligible casters in reach: geometry
+buffers, transform, posed bounds, bone palette values, opacity test/clip, and immutable
+material texture/sampler handles. A changed slot redraws all six faces; removed/faded
+casters and newly empty slots clear correctly. Camera movement alone can reuse a cube,
+unless it changes slot selection. Resource reloads replace the renderer and its cache.
+`THEDAS_DEFERRED_SHADOW_REUSE=0` redraws every active cube for comparison. Animated or moving
+casters still invalidate every cube they reach; stationary capture gains do not predict
+the same gain during motion.
+
+For same-process ABBA captures, combine `THEDAS_BENCH_FRAMES=120`,
+`THEDAS_BENCH_DUMP=1` and `THEDAS_BENCH_SHADOW_COMPARE=reuse|faithful`. The reuse
+control forces every active cube to redraw while both modes retain exact input
+bookkeeping; the other comparison alternates faithful/deferred rendering. Overrides are
+per renderer and restored afterwards, without mutating environment variables while
+worker threads exist. Discard warm-up frames and pair adjacent opposite modes.
 
 1. Shadows exactly as now (the faithful pass places and draws the sun partitions).
 2. **G-buffer pass** over the deferred draws, writing the shared depth buffer:
@@ -55,11 +79,28 @@ original scene before selecting `path = RenderPath::Deferred`.
    level lights whose reach is in view (the scene's and the added ones, i.e. cutscene
    lights; nearest first past 192), each with a bit set of the rooms it reaches
    (`AreaScene::light_rooms`), tested against the pixel's room: no 3-light cap, no leaking
-   through walls into rooms the original never lit. Tiled or clustered culling replaces
-   the per-pixel loop over all of them when light counts call for it.
+   through walls into rooms the original never lit. A conservative 16-by-9 screen grid
+   projects each light sphere's world AABB, with one pixel of margin for reconstruction
+   and tile edges. Bounds crossing the eye plane use every tile. Six ascending 32-bit
+   masks per tile select candidates; exact radius, room and material-domain tests still
+   run per pixel, in the original accumulation order. Two padded vec4s per tile take
+   4,608 bytes in a portable uniform buffer; there are no storage buffers or candidate
+   count truncations. The `wrap` debug view expands tile bounds to twice the radius.
+   `THEDAS_DEFERRED_TILED_LIGHTS=0` puts every light in every tile for comparisons.
 4. Everything not deferred draws forward with its original shaders over that colour and
-   depth: blended, unsupported alpha-tested and multi-pass materials, water, sky, trees,
-   unsupported character materials, cut-away meshes and particles. Then frame effects as now.
+   depth. In a shared deferred frame, all renderers first draw their remaining opaque
+   geometry (including hair depth cores and unsupported materials). Blended and faded
+   geometry and particles then draw against the completed opaque depth, before the MSAA
+   resolve and frame effects. This keeps a forward object from overwriting particles or
+   water in front of it. Draw order within each renderer stays authored; this is not a
+   global transparency sort or order-independent transparency. Distortion still uses its
+   later shared mask. `THEDAS_DEFERRED_LATE_TRANSPARENCY=0` restores the earlier per-renderer
+   order for comparison. Faithful frames keep their existing order.
+
+   API callers of `render_main_with` finish their opaque overlays with `render_over`, then
+   call `finish_transparency` on the level and each overlay, using the shared frame/depth
+   views, before `resolve`. It is a no-op without pending work. `capture_with` does this
+   automatically; a standalone renderer needs no split.
 
 Debug views in place of the lit frame: `THEDAS_DEFERRED_VIEW=albedo|normal|lightmap|
 visibility|diffuse|specular|no-rooms|flat|wrap|shadows|sun-shadows|ao` (see `deferred::debug_view`).
@@ -86,6 +127,16 @@ forward. Alpha coverage is binary at the G-buffer's single sample, including wit
 Cutout point shadows use the independent textured-caster plan; these cards never enter
 the opaque cube-shadow pipeline. Prop punch, eyelashes, hair, trees and blended materials
 retain their own forward equations.
+
+Single-pass, depth-writing `Char1` / `Ch1Alph` character cutouts also share the G-buffer
+when their pass alpha-tests without blending. The ordinary, NoTint, MulTint, ArmourTint
+and corresponding emissive variants retain the existing character probe, tint and lighting
+equations. Coverage uses diffuse alpha times the authored opacity multiplier and the
+pass's rounded 8-bit comparison/reference. This family has no additional shader clip.
+Its G-buffer coverage is single-sampled and binary, including under MSAA.
+The same sampled coverage supplies posed point-shadow casters. Missing opacity maps,
+multi-pass materials, runtime fades and unsupported palettes retain the forward fallback.
+`THEDAS_DEFERRED_CHARACTER_CUTOUTS=0` disables both additions for comparison.
 
 **Objects and characters**: opaque, single-pass `Prop1`, `Weapon1`, `Cloth1`, and
 `Char1` with `Ch1`, its NoTint, MulTint and ArmourTint variants, and their emissive
@@ -127,7 +178,7 @@ room indices, SSAO depth and posed point-shadow geometry with the bodies.
 This is our deferred material approximation, not shader parity: character rim lighting,
 skin scattering, gore/heraldry and remote-material effects are not represented yet. Hair,
 unsupported alpha-tested and blended materials, lower-detail Char2 and other unsupported families
-still draw forward; they also remain absent from deferred point-shadow casters. Tangent
+still draw forward; the known cutouts described below can supply point-shadow coverage. Tangent
 frames still come from derivatives. Probe assignments remain those made at scene load.
 The float lightmap target may change baked-image rounding slightly.
 
@@ -184,13 +235,18 @@ debug views now include the ground. Terrain also joins the point-shadow caster l
   times radius over distance from the camera. Each is six 512-square `R32Float` distance
   maps with a 0.35 m near plane to leave the flame's enclosing torch bowl out. Opaque
   eligible deferred meshes cast from both faces, including geometry outside the camera's
-  view. The lighting pass compares distances with a bilinear 2-by-2 filter, a 4 cm normal
+  view. Each cube face conservatively culls posed world spheres against all six clip
+  planes before allocating/uploading draw uniforms. Face seams and near/far crossings
+  retain a millimetre margin, and unknown bounds stay in every face.
+  `THEDAS_DEFERRED_SHADOW_CULL=0` restores six submissions per in-range caster for
+  comparisons. The lighting pass compares distances with a bilinear 2-by-2 filter, a 4 cm normal
   offset and 2 cm distance bias. Supported skinned objects and terrain cast too; forward
   materials and trees do not, except for the cutouts below. Static lights keep baked
   visibility. At most 24 face passes per frame.
   `THEDAS_DEFERRED_POINT_SHADOWS=0` disables both rendering and sampling these maps for
   captures and cost comparisons; it does not change the faithful path.
-- Forward cutouts: known Origins `Static1_Punch`, `Eye0/Eyelash0`, and the
+- Forward cutouts: known Origins `Static1_Punch`, `Prop1_Punch`, alpha-tested `Ch1Alph`,
+  `Eye0/Eyelash0`, and the
   colour-disabled `Hair0_Pass1` depth core also cast into point-light cubes, independently
   of G-buffer coverage and `THEDAS_DEFERRED_OBJECTS`. Geometry retains UVs, morphs and the
   current four-weight pose. The opacity map, sampler address/filter/mip states, opacity
@@ -198,6 +254,13 @@ debug views now include the ground. Terrain also joins the point-shadow caster l
   clips diffuse alpha times opacity below 0.3; hair takes opacity from the packed
   texture's blue channel and admits only its depth core's `>= 255` coverage. All visible
   hair passes remain forward and are not suppressed. Eyelashes take diffuse alpha.
+  Authored prop punch and eyelash passes also blend colour while writing tested depth.
+  Their ordinary source-alpha blend is accepted for point-shadow coverage, while their
+  colour passes stay forward. Prop punch retains its additional 0.3 shader clip; eyelash
+  coverage retains the authored reference (normally 20). Other blend equations, missing
+  tests, disabled depth/write, and unknown material families do not qualify. The cube
+  stores binary occlusion after the tests, not fractional transmission through surviving
+  texels. `THEDAS_DEFERRED_BLENDED_CUTOUTS=0` restores the earlier exclusion of blends.
   Casts are deduplicated per scene draw; explicit no-cast flags, current posed bounds,
   fade-outs and cutaway exclusions still apply. Missing opacity maps do not become
   rectangular casters. `THEDAS_DEFERRED_CUTOUT_SHADOWS=0` disables just these additions
@@ -241,6 +304,38 @@ budget, missing occluders, screen edges and coarse room probes can cause light l
 ambient discontinuities. The original baked image remains the default while those are
 addressed. Moving the remaining material families into the G-buffer is still
 the next coverage step.
+
+## Measuring frame cost
+
+For fixed-scene save captures (`--save ...`), `THEDAS_BENCH_FRAMES=120 THEDAS_BENCH_DUMP=1`
+reports the headless capture loop's CPU/submission/GPU-wait/readback cost, excluding
+scene load and PNG encoding. `THEDAS_BENCH_DEFERRED_COMPARE=all` alternates full-candidate
+and optimized frames in ABBA order within one loaded scene. `tiles` or `shadows` isolates
+one optimization; `faithful` alternates the faithful path with optimized deferred.
+Start with `--renderer deferred` so planning is already complete, keep `--time`, camera,
+resolution and AA fixed, and discard the first twenty frames before comparing adjacent
+pairs. `bench comparison modes` labels control frames 0 and test frames 1. Overrides
+are per renderer, without mutating environment variables while other threads run, and
+are cleared after the benchmark. These measurements are not isolated GPU timings or
+whole-gameplay FPS; shared-machine load can still affect absolute values.
+
+## Capture profiling
+
+`THEDAS_RENDER_PROFILE=1` records CPU stage durations for offscreen world captures and
+requests optional GPU timestamps from the adapter. When timestamps are
+available, it also reports durations on the actual G-buffer, lighting, reflection and
+level-forward render passes. CPU stages cover shadow preparation/encoding, object overlays,
+post-processing and pixel copies too. Unsupported adapters still report CPU durations.
+The existing `THEDAS_BENCH_FRAMES` and same-process
+ABBA path comparison can collect warmed samples for each renderer.
+
+CPU encoding, submission/wait/pixel unpacking and GPU execution are reported separately.
+Per-pass GPU intervals can overlap on pipelined GPUs and can overlap CPU work.
+Keep each interval separate when interpreting the frame budget.
+The GPU samples cover these four passes. Forward object passes, shadows, uploads and
+post-processing need separate instrumentation for a complete GPU frame budget.
+Profiling adds query resources, timestamp writes and a diagnostic readback per capture.
+Use ordinary paired captures with profiling disabled for the relative frame-cost target.
 
 ## Order of work
 
