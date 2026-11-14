@@ -78,6 +78,7 @@ pub enum AutoSize {
 /// A laid out glyph: font, glyph index, pen position (pixels, baseline), size and colour.
 #[derive(Clone, Debug)]
 pub struct PlacedGlyph {
+    pub index: usize,
     pub font: Arc<Font>,
     pub glyph: usize,
     pub x: f32,
@@ -86,13 +87,26 @@ pub struct PlacedGlyph {
     pub color: [u8; 3],
 }
 
+/// A character's advance, including spaces and missing glyphs, in layout pixels.
+#[derive(Clone, Debug)]
+pub struct CharacterBox {
+    pub index: usize,
+    pub x: f32,
+    pub advance: f32,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Line {
+    pub start: usize,
+    pub end: usize,
+    pub x: f32,
     pub top: f32,
     pub height: f32,
     pub ascent: f32,
+    pub descent: f32,
     pub width: f32,
     pub glyphs: Vec<PlacedGlyph>,
+    pub characters: Vec<CharacterBox>,
     pub images: Vec<(Image, f32, f32)>,
     pub underlines: Vec<(f32, f32, f32, [u8; 3])>,
 }
@@ -103,6 +117,29 @@ pub struct Layout {
     /// `textWidth`/`textHeight` in pixels.
     pub width: f32,
     pub height: f32,
+}
+
+impl Layout {
+    /// At a wrapped boundary the caret belongs to the following line.
+    pub fn caret_position(&self, index: usize) -> Option<(usize, f32)> {
+        self.lines.iter().enumerate().rev().find_map(|(i, line)| {
+            if index < line.start || index > line.end {
+                return None;
+            }
+            let x = line
+                .characters
+                .iter()
+                .find(|c| c.index >= index)
+                .map(|c| c.x)
+                .unwrap_or_else(|| {
+                    line.characters
+                        .last()
+                        .map(|c| c.x + c.advance)
+                        .unwrap_or(line.x)
+                });
+            Some((i, x))
+        })
+    }
 }
 
 /// Finds a font by name and style.
@@ -142,6 +179,8 @@ pub struct TextField {
     pub caret: Option<usize>,
     /// The other end of the focused selection; equal to the caret for an insertion point.
     pub selection_anchor: usize,
+    pub caret_visible: bool,
+    caret_elapsed_ms: f64,
     pub layout: Option<Layout>,
     /// Bumped whenever the text, its format or its box change (renderers cache by it).
     pub revision: u64,
@@ -201,6 +240,8 @@ impl TextField {
             shadow_color: [0, 0, 0],
             caret: None,
             selection_anchor: 0,
+            caret_visible: true,
+            caret_elapsed_ms: 0.0,
             layout: None,
             revision: 0,
             def,
@@ -403,6 +444,30 @@ impl TextField {
         let len = self.len();
         self.selection_anchor = anchor.min(len);
         self.caret = Some(caret.min(len));
+        self.caret_visible = true;
+        self.caret_elapsed_ms = 0.0;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.caret = None;
+        self.selection_anchor = 0;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Only invalidate the picture at a blink boundary; idle text retains its mesh/layout.
+    pub fn advance_caret(&mut self, dt_ms: f64) -> bool {
+        if self.caret.is_none() || !self.input || self.selection().0 != self.selection().1 {
+            return false;
+        }
+        self.caret_elapsed_ms = (self.caret_elapsed_ms + dt_ms) % 1000.0;
+        let visible = self.caret_elapsed_ms < 500.0;
+        if self.caret_visible == visible {
+            return false;
+        }
+        self.caret_visible = visible;
+        self.revision = self.revision.wrapping_add(1);
+        true
     }
 
     pub fn len(&self) -> usize {
@@ -774,11 +839,11 @@ pub fn parse_html(html: &str, base: &Format, _multiline: bool) -> Vec<Span> {
 }
 
 struct Word {
-    /// (char, format index)
-    chars: Vec<(char, usize)>,
-    image: Option<(Image, usize)>,
+    /// (char, format index, character index)
+    chars: Vec<(char, usize, usize)>,
+    image: Option<(Image, usize, usize)>,
     /// Ends the paragraph.
-    newline: bool,
+    newline: Option<usize>,
     space_after: bool,
 }
 
@@ -813,16 +878,16 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
     let mut cur = Word {
         chars: Vec::new(),
         image: None,
-        newline: false,
+        newline: None,
         space_after: false,
     };
-    let flush = |cur: &mut Word, words: &mut Vec<Word>, newline: bool, space: bool| {
+    let flush = |cur: &mut Word, words: &mut Vec<Word>, newline: Option<usize>, space: bool| {
         let w = std::mem::replace(
             cur,
             Word {
                 chars: Vec::new(),
                 image: None,
-                newline: false,
+                newline: None,
                 space_after: false,
             },
         );
@@ -832,35 +897,38 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
             ..w
         });
     };
+    let mut index = 0;
     for (fi, sp) in t.spans.iter().enumerate() {
         match &sp.piece {
             Piece::Image(img) => {
                 if !cur.chars.is_empty() {
-                    flush(&mut cur, &mut words, false, false);
+                    flush(&mut cur, &mut words, None, false);
                 }
-                cur.image = Some((img.clone(), fi));
-                flush(&mut cur, &mut words, false, false);
+                cur.image = Some((img.clone(), fi, index));
+                index += 1;
+                flush(&mut cur, &mut words, None, false);
             }
             Piece::Text(s) => {
                 for c in s.chars() {
                     let c = if t.password && c != '\r' { '*' } else { c };
                     match c {
                         '\r' | '\n' if t.multiline || t.html => {
-                            flush(&mut cur, &mut words, true, false)
+                            flush(&mut cur, &mut words, Some(index), false)
                         }
                         '\r' | '\n' => {}
                         ' ' | '\t' => {
-                            cur.chars.push((' ', fi));
-                            flush(&mut cur, &mut words, false, true);
+                            cur.chars.push((' ', fi, index));
+                            flush(&mut cur, &mut words, None, true);
                         }
-                        _ => cur.chars.push((c, fi)),
+                        _ => cur.chars.push((c, fi, index)),
                     }
+                    index += 1;
                 }
             }
         }
     }
     if !cur.chars.is_empty() || cur.image.is_some() || words.is_empty() {
-        flush(&mut cur, &mut words, false, false);
+        flush(&mut cur, &mut words, None, false);
     }
 
     let box_w = t.bounds.2 - 2.0 * GUTTER;
@@ -870,12 +938,12 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
     let mut y = GUTTER;
     let mut para_start = true;
     let word_width = |w: &Word| -> f32 {
-        if let Some((img, _)) = &w.image {
+        if let Some((img, _, _)) = &w.image {
             return img.width + 2.0 * img.hspace;
         }
         w.chars
             .iter()
-            .map(|&(c, fi)| advance(resolved[fi].as_ref(), &formats[fi], c))
+            .map(|&(c, fi, _)| advance(resolved[fi].as_ref(), &formats[fi], c))
             .sum()
     };
     let emit = |words: &[&Word], first_in_para: bool, y: &mut f32, lines: &mut Vec<Line>| {
@@ -899,7 +967,7 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
         let mut leading: f32 = fmt0.leading;
         let mut any = false;
         for w in words {
-            for &(_, fi) in &w.chars {
+            for &(_, fi, _) in &w.chars {
                 any = true;
                 let f = &formats[fi];
                 if let Some(font) = &resolved[fi] {
@@ -912,7 +980,7 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
                 }
                 leading = leading.max(f.leading);
             }
-            if let Some((img, _)) = &w.image {
+            if let Some((img, _, _)) = &w.image {
                 any = true;
                 ascent = ascent.max(img.height + img.vspace);
             }
@@ -923,7 +991,8 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
                 .iter()
                 .zip(formats.iter())
                 .find(|(_, ff)| *ff == f)
-                .and_then(|(r, _)| r.clone());
+                .and_then(|(r, _)| r.clone())
+                .or_else(|| font_for(fonts, f));
             if let Some(font) = fi {
                 let s = f.size / font.em;
                 ascent = font.ascent * s;
@@ -945,7 +1014,7 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
             trailing = if w.space_after {
                 w.chars
                     .last()
-                    .map(|&(c, fi)| advance(resolved[fi].as_ref(), &formats[fi], c))
+                    .map(|&(c, fi, _)| advance(resolved[fi].as_ref(), &formats[fi], c))
                     .unwrap_or(0.0)
             } else {
                 0.0
@@ -958,9 +1027,30 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
             TextAlign::Center => left + ((avail - content) / 2.0).max(0.0),
         };
         let mut line = Line {
+            start: words
+                .iter()
+                .find_map(|w| {
+                    w.chars
+                        .first()
+                        .map(|c| c.2)
+                        .or(w.image.as_ref().map(|i| i.2))
+                        .or(w.newline)
+                })
+                .unwrap_or(t.len()),
+            end: words
+                .iter()
+                .rev()
+                .find_map(|w| {
+                    w.newline
+                        .or(w.chars.last().map(|c| c.2 + 1))
+                        .or(w.image.as_ref().map(|i| i.2 + 1))
+                })
+                .unwrap_or(t.len()),
+            x: x0,
             top: *y,
             height: ascent + descent + leading,
             ascent,
+            descent,
             width: content,
             ..Default::default()
         };
@@ -968,15 +1058,20 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
         let mut x = x0;
         let mut prev: Option<char> = None;
         for w in words {
-            if let Some((img, fi)) = &w.image {
-                let _ = fi;
+            if let Some((img, _, index)) = &w.image {
                 line.images
                     .push((img.clone(), x + img.hspace, base - img.height));
-                x += img.width + 2.0 * img.hspace;
+                let adv = img.width + 2.0 * img.hspace;
+                line.characters.push(CharacterBox {
+                    index: *index,
+                    x,
+                    advance: adv,
+                });
+                x += adv;
                 prev = None;
                 continue;
             }
-            for &(c, fi) in &w.chars {
+            for &(c, fi, index) in &w.chars {
                 let f = &formats[fi];
                 let font = resolved[fi].as_ref();
                 if let (Some(font), Some(p)) = (font, prev) {
@@ -985,10 +1080,16 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
                     }
                 }
                 let adv = advance(font, f, c);
+                line.characters.push(CharacterBox {
+                    index,
+                    x,
+                    advance: adv,
+                });
                 if let Some(font) = font {
                     if let Some(&gi) = font.index.get(&c) {
                         if c != ' ' {
                             line.glyphs.push(PlacedGlyph {
+                                index,
                                 font: font.clone(),
                                 glyph: gi,
                                 x,
@@ -1023,7 +1124,7 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
         let space_w = if w.space_after {
             w.chars
                 .last()
-                .map(|&(c, fi)| advance(resolved[fi].as_ref(), &formats[fi], c))
+                .map(|&(c, fi, _)| advance(resolved[fi].as_ref(), &formats[fi], c))
                 .unwrap_or(0.0)
         } else {
             0.0
@@ -1036,14 +1137,17 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
         }
         line_words.push(w);
         line_w += ww;
-        if w.newline {
+        if w.newline.is_some() {
             emit(&line_words, para_start, &mut y, &mut lines);
             para_start = true;
             line_words.clear();
             line_w = 0.0;
         }
     }
-    if !line_words.is_empty() || lines.is_empty() {
+    if !line_words.is_empty()
+        || lines.is_empty()
+        || words.last().is_some_and(|w| w.newline.is_some())
+    {
         emit(&line_words, para_start, &mut y, &mut lines);
     }
     // Flash does not count the last line's leading in textHeight.
@@ -1062,6 +1166,22 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focused_caret_blink_resets_without_discarding_layout() {
+        let mut t = TextField::new(Arc::new(EditText::default()), None);
+        t.set_text("ab");
+        t.layout = Some(Layout::default());
+        t.set_selection(2, 2);
+        assert!(!t.advance_caret(499.0));
+        assert!(t.advance_caret(1.0));
+        assert!(!t.caret_visible);
+        t.set_selection(2, 2);
+        assert!(t.caret_visible);
+        t.set_selection(0, 2);
+        assert!(!t.advance_caret(600.0));
+        assert!(t.layout.is_some());
+    }
 
     #[test]
     fn html_subset() {
@@ -1116,5 +1236,36 @@ mod tests {
         // Each char 5 px wide without fonts: "aaaa " is 25 px; a 60 px line fits two words.
         let l = layout(&t, &NoFonts);
         assert_eq!(l.lines.len(), 2);
+    }
+
+    #[test]
+    fn character_positions_preserve_spaces_wraps_and_empty_paragraphs() {
+        let mut t = TextField::new(
+            Arc::new(EditText {
+                height: 200,
+                multiline: true,
+                word_wrap: true,
+                ..Default::default()
+            }),
+            None,
+        );
+        t.bounds = (7.0, 9.0, 24.0, 100.0);
+        t.default_format.align = TextAlign::Center;
+        t.set_text("aa bb\r\r");
+        let l = t.layout(&NoFonts);
+        assert_eq!(
+            l.lines.iter().map(|l| (l.start, l.end)).collect::<Vec<_>>(),
+            [(0, 3), (3, 5), (6, 6), (7, 7)]
+        );
+        assert_eq!(
+            l.lines[0]
+                .characters
+                .iter()
+                .map(|c| c.index)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(l.caret_position(3), Some((1, 7.0)));
+        assert_eq!(l.caret_position(7).unwrap().0, 3);
     }
 }

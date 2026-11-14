@@ -84,7 +84,10 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
    Focused fields track a selection anchor and caret. Ctrl+A and `Selection.setSelection`
    replace/delete the selected range; Shift navigation extends it. Selection getters and
    setters translate script UTF-16 indices to the text storage's character boundaries.
-   Selection highlighting, mouse caret placement and caret drawing remain separate work.
+   Layout retains character advances, including spaces, for selection highlighting and the
+   insertion caret. Focused ranges draw white text over black highlights; an input caret
+   blinks at 500 ms intervals, resets on edits/navigation, and disappears on focus loss.
+   Blink boundaries invalidate the picture without discarding the cached text layout.
 5. **`render`**: wgpu. Shapes are tessellated once per character (lyon) into cached vertex
    buffers; bitmaps (atlas DDS pages) uploaded once; scale9 drawn natively. Colour transform
    and blend mode per draw; multiply and the few other modes against the scene picture,
