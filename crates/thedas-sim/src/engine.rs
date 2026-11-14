@@ -4034,17 +4034,31 @@ pub fn call(
         }
         "CountItemsByTag" => {
             let tag = string(a, 1);
+            let origins = h.sim.game == thedas_vfs::Game::Origins;
+            // Origins 0x666210 -> 0x7615f0: exact tag match, adding stack counts only
+            // for stackable items excluding default ammunition (0x753c60). DA2 is untraced.
             let n = h
                 .object(obj(a, 0))
                 .map(|o| o.inventory.clone())
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|i| {
-                    h.object(*i)
-                        .is_some_and(|x| x.tag.eq_ignore_ascii_case(&tag))
+                .filter_map(|i| {
+                    let x = h.object(i)?;
+                    if !origins {
+                        return x.tag.eq_ignore_ascii_case(&tag).then_some(1_i32);
+                    }
+                    (x.kind == ObjectKind::Item && x.tag == tag).then(|| {
+                        if h.sim.max_stack(i) > 1
+                            && x.fields.get("DefaultAmmo").copied().unwrap_or(0) == 0
+                        {
+                            h.sim.stack_count(i)
+                        } else {
+                            1
+                        }
+                    })
                 })
-                .count();
-            ok(Value::Int(n as i32))
+                .fold(0_i32, i32::wrapping_add);
+            ok(Value::Int(n))
         }
         // DAOrigins.exe's SetCanLevelUp (0x662ea0 -> 0x6aca10) ignores its value: whether a
         // creature can level up is whether it has points to spend (attribute, skill and
@@ -4491,15 +4505,27 @@ pub fn call(
         }),
         "GetItemEquipSlot" => {
             let item = obj(a, 0);
-            let slot = h.sim.world.objects.values().find_map(|o| {
-                o.equipment
-                    .iter()
-                    .find(|(_, i)| **i == item)
-                    .map(|(s, _)| *s)
-            });
-            ok(Value::Int(slot.unwrap_or_else(|| {
-                constant(&h.sim.table, "INVENTORY_SLOT_INVALID")
-            })))
+            let origins = h.sim.game == thedas_vfs::Game::Origins;
+            let invalid = constant(&h.sim.table, "INVENTORY_SLOT_INVALID");
+            if origins && !h.object(item).is_some_and(|i| i.kind == ObjectKind::Item) {
+                return ok(Value::Int(invalid));
+            }
+            // Origins 0x665410 -> 0x797c80: an item's creature owner searches the
+            // active slots, then every weapon set. The returned slot omits the set id.
+            let slot = h
+                .sim
+                .world
+                .objects
+                .values()
+                .filter(|o| !origins || o.kind == ObjectKind::Creature)
+                .find_map(|o| {
+                    o.equipment
+                        .iter()
+                        .chain(o.other_set.iter().filter(|_| origins))
+                        .find(|(_, i)| **i == item)
+                        .map(|(s, _)| *s)
+                });
+            ok(Value::Int(slot.unwrap_or(invalid)))
         }
         "GetWeaponStyle" => ok(Value::Int(h.sim.weapon_style(obj(a, 0)))),
         // Followers fight on their own; the member the player controls is the player's.
@@ -5136,6 +5162,8 @@ mod tests {
         int GetPlotActionState(int a) = 20;\n\
         int EquipItem(object o, object i, int s = 255, int w = -1) = 21;\n\
         object GetItemInEquipSlot(int s, object o, int w = -1) = 22;\n\
+        int CountItemsByTag(object o, string s) = 380;\n\
+        int GetItemEquipSlot(object o) = 358;\n\
         int INVENTORY_SLOT_INVALID = 255;\n\
         object[] GetPartyPoolList() = 23;\n\
         void SetPlaceableActionResult(object o, int a, int s, int v = FALSE) = 24;\n\
@@ -6355,14 +6383,74 @@ mod tests {
         // The bow went to the second set; the dagger is in hand.
         assert_eq!(main(&mut s, -1), Some(o(dagger)));
         assert_eq!(main(&mut s, 1), Some(o(bow)));
+        let slot = |s: &mut Sim, item| run(s, c, "GetItemEquipSlot", &[o(item)]);
+        assert_eq!(slot(&mut s, dagger), Some(Value::Int(0)));
+        assert_eq!(slot(&mut s, bow), Some(Value::Int(0)));
+        assert_eq!(slot(&mut s, armour), Some(Value::Int(4)));
         run(&mut s, c, "SwitchWeaponSet", &[o(c), Value::Int(1)]);
         assert_eq!(main(&mut s, -1), Some(o(bow)));
         assert_eq!(main(&mut s, 0), Some(o(dagger)));
+        assert_eq!(slot(&mut s, dagger), Some(Value::Int(0)));
+        assert_eq!(slot(&mut s, bow), Some(Value::Int(0)));
+        assert!(s.unequip(c, dagger));
+        assert_eq!(slot(&mut s, dagger), Some(Value::Int(255)));
+        assert_eq!(slot(&mut s, OBJECT_INVALID), Some(Value::Int(255)));
+        assert_eq!(slot(&mut s, c), Some(Value::Int(255)));
+        // Preserve DA2's previous active-set-only lookup pending a DA2 trace.
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.world.get_mut(c).unwrap().other_set.insert(0, dagger);
+        assert_eq!(slot(&mut s, dagger), Some(Value::Int(255)));
         assert_eq!(
             s.world.get(c).unwrap().equipment.get(&4),
             Some(&armour),
             "armour stays"
         );
+    }
+
+    #[test]
+    fn tag_counts_use_stacks_but_not_default_ammunition() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.tables().insert(
+            "bitm_base",
+            &["#39974122"],
+            vec![(25, vec![Cell::Int(99)]), (2, vec![Cell::Int(1)])],
+        );
+        let owner = s.world.spawn(ObjectKind::Creature, "owner");
+        let elsewhere = s.world.spawn(ObjectKind::Placeable, "chest");
+        for (holder, tag, base, size, ammo) in [
+            (owner, "poultice", 25, 4, 0),
+            (owner, "poultice", 25, 2, 0),
+            (owner, "poultice", 2, 99, 0),
+            (owner, "poultice", 25, 20, 1),
+            (owner, "Poultice", 25, 3, 0),
+            (elsewhere, "poultice", 25, 7, 0),
+        ] {
+            let item = s.world.spawn(ObjectKind::Item, tag);
+            let f = &mut s.world.get_mut(item).unwrap().fields;
+            f.insert("BaseItem".into(), base);
+            f.insert("StackSize".into(), size);
+            f.insert("DefaultAmmo".into(), ammo);
+            s.world.get_mut(holder).unwrap().inventory.push(item);
+        }
+        let count = |s: &mut Sim, holder, tag: &str| {
+            run(
+                s,
+                owner,
+                "CountItemsByTag",
+                &[Value::Object(holder), Value::String(tag.into())],
+            )
+        };
+        assert_eq!(count(&mut s, owner, "poultice"), Some(Value::Int(8)));
+        assert_eq!(count(&mut s, owner, "Poultice"), Some(Value::Int(3)));
+        assert_eq!(count(&mut s, elsewhere, "poultice"), Some(Value::Int(7)));
+        assert_eq!(
+            count(&mut s, OBJECT_INVALID, "poultice"),
+            Some(Value::Int(0))
+        );
+        assert_eq!(count(&mut s, owner, "missing"), Some(Value::Int(0)));
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(count(&mut s, owner, "poultice"), Some(Value::Int(5)));
     }
 
     #[test]
