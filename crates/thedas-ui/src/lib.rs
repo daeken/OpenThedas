@@ -24,6 +24,7 @@ pub mod stage;
 
 pub use thedas_formats::gfx;
 pub mod navigator;
+pub mod own;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -244,7 +245,7 @@ struct Shared {
 /// own observers with (`_OBSERVER_ID` constants and counters). Provisional.
 const CALLED_OBSERVER_IDS: u64 = 1_000_000;
 
-struct Bridge {
+pub(crate) struct Bridge {
     movie: String,
     shared: Arc<Shared>,
     responder: Option<Responder>,
@@ -263,8 +264,10 @@ impl Bridge {
     }
 }
 
-impl FsCommandProvider for Bridge {
-    fn on_fs_command(&self, command: &str, args: &str) -> bool {
+impl Bridge {
+    /// An `fscommand` from the movie: queued for the engine, its answer kept for the
+    /// wrapped getters.
+    pub(crate) fn fs_command(&self, command: &str, args: &str) {
         let r = self.push(UiCall {
             movie: self.movie.clone(),
             kind: CallKind::FsCommand,
@@ -274,20 +277,17 @@ impl FsCommandProvider for Bridge {
         if let Ok(mut v) = self.shared.retval.lock() {
             *v = r;
         }
-        true
     }
-}
 
-impl ExternalInterfaceProvider for Bridge {
-    fn call_method(&self, _: &mut UpdateContext<'_>, name: &str, args: &[RValue]) -> RValue {
+    /// An `ExternalInterface.call` from the movie.
+    pub(crate) fn external_call(&self, name: &str, args: Vec<UiValue>) -> UiValue {
         // `TokenManager.AddTokenObserverFunc(label, token, callback)` asks the game for the
         // observer's id (`AddTokenObserver(label, "", token)`) and files the callback under
         // it: the observer is the game's to feed from then on, as for
         // `AddTokenObserverWithID` (optionsmenu.gfx's checkboxes and sliders).
         if name == "AddTokenObserver" {
-            let token: UiValue = args.get(2).map(Into::into).unwrap_or(UiValue::Undefined);
-            let UiValue::String(token) = token else {
-                return RValue::Undefined;
+            let UiValue::String(token) = args.get(2).cloned().unwrap_or(UiValue::Undefined) else {
+                return UiValue::Undefined;
             };
             let id = CALLED_OBSERVER_IDS
                 + self
@@ -297,23 +297,35 @@ impl ExternalInterfaceProvider for Bridge {
             if let Ok(mut o) = self.shared.called_observers.lock() {
                 o.push((id.to_string(), token));
             }
-            return RValue::Number(id as f64);
+            return UiValue::Number(id as f64);
         }
         if name == avm1::RETVAL_CALL {
-            let v = self
+            return self
                 .shared
                 .retval
                 .lock()
                 .map(|mut v| std::mem::replace(&mut *v, UiValue::Undefined))
                 .unwrap_or(UiValue::Undefined);
-            return (&v).into();
         }
-        let r = self.push(UiCall {
+        self.push(UiCall {
             movie: self.movie.clone(),
             kind: CallKind::ExternalInterface,
             name: name.to_string(),
-            args: args.iter().map(Into::into).collect(),
-        });
+            args,
+        })
+    }
+}
+
+impl FsCommandProvider for Bridge {
+    fn on_fs_command(&self, command: &str, args: &str) -> bool {
+        self.fs_command(command, args);
+        true
+    }
+}
+
+impl ExternalInterfaceProvider for Bridge {
+    fn call_method(&self, _: &mut UpdateContext<'_>, name: &str, args: &[RValue]) -> RValue {
+        let r = self.external_call(name, args.iter().map(Into::into).collect());
         (&r).into()
     }
 
@@ -501,11 +513,19 @@ pub fn parse_focus_list(list: &str, scale: f64, offset: (f64, f64)) -> Vec<Focus
         .collect()
 }
 
+/// The player a movie runs on.
+enum Backend {
+    Ruffle {
+        player: Arc<Mutex<Player>>,
+        executor: NullExecutor,
+    },
+    Own(Box<own::OwnMovie>),
+}
+
 /// One Scaleform movie playing into an offscreen texture.
 pub struct UiMovie {
     pub name: String,
-    player: Arc<Mutex<Player>>,
-    executor: NullExecutor,
+    backend: Backend,
     shared: Arc<Shared>,
     fetches: navigator::FetchLog,
     size: (u32, u32),
@@ -728,8 +748,7 @@ impl UiMovie {
         }
         Ok(Self {
             name: name.to_string(),
-            player,
-            executor,
+            backend: Backend::Ruffle { player, executor },
             shared,
             fetches,
             size,
@@ -761,6 +780,10 @@ impl UiMovie {
         let size = (w.clamp(1, 8192), h.clamp(1, 8192));
         self.size = size;
         let scale_factor = stage_scale(size, self.authored);
+        if let Some(o) = self.own() {
+            o.resize(size);
+            return;
+        }
         self.with_player(|p| {
             p.set_viewport_dimensions(ruffle_core::ViewportDimensions {
                 width: size.0,
@@ -771,7 +794,84 @@ impl UiMovie {
     }
 
     fn with_player<R>(&self, f: impl FnOnce(&mut Player) -> R) -> Option<R> {
-        self.player.lock().ok().map(|mut p| f(&mut p))
+        match &self.backend {
+            Backend::Ruffle { player, .. } => player.lock().ok().map(|mut p| f(&mut p)),
+            Backend::Own(_) => None,
+        }
+    }
+
+    fn run_executor(&mut self) {
+        if let Backend::Ruffle { executor, .. } = &mut self.backend {
+            executor.run();
+        }
+    }
+
+    fn own(&mut self) -> Option<&mut own::OwnMovie> {
+        match &mut self.backend {
+            Backend::Own(o) => Some(o),
+            Backend::Ruffle { .. } => None,
+        }
+    }
+
+    /// Whether the movie plays on our own player (see [`own`]).
+    pub fn is_own(&self) -> bool {
+        matches!(self.backend, Backend::Own(_))
+    }
+
+    /// Starts a movie on our own player from its GFx file as the game ships it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_own(
+        gpu: &Gpu,
+        name: &str,
+        gfx: &[u8],
+        size: (u32, u32),
+        lookup: ResourceLookup,
+        atlas: Arc<Mutex<atlas::ImageSource>>,
+        responder: Option<Responder>,
+    ) -> Result<Self, UiError> {
+        let shared = Arc::new(Shared::default());
+        let bridge = Bridge {
+            movie: name.to_string(),
+            shared: shared.clone(),
+            responder,
+        };
+        let m = own::OwnMovie::new(
+            gpu,
+            name,
+            gfx,
+            size,
+            lookup,
+            atlas,
+            bridge,
+            avm1::register_invoke(),
+        )?;
+        let authored = {
+            let (w, h) = m.player.vm.movie.stage_size();
+            (w as f64, h as f64)
+        };
+        Ok(Self {
+            name: name.to_string(),
+            backend: Backend::Own(Box::new(m)),
+            shared,
+            fetches: navigator::FetchLog::default(),
+            size,
+            authored,
+            observers: Default::default(),
+            sent: Default::default(),
+            fresh: Vec::new(),
+            scale9: BTreeMap::new(),
+            scale9_laid: Vec::new(),
+            slots: BTreeMap::new(),
+            engine_images: BTreeMap::new(),
+            slots_loaded: Vec::new(),
+            inline_images: Default::default(),
+            multiply_pass: None,
+            multiply_texture: None,
+            above_texture: None,
+            own_texture: None,
+            mouse_in: false,
+            mouse_stirred: false,
+        })
     }
 
     /// The movie's scaling-grid sprites, from its rewrite (`RewriteReport::scale9`).
@@ -1005,26 +1105,32 @@ impl UiMovie {
 
     /// Advances the movie by `dt_ms` of wall time and runs pending loads.
     pub fn tick(&mut self, dt_ms: f64) {
-        self.executor.run();
+        self.run_executor();
+        if let Some(o) = self.own() {
+            o.tick(dt_ms);
+        }
         let pick = self.picks();
         self.with_player(|p| {
             p.set_mouse_in_stage(pick);
             p.tick(FloatDuration::from_millis(dt_ms));
         });
         self.after_step();
-        self.executor.run();
+        self.run_executor();
     }
 
     /// Runs exactly one movie frame, independent of time.
     pub fn run_frame(&mut self) {
-        self.executor.run();
+        self.run_executor();
+        if let Some(o) = self.own() {
+            o.run_frame();
+        }
         let pick = self.picks();
         self.with_player(|p| {
             p.set_mouse_in_stage(pick);
             p.run_frame();
         });
         self.after_step();
-        self.executor.run();
+        self.run_executor();
     }
 
     /// Whether the player should look for what the mouse is over as it runs frames: it
@@ -1043,6 +1149,10 @@ impl UiMovie {
 
     /// Renders the current frame into the texture.
     pub fn render(&mut self) {
+        if let Some(o) = self.own() {
+            o.render();
+            return;
+        }
         self.with_player(|p| p.render());
     }
 
@@ -1155,8 +1265,12 @@ impl UiMovie {
     /// A copy of the frame just rendered, kept in one of the movie's pass textures: the
     /// movie renders the next pass into the same target.
     fn copy_rendered(&mut self, which: PassCopy) -> Option<wgpu::Texture> {
-        let (texture, device, queue) = self
-            .with_player(|p| {
+        let own = self.own().and_then(|o| {
+            let (d, q) = o.device();
+            o.texture().map(|t| (t, d, q))
+        });
+        let (texture, device, queue) = own.or_else(|| {
+            self.with_player(|p| {
                 let r: &mut dyn std::any::Any = p.renderer_mut();
                 r.downcast_mut::<WgpuRenderBackend<TextureTarget>>()
                     .map(|b| {
@@ -1167,7 +1281,8 @@ impl UiMovie {
                         )
                     })
             })
-            .flatten()?;
+            .flatten()
+        })?;
         let slot = match which {
             PassCopy::Multiply => &mut self.multiply_texture,
             PassCopy::Above => &mut self.above_texture,
@@ -1220,6 +1335,9 @@ impl UiMovie {
 
     /// The texture the movie renders into (RGBA8, premultiplied alpha).
     pub fn texture(&self) -> Option<wgpu::Texture> {
+        if let Backend::Own(o) = &self.backend {
+            return o.texture();
+        }
         self.with_player(|p| {
             let r: &mut dyn std::any::Any = p.renderer_mut();
             r.downcast_mut::<WgpuRenderBackend<TextureTarget>>()
@@ -1230,6 +1348,9 @@ impl UiMovie {
 
     /// Reads the last rendered frame back to the CPU (RGBA8, premultiplied alpha).
     pub fn capture(&mut self) -> Option<Rgba> {
+        if let Some(o) = self.own() {
+            return o.capture();
+        }
         self.with_player(|p| {
             let r: &mut dyn std::any::Any = p.renderer_mut();
             r.downcast_mut::<WgpuRenderBackend<TextureTarget>>()
@@ -1254,6 +1375,10 @@ impl UiMovie {
     }
 
     pub fn mouse_move(&mut self, x: f64, y: f64) {
+        if let Some(o) = self.own() {
+            o.mouse_move(x, y);
+            return;
+        }
         self.with_player(|p| {
             // In the window: the player looks for what the mouse is over (see
             // `UiMovie::picks`).
@@ -1279,6 +1404,10 @@ impl UiMovie {
     pub fn mouse_wheel(&mut self, x: f64, y: f64, lines: f64) {
         self.mouse_in = true;
         self.mouse_stirred = true;
+        if let Some(o) = self.own() {
+            o.mouse_wheel(x, y, lines);
+            return;
+        }
         self.with_player(|p| {
             p.set_mouse_in_stage(true);
             p.handle_event(PlayerEvent::MouseMove { x, y });
@@ -1291,6 +1420,10 @@ impl UiMovie {
     /// A key pressed and released: the movie's key listeners hear it (`Key.getCode`), and a
     /// focused text field takes the character or the edit.
     pub fn key(&mut self, key: UiKey) {
+        if let Some(o) = self.own() {
+            o.key(key);
+            return;
+        }
         let (physical, logical) = key.descriptor();
         let descriptor = || KeyDescriptor {
             physical_key: physical,
@@ -1317,6 +1450,19 @@ impl UiMovie {
         let button = MouseButton::Left;
         self.mouse_in = true;
         self.mouse_stirred = true;
+        if self.is_own() {
+            if !down {
+                self.set(avm1::HIDE_LATER, UiValue::List(Vec::new()));
+            }
+            if let Some(o) = self.own() {
+                o.mouse_button(x, y, down);
+            }
+            if !down {
+                self.call(avm1::HIDE_FLUSH, &[]);
+            }
+            self.after_step();
+            return;
+        }
         if down {
             let ev = PlayerEvent::MouseDown {
                 x,
@@ -1506,6 +1652,9 @@ impl UiMovie {
 
     /// Calls a function the movie registered with `ExternalInterface.addCallback`.
     pub fn invoke(&mut self, name: &str, args: &[UiValue]) -> UiValue {
+        if let Some(o) = self.own() {
+            return o.invoke(name, args);
+        }
         self.with_player(|p| {
             let r = p.call_internal_interface(name, args.iter().map(Into::into));
             UiValue::from(&r)
@@ -1524,6 +1673,9 @@ impl UiMovie {
 
     /// Names the movie registered with `ExternalInterface.addCallback`.
     pub fn callbacks(&self) -> Vec<String> {
+        if let Backend::Own(o) = &self.backend {
+            return o.callbacks();
+        }
         self.shared
             .callbacks
             .lock()
@@ -1532,7 +1684,10 @@ impl UiMovie {
     }
 
     /// AVM traces and warnings since the last drain.
-    pub fn drain_log(&self) -> Vec<String> {
+    pub fn drain_log(&mut self) -> Vec<String> {
+        if let Some(o) = self.own() {
+            return o.drain_log();
+        }
         self.shared
             .log
             .lock()
