@@ -1905,8 +1905,11 @@ mod tests {
         assert!((c.floats[20][0] - even).abs() < 1e-4);
         assert!(c.floats[21..27].iter().flatten().all(|v| *v == 0.0));
         assert_eq!(c.floats[30], [0.0, 1.0, 1.0, 1.0]);
-        // Shadows are not drawn for these: every point lit, whatever the pass holds.
-        assert_eq!(c.floats[31..34], NO_SHADOW_DATA[..3]);
+        // The first partition's shadow data, its depth nudged by the receiver bias.
+        assert_eq!(
+            c.floats[31..34],
+            [[7.0; 4], [7.0; 4], [7.0, 7.0, 7.0, 7.0 - DA2_SHADOW_BIAS]]
+        );
 
         // A sun straight down lights an upward normal fully and a downward one not at all:
         // the coefficients' sum at the normal (as the shaders evaluate them) is the
