@@ -1067,7 +1067,7 @@ pub fn goto(vm: &mut Vm, d: DisplayId, frame: u16, play: bool) {
                     vm.display.get(e).is_some_and(|o| match &o.kind {
                         Kind::Clip(c) => Some(c.character) == p.character,
                         Kind::Shape(_, c) | Kind::Morph(_, c) => Some(*c) == p.character,
-                        Kind::Text(_) => true,
+                        Kind::Text(t) => p.character.and_then(|id| vm.movie.characters.get(&id)).is_some_and(|c| matches!(c, Character::EditText(def) if Arc::ptr_eq(&t.def, def))),
                         _ => false,
                     })
                 });
@@ -1330,6 +1330,23 @@ pub fn load_into(vm: &mut Vm, d: DisplayId, url: &str) -> bool {
         c.loaded_image = Some(url.to_string());
     }
     true
+}
+
+pub fn attach_bitmap(
+    vm: &mut Vm,
+    parent: DisplayId,
+    depth: i32,
+    url: String,
+    width: u16,
+    height: u16,
+) {
+    replace_at(vm, parent, depth);
+    let bitmap = vm.display.add(Object::new(Kind::Bitmap {
+        url,
+        width: width as f32,
+        height: height as f32,
+    }));
+    insert_child(vm, parent, bitmap, depth);
 }
 
 pub fn unload(vm: &mut Vm, d: DisplayId) {
@@ -1949,5 +1966,117 @@ mod queue_tests {
             },
         );
         assert!(p.vm.display.child_named(root, "instance3").is_some());
+    }
+
+    #[test]
+    fn exported_bitmaps_attach_with_intrinsic_size_and_replace_their_depth() {
+        let bytes = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p = Player::new(bytes, "bitmaps", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        let mut movie = Movie::default();
+        movie.characters.insert(
+            1,
+            Character::Image(crate::swf::ExternalImage {
+                format: 0,
+                width: 32,
+                height: 24,
+                export_name: "test_coin".into(),
+                file: "test-coin.dds".into(),
+            }),
+        );
+        movie.exports.insert("test_coin".into(), 1);
+        p.vm.movie = Arc::new(movie);
+        let global = Value::Object(p.vm.global);
+        let flash = p.vm.get(&global, "flash");
+        let display = p.vm.get(&flash, "display");
+        let class = p.vm.get(&display, "BitmapData");
+        let bitmap =
+            p.vm.call_method(&class, "loadBitmap", &[Value::from("test_coin")]);
+        assert_eq!(p.vm.get(&bitmap, "width"), Value::Number(32.0));
+        p.vm.set(&bitmap, "width", Value::Number(1.0));
+        assert_eq!(p.vm.get(&bitmap, "width"), Value::Number(32.0));
+        assert_eq!(
+            p.vm.call_method(&class, "loadBitmap", &[Value::from("missing")]),
+            Value::Null
+        );
+        let root = p.vm.root;
+        let target = p.vm.display_object(root);
+        p.vm.call_method(
+            &target,
+            "attachBitmap",
+            &[bitmap.clone(), Value::Number(1.0)],
+        );
+        let old = p.vm.display.get(root).unwrap().children[&1];
+        let bounds = display_api::local_bounds(&p.vm, root).unwrap();
+        assert_eq!((bounds.width(), bounds.height()), (640, 480));
+        assert!(
+            matches!(&p.vm.display.get(old).unwrap().kind, Kind::Bitmap {url, ..} if url == "test-coin.dds")
+        );
+        p.vm.call_method(&target, "attachBitmap", &[Value::Null, Value::Number(1.0)]);
+        assert!(p.vm.display.get(old).is_some());
+        p.vm.call_method(&target, "attachBitmap", &[bitmap, Value::Number(1.0)]);
+        assert!(p.vm.display.get(old).is_none());
+        assert_eq!(p.vm.display.get(root).unwrap().children.len(), 1);
+    }
+
+    #[test]
+    fn goto_replaces_a_different_text_character_at_the_same_depth() {
+        let bytes = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p =
+            Player::new(bytes, "text-state", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        let mut movie = Movie::default();
+        for (id, r, g) in [(1, 200, 180), (2, 153, 0)] {
+            movie.characters.insert(
+                id,
+                Character::EditText(Arc::new(crate::swf::EditText {
+                    color: Some(crate::swf::Color { r, g, b: 0, a: 255 }),
+                    initial: Some("price".into()),
+                    ..Default::default()
+                })),
+            );
+        }
+        let placement = |id| {
+            Command::Place(Box::new(Place {
+                depth: 1,
+                character: Some(id),
+                name: Some("TextField".into()),
+                ..Default::default()
+            }))
+        };
+        let timeline = Arc::new(crate::swf::Timeline {
+            frames: vec![
+                crate::swf::Frame {
+                    commands: vec![placement(1)],
+                    ..Default::default()
+                },
+                crate::swf::Frame {
+                    commands: vec![Command::Remove { depth: 1 }, placement(2)],
+                    ..Default::default()
+                },
+            ],
+            labels: vec![],
+        });
+        p.vm.movie = Arc::new(movie);
+        let root = p.vm.root;
+        p.vm.display
+            .get_mut(root)
+            .unwrap()
+            .clip_mut()
+            .unwrap()
+            .timeline = timeline;
+        enter_frame_of(&mut p.vm, root, 0);
+        let old = p.vm.display.child_named(root, "TextField").unwrap();
+        goto(&mut p.vm, root, 1, false);
+        let red = p.vm.display.child_named(root, "TextField").unwrap();
+        assert_ne!(old, red);
+        assert_eq!(
+            display_api::display_get(&mut p.vm, red, "textColor"),
+            Some(Value::Number(0x990000 as f64))
+        );
+        goto(&mut p.vm, root, 0, false);
+        let gold = p.vm.display.child_named(root, "TextField").unwrap();
+        assert_eq!(
+            display_api::display_get(&mut p.vm, gold, "textColor"),
+            Some(Value::Number(0xc8b400 as f64))
+        );
     }
 }

@@ -728,6 +728,42 @@ fn mc_unload_movie(vm: &mut Vm, this: Value, _: &[Value]) -> Value {
     Value::Undefined
 }
 
+fn bitmap_load(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
+    let name = vm.to_str(&arg(args, 0));
+    let image = vm.movie.exports.get(&name.to_ascii_lowercase())
+        .and_then(|id| vm.movie.characters.get(id))
+        .or_else(|| vm.movie.characters.values().find(|c| matches!(c, crate::swf::Character::Image(i) if i.export_name.eq_ignore_ascii_case(&name))));
+    let Some(crate::swf::Character::Image(image)) = image else {
+        return Value::Null;
+    };
+    let (url, width, height) = (image.file.clone(), image.width, image.height);
+    let proto = vm.get(&this, "prototype").as_object();
+    let object = vm.alloc(proto, OKind::BitmapData { url, width, height });
+    for (key, size) in [("width", width), ("height", height)] {
+        vm.define(
+            object,
+            key,
+            Value::Number(size as f64),
+            DONT_ENUM | super::object::READ_ONLY | super::object::DONT_DELETE,
+        );
+    }
+    Value::Object(object)
+}
+
+fn mc_attach_bitmap(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
+    let bitmap = arg(args, 0)
+        .as_object()
+        .and_then(|id| vm.heap.get(id))
+        .map(|o| o.kind.clone());
+    if let (Some(parent), Some(OKind::BitmapData { url, width, height })) =
+        (vm.display_of(&this), bitmap)
+    {
+        let depth = super::value::to_int32(vm.to_number(&arg(args, 1)));
+        crate::player::attach_bitmap(vm, parent, depth, url, width, height);
+    }
+    Value::Undefined
+}
+
 fn drawing<'a>(vm: &'a mut Vm, this: &Value) -> Option<&'a mut crate::display::Drawing> {
     let d = vm.display_of(this)?;
     vm.dirty = true;
@@ -1358,6 +1394,7 @@ pub fn install(vm: &mut Vm) {
         }),
         ("loadMovie", mc_load_movie),
         ("unloadMovie", mc_unload_movie),
+        ("attachBitmap", mc_attach_bitmap),
         ("beginFill", mc_begin_fill),
         ("endFill", mc_end_fill),
         ("moveTo", mc_move_to),
@@ -1499,6 +1536,11 @@ pub fn install(vm: &mut Vm) {
     // The `flash` package.
     let flash = vm.new_object();
     vm.define(g, "flash", Value::Object(flash), DONT_ENUM);
+    let display = vm.new_object();
+    vm.define(flash, "display", Value::Object(display), 0);
+    let bitmap_proto = vm.new_object();
+    let bitmap_class = class(vm, display, "BitmapData", |_, this, _| this, bitmap_proto);
+    vm.define_native(bitmap_class, "loadBitmap", bitmap_load);
     let external = vm.new_object();
     vm.define(flash, "external", Value::Object(external), 0);
     let ei = vm.new_object();

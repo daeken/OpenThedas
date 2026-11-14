@@ -113,6 +113,10 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
   back into view; cropped/padded filter targets and pooling remain optimizations.
 - Layer blend groups render to isolated targets. Alpha/erase modify that layer's picture;
   outside a layer they draw nothing, matching Flash and avoiding the map's black border.
+- Export-backed `BitmapData.loadBitmap` and `MovieClip.attachBitmap` let the shared host
+  inline-image helper place copper/silver/gold icons in inventory and store prices. Timeline
+  jumps distinguish text characters, so the unaffordable-price state can replace gold text
+  with its authored red definition. Native text-layout `<img>` rendering remains separate.
 - Not yet: text `shadowStyle`, overlay / hard light /
   difference / invert blends (drawn normal), `setMask`, inline `<img>` in text,
   and complete parity on engine-state screens (book screens, popups, conversation).
