@@ -1459,6 +1459,24 @@ impl Sim {
         ability: i32,
         cmd: &crate::world::Command,
     ) {
+        let ev = self.make_ability_event(name, id, target, ability, cmd);
+        let t = self.world.time_ms;
+        self.world.trace.push(crate::trace::TraceEntry::Log {
+            t,
+            channel: -4,
+            text: format!("{name} {id} -> {target}: ability {ability}"),
+        });
+        self.run_script(ABILITY_SCRIPT, id, Some(ev));
+    }
+
+    fn make_ability_event(
+        &mut self,
+        name: &str,
+        id: ObjectId,
+        target: ObjectId,
+        ability: i32,
+        cmd: &crate::world::Command,
+    ) -> crate::world::Event {
         let item = self.ability_item(id, cmd);
         let mut ev = self.new_event(name, Some(id));
         ev.objects = vec![id, item, target];
@@ -1470,13 +1488,7 @@ impl Sim {
         if let Some(l) = cmd.location {
             ev.locations = vec![l];
         }
-        let t = self.world.time_ms;
-        self.world.trace.push(crate::trace::TraceEntry::Log {
-            t,
-            channel: -4,
-            text: format!("{name} {id} -> {target}: ability {ability}"),
-        });
-        self.run_script(ABILITY_SCRIPT, id, Some(ev));
+        ev
     }
 
     /// Native modern executor 0x6d7ec0: START (0x6d80f4) has the pending
@@ -1524,7 +1536,7 @@ impl Sim {
     /// that fires a projectile (`projectile` in `ABI_base`) first announces the launch
     /// (`ABILITY_PROJECTILE_LAUNCHED`, on which `ability_core` starts the cooldown of a
     /// projectile spell; objects caster, target, item, as `ability_core` reads them).
-    /// Provisional: the projectile's flight is not simulated, it lands at once.
+    /// DA2's non-ballistic shots retain the impact payload until arrival.
     pub(crate) fn finish_ability(&mut self, id: ObjectId, cmd: &crate::world::Command) {
         if !self.alive(id) {
             return;
@@ -1541,6 +1553,7 @@ impl Sim {
             })
             .unwrap_or(0);
         if projectile > 0 {
+            let impact = self.make_ability_event("ABILITY_CAST_IMPACT", id, target, ability, cmd);
             let item = self.ability_item(id, cmd);
             let mut ev = self.new_event("ABILITY_PROJECTILE_LAUNCHED", Some(id));
             ev.objects = vec![id, target, item];
@@ -1548,6 +1561,28 @@ impl Sim {
             ev.strings = cmd.strings.clone();
             self.run_script(ABILITY_SCRIPT, id, Some(ev));
             if !self.alive(id) {
+                return;
+            }
+            let from = self.world.get(id).map(|o| o.position).unwrap_or([0.; 3]);
+            let point = self
+                .world
+                .get(target)
+                .map(|o| o.position)
+                .or_else(|| cmd.location.map(|l| l.position))
+                .unwrap_or(from);
+            if let Some(shot) = self.launch_da2_projectile(
+                projectile as i32,
+                id,
+                from,
+                (target != OBJECT_INVALID).then_some(target),
+                point,
+            ) {
+                self.world.da2_projectiles.get_mut(&shot).unwrap().impact =
+                    Some(crate::world::QueuedEvent {
+                        target: id,
+                        event: impact,
+                        script: Some(ABILITY_SCRIPT.into()),
+                    });
                 return;
             }
         }
@@ -2370,6 +2405,61 @@ mod tests {
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         Sim::new(Arc::new(Vfs::new()), table, 3)
+    }
+
+    #[test]
+    fn da2_flying_ability_keeps_the_released_context_after_the_next_command() {
+        let mut s = sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let tables = crate::m2da::Tables::empty();
+        tables.insert("#1", &["projectile"], vec![(123, vec![Cell::Int(17)])]);
+        tables.insert(
+            "#4",
+            &[
+                "#a2166177",
+                "#883650aa",
+                "#fd480c46",
+                "#db26d384",
+                "#fd919690",
+            ],
+            vec![(
+                17,
+                vec![
+                    Cell::Int(0),
+                    Cell::Int(50),
+                    Cell::Int(10),
+                    Cell::Int(15),
+                    Cell::Int(100),
+                ],
+            )],
+        );
+        s.world.tables = Arc::new(tables);
+        let caster = s.world.spawn(ObjectKind::Creature, "caster");
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        s.world.get_mut(target).unwrap().position = [20., 0., 0.];
+        s.world.get_mut(caster).unwrap().combat.ability_cast = Some(AbilityCast {
+            ability: 123,
+            target,
+            item: 42,
+            point: [20., 0., 0.],
+            result: 3,
+            projectile_target: 2,
+        });
+        s.order_ability(caster, 123, target, "");
+        let cmd = s.world.get(caster).unwrap().commands[0].clone();
+        s.finish_ability(caster, &cmd);
+        assert_eq!(s.world.da2_projectiles.len(), 1);
+        assert!(s.world.pop_due(u64::MAX).is_none());
+        // Finishing/chaining commands must not rewrite a released shot's payload.
+        s.world.get_mut(caster).unwrap().combat.ability_cast = None;
+        s.world.time_ms += 500;
+        s.advance_da2_projectiles();
+        let (_, hit) = s.world.pop_due(u64::MAX).unwrap();
+        assert_eq!(hit.script.as_deref(), Some(ABILITY_SCRIPT));
+        assert_eq!(hit.event.objects, [caster, 42, target]);
+        assert_eq!(hit.event.ints, [123, 3]);
+        assert_eq!(hit.event.vectors, [[20., 0., 0.]]);
+        assert!(s.world.pop_due(u64::MAX).is_none());
     }
 
     #[test]

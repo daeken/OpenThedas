@@ -47,6 +47,9 @@ pub struct Node {
     /// conversation, 2 once per game. Provisional.
     #[serde(default)]
     pub show_once: u8,
+    /// DA2 field 30200 on an actual line. Wheel paraphrases are virtual nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cnv_flags: Option<u16>,
     /// Field 12207, the line's ambient flag (said in passing, without the dialog screen:
     /// chants and barks). DAOrigins.exe reads it before running the line's scripts and
     /// answers `DialogIsAmbient` from it (0x7f049a).
@@ -148,6 +151,7 @@ impl Dlg {
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0)
                     .clamp(0, 2) as u8,
+                cnv_flags: None,
                 ambient: g.field(*id, 12207).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
                 cutscene: match g.field(*id, 12211) {
                     Some(Value::Struct(s)) => *s,
@@ -298,7 +302,28 @@ impl Sim {
                 .contains(&format!("{}:{node}", c.dlg.name)),
             _ => true,
         };
-        fresh && {
+        // Native 0x552d30 filters actual CNV lines by local line id (bit 4)
+        // and global spoken strref (bit 5). A wheel label tests its target's
+        // history, but is not itself recorded as a spoken line.
+        let (line, actual) = if n.reply && n.children.len() == 1 {
+            let line = n.children[0];
+            c.dlg
+                .nodes
+                .get(line)
+                .filter(|n| n.cnv_flags.is_some())
+                .map_or((node, n), |actual| (line, actual))
+        } else {
+            (node, n)
+        };
+        let history = actual.cnv_flags.is_none_or(|flags| {
+            (flags & 0x10 == 0 || !c.shown.contains(&line))
+                && (flags & 0x20 == 0
+                    || !self
+                        .world
+                        .dialog_shown
+                        .contains(&format!("cnv:{}", actual.strref.unwrap_or(u32::MAX))))
+        });
+        fresh && history && {
             let cond = n.condition.clone();
             self.dialog_ambient = n.ambient;
             self.condition(&cond, c.owner)
@@ -307,6 +332,17 @@ impl Sim {
 
     /// Records that a node was used, for show-once nodes.
     fn mark_shown(&mut self, c: &mut Conversation, node: usize) {
+        let n = &c.dlg.nodes[node];
+        if n.cnv_flags.is_some() {
+            // 0x56f540 records both histories for every spoken line, including
+            // lines whose own eligibility does not ask for either history.
+            if !c.shown.contains(&node) {
+                c.shown.push(node);
+            }
+            self.world
+                .dialog_shown
+                .insert(format!("cnv:{}", n.strref.unwrap_or(u32::MAX)));
+        }
         match c.dlg.nodes[node].show_once {
             1 => c.shown.push(node),
             2 => {
@@ -544,16 +580,8 @@ impl Sim {
         owner: ObjectId,
         dialog: &str,
     ) -> Option<Vec<NodeCondition>> {
-        let name = if dialog.is_empty() {
-            self.world.get(owner).and_then(|o| o.dialog.clone())?
-        } else {
-            dialog.trim_end_matches(".dlg").to_string()
-        };
-        let d = self
-            .vfs
-            .read(&format!("{}.dlg", name.to_ascii_lowercase()))
-            .ok()
-            .and_then(|(data, _)| Dlg::parse(&data, &name))?;
+        let player = self.world.hero.unwrap_or(owner);
+        let d = self.load_conversation(player, owner, dialog)?;
         Some(self.dlg_conditions(owner, &d))
     }
 
@@ -1304,6 +1332,111 @@ mod tests {
     }
 
     #[test]
+    fn cnv_global_history_filters_the_spoken_target_not_its_wheel_label() {
+        let node = |strref, flags, reply, children| Node {
+            reply,
+            strref: Some(strref),
+            text: Some(format!("line {strref}")),
+            speaker: String::new(),
+            listener: String::new(),
+            condition: PlotRef::default(),
+            action: PlotRef::default(),
+            children,
+            show_once: 0,
+            cnv_flags: flags,
+            ambient: false,
+            cutscene: None,
+        };
+        let dlg = Dlg {
+            name: "cnv_history".into(),
+            starts: vec![0],
+            nodes: vec![
+                node(100, Some(0), false, vec![3, 4]),
+                node(101, Some(0x20), false, vec![]),
+                node(102, Some(0), false, vec![]),
+                node(201, None, true, vec![1]),
+                node(202, None, true, vec![2]),
+            ],
+        };
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim
+            .world
+            .spawn(crate::world::ObjectKind::Creature, "player");
+        let owner = sim
+            .world
+            .spawn(crate::world::ObjectKind::Creature, "speaker");
+        sim.world.hero = Some(hero);
+        sim.open_conversation(hero, owner, dlg.clone(), None);
+        assert_eq!(sim.talk.as_ref().unwrap().replies, [3, 4]);
+        sim.choose_reply(0);
+        assert!(sim.world.dialog_shown.contains("cnv:101"));
+        assert!(!sim.world.dialog_shown.contains("cnv:201"));
+        // Unflagged spoken lines are recorded too (native 0x56f540).
+        assert!(sim.world.dialog_shown.contains("cnv:100"));
+        sim.end_conversation();
+        sim.world = serde_json::from_slice(&serde_json::to_vec(&sim.world).unwrap()).unwrap();
+        let mut other = dlg.clone();
+        other.name = "another_cnv_with_the_same_spoken_line".into();
+        sim.open_conversation(hero, owner, other, None);
+        assert_eq!(sim.talk.as_ref().unwrap().replies, [4]);
+        // Recording the virtual reply did not hide the line before it could speak.
+        assert!(sim.choose_reply(0).unwrap().line.contains("102"));
+    }
+
+    #[test]
+    fn cnv_local_history_uses_line_ids_and_resets_with_the_conversation() {
+        let mut dlg = Dlg::from_gff4(&doc(), "local_cnv").unwrap();
+        dlg.nodes[0].cnv_flags = Some(0x10);
+        dlg.nodes[0].strref = Some(100);
+        dlg.nodes[1].cnv_flags = Some(0x10);
+        dlg.nodes[1].strref = Some(100);
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let mut c = Conversation {
+            dlg,
+            owner: 1,
+            player: 2,
+            line: None,
+            replies: vec![],
+            ended: false,
+            shown: vec![],
+            chain: vec![],
+            cut_from: None,
+            cut_lines_left: 0,
+            staged: vec![],
+            staged_at: None,
+            ambient_run: false,
+        };
+        // Ignore the synthetic DAO fixture's plot condition for this eligibility probe.
+        for n in &mut c.dlg.nodes {
+            n.condition = PlotRef::default();
+        }
+        assert!(sim.usable(&c, 0));
+        sim.mark_shown(&mut c, 0);
+        assert!(!sim.usable(&c, 0));
+        assert!(sim.usable(&c, 1), "same strref, different local line id");
+        let mut c: Conversation = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
+        assert!(
+            !sim.usable(&c, 0),
+            "local history survives a mid-conversation reload"
+        );
+        c.shown.clear();
+        assert!(
+            sim.usable(&c, 0),
+            "a new conversation has new local history"
+        );
+        c.dlg.nodes[0].cnv_flags = Some(0x30);
+        assert!(!sim.usable(&c, 0), "both flags also check global history");
+    }
+
+    #[test]
     fn show_once_lines_are_skipped_the_second_time() {
         let node = |reply: bool, text: &str, children: Vec<usize>, show_once: u8| Node {
             reply,
@@ -1315,6 +1448,7 @@ mod tests {
             action: PlotRef::default(),
             children,
             show_once,
+            cnv_flags: None,
             ambient: false,
             cutscene: None,
         };
@@ -1369,6 +1503,7 @@ mod tests {
             action: PlotRef::default(),
             children: vec![],
             show_once: 0,
+            cnv_flags: None,
             ambient,
             cutscene: None,
         };
@@ -1450,6 +1585,7 @@ mod tests {
             action: PlotRef::default(),
             children: vec![],
             show_once: 0,
+            cnv_flags: None,
             ambient,
             cutscene: cutscene.map(Into::into),
         };
@@ -1498,6 +1634,7 @@ mod tests {
             action: PlotRef::default(),
             children,
             show_once: 0,
+            cnv_flags: None,
             ambient: !reply,
             cutscene: None,
         };

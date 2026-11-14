@@ -587,6 +587,9 @@ pub struct World {
     /// the key also preserves the original landing time when the payload changes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     projectile_impact_events: BTreeMap<ObjectId, (u64, u64)>,
+    /// DA2 flight state and its owned impact payload. Empty in Origins/older saves.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) da2_projectiles: BTreeMap<ObjectId, crate::da2_projectile::Flight>,
     pub module: Option<ObjectId>,
     pub area: Option<ObjectId>,
     /// DA2 encounter registrations. Area/id membership lives on each creature; this list
@@ -879,6 +882,7 @@ impl World {
             queue: BTreeMap::new(),
             next_seq: 0,
             projectile_impact_events: BTreeMap::new(),
+            da2_projectiles: BTreeMap::new(),
             module: None,
             area: None,
             da2_encounter_order: Vec::new(),
@@ -1032,6 +1036,7 @@ impl World {
                     self.queue.remove(&key);
                 }
                 self.objects.remove(&id);
+                self.da2_projectiles.remove(&id);
                 self.da2_encounter_order.retain(|&c| c != id);
                 // A destroyed follower leaves the party (the list holds no dead ids).
                 if let Some(h) = self.hero.and_then(|h| self.objects.get_mut(&h)) {
@@ -1050,6 +1055,21 @@ impl World {
         target: ObjectId,
         event: Event,
     ) {
+        if let Some(flight) = self.da2_projectiles.get_mut(&projectile) {
+            flight.custom = true;
+            flight.impact = Some(crate::world::QueuedEvent {
+                target,
+                event,
+                script: None,
+            });
+            return;
+        }
+        if self
+            .get(projectile)
+            .is_some_and(|p| p.fields.get("FlightComplete") == Some(&1))
+        {
+            return;
+        }
         if !self
             .get(projectile)
             .is_some_and(|p| p.kind == ObjectKind::Projectile)
