@@ -175,9 +175,23 @@ debug views now include the ground. Terrain also joins the point-shadow caster l
   eligible deferred meshes cast from both faces, including geometry outside the camera's
   view. The lighting pass compares distances with a bilinear 2-by-2 filter, a 4 cm normal
   offset and 2 cm distance bias. Supported skinned objects and terrain cast too; forward
-  materials and trees do not. Static lights keep baked visibility. At most 24 face passes per frame.
+  materials and trees do not, except for the cutouts below. Static lights keep baked
+  visibility. At most 24 face passes per frame.
   `THEDAS_DEFERRED_POINT_SHADOWS=0` disables both rendering and sampling these maps for
   captures and cost comparisons; it does not change the faithful path.
+- Forward cutouts: known Origins `Static1_Punch`, `Eye0/Eyelash0`, and the
+  colour-disabled `Hair0_Pass1` depth core also cast into point-light cubes, independently
+  of G-buffer coverage and `THEDAS_DEFERRED_OBJECTS`. Geometry retains UVs, morphs and the
+  current four-weight pose. The opacity map, sampler address/filter/mip states, opacity
+  multiplier, comparison and 8-bit reference are retained. Static1_Punch additionally
+  clips diffuse alpha times opacity below 0.3; hair takes opacity from the packed
+  texture's blue channel and admits only its depth core's `>= 255` coverage. All visible
+  hair passes remain forward and are not suppressed. Eyelashes take diffuse alpha.
+  Casts are deduplicated per scene draw; explicit no-cast flags, current posed bounds,
+  fade-outs and cutaway exclusions still apply. Missing opacity maps do not become
+  rectangular casters. `THEDAS_DEFERRED_CUTOUT_SHADOWS=0` disables just these additions
+  for comparison. Other material families and the trees' wind/LOD/billboard paths remain
+  unsupported; this does not add cutouts to SSAO or change the faithful sun shadows.
 - With baked lighting on, static lights and static geometry still depend on `lm.a`.
   The experimental lightmaps-off mode below lets static lights use the point-shadow pool.
 
