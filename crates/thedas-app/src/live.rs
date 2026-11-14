@@ -1461,6 +1461,13 @@ impl Live {
         out
     }
 
+    /// Resources that changed on disk (mod mode's live edits) are read again: the objects
+    /// are drawn anew with them. The level keeps what it has (see `workspace`).
+    pub fn reload(&mut self, names: &[String]) {
+        self.cache.forget(names);
+        self.objects = None;
+    }
+
     /// Mod mode's scrubber: draws creature `id` with its own animation held at `time`
     /// seconds, or lets go (`None`).
     pub fn set_scrub(&mut self, scrub: Option<(ObjectId, f32)>) {

@@ -27,7 +27,7 @@ use std::path::PathBuf;
 pub use erf::{Erf, ErfEntry, ErfVersion};
 pub use install::{DaoInstall, Game, LevelMount};
 pub use path::{join_ci, resolve_ci};
-pub use vfs::{Layer, Provenance, Vfs};
+pub use vfs::{Layer, Provenance, Vfs, WORKSPACE_LABEL};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

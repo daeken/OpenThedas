@@ -128,6 +128,8 @@ pub enum Action {
     FlyTo(ObjectId),
     /// This object's models written for Blender (see [`crate::glb`]).
     Export(ObjectId),
+    /// Live edits on or off (see [`crate::workspace`]).
+    LiveEdits(bool),
 }
 
 /// Mod mode's state and its egui overlay.
@@ -159,6 +161,10 @@ pub struct ModMode {
     pub fly: bool,
     /// What the last export wrote, or why it failed.
     pub exported: Option<String>,
+    /// Whether live edits are mounted (the app keeps this up to date).
+    pub live: bool,
+    /// What live edits last did.
+    pub live_note: Option<String>,
     actions: Vec<Action>,
 }
 
@@ -191,6 +197,8 @@ impl ModMode {
             world: Default::default(),
             fly: false,
             exported: None,
+            live: false,
+            live_note: None,
             actions: Vec::new(),
         }
     }
@@ -354,6 +362,20 @@ impl ModMode {
                 });
                 if self.fly {
                     ui.weak("WASD move, Q/E down/up, Shift faster, right mouse looks");
+                }
+                let mut live = self.live;
+                if ui
+                    .checkbox(&mut live, "Live edits")
+                    .on_hover_text(
+                        "Mounts workspace/override above every mod. Textures saved over an \
+                         export's PNGs are written there and drawn at once.",
+                    )
+                    .changed()
+                {
+                    self.actions.push(Action::LiveEdits(live));
+                }
+                if let Some(note) = &self.live_note {
+                    ui.weak(note);
                 }
                 ui.separator();
                 match inspected {
