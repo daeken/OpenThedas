@@ -2469,6 +2469,7 @@ mod shadow_tests {
         text.layout = Some(Layout {
             lines: vec![Line {
                 glyphs: vec![PlacedGlyph {
+                    index: 0,
                     font,
                     glyph: 0,
                     x: 2.0,
