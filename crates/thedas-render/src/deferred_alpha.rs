@@ -70,9 +70,7 @@ pub(crate) fn material(
         || !p.z_enable
         || !p.z_write
         || p.color_write != 15
-        || (character
-            && (p.alpha_test.is_none()
-                || std::env::var("THEDAS_DEFERRED_CHARACTER_CUTOUTS").as_deref() == Ok("0")))
+        || (character && (p.alpha_test.is_none() || !crate::config::CONFIG.character_cutouts))
     {
         return None;
     }

@@ -104,19 +104,19 @@ pub(crate) fn plan(
 ) -> (Vec<Draw>, Vec<Material>) {
     let mut draws = Vec::new();
     let mut materials = Vec::new();
-    if std::env::var("THEDAS_DEFERRED_CUTOUT_SHADOWS").as_deref() == Ok("0") {
+    if !crate::config::CONFIG.cutout_shadows {
         return (draws, materials);
     }
     let mut seen = HashSet::new();
     let mut material_of = HashMap::new();
-    let blended = std::env::var("THEDAS_DEFERRED_BLENDED_CUTOUTS").as_deref() != Ok("0");
+    let blended = crate::config::CONFIG.blended_cutouts;
     for (k, d) in d3d.draws.iter().enumerate() {
         let program = d3d.program(d);
         let Some(r) = rule(&program.name) else {
             continue;
         };
         if crate::deferred_alpha::character(&program.name)
-            && std::env::var("THEDAS_DEFERRED_CHARACTER_CUTOUTS").as_deref() == Ok("0")
+            && !crate::config::CONFIG.character_cutouts
         {
             continue;
         }
