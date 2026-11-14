@@ -1282,6 +1282,13 @@ impl AreaRenderer {
         }
     }
 
+    /// Overrides frond coverage for paired captures. `None` restores the planned mode.
+    pub fn set_deferred_fronds(&mut self, enabled: Option<bool>) {
+        if let Some(d) = self.deferred.as_mut() {
+            d.set_fronds(enabled);
+        }
+    }
+
     /// Grades the frame as area `grade` says: its colour curve and `da_hsvmatrix` values
     /// (DAOrigins.exe swaps them when an area becomes active, 0x67b1b0).
     pub fn set_area_grade(&mut self, ctx: &GpuContext, vfs: &Vfs, grade: &crate::post::AreaGrade) {

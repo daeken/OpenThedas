@@ -559,10 +559,11 @@ fn capture(
                         | "depth-lights"
                         | "terrain-layers"
                         | "pass-cost"
+                        | "fronds"
                 )
             }) {
                 bail!(
-                    "THEDAS_BENCH_DEFERRED_COMPARE must be all, tiles, shadows, faithful, reflections, tile-frusta, light-masks, opaque-gbuffer, lighting, specialized-gbuffer, early-light-reject, depth-lights, terrain-layers or pass-cost"
+                    "THEDAS_BENCH_DEFERRED_COMPARE must be all, tiles, shadows, faithful, reflections, tile-frusta, light-masks, opaque-gbuffer, lighting, specialized-gbuffer, early-light-reject, depth-lights, terrain-layers, pass-cost or fronds"
                 );
             }
             let comparison = std::env::var("THEDAS_BENCH_SHADOW_COMPARE").ok();
@@ -593,6 +594,8 @@ fn capture(
                     } else if let Some(level) = live.level.as_mut() {
                         if compare == "reflections" {
                             level.renderer.set_deferred_fused_reflections(Some(enabled));
+                        } else if compare == "fronds" {
+                            level.renderer.set_deferred_fronds(Some(enabled));
                         } else if compare == "tile-frusta" {
                             level.renderer.set_deferred_tight_tiles(Some(enabled));
                         } else if compare == "light-masks" {
@@ -666,6 +669,7 @@ fn capture(
                     level.renderer.set_deferred_early_light_reject(None);
                     level.renderer.set_deferred_depth_lights(None);
                     level.renderer.set_deferred_direct_terrain_layers(None);
+                    level.renderer.set_deferred_fronds(None);
                 }
                 println!("bench comparison modes: {}", modes.join(" "));
             }
