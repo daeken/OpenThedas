@@ -164,6 +164,9 @@ pub struct Sim {
     /// (`DialogIsAmbient`; DAOrigins.exe's server flag at +0x214).
     pub(crate) dialog_ambient: bool,
     pub(crate) talk: Option<crate::dialog::Conversation>,
+    /// DA2's interactive walker owns a conversation even while it temporarily
+    /// removes `talk` to execute a line/reply action. New requests still wait.
+    pub(crate) dialog_advancing: bool,
     /// The conversations being said in passing (see [`crate::dialog::AmbientTalk`]). Not
     /// saved.
     pub(crate) ambient: Vec<crate::dialog::AmbientTalk>,
@@ -633,6 +636,7 @@ impl Sim {
             route_approach: Vec::new(),
             walk_blocked_by: None,
             talk: None,
+            dialog_advancing: false,
             plots: crate::plot::Plots::default(),
             strings: std::sync::OnceLock::new(),
             item_looks: Default::default(),
