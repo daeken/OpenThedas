@@ -389,6 +389,7 @@ Dispatch summary: `engine::call` (`crates/thedas-sim/src/engine.rs:483`) matches
 
 ### Checked and looks complete
 
+- SCR-026 Origins base-object maximum health: missing objects, modules, areas, the party, items, triggers, sounds, waypoints, projectiles, stores and area effects return -1 and ignore `SetMaxHealth` ([trace](../notes/script-base-health.md)). Placeable, stage, map and map-pin health paths remain provisional.
 - Local variables on objects, modules and areas (int, float, string, object, resource, location get/set).
 - Event construction and access (Event, Get/SetEvent* including locations, GetCurrentEvent, SignalEvent immediate and queued, DelayEvent with script override).
 - 2DA access from scripts (GetM2DAInt/Float/String/Resource, GetHashedM2DAInt, GetM2DARows, GetM2DARowIdFromRowIndex), with missing tables and columns counted.
