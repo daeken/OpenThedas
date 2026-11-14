@@ -15,7 +15,7 @@ use thedas_script::vm::{OBJECT_INVALID, ObjectId, Value, VmResult};
 
 use crate::sim::{ScriptHost, Sim, constant};
 use crate::trace::TraceEntry;
-use crate::world::{Command, Effect, EngineData, Event, Location, ObjectKind};
+use crate::world::{Command, Effect, EngineData, Event, Location, Object, ObjectKind};
 
 fn int(a: &[Value], i: usize) -> i32 {
     match a.get(i) {
@@ -45,6 +45,14 @@ fn obj(a: &[Value], i: usize) -> ObjectId {
         Some(Value::Object(o)) => *o,
         _ => OBJECT_INVALID,
     }
+}
+
+/// The independent placeable current, retaining explicit currents from older saves.
+fn origins_placeable_health(o: &Object) -> i32 {
+    o.properties.get(&7).map_or_else(
+        || i32::from(o.fields.get("Health").copied().unwrap_or(0) as i16),
+        |p| p.1.round() as i32,
+    )
 }
 
 /// Origins' health lookup rejects module/area/party objects; these other kinds
@@ -545,7 +553,6 @@ const PRESENTATION: &[&str] = &[
     "PlaySoundObject",
     "LinkAreaMiniMaps",
     "SendGameEventRunDatabase",
-    "SetPlaceableHealth",
     "SetMapPinState",
     "SetCameraTarget",
     "ApplyEffectVisualEffectOnLocation",
@@ -1336,7 +1343,14 @@ pub fn call(
             }
             void()
         }
-        "IsDead" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.dead))),
+        "IsDead" => ok(b(h.object(obj(a, 0)).is_some_and(|o| {
+            if h.sim.game == thedas_vfs::Game::Origins && o.kind == ObjectKind::Placeable {
+                // 0x65a3a0 -> 0x695300 -> current virtual +0x120 (0x750f50).
+                origins_placeable_health(o) <= 0
+            } else {
+                o.dead
+            }
+        }))),
         "IsDestroyable" | "SetDestroyable"
             if h.sim.game == thedas_vfs::Game::Origins
                 && h.object(obj(a, 0)).is_none_or(|o| {
@@ -3123,22 +3137,33 @@ pub fn call(
             }
             void()
         }
+        "SetPlaceableHealth" => {
+            // 0x65a250 -> 0x74e8e0: signed-short current, independent of
+            // maximum and object flags. The scripts send their own DEATH event.
+            let current = i32::from(int(a, 1) as i16);
+            if h.sim.game == thedas_vfs::Game::Origins
+                && let Some(o) = h.sim.world.get_mut(obj(a, 0))
+                && o.kind == ObjectKind::Placeable
+            {
+                o.fields.insert("Health".into(), current);
+                if let Some(p) = o.properties.get_mut(&7) {
+                    p.1 = current as f32;
+                }
+                if current <= 0 && o.inventory.is_empty() {
+                    o.interactive = false;
+                }
+            }
+            void()
+        }
         "GetHealth" => {
             let health = constant(&h.sim.table, "PROPERTY_DEPLETABLE_HEALTH");
-            let current = h.object(obj(a, 0)).map_or(0, |o| {
-                if let Some(p) = o.properties.get(&health) {
-                    // Retain explicit currents from our older saves.
-                    p.1.round() as i32
-                } else if h.sim.game == thedas_vfs::Game::Origins && o.kind == ObjectKind::Placeable
-                {
-                    // 0x750370 loads Health independently of MaxHealth, after
-                    // signed-short narrowing; 0x750f50 reads that current.
-                    i32::from(o.fields.get("Health").copied().unwrap_or(0) as i16)
+            ok(Value::Int(h.object(obj(a, 0)).map_or(0, |o| {
+                if h.sim.game == thedas_vfs::Game::Origins && o.kind == ObjectKind::Placeable {
+                    origins_placeable_health(o)
                 } else {
-                    0
+                    o.properties.get(&health).map_or(0, |p| p.1.round() as i32)
                 }
-            });
-            ok(Value::Int(current))
+            })))
         }
         "MoveItem" => {
             let (from, to, item) = (obj(a, 0), obj(a, 1), obj(a, 2));
@@ -3461,6 +3486,14 @@ pub fn call(
             void()
         }
         // Heartbeats: EVENT_TYPE_HEARTBEAT2 every interval until EndHeartbeat.
+        "InitHeartbeat" | "EndHeartbeat"
+            if h.sim.game == thedas_vfs::Game::Origins
+                && h.object(obj(a, 0))
+                    .is_none_or(|o| o.kind != ObjectKind::Creature) =>
+        {
+            // 0x666380 / 0x666400 both require the creature lookup 0x5d58c0.
+            void()
+        }
         "InitHeartbeat" => {
             let who = obj(a, 0);
             let ms = ((float(a, 1).max(0.1)) * 1000.0) as i32;
@@ -7281,6 +7314,87 @@ mod tests {
     }
 
     #[test]
+    fn origins_scripted_heartbeat_setters_require_a_creature() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"void InitHeartbeat(object o, float seconds) = 342;\n\
+              void EndHeartbeat(object o) = 343;\n\
+              int EVENT_TYPE_HEARTBEAT2 = 81;\n",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            s.game = game;
+            for kind in [
+                ObjectKind::Module,
+                ObjectKind::Area,
+                ObjectKind::Creature,
+                ObjectKind::Placeable,
+                ObjectKind::Item,
+                ObjectKind::Trigger,
+                ObjectKind::Sound,
+                ObjectKind::Waypoint,
+                ObjectKind::Party,
+                ObjectKind::Stage,
+                ObjectKind::Map,
+                ObjectKind::MapPin,
+                ObjectKind::Projectile,
+                ObjectKind::Store,
+                ObjectKind::AreaOfEffect,
+            ] {
+                let id = s.world.spawn(kind, "heartbeat");
+                s.world
+                    .get_mut(id)
+                    .unwrap()
+                    .fields
+                    .insert("HeartbeatMs".into(), 600);
+                let before = s.save_json().unwrap();
+                let queue_len = s.world.queue.len();
+                run(
+                    &mut s,
+                    id,
+                    "InitHeartbeat",
+                    &[Value::Object(id), Value::Float(2.0)],
+                );
+                let accepted = game == thedas_vfs::Game::DragonAge2 || kind == ObjectKind::Creature;
+                assert_eq!(
+                    s.world.get(id).unwrap().fields["HeartbeatMs"],
+                    if accepted { 2000 } else { 600 }
+                );
+                assert_eq!(s.world.queue.len(), queue_len + usize::from(accepted));
+                if !accepted {
+                    assert_eq!(s.save_json().unwrap(), before);
+                }
+                s.load_json(&s.save_json().unwrap()).unwrap();
+                let before = s.save_json().unwrap();
+                let queued = s.world.queue.len();
+                run(&mut s, id, "EndHeartbeat", &[Value::Object(id)]);
+                assert_eq!(
+                    s.world.get(id).unwrap().fields.get("HeartbeatMs").copied(),
+                    if accepted { None } else { Some(600) }
+                );
+                assert_eq!(s.world.queue.len(), queued);
+                if !accepted {
+                    assert_eq!(s.save_json().unwrap(), before);
+                }
+            }
+        }
+        s.game = thedas_vfs::Game::Origins;
+        for id in [OBJECT_INVALID, u32::MAX] {
+            let before = s.save_json().unwrap();
+            run(
+                &mut s,
+                id,
+                "InitHeartbeat",
+                &[Value::Object(id), Value::Float(2.0)],
+            );
+            run(&mut s, id, "EndHeartbeat", &[Value::Object(id)]);
+            assert_eq!(s.save_json().unwrap(), before);
+        }
+    }
+
+    #[test]
     fn da2_attack_constructor_uses_the_modern_default_without_a_forced_roll() {
         let table = Arc::new(
             EngineTable::parse(
@@ -8477,6 +8591,298 @@ mod tests {
                     &[Value::Object(id), Value::Int(30)],
                 );
                 assert_eq!(serde_json::to_value(&s.world).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn origins_placeable_currents_are_signed_shorts_independent_of_maximum_and_flags() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"void SetPlaceableHealth(object o, int n) = 234;\n\
+                  int GetHealth(object o) = 233;\n\
+                  int IsDead(object o) = 237;\n\
+                  int PROPERTY_DEPLETABLE_HEALTH = 7;\n",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let item = s.world.spawn(ObjectKind::Item, "loot");
+        for explicit in [None, Some((100.0, 0.0)), Some((100.0, 80.0))] {
+            for has_items in [false, true] {
+                for value in [
+                    i32::MIN,
+                    -65537,
+                    -32769,
+                    -32768,
+                    -1,
+                    0,
+                    1,
+                    30,
+                    32767,
+                    32768,
+                    65535,
+                    65536,
+                    i32::MAX,
+                ] {
+                    let id = s.world.spawn(ObjectKind::Placeable, "target");
+                    let o = s.world.get_mut(id).unwrap();
+                    o.fields.extend([
+                        ("Health".into(), 5),
+                        ("MaxHealth".into(), 77),
+                        ("State".into(), 1),
+                    ]);
+                    o.modifiers.insert(7, 20.0);
+                    o.active = false;
+                    o.dead = true;
+                    o.immortal = true;
+                    o.plot = true;
+                    if let Some(p) = explicit {
+                        o.properties.insert(7, p);
+                    }
+                    if has_items {
+                        o.inventory.push(item);
+                    }
+                    run(
+                        &mut s,
+                        id,
+                        "SetPlaceableHealth",
+                        &[Value::Object(id), Value::Int(value)],
+                    );
+                    let current = i32::from(value as i16);
+                    assert_eq!(
+                        run(&mut s, id, "GetHealth", &[Value::Object(id)]),
+                        Some(Value::Int(current))
+                    );
+                    assert_eq!(
+                        run(&mut s, id, "IsDead", &[Value::Object(id)]),
+                        Some(Value::Int(i32::from(current <= 0)))
+                    );
+                    let o = s.world.get(id).unwrap();
+                    assert_eq!(o.fields["Health"], current);
+                    assert_eq!(o.fields["MaxHealth"], 77);
+                    assert_eq!(o.fields["State"], 1);
+                    assert_eq!(
+                        o.properties.get(&7).copied(),
+                        explicit.map(|(base, _)| (base, current as f32))
+                    );
+                    assert_eq!(o.interactive, current > 0 || has_items);
+                    assert!(o.dead && o.immortal && o.plot && !o.active);
+                    assert_eq!(o.modifiers[&7], 20.0);
+                    assert!(s.world.queue.is_empty(), "the setter sends no DEATH event");
+                    let saved = s.save_json().unwrap();
+                    s.load_json(&saved).unwrap();
+                    assert_eq!(
+                        run(&mut s, id, "GetHealth", &[Value::Object(id)]),
+                        Some(Value::Int(current))
+                    );
+                    // Positive writes do not restore interaction disabled by an earlier write.
+                    run(
+                        &mut s,
+                        id,
+                        "SetPlaceableHealth",
+                        &[Value::Object(id), Value::Int(5)],
+                    );
+                    assert_eq!(
+                        s.world.get(id).unwrap().interactive,
+                        current > 0 || has_items
+                    );
+                }
+            }
+        }
+        for kind in [
+            ObjectKind::Creature,
+            ObjectKind::Item,
+            ObjectKind::Module,
+            ObjectKind::Area,
+            ObjectKind::Party,
+        ] {
+            let id = s.world.spawn(kind, "control");
+            let before = s.save_json().unwrap();
+            run(
+                &mut s,
+                id,
+                "SetPlaceableHealth",
+                &[Value::Object(id), Value::Int(0)],
+            );
+            assert_eq!(s.save_json().unwrap(), before);
+        }
+        s.game = thedas_vfs::Game::DragonAge2;
+        let id = s.world.spawn(ObjectKind::Placeable, "da2");
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .fields
+            .insert("Health".into(), 5);
+        let before = s.save_json().unwrap();
+        run(
+            &mut s,
+            id,
+            "SetPlaceableHealth",
+            &[Value::Object(id), Value::Int(0)],
+        );
+        assert_eq!(s.save_json().unwrap(), before);
+        assert_eq!(
+            run(&mut s, id, "IsDead", &[Value::Object(id)]),
+            Some(Value::Int(0))
+        );
+    }
+
+    #[test]
+    fn origins_placeable_death_queries_use_current_even_when_the_saved_flag_disagrees() {
+        let table = Arc::new(EngineTable::parse(b"int IsDead(object o) = 237;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let id = s.world.spawn(ObjectKind::Placeable, "target");
+        assert_eq!(
+            run(&mut s, id, "IsDead", &[Value::Object(id)]),
+            Some(Value::Int(1))
+        );
+        for (current, dead) in [
+            (-1, false),
+            (0, false),
+            (1, true),
+            (32768, false),
+            (65537, true),
+        ] {
+            let o = s.world.get_mut(id).unwrap();
+            o.dead = dead;
+            o.fields.insert("Health".into(), current);
+            assert_eq!(
+                run(&mut s, id, "IsDead", &[Value::Object(id)]),
+                Some(Value::Int(i32::from((current as i16) <= 0)))
+            );
+        }
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .properties
+            .insert(7, (100.0, 0.0));
+        assert_eq!(
+            run(&mut s, id, "IsDead", &[Value::Object(id)]),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            run(&mut s, id, "IsDead", &[Value::Object(OBJECT_INVALID)]),
+            Some(Value::Int(0))
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an Origins THEDAS_INSTALL"]
+    fn shipped_placeable_scripts_bash_a_door_and_chest_open_and_leave_loot_accessible() {
+        let install = thedas_vfs::DaoInstall::open(
+            std::env::var_os("THEDAS_INSTALL").expect("THEDAS_INSTALL"),
+        )
+        .unwrap();
+        assert_eq!(install.game(), thedas_vfs::Game::Origins);
+        let vfs = Arc::new(
+            install
+                .global_vfs(thedas_vfs::install::TextureQuality::High)
+                .unwrap(),
+        );
+        let table = Arc::new(
+            EngineTable::parse(&vfs.read("script.ldf").unwrap().0)
+                .unwrap()
+                .with_inferred(),
+        );
+        let mut s = Sim::new(vfs, table, 7);
+        s.world.trace.keep = true;
+        let hero = s.world.spawn(ObjectKind::Creature, "basher");
+        s.world.hero = Some(hero);
+        let types = s.world.tables.get(93, "").unwrap();
+        for controller in ["StateCnt_Door", "StateCnt_Container"] {
+            let appearance = types.find("StateController", controller).unwrap() as i32;
+            for explicit in [false, true] {
+                let target = s.world.spawn(ObjectKind::Placeable, "bash_target");
+                let loot = s.create_item("gen_im_qck_health_101");
+                assert!(s.max_stack(loot) >= 8);
+                s.world
+                    .get_mut(loot)
+                    .unwrap()
+                    .fields
+                    .insert("StackSize".into(), 8);
+                let o = s.world.get_mut(target).unwrap();
+                o.script = Some("placeable_core".into());
+                o.appearance = appearance;
+                o.fields.extend([
+                    ("Appearance".into(), appearance),
+                    ("Health".into(), 5),
+                    ("MaxHealth".into(), 100),
+                    ("State".into(), 0),
+                ]);
+                if explicit {
+                    o.properties.insert(7, (100.0, 5.0));
+                }
+                if controller == "StateCnt_Container" {
+                    o.inventory.push(loot);
+                }
+                s.apply_effect(
+                    target,
+                    Effect {
+                        ty: 1013,
+                        creator: Some(hero),
+                        floats: vec![10000.0],
+                        ints: vec![0, 0, 0],
+                        ..Default::default()
+                    },
+                );
+                s.tick(1);
+                assert_eq!(
+                    run(&mut s, hero, "GetHealth", &[Value::Object(target)]),
+                    Some(Value::Int(0))
+                );
+                assert_eq!(
+                    run(&mut s, hero, "IsDead", &[Value::Object(target)]),
+                    Some(Value::Int(1))
+                );
+                assert_eq!(
+                    run(&mut s, hero, "GetPlaceableState", &[Value::Object(target)]),
+                    Some(Value::Int(3))
+                );
+                if controller == "StateCnt_Container" {
+                    assert!(s.world.get(target).unwrap().interactive);
+                    assert_eq!(s.world.get(target).unwrap().inventory, vec![loot]);
+                    assert_eq!(s.world.get(loot).unwrap().fields["StackSize"], 4);
+                    let before: i32 = s
+                        .world
+                        .get(hero)
+                        .unwrap()
+                        .inventory
+                        .iter()
+                        .map(|&i| s.stack_count(i))
+                        .sum();
+                    s.open_container(target);
+                    assert!(s.take_from_container(loot));
+                    let after: i32 = s
+                        .world
+                        .get(hero)
+                        .unwrap()
+                        .inventory
+                        .iter()
+                        .map(|&i| s.stack_count(i))
+                        .sum();
+                    assert_eq!(after, before + 4);
+                    assert!(s.world.get(target).unwrap().inventory.is_empty());
+                } else {
+                    assert!(!s.world.get(target).unwrap().interactive);
+                }
+                assert!(
+                    !s.world
+                        .trace
+                        .entries
+                        .iter()
+                        .any(|e| matches!(e, TraceEntry::ScriptEnd { error: Some(_), .. }))
+                );
+                let saved = s.save_json().unwrap();
+                s.load_json(&saved).unwrap();
+                assert_eq!(
+                    run(&mut s, hero, "IsDead", &[Value::Object(target)]),
+                    Some(Value::Int(1))
+                );
+                assert_eq!(
+                    run(&mut s, hero, "GetPlaceableState", &[Value::Object(target)]),
+                    Some(Value::Int(3))
+                );
             }
         }
     }
