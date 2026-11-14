@@ -3873,6 +3873,26 @@ pub fn call(
                     })
             }))
         }
+        // Origins 0x65a2c0 -> creature virtual 0x6ab530 reads property 7's total,
+        // narrows it to f32 and uses the CRT's SSE2 integer conversion (0x8e34f0).
+        "Deprecated_GetMaxHealth"
+            if h.sim.game == thedas_vfs::Game::Origins
+                && h.object(obj(a, 0))
+                    .is_some_and(|o| o.kind == ObjectKind::Creature) =>
+        {
+            let id = obj(a, 0);
+            let total = h
+                .object(id)
+                .filter(|o| o.properties.contains_key(&7))
+                .map_or(0.0, |_| h.sim.property_total(id, 7));
+            ok(Value::Int(
+                if (i32::MIN as f32..2147483648.0).contains(&total) {
+                    total as i32
+                } else {
+                    i32::MIN
+                },
+            ))
+        }
         "Deprecated_GetMaxHealth" => ok(Value::Int(
             h.object(obj(a, 0))
                 .and_then(|o| {
@@ -7398,6 +7418,126 @@ mod tests {
         s.world.queue_destroy(0, follower);
         s.world.destroy_due();
         assert!(s.world.get(hero).unwrap().followers.is_empty());
+    }
+
+    #[test]
+    fn deprecated_max_health_reads_the_origins_creatures_bounded_total() {
+        let table =
+            Arc::new(EngineTable::parse(b"int Deprecated_GetMaxHealth(object o) = 235;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.tables.insert(
+            "properties",
+            &["Type", "Min", "Max", "#106ccdd5"],
+            vec![(
+                7,
+                vec![
+                    Cell::String("DEPLETABLE".into()),
+                    Cell::Float(5.0),
+                    Cell::Float(150.0),
+                    Cell::Int(6),
+                ],
+            )],
+        );
+        let id = s.world.spawn(ObjectKind::Creature, "creature");
+        let o = s.world.get_mut(id).unwrap();
+        o.fields.insert("MaxHealth".into(), 999);
+        o.fields.insert("Health".into(), 888);
+        o.properties.insert(7, (100.5, 3.0));
+        o.properties.insert(6, (14.0, 14.0));
+        o.modifiers.insert(7, 7.25);
+        o.dead = true;
+        o.active = false;
+        o.immortal = true;
+        let query = |s: &mut Sim| run(s, id, "Deprecated_GetMaxHealth", &[Value::Object(id)]);
+        let before = serde_json::to_value(&s.world).unwrap();
+        assert_eq!(s.property_total(id, 7), 127.75);
+        assert_eq!(query(&mut s), Some(Value::Int(127)));
+        assert_eq!(serde_json::to_value(&s.world).unwrap(), before);
+        s.load_game(s.save_game()).unwrap();
+        assert_eq!(query(&mut s), Some(Value::Int(127)));
+        for (base, expected) in [(1000.0, 150), (-1000.0, 5)] {
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .properties
+                .get_mut(&7)
+                .unwrap()
+                .0 = base;
+            assert_eq!(query(&mut s), Some(Value::Int(expected)));
+        }
+        s.world.get_mut(id).unwrap().properties.remove(&7);
+        assert_eq!(query(&mut s), Some(Value::Int(0)));
+    }
+
+    #[test]
+    fn deprecated_max_health_uses_the_native_sse2_conversion_for_creatures() {
+        let table =
+            Arc::new(EngineTable::parse(b"int Deprecated_GetMaxHealth(object o) = 235;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let id = s.world.spawn(ObjectKind::Creature, "creature");
+        for (total, expected) in [
+            (12.99, 12),
+            (-12.99, -12),
+            (-2147483648.0, i32::MIN),
+            (2147483520.0, 2147483520),
+            (2147483648.0, i32::MIN),
+            (f32::MAX, i32::MIN),
+            (f32::NEG_INFINITY, i32::MIN),
+            (f32::INFINITY, i32::MIN),
+            (f32::NAN, i32::MIN),
+        ] {
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .properties
+                .insert(7, (total, 0.0));
+            assert_eq!(
+                run(&mut s, id, "Deprecated_GetMaxHealth", &[Value::Object(id)]),
+                Some(Value::Int(expected)),
+                "{total:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deprecated_max_health_retains_the_other_paths_pending_their_traces() {
+        let table =
+            Arc::new(EngineTable::parse(b"int Deprecated_GetMaxHealth(object o) = 235;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for kind in [
+            ObjectKind::Creature,
+            ObjectKind::Placeable,
+            ObjectKind::Item,
+        ] {
+            let id = s.world.spawn(kind, "target");
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .properties
+                .insert(7, (100.0, 1.0));
+            for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+                s.game = game;
+                for (maximum, expected) in [(None, 11), (Some(22), 22)] {
+                    let o = s.world.get_mut(id).unwrap();
+                    o.fields.remove("MaxHealth");
+                    o.fields.insert("Health".into(), 11);
+                    if let Some(maximum) = maximum {
+                        o.fields.insert("MaxHealth".into(), maximum);
+                    }
+                    let expected =
+                        if game == thedas_vfs::Game::Origins && kind == ObjectKind::Creature {
+                            100
+                        } else {
+                            expected
+                        };
+                    assert_eq!(
+                        run(&mut s, id, "Deprecated_GetMaxHealth", &[Value::Object(id)]),
+                        Some(Value::Int(expected)),
+                        "{game:?} {kind:?} {maximum:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
