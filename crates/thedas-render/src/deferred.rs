@@ -4,7 +4,7 @@
 //! Eligible level, terrain, object and skinned character draws share a G-buffer; one pass lights them
 //! per pixel with every light in reach: the sum Static1.psh works out per object for three
 //! lights (`notes/frame-gamma-lightmap-trace.md`), over all of them. Everything else (water,
-//! sky, trees, unsupported character, blended and multi-pass materials, particles) is drawn
+//! sky, tree billboards, unsupported character, blended and multi-pass materials, particles) is drawn
 //! afterwards by the faithful pass, with its original shaders, over that colour and depth.
 //!
 //! Nothing here changes how the faithful path draws: with [`RenderPath::Faithful`] this
@@ -26,6 +26,9 @@ use crate::scene::{AreaScene, DOMAIN_CHARACTERS, DOMAIN_LEVEL, SceneLight};
 #[path = "deferred_light_masks.rs"]
 mod light_masks;
 
+#[path = "deferred_trees.rs"]
+mod trees;
+
 pub const DEFERRED_WGSL: &str = concat!(
     include_str!("deferred_skin.wgsl"),
     include_str!("deferred.wgsl")
@@ -46,6 +49,10 @@ mod alpha_gpu_tests;
 #[cfg(test)]
 #[path = "deferred_reflection_tests.rs"]
 mod reflection_gpu_tests;
+
+#[cfg(test)]
+#[path = "deferred_terrain_gpu_tests.rs"]
+mod terrain_gpu_tests;
 
 /// How the level is drawn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -147,7 +154,15 @@ struct LightingUniforms {
     fog0: [f32; 4],
     fog1: [f32; 4],
     counts: [u32; 4],
+    depth_plane: [f32; 4],
     size: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+struct TileUniforms {
+    screen: crate::deferred_tiles::Masks,
+    depth: crate::deferred_tiles::DepthMasks,
 }
 
 #[repr(C)]
@@ -172,6 +187,8 @@ struct GpuLight {
 #[derive(Clone, Debug)]
 struct PlanDraw {
     alpha_test: bool,
+    /// 0: general material, 1: Static1, 2: terrain.
+    kind: usize,
     /// Its index in [`D3dPass::draws`].
     k: usize,
     /// Its scene draw.
@@ -191,6 +208,7 @@ struct PlanDraw {
 /// renderer is made, and its GPU objects, made the first time a frame is drawn deferred.
 pub(crate) struct DeferredPass {
     draws: Vec<PlanDraw>,
+    trees: trees::Plan,
     cutouts: Vec<crate::deferred_cutout::Draw>,
     cutout_materials: Vec<crate::deferred_cutout::Material>,
     data: Vec<DrawData>,
@@ -201,6 +219,7 @@ pub(crate) struct DeferredPass {
     skin_count: usize,
     /// Per faithful draw (index into [`D3dPass::draws`]): whether this pass draws it.
     takes: Vec<bool>,
+    logged_materials: bool,
     /// The index each room id has in the lights' room sets (1 on; 0 is "no room").
     rooms: HashMap<i64, u32>,
     light_rooms: HashMap<i64, Vec<i64>>,
@@ -222,6 +241,10 @@ pub(crate) struct DeferredPass {
     tight_tiles: Option<bool>,
     light_masks: Option<bool>,
     opaque_gbuffer: Option<bool>,
+    specialized_gbuffer: Option<bool>,
+    early_light_reject: Option<bool>,
+    depth_lights: Option<bool>,
+    direct_terrain_layers: Option<bool>,
 }
 
 pub(crate) struct Contributor<'a> {
@@ -231,9 +254,12 @@ pub(crate) struct Contributor<'a> {
 }
 
 struct Gpu {
+    trees: trees::Gpu,
     /// By cull mode: none, back, front.
     gbuffer: [wgpu::RenderPipeline; 3],
     gbuffer_opaque: [wgpu::RenderPipeline; 3],
+    gbuffer_static: Option<[[wgpu::RenderPipeline; 3]; 2]>,
+    gbuffer_terrain: Option<[wgpu::RenderPipeline; 3]>,
     /// Separate reflection for probe/AO and diagnostic modes (by cull mode).
     env: [wgpu::RenderPipeline; 3],
     lighting: wgpu::RenderPipeline,
@@ -250,7 +276,7 @@ struct Gpu {
     lighting_buffer: wgpu::Buffer,
     light_buffer: wgpu::Buffer,
     tile_buffer: wgpu::Buffer,
-    tiles: Vec<[u32; 8]>,
+    tiles: Option<TileUniforms>,
     mask_buffer: wgpu::Buffer,
     light_masks: Option<light_masks::Masks>,
     /// The shadowed lights' maps, and their faces' view-projections for the lighting.
@@ -602,6 +628,13 @@ impl DeferredPass {
             takes[k] = true;
             draws.push(PlanDraw {
                 alpha_test: alpha.is_some(),
+                kind: if is_terrain {
+                    2
+                } else if is_object {
+                    0
+                } else {
+                    1
+                },
                 k,
                 draw: d.draw,
                 mesh: d.mesh,
@@ -723,14 +756,66 @@ impl DeferredPass {
             &mut vertices,
             &mut skin_count,
         );
+        let trees = trees::Plan::new(scene, d3d, &mut takes);
+        if crate::config::CONFIG.log_materials {
+            // Count planned faithful passes, including offscreen and inactive LODs.
+            // Keep this at load time so even large foliage scenes pay once.
+            let mut counts: HashMap<&str, [usize; 2]> = HashMap::new();
+            for (k, d) in d3d.draws.iter().enumerate() {
+                counts.entry(&d3d.program(d).name).or_default()[usize::from(takes[k])] += 1;
+            }
+            let mut counts: Vec<_> = counts.into_iter().collect();
+            counts.sort_by(|a, b| b.1[0].cmp(&a.1[0]).then_with(|| a.0.cmp(b.0)));
+            for (program, [forward, gbuffer]) in counts {
+                log::info!(
+                    "deferred-material forward={forward} gbuffer={gbuffer} program={program}"
+                );
+            }
+            let mut particles: HashMap<&str, usize> = HashMap::new();
+            for d in &d3d.particles {
+                *particles.entry(&d3d.particle_program(d).name).or_default() += 1;
+            }
+            let mut particles: Vec<_> = particles.into_iter().collect();
+            particles.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            for (program, emitters) in particles {
+                log::info!("deferred-particle emitters={emitters} program={program}");
+            }
+            let mut reasons: HashMap<(&str, &str), usize> = HashMap::new();
+            for (_, d) in d3d.draws.iter().enumerate().filter(|(k, _)| !takes[*k]) {
+                let program = d3d.program(d);
+                let item = scene.draws.get(d.draw);
+                let reason = if scene.cut_away.contains(&d.draw) {
+                    "cutaway"
+                } else if d.multipass {
+                    "multipass"
+                } else if d3d.is_blended(d) {
+                    "blended"
+                } else if program.instanced {
+                    "instance-material"
+                } else if item.is_some_and(|i| i.lod.is_some()) {
+                    "lod-material"
+                } else if static1(program) || terrain(program) || object_material(program) {
+                    "geometry-or-control"
+                } else {
+                    "material"
+                };
+                *reasons.entry((&program.name, reason)).or_default() += 1;
+            }
+            let mut reasons: Vec<_> = reasons.into_iter().collect();
+            reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            for ((program, reason), draws) in reasons {
+                log::info!("deferred-reason draws={draws} reason={reason} program={program}");
+            }
+        }
         log::info!(
-            "deferred: {} of {} draws ({} terrain, {} props, {} character materials, {} skinned), planned in {:.1} ms ({} static draws)",
-            draws.len(),
+            "deferred: {} of {} draws ({} terrain, {} props, {} character materials, {} skinned, {} tree materials), planned in {:.1} ms ({} static draws)",
+            draws.len() + trees.len(),
             d3d.draws.len(),
             data.iter().filter(|d| d.room[2] > 0.5).count(),
             data.iter().filter(|d| d.material[0] == 1.0).count(),
             data.iter().filter(|d| d.material[0] == 2.0).count(),
             draws.iter().filter(|d| d.skin_slot > 0).count(),
+            trees.len(),
             started.elapsed().as_secs_f64() * 1000.0,
             scene.static_draws,
         );
@@ -744,8 +829,9 @@ impl DeferredPass {
                 .filter(|d| d.material[0] > 0.5 && d.alpha[0] > 0.5)
                 .count()
         );
-        (!draws.is_empty() || !cutouts.is_empty()).then(|| DeferredPass {
+        (!draws.is_empty() || !cutouts.is_empty() || !trees.is_empty()).then(|| DeferredPass {
             draws,
+            trees,
             cutouts,
             cutout_materials,
             data,
@@ -754,6 +840,7 @@ impl DeferredPass {
             vertices,
             skin_count,
             takes,
+            logged_materials: false,
             rooms,
             light_rooms: scene.light_rooms.clone(),
             gpu: None,
@@ -768,6 +855,10 @@ impl DeferredPass {
             tight_tiles: None,
             light_masks: None,
             opaque_gbuffer: None,
+            specialized_gbuffer: None,
+            early_light_reject: None,
+            depth_lights: None,
+            direct_terrain_layers: None,
         })
     }
 
@@ -794,6 +885,32 @@ impl DeferredPass {
 
     pub(crate) fn set_opaque_gbuffer(&mut self, enabled: Option<bool>) {
         self.opaque_gbuffer = enabled;
+    }
+
+    pub(crate) fn set_specialized_gbuffer(&mut self, enabled: Option<bool>) {
+        self.specialized_gbuffer = enabled;
+    }
+
+    pub(crate) fn set_early_light_reject(&mut self, enabled: Option<bool>) {
+        self.early_light_reject = enabled;
+    }
+
+    pub(crate) fn set_depth_lights(&mut self, enabled: Option<bool>) {
+        self.depth_lights = enabled;
+    }
+
+    pub(crate) fn set_direct_terrain_layers(&mut self, enabled: Option<bool>) {
+        self.direct_terrain_layers = enabled;
+    }
+
+    pub(crate) fn set_tree_materials(&mut self, enabled: Option<bool>) {
+        for family in trees::Family::NEW {
+            self.trees.set_enabled(family, enabled);
+        }
+    }
+
+    pub(crate) fn set_fronds(&mut self, enabled: Option<bool>) {
+        self.trees.set_enabled(trees::Family::Fronds, enabled);
     }
 
     /// Sets the lights only this pass draws (see [`DeferredPass::effect_lights`]).
@@ -1002,14 +1119,14 @@ impl DeferredPass {
                 })
             })
             .collect();
-        let make_gbuffer = |entry_point| {
+        let make_gbuffer = |entry_point, rigid| {
             [None, Some(wgpu::Face::Back), Some(wgpu::Face::Front)].map(|cull| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("deferred g-buffer"),
                 layout: Some(&gbuffer_layout),
                 vertex: wgpu::VertexState {
                     module: &module,
-                    entry_point: Some("vs_gbuffer"),
+                    entry_point: Some(if rigid { "vs_gbuffer_rigid" } else { "vs_gbuffer" }),
                     compilation_options: Default::default(),
                     buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<DeferredVertex>() as u64,
@@ -1044,8 +1161,19 @@ impl DeferredPass {
             })
         })
         };
-        let gbuffer = make_gbuffer("fs_gbuffer");
-        let gbuffer_opaque = make_gbuffer("fs_gbuffer_opaque");
+        let gbuffer = make_gbuffer("fs_gbuffer", false);
+        let gbuffer_opaque = make_gbuffer("fs_gbuffer_opaque", false);
+        let gbuffer_static = self.draws.iter().any(|d| d.kind == 1).then(|| {
+            [
+                make_gbuffer("fs_gbuffer_static", true),
+                make_gbuffer("fs_gbuffer_static_opaque", true),
+            ]
+        });
+        let gbuffer_terrain = self
+            .draws
+            .iter()
+            .any(|d| d.kind == 2)
+            .then(|| make_gbuffer("fs_gbuffer_terrain", true));
         let env = [None, Some(wgpu::Face::Back), Some(wgpu::Face::Front)].map(|cull| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("deferred reflection"),
@@ -1304,7 +1432,7 @@ impl DeferredPass {
         });
         let tile_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("deferred light tiles"),
-            size: std::mem::size_of::<crate::deferred_tiles::Masks>() as u64,
+            size: std::mem::size_of::<TileUniforms>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1346,8 +1474,11 @@ impl DeferredPass {
             (cull_index(d.cull), d.group, d.mesh)
         });
         Gpu {
+            trees: self.trees.build(device, &frame_buffer),
             gbuffer,
             gbuffer_opaque,
+            gbuffer_static,
+            gbuffer_terrain,
             env,
             lighting,
             mask_buffer,
@@ -1377,7 +1508,7 @@ impl DeferredPass {
             lighting_buffer,
             light_buffer,
             tile_buffer,
-            tiles: Vec::new(),
+            tiles: None,
             shadows: None,
             sun_fallback: device
                 .create_texture(&wgpu::TextureDescriptor {
@@ -1430,9 +1561,31 @@ impl DeferredPass {
         d3d: &D3dPass,
         rooms: &HashMap<i64, u32>,
         fused_reflections: bool,
+        direct_terrain_layers: bool,
     ) -> bool {
         if self.refused {
             return false;
+        }
+        self.trees.prepare(d3d, &mut self.takes);
+        if crate::config::CONFIG.log_materials && !self.logged_materials {
+            self.logged_materials = true;
+            let mut counts: HashMap<&str, [usize; 2]> = HashMap::new();
+            for (k, d) in d3d
+                .draws
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| d3d.in_view(*k))
+            {
+                let taken = self.takes[k] && !d3d.is_faded(d);
+                counts.entry(&d3d.program(d).name).or_default()[usize::from(taken)] += 1;
+            }
+            let mut counts: Vec<_> = counts.into_iter().collect();
+            counts.sort_by(|a, b| b.1[0].cmp(&a.1[0]).then_with(|| a.0.cmp(b.0)));
+            for (program, [forward, gbuffer]) in counts {
+                log::info!(
+                    "deferred-visible forward={forward} gbuffer={gbuffer} program={program}"
+                );
+            }
         }
         if self.gpu.is_none() {
             self.gpu = checked(&ctx.device, "the deferred renderer", || {
@@ -1482,7 +1635,7 @@ impl DeferredPass {
                 1.0 / width.max(1) as f32,
                 1.0 / height.max(1) as f32,
                 if fused_reflections { 1.0 } else { 0.0 },
-                0.0,
+                if direct_terrain_layers { 1.0 } else { 0.0 },
             ],
             fog: [
                 fog[0][3],
@@ -1548,6 +1701,9 @@ impl DeferredPass {
             && self.baked_lighting
             && contributors.iter().all(|c| c.pass.baked_lighting)
             && debug_view() == 0;
+        let direct_terrain_layers = self
+            .direct_terrain_layers
+            .unwrap_or(crate::config::CONFIG.direct_terrain_layers);
         for c in contributors.iter() {
             for &room in c.pass.rooms.keys() {
                 let next = self.rooms.len() as u32 + 1;
@@ -1564,6 +1720,7 @@ impl DeferredPass {
             d3d,
             &self.rooms.clone(),
             fused_reflections,
+            direct_terrain_layers,
         ) {
             return false;
         }
@@ -1576,6 +1733,7 @@ impl DeferredPass {
                 c.d3d,
                 &self.rooms,
                 fused_reflections,
+                direct_terrain_layers,
             );
         }
         let characters = self.data.iter().any(|d| d.material[0] > 1.5)
@@ -1732,10 +1890,20 @@ impl DeferredPass {
                 .unwrap_or(crate::config::CONFIG.tiled_lights),
             tight,
         );
-        if gpu.tiles.as_slice() != tiles {
+        let depth_plane = -view.row(2);
+        let tile_uniforms = TileUniforms {
+            screen: tiles,
+            depth: crate::deferred_tiles::depth_masks(
+                depth_plane,
+                gpu.lights.iter().map(|l| l.position),
+                if debug_view() == 9 { 2.0 } else { 1.0 },
+                true,
+            ),
+        };
+        if gpu.tiles.as_ref() != Some(&tile_uniforms) {
             ctx.queue
-                .write_buffer(&gpu.tile_buffer, 0, bytemuck::cast_slice(&tiles));
-            gpu.tiles = tiles.to_vec();
+                .write_buffer(&gpu.tile_buffer, 0, bytemuck::bytes_of(&tile_uniforms));
+            gpu.tiles = Some(tile_uniforms);
         }
         if crate::config::CONFIG.log_lights {
             static ONCE: [std::sync::Once; 2] = [std::sync::Once::new(), std::sync::Once::new()];
@@ -1779,11 +1947,18 @@ impl DeferredPass {
                     1
                 },
             ],
+            depth_plane: depth_plane.to_array(),
             size: [
                 width as f32,
                 height as f32,
                 if fused_reflections { 1.0 } else { 0.0 },
-                0.0,
+                (u32::from(
+                    self.early_light_reject
+                        .unwrap_or(crate::config::CONFIG.early_light_reject),
+                ) | (u32::from(
+                    self.depth_lights
+                        .unwrap_or(crate::config::CONFIG.depth_lights),
+                ) << 1)) as f32,
             ],
         };
         let sun = SunUniforms {
@@ -1875,12 +2050,19 @@ impl DeferredPass {
             let opaque = self
                 .opaque_gbuffer
                 .unwrap_or(crate::config::CONFIG.opaque_gbuffer);
+            let specialized = self
+                .specialized_gbuffer
+                .unwrap_or(crate::config::CONFIG.specialized_gbuffer)
+                // Separate reflection redraws use the general vertex entry point.
+                // Retain identical clip/depth evaluation across those two passes.
+                && fused_reflections;
             draw_all(
                 &self.draws,
                 &mut pass,
                 gpu,
                 &gpu.gbuffer,
                 opaque.then_some(&gpu.gbuffer_opaque),
+                specialized,
                 d3d,
                 meshes,
             );
@@ -1892,9 +2074,16 @@ impl DeferredPass {
                         g,
                         &g.gbuffer,
                         opaque.then_some(&g.gbuffer_opaque),
+                        specialized,
                         c.d3d,
                         c.meshes,
                     );
+                }
+            }
+            self.trees.draw(&gpu.trees, &mut pass, d3d, meshes);
+            for c in contributors.iter() {
+                if let Some(g) = c.pass.gpu.as_ref() {
+                    c.pass.trees.draw(&g.trees, &mut pass, c.d3d, c.meshes);
                 }
             }
         }
@@ -1957,10 +2146,28 @@ impl DeferredPass {
             multiview_mask: None,
         });
         pass.set_bind_group(2, gpu.sun_group.as_ref().expect("sun targets"), &[]);
-        draw_all(&self.draws, &mut pass, gpu, &gpu.env, None, d3d, meshes);
+        draw_all(
+            &self.draws,
+            &mut pass,
+            gpu,
+            &gpu.env,
+            None,
+            false,
+            d3d,
+            meshes,
+        );
         for c in contributors.iter() {
             if let Some(g) = c.pass.gpu.as_ref() {
-                draw_all(&c.pass.draws, &mut pass, g, &g.env, None, c.d3d, c.meshes);
+                draw_all(
+                    &c.pass.draws,
+                    &mut pass,
+                    g,
+                    &g.env,
+                    None,
+                    false,
+                    c.d3d,
+                    c.meshes,
+                );
             }
         }
         drop(pass);
@@ -2153,6 +2360,7 @@ fn draw_all(
     gpu: &Gpu,
     pipelines: &[wgpu::RenderPipeline; 3],
     opaque_pipelines: Option<&[wgpu::RenderPipeline; 3]>,
+    specialized: bool,
     d3d: &D3dPass,
     meshes: &[GpuMesh],
 ) {
@@ -2167,9 +2375,20 @@ fn draw_all(
         };
         let p = cull_index(d.cull);
         let opaque = opaque_pipelines.filter(|_| !d.alpha_test);
-        let key = p + if opaque.is_some() { 3 } else { 0 };
+        let family = if specialized && d.skin_slot == 0 {
+            d.kind
+        } else {
+            0
+        };
+        let selected = match family {
+            1 => &gpu.gbuffer_static.as_ref().expect("static pipelines")
+                [usize::from(opaque.is_some())],
+            2 => gpu.gbuffer_terrain.as_ref().expect("terrain pipelines"),
+            _ => opaque.unwrap_or(pipelines),
+        };
+        let key = family * 6 + p + if opaque.is_some() { 3 } else { 0 };
         if key != pipeline {
-            pass.set_pipeline(&opaque.unwrap_or(pipelines)[p]);
+            pass.set_pipeline(&selected[p]);
             pipeline = key;
         }
         if d.group != group {
@@ -2318,7 +2537,8 @@ mod tests {
     #[test]
     fn material_and_skin_uniforms_fit_portable_limits() {
         assert_eq!(MAX_LIGHTS, 192);
-        assert!(std::mem::size_of::<crate::deferred_tiles::Masks>() <= 16 * 1024);
+        assert_eq!(std::mem::size_of::<TileUniforms>(), 5120);
+        assert!(std::mem::size_of::<TileUniforms>() <= 16 * 1024);
         assert!(std::mem::size_of::<DrawUniforms>() <= DRAW_STRIDE);
         assert_eq!(DRAW_STRIDE % 256, 0);
         assert_eq!(SKIN_STRIDE % 256, 0);
@@ -2340,16 +2560,43 @@ mod tests {
         .validate(&module)
         .unwrap();
         for (i, entry) in module.entry_points.iter().enumerate() {
+            if entry.name == "vs_gbuffer_rigid" {
+                let used = info.get_entry_point(i);
+                let (skin, _) = module
+                    .global_variables
+                    .iter()
+                    .find(|(_, v)| v.name.as_deref() == Some("skin"))
+                    .unwrap();
+                assert!(
+                    used[skin].is_empty(),
+                    "rigid vertices must not read a bone palette"
+                );
+            }
             if entry.stage != naga::ShaderStage::Fragment {
                 continue;
             }
             let used = info.get_entry_point(i);
-            if entry.name == "fs_gbuffer_opaque" {
+            if entry.name.starts_with("fs_gbuffer_static") {
+                for (handle, variable) in module.global_variables.iter() {
+                    if variable.binding.as_ref().is_some_and(|b| {
+                        b.group == 1 && matches!(b.binding, 7 | 8 | 9 | 11 | 12 | 15)
+                    }) {
+                        assert!(
+                            used[handle].is_empty(),
+                            "Static1 must not reach terrain/head samplers"
+                        );
+                    }
+                }
+            }
+            if matches!(
+                entry.name.as_str(),
+                "fs_gbuffer_opaque" | "fs_gbuffer_static_opaque" | "fs_gbuffer_terrain"
+            ) {
                 assert!(
                     !used.may_kill,
                     "opaque G-buffer must have no reachable discard"
                 );
-            } else if entry.name == "fs_gbuffer" {
+            } else if matches!(entry.name.as_str(), "fs_gbuffer" | "fs_gbuffer_static") {
                 assert!(used.may_kill, "cutout G-buffer must retain alpha rejection");
             }
             let textures = module

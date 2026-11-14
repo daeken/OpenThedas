@@ -1121,6 +1121,54 @@ mod tests {
     }
 
     #[test]
+    fn mouse_button_constants_are_undefined_at_movie_init() {
+        use thedas_gfx::avm1::value::Value;
+
+        // Observe the globals from the movie's own DoInitAction, before the host's
+        // frame-one glue. Capture typeof so a missing initializer cannot pass.
+        let mut init = Vec::new();
+        for name in ["MIDDLE", "RIGHT", "LEFT"] {
+            get_path(&mut init, &["_root"]);
+            push(&mut init, &[Push::Str(name)]);
+            get_path(&mut init, &["_global", "Mouse", name]);
+            init.extend_from_slice(&[TYPEOF, SET_MEMBER]);
+        }
+        init.push(0);
+        let mut movie = b"FWS\x08\0\0\0\0\x08\0\0\x1e\x01\0".to_vec();
+        movie.extend_from_slice(&((59u16 << 6) | 63).to_le_bytes());
+        movie.extend_from_slice(&((init.len() + 2) as u32).to_le_bytes());
+        movie.extend_from_slice(&0u16.to_le_bytes());
+        movie.extend(init);
+        movie.extend_from_slice(&[0x40, 0, 0, 0]); // ShowFrame, End.
+        let len = movie.len() as u32;
+        movie[4..8].copy_from_slice(&len.to_le_bytes());
+        let mut player = thedas_gfx::Player::new(
+            &movie,
+            "mouse-init-test",
+            Box::new(Empty),
+            std::sync::Arc::new(Empty),
+            Some(register_invoke()),
+        )
+        .unwrap();
+        let root = player.vm.display_object(player.vm.root);
+        let mouse = Value::Object(player.vm.mouse);
+        for name in ["MIDDLE", "RIGHT", "LEFT"] {
+            assert_eq!(
+                player.vm.get(&root, name),
+                Value::from("undefined"),
+                "{name}"
+            );
+            assert_eq!(player.vm.get(&mouse, name), Value::Undefined, "{name}");
+        }
+        let global = Value::Object(player.vm.global);
+        player.vm.call_method(&global, "thedas_install", &[]);
+        player.run_frame();
+        for name in ["MIDDLE", "RIGHT", "LEFT"] {
+            assert_eq!(player.vm.get(&mouse, name), Value::Undefined, "{name}");
+        }
+    }
+
+    #[test]
     fn native_mouse_arguments_and_empty_callbacks_need_no_compatibility_globals() {
         use thedas_gfx::HostValue;
         use thedas_gfx::avm1::value::Value;

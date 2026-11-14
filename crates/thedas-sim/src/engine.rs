@@ -47,6 +47,24 @@ fn obj(a: &[Value], i: usize) -> ObjectId {
     }
 }
 
+/// Origins' health lookup rejects module/area/party objects; these other kinds
+/// inherit CCObject's -1 maximum getter and no-op setter. See script-base-health.md.
+fn origins_has_no_health(kind: ObjectKind) -> bool {
+    matches!(
+        kind,
+        ObjectKind::Module
+            | ObjectKind::Area
+            | ObjectKind::Party
+            | ObjectKind::Item
+            | ObjectKind::Trigger
+            | ObjectKind::Sound
+            | ObjectKind::Waypoint
+            | ObjectKind::Projectile
+            | ObjectKind::Store
+            | ObjectKind::AreaOfEffect
+    )
+}
+
 /// What `GetHasEffects`, `GetEffects` and `RemoveEffectsByParameters` select effects by, as
 /// script.ldf documents them: an effect type (`EFFECT_TYPE_INVALID`, 0, for any), an ability
 /// (−1 for any, `GetHasEffects`' default; 0, `ABILITY_INVALID`, for any, the other two's
@@ -1321,8 +1339,14 @@ pub fn call(
         "IsDead" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.dead))),
         "IsImmortal" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.immortal))),
         "SetImmortal" | "Engine_SetImmortal" => {
+            let origins = h.sim.game == thedas_vfs::Game::Origins;
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
                 o.immortal = int(a, 1) != 0;
+                // 0x6ad130 -> property 7 +0x30: write the floor without
+                // reclamping current. Other objects use the flag-only virtual.
+                if origins && o.kind == ObjectKind::Creature && o.properties.contains_key(&7) {
+                    o.health_floor_one = o.immortal;
+                }
             }
             void()
         }
@@ -1401,7 +1425,20 @@ pub fn call(
         "GetDistanceBetween" => {
             let (x, y) = (h.object(obj(a, 0)), h.object(obj(a, 1)));
             ok(Value::Float(match (x, y) {
-                (Some(x), Some(y)) if x.area == y.area => dist(x.position, y.position),
+                (Some(x), Some(y)) if x.area == y.area => {
+                    let distance = dist(x.position, y.position);
+                    if h.sim.game == thedas_vfs::Game::DragonAge2
+                        && int(a, 2) != 0
+                        && x.kind == ObjectKind::Creature
+                        && y.kind == ObjectKind::Creature
+                    {
+                        // 0x4db770 subtracts both personal spaces when asked;
+                        // overlapping creatures may return a negative distance.
+                        distance - h.sim.body_radius(x.id) - h.sim.body_radius(y.id)
+                    } else {
+                        distance
+                    }
+                }
                 _ => -1.0,
             }))
         }
@@ -1953,12 +1990,22 @@ pub fn call(
         // (0x66cd00 -> 0x79c8d0). That setter clamps between the property's current floor
         // and computed total. Mana's floor stays at its initialized zero; the immortality
         // setter changes health's floor only (0x6ad130). See notes/mana-property-floor.md.
-        "GetCreatureMana" | "GetCreatureMaxMana" => {
-            let (id, p) = (obj(a, 0), PROPERTY_MANA_STAMINA);
+        // DA2's renamed stamina calls use property 10: 0x4fb030 reads current,
+        // 0x4fb110 reads total, and both truncate to int (-1 for a non-creature).
+        "GetCreatureMana"
+        | "GetCreatureMaxMana"
+        | "GetCreatureStamina"
+        | "GetCreatureMaxStamina" => {
+            let id = obj(a, 0);
+            let p = if name.ends_with("Stamina") {
+                10
+            } else {
+                PROPERTY_MANA_STAMINA
+            };
             let creature = h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature);
             ok(Value::Int(if !creature {
                 -1
-            } else if name == "GetCreatureMana" {
+            } else if matches!(name, "GetCreatureMana" | "GetCreatureStamina") {
                 h.object(id)
                     .and_then(|o| o.properties.get(&p))
                     .map_or(0.0, |v| v.1) as i32
@@ -1966,20 +2013,28 @@ pub fn call(
                 h.sim.property_total(id, p) as i32
             }))
         }
-        "SetCreatureMana" => {
-            let (id, p) = (obj(a, 0), PROPERTY_MANA_STAMINA);
-            let origins = h.sim.game == thedas_vfs::Game::Origins;
+        "SetCreatureMana" | "SetCreatureStamina" => {
+            // DA2 0x4fb0a0 passes the integer as a float to property 10's current setter.
+            let id = obj(a, 0);
+            let p = if name == "SetCreatureStamina" {
+                10
+            } else {
+                PROPERTY_MANA_STAMINA
+            };
+            let origins = name == "SetCreatureMana" && h.sim.game == thedas_vfs::Game::Origins;
             if h.object(id).is_some_and(|o| {
                 o.kind == ObjectKind::Creature && (!origins || o.properties.contains_key(&p))
             }) {
-                let total = h.sim.property_total(id, p);
                 let requested = int(a, 1) as f32;
                 let current = if origins {
-                    // 0x79c2d0 applies the floor first, then selects the total when it
-                    // is smaller or unordered. A negative total stays negative.
-                    let floored = requested.max(0.0);
-                    if total > floored { floored } else { total }
+                    h.sim.clamped_current(id, p, requested)
                 } else {
+                    let mut total = h.sim.property_total(id, p);
+                    if name == "SetCreatureStamina" {
+                        // Retain DA2's reserved-stamina setter, including its clamp order.
+                        let reserved = h.sim.property_total(id, 11).clamp(0.0, 100.0);
+                        total *= 1.0 - reserved * 0.01;
+                    }
                     requested.clamp(0.0, total.max(0.0))
                 };
                 if let Some(o) = h.sim.world.get_mut(id) {
@@ -3371,10 +3426,38 @@ pub fn call(
             }
             void()
         }
+        "Deprecated_GetMaxHealth" | "SetMaxHealth"
+            if h.sim.game == thedas_vfs::Game::Origins
+                && h.object(obj(a, 0))
+                    .is_none_or(|o| origins_has_no_health(o.kind)) =>
+        {
+            // 0x65a2c0 / 0x65a330: failed CCObject lookup, or base virtuals
+            // 0x4e13d0 / 0x455850. Do not read fields or create a health property.
+            if name == "Deprecated_GetMaxHealth" {
+                ok(Value::Int(-1))
+            } else {
+                void()
+            }
+        }
         "SetMaxHealth" => {
-            // PROPERTY_DEPLETABLE_HEALTH: base is the maximum, current is clamped to it.
-            let health = constant(&h.sim.table, "PROPERTY_DEPLETABLE_HEALTH");
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+            let id = obj(a, 0);
+            if h.sim.game == thedas_vfs::Game::Origins
+                && h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature)
+            {
+                // 0x65a330 -> 0x6ab5b0 writes existing health's CURRENT, after
+                // sign-extending the low 16 argument bits. The base stays put.
+                let current = h.sim.clamped_current(id, 7, f32::from(int(a, 1) as i16));
+                if let Some(v) = h
+                    .sim
+                    .world
+                    .get_mut(id)
+                    .and_then(|o| o.properties.get_mut(&7))
+                {
+                    v.1 = current;
+                }
+            } else if let Some(o) = h.sim.world.get_mut(id) {
+                // Other object virtuals and DA2 retain their provisional paths.
+                let health = constant(&h.sim.table, "PROPERTY_DEPLETABLE_HEALTH");
                 let max = int(a, 1) as f32;
                 let e = o.properties.entry(health).or_insert((max, max));
                 e.0 = max;
@@ -4076,8 +4159,12 @@ pub fn call(
                     .get("EVENT_TARGET")
                     .copied()
                     .unwrap_or(caller);
-                let ms = p.fields.get("FlightMs").copied().unwrap_or(0).max(0) as u64;
-                h.sim.world.queue_event(ms, target, ev, None);
+                if h.sim.game == thedas_vfs::Game::DragonAge2 {
+                    h.sim.world.set_projectile_impact_event(proj, target, ev);
+                } else {
+                    let ms = p.fields.get("FlightMs").copied().unwrap_or(0).max(0) as u64;
+                    h.sim.world.queue_event(ms, target, ev, None);
+                }
             }
             void()
         }
@@ -4283,9 +4370,12 @@ pub fn call(
             }
             void()
         }
-        "IsAbilityAvailable" => ok(b(h
-            .object(obj(a, 0))
-            .is_some_and(|o| o.abilities.contains(&int(a, 1))))),
+        "IsAbilityAvailable" => ok(b(if h.sim.game == thedas_vfs::Game::DragonAge2 {
+            h.sim.da2_ability_available(obj(a, 0), int(a, 1))
+        } else {
+            h.object(obj(a, 0))
+                .is_some_and(|o| o.abilities.contains(&int(a, 1)))
+        })),
         "LoadItemsFromTemplate" => {
             h.sim
                 .load_items_from_template(obj(a, 0), &string(a, 1), int(a, 2) != 0);
@@ -4516,12 +4606,9 @@ pub fn call(
         }
         "SetCanLevelUp" => {
             let who = obj(a, 0);
-            let points: f32 = [34, 35, 36]
-                .iter()
-                .map(|&p| h.sim.property_total(who, p))
-                .sum();
+            let can = h.sim.has_level_up_points(who);
             if let Some(o) = h.sim.world.get_mut(who) {
-                o.fields.insert("CanLevelUp".into(), (points > 0.0) as i32);
+                o.fields.insert("CanLevelUp".into(), i32::from(can));
             }
             void()
         }
@@ -4710,6 +4797,10 @@ pub fn call(
         // DAOrigins.exe (0x665570, 0x7556d0) adds up the power of every one of the item's
         // properties with that id, then, with bIncludeSubItems, its sub-items' (runes) the
         // same way; 0 for what is not an item. Provisional: items hold no sub-items.
+        "GetItemPropertyPower" if h.sim.game == thedas_vfs::Game::DragonAge2 => ok(Value::Float(
+            h.sim
+                .da2_item_property_power(obj(a, 0), int(a, 1), int(a, 3) != 0),
+        )),
         "GetItemPropertyPower" => {
             let (item, p) = (obj(a, 0), int(a, 1));
             let power = if h.object(item).is_some_and(|o| o.kind == ObjectKind::Item) {
@@ -4726,6 +4817,15 @@ pub fn call(
         }
         // The item's property ids, in order (DAOrigins.exe 0x674260). Provisional: the
         // order and, with bIncludeSubItems, sub-items' (items hold none yet).
+        "GetItemProperties" if h.sim.game == thedas_vfs::Game::DragonAge2 => ok(Value::Array {
+            elem: Type::Int,
+            items: h
+                .sim
+                .da2_item_property_ids(obj(a, 0), if a.get(2).is_some() { int(a, 2) } else { -1 })
+                .into_iter()
+                .map(Value::Int)
+                .collect(),
+        }),
         "GetItemProperties" => ok(Value::Array {
             elem: Type::Int,
             items: if h
@@ -5456,11 +5556,16 @@ impl Sim {
                 o.properties.entry(p).or_insert((0.0, 0.0)).0 = value;
             }
         } else if vt == current && kind == PropertyKind::Depletable {
-            let max = self.property_total(id, p);
+            let previous = self
+                .world
+                .get(id)
+                .and_then(|o| o.properties.get(&p))
+                .map_or(0.0, |e| e.1);
+            let v = if update { previous + value } else { value };
+            let v = self.clamped_current(id, p, v);
             if let Some(o) = self.world.get_mut(id) {
                 let e = o.properties.entry(p).or_insert((0.0, 0.0));
-                let v = if update { e.1 + value } else { value };
-                e.1 = v.clamp(0.0, max.max(0.0));
+                e.1 = v;
             }
         } else if vt == modifier && kind != PropertyKind::Simple {
             let gear = self.equipment_bonus(id, p);
@@ -7118,6 +7223,107 @@ mod tests {
     }
 
     #[test]
+    fn da2_projectile_payload_changes_do_not_restart_flight_or_add_hits() {
+        let table = Arc::new(
+            EngineTable::parse(
+                br#"
+            #define ENGINE_STRUCTURE_0 event
+            event Event(int type) = 1;
+            object FireProjectile(int type, vector source, vector target, int crust,
+                int wide, object receiver) = 193;
+            void SetProjectileImpactEvent(object projectile, event payload) = 371;
+        "#,
+            )
+            .unwrap(),
+        );
+        for game in [thedas_vfs::Game::DragonAge2, thedas_vfs::Game::Origins] {
+            let mut s = Sim::new(Arc::new(Vfs::new()), table.clone(), 1);
+            s.game = game;
+            let caller = s.world.spawn(ObjectKind::Creature, "caster");
+            let receiver = s.world.spawn(ObjectKind::Creature, "receiver");
+            // The deadline must remain a u64, including in worlds older than i32 ms.
+            let launch = i32::MAX as u64 + 100;
+            s.world.time_ms = launch;
+            let projectile = run(
+                &mut s,
+                caller,
+                "FireProjectile",
+                &[
+                    Value::Int(17),
+                    Value::Vector([0.0; 3]),
+                    Value::Vector([20.0, 0.0, 0.0]),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Object(receiver),
+                ],
+            )
+            .unwrap();
+            let first = run(&mut s, caller, "Event", &[Value::Int(100)]).unwrap();
+            let second = run(&mut s, caller, "Event", &[Value::Int(200)]).unwrap();
+            s.world.time_ms = launch + 250;
+            run(
+                &mut s,
+                caller,
+                "SetProjectileImpactEvent",
+                &[projectile.clone(), first],
+            );
+            // Save with a custom impact pending, then change it after reloading.
+            s.world = serde_json::from_slice(&serde_json::to_vec(&s.world).unwrap()).unwrap();
+            s.world.time_ms = launch + 500;
+            run(
+                &mut s,
+                caller,
+                "SetProjectileImpactEvent",
+                &[projectile.clone(), second],
+            );
+            if game == thedas_vfs::Game::DragonAge2 {
+                // An unrelated event for the same receiver is not replaced.
+                s.world.queue_event(
+                    500,
+                    receiver,
+                    Event {
+                        ty: 300,
+                        ..Default::default()
+                    },
+                    None,
+                );
+                assert!(s.world.pop_due(launch + 999).is_none());
+                let (due, hit) = s.world.pop_due(launch + 1000).unwrap();
+                assert_eq!(due, launch + 1000);
+                assert_eq!(hit.target, receiver);
+                assert_eq!(hit.event.ty, 200);
+                assert_eq!(hit.event.creator, Some(caller));
+                assert_eq!(s.world.pop_due(launch + 1000).unwrap().1.event.ty, 300);
+                assert!(s.world.pop_due(u64::MAX).is_none());
+                s.world.time_ms = launch + 1000;
+                s.world.destroy_due();
+                assert!(
+                    !s.world
+                        .objects
+                        .values()
+                        .any(|o| o.kind == ObjectKind::Projectile)
+                );
+                // Non-projectiles cannot acquire an impact event.
+                let event = run(&mut s, caller, "Event", &[Value::Int(400)]).unwrap();
+                run(
+                    &mut s,
+                    caller,
+                    "SetProjectileImpactEvent",
+                    &[Value::Object(caller), event],
+                );
+                assert!(s.world.pop_due(u64::MAX).is_none());
+            } else {
+                // Origins keeps its prior scheduling behavior in this DA2-only fix.
+                let (due, hit) = s.world.pop_due(u64::MAX).unwrap();
+                assert_eq!((due, hit.event.ty), (launch + 1250, 100));
+                let (due, hit) = s.world.pop_due(u64::MAX).unwrap();
+                assert_eq!((due, hit.event.ty), (launch + 1500, 200));
+                assert!(s.world.pop_due(u64::MAX).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn unnamed_constructor_types_are_observable_through_the_script_accessor() {
         let table = Arc::new(
             EngineTable::parse(
@@ -7443,6 +7649,276 @@ mod tests {
         assert!(s.world.get(hero).unwrap().followers.is_empty());
     }
 
+    fn health_floor_sim() -> Sim {
+        let table = EngineTable::parse(
+            b"int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
+              int PROPERTY_VALUE_TOTAL = 1;\n\
+              int PROPERTY_VALUE_BASE = 2;\n\
+              int PROPERTY_VALUE_CURRENT = 3;\n\
+              int PROPERTY_VALUE_MODIFIER = 4;\n\
+              void SetMaxHealth(object o, int n) = 1;\n\
+              void SetImmortal(object o, int n) = 2;\n\
+              void Engine_SetImmortal(object o, int n) = 3;\n\
+              void SetCreatureProperty(object o, int p, float v, int t) = 4;\n\
+              void UpdateCreatureProperty(object o, int p, float v, int t) = 5;\n\
+              void SetCreatureMana(object o, int n) = 6;",
+        )
+        .unwrap();
+        Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1)
+    }
+
+    #[test]
+    fn origins_set_max_health_writes_current_using_a_signed_short() {
+        let mut s = health_floor_sim();
+        let id = s.world.spawn(ObjectKind::Creature, "creature");
+        let o = s.world.get_mut(id).unwrap();
+        o.properties.insert(7, (40.0, 12.0));
+        o.modifiers.insert(7, 13.5);
+        o.dead = true;
+        o.active = false;
+        for (requested, expected) in [
+            (i32::MIN, 0.0),
+            (-65537, 0.0),
+            (-32769, 53.5),
+            (-32768, 0.0),
+            (-1, 0.0),
+            (0, 0.0),
+            (1, 1.0),
+            (30, 30.0),
+            (32767, 53.5),
+            (32768, 0.0),
+            (65535, 0.0),
+            (65536, 0.0),
+            (i32::MAX, 0.0),
+        ] {
+            let queued = s.world.queue.len();
+            run(
+                &mut s,
+                id,
+                "SetMaxHealth",
+                &[Value::Object(id), Value::Int(requested)],
+            );
+            let o = s.world.get(id).unwrap();
+            assert_eq!(o.properties[&7], (40.0, expected), "{requested}");
+            assert_eq!(o.modifiers[&7], 13.5);
+            assert!(o.dead);
+            assert!(!o.active);
+            assert_eq!(s.world.queue.len(), queued);
+        }
+        s.world.get_mut(id).unwrap().properties.remove(&7);
+        run(
+            &mut s,
+            id,
+            "SetMaxHealth",
+            &[Value::Object(id), Value::Int(90)],
+        );
+        assert!(!s.world.get(id).unwrap().properties.contains_key(&7));
+        run(
+            &mut s,
+            id,
+            "SetMaxHealth",
+            &[Value::Object(OBJECT_INVALID), Value::Int(90)],
+        );
+    }
+
+    #[test]
+    fn health_floor_is_distinct_from_the_flag_and_survives_our_saves_and_clones() {
+        let mut s = health_floor_sim();
+        let id = s.world.spawn(ObjectKind::Creature, "creature");
+        let o = s.world.get_mut(id).unwrap();
+        o.properties.insert(7, (40.0, 0.0));
+        o.immortal = true; // Flag-only construction/loading must not infer a floor.
+        let saved = s.save_json().unwrap();
+        assert!(
+            !std::str::from_utf8(&saved)
+                .unwrap()
+                .contains("health_floor_one")
+        );
+        s.load_json(&saved).unwrap();
+        run(
+            &mut s,
+            id,
+            "SetMaxHealth",
+            &[Value::Object(id), Value::Int(-1)],
+        );
+        assert_eq!(s.world.get(id).unwrap().properties[&7].1, 0.0);
+        for setter in ["SetImmortal", "Engine_SetImmortal"] {
+            for flag in [-2, 0, 2] {
+                let before = s.world.get(id).unwrap().properties[&7];
+                run(&mut s, id, setter, &[Value::Object(id), Value::Int(flag)]);
+                let o = s.world.get(id).unwrap();
+                assert_eq!(o.properties[&7], before, "the floor setter must not clamp");
+                assert_eq!(o.immortal, flag != 0);
+                assert_eq!(o.health_floor_one, flag != 0);
+                assert_eq!(o.clone().health_floor_one, flag != 0);
+                s.load_json(&s.save_json().unwrap()).unwrap();
+                run(
+                    &mut s,
+                    id,
+                    "SetMaxHealth",
+                    &[Value::Object(id), Value::Int(-1)],
+                );
+                assert_eq!(
+                    s.world.get(id).unwrap().properties[&7],
+                    (40.0, f32::from(flag != 0))
+                );
+            }
+        }
+        let absent = s.world.spawn(ObjectKind::Creature, "absent");
+        let chest = s.world.spawn(ObjectKind::Placeable, "chest");
+        s.world
+            .get_mut(chest)
+            .unwrap()
+            .properties
+            .insert(7, (40.0, 12.0));
+        for target in [absent, chest] {
+            run(
+                &mut s,
+                id,
+                "SetImmortal",
+                &[Value::Object(target), Value::Int(1)],
+            );
+            let o = s.world.get(target).unwrap();
+            assert!(o.immortal);
+            assert!(!o.health_floor_one);
+        }
+        assert!(!s.world.get(absent).unwrap().properties.contains_key(&7));
+        s.world
+            .get_mut(absent)
+            .unwrap()
+            .properties
+            .insert(7, (40.0, 12.0));
+        run(
+            &mut s,
+            id,
+            "SetMaxHealth",
+            &[Value::Object(absent), Value::Int(0)],
+        );
+        assert_eq!(s.world.get(absent).unwrap().properties[&7], (40.0, 0.0));
+        // Other virtuals and DA2 keep their previous paths in this creature-only slice.
+        for (game, target) in [
+            (thedas_vfs::Game::Origins, chest),
+            (thedas_vfs::Game::DragonAge2, id),
+        ] {
+            s.game = game;
+            s.world
+                .get_mut(target)
+                .unwrap()
+                .properties
+                .insert(7, (40.0, 12.0));
+            run(
+                &mut s,
+                id,
+                "SetMaxHealth",
+                &[Value::Object(target), Value::Int(30)],
+            );
+            assert_eq!(s.world.get(target).unwrap().properties[&7], (30.0, 12.0));
+        }
+    }
+
+    #[test]
+    fn depletable_writes_apply_the_health_floor_before_the_total() {
+        let mut s = health_floor_sim();
+        let id = s.world.spawn(ObjectKind::Creature, "creature");
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .properties
+            .insert(7, (40.0, 12.0));
+        run(
+            &mut s,
+            id,
+            "SetImmortal",
+            &[Value::Object(id), Value::Int(1)],
+        );
+        for (base, modifier, expected) in [
+            (40.0, 0.0, 1.0),
+            (0.5, 0.0, 0.5),
+            (0.0, 0.0, 0.0),
+            (40.0, -45.0, -5.0),
+        ] {
+            let o = s.world.get_mut(id).unwrap();
+            o.properties.insert(7, (base, 12.0));
+            o.modifiers.insert(7, modifier);
+            run(
+                &mut s,
+                id,
+                "SetMaxHealth",
+                &[Value::Object(id), Value::Int(-1)],
+            );
+            assert_eq!(s.world.get(id).unwrap().properties[&7], (base, expected));
+        }
+        s.world.get_mut(id).unwrap().modifiers.clear();
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .properties
+            .insert(7, (40.0, 0.0));
+        for setter in ["SetCreatureProperty", "UpdateCreatureProperty"] {
+            run(
+                &mut s,
+                id,
+                setter,
+                &[
+                    Value::Object(id),
+                    Value::Int(7),
+                    Value::Float(-10.0),
+                    Value::Int(3),
+                ],
+            );
+            assert_eq!(s.world.get(id).unwrap().properties[&7], (40.0, 1.0));
+        }
+        // Changing a base also runs the native current setter.
+        run(
+            &mut s,
+            id,
+            "SetCreatureProperty",
+            &[
+                Value::Object(id),
+                Value::Int(7),
+                Value::Float(0.5),
+                Value::Int(2),
+            ],
+        );
+        assert_eq!(s.world.get(id).unwrap().properties[&7], (0.5, 0.5));
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .properties
+            .insert(8, (40.0, 12.0));
+        run(
+            &mut s,
+            id,
+            "SetCreatureMana",
+            &[Value::Object(id), Value::Int(-1)],
+        );
+        assert_eq!(s.world.get(id).unwrap().properties[&8], (40.0, 0.0));
+        let o = s.world.get_mut(id).unwrap();
+        o.properties.insert(7, (f32::NAN, 12.0));
+        run(
+            &mut s,
+            id,
+            "SetMaxHealth",
+            &[Value::Object(id), Value::Int(30)],
+        );
+        assert!(s.world.get(id).unwrap().properties[&7].1.is_nan());
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .properties
+            .insert(7, (40.0, f32::NAN));
+        s.clamp_current(id, 7);
+        assert_eq!(s.world.get(id).unwrap().properties[&7].1, 1.0);
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .properties
+            .insert(7, (40.0, 0.0));
+        s.clamp_current(id, 7);
+        assert_eq!(s.world.get(id).unwrap().properties[&7].1, 0.0);
+    }
+
     #[test]
     fn deprecated_max_health_reads_the_origins_creatures_bounded_total() {
         let table =
@@ -7530,7 +8006,9 @@ mod tests {
         for kind in [
             ObjectKind::Creature,
             ObjectKind::Placeable,
-            ObjectKind::Item,
+            ObjectKind::Stage,
+            ObjectKind::Map,
+            ObjectKind::MapPin,
         ] {
             let id = s.world.spawn(kind, "target");
             s.world
@@ -7559,6 +8037,100 @@ mod tests {
                         "{game:?} {kind:?} {maximum:?}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn origins_base_objects_have_no_maximum_health_and_ignore_its_setter() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"int Deprecated_GetMaxHealth(object o) = 235;\n\
+                  void SetMaxHealth(object o, int n) = 236;\n\
+                  int PROPERTY_DEPLETABLE_HEALTH = 7;",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for kind in [
+            ObjectKind::Module,
+            ObjectKind::Area,
+            ObjectKind::Party,
+            ObjectKind::Item,
+            ObjectKind::Trigger,
+            ObjectKind::Sound,
+            ObjectKind::Waypoint,
+            ObjectKind::Projectile,
+            ObjectKind::Store,
+            ObjectKind::AreaOfEffect,
+        ] {
+            let id = s.world.spawn(kind, "target");
+            for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+                s.game = game;
+                for present in [false, true] {
+                    for maximum in [None, Some(0), Some(22)] {
+                        let o = s.world.get_mut(id).unwrap();
+                        o.fields.remove("MaxHealth");
+                        o.fields.insert("Health".into(), 11);
+                        if let Some(maximum) = maximum {
+                            o.fields.insert("MaxHealth".into(), maximum);
+                        }
+                        o.properties.remove(&7);
+                        if present {
+                            o.properties.insert(7, (100.0, 12.0));
+                        }
+                        o.modifiers.insert(7, 3.5);
+                        o.dead = true;
+                        o.active = false;
+                        o.immortal = true;
+                        let before = serde_json::to_value(&s.world).unwrap();
+                        for value in [i32::MIN, -65537, 0, 30, 32768, i32::MAX] {
+                            let expected = if game == thedas_vfs::Game::Origins {
+                                -1
+                            } else {
+                                maximum.unwrap_or(11)
+                            };
+                            assert_eq!(
+                                run(&mut s, id, "Deprecated_GetMaxHealth", &[Value::Object(id)]),
+                                Some(Value::Int(expected)),
+                                "{game:?} {kind:?} {present} {maximum:?}"
+                            );
+                            run(
+                                &mut s,
+                                id,
+                                "SetMaxHealth",
+                                &[Value::Object(id), Value::Int(value)],
+                            );
+                            if game == thedas_vfs::Game::Origins {
+                                assert_eq!(serde_json::to_value(&s.world).unwrap(), before);
+                            } else {
+                                assert_eq!(s.world.get(id).unwrap().properties[&7].0, value as f32);
+                            }
+                            s.load_game(s.save_game()).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            s.game = game;
+            for id in [OBJECT_INVALID, u32::MAX] {
+                let before = serde_json::to_value(&s.world).unwrap();
+                assert_eq!(
+                    run(&mut s, 0, "Deprecated_GetMaxHealth", &[Value::Object(id)]),
+                    Some(Value::Int(if game == thedas_vfs::Game::Origins {
+                        -1
+                    } else {
+                        0
+                    }))
+                );
+                run(
+                    &mut s,
+                    0,
+                    "SetMaxHealth",
+                    &[Value::Object(id), Value::Int(30)],
+                );
+                assert_eq!(serde_json::to_value(&s.world).unwrap(), before);
             }
         }
     }
@@ -9401,6 +9973,9 @@ mod coverage_tests {
         int GetCreatureMana(object o) = 72;\n\
         void SetCreatureMana(object o, int n) = 73;\n\
         int GetCreatureMaxMana(object o) = 74;\n\
+        int GetCreatureStamina(object o) = 238;\n\
+        void SetCreatureStamina(object o, int n) = 239;\n\
+        int GetCreatureMaxStamina(object o) = 240;\n\
         void RemoveAllEffects(object o, int i = TRUE, int d = FALSE) = 75;\n\
         void SetCreatureIsGhost(object o, int v) = 76;\n\
         void SetQuickslotBar(object o, int n) = 77;\n\
@@ -9736,6 +10311,53 @@ mod coverage_tests {
         call(&mut h, caller, &f, a).unwrap().unwrap()
     }
 
+    #[test]
+    fn da2_distance_can_subtract_both_personal_spaces() {
+        use thedas_formats::gda::Cell;
+        let table = Arc::new(
+            EngineTable::parse(
+                b"float GetDistanceBetween(object a, object b, int spaces = 0) = 37;",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "apr_base",
+            &["PERSPACE"],
+            vec![(1, vec![Cell::Float(0.35)]), (2, vec![Cell::Float(0.95)])],
+        );
+        s.world.tables = Arc::new(tables);
+        let area = s.world.spawn(ObjectKind::Area, "arena");
+        let x = s.world.spawn(ObjectKind::Creature, "human");
+        let y = s.world.spawn(ObjectKind::Creature, "ogre");
+        for (id, appearance) in [(x, 1), (y, 2)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.appearance = appearance;
+        }
+        s.world.get_mut(y).unwrap().position = [3., 4., 0.];
+        let distance = |s: &mut Sim, target, spaces| match run(
+            s,
+            x,
+            "GetDistanceBetween",
+            &[Value::Object(x), Value::Object(target), Value::Int(spaces)],
+        ) {
+            Some(Value::Float(v)) => v,
+            v => panic!("expected distance, got {v:?}"),
+        };
+        // Origins keeps its existing semantics, including the optional flag.
+        assert_eq!(distance(&mut s, y, 1), 5.);
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(distance(&mut s, y, 0), 5.);
+        assert!((distance(&mut s, y, 1) - 3.7).abs() < 0.0001);
+        s.world.get_mut(y).unwrap().position = [0.; 3];
+        assert!((distance(&mut s, y, 1) + 1.3).abs() < 0.0001);
+        assert_eq!(distance(&mut s, OBJECT_INVALID, 1), -1.);
+        s.world.get_mut(y).unwrap().area = None;
+        assert_eq!(distance(&mut s, y, 1), -1.);
+    }
+
     fn effect_value(s: &mut Sim, e: Effect) -> Value {
         let hd = s.world.store(EngineData::Effect(e));
         Value::Engine {
@@ -10046,6 +10668,67 @@ mod coverage_tests {
             s.world.get(chest).unwrap().properties[&PROPERTY_MANA_STAMINA],
             (40.0, 12.0)
         );
+    }
+
+    #[test]
+    fn da2_stamina_uses_property_ten_and_its_computed_ceiling() {
+        let mut s = sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let mage = s.world.spawn(ObjectKind::Creature, "mage");
+        let chest = s.world.spawn(ObjectKind::Placeable, "chest");
+        let o = s.world.get_mut(mage).unwrap();
+        o.properties
+            .extend([(8, (999.0, 998.0)), (10, (40.0, 12.7))]);
+        o.modifiers.insert(10, 13.5);
+        let get = |s: &mut Sim, f: &str, id| run(s, id, f, &[Value::Object(id)]);
+        assert_eq!(
+            get(&mut s, "GetCreatureStamina", mage),
+            Some(Value::Int(12))
+        );
+        assert_eq!(
+            get(&mut s, "GetCreatureMaxStamina", mage),
+            Some(Value::Int(53))
+        );
+        for (value, current) in [(30, 30.0), (90, 53.5), (-5, 0.0)] {
+            run(
+                &mut s,
+                mage,
+                "SetCreatureStamina",
+                &[Value::Object(mage), Value::Int(value)],
+            );
+            assert_eq!(s.world.get(mage).unwrap().properties[&10].1, current);
+        }
+        assert_eq!(s.world.get(mage).unwrap().properties[&8], (999.0, 998.0));
+        s.world
+            .get_mut(mage)
+            .unwrap()
+            .properties
+            .insert(11, (25.0, 0.0));
+        run(
+            &mut s,
+            mage,
+            "SetCreatureStamina",
+            &[Value::Object(mage), Value::Int(90)],
+        );
+        assert_eq!(s.world.get(mage).unwrap().properties[&10].1, 40.125);
+        assert_eq!(
+            get(&mut s, "GetCreatureMaxStamina", mage),
+            Some(Value::Int(53))
+        );
+        for id in [chest, OBJECT_INVALID] {
+            assert_eq!(get(&mut s, "GetCreatureStamina", id), Some(Value::Int(-1)));
+            assert_eq!(
+                get(&mut s, "GetCreatureMaxStamina", id),
+                Some(Value::Int(-1))
+            );
+            run(
+                &mut s,
+                mage,
+                "SetCreatureStamina",
+                &[Value::Object(id), Value::Int(90)],
+            );
+        }
+        assert!(!s.world.get(chest).unwrap().properties.contains_key(&10));
     }
 
     #[test]
@@ -10836,6 +11519,60 @@ mod coverage_tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn da2_item_queries_filter_types_and_return_float_power() {
+        use thedas_formats::gda::Cell;
+        let table = Arc::new(EngineTable::parse(b"int[] GetItemProperties(object o, int sub, int desired = -1) = 316;\nfloat GetItemPropertyPower(object o, int p, int sub, int scale = 0) = 784;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "#12001",
+            &["#12a02374"],
+            vec![(100, vec![Cell::Int(10)]), (200, vec![Cell::Int(5)])],
+        );
+        s.world.tables = Arc::new(tables);
+        let item = s.world.spawn(ObjectKind::Item, "weapon");
+        s.world.get_mut(item).unwrap().item_properties = Some(vec![(100, 1), (200, 8), (100, 2)]);
+        let args = [Value::Object(item), Value::Int(0), Value::Int(5)];
+        let ids = |values: &[i32]| {
+            Some(Value::Array {
+                elem: Type::Int,
+                items: values.iter().copied().map(Value::Int).collect(),
+            })
+        };
+        // Origins retains its integer sum and existing unfiltered enumeration.
+        assert_eq!(
+            run(&mut s, item, "GetItemProperties", &args),
+            ids(&[100, 200, 100])
+        );
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(run(&mut s, item, "GetItemProperties", &args), ids(&[200]));
+        assert_eq!(
+            run(&mut s, item, "GetItemProperties", &args[..2]),
+            ids(&[100, 200])
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                item,
+                "GetItemPropertyPower",
+                &[Value::Object(item), Value::Int(200), Value::Int(0)]
+            ),
+            Some(Value::Float(8.))
+        );
+        // DA2 takes the first local property, rather than adding duplicate records.
+        assert_eq!(
+            run(
+                &mut s,
+                item,
+                "GetItemPropertyPower",
+                &[Value::Object(item), Value::Int(100), Value::Int(0)]
+            ),
+            Some(Value::Float(1.))
+        );
+        assert!(s.da2_item_property_ids(OBJECT_INVALID, -1).is_empty());
     }
 
     #[test]

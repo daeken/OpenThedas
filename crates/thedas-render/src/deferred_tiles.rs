@@ -8,6 +8,38 @@ pub(crate) const TILES: usize = COLUMNS * ROWS;
 /// Six 32-bit light masks, padded to two uniform vec4s per tile (192 lights).
 pub(crate) type Masks = [[u32; 8]; TILES];
 
+pub(crate) const DEPTH_SLICES: usize = 16;
+pub(crate) const DEPTH_STEP: f32 = 4.0;
+pub(crate) type DepthMasks = [[u32; 8]; DEPTH_SLICES];
+
+/// View-depth intervals complement screen tiles without multiplying their uniform
+/// storage. The last slice is unbounded; invalid spheres conservatively reach all.
+pub(crate) fn depth_masks(
+    plane: Vec4,
+    lights: impl IntoIterator<Item = [f32; 4]>,
+    radius_scale: f32,
+    enabled: bool,
+) -> DepthMasks {
+    let mut masks = [[0; 8]; DEPTH_SLICES];
+    for (i, light) in lights.into_iter().take(192).enumerate() {
+        let centre = Vec3::from_slice(&light[..3]);
+        let radius = light[3] * radius_scale;
+        let depth = plane.dot(centre.extend(1.0));
+        let (lo, hi) = if enabled && depth.is_finite() && radius.is_finite() && radius >= 0.0 {
+            // Include boundary neighbours despite inverse-projection/half-float noise.
+            let pad = 1e-3 * (depth.abs() + radius).max(1.0);
+            let slice = |d: f32| ((d.max(0.0) / DEPTH_STEP) as usize).min(DEPTH_SLICES - 1);
+            (slice(depth - radius - pad), slice(depth + radius + pad))
+        } else {
+            (0, DEPTH_SLICES - 1)
+        };
+        for mask in &mut masks[lo..=hi] {
+            mask[i / 32] |= 1 << (i % 32);
+        }
+    }
+    masks
+}
+
 /// A sphere's world AABB projects conservatively while all corners have positive w.
 /// A box crossing the eye plane uses every tile; dividing those corners could otherwise
 /// miss an arbitrarily large projection. One pixel covers the G-buffer half-pixel fixup
@@ -138,6 +170,49 @@ fn tile_planes(vp: Mat4, size: (u32, u32), tile: usize) -> [Vec4; 4] {
 mod tests {
     use super::*;
     use crate::Camera;
+
+    #[test]
+    fn depth_masks_keep_sphere_samples_boundaries_wrap_and_unbounded_distance() {
+        assert_eq!(std::mem::size_of::<DepthMasks>(), 512);
+        for camera in [
+            Camera::new(Vec3::ZERO, 0.0, 0.0),
+            Camera::new(Vec3::new(298.2, 235.0, 3.0), 1.2, -0.4),
+        ] {
+            let plane = -camera.view().row(2);
+            for distance in [-20.0, 0.0, 0.001, 3.999, 4.0, 8.0, 59.999, 60.0, 5000.0] {
+                for radius in [0.0, 0.01, 1.0, 4.0, 30.0] {
+                    let centre = camera.position + camera.forward() * distance;
+                    for scale in [1.0, 2.0] {
+                        let masks =
+                            depth_masks(plane, [centre.extend(radius).to_array()], scale, true);
+                        for step in -16..=16 {
+                            let p =
+                                centre + camera.forward() * (step as f32 / 16.0 * radius * scale);
+                            let depth = plane.dot(p.extend(1.0));
+                            let slice =
+                                ((depth.max(0.0) / DEPTH_STEP) as usize).min(DEPTH_SLICES - 1);
+                            assert_ne!(
+                                masks[slice][0] & 1,
+                                0,
+                                "lost {distance}, {radius}, {scale}, {depth}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for enabled in [false, true] {
+            let masks = depth_masks(Vec4::X, [[f32::NAN, 0.0, 0.0, 1.0]; 192], 1.0, enabled);
+            assert!(
+                masks
+                    .iter()
+                    .all(|m| m[..6] == [u32::MAX; 6] && m[6..] == [0; 2])
+            );
+        }
+        let near = depth_masks(Vec4::X, [[2.0, 0.0, 0.0, 0.1]; 192], 1.0, true);
+        assert_eq!(near[0][..6], [u32::MAX; 6]);
+        assert!(near[1..].iter().all(|m| *m == [0; 8]));
+    }
 
     #[test]
     fn tiles_keep_visible_sphere_samples_edges_near_crossings_and_wrap_radius() {

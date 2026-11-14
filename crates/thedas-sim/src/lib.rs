@@ -24,6 +24,7 @@ pub mod container;
 pub mod cutactors;
 pub mod cutscene;
 pub mod cuttracks;
+mod da2_items;
 mod da2_properties;
 pub mod decay;
 pub mod derived;

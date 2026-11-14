@@ -823,6 +823,18 @@ impl Sim {
                 t.money = t.money.saturating_add(coppers);
             }
             self.world.objects.remove(&item);
+            // DA2 transfers remove the item from the source inventory before adding it
+            // to the destination (0x6cc8f6 -> 0x6c71b0; the coin path is 0x6cc0c6).
+            // Conversion to currency must not swallow the source's removal event: the
+            // authored Cavril chest script completes its task on that event.
+            if self.game == thedas_vfs::Game::DragonAge2
+                && let Some(f) = from
+            {
+                let mut removed = self.new_event("INVENTORY_REMOVED", Some(to));
+                removed.objects = vec![item];
+                removed.ints = vec![1];
+                self.world.queue_event(0, f, removed, None);
+            }
             return true;
         }
         let landed = self.stack_into(to, item);
@@ -1682,6 +1694,40 @@ mod tests {
         assert!(s.give_item(b, ally));
         assert_eq!(s.world.get(ally).unwrap().inventory, vec![b]);
         assert_eq!(s.world.get(ally).unwrap().money, 0);
+    }
+
+    #[test]
+    fn da2_currency_conversion_still_tells_the_source_inventory() {
+        for game in [thedas_vfs::Game::DragonAge2, thedas_vfs::Game::Origins] {
+            let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+            let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+            s.game = game;
+            let hero = s.world.spawn(ObjectKind::Creature, "hero");
+            s.world.hero = Some(hero);
+            let chest = s.world.spawn(ObjectKind::Placeable, "chest");
+            let coin = s.world.spawn(ObjectKind::Item, "coin");
+            let fields = &mut s.world.get_mut(coin).unwrap().fields;
+            fields.insert("BaseItem".into(), 17);
+            fields.insert("StackSize".into(), 37);
+            s.world.get_mut(chest).unwrap().inventory.push(coin);
+            assert_eq!(s.loot(chest, hero), [coin]);
+            assert!(s.loot(chest, hero).is_empty());
+            assert_eq!(s.world.get(hero).unwrap().money, 37);
+            assert!(s.world.get(hero).unwrap().inventory.is_empty());
+            assert!(s.world.get(coin).is_none());
+            let events: Vec<_> = s.world.queue.values().collect();
+            if game == thedas_vfs::Game::DragonAge2 {
+                assert_eq!(events.len(), 1);
+                let event = &events[0];
+                assert_eq!(event.target, chest);
+                assert_eq!(event.event.ty, 7);
+                assert_eq!(event.event.creator, Some(hero));
+                assert_eq!(event.event.objects, [coin]);
+                assert_eq!(event.event.ints, [1]);
+            } else {
+                assert!(events.is_empty());
+            }
+        }
     }
 
     #[test]

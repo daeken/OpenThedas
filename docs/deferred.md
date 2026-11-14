@@ -87,7 +87,17 @@ worker threads exist. Discard warm-up frames and pair adjacent opposite modes.
    4,608 bytes in a portable uniform buffer; there are no storage buffers or candidate
    count truncations. The `wrap` debug view expands tile bounds to twice the radius.
    `THEDAS_DEFERRED_TILED_LIGHTS=0` puts every light in every tile for comparisons.
-4. Everything not deferred draws forward with its original shaders over that colour and
+4. Roomless rigid `SPT_Fronds`, `SPT_Branch`, `SPT_LeafMeshes` and `SPT_LeafCards`
+   draws join the G-buffer using their existing translated
+   wind/placement vertex shader, instance groups and LOD alpha references. Their authored
+   ambient and world normals feed the shared per-pixel lighting, including branch normal
+   maps. Leaves retain the original 8-bit LOD cutout rule; bark remains opaque. These
+   surfaces receive runtime shadows and contribute to SSAO depth. Their point-shadow
+   casting remains to come. `THEDAS_DEFERRED_FRONDS=0`, `THEDAS_DEFERRED_BRANCHES=0`,
+   `THEDAS_DEFERRED_MESH_LEAVES=0` and `THEDAS_DEFERRED_LEAF_CARDS=0` each keep that
+   family forward. The material survey and remaining coverage
+   are recorded in [the inventory](notes/deferred-material-coverage.md).
+5. Everything not deferred draws forward with its original shaders over that colour and
    depth. In a shared deferred frame, all renderers first draw their remaining opaque
    geometry (including hair depth cores and unsupported materials). Blended and faded
    geometry and particles then draw against the completed opaque depth, before the MSAA
@@ -329,7 +339,12 @@ side-plane rejection; `reflections` compares the separate and fused reflection p
 `light-masks` compares per-light room/domain checks with transposed membership masks;
 `opaque-gbuffer` compares the general G-buffer pipeline with discard-free opaque
 pipelines; `lighting` compares all three new optimizations together;
-`faithful` alternates the faithful path with optimized deferred.
+`faithful` alternates the faithful path with optimized deferred. `specialized-gbuffer`
+compares the general shaders with rigid Static1/terrain variants; `terrain-layers`
+compares the eight terrain-layer comparisons with direct palette selection;
+`depth-lights` compares screen tiles with additional view-depth masks;
+`early-light-reject` compares early squared-distance rejection;
+`pass-cost` switches these four controls together.
 Start with `--renderer deferred` so planning is already complete, keep `--time`, camera,
 resolution and AA fixed, and discard the first twenty frames before comparing adjacent
 pairs. `bench comparison modes` labels control frames 0 and test frames 1. Overrides
@@ -339,6 +354,28 @@ whole-gameplay FPS; shared-machine load can still affect absolute values.
 
 Rendering environment controls are read once per process. Set them before starting the
 engine; paired benchmarks use renderer overrides instead of changing the environment.
+
+Rigid Static1 and terrain draws use dedicated G-buffer entry points, sharing the same
+material equations while allowing unrelated face/eye/tint branches to be removed. Their
+vertex entry point reads positions/normals directly, omitting the identity bone palette.
+Skinned draws retain the general vertex path. Cutouts retain their alpha test, and draw
+order is unchanged. `THEDAS_DEFERRED_SPECIALIZED_GBUFFER=0` restores the general shaders.
+These variants run only with fused baked reflections: probe/AO and diagnostic modes
+retain the general vertex path so their separate reflection pass matches G-buffer depth.
+Terrain's MaskV decoding selects its sole possible layer directly, retaining the same
+0.0625 tolerance and the gaps between codes. Specular blending still accumulates all
+eight authored weights in order. `THEDAS_DEFERRED_DIRECT_TERRAIN_LAYERS=0` restores the
+eight comparisons for layer weight/scale selection.
+
+Sixteen four-metre view-depth slices further intersect the screen/room/domain light
+masks. The final slice extends to infinity; spheres crossing boundaries reach both
+slices, with a reconstruction margin, and invalid bounds reach every slice. The screen
+and depth masks together occupy 5,120 bytes of portable uniform storage. `wrap` expands
+both masks to twice the radius. `THEDAS_DEFERRED_DEPTH_LIGHTS=0` omits the depth
+intersection. `THEDAS_DEFERRED_EARLY_LIGHT_REJECT=0` omits the conservative squared-radius
+test before full light evaluation. The original distance cutoff remains, and normal
+rejection precedes trigonometric falloff. Light accumulation order and shadow equations
+are preserved.
 
 ## Capture profiling
 
