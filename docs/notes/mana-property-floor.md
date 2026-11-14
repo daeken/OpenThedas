@@ -36,7 +36,10 @@ the zero result for negative totals. Tests exercise modded bounds, negative
 inputs and totals, fractional modifiers, integer limits, absent properties,
 non-creatures and the independent dead, active and immortal flags.
 
-The separate health immortality-floor behavior remains under SCR-026.
+The separate health immortality floor is now stored independently of the
+flag and shared by current writes and reclamps; see the
+[creature health trace](script-health-current-floor.md). The remaining
+status and lifecycle questions stay under SCR-026.
 
 This trace establishes Origins behavior only. It does not establish DA2's
 property implementation, whose existing path is retained.

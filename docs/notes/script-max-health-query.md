@@ -21,6 +21,5 @@ check. It reads the live total on each call and adds no saved state.
 
 The other virtual implementations and DA2's handler still need tracing
 through construction and loading. Their existing paths remain provisional
-under SCR-026. The native `SetMaxHealth` creature virtual calls the current
-setter at `+0x2c`, so its implementation needs a separate health-floor and
-lifecycle trace.
+under SCR-026. The creature setter and its separate current floor are
+covered by the [health-current trace](script-health-current-floor.md).

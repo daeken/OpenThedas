@@ -55,8 +55,12 @@ pub fn run_actions(vm: &mut Vm, code: &Actions, target: DisplayId) -> Value {
         target,
         stack: Vec::new(),
     };
-    vm.budget = 0;
-    exec(vm, &mut f)
+    if !vm.enter_script() {
+        return Value::Undefined;
+    }
+    let result = exec(vm, &mut f);
+    vm.leave_script();
+    result
 }
 
 /// Calls a bytecode function.
@@ -406,10 +410,10 @@ fn exec(vm: &mut Vm, f: &mut Frame) -> Value {
 
 fn exec_inner(vm: &mut Vm, f: &mut Frame) -> Value {
     let code = f.code.clone();
-    while f.pc < f.end {
+    while f.pc < f.end && !vm.script_stopped {
         vm.budget += 1;
         if vm.budget > super::OP_BUDGET {
-            vm.warn_once("script ran too long; stopped".into());
+            vm.stop_script("script ran too long; stopped");
             return Value::Undefined;
         }
         let op = code[f.pc];

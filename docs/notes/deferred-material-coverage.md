@@ -61,39 +61,61 @@ emitter passes. Each emitter's live quad count changes during simulation.
 Selection and aiming overlays have independent forward renderers. Lava0 and other
 shader variants outside these five scenes need additional area captures for counts.
 
-## Fronds
+## Tree materials
 
-Roomless, rigid, single-pass `SPT_Fronds/SPT_Fronds` geometry now shares the G-buffer.
+Roomless, rigid, single-pass `SPT_Fronds`, `SPT_Branch`, `SPT_LeafMeshes` and
+`SPT_LeafCards` geometry now shares the G-buffer.
 The vertex wrapper calls the existing translated vertex shader. Original wind
 matrices, placement scale/yaw, instance slots, camera culling, LOD index ranges and
 the D3D9 half-pixel adjustment therefore supply the geometry. Read-only accessors
 expose its buffers, bindings and current instance/index ranges.
 
-The fragment material samples the original diffuse texture with its sampler and
-multiplies alpha by `g_fAlphaMultiplier`. The 8-bit Greater comparison reads the
+The fragment material samples the original diffuse texture with its sampler.
+Fronds and leaves multiply alpha by `g_fAlphaMultiplier`. The 8-bit Greater comparison reads the
 current LOD reference from the same constant slot as the faithful shader. The
 existing SPT handling resolves an unnamed/Always state function to Greater. The
-rotated vertex normal supplies per-pixel directional and point lighting. The RML
+rotated vertex normal supplies per-pixel directional and point lighting for fronds.
+Leaves use the translated vertex shader's world lighting normal (`TEXCOORD1`),
+including the mesh leaf's placement basis. Branches sample `smpNormalMap` at the
+translated diffuse UV (`TEXCOORD3`) and transform the signed tangent-space normal
+by the three basis rows supplied by that vertex shader (`TEXCOORD0`–`2`). Bark is
+opaque, including diffuse texels with zero alpha, as its original state requires.
+The RML
 `g_vColorMultiplier` supplies ambient light, with zero specular response. The
 surface receives the existing sun and point shadows and contributes depth to SSAO.
 The shared G-buffer uses the prop material code for these unlightmapped surfaces.
 
-This introduces the deferred renderer's Lambert lighting for fronds. The faithful
-frond material has its own height-dependent shadow adjustment and final colour
-clamp. Fronds retain single-sample binary coverage at their G-buffer edges under
-MSAA. Their own point-shadow caster coverage remains to be implemented. Branches,
-leaves and far billboards remain the next foliage materials in the inventory.
+This introduces the deferred renderer's Lambert lighting for these tree families.
+The faithful tree materials have their own height-dependent shadow adjustments;
+fronds also clamp the final colour. Cutout families retain single-sample binary
+coverage at their G-buffer edges under MSAA. Tree point-shadow caster coverage and
+far billboards remain outstanding.
 
-Room-assigned, skinned, multipass or incompatible frond pipelines retain forward
-rendering. Any runtime-faded frond sends the renderer's complete frond set through
+Room-assigned, skinned, multipass or incompatible tree pipelines retain forward
+rendering. Any runtime-faded tree part sends the renderer's complete family through
 the faithful path that frame, preserving its shared instance groups and blended
-ordering. `THEDAS_DEFERRED_FRONDS=0` keeps this family forward from load time.
+ordering. Other families keep their planned path. `THEDAS_DEFERRED_FRONDS=0`,
+`THEDAS_DEFERRED_BRANCHES=0`, `THEDAS_DEFERRED_MESH_LEAVES=0`, and
+`THEDAS_DEFERRED_LEAF_CARDS=0` each keep that family forward from load time. These
+environment controls are read once.
 `THEDAS_BENCH_DEFERRED_COMPARE=fronds` alternates the planned frond set between
 the two paths with a per-renderer override. Benchmark setup must enable frond
 planning. The override is restored after capture.
+`THEDAS_BENCH_DEFERRED_COMPARE=trees` alternates branches, mesh leaves and leaf cards
+together while retaining deferred fronds. It also uses a renderer-local override
+and restores the planned mode after capture.
 
 The direct-constant shader wrapper translates through the portable backend checks.
 The instanced wrapper retains the faithful tree stream's storage-buffer dependency.
 Its backend checks cover HLSL and SPIR-V, with the same older OpenGL limitation as
 that stream. Synthetic tests cover both layouts and sampled GPU alpha boundaries,
 including opacity multipliers and changes to the LOD reference.
+Sampled GPU material tests also check branch normal-map basis orientation and
+opaque bark at zero texture alpha, plus both leaf families' exact cutout boundary.
+
+The continued survey moves all 9,029 planned branch/leaf passes (189 visible
+instances) into deferred rendering. Planned G-buffer coverage is now 31,226 of
+34,360 geometry passes, with 3,134 remaining forward passes. The next programs by
+planned count are cutaway Static1 (1,092), Black (768), eyelash Eye0 (265) and the
+four hair passes (200 each). The inventory above retains the original baseline
+counts for comparison. These counts do not measure GPU submissions after instancing.
