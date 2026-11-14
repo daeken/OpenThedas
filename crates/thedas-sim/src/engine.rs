@@ -1622,8 +1622,9 @@ pub fn call(
         // property 8 (PROPERTY_DEPLETABLE_MANA_STAMINA) directly: GetCreatureMana its current
         // value (0x66cc30), GetCreatureMaxMana its total (0x66cdc0), both truncated to
         // whole numbers and -1 for what is not a creature; SetCreatureMana its current value
-        // (0x66cd00). Provisional: the setter is taken to keep the value within 0 and the
-        // total as SetCreatureProperty's does.
+        // (0x66cd00 -> 0x79c8d0). That setter clamps between the property's current floor
+        // and computed total. Mana's floor stays at its initialized zero; the immortality
+        // setter changes health's floor only (0x6ad130). See notes/mana-property-floor.md.
         "GetCreatureMana" | "GetCreatureMaxMana" => {
             let (id, p) = (obj(a, 0), PROPERTY_MANA_STAMINA);
             let creature = h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature);
@@ -7839,6 +7840,63 @@ mod coverage_tests {
             );
             assert_eq!(get(&mut s, "GetCreatureMana", mage), Some(Value::Int(want)));
         }
+        // The ceiling is the computed total, including fractional modifiers.
+        s.world
+            .get_mut(mage)
+            .unwrap()
+            .modifiers
+            .insert(PROPERTY_MANA_STAMINA, 13.5);
+        run(
+            &mut s,
+            mage,
+            "SetCreatureMana",
+            &[Value::Object(mage), Value::Int(90)],
+        );
+        assert_eq!(
+            s.world.get(mage).unwrap().properties[&PROPERTY_MANA_STAMINA].1,
+            53.5
+        );
+        assert_eq!(get(&mut s, "GetCreatureMana", mage), Some(Value::Int(53)));
+        assert_eq!(
+            get(&mut s, "GetCreatureMaxMana", mage),
+            Some(Value::Int(53))
+        );
+        // Immortality's nonzero health floor does not raise the mana floor.
+        s.world.get_mut(mage).unwrap().immortal = true;
+        run(
+            &mut s,
+            mage,
+            "SetCreatureMana",
+            &[Value::Object(mage), Value::Int(-1)],
+        );
+        assert_eq!(get(&mut s, "GetCreatureMana", mage), Some(Value::Int(0)));
+        let o = s.world.get_mut(mage).unwrap();
+        o.modifiers.clear();
+        o.properties.insert(PROPERTY_MANA_STAMINA, (-5.0, 0.0));
+        run(
+            &mut s,
+            mage,
+            "SetCreatureMana",
+            &[Value::Object(mage), Value::Int(90)],
+        );
+        assert_eq!(get(&mut s, "GetCreatureMana", mage), Some(Value::Int(0)));
+        s.world
+            .get_mut(chest)
+            .unwrap()
+            .properties
+            .insert(PROPERTY_MANA_STAMINA, (40.0, 12.0));
+        for target in [chest, OBJECT_INVALID] {
+            run(
+                &mut s,
+                mage,
+                "SetCreatureMana",
+                &[Value::Object(target), Value::Int(90)],
+            );
+        }
+        assert_eq!(
+            s.world.get(chest).unwrap().properties[&PROPERTY_MANA_STAMINA],
+            (40.0, 12.0)
+        );
     }
 
     #[test]
