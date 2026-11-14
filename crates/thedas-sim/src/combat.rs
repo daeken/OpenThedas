@@ -1151,7 +1151,7 @@ impl Sim {
     /// Orders a creature to attack another, as the player does by clicking an enemy.
     pub fn order_attack(&mut self, attacker: ObjectId, target: ObjectId) {
         self.note_player_order(attacker);
-        let cmd = crate::world::Command {
+        let mut cmd = crate::world::Command {
             ty: constant_of(self, "COMMAND_TYPE_ATTACK"),
             name: "CommandAttack".into(),
             target: Some(target),
@@ -1168,11 +1168,77 @@ impl Sim {
             arrived: false,
             path: Vec::new(),
         };
+        self.da2_default_attack_command(&mut cmd);
         if let Some(o) = self.world.get_mut(attacker) {
             o.commands.clear();
             o.commands.push(cmd);
             o.combat.in_combat = true;
         }
+    }
+
+    /// DA2 CommandAttack (0x4dda50) constructs modern command 25 with default
+    /// ability 1. Its forced legacy result is not an ability argument.
+    pub(crate) fn da2_default_attack_command(&self, cmd: &mut crate::world::Command) {
+        if self.game == thedas_vfs::Game::DragonAge2 && cmd.name == "CommandAttack" {
+            cmd.name = "CommandUseAbility".into();
+            cmd.ty = constant_of(self, "COMMAND_TYPE_USE_ABILITY");
+            cmd.ints = vec![1];
+        }
+    }
+
+    /// Native modern command preparation (0x640d6d): ability 1 asks the owner's
+    /// script to choose the actual basic attack. The shipped ability_core handles
+    /// CHOOSE_BASIC_ATTACK and returns its choice in the creature's CommandResult.
+    /// Keep selection in that script: it owns range, arc and combo-table rules.
+    pub(crate) fn choose_da2_basic_attack(
+        &mut self,
+        id: ObjectId,
+        cmd: &mut crate::world::Command,
+    ) -> bool {
+        if self.game != thedas_vfs::Game::DragonAge2
+            || cmd.name != "CommandUseAbility"
+            || cmd.ints.first() != Some(&1)
+        {
+            return true;
+        }
+        let target = cmd.target.unwrap_or(OBJECT_INVALID);
+        let point = self
+            .world
+            .get(target)
+            .map(|o| o.position)
+            .or_else(|| cmd.location.map(|l| l.position))
+            .unwrap_or([0.0; 3]);
+        let mut ev = self.new_event("CHOOSE_BASIC_ATTACK", Some(id));
+        ev.objects = vec![id, target, OBJECT_INVALID];
+        // Integer 2 is native command boolean 2. The attack constructor leaves it
+        // false. The sim has no separate alternate/manual combo input yet.
+        ev.ints = vec![0, 0, 0];
+        ev.vectors = vec![point];
+        let script = self.world.get_mut(id).and_then(|o| {
+            o.fields.insert("CommandResult".into(), 0);
+            o.script.clone()
+        });
+        if let Some(script) = script {
+            self.run_script(&script, id, Some(ev));
+        }
+        let choice = self
+            .world
+            .get(id)
+            .and_then(|o| o.fields.get("CommandResult"))
+            .copied()
+            .unwrap_or(0);
+        if choice <= 1 {
+            return false;
+        }
+        cmd.ints[0] = choice;
+        if let Some(area) = self.world.get(id).and_then(|o| o.area) {
+            cmd.location = Some(crate::world::Location {
+                area,
+                position: point,
+                facing: 0.0,
+            });
+        }
+        true
     }
 
     /// On autopilot, during a fight: a party member's AI round runs when its command
@@ -1276,6 +1342,20 @@ impl Sim {
             .and_then(|o| o.commands.first())
             .is_some_and(|c| c.name == cmd.name && c.ints == cmd.ints && c.target == cmd.target);
         if !still {
+            return;
+        }
+        // Native modern preprocessor 0x6b6cd8 only schedules the executor for
+        // a positive pending result. Failed resource/target checks must not cast.
+        if self.game == thedas_vfs::Game::DragonAge2
+            && self
+                .world
+                .get(id)
+                .and_then(|o| o.fields.get("CommandResult"))
+                .copied()
+                .unwrap_or(0)
+                <= 0
+        {
+            self.fail_front_command(id, "COMMAND_FAILED");
             return;
         }
         self.ability_event("ABILITY_CAST_START", id, target, ability, cmd);
@@ -2199,6 +2279,76 @@ mod tests {
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         Sim::new(Arc::new(Vfs::new()), table, 3)
+    }
+
+    #[test]
+    fn da2_basic_attack_uses_the_script_choice_and_keeps_it_on_reload() {
+        use crate::world::Location;
+        let table = EngineTable::parse(
+            b"void SetCommandResult(object who, int result) = 1;\n\
+              int COMMAND_TYPE_ATTACK = 1;\n\
+              int COMMAND_FAILED = -1;\n\
+              int COMMAND_TYPE_USE_ABILITY = 25;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 3);
+        s.game = thedas_vfs::Game::DragonAge2;
+        let area = s.world.spawn(ObjectKind::Area, "arena");
+        let who = s.world.spawn(ObjectKind::Creature, "attacker");
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        s.world.get_mut(who).unwrap().area = Some(area);
+        s.world.get_mut(who).unwrap().script = Some("select.ncs".into());
+        s.world.get_mut(target).unwrap().position = [3., 4., 5.];
+        // Own script: SetCommandResult(attacker, 3110). The native event lets
+        // the shipped script return the selected attack through this API.
+        let mut code = vec![0x04, 0x03];
+        code.extend(3110_i32.to_be_bytes());
+        code.extend([0x04, 0x06]);
+        code.extend(who.to_be_bytes());
+        code.extend([0x05, 0, 0, 1, 2, 0x20, 0]);
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+        bytes.extend(code);
+        s.add_script("select.ncs", thedas_script::Ncs::parse(&bytes).unwrap());
+        s.order_attack(who, target);
+        let mut cmd = s.world.get(who).unwrap().commands[0].clone();
+        assert_eq!(
+            (&*cmd.name, cmd.ty, &*cmd.ints),
+            ("CommandUseAbility", 25, &[1][..])
+        );
+        assert!(s.choose_da2_basic_attack(who, &mut cmd));
+        assert_eq!(cmd.ints, [3110]);
+        assert_eq!(cmd.target, Some(target));
+        assert_eq!(
+            cmd.location,
+            Some(Location {
+                area,
+                position: [3., 4., 5.],
+                facing: 0.
+            })
+        );
+        s.world.get_mut(who).unwrap().commands[0] = cmd;
+        s.world
+            .get_mut(who)
+            .unwrap()
+            .fields
+            .insert("CommandResult".into(), 99);
+        let json = serde_json::to_string(&s.world).unwrap();
+        s.world = serde_json::from_str(&json).unwrap();
+        let mut restored = s.world.get(who).unwrap().commands[0].clone();
+        assert!(s.choose_da2_basic_attack(who, &mut restored));
+        assert_eq!(restored.ints, [3110]);
+        // A concrete attack must not run the selector again on reload or approach.
+        assert_eq!(s.world.get(who).unwrap().fields["CommandResult"], 99);
+        // The native preprocessor stops a cast when its pending resource/target
+        // check fails. Reuse our own script with a negative result.
+        bytes[15..19].copy_from_slice(&(-1_i32).to_be_bytes());
+        s.add_script("select.ncs", thedas_script::Ncs::parse(&bytes).unwrap());
+        s.world.trace.keep = true;
+        s.start_ability(who, &restored);
+        assert!(s.world.get(who).unwrap().commands.is_empty());
+        assert!(!s.world.trace.entries.iter().any(|e| matches!(e,
+            crate::trace::TraceEntry::Log { text, .. } if text.starts_with("ABILITY_CAST_START"))));
     }
 
     #[test]

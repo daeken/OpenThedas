@@ -2706,6 +2706,7 @@ pub fn call(
                     c.path.drain(..start);
                 }
             }
+            h.sim.da2_default_attack_command(&mut c);
             let hd = h.sim.world.store(EngineData::Command(c));
             ok(Value::Engine {
                 ty: ty.command,
@@ -6971,6 +6972,43 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn da2_attack_constructor_uses_the_modern_default_without_a_forced_roll() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"#define ENGINE_STRUCTURE_2 command\n\
+              command CommandAttack(object target, int forced) = 566;\n\
+              int COMMAND_TYPE_ATTACK = 1;\n\
+              int COMMAND_TYPE_USE_ABILITY = 25;\n",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            s.game = game;
+            let Some(Value::Engine { handle, .. }) = run(
+                &mut s,
+                120,
+                "CommandAttack",
+                &[Value::Object(42), Value::Int(4)],
+            ) else {
+                panic!("command constructor");
+            };
+            let Some(EngineData::Command(c)) = s.world.handle(handle) else {
+                panic!("stored command");
+            };
+            assert_eq!(c.target, Some(42));
+            if game == thedas_vfs::Game::DragonAge2 {
+                assert_eq!(
+                    (&*c.name, c.ty, &*c.ints),
+                    ("CommandUseAbility", 25, &[1][..])
+                );
+            } else {
+                assert_eq!((&*c.name, c.ty, &*c.ints), ("CommandAttack", 1, &[4][..]));
+            }
+        }
     }
 
     #[test]
