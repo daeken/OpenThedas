@@ -1322,6 +1322,71 @@ impl Sim {
         if let Some(script) = script {
             self.run_script(&script, id, Some(ev));
         }
+        self.resolve_da2_attack(id, target);
+    }
+
+    /// DA2's ability_core asks the default attack's script to resolve event 1006 with
+    /// objects attacker/target and integer ability. Its answer is module local 8, reset
+    /// to HIT before the synchronous call. Run the player's script so its attack/defense,
+    /// difficulty, dodge, glancing-blow and talent rules use the same VM and saved dice.
+    ///
+    /// DragonAge2.exe 0x4dd210 stores SetAttackResult verbatim and 0x56ba70 skips result
+    /// zero. The newer ability executor (0x6d823e) dispatches to ability_core, whose
+    /// resolution handshake supplies the missing result. Our simplified attack executor
+    /// uses DEFAULT_ATTACK (1). Selection of animation-specific basic attack abilities
+    /// from the combat combo tables is still provisional.
+    fn resolve_da2_attack(&mut self, id: ObjectId, target: ObjectId) {
+        if self.game != thedas_vfs::Game::DragonAge2 {
+            return;
+        }
+        let unresolved = |attack: &AttackResult, hand: usize| {
+            attack.results[hand] == 0 && attack.effects[hand].as_ref().is_some_and(|e| e.ty == 1024)
+        };
+        let needs_roll = self
+            .world
+            .get(id)
+            .and_then(|o| o.combat.attack.as_ref())
+            .is_some_and(|attack| (0..2).any(|hand| unresolved(attack, hand)));
+        if !needs_roll {
+            return;
+        }
+        let script = self
+            .world
+            .tables()
+            .get(1, "")
+            .map(|t| crate::engine::cell_string(t.cell_by_hash(0xf333_fe09, 1)))
+            .filter(|s| !s.is_empty());
+        let Some((script, module)) = script.zip(self.world.module) else {
+            return;
+        };
+        let key = crate::engine::local_name(self, module, &[thedas_script::vm::Value::Int(8)], 0);
+        let hit = constant_of(self, "COMBAT_RESULT_HIT");
+        let Some(o) = self.world.get_mut(module) else {
+            return;
+        };
+        o.locals.ints.insert(key.clone(), hit);
+        let mut ev = self.new_event("", Some(id));
+        ev.ty = 1006;
+        ev.objects = vec![id, target];
+        ev.ints = vec![1];
+        self.run_script(&script, id, Some(ev));
+        let answer = self
+            .world
+            .get(module)
+            .and_then(|o| o.locals.ints.get(&key))
+            .copied();
+        if let (Some(answer), Some(attack)) = (
+            answer,
+            self.world
+                .get_mut(id)
+                .and_then(|o| o.combat.attack.as_mut()),
+        ) {
+            for hand in 0..2 {
+                if unresolved(attack, hand) {
+                    attack.results[hand] = answer;
+                }
+            }
+        }
     }
 
     /// Turns `id` to face `target` (both in the same area; nothing when they stand on the
@@ -1384,17 +1449,16 @@ impl Sim {
     }
 
     pub(crate) fn finish_attack(&mut self, id: ObjectId, target: ObjectId) {
+        // An attack restored from a save made before DA2 resolution was implemented can
+        // still have result zero. Resolve it once before delivering its impact.
+        self.resolve_da2_attack(id, target);
         let Some(result) = self.world.get(id).and_then(|o| o.combat.attack.clone()) else {
             return;
         };
         for hand in 0..2 {
             let hit = result.results[hand];
-            // Dragon Age II's rules_core gives an ordinary blow no result (0) and its damage
-            // as an impact effect, and its impact handler deals the damage only for a result:
-            // the engine settles the blow. Here such a blow lands as a hit
-            // (`COMBAT_RESULT_HIT`). Provisional: read from DA2's rules_core (its attack
-            // function sets a result only for deathblows); how DragonAge2.exe decides a hit
-            // or a miss is not traced, so DA2 blows never miss.
+            // Keep the previous fallback when the module or default attack's script
+            // metadata is unavailable. Normal attacks already hold their script's roll.
             let da2_blow = self.game == thedas_vfs::Game::DragonAge2
                 && hit == 0
                 && result.effects[hand].iter().any(|e| e.ty == 1024);
@@ -2043,6 +2107,118 @@ mod tests {
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         Sim::new(Arc::new(Vfs::new()), table, 3)
+    }
+
+    #[test]
+    fn da2_attack_resolution_runs_the_default_ability_script_once() {
+        let ldf = "object GetModule() = 1;\n\
+            void SetLocalInt(object o, int row, int value) = 2;\n\
+            int COMBAT_RESULT_HIT = 1;\n";
+        let mut s = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(EngineTable::parse(ldf.as_bytes()).unwrap()),
+            3,
+        );
+        s.world.trace.keep = true;
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        s.world.module = Some(module);
+        let attacker = s.world.spawn(ObjectKind::Creature, "attacker");
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "#1",
+            &["#f333fe09"],
+            vec![(1, vec![Cell::String("resolve.ncs".into())])],
+        );
+        tables.insert(
+            "var_module",
+            &["Label"],
+            vec![(8, vec![Cell::String("answer".into())])],
+        );
+        s.world.tables = Arc::new(tables);
+        // Own synthetic script, SetLocalInt(GetModule(), 8, 3).
+        let code = [
+            0x04, 0x03, 0, 0, 0, 3, 0x04, 0x03, 0, 0, 0, 8, 0x05, 0x00, 0, 1, 0, 0x05, 0x00, 0, 2,
+            3, 0x20, 0,
+        ];
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+        bytes.extend(code);
+        s.add_script("resolve.ncs", thedas_script::Ncs::parse(&bytes).unwrap());
+        let attack = AttackResult {
+            results: [0, 2],
+            effects: [
+                Some(Effect {
+                    ty: 1024,
+                    ..Default::default()
+                }),
+                None,
+            ],
+        };
+        s.world.get_mut(attacker).unwrap().combat.attack = Some(attack.clone());
+        // The same objects and table in DA:O never enter the DA2 resolver.
+        s.resolve_da2_attack(attacker, target);
+        assert_eq!(
+            s.world
+                .get(attacker)
+                .unwrap()
+                .combat
+                .attack
+                .as_ref()
+                .unwrap()
+                .results,
+            [0, 2]
+        );
+        assert!(s.world.get(module).unwrap().locals.ints.is_empty());
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.resolve_da2_attack(attacker, target);
+        assert_eq!(
+            s.world
+                .get(attacker)
+                .unwrap()
+                .combat
+                .attack
+                .as_ref()
+                .unwrap()
+                .results,
+            [3, 2]
+        );
+        assert_eq!(s.world.get(module).unwrap().locals.ints["answer"], 3);
+        s.resolve_da2_attack(attacker, target);
+        assert_eq!(
+            s.world
+                .trace
+                .entries
+                .iter()
+                .filter(|e| matches!(e,
+                    crate::trace::TraceEntry::ScriptStart { script, .. } if script == "resolve.ncs"
+                ))
+                .count(),
+            1
+        );
+        // A non-impact effect with result zero remains absent.
+        s.world.get_mut(attacker).unwrap().combat.attack = Some(AttackResult {
+            results: [0, 0],
+            effects: [
+                Some(Effect {
+                    ty: 1013,
+                    ..Default::default()
+                }),
+                None,
+            ],
+        });
+        s.resolve_da2_attack(attacker, target);
+        assert_eq!(
+            s.world
+                .get(attacker)
+                .unwrap()
+                .combat
+                .attack
+                .as_ref()
+                .unwrap()
+                .results,
+            [0, 0]
+        );
     }
 
     #[test]
