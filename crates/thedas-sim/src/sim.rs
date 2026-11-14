@@ -1468,7 +1468,13 @@ impl Sim {
         let Some(p) = self.world.popup.take() else {
             return false;
         };
-        let Some(target) = self.world.module else {
+        // Without a module (tests, a bare simulation) the owner hears it.
+        let Some(target) = self
+            .world
+            .module
+            .or(Some(p.owner))
+            .filter(|&t| self.world.get(t).is_some())
+        else {
             return false;
         };
         let mut ev = self.new_event("POPUP_RESULT", self.world.hero);
