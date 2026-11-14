@@ -256,6 +256,55 @@ pub(crate) fn cell_float(c: Option<&Cell>) -> f32 {
     }
 }
 
+fn upgradable_ability_data(
+    sim: &Sim,
+    id: ObjectId,
+    column: u32,
+    ability: i32,
+    floating: bool,
+) -> Option<(std::sync::Arc<crate::m2da::Table>, Vec<i64>)> {
+    let creature = sim
+        .world
+        .get(id)
+        .filter(|o| o.kind == ObjectKind::Creature)?;
+    let table = sim.world.tables.get(1, "")?;
+    let ability = i64::from(ability);
+    let cell = |row| table.cell_by_hash(column, row);
+    let mut rows = vec![ability];
+    let upgradeable = if floating {
+        cell_float(cell(0)) != 0.0
+    } else {
+        cell_int(cell(0)) != 0
+    };
+    if upgradeable && cell(ability).is_some() {
+        for upgrade in [0xd300_f4d9, 0xf82d_a71a, 0xe136_965b, 0xae77_009c] {
+            let id = cell_int(table.cell_by_hash(upgrade, ability));
+            if creature.abilities.contains(&id) {
+                rows.push(i64::from(id));
+            }
+        }
+    }
+    Some((table, rows))
+}
+
+pub(crate) fn upgradable_ability_int(sim: &Sim, id: ObjectId, column: u32, ability: i32) -> i32 {
+    let Some((table, rows)) = upgradable_ability_data(sim, id, column, ability, false) else {
+        return 0;
+    };
+    rows.into_iter().fold(0i32, |n, row| {
+        n.wrapping_add(cell_int(table.cell_by_hash(column, row)))
+    })
+}
+
+fn upgradable_ability_float(sim: &Sim, id: ObjectId, column: u32, ability: i32) -> f32 {
+    let Some((table, rows)) = upgradable_ability_data(sim, id, column, ability, true) else {
+        return 0.0;
+    };
+    rows.into_iter().fold(0.0, |n, row| {
+        n + cell_float(table.cell_by_hash(column, row))
+    })
+}
+
 pub(crate) fn cell_string(c: Option<&Cell>) -> String {
     match c {
         Some(Cell::Int(v)) => v.to_string(),
@@ -867,6 +916,18 @@ pub fn call(
             if a.len() > 2 { int(a, 2) } else { 9 },
         ))),
         "IntToFloat" => ok(Value::Float(int(a, 0) as f32)),
+        "FloatToInt" if h.sim.game == thedas_vfs::Game::Origins => {
+            // 0x64f3f0 -> 0x8e34f0 uses the CRT's SSE2 truncating conversion.
+            // Its invalid result is i32::MIN, including NaNs and positive overflow.
+            let value = float(a, 0);
+            ok(Value::Int(
+                if (i32::MIN as f32..2147483648.0).contains(&value) {
+                    value as i32
+                } else {
+                    i32::MIN
+                },
+            ))
+        }
         "FloatToInt" => ok(Value::Int(float(a, 0) as i32)),
         "StringToInt" | "HexStringToInt" if h.sim.game == thedas_vfs::Game::Origins => {
             ok(Value::Int(origins_string_to_int(&string(a, 0))))
@@ -1069,11 +1130,13 @@ pub fn call(
                 .unwrap_or_default(),
         )),
         "GetName" => ok(Value::String(h.sim.display_name(obj(a, 0)))),
-        // An empty name gives the template's back. Provisional.
         "SetName" => {
             let name = string(a, 1);
+            // Origins explicitly assigns even an empty localized name (0x66ba00 ->
+            // 0x4d1bb0). DA2's empty-name behavior has not been traced.
+            let assigned = h.sim.game == thedas_vfs::Game::Origins || !name.is_empty();
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.name = (!name.is_empty()).then_some(name);
+                o.name = assigned.then_some(name);
             }
             void()
         }
@@ -1612,6 +1675,28 @@ pub fn call(
                 handle: Some(hd),
             })
         }
+        // DA2's native 0x4f00d0 constructs the ability's delayed impact payload and
+        // schedules it for oObject. Its creator is the calling script's object, not
+        // necessarily the caster; the explicit script overrides oObject's handler.
+        "ConstructAbilityImpactandDelayEvent" => {
+            let target = obj(a, 1);
+            if h.object(target).is_none() {
+                return void();
+            }
+            let ev = Event {
+                ty: int(a, 3),
+                creator: Some(caller),
+                objects: (4..8).map(|i| obj(a, i)).collect(),
+                floats: vec![float(a, 8)],
+                ints: (9..14).map(|i| int(a, i)).collect(),
+                vectors: vec![vector(a, 14)],
+                ..Default::default()
+            };
+            let script = Some(string(a, 2)).filter(|s| !s.is_empty());
+            let ms = (float(a, 0).max(0.0) * 1000.0).round() as u64;
+            h.sim.world.queue_event(ms, target, ev, script);
+            void()
+        }
         "SignalEvent" | "DelayEvent" => {
             let (target, hi, delay) = if name == "SignalEvent" {
                 (obj(a, 0), 1, 0.0)
@@ -1639,12 +1724,32 @@ pub fn call(
                 Some(EngineData::Event(e)) => e.clone(),
                 _ => return void(),
             };
-            let script = string(a, 1);
+            let (script, target) = if h.sim.game == thedas_vfs::Game::Origins {
+                // 0x6586d0 resolves OBJECT_SELF, strips the explicit resource's suffix,
+                // and falls back to that object's script. See notes/script-handle-event.md.
+                let Some(object) = h.object(caller) else {
+                    return void();
+                };
+                if matches!(
+                    object.kind,
+                    ObjectKind::Stage | ObjectKind::Party | ObjectKind::Map | ObjectKind::MapPin
+                ) {
+                    return void();
+                }
+                let resource = string(a, 1);
+                let name = resource.split(['.', '\0']).next().unwrap_or_default();
+                let script = if name.is_empty() {
+                    object.script.clone().unwrap_or_default()
+                } else {
+                    name.to_string()
+                };
+                (script, caller)
+            } else {
+                (string(a, 1), ev.target.unwrap_or(caller))
+            };
             if script.is_empty() {
-                // With no script, the engine's default handling applies; we have none.
                 return void();
             }
-            let target = ev.target.unwrap_or(caller);
             h.sim.run_script(&script, target, Some(ev));
             void()
         }
@@ -1708,48 +1813,12 @@ pub fn call(
         // row 0 marks which columns accept additions from the four learned upgrades.
         // Read the live ability set, so grants/removals and reload need no cached totals.
         "GetUpgradableAbilityHashedM2DAInt" | "GetUpgradableAbilityHashedM2DAFloat" => {
-            let Some(creature) = h
-                .object(obj(a, 0))
-                .filter(|o| o.kind == ObjectKind::Creature)
-            else {
-                return ok(if name.ends_with("Float") {
-                    Value::Float(0.0)
-                } else {
-                    Value::Int(0)
-                });
-            };
-            let table = h.sim.world.tables.get(1, "");
             let column = int(a, 1) as u32;
-            let ability = i64::from(int(a, 2));
-            let cell = |row| table.as_ref().and_then(|t| t.cell_by_hash(column, row));
-            let mut rows = vec![ability];
-            let upgradeable = if name.ends_with("Float") {
-                cell_float(cell(0)) != 0.0
-            } else {
-                cell_int(cell(0)) != 0
-            };
-            if upgradeable && cell(ability).is_some() {
-                for upgrade in [0xd300_f4d9, 0xf82d_a71a, 0xe136_965b, 0xae77_009c] {
-                    let id = cell_int(
-                        table
-                            .as_ref()
-                            .and_then(|t| t.cell_by_hash(upgrade, ability)),
-                    );
-                    if creature.abilities.contains(&id) {
-                        rows.push(i64::from(id));
-                    }
-                }
-            }
+            let ability = int(a, 2);
             ok(if name.ends_with("Float") {
-                Value::Float(
-                    rows.into_iter()
-                        .fold(0.0, |n, row| n + cell_float(cell(row))),
-                )
+                Value::Float(upgradable_ability_float(h.sim, obj(a, 0), column, ability))
             } else {
-                Value::Int(
-                    rows.into_iter()
-                        .fold(0i32, |n, row| n.wrapping_add(cell_int(cell(row)))),
-                )
+                Value::Int(upgradable_ability_int(h.sim, obj(a, 0), column, ability))
             })
         }
         "GetM2DARows" => ok(Value::Int(
@@ -3548,12 +3617,35 @@ pub fn call(
             }
             void()
         }
-        // -1 restores the creature's own appearance (rules_core ends a shapeshift so).
-        // Provisional: its own is taken to be its template's. A party member losing its
-        // appearance is traced: it draws nothing.
         "SetAppearanceType" => {
             let who = obj(a, 0);
             let mut app = int(a, 1);
+            if h.sim.game == thedas_vfs::Game::Origins {
+                // 0x674c80: validate before narrowing, update the base before comparing
+                // current values, and let -1 restore that base (0x747b40/0x748a40).
+                if app != -1 && app <= 0 {
+                    return void();
+                }
+                let Some(o) = h.object(who).filter(|o| o.kind == ObjectKind::Creature) else {
+                    return void();
+                };
+                let current = o.appearance as u16;
+                let base = o.base_appearance;
+                let base = base.unwrap_or_else(|| {
+                    h.sim.original_appearance(who).unwrap_or(i32::from(current)) as u16
+                });
+                let o = h.sim.world.get_mut(who).unwrap();
+                if app > 0 {
+                    // Capture the fallback on the first temporary change, too: creatures
+                    // without a readable template must still retain their prior base.
+                    o.base_appearance = Some(if int(a, 2) != 0 { app as u16 } else { base });
+                }
+                if current != app as u16 {
+                    o.appearance = i32::from(if app == -1 { base } else { app as u16 });
+                }
+                return void();
+            }
+            // DA2's setter is untraced; retain its existing template fallback and inputs.
             if app == -1 {
                 app = h
                     .sim
@@ -5930,6 +6022,167 @@ mod tests {
     }
 
     #[test]
+    fn handle_event_selects_the_callers_default_script_in_origins() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"#define ENGINE_STRUCTURE_0 event\n\
+                void HandleEvent(event e, resource r = R\"\") = 121;\n\
+                event GetCurrentEvent() = 2;\n\
+                int GetEventInteger(event e, int i) = 3;\n\
+                void PrintInteger(int n) = 4;\n",
+            )
+            .unwrap(),
+        );
+        // Our fixture prints integer slot zero from the forwarded current event.
+        let code = [
+            4, 3, 0, 0, 0, 0, 5, 0, 0, 2, 0, 5, 0, 0, 3, 2, 5, 0, 0, 4, 1, 0x20, 0,
+        ];
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend_from_slice(&((13 + code.len()) as u32).to_be_bytes());
+        bytes.extend_from_slice(&code);
+        let script = thedas_script::Ncs::parse(&bytes).unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.trace.keep = true;
+        for name in ["fallback", "explicit", "explicit.extra.ncs"] {
+            s.add_script(name, script.clone());
+        }
+        let other = s.world.spawn(ObjectKind::Creature, "other");
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            s.game = game;
+            for kind in [
+                ObjectKind::Module,
+                ObjectKind::Area,
+                ObjectKind::Creature,
+                ObjectKind::Placeable,
+                ObjectKind::Item,
+                ObjectKind::Trigger,
+                ObjectKind::Sound,
+                ObjectKind::Waypoint,
+                ObjectKind::Projectile,
+                ObjectKind::Store,
+                ObjectKind::AreaOfEffect,
+                ObjectKind::Stage,
+                ObjectKind::Party,
+                ObjectKind::Map,
+                ObjectKind::MapPin,
+            ] {
+                let caller = s.world.spawn(kind, "caller");
+                for (own_script, resource, selected) in [
+                    (None, "", None),
+                    (Some(""), "", None),
+                    (Some("fallback"), "", Some("fallback")),
+                    (None, "explicit.extra.ncs", Some("explicit")),
+                    (Some("fallback"), "explicit.extra.ncs", Some("explicit")),
+                ] {
+                    s.world.get_mut(caller).unwrap().script = own_script.map(str::to_string);
+                    let event = s.world.store(EngineData::Event(Event {
+                        ty: 77,
+                        creator: Some(other),
+                        target: Some(other),
+                        ints: vec![31415],
+                        ..Event::default()
+                    }));
+                    s.world.trace.entries.clear();
+                    run(
+                        &mut s,
+                        caller,
+                        "HandleEvent",
+                        &[
+                            Value::Engine {
+                                ty: 0,
+                                handle: Some(event),
+                            },
+                            Value::Resource(resource.into()),
+                        ],
+                    );
+                    let expected = match game {
+                        thedas_vfs::Game::Origins
+                            if matches!(
+                                kind,
+                                ObjectKind::Stage
+                                    | ObjectKind::Party
+                                    | ObjectKind::Map
+                                    | ObjectKind::MapPin
+                            ) =>
+                        {
+                            None
+                        }
+                        thedas_vfs::Game::Origins => selected.map(|name| (name, caller)),
+                        _ => (!resource.is_empty()).then_some((resource, other)),
+                    };
+                    let started: Vec<_> = s
+                        .world
+                        .trace
+                        .entries
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            TraceEntry::ScriptStart { script, caller, .. } => {
+                                Some((script.as_str(), *caller))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(
+                        started,
+                        expected.into_iter().collect::<Vec<_>>(),
+                        "{game:?} {kind:?} {resource:?}"
+                    );
+                    let messages: Vec<_> = s
+                        .world
+                        .trace
+                        .entries
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            TraceEntry::Log {
+                                channel: 0, text, ..
+                            } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(
+                        messages,
+                        if expected.is_some() {
+                            vec!["31415"]
+                        } else {
+                            vec![]
+                        }
+                    );
+                    assert!(s.world.trace.script_errors.is_empty());
+                    assert!(s.world.queue.is_empty());
+                }
+            }
+        }
+        s.game = thedas_vfs::Game::Origins;
+        let event = s.world.store(EngineData::Event(Event::default()));
+        s.world.trace.entries.clear();
+        run(
+            &mut s,
+            OBJECT_INVALID,
+            "HandleEvent",
+            &[
+                Value::Engine {
+                    ty: 0,
+                    handle: Some(event),
+                },
+                Value::Resource("explicit".into()),
+            ],
+        );
+        run(
+            &mut s,
+            other,
+            "HandleEvent",
+            &[
+                Value::Engine {
+                    ty: 0,
+                    handle: None,
+                },
+                Value::Resource("explicit".into()),
+            ],
+        );
+        assert!(s.world.trace.entries.is_empty());
+    }
+
+    #[test]
     fn dragon_age_2_events_carry_vectors() {
         let ldf = "#define ENGINE_STRUCTURE_0 event\n\
             event Event(int nType) = 1;\n\
@@ -6345,6 +6598,51 @@ mod tests {
     }
 
     #[test]
+    fn origins_float_to_int_uses_the_native_sse2_invalid_result() {
+        let table = Arc::new(EngineTable::parse(b"int FloatToInt(float f) = 49;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for (value, expected, da2_expected) in [
+            (0.0, 0, 0),
+            (-0.0, 0, 0),
+            (f32::from_bits(1), 0, 0),
+            (-f32::from_bits(1), 0, 0),
+            (0.99, 0, 0),
+            (-0.99, 0, 0),
+            (1.0, 1, 1),
+            (-1.0, -1, -1),
+            (1.99, 1, 1),
+            (-1.99, -1, -1),
+            (f32::from_bits(0x4effffff), 2147483520, 2147483520),
+            (2147483648.0, i32::MIN, i32::MAX),
+            (f32::from_bits(0x4f000001), i32::MIN, i32::MAX),
+            (-2147483648.0, i32::MIN, i32::MIN),
+            (f32::from_bits(0xceffffff), -2147483520, -2147483520),
+            (f32::from_bits(0xcf000001), i32::MIN, i32::MIN),
+            (f32::MAX, i32::MIN, i32::MAX),
+            (f32::MIN, i32::MIN, i32::MIN),
+            (f32::INFINITY, i32::MIN, i32::MAX),
+            (f32::NEG_INFINITY, i32::MIN, i32::MIN),
+            (f32::NAN, i32::MIN, 0),
+            (-f32::NAN, i32::MIN, 0),
+            (f32::from_bits(0x7f800001), i32::MIN, 0),
+            (f32::from_bits(0xff800001), i32::MIN, 0),
+        ] {
+            for (game, result) in [
+                (thedas_vfs::Game::Origins, expected),
+                (thedas_vfs::Game::DragonAge2, da2_expected),
+            ] {
+                s.game = game;
+                assert_eq!(
+                    run(&mut s, 1, "FloatToInt", &[Value::Float(value)]),
+                    Some(Value::Int(result)),
+                    "{game:?}, float bits {:08x}",
+                    value.to_bits()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn origins_object_to_string_formats_raw_ids_as_signed_decimal() {
         let table = Arc::new(EngineTable::parse(b"string ObjectToString(object o) = 54;").unwrap());
         let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
@@ -6484,6 +6782,161 @@ mod tests {
         }
     }
 
+    #[test]
+    fn origins_keeps_explicitly_empty_object_names_through_save_reload() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"void SetName(object o, string s) = 1; string GetName(object o) = 2;",
+            )
+            .unwrap(),
+        );
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut s = Sim::new(Arc::new(Vfs::new()), table.clone(), 7);
+            s.game = game;
+            let id = s.world.spawn(ObjectKind::Creature, "fallback_name");
+            assert_eq!(
+                run(&mut s, id, "GetName", &[Value::Object(id)]),
+                Some(Value::String("fallback_name".into()))
+            );
+            // Replacing a name must not turn a later empty assignment into a reset.
+            for name in ["Renamed", "", "Named again", ""] {
+                run(
+                    &mut s,
+                    id,
+                    "SetName",
+                    &[Value::Object(id), Value::String(name.into())],
+                );
+                let expected = if game == thedas_vfs::Game::DragonAge2 && name.is_empty() {
+                    "fallback_name"
+                } else {
+                    name
+                };
+                assert_eq!(
+                    run(&mut s, id, "GetName", &[Value::Object(id)]),
+                    Some(Value::String(expected.into()))
+                );
+            }
+            let save = s.save_json().unwrap();
+            s.world.get_mut(id).unwrap().name = Some("Overwritten".into());
+            s.load_json(&save).unwrap();
+            let expected = if game == thedas_vfs::Game::Origins {
+                ""
+            } else {
+                "fallback_name"
+            };
+            assert_eq!(
+                run(&mut s, id, "GetName", &[Value::Object(id)]),
+                Some(Value::String(expected.into()))
+            );
+            let before = s.save_json().unwrap();
+            run(
+                &mut s,
+                id,
+                "SetName",
+                &[Value::Object(OBJECT_INVALID), Value::String(String::new())],
+            );
+            assert_eq!(s.save_json().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn origins_appearance_base_survives_temporary_changes_and_reload() {
+        let table =
+            EngineTable::parse(b"void SetAppearanceType(object o, int n, int b = 0) = 178;\n")
+                .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        s.module_info.name = "test".into();
+        let creature = s.world.spawn(ObjectKind::Creature, "creature");
+        s.world.get_mut(creature).unwrap().appearance = 15;
+        let set = |s: &mut Sim, appearance, base| {
+            run(
+                s,
+                creature,
+                "SetAppearanceType",
+                &[
+                    Value::Object(creature),
+                    Value::Int(appearance),
+                    Value::Int(base),
+                ],
+            );
+        };
+        set(&mut s, 93, 0);
+        assert_eq!(s.world.get(creature).unwrap().base_appearance, Some(15));
+        // Updating the base still takes effect when the current appearance is unchanged.
+        set(&mut s, 93, -1);
+        assert_eq!(s.world.get(creature).unwrap().base_appearance, Some(93));
+        set(&mut s, 1, 0);
+        s.load_game(s.save_game()).unwrap();
+        set(&mut s, -1, 1);
+        let o = s.world.get(creature).unwrap();
+        assert_eq!((o.appearance, o.base_appearance), (93, Some(93)));
+        // Positive arguments narrow to 16 bits, including a wrapped zero base.
+        set(&mut s, 65536, 1);
+        set(&mut s, 15, 0);
+        set(&mut s, -1, 0);
+        assert_eq!(s.world.get(creature).unwrap().appearance, 0);
+        set(&mut s, 15, 1);
+        set(&mut s, 65535, 0);
+        set(&mut s, -1, 0);
+        // The native 16-bit current comparison happens before the -1 restoration.
+        assert_eq!(s.world.get(creature).unwrap().appearance, 65535);
+        set(&mut s, 65536 + 93, 1);
+        assert_eq!(s.world.get(creature).unwrap().appearance, 93);
+    }
+
+    #[test]
+    fn origins_appearance_validation_preserves_objects_and_da2_behavior() {
+        let table =
+            EngineTable::parse(b"void SetAppearanceType(object o, int n, int b = 0) = 178;\n")
+                .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        for kind in [
+            ObjectKind::Creature,
+            ObjectKind::Placeable,
+            ObjectKind::Item,
+        ] {
+            let id = s.world.spawn(kind, "object");
+            s.world.get_mut(id).unwrap().appearance = 15;
+            for appearance in [0, -2, i32::MIN] {
+                run(
+                    &mut s,
+                    id,
+                    "SetAppearanceType",
+                    &[Value::Object(id), Value::Int(appearance), Value::Int(1)],
+                );
+                let o = s.world.get(id).unwrap();
+                assert_eq!((o.appearance, o.base_appearance), (15, None));
+            }
+            if kind != ObjectKind::Creature {
+                run(
+                    &mut s,
+                    id,
+                    "SetAppearanceType",
+                    &[Value::Object(id), Value::Int(93), Value::Int(1)],
+                );
+                assert_eq!(s.world.get(id).unwrap().appearance, 15);
+            }
+            s.game = thedas_vfs::Game::DragonAge2;
+            run(
+                &mut s,
+                id,
+                "SetAppearanceType",
+                &[Value::Object(id), Value::Int(65536), Value::Int(1)],
+            );
+            let o = s.world.get(id).unwrap();
+            assert_eq!((o.appearance, o.base_appearance), (65536, None));
+            s.game = thedas_vfs::Game::Origins;
+        }
+        let count = s.world.objects.len();
+        run(
+            &mut s,
+            OBJECT_INVALID,
+            "SetAppearanceType",
+            &[Value::Object(OBJECT_INVALID), Value::Int(93), Value::Int(1)],
+        );
+        assert_eq!(s.world.objects.len(), count);
+    }
+
     /// Calls engine function `name` as `caller`.
     fn run(s: &mut Sim, caller: ObjectId, name: &str, a: &[Value]) -> Option<Value> {
         let f = s.table.function_by_name(name).cloned().unwrap();
@@ -6493,6 +6946,78 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn da2_delayed_ability_impacts_keep_the_payload_and_delivery_time_on_reload() {
+        let table = Arc::new(
+            EngineTable::parse(
+                br#"
+            void ConstructAbilityImpactandDelayEvent(float delay, object receiver,
+                string script, int type, object caster, object victim, object item,
+                object secondary, float damage, int ability, int result, int hit,
+                int hand, int damageType, vector position) = 890;
+        "#,
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.game = thedas_vfs::Game::DragonAge2;
+        let caller = s.world.spawn(ObjectKind::Creature, "caller");
+        let receiver = s.world.spawn(ObjectKind::Creature, "receiver");
+        let caster = s.world.spawn(ObjectKind::Creature, "caster");
+        s.world.time_ms = 500;
+        let mut args = vec![
+            Value::Float(0.125),
+            Value::Object(receiver),
+            Value::String("impact".into()),
+            Value::Int(1066),
+            Value::Object(caster),
+            Value::Object(41),
+            Value::Object(OBJECT_INVALID),
+            Value::Object(43),
+            Value::Float(17.25),
+            Value::Int(123),
+            Value::Int(8),
+            Value::Int(2),
+            Value::Int(1),
+            Value::Int(4),
+            Value::Vector([1.0, -2.0, 3.5]),
+        ];
+        run(&mut s, caller, "ConstructAbilityImpactandDelayEvent", &args);
+        assert!(s.world.pop_due(624).is_none());
+        let serialized = serde_json::to_vec(&s.world).unwrap();
+        let mut restored: crate::world::World = serde_json::from_slice(&serialized).unwrap();
+        let (due, queued) = restored.pop_due(625).unwrap();
+        assert_eq!(due, 625);
+        assert_eq!(queued.target, receiver);
+        assert_eq!(queued.script.as_deref(), Some("impact"));
+        assert_eq!(
+            queued.event,
+            Event {
+                ty: 1066,
+                creator: Some(caller),
+                objects: vec![caster, 41, OBJECT_INVALID, 43],
+                floats: vec![17.25],
+                ints: vec![123, 8, 2, 1, 4],
+                vectors: vec![[1.0, -2.0, 3.5]],
+                ..Default::default()
+            }
+        );
+        assert!(restored.pop_due(u64::MAX).is_none());
+        assert_eq!(s.world.pop_due(625).unwrap().1.event, queued.event);
+
+        // No override uses the receiver's ordinary handler. Even a zero or negative
+        // delay is queued, so this helper does not re-enter the caller's script.
+        args[0] = Value::Float(-1.0);
+        args[2] = Value::String(String::new());
+        run(&mut s, caller, "ConstructAbilityImpactandDelayEvent", &args);
+        let (due, queued) = s.world.pop_due(500).unwrap();
+        assert_eq!(due, 500);
+        assert_eq!(queued.script, None);
+        args[1] = Value::Object(OBJECT_INVALID);
+        run(&mut s, caller, "ConstructAbilityImpactandDelayEvent", &args);
+        assert!(s.world.pop_due(u64::MAX).is_none());
     }
 
     #[test]

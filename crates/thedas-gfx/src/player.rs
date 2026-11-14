@@ -31,8 +31,6 @@ pub struct Player {
     queue_init: VecDeque<Queued>,
     queue_construct: VecDeque<Queued>,
     queue_default: VecDeque<Queued>,
-    /// Whether press handlers get the mouse button as Scaleform passed it (`onPress(1)`).
-    pub pass_buttons: bool,
 }
 
 fn clip_for(timeline: Arc<crate::swf::Timeline>, character: u16) -> Clip {
@@ -142,7 +140,6 @@ impl Player {
             queue_init: VecDeque::new(),
             queue_construct: VecDeque::new(),
             queue_default: VecDeque::new(),
-            pass_buttons: true,
         };
         // The root's first frame.
         display_api::display_value(&mut p.vm, root);
@@ -536,11 +533,7 @@ impl Player {
         self.vm.pick_dirty = true;
         self.update_hover();
         let b = Value::Number((button + if double { 4 } else { 0 }) as f64);
-        let press_args: Vec<Value> = if self.pass_buttons {
-            vec![b.clone()]
-        } else {
-            Vec::new()
-        };
+        let press_args = [b.clone()];
         let top = self
             .topmost_at(x, y)
             .map(|d| display_api::display_value(&mut self.vm, d))
@@ -1042,7 +1035,7 @@ fn constructed(vm: &mut Vm, d: DisplayId, by_script: bool, init: Option<ObjId>) 
         });
     }
     // The clip's load event is queued before its first frame makes its children, so a
-    // parent hears `onLoad` before the clips inside it (as Ruffle and Scaleform order it).
+    // parent hears `onLoad` before the clips inside it (as Scaleform orders it).
     let load = clip_events(vm, d, clip_event::LOAD);
     vm.queue.push_back(Queued::Event(d, "onLoad", load));
     enter_frame_of(vm, d, 0);

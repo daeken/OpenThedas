@@ -122,7 +122,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 | `.fev` | yes | no | yes | music chunk raw |
 | `.fsb` | yes (FSB4) | no | yes | IMA ADPCM, MP3, PCM |
 | `.wav` | no | yes (offline renders) | CLI/app recording | |
-| `.gfx` | yes (scan, rewrite to SWF) | SWF rewrite | yes (Ruffle) | LZMA SWF unsupported |
+| `.gfx` | yes (scan, rewrite to SWF) | SWF rewrite | yes (`thedas-gfx`) | LZMA SWF unsupported |
 | `.fxo` / `.psh` / `.vsh` | yes (thedas-shader) | no | yes | |
 | `.ncs` | yes (thedas-script) | no | yes | |
 | `.nss` | no | no | name only | no compiler |
