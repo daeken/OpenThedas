@@ -1055,9 +1055,9 @@ fn add_interval(vm: &mut Vm, args: &[Value], once: bool) -> Value {
     };
     let every = vm.to_number(&arg(rest, 0));
     let every = if every.is_finite() {
-        every.max(1.0)
+        every.trunc().max(10.0)
     } else {
-        1.0
+        10.0
     };
     vm.next_interval += 1;
     let id = vm.next_interval;
@@ -1067,7 +1067,7 @@ fn add_interval(vm: &mut Vm, args: &[Value], once: bool) -> Value {
         func,
         method,
         every: if once { -every } else { every },
-        next: vm.time_ms + every,
+        next: vm.timer_time_ms + every,
         args: rest.get(1..).unwrap_or(&[]).to_vec(),
     });
     Value::Number(id as f64)

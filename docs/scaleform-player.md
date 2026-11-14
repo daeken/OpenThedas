@@ -68,6 +68,9 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
    `Set/GetVariable(path)` from the host; `fscommand` answered synchronously so
    `fsc_retval` is set before the call returns; mouse button passed to press handlers;
    `onLoad` after the frame's code; `Stage.width/height` report the visible area.
+   Intervals preserve their scheduled phase and catch up in deadline order. Delays use
+   integer milliseconds with a 10 ms minimum; a bounded scheduler clock limits catch-up
+   work without rewinding `getTimer`. Removed clips stop receiving method timers.
 3. **`display`**: the display list (MovieClip, Shape, EditText, Morph), timelines, depth
    rules, mouse picking (with `hitTestDisable`), focus and keyboard routing, input text.
    Timeline-placed registered classes construct parents before descendants. This preserves
