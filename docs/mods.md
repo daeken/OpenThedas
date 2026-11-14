@@ -103,6 +103,13 @@ Documents folders, or `THEDAS_MODS=<path to another list>` to use a different li
 
 ## The mod cache
 
+For `.dazip` packages, each add-in uses its own manifest item. `thedas mods` shows
+its title, description, publisher, release version and prerequisites. Listing a
+package enables its add-ins and their installed prerequisites. An add-in requiring
+a newer game version is left out of both the resource stack and level searches;
+the log gives the reason. A missing prerequisite is reported. Packages stay in
+our cache and do not alter the original game's `AddIns.xml`.
+
 `.7z`, `.rar` and `.dazip` files are unpacked once into `mod-cache` inside your data folder, and used
 from there on later starts. A big texture pack takes a while and a lot of disk the first time
 (a 4x texture pack of 11 GB unpacks to about 20 GB). If you change or replace the archive it

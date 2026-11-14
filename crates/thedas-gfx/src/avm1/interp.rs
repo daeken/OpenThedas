@@ -398,6 +398,13 @@ fn property_name(i: u32) -> &'static str {
 }
 
 fn exec(vm: &mut Vm, f: &mut Frame) -> Value {
+    let old = vm.native_target.replace(f.target);
+    let result = exec_inner(vm, f);
+    vm.native_target = old;
+    result
+}
+
+fn exec_inner(vm: &mut Vm, f: &mut Frame) -> Value {
     let code = f.code.clone();
     while f.pc < f.end {
         vm.budget += 1;
