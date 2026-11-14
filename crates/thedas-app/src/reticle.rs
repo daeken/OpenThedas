@@ -136,7 +136,7 @@ pub struct ReticlePass {
 }
 
 impl ReticlePass {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, samples: u32) -> Self {
         use wgpu::util::DeviceExt;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("reticle"),
@@ -198,7 +198,10 @@ impl ReticlePass {
             }),
             primitive: Default::default(),
             depth_stencil: None,
-            multisample: Default::default(),
+            multisample: wgpu::MultisampleState {
+                count: samples.max(1),
+                ..Default::default()
+            },
             multiview_mask: None,
             cache: None,
         });
