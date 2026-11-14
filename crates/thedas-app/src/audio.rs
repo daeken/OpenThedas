@@ -62,6 +62,31 @@ pub struct Gear {
     /// For a placeable: its type, the row of `placeable_types.gda` (worksheet 93, the
     /// placeable's +0x4f0) that names its sounds.
     pub placeable: Option<i64>,
+    /// Its appearance's height (`apr_base.gda` `HEIGHT`, `HEIGHT_F` for a female; none:
+    /// [`DEFAULT_HEIGHT`]), which places its sound emitters (see [`emitter_heights`]).
+    pub height: Option<f32>,
+}
+
+/// A creature's height when its appearance gives none (`CAppearance`'s default, 0x748a51).
+pub const DEFAULT_HEIGHT: f32 = 1.8;
+
+/// How high above a creature's feet its two sound emitters sit (DAOrigins.exe 0x6aa5fd..
+/// 0x6aa6d4, run each frame): the body's (+0x870) at half its appearance's height
+/// (0x6a1a30 -> +0x64, times 0.5 at 0xae70f8), or 0.9 m (0xaf91d0) without an appearance;
+/// the head's (+0x8d0) at its model's node in slot 3 (0xa66b40), else where the body's is.
+/// Provisional: the head's is taken as the appearance's full height.
+pub fn emitter_heights(height: Option<f32>) -> (f32, f32) {
+    let h = height.unwrap_or(DEFAULT_HEIGHT);
+    (h * 0.5, h)
+}
+
+/// Whether an animation event kind sounds from the creature's head emitter rather than
+/// its body's: the play switch after the request queue (0x6b6497, table 0x6b6850, indexed
+/// by the kind less one) sends kinds 1, 3-7, 9, 10, 19 and 21 to the head (+0x8d0,
+/// 0x6b64ae); the rest, footsteps (14), foley (17) and vegetation among them, to the body
+/// (+0x870).
+pub fn sounds_from_head(kind: u32) -> bool {
+    matches!(kind, 1 | 3..=7 | 9 | 10 | 19 | 21)
 }
 
 /// A sound set's lines (`sse_<set>.gda`: row -> strref) and each type's number of them
@@ -1148,7 +1173,8 @@ impl GameAudio {
                     self.engine.play(
                         event,
                         PlayOptions {
-                            position: Some(*pos),
+                            // Rustles sound from the body emitter (0x6b42b3).
+                            position: Some([pos[0], pos[1], pos[2] + emitter_heights(g.height).0]),
                             ..Default::default()
                         },
                     );
@@ -1162,8 +1188,11 @@ impl GameAudio {
             rustled.insert(*id, (*pos, reach));
         }
         self.rustles = rustled;
-        for (id, ani, t, length, pos) in clocks {
+        for (id, ani, t, length, feet) in clocks {
             let key = ani.to_ascii_lowercase();
+            let (body_up, head_up) = emitter_heights(gear.get(&id).and_then(|g| g.height));
+            let body = [feet[0], feet[1], feet[2] + body_up];
+            let head = [feet[0], feet[1], feet[2] + head_up];
             let prev = self.anim_clocks.get(&id).cloned();
             seen.insert(id, (key.clone(), t));
             let events = match self.anim_events.get(&key) {
@@ -1262,8 +1291,9 @@ impl GameAudio {
                     // material, the column of the target's (by label, 0x5b6f60). Kind 7
                     // (0x6a5b00) does the same for the attack's target when the event says
                     // `|PlayHit` (0x69e720), whatever the result.
-                    // Provisional: placeable targets (table 93) are not sounded, and the
-                    // sound plays where the target stands.
+                    // It sounds from the striker's head emitter (kind - 1 = 0 and 6 go to
+                    // 0x6b64ae, +0x8d0), not where the target stands.
+                    // Provisional: placeable targets (table 93) are not sounded.
                     (1 | 7, text) => {
                         let g = gear.get(&id).copied().unwrap_or_default();
                         let left = text.as_deref().is_some_and(|t| t.contains("|Left"));
@@ -1282,7 +1312,7 @@ impl GameAudio {
                         } else {
                             None
                         };
-                        if let Some((struck, at)) = target {
+                        if let Some((struck, _)) = target {
                             let w = if left { g.off } else { g.main };
                             let weapon = self.impacts.material(w).or(g.unarmed);
                             let event = self.weapon_hits.as_ref().and_then(|t| {
@@ -1293,7 +1323,7 @@ impl GameAudio {
                                 self.engine.play(
                                     &e,
                                     PlayOptions {
-                                        position: Some(at),
+                                        position: Some(head),
                                         ..Default::default()
                                     },
                                 );
@@ -1324,7 +1354,7 @@ impl GameAudio {
                             self.engine.play(
                                 &e,
                                 PlayOptions {
-                                    position: Some(pos),
+                                    position: Some(body),
                                     ..Default::default()
                                 },
                             );
@@ -1369,10 +1399,18 @@ impl GameAudio {
                         prev.as_ref().map(|p| p.1),
                         ev.time
                     );
+                    // A placeable sounds where it stands; a creature from its emitter.
+                    let at = if ev.kind == 27 {
+                        feet
+                    } else if sounds_from_head(ev.kind as u32) {
+                        head
+                    } else {
+                        body
+                    };
                     self.engine.play(
                         &event,
                         PlayOptions {
-                            position: Some(pos),
+                            position: Some(at),
                             ..Default::default()
                         },
                     );
@@ -2386,6 +2424,18 @@ fn db_gain(db: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn footsteps_sound_from_the_body_and_swings_from_the_head() {
+        assert_eq!(emitter_heights(Some(1.6)), (0.8, 1.6));
+        assert_eq!(emitter_heights(None), (0.9, 1.8));
+        for kind in [1, 3, 4, 5, 6, 7, 9, 10, 19, 21] {
+            assert!(sounds_from_head(kind), "kind {kind}");
+        }
+        for kind in [2, 8, 11, 14, 17, 18, 20, 27] {
+            assert!(!sounds_from_head(kind), "kind {kind}");
+        }
+    }
 
     #[test]
     fn music_changes_wait_for_the_next_marker() {
