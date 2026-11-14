@@ -1778,7 +1778,8 @@ impl Server {
                         // the hero idle while followers and enemies keep attacking.
                         || (sim.game == thedas_vfs::Game::DragonAge2
                             && h.commands.first().is_none_or(|c| {
-                                c.name != "CommandAttack" || c.target != Some(target)
+                                !matches!(c.name.as_str(), "CommandAttack" | "CommandUseAbility")
+                                    || c.target != Some(target)
                             }))
                 }) {
                     break;
