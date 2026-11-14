@@ -119,6 +119,11 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
   back into view; cropped/padded filter targets and pooling remain optimizations.
 - Layer blend groups render to isolated targets. Alpha/erase modify that layer's picture;
   outside a layer they draw nothing, matching Flash and avoiding the map's black border.
+- Difference, invert, overlay and hard light flatten their source subtree and blend with
+  a resolved destination snapshot. The shader blends straight colours in the overlap and
+  preserves premultiplied source/destination coverage elsewhere. Render-pass boundaries
+  preserve open stencil masks and subsequent sibling order. GPU readback covers transparent
+  pictures, overlapping children, consecutive destination blends and clip-depth masks.
 - Export-backed `BitmapData.loadBitmap` and `MovieClip.attachBitmap` let the shared host
   inline-image helper place copper/silver/gold icons in inventory and store prices. Timeline
   jumps distinguish text characters, so the unaffordable-price state can replace gold text
@@ -126,9 +131,8 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
 - `MovieClip.duplicateMovieClip` constructs a fresh instance of the registered class with
   the source's transform, colour, drawing and clip events. The host can now add its Mod Mode
   button alongside Report Issue using the same menu setup on either backend.
-- Not yet: text `shadowStyle`, overlay / hard light /
-  difference / invert blends (drawn normal), `setMask`, inline `<img>` in text,
-  and complete parity on engine-state screens (book screens, popups, conversation).
+- Remaining work includes complete text `shadowStyle`, native inline `<img>` layout,
+  cached bitmap alpha masks, and broader interaction parity.
 - Tools: `cargo run -p thedas-ui --example sidebyside -- INSTALL OUT.png MOVIES [FRAMES]
   [WxH] [ORIGINAL.png]` (Ruffle and ours, optionally after a shot of the original);
   `thedas-gfx` examples `gfxscan` (parse), `gfxrun` (run headless; `GFX_RENDER=1` times
