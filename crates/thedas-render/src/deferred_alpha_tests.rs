@@ -19,15 +19,15 @@ fn punch_opacity_keeps_holes_comparisons_rounding_and_shader_clip() {
         source: wgpu::ShaderSource::Wgsl(
             format!(
                 r#"{DEFERRED_WGSL}
-            {frond_alpha}
+            {tree_alpha}
             @fragment fn fs_fixture(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {{
                 let opacity = textureSample(diffuse_tex, wrap_smp, vec2<f32>(p.x / 16.0, 0.5)).a;
                 if (draw.alpha.w == -2.0) {{
-                    if (!frond_alpha_kept(opacity, draw.alpha.z, draw.alpha.y)) {{ discard; }}
+                    if (!tree_alpha_kept(opacity, draw.alpha.z, draw.alpha.y)) {{ discard; }}
                 }} else if (!alpha_kept(opacity)) {{ discard; }}
                 return vec4<f32>(1.0);
             }}"#,
-                frond_alpha = fronds::ALPHA_WGSL,
+                tree_alpha = trees::ALPHA_WGSL,
             )
             .into(),
         ),
