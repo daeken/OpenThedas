@@ -939,6 +939,11 @@ fn play_interface(
                 log::info!("aiming ability {} (click a target)", aim.ability);
                 live.aiming = Some(aim);
             }
+            // A script's DoAutoSave, made between frames as every save is.
+            let autosave = live.sim().take_autosave_request();
+            if autosave {
+                ui.auto_save(&live.sim);
+            }
             ui.update_minimap(&live.sim, camera);
             ui.update_floaties(&live.sim, camera, dt.min(100.0), &|c| live.head_height(c));
         }

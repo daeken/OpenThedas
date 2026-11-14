@@ -329,7 +329,6 @@ modules, not that the scripts cannot do it.
 ### Saves
 
 - **SIM-160** **Original save import.** Original: `.das` saves. Ours: JSON world dump only; no `.das` read or write. Evidence: `crates/thedas-sim/src/save.rs:3-6`. Size: L. Depends: none. Kind: missing.
-- **SIM-161** **Autosave and quicksave.** Original: autosave, quicksave. Ours: `DoAutoSave` logs and does nothing; no quicksave code found. Evidence: `crates/thedas-sim/src/engine.rs:2823-2829`. Size: S. Depends: SIM-160. Kind: missing.
 - **SIM-162** **Tutorial queue saved.** Original: whether saved is not traced. Ours: saved; a held pause with an empty queue is released on load. Evidence: `crates/thedas-sim/src/save.rs:333-335`. Size: S. Depends: none. Kind: provisional.
 - **SIM-163** **Music intensity saved.** Original: not traced. Ours: saved. Evidence: `crates/thedas-sim/src/world.rs:566-568`. Size: S. Depends: none. Kind: provisional.
 - **SIM-164** **Sim-level state outside the world is not saved.** Original: not traced. Ours: `Sim` fields such as `following`, `next_follow_ms`, `walk_blocked_by`, `auto_pause_combat` and the policies are not in `SaveGame`. Evidence: `crates/thedas-sim/src/sim.rs:73-139`, `crates/thedas-sim/src/save.rs:87-96`. Size: S. Depends: none. Kind: unverified.

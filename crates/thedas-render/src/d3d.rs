@@ -297,7 +297,12 @@ pub fn pssm_program(
     cache: &mut crate::RenderCache,
 ) -> Option<CasterMaterial> {
     let def = material.definition.as_ref()?;
-    let technique = def.select("PSSM", 3, detail)?;
+    // A Dragon Age II material's own semantic's shadow form, else Origins' `PSSM`.
+    let own = format!("{}{}", material.semantic, thedas_formats::bmat::SHADOW);
+    let (semantic, technique) = match def.select(&own, 3, detail) {
+        Some(t) => (own, t),
+        None => ("PSSM".to_string(), def.select("PSSM", 3, detail)?),
+    };
     let (vs, ps, st) = pass_shaders(technique)?.into_iter().next()?;
     let key = format!("{vs}+{ps}+{st}").to_ascii_lowercase();
     let program = match cache.programs.get(&key) {
@@ -316,7 +321,7 @@ pub fn pssm_program(
     }?;
     let material = SceneMaterial {
         technique: Some(technique.clone()),
-        semantic: "PSSM".into(),
+        semantic,
         ..material.clone()
     };
     Some((program, material))
@@ -868,13 +873,13 @@ pub const NO_SHADOW_DATA: [[f32; 4]; 9] = [
 /// lighting; the second's `x` applies the shadow partition, `y` the fog, `z` shows a debug
 /// view in place of the output; the third's `x` shows another, and `z` keeps the specular
 /// term; the fourth's `y` and `z` show two more. These are the switches for the ordinary
-/// picture, with shadows off because their constants are not fed yet.
+/// picture.
 ///
 /// Provisional: read from that one shader's code; the values the executable writes are not
 /// traced, and other shaders may read components this leaves zero.
 pub const DEBUG_CONTROL: [[f32; 4]; 4] = [
     [0.0, 1.0, 1.0, 1.0],
-    [0.0, 1.0, 0.0, 0.0],
+    [1.0, 1.0, 0.0, 0.0],
     [0.0, 0.0, 1.0, 0.0],
     [0.0, 0.0, 0.0, 0.0],
 ];
@@ -895,6 +900,12 @@ fn probe_at(probe: &IrradianceProbe, n: Vec3) -> Vec3 {
         channel(&rows[8..12]),
     )
 }
+
+/// How much nearer the sun a Dragon Age II receiver is put than its own depth in the
+/// partition (in the partition's depth units, 0 to 1): its shaders compare the map with the
+/// depth as it is, and its shadow techniques set no depth bias, so without it a surface
+/// shadows itself. Provisional: the engine's own bias is not traced.
+pub const DA2_SHADOW_BIAS: f32 = 0.002;
 
 /// Light from every direction for draws in a level with no irradiance probe. Provisional.
 pub const NO_PROBE_IRRADIANCE: [f32; 3] = [0.35, 0.35, 0.35];
@@ -1212,10 +1223,14 @@ impl ConstantContext<'_> {
             ("ApplicationTime", _) => Value::Vectors(vec![[self.time, 0.0, 0.0, 0.0]]),
             ("CloudParameters", _) => Value::Vectors(self.clouds.to_vec()),
             ("ShadowData", _) => Value::Vectors(self.shadow.to_vec()),
-            // Dragon Age II's shadow partitions are not drawn: its shaders get the
-            // partition matrices that find every point lit, whatever this pass's partitions
-            // hold (its face shaders test the shadow with no switch to turn it off).
-            ("ShadowDataUnshadowed", _) => Value::Vectors(NO_SHADOW_DATA.to_vec()),
+            // Dragon Age II's shaders read one partition (`smpShadowPartition1`, bound to
+            // the first): its matrix's rows to the map's x, y and depth, which Origins'
+            // shadow data begins with. With no partitions drawn they find every point lit.
+            ("ShadowDataFirstPartition", _) => {
+                let mut rows = self.shadow[..3].to_vec();
+                rows[2][3] -= DA2_SHADOW_BIAS;
+                Value::Vectors(rows)
+            }
             // Four rows of the partition's matrix, as `PSSMMesh.vsh` reads them (`dp4`).
             ("ShadowPartitionMatrix", _) => Value::Vectors(
                 self.partition
@@ -1299,6 +1314,7 @@ impl ConstantContext<'_> {
                 | "ApplicationTime"
                 | "ShadowData"
                 | "ShadowPartitionMatrix"
+                | "ShadowDataFirstPartition"
                 | "BonesWorld"
         ) || matches!(
             c.name.as_str(),
@@ -1889,8 +1905,11 @@ mod tests {
         assert!((c.floats[20][0] - even).abs() < 1e-4);
         assert!(c.floats[21..27].iter().flatten().all(|v| *v == 0.0));
         assert_eq!(c.floats[30], [0.0, 1.0, 1.0, 1.0]);
-        // Shadows are not drawn for these: every point lit, whatever the pass holds.
-        assert_eq!(c.floats[31..34], NO_SHADOW_DATA[..3]);
+        // The first partition's shadow data, its depth nudged by the receiver bias.
+        assert_eq!(
+            c.floats[31..34],
+            [[7.0; 4], [7.0; 4], [7.0, 7.0, 7.0, 7.0 - DA2_SHADOW_BIAS]]
+        );
 
         // A sun straight down lights an upward normal fully and a downward one not at all:
         // the coefficients' sum at the normal (as the shaders evaluate them) is the
