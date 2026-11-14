@@ -1876,6 +1876,22 @@ fn pick_in(vm: &Vm, d: DisplayId, x: f32, y: f32, mode: PickMode) -> Option<Disp
             }
         }
     }
+    // A clip's dynamic fills are painted behind every child, including negative depths.
+    // Test only its own geometry: hit_shape would also include children rejected above
+    // by their timeline masks, making masked-out content pick the parent instead.
+    if matches!(mode, PickMode::Any)
+        && let Some(drawing) = o.clip().and_then(|c| c.drawing.as_ref())
+        && let Some(inverse) = vm.display.world_matrix(d).invert()
+    {
+        let (lx, ly) = inverse.apply(x, y);
+        if drawing
+            .fills
+            .iter()
+            .any(|(_, points)| polygon_contains(points, lx, ly))
+        {
+            return Some(d);
+        }
+    }
     None
 }
 
@@ -2295,6 +2311,108 @@ mod queue_tests {
         p.vm.set(&bv, "_visible", Value::Bool(true));
         p.mouse_wheel(10.0, 10.0, 1.0);
         assert_eq!(p.drain_log(), ["a out", "b over"]);
+    }
+
+    fn draw_pick_rect(vm: &mut Vm, clip: DisplayId, width: f64, height: f64) {
+        let value = vm.display_object(clip);
+        vm.call_method(
+            &value,
+            "beginFill",
+            &[Value::Number(0.0), Value::Number(0.0)],
+        );
+        for (method, x, y) in [
+            ("moveTo", 0.0, 0.0),
+            ("lineTo", width, 0.0),
+            ("lineTo", width, height),
+            ("lineTo", 0.0, height),
+        ] {
+            vm.call_method(&value, method, &[Value::Number(x), Value::Number(y)]);
+        }
+        vm.call_method(&value, "endFill", &[]);
+    }
+
+    #[test]
+    fn topmost_picks_a_clips_own_drawing_in_world_space() {
+        let (mut p, _) = input_player();
+        let root = p.vm.root;
+        let parent = create_empty(&mut p.vm, root, "parent", 2).unwrap();
+        let clip = create_empty(&mut p.vm, parent, "drawing", 1).unwrap();
+        draw_pick_rect(&mut p.vm, clip, 40.0, 20.0);
+        p.vm.display.get_mut(parent).unwrap().matrix = crate::swf::Matrix {
+            a: 0.0,
+            b: 2.0,
+            c: -2.0,
+            d: 0.0,
+            tx: 2000.0,
+            ty: 400.0,
+        };
+        p.vm.display.get_mut(clip).unwrap().matrix.tx = 200.0;
+        assert_eq!(p.topmost_at(80.0, 80.0), Some(clip));
+        assert_eq!(p.topmost_at(50.0, 80.0), None);
+        p.mouse_move(80.0, 80.0);
+        let mouse = Value::Object(p.vm.mouse);
+        let hit = p.vm.call_method(&mouse, "getTopMostEntity", &[]);
+        assert_eq!(p.vm.display_of(&hit), Some(clip));
+        // Transparent decorative fills remain entities, without acquiring button events
+        // or blocking text focus just because the native entity query sees them.
+        assert_eq!(pick(&p.vm, 1600.0, 1600.0), None);
+        assert_eq!(pick_in(&p.vm, root, 1600.0, 1600.0, PickMode::Focus), None);
+        let value = p.vm.display_object(clip);
+        for property in ["_visible", "hitTestDisable"] {
+            let hidden = property == "hitTestDisable";
+            p.vm.set(&value, property, Value::Bool(hidden));
+            assert_eq!(p.topmost_at(80.0, 80.0), None);
+            p.vm.set(&value, property, Value::Bool(!hidden));
+            assert_eq!(p.topmost_at(80.0, 80.0), Some(clip));
+        }
+        p.vm.display.get_mut(parent).unwrap().matrix.a = 0.0;
+        p.vm.display.get_mut(parent).unwrap().matrix.b = 0.0;
+        assert_eq!(p.topmost_at(80.0, 80.0), None);
+        p.vm.display.get_mut(parent).unwrap().matrix.b = 2.0;
+        assert_eq!(p.topmost_at(80.0, 80.0), Some(clip));
+        p.vm.call_method(&value, "clear", &[]);
+        assert_eq!(p.topmost_at(80.0, 80.0), None);
+    }
+
+    #[test]
+    fn topmost_drawing_stays_below_children_and_respects_both_mask_kinds() {
+        let (mut p, field) = input_player();
+        let root = p.vm.root;
+        let behind = create_empty(&mut p.vm, root, "behind", 0).unwrap();
+        let front = create_empty(&mut p.vm, root, "front", 2).unwrap();
+        draw_pick_rect(&mut p.vm, behind, 100.0, 100.0);
+        draw_pick_rect(&mut p.vm, front, 40.0, 40.0);
+        assert_eq!(p.topmost_at(20.0, 20.0), Some(front));
+        assert_eq!(p.topmost_at(60.0, 20.0), Some(behind));
+        // Even a negative-depth child is painted above its parent's own drawing.
+        p.vm.display.get_mut(root).unwrap().children.remove(&1);
+        let text = p.vm.display.get_mut(field).unwrap();
+        text.parent = Some(front);
+        text.text_mut().unwrap().bounds = (0.0, 0.0, 10.0, 10.0);
+        p.vm.display
+            .get_mut(front)
+            .unwrap()
+            .children
+            .insert(-5, field);
+        assert_eq!(p.topmost_at(5.0, 5.0), Some(field));
+        let child = create_empty(&mut p.vm, front, "child", 1).unwrap();
+        draw_pick_rect(&mut p.vm, child, 80.0, 80.0);
+        let mask = create_empty(&mut p.vm, front, "timelineMask", 0).unwrap();
+        draw_pick_rect(&mut p.vm, mask, 10.0, 10.0);
+        p.vm.display.get_mut(mask).unwrap().clip_depth = Some(1);
+        assert_eq!(p.topmost_at(5.0, 5.0), Some(child));
+        assert_eq!(p.topmost_at(20.0, 20.0), Some(front));
+        // A rejected masked child must not leak into its parent's drawing fallback.
+        assert_eq!(p.topmost_at(60.0, 20.0), Some(behind));
+        let dynamic_mask = create_empty(&mut p.vm, root, "dynamicMask", 3).unwrap();
+        draw_pick_rect(&mut p.vm, dynamic_mask, 10.0, 10.0);
+        assert!(p.vm.display.set_mask(front, Some(dynamic_mask)));
+        p.vm.display.get_mut(dynamic_mask).unwrap().visible = false;
+        assert_eq!(p.topmost_at(5.0, 5.0), Some(child));
+        assert_eq!(p.topmost_at(20.0, 20.0), Some(behind));
+        assert!(p.vm.display.set_mask(front, None));
+        p.vm.display.get_mut(dynamic_mask).unwrap().visible = true;
+        assert_eq!(p.topmost_at(5.0, 5.0), Some(dynamic_mask));
     }
 
     #[test]
