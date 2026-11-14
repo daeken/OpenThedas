@@ -42,7 +42,7 @@ lightmaps. It is not parity work; where the two differ, the faithful path is rig
    reaches, so large floors catch light from beyond its radius. That is most of the
    faithful Cousland hall floor's brightness; per pixel it draws hard rings, so the deferred
    falloff ends at the radius (`THEDAS_DEFERRED_VIEW=wrap` shows the other choice).
-   Point lights come from a uniform array (256, which every backend can bind) holding the
+   Point lights come from a uniform array (192, which every backend can bind) holding the
    level lights whose reach is in view (the scene's and the added ones, i.e. cutscene
    lights; nearest first past 256), each with a bit set of the rooms it reaches
    (`AreaScene::light_rooms`), tested against the pixel's room: no 3-light cap, no leaking
@@ -75,20 +75,28 @@ characters and placeables, move over in later steps.
   flames, embers, spell effects), in the level's, its objects' and the visual effects'
   renderers, gives the deferred pass a point light each frame at its particles' glow-
   weighted centre, its colour their hue and its strength rising with the light they show
-  (`deferred::emitter_light`, constants tuned by eye). A light of no room reaches from the
-  room its box puts it in. `THEDAS_DEFERRED_LOG_LIGHTS=1` logs a frame's. Original idea
+  (`deferred::emitter_light`, constants tuned by eye). Lights without a room reach every
+  room; room boxes do not reliably identify the floor of a multi-storey area.
+  `THEDAS_DEFERRED_LOG_LIGHTS=1` logs a frame's lights and shadow slots. Original idea
   below kept for what is left:
 - Spell and VFX lights (later step): each live emitter of a prop's effect becomes a point
   light at the emitter, its colour the particles' current colour, scaled by how many are
   alive against the emitter's peak, its radius from the emitter's spread. Light nodes inside
   VFX models, where a model has them, are used as they are.
 
-## Shadows (later steps)
+## Shadows
 
 - Sun: the faithful path's two partitions, sampled in the lighting pass (same matrices,
   `ShadowTargets::frame`), so both paths agree on where shadows fall.
-- Point and VFX lights: cube shadow maps for the few lights that matter most this frame
-  (screen size times intensity), from a fixed pool; the rest unshadowed.
+- Point and VFX lights: four cube shadow slots, allocated to dynamic lights by brightness
+  times radius over distance from the camera. Each is six 512-square `R32Float` distance
+  maps with a 0.35 m near plane to leave the flame's enclosing torch bowl out. Opaque
+  deferred static meshes cast from both faces, including geometry outside the camera's
+  view. The lighting pass compares distances with a bilinear 2-by-2 filter, a 4 cm normal
+  offset and 2 cm distance bias. Creatures, trees and terrain do not cast point shadows
+  yet; static lights keep their baked visibility. At most 24 face passes per frame.
+  `THEDAS_DEFERRED_POINT_SHADOWS=0` disables both rendering and sampling these maps for
+  captures and cost comparisons; it does not change the faithful path.
 - With both in, `lm.a` is no longer needed as the visibility term.
 
 ## Real-time lighting in place of lightmaps (later steps)

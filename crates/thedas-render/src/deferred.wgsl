@@ -185,11 +185,16 @@ struct Light {
     colour: vec4<f32>,
     // Bit per room index (256 rooms) the light reaches.
     rooms: array<vec4<u32>, 2>,
+    // x: its shadow map's slot (`deferred_shadow.rs`), −1 for none
+    shadow: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> lighting: Lighting;
-// As many as `MAX_LIGHTS` in deferred.rs: a uniform array, which every backend can read.
-@group(0) @binding(1) var<uniform> lights: array<Light, 256>;
+// As many as `MAX_LIGHTS` in deferred.rs: a uniform array, which every backend can read
+// (16 KiB at most).
+@group(0) @binding(1) var<uniform> lights: array<Light, 192>;
+// Per shadow slot, its six faces' view-projections (`deferred_shadow::faces`).
+@group(0) @binding(2) var<uniform> shadow_faces: array<mat4x4<f32>, 24>;
 
 @group(1) @binding(0) var g_albedo: texture_2d<f32>;
 @group(1) @binding(1) var g_specular: texture_2d<f32>;
@@ -198,6 +203,43 @@ struct Light {
 // The depth buffer as plain numbers (the OpenGL backend cannot `textureLoad` a depth
 // texture; see cut_effects.rs).
 @group(1) @binding(4) var g_depth: texture_2d<f32>;
+// The shadow slots' faces: distance from the light to the nearest caster.
+@group(1) @binding(5) var shadow_maps: texture_2d_array<f32>;
+
+// How much of a point light at `lp` (shadow slot `slot`) reaches `p` (normal `n`): its
+// cube face by the major axis of the direction, a bilinear 2×2 comparison of distances.
+fn shadowed(slot: i32, lp: vec3<f32>, p: vec3<f32>, n: vec3<f32>) -> f32 {
+    let v = p + n * 0.04 - lp;
+    let a = abs(v);
+    // Inside the cube's near planes there is no caster. In particular, do not divide
+    // by a zero projection w when a receiver coincides with the light.
+    if (max(max(a.x, a.y), a.z) < 0.35) {
+        return 1.0;
+    }
+    var face = 0;
+    if (a.x >= a.y && a.x >= a.z) {
+        face = select(1, 0, v.x > 0.0);
+    } else if (a.y >= a.z) {
+        face = select(3, 2, v.y > 0.0);
+    } else {
+        face = select(5, 4, v.z > 0.0);
+    }
+    let layer = slot * 6 + face;
+    let c = shadow_faces[layer] * vec4<f32>(lp + v, 1.0);
+    let ndc = c.xy / c.w;
+    let size = vec2<f32>(textureDimensions(shadow_maps));
+    let at = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * size - 0.5;
+    let base = vec2<i32>(floor(at));
+    let f = at - floor(at);
+    let dist = length(v) - 0.02;
+    let hi = vec2<i32>(size) - vec2<i32>(1);
+    var s: array<f32, 4>;
+    for (var k = 0; k < 4; k = k + 1) {
+        let t = clamp(base + vec2<i32>(k % 2, k / 2), vec2<i32>(0), hi);
+        s[k] = select(0.0, 1.0, dist <= textureLoad(shadow_maps, t, layer, 0).x);
+    }
+    return mix(mix(s[0], s[1], f.x), mix(s[2], s[3], f.x), f.y);
+}
 
 @vertex
 fn vs_fullscreen(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
@@ -275,8 +317,15 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         }
         let h = normalize(v + ln);
         let ndh = max(dot(n, h), 1e-6);
-        let dif = att * ndl * l.colour.rgb;
-        let sp = att * pow(ndh, power) * l.colour.rgb;
+        var shade = 1.0;
+        if (l.shadow.x >= 0.0) {
+            shade = shadowed(i32(l.shadow.x + 0.5), l.position.xyz, p, n);
+            if (lighting.counts.y == 10u) {
+                return vec4<f32>(shade, att, 0.0, 1.0);
+            }
+        }
+        let dif = att * ndl * l.colour.rgb * shade;
+        let sp = att * pow(ndh, power) * l.colour.rgb * shade;
         if (l.colour.w > 0.5) {
             diff_s = diff_s + dif;
             spec_s = spec_s + sp;
