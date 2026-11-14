@@ -1909,7 +1909,13 @@ impl App {
         if changes.is_empty() && glbs.is_empty() {
             return None;
         }
-        let (mut done, mut failed) = workspace::apply(&changes, &overrides);
+        // Each texture written in its original's format.
+        let stack = self.live.as_ref().map(|l| l.sim().vfs.clone());
+        let format_of = |name: &str| {
+            let (data, _) = stack.as_ref()?.read_beneath_workspace(name).ok()?;
+            Some(thedas_formats::dds::Dds::parse(&data).ok()?.format)
+        };
+        let (mut done, mut failed) = workspace::apply(&changes, &overrides, &format_of);
         // Objects moved in a saved file, moved in the world after the meshes.
         let mut moves = Vec::new();
         // Saved meshes: read against the game's own files, not earlier live edits.
