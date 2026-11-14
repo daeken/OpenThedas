@@ -317,6 +317,10 @@ impl CurveTrack {
     }
 }
 
+/// How far short of its end an animation track's time stops (DAOrigins.exe 0x7db400, the
+/// double at 0xae7118).
+pub const SPAN_END_SHORT: f32 = 0.001;
+
 /// An animation an actor plays (an `AANI` track, `ActionPlayAnimation`; its fields are read
 /// by 0x7dad20 and it updates at 0x7db400).
 #[derive(Clone, Debug, PartialEq)]
@@ -346,9 +350,12 @@ pub struct AnimationTrack {
 impl AnimationTrack {
     /// Seconds into the animation `t` seconds into the cutscene (0x7db400): the time since
     /// the track's start, held to its span, times its speed, plus its offset. 0x7db400
-    /// stops a hair (0xae7118) short of the span's end; that is not followed.
+    /// stops 0.001 s (the double at 0xae7118) short of the span's end, so an animation
+    /// that loops and is exactly as long as its track holds its last frame at the end
+    /// and does not wrap to its first.
     pub fn time_at(&self, t: f32) -> f32 {
-        let since = (t - self.start).clamp(0.0, (self.end - self.start).max(0.0));
+        let span = (self.end - self.start - SPAN_END_SHORT).max(0.0);
+        let since = (t - self.start).clamp(0.0, span);
         self.speed * since + self.offset
     }
 
@@ -2766,6 +2773,10 @@ mod tests {
         assert_eq!(names(6.0), ["sit"]);
         // Speed and offset; held to the span.
         assert_eq!(a.animations[1].time_at(2.5), 2.0);
-        assert_eq!(a.animations[1].time_at(9.0), 3.0);
+        // The end of the span is never reached: the time stops 0.001 s of the track short
+        // of it, so a looping animation as long as its track does not wrap to its start.
+        let end = a.animations[1].time_at(9.0);
+        assert!(end < 3.0 && end > 3.0 - 0.01, "{end}");
+        assert_eq!(a.animations[1].time_at(9.0), a.animations[1].time_at(100.0));
     }
 }
