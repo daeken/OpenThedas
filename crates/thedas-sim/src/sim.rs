@@ -128,6 +128,7 @@ pub struct Sim {
     pub(crate) attack_lengths: HashMap<String, Vec<u64>>,
     /// Ability animations by `tree|action` (see `Sim::ability_timing`).
     pub(crate) ability_anims: HashMap<String, Option<crate::combat::AbilityAnimLen>>,
+    pub(crate) da2_animation_data: HashMap<String, Option<crate::da2_animation::AnimationSample>>,
     /// Each area's doors and their doorways' grid cells (doors do not move; see
     /// `Sim::closed_doors`).
     pub(crate) door_cells: HashMap<ObjectId, Arc<Vec<crate::nav::Doorway>>>,
@@ -626,6 +627,7 @@ impl Sim {
             fire_lengths: HashMap::new(),
             attack_lengths: HashMap::new(),
             ability_anims: HashMap::new(),
+            da2_animation_data: HashMap::new(),
             save_issues: Vec::new(),
             door_cells: HashMap::new(),
             route_approach: Vec::new(),
@@ -1129,6 +1131,31 @@ impl Sim {
                 (_, Some((due, id))) if due <= until => {
                     self.world.time_ms = self.world.time_ms.max(due);
                     self.advance_movers();
+                    let da2 = self.game == thedas_vfs::Game::DragonAge2;
+                    let cancellable = self
+                        .world
+                        .get_mut(id)
+                        .and_then(|o| o.commands.first_mut())
+                        .filter(|c| da2 && c.cancellable_at == Some(due))
+                        .map(|c| {
+                            c.cancellable_at = None;
+                            c.cancellable = true;
+                            c.clone()
+                        });
+                    if let Some(cmd) = cancellable {
+                        self.da2_animation_cancellable(id, &cmd);
+                        continue;
+                    }
+                    if da2
+                        && self.world.get(id).is_some_and(|o| {
+                            o.commands.len() > 1
+                                && o.commands[0].cancellable
+                                && o.commands[0].name == "CommandUseAbility"
+                        })
+                    {
+                        self.finish_chained_ability(id);
+                        continue;
+                    }
                     let approached = self
                         .world
                         .get_mut(id)
@@ -1137,7 +1164,10 @@ impl Sim {
                             let at = c.approach.take()?;
                             c.due = None;
                             c.from = None;
-                            c.arrived = c.name == "CommandAttack";
+                            c.arrived = c.name == "CommandAttack"
+                                || (da2
+                                    && c.name == "CommandUseAbility"
+                                    && c.ints.first() == Some(&1));
                             Some(at)
                         });
                     // An ability whose impact comes before its animation ends deals the
@@ -2359,6 +2389,8 @@ impl Sim {
                 approach: None,
                 ring_wait: false,
                 after_impact_ms: None,
+                cancellable_at: None,
+                cancellable: false,
                 impacted: false,
                 arrived: false,
                 path: Vec::new(),
@@ -2908,7 +2940,10 @@ impl Sim {
             })
             .collect();
         for (id, cmd) in walkers {
-            let now = if cmd.name == "CommandAttack" {
+            let basic = self.game == thedas_vfs::Game::DragonAge2
+                && cmd.name == "CommandUseAbility"
+                && cmd.ints.first() == Some(&1);
+            let now = if cmd.name == "CommandAttack" || basic {
                 self.approach_point(id, &cmd)
             } else {
                 self.ability_approach(id, &cmd)
@@ -2919,7 +2954,7 @@ impl Sim {
             // So does one walking up to use a personal-range talent (its slack being
             // `MELEE_TALENT_TOLERANCE`).
             let melee_reach = match cmd.target {
-                Some(t) if cmd.name == "CommandAttack" => (self.attack_reach(id)
+                Some(t) if cmd.name == "CommandAttack" || basic => (self.attack_reach(id)
                     <= crate::combat::MELEE_REACH)
                     .then(|| self.reach_to(id, t)),
                 Some(t)
@@ -3276,10 +3311,65 @@ impl Sim {
             .filter_map(|o| o.commands.first().map(|c| (o.id, c.clone())))
             .collect();
         let mut best: Option<(u64, ObjectId)> = None;
-        for (id, cmd) in fronts {
+        for (id, mut cmd) in fronts {
             let due = match cmd.due {
-                Some(d) => d,
+                Some(d) => {
+                    if self.game == thedas_vfs::Game::DragonAge2 {
+                        if cmd.cancellable
+                            && cmd.name == "CommandUseAbility"
+                            && self.world.get(id).is_some_and(|o| o.commands.len() > 1)
+                        {
+                            now
+                        } else {
+                            cmd.cancellable_at.map_or(d, |ready| ready.min(d))
+                        }
+                    } else {
+                        d
+                    }
+                }
                 None => {
+                    if self.game == thedas_vfs::Game::DragonAge2
+                        && cmd.name == "CommandUseAbility"
+                        && cmd.ints.first() == Some(&1)
+                        && matches!(self.approach_point(id, &cmd), Approach::InReach)
+                    {
+                        let original = cmd.clone();
+                        let chosen = self.choose_da2_basic_attack(id, &mut cmd);
+                        // Selection can prepend a gesture or clear the queue.
+                        // Preserve commands added by the script.
+                        let slot = self
+                            .world
+                            .get(id)
+                            .and_then(|o| o.commands.iter().position(|c| c == &original));
+                        let Some(slot) = slot else { continue };
+                        if !chosen {
+                            // A choice of 1 is a successful no-action in native
+                            // preparation; do not cast the placeholder ability.
+                            let result = self
+                                .world
+                                .get(id)
+                                .and_then(|o| o.fields.get("CommandResult"))
+                                .copied()
+                                .unwrap_or(0);
+                            if let Some(o) = self.world.get_mut(id) {
+                                o.combat.previous_command = Some(o.commands.remove(slot));
+                            }
+                            let mut ev = self.new_event("COMMAND_COMPLETE", Some(id));
+                            ev.ints = vec![cmd.ty, if result == 1 { 1 } else { -3 }];
+                            self.world.queue_event(APPROACH_CHECK_MS, id, ev, None);
+                            continue;
+                        }
+                        if let Some(c) = self
+                            .world
+                            .get_mut(id)
+                            .and_then(|o| o.commands.get_mut(slot))
+                        {
+                            *c = cmd.clone();
+                        }
+                        if slot != 0 {
+                            continue;
+                        }
+                    }
                     // An attack asks its owner's script for the result first, which may
                     // also set how long it takes.
                     // An attacker out of reach walks up first (the attack starts when it
@@ -3287,6 +3377,12 @@ impl Sim {
                     // So does a caster out of its ability's range.
                     let approach = match cmd.name.as_str() {
                         "CommandAttack" => Some(self.approach_point(id, &cmd)),
+                        "CommandUseAbility"
+                            if self.game == thedas_vfs::Game::DragonAge2
+                                && cmd.ints.first() == Some(&1) =>
+                        {
+                            Some(self.approach_point(id, &cmd))
+                        }
                         "CommandUseAbility" => Some(self.ability_approach(id, &cmd)),
                         _ => None,
                     };
@@ -3393,6 +3489,7 @@ impl Sim {
                                 self.world.get_mut(id).and_then(|o| o.commands.first_mut())
                             {
                                 c.after_impact_ms = Some(t.end_ms.saturating_sub(t.impact_ms));
+                                c.cancellable_at = t.cancel_ms.map(|ms| now.saturating_add(ms));
                             }
                         }
                         let unset = unset.or(timing.map(|t| t.impact_ms));
@@ -3488,7 +3585,11 @@ impl Sim {
                             c.path = path;
                         }
                     }
-                    d
+                    self.world
+                        .get(id)
+                        .and_then(|o| o.commands.first())
+                        .and_then(|c| c.cancellable_at)
+                        .map_or(d, |ready| ready.min(d))
                 }
             };
             if best.is_none_or(|(b, bid)| (due, id) < (b, bid)) {
@@ -3552,6 +3653,21 @@ impl Sim {
             None if self.nav_grid(area).is_none() => Some((spot, facing, area)),
             None => None,
         }
+    }
+
+    /// Completes an object's front command: applies its movement and tells the object.
+    pub(crate) fn finish_chained_ability(&mut self, id: ObjectId) {
+        let Some(c) = self
+            .world
+            .get_mut(id)
+            .and_then(|o| o.commands.first_mut())
+            .filter(|c| c.cancellable && c.name == "CommandUseAbility")
+        else {
+            return;
+        };
+        // Cancelling before an impact marker must not deliver that future impact.
+        c.impacted = true;
+        self.finish_command(id);
     }
 
     /// Completes an object's front command: applies its movement and tells the object.
@@ -4863,6 +4979,55 @@ impl ScriptHost<'_> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn da2_basic_no_action_preserves_a_command_prepended_by_its_script() {
+        let ldf = "#define ENGINE_STRUCTURE_2 command\n\
+            void SetCommandResult(object who, int result) = 1;\n\
+            command CommandWait(float seconds) = 2;\n\
+            int AddCommand(object who, command cmd, int front) = 3;\n\
+            int COMMAND_TYPE_ATTACK = 1;\n\
+            int COMMAND_TYPE_USE_ABILITY = 25;\n\
+            int COMMAND_TYPE_WAIT = 13;\n";
+        let mut s = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(EngineTable::parse(ldf.as_bytes()).unwrap()),
+            1,
+        );
+        s.game = thedas_vfs::Game::DragonAge2;
+        let area = s.world.spawn(ObjectKind::Area, "arena");
+        let who = s.world.spawn(ObjectKind::Creature, "attacker");
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        s.world.get_mut(who).unwrap().area = Some(area);
+        s.world.get_mut(target).unwrap().area = Some(area);
+        s.world.get_mut(who).unwrap().script = Some("choose.ncs".into());
+        // Own script: prepend CommandWait(0.25), then decline the placeholder
+        // attack with SetCommandResult(attacker, 1).
+        let mut code = vec![0x04, 0x03, 0, 0, 0, 1, 0x04, 0x04];
+        code.extend(0.25_f32.to_be_bytes());
+        code.extend([0x05, 0, 0, 2, 1, 0x04, 0x06]);
+        code.extend(who.to_be_bytes());
+        code.extend([0x05, 0, 0, 3, 3, 0x1b, 0]);
+        code.extend((-4_i32).to_be_bytes());
+        code.extend([0x04, 0x03, 0, 0, 0, 1, 0x04, 0x06]);
+        code.extend(who.to_be_bytes());
+        code.extend([0x05, 0, 0, 1, 2, 0x20, 0]);
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+        bytes.extend(code);
+        s.add_script("choose.ncs", Ncs::parse(&bytes).unwrap());
+        s.order_attack(who, target);
+        // A modern default attack must finish its approach with the same
+        // arrival tolerance as the old attack, then enter selection once.
+        let (arrival, _) = s.next_command().unwrap();
+        assert!(s.world.get(who).unwrap().commands[0].approach.is_some());
+        s.tick(arrival);
+        let commands = &s.world.get(who).unwrap().commands;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "CommandWait");
+        assert_eq!(commands[0].seconds, 0.25);
+        assert_eq!(s.next_command(), Some((arrival + 250, who)));
+    }
+
+    #[test]
     fn dragon_age_2_reference_functions_run_as_their_twins() {
         let ldf = "#define ENGINE_STRUCTURE_0 event\n\
             event Event(int nType) = 0;\n\
@@ -5125,6 +5290,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -5644,6 +5811,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -5734,6 +5903,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -5774,6 +5945,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -5809,6 +5982,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -5920,6 +6095,8 @@ mod tests {
                 approach: None,
                 ring_wait: false,
                 after_impact_ms: None,
+                cancellable_at: None,
+                cancellable: false,
                 impacted: false,
                 arrived: false,
                 path: Vec::new(),
@@ -5968,6 +6145,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -6110,6 +6289,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -6174,6 +6355,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -6222,6 +6405,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -6446,6 +6631,8 @@ mod tests {
                 approach: None,
                 ring_wait: false,
                 after_impact_ms: None,
+                cancellable_at: None,
+                cancellable: false,
                 impacted: false,
                 arrived: false,
                 path: Vec::new(),
@@ -6470,6 +6657,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -6548,6 +6737,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -6610,6 +6801,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -6833,6 +7026,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),

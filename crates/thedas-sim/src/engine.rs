@@ -2821,6 +2821,8 @@ pub fn call(
                 approach: None,
                 ring_wait: false,
                 after_impact_ms: None,
+                cancellable_at: None,
+                cancellable: false,
                 impacted: false,
                 arrived: false,
                 path: Vec::new(),
@@ -2878,6 +2880,7 @@ pub fn call(
                     c.path.drain(..start);
                 }
             }
+            h.sim.da2_default_attack_command(&mut c);
             let hd = h.sim.world.store(EngineData::Command(c));
             ok(Value::Engine {
                 ty: ty.command,
@@ -2943,6 +2946,16 @@ pub fn call(
             };
             let target = obj(a, 0);
             let front = int(a, 2) != 0;
+            if front
+                && h.sim.game == thedas_vfs::Game::DragonAge2
+                && h.sim.world.get(target).is_some_and(|o| {
+                    o.commands
+                        .first()
+                        .is_some_and(|c| c.cancellable && c.name == "CommandUseAbility")
+                })
+            {
+                h.sim.finish_chained_ability(target);
+            }
             h.sim.world.trace.push(TraceEntry::Command {
                 t,
                 object: target,
@@ -3501,6 +3514,19 @@ pub fn call(
             } else {
                 void()
             }
+        }
+        "SetMaxHealth"
+            if h.sim.game == thedas_vfs::Game::Origins
+                && h.object(obj(a, 0))
+                    .is_some_and(|o| o.kind == ObjectKind::Placeable) =>
+        {
+            // 0x65a330 -> 0x750f70: store the sign-extended short in the
+            // placeable's separate maximum member. Current health stays put.
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields
+                    .insert("MaxHealth".into(), i32::from(int(a, 1) as i16));
+            }
+            void()
         }
         "SetMaxHealth" => {
             let id = obj(a, 0);
@@ -5358,9 +5384,11 @@ pub fn call(
             }
             void()
         }
-        // Ability results only steer animations, which the simulation does not play.
-        // Reports the target's resistance roll (made by the scripts themselves) and the node a
-        // projectile aims at: presentation for the simulation.
+        "SetAbilityResult" if h.sim.game == thedas_vfs::Game::DragonAge2 => {
+            h.sim.remember_ability_result(obj(a, 0), int(a, 1));
+            void()
+        }
+        // Origins' ability result remains presentation-only here.
         "SetAbilityResult" => {
             *h.sim
                 .world
@@ -5507,6 +5535,19 @@ pub(crate) fn cooldown_key(ability: i32, item: &str) -> String {
 /// to Closed_Unlocked). Provisional: only the default action is known to move the state;
 /// other actions leave it.
 fn placeable_transition(sim: &Sim, id: ObjectId, action: i32, variation: bool) -> Option<i32> {
+    if sim.game == thedas_vfs::Game::DragonAge2 {
+        let (table, state) = da2_placeable_controller(sim, id)?;
+        let int = |hash| match table.cell_by_hash(hash, state)? {
+            Cell::Int(n) => Some(*n as i32),
+            _ => None,
+        };
+        if int(0x52be_3c5e)? != action {
+            return None;
+        }
+        let next = int(if variation { 0x5ad0_780d } else { 0xa2b4_782c })?;
+        // Native controller records store -1 as the absent transition sentinel.
+        return (next >= 0).then_some(next);
+    }
     let o = sim.world.get(id)?;
     let appearance = *o.fields.get("Appearance")? as i64;
     let state = o
@@ -5543,6 +5584,13 @@ fn placeable_transition(sim: &Sim, id: ObjectId, action: i32, variation: bool) -
 /// `placeable_types.gda` (the ninth column names the controller table) and the controller's
 /// action column (hash 0x52be3c5e) at the row of the placeable's state. Provisional.
 pub(crate) fn placeable_default_action(sim: &Sim, id: ObjectId) -> Option<i32> {
+    if sim.game == thedas_vfs::Game::DragonAge2 {
+        let (table, state) = da2_placeable_controller(sim, id)?;
+        return match table.cell_by_hash(0x52be_3c5e, state)? {
+            Cell::Int(action) if *action > 0 => Some(*action as i32),
+            _ => None,
+        };
+    }
     let o = sim.world.get(id)?;
     let appearance = *o.fields.get("Appearance")? as i64;
     let state = o
@@ -5570,6 +5618,35 @@ pub(crate) fn placeable_default_action(sim: &Sim, id: ObjectId) -> Option<i32> {
         Cell::Int(v) if *v > 0 => Some(*v as i32),
         _ => None,
     }
+}
+
+/// DA2 selects its controller independently of appearance. Native 0x8c73e0 reads
+/// M2DA 11100's TableIndex, then loads that table's state/action records. The
+/// headless use command resolves its default action rather than caching a cursor
+/// choice in the native placeable's action field (GetPlaceableAction, 0x4e9820).
+fn da2_placeable_controller(
+    sim: &Sim,
+    id: ObjectId,
+) -> Option<(std::sync::Arc<crate::m2da::Table>, i64)> {
+    let object = sim.world.get(id)?;
+    if object.kind != crate::world::ObjectKind::Placeable {
+        return None;
+    }
+    let controller = i64::from(*object.fields.get("StateController")?);
+    let state = i64::from(
+        object
+            .fields
+            .get("State")
+            .or_else(|| object.fields.get("AnimContState"))
+            .copied()
+            .unwrap_or(0),
+    );
+    let tables = sim.world.tables();
+    let registry = tables.get(11100, "")?;
+    let Cell::Int(index) = registry.cell_by_hash(0x8f29_1c52, controller)? else {
+        return None;
+    };
+    Some((tables.get(i32::try_from(*index).ok()?, "")?, state))
 }
 
 impl Sim {
@@ -7214,6 +7291,43 @@ mod tests {
     }
 
     #[test]
+    fn da2_attack_constructor_uses_the_modern_default_without_a_forced_roll() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"#define ENGINE_STRUCTURE_2 command\n\
+              command CommandAttack(object target, int forced) = 566;\n\
+              int COMMAND_TYPE_ATTACK = 1;\n\
+              int COMMAND_TYPE_USE_ABILITY = 25;\n",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            s.game = game;
+            let Some(Value::Engine { handle, .. }) = run(
+                &mut s,
+                120,
+                "CommandAttack",
+                &[Value::Object(42), Value::Int(4)],
+            ) else {
+                panic!("command constructor");
+            };
+            let Some(EngineData::Command(c)) = s.world.handle(handle) else {
+                panic!("stored command");
+            };
+            assert_eq!(c.target, Some(42));
+            if game == thedas_vfs::Game::DragonAge2 {
+                assert_eq!(
+                    (&*c.name, c.ty, &*c.ints),
+                    ("CommandUseAbility", 25, &[1][..])
+                );
+            } else {
+                assert_eq!((&*c.name, c.ty, &*c.ints), ("CommandAttack", 1, &[4][..]));
+            }
+        }
+    }
+
+    #[test]
     fn da2_delayed_ability_impacts_keep_the_payload_and_delivery_time_on_reload() {
         let table = Arc::new(
             EngineTable::parse(
@@ -7687,6 +7801,178 @@ mod tests {
     }
 
     #[test]
+    fn origins_placeable_max_health_does_not_assign_current_health() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
+                  void SetMaxHealth(object o, int n) = 1;\n\
+                  int Deprecated_GetMaxHealth(object o) = 2;\n\
+                  int GetHealth(object o) = 3;",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let id = s.world.spawn(ObjectKind::Placeable, "chest");
+        let o = s.world.get_mut(id).unwrap();
+        o.fields.insert("Health".into(), 16);
+        o.dead = true;
+        o.active = false;
+        o.immortal = true;
+        o.plot = true;
+        o.modifiers.insert(7, 13.5);
+        for health in [None, Some(0.0), Some(80.0)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.properties.remove(&7);
+            if let Some(current) = health {
+                o.properties.insert(7, (100.0, current));
+            }
+            let properties = o.properties.clone();
+            for value in [
+                i32::MIN,
+                -65537,
+                -32769,
+                -32768,
+                -1,
+                0,
+                1,
+                30,
+                32767,
+                32768,
+                65535,
+                65536,
+                i32::MAX,
+            ] {
+                let queued = s.world.queue.len();
+                run(
+                    &mut s,
+                    id,
+                    "SetMaxHealth",
+                    &[Value::Object(id), Value::Int(value)],
+                );
+                let o = s.world.get(id).unwrap();
+                assert_eq!(o.properties, properties);
+                assert_eq!(o.fields["MaxHealth"], i32::from(value as i16));
+                assert_eq!(o.fields["Health"], 16);
+                assert_eq!(o.modifiers[&7], 13.5);
+                assert!(o.dead && o.immortal && o.plot && !o.active);
+                assert_eq!(s.world.queue.len(), queued);
+                assert_eq!(
+                    run(&mut s, id, "Deprecated_GetMaxHealth", &[Value::Object(id)]),
+                    Some(Value::Int(i32::from(value as i16)))
+                );
+                assert_eq!(
+                    run(&mut s, id, "GetHealth", &[Value::Object(id)]),
+                    Some(Value::Int(health.unwrap_or(16.0) as i32))
+                );
+                s.load_json(&s.save_json().unwrap()).unwrap();
+                assert_eq!(s.world.get(id).unwrap().properties, properties);
+                assert_eq!(
+                    s.world.get(id).unwrap().clone().fields["MaxHealth"],
+                    i32::from(value as i16)
+                );
+            }
+        }
+        s.world.get_mut(id).unwrap().properties.remove(&7);
+        for current in [i32::MIN, -65537, 0, 32768, 65535, i32::MAX] {
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .fields
+                .insert("Health".into(), current);
+            assert_eq!(
+                run(&mut s, id, "GetHealth", &[Value::Object(id)]),
+                Some(Value::Int(i32::from(current as i16)))
+            );
+        }
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .properties
+            .insert(7, (100.0, 0.0));
+        run(
+            &mut s,
+            id,
+            "SetMaxHealth",
+            &[Value::Object(id), Value::Int(65535)],
+        );
+        assert_eq!(s.world.get(id).unwrap().properties[&7], (65535.0, 65535.0));
+        s.world.get_mut(id).unwrap().properties.remove(&7);
+        assert_eq!(
+            run(&mut s, id, "GetHealth", &[Value::Object(id)]),
+            Some(Value::Int(0))
+        );
+        s.game = thedas_vfs::Game::Origins;
+        s.world.get_mut(id).unwrap().kind = ObjectKind::Creature;
+        assert_eq!(
+            run(&mut s, id, "GetHealth", &[Value::Object(id)]),
+            Some(Value::Int(0))
+        );
+    }
+
+    #[test]
+    fn old_placeable_saves_preserve_explicit_currents_and_default_missing_fields() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
+                  int GetHealth(object o) = 1;\n\
+                  int Deprecated_GetMaxHealth(object o) = 2;",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let id = s.world.spawn(ObjectKind::Placeable, "old_chest");
+        for fields in [
+            vec![],
+            vec![("Health", 16)],
+            vec![("MaxHealth", 77)],
+            vec![("Health", 16), ("MaxHealth", 77)],
+        ] {
+            for current in [None, Some(0.0), Some(80.0)] {
+                let o = s.world.get_mut(id).unwrap();
+                o.fields = fields.iter().map(|&(k, v)| (k.into(), v)).collect();
+                o.properties.clear();
+                if let Some(current) = current {
+                    o.properties.insert(7, (100.0, current));
+                }
+                let fields = o.fields.clone();
+                let properties = o.properties.clone();
+                // #844 adds no Object or SaveGame members. Older JSON may also
+                // omit #838's independently defaulted creature health floor.
+                let mut legacy: serde_json::Value =
+                    serde_json::from_slice(&s.save_json().unwrap()).unwrap();
+                legacy["world"]["objects"][id.to_string()]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("health_floor_one");
+                s.load_json(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+                for _ in 0..2 {
+                    let o = s.world.get(id).unwrap();
+                    assert_eq!(o.fields, fields);
+                    assert_eq!(o.properties, properties);
+                    assert!(!o.health_floor_one);
+                    assert_eq!(
+                        run(&mut s, id, "GetHealth", &[Value::Object(id)]),
+                        Some(Value::Int(
+                            current.unwrap_or(*fields.get("Health").unwrap_or(&0) as f32) as i32
+                        ))
+                    );
+                    assert_eq!(
+                        run(&mut s, id, "Deprecated_GetMaxHealth", &[Value::Object(id)]),
+                        Some(Value::Int(
+                            *fields
+                                .get("MaxHealth")
+                                .or_else(|| fields.get("Health"))
+                                .unwrap_or(&0)
+                        ))
+                    );
+                    s.load_json(&s.save_json().unwrap()).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn party_members_and_no_perm_death_creatures_cannot_die_permanently() {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
@@ -7858,7 +8144,7 @@ mod tests {
             &[Value::Object(absent), Value::Int(0)],
         );
         assert_eq!(s.world.get(absent).unwrap().properties[&7], (40.0, 0.0));
-        // Other virtuals and DA2 keep their previous paths in this creature-only slice.
+        // Placeables have a separate maximum; DA2 keeps its previous property write.
         for (game, target) in [
             (thedas_vfs::Game::Origins, chest),
             (thedas_vfs::Game::DragonAge2, id),
@@ -7875,7 +8161,14 @@ mod tests {
                 "SetMaxHealth",
                 &[Value::Object(target), Value::Int(30)],
             );
-            assert_eq!(s.world.get(target).unwrap().properties[&7], (30.0, 12.0));
+            let o = s.world.get(target).unwrap();
+            if game == thedas_vfs::Game::Origins {
+                assert_eq!(o.properties[&7], (40.0, 12.0));
+                assert_eq!(o.fields["MaxHealth"], 30);
+                assert!(!o.health_floor_one);
+            } else {
+                assert_eq!(o.properties[&7], (30.0, 12.0));
+            }
         }
     }
 
@@ -8844,6 +9137,55 @@ mod tests {
     }
 
     #[test]
+    fn da2_containers_resolve_actions_by_controller_and_preserve_absent_transitions() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut sim = Sim::new(Arc::new(Vfs::new()), table, 1);
+        sim.game = thedas_vfs::Game::DragonAge2;
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "#11100",
+            &["ID", "#8f291c52"],
+            vec![(5, vec![Cell::Int(5), Cell::Int(11004)])],
+        );
+        let row = |state, action, next| {
+            (
+                state,
+                vec![
+                    Cell::Int(state),
+                    Cell::Int(action),
+                    Cell::Int(next),
+                    Cell::Int(-1),
+                ],
+            )
+        };
+        tables.insert(
+            "#11004",
+            &["ID", "#52be3c5e", "#a2b4782c", "#5ad0780d"],
+            vec![row(0, 11, -1), row(1, 3, 0)],
+        );
+        sim.world.tables = Arc::new(tables);
+        let corpse = sim.world.spawn(ObjectKind::Placeable, "supplies");
+        sim.world.get_mut(corpse).unwrap().fields.extend([
+            ("StateController".into(), 5),
+            ("AnimContState".into(), 0),
+            ("Appearance".into(), 999),
+        ]);
+        assert_eq!(placeable_default_action(&sim, corpse), Some(11));
+        assert_eq!(placeable_transition(&sim, corpse, 11, false), None);
+        sim.world
+            .get_mut(corpse)
+            .unwrap()
+            .fields
+            .insert("State".into(), 1);
+        assert_eq!(placeable_default_action(&sim, corpse), Some(3));
+        assert_eq!(placeable_transition(&sim, corpse, 11, false), None);
+        assert_eq!(placeable_transition(&sim, corpse, 3, false), Some(0));
+        assert_eq!(placeable_transition(&sim, corpse, 3, true), None);
+        sim.game = thedas_vfs::Game::Origins;
+        assert_eq!(placeable_default_action(&sim, corpse), None);
+    }
+
+    #[test]
     fn a_successful_action_moves_a_placeable_along_its_state_controller() {
         use thedas_formats::gda::Cell;
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -9769,6 +10111,8 @@ mod tests {
                 approach: None,
                 ring_wait: false,
                 after_impact_ms: None,
+                cancellable_at: None,
+                cancellable: false,
                 impacted: false,
                 arrived: false,
                 path: vec![],
