@@ -161,6 +161,11 @@ pub struct Object {
     #[serde(default)]
     pub face_choices: BTreeMap<u32, f32>,
     pub immortal: bool,
+    /// Origins property 7's current floor is one after SetImmortal(true), zero
+    /// initially. Kept apart from the flag: native flag-only loading does not set
+    /// the property floor, and changing the floor does not immediately clamp health.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub health_floor_one: bool,
     pub plot: bool,
     pub team: i32,
     pub group: i32,
@@ -245,6 +250,7 @@ impl Object {
             head_morph: None,
             face_choices: BTreeMap::new(),
             immortal: false,
+            health_floor_one: false,
             plot: false,
             team: -1,
             group: 0,
