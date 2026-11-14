@@ -1,7 +1,7 @@
 //! The corpus check: open every archive, read every entry, and parse and round-trip every
 //! GFF4-family resource, including loose files outside archives. Formats with a typed reader
 //! (GDA, TLK, areas, layouts, models, meshes, materials, DDS) are also parsed into their typed
-//! form; the `typed` column counts those.
+//! form, and Bink movies are decoded whole; the `typed` column counts those.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -290,6 +290,41 @@ fn check_audio(path: &Path, ext: &str, label: &str, stats: &mut Stats, keep: usi
     typed_result(stats, ext, label.to_string(), result, keep);
 }
 
+/// Bink movies decode whole: every frame's picture and every audio track's sound.
+fn check_movie(path: &Path, label: &str, stats: &mut Stats, keep: usize) {
+    use thedas_video::bink::{AudioDecoder, Movie, VideoDecoder};
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let decode = || -> std::result::Result<(), String> {
+        let mut movie = Movie::open(path).map_err(|e| e.to_string())?;
+        let mut video = VideoDecoder::new(&movie.header).map_err(|e| e.to_string())?;
+        let mut audio = movie
+            .header
+            .tracks
+            .iter()
+            .map(AudioDecoder::new)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let mut pcm = Vec::new();
+        for i in 0..movie.frames() {
+            let p = movie.packets(i).map_err(|e| format!("frame {i}: {e}"))?;
+            for (a, pkt) in audio.iter_mut().zip(&p.audio) {
+                pcm.clear();
+                a.decode(pkt, &mut pcm)
+                    .map_err(|e| format!("frame {i} audio: {e}"))?;
+            }
+            video
+                .decode(&p.video)
+                .map_err(|e| format!("frame {i}: {e}"))?;
+        }
+        Ok(())
+    };
+    let result = decode();
+    let es = stats.by_ext.entry("bik".to_string()).or_default();
+    es.entries += 1;
+    es.bytes += size;
+    typed_result(stats, "bik", label.to_string(), result, keep);
+}
+
 fn check_loose(path: &Path, label: &str, stats: &mut Stats, keep: usize) {
     use std::io::Read;
     let ext = path
@@ -299,6 +334,9 @@ fn check_loose(path: &Path, label: &str, stats: &mut Stats, keep: usize) {
         .unwrap_or_default();
     if ext == "fev" || ext == "fsb" {
         return check_audio(path, &ext, label, stats, keep);
+    }
+    if ext == "bik" {
+        return check_movie(path, label, stats, keep);
     }
     let mut head = [0u8; 16];
     let n = match std::fs::File::open(path).and_then(|mut f| f.read(&mut head)) {

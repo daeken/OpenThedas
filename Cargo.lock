@@ -4319,6 +4319,7 @@ dependencies = [
  "thedas-sim",
  "thedas-ui",
  "thedas-vfs",
+ "thedas-video",
  "ureq",
  "wgpu",
  "winit",
@@ -4351,6 +4352,7 @@ dependencies = [
  "thedas-shader",
  "thedas-sim",
  "thedas-vfs",
+ "thedas-video",
 ]
 
 [[package]]
@@ -4461,6 +4463,14 @@ dependencies = [
  "sevenz-rust2",
  "thiserror 2.0.18",
  "zip",
+]
+
+[[package]]
+name = "thedas-video"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -81,7 +81,7 @@ Counts are corpus entries, with each archive copy counted.
 | `.bic` | 3 | generic GFF3 only | none (character files) |
 | `.ttf` | 2 | none | none |
 | `.spt` | 688 | typed | parsed, not drawn; billboards stand in |
-| `.bik` | 85 loose | header only | decoded by an external `ffmpeg` |
+| `.bik` | 85 loose | typed (`thedas-video`) | decoded natively, video and sound |
 
 The corpus run's only failures are 5,058 non-fatal "undeclared action" reports in scripts, all
 from four function ids missing from `script.ldf` or the two-argument `CommandFly` in DLC and
@@ -134,7 +134,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 | `.utc`, `.uti`, `.utp`, `.utm` | yes (GFF3) | GFF3 | yes (sim) | |
 | `.utt`, `.uts`, `.ute`, `.utw`, `.uta` | no | no | no | no code names them |
 | `<layout>_mmi.gff` | yes (ui minimap) | no | yes | |
-| `.bik` | header only | no | via external ffmpeg | |
+| `.bik` | yes (`thedas-video`) | yes | yes | Bink 1 revision `i`, Bink audio DCT |
 | `.xml` (`chargenmorphcfg.xml`, Manifest.xml) | ad hoc | no | yes | Manifest by attribute scraping |
 | `.fxe`, `.fxa`, `.lip` | no | no | no | no code found |
 | `.lvl`, `.pth` | no | no | no | no code names them |

@@ -147,7 +147,6 @@ these, so they are the places where one person or stream can take a large, separ
 
 ### Platform, formats and project
 
-- **Movies need an external `ffmpeg`** beside the game or on the PATH (`CAM-029`).
 - **DLC passwords come only from the GOG Ultimate Edition executable or a keys file.** Without
   a keys file, other editions' encrypted DA:O DLC and all DA2 DLC stay unread, and the XOR
   reader is checked only synthetically (`FMT-001`, `FMT-002`).
