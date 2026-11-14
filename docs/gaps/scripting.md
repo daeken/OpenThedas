@@ -303,7 +303,6 @@ Dispatch summary: `engine::call` (`crates/thedas-sim/src/engine.rs:483`) matches
 - **SCR-032** **Timers are simulation-time approximations.** Original: not traced. Ours: `GetTime` = whole simulation seconds; `GetLowResTimer` = simulation milliseconds truncated to i32 (wraps after about 24.8 days of play time). Evidence: `crates/thedas-sim/src/engine.rs:1566`, `engine.rs:3015`. Size: S. Depends: none. Kind: unverified.
 - **SCR-033** **Random number generator is not the exe's.** Original: not traced. Ours: xorshift64* seeded per `Sim`; `Random(n)` is `next % n` (modulo bias), `RandomFloat` 24-bit. Deterministic and saved, but sequences cannot match the original. Evidence: `crates/thedas-sim/src/world.rs:426-453`, `crates/thedas-sim/src/engine.rs:607-608`. Size: S. Depends: none. Kind: unverified.
 - **SCR-035** **Talk-table strings: English only, no tokens.** Original: not traced. Ours: `GetStringByStringId` reads only `*en-us.tlk` and returns the raw text; designer tokens such as `<FirstName/>` are filled only by the UI (`thedas-ui/src/protocol.rs:86`), and no female/alternate string variant is chosen. Evidence: `crates/thedas-sim/src/sim.rs:423-443`, `crates/thedas-sim/src/engine.rs:1581`. Size: M. Depends: none. Kind: missing.
-- **SCR-036** **ActivateSoundByTag compares tags ignoring case.** Original: 0x65d0c0, 0x67c230, 0x7c2190. Ours: case-insensitive compare (provisional); only the active flag is kept. Evidence: `crates/thedas-sim/src/engine.rs:3559-3575`. Size: S. Depends: none. Kind: provisional.
 
 ### Items and inventory functions
 
