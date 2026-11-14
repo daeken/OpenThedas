@@ -892,6 +892,9 @@ fn lighting_pixel(frag: vec4<f32>, baked: bool) -> vec4<f32> {
     }
 
     let ga = textureLoad(g_albedo, px, 0);
+    // Keep unlit Black out of material loads and probe/AO work, as before the
+    // surface evaluator was shared with ordered forward receivers.
+    if (u32(round(ga.a * 255.0)) == 32u) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
     let spec = textureLoad(g_specular, px, 0);
     let gn = textureLoad(g_normal, px, 0);
     let lm = textureLoad(g_lightmap, px, 0);
